@@ -172,6 +172,7 @@ class AppPaths:
         self.bootstrap_state = os.path.join(self.data, "bootstrap_state.json")
         self.update_marker = os.path.join(self.data, "update_pending.json")
         self.crash_marker = os.path.join(self.data, "last_crash.txt")
+        self.networks = os.path.join(self.data, "networks.json")
 
     def as_dict(self):
         return {k: v for k, v in self.__dict__.items()
@@ -5025,6 +5026,8 @@ class DeviceRecord:
     suggested: set = field(default_factory=set)   # keys already suggested
     live: bool = True        # False for records loaded from a saved session
     demo: bool = False
+    iface_stats: dict = field(default_factory=dict)  # per-MAC counters
+    network_id: str = ""
     _last_conf_tier: str = CONFIDENCE_UNCONFIRMED
 
     def add_evidence(self, source, detail, when=None):
@@ -5140,6 +5143,13 @@ class DeviceRecord:
         return avg >= min_avg and cur > avg * multiplier
 
 
+IFACE_STAT_FIELDS = ("packets", "packets_out", "packets_in", "bytes_up",
+                     "bytes_down", "lan_bytes", "internet_bytes")
+_MERGE_COPIED = ("hostname", "hostname_source", "dhcp_hostname",
+                 "mdns_name", "ssdp_name", "vendor", "alias", "notes",
+                 "model_hint", "dhcp_vendor_class", "ssdp_server",
+                 "dhcp_client_id", "mine", "expected")
+
 DEVICE_SAVE_FIELDS = (
     "key", "ip", "mac", "vendor", "hostname", "hostname_source",
     "dhcp_hostname", "mdns_name", "ssdp_name", "ssdp_server", "model_hint",
@@ -5151,7 +5161,8 @@ DEVICE_SAVE_FIELDS = (
     "pinned_no_merge", "lease_ip", "lease_expiry", "link_local_only",
     "is_virtual", "expected", "mine", "alias", "notes", "os_ttl",
     "ip_history", "mac_history", "dhcp_history", "hostname_history",
-    "presence", "merge_note", "merged_from", "demo")
+    "presence", "merge_note", "merged_from", "demo", "dhcp_client_id",
+    "dhcp_params", "network_id", "iface_stats")
 
 
 def looks_generated(name):
@@ -5213,6 +5224,19 @@ def device_from_dict(dd):
             continue
         elif isinstance(cur, str):
             v = sanitize_text(v, 2000 if k == "notes" else 200)
+        elif isinstance(cur, dict):
+            if not isinstance(v, dict):
+                continue
+            if k == "iface_stats":
+                v = {sanitize_text(m, 80): {f: (float(x) if f in
+                                                ("first", "last")
+                                                else int(x))
+                                            for f, x in st.items()
+                                            if f in IFACE_STAT_FIELDS +
+                                            ("first", "last") and
+                                            isinstance(x, (int, float))}
+                     for m, st in list(v.items())[:32]
+                     if isinstance(st, dict)}
         setattr(dev, k, v)
     for k in ("ipv6", "ipv4s", "services", "never_merge", "websites",
               "remote_ips"):
@@ -5486,6 +5510,17 @@ class DeviceRegistry:
         self.moved_ips = []           # IPv4s that changed owner
         self._elig_sig = None
         self._elig = {}
+        self.alias = {}               # absorbed key -> key it was merged into
+        self.bindings = BindingTable()
+        self.network_id = ""          # network new devices are seen on
+
+    def resolve(self, key):
+        """The current key for a device key that may have been merged."""
+        seen = 0
+        while key in self.alias and seen < 16:
+            key = self.alias[key]
+            seen += 1
+        return key
 
     # ---- address rules ----------------------------------------------------
     def classify_address(self, ip):
@@ -5591,6 +5626,7 @@ class DeviceRegistry:
         key = self._key_for(ip, mac)
         if key is None:
             return None
+        key = self.resolve(key)
         dev = self.by_key.get(key)
         if dev is None and not mac and ip:
             known = self.ip_to_key.get(ip)
@@ -5607,12 +5643,13 @@ class DeviceRegistry:
         if dev is None:
             dev = DeviceRecord(key=key, first_seen=when, last_seen=when,
                                last_confirmed=when)
+            dev.network_id = self.network_id
             dev.presence_open(when)
             self._apply_labels(dev)
             self.created.append(key)
         self.by_key[key] = dev
         if ip:
-            self._assign_ip(dev, ip, when)
+            self._assign_ip(dev, ip, when, source, mac)
             if ip.count(".") == 3:
                 dev.link_local_only = (flag == "link-local")
             dev.is_virtual = dev.is_virtual or (flag == "virtual-bridge")
@@ -5646,7 +5683,11 @@ class DeviceRegistry:
             dev._last_conf_tier = dev.confidence
         return dev
 
-    def _assign_ip(self, dev, ip, when):
+    def _assign_ip(self, dev, ip, when, source="traffic", mac=None):
+        src = {"dhcp_lease": "dhcp", "arp_reply": "arp",
+               "ipv6_nd": "nd"}.get(source, "traffic")
+        self.bindings.bind(ip, (mac or dev.mac or dev.key).lower()
+                           if (mac or dev.mac) else dev.key, when, src)
         if ":" in ip:
             if ip not in dev.ipv6:
                 dev.ipv6.add(ip)
@@ -5800,20 +5841,39 @@ class DeviceRegistry:
                          direction == "sent" else
                          "Received traffic on the local network", when)
         if dev:
+            nb = max(nbytes, 0)
+            ik = (mac or "").lower() if mac else dev.key
+            st = dev.iface_stats.get(ik)
+            if st is None:
+                if len(dev.iface_stats) >= 32:
+                    ik = dev.key
+                    st = dev.iface_stats.get(ik)
+                if st is None:
+                    st = dev.iface_stats[ik] = dict.fromkeys(
+                        IFACE_STAT_FIELDS, 0)
+                    st["first"] = when
+            st["last"] = when
             dev.last_traffic = when
             if direction == "sent":
                 dev.last_active = when
                 dev.packets += 1
                 dev.packets_out += 1
-                dev.bytes_up += max(nbytes, 0)
+                dev.bytes_up += nb
                 dev.protocols[proto] += 1
+                st["packets"] += 1
+                st["packets_out"] += 1
+                st["bytes_up"] += nb
             else:
                 dev.packets_in += 1
-                dev.bytes_down += max(nbytes, 0)
+                dev.bytes_down += nb
+                st["packets_in"] += 1
+                st["bytes_down"] += nb
             if internet:
-                dev.internet_bytes += max(nbytes, 0)
+                dev.internet_bytes += nb
+                st["internet_bytes"] += nb
             else:
-                dev.lan_bytes += max(nbytes, 0)
+                dev.lan_bytes += nb
+                st["lan_bytes"] += nb
         return dev
 
     def set_hostname(self, ip, name, source="rdns"):
@@ -5922,6 +5982,18 @@ class DeviceRegistry:
                     return True
         return False
 
+    @staticmethod
+    def same_client_id(a, b):
+        """Equal DHCP client identifiers — strong evidence, but only when
+        the identifier isn't simply derived from each MAC address."""
+        ca, cb = a.dhcp_client_id, b.dhcp_client_id
+        if not ca or ca != cb:
+            return False
+        for d in (a, b):
+            if d.mac and ca.endswith(d.mac.replace(":", "")):
+                return False
+        return True
+
     def can_pair(self, a, b):
         return not (a.key == b.key or a.pinned_no_merge or b.pinned_no_merge
                     or b.key in a.never_merge or a.key in b.never_merge
@@ -5954,6 +6026,17 @@ class DeviceRegistry:
                     dev.dhcp_vendor_class == other.dhcp_vendor_class:
                 pts += 10
                 reasons.append("their DHCP clients identify the same way")
+            if self.same_client_id(dev, other):
+                pts += 40
+                reasons.append("they sent the same DHCP client identifier")
+            elif dev.dhcp_params and dev.dhcp_params == other.dhcp_params:
+                pts += 10
+                reasons.append("they ask DHCP for the same options in the "
+                               "same order")
+            if dev.network_id and other.network_id and \
+                    dev.network_id != other.network_id:
+                pts -= 40
+                reasons.append("but they were seen on different networks")
             if self.overlapped(dev, other):
                 pts -= 60
                 reasons.append("but they were online at the same time")
@@ -5999,6 +6082,9 @@ class DeviceRegistry:
             if older.dhcp_vendor_class and newer.dhcp_vendor_class and \
                     older.dhcp_vendor_class != newer.dhcp_vendor_class:
                 continue
+            if older.network_id and newer.network_id and \
+                    older.network_id != newer.network_id:
+                continue                  # same name, different network
             self.merge(newer.key, older.key, auto=True,
                        reason=f"both announced the name “{name}”, "
                               f"at least one uses a private address, and "
@@ -6007,29 +6093,47 @@ class DeviceRegistry:
         return merged
 
     def merge(self, keep_key, other_key, auto=False, reason=""):
+        """Combine two identities. The absorbed key becomes an alias of the
+        kept one, and enough is recorded to split them apart EXACTLY later:
+        per-hardware-address counters, which labels were copied over, and
+        the absorbed identity's own history (including earlier merges)."""
+        keep_key, other_key = self.resolve(keep_key), self.resolve(other_key)
         keep = self.by_key.get(keep_key)
         other = self.by_key.get(other_key)
         if not keep or not other or keep is other:
             return None
-        snapshot = device_to_dict(other, include_history=False)
+        snapshot = device_to_dict(other, include_history=True)
+        keep_before = {f: getattr(keep, f) for f in _MERGE_COPIED}
+        absorbed = sorted(set(other.iface_stats) |
+                          ({other.mac} if other.mac else set()) |
+                          {other.key})
         keep.first_seen = min(keep.first_seen, other.first_seen)
         keep.last_seen = max(keep.last_seen, other.last_seen)
-        for f in ("packets", "packets_out", "packets_in", "bytes_up",
-                  "bytes_down", "lan_bytes", "internet_bytes"):
+        keep.last_confirmed = max(keep.last_confirmed, other.last_confirmed)
+        for f in IFACE_STAT_FIELDS:
             setattr(keep, f, getattr(keep, f) + getattr(other, f))
+        for ik, st in other.iface_stats.items():
+            mine = keep.iface_stats.get(ik)
+            if mine is None:
+                keep.iface_stats[ik] = dict(st)
+            else:
+                for f in IFACE_STAT_FIELDS:
+                    mine[f] = mine.get(f, 0) + st.get(f, 0)
+                mine["first"] = min(mine.get("first", 0) or 1e18,
+                                    st.get("first", 0) or 1e18)
+                mine["last"] = max(mine.get("last", 0), st.get("last", 0))
         keep.services |= other.services
         keep.websites |= other.websites
         keep.remote_ips |= other.remote_ips
         keep.ipv6 |= other.ipv6
         keep.ipv4s |= other.ipv4s
         keep.protocols.update(other.protocols)
-        for f in ("hostname", "dhcp_hostname", "mdns_name", "ssdp_name",
-                  "vendor", "alias", "notes", "model_hint",
-                  "dhcp_vendor_class", "ssdp_server"):
-            if not getattr(keep, f):
+        for f in _MERGE_COPIED:
+            if f in ("mine", "expected"):
+                setattr(keep, f, getattr(keep, f) or getattr(other, f))
+            elif not getattr(keep, f):
                 setattr(keep, f, getattr(other, f))
-        keep.mine = keep.mine or other.mine
-        keep.expected = keep.expected or other.expected
+        keep_after = {f: getattr(keep, f) for f in _MERGE_COPIED}
         keep.ip_history = sorted(keep.ip_history + other.ip_history,
                                  key=lambda h: h[1])[-20:]
         keep.mac_history = sorted(keep.mac_history + other.mac_history,
@@ -6050,6 +6154,9 @@ class DeviceRegistry:
         if other.ip and not keep.ip:
             keep.ip = other.ip
         del self.by_key[other_key]
+        self.alias[other_key] = keep.key
+        if not other.mac:
+            self.bindings.rename_owner(other.key, keep.key)
         self.removed.append(other_key)
         name = (keep.dhcp_hostname or keep.mdns_name or keep.hostname
                 or keep.display_name())
@@ -6057,7 +6164,8 @@ class DeviceRegistry:
         keep.merge_history.append({
             "key": other.key, "when": self.now(), "auto": bool(auto),
             "reason": reason or f"name “{name}”",
-            "snapshot": snapshot})
+            "snapshot": snapshot, "absorbed": absorbed,
+            "keep_before": keep_before, "keep_after": keep_after})
         keep.merge_note = (
             f"Merged with an earlier identity ({other.key}) "
             f"{'automatically' if auto else 'by you'}"
@@ -6067,33 +6175,341 @@ class DeviceRegistry:
         return keep
 
     def split(self, keep_key, index):
-        """Undo a merge: recreate the absorbed identity from the snapshot
-        taken at merge time. Traffic since the merge stays where it is."""
+        """Undo a merge exactly: the absorbed identity gets back its own
+        hardware addresses with every packet counted for them (also those
+        seen after the merge), its own names, and the addresses it still
+        holds. Labels that were only copied over by the merge are removed
+        from the kept device again (unless you changed them since)."""
+        keep_key = self.resolve(keep_key)
         keep = self.by_key.get(keep_key)
         if not keep or not (0 <= index < len(keep.merge_history)):
             return None
         entry = keep.merge_history.pop(index)
         snap = entry.get("snapshot") or {}
         restored = device_from_dict(snap)
+        orig_key = restored.key
         if restored.key in self.by_key:
             restored.key = restored.key + f"#split{int(self.now())}"
-        restored.state = STATE_INACTIVE
-        restored.presence_close(restored.last_confirmed)
-        for f in ("packets", "packets_out", "packets_in", "bytes_up",
-                  "bytes_down", "lan_bytes", "internet_bytes"):
-            setattr(keep, f, max(0, getattr(keep, f) -
-                                 getattr(restored, f)))
-        keep.never_merge.add(restored.key)
-        restored.never_merge.add(keep.key)
-        if restored.key in keep.merged_from:
-            keep.merged_from.remove(restored.key)
-        keep.merge_note = ""
-        self.by_key[restored.key] = restored
+        restored.live = keep.live
+        absorbed = entry.get("absorbed") or [orig_key]
+        moved = {ik: keep.iface_stats.pop(ik) for ik in absorbed
+                 if ik in keep.iface_stats}
+        if moved:
+            for f in IFACE_STAT_FIELDS:
+                n = sum(st.get(f, 0) for st in moved.values())
+                setattr(restored, f, n)
+                setattr(keep, f, max(0, getattr(keep, f) - n))
+            restored.iface_stats = moved
+        else:                       # merged before per-address counters
+            for f in IFACE_STAT_FIELDS:
+                setattr(keep, f, max(0, getattr(keep, f) -
+                                     getattr(restored, f)))
+        kb, ka = entry.get("keep_before") or {}, entry.get("keep_after") or {}
+        for f in _MERGE_COPIED:
+            if f in ka and f in kb and getattr(keep, f) == ka[f]:
+                setattr(keep, f, kb[f])
+        keep.mac_history = [h for h in keep.mac_history
+                            if h and h[0] not in absorbed]
+        for ak in absorbed:
+            if self.alias.get(ak) == keep.key:
+                self.alias.pop(ak, None)
+        if self.alias.get(orig_key) == keep.key:
+            self.alias.pop(orig_key, None)
+        if restored.key != orig_key:
+            self.alias[orig_key] = restored.key
+        held = set()
+        for ak in absorbed:
+            held.update(self.bindings.held_by(ak.lower()))
+        for ip in held:
+            if ip in keep.ipv4s or ip in keep.ipv6:
+                keep.ipv4s.discard(ip)
+                keep.ipv6.discard(ip)
+                if ":" in ip:
+                    restored.ipv6.add(ip)
+                else:
+                    restored.ipv4s.add(ip)
+                    restored.ip = ip
+                self.ip_to_key[ip] = restored.key
+                if keep.ip == ip:
+                    keep.ip = next((a for a in sorted(keep.ipv4s)), "")
         for ip in restored.ipv4s | restored.ipv6:
             if ip not in keep.ipv4s and ip not in keep.ipv6:
                 self.ip_to_key.setdefault(ip, restored.key)
+        last = max([st.get("last", 0) for st in moved.values()] or
+                   [restored.last_confirmed])
+        restored.last_confirmed = max(restored.last_confirmed, last)
+        restored.last_seen = max(restored.last_seen, last)
+        idle_after = self.config.get("devices.idle_minutes", 2) * 60
+        if self.now() - restored.last_confirmed < idle_after:
+            restored.state = STATE_ACTIVE
+        else:
+            restored.state = STATE_INACTIVE
+            restored.presence_close(restored.last_confirmed)
+        keep.never_merge.add(restored.key)
+        restored.never_merge.add(keep.key)
+        if orig_key in keep.merged_from:
+            keep.merged_from.remove(orig_key)
+        keep.merge_note = ""
+        keep.recompute_score()
+        self.by_key[restored.key] = restored
         self.created.append(restored.key)
         return restored
+
+
+# ============================================================================
+#  7b.  Identity over time — address bindings, corrections, networks
+#
+#  • BindingTable: which hardware address held an IP, from when to when.
+#    An address moving from the printer to a laptop closes one binding and
+#    opens another, so histories never mix.
+#  • CorrectionJournal: everything YOU change about identities (rename,
+#    merge, split, never-merge, flags) is an undoable journal entry.
+#  • NetworkProfiles: each network you use (router MAC + subnet, SSID when
+#    known) is remembered separately. A network seen for the first time
+#    starts in Quiet Mode until you say it's yours.
+# ============================================================================
+class BindingTable:
+    """IP ↔ hardware address over time (bounded)."""
+
+    MAX_PER_IP = 12
+
+    def __init__(self):
+        self.by_ip = {}           # ip -> list[[owner, start, end|None, src]]
+        self.conflicts = deque(maxlen=200)
+
+    def bind(self, ip, owner, ts, source="traffic", lease=None):
+        """Record that `owner` (a MAC, or a device key) holds `ip` at `ts`.
+        Returns the previous owner if the address changed hands."""
+        if not ip or not owner:
+            return None
+        lst = self.by_ip.get(ip)
+        if lst is None:
+            lst = self.by_ip[ip] = []
+        cur = lst[-1] if lst else None
+        if cur is not None and cur[2] is None and cur[0] == owner:
+            if source in ("dhcp", "arp") and cur[3] not in ("dhcp",):
+                cur[3] = source
+            return None
+        prev = None
+        if cur is not None and cur[2] is None:
+            prev = cur[0]
+            # two owners within a few seconds both claiming it = conflict
+            if ts - cur[1] < 5 and source != "dhcp":
+                self.conflicts.append((ip, prev, owner, ts))
+            cur[2] = ts
+        lst.append([owner, ts, None, source])
+        if len(lst) > self.MAX_PER_IP:
+            del lst[:-self.MAX_PER_IP]
+        if len(self.by_ip) > 100000:
+            for k in list(self.by_ip)[:10000]:
+                self.by_ip.pop(k, None)
+        return prev
+
+    def owner_at(self, ip, ts):
+        for owner, start, end, _src in reversed(self.by_ip.get(ip, ())):
+            if start <= ts and (end is None or ts < end):
+                return owner
+        return None
+
+    def history(self, ip):
+        return [tuple(b) for b in self.by_ip.get(ip, ())]
+
+    def held_by(self, owner):
+        """Addresses currently bound to `owner`."""
+        return [ip for ip, lst in self.by_ip.items()
+                if lst and lst[-1][0] == owner and lst[-1][2] is None]
+
+    def rename_owner(self, old, new):
+        for lst in self.by_ip.values():
+            for b in lst:
+                if b[0] == old:
+                    b[0] = new
+
+    def to_list(self, limit=5000):
+        out = []
+        for ip, lst in list(self.by_ip.items())[-limit:]:
+            out.append([ip, [list(b) for b in lst]])
+        return out
+
+    def load(self, data):
+        for item in data or []:
+            if isinstance(item, list) and len(item) == 2 and \
+                    isinstance(item[1], list):
+                self.by_ip[str(item[0])] = [
+                    [str(b[0]), float(b[1]), None if b[2] is None
+                     else float(b[2]), str(b[3])]
+                    for b in item[1] if isinstance(b, list) and len(b) == 4]
+
+
+class CorrectionJournal:
+    """Append-only list of user corrections, each undoable."""
+
+    def __init__(self):
+        self.entries = []          # dicts: id, op, payload, ts, undone
+        self._next = 1
+
+    def add(self, op, payload, ts=None):
+        e = {"id": self._next, "op": op, "payload": payload,
+             "ts": ts or time.time(), "undone": False}
+        self._next += 1
+        self.entries.append(e)
+        if len(self.entries) > 500:
+            del self.entries[:-500]
+        return e
+
+    def last_undoable(self):
+        for e in reversed(self.entries):
+            if not e["undone"]:
+                return e
+        return None
+
+    def get(self, eid):
+        for e in self.entries:
+            if e["id"] == eid:
+                return e
+        return None
+
+    def describe(self, e, namer=lambda k: k):
+        p = e["payload"]
+        op = e["op"]
+        if op == "rename":
+            return (f"Renamed {namer(p['key'])}: “{p['old'] or '(detected)'}"
+                    f"” → “{p['new'] or '(detected)'}”")
+        if op == "merge":
+            return f"Merged {p['other']} into {namer(p['keep'])}"
+        if op == "split":
+            return f"Split {p['restored']} out of {namer(p['keep'])}"
+        if op == "flag":
+            return (f"{namer(p['key'])}: {p['flag'].replace('_', ' ')} → "
+                    f"{'on' if p['new'] else 'off'}")
+        if op == "note":
+            return f"Edited the note on {namer(p['key'])}"
+        if op == "never_merge":
+            return f"Never merge {namer(p['a'])} and {namer(p['b'])}"
+        return op
+
+    def to_list(self):
+        return [dict(e) for e in self.entries[-200:]]
+
+
+def network_fingerprint(router_mac, subnet):
+    """Stable id for 'this network': router hardware address + subnet."""
+    raw = f"{(router_mac or '').lower()}|{subnet or ''}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+def current_ssid():
+    """Name of the Wi-Fi network this computer is on, if the OS tells us
+    without extra permissions ('' when unknown or on cable)."""
+    cmds = []
+    if IS_WINDOWS:
+        cmds.append((["netsh", "wlan", "show", "interfaces"],
+                     r"^\s*SSID\s*:\s*(.+)$"))
+    elif IS_MAC:
+        cmds.append((["/System/Library/PrivateFrameworks/Apple80211."
+                      "framework/Versions/Current/Resources/airport", "-I"],
+                     r"^\s*SSID:\s*(.+)$"))
+        cmds.append((["networksetup", "-getairportnetwork", "en0"],
+                     r"Current Wi-Fi Network:\s*(.+)$"))
+    else:
+        cmds.append((["iwgetid", "-r"], r"^(.+)$"))
+        cmds.append((["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
+                     r"^yes:(.+)$"))
+    for cmd, pat in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=6, creationflags=getattr(
+                                   subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for line in (r.stdout or "").splitlines():
+            m = re.match(pat, line.strip() if pat.startswith("^(") else line)
+            if m and m.group(1).strip() and "BSSID" not in line:
+                return sanitize_text(m.group(1).strip(), 64)
+    return ""
+
+
+def os_neighbor_mac(ip):
+    """The OS's own ARP/neighbour cache entry for `ip` (no traffic sent)."""
+    if not ip:
+        return ""
+    cmds = ([["arp", "-a", ip]] if IS_WINDOWS else
+            [["ip", "neigh", "show", ip], ["arp", "-n", ip]])
+    for cmd in cmds:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=5, creationflags=getattr(
+                                   subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError):
+            continue
+        m = re.search(r"([0-9a-fA-F]{2}([:-])(?:[0-9a-fA-F]{2}\2){4}"
+                      r"[0-9a-fA-F]{2})", r.stdout or "")
+        if m:
+            mac = m.group(1).replace("-", ":").lower()
+            if is_unicast_mac(mac):
+                return mac
+    return ""
+
+
+class NetworkProfiles:
+    """Remembered networks and whether you trust each for active probes."""
+
+    def __init__(self, path):
+        self.path = path
+        existed = os.path.exists(path)
+        self.data = read_json(path, {}) if existed else {}
+        if not isinstance(self.data, dict):
+            self.data = {}
+        self.data.setdefault("networks", {})
+        self.fresh_install = not existed
+
+    def get(self, fp):
+        return self.data["networks"].get(fp)
+
+    def all(self):
+        return sorted(self.data["networks"].items(),
+                      key=lambda kv: -kv[1].get("last_seen", 0))
+
+    def seen(self, fp, router_mac, subnet, ssid, now=None):
+        """Note that we're on network `fp`. Returns (profile, is_new)."""
+        now = now or time.time()
+        nets = self.data["networks"]
+        prof = nets.get(fp)
+        new = prof is None
+        if new:
+            name = ssid or (f"Network {subnet}" if subnet else "This network")
+            prof = nets[fp] = {"name": name, "first_seen": now,
+                               "router_mac": router_mac, "subnet": subnet,
+                               "ssid": ssid, "trusted": False,
+                               "visits": 0}
+        prof["last_seen"] = now
+        prof["visits"] = int(prof.get("visits", 0)) + 1
+        if ssid and not prof.get("ssid"):
+            prof["ssid"] = ssid
+        self.save()
+        return prof, new
+
+    def set_trusted(self, fp, trusted=True):
+        prof = self.get(fp)
+        if prof is not None:
+            prof["trusted"] = bool(trusted)
+            self.save()
+
+    def rename(self, fp, name):
+        prof = self.get(fp)
+        if prof is not None and name:
+            prof["name"] = sanitize_text(name, 60)
+            self.save()
+
+    def forget(self, fp):
+        if self.data["networks"].pop(fp, None) is not None:
+            self.save()
+
+    def save(self):
+        try:
+            atomic_write_json(self.path, self.data)
+        except OSError:
+            LOG.warning("could not save network profiles")
 
 
 # ============================================================================
@@ -7930,6 +8346,8 @@ class NetworkModel:
         self.tl_pending = []
         self.tie_pending = set()
         self._pkt_no = None
+        self.journal = CorrectionJournal()
+        self.network_id = ""
 
     # ---- evidence ------------------------------------------------------------
     def observe(self, kind, subject, ts, data=None, pkt=None, also=()):
@@ -7980,6 +8398,160 @@ class NetworkModel:
         if self.obs_sink:
             self.tie_pending.add((device, domain))
         self.dirty_websites.add(domain)
+
+    # ---- user corrections (undoable) ---------------------------------------
+    def _dev(self, key):
+        return self.registry.by_key.get(self.registry.resolve(key))
+
+    def correct_rename(self, key, name):
+        dev = self._dev(key)
+        if dev is None:
+            return []
+        name = sanitize_text(name or "", 60).strip()
+        if name == dev.alias:
+            return []
+        self.journal.add("rename", {"key": dev.key, "old": dev.alias,
+                                    "new": name})
+        dev.alias = name
+        if name:
+            _push_bounded(dev.hostname_history, [name, "user", self.now()],
+                          20)
+        self._dirty_dev(dev)
+        return [dev.key]
+
+    def correct_flag(self, key, flag, value=None):
+        dev = self._dev(key)
+        if dev is None or flag not in ("mine", "expected", "pinned_no_merge"):
+            return []
+        old = bool(getattr(dev, flag))
+        new = (not old) if value is None else bool(value)
+        if new == old:
+            return []
+        self.journal.add("flag", {"key": dev.key, "flag": flag, "old": old,
+                                  "new": new})
+        setattr(dev, flag, new)
+        self._dirty_dev(dev)
+        return [dev.key]
+
+    def correct_note(self, key, note):
+        dev = self._dev(key)
+        if dev is None:
+            return []
+        note = sanitize_text(note or "", 2000)
+        if note == dev.notes:
+            return []
+        self.journal.add("note", {"key": dev.key, "old": dev.notes,
+                                  "new": note})
+        dev.notes = note
+        return [dev.key]
+
+    def correct_merge(self, keep, other, reason="you merged them"):
+        reg = self.registry
+        keep, other = reg.resolve(keep), reg.resolve(other)
+        k = reg.merge(keep, other, auto=False, reason=reason)
+        if k is None:
+            return []
+        self.journal.add("merge", {"keep": k.key, "other": other})
+        self.dirty_devices.add(k.key)
+        self._classify_dirty.add(k.key)
+        self.push_timeline("identity merged", "INFO",
+                           f"{k.display_name()}: two identities combined "
+                           f"(by you)", ("device", k.key), k.key)
+        return [k.key]
+
+    def correct_split(self, keep, index):
+        reg = self.registry
+        keep = reg.resolve(keep)
+        dev = reg.by_key.get(keep)
+        if dev is None or not (0 <= index < len(dev.merge_history)):
+            return []
+        restored = reg.split(keep, index)
+        if restored is None:
+            return []
+        self.journal.add("split", {"keep": keep, "restored": restored.key})
+        return self._after_split(keep, restored)
+
+    def _after_split(self, keep, restored):
+        self.dirty_devices |= {keep, restored.key}
+        self._classify_dirty |= {keep, restored.key}
+        self.push_timeline("identity", "INFO",
+                           f"Split {restored.display_name()} back out of "
+                           f"{self._dev(keep).display_name()}",
+                           ("device", keep), keep)
+        return [keep, restored.key]
+
+    def correct_never_merge(self, a, b):
+        da, db = self._dev(a), self._dev(b)
+        if da is None or db is None or da is db:
+            return []
+        self.journal.add("never_merge", {"a": da.key, "b": db.key})
+        da.never_merge.add(db.key)
+        db.never_merge.add(da.key)
+        return [da.key, db.key]
+
+    def undo_correction(self, eid=None):
+        """Undo one correction (the latest by default). Returns the keys
+        of the devices it touched (for saving labels), or []."""
+        j = self.journal
+        e = j.get(eid) if eid is not None else j.last_undoable()
+        if e is None or e["undone"]:
+            return []
+        p = e["payload"]
+        reg = self.registry
+        out = []
+        if e["op"] == "rename":
+            dev = self._dev(p["key"])
+            if dev is not None:
+                dev.alias = p["old"]
+                out = [dev.key]
+        elif e["op"] in ("flag",):
+            dev = self._dev(p["key"])
+            if dev is not None:
+                setattr(dev, p["flag"], p["old"])
+                out = [dev.key]
+        elif e["op"] == "note":
+            dev = self._dev(p["key"])
+            if dev is not None:
+                dev.notes = p["old"]
+                out = [dev.key]
+        elif e["op"] == "merge":
+            keep = reg.resolve(p["keep"])
+            dev = reg.by_key.get(keep)
+            idx = next((i for i, m in enumerate(dev.merge_history)
+                        if m.get("key") == p["other"]), None) \
+                if dev is not None else None
+            if idx is None:
+                return []
+            restored = reg.split(keep, idx)
+            if restored is None:
+                return []
+            restored.never_merge.discard(keep)
+            dev.never_merge.discard(restored.key)
+            out = self._after_split(keep, restored)
+        elif e["op"] == "split":
+            keep = reg.resolve(p["keep"])
+            kd, rd = reg.by_key.get(keep), reg.by_key.get(
+                reg.resolve(p["restored"]))
+            if kd is None or rd is None:
+                return []
+            kd.never_merge.discard(rd.key)
+            rd.never_merge.discard(kd.key)
+            k = reg.merge(kd.key, rd.key, auto=False, reason="undo split")
+            if k is None:
+                return []
+            self.dirty_devices.add(k.key)
+            out = [k.key]
+        elif e["op"] == "never_merge":
+            da, db = self._dev(p["a"]), self._dev(p["b"])
+            if da is not None and db is not None:
+                da.never_merge.discard(db.key)
+                db.never_merge.discard(da.key)
+                out = [da.key, db.key]
+        e["undone"] = True
+        for k in out:
+            self.dirty_devices.add(k)
+            self._classify_dirty.add(k)
+        return out
 
     # ---- clock / identity --------------------------------------------------
     def now(self):
@@ -9225,6 +9797,7 @@ class NetworkModel:
 DEFAULT_SHORTCUTS = {
     "start": "<Control-r>", "stop": "<Control-period>",
     "clear": "<Control-l>", "export": "<Control-e>", "find": "<Control-f>",
+    "undo": "<Control-z>",
 }
 
 DEFAULT_FILTER_PRESETS = {
@@ -9244,7 +9817,8 @@ def _default_config():
         "config_version": CONFIG_SCHEMA_VERSION,
         "general": {"auto_start_capture": True, "confirm_before_clear": False,
                     "beginner_explanations": True,
-                    "explanation_verbosity": "Normal", "language": "English"},
+                    "explanation_verbosity": "Normal", "language": "English",
+                    "upgraded_from_3": False},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal"},
         "capture": {"max_stored_events": 5000, "promiscuous": True,
@@ -9473,6 +10047,10 @@ class SessionCodec:
             "health": {k: v for k, v in model.health.items()
                        if isinstance(v, (str, int, float, bool, type(None)))},
             "observations": [list(o) for o in list(model.obs_recent)[-3000:]],
+            "bindings": model.registry.bindings.to_list(3000),
+            "aliases": dict(list(model.registry.alias.items())[-2000:]),
+            "corrections": model.journal.to_list(),
+            "network_id": getattr(model, "network_id", ""),
         }
         return payload
 
@@ -9569,6 +10147,15 @@ class SessionCodec:
         vpn = sess.get("vpn")
         if isinstance(vpn, dict):
             model.vpn.update(vpn)
+        with contextlib.suppress(TypeError, ValueError, IndexError):
+            model.registry.bindings.load(payload.get("bindings"))
+        al = payload.get("aliases")
+        if isinstance(al, dict):
+            model.registry.alias.update(
+                {sanitize_text(k, 80): sanitize_text(v, 80)
+                 for k, v in list(al.items())[:5000]
+                 if isinstance(k, str) and isinstance(v, str)})
+        model.network_id = sanitize_text(payload.get("network_id", ""), 32)
         for o in (payload.get("observations") or [])[-3000:]:
             if isinstance(o, list) and len(o) == 6 and \
                     o[2] in OBS_KIND_CODES and isinstance(o[4], dict):
@@ -11055,6 +11642,8 @@ SETTINGS_PAGES = [
               "label": "Open the export menu"},
              {"key": "shortcuts.find", "type": "shortcut",
               "label": "Jump to search"},
+             {"key": "shortcuts.undo", "type": "shortcut",
+              "label": "Undo your last device change"},
          ]},
      ]},
     {"id": "data", "icon": "\U0001F4BE", "title": "Data & Export",
@@ -15695,6 +16284,14 @@ class MiniWireshark:
         self.data.on_change = lambda: self._async_results.put(
             self._on_data_changed)
         self.known = KnownDevicesStore(PATHS.known_devices)
+        self.networks = NetworkProfiles(PATHS.networks)
+        self.network_fp = ""
+        self.network_profile = None
+        if self.networks.fresh_install and \
+                os.path.exists(self.config.path):
+            # first 4.0 start on a computer that already ran 3.0: the network
+            # it is on now keeps the Active Scanning the user had chosen
+            self.config.set("general.upgraded_from_3", True)
         self.session_id = int(time.time())
         self.history = self._open_store() \
             if self.config.get("history.enabled", False) else None
@@ -16032,6 +16629,11 @@ class MiniWireshark:
         menu.add_command(label="Run self-test",
                          command=self.run_self_test_window)
         menu.add_separator()
+        menu.add_command(label="Your networks…",
+                         command=self.open_networks_dialog)
+        menu.add_command(label="Your device corrections (undo)…",
+                         command=self.open_corrections)
+        menu.add_separator()
         menu.add_command(label="Check for updates",
                          command=lambda: self._check_for_updates(True))
         menu.add_command(label="Open data folder",
@@ -16057,23 +16659,43 @@ class MiniWireshark:
             self.banner_lbl.config(bg=bg, fg=fg, text=text)
 
     def _restyle_mode_banner(self):
+        """Always truthful: says whether anything is being SENT right now
+        and, on a network you haven't trusted, why not."""
         if not hasattr(self, "mode_banner"):
             return
         t = self.theme
-        active = self.config.get("mode.active_scanning", True)
-        if active:
+        wanted = self.config.get("mode.active_scanning", True)
+        live = self.data_mode == "live"
+        prof = getattr(self, "network_profile", None)
+        name = prof.get("name", "") if prof else ""
+        cmd = self._toggle_active_scanning
+        if wanted and live and prof is None:
+            bg, fg = t["mode_quiet_bg"], t["mode_quiet_fg"]
+            text = (tr("mode_quiet") + "  Checking which network this is "
+                    "before sending anything…")
+            btn_text = "Stay in Quiet Mode"
+        elif wanted and prof is not None and not prof.get("trusted"):
+            bg, fg = t["mode_quiet_bg"], t["mode_quiet_fg"]
+            text = (f"\U0001F535 QUIET MODE — “{name}” is a network you "
+                    f"haven't marked as yours, so MiniWireshark is only "
+                    f"listening and sends nothing.")
+            btn_text = "Trust this network"
+            cmd = self.trust_network
+        elif wanted:
             bg, fg = t["mode_active_bg"], t["mode_active_fg"]
-            text = tr("mode_active")
+            text = tr("mode_active") + (f"  Network: {name}." if name
+                                        else "")
             btn_text = "Switch to Quiet Mode"
+            if not live:
+                text += ("  (Nothing is being sent right now: not capturing "
+                         "live.)")
         else:
             bg, fg = t["mode_quiet_bg"], t["mode_quiet_fg"]
-            text = tr("mode_quiet")
+            text = tr("mode_quiet") + (f"  Network: {name}." if name else "")
             btn_text = "Switch to Active Scanning"
-        if active and self.data_mode != "live":
-            text += "  (Nothing is being sent right now: not capturing live.)"
         self.mode_banner.configure(bg=bg)
         self.mode_lbl.configure(bg=bg, fg=fg, text=text)
-        self.mode_toggle_btn.configure(text=btn_text)
+        self.mode_toggle_btn.configure(text=btn_text, command=cmd)
         self._restyle_data_banner()
 
     def _restyle_data_banner(self):
@@ -16093,8 +16715,280 @@ class MiniWireshark:
                                 else "Return to live capture")
         self.data_banner.pack(fill="x", after=self.mode_banner)
 
+    # ---- networks and consent (section 7b) ---------------------------------------
+    def active_mode(self):
+        """True only when you allow active probes AND the current network
+        is one you've said is yours. A network seen for the first time
+        starts quiet."""
+        if not self.config.get("mode.active_scanning", True):
+            return False
+        prof = self.network_profile
+        return bool(prof and prof.get("trusted"))
+
+    def network_name(self):
+        prof = self.network_profile
+        return prof.get("name", "") if prof else ""
+
+    def _identify_network_async(self, attempt=0):
+        if self.data_mode != "live":
+            return
+        gw = self.model.gateway_ip
+        nets = [n for n in self.model.local_nets if n.version == 4]
+        my_ip = next(iter(sorted(self.real_identity[1])), "")
+        subnet = ""
+        if nets:
+            subnet = str(nets[0])
+        elif my_ip:
+            subnet = str(ipaddress.ip_network(f"{my_ip}/24", strict=False))
+        seen_gw_mac = ""
+        gdev = self.model.registry.by_key.get(
+            self.model.registry.ip_to_key.get(gw, "")) if gw else None
+        if gdev is not None and gdev.mac:
+            seen_gw_mac = gdev.mac
+
+        def work():
+            mac = seen_gw_mac or os_neighbor_mac(gw)
+            ssid = current_ssid()
+            self._async_results.put(lambda: self._on_network_known(
+                mac, subnet, ssid, attempt))
+        threading.Thread(target=work, daemon=True,
+                         name="network-id").start()
+
+    def _on_network_known(self, router_mac, subnet, ssid, attempt):
+        if self.data_mode != "live":
+            return
+        if not router_mac and attempt < 6:
+            # the router hasn't spoken yet; listen a little longer
+            self.root.after(10000, lambda: self._identify_network_async(
+                attempt + 1))
+            return
+        fp = network_fingerprint(router_mac or "unknown", subnet)
+        first_ever = self.networks.fresh_install and \
+            not self.networks.data["networks"]
+        prof, new = self.networks.seen(fp, router_mac, subnet, ssid)
+        auto_trusted = False
+        if new and first_ever and self.config.get("mode.active_scanning",
+                                                  True) and \
+                self.config.get("general.upgraded_from_3", False):
+            # you used Active Scanning on this computer before 4.0
+            self.networks.set_trusted(fp, True)
+            auto_trusted = True
+        changed = fp != self.network_fp
+        self.network_fp = fp
+        self.network_profile = self.networks.get(fp)
+        self.model.registry.network_id = fp
+        self.model.network_id = fp
+        for dev in self.model.registry.by_key.values():
+            if dev.live and not dev.network_id:
+                dev.network_id = fp
+        if changed:
+            name = self.network_name()
+            if new and not auto_trusted:
+                self.model.push_timeline(
+                    "network", "INFO", f"New network: {name} — Quiet Mode "
+                    f"until you say it's yours")
+                self._set_banner(
+                    f"\U0001F6E1  This looks like a network I haven't seen "
+                    f"before (“{name}”). I'm only listening. If it's your "
+                    f"own network, click “Trust this network” above to let "
+                    f"me look for quiet devices too.", kind="warn")
+            else:
+                self.model.push_timeline("network", "INFO",
+                                         f"You are on {name}")
+                if auto_trusted:
+                    self._set_banner(
+                        f"\U0001F3E0  I remembered “{name}” as your own "
+                        f"network (Active Scanning was on before). New "
+                        f"networks will start in Quiet Mode.")
+        self._restyle_mode_banner()
+        if self.active_mode():
+            self._start_lan_scanner()
+        else:
+            self._stop_lan_scanner()
+
+    def trust_network(self, trusted=True, fp=None):
+        fp = fp or self.network_fp
+        if not fp:
+            return
+        self.networks.set_trusted(fp, trusted)
+        if fp == self.network_fp:
+            self.network_profile = self.networks.get(fp)
+            if trusted and not self.config.get("mode.active_scanning",
+                                               True):
+                self.config.set("mode.active_scanning", True)
+                self.config.save()
+            self.model.push_timeline(
+                "network", "INFO", f"{self.network_name()} marked as "
+                f"{'your network (active scanning allowed)' if trusted else 'not trusted (quiet)'}")
+            self._restyle_mode_banner()
+            if self.active_mode():
+                self._start_lan_scanner()
+                if self.prober:
+                    self.prober.run_now.set()
+            else:
+                self._stop_lan_scanner()
+
+    def _stop_lan_scanner(self):
+        if self.lan_scanner is not None:
+            self.lan_scanner.stop_flag = True
+            self.lan_scanner = None
+
+    def open_networks_dialog(self, parent=None):
+        win = tk.Toplevel(parent or self.root)
+        win.title("Your networks")
+        win.geometry("720x380")
+        win.transient(parent or self.root)
+        t = self.theme
+        win.configure(bg=t["card_bg"])
+        tk.Label(win, text="Networks MiniWireshark has seen. Active scanning "
+                           "(discovery probes and health checks) only runs on "
+                           "networks you trust.", bg=t["card_bg"],
+                 fg=t["text_fg"], wraplength=680, justify="left",
+                 anchor="w").pack(fill="x", padx=12, pady=(10, 4))
+        wrap, tree = make_tree(win, [
+            ("name", "Name", 200, "w", True),
+            ("trusted", "Trusted", 80, "center", False),
+            ("subnet", "Subnet", 130, "w", False),
+            ("router", "Router MAC", 140, "w", False),
+            ("last", "Last seen", 120, "w", False)], bg=t["card_bg"])
+        wrap.pack(fill="both", expand=True, padx=12, pady=4)
+        rows = IidMap()
+
+        def fill():
+            tree.delete(*tree.get_children())
+            rows.clear()
+            for fp, p in self.networks.all():
+                here = " (here)" if fp == self.network_fp else ""
+                rows[fp] = tree.insert("", "end", values=(
+                    p.get("name", "?") + here,
+                    "✔ yes" if p.get("trusted") else "✖ no",
+                    p.get("subnet", ""), p.get("router_mac", ""),
+                    fmt_clock(p.get("last_seen", 0), True)))
+
+        def sel():
+            s = tree.selection()
+            return key_for_iid(rows, s[0]) if s else None
+
+        def toggle():
+            fp = sel()
+            if fp:
+                p = self.networks.get(fp)
+                self.trust_network(not p.get("trusted"), fp)
+                fill()
+
+        def rename():
+            fp = sel()
+            if fp:
+                name = ask_text(self, "Rename network", "Name:",
+                                self.networks.get(fp).get("name", ""),
+                                parent=win)
+                if name:
+                    self.networks.rename(fp, name)
+                    if fp == self.network_fp:
+                        self.network_profile = self.networks.get(fp)
+                        self._restyle_mode_banner()
+                    fill()
+
+        def forget():
+            fp = sel()
+            if fp and fp != self.network_fp and messagebox.askyesno(
+                    "Forget network", "Forget this network? If you join it "
+                    "again it starts in Quiet Mode.", parent=win):
+                self.networks.forget(fp)
+                fill()
+        bar = tk.Frame(win, bg=t["card_bg"])
+        bar.pack(fill="x", padx=12, pady=(4, 10))
+        ttk.Button(bar, text="Trust / untrust", command=toggle).pack(
+            side="left")
+        ttk.Button(bar, text="Rename…", command=rename).pack(side="left",
+                                                             padx=6)
+        ttk.Button(bar, text="Forget", command=forget).pack(side="left")
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        fill()
+        return win
+
+    # ---- corrections (undoable) ---------------------------------------------------
+    def _apply_correction_result(self, keys, banner=""):
+        for k in keys:
+            dev = self.model.registry.by_key.get(k)
+            if dev is not None and dev.live:
+                self._labels_changed(dev)
+            else:
+                self.model.dirty_devices.add(k)
+        if keys:
+            self.tabs["devices"].rebuild()
+        if banner and keys:
+            self._set_banner(banner)
+
+    def undo_last_correction(self, _e=None):
+        e = self.model.journal.last_undoable()
+        if e is None:
+            self._set_banner("Nothing to undo — you haven't changed any "
+                             "device identities in this session.")
+            return
+        what = self.model.journal.describe(e, self.short_device_name)
+        keys = self.model.undo_correction(e["id"])
+        self._apply_correction_result(keys, f"↶  Undone: {what}")
+        if not keys:
+            self._set_banner(f"Couldn't undo “{what}” (the devices "
+                             f"involved changed since).", kind="warn")
+
+    def open_corrections(self, parent=None):
+        win = tk.Toplevel(parent or self.root)
+        win.title("Your identity corrections")
+        win.geometry("760x380")
+        t = self.theme
+        win.configure(bg=t["card_bg"])
+        tk.Label(win, text="Everything you changed about device identities "
+                           "in this session. Undo any of them; the packets "
+                           "and observations themselves are never changed.",
+                 bg=t["card_bg"], fg=t["text_fg"], wraplength=720,
+                 justify="left", anchor="w").pack(fill="x", padx=12,
+                                                  pady=(10, 4))
+        wrap, tree = make_tree(win, [
+            ("when", "When", 90, "center", False),
+            ("what", "What", 520, "w", True),
+            ("state", "State", 90, "center", False)], bg=t["card_bg"])
+        wrap.pack(fill="both", expand=True, padx=12, pady=4)
+        rows = IidMap()
+
+        def fill():
+            tree.delete(*tree.get_children())
+            rows.clear()
+            for e in reversed(self.model.journal.entries):
+                rows[e["id"]] = tree.insert("", "end", values=(
+                    fmt_clock(e["ts"]),
+                    self.model.journal.describe(e, self.short_device_name),
+                    "undone" if e["undone"] else "active"))
+
+        def undo():
+            s = tree.selection()
+            eid = key_for_iid(rows, s[0]) if s else None
+            if eid is None:
+                return
+            keys = self.model.undo_correction(eid)
+            self._apply_correction_result(keys, "↶  Undone.")
+            fill()
+        bar = tk.Frame(win, bg=t["card_bg"])
+        bar.pack(fill="x", padx=12, pady=(4, 10))
+        ttk.Button(bar, text="Undo selected", command=undo).pack(side="left")
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        fill()
+        return win
+
     def _toggle_active_scanning(self):
         cur = self.config.get("mode.active_scanning", True)
+        prof = self.network_profile
+        if not cur and prof is not None and not prof.get("trusted"):
+            if messagebox.askyesno(
+                    "Active scanning", f"Is “{prof.get('name')}” your own "
+                    f"network? Active scanning sends small discovery "
+                    f"probes and health checks, so only use it on networks "
+                    f"you own or manage.", parent=self.root):
+                self.networks.set_trusted(self.network_fp, True)
+                self.network_profile = self.networks.get(self.network_fp)
+            else:
+                return
         self.config.set("mode.active_scanning", not cur)
         self.config.save()
         self._restyle_mode_banner()
@@ -16432,6 +17326,7 @@ class MiniWireshark:
             "clear": lambda e=None: self.clear(),
             "export": lambda e=None: self._open_export_menu(),
             "find": self._focus_search,
+            "undo": self._undo_shortcut,
         }
         shortcuts = self.config.data.get("shortcuts", DEFAULT_SHORTCUTS)
         for name, seq in shortcuts.items():
@@ -16443,6 +17338,14 @@ class MiniWireshark:
                 self._bound_shortcuts.append(seq)
             except tk.TclError:
                 pass
+
+    def _undo_shortcut(self, event=None):
+        # in text fields Ctrl+Z belongs to the field
+        w = getattr(event, "widget", None)
+        if isinstance(w, (tk.Entry, ttk.Entry, tk.Text)):
+            return None
+        self.undo_last_correction()
+        return "break"
 
     def _capture_shortcut(self, parent, name, display_var):
         win = tk.Toplevel(parent)
@@ -16654,7 +17557,7 @@ class MiniWireshark:
     def on_rows_analysed(self, rows):
         """Called by the analysis worker (holding the gate) per slice."""
         if self.rdns is not None and self.data_mode == "live" and \
-                self.config.get("mode.active_scanning", True):
+                self.active_mode():
             cache = self.model.cache
             for d in rows:
                 for ip in (d["src_ip"], d["dst_ip"]):
@@ -16711,6 +17614,9 @@ class MiniWireshark:
                                            is_vpn_iface(iface_obj)) else ""
         self.data_mode = "live"
         self.model.obs_sink = self._history_live()
+        if self.network_fp:
+            self.model.registry.network_id = self.network_fp
+        self.root.after(1500, self._identify_network_async)
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self._start_lan_scanner()
@@ -16744,7 +17650,7 @@ class MiniWireshark:
 
     def _start_lan_scanner(self):
         if self.lan_scanner is not None or self.data_mode != "live" or \
-                not self.config.get("mode.active_scanning", True):
+                not self.active_mode():
             return
         iface_obj = self.iface_map.get(self.current_iface_label)
         my_ip = _iface_ip(iface_obj) if iface_obj is not None else ""
@@ -17115,8 +18021,7 @@ class MiniWireshark:
     #  Health
     # ======================================================================
     def health_checks_allowed(self):
-        return (self.data_mode == "live" and
-                self.config.get("mode.active_scanning", True) and
+        return (self.data_mode == "live" and self.active_mode() and
                 self.config.get("health.active_checks", True))
 
     def _dns_target(self):
@@ -17170,6 +18075,11 @@ class MiniWireshark:
                     f"{'demo data' if self.data_mode == 'demo' else 'saved data'}"
                     " — active checks don't run on data that isn't "
                     "live.")
+        if self.config.get("mode.active_scanning", True) and \
+                not self.active_mode():
+            return ("This network isn't marked as yours yet, so no test "
+                    "traffic is sent. Click “Trust this network” in the "
+                    "banner above if it's your own network.")
         if not self.config.get("mode.active_scanning", True):
             return ("Quiet Mode: no test traffic is sent, so router/Internet "
                     "checks show what passive listening can tell. Switch to "
@@ -17545,6 +18455,8 @@ class MiniWireshark:
             ("Merge with…", lambda: self.merge_with_ui(k)),
             ("Allow merging" if dev.pinned_no_merge else "Never merge this "
              "device", lambda: self.toggle_flag(k, "pinned_no_merge")),
+            ("Undo my last change", self.undo_last_correction,
+             self.model.journal.last_undoable() is not None),
             ("Export device report…", lambda: self.export_report(
                 "device", k)),
         ]
@@ -17567,11 +18479,7 @@ class MiniWireshark:
                         f"the detected name):", dev.alias, parent=parent)
         if name is None:
             return
-        dev.alias = name.strip()[:60]
-        if dev.alias:
-            _push_bounded(dev.hostname_history,
-                          [dev.alias, "user", time.time()], 20)
-        self._labels_changed(dev)
+        self._apply_correction_result(self.model.correct_rename(key, name))
 
     def edit_note(self, key, parent=None):
         dev = self.model.registry.by_key.get(key)
@@ -17581,15 +18489,11 @@ class MiniWireshark:
                         "computer):", dev.notes, multiline=True,
                         parent=parent)
         if note is not None:
-            dev.notes = note[:2000]
-            self._labels_changed(dev)
+            self._apply_correction_result(self.model.correct_note(key,
+                                                                  note))
 
     def toggle_flag(self, key, flag):
-        dev = self.model.registry.by_key.get(key)
-        if not dev:
-            return
-        setattr(dev, flag, not getattr(dev, flag))
-        self._labels_changed(dev)
+        self._apply_correction_result(self.model.correct_flag(key, flag))
 
     def merge_with_ui(self, key, parent=None):
         dev = self.model.registry.by_key.get(key)
@@ -17640,25 +18544,18 @@ class MiniWireshark:
                 parent=parent or self.root):
             return
         keep, other = (a, b) if da.last_seen >= db.last_seen else (b, a)
-        reg.merge(keep, other, auto=False, reason="you merged them")
-        self.model.dirty_devices.add(keep)
-        self.model.push_timeline("identity merged", "INFO",
-                                 f"{self.short_device_name(keep)}: two "
-                                 f"identities combined (by you)",
-                                 ("device", keep), keep)
-        self._labels_changed(reg.by_key[keep])
-        self._set_banner(f"\U0001F517  Merged into "
-                         f"{self.short_device_name(keep)}.")
+        keys = self.model.correct_merge(keep, other)
+        if keys:
+            self.known.forget(other)
+            self._apply_correction_result(
+                keys, f"\U0001F517  Merged into "
+                f"{self.short_device_name(keys[0])}. (Ctrl+Z undoes it.)")
 
     def split_device(self, key, index, win=None):
-        restored = self.model.registry.split(key, index)
-        if restored:
-            self.model.dirty_devices |= {key, restored.key}
-            self.model.push_timeline("identity", "INFO",
-                                     f"Split {restored.display_name()} back "
-                                     f"out of {self.short_device_name(key)}",
-                                     ("device", key), key)
-            self._labels_changed(self.model.registry.by_key[key])
+        keys = self.model.correct_split(key, index)
+        if keys:
+            self._apply_correction_result(keys, "✂  Split. (Ctrl+Z undoes "
+                                          "it.)")
             if win is not None:
                 with contextlib.suppress(tk.TclError):
                     win.destroy()
@@ -18748,9 +19645,8 @@ class MiniWireshark:
         self._restyle_mode_banner()
         if self.lan_scanner is None:
             self._start_lan_scanner()
-        elif not cfg.get("mode.active_scanning", True):
-            self.lan_scanner.stop_flag = True
-            self.lan_scanner = None
+        elif not self.active_mode():
+            self._stop_lan_scanner()
         dt = self.tabs["devices"]
         dt.show_inactive_var.set(cfg.get("devices.show_inactive", False))
         dt.show_expired_var.set(cfg.get("devices.show_expired", False))
@@ -19761,7 +20657,7 @@ class DiagnosticsWindow:
         threading.Thread(target=run, daemon=True, name="diag-test").start()
 
     def _quiet_ok(self):
-        if self.app.config.get("mode.active_scanning", True):
+        if self.app.active_mode():
             return True
         return messagebox.askyesno(
             "Quiet Mode", "Quiet Mode is on. This test sends a tiny amount of "
@@ -21514,7 +22410,7 @@ def run_pipeline(model, frames, timeout=60):
 @self_test()
 def t_reverse_dns_only_in_active_mode(ctx):
     src = inspect.getsource(MiniWireshark.on_rows_analysed)
-    assert "mode.active_scanning" in src
+    assert "self.active_mode()" in src
 
 
 @self_test()
@@ -21736,6 +22632,163 @@ def t_session_v3_keeps_evidence(ctx):
 
 BENCH_EXTRA.append(bench_store)
 
+@self_test()
+def t_ip_reuse_keeps_histories_apart(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    S = ScenarioBuilder
+    hist = m.registry.bindings.history(S.PRINTER[0])
+    owners = [h[0] for h in hist]
+    assert owners[:1] == [S.PRINTER[1]] and owners[-1] == S.LAPTOP[1], hist
+    assert hist[0][2] is not None and hist[-1][2] is None
+    t_mid = hist[0][1] + 1
+    assert m.registry.bindings.owner_at(S.PRINTER[0], t_mid) == S.PRINTER[1]
+    assert m.registry.bindings.owner_at(S.PRINTER[0], hist[-1][1] + 1) == \
+        S.LAPTOP[1]
+    pr = m.registry.by_key[S.PRINTER[1]]
+    lap = m.registry.by_key[S.LAPTOP[1]]
+    assert S.PRINTER[0] not in pr.ipv4s and lap.ip == S.PRINTER[0]
+    assert "www.example.com" in lap.websites and \
+        "www.example.com" not in pr.websites
+
+
+@self_test()
+def t_corrections_merge_split_undo_exact(ctx):
+    clk = _FakeClock()
+    reg = DeviceRegistry("", [], ctx.cfg(), clk)
+    m = NetworkModel(ctx.cfg(), now_fn=clk)
+    m.registry = reg
+    a = reg.note_traffic("192.168.1.30", "da:00:00:00:00:01", 100, "TLS",
+                         "sent", True)
+    reg._set_dhcp_hostname(a, "Alexs-Phone", clk.t)
+    clk.t += 50
+    b = reg.note_traffic("192.168.1.31", "da:00:00:00:00:02", 200, "TLS",
+                         "sent", True)
+    m.correct_rename(b.key, "Kitchen tablet")
+    keys = m.correct_merge(a.key, b.key)
+    assert keys == [a.key] and b.key not in reg.by_key
+    # traffic from the absorbed address lands on the kept device
+    clk.t += 10
+    d = reg.note_traffic(None, "da:00:00:00:00:02", 300, "TLS", "sent", True)
+    assert d is a and a.bytes_up == 600 and a.alias == "Kitchen tablet"
+    keys = m.undo_correction()            # undo the merge
+    nb = reg.by_key[b.key]
+    assert nb.bytes_up == 500 and a.bytes_up == 100, (nb.bytes_up,
+                                                      a.bytes_up)
+    assert a.alias == "" and nb.alias == "Kitchen tablet"
+    assert reg.resolve(b.key) == b.key
+    assert m.undo_correction() and nb.alias == ""          # undo rename
+    assert m.undo_correction() == []                       # nothing left
+
+
+@self_test(slow=True)
+def t_corrections_property(ctx):
+    """Random merge / split / undo sequences: every packet stays counted
+    exactly once and every hardware address belongs to one device."""
+    rng = random.Random(1234)
+    for trial in range(300):
+        clk = _FakeClock()
+        m = NetworkModel(ctx.cfg(), now_fn=clk)
+        reg = m.registry
+        macs = [f"da:00:00:00:{trial % 256:02x}:{i:02x}" for i in range(5)]
+        total = 0
+        for i, mac in enumerate(macs):
+            reg.note_traffic(f"10.0.{trial % 200}.{i + 2}", mac, 10 * (i + 1),
+                             "TCP", "sent", False)
+            total += 10 * (i + 1)
+        for _step in range(12):
+            op = rng.random()
+            keys = list(reg.by_key)
+            if op < 0.4 and len(keys) >= 2:
+                x, y = rng.sample(keys, 2)
+                m.correct_merge(x, y)
+            elif op < 0.65:
+                cands = [k for k in keys if reg.by_key[k].merge_history]
+                if cands:
+                    k = rng.choice(cands)
+                    m.correct_split(k, rng.randrange(
+                        len(reg.by_key[k].merge_history)))
+            elif op < 0.9:
+                m.undo_correction()
+            else:
+                mac = rng.choice(macs)
+                clk.t += 1
+                reg.note_traffic(None, mac, 7, "TCP", "sent", False)
+                total += 7
+            counted = sum(dv.bytes_up for dv in reg.by_key.values())
+            assert counted == total, (trial, counted, total)
+            owners = Counter(reg.resolve(mac) for mac in macs)
+            for mac in macs:
+                assert reg.resolve(mac) in reg.by_key, (trial, mac)
+            for dv in reg.by_key.values():
+                assert sum(st.get("bytes_up", 0) for st in
+                           dv.iface_stats.values()) == dv.bytes_up
+            assert sum(owners.values()) == len(macs)
+
+
+@self_test()
+def t_rotation_linker_client_id(ctx):
+    clk = _FakeClock()
+    reg = DeviceRegistry("", [], ctx.cfg(), clk)
+    a = reg.touch("192.168.1.40", "da:00:00:00:00:41", "mac_local", "x")
+    b = reg.touch("192.168.1.41", "da:00:00:00:00:42", "mac_local", "x")
+    for dv in (a, b):
+        dv.dhcp_hostname = "kitchen-ipad"
+        dv.dhcp_client_id = "ff00112233445566"
+    a.presence = [[clk.t - 900, clk.t - 800]]
+    b.presence = [[clk.t - 100, None]]
+    c = reg.merge_candidates(b)
+    assert c and any("client identifier" in r for r in c[0][2]), c
+    a.dhcp_client_id = "01" + a.mac.replace(":", "")
+    b.dhcp_client_id = "01" + b.mac.replace(":", "")
+    assert not reg.same_client_id(a, b)        # MAC-derived: no evidence
+    a.network_id, b.network_id = "net1", "net2"
+    c = reg.merge_candidates(b)
+    assert not c or c[0][1] == "Low"
+
+
+@self_test()
+def t_network_profiles_and_consent(ctx):
+    np_ = NetworkProfiles(ctx.path("nets.json"))
+    assert np_.fresh_install
+    fp = network_fingerprint("00:1e:58:aa:00:01", "192.168.1.0/24")
+    assert fp == network_fingerprint("00:1E:58:AA:00:01", "192.168.1.0/24")
+    assert fp != network_fingerprint("00:1e:58:aa:00:01", "10.0.0.0/24")
+    prof, new = np_.seen(fp, "00:1e:58:aa:00:01", "192.168.1.0/24", "Home")
+    assert new and not prof["trusted"] and prof["name"] == "Home"
+    np_.set_trusted(fp, True)
+    again = NetworkProfiles(ctx.path("nets.json"))
+    assert not again.fresh_install and again.get(fp)["trusted"]
+    prof2, new2 = again.seen(fp, "00:1e:58:aa:00:01", "192.168.1.0/24", "")
+    assert not new2 and prof2["visits"] == 2
+
+    class FakeApp:
+        config = ctx.cfg({"mode.active_scanning": True})
+        network_profile = None
+    fa = FakeApp()
+    assert not MiniWireshark.active_mode(fa)          # unknown → quiet
+    fa.network_profile = {"trusted": False}
+    assert not MiniWireshark.active_mode(fa)          # new network → quiet
+    fa.network_profile = {"trusted": True}
+    assert MiniWireshark.active_mode(fa)
+    fa.config.set("mode.active_scanning", False)
+    assert not MiniWireshark.active_mode(fa)
+
+
+def _golden_identity(model):
+    S = ScenarioBuilder
+    ph = model.registry.by_key.get(S.PHONE[1])
+    if ph is None or not ph.dhcp_client_id:
+        return "phone DHCP client id not recorded"
+    if sum(st.get("bytes_up", 0) for st in ph.iface_stats.values()) != \
+            ph.bytes_up:
+        return "per-address counters disagree with device totals"
+    return None
+
+
+GOLDEN_EXTRA.append(_golden_identity)
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -21931,6 +22984,72 @@ def _gs_history(app, ctx):
     c2 = other.counts()
     other.stop(5)
     assert c2["observations"] >= c["observations"], (c, c2)
+    app.data_mode = "idle"
+
+
+@gui_test_step("network consent: new network is quiet until trusted")
+def _gs_consent(app, ctx):
+    root = app.root
+    app.stop()
+    app._leave_nonlive()
+    app.data_mode = "live"
+    app.config.set("mode.active_scanning", True)
+    first = app.networks.fresh_install and not app.networks.data["networks"]
+    if first and app.config.get("general.upgraded_from_3"):
+        # a 3.0 user's first network keeps Active Scanning
+        app._on_network_known("00:1e:58:aa:00:01", "192.168.1.0/24", "Home",
+                              0)
+        assert app.network_profile["trusted"] and app.active_mode()
+        app._stop_lan_scanner()
+    app._on_network_known("00:1e:58:aa:00:99", "10.9.9.0/24", "CafeWiFi", 0)
+    assert app.network_profile and not app.network_profile["trusted"]
+    assert not app.active_mode() and app.lan_scanner is None
+    assert "Trust this network" in str(app.mode_toggle_btn.cget("text"))
+    assert not app.health_checks_allowed()
+    app.trust_network(True)
+    assert app.active_mode()
+    w = app.open_networks_dialog()
+    _gui_pump(root, 0.2)
+    w.destroy()
+    app.trust_network(False)
+    assert not app.active_mode()
+    app._stop_lan_scanner()
+    app.data_mode = "idle"
+    app._restyle_mode_banner()
+
+
+@gui_test_step("corrections: rename, merge, undo from the window")
+def _gs_corrections(app, ctx):
+    root = app.root
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "live"
+    sink = app.lossless_sink()
+    for raw, _ts, lt in ctx.frames():
+        sink(raw, time.time(), lt)
+    _gui_pump(root, 0.3, lambda: not len(app.ring) and not app.worker.busy,
+              timeout=30)
+    S = ScenarioBuilder
+    reg = app.model.registry
+    tv, nas = S.TV[1], S.NAS[1]
+    app._apply_correction_result(app.model.correct_rename(tv, "Big TV"))
+    assert reg.by_key[tv].alias == "Big TV"
+    assert app.known.get(tv)["alias"] == "Big TV"
+    before = reg.by_key[tv].bytes_up + reg.by_key[nas].bytes_up
+    app.merge_devices_ui(tv, nas)
+    keep = reg.resolve(nas)
+    assert reg.resolve(tv) == reg.resolve(nas)
+    assert reg.by_key[keep].bytes_up == before
+    win = app.open_corrections()
+    _gui_pump(root, 0.2)
+    win.destroy()
+    app.undo_last_correction()
+    assert tv in reg.by_key and nas in reg.by_key
+    app.undo_last_correction()
+    assert reg.by_key[tv].alias == ""
+    assert not (app.known.get(tv) or {}).get("alias")
     app.data_mode = "idle"
 
 
