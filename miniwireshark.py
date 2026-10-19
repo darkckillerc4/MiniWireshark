@@ -93,7 +93,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 APP_NAME = "MiniWireshark"
 SCRIPT_VERSION = "3.0.0"
-SESSION_SCHEMA_VERSION = 2
+SESSION_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 2
 
 ELEVATED_FLAG = "--miniwireshark-elevated"
@@ -4969,6 +4969,7 @@ class DeviceRecord:
     model_hint: str = ""
     dhcp_vendor_class: str = ""
     dhcp_params: str = ""
+    dhcp_client_id: str = ""
     type: str = "unknown"
     type_hint: str = ""
     device_class: str = "Unknown"
@@ -6121,6 +6122,15 @@ class WebsiteRecord:
     category: str = ""
     category_source: str = ""
     live: bool = True
+    ties: dict = field(default_factory=dict)   # device -> [assoc, first, last, n]
+    lookups: int = 0
+
+    @property
+    def best_assoc(self):
+        best = ""
+        for t in self.ties.values():
+            best = better_assoc(t[0], best)
+        return best
 
     def encryption_text(self):
         if self.cleartext and self.encrypted:
@@ -6140,6 +6150,8 @@ def website_to_dict(rec):
             "devices": sorted(rec.devices)[:50],
             "countries": sorted(rec.countries), "asns": sorted(rec.asns),
             "encrypted": rec.encrypted, "cleartext": rec.cleartext,
+            "ties": {k: list(v) for k, v in list(rec.ties.items())[:200]},
+            "lookups": rec.lookups,
             "category": rec.category,
             "first_seen": rec.first_seen, "last_seen": rec.last_seen}
 
@@ -6162,6 +6174,14 @@ def website_from_dict(wd):
     rec.cleartext = int(wd.get("cleartext", 0) or 0)
     rec.category = wd.get("category", "") or ""
     rec.last_seen = float(wd.get("last_seen") or rec.first_seen)
+    ties = wd.get("ties") or {}
+    if isinstance(ties, dict):
+        for k, v in list(ties.items())[:200]:
+            if isinstance(v, list) and len(v) == 4 and v[0] in ASSOC_RANK:
+                with contextlib.suppress(TypeError, ValueError):
+                    rec.ties[sanitize_text(k, 80)] = [v[0], float(v[1]),
+                                                      float(v[2]), int(v[3])]
+    rec.lookups = int(wd.get("lookups", 0) or 0)
     if not rec.registrable:
         rec.registrable = registrable_domain(rec.domain)
     return rec
@@ -6265,7 +6285,7 @@ class FlowRecord:
                  "app", "service", "domain", "domain_conf", "tls_version",
                  "alpn", "encrypted", "interp_conf", "country", "asn", "org",
                  "closed", "note", "seq_out", "seq_in", "initiator",
-                 "cleartext", "live")
+                 "cleartext", "live", "assoc")
 
     def __init__(self, fid, key, transport, local_ip, local_port, remote_ip,
                  remote_port, ts):
@@ -6304,6 +6324,7 @@ class FlowRecord:
         self.initiator = "?"
         self.cleartext = ""
         self.live = True
+        self.assoc = ""
 
     @property
     def duration(self):
@@ -6385,6 +6406,7 @@ class FlowTable:
         self.total_flows = 0
         self.dirty = set()
         self.closed_now = []
+        self.closed_log = deque(maxlen=20000)     # for the history store
 
     def resize(self, max_active, archive_size):
         self.max_active = max(200, int(max_active))
@@ -6407,6 +6429,7 @@ class FlowTable:
             self.by_id.pop(old.fid, None)
         self.archive.append(f)
         self.closed_now.append(f)
+        self.closed_log.append(f)
         self.dirty.add(f.fid)
 
     def lookup_or_create(self, key, transport, lip, lport, rip, rport, ts):
@@ -7631,6 +7654,167 @@ class ScanTracker:
 
 
 # ============================================================================
+#  12b.  Evidence levels, observations and lookup correlation
+#
+#  Observations are facts with a source, a time and (when it came from a
+#  packet) the packet number; they are never edited. Everything a view
+#  shows is a CLAIM built from them and carries one of five levels:
+#
+#     ◉ Observed    seen directly in a packet from this device
+#     ◈ Reported    told to us by another system (router, Pi-hole…)
+#     ◎ Correlated  two separate observations line up (lookup → connect)
+#     ◌ Inferred    a reasonable guess with counter-explanations
+#     ?  Unknown    nothing either way — never shown as "no"
+# ============================================================================
+LV_OBSERVED, LV_REPORTED, LV_CORRELATED, LV_INFERRED, LV_UNKNOWN = \
+    "observed", "reported", "correlated", "inferred", "unknown"
+LEVEL_GLYPH = {LV_OBSERVED: "◉", LV_REPORTED: "◈", LV_CORRELATED: "◎",
+               LV_INFERRED: "◌", LV_UNKNOWN: "?"}
+LEVEL_WORD = {LV_OBSERVED: "Observed", LV_REPORTED: "Reported",
+              LV_CORRELATED: "Correlated", LV_INFERRED: "Inferred",
+              LV_UNKNOWN: "Unknown"}
+LEVEL_HELP = {
+    LV_OBSERVED: "Seen directly in a packet (you can open that packet).",
+    LV_REPORTED: "Reported by another system you connected (for example "
+                 "your Pi-hole), not seen by this computer itself.",
+    LV_CORRELATED: "Two separate observations line up — for example a "
+                   "device looked a name up and connected to the answer "
+                   "a moment later.",
+    LV_INFERRED: "A reasonable guess. It could be wrong; the reasons are "
+                 "listed.",
+    LV_UNKNOWN: "Nothing seen either way. Not seeing something does not "
+                "mean it didn't happen."}
+
+
+def level_label(level, word=True):
+    g = LEVEL_GLYPH.get(level, "?")
+    return f"{g} {LEVEL_WORD.get(level, 'Unknown')}" if word else g
+
+
+# ---- how a device is tied to a website -----------------------------------
+AS_CONNECTED = "connected"                 # SNI / HTTP Host in its own flow
+AS_CONNECTED_LOOKUP = "connected-lookup"   # own lookup, then connected
+AS_CONNECTED_AMBIG = "connected-ambiguous" # same, IP serves many names
+AS_REPORTED = "reported"                   # a connector says it looked up
+AS_LOOKUP_ONLY = "lookup-only"             # looked up, no connection seen
+AS_INFERRED = "inferred"                   # another device's lookup
+ASSOC_RANK = {AS_CONNECTED: 6, AS_CONNECTED_LOOKUP: 5, AS_CONNECTED_AMBIG: 4,
+              AS_REPORTED: 3, AS_LOOKUP_ONLY: 2, AS_INFERRED: 1, "": 0}
+ASSOC_LEVEL = {AS_CONNECTED: LV_OBSERVED, AS_CONNECTED_LOOKUP: LV_CORRELATED,
+               AS_CONNECTED_AMBIG: LV_CORRELATED, AS_REPORTED: LV_REPORTED,
+               AS_LOOKUP_ONLY: LV_OBSERVED, AS_INFERRED: LV_INFERRED,
+               "": LV_UNKNOWN}
+ASSOC_TEXT = {
+    AS_CONNECTED: "connected (name seen in the connection)",
+    AS_CONNECTED_LOOKUP: "connected (right after looking it up)",
+    AS_CONNECTED_AMBIG: "connected to an address shared by many names",
+    AS_REPORTED: "looked up (reported by another system)",
+    AS_LOOKUP_ONLY: "looked up — no connection seen",
+    AS_INFERRED: "possibly (another device's lookup)",
+    "": "unknown"}
+ASSOC_SHORT = {AS_CONNECTED: "Connected", AS_CONNECTED_LOOKUP: "Connected",
+               AS_CONNECTED_AMBIG: "Connected (shared address)",
+               AS_REPORTED: "Looked up (reported)",
+               AS_LOOKUP_ONLY: "Looked up only", AS_INFERRED: "Possibly",
+               "": "—"}
+
+
+def assoc_label(assoc):
+    return f"{LEVEL_GLYPH[ASSOC_LEVEL.get(assoc, LV_UNKNOWN)]} " \
+           f"{ASSOC_SHORT.get(assoc, '—')}"
+
+
+def better_assoc(a, b):
+    return a if ASSOC_RANK.get(a, 0) >= ASSOC_RANK.get(b, 0) else b
+
+
+# ---- observation kinds (integer codes keep the history file small) ---------
+OBS_KINDS = ("arp_reply", "arp_probe", "dhcp_request", "dhcp_ack",
+             "dns_query", "dns_answer", "tls_sni", "http_host", "flow_start",
+             "mdns", "ssdp", "nd", "nbns", "ra", "rogue_ra", "quic_sni",
+             "lldp", "service", "name", "probe", "reported")
+OBS_KIND_CODES = {k: i + 1 for i, k in enumerate(OBS_KINDS)}
+OBS_CODE_KINDS = {v: k for k, v in OBS_KIND_CODES.items()}
+OBS_KIND_TEXT = {
+    "arp_reply": "answered ARP", "arp_probe": "asked ARP",
+    "dhcp_request": "asked DHCP for an address", "dhcp_ack": "got a DHCP "
+    "lease", "dns_query": "looked up a name", "dns_answer": "received a DNS "
+    "answer", "tls_sni": "named the site in its secure connection",
+    "http_host": "named the site in a plain web request",
+    "flow_start": "opened a connection", "mdns": "announced itself (mDNS)",
+    "ssdp": "announced itself (SSDP)", "nd": "IPv6 neighbour discovery",
+    "nbns": "answered a Windows name query", "ra": "announced an IPv6 "
+    "router", "rogue_ra": "announced an unexpected IPv6 router",
+    "quic_sni": "named the site in a QUIC handshake",
+    "lldp": "switch announcement (LLDP/CDP)", "service": "advertised a "
+    "service", "name": "name learned", "probe": "answered a health check",
+    "reported": "reported by a connected system"}
+
+
+class LookupCorrelator:
+    """Remembers who looked up what (bounded, time-ordered) so a later
+    connection can be tied to the name its device just resolved — the
+    level is Correlated, never Observed — and so lookups with no
+    connection are shown as exactly that."""
+
+    STRONG_WINDOW = 10.0          # lookup → connection within 10 s
+    KEEP = 1800.0                 # forget lookups after 30 minutes
+
+    def __init__(self):
+        self.by_dev_ip = {}       # (device, ip) -> deque[(ts, domain)]
+        self.by_ip = {}           # ip -> deque[(ts, device, domain)]
+        self.order = deque()      # (ts, device, ip) for expiry
+        self.used = set()         # (device, domain) that led to a connect
+
+    def note_resolution(self, device, domain, ip, ts):
+        k = (device, ip)
+        dq = self.by_dev_ip.get(k)
+        if dq is None:
+            dq = self.by_dev_ip[k] = deque(maxlen=8)
+        dq.append((ts, domain))
+        ipq = self.by_ip.get(ip)
+        if ipq is None:
+            ipq = self.by_ip[ip] = deque(maxlen=16)
+        ipq.append((ts, device, domain))
+        self.order.append((ts, device, ip))
+        self._expire(ts)
+
+    def match(self, device, ip, ts):
+        """→ (domain, kind) for a new connection from `device` to `ip`.
+        kind is "own-recent", "own-old", "other" or ""."""
+        dq = self.by_dev_ip.get((device, ip)) if device else None
+        if dq:
+            t, dom = dq[-1]
+            if 0 <= ts - t <= self.STRONG_WINDOW:
+                self.used.add((device, dom))
+                return dom, "own-recent"
+            if ts - t <= self.KEEP:
+                self.used.add((device, dom))
+                return dom, "own-old"
+        ipq = self.by_ip.get(ip)
+        if ipq:
+            t, _dev, dom = ipq[-1]
+            if ts - t <= self.KEEP:
+                return dom, "other"
+        return "", ""
+
+    def _expire(self, now):
+        while self.order and now - self.order[0][0] > self.KEEP:
+            t, dev, ip = self.order.popleft()
+            dq = self.by_dev_ip.get((dev, ip))
+            if dq and dq[-1][0] <= t:
+                self.by_dev_ip.pop((dev, ip), None)
+            ipq = self.by_ip.get(ip)
+            if ipq and ipq[-1][0] <= t:
+                self.by_ip.pop(ip, None)
+        if len(self.order) > 200000:
+            for _ in range(20000):
+                self.order.popleft()
+        if len(self.used) > 100000:
+            self.used.clear()
+
+
+# ============================================================================
 #  13.  NetworkModel — the single analysis core
 #
 #  Every view (tabs, map, reports, exports, sessions) reads from this one
@@ -7735,6 +7919,67 @@ class NetworkModel:
         self.dirty_devices = set()
         self.dirty_websites = set()
         self.dirty_remotes = set()
+        # evidence (section 12b)
+        self.correlator = LookupCorrelator()
+        self.obs_seq = 0
+        self.obs_recent = deque(maxlen=20000)
+        self.obs_by_subject = {}
+        self.obs_sink = False          # a history store wants observations
+        self.obs_pending = []
+        self.res_pending = []
+        self.tl_pending = []
+        self.tie_pending = set()
+        self._pkt_no = None
+
+    # ---- evidence ------------------------------------------------------------
+    def observe(self, kind, subject, ts, data=None, pkt=None, also=()):
+        """Record one immutable observation. `pkt` is the packet number
+        that proves it (None for observations not from a packet)."""
+        if not subject:
+            return None
+        if pkt is None:
+            pkt = self._pkt_no
+        self.obs_seq += 1
+        o = (self.obs_seq, ts, kind, subject, data or {}, pkt)
+        self.obs_recent.append(o)
+        for subj in (subject,) + tuple(also):
+            dq = self.obs_by_subject.get(subj)
+            if dq is None:
+                if len(self.obs_by_subject) > 60000:
+                    for k in list(self.obs_by_subject)[:6000]:
+                        self.obs_by_subject.pop(k, None)
+                dq = self.obs_by_subject[subj] = deque(maxlen=48)
+            dq.append(o)
+        if self.obs_sink:
+            self.obs_pending.append(o)
+            if len(self.obs_pending) > 200000:
+                del self.obs_pending[:50000]
+        return o
+
+    def observations_for(self, subject, kinds=None, limit=48):
+        out = [o for o in self.obs_by_subject.get(subject, ())
+               if kinds is None or o[2] in kinds]
+        return out[-limit:]
+
+    def tie(self, device, domain, assoc, ts):
+        """Tie a device to a website at the strongest level seen so far."""
+        if not device or not domain:
+            return
+        rec = self.websites.get(domain)
+        if rec is None:
+            return
+        t = rec.ties.get(device)
+        if t is None:
+            if len(rec.ties) >= 400:
+                return
+            rec.ties[device] = [assoc, ts, ts, 1]
+        else:
+            t[0] = better_assoc(assoc, t[0])
+            t[2] = max(t[2], ts)
+            t[3] += 1
+        if self.obs_sink:
+            self.tie_pending.add((device, domain))
+        self.dirty_websites.add(domain)
 
     # ---- clock / identity --------------------------------------------------
     def now(self):
@@ -7776,6 +8021,10 @@ class NetworkModel:
         self.ev_timeline.append(entry)
         if len(self.ev_timeline) > 2000:
             del self.ev_timeline[:-2000]
+        if self.obs_sink:
+            self.tl_pending.append(entry)
+            if len(self.tl_pending) > 20000:
+                del self.tl_pending[:5000]
         return entry
 
     def _alert(self, a):
@@ -7810,6 +8059,7 @@ class NetworkModel:
         if self.use_packet_clock and ts > self.offline_now:
             self.offline_now = ts
         self.count += 1
+        self._pkt_no = d.get("no")
         src_ip, dst_ip = d["src_ip"], d["dst_ip"]
         src_local = self.is_local(src_ip)
         dst_local = self.is_local(dst_ip)
@@ -7861,6 +8111,7 @@ class NetworkModel:
                     if dev:
                         self.registry.set_hostname(src_ip, name, "nbns")
                         self._dirty_dev(dev)
+                        self.observe("nbns", dev.key, ts, {"name": name})
         if d["dns"]:
             self._observe_dns(d, ts, src_dev, dst_dev)
         if d["doh_hint"] and self.config.get("dns.detect_encrypted_dns",
@@ -8006,6 +8257,8 @@ class NetworkModel:
     def _observe_arp(self, ip, mac, ts):
         dev, conflict = self.registry.note_arp_reply(ip, mac, ts)
         self._dirty_dev(dev)
+        if dev is not None:
+            self.observe("arp_reply", dev.key, ts, {"ip": ip, "mac": mac})
         flips = self.registry.arp_flip_count(ip)
         if flips >= int(self.config.get("alerts.arp_flip_threshold", 4)):
             a = self._alert(self.alerts.arp_spoof(
@@ -8054,6 +8307,14 @@ class NetworkModel:
                 client_mac, info.get("hostname", ""),
                 info.get("vendor_class", ""), info.get("param_list", ""), ts)
             self._dirty_dev(dev)
+            if dev is not None:
+                if info.get("client_id"):
+                    dev.dhcp_client_id = info["client_id"]
+                self.observe("dhcp_request", dev.key, ts,
+                             {"hostname": info.get("hostname", ""),
+                              "vendor": info.get("vendor_class", ""),
+                              "params": info.get("param_list", ""),
+                              "client_id": info.get("client_id", "")})
         if mt == 5 and info.get("yiaddr"):            # ACK = a real lease
             existing = self.registry.by_key.get((client_mac or "").lower())
             host = info.get("hostname") or (existing.dhcp_hostname
@@ -8062,6 +8323,11 @@ class NetworkModel:
                 info["yiaddr"], client_mac, host, info.get("lease_time"), ts)
             if dev:
                 self._dirty_dev(dev)
+                self.observe("dhcp_ack", dev.key, ts,
+                             {"ip": info["yiaddr"], "lease":
+                              info.get("lease_time") or 0,
+                              "server": info.get("server_id") or
+                              d["src_ip"], "hostname": host})
                 self.push_timeline("dhcp lease", "INFO",
                                    f"{dev.display_name()} got address "
                                    f"{info['yiaddr']} from DHCP",
@@ -8082,9 +8348,15 @@ class NetworkModel:
                         self.registry.v6_prefixes = self.v6_prefixes
             known_router = mac in self.registry.ra_routers
             dev = self.registry.note_nd(d["src_ip"], mac, "RA", ts)
+            if dev is not None:
+                self.observe("ra", dev.key, ts,
+                             {"prefixes": nd.get("prefixes", [])[:4]})
             self._check_rogue_ra(mac, dev, nd, known_router)
         elif kind == "NA":
             dev = self.registry.note_nd(nd.get("target"), mac, "NA", ts)
+            if dev is not None:
+                self.observe("nd", dev.key, ts, {"ip": nd.get("target"),
+                                                 "kind": "NA"})
         elif kind == "NS" and not nd.get("dad") and nd.get("mac"):
             dev = self.registry.note_nd(d["src_ip"], nd["mac"], "NS", ts)
         else:
@@ -8140,6 +8412,9 @@ class NetworkModel:
             if short and not dev.mdns_name:
                 dev.mdns_name = short
                 _push_bounded(dev.hostname_history, [short, "mdns", ts], 20)
+        self.observe("mdns", dev.key, ts,
+                     {"name": name, "services":
+                      [x for x in (info.get("services") or [])[:4]]})
         txt = info.get("txt") or {}
         for k in ("model", "md", "am", "usb_mdl", "ty", "product", "rpmd"):
             if txt.get(k):
@@ -8156,6 +8431,9 @@ class NetworkModel:
             d["src_ip"], d["src_mac"], "ssdp", label[:80],
             friendly=info.get("friendly", ""), when=ts)
         if dev:
+            self.observe("ssdp", dev.key, ts, {"label": label[:80],
+                                               "server": info.get("server",
+                                                                  "")[:80]})
             if info.get("server"):
                 dev.ssdp_server = info["server"]
             if new and len(dev.services) > 1:
@@ -8183,6 +8461,10 @@ class NetworkModel:
         if info.get("qr") == 0 and d["dport"] == 53:
             self.metrics.add("dns_queries", ts, 1)
             key = src_dev.key if src_dev else ""
+            if key and info.get("qname"):
+                self.observe("dns_query", key, ts,
+                             {"domain": info["qname"], "server":
+                              d["dst_ip"]})
             change = self.dns.on_query(ts, d["src_ip"], d["dst_ip"], info,
                                        key)
             if change and src_dev and src_dev.live:
@@ -8320,16 +8602,14 @@ class NetworkModel:
                 f.tls_version = tls["version"]
             if tls.get("alpn"):
                 f.alpn = ",".join(tls["alpn"][:3])
-            if tls.get("sni"):
+            if tls.get("sni") and tls.get("kind") == "client":
                 f.domain, f.domain_conf = tls["sni"], "Observed"
+                f.assoc = AS_CONNECTED
         if d["http_host"]:
             f.domain, f.domain_conf = d["http_host"], "Observed"
-        if not f.domain and f.remote_public:
-            names = self.ip_to_domains.get(f.remote_ip)
-            if names:
-                f.domain = next(reversed(names))
-                f.domain_conf = "Likely" if len(names) == 1 else \
-                    f"Possibly (one of {len(names)} names)"
+            f.assoc = AS_CONNECTED
+        if new and f.remote_public and not f.domain:
+            self._correlate_flow(f, ts)
         enc = d["encrypted"]
         if enc == "no":
             f.encrypted = "no"
@@ -8343,6 +8623,27 @@ class NetworkModel:
             f.country, f.asn, f.org = rec.country, rec.asn, rec.org
         self.flows.dirty.add(f.fid)
         return f, new
+
+    def _correlate_flow(self, f, ts):
+        """Name a new connection from the lookups that preceded it. The
+        result is Correlated (its own lookup) or Inferred (someone else's),
+        never Observed."""
+        dom, kind = self.correlator.match(f.device_key, f.remote_ip, ts)
+        if not dom:
+            return
+        n = len(self.ip_to_domains.get(f.remote_ip) or ())
+        if kind in ("own-recent", "own-old"):
+            if n <= 3:
+                f.assoc = AS_CONNECTED_LOOKUP
+                f.domain_conf = "Correlated (its own lookup)"
+            else:
+                f.assoc = AS_CONNECTED_AMBIG
+                f.domain_conf = f"Correlated (one of {n} names)"
+        else:
+            f.assoc = AS_INFERRED
+            f.domain_conf = "Possibly (this address was named earlier)"
+        f.domain = dom
+        self.tie(f.device_key, dom, f.assoc, ts)
 
     def _note_reset(self, f, ts):
         dq = self.resets[f.device_key]
@@ -8361,19 +8662,56 @@ class NetworkModel:
     def _observe_websites(self, d, ts, src_dev, dst_dev, flow, new_flow):
         dns = d["dns"]
         if dns and dns.get("qr") == 1 and d["sport"] == 53:
+            dkey = dst_dev.key if dst_dev is not None else ""
+            qname = (dns.get("qname") or "").lower().strip(".")
             for ip, name in d["learns"]:
-                if is_public_ip(ip) and name:
-                    self.register_website(name, ip, dst_dev, "DNS", ts)
+                if not (is_public_ip(ip) and name):
+                    continue
+                rec = self.register_website(name, ip, dst_dev, "DNS", ts)
+                lname = name.lower().strip(".")
+                self.correlator.note_resolution(dkey, lname, ip, ts)
+                if self.obs_sink:
+                    self.res_pending.append((ts, dkey, lname, ip))
+                if rec is not None and dkey and lname == qname:
+                    rec.lookups += 1
+                    self.tie(dkey, lname, AS_LOOKUP_ONLY, ts)
+                    self.observe("dns_answer", dkey, ts,
+                                 {"domain": lname, "ip": ip},
+                                 also=("site:" + lname,))
         tls = d["tls"]
         if tls and tls.get("sni") and tls.get("kind") == "client" and \
                 is_public_ip(d["dst_ip"]):
-            self.register_website(tls["sni"], d["dst_ip"], src_dev,
+            sni = tls["sni"]
+            self.register_website(sni, d["dst_ip"], src_dev,
                                   "TLS SNI", ts, connection=True,
                                   encrypted=True)
+            self.correlator.note_resolution("", sni, d["dst_ip"], ts)
+            if src_dev is not None:
+                self.tie(src_dev.key, sni, AS_CONNECTED, ts)
+                self.observe("tls_sni", src_dev.key, ts,
+                             {"domain": sni, "ip": d["dst_ip"],
+                              "flow": flow.fid if flow else None,
+                              "ech": bool(tls.get("ech"))},
+                             also=("site:" + sni,))
         if d["http_host"] and is_public_ip(d["dst_ip"]):
-            self.register_website(d["http_host"], d["dst_ip"], src_dev,
+            host = d["http_host"]
+            self.register_website(host, d["dst_ip"], src_dev,
                                   "HTTP Host", ts, connection=True,
                                   encrypted=False)
+            self.correlator.note_resolution("", host, d["dst_ip"], ts)
+            if src_dev is not None:
+                self.tie(src_dev.key, host, AS_CONNECTED, ts)
+                self.observe("http_host", src_dev.key, ts,
+                             {"domain": host, "ip": d["dst_ip"],
+                              "flow": flow.fid if flow else None},
+                             also=("site:" + host,))
+        if new_flow and flow is not None and flow.device_key and \
+                flow.remote_public:
+            self.observe("flow_start", flow.device_key, ts,
+                         {"remote": flow.remote_ip, "port": flow.remote_port,
+                          "proto": flow.transport, "flow": flow.fid,
+                          "domain": flow.domain, "assoc": flow.assoc},
+                         also=(f"flow:{flow.fid}",))
         if flow is not None and flow.domain and flow.remote_public:
             rec = self.websites.get(flow.domain)
             if rec is not None:
@@ -9134,6 +9472,7 @@ class SessionCodec:
             "doh_seen": {k: sorted(v) for k, v in model.doh_seen.items()},
             "health": {k: v for k, v in model.health.items()
                        if isinstance(v, (str, int, float, bool, type(None)))},
+            "observations": [list(o) for o in list(model.obs_recent)[-3000:]],
         }
         return payload
 
@@ -9151,6 +9490,10 @@ class SessionCodec:
                 if isinstance(dd, dict) and "hostname_display" not in dd:
                     dd["hostname_display"] = dd.get("hostname", "")
             payload["schema_version"] = 2
+        if ver < 3:
+            # v3 adds site ties, connection association levels and the
+            # recent observations; older files simply have none
+            payload["schema_version"] = 3
         if not any(k in payload for k in ("devices", "websites",
                                           "remote_hosts", "alerts")):
             raise ValueError("this file has no devices, websites, remote "
@@ -9226,6 +9569,13 @@ class SessionCodec:
         vpn = sess.get("vpn")
         if isinstance(vpn, dict):
             model.vpn.update(vpn)
+        for o in (payload.get("observations") or [])[-3000:]:
+            if isinstance(o, list) and len(o) == 6 and \
+                    o[2] in OBS_KIND_CODES and isinstance(o[4], dict):
+                with contextlib.suppress(TypeError, ValueError):
+                    model.observe(o[2], sanitize_text(o[3], 120), float(o[1]),
+                                  o[4], o[5] if isinstance(o[5], int)
+                                  else None)
         model._classify()
         return payload
 
@@ -9233,15 +9583,12 @@ class SessionCodec:
 # ---- optional local history (SQLite) ----------------------------------------
 HISTORY_RETENTION = {"Session only": 0, "7 days": 7, "30 days": 30,
                      "90 days": 90, "Custom": None}
+STORE_SCHEMA_VERSION = 3
 
-
-class HistoryStore:
-    """Optional, compact long-term memory: device summaries, presence,
-    daily traffic, alerts, domain summaries and baselines. No packet
-    contents. Writes happen on a background thread with its own
-    connection; the GUI only hands over small snapshots."""
-
-    SCHEMA = """
+# Numbered migrations. Each runs inside one transaction; a crash rolls it
+# back and the next start retries. The file is copied to .vN.bak first.
+STORE_MIGRATIONS = {
+    1: """
     CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
     CREATE TABLE IF NOT EXISTS devices(key TEXT PRIMARY KEY, data TEXT,
         first_seen REAL, last_seen REAL);
@@ -9256,54 +9603,350 @@ class HistoryStore:
         requests INTEGER, bytes INTEGER, PRIMARY KEY(domain, day));
     CREATE TABLE IF NOT EXISTS baselines(device_key TEXT PRIMARY KEY,
         data TEXT, updated REAL);
-    """
+    """,
+    2: """
+    CREATE TABLE IF NOT EXISTS migration_log(version INTEGER, phase TEXT,
+        at REAL);
+    CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY,
+        started REAL, ended REAL, source TEXT, iface TEXT, network TEXT,
+        app_version TEXT);
+    CREATE TABLE IF NOT EXISTS observations(ts REAL, session INTEGER,
+        kind INTEGER, subject TEXT, data TEXT, pkt INTEGER);
+    CREATE INDEX IF NOT EXISTS obs_subject ON observations(subject, ts);
+    CREATE INDEX IF NOT EXISTS obs_kind ON observations(kind, ts);
+    CREATE TABLE IF NOT EXISTS resolutions(ts REAL, session INTEGER,
+        device TEXT, domain TEXT, ip TEXT);
+    CREATE INDEX IF NOT EXISTS res_ip ON resolutions(ip, ts);
+    CREATE INDEX IF NOT EXISTS res_domain ON resolutions(domain, ts);
+    CREATE TABLE IF NOT EXISTS flows(session INTEGER, fid INTEGER,
+        start REAL, end REAL, device TEXT, remote TEXT, port INTEGER,
+        transport TEXT, app TEXT, domain TEXT, assoc TEXT,
+        bytes_out INTEGER, bytes_in INTEGER, packets INTEGER,
+        PRIMARY KEY(session, fid));
+    CREATE INDEX IF NOT EXISTS flows_device ON flows(device, start);
+    CREATE INDEX IF NOT EXISTS flows_remote ON flows(remote, start);
+    CREATE TABLE IF NOT EXISTS site_ties(session INTEGER, device TEXT,
+        domain TEXT, assoc TEXT, first REAL, last REAL, n INTEGER,
+        PRIMARY KEY(session, device, domain));
+    CREATE INDEX IF NOT EXISTS ties_domain ON site_ties(domain, last);
+    """,
+    3: """
+    CREATE TABLE IF NOT EXISTS events(ts REAL, session INTEGER, kind TEXT,
+        severity TEXT, text TEXT, ref_kind TEXT, ref_id TEXT,
+        device TEXT);
+    CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+    CREATE INDEX IF NOT EXISTS events_kind ON events(kind, ts);
+    CREATE INDEX IF NOT EXISTS events_device ON events(device, ts);
+    CREATE TABLE IF NOT EXISTS packet_segments(session INTEGER,
+        first_no INTEGER, last_no INTEGER, t0 REAL, t1 REAL, path TEXT,
+        bytes INTEGER, linktype INTEGER,
+        PRIMARY KEY(session, first_no));
+    """,
+}
 
-    def __init__(self, path):
+
+class Store:
+    """Durable, optional history in one SQLite file (WAL mode).
+
+    • One writer thread owns the only write connection; callers hand over
+      small batches (observations, lookups, connections, site ties,
+      timeline events) about once a second.
+    • Readers open their own read-only connections, so a history query
+      never blocks capture or the writer.
+    • Numbered migrations with a .vN.bak copy first; a nightly .bak copy;
+      integrity check at open with automatic recovery from the backup.
+    • No packet payloads are ever stored here (the optional packet ring
+      keeps raw packets in separate files, off by default)."""
+
+    def __init__(self, path, session_id=None, meta=None):
         self.path = path
-        self.q = queue.Queue(maxsize=50)
+        self.session = session_id if session_id is not None else \
+            int(time.time())
+        self.meta = dict(meta or {})
+        self.q = queue.Queue(maxsize=400)
         self.error = ""
+        self.recovered = ""
+        self.written = Counter()
+        self.dropped_batches = 0
         self._stop = False
+        self._ready = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="history-writer")
         self._thread.start()
+        self._ready.wait(10)
+
+    # ---- opening, migrations, recovery ---------------------------------------
+    def _check_integrity(self):
+        if not os.path.exists(self.path):
+            return
+        bad = ""
+        try:
+            con = sqlite3.connect(self.path, timeout=10)
+            row = con.execute("PRAGMA quick_check").fetchone()
+            con.close()
+            if not row or row[0] != "ok":
+                bad = str(row[0] if row else "no answer")
+        except sqlite3.DatabaseError as e:
+            bad = str(e)
+        if not bad:
+            return
+        aside = f"{self.path}.corrupt-{int(time.time())}"
+        with contextlib.suppress(OSError):
+            os.replace(self.path, aside)
+        for suffix in ("-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.remove(self.path + suffix)
+        bak = self.path + ".bak"
+        if os.path.exists(bak):
+            with contextlib.suppress(OSError):
+                shutil.copyfile(bak, self.path)
+            self.recovered = (f"The history file was damaged ({bad}); it was "
+                              f"set aside and last night's backup was "
+                              f"restored.")
+        else:
+            self.recovered = (f"The history file was damaged ({bad}); it was "
+                              f"set aside and a new one was started.")
+        LOG.warning("history: %s", self.recovered)
 
     def _connect(self):
-        con = sqlite3.connect(self.path, timeout=10)
-        con.executescript(self.SCHEMA)
-        con.execute("INSERT OR REPLACE INTO meta VALUES('schema','1')")
+        self._check_integrity()
+        con = sqlite3.connect(self.path, timeout=15)
+        with contextlib.suppress(sqlite3.Error):
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("PRAGMA synchronous=NORMAL")
+        con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, "
+                    "v TEXT)")
+        row = con.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
+        ver = int(row[0]) if row and str(row[0]).isdigit() else 0
+        if ver < STORE_SCHEMA_VERSION and ver > 0:
+            with contextlib.suppress(OSError):
+                con.commit()
+                shutil.copyfile(self.path, f"{self.path}.v{ver}.bak")
+        for v in range(ver + 1, STORE_SCHEMA_VERSION + 1):
+            self._migrate(con, v)
+        con.execute("INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?,?)",
+                    (self.session, time.time(), None,
+                     self.meta.get("source", ""), self.meta.get("iface", ""),
+                     self.meta.get("network", ""), SCRIPT_VERSION))
+        con.commit()
         return con
 
+    @staticmethod
+    def _migrate(con, version):
+        con.commit()
+        old_level = con.isolation_level
+        con.isolation_level = None            # explicit transaction below
+        try:
+            con.execute("BEGIN")
+            if version >= 2:
+                con.execute("CREATE TABLE IF NOT EXISTS migration_log("
+                            "version INTEGER, phase TEXT, at REAL)")
+                con.execute("INSERT INTO migration_log VALUES(?,?,?)",
+                            (version, "start", time.time()))
+            for stmt in STORE_MIGRATIONS[version].split(";"):
+                if stmt.strip():
+                    con.execute(stmt)
+            con.execute("INSERT OR REPLACE INTO meta VALUES('schema', ?)",
+                        (str(version),))
+            if version >= 2:
+                con.execute("INSERT INTO migration_log VALUES(?,?,?)",
+                            (version, "done", time.time()))
+            con.execute("COMMIT")
+        except sqlite3.Error:
+            with contextlib.suppress(sqlite3.Error):
+                con.execute("ROLLBACK")
+            raise
+        finally:
+            con.isolation_level = old_level
+
+    def _backup_if_due(self, con):
+        bak = self.path + ".bak"
+        try:
+            age = time.time() - os.path.getmtime(bak)
+        except OSError:
+            age = 1e9
+        if age < 20 * 3600:
+            return
+        try:
+            dst = sqlite3.connect(bak + ".tmp")
+            con.backup(dst)
+            dst.close()
+            os.replace(bak + ".tmp", bak)
+        except (sqlite3.Error, OSError) as e:
+            LOG.info("history backup skipped: %s", e)
+
+    # ---- writer thread -------------------------------------------------------------
     def _run(self):
         try:
             con = self._connect()
         except sqlite3.Error as e:
             self.error = str(e)
             LOG.warning("history db unavailable: %s", e)
+            self._ready.set()
             return
-        while not self._stop:
+        self._ready.set()
+        self._backup_if_due(con)
+        last_backup_check = time.time()
+        while True:
             try:
                 job = self.q.get(timeout=1.0)
             except queue.Empty:
+                self._idle.set()
+                if self._stop:
+                    break
+                if time.time() - last_backup_check > 3600:
+                    last_backup_check = time.time()
+                    self._backup_if_due(con)
                 continue
             if job is None:
                 break
-            try:
-                job(con)
-                con.commit()
-            except sqlite3.Error as e:
-                self.error = str(e)
-                LOG.warning("history write failed: %s", e)
+            self._idle.clear()
+            for attempt in range(3):
+                try:
+                    job(con)
+                    con.commit()
+                    break
+                except sqlite3.OperationalError as e:
+                    self.error = str(e)
+                    with contextlib.suppress(sqlite3.Error):
+                        con.rollback()
+                    if "locked" not in str(e) or attempt == 2:
+                        LOG.warning("history write failed: %s", e)
+                        break
+                    time.sleep(0.2 * (attempt + 1))
+                except sqlite3.Error as e:
+                    self.error = str(e)
+                    with contextlib.suppress(sqlite3.Error):
+                        con.rollback()
+                    LOG.warning("history write failed: %s", e)
+                    break
+            if self.q.empty():
+                self._idle.set()
         with contextlib.suppress(sqlite3.Error):
+            con.execute("UPDATE sessions SET ended=? WHERE id=?",
+                        (time.time(), self.session))
+            con.commit()
             con.close()
+        self._idle.set()
 
     def submit(self, job):
+        if self.error and not self._thread.is_alive():
+            return False
         try:
+            self._idle.clear()
             self.q.put_nowait(job)
             return True
         except queue.Full:
+            self.dropped_batches += 1
+            if self.q.empty():
+                self._idle.set()
             return False
 
+    def flush_now(self, timeout=5.0):
+        """Wait until everything handed over so far is on disk."""
+        t_end = time.time() + timeout
+        while time.time() < t_end:
+            if self.q.empty() and self._idle.wait(0.05):
+                if self.q.empty():
+                    return True
+        return False
+
+    def stop(self, wait=0.0):
+        self._stop = True
+        with contextlib.suppress(queue.Full):
+            self.q.put_nowait(None)
+        if wait:
+            self._thread.join(wait)
+
+    # ---- batched writes ------------------------------------------------------------
+    def write_observations(self, obs):
+        if not obs:
+            return True
+        sess = self.session
+        rows = [(o[1], sess, OBS_KIND_CODES.get(o[2], 0), o[3],
+                 json.dumps(o[4], separators=(",", ":"), default=str)
+                 if o[4] else "", o[5]) for o in obs]
+
+        def job(con):
+            con.executemany("INSERT INTO observations VALUES(?,?,?,?,?,?)",
+                            rows)
+            self.written["observations"] += len(rows)
+        return self.submit(job)
+
+    def write_resolutions(self, res):
+        if not res:
+            return True
+        sess = self.session
+        rows = [(ts, sess, dev, dom, ip) for ts, dev, dom, ip in res]
+
+        def job(con):
+            con.executemany("INSERT INTO resolutions VALUES(?,?,?,?,?)",
+                            rows)
+            self.written["resolutions"] += len(rows)
+        return self.submit(job)
+
+    def write_flows(self, flows):
+        if not flows:
+            return True
+        sess = self.session
+        rows = [(sess, f.fid, f.first_seen, f.last_seen, f.device_key,
+                 f.remote_ip, f.remote_port or 0, f.transport, f.app,
+                 f.domain, f.assoc, f.bytes_out, f.bytes_in, f.packets)
+                for f in flows]
+
+        def job(con):
+            con.executemany("INSERT OR REPLACE INTO flows VALUES"
+                            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            self.written["flows"] += len(rows)
+        return self.submit(job)
+
+    def write_site_ties(self, ties):
+        """ties: iterable of (device, domain, [assoc, first, last, n])."""
+        sess = self.session
+        rows = [(sess, dev, dom, t[0], t[1], t[2], t[3])
+                for dev, dom, t in ties]
+        if not rows:
+            return True
+
+        def job(con):
+            con.executemany("INSERT OR REPLACE INTO site_ties VALUES"
+                            "(?,?,?,?,?,?,?)", rows)
+            self.written["site_ties"] += len(rows)
+        return self.submit(job)
+
+    def write_events(self, events):
+        if not events:
+            return True
+        sess = self.session
+        rows = []
+        for e in events:
+            ref = e.get("ref") or (None, None)
+            if not isinstance(ref, (list, tuple)) or len(ref) != 2:
+                ref = (None, None)
+            rows.append((e["when"], sess, e.get("kind", ""),
+                         e.get("severity", "INFO"), e.get("text", ""),
+                         ref[0], None if ref[1] is None else str(ref[1]),
+                         e.get("device", "")))
+
+        def job(con):
+            con.executemany("INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",
+                            rows)
+            self.written["events"] += len(rows)
+        return self.submit(job)
+
+    def write_segment(self, first_no, last_no, t0, t1, path, nbytes, lt):
+        sess = self.session
+
+        def job(con):
+            con.execute("INSERT OR REPLACE INTO packet_segments VALUES"
+                        "(?,?,?,?,?,?,?,?)", (sess, first_no, last_no, t0,
+                                              t1, path, nbytes, lt))
+        return self.submit(job)
+
     def write_snapshot(self, snap):
+        """3.0-compatible summary snapshot (devices, alerts, domains…)."""
         def job(con):
             day = time.strftime("%Y-%m-%d")
             for key, data, fs, ls, presence, tr in snap["devices"]:
@@ -9337,6 +9980,12 @@ class HistoryStore:
             con.execute("DELETE FROM traffic WHERE day < ?", (cday,))
             con.execute("DELETE FROM domains WHERE day < ?", (cday,))
             con.execute("DELETE FROM devices WHERE last_seen < ?", (cutoff,))
+            for t, col in (("observations", "ts"), ("resolutions", "ts"),
+                           ("flows", "end"), ("site_ties", "last"),
+                           ("events", "ts")):
+                con.execute(f"DELETE FROM {t} WHERE {col} < ?", (cutoff,))
+            con.execute("DELETE FROM sessions WHERE ended IS NOT NULL AND "
+                        "ended < ?", (cutoff,))
         return self.submit(job)
 
     def clear(self, device_key=None):
@@ -9345,43 +9994,87 @@ class HistoryStore:
                 for t, col in (("devices", "key"), ("presence", "device_key"),
                                ("traffic", "device_key"),
                                ("alerts", "device_key"),
-                               ("baselines", "device_key")):
+                               ("baselines", "device_key"),
+                               ("observations", "subject"),
+                               ("resolutions", "device"),
+                               ("flows", "device"), ("site_ties", "device"),
+                               ("events", "device")):
                     con.execute(f"DELETE FROM {t} WHERE {col}=?",
                                 (device_key,))
             else:
                 for t in ("devices", "presence", "traffic", "alerts",
-                          "domains", "baselines"):
+                          "domains", "baselines", "observations",
+                          "resolutions", "flows", "site_ties", "events",
+                          "packet_segments"):
                     con.execute(f"DELETE FROM {t}")
                 con.commit()
                 con.execute("VACUUM")
         return self.submit(job)
 
-    def load_baselines(self):
-        """Synchronous read used once at startup (separate connection)."""
-        out = {}
+    # ---- reads (own read-only connection each time) ------------------------
+    def _reader(self):
+        uri = "file:" + urllib.request.pathname2url(
+            os.path.abspath(self.path)) + "?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=5)
+        con.execute("PRAGMA query_only=ON")
+        return con
+
+    def query(self, sql, args=(), limit=None):
+        """Read-only query. Returns rows, or [] if the file can't be read
+        (the error is kept in .error)."""
+        if not sql.lstrip().upper().startswith(("SELECT", "WITH")):
+            raise ValueError("read-only queries only")
         try:
-            con = sqlite3.connect(self.path, timeout=5)
-            for key, data in con.execute("SELECT device_key, data FROM "
-                                         "baselines"):
-                with contextlib.suppress(ValueError):
-                    out[key] = json.loads(data)
-            con.close()
+            con = self._reader()
+            try:
+                cur = con.execute(sql, args)
+                return cur.fetchmany(limit) if limit else cur.fetchall()
+            finally:
+                con.close()
         except sqlite3.Error as e:
             self.error = str(e)
+            return []
+
+    def observations(self, subject, limit=200, since=0.0):
+        rows = self.query("SELECT ts, kind, data, pkt, session FROM "
+                          "observations WHERE subject=? AND ts>=? ORDER BY "
+                          "ts DESC LIMIT ?", (subject, since, limit))
+        out = []
+        for ts, kind, data, pkt, sess in rows:
+            try:
+                d = json.loads(data) if data else {}
+            except ValueError:
+                d = {}
+            out.append((ts, OBS_CODE_KINDS.get(kind, "?"), d, pkt, sess))
+        return out
+
+    def counts(self):
+        out = {}
+        for t in ("observations", "resolutions", "flows", "site_ties",
+                  "events", "sessions", "devices"):
+            r = self.query(f"SELECT COUNT(*) FROM {t}")
+            out[t] = r[0][0] if r else 0
+        return out
+
+    def schema_version(self):
+        r = self.query("SELECT v FROM meta WHERE k='schema'")
+        return int(r[0][0]) if r and str(r[0][0]).isdigit() else 0
+
+    def load_baselines(self):
+        out = {}
+        for key, data in self.query("SELECT device_key, data FROM "
+                                    "baselines"):
+            with contextlib.suppress(ValueError):
+                out[key] = json.loads(data)
         return out
 
     def known_device_rows(self, limit=500):
         rows = []
-        try:
-            con = sqlite3.connect(self.path, timeout=5)
-            for key, data, fs, ls in con.execute(
-                    "SELECT key, data, first_seen, last_seen FROM devices "
-                    "ORDER BY last_seen DESC LIMIT ?", (limit,)):
-                with contextlib.suppress(ValueError):
-                    rows.append((key, json.loads(data), fs, ls))
-            con.close()
-        except sqlite3.Error as e:
-            self.error = str(e)
+        for key, data, fs, ls in self.query(
+                "SELECT key, data, first_seen, last_seen FROM devices "
+                "ORDER BY last_seen DESC LIMIT ?", (limit,)):
+            with contextlib.suppress(ValueError):
+                rows.append((key, json.loads(data), fs, ls))
         return rows
 
     def size_bytes(self):
@@ -9391,10 +10084,26 @@ class HistoryStore:
                 total += os.path.getsize(self.path + suffix)
         return total
 
-    def stop(self):
-        self._stop = True
-        with contextlib.suppress(queue.Full):
-            self.q.put_nowait(None)
+
+HistoryStore = Store          # 3.0 name
+
+
+def bench_store(n=100000):
+    tmp = tempfile.mkdtemp()
+    st = Store(os.path.join(tmp, "b.sqlite3"))
+    obs = [(i, 1700000000.0 + i * 0.01, "dns_answer", f"dev{i % 50}",
+            {"domain": f"d{i % 900}.example", "ip": "93.184.215.14"}, i)
+           for i in range(n)]
+    t0 = time.perf_counter()
+    for k in range(0, n, 5000):
+        while not st.write_observations(obs[k:k + 5000]):
+            time.sleep(0.01)
+    st.flush_now(60)
+    dt = time.perf_counter() - t0
+    size = st.size_bytes()
+    st.stop(5)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return {"store_obs_per_s": n / dt, "store_bytes_per_obs": size / n}
 
 
 # ============================================================================
@@ -12420,6 +13129,7 @@ class DevicesTab(BaseTab):
 class WebsitesTab(BaseTab):
     name, label_key = "websites", "tab_websites"
     COLS = [("hits", "Lookups / visits", 110, "e", False),
+            ("evidence", "How we know", 170, "w", False),
             ("traffic", "Traffic", 90, "e", False),
             ("who", "Contacted by", 200, "w", True),
             ("security", "Security", 120, "w", False),
@@ -12453,6 +13163,10 @@ class WebsitesTab(BaseTab):
         self.src_var = tk.StringVar(value="Any source")
         self._combo(bar, "Seen via:", self.src_var,
                     ["Any source", "DNS", "TLS SNI", "HTTP Host"], 11)
+        self.ev_var = tk.StringVar(value="Any evidence")
+        self._combo(bar, "Evidence:", self.ev_var,
+                    ["Any evidence", "Connected", "Looked up only",
+                     "Possibly"], 13)
         self.enc_var = tk.StringVar(value="Any")
         self._combo(bar, "Security:", self.enc_var,
                     ["Any", "Encrypted", "Not encrypted"], 12)
@@ -12505,6 +13219,16 @@ class WebsitesTab(BaseTab):
         src = self.src_var.get()
         if src != "Any source" and src not in w.sources:
             return False
+        ev = self.ev_var.get()
+        if ev != "Any evidence":
+            a = self._assoc(w, dev_key)
+            if ev == "Connected" and ASSOC_RANK.get(a, 0) < 4:
+                return False
+            if ev == "Looked up only" and a not in (AS_LOOKUP_ONLY,
+                                                    AS_REPORTED):
+                return False
+            if ev == "Possibly" and a not in (AS_INFERRED, ""):
+                return False
         enc = self.enc_var.get()
         if enc == "Encrypted" and not (w.encrypted and not w.cleartext):
             return False
@@ -12518,13 +13242,20 @@ class WebsitesTab(BaseTab):
             return False
         return True
 
+    def _assoc(self, w, dev_key=None):
+        if dev_key:
+            return w.ties.get(dev_key, [""])[0]
+        return w.best_assoc
+
     def _values(self, w):
         who = ", ".join(self.app.short_device_name(k)
                         for k in sorted(w.devices)[:3]) or "—"
         if len(w.devices) > 3:
             who += f" +{len(w.devices) - 3}"
         where = ", ".join(sorted(w.countries)[:3])
-        return (w.requests, _human_bytes(w.bytes) if w.bytes else "—",
+        dev_key = self.device_key_from_choice(self.dev_var.get())
+        return (w.requests, assoc_label(self._assoc(w, dev_key)),
+                _human_bytes(w.bytes) if w.bytes else "—",
                 who, w.encryption_text(), w.category or "",
                 ", ".join(sorted(w.sources)), fmt_clock(w.first_seen),
                 fmt_clock(w.last_seen), where,
@@ -12597,7 +13328,10 @@ class WebsitesTab(BaseTab):
         who = ", ".join(self.app.short_device_name(k)
                         for k in sorted(devs)[:3]) or "—"
         b = sum(w.bytes for w in members)
-        return (sum(w.requests for w in members),
+        best = ""
+        for w in members:
+            best = better_assoc(w.best_assoc, best)
+        return (sum(w.requests for w in members), assoc_label(best),
                 _human_bytes(b) if b else "—", who, sec,
                 ", ".join(sorted(cats)), "",
                 fmt_clock(min(w.first_seen for w in members)),
@@ -14959,7 +15693,8 @@ class MiniWireshark:
         self.data.on_change = lambda: self._async_results.put(
             self._on_data_changed)
         self.known = KnownDevicesStore(PATHS.known_devices)
-        self.history = HistoryStore(PATHS.history_db) \
+        self.session_id = int(time.time())
+        self.history = self._open_store() \
             if self.config.get("history.enabled", False) else None
         self.geoip = GeoIPService(self._geoip_on_result)
         self.geoip.set_enabled(self.config.get("privacy.geoip_enabled",
@@ -15035,6 +15770,7 @@ class MiniWireshark:
         self.root.after(3000, self._tick_model)
         self.root.after(200, self._drain_async_results)
         self.root.after(60000, self._history_tick)
+        self.root.after(1000, self._pump_store)
         self.root.after(20000, self._confirm_startup_ok)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.report_callback_exception = self._tk_exception
@@ -15071,6 +15807,8 @@ class MiniWireshark:
             m.set_identity(local_nets=self._local_nets(),
                            v6_prefixes=self._local_v6_prefixes())
         m.use_packet_clock = offline
+        m.obs_sink = (getattr(self, "history", None) is not None and
+                      not offline and identity is None)
         return m
 
     def _local_nets(self):
@@ -15970,6 +16708,7 @@ class MiniWireshark:
         self.model.vpn["iface"] = used if (iface_obj is not None and
                                            is_vpn_iface(iface_obj)) else ""
         self.data_mode = "live"
+        self.model.obs_sink = self._history_live()
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self._start_lan_scanner()
@@ -17138,8 +17877,15 @@ class MiniWireshark:
             how.append("looked up through DNS")
         if "HTTP Host" in w.sources:
             how.append("visited over unencrypted http://")
-        devs = "\n".join(f"• {self.short_device_name(k)}"
-                         for k in sorted(w.devices)) or "—"
+        lines = []
+        for k in sorted(w.devices | set(w.ties),
+                        key=lambda k: -ASSOC_RANK.get(
+                            w.ties.get(k, [""])[0], 0)):
+            a = w.ties.get(k, [""])[0]
+            lines.append(f"• {self.short_device_name(k)} — "
+                         f"{LEVEL_GLYPH[ASSOC_LEVEL.get(a, LV_UNKNOWN)]} "
+                         f"{ASSOC_TEXT.get(a, 'unknown')}")
+        devs = "\n".join(lines) or "—"
         sections = [
             ("What is it?", f"{w.domain} (part of {w.registrable}). "
                             f"MiniWireshark {'; '.join(how) or 'saw this name'}"
@@ -17151,7 +17897,9 @@ class MiniWireshark:
                          f"{fmt_clock(w.first_seen, True)}    Last seen: "
                          f"{fmt_clock(w.last_seen, True)}\nSeen via: "
                          f"{sources}\nSecurity: {w.encryption_text()}"),
-            ("Contacted by", devs),
+            ("Which devices, and how we know", devs + "\n\n" +
+             "◉ seen directly · ◎ two observations line up · ◌ a guess. "
+             "A lookup alone doesn't prove a visit."),
             ("Server addresses", ", ".join(sorted(w.resolved_ips)[:12]) or
              "—"),
         ]
@@ -18012,8 +18760,9 @@ class MiniWireshark:
         self._set_geoip_enabled(cfg.get("privacy.geoip_enabled", False),
                                 save=False)
         if cfg.get("history.enabled", False) and self.history is None:
-            self.history = HistoryStore(PATHS.history_db)
+            self.history = self._open_store()
         elif not cfg.get("history.enabled", False) and self.history:
+            self._pump_store(reschedule=False)
             self.history.stop()
             self.history = None
         self.data.unload_disabled()
@@ -18130,6 +18879,63 @@ class MiniWireshark:
                 self.history.submit(lambda con: con.execute(
                     "DELETE FROM baselines"))
             self._set_banner("\U0001F9F9  Learned baselines reset.")
+
+    def _open_store(self):
+        st = Store(PATHS.history_db, self.session_id,
+                   {"source": "live",
+                    "iface": getattr(self, "current_iface_label", "")})
+        if st.recovered:
+            self.root.after(2500, lambda: self._set_banner(
+                "⚠️  " + st.recovered, kind="warn"))
+        return st
+
+    def _history_live(self):
+        """History only ever records live (or idle-between-captures) data —
+        never an imported file, a loaded session or Demo Mode."""
+        m = self.model
+        return (self.history is not None and
+                self.data_mode in ("live", "idle") and not m.demo and
+                not m.use_packet_clock)
+
+    def _pump_store(self, reschedule=True):
+        """Once a second: hand the model's new observations, lookups,
+        timeline events, site ties and finished connections to the store."""
+        m = self.model
+        try:
+            live = self._history_live()
+            m.obs_sink = live
+            if not live:
+                m.obs_pending, m.res_pending, m.tl_pending = [], [], []
+                m.tie_pending = set()
+                m.flows.closed_log.clear()
+            else:
+                st = self.history
+                if m.obs_pending:
+                    batch, m.obs_pending = m.obs_pending, []
+                    st.write_observations(batch)
+                if m.res_pending:
+                    batch, m.res_pending = m.res_pending, []
+                    st.write_resolutions(batch)
+                if m.tl_pending:
+                    batch, m.tl_pending = m.tl_pending, []
+                    st.write_events(batch)
+                if m.tie_pending:
+                    keys, m.tie_pending = m.tie_pending, set()
+                    ties = []
+                    for dev, dom in keys:
+                        w = m.websites.get(dom)
+                        t = w.ties.get(dev) if w is not None else None
+                        if t:
+                            ties.append((dev, dom, list(t)))
+                    st.write_site_ties(ties)
+                if m.flows.closed_log:
+                    fl = list(m.flows.closed_log)
+                    m.flows.closed_log.clear()
+                    st.write_flows(fl)
+        except Exception:                            # noqa: BLE001
+            LOG.exception("history pump")
+        if reschedule:
+            self.root.after(1000, self._pump_store)
 
     def _history_tick(self):
         try:
@@ -18381,6 +19187,9 @@ class MiniWireshark:
             if self.history is not None and self.data_mode in ("live",
                                                                "idle"):
                 self._write_history()
+                for f in list(self.model.flows.active.values()):
+                    self.model.flows.closed_log.append(f)
+                self._pump_store(reschedule=False)
             if self.config.get("history.save_raw_packets", False) and \
                     self.all_rows and self.data_mode in ("live", "idle"):
                 path = os.path.join(PATHS.sessions, time.strftime(
@@ -18407,7 +19216,7 @@ class MiniWireshark:
         self.geoip.stop()
         self.data.stop()
         if self.history is not None:
-            self.history.stop()
+            self.history.stop(wait=5.0)
         with contextlib.suppress(tk.TclError):
             self.root.destroy()
         for w in (self.worker, self.watcher, self.prober, self.demo,
@@ -19650,6 +20459,8 @@ def replay_frames(model, frames, decoder=None, tick_every=500):
         d = dec(raw, ts, lt)
         if d is None:
             continue
+        model.count_frames = getattr(model, "count_frames", 0) + 1
+        d["no"] = model.count_frames
         learn_names_from(model.cache, d)
         model.ingest(d)
         if tick_every and i % tick_every == tick_every - 1:
@@ -19741,6 +20552,37 @@ def golden_checks(model):
 
 
 GOLDEN_EXTRA = []       # later milestones append (model) -> str|None checks
+
+
+def _golden_ties(model):
+    S = ScenarioBuilder
+    w = model.websites
+    want = [("www.example.com", S.ME[1], AS_CONNECTED),
+            ("tracker.example.net", S.PHONE[1], AS_LOOKUP_ONLY),
+            ("video.example.net", S.PHONE[1], AS_CONNECTED),
+            ("files.example.org", S.TV[1], AS_CONNECTED_LOOKUP),
+            ("www.example.com", S.LAPTOP[1], AS_CONNECTED)]
+    bad = []
+    for dom, dev, assoc in want:
+        rec = w.get(dom)
+        got = rec.ties.get(dev, [""])[0] if rec else "(no site)"
+        if got != assoc:
+            bad.append(f"{dom}/{dev}: {got!r} != {assoc!r}")
+    f = [fl for fl in model.flows.all_flows()
+         if fl.domain == "files.example.org"]
+    if not f or f[0].assoc != AS_CONNECTED_LOOKUP:
+        bad.append("TV flow not correlated with its lookup")
+    if bad:
+        return "site ties: " + "; ".join(bad)
+    obs = model.observations_for(S.PHONE[1], kinds=("dhcp_ack",))
+    if not obs or obs[-1][5] is None:
+        return "phone DHCP lease has no packet-backed observation"
+    if not model.observations_for("site:www.example.com"):
+        return "no observations for www.example.com"
+    return None
+
+
+GOLDEN_EXTRA.append(_golden_ties)
 
 
 # ============================================================================
@@ -20783,6 +21625,115 @@ def bench_pipeline():
 
 BENCH_EXTRA = [bench_pipeline]
 
+@self_test()
+def t_store_roundtrip(ctx):
+    st = Store(ctx.path("s.sqlite3"), session_id=42)
+    assert st.schema_version() == STORE_SCHEMA_VERSION, st.error
+    obs = [(1, 100.0, "dns_answer", "aa:bb", {"domain": "x.example",
+                                              "ip": "93.184.215.14"}, 7),
+           (2, 101.0, "tls_sni", "aa:bb", {"domain": "x.example"}, 9)]
+    assert st.write_observations(obs)
+    assert st.write_resolutions([(100.0, "aa:bb", "x.example",
+                                  "93.184.215.14")])
+    f = FlowRecord(5, ("TCP",), "TCP", "192.168.1.5", 4000,
+                   "93.184.215.14", 443, 100.5)
+    f.device_key, f.domain, f.assoc = "aa:bb", "x.example", AS_CONNECTED
+    assert st.write_flows([f])
+    assert st.write_site_ties([("aa:bb", "x.example",
+                                [AS_CONNECTED, 100.0, 101.0, 2])])
+    assert st.write_events([{"when": 102.0, "kind": "website",
+                             "severity": "INFO", "text": "First visit",
+                             "ref": ("website", "x.example"),
+                             "device": "aa:bb"}])
+    assert st.flush_now(10)
+    got = st.observations("aa:bb")
+    assert [o[1] for o in got] == ["tls_sni", "dns_answer"], got
+    assert got[1][2]["ip"] == "93.184.215.14" and got[1][3] == 7
+    c = st.counts()
+    assert c["observations"] == 2 and c["flows"] == 1 and \
+        c["site_ties"] == 1 and c["events"] == 1 and c["sessions"] >= 1, c
+    r = st.query("SELECT assoc, domain FROM flows WHERE device=?",
+                 ("aa:bb",))
+    assert r == [(AS_CONNECTED, "x.example")]
+    try:
+        st.query("DELETE FROM flows")
+        raise AssertionError("write through query()")
+    except ValueError:
+        pass
+    st.prune(1)          # everything above is from 1970: pruned
+    assert st.flush_now(10)
+    assert st.counts()["observations"] == 0
+    st.stop(5)
+
+
+@self_test()
+def t_store_migrates_v1_file(ctx):
+    path = ctx.path("old.sqlite3")
+    con = sqlite3.connect(path)
+    for stmt in STORE_MIGRATIONS[1].split(";"):
+        if stmt.strip():
+            con.execute(stmt)
+    con.execute("INSERT OR REPLACE INTO meta VALUES('schema','1')")
+    con.execute("INSERT INTO devices VALUES('k1', ?, 1, 2)",
+                (json.dumps({"a": 1}),))
+    con.commit()
+    con.close()
+    st = Store(path)
+    assert st.schema_version() == STORE_SCHEMA_VERSION, st.error
+    assert os.path.exists(path + ".v1.bak")
+    assert st.known_device_rows()[0][0] == "k1"
+    log = st.query("SELECT version, phase FROM migration_log ORDER BY "
+                   "rowid")
+    want = [(v, ph) for v in range(2, STORE_SCHEMA_VERSION + 1)
+            for ph in ("start", "done")]
+    assert log == want, log
+    st.stop(5)
+
+
+@self_test()
+def t_store_recovers_from_corruption(ctx):
+    path = ctx.path("bad.sqlite3")
+    good = Store(path)
+    good.write_events([{"when": time.time(), "kind": "x", "text": "keep"}])
+    good.flush_now(10)
+    good.stop(5)
+    shutil.copyfile(path, path + ".bak")
+    with open(path, "wb") as f:
+        f.write(b"SQLite format 3\x00" + os.urandom(4096))
+    st = Store(path)
+    assert st.recovered and "backup" in st.recovered, st.recovered
+    assert st.counts()["events"] == 1
+    assert any(n.startswith("bad.sqlite3.corrupt-")
+               for n in os.listdir(ctx.tmp))
+    st.stop(5)
+    os.remove(path + ".bak")
+    with open(path, "wb") as f:
+        f.write(b"not a database at all" * 50)
+    st2 = Store(path)
+    assert st2.recovered and st2.schema_version() == STORE_SCHEMA_VERSION
+    st2.stop(5)
+
+
+@self_test()
+def t_session_v3_keeps_evidence(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    payload = json.loads(json.dumps(SessionCodec.serialize(m), default=str))
+    assert payload["schema_version"] == 3
+    m2 = NetworkModel(ctx.cfg())
+    SessionCodec.load(payload, m2)
+    w = m2.websites["tracker.example.net"]
+    assert w.ties[ScenarioBuilder.PHONE[1]][0] == AS_LOOKUP_ONLY
+    assert any(f.assoc == AS_CONNECTED_LOOKUP for f in m2.flows.all_flows())
+    assert m2.observations_for(ScenarioBuilder.PHONE[1])
+    v2 = dict(payload, schema_version=2)
+    v2.pop("observations")
+    SessionCodec.load(v2, NetworkModel(ctx.cfg()))
+
+
+BENCH_EXTRA.append(bench_store)
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -20950,6 +21901,35 @@ def _gs_live(app, ctx):
     _gui_pump(app.root, 0.5)
     assert app.sniffer is None and app.data_mode == "idle"
     print(f"      (source: {kind}, {app.count} packets)")
+
+
+@gui_test_step("history store records live evidence (and survives reopen)")
+def _gs_history(app, ctx):
+    root = app.root
+    assert app.history is not None, "history should be on in the GUI test"
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "live"
+    app._pump_store(reschedule=False)      # what the 1 s tick does
+    assert m.obs_sink
+    sink = app.lossless_sink()
+    for raw, _ts, lt in ctx.frames():
+        sink(raw, time.time(), lt)
+    _gui_pump(root, 0.3, lambda: not len(app.ring) and not app.worker.busy,
+              timeout=30)
+    app._pump_store(reschedule=False)
+    assert app.history.flush_now(10)
+    c = app.history.counts()
+    assert c["observations"] > 20 and c["site_ties"] >= 4 and \
+        c["events"] > 0, c
+    # a second, independent connection sees the same data (crash-safe)
+    other = Store(PATHS.history_db, session_id=999)
+    c2 = other.counts()
+    other.stop(5)
+    assert c2["observations"] >= c["observations"], (c, c2)
+    app.data_mode = "idle"
 
 
 def run_gui_test(live=False):
