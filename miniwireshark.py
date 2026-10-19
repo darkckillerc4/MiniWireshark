@@ -11656,7 +11656,8 @@ def _default_config():
         "privacy": {"geoip_enabled": False, "local_asn_db": False,
                     "auto_download_reference": True},
         "history": {"enabled": False, "retention": "30 days",
-                    "custom_days": 14, "save_raw_packets": False},
+                    "custom_days": 14, "save_raw_packets": False,
+                    "packet_ring": False, "packet_ring_mb": 200},
         "filters": {"presets": json.loads(json.dumps(DEFAULT_FILTER_PRESETS))},
         "diagnostics": {"verbose_logging": False},
     }
@@ -12324,6 +12325,19 @@ class Store:
             self.written["events"] += len(rows)
         return self.submit(job)
 
+    def set_session_meta(self, **meta):
+        cols = {k: v for k, v in meta.items()
+                if k in ("source", "iface", "network")}
+        if not cols:
+            return True
+        sess = self.session
+
+        def job(con):
+            for k, v in cols.items():
+                con.execute(f"UPDATE sessions SET {k}=? WHERE id=?",
+                            (str(v), sess))
+        return self.submit(job)
+
     def write_segment(self, first_no, last_no, t0, t1, path, nbytes, lt):
         sess = self.session
 
@@ -12563,6 +12577,328 @@ def change_digest(model, store=None, since=0.0, until=None):
               "dns_changes", "network", "alerts"):
         out[k].sort(key=lambda t: t[0])
     return out
+
+
+def timeline_match(e, since=0.0, severity="All", category="All types",
+                   device=None, q=""):
+    """The in-memory Timeline filter (timeline_sql is its SQL twin)."""
+    if e["when"] < since:
+        return False
+    if severity and severity != "All" and severity != e["severity"]:
+        return False
+    if category and category != "All types" and \
+            TIMELINE_CATEGORY.get(e["kind"], "Devices") != category:
+        return False
+    if device and e.get("device") != device:
+        return False
+    q = (q or "").strip().lower()
+    if q:
+        q = q.replace("%", "").replace("_", "")
+        if q not in e["text"].lower() and q not in e["kind"].lower():
+            return False
+    return True
+
+
+def timeline_sql(category="All types", severity="All", device=None, q="",
+                 since=0.0, until=None, before=None, limit=200,
+                 session=None):
+    """The Timeline's filters compiled to one read-only SQL query over the
+    events table (same meaning as the in-memory filter)."""
+    where, args = ["ts >= ?"], [since]
+    if until is not None:
+        where.append("ts <= ?")
+        args.append(until)
+    if isinstance(before, (tuple, list)):
+        # keyset paging: (ts, rowid) of the last row of the previous page,
+        # so events sharing a timestamp are never skipped
+        where.append("(ts < ? OR (ts = ? AND rowid < ?))")
+        args += [before[0], before[0], before[1]]
+    elif before is not None:
+        where.append("ts < ?")
+        args.append(before)
+    if severity and severity != "All":
+        where.append("severity = ?")
+        args.append(severity)
+    if category and category != "All types":
+        kinds = [k for k, c in TIMELINE_CATEGORY.items() if c == category]
+        if category == "Devices":
+            # anything not explicitly categorised counts as a device event
+            other = [k for k in TIMELINE_CATEGORY]
+            where.append("(kind IN (%s) OR kind NOT IN (%s))" % (
+                ",".join("?" * len(kinds)), ",".join("?" * len(other))))
+            args += kinds + other
+        else:
+            where.append("kind IN (%s)" % ",".join("?" * len(kinds)))
+            args += kinds
+    if device:
+        where.append("device = ?")
+        args.append(device)
+    if q:
+        where.append("(LOWER(text) LIKE ? OR LOWER(kind) LIKE ?)")
+        like = "%" + q.lower().replace("%", "").replace("_", "") + "%"
+        args += [like, like]
+    if session is not None:
+        where.append("session = ?")
+        args.append(session)
+    sql = ("SELECT ts, kind, severity, text, ref_kind, ref_id, device, "
+           "session, rowid FROM events WHERE " + " AND ".join(where) +
+           " ORDER BY ts DESC, rowid DESC LIMIT ?")
+    args.append(int(limit))
+    return sql, args
+
+
+def store_events_page(store, before=None, limit=200, **filters):
+    """One page of timeline events (newest first) as timeline dicts."""
+    sql, args = timeline_sql(before=before, limit=limit, **filters)
+    out = []
+    for ts, kind, sev, text, rk, rid, dev, sess, rowid in \
+            store.query(sql, args):
+        ref = (rk, rid) if rk else None
+        if ref and rk == "flow":
+            with contextlib.suppress(TypeError, ValueError):
+                ref = (rk, int(rid))
+        out.append({"when": ts, "kind": kind, "severity": sev,
+                    "text": text, "ref": ref, "device": dev or "",
+                    "session": sess, "live": False, "rowid": rowid})
+    return out
+
+
+def store_sessions(store, limit=60):
+    rows = store.query("SELECT id, started, ended, source, iface, network "
+                       "FROM sessions ORDER BY started DESC LIMIT ?",
+                       (limit,))
+    return [{"id": r[0], "started": r[1], "ended": r[2], "source": r[3],
+             "iface": r[4], "network": r[5]} for r in rows]
+
+
+def session_label(s):
+    end = fmt_clock(s["ended"]) if s.get("ended") else "running"
+    net = f" · {s['network']}" if s.get("network") else ""
+    return (f"{fmt_clock(s['started'], True)} → {end}{net} "
+            f"[#{s['id']}]")
+
+
+def session_profile(store, sid):
+    """Devices, websites and event counts recorded for one session."""
+    devices = {}
+    for subj, data in store.query(
+            "SELECT subject, data FROM observations WHERE session=? AND "
+            "kind IN (?,?,?,?,?) LIMIT 50000",
+            (sid, OBS_KIND_CODES["dhcp_request"], OBS_KIND_CODES["dhcp_ack"],
+             OBS_KIND_CODES["mdns"], OBS_KIND_CODES["arp_reply"],
+             OBS_KIND_CODES["nbns"])):
+        name = devices.get(subj, "")
+        if not name and data:
+            with contextlib.suppress(ValueError, TypeError):
+                d = json.loads(data)
+                name = d.get("hostname") or d.get("name") or ""
+        devices[subj] = name
+    for (subj,) in store.query("SELECT DISTINCT subject FROM observations "
+                               "WHERE session=? AND subject NOT LIKE 'site:%' "
+                               "AND subject NOT LIKE 'flow:%' LIMIT 20000",
+                               (sid,)):
+        devices.setdefault(subj, "")
+    sites = {}
+    for dom, assoc in store.query("SELECT domain, assoc FROM site_ties "
+                                  "WHERE session=?", (sid,)):
+        root = registrable_domain(dom)
+        sites[root] = better_assoc(assoc, sites.get(root, ""))
+    kinds = dict(store.query("SELECT kind, COUNT(*) FROM events WHERE "
+                             "session=? GROUP BY kind", (sid,)))
+    return {"devices": devices, "sites": sites, "events": kinds}
+
+
+def compare_sessions(store, a, b):
+    """What differs between session a (older) and b (newer)."""
+    pa, pb = session_profile(store, a), session_profile(store, b)
+    da, db = set(pa["devices"]), set(pb["devices"])
+    sa, sb = set(pa["sites"]), set(pb["sites"])
+    return {"new_devices": sorted(db - da), "gone_devices": sorted(da - db),
+            "both_devices": sorted(da & db),
+            "new_sites": sorted(sb - sa), "gone_sites": sorted(sa - sb),
+            "names": {**pa["devices"], **pb["devices"]},
+            "events_a": pa["events"], "events_b": pb["events"]}
+
+
+class PacketRing:
+    """Optional on-disk history of raw packets: pcap segments in the data
+    folder, oldest deleted first so it never exceeds its size cap. Lets a
+    proof chip open a packet that has already left memory. Off by
+    default; never uploaded."""
+
+    SEGMENT_BYTES = 8 * 1024 * 1024
+
+    def __init__(self, folder, cap_mb=200, store=None, session=0):
+        self.folder = folder
+        self.cap = max(20, int(cap_mb)) * 1024 * 1024
+        self.store = store
+        self.session = session
+        self.epoch = 0
+        self.q = queue.Queue(maxsize=50000)
+        self.dropped = 0
+        self.written = 0
+        self.index = []       # [first_no, last_no, path, epoch, bytes]
+        self._seg = None
+        self._stop = False
+        self._lock = threading.Lock()
+        os.makedirs(folder, exist_ok=True)
+        # segments of earlier runs still count toward the size cap
+        old = []
+        with contextlib.suppress(OSError):
+            for name in os.listdir(folder):
+                if name.startswith("seg-") and name.endswith(".pcap"):
+                    path = os.path.join(folder, name)
+                    with contextlib.suppress(OSError):
+                        st = os.stat(path)
+                        old.append((st.st_mtime, path, st.st_size))
+        for _m, path, size in sorted(old):
+            self.index.append([-1, -2, path, -1, size])
+        self._enforce_cap()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="packet-ring")
+        self._thread.start()
+
+    def new_epoch(self):
+        """Packet numbers restart (Clear / new model): keep segments apart."""
+        try:
+            self.q.put_nowait(("epoch",))
+        except queue.Full:
+            self.dropped += 1
+
+    def put(self, no, raw, ts, lt):
+        try:
+            self.q.put_nowait((no, raw, ts, lt))
+            return True
+        except queue.Full:
+            self.dropped += 1
+            return False
+
+    def _open(self, no, ts, lt):
+        name = f"seg-{self.session}-{self.epoch}-{no:012d}.pcap"
+        path = os.path.join(self.folder, name)
+        f = open(path, "wb")
+        f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 262144, lt))
+        self._seg = {"f": f, "path": path, "first": no, "last": no - 1,
+                     "t0": ts, "t1": ts, "lt": lt, "bytes": 24}
+
+    def _close(self):
+        seg, self._seg = self._seg, None
+        if seg is None:
+            return
+        with contextlib.suppress(OSError):
+            seg["f"].close()
+        if seg["last"] < seg["first"]:
+            with contextlib.suppress(OSError):
+                os.remove(seg["path"])
+            return
+        self.index.append([seg["first"], seg["last"], seg["path"],
+                           self.epoch, seg["bytes"]])
+        if self.store is not None:
+            self.store.write_segment(seg["first"], seg["last"], seg["t0"],
+                                     seg["t1"], seg["path"], seg["bytes"],
+                                     seg["lt"])
+        self._enforce_cap()
+
+    def _enforce_cap(self):
+        total = sum(e[4] for e in self.index)
+        while self.index and total > self.cap:
+            old = self.index.pop(0)
+            total -= old[4]
+            with contextlib.suppress(OSError):
+                os.remove(old[2])
+
+    def _run(self):
+        while True:
+            try:
+                item = self.q.get(timeout=0.5)
+            except queue.Empty:
+                if self._stop:
+                    break
+                continue
+            if item is None:
+                break
+            try:
+                with self._lock:
+                    self._handle(item)
+            except (OSError, ValueError, TypeError, struct.error) as e:
+                LOG.warning("packet history: %s", e)
+                with self._lock:
+                    with contextlib.suppress(Exception):
+                        self._seg["f"].close()
+                    self._seg = None
+        with self._lock:
+            self._close()
+
+    def _handle(self, item):
+        if item[0] == "epoch":
+            self._close()
+            self.epoch += 1
+            return
+        if item[0] == "flush":
+            if self._seg is not None:
+                self._seg["f"].flush()
+            item[1].set()
+            return
+        no, raw, ts, lt = item
+        seg = self._seg
+        if seg is None or seg["lt"] != lt or no != seg["last"] + 1 \
+                or seg["bytes"] > self.SEGMENT_BYTES:
+            self._close()
+            self._open(no, ts, lt)
+            seg = self._seg
+        ts = float(ts)
+        sec = int(ts)
+        usec = min(999999, max(0, int(round((ts - sec) * 1e6))))
+        seg["f"].write(struct.pack("<IIII", sec & 0xffffffff, usec,
+                                   len(raw), len(raw)))
+        seg["f"].write(raw)
+        seg["last"], seg["t1"] = no, ts
+        seg["bytes"] += 16 + len(raw)
+        self.written += 1
+
+    def flush(self, timeout=3.0):
+        """Wait until everything queued so far is on disk."""
+        ev = threading.Event()
+        try:
+            self.q.put(("flush", ev), timeout=1)
+        except queue.Full:
+            return False
+        return ev.wait(timeout)
+
+    def find(self, no, epoch=None):
+        """(raw, ts, linktype) of packet `no` from disk, or None."""
+        with self._lock:
+            epoch = self.epoch if epoch is None else epoch
+            seg = self._seg
+            candidates = [e[:] for e in reversed(self.index)
+                          if e[3] == epoch and e[0] <= no <= e[1]]
+            if seg is not None and epoch == self.epoch and \
+                    seg["first"] <= no <= seg["last"]:
+                with contextlib.suppress(OSError, ValueError):
+                    seg["f"].flush()
+                candidates.insert(0, [seg["first"], seg["last"], seg["path"],
+                                      epoch, 0])
+        for first, last, path, _ep, _b in candidates:
+            try:
+                for i, frame in enumerate(iter_raw_capture(path)):
+                    if first + i == no:
+                        return frame
+                    if first + i > last:
+                        break
+            except (OSError, ValueError, struct.error):
+                continue
+        return None
+
+    def size_bytes(self):
+        seg = self._seg
+        return sum(e[4] for e in self.index) + (seg["bytes"] if seg else 0)
+
+    def stop(self, wait=3.0):
+        self._stop = True
+        with contextlib.suppress(queue.Full):
+            self.q.put_nowait(None)
+        if wait:
+            self._thread.join(wait)
 
 
 def digest_summary(dg):
@@ -13498,6 +13834,18 @@ SETTINGS_PAGES = [
               "max": 3650, "step": 1, "unit": "days",
               "label": "Custom retention", "requires": "history.enabled",
               "help": "Used when “Keep history for” is Custom."},
+             {"key": "history.packet_ring", "type": "bool",
+              "label": "Keep recent packets on disk (packet history)",
+              "help": "Stores the newest raw packets in files in the data "
+                      "folder (oldest deleted first), so evidence links can "
+                      "open packets that already left memory. Raw packets "
+                      "can contain private information. Off by default; "
+                      "never uploaded."},
+             {"key": "history.packet_ring_mb", "type": "int", "min": 20,
+              "max": 20000, "step": 10, "unit": "MB",
+              "label": "Packet history size", "requires":
+              "history.packet_ring",
+              "help": "The most disk space the packet history may use."},
              {"key": "history.save_raw_packets", "type": "bool",
               "label": "Also save raw packets when closing (off by default)",
               "help": "Writes the packets still in memory to a .pcap file in "
@@ -15702,12 +16050,35 @@ class TimelineTab(BaseTab):
         self.dev_box.bind("<Button-1>", lambda e: self.dev_box.configure(
             values=self.device_choices()), add="+")
         self.zoom_var = tk.StringVar(value="Full session")
-        self._combo(bar, "Show:", self.zoom_var,
-                    ["Last 5 minutes", "Last hour", "Full session"], 13)
+        self.zoom_box = self._combo(bar, "Show:", self.zoom_var,
+                                    self.LIVE_ZOOMS, 15)
         self.pause_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(bar, text="Pause live updates",
-                        variable=self.pause_var,
-                        command=self._on_pause).pack(side="left", padx=(8, 0))
+        self.pause_chk = ttk.Checkbutton(bar, text="Pause live updates",
+                                         variable=self.pause_var,
+                                         command=self._on_pause)
+        self.pause_chk.pack(side="left", padx=(8, 0))
+        bar2 = self.toolbar()
+        self.source_var = tk.StringVar(value="This session")
+        self.source_box = self._combo(bar2, "Source:", self.source_var,
+                                      ["This session", "Saved history"], 14)
+        self.source_box.bind("<<ComboboxSelected>>",
+                             lambda e: self._on_source(), add="+")
+        self.older_btn = ttk.Button(bar2, text="Load 200 older",
+                                    command=self.load_older)
+        self.older_btn.pack(side="left", padx=(0, 10))
+        self.status_lbl = self.lbl(bar2, "", muted=True)
+        self.status_lbl.pack(side="left")
+        ttk.Button(bar2, text="Compare sessions…",
+                   command=self.app.open_compare).pack(side="right")
+        self.changes_btn = ttk.Menubutton(bar2, text="What changed since…")
+        menu = tk.Menu(self.changes_btn, tearoff=False)
+        for period in CHANGE_PERIODS:
+            menu.add_command(label=period, command=lambda p=period:
+                             self.app.open_changes(p))
+        self.changes_btn["menu"] = menu
+        self.changes_btn.pack(side="right", padx=6)
+        self.oldest_ts = self.cursor = None
+        self.exhausted = False
         wrap, self.tree = make_tree(
             self.frame, [("sev", "Severity", 100, "w", False),
                          ("when", "Time", 80, "center", False),
@@ -15728,6 +16099,70 @@ class TimelineTab(BaseTab):
         cb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
         return cb
 
+    LIVE_ZOOMS = ["Last 5 minutes", "Last hour", "Full session"]
+    HISTORY_ZOOMS = ["Last hour", "Last 24 hours", "Last 7 days",
+                     "Last 30 days", "Everything saved"]
+    ZOOM_SECONDS = {"Last 5 minutes": 300, "Last hour": 3600,
+                    "Last 24 hours": 86400, "Last 7 days": 7 * 86400,
+                    "Last 30 days": 30 * 86400}
+
+    def history_mode(self):
+        return self.source_var.get() == "Saved history" and \
+            self.app.history is not None
+
+    def _on_source(self):
+        if self.source_var.get() == "Saved history" and \
+                self.app.history is None:
+            self.source_var.set("This session")
+            self.app._set_banner("Saved history is off. Turn it on in "
+                                 "Settings → History to keep events from "
+                                 "earlier sessions.", kind="info")
+        hist = self.history_mode()
+        zooms = self.HISTORY_ZOOMS if hist else self.LIVE_ZOOMS
+        self.zoom_box.configure(values=zooms)
+        if self.zoom_var.get() not in zooms:
+            self.zoom_var.set("Last 24 hours" if hist else "Full session")
+        self.rebuild()
+
+    def _sql_filters(self):
+        zoom = self.zoom_var.get()
+        secs = self.ZOOM_SECONDS.get(zoom)
+        since = time.time() - secs if secs else 0.0
+        return {"category": self.type_var.get(),
+                "severity": self.sev_var.get(),
+                "device": self.device_key_from_choice(self.dev_var.get()),
+                "q": self.search_var.get().strip(), "since": since}
+
+    def load_older(self):
+        if not self.history_mode() or self.exhausted:
+            return 0
+        rows = store_events_page(self.app.history, before=self.cursor,
+                                 limit=200, **self._sql_filters())
+        for e in rows:
+            self._insert(e)
+        if rows:
+            self.oldest_ts = rows[-1]["when"]
+            self.cursor = (rows[-1]["when"], rows[-1]["rowid"])
+        self.exhausted = len(rows) < 200
+        self._update_status()
+        return len(rows)
+
+    def _update_status(self):
+        hist = self.history_mode()
+        n = len(self.tree.get_children())
+        with contextlib.suppress(tk.TclError):
+            self.older_btn.configure(state="normal" if hist and not
+                                     self.exhausted else "disabled")
+            self.pause_chk.configure(state="disabled" if hist else "normal")
+            if hist:
+                self.status_lbl.configure(
+                    text=f"{n} saved events" + (
+                        f", back to {fmt_clock(self.oldest_ts, True)}"
+                        if self.oldest_ts else "") +
+                    ("" if not self.exhausted else " (all loaded)"))
+            else:
+                self.status_lbl.configure(text=f"{n} events this session")
+
     def on_theme(self):
         for sev, (fg, bg) in self.app._severity_colors().items():
             with contextlib.suppress(tk.TclError):
@@ -15745,20 +16180,8 @@ class TimelineTab(BaseTab):
             self.rebuild()
 
     def _matches(self, e, cutoff, dev_key, q):
-        if e["when"] < cutoff:
-            return False
-        if self.sev_var.get() != "All" and self.sev_var.get() != \
-                e["severity"]:
-            return False
-        typ = self.type_var.get()
-        if typ != "All types" and TIMELINE_CATEGORY.get(e["kind"],
-                                                        "Devices") != typ:
-            return False
-        if dev_key and e.get("device") != dev_key:
-            return False
-        if q and q not in (e["text"] + " " + e["kind"]).lower():
-            return False
-        return True
+        return timeline_match(e, cutoff, self.sev_var.get(),
+                              self.type_var.get(), dev_key, q)
 
     def _filters(self):
         zoom = self.zoom_var.get()
@@ -15769,7 +16192,7 @@ class TimelineTab(BaseTab):
             self.search_var.get().strip().lower()
 
     def add(self, entries):
-        if self.pause_var.get():
+        if self.pause_var.get() or self.history_mode():
             return
         cutoff, dev_key, q = self._filters()
         for e in entries:
@@ -15784,11 +16207,14 @@ class TimelineTab(BaseTab):
     def _insert(self, e, index="end"):
         icon = self.app.SEVERITY_ICON.get(e["severity"], "•")
         try:
+            old = e.get("live", True) is False and \
+                time.time() - e["when"] > 86400
             iid = self.tree.insert(
                 "", index, tags=(e["severity"],),
-                values=(f"{icon} {e['severity']}", fmt_clock(e["when"]),
+                values=(f"{icon} {e['severity']}",
+                        fmt_clock(e["when"], with_date=old),
                         e["kind"], e["text"]))
-            self.refs[iid] = e.get("ref")
+            self.refs[iid] = e
         except tk.TclError:
             pass
 
@@ -15796,20 +16222,43 @@ class TimelineTab(BaseTab):
         self._rebuild_job = None
         self.tree.delete(*self.tree.get_children())
         self.refs.clear()
+        self.oldest_ts, self.cursor, self.exhausted = None, None, False
+        if self.history_mode():
+            self.load_older()
+            return
         cutoff, dev_key, q = self._filters()
         rows = [e for e in self.model.timeline
                 if self._matches(e, cutoff, dev_key, q)]
         for e in reversed(rows[-1500:]):
             self._insert(e)
+        self._update_status()
 
     def _on_double(self, _e=None):
         sel = self.tree.selection()
-        if sel:
-            self.app.open_ref(self.refs.get(sel[0]))
+        if not sel:
+            return
+        e = self.refs.get(sel[0])
+        if not e:
+            return
+        ref = e.get("ref")
+        st = self.app.history
+        this_session = e.get("live", True) is not False or (
+            st is not None and e.get("session") == st.session)
+        if ref and (this_session or ref[0] in ("device", "website")):
+            if ref[0] != "device" or ref[1] in self.model.registry.by_key:
+                self.app.open_ref(ref)
+                return
+        sess = e.get("session")
+        DetailDialog(self.app, e["kind"].capitalize() if e["kind"] else
+                     "Event", [("What happened", e["text"]),
+                               ("When", fmt_clock(e["when"], True)),
+                               ("Recorded in", f"session #{sess}" if sess
+                                else "this session")], size="520x360")
 
     def reset(self):
         self.tree.delete(*self.tree.get_children())
         self.refs.clear()
+        self.oldest_ts, self.cursor, self.exhausted = None, None, False
 
 
 
@@ -18040,14 +18489,26 @@ class PacketsTab(BaseTab):
                  ("proto", "Protocol", 80, "center", False),
                  ("length", "Length", 60, "e", False),
                  ("stream", "Conn.", 55, "e", False),
-                 ("info", "Info", 520, "w", True)], hscroll=True)
-        enable_sorting(self.tree, on_sort=lambda c, r:
-                       self.follow_var.set(False))
+                 ("info", "Info", 520, "w", True)], hscroll=True,
+            sortable=False)
         self.tree.configure(height=14)
         wrap.pack(fill="both", expand=True)
+        self.vbar = next(w for w in wrap.winfo_children()
+                         if isinstance(w, ttk.Scrollbar) and
+                         str(w.cget("orient")) == "vertical")
+        self.vbar.configure(command=self._yscroll)
+        self.tree.configure(yscrollcommand=lambda *a: None)
+        for c in self.tree["columns"]:
+            self.tree.heading(c, command=lambda cc=c: self._sort_by(cc))
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._context)
         self.tree.bind("<Button-2>", self._context)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.tree.bind(seq, self._wheel)
+        for seq in ("<Up>", "<Down>", "<Prior>", "<Next>", "<Home>",
+                    "<End>"):
+            self.tree.bind(seq, self._key)
+        self.tree.bind("<Configure>", lambda e: self.render(), add="+")
         bottom = tk.Frame(vert, bg=WHITE)
         vert.add(bottom, weight=2)
         nb = ttk.Notebook(bottom)
@@ -18068,9 +18529,15 @@ class PacketsTab(BaseTab):
         nb.add(tf, text="Packet details")
         nb.add(df, text="Text dump")
         nb.add(hf, text="Hex dump")
-        self.iids = deque()
-        self.rows_by_iid = {}
-        self.iid_by_no = {}
+        self.matched = []        # filtered rows, in view order
+        self.top = 0             # index of the first visible row
+        self.slots = []          # the Treeview items that show them
+        self.slot_rows = {}
+        self.sel_no = None
+        self._detail_no = None
+        self.sort_col, self.sort_rev = None, False
+        self.rowh = self.head_h = None
+        self._rendering = False
         self.paused = False
         self.filter = DisplayFilter()
         self.ctx = FilterContext(app)
@@ -18104,6 +18571,7 @@ class PacketsTab(BaseTab):
                                   [3])
 
     def on_theme(self):
+        self.rowh = self.head_h = None       # the font may have changed
         self.set_proto(self.proto, redraw=False)
         t = self.t
         with contextlib.suppress(tk.TclError):
@@ -18248,7 +18716,9 @@ class PacketsTab(BaseTab):
         if not self.paused:
             self.rebuild()
 
-    # ---- rows
+    # ---- rows (virtual table: only the visible rows exist as Treeview
+    #      items; the scrollbar, wheel and keys move a window over
+    #      self.matched, which holds the filtered rows in view order)
     def _values(self, d):
         app = self.app
         return (d["no"], "★" if d["no"] in app.bookmarks else "",
@@ -18257,48 +18727,243 @@ class PacketsTab(BaseTab):
                 app.disp_addr(d["dst_ip"], d["dst_mac"]), d["proto"],
                 d["length"], d.get("flow_id") or "", d["text"])
 
+    def _keep(self, d):
+        try:
+            return self.filter.match(d, self.ctx)
+        except Exception:                            # noqa: BLE001
+            return True
+
+    def _count(self):
+        self.count_var.set(f"{len(self.matched)} shown · "
+                           f"{len(self.app.all_rows)} in memory")
+
     def add_rows(self, rows):
         if self.paused or not self.is_visible():
             self._dirty = True
             return
         self.ctx._alert_cache = None
-        last = None
-        for d in rows:
-            try:
-                ok = self.filter.match(d, self.ctx)
-            except Exception:                        # noqa: BLE001
-                ok = True
-            if ok:
-                last = self._insert(d)
+        new = [d for d in rows if self._keep(d)]
+        if new:
+            self.matched.extend(new)
+            if self.sort_col is not None:
+                self._resort()
         self._trim()
-        if last and self.follow_var.get():
-            with contextlib.suppress(tk.TclError):
-                self.tree.see(last)
-        self.count_var.set(f"{len(self.iids)} shown · "
-                           f"{len(self.app.all_rows)} in memory")
+        if new and self.follow_var.get() and self.sort_col is None:
+            self.top = max(0, len(self.matched) - self._nslots())
+        self.render()
+        self._count()
 
-    def _insert(self, d):
-        tags = (d["tag"],) + (("marked",) if d["no"] in self.app.bookmarks
-                              else ())
-        try:
-            iid = self.tree.insert("", "end", tags=tags,
-                                   values=self._values(d))
-        except tk.TclError:
-            return None
-        self.rows_by_iid[iid] = d
-        self.iid_by_no[d["no"]] = iid
-        self.iids.append(iid)
-        return iid
+    def _bisect_no(self, no):
+        """First index in self.matched (in packet order) with number ≥ no."""
+        m = self.matched
+        lo, hi = 0, len(m)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if m[mid]["no"] < no:
+                lo = mid + 1
+            else:
+                hi = mid
+        return lo
 
     def _trim(self):
+        """Drop rows that have left memory (or exceed the row limit)."""
+        rows = self.app.all_rows
+        m = self.matched
+        if not rows:
+            if m:
+                self.matched, self.top = [], 0
+            return
+        lo_no = rows[0]["no"]
         limit = self.app.max_rows
-        while len(self.iids) > limit:
-            old = self.iids.popleft()
-            d = self.rows_by_iid.pop(old, None)
-            if d:
-                self.iid_by_no.pop(d["no"], None)
+        if self.sort_col is None:
+            k = max(self._bisect_no(lo_no), len(m) - limit)
+            if k > 0:
+                del m[:k]
+                self.top = max(0, self.top - k)
+        elif m and (len(m) > limit or min(d["no"] for d in m) < lo_no):
+            self.matched = [d for d in m if d["no"] >= lo_no]
+
+    def index_of_no(self, no):
+        if no is None:
+            return None
+        m = self.matched
+        if self.sort_col is None:
+            i = self._bisect_no(no)
+            return i if i < len(m) and m[i]["no"] == no else None
+        for i, d in enumerate(m):
+            if d["no"] == no:
+                return i
+        return None
+
+    def _row_height(self):
+        if self.rowh:
+            return self.rowh
+        if self.slots:
             with contextlib.suppress(tk.TclError):
-                self.tree.delete(old)
+                bb = self.tree.bbox(self.slots[0])
+                if bb and bb[3] > 4:
+                    self.rowh, self.head_h = bb[3], bb[1]
+                    return self.rowh
+        return None
+
+    def _nslots(self):
+        try:
+            h = self.tree.winfo_height()
+        except tk.TclError:
+            return 14
+        if h <= 1:
+            return 14
+        rh = self._row_height() or 20
+        return max(1, (h - (self.head_h or 24) - 2) // rh)
+
+    def render(self):
+        """Show self.matched[top : top + visible rows] in the slot items."""
+        if self._rendering:
+            return
+        self._rendering = True
+        tree = self.tree
+        try:
+            m = self.matched
+            n = self._nslots()
+            total = len(m)
+            self.top = max(0, min(self.top, total - n))
+            rows = m[self.top:self.top + n]
+            while len(self.slots) < len(rows):
+                self.slots.append(tree.insert("", "end", values=()))
+            while len(self.slots) > len(rows):
+                tree.delete(self.slots.pop())
+            bm = self.app.bookmarks
+            sel_iid = None
+            for iid, d in zip(self.slots, rows):
+                tags = (d["tag"],) + (("marked",) if d["no"] in bm else ())
+                tree.item(iid, values=self._values(d), tags=tags)
+                if d["no"] == self.sel_no:
+                    sel_iid = iid
+            self.slot_rows = dict(zip(self.slots, rows))
+            cur = tree.selection()
+            if sel_iid is not None:
+                if tuple(cur) != (sel_iid,):
+                    tree.selection_set(sel_iid)
+            elif cur:
+                tree.selection_remove(*cur)
+            tree.yview_moveto(0)
+            if total:
+                self.vbar.set(self.top / total,
+                              min(1.0, (self.top + len(rows)) / total))
+            else:
+                self.vbar.set(0.0, 1.0)
+            if self.rowh is None and self.slots:
+                if self._row_height() and len(rows) == n and \
+                        self._nslots() != n:
+                    self._rendering = False
+                    self.render()
+        except tk.TclError:
+            pass
+        finally:
+            self._rendering = False
+
+    def _yscroll(self, *args):
+        if not args:
+            return
+        n = self._nslots()
+        total = len(self.matched)
+        before = self.top
+        try:
+            if args[0] == "moveto":
+                self.top = int(float(args[1]) * total + 0.5)
+            elif args[0] == "scroll":
+                amt = int(float(args[1]))
+                self.top += amt * (max(1, n - 1) if str(args[2]).startswith(
+                    "page") else 1)
+        except (ValueError, IndexError):
+            return
+        self.top = max(0, min(self.top, total - n))
+        if self.top < before and self.follow_var.get():
+            self.follow_var.set(False)       # the user scrolled back
+        self.render()
+
+    def _wheel(self, e):
+        if getattr(e, "num", 0) == 4:
+            step = -3
+        elif getattr(e, "num", 0) == 5:
+            step = 3
+        else:
+            d = getattr(e, "delta", 0)
+            if not d:
+                return "break"
+            step = -3 if d > 0 else 3
+            if abs(d) >= 240:                # fast wheels report multiples
+                step *= min(5, abs(d) // 120)
+        self._yscroll("scroll", step, "units")
+        return "break"
+
+    def _key(self, e):
+        m = self.matched
+        if not m:
+            return "break"
+        n = self._nslots()
+        i = self.index_of_no(self.sel_no)
+        if i is None:
+            i = self.top - 1 if e.keysym in ("Down", "Next") else self.top
+        i = {"Up": i - 1, "Down": i + 1, "Prior": i - (n - 1),
+             "Next": i + (n - 1), "Home": 0,
+             "End": len(m) - 1}.get(e.keysym, i)
+        i = max(0, min(i, len(m) - 1))
+        self.sel_no = m[i]["no"]
+        if i < self.top:
+            self.top = i
+        elif i >= self.top + n:
+            self.top = i - n + 1
+        if i < len(m) - 1 and self.follow_var.get():
+            self.follow_var.set(False)
+        self.render()
+        self._on_select()
+        return "break"
+
+    SORTERS = {
+        "no": lambda tab, d: d["no"],
+        "mark": lambda tab, d: (d["no"] in tab.app.bookmarks, d["no"]),
+        "time": lambda tab, d: (d["time"], d["no"]),
+        "src": lambda tab, d: (tab.app.disp_addr(d["src_ip"], d["src_mac"])
+                               .lower(), d["no"]),
+        "dst": lambda tab, d: (tab.app.disp_addr(d["dst_ip"], d["dst_mac"])
+                               .lower(), d["no"]),
+        "proto": lambda tab, d: (d["proto"], d["no"]),
+        "length": lambda tab, d: (d["length"], d["no"]),
+        "stream": lambda tab, d: (d.get("flow_id") or 0, d["no"]),
+        "info": lambda tab, d: (d["text"].lower(), d["no"]),
+    }
+
+    def _resort(self):
+        if self.sort_col is None:
+            self.matched.sort(key=lambda d: d["no"])
+            return
+        fn = self.SORTERS.get(self.sort_col, self.SORTERS["no"])
+        self.matched.sort(key=lambda d: fn(self, d), reverse=self.sort_rev)
+
+    def _sort_by(self, col):
+        """Click a heading: sort by it; click again to reverse. Sorting by
+        No. ascending returns to the normal (live) order."""
+        if self.sort_col == col or (self.sort_col is None and col == "no"):
+            self.sort_rev = not self.sort_rev
+            self.sort_col = col
+        else:
+            self.sort_col, self.sort_rev = col, False
+        if self.sort_col == "no" and not self.sort_rev:
+            self.sort_col = None
+        if self.sort_col is not None:
+            self.follow_var.set(False)
+        self._resort()
+        for c in self.tree["columns"]:
+            with contextlib.suppress(tk.TclError):
+                txt = self.tree.heading(c, "text").rstrip(" ▲▼")
+                if c == (self.sort_col or ""):
+                    txt += " ▼" if self.sort_rev else " ▲"
+                self.tree.heading(c, text=txt)
+        i = self.index_of_no(self.sel_no)
+        n = self._nslots()
+        self.top = max(0, i - n // 2) if i is not None else 0
+        self.render()
 
     def refresh(self):
         if self._dirty and not self.paused and self.is_visible():
@@ -18306,56 +18971,49 @@ class PacketsTab(BaseTab):
             self.rebuild()
 
     def rebuild(self):
-        self.tree.delete(*self.tree.get_children())
-        self.iids.clear()
-        self.rows_by_iid.clear()
-        self.iid_by_no.clear()
+        self._dirty = False
         self.ctx._alert_cache = None
-        rows = list(self.app.all_rows)
-        shown = 0
-        for d in reversed(rows):
-            try:
-                ok = self.filter.match(d, self.ctx)
-            except Exception:                        # noqa: BLE001
-                ok = True
-            if ok:
-                shown += 1
-                if shown > self.app.max_rows:
-                    break
-        start = 0
-        if shown > self.app.max_rows:
-            start = len(rows) - shown
-        for d in rows[max(0, start):]:
-            try:
-                ok = self.filter.match(d, self.ctx)
-            except Exception:                        # noqa: BLE001
-                ok = True
-            if ok:
-                self._insert(d)
-        self._trim()
-        if self.iids and self.follow_var.get():
-            with contextlib.suppress(tk.TclError):
-                self.tree.see(self.iids[-1])
-        self.count_var.set(f"{len(self.iids)} shown · "
-                           f"{len(self.app.all_rows)} in memory")
+        rows = self.app.all_rows
+        m = [d for d in rows if self._keep(d)]
+        if len(m) > self.app.max_rows:
+            m = m[-self.app.max_rows:]
+        self.matched = m
+        if self.sort_col is not None:
+            self._resort()
+        n = self._nslots()
+        if self.follow_var.get() and self.sort_col is None:
+            self.top = max(0, len(m) - n)
+        else:
+            i = self.index_of_no(self.sel_no)
+            if i is not None and not (self.top <= i < self.top + n):
+                self.top = max(0, i - n // 2)
+        self.render()
+        self._count()
 
     def refresh_names(self):
-        for iid, d in list(self.rows_by_iid.items())[-800:]:
-            with contextlib.suppress(tk.TclError):
-                self.tree.set(iid, "src", self.app.disp_addr(d["src_ip"],
-                                                             d["src_mac"]))
-                self.tree.set(iid, "dst", self.app.disp_addr(d["dst_ip"],
-                                                             d["dst_mac"]))
+        self.render()
 
     # ---- details
     def _selected_row(self):
         sel = self.tree.selection()
-        return self.rows_by_iid.get(sel[0]) if sel else None
+        d = self.slot_rows.get(sel[0]) if sel else None
+        if d is not None:
+            return d
+        i = self.index_of_no(self.sel_no)
+        return self.matched[i] if i is not None else None
 
     def _on_select(self, _e=None):
-        d = self._selected_row()
+        sel = self.tree.selection()
+        d = self.slot_rows.get(sel[0]) if sel else None
+        if d is None:
+            i = self.index_of_no(self.sel_no)
+            d = self.matched[i] if i is not None else None
         if not d:
             return
+        self.sel_no = d["no"]
+        if self._detail_no == d["no"]:
+            return
+        self._detail_no = d["no"]
         pkt = packet_object(d)
         self.dtree.delete(*self.dtree.get_children())
         summary = self.dtree.insert("", "end", text="Summary", open=True,
@@ -18410,26 +19068,36 @@ class PacketsTab(BaseTab):
         return None
 
     def select_no(self, no):
-        iid = self.iid_by_no.get(no)
-        if iid is None and any(d["no"] == no for d in self.app.all_rows):
+        """Select packet `no` (scrolls to it; clears the filter if the
+        filter hides it). False if it is no longer in memory."""
+        if self._dirty:
+            self.rebuild()
+        i = self.index_of_no(no)
+        if i is None and any(d["no"] == no for d in self.app.all_rows):
             self.follow_var.set(False)
             self.clear_filter()
-            iid = self.iid_by_no.get(no)
-        if iid:
-            with contextlib.suppress(tk.TclError):
-                self.tree.selection_set(iid)
-                self.tree.see(iid)
-            return True
-        return False
+            i = self.index_of_no(no)
+        if i is None:
+            return False
+        self.follow_var.set(False)
+        self.sel_no = no
+        n = self._nslots()
+        if not (self.top <= i < self.top + n):
+            self.top = max(0, i - n // 2)
+        self.render()
+        self._on_select()
+        return True
 
     def _context(self, event):
         iid = self.tree.identify_row(event.y)
         if not iid:
             return
-        self.tree.selection_set(iid)
-        d = self.rows_by_iid.get(iid)
+        d = self.slot_rows.get(iid)
         if not d:
             return
+        self.sel_no = d["no"]
+        with contextlib.suppress(tk.TclError):
+            self.tree.selection_set(iid)
         app = self.app
         src = f"{d['src_ip'] or d['src_mac']}" + (
             f":{d['sport']}" if d["sport"] is not None else "")
@@ -18467,18 +19135,15 @@ class PacketsTab(BaseTab):
             app.bookmarks.discard(d["no"])
         else:
             app.bookmarks.add(d["no"])
-        iid = self.iid_by_no.get(d["no"])
-        if iid:
-            tags = (d["tag"],) + (("marked",) if d["no"] in app.bookmarks
-                                  else ())
-            with contextlib.suppress(tk.TclError):
-                self.tree.item(iid, tags=tags, values=self._values(d))
+        self.render()
 
     def reset(self):
         self.tree.delete(*self.tree.get_children())
-        self.iids.clear()
-        self.rows_by_iid.clear()
-        self.iid_by_no.clear()
+        self.matched, self.slots, self.slot_rows = [], [], {}
+        self.top, self.sel_no, self._detail_no = 0, None, None
+        with contextlib.suppress(tk.TclError):
+            self.vbar.set(0.0, 1.0)
+        self._count()
         self.dtree.delete(*self.dtree.get_children())
         for w in (self.details, self.hexview):
             w.config(state="normal")
@@ -18653,6 +19318,8 @@ class MiniWireshark:
         self.session_id = int(time.time())
         self.history = self._open_store() \
             if self.config.get("history.enabled", False) else None
+        self.packet_ring = None
+        self._sync_packet_ring()
         self.geoip = GeoIPService(self._geoip_on_result)
         self.geoip.set_enabled(self.config.get("privacy.geoip_enabled",
                                                False))
@@ -18819,6 +19486,8 @@ class MiniWireshark:
         Every tab is reset so no old row can linger."""
         self.gen += 1                 # frames of the old source are dropped
         self.ring.clear()
+        if getattr(self, "packet_ring", None) is not None:
+            self.packet_ring.new_epoch()
         self.pending_rows.clear()
         self.model = model
         self.all_rows.clear()
@@ -19170,6 +19839,10 @@ class MiniWireshark:
             auto_trusted = True
         changed = fp != self.network_fp
         self.network_fp = fp
+        if self.history is not None:
+            self.history.set_session_meta(
+                network=(self.networks.get(fp) or {}).get("name", ""),
+                iface=self.current_iface_label)
         self.network_profile = self.networks.get(fp)
         self.model.registry.network_id = fp
         self.model.network_id = fp
@@ -19391,18 +20064,56 @@ class MiniWireshark:
         self.config.save()
 
     def jump_to_packet(self, no):
-        """Open the Packets tab on packet `no` (the proof behind a claim)."""
-        if self.beginner_mode:
-            self.mode_ui_var.set("Advanced")
-            self._on_ui_mode_change()
-        tab = self._select_tab("packets")
-        if tab.select_no(no):
+        """Open the Packets tab on packet `no` (the proof behind a claim);
+        packets that left memory come from the on-disk packet history."""
+        in_memory = any(d["no"] == no for d in self.all_rows) if \
+            self.all_rows and self.all_rows[0]["no"] <= no else False
+        if in_memory:
+            if self.beginner_mode:
+                self.mode_ui_var.set("Advanced")
+                self._on_ui_mode_change()
+            tab = self._select_tab("packets")
+            if tab.select_no(no):
+                return True
+        frame = self.packet_ring.find(no) if self.packet_ring else None
+        if frame is not None:
+            self.show_packet_from_disk(no, frame)
             return True
         self._set_banner(f"Packet #{no} is no longer in memory (only the "
                          f"newest {self.max_rows} are kept). Turn on the "
                          f"packet history in Settings → History to keep "
                          f"older packets on disk.", kind="warn")
         return False
+
+    def show_packet_from_disk(self, no, frame):
+        raw, ts, lt = frame
+        d = fast_decode(raw, ts, lt)
+        pkt = packet_object(d)
+        try:
+            dump = pkt.show(dump=True) if pkt is not None else ""
+            hexd = hexdump(pkt, dump=True) if pkt is not None else raw.hex()
+        except Exception as e:                       # noqa: BLE001
+            dump, hexd = f"(could not decode: {e})", raw.hex()
+        DetailDialog(self, f"Packet #{no} (from the packet history)", [
+            ("Summary", f"{fmt_clock(ts, True)}  {d['src']} → {d['dst']}  "
+                        f"{d['proto']}  {d['length']} bytes\n{d['text']}"),
+            ("Decoded", dump), ("Hex", hexd)], size="760x620")
+
+    def _sync_packet_ring(self):
+        want = bool(self.config.get("history.packet_ring", False))
+        pr = self.packet_ring
+        if want and pr is None:
+            self.packet_ring = PacketRing(
+                os.path.join(PATHS.data, "packets"),
+                self.config.get("history.packet_ring_mb", 200),
+                self.history, self.session_id)
+        elif not want and pr is not None:
+            pr.stop()
+            self.packet_ring = None
+        elif pr is not None:
+            pr.cap = max(20, int(self.config.get("history.packet_ring_mb",
+                                                 200))) * 1024 * 1024
+            pr.store = self.history
 
     def _bind_inspector(self):
         def handler(tab):
@@ -19502,6 +20213,98 @@ class MiniWireshark:
         ]
         DetailDialog(self, f"What changed — {period.lower()}", sections,
                      size="700x600")
+
+    def open_compare(self):
+        """Pick two saved sessions and show what differs between them."""
+        st = self.history
+        if st is None:
+            self._set_banner("Comparing sessions needs the saved history. "
+                             "Turn it on in Settings → History.", kind="info")
+            return None
+        sessions = store_sessions(st)
+        if len(sessions) < 2:
+            self._set_banner("There is only one saved session so far — "
+                             "come back after the next one.", kind="info")
+            return None
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title("Compare sessions")
+        win.geometry("620x230")
+        win.configure(bg=t["tab_bg"])
+        win.transient(self.root)
+        labels = [session_label(x) for x in sessions]
+        by_label = dict(zip(labels, sessions))
+        a_var = tk.StringVar(value=labels[1])
+        b_var = tk.StringVar(value=labels[0])
+        body = tk.Frame(win, bg=t["tab_bg"], padx=16, pady=12)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text="Show what changed between two sessions.",
+                 bg=t["tab_bg"], fg=t["text_fg"],
+                 font=("TkDefaultFont", 11, "bold")).grid(
+                     row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+        for r, (txt, var) in enumerate((("Older session:", a_var),
+                                        ("Newer session:", b_var)), 1):
+            tk.Label(body, text=txt, bg=t["tab_bg"],
+                     fg=t["text_fg"]).grid(row=r, column=0, sticky="w")
+            ttk.Combobox(body, textvariable=var, values=labels, width=58,
+                         state="readonly").grid(row=r, column=1, sticky="we",
+                                                pady=3, padx=(8, 0))
+
+        def go():
+            a, b = by_label[a_var.get()], by_label[b_var.get()]
+            if a["id"] == b["id"]:
+                return
+            if a["started"] > b["started"]:
+                a, b = b, a
+            win.destroy()
+            self.show_compare(a, b)
+        btns = tk.Frame(body, bg=t["tab_bg"])
+        btns.grid(row=3, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="right")
+        ttk.Button(btns, text="Compare", command=go).pack(side="right",
+                                                          padx=6)
+        self._compare_win = win
+        return win
+
+    def show_compare(self, a, b):
+        res = compare_sessions(self.history, a["id"], b["id"])
+        names = res["names"]
+
+        def dev_name(k):
+            reg = self.model.registry
+            d = reg.by_key.get(reg.resolve(k)) if k else None
+            if d is not None:
+                return d.display_name()
+            return names.get(k) or k
+
+        def lst(keys, fn=dev_name):
+            return "\n".join(f"• {fn(k)}" for k in keys[:80]) + (
+                f"\n… and {len(keys) - 80} more" if len(keys) > 80
+                else "") if keys else "—"
+        ev_lines = []
+        for k in sorted(set(res["events_a"]) | set(res["events_b"])):
+            na, nb = res["events_a"].get(k, 0), res["events_b"].get(k, 0)
+            if na != nb:
+                ev_lines.append(f"{k}: {na} → {nb}")
+        summary = (f"{len(res['new_devices'])} device(s) only in the newer "
+                   f"session, {len(res['gone_devices'])} only in the older; "
+                   f"{len(res['both_devices'])} in both. "
+                   f"{len(res['new_sites'])} new website(s), "
+                   f"{len(res['gone_sites'])} no longer seen.")
+        self._last_compare = res
+        DetailDialog(self, "Compare sessions", [
+            ("Sessions", f"Older: {session_label(a)}\nNewer: "
+                         f"{session_label(b)}"),
+            ("Summary", summary),
+            ("Devices only in the newer session", lst(res["new_devices"])),
+            ("Devices only in the older session", lst(res["gone_devices"])),
+            ("Websites first seen in the newer session",
+             lst(res["new_sites"], str)),
+            ("Websites not seen again", lst(res["gone_sites"], str)),
+            ("Event counts that changed", "\n".join(ev_lines) or "—")],
+            size="680x640")
+        return res
 
     # ---- one-click Repair, Runtime Manager, Quick Start (M6b) ----------------------
     def _on_tk(self, fn, timeout=120):
@@ -20645,6 +21448,12 @@ class MiniWireshark:
                 for ip in (d["src_ip"], d["dst_ip"]):
                     if ip and not cache.get(ip) and is_private_ip(ip):
                         self.rdns.lookup(ip)
+        pr = self.packet_ring
+        if pr is not None and self.data_mode == "live":
+            for d in rows:
+                raw = d.get("raw")
+                if raw is not None:
+                    pr.put(d["no"], raw, d["time"], d.get("linktype", 1))
         if len(self.pending_rows) > self.max_rows * 2:
             for _ in range(len(self.pending_rows) - self.max_rows):
                 self.pending_rows.popleft()
@@ -22452,9 +23261,9 @@ class MiniWireshark:
 
     def _export_csv(self, current_view):
         tab = self.tabs["packets"]
-        rows = [tab.rows_by_iid[i] for i in tab.iids
-                if i in tab.rows_by_iid] if current_view else \
-            list(self.all_rows)
+        if current_view and tab._dirty:
+            tab.rebuild()
+        rows = list(tab.matched) if current_view else list(self.all_rows)
         if not rows:
             messagebox.showinfo("Export CSV", "Nothing to export yet." +
                                 (" (Open the Packets tab to build the "
@@ -22722,6 +23531,7 @@ class MiniWireshark:
             self.max_rows = new_max
             self.all_rows = deque(self.all_rows, maxlen=new_max)
             self.tabs["packets"]._trim()
+            self.tabs["packets"].render()
         self.model.flows.resize(cfg.get("connections.max_active", 5000),
                                 cfg.get("connections.archive_size", 2000))
         self.beginner_mode = bool(cfg.get("appearance.beginner_mode", True))
@@ -22757,6 +23567,7 @@ class MiniWireshark:
             self._pump_store(reschedule=False)
             self.history.stop()
             self.history = None
+        self._sync_packet_ring()
         self.data.unload_disabled()
         self.data.start()
         for w in self.model.websites.values():
@@ -23210,6 +24021,8 @@ class MiniWireshark:
             self.rdns.stop()
         self.geoip.stop()
         self.data.stop()
+        if self.packet_ring is not None:
+            self.packet_ring.stop()
         if self.history is not None:
             self.history.stop(wait=5.0)
         with contextlib.suppress(tk.TclError):
@@ -26139,6 +26952,171 @@ def t_least_privilege(ctx):
     if not IS_WINDOWS and not is_admin():
         assert needs_elevation()
 
+@self_test()
+def t_timeline_sql_matches_memory(ctx):
+    """The SQL timeline filter returns exactly what the in-memory filter
+    shows, for every combination the Timeline tab can produce."""
+    if not ctx.scapy_ok:
+        return "skip"
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    events = list(m.timeline)
+    extra = [{"when": 50.0 + i, "kind": k, "severity": sev, "text": txt,
+              "ref": None, "device": dev}
+             for i, (k, sev, txt, dev) in enumerate([
+                 ("odd kind", "INFO", "Something 100% unusual", "aa:01"),
+                 ("alert", "DANGER", "Rogue DHCP server", ""),
+                 ("dns change", "WARNING", "DNS server changed", ""),
+                 ("website", "INFO", "First visit to under_score.example",
+                  "aa:01")])]
+    events += extra
+    assert len(events) > 10
+    st = Store(ctx.path("tl.sqlite3"), session_id=7)
+    assert st.write_events(events) and st.flush_now(10)
+    devs = [None, "aa:01"] + sorted({e.get("device") for e in events
+                                     if e.get("device")})[:2]
+    combos = 0
+    for cat in ["All types", "Devices", "Websites", "Alerts", "DNS",
+                "Network & capture"]:
+        for sev in ["All", "INFO", "WARNING", "DANGER"]:
+            for dev in devs:
+                for q in ["", "visit", "100%", "under_", "DHCP"]:
+                    for since in (0.0, 53.0):
+                        want = sorted(
+                            (e["when"], e["kind"], e["text"]) for e in events
+                            if timeline_match(e, since, sev, cat, dev, q))
+                        got = sorted(
+                            (e["when"], e["kind"], e["text"]) for e in
+                            store_events_page(st, limit=100000, category=cat,
+                                              severity=sev, device=dev, q=q,
+                                              since=since))
+                        assert got == want, (cat, sev, dev, q, since,
+                                             got[:3], want[:3])
+                        combos += 1
+    # paging: newest first, no overlap, nothing lost
+    same = [{"when": 999.0, "kind": "alert", "severity": "INFO",
+             "text": f"same second {i}"} for i in range(10)]
+    assert st.write_events(same) and st.flush_now(10)
+    events += same
+    seen, before = [], None
+    while True:
+        page = store_events_page(st, before=before, limit=7)
+        seen += page
+        if len(page) < 7:
+            break
+        before = (page[-1]["when"], page[-1]["rowid"])
+    ts = [e["when"] for e in seen]
+    assert ts == sorted(ts, reverse=True)
+    assert len(seen) == len(events), (len(seen), len(events))
+    assert len({e["rowid"] for e in seen}) == len(events)
+    st.stop(5)
+    return f"{combos} filter combinations"
+
+
+@self_test()
+def t_compare_sessions(ctx):
+    path = ctx.path("cmp.sqlite3")
+    dk = OBS_KIND_CODES
+    a = Store(path, session_id=1000, meta={"source": "live"})
+    a.write_observations([
+        (1, 1000.0, "dhcp_request", "aa:01", {"hostname": "Laptop"}, 1),
+        (2, 1001.0, "mdns", "aa:02", {"name": "Printer"}, 2),
+        (3, 1002.0, "arp_reply", "aa:03", {}, 3)])
+    a.write_site_ties([("aa:01", "www.example.com",
+                        [AS_CONNECTED, 1000.0, 1001.0, 1]),
+                       ("aa:01", "old.example.org",
+                        [AS_REPORTED, 1000.0, 1001.0, 1])])
+    a.write_events([{"when": 1000.0, "kind": "new device", "text": "x",
+                     "severity": "INFO"}])
+    assert a.flush_now(10)
+    a.stop(5)
+    b = Store(path, session_id=2000)
+    b.set_session_meta(network="Home", iface="eth0")
+    b.write_observations([
+        (1, 2000.0, "dhcp_request", "aa:01", {"hostname": "Laptop"}, 1),
+        (2, 2001.0, "nbns", "aa:09", {"name": "NEWBOX"}, 2)])
+    b.write_site_ties([("aa:01", "api.example.com",
+                        [AS_CONNECTED, 2000.0, 2001.0, 1]),
+                       ("aa:09", "new.example.net",
+                        [AS_LOOKUP_ONLY, 2000.0, 2001.0, 1])])
+    b.write_events([{"when": 2000.0, "kind": "new device", "text": "y",
+                     "severity": "INFO"},
+                    {"when": 2001.0, "kind": "new device", "text": "z",
+                     "severity": "INFO"}])
+    assert b.flush_now(10)
+    ss = store_sessions(b)
+    assert [x["id"] for x in ss[:2]] == [2000, 1000], ss
+    assert ss[0]["network"] == "Home" and "Home" in session_label(ss[0])
+    r = compare_sessions(b, 1000, 2000)
+    assert r["new_devices"] == ["aa:09"], r
+    assert r["gone_devices"] == ["aa:02", "aa:03"], r
+    assert r["both_devices"] == ["aa:01"]
+    assert r["names"]["aa:09"] == "NEWBOX" and r["names"]["aa:01"] == \
+        "Laptop", r["names"]
+    # api.example.com and www.example.com share a registrable domain
+    assert r["new_sites"] == ["example.net"], r
+    assert r["gone_sites"] == ["example.org"], r
+    assert r["events_a"]["new device"] == 1 and \
+        r["events_b"]["new device"] == 2
+    _ = dk
+    b.stop(5)
+
+
+@self_test()
+def t_packet_ring(ctx):
+    """The on-disk packet history: exact frames back by number, segments
+    split on gaps and link-type changes, epochs kept apart, size cap
+    enforced (also against files of earlier runs)."""
+    if not ctx.scapy_ok:
+        return "skip"
+    frames = list(ctx.frames())
+    while len(frames) < 400:
+        frames += list(ctx.frames())
+    folder = ctx.path(f"ring_{uuid.uuid4().hex[:6]}")
+    st = Store(ctx.path("ring.sqlite3"), session_id=5)
+    pr = PacketRing(folder, cap_mb=20, store=st, session=5)
+    for no, (raw, ts, lt) in enumerate(frames[:300], 1):
+        assert pr.put(no, raw, ts, lt)
+    assert pr.flush()
+    for no in (1, 2, 150, 299, 300):
+        got = pr.find(no)
+        raw, ts, lt = frames[no - 1]
+        assert got is not None and got[0] == raw and got[2] == lt, no
+        assert abs(got[1] - ts) < 1e-5, (got[1], ts)
+    assert pr.find(301) is None and pr.find(0) is None
+    # a gap in numbering starts a new segment (and old ones still answer)
+    for no in range(500, 520):
+        raw, ts, lt = frames[no - 500]
+        pr.put(no, raw, ts, lt)
+    assert pr.flush()
+    assert pr.find(505)[0] == frames[5][0] and pr.find(10)[0] == frames[9][0]
+    assert len(pr.index) >= 1
+    # numbers restart after Clear: the old epoch is not confused with it
+    pr.new_epoch()
+    pr.put(1, b"\x00" * 60, 1.0, 1)
+    assert pr.flush()
+    assert pr.find(1)[0] == b"\x00" * 60
+    assert pr.find(150) is None
+    assert pr.find(150, epoch=0)[0] == frames[149][0]
+    written = pr.written
+    pr.stop()
+    assert written == 321, written
+    assert st.flush_now(10)
+    segs = st.query("SELECT first_no, last_no FROM packet_segments "
+                    "ORDER BY first_no")
+    assert (500, 519) in segs and any(f == 1 for f, _l in segs), segs
+    # size cap: pretend old files are huge; a new ring trims them
+    big = os.path.join(folder, "seg-1-0-000000000001.pcap")
+    with open(big, "wb") as f:
+        f.truncate(30 * 1024 * 1024)
+    os.utime(big, (1, 1))
+    pr2 = PacketRing(folder, cap_mb=20, store=None, session=6)
+    assert not os.path.exists(big)
+    assert pr2.size_bytes() <= 20 * 1024 * 1024
+    pr2.stop()
+    st.stop(5)
+    return f"{written} packets"
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -26335,6 +27313,151 @@ def _gs_history(app, ctx):
     c2 = other.counts()
     other.stop(5)
     assert c2["observations"] >= c["observations"], (c, c2)
+    app.data_mode = "idle"
+
+
+@gui_test_step("packet history, virtual table, saved timeline, compare")
+def _gs_history_v2(app, ctx):
+    root = app.root
+    S = ScenarioBuilder
+    old_max = app.config.get("capture.max_stored_events", 5000)
+    app.config.set("capture.max_stored_events", 500)
+    app.config.set("history.packet_ring", True)
+    app._apply_runtime_settings()
+    assert app.max_rows == 500 and app.packet_ring is not None
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "live"
+    app._pump_store(reschedule=False)
+    app.mode_ui_var.set("Advanced")
+    app._on_ui_mode_change()
+    tab = app._select_tab("packets")
+    frames = S().busy_mix(1500)
+    sink = app.lossless_sink()
+    for raw, _ts, lt in frames:
+        sink(raw, time.time(), lt)
+    assert _gui_pump(root, 0.3, lambda: not len(app.ring) and
+                     not app.worker.busy and app.count >= len(frames),
+                     timeout=60), app.count
+    _gui_pump(root, 0.2)
+    assert len(app.all_rows) == 500
+    # ---- virtual table: only the visible rows are Treeview items
+    tab.rebuild()
+    _gui_pump(root, 0.1)
+    n = tab._nslots()
+    kids = tab.tree.get_children()
+    assert len(tab.matched) == 500, len(tab.matched)
+    assert 0 < len(kids) <= n + 1 < 120, (len(kids), n)
+    first_in_mem = app.all_rows[0]["no"]
+    target = app.all_rows[200]["no"]
+    assert tab.select_no(target) and tab._selected_row()["no"] == target
+    assert not tab.follow_var.get()
+
+    class Ev:
+        def __init__(self, keysym="", num=0, delta=0):
+            self.keysym, self.num, self.delta = keysym, num, delta
+    tab._key(Ev("Down"))
+    assert tab.sel_no == app.all_rows[201]["no"], (tab.sel_no, target)
+    tab._key(Ev("End"))
+    assert tab.sel_no == app.all_rows[-1]["no"]
+    vis = {tab.slot_rows[i]["no"] for i in tab.tree.get_children()}
+    assert tab.sel_no in vis
+    tab._key(Ev("Home"))
+    assert tab.top == 0 and tab.sel_no == first_in_mem
+    top0 = tab.top
+    tab._wheel(Ev(num=5))
+    assert tab.top == top0 + 3, tab.top
+    tab._yscroll("moveto", "0.5")
+    assert abs(tab.top - 250) <= n, tab.top
+    tab._yscroll("scroll", "1", "pages")
+    lo, hi = tab.vbar.get()
+    assert 0 < lo < hi <= 1.0
+    tab._sort_by("length")
+    lens = [d["length"] for d in tab.matched]
+    assert lens == sorted(lens)
+    tab._sort_by("length")
+    assert [d["length"] for d in tab.matched] == sorted(lens, reverse=True)
+    tab._sort_by("no")
+    assert tab.sort_col is None
+    nos = [d["no"] for d in tab.matched]
+    assert nos == sorted(nos)
+    tab.set_expression("proto:arp")
+    assert not tab.matched and not tab.tree.get_children()
+    assert tab.vbar.get() == (0.0, 1.0)
+    tab.set_expression("proto:tls")
+    assert len(tab.matched) == 500 and tab.tree.get_children()
+    tab.clear_filter()
+    assert len(tab.matched) == 500
+    # ---- the proof behind a claim, after it left memory: from disk
+    assert app.packet_ring.flush()
+    before = {str(w) for w in root.winfo_children()}
+    assert app.jump_to_packet(10), "packet #10 should come from disk"
+    _gui_pump(root, 0.1)
+    new = [w for w in root.winfo_children() if str(w) not in before and
+           isinstance(w, tk.Toplevel)]
+    assert new and "Packet #10" in new[0].title(), [w.title() for w in new]
+    for w in new:
+        w.destroy()
+    got = app.packet_ring.find(10)
+    assert got is not None and got[0] == frames[9][0]
+    assert app.jump_to_packet(target) and tab._selected_row()["no"] == target
+    # ---- the saved timeline (SQL-backed, paged)
+    app._pump_store(reschedule=False)
+    assert app.history.flush_now(10)
+    tl = app._select_tab("timeline")
+    tl.source_var.set("Saved history")
+    tl._on_source()
+    _gui_pump(root, 0.1)
+    assert tl.history_mode() and tl.tree.get_children(), \
+        tl.status_lbl.cget("text")
+    assert "saved events" in tl.status_lbl.cget("text")
+    assert tl.zoom_var.get() in tl.HISTORY_ZOOMS
+    tl.type_var.set("Websites")
+    tl.rebuild()
+    for iid in tl.tree.get_children()[:20]:
+        assert tl.tree.set(iid, "kind") in ("website",), tl.tree.set(iid)
+    tl.type_var.set("All types")
+    tl.rebuild()
+    tl.tree.selection_set(tl.tree.get_children()[0])
+    tl._on_double()
+    _gui_pump(root, 0.1)
+    tl.load_older()
+    tl.source_var.set("This session")
+    tl._on_source()
+    assert not tl.history_mode() and tl.zoom_var.get() in tl.LIVE_ZOOMS
+    # ---- compare two sessions
+    other = Store(PATHS.history_db, session_id=app.session_id - 3600,
+                  meta={"source": "live"})
+    other.write_observations([(1, time.time() - 3600, "dhcp_request",
+                               "02:00:00:00:00:77", {"hostname": "Old-TV"},
+                               1)])
+    assert other.flush_now(10)
+    other.stop(5)
+    w = app.open_compare()
+    assert w is not None
+    _gui_pump(root, 0.1)
+    w.destroy()
+    ss = store_sessions(app.history)
+    mine = next(x for x in ss if x["id"] == app.session_id)
+    older = next(x for x in ss if x["id"] == app.session_id - 3600)
+    res = app.show_compare(older, mine)
+    assert "02:00:00:00:00:77" in res["gone_devices"], res["gone_devices"]
+    assert res["new_devices"], res
+    _gui_pump(root, 0.1)
+    for w in root.winfo_children():
+        if isinstance(w, tk.Toplevel):
+            w.destroy()
+    # ---- export of the current view uses the virtual table's rows
+    assert len(tab.matched) == 500
+    # ---- turn things back off
+    app.config.set("history.packet_ring", False)
+    app.config.set("capture.max_stored_events", old_max)
+    app._apply_runtime_settings()
+    assert app.packet_ring is None
+    app.mode_ui_var.set("Beginner")
+    app._on_ui_mode_change()
     app.data_mode = "idle"
 
 

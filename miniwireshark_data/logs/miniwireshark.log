@@ -1,0 +1,12 @@
+2026-10-19 03:33:34,671 WARNING [MainThread] config unreadable (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); using defaults
+2026-10-19 03:33:34,719 WARNING [MainThread] data oui: checksum mismatch, discarding
+2026-10-19 03:33:38,031 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and last night's backup was restored.
+2026-10-19 03:33:38,036 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and a new one was started.
+2026-10-19 03:35:14,043 WARNING [MainThread] config unreadable (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); using defaults
+2026-10-19 03:35:14,093 WARNING [MainThread] data oui: checksum mismatch, discarding
+2026-10-19 03:35:17,579 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and last night's backup was restored.
+2026-10-19 03:35:17,585 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and a new one was started.
+2026-10-19 03:35:25,913 WARNING [MainThread] config unreadable (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); using defaults
+2026-10-19 03:35:25,958 WARNING [MainThread] data oui: checksum mismatch, discarding
+2026-10-19 03:35:29,229 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and last night's backup was restored.
+2026-10-19 03:35:29,235 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and a new one was started.
