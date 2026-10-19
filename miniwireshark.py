@@ -91,6 +91,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
+_T_START = time.perf_counter()
+LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
 SCRIPT_VERSION = "3.0.0"
 SESSION_SCHEMA_VERSION = 3
@@ -268,7 +270,8 @@ def _relaunch_elevated():
     env_pairs = [f"{v}={os.environ[v]}" for v in
                  ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
                   "XDG_RUNTIME_DIR", "HOME", "USER", "LANG", "PATH",
-                  "MINIWIRESHARK_DATA", "MINIWIRESHARK_CONFIG")
+                  "MINIWIRESHARK_DATA", "MINIWIRESHARK_CONFIG", "MW_STAGE",
+                  "MINIWIRESHARK_NO_RUNTIME")
                  if v in os.environ]
     launchers = []
     if shutil.which("pkexec"):
@@ -289,6 +292,186 @@ def _relaunch_elevated():
     return False
 
 
+# ============================================================================
+#  1a.  Layer 1 — wide-entry launcher and runtime hand-off
+#
+#  This part runs on whatever Python started the file (3.8 or newer) and
+#  uses only the standard library. If MiniWireshark has a healthy private
+#  Python (installed once, with your consent, into the data folder), the
+#  script re-launches itself with it — a normal start does nothing else:
+#  no downloads, no installs, no changes to the system. Loops are
+#  impossible: the child is marked with MW_STAGE=app, and two failed starts
+#  in a row switch back to the previous runtime (or to this Python).
+#  The system Python, PATH and file associations are never touched.
+# ============================================================================
+RUNTIME_STATE_VERSION = 1
+MW_STAGE = os.environ.get("MW_STAGE", "")
+NO_RUNTIME_FLAG = "--no-runtime"
+RUNTIME_DIR = os.path.join(PATHS.data, "runtime")
+RUNTIME_STATE = os.path.join(RUNTIME_DIR, "state.json")
+
+
+def _state_checksum(state):
+    body = {k: v for k, v in state.items() if k != "checksum"}
+    raw = json.dumps(body, sort_keys=True, separators=(",", ":"),
+                     default=str).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def runtime_state_read():
+    """The runtime state, or {} when missing, unreadable or tampered."""
+    st = read_json(RUNTIME_STATE, None)
+    if not isinstance(st, dict):
+        return {}
+    if st.get("checksum") != _state_checksum(st):
+        return {}
+    return st
+
+
+def runtime_state_write(state):
+    state = dict(state)
+    state["version"] = RUNTIME_STATE_VERSION
+    state["checksum"] = _state_checksum(state)
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    atomic_write_json(RUNTIME_STATE, state)
+    return state
+
+
+def runtime_env(state, env_id=None):
+    env_id = env_id or state.get("current")
+    env = (state.get("envs") or {}).get(env_id) if env_id else None
+    return env if isinstance(env, dict) else None
+
+
+def runtime_healthy(env):
+    """Cheap check (no subprocess): the interpreter file exists and the
+    last self-test inside it passed."""
+    if not env:
+        return False
+    exe = env.get("python", "")
+    return bool(exe and os.path.isfile(exe) and env.get("selftest_ok"))
+
+
+def _same_interpreter(a, b):
+    try:
+        return os.path.normcase(os.path.realpath(a)) == \
+            os.path.normcase(os.path.realpath(b))
+    except (OSError, ValueError):
+        return False
+
+
+def runtime_handoff(argv=None, environ=None, execute=True):
+    """Decide whether to re-launch inside the private runtime. Returns the
+    command it ran (or would run), or None to continue in this Python."""
+    environ = os.environ if environ is None else environ
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if environ.get("MW_STAGE") == "app" or NO_RUNTIME_FLAG in argv or \
+            environ.get("MINIWIRESHARK_NO_RUNTIME"):
+        return None
+    state = runtime_state_read()
+    env = runtime_env(state)
+    if not runtime_healthy(env):
+        return None
+    if _same_interpreter(env["python"], sys.executable):
+        return None
+    if int(state.get("pending_starts", 0)) >= 2:
+        # the last two starts inside this runtime never confirmed: roll back
+        prev = runtime_env(state, state.get("previous"))
+        state["rolled_back"] = {"from": state.get("current"),
+                                "at": time.time()}
+        if runtime_healthy(prev):
+            state["current"], state["previous"] = state.get("previous"), \
+                state.get("current")
+            env = prev
+        else:
+            state["current"] = ""
+            state["pending_starts"] = 0
+            with contextlib.suppress(OSError):
+                runtime_state_write(state)
+            return None
+        state["pending_starts"] = 0
+    state["pending_starts"] = int(state.get("pending_starts", 0)) + 1
+    with contextlib.suppress(OSError):
+        runtime_state_write(state)
+    cmd = [env["python"], SCRIPT_PATH] + argv
+    if not execute:
+        return cmd
+    child_env = dict(environ)
+    child_env["MW_STAGE"] = "app"
+    try:
+        if IS_WINDOWS:
+            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(cmd, env=child_env, creationflags=flags,
+                             close_fds=True)
+            sys.exit(0)
+        os.execve(cmd[0], cmd, child_env)
+    except OSError as e:
+        state = runtime_state_read()
+        state["pending_starts"] = max(0, int(state.get("pending_starts",
+                                                       1)) - 1)
+        state["last_error"] = f"could not start the private Python: {e}"
+        with contextlib.suppress(OSError):
+            runtime_state_write(state)
+        return None
+    return cmd
+
+
+def runtime_confirm_started():
+    """Called by the app once it has been up for a while: this runtime
+    works, so clear the failed-start counter."""
+    if MW_STAGE != "app":
+        return False
+    state = runtime_state_read()
+    if not state or not state.get("pending_starts"):
+        return False
+    state["pending_starts"] = 0
+    env = runtime_env(state)
+    if env is not None:
+        env["last_ok_start"] = time.time()
+    with contextlib.suppress(OSError):
+        runtime_state_write(state)
+    return True
+
+
+def needs_elevation():
+    """Least privilege: Windows with Npcap installed in its default mode
+    lets ordinary users capture, so the app starts unelevated there and
+    only the driver installation asks for administrator rights."""
+    if is_admin():
+        return False
+    if IS_WINDOWS:
+        if not _npcap_present_early():
+            return True
+        return _npcap_admin_only()
+    return True
+
+
+def _npcap_present_early():
+    sd = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                      "System32")
+    return any(os.path.exists(p) for p in
+               (os.path.join(sd, "Npcap", "wpcap.dll"),
+                os.path.join(sd, "wpcap.dll")))
+
+
+def _npcap_admin_only():
+    if not IS_WINDOWS:
+        return False
+    try:
+        import winreg
+        for path in (r"SYSTEM\CurrentControlSet\Services\npcap\Parameters",
+                     r"SOFTWARE\WOW6432Node\Npcap", r"SOFTWARE\Npcap"):
+            try:
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as k:
+                    v, _t = winreg.QueryValueEx(k, "AdminOnly")
+                    return bool(v)
+            except OSError:
+                continue
+    except ImportError:
+        pass
+    return False
+
+
 SELF_TEST_MODE = SELF_TEST_FLAG in sys.argv
 GUI_TEST_MODE = "--gui-test" in sys.argv
 BENCH_MODE = "--bench" in sys.argv
@@ -301,9 +484,12 @@ if ELEVATED_FLAG in sys.argv:
 else:
     _ELEV = False
 
+if __name__ == "__main__" and not TOOL_MODE and not _ELEV:
+    runtime_handoff()          # re-launches in the private Python if healthy
+
 if __name__ == "__main__" and not TOOL_MODE and not _ELEV and \
         not os.environ.get(NO_ELEVATE_ENV) and \
-        NO_ELEVATE_FLAG not in sys.argv and not is_admin():
+        NO_ELEVATE_FLAG not in sys.argv and needs_elevation():
     if _relaunch_elevated():
         sys.exit(0)
     _fatal_dialog(
@@ -471,16 +657,42 @@ def _pip_available():
         return False, str(e)
 
 
+PIP_ASK = [None]     # callable() -> bool: may we use --break-system-packages?
+
+
 def _pip_install(pkg, upgrade=False, timeout=900):
     base = [sys.executable, "-m", "pip", "install",
             "--disable-pip-version-check", "-q"]
     if upgrade:
         base.append("--upgrade")
     last = ""
-    for cmd in (base + [pkg],
-                base + ["--user", pkg],
-                base + ["--break-system-packages", pkg],
-                base + ["--user", "--break-system-packages", pkg]):
+    variants = [base + [pkg], base + ["--user", pkg]]
+    asked = []
+
+    def may_break():
+        if not asked:
+            fn = PIP_ASK[0]
+            asked.append(bool(fn()) if fn is not None else False)
+        return asked[0]
+    for cmd in variants + ["ask"]:
+        if cmd == "ask":
+            if not ("externally-managed" in last.lower() and may_break()):
+                break
+            for cmd2 in (base + ["--break-system-packages", pkg],
+                         base + ["--user", "--break-system-packages", pkg]):
+                try:
+                    r = subprocess.run(cmd2, capture_output=True, text=True,
+                                       timeout=timeout)
+                    if r.returncode == 0:
+                        return True, ""
+                    last = ((r.stdout or "") + (r.stderr or "")).strip()[
+                        -1400:]
+                except subprocess.TimeoutExpired:
+                    last = f"timed out after {timeout}s"
+                    break
+                except (OSError, subprocess.SubprocessError) as e:
+                    last = str(e)
+            break
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=timeout)
@@ -653,55 +865,185 @@ def _install_npcap(loader, state):
 # ============================================================================
 #  2b.  Loading window (first-run / every-run preparation)
 # ============================================================================
-class LoaderWindow(ttk.Frame):
-    def __init__(self, master):
-        super().__init__(master)
+class LoaderWindow(tk.Frame):
+    """Runtime Manager & Welcome Center.
+
+    One window that (1) checks and, with your consent, installs or repairs
+    everything MiniWireshark needs — with named stages, real progress,
+    speed and time left, a safe Cancel and plain-English errors — and
+    (2) then turns into the Welcome Center: Start Monitoring, Try Demo
+    Mode, Quick Start Guide and Diagnostics. Reopened from Settings it runs
+    in maintenance mode (repair, update, roll back, remove, export).
+
+    Worker threads talk to it only through post_*() and ask(), which are
+    thread-safe (a queue drained on the Tk thread)."""
+
+    WHATS_NEW = (
+        ("\U0001F50E", "Evidence you can check",
+         "Every statement says how it's known (◉ observed, ◎ correlated, "
+         "◌ inferred) and links to the packets behind it. Press F2 for the "
+         "Inspector."),
+        ("⚡", "Ten times faster capture",
+         "A new capture pipeline keeps up with busy networks without "
+         "freezing the window."),
+        ("\U0001F6E1", "Quiet on new networks",
+         "Networks you haven't marked as yours start in Quiet Mode — "
+         "nothing is sent until you trust them."),
+        ("\U0001F552", "History and “what changed”",
+         "Optional history keeps evidence across restarts and tells you "
+         "what's new since yesterday."),
+        ("\U0001F6E0", "One-click Repair",
+         "Something wrong? Settings → Repair MiniWireshark checks and "
+         "fixes the usual problems for you."),
+    )
+
+    def __init__(self, master, config=None, mode="startup"):
+        self.config = config
+        theme = (config.get("appearance.theme", "Light") if config
+                 else "Light")
+        hc = bool(config.get("appearance.high_contrast", False)) if config \
+            else False
+        try:
+            self.t = THEMES[palette_name(theme, hc)]
+        except (KeyError, NameError):
+            self.t = None
+        t = self.t or {}
+        self.bg = t.get("window_bg", "#f4f5f7")
+        self.card_bg = t.get("card_bg", "#f6f7fa")
+        self.fg = t.get("text_fg", "#222222")
+        self.muted = t.get("muted_fg", "#666666")
+        self.accent = t.get("accent", "#2b7de9")
+        super().__init__(master, bg=self.bg)
+        self.mode = mode
         self.q = queue.Queue()
         self.details_var = tk.BooleanVar(value=False)
+        self.cancel_requested = False
+        self.handoff = False
+        self.choice = None
+        self.stage_state = {}
+        self._alive = True
         self._build()
+        self.bind("<Destroy>", lambda e: setattr(self, "_alive", False)
+                  if e.widget is self else None)
 
+    # ---- layout ------------------------------------------------------------------
     def _build(self):
-        h = tk.Frame(self, bg="#2b3a55", padx=18, pady=16)
-        h.pack(fill="x")
-        tk.Label(h, text="MiniWireshark", fg="white", bg="#2b3a55",
-                 font=("TkDefaultFont", 16, "bold")).pack(anchor="w")
-        tk.Label(h, text="Getting everything ready — this is quick after "
-                         "the first time", fg="#c8d2e0",
+        hdr = tk.Frame(self, bg="#2b3a55", padx=18, pady=12)
+        hdr.pack(fill="x")
+        left = tk.Frame(hdr, bg="#2b3a55")
+        left.pack(side="left", fill="x", expand=True)
+        tk.Label(left, text=f"MiniWireshark {SCRIPT_VERSION}", fg="white",
+                 bg="#2b3a55", font=("TkDefaultFont", 16, "bold")).pack(
+            anchor="w")
+        self.sub_var = tk.StringVar(
+            value="Runtime Manager — checking everything is ready"
+            if self.mode == "maintenance" else
+            "Getting everything ready — quick after the first time")
+        tk.Label(left, textvariable=self.sub_var, fg="#c8d2e0",
                  bg="#2b3a55").pack(anchor="w")
-        b = tk.Frame(self, bg="#f4f5f7", padx=18, pady=14)
-        b.pack(fill="both", expand=True)
-        self.status_var = tk.StringVar(value="Starting ...")
-        tk.Label(b, textvariable=self.status_var, bg="#f4f5f7",
-                 font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
-        self.progress = ttk.Progressbar(b, mode="determinate",
-                                        length=560, maximum=100)
-        self.progress.pack(fill="x", pady=(8, 8))
-        tk.Checkbutton(b, text="Show technical details",
-                       variable=self.details_var, bg="#f4f5f7",
-                       activebackground="#f4f5f7",
-                       command=self._toggle_details).pack(anchor="w")
-        lf = tk.Frame(b, bg="#ffffff", bd=1, relief="solid")
-        lf.pack(fill="both", expand=True, pady=(4, 0))
-        self.log = tk.Text(lf, height=11, bg="#ffffff", relief="flat",
-                           font=("TkFixedFont", 9), state="disabled",
-                           wrap="word", padx=8, pady=6)
-        vs = ttk.Scrollbar(lf, orient="vertical", command=self.log.yview)
+        self.health_lbl = tk.Label(hdr, text="● Checking", fg="#2b3a55",
+                                   bg="#c8d2e0", padx=10, pady=4,
+                                   font=("TkDefaultFont", 10, "bold"))
+        self.health_lbl.pack(side="right")
+        body = tk.Frame(self, bg=self.bg, padx=18, pady=10)
+        body.pack(fill="both", expand=True)
+        self.body = body
+        stages = tk.Frame(body, bg=self.bg)
+        stages.pack(fill="x", pady=(0, 6))
+        self.stage_lbls = {}
+        for i, name in enumerate(RuntimeManager.STAGES):
+            lb = tk.Label(stages, text=f"○ {name}", bg=self.bg, fg=self.muted,
+                          font=("TkDefaultFont", 9))
+            lb.pack(side="left", padx=(0, 4))
+            if i < len(RuntimeManager.STAGES) - 1:
+                tk.Label(stages, text="›", bg=self.bg,
+                         fg=self.muted).pack(side="left", padx=(0, 4))
+            self.stage_lbls[name] = lb
+        self.status_var = tk.StringVar(value="Starting …")
+        tk.Label(body, textvariable=self.status_var, bg=self.bg, fg=self.fg,
+                 font=("TkDefaultFont", 11, "bold"), anchor="w",
+                 justify="left", wraplength=600).pack(fill="x")
+        self.progress = ttk.Progressbar(body, mode="determinate",
+                                        maximum=100)
+        self.progress.pack(fill="x", pady=(6, 2))
+        self.speed_var = tk.StringVar(value="")
+        tk.Label(body, textvariable=self.speed_var, bg=self.bg,
+                 fg=self.muted, anchor="w").pack(fill="x")
+        self.card = tk.Frame(body, bg=self.bg)
+        self.card.pack(fill="both", expand=True, pady=(6, 4))
+        bar = tk.Frame(body, bg=self.bg)
+        bar.pack(fill="x")
+        tk.Checkbutton(bar, text="Show technical details",
+                       variable=self.details_var, bg=self.bg, fg=self.fg,
+                       selectcolor=self.card_bg, activebackground=self.bg,
+                       command=self._toggle_details).pack(side="left")
+        self.cancel_btn = ttk.Button(bar, text="Cancel",
+                                     command=self._cancel)
+        self.copy_btn = ttk.Button(bar, text="Copy details",
+                                   command=self._copy_details)
+        self.copy_btn.pack(side="right")
+        self.logf = tk.Frame(body, bg=self.card_bg, bd=1, relief="solid")
+        self.log = tk.Text(self.logf, height=8, bg=self.card_bg, fg=self.fg,
+                           relief="flat", font=("TkFixedFont", 9),
+                           state="disabled", wrap="word", padx=8, pady=6)
+        vs = ttk.Scrollbar(self.logf, orient="vertical",
+                           command=self.log.yview)
         self.log.configure(yscrollcommand=vs.set)
         self.log.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
-        self.log.tag_configure("step", foreground="#2b3a56",
-                               font=("TkFixedFont", 9, "bold"))
-        self.log.tag_configure("ok", foreground="#0b6b3a")
-        self.log.tag_configure("err", foreground="#a01a08")
-        self.log.tag_configure("warn", foreground="#8a5a00")
-        self.log.tag_configure("detail", foreground="#666666", elide=True)
-        self.footer = tk.Label(self, text="Please wait ...", bg="#e3e6eb",
+        t = self.t or {}
+        self.log.tag_configure("step", font=("TkFixedFont", 9, "bold"))
+        self.log.tag_configure("ok", foreground=t.get("good_fg", "#0b6b3a"))
+        self.log.tag_configure("err", foreground=t.get("danger_fg",
+                                                       "#a01a08"))
+        self.log.tag_configure("warn", foreground=t.get("warn_fg",
+                                                        "#8a5a00"))
+        self.log.tag_configure("detail", foreground=self.muted)
+        self.footer = tk.Label(self, text="Please wait …",
+                               bg=t.get("side_bg", "#e3e6eb"), fg=self.fg,
                                anchor="w", padx=12, pady=5)
         self.footer.pack(side="bottom", fill="x")
 
     def _toggle_details(self):
-        self.log.tag_configure("detail", elide=not self.details_var.get())
+        if self.details_var.get():
+            self.logf.pack(fill="both", expand=True, pady=(4, 0))
+        else:
+            self.logf.pack_forget()
 
+    def _cancel(self):
+        self.cancel_requested = True
+        self.post_status("Cancelling safely — nothing half-done is kept…")
+
+    def _copy_details(self):
+        try:
+            text = self.log.get("1.0", "end")
+            self.clipboard_clear()
+            self.clipboard_append(mask_sensitive(text))
+            self.post_footer("Details copied (addresses masked).")
+        except tk.TclError:
+            pass
+
+    def _clear_card(self):
+        for w in self.card.winfo_children():
+            w.destroy()
+
+    def _card_frame(self, title, text=""):
+        self._clear_card()
+        f = tk.Frame(self.card, bg=self.card_bg, padx=14, pady=10,
+                     highlightthickness=1,
+                     highlightbackground=(self.t or {}).get("border",
+                                                            "#e0e2e8"))
+        f.pack(fill="both", expand=True)
+        tk.Label(f, text=title, bg=self.card_bg, fg=self.fg,
+                 font=("TkDefaultFont", 12, "bold"), anchor="w",
+                 justify="left", wraplength=620).pack(fill="x")
+        if text:
+            tk.Label(f, text=text, bg=self.card_bg, fg=self.fg, anchor="w",
+                     justify="left", wraplength=620).pack(fill="x",
+                                                          pady=(6, 8))
+        return f
+
+    # ---- thread-safe API (any thread) --------------------------------------------
     def post_log(self, t, tag=None):
         self.q.put(("log", t, tag))
         if tag in ("err", "warn"):
@@ -718,40 +1060,331 @@ class LoaderWindow(ttk.Frame):
     def post_footer(self, t):
         self.q.put(("footer", t))
 
+    def post_stage(self, name, state):
+        self.q.put(("stage", name, state))
+
+    def post_speed(self, text):
+        self.q.put(("speed", text))
+
+    def post_health(self, kind):
+        self.q.put(("health", kind))
+
+    def runtime_progress(self, stage, frac, text, extra):
+        """Adapter for RuntimeManager progress callbacks."""
+        order = RuntimeManager.STAGES
+        posted = self.__dict__.setdefault("_posted", {})
+        if stage in order:
+            for s in order[:order.index(stage)]:
+                if posted.get(s) not in ("done", "skip", "fail"):
+                    posted[s] = "skip" if s not in posted else "done"
+                    self.post_stage(s, posted[s])
+            posted[stage] = "done" if frac >= 1.0 else "active"
+            self.post_stage(stage, posted[stage])
+            base = order.index(stage) / len(order)
+            self.post_progress(int(100 * (base + frac / len(order))))
+        self.post_status(text)
+        sp = extra.get("speed") if extra else None
+        if sp:
+            eta = extra.get("eta") or 0
+            self.post_speed(f"{sp / 1e6:.1f} MB/s · about "
+                            f"{human_duration(eta) if eta else '—'} left")
+        elif stage != "Download":
+            self.post_speed("")
+
+    def ask(self, kind, **kw):
+        """Ask the person something from a worker thread; blocks until they
+        answer. Returns the chosen answer string."""
+        ev = threading.Event()
+        box = [None]
+        self.q.put(("ask", kind, kw, ev, box))
+        while not ev.wait(0.2):
+            if not self._alive:           # never touch Tk from this thread
+                return "cancel"
+        return box[0]
+
+    # ---- Tk thread ---------------------------------------------------------------------
     def pump(self):
+        drain_deferred_tk()
         while True:
             try:
                 it = self.q.get_nowait()
             except queue.Empty:
                 break
             k = it[0]
-            if k == "log":
-                self.log.config(state="normal")
-                if it[2]:
-                    self.log.insert("end", it[1] + "\n", it[2])
-                else:
-                    self.log.insert("end", it[1] + "\n")
-                self.log.see("end")
-                self.log.config(state="disabled")
-            elif k == "status":
-                self.status_var.set(it[1])
-            elif k == "progress":
-                self.progress["value"] = it[1]
-            elif k == "footer":
-                self.footer.config(text=it[1])
+            try:
+                if k == "log":
+                    self.log.config(state="normal")
+                    self.log.insert("end", it[1] + "\n", it[2] or ())
+                    self.log.see("end")
+                    self.log.config(state="disabled")
+                elif k == "status":
+                    self.status_var.set(it[1])
+                elif k == "progress":
+                    self.progress["value"] = it[1]
+                elif k == "footer":
+                    self.footer.config(text=it[1])
+                elif k == "speed":
+                    self.speed_var.set(it[1])
+                elif k == "stage":
+                    self._set_stage(it[1], it[2])
+                elif k == "health":
+                    self._set_health(it[1])
+                elif k == "ask":
+                    self._show_question(*it[1:])
+            except tk.TclError:
+                pass
         try:
             self.update_idletasks()
             self.update()
         except tk.TclError:
             pass
 
+    def _set_stage(self, name, state):
+        self.stage_state[name] = state
+        lb = self.stage_lbls.get(name)
+        if lb is None:
+            return
+        t = self.t or {}
+        glyph, color = {"active": ("●", self.accent),
+                        "done": ("✔", t.get("good_fg", "#0b6b3a")),
+                        "fail": ("✖", t.get("danger_fg", "#a01a08")),
+                        "skip": ("–", self.muted)}.get(state,
+                                                       ("○", self.muted))
+        lb.configure(text=f"{glyph} {name}", fg=color,
+                     font=("TkDefaultFont", 9,
+                           "bold" if state == "active" else "normal"))
+
+    def _set_health(self, kind):
+        t = self.t or {}
+        text, bg, fg = {
+            "healthy": ("✔ Healthy", t.get("mode_active_bg", "#e6f4ea"),
+                        t.get("mode_active_fg", "#0b6b3a")),
+            "repair": ("⚠ Needs repair", t.get("warn_bg", "#fff5e0"),
+                       t.get("warn_fg", "#8a5a00")),
+            "degraded": ("◐ Basic mode", t.get("warn_bg", "#fff5e0"),
+                         t.get("warn_fg", "#8a5a00")),
+            "failed": ("✖ Problem", t.get("danger_bg", "#fbe9e7"),
+                       t.get("danger_fg", "#8a1a08"))}.get(
+            kind, ("● Checking", "#c8d2e0", "#2b3a55"))
+        self.health_lbl.configure(text=text, bg=bg, fg=fg)
+
+    def _show_question(self, kind, kw, ev, box):
+        def answer(value):
+            box[0] = value
+            self._clear_card()
+            ev.set()
+        if kind == "consent":
+            f = self._card_frame("Set up MiniWireshark's own Python? "
+                                 "(recommended)", kw.get("text", ""))
+            row = tk.Frame(f, bg=self.card_bg)
+            row.pack(fill="x", pady=(4, 0))
+            b = ttk.Button(row, text="Install private Python",
+                           style="Accent.TButton",
+                           command=lambda: answer("install"))
+            b.pack(side="left")
+            ttk.Button(row, text="Use my current Python",
+                       command=lambda: answer("this")).pack(side="left",
+                                                           padx=8)
+            ttk.Button(row, text="Exit", command=lambda: answer("cancel")
+                       ).pack(side="right")
+            b.focus_set()
+        elif kind == "error":
+            title, what = RUNTIME_ERRORS.get(kw.get("err", "other"),
+                                             RUNTIME_ERRORS["other"])
+            f = self._card_frame("✖ " + title, what)
+            det = kw.get("detail", "")
+            if det:
+                tk.Label(f, text=det[-300:], bg=self.card_bg, fg=self.muted,
+                         anchor="w", justify="left", wraplength=620,
+                         font=("TkFixedFont", 8)).pack(fill="x")
+            row = tk.Frame(f, bg=self.card_bg)
+            row.pack(fill="x", pady=(8, 0))
+            ttk.Button(row, text="Try again", style="Accent.TButton",
+                       command=lambda: answer("retry")).pack(side="left")
+            ttk.Button(row, text=kw.get("continue_text",
+                                        "Continue with my current Python"),
+                       command=lambda: answer("continue")).pack(
+                side="left", padx=8)
+            ttk.Button(row, text="Copy details",
+                       command=self._copy_details).pack(side="right")
+            self._set_health("failed")
+        elif kind == "pip_system":
+            f = self._card_frame(
+                "Install into your system Python?",
+                "Your Python is managed by the operating system, which "
+                "normally doesn't want programs to add packages to it. I "
+                "can still install the capture engine (scapy) there with "
+                "pip's “--break-system-packages” option. A safer choice "
+                "is the private Python (Settings → Repair). Install into "
+                "your system Python anyway?")
+            row = tk.Frame(f, bg=self.card_bg)
+            row.pack(fill="x")
+            ttk.Button(row, text="Yes, install it",
+                       command=lambda: answer("yes")).pack(side="left")
+            ttk.Button(row, text="No", command=lambda: answer("no")).pack(
+                side="left", padx=8)
+        else:
+            f = self._card_frame(kw.get("title", "Question"),
+                                 kw.get("text", ""))
+            row = tk.Frame(f, bg=self.card_bg)
+            row.pack(fill="x")
+            for label, value in kw.get("buttons", [("OK", "ok")]):
+                ttk.Button(row, text=label,
+                           command=lambda v=value: answer(v)).pack(
+                    side="left", padx=(0, 8))
+
+    def show_install_controls(self, on):
+        try:
+            if on:
+                self.cancel_btn.pack(side="right", padx=8)
+            else:
+                self.cancel_btn.pack_forget()
+        except tk.TclError:
+            pass
+
     def show_fatal(self, m):
         self.post_status("Setup could not finish")
+        self.post_health("failed")
         self.post_log("", None)
         self.post_log(m, "err")
-        self.post_footer("Close this window to exit. Details are in the log: "
-                         + PATHS.log_file)
+        self.post_footer("Close this window to exit. Details are in the "
+                         "log: " + PATHS.log_file)
         self.pump()
+        try:
+            f = self._card_frame("✖ Setup could not finish", m[-900:])
+            ttk.Button(f, text="Copy details",
+                       command=self._copy_details).pack(anchor="w")
+        except tk.TclError:
+            pass
+
+    # ---- Welcome Center ----------------------------------------------------------
+    def show_welcome(self, summary="", health="healthy", first_time=False):
+        """Turn into the Welcome Center and wait for a choice. Returns
+        "monitor", "demo", "guide", "diagnostics", "repair" or "exit"."""
+        self.choice = None
+        for w in (self.progress,):
+            with contextlib.suppress(tk.TclError):
+                w.pack_forget()
+        for lb in self.stage_lbls.values():
+            with contextlib.suppress(tk.TclError):
+                lb.master.pack_forget()
+                break
+        self.speed_var.set("")
+        self._set_health(health)
+        with contextlib.suppress(tk.TclError):
+            self.copy_btn.master.pack_forget()      # details bar
+            self.logf.pack_forget()
+        self.sub_var.set("Welcome — your network, explained in plain "
+                         "English")
+        self.status_var.set("Welcome back!" if not first_time else
+                            "Welcome to MiniWireshark 4!")
+        self._clear_card()
+        top = tk.Frame(self.card, bg=self.bg)
+        top.pack(fill="both", expand=True)
+        tiles = tk.Frame(top, bg=self.bg)
+        tiles.pack(fill="x")
+        spec = (("monitor", "▶", "Start Monitoring",
+                 "Pick the best network card and start watching."),
+                ("demo", "\U0001F3AE", "Try Demo Mode",
+                 "Explore with simulated data. Nothing real is shown."),
+                ("guide", "\U0001F4D6", "Quick Start Guide",
+                 "Five short steps through the important parts."),
+                ("diagnostics", "\U0001FA7A", "Diagnostics",
+                 "Check the setup, capture driver and environment."))
+        first_tile = None
+        for i, (key, icon, title, text) in enumerate(spec):
+            tile = tk.Frame(tiles, bg=self.card_bg, padx=12, pady=10,
+                            cursor="hand2", takefocus=1,
+                            highlightthickness=2,
+                            highlightbackground=self.accent if i == 0
+                            else (self.t or {}).get("border", "#e0e2e8"),
+                            highlightcolor=self.accent)
+            tile.grid(row=0, column=i, sticky="nsew", padx=4)
+            tiles.columnconfigure(i, weight=1)
+            a = tk.Label(tile, text=f"{icon}  {title}", bg=self.card_bg,
+                         fg=self.fg, font=("TkDefaultFont", 11, "bold"),
+                         anchor="w")
+            a.pack(anchor="w")
+            b = tk.Label(tile, text=text, bg=self.card_bg, fg=self.muted,
+                         wraplength=135, justify="left", anchor="w")
+            b.pack(anchor="w", pady=(4, 0))
+            for w in (tile, a, b):
+                w.bind("<Button-1>", lambda e, k=key: self._choose(k))
+            tile.bind("<Return>", lambda e, k=key: self._choose(k))
+            tile.bind("<space>", lambda e, k=key: self._choose(k))
+            if first_tile is None:
+                first_tile = tile
+        news = tk.Frame(top, bg=self.card_bg, padx=12, pady=8)
+        news.pack(fill="both", expand=True, pady=(10, 0))
+        tk.Label(news, text="What's new in 4.0", bg=self.card_bg,
+                 fg=self.fg, font=("TkDefaultFont", 10, "bold"),
+                 anchor="w").pack(fill="x")
+        for icon, title, text in self.WHATS_NEW:
+            tk.Label(news, text=f"{icon}  {title} — {text}",
+                     bg=self.card_bg, fg=self.fg, anchor="w",
+                     justify="left", wraplength=640).pack(fill="x",
+                                                          pady=1)
+        bottom = tk.Frame(top, bg=self.bg)
+        bottom.pack(fill="x", pady=(8, 0))
+        if summary:
+            tk.Label(bottom, text=summary, bg=self.bg, fg=self.muted,
+                     anchor="w", justify="left", wraplength=640).pack(
+                fill="x")
+        row = tk.Frame(bottom, bg=self.bg)
+        row.pack(fill="x", pady=(4, 0))
+        self.show_welcome_var = tk.BooleanVar(
+            value=bool(self.config.get("general.show_welcome", True))
+            if self.config else True)
+        tk.Checkbutton(row, text="Show the Welcome Center at startup",
+                       variable=self.show_welcome_var, bg=self.bg,
+                       fg=self.fg, selectcolor=self.card_bg,
+                       activebackground=self.bg).pack(side="left")
+        rep = tk.Label(row, text="Something wrong? Repair…", bg=self.bg,
+                       fg=self.accent, cursor="hand2",
+                       font=("TkDefaultFont", 10, "underline"))
+        rep.pack(side="right")
+        rep.bind("<Button-1>", lambda e: self._choose("repair"))
+        self.footer.config(text="Enter = Start Monitoring · Tab moves "
+                                "between choices · new networks start in "
+                                "Quiet Mode")
+        self.winfo_toplevel().bind("<Return>",
+                                   lambda e: self._choose("monitor"))
+        self.winfo_toplevel().protocol("WM_DELETE_WINDOW",
+                                       lambda: self._choose("exit"))
+        if first_tile is not None:
+            first_tile.focus_set()
+        while self.choice is None:
+            drain_deferred_tk()
+            try:
+                self.update()
+            except tk.TclError:
+                return "exit"
+            time.sleep(0.01)
+        with contextlib.suppress(tk.TclError):
+            self.winfo_toplevel().unbind("<Return>")
+        if self.config is not None:
+            self.config.set("general.show_welcome",
+                            bool(self.show_welcome_var.get()))
+            self.config.set("general.welcome_version", SCRIPT_VERSION)
+            self.config.save()
+        return self.choice
+
+    def _choose(self, key):
+        self.choice = key
+
+
+def mask_sensitive(text):
+    """Mask IPv4/IPv6 and MAC addresses in shareable text (debug bundles,
+    copied details). Keeps the first part so different addresses stay
+    distinguishable."""
+    text = re.sub(r"\b([0-9a-fA-F]{2})[:-]([0-9a-fA-F]{2})[:-]"
+                  r"[0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}"
+                  r"[:-][0-9a-fA-F]{2}\b", r"\1:\2:xx:xx:xx:xx", text)
+    text = re.sub(r"\b(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}\b",
+                  r"\1.\2.x.x", text)
+    text = re.sub(r"\b([0-9a-fA-F]{1,4}):([0-9a-fA-F]{1,4}):"
+                  r"[0-9a-fA-F:]{2,}\b", r"\1:\2:…", text)
+    return text
 
 
 # ============================================================================
@@ -873,7 +1506,99 @@ def step_npcap(l, state):
     return _install_npcap(l, state)
 
 
+def step_runtime(l, state):
+    """The private Python: use it, offer it (once, with consent) or keep
+    going on this Python. Never changes the system Python."""
+    if MW_STAGE == "app":
+        mgr = RuntimeManager()
+        st = mgr.status()
+        if st["running_inside"]:
+            l.post_health("healthy" if st["lock_current"] else "repair")
+            return True, (f"Running on MiniWireshark's private Python "
+                          f"{platform.python_version()}.")
+        return True, "Running on this Python."
+    if NO_RUNTIME_FLAG in sys.argv or os.environ.get(
+            "MINIWIRESHARK_NO_RUNTIME"):
+        return True, "Private Python skipped (--no-runtime)."
+    mgr = RuntimeManager()
+    st = mgr.status()
+    plan = mgr.plan()
+    if st["healthy"]:
+        if st.get("rolled_back"):
+            l.post_log("  The last start in the newest environment failed; "
+                       "MiniWireshark switched back to the previous one.",
+                       "warn")
+        if st["last_error"]:
+            l.post_log("  " + st["last_error"], "warn")
+        l.post_health("degraded")
+        return True, ("The private Python is installed but couldn't be "
+                      "started; continuing on this Python.")
+    if st["declined"] or not plan["supported"]:
+        l.post_health("degraded" if plan["supported"] else "healthy")
+        return True, ("Using this Python (" + (
+            "you chose not to install the private Python — Settings → "
+            "Repair offers it again" if st["declined"] else
+            "no private Python for this platform") + ").")
+    while True:
+        answer = l.ask("consent", text=mgr.describe())
+        if answer == "cancel":
+            return False, "Setup cancelled — nothing was changed."
+        if answer != "install":
+            mgr.decline()
+            l.post_health("degraded")
+            return True, "Using this Python (you can install the private " \
+                         "Python later from Settings → Repair)."
+        l.cancel_requested = False
+        l.post_footer("Installing — you can cancel safely at any time.")
+        l.show_install_controls(True)
+        try:
+            base = _find_local_python314()
+            mgr.provision(l.runtime_progress, lambda: l.cancel_requested,
+                          base_python=base)
+            l.handoff = True
+            l.post_health("healthy")
+            l.show_install_controls(False)
+            return True, "Private Python ready — restarting inside it."
+        except Exception as e:                       # noqa: BLE001
+            l.show_install_controls(False)
+            kind = classify_runtime_error(e)
+            LOG.warning("runtime install failed (%s): %s", kind, e)
+            for name, stt in list(l.stage_state.items()):
+                if stt == "active":
+                    l.post_stage(name, "fail")
+            if kind == "cancelled":
+                l.post_health("degraded")
+                return True, "Cancelled — continuing on this Python."
+            ans = l.ask("error", err=kind, detail=getattr(e, "detail",
+                                                          str(e)))
+            if ans != "retry":
+                l.post_health("degraded")
+                return True, "Continuing on this Python."
+
+
+def _find_local_python314():
+    """A Python 3.14 already installed on this computer, to build the
+    private environment from (it is never modified)."""
+    names = ["python3.14"]
+    if IS_WINDOWS:
+        names = ["python3.14.exe"]
+        local = os.environ.get("LOCALAPPDATA", "")
+        for d in (os.path.join(local, "Programs", "Python", "Python314"),
+                  r"C:\Program Files\Python314"):
+            exe = os.path.join(d, "python.exe")
+            if os.path.isfile(exe):
+                return exe
+    for n in names:
+        exe = shutil.which(n)
+        if exe:
+            return exe
+    if sys.version_info[:2] == (3, 14):
+        return sys.executable
+    return None
+
+
 BOOTSTRAP_STEPS = [
+    ("Checking for MiniWireshark's private Python", step_runtime, 2),
     ("Checking Python", step_python, 1),
     ("Checking the graphical toolkit", step_tkinter, 1),
     ("Checking the package installer", step_pip, 1),
@@ -917,6 +1642,780 @@ def run_bootstrap(loader):
         time.sleep(0.03)
     loader.pump()
     return result[0]
+
+
+# ============================================================================
+#  2d.  Layer 2 — the private Python runtime (RuntimeManager)
+#
+#  "Update" here always means "the newest versions THIS release of
+#  MiniWireshark has verified": every download is checked against a SHA-256
+#  fingerprint written into this file (and Windows installers against the
+#  Python Software Foundation's signature). Nothing is ever installed into
+#  your own Python, PATH or system folders.
+# ============================================================================
+RUNTIME_PYTHON = "3.14.2"
+RUNTIME_PBS_TAG = "20260127"
+RUNTIME_PBS_BASE = ("https://github.com/astral-sh/python-build-standalone/"
+                    "releases/download/")
+# python-build-standalone "install_only_stripped" builds (relocatable, no
+# admin rights, include Tk). SHA-256 pinned per platform.
+RUNTIME_SOURCES = {
+    ("windows", "x86_64"): (
+        "cpython-3.14.2+20260127-x86_64-pc-windows-msvc-install_only_"
+        "stripped.tar.gz",
+        "42638ce9bd8c177010c44c7a6a6fb3e1dc0b04ea372089036c689ccb57dc0d09"),
+    ("windows", "aarch64"): (
+        "cpython-3.14.2+20260127-aarch64-pc-windows-msvc-install_only_"
+        "stripped.tar.gz",
+        "4780ac64fcf4b3dfd181f86ae87c9dff43d3fa804c5f8d97091298f2d87e19cd"),
+    ("windows", "x86"): (
+        "cpython-3.14.2+20260127-i686-pc-windows-msvc-install_only_"
+        "stripped.tar.gz",
+        "1c68b7e4456ba7acfb26d6a0202fb89db63fca8cfab753c742c69b5f3d643ec4"),
+    ("macos", "aarch64"): (
+        "cpython-3.14.2+20260127-aarch64-apple-darwin-install_only_"
+        "stripped.tar.gz",
+        "2f82ed0cf902c8a2863a3fc5864909645c761e4e0a96525850c9ef8f7e3b79e7"),
+    ("macos", "x86_64"): (
+        "cpython-3.14.2+20260127-x86_64-apple-darwin-install_only_"
+        "stripped.tar.gz",
+        "51e886261fb79f64079b20181a7f8adfca738f2b2882882e981b67a165e1809b"),
+    ("linux", "x86_64"): (
+        "cpython-3.14.2+20260127-x86_64-unknown-linux-gnu-install_only_"
+        "stripped.tar.gz",
+        "c2926d6707f4339e3bf30e90437b387712b47e60e9e55bff1dcb36bf7688b01d"),
+    ("linux", "aarch64"): (
+        "cpython-3.14.2+20260127-aarch64-unknown-linux-gnu-install_only_"
+        "stripped.tar.gz",
+        "1d243bfab134c9fd3e099780a811079d8c6158283bddde65de2bc5f6eda74f7c"),
+}
+# Windows fallback when the Visual C++ runtime is missing: the official
+# python.org installer (per-user, PATH/launcher/associations off), accepted
+# only with a valid Python Software Foundation signature.
+RUNTIME_PYORG_WINDOWS = {
+    "x86_64": "https://www.python.org/ftp/python/3.14.2/"
+              "python-3.14.2-amd64.exe",
+    "aarch64": "https://www.python.org/ftp/python/3.14.2/"
+               "python-3.14.2-arm64.exe",
+}
+PSF_SIGNER = "Python Software Foundation"
+
+# Hash-pinned wheels for the private runtime (cp314). Generated at release
+# time from PyPI (see make_runtime_lock()). Missing entries = not available
+# for that platform; required ones block the install, optional ones just
+# switch their feature off.
+RUNTIME_LOCK = {
+    "scapy": {"version": "2.8.0", "required": True, "any": (
+        "scapy-2.8.0-py3-none-any.whl",
+        "abf855145ee829a42b2eb28983cd6a0a52b12a31d3f861cb7be36791195ed9aa")},
+    "psutil": {"version": "7.2.2", "required": False,
+               "win_amd64": "eb7e81434c8d223ec4a219b5fc1c47d0417b12be7ea866"
+                            "e24fb5ad6e84b3d988",
+               "win_arm64": "8c233660f575a5a89e6d4cb65d9f938126312bca76d8fe"
+                            "087b947b3a1aaac9ee",
+               "macosx_arm64": "1a7b04c10f32cc88ab39cbf606e117fd74721c831c98"
+                               "a27dc04578deb0c16979",
+               "macosx_x86_64": "ed0cace939114f62738d808fdcecd4c869222507e26"
+                                "6e574799e9c0faa17d486",
+               "linux_x86_64": "076a2d2f923fd4821644f5ba89f059523da90dc9014e"
+                               "85f8e45a5774ca5bc6f9",
+               "linux_aarch64": "b0726cecd84f9474419d67252add4ac0cd9811b04d6"
+                                "1123054b9fb6f57df6e9e"},
+    "cryptography": {"version": "50.0.2", "required": False,
+                     "win_amd64": "7afa5a6602a9f29af1f3a2965f831bae7c9d5d597"
+                                  "b7cbb716d41ab3b7d89879c",
+                     "macosx_arm64": "fa8f5efb344d6908a1ce62f4a24e2e5780f825"
+                                     "d6f53f5f50ec5ffacac72936cb",
+                     "linux_x86_64": "630ebfea3bf689d075f82316324ff7433dc447"
+                                     "fe6bc1bfc76524b74b4a9567d2",
+                     "linux_aarch64": "79def8d059362e7831389ed3be0ecdf58a893"
+                                      "86e1271e35dd9f5af84e81bffd0"},
+    "cffi": {"version": "2.1.1", "required": False, "needed_by":
+             "cryptography",
+             "win_amd64": "3222ba5d678f80a030e6afbcc33dc1ae5cb45facabb61cee2"
+                          "c7016b8432fde48",
+             "win_arm64": "ab36d55f9ed2d067327667c2fea18dda018eb628dd6347aa0"
+                          "1dda6cf1f5d3836",
+             "macosx_arm64": "661c298b4821edebead0c91edd2b00374d67ad7c5a1f7a"
+                             "91d4442633b79d6a72",
+             "macosx_x86_64": "d28630f5854ab07ab1fd4aba756de52326c82e6be15d4"
+                              "14b12793f1975048b54",
+             "linux_x86_64": "b0431303acaea1089ad4b3e9ce4e6518193def1118d407"
+                             "3ca848635ee4ea2e96",
+             "linux_aarch64": "58acb8ab8e295e6c5ea12f888cbb13cf21511ef2a3303a"
+                              "23f4325c29d17fe5c1"},
+    "pycparser": {"version": "3.11", "required": False, "needed_by": "cffi",
+                  "any": ("pycparser-3.11-py3-none-any.whl",
+                          "51d5a8ba2be0bbe440b99d2112604c95bbbc3c2748a64260"
+                          "186c541e1729cd80")},
+}
+
+
+def runtime_platform():
+    """('windows'|'macos'|'linux', 'x86_64'|'aarch64'|'x86')."""
+    sysname = "windows" if IS_WINDOWS else "macos" if IS_MAC else \
+        "linux" if sys.platform.startswith("linux") else sys.platform
+    m = (platform.machine() or "").lower()
+    arch = {"amd64": "x86_64", "x86_64": "x86_64", "x64": "x86_64",
+            "arm64": "aarch64", "aarch64": "aarch64", "armv8": "aarch64",
+            "i386": "x86", "i686": "x86", "x86": "x86"}.get(m, m)
+    return sysname, arch
+
+
+def wheel_platform_tag(plat=None):
+    sysname, arch = plat or runtime_platform()
+    if sysname == "windows":
+        return {"x86_64": "win_amd64", "aarch64": "win_arm64"}.get(arch, "")
+    if sysname == "macos":
+        return {"x86_64": "macosx_x86_64", "aarch64": "macosx_arm64"}.get(
+            arch, "")
+    return {"x86_64": "linux_x86_64", "aarch64": "linux_aarch64"}.get(arch,
+                                                                      "")
+
+
+def lock_requirements(plat_tag, lock=None):
+    """→ (requirements.txt text, [(package, required)], [skipped]).
+    Each line pins version + every acceptable hash for this platform."""
+    lock = lock or RUNTIME_LOCK
+    lines, pkgs, skipped = [], [], []
+    for name, spec in lock.items():
+        h = None
+        if "any" in spec:
+            h = spec["any"][1]
+        elif plat_tag in spec:
+            h = spec[plat_tag]
+        if not h:
+            skipped.append(name)
+            continue
+        dep = spec.get("needed_by")
+        if dep and dep in skipped:
+            skipped.append(name)
+            continue
+        lines.append(f"{name}=={spec['version']} --hash=sha256:{h}")
+        pkgs.append((name, bool(spec.get("required"))))
+    return "\n".join(lines) + "\n", pkgs, skipped
+
+
+def lock_fingerprint(lock=None):
+    raw = json.dumps(lock or RUNTIME_LOCK, sort_keys=True).encode()
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def sha256_file(path, bufsize=1 << 20):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(bufsize)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+class RuntimeError_(Exception):
+    """A runtime step failed. `kind` selects the friendly explanation."""
+
+    def __init__(self, kind, detail=""):
+        super().__init__(f"{kind}: {detail}")
+        self.kind = kind
+        self.detail = detail
+
+
+# Friendly error taxonomy (shown by the installer and the Repair report)
+RUNTIME_ERRORS = {
+    "offline": ("No Internet connection",
+                "Check that this computer is online, then try again. "
+                "MiniWireshark keeps working on your current Python "
+                "meanwhile."),
+    "proxy": ("Something between you and the Internet blocked the download",
+              "A company proxy, firewall or antivirus may be intercepting "
+              "secure downloads. Try another network, or allow downloads "
+              "from github.com and pypi.org."),
+    "fingerprint": ("The downloaded file didn't match its fingerprint",
+                    "It was deleted without being used. This usually means "
+                    "a broken download or something interfering with it; "
+                    "try again later."),
+    "signature": ("The installer wasn't signed by the Python Software "
+                  "Foundation", "It was deleted without being run."),
+    "disk": ("Not enough free disk space",
+             "About 250 MB are needed in the data folder. Free some space "
+             "and try again."),
+    "permission": ("No permission to write in the data folder",
+                   "Run MiniWireshark from a folder you can write to, or "
+                   "set MINIWIRESHARK_DATA to one."),
+    "quarantine": ("A security program removed or blocked a file",
+                   "Your antivirus may have quarantined part of the private "
+                   "Python. Restore it or add an exception for the "
+                   "MiniWireshark data folder, then click Repair."),
+    "tk": ("The private Python has no graphical toolkit",
+           "This build can't show windows on this computer; MiniWireshark "
+           "will keep using your current Python."),
+    "selftest": ("The new environment failed its self-test",
+                 "It was not switched on. Your previous setup keeps "
+                 "working; details are in the log."),
+    "unsupported": ("This computer's processor/OS isn't supported by the "
+                    "private Python", "MiniWireshark keeps using your "
+                    "current Python."),
+    "cancelled": ("Cancelled", "Nothing was changed."),
+    "pip": ("Installing a component failed",
+            "Check the details; Repair will retry from the downloaded "
+            "copies."),
+    "other": ("Something unexpected went wrong", "See the details."),
+}
+
+
+def classify_runtime_error(exc):
+    """Map an exception to a RUNTIME_ERRORS kind."""
+    if isinstance(exc, RuntimeError_):
+        return exc.kind
+    text = f"{type(exc).__name__} {exc}".lower()
+    if isinstance(exc, PermissionError) or "permission denied" in text or \
+            "access is denied" in text:
+        return "permission"
+    if "no space" in text or "disk full" in text or "errno 28" in text:
+        return "disk"
+    if "certificate" in text or "ssl" in text or "proxy" in text or \
+            "407" in text:
+        return "proxy"
+    if isinstance(exc, (urllib.error.URLError, _socket.timeout,
+                        ConnectionError)) or "getaddrinfo" in text or \
+            "timed out" in text or "name or service" in text:
+        return "offline"
+    return "other"
+
+
+class RuntimeManager:
+    """Installs, checks, repairs, rolls back and removes the private
+    Python. All long steps report progress through `progress(stage,
+    fraction, text, extra)` and honour `cancel()`."""
+
+    STAGES = ("Check", "Download", "Verify", "Unpack", "Environment",
+              "Packages", "Self-test", "Switch")
+
+    def __init__(self, root_dir=None, script=None):
+        self.root = root_dir or RUNTIME_DIR
+        self.script = script or SCRIPT_PATH
+        self.cache = os.path.join(self.root, "cache")
+        self.wheels = os.path.join(self.root, "wheels")
+        self.log_lines = deque(maxlen=400)
+
+    # ---- facts -------------------------------------------------------------------
+    def plan(self):
+        plat = runtime_platform()
+        src = RUNTIME_SOURCES.get(plat)
+        tag = wheel_platform_tag(plat)
+        _req, pkgs, skipped = lock_requirements(tag)
+        vcr = True
+        if plat[0] == "windows":
+            sd = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                              "System32")
+            vcr = os.path.exists(os.path.join(sd, "vcruntime140.dll"))
+        return {"platform": plat, "source": src, "wheel_tag": tag,
+                "packages": pkgs, "skipped": skipped,
+                "python": RUNTIME_PYTHON, "dir": self.root,
+                "download_mb": 30, "disk_mb": 120,
+                "use_pyorg": plat[0] == "windows" and not vcr,
+                "supported": bool(src) and bool(tag)}
+
+    def describe(self):
+        p = self.plan()
+        if not p["supported"]:
+            return ("A private Python isn't available for this computer "
+                    f"({p['platform'][0]} {p['platform'][1]}); MiniWireshark "
+                    "uses the Python it was started with.")
+        names = ", ".join(n for n, _r in p["packages"])
+        return (f"MiniWireshark can set up its own private Python "
+                f"{p['python']} so it runs the same on every computer.\n\n"
+                f"• Download: about {p['download_mb']} MB from GitHub "
+                f"(python-build-standalone) plus {names} from PyPI.\n"
+                f"• Disk: about {p['disk_mb']} MB, all inside\n  {p['dir']}\n"
+                f"• Every file is checked against a fingerprint built into "
+                f"MiniWireshark before it is used.\n"
+                f"• Your own Python, PATH and system settings are never "
+                f"changed. Remove it any time from Settings → Diagnostics → "
+                f"Runtime Manager.")
+
+    def status(self):
+        st = runtime_state_read()
+        env = runtime_env(st)
+        cur = env or {}
+        return {"state": st, "current": st.get("current", ""),
+                "previous": st.get("previous", ""),
+                "python": cur.get("python", ""),
+                "version": cur.get("version", ""),
+                "healthy": runtime_healthy(env),
+                "running_inside": bool(env) and _same_interpreter(
+                    cur.get("python", ""), sys.executable),
+                "lock": cur.get("lock", ""),
+                "lock_current": cur.get("lock") == lock_fingerprint(),
+                "declined": bool(st.get("declined")),
+                "pending_starts": int(st.get("pending_starts", 0)),
+                "rolled_back": st.get("rolled_back"),
+                "last_error": st.get("last_error", ""),
+                "pending_switch": st.get("pending_switch", "")}
+
+    def _log(self, text):
+        self.log_lines.append(f"{time.strftime('%H:%M:%S')} {text}")
+        LOG.info("runtime: %s", text)
+
+    # ---- download with resume, speed and cancel --------------------------------
+    def download(self, url, dest, expected_sha=None, progress=None,
+                 cancel=lambda: False, size_hint=0):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        if expected_sha and os.path.exists(dest) and \
+                sha256_file(dest) == expected_sha:
+            self._log(f"cached: {os.path.basename(dest)}")
+            return dest
+        part = dest + ".part"
+        have = os.path.getsize(part) if os.path.exists(part) else 0
+        req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+        if have:
+            req.add_header("Range", f"bytes={have}-")
+        t0, last = time.time(), 0.0
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                if have and getattr(r, "status", 200) != 206:
+                    have = 0                       # server ignored Range
+                total = int(r.headers.get("Content-Length") or 0) + have
+                total = total or size_hint
+                mode = "ab" if have else "wb"
+                got = have
+                with open(part, mode) as f:
+                    while True:
+                        if cancel():
+                            raise RuntimeError_("cancelled")
+                        chunk = r.read(256 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        got += len(chunk)
+                        now = time.time()
+                        if progress and now - last > 0.2:
+                            last = now
+                            speed = (got - have) / max(0.001, now - t0)
+                            eta = (total - got) / speed if speed and total \
+                                else 0
+                            progress("Download", got / total if total
+                                     else 0.0,
+                                     f"{got / 1e6:.1f} of "
+                                     f"{total / 1e6:.1f} MB",
+                                     {"speed": speed, "eta": eta})
+        except RuntimeError_:
+            raise
+        except (OSError, urllib.error.URLError) as e:
+            raise RuntimeError_(classify_runtime_error(e), str(e))
+        if expected_sha:
+            if progress:
+                progress("Verify", 0.5, "Checking the fingerprint…", {})
+            actual = sha256_file(part)
+            if actual != expected_sha:
+                with contextlib.suppress(OSError):
+                    os.remove(part)
+                raise RuntimeError_("fingerprint",
+                                    f"expected {expected_sha}, got {actual}")
+        os.replace(part, dest)
+        return dest
+
+    # ---- unpack (refuses unsafe archive paths) ----------------------------------
+    @staticmethod
+    def safe_extract(archive, dest):
+        import tarfile
+        os.makedirs(dest, exist_ok=True)
+        root = os.path.realpath(dest)
+        with tarfile.open(archive, "r:*") as tf:
+            members = []
+            for m in tf.getmembers():
+                target = os.path.realpath(os.path.join(dest, m.name))
+                if not (target == root or target.startswith(root + os.sep)):
+                    raise RuntimeError_("other", f"unsafe path {m.name}")
+                if m.issym() or m.islnk():
+                    link = os.path.realpath(os.path.join(
+                        os.path.dirname(target), m.linkname))
+                    if not link.startswith(root + os.sep):
+                        raise RuntimeError_("other", f"unsafe link {m.name}")
+                if m.isdev():
+                    continue
+                members.append(m)
+            if sys.version_info >= (3, 12):
+                tf.extractall(dest, members=members, filter="tar")
+            else:
+                tf.extractall(dest, members=members)
+
+    @staticmethod
+    def find_python(env_dir):
+        cands = [os.path.join(env_dir, "python", "python.exe"),
+                 os.path.join(env_dir, "python", "bin", "python3"),
+                 os.path.join(env_dir, "python", "install", "bin",
+                              "python3"),
+                 os.path.join(env_dir, "python.exe"),
+                 os.path.join(env_dir, "bin", "python3")]
+        for c in cands:
+            if os.path.isfile(c):
+                return c
+        return ""
+
+    def _run(self, cmd, timeout=600, cancel=lambda: False):
+        self._log("$ " + " ".join(os.path.basename(c) if i == 0 else c
+                                  for i, c in enumerate(cmd)))
+        env = dict(os.environ)
+        for k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
+            env.pop(k, None)
+        env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+        env["PYTHONNOUSERSITE"] = "1"
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True, env=env,
+                             creationflags=getattr(subprocess,
+                                                   "CREATE_NO_WINDOW", 0))
+        out = []
+        t_end = time.time() + timeout
+        while True:
+            if cancel():
+                p.kill()
+                raise RuntimeError_("cancelled")
+            try:
+                o, _ = p.communicate(timeout=0.5)
+                out.append(o or "")
+                break
+            except subprocess.TimeoutExpired:
+                if time.time() > t_end:
+                    p.kill()
+                    raise RuntimeError_("other", f"timed out: {cmd[1:3]}")
+        text = "".join(out)
+        for ln in text.splitlines()[-30:]:
+            self._log("  " + ln)
+        return p.returncode, text
+
+    # ---- the install --------------------------------------------------------------
+    def provision(self, progress=None, cancel=lambda: False,
+                  base_python=None):
+        """Build a NEW environment next to any existing one, test it and
+        record it. Switching happens immediately when nothing is running
+        from the old one, otherwise on the next start. Returns env id."""
+        prog = progress or (lambda *a: None)
+        plan = self.plan()
+        prog("Check", 0.0, "Checking this computer…", {})
+        if not plan["supported"]:
+            raise RuntimeError_("unsupported", str(plan["platform"]))
+        free = shutil.disk_usage(PATHS.data).free if hasattr(
+            shutil, "disk_usage") else 1 << 40
+        if free < 300 * 1024 * 1024:
+            raise RuntimeError_("disk", f"{free // (1024 * 1024)} MB free")
+        env_id = time.strftime("cp314-%Y%m%d-%H%M%S")
+        env_dir = os.path.join(self.root, env_id)
+        try:
+            exe = ""
+            if base_python and self._usable_base(base_python):
+                prog("Unpack", 0.2, "Reusing the Python 3.14 already on "
+                     "this computer (it is not modified)…", {})
+                exe = self._venv_from(base_python, env_dir, cancel)
+            if not exe:
+                name, sha = plan["source"]
+                archive = os.path.join(self.cache, name)
+                url = RUNTIME_PBS_BASE + RUNTIME_PBS_TAG + "/" + \
+                    urllib.request.quote(name)
+                self.download(url, archive, sha, prog, cancel,
+                              size_hint=plan["download_mb"] * 1024 * 1024)
+                prog("Verify", 1.0, "Fingerprint OK", {})
+                prog("Unpack", 0.1, "Unpacking the private Python…", {})
+                self.safe_extract(archive, env_dir)
+                exe = self.find_python(env_dir)
+            if not exe:
+                raise RuntimeError_("quarantine", "python executable missing")
+            prog("Environment", 0.3, "Checking the new Python…", {})
+            rc, out = self._run([exe, "-c",
+                                 "import sys, tkinter, sqlite3, ssl; "
+                                 "print(sys.version.split()[0], "
+                                 "tkinter.TkVersion)"], 120, cancel)
+            if rc != 0:
+                kind = "tk" if "tkinter" in out or "_tkinter" in out \
+                    else "quarantine"
+                raise RuntimeError_(kind, out[-400:])
+            version = out.split()[0] if out.split() else "?"
+            self.install_packages(exe, prog, cancel)
+            prog("Self-test", 0.1, "Running MiniWireshark's self-test in "
+                 "the new environment…", {})
+            ok, text = self.self_test(exe, cancel)
+            if not ok:
+                raise RuntimeError_("selftest", text[-600:])
+        except BaseException:
+            self._log("install failed; removing the half-built "
+                      "environment")
+            shutil.rmtree(env_dir, ignore_errors=True)
+            raise
+        prog("Switch", 0.5, "Switching to the new environment…", {})
+        state = runtime_state_read()
+        envs = dict(state.get("envs") or {})
+        envs[env_id] = {"python": exe, "version": version,
+                        "lock": lock_fingerprint(), "selftest_ok": True,
+                        "created": time.time(), "dir": env_dir}
+        state["envs"] = envs
+        busy = state.get("current") and _same_interpreter(
+            (runtime_env(state) or {}).get("python", ""), sys.executable)
+        if busy:
+            state["pending_switch"] = env_id       # applied at next start
+        else:
+            state["previous"] = state.get("current", "")
+            state["current"] = env_id
+            state["pending_starts"] = 0
+        state["declined"] = False
+        state["last_error"] = ""
+        runtime_state_write(state)
+        self.prune_old()
+        prog("Switch", 1.0, "Done", {})
+        return env_id
+
+    def _usable_base(self, exe):
+        try:
+            r = subprocess.run([exe, "-c", "import sys, tkinter, venv; "
+                                "print(sys.version_info[:2])"],
+                               capture_output=True, text=True, timeout=30)
+            return r.returncode == 0 and "(3, 14)" in r.stdout
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _venv_from(self, base, env_dir, cancel):
+        rc, _ = self._run([base, "-m", "venv", "--without-pip", env_dir],
+                          300, cancel)
+        if rc != 0:
+            return ""
+        exe = os.path.join(env_dir, "Scripts", "python.exe") if IS_WINDOWS \
+            else os.path.join(env_dir, "bin", "python3")
+        if not os.path.isfile(exe):
+            return ""
+        rc, _ = self._run([exe, "-m", "ensurepip", "--default-pip"], 300,
+                          cancel)
+        return exe if rc == 0 else ""
+
+    def install_packages(self, exe, progress=None, cancel=lambda: False,
+                         offline_only=False, force=False):
+        prog = progress or (lambda *a: None)
+        tag = wheel_platform_tag()
+        req_text, pkgs, skipped = lock_requirements(tag)
+        os.makedirs(self.wheels, exist_ok=True)
+        req = os.path.join(self.root, "requirements.lock.txt")
+        with open(req, "w", encoding="utf-8") as f:
+            f.write(req_text)
+        if not offline_only:
+            prog("Packages", 0.1, "Downloading verified components…", {})
+            rc, out = self._run([exe, "-m", "pip", "download",
+                                 "--require-hashes", "--only-binary=:all:",
+                                 "--no-deps", "-d", self.wheels, "-r", req],
+                                900, cancel)
+            if rc != 0:
+                kind = "fingerprint" if "HASHES" in out.upper() and \
+                    "MATCH" in out.upper() else classify_runtime_error(
+                        OSError(out[-300:]))
+                if kind == "other":
+                    kind = "pip"
+                raise RuntimeError_(kind, out[-600:])
+        prog("Packages", 0.6, "Installing components…", {})
+        cmd = [exe, "-m", "pip", "install", "--require-hashes",
+               "--only-binary=:all:", "--no-deps", "--no-index",
+               "--find-links", self.wheels, "-r", req]
+        if force:
+            cmd.insert(4, "--force-reinstall")
+        rc, out = self._run(cmd, 900, cancel)
+        if rc != 0:
+            raise RuntimeError_("pip", out[-600:])
+        prog("Packages", 1.0, "Components installed"
+             + (f" (not available here: {', '.join(skipped)})"
+                if skipped else ""), {})
+        return pkgs, skipped
+
+    def self_test(self, exe, cancel=lambda: False):
+        try:
+            rc, out = self._run([exe, self.script, SELF_TEST_FLAG,
+                                 "--quick"], 600, cancel)
+        except RuntimeError_ as e:
+            if e.kind == "cancelled":
+                raise
+            return False, str(e)
+        return rc == 0, out
+
+    # ---- maintenance --------------------------------------------------------------
+    def repair(self, progress=None, cancel=lambda: False):
+        """Reinstall components from the downloaded copies (no network when
+        the cache is complete), re-test, and re-record the environment.
+        Rebuilds from the cached archive if the interpreter itself is
+        damaged."""
+        prog = progress or (lambda *a: None)
+        st = runtime_state_read()
+        env = runtime_env(st)
+        if not env or not os.path.isfile(env.get("python", "")):
+            prog("Check", 0.2, "The private Python is missing or damaged — "
+                 "rebuilding it…", {})
+            return self.provision(prog, cancel), "rebuilt"
+        exe = env["python"]
+        prog("Check", 0.5, "Checking installed components…", {})
+        try:
+            self.install_packages(exe, prog, cancel, offline_only=True,
+                                  force=True)
+            how = "reinstalled from the downloaded copies"
+        except RuntimeError_ as e:
+            if e.kind == "cancelled":
+                raise
+            self.install_packages(exe, prog, cancel, force=True)
+            how = "downloaded again and reinstalled"
+        ok, text = self.self_test(exe, cancel)
+        st = runtime_state_read()
+        env = runtime_env(st)
+        if env is not None:
+            env["selftest_ok"] = ok
+            env["lock"] = lock_fingerprint()
+            env["repaired"] = time.time()
+            runtime_state_write(st)
+        if not ok:
+            raise RuntimeError_("selftest", text[-600:])
+        return st.get("current"), how
+
+    def rollback(self):
+        st = runtime_state_read()
+        prev = runtime_env(st, st.get("previous"))
+        if not runtime_healthy(prev):
+            return False
+        st["current"], st["previous"] = st.get("previous"), st.get("current")
+        st["pending_starts"] = 0
+        runtime_state_write(st)
+        return True
+
+    def apply_pending_switch(self):
+        st = runtime_state_read()
+        nxt = st.get("pending_switch")
+        if not nxt or not runtime_healthy(runtime_env(st, nxt)):
+            return False
+        st["previous"], st["current"] = st.get("current", ""), nxt
+        st["pending_switch"] = ""
+        st["pending_starts"] = 0
+        runtime_state_write(st)
+        return True
+
+    def decline(self):
+        st = runtime_state_read()
+        st["declined"] = True
+        st["declined_at"] = time.time()
+        runtime_state_write(st)
+
+    def remove(self):
+        """Delete every private runtime (the next start uses the Python
+        MiniWireshark was started with)."""
+        st = runtime_state_read()
+        running = st.get("current") and _same_interpreter(
+            (runtime_env(st) or {}).get("python", ""), sys.executable)
+        if running:
+            st["remove_pending"] = True
+            st["current"] = ""
+            runtime_state_write(st)
+            return "on-exit"
+        shutil.rmtree(self.root, ignore_errors=True)
+        return "removed"
+
+    def prune_old(self, keep_days=7):
+        st = runtime_state_read()
+        keep = {st.get("current"), st.get("previous"),
+                st.get("pending_switch")}
+        envs = dict(st.get("envs") or {})
+        changed = False
+        for eid, env in list(envs.items()):
+            if eid in keep:
+                continue
+            if time.time() - float(env.get("created", 0)) > keep_days * 86400:
+                shutil.rmtree(env.get("dir") or os.path.join(self.root, eid),
+                              ignore_errors=True)
+                envs.pop(eid, None)
+                changed = True
+        if changed:
+            st["envs"] = envs
+            runtime_state_write(st)
+
+    def export_offline_kit(self, folder):
+        """Copy the verified archive and wheels to `folder` so another
+        computer can install without Internet."""
+        os.makedirs(folder, exist_ok=True)
+        n = 0
+        for d in (self.cache, self.wheels):
+            if os.path.isdir(d):
+                for name in os.listdir(d):
+                    if name.endswith((".tar.gz", ".whl", ".exe")):
+                        shutil.copy2(os.path.join(d, name), folder)
+                        n += 1
+        atomic_write_json(os.path.join(folder, "miniwireshark-kit.json"),
+                          {"python": RUNTIME_PYTHON, "lock": RUNTIME_LOCK,
+                           "sources": {f"{k[0]}-{k[1]}": v for k, v in
+                                       RUNTIME_SOURCES.items()}})
+        return n
+
+    def import_offline_kit(self, folder):
+        """Use a kit folder as the download cache (fingerprints are still
+        checked before anything is used)."""
+        n = 0
+        os.makedirs(self.cache, exist_ok=True)
+        os.makedirs(self.wheels, exist_ok=True)
+        for name in os.listdir(folder):
+            src = os.path.join(folder, name)
+            if name.endswith(".whl"):
+                shutil.copy2(src, self.wheels)
+                n += 1
+            elif name.endswith(".tar.gz"):
+                shutil.copy2(src, self.cache)
+                n += 1
+        return n
+
+    def check_newer_python(self, timeout=15):
+        """Explicit, online: is there a newer python-build-standalone
+        release than the one this version of MiniWireshark verified?
+        Sends one ordinary request to api.github.com."""
+        url = ("https://api.github.com/repos/astral-sh/"
+               "python-build-standalone/releases/latest")
+        req = urllib.request.Request(url, headers={"User-Agent": APP_NAME,
+                                                   "Accept":
+                                                   "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read(2_000_000).decode("utf-8", "replace"))
+        names = [a.get("name", "") for a in data.get("assets", [])]
+        vers = set()
+        for n in names:
+            m = re.match(r"cpython-(3\.\d+\.\d+)\+", n)
+            if m:
+                vers.add(m.group(1))
+        newest = max(vers, key=_version_tuple) if vers else ""
+        same_minor = max((v for v in vers if v.startswith("3.14.")),
+                         key=_version_tuple, default="")
+        return {"tag": data.get("tag_name", ""), "newest": newest,
+                "newest_314": same_minor, "verified": RUNTIME_PYTHON,
+                "newer": bool(same_minor) and
+                _version_tuple(same_minor) > _version_tuple(RUNTIME_PYTHON)}
+
+
+def make_runtime_lock(packages=("scapy", "psutil", "cryptography", "cffi",
+                                "pycparser")):
+    """Release tooling: build RUNTIME_LOCK from PyPI's JSON API (needs
+    Internet). Prints a dict to paste into the file."""
+    tags = {"win_amd64": r"win_amd64", "win_arm64": r"win_arm64",
+            "macosx_arm64": r"macosx_\d+_\d+_(arm64|universal2)",
+            "macosx_x86_64": r"macosx_\d+_\d+_(x86_64|universal2)",
+            "linux_x86_64": r"manylinux.*x86_64",
+            "linux_aarch64": r"manylinux.*aarch64"}
+    out = {}
+    for pkg in packages:
+        with urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/json",
+                                    timeout=30) as r:
+            d = json.load(r)
+        ver = d["info"]["version"]
+        spec = {"version": ver, "required": pkg == "scapy"}
+        for f in d["releases"][ver]:
+            fn = f["filename"]
+            if fn.endswith("-none-any.whl"):
+                spec["any"] = (fn, f["digests"]["sha256"])
+                break
+            for tag, pat in tags.items():
+                parts = fn.split("-")
+                if len(parts) < 5 or not re.search(pat, fn) or \
+                        "musllinux" in fn:
+                    continue
+                if parts[2] == "cp314" or parts[3] == "abi3":
+                    spec.setdefault(tag, f["digests"]["sha256"])
+        out[pkg] = spec
+    return out
 
 
 # ============================================================================
@@ -1219,6 +2718,9 @@ class DataManager:
 
     def resource(self, key):
         return next(r for r in DATA_MANIFEST if r.key == key)
+
+    def resources(self):
+        return list(DATA_MANIFEST)
 
     def _paths(self, r):
         p = os.path.join(self.cache_dir, r.filename)
@@ -4435,6 +5937,7 @@ def install_gui_gate(gate=None):
             finally:
                 gate.reacquire(n)
         return wrapper
+    _install_safe_variable_del()
     tk.Misc.wait_window = releasing(tk.Misc.wait_window)
     tk.Misc.wait_variable = releasing(tk.Misc.wait_variable)
     tk.Misc.waitvar = tk.Misc.wait_variable
@@ -4442,6 +5945,42 @@ def install_gui_gate(gate=None):
         from tkinter import commondialog
         commondialog.Dialog.show = releasing(commondialog.Dialog.show)
     return gate
+
+
+_DEFERRED_TK_DELETES = deque()
+
+
+def _install_safe_variable_del():
+    """Python may garbage-collect a Tk variable on ANY thread; Tk calls
+    from a non-GUI thread fail. Defer those clean-ups to the GUI thread
+    (drained by drain_deferred_tk())."""
+    orig = tk.Variable.__del__
+
+    def safe_del(self):
+        if threading.current_thread() is threading.main_thread():
+            try:
+                orig(self)
+            except (tk.TclError, RuntimeError):
+                pass
+            return
+        tkapp = getattr(self, "_tk", None)
+        if tkapp is not None:
+            _DEFERRED_TK_DELETES.append((tkapp, self._name,
+                                         self._tclCommands))
+            self._tk = None
+    tk.Variable.__del__ = safe_del
+
+
+def drain_deferred_tk():
+    while _DEFERRED_TK_DELETES:
+        tkapp, name, cmds = _DEFERRED_TK_DELETES.popleft()
+        try:
+            if tkapp.getboolean(tkapp.call("info", "exists", name)):
+                tkapp.globalunsetvar(name)
+            for c in cmds or ():
+                tkapp.deletecommand(c)
+        except (tk.TclError, RuntimeError):
+            pass
 
 
 class RawRing:
@@ -10067,7 +11606,8 @@ def _default_config():
         "general": {"auto_start_capture": True, "confirm_before_clear": False,
                     "beginner_explanations": True,
                     "explanation_verbosity": "Normal", "language": "English",
-                    "upgraded_from_3": False},
+                    "upgraded_from_3": False, "show_welcome": True,
+                    "welcome_version": ""},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal",
                        "inspector": None},
@@ -10189,6 +11729,15 @@ class AppConfig:
 
     def save(self):
         try:
+            bak = self.path + ".bak"
+            if os.path.exists(self.path) and not self.warning:
+                try:
+                    stale = time.time() - os.path.getmtime(bak) > 86400
+                except OSError:
+                    stale = True
+                if stale:
+                    with contextlib.suppress(OSError):
+                        shutil.copyfile(self.path, bak)
             atomic_write_json(self.path, self.data)
             return True
         except OSError:
@@ -11517,7 +13066,20 @@ SETTINGS_PAGES = [
     {"id": "general", "icon": "⚙", "title": "General",
      "blurb": "How MiniWireshark starts up and how much it explains.",
      "sections": [
+         {"title": "Something not working?", "controls": [
+             {"type": "big_action", "label": "\U0001F6E0  Repair "
+              "MiniWireshark", "action": "repair_all",
+              "help": "One click checks and fixes the usual problems: "
+                      "missing components, damaged reference lists or "
+                      "history, a broken settings file and a stuck capture "
+                      "engine — then tells you what it fixed."},
+         ]},
          {"title": "Startup", "controls": [
+             {"key": "general.show_welcome", "type": "bool",
+              "label": "Show the Welcome Center at startup",
+              "help": "Start Monitoring, Demo Mode, the Quick Start Guide "
+                      "and Diagnostics in one place each time MiniWireshark "
+                      "opens. Turn off to go straight to the main window."},
              {"key": "general.auto_start_capture", "type": "bool",
               "label": "Start watching automatically when MiniWireshark opens",
               "help": "Picks the best network card for you and begins right "
@@ -12042,6 +13604,17 @@ SETTINGS_PAGES = [
                  ("Open diagnostics", "open_diagnostics"),
                  ("Open logs", "open_logs"),
                  ("Run self-test", "run_self_test")]},
+         ]},
+         {"title": "Repair", "controls": [
+             {"type": "big_action", "label": "\U0001F6E0  Repair "
+              "MiniWireshark", "action": "repair_all",
+              "help": "Checks and fixes the usual problems automatically."},
+         ]},
+         {"title": "Runtime Manager", "controls": [
+             {"type": "info", "text_fn": "runtime_status_text"},
+             {"type": "action", "actions": [
+                 ("Repair / Update Environment…", "runtime_manager"),
+                 ("Export debug bundle…", "export_bundle")]},
          ]},
      ]},
 ]
@@ -12610,6 +14183,20 @@ class SettingsWindow:
             lbl.pack(fill="x")
             self._wrap.append((lbl, 60))
 
+        elif typ == "big_action":
+            box = tk.Frame(row, bg=t["card_bg"], padx=12, pady=10,
+                           highlightthickness=1,
+                           highlightbackground=t["border"])
+            box.pack(fill="x", pady=(2, 4))
+            ttk.Button(box, text=c["label"], style="Accent.TButton",
+                       command=lambda n=c["action"]: self._act(n)).pack(
+                side="left")
+            lbl = tk.Label(box, text=c.get("help", ""), bg=t["card_bg"],
+                           fg=t["text_fg"], font=self.F_HELP,
+                           justify="left", anchor="w")
+            lbl.pack(side="left", fill="x", expand=True, padx=(12, 0))
+            self._wrap.append((lbl, 260))
+
         elif typ == "action":
             bar = tk.Frame(row, bg=t["tab_bg"])
             bar.pack(fill="x")
@@ -12776,6 +14363,9 @@ class SettingsWindow:
     def diag_summary_text(self):
         return self.app.diag_summary_text()
 
+    def runtime_status_text(self):
+        return self.app.runtime_status_text()
+
     def _act(self, name):
         if name == "open_config_folder":
             folder = os.path.dirname(self.cfg.path)
@@ -12807,6 +14397,14 @@ class SettingsWindow:
             self.app.open_diagnostics()
         elif name == "run_self_test":
             self.app.run_self_test_window()
+        elif name == "repair_all":
+            self.app.repair_everything(self.win)
+        elif name == "runtime_manager":
+            self.app.open_runtime_manager(self.win)
+        elif name == "export_bundle":
+            self.app.export_debug_bundle(self.win)
+        elif name == "quick_start":
+            self.app.open_quick_start()
         elif name == "unmute_alerts":
             self.cfg.set("alerts.muted_devices", [])
             self.cfg.set("alerts.expected", [])
@@ -16976,6 +18574,39 @@ DATA_MODE_TEXT = {
 }
 
 
+REPAIR_STEPS = (
+    ("components", "Program components"),
+    ("reference", "Reference lists (vendors, domains…)"),
+    ("history", "History database"),
+    ("settings", "Settings file"),
+    ("capture", "Network cards and capture engine"),
+    ("selftest", "Quick self-test"),
+)
+
+QUICK_START = (
+    ("The Dashboard", "Start here. The cards show what's happening right "
+     "now; the two big cards say what this computer can see from where it "
+     "is, and what changed in the last hour. Click any card to dig in.",
+     "dash", "This is the Dashboard — click any card for details."),
+    ("Devices and the Inspector", "Every device on your network, with how "
+     "sure MiniWireshark is. Select one and press F2: the Inspector shows "
+     "each fact about it and the packets that prove it.",
+     "devices", "Select a device, then press F2 to open the Inspector."),
+    ("Evidence marks", "◉ Observed — seen in a packet.  ◎ Correlated — two "
+     "observations line up (a lookup, then a connection).  ◌ Inferred — a "
+     "reasonable guess.  ? Unknown — not seen either way, which never "
+     "means “didn't happen”.", "websites",
+     "The “How we know” column shows the evidence mark for each site."),
+    ("Quiet and Active", "The banner at the top always tells the truth: in "
+     "Quiet Mode MiniWireshark only listens. Active Scanning also sends "
+     "small discovery probes — only on networks you've marked as yours.",
+     "dash", "The coloured banner at the top shows Quiet or Active."),
+    ("Alerts", "Alerts flag unusual things with innocent explanations and "
+     "what to check. Nothing here means “hacked” — it means “worth a "
+     "look”.", "alerts", "Alerts explain what was seen and what to check."),
+)
+
+
 class MiniWireshark:
     MAX_ROWS = 5000
     SEVERITY_ICON = {"INFO": "ℹ", "WARNING": "⚠", "DANGER": "‼"}
@@ -16983,7 +18614,7 @@ class MiniWireshark:
                   "Extra large": 1.3}
 
     def __init__(self, root, gateway_ip, my_ips, my_macs,
-                 default_iface_name="", config=None):
+                 default_iface_name="", config=None, start_action=None):
         global DATA
         self.root = root
         self.real_identity = (gateway_ip, set(my_ips), set(my_macs))
@@ -17110,8 +18741,18 @@ class MiniWireshark:
             self._health_params)
         self.prober.start()
 
-        if START_IN_DEMO:
+        self.start_action = start_action
+        if start_action == "demo" or (START_IN_DEMO and not start_action):
             self.root.after(800, self.start_demo)
+        elif start_action == "monitor":
+            self.root.after(500, self._auto_start_once)
+        elif start_action in ("guide", "diagnostics", "repair"):
+            self.status_var.set("Ready. Click “Start watching” when "
+                                "you'd like to begin.")
+            self.root.after(600, {"guide": self.open_quick_start,
+                                  "diagnostics": self.open_diagnostics,
+                                  "repair": self.repair_everything}
+                            [start_action])
         elif self.config.get("general.auto_start_capture", True):
             self.root.after(700, self._auto_start_once)
         else:
@@ -17367,10 +19008,16 @@ class MiniWireshark:
 
     def _open_help_menu(self):
         menu = themed_menu(self)
+        menu.add_command(label="Quick Start Guide",
+                         command=self.open_quick_start)
         menu.add_command(label="Help & glossary",
                          command=lambda: self.goto("help"))
         menu.add_command(label="Diagnostics…",
                          command=self.open_diagnostics)
+        menu.add_command(label="\U0001F6E0 Repair MiniWireshark…",
+                         command=self.repair_everything)
+        menu.add_command(label="Runtime Manager…",
+                         command=self.open_runtime_manager)
         menu.add_command(label=("Stop Demo Mode" if self.data_mode == "demo"
                                 else "Try Demo Mode"),
                          command=self.toggle_demo)
@@ -17855,6 +19502,557 @@ class MiniWireshark:
         ]
         DetailDialog(self, f"What changed — {period.lower()}", sections,
                      size="700x600")
+
+    # ---- one-click Repair, Runtime Manager, Quick Start (M6b) ----------------------
+    def _on_tk(self, fn, timeout=120):
+        """Run fn on the Tk thread from a worker and wait for its result."""
+        ev = threading.Event()
+        box = [None]
+
+        def run():
+            try:
+                box[0] = fn()
+            finally:
+                ev.set()
+        self._async_results.put(run)
+        ev.wait(timeout)
+        return box[0]
+
+    def repair_everything(self, parent=None):
+        """The big friendly Repair button: checks and fixes the usual
+        problems, then says in plain words what it found and fixed."""
+        if getattr(self, "_repair_win", None) is not None:
+            with contextlib.suppress(tk.TclError):
+                self._repair_win.lift()
+                return
+        t = self.theme
+        win = tk.Toplevel(parent or self.root)
+        self._repair_win = win
+        win.title("Repair MiniWireshark")
+        win.geometry("640x460")
+        win.configure(bg=t["card_bg"])
+        win.transient(parent or self.root)
+        tk.Label(win, text="\U0001F6E0  Repair MiniWireshark", bg=t["card_bg"],
+                 fg=t["text_fg"], font=("TkDefaultFont", 13, "bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(12, 2))
+        tk.Label(win, text="I'm checking the usual suspects and fixing what "
+                           "I can. Your captured data and settings stay as "
+                           "they are.", bg=t["card_bg"], fg=t["muted_fg"],
+                 anchor="w", justify="left", wraplength=600).pack(
+            fill="x", padx=14)
+        lst = tk.Frame(win, bg=t["card_bg"])
+        lst.pack(fill="both", expand=True, padx=14, pady=10)
+        rows = {}
+        for key, title in REPAIR_STEPS:
+            r = tk.Frame(lst, bg=t["card_bg"])
+            r.pack(fill="x", pady=2)
+            icon = tk.Label(r, text="○", bg=t["card_bg"], fg=t["muted_fg"],
+                            width=2, font=("TkDefaultFont", 11))
+            icon.pack(side="left")
+            tk.Label(r, text=title, bg=t["card_bg"], fg=t["text_fg"],
+                     anchor="w", width=34).pack(side="left")
+            msg = tk.Label(r, text="", bg=t["card_bg"], fg=t["muted_fg"],
+                           anchor="w", justify="left", wraplength=330)
+            msg.pack(side="left", fill="x", expand=True)
+            rows[key] = (icon, msg)
+        bar = tk.Frame(win, bg=t["card_bg"])
+        bar.pack(fill="x", padx=14, pady=(0, 12))
+        summary = tk.Label(bar, text="Working…", bg=t["card_bg"],
+                           fg=t["text_fg"], anchor="w",
+                           font=("TkDefaultFont", 10, "bold"))
+        summary.pack(side="left", fill="x", expand=True)
+        close = ttk.Button(bar, text="Close", command=win.destroy,
+                           state="disabled")
+        close.pack(side="right")
+
+        def on_close(_e=None):
+            self._repair_win = None
+        win.bind("<Destroy>", lambda e: on_close() if e.widget is win
+                 else None)
+        glyph = {"ok": ("✔", t["good_fg"]), "fixed": ("\U0001F527",
+                                                      t["accent"]),
+                 "failed": ("✖", t["danger_fg"]),
+                 "skipped": ("–", t["muted_fg"]),
+                 "busy": ("●", t["accent"])}
+
+        def show(key, status, text):
+            def ui():
+                icon, msg = rows[key]
+                g, c = glyph.get(status, ("?", t["muted_fg"]))
+                with contextlib.suppress(tk.TclError):
+                    icon.configure(text=g, fg=c)
+                    msg.configure(text=text)
+            self._async_results.put(ui)
+
+        def work():
+            results = []
+            for key, _title in REPAIR_STEPS:
+                show(key, "busy", "checking…")
+                try:
+                    status, text = getattr(self, f"_repair_{key}")()
+                except Exception as e:               # noqa: BLE001
+                    LOG.exception("repair step %s", key)
+                    status, text = "failed", f"{type(e).__name__}: {e}"
+                results.append((key, status, text))
+                show(key, status, text)
+            fixed = sum(1 for r in results if r[1] == "fixed")
+            failed = sum(1 for r in results if r[1] == "failed")
+            text = ("Everything looks good — nothing needed fixing."
+                    if not fixed and not failed else
+                    f"Fixed {fixed} thing{'s' if fixed != 1 else ''}"
+                    + (f"; {failed} couldn't be fixed (details on each "
+                       f"line)." if failed else "."))
+            LOG.info("repair finished: %s", results)
+            self.last_repair = (time.time(), results)
+
+            def done():
+                with contextlib.suppress(tk.TclError):
+                    summary.configure(text=text)
+                    close.configure(state="normal")
+                self._set_banner("\U0001F6E0  Repair: " + text,
+                                 kind="bad" if failed else "good")
+            self._async_results.put(done)
+        threading.Thread(target=work, daemon=True, name="repair").start()
+        return win
+
+    def _repair_components(self):
+        mgr = RuntimeManager()
+        st = mgr.status()
+        if st["running_inside"]:
+            _eid, how = mgr.repair()
+            return "fixed", f"Private Python components {how}; self-test " \
+                            f"passed."
+        missing = []
+        for dep in DEPENDENCY_MANIFEST:
+            if not _module_ok(dep["import"]):
+                missing.append(dep)
+        if not missing:
+            note = ""
+            if st["declined"] and mgr.plan()["supported"]:
+                s2 = runtime_state_read()
+                s2["declined"] = False
+                runtime_state_write(s2)
+                note = (" The private Python will be offered again next "
+                        "time you start MiniWireshark.")
+            return ("ok" if not note else "fixed"), \
+                "All components import correctly." + note
+        PIP_ASK[0] = lambda: bool(self._on_tk(lambda: messagebox.askyesno(
+            "Repair", "Your Python is managed by the operating system. "
+            "Install the missing components into it anyway "
+            "(--break-system-packages)?", parent=self.root)))
+        try:
+            msgs = []
+            for dep in missing:
+                ok, err = _pip_install(dep["pip"], timeout=600)
+                msgs.append(f"{dep['pip']} {'installed' if ok else 'failed'}")
+        finally:
+            PIP_ASK[0] = None
+        bad = [m for m in msgs if m.endswith("failed")]
+        return ("failed" if bad else "fixed"), "; ".join(msgs) + \
+            (" — restart MiniWireshark to use them." if not bad else "")
+
+    def _repair_reference(self):
+        bad, fixed = [], []
+        for r in self.data.resources():
+            dest, _meta = self.data._paths(r)
+            if not os.path.exists(dest):
+                continue
+            if not self.data._verify_and_load(r):
+                bad.append(r.key)
+        if not bad:
+            return "ok", "Reference lists are intact."
+        self.data.start(force=True)
+        fixed = bad
+        return "fixed", (f"{', '.join(fixed)}: damaged copy removed and "
+                         f"downloading again.")
+
+    def _repair_history(self):
+        if self.history is None:
+            if os.path.exists(PATHS.history_db):
+                return "skipped", "History is off (an old file exists)."
+            return "skipped", "History is off."
+        try:
+            con = sqlite3.connect(PATHS.history_db, timeout=10)
+            row = con.execute("PRAGMA quick_check").fetchone()
+            con.close()
+            ok = bool(row) and row[0] == "ok"
+        except sqlite3.DatabaseError:
+            ok = False
+        if ok:
+            return "ok", "The history database is healthy."
+        old = self.history
+
+        def reopen():
+            old.stop(wait=5)
+            self.history = self._open_store()
+            return self.history.recovered
+        msg = self._on_tk(reopen)
+        return "fixed", msg or "The history database was rebuilt."
+
+    def _repair_settings(self):
+        bak = self.config.path + ".bak"
+        if self.config.warning and os.path.exists(bak):
+            restored = AppConfig(path=bak)
+            if not restored.warning:
+                self.config.data = restored.data
+                self.config.warning = ""
+                self.config.save()
+                return "fixed", "Your settings were restored from the backup."
+        try:
+            if os.path.exists(self.config.path):
+                with open(self.config.path, encoding="utf-8") as f:
+                    json.load(f)
+        except (OSError, ValueError):
+            self.config.save()
+            return "fixed", "The settings file was damaged and was rewritten."
+        return "ok", "Settings file is fine."
+
+    def _repair_capture(self):
+        def act():
+            was = self.sniffer is not None
+            self.refresh_adapters()
+            if was:
+                self._stop_capture_only()
+                return self._start_capture(
+                    [self.current_iface_label] + list(
+                        self.iface_box["values"])[:3], keep_data=True)
+            return None
+        res = self._on_tk(act)
+        n = len(self.iface_map)
+        if IS_WINDOWS and not _npcap_present():
+            return "failed", ("The capture driver (Npcap) is missing — "
+                              "restart MiniWireshark and it will offer to "
+                              "install it.")
+        if res is None:
+            return "ok", f"Network cards re-detected ({n} found)."
+        return ("fixed" if res else "failed"), (
+            f"Re-detected {n} network cards and restarted the capture."
+            if res else "The capture engine couldn't restart; see "
+                        "Diagnostics.")
+
+    def _repair_selftest(self):
+        try:
+            r = subprocess.run([sys.executable, SCRIPT_PATH, SELF_TEST_FLAG,
+                                "--quick"], capture_output=True, text=True,
+                               timeout=600, creationflags=getattr(
+                                   subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError) as e:
+            return "failed", str(e)
+        tail = (r.stdout or "").strip().splitlines()[-1:] or ["?"]
+        return ("ok" if r.returncode == 0 else "failed"), tail[0]
+
+    # ---- Runtime Manager (maintenance mode) --------------------------------------
+    def runtime_status_text(self):
+        mgr = RuntimeManager()
+        st = mgr.status()
+        lines = []
+        if st["running_inside"]:
+            lines.append(f"Running on MiniWireshark's private Python "
+                         f"{platform.python_version()} ({st['python']}).")
+        elif st["healthy"]:
+            lines.append("A private Python is installed but this window "
+                         "runs on another Python.")
+        else:
+            lines.append(f"Running on Python {platform.python_version()} "
+                         f"({sys.executable}). No private Python"
+                         + (" (you declined it)." if st["declined"] else "."))
+        lines.append("Components verified by this release: " + ", ".join(
+            f"{k} {v['version']}" for k, v in RUNTIME_LOCK.items()))
+        if st["healthy"] and not st["lock_current"]:
+            lines.append("⚠ The private Python was built for an older "
+                         "MiniWireshark — Repair / Update brings it up to "
+                         "date.")
+        if st["previous"]:
+            lines.append(f"Previous environment kept for rollback: "
+                         f"{st['previous']}.")
+        if st["pending_switch"]:
+            lines.append("A rebuilt environment will be used from the next "
+                         "start.")
+        lt = LAUNCH_TIMES.get("ready")
+        if lt:
+            lines.append(f"Last launch: ready in {lt * 1000:.0f} ms "
+                         f"(budget 200 ms for the launcher itself).")
+        return "\n".join(lines)
+
+    def open_runtime_manager(self, parent=None):
+        """Settings → Diagnostics → Runtime Manager: the installer window
+        reopened in maintenance mode."""
+        win = tk.Toplevel(parent or self.root)
+        win.title("Runtime Manager")
+        win.geometry("760x640")
+        win.transient(parent or self.root)
+        lw = LoaderWindow(win, self.config, mode="maintenance")
+        lw.pack(fill="both", expand=True)
+        win.configure(bg=lw.bg)
+        mgr = RuntimeManager()
+        st = mgr.status()
+        lw.status_var.set("Runtime Manager")
+        lw._set_health("healthy" if st["running_inside"] and
+                       st["lock_current"] else
+                       "repair" if st["healthy"] else "degraded")
+        f = lw._card_frame("Your MiniWireshark environment",
+                           self.runtime_status_text())
+        busy = {"on": False}
+
+        def run(label, fn, done_text=None):
+            if busy["on"]:
+                return
+            busy["on"] = True
+            lw.cancel_requested = False
+            lw.show_install_controls(True)
+            lw.post_status(label + "…")
+
+            def work():
+                try:
+                    res = fn()
+                    msg = done_text(res) if done_text else "Done."
+                    lw.post_status("✔ " + msg)
+                    lw.post_health("healthy")
+                except Exception as e:               # noqa: BLE001
+                    kind = classify_runtime_error(e)
+                    title, what = RUNTIME_ERRORS.get(kind,
+                                                     RUNTIME_ERRORS["other"])
+                    lw.post_status(f"✖ {title}. {what}")
+                    lw.post_log(str(e), "err")
+                    lw.post_health("failed")
+                finally:
+                    busy["on"] = False
+                    lw.show_install_controls(False)
+                for line in list(mgr.log_lines)[-40:]:
+                    lw.post_log(line, "detail")
+            threading.Thread(target=work, daemon=True,
+                             name="runtime-manager").start()
+
+        def rebuild():
+            return mgr.provision(lw.runtime_progress,
+                                 lambda: lw.cancel_requested,
+                                 base_python=_find_local_python314())
+
+        def repair_or_build():
+            if mgr.status()["healthy"]:
+                return mgr.repair(lw.runtime_progress,
+                                  lambda: lw.cancel_requested)
+            return rebuild(), "installed"
+
+        def newer():
+            info = mgr.check_newer_python()
+            if info["newer"]:
+                return (f"Python {info['newest_314']} exists (this release "
+                        f"verified {info['verified']}). MiniWireshark moves "
+                        f"to it in a future update, after testing it.")
+            return (f"You have the newest Python this release verified "
+                    f"({info['verified']}); newest published: "
+                    f"{info['newest'] or 'unknown'}.")
+
+        def self_test():
+            exe = mgr.status()["python"] or sys.executable
+            ok, text = mgr.self_test(exe, lambda: lw.cancel_requested)
+            lw.post_log(text[-3000:], "detail")
+            if not ok:
+                raise RuntimeError_("selftest", text[-300:])
+            return text.strip().splitlines()[-1] if text.strip() else "ok"
+
+        def remove():
+            if not self._on_tk(lambda: messagebox.askyesno(
+                    "Remove private Python", "Delete MiniWireshark's private "
+                    "Python? MiniWireshark will use the Python it was "
+                    "started with until you install it again.",
+                    parent=win)):
+                return "Kept."
+            return mgr.remove()
+        actions = [
+            ("\U0001F6E0 Repair / Update Environment", lambda: run(
+                "Repairing", repair_or_build,
+                lambda r: f"Environment {r[1]}." if isinstance(r, tuple)
+                else "Done.")),
+            ("Rebuild side by side", lambda: run(
+                "Rebuilding", rebuild,
+                lambda eid: f"New environment {eid} ready (used from the "
+                            f"next start if this one is running).")),
+            ("Check for newer Python", lambda: run(
+                "Asking GitHub for the newest Python build", newer,
+                lambda m: m)),
+            ("Run self-test", lambda: run("Running the self-test", self_test,
+                                          lambda m: f"Self-test: {m}")),
+            ("Roll back", lambda: run(
+                "Rolling back", mgr.rollback,
+                lambda ok: "Switched to the previous environment (used "
+                           "from the next start)." if ok else
+                "There is no previous environment to roll back to.")),
+            ("Remove private Python", lambda: run(
+                "Removing", remove,
+                lambda r: {"removed": "Removed.",
+                           "on-exit": "Removed from the next start."}.get(
+                    r, str(r)))),
+            ("Export debug bundle…", lambda: self.export_debug_bundle(win)),
+            ("Offline kit…", lambda: self._offline_kit(win, mgr)),
+        ]
+        grid = tk.Frame(f, bg=lw.card_bg)
+        grid.pack(fill="x", pady=(6, 0))
+        for i, (label, cmd) in enumerate(actions):
+            ttk.Button(grid, text=label, command=cmd,
+                       style="Accent.TButton" if i == 0 else "TButton").grid(
+                row=i // 3, column=i % 3, sticky="ew", padx=3, pady=3)
+        for c in range(3):
+            grid.columnconfigure(c, weight=1)
+        tk.Label(f, text="“Update” here means the newest versions THIS "
+                         "release of MiniWireshark has verified — never "
+                         "whatever is newest online. Nothing outside "
+                         "MiniWireshark's data folder is changed.",
+                 bg=lw.card_bg, fg=lw.muted, wraplength=680, justify="left",
+                 anchor="w").pack(fill="x", pady=(8, 0))
+
+        def tick():
+            if not lw.winfo_exists():
+                return
+            lw.pump()
+            win.after(100, tick)
+        tick()
+        return win
+
+    def _offline_kit(self, parent, mgr):
+        folder = filedialog.askdirectory(parent=parent,
+                                         title="Folder for the offline kit")
+        if not folder:
+            return
+        if os.path.exists(os.path.join(folder, "miniwireshark-kit.json")):
+            n = mgr.import_offline_kit(folder)
+            messagebox.showinfo("Offline kit", f"Imported {n} verified "
+                                f"files. Repair / Update can now work "
+                                f"without Internet.", parent=parent)
+        else:
+            n = mgr.export_offline_kit(folder)
+            messagebox.showinfo("Offline kit", f"Saved {n} files to "
+                                f"{folder}. Copy the folder to a computer "
+                                f"without Internet and choose it here.",
+                                parent=parent)
+
+    def debug_bundle_text(self, masked=True):
+        parts = [f"MiniWireshark {SCRIPT_VERSION} debug bundle",
+                 time.strftime("%Y-%m-%d %H:%M:%S"), "",
+                 "== Diagnostics ==", DiagnosticsWindow.collect(self), "",
+                 "== Runtime ==", self.runtime_status_text(),
+                 json.dumps({k: v for k, v in RuntimeManager().status()
+                             .items() if k != "state"}, default=str,
+                            indent=1), "",
+                 "== Settings (no secrets are stored in settings) ==",
+                 json.dumps(self.config.data, indent=1, default=str)[:20000],
+                 "", "== Log (newest last) =="]
+        try:
+            with open(PATHS.log_file, encoding="utf-8",
+                      errors="replace") as f:
+                parts.append(f.read()[-60000:])
+        except OSError:
+            parts.append("(no log)")
+        text = "\n".join(parts)
+        return mask_sensitive(text) if masked else text
+
+    def export_debug_bundle(self, parent=None):
+        """Logs, diagnostics and runtime state — never packets. Addresses
+        are masked by default; you see a preview before anything is
+        saved."""
+        parent = parent or self.root
+        t = self.theme
+        win = tk.Toplevel(parent)
+        win.title("Export debug bundle")
+        win.geometry("760x560")
+        win.configure(bg=t["card_bg"])
+        mask_var = tk.BooleanVar(value=True)
+        tk.Label(win, text="Preview — this is exactly what will be saved. "
+                           "It never contains packets or captured contents.",
+                 bg=t["card_bg"], fg=t["text_fg"], anchor="w").pack(
+            fill="x", padx=12, pady=(10, 4))
+        txt = tk.Text(win, wrap="none", bg=t["tab_bg"], fg=t["text_fg"],
+                      font=("TkFixedFont", 8))
+        txt.pack(fill="both", expand=True, padx=12)
+
+        def fill():
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            txt.insert("end", self.debug_bundle_text(mask_var.get()))
+            txt.configure(state="disabled")
+        bar = tk.Frame(win, bg=t["card_bg"])
+        bar.pack(fill="x", padx=12, pady=8)
+        tk.Checkbutton(bar, text="Mask IP and hardware addresses "
+                                 "(recommended)", variable=mask_var,
+                       command=fill, bg=t["card_bg"], fg=t["text_fg"],
+                       selectcolor=t["tab_bg"],
+                       activebackground=t["card_bg"]).pack(side="left")
+
+        def save():
+            path = filedialog.asksaveasfilename(
+                parent=win, defaultextension=".zip",
+                initialfile=time.strftime("miniwireshark-debug-%Y%m%d-%H%M"
+                                          ".zip"),
+                filetypes=[("Zip archive", "*.zip")])
+            if not path:
+                return
+            import zipfile
+            with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+                z.writestr("debug.txt", self.debug_bundle_text(
+                    mask_var.get()))
+            messagebox.showinfo("Debug bundle", f"Saved to {path}",
+                                parent=win)
+            win.destroy()
+        ttk.Button(bar, text="Save…", command=save,
+                   style="Accent.TButton").pack(side="right")
+        ttk.Button(bar, text="Cancel", command=win.destroy).pack(
+            side="right", padx=6)
+        fill()
+        return win
+
+    # ---- Quick Start Guide ------------------------------------------------------
+    def open_quick_start(self):
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title("Quick Start Guide")
+        win.geometry("620x420")
+        win.configure(bg=t["card_bg"])
+        win.transient(self.root)
+        state = {"i": 0}
+        title = tk.Label(win, bg=t["card_bg"], fg=t["text_fg"],
+                         font=("TkDefaultFont", 13, "bold"), anchor="w")
+        title.pack(fill="x", padx=16, pady=(14, 4))
+        body = tk.Label(win, bg=t["card_bg"], fg=t["text_fg"], anchor="nw",
+                        justify="left", wraplength=580)
+        body.pack(fill="both", expand=True, padx=16)
+        dots = tk.Label(win, bg=t["card_bg"], fg=t["muted_fg"])
+        dots.pack()
+        bar = tk.Frame(win, bg=t["card_bg"])
+        bar.pack(fill="x", padx=16, pady=12)
+
+        def render():
+            i = state["i"]
+            step = QUICK_START[i]
+            title.configure(text=f"{i + 1}. {step[0]}")
+            body.configure(text=step[1])
+            dots.configure(text="  ".join("●" if j == i else "○"
+                                          for j in range(len(QUICK_START))))
+            back.configure(state="normal" if i else "disabled")
+            nxt.configure(text="Finish" if i == len(QUICK_START) - 1
+                          else "Next ›")
+
+        def show_me():
+            step = QUICK_START[state["i"]]
+            self.goto(step[2])
+            self._set_banner("\U0001F4D6  " + step[3])
+
+        def go(d):
+            j = state["i"] + d
+            if j >= len(QUICK_START):
+                win.destroy()
+                return
+            state["i"] = max(0, j)
+            render()
+        back = ttk.Button(bar, text="‹ Back", command=lambda: go(-1))
+        back.pack(side="left")
+        ttk.Button(bar, text="Show me", command=show_me).pack(side="left",
+                                                              padx=8)
+        nxt = ttk.Button(bar, text="Next ›", style="Accent.TButton",
+                         command=lambda: go(1))
+        nxt.pack(side="right")
+        render()
+        return win
 
     def _toggle_active_scanning(self):
         cur = self.config.get("mode.active_scanning", True)
@@ -18885,6 +21083,7 @@ class MiniWireshark:
 
     def _drain_async_results(self):
         """The only hand-off point from background threads back to Tk."""
+        drain_deferred_tk()
         try:
             while True:
                 fn = self._async_results.get_nowait()
@@ -20933,7 +23132,10 @@ class MiniWireshark:
         threading.Thread(target=work, daemon=True, name="self-update").start()
 
     def _confirm_startup_ok(self):
-        """20 s after a successful start, an update is considered good."""
+        """20 s after a successful start, an update (and the private
+        runtime) is considered good."""
+        if runtime_confirm_started():
+            LOG.info("private runtime start confirmed")
         marker = read_json(PATHS.update_marker, None)
         if marker:
             with contextlib.suppress(OSError):
@@ -21440,6 +23642,15 @@ class DiagnosticsWindow:
         except tk.TclError:
             return False
 
+    @staticmethod
+    def collect(app):
+        """The diagnostics text without opening the window."""
+        class _H:
+            pass
+        h = _H()
+        h.app = app
+        return DiagnosticsWindow.info(h)
+
     def info(self):
         app, m = self.app, self.app.model
         probe = {}
@@ -21456,6 +23667,13 @@ class DiagnosticsWindow:
             f"MiniWireshark       {SCRIPT_VERSION}",
             f"Python              {platform.python_version()} "
             f"({sys.executable})",
+            "Runtime             " + ("MiniWireshark's private Python"
+                                      if RuntimeManager().status()[
+                                          "running_inside"] else
+                                      "the Python it was started with"),
+            "Launch              " + (f"ready in "
+                                      f"{LAUNCH_TIMES['ready'] * 1000:.0f} ms"
+                                      if LAUNCH_TIMES.get("ready") else "—"),
             f"Operating system    {platform.platform()}",
             f"Administrator/root  {'yes' if is_admin() else 'no'}",
             f"Scapy               {_module_version('scapy') or 'missing'}",
@@ -23751,6 +25969,176 @@ def t_change_digest(ctx):
     assert {k for _t, k, _n in late["new_devices"]} == {S.LAPTOP[1]}, late
     assert digest_summary(change_digest(m, None, 9e12)) == "Nothing new."
 
+def _with_runtime_dir(ctx):
+    """Point the runtime state at a temp folder for a test."""
+    g = globals()
+    old = (g["RUNTIME_DIR"], g["RUNTIME_STATE"])
+    d = ctx.path(f"rt_{uuid.uuid4().hex[:6]}")
+    g["RUNTIME_DIR"], g["RUNTIME_STATE"] = d, os.path.join(d, "state.json")
+    return old
+
+
+def _restore_runtime_dir(old):
+    globals()["RUNTIME_DIR"], globals()["RUNTIME_STATE"] = old
+
+
+@self_test()
+def t_runtime_state_and_handoff(ctx):
+    old = _with_runtime_dir(ctx)
+    try:
+        assert runtime_state_read() == {}
+        fake = ctx.path("fake_python")
+        with open(fake, "w") as f:
+            f.write("#!/bin/sh\n")
+        prev = ctx.path("prev_python")
+        with open(prev, "w") as f:
+            f.write("#!/bin/sh\n")
+        st = runtime_state_write({"current": "a", "previous": "b", "envs": {
+            "a": {"python": fake, "selftest_ok": True},
+            "b": {"python": prev, "selftest_ok": True}}})
+        assert runtime_state_read()["current"] == "a"
+        # tampering invalidates the state
+        raw = read_json(RUNTIME_STATE)
+        raw["current"] = "b"
+        atomic_write_json(RUNTIME_STATE, raw)
+        assert runtime_state_read() == {}
+        runtime_state_write({k: v for k, v in st.items()
+                             if k != "checksum"})
+        env = {}
+        assert runtime_handoff(["x"], {"MW_STAGE": "app"}, False) is None
+        assert runtime_handoff(["--no-runtime"], env, False) is None
+        cmd = runtime_handoff(["--demo"], env, False)
+        assert cmd == [fake, SCRIPT_PATH, "--demo"], cmd
+        assert runtime_state_read()["pending_starts"] == 1
+        runtime_handoff([], env, False)            # 2 unconfirmed starts
+        cmd = runtime_handoff([], env, False)      # → roll back to "b"
+        s2 = runtime_state_read()
+        assert cmd[0] == prev and s2["current"] == "b" and \
+            s2["rolled_back"]["from"] == "a", (cmd, s2)
+        globals()["MW_STAGE"] = "app"
+        try:
+            assert runtime_confirm_started()
+        finally:
+            globals()["MW_STAGE"] = ""
+        assert runtime_state_read()["pending_starts"] == 0
+        os.remove(prev)                            # broken runtime file
+        assert runtime_handoff([], env, False) is None
+    finally:
+        _restore_runtime_dir(old)
+
+
+@self_test()
+def t_runtime_lock_and_platforms(ctx):
+    req, pkgs, skipped = lock_requirements("win_amd64")
+    names = [p for p, _r in pkgs]
+    assert names == ["scapy", "psutil", "cryptography", "cffi",
+                     "pycparser"], names
+    assert all("--hash=sha256:" in ln for ln in req.strip().splitlines())
+    req, pkgs, skipped = lock_requirements("macosx_x86_64")
+    assert "cryptography" in skipped and "cffi" in skipped and \
+        "pycparser" in skipped and ("scapy", True) in pkgs
+    for (sysname, arch), (name, sha) in RUNTIME_SOURCES.items():
+        assert re.match(r"^[0-9a-f]{64}$", sha) and RUNTIME_PYTHON in name
+        assert RUNTIME_PBS_TAG in name and name.endswith(".tar.gz")
+    for spec in RUNTIME_LOCK.values():
+        for k, v in spec.items():
+            if k.startswith(("win_", "macosx_", "linux_")):
+                assert re.match(r"^[0-9a-f]{64}$", v), (k, v)
+    deps = {d["key"] for d in DEPENDENCY_MANIFEST}
+    assert deps <= set(RUNTIME_LOCK), "manifest and lock disagree"
+    assert wheel_platform_tag(("windows", "x86_64")) == "win_amd64"
+    assert wheel_platform_tag(("linux", "aarch64")) == "linux_aarch64"
+    assert len(lock_fingerprint()) == 16
+
+
+@self_test()
+def t_runtime_download_extract_errors(ctx):
+    import http.server
+    import tarfile
+    payload = os.urandom(300_000)
+    srv_dir = ctx.path("srv")
+    os.makedirs(srv_dir, exist_ok=True)
+    with open(os.path.join(srv_dir, "blob.bin"), "wb") as f:
+        f.write(payload)
+
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k):
+            super().__init__(*a, directory=srv_dir, **k)
+
+        def log_message(self, *a):
+            pass
+    class Srv(http.server.ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            pass                  # the cancel test hangs up on purpose
+    httpd = Srv(("127.0.0.1", 0), H)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        mgr = RuntimeManager(ctx.path("rtm"))
+        sha = hashlib.sha256(payload).hexdigest()
+        dest = os.path.join(mgr.cache, "blob.bin")
+        os.makedirs(mgr.cache, exist_ok=True)
+        with open(dest + ".part", "wb") as f:      # resume from 100 kB
+            f.write(payload[:100_000])
+        seen = []
+        url = f"http://127.0.0.1:{port}/blob.bin"
+        mgr.download(url, dest, sha, lambda *a: seen.append(a[0]))
+        assert sha256_file(dest) == sha and "Verify" in seen
+        os.remove(dest)
+        try:
+            mgr.download(url, dest, "0" * 64)
+            raise AssertionError("bad fingerprint accepted")
+        except RuntimeError_ as e:
+            assert e.kind == "fingerprint"
+        assert not os.path.exists(dest) and not os.path.exists(
+            dest + ".part")
+        try:
+            mgr.download(url, dest, sha, cancel=lambda: True)
+            raise AssertionError("cancel ignored")
+        except RuntimeError_ as e:
+            assert e.kind == "cancelled"
+    finally:
+        httpd.shutdown()
+    evil = ctx.path("evil.tar.gz")
+    with tarfile.open(evil, "w:gz") as tf:
+        info = tarfile.TarInfo("../escape.txt")
+        info.size = 2
+        tf.addfile(info, io.BytesIO(b"hi"))
+    try:
+        RuntimeManager.safe_extract(evil, ctx.path("x"))
+        raise AssertionError("path traversal accepted")
+    except RuntimeError_:
+        pass
+    assert not os.path.exists(ctx.path("escape.txt"))
+    assert classify_runtime_error(PermissionError("x")) == "permission"
+    assert classify_runtime_error(OSError("[Errno 28] No space left")) == \
+        "disk"
+    assert classify_runtime_error(urllib.error.URLError("getaddrinfo")) == \
+        "offline"
+    assert classify_runtime_error(OSError("SSL: CERTIFICATE_VERIFY_FAILED")
+                                  ) == "proxy"
+    assert set(RUNTIME_ERRORS) >= {"offline", "proxy", "fingerprint",
+                                   "disk", "permission", "quarantine", "tk",
+                                   "signature", "selftest"}
+
+
+@self_test()
+def t_mask_sensitive(ctx):
+    s = ("dev 192.168.1.23 mac da:a1:19:23:45:67 v6 2a01:e0a:1f:2c0::23 "
+         "gw 10.0.0.1")
+    m = mask_sensitive(s)
+    assert "192.168.1.23" not in m and "da:a1:19:23:45:67" not in m
+    assert "2a01:e0a:1f:2c0::23" not in m and "10.0.0.1" not in m
+    assert "192.168.x.x" in m and "da:a1:xx" in m
+
+
+@self_test()
+def t_least_privilege(ctx):
+    src = inspect.getsource(needs_elevation)
+    assert "_npcap_admin_only" in src
+    if not IS_WINDOWS and not is_admin():
+        assert needs_elevation()
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -23804,6 +26192,7 @@ def _gui_pump(root, seconds=0.0, until=None, timeout=30.0):
     t_end = time.time() + timeout
     t_min = time.time() + seconds
     while True:
+        drain_deferred_tk()
         try:
             root.update()
         except tk.TclError:
@@ -24068,6 +26457,77 @@ def _gs_truth(app, ctx):
     app.data_mode = "idle"
 
 
+@gui_test_step("installer consent and Welcome Center (loader)")
+def _gs_loader(app, ctx):
+    root = app.root
+    win = tk.Toplevel(root)
+    lw = LoaderWindow(win, app.config)
+    lw.pack(fill="both", expand=True)
+    got = []
+    th = threading.Thread(target=lambda: got.append(
+        lw.ask("consent", text="test")), daemon=True)
+    th.start()
+    ok = _gui_pump(win, 0.1, lambda: bool(lw.card.winfo_children()),
+                   timeout=5) if False else None
+    t_end = time.time() + 5
+    btn = None
+    while time.time() < t_end and btn is None:
+        lw.pump()
+        for w in lw.card.winfo_children():
+            for b in w.winfo_children():
+                for bb in b.winfo_children():
+                    if isinstance(bb, ttk.Button) and \
+                            "current Python" in str(bb.cget("text")):
+                        btn = bb
+        time.sleep(0.02)
+    assert btn is not None, "consent card not shown"
+    btn.invoke()
+    th.join(3)
+    assert got == ["this"], got
+    lw.runtime_progress("Download", 0.5, "x", {"speed": 2e6, "eta": 12})
+    lw.runtime_progress("Verify", 1.0, "ok", {})
+    lw.pump()
+    assert lw.stage_state["Download"] in ("active", "done")
+    assert "MB/s" in lw.speed_var.get() or lw.speed_var.get() == ""
+    win.after(300, lambda: lw._choose("demo"))
+    choice = lw.show_welcome("summary", "healthy", True)
+    assert choice == "demo", choice
+    win.destroy()
+
+
+@gui_test_step("repair, runtime manager, debug bundle, quick start")
+def _gs_repair(app, ctx):
+    root = app.root
+    w = app.repair_everything()
+    ok = _gui_pump(root, 0.2, lambda: getattr(app, "last_repair", None)
+                   is not None, timeout=300)
+    assert ok, "repair did not finish"
+    res = {k: (st, msg) for k, st, msg in app.last_repair[1]}
+    assert set(res) == {k for k, _t in REPAIR_STEPS}, res
+    assert res["settings"][0] in ("ok", "fixed"), res
+    assert res["history"][0] in ("ok", "fixed", "skipped"), res
+    assert res["selftest"][0] == "ok", res["selftest"]
+    with contextlib.suppress(tk.TclError):
+        w.destroy()
+    rm = app.open_runtime_manager()
+    _gui_pump(root, 0.3)
+    assert "Python" in app.runtime_status_text()
+    rm.destroy()
+    text = app.debug_bundle_text(masked=True)
+    assert "192.168.1.23" not in text and "debug bundle" in text
+    b = app.export_debug_bundle()
+    _gui_pump(root, 0.2)
+    b.destroy()
+    q = app.open_quick_start()
+    _gui_pump(root, 0.2)
+    q.destroy()
+    app._open_settings()
+    _gui_pump(root, 0.2)
+    app._settings_win.show_page("diagnostics")
+    _gui_pump(root, 0.2)
+    app._settings_win.win.destroy()
+
+
 def run_gui_test(live=False):
     """Returns 0 on success. Prints a step-by-step report."""
     global PATHS
@@ -24282,29 +26742,47 @@ def _install_thread_excepthook():
 
 def main():
     setup_logging()
-    LOG.info("MiniWireshark %s starting (python %s, %s, admin=%s)",
-             SCRIPT_VERSION, platform.python_version(), platform.platform(),
-             is_admin())
+    LOG.info("MiniWireshark %s starting (python %s at %s, %s, admin=%s, "
+             "stage=%s)", SCRIPT_VERSION, platform.python_version(),
+             sys.executable, platform.platform(), is_admin(),
+             MW_STAGE or "launcher")
     _install_thread_excepthook()
+    install_gui_gate()
     rolled = rollback_update_if_needed()
+    if MW_STAGE == "app":
+        RuntimeManager().apply_pending_switch()
+    cfg = AppConfig()
     root = tk.Tk()
     root.title("MiniWireshark")
-    root.geometry("640x500")
-    root.resizable(False, False)
-    root.configure(background="#f4f5f7")
-    with contextlib.suppress(tk.TclError):
-        root.eval("tk::PlaceWindow . center")
+    root.minsize(640, 520)
+    _center_window(root, 760, 680)
+    base_ttk_style()
     if rolled:
         messagebox.showwarning("Update rolled back", rolled)
 
-    loader = LoaderWindow(root)
+    loader = LoaderWindow(root, cfg)
     loader.pack(fill="both", expand=True)
+    root.configure(background=loader.bg)
     root.update()
+    PIP_ASK[0] = lambda: loader.ask("pip_system") == "yes"
 
     ok, err = run_bootstrap(loader)
+    PIP_ASK[0] = None
     if not ok:
         loader.show_fatal(err)
         root.mainloop()
+        return
+    if loader.handoff:
+        # the private Python is ready: continue inside it
+        loader.post_status("Starting inside the private Python …")
+        loader.pump()
+        with contextlib.suppress(tk.TclError):
+            root.destroy()
+        if runtime_handoff() is None:
+            _fatal_dialog("MiniWireshark", "The private Python was installed "
+                          "but could not be started. Start MiniWireshark "
+                          "again; it will use your current Python if the "
+                          "problem persists.")
         return
 
     loader.post_status("Loading the packet engine ...")
@@ -24324,12 +26802,32 @@ def main():
     LOG.info("default iface=%s gateway=%s my_ips=%s", default_iface_name, gw,
              sorted(my_ips))
     startup_sanity_checks()
+    t_ready = time.perf_counter() - _T_START
+    LAUNCH_TIMES["ready"] = t_ready
+
+    action = None
+    first_time = cfg.get("general.welcome_version", "") != SCRIPT_VERSION
+    if START_IN_DEMO:
+        action = "demo"
+    elif cfg.get("general.show_welcome", True) or first_time:
+        health = "healthy"
+        st = RuntimeManager().status()
+        if not st["running_inside"] and RuntimeManager().plan()[
+                "supported"] and NO_RUNTIME_FLAG not in sys.argv:
+            health = "degraded"
+        summary = welcome_summary(cfg)
+        action = loader.show_welcome(summary, health, first_time)
+        if action == "exit":
+            with contextlib.suppress(tk.TclError):
+                root.destroy()
+            return
 
     loader.destroy()
     root.resizable(True, True)
     root.title("MiniWireshark")
     try:
-        MiniWireshark(root, gw, my_ips, my_macs, default_iface_name)
+        MiniWireshark(root, gw, my_ips, my_macs, default_iface_name,
+                      config=cfg, start_action=action)
     except Exception:                                # noqa: BLE001
         text = traceback.format_exc()
         LOG.error("startup error:\n%s", text)
@@ -24343,6 +26841,48 @@ def main():
         return
     root.mainloop()
     LOG.info("MiniWireshark closed")
+
+
+def _center_window(win, w, h):
+    try:
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        w, h = min(w, sw - 40), min(h, sh - 80)
+        win.geometry(f"{w}x{h}+{max(0, (sw - w) // 2)}+"
+                     f"{max(0, (sh - h) // 3)}")
+    except tk.TclError:
+        pass
+
+
+def base_ttk_style():
+    s = ttk.Style()
+    with contextlib.suppress(tk.TclError):
+        s.theme_use("clam")
+    s.configure("TButton", padding=(10, 6))
+    s.configure("Accent.TButton", padding=(14, 8),
+                font=("TkDefaultFont", 11, "bold"), foreground="#ffffff",
+                background="#2b7de9")
+    s.map("Accent.TButton", background=[("active", "#1f66c7"),
+                                        ("disabled", "#9bb8e8")])
+    return s
+
+
+def welcome_summary(cfg):
+    """One line for the Welcome Center: last network, history, setup."""
+    parts = []
+    nets = NetworkProfiles(PATHS.networks)
+    allnets = nets.all()
+    if allnets:
+        fp, prof = allnets[0]
+        parts.append(f"Last network: {prof.get('name', '?')}"
+                     f"{' (trusted)' if prof.get('trusted') else ' (quiet)'}")
+    st = RuntimeManager().status()
+    if st["running_inside"]:
+        parts.append(f"Private Python {platform.python_version()}")
+    else:
+        parts.append(f"Python {platform.python_version()}")
+    if cfg.get("history.enabled", False):
+        parts.append("history on")
+    return " · ".join(parts)
 
 
 if __name__ == "__main__":
