@@ -509,7 +509,10 @@ def _npcap_admin_only():
 SELF_TEST_MODE = SELF_TEST_FLAG in sys.argv
 GUI_TEST_MODE = "--gui-test" in sys.argv
 BENCH_MODE = "--bench" in sys.argv
-TOOL_MODE = SELF_TEST_MODE or GUI_TEST_MODE or BENCH_MODE
+RELEASE_FLAGS = ("--release-check", "--make-release-key", "--sign-release",
+                 "--sign-datapack")
+RELEASE_MODE = any(f in sys.argv for f in RELEASE_FLAGS)
+TOOL_MODE = SELF_TEST_MODE or GUI_TEST_MODE or BENCH_MODE or RELEASE_MODE
 START_IN_DEMO = DEMO_FLAG in sys.argv
 
 if ELEVATED_FLAG in sys.argv:
@@ -17256,7 +17259,9 @@ SETTINGS_PAGES = [
                       "atomically. If the new version fails to start, the "
                       "backup is restored automatically."},
              {"type": "action", "actions": [
-                 ("Check for updates now", "check_updates")]},
+                 ("Check for updates now", "check_updates"),
+                 ("Install a signed data pack…", "install_datapack")]},
+             {"type": "info", "text_fn": "release_keys_text"},
          ]},
          {"title": "Helpers", "controls": [
              {"type": "info", "text_fn": "deps_status_text"},
@@ -18075,6 +18080,15 @@ class SettingsWindow:
     def ledger_status_text(self):
         return self.app.ledger_status_text()
 
+    def release_keys_text(self):
+        if RELEASE_KEYS:
+            return ("Updates and data packs are installed only when signed "
+                    "by: " + ", ".join(RELEASE_KEYS) + ". Older versions "
+                    "are never installed over newer ones.")
+        return ("No release key is built into this copy, so updates are "
+                "check-only: you're told about a new version and download "
+                "it yourself. Nothing unsigned is ever installed.")
+
     def history_size_text(self):
         return self.app.history_status_text()
 
@@ -18095,6 +18109,8 @@ class SettingsWindow:
                                     parent=self.win)
         elif name == "check_updates":
             self.app._check_for_updates(manual=True)
+        elif name == "install_datapack":
+            self.app.install_datapack(self.win)
         elif name == "geoip_test":
             self.app._geoip_test(self.win)
         elif name == "geoip_retry":
@@ -28625,6 +28641,24 @@ class MiniWireshark:
     def data_status_text(self):
         return "\n".join(self.data.summary_lines())
 
+    def install_datapack(self, parent=None):
+        path = filedialog.askopenfilename(
+            parent=parent or self.root, title="Signed data pack",
+            filetypes=[("Data pack", "*.json"), ("All files", "*.*")])
+        if not path:
+            return None
+        try:
+            with open(path, encoding="utf-8") as f:
+                pack = json.load(f)
+            n = apply_data_pack(pack)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Data pack", f"Not installed: {e}",
+                                 parent=parent or self.root)
+            return None
+        messagebox.showinfo("Data pack", f"Installed — {n} entries updated.",
+                            parent=parent or self.root)
+        return n
+
     def ledger_status_text(self):
         state = ("🛑 Kill switch ON — nothing is being sent." if
                  LEDGER.killed else "Sent since start, by feature:")
@@ -29016,6 +29050,10 @@ class MiniWireshark:
                 assets = [a.get("browser_download_url", "")
                           for a in data.get("assets", []) or []
                           if str(a.get("name", "")).endswith(".py")]
+                self._update_manifest_url = next(
+                    (a.get("browser_download_url", "") for a in
+                     data.get("assets", []) or []
+                     if a.get("name") == MANIFEST_NAME), "")
                 self._async_results.put(lambda: self._report_update_result(
                     tag, data.get("html_url", ""), assets, None, manual))
             except (OSError, ValueError, urllib.error.URLError) as e:
@@ -29034,6 +29072,19 @@ class MiniWireshark:
         if tag and _version_tuple(tag) > _version_tuple(SCRIPT_VERSION):
             self._set_banner(f"⬆️  A newer version ({tag}) is "
                              f"available. Release notes: {url}", kind="warn")
+            if not RELEASE_KEYS or not getattr(
+                    self, "_update_manifest_url", ""):
+                if manual:
+                    messagebox.showinfo(
+                        "Update available",
+                        f"MiniWireshark {tag} is available (you have "
+                        f"{SCRIPT_VERSION}).\n\nThis copy only installs "
+                        f"releases signed with a trusted release key, and "
+                        + ("none is configured" if not RELEASE_KEYS else
+                           "this release has no signed manifest") +
+                        ", so please download it yourself from:\n" + url,
+                        parent=self.root)
+                return
             if self.config.get("updates.allow_self_update", False) and \
                     assets and messagebox.askyesno(
                         "Update available",
@@ -29048,13 +29099,20 @@ class MiniWireshark:
                              f"({SCRIPT_VERSION}).")
 
     def _self_update(self, url, tag):
+        murl = getattr(self, "_update_manifest_url", "")
+
         def work():
             try:
+                req = urllib.request.Request(murl, headers={
+                    "User-Agent": APP_NAME})
+                with net_urlopen("update", req, 30, "signed manifest") as r:
+                    manifest = json.loads(r.read(1_000_000).decode("utf-8"))
                 req = urllib.request.Request(url, headers={
                     "User-Agent": APP_NAME})
                 with net_urlopen("update", req, 60, "new version") as r:
                     data = r.read(20_000_000)
-                msg = apply_self_update(data, tag)
+                body = check_release(manifest, data)
+                msg = apply_self_update(data, body["version"])
             except (OSError, ValueError, urllib.error.URLError) as e:
                 msg = f"Update failed, nothing was changed: {e}"
             self._async_results.put(lambda: messagebox.showinfo(
@@ -30041,9 +30099,342 @@ class CrashDialog:
         win.protocol("WM_DELETE_WINDOW", close)
 
 
-def apply_self_update(data, tag):
+# ============================================================================
+#  21b.  Signed updates and data packs (Ed25519)
+#
+#  An update is installed only when its manifest is signed by one of the
+#  release keys below, its SHA-256 and size match, and it is newer than
+#  this version (no downgrades). With no release key configured, updates
+#  are check-only: you are told a new version exists, nothing is installed.
+#  Verification uses `cryptography` when present, else a small pure-Python
+#  Ed25519 (RFC 8032), checked against the RFC's own test vectors.
+# ============================================================================
+RELEASE_KEYS = {
+    # "key-id": "64 hex chars of an Ed25519 public key" — added by the
+    # person who publishes releases (see --make-release-key). Two keys may
+    # be listed at once so a key can be rotated without breaking updates.
+}
+MANIFEST_NAME = "miniwireshark.manifest.json"
+
+_ED_P = 2 ** 255 - 19
+_ED_Q = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = -121665 * pow(121666, _ED_P - 2, _ED_P) % _ED_P
+_ED_I = pow(2, (_ED_P - 1) // 4, _ED_P)
+
+
+def _ed_add(P, Q):
+    p, d = _ED_P, _ED_D
+    A = (P[1] - P[0]) * (Q[1] - Q[0]) % p
+    B = (P[1] + P[0]) * (Q[1] + Q[0]) % p
+    C = 2 * P[3] * Q[3] * d % p
+    D = 2 * P[2] * Q[2] % p
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % p, G * H % p, F * G % p, E * H % p)
+
+
+def _ed_mul(s, P):
+    Q = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            Q = _ed_add(Q, P)
+        P = _ed_add(P, P)
+        s >>= 1
+    return Q
+
+
+def _ed_recover_x(y, sign):
+    p = _ED_P
+    if y >= p:
+        return None
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, p - 2, p) % p
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (p + 3) // 8, p)
+    if (x * x - x2) % p:
+        x = x * _ED_I % p
+    if (x * x - x2) % p:
+        return None
+    if (x & 1) != sign:
+        x = p - x
+    return x
+
+
+_ED_GY = 4 * pow(5, _ED_P - 2, _ED_P) % _ED_P
+_ED_GX = _ed_recover_x(_ED_GY, 0)
+_ED_G = (_ED_GX, _ED_GY, 1, _ED_GX * _ED_GY % _ED_P)
+
+
+def _ed_decompress(s):
+    if len(s) != 32:
+        return None
+    y = int.from_bytes(s, "little")
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    x = _ed_recover_x(y, sign)
+    return None if x is None else (x, y, 1, x * y % _ED_P)
+
+
+def _ed_compress(P):
+    zi = pow(P[2], _ED_P - 2, _ED_P)
+    x, y = P[0] * zi % _ED_P, P[1] * zi % _ED_P
+    return (y | ((x & 1) << 255)).to_bytes(32, "little")
+
+
+def _ed_equal(P, Q):
+    p = _ED_P
+    return (P[0] * Q[2] - Q[0] * P[2]) % p == 0 and \
+        (P[1] * Q[2] - Q[1] * P[2]) % p == 0
+
+
+def ed25519_public_key(secret):
+    h = hashlib.sha512(secret).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    return _ed_compress(_ed_mul(a, _ED_G))
+
+
+def ed25519_sign(secret, msg):
+    """Release tooling only (the app itself never signs anything)."""
+    h = hashlib.sha512(secret).digest()
+    a = int.from_bytes(h[:32], "little")
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    A = _ed_compress(_ed_mul(a, _ED_G))
+    r = int.from_bytes(hashlib.sha512(h[32:] + msg).digest(), "little") \
+        % _ED_Q
+    Rs = _ed_compress(_ed_mul(r, _ED_G))
+    k = int.from_bytes(hashlib.sha512(Rs + A + msg).digest(), "little") \
+        % _ED_Q
+    return Rs + ((r + k * a) % _ED_Q).to_bytes(32, "little")
+
+
+def _ed25519_verify_py(public, msg, sig):
+    if len(public) != 32 or len(sig) != 64:
+        return False
+    A = _ed_decompress(public)
+    R = _ed_decompress(sig[:32])
+    if A is None or R is None:
+        return False
+    s = int.from_bytes(sig[32:], "little")
+    if s >= _ED_Q:
+        return False
+    k = int.from_bytes(hashlib.sha512(sig[:32] + public + msg).digest(),
+                       "little") % _ED_Q
+    return _ed_equal(_ed_mul(s, _ED_G), _ed_add(R, _ed_mul(k, A)))
+
+
+def ed25519_verify(public, msg, sig):
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import \
+            Ed25519PublicKey
+        from cryptography.exceptions import InvalidSignature
+    except Exception:                                # noqa: BLE001
+        return _ed25519_verify_py(public, msg, sig)
+    try:
+        Ed25519PublicKey.from_public_bytes(bytes(public)).verify(bytes(sig),
+                                                                msg)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def _canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True).encode()
+
+
+def sign_manifest(body, keys):
+    """body: dict without "signatures"; keys: {key_id: 32-byte secret}."""
+    msg = _canonical(body)
+    out = dict(body)
+    out["signatures"] = [{"key": kid, "sig": ed25519_sign(sec, msg).hex()}
+                         for kid, sec in keys.items()]
+    return out
+
+
+class UpdateRefused(ValueError):
+    pass
+
+
+def verify_manifest(manifest, trusted=None, kind="release"):
+    """→ the manifest body when a trusted key signed it, else raises
+    UpdateRefused with a plain-English reason."""
+    trusted = RELEASE_KEYS if trusted is None else trusted
+    if not trusted:
+        raise UpdateRefused("No release key is configured, so updates are "
+                            "check-only (nothing is installed "
+                            "automatically).")
+    if not isinstance(manifest, dict) or manifest.get("kind", "release") \
+            != kind:
+        raise UpdateRefused("Not a MiniWireshark manifest of this kind.")
+    body = {k: v for k, v in manifest.items() if k != "signatures"}
+    msg = _canonical(body)
+    for s in manifest.get("signatures") or []:
+        pk = trusted.get(s.get("key", ""))
+        if not pk:
+            continue
+        with contextlib.suppress(ValueError, TypeError):
+            if ed25519_verify(bytes.fromhex(pk), msg, bytes.fromhex(
+                    s.get("sig", ""))):
+                return body
+    raise UpdateRefused("The release isn't signed by a key this "
+                        "MiniWireshark trusts — it was NOT installed.")
+
+
+def check_release(manifest, data, current=SCRIPT_VERSION, trusted=None):
+    """All checks before an update is installed."""
+    body = verify_manifest(manifest, trusted)
+    if _version_tuple(body.get("version", "")) <= _version_tuple(current):
+        raise UpdateRefused(f"The release ({body.get('version')}) isn't "
+                            f"newer than this one ({current}) — downgrades "
+                            f"are refused.")
+    if len(data) != int(body.get("size", -1)):
+        raise UpdateRefused("The download is incomplete or the wrong size.")
+    if hashlib.sha256(data).hexdigest() != body.get("sha256"):
+        raise UpdateRefused("The download doesn't match the signed "
+                            "fingerprint.")
+    return body
+
+
+def make_release_manifest(script_bytes, version, keys, notes=""):
+    return sign_manifest({"kind": "release", "app": APP_NAME,
+                          "version": version,
+                          "sha256": hashlib.sha256(script_bytes).hexdigest(),
+                          "size": len(script_bytes), "notes": notes,
+                          "made": time.strftime("%Y-%m-%d")}, keys)
+
+
+# ---- data packs: signed updates of the reference lists -----------------------
+DATA_PACK_TARGETS = {"services": "PORT_SERVICES", "doh": "DOH_HOSTS"}
+
+
+def apply_data_pack(pack, trusted=None):
+    """Install a signed data pack (port→service names, encrypted-DNS
+    hosts). → number of entries added."""
+    body = verify_manifest(pack, trusted, kind="datapack")
+    target = DATA_PACK_TARGETS.get(body.get("pack"))
+    if target is None:
+        raise UpdateRefused(f"Unknown data pack “{body.get('pack')}”.")
+    data = body.get("data") or {}
+    if not isinstance(data, dict) or len(data) > 50000:
+        raise UpdateRefused("The data pack is malformed.")
+    table = globals()[target]
+    n = 0
+    for k, v in data.items():
+        key = int(k) if target == "PORT_SERVICES" else str(k).lower()
+        val = sanitize_text(str(v), 80)
+        if table.get(key) != val:
+            table[key] = val
+            n += 1
+    return n
+
+
+def release_check(path=None):
+    """Release checklist (developers): prints what to verify and the
+    file's fingerprint. Exit code 0 only when every automatic check
+    passes."""
+    path = path or SCRIPT_PATH
+    with open(path, "rb") as f:
+        data = f.read()
+    text = data.decode("utf-8")
+    checks = []
+    try:
+        import ast
+        ast.parse(text, feature_version=(3, 8))
+        checks.append(("Python 3.8 grammar", True, ""))
+    except SyntaxError as e:
+        checks.append(("Python 3.8 grammar", False, str(e)))
+    m = re.search(r'^SCRIPT_VERSION = "([^"]+)"', text, re.M)
+    checks.append(("Version string", bool(m), m.group(1) if m else ""))
+    checks.append(("Release keys listed", bool(RELEASE_KEYS),
+                   ", ".join(RELEASE_KEYS) or "none — updates check-only"))
+    checks.append(("Runtime lock fingerprint", True, lock_fingerprint()))
+    checks.append(("No debugger left in", "breakpoint()" not in text.replace(
+        '"breakpoint()"', ""), ""))
+    print(f"MiniWireshark release check — {os.path.basename(path)}")
+    for name, ok, detail in checks:
+        print(f"  [{'OK' if ok else '!!'}] {name}" + (f": {detail}"
+                                                      if detail else ""))
+    print(f"  sha256 {hashlib.sha256(data).hexdigest()}  size {len(data)}")
+    print("  Manual: run --self-test and --gui-test on Windows, macOS and "
+          "Linux; sign with --sign-release; attach the .py and "
+          f"{MANIFEST_NAME} to the release.")
+    return 0 if all(ok for name, ok, _d in checks
+                    if name != "Release keys listed") else 1
+
+
+def _arg(argv, name, default=None):
+    if name in argv:
+        i = argv.index(name)
+        if i + 1 < len(argv):
+            return argv[i + 1]
+    return default
+
+
+def release_tool(argv):
+    """Developer commands (never needed by users):
+      --release-check [FILE]
+      --make-release-key KEYFILE [--key-id ID]
+      --sign-release FILE --key KEYFILE [--key-id ID] [--version X]
+      --sign-datapack JSON --key KEYFILE --pack services|doh"""
+    if "--release-check" in argv:
+        return release_check(_arg(argv, "--release-check"))
+    if "--make-release-key" in argv:
+        path = _arg(argv, "--make-release-key")
+        if not path or os.path.exists(path):
+            print("Give a NEW file name for the secret key.")
+            return 2
+        secret = os.urandom(32)
+        kid = _arg(argv, "--key-id", time.strftime("release-%Y"))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"key_id": kid, "secret": secret.hex()}, f)
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+        print(f"Secret key written to {path} — keep it OFFLINE and backed "
+              f"up.\nAdd this line to RELEASE_KEYS:\n    "
+              f"\"{kid}\": \"{ed25519_public_key(secret).hex()}\",")
+        return 0
+    keyfile = _arg(argv, "--key")
+    if not keyfile:
+        print("--key KEYFILE is required")
+        return 2
+    with open(keyfile, encoding="utf-8") as f:
+        kd = json.load(f)
+    keys = {kd["key_id"]: bytes.fromhex(kd["secret"])}
+    if "--sign-release" in argv:
+        path = _arg(argv, "--sign-release")
+        with open(path, "rb") as f:
+            data = f.read()
+        m = re.search(rb'^SCRIPT_VERSION = "([^"]+)"', data, re.M)
+        ver = _arg(argv, "--version", m.group(1).decode() if m else "")
+        man = make_release_manifest(data, ver, keys)
+        out = os.path.join(os.path.dirname(os.path.abspath(path)),
+                           MANIFEST_NAME)
+        atomic_write_json(out, man)
+        print(f"Signed {os.path.basename(path)} {ver} → {out}")
+        return 0
+    if "--sign-datapack" in argv:
+        path = _arg(argv, "--sign-datapack")
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        pack = sign_manifest({"kind": "datapack",
+                              "pack": _arg(argv, "--pack", "services"),
+                              "version": time.strftime("%Y%m%d"),
+                              "data": data}, keys)
+        out = path + ".signed.json"
+        atomic_write_json(out, pack)
+        print(f"Signed data pack → {out}")
+        return 0
+    print(release_tool.__doc__)
+    return 2
+
+
+def apply_self_update(data, tag, script_path=None, marker_path=None):
     """Validate, back up, atomically replace. Never destroys the only
     working copy: the backup stays until the new version has run fine."""
+    script_path = script_path or SCRIPT_PATH
+    marker_path = marker_path or PATHS.update_marker
     if not data or len(data) < 50_000:
         raise ValueError("the downloaded file is too small to be "
                          "MiniWireshark")
@@ -30054,13 +30445,13 @@ def apply_self_update(data, tag):
     if "MiniWireshark" not in text or "def main" not in text:
         raise ValueError("the download doesn't look like MiniWireshark")
     compile(text, "miniwireshark_update.py", "exec")
-    backup = f"{SCRIPT_PATH}.v{SCRIPT_VERSION}.bak"
-    shutil.copy2(SCRIPT_PATH, backup)
-    tmp = SCRIPT_PATH + ".new"
+    backup = f"{script_path}.v{SCRIPT_VERSION}.bak"
+    shutil.copy2(script_path, backup)
+    tmp = script_path + ".new"
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         f.write(text)
-    os.replace(tmp, SCRIPT_PATH)
-    atomic_write_json(PATHS.update_marker, {
+    os.replace(tmp, script_path)
+    atomic_write_json(marker_path, {
         "backup": backup, "version": tag, "from": SCRIPT_VERSION,
         "time": time.time(), "attempts": 0})
     LOG.info("installed update %s (backup %s)", tag, backup)
@@ -30070,22 +30461,25 @@ def apply_self_update(data, tag):
             f"automatically.")
 
 
-def rollback_update_if_needed(force=False):
+def rollback_update_if_needed(force=False, script_path=None,
+                              marker_path=None):
     """Called at startup (and on a startup crash). Returns a message if a
     rollback happened."""
-    marker = read_json(PATHS.update_marker, None)
+    script_path = script_path or SCRIPT_PATH
+    marker_path = marker_path or PATHS.update_marker
+    marker = read_json(marker_path, None)
     if not marker:
         return ""
     marker["attempts"] = int(marker.get("attempts", 0)) + 1
     with contextlib.suppress(OSError):
-        atomic_write_json(PATHS.update_marker, marker)
+        atomic_write_json(marker_path, marker)
     if not force and marker["attempts"] < 3:
         return ""
     backup = marker.get("backup", "")
     if backup and os.path.exists(backup):
         try:
-            shutil.copy2(backup, SCRIPT_PATH)
-            os.remove(PATHS.update_marker)
+            shutil.copy2(backup, script_path)
+            os.remove(marker_path)
             LOG.warning("rolled back update %s", marker.get("version"))
             return (f"The update to {marker.get('version')} didn't start "
                     f"correctly, so the previous version "
@@ -33650,6 +34044,108 @@ def t_redaction_no_leaks(ctx):
     assert S.PHONE[0] in html_to_preview_text(html_doc)
 
 
+@self_test()
+def t_ed25519_rfc8032(ctx):
+    """RFC 8032 §7.1 test vectors 1 and 2, pure Python and library."""
+    for sk, msg, pk, sig in (
+            ("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+             b"", "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+             "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e0652249015"
+             "55fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b"),
+            ("4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+             b"\x72",
+             "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c",
+             "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69d"
+             "a085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00")):
+        sk, pk, sig = bytes.fromhex(sk), bytes.fromhex(pk), bytes.fromhex(sig)
+        assert ed25519_public_key(sk) == pk
+        assert ed25519_sign(sk, msg) == sig
+        assert _ed25519_verify_py(pk, msg, sig) and ed25519_verify(pk, msg,
+                                                                  sig)
+        bad = sig[:10] + bytes([sig[10] ^ 1]) + sig[11:]
+        assert not _ed25519_verify_py(pk, msg, bad)
+        assert not ed25519_verify(pk, msg + b"x", sig)
+
+
+@self_test()
+def t_signed_updates_and_packs(ctx):
+    k_old, k_new, k_evil = os.urandom(32), os.urandom(32), os.urandom(32)
+    trusted = {"new": ed25519_public_key(k_new).hex()}
+    script = ("# MiniWireshark\nSCRIPT_VERSION = \"9.9.9\"\n"
+              "def main():\n    pass\n" + "#" * 60000).encode()
+    man = make_release_manifest(script, "9.9.9", {"old": k_old,
+                                                  "new": k_new})
+    # key rotation: signed by old + new, only the new one is trusted
+    assert check_release(man, script, "4.0.0", trusted)["version"] == "9.9.9"
+
+    def refused(fn, word):
+        try:
+            fn()
+        except UpdateRefused as e:
+            assert word in str(e), (word, str(e))
+            return
+        raise AssertionError(f"accepted ({word})")
+    evil = make_release_manifest(script, "9.9.9", {"new": k_evil})
+    refused(lambda: check_release(evil, script, "4.0.0", trusted),
+            "isn't signed")
+    refused(lambda: check_release(man, script[:-100], "4.0.0", trusted),
+            "incomplete")
+    tampered = script[:-1] + b"!"
+    refused(lambda: check_release(man, tampered, "4.0.0", trusted),
+            "fingerprint")
+    old = make_release_manifest(script, "3.9.0", {"new": k_new})
+    refused(lambda: check_release(old, script, "4.0.0", trusted),
+            "downgrades")
+    forged = dict(man, version="10.0.0")
+    refused(lambda: check_release(forged, script, "4.0.0", trusted),
+            "isn't signed")
+    refused(lambda: check_release(man, script, "4.0.0", {}), "check-only")
+    # data packs: signed ones apply, unsigned ones don't
+    pack = sign_manifest({"kind": "datapack", "pack": "services",
+                          "version": "1", "data": {"40404": "Test svc"}},
+                         {"new": k_new})
+    had = PORT_SERVICES.get(40404)
+    try:
+        assert apply_data_pack(pack, trusted) == 1
+        assert PORT_SERVICES[40404] == "Test svc"
+    finally:
+        if had is None:
+            PORT_SERVICES.pop(40404, None)
+        else:
+            PORT_SERVICES[40404] = had
+    unsigned = dict(pack, signatures=[])
+    refused(lambda: apply_data_pack(unsigned, trusted), "isn't signed")
+    refused(lambda: apply_data_pack(man, trusted), "Not a MiniWireshark")
+    # install + automatic rollback after starts that never confirm
+    d = ctx.path(f"upd_{uuid.uuid4().hex[:6]}")
+    os.makedirs(d)
+    cur = os.path.join(d, "miniwireshark.py")
+    with open(cur, "wb") as f:
+        f.write(b"# MiniWireshark old\ndef main():\n    pass\n" + b"#" * 60000)
+    marker = os.path.join(d, "marker.json")
+    apply_self_update(script, "9.9.9", cur, marker)
+    assert open(cur, "rb").read() == script and os.path.exists(marker)
+    assert rollback_update_if_needed(script_path=cur, marker_path=marker) \
+        == ""                                     # 1st start: wait
+    rollback_update_if_needed(script_path=cur, marker_path=marker)
+    msg = rollback_update_if_needed(script_path=cur, marker_path=marker)
+    assert "restored" in msg and b"old" in open(cur, "rb").read()
+    assert not os.path.exists(marker)
+    # release tooling end to end
+    kf = os.path.join(d, "release.key")
+    with contextlib.redirect_stdout(io.StringIO()):
+        assert release_tool(["--make-release-key", kf, "--key-id",
+                             "t1"]) == 0
+        assert release_tool(["--sign-release", cur, "--key", kf,
+                             "--version", "9.9.10"]) == 0
+    kd = json.load(open(kf))
+    man2 = read_json(os.path.join(d, MANIFEST_NAME))
+    body = verify_manifest(man2, {"t1": ed25519_public_key(
+        bytes.fromhex(kd["secret"])).hex()})
+    assert body["sha256"] == hashlib.sha256(open(cur, "rb").read()) \
+        .hexdigest()
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -34905,6 +35401,8 @@ if __name__ == "__main__":
         for k, v in bench_report().items():
             print(f"  {k:28s} {v:12.1f}")
         sys.exit(0)
+    if RELEASE_MODE:
+        sys.exit(release_tool(sys.argv[1:]))
     try:
         main()
     except KeyboardInterrupt:

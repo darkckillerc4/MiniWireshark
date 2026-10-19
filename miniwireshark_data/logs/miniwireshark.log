@@ -145,3 +145,9 @@ OutboundBlocked: Not sent — the kill switch is on (Connected helpers (Pi-hole,
 2026-10-19 15:40:31,984 WARNING [MainThread] data oui: checksum mismatch, discarding
 2026-10-19 15:40:37,371 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and last night's backup was restored.
 2026-10-19 15:40:37,377 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and a new one was started.
+2026-10-19 15:43:52,289 WARNING [MainThread] config unreadable (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); using defaults
+2026-10-19 15:43:52,355 WARNING [MainThread] data oui: checksum mismatch, discarding
+2026-10-19 15:43:56,942 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and last night's backup was restored.
+2026-10-19 15:43:56,948 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and a new one was started.
+2026-10-19 15:44:02,437 INFO    [MainThread] installed update 9.9.9 (backup /tmp/mw_selftest_weoofkwh/upd_88e46e/miniwireshark.py.v4.0.0.bak)
+2026-10-19 15:44:02,439 WARNING [MainThread] rolled back update 9.9.9
