@@ -4183,6 +4183,7 @@ class TlsReassembler:
 
     def __init__(self):
         self.buf = OrderedDict()
+        self.quic = QuicInitialReader()      # HTTP/3 first packets
 
     def feed(self, key, seq, payload, ts):
         if not payload:
@@ -4528,12 +4529,13 @@ def _new_decoded(pkt):
             "src": "", "dst": "", "src_ip": "", "dst_ip": "",
             "src_mac": "", "dst_mac": "", "ttl": "", "ttl_int": 0,
             "sport": None, "dport": None, "ipver": 0, "transport": "",
-            "tcp_flags": None, "seq": None, "payload_len": 0,
+            "tcp_flags": None, "seq": None, "ack": None, "win": None,
+            "payload_len": 0,
             "dns_names": [], "doh_hint": "", "plain_dns": False,
             "type_hint": "", "dhcp_msgtype": None, "arp_op": None,
             "dhcp_yiaddr": "", "dhcp_hostname": "", "dhcp_client_mac": "",
             "dhcp": None, "dns": None, "tls": None, "nd": None,
-            "ssdp": None, "mdns": None, "http_host": "",
+            "ssdp": None, "mdns": None, "http_host": "", "lldp": None,
             "service": "", "service_port": None, "app_conf": "",
             "encrypted": "unknown", "cleartext": "",
             "multicast": False, "l2_bcast": False,
@@ -4552,6 +4554,18 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
         d["l2_bcast"] = d["dst_mac"] == "ff:ff:ff:ff:ff:ff"
         if d["dst_mac"] and not is_unicast_mac(d["dst_mac"]):
             d["multicast"] = True
+    if type(pkt).__name__ in ("Ether", "Dot3"):
+        try:
+            raw0 = bytes(pkt)
+            info = l2_discovery(raw0)
+        except (struct.error, IndexError, ValueError):
+            info = None
+        if info:
+            if not d["src_mac"]:
+                d["dst_mac"], d["src_mac"] = _mac(raw0[0:6]), \
+                    _mac(raw0[6:12])
+                d["multicast"] = bool(raw0[0] & 1)
+            return _label_l2_discovery(d, info)
 
     if pkt.haslayer(ARP):
         a = pkt[ARP]
@@ -4608,6 +4622,8 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
         flags = int(t.flags)
         d["tcp_flags"] = flags
         d["seq"] = int(t.seq)
+        d["ack"] = int(t.ack)
+        d["win"] = int(t.window)
         names = [n for b, n in ((0x01, "FIN"), (0x02, "SYN"), (0x04, "RST"),
                                 (0x08, "PSH"), (0x10, "ACK"), (0x20, "URG"))
                  if flags & b]
@@ -4717,11 +4733,7 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
                       {3: "request", 4: "reply"}.get(mode, "message") + ")",
                       "app_conf": "Observed", "encrypted": "no"})
         elif 443 in ports and load and (load[0] & 0x80):
-            d.update({"proto": "QUIC", "tag": "QUIC",
-                      "text": "Secure web connection (QUIC — the site name "
-                              "is encrypted)",
-                      "app_conf": "Observed", "encrypted": "yes",
-                      "service": "Secure web browsing (QUIC)"})
+            _quic_label(d, bytes(load), reasm, getattr(pkt, "time", 0.0))
         elif 443 in ports and load:
             d.update({"proto": "QUIC", "tag": "QUIC",
                       "text": "Secure web connection (fast, encrypted)",
@@ -5109,6 +5121,546 @@ def _wire_dhcp(load):
     return dhcp_from_options(opts, yiaddr, chaddr)
 
 
+# ============================================================================
+#  5c.  QUIC Initial packets — the site name a browser sends in its first
+#       HTTP/3 packet
+#
+#  A QUIC client's first packet is encrypted with keys anyone can derive from
+#  the packet itself (RFC 9001 §5.2: the salt is public and the connection
+#  ID is on the wire). It is protection against accidents, not privacy, and
+#  every network middlebox may read it. Nothing else of QUIC is readable, and
+#  nothing here is "decrypting a connection": once the handshake moves on,
+#  real secret keys take over. The name is labelled as read from the first
+#  packet; Encrypted Client Hello (ECH) is detected and said out loud.
+#
+#  Uses the `cryptography` package when present (fast, checks the
+#  authentication tag); otherwise a small pure-Python AES-128 + GHASH (also
+#  checks the tag). Budgeted so a flood of fake Initials can't eat the CPU.
+# ============================================================================
+QUIC_V1 = 0x00000001
+QUIC_V2 = 0x6b3343cf
+QUIC_SALTS = {
+    QUIC_V1: bytes.fromhex("38762cf7f55934b34d179ae6a4c80cadccbb7f0a"),
+    QUIC_V2: bytes.fromhex("0dede3def700a6db819381be6e269dcbf9bd2ed9"),
+}
+QUIC_LABELS = {QUIC_V1: (b"quic key", b"quic iv", b"quic hp"),
+               QUIC_V2: (b"quicv2 key", b"quicv2 iv", b"quicv2 hp")}
+QUIC_INITIAL_TYPE = {QUIC_V1: 0, QUIC_V2: 1}
+
+
+def _hkdf_extract(salt, ikm):
+    import hmac
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def _hkdf_expand_label(secret, label, length, context=b""):
+    import hmac
+    full = b"tls13 " + label
+    info = struct.pack(">H", length) + bytes([len(full)]) + full + \
+        bytes([len(context)]) + context
+    out, t, i = b"", b"", 1
+    while len(out) < length:
+        t = hmac.new(secret, t + info + bytes([i]), hashlib.sha256).digest()
+        out += t
+        i += 1
+    return out[:length]
+
+
+def quic_initial_keys(dcid, version=QUIC_V1, side="client"):
+    """(key, iv, hp) of the Initial packets of one side (RFC 9001 §5.2,
+    RFC 9369 §3.3.1 for v2)."""
+    initial = _hkdf_extract(QUIC_SALTS[version], dcid)
+    secret = _hkdf_expand_label(initial, b"client in" if side == "client"
+                                else b"server in", 32)
+    lk, li, lh = QUIC_LABELS[version]
+    return (_hkdf_expand_label(secret, lk, 16),
+            _hkdf_expand_label(secret, li, 12),
+            _hkdf_expand_label(secret, lh, 16))
+
+
+# ---- AES-128 (encrypt direction only: header mask and CTR keystream) -------
+def _aes_tables():
+    sbox = [0] * 256
+    p = q = 1
+    while True:                      # generate the S-box (FIPS-197 §5.1.1)
+        p = p ^ ((p << 1) & 0xff) ^ (0x1b if p & 0x80 else 0)
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q &= 0xff
+        if q & 0x80:
+            q ^= 0x09
+        x = q ^ ((q << 1) | (q >> 7)) & 0xff ^ ((q << 2) | (q >> 6)) & 0xff \
+            ^ ((q << 3) | (q >> 5)) & 0xff ^ ((q << 4) | (q >> 4)) & 0xff
+        sbox[p] = (x ^ 0x63) & 0xff
+        if p == 1:
+            break
+    sbox[0] = 0x63
+
+    def xt(a):
+        return ((a << 1) ^ 0x1b) & 0xff if a & 0x80 else a << 1
+    t0 = []
+    for i in range(256):
+        s = sbox[i]
+        s2 = xt(s)
+        s3 = s2 ^ s
+        t0.append((s2 << 24) | (s << 16) | (s << 8) | s3)
+    t1 = [((v >> 8) | (v << 24)) & 0xffffffff for v in t0]
+    t2 = [((v >> 16) | (v << 16)) & 0xffffffff for v in t0]
+    t3 = [((v >> 24) | (v << 8)) & 0xffffffff for v in t0]
+    return sbox, t0, t1, t2, t3
+
+
+_AES = None
+
+
+def _aes_expand(key):
+    global _AES
+    if _AES is None:
+        _AES = _aes_tables()
+    sbox = _AES[0]
+    w = list(struct.unpack(">4I", key))
+    rcon = 1
+    for i in range(4, 44):
+        t = w[i - 1]
+        if i % 4 == 0:
+            t = ((t << 8) | (t >> 24)) & 0xffffffff
+            t = (sbox[t >> 24] << 24) | (sbox[(t >> 16) & 0xff] << 16) | \
+                (sbox[(t >> 8) & 0xff] << 8) | sbox[t & 0xff]
+            t ^= rcon << 24
+            rcon = ((rcon << 1) ^ 0x1b) & 0xff if rcon & 0x80 else rcon << 1
+        w.append(w[i - 4] ^ t)
+    return w
+
+
+def _aes_block(w, block):
+    sbox, t0, t1, t2, t3 = _AES
+    s0, s1, s2, s3 = struct.unpack(">4I", block)
+    s0 ^= w[0]
+    s1 ^= w[1]
+    s2 ^= w[2]
+    s3 ^= w[3]
+    k = 4
+    for _ in range(9):
+        a0 = t0[s0 >> 24] ^ t1[(s1 >> 16) & 0xff] ^ t2[(s2 >> 8) & 0xff] ^ \
+            t3[s3 & 0xff] ^ w[k]
+        a1 = t0[s1 >> 24] ^ t1[(s2 >> 16) & 0xff] ^ t2[(s3 >> 8) & 0xff] ^ \
+            t3[s0 & 0xff] ^ w[k + 1]
+        a2 = t0[s2 >> 24] ^ t1[(s3 >> 16) & 0xff] ^ t2[(s0 >> 8) & 0xff] ^ \
+            t3[s1 & 0xff] ^ w[k + 2]
+        a3 = t0[s3 >> 24] ^ t1[(s0 >> 16) & 0xff] ^ t2[(s1 >> 8) & 0xff] ^ \
+            t3[s2 & 0xff] ^ w[k + 3]
+        s0, s1, s2, s3 = a0, a1, a2, a3
+        k += 4
+    o0 = ((sbox[s0 >> 24] << 24) | (sbox[(s1 >> 16) & 0xff] << 16) |
+          (sbox[(s2 >> 8) & 0xff] << 8) | sbox[s3 & 0xff]) ^ w[40]
+    o1 = ((sbox[s1 >> 24] << 24) | (sbox[(s2 >> 16) & 0xff] << 16) |
+          (sbox[(s3 >> 8) & 0xff] << 8) | sbox[s0 & 0xff]) ^ w[41]
+    o2 = ((sbox[s2 >> 24] << 24) | (sbox[(s3 >> 16) & 0xff] << 16) |
+          (sbox[(s0 >> 8) & 0xff] << 8) | sbox[s1 & 0xff]) ^ w[42]
+    o3 = ((sbox[s3 >> 24] << 24) | (sbox[(s0 >> 16) & 0xff] << 16) |
+          (sbox[(s1 >> 8) & 0xff] << 8) | sbox[s2 & 0xff]) ^ w[43]
+    return struct.pack(">4I", o0, o1, o2, o3)
+
+
+def aes128_ecb_encrypt(key, block):
+    """One AES-128 block (pure Python; used when `cryptography` is not
+    installed)."""
+    return _aes_block(_aes_expand(key), block)
+
+
+def _gf128_mul(x, y):
+    r = 0xE1000000000000000000000000000000
+    z, v = 0, y
+    for i in range(127, -1, -1):
+        if (x >> i) & 1:
+            z ^= v
+        v = (v >> 1) ^ r if v & 1 else v >> 1
+    return z
+
+
+def _ghash(h, aad, ct):
+    hx = int.from_bytes(h, "big")
+    x = 0
+    for data in (aad, ct):
+        for i in range(0, len(data), 16):
+            blk = data[i:i + 16].ljust(16, b"\x00")
+            x = _gf128_mul(x ^ int.from_bytes(blk, "big"), hx)
+    x = _gf128_mul(x ^ ((len(aad) * 8) << 64 | len(ct) * 8), hx)
+    return x.to_bytes(16, "big")
+
+
+def _aes_gcm_py(key, nonce, data, aad, decrypt=True):
+    """AES-128-GCM with a 96-bit nonce, pure Python. decrypt=True: `data`
+    is ciphertext‖tag → plaintext or None on a bad tag."""
+    w = _aes_expand(key)
+    h = _aes_block(w, b"\x00" * 16)
+    j0 = nonce + b"\x00\x00\x00\x01"
+    if decrypt:
+        if len(data) < 16:
+            return None
+        ct, tag = data[:-16], data[-16:]
+    else:
+        ct = None
+    src = ct if decrypt else data
+    out = bytearray(len(src))
+    ctr = 2
+    for i in range(0, len(src), 16):
+        ks = _aes_block(w, nonce + struct.pack(">I", ctr))
+        ctr += 1
+        chunk = src[i:i + 16]
+        for j, b in enumerate(chunk):
+            out[i + j] = b ^ ks[j]
+    cipher = ct if decrypt else bytes(out)
+    s = _ghash(h, aad, cipher)
+    ek = _aes_block(w, j0)
+    tag_calc = bytes(a ^ b for a, b in zip(s, ek))
+    if decrypt:
+        import hmac
+        return bytes(out) if hmac.compare_digest(tag_calc, tag) else None
+    return bytes(out) + tag_calc
+
+
+_QUIC_CRYPTO = None
+
+
+def _quic_crypto():
+    """(ecb(key, block), gcm_open(key, nonce, data, aad)) — the fast
+    `cryptography` versions when installed, else pure Python."""
+    global _QUIC_CRYPTO
+    if _QUIC_CRYPTO is not None:
+        return _QUIC_CRYPTO
+    try:
+        from cryptography.hazmat.primitives.ciphers import (Cipher,
+                                                            algorithms,
+                                                            modes)
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.exceptions import InvalidTag
+
+        def ecb(key, block):
+            enc = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+            return enc.update(block) + enc.finalize()
+
+        def gcm_open(key, nonce, data, aad):
+            try:
+                return AESGCM(key).decrypt(nonce, data, aad)
+            except InvalidTag:
+                return None
+        _QUIC_CRYPTO = (ecb, gcm_open, "cryptography")
+    except Exception:                                # noqa: BLE001
+        _QUIC_CRYPTO = (aes128_ecb_encrypt,
+                        lambda k, n, d, a: _aes_gcm_py(k, n, d, a, True),
+                        "pure Python")
+    return _QUIC_CRYPTO
+
+
+def quic_varint(buf, pos):
+    if pos >= len(buf):
+        raise ValueError("varint past end")
+    first = buf[pos]
+    n = 1 << (first >> 6)
+    if pos + n > len(buf):
+        raise ValueError("short varint")
+    v = first & 0x3f
+    for i in range(1, n):
+        v = (v << 8) | buf[pos + i]
+    return v, pos + n
+
+
+def quic_long_header(buf):
+    """Parse a long-header packet's clear part. → dict or None."""
+    if len(buf) < 7 or not buf[0] & 0x80:
+        return None
+    version = struct.unpack_from(">I", buf, 1)[0]
+    pos = 5
+    dl = buf[pos]
+    pos += 1
+    if dl > 20 or pos + dl >= len(buf):
+        return None
+    dcid = bytes(buf[pos:pos + dl])
+    pos += dl
+    sl = buf[pos]
+    pos += 1
+    if sl > 20 or pos + sl > len(buf):
+        return None
+    scid = bytes(buf[pos:pos + sl])
+    pos += sl
+    ptype = (buf[0] >> 4) & 0x03
+    out = {"version": version, "dcid": dcid, "scid": scid, "type": ptype,
+           "token": b"", "pn_offset": 0, "length": 0, "end": len(buf)}
+    if version not in QUIC_SALTS or ptype != QUIC_INITIAL_TYPE[version]:
+        return out
+    tl, pos = quic_varint(buf, pos)
+    out["token"] = bytes(buf[pos:pos + tl])
+    pos += tl
+    ln, pos = quic_varint(buf, pos)
+    out["pn_offset"] = pos
+    out["length"] = ln
+    out["end"] = min(len(buf), pos + ln)
+    out["initial"] = True
+    return out
+
+
+def quic_decrypt_initial(buf, side="client"):
+    """Remove header protection and decrypt one Initial packet (the first
+    packet in `buf`). → (header dict, plaintext frames) or (hdr, None)."""
+    hdr = quic_long_header(buf)
+    if not hdr or not hdr.get("initial"):
+        return hdr, None
+    ecb, gcm_open, _impl = _quic_crypto()
+    key, iv, hp = quic_initial_keys(hdr["dcid"], hdr["version"], side)
+    pn_off = hdr["pn_offset"]
+    if pn_off + 4 + 16 > hdr["end"]:
+        return hdr, None
+    sample = bytes(buf[pn_off + 4:pn_off + 20])
+    mask = ecb(hp, sample)
+    first = buf[0] ^ (mask[0] & 0x0f)
+    pn_len = (first & 0x03) + 1
+    pn_bytes = bytes(b ^ m for b, m in zip(buf[pn_off:pn_off + pn_len],
+                                           mask[1:1 + pn_len]))
+    pn = int.from_bytes(pn_bytes, "big")
+    aad = bytes([first]) + bytes(buf[1:pn_off]) + pn_bytes
+    nonce = bytes(a ^ b for a, b in zip(iv, pn.to_bytes(12, "big")))
+    payload = bytes(buf[pn_off + pn_len:hdr["end"]])
+    plain = gcm_open(key, nonce, payload, aad)
+    hdr["pn"] = pn
+    return hdr, plain
+
+
+def quic_crypto_frames(plain):
+    """CRYPTO frame pieces [(offset, bytes)] from an Initial packet's
+    frames. Raises ValueError on frames an Initial may not carry."""
+    out = []
+    pos, n = 0, len(plain)
+    while pos < n:
+        ft = plain[pos]
+        if ft == 0x00:                                # PADDING
+            pos += 1
+        elif ft == 0x01:                              # PING
+            pos += 1
+        elif ft in (0x02, 0x03):                      # ACK
+            pos += 1
+            _largest, pos = quic_varint(plain, pos)
+            _delay, pos = quic_varint(plain, pos)
+            count, pos = quic_varint(plain, pos)
+            _first, pos = quic_varint(plain, pos)
+            for _ in range(min(count, 256)):
+                _g, pos = quic_varint(plain, pos)
+                _l, pos = quic_varint(plain, pos)
+            if ft == 0x03:
+                for _ in range(3):
+                    _e, pos = quic_varint(plain, pos)
+        elif ft == 0x06:                              # CRYPTO
+            off, pos = quic_varint(plain, pos + 1)
+            ln, pos = quic_varint(plain, pos)
+            if pos + ln > n:
+                raise ValueError("short crypto frame")
+            out.append((off, plain[pos:pos + ln]))
+            pos += ln
+        elif ft in (0x1c, 0x1d):                      # CONNECTION_CLOSE
+            break
+        else:
+            raise ValueError(f"frame {ft:#x} not allowed in Initial")
+    return out
+
+
+class QuicInitialReader:
+    """Stitches a ClientHello split over several Initial packets (modern
+    browsers send post-quantum key shares, so it often needs two) and
+    reads the server name. Bounded: 512 connections, 64 KiB each, 5 s;
+    at most `budget` packets decrypted per second."""
+
+    MAX_ENTRIES = 512
+    MAX_BYTES = 65536
+    TTL = 5.0
+
+    def __init__(self, budget=None):
+        self.buf = OrderedDict()
+        self.done = OrderedDict()
+        if budget is None:          # the pure-Python fallback is ~35× slower
+            budget = 300 if _quic_crypto()[2] == "cryptography" else 40
+        self.budget = budget
+        self._window = [0.0, 0]
+        self.decrypted = self.failed = self.skipped = 0
+
+    def _allowed(self, ts):
+        w = self._window
+        if ts - w[0] >= 1.0 or ts < w[0]:
+            w[0], w[1] = ts, 0
+        if w[1] >= self.budget:
+            self.skipped += 1
+            return False
+        w[1] += 1
+        return True
+
+    def feed(self, key, datagram, ts):
+        """→ parse_tls_hello() dict once the ClientHello is complete
+        (with "via": "quic"), else None."""
+        hdr = quic_long_header(datagram)
+        if not hdr or not hdr.get("initial"):
+            return None
+        ck = (key, hdr["dcid"])
+        if ck in self.done:
+            return None                       # retransmission: already read
+        if not self._allowed(ts):
+            return None
+        try:
+            hdr, plain = quic_decrypt_initial(datagram)
+            frames = quic_crypto_frames(plain) if plain else None
+        except (ValueError, IndexError, struct.error):
+            frames = None
+        if frames is None:
+            self.failed += 1
+            return None
+        self.decrypted += 1
+        ent = self.buf.get(ck)
+        if ent is None:
+            ent = self.buf[ck] = {"parts": {}, "ts": ts}
+            self._trim(ts)
+        for off, data in frames:
+            if off < self.MAX_BYTES:
+                ent["parts"][off] = data
+        hs = self._contiguous(ent["parts"])
+        if len(hs) < 4:
+            return None
+        if hs[0] != 1:                        # not a ClientHello
+            self.buf.pop(ck, None)
+            return None
+        need = 4 + int.from_bytes(hs[1:4], "big")
+        if len(hs) < need and len(hs) < self.MAX_BYTES:
+            return None
+        self.buf.pop(ck, None)
+        self.done[ck] = ts
+        while len(self.done) > 4 * self.MAX_ENTRIES:
+            self.done.popitem(last=False)
+        body = hs[:min(need, 16384)]
+        rec = b"\x16\x03\x01" + struct.pack(">H", len(body)) + body
+        info = parse_tls_hello(rec)
+        if not info or info.get("kind") != "client":
+            return None
+        info["via"] = "quic"
+        info["quic_version"] = "v2" if hdr["version"] == QUIC_V2 else "v1"
+        return info
+
+    @staticmethod
+    def _contiguous(parts):
+        out = bytearray()
+        while True:
+            nxt = None
+            for off in parts:
+                if off <= len(out) < off + len(parts[off]):
+                    nxt = off
+                    break
+            if nxt is None:
+                return bytes(out)
+            out += parts[nxt][len(out) - nxt:]
+
+    def _trim(self, ts):
+        while len(self.buf) > self.MAX_ENTRIES:
+            self.buf.popitem(last=False)
+        for k in list(self.buf):
+            if ts - self.buf[k]["ts"] > self.TTL:
+                self.buf.pop(k, None)
+            else:
+                break
+
+
+def quic_build_initial(dcid, scid, crypto, pn=0, version=QUIC_V1,
+                       crypto_offset=0, pad_to=1200, frames=None):
+    """Build a client Initial packet (tests, demo data and the self-test).
+    `crypto` = ClientHello bytes (no record header) placed at
+    `crypto_offset`; `frames` = raw frame bytes to use instead."""
+    if frames is None:
+        frames = b"\x06" + _quic_varint_enc(crypto_offset) + \
+            _quic_varint_enc(len(crypto)) + crypto
+    key, iv, hp = quic_initial_keys(dcid, version)
+    pn_len = 4
+    first = 0xc0 | (QUIC_INITIAL_TYPE[version] << 4) | (pn_len - 1)
+    head = bytes([first]) + struct.pack(">I", version) + bytes([len(dcid)]) \
+        + dcid + bytes([len(scid)]) + scid + _quic_varint_enc(0)
+    overhead = len(head) + 2 + pn_len + 16
+    if overhead + len(frames) < pad_to:
+        frames = frames + b"\x00" * (pad_to - overhead - len(frames))
+    length = pn_len + len(frames) + 16
+    head += struct.pack(">H", 0x4000 | length)
+    pn_bytes = pn.to_bytes(pn_len, "big")
+    aad = head + pn_bytes
+    nonce = bytes(a ^ b for a, b in zip(iv, pn.to_bytes(12, "big")))
+    sealed = _aes_gcm_py(key, nonce, frames, aad, decrypt=False)
+    pkt = bytearray(aad + sealed)
+    pn_off = len(head)
+    ecb = _quic_crypto()[0]
+    mask = ecb(hp, bytes(pkt[pn_off + 4:pn_off + 20]))
+    pkt[0] ^= mask[0] & 0x0f
+    for i in range(pn_len):
+        pkt[pn_off + i] ^= mask[1 + i]
+    return bytes(pkt)
+
+
+def _quic_varint_enc(v):
+    if v < 0x40:
+        return bytes([v])
+    if v < 0x4000:
+        return struct.pack(">H", 0x4000 | v)
+    if v < 0x40000000:
+        return struct.pack(">I", 0x80000000 | v)
+    return struct.pack(">Q", 0xC000000000000000 | v)
+
+
+def tls_client_hello(sni, alpn=("h3",), ech=False, pad_ext=0):
+    """A minimal TLS 1.3 ClientHello handshake message (no record header)
+    for tests and demo data."""
+    def ext(t, body):
+        return struct.pack(">HH", t, len(body)) + body
+    name = sni.encode()
+    exts = ext(0, struct.pack(">HBH", len(name) + 3, 0, len(name)) + name)
+    al = b"".join(bytes([len(a)]) + a.encode() for a in alpn)
+    exts += ext(16, struct.pack(">H", len(al)) + al)
+    exts += ext(43, b"\x02\x03\x04")
+    if ech:
+        exts += ext(0xfe0d, b"\x00" * 32)
+    if pad_ext:
+        exts += ext(21, b"\x00" * pad_ext)
+    body = b"\x03\x03" + bytes(32) + b"\x00" + b"\x00\x02\x13\x01" + \
+        b"\x01\x00" + struct.pack(">H", len(exts)) + exts
+    return b"\x01" + len(body).to_bytes(3, "big") + body
+
+
+QUIC_NAMES = {"enabled": True}       # Settings → Privacy can turn it off
+
+
+def _quic_label(d, load, reasm, ts):
+    """Shared by both decoders: label a QUIC datagram and, for a client's
+    first packets, read the site name from the ClientHello."""
+    d.update({"proto": "QUIC", "tag": "QUIC",
+              "text": "Secure web connection (QUIC — the site name "
+                      "is encrypted)",
+              "app_conf": "Observed", "encrypted": "yes",
+              "service": "Secure web browsing (QUIC)"})
+    reader = getattr(reasm, "quic", None)
+    if reader is None or not QUIC_NAMES["enabled"] or d["dport"] != 443:
+        return
+    info = reader.feed((d["src_ip"], d["sport"], d["dst_ip"]), load,
+                       float(ts))
+    if not info:
+        return
+    d["tls"] = info
+    sni = info.get("sni", "")
+    if sni:
+        d["text"] = (f"Secure connection to {sni} (HTTP/3 — the name was "
+                     f"read from the connection's first packet)")
+        if info.get("ech"):
+            d["text"] += (" (Encrypted Client Hello — the real site may be "
+                          "hidden behind this name)")
+        d["dns_names"].append(sni)
+        if d["dst_ip"]:
+            d["learns"].append((d["dst_ip"], sni))
+        if sni in DOH_HOSTS:
+            d["doh_hint"] = DOH_HOSTS[sni]
+    else:
+        d["text"] = "Secure connection (HTTP/3 — site name not visible)"
+
+
 def packet_object(d):
     """The scapy packet for a decoded row (built on demand, then cached)."""
     pkt = d.get("pkt")
@@ -5128,17 +5680,158 @@ def packet_object(d):
     return pkt
 
 
+# ---- LLDP and CDP: the switch tells this computer which port it is on ------
+LLDP_CAPS = ((0x04, "switch"), (0x08, "Wi-Fi access point"),
+             (0x10, "router"), (0x20, "phone"), (0x02, "repeater"),
+             (0x40, "cable modem"), (0x80, "station"), (0x01, "other"))
+CDP_CAPS = ((0x08, "switch"), (0x01, "router"), (0x02, "bridge"),
+            (0x10, "host"), (0x80, "phone"), (0x40, "repeater"),
+            (0x200, "two-port MAC relay"))
+CDP_SNAP = b"\xaa\xaa\x03\x00\x00\x0c\x20\x00"
+
+
+def _disc_text(b, limit=120):
+    return sanitize_text(bytes(b).decode("utf-8", "replace"), limit)
+
+
+def _lldp_id(sub, data, port=False):
+    if (sub == 4 and not port or sub == 3 and port) and len(data) == 6:
+        return _mac(data)
+    if (sub == 5 and not port or sub == 4 and port) and len(data) >= 5 \
+            and data[0] == 1:
+        return _ip4(data[1:5])
+    return _disc_text(data)
+
+
+def parse_lldp(buf):
+    """LLDP (IEEE 802.1AB) TLVs → plain facts. Tolerates truncation."""
+    out = {"proto": "LLDP", "chassis": "", "port": "", "port_desc": "",
+           "system": "", "descr": "", "caps": [], "mgmt": "", "vlan": None,
+           "ttl": None}
+    pos, n = 0, len(buf)
+    while pos + 2 <= n:
+        hdr = struct.unpack_from(">H", buf, pos)[0]
+        t, ln = hdr >> 9, hdr & 0x1ff
+        pos += 2
+        v = buf[pos:pos + ln]
+        pos += ln
+        if t == 0:
+            break
+        if t == 1 and len(v) >= 2:
+            out["chassis"] = _lldp_id(v[0], v[1:])
+        elif t == 2 and len(v) >= 2:
+            out["port"] = _lldp_id(v[0], v[1:], port=True)
+        elif t == 3 and len(v) >= 2:
+            out["ttl"] = struct.unpack(">H", v[:2])[0]
+        elif t == 4:
+            out["port_desc"] = _disc_text(v)
+        elif t == 5:
+            out["system"] = _disc_text(v)
+        elif t == 6:
+            out["descr"] = _disc_text(v, 200)
+        elif t == 7 and len(v) >= 4:
+            en = struct.unpack(">H", v[2:4])[0]
+            out["caps"] = [nm for bit, nm in LLDP_CAPS if en & bit]
+        elif t == 8 and len(v) >= 2 and not out["mgmt"]:
+            alen, sub = v[0], v[1]
+            addr = v[2:1 + alen]
+            if sub == 1 and len(addr) == 4:
+                out["mgmt"] = _ip4(addr)
+            elif sub == 2 and len(addr) == 16:
+                out["mgmt"] = _ip6(addr)
+        elif t == 127 and len(v) >= 6 and v[:3] == b"\x00\x80\xc2" and \
+                v[3] == 1:
+            out["vlan"] = struct.unpack(">H", v[4:6])[0]
+    return out if (out["chassis"] or out["system"]) else None
+
+
+def parse_cdp(buf):
+    """Cisco Discovery Protocol (after the SNAP header) → plain facts."""
+    out = {"proto": "CDP", "chassis": "", "port": "", "port_desc": "",
+           "system": "", "descr": "", "caps": [], "mgmt": "", "vlan": None,
+           "ttl": None, "platform": ""}
+    if len(buf) < 4:
+        return None
+    out["ttl"] = buf[1]
+    pos, n = 4, len(buf)
+    while pos + 4 <= n:
+        t, ln = struct.unpack_from(">HH", buf, pos)
+        if ln < 4:
+            break
+        v = buf[pos + 4:pos + ln]
+        pos += ln
+        if t == 0x01:
+            out["system"] = out["chassis"] = _disc_text(v)
+        elif t in (0x02, 0x16) and len(v) >= 4 and not out["mgmt"]:
+            p = 4
+            for _ in range(min(8, struct.unpack(">I", v[:4])[0])):
+                if p + 2 > len(v):
+                    break
+                ptype, plen = v[p], v[p + 1]
+                proto = v[p + 2:p + 2 + plen]
+                p += 2 + plen
+                if p + 2 > len(v):
+                    break
+                alen = struct.unpack(">H", v[p:p + 2])[0]
+                addr = v[p + 2:p + 2 + alen]
+                p += 2 + alen
+                if ptype == 1 and proto == b"\xcc" and len(addr) == 4:
+                    out["mgmt"] = _ip4(addr)
+                    break
+        elif t == 0x03:
+            out["port"] = _disc_text(v)
+        elif t == 0x04 and len(v) >= 4:
+            en = struct.unpack(">I", v[:4])[0]
+            out["caps"] = [nm for bit, nm in CDP_CAPS if en & bit]
+        elif t == 0x05:
+            out["descr"] = _disc_text(v, 200)
+        elif t == 0x06:
+            out["platform"] = _disc_text(v)
+        elif t == 0x0a and len(v) >= 2:
+            out["vlan"] = struct.unpack(">H", v[:2])[0]
+    return out if out["system"] else None
+
+
+def l2_discovery(raw):
+    """LLDP or CDP facts from a raw Ethernet frame, else None."""
+    if len(raw) < 22:
+        return None
+    et = struct.unpack_from(">H", raw, 12)[0]
+    if et == 0x88cc:
+        return parse_lldp(raw[14:])
+    if et < 0x0600 and raw[14:22] == CDP_SNAP:
+        return parse_cdp(raw[22:])
+    return None
+
+
+def _label_l2_discovery(d, info):
+    d["proto"] = d["tag"] = info["proto"]
+    d["lldp"] = info
+    d["app_conf"] = "Observed"
+    d["encrypted"] = "no"
+    d["src"], d["dst"] = d["src_mac"], d["dst_mac"]
+    name = info["system"] or info["chassis"]
+    what = ", ".join(info["caps"][:2]) or "network device"
+    port = info["port_desc"] or info["port"]
+    d["text"] = (f"{what.capitalize()} “{name}” says this link is its port "
+                 f"{port or '?'}" + (f" (VLAN {info['vlan']})"
+                                     if info["vlan"] else "") +
+                 f" — {info['proto']}")
+    return d
+
+
 def _fast_new(raw, ts, lt):
     return {"proto": "?", "tag": "OTHER", "text": "",
             "src": "", "dst": "", "src_ip": "", "dst_ip": "",
             "src_mac": "", "dst_mac": "", "ttl": "", "ttl_int": 0,
             "sport": None, "dport": None, "ipver": 0, "transport": "",
-            "tcp_flags": None, "seq": None, "payload_len": 0,
+            "tcp_flags": None, "seq": None, "ack": None, "win": None,
+            "payload_len": 0,
             "dns_names": [], "doh_hint": "", "plain_dns": False,
             "type_hint": "", "dhcp_msgtype": None, "arp_op": None,
             "dhcp_yiaddr": "", "dhcp_hostname": "", "dhcp_client_mac": "",
             "dhcp": None, "dns": None, "tls": None, "nd": None,
-            "ssdp": None, "mdns": None, "http_host": "",
+            "ssdp": None, "mdns": None, "http_host": "", "lldp": None,
             "service": "", "service_port": None, "app_conf": "",
             "encrypted": "unknown", "cleartext": "",
             "multicast": False, "l2_bcast": False,
@@ -5195,6 +5888,10 @@ def _fast_decode(raw, ts, lt, reasm):
             off += 4
             vlans += 1
         if et < 0x0600:
+            if raw[14:22] == CDP_SNAP:
+                info = parse_cdp(raw[22:])
+                if info:
+                    return _label_l2_discovery(d, info)
             raise NeedDeepParse("802.3/LLC")
     elif lt == 113:                                   # Linux cooked v1
         if n < 16:
@@ -5224,6 +5921,10 @@ def _fast_decode(raw, ts, lt, reasm):
 
     if et == 0x0806:
         return _fast_arp(d, raw, off)
+    if et == 0x88cc:
+        info = parse_lldp(raw[off:])
+        if info:
+            return _label_l2_discovery(d, info)
     if et == 0x0800:
         return _fast_ipv4(d, raw, off, reasm)
     if et == 0x86DD:
@@ -5320,7 +6021,7 @@ def _fast_l4(d, raw, proto, p, end, reasm, ipver):
     if proto == 6:
         return _fast_tcp(d, raw, p, end, reasm)
     if proto == 17:
-        return _fast_udp(d, raw, p, end)
+        return _fast_udp(d, raw, p, end, reasm)
     if proto == 1 and ipver == 4:
         if end - p < 4:
             raise NeedDeepParse("short icmp")
@@ -5362,6 +6063,8 @@ def _fast_tcp(d, raw, p, end, reasm):
     d["proto"], d["tag"] = "TCP", "TCP"
     d["tcp_flags"] = flags
     d["seq"] = seq
+    d["ack"], d["win"] = struct.unpack_from(">I", raw, p + 8)[0], \
+        struct.unpack_from(">H", raw, p + 14)[0]
     names = [nm for b, nm in _TCP_FLAG_NAMES if flags & b]
     svc, sport_ = _port_service(sport, dport)
     d["service"], d["service_port"] = svc, sport_
@@ -5395,7 +6098,7 @@ def _fast_tcp(d, raw, p, end, reasm):
     return _fast_done(d)
 
 
-def _fast_udp(d, raw, p, end):
+def _fast_udp(d, raw, p, end, reasm=None):
     if end - p < 8:
         raise NeedDeepParse("short udp")
     sport, dport, ulen = struct.unpack_from(">HHH", raw, p)
@@ -5466,12 +6169,7 @@ def _fast_udp(d, raw, p, end):
                   {3: "request", 4: "reply"}.get(mode, "message") + ")",
                   "app_conf": "Observed", "encrypted": "no"})
     elif 443 in ports and load and (load[0] & 0x80):
-        d.update({"proto": "QUIC", "tag": "QUIC",
-                  "text": "Secure web connection (QUIC — the site name "
-                          "is encrypted)",
-                  "app_conf": "Observed", "encrypted": "yes",
-                  "service": "Secure web browsing (QUIC)"})
-        d["quic_initial"] = load if (load[0] & 0x30) == 0 else None
+        _quic_label(d, load, reasm, d["time"])
     elif 443 in ports and load:
         d.update({"proto": "QUIC", "tag": "QUIC",
                   "text": "Secure web connection (fast, encrypted)",
@@ -8552,7 +9250,9 @@ class FlowRecord:
                  "app", "service", "domain", "domain_conf", "tls_version",
                  "alpn", "encrypted", "interp_conf", "country", "asn", "org",
                  "closed", "note", "seq_out", "seq_in", "initiator",
-                 "cleartext", "live", "assoc")
+                 "cleartext", "live", "assoc", "rtt", "syn_ts", "syns",
+                 "dupacks", "zero_win", "ack_out", "ack_in", "retx_bytes",
+                 "payload_out", "payload_in")
 
     def __init__(self, fid, key, transport, local_ip, local_port, remote_ip,
                  remote_port, ts):
@@ -8592,6 +9292,14 @@ class FlowRecord:
         self.cleartext = ""
         self.live = True
         self.assoc = ""
+        self.rtt = None              # handshake round trip, seconds
+        self.syn_ts = None
+        self.syns = 0
+        self.dupacks = 0
+        self.zero_win = 0
+        self.ack_out = self.ack_in = None   # (ack, window) last pure ACK
+        self.retx_bytes = 0
+        self.payload_out = self.payload_in = 0
 
     @property
     def duration(self):
@@ -8643,9 +9351,34 @@ class FlowRecord:
                 "\U0001F512 Likely encrypted", "no": "⚠ Not encrypted"
                 }.get(self.encrypted, "Unknown")
 
+    def goodput(self):
+        """Useful bytes per second (re-sent data not counted), or None
+        when the connection is too short to tell."""
+        dur = self.duration
+        useful = self.payload_out + self.payload_in - self.retx_bytes
+        if dur < 1.0 or useful <= 0:
+            return None
+        return useful / dur
+
+    def tcp_health_text(self):
+        bits = []
+        if self.rtt is not None:
+            bits.append(f"round trip {self.rtt * 1000:.0f} ms (handshake)")
+        if self.retrans:
+            bits.append(f"{self.retrans} re-sent")
+        if self.dupacks:
+            bits.append(f"{self.dupacks} duplicate ACKs")
+        if self.zero_win:
+            bits.append(f"receiver full ×{self.zero_win}")
+        gp = self.goodput()
+        if gp:
+            bits.append(f"goodput {_human_bytes(gp)}/s")
+        return ", ".join(bits)
+
     def to_dict(self):
         return {s: getattr(self, s) for s in self.__slots__
-                if s not in ("seq_out", "seq_in")}
+                if s not in ("seq_out", "seq_in", "ack_out", "ack_in",
+                             "syn_ts")}
 
     @classmethod
     def from_dict(cls, d):
@@ -9560,7 +10293,303 @@ class AlertEngine:
                                      "with few successful replies.")
 
 
+# ============================================================================
+#  This computer's Wi-Fi link (read-only questions to the operating system)
+# ============================================================================
+def wifi_channel_from_mhz(mhz):
+    try:
+        f = int(round(float(mhz)))
+    except (TypeError, ValueError):
+        return None, ""
+    if f == 2484:
+        return 14, "2.4 GHz"
+    if 2412 <= f <= 2472:
+        return (f - 2407) // 5, "2.4 GHz"
+    if 5150 <= f <= 5895:
+        return (f - 5000) // 5, "5 GHz"
+    if 5925 <= f <= 7125:
+        return (f - 5950) // 5, "6 GHz"
+    return None, ""
+
+
+def _num(text):
+    try:
+        return float(str(text).replace(",", ".").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_netsh_wlan(text, want=""):
+    """`netsh wlan show interfaces` (English, French or Spanish Windows).
+    `want` = adapter name or description to prefer."""
+    blocks, cur = [], {}
+    for line in (text or "").splitlines():
+        if ":" not in line:
+            if cur and not line.strip():
+                continue
+            continue
+        k, _sep, v = line.partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if k in ("name", "nom", "nombre") and cur.get("name"):
+            blocks.append(cur)
+            cur = {}
+        cur[k] = v
+        if k in ("name", "nom", "nombre"):
+            cur["name"] = v
+    if cur:
+        blocks.append(cur)
+
+    def pick(b, *keys):
+        for key, val in b.items():
+            for k in keys:
+                if key.startswith(k):
+                    return val
+        return ""
+    best = None
+    for b in blocks:
+        state = pick(b, "state", "état", "etat", "estado").lower()
+        ok = state.startswith(("connected", "connect", "conectado"))
+        desc = pick(b, "description", "descripción", "descripcion")
+        if want and (want == b.get("name") or want == desc):
+            best = b if ok else best
+            if ok:
+                break
+        if ok and best is None:
+            best = b
+    if best is None:
+        return None
+    b = best
+    sig = re.search(r"(\d+)\s*%", pick(b, "signal", "señal", "senal"))
+    rssi = _num(pick(b, "rssi"))
+    pct = int(sig.group(1)) if sig else None
+    if rssi is None and pct is not None:
+        rssi = pct / 2.0 - 100.0          # Windows' own mapping
+    ch = _num(pick(b, "channel", "canal"))
+    band = pick(b, "band", "bande", "banda")
+    return {"source": "netsh", "iface": b.get("name", ""),
+            "ssid": pick(b, "ssid"),
+            "bssid": pick(b, "ap bssid", "bssid", "bssid del punto",
+                          "bssid du point").lower(),
+            "rssi": rssi, "signal_pct": pct,
+            "rx_mbps": _num(pick(b, "receive rate", "réception",
+                                 "reception", "velocidad de recepción",
+                                 "velocidad de recepcion")),
+            "tx_mbps": _num(pick(b, "transmit rate", "transmission",
+                                 "velocidad de transmisión",
+                                 "velocidad de transmision")),
+            "channel": int(ch) if ch is not None else None,
+            "band": band or ("2.4 GHz" if ch and ch <= 14 else
+                             "5 GHz" if ch else ""),
+            "standard": pick(b, "radio type", "type de radio",
+                             "tipo de radio")}
+
+
+def parse_iw_link(text, iface=""):
+    """`iw dev <iface> link` (Linux)."""
+    text = text or ""
+    if "Not connected" in text or "Connected to" not in text:
+        return None
+    m = re.search(r"Connected to ([0-9a-fA-F:]{17})", text)
+    out = {"source": "iw", "iface": iface, "ssid": "", "rssi": None,
+           "signal_pct": None, "rx_mbps": None, "tx_mbps": None,
+           "channel": None, "band": "", "standard": "",
+           "bssid": m.group(1).lower() if m else ""}
+    for line in text.splitlines():
+        k, _s, v = line.strip().partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if k == "ssid":
+            out["ssid"] = v
+        elif k == "freq":
+            out["channel"], out["band"] = wifi_channel_from_mhz(v)
+        elif k == "signal":
+            out["rssi"] = _num(v.split()[0]) if v else None
+        elif k in ("rx bitrate", "tx bitrate") and v:
+            rate = _num(v.split()[0])
+            out["rx_mbps" if k.startswith("rx") else "tx_mbps"] = rate
+            for std, tag in (("802.11be", "EHT"), ("802.11ax", "HE"),
+                             ("802.11ac", "VHT"), ("802.11n", "MCS")):
+                if tag in v and not out["standard"]:
+                    out["standard"] = std
+    return out
+
+
+def parse_proc_wireless(text, iface=""):
+    """/proc/net/wireless (Linux, when `iw` is missing): signal only."""
+    for line in (text or "").splitlines()[2:]:
+        name, _s, rest = line.partition(":")
+        name = name.strip()
+        if iface and name != iface:
+            continue
+        parts = rest.split()
+        if len(parts) >= 3:
+            level = _num(parts[2].rstrip("."))
+            if level is None:
+                continue
+            if level > 0:                 # some drivers report 0..100
+                level = level / 2.0 - 100.0
+            return {"source": "/proc/net/wireless", "iface": name,
+                    "ssid": "", "bssid": "", "rssi": level,
+                    "signal_pct": None, "rx_mbps": None, "tx_mbps": None,
+                    "channel": None, "band": "", "standard": ""}
+    return None
+
+
+def parse_macos_airport(text):
+    """`system_profiler SPAirPortDataType` (macOS)."""
+    text = text or ""
+    i = text.find("Current Network Information:")
+    if i < 0:
+        return None
+    block = text[i:].splitlines()[1:]
+    out = {"source": "system_profiler", "iface": "", "ssid": "",
+           "bssid": "", "rssi": None, "signal_pct": None, "rx_mbps": None,
+           "tx_mbps": None, "channel": None, "band": "", "standard": ""}
+    if block:
+        out["ssid"] = block[0].strip().rstrip(":")
+    for line in block[1:30]:
+        k, _s, v = line.strip().partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if not v and k.endswith("information"):
+            break
+        if k == "signal / noise":
+            m = re.match(r"(-?\d+)\s*dBm\s*/\s*(-?\d+)", v)
+            if m:
+                out["rssi"] = float(m.group(1))
+                out["noise"] = float(m.group(2))
+        elif k == "channel":
+            m = re.match(r"(\d+)\s*\(([\d.]+)\s*GHz", v)
+            if m:
+                out["channel"] = int(m.group(1))
+                out["band"] = f"{m.group(2)} GHz"
+        elif k == "transmit rate":
+            out["tx_mbps"] = _num(v)
+        elif k == "phy mode":
+            out["standard"] = v
+    return out
+
+
+def wifi_quality(rssi):
+    """→ (health status, word, plain-English explanation)."""
+    if rssi is None:
+        return "Unknown", "unknown", "Signal strength not reported."
+    if rssi >= -60:
+        return "Healthy", "excellent", "Strong signal."
+    if rssi >= -67:
+        return "Healthy", "good", "Good signal."
+    if rssi >= -75:
+        return "Degraded", "fair", ("Usable, but video calls and big "
+                                    "downloads may stutter.")
+    return "Needs attention", "weak", ("Weak signal — the most likely cause "
+                                       "of slowness. Move closer to the "
+                                       "router or remove obstacles.")
+
+
+class WifiProbe:
+    """Asks the operating system about THIS computer's Wi-Fi link every
+    `interval` seconds, in the background. Read-only: nothing is sent on
+    the network and no setting is changed."""
+
+    def __init__(self, interval=30):
+        self.interval = interval
+        self.last = None
+        self.at = 0.0
+        self.busy = False
+        self.error = ""
+        self.history = deque(maxlen=240)     # (ts, rssi)
+        self.seq = 0
+
+    @staticmethod
+    def _cmd(cmd, timeout=10):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout,
+                               creationflags=getattr(
+                                   subprocess, "CREATE_NO_WINDOW", 0))
+            return r.stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            return ""
+
+    def read(self, iface="", desc=""):
+        if IS_WINDOWS:
+            return parse_netsh_wlan(self._cmd(["netsh", "wlan", "show",
+                                               "interfaces"]), desc or iface)
+        if sys.platform == "darwin":
+            return parse_macos_airport(self._cmd(
+                ["system_profiler", "SPAirPortDataType"], 30))
+        names = [iface] if iface and os.path.isdir(
+            f"/sys/class/net/{iface}/wireless") else [
+            n for n in sorted(os.listdir("/sys/class/net"))
+            if os.path.isdir(f"/sys/class/net/{n}/wireless")] \
+            if os.path.isdir("/sys/class/net") else []
+        for name in names:
+            if shutil.which("iw"):
+                got = parse_iw_link(self._cmd(["iw", "dev", name, "link"]),
+                                    name)
+                if got:
+                    return got
+            try:
+                with open("/proc/net/wireless", encoding="utf-8") as f:
+                    got = parse_proc_wireless(f.read(), name)
+            except OSError:
+                got = None
+            if got:
+                return got
+        return None
+
+    def refresh(self, iface="", desc="", force=False):
+        if self.busy or (not force and time.time() - self.at <
+                         self.interval):
+            return False
+        self.busy = True
+        self.at = time.time()
+
+        def work():
+            try:
+                got = self.read(iface, desc)
+                self.error = ""
+            except Exception as e:                   # noqa: BLE001
+                got, self.error = None, str(e)
+            self.last = got
+            if got and got.get("rssi") is not None:
+                self.history.append((time.time(), got["rssi"]))
+            self.seq += 1
+            self.busy = False
+        threading.Thread(target=work, daemon=True, name="wifi-probe").start()
+        return True
+
+    def summary(self):
+        w = self.last
+        if not w:
+            return None
+        status, word, why = wifi_quality(w.get("rssi"))
+        parts = []
+        if w.get("rssi") is not None:
+            parts.append(f"{w['rssi']:.0f} dBm ({word})")
+        if w.get("tx_mbps") or w.get("rx_mbps"):
+            parts.append(f"link {w.get('rx_mbps') or w.get('tx_mbps'):.0f} "
+                         f"Mbit/s")
+        if w.get("channel"):
+            parts.append(f"channel {w['channel']}"
+                         + (f" ({w['band']})" if w.get("band") else ""))
+        if w.get("standard"):
+            parts.append(w["standard"])
+        return status, word, why, ", ".join(parts)
+
+
 # ---- DNS health / intelligence ---------------------------------------------
+# Lookup-time buckets (upper edges, ms) for the per-resolver histogram.
+DNS_BUCKETS = (10, 25, 50, 100, 250, 500, 1000, float("inf"))
+DNS_BUCKET_LABELS = ("<10", "10–25", "25–50", "50–100", "100–250",
+                     "250–500", "0.5–1 s", ">1 s")
+
+
+def dns_bucket(ms):
+    for i, edge in enumerate(DNS_BUCKETS):
+        if ms < edge:
+            return i
+    return len(DNS_BUCKETS) - 1
+
+
 class DnsTracker:
     """Matches DNS queries to responses (latency), counts failures per
     server, tracks which server each device uses, and notices changes.
@@ -9586,7 +10615,8 @@ class DnsTracker:
             s = self.servers[ip] = {"queries": 0, "responses": 0, "nx": 0,
                                     "servfail": 0, "timeouts": 0,
                                     "lat": deque(maxlen=60), "first": 0.0,
-                                    "last": 0.0, "clients": set()}
+                                    "last": 0.0, "clients": set(),
+                                    "hist": [0] * len(DNS_BUCKETS)}
         return s
 
     def on_query(self, ts, client_ip, server_ip, info, dev_key=""):
@@ -9645,6 +10675,7 @@ class DnsTracker:
             return None
         ms = max(0.0, (ts - ent[0]) * 1000.0)
         s["lat"].append(ms)
+        s["hist"][dns_bucket(ms)] += 1
         self.latencies.append((ts, ms))
         if ms > 1000:
             self.slow.append((info.get("qname", ""), ms, ts, server_ip))
@@ -9676,6 +10707,16 @@ class DnsTracker:
         vals = [ms for ts, ms in self.latencies
                 if now is None or now - ts <= window]
         return (statistics.median(vals), len(vals)) if vals else (None, 0)
+
+    def histogram(self, server=None):
+        """Lookup-time counts per DNS_BUCKETS (all servers or one)."""
+        out = [0] * len(DNS_BUCKETS)
+        for ip, s in self.servers.items():
+            if server and ip != server:
+                continue
+            for i, n in enumerate(s.get("hist") or ()):
+                out[i] += n
+        return out
 
     def summary_rows(self):
         out = []
@@ -9709,6 +10750,9 @@ class DnsTracker:
             srv["lat"].extend(float(x) for x in (s.get("lat") or [])[-60:])
             srv["first"] = float(s.get("first") or 0)
             srv["last"] = float(s.get("last") or 0)
+            hist = s.get("hist") or []
+            if isinstance(hist, list) and len(hist) == len(DNS_BUCKETS):
+                srv["hist"] = [int(x or 0) for x in hist]
         for name, n in d.get("top_domains") or []:
             self.domains[name] = n
         self.encrypted_seen.update(d.get("encrypted") or {})
@@ -10437,6 +11481,8 @@ class NetworkModel:
         self.correlator = LookupCorrelator()
         self.obs_seq = 0
         self.obs_recent = deque(maxlen=20000)
+        self.switch_ports = {}       # (proto, chassis) → what LLDP/CDP said
+        self.rtt_samples = deque(maxlen=2000)  # (ts, rtt, remote, dev, fid)
         self.obs_by_subject = {}
         self.obs_sink = False          # a history store wants observations
         self.obs_pending = []
@@ -10724,6 +11770,62 @@ class NetworkModel:
             self._classify_dirty.add(dev.key)
 
     # ---- ingest -----------------------------------------------------------
+    def _observe_switch(self, d, ts):
+        """A switch (or AP / router) announced itself on this link: it
+        tells which of ITS ports this computer is plugged into."""
+        info = d["lldp"]
+        key = (info["proto"], info["chassis"] or info["system"])
+        cur = self.switch_ports.get(key)
+        rec = dict(info)
+        rec.update({"src_mac": d["src_mac"], "last": ts,
+                    "first": cur["first"] if cur else ts,
+                    "count": (cur["count"] + 1) if cur else 1,
+                    "pkt": d.get("no")})
+        self.switch_ports[key] = rec
+        if cur is None or cur.get("port") != rec["port"] or \
+                cur.get("vlan") != rec["vlan"]:
+            name = rec["system"] or rec["chassis"]
+            port = rec["port_desc"] or rec["port"]
+            text = (f"Plugged into {name}, port {port or '?'}"
+                    + (f", VLAN {rec['vlan']}" if rec["vlan"] else "")
+                    + f" (announced by the switch, {rec['proto']})")
+            if cur is not None:
+                text = (f"Moved to {name}, port {port or '?'} (was "
+                        f"{cur.get('port_desc') or cur.get('port')})")
+            self.push_timeline("network", "INFO" if cur is None else
+                               "WARNING", text)
+        self.observe("lldp", "switch:" + key[1], ts,
+                     {"proto": rec["proto"], "port": rec["port"],
+                      "system": rec["system"], "vlan": rec["vlan"],
+                      "mgmt": rec["mgmt"]})
+
+    def _note_rtt(self, f, ts):
+        if f.remote_public:
+            self.rtt_samples.append((ts, f.rtt, f.remote_ip, f.device_key,
+                                     f.fid))
+
+    def rtt_stats(self, now=None, window=900):
+        """Median / 90th percentile handshake round trip (ms) of recent
+        Internet connections, and how many samples."""
+        now = self.now() if now is None else now
+        vals = sorted(r * 1000 for t, r, *_x in self.rtt_samples
+                      if now - t <= window)
+        if not vals:
+            return None, None, 0
+        p90 = vals[min(len(vals) - 1, int(len(vals) * 0.9))]
+        return statistics.median(vals), p90, len(vals)
+
+    def switch_summary(self, now=None):
+        """The freshest LLDP/CDP neighbour, or None."""
+        if not self.switch_ports:
+            return None
+        rec = max(self.switch_ports.values(), key=lambda r: r["last"])
+        ttl = rec.get("ttl") or 180
+        now = self.now() if now is None else now
+        rec = dict(rec)
+        rec["fresh"] = now - rec["last"] <= max(ttl, 60) * 1.5
+        return rec
+
     def ingest(self, d):
         """Analyse one decoded packet. Returns the flow id (or None)."""
         ts = d["time"]
@@ -10774,6 +11876,8 @@ class NetworkModel:
             self._observe_mdns(d, ts)
         if d["ssdp"] and src_local and not d["ssdp"].get("search"):
             self._observe_ssdp(d, ts)
+        if d.get("lldp") and d["src_mac"] not in self.my_macs:
+            self._observe_switch(d, ts)
         if d["proto"] == "NBNS" and d["learns"] and src_local:
             for ip, name in d["learns"]:
                 if ip == src_ip:
@@ -11212,11 +12316,19 @@ class NetworkModel:
             fl = d["tcp_flags"]
             if fl & 0x02 and not fl & 0x10:
                 f.syn = True
+                f.syns += 1
+                if f.syn_ts is None:
+                    f.syn_ts = ts
                 f.initiator = "local" if out_dir else "remote"
                 if out_dir and dev is not None:
                     self.scans.attempt(dev.key, ts, f.remote_ip,
                                        f.remote_port)
             elif fl & 0x02 and fl & 0x10:
+                if not f.synack and f.syn_ts is not None and f.syns == 1 \
+                        and ts >= f.syn_ts and f.initiator == "local":
+                    # Karn's rule: a re-sent SYN makes the time ambiguous
+                    f.rtt = ts - f.syn_ts
+                    self._note_rtt(f, ts)
                 f.synack = True
                 if not out_dir and f.device_key:
                     self.scans.reply(f.device_key, f.remote_ip,
@@ -11243,6 +12355,24 @@ class NetworkModel:
                     self._note_reset(f, ts)
             elif f.state not in ("Reset",):
                 f.state = "Open" if f.synack or f.packets_in else "Opening"
+            pl = d["payload_len"]
+            if pl:
+                if out_dir:
+                    f.payload_out += pl
+                else:
+                    f.payload_in += pl
+            elif fl == 0x10 and d.get("ack") is not None:
+                # a pure ACK: the same ACK and window again = duplicate
+                cur = (d["ack"], d["win"])
+                last = f.ack_out if out_dir else f.ack_in
+                if last == cur:
+                    f.dupacks += 1
+                if out_dir:
+                    f.ack_out = cur
+                else:
+                    f.ack_in = cur
+            if d.get("win") == 0 and not fl & 0x06:
+                f.zero_win += 1
             if d["payload_len"] and d["seq"] is not None:
                 end = (d["seq"] + d["payload_len"]) & 0xffffffff
                 prev = f.seq_out if out_dir else f.seq_in
@@ -11250,6 +12380,7 @@ class NetworkModel:
                     delta = (end - prev) & 0xffffffff
                     if delta == 0 or delta > 0x7fffffff:
                         f.retrans += 1
+                        f.retx_bytes += d["payload_len"]
                     else:
                         prev = end
                 else:
@@ -11354,16 +12485,18 @@ class NetworkModel:
         if tls and tls.get("sni") and tls.get("kind") == "client" and \
                 is_public_ip(d["dst_ip"]):
             sni = tls["sni"]
+            quic = tls.get("via") == "quic"
             self.register_website(sni, d["dst_ip"], src_dev,
-                                  "TLS SNI", ts, connection=True,
-                                  encrypted=True)
+                                  "QUIC first packet" if quic else "TLS SNI",
+                                  ts, connection=True, encrypted=True)
             self.correlator.note_resolution("", sni, d["dst_ip"], ts)
             if src_dev is not None:
                 self.tie(src_dev.key, sni, AS_CONNECTED, ts)
                 self.observe("tls_sni", src_dev.key, ts,
                              {"domain": sni, "ip": d["dst_ip"],
                               "flow": flow.fid if flow else None,
-                              "ech": bool(tls.get("ech"))},
+                              "ech": bool(tls.get("ech")),
+                              "via": "quic" if quic else "tls"},
                              also=("site:" + sni,))
         if d["http_host"] and is_public_ip(d["dst_ip"]):
             host = d["http_host"]
@@ -11649,10 +12782,14 @@ class NetworkModel:
             tag = "secure"
             did = f"🔐 {d['text']}"
         elif proto == "QUIC":
-            if not (d["tcp_flags"] is None and d["payload_len"] > 1000):
+            if d["tls"] and d["tls"].get("sni"):
+                tag = "secure"
+                did = f"🔐 {d['text']}"
+            elif not (d["tcp_flags"] is None and d["payload_len"] > 1000):
                 return
-            tag = "secure"
-            did = "🔐 opened a fast secure connection (QUIC)"
+            else:
+                tag = "secure"
+                did = "🔐 opened a fast secure connection (QUIC)"
         elif proto == "HTTP":
             tag = "unsecure"
             did = f"⚠️ {d['text']}"
@@ -11966,7 +13103,7 @@ def _default_config():
         "updates": {"check_automatically": False, "repo": "",
                     "allow_self_update": False},
         "privacy": {"geoip_enabled": False, "local_asn_db": False,
-                    "auto_download_reference": True},
+                    "auto_download_reference": True, "quic_names": True},
         "history": {"enabled": False, "retention": "30 days",
                     "custom_days": 14, "save_raw_packets": False,
                     "packet_ring": False, "packet_ring_mb": 200},
@@ -14098,6 +15235,16 @@ SETTINGS_PAGES = [
              {"type": "action", "actions": [
                  ("Refresh now", "refresh_data")]},
          ]},
+         {"title": "What is read from packets", "controls": [
+             {"key": "privacy.quic_names", "type": "bool",
+              "label": "Read site names from HTTP/3 (QUIC) first packets",
+              "help": "A browser's first HTTP/3 packet names the site, "
+                      "protected only by keys anyone can compute from the "
+                      "packet (it is designed to be readable by the "
+                      "network, like the name in a normal HTTPS "
+                      "handshake). Nothing after that first packet can be "
+                      "read. Turn off to treat HTTP/3 as fully opaque."},
+         ]},
          {"title": "Country & provider lookup", "controls": [
              {"key": "privacy.local_asn_db", "type": "bool",
               "label": "Offline country/provider database (recommended)",
@@ -15193,6 +16340,44 @@ def enable_sorting(tree, on_sort=None):
     for c in tree["columns"]:
         tree.heading(c, command=lambda cc=c: do_sort(cc))
     return state
+
+
+def make_scrollable(parent, bg="#ffffff"):
+    """A frame that scrolls vertically (wheel, scrollbar). → (outer to
+    pack, inner to fill)."""
+    outer = tk.Frame(parent, bg=bg)
+    canvas = tk.Canvas(outer, bg=bg, highlightthickness=0)
+    vs = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+    canvas.configure(yscrollcommand=vs.set)
+    vs.pack(side="right", fill="y")
+    canvas.pack(side="left", fill="both", expand=True)
+    inner = tk.Frame(canvas, bg=bg)
+    win = canvas.create_window((0, 0), window=inner, anchor="nw")
+    inner.bind("<Configure>", lambda e: canvas.configure(
+        scrollregion=canvas.bbox("all")))
+    canvas.bind("<Configure>", lambda e: canvas.itemconfigure(
+        win, width=e.width))
+    seqs = ("<MouseWheel>", "<Button-4>", "<Button-5>")
+
+    def wheel(e):
+        num = getattr(e, "num", 0)
+        step = -1 if num == 4 else 1 if num == 5 else \
+            (-1 if getattr(e, "delta", 0) > 0 else 1)
+        with contextlib.suppress(tk.TclError):
+            canvas.yview_scroll(step * 2, "units")
+
+    def bind(_e=None):
+        for sq in seqs:
+            canvas.bind_all(sq, wheel)
+
+    def unbind(_e=None):
+        for sq in seqs:
+            with contextlib.suppress(tk.TclError):
+                canvas.unbind_all(sq)
+    outer.bind("<Enter>", bind)
+    outer.bind("<Leave>", unbind)
+    outer.canvas = canvas
+    return outer, inner
 
 
 def make_tree(parent, columns, bg="#ffffff", show="headings",
@@ -16332,6 +17517,7 @@ TIMELINE_CATEGORY = {
     "website": "Websites", "alert": "Alerts", "dns change": "DNS",
     "capture": "Network & capture", "interface": "Network & capture",
     "internet": "Network & capture", "vpn": "Network & capture",
+    "network": "Network & capture", "wifi": "Network & capture",
 }
 
 
@@ -16809,7 +17995,8 @@ class WebsitesTab(BaseTab):
             values=self.device_choices()), add="+")
         self.src_var = tk.StringVar(value="Any source")
         self._combo(bar, "Seen via:", self.src_var,
-                    ["Any source", "DNS", "TLS SNI", "HTTP Host"], 11)
+                    ["Any source", "DNS", "TLS SNI", "QUIC first packet",
+                     "HTTP Host"], 15)
         self.ev_var = tk.StringVar(value="Any evidence")
         self._combo(bar, "Evidence:", self.ev_var,
                     ["Any evidence", "Connected", "Looked up only",
@@ -17188,6 +18375,10 @@ class ConnectionsTab(BaseTab):
                 bits.append(f"RST×{f.rst}")
             if f.retrans:
                 bits.append(f"retx×{f.retrans}")
+            if f.rtt is not None:
+                bits.append(f"rtt {f.rtt * 1000:.0f}ms")
+            if f.zero_win:
+                bits.append(f"0win×{f.zero_win}")
             tcp = " ".join(bits)
         prov = " · ".join(x for x in (f"AS{f.asn} {f.org}".strip()
                                            if f.asn else f.org,
@@ -18041,18 +19232,43 @@ class MapTab(BaseTab):
 
 
 # ---- Health ------------------------------------------------------------------
+# When several things look wrong, the one most likely to explain the
+# others comes first: a weak Wi-Fi signal causes loss, retransmissions,
+# slow lookups and high latency, not the other way round.
+CULPRIT_ORDER = ("link", "wifi", "gateway", "loss", "dhcp", "dupip",
+                 "internet", "dns", "latency", "retrans", "resets",
+                 "reconnects", "switch", "driver", "vpn")
+
+
+def likely_culprit(results):
+    rank = {"Needs attention": 2, "Degraded": 1}
+    bad = [k for k in CULPRIT_ORDER if rank.get((results.get(k) or
+                                                 ("",))[0], 0)]
+    if not bad:
+        return None
+    top = max(rank[results[k][0]] for k in bad)
+    for k in bad:                         # most severe, then most causal
+        if rank[results[k][0]] == top:
+            return k
+    return bad[0]
+
+
 class HealthTab(BaseTab):
     name, label_key = "health", "tab_health"
-    CHECKS = (("overall", "Overall"), ("gateway", "Router reachable"),
+    CHECKS = (("overall", "Overall"), ("wifi", "Wi-Fi signal (this "
+                                               "computer)"),
+              ("gateway", "Router reachable"),
               ("internet", "Internet reachable"), ("dns", "Website lookups "
                                                          "(DNS)"),
               ("loss", "Packet loss (from checks)"),
+              ("latency", "Internet round trip"),
               ("resets", "Connection resets"),
               ("retrans", "Re-sent data (retransmissions)"),
               ("dhcp", "Address assignment (DHCP)"),
               ("dupip", "Duplicate addresses"),
               ("reconnects", "Devices reconnecting"),
-              ("link", "Network card"), ("driver", "Capture driver"),
+              ("link", "Network card"), ("switch", "Wired switch port"),
+              ("driver", "Capture driver"),
               ("vpn", "VPN"))
 
     def build(self):
@@ -18072,8 +19288,8 @@ class HealthTab(BaseTab):
             fill="x", pady=(2, 8))
         body = tk.Frame(outer, bg=WHITE)
         body.pack(fill="both", expand=True)
-        left = tk.Frame(body, bg=WHITE)
-        left.pack(side="left", fill="both", expand=True)
+        left_outer, left = make_scrollable(body, WHITE)
+        left_outer.pack(side="left", fill="both", expand=True)
         self.rows = {}
         for key, title in self.CHECKS:
             row = tk.Frame(left, bg="#f6f7fa", padx=10, pady=6,
@@ -18090,6 +19306,8 @@ class HealthTab(BaseTab):
             ex = tk.Label(row, text="", bg="#f6f7fa", fg="#333333",
                           anchor="w", justify="left", wraplength=560)
             ex.pack(side="left", fill="x", expand=True)
+            row.bind("<Configure>", lambda e, lb=ex: lb.configure(
+                wraplength=max(220, e.width - 440)))
             self.rows[key] = (st, ex, row)
         right = tk.Frame(body, bg=WHITE, padx=12)
         right.pack(side="left", fill="both")
@@ -18108,8 +19326,59 @@ class HealthTab(BaseTab):
                     ("lat", "Typical ms", 75, "e", False),
                     ("fail", "Failed", 55, "e", False),
                     ("nx", "Not found", 70, "e", False)])
-        self.dns_tree.configure(height=8)
-        wrap.pack(fill="both", expand=True)
+        self.dns_tree.configure(height=4)
+        wrap.pack(fill="x")
+        self.dns_tree.bind("<<TreeviewSelect>>", lambda e: self._draw_hist())
+        self.hist_title = tk.Label(right, text="Lookup times (all servers)",
+                                   bg=WHITE, fg="#2b3a56",
+                                   font=("TkDefaultFont", 11, "bold"))
+        self.hist_title.pack(anchor="w", pady=(10, 0))
+        self.hist = tk.Canvas(right, width=430, height=112, bg=WHITE,
+                              highlightthickness=0)
+        self.hist.pack(anchor="w")
+        self.hist.bind("<Configure>", lambda e: self._draw_hist())
+
+    def _draw_hist(self):
+        c = self.hist
+        t = self.t
+        sel = self.dns_tree.selection()
+        server = self.dns_tree.set(sel[0], "srv") if sel else None
+        counts = self.model.dns.histogram(server)
+        with contextlib.suppress(tk.TclError):
+            self.hist_title.configure(
+                text="Lookup times (" + (server or "all servers") + ")")
+            c.configure(bg=t["tab_bg"])
+            c.delete("all")
+            w = max(300, c.winfo_width())
+            h = int(c.cget("height"))
+            n = len(counts)
+            total = sum(counts)
+            if not total:
+                c.create_text(w // 2, h // 2, text="No timed lookups yet",
+                              fill=t["muted_fg"])
+                return
+            top = max(counts)
+            bw = (w - 20) / n
+            base = h - 22
+            slow = float(self.app.config.get("dns.slow_ms", 800))
+            for i, v in enumerate(counts):
+                x0 = 10 + i * bw + 3
+                x1 = 10 + (i + 1) * bw - 3
+                bh = 0 if not top else (base - 14) * v / top
+                edge = DNS_BUCKETS[i - 1] if i else 0
+                color = t["danger_fg"] if edge >= slow else \
+                    t["warn_fg"] if edge >= 250 else t["accent"]
+                if v:
+                    c.create_rectangle(x0, base - bh, x1, base, fill=color,
+                                       outline="")
+                    c.create_text((x0 + x1) / 2, base - bh - 7,
+                                  text=f"{v / total:.0%}", fill=t["text_fg"],
+                                  font=("TkDefaultFont", 7))
+                c.create_text((x0 + x1) / 2, base + 9,
+                              text=DNS_BUCKET_LABELS[i], fill=t["muted_fg"],
+                              font=("TkDefaultFont", 7))
+            c.create_text(w - 10, h - 4, text="ms", anchor="se",
+                          fill=t["muted_fg"], font=("TkDefaultFont", 7))
 
     STATUS_STYLE = {"Healthy": ("✔ Healthy", "good_fg"),
                     "Degraded": ("⚠ Degraded", "warn_fg"),
@@ -18137,11 +19406,22 @@ class HealthTab(BaseTab):
         allowed = app.health_checks_allowed()
         with contextlib.suppress(tk.TclError):
             self.run_btn.state(["!disabled"] if allowed else ["disabled"])
+        sel = self.dns_tree.selection()
+        keep = self.dns_tree.set(sel[0], "srv") if sel else None
         self.dns_tree.delete(*self.dns_tree.get_children())
         for ip, q, resp, nx, fail, lat in self.model.dns.summary_rows()[:20]:
-            self.dns_tree.insert("", "end", values=(
+            iid = self.dns_tree.insert("", "end", values=(
                 ip, q, f"{lat:.0f}" if lat is not None else "—",
                 fail, nx))
+            if ip == keep:
+                self.dns_tree.selection_set(iid)
+        culprit = getattr(app, "health_culprit", None)
+        for key, (_st, _ex, row) in self.rows.items():
+            with contextlib.suppress(tk.TclError):
+                row.configure(highlightbackground=self.t["danger_fg"]
+                              if key == culprit else self.t["border"],
+                              highlightthickness=2 if key == culprit else 1)
+        self._draw_hist()
 
 
 
@@ -19632,6 +20912,10 @@ class MiniWireshark:
             if self.config.get("history.enabled", False) else None
         self.packet_ring = None
         self._sync_packet_ring()
+        self.wifi = WifiProbe()
+        self._wifi_seen = 0
+        QUIC_NAMES["enabled"] = bool(self.config.get("privacy.quic_names",
+                                                     True))
         self.geoip = GeoIPService(self._geoip_on_result)
         self.geoip.set_enabled(self.config.get("privacy.geoip_enabled",
                                                False))
@@ -22320,12 +23604,63 @@ class MiniWireshark:
                                 f"({self.count} analysed)…")
         with contextlib.suppress(tk.TclError, AttributeError):
             self.footer_var.set(self.footer_text())
+        self._tick_wifi()
         if self.inspector_visible and getattr(self, "_insp_tick", 0) % 5 \
                 == 0:
             with contextlib.suppress(tk.TclError):
                 self.inspector.refresh()
         self._insp_tick = getattr(self, "_insp_tick", 0) + 1
         self.root.after(1000, self._tick_status)
+
+    DEMO_WIFI = {"source": "demo", "iface": "wlan0",
+                 "ssid": "DemoNet (simulated)", "bssid": "02:00:5e:aa:bb:cc",
+                 "rssi": -78.0, "signal_pct": 44, "rx_mbps": 65.0,
+                 "tx_mbps": 58.5, "channel": 11, "band": "2.4 GHz",
+                 "standard": "802.11n"}
+
+    def _wifi_view(self):
+        """The Wi-Fi reading to show: the real one when live, a simulated
+        weak link in Demo Mode (so the Health tab can show a culprit)."""
+        if self.data_mode == "live":
+            return self.wifi
+        if self.data_mode == "demo":
+            p = WifiProbe()
+            p.last = dict(self.DEMO_WIFI)
+            return p
+        return None
+
+    def _tick_wifi(self):
+        """Keep this computer's Wi-Fi reading fresh while watching live,
+        and note roaming and a signal turning weak on the timeline."""
+        if self.data_mode != "live":
+            return
+        obj = self.iface_map.get(self.current_iface_label) \
+            if self.current_iface_label else None
+        self.wifi.refresh(iface_name(obj), iface_desc(obj))
+        if self.wifi.seq == self._wifi_seen:
+            return
+        self._wifi_seen = self.wifi.seq
+        w, prev = self.wifi.last, getattr(self, "_wifi_prev", None)
+        self._wifi_prev = w
+        if not w or not prev:
+            return
+        if w.get("bssid") and prev.get("bssid") and \
+                w["bssid"] != prev["bssid"]:
+            same = w.get("ssid") == prev.get("ssid")
+            self.model.push_timeline(
+                "wifi", "INFO", ("Wi-Fi moved to another access point of "
+                                 f"“{w.get('ssid')}”" if same else
+                                 f"Wi-Fi joined “{w.get('ssid')}”")
+                + f" ({prev['bssid']} → {w['bssid']})")
+        r0, r1 = prev.get("rssi"), w.get("rssi")
+        if r0 is not None and r1 is not None:
+            if r0 >= -75 > r1:
+                self.model.push_timeline(
+                    "wifi", "WARNING", f"This computer's Wi-Fi signal "
+                    f"became weak ({r1:.0f} dBm, was {r0:.0f} dBm)")
+            elif r0 < -75 <= r1:
+                self.model.push_timeline(
+                    "wifi", "INFO", f"Wi-Fi signal recovered ({r1:.0f} dBm)")
 
     def status_text(self):
         m = self.model
@@ -22595,6 +23930,43 @@ class MiniWireshark:
                 "less about individual Internet destinations.")
         else:
             out["vpn"] = ("Info", "No VPN detected.")
+        wp = self._wifi_view()
+        ws = wp.summary() if wp is not None else None
+        if ws:
+            status, _word, why, facts = ws
+            out["wifi"] = (status, f"{facts}. {why}")
+        elif live:
+            out["wifi"] = ("Info", "Not on Wi-Fi (or the system didn't "
+                                   "report it).")
+        elif self.data_mode == "demo":
+            out["wifi"] = ("Info", "Simulated.")
+        else:
+            out["wifi"] = ("Unknown", "Not capturing live.")
+        med_rtt, p90, n_rtt = m.rtt_stats(now)
+        if n_rtt >= 5:
+            out["latency"] = ("Healthy" if med_rtt < 80 else "Degraded" if
+                              med_rtt < 200 else "Needs attention",
+                              f"Typical {med_rtt:.0f} ms, slowest tenth "
+                              f"{p90:.0f} ms, from {n_rtt} connection "
+                              f"handshakes (measured passively).")
+        else:
+            out["latency"] = ("Unknown", "Needs a few new connections "
+                                         "first.")
+        sw = m.switch_summary(now)
+        if sw:
+            name = sw["system"] or sw["chassis"]
+            out["switch"] = ("Healthy" if sw["fresh"] else "Info",
+                             f"Plugged into “{name}”, port "
+                             f"{sw['port_desc'] or sw['port'] or '?'}"
+                             + (f", VLAN {sw['vlan']}" if sw["vlan"] else "")
+                             + f" (announced by the switch via "
+                               f"{sw['proto']})"
+                             + ("" if sw["fresh"] else
+                                " — not heard recently"))
+        else:
+            out["switch"] = ("Info", "No switch has announced itself on "
+                                     "this link (normal on Wi-Fi and with "
+                                     "most home routers).")
         worst = "Healthy"
         order = {"Healthy": 0, "Info": 0, "Unknown": 0, "Degraded": 1,
                  "Needs attention": 2}
@@ -22607,10 +23979,22 @@ class MiniWireshark:
         if known == 0:
             worst = "Unknown"
         names = {k: t for k, t in HealthTab.CHECKS}
-        out["overall"] = (worst, "Everything checked looks fine." if
-                          worst == "Healthy" else
-                          "Not enough information yet." if worst == "Unknown"
-                          else "Look at: " + ", ".join(names[k] for k in bad))
+        culprit = likely_culprit(out)
+        if worst == "Healthy":
+            text = "Everything checked looks fine."
+        elif worst == "Unknown":
+            text = "Not enough information yet."
+        else:
+            parts = []
+            if culprit:
+                parts.append(f"Likely culprit: {names[culprit]} — "
+                             f"{out[culprit][1]}")
+            others = [names[k] for k in bad if k != culprit and k in names]
+            if others:
+                parts.append("Also look at: " + ", ".join(others) + ".")
+            text = " ".join(parts)
+        out["overall"] = (worst, text)
+        self.health_culprit = culprit
         return out
 
     def connection_info_text(self):
@@ -22628,6 +24012,19 @@ class MiniWireshark:
                                                m.v6_prefixes[:2]) or "—"),
                  "Why this card: " + (explain_choice(rec)[15:] if rec
                                       else "—")]
+        wp = self._wifi_view()
+        w = wp.last if wp is not None else None
+        if w:
+            lines.append("Wi-Fi        : " + (w.get("ssid") or "?")
+                         + (f" via {w['bssid']}" if w.get("bssid") else ""))
+            summ = wp.summary()
+            if summ:
+                lines.append("               " + summ[3])
+        sw = self.model.switch_summary()
+        if sw:
+            lines.append("Switch port  : " + (sw["system"] or sw["chassis"])
+                         + f" / {sw['port_desc'] or sw['port']}"
+                         + (f" (VLAN {sw['vlan']})" if sw["vlan"] else ""))
         return "\n".join(lines)
 
     # ---- one-line summaries for the dashboard ---------------------------------
@@ -23131,6 +24528,10 @@ class MiniWireshark:
         if "TLS SNI" in w.sources:
             how.append("seen in the secure-connection handshake (the site "
                        "name only)")
+        if "QUIC first packet" in w.sources:
+            how.append("read from the first packet of an HTTP/3 (QUIC) "
+                       "connection — that packet is protected only by "
+                       "public keys, so the name is visible to the network")
         if "DNS" in w.sources:
             how.append("looked up through DNS")
         if "HTTP Host" in w.sources:
@@ -23238,7 +24639,12 @@ class MiniWireshark:
                         f"{fmt_clock(f.last_seen)})"),
             ("Status", f.status_text() + (
                 f"\nRe-sent data detected {f.retrans} time(s) (approximate)."
-                if f.retrans else "")),
+                if f.retrans else "") + (
+                f"\nMeasured: {f.tcp_health_text()}." if f.transport == "TCP"
+                and f.tcp_health_text() else "") + (
+                "\nThe receiver said it was full (zero window) — the device "
+                "or app couldn't keep up, which is not a network problem."
+                if f.zero_win else "")),
             ("Security", f.encryption_text() + (
                 f" — {f.tls_version}" if f.tls_version else "") +
              (f"; application protocol {f.alpn}" if f.alpn else "") +
@@ -23980,6 +25386,7 @@ class MiniWireshark:
 
     def _apply_runtime_settings(self):
         cfg = self.config
+        QUIC_NAMES["enabled"] = bool(cfg.get("privacy.quic_names", True))
         setup_logging(cfg.get("diagnostics.verbose_logging", False))
         new_max = max(500, int(cfg.get("capture.max_stored_events",
                                        self.MAX_ROWS)))
@@ -25333,6 +26740,25 @@ class DemoGenerator(threading.Thread):
                            DNSRR(rrname=f"{name.replace(' ', '-')}.local",
                                  rdata=ip)]))
 
+    def _visit_quic(self, dev, site, sip, sp, size):
+        """An HTTP/3 visit: the first packet names the site (readable by
+        design), everything after it is opaque."""
+        ip, mac = dev[0], dev[1]
+        base = Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=sip) / \
+            UDP(sport=sp, dport=443)
+        back = Ether(src=self.GW[1], dst=mac) / IP(src=sip, dst=ip, ttl=54) \
+            / UDP(sport=443, dport=sp)
+        dcid = os.urandom(8)
+        self._emit(base / Raw(quic_build_initial(
+            dcid, os.urandom(4), tls_client_hello(site))))
+        time.sleep(random.uniform(0.018, 0.045))
+        sent = 0
+        while sent < size and not self.stop_flag:
+            chunk = min(1250, size - sent)
+            self._emit(back / Raw(b"\x40" + os.urandom(8) +
+                                  b"\x00" * (chunk - 9)))
+            sent += chunk
+
     def _visit(self, dev, site, sip, size=40000):
         ip, mac = dev[0], dev[1]
         self.port += 1
@@ -25349,7 +26775,11 @@ class DemoGenerator(threading.Thread):
         seq = random.randint(1000, 10 ** 9)
         base = Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=sip)
         back = Ether(src=self.GW[1], dst=mac) / IP(src=sip, dst=ip, ttl=54)
+        if random.random() < 0.3:
+            self._visit_quic(dev, site, sip, sp, size)
+            return
         self._emit(base / TCP(sport=sp, dport=443, flags="S", seq=seq))
+        time.sleep(random.uniform(0.018, 0.045))     # an Internet round trip
         self._emit(back / TCP(sport=443, dport=sp, flags="SA", seq=7,
                               ack=seq + 1))
         hello = build_client_hello(site)
@@ -26703,11 +28133,13 @@ def t_iid_map_reverse_index(ctx):
 
 DIFF_FIELDS = ("proto", "tag", "text", "src", "dst", "src_ip", "dst_ip",
                "src_mac", "dst_mac", "ttl", "ttl_int", "sport", "dport",
-               "ipver", "transport", "tcp_flags", "seq", "payload_len",
+               "ipver", "transport", "tcp_flags", "seq", "ack", "win",
+               "payload_len",
                "dns_names", "doh_hint", "plain_dns", "type_hint",
                "dhcp_msgtype", "arp_op", "dhcp_yiaddr", "dhcp_hostname",
                "dhcp_client_mac", "dhcp", "dns", "tls", "nd", "ssdp",
-               "mdns", "http_host", "service", "service_port", "app_conf",
+               "mdns", "http_host", "lldp", "service", "service_port",
+               "app_conf",
                "encrypted", "cleartext", "multicast", "l2_bcast", "learns",
                "length")
 
@@ -27694,6 +29126,409 @@ def t_newer_python_source(ctx):
     assert mgr.newer_python_source(release=rel(asset("3.15.1"))) is None
 
 
+@self_test()
+def t_quic_rfc9001_vectors(ctx):
+    """RFC 9001 Appendix A.1 keys and A.2 header-protection mask; FIPS-197
+    AES; the pure-Python GCM against `cryptography` when installed."""
+    dcid = bytes.fromhex("8394c8f03e515708")
+    k, iv, hp = quic_initial_keys(dcid)
+    assert k.hex() == "1f369613dd76d5467730efcbe3b1a22d"
+    assert iv.hex() == "fa044b2f42a3fd3b46fb255c"
+    assert hp.hex() == "9f50449e04a0e810283a1e9933adedd2"
+    k, iv, hp = quic_initial_keys(dcid, side="server")
+    assert k.hex() == "cf3a5331653c364c88f0f379b6067e37"
+    assert iv.hex() == "0ac1493ca1905853b0bba03e"
+    assert hp.hex() == "c206b8d9b9f0f37644430b490eeaa314"
+    mask = aes128_ecb_encrypt(bytes.fromhex(
+        "9f50449e04a0e810283a1e9933adedd2"),
+        bytes.fromhex("d1b1c98dd7689fb8ec11d242b123dc9b"))
+    assert mask[:5].hex() == "437b9aec36", mask.hex()
+    assert aes128_ecb_encrypt(
+        bytes.fromhex("000102030405060708090a0b0c0d0e0f"),
+        bytes.fromhex("00112233445566778899aabbccddeeff")).hex() == \
+        "69c4e0d86a7b0430d8cdb78070b4c55a"
+    # GCM: NIST test case 4-style round trip and tamper detection
+    key, nonce = bytes(range(16)), bytes(range(12))
+    for n in (0, 15, 16, 33, 1000):
+        data = bytes((i * 7) & 0xff for i in range(n))
+        sealed = _aes_gcm_py(key, nonce, data, b"hdr", decrypt=False)
+        assert _aes_gcm_py(key, nonce, sealed, b"hdr") == data
+        bad = sealed[:-1] + bytes([sealed[-1] ^ 1])
+        assert _aes_gcm_py(key, nonce, bad, b"hdr") is None
+        assert _aes_gcm_py(key, nonce, sealed, b"other") is None
+    try:
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    except ImportError:
+        return "pure Python only"
+    for n in (0, 1, 17, 1162):
+        data = os.urandom(n)
+        assert AESGCM(key).encrypt(nonce, data, b"a") == \
+            _aes_gcm_py(key, nonce, data, b"a", decrypt=False)
+    return "pure Python = cryptography"
+
+
+def _quic_frames(sni, rip="93.184.215.14", src=("192.168.1.23",
+                                                "da:a1:19:23:45:67"),
+                 split=False, version=QUIC_V1, ech=False, sport=51000,
+                 dcid=b"\x11\x22\x33\x44\x55\x66\x77\x88", t0=1000.0):
+    ch = tls_client_hello(sni, ech=ech, pad_ext=1500 if split else 0)
+    pkts = []
+    if split:
+        a, b = 600, 1100
+        f1 = (b"\x06" + _quic_varint_enc(a) + _quic_varint_enc(b - a) +
+              ch[a:b] + b"\x06" + _quic_varint_enc(0) +
+              _quic_varint_enc(a) + ch[:a])          # out of order, on purpose
+        f2 = b"\x06" + _quic_varint_enc(b) + _quic_varint_enc(
+            len(ch) - b) + ch[b:]
+        pkts.append(quic_build_initial(dcid, b"\x01", b"", 0, version,
+                                       frames=f1))
+        pkts.append(quic_build_initial(dcid, b"\x01", b"", 1, version,
+                                       frames=f2))
+    else:
+        pkts.append(quic_build_initial(dcid, b"\x01", ch, 0, version))
+    out = []
+    for i, q in enumerate(pkts):
+        e = Ether(src=src[1], dst=ScenarioBuilder.GW[1]) / \
+            IP(src=src[0], dst=rip) / UDP(sport=sport, dport=443) / Raw(q)
+        out.append((bytes(e), t0 + i * 0.01, 1))
+    return out
+
+
+@self_test()
+def t_quic_initial_names(ctx):
+    """HTTP/3 first packets: the site name is read the same way by both
+    decoders, also when the ClientHello spans two packets with shuffled
+    frames, for QUIC v2, and with ECH flagged; bad packets give nothing."""
+    if not ctx.scapy_ok:
+        return "skip"
+    cases = [("www.example.com", {}), ("video.example.net",
+                                       {"split": True}),
+             ("v2.example.org", {"version": QUIC_V2}),
+             ("cover.example.com", {"ech": True})]
+    for sni, kw in cases:
+        frames = _quic_frames(sni, **kw)
+        for name, dec in (("fast", lambda r, t, lt, ra: _fast_decode(
+                r, t, lt, ra)), ("scapy", lambda r, t, lt, ra:
+                                 decode_packet(Ether(r), reasm=ra))):
+            ra = TlsReassembler()
+            got = [dec(r, t, lt, ra) for r, t, lt in frames]
+            last = got[-1]
+            assert last["proto"] == "QUIC", (name, last["proto"])
+            assert last["tls"] and last["tls"]["sni"] == sni, \
+                (name, sni, last["tls"], last["text"])
+            assert last["tls"]["via"] == "quic"
+            assert (last["tls"]["quic_version"] == "v2") == \
+                (kw.get("version") == QUIC_V2)
+            assert bool(last["tls"]["ech"]) == bool(kw.get("ech"))
+            assert sni in last["text"] and sni in last["dns_names"]
+            if kw.get("split"):
+                assert got[0]["tls"] is None   # half a ClientHello: wait
+            # a retransmitted first packet is not read twice
+            again = dec(frames[0][0], frames[0][1] + 1, 1, ra)
+            assert again["tls"] is None
+    # tampered packet (bad tag) and garbage give no name, no crash
+    raw = bytearray(_quic_frames("x.example.com")[0][0])
+    raw[-5] ^= 0x40
+    d = _fast_decode(bytes(raw), 1.0, 1, TlsReassembler())
+    assert d["proto"] == "QUIC" and d["tls"] is None
+    rng = random.Random(5)
+    ra = TlsReassembler()
+    base = _quic_frames("y.example.com")[0][0]
+    for _ in range(200):
+        b = bytearray(base)
+        for _k in range(rng.randint(1, 8)):
+            b[rng.randrange(42, len(b))] = rng.randrange(256)
+        d = _fast_decode(bytes(b), 2.0, 1, ra)
+        assert d["proto"] == "QUIC"
+    # turned off in Settings → nothing is read
+    QUIC_NAMES["enabled"] = False
+    try:
+        d = _fast_decode(_quic_frames("z.example.com")[0][0], 3.0, 1,
+                         TlsReassembler())
+        assert d["tls"] is None and "encrypted" in d["text"]
+    finally:
+        QUIC_NAMES["enabled"] = True
+    # budget: a flood of fake Initials is capped per second
+    rd = QuicInitialReader(budget=5)
+    for i in range(50):
+        rd.feed(("a", i), base[42:], 10.0)    # the UDP payload
+    assert rd.decrypted + rd.failed <= 5 and rd.skipped >= 45
+    # the model files the name as a connection, labelled as QUIC
+    m = scenario_model(ctx.cfg(), ctx.frames() + _quic_frames(
+        "h3.example.com", t0=ctx.frames()[-1][1] + 1))
+    w = m.websites.get("h3.example.com")
+    assert w is not None and "QUIC first packet" in w.sources, \
+        (w and w.sources)
+    ph = ScenarioBuilder.PHONE[1]
+    dev = m.device_for(ScenarioBuilder.PHONE[0], ph)
+    assert dev is not None and w.ties.get(dev.key, [""])[0] in (
+        AS_CONNECTED, AS_CONNECTED_LOOKUP), w.ties
+
+
+NETSH_EN = """
+There is 1 interface on the system:
+
+    Name                   : Wi-Fi
+    Description            : Intel(R) Wi-Fi 6 AX201 160MHz
+    GUID                   : 0f0e0d0c-0b0a-0908-0706-050403020100
+    Physical address       : 3c:7c:3f:10:00:10
+    Interface type         : Primary
+    State                  : connected
+    SSID                   : HomeNet
+    AP BSSID               : 7C:10:C9:AA:BB:CC
+    Band                   : 5 GHz
+    Channel                : 44
+    Network type           : Infrastructure
+    Radio type             : 802.11ax
+    Authentication         : WPA2-Personal
+    Receive rate (Mbps)    : 1201
+    Transmit rate (Mbps)   : 960
+    Signal                 : 44%
+    Rssi                   : -78
+    Profile                : HomeNet
+"""
+NETSH_FR = """
+    Nom                    : Wi-Fi
+    Description            : Realtek 8822CE
+    État                   : connecté
+    SSID                   : Maison
+    BSSID                  : 11:22:33:44:55:66
+    Type de radio          : 802.11ac
+    Canal                  : 6
+    Réception (Mbits/s)    : 144,4
+    Transmission (Mbits/s) : 130
+    Signal                 : 80 %
+"""
+NETSH_ES = """
+    Nombre                 : Wi-Fi
+    Estado                 : conectado
+    SSID                   : Casa
+    Canal                  : 149
+    Velocidad de recepción (Mbps)  : 866,7
+    Señal                  : 90%
+"""
+IW_LINK = """Connected to 7c:10:c9:aa:bb:cc (on wlp2s0)
+\tSSID: HomeNet
+\tfreq: 5180.0
+\tRX: 123456 bytes (789 packets)
+\tsignal: -54 dBm
+\trx bitrate: 866.7 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 2
+\ttx bitrate: 780.0 MBit/s VHT-MCS 8 80MHz short GI VHT-NSS 2
+"""
+PROC_WIRELESS = """Inter-| sta-|   Quality        |   Discarded packets  | Missed | WE
+ face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22
+wlp2s0: 0000   56.  -61.  -256        0      0      0      0     12        0
+"""
+MAC_AIRPORT = """Wi-Fi:
+      Interfaces:
+        en0:
+          Status: Connected
+          Current Network Information:
+            HomeNet:
+              PHY Mode: 802.11ax
+              Channel: 36 (5GHz, 80MHz)
+              Network Type: Infrastructure
+              Signal / Noise: -71 dBm / -94 dBm
+              Transmit Rate: 864
+          Other Local Wi-Fi Networks:
+"""
+
+
+@self_test()
+def t_wifi_link_parsers(ctx):
+    w = parse_netsh_wlan(NETSH_EN)
+    assert w["ssid"] == "HomeNet" and w["rssi"] == -78 and \
+        w["signal_pct"] == 44 and w["channel"] == 44, w
+    assert w["rx_mbps"] == 1201 and w["tx_mbps"] == 960 and \
+        w["bssid"] == "7c:10:c9:aa:bb:cc" and w["standard"] == "802.11ax"
+    w = parse_netsh_wlan(NETSH_FR)
+    assert w["ssid"] == "Maison" and w["channel"] == 6 and \
+        w["rx_mbps"] == 144.4 and w["rssi"] == -60.0, w   # from 80 %
+    w = parse_netsh_wlan(NETSH_ES)
+    assert w["ssid"] == "Casa" and w["channel"] == 149 and \
+        w["signal_pct"] == 90 and w["rx_mbps"] == 866.7, w
+    assert parse_netsh_wlan("    Name : Wi-Fi\n    State : disconnected\n") \
+        is None
+    w = parse_iw_link(IW_LINK, "wlp2s0")
+    assert w["rssi"] == -54 and w["channel"] == 36 and w["band"] == \
+        "5 GHz" and w["rx_mbps"] == 866.7 and w["standard"] == "802.11ac"
+    assert parse_iw_link("Not connected.") is None
+    w = parse_proc_wireless(PROC_WIRELESS, "wlp2s0")
+    assert w["rssi"] == -61, w
+    w = parse_macos_airport(MAC_AIRPORT)
+    assert w["ssid"] == "HomeNet" and w["rssi"] == -71 and \
+        w["channel"] == 36 and w["noise"] == -94 and w["tx_mbps"] == 864
+    assert wifi_channel_from_mhz(2437) == (6, "2.4 GHz")
+    assert wifi_channel_from_mhz(5955) == (1, "6 GHz")
+    assert wifi_quality(-55)[0] == "Healthy"
+    assert wifi_quality(-70)[0] == "Degraded"
+    assert wifi_quality(-78)[0] == "Needs attention" and "likely" in \
+        wifi_quality(-78)[2]
+    p = WifiProbe()
+    p.last = parse_netsh_wlan(NETSH_EN)
+    st, word, why, facts = p.summary()
+    assert st == "Needs attention" and "-78 dBm" in facts and \
+        "channel 44" in facts
+    # the weak signal is named as the likely culprit, before the symptoms
+    res = {"wifi": ("Needs attention", "weak"), "dns": ("Degraded", "slow"),
+           "retrans": ("Needs attention", "re-sent"),
+           "gateway": ("Healthy", "")}
+    assert likely_culprit(res) == "wifi"
+    assert likely_culprit({"dns": ("Degraded", ""),
+                           "retrans": ("Degraded", "")}) == "dns"
+    assert likely_culprit({"gateway": ("Healthy", "")}) is None
+
+
+def _lldp_frame(system="core-sw1", port="Gi1/0/12", vlan=20,
+                chassis=b"\x00\x1b\x54\x11\x22\x33", src="00:1b:54:11:22:3c"):
+    def tlv(t, v):
+        return struct.pack(">H", (t << 9) | len(v)) + v
+    body = (tlv(1, b"\x04" + chassis) + tlv(2, b"\x05" + port.encode()) +
+            tlv(3, struct.pack(">H", 120)) + tlv(4, b"Uplink to office") +
+            tlv(5, system.encode()) + tlv(6, b"Switch OS 15.2") +
+            tlv(7, struct.pack(">HH", 0x14, 0x04)) +
+            tlv(8, b"\x05\x01\xc0\xa8\x01\x02\x02\x00\x00\x00\x01\x00") +
+            tlv(127, b"\x00\x80\xc2\x01" + struct.pack(">H", vlan)) +
+            tlv(0, b""))
+    return (bytes.fromhex("0180c200000e") + bytes.fromhex(src.replace(":",
+                                                                     "")) +
+            b"\x88\xcc" + body)
+
+
+def _cdp_frame(device="sw-floor2", port="FastEthernet0/7", vlan=30):
+    def tlv(t, v):
+        return struct.pack(">HH", t, len(v) + 4) + v
+    addr = struct.pack(">I", 1) + b"\x01\x01\xcc" + struct.pack(">H", 4) + \
+        bytes([10, 0, 0, 2])
+    body = (b"\x02\xb4\x00\x00" + tlv(1, device.encode()) + tlv(2, addr) +
+            tlv(3, port.encode()) + tlv(4, struct.pack(">I", 0x28)) +
+            tlv(6, b"cisco WS-C2960") + tlv(0x0a, struct.pack(">H", vlan)))
+    payload = CDP_SNAP + body
+    return (bytes.fromhex("01000ccccccc") + bytes.fromhex("001b54aabbcc") +
+            struct.pack(">H", len(payload)) + payload)
+
+
+@self_test()
+def t_lldp_cdp(ctx):
+    """LLDP / CDP: both decoders read the switch, port and VLAN; the model
+    records it and notices when the cable moves to another port."""
+    if not ctx.scapy_ok:
+        return "skip"
+    for raw, proto, name, port, vlan in (
+            (_lldp_frame(), "LLDP", "core-sw1", "Gi1/0/12", 20),
+            (_cdp_frame(), "CDP", "sw-floor2", "FastEthernet0/7", 30)):
+        a = _fast_decode(raw, 1.0, 1, None)
+        b = decode_packet(Ether(raw))
+        for d in (a, b):
+            assert d["proto"] == proto and d["lldp"], (proto, d["proto"])
+            info = d["lldp"]
+            assert info["system"] == name and info["port"] == port and \
+                info["vlan"] == vlan, info
+            assert name in d["text"] and port in d["text"] or \
+                "Uplink" in d["text"], d["text"]
+        assert a["lldp"] == b["lldp"] and a["text"] == b["text"]
+    info = parse_lldp(_lldp_frame()[14:])
+    assert info["chassis"] == "00:1b:54:11:22:33" and info["mgmt"] == \
+        "192.168.1.2" and "switch" in info["caps"] and info["ttl"] == 120
+    info = parse_cdp(_cdp_frame()[22:])
+    assert info["mgmt"] == "10.0.0.2" and "switch" in info["caps"] and \
+        info["platform"] == "cisco WS-C2960"
+    # truncated / hostile frames never crash
+    rng = random.Random(9)
+    base = _lldp_frame()
+    for _ in range(300):
+        cut = bytearray(base[:rng.randint(14, len(base))])
+        for _k in range(rng.randint(0, 4)):
+            if len(cut) > 15:
+                cut[rng.randrange(14, len(cut))] = rng.randrange(256)
+        l2_discovery(bytes(cut))
+    # model: switch facts, a port change is a timeline warning
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    t = ctx.frames()[-1][1]
+    for i, raw in enumerate((_lldp_frame(), _lldp_frame(),
+                             _lldp_frame(port="Gi1/0/13"))):
+        d = _fast_decode(raw, t + 1 + i, 1, None)
+        d["no"] = 90000 + i
+        m.ingest(d)
+    sw = m.switch_summary(t + 5)
+    assert sw and sw["port"] == "Gi1/0/13" and sw["count"] == 3 and \
+        sw["fresh"], sw
+    tl = [e for e in m.timeline if e["kind"] == "network"]
+    assert any("Plugged into core-sw1" in e["text"] for e in tl)
+    assert any("Moved to core-sw1" in e["text"] and e["severity"] ==
+               "WARNING" for e in tl), [e["text"] for e in tl]
+    assert m.observations_for("switch:00:1b:54:11:22:33")
+
+
+@self_test()
+def t_tcp_measurements(ctx):
+    """Handshake round trip (Karn's rule), duplicate ACKs, zero window,
+    re-sent bytes and goodput; DNS lookup-time histogram."""
+    if not ctx.scapy_ok:
+        return "skip"
+    S = ScenarioBuilder
+    me, mac = S.ME[0], S.ME[1]
+    rip = "93.184.215.14"
+
+    def frame(t, out, flags, seq=0, ack=0, win=65535, load=b"", sport=40500):
+        ip = IP(src=me, dst=rip) if out else IP(src=rip, dst=me)
+        tcp = TCP(sport=sport, dport=443, flags=flags, seq=seq, ack=ack,
+                  window=win) if out else TCP(sport=443, dport=sport,
+                                              flags=flags, seq=seq, ack=ack,
+                                              window=win)
+        e = Ether(src=mac if out else S.GW[1], dst=S.GW[1] if out else mac)
+        return (bytes(e / ip / tcp / Raw(load)) if load else
+                bytes(e / ip / tcp), t, 1)
+    t0 = ctx.frames()[-1][1] + 10
+    fr = [frame(t0, True, "S", seq=100),
+          frame(t0 + 0.042, False, "SA", seq=500, ack=101),
+          frame(t0 + 0.043, True, "A", seq=101, ack=501),
+          frame(t0 + 0.05, False, "PA", seq=501, ack=101, load=b"x" * 1000),
+          frame(t0 + 0.06, True, "A", seq=101, ack=1501),
+          frame(t0 + 0.07, True, "A", seq=101, ack=1501),     # duplicate
+          frame(t0 + 0.08, True, "A", seq=101, ack=1501),     # duplicate
+          frame(t0 + 0.30, False, "PA", seq=501, ack=101, load=b"x" * 1000),
+          frame(t0 + 0.40, True, "A", seq=101, ack=1501, win=0),  # full
+          frame(t0 + 2.0, False, "PA", seq=1501, ack=101, load=b"y" * 500)]
+    # a second connection whose SYN was re-sent: no RTT (ambiguous)
+    fr += [frame(t0 + 3, True, "S", seq=7, sport=40600),
+           frame(t0 + 4, True, "S", seq=7, sport=40600),
+           frame(t0 + 4.03, False, "SA", seq=9, ack=8, sport=40600)]
+    m = scenario_model(ctx.cfg(), ctx.frames() + fr)
+    f = next(x for x in m.flows.all_flows() if x.local_port == 40500)
+    assert f.rtt is not None and abs(f.rtt - 0.042) < 0.002, f.rtt
+    assert f.dupacks == 2, f.dupacks
+    assert f.zero_win == 1, f.zero_win
+    assert f.retrans == 1 and f.retx_bytes == 1000, (f.retrans,
+                                                     f.retx_bytes)
+    assert f.payload_in == 2500
+    gp = f.goodput()
+    assert gp and abs(gp - 1500 / 2.0) < 1, gp
+    assert "round trip 42 ms" in f.tcp_health_text()
+    g = next(x for x in m.flows.all_flows() if x.local_port == 40600)
+    assert g.rtt is None and g.syns == 2
+    med, p90, n = m.rtt_stats(t0 + 10)
+    assert n >= 1 and any(abs(r - 0.042) < 0.002 for _t, r, *_x in
+                          m.rtt_samples), list(m.rtt_samples)
+    assert med is not None and p90 >= med
+    # DNS: the scenario's answered lookups land in the histogram
+    hist = m.dns.histogram()
+    assert sum(hist) == len(m.dns.latencies) or sum(hist) >= \
+        min(len(m.dns.latencies), 1), (hist, len(m.dns.latencies))
+    assert dns_bucket(5) == 0 and dns_bucket(30) == 2 and \
+        dns_bucket(5000) == len(DNS_BUCKETS) - 1
+    dt = DnsTracker()
+    for i, ms in enumerate((5, 30, 30, 700, 1500)):
+        info = {"id": i, "qname": f"q{i}.example", "rcode": 0}
+        dt.on_query(100.0, "10.0.0.5", "10.0.0.1", info)
+        dt.on_response(100.0 + ms / 1000.0, "10.0.0.5", "10.0.0.1", info)
+    h = dt.histogram("10.0.0.1")
+    assert h[0] == 1 and h[2] == 2 and h[6] == 1 and h[7] == 1, h
+    round_trip = DnsTracker()
+    round_trip.load(json.loads(json.dumps(dt.to_dict())))
+    assert round_trip.histogram() == h
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -28035,6 +29870,51 @@ def _gs_history_v2(app, ctx):
     assert app.packet_ring is None
     app.mode_ui_var.set("Beginner")
     app._on_ui_mode_change()
+    app.data_mode = "idle"
+
+
+@gui_test_step("diagnostics depth: Wi-Fi culprit, switch port, HTTP/3 names")
+def _gs_diag_depth(app, ctx):
+    root = app.root
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "live"
+    sink = app.lossless_sink()
+    t = time.time()
+    frames = list(ctx.frames()) + [(_lldp_frame(), t, 1)] + \
+        _quic_frames("h3.example.com", t0=t)
+    for raw, _ts, lt in frames:
+        sink(raw, time.time(), lt)
+    assert _gui_pump(root, 0.3, lambda: not len(app.ring) and
+                     not app.worker.busy, timeout=30)
+    app.wifi.last = parse_netsh_wlan(NETSH_EN)       # -78 dBm
+    app.wifi.at = time.time() + 3600                 # no real probe now
+    res = app.health_summary()
+    assert res["wifi"][0] == "Needs attention", res["wifi"]
+    assert app.health_culprit == "wifi"
+    assert "Likely culprit: Wi-Fi" in res["overall"][1], res["overall"]
+    assert res["switch"][0] == "Healthy" and "core-sw1" in res["switch"][1]
+    tab = app._select_tab("health")
+    tab.refresh()
+    _gui_pump(root, 0.2)
+    _st, ex, row = tab.rows["wifi"]
+    assert "-78 dBm" in ex.cget("text")
+    assert int(str(row.cget("highlightthickness"))) == 2
+    assert "core-sw1" in app.connection_info_text()
+    w = app.model.websites.get("h3.example.com")
+    assert w is not None and "QUIC first packet" in w.sources
+    ws = app._select_tab("websites")
+    ws.refresh()
+    _gui_pump(root, 0.1)
+    app.show_website("h3.example.com")
+    _gui_pump(root, 0.1)
+    for win in root.winfo_children():
+        if isinstance(win, tk.Toplevel):
+            win.destroy()
+    app.wifi.last = None
+    app.wifi.at = 0.0
     app.data_mode = "idle"
 
 
