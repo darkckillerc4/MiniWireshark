@@ -82,6 +82,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 import time
 import traceback
 import urllib.error
@@ -8534,8 +8535,9 @@ class NetworkWatcher(threading.Thread):
             wall, mono = time.time(), time.monotonic()
             resumed = (wall - self._wall) - (mono - self._mono) > 20 or \
                 (wall - self._wall) > self.interval + 60
+            since = self._wall
             self._wall, self._mono = wall, mono
-            snap = {"resumed": resumed, "time": wall}
+            snap = {"resumed": resumed, "time": wall, "since": since}
             try:
                 n += 1
                 if n % 2 == 0 or resumed:
@@ -8805,7 +8807,12 @@ def drain_deferred_tk():
 
 class RawRing:
     """Bounded hand-off from capture threads to the analysis worker.
-    deque.append/popleft are atomic, so producers take no lock."""
+    Both caps (frames and bytes) are checked and updated under one lock,
+    so the byte count never drifts with several producers. The worker
+    sleeps on a condition instead of polling; lossless producers (files,
+    demo) wait on the same condition instead of spinning."""
+
+    NOTIFY_AT = 64     # wake the worker for a batch, not for every frame
 
     def __init__(self, max_frames=150000, max_bytes=96 * 1024 * 1024):
         self.dq = deque()
@@ -8813,50 +8820,337 @@ class RawRing:
         self.max_bytes = max_bytes
         self.bytes = 0
         self.dropped = 0              # frames refused because it was full
+        self.dropped_bytes = 0
+        self.accepted = 0             # frames that went in
         self.peak = 0
+        self.peak_bytes = 0
+        self._lock = threading.Lock()
+        self._not_empty = threading.Condition(self._lock)
+        self._not_full = threading.Condition(self._lock)
+        self._consumer_waiting = 0
+        self._producers_waiting = 0
 
     def __len__(self):
         return len(self.dq)
 
-    def put(self, raw, ts, lt, gen):
-        if len(self.dq) >= self.max_frames or self.bytes >= self.max_bytes:
-            self.dropped += 1
-            return False
-        self.dq.append((raw, ts, lt, gen))
-        self.bytes += len(raw)
+    def _full(self):
+        return len(self.dq) >= self.max_frames or \
+            self.bytes >= self.max_bytes
+
+    def _append(self, item, size):
+        self.dq.append(item)
+        self.bytes += size
+        self.accepted += 1
         n = len(self.dq)
         if n > self.peak:
             self.peak = n
-        return True
+        if self.bytes > self.peak_bytes:
+            self.peak_bytes = self.bytes
+        if self._consumer_waiting and n >= self.NOTIFY_AT:
+            self._not_empty.notify()
+
+    def put(self, raw, ts, lt, gen):
+        """Never blocks: a full ring refuses the frame and counts it
+        ("dropped by app")."""
+        size = len(raw)
+        with self._lock:
+            if self._full():
+                self.dropped += 1
+                self.dropped_bytes += size
+                return False
+            self._append((raw, ts, lt, gen), size)
+            return True
 
     def put_wait(self, raw, ts, lt, gen, cancelled=lambda: False):
-        """Lossless variant for file imports and demo data."""
-        while len(self.dq) >= self.max_frames or \
-                self.bytes >= self.max_bytes:
-            if cancelled():
-                return False
-            time.sleep(0.005)
-        self.dq.append((raw, ts, lt, gen))
-        self.bytes += len(raw)
-        return True
+        """Lossless variant for file imports and demo data: waits on a
+        condition until the worker makes room."""
+        size = len(raw)
+        with self._lock:
+            while self._full():
+                if cancelled():
+                    return False
+                self._producers_waiting += 1
+                try:
+                    self._not_full.wait(0.25)
+                finally:
+                    self._producers_waiting -= 1
+            self._append((raw, ts, lt, gen), size)
+            return True
 
-    def drain(self, n):
+    def drain(self, n, timeout=0.0):
+        """Up to n frames; waits up to `timeout` seconds for the first."""
         out = []
-        pop = self.dq.popleft
-        try:
-            for _ in range(n):
+        with self._lock:
+            if not self.dq and timeout > 0:
+                self._consumer_waiting += 1
+                try:
+                    self._not_empty.wait(timeout)
+                finally:
+                    self._consumer_waiting -= 1
+            pop = self.dq.popleft
+            freed = 0
+            while self.dq and len(out) < n:
                 item = pop()
-                self.bytes -= len(item[0])
+                freed += len(item[0])
                 out.append(item)
-        except IndexError:
-            pass
-        if not self.dq:
-            self.bytes = 0
+            self.bytes -= freed
+            if not self.dq:
+                self.bytes = 0
+            if out and self._producers_waiting:
+                self._not_full.notify_all()
         return out
 
+    def wake(self):
+        """Wake a waiting consumer (used when stopping)."""
+        with self._lock:
+            self._not_empty.notify_all()
+            self._not_full.notify_all()
+
     def clear(self):
-        self.dq.clear()
-        self.bytes = 0
+        with self._lock:
+            self.dq.clear()
+            self.bytes = 0
+            self._not_full.notify_all()
+
+    def reset_counters(self):
+        """A new session starts counting from zero."""
+        with self._lock:
+            self.dropped = self.dropped_bytes = self.accepted = 0
+            self.peak = len(self.dq)
+            self.peak_bytes = self.bytes
+
+    def stats(self):
+        with self._lock:
+            return {"queued": len(self.dq), "bytes": self.bytes,
+                    "accepted": self.accepted, "dropped": self.dropped,
+                    "dropped_bytes": self.dropped_bytes, "peak": self.peak,
+                    "peak_bytes": self.peak_bytes,
+                    "max_frames": self.max_frames,
+                    "max_bytes": self.max_bytes}
+
+
+# ---- V5: capture faults, kernel counters, watchdog, coverage ------------------
+CAPTURE_FAULTS = {
+    # kind: (title, what to do, retry automatically?)
+    "permission": ("No permission to capture",
+                   "Run MiniWireshark as Administrator (Windows) or with "
+                   "sudo / the capture capability (Linux, macOS).", False),
+    "driver": ("The capture driver is missing",
+               "Install or repair Npcap with Diagnostics → Repair "
+               "dependencies, then start watching again.", False),
+    "bad_filter": ("The capture filter is not valid",
+                   "Clear or fix the text in “Capture filter” (it uses "
+                   "BPF syntax, for example “port 53”).", False),
+    "wrong_adapter": ("That network card cannot be watched",
+                      "Pick another card in the list, or click "
+                      "“Refresh”.", True),
+    "adapter_gone": ("The network card went away",
+                     "This happens when Wi-Fi reconnects, a cable is "
+                     "pulled or a VPN restarts. MiniWireshark retries on "
+                     "its own.", True),
+    "overflow": ("The system's capture buffer overflowed",
+                 "Traffic arrived faster than it could be read. Use Lite "
+                 "or Normal mode, or a capture filter.", True),
+    "parse": ("A packet could not be read",
+              "Usually harmless; the packet is counted as a decode "
+              "error. If it keeps happening, send a debug bundle.", True),
+    "sleep": ("The computer was asleep",
+              "Nothing is known about the time it was asleep; capture "
+              "restarts on its own.", True),
+    "unknown": ("Capture stopped for an unknown reason",
+                "MiniWireshark retries on its own. Diagnostics has the "
+                "original error.", True),
+}
+
+
+def classify_capture_fault(exc):
+    """→ (kind, title, fix, retry, original). Maps OS and libpcap errors
+    to a fault the user can act on; the original text is always kept."""
+    if exc is None:
+        kind = "unknown"
+        orig = ""
+    else:
+        orig = f"{type(exc).__name__}: {exc}" if not isinstance(exc, str) \
+            else exc
+        low = orig.lower()
+        errno_ = getattr(exc, "errno", None)
+        if isinstance(exc, PermissionError) or errno_ in (1, 13) or any(
+                w in low for w in ("permission", "operation not permitted",
+                                   "access is denied", "access denied",
+                                   "requires root", "administrator")):
+            kind = "permission"
+        elif any(w in low for w in ("npcap", "winpcap", "wpcap",
+                                    "libpcap not", "no libpcap",
+                                    "packet.dll")):
+            kind = "driver"
+        elif any(w in low for w in ("syntax error", "filter", "bpf",
+                                    "illegal token", "parse error in")):
+            kind = "bad_filter"
+        elif "resumed from sleep" in low:
+            kind = "sleep"
+        elif errno_ in (19, 6, 100, 50) or any(
+                w in low for w in ("disappeared", "no such device",
+                                   "network is down", "device not",
+                                   "adapter", "interface went down",
+                                   "enxio", "enodev", "restart failed")):
+            kind = "adapter_gone"
+        elif any(w in low for w in ("no such interface", "not found",
+                                    "invalid interface", "unknown interface",
+                                    "not supported on this interface")):
+            kind = "wrong_adapter"
+        elif errno_ == 105 or any(w in low for w in ("no buffer space",
+                                                     "overflow",
+                                                     "enobufs")):
+            kind = "overflow"
+        elif isinstance(exc, (struct.error, ValueError, IndexError)):
+            kind = "parse"
+        else:
+            kind = "unknown"
+    title, fix, retry = CAPTURE_FAULTS[kind]
+    return kind, title, fix, retry, orig
+
+
+PACKET_STATISTICS = 6          # linux/if_packet.h
+SOL_PACKET = 263
+
+
+class KernelCounters:
+    """Packets the operating system dropped before MiniWireshark could
+    read them. Linux reports them for raw sockets (and resets the
+    counter on every read, so they are summed here); other capture
+    methods report nothing, which is shown as "not reported", never as
+    zero."""
+
+    def __init__(self):
+        self.received = 0
+        self.dropped = 0
+        self.supported = None      # None = not asked yet
+
+    def poll(self, source):
+        sock = getattr(source, "sock", None)
+        fd_obj = getattr(sock, "ins", None) or sock
+        if fd_obj is None or not hasattr(fd_obj, "getsockopt") or \
+                not sys.platform.startswith("linux"):
+            if self.supported is None:
+                self.supported = False
+            return False
+        try:
+            raw = fd_obj.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8)
+            got, drops = struct.unpack("II", raw[:8])
+        except (OSError, struct.error, AttributeError, TypeError,
+                ValueError):
+            if self.supported is None:
+                self.supported = False
+            return False
+        self.supported = True
+        self.received += got
+        self.dropped += drops
+        return True
+
+    def text(self):
+        if not self.supported:
+            return "not reported by this capture method"
+        return f"{self.dropped:,}"
+
+
+class PipelineWatchdog:
+    """Checks every few seconds that each stage moved while it had work:
+    capture → raw ring → analysis → window. A stage that holds work for
+    10 s without progress is reported once (and again if it recovers and
+    sticks again). The worker thread checks the watchdog's own heartbeat,
+    so a frozen window is noticed too."""
+
+    LIMIT = 10.0
+
+    def __init__(self):
+        self.last = {}            # stage -> (value, since)
+        self.stuck = {}           # stage -> seconds stuck (reported)
+        self.beat = time.monotonic()
+        self.reports = deque(maxlen=50)
+
+    def check(self, now, stages):
+        """stages: {name: (progress_counter, has_work)} → list of newly
+        stuck stage names."""
+        self.beat = now
+        new = []
+        for name, (value, has_work) in stages.items():
+            prev = self.last.get(name)
+            if prev is None or value != prev[0] or not has_work:
+                self.last[name] = (value, now)
+                if name in self.stuck and (prev is None or
+                                           value != prev[0] or
+                                           not has_work):
+                    self.stuck.pop(name, None)
+                    self.reports.append((now, name, "moving again"))
+                continue
+            held = now - prev[1]
+            if held >= self.LIMIT and name not in self.stuck:
+                self.stuck[name] = held
+                self.reports.append((now, name, f"stuck {held:.0f} s"))
+                new.append(name)
+            elif name in self.stuck:
+                self.stuck[name] = held
+        return new
+
+    def window_frozen(self, now=None):
+        """Seconds since the window last ran the watchdog (0 if fine)."""
+        lag = (now or time.monotonic()) - self.beat
+        return lag if lag > self.LIMIT else 0.0
+
+    def text(self):
+        if not self.stuck:
+            return "all stages moving"
+        return "; ".join(f"{k} stuck {v:.0f} s" for k, v in
+                         sorted(self.stuck.items()))
+
+
+STAGE_NAMES = {"capture": "capture → raw ring",
+               "analysis": "analysis (raw ring → model)",
+               "window": "window (rows → Packets tab)"}
+
+
+def pipeline_coverage(ring, worker, kernel, rows_not_shown=0, gaps=()):
+    """Every packet in exactly one bucket, with what is unknown said
+    plainly. → dict."""
+    st = ring.stats()
+    analysed = worker.decoded if worker else 0
+    errors = worker.errors if worker else 0
+    stale = worker.stale if worker else 0
+    in_flight = st["queued"]
+    out = {"received": st["accepted"] + st["dropped"],
+           "accepted": st["accepted"],
+           "analysed": analysed, "decode_errors": errors,
+           "dropped_app": st["dropped"], "stale": stale,
+           "in_flight": in_flight, "rows_not_shown": rows_not_shown,
+           "kernel_dropped": kernel.dropped if kernel and kernel.supported
+           else None,
+           "gaps": len(gaps),
+           "gap_seconds": sum(max(0.0, e - s) for s, e, _r in gaps)}
+    return out
+
+
+def coverage_summary(cov):
+    """One honest sentence for the coverage card."""
+    lost = cov["dropped_app"] + (cov["kernel_dropped"] or 0)
+    parts = []
+    if cov["dropped_app"]:
+        parts.append(f"{cov['dropped_app']:,} dropped because analysis "
+                     f"fell behind")
+    if cov["kernel_dropped"]:
+        parts.append(f"{cov['kernel_dropped']:,} dropped by the operating "
+                     f"system")
+    if cov["gaps"]:
+        parts.append(f"{cov['gaps']} capture gap(s), "
+                     f"{human_duration(cov['gap_seconds'])} in total")
+    if not parts:
+        txt = f"Every packet received was analysed ({cov['analysed']:,})"
+        if cov["kernel_dropped"] is None and cov["received"]:
+            txt += "; the operating system's own drops are not reported " \
+                   "by this capture method"
+        return txt, (LV_OBSERVED if cov["kernel_dropped"] is not None
+                     else LV_INFERRED)
+    return ("Not everything: " + ", ".join(parts),
+            LV_UNKNOWN if lost or cov["gaps"] else LV_INFERRED)
 
 
 class AnalysisWorker(threading.Thread):
@@ -8878,18 +9172,28 @@ class AnalysisWorker(threading.Thread):
         self.beat = time.monotonic()
         self.busy = False
         self.deep = 0              # frames the fast path handed to scapy
+        self.window_frozen = 0.0   # seconds the Tk thread missed its checks
 
     def reset(self):
+        """New session: fresh reassembly state and counters."""
         self.reasm = TlsReassembler()
+        self.decoded = self.errors = self.stale = self.deep = 0
+        self.last_error = ""
 
     def run(self):
         ring = self.app.ring
         while not self.stop_flag:
-            self.beat = time.monotonic()
-            batch = ring.drain(self.BATCH)
+            self.beat = now = time.monotonic()
+            wd = getattr(self.app, "watchdog", None)
+            if wd is not None:
+                frozen = wd.window_frozen(now)
+                if frozen and not self.window_frozen:
+                    LOG.warning("the window has not run its checks for "
+                                "%.0f s", frozen)
+                self.window_frozen = frozen
+            batch = ring.drain(self.BATCH, timeout=0.02)
             if not batch:
                 self.busy = False
-                time.sleep(0.004)
                 continue
             self.busy = True
             try:
@@ -9862,6 +10166,7 @@ class DeviceRegistry:
         self.history = []
         self.arp_claims = defaultdict(lambda: deque(maxlen=16))
         self.labels = None            # KnownDevicesStore (aliases etc.)
+        self.gaps = []                # (start, end) capture gaps
         # change notifications drained by the model/UI
         self.rekeyed = []             # (old_key, new_key)
         self.removed = []             # keys removed by merges
@@ -10028,6 +10333,9 @@ class DeviceRegistry:
         dev.add_evidence(source, detail, when)
         dev.last_seen = max(dev.last_seen, when)
         dev.last_confirmed = max(dev.last_confirmed, when)
+        if dev.state in (STATE_ACTIVE, STATE_IDLE) and dev.presence and \
+                dev.presence[-1][1] is not None:
+            dev.presence_open(when)       # seen again after a capture gap
         if dev.state != STATE_ACTIVE:
             if dev.state in (STATE_INACTIVE, STATE_EXPIRED):
                 _push_bounded(dev.reactivations, when, 30)
@@ -10272,10 +10580,17 @@ class DeviceRegistry:
                            self.config.get("devices.expire_minutes",
                                            1440) * 60)
         newly_inactive, newly_expired = [], []
+        gaps = self.gaps[-50:]
         for key, dev in list(self.by_key.items()):
             if not dev.live:
                 continue
             age = now - dev.last_confirmed
+            if gaps:
+                # time MiniWireshark could not see (asleep, capture off)
+                # is not evidence that a device left
+                lc = dev.last_confirmed
+                age -= sum(max(0.0, min(e, now) - max(s, lc))
+                           for s, e in gaps)
             if age >= expire_after and dev.state != STATE_EXPIRED:
                 if dev.state != STATE_INACTIVE:
                     dev.presence_close(dev.last_confirmed)
@@ -14779,6 +15094,7 @@ class NetworkModel:
         self.health = {}
         self.health_history = deque(maxlen=120)
         self.capture_started = 0.0
+        self.epochs = []    # [start, end|None, why started, why ended]
         self.announce_new = True
         self.demo = False
         self._spoof_warned = False
@@ -15135,6 +15451,46 @@ class NetworkModel:
         return self.now() - self.capture_started < self.DISCOVERY_SECONDS
 
     # ---- outbox helpers ----------------------------------------------------
+    # ---- capture epochs: stretches of time actually observed -------------
+    def epoch_open(self, when, why):
+        if self.epochs and self.epochs[-1][1] is None:
+            return
+        _push_bounded(self.epochs, [when, None, why, ""], 500)
+
+    def epoch_close(self, when, why):
+        if self.epochs and self.epochs[-1][1] is None:
+            e = self.epochs[-1]
+            e[1] = max(when, e[0])
+            e[3] = why
+
+    def capture_gaps(self):
+        """[(start, end, why)] between observed stretches."""
+        out = []
+        for a, b in zip(self.epochs, self.epochs[1:]):
+            if a[1] is not None and b[0] - a[1] > 1:
+                out.append((a[1], b[0], a[3] or "capture was off"))
+        return out
+
+    def note_gap(self, start, end, why):
+        """Nothing was observed from start to end (the computer slept, the
+        capture was restarting...). Close the stretch, end every open
+        presence at its last sighting, remember the gap so it does not
+        count as devices leaving, and say so on the timeline."""
+        if end - start < 1:
+            return None
+        self.epoch_close(start, why)
+        for dev in self.registry.by_key.values():
+            if dev.live and dev.presence and dev.presence[-1][1] is None:
+                dev.presence_close(min(dev.last_confirmed, start))
+        _push_bounded(self.registry.gaps, (start, end), 200)
+        entry = self.push_timeline(
+            "capture", "WARNING",
+            f"Capture gap {fmt_clock(start)} – {fmt_clock(end)} "
+            f"({human_duration(end - start)}, {why}): nothing was observed "
+            f"in that time")
+        self.epoch_open(end, "resumed")
+        return entry
+
     def push_timeline(self, kind, severity, text, ref=None, device=""):
         entry = {"when": self.now(), "kind": kind, "severity": severity,
                  "text": text, "ref": ref, "device": device,
@@ -16913,6 +17269,7 @@ class SessionCodec:
             "health": {k: v for k, v in model.health.items()
                        if isinstance(v, (str, int, float, bool, type(None)))},
             "observations": [list(o) for o in list(model.obs_recent)[-3000:]],
+            "epochs": [list(e) for e in model.epochs[-500:]],
             "bindings": model.registry.bindings.to_list(3000),
             "aliases": dict(list(model.registry.alias.items())[-2000:]),
             "corrections": model.journal.to_list(),
@@ -16991,6 +17348,12 @@ class SessionCodec:
                 a = alert_from_dict(ad)
                 model.alerts.alerts[a.id] = a
                 model.alerts.order.append(a.id)
+        for e in payload.get("epochs", []) or []:
+            if isinstance(e, list) and len(e) == 4:
+                with contextlib.suppress(TypeError, ValueError):
+                    model.epochs.append([float(e[0]), None if e[1] is None
+                                         else float(e[1]), str(e[2])[:40],
+                                         str(e[3])[:60]])
         for e in payload.get("timeline", []) or []:
             if isinstance(e, dict) and "text" in e:
                 ref = e.get("ref")
@@ -19106,6 +19469,28 @@ Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
 Automatic (MiniWireshark decides) ¦ Automatique (MiniWireshark décide) ¦ Automático (MiniWireshark decide)
 You set this type ¦ Vous avez choisi ce type ¦ Usted eligió este tipo
 detected ¦ détecté ¦ detectado
+I could not start watching ¦ Je n'ai pas pu commencer la surveillance ¦ No pude empezar a vigilar
+No permission to capture ¦ Pas d'autorisation pour capturer ¦ Sin permiso para capturar
+Run MiniWireshark as Administrator (Windows) or with sudo / the capture capability (Linux, macOS). ¦ Lancez MiniWireshark en tant qu'administrateur (Windows) ou avec sudo / la capacité de capture (Linux, macOS). ¦ Ejecute MiniWireshark como administrador (Windows) o con sudo / el permiso de captura (Linux, macOS).
+The capture driver is missing ¦ Le pilote de capture est absent ¦ Falta el controlador de captura
+Install or repair Npcap with Diagnostics → Repair dependencies, then start watching again. ¦ Installez ou réparez Npcap avec Diagnostics → Réparer les dépendances, puis relancez la surveillance. ¦ Instale o repare Npcap con Diagnóstico → Reparar dependencias y vuelva a empezar a vigilar.
+The capture filter is not valid ¦ Le filtre de capture n'est pas valide ¦ El filtro de captura no es válido
+Clear or fix the text in “Capture filter” (it uses BPF syntax, for example “port 53”). ¦ Effacez ou corrigez le texte de « Filtre de capture » (syntaxe BPF, par exemple « port 53 »). ¦ Borre o corrija el texto de «Filtro de captura» (usa sintaxis BPF, por ejemplo «port 53»).
+That network card cannot be watched ¦ Cette carte réseau ne peut pas être surveillée ¦ Esa tarjeta de red no se puede vigilar
+Pick another card in the list, or click “Refresh adapters”. ¦ Choisissez une autre carte dans la liste ou cliquez sur « Actualiser les cartes ». ¦ Elija otra tarjeta de la lista o pulse «Actualizar adaptadores».
+The network card went away ¦ La carte réseau a disparu ¦ La tarjeta de red desapareció
+This happens when Wi-Fi reconnects, a cable is pulled or a VPN restarts. MiniWireshark retries on its own. ¦ Cela arrive quand le Wi-Fi se reconnecte, qu'un câble est débranché ou qu'un VPN redémarre. MiniWireshark réessaie tout seul. ¦ Ocurre cuando el Wi-Fi se reconecta, se desconecta un cable o se reinicia una VPN. MiniWireshark lo reintenta solo.
+The system's capture buffer overflowed ¦ Le tampon de capture du système a débordé ¦ El búfer de captura del sistema se desbordó
+Traffic arrived faster than it could be read. Use the “Low CPU” performance mode, or a capture filter. ¦ Le trafic arrivait plus vite qu'il ne pouvait être lu. Utilisez le mode de performance « Économie de processeur » ou un filtre de capture. ¦ El tráfico llegó más rápido de lo que se podía leer. Use el modo de rendimiento «Bajo consumo de CPU» o un filtro de captura.
+A packet could not be read ¦ Un paquet n'a pas pu être lu ¦ No se pudo leer un paquete
+Usually harmless; the packet is counted as a decode error. If it keeps happening, send a debug bundle. ¦ Généralement sans gravité ; le paquet est compté comme erreur de décodage. Si cela se répète, envoyez un paquet de débogage. ¦ Normalmente inofensivo; el paquete se cuenta como error de decodificación. Si se repite, envíe un paquete de depuración.
+The computer was asleep ¦ L'ordinateur était en veille ¦ El equipo estaba en suspensión
+Nothing is known about the time it was asleep; capture restarts on its own. ¦ On ne sait rien du temps passé en veille ; la capture redémarre toute seule. ¦ No se sabe nada del tiempo en suspensión; la captura se reinicia sola.
+Capture stopped for an unknown reason ¦ La capture s'est arrêtée pour une raison inconnue ¦ La captura se detuvo por un motivo desconocido
+MiniWireshark retries on its own. Diagnostics has the original error. ¦ MiniWireshark réessaie tout seul. Diagnostics contient l'erreur d'origine. ¦ MiniWireshark lo reintenta solo. Diagnóstico muestra el error original.
+Try running as Administrator / root, or pick a different network card and click “Start watching”. ¦ Essayez de lancer en tant qu'administrateur / root, ou choisissez une autre carte réseau et cliquez sur « Commencer à observer ». ¦ Pruebe a ejecutar como administrador / root, o elija otra tarjeta de red y pulse «Empezar a vigilar».
+Did MiniWireshark see every packet? ¦ MiniWireshark a-t-il vu chaque paquet ? ¦ ¿Vio MiniWireshark todos los paquetes?
+Counted from the moment capture started: packets the operating system dropped (when it reports them), packets MiniWireshark had to drop because analysis fell behind, and time nothing was captured (sleep, restarts). ¦ Compté depuis le début de la capture : paquets perdus par le système (quand il le signale), paquets que MiniWireshark a dû abandonner parce que l'analyse prenait du retard, et moments sans capture (veille, redémarrages). ¦ Contado desde que empezó la captura: paquetes que el sistema descartó (cuando lo informa), paquetes que MiniWireshark tuvo que descartar porque el análisis se retrasó, y tiempo sin captura (suspensión, reinicios).
 Choose ¦ Choisir ¦ Elegir
 Access point ¦ Point d'accès ¦ Punto de acceso
 Windows PC ¦ PC Windows ¦ PC con Windows
@@ -19333,6 +19718,16 @@ I18N_PATTERNS = [
     (r"Looks like (.+?), which you said is a (.+?) \((.+)\)",
      "Ressemble à {t1}, que vous avez désigné comme {t2} ({t3})",
      "Se parece a {t1}, que usted indicó como {t2} ({t3})"),
+    (r"Every packet received was analysed \(([\d,]+)\)",
+     r"Chaque paquet reçu a été analysé (\1)",
+     r"Se analizó cada paquete recibido (\1)"),
+    (r"Every packet received was analysed \(([\d,]+)\); the operating "
+     r"system's own drops are not reported by this capture method",
+     r"Chaque paquet reçu a été analysé (\1) ; les pertes du système "
+     r"lui-même ne sont pas signalées par cette méthode de capture",
+     r"Se analizó cada paquete recibido (\1); esta forma de captura no "
+     r"informa de los descartes del propio sistema"),
+    (r"Not everything: (.+)", "Pas tout : {t1}", "No todo: {t1}"),
     (r"Detection alone suggests: (.+)", "La détection seule suggère : {t1}",
      "La detección por sí sola sugiere: {t1}"),
     (r"Set the type of (.+?): (.+?) → (.+)",
@@ -26861,6 +27256,15 @@ class MiniWireshark:
         self._last_tick_wall = time.monotonic()
         self._rate_window = deque(maxlen=10)
         self._analysis_errors = 0
+        self.watchdog = PipelineWatchdog()
+        self.kernel = KernelCounters()
+        self._rows_drained = 0
+        self._rows_not_shown = 0
+        self._kernel_seen = 0
+        self._wd_last = 0.0
+        self._gap_started = 0.0      # when the capture stopped on its own
+        self._gap_reason = ""
+        self.last_fault = None       # (kind, title, fix, original, when)
         self._settings_win = None
         self._diag_win = None
         self.system_dns = []
@@ -26986,6 +27390,11 @@ class MiniWireshark:
         Every tab is reset so no old row can linger."""
         self.gen += 1                 # frames of the old source are dropped
         self.ring.clear()
+        self.ring.reset_counters()
+        self.kernel = KernelCounters()
+        self._kernel_seen = 0
+        self._rows_not_shown = 0
+        self.watchdog = PipelineWatchdog()
         if getattr(self, "packet_ring", None) is not None:
             self.packet_ring.new_epoch()
         self.pending_rows.clear()
@@ -27642,7 +28051,21 @@ class MiniWireshark:
                 tab.tree.bind("<<TreeviewSelect>>", handler(tab), add="+")
 
     def coverage(self):
-        return coverage_rows(self.model, self.data_mode, self.active_mode())
+        rows = coverage_rows(self.model, self.data_mode, self.active_mode())
+        if self.data_mode == "live" or self.capture_coverage()["received"]:
+            txt, lvl = coverage_summary(self.capture_coverage())
+            rows.insert(0, ("Did MiniWireshark see every packet?", txt, lvl,
+                            "Counted from the moment capture started: "
+                            "packets the operating system dropped (when it "
+                            "reports them), packets MiniWireshark had to "
+                            "drop because analysis fell behind, and time "
+                            "nothing was captured (sleep, restarts)."))
+        return rows
+
+    def capture_coverage(self):
+        return pipeline_coverage(self.ring, self.worker, self.kernel,
+                                 self._rows_not_shown,
+                                 self.model.capture_gaps())
 
     def open_coverage(self):
         m = self.model
@@ -29229,8 +29652,10 @@ class MiniWireshark:
                 if raw is not None:
                     pr.put(d["no"], raw, d["time"], d.get("linktype", 1))
         if len(self.pending_rows) > self.max_rows * 2:
-            for _ in range(len(self.pending_rows) - self.max_rows):
+            extra = len(self.pending_rows) - self.max_rows
+            for _ in range(extra):
                 self.pending_rows.popleft()
+            self._rows_not_shown += extra
             self._rows_overflowed = True
 
     def _start_capture(self, candidates, auto=False, keep_data=False):
@@ -29250,19 +29675,34 @@ class MiniWireshark:
             LOG.info("capture failed on %s: %s", lbl, err)
         if sniffer is None:
             self.status_var.set("Could not start watching on any network card.")
-            hint = ""
-            if IS_WINDOWS and not _npcap_present():
-                hint = " The capture driver (Npcap) seems to be missing — " \
-                       "use Diagnostics → Repair dependencies."
-            self._set_banner(
-                f"❌  I couldn't start watching ({err}).{hint} Try running as "
-                f"Administrator / root, or pick a different network card "
-                f"and click “Start watching”.", kind="bad")
-            LOG.warning("capture could not start: %s", err)
+            kind, title, fix, _retry, orig = classify_capture_fault(err)
+            if IS_WINDOWS and not _npcap_present() and kind in (
+                    "unknown", "wrong_adapter"):
+                kind = "driver"
+                title, fix = CAPTURE_FAULTS["driver"][0], \
+                    CAPTURE_FAULTS["driver"][1]
+            self.last_fault = (kind, title, fix, orig, time.time())
+            if kind == "unknown":
+                fix = ("Try running as Administrator / root, or pick a "
+                       "different network card and click “Start "
+                       "watching”.")
+            self._set_banner(f"❌  {translate_text('I could not start watching')}"
+                             f": {translate_text(title)}. "
+                             f"{translate_text(fix)}"
+                             + (f" ({orig})" if orig else ""), kind="bad")
+            LOG.warning("capture could not start: [%s] %s", kind, orig)
+            boot_step("capture", False, detail=kind,
+                      error=err if isinstance(err, BaseException) else None)
             return False
         self.sniffer = sniffer
         self.current_iface_label = used
         self._capture_started_at = time.time()
+        if keep_data and self._gap_started:
+            self.model.note_gap(self._gap_started, time.time(),
+                                self._gap_reason or "capture was restarting")
+        else:
+            self.model.epoch_open(time.time(), "capture started")
+        self._gap_started, self._gap_reason = 0.0, ""
         self._last_packet_wall = time.time()
         if not keep_data:
             self.model.capture_started = time.time()
@@ -29349,6 +29789,7 @@ class MiniWireshark:
         if self.data_mode == "live":
             self.data_mode = "idle"
         if was_live:
+            self.model.epoch_close(time.time(), "stopped by you")
             self.model.push_timeline("capture", "INFO", "Stopped watching")
             LOG.info("capture stopped by user")
             self.status_var.set(f"Stopped. Saw {self.count} packets.")
@@ -29362,17 +29803,39 @@ class MiniWireshark:
         session data."""
         if self.sniffer is None and self._restart_job:
             return
-        LOG.warning("capture stopped unexpectedly: %s", exc)
+        kind, title, fix, retry, orig = classify_capture_fault(exc)
+        LOG.warning("capture stopped unexpectedly: [%s] %s", kind,
+                    orig or exc)
+        boot_step("capture", False, detail=kind,
+                  error=exc if isinstance(exc, BaseException) else None)
+        if not self._gap_started:
+            self._gap_started = max(self._last_packet_wall or 0.0,
+                                    self._capture_started_at or 0.0) or \
+                time.time()
+            self._gap_reason = self._gap_reason or title.lower()
+        self.model.epoch_close(self._gap_started, title.lower())
         self._stop_capture_only()
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        self.last_fault = (kind, title, fix, orig, time.time())
+        if not retry:
+            self.data_mode = "idle"
+            self._gap_started = 0.0
+            self.model.push_timeline("capture", "WARNING",
+                                     f"Capture stopped: {title}"
+                                     + (f" ({orig})" if orig else ""))
+            self._set_banner(f"⏸️  {translate_text(title)}. "
+                             f"{translate_text(fix)}", kind="bad")
+            self.status_var.set(f"Stopped: {title}.")
+            self._restyle_mode_banner()
+            return
         self._restart_attempts += 1
         n = self._restart_attempts
-        delay = min(60, 2 ** min(n - 1, 6))
+        delay = min(30, 2 ** min(n - 1, 5))
         self.model.push_timeline("capture", "WARNING",
-                                 f"Capture stopped unexpectedly "
-                                 f"({exc or 'unknown reason'}); retrying in "
-                                 f"{delay}s")
+                                 f"Capture stopped unexpectedly: {title}"
+                                 + (f" ({orig})" if orig else "") +
+                                 f"; retrying in {delay}s")
         if n > 12:
             self.data_mode = "idle"
             self._set_banner(f"⏸️  The watcher kept stopping ({exc}). Click "
@@ -29436,15 +29899,22 @@ class MiniWireshark:
         if self.data_mode != "live":
             return
         if snap.get("resumed"):
-            self.model.push_timeline("interface", "INFO",
-                                     "The computer seems to have woken from "
-                                     "sleep")
+            start = float(snap.get("since") or 0.0)
+            end = float(snap.get("time") or time.time())
             if time.time() - self._last_packet_wall > 15:
+                self._gap_started = start or self._last_packet_wall
+                self._gap_reason = "the computer was asleep"
                 self._handle_sniffer_died(RuntimeError("resumed from sleep"))
                 return
+            if start:
+                self.model.note_gap(start, end, "the computer was asleep")
         gw, my_ip = snap.get("gateway", ""), snap.get("my_ip", "")
         if gw and gw != self.real_identity[0]:
             old = self.real_identity[0]
+            if old:
+                now = time.time()
+                self.model.epoch_close(now, "joined another network")
+                self.model.epoch_open(now, "new network")
             self.real_identity = (gw, self.real_identity[1],
                                   self.real_identity[2])
             self.model.set_identity(gateway_ip=gw)
@@ -29495,6 +29965,7 @@ class MiniWireshark:
             self.tabs["packets"]._dirty = True
         if batch:
             self._last_packet_wall = time.time()
+            self._rows_drained += len(batch)
             self.tabs["packets"].add_rows(batch)
         self.root.after(1 if pr else self._ms(80), self._drain_decoded)
 
@@ -29618,6 +30089,33 @@ class MiniWireshark:
                     LOG.exception("refresh %s", tab.name)
         self.root.after(self._ms(2000), self._refresh_insights)
 
+    def _check_pipeline(self, now):
+        """Watchdog and kernel counters. Reports, never restarts the
+        window; only a dead worker is restarted (by _ensure_worker)."""
+        w = self.worker
+        stages = {
+            "analysis": ((w.decoded + w.errors + w.stale) if w else 0,
+                         len(self.ring) > 0),
+            "window": (self._rows_drained, len(self.pending_rows) > 0),
+        }
+        for name in self.watchdog.check(now, stages):
+            LOG.warning("watchdog: %s stuck for %.0f s", name,
+                        self.watchdog.stuck.get(name, 0))
+            self.model.push_timeline(
+                "capture", "WARNING",
+                f"Watchdog: {STAGE_NAMES.get(name, name)} has not moved for "
+                f"{self.watchdog.LIMIT:.0f} s although work is waiting")
+        if self.sniffer is not None and self.kernel.poll(self.sniffer):
+            new = self.kernel.dropped - self._kernel_seen
+            if new > 0:
+                self._kernel_seen = self.kernel.dropped
+                if not self.model.alerts._debounced("kernel-drops", 60):
+                    self.model.push_timeline(
+                        "capture", "WARNING",
+                        f"The operating system dropped {new:,} packets "
+                        f"before MiniWireshark could read them (its "
+                        f"capture buffer was full)")
+
     def _tick_status(self):
         now = time.monotonic()
         self._gui_lag = max(0.0, now - self._last_tick_wall - 1.0)
@@ -29625,6 +30123,9 @@ class MiniWireshark:
         if self.worker is None or not self.worker.is_alive() or \
                 now - self.worker.beat > 10:
             self._ensure_worker()
+        if now - self._wd_last >= 2.0:
+            self._wd_last = now
+            self._check_pipeline(now)
         if self.sniffer is not None:
             if not getattr(self.sniffer, "running", True) or \
                     getattr(self.sniffer, "exception", None) is not None:
@@ -33326,6 +33827,7 @@ class MiniWireshark:
             if w is not None:
                 w.stop_flag = True
         self.ring.clear()
+        self.ring.wake()
         if self.prober is not None:
             self.prober.run_now.set()
         if self.demo is not None:
@@ -34039,9 +34541,25 @@ class DiagnosticsWindow:
             f"Capture source      {getattr(app.sniffer, 'kind', '—')} "
             f"({getattr(app.sniffer, 'received', 0)} frames received)",
             f"Raw ring            {len(app.ring)} / {app.ring.max_frames} "
-            f"(peak {app.ring.peak})",
-            f"Rows waiting (GUI)  {len(app.pending_rows)}",
+            f"frames, {_human_bytes(app.ring.bytes)} / "
+            f"{_human_bytes(app.ring.max_bytes)} (peak {app.ring.peak} frames, "
+            f"{_human_bytes(app.ring.peak_bytes)})",
+            f"Rows waiting (GUI)  {len(app.pending_rows)} (not shown: "
+            f"{app._rows_not_shown})",
             f"Dropped (ring full) {app.ring.dropped}",
+            f"Dropped by the OS   {app.kernel.text()}",
+            "Coverage            " + coverage_summary(
+                app.capture_coverage())[0],
+            "Capture gaps        " + (", ".join(
+                f"{fmt_clock(s)}–{fmt_clock(e)} ({r})"
+                for s, e, r in m.capture_gaps()[-5:]) or "none"),
+            f"Watchdog            {app.watchdog.text()}" + (
+                f"; window missed its checks for "
+                f"{w.window_frozen:.0f} s" if w and w.window_frozen
+                else ""),
+            "Last capture fault  " + (
+                f"{app.last_fault[1]} ({app.last_fault[3] or 'no detail'})"
+                if getattr(app, "last_fault", None) else "none"),
             f"Analysed            {w.decoded if w else 0} "
             f"(via scapy: {w.deep if w else 0}, stale: "
             f"{w.stale if w else 0})",
@@ -39012,6 +39530,210 @@ def test_set_device_type_model_and_undo(ctx):
         LEARNED[0] = old
 
 
+@self_test(slow=False)
+def test_raw_ring_v2_threads_and_waits(ctx):
+    """Several producers and one consumer: the byte count never drifts,
+    every offered frame is either accepted or counted as dropped, and a
+    lossless producer is woken as soon as the worker makes room (no
+    polling)."""
+    r = RawRing(max_frames=500, max_bytes=40_000)
+    offered = [0]
+    consumed = []
+    stop = threading.Event()
+
+    def producer(seed):
+        rnd = random.Random(seed)
+        for i in range(5000):
+            r.put(b"x" * rnd.randint(20, 200), i, 1, 1)
+        offered[0] += 5000
+
+    def consumer():
+        while not stop.is_set() or len(r):
+            for item in r.drain(64, timeout=0.02):
+                consumed.append(len(item[0]))
+    c = threading.Thread(target=consumer)
+    c.start()
+    ps = [threading.Thread(target=producer, args=(s,)) for s in range(4)]
+    for p in ps:
+        p.start()
+    for p in ps:
+        p.join()
+    stop.set()
+    c.join(5)
+    st = r.stats()
+    assert st["accepted"] + st["dropped"] == 20000, st
+    assert st["accepted"] == len(consumed), (st, len(consumed))
+    assert st["bytes"] == 0 and st["queued"] == 0, st
+    assert st["peak"] <= 500 and st["peak_bytes"] <= 40_000 + 200, st
+    # lossless producer waits on the condition and wakes quickly
+    r2 = RawRing(max_frames=2)
+    r2.put(b"a", 0, 1, 1)
+    r2.put(b"b", 0, 1, 1)
+    woke = []
+
+    def waiter():
+        t0 = time.perf_counter()
+        r2.put_wait(b"c", 0, 1, 1)
+        woke.append(time.perf_counter() - t0)
+    t = threading.Thread(target=waiter)
+    t.start()
+    time.sleep(0.1)
+    assert not woke, "put_wait did not wait"
+    t1 = time.perf_counter()
+    r2.drain(1)
+    t.join(2)
+    assert woke and woke[0] < 2, woke
+    assert time.perf_counter() - t1 < 0.2, "producer woke late"
+    cancelled = RawRing(max_frames=1)
+    cancelled.put(b"a", 0, 1, 1)
+    assert cancelled.put_wait(b"b", 0, 1, 1, lambda: True) is False
+    # the consumer sleeps on the condition and wakes on a put
+    r3 = RawRing()
+    got = []
+    t = threading.Thread(target=lambda: got.append(
+        (time.perf_counter(), r3.drain(5, timeout=2.0))))
+    t.start()
+    time.sleep(0.05)
+    t_put = time.perf_counter()
+    for i in range(RawRing.NOTIFY_AT):
+        r3.put(b"z", i, 1, 1)
+    t.join(3)
+    assert got and len(got[0][1]) == 5 and got[0][0] - t_put < 0.2, got
+    r3.reset_counters()
+    assert r3.stats()["accepted"] == 0
+
+
+@self_test(slow=False)
+def test_capture_fault_classifier(ctx):
+    """Each capture failure gets a plain title, a fix, a retry decision,
+    and keeps the original error text."""
+    cases = [
+        (PermissionError(1, "Operation not permitted"), "permission", False),
+        (OSError("Npcap/WinPcap is not installed"), "driver", False),
+        (OSError("syntax error in filter expression"), "bad_filter", False),
+        (OSError(19, "No such device"), "adapter_gone", True),
+        (RuntimeError("adapter disappeared"), "adapter_gone", True),
+        (RuntimeError("resumed from sleep"), "sleep", True),
+        (OSError(105, "No buffer space available"), "overflow", True),
+        (ValueError("Interface 'xyz' not found"), "wrong_adapter", True),
+        (struct.error("unpack requires a buffer"), "parse", True),
+        (RuntimeError("weird"), "unknown", True),
+        (None, "unknown", True),
+    ]
+    for exc, kind, retry in cases:
+        k, title, fix, rt, orig = classify_capture_fault(exc)
+        assert (k, rt) == (kind, retry), (exc, k, rt)
+        assert title and fix
+        if exc is not None:
+            assert str(exc) in orig and type(exc).__name__ in orig
+
+
+@self_test(slow=False)
+def test_kernel_counters_and_coverage(ctx):
+    """Kernel drops are summed when the OS reports them and shown as "not
+    reported" (never as zero) when it doesn't. Coverage puts every packet
+    in one bucket and says so in one sentence."""
+    kc = KernelCounters()
+    assert kc.poll(object()) is False and kc.supported is False
+    assert kc.text() == "not reported by this capture method"
+    if sys.platform.startswith("linux"):
+        try:
+            s = _socket.socket(_socket.AF_PACKET, _socket.SOCK_RAW,
+                               _socket.htons(3))
+        except (OSError, AttributeError):
+            s = None
+        if s is not None:
+            try:
+                s.bind(("lo", 0))
+                src = types.SimpleNamespace(sock=types.SimpleNamespace(
+                    ins=s))
+                k2 = KernelCounters()
+                assert k2.poll(src) and k2.supported
+                assert k2.text() == "0" or k2.dropped >= 0
+            finally:
+                s.close()
+    ring = RawRing(max_frames=3)
+    for i in range(5):
+        ring.put(b"x" * 10, i, 1, 1)
+    w = types.SimpleNamespace(decoded=2, errors=0, stale=0)
+    cov = pipeline_coverage(ring, w, kc, 0, [(10.0, 70.0, "asleep")])
+    assert cov["received"] == 5 and cov["dropped_app"] == 2
+    assert cov["in_flight"] == 3 and cov["kernel_dropped"] is None
+    assert cov["gaps"] == 1 and cov["gap_seconds"] == 60
+    txt, lvl = coverage_summary(cov)
+    assert "2 dropped because analysis fell behind" in txt and \
+        "1 capture gap" in txt and lvl == LV_UNKNOWN, txt
+    clean = pipeline_coverage(RawRing(), types.SimpleNamespace(
+        decoded=0, errors=0, stale=0), kc)
+    txt, lvl = coverage_summary(clean)
+    assert txt.startswith("Every packet received was analysed") and \
+        "not reported" not in txt
+
+
+@self_test(slow=False)
+def test_pipeline_watchdog(ctx):
+    """A stage holding work without progress for 10 s is reported once;
+    it clears when it moves; idle stages are never 'stuck'."""
+    wd = PipelineWatchdog()
+    assert wd.check(0.0, {"analysis": (5, True), "window": (1, False)}) \
+        == []
+    assert wd.check(9.0, {"analysis": (5, True), "window": (1, False)}) \
+        == []
+    assert wd.check(10.5, {"analysis": (5, True),
+                           "window": (1, False)}) == ["analysis"]
+    assert wd.check(12.0, {"analysis": (5, True),
+                           "window": (1, False)}) == [], "reported twice"
+    assert "analysis stuck" in wd.text()
+    assert wd.check(13.0, {"analysis": (9, True), "window": (1, False)}) \
+        == []
+    assert wd.text() == "all stages moving"
+    assert wd.check(40.0, {"analysis": (9, False),
+                           "window": (1, False)}) == [], "idle is fine"
+    wd.beat = time.monotonic() - 30
+    assert wd.window_frozen() >= 29
+    wd.beat = time.monotonic()
+    assert wd.window_frozen() == 0
+
+
+@self_test()
+def test_capture_gaps_presence_and_lifecycle(ctx):
+    """Sleep or a capture restart becomes a visible gap: presence stops
+    at the last sighting, the gap doesn't make devices 'leave', a device
+    seen again gets a new presence stretch, and sessions keep the
+    epochs."""
+    cfg = ctx.cfg({"devices.idle_minutes": 2, "devices.inactive_minutes": 10,
+                   "devices.expire_minutes": 60})
+    clk = _FakeClock(100.0)
+    m = NetworkModel(cfg, "192.168.1.1", {"192.168.1.2"}, set(),
+                     now_fn=clk)
+    m.set_identity(local_nets=[ipaddress.ip_network("192.168.1.0/24")])
+    m.registry.now = clk
+    m.epoch_open(100.0, "capture started")
+    d = m.registry.touch("192.168.1.5", "00:11:22:33:44:55", "mac_local",
+                         "x")
+    assert d.presence[-1][1] is None
+    entry = m.note_gap(200.0, 4000.0, "the computer was asleep")
+    assert entry and "Capture gap" in entry["text"] and \
+        "nothing was observed" in entry["text"]
+    assert d.presence[-1][1] == 100.0, d.presence
+    assert m.capture_gaps() == [(200.0, 4000.0, "the computer was asleep")]
+    assert m.epochs[-1][1] is None and m.epochs[-1][0] == 4000.0
+    clk.t = 4100.0
+    inact, _ = m.registry.tick_lifecycle(4100.0)
+    assert d not in inact and d.state != STATE_INACTIVE, \
+        "sleep time counted as the device leaving"
+    clk.t = 4150.0
+    m.registry.touch("192.168.1.5", "00:11:22:33:44:55", "mac_local", "x")
+    assert d.presence[-1] == [4150.0, None], d.presence
+    assert m.note_gap(5000.0, 5000.5, "blip") is None, "sub-second gap"
+    if ctx.scapy_ok:
+        payload = json.loads(json.dumps(SessionCodec.serialize(m),
+                                        default=str))
+        m2 = NetworkModel(ctx.cfg())
+        SessionCodec.load(payload, m2)
+        assert m2.capture_gaps() == m.capture_gaps()
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -39176,10 +39898,18 @@ def _gs_live(app, ctx):
         _socket.getaddrinfo("example.com", 443)
     _gui_pump(app.root, 1.5)
     kind = getattr(app.sniffer, "kind", "?")
+    app._check_pipeline(time.monotonic())
+    if sys.platform.startswith("linux") and kind == "raw socket":
+        assert app.kernel.supported, "Linux raw socket drops not read"
+    epochs = len(app.model.epochs)
+    assert epochs and app.model.epochs[-1][1] is None
     app.stop()
     _gui_pump(app.root, 0.5)
     assert app.sniffer is None and app.data_mode == "idle"
-    print(f"      (source: {kind}, {app.count} packets)")
+    assert app.model.epochs[-1][1] is not None and \
+        app.model.epochs[-1][3] == "stopped by you"
+    print(f"      (source: {kind}, {app.count} packets, OS drops "
+          f"{app.kernel.text()})")
 
 
 @gui_test_step("history store records live evidence (and survives reopen)")
@@ -39874,6 +40604,46 @@ def _gs_consent(app, ctx):
     app._stop_lan_scanner()
     app.data_mode = "idle"
     app._restyle_mode_banner()
+
+
+@gui_test_step("capture pipeline: coverage, watchdog, faults, gaps")
+def _gs_pipeline(app, ctx):
+    rows = app.coverage()
+    assert rows[0][0] == "Did MiniWireshark see every packet?", rows[0]
+    info = DiagnosticsWindow.collect(app)
+    for want in ("Dropped by the OS", "Watchdog", "Coverage",
+                 "Capture gaps", "Last capture fault"):
+        assert want in info, want
+    # a hopeless fault stops cleanly with a fix and does not retry
+    saved = (app.sniffer, app.data_mode, app._restart_attempts)
+
+    class _Dead:
+        running, exception, received = False, None, 0
+
+        def stop(self):
+            pass
+    app.sniffer = _Dead()
+    app.data_mode = "live"
+    app._handle_sniffer_died(PermissionError(1, "Operation not permitted"))
+    _gui_pump(app.root, 0.2)
+    assert app._restart_job is None, "retried a permission error"
+    assert app.last_fault[0] == "permission"
+    assert "No permission to capture" in DiagnosticsWindow.collect(app)
+    # a transient one schedules a retry with backoff, capped at 30 s
+    app.sniffer = _Dead()
+    app.data_mode = "live"
+    app._restart_attempts = 9
+    app._handle_sniffer_died(OSError(19, "No such device"))
+    assert app._restart_job is not None and app.last_fault[0] == \
+        "adapter_gone"
+    app.root.after_cancel(app._restart_job)
+    app._restart_job = None
+    app.sniffer, app.data_mode, app._restart_attempts = saved
+    app._gap_started = 0.0
+    # the watchdog runs from the status tick
+    app._wd_last = 0.0
+    app._check_pipeline(time.monotonic())
+    assert app.watchdog.text() == "all stages moving"
 
 
 @gui_test_step("corrections: rename, merge, undo from the window")
