@@ -36874,6 +36874,620 @@ def hex_dump_ranges(offset, length):
     return out
 
 
+# ============================================================================
+#  V5: reassembly — IP fragments, TCP streams, message framing
+#
+#  Mail, HTTP and DNS-over-TCP span segments, so they are read from the
+#  reassembled stream, never from single packets. Rules: memory is
+#  bounded everywhere; the first copy of a byte wins and a conflicting
+#  overlap is flagged (a known evasion trick); a stream may start in the
+#  middle; sequence numbers wrap at 2^32; and a message with a hole is
+#  shown as partial with the hole's byte range — never as complete.
+# ============================================================================
+class IpDefragmenter:
+    """Puts IPv4/IPv6 fragments back together. Keyed by (src, dst,
+    protocol, id); 30 s timeout; 64 KB per datagram; bounded in total."""
+
+    def __init__(self, timeout=30.0, max_datagram=65535,
+                 max_total=8 * 1024 * 1024, max_pending=1024):
+        self.timeout, self.max_datagram = timeout, max_datagram
+        self.max_total, self.max_pending = max_total, max_pending
+        self.pending = OrderedDict()   # key -> state dict
+        self.total = 0
+        self.completed = self.expired = self.overlaps = 0
+        self.conflicts = self.too_big = 0
+
+    def _expire(self, now):
+        while self.pending:
+            k, st = next(iter(self.pending.items()))
+            if now - st["first"] <= self.timeout and \
+                    self.total <= self.max_total and \
+                    len(self.pending) <= self.max_pending:
+                break
+            self.pending.popitem(last=False)
+            self.total -= st["bytes"]
+            self.expired += 1
+
+    def add(self, key, offset, more, data, now):
+        """→ (datagram payload or None, warning or "")."""
+        self._expire(now)
+        if offset + len(data) > self.max_datagram:
+            self.too_big += 1
+            self.pending.pop(key, None)
+            return None, "fragment would make the packet too large"
+        st = self.pending.get(key)
+        if st is None:
+            st = self.pending[key] = {"first": now, "parts": {}, "bytes": 0,
+                                      "end": None, "warn": ""}
+        warn = ""
+        for o, b in st["parts"].items():
+            lo, hi = max(o, offset), min(o + len(b), offset + len(data))
+            if lo < hi:
+                self.overlaps += 1
+                if b[lo - o:hi - o] != data[lo - offset:hi - offset]:
+                    self.conflicts += 1
+                    warn = st["warn"] = ("overlapping fragments with "
+                                         "different content (a known way "
+                                         "to hide traffic from monitors); "
+                                         "the first copy was kept")
+                elif not warn:
+                    warn = "overlapping fragments (identical content)"
+        if offset not in st["parts"]:
+            st["parts"][offset] = data
+            st["bytes"] += len(data)
+            self.total += len(data)
+        if not more:
+            st["end"] = offset + len(data)
+        if st["end"] is None:
+            return None, warn
+        buf = bytearray(st["end"])
+        have = bytearray(st["end"])
+        for o in sorted(st["parts"], reverse=True):     # first copy wins:
+            b = st["parts"][o]                         # lower offsets last
+            n = max(0, min(len(b), st["end"] - o))
+            buf[o:o + n] = b[:n]
+            have[o:o + n] = b"\x01" * n
+        if 0 in have:
+            return None, warn
+        # rebuild with first-arrival precedence
+        out = bytearray(st["end"])
+        filled = bytearray(st["end"])
+        for o, b in st["parts"].items():                # insertion order
+            n = max(0, min(len(b), st["end"] - o))
+            for i in range(n):
+                if not filled[o + i]:
+                    out[o + i] = b[i]
+                    filled[o + i] = 1
+        self.pending.pop(key, None)
+        self.total -= st["bytes"]
+        self.completed += 1
+        return bytes(out), warn or st["warn"]
+
+
+class StreamMessage:
+    """One application message read from a stream direction."""
+    __slots__ = ("direction", "start", "end", "data", "partial", "gaps",
+                 "kind")
+
+    def __init__(self, direction, start, data, kind="", gaps=()):
+        self.direction, self.start, self.data = direction, start, data
+        self.end = start + len(data)
+        self.kind = kind
+        self.gaps = list(gaps)
+        self.partial = bool(self.gaps)
+
+    def key(self):
+        return (self.direction, self.start, self.end, self.kind,
+                bytes(self.data), tuple(self.gaps))
+
+    def __repr__(self):
+        return (f"<{self.kind} dir={self.direction} {self.start}-{self.end}"
+                f"{' partial' if self.partial else ''}>")
+
+
+class LineFramer:
+    """Line protocols (SMTP, IMAP, POP3, FTP): one message per line."""
+    kind = "line"
+    MAX = 8192
+
+    def __init__(self):
+        self.buf, self.start, self.gaps = bytearray(), 0, []
+
+    def feed(self, off, data, out, direction):
+        if not self.buf:
+            self.start = off
+        self.buf += data
+        while True:
+            i = self.buf.find(b"\n")
+            if i < 0:
+                if len(self.buf) > self.MAX:
+                    out.append(StreamMessage(direction, self.start,
+                                             bytes(self.buf), self.kind,
+                                             self.gaps + [("too long", "")]))
+                    self.start += len(self.buf)
+                    self.buf, self.gaps = bytearray(), []
+                return
+            line = bytes(self.buf[:i + 1])
+            out.append(StreamMessage(direction, self.start, line, self.kind,
+                                     self.gaps))
+            self.start += len(line)
+            del self.buf[:i + 1]
+            self.gaps = []
+
+    def gap(self, start, end, out, direction):
+        if self.buf:
+            out.append(StreamMessage(direction, self.start, bytes(self.buf),
+                                     self.kind, self.gaps +
+                                     [(start, end)]))
+            self.buf = bytearray()
+        self.gaps = [(start, end)]
+        self.start = end
+
+    def flush(self, out, direction):
+        if self.buf:
+            out.append(StreamMessage(direction, self.start, bytes(self.buf),
+                                     self.kind, self.gaps +
+                                     [("unterminated", "")]))
+            self.buf = bytearray()
+
+
+class LengthFramer:
+    """Length-prefixed records: TLS (5-byte header) or DNS over TCP
+    (2-byte length)."""
+
+    def __init__(self, kind="tls"):
+        self.kind = kind
+        self.buf, self.start, self.gaps = bytearray(), 0, []
+        self.lost = False          # after a gap the framing is unknown
+
+    def _need(self):
+        if self.kind == "tls":
+            if len(self.buf) < 5:
+                return None
+            return 5 + struct.unpack_from("!H", self.buf, 3)[0]
+        if len(self.buf) < 2:
+            return None
+        return 2 + struct.unpack_from("!H", self.buf, 0)[0]
+
+    def feed(self, off, data, out, direction):
+        if self.lost:
+            return
+        if not self.buf:
+            self.start = off
+        self.buf += data
+        while True:
+            n = self._need()
+            if n is None or len(self.buf) < n:
+                return
+            out.append(StreamMessage(direction, self.start,
+                                     bytes(self.buf[:n]), self.kind,
+                                     self.gaps))
+            self.start += n
+            del self.buf[:n]
+            self.gaps = []
+
+    def gap(self, start, end, out, direction):
+        if self.buf:
+            out.append(StreamMessage(direction, self.start, bytes(self.buf),
+                                     self.kind, self.gaps + [(start, end)]))
+            self.buf = bytearray()
+        self.lost = True           # can't find the next record boundary
+
+    def flush(self, out, direction):
+        if self.buf:
+            out.append(StreamMessage(direction, self.start, bytes(self.buf),
+                                     self.kind, self.gaps +
+                                     [("unterminated", "")]))
+            self.buf = bytearray()
+
+
+class HttpFramer:
+    """HTTP/1.x: headers, then a body by Content-Length or chunked."""
+    kind = "http"
+    MAX_HEAD = 65536
+
+    def __init__(self):
+        self.buf, self.start, self.gaps = bytearray(), 0, []
+        self.lost = False
+
+    def _message_len(self):
+        i = self.buf.find(b"\r\n\r\n")
+        if i < 0:
+            return None
+        head = bytes(self.buf[:i]).lower()
+        hl = i + 4
+        m = re.search(rb"\r\ncontent-length:\s*(\d+)", head)
+        if m:
+            return hl + int(m.group(1))
+        if re.search(rb"\r\ntransfer-encoding:\s*chunked", head):
+            p = hl
+            while True:
+                j = self.buf.find(b"\r\n", p)
+                if j < 0:
+                    return None
+                try:
+                    size = int(bytes(self.buf[p:j]).split(b";")[0], 16)
+                except ValueError:
+                    return len(self.buf)        # malformed: take it all
+                p = j + 2 + size + 2
+                if size == 0:
+                    return p if len(self.buf) >= p else None
+                if len(self.buf) < p:
+                    return None
+        if head.startswith(b"http/") and not re.match(
+                rb"http/1\.\d (1\d\d|204|304)", head):
+            return None if not self.closing else len(self.buf)
+        return hl
+
+    closing = False
+
+    def feed(self, off, data, out, direction):
+        if self.lost:
+            return
+        if not self.buf:
+            self.start = off
+        self.buf += data
+        while self.buf:
+            n = self._message_len()
+            if n is None:
+                if len(self.buf) > self.MAX_HEAD and \
+                        b"\r\n\r\n" not in self.buf:
+                    self.lost = True
+                return
+            if len(self.buf) < n:
+                return
+            out.append(StreamMessage(direction, self.start,
+                                     bytes(self.buf[:n]), self.kind,
+                                     self.gaps))
+            self.start += n
+            del self.buf[:n]
+            self.gaps = []
+
+    def gap(self, start, end, out, direction):
+        if self.buf:
+            out.append(StreamMessage(direction, self.start, bytes(self.buf),
+                                     self.kind, self.gaps + [(start, end)]))
+            self.buf = bytearray()
+        self.lost = True
+
+    def flush(self, out, direction):
+        self.closing = True
+        if self.buf:
+            n = self._message_len()
+            data = bytes(self.buf if n is None else self.buf[:n])
+            gaps = self.gaps if n is not None and n <= len(self.buf) else \
+                self.gaps + [("unterminated", "")]
+            out.append(StreamMessage(direction, self.start, data, self.kind,
+                                     gaps))
+            self.buf = bytearray()
+
+
+def framer_for(sport, dport, first=b""):
+    """Pick a framer from the ports (or the first bytes)."""
+    ports = {sport, dport}
+    if ports & {25, 587, 110, 143, 21, 465, 993, 995} and \
+            not ports & {465, 993, 995}:
+        return LineFramer
+    if 53 in ports:
+        return lambda: LengthFramer("dns")
+    if ports & {443, 465, 993, 995, 853} or first[:1] in (b"\x16",
+                                                          b"\x17"):
+        return lambda: LengthFramer("tls")
+    if ports & {80, 8080, 8000} or re.match(rb"^[A-Z]+ \S+ HTTP/1|^HTTP/1",
+                                            first or b""):
+        return HttpFramer
+    return LineFramer
+
+
+class _Dir:
+    __slots__ = ("base", "next", "held", "held_bytes", "fin_at", "closed",
+                 "framer", "midstream", "dups", "conflicts", "gap_bytes",
+                 "delivered", "recent", "pre", "pre_bytes", "pre_since",
+                 "pre_fin")
+
+    def __init__(self):
+        self.pre = []              # (seq, flags, data) before the SYN
+        self.pre_bytes = 0
+        self.pre_since = None
+        self.pre_fin = None
+        self.base = None
+        self.next = 0
+        self.held = {}             # relative offset -> bytes
+        self.held_bytes = 0
+        self.fin_at = None
+        self.closed = False
+        self.framer = None
+        self.midstream = False
+        self.dups = self.conflicts = self.gap_bytes = self.delivered = 0
+        self.recent = bytearray()   # last delivered bytes (overlap checks)
+
+
+class TcpStream:
+    __slots__ = ("key", "a", "dirs", "last", "messages", "notes", "reset")
+
+    def __init__(self, key, a, now):
+        self.key, self.a, self.last = key, a, now
+        self.dirs = (_Dir(), _Dir())
+        self.messages = []
+        self.notes = []
+        self.reset = False
+
+
+class TcpReassembler:
+    """Both directions of each TCP connection, in order, with holes
+    reported. Memory is bounded per stream and in total; the oldest
+    stream is closed first (its holes become gap markers)."""
+
+    RECENT = 65536
+
+    SYN_WAIT = 3.0     # capture seconds to wait for a SYN seen out of order
+
+    def __init__(self, per_stream=256 * 1024, total=32 * 1024 * 1024,
+                 idle=300.0, max_streams=4096, max_messages=2000,
+                 framer=None):
+        self.per_stream, self.total_cap = per_stream, total
+        self.idle, self.max_streams = idle, max_streams
+        self.max_messages = max_messages
+        self.framer_choice = framer
+        self.streams = OrderedDict()
+        self.total = 0
+        self.closed = []           # streams finished (kept briefly)
+        self.recent_closed = OrderedDict()   # key -> stream (late copies)
+        self.evicted = 0
+        self.late = 0
+
+    @staticmethod
+    def stream_key(src, sport, dst, dport):
+        a, b = (src, sport), (dst, dport)
+        return (a, b) if a <= b else (b, a)
+
+    def segment(self, src, sport, dst, dport, seq, flags, payload, now):
+        """flags: TCP flag bits (int). Returns the stream."""
+        key = self.stream_key(src, sport, dst, dport)
+        st = self.streams.get(key)
+        if st is None and key in self.recent_closed and not (
+                flags & 0x02 and not flags & 0x10):
+            self.late += 1             # a late copy of a finished stream
+            return self.recent_closed[key]
+        if st is None:
+            # the side that sends the SYN (or speaks first) is direction 0
+            a = (src, sport) if (flags & 0x02 and not flags & 0x10) or \
+                not flags & 0x02 else (dst, dport)
+            st = self.streams[key] = TcpStream(key, a, now)
+            self._bound(now)
+        else:
+            self.streams.move_to_end(key)
+        st.last = now
+        if flags & 0x02 and not st.messages and not any(
+                x.delivered for x in st.dirs):
+            # the SYN says who opened the connection (direction 0)
+            opener = (src, sport) if not flags & 0x10 else (dst, dport)
+            if opener != st.a:
+                st.a = opener
+                st.dirs = (st.dirs[1], st.dirs[0])
+        di = 0 if (src, sport) == st.a else 1
+        d = st.dirs[di]
+        if d.framer is None:
+            ch = self.framer_choice or framer_for(sport, dport, payload)
+            d.framer = ch()
+        if flags & 0x04:                       # RST: finish both sides
+            st.reset = True
+            st.notes.append("connection reset")
+            self._finish(st, now)
+            return st
+        if d.base is None:
+            if flags & 0x02:
+                d.base = (seq + 1) & 0xFFFFFFFF
+                pre, d.pre, d.pre_bytes = d.pre, [], 0
+                self.total -= sum(len(x[2]) for x in pre)
+                for s2, f2, p2 in pre:
+                    self._take(st, di, d, s2, f2, p2)
+            else:
+                # no SYN yet: hold briefly in case it arrives out of order
+                d.pre.append((seq, flags, bytes(payload)))
+                d.pre_bytes += len(payload)
+                self.total += len(payload)
+                if d.pre_since is None:
+                    d.pre_since = now
+                if d.pre_bytes > self.per_stream or \
+                        now - d.pre_since > self.SYN_WAIT:
+                    self._start_midstream(st, di, d)
+                return st
+        self._take(st, di, d, seq, flags, payload)
+        if all(x.closed for x in st.dirs) or (
+                st.dirs[0].closed and st.dirs[1].base is None and
+                not st.dirs[1].pre):
+            self._finish(st, now)
+        return st
+
+    def _start_midstream(self, st, di, d):
+        """Give up waiting for the SYN: start at the earliest byte held."""
+        pre, d.pre, d.pre_bytes = d.pre, [], 0
+        self.total -= sum(len(x[2]) for x in pre)
+        if not pre:
+            return
+        first = pre[0][0]
+        d.base = min((x[0] for x in pre),
+                     key=lambda x: (x - first + 0x80000000) & 0xFFFFFFFF)
+        d.midstream = True
+        st.notes.append(f"direction {di} started mid-stream")
+        for s2, f2, p2 in pre:
+            self._take(st, di, d, s2, f2, p2)
+
+    def _take(self, st, di, d, seq, flags, payload):
+        rel = (seq + (1 if flags & 0x02 else 0) - d.base) & 0xFFFFFFFF
+        if rel >= 0x80000000:                  # before what we know: old
+            if payload:
+                d.dups += 1
+            return st
+        if payload:
+            self._place(st, di, d, rel, payload)
+        if flags & 0x01:
+            d.fin_at = rel + len(payload)
+            self._drain(st, di, d)
+
+    def _place(self, st, di, d, rel, data):
+        end = rel + len(data)
+        if end <= d.next:                      # fully old: duplicate?
+            d.dups += 1
+            self._check_old(st, d, rel, data)
+            return
+        if rel < d.next:                       # partly old
+            self._check_old(st, d, rel, data[:d.next - rel])
+            data = data[d.next - rel:]
+            rel = d.next
+        # overlap with held segments: first copy wins
+        for o in list(d.held):
+            b = d.held[o]
+            lo, hi = max(o, rel), min(o + len(b), rel + len(data))
+            if lo < hi:
+                if b[lo - o:hi - o] != data[lo - rel:hi - rel]:
+                    d.conflicts += 1
+                    st.notes.append(f"conflicting retransmission at byte "
+                                    f"{lo} (first copy kept)")
+                else:
+                    d.dups += 1
+        if rel in d.held and len(d.held[rel]) >= len(data):
+            return
+        if rel in d.held:
+            d.held_bytes -= len(d.held[rel])
+            self.total -= len(d.held[rel])
+        d.held[rel] = bytes(data)
+        d.held_bytes += len(data)
+        self.total += len(data)
+        self._drain(st, di, d)
+        if d.held_bytes > self.per_stream:     # a hole that won't fill
+            self._skip_hole(st, di, d)
+        if self.total > self.total_cap:
+            self._bound(st.last)
+
+    def _check_old(self, st, d, rel, data):
+        back = d.next - rel
+        if back <= len(d.recent):
+            have = d.recent[len(d.recent) - back:len(d.recent) - back +
+                            len(data)]
+            if have and bytes(have) != data[:len(have)]:
+                d.conflicts += 1
+                st.notes.append(f"conflicting retransmission at byte {rel} "
+                                f"(first copy kept)")
+
+    def _drain(self, st, di, d):
+        while True:
+            # the held segment that covers d.next (lowest start first)
+            cand = [o for o in d.held if o <= d.next]
+            if not cand:
+                break
+            o = min(cand)
+            b = d.held.pop(o)
+            d.held_bytes -= len(b)
+            self.total -= len(b)
+            if o + len(b) <= d.next:
+                continue
+            chunk = b[d.next - o:]
+            self._deliver(st, di, d, d.next, chunk)
+        if d.fin_at is not None and d.next >= d.fin_at and not d.held:
+            if not d.closed:
+                d.closed = True
+                d.framer.flush(st.messages, di)
+
+    def _deliver(self, st, di, d, off, chunk):
+        d.next = off + len(chunk)
+        d.delivered += len(chunk)
+        d.recent += chunk
+        if len(d.recent) > self.RECENT:
+            del d.recent[:len(d.recent) - self.RECENT]
+        if len(st.messages) < self.max_messages:
+            d.framer.feed(off, chunk, st.messages, di)
+
+    def _skip_hole(self, st, di, d):
+        if not d.held:
+            return
+        nxt = min(d.held)
+        if nxt > d.next:
+            d.gap_bytes += nxt - d.next
+            d.framer.gap(d.next, nxt, st.messages, di)
+            st.notes.append(f"bytes {d.next}–{nxt} of direction {di} were "
+                            f"never seen")
+            d.next = nxt
+        self._drain(st, di, d)
+
+    def _finish(self, st, now):
+        for di, d in enumerate(st.dirs):
+            if d.framer is None:
+                continue
+            if d.base is None:
+                self._start_midstream(st, di, d)
+            while d.held:
+                self._skip_hole(st, di, d)
+            if not d.closed:
+                d.closed = True
+                d.framer.flush(st.messages, di)
+        self.streams.pop(st.key, None)
+        self.recent_closed[st.key] = st
+        if len(self.recent_closed) > 1024:
+            self.recent_closed.popitem(last=False)
+        self.closed.append(st)
+        if len(self.closed) > 256:
+            del self.closed[:64]
+
+    def _bound(self, now):
+        while self.streams and (len(self.streams) > self.max_streams or
+                                self.total > self.total_cap):
+            _k, st = next(iter(self.streams.items()))
+            st.notes.append("closed early to stay within memory")
+            self.evicted += 1
+            self._finish(st, now)
+
+    def expire(self, now):
+        for st in [s for s in self.streams.values()
+                   if now - s.last > self.idle]:
+            st.notes.append("idle")
+            self._finish(st, now)
+
+    def flush(self, now=0.0):
+        for st in list(self.streams.values()):
+            self._finish(st, now)
+        return self.closed
+
+    def all_streams(self):
+        return list(self.closed) + list(self.streams.values())
+
+
+def reassemble_frames(frames, **kw):
+    """Feed (raw, ts, lt) Ethernet/IP frames through the defragmenter and
+    the TCP reassembler. → (TcpReassembler, IpDefragmenter)."""
+    tr = TcpReassembler(**kw)
+    df = IpDefragmenter()
+    for raw, ts, lt in frames:
+        d = dissect(raw, lt)
+        ipn = next((n for n in d.nodes if n.key in ("ip", "ipv6")), None)
+        if ipn is None:
+            continue
+        src = d.get("ip.src") or d.get("ipv6.src")
+        dst = d.get("ip.dst") or d.get("ipv6.dst")
+        if ipn.key == "ip" and (d.get("ip.flags.mf") or
+                                d.get("ip.frag_offset")):
+            hl = d.get("ip.hdr_len")
+            pay = raw[ipn.offset + hl:ipn.offset + ipn.length]
+            whole, _w = df.add((src, dst, d.get("ip.proto"), d.get("ip.id")),
+                               d.get("ip.frag_offset"),
+                               bool(d.get("ip.flags.mf")), pay, ts)
+            if whole is None or d.get("ip.proto") != 6:
+                continue
+            seg = whole
+        else:
+            tcpn = next((n for n in d.nodes if n.key == "tcp"), None)
+            if tcpn is None:
+                continue
+            seg = raw[tcpn.offset:tcpn.offset + tcpn.length]
+        if len(seg) < 20:
+            continue
+        sp, dp, seq = struct.unpack_from("!HHI", seg, 0)
+        hl = (seg[12] >> 4) * 4
+        tr.segment(src, sp, dst, dp, seq, seg[13], seg[hl:], ts)
+    return tr, df
+
+
 def build_client_hello(sni, alpn=("h2", "http/1.1"), pad=600, rnd=None):
     """A syntactically valid TLS 1.3-style ClientHello (used by Demo Mode
     and the self-tests). `rnd` = the 32-byte client random (scenarios pass
@@ -38862,6 +39476,36 @@ def bench_components():
 
 
 BENCH_EXTRA.append(bench_components)
+
+
+def bench_dissect():
+    """Own dissector and stream reassembly speed on the scripted corpus."""
+    frames = ScenarioBuilder().home_network() + \
+        ScenarioBuilder(t0=SCENARIO_T0 + 5000).protocol_tour()
+    t0 = time.perf_counter()
+    n = 0
+    while time.perf_counter() - t0 < 1.0:
+        for raw, _ts, lt in frames:
+            dissect(raw, lt)
+        n += len(frames)
+    out = {"dissect_us_per_pkt": (time.perf_counter() - t0) / n * 1e6}
+    corpus = _stream_corpus() * 1
+    t0 = time.perf_counter()
+    k = 0
+    while time.perf_counter() - t0 < 1.0:
+        tr, _df = reassemble_frames(corpus)
+        tr.flush()
+        k += len(corpus)
+    out["reassembly_us_per_pkt"] = (time.perf_counter() - t0) / k * 1e6
+    built = 0
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 0.5:
+        built += len(ScenarioBuilder().home_network())
+    out["builder_frames_per_s"] = built / (time.perf_counter() - t0)
+    return out
+
+
+BENCH_EXTRA.append(bench_dissect)
 
 @self_test()
 def t_ip_reuse_keeps_histories_apart(ctx):
@@ -41720,6 +42364,178 @@ def test_hex_dump_ranges_match_bytes(ctx):
         hexes = "".join(text_at(a, b) for a, b in spans[0::2])
         assert hexes.replace(" ", "") == raw[f.offset:f.offset +
                                              f.length].hex(), f
+
+
+def _stream_corpus(seed=5):
+    """A mail and a web conversation cut into small segments, with a seq
+    number near the 2^32 wrap, built with our own builder."""
+    sb = ScenarioBuilder(seed=seed)
+    L = PK
+    me, nas = sb.ME, sb.NAS
+    frames = []
+    t = [SCENARIO_T0]
+
+    def emit(p):
+        t[0] += 0.001
+        frames.append((bytes(p), round(t[0], 6), 1))
+
+    def convo(sport, dport, cseq, sseq, lines_c, lines_s, seg=7):
+        out = L.Ether(src=me[1], dst=nas[1]) / L.IP(src=me[0], dst=nas[0])
+        back = L.Ether(src=nas[1], dst=me[1]) / L.IP(src=nas[0], dst=me[0])
+        emit(out / L.TCP(sport=sport, dport=dport, flags="S", seq=cseq))
+        emit(back / L.TCP(sport=dport, dport=sport, flags="SA", seq=sseq,
+                          ack=cseq + 1))
+        c, s = cseq + 1, sseq + 1
+        for a, b in zip(lines_s, lines_c + [b""] * len(lines_s)):
+            for i in range(0, len(a), seg):
+                emit(back / L.TCP(sport=dport, dport=sport, flags="PA",
+                                  seq=s & 0xFFFFFFFF) / L.Raw(a[i:i + seg]))
+                s += len(a[i:i + seg])
+            for i in range(0, len(b), seg):
+                emit(out / L.TCP(sport=sport, dport=dport, flags="PA",
+                                 seq=c & 0xFFFFFFFF) / L.Raw(b[i:i + seg]))
+                c += len(b[i:i + seg])
+        emit(out / L.TCP(sport=sport, dport=dport, flags="FA",
+                         seq=c & 0xFFFFFFFF))
+        emit(back / L.TCP(sport=dport, dport=sport, flags="FA",
+                          seq=s & 0xFFFFFFFF))
+    convo(41025, 25, 0xFFFFFF00, 5000,
+          [b"EHLO laptop\r\n", b"MAIL FROM:<a@example.com>\r\n",
+           b"RCPT TO:<b@example.org>\r\n", b"QUIT\r\n"],
+          [b"220 mail.example.org ESMTP\r\n", b"250-mail.example.org\r\n"
+           b"250 SIZE 10240000\r\n", b"250 OK\r\n", b"250 Accepted\r\n"])
+    body = b"x" * 300
+    convo(41080, 80, 1000, 0xFFFFFFF0,
+          [b"GET /a HTTP/1.1\r\nHost: plain.example.org\r\n\r\n",
+           b"GET /b HTTP/1.1\r\nHost: plain.example.org\r\n\r\n"],
+          [b"HTTP/1.1 200 OK\r\nContent-Length: 300\r\n\r\n" + body,
+           b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+           b"5\r\nhello\r\n0\r\n\r\n"], seg=40)
+    return frames
+
+
+def _messages(tr):
+    out = []
+    for st in sorted(tr.all_streams(), key=lambda s: s.key):
+        out.append((st.key, tuple(sorted(m.key() for m in st.messages))))
+    return out
+
+
+@self_test(slow=False)
+def test_tcp_reassembly_determinism(ctx):
+    """The same conversation fed in order, shuffled within a 50-packet
+    window, and with every segment duplicated gives identical messages,
+    across a sequence-number wrap."""
+    frames = _stream_corpus()
+    tr, _df = reassemble_frames(frames)
+    tr.flush()
+    ref = _messages(tr)
+    smtp = next(st for st in tr.all_streams() if st.key[1][1] == 25 or
+                st.key[0][1] == 25)
+    lines = [m.data for m in smtp.messages if m.direction == 0]
+    assert lines == [b"EHLO laptop\r\n", b"MAIL FROM:<a@example.com>\r\n",
+                     b"RCPT TO:<b@example.org>\r\n", b"QUIT\r\n"], lines
+    assert not any(m.partial for m in smtp.messages)
+    web = next(st for st in tr.all_streams() if 80 in (st.key[0][1],
+                                                       st.key[1][1]))
+    resp = [m for m in web.messages if m.direction == 1]
+    assert len(resp) == 2 and resp[0].data.endswith(b"x" * 300) and \
+        resp[1].data.endswith(b"0\r\n\r\n"), resp
+    rnd = random.Random(3)
+    shuffled = []
+    for i in range(0, len(frames), 50):
+        w = frames[i:i + 50]
+        rnd.shuffle(w)
+        shuffled += w
+    for variant in (shuffled, [f for f in frames for _ in (0, 1)]):
+        tr2, _ = reassemble_frames(variant)
+        tr2.flush()
+        assert _messages(tr2) == ref
+
+
+@self_test(slow=False)
+def test_tcp_reassembly_gaps_conflicts_midstream(ctx):
+    """A lost segment makes the message partial with the missing byte
+    range; a retransmission with different bytes is flagged and the first
+    copy kept; a stream that starts mid-way is read from there; memory
+    stays bounded."""
+    tr = TcpReassembler(per_stream=64)
+    a, b = ("10.0.0.2", 40000), ("10.0.0.9", 25)
+    seg = lambda seq, data, fl=0x18: tr.segment(a[0], a[1], b[0], b[1], seq,
+                                                fl, data, 1.0)
+    seg(100, b"", 0x02)
+    seg(101, b"HELO a\r\n")
+    seg(129, b"QUIT\r\n")                   # bytes 8..28 never arrive
+    seg(101, b"HELX a\r\n")                 # conflicting retransmission
+    st = seg(135, b"", 0x11)
+    tr.flush()
+    msgs = [m for m in st.messages if m.direction == 0]
+    assert msgs[0].data == b"HELO a\r\n" and not msgs[0].partial
+    gap_msgs = [m for m in msgs if m.partial]
+    assert gap_msgs and gap_msgs[0].gaps[0] == (8, 28), msgs
+    assert any("conflicting retransmission" in n for n in st.notes)
+    assert any("never seen" in n for n in st.notes)
+    tr2 = TcpReassembler()
+    st2 = tr2.segment("10.0.0.2", 40001, "10.0.0.9", 110, 777777,
+                      0x18, b"+OK ready\r\n", 1.0)
+    st2 = tr2.segment("10.0.0.2", 40001, "10.0.0.9", 110, 777777 + 11,
+                      0x18, b"+OK bye\r\n", 1.0)
+    tr2.flush()
+    assert [m.data for m in st2.messages] == [b"+OK ready\r\n",
+                                              b"+OK bye\r\n"]
+    assert any("mid-stream" in n for n in st2.notes)
+    tr3 = TcpReassembler(total=4096, max_streams=8)
+    for i in range(50):
+        tr3.segment("10.0.0.2", 30000 + i, "10.0.0.9", 80, 1000, 0x18,
+                    b"z" * 10, 1.0)
+        tr3.segment("10.0.0.2", 30000 + i, "10.0.0.9", 80, 5000, 0x18,
+                    b"y" * 200, 1.0)            # held behind a hole
+    assert len(tr3.streams) <= 8 and tr3.total <= 4096 and tr3.evicted
+
+
+@self_test(slow=False)
+def test_ip_defragmentation(ctx):
+    """Fragments in any order become one datagram; overlapping fragments
+    with different bytes are flagged and the first copy wins; incomplete
+    datagrams expire; oversized ones are refused."""
+    df = IpDefragmenter(timeout=30)
+    data = bytes(range(256)) * 4
+    parts = [(0, True, data[:400]), (800, False, data[800:]),
+             (400, True, data[400:800])]
+    out = None
+    for off, more, chunk in parts:
+        out, warn = df.add(("a", "b", 17, 1), off, more, chunk, 10.0)
+    assert out == data and not warn
+    df.add(("a", "b", 17, 2), 0, True, b"A" * 16, 10.0)
+    df.add(("a", "b", 17, 2), 8, True, b"B" * 16, 10.0)
+    out, warn = df.add(("a", "b", 17, 2), 24, False, b"C" * 8, 10.0)
+    assert out == b"A" * 16 + b"B" * 8 + b"C" * 8, out
+    assert "different content" in warn and df.conflicts == 1
+    df.add(("a", "b", 17, 3), 0, True, b"x" * 8, 10.0)
+    df.add(("a", "b", 17, 4), 0, True, b"y" * 8, 50.0)
+    assert ("a", "b", 17, 3) not in df.pending and df.expired >= 1
+    out, warn = df.add(("a", "b", 17, 5), 65530, False, b"z" * 10, 50.0)
+    assert out is None and "too large" in warn
+    # end to end: a fragmented UDP datagram through the frame reader
+    sb = ScenarioBuilder()
+    whole = bytes(PK.IP(src=sb.ME[0], dst=sb.GW[0], id=99) /
+                  PK.UDP(sport=5000, dport=5001) / PK.Raw(b"q" * 100))
+    hdr, pay = bytearray(whole[:20]), whole[20:]
+
+    def frag(off, more, chunk):
+        h = bytearray(hdr)
+        struct.pack_into("!H", h, 2, 20 + len(chunk))
+        struct.pack_into("!H", h, 6, (0x2000 if more else 0) | (off // 8))
+        struct.pack_into("!H", h, 10, 0)
+        struct.pack_into("!H", h, 10, _pk_csum(bytes(h)))
+        return bytes(PK.Ether(src=sb.ME[1], dst=sb.GW[1], type=0x0800)) + \
+            bytes(h) + chunk
+    frames = [(frag(56, False, pay[56:]), 1.0, 1),
+              (frag(0, True, pay[:56]), 1.1, 1)]
+    d0 = dissect(frames[1][0])
+    assert "fragment" in d0.nodes[2].warning
+    _tr, df2 = reassemble_frames(frames)
+    assert df2.completed == 1
 
 
 def bench_report(seconds=2.0):
