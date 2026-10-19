@@ -37216,6 +37216,21 @@ class LengthFramer:
             if len(self.buf) < 5:
                 return None
             return 5 + struct.unpack_from("!H", self.buf, 3)[0]
+        if self.kind == "nbss":
+            if len(self.buf) < 4:
+                return None
+            return 4 + ((self.buf[1] & 1) << 16 | self.buf[2] << 8 |
+                        self.buf[3])
+        if self.kind == "mqtt":
+            n, mult, i = 0, 1, 1
+            while i < len(self.buf) and i <= 4:
+                b = self.buf[i]
+                n += (b & 0x7F) * mult
+                mult *= 128
+                i += 1
+                if not b & 0x80:
+                    return 1 + (i - 1) + n
+            return None
         if len(self.buf) < 2:
             return None
         return 2 + struct.unpack_from("!H", self.buf, 0)[0]
@@ -37344,9 +37359,14 @@ def framer_for(sport, dport, first=b""):
     if ports & {443, 465, 993, 995, 853} or first[:1] in (b"\x16",
                                                           b"\x17"):
         return lambda: LengthFramer("tls")
-    if ports & {80, 8080, 8000} or re.match(rb"^[A-Z]+ \S+ HTTP/1|^HTTP/1",
-                                            first or b""):
+    if ports & {80, 8080, 8000, 5060, 554} or re.match(
+            rb"^[A-Z]+ \S+ (HTTP/1|RTSP/1|SIP/2)|^(HTTP/1|RTSP/1|SIP/2)",
+            first or b""):
         return HttpFramer
+    if ports & {445, 139}:
+        return lambda: LengthFramer("nbss")
+    if ports & {1883}:
+        return lambda: LengthFramer("mqtt")
     return LineFramer
 
 
@@ -37695,11 +37715,386 @@ def _deep_preview(kind, data):
     return f"{len(data)} bytes"
 
 
+# ---- V5 M5: protocol transactions -------------------------------------------
+#  Request/response pairs and handshakes built from single packets (DNS,
+#  DHCP, TLS, NTP, SIP over UDP) and from reassembled stream messages
+#  (HTTP/1, RTSP, SIP over TCP, SSH, SMB, MQTT). Each finished exchange is
+#  one "transaction" dict of plain values (it crosses the worker pipe).
+#  Nothing private leaves the tracker: HTTP paths lose their query string,
+#  cookies and auth headers are never read, MQTT topics and payloads are
+#  never read (counts only).
+_SMB_DIALECTS = {0x0202: "2.0.2", 0x0210: "2.1", 0x0300: "3.0",
+                 0x0302: "3.0.2", 0x0311: "3.1.1", 0x02FF: "2.x (any)"}
+_MQTT_TYPES = {1: "CONNECT", 2: "CONNACK", 3: "PUBLISH", 4: "PUBACK",
+               8: "SUBSCRIBE", 9: "SUBACK", 12: "PINGREQ", 13: "PINGRESP",
+               14: "DISCONNECT"}
+_MQTT_CONNACK = {0: "accepted", 1: "refused: protocol version",
+                 2: "refused: client id", 3: "refused: server unavailable",
+                 4: "refused: bad user name or password",
+                 5: "refused: not authorized"}
+_NTP_EPOCH = 2208988800
+
+
+def _ntp_time(b):
+    sec, frac = struct.unpack("!II", b)
+    return sec - _NTP_EPOCH + frac / 2 ** 32 if sec else 0.0
+
+
+class ProtocolTracker:
+    """Pairs requests with replies and follows handshakes. Bounded: at
+    most MAX_PENDING open exchanges of each kind; old ones expire as
+    unanswered."""
+
+    MAX_PENDING = 2048
+    DNS_TIMEOUT = 5.0
+
+    def __init__(self):
+        self.out = []              # finished transactions
+        self.findings = []
+        self.dns = OrderedDict()   # (client, cport, id) -> state
+        self.dns_last = OrderedDict()   # (client, name, type) -> ts
+        self.dhcp = OrderedDict()  # xid -> state
+        self.dhcp_servers = set()
+        self._dhcp_warned = False
+        self.http = {}             # stream -> deque of pending requests
+        self.tls = OrderedDict()   # stream -> handshake state
+        self.ntp = OrderedDict()   # (client, server, xmt) -> (ts, no)
+        self.ssh = {}              # stream -> banners
+        self.mqtt = {}             # stream -> counters
+        self.counts = Counter()
+
+    def take(self):
+        out, self.out = self.out, []
+        f, self.findings = self.findings, []
+        return out, f
+
+    def _emit(self, **t):
+        self.counts[t["kind"]] += 1
+        self.out.append(t)
+
+    @staticmethod
+    def _bound(od, n):
+        while len(od) > n:
+            od.popitem(last=False)
+
+    # ---- single packets ----------------------------------------------------------
+    def packet(self, no, ts, d, src, dst):
+        if d.get("dns.id") is not None and 53 in (d.get("udp.srcport"),
+                                                  d.get("udp.dstport"),
+                                                  d.get("tcp.srcport"),
+                                                  d.get("tcp.dstport")):
+            self._dns(no, ts, d, src, dst)
+        if d.get("dhcp.id") is not None:
+            self._dhcp(no, ts, d, src, dst)
+        if d.get("tls.handshake.type") is not None or \
+                21 in d.values("tls.record.content_type"):
+            self._tls(no, ts, d, src, dst)
+        if d.get("ntp.flags.mode") is not None:
+            self._ntp(no, ts, d, src, dst)
+        if d.get("udp.srcport") is not None and 5060 in (
+                d.get("udp.srcport"), d.get("udp.dstport")):
+            node = next((n for n in d.nodes if n.key == "udp"), None)
+            if node is not None:
+                self._sip_text(no, ts, d.raw[node.offset + 8:node.offset +
+                                              node.length], src, dst)
+        self._expire(ts)
+
+    def _expire(self, ts):
+        while self.dns:
+            k, s = next(iter(self.dns.items()))
+            if ts - s["ts"] <= self.DNS_TIMEOUT:
+                break
+            self.dns.popitem(last=False)
+            self._emit(kind="dns", ts=s["ts"], no=s["no"], client=k[0],
+                       server=s["server"], name=s["name"], qtype=s["qtype"],
+                       result="no answer", latency_ms=None,
+                       tries=s["tries"], answers=0,
+                       summary=f"{s['name']} ({s['qtype']}): no answer "
+                               f"from {s['server']}")
+
+    def _dns(self, no, ts, d, src, dst):
+        sport = d.get("udp.srcport") or d.get("tcp.srcport")
+        dport = d.get("udp.dstport") or d.get("tcp.dstport")
+        qid = d.get("dns.id")
+        name = d.get("dns.qry.name") or "?"
+        qt = d.get("dns.qry.type")
+        qtn = _DNS_TYPES.get(qt, str(qt))
+        if not d.get("dns.flags.response"):
+            last = self.dns_last.get((src, name, qtn))
+            k = (src, sport, qid)
+            tries = 1
+            if last is not None and ts - last < self.DNS_TIMEOUT:
+                prev = next((s for s in self.dns.values()
+                             if s["client"] == src and s["name"] == name and
+                             s["qtype"] == qtn), None)
+                if prev is not None:
+                    tries = prev["tries"] + 1
+            self.dns[k] = {"ts": ts, "no": no, "name": name, "qtype": qtn,
+                           "server": dst, "client": src, "tries": tries}
+            self.dns_last[(src, name, qtn)] = ts
+            self._bound(self.dns, self.MAX_PENDING)
+            self._bound(self.dns_last, self.MAX_PENDING)
+            return
+        s = self.dns.pop((dst, dport, qid), None)
+        if s is None:
+            return
+        rc = d.get("dns.flags.rcode") or 0
+        lat = (ts - s["ts"]) * 1000.0
+        # an answered retry closes its earlier tries too
+        for k2 in [k for k, v in self.dns.items() if v["client"] == dst and
+                   v["name"] == s["name"] and v["qtype"] == s["qtype"]]:
+            self.dns.pop(k2, None)
+        res = _DNS_RCODES.get(rc, f"code {rc}")
+        n_ans = d.get("dns.count.answers") or 0
+        self._emit(kind="dns", ts=s["ts"], no=s["no"], reply_no=no,
+                   client=dst, server=src, name=s["name"], qtype=s["qtype"],
+                   result=res, rcode=rc, latency_ms=round(lat, 2),
+                   tries=s["tries"], answers=n_ans,
+                   summary=f"{s['name']} ({s['qtype']}): {res}, "
+                           f"{lat:.0f} ms via {src}"
+                           + (f" after {s['tries']} tries"
+                              if s["tries"] > 1 else ""))
+
+    def _dhcp(self, no, ts, d, src, dst):
+        xid = d.get("dhcp.id")
+        mt = d.get("dhcp.option.dhcp")
+        if mt is None:
+            return
+        name = _DHCP_MSG.get(mt, str(mt))
+        s = self.dhcp.get(xid)
+        if s is None:
+            s = self.dhcp[xid] = {"ts": ts, "no": no, "steps": [],
+                                  "mac": d.get("dhcp.hw.mac_addr") or "",
+                                  "host": "", "servers": set()}
+            self._bound(self.dhcp, self.MAX_PENDING)
+        s["steps"].append(name)
+        if d.get("dhcp.option.hostname"):
+            s["host"] = d.get("dhcp.option.hostname")
+        server = d.get("dhcp.option.dhcp_server_id") or (
+            src if mt in (2, 5, 6) else "")
+        if mt in (2, 5, 6) and server:
+            s["servers"].add(server)
+            self.dhcp_servers.add(server)
+            if len(self.dhcp_servers) > 1 and not self._dhcp_warned:
+                self._dhcp_warned = True
+                self.findings.append((
+                    no, ts, "warn", "Security", "More than one DHCP server "
+                    "answered on this network (" + ", ".join(sorted(
+                        self.dhcp_servers)) + ")", "dhcp.option."
+                    "dhcp_server_id"))
+        if mt in (5, 6):
+            self.dhcp.pop(xid, None)
+            lease = d.get("dhcp.option.ip_address_lease_time")
+            ip = d.get("dhcp.ip.your")
+            steps = " → ".join(s["steps"])
+            self._emit(kind="dhcp", ts=s["ts"], no=s["no"], reply_no=no,
+                       client=s["mac"], server=server, host=s["host"],
+                       ip=ip, lease_s=lease, result=name,
+                       latency_ms=round((ts - s["ts"]) * 1000.0, 2),
+                       steps=steps,
+                       summary=f"{s['host'] or s['mac']}: {steps}"
+                               + (f", got {ip}" if mt == 5 else "")
+                               + (f" for {human_duration(lease)}"
+                                  if lease and mt == 5 else "")
+                               + f" from {server}")
+
+    def _tls(self, no, ts, d, src, dst):
+        sp = d.get("tcp.srcport")
+        dp = d.get("tcp.dstport")
+        if sp is None:
+            return
+        key = repr(TcpReassembler.stream_key(src, sp, dst, dp))
+        hs = d.values("tls.handshake.type")
+        s = self.tls.get(key)
+        if 1 in hs:
+            self.tls[key] = s = {
+                "ts": ts, "no": no, "client": src, "server": dst,
+                "sni": d.get("tls.handshake.extensions_server_name") or "",
+                "alpn": d.get("tls.handshake.extensions_alpn_str") or "",
+                "offered": max(d.values("tls.handshake.extensions."
+                                        "supported_version") or
+                               [d.get("tls.handshake.version") or 0])}
+            self._bound(self.tls, self.MAX_PENDING)
+        if s is None:
+            return
+        alert = 21 in d.values("tls.record.content_type")
+        if 2 in hs or alert:
+            self.tls.pop(key, None)
+            sv = d.values("tls.handshake.extensions.supported_version")
+            ver = sv[0] if sv else d.get("tls.handshake.version") or 0
+            vname = _TLS_VER.get(ver, "?") if 2 in hs else "—"
+            res = "alert before the handshake finished" if alert and \
+                2 not in hs else "ok"
+            lat = (ts - s["ts"]) * 1000.0
+            self._emit(kind="tls", ts=s["ts"], no=s["no"], reply_no=no,
+                       client=s["client"], server=s["server"], name=s["sni"],
+                       alpn=s["alpn"], version=vname, result=res,
+                       latency_ms=round(lat, 2),
+                       summary=f"{s['sni'] or s['server']}: {vname}, "
+                               f"handshake {lat:.0f} ms"
+                               + (f" (client offered {s['alpn']})"
+                                  if s["alpn"] else "") if res == "ok" else
+                               f"{s['sni'] or s['server']}: {res}")
+            if 2 in hs and ver and ver < 0x0303:
+                self.findings.append((no, ts, "warn", "Security",
+                                      f"Old TLS version {vname} chosen for "
+                                      f"{s['sni'] or s['server']}",
+                                      "tls.handshake.version"))
+
+    def _ntp(self, no, ts, d, src, dst):
+        node = next((n for n in d.nodes if n.key == "ntp"), None)
+        if node is None or node.length < 48:
+            return
+        b = d.raw[node.offset:node.offset + 48]
+        mode = b[0] & 7
+        if mode == 3:
+            self.ntp[(src, dst, b[40:48])] = (ts, no)
+            self._bound(self.ntp, self.MAX_PENDING)
+        elif mode == 4:
+            got = self.ntp.pop((dst, src, b[24:32]), None)
+            if got is None:
+                return
+            t1, t2 = _ntp_time(b[24:32]), _ntp_time(b[32:40])
+            t3, t4 = _ntp_time(b[40:48]), ts
+            offset = ((t2 - t1) + (t3 - t4)) / 2 if t1 and t2 and t3 \
+                else None
+            delay = (t4 - t1) - (t3 - t2) if t1 and t2 and t3 else None
+            self._emit(kind="ntp", ts=got[0], no=got[1], reply_no=no,
+                       client=dst, server=src, stratum=b[1],
+                       offset_ms=None if offset is None else
+                       round(offset * 1000, 1),
+                       latency_ms=round((ts - got[0]) * 1000.0, 2),
+                       result="ok",
+                       summary=f"time from {src} (stratum {b[1]})"
+                               + (f", clock offset about "
+                                  f"{offset * 1000:+.0f} ms (only meaningful "
+                                  f"when the client is this computer)"
+                                  if offset is not None else ""))
+
+    def _sip_text(self, no, ts, data, src, dst, kind="sip"):
+        first = data.split(b"\r\n", 1)[0][:200].decode("latin-1", "replace")
+        m = re.match(r"^([A-Z]+) (\S+) (SIP|RTSP)/\d\.\d$", first)
+        r = re.match(r"^(SIP|RTSP)/\d\.\d (\d{3}) ?(.*)$", first)
+        if m:
+            self._emit(kind=m.group(3).lower(), ts=ts, no=no, client=src,
+                       server=dst, method=m.group(1), result="request",
+                       summary=f"{m.group(3)} {m.group(1)} → {dst}")
+        elif r:
+            code = int(r.group(2))
+            self._emit(kind=r.group(1).lower(), ts=ts, no=no, client=dst,
+                       server=src, status=code, result=r.group(3)[:60],
+                       summary=f"{r.group(1)} {code} {r.group(3)[:60]} "
+                               f"from {src}")
+            if code >= 400 and kind == "sip":
+                self.findings.append((no, ts, "note", "Response code",
+                                      f"SIP {code} {r.group(3)[:60]}",
+                                      ""))
+
+    # ---- reassembled messages -----------------------------------------------------
+    def message(self, no, ts, st, m):
+        key = repr(st.key)
+        server = st.key[1] if st.a == st.key[0] else st.key[0]
+        client = st.a
+        data = m.data
+        if m.kind == "http":
+            first = data.split(b"\r\n", 1)[0][:300].decode("latin-1",
+                                                           "replace")
+            if first.startswith(("RTSP/", "SIP/")) or re.match(
+                    r"^[A-Z]+ \S+ (RTSP|SIP)/", first):
+                return self._sip_text(no, ts, data, client[0] if
+                                      m.direction == 0 else server[0],
+                                      server[0] if m.direction == 0 else
+                                      client[0], kind="rtsp")
+            q = self.http.setdefault(key, deque(maxlen=64))
+            mm = re.match(r"^([A-Z]+) (\S+) HTTP/1\.\d", first)
+            if m.direction == 0 and mm:
+                host = re.search(rb"\r\nhost:\s*([^\r\n]+)", data, re.I)
+                q.append((ts, no, mm.group(1), mm.group(2).split("?", 1)[0]
+                          [:200], host.group(1).decode("latin-1",
+                                                       "replace")[:120]
+                          if host else server[0], m.partial))
+            elif m.direction == 1:
+                rr = re.match(r"^HTTP/1\.\d (\d{3}) ?(.*)$", first)
+                if not rr:
+                    return None
+                req = q.popleft() if q else None
+                code = int(rr.group(1))
+                if req is None:
+                    self._emit(kind="http", ts=ts, no=no, client=client[0],
+                               server=server[0], status=code,
+                               result=rr.group(2)[:60],
+                               summary=f"HTTP {code} (its request was not "
+                                       f"captured)")
+                    return None
+                lat = (ts - req[0]) * 1000.0
+                self._emit(kind="http", ts=req[0], no=req[1], reply_no=no,
+                           client=client[0], server=server[0],
+                           method=req[2], name=req[4], path=req[3],
+                           status=code, result=rr.group(2)[:60],
+                           latency_ms=round(lat, 2), bytes=len(data),
+                           partial=bool(req[5] or m.partial),
+                           summary=f"{req[2]} {req[4]}{req[3]} → {code} "
+                                   f"{rr.group(2)[:40]} in {lat:.0f} ms"
+                                   + (" (partial)" if m.partial or req[5]
+                                      else ""))
+            return None
+        if m.kind == "line" and data.startswith(b"SSH-"):
+            s = self.ssh.setdefault(key, {})
+            s[m.direction] = data.strip()[:120].decode("latin-1", "replace")
+            if m.direction == 1 and not s.get("done"):
+                s["done"] = True
+                self._emit(kind="ssh", ts=ts, no=no, client=client[0],
+                           server=server[0], result="banner",
+                           client_banner=s.get(0, ""),
+                           server_banner=s.get(1, ""),
+                           summary=f"SSH to {server[0]}: {s.get(1)}")
+                if len(self.ssh) > self.MAX_PENDING:
+                    self.ssh.clear()
+            return None
+        if m.kind == "nbss" and len(data) >= 4 + 64:
+            smb = data[4:]
+            if smb[:4] == b"\xffSMB" and key not in self.ssh:
+                self.ssh[key] = {"done": True}      # once per connection
+                self._emit(kind="smb", ts=ts, no=no, client=client[0],
+                           server=server[0], dialect="1 (obsolete)",
+                           result="SMB1", summary=f"SMB1 with "
+                           f"{server[0]} (obsolete and unsafe)")
+                self.findings.append((no, ts, "warn", "Security",
+                                      f"SMB version 1 in use with "
+                                      f"{server[0]} (obsolete; disable it "
+                                      f"if you can)", ""))
+            elif smb[:4] == b"\xfeSMB":
+                cmd = struct.unpack_from("<H", smb, 12)[0]
+                flags = struct.unpack_from("<I", smb, 16)[0]
+                if cmd == 0 and flags & 1 and len(smb) >= 64 + 6:
+                    dia = struct.unpack_from("<H", smb, 64 + 4)[0]
+                    dn = _SMB_DIALECTS.get(dia, f"0x{dia:04x}")
+                    self._emit(kind="smb", ts=ts, no=no, client=client[0],
+                               server=server[0], dialect=dn, result="ok",
+                               summary=f"SMB {dn} with {server[0]}")
+            return None
+        if m.kind == "mqtt" and data:
+            t = data[0] >> 4
+            s = self.mqtt.setdefault(key, Counter())
+            s[_MQTT_TYPES.get(t, str(t))] += 1
+            if t == 2 and len(data) >= 4:
+                rc = data[3]
+                res = _MQTT_CONNACK.get(rc, f"code {rc}")
+                self._emit(kind="mqtt", ts=ts, no=no, client=client[0],
+                           server=server[0], result=res,
+                           summary=f"MQTT connection to {server[0]}: {res}")
+                if rc:
+                    self.findings.append((no, ts, "note", "Response code",
+                                          f"MQTT broker {server[0]} {res}",
+                                          ""))
+        return None
+
+
 class DeepAnalyzer:
     """Stateful deep pass for one share of the flows. Pure Python, no Tk,
     no scapy: used by the deep thread and by worker processes alike."""
 
-    ANALYZERS = ("dissect", "reassembly", "expert")
+    ANALYZERS = ("dissect", "reassembly", "protocols", "expert")
 
     def __init__(self, my_ips=(), per_stream=256 * 1024,
                  total=64 * 1024 * 1024):
@@ -37708,12 +38103,13 @@ class DeepAnalyzer:
         self.frag = IpDefragmenter()
         self.cost_ns = {a: 0 for a in self.ANALYZERS}
         self.count = 0
+        self.proto = ProtocolTracker()
         self._seen_msgs = {}       # stream key -> messages already reported
 
     def process(self, no, ts, lt, raw):
-        """→ (findings, messages). findings: [(no, ts, severity, group,
-        summary, field_key)]; messages: [(stream, dir, kind, start, end,
-        partial, preview, no)]."""
+        """→ (findings, messages, transactions). findings: [(no, ts,
+        severity, group, summary, field_key)]; messages: [(stream, dir,
+        kind, start, end, partial, preview, no)]; transactions: [dict]."""
         self.count += 1
         f = []
         t0 = time.perf_counter_ns()
@@ -37762,21 +38158,35 @@ class DeepAnalyzer:
                 elif "never seen" in n:
                     f.append((no, ts, "note", "Sequence",
                               "Missing bytes: " + n, "tcp.seq_raw"))
-            done = self._seen_msgs.get(st.key, 0)
-            for m in st.messages[done:]:
+            new_msgs = st.messages[self._seen_msgs.get(st.key, 0):]
+            for m in new_msgs:
                 msgs.append((repr(st.key), m.direction, m.kind, m.start,
                              m.end, m.partial, _deep_preview(m.kind, m.data),
                              no))
             self._seen_msgs[st.key] = len(st.messages)
+        else:
+            new_msgs = ()
         t2 = time.perf_counter_ns()
         self.cost_ns["reassembly"] += t2 - t1
+        try:
+            self.proto.packet(no, ts, d, src, dst)
+            for m in new_msgs:
+                self.proto.message(no, ts, st, m)
+        except (ValueError, IndexError, KeyError, struct.error) as e:
+            f.append((no, ts, "note", "Malformed", f"Could not follow the "
+                      f"protocol exchange ({type(e).__name__})", ""))
+        txns, pf = self.proto.take()
+        f.extend(pf)
+        t3 = time.perf_counter_ns()
+        self.cost_ns["protocols"] += t3 - t2
+        t2 = t3
         f.extend(self._rules(no, ts, d, src))
         self.cost_ns["expert"] += time.perf_counter_ns() - t2
         if len(self._seen_msgs) > 8192:
             live = set(map(lambda s: s.key, self.tcp.streams.values()))
             self._seen_msgs = {k: v for k, v in self._seen_msgs.items()
                                if k in live}
-        return f, msgs
+        return f, msgs, txns
 
     def _rules(self, no, ts, d, src):
         out = []
@@ -37841,8 +38251,14 @@ class DeepAnalyzer:
                 msgs.append((repr(st.key), m.direction, m.kind, m.start,
                              m.end, m.partial, _deep_preview(m.kind, m.data),
                              0))
+                with contextlib.suppress(ValueError, IndexError, KeyError,
+                                         struct.error):
+                    self.proto.message(0, now or 0.0, st, m)
             self._seen_msgs[st.key] = len(st.messages)
-        return msgs
+        self.proto._expire((now or 0.0) + ProtocolTracker.DNS_TIMEOUT + 1
+                           if final else (now or 0.0))
+        txns, pf = self.proto.take()
+        return msgs, txns, pf
 
     def costs_us(self):
         n = max(1, self.count)
@@ -37885,23 +38301,24 @@ def deep_worker_main(inp=None, out=None):
             an.my_ips = set(msg[1])
             continue
         if msg[0] == "flush":
-            _wire_send(out, ("flushed", msg[1], an.flush(msg[2], msg[3]),
-                             an.costs_us()))
+            m2, t2, f2 = an.flush(msg[2], msg[3])
+            _wire_send(out, ("flushed", msg[1], m2, an.costs_us(), t2, f2))
             continue
         if msg[0] == "batch":
             epoch, items = msg[1], msg[2]
-            findings, messages = [], []
+            findings, messages, txns = [], [], []
             for no, ts, lt, raw in items:
                 try:
-                    f, m = an.process(no, ts, lt, raw)
+                    f, m, t = an.process(no, ts, lt, raw)
                 except Exception as e:                # noqa: BLE001
-                    f, m = [(no, ts, "error", "Malformed",
-                             f"Deep analysis failed: {type(e).__name__}",
-                             "")], []
+                    f, m, t = [(no, ts, "error", "Malformed",
+                                f"Deep analysis failed: {type(e).__name__}",
+                                "")], [], []
                 findings.extend(f)
                 messages.extend(m)
+                txns.extend(t)
             _wire_send(out, ("res", epoch, len(items), findings, messages,
-                             an.costs_us()))
+                             an.costs_us(), txns))
 
 
 def deep_value(d):
@@ -37931,18 +38348,24 @@ def deep_value(d):
 class DeepStore:
     """What the deep pass found (bounded; shared with the window)."""
 
-    def __init__(self, max_findings=20000, max_messages=20000):
+    def __init__(self, max_findings=20000, max_messages=20000,
+                 max_txns=20000):
         self.findings = deque(maxlen=max_findings)
         self.messages = deque(maxlen=max_messages)
+        self.txns = deque(maxlen=max_txns)
+        self.by_kind = Counter()
         self.by_sev = Counter()
         self.by_group = Counter()
         self.lock = threading.Lock()
         self.version = 0
 
-    def add(self, findings, messages):
-        if not findings and not messages:
+    def add(self, findings, messages, txns=()):
+        if not findings and not messages and not txns:
             return
         with self.lock:
+            for t in txns:
+                self.txns.append(t)
+                self.by_kind[t.get("kind", "?")] += 1
             for f in findings:
                 self.findings.append(tuple(f))
                 self.by_sev[f[2]] += 1
@@ -37954,6 +38377,8 @@ class DeepStore:
         with self.lock:
             self.findings.clear()
             self.messages.clear()
+            self.txns.clear()
+            self.by_kind.clear()
             self.by_sev.clear()
             self.by_group.clear()
             self.version += 1
@@ -38038,14 +38463,14 @@ class _DeepWorkerProc:
                 if msg is None:
                     raise OSError("worker closed its output")
                 if msg[0] == "res":
-                    _k, _epoch, n, findings, messages, costs = msg
+                    _k, _epoch, n, findings, messages, costs, txns = msg
                     self.costs = costs
-                    self.engine._results(n, findings, messages)
+                    self.engine._results(n, findings, messages, txns)
                     with self.cv:
                         self.inflight -= 1
                         self.cv.notify()
                 elif msg[0] == "flushed":
-                    self.engine.store.add([], msg[2])
+                    self.engine.store.add(msg[5], msg[2], msg[4])
                     self.costs = msg[3]
         except (OSError, ValueError, EOFError) as e:
             self._died(e)
@@ -38233,10 +38658,10 @@ class DeepEngine:
     def _lost(self, n):
         self.lost += n
 
-    def _results(self, n, findings, messages):
+    def _results(self, n, findings, messages, txns=()):
         self.done += n
         self._tick(0, n, 0)
-        self.store.add(findings, messages)
+        self.store.add(findings, messages, txns)
 
     def _tick(self, off, done, shed):
         sec = int(time.monotonic())
@@ -38274,18 +38699,19 @@ class DeepEngine:
             if not batch:
                 continue
             t0 = time.perf_counter_ns()
-            findings, messages = [], []
+            findings, messages, txns = [], [], []
             for no, ts, lt, raw, _v in batch:
                 try:
-                    f, m = an.process(no, ts, lt, raw)
+                    f, m, t = an.process(no, ts, lt, raw)
                 except Exception as e:               # noqa: BLE001
-                    f, m = [(no, ts, "error", "Malformed",
-                             f"Deep analysis failed: {type(e).__name__}",
-                             "")], []
+                    f, m, t = [(no, ts, "error", "Malformed",
+                                f"Deep analysis failed: {type(e).__name__}",
+                                "")], [], []
                 findings.extend(f)
                 messages.extend(m)
+                txns.extend(t)
             self._busy_ns += time.perf_counter_ns() - t0
-            self._results(len(batch), findings, messages)
+            self._results(len(batch), findings, messages, txns)
             time.sleep(0)               # let capture and the window in
 
     # ---- lifecycle -------------------------------------------------------------
@@ -38298,7 +38724,8 @@ class DeepEngine:
             with self.cv:
                 idle = not self.pending
             if idle:
-                self.store.add([], self.analyzer.flush(now, final))
+                m, t, f = self.analyzer.flush(now, final)
+                self.store.add(f, m, t)
 
     def drain(self, timeout=30.0):
         """Wait until everything offered is analysed (tests, imports)."""
@@ -38354,6 +38781,9 @@ class DeepEngine:
                 f"{k} {v:.0f} µs" for k, v in costs.items()) or
                 "not measured yet"),
             f"Findings            {self.store.summary()}",
+            "Exchanges followed  " + (", ".join(
+                f"{k} {v:,}" for k, v in self.store.by_kind.most_common())
+                or "none yet"),
         ]
         if self.last_error:
             lines.append(f"Note                {self.last_error}")
@@ -38935,6 +39365,150 @@ class ScenarioBuilder:
                    / L.DNS(id=79, qd=L.DNSQR(qname="example.org")))
         self.t += 0.01
         self.frames.append((sll + ip, round(self.t, 6), 113))
+        return self.frames
+
+    def _tcp_talk(self, client, server_ip, server_mac, sport, dport, turns,
+                  dt=0.004):
+        """A TCP conversation: handshake, then (direction, bytes) turns,
+        then FIN both ways. Direction 0 = client speaks."""
+        L = self.L
+        cip, cmac = client[0], client[1]
+        out = L.Ether(src=cmac, dst=server_mac) / L.IP(src=cip, dst=server_ip)
+        back = L.Ether(src=server_mac, dst=cmac) / L.IP(src=server_ip,
+                                                         dst=cip, ttl=58)
+        c, s = 1000, 5000
+        self._emit(out / L.TCP(sport=sport, dport=dport, flags="S", seq=c),
+                   dt)
+        self._emit(back / L.TCP(sport=dport, dport=sport, flags="SA", seq=s,
+                                ack=c + 1), dt)
+        c, s = c + 1, s + 1
+        for direction, data in turns:
+            if direction == 0:
+                self._emit(out / L.TCP(sport=sport, dport=dport, flags="PA",
+                                       seq=c, ack=s) / L.Raw(data), dt)
+                c += len(data)
+            else:
+                self._emit(back / L.TCP(sport=dport, dport=sport, flags="PA",
+                                        seq=s, ack=c) / L.Raw(data), dt)
+                s += len(data)
+        self._emit(out / L.TCP(sport=sport, dport=dport, flags="FA", seq=c,
+                               ack=s), dt)
+        self._emit(back / L.TCP(sport=dport, dport=sport, flags="FA", seq=s,
+                                ack=c + 1), dt)
+
+    def protocol_exchanges(self):
+        """Request/response pairs for every protocol M5 follows."""
+        L = self.L
+        me, gw, nas, tv = self.ME, self.GW, self.NAS, self.TV
+        up = L.Ether(src=me[1], dst=gw[1]) / L.IP(src=me[0], dst=gw[0])
+        down = L.Ether(src=gw[1], dst=me[1]) / L.IP(src=gw[0], dst=me[0])
+        # DNS: answered, retried then answered, never answered, NXDOMAIN
+        self._emit(up / L.UDP(sport=50100, dport=53) /
+                   L.DNS(id=11, qd=L.DNSQR(qname="a.example.com")))
+        self._emit(down / L.UDP(sport=53, dport=50100) /
+                   L.DNS(id=11, qr=1, ra=1, qd=L.DNSQR(qname="a.example.com"),
+                         an=L.DNSRR(rrname="a.example.com",
+                                    rdata="93.184.215.14", ttl=60)),
+                   dt=0.025)
+        self._emit(up / L.UDP(sport=50101, dport=53) /
+                   L.DNS(id=12, qd=L.DNSQR(qname="slow.example.com")))
+        self._emit(up / L.UDP(sport=50102, dport=53) /
+                   L.DNS(id=13, qd=L.DNSQR(qname="slow.example.com")),
+                   dt=1.0)
+        self._emit(down / L.UDP(sport=53, dport=50102) /
+                   L.DNS(id=13, qr=1, qd=L.DNSQR(qname="slow.example.com"),
+                         an=L.DNSRR(rrname="slow.example.com",
+                                    rdata="93.184.215.15", ttl=60)),
+                   dt=0.2)
+        self._emit(up / L.UDP(sport=50103, dport=53) /
+                   L.DNS(id=14, qd=L.DNSQR(qname="lost.example.com")))
+        self._emit(up / L.UDP(sport=50104, dport=53) /
+                   L.DNS(id=15, qd=L.DNSQR(qname="nope.example.com")))
+        self._emit(down / L.UDP(sport=53, dport=50104) /
+                   L.DNS(id=15, qr=1, rcode=3,
+                         qd=L.DNSQR(qname="nope.example.com")), dt=0.03)
+        # DHCP: full four-step exchange, plus an offer from a second server
+        mac = tv[1]
+        ch = bytes.fromhex(mac.replace(":", ""))
+        bc = L.Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") / \
+            L.IP(src="0.0.0.0", dst="255.255.255.255") / L.UDP(sport=68,
+                                                               dport=67)
+        for mt, extra in (("discover", []), ("request",
+                                             [("requested_addr", tv[0])])):
+            self._emit(bc / L.BOOTP(chaddr=ch, xid=4242) /
+                       L.DHCP(options=[("message-type", mt),
+                                       ("hostname", b"Living-Room-TV")] +
+                              extra + ["end"]), dt=0.01)
+            reply = "offer" if mt == "discover" else "ack"
+            self._emit(L.Ether(src=gw[1], dst=mac) /
+                       L.IP(src=gw[0], dst=tv[0]) / L.UDP(sport=67, dport=68)
+                       / L.BOOTP(op=2, yiaddr=tv[0], chaddr=ch, xid=4242) /
+                       L.DHCP(options=[("message-type", reply),
+                                       ("server_id", gw[0]),
+                                       ("lease_time", 7200), "end"]),
+                       dt=0.012)
+        self._emit(L.Ether(src="02:00:00:00:66:66", dst=mac) /
+                   L.IP(src="192.168.1.66", dst=tv[0]) /
+                   L.UDP(sport=67, dport=68) /
+                   L.BOOTP(op=2, yiaddr="192.168.1.199", chaddr=ch, xid=999) /
+                   L.DHCP(options=[("message-type", "offer"),
+                                   ("server_id", "192.168.1.66"), "end"]))
+        # TLS: hello and server hello on one connection
+        sh_body = (b"\x03\x03" + bytes(32) + b"\x00" + b"\x13\x01" + b"\x00" +
+                   struct.pack("!H", 6) + struct.pack("!HHH", 43, 2, 0x0304))
+        server_hello = b"\x16\x03\x03" + struct.pack(
+            "!H", len(sh_body) + 4) + b"\x02" + struct.pack(
+            "!I", len(sh_body))[1:] + sh_body
+        self._tcp_talk(me, "93.184.215.14", gw[1], 41443, 443, [
+            (0, build_client_hello("www.example.com", rnd=bytes(32))),
+            (1, server_hello)])
+        # HTTP: two requests, two answers (one partial-free), RTSP, SSH
+        self._tcp_talk(me, "34.117.59.81", gw[1], 41080, 80, [
+            (0, b"GET /index.html?session=SECRET HTTP/1.1\r\n"
+                b"Host: plain.example.org\r\nCookie: id=SECRET\r\n\r\n"),
+            (1, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello"),
+            (0, b"GET /missing HTTP/1.1\r\nHost: plain.example.org\r\n\r\n"),
+            (1, b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")])
+        self._tcp_talk(me, tv[0], tv[1], 41554, 554, [
+            (0, b"OPTIONS rtsp://tv/ RTSP/1.0\r\nCSeq: 1\r\n\r\n"),
+            (1, b"RTSP/1.0 200 OK\r\nCSeq: 1\r\n\r\n")])
+        self._tcp_talk(me, nas[0], nas[1], 41022, 22, [
+            (0, b"SSH-2.0-OpenSSH_9.6\r\n"),
+            (1, b"SSH-2.0-dropbear_2022.83\r\n")])
+        # SMB2 negotiate (dialect 3.1.1) and an SMB1 negotiate
+        hdr = b"\xfeSMB" + struct.pack("<HHIHHI", 64, 0, 0, 0, 0, 1) + \
+            bytes(64 - 20)
+        body = struct.pack("<HHH", 65, 0, 0x0311) + bytes(58)
+        smb2 = hdr + body
+        smb1 = b"\xffSMB" + bytes(60)
+        nb = lambda b: b"\x00" + struct.pack("!I", len(b))[1:] + b
+        self._tcp_talk(me, nas[0], nas[1], 41445, 445, [
+            (0, nb(b"\xfeSMB" + bytes(60) + bytes(8))), (1, nb(smb2))])
+        self._tcp_talk(me, "192.168.1.80", "02:00:00:00:00:80", 41446, 445,
+                       [(0, nb(smb1)), (1, nb(smb1))])
+        # MQTT: connect refused
+        connect = b"\x10" + bytes([12]) + b"\x00\x04MQTT\x04\x02\x00\x3c" + \
+            b"\x00\x00"
+        self._tcp_talk(me, nas[0], nas[1], 41883, 1883, [
+            (0, connect), (1, b"\x20\x02\x00\x05")])
+        # NTP: client request and server reply (offset about +50 ms)
+        t1 = self.t + 0.001
+        frac = lambda t: struct.pack("!II", int(t) + 2208988800,
+                                     int((t % 1) * 2 ** 32))
+        req = bytes([0x23]) + bytes(39) + frac(t1)
+        self._emit(up / L.UDP(sport=50123, dport=123) / L.Raw(req),
+                   dt=0.001)
+        rep = bytes([0x24, 2]) + bytes(22) + frac(t1) + frac(t1 + 0.06) + \
+            frac(t1 + 0.0601)
+        self._emit(down / L.UDP(sport=123, dport=50123) / L.Raw(rep),
+                   dt=0.020)
+        # SIP over UDP: INVITE and Busy Here
+        self._emit(up / L.UDP(sport=5060, dport=5060) /
+                   L.Raw(b"INVITE sip:bob@example.com SIP/2.0\r\n"
+                         b"Content-Length: 0\r\n\r\n"))
+        self._emit(down / L.UDP(sport=5060, dport=5060) /
+                   L.Raw(b"SIP/2.0 486 Busy Here\r\nContent-Length: 0"
+                         b"\r\n\r\n"), dt=0.05)
         return self.frames
 
     def bulk_streams(self, n=50000, flows=200, size=300):
@@ -43524,7 +44098,7 @@ def test_deep_rules_find_problems(ctx):
     an = DeepAnalyzer(my_ips={me[0]})
     found = []
     for i, f in enumerate(frames):
-        fs, _m = an.process(i + 1, 1.0, 1, bytes(f))
+        fs, _m, _t = an.process(i + 1, 1.0, 1, bytes(f))
         found += fs
     text = " | ".join(f[4] for f in found)
     for want in ("Zero window", "DNS no such name for nope.example.com",
@@ -43673,6 +44247,54 @@ def test_deep_worker_process_and_mode_switching(ctx):
     mixed, flips, off1 = run(True)
     assert off0 == 0 and off1 > 0 and flips >= 50, (off0, off1, flips)
     assert mixed == plain
+
+
+@self_test(slow=False)
+def test_protocol_exchanges(ctx):
+    """M5: requests are paired with replies (with latency), retries and
+    unanswered lookups are counted, handshakes are followed, and nothing
+    private leaves the tracker."""
+    fr = ScenarioBuilder().protocol_exchanges()
+    an = DeepAnalyzer(my_ips={ScenarioBuilder.ME[0]})
+    tx, fs = [], []
+    for i, (raw, ts, lt) in enumerate(fr):
+        f, _m, t = an.process(i + 1, ts, lt, raw)
+        tx += t
+        fs += f
+    _m, t, f = an.flush(fr[-1][1], True)
+    tx += t
+    fs += f
+    by = defaultdict(list)
+    for t in tx:
+        by[t["kind"]].append(t)
+        marshal.dumps(t)                   # must cross the worker pipe
+    dns = {t["name"]: t for t in by["dns"]}
+    assert dns["a.example.com"]["latency_ms"] == 25.0
+    assert dns["slow.example.com"]["tries"] == 2
+    assert dns["lost.example.com"]["result"] == "no answer"
+    assert dns["nope.example.com"]["result"] == "no such name"
+    d = by["dhcp"][0]
+    assert d["steps"] == "Discover → Offer → Request → ACK" and \
+        d["lease_s"] == 7200 and d["host"] == "Living-Room-TV"
+    tls = by["tls"][0]
+    assert tls["version"] == "TLS 1.3" and tls["name"] == "www.example.com"
+    http = sorted((t["path"], t["status"]) for t in by["http"])
+    assert http == [("/index.html", 200), ("/missing", 404)], http
+    assert by["ssh"][0]["server_banner"].startswith("SSH-2.0-dropbear")
+    assert sorted(t["dialect"] for t in by["smb"]) == ["1 (obsolete)",
+                                                       "3.1.1"]
+    assert by["mqtt"][0]["result"] == "refused: not authorized"
+    assert abs(by["ntp"][0]["offset_ms"] - 50.0) < 1.0
+    assert {t.get("status") or t.get("method") for t in by["sip"]} == \
+        {"INVITE", 486}
+    assert len(by["rtsp"]) == 2
+    text = repr(tx) + repr(fs)
+    assert "SECRET" not in text and "session=" not in text
+    groups = " | ".join(f[4] for f in fs)
+    for want in ("More than one DHCP server", "SMB version 1",
+                 "MQTT broker", "SIP 486"):
+        assert want in groups, (want, groups)
+    assert sum(1 for f in fs if "SMB version 1" in f[4]) == 1
 
 
 def bench_report(seconds=2.0):
