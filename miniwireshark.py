@@ -54,6 +54,7 @@ import contextlib
 import csv
 import ctypes
 import dataclasses
+import functools
 import gzip
 import hashlib
 import html
@@ -523,7 +524,13 @@ def _boot_time():
         return 0.0
 
 
-NPCAP_FALLBACK_VERSION = "1.79"
+NPCAP_FALLBACK_VERSION = "1.89"
+NPCAP_SIGNER = "Nmap Software LLC"
+NPCAP_LICENSE_NOTE = (
+    "Npcap is made by the Nmap Project. Its free edition may be installed "
+    "on up to 5 computers for personal use and may not be redistributed; "
+    "MiniWireshark only downloads the official installer from npcap.com "
+    "for you. Licence: https://npcap.com/oem/redist.html")
 
 
 def _latest_npcap_version():
@@ -540,17 +547,37 @@ def _latest_npcap_version():
     return NPCAP_FALLBACK_VERSION
 
 
-def _authenticode_status(path):
-    """Ask Windows whether the downloaded installer carries a valid digital
-    signature. Returns e.g. 'Valid', 'NotSigned', or '' if unknown."""
+def _authenticode_info(path):
+    """Ask Windows whether a downloaded installer carries a valid digital
+    signature and who signed it. Returns (status, signer_subject); status
+    is e.g. 'Valid' or 'NotSigned', '' if Windows couldn't tell."""
+    ps = ("$s = Get-AuthenticodeSignature -LiteralPath $args[0]; "
+          "Write-Output $s.Status; "
+          "Write-Output $s.SignerCertificate.Subject")
     try:
         r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-             f"(Get-AuthenticodeSignature -LiteralPath '{path}').Status"],
-            capture_output=True, text=True, timeout=60)
-        return (r.stdout or "").strip()
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps,
+             path], capture_output=True, text=True, timeout=60,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines()]
+        lines += ["", ""]
+        return lines[0], lines[1]
     except (OSError, subprocess.SubprocessError):
-        return ""
+        return "", ""
+
+
+def signer_matches(subject, expected):
+    """True when an X.500 subject names the expected organisation as its
+    CN or O (not merely anywhere in the string)."""
+    for part in re.split(r",\s*(?=[A-Z]+=)", subject or ""):
+        k, _, v = part.partition("=")
+        if k.strip() in ("CN", "O") and v.strip().strip('"') == expected:
+            return True
+    return False
+
+
+def _authenticode_status(path):
+    return _authenticode_info(path)[0]
 
 
 def _install_npcap(loader, state):
@@ -583,12 +610,18 @@ def _install_npcap(loader, state):
             pass
         return False, (f"Could not download the capture driver ({e}). "
                        "Your browser was opened on the Npcap download page.")
-    sig = _authenticode_status(exe)
-    loader.post_log(f"  Installer signature: {sig or 'unknown'}", "detail")
-    if sig and sig not in ("Valid",):
-        return False, (f"The downloaded installer's signature is '{sig}', so "
-                       "MiniWireshark refused to run it. Please install "
-                       "Npcap from https://npcap.com yourself.")
+    sig, signer = _authenticode_info(exe)
+    loader.post_log(f"  Installer signature: {sig or 'unknown'} "
+                    f"({signer or 'no signer'})", "detail")
+    if sig != "Valid" or not signer_matches(signer, NPCAP_SIGNER):
+        with contextlib.suppress(OSError):
+            os.remove(exe)
+        return False, ("The downloaded capture-driver installer is not "
+                       f"signed by {NPCAP_SIGNER} (signature: "
+                       f"{sig or 'unknown'}), so MiniWireshark refused to "
+                       "run it. Please install Npcap from https://npcap.com "
+                       "yourself.")
+    loader.post_log("  " + NPCAP_LICENSE_NOTE, None)
     loader.post_log("  The Npcap installer window is opening — please click "
                     "Next / I Agree / Install. Keep the default options.",
                     None)
@@ -1695,20 +1728,21 @@ THEMES["Dark HC"]["grid"] = "#4a5260"
 THEMES["Light HC"]["grid"] = "#9aa3b2"
 
 
-def is_private_ip(ip):
-    if not ip:
-        return False
+@functools.lru_cache(maxsize=65536)
+def _is_private_cached(ip):
     try:
         a = ipaddress.ip_address(ip)
     except ValueError:
         return False
-    for n in PRIVATE_NETS:
-        try:
-            if a in n:
-                return True
-        except Exception:
-            pass
-    return False
+    return any(a.version == n.version and a in n for n in PRIVATE_NETS)
+
+
+def is_private_ip(ip):
+    """Memoised: called several times per packet (busy networks repeat the
+    same few hundred addresses endlessly)."""
+    if not ip or not isinstance(ip, str):
+        return False
+    return _is_private_cached(ip)
 
 
 def _human_bytes(n):
@@ -1720,15 +1754,21 @@ def _human_bytes(n):
     return f"{n:.1f} GB"
 
 
-def is_public_ip(ip):
-    if not ip:
-        return False
+@functools.lru_cache(maxsize=65536)
+def _is_public_cached(ip):
     try:
         a = ipaddress.ip_address(ip)
     except ValueError:
         return False
     return not a.is_private and not a.is_multicast and not a.is_loopback \
-        and not a.is_link_local and not a.is_reserved and not a.is_unspecified
+        and not a.is_link_local and not a.is_reserved and \
+        not a.is_unspecified
+
+
+def is_public_ip(ip):
+    if not ip or not isinstance(ip, str):
+        return False
+    return _is_public_cached(ip)
 
 
 def _int_to_ip(n):
@@ -1773,18 +1813,41 @@ def local_subnet_for(iface, my_ip):
         return None
 
 
+_UNSAFE_TEXT = re.compile(
+    "[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e"
+    "\u2060-\u2064\u2066-\u2069\ufeff\ufff9-\ufffb]")
+
+
+def sanitize_text(value, limit=200):
+    """Make a string that came off the network (or out of a file) safe to
+    show: strips control characters and the invisible bidirectional
+    overrides that can make 'evil.com' look like 'moc.live', folds tabs and
+    newlines to spaces and caps the length. Applied where untrusted names
+    enter the program (decoder, session/label loading)."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", "replace")
+        else:
+            value = str(value)
+    if value.isprintable() and len(value) <= limit:
+        return value
+    value = value.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+    value = _UNSAFE_TEXT.sub("", value)
+    return value[:limit]
+
+
 def _name_bytes(raw):
     if raw is None:
         return ""
     if isinstance(raw, bytes):
         try:
-            return raw.decode("idna").rstrip(".")
-        except Exception:
-            try:
-                return raw.decode("latin-1").rstrip(".")
-            except Exception:
-                return ""
-    return str(raw).rstrip(".")
+            out = raw.decode("idna")
+        except (UnicodeError, ValueError):
+            out = raw.decode("latin-1")
+        return sanitize_text(out.rstrip("."), 255)
+    return sanitize_text(str(raw).rstrip("."), 255)
 
 
 def _iter_rrs(rr):
@@ -1824,6 +1887,10 @@ def _rdata_ip(rr):
 
 
 def _rdata_str(rr):
+    return sanitize_text(_rdata_str_raw(rr), 255)
+
+
+def _rdata_str_raw(rr):
     rd = rr.rdata
     if isinstance(rd, str):
         return rd.rstrip(".")
@@ -1858,7 +1925,7 @@ def mac_vendor(mac):
         v = conf.manufdb._get_manuf(m)
         if v and v.lower() != m:
             return v
-    except Exception:
+    except (AttributeError, KeyError, TypeError, ValueError):
         pass
     return ""
 
@@ -2097,8 +2164,13 @@ def fmt_clock(ts, with_date=False):
 
 def is_unicast_mac(mac):
     """A MAC that identifies one adapter (not broadcast/multicast/zero)."""
-    if not mac:
+    if not mac or not isinstance(mac, str):
         return False
+    return _is_unicast_mac_cached(mac)
+
+
+@functools.lru_cache(maxsize=16384)
+def _is_unicast_mac_cached(mac):
     try:
         first = int(mac.split(":")[0].split("-")[0], 16)
     except (ValueError, IndexError):
@@ -2108,11 +2180,21 @@ def is_unicast_mac(mac):
     return mac.lower() not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
 
 
-def ip_obj(ip):
+@functools.lru_cache(maxsize=65536)
+def _ip_obj_cached(ip):
     try:
         return ipaddress.ip_address(ip)
-    except (ValueError, TypeError):
+    except ValueError:
         return None
+
+
+def ip_obj(ip):
+    if not isinstance(ip, str):
+        try:
+            return ipaddress.ip_address(ip)
+        except (ValueError, TypeError):
+            return None
+    return _ip_obj_cached(ip)
 
 
 def is_multicast_or_broadcast(ip):
@@ -2391,8 +2473,7 @@ def _decode_dns(d, kind):
             if rr.type == 16:                               # TXT
                 for part in (rr.rdata if isinstance(rr.rdata, (list, tuple))
                              else [rr.rdata]):
-                    s = part.decode("utf-8", "ignore") if \
-                        isinstance(part, bytes) else str(part)
+                    s = sanitize_text(part, 120)
                     if "=" in s:
                         k, _, v = s.partition("=")
                         if k.lower() in ("model", "md", "am", "ty", "fn",
@@ -2449,12 +2530,9 @@ def _decode_dhcp(pkt):
                 info["msgtype"] = int(val)
                 msg = DHCP_MSG.get(int(val), str(val))
             elif code in (12, "hostname"):
-                info["hostname"] = (val.decode("utf-8", "ignore")
-                                    if isinstance(val, bytes) else str(val))
+                info["hostname"] = sanitize_text(val, 64).strip()
             elif code in (60, "vendor_class_id"):
-                info["vendor_class"] = (val.decode("utf-8", "ignore")
-                                        if isinstance(val, bytes)
-                                        else str(val))[:60]
+                info["vendor_class"] = sanitize_text(val, 60)
             elif code in (50, "requested_addr"):
                 info["requested_ip"] = str(val)
             elif code in (51, "lease_time"):
@@ -2517,9 +2595,11 @@ def _decode_ssdp(load):
             headers[k.strip().upper()] = v.strip()
     server = headers.get("SERVER", "")
     st = headers.get("ST", headers.get("NT", ""))
-    info = {"server": server[:120], "st": st[:120],
+    server, st = sanitize_text(server, 120), sanitize_text(st, 120)
+    info = {"server": server, "st": st,
             "search": first.startswith("M-SEARCH"),
-            "friendly": headers.get("X-FRIENDLY-NAME", "")[:60]}
+            "friendly": sanitize_text(headers.get("X-FRIENDLY-NAME", ""),
+                                      60)}
     hint = _ssdp_hint(server + " " + st)
     if info["search"]:
         return "Looking for other devices on the network (SSDP)", hint, info
@@ -2832,6 +2912,8 @@ def _decode_tcp_payload(d, load, reasm):
         line = head.split("\r\n", 1)[0]
         m = re.search(r"\r\nHost:\s*([^\r\n]+)", head, re.I)
         host = m.group(1).strip().lower()[:120] if m else ""
+        if host and not re.match(r"^[a-z0-9._:\[\]-]+$", host):
+            host = ""                     # not a hostname: don't trust it
         if line:
             d["proto"], d["tag"] = "HTTP", "HTTP"
             d["app_conf"] = "Observed"
@@ -3229,6 +3311,14 @@ class LanScanner(threading.Thread):
         self.subnet = local_subnet_for(iface, my_ip) if my_ip else None
         self.sweeps = 0
         self.last_sweep = 0.0
+        self.errors = 0
+        self.last_error = ""
+
+    def _note_error(self, e):
+        self.errors += 1
+        self.last_error = f"{type(e).__name__}: {e}"
+        if self.errors <= 5:
+            LOG.info("LAN discovery send failed: %s", self.last_error)
 
     def run(self):
         # give the capture socket a moment to fully come up first
@@ -3239,8 +3329,8 @@ class LanScanner(threading.Thread):
         while not self.stop_flag:
             try:
                 self._sweep()
-            except Exception:
-                pass
+            except Exception as e:                   # noqa: BLE001
+                self._note_error(e)
             waited = 0.0
             while waited < SCAN_INTERVAL:
                 if self.stop_flag:
@@ -3262,15 +3352,15 @@ class LanScanner(threading.Thread):
             return
         try:
             hosts = [str(h) for h in self.subnet.hosts() if str(h) != self.my_ip]
-        except Exception:
+        except ValueError:
             return
         if not hosts:
             return
         try:
             pkts = [Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=h) for h in hosts]
             sendp(pkts, iface=self.iface, inter=0.003, verbose=False)
-        except Exception:
-            pass
+        except Exception as e:                       # noqa: BLE001
+            self._note_error(e)
 
     def _mdns_browse(self):
         if not self.my_ip:
@@ -3282,8 +3372,8 @@ class LanScanner(threading.Thread):
                    DNS(rd=0, qd=DNSQR(qname="_services._dns-sd._udp.local.",
                                       qtype="PTR")))
             sendp(pkt, iface=self.iface, verbose=False)
-        except Exception:
-            pass
+        except Exception as e:                       # noqa: BLE001
+            self._note_error(e)
 
     def _ssdp_search(self):
         if not self.my_ip:
@@ -3296,8 +3386,8 @@ class LanScanner(threading.Thread):
                    UDP(sport=random.randint(20000, 60000), dport=1900) /
                    Raw(load=msg.encode()))
             sendp(pkt, iface=self.iface, verbose=False)
-        except Exception:
-            pass
+        except Exception as e:                       # noqa: BLE001
+            self._note_error(e)
 
 
 def _iface_ip(iface):
@@ -4003,8 +4093,8 @@ def device_from_dict(dd):
                 continue
         elif isinstance(cur, list) and not isinstance(v, list):
             continue
-        elif isinstance(cur, str) and not isinstance(v, str):
-            v = str(v)
+        elif isinstance(cur, str):
+            v = sanitize_text(v, 2000 if k == "notes" else 200)
         setattr(dev, k, v)
     for k in ("ipv6", "ipv4s", "services", "never_merge", "websites",
               "remote_ips"):
@@ -4242,6 +4332,11 @@ def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
 
 
 
+@functools.lru_cache(maxsize=65536)
+def _classify_address_cached(ip):
+    return DeviceRegistry._classify_address_raw(ip)
+
+
 class DeviceRegistry:
     """Owns every DeviceRecord: creation, evidence, lifecycle transitions,
     presence history and identity merging. This is the single place that
@@ -4271,6 +4366,8 @@ class DeviceRegistry:
         self.created = []             # keys created
         self.events = []              # (kind, severity, text, key)
         self.moved_ips = []           # IPv4s that changed owner
+        self._elig_sig = None
+        self._elig = {}
 
     # ---- address rules ----------------------------------------------------
     def classify_address(self, ip):
@@ -4278,6 +4375,10 @@ class DeviceRegistry:
         its own, or None if it's an ordinary candidate address."""
         if not ip:
             return None
+        return _classify_address_cached(ip)
+
+    @staticmethod
+    def _classify_address_raw(ip):
         a = ip_obj(ip)
         if a is None:
             return None
@@ -4292,7 +4393,22 @@ class DeviceRegistry:
         return None
 
     def eligible_ip(self, ip):
-        """May this address be attached to a LOCAL device?"""
+        """May this address be attached to a LOCAL device? (memoised; the
+        memo resets whenever the local networks or IPv6 prefixes change)"""
+        sig = (id(self.local_nets), len(self.local_nets),
+               id(self.v6_prefixes), len(self.v6_prefixes))
+        if sig != self._elig_sig:
+            self._elig_sig = sig
+            self._elig = {}
+        r = self._elig.get(ip)
+        if r is None:
+            r = self._eligible_uncached(ip)
+            if len(self._elig) > 50000:
+                self._elig.clear()
+            self._elig[ip] = r
+        return r
+
+    def _eligible_uncached(self, ip):
         a = ip_obj(ip)
         if a is None or a.is_multicast or a.is_unspecified or a.is_loopback:
             return False
@@ -4334,8 +4450,8 @@ class DeviceRegistry:
         lab = self.labels.get(dev.key)
         if not lab:
             return
-        dev.alias = lab.get("alias", "") or dev.alias
-        dev.notes = lab.get("notes", "") or dev.notes
+        dev.alias = sanitize_text(lab.get("alias", "")) or dev.alias
+        dev.notes = sanitize_text(lab.get("notes", ""), 2000) or dev.notes
         dev.mine = bool(lab.get("mine", dev.mine))
         dev.expected = bool(lab.get("expected", dev.expected))
         dev.pinned_no_merge = bool(lab.get("pinned", dev.pinned_no_merge))
@@ -4912,8 +5028,10 @@ def website_to_dict(rec):
 
 
 def website_from_dict(wd):
-    rec = WebsiteRecord(domain=str(wd.get("domain", "")).lower(),
-                        registrable=wd.get("registrable", "") or "",
+    rec = WebsiteRecord(domain=sanitize_text(wd.get("domain", ""),
+                                             255).lower(),
+                        registrable=sanitize_text(wd.get("registrable", ""),
+                                                  255),
                         first_seen=float(wd.get("first_seen") or time.time()))
     rec.resolved_ips = set(wd.get("resolved_ips", []) or [])
     rec.requests = int(wd.get("requests", 0) or 0)
@@ -4986,8 +5104,8 @@ def remote_to_dict(rec):
 
 
 def remote_from_dict(rd):
-    rec = RemoteHostRecord(ip=str(rd.get("ip", "")),
-                           domain=rd.get("domain", "") or "")
+    rec = RemoteHostRecord(ip=sanitize_text(rd.get("ip", ""), 64),
+                           domain=sanitize_text(rd.get("domain", ""), 255))
     rec.domains = set(rd.get("domains", []) or ([rec.domain] if rec.domain
                                                  else []))
     rec.ports = set(int(p) for p in rd.get("ports", []) or []
@@ -5408,6 +5526,7 @@ ALERT_TYPES = {
     "new_country":      ("New country contacted", "INFO"),
     "broadcast_storm":  ("Excessive broadcast traffic", "WARNING"),
     "scan_pattern":     ("Possible scanning pattern", "WARNING"),
+    "rogue_ra":         ("Unexpected IPv6 router announcement", "WARNING"),
 }
 
 # default confidence + "why was this flagged" for each kind
@@ -5419,6 +5538,8 @@ ALERT_META = {
     "gateway_change": ("Medium", "Your router's hardware (MAC) address "
                                  "changed during this session."),
     "dhcp_anomaly": ("High", "More than one device answered DHCP requests."),
+    "rogue_ra": ("Medium", "A device other than your router announced "
+                           "itself as an IPv6 router."),
     "chatty_device": ("Medium", "Traffic this minute is far above this "
                                 "device's own recent average."),
     "unknown_device": ("Medium", "The device stayed hard to identify after "
@@ -5469,11 +5590,17 @@ def alert_to_dict(a):
 def alert_from_dict(ad):
     when = float(ad.get("when") or time.time())
     a = Alert(id=ad.get("id") or uuid.uuid4().hex[:8],
-              kind=ad.get("kind", ""), severity=ad.get("severity", "INFO"),
-              device_key=ad.get("device_key", "") or "",
-              reason=ad.get("reason", ""), observed=ad.get("observed", ""),
-              interpretation=ad.get("interpretation", ""),
-              possible_explanations=ad.get("possible_explanations", ""),
+              kind=sanitize_text(ad.get("kind", ""), 40),
+              severity=ad.get("severity", "INFO")
+              if ad.get("severity") in ("INFO", "WARNING", "DANGER")
+              else "INFO",
+              device_key=sanitize_text(ad.get("device_key", ""), 80),
+              reason=sanitize_text(ad.get("reason", ""), 400),
+              observed=sanitize_text(ad.get("observed", ""), 2000),
+              interpretation=sanitize_text(ad.get("interpretation", ""),
+                                           2000),
+              possible_explanations=sanitize_text(
+                  ad.get("possible_explanations", ""), 2000),
               when=when)
     a.acknowledged = bool(ad.get("acknowledged", False))
     a.confidence = ad.get("confidence", "Medium") or "Medium"
@@ -5535,6 +5662,10 @@ ALERT_CHECKLIST = {
                        "router? If yes, this is expected.",
                        "If not, check the router's admin page and its "
                        "connected devices before trusting this network."],
+    "rogue_ra": ["Normal if you have a second router, a mesh system or a "
+                 "device sharing its connection (phone hotspot, VM host).",
+                 "Otherwise find that device: a rogue router announcement "
+                 "can redirect IPv6 traffic through it."],
     "dhcp_anomaly": ["Check whether a second router or access point was "
                      "plugged in recently.",
                      "Unplug anything you don't recognize and see whether "
@@ -5617,7 +5748,7 @@ class AlertEngine:
         self.config = config
         self.now = now_fn or time.time
         self.alerts = {}
-        self.order = []
+        self.order = deque()          # newest first
         self._debounce = {}
         self._open = {}            # (kind, subject) -> alert id
         self.suppressed = 0
@@ -5665,12 +5796,10 @@ class AlertEngine:
                 not device_key.startswith("ip:"):
             a.refs["device"] = device_key
         self.alerts[a.id] = a
-        self.order.insert(0, a.id)
+        self.order.appendleft(a.id)
         self._open[(kind, subject)] = a.id
-        if len(self.order) > 500:
-            for old in self.order[500:]:
-                self.alerts.pop(old, None)
-            del self.order[500:]
+        while len(self.order) > 500:
+            self.alerts.pop(self.order.pop(), None)
         return a
 
     def _debounced(self, key, seconds):
@@ -5747,6 +5876,23 @@ class AlertEngine:
             "less commonly \u2014 a rogue DHCP server. If you don't "
             "recognize one of these addresses, unplug that device and "
             "check your network.")
+
+    def rogue_ra(self, mac, who, prefixes, routers):
+        if self._debounced(f"rogue_ra:{mac}", 600):
+            return None
+        return self._add(
+            "rogue_ra", "WARNING", mac,
+            f"{who} announced itself as an IPv6 router",
+            f"An IPv6 Router Advertisement came from {mac}"
+            f"{(' for ' + ', '.join(prefixes[:3])) if prefixes else ''}. "
+            f"Routers announcing on this network: {', '.join(routers)}.",
+            "Devices that accept this announcement may send IPv6 traffic "
+            "through that device.",
+            "Mesh Wi-Fi nodes, a second router, a phone hotspot or a "
+            "virtual-machine host can do this legitimately.",
+            evidence=[f"RA from {mac}"] + [f"prefix {p}" for p in
+                                           prefixes[:4]],
+            subject=f"rogue_ra:{mac}")
 
     def arp_spoof(self, ip, n_macs, flips, is_gateway):
         if self._debounced(f"arpspoof:{ip}", 120):
@@ -6817,7 +6963,9 @@ class NetworkModel:
                             len(self.v6_prefixes) < 8:
                         self.v6_prefixes.append(net)
                         self.registry.v6_prefixes = self.v6_prefixes
+            known_router = mac in self.registry.ra_routers
             dev = self.registry.note_nd(d["src_ip"], mac, "RA", ts)
+            self._check_rogue_ra(mac, dev, nd, known_router)
         elif kind == "NA":
             dev = self.registry.note_nd(nd.get("target"), mac, "NA", ts)
         elif kind == "NS" and not nd.get("dad") and nd.get("mac"):
@@ -6827,6 +6975,28 @@ class NetworkModel:
                                       "IPv6 neighbor/router discovery", ts) \
                 if d["src_mac"] else None
         self._dirty_dev(dev)
+
+    def _check_rogue_ra(self, mac, dev, nd, known_router):
+        """IPv6 router announcements should come from the router. One from
+        another device is worth a (non-alarming) warning."""
+        if not mac or known_router or not nd.get("lifetime", 1):
+            return
+        gw_macs = set(self.registry.gw_macs)
+        gw_dev = self.registry.by_key.get(
+            self.registry.ip_to_key.get(self.gateway_ip, ""))
+        if gw_dev is not None and gw_dev.mac:
+            gw_macs.add(gw_dev.mac)
+        others = self.registry.ra_routers - gw_macs - {mac}
+        if mac in gw_macs or (not gw_macs and not others):
+            return                # it IS the router, or nothing to compare
+        who = dev.display_name() if dev is not None else mac
+        a = self._alert(self.alerts.rogue_ra(
+            mac, who, nd.get("prefixes", []),
+            sorted(self.registry.ra_routers)))
+        if a is not None and not a.updated:
+            self.push_timeline("rogue router", "WARNING",
+                               f"{who} announced itself as an IPv6 router",
+                               ("device", mac), mac)
 
     def _observe_mdns(self, d, ts):
         info = d["mdns"]
@@ -7638,6 +7808,7 @@ def _default_config():
                    "internet_target": "1.1.1.1:443"},
         "alerts": {"new_device": True, "arp_spoof": True,
                    "gateway_change": True, "dhcp_anomaly": True,
+                   "rogue_ra": True,
                    "chatty_device": True, "unknown_device": True,
                    "reconnect_cycle": True, "duplicate_ip": True,
                    "dns_server_change": True, "dns_failures": True,
@@ -7923,7 +8094,7 @@ class SessionCodec:
                     "when": float(e.get("when") or 0), "kind": e.get("kind",
                                                                     ""),
                     "severity": e.get("severity", "INFO"),
-                    "text": e.get("text", ""),
+                    "text": sanitize_text(e.get("text", ""), 400),
                     "ref": tuple(ref) if isinstance(ref, list) else ref,
                     "device": e.get("device", ""), "live": False})
         model.metrics.load(payload.get("metrics") or {})
@@ -8500,8 +8671,8 @@ class GeoIPService:
             if code:
                 try:
                     self.on_result(ip, code, name, provider)
-                except Exception:
-                    pass
+                except Exception:                    # noqa: BLE001
+                    LOG.exception("geoip result callback")
 
 
 class Tooltip:
@@ -8534,7 +8705,7 @@ class Tooltip:
         if self._after_id is not None:
             try:
                 self.widget.after_cancel(self._after_id)
-            except Exception:
+            except tk.TclError:
                 pass
             self._after_id = None
 
@@ -8569,7 +8740,7 @@ class Tooltip:
         if self._tip is not None:
             try:
                 self._tip.destroy()
-            except Exception:
+            except tk.TclError:
                 pass
             self._tip = None
 
@@ -8838,6 +9009,9 @@ SETTINGS_PAGES = [
                             "Two devices claim the same address."),
              _alert_control("dhcp_anomaly",
                             "More than one device hands out addresses."),
+             _alert_control("rogue_ra",
+                            "A device other than your router announces "
+                            "itself as an IPv6 router."),
              _alert_control("gateway_change",
                             "Your router's hardware address changes."),
              _alert_control("arp_spoof",
@@ -10062,7 +10236,53 @@ def tree_remove(tree, iid_map, key):
             tree.delete(iid)
 
 
+class IidMap(dict):
+    """key -> Treeview iid, with an O(1) reverse index (iid -> key). Tables
+    with thousands of rows used to scan every row on each click."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.rev = {v: key for key, v in self.items()}
+
+    def __setitem__(self, key, iid):
+        old = self.get(key)
+        if old is not None:
+            self.rev.pop(old, None)
+        super().__setitem__(key, iid)
+        self.rev[iid] = key
+
+    def __delitem__(self, key):
+        iid = self[key]
+        super().__delitem__(key)
+        self.rev.pop(iid, None)
+
+    def pop(self, key, *default):
+        if key in self:
+            iid = super().pop(key)
+            self.rev.pop(iid, None)
+            return iid
+        if default:
+            return default[0]
+        raise KeyError(key)
+
+    def clear(self):
+        super().clear()
+        self.rev.clear()
+
+    def setdefault(self, key, iid=None):
+        if key not in self:
+            self[key] = iid
+        return self[key]
+
+    def update(self, *a, **k):
+        for key, v in dict(*a, **k).items():
+            self[key] = v
+
+
 def key_for_iid(iid_map, iid):
+    rev = getattr(iid_map, "rev", None)
+    if rev is not None:
+        return rev.get(iid)
     for k, v in iid_map.items():
         if v == iid:
             return k
@@ -10939,7 +11159,7 @@ class DevicesTab(BaseTab):
         self.tree.bind("<Return>", lambda e: self._details())
         self.tree.bind("<Button-3>", self._context)
         self.tree.bind("<Button-2>", self._context)
-        self.iids = {}
+        self.iids = IidMap()
         self.apply_mode()
 
     def apply_mode(self):
@@ -11404,7 +11624,7 @@ class ConnectionsTab(BaseTab):
         self.tree.bind("<Double-1>", self._details)
         self.tree.bind("<Button-3>", self._context)
         self.tree.bind("<Button-2>", self._context)
-        self.iids = {}
+        self.iids = IidMap()
         self.apply_mode()
 
     def apply_mode(self):
@@ -11623,7 +11843,7 @@ class RemoteTab(BaseTab):
         self.tree.bind("<Double-1>", self._details)
         self.tree.bind("<Button-3>", self._context)
         self.tree.bind("<Button-2>", self._context)
-        self.iids = {}
+        self.iids = IidMap()
 
     def _match(self, r):
         q = self.q_var.get().strip().lower()
@@ -11777,7 +11997,7 @@ class AlertsTab(BaseTab):
         self.tree.bind("<Return>", self._details)
         self.tree.bind("<Button-3>", self._context)
         self.tree.bind("<Button-2>", self._context)
-        self.iids = {}
+        self.iids = IidMap()
         self.on_theme()
 
     def on_theme(self):
@@ -14105,7 +14325,7 @@ class MiniWireshark:
         s = ttk.Style()
         try:
             s.theme_use("clam")
-        except Exception:
+        except tk.TclError:
             pass
         s.configure("TButton", padding=(10, 6))
         s.configure("Accent.TButton", padding=(14, 8),
@@ -14314,7 +14534,7 @@ class MiniWireshark:
                     if a.get("slant") == "italic":
                         parts.append("italic")
                     widget.configure(font=tuple(parts))
-            except Exception:
+            except (tk.TclError, KeyError, TypeError):
                 pass
         try:
             children = widget.winfo_children()
@@ -14339,7 +14559,7 @@ class MiniWireshark:
         for seq in getattr(self, "_bound_shortcuts", []):
             try:
                 self.root.unbind_all(seq)
-            except Exception:
+            except tk.TclError:
                 pass
         self._bound_shortcuts = []
         actions = {
@@ -14809,7 +15029,9 @@ class MiniWireshark:
         t0 = time.perf_counter()
         budget = 0.030 if self.perf_level < 2 else 0.040
         batch = []
-        rdns_ok = self.rdns is not None and self.data_mode == "live"
+        # reverse DNS sends queries, so it belongs to Active mode only
+        rdns_ok = self.rdns is not None and self.data_mode == "live" and \
+            self.config.get("mode.active_scanning", True)
         while time.perf_counter() - t0 < budget:
             try:
                 d = self.row_q.get_nowait()
@@ -17325,7 +17547,7 @@ class ReportBuilder:
     def _alerts(self):
         e = html.escape
         rows = []
-        for aid in self.m.alerts.order[:200]:
+        for aid in list(self.m.alerts.order)[:200]:
             a = self.m.alerts.alerts.get(aid)
             if not a:
                 continue
@@ -19123,6 +19345,82 @@ def t_fuzz_decoder_and_model(ctx):
         if i % 400 == 0:
             m.tick()
     assert decode_errors < n * 0.05, f"{decode_errors} decode errors"
+
+
+@self_test()
+def t_sanitize_hostile_names(ctx):
+    evil = "evil‮gnp.exe\x00\x1b[31m​name\nnext"
+    out = sanitize_text(evil)
+    assert all(ch.isprintable() for ch in out), repr(out)
+    assert "‮" not in out and "\x1b" not in out and "\n" not in out
+    assert sanitize_text("plain-name") == "plain-name"
+    assert len(sanitize_text("x" * 999)) == 200
+    assert sanitize_text(b"bytes\xff") .startswith("bytes")
+    if not ctx.scapy_ok:
+        return
+    sb = ScenarioBuilder()
+    host = ("192.168.1.77", "00:11:22:33:44:77", "pc‮cod.exe\x07")
+    sb.dhcp(host)
+    sb.mdns(host, "_ipp._tcp", "Prin⁦ter\x1b", {"ty": "x‮y"})
+    m = scenario_model(ctx.cfg(), sb.frames)
+    for dv in m.registry.by_key.values():
+        for txt in (dv.display_name(), dv.dhcp_hostname, dv.mdns_name,
+                    dv.model_hint):
+            assert all(ch.isprintable() for ch in txt), repr(txt)
+
+
+@self_test()
+def t_npcap_signer_pin(ctx):
+    good = "CN=Nmap Software LLC, O=Nmap Software LLC, L=Seattle, C=US"
+    assert signer_matches(good, NPCAP_SIGNER)
+    assert not signer_matches("CN=Evil Corp, O=Nmap Software LLC Fans",
+                              NPCAP_SIGNER)
+    assert not signer_matches("", NPCAP_SIGNER)
+    assert not signer_matches("CN=Nmap Software LLC Ltd", NPCAP_SIGNER)
+    assert _version_tuple(NPCAP_FALLBACK_VERSION) >= (1, 89)
+
+
+@self_test()
+def t_rogue_router_advertisement(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    frames = ctx.frames()
+    sb = ScenarioBuilder(t0=frames[-1][1] + 5)
+    sb._emit(Ether(src=ScenarioBuilder.PHONE[1], dst="33:33:00:00:00:01") /
+             IPv6(src="fe80::d8a1:19ff:fe23:4567", dst="ff02::1") /
+             ICMPv6ND_RA(routerlifetime=1800) /
+             ICMPv6NDOptPrefixInfo(prefix="2a01:e0a:9999::", prefixlen=64) /
+             ICMPv6NDOptSrcLLAddr(lladdr=ScenarioBuilder.PHONE[1]))
+    m = scenario_model(ctx.cfg(), frames + sb.frames)
+    kinds = [a for a in m.alerts.alerts.values() if a.kind == "rogue_ra"]
+    assert len(kinds) == 1 and kinds[0].device_key == \
+        ScenarioBuilder.PHONE[1], kinds
+    m2 = scenario_model(ctx.cfg(), frames)
+    assert not any(a.kind == "rogue_ra" for a in m2.alerts.alerts.values())
+
+
+@self_test()
+def t_iid_map_reverse_index(ctx):
+    m = IidMap()
+    m["a"] = "I1"
+    m["b"] = "I2"
+    m["a"] = "I3"
+    assert key_for_iid(m, "I3") == "a" and key_for_iid(m, "I1") is None
+    m.pop("b")
+    assert key_for_iid(m, "I2") is None and m.pop("zz", None) is None
+    m.clear()
+    assert not m.rev
+    ae = AlertEngine(ctx.cfg(), _FakeClock())
+    for i in range(520):
+        ae._add("new_device", "INFO", f"k{i}", "r", "o", "i", "p")
+    assert len(ae.order) == 500 and len(ae.alerts) == 500
+    assert ae.order[0] in ae.alerts
+
+
+@self_test()
+def t_reverse_dns_only_in_active_mode(ctx):
+    src = inspect.getsource(MiniWireshark._drain_decoded)
+    assert "mode.active_scanning" in src
 
 
 def bench_report(seconds=2.0):
