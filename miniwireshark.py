@@ -84,6 +84,7 @@ import threading
 import time
 import traceback
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from collections import Counter, OrderedDict, defaultdict, deque
@@ -747,11 +748,100 @@ NPCAP_LICENSE_NOTE = (
     "for you. Licence: https://npcap.com/oem/redist.html")
 
 
+# ============================================================================
+#  1b.  Everything MiniWireshark itself sends — one gate, one ledger
+#
+#  Every network send the app makes (downloads, update checks, health
+#  checks, discovery probes, reverse lookups, the router check) passes
+#  through outbound() first. It is written to the self-traffic ledger you
+#  can open from Settings → Privacy, and the kill switch stops all of it at
+#  once. A self-test parses this file and fails if any send bypasses it.
+# ============================================================================
+class OutboundBlocked(OSError):
+    """Raised instead of sending while the kill switch is on."""
+
+
+OUTBOUND_FEATURES = {
+    "runtime": "Private Python setup (downloads)",
+    "npcap": "Capture driver install (Windows)",
+    "reference": "Reference lists (vendor names, public suffixes)",
+    "geoip": "Country lookup (online service)",
+    "update": "Update check",
+    "lan_scan": "Device discovery (Active Mode)",
+    "health": "Health checks (router, DNS, Internet)",
+    "rdns": "Device names via reverse DNS (Active Mode)",
+    "diagnostics": "Diagnostics tests you started",
+    "upnp": "Router port-forwarding check",
+    "connector": "Connected helpers (Pi-hole, AdGuard Home)",
+    "release": "Release tooling (developers only)",
+}
+
+
+class SelfTrafficLedger:
+    def __init__(self, keep=3000):
+        self.entries = deque(maxlen=keep)
+        self.killed = False
+        self.counts = Counter()
+        self.blocked = 0
+        self.lock = threading.Lock()
+
+    def record(self, feature, kind, dest, detail="", allowed=True, count=1):
+        e = {"ts": time.time(), "feature": feature, "kind": kind,
+             "dest": str(dest)[:120], "detail": str(detail)[:200],
+             "allowed": allowed, "count": int(count)}
+        with self.lock:
+            self.entries.append(e)
+            if allowed:
+                self.counts[feature] += int(count)
+            else:
+                self.blocked += int(count)
+        return e
+
+    def snapshot(self, feature=None):
+        with self.lock:
+            return [dict(e) for e in self.entries
+                    if feature is None or e["feature"] == feature]
+
+    def summary_lines(self):
+        with self.lock:
+            items = sorted(self.counts.items(), key=lambda kv: -kv[1])
+        out = [f"{OUTBOUND_FEATURES.get(k, k)}: {n}" for k, n in items]
+        if self.blocked:
+            out.append(f"Blocked by the kill switch: {self.blocked}")
+        return out or ["Nothing sent yet."]
+
+
+LEDGER = SelfTrafficLedger()
+
+
+def outbound(feature, kind, dest, detail="", count=1):
+    """The gate in front of every network send. Records it in the ledger,
+    or raises OutboundBlocked while the kill switch is on."""
+    if LEDGER.killed:
+        LEDGER.record(feature, kind, dest, detail, allowed=False,
+                      count=count)
+        raise OutboundBlocked(
+            f"Not sent — the kill switch is on "
+            f"({OUTBOUND_FEATURES.get(feature, feature)})")
+    LEDGER.record(feature, kind, dest, detail, True, count)
+    return True
+
+
+def net_urlopen(feature, req, timeout, detail=""):
+    """urllib.request.urlopen behind the outbound gate."""
+    url = req.full_url if isinstance(req, urllib.request.Request) \
+        else str(req)
+    parts = urllib.parse.urlsplit(url)
+    outbound(feature, parts.scheme or "http", parts.hostname or url,
+             detail or (parts.path or "/")[:100])
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
 def _latest_npcap_version():
     try:
         req = urllib.request.Request("https://npcap.com/",
                                      headers={"User-Agent": APP_NAME})
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with net_urlopen("npcap", req, 15, "latest version") as r:
             page = r.read(600_000).decode("utf-8", "ignore")
         vers = re.findall(r"dist/npcap-(\d+\.\d+)\.exe", page)
         if vers:
@@ -811,7 +901,7 @@ def _install_npcap(loader, state):
     loader.post_log(f"  {url}", "detail")
     try:
         req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
-        with urllib.request.urlopen(req, timeout=120) as r, \
+        with net_urlopen("npcap", req, 120, "installer") as r, \
                 open(exe, "wb") as f:
             shutil.copyfileobj(r, f)
         if os.path.getsize(exe) < 200_000:
@@ -2024,7 +2114,8 @@ class RuntimeManager:
             req.add_header("Range", f"bytes={have}-")
         t0, last = time.time(), 0.0
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with net_urlopen("runtime", req, 60,
+                             os.path.basename(dest)) as r:
                 if have and getattr(r, "status", 200) != 206:
                     have = 0                       # server ignored Range
                 total = int(r.headers.get("Content-Length") or 0) + have
@@ -2644,7 +2735,8 @@ class RuntimeManager:
                    "python-build-standalone/releases/latest")
             req = urllib.request.Request(url, headers={
                 "User-Agent": APP_NAME, "Accept": "application/json"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with net_urlopen("runtime", req, timeout,
+                             "newest Python build") as r:
                 rel = json.loads(r.read(16_000_000).decode("utf-8",
                                                            "replace"))
         tag = rel.get("tag_name", "")
@@ -2681,7 +2773,8 @@ class RuntimeManager:
         req = urllib.request.Request(url, headers={"User-Agent": APP_NAME,
                                                    "Accept":
                                                    "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with net_urlopen("runtime", req, timeout,
+                         "newest Python build") as r:
             data = json.loads(r.read(2_000_000).decode("utf-8", "replace"))
         names = [a.get("name", "") for a in data.get("assets", [])]
         vers = set()
@@ -2709,7 +2802,7 @@ def make_runtime_lock(packages=("scapy", "psutil", "cryptography", "cffi",
             "linux_aarch64": r"manylinux.*aarch64"}
     out = {}
     for pkg in packages:
-        with urllib.request.urlopen(f"https://pypi.org/pypi/{pkg}/json",
+        with net_urlopen("release", f"https://pypi.org/pypi/{pkg}/json",
                                     timeout=30) as r:
             d = json.load(r)
         ver = d["info"]["version"]
@@ -3118,7 +3211,7 @@ class DataManager:
             req = urllib.request.Request(r.url, headers={
                 "User-Agent": f"{APP_NAME}/{SCRIPT_VERSION}"})
             total = 0
-            with urllib.request.urlopen(req, timeout=40) as resp, \
+            with net_urlopen("reference", req, 40, r.key) as resp, \
                     open(tmp, "wb") as f:
                 while True:
                     chunk = resp.read(65536)
@@ -6426,6 +6519,8 @@ class ReverseDNS:
                 time.sleep(self.delay)
             name = ""
             try:
+                outbound("rdns", "dns-ptr", "your DNS server",
+                         f"name of {ip}")
                 name = _socket.gethostbyaddr(ip)[0]
             except (OSError, UnicodeError):
                 name = ""
@@ -6516,6 +6611,9 @@ class LanScanner(threading.Thread):
             return
         try:
             pkts = [Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=h) for h in hosts]
+            outbound("lan_scan", "arp", f"{len(hosts)} addresses in "
+                     f"{self.subnet}", "who-has (one per address)",
+                     count=len(pkts))
             sendp(pkts, iface=self.iface, inter=0.003, verbose=False)
         except Exception as e:                       # noqa: BLE001
             self._note_error(e)
@@ -6529,6 +6627,8 @@ class LanScanner(threading.Thread):
                    UDP(sport=5353, dport=5353) /
                    DNS(rd=0, qd=DNSQR(qname="_services._dns-sd._udp.local.",
                                       qtype="PTR")))
+            outbound("lan_scan", "mdns", "224.0.0.251 (local only)",
+                     "which services are here?")
             sendp(pkt, iface=self.iface, verbose=False)
         except Exception as e:                       # noqa: BLE001
             self._note_error(e)
@@ -6543,6 +6643,8 @@ class LanScanner(threading.Thread):
                    IP(dst="239.255.255.250", src=self.my_ip) /
                    UDP(sport=random.randint(20000, 60000), dport=1900) /
                    Raw(load=msg.encode()))
+            outbound("lan_scan", "ssdp", "239.255.255.250 (local only)",
+                     "M-SEARCH ssdp:all")
             sendp(pkt, iface=self.iface, verbose=False)
         except Exception as e:                       # noqa: BLE001
             self._note_error(e)
@@ -6790,7 +6892,8 @@ class HealthProber(threading.Thread):
             self.run_now.clear()
 
     @staticmethod
-    def _tcp_rtt(host, port, timeout=2.0):
+    def _tcp_rtt(host, port, timeout=2.0, feature="health"):
+        outbound(feature, "tcp", f"{host}:{port}", "connect, then close")
         t0 = time.perf_counter()
         s = _socket.socket(_socket.AF_INET6 if ":" in host
                            else _socket.AF_INET, _socket.SOCK_STREAM)
@@ -6808,7 +6911,9 @@ class HealthProber(threading.Thread):
         return ok, (time.perf_counter() - t0) * 1000.0
 
     @staticmethod
-    def _dns_rtt(server, name="www.example.com", timeout=2.5):
+    def _dns_rtt(server, name="www.example.com", timeout=2.5,
+                 feature="health"):
+        outbound(feature, "dns", f"{server}:53", f"look up {name}")
         qid = random.randint(1, 65535)
         s = _socket.socket(_socket.AF_INET6 if ":" in server
                            else _socket.AF_INET, _socket.SOCK_DGRAM)
@@ -6829,6 +6934,12 @@ class HealthProber(threading.Thread):
                 s.close()
 
     def check(self, p):
+        try:
+            return self._check(p)
+        except OutboundBlocked:
+            return {"time": time.time(), "probes": [], "blocked": True}
+
+    def _check(self, p):
         res = {"time": time.time(), "probes": []}
         gw = p.get("gateway")
         if gw:
@@ -9252,7 +9363,7 @@ class FlowRecord:
                  "closed", "note", "seq_out", "seq_in", "initiator",
                  "cleartext", "live", "assoc", "rtt", "syn_ts", "syns",
                  "dupacks", "zero_win", "ack_out", "ack_in", "retx_bytes",
-                 "payload_out", "payload_in")
+                 "payload_out", "payload_in", "process")
 
     def __init__(self, fid, key, transport, local_ip, local_port, remote_ip,
                  remote_port, ts):
@@ -9300,6 +9411,7 @@ class FlowRecord:
         self.ack_out = self.ack_in = None   # (ack, window) last pure ACK
         self.retx_bytes = 0
         self.payload_out = self.payload_in = 0
+        self.process = ""            # this computer's program, if known
 
     @property
     def duration(self):
@@ -10248,6 +10360,45 @@ class AlertEngine:
                                      "advertised or accepted connections.",
             subject=f"{dev_key}|{service}")
 
+    def new_listener(self, dev_key, program, proto, port, scope):
+        if self._debounced(f"ls:{proto}:{port}:{scope}", 86400):
+            return None
+        net = scope == "the network"
+        return self._add(
+            "new_listener", "WARNING" if net else "INFO", dev_key,
+            f"A program on this computer started accepting connections: "
+            f"{program or 'unknown program'} on {proto} port {port}",
+            f"It is reachable from {scope}. Seen in this computer's own "
+            f"connection table.",
+            "A new service on this computer can be reached by others"
+            if net else "A new local-only service on this computer.",
+            "Often normal (a game, a file-sharing app, a developer tool). "
+            "If you don't recognise the program, close it or check it with "
+            "your antivirus.",
+            confidence="High", why="The operating system lists it as "
+                                   "listening; it wasn't there before.",
+            subject=f"{dev_key}|{proto}/{port}")
+
+    def arp_cache_mismatch(self, ip, cache_mac, seen_macs, is_gateway):
+        if self._debounced(f"arpc:{ip}:{cache_mac}", 3600):
+            return None
+        who = "your router" if is_gateway else ip
+        return self._add(
+            "arp_cache_mismatch", "DANGER" if is_gateway else "WARNING", "",
+            f"This computer's ARP cache disagrees about {who}",
+            f"This computer has {ip} → {cache_mac}, but on the network "
+            f"{ip} answers from {', '.join(sorted(seen_macs)[:3])}.",
+            "Another device may be pretending to be "
+            + ("your router (ARP spoofing), which lets it see your traffic."
+               if is_gateway else "this address."),
+            "If it persists, restart the router and this computer's Wi-Fi; "
+            "if it comes back, look for an unknown device on the network. "
+            "It can also happen right after a router is replaced.",
+            confidence="Medium", why="The address-to-hardware mapping this "
+                                     "computer uses differs from the one "
+                                     "seen in replies on the wire.",
+            subject=f"arp|{ip}")
+
     def new_country(self, dev, country, remote):
         if self._debounced(f"cc:{dev.key}:{country}", 86400):
             return None
@@ -10574,6 +10725,393 @@ class WifiProbe:
         if w.get("standard"):
             parts.append(w["standard"])
         return status, word, why, ", ".join(parts)
+
+
+# ============================================================================
+#  9b.  This computer: which program owns each connection, which programs
+#       accept connections, and what its ARP cache says (all read-only
+#       questions to the operating system)
+# ============================================================================
+def _psutil():
+    ps = OPTIONAL_MODULES.get("psutil")
+    if ps is None and "psutil" not in OPTIONAL_MODULES:
+        try:
+            import psutil as ps                       # noqa: F811
+        except ImportError:
+            ps = None
+        OPTIONAL_MODULES["psutil"] = ps
+    return ps
+
+
+class ProcessMap:
+    """A snapshot of this computer's connection table: local address and
+    port → program. Refreshed in the background every few seconds while
+    watching live. Programs the operating system won't name without admin
+    rights are shown as such, never guessed."""
+
+    def __init__(self, interval=2.0):
+        self.interval = interval
+        self.by_local = {}        # (proto, ip, port) → (pid, name)
+        self.by_port = {}         # (proto, port) → (pid, name)
+        self.listening = {}       # (proto, ip, port) → (pid, name)
+        self.names = {}           # pid → name
+        self.at = 0.0
+        self.busy = False
+        self.needs_admin = False
+        self.error = ""
+        self.available = _psutil() is not None
+        self.seq = 0
+
+    def _name(self, ps, pid):
+        if not pid:
+            return "the operating system"
+        n = self.names.get(pid)
+        if n is None:
+            try:
+                n = ps.Process(pid).name()
+            except Exception:                        # noqa: BLE001
+                n = ""
+            if len(self.names) > 5000:
+                self.names.clear()
+            self.names[pid] = n
+        return n
+
+    def _connections(self, ps):
+        try:
+            return ps.net_connections(kind="inet"), False
+        except ps.AccessDenied:
+            pass                     # macOS without admin: per process
+        out = []
+        for p in ps.process_iter(["pid"]):
+            try:
+                fn = getattr(p, "net_connections", None) or p.connections
+                for c in fn(kind="inet"):
+                    out.append((c, p.pid))     # per-process rows lack pid
+            except Exception:                        # noqa: BLE001
+                continue
+        return out, True
+
+    def read(self):
+        ps = _psutil()
+        if ps is None:
+            return False
+        conns, partial = self._connections(ps)
+        by_local, by_port, listening = {}, {}, {}
+        unnamed = 0
+        for c in conns:
+            pid = None
+            if isinstance(c, tuple) and len(c) == 2 and not hasattr(
+                    c, "laddr"):
+                c, pid = c
+            pid = pid if pid is not None else getattr(c, "pid", None)
+            la = getattr(c, "laddr", None)
+            if not la:
+                continue
+            proto = "TCP" if getattr(c, "type", 1) == 1 else "UDP"
+            ip, port = la[0], la[1]
+            name = self._name(ps, pid) if pid else ""
+            if pid is None:
+                unnamed += 1
+            ent = (pid, name)
+            by_local[(proto, ip, port)] = ent
+            by_port.setdefault((proto, port), ent)
+            ra = getattr(c, "raddr", None)
+            status = getattr(c, "status", "")
+            if (proto == "TCP" and status == "LISTEN") or \
+                    (proto == "UDP" and not ra):
+                listening[(proto, ip, port)] = ent
+        self.by_local, self.by_port, self.listening = by_local, by_port, \
+            listening
+        self.needs_admin = partial or unnamed > 0
+        self.at = time.time()
+        self.seq += 1
+        return True
+
+    def refresh(self, force=False):
+        if not self.available or self.busy or (
+                not force and time.time() - self.at < self.interval):
+            return False
+        self.busy = True
+
+        def work():
+            try:
+                self.read()
+                self.error = ""
+            except Exception as e:                   # noqa: BLE001
+                self.error = str(e)
+            finally:
+                self.busy = False
+        threading.Thread(target=work, daemon=True, name="process-map").start()
+        return True
+
+    def lookup(self, proto, ip, port):
+        """→ (pid, name) or None. Name "" = the OS didn't say (admin)."""
+        if port is None:
+            return None
+        ent = self.by_local.get((proto, ip, port))
+        if ent is None:
+            for any_ip in ("0.0.0.0", "::", ""):
+                ent = self.by_local.get((proto, any_ip, port))
+                if ent is not None:
+                    break
+        if ent is None:
+            ent = self.by_port.get((proto, port))
+        return ent
+
+
+def program_label(ent):
+    if ent is None:
+        return ""
+    pid, name = ent
+    if name:
+        return f"{name} (pid {pid})" if pid else name
+    return "unknown program (needs admin rights to name it)"
+
+
+# Ports below the usual ephemeral range count as "services"; an UDP socket
+# above it is almost always a client asking something.
+LISTEN_EPHEMERAL = 32768
+
+
+def listening_key(proto, ip, port):
+    scope = "this computer only" if ip in ("127.0.0.1", "::1") or \
+        str(ip).startswith("127.") else "the network"
+    return f"{proto}/{port}/{scope}"
+
+
+class ListenWatch:
+    """Remembers which programs accept connections on this computer and
+    reports new ones. The first look only learns (no alerts)."""
+
+    def __init__(self, path):
+        self.path = path
+        self.known = read_json(path, {}) or {}
+        if not isinstance(self.known, dict):
+            self.known = {}
+        self.learning = not self.known
+
+    def check(self, listening, now=None):
+        """→ [(key, proto, ip, port, program, scope)] new since last time."""
+        now = now or time.time()
+        new = []
+        for (proto, ip, port), ent in sorted(listening.items(),
+                                             key=lambda kv: str(kv[0])):
+            if proto == "UDP" and port >= LISTEN_EPHEMERAL:
+                continue
+            key = listening_key(proto, ip, port)
+            prog = program_label(ent)
+            rec = self.known.get(key)
+            if rec is None:
+                self.known[key] = {"program": prog, "first": now,
+                                   "last": now}
+                if not self.learning:
+                    new.append((key, proto, ip, port, prog,
+                                key.rsplit("/", 1)[1]))
+            else:
+                rec["last"] = now
+                if prog and rec.get("program") != prog and \
+                        "needs admin" not in prog:
+                    rec["program"] = prog
+        self.learning = False
+        with contextlib.suppress(OSError):
+            atomic_write_json(self.path, self.known)
+        return new
+
+
+def parse_proc_arp(text):
+    """/proc/net/arp (Linux) → [(ip, mac, iface)]."""
+    out = []
+    for line in (text or "").splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 6 and parts[2] != "0x0":
+            out.append((parts[0], parts[3].lower(), parts[5]))
+    return out
+
+
+def parse_arp_windows(text):
+    """`arp -a` (Windows; any language) → [(ip, mac, iface_ip)]."""
+    out, iface = [], ""
+    for line in (text or "").splitlines():
+        m = re.search(r"(\d+\.\d+\.\d+\.\d+)\s+---\s+0x", line)
+        if m:
+            iface = m.group(1)
+            continue
+        m = re.match(r"\s*(\d+\.\d+\.\d+\.\d+)\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]"
+                     r"{2}){5})\s+(\S+)", line)
+        if m:
+            out.append((m.group(1), m.group(2).replace("-", ":").lower(),
+                        iface))
+    return out
+
+
+def parse_arp_bsd(text):
+    """`arp -an` (macOS / BSD) → [(ip, mac, iface)]."""
+    out = []
+    for line in (text or "").splitlines():
+        m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-fA-F:]+)"
+                      r"(?: on (\S+))?", line)
+        if m and "incomplete" not in line:
+            mac = ":".join(p.zfill(2) for p in m.group(2).split(":"))
+            if len(mac) == 17:
+                out.append((m.group(1), mac.lower(), m.group(3) or ""))
+    return out
+
+
+def read_arp_cache():
+    """This computer's ARP cache (read-only; nothing is sent)."""
+    try:
+        if IS_WINDOWS:
+            r = subprocess.run(["arp", "-a"], capture_output=True, text=True,
+                               timeout=10, creationflags=getattr(
+                                   subprocess, "CREATE_NO_WINDOW", 0))
+            return parse_arp_windows(r.stdout)
+        if os.path.exists("/proc/net/arp"):
+            with open("/proc/net/arp", encoding="utf-8") as f:
+                return parse_proc_arp(f.read())
+        r = subprocess.run(["arp", "-an"], capture_output=True, text=True,
+                           timeout=10)
+        return parse_arp_bsd(r.stdout)
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+# ---- the opt-in router port-forwarding check (UPnP IGD) ---------------------
+UPNP_WAN_SERVICES = ("urn:schemas-upnp-org:service:WANIPConnection:2",
+                     "urn:schemas-upnp-org:service:WANIPConnection:1",
+                     "urn:schemas-upnp-org:service:WANPPPConnection:1")
+
+
+def upnp_parse_description(xml_text, base_url):
+    """Device description → (service type, control URL) of the router's
+    WAN connection service, or None."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+    found = {}
+    for el in root.iter():
+        if el.tag.endswith("service"):
+            st = cu = ""
+            for ch in el:
+                if ch.tag.endswith("serviceType"):
+                    st = (ch.text or "").strip()
+                elif ch.tag.endswith("controlURL"):
+                    cu = (ch.text or "").strip()
+            if st and cu:
+                found[st] = cu
+    for st in UPNP_WAN_SERVICES:
+        if st in found:
+            return st, urllib.parse.urljoin(base_url, found[st])
+    return None
+
+
+def upnp_soap_body(service, action, args):
+    inner = "".join(f"<{k}>{html.escape(str(v))}</{k}>" for k, v in args)
+    return ('<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.'
+            'xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.'
+            'xmlsoap.org/soap/encoding/"><s:Body>'
+            f'<u:{action} xmlns:u="{service}">{inner}</u:{action}>'
+            '</s:Body></s:Envelope>').encode()
+
+
+def upnp_parse_mapping(xml_text):
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return None
+    out = {}
+    for el in root.iter():
+        tag = el.tag.rsplit("}", 1)[-1]
+        if tag.startswith("New"):
+            out[tag[3:]] = (el.text or "").strip()
+    return out or None
+
+
+def upnp_audit(gateway_ip, timeout=3.0, port=1900, max_entries=64,
+               allowed_hosts=None):
+    """Ask the router which ports it forwards from the Internet. Sends:
+    one discovery message to the router itself, one request for its
+    description, then one request per forwarding rule. Only talks to the
+    router's own address. → dict with mappings, or {"error": …}."""
+    allowed = set(allowed_hosts or ()) | {gateway_ip}
+    s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+           'MAN: "ssdp:discover"\r\nMX: 2\r\n'
+           "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n")
+    location = ""
+    try:
+        outbound("upnp", "ssdp", f"{gateway_ip}:{port}",
+                 "is there an Internet gateway here?")
+        s.sendto(msg.encode(), (gateway_ip, port))
+        t_end = time.time() + timeout
+        while time.time() < t_end and not location:
+            try:
+                data, addr = s.recvfrom(4096)
+            except _socket.timeout:
+                break
+            if addr[0] not in allowed:
+                continue
+            m = re.search(rb"(?im)^location:\s*(\S+)", data)
+            if m:
+                location = m.group(1).decode("ascii", "ignore")
+    except OutboundBlocked as e:
+        return {"error": str(e)}
+    except OSError as e:
+        return {"error": f"The router didn't answer ({e})."}
+    finally:
+        s.close()
+    if not location:
+        return {"error": "The router didn't answer the UPnP question — "
+                         "UPnP is probably off, which is the safer "
+                         "setting.", "upnp": False}
+    host = urllib.parse.urlsplit(location).hostname or ""
+    if host not in allowed:
+        return {"error": f"The answer pointed to {host}, not your router, so "
+                         f"I didn't follow it."}
+    try:
+        req = urllib.request.Request(location,
+                                     headers={"User-Agent": APP_NAME})
+        with net_urlopen("upnp", req, timeout, "device description") as r:
+            desc = r.read(262144).decode("utf-8", "replace")
+    except OSError as e:
+        return {"error": f"Couldn't read the router's description ({e})."}
+    svc = upnp_parse_description(desc, location)
+    if not svc:
+        return {"error": "The router speaks UPnP but offers no port "
+                         "forwarding service.", "upnp": True, "mappings": []}
+    service, control = svc
+    if (urllib.parse.urlsplit(control).hostname or "") not in allowed:
+        return {"error": "The router's control address isn't on your "
+                         "router, so I stopped."}
+    mappings = []
+    for i in range(max_entries):
+        body = upnp_soap_body(service, "GetGenericPortMappingEntry",
+                              [("NewPortMappingIndex", i)])
+        req = urllib.request.Request(control, data=body, headers={
+            "User-Agent": APP_NAME,
+            "Content-Type": 'text/xml; charset="utf-8"',
+            "SOAPAction": f'"{service}#GetGenericPortMappingEntry"'})
+        try:
+            with net_urlopen("upnp", req, timeout,
+                             f"forwarding rule #{i}") as r:
+                text = r.read(65536).decode("utf-8", "replace")
+        except urllib.error.HTTPError:
+            break                     # 713 SpecifiedArrayIndexInvalid: done
+        except OSError as e:
+            if not mappings:
+                return {"error": f"The router refused the question ({e}).",
+                        "upnp": True, "mappings": []}
+            break
+        mp = upnp_parse_mapping(text)
+        if not mp:
+            break
+        mappings.append(mp)
+    return {"upnp": True, "service": service, "mappings": mappings,
+            "location": location}
+
 
 
 # ---- DNS health / intelligence ---------------------------------------------
@@ -11798,6 +12336,19 @@ class NetworkModel:
                      {"proto": rec["proto"], "port": rec["port"],
                       "system": rec["system"], "vlan": rec["vlan"],
                       "mgmt": rec["mgmt"]})
+
+    def my_device_key(self):
+        """The registry key of this computer, or ""."""
+        reg = self.registry
+        for mac in sorted(self.my_macs):
+            k = reg.resolve(mac)
+            if k in reg.by_key:
+                return k
+        for ip in sorted(self.my_ips):
+            k = reg.ip_to_key.get(ip)
+            if k in reg.by_key:
+                return k
+        return ""
 
     def _note_rtt(self, f, ts):
         if f.remote_public:
@@ -13103,7 +13654,8 @@ def _default_config():
         "updates": {"check_automatically": False, "repo": "",
                     "allow_self_update": False},
         "privacy": {"geoip_enabled": False, "local_asn_db": False,
-                    "auto_download_reference": True, "quic_names": True},
+                    "auto_download_reference": True, "quic_names": True,
+                    "kill_switch": False},
         "history": {"enabled": False, "retention": "30 days",
                     "custom_days": 14, "save_raw_packets": False,
                     "packet_ring": False, "packet_ring_mb": 200},
@@ -14676,7 +15228,8 @@ class GeoIPService:
         req = urllib.request.Request(
             url, headers={"User-Agent": "MiniWireshark",
                           "Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        with net_urlopen("geoip", req, self.timeout,
+                         "country of one Internet address") as resp:
             return json.loads(resp.read().decode("utf-8", "ignore"))
 
     def _pace(self):
@@ -15223,6 +15776,17 @@ SETTINGS_PAGES = [
               "here, with exactly what it sends. Nothing is uploaded "
               "silently and there is no telemetry.",
      "sections": [
+         {"title": "What MiniWireshark itself sends", "controls": [
+             {"key": "privacy.kill_switch", "type": "bool",
+              "label": "Kill switch: stop everything MiniWireshark sends",
+              "help": "Watching keeps working, but nothing leaves this "
+                      "computer from MiniWireshark: no discovery probes, "
+                      "health checks, name lookups, downloads or update "
+                      "checks. Every send is listed in the ledger below."},
+             {"type": "info", "text_fn": "ledger_status_text"},
+             {"type": "action", "actions": [
+                 ("Open the self-traffic ledger…", "open_ledger")]},
+         ]},
          {"title": "Reference data (no personal data sent)", "controls": [
              {"key": "privacy.auto_download_reference", "type": "bool",
               "label": "Download public reference lists",
@@ -16161,6 +16725,9 @@ class SettingsWindow:
     def data_status_text(self):
         return self.app.data_status_text()
 
+    def ledger_status_text(self):
+        return self.app.ledger_status_text()
+
     def history_size_text(self):
         return self.app.history_status_text()
 
@@ -16208,6 +16775,8 @@ class SettingsWindow:
             self.app.repair_everything(self.win)
         elif name == "runtime_manager":
             self.app.open_runtime_manager(self.win)
+        elif name == "open_ledger":
+            self.app.open_ledger(self.win)
         elif name == "export_bundle":
             self.app.export_debug_bundle(self.win)
         elif name == "quick_start":
@@ -17893,8 +18462,12 @@ class DevicesTab(BaseTab):
     def _count(self):
         n = len(self.iids)
         total = len(self.model.registry.by_key)
+        extra = len(self.app.arp_cache_only()) if \
+            self.app.data_mode == "live" else 0
         self.count_lbl.configure(
-            text=f"{n} shown" + (f" of {total}" if total != n else ""))
+            text=f"{n} shown" + (f" of {total}" if total != n else "")
+            + (f" · {extra} more in this computer's ARP cache (Reported, "
+               f"not seen on the wire yet)" if extra else ""))
 
     def selected_keys(self):
         return [k for k in (key_for_iid(self.iids, i)
@@ -18271,6 +18844,7 @@ class ConnectionsTab(BaseTab):
             ("security", "Security", 120, "w", False),
             ("domain", "Domain (how known)", 200, "w", False),
             ("asn", "Provider / country", 170, "w", False),
+            ("program", "Program (this computer)", 190, "w", False),
             ("id", "ID", 60, "e", False)]
     BEGINNER = ("device", "to", "purpose", "up", "down", "dur", "status")
 
@@ -18393,7 +18967,7 @@ class ConnectionsTab(BaseTab):
                 f.remote_ip,
                 f.transport, port, f.packets, tcp, f.encryption_text(),
                 f"{f.domain} ({f.domain_conf})" if f.domain else "—",
-                prov, f.fid)
+                prov, f.process or "", f.fid)
 
     def update_ids(self, fids):
         if not self.is_visible():
@@ -19436,7 +20010,15 @@ class SecurityTab(BaseTab):
                  font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
         tk.Label(outer, text="Friendly explanations of what I've noticed. "
                              "Unusual is not the same as dangerous.",
-                 bg=WHITE, fg="#666666").pack(anchor="w", pady=(0, 8))
+                 bg=WHITE, fg="#666666").pack(anchor="w", pady=(0, 4))
+        bar = tk.Frame(outer, bg=WHITE)
+        bar.pack(fill="x", pady=(0, 8))
+        self.upnp_btn = ttk.Button(
+            bar, text="Check my router's port forwarding (UPnP)…",
+            command=self.app.run_upnp_audit)
+        self.upnp_btn.pack(side="left")
+        ttk.Button(bar, text="What MiniWireshark sent…",
+                   command=self.app.open_ledger).pack(side="left", padx=8)
         self.text = tk.Text(outer, wrap="word", bg="#fbfbfb", fg="#222222",
                             relief="flat", padx=14, pady=12,
                             font=("TkDefaultFont", 11), state="disabled",
@@ -19695,6 +20277,49 @@ class SecurityTab(BaseTab):
                      "Check the Devices tab to see them.")
             else:
                 good("Every device I've seen can be identified.")
+
+        lst = app.listening_rows() if app.data_mode == "live" else []
+        if app.data_mode == "live" and app.procmap.available:
+            h1("This computer: programs that accept connections")
+            net = [r for r in lst if r[2] == "the network"]
+            if net:
+                warn(f"{len(net)} program(s) on this computer can be reached "
+                     f"from the network:")
+                for proto, port, _scope, prog in net[:12]:
+                    dim(f"{prog} — {proto} port {port}")
+                body("Usually fine (file sharing, games, development tools). "
+                     "New ones are reported on the timeline as they appear.")
+            else:
+                good("No program on this computer accepts connections from "
+                     "the network.")
+            if app.procmap.needs_admin:
+                dim("Some programs couldn't be named without administrator "
+                    "rights.")
+        elif app.data_mode == "live":
+            h1("This computer: programs that accept connections")
+            dim("Needs the optional psutil component (Settings → Repair).")
+        up = getattr(app, "upnp_result", None)
+        h1("Router port forwarding (UPnP)")
+        if up is None:
+            dim("Not checked. Use “Check my router's port forwarding” above "
+                "(Active Mode, on a network you trust). It asks your router "
+                "only, and every request appears in the ledger.")
+        elif up.get("error") and not up.get("mappings"):
+            (good if up.get("upnp") is False else warn)(up["error"])
+        else:
+            maps = up.get("mappings") or []
+            on = [x for x in maps if x.get("Enabled", "1") in ("1", "true")]
+            if on:
+                warn(f"Your router forwards {len(on)} port(s) from the "
+                     f"Internet into your network:")
+                for x in on[:20]:
+                    dim(app.upnp_mapping_text(x))
+                body("Each one lets the Internet reach a device here. Remove "
+                     "the ones you don't recognise in the router's settings, "
+                     "and turn UPnP off if you don't need it.")
+            else:
+                good("UPnP is on, but no ports are forwarded right now.")
+            dim(f"Checked {fmt_clock(up.get('at', 0), True)}.")
 
         h1("The honest summary")
         if app.sniffer is None and app.data_mode == 'idle':
@@ -20914,6 +21539,13 @@ class MiniWireshark:
         self._sync_packet_ring()
         self.wifi = WifiProbe()
         self._wifi_seen = 0
+        self.procmap = ProcessMap()
+        self._proc_seen = 0
+        self.listen_watch = ListenWatch(os.path.join(PATHS.data,
+                                                     "listening.json"))
+        self.arp_cache = []
+        self._arp_at = 0.0
+        self._arp_busy = False
         QUIC_NAMES["enabled"] = bool(self.config.get("privacy.quic_names",
                                                      True))
         self.geoip = GeoIPService(self._geoip_on_result)
@@ -21329,7 +21961,14 @@ class MiniWireshark:
         prof = getattr(self, "network_profile", None)
         name = prof.get("name", "") if prof else ""
         cmd = self._toggle_active_scanning
-        if wanted and live and prof is None:
+        if LEDGER.killed:
+            bg, fg = t["mode_quiet_bg"], t["mode_quiet_fg"]
+            text = ("\U0001F6D1 KILL SWITCH ON — MiniWireshark sends nothing "
+                    "at all (no probes, lookups, downloads or update "
+                    "checks). It only listens.")
+            btn_text = "Turn the kill switch off"
+            cmd = self._kill_switch_off
+        elif wanted and live and prof is None:
             bg, fg = t["mode_quiet_bg"], t["mode_quiet_fg"]
             text = (tr("mode_quiet") + "  Checking which network this is "
                     "before sending anything…")
@@ -21358,6 +21997,12 @@ class MiniWireshark:
         self.mode_toggle_btn.configure(text=btn_text, command=cmd)
         self._restyle_data_banner()
 
+    def _kill_switch_off(self):
+        self.config.set("privacy.kill_switch", False)
+        self.config.save()
+        self._apply_runtime_settings()
+        self._restyle_mode_banner()
+
     def _restyle_data_banner(self):
         t = self.theme
         text = DATA_MODE_TEXT.get(self.data_mode)
@@ -21380,7 +22025,8 @@ class MiniWireshark:
         """True only when you allow active probes AND the current network
         is one you've said is yours. A network seen for the first time
         starts quiet."""
-        if not self.config.get("mode.active_scanning", True):
+        if LEDGER.killed or not self.config.get("mode.active_scanning",
+                                                 True):
             return False
         prof = self.network_profile
         return bool(prof and prof.get("trusted"))
@@ -23605,6 +24251,7 @@ class MiniWireshark:
         with contextlib.suppress(tk.TclError, AttributeError):
             self.footer_var.set(self.footer_text())
         self._tick_wifi()
+        self._tick_this_pc()
         if self.inspector_visible and getattr(self, "_insp_tick", 0) % 5 \
                 == 0:
             with contextlib.suppress(tk.TclError):
@@ -23628,6 +24275,173 @@ class MiniWireshark:
             p.last = dict(self.DEMO_WIFI)
             return p
         return None
+
+    def _tick_this_pc(self):
+        """Programs behind this computer's connections, new listening
+        services, and the ARP-cache cross-check (live only)."""
+        if self.data_mode != "live":
+            return
+        pm = self.procmap
+        pm.refresh()
+        if pm.seq != self._proc_seen:
+            self._proc_seen = pm.seq
+            self.attribute_processes()
+            me = self.model.my_device_key()
+            for _k, proto, _ip, port, prog, scope in \
+                    self.listen_watch.check(pm.listening):
+                self.model.push_timeline(
+                    "service", "WARNING" if scope == "the network" else
+                    "INFO", f"New service on this computer: {prog} on "
+                    f"{proto} port {port} (reachable from {scope})",
+                    device=me)
+                if scope == "the network":
+                    self.model._alert(self.model.alerts.new_listener(
+                        me, prog, proto, port, scope))
+        if time.time() - self._arp_at > 30 and not self._arp_busy:
+            self._arp_at = time.time()
+            self._arp_busy = True
+
+            def work():
+                try:
+                    entries = read_arp_cache()
+                finally:
+                    self._arp_busy = False
+                self._async_results.put(lambda: self.arp_cross_check(
+                    entries))
+            threading.Thread(target=work, daemon=True,
+                             name="arp-cache").start()
+
+    def upnp_mapping_text(self, x):
+        client = x.get("InternalClient", "")
+        k = self.model.registry.ip_to_key.get(client)
+        dev = self.model.registry.by_key.get(k) if k else None
+        who = f"{dev.display_name()} ({client})" if dev else client or "?"
+        desc = x.get("PortMappingDescription", "")
+        ext = x.get("ExternalPort", "?")
+        risky = REMOTE_ACCESS_PORTS.get(int(ext)) if str(ext).isdigit() \
+            else None
+        return (f"{x.get('Protocol', '?')} {ext} → {who}:"
+                f"{x.get('InternalPort', '?')}"
+                + (f" “{desc}”" if desc else "")
+                + (f"  ⚠ {risky}" if risky else ""))
+
+    def run_upnp_audit(self):
+        """Opt-in: ask the router which ports it forwards (UPnP)."""
+        if self.data_mode != "live" or not self.active_mode() or \
+                not self.model.gateway_ip:
+            messagebox.showinfo(
+                "Router port forwarding",
+                "This check needs Active Mode on a network you've marked "
+                "as yours, while watching live (and the kill switch off).",
+                parent=self.root)
+            return False
+        gw = self.model.gateway_ip
+        if not messagebox.askyesno(
+                "Check the router's port forwarding?",
+                f"MiniWireshark will ask your router ({gw}) — and nothing "
+                f"else — which ports it forwards from the Internet:\n\n"
+                f"• one UPnP discovery message to {gw}\n"
+                f"• one request for the router's description\n"
+                f"• one request per forwarding rule (at most 64)\n\n"
+                f"Nothing is changed on the router. Every request appears in "
+                f"the self-traffic ledger. Continue?", parent=self.root):
+            return False
+
+        def work():
+            res = upnp_audit(gw)
+            res["at"] = time.time()
+            self._async_results.put(lambda: self._upnp_done(res))
+        threading.Thread(target=work, daemon=True, name="upnp").start()
+        self._set_banner("Asking your router about port forwarding…")
+        return True
+
+    def _upnp_done(self, res):
+        self.upnp_result = res
+        maps = [x for x in res.get("mappings") or []
+                if x.get("Enabled", "1") in ("1", "true")]
+        m = self.model
+        if maps:
+            m.push_timeline("network", "WARNING" if any(
+                str(x.get("ExternalPort", "")).isdigit() and
+                int(x["ExternalPort"]) in REMOTE_ACCESS_PORTS for x in maps)
+                else "INFO", f"Router forwards {len(maps)} port(s) from the "
+                f"Internet (UPnP check)")
+            for x in maps:
+                ext = x.get("ExternalPort", "")
+                if str(ext).isdigit() and int(ext) in REMOTE_ACCESS_PORTS:
+                    k = m.registry.ip_to_key.get(x.get("InternalClient", ""))
+                    dev = m.registry.by_key.get(k) if k else None
+                    m._alert(m.alerts.remote_access(
+                        dev.display_name() if dev else x.get(
+                            "InternalClient", "?"), k or "",
+                        REMOTE_ACCESS_PORTS[int(ext)],
+                        f"Your router forwards Internet port {ext} to it "
+                        f"(UPnP)."))
+        self._set_banner("Router check done — see the Security tab.")
+        with contextlib.suppress(Exception):
+            self._select_tab("security").refresh()
+
+    def this_pc_programs(self):
+        """[(program, connections, bytes)] for this computer's flows."""
+        agg = {}
+        for f in self.model.flows.all_flows():
+            if f.process:
+                n, b = agg.get(f.process, (0, 0))
+                agg[f.process] = (n + 1, b + f.total_bytes)
+        return sorted(((k, n, b) for k, (n, b) in agg.items()),
+                      key=lambda r: -r[2])
+
+    def listening_rows(self):
+        """[(proto, port, scope, program)] for this computer's services."""
+        out = []
+        for (proto, ip, port), ent in self.procmap.listening.items():
+            if proto == "UDP" and port >= LISTEN_EPHEMERAL:
+                continue
+            scope = listening_key(proto, ip, port).rsplit("/", 1)[1]
+            out.append((proto, port, scope, program_label(ent)))
+        return sorted(set(out), key=lambda r: (r[2] != "the network",
+                                               r[0], r[1]))
+
+    def attribute_processes(self):
+        pm, m = self.procmap, self.model
+        mine = set(m.my_ips)
+        n = 0
+        for f in list(m.flows.active.values())[-3000:]:
+            if f.process or f.local_ip not in mine or \
+                    f.transport not in ("TCP", "UDP"):
+                continue
+            ent = pm.lookup(f.transport, f.local_ip, f.local_port)
+            if ent is not None:
+                f.process = program_label(ent)
+                n += 1
+        return n
+
+    def arp_cross_check(self, entries, now=None):
+        """Compare this computer's ARP cache with what is seen on the
+        wire. → list of mismatches (ip, cache_mac, seen_macs)."""
+        m = self.model
+        reg = m.registry
+        now = now or m.now()
+        self.arp_cache = [(ip, mac, ifc) for ip, mac, ifc in entries
+                          if is_unicast_mac(mac) and mac != "00:00:00:00:00:00"]
+        out = []
+        for ip, mac, _ifc in self.arp_cache:
+            seen = {x.lower() for x in (reg.ip_macs.get(ip) or ())}
+            gw = ip == m.gateway_ip
+            if gw and reg.gw_macs:
+                seen |= {x.lower() for x in reg.gw_macs}
+            if seen and mac not in seen:
+                out.append((ip, mac, seen))
+                m._alert(m.alerts.arp_cache_mismatch(ip, mac, seen, gw))
+        return out
+
+    def arp_cache_only(self):
+        """Addresses in this computer's ARP cache that haven't been seen on
+        the wire (yet) — shown as Reported, not as devices."""
+        reg = self.model.registry
+        return [(ip, mac) for ip, mac, _i in self.arp_cache
+                if ip not in reg.ip_to_key and mac not in reg.by_key
+                and reg.eligible_ip(ip)]
 
     def _tick_wifi(self):
         """Keep this computer's Wi-Fi reading fresh while watching live,
@@ -24373,6 +25187,21 @@ class MiniWireshark:
                              "\n".join(f"• {d}" for d in sorted(descs))))
         if dev.notes:
             sections.append(("Your notes", dev.notes))
+        if dev.key == m.my_device_key():
+            progs = self.this_pc_programs()
+            if progs:
+                sections.append((
+                    "Programs using the network (this computer)",
+                    "\n".join(f"• {name}: {n} connection(s), "
+                              f"{_human_bytes(b)}" for name, n, b in
+                              progs[:12]) +
+                    "\nFrom this computer's own connection table."))
+            lst = self.listening_rows()
+            if lst:
+                sections.append((
+                    "Programs accepting connections",
+                    "\n".join(f"• {prog} — {proto} {port} ({scope})"
+                              for proto, port, scope, prog in lst[:15])))
         b = m.baselines.devices.get(dev.key)
         if b is not None and b.n:
             sections.append(("Normal behaviour (learned)",
@@ -24628,6 +25457,8 @@ class MiniWireshark:
                  f" a {f.transport} connection to {to}"
                  f"{(' (port ' + str(f.remote_port) + ')') if f.remote_port else ''}"
                  f". Purpose: {f.purpose()}.")
+        if f.process:
+            story += f"\nProgram on this computer: {f.process}."
         sections = [
             ("In plain English", story),
             ("Traffic", f"Upload (sent by your device): "
@@ -25387,6 +26218,17 @@ class MiniWireshark:
     def _apply_runtime_settings(self):
         cfg = self.config
         QUIC_NAMES["enabled"] = bool(cfg.get("privacy.quic_names", True))
+        was = LEDGER.killed
+        LEDGER.killed = bool(cfg.get("privacy.kill_switch", False))
+        if LEDGER.killed and not was:
+            with contextlib.suppress(Exception):
+                self._stop_lan_scanner()
+            self._set_banner("\U0001F6D1  Kill switch on — MiniWireshark "
+                             "sends nothing (watching continues).",
+                             kind="warn")
+        if was != LEDGER.killed:
+            with contextlib.suppress(Exception):
+                self._restyle_mode_banner()
         setup_logging(cfg.get("diagnostics.verbose_logging", False))
         new_max = max(500, int(cfg.get("capture.max_stored_events",
                                        self.MAX_ROWS)))
@@ -25443,6 +26285,81 @@ class MiniWireshark:
 
     def data_status_text(self):
         return "\n".join(self.data.summary_lines())
+
+    def ledger_status_text(self):
+        state = ("🛑 Kill switch ON — nothing is being sent." if
+                 LEDGER.killed else "Sent since start, by feature:")
+        return state + "\n" + "\n".join(LEDGER.summary_lines())
+
+    def open_ledger(self, parent=None):
+        """Every network send MiniWireshark itself made (newest first)."""
+        t = self.theme
+        win = tk.Toplevel(parent or self.root)
+        win.title("What MiniWireshark itself sent")
+        win.geometry("900x560")
+        win.configure(bg=t["tab_bg"])
+        top = tk.Frame(win, bg=t["tab_bg"], padx=12, pady=8)
+        top.pack(fill="x")
+        tk.Label(top, text="\U0001F4E4  What MiniWireshark itself sent",
+                 bg=t["tab_bg"], fg=t["text_fg"],
+                 font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+        tk.Label(top, text="Every probe, lookup and download this app made, "
+                           "newest first. Packets it only listened to are "
+                           "not here — this is only what it sent. Nothing "
+                           "is uploaded anywhere.",
+                 bg=t["tab_bg"], fg=t["muted_fg"], wraplength=860,
+                 justify="left").pack(anchor="w")
+        bar = tk.Frame(win, bg=t["tab_bg"], padx=12)
+        bar.pack(fill="x")
+        kill_var = tk.BooleanVar(value=LEDGER.killed)
+
+        def toggle():
+            self.config.set("privacy.kill_switch", kill_var.get())
+            self.config.save()
+            self._apply_runtime_settings()
+            fill()
+        ttk.Checkbutton(bar, text="Kill switch: stop everything MiniWireshark "
+                                  "sends", variable=kill_var,
+                        command=toggle).pack(side="left")
+        sum_var = tk.StringVar()
+        tk.Label(bar, textvariable=sum_var, bg=t["tab_bg"],
+                 fg=t["muted_fg"]).pack(side="right")
+        wrap, tree = make_tree(win, [
+            ("when", "Time", 80, "center", False),
+            ("feature", "Feature", 230, "w", False),
+            ("kind", "What", 70, "center", False),
+            ("dest", "To", 210, "w", False),
+            ("detail", "Details", 260, "w", True),
+            ("status", "", 70, "center", False)])
+        wrap.pack(fill="both", expand=True, padx=12, pady=8)
+        shown = [0]
+
+        def fill():
+            if not win.winfo_exists():
+                return
+            rows = LEDGER.snapshot()
+            if len(rows) != shown[0] or not tree.get_children():
+                tree.delete(*tree.get_children())
+                for e in reversed(rows[-1000:]):
+                    tree.insert("", "end", values=(
+                        fmt_clock(e["ts"]),
+                        OUTBOUND_FEATURES.get(e["feature"], e["feature"]),
+                        e["kind"] + (f" ×{e['count']}" if e["count"] > 1
+                                     else ""),
+                        e["dest"], e["detail"],
+                        "sent" if e["allowed"] else "BLOCKED"))
+                shown[0] = len(rows)
+            n = sum(e["count"] for e in rows if e["allowed"])
+            sum_var.set(f"{n} sent · {LEDGER.blocked} blocked" +
+                        (" · kill switch ON" if LEDGER.killed else ""))
+
+        def tick():
+            with contextlib.suppress(tk.TclError):
+                fill()
+                win.after(1000, tick)
+        tick()
+        self._ledger_win = win
+        return win
 
     def history_status_text(self):
         if self.history is None:
@@ -25754,7 +26671,7 @@ class MiniWireshark:
                 req = urllib.request.Request(url, headers={
                     "User-Agent": APP_NAME,
                     "Accept": "application/vnd.github+json"})
-                with urllib.request.urlopen(req, timeout=8) as resp:
+                with net_urlopen("update", req, 8, "latest release") as resp:
                     data = json.loads(resp.read().decode("utf-8", "ignore"))
                 tag = str(data.get("tag_name", "")).lstrip("v")
                 assets = [a.get("browser_download_url", "")
@@ -25796,7 +26713,7 @@ class MiniWireshark:
             try:
                 req = urllib.request.Request(url, headers={
                     "User-Agent": APP_NAME})
-                with urllib.request.urlopen(req, timeout=60) as r:
+                with net_urlopen("update", req, 60, "new version") as r:
                     data = r.read(20_000_000)
                 msg = apply_self_update(data, tag)
             except (OSError, ValueError, urllib.error.URLError) as e:
@@ -26501,6 +27418,8 @@ class DiagnosticsWindow:
             return
 
         def run():
+            outbound("diagnostics", "dns", "your DNS server",
+                     "look up www.example.com")
             t0 = time.perf_counter()
             infos = _socket.getaddrinfo("www.example.com", 443,
                                         proto=_socket.IPPROTO_TCP)
@@ -26516,7 +27435,8 @@ class DiagnosticsWindow:
 
         def run():
             host, _, port = target.rpartition(":")
-            ok, ms = HealthProber._tcp_rtt(host, int(port), timeout=4)
+            ok, ms = HealthProber._tcp_rtt(host, int(port), timeout=4,
+                                           feature="diagnostics")
             return (f"Internet reachable: {target} answered in {ms:.0f} ms."
                     if ok else f"Could not reach {target}.")
         self._bg(run, "Testing the Internet connection")
@@ -29529,6 +30449,233 @@ def t_tcp_measurements(ctx):
     assert round_trip.histogram() == h
 
 
+NET_SENDS = {"urlopen", "sendp", "sendto", "gethostbyaddr", "getaddrinfo",
+             "create_connection", "sr1", "srp", "srp1", "sendall"}
+
+
+@self_test()
+def t_every_send_goes_through_outbound(ctx):
+    """Static check of this file: every network send happens in a function
+    that first passes the outbound() gate (so the ledger and the kill
+    switch see it). Tests and the gate itself are exempt."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    bad = []
+
+    def calls_outbound(fn):
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call):
+                name = n.func.attr if isinstance(n.func, ast.Attribute) \
+                    else getattr(n.func, "id", "")
+                if name in ("outbound", "net_urlopen"):
+                    return True
+        return False
+
+    def visit(node, fn=None, top=""):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child if fn is None or not calls_outbound(fn)
+                      else fn, top or child.name)
+                continue
+            if isinstance(child, ast.Call):
+                f = child.func
+                name = f.attr if isinstance(f, ast.Attribute) else \
+                    getattr(f, "id", "")
+                is_send = name in NET_SENDS or (
+                    name == "connect" and isinstance(f, ast.Attribute) and
+                    not (isinstance(f.value, ast.Name) and
+                         f.value.id == "sqlite3"))
+                if is_send:
+                    owner = fn.name if fn is not None else "<module>"
+                    exempt = owner in ("net_urlopen",) or \
+                        top.startswith(("t_", "_gs_"))
+                    if not exempt and not (fn is not None and
+                                           calls_outbound(fn)):
+                        bad.append(f"{owner}:{child.lineno} {name}()")
+            visit(child, fn, top)
+    visit(tree)
+    assert not bad, "sends that bypass outbound(): " + ", ".join(bad)
+
+
+@self_test()
+def t_kill_switch_blocks_everything(ctx):
+    was = LEDGER.killed
+    before = LEDGER.blocked
+    LEDGER.killed = True
+    try:
+        for fn in (lambda: net_urlopen("update", "https://example.com/", 1),
+                   lambda: HealthProber._tcp_rtt("192.0.2.1", 443, 0.1),
+                   lambda: HealthProber._dns_rtt("192.0.2.1"),
+                   lambda: outbound("lan_scan", "arp", "x")):
+            try:
+                fn()
+                raise AssertionError("sent while the kill switch was on")
+            except OutboundBlocked:
+                pass
+        res = HealthProber.check(HealthProber.__new__(HealthProber),
+                                 {"gateway": "192.0.2.1"})
+        assert res.get("blocked") and not res["probes"], res
+        got = upnp_audit("192.0.2.1", timeout=0.2)
+        assert "kill switch" in got.get("error", ""), got
+        assert LEDGER.blocked >= before + 6
+        snap = LEDGER.snapshot()
+        assert not snap[-1]["allowed"]
+    finally:
+        LEDGER.killed = was
+    e = outbound("diagnostics", "dns", "test", "ledger check")
+    assert e and LEDGER.snapshot()[-1]["detail"] == "ledger check"
+    assert any("Diagnostics" in x for x in LEDGER.summary_lines())
+
+
+@self_test()
+def t_process_attribution(ctx):
+    """A known connection of this very test process is attributed to it
+    by the connection table, and a new listening port is reported."""
+    if _psutil() is None:
+        return "skip"
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+    cli = _socket.create_connection(("127.0.0.1", port), timeout=2)
+    acc, _ = srv.accept()
+    try:
+        pm = ProcessMap()
+        assert pm.read()
+        lport = cli.getsockname()[1]
+        ent = pm.lookup("TCP", "127.0.0.1", lport)
+        if ent is None or ent[0] is None:
+            return "skip"          # this OS hides the table from us
+        assert ent[0] == os.getpid(), (ent, os.getpid())
+        assert "python" in program_label(ent).lower() or ent[1] == "", ent
+        assert ("TCP", "127.0.0.1", port) in pm.listening
+        lw = ListenWatch(ctx.path(f"listen_{uuid.uuid4().hex[:6]}.json"))
+        first = lw.check({k: v for k, v in pm.listening.items()
+                          if k[2] != port})
+        assert first == [] and not lw.learning     # first look: learn only
+        new = lw.check(pm.listening)
+        assert any(p == port and scope == "this computer only"
+                   for _k, _pr, _ip, p, _g, scope in new), new
+        assert lw.check(pm.listening) == []        # reported once
+    finally:
+        for s_ in (acc, cli, srv):
+            s_.close()
+
+
+ARP_WINDOWS = """
+Interface: 192.168.1.10 --- 0x7
+  Internet Address      Physical Address      Type
+  192.168.1.1           00-1e-58-aa-00-01     dynamic
+  192.168.1.23          da-a1-19-23-45-67     dynamic
+  192.168.1.255         ff-ff-ff-ff-ff-ff     static
+"""
+ARP_BSD = """? (192.168.1.1) at 0:1e:58:aa:0:1 on en0 ifscope [ethernet]
+? (192.168.1.23) at da:a1:19:23:45:67 on en0 ifscope [ethernet]
+? (192.168.1.99) at (incomplete) on en0 ifscope [ethernet]
+"""
+PROC_ARP = """IP address       HW type     Flags       HW address            Mask     Device
+192.168.1.1      0x1         0x2         00:1e:58:aa:00:01     *        eth0
+192.168.1.77     0x1         0x0         00:00:00:00:00:00     *        eth0
+"""
+
+
+@self_test()
+def t_arp_cache_parsers(ctx):
+    w = parse_arp_windows(ARP_WINDOWS)
+    assert ("192.168.1.1", "00:1e:58:aa:00:01", "192.168.1.10") in w
+    assert len(w) == 3
+    b = parse_arp_bsd(ARP_BSD)
+    assert b == [("192.168.1.1", "00:1e:58:aa:00:01", "en0"),
+                 ("192.168.1.23", "da:a1:19:23:45:67", "en0")], b
+    p = parse_proc_arp(PROC_ARP)
+    assert p == [("192.168.1.1", "00:1e:58:aa:00:01", "eth0")], p
+
+
+@self_test()
+def t_upnp_audit_fake_router(ctx):
+    """The router check against a fake router on this computer: finds the
+    forwarding rules, and every request it made is in the ledger."""
+    import http.server
+    rules = [("TCP", "32400", "192.168.1.70", "32400", "Plex"),
+             ("TCP", "3389", "192.168.1.50", "3389", "RDP")]
+    holder = {}
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            body = ("<?xml version='1.0'?><root xmlns='urn:schemas-upnp-org"
+                    ":device-1-0'><device><serviceList><service><serviceType>"
+                    "urn:schemas-upnp-org:service:WANIPConnection:1"
+                    "</serviceType><controlURL>/ctl</controlURL></service>"
+                    "</serviceList></device></root>").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            data = self.rfile.read(int(self.headers["Content-Length"]))
+            i = int(re.search(rb"<NewPortMappingIndex>(\d+)<", data).group(1))
+            holder.setdefault("posts", []).append(i)
+            if i >= len(rules):
+                self.send_response(500)
+                self.end_headers()
+                return
+            pr, ext, cl, inn, desc = rules[i]
+            body = (f"<s:Envelope xmlns:s='x'><s:Body><u:R xmlns:u='y'>"
+                    f"<NewProtocol>{pr}</NewProtocol><NewExternalPort>{ext}"
+                    f"</NewExternalPort><NewInternalClient>{cl}"
+                    f"</NewInternalClient><NewInternalPort>{inn}"
+                    f"</NewInternalPort><NewEnabled>1</NewEnabled>"
+                    f"<NewPortMappingDescription>{desc}"
+                    f"</NewPortMappingDescription></u:R></s:Body>"
+                    f"</s:Envelope>").encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+    hport = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    udp = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+    udp.bind(("127.0.0.1", 0))
+    uport = udp.getsockname()[1]
+
+    def responder():
+        try:
+            data, addr = udp.recvfrom(2048)
+            holder["msearch"] = data
+            udp.sendto((f"HTTP/1.1 200 OK\r\nLOCATION: http://127.0.0.1:"
+                        f"{hport}/desc.xml\r\nST: x\r\n\r\n").encode(), addr)
+        except OSError:
+            pass
+    threading.Thread(target=responder, daemon=True).start()
+    n0 = len(LEDGER.snapshot("upnp"))
+    try:
+        res = upnp_audit("127.0.0.1", timeout=2.0, port=uport)
+    finally:
+        httpd.shutdown()
+        udp.close()
+    assert not res.get("error"), res
+    maps = res["mappings"]
+    assert [(m_["ExternalPort"], m_["InternalClient"]) for m_ in maps] == \
+        [("32400", "192.168.1.70"), ("3389", "192.168.1.50")], maps
+    assert b"InternetGatewayDevice" in holder["msearch"]
+    sent = LEDGER.snapshot("upnp")[n0:]
+    kinds = [e["kind"] for e in sent]
+    # exactly: 1 discovery, 1 description, one per rule + the final "no
+    # more" answer — nothing else
+    assert kinds.count("ssdp") == 1 and len(sent) == 1 + 1 + 3, kinds
+    assert all(e["dest"] == "127.0.0.1" or e["dest"].startswith(
+        "127.0.0.1:") for e in sent), sent
+    # an answer that points away from the router is not followed
+    bad = upnp_parse_description("<root/>", "http://127.0.0.1/")
+    assert bad is None
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -29916,6 +31063,83 @@ def _gs_diag_depth(app, ctx):
     app.wifi.last = None
     app.wifi.at = 0.0
     app.data_mode = "idle"
+
+
+@gui_test_step("this computer: programs, listeners, ARP cache, ledger, kill switch")
+def _gs_this_pc(app, ctx):
+    root = app.root
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "live"
+    sink = app.lossless_sink()
+    for raw, _ts, lt in ctx.frames():
+        sink(raw, time.time(), lt)
+    assert _gui_pump(root, 0.3, lambda: not len(app.ring) and
+                     not app.worker.busy, timeout=30)
+    # programs: pretend the OS table names this computer's connections
+    mine = [f for f in m.flows.all_flows() if f.local_ip in m.my_ips]
+    assert mine, "the scenario has connections from this computer"
+    pm = app.procmap
+    pm.by_local = {(f.transport, f.local_ip, f.local_port): (4242,
+                                                             "firefox.exe")
+                   for f in mine}
+    pm.listening = {("TCP", "0.0.0.0", 8000): (5151, "python.exe"),
+                    ("TCP", "127.0.0.1", 5432): (99, "postgres.exe")}
+    assert app.attribute_processes() >= 1
+    assert all(f.process == "firefox.exe (pid 4242)" for f in mine
+               if f.local_port is not None)
+    rep = dict(app.device_report(m.registry.by_key[m.my_device_key()]))
+    assert "firefox.exe" in rep["Programs using the network (this "
+                               "computer)"]
+    assert "python.exe" in rep["Programs accepting connections"]
+    ct = app._select_tab("connections")
+    ct.rebuild() if hasattr(ct, "rebuild") else None
+    _gui_pump(root, 0.1)
+    # ARP cache: the router's address points at another MAC → alert
+    n0 = len(m.alerts.alerts)
+    gw_mac = sorted(m.registry.gw_macs)[0]
+    out = app.arp_cross_check([(m.gateway_ip, "02:66:66:66:66:66", "eth0"),
+                               (m.gateway_ip, gw_mac, "eth0"),
+                               ("192.168.1.201", "02:11:22:33:44:55",
+                                "eth0")])
+    assert len(out) == 1 and out[0][0] == m.gateway_ip
+    assert len(m.alerts.alerts) == n0 + 1
+    assert any(a.kind == "arp_cache_mismatch" and a.severity == "DANGER"
+               for a in m.alerts.alerts.values())
+    assert ("192.168.1.201", "02:11:22:33:44:55") in app.arp_cache_only()
+    # security tab with listeners and a UPnP result
+    app.upnp_result = {"upnp": True, "at": time.time(), "mappings": [
+        {"Protocol": "TCP", "ExternalPort": "3389",
+         "InternalClient": S_LAPTOP_IP, "InternalPort": "3389",
+         "Enabled": "1", "PortMappingDescription": "RDP"}]}
+    sec = app._select_tab("security")
+    sec.refresh()
+    body = sec.text.get("1.0", "end")
+    assert "python.exe (pid 5151) — TCP port 8000" in body, body[-800:]
+    assert "Remote Desktop" in body and "3389" in body
+    # ledger + kill switch
+    w = app.open_ledger()
+    _gui_pump(root, 0.2)
+    app.config.set("privacy.kill_switch", True)
+    app._apply_runtime_settings()
+    assert LEDGER.killed and not app.active_mode()
+    app._restyle_mode_banner()
+    assert "KILL SWITCH" in app.mode_lbl.cget("text")
+    assert not app.run_upnp_audit()                  # refused, nothing sent
+    app._kill_switch_off()
+    assert not LEDGER.killed
+    w.destroy()
+    for win in root.winfo_children():
+        if isinstance(win, tk.Toplevel):
+            win.destroy()
+    app.upnp_result = None
+    app.data_mode = "idle"
+    app._restyle_mode_banner()
+
+
+S_LAPTOP_IP = "192.168.1.50"
 
 
 @gui_test_step("network consent: new network is quiet until trusted")
@@ -30332,6 +31556,7 @@ def main():
     if MW_STAGE == "app":
         RuntimeManager().apply_pending_switch()
     cfg = AppConfig()
+    LEDGER.killed = bool(cfg.get("privacy.kill_switch", False))
     root = tk.Tk()
     root.title("MiniWireshark")
     root.minsize(640, 520)
