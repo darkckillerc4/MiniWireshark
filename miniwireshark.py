@@ -22689,6 +22689,42 @@ class BaseTab:
     def on_theme(self):
         pass
 
+    def make_subviews(self, names, on_switch=None):
+        """A row of buttons at the top of the tab that switches between
+        sub-views (no extra top-level tabs). → {name: frame}."""
+        outer = self.frame
+        bar = tk.Frame(outer, bg=WHITE, padx=12)
+        bar.pack(fill="x", pady=(6, 0))
+        self._sub_frames, self._sub_btns = {}, {}
+        self._sub_cb = on_switch
+        for n in names:
+            self._sub_frames[n] = tk.Frame(outer, bg=WHITE)
+            b = ttk.Button(bar, text=n, command=lambda n=n:
+                           self.show_subview(n))
+            b.pack(side="left", padx=(0, 4))
+            self._sub_btns[n] = b
+        self.subview = names[0]
+        self._sub_frames[names[0]].pack(fill="both", expand=True)
+        self._style_subviews()
+        return self._sub_frames
+
+    def _style_subviews(self):
+        for n, b in getattr(self, "_sub_btns", {}).items():
+            with contextlib.suppress(tk.TclError):
+                b.configure(style="Accent.TButton" if n == self.subview
+                            else "TButton")
+
+    def show_subview(self, name):
+        if name not in getattr(self, "_sub_frames", {}):
+            return
+        for f in self._sub_frames.values():
+            f.pack_forget()
+        self._sub_frames[name].pack(fill="both", expand=True)
+        self.subview = name
+        self._style_subviews()
+        if self._sub_cb:
+            self._sub_cb(name)
+
     def device_choices(self):
         devs = sorted(self.model.registry.by_key.values(),
                       key=lambda d: d.display_name().lower())
@@ -24178,6 +24214,21 @@ class ConnectionsTab(BaseTab):
     BEGINNER = ("device", "to", "purpose", "up", "down", "dur", "status")
 
     def build(self):
+        outer = self.frame
+        views = self.make_subviews(["Connections", "Mail"],
+                                   on_switch=self._on_subview)
+        self.frame = views["Connections"]
+        try:
+            self._build_connections()
+        finally:
+            self.frame = outer
+        self.mail = MailView(self.app, views["Mail"])
+
+    def _on_subview(self, name):
+        if name == "Mail":
+            self.mail.refresh(force=True)
+
+    def _build_connections(self):
         self.header("\U0001F517  Connections — each row is one "
                     "conversation between a device and something else. "
                     "Upload is what the device sent; download is what it "
@@ -24317,6 +24368,8 @@ class ConnectionsTab(BaseTab):
         self.count_lbl.configure(text=f"{len(self.iids)} shown")
 
     def refresh(self):
+        if self.subview == "Mail" and self.is_visible():
+            self.mail.refresh()
         if getattr(self, "_pending", False) and self.is_visible():
             self._pending = False
             self.rebuild()
@@ -24388,6 +24441,181 @@ class ConnectionsTab(BaseTab):
     def reset(self):
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
+        self.mail.reset()
+
+
+class MailView:
+    """Email Traffic: how mail connections behave — never what anyone
+    wrote. Sessions come from the Full Power pass; their records contain
+    no content, credentials or addresses (the parser drops them)."""
+
+    COLS = [("client", "Device", 150, "w", False),
+            ("server", "Mail server", 170, "w", True),
+            ("proto", "Protocol", 70, "w", False),
+            ("enc", "Encryption", 200, "w", False),
+            ("logins", "Logins (ok / failed)", 130, "w", False),
+            ("msgs", "Messages / recipients", 140, "w", False),
+            ("bytes", "Bytes up / down", 130, "w", False),
+            ("dur", "Duration", 70, "e", False),
+            ("end", "Ended", 90, "w", False)]
+
+    def __init__(self, app, frame):
+        self.app = app
+        self.frame = frame
+        self._version = -1
+        self.rows = {}
+        top = tk.Frame(frame, bg=WHITE, padx=12, pady=8)
+        top.pack(fill="x")
+        tk.Label(top, text="\u2709  Email Traffic — which mail servers your "
+                 "devices use, whether the connection was encrypted, and "
+                 "where it failed. What anyone wrote is never shown.",
+                 bg=WHITE, fg="#333333", wraplength=1000, justify="left",
+                 font=("TkDefaultFont", 11)).pack(anchor="w")
+        self.summary = tk.Label(top, text="", bg=WHITE, fg="#666666",
+                                wraplength=1000, justify="left",
+                                font=("TkDefaultFont", 9))
+        self.summary.pack(anchor="w", pady=(2, 0))
+        bar = tk.Frame(frame, bg=WHITE, padx=12)
+        bar.pack(fill="x", pady=(0, 6))
+        self.fp_btn = ttk.Button(bar, text="Turn on Full Power",
+                                 command=self._full_power)
+        ttk.Button(bar, text="Export report…",
+                   command=lambda: self.export()).pack(side="right")
+        wrap, self.tree = make_tree(frame, self.COLS, hscroll=True)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree.bind("<Double-1>", self._details)
+        self.bar = bar
+
+    def _full_power(self):
+        self.app.config.set("performance.mode", "Full Power")
+        self.app.config.save()
+        self.refresh(force=True)
+
+    def sessions(self):
+        store = self.app.deep.store
+        with store.lock:
+            return [t for t in store.txns if t.get("kind") == "mail"]
+
+    def summary_text(self, rows):
+        if not rows:
+            mode, _w = self.app.effective_perf_mode()
+            if mode != "Full Power":
+                return ("Mail sessions are followed in Full Power mode "
+                        "(Settings → Performance). Nothing is collected "
+                        "until you turn it on.")
+            return "No mail traffic seen yet."
+        by = Counter(r.get("proto") for r in rows)
+        enc = sum(1 for r in rows if r.get("encryption", "").startswith(
+            ("encrypted", "upgraded")))
+        failed = sum(r.get("auth_failures", 0) for r in rows)
+        early = sum(1 for r in rows if r.get("auth_before_tls"))
+        parts = [", ".join(f"{v} {k}" for k, v in by.most_common()),
+                 f"encrypted {enc} of {len(rows)}"]
+        if failed:
+            parts.append(f"{failed} failed login(s)")
+        if early:
+            parts.append(f"{early} login(s) sent before encryption")
+        return " · ".join(parts)
+
+    def values(self, r):
+        name = self.app.short_device_name
+        dev = self.app.model.device_for(r.get("client", ""), None)
+        if r.get("proto") == "webmail":
+            return (name(dev.key) if dev else r.get("client", ""),
+                    r.get("summary", "").split("service ", 1)[-1][:60],
+                    "webmail", r.get("encryption", ""), "—", "—", "—", "—",
+                    "—")
+        return (name(dev.key) if dev else r.get("client", ""),
+                f"{r.get('server')}:{r.get('port')}", r.get("proto", ""),
+                r.get("encryption", ""),
+                f"{r.get('auth_ok', 0)} / {r.get('auth_failures', 0)}"
+                if r.get("auth_attempts") else "none seen",
+                f"{r.get('messages', 0)} / {r.get('rcpt', 0)}",
+                f"{_human_bytes(r.get('bytes_up', 0))} / "
+                f"{_human_bytes(r.get('bytes_down', 0))}",
+                human_duration(r.get("duration_s", 0) or 0),
+                r.get("closed", ""))
+
+    def refresh(self, force=False):
+        v = self.app.deep.store.version
+        if v == self._version and not force:
+            return
+        self._version = v
+        rows = self.sessions()
+        mode, _w = self.app.effective_perf_mode()
+        with contextlib.suppress(tk.TclError):
+            if mode != "Full Power":
+                self.fp_btn.pack(side="left")
+            else:
+                self.fp_btn.pack_forget()
+            self.summary.configure(text=self.summary_text(rows))
+            self.tree.delete(*self.tree.get_children())
+            self.rows = {}
+            for i, r in enumerate(reversed(rows[-2000:])):
+                iid = self.tree.insert("", "end", values=self.values(r))
+                self.rows[iid] = r
+
+    def _details(self, _e=None):
+        sel = self.tree.selection()
+        r = self.rows.get(sel[0]) if sel else None
+        if r is not None:
+            self.show(r)
+
+    def report_sections(self, r):
+        steps = "\n".join(f"+{t:.2f} s  {w}" for t, w in
+                           r.get("timeline", [])) or "—"
+        sec = [("What happened", r.get("summary", "")),
+               ("Timeline", steps)]
+        if r.get("proto") != "webmail":
+            sec.append(("Logins", (
+                f"{r.get('auth_attempts', 0)} attempt(s) using "
+                f"{', '.join(r.get('auth_mechs') or ['?'])}: "
+                f"{r.get('auth_ok', 0)} accepted, "
+                f"{r.get('auth_failures', 0)} refused."
+                + (" A login was sent before the connection was encrypted."
+                   if r.get("auth_before_tls") else "")
+                if r.get("auth_attempts") else "No login seen.")
+                + " Passwords and login data are never read."))
+            sec.append(("Mail sent", f"{r.get('messages', 0)} message(s) to "
+                        f"{r.get('rcpt', 0)} recipient(s), "
+                        f"{r.get('data_bytes', 0)} bytes. Addresses, "
+                        f"subjects and contents are never kept."))
+            if r.get("errors"):
+                sec.append(("Errors", ", ".join(str(e) for e in
+                                                r["errors"])))
+        return sec
+
+    def show(self, r):
+        DetailDialog(self.app, f"Mail session: {r.get('server')}",
+                     self.report_sections(r), size="600x560")
+
+    def export(self, path=None):
+        rows = self.sessions()
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                parent=self.app.root, title="Export mail report",
+                defaultextension=".txt", initialfile="mail-report.txt",
+                filetypes=[("Text", "*.txt")])
+        if not path:
+            return None
+        lines = ["MiniWireshark — Email Traffic report (metadata only: no "
+                 "contents, passwords or addresses)", "",
+                 self.summary_text(rows), ""]
+        for r in rows:
+            lines.append(r.get("summary", ""))
+            for h, txt in self.report_sections(r)[1:]:
+                lines.append(f"  {h}: " + txt.replace("\n", "; "))
+            lines.append("")
+        text = scrub_secrets("\n".join(lines))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        return path
+
+    def reset(self):
+        with contextlib.suppress(tk.TclError):
+            self.tree.delete(*self.tree.get_children())
+        self.rows = {}
+        self._version = -1
 
 
 # ---- Remote hosts (Advanced) -------------------------------------------------
@@ -26912,7 +27140,13 @@ class PacketsTab(BaseTab):
                               values=(str(e),))
         def text_dump():
             out = dis.text() if dis is not None else ""
-            if pkt is not None:
+            # the capture engine's raw view would show what our own tree
+            # hides (passwords, cookies, mail text): leave it out there
+            sensitive = dis is not None and (any(
+                n.key in ("text", "http") for n in dis.nodes) or bool(
+                {dis.get("tcp.srcport"), dis.get("tcp.dstport")} &
+                {21, 23, 25, 110, 143, 465, 587, 993, 995, 80, 8080}))
+            if pkt is not None and not sensitive:
                 out += ("\n\n— the capture engine's own view —\n"
                         if out else "") + pkt.show(dump=True)
             return out or "(nothing to show)"
@@ -36613,6 +36847,33 @@ def _dissect_http(d, off, end, how):
         d.node.warning = "headers continue in the next segment"
 
 
+_MAIL_LABEL_VERBS = {"EHLO", "HELO", "STARTTLS", "QUIT", "MAIL", "RCPT",
+                     "DATA", "AUTH", "LOGIN", "AUTHENTICATE", "USER", "PASS",
+                     "APOP", "SELECT", "EXAMINE", "FETCH", "LOGOUT", "CAPA",
+                     "STLS", "RETR", "TOP", "LIST", "UIDL", "STAT", "NOOP",
+                     "RSET", "CAPABILITY", "IDLE", "DELE", "UID", "SEARCH",
+                     "STORE", "EXPUNGE", "CLOSE", "NAMESPACE", "ID", "ENABLE"}
+
+
+def _mail_line_label(line):
+    """Mail lines in the packet tree: command names and reply codes only
+    (addresses, subjects and contents are never shown)."""
+    words = [w.decode("latin-1", "replace").upper()
+             for w in line.split()[:3]]
+    if not words:
+        return "(blank line)"
+    if re.match(r"^\d{3}(-.*)?$|^\+OK$|^-ERR$", words[0]):
+        return f"reply {words[0][:4]} (text hidden)"
+    for w in words[:2]:
+        if w in ("OK", "NO", "BAD", "BYE", "PREAUTH") or w.startswith("*"):
+            return f"reply {w} (text hidden)" if w != "*" else \
+                "server status line (text hidden)"
+        verb = w.split(":", 1)[0]
+        if verb in _MAIL_LABEL_VERBS:
+            return f"command {verb} (details hidden)"
+    return "(content hidden: Email Traffic shows metadata only)"
+
+
 def _dissect_text_lines(d, off, end, proto_name, how):
     d.begin("text", off, end, how, title=f"{proto_name} (text)")
     p = off
@@ -36622,6 +36883,8 @@ def _dissect_text_lines(d, off, end, proto_name, how):
         if m:
             shown = ((m.group("tag") or b"") + m.group("cmd")).decode(
                 "latin-1", "replace") + " (hidden: credentials)"
+        elif proto_name in ("SMTP", "POP3", "IMAP"):
+            shown = _mail_line_label(clean)
         else:
             shown = clean.decode("utf-8", "replace")[:200]
         if clean or p < end:
@@ -37740,6 +38003,438 @@ def _ntp_time(b):
     return sec - _NTP_EPOCH + frac / 2 ** 32 if sec else 0.0
 
 
+# ---- V5 M6: Email Traffic (metadata only) -------------------------------------
+#  SMTP, IMAP and POP3 sessions followed on reassembled lines. Secrets are
+#  removed inside the parser: an AUTH / LOGIN / PASS / USER / APOP line is
+#  reduced to its command (and mechanism) before anything else sees it;
+#  SASL continuation lines, DATA bodies, IMAP literals and POP3 RETR/TOP
+#  bodies are skipped by length, never stored. Addresses are counted, never
+#  kept. After STARTTLS / STLS succeeds, parsing stops: the rest is
+#  encrypted and is only measured.
+MAIL_PORTS = {25: "SMTP", 587: "SMTP", 465: "SMTP", 2525: "SMTP",
+              143: "IMAP", 993: "IMAP", 110: "POP3", 995: "POP3"}
+MAIL_TLS_PORTS = {465, 993, 995}
+WEBMAIL_HOSTS = {"mail.google.com": "Gmail", "outlook.live.com": "Outlook",
+                 "outlook.office.com": "Outlook",
+                 "outlook.office365.com": "Outlook",
+                 "mail.yahoo.com": "Yahoo Mail", "mail.proton.me": "Proton",
+                 "app.fastmail.com": "Fastmail", "mail.aol.com": "AOL Mail",
+                 "www.icloud.com": "iCloud", "mail.zoho.com": "Zoho Mail",
+                 "webmail.gmx.net": "GMX"}
+_IMAP_LITERAL = re.compile(rb"\{(\d{1,9})\+?\}\r?\n?$")
+
+
+class MailSession:
+    """Everything kept about one mail connection: counts, codes, timing,
+    and a short timeline. No content, no credentials, no addresses."""
+
+    def __init__(self, proto, client, server, port, ts, implicit_tls=False):
+        self.proto, self.client, self.server = proto, client, server
+        self.port, self.start, self.last = port, ts, ts
+        self.implicit_tls = implicit_tls
+        self.tls = implicit_tls          # traffic is encrypted from here
+        self.starttls_offered = False
+        self.starttls_asked = False
+        self.auth_mechs = []
+        self.auth_attempts = self.auth_failures = self.auth_ok = 0
+        self.auth_before_tls = False
+        self.mail_from = self.rcpt = self.messages_sent = 0
+        self.data_bytes = 0
+        self.commands = Counter()
+        self.replies = Counter()
+        self.errors = []
+        self.greeting = ""
+        self.timeline = []
+        self.bytes = [0, 0]
+        self.mode = ""                   # data / auth / literal / multiline
+        self.skip = [0, 0]               # literal bytes to skip, per dir
+        self.pending_tags = {}           # IMAP tag -> command
+        self.last_cmd = ""
+        self.signature = proto is not None
+
+    def note(self, ts, what):
+        if len(self.timeline) < 40:
+            self.timeline.append((round(ts - self.start, 3), what))
+
+    def result(self, closed_ts, how):
+        enc = "encrypted from the start" if self.implicit_tls else \
+            "upgraded to encryption (STARTTLS)" if self.tls else \
+            "not encrypted"
+        dur = max(0.0, closed_ts - self.start)
+        steps = " → ".join(w for _t, w in self.timeline[:12])
+        return {
+            "kind": "mail", "proto": self.proto, "ts": self.start,
+            "client": self.client, "server": self.server, "port": self.port,
+            "encryption": enc, "starttls_offered": self.starttls_offered,
+            "auth_mechs": list(self.auth_mechs),
+            "auth_attempts": self.auth_attempts,
+            "auth_failures": self.auth_failures, "auth_ok": self.auth_ok,
+            "auth_before_tls": self.auth_before_tls,
+            "mail_from": self.mail_from, "rcpt": self.rcpt,
+            "messages": self.messages_sent, "data_bytes": self.data_bytes,
+            "commands": dict(self.commands), "replies": dict(self.replies),
+            "errors": list(self.errors[:20]), "greeting_ok":
+                bool(self.greeting), "bytes_up": self.bytes[0],
+            "bytes_down": self.bytes[1], "duration_s": round(dur, 3),
+            "closed": how, "timeline": list(self.timeline),
+            "result": enc,
+            "summary": f"{self.proto} {self.client} → {self.server}:"
+                       f"{self.port}, {enc}, {steps or 'no commands seen'}"
+                       f" → {how} after {dur:.1f} s"}
+
+
+class MailTracker:
+    """Follows mail sessions inside ProtocolTracker."""
+
+    MAX = 1024
+
+    def __init__(self, emit, finding):
+        self.sessions = OrderedDict()     # stream key -> MailSession
+        self.emit, self.finding = emit, finding
+        self.reconnects = defaultdict(deque)   # (client, server) -> ts
+
+    def proto_for(self, st, first_line, direction):
+        ports = (st.key[0][1], st.key[1][1])
+        for p in ports:
+            if p in MAIL_PORTS:
+                return MAIL_PORTS[p], p
+        # nonstandard port: a greeting from the server, never a keyword
+        if direction == 1:
+            if re.match(rb"^220[ -].*(SMTP|ESMTP|mail)", first_line, re.I):
+                return "SMTP", ports[1] if st.a == st.key[0] else ports[0]
+            if re.match(rb"^\* OK.*IMAP", first_line, re.I):
+                return "IMAP", ports[1] if st.a == st.key[0] else ports[0]
+            if re.match(rb"^\+OK.*(POP|ready)", first_line, re.I):
+                return "POP3", ports[1] if st.a == st.key[0] else ports[0]
+        return None, None
+
+    def session(self, st, ts, m):
+        key = repr(st.key)
+        s = self.sessions.get(key)
+        if s is not None:
+            return s
+        if m.kind not in ("line", "tls"):
+            return None
+        proto, port = self.proto_for(st, m.data[:200], m.direction)
+        if proto is None:
+            return None
+        server = st.key[1] if st.a == st.key[0] else st.key[0]
+        s = MailSession(proto, st.a[0], server[0], port, ts,
+                        implicit_tls=port in MAIL_TLS_PORTS)
+        self.sessions[key] = s
+        while len(self.sessions) > self.MAX:
+            k, old = self.sessions.popitem(last=False)
+            self._close(old, old.last, "still open (too many sessions)")
+        rc = self.reconnects[(s.client, s.server)]
+        rc.append(ts)
+        while rc and ts - rc[0] > 60:
+            rc.popleft()
+        if len(rc) == 10:
+            self.finding(ts, "note", "Sequence",
+                         f"{s.client} reconnected to the mail server "
+                         f"{s.server} 10 times within a minute (a "
+                         f"misconfigured mail app or wrong password)", "")
+        return s
+
+    def message(self, no, ts, st, m):
+        s = self.session(st, ts, m)
+        if s is None:
+            return False
+        s.last = ts
+        s.bytes[m.direction] += len(m.data)
+        if s.tls or m.kind != "line":
+            return True                   # encrypted: measured only
+        line = m.data
+        if s.skip[m.direction]:
+            take = min(s.skip[m.direction], len(line))
+            s.skip[m.direction] -= take
+            return True
+        text = line.rstrip(b"\r\n")
+        if s.proto == "SMTP":
+            self._smtp(no, ts, s, m.direction, text)
+        elif s.proto == "IMAP":
+            self._imap(no, ts, s, m.direction, text)
+        else:
+            self._pop3(no, ts, s, m.direction, text)
+        return True
+
+    # ---- SMTP ---------------------------------------------------------------------
+    def _smtp(self, no, ts, s, direction, text):
+        if direction == 0:
+            if s.mode == "data":
+                if text == b".":
+                    s.mode = ""
+                    s.messages_sent += 1
+                    s.note(ts, f"message {s.data_bytes} bytes")
+                else:
+                    s.data_bytes += len(text) + 2
+                return
+            if s.mode == "auth":
+                return                    # SASL response: never read
+            verb = text.split(b" ", 1)[0].split(b":", 1)[0].upper().decode(
+                "latin-1", "replace")[:12]
+            s.commands[verb] += 1
+            s.last_cmd = verb
+            if verb in ("EHLO", "HELO"):
+                s.note(ts, verb)
+            elif verb == "STARTTLS":
+                s.starttls_asked = True
+                s.note(ts, "STARTTLS")
+            elif verb == "AUTH":
+                parts = text.split(None, 2)
+                mech = parts[1].upper().decode("latin-1", "replace")[:20] \
+                    if len(parts) > 1 else "?"
+                self._auth(no, ts, s, mech)
+            elif verb == "MAIL":
+                s.mail_from += 1
+            elif verb == "RCPT":
+                s.rcpt += 1
+            elif verb == "QUIT":
+                s.note(ts, "QUIT")
+            return
+        m = re.match(rb"^(\d{3})([ -])(.*)$", text)
+        if not m:
+            return
+        code, more, rest = int(m.group(1)), m.group(2) == b"-", m.group(3)
+        if not more:
+            s.replies[str(code)] += 1
+        if code == 220 and not s.greeting and not s.starttls_asked:
+            s.greeting = "ok"
+            s.note(ts, "greeting")
+        elif s.last_cmd in ("EHLO", "HELO") and code == 250:
+            cap = rest.upper()
+            if cap.startswith(b"STARTTLS"):
+                s.starttls_offered = True
+            if cap.startswith(b"AUTH"):
+                s.auth_mechs = [x.decode("latin-1", "replace")[:20]
+                                for x in cap.split()[1:8]]
+            if not more:
+                s.note(ts, "capabilities")
+        if s.starttls_asked and code == 220 and s.last_cmd == "STARTTLS":
+            s.tls = True
+            s.note(ts, "encrypted")
+        elif code == 334:
+            s.mode = "auth"
+        elif code == 235:
+            s.mode = ""
+            s.auth_ok += 1
+            s.note(ts, "login ok")
+        elif code == 354:
+            s.mode = "data"
+        elif code >= 400 and not more:
+            if s.mode == "auth" or s.last_cmd == "AUTH":
+                s.mode = ""
+                self._auth_failed(no, ts, s)
+            s.errors.append(code)
+            s.note(ts, f"error {code}")
+        elif code == 221:
+            s.note(ts, "bye")
+
+    # ---- IMAP ---------------------------------------------------------------------
+    def _imap(self, no, ts, s, direction, text):
+        lit = _IMAP_LITERAL.search(text)
+        if direction == 0:
+            parts = text.split(None, 2)
+            if len(parts) >= 2 and s.mode != "auth":
+                tag = parts[0][:20].decode("latin-1", "replace")
+                cmd = parts[1].upper().decode("latin-1", "replace")[:14]
+                if cmd == "UID" and len(parts) > 2:
+                    cmd = "UID " + parts[2].split(None, 1)[0].upper().decode(
+                        "latin-1", "replace")[:10]
+                s.commands[cmd] += 1
+                s.pending_tags[tag] = cmd
+                if len(s.pending_tags) > 200:
+                    s.pending_tags.clear()
+                if cmd == "STARTTLS":
+                    s.starttls_asked = True
+                    s.note(ts, "STARTTLS")
+                elif cmd in ("LOGIN", "AUTHENTICATE"):
+                    mech = "LOGIN" if cmd == "LOGIN" else (
+                        parts[2].split(None, 1)[0].upper().decode(
+                            "latin-1", "replace")[:20] if len(parts) > 2
+                        else "?")
+                    self._auth(no, ts, s, mech)
+                    if cmd == "AUTHENTICATE":
+                        s.mode = "auth"
+                elif cmd in ("SELECT", "EXAMINE", "IDLE", "LOGOUT"):
+                    s.note(ts, cmd)
+            elif s.mode == "auth":
+                pass                      # SASL response: never read
+            if lit:
+                s.skip[0] = int(lit.group(1))
+            return
+        if lit:
+            s.skip[1] = int(lit.group(1))   # FETCH literal: skipped
+        if text.startswith(b"* "):
+            up = text.upper()
+            if not s.greeting and up.startswith(b"* OK"):
+                s.greeting = "ok"
+                s.note(ts, "greeting")
+            if b"CAPABILITY" in up[:40] or b"[CAPABILITY" in up:
+                if b"STARTTLS" in up:
+                    s.starttls_offered = True
+                s.auth_mechs = sorted({x.split(b"=", 1)[1].decode(
+                    "latin-1", "replace")[:20] for x in up.split()
+                    if x.startswith(b"AUTH=")})[:8]
+            return
+        if text.startswith(b"+"):
+            return
+        parts = text.split(None, 2)
+        if len(parts) < 2:
+            return
+        tag = parts[0].decode("latin-1", "replace")[:20]
+        status = parts[1].upper().decode("latin-1", "replace")[:3]
+        cmd = s.pending_tags.pop(tag, "")
+        s.replies[status] += 1
+        if cmd == "STARTTLS" and status == "OK":
+            s.tls = True
+            s.note(ts, "encrypted")
+        elif cmd in ("LOGIN", "AUTHENTICATE"):
+            s.mode = ""
+            if status == "OK":
+                s.auth_ok += 1
+                s.note(ts, "login ok")
+            else:
+                self._auth_failed(no, ts, s)
+        if status in ("NO", "BAD"):
+            s.errors.append(f"{cmd or '?'} {status}")
+            s.note(ts, f"{cmd or 'command'} {status}")
+
+    # ---- POP3 ---------------------------------------------------------------------
+    def _pop3(self, no, ts, s, direction, text):
+        if direction == 0:
+            if s.mode == "auth":
+                if text.startswith(b"*"):
+                    s.mode = ""
+                return
+            verb = text.split(b" ", 1)[0].upper().decode("latin-1",
+                                                          "replace")[:8]
+            s.commands[verb] += 1
+            s.last_cmd = verb
+            if verb == "STLS":
+                s.starttls_asked = True
+                s.note(ts, "STLS")
+            elif verb in ("USER", "APOP"):
+                self._auth(no, ts, s, verb)
+            elif verb == "PASS":
+                pass                      # counted with USER
+            elif verb == "AUTH":
+                parts = text.split(None, 2)
+                if len(parts) > 1:
+                    self._auth(no, ts, s, parts[1].upper().decode(
+                        "latin-1", "replace")[:20])
+                    s.mode = "auth"
+            elif verb == "QUIT":
+                s.note(ts, "QUIT")
+            return
+        if s.mode == "multiline":
+            if text == b".":
+                s.mode = ""
+            return                         # message bodies: never read
+        if text.startswith(b"+OK"):
+            s.replies["+OK"] += 1
+            if not s.greeting:
+                s.greeting = "ok"
+                s.note(ts, "greeting")
+            elif s.last_cmd == "STLS":
+                s.tls = True
+                s.note(ts, "encrypted")
+            elif s.last_cmd == "PASS" or (s.last_cmd == "APOP"):
+                s.auth_ok += 1
+                s.note(ts, "login ok")
+            elif s.last_cmd in ("RETR", "TOP", "LIST", "UIDL", "CAPA") and \
+                    not (s.last_cmd in ("LIST", "UIDL") and
+                         len(text.split()) > 2):
+                s.mode = "multiline"
+                if s.last_cmd == "CAPA":
+                    s.mode = "capa"
+        elif text.startswith(b"-ERR"):
+            s.replies["-ERR"] += 1
+            if s.last_cmd in ("PASS", "APOP", "USER", "AUTH"):
+                self._auth_failed(no, ts, s)
+            s.errors.append(f"{s.last_cmd} -ERR")
+            s.note(ts, f"{s.last_cmd} failed")
+        elif s.mode == "capa":
+            if text == b".":
+                s.mode = ""
+            elif text.upper().startswith(b"STLS"):
+                s.starttls_offered = True
+            elif text.upper().startswith(b"SASL"):
+                s.auth_mechs = [x.decode("latin-1", "replace")[:20]
+                                for x in text.split()[1:8]]
+
+    # ---- shared -------------------------------------------------------------------
+    def _auth(self, no, ts, s, mech):
+        s.auth_attempts += 1
+        if mech not in s.auth_mechs:
+            s.auth_mechs.append(mech)
+        s.note(ts, f"login ({mech})")
+        if not s.tls:
+            s.auth_before_tls = True
+            if s.auth_attempts == 1:
+                art = "a" if s.proto == "POP3" else "an"
+                self.finding(ts, "warn", "Security",
+                             f"{s.client} sent {art} {s.proto} login to "
+                             f"{s.server} before encryption was on (the "
+                             f"password itself is not read by "
+                             f"MiniWireshark)", "", no)
+
+    def _auth_failed(self, no, ts, s):
+        s.auth_failures += 1
+        s.note(ts, "login failed")
+        if s.auth_failures == 3:
+            self.finding(ts, "warn", "Security",
+                         f"{s.client} failed to log in to the mail server "
+                         f"{s.server} {s.auth_failures} times (wrong saved "
+                         f"password, or someone guessing)", "", no)
+
+    SAFE_VERBS = {"EHLO", "HELO", "STARTTLS", "QUIT", "MAIL", "RCPT",
+                  "DATA", "AUTH", "LOGIN", "AUTHENTICATE", "USER", "PASS",
+                  "APOP", "SELECT", "EXAMINE", "FETCH", "LOGOUT", "CAPA",
+                  "STLS", "RETR", "TOP", "LIST", "UIDL", "STAT", "NOOP",
+                  "RSET", "CAPABILITY", "IDLE", "DELE", "UID", "SEARCH",
+                  "STORE", "EXPUNGE", "CLOSE", "NAMESPACE", "ID", "ENABLE"}
+
+    def preview(self, st, m):
+        """A label for a mail line that can never contain content:
+        command names and reply codes only."""
+        s = self.sessions.get(repr(st.key))
+        if s is None:
+            return None
+        if m.kind != "line" or s.tls:
+            return f"{s.proto}: encrypted, {len(m.data)} bytes"
+        t = m.data.strip().split()
+        who = "client" if m.direction == 0 else "server"
+        if not t:
+            return f"{s.proto} {who}: blank line"
+        words = [w.decode("latin-1", "replace").upper() for w in t[:3]]
+        if m.direction == 1:
+            code = next((w for w in words[:2] if re.match(
+                r"^(\d{3}(-.*)?|\+OK|-ERR|OK|NO|BAD|\*|\+)$", w)), "")
+            return f"{s.proto} {who}: reply {code[:4] or '(text)'}"
+        verb = next((w for w in words[:2] if w in self.SAFE_VERBS), "")
+        return f"{s.proto} {who}: {verb or '(content not shown)'}"
+
+    def closed(self, st, ts, how):
+        s = self.sessions.pop(repr(st.key), None)
+        if s is not None:
+            self._close(s, ts, how)
+
+    def _close(self, s, ts, how):
+        if s.starttls_offered and not s.tls and (s.auth_attempts or
+                                                  s.mail_from):
+            self.finding(ts, "warn", "Security",
+                         f"{s.server} offered encryption (STARTTLS) but "
+                         f"{s.client} did not use it", "")
+        if s.rcpt > 100:
+            self.finding(ts, "note", "Protocol",
+                         f"{s.client} sent mail to {s.rcpt} recipients in "
+                         f"one session (normal for newsletters, printers "
+                         f"scanning to email, backups or a mail gateway)",
+                         "")
+        self.emit(**s.result(ts, how))
+
+
 class ProtocolTracker:
     """Pairs requests with replies and follows handshakes. Bounded: at
     most MAX_PENDING open exchanges of each kind; old ones expire as
@@ -37762,6 +38457,17 @@ class ProtocolTracker:
         self.ssh = {}              # stream -> banners
         self.mqtt = {}             # stream -> counters
         self.counts = Counter()
+        self.mail = MailTracker(self._emit_kw, self._finding)
+
+    def _emit_kw(self, **t):
+        self._emit(**t)
+
+    def _finding(self, ts, sev, group, summary, field, no=0):
+        self.findings.append((no, ts, sev, group, summary, field))
+
+    def closed(self, st, ts, how):
+        """A TCP stream finished (FIN, RST, idle or memory)."""
+        self.mail.closed(st, ts, how)
 
     def take(self):
         out, self.out = self.out, []
@@ -37907,6 +38613,14 @@ class ProtocolTracker:
         hs = d.values("tls.handshake.type")
         s = self.tls.get(key)
         if 1 in hs:
+            sni = d.get("tls.handshake.extensions_server_name") or ""
+            if sni in WEBMAIL_HOSTS:
+                self._emit(kind="mail", proto="webmail", ts=ts, no=no,
+                           client=src, server=dst, port=dp,
+                           encryption="encrypted (HTTPS)", result="contacted",
+                           summary=f"{src} contacted the webmail service "
+                                   f"{WEBMAIL_HOSTS[sni]} ({sni}); its "
+                                   f"contents are encrypted and never shown")
             self.tls[key] = s = {
                 "ts": ts, "no": no, "client": src, "server": dst,
                 "sni": d.get("tls.handshake.extensions_server_name") or "",
@@ -37992,6 +38706,8 @@ class ProtocolTracker:
 
     # ---- reassembled messages -----------------------------------------------------
     def message(self, no, ts, st, m):
+        if self.mail.message(no, ts, st, m):
+            return None
         key = repr(st.key)
         server = st.key[1] if st.a == st.key[0] else st.key[0]
         client = st.a
@@ -38121,6 +38837,7 @@ class DeepAnalyzer:
         dst = d.get("ip.dst") or d.get("ipv6.dst")
         notes_before = None
         st = None
+        new_msgs, finished = (), False
         if src and (d.get("ip.flags.mf") or d.get("ip.frag_offset")):
             ipn = next(n for n in d.nodes if n.key == "ip")
             hl = d.get("ip.hdr_len") or 20
@@ -38159,19 +38876,20 @@ class DeepAnalyzer:
                     f.append((no, ts, "note", "Sequence",
                               "Missing bytes: " + n, "tcp.seq_raw"))
             new_msgs = st.messages[self._seen_msgs.get(st.key, 0):]
-            for m in new_msgs:
-                msgs.append((repr(st.key), m.direction, m.kind, m.start,
-                             m.end, m.partial, _deep_preview(m.kind, m.data),
-                             no))
+            finished = st.key not in self.tcp.streams
             self._seen_msgs[st.key] = len(st.messages)
-        else:
-            new_msgs = ()
         t2 = time.perf_counter_ns()
         self.cost_ns["reassembly"] += t2 - t1
         try:
             self.proto.packet(no, ts, d, src, dst)
             for m in new_msgs:
                 self.proto.message(no, ts, st, m)
+            for m in new_msgs:
+                msgs.append((repr(st.key), m.direction, m.kind, m.start,
+                             m.end, m.partial, self.proto.mail.preview(st, m)
+                             or _deep_preview(m.kind, m.data), no))
+            if st is not None and finished:
+                self.proto.closed(st, ts, "reset" if st.reset else "closed")
         except (ValueError, IndexError, KeyError, struct.error) as e:
             f.append((no, ts, "note", "Malformed", f"Could not follow the "
                       f"protocol exchange ({type(e).__name__})", ""))
@@ -38248,13 +38966,16 @@ class DeepAnalyzer:
         for st in list(self.tcp.closed):
             done = self._seen_msgs.get(st.key, 0)
             for m in st.messages[done:]:
-                msgs.append((repr(st.key), m.direction, m.kind, m.start,
-                             m.end, m.partial, _deep_preview(m.kind, m.data),
-                             0))
                 with contextlib.suppress(ValueError, IndexError, KeyError,
                                          struct.error):
                     self.proto.message(0, now or 0.0, st, m)
+                msgs.append((repr(st.key), m.direction, m.kind, m.start,
+                             m.end, m.partial, self.proto.mail.preview(st, m)
+                             or _deep_preview(m.kind, m.data), 0))
             self._seen_msgs[st.key] = len(st.messages)
+            with contextlib.suppress(ValueError, IndexError, KeyError):
+                self.proto.closed(st, st.last, "idle" if not final else
+                                  "end of capture")
         self.proto._expire((now or 0.0) + ProtocolTracker.DNS_TIMEOUT + 1
                            if final else (now or 0.0))
         txns, pf = self.proto.take()
@@ -39509,6 +40230,77 @@ class ScenarioBuilder:
         self._emit(down / L.UDP(sport=5060, dport=5060) /
                    L.Raw(b"SIP/2.0 486 Busy Here\r\nContent-Length: 0"
                          b"\r\n\r\n"), dt=0.05)
+        return self.frames
+
+    CANARY = "CANARY-7f3a"
+
+    def mail_sessions(self):
+        """Fictional mail sessions (SMTP, IMAP, POP3, implicit TLS,
+        webmail) carrying the canary secret in every place a password, an
+        address, a subject or a body could leak from."""
+        me, srv_mac = self.ME, self.GW[1]
+        c = self.CANARY.encode()
+        b64 = base64.b64encode(b"\x00alex\x00" + c)
+        smtp = "198.51.100.25"
+        self._tcp_talk(me, smtp, srv_mac, 42025, 25, [
+            (1, b"220 mx.example.net ESMTP ready\r\n"),
+            (0, b"EHLO laptop\r\n"),
+            (1, b"250-mx.example.net\r\n250-STARTTLS\r\n"
+                b"250 AUTH PLAIN LOGIN\r\n"),
+            (0, b"AUTH PLAIN " + b64 + b"\r\n"),
+            (1, b"535 5.7.8 Authentication failed\r\n"),
+            (0, b"AUTH LOGIN\r\n"), (1, b"334 VXNlcm5hbWU6\r\n"),
+            (0, base64.b64encode(c) + b"\r\n"), (1, b"334 UGFzc3dvcmQ6\r\n"),
+            (0, base64.b64encode(c) + b"\r\n"),
+            (1, b"535 5.7.8 Authentication failed\r\n"),
+            (0, b"AUTH PLAIN " + b64 + b"\r\n"),
+            (1, b"535 5.7.8 Authentication failed\r\n"),
+            (0, b"MAIL FROM:<" + c + b"@example.com>\r\n"),
+            (1, b"250 OK\r\n"),
+            (0, b"RCPT TO:<" + c + b"@example.org>\r\n"), (1, b"250 OK\r\n"),
+            (0, b"RCPT TO:<bob@example.org>\r\n"), (1, b"250 OK\r\n"),
+            (0, b"DATA\r\n"), (1, b"354 go ahead\r\n"),
+            (0, b"Subject: " + c + b"\r\n\r\nHello " + c + b"\r\n.\r\n"),
+            (1, b"250 queued\r\n"), (0, b"QUIT\r\n"), (1, b"221 bye\r\n")])
+        self._tcp_talk(me, smtp, srv_mac, 42587, 587, [
+            (1, b"220 smtp.example.net ESMTP\r\n"), (0, b"EHLO laptop\r\n"),
+            (1, b"250-smtp.example.net\r\n250 STARTTLS\r\n"),
+            (0, b"STARTTLS\r\n"), (1, b"220 go ahead\r\n"),
+            (0, build_client_hello("smtp.example.net", rnd=bytes(32))),
+            (1, tls_app_record(300)),
+            (0, tls_app_record(120) + c)])
+        imap = "198.51.100.143"
+        self._tcp_talk(me, imap, srv_mac, 42143, 143, [
+            (1, b"* OK [CAPABILITY IMAP4rev1 STARTTLS AUTH=PLAIN] ready\r\n"),
+            (0, b"a1 LOGIN alex " + c + b"\r\n"),
+            (1, b"a1 NO [AUTHENTICATIONFAILED] Invalid credentials\r\n"),
+            (0, b"a2 LOGIN alex {11}\r\n"), (1, b"+ go\r\n"),
+            (0, c + b"\r\n"), (1, b"a2 OK LOGIN completed\r\n"),
+            (0, b"a3 SELECT INBOX\r\n"),
+            (1, b"* 3 EXISTS\r\na3 OK [READ-WRITE] SELECT completed\r\n"),
+            (0, b"a4 FETCH 1 (BODY[])\r\n"),
+            (1, b"* 1 FETCH (BODY[] {28}\r\nSubject: " + c +
+             b"\r\n\r\nhi\r\n)\r\na4 OK FETCH completed\r\n"),
+            (0, b"a5 LOGOUT\r\n"), (1, b"* BYE\r\na5 OK LOGOUT\r\n")])
+        pop = "198.51.100.110"
+        self._tcp_talk(me, pop, srv_mac, 42110, 110, [
+            (1, b"+OK POP3 server ready\r\n"), (0, b"USER alex\r\n"),
+            (1, b"+OK\r\n"), (0, b"PASS " + c + b"\r\n"),
+            (1, b"-ERR invalid password\r\n"), (0, b"USER alex\r\n"),
+            (1, b"+OK\r\n"), (0, b"PASS " + c + b"x\r\n"),
+            (1, b"+OK logged in\r\n"), (0, b"RETR 1\r\n"),
+            (1, b"+OK 40 octets\r\nSubject: " + c + b"\r\n\r\nbody\r\n.\r\n"),
+            (0, b"QUIT\r\n"), (1, b"+OK bye\r\n")])
+        self._tcp_talk(me, "198.51.100.93", srv_mac, 42993, 993, [
+            (0, build_client_hello("imap.example.net", rnd=bytes(32))),
+            (1, tls_app_record(800)), (0, tls_app_record(200))])
+        self._tcp_talk(me, "142.250.80.5", srv_mac, 42444, 443, [
+            (0, build_client_hello("mail.google.com", rnd=bytes(32))),
+            (1, tls_app_record(500))])
+        self._tcp_talk(me, "203.0.113.7", srv_mac, 42526, 2526, [
+            (1, b"220 relay.example.org ESMTP Postfix\r\n"),
+            (0, b"EHLO laptop\r\n"), (1, b"250 relay.example.org\r\n"),
+            (0, b"QUIT\r\n"), (1, b"221 bye\r\n")])
         return self.frames
 
     def bulk_streams(self, n=50000, flows=200, size=300):
@@ -44297,6 +45089,47 @@ def test_protocol_exchanges(ctx):
     assert sum(1 for f in fs if "SMB version 1" in f[4]) == 1
 
 
+@self_test(slow=False)
+def test_mail_sessions_metadata_only(ctx):
+    """M6: SMTP, IMAP and POP3 sessions are followed (logins counted,
+    STARTTLS noticed, failures and risky logins flagged) while no content,
+    password or address ever leaves the parser."""
+    fr = ScenarioBuilder().mail_sessions()
+    an = DeepAnalyzer(my_ips={ScenarioBuilder.ME[0]})
+    tx, fs, ms = [], [], []
+    for i, (raw, ts, lt) in enumerate(fr):
+        f, m, t = an.process(i + 1, ts, lt, raw)
+        tx += t
+        fs += f
+        ms += m
+    m, t, f = an.flush(fr[-1][1], True)
+    tx, fs, ms = tx + t, fs + f, ms + m
+    mail = {(t["proto"], t.get("port")): t for t in tx
+            if t["kind"] == "mail"}
+    smtp = mail[("SMTP", 25)]
+    assert smtp["auth_attempts"] == 3 and smtp["auth_failures"] == 3
+    assert smtp["rcpt"] == 2 and smtp["messages"] == 1 and \
+        smtp["auth_before_tls"] and smtp["starttls_offered"]
+    assert mail[("SMTP", 587)]["encryption"].startswith("upgraded")
+    imap = mail[("IMAP", 143)]
+    assert imap["auth_ok"] == 1 and imap["auth_failures"] == 1 and \
+        imap["commands"].get("SELECT") == 1
+    pop = mail[("POP3", 110)]
+    assert pop["auth_ok"] == 1 and pop["auth_failures"] == 1
+    assert mail[("IMAP", 993)]["encryption"] == "encrypted from the start"
+    assert mail[("webmail", 443)]["result"] == "contacted"
+    assert mail[("SMTP", 2526)]["proto"] == "SMTP", "found by its greeting"
+    text = " | ".join(f[4] for f in fs)
+    for want in ("SMTP login to 198.51.100.25 before encryption",
+                 "failed to log in to the mail server 198.51.100.25 3",
+                 "offered encryption (STARTTLS) but"):
+        assert want in text, (want, text)
+    blob = repr(tx) + repr(fs) + repr(ms)
+    assert ScenarioBuilder.CANARY not in blob, "secret leaked from parser"
+    assert "example.com>" not in blob and "@example" not in blob
+    for raw, ts, lt in fr:
+        assert ScenarioBuilder.CANARY not in dissect(raw, lt).text()
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -45268,6 +46101,68 @@ def _gs_full_power(app, ctx):
         app.config.set("performance.mode", "Automatic")
         app.config.set("performance.deep_runner", "Automatic")
         app.deep.configure("Automatic")
+
+
+@gui_test_step("Email Traffic: Mail view and the canary never leaks")
+def _gs_mail_canary(app, ctx):
+    root = app.root
+    canary = ScenarioBuilder.CANARY
+    app.config.set("performance.mode", "Full Power")
+    app.config.set("performance.deep_runner", "Thread")
+    try:
+        ident = scenario_identity()
+        m = app._new_model(identity=ident[:3])
+        m.set_identity(local_nets=ident[3])
+        app.replace_model(m)
+        app.data_mode = "live"
+        app._pump_store(reschedule=False)
+        sink = app.lossless_sink()
+        frames = ScenarioBuilder().mail_sessions()
+        for raw, ts, lt in frames:
+            sink(raw, ts, lt)
+        _gui_pump(root, until=lambda: app.count >= len(frames), timeout=30)
+        assert app.deep.drain(20)
+        app.deep.flush(final=True)
+        _gui_pump(root, 0.5)
+        app._pump_store(reschedule=False)
+        tab = app._select_tab("connections")
+        tab.show_subview("Mail")
+        _gui_pump(root, 0.3)
+        rows = tab.mail.tree.get_children()
+        assert len(rows) >= 6, len(rows)
+        assert "encrypted" in tab.mail.summary.cget("text")
+        tab.mail.show(tab.mail.rows[rows[0]])
+        _gui_pump(root, 0.2)
+        outputs = {}
+        outputs["mail report"] = open(tab.mail.export(
+            ctx.path("mail.txt")), encoding="utf-8").read()
+        outputs["session"] = json.dumps(SessionCodec.serialize(
+            app.model, app.session_meta()), default=str)
+        outputs["html report"] = ReportBuilder(app).build("full")
+        app._ask_save = lambda *a, **k: ctx.path("pk.csv")
+        app._export_csv(False)
+        outputs["csv"] = open(ctx.path("pk.csv"), encoding="utf-8").read()
+        outputs["debug bundle"] = app.debug_bundle_text(masked=False)
+        outputs["diagnostics"] = DiagnosticsWindow.collect(app)
+        copy_to_clipboard(app, outputs["mail report"])
+        outputs["clipboard"] = root.clipboard_get()
+        with open(PATHS.log_file, encoding="utf-8", errors="replace") as f:
+            outputs["log"] = f.read()
+        if app.history is not None:
+            with open(app.history.path, "rb") as f:
+                outputs["history db"] = f.read().decode("latin-1")
+        ptab = app.tabs["packets"]
+        for d in list(app.all_rows)[-len(frames):]:
+            ptab.select_no(d["no"])
+            outputs["packet details"] = outputs.get("packet details", "") + \
+                ptab.details.get("1.0", "end")
+        for where, text in outputs.items():
+            assert canary not in text, f"the canary leaked into: {where}"
+        assert app.deep.store.by_kind.get("mail", 0) >= 6
+    finally:
+        app.config.set("performance.mode", "Automatic")
+        app.config.set("performance.deep_runner", "Automatic")
+        app.data_mode = "idle"
 
 
 @gui_test_step("corrections: rename, merge, undo from the window")
