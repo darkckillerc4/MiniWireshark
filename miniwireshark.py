@@ -52,6 +52,7 @@ import bisect
 import collections
 import contextlib
 import csv
+import base64
 import ctypes
 import dataclasses
 import functools
@@ -186,6 +187,37 @@ PATHS = AppPaths()
 LOG = logging.getLogger("miniwireshark")
 
 
+_SECRETS = set()                # passwords / tokens never to be shown
+
+
+def register_secret(value):
+    """Remember a secret so logs, copied details and debug bundles can
+    never contain it."""
+    if value and len(str(value)) >= 4:
+        _SECRETS.add(str(value))
+
+
+def scrub_secrets(text):
+    text = str(text)
+    for sec in sorted(_SECRETS, key=len, reverse=True):
+        if sec in text:
+            text = text.replace(sec, "••••••")
+    return text
+
+
+class _SecretFilter(logging.Filter):
+    def filter(self, record):
+        if _SECRETS:
+            try:
+                msg = record.getMessage()
+            except Exception:                         # noqa: BLE001
+                return True
+            clean = scrub_secrets(msg)
+            if clean != msg:
+                record.msg, record.args = clean, ()
+        return True
+
+
 def setup_logging(verbose=False):
     """Small rotating log (standard library only). Never logs payloads."""
     if getattr(setup_logging, "_done", False):
@@ -198,6 +230,7 @@ def setup_logging(verbose=False):
             encoding="utf-8")
         h.setFormatter(logging.Formatter(
             "%(asctime)s %(levelname)-7s [%(threadName)s] %(message)s"))
+        h.addFilter(_SecretFilter())
         LOG.addHandler(h)
     except OSError:
         LOG.addHandler(logging.NullHandler())
@@ -1479,6 +1512,7 @@ def mask_sensitive(text):
     """Mask IPv4/IPv6 and MAC addresses in shareable text (debug bundles,
     copied details). Keeps the first part so different addresses stay
     distinguishable."""
+    text = scrub_secrets(text)
     text = re.sub(r"\b([0-9a-fA-F]{2})[:-]([0-9a-fA-F]{2})[:-]"
                   r"[0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}[:-][0-9a-fA-F]{2}"
                   r"[:-][0-9a-fA-F]{2}\b", r"\1:\2:xx:xx:xx:xx", text)
@@ -7563,7 +7597,7 @@ EVIDENCE_LABELS = {
     "rdns": "Reverse DNS",
 }
 HOSTNAME_PRIORITY = {"user": 5, "dhcp": 4, "mdns": 4, "nbns": 3,
-                     "ssdp": 3, "rdns": 1, "": 0}
+                     "ssdp": 3, "connector": 2, "rdns": 1, "": 0}
 
 # Docker/typical container-bridge / common virtualization NAT ranges — seen
 # on the machine MiniWireshark itself runs on, not a separate LAN device.
@@ -11114,6 +11148,565 @@ def upnp_audit(gateway_ip, timeout=3.0, port=1900, max_entries=64,
 
 
 
+# ============================================================================
+#  10.  Connected helpers (optional, for power users): Pi-hole and AdGuard
+#       Home. Read-only: MiniWireshark only ASKS them for their query log
+#       and device names. What they say is "Reported" evidence — shown
+#       beside what was observed on the wire, never added to it.
+# ============================================================================
+class CredentialVault:
+    """Where connector passwords live: Windows DPAPI, the macOS Keychain,
+    the Linux Secret Service (secret-tool), or — when none exists — a file
+    only your user account can read. Never in settings, logs or bundles."""
+
+    SERVICE = "MiniWireshark"
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(PATHS.data, "vault.json")
+        self.backend = self._pick()
+
+    def _pick(self):
+        if IS_WINDOWS:
+            return "dpapi"
+        if sys.platform == "darwin" and shutil.which("security"):
+            return "keychain"
+        if shutil.which("secret-tool") and os.environ.get(
+                "DBUS_SESSION_BUS_ADDRESS"):
+            return "secret-service"
+        return "file"
+
+    def describe(self):
+        return {"dpapi": "Windows data protection (only your account can "
+                         "unlock it)",
+                "keychain": "the macOS Keychain",
+                "secret-service": "your desktop's keyring",
+                "file": "a private file only your user account can read "
+                        "(this system has no keyring)"}[self.backend]
+
+    def _file(self):
+        d = read_json(self.path, {}) or {}
+        return d if isinstance(d, dict) else {}
+
+    def _write_file(self, d):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        atomic_write_json(self.path, d)
+        with contextlib.suppress(OSError):
+            os.chmod(self.path, 0o600)
+
+    @staticmethod
+    def _dpapi(data, protect=True):
+        import ctypes.wintypes as wt
+
+        class BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wt.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_char))]
+        buf = ctypes.create_string_buffer(data, len(data))
+        inp = BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(
+            ctypes.c_char)))
+        out = BLOB()
+        fn = ctypes.windll.crypt32.CryptProtectData if protect else \
+            ctypes.windll.crypt32.CryptUnprotectData
+        ok = fn(ctypes.byref(inp), None, None, None, None, 0,
+                ctypes.byref(out))
+        if not ok:
+            raise OSError("Windows data protection refused")
+        try:
+            return ctypes.string_at(out.pbData, out.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(out.pbData)
+
+    def set(self, cid, secret):
+        register_secret(secret)
+        if self.backend == "keychain":
+            r = subprocess.run(["security", "add-generic-password", "-U",
+                                "-a", cid, "-s", self.SERVICE, "-w", secret],
+                               capture_output=True, timeout=20)
+            if r.returncode == 0:
+                return True
+        elif self.backend == "secret-service":
+            r = subprocess.run(["secret-tool", "store", "--label",
+                                f"{self.SERVICE} {cid}", "service",
+                                self.SERVICE, "account", cid],
+                               input=secret.encode(), capture_output=True,
+                               timeout=20)
+            if r.returncode == 0:
+                return True
+        d = self._file()
+        if self.backend == "dpapi":
+            d[cid] = {"dpapi": base64.b64encode(self._dpapi(
+                secret.encode())).decode()}
+        else:
+            d[cid] = {"plain": base64.b64encode(secret.encode()).decode()}
+        self._write_file(d)
+        return True
+
+    def get(self, cid):
+        val = None
+        try:
+            if self.backend == "keychain":
+                r = subprocess.run(["security", "find-generic-password",
+                                    "-a", cid, "-s", self.SERVICE, "-w"],
+                                   capture_output=True, text=True,
+                                   timeout=20)
+                if r.returncode == 0:
+                    val = r.stdout.rstrip("\\n")
+            elif self.backend == "secret-service":
+                r = subprocess.run(["secret-tool", "lookup", "service",
+                                    self.SERVICE, "account", cid],
+                                   capture_output=True, text=True,
+                                   timeout=20)
+                if r.returncode == 0 and r.stdout:
+                    val = r.stdout.rstrip("\\n")
+            if val is None:
+                ent = self._file().get(cid) or {}
+                if "dpapi" in ent and IS_WINDOWS:
+                    val = self._dpapi(base64.b64decode(ent["dpapi"]),
+                                      protect=False).decode()
+                elif "plain" in ent:
+                    val = base64.b64decode(ent["plain"]).decode()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            val = None
+        if val:
+            register_secret(val)
+        return val
+
+    def delete(self, cid):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            if self.backend == "keychain":
+                subprocess.run(["security", "delete-generic-password", "-a",
+                                cid, "-s", self.SERVICE], capture_output=True,
+                               timeout=20)
+            elif self.backend == "secret-service":
+                subprocess.run(["secret-tool", "clear", "service",
+                                self.SERVICE, "account", cid],
+                               capture_output=True, timeout=20)
+        d = self._file()
+        if d.pop(cid, None) is not None:
+            self._write_file(d)
+
+
+class ConnectorError(Exception):
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind          # auth | tls | network | api | refused
+
+
+def connector_http(method, url, headers=None, body=None, pin="",
+                   verify=True, timeout=10.0):
+    """One HTTP(S) request to a helper on your network, through the
+    outbound gate. `pin` = the SHA-256 of a self-signed certificate you
+    accepted. → (status, headers dict, body bytes)."""
+    import http.client
+    import ssl
+    parts = urllib.parse.urlsplit(url)
+    host, port = parts.hostname or "", parts.port
+    path = (parts.path or "/") + (("?" + parts.query) if parts.query
+                                  else "")
+    try:
+        outbound("connector", parts.scheme,
+                 f"{host}:{port or ''}".rstrip(":"),
+                 f"{method} {parts.path or '/'}")
+    except OutboundBlocked as e:
+        raise ConnectorError("refused", str(e))
+    try:
+        if parts.scheme == "https":
+            ctx = ssl.create_default_context()
+            if pin or not verify:
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+            conn = http.client.HTTPSConnection(host, port or 443,
+                                               timeout=timeout, context=ctx)
+        else:
+            conn = http.client.HTTPConnection(host, port or 80,
+                                              timeout=timeout)
+        conn.request(method, path, body=body, headers=dict(
+            {"User-Agent": APP_NAME, "Accept": "application/json"},
+            **(headers or {})))
+        if parts.scheme == "https" and pin:
+            der = conn.sock.getpeercert(binary_form=True) or b""
+            if hashlib.sha256(der).hexdigest() != pin.lower():
+                conn.close()
+                raise ConnectorError("tls", "The helper's certificate "
+                                            "changed since you accepted it.")
+        resp = conn.getresponse()
+        data = resp.read(16 * 1024 * 1024)
+        hdrs = {k.lower(): v for k, v in resp.getheaders()}
+        conn.close()
+        return resp.status, hdrs, data
+    except ssl.SSLCertVerificationError as e:
+        why = getattr(e, "verify_message", "") or str(e)
+        raise ConnectorError("tls", f"The certificate isn't trusted ({why})."
+                                    f" If this is your own Pi-hole/AdGuard "
+                                    f"with its built-in certificate, choose "
+                                    f"“Trust this certificate”.")
+    except ConnectorError:
+        raise
+    except OutboundBlocked as e:
+        raise ConnectorError("refused", str(e))
+    except (OSError, http.client.HTTPException) as e:
+        raise ConnectorError("network", f"Couldn't reach {host}: {e}")
+
+
+def connector_cert_fingerprint(url, timeout=8.0):
+    """SHA-256 of the certificate a helper presents (for “Trust this
+    certificate”)."""
+    import ssl
+    parts = urllib.parse.urlsplit(url)
+    outbound("connector", "tls", parts.hostname or "", "read certificate")
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with _socket.create_connection((parts.hostname, parts.port or 443),
+                                   timeout=timeout) as raw:
+        with ctx.wrap_socket(raw, server_hostname=parts.hostname) as tls:
+            der = tls.getpeercert(binary_form=True) or b""
+    return hashlib.sha256(der).hexdigest()
+
+
+class Connector:
+    kind, title = "", ""
+    PATH_HINT = ""
+
+    def __init__(self, spec, vault):
+        self.spec = dict(spec)
+        self.id = spec["id"]
+        self.name = spec.get("name") or self.title
+        self.url = spec.get("url", "").rstrip("/")
+        self.vault = vault
+        self.pin = spec.get("pin", "")
+        self.verify = bool(spec.get("verify", True))
+
+    def _get(self, path, headers=None, method="GET", body=None):
+        st, hd, data = connector_http(method, self.url + path, headers, body,
+                                      self.pin, self.verify)
+        return st, hd, data
+
+    @staticmethod
+    def _json(data):
+        try:
+            return json.loads(data.decode("utf-8", "replace") or "null")
+        except ValueError:
+            raise ConnectorError("api", "The helper answered something that "
+                                        "isn't JSON — is this the right "
+                                        "address?")
+
+    def test(self):
+        raise NotImplementedError
+
+    def fetch(self, since, limit=5000):
+        raise NotImplementedError
+
+    def close(self):
+        pass
+
+
+class PiHoleConnector(Connector):
+    """Pi-hole v6 REST API: POST /api/auth (password or app password) →
+    session ID in the X-FTL-SID header; GET /api/queries and
+    /api/network/devices; DELETE /api/auth when done."""
+
+    kind, title = "pihole", "Pi-hole"
+    PATH_HINT = "http://pi.hole or https://192.168.1.2"
+
+    def __init__(self, spec, vault):
+        super().__init__(spec, vault)
+        self.sid = ""
+        self.sid_until = 0.0
+
+    def _login(self):
+        if self.sid and time.time() < self.sid_until - 30:
+            return
+        pw = self.vault.get(self.id) or ""
+        st, _h, data = self._get("/api/auth", {"Content-Type":
+                                               "application/json"}, "POST",
+                                 json.dumps({"password": pw}).encode())
+        if st == 401:
+            raise ConnectorError("auth", "Pi-hole refused the password. Use "
+                                         "your Pi-hole password or an app "
+                                         "password (Settings → Web "
+                                         "interface / API).")
+        if st == 404:
+            raise ConnectorError("api", "No Pi-hole v6 API at this address "
+                                        "(Pi-hole 5 isn't supported).")
+        if st >= 400:
+            raise ConnectorError("api", f"Pi-hole answered HTTP {st}.")
+        sess = (self._json(data) or {}).get("session") or {}
+        if not sess.get("valid"):
+            raise ConnectorError("auth", "Pi-hole didn't accept the "
+                                         "password.")
+        self.sid = sess.get("sid") or ""
+        if self.sid:
+            register_secret(self.sid)
+        self.sid_until = time.time() + float(sess.get("validity") or 300)
+
+    def _api(self, path):
+        self._login()
+        hd = {"X-FTL-SID": self.sid} if self.sid else {}
+        st, _h, data = self._get(path, hd)
+        if st == 401:
+            self.sid = ""
+            self._login()
+            hd = {"X-FTL-SID": self.sid} if self.sid else {}
+            st, _h, data = self._get(path, hd)
+        if st >= 400:
+            raise ConnectorError("api", f"Pi-hole answered HTTP {st} for "
+                                        f"{path.split('?')[0]}.")
+        return self._json(data)
+
+    def test(self):
+        info = self._api("/api/info/version")
+        ver = ""
+        with contextlib.suppress(AttributeError, TypeError, KeyError):
+            ver = info["version"]["core"]["local"]["version"]
+        return f"Connected to Pi-hole {ver}".strip()
+
+    def fetch(self, since, limit=5000):
+        out = {"lookups": [], "devices": []}
+        until = time.time() + 60
+        q = self._api(f"/api/queries?from={int(since)}&until={int(until)}"
+                      f"&length={int(limit)}")
+        for r in (q or {}).get("queries") or []:
+            try:
+                ts = float(r.get("time") or 0)
+                if ts < since:
+                    continue          # "from" is whole seconds on the API
+                cl = r.get("client") or {}
+                status = str(r.get("status") or "")
+                rep = r.get("reply") or {}
+                ms = rep.get("time")
+                out["lookups"].append({
+                    "ts": ts, "client": str(cl.get("ip") or ""),
+                    "client_name": str(cl.get("name") or ""),
+                    "domain": str(r.get("domain") or "").lower().strip("."),
+                    "type": str(r.get("type") or ""),
+                    "blocked": status in PIHOLE_BLOCKED,
+                    "status": status,
+                    "ms": float(ms) * 1000.0 if isinstance(
+                        ms, (int, float)) and ms < 60 else None})
+            except (TypeError, ValueError, AttributeError):
+                continue
+        d = self._api("/api/network/devices?max_devices=500&"
+                      "max_addresses=8")
+        for dev in (d or {}).get("devices") or []:
+            ips = [(a.get("ip") or "", a.get("name") or "")
+                   for a in dev.get("ips") or [] if isinstance(a, dict)]
+            out["devices"].append({
+                "mac": str(dev.get("hwaddr") or "").lower(),
+                "ips": [i for i, _n in ips if i],
+                "names": [n for _i, n in ips if n],
+                "vendor": dev.get("macVendor") or "",
+                "last": float(dev.get("lastQuery") or 0)})
+        return out
+
+    def close(self):
+        if self.sid:
+            with contextlib.suppress(ConnectorError):
+                self._get("/api/auth", {"X-FTL-SID": self.sid}, "DELETE")
+            self.sid = ""
+
+
+PIHOLE_BLOCKED = {"GRAVITY", "REGEX", "DENYLIST", "EXTERNAL_BLOCKED_IP",
+                  "EXTERNAL_BLOCKED_NULL", "EXTERNAL_BLOCKED_NXRA",
+                  "GRAVITY_CNAME", "REGEX_CNAME", "DENYLIST_CNAME",
+                  "SPECIAL_DOMAIN", "DBBUSY", "EXTERNAL_BLOCKED_EDE15"}
+
+
+class AdGuardConnector(Connector):
+    """AdGuard Home (/control API, HTTP Basic auth): GET /control/status,
+    /control/querylog and /control/clients."""
+
+    kind, title = "adguard", "AdGuard Home"
+    PATH_HINT = "http://192.168.1.2:3000 or https://adguard.home"
+
+    def _auth(self):
+        user = self.spec.get("username", "")
+        pw = self.vault.get(self.id) or ""
+        if not user and not pw:
+            return {}
+        tok = base64.b64encode(f"{user}:{pw}".encode()).decode()
+        register_secret(tok)
+        return {"Authorization": "Basic " + tok}
+
+    def _api(self, path):
+        st, _h, data = self._get("/control" + path, self._auth())
+        if st in (401, 403):
+            raise ConnectorError("auth", "AdGuard Home refused the user name "
+                                         "or password.")
+        if st == 404:
+            raise ConnectorError("api", "No AdGuard Home API at this "
+                                        "address.")
+        if st >= 400:
+            raise ConnectorError("api", f"AdGuard Home answered HTTP {st}.")
+        return self._json(data)
+
+    def test(self):
+        st = self._api("/status") or {}
+        return f"Connected to AdGuard Home {st.get('version', '')}".strip()
+
+    @staticmethod
+    def _ts(text):
+        # "2024-05-01T12:00:00.123456789Z" or with an offset
+        m = re.match(r"(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(\.\d+)?"
+                     r"(Z|[+-]\d\d:\d\d)?", str(text or ""))
+        if not m:
+            return 0.0
+        import calendar
+        secs = calendar.timegm(tuple(int(m.group(i)) for i in range(1, 7)))
+        frac = float("0" + m.group(7)[:7]) if m.group(7) else 0.0
+        tz = m.group(8) or "Z"
+        if tz != "Z":
+            sign = 1 if tz[0] == "+" else -1
+            secs -= sign * (int(tz[1:3]) * 3600 + int(tz[4:6]) * 60)
+        return secs + frac
+
+    def fetch(self, since, limit=5000):
+        out = {"lookups": [], "devices": []}
+        older = ""
+        while len(out["lookups"]) < limit:
+            q = self._api("/querylog?limit=500" + (
+                "&older_than=" + urllib.parse.quote(older) if older else ""))
+            rows = (q or {}).get("data") or []
+            if not rows:
+                break
+            stop = False
+            for r in rows:
+                ts = self._ts(r.get("time"))
+                if ts and ts < since:
+                    stop = True
+                    break
+                qn = (r.get("question") or {})
+                ci = r.get("client_info") or {}
+                reason = str(r.get("reason") or "")
+                ms = None
+                with contextlib.suppress(TypeError, ValueError):
+                    ms = float(r.get("elapsedMs"))
+                out["lookups"].append({
+                    "ts": ts, "client": str(r.get("client") or ""),
+                    "client_name": str(ci.get("name") or ""),
+                    "domain": str(qn.get("name") or "").lower().strip("."),
+                    "type": str(qn.get("type") or ""),
+                    "blocked": reason.startswith("Filtered") and
+                    "NotFiltered" not in reason,
+                    "status": reason, "ms": ms})
+            older = (q or {}).get("oldest") or ""
+            if stop or not older or len(rows) < 500:
+                break
+        with contextlib.suppress(ConnectorError):
+            cl = self._api("/clients") or {}
+            for c in cl.get("clients") or []:
+                ids = [str(x) for x in c.get("ids") or []]
+                out["devices"].append({
+                    "mac": next((x.lower() for x in ids
+                                 if re.match(r"^[0-9a-fA-F:]{17}$", x)), ""),
+                    "ips": [x for x in ids if ip_obj(x) is not None],
+                    "names": [c.get("name")] if c.get("name") else [],
+                    "vendor": "", "last": 0.0})
+        return out
+
+
+CONNECTOR_KINDS = {"pihole": PiHoleConnector, "adguard": AdGuardConnector}
+
+
+class ConnectorManager:
+    """Polls each enabled helper in the background (about once a minute)
+    and hands the results to the app on the Tk thread."""
+
+    def __init__(self, specs, vault, deliver, interval=60.0):
+        self.vault = vault
+        self.deliver = deliver
+        self.interval = interval
+        self.status = {}
+        self.conns = {}
+        self.cursor = {}
+        self._stop = threading.Event()
+        self._wake = threading.Event()
+        self._thread = None
+        self.update(specs)
+
+    def update(self, specs):
+        live = {}
+        for sp in specs or []:
+            cls = CONNECTOR_KINDS.get(sp.get("kind"))
+            if cls is None or not sp.get("id"):
+                continue
+            old = self.conns.get(sp["id"])
+            if old is not None and old.spec == sp:
+                live[sp["id"]] = old
+                continue
+            if old is not None:
+                old.close()
+            live[sp["id"]] = cls(sp, self.vault)
+            self.status.setdefault(sp["id"], {"state": "waiting",
+                                              "message": "Not asked yet.",
+                                              "last_ok": 0.0, "lookups": 0,
+                                              "devices": 0})
+        for cid, c in self.conns.items():
+            if cid not in live:
+                c.close()
+                self.status.pop(cid, None)
+        self.conns = live
+        self._wake.set()
+
+    def start(self):
+        if self._thread is None or not self._thread.is_alive():
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="connectors")
+            self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._wake.set()
+        for c in list(self.conns.values()):
+            c.close()
+
+    def poll_now(self):
+        self._wake.set()
+
+    def poll_once(self, cid):
+        c = self.conns.get(cid)
+        if c is None or not c.spec.get("enabled", True):
+            return None
+        st = self.status.setdefault(cid, {})
+        since = self.cursor.get(cid) or (time.time() - 3600)
+        try:
+            res = c.fetch(since)
+            newest = max((x["ts"] for x in res["lookups"]), default=0.0)
+            if newest:
+                self.cursor[cid] = newest + 0.000001
+            total = st.get("lookups", 0) + len(res["lookups"])
+            st.update({"state": "ok", "last_ok": time.time(),
+                       "message": f"{total} lookups read so far "
+                                  f"(+{len(res['lookups'])} just now); "
+                                  f"knows {len(res['devices'])} device "
+                                  f"name(s).",
+                       "lookups": total,
+                       "devices": len(res["devices"])})
+            self.deliver(c, res)
+            return res
+        except ConnectorError as e:
+            st.update({"state": e.kind, "message": str(e)})
+        except Exception as e:                       # noqa: BLE001
+            LOG.exception("connector %s", c.name)
+            st.update({"state": "api", "message": f"Unexpected answer: "
+                                                  f"{type(e).__name__}"})
+        return None
+
+    def _run(self):
+        while not self._stop.is_set():
+            for cid in list(self.conns):
+                if self._stop.is_set():
+                    break
+                if LEDGER.killed:
+                    self.status.setdefault(cid, {}).update(
+                        {"state": "refused",
+                         "message": "Paused by the kill switch."})
+                    continue
+                self.poll_once(cid)
+            self._wake.wait(self.interval)
+            self._wake.clear()
+
+
 # ---- DNS health / intelligence ---------------------------------------------
 # Lookup-time buckets (upper edges, ms) for the per-resolver histogram.
 DNS_BUCKETS = (10, 25, 50, 100, 250, 500, 1000, float("inf"))
@@ -11789,6 +12382,15 @@ def coverage_rows(model, data_mode="live", active=False):
     rows.append(("Which website names are looked up?", dns_ans, lvl,
                  "Encrypted DNS and VPNs hide names; a lookup alone does "
                  "not prove a visit."))
+    for src, rep in getattr(model, "reported", {}).items():
+        unseen = len(rep["unseen_clients"])
+        rows.append((f"Lookups reported by {src}",
+                     f"lookups for {len(rep['devices'])} devices (Reported)"
+                     + (f" + {unseen} address(es) not seen on the wire"
+                        if unseen else ""), LV_REPORTED,
+                     f"From {src}'s own log. Shown beside what this computer "
+                     f"observed, never added to it; a lookup is not a "
+                     f"visit."))
     if model.vpn.get("iface") or model.vpn.get("endpoint"):
         rows.append(("Internet destinations of this computer",
                      "Hidden inside a VPN tunnel", LV_UNKNOWN,
@@ -11819,6 +12421,8 @@ _NAME_SOURCE = {"user": ("you named it", LV_REPORTED),
                 "nbns": ("it answered a Windows name query", LV_OBSERVED),
                 "ssdp": ("it announced itself via UPnP", LV_OBSERVED),
                 "rdns": ("your DNS server's reverse lookup", LV_REPORTED),
+                "connector": ("your Pi-hole / AdGuard Home knows it by "
+                              "this name", LV_REPORTED),
                 "vendor": ("guessed from the maker and device type",
                            LV_INFERRED),
                 "": ("no name seen", LV_UNKNOWN)}
@@ -11834,7 +12438,7 @@ def device_name_source(dev):
     if dev.mdns_name:
         return "mdns"
     if dev.hostname and dev.hostname_source in ("nbns", "rdns", "mdns",
-                                                "dhcp"):
+                                                "dhcp", "connector"):
         return dev.hostname_source
     if dev.ssdp_name:
         return "ssdp"
@@ -12020,6 +12624,7 @@ class NetworkModel:
         self.obs_seq = 0
         self.obs_recent = deque(maxlen=20000)
         self.switch_ports = {}       # (proto, chassis) → what LLDP/CDP said
+        self.reported = {}           # helper name → what it reported
         self.rtt_samples = deque(maxlen=2000)  # (ts, rtt, remote, dev, fid)
         self.obs_by_subject = {}
         self.obs_sink = False          # a history store wants observations
@@ -12061,6 +12666,58 @@ class NetworkModel:
         out = [o for o in self.obs_by_subject.get(subject, ())
                if kinds is None or o[2] in kinds]
         return out[-limit:]
+
+    def apply_reported(self, source, res):
+        """Fold what a connected helper reported into the model, as
+        Reported evidence beside (never added to) what was observed."""
+        reg = self.registry
+        rep = self.reported.get(source)
+        if rep is None:
+            rep = self.reported[source] = {
+                "lookups": 0, "blocked": 0, "devices": set(),
+                "unseen_clients": set(), "named": 0, "last": 0.0,
+                "domains": Counter(), "first": 0.0}
+        for d in res.get("devices") or []:
+            names = [n for n in d.get("names") or [] if n]
+            if not names:
+                continue
+            for ip in d.get("ips") or []:
+                if reg.set_hostname(ip, sanitize_text(names[0], 63),
+                                    "connector"):
+                    rep["named"] += 1
+                    break
+        for lk in res.get("lookups") or []:
+            dom, ip, ts = lk.get("domain", ""), lk.get("client", ""), \
+                float(lk.get("ts") or 0)
+            if not dom or "." not in dom or not ts:
+                continue
+            dom = sanitize_text(dom, 253).lower()
+            rep["lookups"] += 1
+            rep["last"] = max(rep["last"], ts)
+            rep["first"] = min(rep["first"] or ts, ts)
+            rep["domains"][registrable_domain(dom)] += 1
+            if len(rep["domains"]) > 5000:
+                rep["domains"] = Counter(dict(rep["domains"].most_common(
+                    2500)))
+            key = reg.ip_to_key.get(ip)
+            dev = reg.by_key.get(reg.resolve(key)) if key else None
+            if dev is None:
+                if len(rep["unseen_clients"]) < 500 and ip:
+                    rep["unseen_clients"].add(ip)
+                continue
+            rep["devices"].add(dev.key)
+            blocked = bool(lk.get("blocked"))
+            if blocked:
+                rep["blocked"] += 1
+            else:
+                self.register_website(dom, None, dev, source, ts,
+                                      reported=True)
+                self.tie(dev.key, dom, AS_REPORTED, ts)
+            self.observe("reported", dev.key, ts,
+                         {"domain": dom, "source": source,
+                          "blocked": blocked},
+                         also=() if blocked else ("site:" + dom,))
+        return rep
 
     def tie(self, device, domain, assoc, ts):
         """Tie a device to a website at the strongest level seen so far."""
@@ -13077,7 +13734,7 @@ class NetworkModel:
                 self.dirty_websites.add(flow.domain)
 
     def register_website(self, domain, ip, dev, source, ts=None,
-                         connection=False, encrypted=None):
+                         connection=False, encrypted=None, reported=False):
         ts = ts or self.now()
         key = domain.lower().strip(".")
         if not key or "." not in key:
@@ -13102,6 +13759,8 @@ class NetworkModel:
             if new_root and not self.in_discovery() and \
                     not self.use_packet_clock:
                 self.push_timeline("website", "INFO",
+                                   f"{source} reports a first lookup of "
+                                   f"{reg}" if reported else
                                    f"First visit to {reg}",
                                    ("website", key),
                                    dev.key if dev else "")
@@ -13653,6 +14312,7 @@ def _default_config():
         "shortcuts": dict(DEFAULT_SHORTCUTS),
         "updates": {"check_automatically": False, "repo": "",
                     "allow_self_update": False},
+        "connectors": {"list": [], "interval": 60},
         "privacy": {"geoip_enabled": False, "local_asn_db": False,
                     "auto_download_reference": True, "quic_names": True,
                     "kill_switch": False},
@@ -14960,6 +15620,7 @@ STRINGS = {
         "tab_raw": "\u2699\ufe0f Packets",
         "tab_connections": "\U0001f517 Connections",
         "tab_health": "\U0001fa7a Health",
+        "tab_sources": "\U0001f50c Sources",
         "tab_about": "\u2753 Help",
         "legend_info": "INFO \u2014 normal activity",
         "legend_warning": "WARNING \u2014 worth a look",
@@ -21368,6 +22029,143 @@ class PacketsTab(BaseTab):
             w.config(state="disabled")
 
 
+# ---- Sources (where the information comes from) -----------------------------
+class SourcesTab(BaseTab):
+    name, label_key, advanced = "sources", "tab_sources", True
+
+    def build(self):
+        self.header("\U0001F50C  Sources — where MiniWireshark's information "
+                    "comes from. What this computer sees itself is "
+                    "“Observed”; what a connected helper tells it is "
+                    "“Reported”, shown beside it and never added to it.",
+                    "Optional: connect your Pi-hole or AdGuard Home to see "
+                    "the lookups of devices this computer can't hear. "
+                    "Read-only — nothing is ever changed on them.")
+        bar = self.toolbar()
+        ttk.Button(bar, text="Add Pi-hole…", command=lambda:
+                   self.app.connector_dialog(kind="pihole")).pack(side="left")
+        ttk.Button(bar, text="Add AdGuard Home…", command=lambda:
+                   self.app.connector_dialog(kind="adguard")).pack(
+            side="left", padx=6)
+        self.edit_btn = ttk.Button(bar, text="Edit…", command=self._edit)
+        self.edit_btn.pack(side="left", padx=(18, 0))
+        ttk.Button(bar, text="Ask now", command=self._poll).pack(
+            side="left", padx=6)
+        ttk.Button(bar, text="Pause / resume", command=self._toggle).pack(
+            side="left")
+        ttk.Button(bar, text="Remove", command=self._remove).pack(
+            side="left", padx=6)
+        wrap, self.tree = make_tree(self.frame, [
+            ("source", "Source", 260, "w", True),
+            ("kind", "Gives", 230, "w", False),
+            ("level", "Evidence", 100, "w", False),
+            ("state", "Status", 150, "w", False),
+            ("last", "Last update", 100, "center", False),
+            ("detail", "Details", 380, "w", True)])
+        self.tree.configure(height=8)
+        wrap.pack(fill="x", padx=6, pady=(0, 6))
+        self.tree.bind("<Double-1>", lambda e: self._edit())
+        self.lbl(self.frame, "Reported vs observed", muted=False,
+                 font=("TkDefaultFont", 11, "bold")).pack(anchor="w",
+                                                          padx=10)
+        self.recon = tk.Text(self.frame, height=10, wrap="word",
+                             bg=self.t["text_bg"], fg=self.t["text_fg"],
+                             relief="flat", padx=10, pady=8,
+                             highlightthickness=0,
+                             font=("TkDefaultFont", 10))
+        self.recon.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+
+    def _sel(self):
+        sel = self.tree.selection()
+        if sel and sel[0].startswith("c:"):
+            return sel[0][2:]
+        return None
+
+    def _edit(self):
+        cid = self._sel()
+        if cid:
+            self.app.connector_dialog(cid=cid)
+
+    def _poll(self):
+        if self.app.connectors is not None:
+            self.app.connectors.poll_now()
+            self.app._set_banner("Asking the connected helpers…")
+
+    def _toggle(self):
+        cid = self._sel()
+        if cid:
+            self.app.connector_set(cid, toggle_enabled=True)
+
+    def _remove(self):
+        cid = self._sel()
+        if cid and messagebox.askyesno(
+                "Remove helper", "Remove this connection? Its password is "
+                "deleted too. What it reported this session stays visible "
+                "until you clear.", parent=self.app.root):
+            self.app.connector_remove(cid)
+
+    def refresh(self):
+        if not self.is_visible():
+            return
+        app, m = self.app, self.model
+        sel = self.tree.selection()
+        self.tree.delete(*self.tree.get_children())
+        v = m.vantage.classify(offline=app.data_mode in ("offline",
+                                                         "session"))
+        self.tree.insert("", "end", iid="cap", values=(
+            "This computer's network card", "Packets on the wire",
+            "◉ Observed", {"live": "✔ Watching", "idle": "Stopped"}.get(
+                app.data_mode, app.data_mode), "now" if app.data_mode ==
+            "live" else "—", VANTAGE_TEXT.get(v, ("",))[0]))
+        pm = app.procmap
+        bits = []
+        if pm.available:
+            bits.append("programs" + (" (some need admin)"
+                                      if pm.needs_admin else ""))
+        if app.arp_cache:
+            n = len(app.arp_cache)
+            bits.append(f"ARP cache ({n} entr{'y' if n == 1 else 'ies'})")
+        if app.wifi.last:
+            bits.append("Wi-Fi link")
+        self.tree.insert("", "end", iid="os", values=(
+            "This computer's operating system",
+            "Programs, listening ports, ARP cache, Wi-Fi",
+            "◉ Observed", "✔ Available" if bits else "—",
+            fmt_clock(pm.at) if pm.at else "—", ", ".join(bits) or
+            "Needs live capture" + ("" if pm.available else
+                                    " and the optional psutil component")))
+        st_all = app.connectors.status if app.connectors else {}
+        for sp in app.config.get("connectors.list", []) or []:
+            st = st_all.get(sp["id"], {})
+            state = st.get("state", "waiting")
+            label = {"ok": "✔ Connected", "auth": "✖ Wrong password",
+                     "tls": "✖ Certificate", "network": "✖ Unreachable",
+                     "api": "✖ Unexpected answer",
+                     "refused": "⏸ Kill switch",
+                     "waiting": "… Waiting"}.get(state, state)
+            if not sp.get("enabled", True):
+                label = "⏸ Paused"
+            kind = CONNECTOR_KINDS.get(sp.get("kind"))
+            self.tree.insert("", "end", iid="c:" + sp["id"], values=(
+                f"{sp.get('name') or (kind.title if kind else '?')} — "
+                f"{sp.get('url', '')}",
+                "Lookups and device names of every client",
+                "◈ Reported", label,
+                fmt_clock(st["last_ok"]) if st.get("last_ok") else "—",
+                st.get("message", "")))
+        with contextlib.suppress(tk.TclError):
+            if sel:
+                self.tree.selection_set(sel)
+        self.recon.configure(state="normal")
+        self.recon.delete("1.0", "end")
+        self.recon.insert("end", app.reconciliation_text())
+        self.recon.configure(state="disabled")
+
+    def on_theme(self):
+        with contextlib.suppress(tk.TclError, AttributeError):
+            self.recon.configure(bg=self.t["text_bg"], fg=self.t["text_fg"])
+
+
 # ---- Help --------------------------------------------------------------------
 class HelpTab(BaseTab):
     name, label_key = "help", "tab_about"
@@ -21546,6 +22344,9 @@ class MiniWireshark:
         self.arp_cache = []
         self._arp_at = 0.0
         self._arp_busy = False
+        self.vault = CredentialVault()
+        self.connectors = None
+        self._start_connectors()
         QUIC_NAMES["enabled"] = bool(self.config.get("privacy.quic_names",
                                                      True))
         self.geoip = GeoIPService(self._geoip_on_result)
@@ -21863,7 +22664,8 @@ class MiniWireshark:
         self.tabs = OrderedDict()
         for cls in (DashboardTab, FeedTab, TimelineTab, DevicesTab,
                     WebsitesTab, ConnectionsTab, RemoteTab, AlertsTab,
-                    MapTab, HealthTab, SecurityTab, PacketsTab, HelpTab):
+                    MapTab, HealthTab, SecurityTab, SourcesTab, PacketsTab,
+                    HelpTab):
             tab = cls(self)
             self.tabs[cls.name] = tab
             self.nb.add(tab.frame, text=tr(cls.label_key))
@@ -23134,7 +23936,7 @@ class MiniWireshark:
         except OSError:
             parts.append("(no log)")
         text = "\n".join(parts)
-        return mask_sensitive(text) if masked else text
+        return mask_sensitive(text) if masked else scrub_secrets(text)
 
     def export_debug_bundle(self, parent=None):
         """Logs, diagnostics and runtime state — never packets. Addresses
@@ -24310,6 +25112,262 @@ class MiniWireshark:
                     entries))
             threading.Thread(target=work, daemon=True,
                              name="arp-cache").start()
+
+    # ---- connected helpers (Pi-hole / AdGuard Home) -------------------------
+    def _start_connectors(self):
+        specs = self.config.get("connectors.list", []) or []
+        if self.connectors is None:
+            if not specs:
+                return
+            self.connectors = ConnectorManager(
+                specs, self.vault, self._connector_result,
+                float(self.config.get("connectors.interval", 60)))
+            self.connectors.start()
+        else:
+            self.connectors.update(specs)
+
+    def _connector_result(self, conn, res):
+        """Called on the connector thread: hand over to the Tk thread."""
+        self._async_results.put(lambda: self._apply_connector(conn, res))
+
+    def _apply_connector(self, conn, res):
+        if self.data_mode != "live":
+            return              # helpers describe the live network only
+        rep = self.model.apply_reported(conn.name, res)
+        if rep and rep["lookups"] and not getattr(self, "_conn_told", None):
+            self._conn_told = True
+            self.model.push_timeline(
+                "network", "INFO", f"{conn.name} connected: reporting "
+                f"lookups for {len(rep['devices'])} device(s)")
+        with contextlib.suppress(Exception):
+            if "sources" in self.tabs:
+                self.tabs["sources"].refresh()
+
+    def connector_set(self, cid, toggle_enabled=False, **changes):
+        specs = [dict(x) for x in self.config.get("connectors.list", [])
+                 or []]
+        for sp in specs:
+            if sp["id"] == cid:
+                if toggle_enabled:
+                    sp["enabled"] = not sp.get("enabled", True)
+                sp.update(changes)
+        self.config.set("connectors.list", specs)
+        self.config.save()
+        self._start_connectors()
+        with contextlib.suppress(Exception):
+            self.tabs["sources"].refresh()
+
+    def connector_remove(self, cid):
+        specs = [x for x in self.config.get("connectors.list", []) or []
+                 if x.get("id") != cid]
+        self.config.set("connectors.list", specs)
+        self.config.save()
+        self.vault.delete(cid)
+        self._start_connectors()
+        with contextlib.suppress(Exception):
+            self.tabs["sources"].refresh()
+
+    def connector_save(self, spec, password=None):
+        """Add or update a helper; the password goes to the vault."""
+        specs = [dict(x) for x in self.config.get("connectors.list", [])
+                 or []]
+        if not spec.get("id"):
+            spec["id"] = "c-" + uuid.uuid4().hex[:10]
+        specs = [x for x in specs if x.get("id") != spec["id"]] + [spec]
+        if password:
+            self.vault.set(spec["id"], password)
+        self.config.set("connectors.list", specs)
+        self.config.save()
+        self._start_connectors()
+        return spec["id"]
+
+    def reconciliation_text(self):
+        m = self.model
+        if not m.reported:
+            return ("No helper connected. Observed lookups so far: "
+                    f"{m.dns.queries} (only the ones that crossed this "
+                    f"computer's network card).")
+        lines = []
+        mine_dev = {k for k, s in m.dns.device_servers.items() if s}
+        for src, rep in m.reported.items():
+            unseen = len(rep["unseen_clients"])
+            lines.append(
+                f"{src} reported {rep['lookups']} lookups from "
+                f"{len(rep['devices'])} device(s) you can see"
+                + (f" and {unseen} address(es) never seen on the wire"
+                   if unseen else "") + f"; {rep['blocked']} were blocked.")
+            lines.append(
+                f"    This computer itself observed {m.dns.queries} lookups "
+                f"from {len(mine_dev)} device(s). The two are not added "
+                f"together: they overlap, and the helper also counts "
+                f"devices this computer can't hear.")
+            top = ", ".join(f"{d} ({n})" for d, n in
+                            rep["domains"].most_common(8))
+            if top:
+                lines.append(f"    Most looked up (reported): {top}.")
+            if rep["named"]:
+                lines.append(f"    Names it supplied for {rep['named']} "
+                             f"device(s) are marked as Reported.")
+        return "\n".join(lines)
+
+    def connector_dialog(self, kind=None, cid=None):
+        """Add or edit a Pi-hole / AdGuard Home connection."""
+        t = self.theme
+        spec = {}
+        if cid:
+            spec = next((dict(x) for x in self.config.get(
+                "connectors.list", []) or [] if x["id"] == cid), {})
+            kind = spec.get("kind", kind)
+        cls = CONNECTOR_KINDS.get(kind or "pihole")
+        win = tk.Toplevel(self.root)
+        win.title(("Edit " if cid else "Add ") + cls.title)
+        win.geometry("600x470")
+        win.configure(bg=t["tab_bg"])
+        win.transient(self.root)
+        body = tk.Frame(win, bg=t["tab_bg"], padx=16, pady=12)
+        body.pack(fill="both", expand=True)
+        tk.Label(body, text=f"Connect your {cls.title} (read-only)",
+                 bg=t["tab_bg"], fg=t["text_fg"],
+                 font=("TkDefaultFont", 13, "bold")).grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(body, text="MiniWireshark only reads its query log and "
+                            "device names, about once a minute. Nothing is "
+                            "changed on it. The password is kept in "
+                            f"{self.vault.describe()}.",
+                 bg=t["tab_bg"], fg=t["muted_fg"], wraplength=560,
+                 justify="left").grid(row=1, column=0, columnspan=2,
+                                      sticky="w", pady=(2, 10))
+        name_v = tk.StringVar(value=spec.get("name", cls.title))
+        url_v = tk.StringVar(value=spec.get("url", ""))
+        user_v = tk.StringVar(value=spec.get("username", ""))
+        pw_v = tk.StringVar()
+        ver_v = tk.BooleanVar(value=spec.get("verify", True))
+        rows = [("Name:", name_v), ("Address:", url_v)]
+        if kind == "adguard":
+            rows.append(("User name:", user_v))
+        rows.append(("Password" + (" or app password" if kind == "pihole"
+                                   else "") + ":", pw_v))
+        for i, (lab, var) in enumerate(rows, 2):
+            tk.Label(body, text=lab, bg=t["tab_bg"], fg=t["text_fg"]).grid(
+                row=i, column=0, sticky="w", pady=3)
+            e = ttk.Entry(body, textvariable=var, width=46,
+                          show="•" if var is pw_v else "")
+            e.grid(row=i, column=1, sticky="we", pady=3)
+        r = len(rows) + 2
+        tk.Label(body, text=f"e.g. {cls.PATH_HINT}" + (
+            "  (leave the password empty to keep the saved one)" if cid
+            else ""), bg=t["tab_bg"], fg=t["muted_fg"]).grid(
+            row=r, column=1, sticky="w")
+        ttk.Checkbutton(body, text="Check the certificate (https)",
+                        variable=ver_v).grid(row=r + 1, column=1,
+                                             sticky="w", pady=(6, 0))
+        msg = tk.Label(body, text="", bg=t["tab_bg"], fg=t["text_fg"],
+                       wraplength=560, justify="left")
+        msg.grid(row=r + 2, column=0, columnspan=2, sticky="w", pady=8)
+        pin = {"value": spec.get("pin", "")}
+        trust_btn = ttk.Button(body, text="Trust this certificate")
+
+        def current_spec():
+            url = url_v.get().strip().rstrip("/")
+            if url and "://" not in url:
+                url = "http://" + url
+            return {"id": spec.get("id", ""), "kind": kind,
+                    "name": name_v.get().strip() or cls.title, "url": url,
+                    "username": user_v.get().strip(),
+                    "verify": ver_v.get(), "pin": pin["value"],
+                    "enabled": spec.get("enabled", True)}
+
+        class _Typed:
+            def __init__(self, vault, typed):
+                self.vault, self.typed = vault, typed
+
+            def get(self, cid_):
+                return self.typed or self.vault.get(cid_)
+
+        def warn_http(sp):
+            if sp["url"].startswith("http://") and (pw_v.get() or cid):
+                return ("\n⚠ This address is plain http: the password "
+                        "crosses your network unencrypted. Prefer https:// "
+                        "if your helper offers it.")
+            return ""
+
+        def test():
+            sp = current_spec()
+            if not sp["url"]:
+                msg.configure(text="Type the address first.")
+                return
+            msg.configure(text="Testing…", fg=t["text_fg"])
+            trust_btn.grid_forget()
+            typed = pw_v.get()
+
+            def work():
+                c = cls(dict(sp, id=sp["id"] or "test"),
+                        _Typed(self.vault, typed))
+                try:
+                    text, ok, kind_ = c.test(), True, ""
+                except ConnectorError as e:
+                    text, ok, kind_ = str(e), False, e.kind
+                finally:
+                    c.close()
+                self._async_results.put(lambda: show(text, ok, kind_, sp))
+            threading.Thread(target=work, daemon=True).start()
+
+        def show(text, ok, kind_, sp):
+            with contextlib.suppress(tk.TclError):
+                msg.configure(text=("✔ " if ok else "✖ ") + text +
+                              warn_http(sp),
+                              fg=t["good_fg"] if ok else t["danger_fg"])
+                if kind_ == "tls":
+                    trust_btn.grid(row=r + 3, column=1, sticky="w")
+
+        def trust():
+            sp = current_spec()
+
+            def work():
+                try:
+                    fp = connector_cert_fingerprint(sp["url"])
+                except (OSError, ValueError) as e:
+                    self._async_results.put(lambda: msg.configure(
+                        text=f"✖ Couldn't read the certificate: {e}"))
+                    return
+
+                def ask():
+                    if messagebox.askyesno(
+                            "Trust this certificate?",
+                            f"The helper at {sp['url']} presents a "
+                            f"certificate with fingerprint\n\n{fp}\n\n"
+                            f"Only trust it if this is your own device. "
+                            f"MiniWireshark will refuse to connect if it "
+                            f"ever changes.", parent=win):
+                        pin["value"] = fp
+                        test()
+                self._async_results.put(ask)
+            threading.Thread(target=work, daemon=True).start()
+        trust_btn.configure(command=trust)
+
+        def save():
+            sp = current_spec()
+            if not sp["url"]:
+                msg.configure(text="Type the address first.")
+                return
+            self.connector_save(sp, pw_v.get() or None)
+            win.destroy()
+            with contextlib.suppress(Exception):
+                self._select_tab("sources").refresh()
+        btns = tk.Frame(win, bg=t["tab_bg"], padx=16, pady=10)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="right")
+        ttk.Button(btns, text="Save", style="Accent.TButton",
+                   command=save).pack(side="right", padx=6)
+        ttk.Button(btns, text="Test", command=test).pack(side="left")
+        body.columnconfigure(1, weight=1)
+        self._connector_win = win
+        win._mw_test, win._mw_save = test, save
+        win._mw_vars = {"name": name_v, "url": url_v, "user": user_v,
+                        "pw": pw_v, "verify": ver_v, "msg": msg}
+        return win
+
 
     def upnp_mapping_text(self, x):
         client = x.get("InternalClient", "")
@@ -26220,6 +27278,8 @@ class MiniWireshark:
         QUIC_NAMES["enabled"] = bool(cfg.get("privacy.quic_names", True))
         was = LEDGER.killed
         LEDGER.killed = bool(cfg.get("privacy.kill_switch", False))
+        with contextlib.suppress(Exception):
+            self._start_connectors()
         if LEDGER.killed and not was:
             with contextlib.suppress(Exception):
                 self._stop_lan_scanner()
@@ -26803,6 +27863,8 @@ class MiniWireshark:
         self.data.stop()
         if self.packet_ring is not None:
             self.packet_ring.stop()
+        if self.connectors is not None:
+            self.connectors.stop()
         if self.history is not None:
             self.history.stop(wait=5.0)
         with contextlib.suppress(tk.TclError):
@@ -30676,6 +31738,222 @@ def t_upnp_audit_fake_router(ctx):
     assert bad is None
 
 
+def _fake_helper(kind, password="s3cret-Pw!", user="admin"):
+    """A recorded-fixture Pi-hole v6 / AdGuard Home on 127.0.0.1."""
+    import http.server
+    S = ScenarioBuilder
+    t0 = time.time() - 120
+    calls = []
+    lookups = [(t0 + 1, S.PHONE[0], "Alex-iPhone.lan", "news.example.org",
+                "FORWARDED"),
+               (t0 + 2, S.PHONE[0], "Alex-iPhone.lan", "ads.example.net",
+                "GRAVITY"),
+               (t0 + 3, S.TV[0], "tv.lan", "video.example.net", "CACHE"),
+               (t0 + 4, "192.168.1.199", "", "hidden.example.com",
+                "FORWARDED")]
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, code, obj=None):
+            body = json.dumps(obj).encode() if obj is not None else b""
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _authed(self):
+            if kind == "pihole":
+                return self.headers.get("X-FTL-SID") == "SID-123"
+            want = "Basic " + base64.b64encode(
+                f"{user}:{password}".encode()).decode()
+            return self.headers.get("Authorization") == want
+
+        def do_POST(self):
+            calls.append(("POST", self.path))
+            n = int(self.headers.get("Content-Length") or 0)
+            data = json.loads(self.rfile.read(n) or b"{}")
+            if self.path == "/api/auth" and kind == "pihole":
+                if data.get("password") == password:
+                    return self._send(200, {"session": {
+                        "valid": True, "totp": False, "sid": "SID-123",
+                        "csrf": "x", "validity": 1800}, "took": 0.01})
+                return self._send(401, {"error": {"key": "unauthorized"}})
+            self._send(404, {})
+
+        def do_DELETE(self):
+            calls.append(("DELETE", self.path))
+            self._send(204)
+
+        def do_GET(self):
+            calls.append(("GET", self.path))
+            if not self._authed():
+                return self._send(401, {"error": {"key": "unauthorized"}})
+            p = self.path
+            if kind == "pihole" and p.startswith("/api/info/version"):
+                return self._send(200, {"version": {"core": {"local": {
+                    "version": "v6.1"}}}})
+            if kind == "pihole" and p.startswith("/api/queries"):
+                q = urllib.parse.parse_qs(urllib.parse.urlsplit(p).query)
+                frm = float(q.get("from", ["0"])[0])
+                rows = [{"id": i, "time": ts, "type": "A", "domain": dom,
+                         "status": st, "client": {"ip": ip, "name": nm},
+                         "reply": {"type": "IP", "time": 0.012},
+                         "dnssec": "UNKNOWN", "upstream": "1.1.1.1#53"}
+                        for i, (ts, ip, nm, dom, st) in enumerate(lookups)
+                        if ts >= frm]
+                return self._send(200, {"queries": rows[::-1],
+                                        "cursor": None,
+                                        "recordsTotal": len(rows)})
+            if kind == "pihole" and p.startswith("/api/network/devices"):
+                return self._send(200, {"devices": [{
+                    "id": 1, "hwaddr": S.TV[1], "interface": "eth0",
+                    "firstSeen": 1, "lastQuery": int(t0), "numQueries": 9,
+                    "macVendor": "Google", "ips": [{"ip": S.TV[0],
+                                                    "name": "livingroom-tv",
+                                                    "lastSeen": 1,
+                                                    "nameUpdated": 1}]}]})
+            if kind == "adguard" and p.startswith("/control/status"):
+                return self._send(200, {"version": "v0.107.52",
+                                        "running": True})
+            if kind == "adguard" and p.startswith("/control/querylog"):
+                rows = [{"client": ip, "client_info": {"name": nm,
+                                                       "whois": {},
+                                                       "disallowed": False,
+                                                       "disallowed_rule": ""},
+                         "elapsedMs": "12.5",
+                         "question": {"class": "IN", "name": dom,
+                                      "type": "A"},
+                         "reason": "FilteredBlackList" if st == "GRAVITY"
+                         else "NotFilteredNotFound", "status": "NOERROR",
+                         "time": time.strftime("%Y-%m-%dT%H:%M:%S",
+                                               time.gmtime(ts)) + ".5Z"}
+                        for ts, ip, nm, dom, st in lookups][::-1]
+                return self._send(200, {"data": rows, "oldest": ""})
+            if kind == "adguard" and p.startswith("/control/clients"):
+                return self._send(200, {"clients": [{
+                    "name": "livingroom-tv", "ids": [S.TV[0]]}]})
+            self._send(404, {})
+    httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd, f"http://127.0.0.1:{httpd.server_address[1]}", calls, t0
+
+
+@self_test()
+def t_connectors_fixtures(ctx):
+    """Pi-hole v6 and AdGuard Home against recorded API answers: login,
+    read-only requests, Reported evidence beside observed, secrets never
+    shown."""
+    if not ctx.scapy_ok:
+        return "skip"
+    vault = CredentialVault(ctx.path(f"vault_{uuid.uuid4().hex[:6]}.json"))
+    vault.backend = "file"
+    pw = "s3cret-Pw!"
+    for kind in ("pihole", "adguard"):
+        httpd, url, calls, t0 = _fake_helper(kind, pw)
+        try:
+            cid = f"c-{kind}"
+            spec = {"id": cid, "kind": kind, "name": CONNECTOR_KINDS[
+                kind].title, "url": url, "username": "admin"}
+            vault.set(cid, "wrong-password")
+            c = CONNECTOR_KINDS[kind](spec, vault)
+            try:
+                c.test()
+                raise AssertionError("a wrong password was accepted")
+            except ConnectorError as e:
+                assert e.kind == "auth", e
+            vault.set(cid, pw)
+            c = CONNECTOR_KINDS[kind](spec, vault)
+            assert "Connected" in c.test()
+            res = c.fetch(t0 - 10)
+            c.close()
+            assert len(res["lookups"]) == 4, res["lookups"]
+            blocked = [x for x in res["lookups"] if x["blocked"]]
+            assert [x["domain"] for x in blocked] == ["ads.example.net"]
+            # read-only: nothing but logins, GETs and the logout
+            assert all(m_ == "GET" or (m_, p_) in (("POST", "/api/auth"),
+                                                    ("DELETE", "/api/auth"))
+                       for m_, p_ in calls), calls
+            m = scenario_model(ctx.cfg(), ctx.frames())
+            obs_lookups = m.dns.queries
+            rep = m.apply_reported(c.name, res)
+            S = ScenarioBuilder
+            ph = m.device_for(S.PHONE[0], S.PHONE[1])
+            w = m.websites.get("news.example.org")
+            assert w and w.ties[ph.key][0] == AS_REPORTED, w and w.ties
+            assert c.name in w.sources
+            assert "ads.example.net" not in m.websites    # blocked ≠ visit
+            assert rep["blocked"] == 1 and "192.168.1.199" in \
+                rep["unseen_clients"]
+            # an observed connection stays stronger than a report
+            vid = m.websites.get("video.example.net")
+            tv = m.device_for(S.TV[0], S.TV[1])
+            assert ASSOC_RANK[vid.ties[tv.key][0]] >= \
+                ASSOC_RANK[AS_REPORTED]
+            assert m.dns.queries == obs_lookups    # never summed
+            rows = coverage_rows(m)
+            row = next(r for r in rows if r[0].startswith("Lookups reported"))
+            assert "devices (Reported)" in row[1] and row[2] == LV_REPORTED
+            if kind == "pihole":
+                assert tv.hostname == "livingroom-tv" and \
+                    tv.hostname_source == "connector"
+                dv = m.registry.touch("192.168.1.150", "02:aa:bb:cc:dd:ee",
+                                      "arp_reply", "test")
+                m.apply_reported(c.name, {"devices": [{
+                    "ips": ["192.168.1.150"], "names": ["quiet-box"]}]})
+                claims = dict((cl[0], cl) for cl in device_claims(m, dv))
+                assert dv.display_name() == "quiet-box"
+                assert claims["Name"][2] == LV_REPORTED, claims["Name"]
+        finally:
+            httpd.shutdown()
+    # secrets never appear in logs, copied details or bundles
+    assert pw in _SECRETS
+    assert pw not in mask_sensitive(f"password={pw} 192.168.1.5")
+    assert pw not in scrub_secrets(f"oops {pw}")
+    rec = logging.LogRecord("x", logging.INFO, "f", 1, "pw %s", (pw,), None)
+    _SecretFilter().filter(rec)
+    assert pw not in rec.getMessage()
+    raw = open(vault.path, encoding="utf-8").read()
+    assert pw not in raw                      # not stored as plain text
+    if not IS_WINDOWS:
+        assert os.stat(vault.path).st_mode & 0o077 == 0
+    vault.delete("c-pihole")
+    assert vault.get("c-pihole") is None
+
+
+@self_test()
+def t_connector_manager_and_kill_switch(ctx):
+    httpd, url, _calls, t0 = _fake_helper("pihole")
+    try:
+        vault = CredentialVault(ctx.path(f"v_{uuid.uuid4().hex[:6]}.json"))
+        vault.backend = "file"
+        vault.set("c1", "s3cret-Pw!")
+        got = []
+        mgr = ConnectorManager([{"id": "c1", "kind": "pihole", "url": url,
+                                 "name": "Pi-hole"}], vault,
+                               lambda c, r: got.append(r))
+        res = mgr.poll_once("c1")
+        assert res and got and mgr.status["c1"]["state"] == "ok"
+        assert mgr.cursor["c1"] > t0
+        again = mgr.poll_once("c1")              # only what's new
+        assert again is not None and again["lookups"] == []
+        was = LEDGER.killed
+        LEDGER.killed = True
+        try:
+            mgr.cursor.pop("c1")
+            assert mgr.poll_once("c1") is None
+            assert mgr.status["c1"]["state"] == "refused"
+        finally:
+            LEDGER.killed = was
+        n = sum(1 for e in LEDGER.snapshot("connector"))
+        assert n >= 3
+        mgr.stop()
+    finally:
+        httpd.shutdown()
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -31140,6 +32418,64 @@ def _gs_this_pc(app, ctx):
 
 
 S_LAPTOP_IP = "192.168.1.50"
+
+
+@gui_test_step("sources: add a Pi-hole, Reported lookups, secrets stay hidden")
+def _gs_sources(app, ctx):
+    root = app.root
+    httpd, url, _calls, _t0 = _fake_helper("pihole")
+    try:
+        ident = scenario_identity()
+        m = app._new_model(identity=ident[:3])
+        m.set_identity(local_nets=ident[3])
+        app.replace_model(m)
+        app.data_mode = "live"
+        sink = app.lossless_sink()
+        for raw, _ts, lt in ctx.frames():
+            sink(raw, time.time(), lt)
+        assert _gui_pump(root, 0.3, lambda: not len(app.ring) and
+                         not app.worker.busy, timeout=30)
+        app.vault.path = ctx.path(f"vault_gui_{uuid.uuid4().hex[:6]}.json")
+        app.vault.backend = "file"
+        app.mode_ui_var.set("Advanced")
+        app._on_ui_mode_change()
+        tab = app._select_tab("sources")
+        win = app.connector_dialog(kind="pihole")
+        v = win._mw_vars
+        v["url"].set(url)
+        v["pw"].set("s3cret-Pw!")
+        win._mw_test()
+        assert _gui_pump(root, 0.1, lambda: "Connected" in
+                         v["msg"].cget("text"), timeout=15), \
+            v["msg"].cget("text")
+        assert "plain http" in v["msg"].cget("text")      # honest warning
+        win._mw_save()
+        specs = app.config.get("connectors.list")
+        assert len(specs) == 1 and "s3cret" not in json.dumps(
+            app.config.data)
+        app.connectors.poll_now()
+        assert _gui_pump(root, 0.2, lambda: m.reported, timeout=20), \
+            app.connectors.status
+        tab.refresh()
+        _gui_pump(root, 0.1)
+        row = tab.tree.item("c:" + specs[0]["id"], "values")
+        assert "Connected" in row[3], row
+        assert "reported" in tab.recon.get("1.0", "end")
+        rows = coverage_rows(app.model, "live", app.active_mode())
+        assert any("Reported" in r[1] for r in rows)
+        text = app.debug_bundle_text(masked=False)
+        assert "s3cret-Pw!" not in text and "SID-123" not in text
+        app.connector_remove(specs[0]["id"])
+        assert not app.config.get("connectors.list")
+        assert app.vault.get(specs[0]["id"]) is None
+    finally:
+        httpd.shutdown()
+        for w in root.winfo_children():
+            if isinstance(w, tk.Toplevel):
+                w.destroy()
+        app.mode_ui_var.set("Beginner")
+        app._on_ui_mode_change()
+        app.data_mode = "idle"
 
 
 @gui_test_step("network consent: new network is quiet until trusted")
