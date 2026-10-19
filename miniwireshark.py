@@ -3633,8 +3633,11 @@ for _pname, _tbl in PALETTES.items():
             _CANON[_val] = _canon
 
 
-def palette_name(theme, high_contrast):
-    return f"{theme}{' HC' if high_contrast else ''}"
+def palette_name(theme, high_contrast, cvd=None):
+    """Light/Dark, + " HC", + " deutan|protan|tritan" (colour-blind)."""
+    cvd = CVD_STATE["mode"] if cvd is None else cvd
+    return f"{theme}{' HC' if high_contrast else ''}" + \
+        (f" {cvd}" if cvd else "")
 
 
 def _theme_variant(base, palette):
@@ -3669,6 +3672,150 @@ THEMES["Light HC"]["line_hi"] = "#0a246a"
 THEMES["Dark HC"]["line_hi"] = "#ffd400"
 THEMES["Dark HC"]["grid"] = "#4a5260"
 THEMES["Light HC"]["grid"] = "#9aa3b2"
+
+# ---- Colour-blind modes (Settings → Accessibility) --------------------------
+# The three most common kinds of colour blindness. Each mode recolours the
+# meaning-carrying colours (good / warning / danger, charts, confidence,
+# the map) so they stay distinct for that kind of vision; surfaces and
+# greys are unchanged. Every status also keeps its icon and word, so colour
+# is never the only signal. The chosen triples were picked by simulating
+# each kind of vision (Machado et al. 2009) — a self-test re-checks them.
+CVD_LABELS = {"Off": "",
+              "Red-green — deuteranopia (most common)": "deutan",
+              "Red-green — protanopia": "protan",
+              "Blue-yellow — tritanopia": "tritan"}
+CVD_STATE = {"mode": ""}
+CVD_TRIPLES = {
+    # (mode, dark): good, warn, danger
+    ("deutan", False): ("#1e74ae", "#a36a00", "#760a31"),
+    ("deutan", True): ("#1aacff", "#ffb81a", "#f15a91"),
+    ("protan", False): ("#1e74ae", "#a36a00", "#80001c"),
+    ("protan", True): ("#4dbfff", "#eee12a", "#f56c56"),
+    ("tritan", False): ("#1e8385", "#805800", "#cc002c"),
+    ("tritan", True): ("#4dffce", "#c8b45a", "#ff4d73"),
+}
+# canonical (light) colours that carry a meaning → which role they play
+CVD_ROLES = {"#0b6b3a": "good", "#8a5a00": "warn", "#8a1a08": "danger",
+             "#a01a08": "danger", "#a05608": "warn", "#e07b00": "warn"}
+# Machado, Oliveira & Fernandes (2009), severity 1.0, linear RGB
+CVD_MATRICES = {
+    "protan": ((0.152286, 1.052583, -0.204868),
+               (0.114503, 0.786281, 0.099216),
+               (-0.003882, -0.048116, 1.051998)),
+    "deutan": ((0.367322, 0.860646, -0.227968),
+               (0.280085, 0.672501, 0.047413),
+               (-0.011820, 0.042940, 0.968881)),
+    "tritan": ((1.255528, -0.076749, -0.178779),
+               (-0.078411, 0.930809, 0.147602),
+               (0.004733, 0.691367, 0.303900)),
+}
+
+
+def _srgb_lin(c):
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+def cvd_lab(hexcol, mode=""):
+    """CIE Lab of a colour as seen with `mode` colour vision ("" = normal)."""
+    r, g, b = (_srgb_lin(c / 255.0) for c in _hex_rgb(hexcol))
+    if mode:
+        m = CVD_MATRICES[mode]
+        r, g, b = (max(0.0, min(1.0, m[i][0] * r + m[i][1] * g +
+                                m[i][2] * b)) for i in range(3))
+    x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047
+    y = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
+
+    def f(t):
+        return t ** (1 / 3) if t > 0.008856 else 7.787 * t + 16 / 116
+    return 116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z))
+
+
+def cvd_delta(a, b, mode=""):
+    return math.dist(cvd_lab(a, mode), cvd_lab(b, mode))
+
+
+def wcag_contrast(a, b):
+    def lum(h):
+        r, g, bb = (_srgb_lin(c / 255.0) for c in _hex_rgb(h))
+        return 0.2126 * r + 0.7152 * g + 0.0722 * bb
+    la, lb = sorted((lum(a), lum(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def _cvd_shift(hexcol, mode, dark):
+    """Move a saturated colour's hue to the mode's safe colour for its
+    role (green → good, red → danger, amber → warn), keeping lightness."""
+    import colorsys
+    r, g, b = (c / 255.0 for c in _hex_rgb(hexcol))
+    h, l_, s = colorsys.rgb_to_hls(r, g, b)
+    if s < 0.25 or l_ < 0.06 or l_ > 0.97:
+        return hexcol
+    deg = h * 360
+    role = "good" if 75 <= deg < 170 else "danger" if (
+        deg >= 340 or deg < 15) else "warn" if 15 <= deg < 60 else ""
+    if not role:
+        return hexcol
+    tgt = CVD_TRIPLES[(mode, dark)][("good", "warn", "danger").index(role)]
+    th, _tl, ts = colorsys.rgb_to_hls(*(c / 255.0 for c in _hex_rgb(tgt)))
+    r, g, b = colorsys.hls_to_rgb(th, l_, max(ts * 0.9, min(s, ts)))
+    return _rgb_hex(r * 255, g * 255, b * 255)
+
+
+def _build_cvd_palettes():
+    taken = {}                       # palette value → canonical colour
+    for tbl in PALETTES.values():
+        for canon, val in tbl.items():
+            taken.setdefault(val, canon)
+    for canon in LIGHT_TO_DARK_HEX:
+        taken.setdefault(canon, canon)
+
+    def unique(h, canon):
+        r, g, b = _hex_rgb(h)
+        while taken.get(h, canon) != canon:
+            b = (b + 1) % 256
+            h = _rgb_hex(r, g, b)
+        taken[h] = canon
+        return h
+    for base in ("Light", "Dark", "Light HC", "Dark HC"):
+        dark = base.startswith("Dark")
+        for mode in ("deutan", "protan", "tritan"):
+            src = PALETTES[base]
+            tbl = {}
+            primary = ("#0b6b3a", "#8a5a00", "#8a1a08")   # the token colours
+            for canon in sorted(LIGHT_TO_DARK_HEX,
+                                key=lambda c: c not in primary):
+                role = CVD_ROLES.get(canon)
+                if role:
+                    val = CVD_TRIPLES[(mode, dark)][
+                        ("good", "warn", "danger").index(role)]
+                else:
+                    val = _cvd_shift(src.get(canon, canon), mode, dark)
+                tbl[canon] = unique(val, canon)
+            name = f"{base} {mode}"
+            PALETTES[name] = tbl
+            for canon, val in tbl.items():
+                if val != canon:
+                    _CANON[val] = canon
+            out = {}
+            for k, v in THEMES[base].items():
+                c = _CANON.get(v, v)
+                out[k] = tbl.get(c) or _cvd_shift(v, mode, dark)
+            for tok, canon in (("good_fg", "#0b6b3a"), ("warn_fg", "#8a5a00"),
+                               ("danger_fg", "#8a1a08")):
+                out[tok] = tbl[canon]
+            THEMES[name] = out
+
+
+_build_cvd_palettes()
+
+
+def set_colorblind_mode(label_or_code):
+    code = CVD_LABELS.get(label_or_code, label_or_code or "")
+    CVD_STATE["mode"] = code if code in ("deutan", "protan",
+                                         "tritan") else ""
+    return CVD_STATE["mode"]
+
 
 
 @functools.lru_cache(maxsize=65536)
@@ -14740,6 +14887,7 @@ def _default_config():
                     "explanation_verbosity": "Normal", "language": "English",
                     "upgraded_from_3": False, "show_welcome": True,
                     "welcome_version": ""},
+        "accessibility": {"colorblind": "Off"},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal",
                        "inspector": None},
@@ -16590,14 +16738,6 @@ SETTINGS_PAGES = [
              {"key": "appearance.theme", "type": "choice",
               "choices": ["Light", "Dark"], "label": "Theme",
               "help": "Applies to every window, table, chart and dialog."},
-             {"key": "appearance.high_contrast", "type": "bool",
-              "label": "High contrast",
-              "help": "Stronger text and borders for easier reading. Works "
-                      "with both the Light and Dark themes."},
-             {"key": "appearance.text_size", "type": "choice",
-              "choices": ["Small", "Normal", "Large", "Extra large"],
-              "label": "Text size",
-              "help": "Scales text and table rows throughout the app."},
          ]},
          {"title": "Layout", "controls": [
              {"key": "appearance.beginner_mode", "type": "bool",
@@ -16606,6 +16746,34 @@ SETTINGS_PAGES = [
                       "Packets tabs and the advanced filter fields. Nothing "
                       "is removed — switch this off any time to see "
                       "everything."},
+         ]},
+     ]},
+    {"id": "accessibility", "icon": "\u267F", "title": "Accessibility",
+     "blurb": "Colours, contrast and size that work for your eyes. Every "
+              "status also has an icon and a word, so colour is never the "
+              "only signal.",
+     "sections": [
+         {"title": "Colour vision", "controls": [
+             {"key": "accessibility.colorblind", "type": "choice",
+              "choices": list(CVD_LABELS), "label": "Colour-blind mode",
+              "width": 38,
+              "help": "Recolours good / warning / danger, charts, the map "
+                      "and the setup window so they stay easy to tell "
+                      "apart. Red-green (deuteranopia) is the most common "
+                      "kind, then protanopia; blue-yellow (tritanopia) is "
+                      "rare."},
+             {"type": "cvd_preview"},
+         ]},
+         {"title": "Contrast and size", "controls": [
+             {"key": "appearance.high_contrast", "type": "bool",
+              "label": "High contrast",
+              "help": "Stronger text and borders for easier reading. Works "
+                      "with both the Light and Dark themes and with every "
+                      "colour-blind mode."},
+             {"key": "appearance.text_size", "type": "choice",
+              "choices": ["Small", "Normal", "Large", "Extra large"],
+              "label": "Text size",
+              "help": "Scales text and table rows throughout the app."},
          ]},
      ]},
     {"id": "capture", "icon": "\U0001F4E1", "title": "Capture",
@@ -17680,6 +17848,9 @@ class SettingsWindow:
             text = c.get("text") or getattr(self, c["text_fn"])()
             self._help(row, text, reserve=40)
 
+        elif typ == "cvd_preview":
+            self._cvd_preview(row)
+
         elif typ == "geo_status":
             self.geo_var = tk.StringVar(value=self.app._geoip_status_text())
             lbl = tk.Label(row, textvariable=self.geo_var, bg=t["card_bg"],
@@ -17718,6 +17889,48 @@ class SettingsWindow:
         if c.get("requires"):
             self._deps.append((c["requires"], widgets))
 
+    def _cvd_preview(self, row):
+        """Swatches of the meaning-carrying colours for the chosen mode,
+        updated as you change the choice."""
+        t = self.t
+        box = tk.Frame(row, bg=t["card_bg"], padx=12, pady=10,
+                       highlightthickness=1, highlightbackground=t["border"])
+        box.pack(fill="x")
+        cv = tk.Canvas(box, height=64, bg=t["card_bg"], highlightthickness=0)
+        cv.pack(fill="x")
+        var = self.vars.get("accessibility.colorblind")
+
+        def draw(*_a):
+            with contextlib.suppress(tk.TclError):
+                mode = CVD_LABELS.get(var.get() if var else "Off", "")
+                pal = palette_name(self.app.theme_name,
+                                   self.app.high_contrast, mode)
+                th = THEMES[pal]
+                cv.configure(bg=th["card_bg"])
+                cv.delete("all")
+                items = [("✔ Healthy", th["good_fg"]),
+                         ("⚠ Warning", th["warn_fg"]),
+                         ("‼ Danger", th["danger_fg"]),
+                         ("ℹ Info", th["info_fg"])]
+                x = 8
+                for label, col in items:
+                    cv.create_rectangle(x, 8, x + 22, 30, fill=col,
+                                        outline="")
+                    cv.create_text(x + 30, 19, text=label, anchor="w",
+                                   fill=col, font=("TkDefaultFont", 10,
+                                                   "bold"))
+                    x += 150
+                x = 8
+                for k in ("chart_down", "chart_up", "chart_a", "chart_b",
+                          "chart_c", "chart_d", "chart_e"):
+                    cv.create_rectangle(x, 40, x + 60, 56, fill=th[k],
+                                        outline="")
+                    x += 70
+        if var is not None:
+            var.trace_add("write", draw)
+        cv.bind("<Configure>", draw)
+        draw()
+
     def _badge(self, parent, sev):
         t = self.t
         fg, bg = {"INFO": (t["info_fg"], t["card_bg"]),
@@ -17735,7 +17948,7 @@ class SettingsWindow:
             if vals == "@locales":
                 vals = list(LOCALE_NAMES.values())
             w = ttk.Combobox(parent, textvariable=var, values=vals,
-                             state="readonly", width=16)
+                             state="readonly", width=c.get("width", 16))
             w.pack(anchor="e")
             return [w]
         if typ == "int":
@@ -22829,6 +23042,8 @@ class MiniWireshark:
         self.config = config or AppConfig()
         setup_logging(self.config.get("diagnostics.verbose_logging", False))
         self.theme_name = self.config.get("appearance.theme", "Light")
+        set_colorblind_mode(self.config.get("accessibility.colorblind",
+                                            "Off"))
         self.high_contrast = bool(self.config.get("appearance.high_contrast",
                                                   False))
         self.theme = THEMES[palette_name(self.theme_name, self.high_contrast)]
@@ -27966,7 +28181,10 @@ class MiniWireshark:
         self._apply_shortcuts()
         theme = cfg.get("appearance.theme", "Light")
         hc = bool(cfg.get("appearance.high_contrast", False))
-        if theme != self.theme_name or hc != self.high_contrast:
+        cvd_before = CVD_STATE["mode"]
+        set_colorblind_mode(cfg.get("accessibility.colorblind", "Off"))
+        if theme != self.theme_name or hc != self.high_contrast or \
+                cvd_before != CVD_STATE["mode"]:
             self._apply_theme(theme, hc)
         self._apply_text_size(cfg.get("appearance.text_size", "Normal"))
         self._restyle_mode_banner()
@@ -32756,6 +32974,39 @@ def t_investigations_reach_planted_cause(ctx):
     assert h["key"] == "dns" and h["status"] == "Likely", (h, f["dns_median_ms"])
 
 
+@self_test()
+def t_colorblind_modes(ctx):
+    """Each colour-blind mode keeps good / warning / danger far apart for
+    that kind of vision (simulated) and for normal vision, keeps text
+    readable, and palettes stay one-to-one so switching is lossless."""
+    for (mode, dark), trip in CVD_TRIPLES.items():
+        base = "Dark" if dark else "Light"
+        for hc in (False, True):
+            th = THEMES[palette_name(base, hc, mode)]
+            cols = [th["good_fg"], th["warn_fg"], th["danger_fg"]]
+            assert cols == list(trip) or hc, (mode, dark, cols)
+            for vision in (mode, ""):
+                worst = min(cvd_delta(a, b, vision) for i, a in
+                            enumerate(cols) for b in cols[i + 1:])
+                assert worst >= 25, (mode, dark, hc, vision, worst)
+            for c in cols:
+                assert wcag_contrast(c, th["tab_bg"]) >= 4.5, \
+                    (mode, dark, hc, c, th["tab_bg"])
+    # the default palette is the problem being solved: red/green collide
+    light = THEMES["Light"]
+    assert cvd_delta(light["warn_fg"], light["danger_fg"], "deutan") < 15
+    for name, tbl in PALETTES.items():
+        vals = list(tbl.values())
+        assert len(vals) == len(set(vals)), f"{name} is not one-to-one"
+    keys = set(THEMES["Light"])
+    for name, th in THEMES.items():
+        assert set(th) == keys, name
+    assert set_colorblind_mode("Red-green — protanopia") == "protan"
+    assert palette_name("Dark", True) == "Dark HC protan"
+    assert set_colorblind_mode("Off") == "" and palette_name(
+        "Light", False) == "Light"
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -33589,6 +33840,14 @@ def run_gui_test(live=False):
                 app._select_tab(name)
                 _gui_pump(root, 0.02)
         leaks = dark_theme_leaks(root)
+        for mode in ("deutan", "protan", "tritan", ""):
+            set_colorblind_mode(mode)
+            app._apply_theme("Dark", False)
+            _gui_pump(root, 0.05)
+            leaks += dark_theme_leaks(root)
+            assert app.theme["good_fg"] == (CVD_TRIPLES[(mode, True)][0]
+                                            if mode else
+                                            THEMES["Dark"]["good_fg"])
         app._apply_theme("Light", False)
         assert not leaks, f"{len(leaks)} light widgets in Dark: " + \
             "; ".join(leaks[:6])
@@ -33750,6 +34009,7 @@ def main():
         RuntimeManager().apply_pending_switch()
     cfg = AppConfig()
     LEDGER.killed = bool(cfg.get("privacy.kill_switch", False))
+    set_colorblind_mode(cfg.get("accessibility.colorblind", "Off"))
     root = tk.Tk()
     root.title("MiniWireshark")
     root.minsize(640, 520)
