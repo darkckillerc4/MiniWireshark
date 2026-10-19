@@ -20825,6 +20825,26 @@ class MapTab(BaseTab):
         ttk.Checkbutton(ctrl, text="Include offline devices",
                         variable=self.inactive_var,
                         command=self.redraw).pack(side="left", padx=(8, 0))
+        lay = self.toolbar()
+        self.lbl(lay, "Show:").pack(side="left")
+        self.layer_internet = tk.BooleanVar(value=True)
+        self.layer_switch = tk.BooleanVar(value=True)
+        self.ov_traffic = tk.BooleanVar(value=True)
+        self.ov_alerts = tk.BooleanVar(value=True)
+        self.ov_new = tk.BooleanVar(value=True)
+        for text, var in (("Internet hosts", self.layer_internet),
+                          ("Switch (LLDP/CDP)", self.layer_switch),
+                          ("Traffic", self.ov_traffic),
+                          ("Open alerts", self.ov_alerts),
+                          ("New this hour", self.ov_new)):
+            ttk.Checkbutton(lay, text=text, variable=var, command=lambda:
+                            self.redraw(force=True)).pack(side="left",
+                                                          padx=(6, 0))
+        ttk.Button(lay, text="Forget dragged positions",
+                   command=self.forget_positions).pack(side="right")
+        self.list_btn = ttk.Button(lay, text="List view",
+                                   command=self.toggle_list)
+        self.list_btn.pack(side="right", padx=6)
         ttk.Button(ctrl, text="Reset view", command=self.reset_view).pack(
             side="right")
         ttk.Button(ctrl, text="−", width=3,
@@ -20835,8 +20855,23 @@ class MapTab(BaseTab):
         tk.Label(self.frame, textvariable=self.info_var, bg=WHITE,
                  fg="#666666", anchor="w", font=("TkDefaultFont", 9)).pack(
             fill="x", padx=12)
-        self.c = tk.Canvas(self.frame, bg=WHITE, highlightthickness=0)
+        self.c = tk.Canvas(self.frame, bg=WHITE, highlightthickness=0,
+                           takefocus=1)
         self.c.pack(fill="both", expand=True, padx=10, pady=6)
+        self.list_wrap, self.list_tree = make_tree(self.frame, [
+            ("name", "Device", 220, "w", True),
+            ("kind", "Kind", 160, "w", False),
+            ("addr", "Address", 140, "w", False),
+            ("via", "Connected via", 330, "w", True),
+            ("state", "Status", 100, "w", False),
+            ("lvl", "Evidence", 100, "w", False)])
+        self.list_tree.bind("<Double-1>", self._list_open)
+        self.list_tree.bind("<Return>", self._list_open)
+        self.c.bind("<Key>", self._key)
+        self.c.bind("<FocusIn>", lambda e: self.info_var.set(
+            "Keyboard: arrows move · + / − zoom · 0 resets · Tab picks a "
+            "device · Enter opens it"))
+        self._node_drag = None
         self.scale, self.ox, self.oy = 1.0, 0.0, 0.0
         self.nodes = {}            # canvas item id -> (kind, key, label, info)
         self.selected = None
@@ -20863,26 +20898,64 @@ class MapTab(BaseTab):
                 h / 2 + (y - h / 2) * self.scale + self.oy)
 
     def zoom(self, f):
-        self.scale = max(0.4, min(3.0, self.scale * f))
-        self.redraw(force=True)
+        self._fast_zoom(f)
 
     def reset_view(self):
         self.scale, self.ox, self.oy = 1.0, 0.0, 0.0
         self.selected = None
         self.redraw(force=True)
 
+    def forget_positions(self):
+        allpos = dict(self.app.config.get("map.positions", {}) or {})
+        allpos.pop(self.app.network_fp or "default", None)
+        self.app.config.set("map.positions", allpos)
+        self.app.config.save()
+        self.redraw(force=True)
+
+    def _list_open(self, _e=None):
+        sel = self.list_tree.selection()
+        if sel and sel[0].startswith("d:"):
+            self.app.show_device(sel[0][2:])
+
     def _press(self, e):
-        self._drag = (e.x, e.y, self.ox, self.oy, False)
+        with contextlib.suppress(tk.TclError):
+            self.c.focus_set()
+        node = self._node_at(e.x, e.y)
+        if node and node[0] == "device" and self.mode_var.get() == \
+                "Topology":
+            self._node_drag = (node[1], e.x, e.y, e.x, e.y, False)
+            self._drag = None
+            return
+        self._node_drag = None
+        self._drag = (e.x, e.y, self.ox, self.oy, False, e.x, e.y)
 
     def _motion(self, e):
+        nd = self._node_drag
+        if nd:
+            key, x0, y0, lx, ly, _mv = nd
+            if abs(e.x - x0) + abs(e.y - y0) > 3:
+                self.c.move(f"n:{key}", e.x - lx, e.y - ly)
+                self._node_drag = (key, x0, y0, e.x, e.y, True)
+            return
         if self._drag:
-            x0, y0, ox, oy, _m = self._drag
+            x0, y0, ox, oy, _m, lx, ly = self._drag
             if abs(e.x - x0) + abs(e.y - y0) > 3:
                 self.ox, self.oy = ox + e.x - x0, oy + e.y - y0
-                self._drag = (x0, y0, ox, oy, True)
-                self.redraw(force=True)
+                self._drag = (x0, y0, ox, oy, True, e.x, e.y)
+                self._fast_pan(e.x - lx, e.y - ly)
 
     def _release(self, e):
+        nd = self._node_drag
+        self._node_drag = None
+        if nd and nd[5]:
+            key = nd[0]
+            w, h = self.c.winfo_width(), self.c.winfo_height()
+            # screen → layout coordinates (undo pan and zoom)
+            x = (e.x - self.ox - w / 2) / self.scale + w / 2
+            y = (e.y - self.oy - h / 2) / self.scale + h / 2
+            self._save_position(key, x / max(w, 1), y / max(h, 1))
+            self.redraw(force=True)
+            return
         moved = self._drag[4] if self._drag else False
         self._drag = None
         if moved:
@@ -20998,7 +21071,8 @@ class MapTab(BaseTab):
                self.oy, self.selected, len(m.registry.by_key),
                len(m.websites), len(m.remote_hosts), w, h,
                self.inactive_var.get(), self.app.theme_name,
-               self.app.high_contrast, int(m.now() // 10))
+               self.app.high_contrast, CVD_STATE["mode"],
+               int(m.now() // 10))
         if sig == self._last_sig and not force:
             return
         self._last_sig = sig
@@ -21011,6 +21085,8 @@ class MapTab(BaseTab):
         else:
             self._connections(w, h)
         c.tag_lower("edge")
+        if self.list_wrap.winfo_ismapped():
+            self.fill_list()
 
     def _conf_color(self, conf):
         t = self.t
@@ -21018,63 +21094,140 @@ class MapTab(BaseTab):
                 "Low": t["conf_low"]}.get(conf, t["conf_none"])
 
     def _node(self, x, y, r, fill, kind, key, label, info, hollow=False,
-              letter=""):
+              letter="", show_label=True):
         t = self.t
         X, Y = self.P(x, y)
         R = r * max(0.7, min(1.6, self.scale))
         sel = self.selected == (kind, key)
+        tag = (f"n:{key}", "node")
         oid = self.c.create_oval(X - R, Y - R, X + R, Y + R,
                                  fill="" if hollow else fill,
                                  outline=t["focus"] if sel else fill,
-                                 width=3 if sel else 2)
+                                 width=3 if sel else 2, tags=tag)
         self.nodes[oid] = (kind, key, label, info)
         if letter:
             lid = self.c.create_text(X, Y, text=letter,
                                      fill=t["tab_bg"] if not hollow
-                                     else fill,
+                                     else fill, tags=tag,
                                      font=("TkDefaultFont", 8, "bold"))
             self.nodes[lid] = (kind, key, label, info)
-        tid = self.c.create_text(X, Y + R + 8, text=label[:22],
-                                 fill=t["text_fg"],
-                                 font=("TkDefaultFont", 8,
-                                       "bold" if sel else "normal"))
-        self.nodes[tid] = (kind, key, label, info)
+        if show_label:
+            tid = self.c.create_text(X, Y + R + 8, text=label[:22],
+                                     fill=t["text_fg"], tags=tag,
+                                     font=("TkDefaultFont", 8,
+                                           "bold" if sel else "normal"))
+            self.nodes[tid] = (kind, key, label, info)
         return X, Y
 
-    def _line(self, a, b, weight=0, dash=(), hi=False):
+    def _line(self, a, b, weight=0, dash=(), hi=False, tag=None):
         t = self.t
         width = 1 + min(5, int(math.log10(max(weight, 1)) / 1.5)) \
             if weight else 1
         self.c.create_line(a[0], a[1], b[0], b[1],
                            fill=t["line_hi"] if hi else t["line"],
                            width=width + (1 if hi else 0), dash=dash,
-                           tags=("edge",))
+                           tags=("edge",) + ((tag,) if tag else ()))
+
+    # ---- Map v3: layers, saved positions, evidence-styled edges, fast
+    #      pan/zoom, keyboard and a list twin -----------------------------------
+    KIND_ORDER = ("router", "computer", "this-pc", "phone", "tablet", "tv",
+                  "speaker", "console", "printer", "camera", "iot",
+                  "unknown")
+
+    def _ui_scale(self):
+        try:
+            return max(1.0, float(self.c.tk.call("tk", "scaling")) / 1.333)
+        except (tk.TclError, ValueError):
+            return 1.0
+
+    def _positions_store(self):
+        allpos = self.app.config.get("map.positions", {}) or {}
+        return allpos.get(self.app.network_fp or "default", {})
+
+    def _save_position(self, key, fx, fy):
+        allpos = dict(self.app.config.get("map.positions", {}) or {})
+        net = self.app.network_fp or "default"
+        cur = dict(allpos.get(net, {}))
+        cur[key] = [round(fx, 4), round(fy, 4)]
+        if len(cur) > 2000:
+            cur = dict(list(cur.items())[-2000:])
+        allpos[net] = cur
+        self.app.config.set("map.positions", allpos)
+        self.app.config.save()
+
+    def layout_topology(self, devs, w, h):
+        """Deterministic ring layout grouped by kind (sectors), for any
+        number of devices; positions you dragged are kept."""
+        cx, cy = w * 0.36, h / 2
+        base_r = max(80, min(h, w * 0.6) * 0.40)
+        saved = self._positions_store()
+        order = sorted(devs, key=lambda d: (
+            self.KIND_ORDER.index(d.type) if d.type in self.KIND_ORDER
+            else len(self.KIND_ORDER), d.display_name().lower(), d.key))
+        pos, i, ring = {}, 0, 0
+        n = len(order)
+        while i < n:
+            cap = 14 + 10 * ring
+            chunk = order[i:i + cap]
+            rr = base_r * (0.55 + 0.28 * ring) if n > 14 else base_r * 0.72
+            for j, d in enumerate(chunk):
+                ang = 2 * math.pi * j / max(len(chunk), 1) - math.pi / 2 + \
+                    ring * 0.21
+                pos[d.key] = (cx + rr * math.cos(ang), cy + rr * math.sin(
+                    ang))
+            i += cap
+            ring += 1
+        for k, (fx, fy) in saved.items():
+            if k in pos:
+                pos[k] = (fx * w, fy * h)
+        return pos, (cx, cy), base_r * (0.55 + 0.28 * max(ring - 1, 0)) \
+            if n > 14 else base_r
 
     def _topology(self, w, h):
         t, m = self.t, self.model
-        cx, cy = w * 0.36, h / 2
-        devs = sorted(self._devices(), key=lambda d: d.display_name())[:40]
+        ui = self._ui_scale()
+        devs = sorted(self._devices(), key=lambda d: d.display_name())
         gw = m.gateway_ip
-        devs = [d for d in devs if d.ip != gw or not gw]
-        radius = max(80, min(h, w * 0.6) * 0.40)
+        devs = [d for d in devs if d.ip != gw or not gw][:400]
+        pos, (cx, cy), radius = self.layout_topology(devs, w, h)
+        self._pos = pos
         X0, Y0 = self.P(cx, cy)
-        R0 = radius * self.scale
+        R0 = radius * self.scale * 1.08
         self.c.create_oval(X0 - R0, Y0 - R0, X0 + R0, Y0 + R0,
-                           outline=t["muted_fg"], dash=(4, 3))
+                           outline=t["muted_fg"], dash=(4, 3),
+                           tags=("deco",))
         self.c.create_text(X0, Y0 - R0 - 12, text="YOUR LOCAL NETWORK",
-                           fill=t["muted_fg"],
-                           font=("TkDefaultFont", 9, "bold"))
-        n = max(len(devs), 1)
-        rpos = (cx, cy)
+                           fill=t["muted_fg"], tags=("deco",),
+                           font=("TkDefaultFont", int(9 * ui), "bold"))
         sel_key = self.selected[1] if self.selected and \
             self.selected[0] == "device" else None
-        for i, dev in enumerate(devs):
-            ang = (2 * math.pi * i) / n - math.pi / 2
-            x = cx + radius * 0.72 * math.cos(ang)
-            y = cy + radius * 0.72 * math.sin(ang)
-            weight = dev.bytes_up + dev.bytes_down
-            self._line(self.P(*rpos), self.P(x, y), weight,
-                       hi=(dev.key == sel_key))
+        alerted = {a.device_key for a in m.alerts.alerts.values()
+                   if a.severity in ("WARNING", "DANGER") and
+                   not getattr(a, "acknowledged", False)} \
+            if self.ov_alerts.get() else set()
+        now = m.now()
+        sw = m.switch_summary(now)
+        me = m.my_device_key()
+        sw_pos = None
+        if sw and self.layer_switch.get():
+            sw_pos = (cx - radius * 0.35, cy + radius * 0.35)
+        traffic = self.ov_traffic.get()
+        self._list_rows = []
+        for dev in devs:
+            x, y = pos[dev.key]
+            weight = (dev.bytes_up + dev.bytes_down) if traffic else 0
+            hi = dev.key == sel_key
+            if sw_pos and dev.key == me:
+                # an Observed physical link: the switch said so (LLDP/CDP)
+                self._line(self.P(*sw_pos), self.P(x, y), weight, hi=hi,
+                           tag=f"e:{dev.key}")
+                via = (f"switch {sw['system'] or sw['chassis']} port "
+                       f"{sw['port_desc'] or sw['port']} (◉ LLDP/CDP)")
+            else:
+                # logical only: we know it uses the router, not the path
+                self._line(self.P(cx, cy), self.P(x, y), weight,
+                           dash=(5, 4), hi=hi, tag=f"e:{dev.key}")
+                via = "router (◌ logical — the physical path isn't visible)"
             hollow = dev.live and dev.state not in (STATE_ACTIVE, STATE_IDLE)
             letter = dev.confidence[:1] if dev.confidence != \
                 CONFIDENCE_UNCONFIRMED else "?"
@@ -21084,42 +21237,168 @@ class MapTab(BaseTab):
                     f"{STATE_LABEL.get(dev.state, dev.state)} · "
                     f"↑{_human_bytes(dev.bytes_up)} "
                     f"↓{_human_bytes(dev.bytes_down)}")
-            self._node(x, y, 10, self._conf_color(dev.confidence), "device",
-                       dev.key, f"{DEVICE_ICONS.get(dev.type, '')} "
-                                f"{self.app.device_label(dev)}", info,
-                       hollow=hollow, letter=letter)
-        self._node(cx, cy, 18, t["node_router"], "router", "router",
+            label = f"{DEVICE_ICONS.get(dev.type, '')} " \
+                    f"{self.app.device_label(dev)}"
+            X, Y = self._node(x, y, 10 * ui, self._conf_color(dev.confidence),
+                              "device", dev.key, label, info, hollow=hollow,
+                              letter=letter, show_label=len(devs) <= 60 or
+                              hi)
+            R = 10 * ui * max(0.7, min(1.6, self.scale))
+            if dev.key in alerted:
+                self.c.create_oval(X - R - 5, Y - R - 5, X + R + 5, Y + R + 5,
+                                   outline=t["danger_fg"], width=2,
+                                   tags=(f"n:{dev.key}", "ov"))
+            if self.ov_new.get() and now - dev.first_seen < 3600 and \
+                    dev.live:
+                self.c.create_text(X + R + 4, Y - R - 4, text="★",
+                                   fill=t["warn_fg"],
+                                   tags=(f"n:{dev.key}", "ov"),
+                                   font=("TkDefaultFont", int(10 * ui)))
+            self._list_rows.append((dev.key, label.strip(),
+                                    f"{dev.class_confidence} "
+                                    f"{dev.device_class}".strip(),
+                                    dev.ip or dev.mac, via,
+                                    STATE_LABEL.get(dev.state, dev.state),
+                                    LEVEL_WORD.get(device_weakest(m, dev),
+                                                   "")))
+        if sw_pos:
+            self._line(self.P(*sw_pos), self.P(cx, cy), 0, dash=(5, 4),
+                       tag="e:switch")
+            name = sw["system"] or sw["chassis"]
+            self._node(sw_pos[0], sw_pos[1], 12 * ui, t["node_router"],
+                       "switch", name, f"\U0001F500 {name}",
+                       f"Switch (announced itself via {sw['proto']}) · "
+                       f"this computer is on port "
+                       f"{sw['port_desc'] or sw['port']}"
+                       + (f", VLAN {sw['vlan']}" if sw["vlan"] else ""),
+                       letter="S")
+        self._node(cx, cy, 18 * ui, t["node_router"], "router", "router",
                    "Your router", gw or "router address not known yet",
                    letter="R")
-        remotes = sorted(m.remote_hosts.values(),
-                         key=lambda r: -r.bytes_total)[:8]
-        if sel_key:
-            remotes = [r for r in remotes if sel_key in r.devices] or remotes
+        remotes = []
+        if self.layer_internet.get():
+            remotes = sorted(m.remote_hosts.values(),
+                             key=lambda r: -r.bytes_total)[:8]
+            if sel_key:
+                remotes = [r for r in remotes if sel_key in r.devices] or \
+                    remotes
         rx = cx + radius + max(90, (w - cx - radius) * 0.55)
         X, _ = self.P(rx, 0)
         if remotes:
             self.c.create_text(X, self.P(0, cy - len(remotes) * 14 - 24)[1],
                                text="INTERNET (outside your network)",
-                               fill=t["muted_fg"],
-                               font=("TkDefaultFont", 9, "bold"))
+                               fill=t["muted_fg"], tags=("deco",),
+                               font=("TkDefaultFont", int(9 * ui), "bold"))
         for i, r in enumerate(remotes):
-            ry = cy + (i - (len(remotes) - 1) / 2) * 30
+            ry = cy + (i - (len(remotes) - 1) / 2) * 30 * ui
             hi = bool(sel_key and sel_key in r.devices)
             self._line(self.P(cx + radius, cy), self.P(rx, ry),
-                       r.bytes_total, dash=(2, 2), hi=hi)
+                       r.bytes_total if traffic else 0, dash=(2, 2), hi=hi)
             label = r.domain or r.ip
-            self._node(rx, ry, 7, t["node_remote"], "remote", r.ip, label,
-                       f"{r.ip} · {r.location_text() or 'location unknown'}"
-                       f" · {_human_bytes(r.bytes_total)}")
+            self._node(rx, ry, 7 * ui, t["node_remote"], "remote", r.ip,
+                       label, f"{r.ip} · "
+                       f"{r.location_text() or 'location unknown'} · "
+                       f"{_human_bytes(r.bytes_total)}")
         if not devs and not remotes:
             self.c.create_text(20, 20, anchor="nw", fill=t["muted_fg"],
                                text="Nothing to show yet — start watching "
                                     "and browse for a bit.")
         self.c.create_text(10, h - 10, anchor="sw", fill=t["muted_fg"],
-                           font=("TkDefaultFont", 8),
-                           text="Letters show confidence: H=High M=Medium "
-                                "L=Low ?=Unconfirmed. Hollow = offline. "
-                                "Thicker lines = more traffic.")
+                           tags=("legend",),
+                           font=("TkDefaultFont", int(8 * ui)),
+                           text="Letters = confidence (H M L ?) · hollow = "
+                                "offline · ─ seen (switch said so) · "
+                                "┄ logical (inferred) · ★ new this hour · "
+                                "red ring = open alert · drag a device to "
+                                "place it")
+
+    def _fast_pan(self, dx, dy):
+        """Pan by moving what is drawn (one Tcl call), not redrawing."""
+        self.c.move("all", dx, dy)
+        self.c.move("legend", -dx, -dy)
+        self._schedule_full_redraw()
+
+    def _fast_zoom(self, f, cx=None, cy=None):
+        new = max(0.4, min(3.0, self.scale * f))
+        f = new / self.scale
+        if abs(f - 1) < 1e-6:
+            return
+        w, h = self.c.winfo_width(), self.c.winfo_height()
+        cx = w / 2 if cx is None else cx
+        cy = h / 2 if cy is None else cy
+        self.c.scale("all", cx, cy, f, f)
+        # keep P() in step with what is on screen
+        self.ox = (self.ox + w / 2 - cx) * f + cx - w / 2
+        self.oy = (self.oy + h / 2 - cy) * f + cy - h / 2
+        self.scale = new
+        self._schedule_full_redraw()
+
+    def _schedule_full_redraw(self, ms=180):
+        if getattr(self, "_redraw_job", None):
+            with contextlib.suppress(tk.TclError):
+                self.c.after_cancel(self._redraw_job)
+        self._redraw_job = self.c.after(ms, lambda: self.redraw(force=True))
+
+    def _key(self, e):
+        k = e.keysym
+        step = 40
+        if k in ("Left", "Right", "Up", "Down"):
+            dx = {"Left": step, "Right": -step}.get(k, 0)
+            dy = {"Up": step, "Down": -step}.get(k, 0)
+            self.ox += dx
+            self.oy += dy
+            self._fast_pan(dx, dy)
+        elif k in ("plus", "equal", "KP_Add"):
+            self._fast_zoom(1.25)
+        elif k in ("minus", "KP_Subtract"):
+            self._fast_zoom(0.8)
+        elif k in ("0", "Home"):
+            self.reset_view()
+        elif k in ("Tab", "ISO_Left_Tab"):
+            rows = getattr(self, "_list_rows", [])
+            if rows:
+                keys = [r[0] for r in rows]
+                cur = self.selected[1] if self.selected and \
+                    self.selected[0] == "device" else None
+                i = keys.index(cur) if cur in keys else -1
+                i = (i + (-1 if e.state & 1 or k == "ISO_Left_Tab" else 1)) \
+                    % len(keys)
+                self.selected = ("device", keys[i])
+                r = rows[i]
+                self.info_var.set(f"Selected: {r[1]} — {r[2]} · {r[3]} · "
+                                  f"via {r[4]} (Enter for details)")
+                self.redraw(force=True)
+        elif k in ("Return", "KP_Enter"):
+            if self.selected:
+                self._open(*self.selected)
+        else:
+            return None
+        return "break"
+
+    def toggle_list(self):
+        """The list twin: the same nodes as a table (screen readers,
+        keyboard users, very big networks)."""
+        if self.list_wrap.winfo_ismapped():
+            self.list_wrap.pack_forget()
+            self.c.pack(fill="both", expand=True, padx=10, pady=6)
+            self.list_btn.configure(text="List view")
+            self.redraw(force=True)
+            return False
+        self.c.pack_forget()
+        self.list_wrap.pack(fill="both", expand=True, padx=10, pady=6)
+        self.list_btn.configure(text="Map view")
+        self.fill_list()
+        return True
+
+    def fill_list(self):
+        if not getattr(self, "_list_rows", None):
+            self.redraw(force=True)
+        tv = self.list_tree
+        tv.delete(*tv.get_children())
+        for key, name, kind, addr, via, state, lvl in getattr(
+                self, "_list_rows", []):
+            tv.insert("", "end", iid="d:" + key,
+                      values=(name, kind, addr, via, state, lvl))
 
     def _connections(self, w, h):
         t, m = self.t, self.model
@@ -27831,6 +28110,10 @@ class MiniWireshark:
                       command=lambda: self.export_report("health"))
         m.add_command(label="Device report (HTML)…",
                       command=lambda: self.export_report("device"))
+        m.add_command(label="Device inventory (printable)…",
+                      command=self.export_inventory)
+        m.add_command(label="Shareable report (personal details "
+                            "hidden)…", command=self.export_shareable)
         m.add_separator()
         m.add_command(label="Packets in current view as CSV…",
                       command=lambda: self._export_csv(current_view=True))
@@ -27844,6 +28127,126 @@ class MiniWireshark:
                       command=self._export_json)
         m.add_command(label="Packets as .pcap…", command=self.save_pcap)
         self._popup_at_pointer(m)
+
+    # ---- redaction preview and inventory (M12) ----------------------------------
+    def make_redactor(self, options=None):
+        nets = []
+        for _fp, prof in self.networks.all():
+            nets += [prof.get("name", ""), prof.get("ssid", "")]
+        r = Redactor(self.model, options)
+        for n in nets:
+            r._add_name(n, "networks")
+        w = self.wifi.last or {}
+        if w.get("ssid"):
+            r._add_name(w["ssid"], "networks")
+        return r
+
+    def inventory_document(self):
+        rows = inventory_rows(self.model, self.device_label)
+        net = self.network_name()
+        sub = (f"{net} · " if net else "") + \
+            f"generated {fmt_clock(time.time(), True)}"
+        return inventory_html(rows, "Device inventory", sub)
+
+    def export_inventory(self):
+        self.redaction_preview("Device inventory", self.inventory_document(),
+                               "device-inventory.html", redact=False)
+
+    def export_shareable(self):
+        self.redaction_preview("Shareable network report",
+                               ReportBuilder(self).build("full"),
+                               "network-report-redacted.html", redact=True)
+
+    def redaction_preview(self, title, content, filename, redact=True):
+        """Side by side: what you have, and what will be saved. Options
+        re-render the right side; the original is never changed."""
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title(f"{title} — preview")
+        win.geometry("1100x700")
+        win.configure(bg=t["tab_bg"])
+        bar = tk.Frame(win, bg=t["tab_bg"], padx=12, pady=8)
+        bar.pack(fill="x")
+        on = tk.BooleanVar(value=redact)
+        opts = {k: tk.BooleanVar(value=(k != "sites")) for k in
+                REDACT_OPTIONS}
+        ttk.Checkbutton(bar, text="Hide personal details before saving",
+                        variable=on, command=lambda: render()).pack(
+            side="left")
+        sub = tk.Frame(win, bg=t["tab_bg"], padx=30)
+        sub.pack(fill="x")
+        for k, label in REDACT_OPTIONS.items():
+            ttk.Checkbutton(sub, text=label, variable=opts[k],
+                            command=lambda: render()).pack(side="left",
+                                                           padx=(0, 10))
+        info = tk.Label(win, text="", bg=t["tab_bg"], fg=t["muted_fg"],
+                        anchor="w")
+        info.pack(fill="x", padx=12)
+        panes = tk.Frame(win, bg=t["tab_bg"])
+        panes.pack(fill="both", expand=True, padx=12, pady=6)
+        texts = []
+        for i, head in enumerate(("Your data (not changed)",
+                                  "What will be saved")):
+            col = tk.Frame(panes, bg=t["tab_bg"])
+            col.grid(row=0, column=i, sticky="nsew", padx=(0, 6) if i == 0
+                     else (6, 0))
+            panes.columnconfigure(i, weight=1)
+            tk.Label(col, text=head, bg=t["tab_bg"], fg=t["text_fg"],
+                     font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+            tx = tk.Text(col, wrap="word", bg=t["text_bg"], fg=t["text_fg"],
+                         relief="flat", font=("TkDefaultFont", 9),
+                         highlightthickness=0)
+            tx.pack(fill="both", expand=True)
+            texts.append(tx)
+        panes.rowconfigure(0, weight=1)
+        texts[0].insert("end", html_to_preview_text(content)
+                        if content.lstrip().startswith("<") else content)
+        texts[0].configure(state="disabled")
+        state = {"out": content, "red": None}
+
+        def render():
+            if on.get():
+                red = self.make_redactor({k: v.get()
+                                          for k, v in opts.items()})
+                out = red.text(content)
+                info.configure(text=red.summary())
+                state["red"] = red
+            else:
+                out = content
+                info.configure(text="Saved exactly as shown on the left.")
+                state["red"] = None
+            state["out"] = out
+            tx = texts[1]
+            tx.configure(state="normal")
+            tx.delete("1.0", "end")
+            tx.insert("end", html_to_preview_text(out)
+                      if out.lstrip().startswith("<") else out)
+            tx.configure(state="disabled")
+
+        def save():
+            ext = os.path.splitext(filename)[1] or ".html"
+            path = self._ask_save(ext, [("Web page", "*.html")] if ext ==
+                                  ".html" else [("All files", "*.*")],
+                                  filename)
+            if not path:
+                return
+            try:
+                atomic_write_text(path, state["out"])
+            except OSError as e:
+                messagebox.showerror("Export", str(e), parent=win)
+                return
+            self._set_banner(f"\U0001F4C4  Saved: {path}", kind="good")
+            win.destroy()
+        btns = tk.Frame(win, bg=t["tab_bg"], padx=12, pady=8)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="right")
+        ttk.Button(btns, text="Save…", style="Accent.TButton",
+                   command=save).pack(side="right", padx=6)
+        render()
+        win._mw_state, win._mw_opts, win._mw_on, win._mw_render = \
+            state, opts, on, render
+        return win
 
     def _ask_save(self, ext, types, name):
         return filedialog.asksaveasfilename(
@@ -28850,6 +29253,202 @@ font-weight:600}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
 @media(max-width:800px){.two{grid-template-columns:1fr}}
 footer{color:var(--muted);font-size:12px;text-align:center;padding:20px}
 """
+
+
+# ============================================================================
+#  Redaction (exports you want to share) and the printable inventory
+#
+#  Consistent pseudonyms within one export (the same device is always
+#  "Device C", the same address always 192.0.2.7), chosen from ranges
+#  reserved for documentation so they can never be mistaken for real ones.
+#  Evidence levels and structure are kept; the original data is untouched.
+# ============================================================================
+REDACT_OPTIONS = {"addresses": "IP addresses",
+                  "hardware": "Hardware (MAC) addresses",
+                  "names": "Device names, notes and your labels",
+                  "networks": "Network (Wi-Fi) names",
+                  "sites": "Website names"}
+_RX_MAC = re.compile(r"\b[0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5}\b")
+_RX_IP4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)")
+_RX_IP6 = re.compile(r"(?<![0-9A-Za-z:])(?:[0-9a-fA-F]{0,4}:){2,7}"
+                     r"[0-9a-fA-F]{0,4}(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:])")
+_RX_DOMAIN = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                        r"[a-z]{2,24}\b", re.I)
+
+
+class Redactor:
+    def __init__(self, model=None, options=None, extra_names=()):
+        self.opts = {k: True for k in REDACT_OPTIONS}
+        self.opts["sites"] = False           # public names: kept by default
+        self.opts.update(options or {})
+        self.maps = {k: {} for k in ("ip4", "ip4pub", "ip6", "mac", "name",
+                                     "net", "site")}
+        self.names, self.networks = set(), set()
+        if model is not None:
+            self.learn(model)
+        for n in extra_names:
+            self._add_name(n)
+
+    def _add_name(self, n, kind="names"):
+        n = str(n or "").strip()
+        if len(n) >= 3 and not _RX_IP4.fullmatch(n) and \
+                not _RX_MAC.fullmatch(n):
+            (self.names if kind == "names" else self.networks).add(n)
+
+    def learn(self, model):
+        for d in model.registry.by_key.values():
+            for n in (d.alias, d.hostname, d.dhcp_hostname, d.mdns_name,
+                      d.ssdp_name, d.notes):
+                self._add_name(n)
+            with contextlib.suppress(Exception):
+                self._add_name(d.display_name())
+        prof_names = getattr(model, "network_names", ()) or ()
+        for n in prof_names:
+            self._add_name(n, "networks")
+        for rec in getattr(model, "switch_ports", {}).values():
+            self._add_name(rec.get("system"))
+
+    def _pseudo(self, kind, key, fmt):
+        mp = self.maps[kind]
+        if key not in mp:
+            mp[key] = fmt(len(mp) + 1)
+        return mp[key]
+
+    @staticmethod
+    def _letters(n):
+        s = ""
+        while n:
+            n, r = divmod(n - 1, 26)
+            s = chr(65 + r) + s
+        return s
+
+    def ip(self, ip):
+        if ":" in ip:
+            return self._pseudo("ip6", ip.lower(), lambda n: f"2001:db8::"
+                                f"{n:x}")
+        if is_private_ip(ip) or ip.startswith(("169.254.", "100.")):
+            return self._pseudo("ip4", ip, lambda n: f"192.0.2.{n % 254 + 1}"
+                                if n < 254 else f"192.0.2.{n % 254 + 1}"
+                                f"#{n // 254}")
+        if ip in ("0.0.0.0", "255.255.255.255") or ip.startswith(
+                ("224.", "239.", "127.")):
+            return ip                      # well-known, nothing personal
+        return self._pseudo("ip4pub", ip, lambda n: f"198.51.100."
+                            f"{n % 254 + 1}")
+
+    def mac(self, mac):
+        m = mac.lower().replace("-", ":")
+        if m in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+            return m
+        return self._pseudo("mac", m, lambda n: f"02:00:00:00:{n >> 8:02x}:"
+                            f"{n & 255:02x}")
+
+    def name(self, s):
+        return self._pseudo("name", s.lower(),
+                            lambda n: f"Device {self._letters(n)}")
+
+    def network(self, s):
+        return self._pseudo("net", s.lower(), lambda n: f"Network {n}")
+
+    def site(self, s):
+        return self._pseudo("site", s.lower(), lambda n: f"site-{n}.example")
+
+    def text(self, s):
+        """Redact free text (reports, CSV, copied details)."""
+        s = str(s)
+        if self.opts["names"] and self.names:
+            rx = re.compile("|".join(re.escape(n) for n in sorted(
+                self.names, key=len, reverse=True)), re.I)
+            s = rx.sub(lambda m: self.name(m.group(0)), s)
+        if self.opts["networks"] and self.networks:
+            rx = re.compile("|".join(re.escape(n) for n in sorted(
+                self.networks, key=len, reverse=True)), re.I)
+            s = rx.sub(lambda m: self.network(m.group(0)), s)
+        if self.opts["hardware"]:
+            s = _RX_MAC.sub(lambda m: self.mac(m.group(0)), s)
+        if self.opts["addresses"]:
+            s = _RX_IP6.sub(lambda m: self.ip(m.group(0).split("%")[0])
+                            if ip_obj(m.group(0).split("%")[0]) is not None
+                            else m.group(0), s)
+            s = _RX_IP4.sub(lambda m: self.ip(m.group(0)) if ip_obj(
+                m.group(0)) is not None else m.group(0), s)
+        if self.opts["sites"]:
+            s = _RX_DOMAIN.sub(lambda m: m.group(0) if m.group(0).lower(
+            ).endswith((".example", ".local", ".lan", ".html", ".css")) or
+                m.group(0).lower() in ("miniwireshark",) else
+                self.site(m.group(0)), s)
+        return s
+
+    def summary(self):
+        parts = []
+        for kind, label in (("name", "names"), ("ip4", "local addresses"),
+                            ("ip4pub", "Internet addresses"),
+                            ("ip6", "IPv6 addresses"),
+                            ("mac", "hardware addresses"),
+                            ("net", "network names"), ("site", "websites")):
+            if self.maps[kind]:
+                parts.append(f"{len(self.maps[kind])} {label}")
+        return ("Replaced: " + ", ".join(parts)) if parts else \
+            "Nothing needed replacing."
+
+
+def inventory_rows(model, namer=None):
+    namer = namer or (lambda d: d.display_name())
+    out = []
+    for d in sorted(model.registry.by_key.values(),
+                    key=lambda d: (not d.mine, namer(d).lower())):
+        lvl = device_weakest(model, d)
+        out.append({
+            "name": namer(d), "kind": (f"{d.class_confidence} "
+                                       f"{d.device_class}").strip(),
+            "maker": d.vendor or "—", "ip": d.ip or "—",
+            "ipv6": " ".join(sorted(d.ipv6)[:2]) or "—",
+            "mac": d.mac or "—", "first": fmt_clock(d.first_seen, True),
+            "last": fmt_clock(d.last_seen, True),
+            "status": STATE_LABEL.get(d.state, d.state),
+            "confidence": d.confidence, "evidence": LEVEL_GLYPH.get(lvl, "?")
+            + " " + LEVEL_WORD.get(lvl, "Unknown"),
+            "mine": "★" if d.mine else "", "expected": "✓" if d.expected
+            else "", "notes": d.notes or ""})
+    return out
+
+
+def inventory_html(rows, title="Device inventory", subtitle=""):
+    e = html.escape
+    head = ("<tr><th></th><th>Device</th><th>Kind</th><th>Maker</th>"
+            "<th>Address</th><th>Hardware address</th><th>Status</th>"
+            "<th>Evidence</th><th>First seen</th><th>Last seen</th>"
+            "<th>Expected</th><th>Notes</th></tr>")
+    body = "".join(
+        f"<tr><td>{e(r['mine'])}</td><td><b>{e(r['name'])}</b></td>"
+        f"<td>{e(r['kind'])}</td><td>{e(r['maker'])}</td>"
+        f"<td>{e(r['ip'])}</td><td class='mono'>{e(r['mac'])}</td>"
+        f"<td>{e(r['status'])}</td><td>{e(r['evidence'])}</td>"
+        f"<td>{e(r['first'])}</td><td>{e(r['last'])}</td>"
+        f"<td>{e(r['expected'])}</td><td>{e(r['notes'])}</td></tr>"
+        for r in rows)
+    return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            f"<title>{e(title)}</title><style>{REPORT_CSS}"
+            f"@media print{{header{{background:none;color:#000}}"
+            f"table{{font-size:9pt}}tr{{page-break-inside:avoid}}}}"
+            f".mono{{font-family:monospace}}</style></head><body>"
+            f"<header><h1>{e(title)}</h1><p>{e(subtitle)}</p></header>"
+            f"<main><section><p class='muted'>★ = marked as yours. "
+            f"Evidence: ◉ observed ◈ reported ◎ correlated ◌ inferred. "
+            f"{len(rows)} device(s).</p><table>{head}{body}</table>"
+            f"</section></main><footer>Generated locally by MiniWireshark "
+            f"{SCRIPT_VERSION}. Print this page to keep a paper copy."
+            f"</footer></body></html>")
+
+
+def html_to_preview_text(h):
+    """A readable plain-text rendering of an HTML export (for previews)."""
+    h = re.sub(r"(?is)<(style|script)[^>]*>.*?</\1>", "", h)
+    h = re.sub(r"(?i)<br\s*/?>|</(p|tr|h\d|li|section|div)>", "\n", h)
+    h = re.sub(r"(?i)</t[dh]>", "  ", h)
+    h = re.sub(r"<[^>]+>", "", h)
+    h = html.unescape(h)
+    return re.sub(r"\n{3,}", "\n\n", h).strip()
 
 
 class ReportBuilder:
@@ -33007,6 +33606,50 @@ def t_colorblind_modes(ctx):
         "Light", False) == "Light"
 
 
+@self_test()
+def t_redaction_no_leaks(ctx):
+    """Every original address, hardware address and name is replaced,
+    consistently, and the pseudonyms come from documentation ranges."""
+    if not ctx.scapy_ok:
+        return "skip"
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    S = ScenarioBuilder
+    d = m.device_for(S.PHONE[0], S.PHONE[1])
+    d.alias, d.notes = "Kid's phone", "bought in May"
+    rows = inventory_rows(m)
+    text = "\n".join(" | ".join(str(v) for v in r.values()) for r in rows)
+    text += "\nDNS answer 93.184.215.14 for www.example.com; " \
+            "fe80::21e:58ff:feaa:1; network “HomeNet”."
+    red = Redactor(m)
+    red._add_name("HomeNet", "networks")
+    out = red.text(text)
+    originals = set()
+    for dev in m.registry.by_key.values():
+        originals |= {dev.ip, dev.mac, dev.alias, dev.notes, dev.hostname,
+                      dev.dhcp_hostname, dev.mdns_name}
+        originals |= set(dev.ipv6)
+    originals |= {"93.184.215.14", "HomeNet", "fe80::21e:58ff:feaa:1"}
+    leaks = sorted(o for o in originals if o and len(o) >= 3 and
+                   o.lower() in out.lower())
+    assert not leaks, leaks
+    assert "Kid's phone" not in out and "Device " in out
+    # consistent: the same original always gets the same pseudonym
+    assert red.text(S.PHONE[0]) == red.text(S.PHONE[0])
+    assert red.text(S.PHONE[0]).startswith("192.0.2.")
+    assert red.text("93.184.215.14").startswith("198.51.100.")
+    assert red.text(S.PHONE[1]).startswith("02:00:00:00:")
+    assert "www.example.com" in out                  # public names kept…
+    red2 = Redactor(m, {"sites": True})
+    assert "www.example.com" not in red2.text(text)  # …unless asked
+    # turning an option off keeps that kind of data
+    keep = Redactor(m, {"addresses": False}).text(S.PHONE[0])
+    assert keep == S.PHONE[0]
+    html_doc = inventory_html(rows)
+    assert html_doc.startswith("<!doctype html>") and "@media print" in \
+        html_doc and len(rows) == len(m.registry.by_key)
+    assert S.PHONE[0] in html_to_preview_text(html_doc)
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -33413,6 +34056,9 @@ def _gs_this_pc(app, ctx):
     mine = [f for f in m.flows.all_flows() if f.local_ip in m.my_ips]
     assert mine, "the scenario has connections from this computer"
     pm = app.procmap
+    _gui_pump(root, 0.05, lambda: not pm.busy, timeout=10)
+    pm.at = time.time() + 3600          # no real refresh during the test
+    pm.available = True
     pm.by_local = {(f.transport, f.local_ip, f.local_port): (4242,
                                                              "firefox.exe")
                    for f in mine}
@@ -33466,6 +34112,7 @@ def _gs_this_pc(app, ctx):
         if isinstance(win, tk.Toplevel):
             win.destroy()
     app.upnp_result = None
+    pm.at = 0.0
     app.data_mode = "idle"
     app._restyle_mode_banner()
 
@@ -33583,6 +34230,108 @@ def _gs_investigate(app, ctx):
     tl.rebuild()
     app.wifi.last = None
     app.wifi.at = 0.0
+    app.data_mode = "idle"
+
+
+@gui_test_step("map v3: 300 devices, fast pan/zoom, drag, keyboard, list twin")
+def _gs_map3(app, ctx):
+    root = app.root
+    m = app._new_model(identity=("10.20.0.1", {"10.20.0.10"},
+                                 {"02:00:00:00:00:0a"}))
+    m.set_identity(local_nets=[ipaddress.ip_network("10.20.0.0/16")])
+    now = time.time()
+    for i in range(300):
+        ip = f"10.20.{1 + i // 200}.{2 + i % 200}"
+        mac = f"02:aa:00:00:{i >> 8:02x}:{i & 255:02x}"
+        d = m.registry.touch(ip, mac, "arp_reply", "synthetic", now)
+        d.type = ("phone", "computer", "tv", "iot", "printer")[i % 5]
+    app.replace_model(m)
+    app.mode_ui_var.set("Advanced")
+    app._on_ui_mode_change()
+    root.geometry("1400x900")
+    tab = app._select_tab("map")
+    _gui_pump(root, 0.3)
+    t0 = time.perf_counter()
+    tab.redraw(force=True)
+    root.update_idletasks()
+    full = (time.perf_counter() - t0) * 1000
+    nodes = {v[1] for v in tab.nodes.values() if v[0] == "device"}
+    assert len(nodes) == 300, len(nodes)
+    times = []
+    for i in range(20):
+        t0 = time.perf_counter()
+        tab._fast_pan(5, 3)
+        root.update_idletasks()
+        times.append((time.perf_counter() - t0) * 1000)
+    t0 = time.perf_counter()
+    tab._fast_zoom(1.1)
+    root.update_idletasks()
+    zoom_ms = (time.perf_counter() - t0) * 1000
+    worst = sorted(times)[-2]
+    print(f"      (300 devices: full draw {full:.0f} ms, pan frame "
+          f"{worst:.1f} ms, zoom frame {zoom_ms:.1f} ms)")
+    assert worst <= 16 and zoom_ms <= 16, (worst, zoom_ms)
+    _gui_pump(root, 0.3)                       # the debounced redraw
+    # drag one device and it stays where it was put
+    key = sorted(nodes)[0]
+    x, y = tab.P(*tab._pos[key])
+    tab._press(type("E", (), {"x": int(x), "y": int(y)})())
+    tab._motion(type("E", (), {"x": int(x) + 60, "y": int(y) + 40})())
+    tab._release(type("E", (), {"x": int(x) + 60, "y": int(y) + 40})())
+    saved = tab._positions_store()
+    assert key in saved, saved
+    tab.redraw(force=True)
+    nx, ny = tab.P(*tab._pos[key])
+    assert abs(nx - (x + 60)) < 3 and abs(ny - (y + 40)) < 3, (nx, ny, x, y)
+    tab.forget_positions()
+    assert key not in tab._positions_store()
+    # keyboard: Tab selects, Enter opens
+    ev = type("E", (), {"keysym": "Tab", "state": 0})()
+    assert tab._key(ev) == "break" and tab.selected
+    # the list twin shows the same devices, with how each one connects
+    assert tab.toggle_list()
+    _gui_pump(root, 0.1)
+    rows = tab.list_tree.get_children()
+    assert len(rows) == 300
+    via = tab.list_tree.set(rows[0], "via")
+    assert "logical" in via, via
+    assert not tab.toggle_list()
+    app.mode_ui_var.set("Beginner")
+    app._on_ui_mode_change()
+
+
+@gui_test_step("redaction preview, shareable report and printable inventory")
+def _gs_redaction(app, ctx):
+    root = app.root
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "live"
+    sink = app.lossless_sink()
+    for raw, _ts, lt in ctx.frames():
+        sink(raw, time.time(), lt)
+    assert _gui_pump(root, 0.3, lambda: not len(app.ring) and
+                     not app.worker.busy, timeout=30)
+    full = ReportBuilder(app).build("full")
+    w = app.redaction_preview("Shareable", full, "x.html", redact=True)
+    _gui_pump(root, 0.2)
+    out = w._mw_state["out"]
+    for dev in m.registry.by_key.values():
+        for o in (dev.ip, dev.mac):
+            assert not o or o not in out, o
+    for name in ("Alex-iPhone", "family-nas", "Living Room TV"):
+        assert name.lower() not in out.lower(), name
+    assert "<html" in out.lower()                  # still a valid document
+    w._mw_on.set(False)
+    w._mw_render()
+    assert w._mw_state["out"] == full              # original untouched
+    w.destroy()
+    inv = app.inventory_document()
+    assert "Alex-iPhone" in inv and "Device inventory" in inv
+    w = app.redaction_preview("Inventory", inv, "inv.html", redact=False)
+    _gui_pump(root, 0.1)
+    w.destroy()
     app.data_mode = "idle"
 
 
