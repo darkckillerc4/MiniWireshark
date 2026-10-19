@@ -105,3 +105,11 @@ OutboundBlocked: Not sent — the kill switch is on (Connected helpers (Pi-hole,
 2026-10-19 15:16:47,008 WARNING [MainThread] data oui: checksum mismatch, discarding
 2026-10-19 15:16:52,499 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and last night's backup was restored.
 2026-10-19 15:16:52,505 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and a new one was started.
+2026-10-19 15:22:03,661 WARNING [MainThread] config unreadable (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); using defaults
+2026-10-19 15:22:03,715 WARNING [MainThread] data oui: checksum mismatch, discarding
+2026-10-19 15:22:08,045 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and last night's backup was restored.
+2026-10-19 15:22:08,052 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and a new one was started.
+2026-10-19 15:23:37,822 WARNING [MainThread] config unreadable (Expecting property name enclosed in double quotes: line 1 column 2 (char 1)); using defaults
+2026-10-19 15:23:37,885 WARNING [MainThread] data oui: checksum mismatch, discarding
+2026-10-19 15:23:43,462 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and last night's backup was restored.
+2026-10-19 15:23:43,467 WARNING [history-writer] history: The history file was damaged (file is not a database); it was set aside and a new one was started.

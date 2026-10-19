@@ -12515,6 +12515,471 @@ def device_weakest(model, dev):
 
 
 # ============================================================================
+#  12d.  Insights: narratives that cannot overclaim, periodicity, episodes
+#        and guided investigations (a hypothesis board, never a verdict)
+# ============================================================================
+class NarrativeRefused(ValueError):
+    """A template was given a claim weaker than its slot accepts."""
+
+
+class C:
+    """A claim used to fill a narrative slot: a value with its level."""
+    __slots__ = ("value", "level", "proof")
+
+    def __init__(self, value, level, proof=""):
+        self.value, self.level, self.proof = value, level, proof
+
+    def __repr__(self):
+        return f"C({self.value!r}, {self.level})"
+
+
+# How strong each level is when a sentence states it as fact.
+LEVEL_STRENGTH = {LV_OBSERVED: 4, LV_REPORTED: 3, LV_CORRELATED: 2,
+                  LV_INFERRED: 1, LV_UNKNOWN: 0}
+VERBS = {
+    "made": {LV_OBSERVED: "made", LV_REPORTED: "was reported to make",
+             LV_CORRELATED: "appears to have made",
+             LV_INFERRED: "may have made"},
+    "is": {LV_OBSERVED: "is", LV_REPORTED: "is reported to be",
+           LV_CORRELATED: "appears to be", LV_INFERRED: "may be"},
+    "used": {LV_OBSERVED: "used", LV_REPORTED: "was reported to use",
+             LV_CORRELATED: "appears to have used",
+             LV_INFERRED: "may have used"},
+    "contacts": {LV_OBSERVED: "contacts", LV_REPORTED: "reportedly contacts",
+                 LV_CORRELATED: "appears to contact",
+                 LV_INFERRED: "may contact"},
+}
+
+
+class NarrativeTemplate:
+    """Text with {slot} and {verb:NAME} markers. Each slot lists the
+    levels it accepts; the verb is conjugated by the WEAKEST level among
+    the slots, and the sentence carries that level's glyph. A missing
+    required slot means nothing is rendered."""
+
+    def __init__(self, key, text, slots, optional=()):
+        self.key, self.text = key, text
+        self.slots = dict(slots)          # name → set of accepted levels
+        self.optional = set(optional)
+
+    def render(self, **claims):
+        vals, weakest = {}, LV_OBSERVED
+        for name, allowed in self.slots.items():
+            c = claims.get(name)
+            if c is None or c.value in (None, ""):
+                if name in self.optional:
+                    vals[name] = ""
+                    continue
+                return None                  # empty required slot
+            if not isinstance(c, C):
+                raise NarrativeRefused(f"slot {name} needs a claim")
+            if c.level not in allowed:
+                raise NarrativeRefused(
+                    f"{self.key}: slot {name} accepts "
+                    f"{sorted(allowed)}, got {c.level}")
+            vals[name] = c.value
+            if LEVEL_STRENGTH[c.level] < LEVEL_STRENGTH[weakest]:
+                weakest = c.level
+        text = re.sub(r"\{verb:(\w+)\}", lambda m: VERBS[m.group(1)][weakest],
+                      self.text)
+        text = text.format(**vals)
+        return LEVEL_GLYPH[weakest] + " " + _cap(text.strip()), weakest
+
+
+_ALL = {LV_OBSERVED, LV_REPORTED, LV_CORRELATED, LV_INFERRED}
+_SEEN = {LV_OBSERVED, LV_REPORTED}
+NARRATIVES = {t.key: t for t in (
+    NarrativeTemplate("connections",
+                      "{device} {verb:made} {count} connections to "
+                      "{destination} over {duration}.",
+                      {"device": _ALL, "count": _SEEN, "destination": _ALL,
+                       "duration": _SEEN}),
+    NarrativeTemplate("periodic",
+                      "{device} {verb:contacts} {destination} about every "
+                      "{period} ({repeats} times).",
+                      {"device": _ALL, "destination": _ALL,
+                       "period": {LV_CORRELATED, LV_OBSERVED},
+                       "repeats": _SEEN}),
+    NarrativeTemplate("bandwidth",
+                      "{device} {verb:used} {amount} in the last {window}"
+                      "{share}.",
+                      {"device": _ALL, "amount": _SEEN, "window": _SEEN,
+                       "share": _ALL}, optional=("share",)),
+    NarrativeTemplate("shape",
+                      "Pattern looks like {shape} ({detail}).",
+                      {"shape": {LV_INFERRED}, "detail": _SEEN}),
+    NarrativeTemplate("program",
+                      "{program} on this computer {verb:is} using "
+                      "{rate}.",
+                      {"program": {LV_OBSERVED}, "rate": _SEEN}),
+)}
+
+
+def narrate(key, **claims):
+    """Render a narrative or None (missing data). Raises NarrativeRefused
+    when a claim is weaker than the sentence would state."""
+    got = NARRATIVES[key].render(**claims)
+    return got[0] if got else None
+
+
+# ---- periodicity: "contacts X about every 60 s" ----------------------------
+PERIOD_BUCKETS = (5, 10, 20, 40, 75, 150, 300, 600, 1200, 2400, 4800,
+                  float("inf"))
+
+
+def detect_periodic(starts, min_repeats=10, share=0.7):
+    """Connection start times → (period seconds, repeats) when most
+    intervals fall in one log-scale bucket, else None."""
+    ts = sorted(starts)
+    if len(ts) < min_repeats + 1:
+        return None
+    gaps = [b - a for a, b in zip(ts, ts[1:]) if b - a >= 1.0]
+    if len(gaps) < min_repeats:
+        return None
+    buckets = Counter()
+    for g in gaps:
+        for i, edge in enumerate(PERIOD_BUCKETS):
+            if g < edge:
+                buckets[i] += 1
+                break
+    idx, n = buckets.most_common(1)[0]
+    if n < min_repeats or n / len(gaps) < share:
+        return None
+    lo = PERIOD_BUCKETS[idx - 1] if idx else 0
+    inside = [g for g in gaps if lo <= g < PERIOD_BUCKETS[idx]]
+    return statistics.median(inside), n
+
+
+def human_period(sec):
+    if sec < 90:
+        return f"{sec:.0f} s"
+    if sec < 5400:
+        return f"{sec / 60:.0f} min"
+    return f"{sec / 3600:.1f} h"
+
+
+def periodic_findings(model, min_repeats=10):
+    """[(device_key, destination, period, repeats, narrative)]."""
+    out = []
+    reg = model.registry
+    for (dev_key, remote), starts in list(model.flow_starts.items()):
+        got = detect_periodic(starts, min_repeats)
+        if not got:
+            continue
+        period, n = got
+        names = model.ip_to_domains.get(remote)
+        dest = next(reversed(names)) if names else remote
+        dev = reg.by_key.get(reg.resolve(dev_key))
+        text = narrate("periodic",
+                       device=C(dev.display_name() if dev else dev_key,
+                                LV_OBSERVED),
+                       destination=C(dest, LV_OBSERVED if not names else
+                                     LV_CORRELATED),
+                       period=C(human_period(period), LV_CORRELATED),
+                       repeats=C(n + 1, LV_OBSERVED))
+        out.append((dev_key, dest, period, n + 1, text))
+    out.sort(key=lambda r: -r[3])
+    return out
+
+
+# ---- episodes: bursts of related events under one headline -----------------
+EPISODE_RULES = (
+    ("reconnect_wave",
+     lambda evs: sum(1 for e in evs if e["kind"] in ("device back",
+                                                     "dhcp lease",
+                                                     "new device")) >= 3,
+     lambda evs: (f"{sum(1 for e in evs if e['kind'] in ('device back', 'dhcp lease', 'new device'))} "
+                  f"devices (re)joined within "
+                  f"{human_duration(evs[-1]['when'] - evs[0]['when'])}"),
+     "the router or the Wi-Fi restarted (or the power came back)",
+     LV_INFERRED),
+    ("drop_wave",
+     lambda evs: sum(1 for e in evs if e["kind"] == "device left") >= 3,
+     lambda evs: (f"{sum(1 for e in evs if e['kind'] == 'device left')} "
+                  f"devices went offline together"),
+     "a Wi-Fi drop, a power cut or devices going to sleep at the same "
+     "time", LV_INFERRED),
+    ("network_change",
+     lambda evs: any(e["kind"] in ("network", "interface", "internet",
+                                   "wifi") for e in evs) and len(evs) >= 2,
+     lambda evs: next(e["text"] for e in evs if e["kind"] in (
+         "network", "interface", "internet", "wifi")),
+     "a change of network or connection", LV_OBSERVED),
+    ("browsing_burst",
+     lambda evs: len({e.get("device") for e in evs
+                      if e["kind"] == "website"}) == 1 and
+     sum(1 for e in evs if e["kind"] == "website") >= 4,
+     lambda evs: (f"{sum(1 for e in evs if e['kind'] == 'website')} new "
+                  f"websites in a short burst"),
+     "one page or app loading many services", LV_OBSERVED),
+)
+
+
+def build_episodes(events, window=120.0, min_events=2):
+    """Group time-ordered timeline events: a new episode starts after
+    `window` seconds of quiet. → [{"start", "end", "events", "headline",
+    "cause", "level", "rule"}] (single events are left alone)."""
+    evs = sorted(events, key=lambda e: e["when"])
+    groups, cur = [], []
+    for e in evs:
+        if cur and e["when"] - cur[-1]["when"] > window:
+            groups.append(cur)
+            cur = []
+        cur.append(e)
+    if cur:
+        groups.append(cur)
+    out = []
+    for g in groups:
+        if len(g) < min_events:
+            continue
+        ep = {"start": g[0]["when"], "end": g[-1]["when"], "events": g,
+              "headline": f"{len(g)} related events", "cause": "",
+              "level": LV_INFERRED, "rule": ""}
+        for rule, match, head, cause, lvl in EPISODE_RULES:
+            try:
+                if match(g):
+                    ep.update(headline=head(g), cause=cause, level=lvl,
+                              rule=rule)
+                    break
+            except (StopIteration, KeyError):
+                continue
+        out.append(ep)
+    return out
+
+
+# ---- guided investigations --------------------------------------------------
+HYP_STATUS_ORDER = {"Likely": 3, "Possible": 2, "Can't tell": 1,
+                    "Unlikely": 0}
+
+
+def _hyp(key, title, score, status, why_for=(), why_against=(), fix=""):
+    return {"key": key, "title": title, "score": float(score),
+            "status": status, "for": list(why_for),
+            "against": list(why_against), "fix": fix}
+
+
+def slow_facts(model, wifi=None, health=None, dns_slow_ms=800.0,
+               offline=False, namer=None, window=600):
+    """The facts investigate_slow() weighs, gathered from a model."""
+    m = model
+    now = m.now()
+    namer = namer or (lambda k: k)
+    f = {"wifi": wifi, "wired": bool(m.switch_summary(now)),
+         "health": health or {}, "dns_slow_ms": dns_slow_ms,
+         "dns_encrypted": bool(m.dns.encrypted_seen),
+         "vpn": bool(m.vpn.get("iface") or m.vpn.get("endpoint")),
+         "vantage": m.vantage.classify(offline=offline)}
+    f["dns_median_ms"], f["dns_n"] = m.dns.median_latency(now)
+    f["dns_fail_rate"], _nq = m.dns.failure_rate(now)
+    f["rtt_median_ms"], f["rtt_p90"], f["rtt_n"] = m.rtt_stats(now)
+    tcp = [x for x in m.flows.all_flows() if x.transport == "TCP"]
+    pk = sum(x.packets for x in tcp)
+    f["tcp_packets"] = pk
+    f["retrans_pct"] = (sum(x.retrans for x in tcp) / pk) if pk else None
+    progs, others = Counter(), Counter()
+    mine = set(m.my_ips)
+    me = m.my_device_key()
+    for x in m.flows.all_flows():
+        if now - x.last_seen > window:
+            continue
+        rate = x.total_bytes / max(5.0, min(window, x.duration or 5.0))
+        if x.process and x.local_ip in mine:
+            progs[x.process] += rate
+        elif x.device_key and x.device_key != me:
+            others[x.device_key] += rate
+    f["this_pc_top"] = progs.most_common(3)
+    if others:
+        k, r = others.most_common(1)[0]
+        f["other_top"] = (namer(k), r)
+    return f
+
+
+def investigate_slow(f):
+    """“Why is my Internet slow?” → ranked hypotheses (a board, not a
+    verdict). `f` = facts gathered by the app (see collect_slow_facts).
+    “Can't tell from here” is a valid answer and comes first when nothing
+    visible explains the slowness."""
+    H = []
+    w = f.get("wifi")
+    if w and w.get("rssi") is not None:
+        r = w["rssi"]
+        if r < -75:
+            H.append(_hyp("wifi", "Weak Wi-Fi on this computer", 0.92,
+                          "Likely", [f"◉ Signal {r:.0f} dBm (weak)"],
+                          fix="Move closer to the router, remove obstacles, "
+                              "or use 5 GHz / a cable."))
+        elif r < -67:
+            H.append(_hyp("wifi", "Weak Wi-Fi on this computer", 0.5,
+                          "Possible", [f"◉ Signal {r:.0f} dBm (fair)"],
+                          fix="Moving closer usually helps."))
+        else:
+            H.append(_hyp("wifi", "Weak Wi-Fi on this computer", 0.05,
+                          "Unlikely", (), [f"◉ Signal {r:.0f} dBm (good)"]))
+    elif f.get("wired"):
+        H.append(_hyp("wifi", "Weak Wi-Fi on this computer", 0.0,
+                      "Unlikely", (), ["◉ This computer uses a cable"]))
+    h = f.get("health") or {}
+    if "gateway_ok" in h:
+        if not h["gateway_ok"]:
+            H.append(_hyp("router", "The router isn't answering", 0.9,
+                          "Likely", ["◉ The router didn't answer the "
+                                     "check"],
+                          fix="Restart the router; check its cables."))
+        elif (h.get("gateway_ms") or 0) > 50:
+            H.append(_hyp("router", "The router is slow to answer", 0.55,
+                          "Possible", [f"◉ Router answered in "
+                                       f"{h['gateway_ms']:.0f} ms"],
+                          fix="The router may be overloaded; restart it."))
+        else:
+            H.append(_hyp("router", "The router is slow or down", 0.05,
+                          "Unlikely", (), [f"◉ Router answered in "
+                                           f"{h.get('gateway_ms') or 0:.0f} "
+                                           f"ms"]))
+    dm, fr, dn = f.get("dns_median_ms"), f.get("dns_fail_rate") or 0, \
+        f.get("dns_n") or 0
+    slow = f.get("dns_slow_ms", 800)
+    if dn >= 5 and (fr >= 0.3 or (dm or 0) >= slow):
+        H.append(_hyp("dns", "Slow or failing website lookups (DNS)", 0.85,
+                      "Likely", [f"◉ Typical lookup {dm or 0:.0f} ms" +
+                                 (f", {fr:.0%} failed" if fr else "")],
+                      fix="Try another DNS server (in the router or this "
+                          "computer's settings)."))
+    elif dn >= 5 and (dm or 0) >= 250:
+        H.append(_hyp("dns", "Slow website lookups (DNS)", 0.45,
+                      "Possible", [f"◉ Typical lookup {dm:.0f} ms"]))
+    elif dn >= 5:
+        H.append(_hyp("dns", "Slow website lookups (DNS)", 0.05, "Unlikely",
+                      (), [f"◉ Typical lookup {dm or 0:.0f} ms over {dn} "
+                           f"lookups"]))
+    elif f.get("dns_encrypted"):
+        H.append(_hyp("dns", "Slow website lookups (DNS)", 0.0,
+                      "Can't tell", (), ["Lookups are encrypted, so they "
+                                         "can't be timed"]))
+    rtt, rn = f.get("rtt_median_ms"), f.get("rtt_n") or 0
+    local_ok = not any(x["key"] in ("wifi", "router") and
+                       x["status"] in ("Likely", "Possible") for x in H)
+    if rn >= 5 and rtt is not None:
+        if rtt >= 200:
+            H.append(_hyp("isp", "Delay beyond your router (Internet "
+                                 "provider or the sites themselves)",
+                          0.75 if local_ok else 0.4,
+                          "Likely" if local_ok else "Possible",
+                          [f"◉ Connections take {rtt:.0f} ms to open"] +
+                          (["◉ Wi-Fi and router look fine"] if local_ok
+                           else []),
+                          fix="Test at another time; if it persists, "
+                              "contact your Internet provider."))
+        elif rtt >= 100:
+            H.append(_hyp("isp", "Delay beyond your router", 0.3,
+                          "Possible", [f"◉ Connections take {rtt:.0f} ms "
+                                       f"to open"]))
+        else:
+            H.append(_hyp("isp", "Delay beyond your router", 0.05,
+                          "Unlikely", (), [f"◉ Connections open in "
+                                           f"{rtt:.0f} ms"]))
+    rp = f.get("retrans_pct")
+    if rp is not None and (f.get("tcp_packets") or 0) > 500:
+        wifi_weak = any(x["key"] == "wifi" and x["status"] == "Likely"
+                        for x in H)
+        if rp >= 0.06:
+            H.append(_hyp("loss", "Packets getting lost on the way",
+                          0.5 if wifi_weak else 0.7,
+                          "Possible" if wifi_weak else "Likely",
+                          [f"◉ {rp:.1%} of data was re-sent"] +
+                          (["◎ Consistent with the weak Wi-Fi"]
+                           if wifi_weak else [])))
+        elif rp >= 0.02:
+            H.append(_hyp("loss", "Packets getting lost on the way", 0.35,
+                          "Possible", [f"◉ {rp:.1%} of data was re-sent"]))
+        else:
+            H.append(_hyp("loss", "Packets getting lost", 0.05, "Unlikely",
+                          (), [f"◉ Only {rp:.1%} re-sent"]))
+    top = f.get("this_pc_top") or []
+    if top:
+        prog, rate = top[0][0], top[0][1]
+        if rate >= 2e6:
+            H.append(_hyp("local_hog", f"{prog} on this computer is using "
+                                       f"most of the connection", 0.65,
+                          "Possible", [narrate(
+                              "program", program=C(prog, LV_OBSERVED),
+                              rate=C(_human_bytes(rate) + "/s",
+                                     LV_OBSERVED))],
+                          fix=f"Pause {prog}'s downloads or updates and "
+                              f"try again."))
+    other = f.get("other_top")
+    if f.get("vantage") in ("mirror", "partial") and other:
+        name, rate = other
+        if rate >= 2e6:
+            H.append(_hyp("other_hog", f"{name} is using a lot of the "
+                                       f"connection", 0.6, "Possible",
+                          [f"◉ {_human_bytes(rate)}/s right now"],
+                          fix=f"Check what {name} is doing (streaming, "
+                              f"backups, updates)."))
+    elif f.get("vantage") == "endpoint":
+        H.append(_hyp("other_hog", "Another device using the connection",
+                      0.0, "Can't tell", (),
+                      ["From this computer, other devices' traffic isn't "
+                       "visible (it goes straight to the router)."]))
+    if f.get("vpn"):
+        H.append(_hyp("vpn", "The VPN adds a detour", 0.3, "Possible",
+                      ["◉ A VPN is active"],
+                      fix="Try once with the VPN off to compare."))
+    best = max((x["score"] for x in H if x["status"] in ("Likely",
+                                                         "Possible")),
+               default=0.0)
+    if best < 0.5:
+        H.append(_hyp("cant_tell", "Can't tell from here", 0.49,
+                      "Can't tell",
+                      ["Nothing this computer can see explains it right "
+                       "now."],
+                      fix="Check again while it's slow, or connect a "
+                          "Pi-hole / use a mirror port to see more. The "
+                          "router's own Internet line isn't visible from "
+                          "here."))
+    H.sort(key=lambda x: (-x["score"], -HYP_STATUS_ORDER[x["status"]]))
+    return H
+
+
+def investigate_bandwidth(f):
+    """“What is using my bandwidth?” — totals per device by the evidence
+    level trusted, the unattributed share, and the blind spot."""
+    rows = sorted(f.get("devices") or [], key=lambda r: -r[1])
+    total = sum(r[1] for r in rows) + (f.get("unattributed") or 0)
+    out = {"rows": [], "unattributed": f.get("unattributed") or 0,
+           "total": total, "vantage": f.get("vantage"), "conclusion": ""}
+    for name, nbytes, level in rows[:12]:
+        share = f" ({nbytes / total:.0%} of what I can see)" if total else ""
+        out["rows"].append(narrate(
+            "bandwidth", device=C(name, LV_OBSERVED),
+            amount=C(_human_bytes(nbytes), level),
+            window=C(f.get("window_text", "few minutes"), LV_OBSERVED),
+            share=C(share, LV_OBSERVED)))
+    if f.get("vantage") == "endpoint":
+        out["conclusion"] = (
+            "Can't tell from here for other devices: this computer only "
+            "sees its own traffic. "
+            + (f"{rows[0][0]} is the biggest user I can see." if rows
+               else "") + " Your router's status page, a Pi-hole, or a "
+            "mirror port can show the others.")
+    elif not rows:
+        out["conclusion"] = "Not enough traffic yet."
+    else:
+        top = rows[0]
+        share = top[1] / total if total else 0
+        out["conclusion"] = (
+            f"{top[0]} is using the most ({share:.0%} of what I can see)."
+            if share >= 0.4 else
+            "No single device stands out; the usage is spread out.")
+        if out["unattributed"] and total and \
+                out["unattributed"] / total >= 0.2:
+            out["conclusion"] += (f" {out['unattributed'] / total:.0%} of "
+                                  f"the traffic couldn't be tied to a "
+                                  f"device.")
+    return out
+
+
+
+# ============================================================================
 #  13.  NetworkModel — the single analysis core
 #
 #  Every view (tabs, map, reports, exports, sessions) reads from this one
@@ -12625,6 +13090,7 @@ class NetworkModel:
         self.obs_recent = deque(maxlen=20000)
         self.switch_ports = {}       # (proto, chassis) → what LLDP/CDP said
         self.reported = {}           # helper name → what it reported
+        self.flow_starts = OrderedDict()   # (device, remote) → start times
         self.rtt_samples = deque(maxlen=2000)  # (ts, rtt, remote, dev, fid)
         self.obs_by_subject = {}
         self.obs_sink = False          # a history store wants observations
@@ -13720,6 +14186,13 @@ class NetworkModel:
                              also=("site:" + host,))
         if new_flow and flow is not None and flow.device_key and \
                 flow.remote_public:
+            fk = (flow.device_key, flow.remote_ip)
+            q = self.flow_starts.get(fk)
+            if q is None:
+                if len(self.flow_starts) >= 6000:
+                    self.flow_starts.popitem(last=False)
+                q = self.flow_starts[fk] = deque(maxlen=64)
+            q.append(ts)
             self.observe("flow_start", flow.device_key, ts,
                          {"remote": flow.remote_ip, "port": flow.remote_port,
                           "proto": flow.transport, "flow": flow.fid,
@@ -18791,6 +19264,11 @@ class TimelineTab(BaseTab):
                                       ["This session", "Saved history"], 14)
         self.source_box.bind("<<ComboboxSelected>>",
                              lambda e: self._on_source(), add="+")
+        self.episodes_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar2, text="Group into episodes",
+                        variable=self.episodes_var,
+                        command=self.rebuild).pack(side="left",
+                                                   padx=(0, 10))
         self.older_btn = ttk.Button(bar2, text="Load 200 older",
                                     command=self.load_older)
         self.older_btn.pack(side="left", padx=(0, 10))
@@ -18896,6 +19374,10 @@ class TimelineTab(BaseTab):
             with contextlib.suppress(tk.TclError):
                 self.tree.tag_configure(sev, foreground=fg,
                                         background=bg or "")
+        with contextlib.suppress(tk.TclError):
+            self.tree.tag_configure("episode", font=("TkDefaultFont", 10,
+                                                     "bold"),
+                                    background=self.t["card_bg"])
 
     def _schedule_rebuild(self):
         if self._rebuild_job:
@@ -18957,9 +19439,37 @@ class TimelineTab(BaseTab):
         cutoff, dev_key, q = self._filters()
         rows = [e for e in self.model.timeline
                 if self._matches(e, cutoff, dev_key, q)]
-        for e in reversed(rows[-1500:]):
-            self._insert(e)
+        if self.episodes_var.get():
+            self._insert_episodes(rows[-1500:])
+        else:
+            for e in reversed(rows[-1500:]):
+                self._insert(e)
         self._update_status()
+
+    def _insert_episodes(self, rows):
+        eps = build_episodes(rows)
+        inside = {id(e) for ep in eps for e in ep["events"]}
+        items = [(ep["end"], "ep", ep) for ep in eps] + \
+            [(e["when"], "ev", e) for e in rows if id(e) not in inside]
+        items.sort(key=lambda it: -it[0])
+        for _when, kind, obj in items:
+            if kind == "ev":
+                self._insert(obj)
+                continue
+            ep = obj
+            head = f"{LEVEL_GLYPH[ep['level']]} {ep['headline']}" + (
+                f" — likely {ep['cause']}" if ep["cause"] else "")
+            try:
+                iid = self.tree.insert(
+                    "", "end", tags=("episode",),
+                    values=("▸ Episode", fmt_clock(ep["start"]) + "–" +
+                            fmt_clock(ep["end"]), f"{len(ep['events'])} "
+                            f"events", head))
+                self.refs[iid] = None
+            except tk.TclError:
+                continue
+            for e in reversed(ep["events"]):
+                self._insert(dict(e, text="    ↳ " + e["text"]))
 
     def _on_double(self, _e=None):
         sel = self.tree.selection()
@@ -19911,6 +20421,14 @@ class AlertsTab(BaseTab):
                           state="readonly")
         sb.pack(side="left", padx=4)
         sb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
+        inv = ttk.Menubutton(bar, text="\U0001F50E Investigate…")
+        menu = tk.Menu(inv, tearoff=False)
+        menu.add_command(label="Why is my Internet slow?",
+                         command=lambda: self.app.investigate("slow"))
+        menu.add_command(label="What is using my bandwidth?",
+                         command=lambda: self.app.investigate("bandwidth"))
+        inv["menu"] = menu
+        inv.pack(side="left", padx=(12, 0))
         for label, fn in (("Copy report", self.copy_report),
                           ("Go to related", self.goto_related),
                           ("Mute for this device", self.mute_device),
@@ -20517,6 +21035,9 @@ class HealthTab(BaseTab):
         self.run_btn = ttk.Button(head, text="Run checks now",
                                   command=self.app.run_health_checks)
         self.run_btn.pack(side="right")
+        ttk.Button(head, text="\U0001F50E Why is it slow?",
+                   command=lambda: self.app.investigate("slow")).pack(
+            side="right", padx=6)
         self.note_var = tk.StringVar()
         tk.Label(outer, textvariable=self.note_var, bg=WHITE, fg="#666666",
                  justify="left", anchor="w", wraplength=1100).pack(
@@ -25369,6 +25890,139 @@ class MiniWireshark:
         return win
 
 
+    # ---- guided investigations (M11) -----------------------------------------
+    def collect_slow_facts(self, window=600):
+        wp = self._wifi_view()
+        return slow_facts(
+            self.model, wifi=dict(wp.last) if wp is not None and wp.last
+            else None, health=dict(self.model.health)
+            if self.data_mode == "live" else {},
+            dns_slow_ms=float(self.config.get("dns.slow_ms", 800)),
+            offline=self.data_mode in ("offline", "session"),
+            namer=self.short_device_name, window=window)
+
+    def collect_bandwidth_facts(self, window=600):
+        m = self.model
+        now = m.now()
+        per, unatt = Counter(), 0
+        for x in m.flows.all_flows():
+            if now - x.last_seen > window:
+                continue
+            if x.device_key:
+                per[x.device_key] += x.total_bytes
+            else:
+                unatt += x.total_bytes
+        return {"devices": [(self.short_device_name(k), b, LV_OBSERVED)
+                            for k, b in per.items()],
+                "unattributed": unatt, "window_text": human_duration(window),
+                "vantage": m.vantage.classify(
+                    offline=self.data_mode in ("offline", "session"))}
+
+    def investigate(self, which="slow"):
+        """Open the guided investigation window."""
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title("Why is my Internet slow?" if which == "slow" else
+                  "What is using my bandwidth?")
+        win.geometry("760x640")
+        win.configure(bg=t["tab_bg"])
+        top = tk.Frame(win, bg=t["tab_bg"], padx=14, pady=10)
+        top.pack(fill="x")
+        tk.Label(top, text=win.title(), bg=t["tab_bg"], fg=t["text_fg"],
+                 font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+        sub = tk.Label(top, text="", bg=t["tab_bg"], fg=t["muted_fg"],
+                       wraplength=720, justify="left")
+        sub.pack(anchor="w")
+        outer, inner = make_scrollable(win, t["tab_bg"])
+        outer.pack(fill="both", expand=True, padx=8)
+        inner.configure(bg=t["tab_bg"])
+        result = {"text": ""}
+
+        def run():
+            for w in inner.winfo_children():
+                w.destroy()
+            if which == "slow":
+                hyps = investigate_slow(self.collect_slow_facts())
+                result["hyps"] = hyps
+                v = self.model.vantage.classify(
+                    offline=self.data_mode in ("offline", "session"))
+                sub.configure(text="A ranked list of explanations with the "
+                                   "evidence for and against each. It is "
+                                   "not a verdict: the top one is the best "
+                                   "fit for what this computer can see "
+                                   f"({VANTAGE_TEXT.get(v, ('',))[0]}).")
+                lines = []
+                for h in hyps:
+                    color = {"Likely": t["danger_fg"],
+                             "Possible": t["warn_fg"],
+                             "Can't tell": t["info_fg"],
+                             "Unlikely": t["good_fg"]}[h["status"]]
+                    card = tk.Frame(inner, bg=t["card_bg"], padx=12, pady=8,
+                                    highlightthickness=1,
+                                    highlightbackground=t["border"])
+                    card.pack(fill="x", pady=4, padx=4)
+                    head = tk.Frame(card, bg=t["card_bg"])
+                    head.pack(fill="x")
+                    tk.Label(head, text=h["status"], bg=t["card_bg"],
+                             fg=color, width=11, anchor="w",
+                             font=("TkDefaultFont", 10, "bold")).pack(
+                        side="left")
+                    tk.Label(head, text=h["title"], bg=t["card_bg"],
+                             fg=t["text_fg"], anchor="w",
+                             font=("TkDefaultFont", 11, "bold")).pack(
+                        side="left")
+                    for pre, items in (("For: ", h["for"]),
+                                       ("Against: ", h["against"])):
+                        for it in items:
+                            tk.Label(card, text=pre + it, bg=t["card_bg"],
+                                     fg=t["text_fg"], anchor="w",
+                                     justify="left", wraplength=640).pack(
+                                fill="x")
+                    if h["fix"] and h["status"] != "Unlikely":
+                        tk.Label(card, text="What to try: " + h["fix"],
+                                 bg=t["card_bg"], fg=t["muted_fg"],
+                                 anchor="w", justify="left",
+                                 wraplength=640).pack(fill="x", pady=(2, 0))
+                    lines.append(f"[{h['status']}] {h['title']}\n" + "".join(
+                        f"   for: {x}\n" for x in h["for"]) + "".join(
+                        f"   against: {x}\n" for x in h["against"]) +
+                        (f"   try: {h['fix']}\n" if h["fix"] else ""))
+                result["text"] = "\n".join(lines)
+            else:
+                res = investigate_bandwidth(self.collect_bandwidth_facts())
+                result["bw"] = res
+                sub.configure(text="Counted from connections active in the "
+                                   "last 10 minutes, by device. Bytes that "
+                                   "can't be tied to a device are shown "
+                                   "separately — never guessed.")
+                tk.Label(inner, text=res["conclusion"], bg=t["tab_bg"],
+                         fg=t["text_fg"], wraplength=700, justify="left",
+                         font=("TkDefaultFont", 11, "bold")).pack(
+                    anchor="w", pady=(4, 8), padx=4)
+                for line in res["rows"]:
+                    tk.Label(inner, text=line, bg=t["tab_bg"],
+                             fg=t["text_fg"], anchor="w", justify="left",
+                             wraplength=700).pack(fill="x", padx=4)
+                if res["unattributed"]:
+                    tk.Label(inner, text=f"? {_human_bytes(res['unattributed'])}"
+                                         f" not tied to any device",
+                             bg=t["tab_bg"], fg=t["muted_fg"],
+                             anchor="w").pack(fill="x", padx=4)
+                result["text"] = res["conclusion"] + "\n" + "\n".join(
+                    res["rows"])
+        bar = tk.Frame(win, bg=t["tab_bg"], padx=14, pady=8)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Run again", command=run).pack(side="left")
+        ttk.Button(bar, text="Copy result", command=lambda:
+                   copy_to_clipboard(self, result["text"])).pack(
+            side="left", padx=6)
+        ttk.Button(bar, text="Close", command=win.destroy).pack(
+            side="right")
+        run()
+        win._mw_result = result
+        return win
+
+
     def upnp_mapping_text(self, x):
         client = x.get("InternalClient", "")
         k = self.model.registry.ip_to_key.get(client)
@@ -26245,6 +26899,10 @@ class MiniWireshark:
                              "\n".join(f"• {d}" for d in sorted(descs))))
         if dev.notes:
             sections.append(("Your notes", dev.notes))
+        per = [r for r in periodic_findings(m) if r[0] == dev.key]
+        if per:
+            sections.append(("Regular check-ins (repeating connections)",
+                             "\n".join(r[4] for r in per[:8] if r[4])))
         if dev.key == m.my_device_key():
             progs = self.this_pc_programs()
             if progs:
@@ -31954,6 +32612,150 @@ def t_connector_manager_and_kill_switch(ctx):
         httpd.shutdown()
 
 
+@self_test()
+def t_narratives_cannot_overclaim(ctx):
+    """The M11 gate: a sentence never states a claim above its evidence
+    level, and a sentence with missing data is not written at all."""
+    t = narrate("connections", device=C("TV", LV_OBSERVED),
+                count=C(14, LV_OBSERVED),
+                destination=C("video.example.net", LV_OBSERVED),
+                duration=C("2 minutes", LV_OBSERVED))
+    assert t == "◉ TV made 14 connections to video.example.net over " \
+                "2 minutes.", t
+    t = narrate("connections", device=C("TV", LV_OBSERVED),
+                count=C(14, LV_OBSERVED),
+                destination=C("video.example.net", LV_CORRELATED),
+                duration=C("2 minutes", LV_OBSERVED))
+    assert t.startswith("◎ TV appears to have made"), t
+    t = narrate("connections", device=C("TV", LV_REPORTED),
+                count=C(3, LV_REPORTED), destination=C("x.example",
+                                                      LV_REPORTED),
+                duration=C("1 hour", LV_OBSERVED))
+    assert "was reported to make" in t and t.startswith("◈"), t
+    # an Inferred claim in a slot that only takes Observed/Reported facts
+    for key, slot in (("connections", "count"), ("program", "program"),
+                      ("periodic", "repeats"), ("bandwidth", "amount")):
+        tpl = NARRATIVES[key]
+        claims = {s_: C("x", next(iter(lv))) for s_, lv in
+                  tpl.slots.items()}
+        claims[slot] = C("x", LV_INFERRED)
+        try:
+            tpl.render(**claims)
+            raise AssertionError(f"{key}.{slot} accepted an Inferred claim")
+        except NarrativeRefused:
+            pass
+    assert narrate("connections", device=C("TV", LV_OBSERVED),
+                   count=C(None, LV_OBSERVED),
+                   destination=C("x", LV_OBSERVED),
+                   duration=C("1 s", LV_OBSERVED)) is None
+    try:
+        narrate("shape", shape=C("streaming", LV_OBSERVED),
+                detail=C("6 Mbit/s", LV_OBSERVED))
+        raise AssertionError("a flow-shape guess was stated as observed")
+    except NarrativeRefused:
+        pass
+    assert narrate("shape", shape=C("streaming", LV_INFERRED),
+                   detail=C("6 Mbit/s", LV_OBSERVED)).startswith("◌")
+
+
+@self_test()
+def t_periodicity_and_episodes(ctx):
+    rng = random.Random(4)
+    starts = [1000 + i * 60 + rng.uniform(-2, 2) for i in range(15)]
+    got = detect_periodic(starts)
+    assert got and 55 < got[0] < 65 and got[1] == 14, got
+    assert detect_periodic([1000 + rng.uniform(0, 3000) for _ in
+                            range(15)]) is None
+    assert detect_periodic(starts[:8]) is None             # too few
+    assert human_period(60) == "60 s" and human_period(300) == "5 min"
+    if ctx.scapy_ok:
+        S = ScenarioBuilder
+        b = S()
+        b.t = ctx.frames()[-1][1] + 5
+        for i in range(13):                 # the plug phones home each 60 s
+            b.t += 60
+            b.tls(S.PLUG, "cloud.example.net", "52.1.2.3", size=600)
+        m = scenario_model(ctx.cfg(), ctx.frames() + b.frames)
+        per = periodic_findings(m)
+        plug = m.device_for(S.PLUG[0], S.PLUG[1])
+        mine = [r for r in per if r[0] == plug.key]
+        assert mine and "about every 60 s" in mine[0][4], per
+        assert mine[0][4].startswith("◎")        # Correlated, not Observed
+    ev = ([{"when": 100 + i, "kind": "device back", "text": f"d{i} back",
+            "severity": "INFO"} for i in range(4)] +
+          [{"when": 1000, "kind": "website", "text": "First visit",
+            "severity": "INFO", "device": "a"}] +
+          [{"when": 3000 + i * 5, "kind": "device left",
+            "text": f"x{i} left", "severity": "INFO"} for i in range(3)])
+    eps = build_episodes(ev)
+    assert [e["rule"] for e in eps] == ["reconnect_wave", "drop_wave"], eps
+    assert "4 devices (re)joined" in eps[0]["headline"]
+    assert eps[0]["level"] == LV_INFERRED and "router" in eps[0]["cause"]
+
+
+@self_test()
+def t_investigations_reach_planted_cause(ctx):
+    base = {"vantage": "endpoint", "dns_n": 40, "dns_median_ms": 20,
+            "dns_fail_rate": 0.0, "rtt_n": 20, "rtt_median_ms": 25,
+            "tcp_packets": 5000, "retrans_pct": 0.005,
+            "health": {"gateway_ok": True, "gateway_ms": 3},
+            "wifi": {"rssi": -52}}
+
+    def top(**over):
+        f = dict(base, **over)
+        return investigate_slow(f)[0]
+    h = top(wifi={"rssi": -80}, retrans_pct=0.09)
+    assert h["key"] == "wifi" and h["status"] == "Likely", h
+    h = top(dns_median_ms=1200)
+    assert h["key"] == "dns" and h["status"] == "Likely", h
+    h = top(health={"gateway_ok": False})
+    assert h["key"] == "router", h
+    h = top(rtt_median_ms=340)
+    assert h["key"] == "isp" and h["status"] == "Likely", h
+    h = top(this_pc_top=[("steam.exe (pid 9)", 9e6)])
+    assert h["key"] == "local_hog" and "steam.exe" in h["title"], h
+    h = top()
+    assert h["key"] == "cant_tell", h          # nothing visible explains it
+    hyps = investigate_slow(dict(base))
+    assert any(x["key"] == "other_hog" and x["status"] == "Can't tell"
+               for x in hyps)                  # blind spot stated
+    # evidence lines that use narratives carry their level glyph
+    h = top(this_pc_top=[("steam.exe (pid 9)", 9e6)])
+    assert h["for"][0].startswith("◉")
+    # bandwidth: honest about the vantage point
+    bw = investigate_bandwidth({"devices": [("Laptop", 9e6, LV_OBSERVED)],
+                                "vantage": "endpoint", "unattributed": 0})
+    assert "Can't tell from here" in bw["conclusion"]
+    bw = investigate_bandwidth({"devices": [("TV", 90e6, LV_OBSERVED),
+                                            ("Phone", 5e6, LV_OBSERVED)],
+                                "vantage": "mirror", "unattributed": 30e6,
+                                "window_text": "10 min"})
+    assert bw["conclusion"].startswith("TV is using the most"), bw
+    assert "couldn't be tied" in bw["conclusion"]
+    assert bw["rows"][0].startswith("◉ TV used")
+    # on a scripted replay: slow DNS answers are the planted cause
+    if not ctx.scapy_ok:
+        return
+    S = ScenarioBuilder
+    fr = []
+    t = ctx.frames()[-1][1] + 5
+    for i in range(12):
+        q = Ether(src=S.ME[1], dst=S.GW[1]) / IP(src=S.ME[0],
+                                                  dst=S.GW[0]) / \
+            UDP(sport=50000 + i, dport=53) / DNS(id=900 + i, rd=1, qd=DNSQR(
+                qname=f"s{i}.example.com"))
+        a = Ether(src=S.GW[1], dst=S.ME[1]) / IP(src=S.GW[0], dst=S.ME[0]) \
+            / UDP(sport=53, dport=50000 + i) / DNS(
+                id=900 + i, qr=1, qd=DNSQR(qname=f"s{i}.example.com"),
+                an=DNSRR(rrname=f"s{i}.example.com", rdata="93.184.215.14"))
+        fr += [(bytes(q), t + i * 2, 1), (bytes(a), t + i * 2 + 1.3, 1)]
+    m = scenario_model(ctx.cfg(), ctx.frames() + fr)
+    f = slow_facts(m, wifi={"rssi": -50},
+                   health={"gateway_ok": True, "gateway_ms": 2})
+    h = investigate_slow(f)[0]
+    assert h["key"] == "dns" and h["status"] == "Likely", (h, f["dns_median_ms"])
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -32476,6 +33278,61 @@ def _gs_sources(app, ctx):
         app.mode_ui_var.set("Beginner")
         app._on_ui_mode_change()
         app.data_mode = "idle"
+
+
+@gui_test_step("investigations, episodes and regular check-ins")
+def _gs_investigate(app, ctx):
+    root = app.root
+    S = ScenarioBuilder
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "live"
+    b = S()
+    b.t = time.time()
+    for _ in range(13):
+        b.t += 60
+        b.tls(S.PLUG, "cloud.example.net", "52.1.2.3", size=600)
+    sink = app.lossless_sink()
+    for raw, _ts, lt in ctx.frames():
+        sink(raw, time.time(), lt)
+    m.use_packet_clock = True                 # replay the check-ins in time
+    for raw, ts, lt in b.frames:
+        sink(raw, ts, lt)
+    assert _gui_pump(root, 0.3, lambda: not len(app.ring) and
+                     not app.worker.busy, timeout=30)
+    app.wifi.last = {"rssi": -80.0, "ssid": "Home"}
+    app.wifi.at = time.time() + 3600
+    w = app.investigate("slow")
+    _gui_pump(root, 0.2)
+    hyps = w._mw_result["hyps"]
+    assert hyps[0]["key"] == "wifi", [h["key"] for h in hyps]
+    assert "Weak Wi-Fi" in w._mw_result["text"]
+    w.destroy()
+    w = app.investigate("bandwidth")
+    _gui_pump(root, 0.2)
+    assert w._mw_result["bw"]["conclusion"]
+    w.destroy()
+    plug = m.device_for(S.PLUG[0], S.PLUG[1])
+    rep = dict(app.device_report(plug))
+    assert "about every 60 s" in rep.get("Regular check-ins (repeating "
+                                         "connections)", ""), rep.keys()
+    tl = app._select_tab("timeline")
+    m.push_timeline("device back", "INFO", "a back")
+    m.push_timeline("device back", "INFO", "b back")
+    m.push_timeline("device back", "INFO", "c back")
+    tl.episodes_var.set(True)
+    tl.rebuild()
+    _gui_pump(root, 0.1)
+    vals = [tl.tree.item(i, "values") for i in tl.tree.get_children()]
+    assert any(v[0] == "▸ Episode" and "(re)joined" in v[3] for v in vals), \
+        vals[:5]
+    tl.episodes_var.set(False)
+    tl.rebuild()
+    app.wifi.last = None
+    app.wifi.at = 0.0
+    app.data_mode = "idle"
 
 
 @gui_test_step("network consent: new network is quiet until trusted")
