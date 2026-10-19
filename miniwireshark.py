@@ -10070,7 +10070,7 @@ def _default_config():
                     "upgraded_from_3": False},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal",
-                       "inspector": True},
+                       "inspector": None},
         "capture": {"max_stored_events": 5000, "promiscuous": True,
                     "auto_select_interface": True,
                     "preferred_interface": "", "follow_newest": True},
@@ -13438,12 +13438,22 @@ class Inspector:
         self.legend = tk.Label(
             self.frame, text="◉ observed  ◈ reported  ◎ correlated  "
                              "◌ inferred  ? unknown", bg=WHITE,
-            fg="#666666", font=("TkDefaultFont", 8), anchor="w")
+            fg="#666666", font=("TkDefaultFont", 8), anchor="w",
+            justify="left", wraplength=self.WIDTH - 30)
         self.legend.pack(fill="x", padx=10, pady=(0, 6))
+        self.frame.bind("<Configure>", self._on_resize)
         self.current = None
         self._chip = 0
         self.on_theme()
         self._empty()
+
+    def _on_resize(self, event):
+        w = max(120, event.width - 30)
+        with contextlib.suppress(tk.TclError):
+            self.legend.configure(wraplength=w)
+            for child in self.frame.winfo_children()[0].winfo_children():
+                if isinstance(child, tk.Label) and child.cget("textvariable"):
+                    child.configure(wraplength=w - 20)
 
     # ---- rendering helpers
     def on_theme(self):
@@ -17322,7 +17332,10 @@ class MiniWireshark:
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
         self.inspector = Inspector(self, self.body)
         self.inspector_visible = False
-        if self.config.get("appearance.inspector", True):
+        want = self.config.get("appearance.inspector", None)
+        if want is None:              # first run: only on wide screens
+            want = self.root.winfo_screenwidth() >= 1700
+        if want:
             self.body.add(self.inspector.frame, weight=1)
             self.inspector_visible = True
         self._bind_inspector()
@@ -17960,7 +17973,7 @@ class MiniWireshark:
                     font=("TkDefaultFont", 11, "bold"))
         s.configure("Treeview", rowheight=26, font=("TkDefaultFont", 10))
         s.configure("Treeview.Heading", font=("TkDefaultFont", 10, "bold"))
-        s.configure("TNotebook.Tab", padding=(10, 7),
+        s.configure("TNotebook.Tab", padding=(8, 6),
                     font=("TkDefaultFont", 10, "bold"))
 
     # ---------- severity system (INFO / WARNING / DANGER) ----------------
@@ -18730,6 +18743,10 @@ class MiniWireshark:
             if m.dirty_devices:
                 keys, m.dirty_devices = m.dirty_devices, set()
                 self.tabs["devices"].update_keys(keys)
+                cur = self.inspector.current if self.inspector_visible \
+                    else None
+                if cur and cur[0] == "device" and cur[1] in keys:
+                    self.inspector.refresh()
             if m.dirty_websites:
                 keys, m.dirty_websites = m.dirty_websites, set()
                 self.tabs["websites"].update_keys(keys)
