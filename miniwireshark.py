@@ -26254,21 +26254,37 @@ class PacketsTab(BaseTab):
         nb = ttk.Notebook(bottom)
         nb.pack(fill="both", expand=True)
         tf = tk.Frame(nb, bg=WHITE)
-        self.dtree = ttk.Treeview(tf, columns=("value",), show="tree headings")
+        dpane = ttk.PanedWindow(tf, orient="horizontal")
+        dpane.pack(fill="both", expand=True)
+        tleft = tk.Frame(dpane, bg=WHITE)
+        dpane.add(tleft, weight=3)
+        self.dtree = ttk.Treeview(tleft, columns=("value",),
+                                  show="tree headings")
         self.dtree.heading("#0", text="Field")
         self.dtree.heading("value", text="Value")
         self.dtree.column("#0", width=260)
-        self.dtree.column("value", width=600, stretch=True)
+        self.dtree.column("value", width=420, stretch=True)
         self.dtree.configure(height=7)
-        dvs = ttk.Scrollbar(tf, orient="vertical", command=self.dtree.yview)
+        dvs = ttk.Scrollbar(tleft, orient="vertical",
+                            command=self.dtree.yview)
         self.dtree.configure(yscrollcommand=dvs.set)
         self.dtree.pack(side="left", fill="both", expand=True)
         dvs.pack(side="right", fill="y")
+        bf, self.bytes_view = self._scrolled(dpane)
+        self.bytes_view.configure(width=72)
+        dpane.add(bf, weight=2)
+        self._dt_ranges = {}     # details-tree item -> (offset, length)
+        self._dt_keys = {}       # details-tree item -> filter key
+        self.dtree.bind("<<TreeviewSelect>>", self._on_field_select)
+        self.field_var = tk.StringVar(value="")
         df, self.details = self._scrolled(nb)
         hf, self.hexview = self._scrolled(nb)
         nb.add(tf, text="Packet details")
         nb.add(df, text="Text dump")
         nb.add(hf, text="Hex dump")
+        tk.Label(bottom, textvariable=self.field_var, anchor="w", bg=WHITE,
+                 fg="#555555", font=("TkDefaultFont", 9)).pack(
+            side="bottom", fill="x", before=nb)
         self.matched = []        # filtered rows, in view order
         self.top = 0             # index of the first visible row
         self.slots = []          # the Treeview items that show them
@@ -26756,6 +26772,9 @@ class PacketsTab(BaseTab):
         self._detail_no = d["no"]
         pkt = packet_object(d)
         self.dtree.delete(*self.dtree.get_children())
+        self._dt_ranges, self._dt_keys = {}, {}
+        raw = d.get("raw")
+        dis = dissect(raw, d.get("linktype", 1)) if raw else None
         summary = self.dtree.insert("", "end", text="Summary", open=True,
                                     values=(d["text"],))
         for k, v in (("Direction", {"up": "Upload (to the Internet)",
@@ -26767,8 +26786,12 @@ class PacketsTab(BaseTab):
                      ("Interpretation", d.get("app_conf") or "—"),
                      ("Encryption", d.get("encrypted"))):
             self.dtree.insert(summary, "end", text=k, values=(v,))
-        try:
+        if dis is not None:
+            self._fill_dissection(dis)
+            layer = None
+        else:
             layer = pkt
+        try:
             depth = 0
             while layer is not None and depth < 12:
                 name = getattr(layer, "name", type(layer).__name__)
@@ -26791,8 +26814,19 @@ class PacketsTab(BaseTab):
         except Exception as e:                       # noqa: BLE001
             self.dtree.insert("", "end", text="(could not decode)",
                               values=(str(e),))
-        for w, fn in ((self.details, lambda: pkt.show(dump=True)),
-                      (self.hexview, lambda: hexdump(pkt, dump=True))):
+        def text_dump():
+            out = dis.text() if dis is not None else ""
+            if pkt is not None:
+                out += ("\n\n— the capture engine's own view —\n"
+                        if out else "") + pkt.show(dump=True)
+            return out or "(nothing to show)"
+
+        def hex_dump():
+            if raw:
+                return hex_dump_lines(raw)
+            return hexdump(pkt, dump=True) if pkt is not None else ""
+        for w, fn in ((self.details, text_dump), (self.hexview, hex_dump),
+                      (self.bytes_view, hex_dump)):
             w.config(state="normal")
             w.delete("1.0", "end")
             try:
@@ -26800,6 +26834,57 @@ class PacketsTab(BaseTab):
             except Exception as e:                   # noqa: BLE001
                 w.insert("end", f"<cannot show: {e}>")
             w.config(state="disabled")
+
+    def _fill_dissection(self, dis):
+        """The packet tree from MiniWireshark's own dissectors: every row
+        knows its bytes (selecting it highlights them) and its filter
+        key."""
+        dt = self.dtree
+
+        def add_fields(parent, fields):
+            for f in fields:
+                val = str(f.value)
+                if len(val) > 200:
+                    val = val[:200] + "…"
+                if f.warning:
+                    val += f"   ⚠ {f.warning}"
+                iid = dt.insert(parent, "end", text=f.name, values=(val,),
+                                open=False)
+                self._dt_ranges[iid] = (f.offset, f.length)
+                self._dt_keys[iid] = f.key
+                add_fields(iid, f.children)
+        for n in dis.nodes:
+            title = n.title + (f"  [{n.how}]" if n.how else "")
+            iid = dt.insert("", "end", text=title,
+                            values=(f"⚠ {n.warning}" if n.warning else "",),
+                            open=n.key not in ("frame", "eth", "sll"))
+            self._dt_ranges[iid] = (n.offset, n.length)
+            self._dt_keys[iid] = n.key
+            add_fields(iid, n.fields)
+
+    def _on_field_select(self, _e=None):
+        sel = self.dtree.selection()
+        if not sel:
+            return
+        rng = self._dt_ranges.get(sel[0])
+        key = self._dt_keys.get(sel[0], "")
+        meta = FIELD_REGISTRY.get(key)
+        self.field_var.set(f"{key} — {meta[2]}" if meta else key)
+        bv = self.bytes_view
+        try:
+            bv.tag_remove("hl", "1.0", "end")
+            if rng and rng[1] > 0:
+                table = PALETTES[palette_name(self.app.theme_name,
+                                              self.app.high_contrast)]
+                bv.tag_configure("hl", background=self.t["accent"],
+                                 foreground=table.get("#ffffff", "#ffffff"))
+                spans = hex_dump_ranges(*rng)
+                for a, b in spans:
+                    bv.tag_add("hl", a, b)
+                if spans:
+                    bv.see(spans[0][0])
+        except tk.TclError:
+            pass
 
     def inspect_target(self):
         d = self._selected_row()
@@ -28012,12 +28097,7 @@ class MiniWireshark:
     def show_packet_from_disk(self, no, frame):
         raw, ts, lt = frame
         d = fast_decode(raw, ts, lt)
-        pkt = packet_object(d)
-        try:
-            dump = pkt.show(dump=True) if pkt is not None else ""
-            hexd = hexdump(pkt, dump=True) if pkt is not None else raw.hex()
-        except Exception as e:                       # noqa: BLE001
-            dump, hexd = f"(could not decode: {e})", raw.hex()
+        dump, hexd = dissect(raw, lt).text(), hex_dump_lines(raw)
         DetailDialog(self, f"Packet #{no} (from the packet history)", [
             ("Summary", f"{fmt_clock(ts, True)}  {d['src']} → {d['dst']}  "
                         f"{d['proto']}  {d['length']} bytes\n{d['text']}"),
@@ -32148,14 +32228,6 @@ class MiniWireshark:
                     "cleared (save it first if you want it). Continue?",
                     parent=self.root):
                 return
-        if Ether is None:
-            if messagebox.askyesno(
-                    "Demo Mode", "Demo Mode builds its sample traffic with "
-                    "the capture engine (scapy), which isn't available "
-                    "right now. Opening a capture file still works.\n\n"
-                    "Run Repair now to install it?", parent=self.root):
-                self.repair_everything()
-            return
         self.stop()
         self._leave_nonlive()
         self._ensure_worker()
@@ -35156,9 +35228,1656 @@ def rollback_update_if_needed(force=False, script_path=None,
 #  decoder and analysis as live capture, so every tab behaves for real.
 #  Domains use the reserved ".example" names. Nothing is transmitted.
 # ============================================================================
-def build_client_hello(sni, alpn=("h2", "http/1.1"), pad=600):
+# ---- V5: a small packet builder of our own -----------------------------------
+#  Demo Mode, the scripted scenarios, the fuzzer and the benchmarks build their
+#  frames with these few layers instead of scapy, so they work on a computer
+#  where the capture engine is missing (limited mode) and produce the same
+#  bytes everywhere. Layers stack with "/" like scapy's and serialise with
+#  bytes(); lengths and checksums are filled in automatically. The self-test
+#  checks that every scripted frame is byte-identical to what scapy builds.
+def _pk_mac(s):
+    return bytes.fromhex(s.replace(":", "").replace("-", ""))
+
+
+def _pk_ip4(s):
+    return _socket.inet_aton(s)
+
+
+def _pk_ip6(s):
+    return _socket.inet_pton(_socket.AF_INET6, s)
+
+
+def _pk_csum(data):
+    if len(data) % 2:
+        data += b"\x00"
+    s = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while s >> 16:
+        s = (s & 0xFFFF) + (s >> 16)
+    return (~s) & 0xFFFF
+
+
+def _pk_name(name):
+    """DNS name → wire format (no compression, like scapy's builder)."""
+    if isinstance(name, bytes):
+        name = name.decode("ascii", "replace")
+    name = name.rstrip(".")
+    out = b""
+    for label in name.split(".") if name else []:
+        lab = label.encode("utf-8")
+        out += bytes([len(lab)]) + lab
+    return out + b"\x00"
+
+
+class PkLayer:
+    """One protocol layer; `a / b` puts b on top of a."""
+
+    FIELDS = {}
+
+    def __init__(self, *args, **kw):
+        for k, v in self.FIELDS.items():
+            setattr(self, k, v)
+        for k, v in zip(self.FIELDS, args):     # positional, in field order
+            setattr(self, k, v)
+        for k, v in kw.items():
+            if k not in self.FIELDS:
+                raise TypeError(f"{type(self).__name__} has no field {k}")
+            setattr(self, k, v)
+        self.payload = None
+        self.under = None
+
+    def copy(self):
+        c = object.__new__(type(self))
+        c.__dict__.update(self.__dict__)
+        c.payload = self.payload.copy() if self.payload is not None else None
+        if c.payload is not None:
+            c.payload.under = c
+        c.under = None
+        return c
+
+    def __truediv__(self, other):
+        if isinstance(other, (bytes, bytearray)):
+            other = PkRaw(load=bytes(other))
+        top = self.copy()
+        last = top
+        while last.payload is not None:
+            last = last.payload
+        o = other.copy()
+        last.payload = o
+        o.under = last
+        return top
+
+    def payload_bytes(self):
+        return bytes(self.payload) if self.payload is not None else b""
+
+    def build(self, pay):            # → this layer's bytes + pay
+        raise NotImplementedError
+
+    def __bytes__(self):
+        return self.build(self.payload_bytes())
+
+    def __len__(self):
+        return len(bytes(self))
+
+
+class PkRaw(PkLayer):
+    FIELDS = {"load": b""}
+
+    def build(self, pay):
+        return bytes(self.load) + pay
+
+
+class PkEther(PkLayer):
+    FIELDS = {"dst": "ff:ff:ff:ff:ff:ff", "src": "00:00:00:00:00:00",
+              "type": None}
+
+    def build(self, pay):
+        t = self.type
+        if t is None:
+            t = {PkIP: 0x0800, PkIPv6: 0x86DD, PkARP: 0x0806,
+                 PkDot1Q: 0x8100}.get(type(self.payload), 0x9000)
+        return _pk_mac(self.dst) + _pk_mac(self.src) + \
+            struct.pack("!H", t) + pay
+
+
+class PkDot1Q(PkLayer):
+    FIELDS = {"prio": 0, "id": 0, "vlan": 1, "type": None}
+
+    def build(self, pay):
+        t = self.type
+        if t is None:
+            t = {PkIP: 0x0800, PkIPv6: 0x86DD, PkARP: 0x0806}.get(
+                type(self.payload), 0x9000)
+        return struct.pack("!HH", (self.prio << 13) | (self.id << 12) |
+                           self.vlan, t) + pay
+
+
+class PkARP(PkLayer):
+    FIELDS = {"hwtype": 1, "ptype": 0x0800, "hwlen": 6, "plen": 4, "op": 1,
+              "hwsrc": "00:00:00:00:00:00", "psrc": "0.0.0.0",
+              "hwdst": "00:00:00:00:00:00", "pdst": "0.0.0.0"}
+
+    def build(self, pay):
+        return struct.pack("!HHBBH", self.hwtype, self.ptype, self.hwlen,
+                           self.plen, self.op) + _pk_mac(self.hwsrc) + \
+            _pk_ip4(self.psrc) + _pk_mac(self.hwdst) + \
+            _pk_ip4(self.pdst) + pay
+
+
+class PkIP(PkLayer):
+    FIELDS = {"tos": 0, "id": 1, "flags": 0, "frag": 0, "ttl": 64,
+              "proto": None, "src": "0.0.0.0", "dst": "127.0.0.1",
+              "options": b""}
+
+    def build(self, pay):
+        proto = self.proto
+        if proto is None:
+            proto = {PkTCP: 6, PkUDP: 17, PkICMP: 1}.get(type(self.payload),
+                                                         0)
+        opts = bytes(self.options or b"")
+        if len(opts) % 4:
+            opts += b"\x00" * (4 - len(opts) % 4)
+        hl = 20 + len(opts)
+        hdr = struct.pack("!BBHHHBBH4s4s", 0x40 | (hl // 4), self.tos,
+                          hl + len(pay),
+                          self.id, (self.flags << 13) | self.frag, self.ttl,
+                          proto, 0, _pk_ip4(self.src),
+                          _pk_ip4(self.dst)) + opts
+        c = _pk_csum(hdr)
+        return hdr[:10] + struct.pack("!H", c) + hdr[12:] + pay
+
+    def pseudo(self, proto, length):
+        return _pk_ip4(self.src) + _pk_ip4(self.dst) + \
+            struct.pack("!BBH", 0, proto, length)
+
+
+class PkIPv6(PkLayer):
+    FIELDS = {"tc": 0, "fl": 0, "nh": None, "hlim": None, "src": "::1",
+              "dst": "::1"}
+
+    def build(self, pay):
+        hlim = self.hlim
+        if hlim is None:          # neighbour discovery must arrive with 255
+            hlim = 255 if isinstance(self.payload, (
+                PkICMPv6ND_RA, PkICMPv6ND_NA)) else 64
+        nh = self.nh
+        if nh is None:
+            nh = 58 if isinstance(self.payload, _PkICMPv6) else \
+                {PkTCP: 6, PkUDP: 17}.get(type(self.payload), 59)
+        return struct.pack("!IHBB", (6 << 28) | (self.tc << 20) | self.fl,
+                           len(pay), nh, hlim) + _pk_ip6(self.src) + \
+            _pk_ip6(self.dst) + pay
+
+    def pseudo(self, proto, length):
+        return _pk_ip6(self.src) + _pk_ip6(self.dst) + \
+            struct.pack("!IxxxB", length, proto)
+
+
+def _pk_l4_csum(layer, proto, seg, zero_is_ffff=False):
+    ip = layer.under
+    if ip is None or not hasattr(ip, "pseudo"):
+        return 0
+    c = _pk_csum(ip.pseudo(proto, len(seg)) + seg)
+    if zero_is_ffff and c == 0:
+        c = 0xFFFF
+    return c
+
+
+class PkICMP(PkLayer):
+    FIELDS = {"type": 8, "code": 0, "id": 0, "seq": 0}
+
+    def build(self, pay):
+        msg = struct.pack("!BBHHH", self.type, self.code, 0, self.id,
+                          self.seq) + pay
+        return msg[:2] + struct.pack("!H", _pk_csum(msg)) + msg[4:]
+
+
+class PkUDP(PkLayer):
+    FIELDS = {"sport": 53, "dport": 53}
+
+    def build(self, pay):
+        n = 8 + len(pay)
+        seg = struct.pack("!HHHH", self.sport, self.dport, n, 0) + pay
+        c = _pk_l4_csum(self, 17, seg, zero_is_ffff=True)
+        return seg[:6] + struct.pack("!H", c) + seg[8:]
+
+
+_PK_TCP_FLAGS = {"F": 0x01, "S": 0x02, "R": 0x04, "P": 0x08, "A": 0x10,
+                 "U": 0x20, "E": 0x40, "C": 0x80}
+
+
+class PkTCP(PkLayer):
+    FIELDS = {"sport": 20, "dport": 80, "seq": 0, "ack": 0, "flags": "S",
+              "window": 8192, "urgptr": 0, "options": b""}
+
+    def build(self, pay):
+        fl = self.flags
+        if isinstance(fl, str):
+            fl = sum(_PK_TCP_FLAGS[c] for c in fl)
+        opts = bytes(self.options or b"")
+        if len(opts) % 4:
+            opts += b"\x00" * (4 - len(opts) % 4)
+        off = (20 + len(opts)) // 4
+        seg = struct.pack("!HHIIBBHHH", self.sport, self.dport,
+                          self.seq & 0xFFFFFFFF, self.ack & 0xFFFFFFFF,
+                          off << 4, fl, self.window, 0, self.urgptr) + \
+            opts + pay
+        c = _pk_l4_csum(self, 6, seg)
+        return seg[:16] + struct.pack("!H", c) + seg[18:]
+
+
+class PkBOOTP(PkLayer):
+    FIELDS = {"op": 1, "htype": 1, "hlen": 6, "hops": 0, "xid": 0, "secs": 0,
+              "flags": 0, "ciaddr": "0.0.0.0", "yiaddr": "0.0.0.0",
+              "siaddr": "0.0.0.0", "giaddr": "0.0.0.0", "chaddr": b"",
+              "sname": b"", "file": b"", "options": b""}
+
+    def build(self, pay):
+        opts = self.options
+        if not opts and isinstance(self.payload, PkDHCP):
+            opts = b"c\x82Sc"
+        return struct.pack("!BBBBIHH", self.op, self.htype, self.hlen,
+                           self.hops, self.xid, self.secs, self.flags) + \
+            _pk_ip4(self.ciaddr) + _pk_ip4(self.yiaddr) + \
+            _pk_ip4(self.siaddr) + _pk_ip4(self.giaddr) + \
+            bytes(self.chaddr)[:16].ljust(16, b"\x00") + \
+            bytes(self.sname)[:64].ljust(64, b"\x00") + \
+            bytes(self.file)[:128].ljust(128, b"\x00") + bytes(opts) + pay
+
+
+_PK_DHCP_CODES = {"subnet_mask": (1, "ip"), "router": (3, "ip"),
+                  "name_server": (6, "ip"), "hostname": (12, "bytes"),
+                  "requested_addr": (50, "ip"), "lease_time": (51, "int"),
+                  "message-type": (53, "type"), "server_id": (54, "ip"),
+                  "param_req_list": (55, "list"),
+                  "vendor_class_id": (60, "bytes"),
+                  "client_id": (61, "bytes")}
+_PK_DHCP_TYPES = {"discover": 1, "offer": 2, "request": 3, "decline": 4,
+                  "ack": 5, "nak": 6, "release": 7, "inform": 8}
+
+
+class PkDHCP(PkLayer):
+    FIELDS = {"options": ()}
+
+    def build(self, pay):
+        out = b""
+        for o in self.options:
+            if o == "end":
+                out += b"\xff"
+                continue
+            if o == "pad":
+                out += b"\x00"
+                continue
+            name, val = o[0], o[1]
+            code, kind = _PK_DHCP_CODES[name]
+            if kind == "ip":
+                data = _pk_ip4(val)
+            elif kind == "int":
+                data = struct.pack("!I", int(val))
+            elif kind == "type":
+                data = bytes([_PK_DHCP_TYPES.get(val, val)
+                              if isinstance(val, str) else int(val)])
+            elif kind == "list":
+                data = bytes(int(x) for x in val)
+            else:
+                data = val.encode() if isinstance(val, str) else bytes(val)
+            out += bytes([code, len(data)]) + data
+        return out + pay
+
+
+_PK_DNS_TYPES = {"A": 1, "NS": 2, "CNAME": 5, "PTR": 12, "TXT": 16,
+                 "AAAA": 28, "SRV": 33}
+
+
+class PkDNSQR(PkLayer):
+    FIELDS = {"qname": "www.example.com", "qtype": 1, "qclass": 1}
+
+    def build(self, pay):
+        qt = _PK_DNS_TYPES.get(self.qtype, self.qtype)
+        return _pk_name(self.qname) + struct.pack("!HH", qt,
+                                                  self.qclass) + pay
+
+
+class PkDNSRR(PkLayer):
+    FIELDS = {"rrname": ".", "type": 1, "rclass": 1, "ttl": 0, "rdata": None}
+
+    def build(self, pay):
+        t = _PK_DNS_TYPES.get(self.type, self.type)
+        rd = self.rdata
+        if t == 1:
+            data = _pk_ip4(rd or "0.0.0.0")
+        elif t == 28:
+            data = _pk_ip6(rd or "::")
+        elif t in (2, 5, 12):
+            data = _pk_name(rd or "")
+        elif t == 16:
+            items = rd if isinstance(rd, (list, tuple)) else [rd or b""]
+            data = b"".join(bytes([len(x)]) + x for x in
+                            (i.encode() if isinstance(i, str) else bytes(i)
+                             for i in items))
+        else:
+            data = bytes(rd or b"")
+        return _pk_name(self.rrname) + struct.pack(
+            "!HHIH", t, self.rclass, self.ttl, len(data)) + data + pay
+
+
+class PkDNS(PkLayer):
+    FIELDS = {"id": 0, "qr": 0, "opcode": 0, "aa": 0, "tc": 0, "rd": 1,
+              "ra": 0, "z": 0, "ad": 0, "cd": 0, "rcode": 0, "qd": (),
+              "an": None, "ns": None, "ar": None}
+
+    @staticmethod
+    def _list(v):
+        if v is None:
+            return []
+        return list(v) if isinstance(v, (list, tuple)) else [v]
+
+    def build(self, pay):
+        qd, an = self._list(self.qd), self._list(self.an)
+        ns, ar = self._list(self.ns), self._list(self.ar)
+        flags = (self.qr << 15) | (self.opcode << 11) | (self.aa << 10) | \
+            (self.tc << 9) | (self.rd << 8) | (self.ra << 7) | \
+            (self.z << 6) | (self.ad << 5) | (self.cd << 4) | self.rcode
+        body = b"".join(bytes(x) for x in qd + an + ns + ar)
+        return struct.pack("!HHHHHH", self.id, flags, len(qd), len(an),
+                           len(ns), len(ar)) + body + pay
+
+
+class _PkICMPv6(PkLayer):
+    TYPE = 0
+
+    def head(self):
+        return b""
+
+    def build(self, pay):
+        msg = struct.pack("!BBH", self.TYPE, 0, 0) + self.head() + pay
+        c = _pk_l4_csum(self, 58, msg)
+        return msg[:2] + struct.pack("!H", c) + msg[4:]
+
+
+class PkICMPv6ND_RA(_PkICMPv6):
+    TYPE = 134
+    FIELDS = {"chlim": 0, "M": 0, "O": 0, "H": 0, "prf": 1, "P": 0,
+              "routerlifetime": 1800, "reachabletime": 0, "retranstimer": 0}
+
+    def head(self):
+        b = (self.M << 7) | (self.O << 6) | (self.H << 5) | \
+            (self.prf << 3) | (self.P << 2)
+        return struct.pack("!BBHII", self.chlim, b, self.routerlifetime,
+                           self.reachabletime, self.retranstimer)
+
+
+class PkICMPv6ND_NA(_PkICMPv6):
+    TYPE = 136
+    FIELDS = {"R": 1, "S": 0, "O": 1, "tgt": "::"}
+
+    def head(self):
+        return struct.pack("!I", (self.R << 31) | (self.S << 30) |
+                           (self.O << 29)) + _pk_ip6(self.tgt)
+
+
+class _PkNDOpt(PkLayer):
+    def build(self, pay):
+        return self.body() + pay
+
+
+class PkICMPv6NDOptSrcLLAddr(_PkNDOpt):
+    FIELDS = {"lladdr": "00:00:00:00:00:00"}
+
+    def body(self):
+        return b"\x01\x01" + _pk_mac(self.lladdr)
+
+
+class PkICMPv6NDOptDstLLAddr(_PkNDOpt):
+    FIELDS = {"lladdr": "00:00:00:00:00:00"}
+
+    def body(self):
+        return b"\x02\x01" + _pk_mac(self.lladdr)
+
+
+class PkICMPv6NDOptPrefixInfo(_PkNDOpt):
+    FIELDS = {"prefixlen": 64, "L": 1, "A": 1, "R": 0,
+              "validlifetime": 0xFFFFFFFF, "preferredlifetime": 0xFFFFFFFF,
+              "prefix": "::"}
+
+    def body(self):
+        fl = (self.L << 7) | (self.A << 6) | (self.R << 5)
+        return struct.pack("!BBBBIII", 3, 4, self.prefixlen, fl,
+                           self.validlifetime, self.preferredlifetime, 0) + \
+            _pk_ip6(self.prefix)
+
+
+class PK:
+    """The builder's layers under scapy's names (PK.Ether, PK.IP, ...)."""
+    Ether, ARP, IP, IPv6, UDP, TCP, Raw = (PkEther, PkARP, PkIP, PkIPv6,
+                                           PkUDP, PkTCP, PkRaw)
+    Dot1Q, ICMP = PkDot1Q, PkICMP
+    BOOTP, DHCP, DNS, DNSQR, DNSRR = PkBOOTP, PkDHCP, PkDNS, PkDNSQR, PkDNSRR
+    ICMPv6ND_RA, ICMPv6ND_NA = PkICMPv6ND_RA, PkICMPv6ND_NA
+    ICMPv6NDOptSrcLLAddr = PkICMPv6NDOptSrcLLAddr
+    ICMPv6NDOptDstLLAddr = PkICMPv6NDOptDstLLAddr
+    ICMPv6NDOptPrefixInfo = PkICMPv6NDOptPrefixInfo
+
+
+# ============================================================================
+#  V5: packet dissection — one field model, one declarative registry
+#
+#  Every decoded value is a PacketField with its exact byte range, how it
+#  was known (observed / inferred) and a Wireshark-style filter key. Each
+#  dissector declares its fields once in FIELD_REGISTRY (key, type, unit,
+#  one-line description): the packet tree, the hex view highlight, the help
+#  glossary and the tests all read that one table. Dissection never raises:
+#  a short or malformed packet ends with a "truncated" / "malformed"
+#  warning on the last node. Secrets never reach a field value: cookies,
+#  authorization headers and mail/FTP passwords are replaced by "(hidden)".
+# ============================================================================
+LV_FIELD_OBSERVED = "observed"
+LV_FIELD_INFERRED = "inferred"
+
+FIELD_REGISTRY = {}          # key -> (type, unit, description, protocol)
+PROTOCOL_TITLES = {}         # protocol key -> title
+
+
+def declare_fields(proto, title, fields):
+    """fields: [(key, type, unit, description)]."""
+    PROTOCOL_TITLES[proto] = title
+    for key, ftype, unit, desc in fields:
+        FIELD_REGISTRY[key] = (ftype, unit, desc, proto)
+
+
+class PacketField:
+    __slots__ = ("key", "name", "value", "offset", "length", "level",
+                 "warning", "children", "raw_value")
+
+    def __init__(self, key, name, value, offset, length,
+                 level=LV_FIELD_OBSERVED, warning="", raw_value=None):
+        self.key, self.name, self.value = key, name, value
+        self.offset, self.length = offset, length
+        self.level, self.warning = level, warning
+        self.children = []
+        self.raw_value = value if raw_value is None else raw_value
+
+    def __repr__(self):
+        return f"<{self.key}={self.value!r} @{self.offset}+{self.length}>"
+
+
+class ProtocolNode:
+    __slots__ = ("key", "title", "offset", "length", "fields", "warning",
+                 "level", "how")
+
+    def __init__(self, key, title, offset, length=0,
+                 level=LV_FIELD_OBSERVED, how=""):
+        self.key, self.title, self.offset, self.length = key, title, \
+            offset, length
+        self.fields, self.warning, self.level, self.how = [], "", level, how
+
+
+class Dissection:
+    """The result: protocol nodes in order, plus helpers."""
+
+    def __init__(self, raw, linktype):
+        self.raw, self.linktype = raw, linktype
+        self.nodes = []
+
+    def all_fields(self):
+        for n in self.nodes:
+            stack = list(reversed(n.fields))
+            while stack:
+                f = stack.pop()
+                yield f
+                stack.extend(reversed(f.children))
+
+    def get(self, key):
+        """First value for a filter key (or None)."""
+        for f in self.all_fields():
+            if f.key == key:
+                return f.raw_value
+        return None
+
+    def values(self, key):
+        return [f.raw_value for f in self.all_fields() if f.key == key]
+
+    def keys(self):
+        return {f.key for f in self.all_fields()}
+
+    def warnings(self):
+        out = [(n.title, n.warning) for n in self.nodes if n.warning]
+        out += [(f.name, f.warning) for f in self.all_fields() if f.warning]
+        return out
+
+    def text(self):
+        """Plain-text tree (the Packet details pane and reports)."""
+        lines = []
+        for n in self.nodes:
+            head = n.title + (f"  [{n.how}]" if n.how else "")
+            if n.warning:
+                head += f"  ⚠ {n.warning}"
+            lines.append(head)
+
+            def walk(fields, depth):
+                for f in fields:
+                    w = f"  ⚠ {f.warning}" if f.warning else ""
+                    lines.append("    " * depth + f"{f.name}: {f.value}{w}")
+                    walk(f.children, depth + 1)
+            walk(n.fields, 1)
+        return "\n".join(lines)
+
+
+class _Cut(Exception):
+    """Raised inside a dissector when the packet ends too early."""
+
+
+class _D:
+    """Cursor over the frame used by the dissectors."""
+
+    def __init__(self, out):
+        self.out = out
+        self.raw = out.raw
+        self.node = None
+
+    def begin(self, proto, start, end=None, how="", title=None,
+              level=LV_FIELD_OBSERVED):
+        n = ProtocolNode(proto, title or PROTOCOL_TITLES.get(proto, proto),
+                         start, ((end if end is not None else len(self.raw))
+                                 - start), level, how)
+        self.out.nodes.append(n)
+        self.node = n
+        return n
+
+    def need(self, off, n):
+        if off + n > len(self.raw):
+            raise _Cut()
+
+    def add(self, key, value, off, length, display=None, parent=None,
+            warning="", level=None):
+        self.need(off, length)
+        if display is None and isinstance(value, bool):
+            display = "yes" if value else "no"
+        f = PacketField(key, _FIELD_LABELS.get(key, key),
+                        display if display is not None else value, off,
+                        length, level or (self.node.level if self.node else
+                                          LV_FIELD_OBSERVED), warning,
+                        raw_value=value)
+        (parent.children if parent is not None else self.node.fields
+         ).append(f)
+        return f
+
+    def u8(self, off):
+        self.need(off, 1)
+        return self.raw[off]
+
+    def u16(self, off):
+        self.need(off, 2)
+        return struct.unpack_from("!H", self.raw, off)[0]
+
+    def u32(self, off):
+        self.need(off, 4)
+        return struct.unpack_from("!I", self.raw, off)[0]
+
+
+def _fmt_mac(b):
+    return ":".join(f"{x:02x}" for x in b)
+
+
+def _mac_desc(b):
+    mac = _fmt_mac(b)
+    if mac == "ff:ff:ff:ff:ff:ff":
+        return f"{mac} (broadcast)"
+    v = ""
+    with contextlib.suppress(Exception):
+        v = mac_vendor(mac) if not (b[0] & 1) else ""
+    if b[0] & 1:
+        return f"{mac} (multicast)"
+    return f"{mac} ({v})" if v else mac
+
+
+_FIELD_LABELS = {}            # key -> short label shown in the tree
+
+_ETHERTYPES = {0x0800: "IPv4", 0x86DD: "IPv6", 0x0806: "ARP",
+               0x8100: "802.1Q VLAN", 0x88A8: "802.1ad (Q-in-Q)",
+               0x88CC: "LLDP", 0x888E: "802.1X (EAPOL)", 0x8863: "PPPoE",
+               0x8864: "PPPoE session", 0x88E5: "MACsec"}
+_IP_PROTOS = {1: "ICMP", 2: "IGMP", 6: "TCP", 17: "UDP", 41: "IPv6",
+              47: "GRE", 50: "ESP", 51: "AH", 58: "ICMPv6", 89: "OSPF",
+              132: "SCTP"}
+
+
+def _labels(pairs):
+    for k, lab in pairs:
+        _FIELD_LABELS[k] = lab
+
+
+# ---- the declarations ----------------------------------------------------------
+declare_fields("frame", "Frame", [
+    ("frame.len", "int", "bytes", "Frame length: bytes on the wire"),
+    ("frame.linktype", "int", "", "Link type: how the frame was captured"),
+])
+declare_fields("eth", "Ethernet II", [
+    ("eth.dst", "mac", "", "Destination: the card the frame is for"),
+    ("eth.src", "mac", "", "Source: the card that sent the frame"),
+    ("eth.type", "hex", "", "Type: which protocol is inside"),
+])
+declare_fields("vlan", "802.1Q VLAN tag", [
+    ("vlan.priority", "int", "", "Priority: 0 (lowest) to 7"),
+    ("vlan.id", "int", "", "VLAN ID: which virtual network"),
+    ("vlan.etype", "hex", "", "Type: which protocol is inside the tag"),
+])
+declare_fields("sll", "Linux cooked capture", [
+    ("sll.pkttype", "int", "", "Packet type: to us, broadcast, sent by us…"),
+    ("sll.src.eth", "mac", "", "Source: the card that sent the frame"),
+    ("sll.etype", "hex", "", "Protocol: which protocol is inside"),
+])
+declare_fields("arp", "ARP", [
+    ("arp.hw.type", "int", "", "Hardware type"),
+    ("arp.proto.type", "hex", "", "Protocol type"),
+    ("arp.opcode", "int", "", "Operation: request (who has?) or reply"),
+    ("arp.src.hw_mac", "mac", "", "Sender MAC address"),
+    ("arp.src.proto_ipv4", "ipv4", "", "Sender IP address"),
+    ("arp.dst.hw_mac", "mac", "", "Target MAC address"),
+    ("arp.dst.proto_ipv4", "ipv4", "", "Target IP address"),
+])
+declare_fields("ip", "Internet Protocol version 4", [
+    ("ip.version", "int", "", "Version"),
+    ("ip.hdr_len", "int", "bytes", "Header length"),
+    ("ip.dsfield", "hex", "", "Differentiated services (priority marking)"),
+    ("ip.len", "int", "bytes", "Total length"),
+    ("ip.id", "hex", "", "Identification: groups fragments of one packet"),
+    ("ip.flags.df", "bool", "", "Don't fragment"),
+    ("ip.flags.mf", "bool", "", "More fragments follow"),
+    ("ip.frag_offset", "int", "bytes", "Fragment offset"),
+    ("ip.ttl", "int", "hops", "Time to live: routers it may still cross"),
+    ("ip.proto", "int", "", "Protocol: what is inside"),
+    ("ip.checksum", "hex", "", "Header checksum"),
+    ("ip.checksum.status", "str", "", "Checksum check"),
+    ("ip.src", "ipv4", "", "Source address"),
+    ("ip.dst", "ipv4", "", "Destination address"),
+    ("ip.options", "bytes", "", "Options"),
+])
+declare_fields("ipv6", "Internet Protocol version 6", [
+    ("ipv6.version", "int", "", "Version"),
+    ("ipv6.tclass", "hex", "", "Traffic class (priority marking)"),
+    ("ipv6.flow", "hex", "", "Flow label"),
+    ("ipv6.plen", "int", "bytes", "Payload length"),
+    ("ipv6.nxt", "int", "", "Next header: what follows"),
+    ("ipv6.hlim", "int", "hops", "Hop limit: routers it may still cross"),
+    ("ipv6.src", "ipv6", "", "Source address"),
+    ("ipv6.dst", "ipv6", "", "Destination address"),
+    ("ipv6.ext", "str", "", "Extension header"),
+    ("ipv6.fragment.id", "hex", "", "Fragment identification"),
+    ("ipv6.fragment.offset", "int", "bytes", "Fragment offset"),
+    ("ipv6.fragment.more", "bool", "", "More fragments follow"),
+])
+declare_fields("icmp", "Internet Control Message Protocol", [
+    ("icmp.type", "int", "", "Type: what kind of message"),
+    ("icmp.code", "int", "", "Code: detail for the type"),
+    ("icmp.checksum", "hex", "", "Checksum"),
+    ("icmp.ident", "int", "", "Identifier (ping)"),
+    ("icmp.seq", "int", "", "Sequence number (ping)"),
+])
+declare_fields("icmpv6", "Internet Control Message Protocol v6", [
+    ("icmpv6.type", "int", "", "Type: what kind of message"),
+    ("icmpv6.code", "int", "", "Code: detail for the type"),
+    ("icmpv6.checksum", "hex", "", "Checksum"),
+    ("icmpv6.nd.ra.cur_hop_limit", "int", "", "Suggested hop limit"),
+    ("icmpv6.nd.ra.flag", "hex", "", "Router flags (managed, other…)"),
+    ("icmpv6.nd.ra.router_lifetime", "int", "s",
+     "Router lifetime: how long to use this router"),
+    ("icmpv6.nd.na.flag", "hex", "", "Flags (router, solicited, override)"),
+    ("icmpv6.nd.target", "ipv6", "", "Target address"),
+    ("icmpv6.opt.type", "int", "", "Option type"),
+    ("icmpv6.opt.linkaddr", "mac", "", "Link-layer address"),
+    ("icmpv6.opt.prefix", "ipv6", "", "Prefix announced to the network"),
+    ("icmpv6.opt.prefix.length", "int", "bits", "Prefix length"),
+])
+declare_fields("udp", "User Datagram Protocol", [
+    ("udp.srcport", "int", "", "Source port"),
+    ("udp.dstport", "int", "", "Destination port"),
+    ("udp.length", "int", "bytes", "Length"),
+    ("udp.checksum", "hex", "", "Checksum"),
+    ("udp.checksum.status", "str", "", "Checksum check"),
+])
+declare_fields("tcp", "Transmission Control Protocol", [
+    ("tcp.srcport", "int", "", "Source port"),
+    ("tcp.dstport", "int", "", "Destination port"),
+    ("tcp.seq_raw", "int", "", "Sequence number"),
+    ("tcp.ack_raw", "int", "", "Acknowledgment number"),
+    ("tcp.hdr_len", "int", "bytes", "Header length"),
+    ("tcp.flags", "hex", "", "Flags"),
+    ("tcp.flags.syn", "bool", "", "SYN: open a connection"),
+    ("tcp.flags.ack", "bool", "", "ACK: acknowledges data"),
+    ("tcp.flags.push", "bool", "", "PSH: hand data to the program now"),
+    ("tcp.flags.fin", "bool", "", "FIN: no more data from this side"),
+    ("tcp.flags.reset", "bool", "", "RST: abort the connection"),
+    ("tcp.flags.urg", "bool", "", "URG: urgent pointer is valid"),
+    ("tcp.window_size_value", "int", "", "Window: receive space advertised"),
+    ("tcp.checksum", "hex", "", "Checksum"),
+    ("tcp.checksum.status", "str", "", "Checksum check"),
+    ("tcp.urgent_pointer", "int", "", "Urgent pointer"),
+    ("tcp.len", "int", "bytes", "Payload length"),
+    ("tcp.options.mss_val", "int", "bytes",
+     "Maximum segment size: largest piece the sender accepts"),
+    ("tcp.options.wscale.shift", "int", "",
+     "Window scale: multiplies the window by 2^shift"),
+    ("tcp.options.sack_perm", "bool", "", "Selective acknowledgments allowed"),
+    ("tcp.options.sack", "str", "", "Selective acknowledgment blocks"),
+    ("tcp.options.timestamp.tsval", "int", "", "Timestamp value"),
+    ("tcp.options.timestamp.tsecr", "int", "", "Timestamp echo reply"),
+])
+declare_fields("dns", "Domain Name System", [
+    ("dns.id", "hex", "", "Transaction ID: pairs a question with its answer"),
+    ("dns.flags.response", "bool", "", "Message: query or response"),
+    ("dns.flags.opcode", "int", "", "Opcode"),
+    ("dns.flags.authoritative", "bool", "", "Authoritative answer"),
+    ("dns.flags.truncated", "bool", "", "Truncated"),
+    ("dns.flags.recdesired", "bool", "", "Recursion desired"),
+    ("dns.flags.recavail", "bool", "", "Recursion available"),
+    ("dns.flags.rcode", "int", "", "Reply code: did the lookup work?"),
+    ("dns.count.queries", "int", "", "Questions"),
+    ("dns.count.answers", "int", "", "Answers"),
+    ("dns.count.auth_rr", "int", "", "Authority records"),
+    ("dns.count.add_rr", "int", "", "Additional records"),
+    ("dns.qry.name", "str", "", "Name looked up"),
+    ("dns.qry.type", "int", "", "Record type asked for"),
+    ("dns.resp.name", "str", "", "Name"),
+    ("dns.resp.type", "int", "", "Record type"),
+    ("dns.resp.ttl", "int", "s", "Time to live: how long it may be cached"),
+    ("dns.a", "ipv4", "", "Address (A)"),
+    ("dns.aaaa", "ipv6", "", "Address (AAAA)"),
+    ("dns.cname", "str", "", "Alias of (CNAME)"),
+    ("dns.ptr.domain_name", "str", "", "Points to (PTR)"),
+    ("dns.txt", "str", "", "Text (TXT)"),
+    ("dns.srv.target", "str", "", "Service host (SRV)"),
+    ("dns.srv.port", "int", "", "Service port (SRV)"),
+])
+declare_fields("dhcp", "Dynamic Host Configuration Protocol", [
+    ("dhcp.type", "int", "", "Message: 1 request from a device, 2 reply"),
+    ("dhcp.id", "hex", "", "Transaction ID"),
+    ("dhcp.ip.client", "ipv4", "", "Client's current address"),
+    ("dhcp.ip.your", "ipv4", "", "Address offered to the client"),
+    ("dhcp.ip.server", "ipv4", "", "Next server address"),
+    ("dhcp.ip.relay", "ipv4", "", "Relay agent address"),
+    ("dhcp.hw.mac_addr", "mac", "", "Client hardware address"),
+    ("dhcp.cookie", "hex", "", "Magic cookie"),
+    ("dhcp.option.dhcp", "int", "", "DHCP message type"),
+    ("dhcp.option.hostname", "str", "", "Host name the device announced"),
+    ("dhcp.option.requested_ip_address", "ipv4", "", "Requested address"),
+    ("dhcp.option.ip_address_lease_time", "int", "s", "Lease time"),
+    ("dhcp.option.router", "ipv4", "", "Router"),
+    ("dhcp.option.domain_name_server", "ipv4", "", "DNS server"),
+    ("dhcp.option.dhcp_server_id", "ipv4", "", "DHCP server"),
+    ("dhcp.option.vendor_class_id", "str", "", "Vendor class"),
+    ("dhcp.option.request_list", "str", "",
+     "Parameter request list (a device fingerprint)"),
+    ("dhcp.option.client_id", "hex", "", "Client identifier"),
+    ("dhcp.option.other", "hex", "", "Other option"),
+])
+declare_fields("tls", "Transport Layer Security", [
+    ("tls.record.content_type", "int", "", "Content type"),
+    ("tls.record.version", "hex", "", "Record version"),
+    ("tls.record.length", "int", "bytes", "Record length"),
+    ("tls.handshake.type", "int", "", "Handshake type"),
+    ("tls.handshake.version", "hex", "", "Version offered"),
+    ("tls.handshake.ciphersuites_count", "int", "", "Cipher suites offered"),
+    ("tls.handshake.extensions_server_name", "str", "",
+     "Server name (SNI): the site asked for"),
+    ("tls.handshake.extensions_alpn_str", "str", "",
+     "Application protocols offered (ALPN)"),
+    ("tls.handshake.extensions.supported_version", "hex", "",
+     "Supported version"),
+    ("tls.app_data", "str", "", "Encrypted application data"),
+])
+declare_fields("quic", "QUIC", [
+    ("quic.header_form", "str", "", "Header form"),
+    ("quic.version", "hex", "", "Version"),
+    ("quic.dcid", "hex", "", "Destination connection ID"),
+    ("quic.scid", "hex", "", "Source connection ID"),
+    ("quic.long.packet_type", "str", "", "Packet type"),
+    ("quic.payload", "str", "", "Protected payload"),
+])
+declare_fields("http", "Hypertext Transfer Protocol", [
+    ("http.request.method", "str", "", "Method"),
+    ("http.request.uri", "str", "", "Path asked for"),
+    ("http.request.version", "str", "", "Version"),
+    ("http.response.code", "int", "", "Status code"),
+    ("http.response.phrase", "str", "", "Status text"),
+    ("http.host", "str", "", "Host: the site asked for"),
+    ("http.user_agent", "str", "", "User agent: the program asking"),
+    ("http.server", "str", "", "Server software"),
+    ("http.content_length", "int", "bytes", "Content length"),
+    ("http.header", "str", "", "Header"),
+])
+declare_fields("ntp", "Network Time Protocol", [
+    ("ntp.flags.li", "int", "", "Leap indicator"),
+    ("ntp.flags.vn", "int", "", "Version"),
+    ("ntp.flags.mode", "int", "", "Mode: 3 client, 4 server"),
+    ("ntp.stratum", "int", "", "Stratum: distance from a reference clock"),
+    ("ntp.xmt", "str", "", "Transmit time"),
+])
+declare_fields("text", "Text protocol", [
+    ("text.line", "str", "", "Line"),
+])
+declare_fields("data", "Data", [
+    ("data.len", "int", "bytes", "Bytes not decoded further"),
+])
+_labels([(k, v[2].split(":")[0]) for k, v in FIELD_REGISTRY.items()])
+
+_ARP_OPS = {1: "request (who has?)", 2: "reply"}
+_ICMP_TYPES = {0: "Echo reply (ping answer)", 3: "Destination unreachable",
+               5: "Redirect", 8: "Echo request (ping)", 11: "Time exceeded"}
+_ICMPV6_TYPES = {1: "Destination unreachable", 2: "Packet too big",
+                 3: "Time exceeded", 128: "Echo request (ping)",
+                 129: "Echo reply", 133: "Router solicitation",
+                 134: "Router advertisement", 135: "Neighbour solicitation",
+                 136: "Neighbour advertisement", 143: "Multicast listener "
+                 "report v2"}
+_DNS_TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX",
+              16: "TXT", 28: "AAAA", 33: "SRV", 41: "OPT", 47: "NSEC",
+              64: "SVCB", 65: "HTTPS", 255: "ANY"}
+_DNS_RCODES = {0: "no error", 1: "format error", 2: "server failure",
+               3: "no such name", 4: "not implemented", 5: "refused"}
+_DHCP_MSG = {1: "Discover", 2: "Offer", 3: "Request", 4: "Decline",
+             5: "ACK", 6: "NAK", 7: "Release", 8: "Inform"}
+_TLS_CT = {20: "Change cipher spec", 21: "Alert", 22: "Handshake",
+           23: "Application data", 24: "Heartbeat"}
+_TLS_HS = {1: "Client Hello", 2: "Server Hello", 4: "New session ticket",
+           8: "Encrypted extensions", 11: "Certificate", 12: "Server key "
+           "exchange", 13: "Certificate request", 14: "Server hello done",
+           15: "Certificate verify", 16: "Client key exchange",
+           20: "Finished"}
+_TLS_VER = {0x0300: "SSL 3.0", 0x0301: "TLS 1.0", 0x0302: "TLS 1.1",
+            0x0303: "TLS 1.2", 0x0304: "TLS 1.3"}
+_HIDDEN_HEADERS = {"cookie", "set-cookie", "authorization",
+                   "proxy-authorization", "x-api-key", "x-auth-token"}
+_TEXT_PORTS = {21: "FTP", 25: "SMTP", 110: "POP3", 143: "IMAP", 587: "SMTP",
+               22: "SSH", 23: "Telnet", 119: "NNTP", 6667: "IRC"}
+_SECRET_CMDS = re.compile(
+    rb"^(?:(?P<tag>[A-Za-z0-9.]+\s+)?(?P<cmd>PASS|AUTH|LOGIN|APOP|"
+    rb"AUTHENTICATE)\b)(?P<rest>.*)$", re.I)
+
+
+def _verify_l4(d, proto, off, length, csum_off, kind):
+    """Checksum check of a TCP/UDP/ICMPv6 segment in place."""
+    ipn = next((n for n in reversed(d.out.nodes) if n.key in ("ip",
+                                                              "ipv6")), None)
+    if ipn is None or off + length > len(d.raw):
+        return "not checked"
+    raw = d.raw
+    seg = bytearray(raw[off:off + length])
+    if seg[csum_off:csum_off + 2] == b"\x00\x00" and kind == "udp":
+        return "none (allowed for UDP over IPv4)"
+    seg[csum_off:csum_off + 2] = b"\x00\x00"
+    if ipn.key == "ip":
+        pseudo = raw[ipn.offset + 12:ipn.offset + 20] + struct.pack(
+            "!BBH", 0, proto, length)
+    else:
+        pseudo = raw[ipn.offset + 8:ipn.offset + 40] + struct.pack(
+            "!IxxxB", length, proto)
+    c = _pk_csum(pseudo + bytes(seg))
+    if kind == "udp" and c == 0:
+        c = 0xFFFF
+    want = struct.unpack_from("!H", raw, off + csum_off)[0]
+    return "correct" if c == want else "incorrect"
+
+
+def _dns_name(raw, off, base, depth=0):
+    """→ (name, end offset of the name in place). Follows compression."""
+    labels, end, jumps = [], None, 0
+    while True:
+        if off >= len(raw):
+            raise _Cut()
+        ln = raw[off]
+        if ln == 0:
+            off += 1
+            break
+        if ln & 0xC0 == 0xC0:
+            if off + 1 >= len(raw):
+                raise _Cut()
+            ptr = ((ln & 0x3F) << 8) | raw[off + 1]
+            if end is None:
+                end = off + 2
+            off = base + ptr
+            jumps += 1
+            if jumps > 20:
+                raise ValueError("DNS name loop")
+            continue
+        off += 1
+        labels.append(raw[off:off + ln].decode("utf-8", "replace"))
+        off += ln
+        if len(labels) > 64:
+            raise ValueError("DNS name too long")
+    return ".".join(labels) or "<root>", (end if end is not None else off)
+
+
+def _dissect_dns(d, off, end, how, tcp=False):
+    if tcp:
+        d.begin("dns", off, end, how)
+        ln = d.u16(off)
+        d.add("data.len", ln, off, 2, f"{ln} (DNS over TCP length)")
+        off += 2
+    else:
+        d.begin("dns", off, end, how)
+    base = off
+    d.add("dns.id", d.u16(off), off, 2, f"0x{d.u16(off):04x}")
+    fl = d.u16(off + 2)
+    ff = d.add("dns.flags.response", bool(fl & 0x8000), off + 2, 2,
+               "response" if fl & 0x8000 else "query")
+    for key, bit in (("dns.flags.authoritative", 0x0400),
+                     ("dns.flags.truncated", 0x0200),
+                     ("dns.flags.recdesired", 0x0100),
+                     ("dns.flags.recavail", 0x0080)):
+        d.add(key, bool(fl & bit), off + 2, 2, parent=ff)
+    d.add("dns.flags.opcode", (fl >> 11) & 15, off + 2, 2, parent=ff)
+    rc = fl & 15
+    d.add("dns.flags.rcode", rc, off + 2, 2,
+          f"{rc} ({_DNS_RCODES.get(rc, 'other')})", parent=ff,
+          warning="" if rc in (0,) or not fl & 0x8000 else
+          _DNS_RCODES.get(rc, "error"))
+    counts = [d.u16(off + 4 + 2 * i) for i in range(4)]
+    for key, i in (("dns.count.queries", 0), ("dns.count.answers", 1),
+                   ("dns.count.auth_rr", 2), ("dns.count.add_rr", 3)):
+        d.add(key, counts[i], off + 4 + 2 * i, 2)
+    p = off + 12
+    for _ in range(min(counts[0], 50)):
+        name, q_end = _dns_name(d.raw, p, base)
+        qt = d.u16(q_end)
+        q = d.add("dns.qry.name", name, p, q_end + 4 - p,
+                  f"{name}  (type {_DNS_TYPES.get(qt, qt)})")
+        d.add("dns.qry.type", qt, q_end, 2,
+              f"{_DNS_TYPES.get(qt, qt)} ({qt})", parent=q)
+        p = q_end + 4
+    for _ in range(min(sum(counts[1:]), 100)):
+        name, n_end = _dns_name(d.raw, p, base)
+        t, _cls, ttl, rdl = struct.unpack_from("!HHIH", d.raw, n_end) \
+            if n_end + 10 <= len(d.raw) else (None, 0, 0, 0)
+        if t is None:
+            raise _Cut()
+        rd = n_end + 10
+        d.need(rd, rdl)
+        tname = _DNS_TYPES.get(t, str(t))
+        rr = d.add("dns.resp.name", name, p, rd + rdl - p,
+                   f"{name}  {tname}")
+        d.add("dns.resp.type", t, n_end, 2, f"{tname} ({t})", parent=rr)
+        if t != 41:
+            d.add("dns.resp.ttl", ttl, n_end + 4, 4, f"{ttl} s", parent=rr)
+        if t == 1 and rdl == 4:
+            v = _socket.inet_ntoa(d.raw[rd:rd + 4])
+            d.add("dns.a", v, rd, 4, parent=rr)
+            rr.value += f"  {v}"
+        elif t == 28 and rdl == 16:
+            v = _socket.inet_ntop(_socket.AF_INET6, d.raw[rd:rd + 16])
+            d.add("dns.aaaa", v, rd, 16, parent=rr)
+            rr.value += f"  {v}"
+        elif t in (5, 12, 2):
+            v, _e = _dns_name(d.raw, rd, base)
+            d.add("dns.cname" if t == 5 else "dns.ptr.domain_name" if
+                  t == 12 else "dns.resp.name", v, rd, rdl, parent=rr)
+            rr.value += f"  {v}"
+        elif t == 16:
+            q = rd
+            while q < rd + rdl:
+                ln = d.raw[q]
+                txt = d.raw[q + 1:q + 1 + ln].decode("utf-8", "replace")
+                d.add("dns.txt", txt, q, 1 + ln, parent=rr)
+                q += 1 + ln
+        elif t == 33 and rdl >= 7:
+            port = struct.unpack_from("!H", d.raw, rd + 4)[0]
+            v, _e = _dns_name(d.raw, rd + 6, base)
+            d.add("dns.srv.port", port, rd + 4, 2, parent=rr)
+            d.add("dns.srv.target", v, rd + 6, rdl - 6, parent=rr)
+            rr.value += f"  {v}:{port}"
+        p = rd + rdl
+
+
+def _dissect_dhcp(d, off, end, how):
+    d.begin("dhcp", off, end, how)
+    op = d.u8(off)
+    d.add("dhcp.type", op, off, 1, f"{op} ({'request' if op == 1 else 'reply'})")
+    d.add("dhcp.id", d.u32(off + 4), off + 4, 4, f"0x{d.u32(off + 4):08x}")
+    for key, o in (("dhcp.ip.client", 12), ("dhcp.ip.your", 16),
+                   ("dhcp.ip.server", 20), ("dhcp.ip.relay", 24)):
+        d.need(off + o, 4)
+        d.add(key, _socket.inet_ntoa(d.raw[off + o:off + o + 4]), off + o, 4)
+    d.need(off + 28, 6)
+    d.add("dhcp.hw.mac_addr", _fmt_mac(d.raw[off + 28:off + 34]), off + 28,
+          16, _mac_desc(d.raw[off + 28:off + 34]))
+    p = off + 236
+    if d.raw[p:p + 4] != b"c\x82Sc":
+        return
+    d.add("dhcp.cookie", 0x63825363, p, 4, "DHCP")
+    p += 4
+    while p < end:
+        code = d.u8(p)
+        if code == 255:
+            d.add("dhcp.option.other", 255, p, 1, "End")
+            break
+        if code == 0:
+            p += 1
+            continue
+        ln = d.u8(p + 1)
+        d.need(p + 2, ln)
+        v = d.raw[p + 2:p + 2 + ln]
+        ip = _socket.inet_ntoa(v[:4]) if ln >= 4 else ""
+        if code == 53 and ln == 1:
+            d.add("dhcp.option.dhcp", v[0], p, 2 + ln,
+                  f"{_DHCP_MSG.get(v[0], v[0])} ({v[0]})")
+        elif code == 12:
+            d.add("dhcp.option.hostname", v.decode("utf-8", "replace"), p,
+                  2 + ln)
+        elif code == 50 and ln == 4:
+            d.add("dhcp.option.requested_ip_address", ip, p, 2 + ln)
+        elif code == 51 and ln == 4:
+            s = struct.unpack("!I", v)[0]
+            d.add("dhcp.option.ip_address_lease_time", s, p, 2 + ln,
+                  f"{s} s ({human_duration(s)})")
+        elif code == 3 and ln >= 4:
+            d.add("dhcp.option.router", ip, p, 2 + ln)
+        elif code == 6 and ln >= 4:
+            d.add("dhcp.option.domain_name_server", ip, p, 2 + ln,
+                  ", ".join(_socket.inet_ntoa(v[i:i + 4])
+                            for i in range(0, ln - ln % 4, 4)))
+        elif code == 54 and ln == 4:
+            d.add("dhcp.option.dhcp_server_id", ip, p, 2 + ln)
+        elif code == 60:
+            d.add("dhcp.option.vendor_class_id",
+                  v.decode("utf-8", "replace"), p, 2 + ln)
+        elif code == 55:
+            d.add("dhcp.option.request_list", ",".join(str(x) for x in v),
+                  p, 2 + ln)
+        elif code == 61:
+            d.add("dhcp.option.client_id", v.hex(), p, 2 + ln)
+        else:
+            d.add("dhcp.option.other", code, p, 2 + ln,
+                  f"option {code}: {v[:32].hex()}")
+        p += 2 + ln
+
+
+def _dissect_tls(d, off, end, how):
+    d.begin("tls", off, end, how)
+    p = off
+    n = 0
+    while p + 5 <= end and n < 16:
+        ct, ver, ln = d.raw[p], d.u16(p + 1), d.u16(p + 3)
+        if ct not in _TLS_CT or ver >> 8 != 3:
+            break
+        rec = d.add("tls.record.content_type", ct, p, min(5 + ln, end - p),
+                    f"{_TLS_CT[ct]} ({ct})")
+        d.add("tls.record.version", ver, p + 1, 2,
+              _TLS_VER.get(ver, f"0x{ver:04x}"), parent=rec)
+        d.add("tls.record.length", ln, p + 3, 2, parent=rec)
+        body = p + 5
+        if p + 5 + ln > end:
+            rec.warning = "continues in the next segment"
+        if ct == 22 and body + 4 <= end:
+            ht = d.raw[body]
+            hs = d.add("tls.handshake.type", ht, body, 4,
+                       f"{_TLS_HS.get(ht, ht)} ({ht})", parent=rec)
+            if ht in (1, 2) and body + 6 <= end:
+                _tls_hello(d, body + 4, min(end, body + 4 + ((
+                    d.raw[body + 1] << 16) | d.u16(body + 2))), ht, hs)
+        elif ct == 23:
+            d.add("tls.app_data", f"{ln} bytes", body,
+                  min(ln, end - body), "encrypted — content is not "
+                  "visible", parent=rec)
+        p += 5 + ln
+        n += 1
+
+
+def _tls_hello(d, p, end, ht, parent):
+    try:
+        ver = d.u16(p)
+        d.add("tls.handshake.version", ver, p, 2,
+              _TLS_VER.get(ver, f"0x{ver:04x}"), parent=parent)
+        p += 2 + 32
+        sid = d.u8(p)
+        p += 1 + sid
+        if ht == 1:
+            n = d.u16(p)
+            d.add("tls.handshake.ciphersuites_count", n // 2, p, 2 + n,
+                  parent=parent)
+            p += 2 + n
+            p += 1 + d.u8(p)
+        else:
+            p += 3
+        if p + 2 > end:
+            return
+        ext_end = min(end, p + 2 + d.u16(p))
+        p += 2
+        while p + 4 <= ext_end:
+            et, el = d.u16(p), d.u16(p + 2)
+            body = p + 4
+            if et == 0 and el >= 5:
+                nl = d.u16(body + 3)
+                host = d.raw[body + 5:body + 5 + nl].decode("ascii",
+                                                             "replace")
+                d.add("tls.handshake.extensions_server_name", host, p,
+                      4 + el, parent=parent)
+            elif et == 16 and el >= 2:
+                q, names = body + 2, []
+                while q < body + el:
+                    ln = d.raw[q]
+                    names.append(d.raw[q + 1:q + 1 + ln].decode("ascii",
+                                                                "replace"))
+                    q += 1 + ln
+                d.add("tls.handshake.extensions_alpn_str", ", ".join(names),
+                      p, 4 + el, parent=parent)
+            elif et == 43:
+                vals = d.raw[body + (1 if ht == 1 else 0):body + el]
+                for i in range(0, len(vals) - 1, 2):
+                    v = struct.unpack_from("!H", vals, i)[0]
+                    d.add("tls.handshake.extensions.supported_version", v,
+                          p, 4 + el, _TLS_VER.get(v, f"0x{v:04x}"),
+                          parent=parent)
+            p = body + el
+    except _Cut:
+        parent.warning = "continues in the next segment"
+
+
+def _dissect_quic(d, off, end, how):
+    d.begin("quic", off, end, how)
+    b0 = d.u8(off)
+    if not b0 & 0x80:
+        d.add("quic.header_form", "short", off, 1,
+              "short header (after the handshake)")
+        d.add("quic.payload", f"{end - off - 1} bytes", off + 1,
+              end - off - 1, "encrypted — content is not visible")
+        return
+    d.add("quic.header_form", "long", off, 1, "long header (handshake)")
+    ver = d.u32(off + 1)
+    d.add("quic.version", ver, off + 1, 4,
+          {1: "1 (RFC 9000)", 0x6B3343CF: "2 (RFC 9369)", 0: "version "
+           "negotiation"}.get(ver, f"0x{ver:08x}"))
+    ptype = (b0 >> 4) & 3
+    d.add("quic.long.packet_type", ptype, off, 1,
+          ("Initial", "0-RTT", "Handshake", "Retry")[ptype])
+    p = off + 5
+    dl = d.u8(p)
+    d.add("quic.dcid", d.raw[p + 1:p + 1 + dl].hex(), p, 1 + dl)
+    p += 1 + dl
+    sl = d.u8(p)
+    d.add("quic.scid", d.raw[p + 1:p + 1 + sl].hex(), p, 1 + sl)
+    p += 1 + sl
+    d.add("quic.payload", f"{max(0, end - p)} bytes", p, max(0, end - p),
+          "protected — only the first packet's site name can be read, "
+          "and only by decrypting it with keys anyone can derive")
+
+
+def _dissect_http(d, off, end, how):
+    data = d.raw[off:end]
+    head, sep, _body = data.partition(b"\r\n\r\n")
+    lines = head.split(b"\r\n")
+    first = lines[0].decode("latin-1", "replace")
+    d.begin("http", off, end, how)
+    m = re.match(r"^([A-Z]+) (\S+) (HTTP/\d\.\d)$", first)
+    r = re.match(r"^(HTTP/\d\.\d) (\d{3}) ?(.*)$", first)
+    if m:
+        d.add("http.request.method", m.group(1), off, len(m.group(1)))
+        uri = m.group(2)
+        d.add("http.request.uri", uri, off + len(m.group(1)) + 1, len(uri),
+              uri if len(uri) < 200 else uri[:200] + "…")
+        d.add("http.request.version", m.group(3), off + len(first) -
+              len(m.group(3)), len(m.group(3)))
+    elif r:
+        d.add("http.request.version", r.group(1), off, len(r.group(1)))
+        d.add("http.response.code", int(r.group(2)), off + 9, 3)
+        d.add("http.response.phrase", r.group(3), off + 13,
+              max(0, len(first) - 13))
+    else:
+        d.add("text.line", first[:200], off, len(lines[0]))
+    p = off + len(lines[0]) + 2
+    for line in lines[1:60]:
+        k, _c, v = line.decode("latin-1", "replace").partition(":")
+        v = v.strip()
+        kl = k.strip().lower()
+        shown = "(hidden: may contain a password or session)" \
+            if kl in _HIDDEN_HEADERS else v[:200]
+        key = {"host": "http.host", "user-agent": "http.user_agent",
+               "server": "http.server",
+               "content-length": "http.content_length"}.get(kl,
+                                                            "http.header")
+        val = int(v) if key == "http.content_length" and v.isdigit() \
+            else (shown if key == "http.header" else v[:200])
+        d.add(key, val, p, len(line), f"{k.strip()}: {shown}"
+              if key == "http.header" else None)
+        p += len(line) + 2
+    if not sep:
+        d.node.warning = "headers continue in the next segment"
+
+
+def _dissect_text_lines(d, off, end, proto_name, how):
+    d.begin("text", off, end, how, title=f"{proto_name} (text)")
+    p = off
+    for line in d.raw[off:end].split(b"\n")[:30]:
+        clean = line.rstrip(b"\r")
+        m = _SECRET_CMDS.match(clean)
+        if m:
+            shown = ((m.group("tag") or b"") + m.group("cmd")).decode(
+                "latin-1", "replace") + " (hidden: credentials)"
+        else:
+            shown = clean.decode("utf-8", "replace")[:200]
+        if clean or p < end:
+            d.add("text.line", shown, p, len(line))
+        p += len(line) + 1
+        if p >= end:
+            break
+
+
+def _dissect_ntp(d, off, end, how):
+    d.begin("ntp", off, end, how)
+    b0 = d.u8(off)
+    d.add("ntp.flags.li", b0 >> 6, off, 1)
+    d.add("ntp.flags.vn", (b0 >> 3) & 7, off, 1)
+    mode = b0 & 7
+    mname = {3: "client", 4: "server", 5: "broadcast"}.get(mode, "other")
+    d.add("ntp.flags.mode", mode, off, 1, f"{mode} ({mname})")
+    d.add("ntp.stratum", d.u8(off + 1), off + 1, 1)
+    sec = d.u32(off + 40)
+    d.add("ntp.xmt", sec, off + 40, 8,
+          "not set" if sec == 0 else fmt_clock(sec - 2208988800, True))
+
+
+def _app_layer(d, off, end, transport, sport, dport):
+    """Pick the application dissector: by content first, then by port."""
+    if end <= off:
+        return
+    data = d.raw[off:end]
+    ports = (sport, dport)
+    if transport == "tcp":
+        if data[:1] in (b"\x14", b"\x15", b"\x16", b"\x17") and \
+                data[1:2] == b"\x03":
+            return _dissect_tls(d, off, end, "recognised from the content")
+        if re.match(rb"^(GET|POST|PUT|HEAD|DELETE|OPTIONS|PATCH|CONNECT) "
+                    rb"\S+ HTTP/1\.[01]\r\n|^HTTP/1\.[01] \d{3}", data):
+            return _dissect_http(d, off, end, "recognised from the content")
+        if 53 in ports:
+            return _dissect_dns(d, off, end, "port 53", tcp=True)
+        for p in ports:
+            if p in _TEXT_PORTS:
+                return _dissect_text_lines(d, off, end, _TEXT_PORTS[p],
+                                           f"port {p}")
+        if data.startswith(b"SSH-"):
+            return _dissect_text_lines(d, off, end, "SSH",
+                                       "recognised from the content")
+    else:
+        if ports[0] in (67, 68) or ports[1] in (67, 68):
+            return _dissect_dhcp(d, off, end, "port 67/68")
+        dns_ports = [p for p in ports if p in (53, 5353, 5355)]
+        if dns_ports:
+            return _dissect_dns(d, off, end, f"port {dns_ports[0]}")
+        if 123 in ports and len(data) >= 48:
+            return _dissect_ntp(d, off, end, "port 123")
+        if 443 in ports and data[:1] and (data[0] & 0x40):
+            return _dissect_quic(d, off, end, "port 443")
+        if 1900 in ports:
+            return _dissect_http(d, off, end, "port 1900 (SSDP)")
+    d.begin("data", off, end)
+    d.add("data.len", end - off, off, end - off, f"{end - off} bytes")
+
+
+def _dissect_tcp(d, off, end):
+    d.begin("tcp", off, end)
+    sp, dp = d.u16(off), d.u16(off + 2)
+    d.add("tcp.srcport", sp, off, 2)
+    d.add("tcp.dstport", dp, off + 2, 2)
+    d.add("tcp.seq_raw", d.u32(off + 4), off + 4, 4)
+    d.add("tcp.ack_raw", d.u32(off + 8), off + 8, 4)
+    hl = (d.u8(off + 12) >> 4) * 4
+    d.add("tcp.hdr_len", hl, off + 12, 1, f"{hl} bytes",
+          warning="" if hl >= 20 else "too short")
+    fl = d.u8(off + 13)
+    names = [n for n, b in (("FIN", 1), ("SYN", 2), ("RST", 4), ("PSH", 8),
+                            ("ACK", 16), ("URG", 32)) if fl & b]
+    ff = d.add("tcp.flags", fl, off + 12, 2, f"0x{fl:03x} "
+               f"({', '.join(names) or 'none'})")
+    for key, b in (("tcp.flags.syn", 2), ("tcp.flags.ack", 16),
+                   ("tcp.flags.push", 8), ("tcp.flags.fin", 1),
+                   ("tcp.flags.reset", 4), ("tcp.flags.urg", 32)):
+        d.add(key, bool(fl & b), off + 13, 1, parent=ff)
+    d.add("tcp.window_size_value", d.u16(off + 14), off + 14, 2)
+    d.add("tcp.checksum", d.u16(off + 16), off + 16, 2,
+          f"0x{d.u16(off + 16):04x}")
+    st = _verify_l4(d, 6, off, end - off, 16, "tcp")
+    d.add("tcp.checksum.status", st, off + 16, 2, warning="checksum does "
+          "not match (normal for packets this computer sends when the card "
+          "computes it)" if st == "incorrect" else "")
+    d.add("tcp.urgent_pointer", d.u16(off + 18), off + 18, 2)
+    p, oend = off + 20, off + max(20, hl)
+    while p < oend:
+        kind = d.u8(p)
+        if kind == 0:
+            break
+        if kind == 1:
+            p += 1
+            continue
+        ln = d.u8(p + 1)
+        if ln < 2:
+            d.node.warning = "malformed TCP option"
+            break
+        if kind == 2 and ln == 4:
+            d.add("tcp.options.mss_val", d.u16(p + 2), p, 4)
+        elif kind == 3 and ln == 3:
+            d.add("tcp.options.wscale.shift", d.u8(p + 2), p, 3,
+                  f"{d.u8(p + 2)} (×{1 << min(d.u8(p + 2), 14)})")
+        elif kind == 4:
+            d.add("tcp.options.sack_perm", True, p, ln)
+        elif kind == 5:
+            blocks = [f"{d.u32(p + 2 + i)}-{d.u32(p + 6 + i)}"
+                      for i in range(0, ln - 2, 8)]
+            d.add("tcp.options.sack", ", ".join(blocks), p, ln)
+        elif kind == 8 and ln == 10:
+            d.add("tcp.options.timestamp.tsval", d.u32(p + 2), p + 2, 4)
+            d.add("tcp.options.timestamp.tsecr", d.u32(p + 6), p + 6, 4)
+        p += ln
+    pay = off + hl
+    d.add("tcp.len", max(0, end - pay), off, 0, f"{max(0, end - pay)} bytes")
+    _app_layer(d, pay, end, "tcp", sp, dp)
+
+
+def _dissect_udp(d, off, end):
+    d.begin("udp", off, end)
+    sp, dp, ln = d.u16(off), d.u16(off + 2), d.u16(off + 4)
+    d.add("udp.srcport", sp, off, 2)
+    d.add("udp.dstport", dp, off + 2, 2)
+    d.add("udp.length", ln, off + 4, 2, warning="" if off + ln <= len(
+        d.raw) else "longer than the packet (truncated)")
+    d.add("udp.checksum", d.u16(off + 6), off + 6, 2,
+          f"0x{d.u16(off + 6):04x}")
+    seg_end = min(end, off + ln) if ln >= 8 else end
+    st = _verify_l4(d, 17, off, seg_end - off, 6, "udp")
+    d.add("udp.checksum.status", st, off + 6, 2,
+          warning="checksum does not match" if st == "incorrect" else "")
+    _app_layer(d, off + 8, seg_end, "udp", sp, dp)
+
+
+def _dissect_icmp(d, off, end):
+    d.begin("icmp", off, end)
+    t, c = d.u8(off), d.u8(off + 1)
+    d.add("icmp.type", t, off, 1, f"{t} ({_ICMP_TYPES.get(t, 'other')})")
+    d.add("icmp.code", c, off + 1, 1)
+    d.add("icmp.checksum", d.u16(off + 2), off + 2, 2,
+          f"0x{d.u16(off + 2):04x}")
+    if t in (0, 8):
+        d.add("icmp.ident", d.u16(off + 4), off + 4, 2)
+        d.add("icmp.seq", d.u16(off + 6), off + 6, 2)
+
+
+def _dissect_icmpv6(d, off, end):
+    d.begin("icmpv6", off, end)
+    t, c = d.u8(off), d.u8(off + 1)
+    d.add("icmpv6.type", t, off, 1, f"{t} ({_ICMPV6_TYPES.get(t, 'other')})")
+    d.add("icmpv6.code", c, off + 1, 1)
+    d.add("icmpv6.checksum", d.u16(off + 2), off + 2, 2,
+          f"0x{d.u16(off + 2):04x}")
+    p = off + 4
+    if t == 134:
+        d.add("icmpv6.nd.ra.cur_hop_limit", d.u8(p), p, 1)
+        d.add("icmpv6.nd.ra.flag", d.u8(p + 1), p + 1, 1,
+              f"0x{d.u8(p + 1):02x}")
+        d.add("icmpv6.nd.ra.router_lifetime", d.u16(p + 2), p + 2, 2,
+              f"{d.u16(p + 2)} s")
+        p += 12
+    elif t in (135, 136):
+        if t == 136:
+            d.add("icmpv6.nd.na.flag", d.u32(p) >> 29, p, 4,
+                  ", ".join(n for n, b in (("router", 4), ("solicited", 2),
+                                           ("override", 1))
+                            if (d.u32(p) >> 29) & b) or "none")
+        d.need(p + 4, 16)
+        d.add("icmpv6.nd.target", _socket.inet_ntop(
+            _socket.AF_INET6, d.raw[p + 4:p + 20]), p + 4, 16)
+        p += 20
+    elif t == 133:
+        p += 4
+    else:
+        return
+    while p + 2 <= end:
+        ot, ol = d.u8(p), d.u8(p + 1) * 8
+        if ol == 0:
+            d.node.warning = "malformed option (length 0)"
+            break
+        o = d.add("icmpv6.opt.type", ot, p, ol, {1: "Source link-layer "
+                                                  "address", 2: "Target "
+                                                  "link-layer address",
+                                                  3: "Prefix information",
+                                                  5: "MTU", 25: "DNS "
+                                                  "servers (RDNSS)"}.get(
+            ot, f"option {ot}"))
+        if ot in (1, 2) and ol >= 8:
+            d.add("icmpv6.opt.linkaddr", _fmt_mac(d.raw[p + 2:p + 8]), p + 2,
+                  6, _mac_desc(d.raw[p + 2:p + 8]), parent=o)
+        elif ot == 3 and ol >= 32:
+            d.add("icmpv6.opt.prefix.length", d.u8(p + 2), p + 2, 1,
+                  parent=o)
+            d.need(p + 16, 16)
+            d.add("icmpv6.opt.prefix", _socket.inet_ntop(
+                _socket.AF_INET6, d.raw[p + 16:p + 32]), p + 16, 16,
+                parent=o)
+        p += ol
+
+
+def _dissect_ipv4(d, off):
+    d.begin("ip", off)
+    b0 = d.u8(off)
+    hl = (b0 & 15) * 4
+    tl = d.u16(off + 2)
+    end = min(len(d.raw), off + tl) if tl >= hl else len(d.raw)
+    d.node.length = end - off
+    d.add("ip.version", b0 >> 4, off, 1)
+    d.add("ip.hdr_len", hl, off, 1, f"{hl} bytes",
+          warning="" if hl >= 20 else "too short")
+    d.add("ip.dsfield", d.u8(off + 1), off + 1, 1, f"0x{d.u8(off + 1):02x}")
+    d.add("ip.len", tl, off + 2, 2, warning="" if off + tl <= len(d.raw)
+          else "longer than the captured frame (truncated capture)")
+    d.add("ip.id", d.u16(off + 4), off + 4, 2, f"0x{d.u16(off + 4):04x}")
+    fr = d.u16(off + 6)
+    d.add("ip.flags.df", bool(fr & 0x4000), off + 6, 1)
+    d.add("ip.flags.mf", bool(fr & 0x2000), off + 6, 1)
+    fo = (fr & 0x1FFF) * 8
+    d.add("ip.frag_offset", fo, off + 6, 2)
+    d.add("ip.ttl", d.u8(off + 8), off + 8, 1)
+    proto = d.u8(off + 9)
+    d.add("ip.proto", proto, off + 9, 1,
+          f"{_IP_PROTOS.get(proto, 'other')} ({proto})")
+    d.add("ip.checksum", d.u16(off + 10), off + 10, 2,
+          f"0x{d.u16(off + 10):04x}")
+    d.need(off, hl)
+    hdr = bytearray(d.raw[off:off + hl])
+    hdr[10:12] = b"\x00\x00"
+    ok = _pk_csum(bytes(hdr)) == d.u16(off + 10)
+    d.add("ip.checksum.status", "correct" if ok else "incorrect", off + 10, 2,
+          warning="" if ok else "checksum does not match (normal for "
+          "packets this computer sends when the card computes it)")
+    d.add("ip.src", _socket.inet_ntoa(d.raw[off + 12:off + 16]), off + 12, 4)
+    d.add("ip.dst", _socket.inet_ntoa(d.raw[off + 16:off + 20]), off + 16, 4)
+    if hl > 20:
+        d.add("ip.options", d.raw[off + 20:off + hl].hex(), off + 20, hl - 20)
+    if fr & 0x2000 or fo:
+        d.node.warning = (f"fragment at offset {fo}"
+                          + (" (more follow)" if fr & 0x2000 else
+                             " (last piece)"))
+        if fo:
+            d.begin("data", off + hl, end)
+            d.add("data.len", end - off - hl, off + hl, end - off - hl,
+                  f"{end - off - hl} bytes (rest of a fragmented packet)")
+            return
+    _next_proto(d, proto, off + hl, end)
+
+
+def _dissect_ipv6(d, off):
+    d.begin("ipv6", off)
+    w = d.u32(off)
+    plen = d.u16(off + 4)
+    end = min(len(d.raw), off + 40 + plen)
+    d.node.length = end - off
+    d.add("ipv6.version", w >> 28, off, 1)
+    d.add("ipv6.tclass", (w >> 20) & 0xFF, off, 2, f"0x{(w >> 20) & 0xFF:02x}")
+    d.add("ipv6.flow", w & 0xFFFFF, off + 1, 3, f"0x{w & 0xFFFFF:05x}")
+    d.add("ipv6.plen", plen, off + 4, 2, warning="" if off + 40 + plen <=
+          len(d.raw) else "longer than the captured frame")
+    nh = d.u8(off + 6)
+    d.add("ipv6.nxt", nh, off + 6, 1, f"{_IP_PROTOS.get(nh, nh)} ({nh})")
+    d.add("ipv6.hlim", d.u8(off + 7), off + 7, 1)
+    d.need(off + 8, 32)
+    d.add("ipv6.src", _socket.inet_ntop(_socket.AF_INET6,
+                                        d.raw[off + 8:off + 24]), off + 8, 16)
+    d.add("ipv6.dst", _socket.inet_ntop(_socket.AF_INET6,
+                                        d.raw[off + 24:off + 40]), off + 24,
+          16)
+    p = off + 40
+    hops = 0
+    while nh in (0, 43, 44, 60) and hops < 8:
+        hops += 1
+        nxt = d.u8(p)
+        if nh == 44:
+            fo = d.u16(p + 2)
+            x = d.add("ipv6.ext", "fragment", p, 8, "Fragment header")
+            d.add("ipv6.fragment.offset", (fo >> 3) * 8, p + 2, 2, parent=x)
+            d.add("ipv6.fragment.more", bool(fo & 1), p + 2, 2, parent=x)
+            d.add("ipv6.fragment.id", d.u32(p + 4), p + 4, 4,
+                  f"0x{d.u32(p + 4):08x}", parent=x)
+            if fo >> 3:
+                d.node.warning = "fragment (not the first piece)"
+                return
+            p += 8
+        else:
+            ln = (d.u8(p + 1) + 1) * 8
+            d.add("ipv6.ext", {0: "hop-by-hop", 43: "routing",
+                               60: "destination options"}[nh], p, ln)
+            p += ln
+        nh = nxt
+    _next_proto(d, nh, p, end)
+
+
+def _next_proto(d, proto, off, end):
+    if proto == 6:
+        _dissect_tcp(d, off, end)
+    elif proto == 17:
+        _dissect_udp(d, off, end)
+    elif proto == 1:
+        _dissect_icmp(d, off, end)
+    elif proto == 58:
+        _dissect_icmpv6(d, off, end)
+    elif end > off:
+        d.begin("data", off, end)
+        d.add("data.len", end - off, off, end - off,
+              f"{end - off} bytes ({_IP_PROTOS.get(proto, 'protocol')} "
+              f"{proto})")
+
+
+def _dissect_ethertype(d, et, off):
+    if et == 0x0800:
+        _dissect_ipv4(d, off)
+    elif et == 0x86DD:
+        _dissect_ipv6(d, off)
+    elif et == 0x0806:
+        d.begin("arp", off, min(len(d.raw), off + 28))
+        d.add("arp.hw.type", d.u16(off), off, 2)
+        d.add("arp.proto.type", d.u16(off + 2), off + 2, 2,
+              f"0x{d.u16(off + 2):04x}")
+        op = d.u16(off + 6)
+        d.add("arp.opcode", op, off + 6, 2, f"{op} ({_ARP_OPS.get(op, '?')})")
+        d.need(off + 8, 20)
+        d.add("arp.src.hw_mac", _fmt_mac(d.raw[off + 8:off + 14]), off + 8,
+              6, _mac_desc(d.raw[off + 8:off + 14]))
+        d.add("arp.src.proto_ipv4", _socket.inet_ntoa(
+            d.raw[off + 14:off + 18]), off + 14, 4)
+        d.add("arp.dst.hw_mac", _fmt_mac(d.raw[off + 18:off + 24]), off + 18,
+              6)
+        d.add("arp.dst.proto_ipv4", _socket.inet_ntoa(
+            d.raw[off + 24:off + 28]), off + 24, 4)
+    elif et in (0x8100, 0x88A8):
+        d.begin("vlan", off, off + 4)
+        tci = d.u16(off)
+        d.add("vlan.priority", tci >> 13, off, 2)
+        d.add("vlan.id", tci & 0xFFF, off, 2)
+        inner = d.u16(off + 2)
+        d.add("vlan.etype", inner, off + 2, 2,
+              f"{_ETHERTYPES.get(inner, 'other')} (0x{inner:04x})")
+        _dissect_ethertype(d, inner, off + 4)
+    elif off < len(d.raw):
+        d.begin("data", off)
+        d.add("data.len", len(d.raw) - off, off, len(d.raw) - off,
+              f"{len(d.raw) - off} bytes ({_ETHERTYPES.get(et, 'type')} "
+              f"0x{et:04x})")
+
+
+def dissect(raw, linktype=1):
+    """Raw frame → Dissection. Never raises."""
+    raw = bytes(raw or b"")
+    out = Dissection(raw, linktype)
+    d = _D(out)
+    d.begin("frame", 0, len(raw), title=f"Frame: {len(raw)} bytes")
+    d.add("frame.len", len(raw), 0, 0, f"{len(raw)} bytes")
+    d.add("frame.linktype", linktype, 0, 0,
+          {1: "Ethernet", 101: "raw IP", 12: "raw IP", 113: "Linux cooked",
+           228: "raw IPv4", 229: "raw IPv6"}.get(linktype, str(linktype)))
+    try:
+        if linktype == 1:
+            d.begin("eth", 0, 14)
+            d.need(0, 14)
+            d.add("eth.dst", _fmt_mac(raw[0:6]), 0, 6, _mac_desc(raw[0:6]))
+            d.add("eth.src", _fmt_mac(raw[6:12]), 6, 6, _mac_desc(raw[6:12]))
+            et = d.u16(12)
+            d.add("eth.type", et, 12, 2,
+                  f"{_ETHERTYPES.get(et, 'other')} (0x{et:04x})")
+            if et >= 0x0600:
+                _dissect_ethertype(d, et, 14)
+        elif linktype in (101, 12, 228, 229):
+            v = raw[0] >> 4 if raw else 0
+            (_dissect_ipv4 if v == 4 else _dissect_ipv6)(d, 0)
+        elif linktype == 113:
+            d.begin("sll", 0, 16)
+            d.add("sll.pkttype", d.u16(0), 0, 2)
+            alen = d.u16(4)
+            d.add("sll.src.eth", _fmt_mac(raw[6:6 + min(alen, 6)]), 6, 8)
+            et = d.u16(14)
+            d.add("sll.etype", et, 14, 2,
+                  f"{_ETHERTYPES.get(et, 'other')} (0x{et:04x})")
+            _dissect_ethertype(d, et, 16)
+        else:
+            d.begin("data", 0)
+            d.add("data.len", len(raw), 0, len(raw),
+                  f"{len(raw)} bytes (link type {linktype})")
+    except _Cut:
+        if out.nodes:
+            out.nodes[-1].warning = (out.nodes[-1].warning + "; "
+                                     if out.nodes[-1].warning else "") + \
+                "truncated: the packet ends early"
+    except (ValueError, IndexError, struct.error, OSError) as e:
+        if out.nodes:
+            out.nodes[-1].warning = f"malformed ({e})"
+    return out
+
+
+def hex_dump_lines(raw):
+    """Hex view text: 16 bytes per line, offset · hex · ASCII."""
+    out = []
+    for i in range(0, len(raw), 16):
+        chunk = raw[i:i + 16]
+        hx = " ".join(f"{b:02x}" for b in chunk)
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        out.append(f"{i:04x}  {hx:<47}  {asc}")
+    return "\n".join(out)
+
+
+def hex_dump_ranges(offset, length):
+    """Tk text index ranges (start, end) covering bytes [offset, offset +
+    length) in hex_dump_lines() output, for both the hex and ASCII
+    columns."""
+    out = []
+    end = offset + max(1, length)
+    p = offset
+    while p < end:
+        line = p // 16
+        a, b = p % 16, min(16, (end - line * 16))
+        out.append((f"{line + 1}.{6 + 3 * a}", f"{line + 1}.{6 + 3 * b - 1}"))
+        out.append((f"{line + 1}.{55 + a}", f"{line + 1}.{55 + b}"))
+        p = (line + 1) * 16
+    return out
+
+
+def build_client_hello(sni, alpn=("h2", "http/1.1"), pad=600, rnd=None):
     """A syntactically valid TLS 1.3-style ClientHello (used by Demo Mode
-    and the self-tests)."""
+    and the self-tests). `rnd` = the 32-byte client random (scenarios pass
+    a seeded one so their bytes never change)."""
     host = sni.encode("ascii")
     ext_sni = struct.pack(">HHHBH", 0, len(host) + 5, len(host) + 3, 0,
                           len(host)) + host
@@ -35167,13 +36886,14 @@ def build_client_hello(sni, alpn=("h2", "http/1.1"), pad=600):
     ext_ver = struct.pack(">HHB", 43, 5, 4) + b"\x03\x04\x03\x03"
     ext_pad = struct.pack(">HH", 21, pad) + b"\x00" * pad
     exts = ext_ver + ext_pad + ext_alpn + ext_sni
-    body = (b"\x03\x03" + os.urandom(32) + b"\x00" + b"\x00\x04\x13\x01\x13"
+    body = (b"\x03\x03" + (rnd or os.urandom(32)) + b"\x00" + b"\x00\x04\x13\x01\x13"
             b"\x02" + b"\x01\x00" + struct.pack(">H", len(exts)) + exts)
     hs = b"\x01" + struct.pack(">I", len(body))[1:] + body
     return b"\x16\x03\x01" + struct.pack(">H", len(hs)) + hs
 
 
 class DemoGenerator(threading.Thread):
+    L = PK                    # our own packet builder: works without scapy
     GW = ("192.168.50.1", "02:00:5e:10:00:01")
     ME = ("192.168.50.10", "02:00:5e:10:00:10")
     DEVICES = [
@@ -35214,7 +36934,7 @@ class DemoGenerator(threading.Thread):
         self.sink(bytes(p), time.time(), 1, lambda: self.stop_flag)
 
     def _eth(self, src, dst):
-        return Ether(src=src[1], dst=dst[1] if isinstance(dst, tuple)
+        return self.L.Ether(src=src[1], dst=dst[1] if isinstance(dst, tuple)
                      else dst)
 
     def _dhcp(self, ip, mac, host, vc):
@@ -35224,47 +36944,47 @@ class DemoGenerator(threading.Thread):
             opts.append(("hostname", host.encode()))
         if vc:
             opts.append(("vendor_class_id", vc.encode()))
-        self._emit(Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
-                   IP(src="0.0.0.0", dst="255.255.255.255") /
-                   UDP(sport=68, dport=67) / BOOTP(chaddr=chaddr) /
-                   DHCP(options=opts + ["end"]))
-        self._emit(Ether(src=self.GW[1], dst=mac) /
-                   IP(src=self.GW[0], dst=ip) / UDP(sport=67, dport=68) /
-                   BOOTP(op=2, yiaddr=ip, chaddr=chaddr) /
-                   DHCP(options=[("message-type", "ack"),
+        self._emit(self.L.Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+                   self.L.IP(src="0.0.0.0", dst="255.255.255.255") /
+                   self.L.UDP(sport=68, dport=67) / self.L.BOOTP(chaddr=chaddr) /
+                   self.L.DHCP(options=opts + ["end"]))
+        self._emit(self.L.Ether(src=self.GW[1], dst=mac) /
+                   self.L.IP(src=self.GW[0], dst=ip) / self.L.UDP(sport=67, dport=68) /
+                   self.L.BOOTP(op=2, yiaddr=ip, chaddr=chaddr) /
+                   self.L.DHCP(options=[("message-type", "ack"),
                                  ("lease_time", 86400),
                                  ("router", self.GW[0]),
                                  ("name_server", self.GW[0]), "end"]))
 
     def _mdns(self, ip, mac, svc, name, txt):
         txtv = [f"{k}={v}".encode() for k, v in txt.items()]
-        self._emit(Ether(src=mac, dst="01:00:5e:00:00:fb") /
-                   IP(src=ip, dst="224.0.0.251", ttl=255) /
-                   UDP(sport=5353, dport=5353) /
-                   DNS(qr=1, aa=1, qd=None,
-                       an=DNSRR(rrname=f"{svc}.local", type="PTR",
+        self._emit(self.L.Ether(src=mac, dst="01:00:5e:00:00:fb") /
+                   self.L.IP(src=ip, dst="224.0.0.251", ttl=255) /
+                   self.L.UDP(sport=5353, dport=5353) /
+                   self.L.DNS(qr=1, aa=1, qd=None,
+                       an=self.L.DNSRR(rrname=f"{svc}.local", type="PTR",
                                 rdata=f"{name}.{svc}.local"),
-                       ar=[DNSRR(rrname=f"{name}.{svc}.local", type="TXT",
+                       ar=[self.L.DNSRR(rrname=f"{name}.{svc}.local", type="TXT",
                                  rdata=txtv),
-                           DNSRR(rrname=f"{name.replace(' ', '-')}.local",
+                           self.L.DNSRR(rrname=f"{name.replace(' ', '-')}.local",
                                  rdata=ip)]))
 
     def _visit_quic(self, dev, site, sip, sp, size):
         """An HTTP/3 visit: the first packet names the site (readable by
         design), everything after it is opaque."""
         ip, mac = dev[0], dev[1]
-        base = Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=sip) / \
-            UDP(sport=sp, dport=443)
-        back = Ether(src=self.GW[1], dst=mac) / IP(src=sip, dst=ip, ttl=54) \
-            / UDP(sport=443, dport=sp)
+        base = self.L.Ether(src=mac, dst=self.GW[1]) / self.L.IP(src=ip, dst=sip) / \
+            self.L.UDP(sport=sp, dport=443)
+        back = self.L.Ether(src=self.GW[1], dst=mac) / self.L.IP(src=sip, dst=ip, ttl=54) \
+            / self.L.UDP(sport=443, dport=sp)
         dcid = os.urandom(8)
-        self._emit(base / Raw(quic_build_initial(
+        self._emit(base / self.L.Raw(quic_build_initial(
             dcid, os.urandom(4), tls_client_hello(site))))
         time.sleep(random.uniform(0.018, 0.045))
         sent = 0
         while sent < size and not self.stop_flag:
             chunk = min(1250, size - sent)
-            self._emit(back / Raw(b"\x40" + os.urandom(8) +
+            self._emit(back / self.L.Raw(b"\x40" + os.urandom(8) +
                                   b"\x00" * (chunk - 9)))
             sent += chunk
 
@@ -35273,38 +36993,38 @@ class DemoGenerator(threading.Thread):
         self.port += 1
         sp = self.port
         qid = random.randint(1, 65000)
-        self._emit(Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=self.GW[0])
-                   / UDP(sport=sp, dport=53) /
-                   DNS(id=qid, rd=1, qd=DNSQR(qname=site)))
+        self._emit(self.L.Ether(src=mac, dst=self.GW[1]) / self.L.IP(src=ip, dst=self.GW[0])
+                   / self.L.UDP(sport=sp, dport=53) /
+                   self.L.DNS(id=qid, rd=1, qd=self.L.DNSQR(qname=site)))
         time.sleep(0.02)
-        self._emit(Ether(src=self.GW[1], dst=mac) / IP(src=self.GW[0], dst=ip)
-                   / UDP(sport=53, dport=sp) /
-                   DNS(id=qid, qr=1, qd=DNSQR(qname=site),
-                       an=DNSRR(rrname=site, rdata=sip, ttl=300)))
+        self._emit(self.L.Ether(src=self.GW[1], dst=mac) / self.L.IP(src=self.GW[0], dst=ip)
+                   / self.L.UDP(sport=53, dport=sp) /
+                   self.L.DNS(id=qid, qr=1, qd=self.L.DNSQR(qname=site),
+                       an=self.L.DNSRR(rrname=site, rdata=sip, ttl=300)))
         seq = random.randint(1000, 10 ** 9)
-        base = Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=sip)
-        back = Ether(src=self.GW[1], dst=mac) / IP(src=sip, dst=ip, ttl=54)
+        base = self.L.Ether(src=mac, dst=self.GW[1]) / self.L.IP(src=ip, dst=sip)
+        back = self.L.Ether(src=self.GW[1], dst=mac) / self.L.IP(src=sip, dst=ip, ttl=54)
         if random.random() < 0.3:
             self._visit_quic(dev, site, sip, sp, size)
             return
-        self._emit(base / TCP(sport=sp, dport=443, flags="S", seq=seq))
+        self._emit(base / self.L.TCP(sport=sp, dport=443, flags="S", seq=seq))
         time.sleep(random.uniform(0.018, 0.045))     # an Internet round trip
-        self._emit(back / TCP(sport=443, dport=sp, flags="SA", seq=7,
+        self._emit(back / self.L.TCP(sport=443, dport=sp, flags="SA", seq=7,
                               ack=seq + 1))
         hello = build_client_hello(site)
-        self._emit(base / TCP(sport=sp, dport=443, flags="PA", seq=seq + 1) /
-                   Raw(hello))
+        self._emit(base / self.L.TCP(sport=sp, dport=443, flags="PA", seq=seq + 1) /
+                   self.L.Raw(hello))
         sent = 0
         s2 = 8
         while sent < size and not self.stop_flag:
             chunk = min(1400, size - sent)
-            self._emit(back / TCP(sport=443, dport=sp, flags="A", seq=s2) /
-                       Raw(b"\x17\x03\x03" + b"\x00" * (chunk - 3)))
+            self._emit(back / self.L.TCP(sport=443, dport=sp, flags="A", seq=s2) /
+                       self.L.Raw(b"\x17\x03\x03" + b"\x00" * (chunk - 3)))
             s2 += chunk
             sent += chunk
-        self._emit(base / TCP(sport=sp, dport=443, flags="FA",
+        self._emit(base / self.L.TCP(sport=sp, dport=443, flags="FA",
                               seq=seq + 1 + len(hello)))
-        self._emit(back / TCP(sport=443, dport=sp, flags="FA", seq=s2))
+        self._emit(back / self.L.TCP(sport=443, dport=sp, flags="FA", seq=s2))
 
     def run(self):
         try:
@@ -35315,26 +37035,26 @@ class DemoGenerator(threading.Thread):
     def _run(self):
         gw, me = self.GW, self.ME
         for dev in [me] + self.DEVICES:
-            self._emit(Ether(src=dev[1], dst="ff:ff:ff:ff:ff:ff") /
-                       ARP(op=1, psrc=dev[0], pdst=gw[0], hwsrc=dev[1]))
-            self._emit(Ether(src=gw[1], dst=dev[1]) /
-                       ARP(op=2, psrc=gw[0], hwsrc=gw[1], pdst=dev[0],
+            self._emit(self.L.Ether(src=dev[1], dst="ff:ff:ff:ff:ff:ff") /
+                       self.L.ARP(op=1, psrc=dev[0], pdst=gw[0], hwsrc=dev[1]))
+            self._emit(self.L.Ether(src=gw[1], dst=dev[1]) /
+                       self.L.ARP(op=2, psrc=gw[0], hwsrc=gw[1], pdst=dev[0],
                            hwdst=dev[1]))
-            self._emit(Ether(src=dev[1], dst=gw[1]) /
-                       ARP(op=2, psrc=dev[0], hwsrc=dev[1], pdst=gw[0],
+            self._emit(self.L.Ether(src=dev[1], dst=gw[1]) /
+                       self.L.ARP(op=2, psrc=dev[0], hwsrc=dev[1], pdst=gw[0],
                            hwdst=gw[1]))
         for ip, mac, host, vc, md in self.DEVICES:
             self._dhcp(ip, mac, host, vc)
             if md:
                 self._mdns(ip, mac, *md)
-        self._emit(Ether(src=gw[1], dst="33:33:00:00:00:01") /
-                   IPv6(src="fe80::1", dst="ff02::1") / ICMPv6ND_RA() /
-                   ICMPv6NDOptSrcLLAddr(lladdr=gw[1]))
+        self._emit(self.L.Ether(src=gw[1], dst="33:33:00:00:00:01") /
+                   self.L.IPv6(src="fe80::1", dst="ff02::1") / self.L.ICMPv6ND_RA() /
+                   self.L.ICMPv6NDOptSrcLLAddr(lladdr=gw[1]))
         tv = self.DEVICES[1]
-        self._emit(Ether(src=tv[1], dst="01:00:5e:7f:ff:fa") /
-                   IP(src=tv[0], dst="239.255.255.250") /
-                   UDP(sport=1900, dport=1900) /
-                   Raw(b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+        self._emit(self.L.Ether(src=tv[1], dst="01:00:5e:7f:ff:fa") /
+                   self.L.IP(src=tv[0], dst="239.255.255.250") /
+                   self.L.UDP(sport=1900, dport=1900) /
+                   self.L.Raw(b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
                        b"NT: urn:dial-multiscreen-org:service:dial:1\r\n"
                        b"SERVER: Linux/4.9 UPnP/1.0 Chromecast/1.56\r\n\r\n"))
         tick = 0
@@ -35349,14 +37069,14 @@ class DemoGenerator(threading.Thread):
                 (8000, 20000, 60000)) * (8 if big else 1))
             if tick % 4 == 0:
                 plug = self.DEVICES[3]
-                self._emit(Ether(src=plug[1], dst=gw[1]) /
-                           IP(src=plug[0], dst="129.6.15.28") /
-                           UDP(sport=12345, dport=123) / Raw(b"\x1b" +
+                self._emit(self.L.Ether(src=plug[1], dst=gw[1]) /
+                           self.L.IP(src=plug[0], dst="129.6.15.28") /
+                           self.L.UDP(sport=12345, dport=123) / self.L.Raw(b"\x1b" +
                                                               b"\x00" * 47))
             if tick % 6 == 0:
                 for dv in self.DEVICES:
-                    self._emit(Ether(src=dv[1], dst=me[1]) /
-                               ARP(op=2, psrc=dv[0], hwsrc=dv[1],
+                    self._emit(self.L.Ether(src=dv[1], dst=me[1]) /
+                               self.L.ARP(op=2, psrc=dv[0], hwsrc=dv[1],
                                    pdst=me[0], hwdst=me[1]))
             elapsed = time.time() - self.t0
             if elapsed > 45 and not late_done:
@@ -35367,27 +37087,27 @@ class DemoGenerator(threading.Thread):
             if elapsed > 25 and not ftp_done:
                 ftp_done = True
                 pr = self.DEVICES[2]
-                b = Ether(src=pr[1], dst=gw[1]) / IP(src=pr[0],
+                b = self.L.Ether(src=pr[1], dst=gw[1]) / self.L.IP(src=pr[0],
                                                      dst="34.117.59.81")
-                self._emit(b / TCP(sport=40500, dport=21, flags="S"))
-                self._emit(Ether(src=gw[1], dst=pr[1]) /
-                           IP(src="34.117.59.81", dst=pr[0]) /
-                           TCP(sport=21, dport=40500, flags="SA"))
-                self._emit(b / TCP(sport=40500, dport=21, flags="PA") /
-                           Raw(b"USER scanner\r\n"))
+                self._emit(b / self.L.TCP(sport=40500, dport=21, flags="S"))
+                self._emit(self.L.Ether(src=gw[1], dst=pr[1]) /
+                           self.L.IP(src="34.117.59.81", dst=pr[0]) /
+                           self.L.TCP(sport=21, dport=40500, flags="SA"))
+                self._emit(b / self.L.TCP(sport=40500, dport=21, flags="PA") /
+                           self.L.Raw(b"USER scanner\r\n"))
             if elapsed > 35 and not ssh_done:
                 ssh_done = True
                 ph = self.DEVICES[0]
-                self._emit(Ether(src=ph[1], dst=me[1]) /
-                           IP(src=ph[0], dst=me[0]) /
-                           TCP(sport=50022, dport=22, flags="S"))
-                self._emit(Ether(src=me[1], dst=ph[1]) /
-                           IP(src=me[0], dst=ph[0]) /
-                           TCP(sport=22, dport=50022, flags="SA"))
-                self._emit(Ether(src=me[1], dst=ph[1]) /
-                           IP(src=me[0], dst=ph[0]) /
-                           TCP(sport=22, dport=50022, flags="PA") /
-                           Raw(b"SSH-2.0-OpenSSH_9.6\r\n"))
+                self._emit(self.L.Ether(src=ph[1], dst=me[1]) /
+                           self.L.IP(src=ph[0], dst=me[0]) /
+                           self.L.TCP(sport=50022, dport=22, flags="S"))
+                self._emit(self.L.Ether(src=me[1], dst=ph[1]) /
+                           self.L.IP(src=me[0], dst=ph[0]) /
+                           self.L.TCP(sport=22, dport=50022, flags="SA"))
+                self._emit(self.L.Ether(src=me[1], dst=ph[1]) /
+                           self.L.IP(src=me[0], dst=ph[0]) /
+                           self.L.TCP(sport=22, dport=50022, flags="PA") /
+                           self.L.Raw(b"SSH-2.0-OpenSSH_9.6\r\n"))
             for _ in range(int(random.uniform(8, 20))):
                 if self.stop_flag:
                     return
@@ -35408,7 +37128,12 @@ SCENARIO_T0 = 1_760_000_000.0
 
 
 class ScenarioBuilder:
-    """Builds lists of (raw_bytes, timestamp, linktype) frames."""
+    """Builds lists of (raw_bytes, timestamp, linktype) frames with
+    MiniWireshark's own packet builder (PK), so scenarios, the fuzzer and
+    the benchmarks run without scapy. `layers` swaps in another builder
+    with the same names (the self-test compares against scapy's)."""
+
+    L = PK
 
     GW = ("192.168.1.1", "00:1e:58:aa:00:01")
     ME = ("192.168.1.10", "3c:7c:3f:10:00:10")
@@ -35425,7 +37150,9 @@ class ScenarioBuilder:
              "plain.example.org": "34.117.59.81",
              "files.example.org": "34.117.59.81"}
 
-    def __init__(self, t0=SCENARIO_T0, seed=7):
+    def __init__(self, t0=SCENARIO_T0, seed=7, layers=None):
+        if layers is not None:
+            self.L = layers
         self.t = t0
         self.frames = []
         self.rng = random.Random(seed)
@@ -35443,13 +37170,13 @@ class ScenarioBuilder:
 
     def arp_announce(self, host):
         ip, mac = host[0], host[1]
-        self._emit(Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
-                   ARP(op=1, psrc=ip, pdst=self.GW[0], hwsrc=mac))
-        self._emit(Ether(src=self.GW[1], dst=mac) /
-                   ARP(op=2, psrc=self.GW[0], hwsrc=self.GW[1], pdst=ip,
+        self._emit(self.L.Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+                   self.L.ARP(op=1, psrc=ip, pdst=self.GW[0], hwsrc=mac))
+        self._emit(self.L.Ether(src=self.GW[1], dst=mac) /
+                   self.L.ARP(op=2, psrc=self.GW[0], hwsrc=self.GW[1], pdst=ip,
                        hwdst=mac))
-        self._emit(Ether(src=mac, dst=self.GW[1]) /
-                   ARP(op=2, psrc=ip, hwsrc=mac, pdst=self.GW[0],
+        self._emit(self.L.Ether(src=mac, dst=self.GW[1]) /
+                   self.L.ARP(op=2, psrc=ip, hwsrc=mac, pdst=self.GW[0],
                        hwdst=self.GW[1]))
 
     def dhcp(self, host, vendor_class="", client_id=True, lease=86400):
@@ -35464,15 +37191,15 @@ class ScenarioBuilder:
         if vendor_class:
             opts.append(("vendor_class_id", vendor_class.encode()))
         opts.append(("param_req_list", [1, 3, 6, 15, 119, 252]))
-        self._emit(Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
-                   IP(src="0.0.0.0", dst="255.255.255.255") /
-                   UDP(sport=68, dport=67) /
-                   BOOTP(chaddr=chaddr, xid=self.rng.randint(1, 2 ** 31)) /
-                   DHCP(options=opts + ["end"]))
-        self._emit(Ether(src=self.GW[1], dst=mac) /
-                   IP(src=self.GW[0], dst=ip) / UDP(sport=67, dport=68) /
-                   BOOTP(op=2, yiaddr=ip, chaddr=chaddr) /
-                   DHCP(options=[("message-type", "ack"),
+        self._emit(self.L.Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+                   self.L.IP(src="0.0.0.0", dst="255.255.255.255") /
+                   self.L.UDP(sport=68, dport=67) /
+                   self.L.BOOTP(chaddr=chaddr, xid=self.rng.randint(1, 2 ** 31)) /
+                   self.L.DHCP(options=opts + ["end"]))
+        self._emit(self.L.Ether(src=self.GW[1], dst=mac) /
+                   self.L.IP(src=self.GW[0], dst=ip) / self.L.UDP(sport=67, dport=68) /
+                   self.L.BOOTP(op=2, yiaddr=ip, chaddr=chaddr) /
+                   self.L.DHCP(options=[("message-type", "ack"),
                                  ("server_id", self.GW[0]),
                                  ("lease_time", lease),
                                  ("router", self.GW[0]),
@@ -35481,71 +37208,72 @@ class ScenarioBuilder:
     def mdns(self, host, svc, name, txt):
         ip, mac = host[0], host[1]
         txtv = [f"{k}={v}".encode() for k, v in txt.items()]
-        self._emit(Ether(src=mac, dst="01:00:5e:00:00:fb") /
-                   IP(src=ip, dst="224.0.0.251", ttl=255) /
-                   UDP(sport=5353, dport=5353) /
-                   DNS(qr=1, aa=1, qd=None,
-                       an=DNSRR(rrname=f"{svc}.local", type="PTR",
+        self._emit(self.L.Ether(src=mac, dst="01:00:5e:00:00:fb") /
+                   self.L.IP(src=ip, dst="224.0.0.251", ttl=255) /
+                   self.L.UDP(sport=5353, dport=5353) /
+                   self.L.DNS(qr=1, aa=1, qd=None,
+                       an=self.L.DNSRR(rrname=f"{svc}.local", type="PTR",
                                 rdata=f"{name}.{svc}.local"),
-                       ar=[DNSRR(rrname=f"{name}.{svc}.local", type="TXT",
+                       ar=[self.L.DNSRR(rrname=f"{name}.{svc}.local", type="TXT",
                                  rdata=txtv),
-                           DNSRR(rrname=f"{name.replace(' ', '-')}.local",
+                           self.L.DNSRR(rrname=f"{name.replace(' ', '-')}.local",
                                  rdata=ip)]))
 
     def dns(self, host, name, answer_ip, rcode=0):
         ip, mac = host[0], host[1]
         sp = self._next_port()
         self.qid += 1
-        self._emit(Ether(src=mac, dst=self.GW[1]) /
-                   IP(src=ip, dst=self.GW[0]) / UDP(sport=sp, dport=53) /
-                   DNS(id=self.qid, rd=1, qd=DNSQR(qname=name)))
-        an = DNSRR(rrname=name, rdata=answer_ip, ttl=300) if answer_ip \
+        self._emit(self.L.Ether(src=mac, dst=self.GW[1]) /
+                   self.L.IP(src=ip, dst=self.GW[0]) / self.L.UDP(sport=sp, dport=53) /
+                   self.L.DNS(id=self.qid, rd=1, qd=self.L.DNSQR(qname=name)))
+        an = self.L.DNSRR(rrname=name, rdata=answer_ip, ttl=300) if answer_ip \
             else None
-        self._emit(Ether(src=self.GW[1], dst=mac) /
-                   IP(src=self.GW[0], dst=ip) / UDP(sport=53, dport=sp) /
-                   DNS(id=self.qid, qr=1, rcode=rcode,
-                       qd=DNSQR(qname=name), an=an), dt=0.02)
+        self._emit(self.L.Ether(src=self.GW[1], dst=mac) /
+                   self.L.IP(src=self.GW[0], dst=ip) / self.L.UDP(sport=53, dport=sp) /
+                   self.L.DNS(id=self.qid, qr=1, rcode=rcode,
+                       qd=self.L.DNSQR(qname=name), an=an), dt=0.02)
 
     def tls(self, host, site, rip, size=30000, sni=True, rst=False,
             port=443):
         ip, mac = host[0], host[1]
         sp = self._next_port()
         seq = self.rng.randint(1000, 10 ** 9)
-        out = Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=rip)
-        back = Ether(src=self.GW[1], dst=mac) / IP(src=rip, dst=ip, ttl=54)
-        self._emit(out / TCP(sport=sp, dport=port, flags="S", seq=seq))
-        self._emit(back / TCP(sport=port, dport=sp, flags="SA", seq=7,
+        out = self.L.Ether(src=mac, dst=self.GW[1]) / self.L.IP(src=ip, dst=rip)
+        back = self.L.Ether(src=self.GW[1], dst=mac) / self.L.IP(src=rip, dst=ip, ttl=54)
+        self._emit(out / self.L.TCP(sport=sp, dport=port, flags="S", seq=seq))
+        self._emit(back / self.L.TCP(sport=port, dport=sp, flags="SA", seq=7,
                               ack=seq + 1), dt=0.03)
-        hello = build_client_hello(site if sni else "", pad=300) if sni \
+        hello = build_client_hello(site if sni else "", pad=300, rnd=bytes(
+            self.rng.getrandbits(8) for _ in range(32))) if sni \
             else b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00"
-        self._emit(out / TCP(sport=sp, dport=port, flags="PA", seq=seq + 1) /
-                   Raw(hello))
+        self._emit(out / self.L.TCP(sport=sp, dport=port, flags="PA", seq=seq + 1) /
+                   self.L.Raw(hello))
         s2, sent = 8, 0
         while sent < size:
             chunk = min(1400, size - sent)
-            self._emit(back / TCP(sport=port, dport=sp, flags="A", seq=s2) /
-                       Raw(b"\x17\x03\x03" + bytes(chunk - 3)), dt=0.002)
+            self._emit(back / self.L.TCP(sport=port, dport=sp, flags="A", seq=s2) /
+                       self.L.Raw(b"\x17\x03\x03" + bytes(chunk - 3)), dt=0.002)
             s2 += chunk
             sent += chunk
         if rst:
-            self._emit(back / TCP(sport=port, dport=sp, flags="R", seq=s2))
+            self._emit(back / self.L.TCP(sport=port, dport=sp, flags="R", seq=s2))
             return
-        self._emit(out / TCP(sport=sp, dport=port, flags="FA",
+        self._emit(out / self.L.TCP(sport=sp, dport=port, flags="FA",
                              seq=seq + 1 + len(hello)))
-        self._emit(back / TCP(sport=port, dport=sp, flags="FA", seq=s2))
+        self._emit(back / self.L.TCP(sport=port, dport=sp, flags="FA", seq=s2))
 
     def http(self, host, site, rip):
         ip, mac = host[0], host[1]
         sp = self._next_port()
-        out = Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=rip)
-        back = Ether(src=self.GW[1], dst=mac) / IP(src=rip, dst=ip, ttl=54)
-        self._emit(out / TCP(sport=sp, dport=80, flags="S", seq=1))
-        self._emit(back / TCP(sport=80, dport=sp, flags="SA", seq=1, ack=2))
-        self._emit(out / TCP(sport=sp, dport=80, flags="PA", seq=2) /
-                   Raw(f"GET /index.html HTTP/1.1\r\nHost: {site}\r\n"
+        out = self.L.Ether(src=mac, dst=self.GW[1]) / self.L.IP(src=ip, dst=rip)
+        back = self.L.Ether(src=self.GW[1], dst=mac) / self.L.IP(src=rip, dst=ip, ttl=54)
+        self._emit(out / self.L.TCP(sport=sp, dport=80, flags="S", seq=1))
+        self._emit(back / self.L.TCP(sport=80, dport=sp, flags="SA", seq=1, ack=2))
+        self._emit(out / self.L.TCP(sport=sp, dport=80, flags="PA", seq=2) /
+                   self.L.Raw(f"GET /index.html HTTP/1.1\r\nHost: {site}\r\n"
                        f"User-Agent: test\r\n\r\n".encode()))
-        self._emit(back / TCP(sport=80, dport=sp, flags="PA", seq=2) /
-                   Raw(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+        self._emit(back / self.L.TCP(sport=80, dport=sp, flags="PA", seq=2) /
+                   self.L.Raw(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
 
     # ---- the scripted home network ---------------------------------------------
     def home_network(self):
@@ -35560,26 +37288,26 @@ class ScenarioBuilder:
         self.dhcp(self.NAS)
         # IPv6: router advertisement with a global prefix, then the phone's
         # global address is resolved by neighbour discovery
-        self._emit(Ether(src=gw[1], dst="33:33:00:00:00:01") /
-                   IPv6(src="fe80::21e:58ff:feaa:1", dst="ff02::1") /
-                   ICMPv6ND_RA(routerlifetime=1800) /
-                   ICMPv6NDOptPrefixInfo(prefix=self.V6_PREFIX + "::",
+        self._emit(self.L.Ether(src=gw[1], dst="33:33:00:00:00:01") /
+                   self.L.IPv6(src="fe80::21e:58ff:feaa:1", dst="ff02::1") /
+                   self.L.ICMPv6ND_RA(routerlifetime=1800) /
+                   self.L.ICMPv6NDOptPrefixInfo(prefix=self.V6_PREFIX + "::",
                                          prefixlen=64) /
-                   ICMPv6NDOptSrcLLAddr(lladdr=gw[1]))
+                   self.L.ICMPv6NDOptSrcLLAddr(lladdr=gw[1]))
         p6 = self.V6_PREFIX + "::23"
-        self._emit(Ether(src=self.PHONE[1], dst=gw[1]) /
-                   IPv6(src=p6, dst="fe80::21e:58ff:feaa:1") /
-                   ICMPv6ND_NA(tgt=p6, R=0, S=1, O=1) /
-                   ICMPv6NDOptDstLLAddr(lladdr=self.PHONE[1]))
+        self._emit(self.L.Ether(src=self.PHONE[1], dst=gw[1]) /
+                   self.L.IPv6(src=p6, dst="fe80::21e:58ff:feaa:1") /
+                   self.L.ICMPv6ND_NA(tgt=p6, R=0, S=1, O=1) /
+                   self.L.ICMPv6NDOptDstLLAddr(lladdr=self.PHONE[1]))
         self.mdns(self.TV, "_googlecast._tcp", "Living Room TV",
                   {"md": "Chromecast", "fn": "Living Room TV"})
         self.mdns(self.PRINTER, "_ipp._tcp", "Brother HL-L2350DW",
                   {"ty": "Brother HL-L2350DW"})
         self.mdns(self.NAS, "_smb._tcp", "family-nas", {"model": "DS220+"})
-        self._emit(Ether(src=self.TV[1], dst="01:00:5e:7f:ff:fa") /
-                   IP(src=self.TV[0], dst="239.255.255.250") /
-                   UDP(sport=1900, dport=1900) /
-                   Raw(b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+        self._emit(self.L.Ether(src=self.TV[1], dst="01:00:5e:7f:ff:fa") /
+                   self.L.IP(src=self.TV[0], dst="239.255.255.250") /
+                   self.L.UDP(sport=1900, dport=1900) /
+                   self.L.Raw(b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
                        b"NT: urn:dial-multiscreen-org:service:dial:1\r\n"
                        b"SERVER: Linux/4.9 UPnP/1.0 Chromecast/1.56\r\n\r\n"))
         # browsing: lookup → connection with SNI
@@ -35597,53 +37325,123 @@ class ScenarioBuilder:
         # plain web and cleartext
         self.http(me, "plain.example.org", s["plain.example.org"])
         pr = self.PRINTER
-        out = Ether(src=pr[1], dst=gw[1]) / IP(src=pr[0], dst="34.117.59.81")
-        self._emit(out / TCP(sport=40500, dport=21, flags="S"))
-        self._emit(Ether(src=gw[1], dst=pr[1]) /
-                   IP(src="34.117.59.81", dst=pr[0]) /
-                   TCP(sport=21, dport=40500, flags="SA"))
-        self._emit(out / TCP(sport=40500, dport=21, flags="PA") /
-                   Raw(b"USER scanner\r\n"))
+        out = self.L.Ether(src=pr[1], dst=gw[1]) / self.L.IP(src=pr[0], dst="34.117.59.81")
+        self._emit(out / self.L.TCP(sport=40500, dport=21, flags="S"))
+        self._emit(self.L.Ether(src=gw[1], dst=pr[1]) /
+                   self.L.IP(src="34.117.59.81", dst=pr[0]) /
+                   self.L.TCP(sport=21, dport=40500, flags="SA"))
+        self._emit(out / self.L.TCP(sport=40500, dport=21, flags="PA") /
+                   self.L.Raw(b"USER scanner\r\n"))
         # NTP from the smart plug
-        self._emit(Ether(src=self.PLUG[1], dst=gw[1]) /
-                   IP(src=self.PLUG[0], dst="129.6.15.28") /
-                   UDP(sport=12345, dport=123) / Raw(b"\x1b" + bytes(47)))
-        self._emit(Ether(src=gw[1], dst=self.PLUG[1]) /
-                   IP(src="129.6.15.28", dst=self.PLUG[0], ttl=50) /
-                   UDP(sport=123, dport=12345) / Raw(b"\x1c" + bytes(47)))
+        self._emit(self.L.Ether(src=self.PLUG[1], dst=gw[1]) /
+                   self.L.IP(src=self.PLUG[0], dst="129.6.15.28") /
+                   self.L.UDP(sport=12345, dport=123) / self.L.Raw(b"\x1b" + bytes(47)))
+        self._emit(self.L.Ether(src=gw[1], dst=self.PLUG[1]) /
+                   self.L.IP(src="129.6.15.28", dst=self.PLUG[0], ttl=50) /
+                   self.L.UDP(sport=123, dport=12345) / self.L.Raw(b"\x1c" + bytes(47)))
         # QUIC (long header) and encrypted DNS to a known DoH host
-        self._emit(Ether(src=me[1], dst=gw[1]) /
-                   IP(src=me[0], dst="142.250.80.46") /
-                   UDP(sport=51000, dport=443) / Raw(b"\xc3" + bytes(1250)))
+        self._emit(self.L.Ether(src=me[1], dst=gw[1]) /
+                   self.L.IP(src=me[0], dst="142.250.80.46") /
+                   self.L.UDP(sport=51000, dport=443) / self.L.Raw(b"\xc3" + bytes(1250)))
         self.tls(me, "dns.google", "8.8.8.8", size=3000)
         # local name protocols
-        self._emit(Ether(src=me[1], dst="01:00:5e:00:00:fc") /
-                   IP(src=me[0], dst="224.0.0.252") /
-                   UDP(sport=55000, dport=5355) /
-                   DNS(id=9, qd=DNSQR(qname="nas")))
+        self._emit(self.L.Ether(src=me[1], dst="01:00:5e:00:00:fc") /
+                   self.L.IP(src=me[0], dst="224.0.0.252") /
+                   self.L.UDP(sport=55000, dport=5355) /
+                   self.L.DNS(id=9, qd=self.L.DNSQR(qname="nas")))
         nb = (b"\x81\x02\x85\x00\x00\x00\x00\x01\x00\x00\x00\x00\x20" +
               b"".join(bytes([0x41 + (c >> 4), 0x41 + (c & 15)])
                        for c in b"FAMILY-NAS      ") + b"\x00")
-        self._emit(Ether(src=self.NAS[1], dst=me[1]) /
-                   IP(src=self.NAS[0], dst=me[0]) /
-                   UDP(sport=137, dport=137) / Raw(nb))
+        self._emit(self.L.Ether(src=self.NAS[1], dst=me[1]) /
+                   self.L.IP(src=self.NAS[0], dst=me[0]) /
+                   self.L.UDP(sport=137, dport=137) / self.L.Raw(nb))
         # a reset connection and an SSH session on the LAN
         self.tls(me, "www.example.com", s["www.example.com"], size=1400,
                  rst=True)
         ph = self.PHONE
-        self._emit(Ether(src=ph[1], dst=me[1]) / IP(src=ph[0], dst=me[0]) /
-                   TCP(sport=50022, dport=22, flags="S"))
-        self._emit(Ether(src=me[1], dst=ph[1]) / IP(src=me[0], dst=ph[0]) /
-                   TCP(sport=22, dport=50022, flags="SA"))
-        self._emit(Ether(src=me[1], dst=ph[1]) / IP(src=me[0], dst=ph[0]) /
-                   TCP(sport=22, dport=50022, flags="PA") /
-                   Raw(b"SSH-2.0-OpenSSH_9.6\r\n"))
+        self._emit(self.L.Ether(src=ph[1], dst=me[1]) / self.L.IP(src=ph[0], dst=me[0]) /
+                   self.L.TCP(sport=50022, dport=22, flags="S"))
+        self._emit(self.L.Ether(src=me[1], dst=ph[1]) / self.L.IP(src=me[0], dst=ph[0]) /
+                   self.L.TCP(sport=22, dport=50022, flags="SA"))
+        self._emit(self.L.Ether(src=me[1], dst=ph[1]) / self.L.IP(src=me[0], dst=ph[0]) /
+                   self.L.TCP(sport=22, dport=50022, flags="PA") /
+                   self.L.Raw(b"SSH-2.0-OpenSSH_9.6\r\n"))
         # later: the printer is gone and its address is reused by a laptop
         self.t += 900
         self.dhcp(self.LAPTOP, vendor_class="MSFT 5.0")
         self.arp_announce(self.LAPTOP)
         self.tls(self.LAPTOP, "www.example.com", s["www.example.com"],
                  size=9000)
+        return self.frames
+
+    def protocol_tour(self):
+        """Frames that exercise every field the dissectors declare but the
+        home network never sends: VLAN tags, IP options, ping, TCP
+        options, IPv6 extension headers, CNAME/AAAA/SRV answers and a
+        Linux "cooked" capture frame."""
+        self.vlan_ping()
+        L = self.L
+        me, gw, nas = self.ME, self.GW, self.NAS
+        self._emit(L.Ether(src=me[1], dst="01:00:5e:00:00:16") /
+                   L.IP(src=me[0], dst="224.0.0.22", ttl=1,
+                        options=b"\x94\x04\x00\x00") /
+                   L.UDP(sport=50001, dport=50002) / L.Raw(b"opt"))
+        return self._tour_rest()
+
+    def vlan_ping(self):
+        L, me, gw = self.L, self.ME, self.GW
+        self._emit(L.Ether(src=me[1], dst=gw[1]) / L.Dot1Q(vlan=20, prio=3) /
+                   L.IP(src=me[0], dst="1.1.1.1") /
+                   L.ICMP(type=8, id=7, seq=1) / L.Raw(b"ping" * 8))
+        self._emit(L.Ether(src=gw[1], dst=me[1]) / L.Dot1Q(vlan=20, prio=3) /
+                   L.IP(src="1.1.1.1", dst=me[0], ttl=57) /
+                   L.ICMP(type=0, id=7, seq=1) / L.Raw(b"ping" * 8))
+        return self.frames
+
+    def _tour_rest(self):
+        L = self.L
+        me, gw, nas = self.ME, self.GW, self.NAS
+        sp = self._next_port()
+        syn_opts = (b"\x02\x04\x05\xb4\x04\x02\x08\x0a" +
+                    struct.pack("!II", 123456, 0) + b"\x01\x03\x03\x07")
+        out = L.Ether(src=me[1], dst=nas[1]) / L.IP(src=me[0], dst=nas[0])
+        back = L.Ether(src=nas[1], dst=me[1]) / L.IP(src=nas[0], dst=me[0])
+        self._emit(out / L.TCP(sport=sp, dport=445, flags="S", seq=100,
+                               window=64240, options=syn_opts))
+        self._emit(back / L.TCP(sport=445, dport=sp, flags="SA", seq=900,
+                                ack=101, window=65160, options=syn_opts))
+        self._emit(out / L.TCP(sport=sp, dport=445, flags="A", seq=101,
+                               ack=901, options=b"\x01\x01\x05\x0a" +
+                               struct.pack("!II", 2000, 3000)))
+        name = "media.example.com"
+        rrs = [L.DNSRR(rrname=name, type="CNAME", rdata="cdn.example.net",
+                       ttl=60),
+               L.DNSRR(rrname="cdn.example.net", type="AAAA",
+                       rdata=self.V6_PREFIX + "::80", ttl=60)]
+        srv = L.DNSRR(rrname="_sip._tcp.example.com", type=33, ttl=300,
+                      rdata=struct.pack("!HHH", 10, 5, 5060) +
+                      b"\x03sip\x07example\x03com\x00")
+        self._emit(L.Ether(src=gw[1], dst=me[1]) / L.IP(src=gw[0], dst=me[0])
+                   / L.UDP(sport=53, dport=self._next_port()) /
+                   L.DNS(id=77, qr=1, ra=1, qd=L.DNSQR(qname=name,
+                                                       qtype="AAAA"),
+                         an=rrs, ar=srv))
+        src6, dst6 = self.V6_PREFIX + "::10", "2001:db8::53"
+        udp = bytes(L.IPv6(src=src6, dst=dst6) /
+                    L.UDP(sport=53000, dport=53) /
+                    L.DNS(id=78, qd=L.DNSQR(qname="example.com",
+                                            qtype="AAAA")))[40:]
+        hbh = bytes([44, 0, 1, 4, 0, 0, 0, 0])          # → fragment hdr
+        frag = bytes([17, 0, 0, 0]) + struct.pack("!I", 0x1234)
+        self._emit(L.Ether(src=me[1], dst=gw[1]) /
+                   L.IPv6(src=src6, dst=dst6, nh=0) /
+                   L.Raw(hbh + frag + udp))
+        sll = struct.pack("!HHH", 0, 1, 6) + _pk_mac(me[1]) + b"\x00\x00" + \
+            struct.pack("!H", 0x0800)
+        ip = bytes(L.IP(src=me[0], dst=gw[0]) / L.UDP(sport=53001, dport=53)
+                   / L.DNS(id=79, qd=L.DNSQR(qname="example.org")))
+        self.t += 0.01
+        self.frames.append((sll + ip, round(self.t, 6), 113))
         return self.frames
 
     def busy_mix(self, n=20000, seed=3):
@@ -35656,15 +37454,15 @@ class ScenarioBuilder:
             mac = f"00:16:3e:00:{i // 256:02x}:{i % 256:02x}"
             ip = f"192.168.1.{100 + i % 120}"
             rip = f"34.{i}.{i % 7}.{(i * 13) % 251 + 1}"
-            tmpl.append(bytes(Ether(src=mac, dst=self.GW[1]) /
-                              IP(src=ip, dst=rip) /
-                              TCP(sport=40000 + i, dport=443, flags="PA") /
-                              Raw(b"\x17\x03\x03" + bytes(rng.choice(
+            tmpl.append(bytes(self.L.Ether(src=mac, dst=self.GW[1]) /
+                              self.L.IP(src=ip, dst=rip) /
+                              self.L.TCP(sport=40000 + i, dport=443, flags="PA") /
+                              self.L.Raw(b"\x17\x03\x03" + bytes(rng.choice(
                                   (60, 300, 1200))))))
-            tmpl.append(bytes(Ether(src=self.GW[1], dst=mac) /
-                              IP(src=rip, dst=ip, ttl=55) /
-                              TCP(sport=443, dport=40000 + i, flags="A") /
-                              Raw(b"\x17\x03\x03" + bytes(1380))))
+            tmpl.append(bytes(self.L.Ether(src=self.GW[1], dst=mac) /
+                              self.L.IP(src=rip, dst=ip, ttl=55) /
+                              self.L.TCP(sport=443, dport=40000 + i, flags="A") /
+                              self.L.Raw(b"\x17\x03\x03" + bytes(1380))))
         for k in range(n):
             t += 0.00005
             frames.append((tmpl[k % len(tmpl)], round(t, 6), 1))
@@ -35707,7 +37505,20 @@ def replay_frames(model, frames, decoder=None, tick_every=500):
     return model
 
 
+def fast_frame_decoder(model):
+    """The capture path's own decoder (no scapy needed)."""
+    reasm = TlsReassembler()
+
+    def dec(raw, ts, lt=1):
+        return fast_decode(raw, ts, lt, reasm, model.gateway_ip,
+                           model.my_ips)
+    return dec
+
+
 def default_frame_decoder(model):
+    """scapy's reference decoder when it is there, else the fast one."""
+    if Ether is None:
+        return fast_frame_decoder(model)
     reasm = TlsReassembler()
 
     def dec(raw, ts, lt=1):
@@ -39734,6 +41545,183 @@ def test_capture_gaps_presence_and_lifecycle(ctx):
         assert m2.capture_gaps() == m.capture_gaps()
 
 
+@self_test()
+def test_scenarios_and_demo_without_scapy(ctx):
+    """With scapy blocked: the scripted network builds, decodes and passes
+    every golden check through the fast decoder, and Demo Mode's
+    generator produces frames that all decode. With scapy present: every
+    scripted frame is byte-identical to scapy's own build."""
+    code = r'''
+import sys, importlib.abc, importlib.util, os, tempfile, time
+class Block(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, path, target=None):
+        if name == "scapy" or name.startswith("scapy."):
+            raise ImportError("blocked for the test")
+sys.meta_path.insert(0, Block())
+sys.argv = ["x", "--bench"]
+spec = importlib.util.spec_from_file_location("mw", os.environ["MW_FILE"])
+mw = importlib.util.module_from_spec(spec)
+sys.modules["mw"] = mw
+spec.loader.exec_module(mw)
+assert mw.Ether is None
+cfg = mw.AppConfig(path=os.path.join(tempfile.mkdtemp(), "c.json"))
+m = mw.scenario_model(cfg, mw.ScenarioBuilder().home_network())
+fails = mw.golden_checks(m)
+assert not fails, fails
+got = []
+def sink(raw, ts, lt, cancelled=lambda: False):
+    got.append((raw, ts, lt))
+    return True
+g = mw.DemoGenerator(sink)
+g.start()
+t_end = time.time() + 20
+while len(got) < 60 and time.time() < t_end:
+    time.sleep(0.05)
+g.stop()
+assert len(got) >= 60, len(got)
+reasm = mw.TlsReassembler()
+for raw, ts, lt in got:
+    mw.fast_decode(raw, ts, lt, reasm)
+print("OK", len(m.registry.by_key), len(got))
+'''
+    env = dict(os.environ, MW_FILE=os.path.abspath(__file__),
+               MINIWIRESHARK_DATA=ctx.path("noscapy-data"))
+    r = subprocess.run([sys.executable, "-I", "-c", code], env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "OK" in r.stdout, (r.stdout[-500:],
+                                                    r.stderr[-1500:])
+    if ctx.scapy_ok:
+        import scapy.all as _sa
+
+        class _Scapy:
+            pass
+        for n in [k for k in dir(PK) if not k.startswith("_")]:
+            setattr(_Scapy, n, getattr(_sa, n))
+        ours = ScenarioBuilder().home_network() + \
+            ScenarioBuilder().vlan_ping()
+        theirs = ScenarioBuilder(layers=_Scapy).home_network() + \
+            ScenarioBuilder(layers=_Scapy).vlan_ping()
+        diff = [i for i, (a, b) in enumerate(zip(ours, theirs))
+                if a[0] != b[0]]
+        assert len(ours) == len(theirs) and not diff, diff[:5]
+
+
+def _dissect_corpus():
+    return ScenarioBuilder().home_network() + \
+        ScenarioBuilder(t0=SCENARIO_T0 + 5000).protocol_tour()
+
+
+@self_test(slow=False)
+def test_dissector_registry_and_corpus(ctx):
+    """Every field the dissectors declare appears in the corpus; every
+    field's bytes lie inside its frame; checksums verify; nothing in the
+    corpus is flagged as malformed."""
+    seen = set()
+    for raw, ts, lt in _dissect_corpus():
+        d = dissect(raw, lt)
+        assert not d.warnings(), (d.warnings(), d.text()[:400])
+        seen |= d.keys()
+        for f in d.all_fields():
+            assert 0 <= f.offset and f.offset + f.length <= len(raw), f
+            assert f.key in FIELD_REGISTRY, f.key
+            if f.key.endswith("checksum.status"):
+                assert f.raw_value in ("correct", "none (allowed for UDP "
+                                       "over IPv4)"), (f, d.text()[:300])
+    missing = sorted(set(FIELD_REGISTRY) - seen)
+    assert not missing, f"declared but never seen: {missing}"
+    tour = ScenarioBuilder(t0=SCENARIO_T0).protocol_tour()
+    d = dissect(tour[0][0])
+    assert d.get("vlan.id") == 20 and d.get("icmp.type") == 8
+    syn = dissect(tour[3][0])
+    assert syn.get("tcp.options.mss_val") == 1460 and \
+        syn.get("tcp.options.wscale.shift") == 7
+    sll = dissect(tour[-1][0], 113)
+    assert sll.get("dns.qry.name") == "example.org"
+    home = ScenarioBuilder().home_network()
+    names = {dissect(r).get("tls.handshake.extensions_server_name")
+             for r, _t, _l in home} - {None}
+    assert {"www.example.com", "video.example.net", "dns.google"} <= names
+    hosts = {dissect(r).get("dhcp.option.hostname") for r, _t, _l in home}
+    assert "Alex-iPhone" in hosts and "ESP_6A1B2C" in hosts
+
+
+@self_test(slow=False)
+def test_dissector_never_raises(ctx):
+    """Every prefix of a frame and thousands of mutated frames dissect
+    without an exception; a frame cut inside a header says so."""
+    rnd = random.Random(11)
+    corpus = _dissect_corpus()
+    for raw, ts, lt in corpus[:60:7]:
+        for n in range(0, len(raw), max(1, len(raw) // 40)):
+            dissect(raw[:n], lt)
+    cut = dissect(corpus[40][0][:30])
+    assert any("truncated" in w for _t, w in cut.warnings()), cut.warnings()
+    for i in range(3000):
+        raw, ts, lt = corpus[rnd.randrange(len(corpus))]
+        b = bytearray(raw)
+        for _ in range(rnd.randint(1, 6)):
+            b[rnd.randrange(len(b))] = rnd.randrange(256)
+        if rnd.random() < 0.3:
+            b = b[:rnd.randrange(len(b) + 1)]
+        dissect(bytes(b), lt)
+    for n in range(200):
+        dissect(bytes(rnd.randrange(256) for _ in range(rnd.randint(0, 120))),
+                rnd.choice((1, 101, 113, 0)))
+
+
+@self_test(slow=False)
+def test_dissector_hides_secrets(ctx):
+    """Cookies, authorization headers and mail/FTP passwords never appear
+    in the packet tree or the text dump."""
+    sb = ScenarioBuilder()
+    L = PK
+    out = L.Ether(src=sb.ME[1], dst=sb.GW[1]) / L.IP(src=sb.ME[0],
+                                                       dst="34.117.59.81")
+    frames = [
+        out / L.TCP(sport=41000, dport=80, flags="PA") / L.Raw(
+            b"GET /a HTTP/1.1\r\nHost: plain.example.org\r\n"
+            b"Cookie: session=SECRETCOOKIE\r\n"
+            b"Authorization: Basic U0VDUkVUUEFTUw==\r\n\r\n"),
+        out / L.TCP(sport=41001, dport=21, flags="PA") /
+        L.Raw(b"PASS SECRETPASS\r\n"),
+        out / L.TCP(sport=41002, dport=143, flags="PA") /
+        L.Raw(b"a1 LOGIN alex SECRETPASS\r\n"),
+        out / L.TCP(sport=41003, dport=110, flags="PA") /
+        L.Raw(b"APOP alex SECRETDIGEST\r\n"),
+        out / L.TCP(sport=41004, dport=25, flags="PA") /
+        L.Raw(b"AUTH PLAIN AGFsZXgAU0VDUkVU\r\n"),
+    ]
+    for f in frames:
+        d = dissect(bytes(f))
+        txt = d.text()
+        assert "SECRET" not in txt and "U0VDUkVU" not in txt and \
+            "AGFsZXgA" not in txt, txt
+        assert "(hidden" in txt, txt
+    host = dissect(bytes(frames[0])).get("http.host")
+    assert host == "plain.example.org"
+
+
+@self_test(slow=False)
+def test_hex_dump_ranges_match_bytes(ctx):
+    """Selecting a field highlights exactly its bytes in the hex view."""
+    raw = ScenarioBuilder().home_network()[38][0]
+    lines = hex_dump_lines(raw).split("\n")
+
+    def text_at(a, b):
+        la, ca = (int(x) for x in a.split("."))
+        lb, cb = (int(x) for x in b.split("."))
+        assert la == lb
+        return lines[la - 1][ca:cb]
+    d = dissect(raw)
+    for f in list(d.all_fields())[:80]:
+        if f.length <= 0:
+            continue
+        spans = hex_dump_ranges(f.offset, f.length)
+        hexes = "".join(text_at(a, b) for a, b in spans[0::2])
+        assert hexes.replace(" ", "") == raw[f.offset:f.offset +
+                                             f.length].hex(), f
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -40644,6 +42632,29 @@ def _gs_pipeline(app, ctx):
     app._wd_last = 0.0
     app._check_pipeline(time.monotonic())
     assert app.watchdog.text() == "all stages moving"
+
+
+@gui_test_step("packet details: own dissector tree and linked bytes")
+def _gs_dissect(app, ctx):
+    tab = app.tabs["packets"]
+    app._select_tab("packets")
+    row = next((d for d in app.all_rows if d.get("raw") and
+                b"www.example.com" in d["raw"] and d.get("sport")), None)
+    assert row is not None, "no TLS row in memory"
+    assert tab.select_no(row["no"])
+    _gui_pump(app.root, 0.3)
+    top = [tab.dtree.item(i, "text") for i in tab.dtree.get_children()]
+    assert any(t.startswith("Transport Layer Security") for t in top), top
+    sni = next(i for i, k in tab._dt_keys.items()
+               if k == "tls.handshake.extensions_server_name")
+    tab.dtree.selection_set(sni)
+    tab.dtree.see(sni)
+    _gui_pump(app.root, 0.2)
+    spans = tab.bytes_view.tag_ranges("hl")
+    assert spans, "selected field's bytes not highlighted"
+    assert "tls.handshake.extensions_server_name" in tab.field_var.get()
+    txt = tab.details.get("1.0", "end")
+    assert "Server name (SNI): www.example.com" in txt, txt[:500]
 
 
 @gui_test_step("corrections: rename, merge, undo from the window")
