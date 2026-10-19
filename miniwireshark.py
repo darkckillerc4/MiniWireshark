@@ -179,6 +179,8 @@ class AppPaths:
         self.bootstrap_state = os.path.join(self.data, "bootstrap_state.json")
         self.update_marker = os.path.join(self.data, "update_pending.json")
         self.crash_marker = os.path.join(self.data, "last_crash.txt")
+        self.journal = os.path.join(self.sessions,
+                                    "journal.mwsession.json")
         self.networks = os.path.join(self.data, "networks.json")
 
     def as_dict(self):
@@ -16929,6 +16931,7 @@ DEFAULT_SHORTCUTS = {
     "start": "<Control-r>", "stop": "<Control-period>",
     "clear": "<Control-l>", "export": "<Control-e>", "find": "<Control-f>",
     "undo": "<Control-z>", "inspector": "<F2>",
+    "palette": "<Control-k>",
 }
 
 DEFAULT_FILTER_PRESETS = {
@@ -16994,7 +16997,8 @@ def _default_config():
         "performance": {"cpu_friendly_mode": False, "mode": "Automatic",
                         "full_power_cores": 2, "ram_cap_mb": 1536,
                         "shedding": "Smart", "battery_aware": True,
-                        "deep_runner": "Automatic"},
+                        "deep_runner": "Automatic", "calibration": {}},
+        "workspaces": {"saved": {}},
         "export": {"default_dir": ""},
         "mode": {"active_scanning": True},
         "shortcuts": dict(DEFAULT_SHORTCUTS),
@@ -19514,6 +19518,7 @@ Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
 Automatic (MiniWireshark decides) ¦ Automatique (MiniWireshark décide) ¦ Automático (MiniWireshark decide)
 You set this type ¦ Vous avez choisi ce type ¦ Usted eligió este tipo
 detected ¦ détecté ¦ detectado
+Go to anything (command palette) ¦ Aller n'importe où (palette de commandes) ¦ Ir a cualquier parte (paleta de comandos)
 Full Power ¦ Pleine puissance ¦ Máxima potencia
 Full Power budget ¦ Budget de la pleine puissance ¦ Presupuesto de máxima potencia
 Processor cores to use ¦ Cœurs de processeur à utiliser ¦ Núcleos de procesador a usar
@@ -21118,6 +21123,8 @@ SETTINGS_PAGES = [
               "label": "Jump to search"},
              {"key": "shortcuts.undo", "type": "shortcut",
               "label": "Undo your last device change"},
+             {"key": "shortcuts.palette", "type": "shortcut",
+              "label": "Go to anything (command palette)"},
              {"key": "shortcuts.inspector", "type": "shortcut",
               "label": "Show / hide the inspector"},
          ]},
@@ -25867,6 +25874,8 @@ class SecurityTab(BaseTab):
         self.upnp_btn.pack(side="left")
         ttk.Button(bar, text="What MiniWireshark sent…",
                    command=self.app.open_ledger).pack(side="left", padx=8)
+        ttk.Button(bar, text="Privacy posture…",
+                   command=self.app.open_privacy_posture).pack(side="left")
         self.text = tk.Text(outer, wrap="word", bg="#fbfbfb", fg="#222222",
                             relief="flat", padx=14, pady=12,
                             font=("TkDefaultFont", 11), state="disabled",
@@ -28407,7 +28416,8 @@ class StatisticsView(_SubView):
     """Protocol hierarchy, conversations, endpoints and an I/O graph, all
     from the packets in memory (the denominator is always stated)."""
 
-    KINDS = ("Protocol hierarchy", "Conversations", "Endpoints", "I/O graph")
+    KINDS = ("Protocol hierarchy", "Conversations", "Endpoints", "I/O graph",
+             "DNS resolvers")
 
     def build(self):
         b = self.bar()
@@ -28604,6 +28614,30 @@ class StatisticsView(_SubView):
         k = self._ep.get(sel[0]) if sel else None
         if k:
             self.app.goto(*k)
+
+    # ---- DNS resolvers
+    def _dns(self, rows):
+        tree = self._table([("srv", "Resolver", 180, "w", True),
+                            ("n", "Lookups", 80, "e", False),
+                            ("ok", "Answered", 80, "e", False),
+                            ("med", "Typical", 80, "e", False),
+                            ("p95", "Slowest 5 %", 90, "e", False),
+                            ("fail", "Errors", 70, "e", False),
+                            ("lost", "No answer", 80, "e", False),
+                            ("retry", "Retries", 70, "e", False)])
+        store = self.app.deep.store
+        with store.lock:
+            stats = dns_resolver_stats(list(store.txns))
+        fmt = lambda v: "—" if v is None else f"{v:.0f} ms"
+        for r in stats:
+            tree.insert("", "end", values=(
+                r["server"], r["lookups"], r["answered"],
+                fmt(r["median_ms"]), fmt(r["p95_ms"]), r["failures"],
+                r["no_answer"], r["retries"]))
+        self.note.configure(text=(
+            "Timed from matched question/answer pairs (Full Power). One "
+            "slow resolver makes every site feel slow." if stats else
+            "No DNS timings yet: they are measured in Full Power mode."))
 
     # ---- I/O graph
     def io_series(self, rows, step):
@@ -29099,6 +29133,17 @@ class MiniWireshark:
         self.root.after(700, self._flush_ui)
         self.root.after(1000, self._tick_status)
         self.root.after(2000, self._refresh_insights)
+        self._journal_found = PATHS.journal if os.path.exists(
+            PATHS.journal) else ""
+        if self._journal_found and not TOOL_MODE:
+            self.root.after(2500, lambda: self._set_banner(
+                "\U0001F6DF  The last session ended unexpectedly. Session → "
+                "“Restore the interrupted session” brings it back (up to "
+                "its last 30 seconds).", kind="warn"))
+        self.root.after(30000, self._journal_tick)
+        if not TOOL_MODE and not self.config.get(
+                "performance.calibration", {}).get("pps"):
+            self.root.after(6000, self.start_calibration)
         self.root.after(300, self._flush_feed)
         self.root.after(3000, self._tick_model)
         self.root.after(200, self._drain_async_results)
@@ -29793,6 +29838,362 @@ class MiniWireshark:
         self.inspector_visible = show
         self.config.set("appearance.inspector", show)
         self.config.save()
+
+    # ---- M9/M10 ---------------------------------------------------------------
+    def device_visibility(self, dev):
+        m = self.model
+        if dev.ip in m.my_ips or dev.mac in m.my_macs:
+            return ("All of it: this is the computer MiniWireshark runs on.")
+        own = [f for f in m.flows.all_flows() if f.device_key == dev.key and
+               f.remote_public]
+        v = m.vantage.classify(offline=self.data_mode in ("offline",
+                                                          "session"))
+        if own:
+            return (f"Its own Internet connections are visible here "
+                    f"({len(own)} seen), so this computer sees its traffic "
+                    f"(a mirrored port, a hub, or it is this computer's "
+                    f"router path).")
+        if v == "endpoint":
+            return ("Only what it broadcasts or sends to this computer "
+                    "(announcements, name lookups shared on the network). "
+                    "Its private connections go straight to the router and "
+                    "are not visible from here.")
+        return ("Seen through local announcements and the traffic that "
+                "passes this computer; no Internet connections of its own "
+                "were visible.")
+
+    def current_tab_name(self):
+        for name, tab in self.tabs.items():
+            if tab.is_visible():
+                return name
+        return ""
+
+    def palette_items(self):
+        """Everything Ctrl+K can reach: (label, category, action)."""
+        items = []
+        for name, tab in self.tabs.items():
+            label = translate_text(STRINGS.get(tab.label_key, name)) if \
+                tab.label_key else name
+            items.append((re.sub(r"^\W+\s*", "", label), "tab",
+                          lambda n=name: self._select_tab(n)))
+        for sv in PacketsTab.SUBVIEWS:
+            items.append((f"Packets → {sv}", "view",
+                          lambda s=sv: (self._select_tab("packets"),
+                                        self.tabs["packets"].show_subview(
+                                            s))))
+        items.append(("Connections → Mail", "view",
+                      lambda: (self._select_tab("connections"),
+                               self.tabs["connections"].show_subview(
+                                   "Mail"))))
+        for page in SETTINGS_PAGES:
+            items.append((f"Settings: {page['title']}", "setting",
+                          lambda p=page["id"]: self._open_settings(p)))
+        acts = [("Start watching", self.start), ("Stop watching", self.stop),
+                ("Demo mode", self.start_demo),
+                ("Open a capture file…", self.open_pcap),
+                ("Save session…", self._save_session),
+                ("Shareable report…", self.export_shareable),
+                ("Diagnostics", self.open_diagnostics),
+                ("Components Center", self.open_components_center),
+                ("Storage used…", self.open_storage),
+                ("Privacy posture…", self.open_privacy_posture),
+                ("What changed recently", self.open_changes),
+                ("Show / hide the inspector", self.toggle_inspector),
+                ("Full Power on", lambda: self.set_perf_mode("Full Power")),
+                ("Full Power off (Automatic)",
+                 lambda: self.set_perf_mode("Automatic")),
+                ("Measure this computer's speed again",
+                 lambda: self.start_calibration(force=True)),
+                ("Save this view as a workspace…", self.save_workspace)]
+        items += [(a, "action", fn) for a, fn in acts]
+        for name in TASK_WORKSPACES:
+            items.append((f"Workspace: {name}", "workspace",
+                          lambda n=name: self.run_workspace(n)))
+        for name in (self.config.get("workspaces.saved", {}) or {}):
+            items.append((f"Workspace: {name}", "your workspace",
+                          lambda n=name: self.run_workspace(n)))
+        presets = self.config.get("filters.presets", {}) or {}
+        for name in presets:
+            items.append((f"Filter: {name}", "filter",
+                          lambda n=name: self._apply_preset(n)))
+        for expr in (self.config.get("filters.recent", []) or [])[:8]:
+            items.append((f"Filter: {expr}", "recent filter",
+                          lambda e=expr: (self._select_tab("packets"),
+                                          self.tabs["packets"]
+                                          .set_expression(e))))
+        for dev in list(self.model.registry.by_key.values())[:300]:
+            items.append((f"Device: {self.device_label(dev)}", "device",
+                          lambda k=dev.key: self.show_device(k)))
+        return items
+
+    def _apply_preset(self, name):
+        tab = self._select_tab("packets")
+        tab.show_subview("Packets")
+        tab.preset_var.set(name)
+        tab._load_preset()
+
+    def open_palette(self, _e=None):
+        self._palette = CommandPalette(self)
+        return self._palette
+
+    def set_perf_mode(self, mode):
+        self.config.set("performance.mode", mode)
+        self.config.save()
+        self._set_banner(f"⚡ Performance mode: {translate_text(mode)}.")
+
+    def run_workspace(self, name):
+        saved = (self.config.get("workspaces.saved", {}) or {}).get(name)
+        if saved:
+            tab = self._select_tab(saved.get("tab") or "dashboard")
+            if saved.get("subview"):
+                tab.show_subview(saved["subview"])
+            if saved.get("expr") is not None and saved.get("tab") == \
+                    "packets":
+                tab.set_expression(saved["expr"])
+            if saved.get("mode"):
+                self.set_perf_mode(saved["mode"])
+            return tab
+        if name == "Slow Internet":
+            tab = self._select_tab("health")
+        elif name == "Mail problem":
+            self.set_perf_mode("Full Power")
+            tab = self._select_tab("connections")
+            tab.show_subview("Mail")
+        elif name == "Who is new on my network":
+            tab = self._select_tab("devices")
+            self.root.after(100, self.open_changes)
+        else:
+            tab = self._select_tab("health")
+        self._set_banner(f"\U0001F9ED  {translate_text(name)}: "
+                         f"{translate_text(TASK_WORKSPACES.get(name, ''))}")
+        return tab
+
+    def save_workspace(self, name=None):
+        name = name or ask_text(self, "Save workspace",
+                                "Name for this view (tab, sub-view, filter "
+                                "and mode):")
+        if not name:
+            return None
+        cur = self.current_tab_name()
+        tab = self.tabs.get(cur)
+        saved = dict(self.config.get("workspaces.saved", {}) or {})
+        saved[name] = {"tab": cur, "subview": getattr(tab, "subview", ""),
+                       "expr": self.tabs["packets"].expr_var.get()
+                       if cur == "packets" else None,
+                       "mode": self.config.get("performance.mode")}
+        self.config.set("workspaces.saved", saved)
+        self.config.save()
+        return saved[name]
+
+    def save_alert_context(self, a, path=None, seconds=60):
+        """Flight recorder: the packets of the minute before an alert, as a
+        capture file (raw, so it cannot be redacted — you are asked)."""
+        rows = [d for d in self.all_rows if d.get("raw") and
+                a.when - seconds <= d["time"] <= a.when + 1]
+        if not rows:
+            messagebox.showinfo("Save what led to this", "The packets "
+                                "from before this alert are no longer in "
+                                "memory.", parent=self.root)
+            return 0
+        if path is None:
+            if not messagebox.askyesno(
+                    "Save what led to this",
+                    f"Save the {len(rows)} packets from the minute before "
+                    f"this alert as a capture file? Raw packets can "
+                    f"contain private data and cannot be redacted.",
+                    parent=self.root):
+                return 0
+            path = self._ask_save(".pcap", [("Capture file", "*.pcap")],
+                                  time.strftime("alert-%Y%m%d-%H%M%S.pcap"))
+            if not path:
+                return 0
+        n = self.save_pcap_to(path, rows)
+        self._set_banner(f"\U0001F4BE  Saved {n} packets from before the "
+                         f"alert to {path}", kind="good")
+        return n
+
+    def privacy_posture_sections(self):
+        store = self.deep.store
+        with store.lock:
+            mail = [t for t in store.txns if t.get("kind") == "mail"]
+        pp = privacy_posture(self.model, mail)
+        if not pp:
+            return [("Result", "No device used a protocol that sends its "
+                               "contents unencrypted (in what this computer "
+                               "could see).")]
+        secs = [("What this shows", "Devices that used protocols anyone "
+                 "between them and the other end could read. Contents are "
+                 "never shown here. Plain protocols are common on printers, "
+                 "cameras and old devices, and encryption is not a sign of "
+                 "anything bad either.")]
+        for key, protos in sorted(pp.items(), key=lambda x: -sum(
+                x[1].values())):
+            dev = self.model.registry.by_key.get(key)
+            name = self.device_label(dev) if dev else key
+            secs.append((name, "\n".join(f"• {p}: {n} connection(s)"
+                                          for p, n in sorted(
+                                              protos.items(),
+                                              key=lambda x: -x[1]))))
+        return secs
+
+    def open_privacy_posture(self):
+        return DetailDialog(self, "Privacy posture",
+                            self.privacy_posture_sections(), size="600x560")
+
+    def storage_rows(self):
+        h = getattr(self, "history", None)
+        sizes = {
+            "history": _folder_size(h.path if h is not None else
+                                    PATHS.history_db),
+            "packets": _folder_size(os.path.join(PATHS.data, "packets")),
+            "reference": sum(self.data.disk_usage().values()),
+            "packages": PRIVATE_PACKAGES.size_bytes(),
+            "sessions": _folder_size(PATHS.sessions),
+            "logs": _folder_size(PATHS.logs) + _folder_size(
+                os.path.join(PATHS.data, "boot")),
+        }
+        caps = {"packets": f"{self.config.get('history.packet_ring_mb', 200)}"
+                           f" MB" if self.config.get("history.packet_ring")
+                else "off",
+                "history": self.config.get("history.retention", ""),
+                "logs": "rotated automatically"}
+        return [(k, title, desc, sizes.get(k, 0), caps.get(k, ""))
+                for k, title, desc in STORAGE_CATEGORIES]
+
+    def clear_storage(self, key, parent=None):
+        parent = parent or self.root
+        if key == "history":
+            return self.clear_history(parent)
+        if key == "reference":
+            return self.components_reset(parent)
+        if key == "packages":
+            messagebox.showinfo("Private packages", "These are needed to "
+                                "capture. Use Diagnostics → Repair to "
+                                "reinstall them instead of deleting them.",
+                                parent=parent)
+            return False
+        if not messagebox.askyesno("Clear", "Delete these files?",
+                                   parent=parent):
+            return False
+        targets = {"packets": [os.path.join(PATHS.data, "packets")],
+                   "sessions": [PATHS.sessions],
+                   "logs": [PATHS.logs, os.path.join(PATHS.data, "boot")]
+                   }.get(key, [])
+        keep = {os.path.abspath(PATHS.log_file)}
+        if BOOT is not None:
+            keep.add(os.path.abspath(BOOT.path))
+        for folder in targets:
+            for root, _d, files in os.walk(folder):
+                for f in files:
+                    p = os.path.abspath(os.path.join(root, f))
+                    if p not in keep:
+                        with contextlib.suppress(OSError):
+                            os.remove(p)
+        return True
+
+    def open_storage(self):
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title("Storage used")
+        win.geometry("760x420")
+        win.configure(bg=t["tab_bg"])
+        tk.Label(win, text="Where MiniWireshark's disk space goes. Nothing "
+                 "is sent anywhere.", bg=t["tab_bg"], fg=t["text_fg"],
+                 font=("TkDefaultFont", 11)).pack(anchor="w", padx=14,
+                                                  pady=(12, 6))
+        body = tk.Frame(win, bg=t["tab_bg"])
+        body.pack(fill="both", expand=True, padx=14)
+        rows = self.storage_rows()
+        for i, (key, title, desc, size, cap) in enumerate(rows):
+            tk.Label(body, text=title, bg=t["tab_bg"], fg=t["text_fg"],
+                     font=("TkDefaultFont", 10, "bold"), anchor="w").grid(
+                row=i * 2, column=0, sticky="w", pady=(6, 0))
+            tk.Label(body, text=_human_bytes(size) + (f"   (limit: {cap})"
+                                                      if cap else ""),
+                     bg=t["tab_bg"], fg=t["text_fg"]).grid(
+                row=i * 2, column=1, sticky="e", padx=10)
+            ttk.Button(body, text="Clear…", command=lambda k=key: (
+                self.clear_storage(k, win), win.destroy(),
+                self.open_storage())).grid(row=i * 2, column=2, rowspan=2)
+            tk.Label(body, text=desc, bg=t["tab_bg"], fg=t["muted_fg"],
+                     font=("TkDefaultFont", 9), anchor="w").grid(
+                row=i * 2 + 1, column=0, columnspan=2, sticky="w")
+        body.columnconfigure(0, weight=1)
+        win._mw_rows = rows
+        return win
+
+    def _journal_tick(self):
+        """Every 30 s while live: a crash-safe copy of the session (removed
+        on a clean exit)."""
+        try:
+            if self.data_mode == "live" and self.model.has_data() and \
+                    self.count != getattr(self, "_journal_count", -1):
+                self.write_journal()
+        except Exception:                            # noqa: BLE001
+            LOG.exception("session journal")
+        with contextlib.suppress(tk.TclError):
+            self.root.after(30000, self._journal_tick)
+
+    def write_journal(self, path=None):
+        path = path or PATHS.journal
+        payload = SessionCodec.serialize(self.model, self.session_meta())
+        body = json.dumps(payload, default=str, sort_keys=True)
+        atomic_write_json(path, {"journal": 1, "saved_at": time.time(),
+                                 "sha256": hashlib.sha256(
+                                     body.encode()).hexdigest(),
+                                 "session": payload})
+        self._journal_count = self.count
+        self._journal_written = True
+        return path
+
+    def restore_journal(self, path=None):
+        path = path or getattr(self, "_journal_found", "") or PATHS.journal
+        try:
+            with open(path, encoding="utf-8") as f:
+                j = json.load(f)
+            body = json.dumps(j["session"], default=str, sort_keys=True)
+            if hashlib.sha256(body.encode()).hexdigest() != j["sha256"]:
+                raise ValueError("the journal is damaged")
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            messagebox.showerror("Restore", f"The interrupted session could "
+                                 f"not be read: {e}", parent=self.root)
+            return False
+        tmp = os.path.join(PATHS.sessions, "restored.mwsession.json")
+        atomic_write_json(tmp, j["session"])
+        self._load_session(tmp)
+        with contextlib.suppress(OSError):
+            os.remove(path)
+        self._journal_found = ""
+        return True
+
+    def start_calibration(self, force=False):
+        """3 seconds of synthetic packets (no network traffic) measure this
+        computer; the result sets Full Power's default core count."""
+        if getattr(self, "_calibrating", False):
+            return
+
+        def run():
+            try:
+                pps = calibrate(1.5)
+            except Exception:                        # noqa: BLE001
+                LOG.exception("calibration")
+                pps = 0
+            self._async_results.put(lambda: self._calibrated(pps))
+        self._calibrating = True
+        threading.Thread(target=run, daemon=True, name="calibrate").start()
+
+    def _calibrated(self, pps):
+        self._calibrating = False
+        if not pps:
+            return
+        cores = os.cpu_count() or 1
+        self.config.set("performance.calibration", {
+            "pps": round(pps), "when": time.time(), "cores": cores})
+        if self.config.get("performance.full_power_cores", 2) == 2:
+            self.config.set("performance.full_power_cores",
+                            max(1, min(4, cores - 1)))
+        self.config.save()
+        LOG.info("calibration: %.0f packets/s on %d cores", pps, cores)
 
     def follow_stream(self, fid):
         """Packets → Streams on one connection (any mode)."""
@@ -31287,6 +31688,7 @@ class MiniWireshark:
             "find": self._focus_search,
             "undo": self._undo_shortcut,
             "inspector": lambda e=None: self.toggle_inspector(),
+            "palette": lambda e=None: self.open_palette(),
         }
         shortcuts = self.config.data.get("shortcuts", DEFAULT_SHORTCUTS)
         for name, seq in shortcuts.items():
@@ -33387,6 +33789,8 @@ class MiniWireshark:
                     "Programs accepting connections",
                     "\n".join(f"• {prog} — {proto} {port} ({scope})"
                               for proto, port, scope, prog in lst[:15])))
+        sections.append(("How much of it MiniWireshark can see",
+                         self.device_visibility(dev)))
         b = m.baselines.devices.get(dev.key)
         if b is not None and b.n:
             sections.append(("Normal behaviour (learned)",
@@ -33756,7 +34160,8 @@ class MiniWireshark:
                            f"{a.reason}", self.alert_report(a), actions=[
             ("Acknowledge", ack),
             ("Mark expected", lambda: self.alert_mark_expected(a)),
-            ("Go to related", lambda: self.alert_goto_related(a))],
+            ("Go to related", lambda: self.alert_goto_related(a)),
+            ("Save what led to this…", lambda: self.save_alert_context(a))],
             size="560x560")
 
     def alert_mark_expected(self, a):
@@ -34092,6 +34497,10 @@ class MiniWireshark:
         if os.path.exists(PATHS.autosave):
             m.add_command(label="Open last autosave",
                           command=lambda: self._load_session(PATHS.autosave))
+        if getattr(self, "_journal_found", "") and \
+                os.path.exists(self._journal_found):
+            m.add_command(label="Restore the interrupted session",
+                          command=self.restore_journal)
         self._popup_at_pointer(m)
 
     def _open_export_menu(self):
@@ -35695,6 +36104,13 @@ class MiniWireshark:
                     self.save_pcap_to(path, self.all_rows)
             if self.config.get("history.retention") != "Session only":
                 self.autosave("exit")
+            with contextlib.suppress(OSError):
+                if os.path.exists(PATHS.journal) and \
+                        PATHS.journal != getattr(self, "_journal_found", ""):
+                    os.remove(PATHS.journal)
+                elif os.path.exists(PATHS.journal) and \
+                        getattr(self, "_journal_written", False):
+                    os.remove(PATHS.journal)
         except Exception:                            # noqa: BLE001
             LOG.exception("while saving on exit")
         self._stop_capture_only()
@@ -36434,6 +36850,11 @@ class DiagnosticsWindow:
                 f"; window missed its checks for "
                 f"{w.window_frozen:.0f} s" if w and w.window_frozen
                 else ""),
+            "Calibration         " + (
+                f"{app.config.get('performance.calibration', {}).get('pps', 0):,}"
+                f" packets/s analysed on this computer" if
+                app.config.get("performance.calibration", {}).get("pps")
+                else "not measured yet"),
             "Full Power:"] + [f"   {x}" for x in app.deep.status_text()] + [
             "Last capture fault  " + (
                 f"{app.last_fault[1]} ({app.last_fault[3] or 'no detail'})"
@@ -36571,6 +36992,201 @@ class DiagnosticsWindow:
             return (f"Internet reachable: {target} answered in {ms:.0f} ms."
                     if ok else f"Could not reach {target}.")
         self._bg(run, "Testing the Internet connection")
+
+
+# ---- V5 M9/M10: context, resilience and speed of use ---------------------------
+def fuzzy_score(query, text):
+    """Subsequence match with bonuses for word starts and runs; None when
+    the letters are not all there in order. Higher is better."""
+    q = query.lower().strip()
+    t = text.lower()
+    if not q:
+        return 0
+    if q in t:
+        return 1000 - t.index(q) * 2 - len(t) * 0.01
+    score, ti, prev = 0, 0, -2
+    for ch in q:
+        if ch == " ":
+            continue
+        j = t.find(ch, ti)
+        if j < 0:
+            return None
+        score += 10 if j == prev + 1 else 1
+        if j == 0 or not t[j - 1].isalnum():
+            score += 8
+        prev, ti = j, j + 1
+    return score - len(t) * 0.01
+
+
+TASK_WORKSPACES = {
+    "Slow Internet": "Health tab with the Wi-Fi and router checks, so the "
+                     "likely culprit is on screen.",
+    "Mail problem": "Full Power on, then Connections → Mail, which shows "
+                    "which mail server failed and how.",
+    "Who is new on my network": "The Devices tab plus what changed in the "
+                                "last hour.",
+    "Is my router OK": "The Health tab's router answers and the Security "
+                       "tab's router checks.",
+}
+
+
+class CommandPalette:
+    """Ctrl+K: type to reach any tab, view, setting, filter, device or
+    action."""
+
+    def __init__(self, app):
+        self.app = app
+        t = app.theme
+        self.items = app.palette_items()
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Go to…")
+        self.win.geometry("620x420")
+        self.win.configure(bg=t["tab_bg"])
+        self.win.transient(app.root)
+        self.q = tk.StringVar()
+        e = ttk.Entry(self.win, textvariable=self.q, font=("TkDefaultFont",
+                                                           12))
+        e.pack(fill="x", padx=12, pady=(12, 6))
+        self.lb = tk.Listbox(self.win, bg=t["text_bg"], fg=t["text_fg"],
+                             selectbackground=t["accent"],
+                             activestyle="none", highlightthickness=0,
+                             font=("TkDefaultFont", 11))
+        self.lb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.shown = []
+        self.q.trace_add("write", lambda *a: self.filter())
+        e.bind("<Return>", self.run)
+        e.bind("<Down>", lambda ev: self._move(1))
+        e.bind("<Up>", lambda ev: self._move(-1))
+        self.lb.bind("<Double-1>", self.run)
+        self.win.bind("<Escape>", lambda ev: self.win.destroy())
+        self.filter()
+        e.focus_set()
+
+    def filter(self):
+        q = self.q.get()
+        scored = []
+        for label, cat, fn in self.items:
+            s = fuzzy_score(q, f"{label} {cat}")
+            if s is not None:
+                scored.append((-s, label, cat, fn))
+        scored.sort(key=lambda x: x[0])
+        self.shown = scored[:60]
+        self.lb.delete(0, "end")
+        for _s, label, cat, _fn in self.shown:
+            self.lb.insert("end", f"{label}    — {cat}")
+        if self.shown:
+            self.lb.selection_set(0)
+
+    def _move(self, d):
+        sel = self.lb.curselection()
+        i = max(0, min(len(self.shown) - 1, (sel[0] if sel else 0) + d))
+        self.lb.selection_clear(0, "end")
+        self.lb.selection_set(i)
+        self.lb.see(i)
+        return "break"
+
+    def run(self, _e=None):
+        sel = self.lb.curselection()
+        if not sel or sel[0] >= len(self.shown):
+            return
+        fn = self.shown[sel[0]][3]
+        self.win.destroy()
+        fn()
+
+
+STORAGE_CATEGORIES = (
+    ("history", "History database",
+     "What MiniWireshark learned over time (devices, sites, events)."),
+    ("packets", "Packet history",
+     "Raw packets kept on disk (off unless you turned it on)."),
+    ("reference", "Optional data (Components Center)",
+     "Vendor, port, encrypted-DNS and reputation lists you downloaded."),
+    ("packages", "Private packages folder",
+     "The capture engine and optional helpers installed for this Python."),
+    ("sessions", "Saved sessions, autosave and crash journal",
+     "Sessions you saved and the automatic copies."),
+    ("logs", "Logs and startup history",
+     "Diagnostics text; nothing captured from the network."),
+)
+
+
+def _folder_size(path):
+    total = 0
+    if not path or not os.path.exists(path):
+        return 0
+    if os.path.isfile(path):
+        return os.path.getsize(path)
+    for root, _dirs, files in os.walk(path):
+        for f in files:
+            with contextlib.suppress(OSError):
+                total += os.path.getsize(os.path.join(root, f))
+    return total
+
+
+def privacy_posture(model, mail_sessions=()):
+    """Devices that used protocols anyone on the path could read. Never a
+    verdict: plaintext is common on home gear, and encryption is not a
+    sign of anything bad either."""
+    plain = {80: "web pages (HTTP)", 21: "file transfer (FTP)",
+             23: "remote terminal (Telnet)", 110: "mail download (POP3)",
+             143: "mail (IMAP)", 25: "mail sending (SMTP)",
+             1883: "smart-home messages (MQTT)", 554: "video streams (RTSP)",
+             5060: "internet calls (SIP)", 69: "file transfer (TFTP)"}
+    out = defaultdict(lambda: defaultdict(int))
+    for f in model.flows.all_flows():
+        if f.device_key and f.remote_port in plain and \
+                f.encrypted != "yes":
+            out[f.device_key][plain[f.remote_port]] += 1
+    for s in mail_sessions:
+        if s.get("auth_before_tls"):
+            dev = model.device_for(s.get("client", ""), None)
+            if dev is not None:
+                out[dev.key][f"{s.get('proto')} login before "
+                             f"encryption"] += 1
+    return {k: dict(v) for k, v in out.items()}
+
+
+def dns_resolver_stats(txns):
+    """Per resolver: lookups, answers, latency median / 95th percentile,
+    failures and retries (from matched DNS pairs only)."""
+    by = defaultdict(list)
+    for t in txns:
+        if t.get("kind") == "dns":
+            by[t.get("server", "?")].append(t)
+    out = []
+    for srv, ts in by.items():
+        lat = sorted(t["latency_ms"] for t in ts
+                     if isinstance(t.get("latency_ms"), (int, float)))
+        q = lambda p: lat[min(len(lat) - 1, int(p * len(lat)))] if lat \
+            else None
+        out.append({"server": srv, "lookups": len(ts),
+                    "answered": len(lat),
+                    "median_ms": q(0.5), "p95_ms": q(0.95),
+                    "failures": sum(1 for t in ts if t.get("rcode")),
+                    "no_answer": sum(1 for t in ts
+                                     if t.get("result") == "no answer"),
+                    "retries": sum(max(0, (t.get("tries") or 1) - 1)
+                                   for t in ts)})
+    return sorted(out, key=lambda r: -r["lookups"])
+
+
+def calibrate(seconds=1.5):
+    """A short synthetic replay through the real decode and model path
+    (no network traffic). → packets per second on this computer."""
+    frames = ScenarioBuilder().busy_mix(4000)
+    cfg = AppConfig(path=os.path.join(tempfile.mkdtemp(), "cal.json"))
+    m = NetworkModel(cfg, *scenario_identity()[:3])
+    m.set_identity(local_nets=scenario_identity()[3])
+    m.use_packet_clock = True
+    reasm = TlsReassembler()
+    n = 0
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < seconds:
+        for raw, ts, lt in frames[:1000]:
+            d = fast_decode(raw, ts, lt, reasm)
+            m.ingest(d)
+            n += 1
+    return n / max(1e-6, time.perf_counter() - t0)
 
 
 class CrashDialog:
@@ -46660,6 +47276,36 @@ def test_follow_stream_and_explain(ctx):
     tcp = sum(v[0] for k, v in h.items() if len(k) == 4 and k[3] == "TCP")
     assert tcp == sum(1 for d in rows if d["transport"] == "TCP")
 
+@self_test(slow=False)
+def test_palette_matcher_resolvers_posture(ctx):
+    """M9/M10 helpers: the palette's matcher ranks sensible hits first;
+    DNS resolver statistics come from matched pairs; the privacy posture
+    lists plain-text protocols per device; calibration measures."""
+    names = ["Connections → Mail", "Settings: Performance", "Device: TV",
+             "Packets → Statistics", "Demo mode"]
+    best = max(names, key=lambda n: fuzzy_score("mail", n) or -1)
+    assert best == "Connections → Mail"
+    assert fuzzy_score("pkst", "Packets → Statistics") is not None
+    assert fuzzy_score("zzz", "Demo mode") is None
+    an = DeepAnalyzer()
+    tx = []
+    for i, (raw, ts, lt) in enumerate(
+            ScenarioBuilder().protocol_exchanges()):
+        tx += an.process(i + 1, ts, lt, raw)[2]
+    tx += an.flush(1e12, True)[1]
+    st = dns_resolver_stats(tx)
+    assert st[0]["server"] == "192.168.1.1" and st[0]["lookups"] == 4
+    assert st[0]["no_answer"] == 1 and st[0]["failures"] == 1 and \
+        st[0]["retries"] == 1 and st[0]["median_ms"] is not None
+    if ctx.scapy_ok:
+        m = scenario_model(ctx.cfg(), ScenarioBuilder().home_network())
+        pp = privacy_posture(m, [{"auth_before_tls": True, "proto": "IMAP",
+                                  "client": ScenarioBuilder.ME[0]}])
+        mine = pp.get(ScenarioBuilder.ME[1]) or next(iter(pp.values()))
+        assert any("HTTP" in k for k in mine) and \
+            any("IMAP login" in k for k in mine), pp
+    assert calibrate(0.2) > 100
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -47786,11 +48432,78 @@ def _gs_workspace(app, ctx):
             tab.stats.kind_var.set(k)
             tab.stats.refresh(force=True)
             _gui_pump(root, 0.15)
-        assert tab.stats.canvas is not None
+            if k == "I/O graph":
+                assert tab.stats.canvas is not None
         tab.show_subview("Packets")
     finally:
         app.config.set("performance.mode", "Automatic")
         app.config.set("performance.deep_runner", "Automatic")
+
+
+@gui_test_step("palette, workspaces, flight recorder, storage, journal")
+def _gs_m10(app, ctx):
+    root = app.root
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    m.use_packet_clock = True              # alerts carry packet times
+    app.replace_model(m)
+    app.data_mode = "live"
+    sink = app.lossless_sink()
+    frames = ScenarioBuilder().home_network()
+    for raw, ts, lt in frames:
+        sink(raw, ts, lt)
+    _gui_pump(root, until=lambda: app.count >= len(frames), timeout=30)
+    # command palette
+    p = app.open_palette()
+    p.q.set("conn mail")
+    _gui_pump(root, 0.1)
+    assert p.shown and p.shown[0][1] == "Connections → Mail", p.shown[:3]
+    p.run()
+    _gui_pump(root, 0.1)
+    assert app.current_tab_name() == "connections" and \
+        app.tabs["connections"].subview == "Mail"
+    labels = [x[0] for x in app.palette_items()]
+    assert any(x.startswith("Device: ") for x in labels) and \
+        "Workspace: Slow Internet" in labels
+    # workspaces
+    app.run_workspace("Slow Internet")
+    assert app.current_tab_name() == "health"
+    app._select_tab("packets").show_subview("Statistics")
+    saved = app.save_workspace("My stats")
+    assert saved["tab"] == "packets" and saved["subview"] == "Statistics"
+    app._select_tab("devices")
+    app.run_workspace("My stats")
+    assert app.current_tab_name() == "packets" and \
+        app.tabs["packets"].subview == "Statistics"
+    tab = app.tabs["packets"]
+    tab.stats.kind_var.set("DNS resolvers")
+    tab.stats.refresh(force=True)
+    tab.show_subview("Packets")
+    # flight recorder
+    a = next(iter(app.model.alerts.alerts.values()), None)
+    if a is not None:
+        n = app.save_alert_context(a, path=ctx.path("alert.pcap"))
+        assert n > 0 and os.path.getsize(ctx.path("alert.pcap")) > 24
+    # storage, privacy posture, device visibility
+    w = app.open_storage()
+    keys = [r[0] for r in w._mw_rows]
+    assert keys == [c[0] for c in STORAGE_CATEGORIES]
+    w.destroy()
+    secs = app.privacy_posture_sections()
+    assert any("HTTP" in s[1] for s in secs), secs
+    dev = next(d for d in app.model.registry.by_key.values()
+               if d.ip == ScenarioBuilder.PHONE[0])
+    rep = dict(app.device_report(dev))
+    assert "How much of it MiniWireshark can see" in rep
+    # crash-safe journal: write, then restore it
+    path = app.write_journal(ctx.path("journal.json"))
+    n_dev = len(app.model.registry.by_key)
+    assert app.restore_journal(path)
+    _gui_pump(root, 0.5)
+    assert len(app.model.registry.by_key) == n_dev
+    assert not os.path.exists(path)
+    app.data_mode = "idle"
 
 
 @gui_test_step("corrections: rename, merge, undo from the window")
