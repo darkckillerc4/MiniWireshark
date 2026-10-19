@@ -17010,7 +17010,8 @@ def _default_config():
         "history": {"enabled": False, "retention": "30 days",
                     "custom_days": 14, "save_raw_packets": False,
                     "packet_ring": False, "packet_ring_mb": 200},
-        "filters": {"presets": json.loads(json.dumps(DEFAULT_FILTER_PRESETS))},
+        "filters": {"presets": json.loads(json.dumps(DEFAULT_FILTER_PRESETS)),
+                    "recent": []},
         "diagnostics": {"verbose_logging": False},
     }
 
@@ -24522,7 +24523,7 @@ class MailView:
         dev = self.app.model.device_for(r.get("client", ""), None)
         if r.get("proto") == "webmail":
             return (name(dev.key) if dev else r.get("client", ""),
-                    r.get("summary", "").split("service ", 1)[-1][:60],
+                    r.get("service") or r.get("server", ""),
                     "webmail", r.get("encryption", ""), "—", "—", "—", "—",
                     "—")
         return (name(dev.key) if dev else r.get("client", ""),
@@ -26182,6 +26183,291 @@ class SecurityTab(BaseTab):
 
 
 # ---- Display filters (independent of the capture BPF filter) ----------------
+# ---- V5 M8: field filter expressions -------------------------------------------
+#  ip.src == 192.168.1.5 · tcp.port == 443 · dns.qry.name contains "example"
+#  · smtp · expert.severity >= warning · frame.len > 1000, combined with
+#  and / or / not and parentheses. A hand-written parser compiles to Python
+#  closures: no eval, no user regex. Common fields read the packet row
+#  directly; any other registry field dissects the packet once (cached).
+FILTER_OPS = ("==", "!=", ">=", "<=", ">", "<", "contains")
+_FTOK = re.compile(r'\s*(?:(\(|\)|==|!=|>=|<=|>|<|&&|\|\||!)|"((?:[^"\\]|'
+                   r'\\.)*)"|([^\s()=!<>"&|]+))')
+FILTER_PROTOCOLS = {
+    "eth": ("eth",), "arp": ("arp",), "ip": ("ip",), "ipv6": ("ipv6",),
+    "icmp": ("icmp",), "icmpv6": ("icmpv6",), "tcp": ("tcp",),
+    "udp": ("udp",), "dns": ("dns",), "mdns": ("dns",), "dhcp": ("dhcp",),
+    "tls": ("tls",), "quic": ("quic",), "http": ("http",),
+    "ntp": ("ntp",), "vlan": ("vlan",)}
+FILTER_PORT_PROTOS = {"smtp": {25, 465, 587}, "imap": {143, 993},
+                      "pop3": {110, 995}, "ssh": {22}, "ftp": {21},
+                      "telnet": {23}, "smb": {445, 139}, "rdp": {3389},
+                      "mqtt": {1883, 8883}, "sip": {5060, 5061},
+                      "rtsp": {554}, "ssdp": {1900}, "dot": {853}}
+EXPERT_RANK = {"chat": 0, "note": 1, "warn": 2, "warning": 2, "error": 3}
+SPECIAL_FIELDS = {
+    "frame.number": "int", "ip.addr": "ipv4", "ipv6.addr": "ipv6",
+    "tcp.port": "int", "udp.port": "int", "eth.addr": "mac",
+    "expert.severity": "severity", "frame.time_relative": "float",
+    "tcp.stream": "int"}
+
+
+def _row_field(d, key):
+    """Fast values straight from the packet row (None = needs dissection).
+    Always a list (a field can occur twice)."""
+    if key in ("frame.len",):
+        return [d.get("length")]
+    if key == "frame.number":
+        return [d.get("no")]
+    if key in ("ip.src", "ip.dst", "ip.addr"):
+        if d.get("ipver") != 4:
+            return []
+        return [d.get("src_ip")] if key == "ip.src" else \
+            [d.get("dst_ip")] if key == "ip.dst" else \
+            [d.get("src_ip"), d.get("dst_ip")]
+    if key in ("ipv6.src", "ipv6.dst", "ipv6.addr"):
+        if d.get("ipver") != 6:
+            return []
+        return [d.get("src_ip")] if key == "ipv6.src" else \
+            [d.get("dst_ip")] if key == "ipv6.dst" else \
+            [d.get("src_ip"), d.get("dst_ip")]
+    tr = (d.get("transport") or "").lower()
+    if key.startswith(("tcp.", "udp.")):
+        proto = key.split(".", 1)[0]
+        if key.endswith((".srcport", ".dstport", ".port")) and tr != proto:
+            return []
+        if key.endswith(".srcport"):
+            return [d.get("sport")]
+        if key.endswith(".dstport"):
+            return [d.get("dport")]
+        if key.endswith(".port"):
+            return [d.get("sport"), d.get("dport")]
+    if key == "tcp.stream":
+        return [d.get("flow_id")] if d.get("flow_id") else []
+    if key in ("eth.src", "eth.dst", "eth.addr"):
+        if d.get("linktype", 1) != 1:
+            return []
+        return [d.get("src_mac")] if key == "eth.src" else \
+            [d.get("dst_mac")] if key == "eth.dst" else \
+            [d.get("src_mac"), d.get("dst_mac")]
+    return None
+
+
+class FieldFilter:
+    """A compiled field expression: fn(row, ctx) → bool."""
+
+    def __init__(self, text):
+        self.text = text.strip()
+        self.toks = []
+        for m in _FTOK.finditer(self.text):
+            if m.group(1):
+                self.toks.append(("op", m.group(1)))
+            elif m.group(2) is not None:
+                self.toks.append(("str", m.group(2).replace('\\"', '"')))
+            elif m.group(3):
+                self.toks.append(("word", m.group(3)))
+        rebuilt = "".join(m.group(0) for m in _FTOK.finditer(self.text))
+        if rebuilt.strip().replace(" ", "") != self.text.replace(" ", ""):
+            raise ValueError("Unexpected character in the filter.")
+        self.i = 0
+        if not self.toks:
+            raise ValueError("The filter is empty.")
+        self.fn = self._or()
+        if self.i != len(self.toks):
+            raise ValueError(f"Unexpected “{self.toks[self.i][1]}”.")
+        self.needs_dissect = getattr(self, "_dissect", False)
+
+    @staticmethod
+    def looks_like(text):
+        """True when the text uses the field syntax (not the friendly
+        tokens such as site: and port:)."""
+        if re.search(r"==|!=|>=|<=|&&|\|\||\bcontains\b|[()]", text):
+            return True
+        words = re.findall(r"[A-Za-z][\w.]*|\S", text)
+        for w in words:
+            if "." in w and (w.lower() in FIELD_REGISTRY or
+                             w.lower() in SPECIAL_FIELDS):
+                return True
+        protos = set(FILTER_PROTOCOLS) | set(FILTER_PORT_PROTOS) | {
+            "and", "or", "not", "!"}
+        return bool(words) and all(w.lower() in protos for w in words) \
+            and any(w.lower() not in ("and", "or", "not", "!")
+                    for w in words)
+
+    # ---- parser
+    def _peek(self):
+        return self.toks[self.i] if self.i < len(self.toks) else (None,
+                                                                 None)
+
+    def _take(self):
+        t = self._peek()
+        self.i += 1
+        return t
+
+    def _or(self):
+        parts = [self._and()]
+        while self._peek()[1] in ("or", "||"):
+            self._take()
+            parts.append(self._and())
+        if len(parts) == 1:
+            return parts[0]
+        return lambda d, c: any(p(d, c) for p in parts)
+
+    def _and(self):
+        parts = [self._not()]
+        while self._peek()[1] in ("and", "&&"):
+            self._take()
+            parts.append(self._not())
+        if len(parts) == 1:
+            return parts[0]
+        return lambda d, c: all(p(d, c) for p in parts)
+
+    def _not(self):
+        if self._peek()[1] in ("not", "!"):
+            self._take()
+            inner = self._not()
+            return lambda d, c: not inner(d, c)
+        return self._primary()
+
+    def _primary(self):
+        kind, val = self._take()
+        if kind is None:
+            raise ValueError("The filter ends too early.")
+        if val == "(":
+            inner = self._or()
+            if self._take()[1] != ")":
+                raise ValueError("A “(” is not closed.")
+            return inner
+        if kind != "word":
+            raise ValueError(f"Expected a field name, found “{val}”.")
+        field = val.lower()
+        nxt = self._peek()
+        if nxt[1] in FILTER_OPS or nxt[1] == "contains":
+            op = self._take()[1]
+            vk, value = self._take()
+            if vk is None or value in ("(", ")"):
+                raise ValueError(f"“{field} {op}” needs a value.")
+            return self._compare(field, op, value)
+        return self._exists(field)
+
+    # ---- leaves
+    def _check_field(self, field):
+        if field in FIELD_REGISTRY or field in SPECIAL_FIELDS:
+            return
+        close = [k for k in FIELD_REGISTRY if k.startswith(field + ".")]
+        raise ValueError(f"Unknown field “{field}”." + (
+            f" Try {close[0]}." if close else
+            " The Fields… button lists them all."))
+
+    def _values(self, field):
+        if field == "expert.severity":
+            return lambda d, c: c.expert_severities(d)
+        fast = field in ("frame.len", "frame.number", "ip.src", "ip.dst",
+                         "ip.addr", "ipv6.src", "ipv6.dst", "ipv6.addr",
+                         "tcp.srcport", "tcp.dstport", "tcp.port",
+                         "udp.srcport", "udp.dstport", "udp.port",
+                         "eth.src", "eth.dst", "eth.addr", "tcp.stream")
+        if fast:
+            return lambda d, c: [v for v in _row_field(d, field)
+                                 if v is not None]
+        self._dissect = True
+        return lambda d, c: c.dissection(d).values(field)
+
+    def _exists(self, field):
+        if field in FILTER_PROTOCOLS:
+            keys = FILTER_PROTOCOLS[field]
+            if field in ("tcp", "udp"):
+                return lambda d, c: (d.get("transport") or "").lower() == \
+                    field
+            if field in ("arp",):
+                return lambda d, c: d.get("tag") == "ARP" or \
+                    d.get("proto") == "ARP"
+            self._dissect = True
+            return lambda d, c: any(n.key in keys for n in
+                                    c.dissection(d).nodes) and (
+                field != "mdns" or 5353 in (d.get("sport"), d.get("dport")))
+        if field in FILTER_PORT_PROTOS:
+            ports = FILTER_PORT_PROTOS[field]
+            return lambda d, c: d.get("sport") in ports or \
+                d.get("dport") in ports
+        self._check_field(field)
+        get = self._values(field)
+        return lambda d, c: bool(get(d, c))
+
+    def _compare(self, field, op, raw):
+        self._check_field(field)
+        get = self._values(field)
+        ftype = SPECIAL_FIELDS.get(field) or FIELD_REGISTRY[field][0]
+        if ftype == "severity":
+            rank = EXPERT_RANK.get(raw.lower())
+            if rank is None:
+                raise ValueError("expert.severity is chat, note, warning or "
+                                 "error.")
+            want = rank
+            conv = EXPERT_RANK.get
+        elif op == "contains":
+            want = raw.lower()
+            return lambda d, c: any(want in str(v).lower()
+                                    for v in get(d, c))
+        elif ftype in ("int", "float", "hex"):
+            try:
+                want = int(raw, 0) if ftype != "float" else float(raw)
+            except ValueError:
+                raise ValueError(f"{field} needs a number, not “{raw}”.")
+            conv = None
+        elif ftype == "bool":
+            want = raw.lower() in ("1", "true", "yes", "on")
+            if raw.lower() not in ("1", "0", "true", "false", "yes", "no",
+                                   "on", "off"):
+                raise ValueError(f"{field} is yes or no.")
+            conv = bool
+        elif ftype in ("ipv4", "ipv6") and "/" in raw:
+            try:
+                net = ipaddress.ip_network(raw, strict=False)
+            except ValueError:
+                raise ValueError(f"“{raw}” is not an address range.")
+            if op not in ("==", "!="):
+                raise ValueError("Address ranges work with == and !=.")
+            inside = lambda v: _in_net(v, net)
+            if op == "==":
+                return lambda d, c: any(inside(v) for v in get(d, c))
+            return lambda d, c: not any(inside(v) for v in get(d, c))
+        else:
+            want = raw.lower()
+            conv = lambda v: str(v).lower()
+        cmp = {"==": lambda a: a == want, "!=": lambda a: a != want,
+               ">": lambda a: a > want, "<": lambda a: a < want,
+               ">=": lambda a: a >= want, "<=": lambda a: a <= want}[op]
+
+        def test(d, c):
+            vals = get(d, c)
+            if not vals:
+                return op == "!="
+            for v in vals:
+                try:
+                    a = conv(v) if conv else v
+                    if a is None:
+                        continue
+                    if op == "!=":
+                        if not cmp(a):
+                            return False
+                    elif cmp(a):
+                        return True
+                except TypeError:
+                    continue
+            return op == "!="
+        return test
+
+    def match(self, d, ctx):
+        return self.fn(d, ctx)
+
+
+def _in_net(v, net):
+    try:
+        return ipaddress.ip_address(v) in net
+    except (ValueError, TypeError):
+        return False
+
+
 class DisplayFilter:
     """A friendly display filter. GUI fields AND an optional text
     expression:  terms are ANDed, `or` separates alternatives, `-term` or
@@ -26196,7 +26482,9 @@ class DisplayFilter:
 
     def __init__(self, proto="All", device_key=None, site="", direction="Both",
                  port="", severity="Any", marked_only=False, expr=""):
-        self.groups = self.compile(expr)
+        self.field = FieldFilter(expr) if expr and \
+            FieldFilter.looks_like(expr) else None
+        self.groups = [] if self.field else self.compile(expr)
         self.proto = proto
         self.device_key = device_key
         self.site = site.strip().lower()
@@ -26313,6 +26601,8 @@ class DisplayFilter:
             return False
         if self.marked_only and not ctx.is_marked(d):
             return False
+        if self.field is not None:
+            return self.field.match(d, ctx)
         if not self.groups:
             return True
         return any(all(self._term(d, ctx, t) != t[0] for t in g)
@@ -26376,6 +26666,30 @@ class FilterContext:
     def __init__(self, app):
         self.app = app
         self._alert_cache = None
+        self._dis = OrderedDict()
+        self._sev = (None, {})
+
+    def dissection(self, d):
+        """The packet's field tree (cached for the last 5000 packets)."""
+        key = (d.get("no"), id(d.get("raw")))
+        got = self._dis.get(key)
+        if got is None:
+            got = dissect(d.get("raw") or b"", d.get("linktype", 1))
+            self._dis[key] = got
+            if len(self._dis) > 5000:
+                self._dis.popitem(last=False)
+        return got
+
+    def expert_severities(self, d):
+        store = self.app.deep.store
+        ver, idx = self._sev
+        if ver != store.version:
+            idx = {}
+            with store.lock:
+                for f in store.findings:
+                    idx.setdefault(f[0], []).append(f[2])
+            self._sev = (store.version, idx)
+        return idx.get(d.get("no"), [])
 
     def device_keys(self, d):
         m = self.app.model
@@ -26441,8 +26755,35 @@ class FilterContext:
 # ---- Packets (Advanced) -------------------------------------------------------
 class PacketsTab(BaseTab):
     name, label_key, advanced = "packets", "tab_raw", True
+    SUBVIEWS = ("Packets", "Streams", "Exchanges", "Statistics", "Expert")
 
     def build(self):
+        outer = self.frame
+        views = self.make_subviews(list(self.SUBVIEWS),
+                                   on_switch=self._on_subview)
+        self.frame = views["Packets"]
+        try:
+            self._build_packets()
+        finally:
+            self.frame = outer
+        self.streams = StreamsView(self.app, views["Streams"])
+        self.exchanges = ExchangesView(self.app, views["Exchanges"])
+        self.stats = StatisticsView(self.app, views["Statistics"])
+        self.expert = ExpertView(self.app, views["Expert"])
+
+    def _sub(self):
+        return {"Streams": self.streams, "Exchanges": self.exchanges,
+                "Statistics": self.stats,
+                "Expert": self.expert}.get(self.subview)
+
+    def _on_subview(self, name):
+        v = self._sub()
+        if v is not None:
+            v.refresh(force=True)
+        elif self._dirty:
+            self.rebuild()
+
+    def _build_packets(self):
         app = self.app
         pills = tk.Frame(self.frame, bg=WHITE, padx=10, pady=6)
         pills.pack(fill="x")
@@ -26503,9 +26844,16 @@ class PacketsTab(BaseTab):
         ee = ttk.Entry(self.adv_row, textvariable=self.expr_var, width=46)
         ee.pack(side="left", padx=(4, 6))
         ee.bind("<Return>", lambda e: self.apply())
+        ee.bind("<KeyRelease>", lambda e: self._validate_expr(), add="+")
+        self.expr_entry = ee
         Tooltip(ee, "Examples:  proto:tls site:example.com    "
                     "port:53 or port:853    ip:192.168.1.0/24 -proto:arp    "
-                    "len>1000 dir:up    device:@mine    stream:12    marked")
+                    "len>1000 dir:up    device:@mine    stream:12    marked\n"
+                    "Field expressions:  ip.src == 192.168.1.5    "
+                    "tcp.port == 443    dns.qry.name contains \"example\"    "
+                    "smtp    expert.severity >= warning    frame.len > 1000")
+        ttk.Button(self.adv_row, text="Fields…",
+                   command=self.open_fields).pack(side="left", padx=(0, 4))
         ttk.Button(self.adv_row, text="Apply",
                    command=self.apply).pack(side="left")
         ttk.Button(self.adv_row, text="Clear filter",
@@ -26609,6 +26957,14 @@ class PacketsTab(BaseTab):
         tk.Label(bottom, textvariable=self.field_var, anchor="w", bg=WHITE,
                  fg="#555555", font=("TkDefaultFont", 9)).pack(
             side="bottom", fill="x", before=nb)
+        self.explain_var = DisplayVar(value="")
+        tk.Label(bottom, textvariable=self.explain_var, anchor="w",
+                 bg=WHITE, fg="#2b3a56", justify="left", wraplength=1000,
+                 font=("TkDefaultFont", 10)).pack(side="top", fill="x",
+                                                  before=nb, padx=4)
+        self.dtree.bind("<Button-3>", self._field_menu)
+        self.dtree.bind("<Button-2>", self._field_menu)
+        self.bytes_view.bind("<Button-1>", self._byte_click)
         self.matched = []        # filtered rows, in view order
         self.top = 0             # index of the first visible row
         self.slots = []          # the Treeview items that show them
@@ -26691,6 +27047,72 @@ class PacketsTab(BaseTab):
             marked_only=self.marked_var.get(),
             expr=self.expr_var.get() if not self.app.beginner_mode else "")
 
+    def _validate_expr(self):
+        """Live check while typing: the field turns red on a mistake."""
+        text = self.expr_var.get()
+        try:
+            DisplayFilter(expr=text)
+            ok, msg = True, ""
+        except ValueError as e:
+            ok, msg = False, str(e)
+        with contextlib.suppress(tk.TclError):
+            self.expr_entry.configure(style="TEntry" if ok or not text
+                                      else "Bad.TEntry")
+        self.err_var.set("" if ok else f"⚠ {msg}")
+        return ok
+
+    def open_fields(self):
+        """The field glossary: every filter key, its meaning, and a
+        double-click to put it in the expression."""
+        t = self.app.theme
+        win = tk.Toplevel(self.app.root)
+        win.title("Filter fields")
+        win.geometry("720x520")
+        win.configure(bg=t["tab_bg"])
+        bar = tk.Frame(win, bg=t["tab_bg"], padx=10, pady=8)
+        bar.pack(fill="x")
+        tk.Label(bar, text="Search:", bg=t["tab_bg"],
+                 fg=t["text_fg"]).pack(side="left")
+        q = tk.StringVar()
+        ent = ttk.Entry(bar, textvariable=q, width=30)
+        ent.pack(side="left", padx=6)
+        wrap, tree = make_tree(win, [("key", "Field", 260, "w", False),
+                                     ("type", "Type", 70, "w", False),
+                                     ("desc", "Meaning", 360, "w", True)])
+        wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        keys = sorted(set(FIELD_REGISTRY) | set(SPECIAL_FIELDS) |
+                      set(FILTER_PROTOCOLS) | set(FILTER_PORT_PROTOS))
+
+        def fill(*_a):
+            tree.delete(*tree.get_children())
+            s = q.get().strip().lower()
+            for k in keys:
+                if k in FIELD_REGISTRY:
+                    ftype, unit, desc, _p = FIELD_REGISTRY[k]
+                elif k in SPECIAL_FIELDS:
+                    ftype, desc = SPECIAL_FIELDS[k], "Either direction / " \
+                        "special"
+                else:
+                    ftype, desc = "protocol", "Packets of this protocol"
+                if s and s not in k and s not in desc.lower():
+                    continue
+                tree.insert("", "end", iid=k, values=(k, ftype, desc))
+
+        def use(_e=None):
+            sel = tree.selection()
+            if sel:
+                cur = self.expr_var.get().strip()
+                self.expr_var.set((cur + " and " if cur else "") + sel[0])
+                self._validate_expr()
+                with contextlib.suppress(tk.TclError):
+                    self.expr_entry.focus_set()
+                    self.expr_entry.icursor("end")
+        q.trace_add("write", fill)
+        tree.bind("<Double-1>", use)
+        fill()
+        win._mw_tree = tree
+        return win
+
     def apply(self):
         try:
             self.filter = self._build_filter()
@@ -26700,6 +27122,8 @@ class PacketsTab(BaseTab):
                              f"previous filter is still in use.)")
             return
         self.ind_var.set("Display filter: " + self.filter.describe())
+        if not self.app.beginner_mode:
+            self._remember_expr(self.expr_var.get())
         self.rebuild()
 
     def clear_filter(self):
@@ -26722,12 +27146,28 @@ class PacketsTab(BaseTab):
         self.expr_var.set(expr)
         self.apply()
 
+    RECENT = "Recent: "
+
     def refresh_presets(self):
         presets = self.app.config.get("filters.presets", {}) or {}
-        self.preset_box.configure(values=sorted(presets))
+        recent = self.app.config.get("filters.recent", []) or []
+        self.preset_box.configure(values=sorted(presets) + [
+            self.RECENT + r for r in recent[:8]])
+
+    def _remember_expr(self, expr):
+        expr = (expr or "").strip()
+        if not expr:
+            return
+        recent = [r for r in (self.app.config.get("filters.recent", [])
+                              or []) if r != expr]
+        self.app.config.set("filters.recent", [expr] + recent[:7])
+        self.refresh_presets()
 
     def _load_preset(self, _e=None):
         name = self.preset_var.get()
+        if name.startswith(self.RECENT):
+            self.set_expression(name[len(self.RECENT):])
+            return
         p = (self.app.config.get("filters.presets", {}) or {}).get(name)
         if not isinstance(p, dict):
             return
@@ -27046,6 +27486,11 @@ class PacketsTab(BaseTab):
         self.render()
 
     def refresh(self):
+        v = self._sub()
+        if v is not None:
+            if self.is_visible():
+                v.refresh()
+            return
         if self._dirty and not self.paused and self.is_visible():
             self._dirty = False
             self.rebuild()
@@ -27112,6 +27557,12 @@ class PacketsTab(BaseTab):
             self.dtree.insert(summary, "end", text=k, values=(v,))
         if dis is not None:
             self._fill_dissection(dis)
+            self._dis = dis
+            try:
+                self.explain_var.set("💬 " + explain_packet(
+                    dis, self.app.address_label))
+            except Exception:                        # noqa: BLE001
+                self.explain_var.set("")
             layer = None
         else:
             layer = pkt
@@ -27192,6 +27643,75 @@ class PacketsTab(BaseTab):
             self._dt_keys[iid] = n.key
             add_fields(iid, n.fields)
 
+    def _field_filter_text(self, iid):
+        key = self._dt_keys.get(iid, "")
+        dis = getattr(self, "_dis", None)
+        if not key or dis is None:
+            return key, None
+        if key in FILTER_PROTOCOLS or key in PROTOCOL_TITLES and \
+                "." not in key:
+            return key, key
+        f = next((f for f in dis.all_fields() if f.key == key and
+                  (f.offset, f.length) == self._dt_ranges.get(iid)), None)
+        if f is None:
+            return key, None
+        v = f.raw_value
+        if isinstance(v, bool):
+            v = "1" if v else "0"
+        elif isinstance(v, str) and not re.match(r"^[\w.:/-]+$", v):
+            v = '"' + v.replace('"', '\\"') + '"'
+        return key, f"{key} == {v}"
+
+    def _field_menu(self, event):
+        iid = self.dtree.identify_row(event.y)
+        if not iid:
+            return
+        self.dtree.selection_set(iid)
+        key, expr = self._field_filter_text(iid)
+        app = self.app
+        d = self._selected_row()
+        val = self.dtree.item(iid, "values")
+        items = [("Apply as filter", lambda: self.set_expression(expr),
+                  bool(expr)),
+                 ("Exclude from the view", lambda: self.set_expression(
+                     f"not ({expr})"), bool(expr)),
+                 ("Copy field name", lambda: copy_to_clipboard(app, key),
+                  bool(key)),
+                 ("Copy value", lambda: copy_to_clipboard(
+                     app, str(val[0]) if val else ""), bool(val)),
+                 ("Copy as filter", lambda: copy_to_clipboard(app, expr),
+                  bool(expr)),
+                 None,
+                 ("Follow stream", lambda: app.follow_stream(
+                     d.get("flow_id")), bool(d and d.get("flow_id"))),
+                 ("Show the connection", lambda: app.goto(
+                     "connection", d.get("flow_id")),
+                  bool(d and d.get("flow_id"))),
+                 ("Bookmark this packet", lambda: self.toggle_mark(d),
+                  bool(d))]
+        popup_menu(app, event, items)
+
+    def _byte_click(self, event):
+        """Click a byte in the bytes pane: select the field that owns it."""
+        idx = self.bytes_view.index(f"@{event.x},{event.y}")
+        line, col = (int(x) for x in idx.split("."))
+        if 6 <= col < 6 + 47:
+            k = (col - 6) // 3
+        elif 55 <= col < 71:
+            k = col - 55
+        else:
+            return "break"
+        off = (line - 1) * 16 + k
+        best = None
+        for iid, (o, n) in self._dt_ranges.items():
+            if n > 0 and o <= off < o + n and (best is None or
+                                               n <= best[1]):
+                best = (iid, n)
+        if best:
+            self.dtree.see(best[0])
+            self.dtree.selection_set(best[0])
+        return "break"
+
     def _on_field_select(self, _e=None):
         sel = self.dtree.selection()
         if not sel:
@@ -27225,6 +27745,8 @@ class PacketsTab(BaseTab):
     def select_no(self, no):
         """Select packet `no` (scrolls to it; clears the filter if the
         filter hides it). False if it is no longer in memory."""
+        if self.subview != "Packets":
+            self.show_subview("Packets")
         if self._dirty:
             self.rebuild()
         i = self.index_of_no(no)
@@ -27262,7 +27784,9 @@ class PacketsTab(BaseTab):
                    f"{d['proto']} {d['length']}B  {d['text']}")
         devs = list(self.ctx.device_keys(d))
         names = [n for n in self.ctx.names(d) if "." in n]
-        items = [("Copy summary", lambda: copy_to_clipboard(app, summary)),
+        items = [("Follow stream", lambda: app.follow_stream(
+                     d.get("flow_id")), bool(d.get("flow_id"))),
+                 ("Copy summary", lambda: copy_to_clipboard(app, summary)),
                  ("Copy source", lambda: copy_to_clipboard(app, src)),
                  ("Copy destination", lambda: copy_to_clipboard(app, dst)),
                  ("Remove bookmark" if d["no"] in app.bookmarks
@@ -27300,10 +27824,872 @@ class PacketsTab(BaseTab):
             self.vbar.set(0.0, 1.0)
         self._count()
         self.dtree.delete(*self.dtree.get_children())
-        for w in (self.details, self.hexview):
+        for w in (self.details, self.hexview, self.bytes_view):
             w.config(state="normal")
             w.delete("1.0", "end")
             w.config(state="disabled")
+        self.explain_var.set("")
+        for v in (self.streams, self.exchanges, self.stats, self.expert):
+            v.reset()
+
+
+# ---- V5 M7: the packet workspace sub-views ------------------------------------
+STREAM_SENSITIVE_PORTS = {21, 23, 25, 80, 110, 143, 587, 8080, 5060, 1883,
+                          554, 2525}
+
+
+def explain_packet(dis, name=lambda ip: ip):
+    """One plain-language sentence per packet (the beginner promise
+    inside the expert view)."""
+    g = dis.get
+    src = g("ip.src") or g("ipv6.src") or g("arp.src.proto_ipv4") or \
+        g("eth.src") or "?"
+    dst = g("ip.dst") or g("ipv6.dst") or g("arp.dst.proto_ipv4") or \
+        g("eth.dst") or "?"
+    s, t = name(src), name(dst)
+    if g("arp.opcode") == 1:
+        return f"{s} asked the local network who has {g('arp.dst.proto_ipv4')} (ARP)."
+    if g("arp.opcode") == 2:
+        return f"{s} answered that it has {g('arp.src.proto_ipv4')} (ARP)."
+    if g("dhcp.option.dhcp") is not None:
+        mt = _DHCP_MSG.get(g("dhcp.option.dhcp"), "message")
+        host = g("dhcp.option.hostname")
+        return (f"DHCP {mt}: " + (f"a device called “{host}” " if host else
+                                  "a device ") +
+                ("asks for an address." if mt in ("Discover", "Request")
+                 else f"is offered or given {g('dhcp.ip.your')}."))
+    if g("dns.id") is not None:
+        q = g("dns.qry.name") or "?"
+        if g("dns.flags.response"):
+            ans = g("dns.a") or g("dns.aaaa") or g("dns.cname")
+            rc = g("dns.flags.rcode") or 0
+            return (f"{s} answered the name lookup for {q}: "
+                    + (f"{ans}." if ans else
+                       f"{_DNS_RCODES.get(rc, 'no answer')}.") + " (DNS)")
+        return f"{s} asked {t} for the address of {q} (DNS)."
+    sni = g("tls.handshake.extensions_server_name")
+    if sni:
+        return (f"{s} started an encrypted connection (TLS) to {sni}; the "
+                f"site name is visible, the content will not be.")
+    if 23 in dis.values("tls.record.content_type"):
+        return f"Encrypted data between {s} and {t} (TLS); the content is not visible."
+    if g("http.request.method"):
+        return (f"{s} asked {g('http.host') or t} for "
+                f"{g('http.request.uri')} over plain HTTP (not encrypted).")
+    if g("http.response.code"):
+        return (f"{s} answered {g('http.response.code')} "
+                f"{g('http.response.phrase') or ''} over plain HTTP.")
+    if g("quic.version") is not None or g("quic.header_form"):
+        return f"{s} and {t} talk over QUIC (HTTP/3, encrypted)."
+    if g("icmp.type") is not None:
+        return f"{s} sent {_ICMP_TYPES.get(g('icmp.type'), 'an ICMP message').lower()} to {t}."
+    if g("icmpv6.type") is not None:
+        return f"{s} sent an IPv6 control message: {_ICMPV6_TYPES.get(g('icmpv6.type'), 'other')}."
+    if g("ntp.flags.mode") is not None:
+        return f"{s} and {t} exchanged the time (NTP)."
+    fl = g("tcp.flags")
+    if fl is not None:
+        port = g("tcp.dstport")
+        svc = PORT_SERVICES.get(port) or PORT_SERVICES.get(
+            g("tcp.srcport")) or "a service"
+        if fl & 0x02 and not fl & 0x10:
+            return f"{s} opened a connection to {t} port {port} ({svc})."
+        if fl & 0x04:
+            return f"{s} abruptly closed (reset) its connection with {t}."
+        if fl & 0x01:
+            return f"{s} finished sending on its connection with {t}."
+        n = g("tcp.len") or 0
+        return (f"{s} sent {n} bytes to {t} ({svc})." if n else
+                f"{s} acknowledged data from {t}.")
+    if g("udp.srcport") is not None:
+        return f"{s} sent a {g('udp.length')}-byte datagram to {t} port {g('udp.dstport')}."
+    return f"{s} sent a {dis.nodes[-1].title if dis.nodes else 'frame'} to {t}."
+
+
+class _CollectFramer:
+    """Keeps every in-order byte of a direction with its packet."""
+
+    def __init__(self, owner):
+        self.owner = owner
+
+    def feed(self, off, data, out, direction):
+        self.owner.chunks.append((direction, off, bytes(data),
+                                  self.owner.current_no))
+
+    def gap(self, start, end, out, direction):
+        self.owner.chunks.append((direction, start, None, end))
+
+    def flush(self, out, direction):
+        pass
+
+
+class FollowResult:
+    def __init__(self):
+        self.chunks = []         # (dir, offset, bytes | None, no | gap end)
+        self.current_no = 0
+        self.client = self.server = ("", 0)
+        self.transport = "TCP"
+        self.notes = []
+        self.retrans = 0
+
+    def sensitive(self):
+        return bool({self.client[1], self.server[1]} &
+                    STREAM_SENSITIVE_PORTS)
+
+
+def follow_stream(rows, flow_id):
+    """Rebuild one connection from the packets in memory (any mode)."""
+    res = FollowResult()
+    mine = [d for d in rows if d.get("flow_id") == flow_id and d.get("raw")]
+    if not mine:
+        return res
+    first = dissect(mine[0]["raw"], mine[0].get("linktype", 1))
+    if first.get("udp.srcport") is not None:
+        res.transport = "UDP"
+        a = (first.get("ip.src") or first.get("ipv6.src"),
+             first.get("udp.srcport"))
+        b = (first.get("ip.dst") or first.get("ipv6.dst"),
+             first.get("udp.dstport"))
+        res.client, res.server = a, b
+        for d in mine:
+            dis = dissect(d["raw"], d.get("linktype", 1))
+            node = next((n for n in dis.nodes if n.key == "udp"), None)
+            if node is None:
+                continue
+            src = (dis.get("ip.src") or dis.get("ipv6.src"),
+                   dis.get("udp.srcport"))
+            pay = d["raw"][node.offset + 8:node.offset + node.length]
+            res.chunks.append((0 if src == a else 1, 0, pay, d["no"]))
+        return res
+    tr = TcpReassembler(framer=lambda: _CollectFramer(res))
+    for d in mine:
+        dis = dissect(d["raw"], d.get("linktype", 1))
+        node = next((n for n in dis.nodes if n.key == "tcp"), None)
+        if node is None:
+            continue
+        src = dis.get("ip.src") or dis.get("ipv6.src")
+        dst = dis.get("ip.dst") or dis.get("ipv6.dst")
+        hl = dis.get("tcp.hdr_len") or 20
+        res.current_no = d["no"]
+        st = tr.segment(src, dis.get("tcp.srcport"), dst,
+                        dis.get("tcp.dstport"), dis.get("tcp.seq_raw"),
+                        dis.get("tcp.flags"),
+                        d["raw"][node.offset + hl:node.offset + node.length],
+                        d["time"])
+        res.client = st.a
+        res.server = st.key[1] if st.a == st.key[0] else st.key[0]
+    for st in tr.flush():
+        res.notes += st.notes
+        res.retrans += sum(x.dups for x in st.dirs)
+    return res
+
+
+def redact_stream_line(line, res):
+    """A stream line safe to show by default for sensitive protocols."""
+    ports = {res.client[1], res.server[1]}
+    clean = line.rstrip(b"\r\n")
+    if ports & {25, 587, 110, 143, 2525}:
+        return _mail_line_label(clean)
+    m = _SECRET_CMDS.match(clean)
+    if m:
+        return ((m.group("tag") or b"") + m.group("cmd")).decode(
+            "latin-1", "replace") + " (hidden: credentials)"
+    rq = re.match(rb"^([A-Z]+ \S*?)\?\S* ((HTTP|RTSP)/\d\.\d)$", clean)
+    if rq:
+        return (rq.group(1) + b"?(query hidden) " + rq.group(2)).decode(
+            "latin-1", "replace")
+    k, sep, _v = clean.partition(b":")
+    if sep and k.strip().lower().decode("latin-1", "replace") in \
+            _HIDDEN_HEADERS:
+        return k.decode("latin-1", "replace") + ": (hidden)"
+    return clean.decode("utf-8", "replace")
+
+
+class _SubView:
+    """Common bits of the Packets workspace sub-views."""
+
+    def __init__(self, app, frame):
+        self.app, self.frame = app, frame
+        self._version = None
+        self.build()
+
+    def bar(self):
+        b = tk.Frame(self.frame, bg=WHITE, padx=10)
+        b.pack(fill="x", pady=(6, 4))
+        return b
+
+    def label(self, parent, text, muted=False, **kw):
+        return tk.Label(parent, text=text, bg=WHITE,
+                        fg="#888888" if muted else "#333333", **kw)
+
+    def jump(self, no):
+        if no:
+            self.app.jump_to_packet(no)
+
+    def full_power_hint(self):
+        mode, _w = self.app.effective_perf_mode()
+        return "" if mode == "Full Power" else (
+            "This view fills in Full Power mode (Settings → Performance).")
+
+    def build(self):
+        pass
+
+    def refresh(self, force=False):
+        pass
+
+    def reset(self):
+        self._version = None
+
+
+class StreamsView(_SubView):
+    """Follow one connection: both directions in colour, gaps marked,
+    retransmissions folded, sensitive protocols redacted by default."""
+
+    def build(self):
+        b = self.bar()
+        self.label(b, "Connection:").pack(side="left")
+        self.flow_var = tk.StringVar()
+        self.box = ttk.Combobox(b, textvariable=self.flow_var, width=60,
+                                state="readonly")
+        self.box.pack(side="left", padx=(4, 8))
+        self.box.bind("<Button-1>", lambda e: self.box.configure(
+            values=self.choices()), add="+")
+        self.box.bind("<<ComboboxSelected>>", lambda e: self.show())
+        self.mode_var = tk.StringVar(value="Text")
+        for m in ("Text", "Hex"):
+            ttk.Radiobutton(b, text=m, value=m, variable=self.mode_var,
+                            command=self.render).pack(side="left")
+        self.raw_btn = ttk.Button(b, text="Show raw text…",
+                                  command=self.ask_raw)
+        b2 = self.bar()
+        self.label(b2, "Find:").pack(side="left")
+        self.find_var = tk.StringVar()
+        fe = ttk.Entry(b2, textvariable=self.find_var, width=24)
+        fe.pack(side="left", padx=(4, 6))
+        fe.bind("<Return>", lambda e: self.find())
+        ttk.Button(b2, text="Find", command=self.find).pack(side="left")
+        self.info = self.label(b2, "", muted=True)
+        self.info.pack(side="left", padx=10)
+        f = tk.Frame(self.frame, bg=WHITE)
+        f.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.txt = tk.Text(f, wrap="char", font=self.app.mono, bg=WHITE,
+                           fg="#222222", relief="flat", highlightthickness=0,
+                           padx=6, pady=6, cursor="arrow")
+        vs = ttk.Scrollbar(f, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=vs.set, state="disabled")
+        self.txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.result = None
+        self.flow_id = None
+        self.on_theme()
+
+    def on_theme(self):
+        t = self.app.theme
+        with contextlib.suppress(tk.TclError):
+            self.txt.tag_configure("d0", foreground=t["accent"])
+            self.txt.tag_configure("d1", foreground=t["warn_fg"])
+            self.txt.tag_configure("gap", foreground=t["muted_fg"],
+                                   font=("TkDefaultFont", 9, "italic"))
+            self.txt.tag_configure("found", background=t["border"])
+
+    def choices(self):
+        out = []
+        ids = {d.get("flow_id") for d in self.app.all_rows
+               if d.get("flow_id")}
+        for f in sorted((self.app.model.flows.get(i) for i in ids),
+                        key=lambda f: -(f.last_seen if f else 0)):
+            if f is None or f.transport not in ("TCP", "UDP"):
+                continue
+            out.append(f"#{f.fid}  {f.local_ip}:{f.local_port} ↔ "
+                       f"{f.domain or f.remote_ip}:{f.remote_port}  "
+                       f"{f.transport} {f.service or ''}".strip())
+            if len(out) >= 400:
+                break
+        return out
+
+    def open_flow(self, fid):
+        f = self.app.model.flows.get(fid)
+        self.flow_var.set(f"#{fid}" + (f"  {f.local_ip}:{f.local_port} ↔ "
+                                       f"{f.domain or f.remote_ip}:"
+                                       f"{f.remote_port}" if f else ""))
+        self.show()
+
+    def show(self):
+        m = re.match(r"#(\d+)", self.flow_var.get())
+        if not m:
+            return
+        self.flow_id = int(m.group(1))
+        self.result = follow_stream(self.app.all_rows, self.flow_id)
+        self.render()
+
+    def ask_raw(self):
+        if messagebox.askyesno(
+                "Show raw text",
+                "This connection can contain passwords, cookies or private "
+                "mail. The raw text stays in this window only and is never "
+                "saved unless you export the packets yourself. Show it for "
+                "this session?", parent=self.app.root):
+            self.app.raw_streams_ok = True
+            self.render()
+
+    def render(self):
+        r = self.result
+        txt = self.txt
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+        for tag in txt.tag_names():
+            if tag.startswith("p_"):
+                txt.tag_delete(tag)
+        with contextlib.suppress(tk.TclError):
+            self.raw_btn.pack_forget()
+        if r is None or not r.chunks:
+            txt.insert("end", "Pick a connection (or right-click a packet → "
+                       "Follow stream). Only packets still in memory can be "
+                       "shown.")
+            txt.configure(state="disabled")
+            self.info.configure(text="")
+            return
+        redact = r.sensitive() and not getattr(self.app, "raw_streams_ok",
+                                               False)
+        if redact:
+            self.raw_btn.pack(side="left", padx=(8, 0))
+        hexmode = self.mode_var.get() == "Hex"
+        sizes = [0, 0]
+        for i, (direction, off, data, no) in enumerate(r.chunks):
+            if data is None:
+                txt.insert("end", f"\n[… bytes {off}–{no} of "
+                           f"{'the client' if direction == 0 else 'the server'}"
+                           f" side were never captured …]\n", ("gap",))
+                continue
+            sizes[direction] += len(data)
+            ptag = f"p_{i}"
+            txt.tag_bind(ptag, "<Double-1>", lambda e, n=no: self.jump(n))
+            if hexmode:
+                body = hex_dump_lines(data) + "\n"
+            elif redact:
+                body = "".join(redact_stream_line(line, r) + "\n"
+                               for line in data.splitlines(True))
+            else:
+                body = data.decode("utf-8", "replace")
+                body = "".join(ch if ch.isprintable() or ch in "\r\n\t"
+                               else "." for ch in body)
+            txt.insert("end", body, (f"d{direction}", ptag))
+        txt.configure(state="disabled")
+        c, s = r.client, r.server
+        self.info.configure(text=(
+            f"{r.transport} {c[0]}:{c[1]} → {s[0]}:{s[1]} · client sent "
+            f"{sizes[0]:,} B, server sent {sizes[1]:,} B"
+            + (f" · {r.retrans} repeated segment(s) folded" if r.retrans
+               else "")
+            + (" · redacted (mail, web or login protocol)" if redact else "")
+            + " · double-click text to open its packet"))
+
+    def find(self):
+        q = self.find_var.get()
+        txt = self.txt
+        txt.tag_remove("found", "1.0", "end")
+        if not q:
+            return 0
+        n, pos = 0, "1.0"
+        first = None
+        while True:
+            pos = txt.search(q, pos, nocase=True, stopindex="end")
+            if not pos:
+                break
+            end = f"{pos}+{len(q)}c"
+            txt.tag_add("found", pos, end)
+            first = first or pos
+            pos = end
+            n += 1
+        if first:
+            txt.see(first)
+        return n
+
+    def reset(self):
+        self.result = None
+        with contextlib.suppress(tk.TclError):
+            self.render()
+
+
+class ExchangesView(_SubView):
+    """Requests paired with replies (Full Power): DNS, DHCP, TLS, HTTP,
+    NTP, SSH, SMB, SIP, RTSP, MQTT, mail."""
+
+    COLS = [("time", "Time", 90, "w", False), ("kind", "Kind", 60, "w", False),
+            ("client", "Client", 140, "w", False),
+            ("server", "Server", 140, "w", False),
+            ("what", "What happened", 420, "w", True),
+            ("lat", "Took", 70, "e", False)]
+
+    def build(self):
+        b = self.bar()
+        self.label(b, "Kind:").pack(side="left")
+        self.kind_var = tk.StringVar(value="All")
+        self.kbox = ttk.Combobox(b, textvariable=self.kind_var, width=10,
+                                 state="readonly", values=["All"])
+        self.kbox.pack(side="left", padx=(4, 8))
+        self.kbox.bind("<<ComboboxSelected>>",
+                       lambda e: self.refresh(force=True))
+        self.hint = self.label(b, "", muted=True)
+        self.hint.pack(side="left", padx=8)
+        wrap, self.tree = make_tree(self.frame, self.COLS, hscroll=True)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree.bind("<Double-1>", self._open)
+        self.rows = {}
+
+    def refresh(self, force=False):
+        store = self.app.deep.store
+        if store.version == self._version and not force:
+            return
+        self._version = store.version
+        with store.lock:
+            tx = [t for t in store.txns]
+        kinds = sorted({t.get("kind", "?") for t in tx})
+        k = self.kind_var.get()
+        with contextlib.suppress(tk.TclError):
+            self.kbox.configure(values=["All"] + kinds)
+            self.hint.configure(text=self.full_power_hint() or
+                                f"{len(tx):,} exchanges · double-click to "
+                                f"open the first packet")
+            self.tree.delete(*self.tree.get_children())
+        self.rows = {}
+        name = self.app.short_device_name
+        for t in reversed(tx[-3000:]):
+            if k != "All" and t.get("kind") != k:
+                continue
+            dev = self.app.model.device_for(t.get("client", ""), None)
+            lat = t.get("latency_ms")
+            iid = self.tree.insert("", "end", values=(
+                fmt_clock(t.get("ts", 0)), t.get("kind", ""),
+                name(dev.key) if dev else t.get("client", ""),
+                t.get("server", ""), t.get("summary", ""),
+                f"{lat:.0f} ms" if isinstance(lat, (int, float)) else "—"))
+            self.rows[iid] = t
+
+    def _open(self, _e=None):
+        sel = self.tree.selection()
+        t = self.rows.get(sel[0]) if sel else None
+        if t:
+            self.jump(t.get("no"))
+
+
+EXPERT_ADVICE = {
+    "Malformed": ("A damaged or cut-off packet. Common with a busy Wi-Fi "
+                  "link, capture filters that cut packets short, or "
+                  "unusual software.",
+                  "If it repeats for one device, check its connection."),
+    "Sequence": ("Ordinary TCP housekeeping: resent data, resets and "
+                 "connections opening or closing. A few are normal.",
+                 "Many resets or resends to one place point at a weak link "
+                 "or an overloaded server."),
+    "Protocol": ("A protocol reported an error (TLS alert, unreachable "
+                 "host).",
+                 "Check whether the program that made the connection "
+                 "works."),
+    "Security": ("Something worth a look: logins without encryption, "
+                 "differing resent data, obsolete protocols, more than one "
+                 "DHCP server.",
+                 "Read the finding, then check the device it names; most "
+                 "have an ordinary cause."),
+    "Checksum": ("The packet's checksum does not match. Normal for packets "
+                 "this computer sends (the network card fills it in).",
+                 "Only worth a look for packets from other devices."),
+    "Response code": ("A server answered with an error (no such name, "
+                      "404, refused).",
+                      "One-off errors are normal; many in a row point at a "
+                      "broken setting or a blocked service."),
+}
+
+
+class ExpertView(_SubView):
+    """Expert findings, grouped so repeats count instead of flooding."""
+
+    COLS = [("sev", "Severity", 80, "w", False),
+            ("group", "Group", 110, "w", False),
+            ("summary", "Finding", 440, "w", True),
+            ("count", "Count", 60, "e", False),
+            ("first", "First packet", 90, "e", False),
+            ("last", "Last packet", 90, "e", False)]
+    SEV_ORDER = {"error": 0, "warn": 1, "note": 2, "chat": 3}
+
+    def build(self):
+        b = self.bar()
+        self.label(b, "Show:").pack(side="left")
+        self.sev_var = tk.StringVar(value="Note and above")
+        box = ttk.Combobox(b, textvariable=self.sev_var, width=16,
+                           state="readonly", values=[
+                               "All", "Note and above", "Warning and above",
+                               "Errors"])
+        box.pack(side="left", padx=(4, 8))
+        box.bind("<<ComboboxSelected>>", lambda e: self.refresh(force=True))
+        self.hint = self.label(b, "", muted=True)
+        self.hint.pack(side="left", padx=8)
+        pw = ttk.PanedWindow(self.frame, orient="vertical")
+        pw.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        top = tk.Frame(pw, bg=WHITE)
+        pw.add(top, weight=3)
+        wrap, self.tree = make_tree(top, self.COLS, hscroll=True)
+        wrap.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self._select)
+        self.tree.bind("<Double-1>", self._open)
+        self.detail = tk.Label(pw, text="", bg=WHITE, fg="#333333",
+                               justify="left", anchor="nw", wraplength=900,
+                               padx=8, pady=6)
+        pw.add(self.detail, weight=1)
+        self.groups = {}
+
+    @staticmethod
+    def group_key(f):
+        text = re.sub(r"\d+(\.\d+){0,3}", "#", f[4])
+        return (f[2], f[3], text[:90])
+
+    def grouped(self, findings, min_rank=2):
+        groups = {}
+        for f in findings:
+            if self.SEV_ORDER.get(f[2], 3) > min_rank:
+                continue
+            k = self.group_key(f)
+            g = groups.get(k)
+            if g is None:
+                groups[k] = g = {"sev": f[2], "group": f[3],
+                                 "summary": f[4], "count": 0,
+                                 "first": f[0], "last": f[0], "field": f[5]}
+            g["count"] += 1
+            g["first"] = min(g["first"], f[0]) if f[0] else g["first"]
+            g["last"] = max(g["last"], f[0])
+        return sorted(groups.values(), key=lambda g: (
+            self.SEV_ORDER.get(g["sev"], 3), -g["count"]))
+
+    def refresh(self, force=False):
+        store = self.app.deep.store
+        if store.version == self._version and not force:
+            return
+        self._version = store.version
+        with store.lock:
+            fs = list(store.findings)
+        rank = {"All": 3, "Note and above": 2, "Warning and above": 1,
+                "Errors": 0}.get(self.sev_var.get(), 2)
+        gs = self.grouped(fs, rank)
+        self.groups = {}
+        with contextlib.suppress(tk.TclError):
+            self.tree.delete(*self.tree.get_children())
+            for g in gs[:2000]:
+                iid = self.tree.insert("", "end", values=(
+                    {"warn": "warning"}.get(g["sev"], g["sev"]), g["group"],
+                    g["summary"] + (" (and similar)" if g["count"] > 1
+                                    else ""), g["count"],
+                    f"#{g['first']}" if g["first"] else "—",
+                    f"#{g['last']}" if g["last"] else "—"))
+                self.groups[iid] = g
+            self.hint.configure(text=self.full_power_hint() or (
+                f"{len(fs):,} findings in {len(gs):,} groups · double-click "
+                f"to open the first packet"))
+
+    def _select(self, _e=None):
+        sel = self.tree.selection()
+        g = self.groups.get(sel[0]) if sel else None
+        if not g:
+            return
+        why, nxt = EXPERT_ADVICE.get(g["group"], ("", ""))
+        self.detail.configure(text=(
+            f"{g['summary']}\n\nOften harmless because: {why}\nWhat to do: "
+            f"{nxt}" + (f"\nEvidence field: {g['field']}" if g["field"]
+                        else "")))
+
+    def _open(self, _e=None):
+        sel = self.tree.selection()
+        g = self.groups.get(sel[0]) if sel else None
+        if g:
+            self.jump(g["first"])
+
+
+class StatisticsView(_SubView):
+    """Protocol hierarchy, conversations, endpoints and an I/O graph, all
+    from the packets in memory (the denominator is always stated)."""
+
+    KINDS = ("Protocol hierarchy", "Conversations", "Endpoints", "I/O graph")
+
+    def build(self):
+        b = self.bar()
+        self.kind_var = tk.StringVar(value=self.KINDS[0])
+        for k in self.KINDS:
+            ttk.Radiobutton(b, text=k, value=k, variable=self.kind_var,
+                            command=lambda: self.refresh(force=True)).pack(
+                side="left", padx=(0, 6))
+        self.interval_var = tk.StringVar(value="Auto")
+        self.ibox = ttk.Combobox(b, textvariable=self.interval_var, width=8,
+                                 state="readonly",
+                                 values=["Auto", "1 s", "10 s", "1 min"])
+        self.ibox.bind("<<ComboboxSelected>>",
+                       lambda e: self.refresh(force=True))
+        self.note = self.label(self.frame, "", muted=True, anchor="w")
+        self.note.pack(fill="x", padx=12)
+        self.body = tk.Frame(self.frame, bg=WHITE)
+        self.body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree = None
+        self.canvas = None
+        self._last = None
+
+    def _table(self, cols):
+        for w in self.body.winfo_children():
+            w.destroy()
+        self.canvas = None
+        wrap, self.tree = make_tree(self.body, cols, hscroll=True,
+                                    show="tree headings" if cols and
+                                    cols[0][0] == "#0" else "headings")
+        wrap.pack(fill="both", expand=True)
+        return self.tree
+
+    def refresh(self, force=False):
+        rows = self.app.all_rows
+        sig = (self.kind_var.get(), len(rows), rows[-1]["no"] if rows
+               else 0, self.interval_var.get())
+        if sig == self._last and not force:
+            return
+        self._last = sig
+        kind = self.kind_var.get()
+        with contextlib.suppress(tk.TclError):
+            if kind == "I/O graph":
+                self.ibox.pack(side="left", padx=(12, 0))
+            else:
+                self.ibox.pack_forget()
+        getattr(self, "_" + kind.split()[0].lower().replace("/", ""))(
+            list(rows))
+
+    # ---- protocol hierarchy
+    @staticmethod
+    def hierarchy(rows):
+        """{path tuple: [packets, bytes]} for frame → link → network →
+        transport → application."""
+        out = defaultdict(lambda: [0, 0])
+        for d in rows:
+            path = ["Frame"]
+            path.append("Ethernet" if d.get("linktype", 1) == 1 else
+                        f"Link type {d.get('linktype')}")
+            v = d.get("ipver")
+            if v:
+                path.append("IPv4" if v == 4 else "IPv6")
+            elif d.get("tag") == "ARP" or d.get("proto") == "ARP":
+                path.append("ARP")
+            tr = d.get("transport")
+            if tr:
+                path.append(tr)
+            app = d.get("proto") or ""
+            if app and app not in path and app not in ("TCP", "UDP", "IPv4",
+                                                       "IPv6", "ARP", "?"):
+                path.append(app)
+            for i in range(1, len(path) + 1):
+                e = out[tuple(path[:i])]
+                e[0] += 1
+                e[1] += d.get("length", 0)
+        return out
+
+    def _protocol(self, rows):
+        tree = self._table([("#0", "Protocol", 0, "w", True),
+                            ("pk", "Packets", 90, "e", False),
+                            ("pct", "% of packets", 100, "e", False),
+                            ("bytes", "Bytes", 110, "e", False),
+                            ("bpct", "% of bytes", 90, "e", False)])
+        tree.heading("#0", text="Protocol")
+        tree.column("#0", width=280, stretch=True)
+        h = self.hierarchy(rows)
+        tot = h.get(("Frame",), [0, 0])
+        nodes = {}
+        for path in sorted(h, key=lambda p: (len(p), -h[p][0])):
+            pk, by = h[path]
+            parent = nodes.get(path[:-1], "")
+            nodes[path] = tree.insert(parent, "end", text=path[-1], open=True,
+                                      values=(f"{pk:,}",
+                                              f"{100 * pk / max(1, tot[0]):.1f}",
+                                              _human_bytes(by),
+                                              f"{100 * by / max(1, tot[1]):.1f}"))
+        tree.bind("<Double-1>", lambda e: self._filter_proto(tree))
+        self.note.configure(text=f"Out of {tot[0]:,} packets in memory "
+                                 f"({_human_bytes(tot[1])}). Double-click a "
+                                 f"protocol to filter the packet list.")
+
+    def _filter_proto(self, tree):
+        sel = tree.selection()
+        if not sel:
+            return
+        name = tree.item(sel[0], "text").lower()
+        expr = {"ipv4": "ip", "ipv6": "ipv6", "tcp": "tcp", "udp": "udp",
+                "arp": "arp", "ethernet": "eth"}.get(name)
+        expr = expr or (name if name in FILTER_PROTOCOLS or name in
+                        FILTER_PORT_PROTOS else f"proto:{name}")
+        tab = self.app.tabs["packets"]
+        tab.show_subview("Packets")
+        tab.set_expression(expr)
+
+    # ---- conversations
+    def _conversations(self, rows):
+        tree = self._table([("a", "Address A", 170, "w", False),
+                            ("b", "Address B", 200, "w", True),
+                            ("tr", "Type", 60, "w", False),
+                            ("pk", "Packets", 80, "e", False),
+                            ("ab", "A → B", 90, "e", False),
+                            ("ba", "B → A", 90, "e", False),
+                            ("dur", "Duration", 80, "e", False),
+                            ("rate", "Average rate", 100, "e", False),
+                            ("st", "State", 90, "w", False)])
+        ids = {d.get("flow_id") for d in rows if d.get("flow_id")}
+        flows = [f for f in (self.app.model.flows.get(i) for i in ids) if f]
+        flows.sort(key=lambda f: -f.total_bytes)
+        self._conv = {}
+        for f in flows[:3000]:
+            dur = max(0.001, f.duration)
+            iid = tree.insert("", "end", values=(
+                f"{f.local_ip}:{f.local_port}" if f.local_port else
+                f.local_ip,
+                f"{f.domain or f.remote_ip}:{f.remote_port}"
+                if f.remote_port else (f.domain or f.remote_ip),
+                f.transport, f"{f.packets:,}", _human_bytes(f.bytes_out),
+                _human_bytes(f.bytes_in), human_duration(f.duration),
+                f"{_human_bytes(f.total_bytes / dur)}/s",
+                "reset" if f.rst else "closed" if f.closed else "open"))
+            self._conv[iid] = f.fid
+        tree.bind("<Double-1>", lambda e: self._open_conv(tree))
+        self.note.configure(text=f"{len(flows):,} conversations among the "
+                                 f"{len(rows):,} packets in memory. "
+                                 f"Double-click one to follow it.")
+
+    def _open_conv(self, tree):
+        sel = tree.selection()
+        fid = self._conv.get(sel[0]) if sel else None
+        if fid:
+            self.app.follow_stream(fid)
+
+    # ---- endpoints
+    def _endpoints(self, rows):
+        tree = self._table([("addr", "Address", 200, "w", False),
+                            ("what", "What it is", 260, "w", True),
+                            ("pk", "Packets", 80, "e", False),
+                            ("tx", "Sent", 90, "e", False),
+                            ("rx", "Received", 90, "e", False)])
+        st = defaultdict(lambda: [0, 0, 0])
+        for d in rows:
+            n = d.get("length", 0)
+            for ip, i in ((d.get("src_ip"), 1), (d.get("dst_ip"), 2)):
+                if ip:
+                    st[ip][0] += 1
+                    st[ip][i] += n
+        m = self.app.model
+        self._ep = {}
+        for ip, (pk, tx, rx) in sorted(st.items(), key=lambda x: -x[1][0])[
+                :3000]:
+            if is_public_ip(ip):
+                rec = m.remote_hosts.get(ip)
+                what = "remote host" + (f": {rec.provider_text()}"
+                                        if rec and rec.provider_text() else "")
+                key = ("remote", ip)
+            else:
+                dev = m.device_for(ip, None)
+                what = f"device: {self.app.short_device_name(dev.key)}" \
+                    if dev else ("multicast / broadcast" if
+                                 ipaddress.ip_address(ip).is_multicast or
+                                 ip.endswith(".255") else "local address")
+                key = ("device", dev.key) if dev else None
+            iid = tree.insert("", "end", values=(ip, what, f"{pk:,}",
+                                                 _human_bytes(tx),
+                                                 _human_bytes(rx)))
+            self._ep[iid] = key
+        tree.bind("<Double-1>", lambda e: self._open_ep(tree))
+        self.note.configure(text=f"{len(st):,} addresses in {len(rows):,} "
+                                 f"packets in memory. A remote host is "
+                                 f"never counted as a device on your "
+                                 f"network.")
+
+    def _open_ep(self, tree):
+        sel = tree.selection()
+        k = self._ep.get(sel[0]) if sel else None
+        if k:
+            self.app.goto(*k)
+
+    # ---- I/O graph
+    def io_series(self, rows, step):
+        if not rows:
+            return [], 0, {}
+        t0 = rows[0]["time"]
+        n = int((rows[-1]["time"] - t0) // step) + 1
+        n = min(n, 2000)
+        pk, up, down = [0] * n, [0.0] * n, [0.0] * n
+        first = {}
+        for d in rows:
+            i = min(n - 1, int((d["time"] - t0) // step))
+            pk[i] += 1
+            first.setdefault(i, d["no"])
+            if d.get("direction") == "up":
+                up[i] += d.get("length", 0) * 8
+            elif d.get("direction") == "down":
+                down[i] += d.get("length", 0) * 8
+        dns = [0.0] * n
+        cnt = [0] * n
+        store = self.app.deep.store
+        with store.lock:
+            for t in store.txns:
+                if t.get("kind") == "dns" and isinstance(
+                        t.get("latency_ms"), (int, float)):
+                    i = int((t["ts"] - t0) // step)
+                    if 0 <= i < n:
+                        dns[i] += t["latency_ms"]
+                        cnt[i] += 1
+        dns = [dns[i] / cnt[i] if cnt[i] else 0 for i in range(n)]
+        series = [("packets/s", [v / step for v in pk]),
+                  ("upload bits/s", [v / step for v in up]),
+                  ("download bits/s", [v / step for v in down]),
+                  ("DNS latency ms", dns)]
+        return series, t0, first
+
+    def _io(self, rows):
+        for w in self.body.winfo_children():
+            w.destroy()
+        self.tree = None
+        t = self.app.theme
+        c = tk.Canvas(self.body, bg=t["tab_bg"], highlightthickness=0,
+                      height=360)
+        c.pack(fill="both", expand=True)
+        self.canvas = c
+        span = (rows[-1]["time"] - rows[0]["time"]) if rows else 0
+        iv = self.interval_var.get()
+        step = {"1 s": 1.0, "10 s": 10.0, "1 min": 60.0}.get(
+            iv, 1.0 if span < 600 else 10.0 if span < 6000 else 60.0)
+        series, t0, first = self.io_series(rows, step)
+        colors = [t["accent"], t["good_fg"], t["warn_fg"], t["muted_fg"]]
+
+        def draw(_e=None):
+            c.delete("all")
+            w, h = max(300, c.winfo_width()), max(200, c.winfo_height())
+            top = series[:3]
+            Charts.line(c, 10, 6, w - 20, h * 0.62 - 10,
+                        [(lab, v, colors[i]) for i, (lab, v) in
+                         enumerate(top)], t, title="Traffic",
+                        fmt=lambda v: f"{v:,.0f}",
+                        xlabels=(fmt_clock(t0) if rows else "",
+                                 fmt_clock(rows[-1]["time"]) if rows
+                                 else ""))
+            Charts.line(c, 10, h * 0.62 + 4, w - 20, h * 0.38 - 10,
+                        [(series[3][0], series[3][1], colors[3])]
+                        if series else [], t, title="DNS latency (Full "
+                        "Power)", fmt=lambda v: f"{v:.0f}",
+                        empty="No DNS timings (turn on Full Power)")
+        c.bind("<Configure>", draw)
+        c.bind("<Double-1>", lambda e: self._io_jump(e, first, step))
+        self.after_draw = draw
+        draw()
+        self.note.configure(text=f"{len(rows):,} packets in memory, "
+                                 f"{step:g} s per point. Double-click the "
+                                 f"chart to open the packets at that "
+                                 f"moment.")
+
+    def _io_jump(self, e, first, step):
+        if not first:
+            return
+        w = max(300, self.canvas.winfo_width())
+        n = max(first) + 1
+        left, pw = 10 + 64, max(40, w - 20 - 74)
+        i = int(round((e.x - left) / pw * max(1, n - 1)))
+        i = min(first, key=lambda k: abs(k - i))
+        self.jump(first[i])
 
 
 # ---- Sources (where the information comes from) -----------------------------
@@ -27676,6 +29062,7 @@ class MiniWireshark:
         self.deep = DeepEngine()
         self._battery = (None, 0.0)      # (reading, when)
         self.full_power_override = False
+        self.raw_streams_ok = False      # per session, asked in Streams
         self._rows_drained = 0
         self._rows_not_shown = 0
         self._kernel_seen = 0
@@ -28407,6 +29794,25 @@ class MiniWireshark:
         self.config.set("appearance.inspector", show)
         self.config.save()
 
+    def follow_stream(self, fid):
+        """Packets → Streams on one connection (any mode)."""
+        if not fid:
+            return None
+        if self.beginner_mode:
+            self.mode_ui_var.set("Advanced")
+            self._on_ui_mode_change()
+        tab = self._select_tab("packets")
+        tab.show_subview("Streams")
+        tab.streams.open_flow(fid)
+        return tab.streams
+
+    def address_label(self, ip):
+        """Device name for a local address, else the address."""
+        dev = self.model.device_for(ip, None) if ip else None
+        if dev is not None and not is_public_ip(ip or "0.0.0.0"):
+            return self.short_device_name(dev.key)
+        return ip
+
     def jump_to_packet(self, no):
         """Open the Packets tab on packet `no` (the proof behind a claim);
         packets that left memory come from the on-disk packet history."""
@@ -28516,7 +29922,7 @@ class MiniWireshark:
         pct, off, _d, _s = self.deep.coverage_60s()
         if not off:
             return "⚡ Full Power"
-        return f"⚡ Full Power · {pct:.0f} % deep-analysed (60 s)"
+        return f"⚡ Full Power {pct:.0f} %"
 
     def coverage(self):
         rows = coverage_rows(self.model, self.data_mode, self.active_mode())
@@ -29767,6 +31173,8 @@ class MiniWireshark:
                          ("selectForeground", selfg)):
             self.root.option_add(f"*TCombobox*Listbox.{opt}", val)
         style.configure("TEntry", fieldbackground=field, foreground=fg)
+        style.configure("Bad.TEntry", fieldbackground="#5c1f1f" if dark
+                        else "#ffe3e3", foreground=fg)
         style.configure("TSpinbox", fieldbackground=field, foreground=fg)
         style.configure("TScrollbar", background=bg, troughcolor=frame,
                         arrowcolor=fg, bordercolor=frame,
@@ -37873,6 +39281,13 @@ class TcpReassembler:
                 self._start_midstream(st, di, d)
             while d.held:
                 self._skip_hole(st, di, d)
+            if d.fin_at is not None and d.next < d.fin_at:
+                # bytes before the FIN that never arrived
+                d.gap_bytes += d.fin_at - d.next
+                d.framer.gap(d.next, d.fin_at, st.messages, di)
+                st.notes.append(f"bytes {d.next}–{d.fin_at} of direction "
+                                f"{di} were never seen")
+                d.next = d.fin_at
             if not d.closed:
                 d.closed = True
                 d.framer.flush(st.messages, di)
@@ -38617,6 +40032,7 @@ class ProtocolTracker:
             if sni in WEBMAIL_HOSTS:
                 self._emit(kind="mail", proto="webmail", ts=ts, no=no,
                            client=src, server=dst, port=dp,
+                           service=f"{WEBMAIL_HOSTS[sni]} ({sni})",
                            encryption="encrypted (HTTPS)", result="contacted",
                            summary=f"{src} contacted the webmail service "
                                    f"{WEBMAIL_HOSTS[sni]} ({sni}); its "
@@ -45130,6 +46546,120 @@ def test_mail_sessions_metadata_only(ctx):
     for raw, ts, lt in fr:
         assert ScenarioBuilder.CANARY not in dissect(raw, lt).text()
 
+class _FilterCtx:
+    """Just enough of FilterContext for filter tests."""
+
+    def __init__(self, findings=None):
+        self._f = findings or {}
+
+    def dissection(self, d):
+        return dissect(d["raw"], d.get("linktype", 1))
+
+    def expert_severities(self, d):
+        return self._f.get(d["no"], [])
+
+
+@self_test(slow=False)
+def test_field_filter_language(ctx):
+    """M8: field expressions with the registry's names, combined with
+    and/or/not and parentheses; bad expressions fail at compile time with
+    a helpful message; the friendly V4 tokens still work."""
+    frames = ScenarioBuilder().home_network() + \
+        ScenarioBuilder(t0=SCENARIO_T0 + 9000).protocol_exchanges()
+    rows = _deep_rows(frames)
+    c = _FilterCtx({rows[0]["no"]: ["warn"], rows[1]["no"]: ["chat"]})
+
+    def count(expr):
+        f = FieldFilter(expr)
+        return sum(1 for d in rows if f.match(d, c))
+    n_dns = sum(1 for d in rows if 53 in (d["sport"], d["dport"]))
+    assert count("udp.port == 53 or tcp.port == 53") == n_dns
+    assert count("ip.src == 192.168.1.23") == sum(
+        1 for d in rows if d["src_ip"] == "192.168.1.23")
+    assert count("ip.addr == 192.168.1.0/24") > 0
+    assert count('dns.qry.name contains "example"') > 0
+    assert count('tls.handshake.extensions_server_name == '
+                 '"www.example.com"') >= 1
+    assert count("frame.len > 1000 and not tcp") == sum(
+        1 for d in rows if d["length"] > 1000 and d["transport"] != "TCP")
+    assert count("smtp") == 0 and count("ssh") > 0
+    assert count("(tcp.flags.syn == 1) && !(tcp.flags.ack == yes)") == sum(
+        1 for d in rows if d["tcp_flags"] is not None and
+        d["tcp_flags"] & 2 and not d["tcp_flags"] & 16)
+    assert count("expert.severity >= warning") == 1
+    assert count("dhcp.option.hostname") > 0
+    assert count("http.response.code == 404") == 1
+    for bad, msg in (("ip.src ==", "needs a value"),
+                     ("frame.len > big", "needs a number"),
+                     ("nosuch.field == 1", "Unknown field"),
+                     ("(tcp", "not closed"), ("tcp.port == 1 )", "Unexpected"),
+                     ("expert.severity > loud", "chat, note")):
+        try:
+            FieldFilter(bad)
+        except ValueError as e:
+            assert msg in str(e), (bad, str(e))
+        else:
+            raise AssertionError(f"accepted: {bad}")
+    assert FieldFilter.looks_like("dns and not mdns")
+    assert not FieldFilter.looks_like("proto:tls site:example.com")
+    assert not FieldFilter.looks_like("example")
+    df = DisplayFilter(expr="tcp.port == 443")
+    assert df.field is not None and df.active()
+    assert DisplayFilter(expr="port:53").field is None
+
+@self_test(slow=False)
+def test_follow_stream_and_explain(ctx):
+    """M7: a connection is rebuilt from the packets in memory with its
+    gaps; mail and web streams are redacted by default; every packet gets
+    a plain-language sentence; the protocol hierarchy adds up."""
+    frames = ScenarioBuilder().protocol_exchanges() + \
+        ScenarioBuilder(t0=SCENARIO_T0 + 99).mail_sessions()
+    rows = _deep_rows(frames)
+    key_of = {}
+    fid = 0
+    for d in rows:
+        if d.get("sport") is None:
+            continue
+        k = tuple(sorted([(d["src_ip"], d["sport"]),
+                          (d["dst_ip"], d["dport"])]))
+        if k not in key_of:
+            fid += 1
+            key_of[k] = fid
+        d["flow_id"] = key_of[k]
+    http = next(v for k, v in key_of.items() if k[1][1] == 80 or
+                k[0][1] == 80)
+    r = follow_stream(rows, http)
+    text = b"".join(c[2] for c in r.chunks if c[2] is not None)
+    assert b"GET /index.html" in text and b"HTTP/1.1 404" in text
+    assert r.client[1] == 41080 and r.server[1] == 80 and r.sensitive()
+    red = "".join(redact_stream_line(line, r) for c in r.chunks if c[2]
+                  for line in c[2].splitlines(True))
+    assert "Cookie: (hidden)" in red and "SECRET" not in red.split(
+        "GET /index.html?")[0]
+    smtp = next(v for k, v in key_of.items() if 25 in (k[0][1], k[1][1]))
+    r2 = follow_stream(rows, smtp)
+    red2 = "".join(redact_stream_line(line, r2) for c in r2.chunks if c[2]
+                   for line in c[2].splitlines(True))
+    assert ScenarioBuilder.CANARY not in red2 and "command AUTH" in red2
+    # a lost segment shows as a gap
+    lost = [d for d in rows if d["flow_id"] != http or
+            b"/missing" not in d["raw"]]
+    r3 = follow_stream(lost, http)
+    assert any(c[2] is None for c in r3.chunks), "gap not marked"
+    udp = next(d["flow_id"] for d in rows if d["transport"] == "UDP" and
+               d.get("flow_id"))
+    assert follow_stream(rows, udp).transport == "UDP"
+    for d in rows[:60]:
+        s = explain_packet(dissect(d["raw"]))
+        assert s and s.endswith((".", ")")), s
+    arp = explain_packet(dissect(ScenarioBuilder().home_network()[0][0]))
+    assert "asked the local network who has" in arp
+    h = StatisticsView.hierarchy(rows)
+    assert h[("Frame",)][0] == len(rows)
+    assert h[("Frame", "Ethernet")][0] == len(rows)
+    tcp = sum(v[0] for k, v in h.items() if len(k) == 4 and k[3] == "TCP")
+    assert tcp == sum(1 for d in rows if d["transport"] == "TCP")
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -46085,7 +47615,7 @@ def _gs_full_power(app, ctx):
         assert app.deep.drain(20), app.deep.status_text()
         assert app.deep.offered == len(frames) == app.deep.done
         pill = app.mode_pill_text()
-        assert "Full Power · 100 % deep-analysed" in pill, pill
+        assert "Full Power 100 %" in pill, pill
         assert pill in app.footer_text()
         info = DiagnosticsWindow.collect(app)
         assert "Runs in             thread" in info and \
@@ -46163,6 +47693,104 @@ def _gs_mail_canary(app, ctx):
         app.config.set("performance.mode", "Automatic")
         app.config.set("performance.deep_runner", "Automatic")
         app.data_mode = "idle"
+
+
+@gui_test_step("packet workspace: streams, exchanges, statistics, expert, fields")
+def _gs_workspace(app, ctx):
+    root = app.root
+    app.config.set("performance.mode", "Full Power")
+    app.config.set("performance.deep_runner", "Thread")
+    try:
+        ident = scenario_identity()
+        m = app._new_model(identity=ident[:3])
+        m.set_identity(local_nets=ident[3])
+        app.replace_model(m)
+        app.data_mode = "offline"
+        sink = app.lossless_sink()
+        frames = ScenarioBuilder().home_network() + \
+            ScenarioBuilder(t0=SCENARIO_T0 + 2000).protocol_exchanges()
+        for raw, ts, lt in frames:
+            sink(raw, ts, lt)
+        _gui_pump(root, until=lambda: app.count >= len(frames), timeout=30)
+        assert app.deep.drain(20)
+        app.deep.flush(final=True)
+        _gui_pump(root, 0.5)
+        tab = app._select_tab("packets")
+        tab.rebuild()
+        # field filter, live validation and the glossary
+        tab.expr_var.set("tcp.port == ")
+        assert not tab._validate_expr()
+        tab.expr_var.set('dns.qry.name contains "example"')
+        assert tab._validate_expr()
+        tab.apply()
+        assert tab.matched and all(53 in (d["sport"], d["dport"])
+                                   for d in tab.matched), len(tab.matched)
+        w = tab.open_fields()
+        assert "tls.handshake.extensions_server_name" in \
+            w._mw_tree.get_children()
+        w.destroy()
+        tab.clear_filter()
+        # packet details: explanation, right-click filter, byte click
+        row = next(d for d in app.all_rows if d.get("raw") and
+                   b"www.example.com" in d["raw"] and d.get("sport"))
+        tab.select_no(row["no"])
+        _gui_pump(root, 0.2)
+        assert "encrypted connection (TLS) to www.example.com" in \
+            tab.explain_var.get(), tab.explain_var.get()
+        sni = next(i for i, k in tab._dt_keys.items()
+                   if k == "tls.handshake.extensions_server_name")
+        key, expr = tab._field_filter_text(sni)
+        assert expr == "tls.handshake.extensions_server_name == " \
+                       "www.example.com", expr
+        tab.set_expression(expr)
+        assert len(tab.matched) >= 1
+        tab.clear_filter()
+        tab.select_no(row["no"])
+        _gui_pump(root, 0.2)
+
+        class _Ev:
+            x = y = 0
+        bv = tab.bytes_view
+        bv.update_idletasks()
+        x, y, _w, _h = bv.bbox("2.6")       # byte 16: inside the IP header
+        _Ev.x, _Ev.y = x + 1, y + 1
+        tab._byte_click(_Ev)
+        assert tab._dt_keys.get(tab.dtree.selection()[0], "").startswith(
+            "ip."), tab.dtree.selection()
+        # streams
+        sv = app.follow_stream(row["flow_id"])
+        _gui_pump(root, 0.2)
+        body = sv.txt.get("1.0", "end")
+        assert "www.example.com" in body and tab.subview == "Streams"
+        sv.find_var.set("example")
+        assert sv.find() >= 1
+        http = next(d for d in app.all_rows if d.get("dport") == 80 and
+                    d.get("flow_id") and b"Cookie" in (d.get("raw") or b""))
+        sv = app.follow_stream(http["flow_id"])
+        body = sv.txt.get("1.0", "end")
+        assert "Cookie: (hidden)" in body and "redacted" in \
+            sv.info.cget("text"), body[:300]
+        # exchanges, expert, statistics
+        tab.show_subview("Exchanges")
+        _gui_pump(root, 0.2)
+        assert len(tab.exchanges.tree.get_children()) >= 10
+        tab.show_subview("Expert")
+        _gui_pump(root, 0.2)
+        assert tab.expert.tree.get_children(), "no expert groups"
+        first = tab.expert.tree.get_children()[0]
+        tab.expert.tree.selection_set(first)
+        tab.expert._select()
+        assert "What to do" in tab.expert.detail.cget("text")
+        tab.show_subview("Statistics")
+        for k in StatisticsView.KINDS:
+            tab.stats.kind_var.set(k)
+            tab.stats.refresh(force=True)
+            _gui_pump(root, 0.15)
+        assert tab.stats.canvas is not None
+        tab.show_subview("Packets")
+    finally:
+        app.config.set("performance.mode", "Automatic")
+        app.config.set("performance.deep_runner", "Automatic")
 
 
 @gui_test_step("corrections: rename, merge, undo from the window")
