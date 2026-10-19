@@ -9848,9 +9848,11 @@ class Store:
         """Wait until everything handed over so far is on disk."""
         t_end = time.time() + timeout
         while time.time() < t_end:
-            if self.q.empty() and self._idle.wait(0.05):
-                if self.q.empty():
-                    return True
+            if not self.q.empty():
+                time.sleep(0.02)        # never spin: it starves the writer
+                continue
+            if self._idle.wait(0.05) and self.q.empty():
+                return True
         return False
 
     def stop(self, wait=0.0):
