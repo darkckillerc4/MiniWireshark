@@ -94,7 +94,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 _T_START = time.perf_counter()
 LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
-SCRIPT_VERSION = "3.0.0"
+SCRIPT_VERSION = "4.0.0"
 SESSION_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 2
 
@@ -913,6 +913,9 @@ class LoaderWindow(tk.Frame):
         self.fg = t.get("text_fg", "#222222")
         self.muted = t.get("muted_fg", "#666666")
         self.accent = t.get("accent", "#2b7de9")
+        self.good = t.get("good_fg", "#0b6b3a")
+        self.warn = t.get("warn_fg", "#8a5a00")
+        self.bad = t.get("danger_fg", "#a01a08")
         super().__init__(master, bg=self.bg)
         self.mode = mode
         self.q = queue.Queue()
@@ -1131,8 +1134,14 @@ class LoaderWindow(tk.Frame):
                     self._set_health(it[1])
                 elif k == "ask":
                     self._show_question(*it[1:])
+                elif k == "controls":
+                    self.show_install_controls(it[1])
+                elif k == "call":
+                    it[1]()
             except tk.TclError:
                 pass
+        if self.mode == "maintenance":
+            return          # inside the app: its own main loop draws
         try:
             self.update_idletasks()
             self.update()
@@ -1234,6 +1243,9 @@ class LoaderWindow(tk.Frame):
                     side="left", padx=(0, 8))
 
     def show_install_controls(self, on):
+        if threading.current_thread() is not threading.main_thread():
+            self.q.put(("controls", on))     # Tk only on its own thread
+            return
         try:
             if on:
                 self.cancel_btn.pack(side="right", padx=8)
@@ -1506,6 +1518,35 @@ def step_npcap(l, state):
     return _install_npcap(l, state)
 
 
+# When each Python version stops receiving security fixes (python.org's
+# release-cycle page, as of this release).
+PY_END_OF_LIFE = {(3, 7): "2023-06", (3, 8): "2024-10", (3, 9): "2025-10",
+                  (3, 10): "2026-10", (3, 11): "2027-10", (3, 12): "2028-10",
+                  (3, 13): "2029-10", (3, 14): "2030-10"}
+
+
+def python_age(version=None, today=None):
+    """→ ("current" | "ageing" | "outdated", plain-English note)."""
+    v = tuple(version or sys.version_info[:2])
+    today = today or time.strftime("%Y-%m")
+    eol = PY_END_OF_LIFE.get(v)
+    name = f"Python {v[0]}.{v[1]}"
+    if eol is None:
+        if v > max(PY_END_OF_LIFE):
+            return "current", f"{name} is newer than this release knows."
+        return "outdated", f"{name} is very old and no longer supported."
+    if today >= eol:
+        return "outdated", (f"You're running {name}, which stopped "
+                            f"receiving security fixes in {eol}. It still "
+                            f"works, but the private Python "
+                            f"{RUNTIME_PYTHON} is recommended.")
+    if v < (3, 12):
+        return "ageing", (f"You're running {name} (security fixes until "
+                          f"{eol}). The private Python {RUNTIME_PYTHON} is "
+                          f"faster and is what MiniWireshark is tested on.")
+    return "current", f"{name} is supported until {eol}."
+
+
 def step_runtime(l, state):
     """The private Python: use it, offer it (once, with consent) or keep
     going on this Python. Never changes the system Python."""
@@ -1533,14 +1574,23 @@ def step_runtime(l, state):
         l.post_health("degraded")
         return True, ("The private Python is installed but couldn't be "
                       "started; continuing on this Python.")
+    age, age_note = python_age()
+    if st["declined"] and plan["supported"] and age == "outdated" and \
+            time.time() - float(st["state"].get("declined_at", 0) or 0) > \
+            30 * 86400:
+        st["declined"] = False          # ask again, at most once a month
+        l.post_log("  " + age_note, "warn")
     if st["declined"] or not plan["supported"]:
+        if age != "current":
+            l.post_log("  " + age_note, "warn")
         l.post_health("degraded" if plan["supported"] else "healthy")
         return True, ("Using this Python (" + (
             "you chose not to install the private Python — Settings → "
             "Repair offers it again" if st["declined"] else
             "no private Python for this platform") + ").")
     while True:
-        answer = l.ask("consent", text=mgr.describe())
+        answer = l.ask("consent", text=(age_note + "\n\n" if age != "current"
+                                        else "") + mgr.describe())
         if answer == "cancel":
             return False, "Setup cancelled — nothing was changed."
         if answer != "install":
@@ -1898,6 +1948,7 @@ class RuntimeManager:
         self.cache = os.path.join(self.root, "cache")
         self.wheels = os.path.join(self.root, "wheels")
         self.log_lines = deque(maxlen=400)
+        self.last_pip_problems = []
 
     # ---- facts -------------------------------------------------------------------
     def plan(self):
@@ -2087,7 +2138,7 @@ class RuntimeManager:
 
     # ---- the install --------------------------------------------------------------
     def provision(self, progress=None, cancel=lambda: False,
-                  base_python=None):
+                  base_python=None, source=None):
         """Build a NEW environment next to any existing one, test it and
         record it. Switching happens immediately when nothing is running
         from the old one, otherwise on the next start. Returns env id."""
@@ -2109,10 +2160,17 @@ class RuntimeManager:
                      "this computer (it is not modified)…", {})
                 exe = self._venv_from(base_python, env_dir, cancel)
             if not exe:
-                name, sha = plan["source"]
+                if source:
+                    name, sha, url = source["name"], source["sha"], \
+                        source["url"]
+                    prog("Download", 0.0, f"Downloading Python "
+                         f"{source['version']} (newer than the one this "
+                         f"release verified)…", {})
+                else:
+                    name, sha = plan["source"]
+                    url = RUNTIME_PBS_BASE + RUNTIME_PBS_TAG + "/" + \
+                        urllib.request.quote(name)
                 archive = os.path.join(self.cache, name)
-                url = RUNTIME_PBS_BASE + RUNTIME_PBS_TAG + "/" + \
-                    urllib.request.quote(name)
                 self.download(url, archive, sha, prog, cancel,
                               size_hint=plan["download_mb"] * 1024 * 1024)
                 prog("Verify", 1.0, "Fingerprint OK", {})
@@ -2147,7 +2205,11 @@ class RuntimeManager:
         envs = dict(state.get("envs") or {})
         envs[env_id] = {"python": exe, "version": version,
                         "lock": lock_fingerprint(), "selftest_ok": True,
-                        "created": time.time(), "dir": env_dir}
+                        "created": time.time(), "dir": env_dir,
+                        "verified_by": "GitHub's published checksum + "
+                                       "self-test" if source else
+                                       "fingerprint built into this "
+                                       "release"}
         state["envs"] = envs
         busy = state.get("current") and _same_interpreter(
             (runtime_env(state) or {}).get("python", ""), sys.executable)
@@ -2247,6 +2309,10 @@ class RuntimeManager:
             return self.provision(prog, cancel), "rebuilt"
         exe = env["python"]
         prog("Check", 0.5, "Checking installed components…", {})
+        if not self.components(exe).get("pip"):
+            prog("Check", 0.6, "Restoring pip from the copy bundled with "
+                 "Python…", {})
+            self._run([exe, "-m", "ensurepip", "--upgrade"], 300, cancel)
         try:
             self.install_packages(exe, prog, cancel, offline_only=True,
                                   force=True)
@@ -2256,6 +2322,13 @@ class RuntimeManager:
                 raise
             self.install_packages(exe, prog, cancel, force=True)
             how = "downloaded again and reinstalled"
+        clean, problems = self.pip_check(exe)
+        ours = [p for p in problems if any(n in p.lower()
+                                           for n in RUNTIME_LOCK)]
+        if ours:
+            raise RuntimeError_("pip", "conflicting packages remain after "
+                                       "the reinstall: " + "; ".join(ours))
+        self.last_pip_problems = problems
         ok, text = self.self_test(exe, cancel)
         st = runtime_state_read()
         env = runtime_env(st)
@@ -2359,6 +2432,245 @@ class RuntimeManager:
                 shutil.copy2(src, self.cache)
                 n += 1
         return n
+
+    # ---- environment diagnostics (component by component) -----------------------
+    COMPONENT_MODULES = {"scapy": "scapy", "psutil": "psutil",
+                         "cryptography": "cryptography", "cffi": "cffi",
+                         "pycparser": "pycparser"}
+    PROBE = (
+        "import json, sys, importlib\n"
+        "out = {'python': sys.version.split()[0], 'exe': sys.executable}\n"
+        "try:\n"
+        "    import importlib.metadata as md\n"
+        "except ImportError:\n"
+        "    md = None\n"
+        "def ver(d):\n"
+        "    try:\n"
+        "        return md.version(d) if md else ''\n"
+        "    except Exception:\n"
+        "        return ''\n"
+        "out['pip'] = ver('pip')\n"
+        "try:\n"
+        "    import tkinter\n"
+        "    out['tk'] = str(tkinter.TkVersion)\n"
+        "except Exception:\n"
+        "    out['tk'] = ''\n"
+        "try:\n"
+        "    import ssl\n"
+        "    out['ssl'] = ssl.OPENSSL_VERSION\n"
+        "except Exception:\n"
+        "    out['ssl'] = ''\n"
+        "pk = {}\n"
+        "for dist, mod in json.loads(sys.argv[1]).items():\n"
+        "    r = {'version': ver(dist), 'import': False, 'error': ''}\n"
+        "    try:\n"
+        "        importlib.import_module(mod)\n"
+        "        r['import'] = True\n"
+        "    except Exception as e:\n"
+        "        r['error'] = (type(e).__name__ + ': ' + str(e))[:200]\n"
+        "    pk[dist] = r\n"
+        "out['packages'] = pk\n"
+        "print('MWPROBE' + json.dumps(out))\n")
+
+    def _is_private(self, exe):
+        try:
+            root = os.path.realpath(self.root)
+            return os.path.realpath(exe).startswith(root + os.sep)
+        except (OSError, ValueError):
+            return False
+
+    def _env_for(self, exe):
+        env = dict(os.environ)
+        env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
+        if self._is_private(exe):
+            for k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
+                env.pop(k, None)
+            env["PYTHONNOUSERSITE"] = "1"
+        return env
+
+    def components(self, exe=None, timeout=180):
+        """Each component in `exe` (default: the Python running now):
+        installed version, whether it loads, plus pip / Tk / SSL."""
+        exe = exe or sys.executable
+        try:
+            r = subprocess.run(
+                [exe, "-c", self.PROBE, json.dumps(self.COMPONENT_MODULES)],
+                capture_output=True, text=True, timeout=timeout,
+                env=self._env_for(exe),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError) as e:
+            return {"error": f"could not start {exe}: {e}", "packages": {}}
+        for line in (r.stdout or "").splitlines():
+            if line.startswith("MWPROBE"):
+                try:
+                    return json.loads(line[7:])
+                except ValueError:
+                    break
+        return {"error": ((r.stderr or r.stdout or "no output")[-400:]),
+                "packages": {}}
+
+    def pip_check(self, exe=None, timeout=180):
+        """`pip check`: packages whose requirements are missing or in
+        conflict. → (ok, [problem lines])."""
+        exe = exe or sys.executable
+        try:
+            r = subprocess.run([exe, "-m", "pip", "check"],
+                               capture_output=True, text=True,
+                               timeout=timeout, env=self._env_for(exe),
+                               creationflags=getattr(
+                                   subprocess, "CREATE_NO_WINDOW", 0))
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, [f"pip could not run: {e}"]
+        lines = [ln.strip() for ln in (r.stdout or "").splitlines()
+                 if ln.strip() and "no broken requirements" not in
+                 ln.lower()]
+        if r.returncode != 0 and not lines:
+            lines = [(r.stderr or "pip check failed").strip()[-300:]]
+        return r.returncode == 0, lines
+
+    def update_pip(self, exe, progress=None, cancel=lambda: False):
+        """Bring pip up to date INSIDE the private Python only: first from
+        the copy bundled with Python (offline), then from PyPI. Your own
+        Python's pip is never touched. → (old, new)."""
+        if not self._is_private(exe):
+            raise RuntimeError_("other", "pip is only updated inside "
+                                         "MiniWireshark's private Python")
+        prog = progress or (lambda *a: None)
+        old = self.components(exe).get("pip", "")
+        prog("Packages", 0.2, "Updating pip from the copy bundled with "
+             "Python…", {})
+        self._run([exe, "-m", "ensurepip", "--upgrade"], 300, cancel)
+        prog("Packages", 0.6, "Asking PyPI for the newest pip…", {})
+        rc, out = self._run([exe, "-m", "pip", "install", "--upgrade",
+                             "--only-binary=:all:", "pip"], 300, cancel)
+        if rc != 0:
+            self._log("pip could not be updated online (kept the bundled "
+                      "version)")
+        new = self.components(exe).get("pip", "")
+        prog("Packages", 1.0, f"pip {new or '?'}", {})
+        return old, new
+
+    @staticmethod
+    def component_rows(info, lock=None, pip_problems=()):
+        """→ [(name, installed, verified, status, severity)] for display
+        and tests; severity: ok | warn | bad."""
+        lock = lock or RUNTIME_LOCK
+        rows = []
+        if info.get("error") and not info.get("packages"):
+            return [("Python", "", "", "Could not be checked: " +
+                     info["error"][-200:], "bad")]
+        rows.append(("Python", info.get("python", ""), RUNTIME_PYTHON,
+                     "OK" if _version_tuple(info.get("python", "")) >= (3, 8)
+                     else "Too old", "ok"))
+        rows.append(("Graphical toolkit (Tk)", info.get("tk", ""), "",
+                     "OK" if info.get("tk") else "Missing",
+                     "ok" if info.get("tk") else "bad"))
+        rows.append(("pip", info.get("pip", ""), "",
+                     "OK" if info.get("pip") else "Missing (Repair adds it)",
+                     "ok" if info.get("pip") else "warn"))
+        broken = " ".join(pip_problems).lower()
+        for name, spec in lock.items():
+            r = (info.get("packages") or {}).get(name, {})
+            have, want = r.get("version", ""), spec.get("version", "")
+            parent = spec.get("needed_by")
+            parent_ok = bool(parent and ((info.get("packages") or {}).get(
+                parent) or {}).get("import"))
+            if not have and parent and (parent_ok or not (
+                    (info.get("packages") or {}).get(parent) or {}).get(
+                    "version")):
+                st, sev = (f"Not installed — only a helper for {parent}, "
+                           f"which " + ("works without it here" if parent_ok
+                                        else "isn't installed either"),
+                           "ok")
+            elif not have:
+                st, sev = ("Missing" + (" — needed" if spec.get("required")
+                                        else " (optional feature off)"),
+                           "bad" if spec.get("required") else "warn")
+            elif not r.get("import"):
+                st, sev = "Installed but won't load: " + r.get(
+                    "error", "")[:120], "bad"
+            elif name.lower() in broken:
+                st, sev = "Conflicting requirements (Repair fixes it)", "bad"
+            elif have != want:
+                st, sev = (f"Works; a different version than the one this "
+                           f"release verified ({want})", "warn")
+            else:
+                st, sev = "OK — the verified version", "ok"
+            rows.append((name, have, want, st, sev))
+        return rows
+
+    def diagnose(self, exe=None):
+        """Full environment report as text (used by Diagnostics, the
+        Runtime Manager and the debug bundle)."""
+        exe = exe or sys.executable
+        info = self.components(exe)
+        ok, problems = self.pip_check(exe) if info.get("pip") else \
+            (True, [])
+        rows = self.component_rows(info, pip_problems=problems)
+        mark = {"ok": "✔", "warn": "⚠", "bad": "✖"}
+        lines = [f"Environment: {exe}"
+                 + ("  (MiniWireshark's private Python)"
+                    if self._is_private(exe) else "")]
+        if info.get("ssl"):
+            lines.append(f"Secure connections: {info['ssl']}")
+        for name, have, want, st, sev in rows:
+            lines.append(f"{mark[sev]} {name:<22} {have or '—':<10} {st}")
+        if problems:
+            lines.append("pip check found:")
+            lines += ["   " + p for p in problems[:20]]
+        else:
+            lines.append("✔ pip check: no missing or conflicting "
+                         "requirements.")
+        worst = "bad" if any(r[4] == "bad" for r in rows) or (
+            problems and any(n in " ".join(problems).lower()
+                             for n in RUNTIME_LOCK)) else \
+            "warn" if any(r[4] == "warn" for r in rows) else "ok"
+        return {"text": "\n".join(lines), "rows": rows, "worst": worst,
+                "pip_problems": problems, "info": info}
+
+    # ---- a newer compatible Python, installed side by side on request -------------
+    def newer_python_source(self, info=None, release=None, timeout=20):
+        """If GitHub has a newer Python 3.14.x build for this computer,
+        return {version, name, sha, tag, url}. The fingerprint comes from
+        GitHub's own checksum for that file (not built into this release),
+        so the new Python is only used after the self-test passes in it."""
+        plat = runtime_platform()
+        cur = RUNTIME_SOURCES.get(plat)
+        if not cur:
+            return None
+        rel = release
+        if rel is None:
+            url = ("https://api.github.com/repos/astral-sh/"
+                   "python-build-standalone/releases/latest")
+            req = urllib.request.Request(url, headers={
+                "User-Agent": APP_NAME, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                rel = json.loads(r.read(16_000_000).decode("utf-8",
+                                                           "replace"))
+        tag = rel.get("tag_name", "")
+        assets = list(rel.get("assets") or [])
+        suffix = cur[0].split("-", 2)[2]       # e.g. x86_64-…-stripped.tar.gz
+        best = None
+        for a in assets:
+            n = a.get("name", "")
+            m = re.match(r"cpython-(3\.14\.\d+)\+(\d+)-(.+)$", n)
+            if not m or m.group(3) != suffix:
+                continue
+            if best is None or _version_tuple(m.group(1)) > \
+                    _version_tuple(best[0]):
+                best = (m.group(1), n, a)
+        if best is None or _version_tuple(best[0]) <= \
+                _version_tuple(RUNTIME_PYTHON):
+            return None
+        digest = str(best[2].get("digest") or "")
+        sha = digest.split(":", 1)[1] if digest.startswith("sha256:") \
+            else ""
+        if not re.match(r"^[0-9a-f]{64}$", sha):
+            return None                  # no checksum published: don't offer
+        return {"version": best[0], "name": best[1], "sha": sha,
+                "tag": tag, "url": best[2].get("browser_download_url") or
+                RUNTIME_PBS_BASE + tag + "/" + urllib.request.quote(
+                    best[1])}
 
     def check_newer_python(self, timeout=15):
         """Explicit, online: is there a newer python-build-standalone
@@ -20582,7 +20894,8 @@ class MiniWireshark:
         reopened in maintenance mode."""
         win = tk.Toplevel(parent or self.root)
         win.title("Runtime Manager")
-        win.geometry("760x640")
+        win.geometry("780x820")
+        win.minsize(700, 600)
         win.transient(parent or self.root)
         lw = LoaderWindow(win, self.config, mode="maintenance")
         lw.pack(fill="both", expand=True)
@@ -20595,6 +20908,36 @@ class MiniWireshark:
                        "repair" if st["healthy"] else "degraded")
         f = lw._card_frame("Your MiniWireshark environment",
                            self.runtime_status_text())
+        lw.post_footer("Maintenance mode — nothing changes until you click "
+                       "a button. Your own Python is never modified.")
+        report_fr = tk.Frame(f, bg=lw.card_bg)
+        report_fr.pack(fill="x", pady=(6, 0))
+        tk.Label(report_fr, text="Checking every component…",
+                 bg=lw.card_bg, fg=lw.muted).grid(row=0, column=0,
+                                                  sticky="w")
+
+        def fill_report(rep):
+            for w in report_fr.winfo_children():
+                w.destroy()
+            colors = {"ok": lw.good, "warn": lw.warn, "bad": lw.bad}
+            rows = list(rep["rows"])
+            if rep["pip_problems"]:
+                rows.append(("pip check", "", "",
+                             rep["pip_problems"][0][:90], "bad"))
+            for i, (name, have, _want, st, sev) in enumerate(rows):
+                tk.Label(report_fr, text={"ok": "✔", "warn": "⚠",
+                                          "bad": "✖"}[sev],
+                         bg=lw.card_bg, fg=colors[sev]).grid(
+                    row=i, column=0, sticky="w")
+                tk.Label(report_fr, text=name, bg=lw.card_bg, fg=lw.fg,
+                         anchor="w").grid(row=i, column=1, sticky="w",
+                                          padx=(4, 12))
+                tk.Label(report_fr, text=have or "—", bg=lw.card_bg,
+                         fg=lw.fg, anchor="w").grid(row=i, column=2,
+                                                    sticky="w", padx=(0, 12))
+                tk.Label(report_fr, text=st, bg=lw.card_bg, fg=lw.muted,
+                         anchor="w", wraplength=440, justify="left").grid(
+                    row=i, column=3, sticky="w")
         busy = {"on": False}
 
         def run(label, fn, done_text=None):
@@ -20626,57 +20969,125 @@ class MiniWireshark:
             threading.Thread(target=work, daemon=True,
                              name="runtime-manager").start()
 
+        def cancel():
+            return lw.cancel_requested
+
+        def env_exe():
+            st2 = mgr.status()
+            return st2["python"] if st2["healthy"] else sys.executable
+
+        def ask(title, text):
+            return bool(self._on_tk(lambda: messagebox.askyesno(
+                title, text, parent=win)))
+
         def rebuild():
-            return mgr.provision(lw.runtime_progress,
-                                 lambda: lw.cancel_requested,
+            return mgr.provision(lw.runtime_progress, cancel,
                                  base_python=_find_local_python314())
 
+        def show_report(rep):
+            self._env_report = (time.time(), rep)
+            lw.q.put(("call", lambda: fill_report(rep)))
+            for line in rep["text"].splitlines():
+                lw.post_log(line, {"✖": "err", "⚠": "warn",
+                                   "✔": "ok"}.get(line[:1], "detail"))
+
         def repair_or_build():
-            if mgr.status()["healthy"]:
-                return mgr.repair(lw.runtime_progress,
-                                  lambda: lw.cancel_requested)
-            return rebuild(), "installed"
+            """Repair / Update: reinstall the verified components, restore
+            and update pip, fix conflicts, re-test, then report."""
+            if not mgr.status()["healthy"]:
+                if not ask("Install the private Python?",
+                           mgr.describe() + "\n\nInstall it now?"):
+                    return None, "kept as it is"
+                return rebuild(), "installed"
+            eid, how = mgr.repair(lw.runtime_progress, cancel)
+            notes = []
+            with contextlib.suppress(Exception):
+                old, new_ = mgr.update_pip(mgr.status()["python"],
+                                           lw.runtime_progress, cancel)
+                if new_ and old != new_:
+                    notes.append(f"pip {old or '?'} → {new_}")
+            rep = mgr.diagnose(mgr.status()["python"])
+            show_report(rep)
+            if rep["worst"] == "bad":
+                raise RuntimeError_("pip", "some components still need "
+                                           "attention (see details)")
+            return eid, how + ("; " + ", ".join(notes) if notes else "")
+
+        def check_env():
+            rep = mgr.diagnose(env_exe())
+            show_report(rep)
+            if rep["worst"] == "bad":
+                lw.post_health("repair")
+                return ("some components need repair — click Repair / "
+                        "Update Environment")
+            return ("everything checks out" if rep["worst"] == "ok" else
+                    "everything works (notes in the details)")
+
+        def pip_update():
+            st2 = mgr.status()
+            if not st2["healthy"]:
+                return ("pip is only updated inside MiniWireshark's private "
+                        "Python, and there isn't one yet — Repair / Update "
+                        "Environment installs it. Your own Python's pip is "
+                        "never changed.")
+            old, new_ = mgr.update_pip(st2["python"], lw.runtime_progress,
+                                       cancel)
+            if old == new_:
+                return f"pip {new_ or '?'} is already up to date."
+            return f"pip updated: {old or '?'} → {new_ or '?'}."
 
         def newer():
-            info = mgr.check_newer_python()
-            if info["newer"]:
-                return (f"Python {info['newest_314']} exists (this release "
-                        f"verified {info['verified']}). MiniWireshark moves "
-                        f"to it in a future update, after testing it.")
-            return (f"You have the newest Python this release verified "
-                    f"({info['verified']}); newest published: "
-                    f"{info['newest'] or 'unknown'}.")
+            src = mgr.newer_python_source()
+            if not src:
+                return (f"You already have the newest Python 3.14 build for "
+                        f"this computer that MiniWireshark can use "
+                        f"({RUNTIME_PYTHON} or newer is not published yet).")
+            if not ask("Newer Python available",
+                       f"Python {src['version']} is available (this release "
+                       f"of MiniWireshark verified {RUNTIME_PYTHON}).\n\n"
+                       f"Install it side by side? MiniWireshark downloads "
+                       f"it, checks GitHub's published fingerprint, "
+                       f"installs the verified components and runs its "
+                       f"self-test inside it. It switches only if every "
+                       f"test passes; your current Python stays as the "
+                       f"fallback, and Roll back returns to it."):
+                return "Kept the current Python."
+            eid = mgr.provision(lw.runtime_progress, cancel, source=src)
+            return (f"Python {src['version']} installed and tested "
+                    f"({eid}). It is used from the next start.")
 
         def self_test():
             exe = mgr.status()["python"] or sys.executable
-            ok, text = mgr.self_test(exe, lambda: lw.cancel_requested)
+            ok, text = mgr.self_test(exe, cancel)
             lw.post_log(text[-3000:], "detail")
             if not ok:
                 raise RuntimeError_("selftest", text[-300:])
             return text.strip().splitlines()[-1] if text.strip() else "ok"
 
         def remove():
-            if not self._on_tk(lambda: messagebox.askyesno(
-                    "Remove private Python", "Delete MiniWireshark's private "
-                    "Python? MiniWireshark will use the Python it was "
-                    "started with until you install it again.",
-                    parent=win)):
+            if not ask("Remove private Python", "Delete MiniWireshark's "
+                       "private Python? MiniWireshark will use the Python it "
+                       "was started with until you install it again."):
                 return "Kept."
             return mgr.remove()
         actions = [
             ("\U0001F6E0 Repair / Update Environment", lambda: run(
-                "Repairing", repair_or_build,
+                "Repairing and updating", repair_or_build,
                 lambda r: f"Environment {r[1]}." if isinstance(r, tuple)
                 else "Done.")),
-            ("Rebuild side by side", lambda: run(
-                "Rebuilding", rebuild,
-                lambda eid: f"New environment {eid} ready (used from the "
-                            f"next start if this one is running).")),
+            ("Check environment", lambda: run(
+                "Checking every component", check_env, lambda m: m)),
+            ("Update pip", lambda: run("Updating pip", pip_update,
+                                       lambda m: m)),
             ("Check for newer Python", lambda: run(
                 "Asking GitHub for the newest Python build", newer,
                 lambda m: m)),
             ("Run self-test", lambda: run("Running the self-test", self_test,
                                           lambda m: f"Self-test: {m}")),
+            ("Rebuild side by side", lambda: run(
+                "Rebuilding", rebuild,
+                lambda eid: f"New environment {eid} ready (used from the "
+                            f"next start if this one is running).")),
             ("Roll back", lambda: run(
                 "Rolling back", mgr.rollback,
                 lambda ok: "Switched to the previous environment (used "
@@ -20690,6 +21101,7 @@ class MiniWireshark:
             ("Export debug bundle…", lambda: self.export_debug_bundle(win)),
             ("Offline kit…", lambda: self._offline_kit(win, mgr)),
         ]
+        self._rm_actions = dict((a[0], a[1]) for a in actions)
         grid = tk.Frame(f, bg=lw.card_bg)
         grid.pack(fill="x", pady=(6, 0))
         for i, (label, cmd) in enumerate(actions):
@@ -20698,10 +21110,12 @@ class MiniWireshark:
                 row=i // 3, column=i % 3, sticky="ew", padx=3, pady=3)
         for c in range(3):
             grid.columnconfigure(c, weight=1)
-        tk.Label(f, text="“Update” here means the newest versions THIS "
-                         "release of MiniWireshark has verified — never "
-                         "whatever is newest online. Nothing outside "
-                         "MiniWireshark's data folder is changed.",
+        tk.Label(f, text="Repair / Update installs the versions THIS "
+                         "release of MiniWireshark verified, and updates pip "
+                         "inside the private Python. A newer Python is only "
+                         "installed when you ask, after GitHub's checksum and "
+                         "the self-test pass. Nothing outside MiniWireshark's "
+                         "data folder is changed.",
                  bg=lw.card_bg, fg=lw.muted, wraplength=680, justify="left",
                  anchor="w").pack(fill="x", pady=(8, 0))
 
@@ -20711,7 +21125,49 @@ class MiniWireshark:
             lw.pump()
             win.after(100, tick)
         tick()
+        if not getattr(self, "_no_auto_env_check", False):
+            run("Checking every component", check_env, lambda m: m)
         return win
+
+    def refresh_env_report(self, max_age=600):
+        """Component-by-component check in the background (Diagnostics,
+        debug bundle). Result in self._env_report = (time, report)."""
+        cur = getattr(self, "_env_report", None)
+        if cur and time.time() - cur[0] < max_age:
+            return False
+        if getattr(self, "_env_checking", False):
+            return False
+        self._env_checking = True
+
+        def work():
+            try:
+                mgr = RuntimeManager()
+                st = mgr.status()
+                exe = st["python"] if st["running_inside"] else \
+                    sys.executable
+                self._env_report = (time.time(), mgr.diagnose(exe))
+            except Exception:                        # noqa: BLE001
+                LOG.exception("environment check")
+            finally:
+                self._env_checking = False
+        threading.Thread(target=work, daemon=True, name="env-check").start()
+        return True
+
+    def env_report_summary(self):
+        cur = getattr(self, "_env_report", None)
+        if not cur:
+            return "checking…"
+        rep = cur[1]
+        return {"ok": "✔ every component checks out",
+                "warn": "⚠ works, with notes (details at the end)",
+                "bad": "✖ needs repair — Settings → Repair MiniWireshark"}[
+            rep["worst"]]
+
+    def env_report_text(self):
+        cur = getattr(self, "_env_report", None)
+        if not cur:
+            return "(checking every component…)"
+        return (f"checked {fmt_clock(cur[0])}\n" + cur[1]["text"])
 
     def _offline_kit(self, parent, mgr):
         folder = filedialog.askdirectory(parent=parent,
@@ -24410,13 +24866,16 @@ class DiagnosticsWindow:
         tk.Label(top, text="Nothing here needs a terminal. Copy or export "
                            "this information if you ask someone for help "
                            "(it contains no packet contents).",
-                 bg=t["tab_bg"], fg=t["muted_fg"]).pack(anchor="w")
+                 bg=t["tab_bg"], fg=t["muted_fg"], wraplength=720,
+                 justify="left").pack(anchor="w")
         bars = tk.Frame(self.win, bg=t["tab_bg"], padx=12)
         bars.pack(fill="x")
         row1 = tk.Frame(bars, bg=t["tab_bg"])
         row1.pack(fill="x", pady=2)
         row2 = tk.Frame(bars, bg=t["tab_bg"])
         row2.pack(fill="x", pady=2)
+        row3 = tk.Frame(bars, bg=t["tab_bg"])
+        row3.pack(fill="x", pady=2)
         for row, items in ((row1, (("Copy diagnostics", self.copy),
                                    ("Export report…", self.export),
                                    ("Open logs", lambda: _open_path(
@@ -24425,6 +24884,11 @@ class DiagnosticsWindow:
                                     app.refresh_adapters),
                                    ("Repair dependencies", lambda:
                                     app.repair_dependencies(self.win)))),
+                           (row3, (("Check environment", self.check_env),
+                                   ("Runtime Manager…", lambda:
+                                    app.open_runtime_manager(self.win)),
+                                   ("\U0001F6E0 Repair MiniWireshark", lambda:
+                                    app.repair_everything(self.win)))),
                            (row2, (("Test capture engine", self.test_capture),
                                    ("Test DNS", self.test_dns),
                                    ("Test Internet", self.test_internet),
@@ -24447,7 +24911,14 @@ class DiagnosticsWindow:
         self.txt.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
         self.win.bind("<Escape>", lambda e: self.win.destroy())
+        app.refresh_env_report()
         self.refresh()
+
+    def check_env(self):
+        self.app._env_report = None
+        self.app.refresh_env_report()
+        self.result_var.set("Checking every component in the background — "
+                            "the result appears at the end of the report.")
 
     def alive(self):
         try:
@@ -24484,6 +24955,7 @@ class DiagnosticsWindow:
                                       if RuntimeManager().status()[
                                           "running_inside"] else
                                       "the Python it was started with"),
+            "Environment check   " + app.env_report_summary(),
             "Launch              " + (f"ready in "
                                       f"{LAUNCH_TIMES['ready'] * 1000:.0f} ms"
                                       if LAUNCH_TIMES.get("ready") else "—"),
@@ -24536,6 +25008,8 @@ class DiagnosticsWindow:
                                        .replace("\n", " ")),
             "Optional databases:"] + [f"   {s}" for s in
                                       app.data.summary_lines()]
+        lines += ["", "Environment, component by component:"] + [
+            "   " + ln for ln in app.env_report_text().splitlines()]
         return "\n".join(lines)
 
     def refresh(self):
@@ -27115,6 +27589,109 @@ def t_packet_ring(ctx):
     pr2.stop()
     st.stop(5)
     return f"{written} packets"
+
+
+@self_test()
+def t_python_age(ctx):
+    a, note = python_age((3, 9), today="2026-10")
+    assert a == "outdated" and "stopped receiving security fixes" in note
+    a, note = python_age((3, 10), today="2026-10")
+    assert a == "outdated", note                 # ends this month
+    a, note = python_age((3, 11), today="2026-10")
+    assert a == "ageing" and "2027-10" in note
+    assert python_age((3, 14), today="2026-10")[0] == "current"
+    assert python_age((3, 16), today="2026-10")[0] == "current"
+    assert python_age((3, 6), today="2026-10")[0] == "outdated"
+
+
+@self_test()
+def t_component_rows(ctx):
+    lock = {"scapy": {"version": "2.8.0", "required": True},
+            "psutil": {"version": "7.2.2", "required": False},
+            "cryptography": {"version": "50.0.2", "required": False},
+            "cffi": {"version": "2.1.1", "required": False,
+                     "needed_by": "cryptography"}}
+    info = {"python": "3.14.2", "tk": "9.0", "pip": "25.3", "packages": {
+        "scapy": {"version": "2.8.0", "import": True},
+        "psutil": {"version": "", "import": False},
+        "cryptography": {"version": "41.0.7", "import": True},
+        "cffi": {"version": "", "import": False}}}
+    rows = {r[0]: r for r in RuntimeManager.component_rows(info, lock)}
+    assert rows["scapy"][4] == "ok" and "verified" in rows["scapy"][3]
+    assert rows["psutil"][4] == "warn" and "optional" in rows["psutil"][3]
+    assert rows["cryptography"][4] == "warn" and "50.0.2" in \
+        rows["cryptography"][3]
+    assert rows["cffi"][4] == "ok" and "helper" in rows["cffi"][3]
+    info["packages"]["scapy"] = {"version": "2.8.0", "import": False,
+                                 "error": "ImportError: libpcap"}
+    rows = {r[0]: r for r in RuntimeManager.component_rows(info, lock)}
+    assert rows["scapy"][4] == "bad" and "won't load" in rows["scapy"][3]
+    info["packages"]["scapy"] = {"version": "", "import": False}
+    rows = {r[0]: r for r in RuntimeManager.component_rows(info, lock)}
+    assert rows["scapy"][4] == "bad" and "needed" in rows["scapy"][3]
+    info["packages"]["scapy"] = {"version": "2.8.0", "import": True}
+    rows = {r[0]: r for r in RuntimeManager.component_rows(
+        info, lock, pip_problems=["scapy 2.8.0 requires foo, which is not "
+                                  "installed."])}
+    assert rows["scapy"][4] == "bad" and "Conflict" in rows["scapy"][3]
+    info["tk"] = ""
+    rows = {r[0]: r for r in RuntimeManager.component_rows(info, lock)}
+    assert rows["Graphical toolkit (Tk)"][4] == "bad"
+    rows = RuntimeManager.component_rows({"error": "boom", "packages": {}})
+    assert rows[0][4] == "bad" and "boom" in rows[0][3]
+
+
+@self_test(slow=True)
+def t_environment_diagnose(ctx):
+    """The real component check on the Python running the self-test."""
+    mgr = RuntimeManager(root_dir=ctx.path("rtdiag"))
+    rep = mgr.diagnose(sys.executable)
+    names = [r[0] for r in rep["rows"]]
+    assert names[:3] == ["Python", "Graphical toolkit (Tk)", "pip"], names
+    assert set(RUNTIME_LOCK) <= set(names)
+    sc = next(r for r in rep["rows"] if r[0] == "scapy")
+    assert sc[1] and sc[4] != "bad", sc        # the self-test needs scapy
+    assert "pip check" in rep["text"] or rep["pip_problems"]
+    assert rep["info"]["python"] == platform.python_version()
+    try:
+        mgr.update_pip(sys.executable)
+        raise AssertionError("system pip must never be updated")
+    except RuntimeError_:
+        pass
+    return rep["worst"]
+
+
+@self_test()
+def t_newer_python_source(ctx):
+    mgr = RuntimeManager(root_dir=ctx.path("rtnew"))
+    plat = runtime_platform()
+    if plat not in RUNTIME_SOURCES:
+        return "skip"
+    suffix = RUNTIME_SOURCES[plat][0].split("-", 2)[2]
+    sha = "ab" * 32
+
+    def rel(*assets):
+        return {"tag_name": "20261013", "assets": list(assets)}
+
+    def asset(ver, suf=suffix, digest="sha256:" + sha, tag="20261013"):
+        n = f"cpython-{ver}+{tag}-{suf}"
+        return {"name": n, "digest": digest,
+                "browser_download_url": "https://github.com/x/" + n}
+    got = mgr.newer_python_source(release=rel(
+        asset("3.14.1"), asset("3.14.4"), asset("3.14.3"),
+        asset("3.15.0"), asset("3.14.9", suf="other-target.tar.gz")))
+    assert got and got["version"] == "3.14.4" and got["sha"] == sha, got
+    assert got["name"].endswith(suffix) and got["url"].endswith(got["name"])
+    # no published checksum → never offered
+    assert mgr.newer_python_source(release=rel(asset("3.14.4",
+                                                     digest=""))) is None
+    assert mgr.newer_python_source(release=rel(asset(
+        "3.14.4", digest="sha256:nothex"))) is None
+    # nothing newer than the verified one
+    assert mgr.newer_python_source(release=rel(asset(RUNTIME_PYTHON),
+                                               asset("3.14.1"))) is None
+    # a newer minor (3.15) is not offered as a drop-in replacement
+    assert mgr.newer_python_source(release=rel(asset("3.15.1"))) is None
 
 
 def bench_report(seconds=2.0):
