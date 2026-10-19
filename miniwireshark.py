@@ -16456,8 +16456,11 @@ class NetworkModel:
                 dev, self.gateway_ip, self.my_ips, self.my_macs,
                 self.registry.ra_routers, self.registry.gw_macs)
             if dev.user_class:
-                cls, word, reasons = dev.user_class, "", [
-                    "You set this type"] + [r for r in reasons][:2]
+                auto = f"{word} {cls}".strip()
+                reasons = ["You set this type"] + (
+                    [f"Detection alone suggests: {auto}"]
+                    if cls not in ("Unknown", dev.user_class) else [])
+                cls, word = dev.user_class, ""
             elif word != "Likely" and not getattr(self, "demo", False) and \
                     not dev.demo and \
                     self.config.get("devices.learn_types", True):
@@ -19103,6 +19106,22 @@ Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
 Automatic (MiniWireshark decides) ¦ Automatique (MiniWireshark décide) ¦ Automático (MiniWireshark decide)
 You set this type ¦ Vous avez choisi ce type ¦ Usted eligió este tipo
 detected ¦ détecté ¦ detectado
+Choose ¦ Choisir ¦ Elegir
+Access point ¦ Point d'accès ¦ Punto de acceso
+Windows PC ¦ PC Windows ¦ PC con Windows
+Linux PC ¦ PC Linux ¦ PC con Linux
+Android phone ¦ Téléphone Android ¦ Teléfono Android
+Tablet ¦ Tablette ¦ Tableta
+Printer ¦ Imprimante ¦ Impresora
+Smart TV ¦ Téléviseur connecté ¦ Televisor inteligente
+Streaming device ¦ Appareil de streaming ¦ Dispositivo de streaming
+Console ¦ Console de jeu ¦ Consola de juegos
+Speaker ¦ Enceinte ¦ Altavoz
+Camera ¦ Caméra ¦ Cámara
+NAS ¦ NAS (stockage réseau) ¦ NAS (almacenamiento en red)
+Smart-home/IoT ¦ Maison connectée / IoT ¦ Hogar inteligente / IoT
+Virtual machine ¦ Machine virtuelle ¦ Máquina virtual
+Container/virtual interface ¦ Conteneur / interface virtuelle ¦ Contenedor / interfaz virtual
 Learn from the device types I set ¦ Apprendre des types d'appareils que je définis ¦ Aprender de los tipos de dispositivo que defino
 When you use “Set device type…”, the device's fingerprint (maker block, DHCP request list, services, name pattern) is kept on this computer so look-alike devices get the same suggestion. Two matching signals are needed; nothing is sent anywhere. ¦ Quand vous utilisez « Définir le type d'appareil… », l'empreinte de l'appareil (bloc du fabricant, liste de requêtes DHCP, services, modèle de nom) est gardée sur cet ordinateur pour que les appareils semblables reçoivent la même suggestion. Deux signaux concordants sont nécessaires ; rien n'est envoyé. ¦ Cuando usa «Definir el tipo de dispositivo…», la huella del dispositivo (bloque del fabricante, lista de solicitudes DHCP, servicios, patrón de nombre) se guarda en este equipo para que los dispositivos parecidos reciban la misma sugerencia. Se necesitan dos señales coincidentes; no se envía nada.
 Forget learned device types… ¦ Oublier les types d'appareils appris… ¦ Olvidar los tipos de dispositivo aprendidos…
@@ -19314,6 +19333,8 @@ I18N_PATTERNS = [
     (r"Looks like (.+?), which you said is a (.+?) \((.+)\)",
      "Ressemble à {t1}, que vous avez désigné comme {t2} ({t3})",
      "Se parece a {t1}, que usted indicó como {t2} ({t3})"),
+    (r"Detection alone suggests: (.+)", "La détection seule suggère : {t1}",
+     "La detección por sí sola sugiere: {t1}"),
     (r"Set the type of (.+?): (.+?) → (.+)",
      "Type de {t1} défini : {t2} → {t3}",
      "Tipo de {t1} definido: {t2} → {t3}"),
@@ -36433,6 +36454,85 @@ def t_session_v3_keeps_evidence(ctx):
 
 
 BENCH_EXTRA.append(bench_store)
+
+
+def bench_components():
+    """Components Center costs: load time and memory for each list at its
+    real-world size (synthetic contents, no network), lookup speed, and
+    the teach-once matcher at its 300-entry cap."""
+    import tracemalloc
+    out = {}
+    tmp = tempfile.mkdtemp(prefix="mw-bench-cc-")
+    rnd = random.Random(7)
+
+    def pub_ip():
+        while True:
+            ip = ".".join(str(rnd.randint(1, 223)) if i == 0 else
+                          str(rnd.randint(0, 255)) for i in range(4))
+            if is_public_ip(ip):
+                return ip
+    feodo = os.path.join(tmp, "feodo.txt")
+    with open(feodo, "w") as f:
+        f.write("################\n# abuse.ch Feodo Tracker\n"
+                "# Last updated: 2026-10-19 00:00:00 UTC\n#\n")
+        for _ in range(1000):
+            f.write(pub_ip() + "\n")
+    drop = os.path.join(tmp, "drop.json")
+    with open(drop, "w") as f:
+        seen = set()
+        while len(seen) < 1500:
+            net = ipaddress.ip_network(pub_ip() + "/" +
+                                       str(rnd.randint(16, 24)), strict=False)
+            seen.add(net)
+        nets = sorted(seen)
+        # DROP ranges do not overlap: keep only the first of nested ones
+        kept, end = [], -1
+        for n in nets:
+            if int(n.network_address) > end:
+                kept.append(n)
+                end = int(n.broadcast_address)
+        for i, n in enumerate(kept):
+            f.write(json.dumps({"cidr": str(n), "sblid": f"SBL{i}",
+                                "rir": "x"}) + "\n")
+        f.write(json.dumps({"type": "metadata", "timestamp": 1760000000,
+                            "size": len(kept)}) + "\n")
+    for key, fn, path in (("feodo", load_feodo, feodo),
+                          ("drop", load_drop, drop)):
+        tracemalloc.start()
+        t0 = time.perf_counter()
+        rl = fn(path)
+        out[f"cc_{key}_load_ms"] = (time.perf_counter() - t0) * 1000
+        out[f"cc_{key}_entries"] = len(rl)
+        out[f"cc_{key}_mem_kb"] = tracemalloc.get_traced_memory()[0] / 1024
+        tracemalloc.stop()
+        probes = [pub_ip() for _ in range(20000)]
+        t0 = time.perf_counter()
+        for ip in probes:
+            rl.lookup(ip)
+        out[f"cc_{key}_lookup_us"] = (time.perf_counter() - t0) / \
+            len(probes) * 1e6
+    t0 = time.perf_counter()
+    for i in range(20000):
+        explain_port(1 + (i * 7919) % 65535)
+    out["cc_port_explain_us"] = (time.perf_counter() - t0) / 20000 * 1e6
+    lt = LearnedTypes(path=os.path.join(tmp, "learned.json"))
+    lt.save = lambda: None
+    for i in range(LearnedTypes.MAX):
+        lt.learn(DeviceRecord(key=f"k{i}", mac=f"00:1b:{i // 256:02x}:"
+                                               f"{i % 256:02x}:00:01",
+                              dhcp_params=f"1,3,6,{i % 40}",
+                              services={f"_svc{i % 25}._tcp"}), "Printer")
+    probe = DeviceRecord(key="probe", mac="00:1b:00:07:00:02",
+                         dhcp_params="1,3,6,7", services={"_svc7._tcp"})
+    t0 = time.perf_counter()
+    for _ in range(500):
+        lt.match(probe)
+    out["cc_learned_match_us"] = (time.perf_counter() - t0) / 500 * 1e6
+    shutil.rmtree(tmp, ignore_errors=True)
+    return out
+
+
+BENCH_EXTRA.append(bench_components)
 
 @self_test()
 def t_ip_reuse_keeps_histories_apart(ctx):
