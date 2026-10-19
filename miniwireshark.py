@@ -282,7 +282,8 @@ def _fatal_dialog(title, message):
 
 def _relaunch_elevated():
     script = SCRIPT_PATH
-    extra = [a for a in sys.argv[1:] if a != ELEVATED_FLAG]
+    extra = [a for a in sys.argv[1:] if a != ELEVATED_FLAG] + \
+        list(_HANDOFF_ARGS) + ([SAFE_FLAG] if SAFE_MODE else [])
     if IS_WINDOWS:
         params = subprocess.list2cmdline([script, ELEVATED_FLAG] + extra)
         try:
@@ -305,7 +306,7 @@ def _relaunch_elevated():
                  ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
                   "XDG_RUNTIME_DIR", "HOME", "USER", "LANG", "PATH",
                   "MINIWIRESHARK_DATA", "MINIWIRESHARK_CONFIG", "MW_STAGE",
-                  "MINIWIRESHARK_NO_RUNTIME")
+                  "MINIWIRESHARK_NO_RUNTIME", "MW_READY_FILE")
                  if v in os.environ]
     launchers = []
     if shutil.which("pkexec"):
@@ -383,7 +384,8 @@ def runtime_healthy(env):
     if not env:
         return False
     exe = env.get("python", "")
-    return bool(exe and os.path.isfile(exe) and env.get("selftest_ok"))
+    return bool(exe and os.path.isfile(exe) and env.get("selftest_ok")
+                and not env.get("handshake_failed"))
 
 
 def _same_interpreter(a, b):
@@ -394,19 +396,319 @@ def _same_interpreter(a, b):
         return False
 
 
-def runtime_handoff(argv=None, environ=None, execute=True):
-    """Decide whether to re-launch inside the private runtime. Returns the
-    command it ran (or would run), or None to continue in this Python."""
+def runtime_confirm_started():
+    """Called by the app once it has been up for a while: this runtime
+    works, so clear the failed-start counter."""
+    if MW_STAGE != "app":
+        return False
+    state = runtime_state_read()
+    if not state or not state.get("pending_starts"):
+        return False
+    state["pending_starts"] = 0
+    env = runtime_env(state)
+    if env is not None:
+        env["last_ok_start"] = time.time()
+    with contextlib.suppress(OSError):
+        runtime_state_write(state)
+    return True
+
+
+# ============================================================================
+#  1a+.  V5 startup: boot receipts, Safe Mode, the handshake hand-off and
+#        the private packages folder
+#
+#  MiniWireshark 5 opens on the Python that started it whenever that Python
+#  can run it. Missing packages go into a private folder inside the data
+#  folder (one per Python version and platform), never into the system
+#  Python. A managed Python is only used when you chose it, or when this
+#  Python is too old or has no graphical toolkit — and then only after its
+#  window has reported back (the "handshake"); otherwise this process stays
+#  and explains what went wrong.
+#
+#  Every start writes a small "boot receipt" (stages, timings, errors) so a
+#  failure on another computer can be read instead of guessed. Two starts in
+#  a row that never reached the main window switch the next start to Safe
+#  Mode.
+# ============================================================================
+BOOT_DIR = os.path.join(PATHS.data, "boot")
+SAFE_FLAG = "--safe"
+BOOT_CHECK_FLAG = "--boot-check"
+READY_ARG = "--mw-ready="
+STAGE_ARG = "--mw-stage=app"
+HANDSHAKE_TIMEOUT = 25.0          # seconds for the managed Python's window
+HANDSHAKE_ELEVATION_TIMEOUT = 180.0   # if it is waiting for a UAC click
+HANDOFF_NOTE = [""]               # why a hand-off failed (shown at startup)
+
+# arguments that only carry the hand-off between two processes
+_HANDOFF_ARGS = [a for a in sys.argv[1:] if a.startswith(READY_ARG) or
+                 a == STAGE_ARG]
+for _a in _HANDOFF_ARGS:
+    sys.argv.remove(_a)
+if STAGE_ARG in _HANDOFF_ARGS and not MW_STAGE:
+    MW_STAGE = "app"
+READY_FILE = next((a[len(READY_ARG):] for a in _HANDOFF_ARGS
+                   if a.startswith(READY_ARG)), "") or \
+    os.environ.get("MW_READY_FILE", "")
+
+
+def _pid_alive(pid):
+    """True while a process with this id exists (best effort)."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if IS_WINDOWS:
+        try:
+            k = ctypes.windll.kernel32
+            h = k.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFO
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+            k.CloseHandle(h)
+            return bool(ok) and code.value == 259    # STILL_ACTIVE
+        except (AttributeError, OSError):
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+class BootReceipt:
+    """One small JSON file per start: what ran, how long it took, what
+    failed (with the exact error). Written after every step, so even a hard
+    crash leaves a readable trace. The newest KEEP receipts are kept."""
+
+    KEEP = 10
+    FAILED = ("running", "crashed", "fatal")
+
+    def __init__(self, directory=None, argv=None, kind="start"):
+        self.dir = directory or BOOT_DIR
+        self.m0 = time.monotonic()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        self.path = os.path.join(self.dir, f"boot-{stamp}-{os.getpid()}"
+                                           f".json")
+        self._lock = threading.Lock()
+        self.data = {
+            "kind": kind, "version": SCRIPT_VERSION, "started": time.time(),
+            "pid": os.getpid(), "python": platform.python_version(),
+            "executable": sys.executable, "platform": platform.platform(),
+            "stage": MW_STAGE or "launcher",
+            "argv": [a for a in (sys.argv[1:] if argv is None else argv)
+                     if not a.startswith(READY_ARG)][:8],
+            "steps": [], "reached_window": False, "reached_main_window":
+                False, "safe_mode": False, "outcome": "running"}
+        self._write()
+        self.prune()
+
+    def step(self, name, ok=True, detail="", error=None):
+        e = {"name": str(name), "at": round(time.monotonic() - self.m0, 3),
+             "ok": bool(ok), "detail": scrub_secrets(str(detail))[:300]}
+        if error is not None:
+            e["error"] = scrub_secrets(
+                f"{type(error).__name__}: {error}")[:600]
+        with self._lock:
+            self.data["steps"].append(e)
+            if len(self.data["steps"]) > 200:
+                del self.data["steps"][:50]
+            self._write()
+        return e
+
+    def mark(self, **kw):
+        with self._lock:
+            self.data.update(kw)
+            if kw.get("outcome") and kw["outcome"] != "running":
+                self.data["ended"] = time.time()
+                self.data["duration"] = round(time.monotonic() - self.m0, 3)
+            self._write()
+
+    def _write(self):
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            atomic_write_json(self.path, self.data)
+        except OSError:
+            pass
+
+    def prune(self):
+        for old in BootReceipt.files(self.dir)[self.KEEP:]:
+            with contextlib.suppress(OSError):
+                os.remove(old)
+
+    @staticmethod
+    def files(directory=None):
+        d = directory or BOOT_DIR
+        try:
+            names = [n for n in os.listdir(d)
+                     if n.startswith("boot-") and n.endswith(".json")]
+        except OSError:
+            return []
+        paths = [os.path.join(d, n) for n in names]
+        return sorted(paths, key=lambda p: (os.path.getmtime(p)
+                                            if os.path.exists(p) else 0, p),
+                      reverse=True)
+
+    @staticmethod
+    def recent(directory=None, n=10):
+        out = []
+        for p in BootReceipt.files(directory)[:n]:
+            r = read_json(p, None)
+            if isinstance(r, dict):
+                r["_path"] = p
+                out.append(r)
+        return out
+
+    @staticmethod
+    def failed(r):
+        """A start that never reached the main window and is not still
+        running (a closed Welcome Center or a hand-off is not a failure)."""
+        if r.get("kind") != "start" or r.get("reached_main_window"):
+            return False
+        if r.get("outcome") not in BootReceipt.FAILED:
+            return False
+        if r.get("outcome") == "running" and _pid_alive(r.get("pid")):
+            return False
+        return True
+
+    @staticmethod
+    def summary(r):
+        steps = r.get("steps") or []
+        bad = next((s for s in steps if not s.get("ok")), None)
+        when = time.strftime("%Y-%m-%d %H:%M:%S",
+                             time.localtime(r.get("started", 0)))
+        line = (f"{when}  {r.get('outcome', '?'):<10} Python "
+                f"{r.get('python', '?')} ({r.get('stage', '?')})"
+                f"  {r.get('duration', '…')} s")
+        if r.get("safe_mode"):
+            line += "  [Safe Mode]"
+        if bad:
+            line += f"\n    failed at: {bad['name']} — " \
+                    f"{bad.get('error') or bad.get('detail')}"
+        elif r.get("outcome") in BootReceipt.FAILED and steps:
+            line += f"\n    last step: {steps[-1]['name']}"
+        return line
+
+
+def crash_loop_detected(receipts, current_path=""):
+    """True when the two newest previous starts both failed."""
+    prev = [r for r in receipts if r.get("_path") != current_path and
+            r.get("kind") == "start"][:2]
+    return len(prev) == 2 and all(BootReceipt.failed(r) for r in prev)
+
+
+BOOT = None                       # this start's receipt (GUI starts only)
+SAFE_MODE = SAFE_FLAG in sys.argv
+SAFE_REASON = ["You asked for Safe Mode (--safe)." if SAFE_MODE else ""]
+if SAFE_MODE:
+    sys.argv.remove(SAFE_FLAG)
+
+
+def boot_step(name, ok=True, detail="", error=None):
+    if BOOT is not None:
+        BOOT.step(name, ok, detail, error)
+
+
+def signal_ready():
+    """The managed-Python child tells its parent that its window is up."""
+    if not READY_FILE:
+        return False
+    try:
+        with open(READY_FILE, "w", encoding="utf-8") as f:
+            f.write(f"READY {os.getpid()}\n")
+        return True
+    except OSError:
+        return False
+
+
+def system_python_suitable(version=None, has_tk=None):
+    """(ok, reason): can the Python that started the file run the app?"""
+    v = tuple(version or sys.version_info[:2])
+    if v < (3, 8):
+        return False, f"Python {v[0]}.{v[1]} is too old (3.8+ needed)"
+    if has_tk is None:
+        try:
+            import importlib.util as _iu
+            has_tk = _iu.find_spec("_tkinter") is not None
+        except (ImportError, ValueError):
+            has_tk = False
+    if not has_tk:
+        return False, "this Python has no graphical toolkit (Tk)"
+    return True, ""
+
+
+def wait_for_handshake(proc, ready_file, timeout=HANDSHAKE_TIMEOUT,
+                       elevation_timeout=HANDSHAKE_ELEVATION_TIMEOUT,
+                       poll=0.1):
+    """→ ("ready" | "exited" | "timeout", return code or None).
+    A child that exits with 0 before the handshake may have handed over to
+    an elevated copy of itself, so the wait continues (longer) for that."""
+    t0 = time.monotonic()
+    limit = timeout
+    rc = None
+    while True:
+        if ready_file and os.path.exists(ready_file):
+            return "ready", rc
+        if rc is None:
+            rc = proc.poll()
+            if rc is not None:
+                if rc != 0:
+                    if ready_file and os.path.exists(ready_file):
+                        return "ready", rc
+                    return "exited", rc
+                limit = max(limit, elevation_timeout)
+        if time.monotonic() - t0 > limit:
+            return ("timeout" if rc is None else "exited"), rc
+        time.sleep(poll)
+
+
+def _child_log_path():
+    return os.path.join(PATHS.logs, time.strftime("child-%Y%m%d-%H%M%S")
+                        + f"-{os.getpid()}.log")
+
+
+def _tail(path, n=1200):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - n))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def runtime_handoff(argv=None, environ=None, execute=True, suitable=None,
+                    timeout=HANDSHAKE_TIMEOUT):
+    """Decide whether to start the app inside the managed Python. Returns
+    the command it ran (or would run), or None to continue in this Python.
+
+    V5 rules: never when this Python can run the app, unless you chose the
+    managed Python in the Runtime Manager; never in Safe Mode; and the
+    child must report its window within the handshake time, or this
+    process stays and explains why."""
     environ = os.environ if environ is None else environ
     argv = list(sys.argv[1:] if argv is None else argv)
-    if environ.get("MW_STAGE") == "app" or NO_RUNTIME_FLAG in argv or \
-            environ.get("MINIWIRESHARK_NO_RUNTIME"):
+    if environ.get("MW_STAGE") == "app" or MW_STAGE == "app" or \
+            NO_RUNTIME_FLAG in argv or \
+            environ.get("MINIWIRESHARK_NO_RUNTIME") or SAFE_MODE:
         return None
     state = runtime_state_read()
     env = runtime_env(state)
     if not runtime_healthy(env):
         return None
     if _same_interpreter(env["python"], sys.executable):
+        return None
+    ok, _why = suitable if suitable is not None else system_python_suitable()
+    if ok and state.get("prefer", "auto") != "managed":
         return None
     if int(state.get("pending_starts", 0)) >= 2:
         # the last two starts inside this runtime never confirmed: roll back
@@ -427,44 +729,77 @@ def runtime_handoff(argv=None, environ=None, execute=True):
     state["pending_starts"] = int(state.get("pending_starts", 0)) + 1
     with contextlib.suppress(OSError):
         runtime_state_write(state)
-    cmd = [env["python"], SCRIPT_PATH] + argv
+    ready = os.path.join(BOOT_DIR, f"ready-{os.getpid()}-"
+                                   f"{uuid.uuid4().hex[:8]}")
+    cmd = [env["python"], SCRIPT_PATH] + argv + [STAGE_ARG,
+                                                 READY_ARG + ready]
     if not execute:
-        return cmd
+        return cmd[:len(cmd) - 2]
     child_env = dict(environ)
     child_env["MW_STAGE"] = "app"
+    child_env["MW_READY_FILE"] = ready
+    log_path = _child_log_path()
+    boot_step("hand-off", True, f"starting the managed Python "
+                                f"{env.get('version', '?')}")
     try:
-        if IS_WINDOWS:
-            flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-            subprocess.Popen(cmd, env=child_env, creationflags=flags,
-                             close_fds=True)
-            sys.exit(0)
-        os.execve(cmd[0], cmd, child_env)
+        os.makedirs(BOOT_DIR, exist_ok=True)
+        logf = open(log_path, "wb")
+    except OSError:
+        logf = subprocess.DEVNULL
+    try:
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) \
+            if IS_WINDOWS else 0
+        proc = subprocess.Popen(cmd, env=child_env, creationflags=flags,
+                                close_fds=True, stdout=logf,
+                                stderr=subprocess.STDOUT)
     except OSError as e:
-        state = runtime_state_read()
-        state["pending_starts"] = max(0, int(state.get("pending_starts",
-                                                       1)) - 1)
-        state["last_error"] = f"could not start the private Python: {e}"
-        with contextlib.suppress(OSError):
-            runtime_state_write(state)
+        _handoff_failed(env, f"could not start it: {e}", log_path)
         return None
-    return cmd
+    finally:
+        if logf is not subprocess.DEVNULL:
+            with contextlib.suppress(OSError):
+                logf.close()
+    result, rc = wait_for_handshake(proc, ready, timeout=timeout)
+    if result == "ready":
+        with contextlib.suppress(OSError):
+            os.remove(ready)
+        boot_step("hand-off", True, "the managed Python's window is up")
+        if BOOT is not None:
+            BOOT.mark(outcome="handed_off", reached_window=True)
+        sys.exit(0)
+    if result == "timeout" and proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.terminate()
+        with contextlib.suppress(subprocess.SubprocessError, OSError):
+            proc.wait(5)
+        with contextlib.suppress(OSError):
+            proc.kill()
+    why = (f"its window did not appear within {int(timeout)} s"
+           if result == "timeout" else f"it stopped with code {rc} before "
+                                       f"opening its window")
+    _handoff_failed(env, why, log_path)
+    return None
 
 
-def runtime_confirm_started():
-    """Called by the app once it has been up for a while: this runtime
-    works, so clear the failed-start counter."""
-    if MW_STAGE != "app":
-        return False
+def _handoff_failed(env, why, log_path):
+    """Remember a failed hand-off so it is not retried automatically, and
+    tell this start what happened."""
+    tail = _tail(log_path, 600).strip()
     state = runtime_state_read()
-    if not state or not state.get("pending_starts"):
-        return False
+    cur = state.get("current")
+    envs = state.get("envs") or {}
+    if cur in envs:
+        envs[cur]["handshake_failed"] = time.time()
+        envs[cur]["handshake_error"] = why
     state["pending_starts"] = 0
-    env = runtime_env(state)
-    if env is not None:
-        env["last_ok_start"] = time.time()
+    state["last_error"] = (f"The managed Python {env.get('version', '')} "
+                           f"could not start: {why}. MiniWireshark is using "
+                           f"this Python instead. Log: {log_path}")
     with contextlib.suppress(OSError):
         runtime_state_write(state)
-    return True
+    HANDOFF_NOTE[0] = state["last_error"]
+    boot_step("hand-off", False, why + (f" | {tail[-300:]}" if tail else ""))
+    LOG.warning("hand-off failed: %s", why)
 
 
 def needs_elevation():
@@ -512,7 +847,9 @@ BENCH_MODE = "--bench" in sys.argv
 RELEASE_FLAGS = ("--release-check", "--make-release-key", "--sign-release",
                  "--sign-datapack")
 RELEASE_MODE = any(f in sys.argv for f in RELEASE_FLAGS)
-TOOL_MODE = SELF_TEST_MODE or GUI_TEST_MODE or BENCH_MODE or RELEASE_MODE
+BOOT_CHECK_MODE = BOOT_CHECK_FLAG in sys.argv
+TOOL_MODE = SELF_TEST_MODE or GUI_TEST_MODE or BENCH_MODE or \
+    RELEASE_MODE or BOOT_CHECK_MODE
 START_IN_DEMO = DEMO_FLAG in sys.argv
 
 if ELEVATED_FLAG in sys.argv:
@@ -521,12 +858,25 @@ if ELEVATED_FLAG in sys.argv:
 else:
     _ELEV = False
 
+if __name__ == "__main__" and not TOOL_MODE:
+    BOOT = BootReceipt()
+    if not SAFE_MODE and crash_loop_detected(BootReceipt.recent(),
+                                             BOOT.path):
+        SAFE_MODE = True
+        SAFE_REASON[0] = ("The last two starts didn't reach the main "
+                          "window, so this start uses Safe Mode.")
+    BOOT.mark(safe_mode=SAFE_MODE)
+    boot_step("launch", True, f"Python {platform.python_version()} "
+                              f"({'app' if MW_STAGE else 'launcher'})")
+
 if __name__ == "__main__" and not TOOL_MODE and not _ELEV:
-    runtime_handoff()          # re-launches in the private Python if healthy
+    runtime_handoff()          # managed Python only when chosen or needed
 
 if __name__ == "__main__" and not TOOL_MODE and not _ELEV and \
         not os.environ.get(NO_ELEVATE_ENV) and \
         NO_ELEVATE_FLAG not in sys.argv and needs_elevation():
+    if BOOT is not None:
+        BOOT.mark(outcome="elevated")
     if _relaunch_elevated():
         sys.exit(0)
     _fatal_dialog(
@@ -537,6 +887,9 @@ if __name__ == "__main__" and not TOOL_MODE and not _ELEV and \
         "•  Linux:  install pkexec or run with sudo.\n"
         "•  macOS:  accept the password prompt.\n\n"
         "The program will now close.")
+    if BOOT is not None:
+        BOOT.mark(outcome="fatal")
+        boot_step("elevation", False, "administrator rights refused")
     sys.exit(1)
 
 
@@ -685,63 +1038,392 @@ def _version_tuple(v):
     return tuple(out)
 
 
-def _pip_available():
+def abi_tag(version=None, plat=None):
+    """'cp312-win_amd64': one private packages folder per Python version
+    and platform, so binary packages never mix after a Python upgrade."""
+    import sysconfig
+    v = version or sys.version_info[:2]
+    p = plat or sysconfig.get_platform()
+    p = re.sub(r"[^A-Za-z0-9]+", "_", p).strip("_").lower()
+    return f"cp{v[0]}{v[1]}-{p}"
+
+
+PKG_ROOT = os.path.join(PATHS.data, "site")
+PKG_DIR = os.path.join(PKG_ROOT, abi_tag())
+
+# Pure-Python wheels installed without pip: download, check the SHA-256
+# written here, unzip. (scapy is pure Python, so the capture engine never
+# needs pip.) Pip wheels let a Python without pip run pip from the wheel.
+PURE_WHEELS = {
+    "scapy": ("2.8.0", "scapy-2.8.0-py3-none-any.whl",
+              "abf855145ee829a42b2eb28983cd6a0a52b12a31d3f861cb7be36791195ed9aa",
+              2_762_122),
+}
+PIP_WHEELS = {
+    "old": ("24.3.1", "pip-24.3.1-py3-none-any.whl",
+            "3790624780082365f47549d032f3770eeb2b1e8bd1f7b2e02dace1afa361b4ed"),
+    "new": ("25.2", "pip-25.2-py3-none-any.whl",
+            "6d67a2b4e7f14d8b31b8b52648866fa717f45a1eb70e83002f4331d07e953717"),
+}
+# Optional binary packages: exact versions, installed only when you ask
+# (Settings → Components); pip checks PyPI's own hashes.
+OPTIONAL_PACKAGES = {
+    "psutil": {"version": "7.2.2", "import": "psutil", "size_mb": 0.5,
+               "license": "BSD-3-Clause",
+               "benefit": "Shows which program on this computer owns each "
+                          "connection; adapter link status; CPU-aware "
+                          "performance mode."},
+    "cryptography": {"version": "50.0.2", "version_py38": "46.0.3",
+                     "import": "cryptography",
+                     "size_mb": 4.5, "license": "Apache-2.0 or BSD",
+                     "benefit": "Reads HTTP/3 (QUIC) site names about 50x "
+                                "faster than the built-in pure-Python "
+                                "code."},
+}
+
+
+def optional_version(key, version=None):
+    spec = OPTIONAL_PACKAGES[key]
+    v = tuple(version or sys.version_info[:2])
+    if v < (3, 9) and spec.get("version_py38"):
+        return spec["version_py38"]
+    return spec["version"]
+
+
+def pypi_file_url(filename):
+    """files.pythonhosted.org serves every release file at a predictable
+    path (it redirects to the hashed location)."""
+    name = filename.split("-", 1)[0].lower().replace("_", "-")
+    pytag = filename[:-4].split("-")[-3] if filename.endswith(".whl") \
+        else "source"
+    return (f"https://files.pythonhosted.org/packages/{pytag}/{name[0]}/"
+            f"{name}/{filename}")
+
+
+def fetch_to_file(url, dest, expected_sha=None, feature="packages",
+                  progress=None, cancel=lambda: False, size_hint=0,
+                  max_bytes=200 * 1024 * 1024, timeout=60):
+    """Download behind the outbound gate: resumable, capped in size,
+    cancellable, checked against a SHA-256 when one is given. Writes
+    dest only when everything checked out. Raises RuntimeError_."""
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    if expected_sha and os.path.exists(dest) and \
+            sha256_file(dest) == expected_sha:
+        return dest
+    part = dest + ".part"
+    have = os.path.getsize(part) if (expected_sha and
+                                     os.path.exists(part)) else 0
+    req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+    if have:
+        req.add_header("Range", f"bytes={have}-")
+    t0, last = time.time(), 0.0
     try:
-        r = subprocess.run([sys.executable, "-m", "pip", "--version"],
-                           capture_output=True, text=True, timeout=30)
-        return r.returncode == 0, (r.stdout or r.stderr).strip()
-    except (OSError, subprocess.SubprocessError) as e:
-        return False, str(e)
+        with net_urlopen(feature, req, timeout,
+                         os.path.basename(dest)) as r:
+            if have and getattr(r, "status", 200) != 206:
+                have = 0
+            total = int(r.headers.get("Content-Length") or 0) + have
+            total = total or size_hint
+            if total and total > max_bytes:
+                raise RuntimeError_("other", f"{total} bytes is more than "
+                                             f"the {max_bytes} limit")
+            got = have
+            with open(part, "ab" if have else "wb") as f:
+                while True:
+                    if cancel():
+                        raise RuntimeError_("cancelled")
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    got += len(chunk)
+                    if got > max_bytes:
+                        raise RuntimeError_("other", "download larger than "
+                                                     "its limit")
+                    f.write(chunk)
+                    now = time.time()
+                    if progress and now - last > 0.2:
+                        last = now
+                        speed = (got - have) / max(0.001, now - t0)
+                        eta = (total - got) / speed if speed and total \
+                            else 0
+                        progress("Download", got / total if total else 0.0,
+                                 f"{got / 1e6:.1f} of {total / 1e6:.1f} MB",
+                                 {"speed": speed, "eta": eta})
+    except RuntimeError_:
+        raise
+    except (OSError, urllib.error.URLError) as e:
+        raise RuntimeError_(classify_runtime_error(e), str(e))
+    if expected_sha:
+        actual = sha256_file(part)
+        if actual != expected_sha:
+            with contextlib.suppress(OSError):
+                os.remove(part)
+            raise RuntimeError_("fingerprint",
+                                f"expected {expected_sha}, got {actual}")
+    os.replace(part, dest)
+    return dest
 
 
-PIP_ASK = [None]     # callable() -> bool: may we use --break-system-packages?
+class PrivatePackages:
+    """MiniWireshark's own packages folder, one per Python version and
+    platform, added to sys.path at startup. Installing here never touches
+    the system Python: pure-Python wheels are unzipped after a SHA-256
+    check; binary packages go through `pip install --target` run by this
+    same Python (or by pip straight from its pinned wheel when this Python
+    has no pip). Each package is swapped in atomically and the previous
+    copy is kept until the new one imports."""
 
+    def __init__(self, root=None, cache=None, python=None):
+        self.root = root or PKG_DIR
+        self.cache = cache or os.path.join(PATHS.cache, "wheels")
+        self.python = python or sys.executable
+        self.manifest_path = os.path.join(self.root, "mw-packages.json")
 
-def _pip_install(pkg, upgrade=False, timeout=900):
-    base = [sys.executable, "-m", "pip", "install",
-            "--disable-pip-version-check", "-q"]
-    if upgrade:
-        base.append("--upgrade")
-    last = ""
-    variants = [base + [pkg], base + ["--user", pkg]]
-    asked = []
+    # ---- state -----------------------------------------------------------
+    def manifest(self):
+        m = read_json(self.manifest_path, None)
+        if not isinstance(m, dict) or not isinstance(m.get("packages"),
+                                                     dict):
+            m = {"packages": {}}
+        return m
 
-    def may_break():
-        if not asked:
-            fn = PIP_ASK[0]
-            asked.append(bool(fn()) if fn is not None else False)
-        return asked[0]
-    for cmd in variants + ["ask"]:
-        if cmd == "ask":
-            if not ("externally-managed" in last.lower() and may_break()):
-                break
-            for cmd2 in (base + ["--break-system-packages", pkg],
-                         base + ["--user", "--break-system-packages", pkg]):
-                try:
-                    r = subprocess.run(cmd2, capture_output=True, text=True,
-                                       timeout=timeout)
-                    if r.returncode == 0:
-                        return True, ""
-                    last = ((r.stdout or "") + (r.stderr or "")).strip()[
-                        -1400:]
-                except subprocess.TimeoutExpired:
-                    last = f"timed out after {timeout}s"
-                    break
-                except (OSError, subprocess.SubprocessError) as e:
-                    last = str(e)
-            break
+    def _save(self, m):
+        os.makedirs(self.root, exist_ok=True)
+        atomic_write_json(self.manifest_path, m)
+
+    def installed(self):
+        return dict(self.manifest()["packages"])
+
+    def activate(self):
+        """Put the folder on sys.path (after the script's own folder)."""
+        if os.path.isdir(self.root) and self.root not in sys.path:
+            sys.path.insert(1 if sys.path else 0, self.root)
+            importlib.invalidate_caches()
+            return True
+        return False
+
+    def size_bytes(self):
+        total = 0
+        for dp, _dn, fn in os.walk(self.root):
+            for n in fn:
+                with contextlib.suppress(OSError):
+                    total += os.path.getsize(os.path.join(dp, n))
+        return total
+
+    # ---- install ---------------------------------------------------------
+    @staticmethod
+    def _safe_names(zf):
+        for info in zf.infolist():
+            n = info.filename.replace("\\", "/")
+            if n.startswith("/") or re.match(r"^[A-Za-z]:", n) or \
+                    any(part == ".." for part in n.split("/")):
+                raise RuntimeError_("other", f"unsafe path in wheel: {n}")
+        return [i.filename for i in zf.infolist()]
+
+    def install_wheel_file(self, path, source="", sha=""):
+        """Unzip a pure-Python wheel into the folder, atomically per
+        top-level entry. Returns (name, version)."""
+        import zipfile
+        os.makedirs(self.root, exist_ok=True)
+        staging = os.path.join(self.root, f".staging-{uuid.uuid4().hex[:8]}")
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout)
-            if r.returncode == 0:
-                return True, ""
-            last = ((r.stdout or "") + (r.stderr or "")).strip()[-1400:]
-        except subprocess.TimeoutExpired:
-            last = f"timed out after {timeout}s"
-            break
-        except (OSError, subprocess.SubprocessError) as e:
-            last = str(e)
-    return False, last
+            with zipfile.ZipFile(path) as zf:
+                names = self._safe_names(zf)
+                dist = sorted({n.split("/")[0] for n in names
+                               if n.split("/")[0].endswith(".dist-info")})
+                if len(dist) != 1:
+                    raise RuntimeError_("other", "not a wheel (no single "
+                                                 ".dist-info folder)")
+                zf.extractall(staging)
+            m = re.match(r"(.+?)-([^-]+)\.dist-info$", dist[0])
+            name, version = (m.group(1), m.group(2)) if m else \
+                (dist[0], "?")
+            self._merge(staging, name, version, source, sha)
+            return name, version
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    def _merge(self, staging, name, version, source, sha):
+        """Move each top-level entry of staging into the folder, replacing
+        older copies; the manifest records which entries belong to whom."""
+        m = self.manifest()
+        key = name.lower().replace("_", "-")
+        old_entries = (m["packages"].get(key) or {}).get("entries", [])
+        entries = sorted(os.listdir(staging))
+        backup = os.path.join(self.root, f".old-{uuid.uuid4().hex[:8]}")
+        os.makedirs(backup, exist_ok=True)
+        moved = []
+        try:
+            for e in set(entries) | set(old_entries):
+                cur = os.path.join(self.root, e)
+                if os.path.lexists(cur):
+                    os.replace(cur, os.path.join(backup, e))
+                    moved.append(e)
+            for e in entries:
+                os.replace(os.path.join(staging, e),
+                           os.path.join(self.root, e))
+        except OSError:
+            for e in entries:                      # roll back
+                with contextlib.suppress(OSError):
+                    p = os.path.join(self.root, e)
+                    if os.path.isdir(p) and not os.path.islink(p):
+                        shutil.rmtree(p)
+                    elif os.path.lexists(p):
+                        os.remove(p)
+            for e in moved:
+                with contextlib.suppress(OSError):
+                    os.replace(os.path.join(backup, e),
+                               os.path.join(self.root, e))
+            raise
+        finally:
+            shutil.rmtree(backup, ignore_errors=True)
+        m["packages"][key] = {"version": version, "entries": entries,
+                              "source": source, "sha256": sha,
+                              "installed": time.time()}
+        self._save(m)
+        importlib.invalidate_caches()
+
+    def install_pure(self, key, progress=None, cancel=lambda: False):
+        version, filename, sha, size = PURE_WHEELS[key]
+        dest = os.path.join(self.cache, filename)
+        fetch_to_file(pypi_file_url(filename), dest, sha, "packages",
+                      progress, cancel, size_hint=size,
+                      max_bytes=max(4 * size, 8 << 20))
+        return self.install_wheel_file(dest, source=pypi_file_url(filename),
+                                       sha=sha)
+
+    def pip_command(self, specs, target):
+        """The pip command line (never --user, never into the system)."""
+        base = ["install", "--target", target, "--only-binary=:all:",
+                "--no-input", "--disable-pip-version-check",
+                "--no-warn-script-location", "--upgrade"] + list(specs)
+        if self._has_pip():
+            return [self.python, "-m", "pip"] + base
+        wheel = self._pip_wheel()
+        return [self.python, os.path.join(wheel, "pip")] + base
+
+    def _has_pip(self):
+        try:
+            r = subprocess.run([self.python, "-m", "pip", "--version"],
+                               capture_output=True, text=True, timeout=30)
+            return r.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def _pip_wheel(self, progress=None, cancel=lambda: False):
+        old = sys.version_info[:2] < (3, 9) if self.python == \
+            sys.executable else False
+        version, filename, sha = PIP_WHEELS["old" if old else "new"]
+        dest = os.path.join(self.cache, filename)
+        fetch_to_file(pypi_file_url(filename), dest, sha, "packages",
+                      progress, cancel, max_bytes=8 << 20)
+        return dest
+
+    def pip_install(self, key, progress=None, cancel=lambda: False,
+                    timeout=900):
+        """Install one optional package (and its dependencies) with pip
+        into a staging folder, then swap it in."""
+        ver = optional_version(key)
+        staging = os.path.join(self.root, f".staging-{uuid.uuid4().hex[:8]}")
+        os.makedirs(staging, exist_ok=True)
+        try:
+            outbound("packages", "https", "pypi.org",
+                     f"pip install {key}=={ver}")
+            cmd = self.pip_command([f"{key}=={ver}"], staging)
+            if progress:
+                progress("Packages", 0.2, f"Installing {key} {ver}…", {})
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True,
+                                   timeout=timeout)
+            except subprocess.TimeoutExpired:
+                raise RuntimeError_("network", f"pip took more than "
+                                               f"{timeout} s")
+            if r.returncode != 0:
+                raise RuntimeError_("pip", ((r.stdout or "") +
+                                            (r.stderr or ""))[-800:])
+            dists = sorted(d for d in os.listdir(staging)
+                           if d.endswith(".dist-info"))
+            # one manifest entry per installed distribution
+            groups = self._group_by_dist(staging, dists)
+            for dname, (version, entries) in groups.items():
+                sub = os.path.join(staging, f".one-{dname}")
+                os.makedirs(sub, exist_ok=True)
+                for e in entries:
+                    os.replace(os.path.join(staging, e),
+                               os.path.join(sub, e))
+                self._merge(sub, dname, version, "pypi.org (pip)", "")
+            return ver
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+    @staticmethod
+    def _group_by_dist(staging, dists):
+        """dist name → (version, top-level entries) using RECORD files."""
+        out = {}
+        claimed = set()
+        for d in dists:
+            m = re.match(r"(.+?)-([^-]+)\.dist-info$", d)
+            name, version = (m.group(1), m.group(2)) if m else (d, "?")
+            entries = {d}
+            rec = os.path.join(staging, d, "RECORD")
+            with contextlib.suppress(OSError):
+                with open(rec, encoding="utf-8", errors="replace") as f:
+                    for row in csv.reader(f):
+                        if row and row[0]:
+                            top = row[0].replace("\\", "/").split("/")[0]
+                            if top and top != ".." and \
+                                    os.path.lexists(os.path.join(staging,
+                                                                 top)):
+                                entries.add(top)
+            entries -= claimed
+            claimed |= entries
+            out[name] = (version, sorted(entries))
+        rest = [e for e in os.listdir(staging)
+                if e not in claimed and not e.startswith(".")]
+        if rest and out:
+            first = next(iter(out))
+            v, ents = out[first]
+            out[first] = (v, sorted(set(ents) | set(rest)))
+        return out
+
+    # ---- remove ----------------------------------------------------------
+    def remove(self, key):
+        m = self.manifest()
+        key = key.lower().replace("_", "-")
+        info = m["packages"].pop(key, None)
+        if not info:
+            return False
+        for e in info.get("entries", []):
+            p = os.path.join(self.root, e)
+            with contextlib.suppress(OSError):
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p)
+                elif os.path.lexists(p):
+                    os.remove(p)
+        self._save(m)
+        importlib.invalidate_caches()
+        return True
+
+    def verify(self):
+        """Names whose files are missing from the folder."""
+        bad = []
+        for key, info in self.installed().items():
+            entries = info.get("entries") or []
+            if not entries or not all(os.path.lexists(
+                    os.path.join(self.root, e)) for e in entries):
+                bad.append(key)
+        return bad
+
+    def reset(self):
+        """Delete the whole folder (all private packages)."""
+        if self.root in sys.path:
+            sys.path.remove(self.root)
+        shutil.rmtree(self.root, ignore_errors=True)
+        importlib.invalidate_caches()
+
+
+PRIVATE_PACKAGES = PrivatePackages()
+PRIVATE_PACKAGES.activate()
 
 
 def _scapy_version():
@@ -810,6 +1492,7 @@ OUTBOUND_FEATURES = {
     "upnp": "Router port-forwarding check",
     "connector": "Connected helpers (Pi-hole, AdGuard Home)",
     "release": "Release tooling (developers only)",
+    "packages": "Components and packages (downloads you approved)",
 }
 
 
@@ -1343,21 +2026,6 @@ class LoaderWindow(tk.Frame):
             ttk.Button(row, text="Copy details",
                        command=self._copy_details).pack(side="right")
             self._set_health("failed")
-        elif kind == "pip_system":
-            f = self._card_frame(
-                "Install into your system Python?",
-                "Your Python is managed by the operating system, which "
-                "normally doesn't want programs to add packages to it. I "
-                "can still install the capture engine (scapy) there with "
-                "pip's “--break-system-packages” option. A safer choice "
-                "is the private Python (Settings → Repair). Install into "
-                "your system Python anyway?")
-            row = tk.Frame(f, bg=self.card_bg)
-            row.pack(fill="x")
-            ttk.Button(row, text="Yes, install it",
-                       command=lambda: answer("yes")).pack(side="left")
-            ttk.Button(row, text="No", command=lambda: answer("no")).pack(
-                side="left", padx=8)
         else:
             f = self._card_frame(kw.get("title", "Question"),
                                  kw.get("text", ""))
@@ -1396,7 +2064,8 @@ class LoaderWindow(tk.Frame):
             pass
 
     # ---- Welcome Center ----------------------------------------------------------
-    def show_welcome(self, summary="", health="healthy", first_time=False):
+    def show_welcome(self, summary="", health="healthy", first_time=False,
+                     notice=""):
         """Turn into the Welcome Center and wait for a choice. Returns
         "monitor", "demo", "guide", "diagnostics", "repair" or "exit"."""
         self.choice = None
@@ -1419,6 +2088,12 @@ class LoaderWindow(tk.Frame):
         self._clear_card()
         top = tk.Frame(self.card, bg=self.bg)
         top.pack(fill="both", expand=True)
+        if notice:
+            self.notice_lbl = tk.Label(
+                top, text=notice, bg=self.card_bg, fg=self.warn,
+                anchor="w", justify="left", wraplength=680, padx=10, pady=8,
+                highlightthickness=1, highlightbackground=self.warn)
+            self.notice_lbl.pack(fill="x", pady=(0, 8))
         tiles = tk.Frame(top, bg=self.bg)
         tiles.pack(fill="x")
         spec = (("monitor", "▶", "Start Monitoring",
@@ -1494,6 +2169,15 @@ class LoaderWindow(tk.Frame):
                                        lambda: self._choose("exit"))
         if first_tile is not None:
             first_tile.focus_set()
+        with contextlib.suppress(tk.TclError):      # room for everything
+            top_win = self.winfo_toplevel()
+            top_win.update_idletasks()
+            need = top_win.winfo_reqheight()
+            have = top_win.winfo_height()
+            limit = top_win.winfo_screenheight() - 80
+            if need > have:
+                top_win.geometry(f"{top_win.winfo_width()}x"
+                                 f"{min(need, limit)}")
         while self.choice is None:
             drain_deferred_tk()
             try:
@@ -1545,87 +2229,86 @@ def step_tkinter(l, state):
     return True, f"Graphical toolkit ready (Tk {tk.TkVersion})."
 
 
-def step_pip(l, state):
-    ok, info = _pip_available()
-    if ok:
-        l.post_log(f"  {info}", "detail")
-        return True, "Package installer is ready."
-    if state.recent_attempts("ensurepip", 24 * 3600) >= 2:
-        return True, ("Package installer unavailable (already tried today) "
-                      "— continuing with what is installed.")
-    state.note_attempt("ensurepip")
-    l.post_log("  Repairing Python's package installer ...", None)
-    try:
-        r = subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"],
-                           capture_output=True, text=True, timeout=180)
-        l.post_log("  " + (r.stdout or r.stderr or "").strip()[-300:],
-                   "detail")
-    except (OSError, subprocess.SubprocessError) as e:
-        l.post_log(f"  ensurepip: {e}", "detail")
-    ok, info = _pip_available()
-    return True, ("Package installer repaired." if ok else
-                  "Package installer unavailable — continuing with what is "
-                  "already installed.")
-
-
 def _cap(text):
     return text[:1].upper() + text[1:]
 
 
-def _ensure_dependency(l, state, dep):
+def _required_ready(dep):
     name = dep["import"]
-    if _module_ok(name):
-        ver = _module_version(name)
-        if dep.get("min_version") and _version_tuple(ver) and \
-                _version_tuple(ver) < dep["min_version"]:
-            l.post_log(f"  {dep['pip']} {ver} is older than needed; "
-                       f"updating ...", "detail")
-            if state.recent_attempts("pip:" + dep["key"], 24 * 3600) < 2:
-                state.note_attempt("pip:" + dep["key"])
-                _pip_install(dep["pip"], upgrade=True)
-        OPTIONAL_MODULES[dep["key"]] = importlib.import_module(name)
-        return True, f"{_cap(dep['friendly'])} is ready."
-    budget_window = 24 * 3600 if dep["required"] else 7 * 24 * 3600
-    budget = 3 if dep["required"] else 1
-    if state.recent_attempts("pip:" + dep["key"], budget_window) >= budget:
-        if dep["required"]:
-            return False, (f"Installing {dep['friendly']} failed several times "
-                           "today. Check your internet connection and start "
-                           "MiniWireshark again later.")
-        OPTIONAL_MODULES[dep["key"]] = None
-        return True, (f"{dep['feature']}: unavailable (will retry in a few "
-                      "days).")
-    state.note_attempt("pip:" + dep["key"])
-    l.post_log(f"  Installing {dep['friendly']} ...", None)
-    l.post_log(f"  pip install {dep['pip']}", "detail")
-    l.post_footer(f"Downloading {dep['friendly']} — please wait ...")
-    ok, err = _pip_install(dep["pip"],
-                           timeout=900 if dep["required"] else 240)
-    if not ok and dep["required"]:
-        # an outdated pip is the most common cause; upgrade it once, retry
-        l.post_log("  Updating the package installer and retrying ...", None)
-        _pip_install("pip", upgrade=True, timeout=300)
-        ok, err = _pip_install(dep["pip"])
-    if err:
-        l.post_log("  " + err[-600:], "detail")
-    if ok and _module_ok(name):
-        OPTIONAL_MODULES[dep["key"]] = importlib.import_module(name)
-        return True, f"{_cap(dep['friendly'])} installed."
-    if dep["required"]:
-        return False, (f"Couldn't install {dep['friendly']} automatically.\n"
-                       f"Technical detail: {err[-500:] if err else 'import failed'}")
-    OPTIONAL_MODULES[dep["key"]] = None
-    return True, f"{dep['feature']}: unavailable (optional)."
+    if not _module_ok(name):
+        return False, "not installed"
+    ver = _module_version(name)
+    if dep.get("min_version") and _version_tuple(ver) and \
+            _version_tuple(ver) < dep["min_version"]:
+        return False, f"version {ver} is older than needed"
+    return True, ver
+
+
+CAPTURE_LIMITED = [""]      # why live capture is unavailable (if it is)
 
 
 def step_dependencies(l, state):
-    msgs = []
+    """The capture engine (scapy) is the only thing needed to capture; it
+    is pure Python, so it installs into the private packages folder from a
+    fingerprinted file, without pip and without touching this Python.
+    Optional packages are only imported if present (Settings → Components
+    installs them when you ask)."""
     for dep in DEPENDENCY_MANIFEST:
-        ok, msg = _ensure_dependency(l, state, dep)
-        if not ok:
-            return False, msg
-        msgs.append(msg)
-        l.post_log("  " + msg, "ok" if "unavailable" not in msg else "warn")
+        if not dep["required"]:
+            OPTIONAL_MODULES[dep["key"]] = None
+            if not SAFE_MODE and _module_ok(dep["import"]):
+                with contextlib.suppress(Exception):
+                    OPTIONAL_MODULES[dep["key"]] = importlib.import_module(
+                        dep["import"])
+            continue
+        ok, info = _required_ready(dep)
+        if ok:
+            l.post_log(f"  {_cap(dep['friendly'])} {info} is ready.", "ok")
+            continue
+        if state.recent_attempts("pkg:" + dep["key"], 24 * 3600) >= 3:
+            CAPTURE_LIMITED[0] = (f"{_cap(dep['friendly'])} is {info}, and "
+                                  f"installing it already failed 3 times "
+                                  f"today.")
+            l.post_log("  " + CAPTURE_LIMITED[0], "warn")
+            continue
+        state.note_attempt("pkg:" + dep["key"])
+        l.post_log(f"  Installing {dep['friendly']} into MiniWireshark's "
+                   f"own packages folder (this Python is not changed) …",
+                   None)
+        version, filename, _sha, size = PURE_WHEELS[dep["key"]]
+        l.post_log(f"  {filename} ({size / 1e6:.1f} MB) from "
+                   f"files.pythonhosted.org, fingerprint-checked", "detail")
+
+        def prog(stage, frac, text, extra, _l=l):
+            speed = extra.get("speed") if extra else None
+            _l.post_footer(f"{dep['friendly'].capitalize()}: {text}"
+                           + (f" — {speed / 1e6:.1f} MB/s" if speed else ""))
+        try:
+            PRIVATE_PACKAGES.install_pure(dep["key"], prog,
+                                          lambda: l.cancel_requested)
+            PRIVATE_PACKAGES.activate()
+            importlib.invalidate_caches()
+        except Exception as e:                       # noqa: BLE001
+            kind = getattr(e, "kind", "") or classify_runtime_error(e)
+            CAPTURE_LIMITED[0] = (f"Couldn't install {dep['friendly']} "
+                                  f"({kind}: {str(e)[:160]}). Live capture "
+                                  f"is off; Demo Mode and opening capture "
+                                  f"files still work.")
+            l.post_log("  " + CAPTURE_LIMITED[0], "warn")
+            boot_step("install " + dep["key"], False, error=e)
+            continue
+        ok, info = _required_ready(dep)
+        if ok:
+            l.post_log(f"  {_cap(dep['friendly'])} {info} installed.", "ok")
+            boot_step("install " + dep["key"], True, info)
+        else:
+            CAPTURE_LIMITED[0] = (f"{_cap(dep['friendly'])} was downloaded "
+                                  f"but does not load ({info}).")
+            l.post_log("  " + CAPTURE_LIMITED[0], "warn")
+            boot_step("install " + dep["key"], False, info)
+    if CAPTURE_LIMITED[0]:
+        l.post_health("degraded")
+        return True, "Starting without live capture (see above)."
     return True, ""
 
 
@@ -1668,92 +2351,39 @@ def python_age(version=None, today=None):
     if today >= eol:
         return "outdated", (f"You're running {name}, which stopped "
                             f"receiving security fixes in {eol}. It still "
-                            f"works, but the private Python "
-                            f"{RUNTIME_PYTHON} is recommended.")
+                            f"works; Settings → Diagnostics → Runtime "
+                            f"Manager can add a managed Python "
+                            f"{RUNTIME_PYTHON} if you want one.")
     if v < (3, 12):
         return "ageing", (f"You're running {name} (security fixes until "
-                          f"{eol}). The private Python {RUNTIME_PYTHON} is "
-                          f"faster and is what MiniWireshark is tested on.")
+                          f"{eol}). It works fine; a managed Python "
+                          f"{RUNTIME_PYTHON} is available in the Runtime "
+                          f"Manager if you want one.")
     return "current", f"{name} is supported until {eol}."
 
 
 def step_runtime(l, state):
-    """The private Python: use it, offer it (once, with consent) or keep
-    going on this Python. Never changes the system Python."""
+    """V5: run on this Python whenever it can run the app. The managed
+    Python is never offered as a blocking question at startup; it lives in
+    the Runtime Manager (and is used only after its window reports back)."""
     if MW_STAGE == "app":
         mgr = RuntimeManager()
         st = mgr.status()
         if st["running_inside"]:
             l.post_health("healthy" if st["lock_current"] else "repair")
-            return True, (f"Running on MiniWireshark's private Python "
+            return True, (f"Running on MiniWireshark's managed Python "
                           f"{platform.python_version()}.")
         return True, "Running on this Python."
-    if NO_RUNTIME_FLAG in sys.argv or os.environ.get(
-            "MINIWIRESHARK_NO_RUNTIME"):
-        return True, "Private Python skipped (--no-runtime)."
-    mgr = RuntimeManager()
-    st = mgr.status()
-    plan = mgr.plan()
-    if st["healthy"]:
-        if st.get("rolled_back"):
-            l.post_log("  The last start in the newest environment failed; "
-                       "MiniWireshark switched back to the previous one.",
-                       "warn")
-        if st["last_error"]:
-            l.post_log("  " + st["last_error"], "warn")
+    if HANDOFF_NOTE[0]:
+        l.post_log("  " + HANDOFF_NOTE[0], "warn")
         l.post_health("degraded")
-        return True, ("The private Python is installed but couldn't be "
-                      "started; continuing on this Python.")
-    age, age_note = python_age()
-    if st["declined"] and plan["supported"] and age == "outdated" and \
-            time.time() - float(st["state"].get("declined_at", 0) or 0) > \
-            30 * 86400:
-        st["declined"] = False          # ask again, at most once a month
-        l.post_log("  " + age_note, "warn")
-    if st["declined"] or not plan["supported"]:
-        if age != "current":
-            l.post_log("  " + age_note, "warn")
-        l.post_health("degraded" if plan["supported"] else "healthy")
-        return True, ("Using this Python (" + (
-            "you chose not to install the private Python — Settings → "
-            "Repair offers it again" if st["declined"] else
-            "no private Python for this platform") + ").")
-    while True:
-        answer = l.ask("consent", text=(age_note + "\n\n" if age != "current"
-                                        else "") + mgr.describe())
-        if answer == "cancel":
-            return False, "Setup cancelled — nothing was changed."
-        if answer != "install":
-            mgr.decline()
-            l.post_health("degraded")
-            return True, "Using this Python (you can install the private " \
-                         "Python later from Settings → Repair)."
-        l.cancel_requested = False
-        l.post_footer("Installing — you can cancel safely at any time.")
-        l.show_install_controls(True)
-        try:
-            base = _find_local_python314()
-            mgr.provision(l.runtime_progress, lambda: l.cancel_requested,
-                          base_python=base)
-            l.handoff = True
-            l.post_health("healthy")
-            l.show_install_controls(False)
-            return True, "Private Python ready — restarting inside it."
-        except Exception as e:                       # noqa: BLE001
-            l.show_install_controls(False)
-            kind = classify_runtime_error(e)
-            LOG.warning("runtime install failed (%s): %s", kind, e)
-            for name, stt in list(l.stage_state.items()):
-                if stt == "active":
-                    l.post_stage(name, "fail")
-            if kind == "cancelled":
-                l.post_health("degraded")
-                return True, "Cancelled — continuing on this Python."
-            ans = l.ask("error", err=kind, detail=getattr(e, "detail",
-                                                          str(e)))
-            if ans != "retry":
-                l.post_health("degraded")
-                return True, "Continuing on this Python."
+        return True, (f"Using this Python {platform.python_version()} (the "
+                      f"managed Python could not start — details in "
+                      f"Diagnostics → Startup history).")
+    age, note = python_age()
+    if age != "current":
+        l.post_log("  " + note, "warn")
+    return True, f"Running on this Python {platform.python_version()}."
 
 
 def _find_local_python314():
@@ -1778,10 +2408,9 @@ def _find_local_python314():
 
 
 BOOTSTRAP_STEPS = [
-    ("Checking for MiniWireshark's private Python", step_runtime, 2),
     ("Checking Python", step_python, 1),
+    ("Checking which Python to use", step_runtime, 1),
     ("Checking the graphical toolkit", step_tkinter, 1),
-    ("Checking the package installer", step_pip, 1),
     ("Preparing the packet capture engine", step_dependencies, 8),
     ("Preparing the capture driver", step_npcap, 6),
     ("Finishing up", lambda l, s: (True, "Ready."), 1),
@@ -1801,9 +2430,11 @@ def run_bootstrap(loader):
             loader.post_log(f"→ {title}", "step")
             try:
                 ok, msg = fn(loader, state)
+                boot_step(title, ok, msg)
             except Exception as e:                   # noqa: BLE001
                 LOG.exception("bootstrap step %s", title)
                 ok, msg = False, f"{type(e).__name__}: {e}"
+                boot_step(title, False, error=e)
             if not ok:
                 loader.post_log(f"✗ {msg}", "err")
                 result[0] = (False, msg)
@@ -15009,10 +15640,16 @@ class AppConfig:
             return defaults
 
     def get(self, dotted, default=None):
+        ov = getattr(self, "overrides", None)
+        if ov and dotted in ov:
+            return ov[dotted]
         section, _, key = dotted.partition(".")
         return self.data.get(section, {}).get(key, default)
 
     def set(self, dotted, value):
+        ov = getattr(self, "overrides", None)
+        if ov:
+            ov.pop(dotted, None)          # an explicit change wins
         section, _, key = dotted.partition(".")
         self.data.setdefault(section, {})[key] = value
 
@@ -16326,7 +16963,6 @@ See the details. ¦ Voir les détails. ¦ Vea los detalles.
 Try again ¦ Réessayer ¦ Reintentar
 Continue with my current Python ¦ Continuer avec mon Python actuel ¦ Continuar con mi Python actual
 Install into your system Python? ¦ Installer dans le Python du système ? ¦ ¿Instalar en el Python del sistema?
-Your Python is managed by the operating system, which normally doesn't want programs to add packages to it. I can still install the capture engine (scapy) there with pip's “--break-system-packages” option. A safer choice is the private Python (Settings → Repair). Install into your system Python anyway? ¦ Votre Python est géré par le système d'exploitation, qui n'aime pas que des programmes y ajoutent des paquets. Je peux quand même y installer le moteur de capture (scapy) avec l'option « --break-system-packages » de pip. Le Python privé est un choix plus sûr (Paramètres → Réparer). Installer quand même dans le Python du système ? ¦ Su Python lo gestiona el sistema operativo, que normalmente no quiere que los programas le añadan paquetes. Aun así puedo instalar el motor de captura (scapy) con la opción «--break-system-packages» de pip. El Python privado es más seguro (Ajustes → Reparar). ¿Instalar igualmente en el Python del sistema?
 Yes, install it ¦ Oui, l'installer ¦ Sí, instalarlo
 No ¦ Non ¦ No
 Yes ¦ Oui ¦ Sí
@@ -17276,7 +17912,6 @@ Update rolled back ¦ Mise à jour annulée ¦ Actualización revertida
 What this computer can and can't see. Click for the full coverage report. ¦ Ce que cet ordinateur peut voir ou non. Cliquez pour le rapport de couverture complet. ¦ Lo que este equipo puede y no puede ver. Haga clic para el informe de cobertura completo.
 Yes = delete ALL stored history.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
 You have unsaved changes. Close without saving? ¦ Vous avez des modifications non enregistrées. Fermer sans enregistrer ? ¦ Tiene cambios sin guardar. ¿Cerrar sin guardar?
-Your Python is managed by the operating system. Install the missing components into it anyway (--break-system-packages)? ¦ Votre Python est géré par le système d'exploitation. Y installer quand même les composants manquants (--break-system-packages) ? ¦ Su Python lo gestiona el sistema operativo. ¿Instalar igualmente los componentes que faltan (--break-system-packages)?
 Your device corrections (undo) ¦ Vos corrections d'appareils (annuler) ¦ Sus correcciones de dispositivos (deshacer)
 Your identity corrections ¦ Vos corrections d'identité ¦ Sus correcciones de identidad
 Your networks ¦ Vos réseaux ¦ Sus redes
@@ -25943,33 +26578,36 @@ class MiniWireshark:
             _eid, how = mgr.repair()
             return "fixed", f"Private Python components {how}; self-test " \
                             f"passed."
-        missing = []
+        msgs, bad = [], []
+        for key in PRIVATE_PACKAGES.verify():
+            if key in PURE_WHEELS:
+                continue                       # reinstalled just below
+            PRIVATE_PACKAGES.remove(key)
+            msgs.append(f"{key}: damaged, removed (reinstall it from "
+                        f"Settings → Components)")
         for dep in DEPENDENCY_MANIFEST:
-            if not _module_ok(dep["import"]):
-                missing.append(dep)
-        if not missing:
-            note = ""
-            if st["declined"] and mgr.plan()["supported"]:
-                s2 = runtime_state_read()
-                s2["declined"] = False
-                runtime_state_write(s2)
-                note = (" The private Python will be offered again next "
-                        "time you start MiniWireshark.")
-            return ("ok" if not note else "fixed"), \
-                "All components import correctly." + note
-        PIP_ASK[0] = lambda: bool(self._on_tk(lambda: messagebox.askyesno(
-            "Repair", "Your Python is managed by the operating system. "
-            "Install the missing components into it anyway "
-            "(--break-system-packages)?", parent=self.root)))
-        try:
-            msgs = []
-            for dep in missing:
-                ok, err = _pip_install(dep["pip"], timeout=600)
-                msgs.append(f"{dep['pip']} {'installed' if ok else 'failed'}")
-        finally:
-            PIP_ASK[0] = None
-        bad = [m for m in msgs if m.endswith("failed")]
-        return ("failed" if bad else "fixed"), "; ".join(msgs) + \
+            if not dep["required"]:
+                continue
+            ok, info = _required_ready(dep)
+            if ok and dep["key"] not in PRIVATE_PACKAGES.verify():
+                continue
+            try:
+                PRIVATE_PACKAGES.install_pure(dep["key"])
+                PRIVATE_PACKAGES.activate()
+                ok, info = _required_ready(dep)
+            except Exception as e:                   # noqa: BLE001
+                ok, info = False, f"{type(e).__name__}: {str(e)[:160]}"
+            done = "installed into the private packages folder" if ok \
+                else "failed: " + info
+            (msgs if ok else bad).append(f"{dep['pip']} {done}")
+        missing_opt = [d["pip"] for d in DEPENDENCY_MANIFEST
+                       if not d["required"] and not _module_ok(d["import"])]
+        if not msgs and not bad:
+            return "ok", ("All components import correctly." +
+                          (f" Optional, not installed: "
+                           f"{', '.join(missing_opt)} (Settings → "
+                           f"Components)." if missing_opt else ""))
+        return ("failed" if bad else "fixed"), "; ".join(msgs + bad) + \
             (" — restart MiniWireshark to use them." if not bad else "")
 
     def _repair_reference(self):
@@ -26066,33 +26704,50 @@ class MiniWireshark:
     def runtime_status_text(self):
         mgr = RuntimeManager()
         st = mgr.status()
+        state = runtime_state_read()
+        env = runtime_env(state) or {}
         lines = []
         if st["running_inside"]:
-            lines.append(f"Running on MiniWireshark's private Python "
+            lines.append(f"Running on MiniWireshark's managed Python "
                          f"{platform.python_version()} ({st['python']}).")
-        elif st["healthy"]:
-            lines.append("A private Python is installed but this window "
-                         "runs on another Python.")
         else:
             lines.append(f"Running on Python {platform.python_version()} "
-                         f"({sys.executable}). No private Python"
-                         + (" (you declined it)." if st["declined"] else "."))
-        lines.append("Components verified by this release: " + ", ".join(
-            f"{k} {v['version']}" for k, v in RUNTIME_LOCK.items()))
+                         f"({sys.executable}) — the Python that started "
+                         f"MiniWireshark. It is never modified.")
+            if env.get("handshake_failed"):
+                lines.append(f"⚠ A managed Python is installed, but its "
+                             f"window didn't come up last time "
+                             f"({env.get('handshake_error', '?')}). It is "
+                             f"not used until Repair / Update or Rebuild.")
+            elif st["healthy"] and state.get("prefer") == "managed":
+                lines.append("A managed Python is installed and chosen; it "
+                             "starts from the next launch (after its window "
+                             "reports back).")
+            elif st["healthy"]:
+                lines.append("A managed Python is installed but not chosen "
+                             "(tick “Start in the managed Python” below to "
+                             "use it).")
+        pk = PRIVATE_PACKAGES.installed()
+        lines.append(f"Private packages folder ({abi_tag()}): " + (
+            ", ".join(f"{k} {v.get('version', '?')}" for k, v in
+                      sorted(pk.items())) if pk else "empty"))
+        if HANDOFF_NOTE[0]:
+            lines.append("⚠ " + HANDOFF_NOTE[0])
+        if CAPTURE_LIMITED[0]:
+            lines.append("⚠ " + CAPTURE_LIMITED[0])
         if st["healthy"] and not st["lock_current"]:
-            lines.append("⚠ The private Python was built for an older "
+            lines.append("⚠ The managed Python was built for an older "
                          "MiniWireshark — Repair / Update brings it up to "
                          "date.")
         if st["previous"]:
-            lines.append(f"Previous environment kept for rollback: "
+            lines.append(f"Previous managed environment kept for rollback: "
                          f"{st['previous']}.")
         if st["pending_switch"]:
             lines.append("A rebuilt environment will be used from the next "
                          "start.")
         lt = LAUNCH_TIMES.get("ready")
         if lt:
-            lines.append(f"Last launch: ready in {lt * 1000:.0f} ms "
-                         f"(budget 200 ms for the launcher itself).")
+            lines.append(f"Last launch: ready in {lt * 1000:.0f} ms.")
         return "\n".join(lines)
 
     def open_runtime_manager(self, parent=None):
@@ -26186,9 +26841,17 @@ class MiniWireshark:
             return bool(self._on_tk(lambda: messagebox.askyesno(
                 title, text, parent=win)))
 
+        def choose_managed():
+            s = runtime_state_read()
+            s["prefer"] = "managed"
+            runtime_state_write(s)
+            lw.q.put(("call", lambda: pref.set(True)))
+
         def rebuild():
-            return mgr.provision(lw.runtime_progress, cancel,
-                                 base_python=_find_local_python314())
+            eid = mgr.provision(lw.runtime_progress, cancel,
+                                base_python=_find_local_python314())
+            choose_managed()
+            return eid
 
         def show_report(rep):
             self._env_report = (time.time(), rep)
@@ -26198,13 +26861,21 @@ class MiniWireshark:
                                    "✔": "ok"}.get(line[:1], "detail"))
 
         def repair_or_build():
-            """Repair / Update: reinstall the verified components, restore
-            and update pip, fix conflicts, re-test, then report."""
+            """Repair / Update: on this Python, repair the private packages
+            folder; with a managed Python, also reinstall its verified
+            components, update its pip, re-test, then report."""
+            state = runtime_state_read()
+            env = runtime_env(state)
+            if env and env.get("handshake_failed"):
+                env.pop("handshake_failed", None)    # try it once more
+                env.pop("handshake_error", None)
+                runtime_state_write(state)
             if not mgr.status()["healthy"]:
-                if not ask("Install the private Python?",
-                           mgr.describe() + "\n\nInstall it now?"):
-                    return None, "kept as it is"
-                return rebuild(), "installed"
+                status, msg = self._repair_components()
+                lw.post_log(msg, "ok" if status != "failed" else "err")
+                if status == "failed":
+                    raise RuntimeError_("pip", msg)
+                return None, msg
             eid, how = mgr.repair(lw.runtime_progress, cancel)
             notes = []
             with contextlib.suppress(Exception):
@@ -26259,8 +26930,10 @@ class MiniWireshark:
                        f"fallback, and Roll back returns to it."):
                 return "Kept the current Python."
             eid = mgr.provision(lw.runtime_progress, cancel, source=src)
+            choose_managed()
             return (f"Python {src['version']} installed and tested "
-                    f"({eid}). It is used from the next start.")
+                    f"({eid}). It is used from the next start, once its "
+                    f"window reports back.")
 
         def self_test():
             exe = mgr.status()["python"] or sys.executable
@@ -26271,16 +26944,17 @@ class MiniWireshark:
             return text.strip().splitlines()[-1] if text.strip() else "ok"
 
         def remove():
-            if not ask("Remove private Python", "Delete MiniWireshark's "
-                       "private Python? MiniWireshark will use the Python it "
-                       "was started with until you install it again."):
+            if not ask("Remove managed Python", "Delete MiniWireshark's "
+                       "managed Python? MiniWireshark will use the Python it "
+                       "was started with (and its private packages "
+                       "folder)."):
                 return "Kept."
             return mgr.remove()
         actions = [
             ("\U0001F6E0 Repair / Update Environment", lambda: run(
                 "Repairing and updating", repair_or_build,
-                lambda r: f"Environment {r[1]}." if isinstance(r, tuple)
-                else "Done.")),
+                lambda r: (r[1] if r[0] is None else f"Environment {r[1]}.")
+                if isinstance(r, tuple) else "Done.")),
             ("Check environment", lambda: run(
                 "Checking every component", check_env, lambda m: m)),
             ("Update pip", lambda: run("Updating pip", pip_update,
@@ -26290,7 +26964,7 @@ class MiniWireshark:
                 lambda m: m)),
             ("Run self-test", lambda: run("Running the self-test", self_test,
                                           lambda m: f"Self-test: {m}")),
-            ("Rebuild side by side", lambda: run(
+            ("Get / rebuild managed Python", lambda: run(
                 "Rebuilding", rebuild,
                 lambda eid: f"New environment {eid} ready (used from the "
                             f"next start if this one is running).")),
@@ -26299,7 +26973,7 @@ class MiniWireshark:
                 lambda ok: "Switched to the previous environment (used "
                            "from the next start)." if ok else
                 "There is no previous environment to roll back to.")),
-            ("Remove private Python", lambda: run(
+            ("Remove managed Python", lambda: run(
                 "Removing", remove,
                 lambda r: {"removed": "Removed.",
                            "on-exit": "Removed from the next start."}.get(
@@ -26316,12 +26990,31 @@ class MiniWireshark:
                 row=i // 3, column=i % 3, sticky="ew", padx=3, pady=3)
         for c in range(3):
             grid.columnconfigure(c, weight=1)
-        tk.Label(f, text="Repair / Update installs the versions THIS "
-                         "release of MiniWireshark verified, and updates pip "
-                         "inside the private Python. A newer Python is only "
-                         "installed when you ask, after GitHub's checksum and "
-                         "the self-test pass. Nothing outside MiniWireshark's "
-                         "data folder is changed.",
+        pref = tk.BooleanVar(value=runtime_state_read().get("prefer") ==
+                             "managed")
+
+        def set_pref():
+            s = runtime_state_read()
+            s["prefer"] = "managed" if pref.get() else "auto"
+            runtime_state_write(s)
+        cb = tk.Checkbutton(
+            f, text="Start in the managed Python (used only after its "
+                    "window reports back; otherwise the Python you started "
+                    "with)", variable=pref, command=set_pref,
+            bg=lw.card_bg, fg=lw.fg, selectcolor=lw.card_bg,
+            activebackground=lw.card_bg, anchor="w", justify="left",
+            wraplength=660)
+        cb.pack(fill="x", pady=(8, 0))
+        if not runtime_env(runtime_state_read()):
+            cb.configure(state="disabled")
+        self._rm_pref = pref
+        tk.Label(f, text="Repair / Update fixes the private packages folder "
+                         "(the capture engine is reinstalled from a "
+                         "fingerprinted file) and, if you have a managed "
+                         "Python, reinstalls its verified components and "
+                         "updates its pip. A newer Python is only installed "
+                         "when you ask. Nothing outside MiniWireshark's data "
+                         "folder is changed.",
                  bg=lw.card_bg, fg=lw.muted, wraplength=680, justify="left",
                  anchor="w").pack(fill="x", pady=(8, 0))
 
@@ -26392,10 +27085,63 @@ class MiniWireshark:
                                 f"without Internet and choose it here.",
                                 parent=parent)
 
+    def boot_history_text(self, n=10):
+        rs = BootReceipt.recent(n=n)
+        if not rs:
+            return "No startup records yet."
+        out = [f"Last {len(rs)} starts, newest first (folder: {BOOT_DIR})",
+               ""]
+        for r in rs:
+            out.append(BootReceipt.summary(r))
+            for s in (r.get("steps") or [])[:40]:
+                mark = "✔" if s.get("ok") else "✖"
+                extra = s.get("error") or s.get("detail") or ""
+                out.append(f"      {s.get('at', 0):7.2f}s {mark} "
+                           f"{s.get('name')}"
+                           + (f" — {extra[:160]}" if extra else ""))
+            out.append("")
+        return "\n".join(out)
+
+    def open_boot_history(self, parent=None):
+        """Diagnostics → Startup history: what each recent start did."""
+        t = self.theme
+        win = tk.Toplevel(parent or self.root)
+        win.title("Startup history")
+        win.geometry("820x560")
+        win.configure(bg=t["card_bg"])
+        tk.Label(win, text="Each start of MiniWireshark writes what it did "
+                           "and how long it took. If starting ever fails, "
+                           "this shows where — copy it if you ask for help "
+                           "(it contains no network data).",
+                 bg=t["card_bg"], fg=t["text_fg"], anchor="w",
+                 justify="left", wraplength=780).pack(fill="x", padx=12,
+                                                      pady=(10, 4))
+        txt = tk.Text(win, wrap="none", bg=t["tab_bg"], fg=t["text_fg"],
+                      font=self.mono, relief="flat", padx=8, pady=6)
+        txt.pack(fill="both", expand=True, padx=12)
+        text = self.boot_history_text()
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")
+        bar = tk.Frame(win, bg=t["card_bg"])
+        bar.pack(fill="x", padx=12, pady=8)
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(mask_sensitive(text))
+            self._set_banner("📋  Copied to the clipboard.")
+        ttk.Button(bar, text="Copy", command=copy).pack(side="left")
+        ttk.Button(bar, text="Open folder", command=lambda: _open_path(
+            BOOT_DIR)).pack(side="left", padx=6)
+        ttk.Button(bar, text="Close", command=win.destroy).pack(
+            side="right")
+        win._mw_text = text
+        return win
+
     def debug_bundle_text(self, masked=True):
         parts = [f"MiniWireshark {SCRIPT_VERSION} debug bundle",
                  time.strftime("%Y-%m-%d %H:%M:%S"), "",
                  "== Diagnostics ==", DiagnosticsWindow.collect(self), "",
+                 "== Startup history ==", self.boot_history_text(5), "",
                  "== Runtime ==", self.runtime_status_text(),
                  json.dumps({k: v for k, v in RuntimeManager().status()
                              .items() if k != "state"}, default=str,
@@ -29500,6 +30246,14 @@ class MiniWireshark:
                     "cleared (save it first if you want it). Continue?",
                     parent=self.root):
                 return
+        if Ether is None:
+            if messagebox.askyesno(
+                    "Demo Mode", "Demo Mode builds its sample traffic with "
+                    "the capture engine (scapy), which isn't available "
+                    "right now. Opening a capture file still works.\n\n"
+                    "Run Repair now to install it?", parent=self.root):
+                self.repair_everything()
+            return
         self.stop()
         self._leave_nonlive()
         self._ensure_worker()
@@ -30217,9 +30971,11 @@ class MiniWireshark:
     def repair_dependencies(self, parent=None):
         if not messagebox.askyesno(
                 "Repair dependencies",
-                "Reinstall/upgrade the packet capture engine (scapy) and "
-                "optional helpers now? This needs an Internet connection and "
-                "may take a minute. MiniWireshark keeps running.",
+                "Reinstall the packet capture engine (scapy) and the "
+                "optional packages you installed, into MiniWireshark's own "
+                "packages folder? This needs an Internet connection and "
+                "may take a minute. Your Python is not changed. "
+                "MiniWireshark keeps running.",
                 parent=parent or self.root):
             return
         self._set_banner("\U0001F527  Repairing dependencies in the "
@@ -30228,9 +30984,18 @@ class MiniWireshark:
         def work():
             msgs = []
             for dep in DEPENDENCY_MANIFEST:
-                ok, err = _pip_install(dep["pip"], upgrade=True, timeout=600)
-                msgs.append(f"{dep['pip']}: {'ok' if ok else 'failed'}"
-                            f"{(' (' + err[-160:] + ')') if err else ''}")
+                try:
+                    if dep["key"] in PURE_WHEELS:
+                        _n, ver = PRIVATE_PACKAGES.install_pure(dep["key"])
+                    elif dep["key"] in PRIVATE_PACKAGES.installed():
+                        ver = PRIVATE_PACKAGES.pip_install(dep["key"])
+                    else:
+                        msgs.append(f"{dep['pip']}: optional, not "
+                                    f"installed (Settings → Components)")
+                        continue
+                    msgs.append(f"{dep['pip']} {ver}: ok")
+                except Exception as e:               # noqa: BLE001
+                    msgs.append(f"{dep['pip']}: failed ({str(e)[-160:]})")
             npcap = ""
             if IS_WINDOWS and not _npcap_present():
                 npcap = ("\n\nNpcap is missing: restart MiniWireshark and it "
@@ -31251,6 +32016,8 @@ class DiagnosticsWindow:
                                    ("Repair dependencies", lambda:
                                     app.repair_dependencies(self.win)))),
                            (row3, (("Check environment", self.check_env),
+                                   ("Startup history…", lambda:
+                                    app.open_boot_history(self.win)),
                                    ("Runtime Manager…", lambda:
                                     app.open_runtime_manager(self.win)),
                                    ("\U0001F6E0 Repair MiniWireshark", lambda:
@@ -34023,12 +34790,16 @@ def t_runtime_state_and_handoff(ctx):
                              if k != "checksum"})
         env = {}
         assert runtime_handoff(["x"], {"MW_STAGE": "app"}, False) is None
-        assert runtime_handoff(["--no-runtime"], env, False) is None
-        cmd = runtime_handoff(["--demo"], env, False)
+        assert runtime_handoff(["--no-runtime"], env, False,
+                            suitable=(False, "test")) is None
+        cmd = runtime_handoff(["--demo"], env, False,
+                            suitable=(False, "test"))
         assert cmd == [fake, SCRIPT_PATH, "--demo"], cmd
         assert runtime_state_read()["pending_starts"] == 1
-        runtime_handoff([], env, False)            # 2 unconfirmed starts
-        cmd = runtime_handoff([], env, False)      # → roll back to "b"
+        runtime_handoff([], env, False,
+                            suitable=(False, "test"))            # 2 unconfirmed starts
+        cmd = runtime_handoff([], env, False,
+                            suitable=(False, "test"))      # → roll back to "b"
         s2 = runtime_state_read()
         assert cmd[0] == prev and s2["current"] == "b" and \
             s2["rolled_back"]["from"] == "a", (cmd, s2)
@@ -34039,7 +34810,8 @@ def t_runtime_state_and_handoff(ctx):
             globals()["MW_STAGE"] = ""
         assert runtime_state_read()["pending_starts"] == 0
         os.remove(prev)                            # broken runtime file
-        assert runtime_handoff([], env, False) is None
+        assert runtime_handoff([], env, False,
+                            suitable=(False, "test")) is None
     finally:
         _restore_runtime_dir(old)
 
@@ -35642,6 +36414,243 @@ def test_i18n_catalog(ctx):
     assert set(LOCALE_NAMES) == set(I18N_LOCALES)
 
 
+@self_test(slow=False)
+def test_boot_receipts_and_crash_loop(ctx):
+    """V5 startup: every start leaves a receipt; two failed starts in a row
+    turn on Safe Mode; a closed Welcome Center or a hand-off is no
+    failure; receipts are pruned to the newest ten."""
+    d = ctx.path("boot")
+    r = BootReceipt(directory=d, argv=["--demo", READY_ARG + "x"])
+    r.step("window", True, "Tk 8.6")
+    r.step("capture engine", False, error=ImportError("no scapy"))
+    data = read_json(r.path)
+    assert data["argv"] == ["--demo"], data["argv"]
+    assert data["steps"][1]["error"].startswith("ImportError"), data
+    assert "failed at: capture engine" in BootReceipt.summary(data)
+    r.mark(outcome="closed", reached_main_window=True)
+    assert read_json(r.path)["outcome"] == "closed"
+
+    def fake(name, outcome, main=False, pid=999999999, age=0):
+        p = os.path.join(d, f"boot-{name}.json")
+        atomic_write_json(p, {"kind": "start", "outcome": outcome,
+                              "reached_main_window": main, "pid": pid,
+                              "steps": [{"name": "window", "ok": True}],
+                              "started": time.time() - age})
+        t = time.time() - age
+        os.utime(p, (t, t))
+        return p
+    shutil.rmtree(d)
+    os.makedirs(d)
+    fake("a", "closed", True, age=30)
+    fake("b", "crashed", age=20)
+    cur = fake("c", "running", pid=os.getpid(), age=0)
+    assert not crash_loop_detected(BootReceipt.recent(d), cur)
+    fake("d", "running", age=10)               # died without a word
+    assert crash_loop_detected(BootReceipt.recent(d), cur)
+    fake("e", "user_exit", age=5)              # closed the Welcome Center
+    assert not crash_loop_detected(BootReceipt.recent(d), cur)
+    fake("f", "running", pid=os.getpid(), age=4)   # still running here
+    fake("g", "fatal", age=3)
+    assert not crash_loop_detected(BootReceipt.recent(d), cur)
+    for i in range(14):
+        fake(f"z{i:02d}", "closed", True, age=100 + i)
+    BootReceipt(directory=d).prune()
+    assert len(BootReceipt.files(d)) == BootReceipt.KEEP
+
+
+@self_test(slow=False)
+def test_v5_handoff_policy_and_handshake(ctx):
+    """The managed Python is used only when chosen or needed, and only
+    after its window reports back; a child that crashes or hangs is
+    stopped, remembered, and this Python carries on."""
+    assert system_python_suitable((3, 7), True)[0] is False
+    assert system_python_suitable((3, 12), False) == \
+        (False, "this Python has no graphical toolkit (Tk)")
+    assert system_python_suitable((3, 12), True) == (True, "")
+    # handshake outcomes, with real child processes
+    rf = ctx.path("ready-ok")
+    p = subprocess.Popen([sys.executable, "-c",
+                          f"import time; time.sleep(0.2); "
+                          f"open({rf!r}, 'w').write('READY'); "
+                          f"time.sleep(0.5)"])
+    assert wait_for_handshake(p, rf, timeout=10)[0] == "ready"
+    p.wait(5)
+    p = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(3)"])
+    assert wait_for_handshake(p, ctx.path("never"), timeout=10) == \
+        ("exited", 3)
+    p = subprocess.Popen([sys.executable, "-c", "import time; "
+                                               "time.sleep(30)"])
+    t0 = time.monotonic()
+    res = wait_for_handshake(p, ctx.path("never2"), timeout=0.6)
+    assert res == ("timeout", None) and time.monotonic() - t0 < 5, res
+    p.kill()
+    p.wait(5)
+    # a child that exits 0 (handed to an elevated copy) gets more time
+    rf2 = ctx.path("ready-late")
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    threading.Timer(0.8, lambda: open(rf2, "w").write("READY")).start()
+    assert wait_for_handshake(p, rf2, timeout=0.3,
+                              elevation_timeout=10)[0] == "ready"
+    # the whole hand-off with a fake managed Python that crashes
+    old = _with_runtime_dir(ctx)
+    old_boot = globals()["BOOT_DIR"]
+    globals()["BOOT_DIR"] = ctx.path("bootdir")
+    try:
+        crash = ctx.path("crash_python.py")
+        with open(crash, "w") as f:
+            f.write("import sys; print('boom: no Tk here'); sys.exit(5)\n")
+        launcher = ctx.path("fake_python")
+        if IS_WINDOWS:
+            launcher = sys.executable
+        else:
+            with open(launcher, "w") as f:
+                f.write(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
+                        f"{shlex.quote(crash)}\n")
+            os.chmod(launcher, 0o755)
+        runtime_state_write({"current": "a", "prefer": "managed", "envs": {
+            "a": {"python": launcher, "selftest_ok": True,
+                  "version": "3.14.2"}}})
+        HANDOFF_NOTE[0] = ""
+        if not IS_WINDOWS:
+            assert runtime_handoff([], {}, True, suitable=(True, ""),
+                                   timeout=10) is None
+            st = runtime_state_read()
+            assert st["envs"]["a"].get("handshake_failed"), st
+            assert "stopped with code 5" in HANDOFF_NOTE[0], HANDOFF_NOTE
+            assert not runtime_healthy(runtime_env(st))
+            # remembered: the next start does not try again
+            assert runtime_handoff([], {}, False, suitable=(True, "")) \
+                is None
+        # policy: a healthy managed Python is skipped when this Python
+        # works and you did not choose it
+        runtime_state_write({"current": "b", "envs": {
+            "b": {"python": launcher, "selftest_ok": True}}})
+        assert runtime_handoff([], {}, False, suitable=(True, "")) is None
+        assert runtime_handoff(["--x"], {}, False,
+                               suitable=(False, "no Tk"))[:2] == \
+            [launcher, SCRIPT_PATH]
+    finally:
+        HANDOFF_NOTE[0] = ""
+        globals()["BOOT_DIR"] = old_boot
+        _restore_runtime_dir(old)
+
+
+def _fake_wheel(path, name, version, files):
+    import zipfile
+    with zipfile.ZipFile(path, "w") as zf:
+        for rel, body in files.items():
+            zf.writestr(rel, body)
+        zf.writestr(f"{name}-{version}.dist-info/METADATA",
+                    f"Name: {name}\nVersion: {version}\n")
+        zf.writestr(f"{name}-{version}.dist-info/RECORD", "")
+    return path
+
+
+@self_test(slow=False)
+def test_private_packages_folder(ctx):
+    """Packages go into MiniWireshark's own folder: swapped in atomically,
+    importable, removable, and never through the system Python's pip."""
+    root = ctx.path("site")
+    pp = PrivatePackages(root=root, cache=ctx.path("wheels"))
+    w1 = _fake_wheel(ctx.path("mwfakepkg-1.0-py3-none-any.whl"),
+                     "mwfakepkg", "1.0",
+                     {"mwfakepkg/__init__.py": "VERSION = '1.0'\n"})
+    assert pp.install_wheel_file(w1) == ("mwfakepkg", "1.0")
+    assert pp.activate() and root in sys.path
+    try:
+        import mwfakepkg                               # noqa: F401
+        assert sys.modules["mwfakepkg"].VERSION == "1.0"
+        w2 = _fake_wheel(ctx.path("mwfakepkg-2.0-py3-none-any.whl"),
+                         "mwfakepkg", "2.0",
+                         {"mwfakepkg/__init__.py": "VERSION = '2.0'\n",
+                          "mwfakepkg/extra.py": "X = 1\n"})
+        pp.install_wheel_file(w2)
+        assert pp.installed()["mwfakepkg"]["version"] == "2.0"
+        assert sorted(pp.installed()["mwfakepkg"]["entries"]) == \
+            ["mwfakepkg", "mwfakepkg-2.0.dist-info"]
+        assert not os.path.exists(os.path.join(
+            root, "mwfakepkg-1.0.dist-info")), os.listdir(root)
+        assert pp.verify() == []
+        shutil.rmtree(os.path.join(root, "mwfakepkg"))
+        assert pp.verify() == ["mwfakepkg"]
+        assert pp.remove("mwfakepkg") and pp.installed() == {}
+        bad = _fake_wheel(ctx.path("evil-1.0-py3-none-any.whl"), "evil",
+                          "1.0", {"../escape.py": "x = 1\n"})
+        try:
+            pp.install_wheel_file(bad)
+            raise AssertionError("unsafe wheel accepted")
+        except RuntimeError_:
+            pass
+        assert not os.path.exists(ctx.path("escape.py"))
+        assert not [n for n in os.listdir(root) if n.startswith(".")]
+    finally:
+        sys.modules.pop("mwfakepkg", None)
+        with contextlib.suppress(ValueError):
+            sys.path.remove(root)
+    # the pip command: own folder only, binary wheels, never --user
+    cmd = pp.pip_command(["psutil==7.2.2"], ctx.path("stage"))
+    joined = " ".join(cmd)
+    assert "--target" in cmd and "--only-binary=:all:" in cmd, cmd
+    assert "--user" not in cmd and "break-system" not in joined, cmd
+    src = inspect.getsource(PrivatePackages) + \
+        inspect.getsource(step_dependencies)
+    assert "break-system" not in src and '"--user"' not in src
+    assert pypi_file_url("scapy-2.8.0-py3-none-any.whl") == (
+        "https://files.pythonhosted.org/packages/py3/s/scapy/"
+        "scapy-2.8.0-py3-none-any.whl")
+    assert abi_tag((3, 12), "win-amd64") == "cp312-win_amd64"
+    assert abi_tag((3, 9), "macosx-11.0-arm64") == "cp39-macosx_11_0_arm64"
+    assert optional_version("cryptography", (3, 8)) == "46.0.3"
+    assert optional_version("cryptography", (3, 13)) == "50.0.2"
+    # a fingerprint mismatch never leaves a file behind
+    srcf = ctx.path("blob.bin")
+    with open(srcf, "wb") as f:
+        f.write(b"x" * 1000)
+    try:
+        fetch_to_file("file://" + urllib.request.pathname2url(srcf),
+                      ctx.path("dl/blob.bin"), "0" * 64, "packages")
+        raise AssertionError("bad fingerprint accepted")
+    except RuntimeError_ as e:
+        assert e.kind == "fingerprint", e.kind
+    assert not os.path.exists(ctx.path("dl/blob.bin"))
+    ok = fetch_to_file("file://" + urllib.request.pathname2url(srcf),
+                       ctx.path("dl/blob2.bin"), sha256_file(srcf),
+                       "packages")
+    assert os.path.getsize(ok) == 1000
+    try:
+        fetch_to_file("file://" + urllib.request.pathname2url(srcf),
+                      ctx.path("dl/blob3.bin"), None, "packages",
+                      max_bytes=100)
+        raise AssertionError("size cap ignored")
+    except RuntimeError_:
+        pass
+
+
+@self_test(slow=False)
+def test_safe_mode_overrides(ctx):
+    """Safe Mode switches risky things off for one session without
+    changing your saved settings; anything you change explicitly wins."""
+    c = ctx.cfg({"general.auto_start_capture": True,
+                 "history.enabled": True})
+    c.overrides = dict(SAFE_MODE_OVERRIDES)
+    assert c.get("general.auto_start_capture") is False
+    assert c.get("history.enabled") is False
+    assert c.data["general"]["auto_start_capture"] is True   # unchanged
+    c.set("history.enabled", True)
+    assert c.get("history.enabled") is True
+    old = (SAFE_MODE, HANDOFF_NOTE[0], CAPTURE_LIMITED[0])
+    try:
+        globals()["SAFE_MODE"] = True
+        SAFE_REASON[0] = "test"
+        CAPTURE_LIMITED[0] = "no scapy"
+        n = startup_notice()
+        assert "Safe Mode" in n and "no scapy" in n, n
+    finally:
+        globals()["SAFE_MODE"] = old[0]
+        HANDOFF_NOTE[0], CAPTURE_LIMITED[0] = old[1], old[2]
+        SAFE_REASON[0] = ""
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -36375,6 +37384,39 @@ def _gs_languages(app, ctx):
     assert CURRENT_LOCALE == "en"
 
 
+@gui_test_step("V5 startup: notice, startup history, managed-Python choice")
+def _gs_v5_startup(app, ctx):
+    root = app.root
+    win = tk.Toplevel(root)
+    lw = LoaderWindow(win, app.config)
+    lw.pack(fill="both", expand=True)
+    win.after(300, lambda: lw._choose("exit"))
+    choice = lw.show_welcome("summary", "degraded", False,
+                             notice="⚠ test notice")
+    assert choice == "exit", choice
+    assert lw.notice_lbl.cget("text") == "⚠ test notice"
+    win.destroy()
+    old = globals()["BOOT_DIR"]
+    globals()["BOOT_DIR"] = ctx.path("boot_hist")
+    try:
+        r = BootReceipt()
+        r.step("window", True, "Tk")
+        r.step("main window", False, error=ValueError("boom"))
+        r.mark(outcome="fatal")
+        w = app.open_boot_history()
+        _gui_pump(root, 0.2)
+        assert "boom" in w._mw_text and "fatal" in w._mw_text, w._mw_text
+        w.destroy()
+        assert "Startup history" in app.debug_bundle_text()
+    finally:
+        globals()["BOOT_DIR"] = old
+    rm = app.open_runtime_manager()
+    _gui_pump(root, 0.3)
+    assert app._rm_pref.get() is False
+    rm.destroy()
+    assert "Private packages folder" in app.runtime_status_text()
+
+
 @gui_test_step("network consent: new network is quiet until trusted")
 def _gs_consent(app, ctx):
     root = app.root
@@ -36797,6 +37839,9 @@ def main():
     if MW_STAGE == "app":
         RuntimeManager().apply_pending_switch()
     cfg = AppConfig()
+    if SAFE_MODE:
+        cfg.overrides = dict(SAFE_MODE_OVERRIDES)
+        LOG.warning("Safe Mode: %s", SAFE_REASON[0])
     LEDGER.killed = bool(cfg.get("privacy.kill_switch", False))
     set_colorblind_mode(cfg.get("accessibility.colorblind", "Off"))
     set_locale(cfg.get("general.language", "English"))
@@ -36812,11 +37857,15 @@ def main():
     loader.pack(fill="both", expand=True)
     root.configure(background=loader.bg)
     root.update()
-    PIP_ASK[0] = lambda: loader.ask("pip_system") == "yes"
+    boot_step("window", True, f"Tk {tk.TkVersion}")
+    if BOOT is not None:
+        BOOT.mark(reached_window=True)
+    signal_ready()
 
     ok, err = run_bootstrap(loader)
-    PIP_ASK[0] = None
     if not ok:
+        if BOOT is not None:
+            BOOT.mark(outcome="fatal")
         loader.show_fatal(err)
         root.mainloop()
         return
@@ -36836,14 +37885,20 @@ def main():
     loader.post_status("Loading the packet engine ...")
     loader.post_progress(100)
     loader.pump()
-    try:
-        load_scapy()
-    except Exception as e:                           # noqa: BLE001
-        LOG.exception("scapy import")
-        loader.show_fatal(f"Could not load the capture engine (scapy): {e}\n\n"
-                          f"{traceback.format_exc()}")
-        root.mainloop()
-        return
+    if not CAPTURE_LIMITED[0]:
+        try:
+            if os.environ.get("MW_FAKE_NO_SCAPY"):
+                raise ImportError("scapy disabled for a test")
+            load_scapy()
+            boot_step("capture engine", True, _scapy_version() or "")
+        except Exception as e:                       # noqa: BLE001
+            LOG.exception("scapy import")
+            CAPTURE_LIMITED[0] = (f"The capture engine (scapy) didn't load "
+                                  f"({type(e).__name__}: {str(e)[:160]}). "
+                                  f"Live capture is off; Demo Mode and "
+                                  f"opening capture files still work. "
+                                  f"Settings → Repair can fix it.")
+            boot_step("capture engine", False, error=e)
     loader.post_status("Looking at your network adapters ...")
     loader.pump()
     gw, my_ips, my_macs, default_iface_name = detect_gateway_and_self()
@@ -36857,15 +37912,17 @@ def main():
     first_time = cfg.get("general.welcome_version", "") != SCRIPT_VERSION
     if START_IN_DEMO:
         action = "demo"
-    elif cfg.get("general.show_welcome", True) or first_time:
+    elif cfg.get("general.show_welcome", True) or first_time or \
+            startup_notice():
         health = "healthy"
-        st = RuntimeManager().status()
-        if not st["running_inside"] and RuntimeManager().plan()[
-                "supported"] and NO_RUNTIME_FLAG not in sys.argv:
+        if CAPTURE_LIMITED[0] or HANDOFF_NOTE[0] or SAFE_MODE:
             health = "degraded"
         summary = welcome_summary(cfg)
-        action = loader.show_welcome(summary, health, first_time)
+        action = loader.show_welcome(summary, health, first_time,
+                                     notice=startup_notice())
         if action == "exit":
+            if BOOT is not None:
+                BOOT.mark(outcome="user_exit")
             with contextlib.suppress(tk.TclError):
                 root.destroy()
             return
@@ -36876,9 +37933,16 @@ def main():
     try:
         MiniWireshark(root, gw, my_ips, my_macs, default_iface_name,
                       config=cfg, start_action=action)
-    except Exception:                                # noqa: BLE001
+        boot_step("main window", True, f"{time.perf_counter() - _T_START:.2f}"
+                                       f" s after launch")
+        if BOOT is not None:
+            BOOT.mark(reached_main_window=True)
+    except Exception as e:                           # noqa: BLE001
         text = traceback.format_exc()
         LOG.error("startup error:\n%s", text)
+        boot_step("main window", False, error=e)
+        if BOOT is not None:
+            BOOT.mark(outcome="fatal")
         rolled = rollback_update_if_needed(force=True) \
             if os.path.exists(PATHS.update_marker) else ""
         messagebox.showerror("Startup error",
@@ -36888,6 +37952,8 @@ def main():
         root.destroy()
         return
     root.mainloop()
+    if BOOT is not None:
+        BOOT.mark(outcome="closed")
     LOG.info("MiniWireshark closed")
 
 
@@ -36914,6 +37980,30 @@ def base_ttk_style():
     return s
 
 
+SAFE_MODE_OVERRIDES = {
+    "general.auto_start_capture": False,
+    "history.enabled": False,
+    "connectors.list": [],
+    "updates.check_automatically": False,
+    "privacy.auto_download_reference": False,
+}
+
+
+def startup_notice():
+    """Plain words for anything unusual about this start (or "")."""
+    parts = []
+    if SAFE_MODE:
+        parts.append("🛟 Safe Mode — " + (SAFE_REASON[0] or "") +
+                     " Automatic capture, history, helpers and downloads "
+                     "are off for this session. Repair checks the usual "
+                     "causes.")
+    if HANDOFF_NOTE[0]:
+        parts.append("⚠ " + HANDOFF_NOTE[0])
+    if CAPTURE_LIMITED[0]:
+        parts.append("⚠ " + CAPTURE_LIMITED[0])
+    return "\n".join(parts)
+
+
 def welcome_summary(cfg):
     """One line for the Welcome Center: last network, history, setup."""
     parts = []
@@ -36925,15 +38015,94 @@ def welcome_summary(cfg):
                      f"{' (trusted)' if prof.get('trusted') else ' (quiet)'}")
     st = RuntimeManager().status()
     if st["running_inside"]:
-        parts.append(f"Private Python {platform.python_version()}")
+        parts.append(f"Managed Python {platform.python_version()}")
     else:
         parts.append(f"Python {platform.python_version()}")
+    pk = PRIVATE_PACKAGES.installed()
+    if pk:
+        parts.append(f"{len(pk)} private package"
+                     f"{'s' if len(pk) != 1 else ''}")
     if cfg.get("history.enabled", False):
         parts.append("history on")
     return " · ".join(parts)
 
 
+BOOT_TESTS = ("test_boot_receipts_and_crash_loop",
+              "test_v5_handoff_policy_and_handshake",
+              "test_private_packages_folder", "test_safe_mode_overrides",
+              "t_runtime_state_and_handoff")
+
+
+def boot_check(out=print):
+    """`--boot-check`: what this computer offers MiniWireshark at startup,
+    the recent startup records, and the startup tests. Exit code 0 when the
+    app can open its window here."""
+    setup_logging()
+    ok_all = True
+    out(f"MiniWireshark {SCRIPT_VERSION} boot check")
+    out(f"  Python      {platform.python_version()} ({sys.executable})")
+    suitable, why = system_python_suitable()
+    out(f"  Suitable    {'yes' if suitable else 'no — ' + why}")
+    try:
+        r = tk.Tk()
+        r.withdraw()
+        r.update()
+        r.destroy()
+        out(f"  Window      ok (Tk {tk.TkVersion})")
+    except Exception as e:                           # noqa: BLE001
+        ok_all = False
+        out(f"  Window      FAILED: {type(e).__name__}: {e}")
+    dep = next(d for d in DEPENDENCY_MANIFEST if d["required"])
+    ready, info = _required_ready(dep)
+    out(f"  scapy       {info if ready else 'missing — ' + info}")
+    for d in DEPENDENCY_MANIFEST:
+        if not d["required"]:
+            out(f"  {d['key']:<11} {_module_version(d['import']) or 'not installed (optional)'}")
+    out(f"  Packages    {PKG_DIR}: "
+        f"{', '.join(sorted(PRIVATE_PACKAGES.installed())) or 'empty'}")
+    out(f"  Driver      {'present' if _npcap_present() else 'Npcap missing'}"
+        f" · admin: {'yes' if is_admin() else 'no'}")
+    out(f"  Data folder {PATHS.data} "
+        f"({'writable' if _dir_writable(PATHS.data) else 'NOT writable'})")
+    if not _dir_writable(PATHS.data):
+        ok_all = False
+    st = RuntimeManager().status()
+    env = runtime_env(runtime_state_read()) or {}
+    out(f"  Managed     {'installed' if env else 'none'}"
+        + (f", window failed: {env.get('handshake_error')}"
+           if env.get("handshake_failed") else "")
+        + (", chosen" if runtime_state_read().get("prefer") == "managed"
+           else ""))
+    out("")
+    out("Recent starts:")
+    for r in BootReceipt.recent(n=5):
+        out("  " + BootReceipt.summary(r).replace("\n", "\n  "))
+    out("")
+    out("Startup tests:")
+    tmp = tempfile.mkdtemp(prefix="mw_bootcheck_")
+    ctx = TestContext(tmp, scapy_ok=ready)
+    failed = 0
+    for fn, _slow in SELF_TESTS:
+        if fn.__name__ not in BOOT_TESTS:
+            continue
+        t0 = time.perf_counter()
+        try:
+            fn(ctx)
+            out(f"  [PASS] {fn.__name__} "
+                f"({(time.perf_counter() - t0) * 1000:.0f} ms)")
+        except Exception as e:                       # noqa: BLE001
+            failed += 1
+            out(f"  [FAIL] {fn.__name__}: {type(e).__name__}: {e}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    out("")
+    out("Result: " + ("ready to start" if ok_all and not failed else
+                      "problems found (see above)"))
+    return 0 if ok_all and not failed else 1
+
+
 if __name__ == "__main__":
+    if BOOT_CHECK_MODE:
+        sys.exit(boot_check())
     if SELF_TEST_MODE:
         setup_logging()
         print(f"MiniWireshark {SCRIPT_VERSION} self-test")
@@ -36952,8 +38121,11 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
-    except Exception:                                # noqa: BLE001
+    except Exception as e:                           # noqa: BLE001
         LOG.exception("fatal error")
+        boot_step("crash", False, error=e)
+        if BOOT is not None:
+            BOOT.mark(outcome="crashed")
         _fatal_dialog("MiniWireshark stopped unexpectedly",
                       traceback.format_exc()[-2500:] +
                       f"\n\nDetails were written to {PATHS.log_file}")
