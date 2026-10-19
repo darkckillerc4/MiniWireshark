@@ -336,6 +336,7 @@ except ImportError:                                  # pragma: no cover
 AsyncSniffer = conf = get_if_list = hexdump = wrpcap = None
 sendp = get_if_addr = PcapReader = None
 DNS = DNSRR = DNSQR = IP = TCP = UDP = ICMP = ARP = Ether = Raw = None
+Padding = None
 IPv6 = BOOTP = DHCP = None
 ICMPv6ND_NS = ICMPv6ND_NA = ICMPv6ND_RS = ICMPv6ND_RA = None
 ICMPv6NDOptSrcLLAddr = ICMPv6NDOptDstLLAddr = ICMPv6NDOptPrefixInfo = None
@@ -346,7 +347,7 @@ HAVE_IPV6 = HAVE_DHCP = HAVE_SCAPY = False
 def load_scapy():
     global AsyncSniffer, conf, get_if_list, hexdump, wrpcap, PcapReader
     global sendp, get_if_addr
-    global DNS, DNSRR, DNSQR, IP, TCP, UDP, ICMP, ARP, Ether, Raw
+    global DNS, DNSRR, DNSQR, IP, TCP, UDP, ICMP, ARP, Ether, Raw, Padding
     global IPv6, BOOTP, DHCP, HAVE_IPV6, HAVE_DHCP, HAVE_SCAPY
     global ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6ND_RS, ICMPv6ND_RA
     global ICMPv6NDOptSrcLLAddr, ICMPv6NDOptDstLLAddr, ICMPv6NDOptPrefixInfo
@@ -358,7 +359,7 @@ def load_scapy():
     from scapy.layers.dns import DNS, DNSRR, DNSQR
     from scapy.layers.inet import ICMP, IP, TCP, UDP
     from scapy.layers.l2 import ARP, Ether
-    from scapy.packet import Raw
+    from scapy.packet import Raw, Padding
     try:
         from scapy.layers.inet6 import (
             IPv6, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6ND_RS, ICMPv6ND_RA,
@@ -2420,10 +2421,8 @@ _SERVICE_RE = re.compile(r"(_[a-z0-9-]+\._(?:tcp|udp))", re.I)
 
 
 def _decode_dns(d, kind):
-    """Returns (text, learns, hint, info). `info` carries structured data:
-    id, qr, qname, qtype, rcode, answers, plus mDNS names/services/TXT."""
-    learns = []
-    hint = ""
+    """scapy DNS layer → (text, learns, hint, info), via the shared
+    summary so the fast decoder behaves identically."""
     qname, qtype = "", 0
     if d.qd is not None and getattr(d, "qdcount", 1):
         try:
@@ -2433,26 +2432,42 @@ def _decode_dns(d, kind):
         if q is not None:
             qname = _name_bytes(getattr(q, "qname", b""))
             qtype = getattr(q, "qtype", 0) or 0
-    info = {"id": int(getattr(d, "id", 0) or 0), "qr": int(d.qr or 0),
-            "qname": qname, "qtype": qtype, "rcode": int(d.rcode or 0),
-            "answers": [], "services": [], "names": [], "txt": {},
-            "hostnames": []}
+    records = []
+    if int(d.qr or 0):
+        rrs = list(_iter_rrs(d.an))
+        if kind == "mDNS":
+            rrs += list(_iter_rrs(getattr(d, "ar", None)))
+        for rr in rrs:
+            rd = rr.rdata
+            txt = []
+            if rr.type == 16:
+                txt = list(rd) if isinstance(rd, (list, tuple)) else [rd]
+            records.append((_name_bytes(getattr(rr, "rrname", b"")),
+                            int(rr.type), _rdata_ip(rr), _rdata_str(rr),
+                            txt))
+    return dns_summary(kind, qname, qtype, int(getattr(d, "id", 0) or 0),
+                       int(d.qr or 0), int(d.rcode or 0), records)
+
+
+def dns_summary(kind, qname, qtype, qid, qr, rcode, records):
+    """Shared DNS interpretation. records: (rrname, type, ip_or_None,
+    rdata_text, txt_parts) for the answer section (+ additional records
+    for mDNS). Returns (text, learns, hint, info)."""
+    learns = []
+    hint = ""
+    info = {"id": qid, "qr": qr, "qname": qname, "qtype": qtype,
+            "rcode": rcode, "answers": [], "services": [], "names": [],
+            "txt": {}, "hostnames": []}
     if kind == "mDNS":
         hint = mdns_service_hint(qname)
         m = _SERVICE_RE.search(qname or "")
-        if m and d.qr == 0:
+        if m and qr == 0:
             info["services"].append(m.group(1).lower())
-
-    if d.qr == 0:
+    if qr == 0:
         return (f"Looking up {qname}" if qname else "DNS query"), learns, \
             hint, info
-
     answers, cname = [], ""
-    records = list(_iter_rrs(d.an))
-    if kind == "mDNS":
-        records += list(_iter_rrs(getattr(d, "ar", None)))
-    for rr in records:
-        rrname = _name_bytes(getattr(rr, "rrname", b""))
+    for rrname, rtype, ip, rstr, txt in records:
         if kind == "mDNS":
             if not hint:
                 hint = mdns_service_hint(rrname)
@@ -2462,27 +2477,24 @@ def _decode_dns(d, kind):
                 if svc not in info["services"]:
                     info["services"].append(svc)
                 inst = rrname.split("._", 1)[0]
-                if rr.type == 16 and inst and not inst.startswith("_"):
+                if rtype == 16 and inst and not inst.startswith("_"):
                     info["names"].append(inst)
-            if rr.type == 12:                               # PTR → instance
-                target = _rdata_str(rr)
-                inst = target.split("._", 1)[0]
+            if rtype == 12:                                 # PTR → instance
+                inst = rstr.split("._", 1)[0]
                 if inst and not inst.startswith("_") and \
-                        "._" in target and inst not in info["names"]:
+                        "._" in rstr and inst not in info["names"]:
                     info["names"].append(inst)
-            if rr.type == 16:                               # TXT
-                for part in (rr.rdata if isinstance(rr.rdata, (list, tuple))
-                             else [rr.rdata]):
+            if rtype == 16:                                 # TXT
+                for part in txt:
                     s = sanitize_text(part, 120)
                     if "=" in s:
                         k, _, v = s.partition("=")
                         if k.lower() in ("model", "md", "am", "ty", "fn",
                                          "usb_mdl", "product", "rpmd"):
                             info["txt"][k.lower()] = v[:60]
-        if rr.type == 5:
-            cname = _rdata_str(rr)
+        if rtype == 5:
+            cname = rstr
             continue
-        ip = _rdata_ip(rr)
         if ip:
             answers.append(ip)
             if kind == "mDNS":
@@ -2493,10 +2505,11 @@ def _decode_dns(d, kind):
                 learns.append((ip, qname))
                 if cname:
                     learns.append((ip, cname))
-        elif rr.type not in (12, 16, 33, 47):
-            answers.append(f"{DNS_TYPES.get(rr.type, rr.type)}="
-                           f"{_rdata_str(rr)[:60]}")
-    info["answers"] = [a for a in answers if "=" not in a]
+        elif rtype not in (1, 28, 12, 16, 33, 47):
+            answers.append(f"{DNS_TYPES.get(rtype, rtype)}={rstr[:60]}")
+    info["answers"] = [a for a in answers if "=" not in a][:32]
+    info["names"] = info["names"][:8]
+    info["hostnames"] = info["hostnames"][:8]
     head = qname or (info["names"][0] if info["names"] else "?")
     if kind == "mDNS" and info["services"] and not answers:
         return (f"Announced: {head} ({', '.join(info['services'][:3])})",
@@ -2506,22 +2519,33 @@ def _decode_dns(d, kind):
         if len(answers) > 3:
             shown += f" +{len(answers) - 3}"
         return f"{head} → {shown}", learns, hint, info
-    if d.rcode == 3:
+    if rcode == 3:
         return f"{head} → does not exist", learns, hint, info
-    if d.rcode == 2:
+    if rcode == 2:
         return f"{head} → server failure", learns, hint, info
     return f"{head} → no answer", learns, hint, info
 
 
 def _decode_dhcp(pkt):
-    learns = []
     bootp = pkt[BOOTP]
-    dhcp = pkt[DHCP]
+    yiaddr = getattr(bootp, "yiaddr", "") or ""
+    try:
+        chaddr = bytes(bootp.chaddr)[:6]
+    except (TypeError, ValueError):
+        chaddr = b""
+    return dhcp_from_options(pkt[DHCP].options, yiaddr, chaddr)
+
+
+def dhcp_from_options(options, yiaddr, chaddr_bytes):
+    """Shared by the scapy decoder and the fast wire decoder. `options` is
+    a list of tuples (code-or-scapy-name, value, ...)."""
+    learns = []
     info = {"msgtype": None, "hostname": "", "vendor_class": "",
             "requested_ip": "", "lease_time": None, "server_id": "",
-            "router": "", "dns_servers": [], "param_list": ""}
+            "router": "", "dns_servers": [], "param_list": "",
+            "client_id": ""}
     msg = "DHCP"
-    for opt in dhcp.options:
+    for opt in options:
         if not isinstance(opt, tuple) or len(opt) < 2:
             continue
         code, val = opt[0], opt[1]
@@ -2542,22 +2566,25 @@ def _decode_dhcp(pkt):
             elif code in (3, "router"):
                 info["router"] = str(val)
             elif code in (6, "name_server"):
-                info["dns_servers"] = [str(v) for v in opt[1:]]
+                info["dns_servers"] = [str(v) for v in opt[1:]][:8]
             elif code in (55, "param_req_list"):
                 info["param_list"] = ",".join(str(x) for x in val)[:80] \
-                    if isinstance(val, (list, tuple)) else str(val)[:80]
+                    if isinstance(val, (list, tuple, bytes)) \
+                    else str(val)[:80]
+            elif code in (61, "client_id"):
+                if isinstance(val, bytes):
+                    info["client_id"] = val[:32].hex()
+                else:
+                    info["client_id"] = sanitize_text(val, 64)
         except (TypeError, ValueError):
             continue
-    yiaddr = getattr(bootp, "yiaddr", "") or ""
+    yiaddr = yiaddr if isinstance(yiaddr, str) else ""
     if yiaddr == "0.0.0.0":
         yiaddr = ""
     chaddr = ""
-    try:
-        raw = bytes(bootp.chaddr)[:6]
-        if any(raw):
-            chaddr = ":".join(f"{b:02x}" for b in raw)
-    except (TypeError, ValueError):
-        pass
+    raw = bytes(chaddr_bytes or b"")[:6]
+    if len(raw) == 6 and any(raw):
+        chaddr = ":".join(f"{b:02x}" for b in raw)
     if info["hostname"] and yiaddr:
         learns.append((yiaddr, info["hostname"]))
     parts = [msg]
@@ -2664,6 +2691,21 @@ def _tcp_app_from_payload(load, sport, dport):
     if 110 in (sport, dport) and (head[:3] == b"+OK" or head[:4] == b"USER"):
         return "POP3", "Checking email (POP3, not encrypted)"
     return "", ""
+
+
+def _l4_payload(pkt, l4):
+    """The transport payload as raw bytes, whatever scapy dissected it into
+    (NTP, NBNS… layers) and without Ethernet padding."""
+    try:
+        data = bytes(l4.payload)
+    except Exception:                                # noqa: BLE001
+        return b""
+    pad = pkt.getlayer(Padding) if Padding is not None else None
+    if pad is not None and getattr(pad, "load", None):
+        cut = len(pad.load)
+        if 0 < cut <= len(data) and data.endswith(pad.load):
+            data = data[:-cut]
+    return data
 
 
 def _new_decoded(pkt):
@@ -2773,8 +2815,7 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
             d["plain_dns"] = t.dport == 53
             d["encrypted"] = "no"
         else:
-            # Raw only: Ethernet padding (scapy's Padding layer) is not data
-            load = bytes(pkt[Raw].load) if pkt.haslayer(Raw) else b""
+            load = _l4_payload(pkt, t)
             d["payload_len"] = len(load)
             if load:
                 _decode_tcp_payload(d, load, reasm)
@@ -2789,12 +2830,21 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
         d["sport"], d["dport"] = int(u.sport), int(u.dport)
         d["transport"] = "UDP"
         ports = (u.sport, u.dport)
-        try:
-            load = bytes(pkt[Raw].load) if pkt.haslayer(Raw) else b""
-        except Exception:                            # noqa: BLE001
-            load = b""
-        d["payload_len"] = max(0, int(u.len or 8) - 8)
-        if pkt.haslayer(DNS) and any(p in (53, 5353, 5355) for p in ports):
+        load = _l4_payload(pkt, u)
+        if u.len and int(u.len) >= 8:
+            load = load[:int(u.len) - 8]
+            d["payload_len"] = int(u.len) - 8
+        else:
+            d["payload_len"] = len(load)
+        dns_layer = pkt[DNS] if pkt.haslayer(DNS) else None
+        if dns_layer is None and load and len(load) >= 12 and \
+                any(p in (53, 5353, 5355) for p in ports):
+            try:                  # scapy dissects LLMNR as its own layer
+                dns_layer = DNS(load)
+            except Exception:                        # noqa: BLE001
+                dns_layer = None
+        if dns_layer is not None and \
+                any(p in (53, 5353, 5355) for p in ports):
             name = "DNS"
             if 5353 in ports:
                 name = "mDNS"
@@ -2802,7 +2852,7 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
                 name = "LLMNR"
             if u.dport == 53:
                 d["plain_dns"] = True
-            text, learns, hint, info = _decode_dns(pkt[DNS], name)
+            text, learns, hint, info = _decode_dns(dns_layer, name)
             info["transport"] = "UDP"
             d.update({"proto": name, "tag": name, "text": text,
                       "app_conf": "Observed", "encrypted": "no"})
@@ -2813,7 +2863,7 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
             d["learns"].extend(learns)
             if hint:
                 d["type_hint"] = hint
-        elif HAVE_DHCP and pkt.haslayer(BOOTP) and \
+        elif HAVE_DHCP and pkt.haslayer(BOOTP) and pkt.haslayer(DHCP) and \
                 any(p in (67, 68) for p in ports):
             p, t2, text, learns, info = _decode_dhcp(pkt)
             d.update({"proto": p, "tag": t2, "text": text, "dhcp": info,
@@ -3054,6 +3104,654 @@ def _decode_icmpv6(d, pkt):
 
 
 # ============================================================================
+#  5b.  Fast wire decoder
+#
+#  A struct-based decoder for the frames that make up nearly all real
+#  traffic (Ethernet/VLAN, ARP, IPv4/IPv6, TCP, UDP, ICMP/ICMPv6 incl.
+#  neighbour discovery, DNS/mDNS/LLMNR, DHCP, SSDP, NBNS, NTP, QUIC, TLS and
+#  HTTP). It produces exactly the same dict as decode_packet() — a
+#  differential self-test replays the scenario through both and compares
+#  them field by field — at roughly 15–20× the speed, and it never builds a
+#  scapy object. Anything it doesn't understand is handed to the scapy
+#  decoder, so coverage never shrinks. The packet object for the detail
+#  view is built lazily from the raw bytes (packet_object()).
+# ============================================================================
+_U16 = struct.Struct(">H")
+_U32 = struct.Struct(">I")
+_TCP_FLAG_NAMES = ((0x01, "FIN"), (0x02, "SYN"), (0x04, "RST"),
+                   (0x08, "PSH"), (0x10, "ACK"), (0x20, "URG"))
+_ETHER_NAMES = {0x88cc: "LLDP", 0x888e: "EAPOL", 0x8863: "PPPoE",
+                0x8864: "PPPoE", 0x88e1: "HomePlug AV", 0x893a: "IEEE 1905",
+                0x8899: "Realtek", 0x88b5: "Experimental", 0x22f0: "AVTP",
+                0x88f7: "PTP", 0x9000: "Loopback"}
+_IPPROTO_NAMES = {47: "GRE", 50: "ESP", 51: "AH", 89: "OSPF", 132: "SCTP",
+                  103: "PIM", 112: "VRRP", 41: "IPv6-in-IPv4", 4: "IP-in-IP"}
+_ICMP4_TEXT = {0: "Ping reply", 3: "Destination unreachable",
+               8: "Ping request", 11: "Time exceeded",
+               5: "Redirect (router suggests another path)"}
+_ICMP6_NAMES = {2: "ICMPv6 Packet Too Big", 3: "ICMPv6 Time Exceeded",
+                4: "ICMPv6 Parameter Problem", 137: "ICMPv6 ND Redirect",
+                139: "ICMPv6 Node Information Query",
+                140: "ICMPv6 Node Information Reply"}
+_MLD_TYPES = (130, 131, 132, 143)
+
+
+class NeedDeepParse(Exception):
+    """The fast decoder declines this frame; use the scapy decoder."""
+
+
+def _mac(b):
+    return "%02x:%02x:%02x:%02x:%02x:%02x" % tuple(b[:6])
+
+
+def _ip4(b):
+    return "%d.%d.%d.%d" % (b[0], b[1], b[2], b[3])
+
+
+def _ip6(b):
+    try:
+        return str(ipaddress.IPv6Address(bytes(b[:16])))
+    except (ValueError, ipaddress.AddressValueError):
+        return ""
+
+
+def _wire_name(buf, pos, depth=0):
+    """DNS name at `pos` (with compression). Returns (name, next_pos)."""
+    labels = []
+    jumped = False
+    nxt = pos
+    hops = 0
+    n = len(buf)
+    while True:
+        if pos >= n:
+            raise ValueError("name past end")
+        ln = buf[pos]
+        if ln == 0:
+            pos += 1
+            break
+        if ln & 0xC0 == 0xC0:
+            if pos + 1 >= n:
+                raise ValueError("bad pointer")
+            ptr = ((ln & 0x3F) << 8) | buf[pos + 1]
+            if not jumped:
+                nxt = pos + 2
+            jumped = True
+            hops += 1
+            if hops > 32 or ptr >= n:
+                raise ValueError("pointer loop")
+            pos = ptr
+            continue
+        if ln & 0xC0:
+            raise ValueError("bad label")
+        pos += 1
+        labels.append(bytes(buf[pos:pos + ln]))
+        pos += ln
+        if len(labels) > 64:
+            raise ValueError("too many labels")
+    raw = b".".join(labels)
+    return _name_bytes(raw), (nxt if jumped else pos)
+
+
+def wire_dns(buf, kind):
+    """DNS message bytes → (text, learns, hint, info) via dns_summary()."""
+    if len(buf) < 12:
+        raise ValueError("short DNS header")
+    qid, flags, qd, an, ns, ar = struct.unpack_from(">HHHHHH", buf, 0)
+    qr = (flags >> 15) & 1
+    rcode = flags & 0x0F
+    pos = 12
+    qname, qtype = "", 0
+    for i in range(min(qd, 16)):
+        name, pos = _wire_name(buf, pos)
+        if pos + 4 > len(buf):
+            raise ValueError("short question")
+        t = _U16.unpack_from(buf, pos)[0]
+        pos += 4
+        if i == 0:
+            qname, qtype = name, t
+    records = []
+    if qr:
+        for i in range(min(an + ns + ar, 200)):
+            if pos >= len(buf):
+                break
+            rrname, pos = _wire_name(buf, pos)
+            if pos + 10 > len(buf):
+                break
+            rtype, _rclass, _ttl, rdlen = struct.unpack_from(">HHIH", buf,
+                                                             pos)
+            pos += 10
+            rdata = buf[pos:pos + rdlen]
+            rstart = pos
+            pos += rdlen
+            in_an = i < an
+            in_ar = i >= an + ns
+            if not (in_an or (kind == "mDNS" and in_ar)):
+                continue
+            ip, rstr, txt = None, "", []
+            if rtype == 1 and rdlen == 4:
+                ip = rstr = _ip4(rdata)
+            elif rtype == 28 and rdlen == 16:
+                ip = rstr = _ip6(rdata)
+            elif rtype in (5, 12, 2):
+                try:
+                    rstr = _wire_name(buf, rstart)[0]
+                except ValueError:
+                    rstr = ""
+            elif rtype == 16:
+                p = 0
+                while p < len(rdata):
+                    ln = rdata[p]
+                    txt.append(bytes(rdata[p + 1:p + 1 + ln]))
+                    p += 1 + ln
+                rstr = sanitize_text(" ".join(
+                    t.decode("utf-8", "ignore") for t in txt), 255)
+            elif rtype == 33 and rdlen >= 7:
+                try:
+                    rstr = _wire_name(buf, rstart + 6)[0]
+                except ValueError:
+                    rstr = ""
+            else:
+                rstr = sanitize_text(bytes(rdata).decode("utf-8", "ignore"),
+                                     255)
+            records.append((rrname, rtype, ip, rstr, txt))
+    return dns_summary(kind, qname, qtype, qid, qr, rcode, records)
+
+
+def _wire_dhcp(load):
+    """BOOTP/DHCP payload → dhcp_from_options() result."""
+    if len(load) < 240 or load[236:240] != b"\x63\x82\x53\x63":
+        raise NeedDeepParse("not DHCP")
+    yiaddr = _ip4(load[16:20])
+    chaddr = bytes(load[28:34])
+    opts = []
+    p = 240
+    n = len(load)
+    while p < n:
+        code = load[p]
+        if code == 255:
+            break
+        if code == 0:
+            p += 1
+            continue
+        if p + 1 >= n:
+            break
+        ln = load[p + 1]
+        val = bytes(load[p + 2:p + 2 + ln])
+        p += 2 + ln
+        if code in (53,) and ln >= 1:
+            opts.append((53, val[0]))
+        elif code in (12, 60, 61):
+            opts.append((code, val))
+        elif code in (50, 54, 3) and ln >= 4:
+            opts.append((code, _ip4(val)))
+        elif code == 51 and ln >= 4:
+            opts.append((51, _U32.unpack_from(val)[0]))
+        elif code == 6 and ln >= 4:
+            opts.append(tuple([6] + [_ip4(val[i:i + 4])
+                                     for i in range(0, ln - ln % 4, 4)]))
+        elif code == 55:
+            opts.append((55, list(val)))
+    return dhcp_from_options(opts, yiaddr, chaddr)
+
+
+def packet_object(d):
+    """The scapy packet for a decoded row (built on demand, then cached)."""
+    pkt = d.get("pkt")
+    if pkt is not None:
+        return pkt
+    raw = d.get("raw")
+    if raw is None or Ether is None:
+        return None
+    lt = d.get("linktype", 1)
+    try:
+        cls = Ether if lt == 1 else (conf.l2types.get(lt) or Raw)
+        pkt = cls(raw)
+    except Exception:                                # noqa: BLE001
+        pkt = Raw(raw)
+    pkt.time = d.get("time", 0.0)
+    d["pkt"] = pkt
+    return pkt
+
+
+def _fast_new(raw, ts, lt):
+    return {"proto": "?", "tag": "OTHER", "text": "",
+            "src": "", "dst": "", "src_ip": "", "dst_ip": "",
+            "src_mac": "", "dst_mac": "", "ttl": "", "ttl_int": 0,
+            "sport": None, "dport": None, "ipver": 0, "transport": "",
+            "tcp_flags": None, "seq": None, "payload_len": 0,
+            "dns_names": [], "doh_hint": "", "plain_dns": False,
+            "type_hint": "", "dhcp_msgtype": None, "arp_op": None,
+            "dhcp_yiaddr": "", "dhcp_hostname": "", "dhcp_client_mac": "",
+            "dhcp": None, "dns": None, "tls": None, "nd": None,
+            "ssdp": None, "mdns": None, "http_host": "",
+            "service": "", "service_port": None, "app_conf": "",
+            "encrypted": "unknown", "cleartext": "",
+            "multicast": False, "l2_bcast": False,
+            "learns": [], "pkt": None, "raw": raw, "linktype": lt,
+            "time": ts, "length": len(raw)}
+
+
+def fast_decode(raw, ts, lt=1, reasm=None, gateway_ip="", my_ips=()):
+    """Raw frame bytes → decoded dict (same shape as decode_packet()).
+    Falls back to the scapy decoder when it declines the frame."""
+    try:
+        return _fast_decode(raw, ts, lt, reasm)
+    except (NeedDeepParse, struct.error, IndexError, ValueError, TypeError):
+        pass
+    if Ether is None:
+        raise RuntimeError("no decoder available for this frame")
+    try:
+        cls = Ether if lt == 1 else (conf.l2types.get(lt) or Raw)
+        pkt = cls(raw)
+    except Exception:                                # noqa: BLE001
+        pkt = Raw(raw)
+    pkt.time = ts
+    try:
+        d = decode_packet(pkt, gateway_ip, my_ips, reasm)
+    except Exception as e:                           # noqa: BLE001
+        d = _fast_new(raw, ts, lt)
+        d["text"] = f"Undecodable frame ({type(e).__name__})"
+        d["pkt"] = pkt
+        return d
+    d["time"] = ts
+    d["raw"] = raw
+    d["linktype"] = lt
+    return d
+
+
+def _fast_decode(raw, ts, lt, reasm):
+    d = _fast_new(raw, ts, lt)
+    n = len(raw)
+    if lt == 1:
+        if n < 14:
+            raise NeedDeepParse("runt")
+        dst, src = raw[0:6], raw[6:12]
+        d["dst_mac"], d["src_mac"] = _mac(dst), _mac(src)
+        d["l2_bcast"] = dst == b"\xff\xff\xff\xff\xff\xff"
+        if dst[0] & 1 or dst == b"\x00\x00\x00\x00\x00\x00":
+            d["multicast"] = True
+        et = _U16.unpack_from(raw, 12)[0]
+        off = 14
+        vlans = 0
+        while et in (0x8100, 0x88a8, 0x9100) and vlans < 2:
+            if n < off + 4:
+                raise NeedDeepParse("vlan")
+            et = _U16.unpack_from(raw, off + 2)[0]
+            off += 4
+            vlans += 1
+        if et < 0x0600:
+            raise NeedDeepParse("802.3/LLC")
+    elif lt == 113:                                   # Linux cooked v1
+        if n < 16:
+            raise NeedDeepParse("runt")
+        et, off = _U16.unpack_from(raw, 14)[0], 16
+    elif lt == 276:                                   # Linux cooked v2
+        if n < 20:
+            raise NeedDeepParse("runt")
+        et, off = _U16.unpack_from(raw, 0)[0], 20
+    elif lt in (101, 12, 14, 228, 229):               # raw IP
+        if not n:
+            raise NeedDeepParse("empty")
+        v = raw[0] >> 4
+        et, off = (0x0800 if v == 4 else 0x86DD if v == 6 else 0), 0
+        if not et:
+            raise NeedDeepParse("raw ip")
+    elif lt == 0:                                     # BSD loopback
+        if n < 4:
+            raise NeedDeepParse("runt")
+        fam = struct.unpack_from("<I", raw, 0)[0]
+        et, off = (0x0800 if fam == 2 else 0x86DD if fam in (24, 28, 30)
+                   else 0), 4
+        if not et:
+            raise NeedDeepParse("loopback family")
+    else:
+        raise NeedDeepParse(f"linktype {lt}")
+
+    if et == 0x0806:
+        return _fast_arp(d, raw, off)
+    if et == 0x0800:
+        return _fast_ipv4(d, raw, off, reasm)
+    if et == 0x86DD:
+        return _fast_ipv6(d, raw, off, reasm)
+    name = _ETHER_NAMES.get(et)
+    if name is None:
+        raise NeedDeepParse(f"ethertype {et:#x}")
+    d["proto"] = name
+    d["text"] = f"{name} frame"
+    d["src"], d["dst"] = d["src_mac"], d["dst_mac"]
+    return d
+
+
+def _fast_arp(d, raw, off):
+    if len(raw) < off + 28:
+        raise NeedDeepParse("short arp")
+    htype, ptype, hlen, plen, op = struct.unpack_from(">HHBBH", raw, off)
+    if htype != 1 or ptype != 0x0800 or hlen != 6 or plen != 4:
+        raise NeedDeepParse("unusual arp")
+    hwsrc = _mac(raw[off + 8:off + 14])
+    psrc = _ip4(raw[off + 14:off + 18])
+    hwdst = _mac(raw[off + 18:off + 24])
+    pdst = _ip4(raw[off + 24:off + 28])
+    d["src_ip"], d["dst_ip"] = psrc, pdst
+    d["src_mac"], d["dst_mac"] = hwsrc, hwdst
+    d["proto"], d["tag"], d["transport"] = "ARP", "ARP", "ARP"
+    d["arp_op"] = op
+    if op == 1:
+        if psrc == pdst:
+            d["text"] = f"{psrc} announced itself (gratuitous ARP)"
+        else:
+            d["text"] = f"Who has {pdst}? Tell {psrc}"
+    elif op == 2:
+        d["text"] = f"{psrc} is at {hwsrc}"
+    else:
+        d["text"] = f"ARP op={op}"
+    d["src"] = psrc or hwsrc
+    d["dst"] = pdst or hwdst
+    d["ipver"] = 4
+    return d
+
+
+def _fast_ipv4(d, raw, off, reasm):
+    n = len(raw)
+    if n < off + 20:
+        raise NeedDeepParse("short ipv4")
+    vihl = raw[off]
+    ihl = (vihl & 0x0F) * 4
+    if vihl >> 4 != 4 or ihl < 20 or n < off + ihl:
+        raise NeedDeepParse("bad ipv4 header")
+    total = _U16.unpack_from(raw, off + 2)[0]
+    frag = _U16.unpack_from(raw, off + 6)[0]
+    ttl, proto = raw[off + 8], raw[off + 9]
+    src, dst = _ip4(raw[off + 12:off + 16]), _ip4(raw[off + 16:off + 20])
+    d["src_ip"], d["dst_ip"] = src, dst
+    d["ttl"], d["ttl_int"], d["ipver"] = str(ttl), ttl, 4
+    if is_multicast_or_broadcast(dst):
+        d["multicast"] = True
+    if frag & 0x1FFF or frag & 0x2000:
+        raise NeedDeepParse("fragment")
+    end = off + total if ihl <= total and off + total <= n else n
+    l4 = off + ihl
+    return _fast_l4(d, raw, proto, l4, end, reasm, 4)
+
+
+def _fast_ipv6(d, raw, off, reasm):
+    n = len(raw)
+    if n < off + 40:
+        raise NeedDeepParse("short ipv6")
+    if raw[off] >> 4 != 6:
+        raise NeedDeepParse("bad ipv6")
+    plen = _U16.unpack_from(raw, off + 4)[0]
+    nh, hlim = raw[off + 6], raw[off + 7]
+    src, dst = _ip6(raw[off + 8:off + 24]), _ip6(raw[off + 24:off + 40])
+    d["src_ip"], d["dst_ip"] = src, dst
+    d["ttl"], d["ttl_int"], d["ipver"] = str(hlim), hlim, 6
+    if is_multicast_or_broadcast(dst):
+        d["multicast"] = True
+    end = off + 40 + plen if off + 40 + plen <= n else n
+    p = off + 40
+    hops = 0
+    while nh in (0, 43, 60) and hops < 6:
+        if p + 2 > end:
+            raise NeedDeepParse("short extension header")
+        nh, hl = raw[p], (raw[p + 1] + 1) * 8
+        p += hl
+        hops += 1
+    if nh == 44:
+        raise NeedDeepParse("ipv6 fragment")
+    return _fast_l4(d, raw, nh, p, end, reasm, 6)
+
+
+def _fast_l4(d, raw, proto, p, end, reasm, ipver):
+    if proto == 6:
+        return _fast_tcp(d, raw, p, end, reasm)
+    if proto == 17:
+        return _fast_udp(d, raw, p, end)
+    if proto == 1 and ipver == 4:
+        if end - p < 4:
+            raise NeedDeepParse("short icmp")
+        t, code = raw[p], raw[p + 1]
+        d["proto"], d["tag"], d["transport"] = "ICMP", "ICMP", "ICMP"
+        d["sport"], d["dport"] = t, code
+        d["text"] = _ICMP4_TEXT.get(t, f"ICMP type {t}")
+        return _fast_done(d)
+    if proto == 58 and ipver == 6:
+        return _fast_icmpv6(d, raw, p, end)
+    if proto == 2 and ipver == 4:
+        d.update({"proto": "IGMP", "tag": "IGMP", "transport": "IGMP",
+                  "text": "Joining/leaving a multicast group (IGMP)"})
+        return _fast_done(d)
+    name = _IPPROTO_NAMES.get(proto)
+    if name is None:
+        raise NeedDeepParse(f"ip proto {proto}")
+    d["proto"] = name
+    d["text"] = f"{name} frame"
+    return _fast_done(d)
+
+
+def _fast_done(d):
+    d["src"] = d["src_ip"] or d["src_mac"]
+    d["dst"] = d["dst_ip"] or d["dst_mac"]
+    return d
+
+
+def _fast_tcp(d, raw, p, end, reasm):
+    if end - p < 20:
+        raise NeedDeepParse("short tcp")
+    sport, dport, seq = struct.unpack_from(">HHI", raw, p)
+    dataofs = (raw[p + 12] >> 4) * 4
+    flags = raw[p + 13] | ((raw[p + 12] & 1) << 8)
+    if dataofs < 20 or p + dataofs > end:
+        raise NeedDeepParse("bad tcp header")
+    d["sport"], d["dport"] = sport, dport
+    d["transport"] = "TCP"
+    d["proto"], d["tag"] = "TCP", "TCP"
+    d["tcp_flags"] = flags
+    d["seq"] = seq
+    names = [nm for b, nm in _TCP_FLAG_NAMES if flags & b]
+    svc, sport_ = _port_service(sport, dport)
+    d["service"], d["service_port"] = svc, sport_
+    if svc:
+        d["text"] = f"{svc} ({','.join(names) or 'data'})"
+        d["app_conf"] = "Likely (by port)"
+    else:
+        d["text"] = f"Connecting ({','.join(names) or 'data'})"
+    if sport_ in ENCRYPTED_PORTS:
+        d["encrypted"] = "likely"
+    load = raw[p + dataofs:end]
+    if 53 in (sport, dport) and len(load) > 2:
+        try:
+            text, learns, hint, info = wire_dns(load[2:], "DNS")
+        except ValueError:
+            raise NeedDeepParse("odd dns/tcp")
+        info["transport"] = "TCP"
+        d.update({"proto": "DNS", "tag": "DNS", "text": text + " (TCP)",
+                  "dns": info, "app_conf": "Observed"})
+        d["learns"].extend(learns)
+        d["plain_dns"] = dport == 53
+        d["encrypted"] = "no"
+        return _fast_done(d)
+    d["payload_len"] = len(load)
+    if load:
+        _decode_tcp_payload(d, bytes(load), reasm)
+    if not d["cleartext"] and d["payload_len"] and \
+            sport_ in CLEARTEXT_PORTS:
+        d["cleartext"] = CLEARTEXT_PORTS[sport_]
+        d["encrypted"] = "no"
+    return _fast_done(d)
+
+
+def _fast_udp(d, raw, p, end):
+    if end - p < 8:
+        raise NeedDeepParse("short udp")
+    sport, dport, ulen = struct.unpack_from(">HHH", raw, p)
+    d["sport"], d["dport"] = sport, dport
+    d["transport"] = "UDP"
+    ports = (sport, dport)
+    load = raw[p + 8:end]
+    if ulen >= 8:
+        load = load[:ulen - 8]
+        d["payload_len"] = ulen - 8
+    else:
+        d["payload_len"] = len(load)
+    load = bytes(load)
+    if (53 in ports or 5353 in ports or 5355 in ports) and len(load) >= 12:
+        name = "mDNS" if 5353 in ports else "LLMNR" if 5355 in ports \
+            else "DNS"
+        try:
+            text, learns, hint, info = wire_dns(load, name)
+        except ValueError:
+            raise NeedDeepParse("odd dns")
+        if dport == 53:
+            d["plain_dns"] = True
+        info["transport"] = "UDP"
+        d.update({"proto": name, "tag": name, "text": text,
+                  "app_conf": "Observed", "encrypted": "no"})
+        if name == "mDNS":
+            d["mdns"] = info
+        else:
+            d["dns"] = info
+        d["learns"].extend(learns)
+        if hint:
+            d["type_hint"] = hint
+    elif (67 in ports or 68 in ports) and len(load) >= 240:
+        pr, t2, text, learns, info = _wire_dhcp(load)
+        d.update({"proto": pr, "tag": t2, "text": text, "dhcp": info,
+                  "app_conf": "Observed"})
+        d["learns"].extend(learns)
+        d["dhcp_msgtype"] = info["msgtype"]
+        d["dhcp_yiaddr"] = info["yiaddr"]
+        d["dhcp_hostname"] = info["hostname"]
+        d["dhcp_client_mac"] = info["client_mac"]
+    elif (546 in ports or 547 in ports) and load:
+        mt = load[0]
+        d.update({"proto": "DHCPv6", "tag": "DHCPv6",
+                  "text": "IPv6 address setup: " +
+                  DHCPV6_MSG.get(mt, f"message {mt}"),
+                  "app_conf": "Observed"})
+    elif 137 in ports and load:
+        d["proto"], d["tag"] = "NBNS", "NBNS"
+        nm = _try_nbns(load)
+        if nm and d["src_ip"] and sport == 137 and len(load) > 12 and \
+                load[2] & 0x80:
+            d["text"] = f"{nm} is at {d['src_ip']} (Windows name)"
+            d["learns"].append((d["src_ip"], nm))
+        else:
+            d["text"] = f"Local name lookup{(': ' + nm) if nm else ''}"
+        d["app_conf"] = "Observed"
+    elif 1900 in ports and load:
+        text, hint, info = _decode_ssdp(load)
+        d.update({"proto": "SSDP", "tag": "SSDP", "text": text,
+                  "ssdp": info, "app_conf": "Observed"})
+        if hint:
+            d["type_hint"] = hint
+    elif 123 in ports and len(load) >= 48:
+        mode = load[0] & 0x07
+        d.update({"proto": "NTP", "tag": "NTP",
+                  "text": "Checking the time (NTP " +
+                  {3: "request", 4: "reply"}.get(mode, "message") + ")",
+                  "app_conf": "Observed", "encrypted": "no"})
+    elif 443 in ports and load and (load[0] & 0x80):
+        d.update({"proto": "QUIC", "tag": "QUIC",
+                  "text": "Secure web connection (QUIC — the site name "
+                          "is encrypted)",
+                  "app_conf": "Observed", "encrypted": "yes",
+                  "service": "Secure web browsing (QUIC)"})
+        d["quic_initial"] = load if (load[0] & 0x30) == 0 else None
+    elif 443 in ports and load:
+        d.update({"proto": "QUIC", "tag": "QUIC",
+                  "text": "Secure web connection (fast, encrypted)",
+                  "app_conf": "Likely (by port)", "encrypted": "yes"})
+    else:
+        svc, sp = _port_service(sport, dport)
+        d["service"], d["service_port"] = svc, sp
+        d["proto"], d["tag"] = "UDP", "UDP"
+        if sp in PORT_APP:
+            d["proto"] = d["tag"] = PORT_APP[sp]
+        d["text"] = (f"{svc} ({d['payload_len']} bytes)" if svc
+                     else f"Quick message ({d['payload_len']} bytes)")
+        d["app_conf"] = "Likely (by port)" if svc else ""
+        if sp in VPN_PORTS:
+            d["encrypted"] = "yes"
+        elif sp in CLEARTEXT_PORTS:
+            d["cleartext"] = CLEARTEXT_PORTS[sp]
+            d["encrypted"] = "no"
+    return _fast_done(d)
+
+
+def _nd_options(raw, p, end):
+    """ICMPv6 ND options → dict of first src/dst lladdr + prefix list."""
+    out = {"src": "", "dst": "", "prefixes": []}
+    hops = 0
+    while p + 2 <= end and hops < 16:
+        t, ln = raw[p], raw[p + 1] * 8
+        if ln == 0 or p + ln > end:
+            break
+        body = raw[p:p + ln]
+        if t == 1 and ln >= 8 and not out["src"]:
+            out["src"] = _mac(body[2:8])
+        elif t == 2 and ln >= 8 and not out["dst"]:
+            out["dst"] = _mac(body[2:8])
+        elif t == 3 and ln >= 32 and len(out["prefixes"]) < 7:
+            out["prefixes"].append(f"{_ip6(body[16:32])}/{body[2]}")
+        p += ln
+        hops += 1
+    return out
+
+
+def _fast_icmpv6(d, raw, p, end):
+    if end - p < 4:
+        raise NeedDeepParse("short icmpv6")
+    t = raw[p]
+    nd = None
+    if t == 134 and end - p >= 16:
+        opts = _nd_options(raw, p + 16, end)
+        nd = {"kind": "RA", "target": d["src_ip"],
+              "mac": opts["src"] or d["src_mac"],
+              "prefixes": opts["prefixes"],
+              "lifetime": _U16.unpack_from(raw, p + 6)[0]}
+        d["text"] = "Router announcement (IPv6)" + (
+            f" — network {', '.join(opts['prefixes'])}"
+            if opts["prefixes"] else "")
+    elif t == 133:
+        nd = {"kind": "RS", "target": "", "mac": d["src_mac"],
+              "prefixes": []}
+        d["text"] = "Looking for an IPv6 router (Router Solicitation)"
+    elif t == 135 and end - p >= 24:
+        tgt = _ip6(raw[p + 8:p + 24])
+        opts = _nd_options(raw, p + 24, end)
+        nd = {"kind": "NS", "target": tgt, "mac": opts["src"],
+              "prefixes": [], "dad": d["src_ip"] == "::"}
+        d["text"] = (f"Checking nobody else uses {tgt} (duplicate check)"
+                     if nd["dad"] else f"Who has {tgt}? (IPv6)")
+    elif t == 136 and end - p >= 24:
+        tgt = _ip6(raw[p + 8:p + 24])
+        opts = _nd_options(raw, p + 24, end)
+        mac = opts["dst"] or d["src_mac"]
+        nd = {"kind": "NA", "target": tgt, "mac": mac, "prefixes": [],
+              "router": bool(raw[p + 4] & 0x80)}
+        d["text"] = f"{tgt} is at {mac or '?'} (IPv6)"
+    if nd is not None:
+        d.update({"proto": "NDP", "tag": "NDP", "transport": "ICMPv6",
+                  "nd": nd, "app_conf": "Observed"})
+        return _fast_done(d)
+    base = {"proto": "ICMPv6", "tag": "ICMPv6", "transport": "ICMPv6"}
+    if t == 128:
+        d.update(base, text="Ping request (IPv6)", sport=128, dport=0)
+    elif t == 129:
+        d.update(base, text="Ping reply (IPv6)", sport=129, dport=0)
+    elif t == 1:
+        d.update(base, text="Destination unreachable (IPv6)", sport=1,
+                 dport=0)
+    elif t in _MLD_TYPES:
+        d.update(base, text="Multicast group membership report (IPv6)")
+    elif t in _ICMP6_NAMES:
+        d.update(base, text=_ICMP6_NAMES[t])
+    else:
+        raise NeedDeepParse(f"icmpv6 type {t}")
+    return _fast_done(d)
+
+
+# ============================================================================
 #  6.  Capture workers
 #
 #  The capture callback only enqueues (it must stay extremely cheap); a
@@ -3062,8 +3760,6 @@ def _decode_icmpv6(d, pkt):
 #  capture keeps going and the overflow is counted and shown honestly as
 #  "dropped analysis" rather than freezing the window.
 # ============================================================================
-PKT_QUEUE_MAX = 20000
-ROW_QUEUE_MAX = 20000
 
 
 def probe_l2_socket():
@@ -3238,57 +3934,6 @@ def learn_names_from(cache, d):
     src = _LEARN_SOURCE.get(d["proto"], "dns")
     for ip, name in d["learns"]:
         cache.learn(ip, name, source=src)
-
-
-class DecodeWorker(threading.Thread):
-    """Decodes captured packets off the GUI thread."""
-
-    def __init__(self, in_q, out_q, cache, gw, my_ips):
-        super().__init__(daemon=True, name="decoder")
-        self.in_q, self.out_q = in_q, out_q
-        self.cache = cache
-        self.gw = gw
-        self.my_ips = my_ips
-        self.stop_flag = False
-        self.lossless = False        # True while importing a PCAP
-        self.reasm = TlsReassembler()
-        self.decoded = 0
-        self.dropped = 0
-        self.errors = 0
-        self.last_error = ""
-
-    def run(self):
-        while not self.stop_flag:
-            try:
-                pkt = self.in_q.get(timeout=0.4)
-            except queue.Empty:
-                continue
-            if pkt is None:
-                continue
-            try:
-                d = decode_packet(pkt, self.gw, self.my_ips, self.reasm)
-            except Exception as e:                   # noqa: BLE001
-                self.errors += 1
-                if self.errors < 20:
-                    self.last_error = f"{type(e).__name__}: {e}"
-                    LOG.debug("decode error: %s", self.last_error)
-                continue
-            self.decoded += 1
-            learn_names_from(self.cache, d)
-            if self.lossless:
-                while not self.stop_flag:
-                    try:
-                        self.out_q.put(d, timeout=0.5)
-                        break
-                    except queue.Full:
-                        continue
-            else:
-                try:
-                    self.out_q.put_nowait(d)
-                except queue.Full:
-                    self.dropped += 1
-
-
 
 
 class LanScanner(threading.Thread):
@@ -3550,48 +4195,6 @@ def system_dns_servers():
     return out[:6]
 
 
-class PcapImporter(threading.Thread):
-    """Feeds a .pcap/.pcapng file through the SAME decode/analysis pipeline
-    as live packets. Uses blocking puts (no drops) and can be cancelled."""
-
-    def __init__(self, path, out_q, on_progress, on_done):
-        super().__init__(daemon=True, name="pcap-import")
-        self.path = path
-        self.out_q = out_q
-        self.on_progress = on_progress
-        self.on_done = on_done
-        self.cancelled = False
-        self.count = 0
-
-    def run(self):
-        err = None
-        reader = None
-        try:
-            reader = PcapReader(self.path)
-            for pkt in reader:
-                if self.cancelled:
-                    break
-                while not self.cancelled:
-                    try:
-                        self.out_q.put(pkt, timeout=0.5)
-                        break
-                    except queue.Full:
-                        continue
-                self.count += 1
-                if self.count % 2000 == 0:
-                    self.on_progress(self.count)
-        except Exception as e:                       # noqa: BLE001
-            err = (f"{type(e).__name__}: {e}. The file may be damaged, or "
-                   "its format isn't supported by the installed capture "
-                   "engine.")
-            LOG.warning("pcap import failed: %s", err)
-        finally:
-            if reader is not None:
-                with contextlib.suppress(Exception):
-                    reader.close()
-        self.on_done(self.count, err, self.cancelled)
-
-
 class NetworkWatcher(threading.Thread):
     """Notices the things that silently break a capture: the adapter
     vanishing, Wi-Fi reconnecting with a new address, the router changing,
@@ -3738,6 +4341,520 @@ class HealthProber(threading.Thread):
             res["probes"].append((dns, 53))
             res["dns_ok"], res["dns_ms"], res["dns_server"] = ok, rtt, dns
         return res
+
+
+# ============================================================================
+#  6b.  Capture pipeline v2
+#
+#  capture thread ──raw bytes──▶ RawRing ──▶ AnalysisWorker ──▶ model
+#                                              (decode off the GUI,
+#                                               ingest under GuiGate)
+#  Capture threads never parse: they append (bytes, time, linktype,
+#  generation) and go straight back to the socket, so a busy network can't
+#  starve them. One analysis worker decodes (fast_decode) and feeds the
+#  NetworkModel. The model is shared with the Tk thread, so both take the
+#  GuiGate — a re-entrant lock that every Tk callback holds automatically
+#  (it wraps tkinter's CallWrapper) and that modal dialogs release while
+#  they wait. The worker holds it for at most ~25 ms at a time, so the
+#  window stays responsive. Drops can only happen at the ring, are counted
+#  per cause and are shown in the status bar and Diagnostics.
+# ============================================================================
+class GuiGate:
+    """Re-entrant lock with the ability to step out of a nested hold
+    completely (for modal waits) and step back in afterwards."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._owner = None
+        self._count = 0
+        self.wait_ms = 0.0            # time the worker spent waiting
+
+    def acquire(self):
+        self._lock.acquire()
+        self._owner = threading.get_ident()
+        self._count += 1
+
+    def release(self):
+        self._count -= 1
+        if self._count == 0:
+            self._owner = None
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self.release()
+        return False
+
+    def held(self):
+        return self._owner == threading.get_ident()
+
+    def release_all(self):
+        if self._owner != threading.get_ident():
+            return 0
+        n = self._count
+        for _ in range(n):
+            self.release()
+        return n
+
+    def reacquire(self, n):
+        for _ in range(n):
+            self.acquire()
+
+
+GUI_GATE = GuiGate()
+_GATE_INSTALLED = [False]
+
+
+def install_gui_gate(gate=None):
+    """Every Tk callback runs holding the gate; modal waits step out of it
+    so analysis continues while a dialog is open."""
+    gate = gate or GUI_GATE
+    if _GATE_INSTALLED[0]:
+        return gate
+    _GATE_INSTALLED[0] = True
+    orig_call = tk.CallWrapper.__call__
+
+    def gated_call(self, *args):
+        gate.acquire()
+        try:
+            return orig_call(self, *args)
+        finally:
+            gate.release()
+    tk.CallWrapper.__call__ = gated_call
+
+    def releasing(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **k):
+            n = gate.release_all()
+            try:
+                return fn(*a, **k)
+            finally:
+                gate.reacquire(n)
+        return wrapper
+    tk.Misc.wait_window = releasing(tk.Misc.wait_window)
+    tk.Misc.wait_variable = releasing(tk.Misc.wait_variable)
+    tk.Misc.waitvar = tk.Misc.wait_variable
+    with contextlib.suppress(ImportError, AttributeError):
+        from tkinter import commondialog
+        commondialog.Dialog.show = releasing(commondialog.Dialog.show)
+    return gate
+
+
+class RawRing:
+    """Bounded hand-off from capture threads to the analysis worker.
+    deque.append/popleft are atomic, so producers take no lock."""
+
+    def __init__(self, max_frames=150000, max_bytes=96 * 1024 * 1024):
+        self.dq = deque()
+        self.max_frames = max_frames
+        self.max_bytes = max_bytes
+        self.bytes = 0
+        self.dropped = 0              # frames refused because it was full
+        self.peak = 0
+
+    def __len__(self):
+        return len(self.dq)
+
+    def put(self, raw, ts, lt, gen):
+        if len(self.dq) >= self.max_frames or self.bytes >= self.max_bytes:
+            self.dropped += 1
+            return False
+        self.dq.append((raw, ts, lt, gen))
+        self.bytes += len(raw)
+        n = len(self.dq)
+        if n > self.peak:
+            self.peak = n
+        return True
+
+    def put_wait(self, raw, ts, lt, gen, cancelled=lambda: False):
+        """Lossless variant for file imports and demo data."""
+        while len(self.dq) >= self.max_frames or \
+                self.bytes >= self.max_bytes:
+            if cancelled():
+                return False
+            time.sleep(0.005)
+        self.dq.append((raw, ts, lt, gen))
+        self.bytes += len(raw)
+        return True
+
+    def drain(self, n):
+        out = []
+        pop = self.dq.popleft
+        try:
+            for _ in range(n):
+                item = pop()
+                self.bytes -= len(item[0])
+                out.append(item)
+        except IndexError:
+            pass
+        if not self.dq:
+            self.bytes = 0
+        return out
+
+    def clear(self):
+        self.dq.clear()
+        self.bytes = 0
+
+
+class AnalysisWorker(threading.Thread):
+    """The only thread that feeds packets into the model."""
+
+    BATCH = 1500
+    SLICE = 0.025                 # max seconds per hold of the GuiGate
+
+    def __init__(self, app, gate=None):
+        super().__init__(daemon=True, name="analysis")
+        self.app = app
+        self.gate = gate or GUI_GATE
+        self.reasm = TlsReassembler()
+        self.stop_flag = False
+        self.decoded = 0
+        self.errors = 0
+        self.stale = 0             # frames from a previous data source
+        self.last_error = ""
+        self.beat = time.monotonic()
+        self.busy = False
+        self.deep = 0              # frames the fast path handed to scapy
+
+    def reset(self):
+        self.reasm = TlsReassembler()
+
+    def run(self):
+        ring = self.app.ring
+        while not self.stop_flag:
+            self.beat = time.monotonic()
+            batch = ring.drain(self.BATCH)
+            if not batch:
+                self.busy = False
+                time.sleep(0.004)
+                continue
+            self.busy = True
+            try:
+                self._process(batch)
+            except Exception as e:                   # noqa: BLE001
+                self.errors += 1
+                self.last_error = f"{type(e).__name__}: {e}"
+                if self.errors <= 20:
+                    LOG.exception("analysis batch")
+        self.busy = False
+
+    def _process(self, batch):
+        app = self.app
+        gen = app.gen
+        model = app.model
+        gw, my_ips = model.gateway_ip, model.my_ips
+        decoded = []
+        for raw, ts, lt, g in batch:
+            if g != gen:
+                self.stale += 1
+                continue
+            try:
+                d = fast_decode(raw, ts, lt, self.reasm, gw, my_ips)
+            except Exception as e:                   # noqa: BLE001
+                self.errors += 1
+                if self.errors <= 20:
+                    self.last_error = f"{type(e).__name__}: {e}"
+                    LOG.debug("decode error: %s", self.last_error)
+                continue
+            if d.get("pkt") is not None:
+                self.deep += 1
+            decoded.append(d)
+        if not decoded:
+            return
+        i = 0
+        while i < len(decoded):
+            t_wait = time.perf_counter()
+            with self.gate:
+                self.gate.wait_ms += (time.perf_counter() - t_wait) * 1000
+                if app.gen != gen or app.model is not model:
+                    self.stale += len(decoded) - i
+                    return
+                t0 = time.perf_counter()
+                start = i
+                while i < len(decoded):
+                    d = decoded[i]
+                    i += 1
+                    app.count += 1
+                    d["no"] = app.count
+                    learn_names_from(model.cache, d)
+                    try:
+                        model.ingest(d)
+                    except Exception:                # noqa: BLE001
+                        app._analysis_errors += 1
+                        if app._analysis_errors <= 5:
+                            LOG.exception("analysis error")
+                    if time.perf_counter() - t0 > self.SLICE:
+                        break
+                rows = decoded[start:i]
+                app.all_rows.extend(rows)
+                app.pending_rows.extend(rows)
+                self.decoded += len(rows)
+                app.on_rows_analysed(rows)
+            time.sleep(0)           # let the Tk thread in between slices
+
+
+def _layer2num(cls):
+    try:
+        return int(conf.l2types.layer2num.get(cls, 1))
+    except (AttributeError, TypeError, ValueError):
+        return 1
+
+
+class RawCapture(threading.Thread):
+    """Live capture straight from a layer-2 socket: no scapy packet is
+    built in the capture thread, just bytes + timestamp."""
+
+    def __init__(self, iface, bpf, promisc, sink):
+        super().__init__(daemon=True, name="capture")
+        self.iface = iface
+        self.bpf = bpf
+        self.promisc = promisc
+        self.sink = sink
+        self.stop_flag = False
+        self.running = False
+        self.exception = None
+        self.received = 0
+        self.started = threading.Event()
+        self.sock = None
+        self.kind = "raw socket"
+
+    def _open(self):
+        kwargs = {"iface": self.iface}
+        if self.bpf:
+            kwargs["filter"] = self.bpf
+        last = None
+        for extra in ({"promisc": self.promisc}, {}):
+            try:
+                return conf.L2listen(**dict(kwargs, **extra))
+            except TypeError as e:
+                last = e
+                continue
+        raise last or RuntimeError("could not open capture socket")
+
+    def run(self):
+        try:
+            self.sock = self._open()
+        except Exception as e:                       # noqa: BLE001
+            self.exception = e
+            self.started.set()
+            return
+        self.running = True
+        self.started.set()
+        sock = self.sock
+        lt_cache = {}
+        select = getattr(type(sock), "select", None)
+        try:
+            while not self.stop_flag:
+                if select is not None:
+                    ready = select([sock], 0.25)
+                    if not ready:
+                        continue
+                r = sock.recv_raw(65535)
+                if not r:
+                    continue
+                cls, raw, ts = r[0], r[1], r[2] if len(r) > 2 else None
+                if raw is None:
+                    continue
+                lt = lt_cache.get(cls)
+                if lt is None:
+                    lt = lt_cache[cls] = _layer2num(cls)
+                self.received += 1
+                self.sink(raw, float(ts) if ts else time.time(), lt)
+        except Exception as e:                       # noqa: BLE001
+            if not self.stop_flag:
+                self.exception = e
+        finally:
+            self.running = False
+            with contextlib.suppress(Exception):
+                sock.close()
+
+    def stop(self):
+        self.stop_flag = True
+        if self.is_alive():
+            self.join(timeout=1.5)
+
+
+class SnifferCapture:
+    """Fallback: scapy's AsyncSniffer (slower, builds packet objects) for
+    backends without raw receive. Same interface as RawCapture."""
+
+    kind = "scapy sniffer"
+
+    def __init__(self, sniffer):
+        self.sniffer = sniffer
+        self.received = 0
+
+    @property
+    def running(self):
+        return getattr(self.sniffer, "running", True)
+
+    @property
+    def exception(self):
+        return getattr(self.sniffer, "exception", None)
+
+    def stop(self):
+        with contextlib.suppress(Exception):
+            self.sniffer.stop()
+
+    def is_alive(self):
+        return self.running
+
+
+def start_capture_source(iface, bpf, promisc, sink):
+    """Raw socket first, AsyncSniffer as fallback. Returns (source, err)."""
+    rc = RawCapture(iface, bpf, promisc, sink)
+    rc.start()
+    rc.started.wait(3.0)
+    time.sleep(0.2)
+    if rc.exception is None and rc.is_alive():
+        return rc, None
+    err = rc.exception
+    rc.stop_flag = True
+    LOG.info("raw capture unavailable (%s); trying the scapy sniffer", err)
+    counter = {"n": 0}
+
+    def prn(pkt):
+        counter["n"] += 1
+        sink(bytes(pkt), float(getattr(pkt, "time", time.time())),
+             _layer2num(type(pkt)))
+    sn, err2 = build_sniffer(iface, prn, bpf, promisc)
+    if sn is None:
+        return None, err2 or err
+    return SnifferCapture(sn), None
+
+
+# ---- capture files (stdlib reader for pcap and pcapng) ----------------------
+def iter_raw_capture(path):
+    """Yield (raw_bytes, timestamp, linktype) from a .pcap or .pcapng
+    file without scapy. Raises ValueError for unknown formats."""
+    with open(path, "rb") as f:
+        head = f.read(4)
+        if len(head) < 4:
+            raise ValueError("file is empty")
+        if head == b"\x0a\x0d\x0d\x0a":
+            yield from _iter_pcapng(f, head)
+            return
+        magic_le = struct.unpack("<I", head)[0]
+        magics = {0xa1b2c3d4: ("<", 1e-6), 0xd4c3b2a1: (">", 1e-6),
+                  0xa1b23c4d: ("<", 1e-9), 0x4d3cb2a1: (">", 1e-9)}
+        if magic_le not in magics:
+            raise ValueError("not a pcap/pcapng file")
+        end, scale = magics[magic_le]
+        rest = f.read(20)
+        if len(rest) < 20:
+            raise ValueError("truncated pcap header")
+        _vmaj, _vmin, _tz, _sig, _snap, lt = struct.unpack(end + "HHiIII",
+                                                           rest)
+        lt &= 0x0FFFFFFF
+        rec = struct.Struct(end + "IIII")
+        while True:
+            h = f.read(16)
+            if len(h) < 16:
+                return
+            sec, frac, incl, _orig = rec.unpack(h)
+            if incl > 262144 * 4:
+                raise ValueError("corrupt record length")
+            data = f.read(incl)
+            if len(data) < incl:
+                return
+            yield data, sec + frac * scale, lt
+
+
+def _iter_pcapng(f, first):
+    end = "<"
+    ifaces = []                   # (linktype, ts_scale)
+    last_ts = 0.0
+    block_type = first
+    while True:
+        if block_type is None:
+            block_type = f.read(4)
+            if len(block_type) < 4:
+                return
+        lenb = f.read(4)
+        if len(lenb) < 4:
+            return
+        if block_type == b"\x0a\x0d\x0d\x0a":
+            bom = f.read(4)
+            end = "<" if bom == b"\x4d\x3c\x2b\x1a" else ">"
+            blen = struct.unpack(end + "I", lenb)[0]
+            body = f.read(blen - 12)
+            ifaces = []
+            block_type = None
+            continue
+        btype = struct.unpack(end + "I", block_type)[0]
+        blen = struct.unpack(end + "I", lenb)[0]
+        if blen < 12 or blen > 64 * 1024 * 1024:
+            raise ValueError("corrupt pcapng block")
+        body = f.read(blen - 8)
+        if len(body) < blen - 8:
+            return
+        body = body[:-4]
+        block_type = None
+        if btype == 1 and len(body) >= 8:              # interface description
+            lt = struct.unpack_from(end + "H", body, 0)[0]
+            scale = 1e-6
+            p = 8
+            while p + 4 <= len(body):
+                code, ln = struct.unpack_from(end + "HH", body, p)
+                if code == 0:
+                    break
+                if code == 9 and ln >= 1:
+                    v = body[p + 4]
+                    scale = (2 ** -(v & 0x7F)) if v & 0x80 else 10 ** -v
+                p += 4 + ln + ((4 - ln % 4) % 4)
+            ifaces.append((lt, scale))
+        elif btype == 6 and len(body) >= 20:           # enhanced packet
+            iid, hi, lo, cap, _orig = struct.unpack_from(end + "IIIII", body,
+                                                         0)
+            lt, scale = ifaces[iid] if iid < len(ifaces) else (1, 1e-6)
+            ts = ((hi << 32) | lo) * scale
+            last_ts = ts
+            yield bytes(body[20:20 + cap]), ts, lt
+        elif btype == 3 and len(body) >= 4:            # simple packet
+            lt, _s = ifaces[0] if ifaces else (1, 1e-6)
+            orig = struct.unpack_from(end + "I", body, 0)[0]
+            yield bytes(body[4:4 + orig]), last_ts, lt
+        elif btype == 2 and len(body) >= 20:           # obsolete packet
+            iid = struct.unpack_from(end + "H", body, 0)[0]
+            hi, lo, cap = struct.unpack_from(end + "III", body, 4)
+            lt, scale = ifaces[iid] if iid < len(ifaces) else (1, 1e-6)
+            ts = ((hi << 32) | lo) * scale
+            last_ts = ts
+            yield bytes(body[20:20 + cap]), ts, lt
+
+
+class RawPcapImporter(threading.Thread):
+    """Feeds a capture file through the SAME pipeline as live packets
+    (lossless: it waits when the ring is full) and can be cancelled."""
+
+    def __init__(self, path, sink, on_progress, on_done):
+        super().__init__(daemon=True, name="pcap-import")
+        self.path = path
+        self.sink = sink              # sink(raw, ts, lt, cancelled) -> bool
+        self.on_progress = on_progress
+        self.on_done = on_done
+        self.cancelled = False
+        self.count = 0
+
+    def run(self):
+        err = None
+        try:
+            for raw, ts, lt in iter_raw_capture(self.path):
+                if self.cancelled:
+                    break
+                if not self.sink(raw, ts, lt, lambda: self.cancelled):
+                    break
+                self.count += 1
+                if self.count % 2000 == 0:
+                    self.on_progress(self.count)
+        except (OSError, ValueError, struct.error) as e:
+            err = (f"{e}. The file may be damaged, or it isn't a "
+                   "pcap/pcapng capture.")
+            LOG.warning("capture import failed: %s", err)
+        self.on_done(self.count, err, self.cancelled)
 
 
 # ============================================================================
@@ -13601,7 +14718,7 @@ class PacketsTab(BaseTab):
         d = self._selected_row()
         if not d:
             return
-        pkt = d["pkt"]
+        pkt = packet_object(d)
         self.dtree.delete(*self.dtree.get_children())
         summary = self.dtree.insert("", "end", text="Summary", open=True,
                                     values=(d["text"],))
@@ -13849,9 +14966,11 @@ class MiniWireshark:
                                                False))
         self._async_results = queue.Queue()
 
-        # ---- capture pipeline state
-        self.pkt_q = queue.Queue(maxsize=PKT_QUEUE_MAX)
-        self.row_q = queue.Queue(maxsize=ROW_QUEUE_MAX)
+        # ---- capture pipeline state (see section 6b)
+        install_gui_gate()
+        self.gate = GUI_GATE
+        self.ring = RawRing()
+        self.gen = 0                   # bumps whenever the data source changes
         self.worker = None
         self.sniffer = None
         self.rdns = None
@@ -13865,6 +14984,7 @@ class MiniWireshark:
         self.max_rows = max(500, int(self.config.get(
             "capture.max_stored_events", self.MAX_ROWS)))
         self.all_rows = deque(maxlen=self.max_rows)
+        self.pending_rows = deque()
         self.bookmarks = set()
         self.data_mode = "idle"        # idle | live | offline | session | demo
         self.data_label = ""
@@ -13899,6 +15019,7 @@ class MiniWireshark:
         self._apply_text_size()
         self._apply_shortcuts()
         self.data.start()
+        self._ensure_worker()
         threading.Thread(target=self._discover_dns, daemon=True,
                          name="dns-discovery").start()
 
@@ -13991,13 +15112,16 @@ class MiniWireshark:
     def replace_model(self, model):
         """Swap in a fresh model (Clear / New session / offline / demo).
         Every tab is reset so no old row can linger."""
+        self.gen += 1                 # frames of the old source are dropped
+        self.ring.clear()
+        self.pending_rows.clear()
         self.model = model
         self.all_rows.clear()
         self.bookmarks.clear()
         self.count = 0
         self.dropped_capture = 0
         if self.worker is not None:
-            self.worker.cache = model.cache
+            self.worker.reset()
         if self.rdns is not None:
             self.rdns.cache = model.cache
         for tab in self.tabs.values():
@@ -14758,21 +15882,48 @@ class MiniWireshark:
             self._baselines_from_history()
         self.data_mode = "idle"
         self.data_label = ""
-        if self.worker is not None:
-            self.worker.lossless = False
         self._restyle_mode_banner()
 
     def _ensure_worker(self):
         if self.worker is None or not self.worker.is_alive():
-            self.worker = DecodeWorker(self.pkt_q, self.row_q,
-                                       self.model.cache,
-                                       self.real_identity[0],
-                                       self.real_identity[1])
+            if self.worker is not None:
+                LOG.warning("analysis worker had stopped; restarting it")
+            self.worker = AnalysisWorker(self, self.gate)
             self.worker.start()
-        self.worker.cache = self.model.cache
         if self.rdns is None:
             self.rdns = ReverseDNS(self.model.cache)
         self.rdns.cache = self.model.cache
+
+    def live_sink(self):
+        """Producer callback for live capture: never blocks, counts drops."""
+        ring, gen = self.ring, self.gen
+
+        def sink(raw, ts, lt):
+            ring.put(raw, ts, lt, gen)
+        return sink
+
+    def lossless_sink(self):
+        """Producer callback for files and demo data: waits instead of
+        dropping."""
+        ring, gen = self.ring, self.gen
+
+        def sink(raw, ts, lt, cancelled=lambda: False):
+            return ring.put_wait(raw, ts, lt, gen, cancelled)
+        return sink
+
+    def on_rows_analysed(self, rows):
+        """Called by the analysis worker (holding the gate) per slice."""
+        if self.rdns is not None and self.data_mode == "live" and \
+                self.config.get("mode.active_scanning", True):
+            cache = self.model.cache
+            for d in rows:
+                for ip in (d["src_ip"], d["dst_ip"]):
+                    if ip and not cache.get(ip) and is_private_ip(ip):
+                        self.rdns.lookup(ip)
+        if len(self.pending_rows) > self.max_rows * 2:
+            for _ in range(len(self.pending_rows) - self.max_rows):
+                self.pending_rows.popleft()
+            self._rows_overflowed = True
 
     def _start_capture(self, candidates, auto=False, keep_data=False):
         self._ensure_worker()
@@ -14781,9 +15932,10 @@ class MiniWireshark:
         self.status_var.set("Starting ...")
         self.root.update_idletasks()
         sniffer, err, used = None, None, None
+        sink = self.live_sink()
         for lbl in candidates:
             iface = self.iface_map.get(lbl)
-            sniffer, err = build_sniffer(iface, self._sniff_cb, bpf, promisc)
+            sniffer, err = start_capture_source(iface, bpf, promisc, sink)
             if sniffer is not None:
                 used = lbl
                 break
@@ -14861,12 +16013,6 @@ class MiniWireshark:
             return                       # never probe through a tunnel
         self.lan_scanner = LanScanner(iface_obj, my_ip)
         self.lan_scanner.start()
-
-    def _sniff_cb(self, pkt):
-        try:
-            self.pkt_q.put_nowait(pkt)
-        except queue.Full:
-            self.dropped_capture += 1
 
     def _stop_capture_only(self):
         s, self.sniffer = self.sniffer, None
@@ -15026,37 +16172,19 @@ class MiniWireshark:
         return int(base * mult)
 
     def _drain_decoded(self):
-        t0 = time.perf_counter()
-        budget = 0.030 if self.perf_level < 2 else 0.040
+        """Hands freshly analysed rows to the Packets tab (the analysis
+        itself happens on the worker thread)."""
+        pr = self.pending_rows
         batch = []
-        # reverse DNS sends queries, so it belongs to Active mode only
-        rdns_ok = self.rdns is not None and self.data_mode == "live" and \
-            self.config.get("mode.active_scanning", True)
-        while time.perf_counter() - t0 < budget:
-            try:
-                d = self.row_q.get_nowait()
-            except queue.Empty:
-                break
-            self.count += 1
-            d["no"] = self.count
-            try:
-                self.model.ingest(d)
-            except Exception:                        # noqa: BLE001
-                self._analysis_errors += 1
-                if self._analysis_errors <= 5:
-                    LOG.exception("analysis error")
-            self.all_rows.append(d)
-            batch.append(d)
-            if rdns_ok:
-                for ip in (d["src_ip"], d["dst_ip"]):
-                    if ip and not self.model.cache.get(ip) and \
-                            is_private_ip(ip):
-                        self.rdns.lookup(ip)
+        while pr and len(batch) < 4000:
+            batch.append(pr.popleft())
+        if getattr(self, "_rows_overflowed", False):
+            self._rows_overflowed = False
+            self.tabs["packets"]._dirty = True
         if batch:
             self._last_packet_wall = time.time()
             self.tabs["packets"].add_rows(batch)
-        more = not self.row_q.empty()
-        self.root.after(1 if more else self._ms(50), self._drain_decoded)
+        self.root.after(1 if pr else self._ms(80), self._drain_decoded)
 
     def _flush_ui(self):
         m = self.model
@@ -15151,7 +16279,7 @@ class MiniWireshark:
         if len(self._rate_window) >= 2:
             (t0, c0), (t1, c1) = self._rate_window[0], self._rate_window[-1]
             rate = (c1 - c0) / max(0.5, t1 - t0)
-        q = self.row_q.qsize()
+        q = len(self.ring)
         level = 0
         if rate > 800 or self._gui_lag > 0.3 or q > 2000:
             level = 1
@@ -15178,6 +16306,9 @@ class MiniWireshark:
         now = time.monotonic()
         self._gui_lag = max(0.0, now - self._last_tick_wall - 1.0)
         self._last_tick_wall = now
+        if self.worker is None or not self.worker.is_alive() or \
+                now - self.worker.beat > 10:
+            self._ensure_worker()
         if self.sniffer is not None:
             if not getattr(self.sniffer, "running", True) or \
                     getattr(self.sniffer, "exception", None) is not None:
@@ -15194,10 +16325,10 @@ class MiniWireshark:
     def status_text(self):
         m = self.model
         drops = []
-        if self.dropped_capture:
-            drops.append(f"capture overflow {self.dropped_capture}")
-        if self.worker is not None and self.worker.dropped:
-            drops.append(f"analysis skipped {self.worker.dropped}")
+        if self.ring.dropped:
+            drops.append(f"capture overflow {self.ring.dropped}")
+        if self.worker is not None and self.worker.errors:
+            drops.append(f"undecodable {self.worker.errors}")
         d = ("  ⚠ " + ", ".join(drops) +
              " (busy network: capture kept going; some packets weren't "
              "analysed)") if drops else ""
@@ -15264,7 +16395,8 @@ class MiniWireshark:
         probes = [(gw, 53), (gw, 80), (gw, 443), (dns, 53)]
         with contextlib.suppress(ValueError):
             probes.append((host, int(port)))
-        self.model.note_probes(probes, time.time() + 20)
+        with self.gate:               # called from the prober thread
+            self.model.note_probes(probes, time.time() + 20)
         return {"gateway": gw, "internet_target": target, "dns_server": dns,
                 "interval": int(self.config.get("health.interval_seconds",
                                                 30))}
@@ -16385,16 +17517,10 @@ class MiniWireshark:
         self.stop()
         self._leave_nonlive()
         self._ensure_worker()
-        with contextlib.suppress(queue.Empty):
-            while True:
-                self.row_q.get_nowait()
         m = self._new_model(offline=True, identity=("", set(), set()))
         m.announce_new = True
         m.capture_started = 0
         self.replace_model(m)
-        self.worker.cache = m.cache
-        self.worker.reasm = TlsReassembler()
-        self.worker.lossless = True
         self.data_mode = "offline"
         self.data_label = os.path.basename(path)
         self._restyle_mode_banner()
@@ -16409,7 +17535,8 @@ class MiniWireshark:
         def done(n, err, cancelled):
             self._async_results.put(lambda: self._pcap_done(n, err,
                                                             cancelled))
-        self.importer = PcapImporter(path, self.pkt_q, progress, done)
+        self.importer = RawPcapImporter(path, self.lossless_sink(), progress,
+                                        done)
         self.importer.start()
 
     def _pcap_done(self, n, err, cancelled):
@@ -16425,11 +17552,10 @@ class MiniWireshark:
         self.root.after(1500, self._pcap_finalize, n, cancelled)
 
     def _pcap_finalize(self, n, cancelled):
-        if not self.row_q.empty():
-            self.root.after(500, self._pcap_finalize, n, cancelled)
+        if len(self.ring) or (self.worker is not None and
+                              self.worker.busy) or self.pending_rows:
+            self.root.after(300, self._pcap_finalize, n, cancelled)
             return
-        if self.worker is not None:
-            self.worker.lossless = False
         self.model.tick()
         self.model._classify_dirty |= set(self.model.registry.by_key)
         self.model._classify()
@@ -16470,7 +17596,7 @@ class MiniWireshark:
         self.replace_model(m)
         self.data_mode = "demo"
         self.data_label = "simulated"
-        self.demo = DemoGenerator(self.pkt_q)
+        self.demo = DemoGenerator(self.lossless_sink())
         self.demo.start()
         self._restyle_mode_banner()
         self._set_banner("\U0001F3AE  DEMO DATA — NOT LIVE TRAFFIC. Explore "
@@ -16561,11 +17687,27 @@ class MiniWireshark:
         if not path:
             return
         try:
-            wrpcap(path, [d["pkt"] for d in self.all_rows])
-        except Exception as e:                       # noqa: BLE001
+            self.save_pcap_to(path, self.all_rows)
+        except (OSError, ValueError) as e:
             messagebox.showerror("Save error", str(e), parent=self.root)
             return
         self.status_var.set(f"Saved {len(self.all_rows)} packets to {path}")
+
+    @staticmethod
+    def save_pcap_to(path, rows):
+        frames = []
+        for d in rows:
+            raw = d.get("raw")
+            if raw is None:
+                pkt = d.get("pkt")
+                raw = bytes(pkt) if pkt is not None else None
+            if raw is not None:
+                frames.append((raw, d["time"], d.get("linktype", 1)))
+        if frames:
+            lt = frames[0][2]
+            frames = [f for f in frames if f[2] == lt]
+        write_raw_pcap(path, frames)
+        return len(frames)
 
     def _export_csv(self, current_view):
         tab = self.tabs["packets"]
@@ -17243,8 +18385,8 @@ class MiniWireshark:
                     self.all_rows and self.data_mode in ("live", "idle"):
                 path = os.path.join(PATHS.sessions, time.strftime(
                     "packets-%Y%m%d-%H%M%S.pcap"))
-                with contextlib.suppress(Exception):
-                    wrpcap(path, [d["pkt"] for d in self.all_rows])
+                with contextlib.suppress(OSError, ValueError):
+                    self.save_pcap_to(path, self.all_rows)
             if self.config.get("history.retention") != "Session only":
                 self.autosave("exit")
         except Exception:                            # noqa: BLE001
@@ -17253,6 +18395,7 @@ class MiniWireshark:
         for w in (self.worker, self.watcher, self.prober):
             if w is not None:
                 w.stop_flag = True
+        self.ring.clear()
         if self.prober is not None:
             self.prober.run_now.set()
         if self.demo is not None:
@@ -17729,10 +18872,16 @@ class DiagnosticsWindow:
             "Gateway             " + (m.gateway_ip or "—"),
             "DNS servers         " + (", ".join(app.system_dns) or
                                       "—"),
-            f"Raw queue           {app.pkt_q.qsize()} / {PKT_QUEUE_MAX}",
-            f"Decoder queue       {app.row_q.qsize()} / {ROW_QUEUE_MAX}",
-            f"Dropped (capture)   {app.dropped_capture}",
-            f"Dropped (analysis)  {w.dropped if w else 0}",
+            f"Capture source      {getattr(app.sniffer, 'kind', '—')} "
+            f"({getattr(app.sniffer, 'received', 0)} frames received)",
+            f"Raw ring            {len(app.ring)} / {app.ring.max_frames} "
+            f"(peak {app.ring.peak})",
+            f"Rows waiting (GUI)  {len(app.pending_rows)}",
+            f"Dropped (ring full) {app.ring.dropped}",
+            f"Analysed            {w.decoded if w else 0} "
+            f"(via scapy: {w.deep if w else 0}, stale: "
+            f"{w.stale if w else 0})",
+            f"Worker wait on GUI  {app.gate.wait_ms:.0f} ms total",
             f"Decode errors       {w.errors if w else 0} "
             f"{(w.last_error if w else '')[:80]}",
             f"Analysis errors     {app._analysis_errors}",
@@ -18028,9 +19177,9 @@ class DemoGenerator(threading.Thread):
              ("photos.example.org", "185.199.108.153"),
              ("mail.example.com", "23.215.0.136")]
 
-    def __init__(self, out_q):
+    def __init__(self, sink):
         super().__init__(daemon=True, name="demo")
-        self.q = out_q
+        self.sink = sink              # sink(raw, ts, lt, cancelled)
         self.stop_flag = False
         self.t0 = time.time()
         self.port = 40000
@@ -18039,12 +19188,7 @@ class DemoGenerator(threading.Thread):
         self.stop_flag = True
 
     def _emit(self, p):
-        try:
-            pkt = Ether(bytes(p))
-            pkt.time = time.time()
-            self.q.put(pkt, timeout=0.5)
-        except queue.Full:
-            pass
+        self.sink(bytes(p), time.time(), 1, lambda: self.stop_flag)
 
     def _eth(self, src, dst):
         return Ether(src=src[1], dst=dst[1] if isinstance(dst, tuple)
@@ -19417,11 +20561,227 @@ def t_iid_map_reverse_index(ctx):
     assert ae.order[0] in ae.alerts
 
 
+DIFF_FIELDS = ("proto", "tag", "text", "src", "dst", "src_ip", "dst_ip",
+               "src_mac", "dst_mac", "ttl", "ttl_int", "sport", "dport",
+               "ipver", "transport", "tcp_flags", "seq", "payload_len",
+               "dns_names", "doh_hint", "plain_dns", "type_hint",
+               "dhcp_msgtype", "arp_op", "dhcp_yiaddr", "dhcp_hostname",
+               "dhcp_client_mac", "dhcp", "dns", "tls", "nd", "ssdp",
+               "mdns", "http_host", "service", "service_port", "app_conf",
+               "encrypted", "cleartext", "multicast", "l2_bcast", "learns",
+               "length")
+
+
+def decoder_differences(frames):
+    """Compare fast_decode() with the scapy decoder frame by frame."""
+    out = []
+    ra, rb = TlsReassembler(), TlsReassembler()
+    for i, (raw, ts, lt) in enumerate(frames):
+        try:
+            a = _fast_decode(raw, ts, lt, ra)
+        except (NeedDeepParse, struct.error, IndexError, ValueError):
+            continue                     # declined: scapy handles it anyway
+        pkt = Ether(raw)
+        pkt.time = ts
+        b = decode_packet(pkt, reasm=rb)
+        for k in DIFF_FIELDS:
+            va, vb = a.get(k), b.get(k)
+            if k in ("dns", "mdns") and va and vb:
+                va = dict(va)
+                vb = dict(vb)
+            if va != vb:
+                out.append(f"frame {i} {a['proto']}: {k}: fast={va!r} "
+                           f"scapy={vb!r}")
+    return out
+
+
+@self_test()
+def t_fast_decoder_matches_scapy(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    frames = ctx.frames() + ScenarioBuilder().busy_mix(300)
+    diffs = decoder_differences(frames)
+    assert not diffs, f"{len(diffs)} differences, e.g. " + \
+        " | ".join(diffs[:4])
+    declined = 0
+    for raw, ts, lt in frames:
+        try:
+            _fast_decode(raw, ts, lt, TlsReassembler())
+        except (NeedDeepParse, struct.error, IndexError, ValueError):
+            declined += 1
+    assert declined <= len(frames) * 0.02, f"declined {declined}"
+
+
+@self_test(slow=True)
+def t_fast_decoder_fuzz(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    rng = random.Random(5)
+    frames = ctx.frames()
+    for i in range(4000):
+        raw = bytearray(frames[rng.randrange(len(frames))][0])
+        for _ in range(rng.randint(1, 5)):
+            if raw and rng.random() < 0.6:
+                raw[rng.randrange(len(raw))] = rng.randrange(256)
+            elif len(raw) > 2:
+                del raw[rng.randrange(1, len(raw)):]
+        d = fast_decode(bytes(raw), 1.0 + i)     # must never raise
+        assert isinstance(d, dict) and "proto" in d
+
+
+class _PipelineHarness:
+    """Just enough of the app for the analysis worker (tests, bench)."""
+
+    def __init__(self, model):
+        self.ring = RawRing()
+        self.gen = 1
+        self.model = model
+        self.count = 0
+        self.all_rows = deque(maxlen=5000)
+        self.pending_rows = deque(maxlen=5000)
+        self._analysis_errors = 0
+        self.analysed = 0
+
+    def on_rows_analysed(self, rows):
+        self.analysed += len(rows)
+
+    def sink(self):
+        ring, gen = self.ring, self.gen
+        return lambda raw, ts, lt, c=lambda: False: \
+            ring.put_wait(raw, ts, lt, gen, c)
+
+
+def run_pipeline(model, frames, timeout=60):
+    h = _PipelineHarness(model)
+    w = AnalysisWorker(h, GuiGate())
+    w.start()
+    sink = h.sink()
+    for raw, ts, lt in frames:
+        sink(raw, ts, lt)
+    t_end = time.time() + timeout
+    while (len(h.ring) or w.busy or h.count < len(frames)) and \
+            time.time() < t_end:
+        time.sleep(0.01)
+    w.stop_flag = True
+    w.join(2)
+    return h, w
+
+
 @self_test()
 def t_reverse_dns_only_in_active_mode(ctx):
-    src = inspect.getsource(MiniWireshark._drain_decoded)
+    src = inspect.getsource(MiniWireshark.on_rows_analysed)
     assert "mode.active_scanning" in src
 
+
+@self_test()
+def t_capture_file_readers(ctx):
+    frames = [(bytes([i % 256]) * (60 + i), 1700000000.0 + i * 0.25, 1)
+              for i in range(50)]
+    p = ctx.path("rt.pcap")
+    write_raw_pcap(p, frames)
+    back = list(iter_raw_capture(p))
+    assert len(back) == 50 and back[7][0] == frames[7][0]
+    assert abs(back[7][1] - frames[7][1]) < 1e-5 and back[0][2] == 1
+    # a hand-built pcapng: SHB, IDB (nanosecond resolution), 2 EPBs
+    def block(btype, body):
+        body += b"\x00" * ((4 - len(body) % 4) % 4)
+        ln = 12 + len(body)
+        return struct.pack("<II", btype, ln) + body + struct.pack("<I", ln)
+    shb = block(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    idb = block(1, struct.pack("<HHI", 1, 0, 65535) +
+                struct.pack("<HHB", 9, 1, 9) + b"\x00" * 3 +
+                struct.pack("<HH", 0, 0))
+    out = shb + idb
+    for i in range(2):
+        ts = (1700000000 + i) * 10 ** 9 + 500
+        data = frames[i][0]
+        out += block(6, struct.pack("<IIIII", 0, ts >> 32, ts & 0xffffffff,
+                                    len(data), len(data)) + data)
+    p2 = ctx.path("rt.pcapng")
+    with open(p2, "wb") as f:
+        f.write(out)
+    back = list(iter_raw_capture(p2))
+    assert len(back) == 2 and back[1][0] == frames[1][0], back
+    assert abs(back[1][1] - 1700000001.0000005) < 1e-6
+    with open(ctx.path("junk.pcap"), "wb") as f:
+        f.write(b"hello world, not a capture")
+    try:
+        list(iter_raw_capture(ctx.path("junk.pcap")))
+        raise AssertionError("junk accepted")
+    except ValueError:
+        pass
+
+
+@self_test()
+def t_raw_ring_and_gate(ctx):
+    r = RawRing(max_frames=3)
+    for i in range(5):
+        r.put(b"x" * 10, i, 1, 1)
+    assert len(r) == 3 and r.dropped == 2 and r.bytes == 30
+    assert [x[1] for x in r.drain(10)] == [0, 1, 2] and r.bytes == 0
+    g = GuiGate()
+    g.acquire()
+    g.acquire()
+    assert g.held() and g.release_all() == 2 and not g.held()
+    got = []
+    t = threading.Thread(target=lambda: (g.acquire(), got.append(1),
+                                         g.release()))
+    t.start()
+    t.join(2)
+    assert got == [1], "gate not released"
+    g.reacquire(2)
+    assert g.held()
+    g.release()
+    g.release()
+    assert not g.held()
+
+
+@self_test()
+def t_pipeline_worker(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg(), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    frames = ctx.frames()
+    h, w = run_pipeline(m, frames)
+    assert h.count == len(frames), (h.count, len(frames), w.errors,
+                                    w.last_error)
+    m.tick()
+    m._announce_created(flush=True)
+    fails = golden_checks(m)
+    assert not fails, "; ".join(fails)
+    assert [d["no"] for d in list(h.all_rows)[:3]] == [1, 2, 3]
+    assert all(d.get("raw") for d in h.all_rows)
+    # frames of an old generation never reach a new model
+    h2 = _PipelineHarness(m)
+    w2 = AnalysisWorker(h2, GuiGate())
+    old_sink = h2.sink()
+    h2.gen = 2
+    for raw, ts, lt in frames[:40]:
+        old_sink(raw, ts, lt)
+    w2.start()
+    time.sleep(0.3)
+    w2.stop_flag = True
+    w2.join(2)
+    assert h2.count == 0 and w2.stale == 40, (h2.count, w2.stale)
+
+
+def bench_pipeline():
+    gw, ips, macs, nets = scenario_identity()
+    cfg = AppConfig(path=os.path.join(tempfile.mkdtemp(), "c.json"))
+    m = NetworkModel(cfg, gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    frames = ScenarioBuilder().busy_mix(30000)
+    t0 = time.perf_counter()
+    h, w = run_pipeline(m, frames, timeout=120)
+    dt = time.perf_counter() - t0
+    return {"pipeline_pkts_per_s": h.count / dt}
+
+
+BENCH_EXTRA = [bench_pipeline]
 
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
@@ -19530,6 +20890,66 @@ def dark_theme_leaks(root):
             walk(c)
     walk(root)
     return leaks
+
+
+@gui_test_step("stress: 30k frames while the window stays responsive")
+def _gs_stress(app, ctx):
+    root = app.root
+    app.stop()
+    app._leave_nonlive()
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "live"            # behave like a live capture
+    app._select_tab("packets")
+    frames = ScenarioBuilder().busy_mix(30000)
+    sink = app.lossless_sink()
+    feeder = threading.Thread(
+        target=lambda: [sink(r, time.time(), lt) for r, _t, lt in frames],
+        daemon=True)
+    stalls = []
+    last = [time.perf_counter()]
+
+    def beat():
+        now = time.perf_counter()
+        stalls.append(now - last[0])
+        last[0] = now
+        if feeder.is_alive() or len(app.ring) or app.worker.busy:
+            root.after(10, beat)
+    t0 = time.perf_counter()
+    feeder.start()
+    root.after(10, beat)
+    ok = _gui_pump(root, 0.5, lambda: not feeder.is_alive() and
+                   not len(app.ring) and not app.worker.busy and
+                   app.count >= len(frames), timeout=120)
+    dt = time.perf_counter() - t0
+    worst = max(stalls) if stalls else 0
+    print(f"      ({len(frames)} frames in {dt:.1f}s, worst UI stall "
+          f"{worst * 1000:.0f} ms, ring peak {app.ring.peak})")
+    assert ok, f"pipeline stalled at {app.count}/{len(frames)}"
+    assert worst < 0.6, f"UI froze for {worst * 1000:.0f} ms"
+    app.data_mode = "idle"
+    _gui_pump(root, 0.3)
+    assert len(app.tabs["packets"].tree.get_children()) > 0
+
+
+@gui_test_step("live capture starts and stops (only with --live)")
+def _gs_live(app, ctx):
+    if "--live" not in sys.argv:
+        return
+    app.start(auto=True)
+    _gui_pump(app.root, 3.0)
+    assert app.sniffer is not None, "capture did not start"
+    assert app.sniffer.exception is None, app.sniffer.exception
+    with contextlib.suppress(OSError):
+        _socket.getaddrinfo("example.com", 443)
+    _gui_pump(app.root, 1.5)
+    kind = getattr(app.sniffer, "kind", "?")
+    app.stop()
+    _gui_pump(app.root, 0.5)
+    assert app.sniffer is None and app.data_mode == "idle"
+    print(f"      (source: {kind}, {app.count} packets)")
 
 
 def run_gui_test(live=False):
