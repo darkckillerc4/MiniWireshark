@@ -8231,6 +8231,253 @@ class LookupCorrelator:
 
 
 # ============================================================================
+#  12c.  Coverage and claims — "what can I actually see from here?"
+#
+#  The vantage meter watches what share of unicast traffic belongs to OTHER
+#  devices. On an ordinary switched network or Wi-Fi this computer mostly
+#  sees its own traffic plus broadcasts ("endpoint view"); behind a hub,
+#  a mirror/SPAN port or with monitor-mode Wi-Fi it sees much more. Every
+#  view uses this to say what it can't know, instead of implying that
+#  "not seen" means "didn't happen".
+# ============================================================================
+VANTAGE_TEXT = {
+    "unknown": ("Still measuring", "Not enough traffic yet to tell what "
+                "this computer can see."),
+    "endpoint": ("This computer's view", "I see this computer's own "
+                 "traffic plus broadcasts and announcements from everyone. "
+                 "Other devices' private connections go straight to the "
+                 "router and are NOT visible here."),
+    "partial": ("Partial view", "I see some traffic between other devices "
+                "(a hub, a Wi-Fi quirk or a partial mirror), but not all "
+                "of it."),
+    "mirror": ("Network-wide view", "Most traffic I see is between other "
+               "devices — this looks like a mirror/SPAN port or a hub, so "
+               "other devices' connections are visible too."),
+    "file": ("Imported capture", "This data comes from a file; where it "
+             "was captured (and so what it could see) is unknown."),
+}
+
+
+class VantageMeter:
+    """Decayed share of unicast frames that involve neither this computer's
+    hardware address nor its IP."""
+
+    DECAY = 0.9995
+
+    def __init__(self):
+        self.own = 0.0
+        self.third = 0.0
+        self.frames = 0
+        self.bcast = 0
+
+    def note(self, d, my_macs, my_ips):
+        self.frames += 1
+        if d["multicast"]:
+            self.bcast += 1
+            return
+        sm, dm = d["src_mac"], d["dst_mac"]
+        if sm and dm and my_macs:
+            mine = sm in my_macs or dm in my_macs
+        else:
+            mine = d["src_ip"] in my_ips or d["dst_ip"] in my_ips
+        self.own *= self.DECAY
+        self.third *= self.DECAY
+        if mine:
+            self.own += 1.0
+        else:
+            self.third += 1.0
+
+    def share_third(self):
+        tot = self.own + self.third
+        return self.third / tot if tot else 0.0
+
+    def classify(self, offline=False):
+        if offline:
+            return "file"
+        if self.own + self.third < 150:
+            return "unknown"
+        r = self.share_third()
+        if r < 0.02:
+            return "endpoint"
+        if r < 0.35:
+            return "partial"
+        return "mirror"
+
+    def to_dict(self):
+        return {"own": self.own, "third": self.third, "frames": self.frames,
+                "bcast": self.bcast}
+
+    def load(self, d):
+        with contextlib.suppress(TypeError, ValueError, AttributeError):
+            self.own = float(d.get("own", 0))
+            self.third = float(d.get("third", 0))
+            self.frames = int(d.get("frames", 0))
+            self.bcast = int(d.get("bcast", 0))
+
+
+def coverage_rows(model, data_mode="live", active=False):
+    """[(question, answer, level, why)] — the coverage card's content."""
+    v = model.vantage.classify(offline=data_mode in ("offline", "session"))
+    rows = []
+    devs = [d for d in model.registry.by_key.values()]
+    heard = sum(1 for d in devs if d.packets_out == 0)
+    rows.append((
+        "Which devices are on the network?",
+        f"{len(devs)} found" + (f" ({heard} only heard about, never seen "
+                                f"sending)" if heard else ""),
+        LV_OBSERVED if devs else LV_UNKNOWN,
+        "Devices appear when they send something local (ARP, DHCP, mDNS…)."
+        + ("" if active else " In Quiet Mode, silent devices that never "
+           "announce themselves can be missed.")))
+    if v in ("endpoint", "unknown", "file"):
+        rows.append((
+            "What do OTHER devices connect to?",
+            "Mostly not visible from here" if v == "endpoint" else
+            VANTAGE_TEXT[v][0],
+            LV_UNKNOWN,
+            "Their lookups (if they use plain DNS through this computer) "
+            "and broadcasts are visible; their private connections go "
+            "straight to the router. A router or Pi-hole connection can "
+            "add this."))
+    else:
+        rows.append(("What do OTHER devices connect to?",
+                     "Visible (" + VANTAGE_TEXT[v][0].lower() + ")",
+                     LV_OBSERVED, VANTAGE_TEXT[v][1]))
+    enc = sum(model.dns.encrypted_seen.values())
+    plain = model.dns.queries
+    if enc and not plain:
+        dns_ans, lvl = "Hidden: lookups are encrypted (DoH/DoT)", \
+            LV_UNKNOWN
+    elif enc:
+        dns_ans, lvl = "Partly hidden: some devices use encrypted DNS", \
+            LV_OBSERVED
+    else:
+        dns_ans, lvl = "Plain DNS lookups are visible", LV_OBSERVED
+    rows.append(("Which website names are looked up?", dns_ans, lvl,
+                 "Encrypted DNS and VPNs hide names; a lookup alone does "
+                 "not prove a visit."))
+    if model.vpn.get("iface") or model.vpn.get("endpoint"):
+        rows.append(("Internet destinations of this computer",
+                     "Hidden inside a VPN tunnel", LV_UNKNOWN,
+                     "Only the tunnel endpoint is visible."))
+    rows.append(("Full web addresses and page contents",
+                 "Never visible for https", LV_UNKNOWN,
+                 "Only the site NAME (e.g. example.com) can be seen."))
+    return rows
+
+
+def blind_spots(model, data_mode="live", active=False):
+    out = []
+    v = model.vantage.classify(offline=data_mode in ("offline", "session"))
+    if v == "endpoint":
+        out.append("Other devices' connections (switched network)")
+    if not active and data_mode == "live":
+        out.append("Silent devices (Quiet Mode sends no probes)")
+    if model.dns.encrypted_seen:
+        out.append("Encrypted DNS lookups")
+    if model.vpn.get("iface") or model.vpn.get("endpoint"):
+        out.append("Traffic inside the VPN")
+    return out
+
+
+_NAME_SOURCE = {"user": ("you named it", LV_REPORTED),
+                "dhcp": ("it announced this name via DHCP", LV_OBSERVED),
+                "mdns": ("it announced this name via mDNS", LV_OBSERVED),
+                "nbns": ("it answered a Windows name query", LV_OBSERVED),
+                "ssdp": ("it announced itself via UPnP", LV_OBSERVED),
+                "rdns": ("your DNS server's reverse lookup", LV_REPORTED),
+                "vendor": ("guessed from the maker and device type",
+                           LV_INFERRED),
+                "": ("no name seen", LV_UNKNOWN)}
+_EXIST_OBS = ("arp_reply", "dhcp_request", "dhcp_ack", "mdns", "ssdp", "nd",
+              "nbns", "ra")
+
+
+def device_name_source(dev):
+    if dev.alias:
+        return "user"
+    if dev.dhcp_hostname:
+        return "dhcp"
+    if dev.mdns_name:
+        return "mdns"
+    if dev.hostname and dev.hostname_source in ("nbns", "rdns", "mdns",
+                                                "dhcp"):
+        return dev.hostname_source
+    if dev.ssdp_name:
+        return "ssdp"
+    if dev.vendor or dev.device_class != "Unknown":
+        return "vendor"
+    return ""
+
+
+def device_claims(model, dev):
+    """[(claim, value, level, why, proof_kinds)] for the inspector."""
+    claims = []
+    if dev.packets_out:
+        lvl, why = LV_OBSERVED, "It sent traffic on your local network."
+    elif any(e.source in ("arp_reply", "dhcp_lease", "dhcp_client",
+                          "ipv6_nd", "mdns", "ssdp", "nbns")
+             for e in dev.evidence):
+        lvl, why = LV_OBSERVED, "It answered or announced itself."
+    else:
+        lvl, why = LV_INFERRED, ("Only heard about: other traffic was "
+                                 "addressed to it, but it hasn't been seen "
+                                 "sending anything itself.")
+    claims.append(("Is on your network", dev.confidence + " confidence",
+                   lvl, why, _EXIST_OBS))
+    src = device_name_source(dev)
+    text, lvl = _NAME_SOURCE.get(src, _NAME_SOURCE[""])
+    claims.append(("Name", dev.display_name(), lvl, _cap(text) + ".",
+                   ("dhcp_request", "dhcp_ack", "mdns", "nbns", "ssdp")))
+    if dev.device_class != "Unknown":
+        claims.append(("Kind of device",
+                       f"{dev.class_confidence} {dev.device_class}".strip(),
+                       LV_INFERRED, "; ".join(dev.class_reasons[:3]) or
+                       "Combined weak hints.", ()))
+    else:
+        claims.append(("Kind of device", "Unknown", LV_UNKNOWN,
+                       "Not enough clues yet.", ()))
+    if dev.ip:
+        claims.append(("Address", dev.ip, LV_OBSERVED,
+                       "Seen in its own traffic or its DHCP lease.",
+                       ("dhcp_ack", "arp_reply")))
+    now = model.now()
+    if dev.state == STATE_ACTIVE:
+        claims.append(("Online", f"yes — seen {human_duration(max(0, now - dev.last_seen))} ago",
+                       LV_OBSERVED, "Recent traffic or replies.", ()))
+    else:
+        claims.append(("Online", f"not seen for "
+                                 f"{human_duration(max(0, now - dev.last_seen))}",
+                       LV_UNKNOWN, "Not seeing a device doesn't prove it's "
+                                   "off — it may just be quiet.", ()))
+    conn = look = poss = 0
+    for dom in dev.websites:
+        w = model.websites.get(dom)
+        a = w.ties.get(dev.key, [""])[0] if w else ""
+        if ASSOC_RANK.get(a, 0) >= 4:
+            conn += 1
+        elif a in (AS_LOOKUP_ONLY, AS_REPORTED):
+            look += 1
+        else:
+            poss += 1
+    if conn or look or poss:
+        claims.append(("Websites", f"{conn} connected · {look} looked up "
+                                   f"only · {poss} possibly",
+                       LV_OBSERVED if conn else
+                       (LV_CORRELATED if look else LV_INFERRED),
+                       "Connected = name seen in its connection or right "
+                       "after its own lookup.",
+                       ("tls_sni", "http_host", "dns_answer")))
+    return claims
+
+
+def device_weakest(model, dev):
+    """Three-glyph evidence signature: exists · name · kind."""
+    c = device_claims(model, dev)
+    return " ".join(LEVEL_GLYPH[x[2]] for x in c[:3])
+
+
+# ============================================================================
 #  13.  NetworkModel — the single analysis core
 #
 #  Every view (tabs, map, reports, exports, sessions) reads from this one
@@ -8348,6 +8595,7 @@ class NetworkModel:
         self._pkt_no = None
         self.journal = CorrectionJournal()
         self.network_id = ""
+        self.vantage = VantageMeter()
 
     # ---- evidence ------------------------------------------------------------
     def observe(self, kind, subject, ts, data=None, pkt=None, also=()):
@@ -8632,6 +8880,7 @@ class NetworkModel:
             self.offline_now = ts
         self.count += 1
         self._pkt_no = d.get("no")
+        self.vantage.note(d, self.my_macs, self.my_ips)
         src_ip, dst_ip = d["src_ip"], d["dst_ip"]
         src_local = self.is_local(src_ip)
         dst_local = self.is_local(dst_ip)
@@ -9797,7 +10046,7 @@ class NetworkModel:
 DEFAULT_SHORTCUTS = {
     "start": "<Control-r>", "stop": "<Control-period>",
     "clear": "<Control-l>", "export": "<Control-e>", "find": "<Control-f>",
-    "undo": "<Control-z>",
+    "undo": "<Control-z>", "inspector": "<F2>",
 }
 
 DEFAULT_FILTER_PRESETS = {
@@ -9820,7 +10069,8 @@ def _default_config():
                     "explanation_verbosity": "Normal", "language": "English",
                     "upgraded_from_3": False},
         "appearance": {"theme": "Light", "beginner_mode": True,
-                       "high_contrast": False, "text_size": "Normal"},
+                       "high_contrast": False, "text_size": "Normal",
+                       "inspector": True},
         "capture": {"max_stored_events": 5000, "promiscuous": True,
                     "auto_select_interface": True,
                     "preferred_interface": "", "follow_newest": True},
@@ -10693,6 +10943,89 @@ def bench_store(n=100000):
     st.stop(5)
     shutil.rmtree(tmp, ignore_errors=True)
     return {"store_obs_per_s": n / dt, "store_bytes_per_obs": size / n}
+
+
+# ============================================================================
+#  14c.  History views — what changed, sessions, packet history
+# ============================================================================
+CHANGE_PERIODS = {"Last hour": 3600, "Last 24 hours": 86400,
+                  "Last 7 days": 7 * 86400, "Since this session started":
+                  None}
+
+
+def change_digest(model, store=None, since=0.0, until=None):
+    """What changed between `since` and `until`: new / returning / gone
+    devices, first-seen websites, address and DNS changes, network events
+    and warnings. In-memory data first; older periods come from the
+    history store (if enabled)."""
+    until = until or model.now()
+    reg = model.registry
+    own = set(model.my_ips) | {model.gateway_ip}
+    out = {"since": since, "until": until, "new_devices": [],
+           "returned": [], "left": [], "new_sites": [], "ip_changes": [],
+           "dns_changes": [], "network": [], "alerts": [], "from_store": 0}
+    for d in reg.by_key.values():
+        if not d.live or not (since <= d.first_seen <= until):
+            continue
+        if d.ip in own or (d.mac and d.mac in model.my_macs):
+            continue
+        out["new_devices"].append((d.first_seen, d.key, d.display_name()))
+    first_by_root = {}
+    for w in model.websites.values():
+        r = w.registrable or w.domain
+        if r not in first_by_root or w.first_seen < first_by_root[r][0]:
+            first_by_root[r] = (w.first_seen, w)
+    for r, (fs, w) in first_by_root.items():
+        if since <= fs <= until and w.live:
+            out["new_sites"].append((fs, r, sorted(w.devices)[:3],
+                                     w.best_assoc))
+    kinds = {"device back": "returned", "device left": "left",
+             "ip changed": "ip_changes", "dns change": "dns_changes",
+             "network": "network", "interface": "network",
+             "rogue router": "network", "internet": "network"}
+    for e in model.timeline:
+        k = kinds.get(e.get("kind"))
+        if k and since <= e["when"] <= until:
+            out[k].append((e["when"], e.get("device", ""), e["text"]))
+    for a in model.alerts.alerts.values():
+        if a.severity in ("WARNING", "DANGER") and \
+                since <= a.first_seen <= until:
+            out["alerts"].append((a.first_seen, a.severity, a.reason))
+    if store is not None:
+        known_new = {k for _t, k, _n in out["new_devices"]}
+        rows = store.query(
+            "SELECT ts, kind, severity, text, device FROM events WHERE "
+            "ts>=? AND ts<=? AND session<>? ORDER BY ts LIMIT 5000",
+            (since, until, getattr(store, "session", -1)))
+        out["from_store"] = len(rows)
+        for ts, kind, sev, text, dev in rows:
+            k = kinds.get(kind)
+            if kind == "new device" and dev not in known_new:
+                out["new_devices"].append((ts, dev, text))
+                known_new.add(dev)
+            elif kind == "website":
+                out["new_sites"].append((ts, text.replace(
+                    "First visit to ", ""), [dev] if dev else [], ""))
+            elif k:
+                out[k].append((ts, dev, text))
+            elif kind == "alert" and sev in ("WARNING", "DANGER"):
+                out["alerts"].append((ts, sev, text))
+    for k in ("new_devices", "returned", "left", "new_sites", "ip_changes",
+              "dns_changes", "network", "alerts"):
+        out[k].sort(key=lambda t: t[0])
+    return out
+
+
+def digest_summary(dg):
+    parts = []
+    for key, one, many in (("new_devices", "new device", "new devices"),
+                           ("new_sites", "new website", "new websites"),
+                           ("left", "device left", "devices left"),
+                           ("alerts", "warning", "warnings")):
+        n = len(dg[key])
+        if n:
+            parts.append(f"{n} {one if n == 1 else many}")
+    return " · ".join(parts) if parts else "Nothing new."
 
 
 # ============================================================================
@@ -11644,6 +11977,8 @@ SETTINGS_PAGES = [
               "label": "Jump to search"},
              {"key": "shortcuts.undo", "type": "shortcut",
               "label": "Undo your last device change"},
+             {"key": "shortcuts.inspector", "type": "shortcut",
+              "label": "Show / hide the inspector"},
          ]},
      ]},
     {"id": "data", "icon": "\U0001F4BE", "title": "Data & Export",
@@ -13067,6 +13402,316 @@ class BaseTab:
         return dev.key if dev else None
 
 
+# ---- Inspector (docked evidence pane, F2) -------------------------------------
+class Inspector:
+    """Shows the selected device / website / remote host / connection /
+    alert as a list of claims, each with its evidence level and clickable
+    proof chips (#packet numbers) that open the packet behind it."""
+
+    WIDTH = 360
+
+    def __init__(self, app, parent):
+        self.app = app
+        self.frame = tk.Frame(parent, bg=WHITE, width=self.WIDTH)
+        head = tk.Frame(self.frame, bg=WHITE, padx=10, pady=6)
+        head.pack(fill="x")
+        self.title_var = tk.StringVar(value="Inspector")
+        tk.Label(head, textvariable=self.title_var, bg=WHITE, fg="#2b3a56",
+                 font=("TkDefaultFont", 11, "bold"), anchor="w",
+                 justify="left", wraplength=self.WIDTH - 40).pack(
+            side="left", fill="x", expand=True)
+        close = tk.Label(head, text="✕", bg=WHITE, fg="#666666",
+                         cursor="hand2")
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda e: app.toggle_inspector(False))
+        Tooltip(close, "Hide the inspector (F2 shows it again)")
+        body = tk.Frame(self.frame, bg=WHITE)
+        body.pack(fill="both", expand=True, padx=(8, 4))
+        self.txt = tk.Text(body, wrap="word", bg=WHITE, fg="#222222",
+                           relief="flat", highlightthickness=0, padx=4,
+                           pady=4, cursor="arrow", width=40,
+                           font=("TkDefaultFont", 10))
+        vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=vs.set, state="disabled")
+        self.txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.legend = tk.Label(
+            self.frame, text="◉ observed  ◈ reported  ◎ correlated  "
+                             "◌ inferred  ? unknown", bg=WHITE,
+            fg="#666666", font=("TkDefaultFont", 8), anchor="w")
+        self.legend.pack(fill="x", padx=10, pady=(0, 6))
+        self.current = None
+        self._chip = 0
+        self.on_theme()
+        self._empty()
+
+    # ---- rendering helpers
+    def on_theme(self):
+        t = self.app.theme
+        with contextlib.suppress(tk.TclError):
+            self.txt.configure(bg=t["tab_bg"], fg=t["text_fg"],
+                               insertbackground=t["text_fg"])
+            self.txt.tag_configure("h", font=("TkDefaultFont", 10, "bold"),
+                                   foreground=t["text_fg"], spacing1=6)
+            self.txt.tag_configure("muted", foreground=t["muted_fg"],
+                                   font=("TkDefaultFont", 9))
+            self.txt.tag_configure("chip", foreground=t["accent"],
+                                   underline=True,
+                                   font=("TkDefaultFont", 9))
+            self.txt.tag_configure("link", foreground=t["accent"],
+                                   underline=True)
+            self.txt.tag_configure("warn", foreground=t["warn_fg"])
+            self.txt.tag_configure("good", foreground=t["good_fg"])
+
+    def _begin(self, title):
+        self.title_var.set(title)
+        self.txt.configure(state="normal")
+        self.txt.delete("1.0", "end")
+        for tag in self.txt.tag_names():
+            if tag.startswith("c_"):
+                self.txt.tag_delete(tag)
+
+    def _end(self):
+        self.txt.configure(state="disabled")
+
+    def _w(self, text, *tags):
+        self.txt.insert("end", text, tags)
+
+    def _clickable(self, text, fn, base="link"):
+        self._chip += 1
+        tag = f"c_{self._chip}"
+        self.txt.insert("end", text, (base, tag))
+        self.txt.tag_bind(tag, "<Button-1>", lambda e: fn())
+        self.txt.tag_bind(tag, "<Enter>",
+                          lambda e: self.txt.configure(cursor="hand2"))
+        self.txt.tag_bind(tag, "<Leave>",
+                          lambda e: self.txt.configure(cursor="arrow"))
+
+    def _claim(self, label, value, level, why=""):
+        self._w(f"{LEVEL_GLYPH.get(level, '?')} {label}: ", "h")
+        self._w(f"{value}\n")
+        if why:
+            self._w(f"   {why}\n", "muted")
+
+    def _chips(self, obs, limit=5):
+        obs = [o for o in obs if o[5]][-limit:]
+        if not obs:
+            return
+        self._w("   proof: ", "muted")
+        for o in obs:
+            no = o[5]
+            self._clickable(f"#{no}", lambda n=no: self.app.jump_to_packet(n),
+                            "chip")
+            self._w(f" {OBS_KIND_TEXT.get(o[2], o[2])} "
+                    f"{fmt_clock(o[1])}   ", "muted")
+        self._w("\n")
+
+    def _empty(self):
+        self._begin("Inspector")
+        self._w("Select a device, website, connection or alert to see "
+                "what MiniWireshark knows about it — and how it knows.\n\n",
+                "muted")
+        self._w("Every statement carries a mark:\n", "muted")
+        for lv in (LV_OBSERVED, LV_REPORTED, LV_CORRELATED, LV_INFERRED,
+                   LV_UNKNOWN):
+            self._w(f"{LEVEL_GLYPH[lv]} {LEVEL_WORD[lv]}", "h")
+            self._w(f" — {LEVEL_HELP[lv]}\n", "muted")
+        self._end()
+
+    # ---- entry point
+    def show(self, kind, key):
+        self.current = (kind, key)
+        fn = {"device": self._show_device, "website": self._show_website,
+              "remote": self._show_remote, "flow": self._show_flow,
+              "alert": self._show_alert}.get(kind)
+        try:
+            if fn is None or not fn(key):
+                self._empty()
+        except tk.TclError:
+            pass
+
+    def refresh(self):
+        if self.current:
+            self.show(*self.current)
+
+    # ---- entity views
+    def _show_device(self, key):
+        m = self.app.model
+        dev = m.registry.by_key.get(m.registry.resolve(key))
+        if dev is None:
+            return False
+        self._begin(f"{DEVICE_ICONS.get(dev.type, '❓')} "
+                    f"{dev.display_name()}")
+        for label, value, level, why, kinds in device_claims(m, dev):
+            self._claim(label, value, level, why)
+            if kinds:
+                self._chips(m.observations_for(dev.key, kinds))
+        sites = []
+        for dom in dev.websites:
+            w = m.websites.get(dom)
+            if w is not None:
+                sites.append((ASSOC_RANK.get(w.ties.get(dev.key, [""])[0], 0),
+                              dom, w.ties.get(dev.key, [""])[0]))
+        if sites:
+            self._w("\nWebsites\n", "h")
+            for _r, dom, a in sorted(sites, reverse=True)[:12]:
+                self._w(f"  {assoc_label(a)}  ")
+                self._clickable(dom, lambda d=dom: self.app.inspect(
+                    "website", d))
+                self._w("\n")
+        if dev.merge_history:
+            self._w("\nMerged identities: ", "h")
+            self._w(", ".join(h.get("key", "?") for h in dev.merge_history)
+                    + "\n", "muted")
+        held = m.registry.bindings.history(dev.ip) if dev.ip else []
+        if len(held) > 1:
+            self._w("\nThis address over time\n", "h")
+            for owner, start, end, src in held[-4:]:
+                who = "this device" if owner in (dev.mac, dev.key) else owner
+                self._w(f"  {fmt_clock(start)}–"
+                        f"{fmt_clock(end) if end else 'now'}  {who} "
+                        f"({src})\n", "muted")
+        self._w("\n")
+        self._clickable("Open full details…",
+                        lambda: self.app.show_device(dev.key))
+        self._w("    ")
+        self._clickable("Show its packets", lambda: self.app.goto(
+            "packets", f'device:"{dev.ip or dev.mac}"'))
+        self._end()
+        return True
+
+    def _show_website(self, dom):
+        m = self.app.model
+        w = m.websites.get(dom)
+        if w is None:
+            return False
+        self._begin(f"\U0001F30D {w.domain}")
+        self._claim("Best evidence", ASSOC_TEXT.get(w.best_assoc, "unknown"),
+                    ASSOC_LEVEL.get(w.best_assoc, LV_UNKNOWN),
+                    "A lookup alone doesn't prove a visit; HTTPS shows "
+                    "only the site name, never the page.")
+        self._w("\nDevices\n", "h")
+        obs = m.observations_for("site:" + dom)
+        for dev_key, t in sorted(w.ties.items(),
+                                 key=lambda kv: -ASSOC_RANK.get(kv[1][0],
+                                                                0))[:15]:
+            self._w(f"  {assoc_label(t[0])}  ")
+            self._clickable(self.app.short_device_name(dev_key),
+                            lambda k=dev_key: self.app.inspect("device", k))
+            self._w(f"  ×{t[3]}\n", "muted")
+            self._chips([o for o in obs if o[3] == dev_key], 3)
+        if not w.ties:
+            self._w("  (no device tied to it — e.g. the router's own "
+                    "lookup)\n", "muted")
+        self._claim("Server addresses",
+                    ", ".join(sorted(w.resolved_ips)[:6]) or "—",
+                    LV_OBSERVED if w.resolved_ips else LV_UNKNOWN,
+                    "From DNS answers or the connection itself.")
+        self._claim("Encryption", w.encryption_text(),
+                    LV_OBSERVED if (w.encrypted or w.cleartext)
+                    else LV_UNKNOWN)
+        self._w("\n")
+        self._clickable("Open full details…",
+                        lambda: self.app.show_website(dom))
+        self._end()
+        return True
+
+    def _show_remote(self, ip):
+        m = self.app.model
+        r = m.remote_hosts.get(ip)
+        if r is None:
+            return False
+        self._begin(f"☁️ {ip}")
+        names = list(m.ip_to_domains.get(ip) or ())
+        self._claim("Names for this address",
+                    ", ".join(names[-5:]) or "none seen",
+                    LV_CORRELATED if names else LV_UNKNOWN,
+                    "Names come from DNS answers and secure-connection "
+                    "names; shared (CDN) addresses serve many sites.")
+        self._claim("Never a local device", "it's on the Internet",
+                    LV_OBSERVED, "Public addresses are kept separate from "
+                    "your devices.")
+        if r.country or r.asn:
+            self._claim("Location / provider",
+                        f"{r.country_name or r.country} {r.org}".strip(),
+                        LV_REPORTED, f"From {r.geo_source or 'a database'};"
+                        f" an estimate.")
+        self._claim("Traffic", f"↑{_human_bytes(r.bytes_out)} "
+                               f"↓{_human_bytes(r.bytes_in)} · "
+                               f"{r.connections} connections", LV_OBSERVED)
+        self._w("\nDevices\n", "h")
+        for k in sorted(r.devices)[:12]:
+            self._w("  ")
+            self._clickable(self.app.short_device_name(k),
+                            lambda kk=k: self.app.inspect("device", kk))
+            self._w("\n")
+        self._w("\n")
+        self._clickable("Open full details…",
+                        lambda: self.app.show_remote(ip))
+        self._end()
+        return True
+
+    def _show_flow(self, fid):
+        m = self.app.model
+        f = m.flows.get(fid)
+        if f is None:
+            return False
+        self._begin(f"\U0001F517 Connection #{f.fid}")
+        self._claim("Device", self.app.short_device_name(f.device_key)
+                    if f.device_key else f.local_ip,
+                    LV_OBSERVED if f.device_key else LV_UNKNOWN,
+                    f"{f.local_ip}:{f.local_port}")
+        self._claim("Other side", f"{f.remote_ip}:{f.remote_port}",
+                    LV_OBSERVED)
+        if f.domain:
+            self._claim("Website", f"{f.domain} — "
+                        f"{ASSOC_TEXT.get(f.assoc, f.domain_conf)}",
+                        ASSOC_LEVEL.get(f.assoc, LV_INFERRED),
+                        f.domain_conf)
+        else:
+            self._claim("Website", "unknown", LV_UNKNOWN,
+                        "No name was visible and no lookup preceded it.")
+        purpose_lvl = LV_OBSERVED if f.interp_conf == "Observed" else \
+            LV_INFERRED
+        self._claim("Purpose", f.purpose(), purpose_lvl, f.interp_conf or "")
+        self._claim("Encryption", f.encryption_text(),
+                    LV_OBSERVED if f.encrypted in ("yes", "no")
+                    else LV_INFERRED)
+        self._claim("Traffic", f"↑{_human_bytes(f.bytes_out)} "
+                               f"↓{_human_bytes(f.bytes_in)} · "
+                               f"{f.packets} packets · {f.status_text()}",
+                    LV_OBSERVED)
+        self._chips(m.observations_for(f"flow:{f.fid}"), 3)
+        self._w("\n")
+        self._clickable("Show its packets", lambda: self.app.goto(
+            "packets", f"stream:{f.fid}"))
+        self._end()
+        return True
+
+    def _show_alert(self, aid):
+        m = self.app.model
+        a = m.alerts.alerts.get(aid)
+        if a is None:
+            return False
+        self._begin(f"{MiniWireshark.SEVERITY_ICON.get(a.severity, '')} "
+                    f"{a.reason}")
+        self._claim("What was observed", a.observed, LV_OBSERVED)
+        self._claim("What it might mean", a.interpretation, LV_INFERRED,
+                    f"Confidence: {a.confidence}. {a.why}")
+        self._claim("Innocent explanations", a.possible_explanations,
+                    LV_INFERRED)
+        if a.evidence:
+            self._w("\nEvidence\n", "h")
+            for e in a.evidence[-8:]:
+                self._w(f"  • {e}\n", "muted")
+        if a.device_key:
+            self._w("\n")
+            self._clickable("Go to the device", lambda: self.app.inspect(
+                "device", a.device_key))
+        self._end()
+        return True
+
+
 # ---- Dashboard ---------------------------------------------------------------
 class DashboardTab(BaseTab):
     name, label_key = "dash", "tab_dashboard"
@@ -13111,6 +13756,32 @@ class DashboardTab(BaseTab):
                                   justify="left", wraplength=1100, padx=12,
                                   pady=8, font=("TkDefaultFont", 11))
         self.state_lbl.pack(fill="x", pady=(0, 8))
+        self.big = tk.Frame(outer, bg=WHITE)
+        self.big.pack(fill="x", pady=(0, 4))
+        self.big_vars = {}
+        for i, (key, title, cmd) in enumerate((
+                ("coverage", "WHAT I CAN SEE FROM HERE",
+                 lambda: self.app.open_coverage()),
+                ("changed", "WHAT CHANGED (LAST HOUR)",
+                 lambda: self.app.open_changes("Last hour")))):
+            card = tk.Frame(self.big, bg="#f6f7fa", padx=12, pady=8,
+                            highlightbackground="#e0e2e8",
+                            highlightthickness=1, cursor="hand2",
+                            takefocus=1)
+            card.grid(row=0, column=i, sticky="nsew", padx=4)
+            tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#888888",
+                          font=("TkDefaultFont", 8, "bold"), anchor="w")
+            tl.pack(anchor="w")
+            v = tk.StringVar(value="—")
+            vl = tk.Label(card, textvariable=v, bg="#f6f7fa", fg="#222222",
+                          font=("TkDefaultFont", 10), justify="left",
+                          anchor="w", wraplength=520)
+            vl.pack(anchor="w", fill="x", pady=(2, 0))
+            self.big_vars[key] = v
+            for w in (card, tl, vl):
+                w.bind("<Button-1>", lambda e, c=cmd: c())
+            card.bind("<Return>", lambda e, c=cmd: c())
+            self.big.columnconfigure(i, weight=1)
         grid = tk.Frame(outer, bg=WHITE)
         grid.pack(fill="x")
         self.vars, self.card_widgets = {}, []
@@ -13187,6 +13858,14 @@ class DashboardTab(BaseTab):
                                   if m.metrics.first_ts else "—")
         state, bg, fg = app.network_state_text()
         self.state_var.set(state)
+        v = m.vantage.classify(offline=app.data_mode in ("offline",
+                                                         "session"))
+        spots = blind_spots(m, app.data_mode, app.active_mode())
+        self.big_vars["coverage"].set(
+            f"{VANTAGE_TEXT[v][0]}. " + (
+                "Blind spots: " + "; ".join(spots) + "." if spots else
+                "No known blind spots right now.") + "  (click for details)")
+        self.big_vars["changed"].set(app.changes_summary_short())
         with contextlib.suppress(tk.TclError):
             self.state_lbl.configure(bg=bg, fg=fg)
         self._draw_charts(now)
@@ -13536,6 +14215,7 @@ class DevicesTab(BaseTab):
             ("mac", "MAC address", 135, "w", False),
             ("vendor", "Made by", 140, "w", True),
             ("conf", "Confidence", 110, "w", False),
+            ("evidence", "Evidence", 80, "center", False),
             ("status", "Status", 95, "w", False),
             ("traffic", "Traffic ↑/↓", 150, "w", False),
             ("last", "Last seen", 80, "center", False),
@@ -13620,12 +14300,15 @@ class DevicesTab(BaseTab):
         status = STATE_LABEL.get(dev.state, dev.state)
         if not dev.live:
             status += " (saved)"
+        elif dev.packets_out == 0 and dev.state == STATE_ACTIVE:
+            status = "◌ Heard about"
         vendor = dev.vendor or ("Private address" if dev.randomized_mac
                                 else "—")
         traffic = (f"↑{_human_bytes(dev.bytes_up)}  "
                    f"↓{_human_bytes(dev.bytes_down)}")
         return (icon, label, cls, dev.ip or "—", dev.mac or "—",
-                vendor, conf, status, traffic, fmt_clock(dev.last_seen),
+                vendor, conf, device_weakest(self.model, dev), status,
+                traffic, fmt_clock(dev.last_seen),
                 ", ".join(sorted(dev.ipv6)[:2]) or "—", dev.packets)
 
     def update_keys(self, keys):
@@ -13661,6 +14344,10 @@ class DevicesTab(BaseTab):
     def selected_keys(self):
         return [k for k in (key_for_iid(self.iids, i)
                             for i in self.tree.selection()) if k]
+
+    def inspect_target(self):
+        keys = self.selected_keys()
+        return ("device", keys[0]) if keys else None
 
     def select(self, key):
         iid = self.iids.get(key)
@@ -13956,6 +14643,10 @@ class WebsitesTab(BaseTab):
         sel = self.tree.selection()
         return self.iid_to_key.get(sel[0]) if sel else None
 
+    def inspect_target(self):
+        k = self.selected()
+        return ("website", k[1]) if k and k[0] == "site" else None
+
     def _details(self, _e=None):
         k = self.selected()
         if k and k[0] == "site":
@@ -14195,6 +14886,10 @@ class ConnectionsTab(BaseTab):
         sel = self.tree.selection()
         return key_for_iid(self.iids, sel[0]) if sel else None
 
+    def inspect_target(self):
+        fid = self.selected()
+        return ("flow", fid) if fid is not None else None
+
     def _details(self, _e=None):
         fid = self.selected()
         if fid is not None:
@@ -14351,6 +15046,11 @@ class RemoteTab(BaseTab):
                 self.tree.selection_set(iid)
                 self.tree.see(iid)
 
+    def inspect_target(self):
+        sel = self.tree.selection()
+        ip = key_for_iid(self.iids, sel[0]) if sel else None
+        return ("remote", ip) if ip else None
+
     def _details(self, _e=None):
         sel = self.tree.selection()
         if sel:
@@ -14484,6 +15184,11 @@ class AlertsTab(BaseTab):
             a = self.model.alerts.alerts.get(aid)
             if a:
                 self.upsert(a)
+
+    def inspect_target(self):
+        sel = self.tree.selection()
+        aid = key_for_iid(self.iids, sel[0]) if sel else None
+        return ("alert", aid) if aid else None
 
     def selected(self):
         out = []
@@ -16090,12 +16795,24 @@ class PacketsTab(BaseTab):
                 w.insert("end", f"<cannot show: {e}>")
             w.config(state="disabled")
 
+    def inspect_target(self):
+        d = self._selected_row()
+        if d and d.get("flow_id"):
+            return ("flow", d["flow_id"])
+        return None
+
     def select_no(self, no):
         iid = self.iid_by_no.get(no)
+        if iid is None and any(d["no"] == no for d in self.app.all_rows):
+            self.follow_var.set(False)
+            self.clear_filter()
+            iid = self.iid_by_no.get(no)
         if iid:
             with contextlib.suppress(tk.TclError):
                 self.tree.selection_set(iid)
                 self.tree.see(iid)
+            return True
+        return False
 
     def _context(self, event):
         iid = self.tree.identify_row(event.y)
@@ -16590,8 +17307,10 @@ class MiniWireshark:
                                    state="disabled")
         self.stop_btn.pack(side="left", padx=6)
 
-        self.nb = ttk.Notebook(self.root)
-        self.nb.pack(fill="both", expand=True, padx=12, pady=(6, 4))
+        self.body = ttk.PanedWindow(self.root, orient="horizontal")
+        self.body.pack(fill="both", expand=True, padx=12, pady=(6, 4))
+        self.nb = ttk.Notebook(self.body)
+        self.body.add(self.nb, weight=4)
         self.nb.enable_traversal()
         self.tabs = OrderedDict()
         for cls in (DashboardTab, FeedTab, TimelineTab, DevicesTab,
@@ -16601,14 +17320,30 @@ class MiniWireshark:
             self.tabs[cls.name] = tab
             self.nb.add(tab.frame, text=tr(cls.label_key))
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self.inspector = Inspector(self, self.body)
+        self.inspector_visible = False
+        if self.config.get("appearance.inspector", True):
+            self.body.add(self.inspector.frame, weight=1)
+            self.inspector_visible = True
+        self._bind_inspector()
         self._apply_ui_mode()
 
         self.status_var = tk.StringVar(
             value="Getting ready — I'll pick a network card and start "
                   "watching automatically.")
-        tk.Label(self.root, textvariable=self.status_var, anchor="w",
+        status = tk.Frame(self.root, bg="#e3e6eb")
+        status.pack(side="bottom", fill="x", before=self.body)
+        tk.Label(status, textvariable=self.status_var, anchor="w",
                  fg="#222222", bg="#e3e6eb", padx=10, pady=4).pack(
-            side="bottom", fill="x")
+            side="left", fill="x", expand=True)
+        self.footer_var = tk.StringVar(value="")
+        foot = tk.Label(status, textvariable=self.footer_var, anchor="e",
+                        fg="#666666", bg="#e3e6eb", padx=10, pady=4,
+                        cursor="hand2")
+        foot.pack(side="right")
+        foot.bind("<Button-1>", lambda e: self.open_coverage())
+        Tooltip(foot, "What this computer can and can't see. Click for "
+                      "the full coverage report.")
         self._restyle_mode_banner()
 
     def _on_tab_changed(self, _e=None):
@@ -16976,6 +17711,138 @@ class MiniWireshark:
         fill()
         return win
 
+    # ---- truth UI (inspector, coverage) --------------------------------------
+    def inspect(self, kind, key):
+        if not self.inspector_visible:
+            self.toggle_inspector(True)
+        self.inspector.show(kind, key)
+
+    def toggle_inspector(self, show=None, _e=None):
+        show = (not self.inspector_visible) if show is None else bool(show)
+        try:
+            if show and not self.inspector_visible:
+                self.body.add(self.inspector.frame, weight=1)
+            elif not show and self.inspector_visible:
+                self.body.forget(self.inspector.frame)
+        except tk.TclError:
+            return
+        self.inspector_visible = show
+        self.config.set("appearance.inspector", show)
+        self.config.save()
+
+    def jump_to_packet(self, no):
+        """Open the Packets tab on packet `no` (the proof behind a claim)."""
+        if self.beginner_mode:
+            self.mode_ui_var.set("Advanced")
+            self._on_ui_mode_change()
+        tab = self._select_tab("packets")
+        if tab.select_no(no):
+            return True
+        self._set_banner(f"Packet #{no} is no longer in memory (only the "
+                         f"newest {self.max_rows} are kept). Turn on the "
+                         f"packet history in Settings → History to keep "
+                         f"older packets on disk.", kind="warn")
+        return False
+
+    def _bind_inspector(self):
+        def handler(tab):
+            def on_select(_e=None):
+                tgt = tab.inspect_target()
+                if tgt and self.inspector_visible:
+                    self.inspector.show(*tgt)
+            return on_select
+        for tab in self.tabs.values():
+            if hasattr(tab, "inspect_target") and hasattr(tab, "tree"):
+                tab.tree.bind("<<TreeviewSelect>>", handler(tab), add="+")
+
+    def coverage(self):
+        return coverage_rows(self.model, self.data_mode, self.active_mode())
+
+    def open_coverage(self):
+        m = self.model
+        v = m.vantage.classify(offline=self.data_mode in ("offline",
+                                                          "session"))
+        head, text = VANTAGE_TEXT[v]
+        sections = [("From this computer", f"{head}. {text}\n\nShare of "
+                     f"traffic between OTHER devices: "
+                     f"{m.vantage.share_third() * 100:.1f}% "
+                     f"({m.vantage.frames} frames measured).")]
+        for q, a, lvl, why in self.coverage():
+            sections.append((f"{LEVEL_GLYPH[lvl]} {q}", f"{a}\n{why}"))
+        spots = blind_spots(m, self.data_mode, self.active_mode())
+        if spots:
+            sections.append(("Blind spots right now",
+                             "\n".join(f"• {s}" for s in spots)))
+        sections.append(("How to see more",
+                         "• Connect your Pi-hole or AdGuard Home (Settings → "
+                         "Sources) to see every device's lookups.\n"
+                         "• A managed switch with a mirror port shows "
+                         "everything on the wire.\n"
+                         "• Not seeing something never means it didn't "
+                         "happen."))
+        DetailDialog(self, "What can I see from here?", sections,
+                     size="680x560")
+
+    def footer_text(self):
+        v = self.model.vantage.classify(
+            offline=self.data_mode in ("offline", "session"))
+        spots = blind_spots(self.model, self.data_mode, self.active_mode())
+        return (f"{VANTAGE_TEXT[v][0]}"
+                f"{' · blind spots: ' + str(len(spots)) if spots else ''}"
+                f"  ·  ◉ observed ◎ correlated ◌ inferred ? unknown  "
+                f"·  F2 inspector")
+
+    # ---- what changed --------------------------------------------------------
+    def _digest(self, period):
+        secs = CHANGE_PERIODS.get(period, 3600)
+        now = self.model.now()
+        since = (self.model.metrics.first_ts or self.session_started) \
+            if secs is None else now - secs
+        store = self.history if self.data_mode in ("live", "idle") else None
+        return change_digest(self.model, store, since, now)
+
+    def changes_summary_short(self):
+        try:
+            dg = self._digest("Last hour")
+        except Exception:                            # noqa: BLE001
+            LOG.exception("change digest")
+            return "—"
+        return digest_summary(dg) + "  (click for details)"
+
+    def open_changes(self, period="Last hour"):
+        dg = self._digest(period)
+        name = self.short_device_name
+
+        def lines(items, fmt):
+            return "\n".join(fmt(*it) for it in items[-40:]) or "—"
+        sections = [
+            ("Summary", f"{digest_summary(dg)}\nPeriod: "
+                        f"{fmt_clock(dg['since'], True)} → "
+                        f"{fmt_clock(dg['until'], True)}"
+                        + (f"\nIncludes {dg['from_store']} events from "
+                           f"earlier sessions (history)." if dg["from_store"]
+                           else "")),
+            ("New devices", lines(dg["new_devices"], lambda t, k, n:
+                                  f"{fmt_clock(t)}  {n}")),
+            ("New websites (first seen)", lines(
+                dg["new_sites"], lambda t, r, devs, a:
+                f"{fmt_clock(t)}  {r}" + (f" — {', '.join(name(d) for d in devs)}"
+                                          if devs else "")
+                + (f" ({ASSOC_SHORT.get(a, '')})" if a else ""))),
+            ("Came back / went offline", lines(
+                dg["returned"] + dg["left"], lambda t, d, x:
+                f"{fmt_clock(t)}  {x}")),
+            ("Address and DNS changes", lines(
+                dg["ip_changes"] + dg["dns_changes"], lambda t, d, x:
+                f"{fmt_clock(t)}  {x}")),
+            ("Network events", lines(dg["network"], lambda t, d, x:
+                                     f"{fmt_clock(t)}  {x}")),
+            ("Warnings", lines(dg["alerts"], lambda t, sev, x:
+                               f"{fmt_clock(t)}  {sev}: {x}")),
+        ]
+        DetailDialog(self, f"What changed — {period.lower()}", sections,
+                     size="700x600")
+
     def _toggle_active_scanning(self):
         cur = self.config.get("mode.active_scanning", True)
         prof = self.network_profile
@@ -17066,6 +17933,9 @@ class MiniWireshark:
         for tab in self.tabs.values():
             with contextlib.suppress(tk.TclError):
                 tab.on_theme()
+        if hasattr(self, "inspector"):
+            self.inspector.on_theme()
+            self.inspector.refresh()
         self._restyle_mode_banner()
         for tab in self.tabs.values():
             if tab.is_visible():
@@ -17327,6 +18197,7 @@ class MiniWireshark:
             "export": lambda e=None: self._open_export_menu(),
             "find": self._focus_search,
             "undo": self._undo_shortcut,
+            "inspector": lambda e=None: self.toggle_inspector(),
         }
         shortcuts = self.config.data.get("shortcuts", DEFAULT_SHORTCUTS)
         for name, seq in shortcuts.items():
@@ -17967,6 +18838,13 @@ class MiniWireshark:
             self.status_var.set(f"\U0001F4C2 Reading {self.data_label}: "
                                 f"{self.importer.count} packets so far "
                                 f"({self.count} analysed)…")
+        with contextlib.suppress(tk.TclError, AttributeError):
+            self.footer_var.set(self.footer_text())
+        if self.inspector_visible and getattr(self, "_insp_tick", 0) % 5 \
+                == 0:
+            with contextlib.suppress(tk.TclError):
+                self.inspector.refresh()
+        self._insp_tick = getattr(self, "_insp_tick", 0) + 1
         self.root.after(1000, self._tick_status)
 
     def status_text(self):
@@ -22789,6 +23667,73 @@ def _golden_identity(model):
 
 GOLDEN_EXTRA.append(_golden_identity)
 
+@self_test()
+def t_vantage_meter(ctx):
+    vm = VantageMeter()
+    me = {"aa:aa:aa:aa:aa:01"}
+    base = {"multicast": False, "src_ip": "", "dst_ip": ""}
+    for i in range(400):
+        vm.note(dict(base, src_mac="aa:aa:aa:aa:aa:01",
+                     dst_mac="bb:bb:bb:bb:bb:01"), me, set())
+    assert vm.classify() == "endpoint"
+    for i in range(3000):
+        vm.note(dict(base, src_mac="cc:cc:cc:cc:cc:01",
+                     dst_mac="bb:bb:bb:bb:bb:01"), me, set())
+    assert vm.classify() == "mirror", vm.share_third()
+    assert vm.classify(offline=True) == "file"
+    assert VantageMeter().classify() == "unknown"
+
+
+@self_test()
+def t_claims_and_coverage(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    frames = ctx.frames()
+    sb = ScenarioBuilder(t0=frames[-1][1] + 1)
+    # traffic addressed to a device that never sends anything itself
+    sb._emit(Ether(src=ScenarioBuilder.ME[1], dst="00:11:22:33:44:99") /
+             IP(src=ScenarioBuilder.ME[0], dst="192.168.1.99") /
+             UDP(sport=5000, dport=9) / Raw(b"x" * 20))
+    m = scenario_model(ctx.cfg(), frames + sb.frames)
+    S = ScenarioBuilder
+    ph = m.registry.by_key[S.PHONE[1]]
+    claims = device_claims(m, ph)
+    by = {c[0]: c for c in claims}
+    assert by["Is on your network"][2] == LV_OBSERVED
+    assert by["Name"][2] == LV_OBSERVED and "DHCP" in by["Name"][3]
+    assert by["Kind of device"][2] == LV_INFERRED
+    obs = m.observations_for(ph.key, by["Name"][4])
+    assert obs and all(o[5] for o in obs)
+    heard = m.registry.by_key.get("00:11:22:33:44:99")
+    assert heard is not None and heard.packets_out == 0
+    assert device_claims(m, heard)[0][2] == LV_INFERRED
+    for dv in m.registry.by_key.values():
+        for c in device_claims(m, dv):
+            assert c[2] in LEVEL_GLYPH, c
+    rows = coverage_rows(m, "live", active=False)
+    assert rows and all(r[2] in LEVEL_GLYPH for r in rows)
+    assert any("https" in r[0] or "Full web" in r[0] for r in rows)
+    assert "Silent devices (Quiet Mode sends no probes)" in \
+        blind_spots(m, "live", active=False)
+
+
+@self_test()
+def t_change_digest(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    dg = change_digest(m, None, 0.0)
+    S = ScenarioBuilder
+    keys = {k for _t, k, _n in dg["new_devices"]}
+    assert S.PHONE[1] in keys and S.LAPTOP[1] in keys
+    assert S.ME[1] not in keys and S.GW[1] not in keys
+    roots = {r for _t, r, _d, _a in dg["new_sites"]}
+    assert {"example.com", "example.net", "example.org"} <= roots, roots
+    assert digest_summary(dg).startswith(f"{len(keys)} new devices")
+    late = change_digest(m, None, ctx.frames()[-30][1])
+    assert {k for _t, k, _n in late["new_devices"]} == {S.LAPTOP[1]}, late
+    assert digest_summary(change_digest(m, None, 9e12)) == "Nothing new."
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -23050,6 +23995,59 @@ def _gs_corrections(app, ctx):
     app.undo_last_correction()
     assert reg.by_key[tv].alias == ""
     assert not (app.known.get(tv) or {}).get("alias")
+    app.data_mode = "idle"
+
+
+@gui_test_step("inspector, proof chips, coverage and changes")
+def _gs_truth(app, ctx):
+    root = app.root
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "live"
+    sink = app.lossless_sink()
+    for raw, _ts, lt in ctx.frames():
+        sink(raw, time.time(), lt)
+    _gui_pump(root, 0.3, lambda: not len(app.ring) and not app.worker.busy,
+              timeout=30)
+    _gui_pump(root, 0.3)
+    S = ScenarioBuilder
+    app.toggle_inspector(True)
+    dt = app._select_tab("devices")
+    dt.rebuild()
+    dt.select(S.PHONE[1])
+    _gui_pump(root, 0.1)
+    assert app.inspector.current == ("device", S.PHONE[1]), \
+        app.inspector.current
+    assert "Alex-iPhone" in app.inspector.title_var.get()
+    body = app.inspector.txt.get("1.0", "end")
+    assert "proof:" in body and "#" in body, body[:400]
+    no = next(o[5] for o in app.model.observations_for(S.PHONE[1])
+              if o[5])
+    assert app.jump_to_packet(no), "proof chip did not open its packet"
+    sel = app.tabs["packets"]._selected_row()
+    assert sel and sel["no"] == no
+    for kind, key in (("website", "www.example.com"),
+                      ("remote", "93.184.215.14"),
+                      ("flow", next(iter(app.model.flows.by_id))),
+                      ("alert", next(iter(app.model.alerts.order)))):
+        app.inspect(kind, key)
+        assert app.inspector.current == (kind, key)
+        assert app.inspector.txt.get("1.0", "end").strip()
+    app.toggle_inspector()
+    assert not app.inspector_visible
+    app.toggle_inspector()
+    assert app.inspector_visible
+    app.open_coverage()
+    app.open_changes("Last hour")
+    _gui_pump(root, 0.2)
+    for w in root.winfo_children():
+        if isinstance(w, tk.Toplevel):
+            w.destroy()
+    assert "◉" in app.footer_text()
+    app.mode_ui_var.set("Beginner")
+    app._on_ui_mode_change()
     app.data_mode = "idle"
 
 
