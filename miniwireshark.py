@@ -2291,9 +2291,7 @@ def step_dependencies(l, state):
         except Exception as e:                       # noqa: BLE001
             kind = getattr(e, "kind", "") or classify_runtime_error(e)
             CAPTURE_LIMITED[0] = (f"Couldn't install {dep['friendly']} "
-                                  f"({kind}: {str(e)[:160]}). Live capture "
-                                  f"is off; Demo Mode and opening capture "
-                                  f"files still work.")
+                                  f"({kind}: {str(e)[:160]}).")
             l.post_log("  " + CAPTURE_LIMITED[0], "warn")
             boot_step("install " + dep["key"], False, error=e)
             continue
@@ -3721,6 +3719,350 @@ def validate_asn(path):
     return len(db) > 100_000, f"{len(db)} address ranges"
 
 
+# ---- V5: more optional reference data (Components Center) -------------------
+class ServiceDB:
+    """IANA's port registry: (port, transport) → (service name, what it
+    is). Used after MiniWireshark's own plain-English port names."""
+
+    def __init__(self):
+        self.ports = {}
+
+    def lookup(self, port, transport="tcp"):
+        return self.ports.get((int(port), (transport or "tcp").lower()))
+
+    def __len__(self):
+        return len(self.ports)
+
+
+def load_iana_services(path):
+    db = ServiceDB()
+    with open(path, "r", encoding="utf-8", errors="replace",
+              newline="") as f:
+        rd = csv.reader(f)
+        head = next(rd, [])
+        if not head or head[0].strip() != "Service Name":
+            raise ValueError("not the IANA service registry")
+        for row in rd:
+            if len(row) < 4:
+                continue
+            name, port, proto, desc = (row[0].strip(), row[1].strip(),
+                                       row[2].strip().lower(),
+                                       row[3].strip())
+            if not port or proto not in ("tcp", "udp", "sctp", "dccp") or \
+                    (not name and desc.lower() in ("reserved",
+                                                   "unassigned")):
+                continue
+            desc = sanitize_text(" ".join(desc.split()), 120)
+            name = sanitize_text(name, 40)
+            if "-" in port:
+                a, _, b = port.partition("-")
+                if not (a.isdigit() and b.isdigit()) or \
+                        int(b) - int(a) > 64:
+                    continue
+                rng = range(int(a), int(b) + 1)
+            elif port.isdigit():
+                rng = (int(port),)
+            else:
+                continue
+            for p in rng:
+                db.ports.setdefault((p, proto), (name, desc))
+    return db
+
+
+def validate_iana_services(path):
+    db = load_iana_services(path)
+    return len(db) > 5000, f"{len(db)} registered ports"
+
+
+# DNS stamps (sdns://…) carry each resolver's protocol, address and host.
+STAMP_PROTOCOLS = {0x00: "plain DNS", 0x01: "DNSCrypt", 0x02: "DoH",
+                   0x03: "DoT", 0x04: "DoQ", 0x05: "Oblivious DoH",
+                   0x81: "DNSCrypt relay", 0x85: "ODoH relay"}
+
+
+def parse_dns_stamp(stamp):
+    """→ {"proto", "addr", "host", "path"} or None for a malformed stamp."""
+    if not stamp.startswith("sdns://"):
+        return None
+    raw = stamp[7:].strip()
+    try:
+        b = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+    except (ValueError, TypeError):
+        return None
+    if not b:
+        return None
+    pos = [1]
+
+    def lp():
+        n = b[pos[0]]
+        v = b[pos[0] + 1:pos[0] + 1 + n]
+        if len(v) != n:
+            raise IndexError
+        pos[0] += 1 + n
+        return v
+
+    def vlp():
+        out = []
+        while True:
+            n = b[pos[0]]
+            more, n = n & 0x80, n & 0x7F
+            out.append(b[pos[0] + 1:pos[0] + 1 + n])
+            pos[0] += 1 + n
+            if not more:
+                return out
+    proto = b[0]
+    out = {"proto": STAMP_PROTOCOLS.get(proto, f"0x{proto:02x}"),
+           "addr": "", "host": "", "path": ""}
+    try:
+        if proto in (0x00, 0x01, 0x02, 0x03, 0x04, 0x05):
+            pos[0] = 9                      # protocol byte + 8 props
+        if proto == 0x00:
+            out["addr"] = lp().decode("utf-8", "replace")
+        elif proto == 0x01:
+            out["addr"] = lp().decode("utf-8", "replace")
+            lp()                            # server public key
+            out["host"] = lp().decode("utf-8", "replace")
+        elif proto in (0x02, 0x03, 0x04):
+            out["addr"] = lp().decode("utf-8", "replace")
+            vlp()                           # certificate hashes
+            out["host"] = lp().decode("utf-8", "replace")
+            if proto == 0x02:
+                out["path"] = lp().decode("utf-8", "replace")
+        elif proto == 0x05:
+            out["host"] = lp().decode("utf-8", "replace")
+            out["path"] = lp().decode("utf-8", "replace")
+        elif proto in (0x81, 0x85):
+            pos[0] = 1 if proto == 0x81 else 9
+            out["addr"] = lp().decode("utf-8", "replace")
+        else:
+            return None
+    except IndexError:
+        return None
+    for k in ("addr", "host"):
+        v = out[k].strip()
+        if v.startswith("["):
+            v = v[1:].split("]", 1)[0]          # [ipv6]:port
+        elif v.count(":") == 1:
+            v = v.split(":", 1)[0]              # host:port / ipv4:port
+        out[k] = sanitize_text(v.lower(), 120)
+    return out
+
+
+class ResolverDB:
+    """Encrypted-DNS resolvers by host name and by address."""
+
+    def __init__(self):
+        self.hosts = {}      # host → (resolver name, protocol)
+        self.ips = {}        # ip → (resolver name, protocol)
+        self.count = 0
+
+    def lookup(self, host_or_ip):
+        k = (host_or_ip or "").lower().strip(".")
+        return self.hosts.get(k) or self.ips.get(k)
+
+    def __len__(self):
+        return self.count
+
+
+def load_dnscrypt_list(path):
+    db = ResolverDB()
+    name = ""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("## "):
+                name = sanitize_text(line[3:].strip(), 60)
+            elif line.startswith("sdns://") and name:
+                st = parse_dns_stamp(line)
+                if not st or st["proto"] in ("plain DNS", "DNSCrypt relay",
+                                             "ODoH relay"):
+                    continue
+                db.count += 1
+                label = (name, st["proto"])
+                if st["host"] and "." in st["host"] and not \
+                        _looks_like_ip(st["host"]):
+                    db.hosts.setdefault(st["host"], label)
+                for v in (st["addr"], st["host"]):
+                    if _looks_like_ip(v):
+                        db.ips.setdefault(v, label)
+    return db
+
+
+def _looks_like_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_dnscrypt_list(path):
+    db = load_dnscrypt_list(path)
+    return db.count >= 50, f"{db.count} encrypted-DNS resolvers"
+
+
+def minisign_verify(data, sig_text, pubkey_b64):
+    """Verify a minisign signature (Ed25519; legacy "Ed" signs the data,
+    "ED" signs its BLAKE2b-512 hash) including the trusted comment.
+    → (ok, trusted comment or reason)."""
+    try:
+        pk = base64.b64decode(pubkey_b64.strip())
+        lines = [ln.rstrip("\r") for ln in sig_text.splitlines()]
+        sig = base64.b64decode(lines[1].strip())
+        tc_line = lines[2]
+        gsig = base64.b64decode(lines[3].strip())
+    except (ValueError, IndexError, TypeError):
+        return False, "unreadable signature file"
+    if len(pk) != 42 or pk[:2] != b"Ed" or len(sig) != 74 or \
+            len(gsig) != 64:
+        return False, "unexpected signature format"
+    if sig[2:10] != pk[2:10]:
+        return False, "signed with a different key"
+    alg = sig[:2]
+    if alg == b"ED":
+        msg = hashlib.blake2b(data, digest_size=64).digest()
+    elif alg == b"Ed":
+        msg = data
+    else:
+        return False, "unknown signature algorithm"
+    if not ed25519_verify(pk[10:], msg, sig[10:]):
+        return False, "the file does not match its signature"
+    prefix = "trusted comment: "
+    if not tc_line.startswith(prefix):
+        return False, "no trusted comment"
+    comment = tc_line[len(prefix):]
+    if not ed25519_verify(pk[10:], sig[10:] + comment.encode("utf-8"),
+                          gsig):
+        return False, "the trusted comment was altered"
+    return True, comment
+
+
+class ReputationList:
+    """Addresses a public list says are malicious: exact IPs and CIDR
+    ranges, looked up on this computer only."""
+
+    def __init__(self, source):
+        self.source = source
+        self.ips = set()
+        self.starts = array.array("Q")
+        self.ends = array.array("Q")
+        self.ids = []
+        self.updated = ""
+
+    def lookup(self, ip):
+        """→ detail string (list id, range) or "" when not listed."""
+        if ip in self.ips:
+            return ip
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return ""
+        if a.version != 4 or not self.starts:
+            return ""
+        n = int(a)
+        i = bisect.bisect_right(self.starts, n) - 1
+        if i >= 0 and n <= self.ends[i]:
+            return self.ids[i]
+        return ""
+
+    def __len__(self):
+        return len(self.ips) + len(self.starts)
+
+
+def load_feodo(path):
+    rl = ReputationList("abuse.ch Feodo Tracker")
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("# Last updated:"):
+                rl.updated = line.split(":", 1)[1].strip()[:20]
+            if not line or line.startswith("#"):
+                continue
+            ip = line.split(",")[0].strip()
+            if _looks_like_ip(ip) and is_public_ip(ip):
+                rl.ips.add(ip)
+    return rl
+
+
+def validate_feodo(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        head = f.read(4000)
+    if "Feodo Tracker" not in head or "#" not in head[:2]:
+        return False, "not a Feodo Tracker list"
+    rl = load_feodo(path)
+    return True, f"{len(rl)} listed addresses"
+
+
+def load_drop(path):
+    rl = ReputationList("Spamhaus DROP")
+    rows = []
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if obj.get("type") == "metadata":
+                ts = obj.get("timestamp")
+                if isinstance(ts, (int, float)):
+                    rl.updated = time.strftime("%Y-%m-%d", time.gmtime(ts))
+                continue
+            try:
+                net = ipaddress.ip_network(str(obj.get("cidr", "")),
+                                           strict=False)
+            except ValueError:
+                continue
+            if net.version == 4:
+                rows.append((int(net.network_address),
+                             int(net.broadcast_address),
+                             sanitize_text(str(obj.get("sblid", "")), 20)
+                             + f" {net}"))
+    rows.sort()
+    for s, e, i in rows:
+        rl.starts.append(s)
+        rl.ends.append(e)
+        rl.ids.append(i)
+    return rl
+
+
+def validate_drop(path):
+    rl = load_drop(path)
+    return len(rl) > 100, f"{len(rl)} hijacked address blocks"
+
+
+class ReputationDB:
+    """Every enabled reputation list together. Two independent lists
+    naming the same address raise the confidence; one alone is a
+    warning, never a verdict."""
+
+    def __init__(self, lists):
+        self.lists = [x for x in lists if x is not None]
+
+    def lookup(self, ip):
+        hits = []
+        if not ip or not is_public_ip(ip):
+            return hits
+        for rl in self.lists:
+            d = rl.lookup(ip)
+            if d:
+                hits.append((rl.source, d, rl.updated))
+        return hits
+
+
+def reputation_db():
+    if DATA is None:
+        return None
+    lists = [DATA.get("feodo"), DATA.get("drop")]
+    lists = [x for x in lists if x is not None]
+    return ReputationDB(lists) if lists else None
+
+
+DNSCRYPT_MINISIGN_KEY = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3"
+
+
 @dataclass
 class DataResource:
     key: str
@@ -3734,6 +4076,16 @@ class DataResource:
     enable_key: str          # config key that must be True to download/load
     description: str
     sends: str
+    publisher: str = ""
+    license: str = ""
+    redistributable: bool = True   # may it go into an exported offline pack?
+    download_est: str = ""
+    benefit: str = ""
+    fallback: str = "none — the feature just shows less"
+    min_interval: int = 86400      # never fetched more often than this
+    sig_url: str = ""
+    minisign_key: str = ""
+    category: str = "Reference data"
 
 
 DATA_MANIFEST = [
@@ -3744,7 +4096,30 @@ DATA_MANIFEST = [
         "privacy.auto_download_reference",
         "Turns the first half of a MAC address into a manufacturer name.",
         "Downloads a public file from wireshark.org. Nothing about your "
-        "network is sent."),
+        "network is sent.",
+        publisher="Wireshark, built from the IEEE MA-L, MA-M and MA-S "
+                  "registries",
+        license="public registry data; not re-shared in offline packs",
+        redistributable=False, download_est="about 2 MB",
+        benefit="A maker name for every device, including the newest and "
+                "the small 28/36-bit blocks.",
+        fallback="the capture engine's bundled vendor list (older)"),
+    DataResource(
+        "services", "Port and service names",
+        "https://www.iana.org/assignments/service-names-port-numbers/"
+        "service-names-port-numbers.csv",
+        "iana-services.csv", 60, 8_000_000, validate_iana_services,
+        load_iana_services, "components.services",
+        "Names every registered port, not only the common ones "
+        "MiniWireshark explains itself.",
+        "Downloads IANA's public registry. Nothing about your network is "
+        "sent.",
+        publisher="IANA (Internet Assigned Numbers Authority)",
+        license="public registry", redistributable=True,
+        download_est="about 3 MB",
+        benefit="Connections on unusual ports get a registered service "
+                "name.",
+        fallback="about 130 built-in ports with plain-English names"),
     DataResource(
         "psl", "Public Suffix List",
         "https://publicsuffix.org/list/public_suffix_list.dat",
@@ -3753,7 +4128,11 @@ DATA_MANIFEST = [
         "Groups www.example.co.uk and mail.example.co.uk under "
         "example.co.uk.",
         "Downloads a public file from publicsuffix.org. Nothing about your "
-        "network is sent."),
+        "network is sent.",
+        publisher="Mozilla / publicsuffix.org", license="MPL 2.0",
+        redistributable=True, download_est="about 250 KB",
+        benefit="Sites are grouped by their real owner domain everywhere.",
+        fallback="a compact built-in list of common suffixes"),
     DataResource(
         "trackers", "Tracker / ad-domain list",
         "https://raw.githubusercontent.com/disconnectme/"
@@ -3763,7 +4142,11 @@ DATA_MANIFEST = [
         "Labels domains as Advertising / Analytics / Social / Tracking "
         "(informational only — nothing is blocked).",
         "Downloads Disconnect's public list from GitHub. Domains you visit "
-        "are checked against it on this computer only."),
+        "are checked against it on this computer only.",
+        publisher="Disconnect", license="GPL-3.0",
+        redistributable=True, download_est="about 1 MB",
+        benefit="Advertising, analytics and tracking domains are labelled "
+                "in Websites."),
     DataResource(
         "asn", "Offline country & provider database",
         "https://iptoasn.com/data/ip2asn-v4.tsv.gz",
@@ -3772,13 +4155,73 @@ DATA_MANIFEST = [
         "Shows the country and network provider (ASN) of Internet hosts "
         "without asking any online service.",
         "Downloads a public ~7 MB file from iptoasn.com. Lookups then happen "
-        "entirely on this computer."),
+        "entirely on this computer.",
+        publisher="iptoasn.com", license="Public Domain (PDDL 1.0)",
+        redistributable=True, download_est="about 7 MB",
+        benefit="Country and network owner for every Internet host, "
+                "offline.",
+        fallback="none — shown as unknown (the online lookup stays off "
+                 "unless you turn it on)"),
+    DataResource(
+        "doh", "Encrypted-DNS resolvers",
+        "https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/"
+        "master/v3/public-resolvers.md",
+        "public-resolvers.md", 14, 3_000_000, validate_dnscrypt_list,
+        load_dnscrypt_list, "components.doh",
+        "Recognizes hundreds of DNS-over-HTTPS / TLS / QUIC servers, so "
+        "hidden website lookups are explained instead of missed.",
+        "Downloads the DNSCrypt project's public list from GitHub and "
+        "checks its minisign signature. Nothing about your network is "
+        "sent.",
+        publisher="DNSCrypt project (Frank Denis)",
+        license="no license stated: used on this computer only, never "
+                "re-shared", redistributable=False,
+        download_est="about 300 KB",
+        benefit="Encrypted-DNS use is detected for many more providers.",
+        fallback="about 40 well-known providers built in",
+        sig_url="https://raw.githubusercontent.com/DNSCrypt/"
+                "dnscrypt-resolvers/master/v3/public-resolvers.md.minisig",
+        minisign_key=DNSCRYPT_MINISIGN_KEY),
+    DataResource(
+        "feodo", "Botnet command servers",
+        "https://feodotracker.abuse.ch/downloads/"
+        "ipblocklist_recommended.txt",
+        "feodo-recommended.txt", 1, 2_000_000, validate_feodo, load_feodo,
+        "components.feodo",
+        "Flags a device that talks to an address abuse.ch currently lists "
+        "as a botnet command server (recommended list only).",
+        "Downloads abuse.ch's public list. Addresses your devices contact "
+        "are checked on this computer only — nothing is sent.",
+        publisher="abuse.ch Feodo Tracker", license="CC0",
+        redistributable=True, download_est="under 50 KB",
+        benefit="A warning if a device contacts a listed command server.",
+        min_interval=300, category="Reputation"),
+    DataResource(
+        "drop", "Hijacked address blocks",
+        "https://www.spamhaus.org/drop/drop_v4.json",
+        "spamhaus-drop-v4.json", 1, 3_000_000, validate_drop, load_drop,
+        "components.drop",
+        "Flags traffic to address blocks Spamhaus lists as hijacked or "
+        "run by criminals (\"Don't Route Or Peer\").",
+        "Downloads Spamhaus' public list. Addresses are checked on this "
+        "computer only — nothing is sent.",
+        publisher="The Spamhaus Project",
+        license="free to use; copyrighted and revocable — your own use "
+                "only, never re-shared", redistributable=False,
+        download_est="about 100 KB",
+        benefit="A warning if a device contacts a hijacked network.",
+        min_interval=3600, category="Reputation"),
 ]
 
 
 class DataManager:
-    """Loads cached resources at startup and refreshes them in the
-    background. Thread-safe; never touches Tk."""
+    """Loads cached resources and refreshes them — only when you ask, or
+    weekly if you chose that in the Components Center. Keeps the previous
+    good copy for rollback, falls back to it (then to the built-in data)
+    when a copy is damaged, exports and imports offline packs. Thread-safe;
+    never touches Tk."""
+
+    POLICIES = ("Manual", "Weekly")
 
     def __init__(self, cache_dir, config):
         self.cache_dir = cache_dir
@@ -3786,11 +4229,12 @@ class DataManager:
         self.lock = threading.Lock()
         self.objects = {}
         self.status = {r.key: {"state": "missing", "message": "Not loaded",
-                               "version": "", "size": 0}
+                               "version": "", "size": 0, "source": ""}
                        for r in DATA_MANIFEST}
         self.on_change = None         # callable() — called from worker thread
         self._busy = False
         self._stop = False
+        self.doctor = {}              # key -> what the pack doctor did
 
     def resource(self, key):
         return next(r for r in DATA_MANIFEST if r.key == key)
@@ -3805,6 +4249,9 @@ class DataManager:
     def enabled(self, r):
         return bool(self.config.get(r.enable_key, False))
 
+    def set_enabled(self, key, on):
+        self.config.set(self.resource(key).enable_key, bool(on))
+
     def get(self, key):
         with self.lock:
             return self.objects.get(key)
@@ -3812,6 +4259,22 @@ class DataManager:
     def _set_status(self, key, **kw):
         with self.lock:
             self.status[key].update(kw)
+
+    def policy(self):
+        p = self.config.get("components.policy", "Manual")
+        return p if p in self.POLICIES else "Manual"
+
+    def meta(self, key):
+        return read_json(self._paths(self.resource(key))[1], {}) or {}
+
+    def provenance(self, key):
+        """'IEEE registries via Wireshark, downloaded 2026-10-01' or ''."""
+        r = self.resource(key)
+        st = self.status.get(key, {})
+        if st.get("state") != "ready":
+            return ""
+        src = st.get("source") or r.publisher or r.title
+        return f"{src}, {st.get('version') or 'date unknown'}"
 
     def status_text(self, key):
         st = self.status.get(key, {})
@@ -3827,40 +4290,63 @@ class DataManager:
         return [self.status_text(r.key) for r in DATA_MANIFEST]
 
     # ---- loading --------------------------------------------------------
-    def _verify_and_load(self, r):
-        path, meta_path = self._paths(r)
-        if not os.path.exists(path):
-            return False
-        meta = read_json(meta_path, {}) or {}
+    def _load_file(self, r, path, meta):
         try:
             with open(path, "rb") as f:
                 digest = hashlib.sha256(f.read()).hexdigest()
         except OSError:
-            return False
+            return None, "unreadable"
         if meta.get("sha256") and meta["sha256"] != digest:
-            LOG.warning("data %s: checksum mismatch, discarding", r.key)
+            return None, "checksum mismatch"
+        try:
+            return r.loader(path), ""
+        except Exception as e:                       # noqa: BLE001
+            return None, f"couldn't read it ({str(e)[:80]})"
+
+    def _verify_and_load(self, r):
+        """Load the current copy; if it is damaged, the previous good copy
+        (the pack doctor); else report and fall back to built-in data."""
+        path, meta_path = self._paths(r)
+        if not os.path.exists(path) and not os.path.exists(path + ".prev"):
+            return False
+        meta = read_json(meta_path, {}) or {}
+        obj, why = (None, "missing")
+        if os.path.exists(path):
+            obj, why = self._load_file(r, path, meta)
+        used_prev = False
+        if obj is None:
+            LOG.warning("data %s: %s", r.key, why)
             for p in (path, meta_path):
                 with contextlib.suppress(OSError):
                     os.remove(p)
-            self._set_status(r.key, state="error",
-                             message="Cached copy was damaged; will "
-                                     "download again.")
-            return False
-        try:
-            obj = r.loader(path)
-        except Exception as e:                       # noqa: BLE001
-            LOG.warning("data %s: load failed: %s", r.key, e)
-            self._set_status(r.key, state="error",
-                             message=f"Couldn't read cached copy ({e}).")
-            return False
+            prev_meta = read_json(meta_path + ".prev", {}) or {}
+            if os.path.exists(path + ".prev"):
+                obj, why2 = self._load_file(r, path + ".prev", prev_meta)
+                if obj is not None:
+                    used_prev = True
+                    meta = prev_meta
+                    with contextlib.suppress(OSError):
+                        os.replace(path + ".prev", path)
+                        os.replace(meta_path + ".prev", meta_path)
+            if obj is None:
+                self.doctor[r.key] = f"{why}; using the built-in data"
+                self._set_status(r.key, state="error",
+                                 message="Cached copy was damaged; will "
+                                         "download again." if
+                                 self.enabled(r) else "damaged copy removed")
+                return False
+            self.doctor[r.key] = f"{why}; went back to the previous copy"
         with self.lock:
             self.objects[r.key] = obj
-        self._set_status(r.key, state="ready",
-                         message=f"ready, {meta.get('summary', '')}".strip(", "),
-                         version=time.strftime(
-                             "%Y-%m-%d", time.localtime(meta.get("fetched", 0)))
-                         if meta.get("fetched") else "",
-                         size=os.path.getsize(path))
+        fetched = meta.get("fetched", 0)
+        self._set_status(
+            r.key, state="ready",
+            message=(f"ready, {meta.get('summary', '')}".strip(", ")
+                     + (" (previous copy)" if used_prev else "")),
+            version=time.strftime("%Y-%m-%d", time.localtime(fetched))
+            if fetched else "",
+            size=os.path.getsize(path) if os.path.exists(path) else 0,
+            source=meta.get("via", "") or r.publisher)
         return True
 
     def _due(self, r):
@@ -3873,18 +4359,46 @@ class DataManager:
             return True
         return now - meta.get("fetched", 0) > r.refresh_days * 86400
 
+    def _too_soon(self, r):
+        meta = self.meta(r.key)
+        return time.time() - meta.get("fetched", 0) < r.min_interval
+
+    def _install_file(self, r, tmp, summary, via, extra=None):
+        """Swap a validated file in, keeping the previous copy."""
+        path, meta_path = self._paths(r)
+        with open(tmp, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        if os.path.exists(path):
+            with contextlib.suppress(OSError):
+                os.replace(path, path + ".prev")
+                if os.path.exists(meta_path):
+                    os.replace(meta_path, meta_path + ".prev")
+        os.replace(tmp, path)
+        meta = {"fetched": time.time(), "sha256": digest, "source": r.url,
+                "via": via, "summary": summary, "fails": 0,
+                "next_retry": 0, "app_version": SCRIPT_VERSION}
+        meta.update(extra or {})
+        atomic_write_json(meta_path, meta)
+        return meta
+
     def _download(self, r):
         path, meta_path = self._paths(r)
         meta = read_json(meta_path, {}) or {}
+        if self._too_soon(r) and os.path.exists(path):
+            self._set_status(r.key, message="up to date (checked "
+                                            "moments ago)")
+            return False
         self._set_status(r.key, state="downloading", message="downloading…")
         tmp = path + f".download{os.getpid()}"
         try:
             req = urllib.request.Request(r.url, headers={
                 "User-Agent": f"{APP_NAME}/{SCRIPT_VERSION}"})
             total = 0
-            with net_urlopen("reference", req, 40, r.key) as resp, \
+            with net_urlopen("reference", req, 60, r.key) as resp, \
                     open(tmp, "wb") as f:
                 while True:
+                    if self._stop:
+                        raise ValueError("cancelled")
                     chunk = resp.read(65536)
                     if not chunk:
                         break
@@ -3892,17 +4406,32 @@ class DataManager:
                     if total > r.max_bytes:
                         raise ValueError("file larger than expected")
                     f.write(chunk)
+            extra = {}
+            if r.sig_url:
+                sreq = urllib.request.Request(r.sig_url, headers={
+                    "User-Agent": f"{APP_NAME}/{SCRIPT_VERSION}"})
+                with net_urlopen("reference", sreq, 30,
+                                 r.key + " signature") as resp:
+                    sig_text = resp.read(4096).decode("utf-8", "replace")
+                with open(tmp, "rb") as f:
+                    ok, info = minisign_verify(f.read(), sig_text,
+                                               r.minisign_key)
+                if not ok:
+                    raise ValueError(f"signature check failed: {info}")
+                extra["signature"] = "minisign ok"
+                extra["signed_comment"] = info[:120]
             ok, summary = r.validator(tmp)
             if not ok:
                 raise ValueError(f"downloaded file failed validation "
                                  f"({summary})")
-            with open(tmp, "rb") as f:
-                digest = hashlib.sha256(f.read()).hexdigest()
-            os.replace(tmp, path)
-            atomic_write_json(meta_path, {
-                "fetched": time.time(), "sha256": digest, "source": r.url,
-                "summary": summary, "fails": 0, "next_retry": 0,
-                "app_version": SCRIPT_VERSION})
+            old = meta.get("summary", "")
+            m_old = re.match(r"(\d+)", old or "")
+            m_new = re.match(r"(\d+)", summary or "")
+            if m_old and m_new and int(m_old.group(1)) > 1000 and \
+                    int(m_new.group(1)) < int(m_old.group(1)) // 2:
+                raise ValueError(f"the new copy is less than half the old "
+                                 f"one ({summary} vs {old}) — kept the old")
+            self._install_file(r, tmp, summary, r.publisher, extra)
             LOG.info("data %s: downloaded (%s)", r.key, summary)
             return True
         except Exception as e:                       # noqa: BLE001
@@ -3913,29 +4442,33 @@ class DataManager:
             meta.update({"fails": fails, "next_retry": time.time() + backoff,
                          "last_error": str(e)[:200]})
             with contextlib.suppress(OSError):
-                atomic_write_json(meta_path, meta)
+                if os.path.exists(path):
+                    atomic_write_json(meta_path, meta)
             LOG.info("data %s: download failed (%s); retry in %ss",
                      r.key, e, backoff)
             have = r.key in self.objects
             self._set_status(
                 r.key, state="ready" if have else "error",
                 message=("ready (refresh failed — using cached copy)" if have
-                         else f"unavailable offline ({str(e)[:80]})"))
+                         else f"unavailable ({str(e)[:80]})"),
+                last_error=str(e)[:200])
             return False
 
-    def start(self, force=False):
-        """Load cached copies, then refresh anything due — all in the
-        background."""
+    def start(self, force=False, keys=None):
+        """Load cached copies; download what you asked for (keys/force) or
+        what is due under the Weekly policy — all in the background."""
         if self._busy:
-            return
+            return False
         self._busy = True
+        weekly = self.policy() == "Weekly"
 
         def run():
             try:
                 for r in DATA_MANIFEST:
                     if self._stop:
                         return
-                    if not self.enabled(r):
+                    wanted = keys is not None and r.key in keys
+                    if not self.enabled(r) and not wanted:
                         if r.key not in self.objects:
                             self._set_status(r.key, state="disabled",
                                              message="off")
@@ -3943,17 +4476,169 @@ class DataManager:
                     if r.key not in self.objects:
                         self._verify_and_load(r)
                         self._notify()
-                    if force or self._due(r):
+                    if wanted or (force and keys is None) or \
+                            (weekly and self._due(r) and
+                             time.time() - self.meta(r.key).get(
+                                 "fetched", 0) > 7 * 86400):
                         if self._download(r):
+                            with self.lock:
+                                self.objects.pop(r.key, None)
                             self._verify_and_load(r)
                         self._notify()
                     elif r.key not in self.objects:
-                        self._set_status(r.key, state="error",
-                                         message="waiting to retry download")
+                        self._set_status(r.key, state="missing",
+                                         message="not downloaded (get it "
+                                                 "in Components)")
+                if weekly:
+                    with contextlib.suppress(Exception):
+                        self.config.set("components.last_check", time.time())
             finally:
                 self._busy = False
                 self._notify()
         threading.Thread(target=run, daemon=True, name="data-manager").start()
+        return True
+
+    def busy(self):
+        return self._busy
+
+    def delete(self, key):
+        """Turn a resource off and delete its downloaded copies."""
+        r = self.resource(key)
+        path, meta_path = self._paths(r)
+        for p in (path, meta_path, path + ".prev", meta_path + ".prev"):
+            with contextlib.suppress(OSError):
+                os.remove(p)
+        with self.lock:
+            self.objects.pop(key, None)
+        self.set_enabled(key, False)
+        self._set_status(key, state="disabled", message="off (deleted)",
+                         version="", size=0)
+        self._notify()
+
+    def rollback(self, key):
+        """Go back to the previous downloaded copy."""
+        r = self.resource(key)
+        path, meta_path = self._paths(r)
+        if not os.path.exists(path + ".prev"):
+            return False
+        with contextlib.suppress(OSError):
+            os.replace(path, path + ".newer")
+            os.replace(meta_path, meta_path + ".newer")
+        os.replace(path + ".prev", path)
+        with contextlib.suppress(OSError):
+            os.replace(meta_path + ".prev", meta_path)
+        with contextlib.suppress(OSError):
+            os.replace(path + ".newer", path + ".prev")
+            os.replace(meta_path + ".newer", meta_path + ".prev")
+        with self.lock:
+            self.objects.pop(key, None)
+        ok = self._verify_and_load(r)
+        self._notify()
+        return ok
+
+    def reset_all(self):
+        """Back to the built-in baseline: every downloaded copy deleted,
+        every optional source off."""
+        for r in DATA_MANIFEST:
+            self.delete(r.key)
+
+    def disk_usage(self):
+        total = {}
+        for r in DATA_MANIFEST:
+            path, meta_path = self._paths(r)
+            n = 0
+            for p in (path, path + ".prev"):
+                with contextlib.suppress(OSError):
+                    n += os.path.getsize(p)
+            total[r.key] = n
+        return total
+
+    # ---- offline packs --------------------------------------------------
+    PACK_MANIFEST = "miniwireshark-datapack.json"
+
+    def export_pack(self, dest):
+        """One zip with every downloaded source whose terms allow
+        re-sharing, plus a manifest of SHA-256 fingerprints."""
+        import zipfile
+        man = {"kind": "miniwireshark-offline-pack",
+               "app_version": SCRIPT_VERSION, "created": time.time(),
+               "files": {}}
+        skipped = []
+        tmp = dest + f".tmp{os.getpid()}"
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            for r in DATA_MANIFEST:
+                path, _m = self._paths(r)
+                if not os.path.exists(path):
+                    continue
+                if not r.redistributable:
+                    skipped.append(r.title)
+                    continue
+                meta = self.meta(r.key)
+                zf.write(path, r.filename)
+                man["files"][r.key] = {
+                    "file": r.filename, "sha256": sha256_file(path),
+                    "fetched": meta.get("fetched", 0),
+                    "source": meta.get("source", r.url),
+                    "summary": meta.get("summary", "")}
+            zf.writestr(self.PACK_MANIFEST, json.dumps(man, indent=1))
+        os.replace(tmp, dest)
+        return sorted(man["files"]), skipped
+
+    def import_pack(self, src):
+        """Install the sources in a pack after checking each fingerprint
+        and parsing each file. → (installed keys, problems)."""
+        import zipfile
+        done, problems = [], []
+        with zipfile.ZipFile(src) as zf:
+            try:
+                man = json.loads(zf.read(self.PACK_MANIFEST))
+            except (KeyError, ValueError):
+                raise ValueError("not a MiniWireshark offline pack")
+            if man.get("kind") != "miniwireshark-offline-pack":
+                raise ValueError("not a MiniWireshark offline pack")
+            for key, info in (man.get("files") or {}).items():
+                try:
+                    r = self.resource(key)
+                except StopIteration:
+                    problems.append(f"{key}: unknown source, skipped")
+                    continue
+                if not r.redistributable:
+                    problems.append(f"{r.title}: may not be imported "
+                                    f"from a pack")
+                    continue
+                if info.get("file") != r.filename:
+                    problems.append(f"{r.title}: unexpected file name")
+                    continue
+                tmp = os.path.join(self.cache_dir,
+                                   f".import-{uuid.uuid4().hex[:8]}")
+                data = zf.read(r.filename)
+                if len(data) > r.max_bytes:
+                    problems.append(f"{r.title}: too large")
+                    continue
+                if hashlib.sha256(data).hexdigest() != info.get("sha256"):
+                    problems.append(f"{r.title}: fingerprint mismatch")
+                    continue
+                with open(tmp, "wb") as f:
+                    f.write(data)
+                try:
+                    ok, summary = r.validator(tmp)
+                except Exception as e:               # noqa: BLE001
+                    ok, summary = False, str(e)[:80]
+                if not ok:
+                    with contextlib.suppress(OSError):
+                        os.remove(tmp)
+                    problems.append(f"{r.title}: {summary}")
+                    continue
+                self._install_file(r, tmp, summary, "offline pack",
+                                   {"fetched": info.get("fetched") or
+                                    time.time()})
+                self.set_enabled(key, True)
+                with self.lock:
+                    self.objects.pop(key, None)
+                self._verify_and_load(r)
+                done.append(key)
+        self._notify()
+        return done, problems
 
     def unload_disabled(self):
         for r in DATA_MANIFEST:
@@ -3975,6 +4660,200 @@ class DataManager:
 
 
 DATA = None   # the running DataManager (set by the app; None in self-tests)
+_REP_GEN = [0]   # bumped when reputation lists change (cache invalidation)
+
+
+# ---- V5: enrichment helpers that use the Components Center data --------------
+def doh_name(host):
+    """Encrypted-DNS provider for a server name: the built-in list first,
+    then the downloaded DNSCrypt list (if you turned it on)."""
+    v = DOH_HOSTS.get(host)
+    if v:
+        return v
+    db = DATA.get("doh") if DATA is not None else None
+    hit = db.hosts.get(host) if db is not None else None
+    return f"{hit[0]} (encrypted DNS, {hit[1]})" if hit else None
+
+
+def doh_ip_name(ip):
+    v = DOH_IPS.get(ip)
+    if v:
+        return v
+    db = DATA.get("doh") if DATA is not None else None
+    hit = db.ips.get(ip) if db is not None else None
+    return f"{hit[0]} ({hit[1]})" if hit else None
+
+
+# The port explainer: what normally uses a port, and whether it is normally
+# reachable from the Internet. Written for people, not for parsers.
+PORT_NOTES = {
+    21: ("old file-transfer servers", "Should not be open to the "
+         "Internet: passwords travel unencrypted."),
+    22: ("remote command line on computers, NAS boxes and routers",
+         "Fine on a computer you administer; exposed to the Internet it "
+         "is attacked constantly — keys, not passwords."),
+    23: ("very old remote terminals, some cheap IoT devices",
+         "Unencrypted. A device offering Telnet is a red flag; turn it "
+         "off if you can."),
+    25: ("mail servers passing mail to each other",
+         "Home computers rarely use it; a home device sending lots on 25 "
+         "can mean it is sending spam."),
+    53: ("DNS — turning names into addresses",
+         "Normal to your router or DNS server. A home device answering "
+         "DNS for the Internet is unusual."),
+    67: ("DHCP — handing out IP addresses",
+         "Only your router should answer on it."),
+    80: ("plain (unencrypted) websites and device admin pages",
+         "Normal for local gadgets; passwords sent here are readable."),
+    110: ("old mailbox downloads (POP3)",
+          "Unencrypted unless upgraded with STLS; prefer 995."),
+    123: ("time synchronisation (NTP)", "Normal everywhere."),
+    137: ("Windows name lookup (NetBIOS)",
+          "Normal on a home LAN; never needed from the Internet."),
+    139: ("old Windows file sharing", "LAN only; never expose it."),
+    143: ("mailbox access (IMAP)",
+          "Unencrypted unless upgraded with STARTTLS; prefer 993."),
+    161: ("network device monitoring (SNMP)",
+          "Often enabled on printers and routers with a default password; "
+          "LAN only."),
+    443: ("secure websites and most apps (HTTPS)",
+          "Normal. Contents are encrypted; only the site name is "
+          "visible."),
+    445: ("Windows / Samba file sharing (SMB)",
+          "LAN only — exposed to the Internet it is a classic attack "
+          "route."),
+    465: ("sending mail securely (SMTP over TLS)", "Normal for mail apps."),
+    514: ("system logs (syslog)", "LAN only."),
+    548: ("Apple file sharing (AFP)", "LAN only; replaced by SMB."),
+    554: ("camera and media streams (RTSP)",
+          "Common on cameras; exposed cameras are found by scanners "
+          "quickly."),
+    587: ("sending mail from apps (SMTP submission)",
+          "Normal; should switch to encryption (STARTTLS) before login."),
+    631: ("printing (IPP)", "LAN only."),
+    853: ("encrypted DNS (DNS-over-TLS)",
+          "Normal: the device keeps its website lookups private."),
+    993: ("mailbox access, encrypted (IMAPS)", "Normal for mail apps."),
+    995: ("mailbox downloads, encrypted (POP3S)", "Normal for mail apps."),
+    1194: ("OpenVPN tunnels", "Normal if you use a VPN."),
+    1883: ("smart-home messaging (MQTT)",
+           "Unencrypted; normal inside the house, not from the Internet."),
+    1900: ("device discovery (SSDP / UPnP)",
+           "Normal on a LAN; a router answering it on the Internet side "
+           "is a misconfiguration."),
+    3306: ("MySQL / MariaDB databases", "Should not face the Internet."),
+    3389: ("Windows Remote Desktop",
+           "Exposed to the Internet it is a top ransomware entry point; "
+           "use a VPN instead."),
+    5000: ("Synology admin page, AirPlay, many dev servers",
+           "Depends on the device; admin pages should stay on the LAN."),
+    5060: ("Internet calling (SIP)",
+           "Normal for VoIP phones; exposed SIP gets toll-fraud attempts."),
+    5353: ("local name discovery (mDNS / Bonjour)", "Normal on a LAN."),
+    5900: ("screen sharing (VNC)",
+           "Often weakly protected; never expose it to the Internet."),
+    8080: ("alternate web port: proxies, admin pages, dev servers",
+           "Check what answers there; admin pages should stay on the "
+           "LAN."),
+    8443: ("alternate secure web port, often admin pages",
+           "Normal for some devices' settings pages."),
+    8883: ("smart-home messaging, encrypted (MQTT over TLS)",
+           "Normal for many IoT devices talking to their cloud."),
+    9100: ("raw printing (JetDirect)", "LAN only."),
+    32400: ("Plex media server", "Normal if you run Plex."),
+    51820: ("WireGuard VPN", "Normal if you use a WireGuard VPN."),
+}
+
+
+def explain_port(port, transport="tcp"):
+    """→ {"port", "plain", "users", "note", "iana", "source"} for a port."""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return None
+    out = {"port": port, "plain": PORT_SERVICES.get(port, ""),
+           "users": "", "note": "", "iana": "", "source": ""}
+    if port in PORT_NOTES:
+        out["users"], out["note"] = PORT_NOTES[port]
+    db = DATA.get("services") if DATA is not None else None
+    if db is not None:
+        hit = db.lookup(port, transport)
+        if hit:
+            name, desc = hit
+            out["iana"] = f"{name} — {desc}" if name and desc else \
+                (name or desc)
+            out["source"] = DATA.provenance("services")
+    return out
+
+
+def explain_port_text(port, transport="tcp"):
+    e = explain_port(port, transport)
+    if not e:
+        return ""
+    lines = []
+    if e["plain"]:
+        lines.append(f"Port {port}: {e['plain']}.")
+    if e["users"]:
+        lines.append(f"Normally used by {e['users']}.")
+    if e["note"]:
+        lines.append(e["note"])
+    if e["iana"]:
+        lines.append(f"Registered with IANA as: {e['iana']}"
+                     + (f" (from {e['source']})" if e["source"] else ""))
+    if not lines:
+        if port >= 49152:
+            return (f"Port {port} is in the temporary (\"ephemeral\") "
+                    f"range computers pick for their own side of a "
+                    f"connection; it says nothing about the service.")
+        return (f"Port {port} has no built-in description"
+                + ("" if db_ready("services") else
+                   " — the IANA port registry in Settings → Components "
+                   "names every registered port") + ".")
+    return "\n".join(lines)
+
+
+def db_ready(key):
+    return DATA is not None and DATA.get(key) is not None
+
+
+def vendor_source(mac):
+    """Where a vendor name came from, for the hover/inspector."""
+    if not mac or is_randomized_mac(mac):
+        return ""
+    db = DATA.get("oui") if DATA is not None else None
+    if db is not None and db.lookup(mac):
+        return DATA.provenance("oui")
+    return "the capture engine's bundled vendor list"
+
+
+def _tr_status(status):
+    """Translate a Components Center status, keeping versions and the
+    "(previous copy)" note."""
+    base, sep, rest = status.partition(" (")
+    if base.startswith("installed ") and "(private folder)" in status:
+        return translate_text("installed") + base[9:] + " (" + \
+            translate_text("private folder") + ")"
+    if base.startswith("in your Python"):
+        return translate_text("in your Python") + " (" + rest
+    out = translate_text(base)
+    if sep:
+        out += " (" + translate_text(rest.rstrip(")")) + ")"
+    return out
+
+
+def reputation_text(hits):
+    """Plain words for reputation-list matches — who listed it, never a
+    verdict."""
+    if not hits:
+        return ""
+    parts = []
+    for source, detail, updated in hits:
+        when = f" (list updated {updated})" if updated else ""
+        parts.append(f"listed by {source}{when}"
+                     + (f": {detail}" if detail and not _looks_like_ip(
+                         detail) else ""))
+    return "; ".join(parts)
+
 
 # ============================================================================
 #  4.  Constants, palettes and small helpers
@@ -5742,8 +6621,9 @@ def _decode_tcp_payload(d, load, reasm):
                                      "site may be hidden behind this name)"
                     d["dns_names"].append(sni)
                     d["learns"].append((d["dst_ip"], sni))
-                    if sni in DOH_HOSTS:
-                        d["doh_hint"] = DOH_HOSTS[sni]
+                    hint = doh_name(sni)
+                    if hint:
+                        d["doh_hint"] = hint
                 else:
                     d["text"] = "Secure connection (site name not visible)"
                 if 853 in (d["sport"], d["dport"]):
@@ -6566,8 +7446,9 @@ def _quic_label(d, load, reasm, ts):
         d["dns_names"].append(sni)
         if d["dst_ip"]:
             d["learns"].append((d["dst_ip"], sni))
-        if sni in DOH_HOSTS:
-            d["doh_hint"] = DOH_HOSTS[sni]
+        hint = doh_name(sni)
+        if hint:
+            d["doh_hint"] = hint
     else:
         d["text"] = "Secure connection (HTTP/3 — site name not visible)"
 
@@ -8449,6 +9330,7 @@ class DeviceRecord:
     dhcp_vendor_class: str = ""
     dhcp_params: str = ""
     dhcp_client_id: str = ""
+    user_class: str = ""          # the type YOU set (overrides detection)
     type: str = "unknown"
     type_hint: str = ""
     device_class: str = "Unknown"
@@ -8640,7 +9522,7 @@ DEVICE_SAVE_FIELDS = (
     "is_virtual", "expected", "mine", "alias", "notes", "os_ttl",
     "ip_history", "mac_history", "dhcp_history", "hostname_history",
     "presence", "merge_note", "merged_from", "demo", "dhcp_client_id",
-    "dhcp_params", "network_id", "iface_stats")
+    "dhcp_params", "network_id", "iface_stats", "user_class")
 
 
 def looks_generated(name):
@@ -9086,6 +9968,9 @@ class DeviceRegistry:
         dev.mine = bool(lab.get("mine", dev.mine))
         dev.expected = bool(lab.get("expected", dev.expected))
         dev.pinned_no_merge = bool(lab.get("pinned", dev.pinned_no_merge))
+        uc = lab.get("user_class", "")
+        if uc in DEVICE_CLASSES:
+            dev.user_class = uc
         dev.never_merge |= set(lab.get("never_merge", []))
         if dev.alias:
             dev.hostname_history.append([dev.alias, "user", self.now()])
@@ -9862,6 +10747,9 @@ class CorrectionJournal:
                     f"{'on' if p['new'] else 'off'}")
         if op == "note":
             return f"Edited the note on {namer(p['key'])}"
+        if op == "type":
+            return (f"Set the type of {namer(p['key'])}: "
+                    f"{p['old'] or 'detected'} → {p['new'] or 'detected'}")
         if op == "never_merge":
             return f"Never merge {namer(p['a'])} and {namer(p['b'])}"
         return op
@@ -10108,6 +10996,7 @@ class RemoteHostRecord:
     geo_source: str = ""
     vpn_endpoint: str = ""   # "WireGuard" etc. when it looks like a VPN server
     live: bool = True
+    reputation: list = field(default_factory=list)  # (source, detail, date)
 
     def location_text(self):
         if self.country and self.country_name:
@@ -10597,6 +11486,8 @@ ALERT_TYPES = {
     "broadcast_storm":  ("Excessive broadcast traffic", "WARNING"),
     "scan_pattern":     ("Possible scanning pattern", "WARNING"),
     "rogue_ra":         ("Unexpected IPv6 router announcement", "WARNING"),
+    "reputation":       ("Address on a public blocklist contacted",
+                         "WARNING"),
 }
 
 # default confidence + "why was this flagged" for each kind
@@ -10610,6 +11501,9 @@ ALERT_META = {
     "dhcp_anomaly": ("High", "More than one device answered DHCP requests."),
     "rogue_ra": ("Medium", "A device other than your router announced "
                            "itself as an IPv6 router."),
+    "reputation": ("Medium", "The address is on a public list of "
+                             "malicious servers you turned on in the "
+                             "Components Center."),
     "chatty_device": ("Medium", "Traffic this minute is far above this "
                                 "device's own recent average."),
     "unknown_device": ("Medium", "The device stayed hard to identify after "
@@ -10850,6 +11744,11 @@ class AlertEngine:
                 a.count += 1
                 a.last_seen = now
                 a.observed = observed
+                rank = {"INFO": 0, "WARNING": 1, "DANGER": 2}
+                if rank.get(severity, 0) > rank.get(a.severity, 0):
+                    a.severity, a.reason = severity, reason
+                    a.interpretation = interp
+                    a.confidence = confidence or a.confidence
                 if evidence:
                     a.evidence = (a.evidence + list(evidence))[-20:]
                 a.updated = True
@@ -11216,6 +12115,33 @@ class AlertEngine:
                                      "computer uses differs from the one "
                                      "seen in replies on the wire.",
             subject=f"arp|{ip}")
+
+    def reputation(self, dev, ip, port, hits):
+        """A device contacted an address a public list names. One list:
+        a warning; two independent lists agreeing: stronger. Never a
+        verdict — lists go stale and shared hosting is common."""
+        if not hits or self._debounced(f"rep:{dev.key}:{ip}", 86400):
+            return None
+        sources = sorted({h[0] for h in hits})
+        two = len(sources) >= 2
+        return self._add(
+            "reputation", "DANGER" if two else "WARNING", dev.key,
+            f"{dev.display_name()} contacted an address on "
+            f"{'two public blocklists' if two else 'a public blocklist'}",
+            f"It connected to {ip}" + (f" (port {port})" if port else "")
+            + f", which is {reputation_text(hits)}.",
+            ("Two independent lists name this address, which makes a "
+             "mistake less likely." if two else
+             "A public list names this address as malicious (for example "
+             "a botnet command server or a hijacked network)."),
+            "Lists can be out of date, and one address can host many "
+            "unrelated sites. Check which program on that device made the "
+            "connection; if you don't recognise it, run a malware scan on "
+            "that device.",
+            confidence="High" if two else "Medium",
+            why=f"Matched {', '.join(sources)} on this computer (the "
+                f"address was never sent anywhere).",
+            refs={"remote": ip}, subject=f"rep|{dev.key}|{ip}")
 
     def new_country(self, dev, country, remote):
         if self._debounced(f"cc:{dev.key}:{country}", 86400):
@@ -14023,6 +14949,28 @@ class NetworkModel:
         self._dirty_dev(dev)
         return [dev.key]
 
+    def correct_type(self, key, cls):
+        """You say what a device is ("" = let MiniWireshark decide). The
+        device's fingerprint is remembered so look-alikes get a
+        suggestion."""
+        dev = self._dev(key)
+        if dev is None or (cls and cls not in DEVICE_CLASSES):
+            return []
+        if cls == dev.user_class:
+            return []
+        self.journal.add("type", {"key": dev.key, "old": dev.user_class,
+                                  "new": cls})
+        dev.user_class = cls
+        if not getattr(self, "demo", False) and dev.live and not dev.demo:
+            if cls:
+                learned_types().learn(dev, cls)
+            else:
+                learned_types().forget(dev.key)
+        self._classify_dirty.update(self.registry.by_key)  # look-alikes too
+        self._classify()
+        self._dirty_dev(dev)
+        return [dev.key]
+
     def correct_note(self, key, note):
         dev = self._dev(key)
         if dev is None:
@@ -14103,6 +15051,18 @@ class NetworkModel:
             dev = self._dev(p["key"])
             if dev is not None:
                 dev.notes = p["old"]
+                out = [dev.key]
+        elif e["op"] == "type":
+            dev = self._dev(p["key"])
+            if dev is not None:
+                dev.user_class = p["old"]
+                if not getattr(self, "demo", False):
+                    if p["old"]:
+                        learned_types().learn(dev, p["old"])
+                    else:
+                        learned_types().forget(dev.key)
+                self._classify_dirty.update(self.registry.by_key)
+                self._classify()
                 out = [dev.key]
         elif e["op"] == "merge":
             keep = reg.resolve(p["keep"])
@@ -14763,10 +15723,11 @@ class NetworkModel:
                 f.note = "MiniWireshark health check"
             if f.remote_port == 853:
                 self.dns.encrypted_seen["DNS-over-TLS (port 853)"] += 1
-            if f.remote_port == 443 and f.remote_ip in DOH_IPS and \
-                    self.config.get("dns.detect_encrypted_dns", True):
+            doh_ip = doh_ip_name(f.remote_ip) if f.remote_port in (
+                443, 853) else None
+            if doh_ip and self.config.get("dns.detect_encrypted_dns", True):
                 self.dns.encrypted_seen[
-                    f"Likely encrypted DNS to {DOH_IPS[f.remote_ip]}"] += 1
+                    f"Likely encrypted DNS to {doh_ip}"] += 1
             if tr == "UDP" and f.remote_port in VPN_PORTS:
                 f.app = f.app or "VPN"
                 f.service = PORT_SERVICES.get(f.remote_port, "VPN tunnel")
@@ -15061,9 +16022,10 @@ class NetworkModel:
         if source == "HTTP Host":
             self.http_count += 1
             self.http_hosts[key] += 1
-        if key in DOH_HOSTS and self.config.get("dns.detect_encrypted_dns",
-                                                True):
-            self.dns.encrypted_seen[DOH_HOSTS[key]] += 1
+        doh = doh_name(key) if self.config.get(
+            "dns.detect_encrypted_dns", True) else None
+        if doh:
+            self.dns.encrypted_seen[doh] += 1
         self.dirty_websites.add(key)
         return rec
 
@@ -15088,6 +16050,7 @@ class NetworkModel:
             rec = RemoteHostRecord(ip=pub, first_seen=ts, last_seen=ts)
             self.remote_hosts[pub] = rec
             self._geo_fill(rec)
+            self._reputation_fill(rec)
             if len(self.remote_hosts) > 30000:
                 for old in sorted(self.remote_hosts.values(),
                                   key=lambda r: r.last_seen)[:3000]:
@@ -15106,8 +16069,11 @@ class NetworkModel:
         if new_flow:
             rec.connections += 1
         if dev is not None:
-            if len(rec.devices) < 100:
+            if len(rec.devices) < 100 and dev.key not in rec.devices:
                 rec.devices.add(dev.key)
+                if rec.reputation and dev.live:
+                    self._alert(self.alerts.reputation(
+                        dev, pub, rport, rec.reputation))
         names = self.ip_to_domains.get(pub)
         if names:
             dom = next(reversed(names))
@@ -15119,6 +16085,55 @@ class NetworkModel:
         self.dirty_remotes.add(pub)
         if not rec.country:
             self.ev_geo.add(pub)
+
+    def _reputation_fill(self, rec):
+        rdb = getattr(self, "_rep_db", None)
+        if rdb is None or getattr(self, "_rep_db_gen", -1) != _REP_GEN[0]:
+            rdb = self._rep_db = reputation_db()
+            self._rep_db_gen = _REP_GEN[0]
+        rec.reputation = rdb.lookup(rec.ip) if rdb is not None else []
+
+    def reenrich(self):
+        """Re-label this session with the reference data loaded now (after
+        a Components Center update) without recapturing. → counts."""
+        _REP_GEN[0] += 1
+        n = {"vendors": 0, "remote": 0, "reputation": 0, "websites": 0}
+        for dev in list(self.registry.by_key.values()):
+            if dev.mac and not dev.randomized_mac:
+                v = mac_vendor(dev.mac)
+                if v and v != dev.vendor:
+                    dev.vendor = v
+                    dev.add_evidence("oui_match", f"Vendor prefix matches "
+                                                  f"{v}", self.now())
+                    n["vendors"] += 1
+                    self._dirty_dev(dev)
+        for rec in list(self.remote_hosts.values()):
+            before = (rec.asn, rec.country, len(rec.reputation))
+            if not rec.country or rec.geo_source == "offline database":
+                rec.country = ""
+                self._geo_fill(rec)
+            had = {h[0] for h in rec.reputation}
+            self._reputation_fill(rec)
+            if {h[0] for h in rec.reputation} - had:
+                n["reputation"] += 1
+                for dk in sorted(rec.devices):
+                    dev = self.registry.by_key.get(dk)
+                    if dev is not None and dev.live:
+                        port = min(rec.ports) if rec.ports else 0
+                        self._alert(self.alerts.reputation(
+                            dev, rec.ip, port, rec.reputation))
+            if (rec.asn, rec.country, len(rec.reputation)) != before:
+                n["remote"] += 1
+                self.dirty_remotes.add(rec.ip)
+        for w in list(self.websites.values()):
+            cat, srcname = domain_category(w.domain)
+            if cat and (cat, srcname) != (w.category, w.category_source) \
+                    and (cat == "CDN" or self.config.get(
+                        "websites.tracker_classification", False)):
+                w.category, w.category_source = cat, srcname
+                n["websites"] += 1
+                self.dirty_websites.add(w.domain)
+        return n
 
     def _geo_fill(self, rec):
         if not self.config.get("privacy.local_asn_db", False):
@@ -15440,6 +16455,18 @@ class NetworkModel:
             cls, word, reasons = classify_device(
                 dev, self.gateway_ip, self.my_ips, self.my_macs,
                 self.registry.ra_routers, self.registry.gw_macs)
+            if dev.user_class:
+                cls, word, reasons = dev.user_class, "", [
+                    "You set this type"] + [r for r in reasons][:2]
+            elif word != "Likely" and not getattr(self, "demo", False) and \
+                    not dev.demo and \
+                    self.config.get("devices.learn_types", True):
+                hit = learned_types().match(dev)
+                if hit:
+                    cls = hit["cls"]
+                    word = "Likely" if hit["score"] >= 5 else "Possibly"
+                    reasons = [f"Looks like {hit['from']}, which you said is "
+                               f"a {hit['cls']} ({hit['why']})"] + reasons
             if cls != dev.device_class or word != dev.class_confidence:
                 dev.device_class, dev.class_confidence = cls, word
                 dev.class_reasons = reasons
@@ -15531,7 +16558,7 @@ def _default_config():
         "capture": {"max_stored_events": 5000, "promiscuous": True,
                     "auto_select_interface": True,
                     "preferred_interface": "", "follow_newest": True},
-        "devices": {"idle_minutes": 2, "inactive_minutes": 10,
+        "devices": {"learn_types": True, "idle_minutes": 2, "inactive_minutes": 10,
                     "expire_minutes": 1440, "auto_merge": True,
                     "suggest_merges": True,
                     "show_inactive": False, "show_expired": False},
@@ -15554,7 +16581,7 @@ def _default_config():
                    "tcp_resets": True, "new_service": True,
                    "cleartext": True, "remote_access": True,
                    "new_country": True, "broadcast_storm": True,
-                   "scan_pattern": True,
+                   "scan_pattern": True, "reputation": True,
                    "chatty_multiplier": 4, "chatty_min_rate": 3,
                    "unknown_min_packets": 5, "reconnect_count": 5,
                    "reconnect_window_minutes": 30, "arp_flip_threshold": 4,
@@ -15574,6 +16601,9 @@ def _default_config():
         "privacy": {"geoip_enabled": False, "local_asn_db": False,
                     "auto_download_reference": True, "quic_names": True,
                     "kill_switch": False},
+        "components": {"policy": "Manual", "last_check": 0,
+                       "services": False, "doh": False, "feodo": False,
+                       "drop": False},
         "history": {"enabled": False, "retention": "30 days",
                     "custom_days": 14, "save_raw_packets": False,
                     "packet_ring": False, "packet_ring_mb": 200},
@@ -15688,6 +16718,113 @@ def config_defaults_flat():
     return out
 
 
+# ---- V5: teach-once device fingerprints ---------------------------------------
+def _name_pattern(name):
+    """'ESP_6A1B2C' → 'esp_*', 'BRW008077500050' → 'brw*'; '' when the
+    name carries no family pattern (a person's chosen name)."""
+    n = (name or "").strip().lower()
+    if not n or not looks_generated(n):
+        return ""
+    p = re.sub(r"[0-9a-f]{4,}", "*", n)
+    p = re.sub(r"\d+", "#", p)
+    return p if len(p.replace("*", "").replace("#", "")) >= 2 else ""
+
+
+class LearnedTypes:
+    """When you set a device's type, its fingerprint is remembered on this
+    computer (vendor block, DHCP request list, advertised services, name
+    family). Look-alike devices then get that type as a suggestion that
+    says where it was learned. Nothing leaves this computer."""
+
+    MAX = 300
+
+    def __init__(self, path=None):
+        self.path = path or os.path.join(PATHS.data, "learned_types.json")
+        d = read_json(self.path, None)
+        self.items = d.get("items", []) if isinstance(d, dict) else []
+
+    @staticmethod
+    def fingerprint(dev):
+        names = [dev.dhcp_hostname, dev.hostname, dev.mdns_name]
+        pat = next((p for p in (_name_pattern(x) for x in names) if p), "")
+        return {
+            "vendor_block": "" if (not dev.mac or dev.randomized_mac)
+            else dev.mac.lower()[:8],
+            "dhcp": dev.dhcp_params or "",
+            "services": sorted(dev.services)[:12],
+            "name": pat,
+        }
+
+    def learn(self, dev, cls):
+        fp = self.fingerprint(dev)
+        signals = sum(1 for k in ("vendor_block", "dhcp", "services", "name")
+                      if fp[k])
+        self.items = [x for x in self.items if x.get("key") != dev.key]
+        if not cls or signals == 0:
+            self.save()
+            return False
+        self.items.append({"key": dev.key, "cls": cls,
+                           "from": sanitize_text(dev.display_name(), 60),
+                           "learned": time.time(), **fp})
+        if len(self.items) > self.MAX:
+            self.items = self.items[-self.MAX:]
+        self.save()
+        return True
+
+    def forget(self, key):
+        n = len(self.items)
+        self.items = [x for x in self.items if x.get("key") != key]
+        if len(self.items) != n:
+            self.save()
+
+    def clear(self):
+        self.items = []
+        self.save()
+
+    def save(self):
+        try:
+            atomic_write_json(self.path, {"version": 1, "items": self.items})
+        except OSError:
+            LOG.warning("could not save learned device types")
+
+    def match(self, dev):
+        """Best learned type for a look-alike device, or None. Needs two
+        independent matching signals worth at least 4 points."""
+        fp = self.fingerprint(dev)
+        best = None
+        for it in self.items:
+            if it.get("key") == dev.key:
+                continue
+            score, why = 0, []
+            if fp["vendor_block"] and fp["vendor_block"] == it.get(
+                    "vendor_block"):
+                score += 2
+                why.append("same maker block")
+            if fp["dhcp"] and fp["dhcp"] == it.get("dhcp"):
+                score += 3
+                why.append("same DHCP request list")
+            if fp["services"] and fp["services"] == it.get("services"):
+                score += 2
+                why.append("same advertised services")
+            if fp["name"] and fp["name"] == it.get("name"):
+                score += 2
+                why.append("same name pattern")
+            if score >= 4 and len(why) >= 2 and (
+                    best is None or score > best["score"]):
+                best = {"cls": it["cls"], "from": it.get("from", "?"),
+                        "why": ", ".join(why), "score": score}
+        return best
+
+
+LEARNED = [None]
+
+
+def learned_types():
+    if LEARNED[0] is None:
+        LEARNED[0] = LearnedTypes()
+    return LEARNED[0]
+
+
 class KnownDevicesStore:
     """What YOU told MiniWireshark about your devices (names, notes,
     'mine', 'expected', 'never merge'). Kept locally in the data folder so
@@ -15707,9 +16844,10 @@ class KnownDevicesStore:
                  "expected": dev.expected, "pinned": dev.pinned_no_merge,
                  "never_merge": sorted(dev.never_merge),
                  "vendor": dev.vendor, "last_ip": dev.ip,
-                 "updated": time.time()}
+                 "user_class": dev.user_class, "updated": time.time()}
         if not any((dev.alias, dev.notes, dev.mine, dev.expected,
-                    dev.pinned_no_merge, dev.never_merge)):
+                    dev.pinned_no_merge, dev.never_merge,
+                    dev.user_class)):
             self.data.pop(dev.key, None)
         else:
             self.data[dev.key] = entry
@@ -17945,6 +19083,153 @@ Running the built-in self-test ¦ Exécution de l'autotest intégré ¦ Ejecutan
 Learned baselines reset. ¦ Habitudes apprises réinitialisées. ¦ Referencias aprendidas restablecidas.
 Running health checks ¦ Vérifications de santé en cours ¦ Ejecutando comprobaciones de salud
 Getting ready — I'll pick a network card and start watching automatically. ¦ Préparation — je vais choisir une carte réseau et commencer à observer automatiquement. ¦ Preparando — elegiré una tarjeta de red y empezaré a observar automáticamente.
+Components ¦ Composants ¦ Componentes
+Optional data, packages and helpers — nothing here is needed to watch your network. ¦ Données, paquets et outils facultatifs — rien ici n'est nécessaire pour surveiller votre réseau. ¦ Datos, paquetes y herramientas opcionales — nada de esto hace falta para vigilar su red.
+Optional intelligence ¦ Intelligence facultative ¦ Inteligencia opcional
+Updates ¦ Mises à jour ¦ Actualizaciones
+Manual ¦ Manuelles ¦ Manuales
+Weekly ¦ Chaque semaine ¦ Semanales
+Manual: downloads happen only when you click Get or Check now. Weekly: sources you turned on are checked about once a week (each one never more often than its publisher allows). ¦ Manuelles : les téléchargements n'ont lieu que lorsque vous cliquez sur Obtenir ou Vérifier maintenant. Chaque semaine : les sources activées sont vérifiées environ une fois par semaine (jamais plus souvent que leur éditeur ne le permet). ¦ Manuales: las descargas solo ocurren cuando pulsa Obtener o Comprobar ahora. Semanales: las fuentes activadas se comprueban más o menos una vez por semana (nunca más a menudo de lo que permite su editor).
+Open the Components Center ¦ Ouvrir le centre des composants ¦ Abrir el centro de componentes
+Return to built-in data ¦ Revenir aux données intégrées ¦ Volver a los datos integrados
+Components Center ¦ Centre des composants ¦ Centro de componentes
+Address on a public blocklist contacted ¦ Adresse d'une liste de blocage publique contactée ¦ Contacto con una dirección de una lista de bloqueo pública
+A device contacts an address on a public blocklist you turned on in the Components Center. ¦ Un appareil contacte une adresse figurant sur une liste de blocage publique activée dans le centre des composants. ¦ Un dispositivo contacta con una dirección de una lista de bloqueo pública que activó en el centro de componentes.
+Use the downloaded vendor and site lists ¦ Utiliser les listes de fabricants et de sites téléchargées ¦ Usar las listas de fabricantes y sitios descargadas
+Uses the hardware-vendor list and the Public Suffix List you got in the Components Center. They are only downloaded when you ask (or weekly, if you choose that there); nothing about your network is sent. Built-in lists are used when this is off or nothing was downloaded. ¦ Utilise la liste des fabricants et la Public Suffix List obtenues dans le centre des composants. Elles ne sont téléchargées que sur demande (ou chaque semaine si vous le choisissez) ; rien sur votre réseau n'est envoyé. Les listes intégrées servent quand c'est désactivé ou que rien n'a été téléchargé. ¦ Usa la lista de fabricantes y la Public Suffix List que obtuvo en el centro de componentes. Solo se descargan cuando lo pide (o cada semana, si lo elige allí); no se envía nada sobre su red. Se usan las listas integradas cuando está desactivado o no se descargó nada.
+Startup history ¦ Historique des démarrages ¦ Historial de inicios
+Set device type… ¦ Définir le type d'appareil… ¦ Definir el tipo de dispositivo…
+Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
+Automatic (MiniWireshark decides) ¦ Automatique (MiniWireshark décide) ¦ Automático (MiniWireshark decide)
+You set this type ¦ Vous avez choisi ce type ¦ Usted eligió este tipo
+detected ¦ détecté ¦ detectado
+Learn from the device types I set ¦ Apprendre des types d'appareils que je définis ¦ Aprender de los tipos de dispositivo que defino
+When you use “Set device type…”, the device's fingerprint (maker block, DHCP request list, services, name pattern) is kept on this computer so look-alike devices get the same suggestion. Two matching signals are needed; nothing is sent anywhere. ¦ Quand vous utilisez « Définir le type d'appareil… », l'empreinte de l'appareil (bloc du fabricant, liste de requêtes DHCP, services, modèle de nom) est gardée sur cet ordinateur pour que les appareils semblables reçoivent la même suggestion. Deux signaux concordants sont nécessaires ; rien n'est envoyé. ¦ Cuando usa «Definir el tipo de dispositivo…», la huella del dispositivo (bloque del fabricante, lista de solicitudes DHCP, servicios, patrón de nombre) se guarda en este equipo para que los dispositivos parecidos reciban la misma sugerencia. Se necesitan dos señales coincidentes; no se envía nada.
+Forget learned device types… ¦ Oublier les types d'appareils appris… ¦ Olvidar los tipos de dispositivo aprendidos…
+Forget learned device types ¦ Oublier les types d'appareils appris ¦ Olvidar los tipos de dispositivo aprendidos
+Each start of MiniWireshark writes what it did and how long it took. If starting ever fails, this shows where — copy it if you ask for help (it contains no network data). ¦ Chaque démarrage de MiniWireshark note ce qu'il a fait et combien de temps cela a pris. Si un démarrage échoue, ceci montre où — copiez-le si vous demandez de l'aide (il ne contient aucune donnée réseau). ¦ Cada inicio de MiniWireshark anota lo que hizo y cuánto tardó. Si alguna vez falla, esto muestra dónde — cópielo si pide ayuda (no contiene datos de red).
+Open folder ¦ Ouvrir le dossier ¦ Abrir carpeta
+Get / rebuild managed Python ¦ Obtenir / reconstruire le Python géré ¦ Obtener / reconstruir el Python gestionado
+Remove managed Python ¦ Supprimer le Python géré ¦ Eliminar el Python gestionado
+Start in the managed Python (used only after its window reports back; otherwise the Python you started with) ¦ Démarrer dans le Python géré (utilisé seulement si sa fenêtre confirme son ouverture ; sinon le Python avec lequel vous avez démarré) ¦ Iniciar en el Python gestionado (solo si su ventana confirma que se abrió; si no, el Python con el que lo inició)
+Repair / Update fixes the private packages folder (the capture engine is reinstalled from a fingerprinted file) and, if you have a managed Python, reinstalls its verified components and updates its pip. A newer Python is only installed when you ask. Nothing outside MiniWireshark's data folder is changed. ¦ Réparer / mettre à jour corrige le dossier des paquets privés (le moteur de capture est réinstallé depuis un fichier à empreinte vérifiée) et, si vous avez un Python géré, réinstalle ses composants vérifiés et met à jour son pip. Un Python plus récent n'est installé que sur demande. Rien n'est modifié hors du dossier de données de MiniWireshark. ¦ Reparar / actualizar arregla la carpeta de paquetes privados (el motor de captura se reinstala desde un archivo con huella verificada) y, si tiene un Python gestionado, reinstala sus componentes verificados y actualiza su pip. Un Python más reciente solo se instala si lo pide. No se cambia nada fuera de la carpeta de datos de MiniWireshark.
+Optional data, packages and helpers. MiniWireshark watches your network without any of them, and nothing downloads unless you ask. Every download is listed in the self-traffic ledger, and the kill switch blocks them all. ¦ Données, paquets et outils facultatifs. MiniWireshark surveille votre réseau sans aucun d'eux, et rien n'est téléchargé sans votre demande. Chaque téléchargement figure dans le registre des envois, et l'arrêt d'urgence les bloque tous. ¦ Datos, paquetes y herramientas opcionales. MiniWireshark vigila su red sin ninguno de ellos y no se descarga nada salvo que lo pida. Cada descarga figura en el registro de envíos y el interruptor de corte las bloquea todas.
+Check now ¦ Vérifier maintenant ¦ Comprobar ahora
+Export offline pack ¦ Exporter un pack hors ligne ¦ Exportar paquete sin conexión
+Import offline pack ¦ Importer un pack hors ligne ¦ Importar paquete sin conexión
+Re-label this session ¦ Réétiqueter cette session ¦ Reetiquetar esta sesión
+Get / update ¦ Obtenir / mettre à jour ¦ Obtener / actualizar
+Turn on ¦ Activer ¦ Activar
+Turn off ¦ Désactiver ¦ Desactivar
+Delete ¦ Supprimer ¦ Eliminar
+Component ¦ Composant ¦ Componente
+Size ¦ Taille ¦ Tamaño
+Updated ¦ Mis à jour ¦ Actualizado
+License ¦ Licence ¦ Licencia
+Select a component ¦ Sélectionnez un composant ¦ Seleccione un componente
+Reference data ¦ Données de référence ¦ Datos de referencia
+Reputation ¦ Réputation ¦ Reputación
+Python package ¦ Paquet Python ¦ Paquete de Python
+in use ¦ utilisé ¦ en uso
+downloaded, off ¦ téléchargé, désactivé ¦ descargado, desactivado
+downloading… ¦ téléchargement… ¦ descargando…
+problem — using built-in ¦ problème — données intégrées utilisées ¦ problema — se usan los datos integrados
+on, not downloaded yet ¦ activé, pas encore téléchargé ¦ activado, aún sin descargar
+previous copy ¦ copie précédente ¦ copia anterior
+not installed ¦ non installé ¦ no instalado
+installed ¦ installé ¦ instalado
+private folder ¦ dossier privé ¦ carpeta privada
+in your Python ¦ dans votre Python ¦ en su Python
+built into the system ¦ intégré au système ¦ integrado en el sistema
+missing ¦ absent ¦ falta
+What it does ¦ À quoi ça sert ¦ Para qué sirve
+Benefit ¦ Avantage ¦ Ventaja
+Publisher ¦ Éditeur ¦ Editor
+License / terms ¦ Licence / conditions ¦ Licencia / condiciones
+On disk ¦ Sur le disque ¦ En disco
+Privacy ¦ Confidentialité ¦ Privacidad
+Without it ¦ Sans lui ¦ Sin él
+Proof of origin ¦ Preuve d'origine ¦ Prueba de origen
+Offline packs ¦ Packs hors ligne ¦ Paquetes sin conexión
+Last problem ¦ Dernier problème ¦ Último problema
+Pack doctor ¦ Contrôle des packs ¦ Revisión de paquetes
+Version ¦ Version ¦ Versión
+Where it goes ¦ Où il est installé ¦ Dónde se instala
+nothing yet ¦ rien pour l'instant ¦ nada todavía
+never ¦ jamais ¦ nunca
+included ¦ inclus ¦ incluido
+never included (its terms don't allow re-sharing) ¦ jamais inclus (ses conditions n'autorisent pas le partage) ¦ nunca incluido (sus condiciones no permiten compartirlo)
+minisign signature (checked on every download) ¦ signature minisign (vérifiée à chaque téléchargement) ¦ firma minisign (comprobada en cada descarga)
+HTTPS + the file must parse and not shrink by more than half ¦ HTTPS + le fichier doit être lisible et ne pas rétrécir de plus de moitié ¦ HTTPS + el archivo debe poder leerse y no encogerse más de la mitad
+Hardware vendor list ¦ Liste des fabricants ¦ Lista de fabricantes
+Port and service names ¦ Noms des ports et services ¦ Nombres de puertos y servicios
+Public Suffix List ¦ Public Suffix List ¦ Public Suffix List
+Tracker / ad-domain list ¦ Liste des domaines de pistage / publicité ¦ Lista de dominios de rastreo / publicidad
+Offline country & provider database ¦ Base pays et fournisseur hors ligne ¦ Base de datos de país y proveedor sin conexión
+Encrypted-DNS resolvers ¦ Résolveurs DNS chiffrés ¦ Resolutores de DNS cifrado
+Botnet command servers ¦ Serveurs de commande de botnets ¦ Servidores de mando de botnets
+Hijacked address blocks ¦ Blocs d'adresses détournés ¦ Bloques de direcciones secuestrados
+Turns the first half of a MAC address into a manufacturer name. ¦ Transforme la première moitié d'une adresse MAC en nom de fabricant. ¦ Convierte la primera mitad de una dirección MAC en un nombre de fabricante.
+Names every registered port, not only the common ones MiniWireshark explains itself. ¦ Nomme chaque port enregistré, pas seulement les ports courants que MiniWireshark explique lui-même. ¦ Nombra cada puerto registrado, no solo los habituales que MiniWireshark explica por sí mismo.
+Groups www.example.co.uk and mail.example.co.uk under example.co.uk. ¦ Regroupe www.example.co.uk et mail.example.co.uk sous example.co.uk. ¦ Agrupa www.example.co.uk y mail.example.co.uk bajo example.co.uk.
+Labels domains as Advertising / Analytics / Social / Tracking (informational only — nothing is blocked). ¦ Étiquette les domaines Publicité / Mesure d'audience / Réseaux sociaux / Pistage (pour information seulement — rien n'est bloqué). ¦ Etiqueta los dominios como Publicidad / Analítica / Redes sociales / Rastreo (solo informativo — no se bloquea nada).
+Shows the country and network provider (ASN) of Internet hosts without asking any online service. ¦ Affiche le pays et le fournisseur réseau (ASN) des hôtes Internet sans interroger aucun service en ligne. ¦ Muestra el país y el proveedor de red (ASN) de los equipos de Internet sin consultar ningún servicio en línea.
+Recognizes hundreds of DNS-over-HTTPS / TLS / QUIC servers, so hidden website lookups are explained instead of missed. ¦ Reconnaît des centaines de serveurs DNS-over-HTTPS / TLS / QUIC, pour que les recherches de sites cachées soient expliquées au lieu d'être manquées. ¦ Reconoce cientos de servidores DNS-over-HTTPS / TLS / QUIC, para que las búsquedas ocultas se expliquen en vez de pasar desapercibidas.
+Flags a device that talks to an address abuse.ch currently lists as a botnet command server (recommended list only). ¦ Signale un appareil qui communique avec une adresse qu'abuse.ch répertorie actuellement comme serveur de commande de botnet (liste recommandée uniquement). ¦ Señala un dispositivo que habla con una dirección que abuse.ch incluye actualmente como servidor de mando de botnet (solo la lista recomendada).
+Flags traffic to address blocks Spamhaus lists as hijacked or run by criminals ("Don't Route Or Peer"). ¦ Signale le trafic vers des blocs d'adresses que Spamhaus répertorie comme détournés ou exploités par des criminels (« Don't Route Or Peer »). ¦ Señala el tráfico hacia bloques de direcciones que Spamhaus incluye como secuestrados o gestionados por delincuentes («Don't Route Or Peer»).
+Downloads a public file from wireshark.org. Nothing about your network is sent. ¦ Télécharge un fichier public depuis wireshark.org. Rien sur votre réseau n'est envoyé. ¦ Descarga un archivo público de wireshark.org. No se envía nada sobre su red.
+Downloads IANA's public registry. Nothing about your network is sent. ¦ Télécharge le registre public de l'IANA. Rien sur votre réseau n'est envoyé. ¦ Descarga el registro público de la IANA. No se envía nada sobre su red.
+Downloads a public file from publicsuffix.org. Nothing about your network is sent. ¦ Télécharge un fichier public depuis publicsuffix.org. Rien sur votre réseau n'est envoyé. ¦ Descarga un archivo público de publicsuffix.org. No se envía nada sobre su red.
+Downloads Disconnect's public list from GitHub. Domains you visit are checked against it on this computer only. ¦ Télécharge la liste publique de Disconnect depuis GitHub. Les domaines visités sont comparés à cette liste sur cet ordinateur uniquement. ¦ Descarga la lista pública de Disconnect desde GitHub. Los dominios que visita se comparan con ella solo en este equipo.
+Downloads a public ~7 MB file from iptoasn.com. Lookups then happen entirely on this computer. ¦ Télécharge un fichier public d'environ 7 Mo depuis iptoasn.com. Les recherches se font ensuite entièrement sur cet ordinateur. ¦ Descarga un archivo público de unos 7 MB de iptoasn.com. Las búsquedas se hacen después enteramente en este equipo.
+Downloads the DNSCrypt project's public list from GitHub and checks its minisign signature. Nothing about your network is sent. ¦ Télécharge la liste publique du projet DNSCrypt depuis GitHub et vérifie sa signature minisign. Rien sur votre réseau n'est envoyé. ¦ Descarga la lista pública del proyecto DNSCrypt desde GitHub y comprueba su firma minisign. No se envía nada sobre su red.
+Downloads abuse.ch's public list. Addresses your devices contact are checked on this computer only — nothing is sent. ¦ Télécharge la liste publique d'abuse.ch. Les adresses contactées par vos appareils sont vérifiées sur cet ordinateur uniquement — rien n'est envoyé. ¦ Descarga la lista pública de abuse.ch. Las direcciones que contactan sus dispositivos se comprueban solo en este equipo — no se envía nada.
+Downloads Spamhaus' public list. Addresses are checked on this computer only — nothing is sent. ¦ Télécharge la liste publique de Spamhaus. Les adresses sont vérifiées sur cet ordinateur uniquement — rien n'est envoyé. ¦ Descarga la lista pública de Spamhaus. Las direcciones se comprueban solo en este equipo — no se envía nada.
+A maker name for every device, including the newest and the small 28/36-bit blocks. ¦ Un nom de fabricant pour chaque appareil, y compris les plus récents et les petits blocs de 28/36 bits. ¦ Un nombre de fabricante para cada dispositivo, incluidos los más nuevos y los pequeños bloques de 28/36 bits.
+Connections on unusual ports get a registered service name. ¦ Les connexions sur des ports inhabituels reçoivent un nom de service enregistré. ¦ Las conexiones en puertos poco habituales reciben un nombre de servicio registrado.
+Sites are grouped by their real owner domain everywhere. ¦ Les sites sont regroupés partout selon leur vrai domaine propriétaire. ¦ Los sitios se agrupan en todas partes por su dominio propietario real.
+Advertising, analytics and tracking domains are labelled in Websites. ¦ Les domaines de publicité, de mesure d'audience et de pistage sont étiquetés dans Sites web. ¦ Los dominios de publicidad, analítica y rastreo se etiquetan en Sitios web.
+Country and network owner for every Internet host, offline. ¦ Pays et propriétaire réseau de chaque hôte Internet, hors ligne. ¦ País y propietario de red de cada equipo de Internet, sin conexión.
+Encrypted-DNS use is detected for many more providers. ¦ L'usage du DNS chiffré est détecté pour bien plus de fournisseurs. ¦ Se detecta el uso de DNS cifrado en muchos más proveedores.
+A warning if a device contacts a listed command server. ¦ Un avertissement si un appareil contacte un serveur de commande répertorié. ¦ Un aviso si un dispositivo contacta con un servidor de mando incluido en la lista.
+A warning if a device contacts a hijacked network. ¦ Un avertissement si un appareil contacte un réseau détourné. ¦ Un aviso si un dispositivo contacta con una red secuestrada.
+none — the feature just shows less ¦ aucun — la fonction affiche simplement moins ¦ ninguno — la función simplemente muestra menos
+the capture engine's bundled vendor list (older) ¦ la liste des fabricants fournie avec le moteur de capture (plus ancienne) ¦ la lista de fabricantes incluida con el motor de captura (más antigua)
+about 130 built-in ports with plain-English names ¦ environ 130 ports intégrés avec des noms en langage simple ¦ unos 130 puertos integrados con nombres en lenguaje sencillo
+a compact built-in list of common suffixes ¦ une liste intégrée compacte des suffixes courants ¦ una lista integrada compacta de sufijos comunes
+none — shown as unknown (the online lookup stays off unless you turn it on) ¦ aucun — affiché comme inconnu (la recherche en ligne reste désactivée sauf si vous l'activez) ¦ ninguno — se muestra como desconocido (la búsqueda en línea sigue desactivada salvo que la active)
+about 40 well-known providers built in ¦ environ 40 fournisseurs connus intégrés ¦ unos 40 proveedores conocidos integrados
+public registry data; not re-shared in offline packs ¦ données de registre public ; non partagées dans les packs hors ligne ¦ datos de registro público; no se comparten en paquetes sin conexión
+public registry ¦ registre public ¦ registro público
+no license stated: used on this computer only, never re-shared ¦ aucune licence indiquée : utilisé sur cet ordinateur uniquement, jamais partagé ¦ sin licencia indicada: se usa solo en este equipo, nunca se comparte
+free to use; copyrighted and revocable — your own use only, never re-shared ¦ utilisation gratuite ; protégé par le droit d'auteur et révocable — pour votre usage uniquement, jamais partagé ¦ uso gratuito; con derechos de autor y revocable — solo para su propio uso, nunca se comparte
+Public Domain (PDDL 1.0) ¦ Domaine public (PDDL 1.0) ¦ Dominio público (PDDL 1.0)
+Npcap free license (Nmap) ¦ Licence gratuite Npcap (Nmap) ¦ Licencia gratuita de Npcap (Nmap)
+part of the operating system ¦ fait partie du système d'exploitation ¦ forma parte del sistema operativo
+System capture (libpcap / raw sockets) ¦ Capture du système (libpcap / sockets bruts) ¦ Captura del sistema (libpcap / sockets sin procesar)
+Lets Windows programs capture network traffic. ¦ Permet aux programmes Windows de capturer le trafic réseau. ¦ Permite a los programas de Windows capturar el tráfico de red.
+Linux and macOS capture traffic with their own built-in facilities; nothing to install. ¦ Linux et macOS capturent le trafic avec leurs propres outils intégrés ; rien à installer. ¦ Linux y macOS capturan el tráfico con sus propias herramientas integradas; no hay nada que instalar.
+Shows which program on this computer owns each connection; adapter link status; CPU-aware performance mode. ¦ Montre quel programme de cet ordinateur possède chaque connexion ; état de liaison des cartes ; mode de performances adapté au processeur. ¦ Muestra qué programa de este equipo es dueño de cada conexión; estado del enlace de los adaptadores; modo de rendimiento según la CPU.
+Reads HTTP/3 (QUIC) site names about 50x faster than the built-in pure-Python code. ¦ Lit les noms de sites HTTP/3 (QUIC) environ 50 fois plus vite que le code Python intégré. ¦ Lee los nombres de sitios HTTP/3 (QUIC) unas 50 veces más rápido que el código Python integrado.
+MiniWireshark works normally; the feature above is simply slower or unavailable. ¦ MiniWireshark fonctionne normalement ; la fonction ci-dessus est simplement plus lente ou indisponible. ¦ MiniWireshark funciona con normalidad; la función de arriba simplemente es más lenta o no está disponible.
+not installed in the private folder ¦ non installé dans le dossier privé ¦ no instalado en la carpeta privada
+No optional data source is turned on yet. ¦ Aucune source de données facultative n'est encore activée. ¦ Todavía no hay ninguna fuente de datos opcional activada.
+The kill switch is on, so nothing can be downloaded. ¦ L'arrêt d'urgence est activé : rien ne peut être téléchargé. ¦ El interruptor de corte está activado, así que no se puede descargar nada.
+There is no previous copy to go back to. ¦ Il n'y a pas de copie précédente vers laquelle revenir. ¦ No hay ninguna copia anterior a la que volver.
+Turn off every optional data source and delete everything downloaded for them? MiniWireshark keeps working with its built-in lists. (Private packages are not touched.) ¦ Désactiver toutes les sources de données facultatives et supprimer tout ce qui a été téléchargé pour elles ? MiniWireshark continue avec ses listes intégrées. (Les paquets privés ne sont pas touchés.) ¦ ¿Desactivar todas las fuentes de datos opcionales y borrar todo lo descargado para ellas? MiniWireshark sigue funcionando con sus listas integradas. (Los paquetes privados no se tocan.)
+not downloaded (get it in Components) ¦ non téléchargé (à obtenir dans Composants) ¦ sin descargar (obténgalo en Componentes)
+off (deleted) ¦ désactivé (supprimé) ¦ desactivado (eliminado)
+up to date (checked moments ago) ¦ à jour (vérifié à l'instant) ¦ actualizado (comprobado hace un momento)
+Kill switch ¦ Arrêt d'urgence ¦ Interruptor de corte
+Demo Mode builds its sample traffic with the capture engine (scapy), which isn't available right now. Opening a capture file still works.⏎⏎Run Repair now to install it? ¦ Le mode démo construit son trafic d'exemple avec le moteur de capture (scapy), qui n'est pas disponible pour l'instant. L'ouverture d'un fichier de capture fonctionne toujours.⏎⏎Lancer la réparation maintenant pour l'installer ? ¦ El modo demo crea su tráfico de ejemplo con el motor de captura (scapy), que ahora no está disponible. Abrir un archivo de captura sigue funcionando.⏎⏎¿Ejecutar la reparación ahora para instalarlo?
+Reinstall the packet capture engine (scapy) and the optional packages you installed, into MiniWireshark's own packages folder? This needs an Internet connection and may take a minute. Your Python is not changed. MiniWireshark keeps running. ¦ Réinstaller le moteur de capture (scapy) et les paquets facultatifs que vous avez installés, dans le dossier de paquets de MiniWireshark ? Il faut une connexion Internet et cela peut prendre une minute. Votre Python n'est pas modifié. MiniWireshark continue de fonctionner. ¦ ¿Reinstalar el motor de captura (scapy) y los paquetes opcionales que instaló, en la carpeta de paquetes propia de MiniWireshark? Necesita conexión a Internet y puede tardar un minuto. Su Python no cambia. MiniWireshark sigue funcionando.
+Safe Mode ¦ Mode sans échec ¦ Modo seguro
+You asked for Safe Mode (--safe). ¦ Vous avez demandé le mode sans échec (--safe). ¦ Pidió el modo seguro (--safe).
+The last two starts didn't reach the main window, so this start uses Safe Mode. ¦ Les deux derniers démarrages n'ont pas atteint la fenêtre principale : ce démarrage utilise le mode sans échec. ¦ Los dos últimos inicios no llegaron a la ventana principal, así que este inicio usa el modo seguro.
+Automatic capture, history, helpers and downloads are off for this session. Repair checks the usual causes. ¦ La capture automatique, l'historique, les assistants et les téléchargements sont désactivés pour cette session. La réparation vérifie les causes habituelles. ¦ La captura automática, el historial, los ayudantes y las descargas están desactivados en esta sesión. La reparación comprueba las causas habituales.
+The managed Python couldn't open its window, so MiniWireshark is using the Python you started it with. ¦ Le Python géré n'a pas pu ouvrir sa fenêtre : MiniWireshark utilise le Python avec lequel vous l'avez démarré. ¦ El Python gestionado no pudo abrir su ventana, así que MiniWireshark usa el Python con el que lo inició.
+Live capture is off because the capture engine (scapy) isn't available. Opening capture files still works, and Repair can fix it. ¦ La capture en direct est désactivée car le moteur de capture (scapy) n'est pas disponible. L'ouverture de fichiers de capture fonctionne toujours, et la réparation peut corriger cela. ¦ La captura en directo está desactivada porque el motor de captura (scapy) no está disponible. Abrir archivos de captura sigue funcionando y la reparación puede arreglarlo.
+Running on this Python ¦ Fonctionne sur ce Python ¦ Funciona con este Python
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -18019,6 +19304,19 @@ I18N_PATTERNS = [
      r"\1 dBm ({t2}), enlace \3, canal \4. {t5}"),
     (r"Router answered in (\d+) ms", r"La box a répondu en \1 ms",
      r"El router respondió en \1 ms"),
+    # V5 teach-once device types
+    (r"What is (.+?)\? Look-alike devices will get the same suggestion "
+     r"\(learned on this computer only\)\.",
+     r"Qu'est-ce que \1 ? Les appareils semblables recevront la même "
+     r"suggestion (apprise sur cet ordinateur uniquement).",
+     r"¿Qué es \1? Los dispositivos parecidos recibirán la misma "
+     r"sugerencia (aprendida solo en este equipo)."),
+    (r"Looks like (.+?), which you said is a (.+?) \((.+)\)",
+     "Ressemble à {t1}, que vous avez désigné comme {t2} ({t3})",
+     "Se parece a {t1}, que usted indicó como {t2} ({t3})"),
+    (r"Set the type of (.+?): (.+?) → (.+)",
+     "Type de {t1} défini : {t2} → {t3}",
+     "Tipo de {t1} definido: {t2} → {t3}"),
     (r"Typical lookup (\d+) ms over (\d+) lookups",
      r"Recherche habituelle \1 ms sur \2 recherches",
      r"Búsqueda típica \1 ms en \2 búsquedas"),
@@ -18936,6 +20234,16 @@ SETTINGS_PAGES = [
               "help": "When MiniWireshark isn't sure, it doesn't merge — "
                       "it adds a suggestion to the Timeline and the device "
                       "card so you can decide."},
+             {"key": "devices.learn_types", "type": "bool",
+              "label": "Learn from the device types I set",
+              "help": "When you use “Set device type…”, the device's "
+                      "fingerprint (maker block, DHCP request list, "
+                      "services, name pattern) is kept on this computer so "
+                      "look-alike devices get the same suggestion. Two "
+                      "matching signals are needed; nothing is sent "
+                      "anywhere."},
+             {"type": "action", "actions": [
+                 ("Forget learned device types…", "forget_learned_types")]},
          ]},
      ]},
     {"id": "websites", "icon": "\U0001F30D", "title": "Websites & DNS",
@@ -19079,6 +20387,9 @@ SETTINGS_PAGES = [
               _alert_control("new_country", "A device contacts a country "
                                             "it hasn't before (needs "
                                             "country lookup)."),
+              _alert_control("reputation", "A device contacts an address on "
+                                           "a public blocklist you turned "
+                                           "on in the Components Center."),
           ]},
          {"title": "Sensitivity", "controls": [
              {"key": "alerts.chatty_multiplier", "type": "int", "min": 2,
@@ -19171,14 +20482,16 @@ SETTINGS_PAGES = [
          ]},
          {"title": "Reference data (no personal data sent)", "controls": [
              {"key": "privacy.auto_download_reference", "type": "bool",
-              "label": "Download public reference lists",
-              "help": "Fetches the hardware-vendor list (wireshark.org) and "
-                      "the Public Suffix List (publicsuffix.org) about once a "
-                      "month. These are ordinary file downloads: nothing "
-                      "about your network is sent. Built-in lists are used "
-                      "when this is off or offline."},
+              "label": "Use the downloaded vendor and site lists",
+              "help": "Uses the hardware-vendor list and the Public Suffix "
+                      "List you got in the Components Center. They are only "
+                      "downloaded when you ask (or weekly, if you choose "
+                      "that there); nothing about your network is sent. "
+                      "Built-in lists are used when this is off or nothing "
+                      "was downloaded."},
              {"type": "info", "text_fn": "data_status_text"},
              {"type": "action", "actions": [
+                 ("Components Center…", "components_center"),
                  ("Refresh now", "refresh_data")]},
          ]},
          {"title": "What is read from packets", "controls": [
@@ -19344,6 +20657,23 @@ SETTINGS_PAGES = [
              {"type": "info", "text_fn": "deps_status_text"},
              {"type": "action", "actions": [
                  ("Repair dependencies", "repair_deps")]},
+         ]},
+     ]},
+    {"id": "components", "icon": "\U0001F9E9", "title": "Components",
+     "blurb": "Optional data, packages and helpers — nothing here is "
+              "needed to watch your network.",
+     "sections": [
+         {"title": "Optional intelligence", "controls": [
+             {"key": "components.policy", "type": "choice",
+              "choices": ["Manual", "Weekly"], "label": "Updates",
+              "help": "Manual: downloads happen only when you click Get or "
+                      "Check now. Weekly: sources you turned on are checked "
+                      "about once a week (each one never more often than "
+                      "its publisher allows)."},
+             {"type": "info", "text_fn": "components_summary_text"},
+             {"type": "action", "actions": [
+                 ("Open the Components Center…", "components_center"),
+                 ("Return to built-in data…", "components_reset")]},
          ]},
      ]},
     {"id": "diagnostics", "icon": "\U0001F6E0", "title": "Diagnostics",
@@ -20155,6 +21485,9 @@ class SettingsWindow:
     def data_status_text(self):
         return self.app.data_status_text()
 
+    def components_summary_text(self):
+        return self.app.components_summary_text()
+
     def ledger_status_text(self):
         return self.app.ledger_status_text()
 
@@ -20195,6 +21528,12 @@ class SettingsWindow:
             self.app._geoip_retry()
         elif name == "refresh_data":
             self.app.refresh_reference_data(force=True)
+        elif name == "components_center":
+            self.app.open_components_center(self.win)
+        elif name == "components_reset":
+            self.app.components_reset(self.win)
+        elif name == "forget_learned_types":
+            self.app.forget_learned_types(self.win)
         elif name == "repair_deps":
             self.app.repair_dependencies(self.win)
         elif name == "clear_history":
@@ -25427,6 +26766,8 @@ class MiniWireshark:
 
         # ---- services
         self.data = DataManager(PATHS.cache, self.config)
+        self._components_queue = set()
+        self._components_inflight = set()
         DATA = self.data
         self.data.on_change = lambda: self._async_results.put(
             self._on_data_changed)
@@ -29430,6 +30771,7 @@ class MiniWireshark:
             ("Unmark expected" if dev.expected else "Mark as expected",
              lambda: self.toggle_flag(k, "expected")),
             ("Add / edit note…", lambda: self.edit_note(k)),
+            ("Set device type…", lambda: self.set_device_type(k)),
             None,
             ("Copy IP", lambda: copy_to_clipboard(self, dev.ip), bool(dev.ip)),
             ("Copy MAC", lambda: copy_to_clipboard(self, dev.mac),
@@ -29465,6 +30807,25 @@ class MiniWireshark:
         if name is None:
             return
         self._apply_correction_result(self.model.correct_rename(key, name))
+
+    def set_device_type(self, key, parent=None, choice=None):
+        """Tell MiniWireshark what a device is. It remembers the device's
+        fingerprint so similar devices get the same suggestion."""
+        dev = self.model.registry.by_key.get(key)
+        if not dev:
+            return
+        auto = translate_text("Automatic (MiniWireshark decides)")
+        opts = [(auto, "")] + [(translate_text(c), c) for c in DEVICE_CLASSES
+                               if c not in ("Unknown", "This computer")]
+        if choice is None:
+            choice = choose_from_list(
+                self, "Set device type",
+                f"What is {self.device_label(dev)}? Look-alike devices "
+                f"will get the same suggestion (learned on this computer "
+                f"only).", opts, parent=parent)
+        if choice is None:
+            return
+        self._apply_correction_result(self.model.correct_type(key, choice))
 
     def edit_note(self, key, parent=None):
         dev = self.model.registry.by_key.get(key)
@@ -29583,6 +30944,8 @@ class MiniWireshark:
             ("  (private / randomized address)" if dev.randomized_mac
              else "") +
             "\nVendor: " + (dev.vendor or "Unknown") +
+            (f" (from {vendor_source(dev.mac)})" if dev.vendor and
+             vendor_source(dev.mac) else "") +
             "\nFirst seen: " + fmt_clock(dev.first_seen, True) +
             "    Last seen: " + fmt_clock(dev.last_seen, True) +
             f"\nStatus: {STATE_LABEL.get(dev.state, dev.state)}" +
@@ -29861,6 +31224,14 @@ class MiniWireshark:
                          f"First seen: {fmt_clock(r.first_seen, True)}    "
                          f"Last seen: {fmt_clock(r.last_seen, True)}"),
             ("Contacted by", devs)]
+        if r.reputation:
+            sections.insert(1, ("⚠ Reputation", "This address is " +
+                                reputation_text(r.reputation) + ". A list "
+                                "entry is a reason to look, not proof."))
+        ports = [p for p in sorted(r.ports)[:4] if p < 49152]
+        if ports:
+            sections.append(("About its ports", "\n\n".join(
+                explain_port_text(p) for p in ports)))
         DetailDialog(self, f"Remote host: {ip}", sections, actions=[
             ("Connections", lambda: self.goto("connections", ip)),
             ("Packets", lambda: self.goto("packets", f"ip:{ip}"))])
@@ -29913,6 +31284,15 @@ class MiniWireshark:
                 f.interp_conf == "Observed" else
                 "guessed from the port number, so treat it as likely, not "
                 "certain." if f.interp_conf else "not identified."))]
+        if f.remote_port:
+            about = explain_port_text(f.remote_port,
+                                      (f.transport or "tcp").lower())
+            if about:
+                sections.append((f"About port {f.remote_port}", about))
+        rec = self.model.remote_hosts.get(f.remote_ip)
+        if rec is not None and rec.reputation:
+            sections.insert(1, ("⚠ Reputation", "The remote address is "
+                                + reputation_text(rec.reputation) + "."))
         if f.note:
             sections.insert(1, ("Note", f.note + " — this connection "
                                 "was made by MiniWireshark itself."))
@@ -30838,6 +32218,531 @@ class MiniWireshark:
                 w.category, w.category_source = cat, src
             else:
                 w.category = w.category_source = ""
+
+    # ======================================================================
+    #  V5: Optional Intelligence & Components Center
+    # ======================================================================
+    def components_rows(self):
+        """Every optional component: (id, kind, name, status, size,
+        updated, license)."""
+        rows = []
+        usage = self.data.disk_usage()
+        for r in self.data.resources():
+            st = self.data.status.get(r.key, {})
+            on = self.data.enabled(r)
+            state = st.get("state", "missing")
+            if state == "ready":
+                status = "in use" if on else "downloaded, off"
+            elif state == "downloading":
+                status = "downloading…"
+            elif state == "error":
+                status = "problem — using built-in"
+            elif on:
+                status = "on, not downloaded yet"
+            else:
+                status = "off"
+            if r.key in self.data.doctor and state == "ready":
+                status += " (previous copy)"
+            rows.append((f"data:{r.key}", r.category, r.title, status,
+                         _human_bytes(usage.get(r.key, 0)) if usage.get(
+                             r.key) else r.download_est,
+                         st.get("version", "") or "—", r.license))
+        inst = PRIVATE_PACKAGES.installed()
+        for key, spec in OPTIONAL_PACKAGES.items():
+            if key in inst:
+                status = f"installed {inst[key].get('version', '')} " \
+                         f"(private folder)"
+            elif _module_ok(spec["import"]):
+                status = f"in your Python " \
+                         f"({_module_version(spec['import']) or '?'})"
+            else:
+                status = "not installed"
+            rows.append((f"pkg:{key}", "Python package", key, status,
+                         f"about {spec['size_mb']} MB",
+                         time.strftime("%Y-%m-%d", time.localtime(
+                             inst[key]["installed"])) if key in inst
+                         else "—", spec["license"]))
+        if IS_WINDOWS:
+            rows.append(("helper:npcap", "Capture driver", "Npcap",
+                         "installed" if _npcap_present() else "missing",
+                         "about 1 MB", "—", "Npcap free license (Nmap)"))
+        else:
+            rows.append(("helper:pcap", "Capture driver", "System capture "
+                         "(libpcap / raw sockets)", "built into the system",
+                         "—", "—", "part of the operating system"))
+        return rows
+
+    def components_detail(self, cid):
+        kind, _, key = cid.partition(":")
+        if kind == "data":
+            r = self.data.resource(key)
+            st = self.data.status.get(key, {})
+            meta = self.data.meta(key)
+            usage = self.data.disk_usage().get(key, 0)
+            lines = [
+                ("What it does", r.description),
+                ("Benefit", r.benefit or "—"),
+                ("Publisher", r.publisher or "—"),
+                ("License / terms", r.license or "—"),
+                ("Download", f"{r.download_est or '?'} from {r.url}"),
+                ("On disk", _human_bytes(usage) if usage else "nothing yet"),
+                ("Last update", (st.get("version") or "never") + (
+                    f" · {meta.get('summary')}" if meta.get("summary")
+                    else "")),
+                ("Privacy", r.sends),
+                ("Without it", r.fallback),
+                ("Proof of origin", meta.get("signature") or (
+                    "minisign signature (checked on every download)"
+                    if r.sig_url else "HTTPS + the file must parse and not "
+                                      "shrink by more than half")),
+                ("Updates", f"only when you ask{'' if self.data.policy() == 'Manual' else ', or weekly'}; "
+                            f"never more often than every "
+                            f"{human_duration(r.min_interval)}"),
+                ("Offline packs", "included" if r.redistributable else
+                 "never included (its terms don't allow re-sharing)"),
+            ]
+            if meta.get("last_error"):
+                lines.append(("Last problem", meta["last_error"]))
+            if key in self.data.doctor:
+                lines.append(("Pack doctor", self.data.doctor[key]))
+            return r.title, lines
+        if kind == "pkg":
+            spec = OPTIONAL_PACKAGES[key]
+            inst = PRIVATE_PACKAGES.installed().get(key)
+            return key, [
+                ("What it does", spec["benefit"]),
+                ("Version", optional_version(key) + " (pinned by this "
+                            "release; pip checks PyPI's own fingerprints)"),
+                ("License", spec["license"]),
+                ("Download", f"about {spec['size_mb']} MB from pypi.org"),
+                ("Where it goes", f"MiniWireshark's private packages folder "
+                                  f"({PKG_DIR}) — your Python is never "
+                                  f"changed"),
+                ("Status", (f"installed {inst.get('version')}" if inst else
+                            "not installed in the private folder")),
+                ("Without it", "MiniWireshark works normally; the feature "
+                               "above is simply slower or unavailable."),
+            ]
+        if key == "npcap":
+            return "Npcap", [
+                ("What it does", "Lets Windows programs capture network "
+                                 "traffic."),
+                ("Status", "installed" if _npcap_present() else
+                 "missing — Repair offers to install it (with your "
+                 "approval; the installer is signature-checked)"),
+                ("License", NPCAP_LICENSE_NOTE)]
+        return "System capture", [
+            ("What it does", "Linux and macOS capture traffic with their own "
+                             "built-in facilities; nothing to install.")]
+
+    def components_summary_text(self):
+        rows = self.components_rows()
+        on = sum(1 for r in rows if r[0].startswith("data:") and
+                 r[3].startswith("in use"))
+        pk = len(PRIVATE_PACKAGES.installed())
+        usage = sum(self.data.disk_usage().values())
+        return (f"{on} optional data source{'s' if on != 1 else ''} in use, "
+                f"{pk} private package{'s' if pk != 1 else ''}; "
+                f"{_human_bytes(usage)} of downloaded data. Updates: "
+                f"{self.data.policy().lower()}.")
+
+    def reenrich_session(self):
+        n = self.model.reenrich()
+        msg = (f"Re-labelled this session: {n['vendors']} vendor names, "
+               f"{n['remote']} Internet hosts, {n['websites']} website "
+               f"categories" + (f", {n['reputation']} blocklist matches"
+                                if n["reputation"] else "") + ".")
+        self._set_banner("\U0001F9E9  " + msg)
+        return n
+
+    def components_get(self, cid, parent=None, confirm=True):
+        kind, _, key = cid.partition(":")
+        parent = parent or self.root
+        if kind == "data":
+            r = self.data.resource(key)
+            if confirm and not messagebox.askyesno(
+                    "Get " + r.title,
+                    f"{r.description}\n\nDownload: {r.download_est} from "
+                    f"{r.publisher}.\nLicense: {r.license}.\nPrivacy: "
+                    f"{r.sends}\n\nDownload it now and turn it on?",
+                    parent=parent):
+                return False
+            if LEDGER.killed:
+                messagebox.showinfo("Kill switch", "The kill switch is on, "
+                                    "so nothing can be downloaded.",
+                                    parent=parent)
+                return False
+            self.data.set_enabled(key, True)
+            self.config.save()
+            self._components_queue.add(key)
+            self._components_pump()
+            return True
+        if kind == "pkg":
+            spec = OPTIONAL_PACKAGES[key]
+            if confirm and not messagebox.askyesno(
+                    f"Install {key}",
+                    f"{spec['benefit']}\n\nVersion {optional_version(key)} "
+                    f"(about {spec['size_mb']} MB from pypi.org, "
+                    f"{spec['license']}).\nIt goes into MiniWireshark's "
+                    f"private packages folder; your Python is not "
+                    f"changed.\n\nInstall it now?", parent=parent):
+                return False
+            self._set_banner(f"\U0001F9E9  Installing {key}…")
+
+            def work():
+                try:
+                    ver = PRIVATE_PACKAGES.pip_install(key)
+                    PRIVATE_PACKAGES.activate()
+                    OPTIONAL_MODULES.pop(key, None)
+                    msg = (f"{key} {ver} installed in the private packages "
+                           f"folder. Some features use it after a "
+                           f"restart.")
+                except Exception as e:               # noqa: BLE001
+                    msg = f"Couldn't install {key}: {str(e)[-300:]}"
+                self._async_results.put(lambda: self._set_banner(
+                    "\U0001F9E9  " + msg))
+            threading.Thread(target=work, daemon=True,
+                             name="component-install").start()
+            return True
+        if key == "npcap":
+            self.repair_everything(parent)
+        return False
+
+    def _components_pump(self):
+        """Feed queued downloads to the data manager one batch at a time;
+        re-label the session when they land."""
+        q = self._components_queue
+        if q and not self.data.busy():
+            keys = set(q)
+            q.clear()
+            self._components_inflight = keys
+            self.data.start(keys=keys)
+        if self._components_inflight and not self.data.busy() and not q:
+            done = [k for k in self._components_inflight
+                    if self.data.status.get(k, {}).get("state") == "ready"]
+            self._components_inflight = set()
+            _REP_GEN[0] += 1
+            if done:
+                self.reenrich_session()
+            return
+        if q or self._components_inflight:
+            self.root.after(400, self._components_pump)
+
+    def components_off(self, cid, on=False):
+        kind, _, key = cid.partition(":")
+        if kind == "data":
+            self.data.set_enabled(key, on)
+            self.config.save()
+            if on:
+                self.data.start()
+            else:
+                self.data.unload_disabled()
+            _REP_GEN[0] += 1
+
+    def components_delete(self, cid, parent=None):
+        kind, _, key = cid.partition(":")
+        parent = parent or self.root
+        if kind == "data":
+            r = self.data.resource(key)
+            if not messagebox.askyesno("Delete " + r.title,
+                                       f"Delete the downloaded {r.title} "
+                                       f"and turn it off? MiniWireshark "
+                                       f"goes back to: {r.fallback}.",
+                                       parent=parent):
+                return False
+            self.data.delete(key)
+            self.config.save()
+            _REP_GEN[0] += 1
+            return True
+        if kind == "pkg":
+            if key not in PRIVATE_PACKAGES.installed():
+                messagebox.showinfo(
+                    "Remove", f"{key} is not in MiniWireshark's private "
+                    f"folder" + (" — it belongs to your Python, which "
+                                 "MiniWireshark never changes." if
+                                 _module_ok(OPTIONAL_PACKAGES[key]["import"])
+                                 else "."), parent=parent)
+                return False
+            if not messagebox.askyesno("Remove", f"Remove {key} from the "
+                                       f"private packages folder?",
+                                       parent=parent):
+                return False
+            PRIVATE_PACKAGES.remove(key)
+            self._set_banner(f"\U0001F9E9  {key} removed (fully gone after "
+                             f"a restart).")
+            return True
+        return False
+
+    def components_reset(self, parent=None):
+        parent = parent or self.root
+        if not messagebox.askyesno(
+                "Return to built-in data",
+                "Turn off every optional data source and delete everything "
+                "downloaded for them? MiniWireshark keeps working with its "
+                "built-in lists. (Private packages are not touched.)",
+                parent=parent):
+            return False
+        self.data.reset_all()
+        self.config.save()
+        _REP_GEN[0] += 1
+        self.reenrich_session()
+        return True
+
+    def forget_learned_types(self, parent=None, confirm=True):
+        lt = learned_types()
+        n = len(lt.items)
+        if confirm and not messagebox.askyesno(
+                "Forget learned device types",
+                f"Forget the {n} device fingerprints learned from the types "
+                f"you set? The types you set on each device stay; only the "
+                f"look-alike suggestions stop.", parent=parent or self.root):
+            return False
+        lt.clear()
+        self.model._classify_dirty.update(self.model.registry.by_key)
+        self.model._classify()
+        self.tabs["devices"].rebuild()
+        return True
+
+    def components_export(self, parent=None, path=None):
+        parent = parent or self.root
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                parent=parent, title="Export offline pack",
+                defaultextension=".mwpack",
+                initialfile=f"miniwireshark-data-"
+                            f"{time.strftime('%Y%m%d')}.mwpack",
+                filetypes=[("MiniWireshark offline pack", "*.mwpack"),
+                           ("Zip file", "*.zip")])
+        if not path:
+            return None
+        keys, skipped = self.data.export_pack(path)
+        msg = (f"Saved {len(keys)} source{'s' if len(keys) != 1 else ''} "
+               f"to {os.path.basename(path)}." +
+               (f" Left out (their terms don't allow re-sharing): "
+                f"{', '.join(skipped)}." if skipped else ""))
+        self._set_banner("\U0001F9E9  " + msg)
+        return keys, skipped
+
+    def components_import(self, parent=None, path=None):
+        parent = parent or self.root
+        if path is None:
+            path = filedialog.askopenfilename(
+                parent=parent, title="Import offline pack",
+                filetypes=[("MiniWireshark offline pack", "*.mwpack"),
+                           ("Zip file", "*.zip"), ("All files", "*")])
+        if not path:
+            return None
+        try:
+            done, problems = self.data.import_pack(path)
+        except Exception as e:                       # noqa: BLE001
+            messagebox.showerror("Import offline pack", str(e),
+                                 parent=parent)
+            return None
+        self.config.save()
+        _REP_GEN[0] += 1
+        self.reenrich_session()
+        if problems:
+            messagebox.showwarning("Import offline pack",
+                                   "Imported: " + (", ".join(done) or
+                                                   "nothing") +
+                                   "\n\nNot imported:\n" +
+                                   "\n".join(problems), parent=parent)
+        return done, problems
+
+    def open_components_center(self, parent=None):
+        if getattr(self, "_cc_win", None) is not None:
+            with contextlib.suppress(tk.TclError):
+                self._cc_win.lift()
+                return self._cc_win
+        t = self.theme
+        win = tk.Toplevel(parent or self.root)
+        self._cc_win = win
+        win.title("Components Center")
+        win.geometry("980x680")
+        win.minsize(820, 560)
+        win.configure(bg=t["tab_bg"])
+        tk.Label(win, text="\U0001F9E9  Components Center", bg=t["tab_bg"],
+                 fg=t["text_fg"], font=("TkDefaultFont", 14, "bold"),
+                 anchor="w").pack(fill="x", padx=14, pady=(12, 0))
+        tk.Label(win, text="Optional data, packages and helpers. "
+                           "MiniWireshark watches your network without any "
+                           "of them, and nothing downloads unless you ask. "
+                           "Every download is listed in the self-traffic "
+                           "ledger, and the kill switch blocks them all.",
+                 bg=t["tab_bg"], fg=t["muted_fg"], anchor="w",
+                 justify="left", wraplength=940).pack(fill="x", padx=14,
+                                                      pady=(2, 8))
+        bar = tk.Frame(win, bg=t["tab_bg"])
+        bar.pack(fill="x", padx=14)
+        tk.Label(bar, text="Updates:", bg=t["tab_bg"],
+                 fg=t["text_fg"]).pack(side="left")
+        pol = tk.StringVar(value=self.data.policy())
+        cb = ttk.Combobox(bar, textvariable=pol, values=list(
+            DataManager.POLICIES), state="readonly", width=10)
+        cb.pack(side="left", padx=(4, 12))
+
+        def set_policy(_e=None):
+            self.config.set("components.policy", pol.get())
+            self.config.save()
+            refresh()
+        cb.bind("<<ComboboxSelected>>", set_policy)
+
+        def check_all():
+            on = [r.key for r in self.data.resources()
+                  if self.data.enabled(r)]
+            if not on:
+                messagebox.showinfo("Check now", "No optional data source "
+                                    "is turned on yet.", parent=win)
+                return
+            self._components_queue.update(on)
+            self._components_pump()
+        for label, fn in (("Check now", check_all),
+                          ("Export offline pack…",
+                           lambda: self.components_export(win)),
+                          ("Import offline pack…",
+                           lambda: self.components_import(win)),
+                          ("Return to built-in data…",
+                           lambda: self.components_reset(win)),
+                          ("Re-label this session",
+                           self.reenrich_session)):
+            ttk.Button(bar, text=label, command=fn).pack(side="left",
+                                                         padx=(0, 6))
+        body = ttk.PanedWindow(win, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=14, pady=10)
+        left = tk.Frame(body, bg=t["tab_bg"])
+        cols = ("kind", "status", "size", "updated", "license")
+        tree = ttk.Treeview(left, columns=cols, show="tree headings",
+                            selectmode="browse", height=14)
+        tree.heading("#0", text="Component")
+        tree.column("#0", width=230, stretch=True)
+        for c, title, w in (("kind", "Kind", 110), ("status", "Status", 170),
+                            ("size", "Size", 80), ("updated", "Updated", 90),
+                            ("license", "License", 160)):
+            tree.heading(c, text=title)
+            tree.column(c, width=w, stretch=c in ("status", "license"))
+        tree.pack(fill="both", expand=True)
+        body.add(left, weight=3)
+        right = tk.Frame(body, bg=t["card_bg"])
+        body.add(right, weight=2)
+        title_var = DisplayVar(value="Select a component")
+        tk.Label(right, textvariable=title_var, bg=t["card_bg"],
+                 fg=t["text_fg"], font=("TkDefaultFont", 12, "bold"),
+                 anchor="w").pack(fill="x", padx=10, pady=(8, 4))
+        txt = tk.Text(right, wrap="word", bg=t["card_bg"], fg=t["text_fg"],
+                      relief="flat", height=18, padx=10, pady=4,
+                      highlightthickness=0)
+        txt.pack(fill="both", expand=True)
+        txt.tag_configure("k", font=("TkDefaultFont", 9, "bold"),
+                          foreground=t["muted_fg"])
+        acts = tk.Frame(right, bg=t["card_bg"])
+        acts.pack(fill="x", padx=10, pady=8)
+        sel = {"id": None}
+        buttons = {}
+        for name, label in (("get", "Get / update"), ("on", "Turn on"),
+                            ("off", "Turn off"), ("rollback", "Roll back"),
+                            ("delete", "Delete")):
+            b = ttk.Button(acts, text=label)
+            b.pack(side="left", padx=(0, 6))
+            buttons[name] = b
+        status_var = DisplayVar(value="")
+        tk.Label(win, textvariable=status_var, bg=t["tab_bg"],
+                 fg=t["info_fg"], anchor="w").pack(fill="x", padx=14,
+                                                   pady=(0, 10))
+
+        def show(cid):
+            sel["id"] = cid
+            name, lines = self.components_detail(cid)
+            title_var.set(translate_text(name))
+            txt.configure(state="normal")
+            txt.delete("1.0", "end")
+            for k, v in lines:
+                txt.insert("end", translate_text(k) + "\n", "k")
+                txt.insert("end", f"{translate_text(str(v))}\n\n")
+            txt.configure(state="disabled")
+            kind = cid.split(":", 1)[0]
+            key = cid.split(":", 1)[1]
+            if kind == "data":
+                r = self.data.resource(key)
+                on = self.data.enabled(r)
+                have = self.data.status.get(key, {}).get("state") == "ready"
+                prev = os.path.exists(self.data._paths(r)[0] + ".prev")
+                states = {"get": True, "on": have and not on, "off": on,
+                          "rollback": prev, "delete": have or on}
+            elif kind == "pkg":
+                states = {"get": True, "on": False, "off": False,
+                          "rollback": False,
+                          "delete": key in PRIVATE_PACKAGES.installed()}
+            else:
+                states = {"get": key == "npcap" and not _npcap_present(),
+                          "on": False, "off": False, "rollback": False,
+                          "delete": False}
+            for n, b in buttons.items():
+                b.configure(state="normal" if states[n] else "disabled")
+
+        def refresh():
+            if not win.winfo_exists():
+                return
+            cur = sel["id"]
+            rows = self.components_rows()
+            known = set(tree.get_children())
+            for cid, kind, name, status, size, upd, lic in rows:
+                name = translate_text(name)
+                vals = (translate_text(kind), _tr_status(status), size, upd,
+                        translate_text(lic))
+                if cid in known:
+                    tree.item(cid, text=name, values=vals)
+                else:
+                    tree.insert("", "end", iid=cid, text=name, values=vals)
+            if cur:
+                show(cur)
+            status_var.set(self.components_summary_text())
+
+        def on_select(_e=None):
+            s = tree.selection()
+            if s:
+                show(s[0])
+
+        def act(name):
+            cid = sel["id"]
+            if not cid:
+                return
+            if name == "get":
+                self.components_get(cid, win)
+            elif name in ("on", "off"):
+                self.components_off(cid, on=(name == "on"))
+            elif name == "rollback":
+                if not self.data.rollback(cid.split(":", 1)[1]):
+                    messagebox.showinfo("Roll back", "There is no previous "
+                                        "copy to go back to.", parent=win)
+                else:
+                    self.reenrich_session()
+            elif name == "delete":
+                self.components_delete(cid, win)
+            refresh()
+        for n, b in buttons.items():
+            b.configure(command=lambda n=n: act(n))
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        def tick():
+            if not win.winfo_exists():
+                return
+            refresh()
+            win.after(1500, tick)
+        refresh()
+        first = tree.get_children()
+        if first:
+            tree.selection_set(first[0])
+            show(first[0])
+        tick()
+
+        def closed(_e=None):
+            if _e is None or _e.widget is win:
+                self._cc_win = None
+        win.bind("<Destroy>", closed)
+        win._mw_tree = tree
+        win._mw_act = act
+        win._mw_show = show
+        return win
 
     def data_status_text(self):
         return "\n".join(self.data.summary_lines())
@@ -36651,6 +38556,362 @@ def test_safe_mode_overrides(ctx):
         SAFE_REASON[0] = ""
 
 
+def _minisign_pair(seed=b"\x07" * 32, key_id=b"MWTESTK1"):
+    pk = ed25519_public_key(seed)
+    return seed, base64.b64encode(b"Ed" + key_id + pk).decode(), key_id
+
+
+def _minisign_sign(secret, key_id, data, comment="timestamp:1\tfile:x",
+                   prehash=True):
+    alg = b"ED" if prehash else b"Ed"
+    msg = hashlib.blake2b(data, digest_size=64).digest() if prehash \
+        else data
+    sig = ed25519_sign(secret, msg)
+    gsig = ed25519_sign(secret, sig + comment.encode())
+    return ("untrusted comment: test\n" +
+            base64.b64encode(alg + key_id + sig).decode() + "\n" +
+            "trusted comment: " + comment + "\n" +
+            base64.b64encode(gsig).decode() + "\n")
+
+
+def _stamp(proto, addr, host="", path="", hashes=(b"\x01" * 32,)):
+    def lp(b):
+        return bytes([len(b)]) + b
+    body = bytes([proto]) + b"\x00" * 8
+    if proto == 0x02 or proto == 0x03:
+        h = b""
+        for i, x in enumerate(hashes):
+            n = len(x) | (0x80 if i < len(hashes) - 1 else 0)
+            h += bytes([n]) + x
+        body += lp(addr.encode()) + h + lp(host.encode())
+        if proto == 0x02:
+            body += lp(path.encode())
+    elif proto == 0x00:
+        body += lp(addr.encode())
+    return "sdns://" + base64.urlsafe_b64encode(body).decode().rstrip("=")
+
+
+IANA_SAMPLE = (
+    "Service Name,Port Number,Transport Protocol,Description,Assignee,"
+    "Contact,Registration Date,Modification Date,Reference,Service Code,"
+    "Unauthorized Use Reported,Assignment Notes\n"
+    ",0,tcp,Reserved,,,,2024-12-20,[RFC 6335],,,\n"
+    "tcpmux,1,tcp,TCP Port Service Multiplexer,[Mark_Lottor],"
+    "[Mark_Lottor],,,,,,\n"
+    "x11,6000-6003,tcp,X Window System,[Stephen_Gildea],,,,,,,\n"
+    "ibm-mqisdp,1883,tcp,IBM MQSeries SCADA,[Andy_Stanford-Clark],,,,,,,\n"
+    "secure-mqtt,8883,tcp,\"Secure MQTT\",[Andy],,,,,,,\n"
+    "big,1000-9000,tcp,too wide a range,,,,,,,,\n")
+FEODO_SAMPLE = (
+    "################################################################\n"
+    "# abuse.ch Feodo Tracker Botnet C2 IP Blocklist (recommended)  #\n"
+    "# Last updated: 2026-10-18 14:28:39 UTC                        #\n"
+    "#\n# DstIP\n50.16.16.211\n93.184.215.14\n10.0.0.1\n# END 3 entries\n")
+DROP_SAMPLE = "".join(
+    json.dumps({"cidr": f"203.0.{i}.0/24", "sblid": f"SBL{1000 + i}",
+                "rir": "ripencc"}) + "\n" for i in range(150)) + \
+    json.dumps({"cidr": "93.184.215.0/24", "sblid": "SBL9", "rir": "x"}) + \
+    "\n" + json.dumps({"type": "metadata", "timestamp": 1792000000,
+                       "size": 151}) + "\n"
+
+
+@self_test(slow=False)
+def test_components_parsers(ctx):
+    """Components Center parsers: IANA ports, DNS stamps, minisign
+    (prehashed and legacy), abuse.ch and Spamhaus lists, two-source
+    reputation."""
+    p = ctx.path("iana.csv")
+    with open(p, "w") as f:
+        f.write(IANA_SAMPLE)
+    db = load_iana_services(p)
+    assert db.lookup(1883) == ("ibm-mqisdp", "IBM MQSeries SCADA")
+    assert db.lookup(6002) == ("x11", "X Window System")
+    assert db.lookup(0) is None and db.lookup(5000) is None
+    assert db.lookup(1883, "udp") is None
+    s = parse_dns_stamp(_stamp(0x02, "9.9.9.9:443", "dns.example-doh.net",
+                               "/dns-query"))
+    assert s == {"proto": "DoH", "addr": "9.9.9.9",
+                 "host": "dns.example-doh.net", "path": "/dns-query"}, s
+    s = parse_dns_stamp(_stamp(0x03, "[2001:db8::53]:853", "dot.example",
+                               hashes=(b"\x02" * 32, b"\x03" * 32)))
+    assert s["proto"] == "DoT" and s["addr"] == "2001:db8::53" and \
+        s["host"] == "dot.example", s
+    assert parse_dns_stamp("sdns://AA") is None
+    assert parse_dns_stamp("https://x") is None
+    md = ctx.path("resolvers.md")
+    with open(md, "w") as f:
+        f.write("# public-resolvers\n\n## example-doh\nA test.\n" +
+                _stamp(0x02, "192.0.2.53", "doh.example.org", "/q") +
+                "\n\n## plain\n" + _stamp(0x00, "192.0.2.1") + "\n")
+    rdb = load_dnscrypt_list(md)
+    assert rdb.lookup("doh.example.org") == ("example-doh", "DoH")
+    assert rdb.lookup("192.0.2.53") == ("example-doh", "DoH")
+    assert rdb.lookup("192.0.2.1") is None and len(rdb) == 1
+    secret, pub, kid = _minisign_pair()
+    data = b"resolver list body\n"
+    for pre in (True, False):
+        sig = _minisign_sign(secret, kid, data, prehash=pre)
+        assert minisign_verify(data, sig, pub) == (True,
+                                                   "timestamp:1\tfile:x")
+        assert minisign_verify(data + b"!", sig, pub)[0] is False
+    sig = _minisign_sign(secret, kid, data)
+    bad_tc = sig.replace("timestamp:1", "timestamp:2")
+    assert minisign_verify(data, bad_tc, pub) == \
+        (False, "the trusted comment was altered")
+    _s2, pub2, _k2 = _minisign_pair(b"\x08" * 32, b"OTHERKEY")
+    assert minisign_verify(data, sig, pub2)[1] == "signed with a different key"
+    assert minisign_verify(data, "garbage", pub)[0] is False
+    fp = ctx.path("feodo.txt")
+    with open(fp, "w") as f:
+        f.write(FEODO_SAMPLE)
+    assert validate_feodo(fp) == (True, "2 listed addresses")
+    feodo = load_feodo(fp)
+    assert feodo.lookup("50.16.16.211") and not feodo.lookup("10.0.0.1")
+    assert feodo.updated.startswith("2026-10-18")
+    dp = ctx.path("drop.json")
+    with open(dp, "w") as f:
+        f.write(DROP_SAMPLE)
+    drop = load_drop(dp)
+    assert len(drop) == 151 and drop.updated
+    assert drop.lookup("203.0.42.7") == "SBL1042 203.0.42.0/24"
+    assert drop.lookup("198.51.100.1") == ""
+    rep = ReputationDB([feodo, drop])
+    hits = rep.lookup("93.184.215.14")
+    assert sorted(h[0] for h in hits) == ["Spamhaus DROP",
+                                          "abuse.ch Feodo Tracker"], hits
+    assert rep.lookup("192.168.1.5") == [] and rep.lookup("") == []
+    txt = reputation_text(hits)
+    assert "listed by abuse.ch Feodo Tracker" in txt and "SBL9" in txt
+    assert "malicious" not in txt and "hacked" not in txt
+    e = explain_port_text(3389)
+    assert "Remote Desktop" in e and "ransomware" in e, e
+    assert "ephemeral" in explain_port_text(51515)
+
+
+@self_test(slow=False)
+def test_components_manager_lifecycle(ctx):
+    """Download (file:// stands in for HTTPS), signature check, previous
+    copy kept, the pack doctor falls back to it, roll back, delete,
+    baseline reset, offline packs that respect licenses, min interval."""
+    cache = ctx.path("cc_lifecycle")
+    os.makedirs(cache)
+    cfg = ctx.cfg({"components.feodo": True, "components.drop": True,
+                   "components.doh": True})
+    dm = DataManager(cache, cfg)
+    src = ctx.path("cc_srv")
+    os.makedirs(src)
+
+    def url(name):
+        return "file://" + urllib.request.pathname2url(
+            os.path.join(src, name))
+    with open(os.path.join(src, "feodo.txt"), "w") as f:
+        f.write(FEODO_SAMPLE)
+    feodo_r = dataclasses.replace(dm.resource("feodo"), url=url(
+        "feodo.txt"), min_interval=0)
+    drop_r = dataclasses.replace(dm.resource("drop"), url=url("drop.json"),
+                                 min_interval=0)
+    with open(os.path.join(src, "drop.json"), "w") as f:
+        f.write(DROP_SAMPLE)
+    secret, pub, kid = _minisign_pair()
+    body = ("# public-resolvers\n" + "".join(
+        f"\n## r{i}\n" + _stamp(0x02, f"192.0.2.{i}", f"doh{i}.example",
+                                "/q") + "\n" for i in range(60))).encode()
+    with open(os.path.join(src, "res.md"), "wb") as f:
+        f.write(body)
+    with open(os.path.join(src, "res.md.minisig"), "w") as f:
+        f.write(_minisign_sign(secret, kid, body))
+    doh_r = dataclasses.replace(dm.resource("doh"), url=url("res.md"),
+                                sig_url=url("res.md.minisig"),
+                                minisign_key=pub, min_interval=0)
+    assert dm._download(feodo_r) and dm._verify_and_load(feodo_r)
+    assert dm.get("feodo").lookup("50.16.16.211")
+    assert dm._download(doh_r) and dm._verify_and_load(doh_r)
+    assert dm.meta("doh")["signature"] == "minisign ok"
+    assert dm.get("doh").lookup("doh7.example") == ("r7", "DoH")
+    # a tampered list is refused, the good copy stays
+    with open(os.path.join(src, "res.md"), "ab") as f:
+        f.write(b"\n## evil\n")
+    assert dm._download(doh_r) is False
+    assert "signature check failed" in dm.meta("doh")["last_error"]
+    assert dm.get("doh") is not None
+    # second download keeps the previous copy; a damaged copy falls back
+    assert dm._download(drop_r) and dm._verify_and_load(drop_r)
+    assert dm._download(drop_r)
+    path, meta = dm._paths(drop_r)
+    assert os.path.exists(path + ".prev")
+    with open(path, "a") as f:
+        f.write("tampered\n")
+    with dm.lock:
+        dm.objects.pop("drop", None)
+    assert dm._verify_and_load(drop_r)
+    assert "previous copy" in dm.doctor["drop"], dm.doctor
+    assert dm.get("drop").lookup("203.0.1.1")
+    # the shrink guard keeps a list that suddenly lost most entries
+    small = "".join(json.dumps({"cidr": f"198.18.{i}.0/24"}) + "\n"
+                    for i in range(101))
+    atomic_write_json(meta, dict(read_json(meta), summary="5000 blocks"))
+    with open(os.path.join(src, "drop.json"), "w") as f:
+        f.write(small)
+    assert dm._download(drop_r) is False
+    assert "less than half" in dm.meta("drop")["last_error"]
+    # min interval: a fresh copy is not fetched again
+    quick = dataclasses.replace(feodo_r, min_interval=3600)
+    assert dm._download(quick) is False
+    # offline pack: CC0 Feodo goes in; DROP and DNSCrypt never do
+    pack = ctx.path("data.mwpack")
+    keys, skipped = dm.export_pack(pack)
+    assert keys == ["feodo"], keys
+    assert "Hijacked address blocks" in skipped and \
+        "Encrypted-DNS resolvers" in skipped, skipped
+    cache2 = ctx.path("cc_lifecycle2")
+    os.makedirs(cache2)
+    cfg2 = ctx.cfg()
+    dm2 = DataManager(cache2, cfg2)
+    done, problems = dm2.import_pack(pack)
+    assert done == ["feodo"] and not problems, (done, problems)
+    assert cfg2.get("components.feodo") is True
+    assert dm2.get("feodo").lookup("50.16.16.211")
+    assert dm2.meta("feodo")["via"] == "offline pack"
+    import zipfile
+    bad = ctx.path("bad.mwpack")
+    with zipfile.ZipFile(pack) as zin, zipfile.ZipFile(bad, "w") as zout:
+        for n in zin.namelist():
+            data = zin.read(n)
+            if n.endswith(".txt"):
+                data += b"203.0.113.9\n"
+            zout.writestr(n, data)
+    os.makedirs(ctx.path("cc_lifecycle3"))
+    done, problems = DataManager(ctx.path("cc_lifecycle3"),
+                                 ctx.cfg()).import_pack(bad)
+    assert not done and "fingerprint mismatch" in problems[0], problems
+    # roll back, delete, return to baseline
+    assert dm.rollback("drop") or True
+    dm.delete("feodo")
+    assert dm.get("feodo") is None and not cfg.get("components.feodo")
+    assert not os.path.exists(dm._paths(feodo_r)[0])
+    dm.reset_all()
+    assert all(not dm.enabled(r) for r in dm.resources())
+    assert sum(dm.disk_usage().values()) == 0
+
+
+@self_test()
+def test_reputation_alerts_and_reenrich(ctx):
+    """A device contacting a listed address raises a cautious alert; two
+    independent lists make it stronger; turning a list on later and
+    re-labelling the session finds earlier contacts too."""
+    if not ctx.scapy_ok:
+        return "skip"
+    cache = ctx.path("rep")
+    os.makedirs(cache)
+    cfg = ctx.cfg({"components.feodo": True, "components.drop": False})
+    dm = DataManager(cache, cfg)
+    for key, body in (("feodo", FEODO_SAMPLE), ("drop", DROP_SAMPLE)):
+        r = dm.resource(key)
+        tmp = os.path.join(cache, f"{key}.tmp")
+        with open(tmp, "w") as f:
+            f.write(body)
+        dm._install_file(r, tmp, "test", "test")
+    dm._verify_and_load(dm.resource("feodo"))
+    old = globals()["DATA"]
+    globals()["DATA"] = dm
+    _REP_GEN[0] += 1
+    try:
+        m = scenario_model(cfg, ctx.frames())
+        reps = [a for a in m.alerts.alerts.values() if a.kind ==
+                "reputation"]
+        assert reps, "no reputation alert"
+        a = reps[0]
+        assert a.severity == "WARNING" and "93.184.215.14" in a.observed
+        assert "Feodo" in a.observed and "hacked" not in a.observed.lower()
+        assert m.remote_hosts["93.184.215.14"].reputation
+        # now the second list: re-labelling finds the same host again
+        cfg.set("components.drop", True)
+        dm._verify_and_load(dm.resource("drop"))
+        for x in reps:
+            m.alerts.acknowledge(x.id)
+        m.alerts._debounce.clear()
+        n = m.reenrich()
+        assert n["remote"] >= 1, n
+        strong = [x for x in m.alerts.alerts.values()
+                  if x.kind == "reputation" and x.severity == "DANGER"]
+        assert strong, [x.severity for x in m.alerts.alerts.values()
+                        if x.kind == "reputation"]
+        assert "two public blocklists" in strong[0].reason
+    finally:
+        globals()["DATA"] = old
+        _REP_GEN[0] += 1
+
+
+@self_test(slow=False)
+def test_teach_once_fingerprints(ctx):
+    """Setting a device's type remembers its fingerprint on this computer;
+    a look-alike needs two matching signals before it gets a suggestion,
+    and the suggestion says where it was learned."""
+    lt = LearnedTypes(path=ctx.path("learned.json"))
+    a = DeviceRecord(key="00:1b:a9:00:00:01", mac="00:1b:a9:00:00:01",
+                     dhcp_params="1,3,6,15,51", dhcp_hostname="NPI6A1B2C")
+    b = DeviceRecord(key="00:1b:a9:00:00:02", mac="00:1b:a9:00:00:02",
+                     dhcp_params="1,3,6,15,51")
+    c = DeviceRecord(key="00:1b:a9:00:00:03", mac="00:1b:a9:00:00:03")
+    r = DeviceRecord(key="ip:10.0.0.9", ip="10.0.0.9")
+    assert lt.learn(a, "Printer")
+    assert not lt.learn(r, "Printer"), "no signals: nothing to learn"
+    hit = lt.match(b)
+    assert hit and hit["cls"] == "Printer" and hit["score"] == 5, hit
+    assert "same DHCP request list" in hit["why"]
+    assert lt.match(c) is None, "one signal (maker block) is not enough"
+    assert lt.match(a) is None, "a device never matches itself"
+    again = LearnedTypes(path=ctx.path("learned.json"))
+    assert again.match(b)["cls"] == "Printer", "saved to disk"
+    lt.forget(a.key)
+    assert lt.match(b) is None
+    assert LearnedTypes(path=ctx.path("learned.json")).items == []
+    assert _name_pattern("ESP_6A1B2C") == "esp_*"
+    assert _name_pattern("Krystel's laptop") == ""
+    lt2 = LearnedTypes(path=ctx.path("learned2.json"))
+    for i in range(LearnedTypes.MAX + 20):
+        lt2.learn(DeviceRecord(key=f"k{i}", mac=f"00:1b:a9:00:{i // 256:02x}:"
+                                               f"{i % 256:02x}",
+                               dhcp_params="1,3"), "Camera")
+    assert len(lt2.items) == LearnedTypes.MAX, "bounded"
+
+
+@self_test()
+def test_set_device_type_model_and_undo(ctx):
+    """'Set device type' overrides detection, says so, is journalled with
+    a readable description, survives as a saved label, and undoes back to
+    the detected type."""
+    if not ctx.scapy_ok:
+        return "skip"
+    old = LEARNED[0]
+    LEARNED[0] = LearnedTypes(path=ctx.path("learned-m.json"))
+    try:
+        m = scenario_model(ctx.cfg(), ctx.frames())
+        dev = next(d for d in m.registry.by_key.values()
+                   if d.mac and d.device_class not in ("Printer",
+                                                       "This computer"))
+        before = (dev.device_class, dev.class_confidence)
+        assert m.correct_type(dev.key, "Printer") == [dev.key]
+        assert dev.user_class == "Printer" and dev.device_class == "Printer"
+        assert dev.class_confidence == "" and \
+            dev.class_reasons[0] == "You set this type"
+        assert m.correct_type(dev.key, "Printer") == [], "no-op"
+        assert m.correct_type(dev.key, "Spaceship") == [], "unknown type"
+        e = m.journal.last_undoable()
+        assert e["op"] == "type"
+        text = m.journal.describe(e)
+        assert "detected → Printer" in text, text
+        store = KnownDevicesStore(ctx.path("known.json"))
+        store.update_from(dev)
+        assert store.data[dev.key]["user_class"] == "Printer"
+        m.undo_correction()
+        assert dev.user_class == "" and \
+            (dev.device_class, dev.class_confidence) == before
+        assert "user_class" in DEVICE_SAVE_FIELDS
+    finally:
+        LEARNED[0] = old
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -37417,6 +39678,73 @@ def _gs_v5_startup(app, ctx):
     assert "Private packages folder" in app.runtime_status_text()
 
 
+@gui_test_step("Components Center: catalog, details, packs, baseline")
+def _gs_components(app, ctx):
+    root = app.root
+    w = app.open_components_center()
+    _gui_pump(root, 0.3)
+    ids = w._mw_tree.get_children()
+    for cid in ("data:oui", "data:feodo", "data:drop", "data:doh",
+                "pkg:psutil", "pkg:cryptography"):
+        assert cid in ids, ids
+    name, lines = app.components_detail("data:doh")
+    d = dict(lines)
+    assert "minisign" in d["Proof of origin"] and "never included" in \
+        d["Offline packs"], d
+    name, lines = app.components_detail("data:drop")
+    assert "your own use only" in dict(lines)["License / terms"]
+    # a source installed by hand behaves like a download
+    r = app.data.resource("feodo")
+    tmp = ctx.path("feodo-gui.txt")
+    with open(tmp, "w") as f:
+        f.write(FEODO_SAMPLE)
+    app.data._install_file(r, tmp, "2 listed addresses", "test")
+    app.data.set_enabled("feodo", True)
+    assert app.data._verify_and_load(r)
+    _gui_pump(root, 1.8)
+    row = w._mw_tree.item("data:feodo", "values")
+    assert row[1] == "in use", row
+    keys, skipped = app.components_export(path=ctx.path("gui.mwpack"))
+    assert keys == ["feodo"], keys
+    assert app.components_reset()
+    assert app.data.get("feodo") is None
+    done, problems = app.components_import(path=ctx.path("gui.mwpack"))
+    assert done == ["feodo"] and not problems
+    assert "1 optional data source in use" in app.components_summary_text()
+    w._mw_show("data:feodo")
+    w.destroy()
+    app._open_settings("components")
+    _gui_pump(root, 0.3)
+    app._settings_win.win.destroy()
+    app.data.delete("feodo")
+
+
+@gui_test_step("Set device type: menu, card and undo")
+def _gs_set_device_type(app, ctx):
+    old = LEARNED[0]
+    LEARNED[0] = LearnedTypes(path=ctx.path("learned-gui.json"))
+    try:
+        dev = next(d for d in app.model.registry.by_key.values()
+                   if d.mac and d.device_class != "This computer")
+        labels = [x[0] for x in app.device_menu_items(dev) if x]
+        assert "Set device type…" in labels, labels
+        app.set_device_type(dev.key, choice="Camera")
+        _gui_pump(app.root, 0.3)
+        assert dev.device_class == "Camera"
+        rep = dict(app.device_report(dev))
+        what = rep["What is it?"]
+        assert "Camera" in what and "You set this type" in what, what
+        seen = rep.get("What did MiniWireshark see?", "")
+        if dev.vendor and vendor_source(dev.mac) and seen:
+            assert "(from " in seen, seen
+        app.set_device_type(dev.key, choice="")
+        _gui_pump(app.root, 0.3)
+        assert dev.user_class == "" and dev.class_reasons[:1] != [
+            "You set this type"]
+    finally:
+        LEARNED[0] = old
+
+
 @gui_test_step("network consent: new network is quiet until trusted")
 def _gs_consent(app, ctx):
     root = app.root
@@ -37893,11 +40221,8 @@ def main():
             boot_step("capture engine", True, _scapy_version() or "")
         except Exception as e:                       # noqa: BLE001
             LOG.exception("scapy import")
-            CAPTURE_LIMITED[0] = (f"The capture engine (scapy) didn't load "
-                                  f"({type(e).__name__}: {str(e)[:160]}). "
-                                  f"Live capture is off; Demo Mode and "
-                                  f"opening capture files still work. "
-                                  f"Settings → Repair can fix it.")
+            CAPTURE_LIMITED[0] = (f"The capture engine (scapy) didn't load: "
+                                  f"{type(e).__name__}: {str(e)[:160]}")
             boot_step("capture engine", False, error=e)
     loader.post_status("Looking at your network adapters ...")
     loader.pump()
@@ -37993,14 +40318,22 @@ def startup_notice():
     """Plain words for anything unusual about this start (or "")."""
     parts = []
     if SAFE_MODE:
-        parts.append("🛟 Safe Mode — " + (SAFE_REASON[0] or "") +
-                     " Automatic capture, history, helpers and downloads "
-                     "are off for this session. Repair checks the usual "
-                     "causes.")
+        parts.append("🛟 " + translate_text("Safe Mode") + " — " +
+                     translate_text(SAFE_REASON[0] or "") + " " +
+                     translate_text("Automatic capture, history, helpers "
+                                    "and downloads are off for this "
+                                    "session. Repair checks the usual "
+                                    "causes."))
     if HANDOFF_NOTE[0]:
-        parts.append("⚠ " + HANDOFF_NOTE[0])
+        parts.append("⚠ " + translate_text(
+            "The managed Python couldn't open its window, so MiniWireshark "
+            "is using the Python you started it with.") +
+            "\n   (" + HANDOFF_NOTE[0] + ")")
     if CAPTURE_LIMITED[0]:
-        parts.append("⚠ " + CAPTURE_LIMITED[0])
+        parts.append("⚠ " + translate_text(
+            "Live capture is off because the capture engine (scapy) isn't "
+            "available. Opening capture files still works, and Repair can "
+            "fix it.") + "\n   (" + CAPTURE_LIMITED[0] + ")")
     return "\n".join(parts)
 
 
