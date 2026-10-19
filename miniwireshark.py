@@ -66,6 +66,7 @@ import ipaddress
 import json
 import logging
 import logging.handlers
+import marshal
 import math
 import os
 import platform
@@ -83,6 +84,7 @@ import sys
 import tempfile
 import threading
 import types
+import zlib
 import time
 import traceback
 import urllib.error
@@ -849,8 +851,9 @@ RELEASE_FLAGS = ("--release-check", "--make-release-key", "--sign-release",
                  "--sign-datapack")
 RELEASE_MODE = any(f in sys.argv for f in RELEASE_FLAGS)
 BOOT_CHECK_MODE = BOOT_CHECK_FLAG in sys.argv
+WORKER_MODE = "--mw-worker" in sys.argv      # a Full Power worker process
 TOOL_MODE = SELF_TEST_MODE or GUI_TEST_MODE or BENCH_MODE or \
-    RELEASE_MODE or BOOT_CHECK_MODE
+    RELEASE_MODE or BOOT_CHECK_MODE or WORKER_MODE
 START_IN_DEMO = DEMO_FLAG in sys.argv
 
 if ELEVATED_FLAG in sys.argv:
@@ -7640,7 +7643,7 @@ def fast_decode(raw, ts, lt=1, reasm=None, gateway_ip="", my_ips=()):
     except (NeedDeepParse, struct.error, IndexError, ValueError, TypeError):
         pass
     if Ether is None:
-        raise RuntimeError("no decoder available for this frame")
+        return _row_from_dissection(raw, ts, lt)
     try:
         cls = Ether if lt == 1 else (conf.l2types.get(lt) or Raw)
         pkt = cls(raw)
@@ -7657,6 +7660,34 @@ def fast_decode(raw, ts, lt=1, reasm=None, gateway_ip="", my_ips=()):
     d["time"] = ts
     d["raw"] = raw
     d["linktype"] = lt
+    return d
+
+
+def _row_from_dissection(raw, ts, lt):
+    """A basic row from MiniWireshark's own dissector, for frames the fast
+    path declines when scapy is not available (limited mode)."""
+    d = _fast_new(raw, ts, lt)
+    dis = dissect(raw, lt)
+    d["src_ip"] = dis.get("ip.src") or dis.get("ipv6.src") or ""
+    d["dst_ip"] = dis.get("ip.dst") or dis.get("ipv6.dst") or ""
+    d["src"], d["dst"] = d["src_ip"], d["dst_ip"]
+    d["src_mac"] = dis.get("eth.src") or dis.get("sll.src.eth") or ""
+    d["dst_mac"] = dis.get("eth.dst") or ""
+    for t in ("tcp", "udp"):
+        if dis.get(f"{t}.srcport") is not None:
+            d["sport"], d["dport"] = dis.get(f"{t}.srcport"), \
+                dis.get(f"{t}.dstport")
+            d["transport"] = t.upper()
+    top = next((n for n in reversed(dis.nodes)
+                if n.key not in ("frame", "data", "text")), None)
+    name = {"ip": "IPv4", "ipv6": "IPv6", "eth": "Ethernet", "sll": "Linux",
+            "vlan": "VLAN"}.get(top.key, top.key.upper()) if top else "?"
+    d["proto"], d["tag"] = name, name if name in (
+        "TCP", "UDP", "DNS", "ARP", "ICMP", "DHCP", "TLS", "QUIC",
+        "HTTP") else "OTHER"
+    d["ipver"] = 4 if dis.get("ip.src") else 6 if dis.get("ipv6.src") \
+        else 0
+    d["text"] = (top.title if top else "Frame") + " (basic decode)"
     return d
 
 
@@ -9209,6 +9240,14 @@ class AnalysisWorker(threading.Thread):
         app = self.app
         gen = app.gen
         model = app.model
+        deep = getattr(app, "deep", None)
+        if deep is not None:
+            try:
+                app.sync_deep()        # mode switches happen only here
+            except Exception:                        # noqa: BLE001
+                LOG.exception("deep analysis setup")
+            if not deep.active():
+                deep = None
         gw, my_ips = model.gateway_ip, model.my_ips
         decoded = []
         for raw, ts, lt, g in batch:
@@ -9250,6 +9289,8 @@ class AnalysisWorker(threading.Thread):
                         app._analysis_errors += 1
                         if app._analysis_errors <= 5:
                             LOG.exception("analysis error")
+                    if deep is not None:
+                        deep.offer(d, d["no"])
                     if time.perf_counter() - t0 > self.SLICE:
                         break
                 rows = decoded[start:i]
@@ -16950,7 +16991,10 @@ def _default_config():
                    "flag_http": False,
                    "muted_devices": [], "expected": []},
         "notifications": {"feed_alerts": True, "danger_only": False},
-        "performance": {"cpu_friendly_mode": False, "mode": "Automatic"},
+        "performance": {"cpu_friendly_mode": False, "mode": "Automatic",
+                        "full_power_cores": 2, "ram_cap_mb": 1536,
+                        "shedding": "Smart", "battery_aware": True,
+                        "deep_runner": "Automatic"},
         "export": {"default_dir": ""},
         "mode": {"active_scanning": True},
         "shortcuts": dict(DEFAULT_SHORTCUTS),
@@ -19469,6 +19513,22 @@ Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
 Automatic (MiniWireshark decides) ¦ Automatique (MiniWireshark décide) ¦ Automático (MiniWireshark decide)
 You set this type ¦ Vous avez choisi ce type ¦ Usted eligió este tipo
 detected ¦ détecté ¦ detectado
+Full Power ¦ Pleine puissance ¦ Máxima potencia
+Full Power budget ¦ Budget de la pleine puissance ¦ Presupuesto de máxima potencia
+Processor cores to use ¦ Cœurs de processeur à utiliser ¦ Núcleos de procesador a usar
+The deep pass runs in this many helper processes (at most one less than the computer has, so the window and the capture always keep a core). ¦ L'analyse approfondie tourne dans ce nombre de processus d'aide (au plus un de moins que l'ordinateur n'en a, pour que la fenêtre et la capture gardent toujours un cœur). ¦ El análisis profundo se ejecuta en esta cantidad de procesos auxiliares (como máximo uno menos de los que tiene el equipo, para que la ventana y la captura conserven siempre un núcleo).
+Memory for reassembly and queues ¦ Mémoire pour le réassemblage et les files ¦ Memoria para reensamblado y colas
+Streams waiting for a missing piece and packets waiting for the deep pass stay inside this. The oldest stream closes first, marked with its gap. ¦ Les flux qui attendent un morceau manquant et les paquets qui attendent l'analyse approfondie restent dans cette limite. Le flux le plus ancien se ferme en premier, avec son trou indiqué. ¦ Los flujos que esperan una parte que falta y los paquetes que esperan el análisis profundo se mantienen dentro de este límite. El flujo más antiguo se cierra primero, marcado con su hueco.
+When it falls behind ¦ Quand elle prend du retard ¦ Cuando se retrasa
+Smart ¦ Intelligent ¦ Inteligente
+Strict ¦ Strict ¦ Estricto
+Smart skips the least useful work first (repeats of a big download before names, connection set-up and anything behind an alert), using the measured cost of each analyzer. Off only skips when the queue is full. Strict keeps a small queue. Skipped packets are counted, never hidden. ¦ Intelligent saute d'abord le travail le moins utile (les répétitions d'un gros téléchargement avant les noms, l'ouverture des connexions et tout ce qui est lié à une alerte), selon le coût mesuré de chaque analyseur. Désactivé ne saute que si la file est pleine. Strict garde une petite file. Les paquets sautés sont comptés, jamais cachés. ¦ Inteligente omite primero el trabajo menos útil (las repeticiones de una descarga grande antes que los nombres, el inicio de conexiones y todo lo relacionado con una alerta), según el coste medido de cada analizador. Desactivado solo omite cuando la cola está llena. Estricto mantiene una cola pequeña. Los paquetes omitidos se cuentan, nunca se ocultan.
+Pause Full Power on battery below 30 % ¦ Suspendre la pleine puissance sur batterie sous 30 % ¦ Pausar la máxima potencia con batería por debajo del 30 %
+Full Power works like Normal until the computer is plugged in again; the status bar says so. ¦ La pleine puissance fonctionne comme Normal jusqu'à ce que l'ordinateur soit rebranché ; la barre d'état l'indique. ¦ La máxima potencia funciona como Normal hasta que el equipo se vuelva a enchufar; la barra de estado lo indica.
+Where the deep pass runs ¦ Où tourne l'analyse approfondie ¦ Dónde se ejecuta el análisis profundo
+Thread ¦ Fil d'exécution ¦ Hilo
+Automatic uses helper processes when the computer has more than one core (measured faster), else a thread. Thread keeps everything in one process. ¦ Automatique utilise des processus d'aide quand l'ordinateur a plus d'un cœur (plus rapide, mesuré), sinon un fil d'exécution. Fil d'exécution garde tout dans un seul processus. ¦ Automático usa procesos auxiliares cuando el equipo tiene más de un núcleo (medido más rápido); si no, un hilo. Hilo mantiene todo en un solo proceso.
+Automatic slows screen refreshes when traffic is heavy or the window lags. Low CPU always refreshes about 2.5× less often. Full Power adds a deep pass (every dissector, stream reassembly, expert findings) inside the budget below. None of them changes what the network card can see, sends anything, or changes an alert threshold. ¦ Automatique ralentit l'actualisation de l'écran quand le trafic est intense ou que la fenêtre rame. Économie de processeur actualise toujours environ 2,5× moins souvent. Pleine puissance ajoute une analyse approfondie (tous les décodeurs, le réassemblage des flux, les constats d'expert) dans le budget ci-dessous. Aucun ne change ce que la carte réseau peut voir, n'envoie quoi que ce soit ni ne modifie un seuil d'alerte. ¦ Automático ralentiza la actualización de la pantalla cuando el tráfico es intenso o la ventana va lenta. Bajo consumo de CPU actualiza siempre unas 2,5× menos. Máxima potencia añade un análisis profundo (todos los decodificadores, reensamblado de flujos, hallazgos de experto) dentro del presupuesto de abajo. Ninguno cambia lo que la tarjeta de red puede ver, envía nada ni cambia un umbral de alerta.
 I could not start watching ¦ Je n'ai pas pu commencer la surveillance ¦ No pude empezar a vigilar
 No permission to capture ¦ Pas d'autorisation pour capturer ¦ Sin permiso para capturar
 Run MiniWireshark as Administrator (Windows) or with sudo / the capture capability (Linux, macOS). ¦ Lancez MiniWireshark en tant qu'administrateur (Windows) ou avec sudo / la capacité de capture (Linux, macOS). ¦ Ejecute MiniWireshark como administrador (Windows) o con sudo / el permiso de captura (Linux, macOS).
@@ -20997,12 +21057,48 @@ SETTINGS_PAGES = [
      "sections": [
          {"title": "Refresh speed", "controls": [
              {"key": "performance.mode", "type": "choice",
-              "choices": ["Automatic", "Normal", "Low CPU"],
+              "choices": ["Automatic", "Normal", "Low CPU", "Full Power"],
               "label": "Performance mode",
               "help": "Automatic slows screen refreshes when traffic is "
                       "heavy or the window lags. Low CPU always refreshes "
-                      "about 2.5× less often. Neither changes what is "
-                      "captured or any alert threshold."},
+                      "about 2.5× less often. Full Power adds a deep pass "
+                      "(every dissector, stream reassembly, expert "
+                      "findings) inside the budget below. None of them "
+                      "changes what the network card can see, sends "
+                      "anything, or changes an alert threshold."},
+         ]},
+         {"title": "Full Power budget", "controls": [
+             {"key": "performance.full_power_cores", "type": "int",
+              "min": 1, "max": 64, "step": 1, "unit": "cores",
+              "label": "Processor cores to use",
+              "help": "The deep pass runs in this many helper processes "
+                      "(at most one less than the computer has, so the "
+                      "window and the capture always keep a core)."},
+             {"key": "performance.ram_cap_mb", "type": "int", "min": 256,
+              "max": 65536, "step": 256, "unit": "MB",
+              "label": "Memory for reassembly and queues",
+              "help": "Streams waiting for a missing piece and packets "
+                      "waiting for the deep pass stay inside this. The "
+                      "oldest stream closes first, marked with its gap."},
+             {"key": "performance.shedding", "type": "choice",
+              "choices": ["Smart", "Off", "Strict"],
+              "label": "When it falls behind",
+              "help": "Smart skips the least useful work first (repeats "
+                      "of a big download before names, connection "
+                      "set-up and anything behind an alert), using the "
+                      "measured cost of each analyzer. Off only skips when "
+                      "the queue is full. Strict keeps a small queue. "
+                      "Skipped packets are counted, never hidden."},
+             {"key": "performance.battery_aware", "type": "bool",
+              "label": "Pause Full Power on battery below 30 %",
+              "help": "Full Power works like Normal until the computer is "
+                      "plugged in again; the status bar says so."},
+             {"key": "performance.deep_runner", "type": "choice",
+              "choices": ["Automatic", "Thread"],
+              "label": "Where the deep pass runs",
+              "help": "Automatic uses helper processes when the computer "
+                      "has more than one core (measured faster), else a "
+                      "thread. Thread keeps everything in one process."},
          ]},
      ]},
     {"id": "shortcuts", "icon": "⌨", "title": "Keyboard Shortcuts",
@@ -27343,6 +27439,9 @@ class MiniWireshark:
         self._analysis_errors = 0
         self.watchdog = PipelineWatchdog()
         self.kernel = KernelCounters()
+        self.deep = DeepEngine()
+        self._battery = (None, 0.0)      # (reading, when)
+        self.full_power_override = False
         self._rows_drained = 0
         self._rows_not_shown = 0
         self._kernel_seen = 0
@@ -27476,6 +27575,8 @@ class MiniWireshark:
         self.gen += 1                 # frames of the old source are dropped
         self.ring.clear()
         self.ring.reset_counters()
+        if getattr(self, "deep", None) is not None:
+            self.deep.reset()
         self.kernel = KernelCounters()
         self._kernel_seen = 0
         self._rows_not_shown = 0
@@ -28130,6 +28231,59 @@ class MiniWireshark:
             if hasattr(tab, "inspect_target") and hasattr(tab, "tree"):
                 tab.tree.bind("<<TreeviewSelect>>", handler(tab), add="+")
 
+    # ---- Full Power --------------------------------------------------------
+    def battery_state(self):
+        """(percent, plugged) or None; read at most every 30 s."""
+        reading, when = self._battery
+        if time.monotonic() - when < 30 and when:
+            return reading
+        reading = None
+        with contextlib.suppress(Exception):
+            import psutil                             # optional
+            b = psutil.sensors_battery()
+            if b is not None:
+                reading = (float(b.percent), bool(b.power_plugged))
+        self._battery = (reading, time.monotonic())
+        return reading
+
+    def effective_perf_mode(self):
+        """→ (mode actually used, reason when it differs)."""
+        mode = self.config.get("performance.mode", "Automatic")
+        if mode == "Full Power" and self.config.get(
+                "performance.battery_aware", True) and \
+                not self.full_power_override:
+            b = self.battery_state()
+            if b is not None and not b[1] and b[0] < 30:
+                return "Normal", (f"on battery ({b[0]:.0f} %) — Full Power "
+                                  f"paused")
+        return mode, ""
+
+    def sync_deep(self):
+        """Called by the analysis worker between batches (one atomic swap
+        of the analyzer set)."""
+        mode, _why = self.effective_perf_mode()
+        cfg = self.config
+        self.deep.configure(
+            mode, cores=int(cfg.get("performance.full_power_cores", 2)),
+            ram_mb=int(cfg.get("performance.ram_cap_mb", 1536)),
+            policy=cfg.get("performance.shedding", "Smart"),
+            my_ips=self.model.my_ips,
+            prefer_process=cfg.get("performance.deep_runner",
+                                   "Automatic") != "Thread")
+        if self.deep.active():
+            self.deep._ensure_backend()
+
+    def mode_pill_text(self):
+        mode, why = self.effective_perf_mode()
+        if why:
+            return f"⚡ {why}"
+        if mode != "Full Power":
+            return ""
+        pct, off, _d, _s = self.deep.coverage_60s()
+        if not off:
+            return "⚡ Full Power"
+        return f"⚡ Full Power · {pct:.0f} % deep-analysed (60 s)"
+
     def coverage(self):
         rows = coverage_rows(self.model, self.data_mode, self.active_mode())
         if self.data_mode == "live" or self.capture_coverage()["received"]:
@@ -28176,7 +28330,9 @@ class MiniWireshark:
         v = self.model.vantage.classify(
             offline=self.data_mode in ("offline", "session"))
         spots = blind_spots(self.model, self.data_mode, self.active_mode())
-        return (f"{VANTAGE_TEXT[v][0]}"
+        pill = self.mode_pill_text()
+        return ((pill + "  ·  ") if pill else "") + (
+                f"{VANTAGE_TEXT[v][0]}"
                 f"{' · blind spots: ' + str(len(spots)) if spots else ''}"
                 f"  ·  ◉ observed ◎ correlated ◌ inferred ? unknown  "
                 f"·  F2 inspector")
@@ -30025,9 +30181,10 @@ class MiniWireshark:
     def _ms(self, base):
         mode = self.config.get("performance.mode", "Automatic")
         if mode == "Low CPU" or self.config.get(
-                "performance.cpu_friendly_mode", False) and mode != "Normal":
+                "performance.cpu_friendly_mode", False) and mode not in (
+                    "Normal", "Full Power"):
             mult = 2.5
-        elif mode == "Normal":
+        elif mode in ("Normal", "Full Power"):
             mult = 1.0
         else:
             mult = {0: 1.0, 1: 1.6, 2: 2.5}.get(self.perf_level, 1.0)
@@ -30206,6 +30363,8 @@ class MiniWireshark:
         if now - self._wd_last >= 2.0:
             self._wd_last = now
             self._check_pipeline(now)
+            if self.deep.active() and int(now) % 10 < 2:
+                self.deep.flush()
         if self.sniffer is not None:
             if not getattr(self.sniffer, "running", True) or \
                     getattr(self.sniffer, "exception", None) is not None:
@@ -32203,6 +32362,8 @@ class MiniWireshark:
         self.model.tick()
         self.model._classify_dirty |= set(self.model.registry.by_key)
         self.model._classify()
+        if self.deep.active():
+            self.deep.flush(final=True)
         self.tabs["devices"].rebuild()
         self.tabs["websites"].rebuild()
         gw = self.model.gateway_ip
@@ -33900,6 +34061,8 @@ class MiniWireshark:
                 w.stop_flag = True
         self.ring.clear()
         self.ring.wake()
+        with contextlib.suppress(Exception):
+            self.deep.stop()
         if self.prober is not None:
             self.prober.run_now.set()
         if self.demo is not None:
@@ -34629,6 +34792,7 @@ class DiagnosticsWindow:
                 f"; window missed its checks for "
                 f"{w.window_frozen:.0f} s" if w and w.window_frozen
                 else ""),
+            "Full Power:"] + [f"   {x}" for x in app.deep.status_text()] + [
             "Last capture fault  " + (
                 f"{app.last_fault[1]} ({app.last_fault[3] or 'no detail'})"
                 if getattr(app, "last_fault", None) else "none"),
@@ -35717,6 +35881,7 @@ class Dissection:
     def __init__(self, raw, linktype):
         self.raw, self.linktype = raw, linktype
         self.nodes = []
+        self._idx = None
 
     def all_fields(self):
         for n in self.nodes:
@@ -35726,18 +35891,24 @@ class Dissection:
                 yield f
                 stack.extend(reversed(f.children))
 
+    def _index(self):
+        if self._idx is None:
+            idx = {}
+            for f in self.all_fields():
+                idx.setdefault(f.key, []).append(f.raw_value)
+            self._idx = idx
+        return self._idx
+
     def get(self, key):
         """First value for a filter key (or None)."""
-        for f in self.all_fields():
-            if f.key == key:
-                return f.raw_value
-        return None
+        v = self._index().get(key)
+        return v[0] if v else None
 
     def values(self, key):
-        return [f.raw_value for f in self.all_fields() if f.key == key]
+        return list(self._index().get(key, ()))
 
     def keys(self):
-        return {f.key for f in self.all_fields()}
+        return set(self._index())
 
     def warnings(self):
         out = [(n.title, n.warning) for n in self.nodes if n.warning]
@@ -37488,6 +37659,714 @@ def reassemble_frames(frames, **kw):
     return tr, df
 
 
+# ============================================================================
+#  V5: Full Power — deep analysis inside a budget
+#
+#  The fast path (fast_decode → model) runs for every packet in every mode
+#  and is never slowed by depth. Full Power adds a second, budgeted pass:
+#  every supported dissector, TCP reassembly for all flows within a memory
+#  cap, and expert findings. It runs in worker processes (this same .py
+#  started with --mw-worker) when that is faster than a thread — measured,
+#  see bench_deep — and falls back to a thread otherwise. Results live in
+#  their own store, so switching modes never changes the model.
+# ============================================================================
+WORKER_FLAG = "--mw-worker"
+DEEP_SEVERITIES = ("error", "warn", "note", "chat")
+DEEP_GROUPS = ("Malformed", "Sequence", "Protocol", "Security", "Checksum",
+               "Response code")
+
+
+def _deep_preview(kind, data):
+    """A short, secret-free label for a reassembled message."""
+    if kind == "line":
+        line = data.split(b"\n", 1)[0].rstrip(b"\r")
+        m = _SECRET_CMDS.match(line)
+        if m:
+            return ((m.group("tag") or b"") + m.group("cmd")).decode(
+                "latin-1", "replace") + " (hidden: credentials)"
+        return line[:120].decode("utf-8", "replace")
+    if kind == "http":
+        return data.split(b"\r\n", 1)[0][:120].decode("latin-1", "replace")
+    if kind == "tls":
+        ct = data[0] if data else 0
+        return f"TLS {_TLS_CT.get(ct, ct)} record, {len(data)} bytes"
+    if kind == "dns":
+        return f"DNS message over TCP, {len(data)} bytes"
+    return f"{len(data)} bytes"
+
+
+class DeepAnalyzer:
+    """Stateful deep pass for one share of the flows. Pure Python, no Tk,
+    no scapy: used by the deep thread and by worker processes alike."""
+
+    ANALYZERS = ("dissect", "reassembly", "expert")
+
+    def __init__(self, my_ips=(), per_stream=256 * 1024,
+                 total=64 * 1024 * 1024):
+        self.my_ips = set(my_ips)
+        self.tcp = TcpReassembler(per_stream=per_stream, total=total)
+        self.frag = IpDefragmenter()
+        self.cost_ns = {a: 0 for a in self.ANALYZERS}
+        self.count = 0
+        self._seen_msgs = {}       # stream key -> messages already reported
+
+    def process(self, no, ts, lt, raw):
+        """→ (findings, messages). findings: [(no, ts, severity, group,
+        summary, field_key)]; messages: [(stream, dir, kind, start, end,
+        partial, preview, no)]."""
+        self.count += 1
+        f = []
+        t0 = time.perf_counter_ns()
+        d = dissect(raw, lt)
+        t1 = time.perf_counter_ns()
+        self.cost_ns["dissect"] += t1 - t0
+        msgs = []
+        src = d.get("ip.src") or d.get("ipv6.src")
+        dst = d.get("ip.dst") or d.get("ipv6.dst")
+        notes_before = None
+        st = None
+        if src and (d.get("ip.flags.mf") or d.get("ip.frag_offset")):
+            ipn = next(n for n in d.nodes if n.key == "ip")
+            hl = d.get("ip.hdr_len") or 20
+            whole, warn = self.frag.add(
+                (src, dst, d.get("ip.proto"), d.get("ip.id")),
+                d.get("ip.frag_offset") or 0, bool(d.get("ip.flags.mf")),
+                raw[ipn.offset + hl:ipn.offset + ipn.length], ts)
+            if warn and "different content" in warn:
+                f.append((no, ts, "warn", "Security",
+                          "Overlapping IP fragments with different "
+                          "content", "ip.frag_offset"))
+        elif d.get("tcp.srcport") is not None and src:
+            tcpn = next(n for n in d.nodes if n.key == "tcp")
+            hl = d.get("tcp.hdr_len") or 20
+            key = TcpReassembler.stream_key(src, d.get("tcp.srcport"), dst,
+                                            d.get("tcp.dstport"))
+            old = self.tcp.streams.get(key)
+            dups = sum(x.dups for x in old.dirs) if old else 0
+            notes_before = len(old.notes) if old else 0
+            st = self.tcp.segment(
+                src, d.get("tcp.srcport"), dst, d.get("tcp.dstport"),
+                d.get("tcp.seq_raw"), d.get("tcp.flags"),
+                raw[tcpn.offset + hl:tcpn.offset + tcpn.length], ts)
+            if old is not st:
+                notes_before, dups = 0, 0
+            if sum(x.dups for x in st.dirs) > dups and \
+                    d.get("tcp.len"):
+                f.append((no, ts, "note", "Sequence",
+                          "Retransmission (data seen before)", "tcp.seq_raw"))
+            for n in st.notes[notes_before:]:
+                if "conflicting" in n:
+                    f.append((no, ts, "warn", "Security",
+                              "Retransmitted data differs from the first "
+                              "copy (" + n + ")", "tcp.seq_raw"))
+                elif "never seen" in n:
+                    f.append((no, ts, "note", "Sequence",
+                              "Missing bytes: " + n, "tcp.seq_raw"))
+            done = self._seen_msgs.get(st.key, 0)
+            for m in st.messages[done:]:
+                msgs.append((repr(st.key), m.direction, m.kind, m.start,
+                             m.end, m.partial, _deep_preview(m.kind, m.data),
+                             no))
+            self._seen_msgs[st.key] = len(st.messages)
+        t2 = time.perf_counter_ns()
+        self.cost_ns["reassembly"] += t2 - t1
+        f.extend(self._rules(no, ts, d, src))
+        self.cost_ns["expert"] += time.perf_counter_ns() - t2
+        if len(self._seen_msgs) > 8192:
+            live = set(map(lambda s: s.key, self.tcp.streams.values()))
+            self._seen_msgs = {k: v for k, v in self._seen_msgs.items()
+                               if k in live}
+        return f, msgs
+
+    def _rules(self, no, ts, d, src):
+        out = []
+        for title, w in d.warnings():
+            if "checksum" in w:
+                if src not in self.my_ips:
+                    out.append((no, ts, "note", "Checksum",
+                                f"{title}: checksum does not match", ""))
+            elif "truncated" in w:
+                out.append((no, ts, "warn", "Malformed", f"{title}: {w}",
+                            ""))
+            elif "malformed" in w or "too short" in w:
+                out.append((no, ts, "error", "Malformed", f"{title}: {w}",
+                            ""))
+            elif w.startswith("fragment"):
+                out.append((no, ts, "chat", "Sequence", f"IP {w}",
+                            "ip.frag_offset"))
+        fl = d.get("tcp.flags")
+        if fl is not None:
+            if fl & 0x04:
+                out.append((no, ts, "warn", "Sequence",
+                            "Connection reset (RST)", "tcp.flags.reset"))
+            elif d.get("tcp.window_size_value") == 0 and not fl & 0x02:
+                out.append((no, ts, "warn", "Sequence",
+                            "Zero window: the receiver has no room left",
+                            "tcp.window_size_value"))
+            if fl & 0x02 and not fl & 0x10:
+                out.append((no, ts, "chat", "Sequence",
+                            "Connection opened (SYN)", "tcp.flags.syn"))
+        rc = d.get("dns.flags.rcode")
+        if rc and d.get("dns.flags.response"):
+            name = d.get("dns.qry.name") or "?"
+            out.append((no, ts, "note" if rc == 3 else "warn",
+                        "Response code", f"DNS {_DNS_RCODES.get(rc, rc)} "
+                        f"for {name}", "dns.flags.rcode"))
+        code = d.get("http.response.code")
+        if code and code >= 400:
+            out.append((no, ts, "warn" if code >= 500 else "note",
+                        "Response code", f"HTTP {code} "
+                        f"{d.get('http.response.phrase') or ''}".strip(),
+                        "http.response.code"))
+        if 21 in d.values("tls.record.content_type"):
+            out.append((no, ts, "note", "Protocol", "TLS alert (the "
+                        "connection reported an error or closed)",
+                        "tls.record.content_type"))
+        if d.get("icmp.type") == 3 or d.get("icmpv6.type") == 1:
+            out.append((no, ts, "note", "Protocol", "Destination "
+                        "unreachable", "icmp.type"))
+        return out
+
+    def flush(self, now, final=False):
+        """Close idle streams (or all of them when final) and report the
+        messages that closing completed."""
+        msgs = []
+        if final:
+            self.tcp.flush(now)
+        else:
+            self.tcp.expire(now)
+        for st in list(self.tcp.closed):
+            done = self._seen_msgs.get(st.key, 0)
+            for m in st.messages[done:]:
+                msgs.append((repr(st.key), m.direction, m.kind, m.start,
+                             m.end, m.partial, _deep_preview(m.kind, m.data),
+                             0))
+            self._seen_msgs[st.key] = len(st.messages)
+        return msgs
+
+    def costs_us(self):
+        n = max(1, self.count)
+        return {k: v / 1000.0 / n for k, v in self.cost_ns.items()}
+
+
+# ---- the worker process side --------------------------------------------------
+def _wire_send(stream, obj):
+    data = marshal.dumps(obj)
+    stream.write(struct.pack("!I", len(data)) + data)
+    stream.flush()
+
+
+def _wire_recv(stream):
+    head = stream.read(4)
+    if len(head) < 4:
+        return None
+    n = struct.unpack("!I", head)[0]
+    if n > 256 * 1024 * 1024:
+        raise ValueError("message too large")
+    data = stream.read(n)
+    if len(data) < n:
+        return None
+    return marshal.loads(data)
+
+
+def deep_worker_main(inp=None, out=None):
+    """Entry point of `python miniwireshark.py --mw-worker`: reads batches
+    of frames on stdin, writes compact results on stdout. Never touches
+    the network, the GUI or any file."""
+    inp = inp or sys.stdin.buffer
+    out = out or sys.stdout.buffer
+    an = DeepAnalyzer()
+    _wire_send(out, ("ready", SCRIPT_VERSION, os.getpid()))
+    while True:
+        msg = _wire_recv(inp)
+        if msg is None or msg[0] == "stop":
+            return 0
+        if msg[0] == "config":
+            an.my_ips = set(msg[1])
+            continue
+        if msg[0] == "flush":
+            _wire_send(out, ("flushed", msg[1], an.flush(msg[2], msg[3]),
+                             an.costs_us()))
+            continue
+        if msg[0] == "batch":
+            epoch, items = msg[1], msg[2]
+            findings, messages = [], []
+            for no, ts, lt, raw in items:
+                try:
+                    f, m = an.process(no, ts, lt, raw)
+                except Exception as e:                # noqa: BLE001
+                    f, m = [(no, ts, "error", "Malformed",
+                             f"Deep analysis failed: {type(e).__name__}",
+                             "")], []
+                findings.extend(f)
+                messages.extend(m)
+            _wire_send(out, ("res", epoch, len(items), findings, messages,
+                             an.costs_us()))
+
+
+def deep_value(d):
+    """How much a packet is worth deep-analysing: 3 control / names /
+    alerts, 2 ordinary, 1 bulk repeat. Smart shedding drops 1 first."""
+    tr = d.get("transport")
+    if tr == "TCP":
+        fl = d.get("tcp_flags") or 0
+        if fl & 0x07 or d.get("win") == 0:
+            return 3
+        if d.get("tls") is not None or d.get("http_host") or \
+                d.get("dns") is not None:
+            return 3
+        ports = {d.get("sport"), d.get("dport")}
+        if ports & {21, 25, 53, 110, 143, 587, 80, 8080, 22, 23}:
+            return 3
+        return 1 if (d.get("payload_len") or 0) >= 1000 or \
+            not d.get("payload_len") else 2
+    if tr == "UDP":
+        if d.get("dns") is not None or d.get("dhcp") is not None or \
+                d.get("mdns") is not None or d.get("ssdp") is not None:
+            return 3
+        return 1 if (d.get("payload_len") or 0) >= 1000 else 2
+    return 3                      # ARP, ICMP, ND, other link protocols
+
+
+class DeepStore:
+    """What the deep pass found (bounded; shared with the window)."""
+
+    def __init__(self, max_findings=20000, max_messages=20000):
+        self.findings = deque(maxlen=max_findings)
+        self.messages = deque(maxlen=max_messages)
+        self.by_sev = Counter()
+        self.by_group = Counter()
+        self.lock = threading.Lock()
+        self.version = 0
+
+    def add(self, findings, messages):
+        if not findings and not messages:
+            return
+        with self.lock:
+            for f in findings:
+                self.findings.append(tuple(f))
+                self.by_sev[f[2]] += 1
+                self.by_group[f[3]] += 1
+            self.messages.extend(tuple(m) for m in messages)
+            self.version += 1
+
+    def clear(self):
+        with self.lock:
+            self.findings.clear()
+            self.messages.clear()
+            self.by_sev.clear()
+            self.by_group.clear()
+            self.version += 1
+
+    def summary(self):
+        with self.lock:
+            if not self.findings:
+                return "no findings"
+            return ", ".join(f"{self.by_sev[s]} {s}" for s in
+                             DEEP_SEVERITIES if self.by_sev[s])
+
+
+class _DeepWorkerProc:
+    """One `--mw-worker` process: a writer feeds it batches, a reader
+    collects its results. At most IN_FLIGHT batches outstanding."""
+
+    IN_FLIGHT = 4
+
+    def __init__(self, engine, idx):
+        self.engine, self.idx = engine, idx
+        self.items = deque()
+        self.cv = threading.Condition()
+        self.inflight = 0
+        self.alive = False
+        self.error = ""
+        self.costs = {}
+        self.proc = None
+
+    def start(self, my_ips):
+        script = os.path.abspath(__file__)
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        log = open(os.path.join(PATHS.logs, f"deep-worker-{self.idx}.log"),
+                   "ab")
+        kw = {}
+        if IS_WINDOWS:
+            kw["creationflags"] = 0x08000000          # CREATE_NO_WINDOW
+        self.proc = subprocess.Popen(
+            [sys.executable, script, WORKER_FLAG], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=log, env=env, **kw)
+        log.close()
+        hello = _wire_recv(self.proc.stdout)
+        if not hello or hello[0] != "ready":
+            raise RuntimeError("deep worker did not start")
+        _wire_send(self.proc.stdin, ("config", sorted(my_ips)))
+        self.alive = True
+        threading.Thread(target=self._writer, daemon=True,
+                         name=f"deep-w{self.idx}-out").start()
+        threading.Thread(target=self._reader, daemon=True,
+                         name=f"deep-w{self.idx}-in").start()
+
+    def put(self, item):
+        with self.cv:
+            self.items.append(item)
+            self.cv.notify()
+
+    def pending(self):
+        return len(self.items) + self.inflight * 256
+
+    def _writer(self):
+        try:
+            while self.alive:
+                with self.cv:
+                    while self.alive and (not self.items or
+                                          self.inflight >= self.IN_FLIGHT):
+                        self.cv.wait(0.2)
+                    if not self.alive:
+                        break
+                    batch = [self.items.popleft() for _ in range(
+                        min(256, len(self.items)))]
+                    self.inflight += 1
+                epoch = self.engine.epoch
+                _wire_send(self.proc.stdin, ("batch", epoch,
+                                             [b[:4] for b in batch]))
+        except (OSError, ValueError) as e:
+            self._died(e)
+
+    def _reader(self):
+        try:
+            while self.alive:
+                msg = _wire_recv(self.proc.stdout)
+                if msg is None:
+                    raise OSError("worker closed its output")
+                if msg[0] == "res":
+                    _k, _epoch, n, findings, messages, costs = msg
+                    self.costs = costs
+                    self.engine._results(n, findings, messages)
+                    with self.cv:
+                        self.inflight -= 1
+                        self.cv.notify()
+                elif msg[0] == "flushed":
+                    self.engine.store.add([], msg[2])
+                    self.costs = msg[3]
+        except (OSError, ValueError, EOFError) as e:
+            self._died(e)
+
+    def _died(self, e):
+        if self.alive:
+            self.alive = False
+            self.error = f"{type(e).__name__}: {e}"
+            LOG.warning("deep worker %d stopped: %s", self.idx, self.error)
+            lost = len(self.items) + self.inflight * 256
+            self.items.clear()
+            self.engine._lost(lost)
+
+    def flush(self, now, final=False):
+        with contextlib.suppress(OSError, ValueError):
+            if self.alive:
+                with self.cv:
+                    pass
+                _wire_send(self.proc.stdin, ("flush", 0, now, final))
+
+    def stop(self):
+        self.alive = False
+        with self.cv:
+            self.cv.notify_all()
+        if self.proc is not None:
+            with contextlib.suppress(OSError, ValueError):
+                _wire_send(self.proc.stdin, ("stop",))
+            with contextlib.suppress(Exception):
+                self.proc.wait(timeout=2)
+            if self.proc.poll() is None:
+                with contextlib.suppress(Exception):
+                    self.proc.kill()
+
+
+class DeepEngine:
+    """Schedules the deep pass: decides per packet whether it is eligible
+    (the mode), worth it (Smart shedding with measured costs) and where it
+    runs (worker processes or a thread). Every offered packet ends in one
+    bucket: deep-analysed, skipped by budget, or lost with a worker."""
+
+    QUEUE_CAP = 20000
+
+    def __init__(self, store=None):
+        self.store = store or DeepStore()
+        self.mode = "Normal"
+        self.backend = "off"          # off | thread | process
+        self.workers = []
+        self.thread = None
+        self.analyzer = None
+        self.pending = deque()
+        self.cv = threading.Condition()
+        self.epoch = 0
+        self.policy = "Smart"
+        self.cores = 1
+        self.ram_mb = 1536
+        self.my_ips = set()
+        self.offered = self.done = self.shed = self.lost = 0
+        self.shed_why = Counter()
+        self.window = deque()          # (second, offered, done, shed)
+        self.stop_flag = False
+        self.last_error = ""
+        self.want_process = True
+        self._busy_ns = 0
+        self._t_start = time.monotonic()
+
+    # ---- configuration ------------------------------------------------------
+    def configure(self, mode, cores=2, ram_mb=1536, policy="Smart",
+                  my_ips=(), prefer_process=True):
+        """Atomic switch at a batch boundary (called by the analysis
+        worker between batches). Returns True when the mode changed."""
+        changed = mode != self.mode
+        self.cores, self.ram_mb, self.policy = cores, ram_mb, policy
+        self.my_ips = set(my_ips)
+        self.want_process = prefer_process
+        if changed:
+            self.epoch += 1
+            self.mode = mode
+            if mode != "Full Power":
+                with self.cv:
+                    n = len(self.pending)
+                    self.pending.clear()
+                if n:
+                    self._count_shed(n, "mode change")
+        return changed
+
+    def active(self):
+        return self.mode == "Full Power"
+
+    def _ensure_backend(self):
+        if self.backend != "off" and (
+                self.backend == "thread" and self.thread is not None and
+                self.thread.is_alive() or
+                self.backend == "process" and any(w.alive for w in
+                                                  self.workers)):
+            return
+        n = max(1, min(self.cores, (os.cpu_count() or 1) - 1))
+        if self.want_process and (os.cpu_count() or 1) > 1:
+            try:
+                ws = []
+                for i in range(n):
+                    w = _DeepWorkerProc(self, i)
+                    w.start(self.my_ips)
+                    ws.append(w)
+                self.workers, self.backend = ws, "process"
+                return
+            except Exception as e:                   # noqa: BLE001
+                self.last_error = f"worker processes unavailable: {e}"
+                LOG.warning("deep analysis: %s; using a thread",
+                            self.last_error)
+                for w in locals().get("ws", []):
+                    w.stop()
+        self.analyzer = DeepAnalyzer(self.my_ips,
+                                     total=self.ram_mb * 1024 * 1024 // 2)
+        self.thread = threading.Thread(target=self._thread_loop, daemon=True,
+                                       name="deep")
+        self.backend = "thread"
+        self.thread.start()
+
+    # ---- the scheduler -------------------------------------------------------
+    def cost_us(self):
+        """Measured microseconds per packet (all analyzers)."""
+        costs = self.analyzer_costs()
+        return sum(costs.values()) if costs else 70.0
+
+    def analyzer_costs(self):
+        if self.backend == "process":
+            agg = Counter()
+            ws = [w for w in self.workers if w.costs]
+            for w in ws:
+                for k, v in w.costs.items():
+                    agg[k] += v / len(ws)
+            return dict(agg)
+        return self.analyzer.costs_us() if self.analyzer else {}
+
+    def queued(self):
+        if self.backend == "process":
+            return len(self.pending) + sum(w.pending() for w in self.workers)
+        return len(self.pending)
+
+    def offer(self, d, no):
+        """Called by the analysis worker for each committed packet."""
+        if self.mode != "Full Power" or d.get("raw") is None:
+            return False
+        self.offered += 1
+        self._tick(1, 0, 0)
+        v = deep_value(d)
+        q = self.queued()
+        lanes = max(1, len(self.workers) if self.backend == "process" else 1)
+        drain = q * self.cost_us() / 1e6 / lanes
+        cap = self.QUEUE_CAP if self.policy != "Strict" else \
+            self.QUEUE_CAP // 4
+        why = ""
+        if q >= cap:
+            why = "queue full"
+        elif self.policy == "Smart" and ((drain > 2.0 and v == 1) or
+                                         (drain > 5.0 and v <= 2)):
+            why = "busy: low-value packet"
+        elif self.policy == "Strict" and drain > 1.0:
+            why = "over budget"
+        if why:
+            self._count_shed(1, why)
+            return False
+        self._ensure_backend()
+        item = (no, d.get("time", 0.0), d.get("linktype", 1), d["raw"], v)
+        if self.backend == "process":
+            live = [w for w in self.workers if w.alive]
+            if not live:
+                self._lost(1)
+                return False
+            key = (d.get("src_ip") or "", d.get("sport") or 0), \
+                (d.get("dst_ip") or "", d.get("dport") or 0)
+            h = zlib.crc32(repr(min(key) + max(key)).encode())
+            live[h % len(live)].put(item)
+        else:
+            with self.cv:
+                self.pending.append(item)
+                self.cv.notify()
+        return True
+
+    def _count_shed(self, n, why):
+        self.shed += n
+        self.shed_why[why] += n
+        self._tick(0, 0, n)
+
+    def _lost(self, n):
+        self.lost += n
+
+    def _results(self, n, findings, messages):
+        self.done += n
+        self._tick(0, n, 0)
+        self.store.add(findings, messages)
+
+    def _tick(self, off, done, shed):
+        sec = int(time.monotonic())
+        w = self.window
+        if w and w[-1][0] == sec:
+            s, a, b, c = w[-1]
+            w[-1] = (s, a + off, b + done, c + shed)
+        else:
+            w.append((sec, off, done, shed))
+            while w and w[0][0] < sec - 60:
+                w.popleft()
+
+    def coverage_60s(self):
+        """→ (percent deep-analysed of eligible, offered, done, shed)."""
+        sec = int(time.monotonic())
+        off = done = shed = 0
+        for s, a, b, c in list(self.window):
+            if s >= sec - 60:
+                off, done, shed = off + a, done + b, shed + c
+        pct = 100.0 * done / off if off else 100.0
+        return min(100.0, pct), off, done, shed
+
+    def in_flight(self):
+        return max(0, self.offered - self.done - self.shed - self.lost)
+
+    # ---- the thread backend --------------------------------------------------
+    def _thread_loop(self):
+        an = self.analyzer
+        while not self.stop_flag and self.backend == "thread":
+            with self.cv:
+                while not self.pending and not self.stop_flag:
+                    self.cv.wait(0.25)
+                batch = [self.pending.popleft() for _ in range(
+                    min(256, len(self.pending)))]
+            if not batch:
+                continue
+            t0 = time.perf_counter_ns()
+            findings, messages = [], []
+            for no, ts, lt, raw, _v in batch:
+                try:
+                    f, m = an.process(no, ts, lt, raw)
+                except Exception as e:               # noqa: BLE001
+                    f, m = [(no, ts, "error", "Malformed",
+                             f"Deep analysis failed: {type(e).__name__}",
+                             "")], []
+                findings.extend(f)
+                messages.extend(m)
+            self._busy_ns += time.perf_counter_ns() - t0
+            self._results(len(batch), findings, messages)
+            time.sleep(0)               # let capture and the window in
+
+    # ---- lifecycle -------------------------------------------------------------
+    def flush(self, final=False):
+        now = time.time()
+        if self.backend == "process":
+            for w in self.workers:
+                w.flush(now, final)
+        elif self.analyzer is not None:
+            with self.cv:
+                idle = not self.pending
+            if idle:
+                self.store.add([], self.analyzer.flush(now, final))
+
+    def drain(self, timeout=30.0):
+        """Wait until everything offered is analysed (tests, imports)."""
+        t_end = time.time() + timeout
+        while self.in_flight() and time.time() < t_end:
+            time.sleep(0.02)
+        return self.in_flight() == 0
+
+    def reset(self):
+        """A new session: fresh state, same backend."""
+        with self.cv:
+            self.pending.clear()
+        self.epoch += 1
+        self.offered = self.done = self.shed = self.lost = 0
+        self.shed_why.clear()
+        self.window.clear()
+        self.store.clear()
+        if self.backend == "thread" and self.analyzer is not None:
+            self.analyzer.__init__(self.my_ips,
+                                   total=self.ram_mb * 1024 * 1024 // 2)
+        elif self.backend == "process":
+            for w in self.workers:
+                w.stop()
+            self.workers, self.backend = [], "off"
+
+    def stop(self):
+        self.stop_flag = True
+        with self.cv:
+            self.cv.notify_all()
+        for w in self.workers:
+            w.stop()
+        self.workers = []
+        self.backend = "off"
+
+    def status_text(self):
+        pct, off, done, shed = self.coverage_60s()
+        costs = self.analyzer_costs()
+        lines = [
+            f"Mode                {self.mode}",
+            f"Runs in             {self.backend}"
+            + (f" ({len(self.workers)} worker process"
+               f"{'es' if len(self.workers) != 1 else ''})"
+               if self.backend == "process" else ""),
+            f"Offered / analysed  {self.offered:,} / {self.done:,} "
+            f"(skipped {self.shed:,}, lost {self.lost:,}, waiting "
+            f"{self.in_flight():,})",
+            f"Last 60 s           {pct:.0f} % of {off:,} eligible "
+            f"packets deep-analysed",
+            "Skipped because     " + (", ".join(
+                f"{k} ({v:,})" for k, v in self.shed_why.most_common())
+                or "—"),
+            "Cost per packet     " + (", ".join(
+                f"{k} {v:.0f} µs" for k, v in costs.items()) or
+                "not measured yet"),
+            f"Findings            {self.store.summary()}",
+        ]
+        if self.last_error:
+            lines.append(f"Note                {self.last_error}")
+        return lines
+
+
+def tls_app_record(n):
+    """n bytes of TLS application data with a correct record header (the
+    content itself is zeros: it is encrypted on a real network)."""
+    n = max(5, n)
+    return b"\x17\x03\x03" + struct.pack("!H", n - 5) + bytes(n - 5)
+
+
 def build_client_hello(sni, alpn=("h2", "http/1.1"), pad=600, rnd=None):
     """A syntactically valid TLS 1.3-style ClientHello (used by Demo Mode
     and the self-tests). `rnd` = the 32-byte client random (scenarios pass
@@ -37633,7 +38512,7 @@ class DemoGenerator(threading.Thread):
         while sent < size and not self.stop_flag:
             chunk = min(1400, size - sent)
             self._emit(back / self.L.TCP(sport=443, dport=sp, flags="A", seq=s2) /
-                       self.L.Raw(b"\x17\x03\x03" + b"\x00" * (chunk - 3)))
+                       self.L.Raw(tls_app_record(chunk)))
             s2 += chunk
             sent += chunk
         self._emit(base / self.L.TCP(sport=sp, dport=443, flags="FA",
@@ -37866,7 +38745,7 @@ class ScenarioBuilder:
         while sent < size:
             chunk = min(1400, size - sent)
             self._emit(back / self.L.TCP(sport=port, dport=sp, flags="A", seq=s2) /
-                       self.L.Raw(b"\x17\x03\x03" + bytes(chunk - 3)), dt=0.002)
+                       self.L.Raw(tls_app_record(chunk)), dt=0.002)
             s2 += chunk
             sent += chunk
         if rst:
@@ -38058,6 +38937,36 @@ class ScenarioBuilder:
         self.frames.append((sll + ip, round(self.t, 6), 113))
         return self.frames
 
+    def bulk_streams(self, n=50000, flows=200, size=300):
+        """Many long TLS downloads with correct sequence numbers (the deep
+        pass benchmark: every segment is new data to reassemble)."""
+        L = self.L
+        out = []
+        st = []
+        for i in range(flows):
+            mac = f"00:16:3e:01:{i // 256:02x}:{i % 256:02x}"
+            ip = f"192.168.1.{100 + i % 120}"
+            rip = f"34.{i % 250}.{i % 7}.{(i * 13) % 251 + 1}"
+            st.append([mac, ip, rip, 41000 + i, 1000, 9000])
+        t = self.t
+        for k in range(n):
+            f = st[k % flows]
+            mac, ip, rip, sp, cseq, sseq = f
+            t += 0.00002
+            if k < flows:
+                p = L.Ether(src=mac, dst=self.GW[1]) / L.IP(src=ip, dst=rip) \
+                    / L.TCP(sport=sp, dport=443, flags="S", seq=cseq)
+                f[4] += 1
+            else:
+                rec = tls_app_record(size)
+                p = L.Ether(src=self.GW[1], dst=mac) / \
+                    L.IP(src=rip, dst=ip, ttl=55) / \
+                    L.TCP(sport=443, dport=sp, flags="A", seq=sseq,
+                          ack=cseq) / L.Raw(rec)
+                f[5] += len(rec)
+            out.append((bytes(p), round(t, 6), 1))
+        return out
+
     def busy_mix(self, n=20000, seed=3):
         """Many short flows from many devices (benchmarks)."""
         rng = random.Random(seed)
@@ -38071,12 +38980,12 @@ class ScenarioBuilder:
             tmpl.append(bytes(self.L.Ether(src=mac, dst=self.GW[1]) /
                               self.L.IP(src=ip, dst=rip) /
                               self.L.TCP(sport=40000 + i, dport=443, flags="PA") /
-                              self.L.Raw(b"\x17\x03\x03" + bytes(rng.choice(
+                              self.L.Raw(tls_app_record(3 + rng.choice(
                                   (60, 300, 1200))))))
             tmpl.append(bytes(self.L.Ether(src=self.GW[1], dst=mac) /
                               self.L.IP(src=rip, dst=ip, ttl=55) /
                               self.L.TCP(sport=443, dport=40000 + i, flags="A") /
-                              self.L.Raw(b"\x17\x03\x03" + bytes(1380))))
+                              self.L.Raw(tls_app_record(1383))))
         for k in range(n):
             t += 0.00005
             frames.append((tmpl[k % len(tmpl)], round(t, 6), 1))
@@ -39506,6 +40415,44 @@ def bench_dissect():
 
 
 BENCH_EXTRA.append(bench_dissect)
+
+
+def bench_deep(n=None):
+    """Full Power throughput: the same replay through the deep pass in a
+    thread and in worker processes (the plan ships processes only if they
+    beat the thread by at least 30 %)."""
+    n = n or int(os.environ.get("MW_BENCH_DEEP", "40000"))
+    frames = ScenarioBuilder().bulk_streams(n)
+    rows = []
+    for i, (raw, ts, lt) in enumerate(frames):
+        rows.append({"no": i + 1, "time": ts, "linktype": lt, "raw": raw,
+                     "transport": "TCP", "tcp_flags": 0x10,
+                     "payload_len": len(raw) - 54, "src_ip": "", "dst_ip": "",
+                     "sport": i % 200, "dport": 443})
+    out = {}
+    runners = [("thread", False)]
+    if (os.cpu_count() or 1) > 1:
+        runners.append(("process", True))
+    for name, proc in runners:
+        e = DeepEngine()
+        e.QUEUE_CAP = len(rows) + 1
+        e.configure("Full Power", cores=max(1, (os.cpu_count() or 2) - 1),
+                    policy="Off", prefer_process=proc)
+        e._ensure_backend()
+        t0 = time.perf_counter()
+        for d in rows:
+            e.offer(d, d["no"])
+        e.drain(600)
+        out[f"deep_{name}_pkts_per_s"] = e.done / (time.perf_counter() - t0)
+        e.stop()
+    if "deep_process_pkts_per_s" in out:
+        out["deep_process_gain_pct"] = 100.0 * (
+            out["deep_process_pkts_per_s"] /
+            out["deep_thread_pkts_per_s"] - 1)
+    return out
+
+
+BENCH_EXTRA.append(bench_deep)
 
 @self_test()
 def t_ip_reuse_keeps_histories_apart(ctx):
@@ -42538,6 +43485,196 @@ def test_ip_defragmentation(ctx):
     assert df2.completed == 1
 
 
+def _deep_rows(frames):
+    r = TlsReassembler()
+    rows = []
+    for i, (raw, ts, lt) in enumerate(frames):
+        d = fast_decode(raw, ts, lt, r)
+        d["no"] = i + 1
+        rows.append(d)
+    return rows
+
+
+@self_test(slow=False)
+def test_deep_rules_find_problems(ctx):
+    """The deep pass flags what a person would want pointed out, and says
+    where (a field key) — never as free text alone."""
+    sb = ScenarioBuilder()
+    L = PK
+    me, gw = sb.ME, sb.GW
+    out = L.Ether(src=me[1], dst=gw[1]) / L.IP(src=me[0], dst="34.117.59.81")
+    back = L.Ether(src=gw[1], dst=me[1]) / L.IP(src="34.117.59.81",
+                                                 dst=me[0])
+    frames = [
+        out / L.TCP(sport=40100, dport=443, flags="A", seq=5, window=0),
+        back / L.UDP(sport=53, dport=40200) / L.DNS(
+            id=5, qr=1, rcode=3, qd=L.DNSQR(qname="nope.example.com")),
+        back / L.TCP(sport=80, dport=40300, flags="PA", seq=1) /
+        L.Raw(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0"
+              b"\r\n\r\n"),
+        back / L.TCP(sport=443, dport=40400, flags="PA", seq=1) /
+        L.Raw(b"\x15\x03\x03\x00\x02\x02\x28"),
+        back / L.ICMP(type=3, code=1) / L.Raw(bytes(28)),
+        out / L.TCP(sport=40500, dport=25, flags="S", seq=100),
+        out / L.TCP(sport=40500, dport=25, flags="PA", seq=101) /
+        L.Raw(b"HELO a\r\n"),
+        out / L.TCP(sport=40500, dport=25, flags="PA", seq=101) /
+        L.Raw(b"HELX a\r\n"),
+    ]
+    an = DeepAnalyzer(my_ips={me[0]})
+    found = []
+    for i, f in enumerate(frames):
+        fs, _m = an.process(i + 1, 1.0, 1, bytes(f))
+        found += fs
+    text = " | ".join(f[4] for f in found)
+    for want in ("Zero window", "DNS no such name for nope.example.com",
+                 "HTTP 503 Service Unavailable", "TLS alert",
+                 "Destination unreachable", "differs from the first copy"):
+        assert want in text, (want, text)
+    assert all(f[2] in DEEP_SEVERITIES and f[3] in DEEP_GROUPS
+               for f in found)
+    zw = next(f for f in found if "Zero window" in f[4])
+    assert zw[5] == "tcp.window_size_value" and zw[0] == 1
+    costs = an.costs_us()
+    assert set(costs) == set(DeepAnalyzer.ANALYZERS) and \
+        all(v > 0 for v in costs.values())
+
+
+@self_test(slow=False)
+def test_deep_engine_buckets_and_shedding(ctx):
+    """Every offered packet ends in exactly one bucket; Smart shedding
+    under pressure keeps control packets and skips bulk repeats; leaving
+    Full Power cancels queued work and counts it."""
+    rows = _deep_rows(ScenarioBuilder().home_network())
+    e = DeepEngine()
+    e.configure("Full Power", cores=1, prefer_process=False)
+    for d in rows:
+        e.offer(d, d["no"])
+    assert e.drain(20) and e.offered == len(rows) == e.done and not e.shed
+    pct, off, done, _s = e.coverage_60s()
+    assert pct == 100.0 and off == done == len(rows)
+    e.stop()
+    # pressure: no backend running, a measured cost that looks slow
+    e2 = DeepEngine()
+    e2.configure("Full Power", cores=1, prefer_process=False)
+    e2._ensure_backend = lambda: setattr(e2, "backend", "thread")
+    e2.cost_us = lambda: 50000.0
+    for d in rows:
+        e2.offer(d, d["no"])
+    kept = [it[4] for it in e2.pending]
+    assert e2.offered == len(rows)
+    assert e2.offered == e2.done + e2.shed + e2.lost + e2.in_flight()
+    # 50 ms a packet: bulk stops past 2 s of queue (40), ordinary past 5 s
+    assert e2.shed and 1 not in kept[41:] and set(kept[101:]) <= {3}, kept
+    assert e2.shed_why["busy: low-value packet"] == e2.shed
+    controls = sum(1 for d in rows if deep_value(d) == 3)
+    assert len(kept) >= controls - 1, (len(kept), controls)
+    n = len(e2.pending)
+    e2.configure("Normal")
+    assert not e2.pending and e2.shed_why["mode change"] == n
+    assert not e2.offer(rows[0], 1), "not eligible outside Full Power"
+
+
+@self_test(slow=False)
+def test_deep_worker_protocol(ctx):
+    """The worker loop answers over its pipe exactly like the in-process
+    analyzer (run in memory here; a real process in the next test)."""
+    frames = ScenarioBuilder().home_network()[:80]
+    inp = io.BytesIO()
+    _wire_send(inp, ("config", ["192.168.1.10"]))
+    _wire_send(inp, ("batch", 1, [(i + 1, ts, lt, raw) for i, (raw, ts, lt)
+                                  in enumerate(frames)]))
+    _wire_send(inp, ("flush", 0, 0.0, True))
+    _wire_send(inp, ("stop",))
+    inp.seek(0)
+    out = io.BytesIO()
+    assert deep_worker_main(inp, out) == 0
+    out.seek(0)
+    msgs = []
+    while True:
+        m = _wire_recv(out)
+        if m is None:
+            break
+        msgs.append(m)
+    assert msgs[0][0] == "ready" and msgs[1][0] == "res" and \
+        msgs[1][2] == 80 and msgs[2][0] == "flushed"
+    an = DeepAnalyzer(my_ips={"192.168.1.10"})
+    ref = []
+    for i, (raw, ts, lt) in enumerate(frames):
+        ref += an.process(i + 1, ts, lt, raw)[0]
+    assert sorted(map(tuple, msgs[1][3])) == sorted(ref)
+
+
+@self_test()
+def test_deep_worker_process_and_mode_switching(ctx):
+    """A real worker process gives the same findings as the thread; and
+    switching Normal ↔ Full Power 50 times during a replay leaves the
+    model exactly as a single-mode run (depth never changes the model)."""
+    frames = ScenarioBuilder().home_network()
+    rows = _deep_rows(frames)
+    res = {}
+    runners = [False] + ([True] if (os.cpu_count() or 1) > 1 else [])
+    for proc in runners:
+        e = DeepEngine()
+        e.configure("Full Power", cores=1, prefer_process=proc)
+        e._ensure_backend()
+        assert e.backend == ("process" if proc else "thread"), e.last_error
+        for d in rows:
+            e.offer(d, d["no"])
+        assert e.drain(30), e.status_text()
+        res[proc] = sorted(e.store.findings)
+        e.stop()
+    if len(res) == 2:
+        assert res[True] == res[False]
+
+    def summary(m):
+        return (sorted((d.key, d.device_class, d.ip) for d in
+                       m.registry.by_key.values()),
+                sorted(m.websites), len(m.flows.all_flows()),
+                sorted(a.kind for a in m.alerts.alerts.values()))
+
+    def run(toggle):
+        gw, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg(), gw, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        h = _PipelineHarness(m)
+        h.deep = DeepEngine()
+        flip = [0]
+
+        def sync():
+            flip[0] += 1
+            mode = ("Full Power" if flip[0] % 2 else "Normal") if toggle \
+                else "Normal"
+            h.deep.configure(mode, cores=1, prefer_process=False)
+            if h.deep.active():
+                h.deep._ensure_backend()
+        h.sync_deep = sync
+        w = AnalysisWorker(h, GuiGate())
+        w.BATCH = max(1, len(frames) // 55)
+        w.start()
+        sink = h.sink()
+        for raw, ts, lt in frames:
+            sink(raw, ts, lt)
+        t_end = time.time() + 60
+        while (len(h.ring) or w.busy or h.count < len(frames)) and \
+                time.time() < t_end:
+            time.sleep(0.01)
+        w.stop_flag = True
+        w.join(2)
+        m.tick()
+        m._announce_created(flush=True)
+        e = h.deep
+        e.drain(10)
+        assert e.offered == e.done + e.shed + e.lost + e.in_flight()
+        e.stop()
+        return summary(m), flip[0], e.offered
+    plain, _n, off0 = run(False)
+    mixed, flips, off1 = run(True)
+    assert off0 == 0 and off1 > 0 and flips >= 50, (off0, off1, flips)
+    assert mixed == plain
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -43473,6 +44610,44 @@ def _gs_dissect(app, ctx):
     assert "Server name (SNI): www.example.com" in txt, txt[:500]
 
 
+@gui_test_step("Full Power: deep pass, coverage pill, battery pause")
+def _gs_full_power(app, ctx):
+    root = app.root
+    app.config.set("performance.mode", "Full Power")
+    app.config.set("performance.deep_runner", "Thread")
+    try:
+        ident = scenario_identity()
+        m = app._new_model(identity=ident[:3])
+        m.set_identity(local_nets=ident[3])
+        app.replace_model(m)
+        app.data_mode = "offline"
+        sink = app.lossless_sink()
+        frames = ScenarioBuilder().home_network()
+        for raw, ts, lt in frames:
+            sink(raw, ts, lt)
+        _gui_pump(root, until=lambda: app.count >= len(frames), timeout=30)
+        assert app.count >= len(frames), app.count
+        assert app.deep.drain(20), app.deep.status_text()
+        assert app.deep.offered == len(frames) == app.deep.done
+        pill = app.mode_pill_text()
+        assert "Full Power · 100 % deep-analysed" in pill, pill
+        assert pill in app.footer_text()
+        info = DiagnosticsWindow.collect(app)
+        assert "Runs in             thread" in info and \
+            "Cost per packet     dissect" in info, info
+        app._battery = ((22.0, False), time.monotonic())
+        assert app.effective_perf_mode()[0] == "Normal"
+        assert "on battery (22 %)" in app.mode_pill_text()
+        app.full_power_override = True
+        assert app.effective_perf_mode()[0] == "Full Power"
+    finally:
+        app.full_power_override = False
+        app._battery = (None, 0.0)
+        app.config.set("performance.mode", "Automatic")
+        app.config.set("performance.deep_runner", "Automatic")
+        app.deep.configure("Automatic")
+
+
 @gui_test_step("corrections: rename, merge, undo from the window")
 def _gs_corrections(app, ctx):
     root = app.root
@@ -44131,6 +45306,8 @@ def boot_check(out=print):
 
 
 if __name__ == "__main__":
+    if WORKER_MODE:
+        sys.exit(deep_worker_main())
     if BOOT_CHECK_MODE:
         sys.exit(boot_check())
     if SELF_TEST_MODE:
