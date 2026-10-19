@@ -1,0 +1,40 @@
+Move closer to the router, remove obstacles, or use 5 GHz / a cable.	Rapprochez-vous de la box, enlevez les obstacles ou utilisez le 5 GHz / un câble.	Acérquese al router, quite obstáculos o use 5 GHz / un cable.
+Moving closer usually helps.	Se rapprocher aide en général.	Acercarse suele ayudar.
+This computer uses a cable	Cet ordinateur utilise un câble	Este equipo usa cable
+The router isn't answering	La box ne répond pas	El router no responde
+The router didn't answer the check	La box n'a pas répondu à la vérification	El router no respondió a la comprobación
+Restart the router; check its cables.	Redémarrez la box ; vérifiez ses câbles.	Reinicie el router; revise sus cables.
+The router is slow to answer	La box répond lentement	El router tarda en responder
+The router may be overloaded; restart it.	La box est peut-être surchargée ; redémarrez-la.	Puede que el router esté sobrecargado; reinícielo.
+The router is slow or down	La box est lente ou hors service	El router va lento o no funciona
+Slow or failing website lookups (DNS)	Recherches de sites lentes ou en échec (DNS)	Búsquedas de sitios lentas o fallidas (DNS)
+Try another DNS server (in the router or this computer's settings).	Essayez un autre serveur DNS (dans la box ou les réglages de cet ordinateur).	Pruebe otro servidor DNS (en el router o en los ajustes de este equipo).
+Lookups are encrypted, so they can't be timed	Les recherches sont chiffrées, on ne peut pas les chronométrer	Las búsquedas están cifradas, así que no se pueden cronometrar
+Delay beyond your router (Internet provider or the sites themselves)	Retard au-delà de votre box (fournisseur d'accès ou les sites eux-mêmes)	Retraso más allá de su router (proveedor de Internet o los propios sitios)
+Wi-Fi and router look fine	Le Wi-Fi et la box semblent corrects	El Wi-Fi y el router parecen estar bien
+Test at another time; if it persists, contact your Internet provider.	Testez à un autre moment ; si cela persiste, contactez votre fournisseur d'accès.	Pruebe en otro momento; si continúa, contacte con su proveedor de Internet.
+Packets getting lost on the way	Des paquets se perdent en route	Se pierden paquetes por el camino
+Packets getting lost	Des paquets se perdent	Se pierden paquetes
+Consistent with the weak Wi-Fi	Cohérent avec le Wi-Fi faible	Coherente con el Wi-Fi débil
+Another device using the connection	Un autre appareil utilise la connexion	Otro dispositivo usa la conexión
+From this computer, other devices' traffic isn't visible (it goes straight to the router).	Depuis cet ordinateur, le trafic des autres appareils n'est pas visible (il va directement à la box).	Desde este equipo no se ve el tráfico de otros dispositivos (va directamente al router).
+The VPN adds a detour	Le VPN ajoute un détour	La VPN añade un desvío
+A VPN is active	Un VPN est actif	Hay una VPN activa
+Try once with the VPN off to compare.	Essayez une fois sans le VPN pour comparer.	Pruebe una vez sin la VPN para comparar.
+Can't tell from here	Impossible à dire d'ici	No se puede saber desde aquí
+Can't tell	Impossible à dire	No se sabe
+Nothing this computer can see explains it right now.	Rien de ce que voit cet ordinateur ne l'explique pour l'instant.	Nada de lo que ve este equipo lo explica por ahora.
+Check again while it's slow, or connect a Pi-hole / use a mirror port to see more. The router's own Internet line isn't visible from here.	Revérifiez pendant la lenteur, ou connectez un Pi-hole / utilisez un port miroir pour en voir plus. La ligne Internet de la box n'est pas visible d'ici.	Vuelva a comprobarlo mientras vaya lento, o conecte un Pi-hole / use un puerto espejo para ver más. La línea de Internet del propio router no se ve desde aquí.
+weak	faible	débil
+fair	moyen	aceptable
+good	bon	bueno
+excellent	excellent	excelente
+Weak signal — the most likely cause of slowness. Move closer to the router or remove obstacles.	Signal faible — la cause la plus probable de lenteur. Rapprochez-vous de la box ou enlevez les obstacles.	Señal débil — la causa más probable de la lentitud. Acérquese al router o quite obstáculos.
+Usable, but video calls and big downloads may stutter.	Utilisable, mais les appels vidéo et gros téléchargements peuvent saccader.	Utilizable, pero las videollamadas y descargas grandes pueden ir a saltos.
+Good signal.	Bon signal.	Buena señal.
+Strong signal.	Signal fort.	Señal fuerte.
+Signal strength not reported.	Force du signal non indiquée.	Intensidad de señal no indicada.
+Welcome back!	Bon retour !	¡Bienvenido de nuevo!
+Welcome to MiniWireshark 4!	Bienvenue dans MiniWireshark 4 !	¡Bienvenido a MiniWireshark 4!
+Getting started	Démarrage	Empezando
+Works; a different version than the one this release verified	Fonctionne ; version différente de celle vérifiée par cette version	Funciona; una versión distinta de la que verificó esta versión

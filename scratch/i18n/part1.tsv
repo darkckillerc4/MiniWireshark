@@ -1,0 +1,296 @@
+Getting everything ready — quick after the first time	Préparation en cours — rapide après la première fois	Preparando todo — rápido después de la primera vez
+Checking	Vérification	Comprobando
+Check	Vérifier	Comprobar
+Download	Téléchargement	Descarga
+Verify	Contrôler	Verificar
+Unpack	Décompresser	Descomprimir
+Environment	Environnement	Entorno
+Packages	Composants	Componentes
+Self-test	Autotest	Autoprueba
+Switch	Basculer	Cambiar
+Starting	Démarrage	Iniciando
+Show technical details	Afficher les détails techniques	Mostrar detalles técnicos
+Hide technical details	Masquer les détails techniques	Ocultar detalles técnicos
+Cancel	Annuler	Cancelar
+Copy details	Copier les détails	Copiar detalles
+Please wait	Veuillez patienter	Espere, por favor
+Set up MiniWireshark's own Python? (recommended)	Installer le Python privé de MiniWireshark ? (recommandé)	¿Instalar el Python propio de MiniWireshark? (recomendado)
+Install private Python	Installer le Python privé	Instalar el Python privado
+Use my current Python	Utiliser mon Python actuel	Usar mi Python actual
+Exit	Quitter	Salir
+Problem	Problème	Problema
+Something unexpected went wrong	Une erreur inattendue s'est produite	Algo inesperado salió mal
+See the details.	Voir les détails.	Vea los detalles.
+Try again	Réessayer	Reintentar
+Continue with my current Python	Continuer avec mon Python actuel	Continuar con mi Python actual
+Install into your system Python?	Installer dans le Python du système ?	¿Instalar en el Python del sistema?
+Your Python is managed by the operating system, which normally doesn't want programs to add packages to it. I can still install the capture engine (scapy) there with pip's “--break-system-packages” option. A safer choice is the private Python (Settings → Repair). Install into your system Python anyway?	Votre Python est géré par le système d'exploitation, qui n'aime pas que des programmes y ajoutent des paquets. Je peux quand même y installer le moteur de capture (scapy) avec l'option « --break-system-packages » de pip. Le Python privé est un choix plus sûr (Paramètres → Réparer). Installer quand même dans le Python du système ?	Su Python lo gestiona el sistema operativo, que normalmente no quiere que los programas le añadan paquetes. Aun así puedo instalar el motor de captura (scapy) con la opción «--break-system-packages» de pip. El Python privado es más seguro (Ajustes → Reparar). ¿Instalar igualmente en el Python del sistema?
+Yes, install it	Oui, l'installer	Sí, instalarlo
+No	Non	No
+Yes	Oui	Sí
+Welcome — your network, explained in plain English	Bienvenue — votre réseau expliqué simplement	Bienvenido — su red, explicada con palabras sencillas
+Healthy	Sain	Correcto
+Start Monitoring	Commencer la surveillance	Empezar a vigilar
+Pick the best network card and start watching.	Choisit la meilleure carte réseau et commence à observer.	Elige la mejor tarjeta de red y empieza a observar.
+Try Demo Mode	Essayer le mode démo	Probar el modo demo
+Explore with simulated data. Nothing real is shown.	Explorer avec des données simulées. Rien de réel n'est affiché.	Explore con datos simulados. No se muestra nada real.
+Quick Start Guide	Guide de démarrage rapide	Guía de inicio rápido
+Five short steps through the important parts.	Cinq petites étapes à travers l'essentiel.	Cinco pasos breves por lo más importante.
+Diagnostics	Diagnostic	Diagnóstico
+Check the setup, capture driver and environment.	Vérifier l'installation, le pilote de capture et l'environnement.	Comprobar la instalación, el controlador de captura y el entorno.
+What's new in 4.0	Nouveautés de la 4.0	Novedades de la 4.0
+Ten times faster capture — A new capture pipeline keeps up with busy networks without freezing the window.	Capture dix fois plus rapide — Un nouveau moteur suit les réseaux chargés sans figer la fenêtre.	Captura diez veces más rápida — Un nuevo motor sigue el ritmo de redes con mucho tráfico sin congelar la ventana.
+Quiet on new networks — Networks you haven't marked as yours start in Quiet Mode — nothing is sent until you trust them.	Discret sur les nouveaux réseaux — Les réseaux que vous n'avez pas marqués comme vôtres démarrent en mode discret : rien n'est envoyé tant que vous ne leur faites pas confiance.	Discreto en redes nuevas — Las redes que no ha marcado como suyas empiezan en modo silencioso: no se envía nada hasta que confíe en ellas.
+History and “what changed” — Optional history keeps evidence across restarts and tells you what's new since yesterday.	Historique et « ce qui a changé » — L'historique optionnel conserve les preuves entre les redémarrages et indique ce qui est nouveau depuis hier.	Historial y «qué cambió» — El historial opcional conserva las pruebas entre reinicios y le dice qué hay de nuevo desde ayer.
+One-click Repair — Something wrong? Settings → Repair MiniWireshark checks and fixes the usual problems for you.	Réparation en un clic — Un souci ? Paramètres → Réparer MiniWireshark vérifie et corrige les problèmes habituels pour vous.	Reparación con un clic — ¿Algo falla? Ajustes → Reparar MiniWireshark comprueba y corrige los problemas habituales por usted.
+Evidence you can check — Every statement says how it's known (◉ observed, ◎ correlated, ◌ inferred) and links to the packets behind it.	Des preuves vérifiables — Chaque affirmation indique comment elle est connue (◉ observé, ◎ corrélé, ◌ déduit) et renvoie aux paquets qui la justifient.	Pruebas que puede comprobar — Cada afirmación dice cómo se sabe (◉ observado, ◎ correlacionado, ◌ deducido) y enlaza con los paquetes que la respaldan.
+Show the Welcome Center at startup	Afficher l'accueil au démarrage	Mostrar la bienvenida al iniciar
+Something wrong? Repair	Un souci ? Réparer	¿Algo falla? Reparar
+Enter = Start Monitoring · Tab moves between choices · new networks start in Quiet Mode	Entrée = commencer la surveillance · Tab passe d'un choix à l'autre · les nouveaux réseaux démarrent en mode discret	Intro = empezar a vigilar · Tab cambia de opción · las redes nuevas empiezan en modo silencioso
+Your network, explained in plain English	Votre réseau, expliqué simplement	Su red, explicada con palabras sencillas
+Settings	Paramètres	Ajustes
+Help / About	Aide / À propos	Ayuda / Acerca de
+View	Affichage	Vista
+Search	Rechercher	Buscar
+ACTIVE SCANNING — MiniWireshark is also sending harmless discovery probes (ARP/mDNS/SSDP) on your own local network to find quiet devices.  (Nothing is being sent right now: not capturing live.)	ANALYSE ACTIVE — MiniWireshark envoie aussi des sondes de découverte inoffensives (ARP/mDNS/SSDP) sur votre propre réseau local pour trouver les appareils discrets.  (Rien n'est envoyé en ce moment : pas de capture en direct.)	EXPLORACIÓN ACTIVA — MiniWireshark también envía sondas de descubrimiento inofensivas (ARP/mDNS/SSDP) en su propia red local para encontrar dispositivos silenciosos.  (Ahora no se envía nada: no hay captura en directo.)
+Switch to Quiet Mode	Passer en mode discret	Pasar a modo silencioso
+Switch to Active Scanning	Passer en analyse active	Pasar a exploración activa
+Trust this network	Faire confiance à ce réseau	Confiar en esta red
+Stay in Quiet Mode	Rester en mode discret	Seguir en modo silencioso
+Turn the kill switch off	Désactiver l'arrêt d'urgence	Desactivar el interruptor de corte
+DEMO DATA — NOT LIVE TRAFFIC. Everything shown is simulated sample data.   [simulated]	DONNÉES DE DÉMO — PAS DU TRAFIC RÉEL. Tout ce qui est affiché est simulé.   [simulé]	DATOS DE DEMOSTRACIÓN — NO ES TRÁFICO REAL. Todo lo que se muestra es simulado.   [simulado]
+Exit demo	Quitter la démo	Salir de la demo
+DEMO DATA — NOT LIVE TRAFFIC. Explore the tabs; nothing here is real and nothing mixes with your real session.	DONNÉES DE DÉMO — PAS DU TRAFIC RÉEL. Explorez les onglets ; rien ici n'est réel et rien ne se mélange à votre vraie session.	DATOS DE DEMOSTRACIÓN — NO ES TRÁFICO REAL. Explore las pestañas; nada de esto es real y nada se mezcla con su sesión real.
+Session	Session	Sesión
+Export	Exporter	Exportar
+Clear	Effacer	Borrar
+Network card	Carte réseau	Tarjeta de red
+Capture filter	Filtre de capture	Filtro de captura
+Start watching	Commencer à observer	Empezar a observar
+Stop	Arrêter	Detener
+Dashboard	Tableau de bord	Panel
+Happening	En direct	En directo
+Timeline	Chronologie	Cronología
+Devices	Appareils	Dispositivos
+Websites	Sites web	Sitios web
+Connections	Connexions	Conexiones
+Remote hosts	Hôtes distants	Equipos remotos
+Alerts	Alertes	Alertas
+Map	Carte	Mapa
+Health	Santé	Salud
+Security	Sécurité	Seguridad
+Sources	Sources	Fuentes
+Packets	Paquets	Paquetes
+Help	Aide	Ayuda
+Charts	Graphiques	Gráficos
+A quick overview — click any card to open the full picture.	Un aperçu rapide — cliquez sur une carte pour voir le détail.	Un vistazo rápido — haga clic en una tarjeta para ver el detalle.
+(Not live) ✔ Healthy — nothing unusual noticed so far.	(Pas en direct) ✔ Sain — rien d'inhabituel pour l'instant.	(No en directo) ✔ Correcto — nada inusual por ahora.
+Healthy — nothing unusual noticed so far.	Sain — rien d'inhabituel pour l'instant.	Correcto — nada inusual por ahora.
+WHAT I CAN SEE FROM HERE	CE QUE JE VOIS D'ICI	LO QUE VEO DESDE AQUÍ
+Still measuring. No known blind spots right now.  (click for details)	Mesure en cours. Aucun angle mort connu pour l'instant.  (cliquez pour les détails)	Aún midiendo. No hay puntos ciegos conocidos por ahora.  (clic para detalles)
+WHAT CHANGED (LAST HOUR)	CE QUI A CHANGÉ (DERNIÈRE HEURE)	QUÉ CAMBIÓ (ÚLTIMA HORA)
+INTERNET	INTERNET	INTERNET
+Traffic flowing	Le trafic circule	Hay tráfico
+CAPTURE	CAPTURE	CAPTURA
+Demo (not live)	Démo (pas en direct)	Demo (no en directo)
+ACTIVE DEVICES	APPAREILS ACTIFS	DISPOSITIVOS ACTIVOS
+KNOWN DEVICES	APPAREILS CONNUS	DISPOSITIVOS CONOCIDOS
+DOWNLOAD NOW	TÉLÉCHARGEMENT ACTUEL	DESCARGA AHORA
+UPLOAD NOW	ENVOI ACTUEL	SUBIDA AHORA
+PACKETS / SEC	PAQUETS / S	PAQUETES / S
+DNS HEALTH	SANTÉ DNS	SALUD DNS
+ALERTS	ALERTES	ALERTAS
+MOST ACTIVE DEVICE	APPAREIL LE PLUS ACTIF	DISPOSITIVO MÁS ACTIVO
+This computer	Cet ordinateur	Este equipo
+MOST CONTACTED WEBSITE	SITE LE PLUS CONTACTÉ	SITIO MÁS CONTACTADO
+CAPTURE DURATION	DURÉE DE CAPTURE	DURACIÓN DE LA CAPTURA
+Feed speed	Vitesse du fil	Velocidad del flujo
+Pause feed	Mettre le fil en pause	Pausar el flujo
+Resume feed	Reprendre le fil	Reanudar el flujo
+“Calm” groups busy moments so they're easy to read — “Full speed” shows every line as it happens.	« Calme » regroupe les moments chargés pour une lecture facile — « Pleine vitesse » affiche chaque ligne en temps réel.	«Tranquilo» agrupa los momentos de mucho movimiento para leerlos con facilidad — «Velocidad máxima» muestra cada línea al instante.
+Calm	Calme	Tranquilo
+Full speed	Pleine vitesse	Velocidad máxima
+Who	Qui	Quién
+What they did	Ce qu'ils ont fait	Qué hicieron
+When	Quand	Cuándo
+Timeline — devices joining and leaving, address and name changes, first visits to websites, DNS changes, capture events and alerts, in order. Double-click a row to jump to it.	Chronologie — arrivées et départs d'appareils, changements d'adresse et de nom, premières visites de sites, changements DNS, événements de capture et alertes, dans l'ordre. Double-cliquez sur une ligne pour y aller.	Cronología — entradas y salidas de dispositivos, cambios de dirección y nombre, primeras visitas a sitios, cambios de DNS, eventos de captura y alertas, en orden. Haga doble clic en una fila para ir a ella.
+Type	Type	Tipo
+Severity	Gravité	Gravedad
+Device	Appareil	Dispositivo
+Show	Afficher	Mostrar
+Pause live updates	Suspendre les mises à jour	Pausar actualizaciones
+Source	Source	Fuente
+Group into episodes	Regrouper en épisodes	Agrupar en episodios
+Compare sessions	Comparer des sessions	Comparar sesiones
+What changed since	Ce qui a changé depuis	Qué cambió desde
+Time	Heure	Hora
+What happened	Ce qui s'est passé	Qué pasó
+The devices on your local network. Confidence shows how much local evidence supports each one — an IP address alone is never enough to count as a device.	Les appareils de votre réseau local. La confiance indique combien de preuves locales soutiennent chacun — une adresse IP seule ne suffit jamais à compter comme appareil.	Los dispositivos de su red local. La confianza indica cuántas pruebas locales respaldan cada uno — una dirección IP sola nunca basta para contar como dispositivo.
+Double-click a device for details, or right-click for actions (rename, mark as yours, merge…).	Double-cliquez sur un appareil pour les détails, ou clic droit pour les actions (renommer, marquer comme vôtre, fusionner…).	Haga doble clic en un dispositivo para ver detalles, o clic derecho para acciones (renombrar, marcar como suyo, fusionar…).
+Show offline	Afficher hors ligne	Mostrar desconectados
+Show expired	Afficher expirés	Mostrar caducados
+Filter	Filtre	Filtro
+Merge devices	Fusionner des appareils	Fusionar dispositivos
+Details	Détails	Detalles
+What it likely is	Ce que c'est probablement	Qué es probablemente
+Local IP	IP locale	IP local
+MAC address	Adresse MAC	Dirección MAC
+Made by	Fabricant	Fabricante
+Confidence	Confiance	Confianza
+Evidence	Preuve	Prueba
+Status	État	Estado
+Traffic ↑/↓	Trafic ↑/↓	Tráfico ↑/↓
+Last seen	Vu pour la dernière fois	Visto por última vez
+Websites and online services your devices looked up or connected to.	Sites web et services en ligne que vos appareils ont recherchés ou contactés.	Sitios web y servicios en línea que sus dispositivos buscaron o a los que se conectaron.
+Seen via	Vu via	Visto mediante
+Category	Catégorie	Categoría
+Sort	Trier	Ordenar
+Lookups / visits	Recherches / visites	Búsquedas / visitas
+How we know	Comment on le sait	Cómo lo sabemos
+Traffic	Trafic	Tráfico
+Contacted by	Contacté par	Contactado por
+First seen	Vu pour la première fois	Visto por primera vez
+Where	Où	Dónde
+Server IPs	IP des serveurs	IP de servidores
+Connections — each row is one conversation between a device and something else. Upload is what the device sent; download is what it received.	Connexions — chaque ligne est une conversation entre un appareil et autre chose. L'envoi est ce que l'appareil a émis ; le téléchargement ce qu'il a reçu.	Conexiones — cada fila es una conversación entre un dispositivo y otra cosa. La subida es lo que envió el dispositivo; la descarga, lo que recibió.
+Double-click for a plain-English report. “Domain (how known)” says whether the name was seen in the connection itself or inferred from an earlier lookup.	Double-cliquez pour un rapport en clair. « Domaine (comment connu) » indique si le nom a été vu dans la connexion elle-même ou déduit d'une recherche antérieure.	Haga doble clic para un informe en lenguaje sencillo. «Dominio (cómo se sabe)» indica si el nombre se vio en la propia conexión o se dedujo de una búsqueda anterior.
+Technical columns	Colonnes techniques	Columnas técnicas
+Connected to	Connecté à	Conectado a
+Purpose	Rôle	Finalidad
+Upload	Envoi	Subida
+Duration	Durée	Duración
+Local endpoint	Extrémité locale	Extremo local
+Remote endpoint	Extrémité distante	Extremo remoto
+Transport	Transport	Transporte
+Port	Port	Puerto
+TCP state	État TCP	Estado TCP
+Domain (how known)	Domaine (comment connu)	Dominio (cómo se sabe)
+Provider / country	Fournisseur / pays	Proveedor / país
+Program (this computer)	Programme (cet ordinateur)	Programa (este equipo)
+REMOTE HOSTS — public Internet addresses your devices talked to. These are never devices on your network — they live somewhere out on the Internet.	HÔTES DISTANTS — adresses Internet publiques avec lesquelles vos appareils ont communiqué. Ce ne sont jamais des appareils de votre réseau — ils sont quelque part sur Internet.	EQUIPOS REMOTOS — direcciones públicas de Internet con las que hablaron sus dispositivos. Nunca son dispositivos de su red — están en algún lugar de Internet.
+Online country lookup	Recherche de pays en ligne	Búsqueda de país en línea
+Test	Tester	Probar
+Retry failed	Réessayer les échecs	Reintentar fallidos
+Online country lookup is off. Turn on the offline database in Settings → Privacy for private, local lookups.	La recherche de pays en ligne est désactivée. Activez la base hors ligne dans Paramètres → Confidentialité pour des recherches locales et privées.	La búsqueda de país en línea está desactivada. Active la base de datos sin conexión en Ajustes → Privacidad para búsquedas locales y privadas.
+Remote IP	IP distante	IP remota
+Country	Pays	País
+Provider (ASN)	Fournisseur (ASN)	Proveedor (ASN)
+Known name(s)	Nom(s) connu(s)	Nombre(s) conocido(s)
+Ports	Ports	Puertos
+Protocol(s)	Protocole(s)	Protocolo(s)
+Alerts — every alert separates what was observed from what it might mean. These are ANOMALIES (unusual behaviour), never a verdict that something is hacked.	Alertes — chaque alerte sépare ce qui a été observé de ce que cela pourrait signifier. Ce sont des ANOMALIES (comportement inhabituel), jamais un verdict de piratage.	Alertas — cada alerta separa lo observado de lo que podría significar. Son ANOMALÍAS (comportamiento inusual), nunca un veredicto de que algo esté pirateado.
+INFO — normal activity	INFO — activité normale	INFO — actividad normal
+WARNING — worth a look	AVERTISSEMENT — à vérifier	AVISO — merece un vistazo
+DANGER — strong evidence of a real problem	DANGER — indices sérieux d'un vrai problème	PELIGRO — indicios sólidos de un problema real
+Show acknowledged	Afficher les alertes vues	Mostrar las reconocidas
+Investigate	Enquêter	Investigar
+Copy report	Copier le rapport	Copiar informe
+Go to related	Aller à l'élément lié	Ir a lo relacionado
+Mute for this device	Masquer pour cet appareil	Silenciar para este dispositivo
+Mute this type	Masquer ce type	Silenciar este tipo
+Mark expected	Marquer comme attendu	Marcar como esperado
+Acknowledge	Marquer comme vu	Reconocer
+Related to	Concerne	Relacionado con
+Times	Fois	Veces
+Network map	Carte du réseau	Mapa de la red
+Click a node to select it, double-click for details, drag the background to move, scroll or use +/− to zoom.	Cliquez sur un nœud pour le sélectionner, double-cliquez pour les détails, faites glisser le fond pour déplacer, molette ou +/− pour zoomer.	Haga clic en un nodo para seleccionarlo, doble clic para detalles, arrastre el fondo para moverlo, rueda o +/− para hacer zoom.
+Topology (your LAN)	Topologie (votre réseau local)	Topología (su red local)
+Connections (device → website → remote host)	Connexions (appareil → site → hôte distant)	Conexiones (dispositivo → sitio → equipo remoto)
+Include offline devices	Inclure les appareils hors ligne	Incluir dispositivos desconectados
+Reset view	Réinitialiser la vue	Restablecer vista
+Internet hosts	Hôtes Internet	Equipos de Internet
+Switch (LLDP/CDP)	Commutateur (LLDP/CDP)	Conmutador (LLDP/CDP)
+Open alerts	Alertes ouvertes	Alertas abiertas
+New this hour	Nouveaux cette heure	Nuevos en esta hora
+Forget dragged positions	Oublier les positions déplacées	Olvidar posiciones movidas
+List view	Vue en liste	Vista de lista
+Map view	Vue en carte	Vista de mapa
+Kind	Genre	Clase
+Address	Adresse	Dirección
+Connected via	Connecté via	Conectado mediante
+Network health	Santé du réseau	Salud de la red
+Run checks now	Lancer les vérifications	Comprobar ahora
+Why is it slow?	Pourquoi c'est lent ?	¿Por qué va lento?
+Showing what can be worked out from the demo data — active checks don't run on data that isn't live.	Ce qui peut être déduit des données de démo — les vérifications actives ne s'exécutent pas sur des données qui ne sont pas en direct.	Lo que se puede deducir de los datos de demostración — las comprobaciones activas no se ejecutan con datos que no son en directo.
+Needs attention	À surveiller	Requiere atención
+Degraded	Dégradé	Degradado
+Unknown	Inconnu	Desconocido
+Info	Info	Info
+Overall	Global	General
+Wi-Fi signal (this computer)	Signal Wi-Fi (cet ordinateur)	Señal Wi-Fi (este equipo)
+Router reachable	Routeur joignable	Router accesible
+Internet reachable	Internet joignable	Internet accesible
+Website lookups (DNS)	Recherches de sites (DNS)	Búsquedas de sitios (DNS)
+Packet loss (from checks)	Perte de paquets (vérifications)	Pérdida de paquetes (comprobaciones)
+Needs a few active checks first.	Il faut d'abord quelques vérifications actives.	Primero hacen falta algunas comprobaciones activas.
+Internet round trip	Aller-retour Internet	Ida y vuelta a Internet
+Needs a few new connections first.	Il faut d'abord quelques nouvelles connexions.	Primero hacen falta algunas conexiones nuevas.
+Connection resets	Connexions réinitialisées	Conexiones restablecidas
+Not enough connections yet.	Pas encore assez de connexions.	Aún no hay suficientes conexiones.
+Re-sent data (retransmissions)	Données renvoyées (retransmissions)	Datos reenviados (retransmisiones)
+Not enough traffic yet.	Pas encore assez de trafic.	Aún no hay suficiente tráfico.
+Address assignment (DHCP)	Attribution d'adresses (DHCP)	Asignación de direcciones (DHCP)
+Duplicate addresses	Adresses en double	Direcciones duplicadas
+No conflicts seen.	Aucun conflit constaté.	No se han visto conflictos.
+Devices reconnecting	Appareils qui se reconnectent	Dispositivos que se reconectan
+No devices are cycling on and off.	Aucun appareil ne se connecte et déconnecte en boucle.	Ningún dispositivo se conecta y desconecta sin parar.
+Not capturing live.	Pas de capture en direct.	Sin captura en directo.
+Wired switch port	Port du commutateur filaire	Puerto del conmutador con cable
+No switch has announced itself on this link (normal on Wi-Fi and with most home routers).	Aucun commutateur ne s'est annoncé sur ce lien (normal en Wi-Fi et avec la plupart des box).	Ningún conmutador se ha anunciado en este enlace (normal en Wi-Fi y con la mayoría de routers domésticos).
+Capture driver	Pilote de capture	Controlador de captura
+Built-in packet capture.	Capture de paquets intégrée.	Captura de paquetes integrada.
+No VPN detected.	Aucun VPN détecté.	No se ha detectado VPN.
+Your connection	Votre connexion	Su conexión
+DNS servers seen	Serveurs DNS vus	Servidores DNS vistos
+Server	Serveur	Servidor
+Queries	Requêtes	Consultas
+Typical ms	ms habituelles	ms típicos
+Failed	Échecs	Fallidas
+Not found	Introuvables	No encontradas
+Lookup times (all servers)	Temps de recherche (tous les serveurs)	Tiempos de búsqueda (todos los servidores)
+Security check	Contrôle de sécurité	Revisión de seguridad
+Friendly explanations of what I've noticed. Unusual is not the same as dangerous.	Explications simples de ce que j'ai remarqué. Inhabituel ne veut pas dire dangereux.	Explicaciones sencillas de lo que he notado. Inusual no es lo mismo que peligroso.
+Check my router's port forwarding (UPnP)	Vérifier les redirections de ports de ma box (UPnP)	Comprobar la redirección de puertos de mi router (UPnP)
+What MiniWireshark sent	Ce que MiniWireshark a envoyé	Lo que envió MiniWireshark
+Sources — where MiniWireshark's information comes from. What this computer sees itself is “Observed”; what a connected helper tells it is “Reported”, shown beside it and never added to it.	Sources — d'où viennent les informations de MiniWireshark. Ce que cet ordinateur voit lui-même est « Observé » ; ce qu'un assistant connecté lui dit est « Rapporté », affiché à côté et jamais additionné.	Fuentes — de dónde viene la información de MiniWireshark. Lo que ve este equipo es «Observado»; lo que le dice un ayudante conectado es «Informado», mostrado al lado y nunca sumado.
+Optional: connect your Pi-hole or AdGuard Home to see the lookups of devices this computer can't hear. Read-only — nothing is ever changed on them.	Facultatif : connectez votre Pi-hole ou AdGuard Home pour voir les recherches des appareils que cet ordinateur n'entend pas. Lecture seule — rien n'y est jamais modifié.	Opcional: conecte su Pi-hole o AdGuard Home para ver las búsquedas de los dispositivos que este equipo no oye. Solo lectura — nunca se cambia nada en ellos.
+Add Pi-hole	Ajouter Pi-hole	Añadir Pi-hole
+Add AdGuard Home	Ajouter AdGuard Home	Añadir AdGuard Home
+Edit	Modifier	Editar
+Ask now	Interroger maintenant	Consultar ahora
+Pause / resume	Pause / reprise	Pausar / reanudar
+Remove	Supprimer	Quitar
+Gives	Fournit	Aporta
+Last update	Dernière mise à jour	Última actualización
+Reported vs observed	Rapporté ou observé	Informado frente a observado
+Show only	Afficher seulement	Mostrar solo
+All	Tous	Todos
+Website	Site web	Sitio web
+Direction	Sens	Sentido
+Bookmarked only	Favoris seulement	Solo marcados
+Expression	Expression	Expresión
+Apply	Appliquer	Aplicar
+Clear filter	Effacer le filtre	Quitar filtro
+Save as preset	Enregistrer comme préréglage	Guardar como ajuste
+Delete preset	Supprimer le préréglage	Borrar ajuste
+Pause display	Suspendre l'affichage	Pausar la vista
+Resume display	Reprendre l'affichage	Reanudar la vista
+Follow newest packet	Suivre le paquet le plus récent	Seguir el paquete más reciente
+Display filter: showing everything	Filtre d'affichage : tout est affiché	Filtro de vista: se muestra todo
+No.	N°	N.º
+Destination	Destination	Destino
+Protocol	Protocole	Protocolo
+Length	Longueur	Longitud
+Conn.	Conn.	Con.
+Packet details	Détails du paquet	Detalles del paquete
+Text dump	Vidage texte	Volcado de texto
+Hex dump	Vidage hexadécimal	Volcado hexadecimal
+Value	Valeur	Valor
+Field	Champ	Campo
+Stop Demo Mode	Arrêter le mode démo	Detener el modo demo
+Run self-test	Lancer l'autotest	Ejecutar autoprueba
+Open data folder	Ouvrir le dossier des données	Abrir la carpeta de datos
+Open logs	Ouvrir les journaux	Abrir registros
+Inspector	Inspecteur	Inspector
+observed  ◈ reported  ◎ correlated  ◌ inferred  ? unknown	observé  ◈ rapporté  ◎ corrélé  ◌ déduit  ? inconnu	observado  ◈ informado  ◎ correlacionado  ◌ deducido  ? desconocido
+Ready. Click “Start watching” when you'd like to begin.	Prêt. Cliquez sur « Commencer à observer » quand vous voulez.	Listo. Haga clic en «Empezar a observar» cuando quiera.

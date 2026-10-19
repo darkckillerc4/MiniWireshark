@@ -1,0 +1,64 @@
+Beginner	Débutant	Principiante
+Advanced	Avancé	Avanzado
+Advertising	Publicité	Publicidad
+Analytics	Mesure d'audience	Analítica
+Social	Réseaux sociaux	Redes sociales
+Tracking	Pistage	Rastreo
+CDN	Diffusion de contenu (CDN)	Red de contenidos (CDN)
+Content	Contenu	Contenido
+Uncategorised	Non classé	Sin categoría
+All devices	Tous les appareils	Todos los dispositivos
+All types	Tous les types	Todos los tipos
+Any	Tous	Cualquiera
+Any category	Toutes catégories	Cualquier categoría
+Any evidence	Toute preuve	Cualquier prueba
+Any source	Toute source	Cualquier fuente
+Both	Les deux	Ambos
+Connected	Connecté	Conectado
+Connected (shared address)	Connecté (adresse partagée)	Conectado (dirección compartida)
+Looked up (reported)	Recherché (rapporté)	Buscado (informado)
+Looked up only	Recherché seulement	Solo buscado
+Possibly	Peut-être	Posiblemente
+Encrypted	Chiffré	Cifrado
+Not encrypted	Non chiffré	Sin cifrar
+Finished	Terminée	Terminada
+HTTP Host	Hôte HTTP	Host HTTP
+TLS SNI	TLS SNI	SNI de TLS
+QUIC first packet	Premier paquet QUIC	Primer paquete QUIC
+Local only	Local seulement	Solo local
+Most contacted	Les plus contactés	Más contactados
+Most traffic	Le plus de trafic	Más tráfico
+Recently seen	Vus récemment	Vistos recientemente
+Reset	Réinitialisée	Restablecida
+Network & capture	Réseau et capture	Red y captura
+This session	Cette session	Esta sesión
+Saved history	Historique enregistré	Historial guardado
+Outgoing	Sortant	Saliente
+Incoming	Entrant	Entrante
+Alphabetical	Alphabétique	Alfabético
+Name (A–Z)	Nom (A–Z)	Nombre (A–Z)
+Online	En ligne	Conectado
+Idle	Inactif	Inactivo
+Offline	Hors ligne	Desconectado
+Expired	Expiré	Caducado
+Search settings	Rechercher un paramètre	Buscar un ajuste
+Asking PyPI for the newest pip	Interrogation de PyPI pour le pip le plus récent	Consultando PyPI para obtener el pip más reciente
+Cancelling safely — nothing half-done is kept	Annulation en toute sécurité — rien d'inachevé n'est conservé	Cancelando con seguridad — no se conserva nada a medias
+Checking installed components	Vérification des composants installés	Comprobando los componentes instalados
+Checking the new Python	Vérification du nouveau Python	Comprobando el nuevo Python
+Checking this computer	Vérification de cet ordinateur	Comprobando este equipo
+Downloading verified components	Téléchargement des composants vérifiés	Descargando componentes verificados
+Fingerprint OK	Empreinte correcte	Huella correcta
+Installing components	Installation des composants	Instalando componentes
+Components installed	Composants installés	Componentes instalados
+Loading the packet engine	Chargement du moteur de paquets	Cargando el motor de paquetes
+Looking at your network adapters	Examen de vos cartes réseau	Examinando sus adaptadores de red
+Restoring pip from the copy bundled with Python	Restauration de pip à partir de la copie fournie avec Python	Restaurando pip desde la copia incluida con Python
+Reusing the Python 3.14 already on this computer (it is not modified)	Réutilisation du Python 3.14 déjà présent sur cet ordinateur (il n'est pas modifié)	Reutilizando el Python 3.14 que ya está en este equipo (no se modifica)
+Running MiniWireshark's self-test in the new environment	Autotest de MiniWireshark dans le nouvel environnement	Ejecutando la autoprueba de MiniWireshark en el nuevo entorno
+Setup could not finish	L'installation n'a pas pu se terminer	La instalación no pudo terminar
+Starting inside the private Python	Démarrage dans le Python privé	Iniciando dentro del Python privado
+Switching to the new environment	Passage au nouvel environnement	Cambiando al nuevo entorno
+The private Python is missing or damaged — rebuilding it	Le Python privé est absent ou endommagé — reconstruction	El Python privado falta o está dañado — reconstruyéndolo
+Unpacking the private Python	Décompression du Python privé	Descomprimiendo el Python privado
+Updating pip from the copy bundled with Python	Mise à jour de pip à partir de la copie fournie avec Python	Actualizando pip desde la copia incluida con Python

@@ -1064,7 +1064,7 @@ class LoaderWindow(tk.Frame):
         tk.Label(left, text=f"MiniWireshark {SCRIPT_VERSION}", fg="white",
                  bg="#2b3a55", font=("TkDefaultFont", 16, "bold")).pack(
             anchor="w")
-        self.sub_var = tk.StringVar(
+        self.sub_var = DisplayVar(
             value="Runtime Manager — checking everything is ready"
             if self.mode == "maintenance" else
             "Getting everything ready — quick after the first time")
@@ -1088,14 +1088,14 @@ class LoaderWindow(tk.Frame):
                 tk.Label(stages, text="›", bg=self.bg,
                          fg=self.muted).pack(side="left", padx=(0, 4))
             self.stage_lbls[name] = lb
-        self.status_var = tk.StringVar(value="Starting …")
+        self.status_var = DisplayVar(value="Starting …")
         tk.Label(body, textvariable=self.status_var, bg=self.bg, fg=self.fg,
                  font=("TkDefaultFont", 11, "bold"), anchor="w",
                  justify="left", wraplength=600).pack(fill="x")
         self.progress = ttk.Progressbar(body, mode="determinate",
                                         maximum=100)
         self.progress.pack(fill="x", pady=(6, 2))
-        self.speed_var = tk.StringVar(value="")
+        self.speed_var = DisplayVar(value="")
         tk.Label(body, textvariable=self.speed_var, bg=self.bg,
                  fg=self.muted, anchor="w").pack(fill="x")
         self.card = tk.Frame(body, bg=self.bg)
@@ -1438,10 +1438,11 @@ class LoaderWindow(tk.Frame):
                             else (self.t or {}).get("border", "#e0e2e8"),
                             highlightcolor=self.accent)
             tile.grid(row=0, column=i, sticky="nsew", padx=4)
-            tiles.columnconfigure(i, weight=1)
-            a = tk.Label(tile, text=f"{icon}  {title}", bg=self.card_bg,
-                         fg=self.fg, font=("TkDefaultFont", 11, "bold"),
-                         anchor="w")
+            tiles.columnconfigure(i, weight=1, uniform="tile")
+            a = tk.Label(tile, text=f"{icon}  {translate_text(title)}",
+                         bg=self.card_bg, fg=self.fg, wraplength=150,
+                         font=("TkDefaultFont", 11, "bold"),
+                         anchor="w", justify="left")
             a.pack(anchor="w")
             b = tk.Label(tile, text=text, bg=self.card_bg, fg=self.muted,
                          wraplength=135, justify="left", anchor="w")
@@ -1458,7 +1459,8 @@ class LoaderWindow(tk.Frame):
                  fg=self.fg, font=("TkDefaultFont", 10, "bold"),
                  anchor="w").pack(fill="x")
         for icon, title, text in self.WHATS_NEW:
-            tk.Label(news, text=f"{icon}  {title} — {text}",
+            tk.Label(news, text=f"{icon}  {translate_text(title)} — "
+                               f"{translate_text(text)}",
                      bg=self.card_bg, fg=self.fg, anchor="w",
                      justify="left", wraplength=640).pack(fill="x",
                                                           pady=1)
@@ -1484,7 +1486,8 @@ class LoaderWindow(tk.Frame):
         rep.bind("<Button-1>", lambda e: self._choose("repair"))
         self.footer.config(text="Enter = Start Monitoring · Tab moves "
                                 "between choices · new networks start in "
-                                "Quiet Mode")
+                                "Quiet Mode", wraplength=720,
+                           justify="left")
         self.winfo_toplevel().bind("<Return>",
                                    lambda e: self._choose("monitor"))
         self.winfo_toplevel().protocol("WM_DELETE_WINDOW",
@@ -16259,7 +16262,7 @@ STRINGS = {
     },
 }
 CURRENT_LOCALE = "en"
-LOCALE_NAMES = {"en": "English"}   # display name -> add more as they're built
+LOCALE_NAMES = {"en": "English", "fr": "Fran\u00e7ais", "es": "Espa\u00f1ol"}
 
 
 def tr(key, **kwargs):
@@ -16271,12 +16274,1451 @@ def tr(key, **kwargs):
 
 
 def set_locale(name):
+    """Accepts a display name ("Français") or a code ("fr"); anything else
+    means English. Returns the code now in use."""
     global CURRENT_LOCALE
     for code, display in LOCALE_NAMES.items():
-        if display == name:
+        if name in (display, code):
             CURRENT_LOCALE = code
-            return
+            return code
     CURRENT_LOCALE = "en"
+    return "en"
+
+
+# ---------------------------------------------------------------------------
+# Languages: English, French, Spanish
+# ---------------------------------------------------------------------------
+# The program is written in English. Every visible label, button, menu,
+# tab, column heading, window title and message box passes through one hook
+# (installed below on tkinter itself), which looks the English text up in
+# this catalog. A label with a leading icon or a trailing ":" "…" "›" is
+# matched on its words, so "▶  Start watching" and "Start watching" share
+# one entry. Anything not in the catalog (device names, websites, numbers,
+# reports built from live data) is shown as it is — a missing translation
+# never breaks or hides anything.
+#
+# One line per string: English ¦ French ¦ Spanish (⏎ marks a line break).
+I18N_SEP = " \u00a6 "
+I18N_CATALOG = """\
+Getting everything ready — quick after the first time ¦ Préparation en cours — rapide après la première fois ¦ Preparando todo — rápido después de la primera vez
+Checking ¦ Vérification ¦ Comprobando
+Check ¦ Vérifier ¦ Comprobar
+Download ¦ Téléchargement ¦ Descarga
+Verify ¦ Contrôler ¦ Verificar
+Unpack ¦ Décompresser ¦ Descomprimir
+Environment ¦ Environnement ¦ Entorno
+Packages ¦ Composants ¦ Componentes
+Self-test ¦ Autotest ¦ Autoprueba
+Switch ¦ Basculer ¦ Cambiar
+Starting ¦ Démarrage ¦ Iniciando
+Show technical details ¦ Afficher les détails techniques ¦ Mostrar detalles técnicos
+Hide technical details ¦ Masquer les détails techniques ¦ Ocultar detalles técnicos
+Cancel ¦ Annuler ¦ Cancelar
+Copy details ¦ Copier les détails ¦ Copiar detalles
+Please wait ¦ Veuillez patienter ¦ Espere, por favor
+Set up MiniWireshark's own Python? (recommended) ¦ Installer le Python privé de MiniWireshark ? (recommandé) ¦ ¿Instalar el Python propio de MiniWireshark? (recomendado)
+Install private Python ¦ Installer le Python privé ¦ Instalar el Python privado
+Use my current Python ¦ Utiliser mon Python actuel ¦ Usar mi Python actual
+Exit ¦ Quitter ¦ Salir
+Problem ¦ Problème ¦ Problema
+Something unexpected went wrong ¦ Une erreur inattendue s'est produite ¦ Algo inesperado salió mal
+See the details. ¦ Voir les détails. ¦ Vea los detalles.
+Try again ¦ Réessayer ¦ Reintentar
+Continue with my current Python ¦ Continuer avec mon Python actuel ¦ Continuar con mi Python actual
+Install into your system Python? ¦ Installer dans le Python du système ? ¦ ¿Instalar en el Python del sistema?
+Your Python is managed by the operating system, which normally doesn't want programs to add packages to it. I can still install the capture engine (scapy) there with pip's “--break-system-packages” option. A safer choice is the private Python (Settings → Repair). Install into your system Python anyway? ¦ Votre Python est géré par le système d'exploitation, qui n'aime pas que des programmes y ajoutent des paquets. Je peux quand même y installer le moteur de capture (scapy) avec l'option « --break-system-packages » de pip. Le Python privé est un choix plus sûr (Paramètres → Réparer). Installer quand même dans le Python du système ? ¦ Su Python lo gestiona el sistema operativo, que normalmente no quiere que los programas le añadan paquetes. Aun así puedo instalar el motor de captura (scapy) con la opción «--break-system-packages» de pip. El Python privado es más seguro (Ajustes → Reparar). ¿Instalar igualmente en el Python del sistema?
+Yes, install it ¦ Oui, l'installer ¦ Sí, instalarlo
+No ¦ Non ¦ No
+Yes ¦ Oui ¦ Sí
+Welcome — your network, explained in plain English ¦ Bienvenue — votre réseau expliqué simplement ¦ Bienvenido — su red, explicada con palabras sencillas
+Healthy ¦ Sain ¦ Correcto
+Start Monitoring ¦ Commencer la surveillance ¦ Empezar a vigilar
+Pick the best network card and start watching. ¦ Choisit la meilleure carte réseau et commence à observer. ¦ Elige la mejor tarjeta de red y empieza a observar.
+Try Demo Mode ¦ Essayer le mode démo ¦ Probar el modo demo
+Explore with simulated data. Nothing real is shown. ¦ Explorer avec des données simulées. Rien de réel n'est affiché. ¦ Explore con datos simulados. No se muestra nada real.
+Quick Start Guide ¦ Guide de démarrage rapide ¦ Guía de inicio rápido
+Five short steps through the important parts. ¦ Cinq petites étapes à travers l'essentiel. ¦ Cinco pasos breves por lo más importante.
+Diagnostics ¦ Diagnostic ¦ Diagnóstico
+Check the setup, capture driver and environment. ¦ Vérifier l'installation, le pilote de capture et l'environnement. ¦ Comprobar la instalación, el controlador de captura y el entorno.
+What's new in 4.0 ¦ Nouveautés de la 4.0 ¦ Novedades de la 4.0
+Ten times faster capture — A new capture pipeline keeps up with busy networks without freezing the window. ¦ Capture dix fois plus rapide — Un nouveau moteur suit les réseaux chargés sans figer la fenêtre. ¦ Captura diez veces más rápida — Un nuevo motor sigue el ritmo de redes con mucho tráfico sin congelar la ventana.
+Quiet on new networks — Networks you haven't marked as yours start in Quiet Mode — nothing is sent until you trust them. ¦ Discret sur les nouveaux réseaux — Les réseaux que vous n'avez pas marqués comme vôtres démarrent en mode discret : rien n'est envoyé tant que vous ne leur faites pas confiance. ¦ Discreto en redes nuevas — Las redes que no ha marcado como suyas empiezan en modo silencioso: no se envía nada hasta que confíe en ellas.
+History and “what changed” — Optional history keeps evidence across restarts and tells you what's new since yesterday. ¦ Historique et « ce qui a changé » — L'historique optionnel conserve les preuves entre les redémarrages et indique ce qui est nouveau depuis hier. ¦ Historial y «qué cambió» — El historial opcional conserva las pruebas entre reinicios y le dice qué hay de nuevo desde ayer.
+One-click Repair — Something wrong? Settings → Repair MiniWireshark checks and fixes the usual problems for you. ¦ Réparation en un clic — Un souci ? Paramètres → Réparer MiniWireshark vérifie et corrige les problèmes habituels pour vous. ¦ Reparación con un clic — ¿Algo falla? Ajustes → Reparar MiniWireshark comprueba y corrige los problemas habituales por usted.
+Evidence you can check — Every statement says how it's known (◉ observed, ◎ correlated, ◌ inferred) and links to the packets behind it. ¦ Des preuves vérifiables — Chaque affirmation indique comment elle est connue (◉ observé, ◎ corrélé, ◌ déduit) et renvoie aux paquets qui la justifient. ¦ Pruebas que puede comprobar — Cada afirmación dice cómo se sabe (◉ observado, ◎ correlacionado, ◌ deducido) y enlaza con los paquetes que la respaldan.
+Show the Welcome Center at startup ¦ Afficher l'accueil au démarrage ¦ Mostrar la bienvenida al iniciar
+Something wrong? Repair ¦ Un souci ? Réparer ¦ ¿Algo falla? Reparar
+Enter = Start Monitoring · Tab moves between choices · new networks start in Quiet Mode ¦ Entrée = commencer la surveillance · Tab passe d'un choix à l'autre · les nouveaux réseaux démarrent en mode discret ¦ Intro = empezar a vigilar · Tab cambia de opción · las redes nuevas empiezan en modo silencioso
+Your network, explained in plain English ¦ Votre réseau, expliqué simplement ¦ Su red, explicada con palabras sencillas
+Settings ¦ Paramètres ¦ Ajustes
+Help / About ¦ Aide / À propos ¦ Ayuda / Acerca de
+View ¦ Affichage ¦ Vista
+Search ¦ Rechercher ¦ Buscar
+ACTIVE SCANNING — MiniWireshark is also sending harmless discovery probes (ARP/mDNS/SSDP) on your own local network to find quiet devices.  (Nothing is being sent right now: not capturing live.) ¦ ANALYSE ACTIVE — MiniWireshark envoie aussi des sondes de découverte inoffensives (ARP/mDNS/SSDP) sur votre propre réseau local pour trouver les appareils discrets.  (Rien n'est envoyé en ce moment : pas de capture en direct.) ¦ EXPLORACIÓN ACTIVA — MiniWireshark también envía sondas de descubrimiento inofensivas (ARP/mDNS/SSDP) en su propia red local para encontrar dispositivos silenciosos.  (Ahora no se envía nada: no hay captura en directo.)
+Switch to Quiet Mode ¦ Passer en mode discret ¦ Pasar a modo silencioso
+Switch to Active Scanning ¦ Passer en analyse active ¦ Pasar a exploración activa
+Trust this network ¦ Faire confiance à ce réseau ¦ Confiar en esta red
+Stay in Quiet Mode ¦ Rester en mode discret ¦ Seguir en modo silencioso
+Turn the kill switch off ¦ Désactiver l'arrêt d'urgence ¦ Desactivar el interruptor de corte
+DEMO DATA — NOT LIVE TRAFFIC. Everything shown is simulated sample data.   [simulated] ¦ DONNÉES DE DÉMO — PAS DU TRAFIC RÉEL. Tout ce qui est affiché est simulé.   [simulé] ¦ DATOS DE DEMOSTRACIÓN — NO ES TRÁFICO REAL. Todo lo que se muestra es simulado.   [simulado]
+Exit demo ¦ Quitter la démo ¦ Salir de la demo
+DEMO DATA — NOT LIVE TRAFFIC. Explore the tabs; nothing here is real and nothing mixes with your real session. ¦ DONNÉES DE DÉMO — PAS DU TRAFIC RÉEL. Explorez les onglets ; rien ici n'est réel et rien ne se mélange à votre vraie session. ¦ DATOS DE DEMOSTRACIÓN — NO ES TRÁFICO REAL. Explore las pestañas; nada de esto es real y nada se mezcla con su sesión real.
+Session ¦ Session ¦ Sesión
+Export ¦ Exporter ¦ Exportar
+Clear ¦ Effacer ¦ Borrar
+Network card ¦ Carte réseau ¦ Tarjeta de red
+Capture filter ¦ Filtre de capture ¦ Filtro de captura
+Start watching ¦ Commencer à observer ¦ Empezar a observar
+Stop ¦ Arrêter ¦ Detener
+Dashboard ¦ Tableau de bord ¦ Panel
+Happening ¦ En direct ¦ En directo
+Timeline ¦ Chronologie ¦ Cronología
+Devices ¦ Appareils ¦ Dispositivos
+Websites ¦ Sites web ¦ Sitios web
+Connections ¦ Connexions ¦ Conexiones
+Remote hosts ¦ Hôtes distants ¦ Equipos remotos
+Alerts ¦ Alertes ¦ Alertas
+Map ¦ Carte ¦ Mapa
+Health ¦ Santé ¦ Salud
+Security ¦ Sécurité ¦ Seguridad
+Sources ¦ Sources ¦ Fuentes
+Packets ¦ Paquets ¦ Paquetes
+Help ¦ Aide ¦ Ayuda
+Charts ¦ Graphiques ¦ Gráficos
+A quick overview — click any card to open the full picture. ¦ Un aperçu rapide — cliquez sur une carte pour voir le détail. ¦ Un vistazo rápido — haga clic en una tarjeta para ver el detalle.
+(Not live) ✔ Healthy — nothing unusual noticed so far. ¦ (Pas en direct) ✔ Sain — rien d'inhabituel pour l'instant. ¦ (No en directo) ✔ Correcto — nada inusual por ahora.
+Healthy — nothing unusual noticed so far. ¦ Sain — rien d'inhabituel pour l'instant. ¦ Correcto — nada inusual por ahora.
+WHAT I CAN SEE FROM HERE ¦ CE QUE JE VOIS D'ICI ¦ LO QUE VEO DESDE AQUÍ
+Still measuring. No known blind spots right now.  (click for details) ¦ Mesure en cours. Aucun angle mort connu pour l'instant.  (cliquez pour les détails) ¦ Aún midiendo. No hay puntos ciegos conocidos por ahora.  (clic para detalles)
+WHAT CHANGED (LAST HOUR) ¦ CE QUI A CHANGÉ (DERNIÈRE HEURE) ¦ QUÉ CAMBIÓ (ÚLTIMA HORA)
+INTERNET ¦ INTERNET ¦ INTERNET
+Traffic flowing ¦ Le trafic circule ¦ Hay tráfico
+CAPTURE ¦ CAPTURE ¦ CAPTURA
+Demo (not live) ¦ Démo (pas en direct) ¦ Demo (no en directo)
+ACTIVE DEVICES ¦ APPAREILS ACTIFS ¦ DISPOSITIVOS ACTIVOS
+KNOWN DEVICES ¦ APPAREILS CONNUS ¦ DISPOSITIVOS CONOCIDOS
+DOWNLOAD NOW ¦ TÉLÉCHARGEMENT ACTUEL ¦ DESCARGA AHORA
+UPLOAD NOW ¦ ENVOI ACTUEL ¦ SUBIDA AHORA
+PACKETS / SEC ¦ PAQUETS / S ¦ PAQUETES / S
+DNS HEALTH ¦ SANTÉ DNS ¦ SALUD DNS
+ALERTS ¦ ALERTES ¦ ALERTAS
+MOST ACTIVE DEVICE ¦ APPAREIL LE PLUS ACTIF ¦ DISPOSITIVO MÁS ACTIVO
+This computer ¦ Cet ordinateur ¦ Este equipo
+MOST CONTACTED WEBSITE ¦ SITE LE PLUS CONTACTÉ ¦ SITIO MÁS CONTACTADO
+CAPTURE DURATION ¦ DURÉE DE CAPTURE ¦ DURACIÓN DE LA CAPTURA
+Feed speed ¦ Vitesse du fil ¦ Velocidad del flujo
+Pause feed ¦ Mettre le fil en pause ¦ Pausar el flujo
+Resume feed ¦ Reprendre le fil ¦ Reanudar el flujo
+“Calm” groups busy moments so they're easy to read — “Full speed” shows every line as it happens. ¦ « Calme » regroupe les moments chargés pour une lecture facile — « Pleine vitesse » affiche chaque ligne en temps réel. ¦ «Tranquilo» agrupa los momentos de mucho movimiento para leerlos con facilidad — «Velocidad máxima» muestra cada línea al instante.
+Calm ¦ Calme ¦ Tranquilo
+Full speed ¦ Pleine vitesse ¦ Velocidad máxima
+Who ¦ Qui ¦ Quién
+What they did ¦ Ce qu'ils ont fait ¦ Qué hicieron
+When ¦ Quand ¦ Cuándo
+Timeline — devices joining and leaving, address and name changes, first visits to websites, DNS changes, capture events and alerts, in order. Double-click a row to jump to it. ¦ Chronologie — arrivées et départs d'appareils, changements d'adresse et de nom, premières visites de sites, changements DNS, événements de capture et alertes, dans l'ordre. Double-cliquez sur une ligne pour y aller. ¦ Cronología — entradas y salidas de dispositivos, cambios de dirección y nombre, primeras visitas a sitios, cambios de DNS, eventos de captura y alertas, en orden. Haga doble clic en una fila para ir a ella.
+Type ¦ Type ¦ Tipo
+Severity ¦ Gravité ¦ Gravedad
+Device ¦ Appareil ¦ Dispositivo
+Show ¦ Afficher ¦ Mostrar
+Pause live updates ¦ Suspendre les mises à jour ¦ Pausar actualizaciones
+Source ¦ Source ¦ Fuente
+Group into episodes ¦ Regrouper en épisodes ¦ Agrupar en episodios
+Compare sessions ¦ Comparer des sessions ¦ Comparar sesiones
+What changed since ¦ Ce qui a changé depuis ¦ Qué cambió desde
+Time ¦ Heure ¦ Hora
+What happened ¦ Ce qui s'est passé ¦ Qué pasó
+The devices on your local network. Confidence shows how much local evidence supports each one — an IP address alone is never enough to count as a device. ¦ Les appareils de votre réseau local. La confiance indique combien de preuves locales soutiennent chacun — une adresse IP seule ne suffit jamais à compter comme appareil. ¦ Los dispositivos de su red local. La confianza indica cuántas pruebas locales respaldan cada uno — una dirección IP sola nunca basta para contar como dispositivo.
+Double-click a device for details, or right-click for actions (rename, mark as yours, merge…). ¦ Double-cliquez sur un appareil pour les détails, ou clic droit pour les actions (renommer, marquer comme vôtre, fusionner…). ¦ Haga doble clic en un dispositivo para ver detalles, o clic derecho para acciones (renombrar, marcar como suyo, fusionar…).
+Show offline ¦ Afficher hors ligne ¦ Mostrar desconectados
+Show expired ¦ Afficher expirés ¦ Mostrar caducados
+Filter ¦ Filtre ¦ Filtro
+Merge devices ¦ Fusionner des appareils ¦ Fusionar dispositivos
+Details ¦ Détails ¦ Detalles
+What it likely is ¦ Ce que c'est probablement ¦ Qué es probablemente
+Local IP ¦ IP locale ¦ IP local
+MAC address ¦ Adresse MAC ¦ Dirección MAC
+Made by ¦ Fabricant ¦ Fabricante
+Confidence ¦ Confiance ¦ Confianza
+Evidence ¦ Preuve ¦ Prueba
+Status ¦ État ¦ Estado
+Traffic ↑/↓ ¦ Trafic ↑/↓ ¦ Tráfico ↑/↓
+Last seen ¦ Vu pour la dernière fois ¦ Visto por última vez
+Websites and online services your devices looked up or connected to. ¦ Sites web et services en ligne que vos appareils ont recherchés ou contactés. ¦ Sitios web y servicios en línea que sus dispositivos buscaron o a los que se conectaron.
+Seen via ¦ Vu via ¦ Visto mediante
+Category ¦ Catégorie ¦ Categoría
+Sort ¦ Trier ¦ Ordenar
+Lookups / visits ¦ Recherches / visites ¦ Búsquedas / visitas
+How we know ¦ Comment on le sait ¦ Cómo lo sabemos
+Traffic ¦ Trafic ¦ Tráfico
+Contacted by ¦ Contacté par ¦ Contactado por
+First seen ¦ Vu pour la première fois ¦ Visto por primera vez
+Where ¦ Où ¦ Dónde
+Server IPs ¦ IP des serveurs ¦ IP de servidores
+Connections — each row is one conversation between a device and something else. Upload is what the device sent; download is what it received. ¦ Connexions — chaque ligne est une conversation entre un appareil et autre chose. L'envoi est ce que l'appareil a émis ; le téléchargement ce qu'il a reçu. ¦ Conexiones — cada fila es una conversación entre un dispositivo y otra cosa. La subida es lo que envió el dispositivo; la descarga, lo que recibió.
+Double-click for a plain-English report. “Domain (how known)” says whether the name was seen in the connection itself or inferred from an earlier lookup. ¦ Double-cliquez pour un rapport en clair. « Domaine (comment connu) » indique si le nom a été vu dans la connexion elle-même ou déduit d'une recherche antérieure. ¦ Haga doble clic para un informe en lenguaje sencillo. «Dominio (cómo se sabe)» indica si el nombre se vio en la propia conexión o se dedujo de una búsqueda anterior.
+Technical columns ¦ Colonnes techniques ¦ Columnas técnicas
+Connected to ¦ Connecté à ¦ Conectado a
+Purpose ¦ Rôle ¦ Finalidad
+Upload ¦ Envoi ¦ Subida
+Duration ¦ Durée ¦ Duración
+Local endpoint ¦ Extrémité locale ¦ Extremo local
+Remote endpoint ¦ Extrémité distante ¦ Extremo remoto
+Transport ¦ Transport ¦ Transporte
+Port ¦ Port ¦ Puerto
+TCP state ¦ État TCP ¦ Estado TCP
+Domain (how known) ¦ Domaine (comment connu) ¦ Dominio (cómo se sabe)
+Provider / country ¦ Fournisseur / pays ¦ Proveedor / país
+Program (this computer) ¦ Programme (cet ordinateur) ¦ Programa (este equipo)
+REMOTE HOSTS — public Internet addresses your devices talked to. These are never devices on your network — they live somewhere out on the Internet. ¦ HÔTES DISTANTS — adresses Internet publiques avec lesquelles vos appareils ont communiqué. Ce ne sont jamais des appareils de votre réseau — ils sont quelque part sur Internet. ¦ EQUIPOS REMOTOS — direcciones públicas de Internet con las que hablaron sus dispositivos. Nunca son dispositivos de su red — están en algún lugar de Internet.
+Online country lookup ¦ Recherche de pays en ligne ¦ Búsqueda de país en línea
+Test ¦ Tester ¦ Probar
+Retry failed ¦ Réessayer les échecs ¦ Reintentar fallidos
+Online country lookup is off. Turn on the offline database in Settings → Privacy for private, local lookups. ¦ La recherche de pays en ligne est désactivée. Activez la base hors ligne dans Paramètres → Confidentialité pour des recherches locales et privées. ¦ La búsqueda de país en línea está desactivada. Active la base de datos sin conexión en Ajustes → Privacidad para búsquedas locales y privadas.
+Remote IP ¦ IP distante ¦ IP remota
+Country ¦ Pays ¦ País
+Provider (ASN) ¦ Fournisseur (ASN) ¦ Proveedor (ASN)
+Known name(s) ¦ Nom(s) connu(s) ¦ Nombre(s) conocido(s)
+Ports ¦ Ports ¦ Puertos
+Protocol(s) ¦ Protocole(s) ¦ Protocolo(s)
+Alerts — every alert separates what was observed from what it might mean. These are ANOMALIES (unusual behaviour), never a verdict that something is hacked. ¦ Alertes — chaque alerte sépare ce qui a été observé de ce que cela pourrait signifier. Ce sont des ANOMALIES (comportement inhabituel), jamais un verdict de piratage. ¦ Alertas — cada alerta separa lo observado de lo que podría significar. Son ANOMALÍAS (comportamiento inusual), nunca un veredicto de que algo esté pirateado.
+INFO — normal activity ¦ INFO — activité normale ¦ INFO — actividad normal
+WARNING — worth a look ¦ AVERTISSEMENT — à vérifier ¦ AVISO — merece un vistazo
+DANGER — strong evidence of a real problem ¦ DANGER — indices sérieux d'un vrai problème ¦ PELIGRO — indicios sólidos de un problema real
+Show acknowledged ¦ Afficher les alertes vues ¦ Mostrar las reconocidas
+Investigate ¦ Enquêter ¦ Investigar
+Copy report ¦ Copier le rapport ¦ Copiar informe
+Go to related ¦ Aller à l'élément lié ¦ Ir a lo relacionado
+Mute for this device ¦ Masquer pour cet appareil ¦ Silenciar para este dispositivo
+Mute this type ¦ Masquer ce type ¦ Silenciar este tipo
+Mark expected ¦ Marquer comme attendu ¦ Marcar como esperado
+Acknowledge ¦ Marquer comme vu ¦ Reconocer
+Related to ¦ Concerne ¦ Relacionado con
+Times ¦ Fois ¦ Veces
+Network map ¦ Carte du réseau ¦ Mapa de la red
+Click a node to select it, double-click for details, drag the background to move, scroll or use +/− to zoom. ¦ Cliquez sur un nœud pour le sélectionner, double-cliquez pour les détails, faites glisser le fond pour déplacer, molette ou +/− pour zoomer. ¦ Haga clic en un nodo para seleccionarlo, doble clic para detalles, arrastre el fondo para moverlo, rueda o +/− para hacer zoom.
+Topology (your LAN) ¦ Topologie (votre réseau local) ¦ Topología (su red local)
+Connections (device → website → remote host) ¦ Connexions (appareil → site → hôte distant) ¦ Conexiones (dispositivo → sitio → equipo remoto)
+Include offline devices ¦ Inclure les appareils hors ligne ¦ Incluir dispositivos desconectados
+Reset view ¦ Réinitialiser la vue ¦ Restablecer vista
+Internet hosts ¦ Hôtes Internet ¦ Equipos de Internet
+Switch (LLDP/CDP) ¦ Commutateur (LLDP/CDP) ¦ Conmutador (LLDP/CDP)
+Open alerts ¦ Alertes ouvertes ¦ Alertas abiertas
+New this hour ¦ Nouveaux cette heure ¦ Nuevos en esta hora
+Forget dragged positions ¦ Oublier les positions déplacées ¦ Olvidar posiciones movidas
+List view ¦ Vue en liste ¦ Vista de lista
+Map view ¦ Vue en carte ¦ Vista de mapa
+Kind ¦ Genre ¦ Clase
+Address ¦ Adresse ¦ Dirección
+Connected via ¦ Connecté via ¦ Conectado mediante
+Network health ¦ Santé du réseau ¦ Salud de la red
+Run checks now ¦ Lancer les vérifications ¦ Comprobar ahora
+Why is it slow? ¦ Pourquoi c'est lent ? ¦ ¿Por qué va lento?
+Showing what can be worked out from the demo data — active checks don't run on data that isn't live. ¦ Ce qui peut être déduit des données de démo — les vérifications actives ne s'exécutent pas sur des données qui ne sont pas en direct. ¦ Lo que se puede deducir de los datos de demostración — las comprobaciones activas no se ejecutan con datos que no son en directo.
+Needs attention ¦ À surveiller ¦ Requiere atención
+Degraded ¦ Dégradé ¦ Degradado
+Unknown ¦ Inconnu ¦ Desconocido
+Info ¦ Info ¦ Info
+Overall ¦ Global ¦ General
+Wi-Fi signal (this computer) ¦ Signal Wi-Fi (cet ordinateur) ¦ Señal Wi-Fi (este equipo)
+Router reachable ¦ Routeur joignable ¦ Router accesible
+Internet reachable ¦ Internet joignable ¦ Internet accesible
+Website lookups (DNS) ¦ Recherches de sites (DNS) ¦ Búsquedas de sitios (DNS)
+Packet loss (from checks) ¦ Perte de paquets (vérifications) ¦ Pérdida de paquetes (comprobaciones)
+Needs a few active checks first. ¦ Il faut d'abord quelques vérifications actives. ¦ Primero hacen falta algunas comprobaciones activas.
+Internet round trip ¦ Aller-retour Internet ¦ Ida y vuelta a Internet
+Needs a few new connections first. ¦ Il faut d'abord quelques nouvelles connexions. ¦ Primero hacen falta algunas conexiones nuevas.
+Connection resets ¦ Connexions réinitialisées ¦ Conexiones restablecidas
+Not enough connections yet. ¦ Pas encore assez de connexions. ¦ Aún no hay suficientes conexiones.
+Re-sent data (retransmissions) ¦ Données renvoyées (retransmissions) ¦ Datos reenviados (retransmisiones)
+Not enough traffic yet. ¦ Pas encore assez de trafic. ¦ Aún no hay suficiente tráfico.
+Address assignment (DHCP) ¦ Attribution d'adresses (DHCP) ¦ Asignación de direcciones (DHCP)
+Duplicate addresses ¦ Adresses en double ¦ Direcciones duplicadas
+No conflicts seen. ¦ Aucun conflit constaté. ¦ No se han visto conflictos.
+Devices reconnecting ¦ Appareils qui se reconnectent ¦ Dispositivos que se reconectan
+No devices are cycling on and off. ¦ Aucun appareil ne se connecte et déconnecte en boucle. ¦ Ningún dispositivo se conecta y desconecta sin parar.
+Not capturing live. ¦ Pas de capture en direct. ¦ Sin captura en directo.
+Wired switch port ¦ Port du commutateur filaire ¦ Puerto del conmutador con cable
+No switch has announced itself on this link (normal on Wi-Fi and with most home routers). ¦ Aucun commutateur ne s'est annoncé sur ce lien (normal en Wi-Fi et avec la plupart des box). ¦ Ningún conmutador se ha anunciado en este enlace (normal en Wi-Fi y con la mayoría de routers domésticos).
+Capture driver ¦ Pilote de capture ¦ Controlador de captura
+Built-in packet capture. ¦ Capture de paquets intégrée. ¦ Captura de paquetes integrada.
+No VPN detected. ¦ Aucun VPN détecté. ¦ No se ha detectado VPN.
+Your connection ¦ Votre connexion ¦ Su conexión
+DNS servers seen ¦ Serveurs DNS vus ¦ Servidores DNS vistos
+Server ¦ Serveur ¦ Servidor
+Queries ¦ Requêtes ¦ Consultas
+Typical ms ¦ ms habituelles ¦ ms típicos
+Failed ¦ Échecs ¦ Fallidas
+Not found ¦ Introuvables ¦ No encontradas
+Lookup times (all servers) ¦ Temps de recherche (tous les serveurs) ¦ Tiempos de búsqueda (todos los servidores)
+Security check ¦ Contrôle de sécurité ¦ Revisión de seguridad
+Friendly explanations of what I've noticed. Unusual is not the same as dangerous. ¦ Explications simples de ce que j'ai remarqué. Inhabituel ne veut pas dire dangereux. ¦ Explicaciones sencillas de lo que he notado. Inusual no es lo mismo que peligroso.
+Check my router's port forwarding (UPnP) ¦ Vérifier les redirections de ports de ma box (UPnP) ¦ Comprobar la redirección de puertos de mi router (UPnP)
+What MiniWireshark sent ¦ Ce que MiniWireshark a envoyé ¦ Lo que envió MiniWireshark
+Sources — where MiniWireshark's information comes from. What this computer sees itself is “Observed”; what a connected helper tells it is “Reported”, shown beside it and never added to it. ¦ Sources — d'où viennent les informations de MiniWireshark. Ce que cet ordinateur voit lui-même est « Observé » ; ce qu'un assistant connecté lui dit est « Rapporté », affiché à côté et jamais additionné. ¦ Fuentes — de dónde viene la información de MiniWireshark. Lo que ve este equipo es «Observado»; lo que le dice un ayudante conectado es «Informado», mostrado al lado y nunca sumado.
+Optional: connect your Pi-hole or AdGuard Home to see the lookups of devices this computer can't hear. Read-only — nothing is ever changed on them. ¦ Facultatif : connectez votre Pi-hole ou AdGuard Home pour voir les recherches des appareils que cet ordinateur n'entend pas. Lecture seule — rien n'y est jamais modifié. ¦ Opcional: conecte su Pi-hole o AdGuard Home para ver las búsquedas de los dispositivos que este equipo no oye. Solo lectura — nunca se cambia nada en ellos.
+Add Pi-hole ¦ Ajouter Pi-hole ¦ Añadir Pi-hole
+Add AdGuard Home ¦ Ajouter AdGuard Home ¦ Añadir AdGuard Home
+Edit ¦ Modifier ¦ Editar
+Ask now ¦ Interroger maintenant ¦ Consultar ahora
+Pause / resume ¦ Pause / reprise ¦ Pausar / reanudar
+Remove ¦ Supprimer ¦ Quitar
+Gives ¦ Fournit ¦ Aporta
+Last update ¦ Dernière mise à jour ¦ Última actualización
+Reported vs observed ¦ Rapporté ou observé ¦ Informado frente a observado
+Show only ¦ Afficher seulement ¦ Mostrar solo
+All ¦ Tous ¦ Todos
+Website ¦ Site web ¦ Sitio web
+Direction ¦ Sens ¦ Sentido
+Bookmarked only ¦ Favoris seulement ¦ Solo marcados
+Expression ¦ Expression ¦ Expresión
+Apply ¦ Appliquer ¦ Aplicar
+Clear filter ¦ Effacer le filtre ¦ Quitar filtro
+Save as preset ¦ Enregistrer comme préréglage ¦ Guardar como ajuste
+Delete preset ¦ Supprimer le préréglage ¦ Borrar ajuste
+Pause display ¦ Suspendre l'affichage ¦ Pausar la vista
+Resume display ¦ Reprendre l'affichage ¦ Reanudar la vista
+Follow newest packet ¦ Suivre le paquet le plus récent ¦ Seguir el paquete más reciente
+Display filter: showing everything ¦ Filtre d'affichage : tout est affiché ¦ Filtro de vista: se muestra todo
+No. ¦ N° ¦ N.º
+Destination ¦ Destination ¦ Destino
+Protocol ¦ Protocole ¦ Protocolo
+Length ¦ Longueur ¦ Longitud
+Conn. ¦ Conn. ¦ Con.
+Packet details ¦ Détails du paquet ¦ Detalles del paquete
+Text dump ¦ Vidage texte ¦ Volcado de texto
+Hex dump ¦ Vidage hexadécimal ¦ Volcado hexadecimal
+Value ¦ Valeur ¦ Valor
+Field ¦ Champ ¦ Campo
+Stop Demo Mode ¦ Arrêter le mode démo ¦ Detener el modo demo
+Run self-test ¦ Lancer l'autotest ¦ Ejecutar autoprueba
+Open data folder ¦ Ouvrir le dossier des données ¦ Abrir la carpeta de datos
+Open logs ¦ Ouvrir les journaux ¦ Abrir registros
+Inspector ¦ Inspecteur ¦ Inspector
+observed  ◈ reported  ◎ correlated  ◌ inferred  ? unknown ¦ observé  ◈ rapporté  ◎ corrélé  ◌ déduit  ? inconnu ¦ observado  ◈ informado  ◎ correlacionado  ◌ deducido  ? desconocido
+Ready. Click “Start watching” when you'd like to begin. ¦ Prêt. Cliquez sur « Commencer à observer » quand vous voulez. ¦ Listo. Haga clic en «Empezar a observar» cuando quiera.
+General ¦ Général ¦ General
+Appearance ¦ Apparence ¦ Apariencia
+Accessibility ¦ Accessibilité ¦ Accesibilidad
+Capture ¦ Capture ¦ Captura
+Devices & Identity ¦ Appareils et identité ¦ Dispositivos e identidad
+Websites & DNS ¦ Sites web et DNS ¦ Sitios web y DNS
+Network Health ¦ Santé du réseau ¦ Salud de la red
+Privacy & Lookups ¦ Confidentialité et recherches ¦ Privacidad y búsquedas
+History ¦ Historique ¦ Historial
+Performance ¦ Performances ¦ Rendimiento
+Keyboard Shortcuts ¦ Raccourcis clavier ¦ Atajos de teclado
+Data & Export ¦ Données et export ¦ Datos y exportación
+Updates & Dependencies ¦ Mises à jour ¦ Actualizaciones
+Reset all settings ¦ Tout réinitialiser ¦ Restablecer todo
+How MiniWireshark starts up and how much it explains. ¦ Comment MiniWireshark démarre et le niveau d'explication. ¦ Cómo se inicia MiniWireshark y cuánto explica.
+All changes saved ¦ Modifications enregistrées ¦ Cambios guardados
+OK ¦ OK ¦ Aceptar
+Reset this page ¦ Page par défaut ¦ Restaurar página
+Something not working? ¦ Quelque chose ne fonctionne pas ? ¦ ¿Algo no funciona?
+Repair MiniWireshark ¦ Réparer MiniWireshark ¦ Reparar MiniWireshark
+One click checks and fixes the usual problems: missing components, damaged reference lists or history, a broken settings file and a stuck capture engine — then tells you what it fixed. ¦ Un clic vérifie et corrige les problèmes habituels : composants manquants, listes de référence ou historique endommagés, fichier de paramètres cassé, moteur de capture bloqué — puis vous dit ce qui a été réparé. ¦ Un clic comprueba y corrige los problemas habituales: componentes que faltan, listas de referencia o historial dañados, un archivo de ajustes roto y un motor de captura bloqueado — y luego le dice qué arregló.
+Startup ¦ Démarrage ¦ Inicio
+Start Monitoring, Demo Mode, the Quick Start Guide and Diagnostics in one place each time MiniWireshark opens. Turn off to go straight to the main window. ¦ Surveillance, mode démo, guide de démarrage et diagnostic réunis à chaque ouverture de MiniWireshark. Désactivez pour aller directement à la fenêtre principale. ¦ Vigilancia, modo demo, guía de inicio y diagnóstico en un solo lugar cada vez que se abre MiniWireshark. Desactívelo para ir directamente a la ventana principal.
+Start watching automatically when MiniWireshark opens ¦ Commencer à observer automatiquement à l'ouverture ¦ Empezar a observar automáticamente al abrir MiniWireshark
+Picks the best network card for you and begins right away. Turn off to choose a card and press Start yourself. ¦ Choisit la meilleure carte réseau et commence aussitôt. Désactivez pour choisir une carte et démarrer vous-même. ¦ Elige la mejor tarjeta de red y empieza enseguida. Desactívelo para elegir la tarjeta y pulsar Empezar usted mismo.
+Ask before clearing data ¦ Demander avant d'effacer les données ¦ Preguntar antes de borrar los datos
+Shows a confirmation before Clear wipes the devices, websites and alerts collected so far. ¦ Demande confirmation avant qu'Effacer supprime les appareils, sites et alertes collectés. ¦ Pide confirmación antes de que Borrar elimine los dispositivos, sitios y alertas recogidos.
+Explanations ¦ Explications ¦ Explicaciones
+Include plain-English guidance ¦ Inclure des conseils en langage simple ¦ Incluir consejos en lenguaje sencillo
+Adds “what should I check?” advice to device cards, alerts and the Security check. Turn off for just the facts. ¦ Ajoute des conseils « que dois-je vérifier ? » aux fiches d'appareils, alertes et au contrôle de sécurité. Désactivez pour n'avoir que les faits. ¦ Añade consejos de «¿qué debo comprobar?» a las fichas de dispositivos, alertas y la revisión de seguridad. Desactívelo para ver solo los hechos.
+Detail level ¦ Niveau de détail ¦ Nivel de detalle
+Short: the essentials. Normal: what was seen and what it means. Detailed: also shows how confidence was scored, protocols, websites and step-by-step checks. ¦ Court : l'essentiel. Normal : ce qui a été vu et ce que cela signifie. Détaillé : montre aussi le calcul de la confiance, les protocoles, les sites et les vérifications pas à pas. ¦ Breve: lo esencial. Normal: lo que se vio y qué significa. Detallado: también cómo se calculó la confianza, protocolos, sitios y comprobaciones paso a paso.
+Short ¦ Court ¦ Breve
+Normal ¦ Normal ¦ Normal
+Detailed ¦ Détaillé ¦ Detallado
+Language ¦ Langue ¦ Idioma
+The language of every window, menu and message. English, French and Spanish are included. ¦ La langue de chaque fenêtre, menu et message. Anglais, français et espagnol sont inclus. ¦ El idioma de cada ventana, menú y mensaje. Se incluyen inglés, francés y español.
+Make it comfortable to look at. ¦ Rendez l'affichage confortable. ¦ Haga que sea cómodo de ver.
+Look ¦ Aspect ¦ Aspecto
+Theme ¦ Thème ¦ Tema
+Light ¦ Clair ¦ Claro
+Dark ¦ Sombre ¦ Oscuro
+System ¦ Système ¦ Sistema
+Applies to every window, table, chart and dialog. ¦ S'applique à chaque fenêtre, tableau, graphique et boîte de dialogue. ¦ Se aplica a cada ventana, tabla, gráfico y cuadro de diálogo.
+Layout ¦ Disposition ¦ Diseño
+Beginner view ¦ Vue débutant ¦ Vista para principiantes
+Hides the technical Connections, Remote hosts and Packets tabs and the advanced filter fields. Nothing is removed — switch this off any time to see everything. ¦ Masque les onglets techniques Connexions, Hôtes distants et Paquets ainsi que les filtres avancés. Rien n'est supprimé — désactivez à tout moment pour tout voir. ¦ Oculta las pestañas técnicas Conexiones, Equipos remotos y Paquetes y los filtros avanzados. No se elimina nada — desactívelo cuando quiera para verlo todo.
+Colours, contrast and size that work for your eyes. Every status also has an icon and a word, so colour is never the only signal. ¦ Des couleurs, un contraste et une taille adaptés à vos yeux. Chaque état a aussi une icône et un mot : la couleur n'est jamais le seul signal. ¦ Colores, contraste y tamaño que se adaptan a su vista. Cada estado tiene también un icono y una palabra, así que el color nunca es la única señal.
+Colour vision ¦ Vision des couleurs ¦ Visión del color
+Colour-blind mode ¦ Mode daltonien ¦ Modo daltónico
+Recolours good / warning / danger, charts, the map and the setup window so they stay easy to tell apart. Red-green (deuteranopia) is the most common kind, then protanopia; blue-yellow (tritanopia) is rare. ¦ Recolore bon / avertissement / danger, les graphiques, la carte et la fenêtre d'installation pour qu'ils restent faciles à distinguer. Le rouge-vert (deutéranopie) est le plus courant, puis la protanopie ; le bleu-jaune (tritanopie) est rare. ¦ Cambia los colores de bien / aviso / peligro, gráficos, mapa y ventana de instalación para que sigan siendo fáciles de distinguir. El rojo-verde (deuteranopía) es el más común, luego la protanopía; el azul-amarillo (tritanopía) es raro.
+Off ¦ Désactivé ¦ Desactivado
+Contrast and size ¦ Contraste et taille ¦ Contraste y tamaño
+High contrast ¦ Contraste élevé ¦ Alto contraste
+Stronger text and borders for easier reading. Works with both the Light and Dark themes and with every colour-blind mode. ¦ Texte et bordures renforcés pour une lecture plus facile. Fonctionne avec les thèmes clair et sombre et chaque mode daltonien. ¦ Texto y bordes más marcados para leer mejor. Funciona con los temas claro y oscuro y con cada modo daltónico.
+Text size ¦ Taille du texte ¦ Tamaño del texto
+Scales text and table rows throughout the app. ¦ Agrandit le texte et les lignes des tableaux dans toute l'application. ¦ Ajusta el texto y las filas de tabla en toda la aplicación.
+What MiniWireshark listens to. ¦ Ce que MiniWireshark écoute. ¦ Lo que escucha MiniWireshark.
+Scanning ¦ Analyse ¦ Exploración
+Actively look for devices (Active Scanning) ¦ Chercher activement les appareils (analyse active) ¦ Buscar dispositivos activamente (exploración activa)
+Sends a few harmless ARP / mDNS / SSDP probes on your own network about every 40 seconds to find quiet devices. Off is Quiet Mode: listen only, send nothing (health checks pause too). The banner at the top always shows which mode is on. ¦ Envoie quelques sondes ARP / mDNS / SSDP inoffensives sur votre propre réseau environ toutes les 40 secondes pour trouver les appareils discrets. Désactivé = mode discret : écoute seule, rien n'est envoyé (les vérifications de santé aussi s'arrêtent). Le bandeau en haut indique toujours le mode actif. ¦ Envía unas pocas sondas ARP / mDNS / SSDP inofensivas en su propia red cada 40 segundos aproximadamente para encontrar dispositivos silenciosos. Desactivado es el modo silencioso: solo escucha, no envía nada (las comprobaciones de salud también se pausan). La franja superior siempre muestra el modo activo.
+Choose the network card automatically ¦ Choisir la carte réseau automatiquement ¦ Elegir la tarjeta de red automáticamente
+Scores every adapter (default route, real address, not virtual/VPN/loopback) and explains its choice. Turn off to always use the card you pick. ¦ Note chaque carte (route par défaut, adresse réelle, ni virtuelle ni VPN ni boucle locale) et explique son choix. Désactivez pour toujours utiliser la carte choisie. ¦ Puntúa cada adaptador (ruta predeterminada, dirección real, no virtual/VPN/bucle local) y explica su elección. Desactívelo para usar siempre la tarjeta que elija.
+Listen to all traffic the card can see ¦ Écouter tout le trafic visible par la carte ¦ Escuchar todo el tráfico que ve la tarjeta
+“Promiscuous mode.” On most Wi-Fi networks you'll still mainly see this computer's traffic plus broadcasts — that's how Wi-Fi works. ¦ « Mode promiscuité. » Sur la plupart des réseaux Wi-Fi, vous verrez surtout le trafic de cet ordinateur plus les diffusions — c'est le fonctionnement du Wi-Fi. ¦ «Modo promiscuo.» En la mayoría de redes Wi-Fi seguirá viendo sobre todo el tráfico de este equipo más las difusiones — así funciona el Wi-Fi.
+Memory ¦ Mémoire ¦ Memoria
+Packets kept in memory ¦ Paquets gardés en mémoire ¦ Paquetes guardados en memoria
+Older packets are dropped beyond this. Higher means a longer history for the Packets tab and .pcap export, at the cost of memory. ¦ Au-delà, les plus anciens paquets sont abandonnés. Plus haut = historique plus long pour l'onglet Paquets et l'export .pcap, au prix de mémoire. ¦ Más allá de esto se descartan los paquetes más antiguos. Más alto significa más historial para la pestaña Paquetes y la exportación .pcap, a costa de memoria.
+packets ¦ paquets ¦ paquetes
+Packets tab follows the newest packet ¦ L'onglet Paquets suit le paquet le plus récent ¦ La pestaña Paquetes sigue el paquete más reciente
+Keeps the newest packet in view. You can also toggle this on the Packets tab. ¦ Garde le paquet le plus récent visible. Également modifiable depuis l'onglet Paquets. ¦ Mantiene a la vista el paquete más reciente. También puede cambiarlo en la pestaña Paquetes.
+When a device counts as gone, and how identities are combined. ¦ Quand un appareil est considéré parti, et comment les identités sont combinées. ¦ Cuándo se considera que un dispositivo se ha ido y cómo se combinan las identidades.
+Device lifetime ¦ Durée de vie des appareils ¦ Vida de los dispositivos
+Idle after ¦ Inactif après ¦ Inactivo tras
+No traffic for this long and a device shows as “Idle”. It's still counted as online. ¦ Sans trafic pendant cette durée, un appareil apparaît « Inactif ». Il reste compté comme en ligne. ¦ Sin tráfico durante este tiempo, el dispositivo aparece como «Inactivo». Sigue contando como conectado.
+minutes ¦ minutes ¦ minutos
+Offline after ¦ Hors ligne après ¦ Desconectado tras
+Silent this long and it's treated as offline (its presence history records when it left). ¦ Silencieux pendant cette durée, il est considéré hors ligne (son historique de présence note quand il est parti). ¦ Si está en silencio este tiempo, se considera desconectado (su historial de presencia registra cuándo se fue).
+Expire after ¦ Expire après ¦ Caduca tras
+Gone this long and it moves into history. An old ARP entry is never treated as proof a device is still there. ¦ Absent pendant cette durée, il passe dans l'historique. Une vieille entrée ARP n'est jamais une preuve qu'un appareil est encore là. ¦ Ausente este tiempo, pasa al historial. Una entrada ARP antigua nunca se toma como prueba de que el dispositivo sigue ahí.
+What the Devices tab shows ¦ Ce qu'affiche l'onglet Appareils ¦ Qué muestra la pestaña Dispositivos
+Show offline devices ¦ Afficher les appareils hors ligne ¦ Mostrar dispositivos desconectados
+Include devices that have gone quiet. ¦ Inclure les appareils devenus silencieux. ¦ Incluir los dispositivos que se han quedado en silencio.
+Show expired devices ¦ Afficher les appareils expirés ¦ Mostrar dispositivos caducados
+Include devices not seen for a long time. ¦ Inclure les appareils non vus depuis longtemps. ¦ Incluir dispositivos que no se ven desde hace mucho.
+Identity ¦ Identité ¦ Identidad
+Combine identities automatically (only when certain) ¦ Combiner les identités automatiquement (seulement en cas de certitude) ¦ Combinar identidades automáticamente (solo si es seguro)
+Phones and laptops rotate their Wi-Fi address for privacy. Two entries are combined only when they announce the same distinctive name, at least one uses a private address, and they were never online at the same time. Never based on traffic similarity. ¦ Les téléphones et portables changent d'adresse Wi-Fi pour la confidentialité. Deux entrées ne sont combinées que si elles annoncent le même nom distinctif, qu'au moins une utilise une adresse privée et qu'elles n'ont jamais été en ligne en même temps. Jamais sur la base d'un trafic similaire. ¦ Los teléfonos y portátiles cambian su dirección Wi-Fi por privacidad. Dos entradas solo se combinan si anuncian el mismo nombre distintivo, al menos una usa una dirección privada y nunca estuvieron conectadas a la vez. Nunca por similitud de tráfico.
+Suggest “Possibly the same device” ¦ Suggérer « Peut-être le même appareil » ¦ Sugerir «Posiblemente el mismo dispositivo»
+When MiniWireshark isn't sure, it doesn't merge — it adds a suggestion to the Timeline and the device card so you can decide. ¦ Quand MiniWireshark n'est pas sûr, il ne fusionne pas — il ajoute une suggestion dans la chronologie et la fiche de l'appareil pour que vous décidiez. ¦ Cuando MiniWireshark no está seguro, no fusiona — añade una sugerencia a la cronología y a la ficha del dispositivo para que usted decida.
+How websites and name lookups are shown. ¦ Comment les sites et recherches de noms sont affichés. ¦ Cómo se muestran los sitios web y las búsquedas de nombres.
+Group sub-sites under their main domain ¦ Regrouper les sous-sites sous leur domaine principal ¦ Agrupar subsitios bajo su dominio principal
+Label advertising / analytics / tracking domains ¦ Étiqueter les domaines de publicité / mesure / pistage ¦ Etiquetar dominios de publicidad / analítica / rastreo
+Downloads a public tracker list (Disconnect) to this computer and labels domains locally. Informational only: nothing is blocked, and being on the list doesn't mean a domain is malicious. ¦ Télécharge une liste publique de traqueurs (Disconnect) sur cet ordinateur et étiquette les domaines localement. Pour information seulement : rien n'est bloqué, et figurer sur la liste ne veut pas dire qu'un domaine est malveillant. ¦ Descarga una lista pública de rastreadores (Disconnect) en este equipo y etiqueta los dominios localmente. Solo informativo: no se bloquea nada y estar en la lista no significa que un dominio sea malicioso.
+Detect encrypted DNS (DoH / DoT) ¦ Détecter le DNS chiffré (DoH / DoT) ¦ Detectar DNS cifrado (DoH / DoT)
+Notices when a device hides its website lookups behind encryption, and explains why some names can't be seen. Detection only — never decryption. ¦ Remarque quand un appareil chiffre ses recherches de sites et explique pourquoi certains noms sont invisibles. Détection seulement — jamais de déchiffrement. ¦ Detecta cuándo un dispositivo oculta sus búsquedas tras cifrado y explica por qué algunos nombres no se ven. Solo detección — nunca descifrado.
+Call DNS slow above ¦ DNS considéré lent au-delà de ¦ Considerar DNS lento por encima de
+The typical lookup time above which DNS is reported as slow on the Health tab and in alerts. ¦ Le temps de recherche habituel au-delà duquel le DNS est signalé lent dans l'onglet Santé et les alertes. ¦ El tiempo de búsqueda típico por encima del cual el DNS se indica como lento en la pestaña Salud y en las alertas.
+ms ¦ ms ¦ ms
+The higher-level view of who talks to whom. ¦ La vue d'ensemble de qui parle à qui. ¦ La vista general de quién habla con quién.
+Open connections tracked at once ¦ Connexions ouvertes suivies en même temps ¦ Conexiones abiertas seguidas a la vez
+When more than this are open, the least recently used are closed into the archive. ¦ Au-delà, les moins récemment utilisées sont archivées. ¦ Si hay más abiertas, las usadas hace más tiempo se cierran y se archivan.
+connections ¦ connexions ¦ conexiones
+Finished connections remembered ¦ Connexions terminées mémorisées ¦ Conexiones terminadas recordadas
+How many ended connections stay in the Connections tab and session files. ¦ Combien de connexions terminées restent dans l'onglet Connexions et les fichiers de session. ¦ Cuántas conexiones terminadas permanecen en la pestaña Conexiones y en los archivos de sesión.
+Display ¦ Affichage ¦ Visualización
+Hide tiny one-off connections in Beginner view ¦ Masquer les petites connexions ponctuelles en vue débutant ¦ Ocultar conexiones pequeñas y aisladas en la vista para principiantes
+Checks that your router, DNS and Internet are working. ¦ Vérifie que votre box, le DNS et Internet fonctionnent. ¦ Comprueba que su router, el DNS e Internet funcionan.
+Active checks ¦ Vérifications actives ¦ Comprobaciones activas
+Run small, periodic health checks ¦ Effectuer de petites vérifications de santé régulières ¦ Hacer pequeñas comprobaciones de salud periódicas
+A TCP connection attempt to your router, one to an Internet address, and one DNS lookup — a few hundred bytes each time. Never run in Quiet Mode or while viewing offline/saved/demo data. ¦ Une tentative de connexion TCP vers votre box, une vers une adresse Internet et une recherche DNS — quelques centaines d'octets à chaque fois. Jamais en mode discret ni pendant la consultation de données hors ligne, enregistrées ou de démo. ¦ Un intento de conexión TCP a su router, otro a una dirección de Internet y una búsqueda DNS — unos cientos de bytes cada vez. Nunca en modo silencioso ni al ver datos sin conexión, guardados o de demostración.
+Check every ¦ Vérifier toutes les ¦ Comprobar cada
+How often the checks run. ¦ Fréquence des vérifications. ¦ Con qué frecuencia se hacen las comprobaciones.
+seconds ¦ secondes ¦ segundos
+Internet test address ¦ Adresse de test Internet ¦ Dirección de prueba de Internet
+An always-on public address and port used to test Internet reachability (only a connection attempt is made; no data is sent). ¦ Une adresse publique et un port toujours actifs pour tester l'accès à Internet (seule une tentative de connexion est faite ; aucune donnée n'est envoyée). ¦ Una dirección y puerto públicos siempre activos para probar el acceso a Internet (solo se intenta conectar; no se envían datos).
+Choose what gets flagged and how sensitive it is. Alerts describe unusual behaviour — never a verdict that something is hacked. ¦ Choisissez ce qui est signalé et avec quelle sensibilité. Les alertes décrivent un comportement inhabituel — jamais un verdict de piratage. ¦ Elija qué se señala y con qué sensibilidad. Las alertas describen comportamientos inusuales — nunca un veredicto de pirateo.
+New device ¦ Nouvel appareil ¦ Dispositivo nuevo
+INFO ¦ INFO ¦ INFO
+A device you haven't seen before joins. ¦ Un appareil jamais vu rejoint le réseau. ¦ Se une un dispositivo que no había visto antes.
+Unknown / unconfirmed device ¦ Appareil inconnu / non confirmé ¦ Dispositivo desconocido / sin confirmar
+WARNING ¦ AVERTISSEMENT ¦ AVISO
+A device stays hard to identify after a while. ¦ Un appareil reste difficile à identifier au bout d'un moment. ¦ Un dispositivo sigue siendo difícil de identificar al cabo de un rato.
+Unusually chatty device ¦ Appareil anormalement bavard ¦ Dispositivo inusualmente activo
+A device gets much busier than its own normal. ¦ Un appareil devient bien plus actif que d'habitude. ¦ Un dispositivo está mucho más activo de lo normal para él.
+Rapid reconnect/disconnect ¦ Reconnexions/déconnexions rapides ¦ Reconexión/desconexión rápida
+A device keeps dropping off and coming back. ¦ Un appareil se déconnecte et revient sans cesse. ¦ Un dispositivo se desconecta y vuelve una y otra vez.
+New advertised service ¦ Nouveau service annoncé ¦ Nuevo servicio anunciado
+A known device starts advertising a new service. ¦ Un appareil connu commence à annoncer un nouveau service. ¦ Un dispositivo conocido empieza a anunciar un servicio nuevo.
+Remote-access service seen ¦ Service d'accès à distance vu ¦ Servicio de acceso remoto visto
+A device offers remote control (SSH, Remote Desktop, VNC…). ¦ Un appareil propose une prise de contrôle à distance (SSH, Bureau à distance, VNC…). ¦ Un dispositivo ofrece control remoto (SSH, Escritorio remoto, VNC…).
+Network integrity ¦ Intégrité du réseau ¦ Integridad de la red
+Duplicate IP address ¦ Adresse IP en double ¦ Dirección IP duplicada
+Two devices claim the same address. ¦ Deux appareils revendiquent la même adresse. ¦ Dos dispositivos reclaman la misma dirección.
+DHCP anomaly ¦ Anomalie DHCP ¦ Anomalía DHCP
+More than one device hands out addresses. ¦ Plusieurs appareils distribuent des adresses. ¦ Más de un dispositivo reparte direcciones.
+Unexpected IPv6 router announcement ¦ Annonce de routeur IPv6 inattendue ¦ Anuncio inesperado de router IPv6
+A device other than your router announces itself as an IPv6 router. ¦ Un appareil autre que votre box s'annonce comme routeur IPv6. ¦ Un dispositivo distinto de su router se anuncia como router IPv6.
+Gateway identity changed ¦ Identité de la passerelle modifiée ¦ Cambió la identidad de la puerta de enlace
+Your router's hardware address changes. ¦ L'adresse matérielle de votre box change. ¦ Cambia la dirección física de su router.
+Possible ARP spoofing ¦ Usurpation ARP possible ¦ Posible suplantación ARP
+DANGER ¦ DANGER ¦ PELIGRO
+An address keeps flipping between two devices — the signature of ARP spoofing. ¦ Une adresse bascule sans cesse entre deux appareils — la signature d'une usurpation ARP. ¦ Una dirección cambia una y otra vez entre dos dispositivos — la firma de la suplantación ARP.
+Excessive broadcast traffic ¦ Trafic de diffusion excessif ¦ Tráfico de difusión excesivo
+The network is flooded with broadcast traffic. ¦ Le réseau est inondé de trafic de diffusion. ¦ La red está inundada de tráfico de difusión.
+Possible scanning pattern ¦ Balayage possible ¦ Posible patrón de exploración
+A device tries many hosts/ports with few answers. ¦ Un appareil essaie beaucoup d'hôtes/ports avec peu de réponses. ¦ Un dispositivo prueba muchos equipos/puertos con pocas respuestas.
+DNS server changed ¦ Serveur DNS modifié ¦ Cambió el servidor DNS
+A device switches to a different DNS server. ¦ Un appareil passe à un autre serveur DNS. ¦ Un dispositivo cambia a otro servidor DNS.
+Many DNS failures ¦ Nombreux échecs DNS ¦ Muchos fallos de DNS
+Many lookups fail. ¦ Beaucoup de recherches échouent. ¦ Fallan muchas búsquedas.
+Slow DNS ¦ DNS lent ¦ DNS lento
+Lookups are slow. ¦ Les recherches sont lentes. ¦ Las búsquedas son lentas.
+Several DNS servers in use ¦ Plusieurs serveurs DNS utilisés ¦ Varios servidores DNS en uso
+Several different DNS servers are in use. ¦ Plusieurs serveurs DNS différents sont utilisés. ¦ Se usan varios servidores DNS distintos.
+Traffic (compared with each device's own baseline) ¦ Trafic (comparé à l'habitude de chaque appareil) ¦ Tráfico (comparado con lo habitual de cada dispositivo)
+Unusual upload spike ¦ Pic d'envoi inhabituel ¦ Pico de subida inusual
+A device uploads far more than usual. ¦ Un appareil envoie bien plus que d'habitude. ¦ Un dispositivo sube mucho más de lo habitual.
+Unusual download spike ¦ Pic de téléchargement inhabituel ¦ Pico de descarga inusual
+A device downloads far more than usual. ¦ Un appareil télécharge bien plus que d'habitude. ¦ Un dispositivo descarga mucho más de lo habitual.
+Unusually many destinations ¦ Destinations anormalement nombreuses ¦ Destinos inusualmente numerosos
+A device talks to far more places than usual. ¦ Un appareil contacte bien plus de destinations que d'habitude. ¦ Un dispositivo habla con muchos más destinos de lo habitual.
+Unusually many new connections ¦ Nouvelles connexions anormalement nombreuses ¦ Conexiones nuevas inusualmente numerosas
+A device opens far more connections than usual. ¦ Un appareil ouvre bien plus de connexions que d'habitude. ¦ Un dispositivo abre muchas más conexiones de lo habitual.
+Repeated connection resets ¦ Réinitialisations de connexion répétées ¦ Restablecimientos de conexión repetidos
+Many connections are being reset. ¦ Beaucoup de connexions sont réinitialisées. ¦ Se están restableciendo muchas conexiones.
+Unencrypted protocol in use ¦ Protocole non chiffré utilisé ¦ Protocolo sin cifrar en uso
+Unencrypted protocols such as Telnet or FTP are used. ¦ Des protocoles non chiffrés comme Telnet ou FTP sont utilisés. ¦ Se usan protocolos sin cifrar como Telnet o FTP.
+New country contacted ¦ Nouveau pays contacté ¦ Nuevo país contactado
+A device contacts a country it hasn't before (needs country lookup). ¦ Un appareil contacte un pays jamais contacté avant (nécessite la recherche de pays). ¦ Un dispositivo contacta con un país nuevo para él (requiere búsqueda de país).
+Sensitivity ¦ Sensibilité ¦ Sensibilidad
+Busy-device threshold ¦ Seuil d'appareil chargé ¦ Umbral de dispositivo ocupado
+A device is “unusual” when this minute exceeds this multiple of its own recent average. ¦ Un appareil est « inhabituel » quand la minute en cours dépasse ce multiple de sa moyenne récente. ¦ Un dispositivo es «inusual» cuando este minuto supera este múltiplo de su media reciente.
+its usual rate ¦ son rythme habituel ¦ su ritmo habitual
+Ignore quiet devices below ¦ Ignorer les appareils calmes sous ¦ Ignorar dispositivos tranquilos por debajo de
+Devices averaging less than this are never flagged as chatty, so sleepy gadgets don't cause noise. ¦ Les appareils en dessous de cette moyenne ne sont jamais signalés comme bavards, pour que les gadgets endormis ne fassent pas de bruit. ¦ Los dispositivos con una media inferior nunca se señalan como activos, para que los aparatos dormidos no generen ruido.
+packets/min ¦ paquets/min ¦ paquetes/min
+Learn for at least ¦ Apprendre pendant au moins ¦ Aprender durante al menos
+Traffic-spike alerts only start after a device has been observed this long, so its normal is known. ¦ Les alertes de pic ne commencent qu'après cette durée d'observation, pour connaître l'habitude de l'appareil. ¦ Las alertas de picos solo empiezan tras observar el dispositivo este tiempo, para conocer lo normal en él.
+active minutes ¦ minutes actives ¦ minutos activos
+Wait before flagging unknown devices ¦ Attendre avant de signaler les appareils inconnus ¦ Esperar antes de señalar dispositivos desconocidos
+How many packets a device must send while still poorly identified before it's flagged. ¦ Combien de paquets un appareil mal identifié doit envoyer avant d'être signalé. ¦ Cuántos paquetes debe enviar un dispositivo aún mal identificado antes de señalarlo.
+Reconnects that count as cycling ¦ Reconnexions comptées comme boucle ¦ Reconexiones que cuentan como ciclo
+Number of come-backs within the window below. ¦ Nombre de retours dans la fenêtre ci-dessous. ¦ Número de regresos dentro del intervalo de abajo.
+times ¦ fois ¦ veces
+Reconnect window ¦ Fenêtre de reconnexion ¦ Intervalo de reconexión
+Time span used for counting reconnects. ¦ Durée utilisée pour compter les reconnexions. ¦ Intervalo de tiempo para contar las reconexiones.
+ARP flip-flop threshold ¦ Seuil de bascule ARP ¦ Umbral de alternancia ARP
+How many times an address must swap between devices within a minute before it's called possible ARP spoofing. One change is normal. ¦ Combien de fois une adresse doit changer d'appareil en une minute avant d'être signalée comme usurpation ARP possible. Un seul changement est normal. ¦ Cuántas veces debe cambiar una dirección entre dispositivos en un minuto antes de considerarlo posible suplantación ARP. Un solo cambio es normal.
+flips in a minute ¦ bascules par minute ¦ cambios por minuto
+Connection-reset threshold ¦ Seuil de réinitialisations ¦ Umbral de restablecimientos
+Resets per device in 10 minutes before it's flagged. ¦ Réinitialisations par appareil en 10 minutes avant signalement. ¦ Restablecimientos por dispositivo en 10 minutos antes de señalarlo.
+Broadcast flood threshold ¦ Seuil d'inondation de diffusion ¦ Umbral de inundación de difusión
+packets/sec ¦ paquets/s ¦ paquetes/s
+Scanning: ports on one host ¦ Balayage : ports d'un hôte ¦ Exploración: puertos de un equipo
+Unanswered attempts to this many different ports on one host within a minute looks like a port scan. ¦ Des tentatives sans réponse vers autant de ports différents d'un hôte en une minute ressemblent à un balayage de ports. ¦ Intentos sin respuesta a tantos puertos distintos de un equipo en un minuto parecen un escaneo de puertos.
+ports/min ¦ ports/min ¦ puertos/min
+Scanning: hosts on one port ¦ Balayage : hôtes sur un port ¦ Exploración: equipos en un puerto
+Unanswered attempts to this many different hosts on one port within a minute looks like a sweep. ¦ Des tentatives sans réponse vers autant d'hôtes différents sur un port en une minute ressemblent à un balayage. ¦ Intentos sin respuesta a tantos equipos distintos en un puerto en un minuto parecen un barrido.
+hosts/min ¦ hôtes/min ¦ equipos/min
+Also flag unencrypted web (http://) uploads ¦ Signaler aussi les envois web non chiffrés (http://) ¦ Señalar también las subidas web sin cifrar (http://)
+Off by default because plain web is still common on local gadgets. ¦ Désactivé par défaut car le web non chiffré reste courant sur les appareils locaux. ¦ Desactivado por defecto porque la web sin cifrar aún es común en aparatos locales.
+Where alerts appear ¦ Où apparaissent les alertes ¦ Dónde aparecen las alertas
+Also show alerts in the live feed ¦ Afficher aussi les alertes dans le fil en direct ¦ Mostrar también las alertas en el flujo en directo
+Alerts always appear in the Alerts and Timeline tabs. ¦ Les alertes apparaissent toujours dans les onglets Alertes et Chronologie. ¦ Las alertas siempre aparecen en las pestañas Alertas y Cronología.
+In the feed, only show DANGER alerts ¦ Dans le fil, n'afficher que les alertes DANGER ¦ En el flujo, mostrar solo las alertas de PELIGRO
+Keeps the feed calm; warnings stay in the Alerts tab. ¦ Garde le fil calme ; les avertissements restent dans l'onglet Alertes. ¦ Mantiene el flujo tranquilo; los avisos quedan en la pestaña Alertas.
+Un-mute all alerts ¦ Réactiver toutes les alertes ¦ Reactivar todas las alertas
+Every feature that contacts an outside service is listed here, with exactly what it sends. Nothing is uploaded silently and there is no telemetry. ¦ Chaque fonction qui contacte un service extérieur est listée ici, avec exactement ce qu'elle envoie. Rien n'est envoyé en silence et il n'y a aucune télémétrie. ¦ Cada función que contacta con un servicio externo aparece aquí, con exactamente lo que envía. No se sube nada en silencio y no hay telemetría.
+What MiniWireshark itself sends ¦ Ce que MiniWireshark envoie lui-même ¦ Lo que envía el propio MiniWireshark
+Kill switch: stop everything MiniWireshark sends ¦ Arrêt d'urgence : stopper tout envoi de MiniWireshark ¦ Interruptor de corte: detener todo lo que envía MiniWireshark
+Watching keeps working, but nothing leaves this computer from MiniWireshark: no discovery probes, health checks, name lookups, downloads or update checks. Every send is listed in the ledger below. ¦ L'observation continue, mais rien ne quitte cet ordinateur de la part de MiniWireshark : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. Chaque envoi est listé dans le registre ci-dessous. ¦ La observación sigue funcionando, pero nada sale de este equipo por parte de MiniWireshark: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. Cada envío figura en el registro de abajo.
+Open the self-traffic ledger ¦ Ouvrir le registre des envois ¦ Abrir el registro de envíos propios
+Reference data (no personal data sent) ¦ Données de référence (aucune donnée personnelle envoyée) ¦ Datos de referencia (no se envían datos personales)
+Download public reference lists ¦ Télécharger les listes de référence publiques ¦ Descargar listas de referencia públicas
+Fetches the hardware-vendor list (wireshark.org) and the Public Suffix List (publicsuffix.org) about once a month. These are ordinary file downloads: nothing about your network is sent. Built-in lists are used when this is off or offline. ¦ Récupère la liste des fabricants (wireshark.org) et la Public Suffix List (publicsuffix.org) environ une fois par mois. Ce sont de simples téléchargements : rien sur votre réseau n'est envoyé. Les listes intégrées servent quand c'est désactivé ou hors ligne. ¦ Obtiene la lista de fabricantes (wireshark.org) y la Public Suffix List (publicsuffix.org) más o menos una vez al mes. Son descargas normales: no se envía nada sobre su red. Se usan las listas integradas cuando está desactivado o sin conexión.
+Refresh now ¦ Actualiser maintenant ¦ Actualizar ahora
+What is read from packets ¦ Ce qui est lu dans les paquets ¦ Qué se lee de los paquetes
+Read site names from HTTP/3 (QUIC) first packets ¦ Lire les noms de sites dans les premiers paquets HTTP/3 (QUIC) ¦ Leer nombres de sitios de los primeros paquetes HTTP/3 (QUIC)
+A browser's first HTTP/3 packet names the site, protected only by keys anyone can compute from the packet (it is designed to be readable by the network, like the name in a normal HTTPS handshake). Nothing after that first packet can be read. Turn off to treat HTTP/3 as fully opaque. ¦ Le premier paquet HTTP/3 d'un navigateur nomme le site, protégé seulement par des clés que n'importe qui peut calculer à partir du paquet (il est conçu pour être lisible par le réseau, comme le nom dans une connexion HTTPS normale). Rien après ce premier paquet n'est lisible. Désactivez pour traiter HTTP/3 comme entièrement opaque. ¦ El primer paquete HTTP/3 de un navegador nombra el sitio, protegido solo por claves que cualquiera puede calcular a partir del paquete (está diseñado para que la red pueda leerlo, como el nombre en un saludo HTTPS normal). Nada después de ese primer paquete se puede leer. Desactívelo para tratar HTTP/3 como totalmente opaco.
+Country & provider lookup ¦ Recherche de pays et fournisseur ¦ Búsqueda de país y proveedor
+Offline country/provider database (recommended) ¦ Base pays/fournisseur hors ligne (recommandé) ¦ Base de datos de país/proveedor sin conexión (recomendado)
+Online country lookup (fallback) ¦ Recherche de pays en ligne (secours) ¦ Búsqueda de país en línea (alternativa)
+Sends each remote (Internet) IP address — never your own devices' addresses, MAC addresses, packet contents or website names — to a public geolocation service (ipwho.is, geojs.io, ipapi.co, ip-api.com) to find its country. ¦ Envoie chaque adresse IP distante (Internet) — jamais les adresses de vos appareils, les adresses MAC, le contenu des paquets ni les noms de sites — à un service public de géolocalisation (ipwho.is, geojs.io, ipapi.co, ip-api.com) pour trouver son pays. ¦ Envía cada dirección IP remota (de Internet) — nunca las de sus dispositivos, direcciones MAC, contenido de paquetes ni nombres de sitios — a un servicio público de geolocalización (ipwho.is, geojs.io, ipapi.co, ip-api.com) para saber su país.
+Test lookup ¦ Tester la recherche ¦ Probar la búsqueda
+What MiniWireshark keeps ¦ Ce que MiniWireshark conserve ¦ Lo que guarda MiniWireshark
+Captured network information is processed on this computer and stays here unless you export it. Raw packets are never written to disk unless you export them or enable it under History. Settings live in a small file next to the program; names you give devices are kept in the data folder. ¦ Les informations réseau capturées sont traitées sur cet ordinateur et y restent sauf si vous les exportez. Les paquets bruts ne sont jamais écrits sur disque sauf si vous les exportez ou l'activez dans Historique. Les paramètres sont dans un petit fichier à côté du programme ; les noms donnés aux appareils sont dans le dossier des données. ¦ La información de red capturada se procesa en este equipo y se queda aquí salvo que la exporte. Los paquetes en bruto nunca se escriben en disco salvo que los exporte o lo active en Historial. Los ajustes están en un pequeño archivo junto al programa; los nombres que da a los dispositivos se guardan en la carpeta de datos.
+Optional long-term memory, stored only on this computer. ¦ Mémoire à long terme facultative, stockée uniquement sur cet ordinateur. ¦ Memoria a largo plazo opcional, guardada solo en este equipo.
+Local history ¦ Historique local ¦ Historial local
+Remember devices and summaries between sessions ¦ Mémoriser appareils et résumés entre les sessions ¦ Recordar dispositivos y resúmenes entre sesiones
+Saves compact summaries (devices, presence, daily traffic totals, alerts, domains, learned baselines) in a local database. No packet contents. ¦ Enregistre des résumés compacts (appareils, présence, totaux de trafic quotidiens, alertes, domaines, habitudes apprises) dans une base locale. Aucun contenu de paquet. ¦ Guarda resúmenes compactos (dispositivos, presencia, totales diarios de tráfico, alertas, dominios, referencias aprendidas) en una base de datos local. Sin contenido de paquetes.
+Keep history for ¦ Conserver l'historique pendant ¦ Guardar historial durante
+Older summaries are deleted automatically. “Session only” keeps nothing after you close MiniWireshark. ¦ Les résumés plus anciens sont supprimés automatiquement. « Session seulement » ne garde rien après la fermeture de MiniWireshark. ¦ Los resúmenes más antiguos se borran automáticamente. «Solo la sesión» no guarda nada al cerrar MiniWireshark.
+Session only ¦ Session seulement ¦ Solo la sesión
+Custom ¦ Personnalisé ¦ Personalizado
+Custom retention ¦ Durée personnalisée ¦ Retención personalizada
+Used when “Keep history for” is Custom. ¦ Utilisé quand « Conserver l'historique pendant » est Personnalisé. ¦ Se usa cuando «Guardar historial durante» es Personalizado.
+days ¦ jours ¦ días
+Keep recent packets on disk (packet history) ¦ Garder les paquets récents sur disque (historique des paquets) ¦ Guardar paquetes recientes en disco (historial de paquetes)
+Stores the newest raw packets in files in the data folder (oldest deleted first), so evidence links can open packets that already left memory. Raw packets can contain private information. Off by default; never uploaded. ¦ Stocke les paquets bruts les plus récents dans des fichiers du dossier des données (les plus anciens supprimés d'abord), pour que les liens de preuve ouvrent des paquets sortis de la mémoire. Les paquets bruts peuvent contenir des informations privées. Désactivé par défaut ; jamais envoyé. ¦ Guarda los paquetes en bruto más recientes en archivos de la carpeta de datos (se borran primero los más antiguos), para que los enlaces de pruebas abran paquetes que ya salieron de la memoria. Pueden contener información privada. Desactivado por defecto; nunca se sube.
+Packet history size ¦ Taille de l'historique des paquets ¦ Tamaño del historial de paquetes
+The most disk space the packet history may use. ¦ L'espace disque maximal de l'historique des paquets. ¦ El máximo espacio en disco que puede usar el historial de paquetes.
+Also save raw packets when closing (off by default) ¦ Enregistrer aussi les paquets bruts à la fermeture (désactivé par défaut) ¦ Guardar también los paquetes en bruto al cerrar (desactivado por defecto)
+Writes the packets still in memory to a .pcap file in the data folder when you close MiniWireshark. Raw packets can contain private information. ¦ Écrit les paquets encore en mémoire dans un fichier .pcap du dossier des données à la fermeture de MiniWireshark. Les paquets bruts peuvent contenir des informations privées. ¦ Escribe los paquetes que siguen en memoria en un archivo .pcap de la carpeta de datos al cerrar MiniWireshark. Los paquetes en bruto pueden contener información privada.
+History is off. Nothing is kept after you close MiniWireshark except names you give devices. ¦ L'historique est désactivé. Rien n'est gardé après la fermeture sauf les noms donnés aux appareils. ¦ El historial está desactivado. No se guarda nada al cerrar MiniWireshark, salvo los nombres que da a los dispositivos.
+Clear history ¦ Effacer l'historique ¦ Borrar historial
+Reset learned baselines ¦ Réinitialiser les habitudes apprises ¦ Restablecer referencias aprendidas
+Keep MiniWireshark light on busy networks or slow computers. ¦ Gardez MiniWireshark léger sur les réseaux chargés ou les ordinateurs lents. ¦ Mantenga MiniWireshark ligero en redes con mucho tráfico o equipos lentos.
+Refresh speed ¦ Vitesse de rafraîchissement ¦ Velocidad de actualización
+Performance mode ¦ Mode performances ¦ Modo rendimiento
+Click Change, then press the new key combination. Ctrl+Tab / Ctrl+Shift+Tab also switch tabs. ¦ Cliquez sur Modifier, puis appuyez sur la nouvelle combinaison. Ctrl+Tab / Ctrl+Maj+Tab changent aussi d'onglet. ¦ Haga clic en Cambiar y pulse la nueva combinación. Ctrl+Tab / Ctrl+Mayús+Tab también cambian de pestaña.
+Actions ¦ Actions ¦ Acciones
+Change ¦ Modifier ¦ Cambiar
+Default ¦ Par défaut ¦ Predeterminado
+Start / stop watching ¦ Démarrer / arrêter l'observation ¦ Iniciar / detener la observación
+Open the export menu ¦ Ouvrir le menu d'export ¦ Abrir el menú de exportación
+Jump to search ¦ Aller à la recherche ¦ Ir a la búsqueda
+Undo your last device change ¦ Annuler la dernière modification d'appareil ¦ Deshacer el último cambio de dispositivo
+Show / hide the inspector ¦ Afficher / masquer l'inspecteur ¦ Mostrar / ocultar el inspector
+Where files go, and where your settings live. ¦ Où vont les fichiers, et où sont vos paramètres. ¦ Dónde van los archivos y dónde están sus ajustes.
+Exports ¦ Exports ¦ Exportaciones
+Default folder for exports and sessions ¦ Dossier par défaut des exports et sessions ¦ Carpeta predeterminada de exportaciones y sesiones
+File dialogs open here. Leave empty to use the system default. ¦ Les boîtes de dialogue de fichiers s'ouvrent ici. Laissez vide pour le dossier par défaut du système. ¦ Los diálogos de archivos se abren aquí. Déjelo vacío para usar el predeterminado del sistema.
+Browse ¦ Parcourir ¦ Examinar
+Files ¦ Fichiers ¦ Archivos
+Open settings folder ¦ Ouvrir le dossier des paramètres ¦ Abrir la carpeta de ajustes
+Keep MiniWireshark and its helpers up to date — only when you ask. ¦ Gardez MiniWireshark et ses composants à jour — seulement quand vous le demandez. ¦ Mantenga MiniWireshark y sus componentes al día — solo cuando lo pida.
+Update checks ¦ Recherche de mises à jour ¦ Comprobación de actualizaciones
+GitHub repository ¦ Dépôt GitHub ¦ Repositorio de GitHub
+Where new releases are published, as owner/name. Leave empty and MiniWireshark never checks. ¦ Où les nouvelles versions sont publiées, sous la forme propriétaire/nom. Laissez vide et MiniWireshark ne vérifie jamais. ¦ Dónde se publican las versiones nuevas, como propietario/nombre. Déjelo vacío y MiniWireshark nunca comprobará.
+Check when MiniWireshark opens ¦ Vérifier à l'ouverture de MiniWireshark ¦ Comprobar al abrir MiniWireshark
+Asks GitHub for the latest release number only. ¦ Demande seulement à GitHub le numéro de la dernière version. ¦ Solo pide a GitHub el número de la última versión.
+Offer to install updates (keeps a backup) ¦ Proposer d'installer les mises à jour (garde une sauvegarde) ¦ Ofrecer instalar actualizaciones (guarda una copia)
+Downloads the new .py from the release, checks it, saves a backup of this version, then replaces it atomically. If the new version fails to start, the backup is restored automatically. ¦ Télécharge le nouveau .py de la version, le vérifie, sauvegarde cette version puis la remplace d'un coup. Si la nouvelle version ne démarre pas, la sauvegarde est restaurée automatiquement. ¦ Descarga el nuevo .py de la versión, lo comprueba, guarda una copia de esta versión y la sustituye de una vez. Si la nueva versión no arranca, la copia se restaura automáticamente.
+Check for updates now ¦ Rechercher des mises à jour ¦ Buscar actualizaciones ahora
+Install a signed data pack ¦ Installer un pack de données signé ¦ Instalar un paquete de datos firmado
+No release key is built into this copy, so updates are check-only: you're told about a new version and download it yourself. Nothing unsigned is ever installed. ¦ Aucune clé de publication n'est intégrée à cette copie : les mises à jour sont seulement signalées et vous les téléchargez vous-même. Rien de non signé n'est jamais installé. ¦ Esta copia no incluye clave de publicación, así que las actualizaciones solo se comprueban: se le avisa de una versión nueva y la descarga usted. Nunca se instala nada sin firmar.
+Helpers ¦ Composants ¦ Componentes auxiliares
+Repair dependencies ¦ Réparer les dépendances ¦ Reparar dependencias
+Information for troubleshooting — no terminal needed. ¦ Informations de dépannage — aucun terminal nécessaire. ¦ Información para resolver problemas — sin necesidad de terminal.
+Troubleshooting ¦ Dépannage ¦ Solución de problemas
+Detailed logging ¦ Journalisation détaillée ¦ Registro detallado
+Writes more detail to the log file. Packet contents are never logged. ¦ Écrit plus de détails dans le journal. Le contenu des paquets n'est jamais journalisé. ¦ Escribe más detalle en el registro. El contenido de los paquetes nunca se registra.
+Open diagnostics ¦ Ouvrir le diagnostic ¦ Abrir el diagnóstico
+Repair ¦ Réparer ¦ Reparar
+Checks and fixes the usual problems automatically. ¦ Vérifie et corrige automatiquement les problèmes habituels. ¦ Comprueba y corrige automáticamente los problemas habituales.
+Runtime Manager ¦ Gestionnaire d'environnement ¦ Gestor del entorno
+Repair / Update Environment ¦ Réparer / mettre à jour l'environnement ¦ Reparar / actualizar el entorno
+Export debug bundle ¦ Exporter le paquet de débogage ¦ Exportar paquete de depuración
+MiniWireshark diagnostics ¦ Diagnostic de MiniWireshark ¦ Diagnóstico de MiniWireshark
+Troubleshooting & diagnostics ¦ Dépannage et diagnostic ¦ Solución de problemas y diagnóstico
+Nothing here needs a terminal. Copy or export this information if you ask someone for help (it contains no packet contents). ¦ Rien ici ne nécessite de terminal. Copiez ou exportez ces informations si vous demandez de l'aide (elles ne contiennent aucun contenu de paquet). ¦ Nada de esto necesita terminal. Copie o exporte esta información si pide ayuda a alguien (no contiene contenido de paquetes).
+Copy diagnostics ¦ Copier le diagnostic ¦ Copiar diagnóstico
+Export report ¦ Exporter le rapport ¦ Exportar informe
+Refresh adapters ¦ Actualiser les cartes ¦ Actualizar adaptadores
+Test capture engine ¦ Tester le moteur de capture ¦ Probar el motor de captura
+Test DNS ¦ Tester le DNS ¦ Probar el DNS
+Test Internet ¦ Tester Internet ¦ Probar Internet
+Test country lookup ¦ Tester la recherche de pays ¦ Probar la búsqueda de país
+Check environment ¦ Vérifier l'environnement ¦ Comprobar el entorno
+Runtime Manager — checking everything is ready ¦ Gestionnaire d'environnement — vérification que tout est prêt ¦ Gestor del entorno — comprobando que todo está listo
+everything works (notes in the details) ¦ tout fonctionne (remarques dans les détails) ¦ todo funciona (notas en los detalles)
+Your MiniWireshark environment ¦ Votre environnement MiniWireshark ¦ Su entorno de MiniWireshark
+Graphical toolkit (Tk) ¦ Boîte à outils graphique (Tk) ¦ Kit gráfico (Tk)
+OK — the verified version ¦ OK — la version vérifiée ¦ Correcto — la versión verificada
+Not installed — only a helper for cryptography, which works without it here ¦ Non installé — seulement un auxiliaire de cryptography, qui fonctionne sans ici ¦ No instalado — solo es un auxiliar de cryptography, que aquí funciona sin él
+Not installed — only a helper for cffi, which isn't installed either ¦ Non installé — seulement un auxiliaire de cffi, qui n'est pas installé non plus ¦ No instalado — solo es un auxiliar de cffi, que tampoco está instalado
+Update pip ¦ Mettre à jour pip ¦ Actualizar pip
+Check for newer Python ¦ Rechercher un Python plus récent ¦ Buscar un Python más reciente
+Rebuild side by side ¦ Reconstruire à côté ¦ Reconstruir en paralelo
+Roll back ¦ Revenir en arrière ¦ Revertir
+Remove private Python ¦ Supprimer le Python privé ¦ Eliminar el Python privado
+Offline kit ¦ Kit hors ligne ¦ Kit sin conexión
+Repair / Update installs the versions THIS release of MiniWireshark verified, and updates pip inside the private Python. A newer Python is only installed when you ask, after GitHub's checksum and the self-test pass. Nothing outside MiniWireshark's data folder is changed. ¦ Réparer / mettre à jour installe les versions vérifiées par CETTE version de MiniWireshark et met à jour pip dans le Python privé. Un Python plus récent n'est installé que si vous le demandez, après la somme de contrôle GitHub et l'autotest. Rien n'est modifié hors du dossier des données de MiniWireshark. ¦ Reparar / actualizar instala las versiones que ESTA versión de MiniWireshark verificó y actualiza pip dentro del Python privado. Un Python más reciente solo se instala si lo pide, tras superar la suma de comprobación de GitHub y la autoprueba. No se cambia nada fuera de la carpeta de datos de MiniWireshark.
+Maintenance mode — nothing changes until you click a button. Your own Python is never modified. ¦ Mode maintenance — rien ne change tant que vous ne cliquez pas sur un bouton. Votre propre Python n'est jamais modifié. ¦ Modo mantenimiento — nada cambia hasta que pulse un botón. Su propio Python nunca se modifica.
+What MiniWireshark itself sent ¦ Ce que MiniWireshark a envoyé lui-même ¦ Lo que envió el propio MiniWireshark
+Every probe, lookup and download this app made, newest first. Packets it only listened to are not here — this is only what it sent. Nothing is uploaded anywhere. ¦ Chaque sonde, recherche et téléchargement fait par cette application, du plus récent au plus ancien. Les paquets seulement écoutés n'y sont pas — uniquement ce qu'elle a envoyé. Rien n'est envoyé nulle part. ¦ Cada sonda, búsqueda y descarga que hizo esta aplicación, de la más reciente a la más antigua. Los paquetes que solo escuchó no están aquí — solo lo que envió. No se sube nada a ninguna parte.
+Feature ¦ Fonction ¦ Función
+What ¦ Quoi ¦ Qué
+To ¦ Vers ¦ Hacia
+Why is my Internet slow? ¦ Pourquoi mon Internet est-il lent ? ¦ ¿Por qué va lento mi Internet?
+A ranked list of explanations with the evidence for and against each. It is not a verdict: the top one is the best fit for what this computer can see (Network-wide view). ¦ Une liste classée d'explications avec les preuves pour et contre chacune. Ce n'est pas un verdict : la première est la plus cohérente avec ce que cet ordinateur peut voir (vue de tout le réseau). ¦ Una lista ordenada de explicaciones con las pruebas a favor y en contra de cada una. No es un veredicto: la primera es la que mejor encaja con lo que ve este equipo (vista de toda la red).
+Likely ¦ Probable ¦ Probable
+Possible ¦ Possible ¦ Posible
+Unlikely ¦ Peu probable ¦ Poco probable
+Weak Wi-Fi on this computer ¦ Wi-Fi faible sur cet ordinateur ¦ Wi-Fi débil en este equipo
+What to try: Move closer to the router, remove obstacles, or use 5 GHz / a cable. ¦ À essayer : rapprochez-vous de la box, enlevez les obstacles ou utilisez le 5 GHz / un câble. ¦ Qué probar: acérquese al router, quite obstáculos o use 5 GHz / un cable.
+Slow website lookups (DNS) ¦ Recherches de sites lentes (DNS) ¦ Búsquedas de sitios lentas (DNS)
+Delay beyond your router ¦ Retard au-delà de votre box ¦ Retraso más allá de su router
+Run again ¦ Relancer ¦ Volver a ejecutar
+Copy result ¦ Copier le résultat ¦ Copiar resultado
+Close ¦ Fermer ¦ Cerrar
+What is using my bandwidth? ¦ Qu'est-ce qui utilise ma bande passante ? ¦ ¿Qué está usando mi ancho de banda?
+Counted from connections active in the last 10 minutes, by device. Bytes that can't be tied to a device are shown separately — never guessed. ¦ Calculé à partir des connexions actives ces 10 dernières minutes, par appareil. Les octets non attribuables à un appareil sont affichés à part — jamais devinés. ¦ Contado a partir de las conexiones activas en los últimos 10 minutos, por dispositivo. Los bytes que no se pueden atribuir a un dispositivo se muestran aparte — nunca se adivinan.
+No single device stands out; the usage is spread out. ¦ Aucun appareil ne se distingue ; l'utilisation est répartie. ¦ Ningún dispositivo destaca; el uso está repartido.
+Connect your Pi-hole (read-only) ¦ Connecter votre Pi-hole (lecture seule) ¦ Conectar su Pi-hole (solo lectura)
+Connect your AdGuard Home (read-only) ¦ Connecter votre AdGuard Home (lecture seule) ¦ Conectar su AdGuard Home (solo lectura)
+MiniWireshark only reads its query log and device names, about once a minute. Nothing is changed on it. The password is kept in a private file only your user account can read (this system has no keyring). ¦ MiniWireshark lit seulement son journal de requêtes et les noms d'appareils, environ une fois par minute. Rien n'y est modifié. Le mot de passe est gardé dans un fichier privé que seul votre compte peut lire (ce système n'a pas de trousseau). ¦ MiniWireshark solo lee su registro de consultas y los nombres de dispositivos, más o menos una vez por minuto. No se cambia nada en él. La contraseña se guarda en un archivo privado que solo su cuenta puede leer (este sistema no tiene llavero).
+Name ¦ Nom ¦ Nombre
+Password or app password ¦ Mot de passe ou mot de passe d'application ¦ Contraseña o contraseña de aplicación
+Username ¦ Nom d'utilisateur ¦ Usuario
+Check the certificate (https) ¦ Vérifier le certificat (https) ¦ Comprobar el certificado (https)
+Trust this certificate ¦ Faire confiance à ce certificat ¦ Confiar en este certificado
+Save ¦ Enregistrer ¦ Guardar
+Start here. The cards show what's happening right now; the two big cards say what this computer can see from where it is, and what changed in the last hour. Click any card to dig in. ¦ Commencez ici. Les cartes montrent ce qui se passe maintenant ; les deux grandes indiquent ce que cet ordinateur peut voir d'où il est, et ce qui a changé dans la dernière heure. Cliquez sur une carte pour approfondir. ¦ Empiece aquí. Las tarjetas muestran lo que pasa ahora mismo; las dos grandes dicen lo que este equipo puede ver desde donde está y qué cambió en la última hora. Haga clic en una tarjeta para profundizar.
+Back ¦ Retour ¦ Atrás
+Show me ¦ Montrer ¦ Muéstrame
+Next ¦ Suivant ¦ Siguiente
+Done ¦ Terminé ¦ Listo
+I'm checking the usual suspects and fixing what I can. Your captured data and settings stay as they are. ¦ Je vérifie les suspects habituels et répare ce que je peux. Vos données capturées et vos paramètres restent intacts. ¦ Estoy revisando los sospechosos habituales y arreglando lo que puedo. Sus datos capturados y ajustes se quedan como están.
+Program components ¦ Composants du programme ¦ Componentes del programa
+All components import correctly. ¦ Tous les composants se chargent correctement. ¦ Todos los componentes se cargan correctamente.
+Reference lists (vendors, domains…) ¦ Listes de référence (fabricants, domaines…) ¦ Listas de referencia (fabricantes, dominios…)
+Reference lists are intact. ¦ Les listes de référence sont intactes. ¦ Las listas de referencia están intactas.
+History database ¦ Base de l'historique ¦ Base de datos del historial
+History is off. ¦ L'historique est désactivé. ¦ El historial está desactivado.
+Settings file ¦ Fichier de paramètres ¦ Archivo de ajustes
+Settings file is fine. ¦ Le fichier de paramètres est correct. ¦ El archivo de ajustes está bien.
+Network cards and capture engine ¦ Cartes réseau et moteur de capture ¦ Tarjetas de red y motor de captura
+Quick self-test ¦ Autotest rapide ¦ Autoprueba rápida
+checking ¦ vérification ¦ comprobando
+Working ¦ En cours ¦ Trabajando
+Device inventory — preview ¦ Inventaire des appareils — aperçu ¦ Inventario de dispositivos — vista previa
+Hide personal details before saving ¦ Masquer les détails personnels avant d'enregistrer ¦ Ocultar datos personales antes de guardar
+IP addresses ¦ Adresses IP ¦ Direcciones IP
+Hardware (MAC) addresses ¦ Adresses matérielles (MAC) ¦ Direcciones físicas (MAC)
+Device names, notes and your labels ¦ Noms d'appareils, notes et vos étiquettes ¦ Nombres de dispositivos, notas y sus etiquetas
+Network (Wi-Fi) names ¦ Noms de réseaux (Wi-Fi) ¦ Nombres de red (Wi-Fi)
+Website names ¦ Noms de sites ¦ Nombres de sitios
+Saved exactly as shown on the left. ¦ Enregistré exactement comme à gauche. ¦ Se guarda exactamente como se ve a la izquierda.
+Your data (not changed) ¦ Vos données (non modifiées) ¦ Sus datos (sin cambios)
+What will be saved ¦ Ce qui sera enregistré ¦ Lo que se guardará
+Finish ¦ Terminer ¦ Terminar
+The Dashboard ¦ Le tableau de bord ¦ El panel
+This is the Dashboard — click any card for details. ¦ Voici le tableau de bord — cliquez sur une carte pour les détails. ¦ Este es el panel — haga clic en una tarjeta para ver detalles.
+Devices and the Inspector ¦ Les appareils et l'inspecteur ¦ Los dispositivos y el inspector
+Every device on your network, with how sure MiniWireshark is. Select one and press F2: the Inspector shows each fact about it and the packets that prove it. ¦ Chaque appareil de votre réseau, avec le degré de certitude de MiniWireshark. Sélectionnez-en un et appuyez sur F2 : l'inspecteur montre chaque fait le concernant et les paquets qui le prouvent. ¦ Cada dispositivo de su red, con lo seguro que está MiniWireshark. Seleccione uno y pulse F2: el inspector muestra cada dato sobre él y los paquetes que lo demuestran.
+Select a device, then press F2 to open the Inspector. ¦ Sélectionnez un appareil, puis appuyez sur F2 pour ouvrir l'inspecteur. ¦ Seleccione un dispositivo y pulse F2 para abrir el inspector.
+Evidence marks ¦ Les marques de preuve ¦ Las marcas de prueba
+◉ Observed — seen in a packet.  ◎ Correlated — two observations line up (a lookup, then a connection).  ◌ Inferred — a reasonable guess.  ? Unknown — not seen either way, which never means “didn't happen”. ¦ ◉ Observé — vu dans un paquet.  ◎ Corrélé — deux observations concordent (une recherche, puis une connexion).  ◌ Déduit — une supposition raisonnable.  ? Inconnu — rien n'a été vu, ce qui ne veut jamais dire « ne s'est pas produit ». ¦ ◉ Observado — visto en un paquete.  ◎ Correlacionado — dos observaciones coinciden (una búsqueda y luego una conexión).  ◌ Deducido — una suposición razonable.  ? Desconocido — no se vio nada, lo que nunca significa «no ocurrió».
+The “How we know” column shows the evidence mark for each site. ¦ La colonne « Comment on le sait » montre la marque de preuve de chaque site. ¦ La columna «Cómo lo sabemos» muestra la marca de prueba de cada sitio.
+Quiet and Active ¦ Discret et actif ¦ Silencioso y activo
+The banner at the top always tells the truth: in Quiet Mode MiniWireshark only listens. Active Scanning also sends small discovery probes — only on networks you've marked as yours. ¦ Le bandeau en haut dit toujours la vérité : en mode discret, MiniWireshark ne fait qu'écouter. L'analyse active envoie aussi de petites sondes de découverte — seulement sur les réseaux que vous avez marqués comme vôtres. ¦ La franja superior siempre dice la verdad: en modo silencioso MiniWireshark solo escucha. La exploración activa también envía pequeñas sondas de descubrimiento — solo en redes que ha marcado como suyas.
+The coloured banner at the top shows Quiet or Active. ¦ Le bandeau coloré en haut indique discret ou actif. ¦ La franja de color de arriba indica silencioso o activo.
+Alerts flag unusual things with innocent explanations and what to check. Nothing here means “hacked” — it means “worth a look”. ¦ Les alertes signalent ce qui est inhabituel, avec des explications innocentes et quoi vérifier. Rien ici ne veut dire « piraté » — cela veut dire « à regarder ». ¦ Las alertas señalan lo inusual con explicaciones inocentes y qué comprobar. Nada aquí significa «pirateado» — significa «merece un vistazo».
+Alerts explain what was seen and what to check. ¦ Les alertes expliquent ce qui a été vu et quoi vérifier. ¦ Las alertas explican lo que se vio y qué comprobar.
+Evidence you can check ¦ Des preuves vérifiables ¦ Pruebas que puede comprobar
+Every statement says how it's known (◉ observed, ◎ correlated, ◌ inferred) and links to the packets behind it. Press F2 for the Inspector. ¦ Chaque affirmation indique comment elle est connue (◉ observé, ◎ corrélé, ◌ déduit) et renvoie aux paquets qui la justifient. Appuyez sur F2 pour l'inspecteur. ¦ Cada afirmación dice cómo se sabe (◉ observado, ◎ correlacionado, ◌ deducido) y enlaza con los paquetes que la respaldan. Pulse F2 para el inspector.
+Ten times faster capture ¦ Capture dix fois plus rapide ¦ Captura diez veces más rápida
+A new capture pipeline keeps up with busy networks without freezing the window. ¦ Un nouveau moteur de capture suit les réseaux chargés sans figer la fenêtre. ¦ Un nuevo motor de captura sigue el ritmo de redes con mucho tráfico sin congelar la ventana.
+Quiet on new networks ¦ Discret sur les nouveaux réseaux ¦ Discreto en redes nuevas
+Networks you haven't marked as yours start in Quiet Mode — nothing is sent until you trust them. ¦ Les réseaux que vous n'avez pas marqués comme vôtres démarrent en mode discret — rien n'est envoyé tant que vous ne leur faites pas confiance. ¦ Las redes que no ha marcado como suyas empiezan en modo silencioso — no se envía nada hasta que confíe en ellas.
+History and “what changed” ¦ Historique et « ce qui a changé » ¦ Historial y «qué cambió»
+Optional history keeps evidence across restarts and tells you what's new since yesterday. ¦ L'historique facultatif conserve les preuves entre les redémarrages et indique ce qui est nouveau depuis hier. ¦ El historial opcional conserva las pruebas entre reinicios y le dice qué hay de nuevo desde ayer.
+One-click Repair ¦ Réparation en un clic ¦ Reparación con un clic
+Something wrong? Settings → Repair MiniWireshark checks and fixes the usual problems for you. ¦ Un souci ? Paramètres → Réparer MiniWireshark vérifie et corrige les problèmes habituels pour vous. ¦ ¿Algo falla? Ajustes → Reparar MiniWireshark comprueba y corrige los problemas habituales por usted.
+DEMO DATA — NOT LIVE TRAFFIC. Everything shown is simulated sample data. ¦ DONNÉES DE DÉMO — PAS DU TRAFIC RÉEL. Tout ce qui est affiché est simulé. ¦ DATOS DE DEMOSTRACIÓN — NO ES TRÁFICO REAL. Todo lo que se muestra es simulado.
+OFFLINE CAPTURE — not live. You're looking at packets from a file. ¦ CAPTURE HORS LIGNE — pas en direct. Vous regardez des paquets issus d'un fichier. ¦ CAPTURA SIN CONEXIÓN — no en directo. Está viendo paquetes de un archivo.
+SAVED SESSION — not live. You're looking at a previously saved session. ¦ SESSION ENREGISTRÉE — pas en direct. Vous regardez une session enregistrée. ¦ SESIÓN GUARDADA — no en directo. Está viendo una sesión guardada anteriormente.
+QUIET MODE — PASSIVE ONLY — MiniWireshark is only listening to traffic that already exists; it is not sending anything itself. ¦ MODE DISCRET — ÉCOUTE SEULE — MiniWireshark écoute seulement le trafic existant ; il n'envoie rien lui-même. ¦ MODO SILENCIOSO — SOLO ESCUCHA — MiniWireshark solo escucha el tráfico que ya existe; no envía nada por sí mismo.
+ACTIVE SCANNING — MiniWireshark is also sending harmless discovery probes (ARP/mDNS/SSDP) on your own local network to find quiet devices. ¦ ANALYSE ACTIVE — MiniWireshark envoie aussi des sondes de découverte inoffensives (ARP/mDNS/SSDP) sur votre propre réseau local pour trouver les appareils discrets. ¦ EXPLORACIÓN ACTIVA — MiniWireshark también envía sondas de descubrimiento inofensivas (ARP/mDNS/SSDP) en su propia red local para encontrar dispositivos silenciosos.
+Last 5 minutes ¦ 5 dernières minutes ¦ Últimos 5 minutos
+Last hour ¦ Dernière heure ¦ Última hora
+Last 24 hours ¦ Dernières 24 heures ¦ Últimas 24 horas
+Last 7 days ¦ 7 derniers jours ¦ Últimos 7 días
+Since this session started ¦ Depuis le début de la session ¦ Desde que empezó la sesión
+Full session ¦ Session complète ¦ Sesión completa
+7 days ¦ 7 jours ¦ 7 días
+30 days ¦ 30 jours ¦ 30 días
+90 days ¦ 90 jours ¦ 90 días
+1 year ¦ 1 an ¦ 1 año
+Small ¦ Petit ¦ Pequeño
+Large ¦ Grand ¦ Grande
+Extra large ¦ Très grand ¦ Muy grande
+Automatic ¦ Automatique ¦ Automático
+Low CPU ¦ Économie de processeur ¦ Bajo consumo de CPU
+Automatic slows screen refreshes when traffic is heavy or the window lags. Low CPU always refreshes about 2.5× less often. Neither changes what is captured or any alert threshold. ¦ Automatique ralentit les rafraîchissements quand le trafic est intense ou que la fenêtre rame. Économie de processeur rafraîchit toujours environ 2,5× moins souvent. Aucun des deux ne change ce qui est capturé ni les seuils d'alerte. ¦ Automático reduce las actualizaciones de pantalla cuando hay mucho tráfico o la ventana va lenta. Bajo consumo de CPU actualiza siempre unas 2,5× menos. Ninguno cambia lo que se captura ni los umbrales de alerta.
+Broadcast/multicast packets per second (10-second average) that count as a flood. ¦ Paquets de diffusion/multidiffusion par seconde (moyenne sur 10 secondes) considérés comme une inondation. ¦ Paquetes de difusión/multidifusión por segundo (media de 10 segundos) que cuentan como inundación.
+Downloads a public ~7 MB database (iptoasn.com) once, then looks up each Internet host's country and network provider ON THIS COMPUTER. Nothing is sent per lookup. IPv4 only. ¦ Télécharge une fois une base publique d'environ 7 Mo (iptoasn.com), puis trouve le pays et le fournisseur de chaque hôte Internet SUR CET ORDINATEUR. Rien n'est envoyé à chaque recherche. IPv4 seulement. ¦ Descarga una vez una base de datos pública de unos 7 MB (iptoasn.com) y luego busca el país y el proveedor de cada equipo de Internet EN ESTE EQUIPO. No se envía nada por búsqueda. Solo IPv4.
+Hides connections under one second with fewer than 3 packets, which are mostly background noise. ¦ Masque les connexions de moins d'une seconde avec moins de 3 paquets, qui sont surtout du bruit de fond. ¦ Oculta las conexiones de menos de un segundo con menos de 3 paquetes, que son sobre todo ruido de fondo.
+Shows www.example.com and mail.example.com under example.com. Only a display choice — nothing is merged or lost. ¦ Affiche www.example.com et mail.example.com sous example.com. Simple choix d'affichage — rien n'est fusionné ni perdu. ¦ Muestra www.example.com y mail.example.com bajo example.com. Solo es una opción de vista — no se fusiona ni se pierde nada.
+Red-green — deuteranopia (most common) ¦ Rouge-vert — deutéranopie (la plus courante) ¦ Rojo-verde — deuteranopía (la más común)
+Red-green — protanopia ¦ Rouge-vert — protanopie ¦ Rojo-verde — protanopía
+Blue-yellow — tritanopia ¦ Bleu-jaune — tritanopie ¦ Azul-amarillo — tritanopía
+resets / 10 min ¦ réinitialisations / 10 min ¦ restablecimientos / 10 min
+× its usual rate ¦ × son rythme habituel ¦ × su ritmo habitual
+MB ¦ Mo ¦ MB
+Danger ¦ Danger ¦ Peligro
+Warning ¦ Avertissement ¦ Aviso
+Click to open the details. ¦ Cliquez pour ouvrir les détails. ¦ Haga clic para abrir los detalles.
+INTERNET (outside your network) ¦ INTERNET (hors de votre réseau) ¦ INTERNET (fuera de su red)
+YOUR LOCAL NETWORK ¦ VOTRE RÉSEAU LOCAL ¦ SU RED LOCAL
+Letters = confidence (H M L ?) · hollow = offline · ─ seen (switch said so) · ┄ logical (inferred) · ★ new this hour · red ring = open alert · drag a device to place it ¦ Lettres = confiance (H M L ?) · creux = hors ligne · ─ vu (selon le commutateur) · ┄ logique (déduit) · ★ nouveau cette heure · anneau rouge = alerte ouverte · faites glisser un appareil pour le placer ¦ Letras = confianza (H M L ?) · hueco = desconectado · ─ visto (según el conmutador) · ┄ lógico (deducido) · ★ nuevo en esta hora · anillo rojo = alerta abierta · arrastre un dispositivo para colocarlo
+Load 200 older ¦ Charger 200 plus anciens ¦ Cargar 200 anteriores
+Internet traffic ¦ Trafic Internet ¦ Tráfico de Internet
+No Internet traffic measured yet ¦ Aucun trafic Internet mesuré pour l'instant ¦ Aún no se ha medido tráfico de Internet
+Packets per second ¦ Paquets par seconde ¦ Paquetes por segundo
+Packets/sec ¦ Paquets/s ¦ Paquetes/s
+Protocols (by volume) ¦ Protocoles (par volume) ¦ Protocolos (por volumen)
+Top devices (click to open) ¦ Principaux appareils (cliquez pour ouvrir) ¦ Dispositivos principales (clic para abrir)
+Top websites (click to open) ¦ Principaux sites (cliquez pour ouvrir) ¦ Sitios principales (clic para abrir)
+Website (grouped by main domain) ¦ Site web (groupé par domaine principal) ¦ Sitio web (agrupado por dominio principal)
+Switched to Advanced view to show that. ¦ Passage à la vue avancée pour afficher cela. ¦ Se cambió a la vista avanzada para mostrarlo.
+Your router ¦ Votre box ¦ Su router
+Your router / gateway ¦ Votre box / passerelle ¦ Su router / puerta de enlace
+Network-wide view ¦ Vue de tout le réseau ¦ Vista de toda la red
+Network-wide view. No known blind spots right now.  (click for details) ¦ Vue de tout le réseau. Aucun angle mort connu pour l'instant.  (cliquez pour les détails) ¦ Vista de toda la red. No hay puntos ciegos conocidos por ahora.  (clic para detalles)
+Network-wide view  ·  ◉ observed ◎ correlated ◌ inferred ? unknown  ·  F2 inspector ¦ Vue de tout le réseau  ·  ◉ observé ◎ corrélé ◌ déduit ? inconnu  ·  F2 inspecteur ¦ Vista de toda la red  ·  ◉ observado ◎ correlacionado ◌ deducido ? desconocido  ·  F2 inspector
+For secure (https) sites MiniWireshark sees only the site NAME (e.g. example.com) — never the page or full address like https://example.com/private/page. Lookups hidden by encrypted DNS or a VPN can't be listed. ¦ Pour les sites sécurisés (https), MiniWireshark ne voit que le NOM du site (par ex. example.com) — jamais la page ni l'adresse complète comme https://example.com/private/page. Les recherches cachées par un DNS chiffré ou un VPN ne peuvent pas être listées. ¦ En los sitios seguros (https) MiniWireshark solo ve el NOMBRE del sitio (p. ej. example.com) — nunca la página ni la dirección completa como https://example.com/private/page. Las búsquedas ocultas por DNS cifrado o una VPN no se pueden listar.
+Network cards refreshed. ¦ Cartes réseau actualisées. ¦ Tarjetas de red actualizadas.
+Now ¦ Maintenant ¦ Ahora
+now ¦ maintenant ¦ ahora
+Router ¦ Box / routeur ¦ Router
+Wi-Fi ¦ Wi-Fi ¦ Wi-Fi
+On ¦ Activé ¦ Activado
+Rename ¦ Renommer ¦ Renombrar
+Mark as mine ¦ Marquer comme à moi ¦ Marcar como mío
+Forget ¦ Oublier ¦ Olvidar
+Copy ¦ Copier ¦ Copiar
+Open ¦ Ouvrir ¦ Abrir
+Save as… ¦ Enregistrer sous… ¦ Guardar como…
+Error ¦ Erreur ¦ Error
+Move closer to the router, remove obstacles, or use 5 GHz / a cable. ¦ Rapprochez-vous de la box, enlevez les obstacles ou utilisez le 5 GHz / un câble. ¦ Acérquese al router, quite obstáculos o use 5 GHz / un cable.
+Moving closer usually helps. ¦ Se rapprocher aide en général. ¦ Acercarse suele ayudar.
+This computer uses a cable ¦ Cet ordinateur utilise un câble ¦ Este equipo usa cable
+The router isn't answering ¦ La box ne répond pas ¦ El router no responde
+The router didn't answer the check ¦ La box n'a pas répondu à la vérification ¦ El router no respondió a la comprobación
+Restart the router; check its cables. ¦ Redémarrez la box ; vérifiez ses câbles. ¦ Reinicie el router; revise sus cables.
+The router is slow to answer ¦ La box répond lentement ¦ El router tarda en responder
+The router may be overloaded; restart it. ¦ La box est peut-être surchargée ; redémarrez-la. ¦ Puede que el router esté sobrecargado; reinícielo.
+The router is slow or down ¦ La box est lente ou hors service ¦ El router va lento o no funciona
+Slow or failing website lookups (DNS) ¦ Recherches de sites lentes ou en échec (DNS) ¦ Búsquedas de sitios lentas o fallidas (DNS)
+Try another DNS server (in the router or this computer's settings). ¦ Essayez un autre serveur DNS (dans la box ou les réglages de cet ordinateur). ¦ Pruebe otro servidor DNS (en el router o en los ajustes de este equipo).
+Lookups are encrypted, so they can't be timed ¦ Les recherches sont chiffrées, on ne peut pas les chronométrer ¦ Las búsquedas están cifradas, así que no se pueden cronometrar
+Delay beyond your router (Internet provider or the sites themselves) ¦ Retard au-delà de votre box (fournisseur d'accès ou les sites eux-mêmes) ¦ Retraso más allá de su router (proveedor de Internet o los propios sitios)
+Wi-Fi and router look fine ¦ Le Wi-Fi et la box semblent corrects ¦ El Wi-Fi y el router parecen estar bien
+Test at another time; if it persists, contact your Internet provider. ¦ Testez à un autre moment ; si cela persiste, contactez votre fournisseur d'accès. ¦ Pruebe en otro momento; si continúa, contacte con su proveedor de Internet.
+Packets getting lost on the way ¦ Des paquets se perdent en route ¦ Se pierden paquetes por el camino
+Packets getting lost ¦ Des paquets se perdent ¦ Se pierden paquetes
+Consistent with the weak Wi-Fi ¦ Cohérent avec le Wi-Fi faible ¦ Coherente con el Wi-Fi débil
+Another device using the connection ¦ Un autre appareil utilise la connexion ¦ Otro dispositivo usa la conexión
+From this computer, other devices' traffic isn't visible (it goes straight to the router). ¦ Depuis cet ordinateur, le trafic des autres appareils n'est pas visible (il va directement à la box). ¦ Desde este equipo no se ve el tráfico de otros dispositivos (va directamente al router).
+The VPN adds a detour ¦ Le VPN ajoute un détour ¦ La VPN añade un desvío
+A VPN is active ¦ Un VPN est actif ¦ Hay una VPN activa
+Try once with the VPN off to compare. ¦ Essayez une fois sans le VPN pour comparer. ¦ Pruebe una vez sin la VPN para comparar.
+Can't tell from here ¦ Impossible à dire d'ici ¦ No se puede saber desde aquí
+Can't tell ¦ Impossible à dire ¦ No se sabe
+Nothing this computer can see explains it right now. ¦ Rien de ce que voit cet ordinateur ne l'explique pour l'instant. ¦ Nada de lo que ve este equipo lo explica por ahora.
+Check again while it's slow, or connect a Pi-hole / use a mirror port to see more. The router's own Internet line isn't visible from here. ¦ Revérifiez pendant la lenteur, ou connectez un Pi-hole / utilisez un port miroir pour en voir plus. La ligne Internet de la box n'est pas visible d'ici. ¦ Vuelva a comprobarlo mientras vaya lento, o conecte un Pi-hole / use un puerto espejo para ver más. La línea de Internet del propio router no se ve desde aquí.
+weak ¦ faible ¦ débil
+fair ¦ moyen ¦ aceptable
+good ¦ bon ¦ bueno
+excellent ¦ excellent ¦ excelente
+Weak signal — the most likely cause of slowness. Move closer to the router or remove obstacles. ¦ Signal faible — la cause la plus probable de lenteur. Rapprochez-vous de la box ou enlevez les obstacles. ¦ Señal débil — la causa más probable de la lentitud. Acérquese al router o quite obstáculos.
+Usable, but video calls and big downloads may stutter. ¦ Utilisable, mais les appels vidéo et gros téléchargements peuvent saccader. ¦ Utilizable, pero las videollamadas y descargas grandes pueden ir a saltos.
+Good signal. ¦ Bon signal. ¦ Buena señal.
+Strong signal. ¦ Signal fort. ¦ Señal fuerte.
+Signal strength not reported. ¦ Force du signal non indiquée. ¦ Intensidad de señal no indicada.
+Welcome back! ¦ Bon retour ! ¦ ¡Bienvenido de nuevo!
+Welcome to MiniWireshark 4! ¦ Bienvenue dans MiniWireshark 4 ! ¦ ¡Bienvenido a MiniWireshark 4!
+Getting started ¦ Démarrage ¦ Empezando
+Works; a different version than the one this release verified ¦ Fonctionne ; version différente de celle vérifiée par cette version ¦ Funciona; una versión distinta de la que verificó esta versión
+Beginner ¦ Débutant ¦ Principiante
+Advanced ¦ Avancé ¦ Avanzado
+Advertising ¦ Publicité ¦ Publicidad
+Analytics ¦ Mesure d'audience ¦ Analítica
+Social ¦ Réseaux sociaux ¦ Redes sociales
+Tracking ¦ Pistage ¦ Rastreo
+CDN ¦ Diffusion de contenu (CDN) ¦ Red de contenidos (CDN)
+Content ¦ Contenu ¦ Contenido
+Uncategorised ¦ Non classé ¦ Sin categoría
+All devices ¦ Tous les appareils ¦ Todos los dispositivos
+All types ¦ Tous les types ¦ Todos los tipos
+Any ¦ Tous ¦ Cualquiera
+Any category ¦ Toutes catégories ¦ Cualquier categoría
+Any evidence ¦ Toute preuve ¦ Cualquier prueba
+Any source ¦ Toute source ¦ Cualquier fuente
+Both ¦ Les deux ¦ Ambos
+Connected ¦ Connecté ¦ Conectado
+Connected (shared address) ¦ Connecté (adresse partagée) ¦ Conectado (dirección compartida)
+Looked up (reported) ¦ Recherché (rapporté) ¦ Buscado (informado)
+Looked up only ¦ Recherché seulement ¦ Solo buscado
+Possibly ¦ Peut-être ¦ Posiblemente
+Encrypted ¦ Chiffré ¦ Cifrado
+Not encrypted ¦ Non chiffré ¦ Sin cifrar
+Finished ¦ Terminée ¦ Terminada
+HTTP Host ¦ Hôte HTTP ¦ Host HTTP
+TLS SNI ¦ TLS SNI ¦ SNI de TLS
+QUIC first packet ¦ Premier paquet QUIC ¦ Primer paquete QUIC
+Local only ¦ Local seulement ¦ Solo local
+Most contacted ¦ Les plus contactés ¦ Más contactados
+Most traffic ¦ Le plus de trafic ¦ Más tráfico
+Recently seen ¦ Vus récemment ¦ Vistos recientemente
+Reset ¦ Réinitialisée ¦ Restablecida
+Network & capture ¦ Réseau et capture ¦ Red y captura
+This session ¦ Cette session ¦ Esta sesión
+Saved history ¦ Historique enregistré ¦ Historial guardado
+Outgoing ¦ Sortant ¦ Saliente
+Incoming ¦ Entrant ¦ Entrante
+Alphabetical ¦ Alphabétique ¦ Alfabético
+Name (A–Z) ¦ Nom (A–Z) ¦ Nombre (A–Z)
+Online ¦ En ligne ¦ Conectado
+Idle ¦ Inactif ¦ Inactivo
+Offline ¦ Hors ligne ¦ Desconectado
+Expired ¦ Expiré ¦ Caducado
+Search settings ¦ Rechercher un paramètre ¦ Buscar un ajuste
+Asking PyPI for the newest pip ¦ Interrogation de PyPI pour le pip le plus récent ¦ Consultando PyPI para obtener el pip más reciente
+Cancelling safely — nothing half-done is kept ¦ Annulation en toute sécurité — rien d'inachevé n'est conservé ¦ Cancelando con seguridad — no se conserva nada a medias
+Checking installed components ¦ Vérification des composants installés ¦ Comprobando los componentes instalados
+Checking the new Python ¦ Vérification du nouveau Python ¦ Comprobando el nuevo Python
+Checking this computer ¦ Vérification de cet ordinateur ¦ Comprobando este equipo
+Downloading verified components ¦ Téléchargement des composants vérifiés ¦ Descargando componentes verificados
+Fingerprint OK ¦ Empreinte correcte ¦ Huella correcta
+Installing components ¦ Installation des composants ¦ Instalando componentes
+Components installed ¦ Composants installés ¦ Componentes instalados
+Loading the packet engine ¦ Chargement du moteur de paquets ¦ Cargando el motor de paquetes
+Looking at your network adapters ¦ Examen de vos cartes réseau ¦ Examinando sus adaptadores de red
+Restoring pip from the copy bundled with Python ¦ Restauration de pip à partir de la copie fournie avec Python ¦ Restaurando pip desde la copia incluida con Python
+Reusing the Python 3.14 already on this computer (it is not modified) ¦ Réutilisation du Python 3.14 déjà présent sur cet ordinateur (il n'est pas modifié) ¦ Reutilizando el Python 3.14 que ya está en este equipo (no se modifica)
+Running MiniWireshark's self-test in the new environment ¦ Autotest de MiniWireshark dans le nouvel environnement ¦ Ejecutando la autoprueba de MiniWireshark en el nuevo entorno
+Setup could not finish ¦ L'installation n'a pas pu se terminer ¦ La instalación no pudo terminar
+Starting inside the private Python ¦ Démarrage dans le Python privé ¦ Iniciando dentro del Python privado
+Switching to the new environment ¦ Passage au nouvel environnement ¦ Cambiando al nuevo entorno
+The private Python is missing or damaged — rebuilding it ¦ Le Python privé est absent ou endommagé — reconstruction ¦ El Python privado falta o está dañado — reconstruyéndolo
+Unpacking the private Python ¦ Décompression du Python privé ¦ Descomprimiendo el Python privado
+Updating pip from the copy bundled with Python ¦ Mise à jour de pip à partir de la copie fournie avec Python ¦ Actualizando pip desde la copia incluida con Python
+(could not decode) ¦ (décodage impossible) ¦ (no se pudo decodificar)
+Active scanning ¦ Analyse active ¦ Exploración activa
+All packets as CSV ¦ Tous les paquets en CSV ¦ Todos los paquetes en CSV
+Asking the connected helpers ¦ Interrogation des assistants connectés ¦ Consultando a los ayudantes conectados
+Asking your router about port forwarding ¦ Interrogation de votre box sur les redirections de ports ¦ Consultando a su router sobre la redirección de puertos
+Beginner shows the essentials. Advanced adds the Connections, Remote hosts and Packets tabs, technical columns and filter expressions. Same data either way. ¦ Débutant montre l'essentiel. Avancé ajoute les onglets Connexions, Hôtes distants et Paquets, les colonnes techniques et les expressions de filtre. Mêmes données dans les deux cas. ¦ Principiante muestra lo esencial. Avanzado añade las pestañas Conexiones, Equipos remotos y Paquetes, columnas técnicas y expresiones de filtro. Los mismos datos en ambos casos.
+Cached copy was damaged; will download again. ¦ La copie en cache était endommagée ; nouveau téléchargement. ¦ La copia en caché estaba dañada; se volverá a descargar.
+Check for updates ¦ Rechercher des mises à jour ¦ Buscar actualizaciones
+Check the router's port forwarding? ¦ Vérifier les redirections de ports de la box ? ¦ ¿Comprobar la redirección de puertos del router?
+Checking every component ¦ Vérification de chaque composant ¦ Comprobando cada componente
+Clear everything? ¦ Tout effacer ? ¦ ¿Borrarlo todo?
+Comparing sessions needs the saved history. Turn it on in Settings → History. ¦ Comparer des sessions nécessite l'historique enregistré. Activez-le dans Paramètres → Historique. ¦ Comparar sesiones requiere el historial guardado. Actívelo en Ajustes → Historial.
+Connections as CSV ¦ Connexions en CSV ¦ Conexiones en CSV
+Copy error ¦ Erreur de copie ¦ Error al copiar
+Data folder ¦ Dossier des données ¦ Carpeta de datos
+Data pack ¦ Pack de données ¦ Paquete de datos
+Debug bundle ¦ Paquet de débogage ¦ Paquete de depuración
+Demo Mode ¦ Mode démo ¦ Modo demo
+Demo Mode ended — all demo data was discarded. ¦ Mode démo terminé — toutes les données de démo ont été supprimées. ¦ Modo demo terminado — se descartaron todos los datos de demostración.
+Demo Mode stops live capture and shows simulated data instead. Your live data on screen will be cleared (save it first if you want it). Continue? ¦ Le mode démo arrête la capture en direct et affiche des données simulées. Vos données réelles à l'écran seront effacées (enregistrez-les d'abord si vous voulez les garder). Continuer ? ¦ El modo demo detiene la captura en directo y muestra datos simulados. Sus datos reales en pantalla se borrarán (guárdelos antes si los quiere). ¿Continuar?
+Device inventory (printable) ¦ Inventaire des appareils (imprimable) ¦ Inventario de dispositivos (para imprimir)
+Device report ¦ Rapport d'appareil ¦ Informe del dispositivo
+Device report (HTML) ¦ Rapport d'appareil (HTML) ¦ Informe del dispositivo (HTML)
+Devices as CSV ¦ Appareils en CSV ¦ Dispositivos en CSV
+Discard changes? ¦ Abandonner les modifications ? ¦ ¿Descartar los cambios?
+Everything as JSON ¦ Tout en JSON ¦ Todo en JSON
+Everything you changed about device identities in this session. Undo any of them; the packets and observations themselves are never changed. ¦ Tout ce que vous avez modifié dans l'identité des appareils pendant cette session. Annulez ce que vous voulez ; les paquets et observations eux-mêmes ne sont jamais modifiés. ¦ Todo lo que cambió en la identidad de los dispositivos en esta sesión. Deshaga lo que quiera; los paquetes y observaciones nunca se modifican.
+Expected / known ¦ Attendu / connu ¦ Esperado / conocido
+Explore every tab with simulated, clearly labelled sample data. No real capture happens and nothing mixes with your real session. ¦ Explorez chaque onglet avec des données d'exemple simulées et clairement signalées. Aucune vraie capture n'a lieu et rien ne se mélange à votre vraie session. ¦ Explore cada pestaña con datos de ejemplo simulados y claramente señalados. No se captura nada real y nada se mezcla con su sesión real.
+Export CSV ¦ Exporter en CSV ¦ Exportar CSV
+Export error ¦ Erreur d'export ¦ Error al exportar
+Folder for the offline kit ¦ Dossier du kit hors ligne ¦ Carpeta del kit sin conexión
+Forget network ¦ Oublier le réseau ¦ Olvidar la red
+Forget this network? If you join it again it starts in Quiet Mode. ¦ Oublier ce réseau ? Si vous le rejoignez à nouveau, il démarrera en mode discret. ¦ ¿Olvidar esta red? Si vuelve a conectarse, empezará en modo silencioso.
+Forget what's normal for every device? Traffic-spike alerts pause until each device has been observed again. ¦ Oublier l'habitude de chaque appareil ? Les alertes de pic sont suspendues jusqu'à ce que chaque appareil soit de nouveau observé. ¦ ¿Olvidar lo normal de cada dispositivo? Las alertas de picos se pausan hasta volver a observar cada dispositivo.
+Full report (HTML) ¦ Rapport complet (HTML) ¦ Informe completo (HTML)
+Health checks send a few tiny test connections, so they only run while watching live with Active Scanning on (not in Quiet Mode). ¦ Les vérifications de santé envoient quelques minuscules connexions de test : elles ne tournent que pendant l'observation en direct avec l'analyse active (pas en mode discret). ¦ Las comprobaciones de salud envían unas pocas conexiones de prueba diminutas, así que solo se ejecutan al observar en directo con la exploración activa (no en modo silencioso).
+Help & glossary ¦ Aide et glossaire ¦ Ayuda y glosario
+Hide the inspector (F2 shows it again) ¦ Masquer l'inspecteur (F2 le réaffiche) ¦ Ocultar el inspector (F2 lo vuelve a mostrar)
+History is off, but an old history file exists. Delete it? ¦ L'historique est désactivé, mais un ancien fichier d'historique existe. Le supprimer ? ¦ El historial está desactivado, pero existe un archivo de historial antiguo. ¿Borrarlo?
+Load session error ¦ Erreur de chargement de session ¦ Error al cargar la sesión
+Load session ¦ Charger une session ¦ Cargar sesión
+Mask IP and hardware addresses (recommended) ¦ Masquer les adresses IP et matérielles (recommandé) ¦ Ocultar direcciones IP y físicas (recomendado)
+Mute alert type ¦ Masquer le type d'alerte ¦ Silenciar el tipo de alerta
+Network health report (HTML) ¦ Rapport de santé du réseau (HTML) ¦ Informe de salud de la red (HTML)
+Networks MiniWireshark has seen. Active scanning (discovery probes and health checks) only runs on networks you trust. ¦ Réseaux vus par MiniWireshark. L'analyse active (sondes de découverte et vérifications de santé) ne tourne que sur les réseaux de confiance. ¦ Redes que ha visto MiniWireshark. La exploración activa (sondas de descubrimiento y comprobaciones de salud) solo se ejecuta en redes de confianza.
+Never merge ¦ Ne jamais fusionner ¦ No fusionar nunca
+New session (stop → clear) ¦ Nouvelle session (arrêter → effacer) ¦ Nueva sesión (detener → borrar)
+New shortcut ¦ Nouveau raccourci ¦ Nuevo atajo
+No devices yet. ¦ Pas encore d'appareils. ¦ Aún no hay dispositivos.
+No matches found. Tip: try device:, site:, ip:, port: or alert: ¦ Aucun résultat. Astuce : essayez device:, site:, ip:, port: ou alert: ¦ Sin resultados. Consejo: pruebe device:, site:, ip:, port: o alert:
+No packets to save yet. ¦ Pas encore de paquets à enregistrer. ¦ Aún no hay paquetes que guardar.
+No settings match that search. ¦ Aucun paramètre ne correspond à cette recherche. ¦ Ningún ajuste coincide con esa búsqueda.
+No timed lookups yet ¦ Pas encore de recherche chronométrée ¦ Aún no hay búsquedas cronometradas
+No update source is configured. If you host this script's releases on GitHub, set “owner/repo” in Settings → Updates & Dependencies — MiniWireshark never guesses one. ¦ Aucune source de mises à jour n'est configurée. Si vous publiez ce script sur GitHub, indiquez « propriétaire/dépôt » dans Paramètres → Mises à jour — MiniWireshark n'en devine jamais. ¦ No hay ninguna fuente de actualizaciones configurada. Si publica este script en GitHub, indique «propietario/repositorio» en Ajustes → Actualizaciones — MiniWireshark nunca adivina una.
+No website names were seen for this address. ¦ Aucun nom de site n'a été vu pour cette adresse. ¦ No se vio ningún nombre de sitio para esta dirección.
+Nothing to show yet — start watching and browse for a bit. ¦ Rien à afficher pour l'instant — commencez à observer et naviguez un peu. ¦ Aún no hay nada que mostrar — empiece a observar y navegue un poco.
+Nothing to undo — you haven't changed any device identities in this session. ¦ Rien à annuler — vous n'avez modifié aucune identité d'appareil dans cette session. ¦ Nada que deshacer — no ha cambiado ninguna identidad de dispositivo en esta sesión.
+Online country lookup is off. The test sends one well-known public address (8.8.8.8) to the lookup service. Run the test? ¦ La recherche de pays en ligne est désactivée. Le test envoie une adresse publique bien connue (8.8.8.8) au service de recherche. Lancer le test ? ¦ La búsqueda de país en línea está desactivada. La prueba envía una dirección pública conocida (8.8.8.8) al servicio de búsqueda. ¿Ejecutar la prueba?
+Open PCAP / PCAPNG file ¦ Ouvrir un fichier PCAP / PCAPNG ¦ Abrir archivo PCAP / PCAPNG
+Open last autosave ¦ Ouvrir la dernière sauvegarde automatique ¦ Abrir el último guardado automático
+Open log ¦ Ouvrir le journal ¦ Abrir el registro
+Open the report now? ¦ Ouvrir le rapport maintenant ? ¦ ¿Abrir el informe ahora?
+Optional (advanced): only CAPTURE packets matching a BPF filter, e.g. “host 192.168.1.20”. Leave empty to see everything. For viewing, use the display filters on the Packets tab instead. ¦ Facultatif (avancé) : ne CAPTURER que les paquets correspondant à un filtre BPF, par ex. « host 192.168.1.20 ». Laissez vide pour tout voir. Pour l'affichage, utilisez plutôt les filtres de l'onglet Paquets. ¦ Opcional (avanzado): solo CAPTURAR los paquetes que coincidan con un filtro BPF, p. ej. «host 192.168.1.20». Déjelo vacío para verlo todo. Para la vista, use los filtros de la pestaña Paquetes.
+Packets as .pcap ¦ Paquets en .pcap ¦ Paquetes en .pcap
+Packets in current view as CSV ¦ Paquets de la vue actuelle en CSV ¦ Paquetes de la vista actual en CSV
+Press the new key combination now⏎(Esc to cancel) ¦ Appuyez sur la nouvelle combinaison⏎(Échap pour annuler) ¦ Pulse la nueva combinación⏎(Esc para cancelar)
+Preview — this is exactly what will be saved. It never contains packets or captured contents. ¦ Aperçu — c'est exactement ce qui sera enregistré. Il ne contient jamais de paquets ni de contenu capturé. ¦ Vista previa — esto es exactamente lo que se guardará. Nunca contiene paquetes ni contenido capturado.
+Quiet Mode ¦ Mode discret ¦ Modo silencioso
+Quiet Mode is on. This test sends a tiny amount of traffic (you asked for it). Run it anyway? ¦ Le mode discret est actif. Ce test envoie une toute petite quantité de trafic (à votre demande). Le lancer quand même ? ¦ El modo silencioso está activo. Esta prueba envía una cantidad mínima de tráfico (usted lo pidió). ¿Ejecutarla de todos modos?
+Reinstall/upgrade the packet capture engine (scapy) and optional helpers now? This needs an Internet connection and may take a minute. MiniWireshark keeps running. ¦ Réinstaller / mettre à jour le moteur de capture (scapy) et les composants facultatifs maintenant ? Il faut une connexion Internet et cela peut prendre une minute. MiniWireshark continue de fonctionner. ¦ ¿Reinstalar / actualizar ahora el motor de captura (scapy) y los componentes opcionales? Necesita conexión a Internet y puede tardar un minuto. MiniWireshark sigue funcionando.
+Remove helper ¦ Supprimer l'assistant ¦ Quitar el ayudante
+Remove this connection? Its password is deleted too. What it reported this session stays visible until you clear. ¦ Supprimer cette connexion ? Son mot de passe est aussi supprimé. Ce qu'elle a rapporté pendant cette session reste visible jusqu'à ce que vous effaciez. ¦ ¿Quitar esta conexión? También se borra su contraseña. Lo que informó en esta sesión sigue visible hasta que borre.
+Report error ¦ Erreur de rapport ¦ Error del informe
+Report saved ¦ Rapport enregistré ¦ Informe guardado
+Restart MiniWireshark ¦ Redémarrer MiniWireshark ¦ Reiniciar MiniWireshark
+Restore every setting to its default?⏎⏎Your captured data isn't affected. ¦ Rétablir tous les paramètres par défaut ?⏎⏎Vos données capturées ne sont pas touchées. ¦ ¿Restablecer todos los ajustes a sus valores predeterminados?⏎⏎Sus datos capturados no se ven afectados.
+Return to live capture ¦ Revenir à la capture en direct ¦ Volver a la captura en directo
+Router check done — see the Security tab. ¦ Vérification de la box terminée — voir l'onglet Sécurité. ¦ Comprobación del router terminada — vea la pestaña Seguridad.
+Router port forwarding ¦ Redirections de ports de la box ¦ Redirección de puertos del router
+Save .pcap ¦ Enregistrer en .pcap ¦ Guardar .pcap
+Save error ¦ Erreur d'enregistrement ¦ Error al guardar
+Save session error ¦ Erreur d'enregistrement de session ¦ Error al guardar la sesión
+Save session ¦ Enregistrer la session ¦ Guardar sesión
+Saved history is off. Turn it on in Settings → History to keep events from earlier sessions. ¦ L'historique enregistré est désactivé. Activez-le dans Paramètres → Historique pour garder les événements des sessions précédentes. ¦ El historial guardado está desactivado. Actívelo en Ajustes → Historial para conservar los eventos de sesiones anteriores.
+Search devices, names, MACs, IPs, vendors, websites, remote hosts, countries, providers, alerts, timeline and ports. Tokens: device: site: ip: port: alert: (Ctrl+F) ¦ Rechercher appareils, noms, MAC, IP, fabricants, sites, hôtes distants, pays, fournisseurs, alertes, chronologie et ports. Mots-clés : device: site: ip: port: alert: (Ctrl+F) ¦ Buscar dispositivos, nombres, MAC, IP, fabricantes, sitios, equipos remotos, países, proveedores, alertas, cronología y puertos. Palabras clave: device: site: ip: port: alert: (Ctrl+F)
+Security report (HTML) ¦ Rapport de sécurité (HTML) ¦ Informe de seguridad (HTML)
+Select a device in the Devices tab first. ¦ Sélectionnez d'abord un appareil dans l'onglet Appareils. ¦ Seleccione primero un dispositivo en la pestaña Dispositivos.
+Select one device (to choose what to merge it with) or two devices (Ctrl+click), then click Merge. ¦ Sélectionnez un appareil (pour choisir avec quoi le fusionner) ou deux appareils (Ctrl+clic), puis cliquez sur Fusionner. ¦ Seleccione un dispositivo (para elegir con cuál fusionarlo) o dos (Ctrl+clic) y pulse Fusionar.
+Sends each remote IP address (never your own devices, never packet contents) to a public geolocation service to find its country. Off by default. The offline database (Settings → Privacy) needs no online lookups. ¦ Envoie chaque adresse IP distante (jamais vos propres appareils, jamais le contenu des paquets) à un service public de géolocalisation pour trouver son pays. Désactivé par défaut. La base hors ligne (Paramètres → Confidentialité) n'a besoin d'aucune recherche en ligne. ¦ Envía cada dirección IP remota (nunca sus dispositivos, nunca contenido de paquetes) a un servicio público de geolocalización para saber su país. Desactivado por defecto. La base de datos sin conexión (Ajustes → Privacidad) no necesita búsquedas en línea.
+Settings folder ¦ Dossier des paramètres ¦ Carpeta de ajustes
+Shareable report (personal details hidden) ¦ Rapport partageable (détails personnels masqués) ¦ Informe para compartir (datos personales ocultos)
+Show what changed between two sessions. ¦ Montrer ce qui a changé entre deux sessions. ¦ Mostrar qué cambió entre dos sesiones.
+Signed data pack ¦ Pack de données signé ¦ Paquete de datos firmado
+Something went wrong ¦ Une erreur s'est produite ¦ Algo salió mal
+Startup error ¦ Erreur au démarrage ¦ Error al iniciar
+There is no other device this one can be merged with. ¦ Il n'y a aucun autre appareil avec lequel fusionner celui-ci. ¦ No hay otro dispositivo con el que fusionar este.
+There is only one saved session so far — come back after the next one. ¦ Il n'y a qu'une session enregistrée pour l'instant — revenez après la prochaine. ¦ Por ahora solo hay una sesión guardada — vuelva después de la próxima.
+There's no single related item for this alert. ¦ Cette alerte ne concerne pas un élément unique. ¦ Esta alerta no tiene un único elemento relacionado.
+These two can't be merged (one is marked “never merge”, or one is from a saved session). ¦ Ces deux-là ne peuvent pas être fusionnés (l'un est marqué « ne jamais fusionner » ou provient d'une session enregistrée). ¦ Estos dos no se pueden fusionar (uno está marcado «no fusionar nunca» o es de una sesión guardada).
+This alert isn't about one device; use “Mute this type” instead. ¦ Cette alerte ne concerne pas un seul appareil ; utilisez plutôt « Masquer ce type ». ¦ Esta alerta no trata de un solo dispositivo; use «Silenciar este tipo».
+This banner always tells the truth about whether MiniWireshark is sending discovery probes and health checks on your network or only listening. It can never be hidden — that's a transparency guarantee, not a setting. ¦ Ce bandeau dit toujours la vérité : MiniWireshark envoie-t-il des sondes de découverte et des vérifications de santé sur votre réseau, ou écoute-t-il seulement ? Il ne peut jamais être masqué — c'est une garantie de transparence, pas un réglage. ¦ Esta franja siempre dice la verdad sobre si MiniWireshark envía sondas de descubrimiento y comprobaciones de salud en su red o solo escucha. Nunca se puede ocultar — es una garantía de transparencia, no un ajuste.
+This check needs Active Mode on a network you've marked as yours, while watching live (and the kill switch off). ¦ Cette vérification nécessite le mode actif sur un réseau marqué comme vôtre, pendant l'observation en direct (et l'arrêt d'urgence désactivé). ¦ Esta comprobación necesita el modo activo en una red marcada como suya, observando en directo (y el interruptor de corte desactivado).
+This clears all packets, devices, websites, connections, alerts and the timeline from this session. Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. ¿Continuar?
+This preset uses an advanced expression; switch to Advanced view to see it. ¦ Ce préréglage utilise une expression avancée ; passez en vue avancée pour la voir. ¦ Este ajuste usa una expresión avanzada; cambie a la vista avanzada para verla.
+Trust / untrust ¦ Faire confiance / retirer ¦ Confiar / dejar de confiar
+Trust this certificate? ¦ Faire confiance à ce certificat ? ¦ ¿Confiar en este certificado?
+Type the address first. ¦ Saisissez d'abord l'adresse. ¦ Escriba primero la dirección.
+Undo selected ¦ Annuler la sélection ¦ Deshacer lo seleccionado
+Update available ¦ Mise à jour disponible ¦ Actualización disponible
+Update rolled back ¦ Mise à jour annulée ¦ Actualización revertida
+What this computer can and can't see. Click for the full coverage report. ¦ Ce que cet ordinateur peut voir ou non. Cliquez pour le rapport de couverture complet. ¦ Lo que este equipo puede y no puede ver. Haga clic para el informe de cobertura completo.
+Yes = delete ALL stored history.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
+You have unsaved changes. Close without saving? ¦ Vous avez des modifications non enregistrées. Fermer sans enregistrer ? ¦ Tiene cambios sin guardar. ¿Cerrar sin guardar?
+Your Python is managed by the operating system. Install the missing components into it anyway (--break-system-packages)? ¦ Votre Python est géré par le système d'exploitation. Y installer quand même les composants manquants (--break-system-packages) ? ¦ Su Python lo gestiona el sistema operativo. ¿Instalar igualmente los componentes que faltan (--break-system-packages)?
+Your device corrections (undo) ¦ Vos corrections d'appareils (annuler) ¦ Sus correcciones de dispositivos (deshacer)
+Your identity corrections ¦ Vos corrections d'identité ¦ Sus correcciones de identidad
+Your networks ¦ Vos réseaux ¦ Sus redes
+now (green = online) ¦ maintenant (vert = en ligne) ¦ ahora (verde = conectado)
+waiting to retry download ¦ en attente d'un nouvel essai de téléchargement ¦ esperando para reintentar la descarga
+Stopped watching. ¦ Observation arrêtée. ¦ Observación detenida.
+Unsaved changes ¦ Modifications non enregistrées ¦ Cambios sin guardar
+This is mine ¦ C'est à moi ¦ Es mío
+Settings saved. ¦ Paramètres enregistrés. ¦ Ajustes guardados.
+Some settings need attention ¦ Certains paramètres demandent votre attention ¦ Algunos ajustes requieren atención
+Country lookup can't reach any service. ¦ La recherche de pays ne peut joindre aucun service. ¦ La búsqueda de país no puede contactar con ningún servicio.
+Marked as expected — I won't alert on this again. ¦ Marqué comme attendu — je ne signalerai plus cela. ¦ Marcado como esperado — no volveré a avisar de esto.
+The capture engine isn't available. ¦ Le moteur de capture n'est pas disponible. ¦ El motor de captura no está disponible.
+Testing country lookup ¦ Test de la recherche de pays ¦ Probando la búsqueda de país
+Welcome! I'll pick your network card and start watching. I'll explain everything in plain English. ¦ Bienvenue ! Je vais choisir votre carte réseau et commencer à observer. J'expliquerai tout simplement. ¦ ¡Bienvenido! Elegiré su tarjeta de red y empezaré a observar. Se lo explicaré todo con palabras sencillas.
+Copied to the clipboard. ¦ Copié dans le presse-papiers. ¦ Copiado al portapapeles.
+Refreshing reference data in the background ¦ Actualisation des données de référence en arrière-plan ¦ Actualizando los datos de referencia en segundo plano
+Search results ¦ Résultats de recherche ¦ Resultados de la búsqueda
+This looks like a VPN/tunnel adapter. Traffic may be encrypted inside the tunnel, so I can see less about individual Internet destinations. ¦ Cela ressemble à une carte VPN/tunnel. Le trafic peut être chiffré dans le tunnel, je vois donc moins de détails sur les destinations Internet. ¦ Parece un adaptador de VPN/túnel. El tráfico puede ir cifrado dentro del túnel, así que veo menos sobre los destinos de Internet.
+All alert mutes were cleared. ¦ Toutes les alertes masquées ont été réactivées. ¦ Se reactivaron todas las alertas silenciadas.
+Muted this alert type for that device. ¦ Ce type d'alerte est masqué pour cet appareil. ¦ Se silenció este tipo de alerta para ese dispositivo.
+Repairing dependencies in the background ¦ Réparation des dépendances en arrière-plan ¦ Reparando dependencias en segundo plano
+Switched to Quiet Mode — I stopped sending discovery probes and health checks. I'm still listening normally. ¦ Passé en mode discret — j'ai arrêté les sondes de découverte et les vérifications de santé. J'écoute toujours normalement. ¦ Cambiado a modo silencioso — dejé de enviar sondas de descubrimiento y comprobaciones de salud. Sigo escuchando con normalidad.
+History cleared. ¦ Historique effacé. ¦ Historial borrado.
+That device's history was deleted. ¦ L'historique de cet appareil a été supprimé. ¦ Se borró el historial de ese dispositivo.
+Kill switch on — MiniWireshark sends nothing (watching continues). ¦ Arrêt d'urgence activé — MiniWireshark n'envoie rien (l'observation continue). ¦ Interruptor de corte activado — MiniWireshark no envía nada (la observación continúa).
+Switched to Active Scanning — I'll periodically look for quiet devices on your own network again. ¦ Passé en analyse active — je chercherai de nouveau régulièrement les appareils discrets sur votre réseau. ¦ Cambiado a exploración activa — volveré a buscar periódicamente dispositivos silenciosos en su red.
+MiniWireshark hit an unexpected problem ¦ MiniWireshark a rencontré un problème inattendu ¦ MiniWireshark encontró un problema inesperado
+Getting started automatically — picking your best network card ¦ Démarrage automatique — choix de votre meilleure carte réseau ¦ Empezando automáticamente — eligiendo su mejor tarjeta de red
+Running the built-in self-test ¦ Exécution de l'autotest intégré ¦ Ejecutando la autoprueba integrada
+Learned baselines reset. ¦ Habitudes apprises réinitialisées. ¦ Referencias aprendidas restablecidas.
+Running health checks ¦ Vérifications de santé en cours ¦ Ejecutando comprobaciones de salud
+Getting ready — I'll pick a network card and start watching automatically. ¦ Préparation — je vais choisir une carte réseau et commencer à observer automatiquement. ¦ Preparando — elegiré una tarjeta de red y empezaré a observar automáticamente.
+"""
+
+I18N = {"fr": {}, "es": {}}
+I18N_LOCALES = ("en", "fr", "es")
+
+
+def _i18n_load(text=None):
+    """Parse the catalog. Returns a list of problems (empty when clean) so
+    the self-test can check it; the tables are filled either way."""
+    problems = []
+    tables = {"fr": {}, "es": {}}
+    for n, line in enumerate((text or I18N_CATALOG).splitlines(), 1):
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split(I18N_SEP)
+        if len(parts) != 3 or not all(p.strip() for p in parts):
+            problems.append(f"line {n}: needs English ¦ French ¦ Spanish")
+            continue
+        en, fr, es = (p.replace("\u23ce", "\n") for p in parts)
+        if en in tables["fr"]:
+            problems.append(f"line {n}: duplicate entry {en!r}")
+        for code, val in (("fr", fr), ("es", es)):
+            if set(re.findall(r"\{\w*\}", en)) != \
+                    set(re.findall(r"\{\w*\}", val)):
+                problems.append(f"line {n}: placeholders differ in {code}")
+            tables[code][en] = val
+    I18N["fr"], I18N["es"] = tables["fr"], tables["es"]
+    return problems
+
+
+_i18n_load()
+
+# Dynamic strings: (English pattern, French, Spanish); groups are kept.
+I18N_PATTERNS = [
+    (r"(\d[\d,]*) shown", r"\1 affichés", r"\1 mostrados"),
+    (r"(\d[\d,]*) of (\d[\d,]*) shown", r"\1 sur \2 affichés",
+     r"\1 de \2 mostrados"),
+    (r"(\d[\d,]*) shown · (\d[\d,]*) in memory",
+     r"\1 affichés · \2 en mémoire", r"\1 mostrados · \2 en memoria"),
+    (r"(\d[\d,]*) events? this session", r"\1 événements cette session",
+     r"\1 eventos en esta sesión"),
+    (r"(\d[\d,]*) devices?", r"\1 appareils", r"\1 dispositivos"),
+    (r"(\d[\d,]*) websites?", r"\1 sites web", r"\1 sitios web"),
+    (r"(\d[\d,]*) sites?", r"\1 sites", r"\1 sitios"),
+    (r"(\d[\d,]*) hits?", r"\1 visites", r"\1 visitas"),
+    (r"(\d[\d,]*) connections?", r"\1 connexions", r"\1 conexiones"),
+    (r"(\d[\d,]*) alerts?", r"\1 alertes", r"\1 alertas"),
+    (r"(\d[\d,]*) packets?", r"\1 paquets", r"\1 paquetes"),
+    (r"(\d[\d,]*) online", r"\1 en ligne", r"\1 conectados"),
+    (r"(\d[\d,]*) sent · (\d[\d,]*) blocked", r"\1 envoyés · \2 bloqués",
+     r"\1 enviados · \2 bloqueados"),
+    (r"(\d+) new devices? · (\d+) new websites?(\s+)\(click for details\)",
+     r"\1 nouveaux appareils · \2 nouveaux sites\3(cliquez pour les détails)",
+     r"\1 dispositivos nuevos · \2 sitios nuevos\3(clic para detalles)"),
+    (r"Help / About — MiniWireshark (\S+)", r"Aide / À propos — MiniWireshark \1",
+     r"Ayuda / Acerca de — MiniWireshark \1"),
+    (r"Network cards re-detected \((\d+) found\)\.",
+     r"Cartes réseau redétectées (\1 trouvées).",
+     r"Tarjetas de red detectadas de nuevo (\1 encontradas)."),
+    (r"Step (\d+) of (\d+)", r"Étape \1 sur \2", r"Paso \1 de \2"),
+    (r"Examples:(\s+.+)", r"Exemples :\1", r"Ejemplos:\1"),
+    # explanations built from live measurements
+    (r"What to try: (.+)", "À essayer : {t1}", "Qué probar: {t1}"),
+    (r"For: (.+)", "Pour : {t1}", "A favor: {t1}"),
+    (r"Against: (.+)", "Contre : {t1}", "En contra: {t1}"),
+    (r"Likely culprit: (.+?) — (.+)", "Cause probable : {t1} — {t2}",
+     "Causa probable: {t1} — {t2}"),
+    (r"Signal (-?\d+) dBm \((\w+)\)", r"Signal \1 dBm ({t2})",
+     r"Señal \1 dBm ({t2})"),
+    (r"(-?\d+) dBm \((\w+)\), link (.+?), channel (.+?)\. (.+)",
+     r"\1 dBm ({t2}), lien \3, canal \4. {t5}",
+     r"\1 dBm ({t2}), enlace \3, canal \4. {t5}"),
+    (r"Router answered in (\d+) ms", r"La box a répondu en \1 ms",
+     r"El router respondió en \1 ms"),
+    (r"Typical lookup (\d+) ms over (\d+) lookups",
+     r"Recherche habituelle \1 ms sur \2 recherches",
+     r"Búsqueda típica \1 ms en \2 búsquedas"),
+    (r"Typical lookup (\d+) ms, (\S+) failed",
+     r"Recherche habituelle \1 ms, \2 en échec",
+     r"Búsqueda típica \1 ms, \2 fallidas"),
+    (r"Typical lookup (\d+) ms", r"Recherche habituelle \1 ms",
+     r"Búsqueda típica \1 ms"),
+    (r"Typical lookup (\d+) ms over (\d+) recent lookups; (\S+) failed\.",
+     r"Recherche habituelle \1 ms sur \2 recherches récentes ; \3 en échec.",
+     r"Búsqueda típica \1 ms en \2 búsquedas recientes; \3 fallidas."),
+    (r"Connections take (\d+) ms to open",
+     r"Les connexions mettent \1 ms à s'ouvrir",
+     r"Las conexiones tardan \1 ms en abrirse"),
+    (r"Connections open in (\d+) ms", r"Les connexions s'ouvrent en \1 ms",
+     r"Las conexiones se abren en \1 ms"),
+    (r"(\S+) of data was re-sent", r"\1 des données ont été renvoyées",
+     r"se reenvió el \1 de los datos"),
+    (r"Only (\S+) re-sent", r"Seulement \1 renvoyées",
+     r"Solo se reenvió el \1"),
+    (r"Typical (\d+) ms, slowest tenth (\d+) ms, from (\d+) connection "
+     r"handshakes \(measured passively\)\.",
+     r"Habituel \1 ms, dixième le plus lent \2 ms, sur \3 ouvertures de "
+     r"connexion (mesure passive).",
+     r"Típico \1 ms, la décima parte más lenta \2 ms, de \3 aperturas de "
+     r"conexión (medido pasivamente)."),
+    (r"(.+) is using the most \((\d+%) of what I can see\)\.",
+     r"{t1} utilise le plus (\2 de ce que je vois).",
+     r"{t1} es el que más usa (\2 de lo que veo)."),
+    (r"(.+) used (.+) in the last (.+) \((\d+%) of what I can see\)\.",
+     r"{t1} a utilisé \2 ces dernières \3 (\4 de ce que je vois).",
+     r"{t1} usó \2 en los últimos \3 (\4 de lo que veo)."),
+    (r"Data is arriving from the Internet \((.+) so far\), so it's "
+     r"reachable\.",
+     r"Des données arrivent d'Internet (\1 jusqu'ici) : il est joignable.",
+     r"Llegan datos de Internet (\1 hasta ahora), así que es accesible."),
+    (r"Your router \((.+)\) is visible on the network \(passive\)\.",
+     r"Votre box (\1) est visible sur le réseau (passif).",
+     r"Su router (\1) es visible en la red (pasivo)."),
+    (r"One DHCP server \((.+)\)\.", r"Un seul serveur DHCP (\1).",
+     r"Un solo servidor DHCP (\1)."),
+    (r"(.+) on this computer is using most of the connection",
+     r"\1 sur cet ordinateur utilise l'essentiel de la connexion",
+     r"\1 en este equipo usa casi toda la conexión"),
+    (r"Pause (.+)'s downloads or updates and try again\.",
+     r"Mettez en pause les téléchargements ou mises à jour de \1 et "
+     r"réessayez.",
+     r"Pause las descargas o actualizaciones de \1 y vuelva a probar."),
+    (r"(.+) is using a lot of the connection",
+     r"{t1} utilise une grande part de la connexion",
+     r"{t1} usa gran parte de la conexión"),
+    (r"Check what (.+) is doing \(streaming, backups, updates\)\.",
+     r"Vérifiez ce que fait {t1} (streaming, sauvegardes, mises à jour).",
+     r"Compruebe qué hace {t1} (streaming, copias de seguridad, "
+     r"actualizaciones)."),
+    (r"(.+)/s right now", r"\1/s en ce moment", r"\1/s ahora mismo"),
+    (r"(\d+)\. (.+)", None, None),         # numbered title: translate rest
+]
+_I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
+                     for p, fr, es in I18N_PATTERNS]
+_I18N_CORE = re.compile(
+    r"\A([^A-Za-z0-9\u00c0-\u024f\u201c\"(\u00bf\u00a1]*)(.*?)"
+    r"((?:\.\.\.|[\s:\u2026\u25be\u203a])*)\Z", re.S)
+I18N_REVERSE = {}          # shown translation -> English source
+_I18N_CACHE = {}
+
+
+def _i18n_lookup(s, table, loc):
+    hit = table.get(s)
+    if hit is not None:
+        return hit
+    tries = [("", s, "")]
+    m = _I18N_CORE.match(s)
+    if m and m.group(2) and (m.group(1) or m.group(3)):
+        tries.append((m.group(1), m.group(2), m.group(3)))
+        hit = table.get(m.group(2))
+        if hit is not None:
+            return m.group(1) + hit + m.group(3)
+    for pre, core, post in tries:
+        for rx, fr, es in _I18N_PATTERNS_RX:
+            mm = rx.match(core)
+            if not mm:
+                continue
+            tpl = fr if loc == "fr" else es
+            if tpl is None:              # numbered title: "3. Something"
+                rest = _i18n_lookup(mm.group(2), table, loc)
+                if rest is None:
+                    break
+                return f"{pre}{mm.group(1)}. {rest}{post}"
+            out = mm.expand(tpl)
+            if "{t" in out:              # {tN}: group N, itself translated
+                for i, g in enumerate(mm.groups(), 1):
+                    tok = "{t%d}" % i
+                    if tok in out:
+                        sub = g or ""
+                        if sub:
+                            sub = _i18n_lookup(sub, table, loc) or sub
+                        out = out.replace(tok, sub)
+            return pre + out + post
+    # "Title — explanation": both halves known
+    for pre, core, post in tries:
+        if " \u2014 " in core:
+            a, b = core.split(" \u2014 ", 1)
+            ta, tb = table.get(a), _i18n_lookup(b, table, loc)
+            if ta is not None and tb is not None:
+                return f"{pre}{ta} \u2014 {tb}{post}"
+    return None
+
+
+def translate_text(s, locale=None):
+    """English UI text -> the current language (unchanged when English,
+    unknown, or not text)."""
+    loc = locale or CURRENT_LOCALE
+    if loc == "en" or not isinstance(s, str) or not s or len(s) > 2000:
+        return s
+    table = I18N.get(loc)
+    if not table:
+        return s
+    key = (loc, s)
+    out = _I18N_CACHE.get(key)
+    if out is None:
+        out = _i18n_lookup(s, table, loc)
+        if out is None:
+            out = s
+        if len(_I18N_CACHE) > 20000:
+            _I18N_CACHE.clear()
+        _I18N_CACHE[key] = out
+        if out is not s:
+            if len(I18N_REVERSE) > 50000:
+                I18N_REVERSE.clear()
+            I18N_REVERSE[out] = s
+    return out
+
+
+def untranslate_text(s):
+    """Shown text -> its English source (unchanged when not a translation)."""
+    if not isinstance(s, str):
+        return s
+    return I18N_REVERSE.get(s, s)
+
+
+_I18N_KEYS = ("text", "label", "message", "detail", "title")
+_I18N_HOOKED = []
+
+
+def _i18n_cnf(cnf):
+    if not cnf:
+        return cnf
+    hit = [k for k in _I18N_KEYS if isinstance(cnf.get(k), str)]
+    if not hit:
+        return cnf
+    cnf = dict(cnf)
+    for k in hit:
+        cnf[k] = translate_text(cnf[k])
+    return cnf
+
+
+def _i18n_fit_heading(tree, column, text):
+    """Widen a table column so a longer translated heading isn't cut."""
+    try:
+        need = tkfont.nametofont("TkHeadingFont").measure(text) + 18
+        if int(tree.column(column, "width")) < need:
+            tree.column(column, width=need)
+    except (tk.TclError, ValueError, TypeError):
+        pass
+
+
+def install_i18n_hooks():
+    """Route every widget's visible text through translate_text(). Costs one
+    comparison per call while the language is English."""
+    if _I18N_HOOKED:
+        return
+    orig_options = tk.Misc._options
+
+    def _options(self, cnf, kw=None):
+        if CURRENT_LOCALE != "en":
+            try:
+                merged = tk._cnfmerge((cnf, kw)) if kw else tk._cnfmerge(cnf)
+            except (TypeError, AttributeError):
+                return orig_options(self, cnf, kw)
+            if isinstance(merged, dict):
+                return orig_options(self, _i18n_cnf(merged))
+        return orig_options(self, cnf, kw)
+    tk.Misc._options = _options
+
+    orig_title = tk.Wm.wm_title
+
+    def wm_title(self, string=None):
+        if string is not None and CURRENT_LOCALE != "en":
+            string = translate_text(string)
+        return orig_title(self, string)
+    tk.Wm.wm_title = tk.Wm.title = wm_title
+
+    def wrap_kw(cls, name):
+        orig = getattr(cls, name)
+
+        def method(self, *a, **kw):
+            if CURRENT_LOCALE != "en" and isinstance(kw.get("text"), str):
+                src = kw["text"]
+                kw["text"] = translate_text(src)
+                if kw["text"] != src and name == "heading" and a:
+                    out = orig(self, *a, **kw)
+                    _i18n_fit_heading(self, a[0], kw["text"])
+                    return out
+            return orig(self, *a, **kw)
+        method.__doc__ = orig.__doc__
+        setattr(cls, name, method)
+    for cls, name in ((ttk.Notebook, "add"), (ttk.Notebook, "insert"),
+                      (ttk.Notebook, "tab"), (ttk.Treeview, "heading")):
+        wrap_kw(cls, name)
+
+    orig_column = ttk.Treeview.column
+
+    def column(self, col, option=None, **kw):
+        out = orig_column(self, col, option, **kw)
+        if kw.get("width") is not None and CURRENT_LOCALE != "en":
+            try:
+                text = self.heading(col, "text")
+            except tk.TclError:
+                text = ""
+            if text and text != untranslate_text(text):
+                _i18n_fit_heading(self, col, text)
+        return out
+    column.__doc__ = orig_column.__doc__
+    ttk.Treeview.column = column
+
+    # read-only drop-downs: the program's variable keeps the English value,
+    # the box shows (and accepts) the current language
+    orig_combo = ttk.Combobox.__init__
+
+    def combo_init(self, master=None, **kw):
+        var, vals = kw.get("textvariable"), kw.get("values")
+        if not (isinstance(var, tk.StringVar) and
+                not isinstance(var, DisplayVar) and
+                isinstance(vals, (list, tuple)) and vals and
+                all(isinstance(v, str) for v in vals) and
+                str(kw.get("state", "")) == "readonly"):
+            return orig_combo(self, master, **kw)
+        info = {"var": var, "values": list(vals)}
+        shown = tk.StringVar(master, value=translate_text(var.get()))
+        info["shown"] = shown
+
+        def to_var(*_):
+            val = shown.get()
+            for v in info["values"]:
+                if translate_text(v) == val:
+                    val = v
+                    break
+            if var.get() != val:
+                var.set(val)
+
+        def to_shown(*_):
+            val = translate_text(var.get())
+            if shown.get() != val:
+                shown.set(val)
+        shown.trace_add("write", to_var)
+        var.trace_add("write", to_shown)
+        kw["textvariable"] = shown
+        kw["values"] = [translate_text(v) for v in vals]
+        width = kw.get("width")
+        if isinstance(width, int) and width > 0:
+            kw["width"] = max(width, max(len(v) for v in kw["values"]) + 1)
+        orig_combo(self, master, **kw)
+        self._mw_i18n = info
+    combo_init.__doc__ = orig_combo.__doc__
+    ttk.Combobox.__init__ = combo_init
+    _I18N_HOOKED.append(True)
+
+
+def i18n_retranslate(root):
+    """Re-label every open window after the language changes: each shown
+    text goes back to its English source and through the hook again."""
+    count = 0
+    stack = [root]
+    while stack:
+        w = stack.pop()
+        try:
+            stack.extend(w.winfo_children())
+        except tk.TclError:
+            continue
+        try:
+            if isinstance(w, (tk.Tk, tk.Toplevel)):
+                w.title(untranslate_text(w.title()))
+            if isinstance(w, tk.Menu):
+                end = w.index("end")
+                for i in range(0 if end is None else end + 1):
+                    if w.type(i) in ("command", "cascade", "checkbutton",
+                                     "radiobutton"):
+                        lab = w.entrycget(i, "label")
+                        w.entryconfigure(i, label=untranslate_text(lab))
+                continue
+            if isinstance(w, ttk.Notebook):
+                for t in w.tabs():
+                    w.tab(t, text=untranslate_text(w.tab(t, "text")))
+            elif isinstance(w, ttk.Combobox) and \
+                    getattr(w, "_mw_i18n", None):
+                info = w._mw_i18n
+                w.configure(values=[translate_text(v)
+                                    for v in info["values"]])
+                info["shown"].set(translate_text(info["var"].get()))
+            elif isinstance(w, ttk.Treeview):
+                for c in ("#0",) + tuple(w["columns"]):
+                    w.heading(c, text=untranslate_text(w.heading(c, "text")))
+            elif isinstance(w, tk.Canvas):
+                for item in w.find_all():
+                    if w.type(item) == "text":
+                        w.itemconfigure(item, text=untranslate_text(
+                            w.itemcget(item, "text")))
+            keys = w.keys()
+            if "text" in keys and "textvariable" in keys and \
+                    not str(w.cget("textvariable")):
+                cur = w.cget("text")
+                if isinstance(cur, str) and cur:
+                    w.configure(text=untranslate_text(cur))
+                    count += 1
+        except (tk.TclError, TypeError, ValueError):
+            continue
+    return count
+
+
+class DisplayVar(tk.StringVar):
+    """A StringVar for text that is only shown (status lines, card values):
+    whatever is set is shown in the current language. Never use it for a
+    value the program reads back as a setting."""
+
+    def __init__(self, master=None, value=None, name=None):
+        super().__init__(master, translate_text(value)
+                         if isinstance(value, str) else value, name)
+
+    def set(self, value):
+        return super().set(translate_text(value)
+                           if isinstance(value, str) else value)
+
+
+install_i18n_hooks()
 
 
 GLOSSARY = [
@@ -16730,8 +18172,8 @@ SETTINGS_PAGES = [
          {"title": "Language", "controls": [
              {"key": "general.language", "type": "choice",
               "choices": "@locales", "label": "Language",
-              "help": "Only English exists today. The app is built so more "
-                      "languages can be added without changing any code."},
+              "help": "The language of every window, menu and message. "
+                      "English, French and Spanish are included."},
          ]},
      ]},
     {"id": "appearance", "icon": "\U0001F3A8", "title": "Appearance",
@@ -17658,6 +19100,7 @@ class SettingsWindow:
     def _placeholder(self, entry, var, text):
         """Grey hint text inside an empty entry that vanishes on focus."""
         state = {"on": False}
+        text = translate_text(text)
 
         def show(_e=None):
             if not var.get():
@@ -17857,7 +19300,7 @@ class SettingsWindow:
             self._cvd_preview(row)
 
         elif typ == "geo_status":
-            self.geo_var = tk.StringVar(value=self.app._geoip_status_text())
+            self.geo_var = DisplayVar(value=self.app._geoip_status_text())
             lbl = tk.Label(row, textvariable=self.geo_var, bg=t["card_bg"],
                            fg=t["text_fg"], font=self.F_HELP, justify="left",
                            anchor="w", padx=10, pady=8)
@@ -18790,7 +20233,7 @@ class Inspector:
         self.frame = tk.Frame(parent, bg=WHITE, width=self.WIDTH)
         head = tk.Frame(self.frame, bg=WHITE, padx=10, pady=6)
         head.pack(fill="x")
-        self.title_var = tk.StringVar(value="Inspector")
+        self.title_var = DisplayVar(value="Inspector")
         tk.Label(head, textvariable=self.title_var, bg=WHITE, fg="#2b3a56",
                  font=("TkDefaultFont", 11, "bold"), anchor="w",
                  justify="left", wraplength=self.WIDTH - 40).pack(
@@ -19135,7 +20578,7 @@ class DashboardTab(BaseTab):
         tk.Label(outer, text="A quick overview — click any card to open "
                              "the full picture.", bg=WHITE,
                  fg="#666666").pack(anchor="w", pady=(0, 8))
-        self.state_var = tk.StringVar(value="Getting started …")
+        self.state_var = DisplayVar(value="Getting started …")
         self.state_lbl = tk.Label(outer, textvariable=self.state_var,
                                   bg="#eef4fb", fg="#0b5394", anchor="w",
                                   justify="left", wraplength=1100, padx=12,
@@ -19157,7 +20600,7 @@ class DashboardTab(BaseTab):
             tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#888888",
                           font=("TkDefaultFont", 8, "bold"), anchor="w")
             tl.pack(anchor="w")
-            v = tk.StringVar(value="—")
+            v = DisplayVar(value="—")
             vl = tk.Label(card, textvariable=v, bg="#f6f7fa", fg="#222222",
                           font=("TkDefaultFont", 10), justify="left",
                           anchor="w", wraplength=520)
@@ -19180,7 +20623,7 @@ class DashboardTab(BaseTab):
             tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#888888",
                           font=("TkDefaultFont", 8, "bold"), anchor="w")
             tl.pack(anchor="w")
-            v = tk.StringVar(value="—")
+            v = DisplayVar(value="—")
             vl = tk.Label(card, textvariable=v, bg="#f6f7fa", fg="#222222",
                           font=("TkDefaultFont", 12, "bold"), justify="left",
                           anchor="w", wraplength=170)
@@ -20505,7 +21948,7 @@ class RemoteTab(BaseTab):
         e = ttk.Entry(geo, textvariable=self.q_var, width=16)
         e.pack(side="left", padx=4)
         e.bind("<KeyRelease>", lambda ev: self.rebuild())
-        self.status_var = tk.StringVar()
+        self.status_var = DisplayVar()
         tk.Label(self.frame, textvariable=self.status_var, bg=WHITE,
                  fg="#666666", justify="left", anchor="w", wraplength=1100,
                  font=("TkDefaultFont", 9)).pack(fill="x", padx=12)
@@ -20867,7 +22310,7 @@ class MapTab(BaseTab):
                    command=lambda: self.zoom(0.8)).pack(side="right", padx=2)
         ttk.Button(ctrl, text="+", width=3,
                    command=lambda: self.zoom(1.25)).pack(side="right", padx=2)
-        self.info_var = tk.StringVar(value="")
+        self.info_var = DisplayVar(value="")
         tk.Label(self.frame, textvariable=self.info_var, bg=WHITE,
                  fg="#666666", anchor="w", font=("TkDefaultFont", 9)).pack(
             fill="x", padx=12)
@@ -21546,7 +22989,7 @@ class HealthTab(BaseTab):
         ttk.Button(head, text="\U0001F50E Why is it slow?",
                    command=lambda: self.app.investigate("slow")).pack(
             side="right", padx=6)
-        self.note_var = tk.StringVar()
+        self.note_var = DisplayVar()
         tk.Label(outer, textvariable=self.note_var, bg=WHITE, fg="#666666",
                  justify="left", anchor="w", wraplength=1100).pack(
             fill="x", pady=(2, 8))
@@ -21565,8 +23008,8 @@ class HealthTab(BaseTab):
                           font=("TkDefaultFont", 10, "bold"))
             st.pack(side="left")
             tk.Label(row, text=title, bg="#f6f7fa", fg="#222222", width=26,
-                     anchor="w", font=("TkDefaultFont", 10, "bold")).pack(
-                side="left")
+                     anchor="w", justify="left", wraplength=210,
+                     font=("TkDefaultFont", 10, "bold")).pack(side="left")
             ex = tk.Label(row, text="", bg="#f6f7fa", fg="#333333",
                           anchor="w", justify="left", wraplength=560)
             ex.pack(side="left", fill="x", expand=True)
@@ -21577,7 +23020,7 @@ class HealthTab(BaseTab):
         right.pack(side="left", fill="both")
         tk.Label(right, text="Your connection", bg=WHITE, fg="#2b3a56",
                  font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
-        self.info_var = tk.StringVar()
+        self.info_var = DisplayVar()
         tk.Label(right, textvariable=self.info_var, bg=WHITE, fg="#333333",
                  justify="left", anchor="w", wraplength=420,
                  font=("TkFixedFont", 9)).pack(
@@ -22363,7 +23806,7 @@ class PacketsTab(BaseTab):
                    command=self._save_preset).pack(side="left")
         ttk.Button(self.adv_row, text="Delete preset",
                    command=self._delete_preset).pack(side="left", padx=4)
-        self.err_var = tk.StringVar()
+        self.err_var = DisplayVar()
         tk.Label(self.frame, textvariable=self.err_var, bg=WHITE,
                  fg="#a01a08", anchor="w").pack(fill="x", padx=12)
         stat = tk.Frame(self.frame, bg=WHITE, padx=10)
@@ -22376,11 +23819,11 @@ class PacketsTab(BaseTab):
         ttk.Checkbutton(stat, text="Follow newest packet",
                         variable=self.follow_var).pack(side="left",
                                                        padx=(8, 0))
-        self.ind_var = tk.StringVar(value="Display filter: showing "
+        self.ind_var = DisplayVar(value="Display filter: showing "
                                           "everything")
         tk.Label(stat, textvariable=self.ind_var, bg=WHITE, fg="#0b5394",
                  anchor="w").pack(side="left", padx=(16, 0))
-        self.count_var = tk.StringVar()
+        self.count_var = DisplayVar()
         tk.Label(stat, textvariable=self.count_var, bg=WHITE, fg="#888888"
                  ).pack(side="right")
         vert = ttk.PanedWindow(self.frame, orient="vertical")
@@ -23590,7 +25033,7 @@ class MiniWireshark:
         self.mode_ui_var = tk.StringVar(
             value="Beginner" if self.beginner_mode else "Advanced")
         mode_box = ttk.Combobox(header, textvariable=self.mode_ui_var,
-                                values=("Beginner", "Advanced"), width=9,
+                                values=("Beginner", "Advanced"), width=12,
                                 state="readonly")
         mode_box.pack(side="right", padx=(0, 8))
         mode_box.bind("<<ComboboxSelected>>", self._on_ui_mode_change)
@@ -23654,18 +25097,18 @@ class MiniWireshark:
 
         bar = ttk.Frame(self.root, padding=(12, 8, 12, 2))
         bar.pack(fill="x")
-        ttk.Button(bar, text="Session ▾",
+        ttk.Button(bar, text="Session ▾", width=-8,
                    command=self._open_session_menu).pack(side="right")
-        ttk.Button(bar, text="Export ▾",
+        ttk.Button(bar, text="Export ▾", width=-8,
                    command=self._open_export_menu).pack(side="right",
                                                         padx=(0, 6))
-        self.clear_btn = ttk.Button(bar, text=tr("btn_clear"),
+        self.clear_btn = ttk.Button(bar, text=tr("btn_clear"), width=-8,
                                     command=self.clear)
         self.clear_btn.pack(side="right", padx=(0, 6))
         ttk.Label(bar, text="Network card:").pack(side="left")
         self.iface_var = tk.StringVar()
         self.iface_box = ttk.Combobox(bar, textvariable=self.iface_var,
-                                      width=30, state="readonly")
+                                      width=26, state="readonly")
         self.iface_box.pack(side="left", padx=(6, 2))
         self.iface_tip = Tooltip(self.iface_box, "")
         self.iface_box.bind("<<ComboboxSelected>>", self._on_iface_picked)
@@ -23712,7 +25155,7 @@ class MiniWireshark:
         self._bind_inspector()
         self._apply_ui_mode()
 
-        self.status_var = tk.StringVar(
+        self.status_var = DisplayVar(
             value="Getting ready — I'll pick a network card and start "
                   "watching automatically.")
         status = tk.Frame(self.root, bg="#e3e6eb")
@@ -23720,7 +25163,7 @@ class MiniWireshark:
         tk.Label(status, textvariable=self.status_var, anchor="w",
                  fg="#222222", bg="#e3e6eb", padx=10, pady=4).pack(
             side="left", fill="x", expand=True)
-        self.footer_var = tk.StringVar(value="")
+        self.footer_var = DisplayVar(value="")
         foot = tk.Label(status, textvariable=self.footer_var, anchor="e",
                         fg="#666666", bg="#e3e6eb", padx=10, pady=4,
                         cursor="hand2")
@@ -25136,6 +26579,10 @@ class MiniWireshark:
                 tab.apply_mode()
 
     def _apply_locale(self):
+        shown = getattr(self, "_locale_shown", "en")
+        if shown != CURRENT_LOCALE:
+            self._locale_shown = CURRENT_LOCALE
+            i18n_retranslate(self.root)
         try:
             self.hdr_title.configure(text=tr("app_title"))
             self.hdr_subtitle.configure(text=tr("app_subtitle"))
@@ -28694,7 +30141,7 @@ class MiniWireshark:
         ttk.Checkbutton(bar, text="Kill switch: stop everything MiniWireshark "
                                   "sends", variable=kill_var,
                         command=toggle).pack(side="left")
-        sum_var = tk.StringVar()
+        sum_var = DisplayVar()
         tk.Label(bar, textvariable=sum_var, bg=t["tab_bg"],
                  fg=t["muted_fg"]).pack(side="right")
         wrap, tree = make_tree(win, [
@@ -29816,7 +31263,7 @@ class DiagnosticsWindow:
             for label, fn in items:
                 ttk.Button(row, text=label, command=fn).pack(side="left",
                                                              padx=(0, 6))
-        self.result_var = tk.StringVar()
+        self.result_var = DisplayVar()
         tk.Label(self.win, textvariable=self.result_var, bg=t["tab_bg"],
                  fg=t["info_fg"], anchor="w", justify="left",
                  wraplength=720).pack(fill="x", padx=12, pady=(6, 0))
@@ -34146,6 +35593,55 @@ def t_signed_updates_and_packs(ctx):
         .hexdigest()
 
 
+@self_test(slow=False)
+def test_i18n_catalog(ctx):
+    """Languages: the catalog parses cleanly and covers every fixed string
+    of the setup window, Welcome Center, Settings, tour and banners."""
+    assert _i18n_load() == [], _i18n_load()
+    assert len(I18N["fr"]) == len(I18N["es"]) >= 700, len(I18N["fr"])
+    must = []
+    for p in SETTINGS_PAGES:
+        must += [p.get("title"), p.get("blurb")]
+        for sec in p.get("sections", []):
+            must.append(sec.get("title"))
+            for c in sec.get("controls", []):
+                must += [c.get("label"), c.get("help")]
+                if isinstance(c.get("choices"), (list, tuple)):
+                    must += list(c["choices"])
+    must += list(STRINGS["en"].values())
+    for q in QUICK_START:
+        must += [q[0], q[1], q[3]]
+    for _icon, title, text in LoaderWindow.WHATS_NEW:
+        must += [title, text]
+    must += list(RuntimeManager.STAGES) + [v for _k, v in REPAIR_STEPS]
+    must += list(DATA_MODE_TEXT.values())
+    tech = {"DNS", "MB", "ms", "MiniWireshark"}
+    for loc in ("fr", "es"):
+        missing = sorted({s for s in must if isinstance(s, str) and s and
+                          re.sub(r"^[^A-Za-z]+", "", s).strip() not in tech and
+                          re.search(r"[A-Za-z]{2}", s) and
+                          _i18n_lookup(s, I18N[loc], loc) is None})
+        assert not missing, (loc, missing[:8])
+    # icons and punctuation around a label survive; numbers are kept
+    assert translate_text("▶  Start watching", "fr") == \
+        "▶  Commencer à observer"
+    assert translate_text("Network card:", "es") == "Tarjeta de red:"
+    assert translate_text("1,204 shown", "fr") == "1,204 affichés"
+    assert translate_text("3. The Dashboard", "es") == "3. El panel"
+    assert translate_text("For: ◉ Signal -80 dBm (weak)", "fr") == \
+        "Pour : ◉ Signal -80 dBm (faible)"
+    assert translate_text("Start watching", "en") == "Start watching"
+    assert translate_text("my-laptop", "fr") == "my-laptop"   # data stays
+    assert untranslate_text(translate_text("Devices", "fr")) == "Devices"
+    try:
+        assert set_locale("Español") == "es" and CURRENT_LOCALE == "es"
+        assert set_locale("fr") == "fr"
+        assert set_locale("Klingon") == "en"
+    finally:
+        set_locale("English")
+    assert set(LOCALE_NAMES) == set(I18N_LOCALES)
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -34831,6 +36327,54 @@ def _gs_redaction(app, ctx):
     app.data_mode = "idle"
 
 
+def _all_widgets(root):
+    out, stack = [], [root]
+    while stack:
+        w = stack.pop()
+        out.append(w)
+        with contextlib.suppress(tk.TclError):
+            stack.extend(w.winfo_children())
+    return out
+
+
+@gui_test_step("languages: switch to French and Spanish and back")
+def _gs_languages(app, ctx):
+    tab = app.tabs["dash"]
+    english = app.nb.tab(tab.frame, "text")
+    mode = app.mode_ui_var.get()
+    try:
+        app.config.set("general.language", "Français")
+        app._apply_runtime_settings()
+        _gui_pump(app.root, 0.3)
+        fr = app.nb.tab(tab.frame, "text")
+        assert "Tableau de bord" in fr, fr
+        assert app.start_btn.cget("text").endswith("Commencer à observer")
+        # a drop-down shows French while the program keeps English values
+        assert app.mode_ui_var.get() == mode
+        boxes = [w for w in _all_widgets(app.root)
+                 if getattr(w, "_mw_i18n", None) and
+                 w._mw_i18n["var"] is app.mode_ui_var]
+        assert boxes and boxes[0].get() == translate_text(mode, "fr"), \
+            boxes and boxes[0].get()
+        # a status line set later is shown in French too
+        app.status_var.set("Ready. Click “Start watching” when you'd like "
+                           "to begin.")
+        assert app.status_var.get().startswith("Prêt."), \
+            app.status_var.get()
+        app.config.set("general.language", "Español")
+        app._apply_runtime_settings()
+        _gui_pump(app.root, 0.3)
+        assert "Panel" in app.nb.tab(tab.frame, "text")
+        assert boxes[0].get() == translate_text(mode, "es")
+    finally:
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        _gui_pump(app.root, 0.3)
+    assert app.nb.tab(tab.frame, "text") == english
+    assert boxes[0].get() == mode and app.mode_ui_var.get() == mode
+    assert CURRENT_LOCALE == "en"
+
+
 @gui_test_step("network consent: new network is quiet until trusted")
 def _gs_consent(app, ctx):
     root = app.root
@@ -35255,6 +36799,7 @@ def main():
     cfg = AppConfig()
     LEDGER.killed = bool(cfg.get("privacy.kill_switch", False))
     set_colorblind_mode(cfg.get("accessibility.colorblind", "Off"))
+    set_locale(cfg.get("general.language", "English"))
     root = tk.Tk()
     root.title("MiniWireshark")
     root.minsize(640, 520)
