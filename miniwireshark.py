@@ -288,6 +288,9 @@ def _relaunch_elevated():
 
 
 SELF_TEST_MODE = SELF_TEST_FLAG in sys.argv
+GUI_TEST_MODE = "--gui-test" in sys.argv
+BENCH_MODE = "--bench" in sys.argv
+TOOL_MODE = SELF_TEST_MODE or GUI_TEST_MODE or BENCH_MODE
 START_IN_DEMO = DEMO_FLAG in sys.argv
 
 if ELEVATED_FLAG in sys.argv:
@@ -296,7 +299,7 @@ if ELEVATED_FLAG in sys.argv:
 else:
     _ELEV = False
 
-if __name__ == "__main__" and not SELF_TEST_MODE and not _ELEV and \
+if __name__ == "__main__" and not TOOL_MODE and not _ELEV and \
         not os.environ.get(NO_ELEVATE_ENV) and \
         NO_ELEVATE_FLAG not in sys.argv and not is_admin():
     if _relaunch_elevated():
@@ -2615,22 +2618,31 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
 
     if pkt.haslayer(ARP):
         a = pkt[ARP]
-        d["src_ip"], d["dst_ip"] = a.psrc, a.pdst
-        d["src_mac"], d["dst_mac"] = (a.hwsrc or "").lower(), \
-            (a.hwdst or "").lower()
+
+        def sf(v):
+            # malformed ARP (odd hardware/protocol lengths) gives bytes
+            return v if isinstance(v, str) else ""
+        psrc, pdst = sf(a.psrc), sf(a.pdst)
+        hwsrc, hwdst = sf(a.hwsrc).lower(), sf(a.hwdst).lower()
+        if (psrc and ip_obj(psrc) is None) or (pdst and ip_obj(pdst) is None):
+            psrc = pdst = ""
+        d["src_ip"], d["dst_ip"] = psrc, pdst
+        d["src_mac"], d["dst_mac"] = hwsrc, hwdst
         d["proto"], d["tag"], d["transport"] = "ARP", "ARP", "ARP"
-        d["arp_op"] = int(a.op)
-        if a.op == 1:
-            if a.psrc == a.pdst:
-                d["text"] = f"{a.psrc} announced itself (gratuitous ARP)"
+        d["arp_op"] = int(a.op) if isinstance(a.op, int) else 0
+        if not (psrc and hwsrc):
+            d["arp_op"] = 0
+        if d["arp_op"] == 1:
+            if psrc == pdst:
+                d["text"] = f"{psrc} announced itself (gratuitous ARP)"
             else:
-                d["text"] = f"Who has {a.pdst}? Tell {a.psrc}"
-        elif a.op == 2:
-            d["text"] = f"{a.psrc} is at {a.hwsrc}"
+                d["text"] = f"Who has {pdst}? Tell {psrc}"
+        elif d["arp_op"] == 2:
+            d["text"] = f"{psrc} is at {hwsrc}"
         else:
             d["text"] = f"ARP op={a.op}"
-        d["src"] = a.psrc or a.hwsrc
-        d["dst"] = a.pdst or a.hwdst
+        d["src"] = psrc or hwsrc
+        d["dst"] = pdst or hwdst
         d["ipver"] = 4
         return d
 
@@ -3135,6 +3147,17 @@ class ReverseDNS:
                 self.cache.learn(ip, name, source="rdns")
 
 
+_LEARN_SOURCE = {"mDNS": "mdns", "DHCP": "dhcp", "NBNS": "nbns",
+                 "TLS": "sni", "HTTP": "sni", "DoT": "sni"}
+
+
+def learn_names_from(cache, d):
+    """Feed the IP→name cache from one decoded packet (any thread)."""
+    src = _LEARN_SOURCE.get(d["proto"], "dns")
+    for ip, name in d["learns"]:
+        cache.learn(ip, name, source=src)
+
+
 class DecodeWorker(threading.Thread):
     """Decodes captured packets off the GUI thread."""
 
@@ -3169,17 +3192,7 @@ class DecodeWorker(threading.Thread):
                     LOG.debug("decode error: %s", self.last_error)
                 continue
             self.decoded += 1
-            for ip, name in d["learns"]:
-                src = "dns"
-                if d["proto"] == "mDNS":
-                    src = "mdns"
-                elif d["proto"] == "DHCP":
-                    src = "dhcp"
-                elif d["proto"] == "NBNS":
-                    src = "nbns"
-                elif d["proto"] in ("TLS", "HTTP"):
-                    src = "sni"
-                self.cache.learn(ip, name, source=src)
+            learn_names_from(self.cache, d)
             if self.lossless:
                 while not self.stop_flag:
                     try:
@@ -4257,6 +4270,7 @@ class DeviceRegistry:
         self.removed = []             # keys removed by merges
         self.created = []             # keys created
         self.events = []              # (kind, severity, text, key)
+        self.moved_ips = []           # IPv4s that changed owner
 
     # ---- address rules ----------------------------------------------------
     def classify_address(self, ip):
@@ -4410,6 +4424,8 @@ class DeviceRegistry:
             self.ip_to_key[ip] = dev.key
             return
         prior = self.ip_to_key.get(ip)
+        if prior and prior != dev.key:
+            self.moved_ips.append(ip)
         if prior and prior != dev.key and prior in self.by_key:
             other = self.by_key[prior]
             if other.ip == ip:
@@ -6589,6 +6605,8 @@ class NetworkModel:
             self.doh_seen[src_ip].add(d["doh_hint"])
             self.dns.encrypted_seen[d["doh_hint"]] += 1
 
+        if self.registry.moved_ips:
+            self._forget_moved_names()
         flow, new_flow = self._observe_flow(d, src_local, dst_local, ts,
                                             src_dev, dst_dev)
         self._observe_websites(d, ts, src_dev, dst_dev, flow, new_flow)
@@ -6662,6 +6680,16 @@ class NetworkModel:
                     self._alert(self.alerts.reconnect_cycle(
                         dev, len(recent), window))
         return out[0], out[1]
+
+    def _forget_moved_names(self):
+        """An address now belongs to a different device: names learned for
+        the previous owner (mDNS, NBNS, reverse DNS…) must not follow the
+        address to its new owner."""
+        moved, self.registry.moved_ips = self.registry.moved_ips, []
+        for ip in moved:
+            if self.cache.source(ip) in ("mdns", "nbns", "rdns", "dhcp",
+                                         "dns"):
+                self.cache.forget(ip)
 
     def _routed_private_v4(self, ip):
         """A private IPv4 address outside our own subnets arrives through
@@ -16129,6 +16157,9 @@ class MiniWireshark:
             return
         if not self._confirm_leave_live("Opening a capture file"):
             return
+        self.import_pcap_path(path)
+
+    def import_pcap_path(self, path):
         self.stop()
         self._leave_nonlive()
         self._ensure_worker()
@@ -17952,6 +17983,401 @@ class DemoGenerator(threading.Thread):
 
 
 # ============================================================================
+#  20a.  Replay scenarios — deterministic synthetic captures
+#
+#  A scripted home network built from ordinary packets (raw bytes plus a
+#  timestamp). The same frames drive the self-tests, the fuzzer, the GUI
+#  test, the benchmarks and the "golden" checks, so a behaviour change in
+#  the decoder or the model shows up as a failing check within seconds.
+#  All public addresses are real-looking but every domain is a reserved
+#  ".example" name. Nothing is ever transmitted.
+# ============================================================================
+SCENARIO_T0 = 1_760_000_000.0
+
+
+class ScenarioBuilder:
+    """Builds lists of (raw_bytes, timestamp, linktype) frames."""
+
+    GW = ("192.168.1.1", "00:1e:58:aa:00:01")
+    ME = ("192.168.1.10", "3c:7c:3f:10:00:10")
+    PHONE = ("192.168.1.23", "da:a1:19:23:45:67", "Alex-iPhone")
+    TV = ("192.168.1.40", "f4:f5:d8:40:00:40", "Living Room TV")
+    PRINTER = ("192.168.1.50", "00:80:77:50:00:50", "BRW008077500050")
+    PLUG = ("192.168.1.60", "24:0a:c4:60:00:60", "ESP_6A1B2C")
+    NAS = ("192.168.1.70", "00:11:32:70:00:70", "family-nas")
+    LAPTOP = ("192.168.1.50", "3c:22:fb:88:00:88", "DESKTOP-GUEST7Q")
+    V6_PREFIX = "2a01:e0a:1f:2c0"
+    SITES = {"www.example.com": "93.184.215.14",
+             "video.example.net": "142.250.80.46",
+             "tracker.example.net": "151.101.1.1",
+             "plain.example.org": "34.117.59.81",
+             "files.example.org": "34.117.59.81"}
+
+    def __init__(self, t0=SCENARIO_T0, seed=7):
+        self.t = t0
+        self.frames = []
+        self.rng = random.Random(seed)
+        self.port = 40000
+        self.qid = 100
+
+    # ---- low level -----------------------------------------------------------
+    def _emit(self, pkt, dt=0.01):
+        self.t += dt
+        self.frames.append((bytes(pkt), round(self.t, 6), 1))
+
+    def _next_port(self):
+        self.port += 1
+        return self.port
+
+    def arp_announce(self, host):
+        ip, mac = host[0], host[1]
+        self._emit(Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+                   ARP(op=1, psrc=ip, pdst=self.GW[0], hwsrc=mac))
+        self._emit(Ether(src=self.GW[1], dst=mac) /
+                   ARP(op=2, psrc=self.GW[0], hwsrc=self.GW[1], pdst=ip,
+                       hwdst=mac))
+        self._emit(Ether(src=mac, dst=self.GW[1]) /
+                   ARP(op=2, psrc=ip, hwsrc=mac, pdst=self.GW[0],
+                       hwdst=self.GW[1]))
+
+    def dhcp(self, host, vendor_class="", client_id=True, lease=86400):
+        ip, mac, name = host[0], host[1], host[2]
+        chaddr = bytes.fromhex(mac.replace(":", "")) + b"\x00" * 10
+        opts = [("message-type", "request"), ("requested_addr", ip)]
+        if client_id:
+            opts.append(("client_id", b"\x01" + bytes.fromhex(
+                mac.replace(":", ""))))
+        if name:
+            opts.append(("hostname", name.encode()))
+        if vendor_class:
+            opts.append(("vendor_class_id", vendor_class.encode()))
+        opts.append(("param_req_list", [1, 3, 6, 15, 119, 252]))
+        self._emit(Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+                   IP(src="0.0.0.0", dst="255.255.255.255") /
+                   UDP(sport=68, dport=67) /
+                   BOOTP(chaddr=chaddr, xid=self.rng.randint(1, 2 ** 31)) /
+                   DHCP(options=opts + ["end"]))
+        self._emit(Ether(src=self.GW[1], dst=mac) /
+                   IP(src=self.GW[0], dst=ip) / UDP(sport=67, dport=68) /
+                   BOOTP(op=2, yiaddr=ip, chaddr=chaddr) /
+                   DHCP(options=[("message-type", "ack"),
+                                 ("server_id", self.GW[0]),
+                                 ("lease_time", lease),
+                                 ("router", self.GW[0]),
+                                 ("name_server", self.GW[0]), "end"]))
+
+    def mdns(self, host, svc, name, txt):
+        ip, mac = host[0], host[1]
+        txtv = [f"{k}={v}".encode() for k, v in txt.items()]
+        self._emit(Ether(src=mac, dst="01:00:5e:00:00:fb") /
+                   IP(src=ip, dst="224.0.0.251", ttl=255) /
+                   UDP(sport=5353, dport=5353) /
+                   DNS(qr=1, aa=1, qd=None,
+                       an=DNSRR(rrname=f"{svc}.local", type="PTR",
+                                rdata=f"{name}.{svc}.local"),
+                       ar=[DNSRR(rrname=f"{name}.{svc}.local", type="TXT",
+                                 rdata=txtv),
+                           DNSRR(rrname=f"{name.replace(' ', '-')}.local",
+                                 rdata=ip)]))
+
+    def dns(self, host, name, answer_ip, rcode=0):
+        ip, mac = host[0], host[1]
+        sp = self._next_port()
+        self.qid += 1
+        self._emit(Ether(src=mac, dst=self.GW[1]) /
+                   IP(src=ip, dst=self.GW[0]) / UDP(sport=sp, dport=53) /
+                   DNS(id=self.qid, rd=1, qd=DNSQR(qname=name)))
+        an = DNSRR(rrname=name, rdata=answer_ip, ttl=300) if answer_ip \
+            else None
+        self._emit(Ether(src=self.GW[1], dst=mac) /
+                   IP(src=self.GW[0], dst=ip) / UDP(sport=53, dport=sp) /
+                   DNS(id=self.qid, qr=1, rcode=rcode,
+                       qd=DNSQR(qname=name), an=an), dt=0.02)
+
+    def tls(self, host, site, rip, size=30000, sni=True, rst=False,
+            port=443):
+        ip, mac = host[0], host[1]
+        sp = self._next_port()
+        seq = self.rng.randint(1000, 10 ** 9)
+        out = Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=rip)
+        back = Ether(src=self.GW[1], dst=mac) / IP(src=rip, dst=ip, ttl=54)
+        self._emit(out / TCP(sport=sp, dport=port, flags="S", seq=seq))
+        self._emit(back / TCP(sport=port, dport=sp, flags="SA", seq=7,
+                              ack=seq + 1), dt=0.03)
+        hello = build_client_hello(site if sni else "", pad=300) if sni \
+            else b"\x16\x03\x01\x00\x05\x01\x00\x00\x01\x00"
+        self._emit(out / TCP(sport=sp, dport=port, flags="PA", seq=seq + 1) /
+                   Raw(hello))
+        s2, sent = 8, 0
+        while sent < size:
+            chunk = min(1400, size - sent)
+            self._emit(back / TCP(sport=port, dport=sp, flags="A", seq=s2) /
+                       Raw(b"\x17\x03\x03" + bytes(chunk - 3)), dt=0.002)
+            s2 += chunk
+            sent += chunk
+        if rst:
+            self._emit(back / TCP(sport=port, dport=sp, flags="R", seq=s2))
+            return
+        self._emit(out / TCP(sport=sp, dport=port, flags="FA",
+                             seq=seq + 1 + len(hello)))
+        self._emit(back / TCP(sport=port, dport=sp, flags="FA", seq=s2))
+
+    def http(self, host, site, rip):
+        ip, mac = host[0], host[1]
+        sp = self._next_port()
+        out = Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=rip)
+        back = Ether(src=self.GW[1], dst=mac) / IP(src=rip, dst=ip, ttl=54)
+        self._emit(out / TCP(sport=sp, dport=80, flags="S", seq=1))
+        self._emit(back / TCP(sport=80, dport=sp, flags="SA", seq=1, ack=2))
+        self._emit(out / TCP(sport=sp, dport=80, flags="PA", seq=2) /
+                   Raw(f"GET /index.html HTTP/1.1\r\nHost: {site}\r\n"
+                       f"User-Agent: test\r\n\r\n".encode()))
+        self._emit(back / TCP(sport=80, dport=sp, flags="PA", seq=2) /
+                   Raw(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+
+    # ---- the scripted home network ---------------------------------------------
+    def home_network(self):
+        gw, me = self.GW, self.ME
+        hosts = [me, self.PHONE, self.TV, self.PRINTER, self.PLUG, self.NAS]
+        for h in hosts:
+            self.arp_announce(h)
+        self.dhcp(self.PHONE, client_id=True)
+        self.dhcp(self.TV)
+        self.dhcp(self.PRINTER)
+        self.dhcp(self.PLUG, vendor_class="udhcp 1.30")
+        self.dhcp(self.NAS)
+        # IPv6: router advertisement with a global prefix, then the phone's
+        # global address is resolved by neighbour discovery
+        self._emit(Ether(src=gw[1], dst="33:33:00:00:00:01") /
+                   IPv6(src="fe80::21e:58ff:feaa:1", dst="ff02::1") /
+                   ICMPv6ND_RA(routerlifetime=1800) /
+                   ICMPv6NDOptPrefixInfo(prefix=self.V6_PREFIX + "::",
+                                         prefixlen=64) /
+                   ICMPv6NDOptSrcLLAddr(lladdr=gw[1]))
+        p6 = self.V6_PREFIX + "::23"
+        self._emit(Ether(src=self.PHONE[1], dst=gw[1]) /
+                   IPv6(src=p6, dst="fe80::21e:58ff:feaa:1") /
+                   ICMPv6ND_NA(tgt=p6, R=0, S=1, O=1) /
+                   ICMPv6NDOptDstLLAddr(lladdr=self.PHONE[1]))
+        self.mdns(self.TV, "_googlecast._tcp", "Living Room TV",
+                  {"md": "Chromecast", "fn": "Living Room TV"})
+        self.mdns(self.PRINTER, "_ipp._tcp", "Brother HL-L2350DW",
+                  {"ty": "Brother HL-L2350DW"})
+        self.mdns(self.NAS, "_smb._tcp", "family-nas", {"model": "DS220+"})
+        self._emit(Ether(src=self.TV[1], dst="01:00:5e:7f:ff:fa") /
+                   IP(src=self.TV[0], dst="239.255.255.250") /
+                   UDP(sport=1900, dport=1900) /
+                   Raw(b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                       b"NT: urn:dial-multiscreen-org:service:dial:1\r\n"
+                       b"SERVER: Linux/4.9 UPnP/1.0 Chromecast/1.56\r\n\r\n"))
+        # browsing: lookup → connection with SNI
+        s = self.SITES
+        self.dns(me, "www.example.com", s["www.example.com"])
+        self.tls(me, "www.example.com", s["www.example.com"], size=40000)
+        # a lookup with no connection afterwards
+        self.dns(self.PHONE, "tracker.example.net", s["tracker.example.net"])
+        self.dns(self.PHONE, "video.example.net", s["video.example.net"])
+        self.tls(self.PHONE, "video.example.net", s["video.example.net"],
+                 size=120000)
+        # a connection that only the earlier lookup can name (no SNI)
+        self.dns(self.TV, "files.example.org", s["files.example.org"])
+        self.tls(self.TV, "", s["files.example.org"], sni=False, size=6000)
+        # plain web and cleartext
+        self.http(me, "plain.example.org", s["plain.example.org"])
+        pr = self.PRINTER
+        out = Ether(src=pr[1], dst=gw[1]) / IP(src=pr[0], dst="34.117.59.81")
+        self._emit(out / TCP(sport=40500, dport=21, flags="S"))
+        self._emit(Ether(src=gw[1], dst=pr[1]) /
+                   IP(src="34.117.59.81", dst=pr[0]) /
+                   TCP(sport=21, dport=40500, flags="SA"))
+        self._emit(out / TCP(sport=40500, dport=21, flags="PA") /
+                   Raw(b"USER scanner\r\n"))
+        # NTP from the smart plug
+        self._emit(Ether(src=self.PLUG[1], dst=gw[1]) /
+                   IP(src=self.PLUG[0], dst="129.6.15.28") /
+                   UDP(sport=12345, dport=123) / Raw(b"\x1b" + bytes(47)))
+        self._emit(Ether(src=gw[1], dst=self.PLUG[1]) /
+                   IP(src="129.6.15.28", dst=self.PLUG[0], ttl=50) /
+                   UDP(sport=123, dport=12345) / Raw(b"\x1c" + bytes(47)))
+        # QUIC (long header) and encrypted DNS to a known DoH host
+        self._emit(Ether(src=me[1], dst=gw[1]) /
+                   IP(src=me[0], dst="142.250.80.46") /
+                   UDP(sport=51000, dport=443) / Raw(b"\xc3" + bytes(1250)))
+        self.tls(me, "dns.google", "8.8.8.8", size=3000)
+        # local name protocols
+        self._emit(Ether(src=me[1], dst="01:00:5e:00:00:fc") /
+                   IP(src=me[0], dst="224.0.0.252") /
+                   UDP(sport=55000, dport=5355) /
+                   DNS(id=9, qd=DNSQR(qname="nas")))
+        nb = (b"\x81\x02\x85\x00\x00\x00\x00\x01\x00\x00\x00\x00\x20" +
+              b"".join(bytes([0x41 + (c >> 4), 0x41 + (c & 15)])
+                       for c in b"FAMILY-NAS      ") + b"\x00")
+        self._emit(Ether(src=self.NAS[1], dst=me[1]) /
+                   IP(src=self.NAS[0], dst=me[0]) /
+                   UDP(sport=137, dport=137) / Raw(nb))
+        # a reset connection and an SSH session on the LAN
+        self.tls(me, "www.example.com", s["www.example.com"], size=1400,
+                 rst=True)
+        ph = self.PHONE
+        self._emit(Ether(src=ph[1], dst=me[1]) / IP(src=ph[0], dst=me[0]) /
+                   TCP(sport=50022, dport=22, flags="S"))
+        self._emit(Ether(src=me[1], dst=ph[1]) / IP(src=me[0], dst=ph[0]) /
+                   TCP(sport=22, dport=50022, flags="SA"))
+        self._emit(Ether(src=me[1], dst=ph[1]) / IP(src=me[0], dst=ph[0]) /
+                   TCP(sport=22, dport=50022, flags="PA") /
+                   Raw(b"SSH-2.0-OpenSSH_9.6\r\n"))
+        # later: the printer is gone and its address is reused by a laptop
+        self.t += 900
+        self.dhcp(self.LAPTOP, vendor_class="MSFT 5.0")
+        self.arp_announce(self.LAPTOP)
+        self.tls(self.LAPTOP, "www.example.com", s["www.example.com"],
+                 size=9000)
+        return self.frames
+
+    def busy_mix(self, n=20000, seed=3):
+        """Many short flows from many devices (benchmarks)."""
+        rng = random.Random(seed)
+        frames = []
+        t = self.t
+        tmpl = []
+        for i in range(64):
+            mac = f"00:16:3e:00:{i // 256:02x}:{i % 256:02x}"
+            ip = f"192.168.1.{100 + i % 120}"
+            rip = f"34.{i}.{i % 7}.{(i * 13) % 251 + 1}"
+            tmpl.append(bytes(Ether(src=mac, dst=self.GW[1]) /
+                              IP(src=ip, dst=rip) /
+                              TCP(sport=40000 + i, dport=443, flags="PA") /
+                              Raw(b"\x17\x03\x03" + bytes(rng.choice(
+                                  (60, 300, 1200))))))
+            tmpl.append(bytes(Ether(src=self.GW[1], dst=mac) /
+                              IP(src=rip, dst=ip, ttl=55) /
+                              TCP(sport=443, dport=40000 + i, flags="A") /
+                              Raw(b"\x17\x03\x03" + bytes(1380))))
+        for k in range(n):
+            t += 0.00005
+            frames.append((tmpl[k % len(tmpl)], round(t, 6), 1))
+        return frames
+
+
+def scenario_identity():
+    """(gateway, my_ips, my_macs, local_nets) of the scripted network."""
+    return (ScenarioBuilder.GW[0], {ScenarioBuilder.ME[0]},
+            {ScenarioBuilder.ME[1]},
+            [ipaddress.ip_network("192.168.1.0/24")])
+
+
+def scenario_model(config, frames=None, decoder=None):
+    """Replay frames through decoder + model exactly like an import."""
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(config, gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    frames = frames if frames is not None else \
+        ScenarioBuilder().home_network()
+    replay_frames(m, frames, decoder=decoder)
+    return m
+
+
+def replay_frames(model, frames, decoder=None, tick_every=500):
+    dec = decoder or default_frame_decoder(model)
+    for i, (raw, ts, lt) in enumerate(frames):
+        d = dec(raw, ts, lt)
+        if d is None:
+            continue
+        learn_names_from(model.cache, d)
+        model.ingest(d)
+        if tick_every and i % tick_every == tick_every - 1:
+            model.tick()
+    model.tick()
+    model._announce_created(flush=True)
+    return model
+
+
+def default_frame_decoder(model):
+    reasm = TlsReassembler()
+
+    def dec(raw, ts, lt=1):
+        pkt = Ether(raw) if lt == 1 else Raw(raw)
+        pkt.time = ts
+        d = decode_packet(pkt, model.gateway_ip, model.my_ips, reasm)
+        d["time"] = ts
+        return d
+    return dec
+
+
+def golden_checks(model):
+    """Semantic expectations for ScenarioBuilder.home_network(). Returns a
+    list of human-readable failures (empty = all good)."""
+    fails = []
+    S = ScenarioBuilder
+    reg = model.registry
+
+    def dev_by_mac(mac):
+        return reg.by_key.get(reg.resolve(mac)) if hasattr(reg, "resolve") \
+            else reg.by_key.get(mac)
+
+    def check(cond, msg):
+        if not cond:
+            fails.append(msg)
+
+    for dv in reg.by_key.values():
+        check(not (dv.ip and is_public_ip(dv.ip)),
+              f"public address became a device: {dv.ip}")
+        for a in dv.ipv4s:
+            check(not is_public_ip(a), f"device {dv.key} holds public {a}")
+    phone = dev_by_mac(S.PHONE[1])
+    check(phone is not None, "phone not discovered")
+    if phone is not None:
+        check(phone.dhcp_hostname == "Alex-iPhone",
+              f"phone hostname={phone.dhcp_hostname!r}")
+        check(any(a.startswith(S.V6_PREFIX) for a in phone.ipv6),
+              f"phone IPv6 missing: {sorted(phone.ipv6)}")
+    tv = dev_by_mac(S.TV[1])
+    check(tv is not None and tv.device_class in ("Smart TV",
+                                                 "Streaming device"),
+          f"tv class={getattr(tv, 'device_class', None)}")
+    pr = dev_by_mac(S.PRINTER[1])
+    check(pr is not None and pr.device_class == "Printer",
+          f"printer class={getattr(pr, 'device_class', None)}")
+    lap = dev_by_mac(S.LAPTOP[1])
+    check(lap is not None and lap.device_class == "Windows PC",
+          f"laptop class={getattr(lap, 'device_class', None)}")
+    check(lap is not None and pr is not None and lap.key != pr.key,
+          "printer and laptop merged (IP reuse)")
+    gwd = dev_by_mac(S.GW[1])
+    check(gwd is not None and gwd.device_class == "Router",
+          f"router class={getattr(gwd, 'device_class', None)}")
+    w = model.websites
+    check("www.example.com" in w and "TLS SNI" in w["www.example.com"].sources,
+          "www.example.com not seen via TLS SNI")
+    check("tracker.example.net" in w and
+          w["tracker.example.net"].connections == 0,
+          "lookup-only domain counted as a connection")
+    check("plain.example.org" in w and
+          "HTTP Host" in w["plain.example.org"].sources,
+          "HTTP Host not recorded")
+    check("93.184.215.14" in model.remote_hosts, "remote host missing")
+    check("93.184.215.14" not in reg.ip_to_key,
+          "remote host address mapped to a device")
+    kinds = {a.kind for a in model.alerts.alerts.values()}
+    check("cleartext" in kinds, f"no cleartext alert (kinds={sorted(kinds)})")
+    check(model.dns.encrypted_seen, "encrypted DNS not noticed")
+    check(len(model.flows.all_flows()) >= 10,
+          f"too few flows: {len(model.flows.all_flows())}")
+    check(any(f.domain == "files.example.org"
+              for f in model.flows.all_flows()),
+          "connection not named from its lookup")
+    for extra in GOLDEN_EXTRA:
+        msg = extra(model)
+        if msg:
+            fails.append(msg)
+    return fails
+
+
+GOLDEN_EXTRA = []       # later milestones append (model) -> str|None checks
+
+
+# ============================================================================
 #  20b.  Self-tests  —  python miniwireshark.py --self-test
 #
 #  No administrator rights and no packet capture needed. Packet-based tests
@@ -17981,10 +18407,10 @@ def run_self_tests(verbose=True):
         try:
             r = fn()
             status = "SKIP" if r == "skip" else "PASS"
-            msg = "" if status == "PASS" else "scapy not available"
+            msg = "" if status == "PASS" else "not available here"
         except Exception as e:                       # noqa: BLE001
             status, msg = "FAIL", f"{type(e).__name__}: {e}\n" + \
-                traceback.format_exc(limit=4)
+                traceback.format_exc(limit=12)
         results.append((status, name, msg, time.perf_counter() - t0))
         if verbose:
             print(f"  [{status}] {name} ({(time.perf_counter() - t0) * 1000:.0f}"
@@ -18563,6 +18989,16 @@ def run_self_tests(verbose=True):
                t_dns_tracker, t_baseline, t_data_loaders, t_history_store,
                t_fingerprinting, t_interface_scoring, t_busy_workload):
         test(fn)
+    ctx = TestContext(tmp, scapy_ok)
+    quick = "--quick" in sys.argv
+    for fn, slow in SELF_TESTS:
+        if slow and quick:
+            continue
+
+        def wrapped(fn=fn):
+            return fn(ctx)
+        wrapped.__name__ = fn.__name__
+        test(wrapped)
     shutil.rmtree(tmp, ignore_errors=True)
     failed = [r for r in results if r[0] == "FAIL"]
     if verbose:
@@ -18571,6 +19007,383 @@ def run_self_tests(verbose=True):
         for status, name, msg, _t in failed:
             print(f"\nFAILED: {name}\n{msg}")
     return 1 if failed else 0
+
+
+# ---- registered tests (added milestone by milestone) -------------------------
+SELF_TESTS = []              # (function, slow)
+
+
+def self_test(slow=False):
+    """Register a module-level test: fn(ctx) raises on failure, may return
+    "skip". `slow` tests are skipped by --quick."""
+    def deco(fn):
+        SELF_TESTS.append((fn, slow))
+        return fn
+    return deco
+
+
+class TestContext:
+    def __init__(self, tmp, scapy_ok):
+        self.tmp = tmp
+        self.scapy_ok = scapy_ok
+        self._frames = None
+
+    def cfg(self, extra=None):
+        c = AppConfig(path=os.path.join(self.tmp,
+                                        f"cfg_{uuid.uuid4().hex}.json"))
+        for k, v in (extra or {}).items():
+            c.set(k, v)
+        return c
+
+    def path(self, name):
+        return os.path.join(self.tmp, name)
+
+    def frames(self):
+        """The home-network scenario, built once per run."""
+        if self._frames is None:
+            self._frames = ScenarioBuilder().home_network()
+        return list(self._frames)
+
+
+def model_summary(model):
+    """Semantic fingerprint of a model, for determinism checks."""
+    reg = model.registry
+    return {
+        "devices": sorted((d.key, d.display_name(), d.device_class)
+                          for d in reg.by_key.values()),
+        "websites": sorted((w.domain, tuple(sorted(w.sources)),
+                            w.connections) for w in model.websites.values()),
+        "remotes": sorted(model.remote_hosts),
+        "flows": len(model.flows.all_flows()),
+        "alerts": sorted((a.kind, a.device_key)
+                         for a in model.alerts.alerts.values()),
+    }
+
+
+@self_test()
+def t_python38_grammar(ctx):
+    """The launcher stage must parse on Python 3.8 (old installs hand over
+    to the managed runtime, so the whole file keeps 3.8 syntax)."""
+    import ast
+    with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    ast.parse(src, feature_version=(3, 8))
+
+
+@self_test()
+def t_scenario_golden(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    fails = golden_checks(m)
+    assert not fails, "; ".join(fails)
+
+
+@self_test()
+def t_scenario_deterministic(ctx):
+    if not ctx.scapy_ok:
+        return "skip"
+    sums = [model_summary(scenario_model(ctx.cfg(), ctx.frames()))
+            for _ in range(3)]
+    assert sums[0] == sums[1] == sums[2], "replay is not deterministic"
+
+
+@self_test(slow=True)
+def t_fuzz_decoder_and_model(ctx):
+    """Mutated frames must never crash analysis (decoder errors are counted
+    and skipped by the pipeline; the model must never raise)."""
+    if not ctx.scapy_ok:
+        return "skip"
+    rng = random.Random(11)
+    frames = ctx.frames()
+    m = NetworkModel(ctx.cfg(), *scenario_identity()[:3])
+    m.set_identity(local_nets=scenario_identity()[3])
+    m.use_packet_clock = True
+    dec = default_frame_decoder(m)
+    decode_errors = 0
+    n = 2500
+    for i in range(n):
+        raw, ts, lt = frames[rng.randrange(len(frames))]
+        b = bytearray(raw)
+        for _ in range(rng.randint(1, 6)):
+            op = rng.random()
+            if op < 0.5 and b:
+                b[rng.randrange(len(b))] = rng.randrange(256)
+            elif op < 0.8 and len(b) > 14:
+                del b[rng.randrange(14, len(b)):]
+            else:
+                b.extend(bytes(rng.randrange(256)
+                               for _ in range(rng.randint(1, 40))))
+        try:
+            d = dec(bytes(b), ts + i * 0.001, lt)
+        except Exception:                            # noqa: BLE001
+            decode_errors += 1
+            continue
+        m.ingest(d)
+        if i % 400 == 0:
+            m.tick()
+    assert decode_errors < n * 0.05, f"{decode_errors} decode errors"
+
+
+def bench_report(seconds=2.0):
+    """Measured numbers for this machine (python miniwireshark.py --bench)."""
+    load_scapy()
+    out = {}
+    sb = ScenarioBuilder()
+    frames = sb.busy_mix(20000)
+    cfg = AppConfig(path=os.path.join(tempfile.mkdtemp(), "c.json"))
+    m = NetworkModel(cfg, *scenario_identity()[:3])
+    m.set_identity(local_nets=scenario_identity()[3])
+    m.use_packet_clock = True
+    dec = default_frame_decoder(m)
+    t0 = time.perf_counter()
+    decoded = [dec(raw, ts, lt) for raw, ts, lt in frames[:5000]]
+    out["reference_decode_per_s"] = 5000 / (time.perf_counter() - t0)
+    fast = globals().get("fast_decode")
+    if fast is not None:
+        t0 = time.perf_counter()
+        for raw, ts, lt in frames:
+            fast(raw, ts, lt)
+        out["fast_decode_per_s"] = len(frames) / (time.perf_counter() - t0)
+    t0 = time.perf_counter()
+    for i, d in enumerate(decoded):
+        m.ingest(d)
+    out["ingest_us_per_pkt"] = (time.perf_counter() - t0) / len(decoded) * 1e6
+    extra = globals().get("BENCH_EXTRA") or []
+    for fn in extra:
+        with contextlib.suppress(Exception):
+            out.update(fn())
+    return out
+
+
+# ============================================================================
+#  20c.  GUI test — drives the real window under a (virtual) display
+#
+#  python miniwireshark.py --gui-test   (Linux: run it inside xvfb-run)
+#  It imports the scripted capture through the normal PCAP path, visits
+#  every tab in every theme and mode, opens the detail views and settings,
+#  checks Dark mode for light-coloured leaks, and shuts down cleanly.
+# ============================================================================
+GUI_TEST_STEPS = []           # later milestones append (name, fn(app, ctx))
+
+
+def gui_test_step(name):
+    def deco(fn):
+        GUI_TEST_STEPS.append((name, fn))
+        return fn
+    return deco
+
+
+def _gui_pump(root, seconds=0.0, until=None, timeout=30.0):
+    t_end = time.time() + timeout
+    t_min = time.time() + seconds
+    while True:
+        try:
+            root.update()
+        except tk.TclError:
+            return False
+        now = time.time()
+        if now >= t_min and (until is None or until()):
+            return True
+        if now > t_end:
+            return False
+        time.sleep(0.01)
+
+
+def _patch_dialogs_for_tests():
+    """No modal dialog may block an unattended test run."""
+    messagebox.askyesno = lambda *a, **k: True
+    messagebox.askokcancel = lambda *a, **k: True
+    messagebox.askyesnocancel = lambda *a, **k: True
+    messagebox.showinfo = lambda *a, **k: "ok"
+    messagebox.showwarning = lambda *a, **k: "ok"
+    messagebox.showerror = lambda *a, **k: "ok"
+    filedialog.askopenfilename = lambda *a, **k: ""
+    filedialog.asksaveasfilename = lambda *a, **k: ""
+    filedialog.askdirectory = lambda *a, **k: ""
+
+
+def _luminance(hexcol):
+    try:
+        return _hex_lum(hexcol)
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
+def dark_theme_leaks(root):
+    """Widgets that still paint a light background in Dark mode."""
+    leaks = []
+
+    def walk(w):
+        try:
+            if isinstance(w, (tk.Frame, tk.Label, tk.Text, tk.Canvas,
+                              tk.Listbox, tk.Button, tk.Checkbutton,
+                              tk.Radiobutton, tk.Entry, tk.Toplevel,
+                              tk.LabelFrame, tk.Message)):
+                bg = str(w.cget("bg"))
+                if bg.startswith("#") and len(bg) == 7:
+                    lum = _luminance(bg)
+                    if lum is not None and lum > 0.82 and \
+                            not getattr(w, "_mw_light_ok", False):
+                        leaks.append(f"{w.winfo_class()} {w} bg={bg}")
+        except tk.TclError:
+            pass
+        for c in w.winfo_children():
+            walk(c)
+    walk(root)
+    return leaks
+
+
+def run_gui_test(live=False):
+    """Returns 0 on success. Prints a step-by-step report."""
+    global PATHS
+    tmp = tempfile.mkdtemp(prefix="mw_guitest_")
+    os.environ["MINIWIRESHARK_DATA"] = tmp
+    PATHS = AppPaths()
+    setup_logging()
+    load_scapy()
+    _patch_dialogs_for_tests()
+    results = []
+    ctx = TestContext(tmp, True)
+    cfg = ctx.cfg({"general.auto_start_capture": False,
+                   "updates.check_automatically": False,
+                   "privacy.auto_download_reference": False,
+                   "history.enabled": True,
+                   "history.retention": "7 days"})
+    cfg.save()
+    root = tk.Tk()
+    gw, ips, macs, nets = scenario_identity()
+    app = MiniWireshark(root, "", set(), set(), "", config=cfg)
+
+    def step(name, fn):
+        t0 = time.perf_counter()
+        try:
+            fn()
+            results.append(("PASS", name, ""))
+        except Exception as e:                       # noqa: BLE001
+            results.append(("FAIL", name, f"{type(e).__name__}: {e}\n" +
+                            traceback.format_exc(limit=6)))
+        print(f"  [{results[-1][0]}] {name} "
+              f"({(time.perf_counter() - t0) * 1000:.0f} ms)", flush=True)
+
+    frames = ctx.frames()
+    pcap = ctx.path("scenario.pcap")
+    write_raw_pcap(pcap, frames)
+
+    def s_import():
+        app.import_pcap_path(pcap)
+        ok = _gui_pump(root, 0.5, lambda: app.importer is None and
+                       app.data_mode == "offline" and
+                       app.model.count >= len(frames), timeout=60)
+        assert ok, f"import stalled at {app.model.count}/{len(frames)}"
+        _gui_pump(root, 2.2)
+        fails = golden_checks(app.model)
+        assert not fails, "; ".join(fails)
+
+    def s_tabs():
+        for name, tab in app.tabs.items():
+            app._select_tab(name)
+            _gui_pump(root, 0.05)
+            tab.refresh()
+
+    def s_modes_and_themes():
+        for mode in ("Advanced", "Beginner", "Advanced"):
+            app.mode_ui_var.set(mode)
+            app._on_ui_mode_change()
+            _gui_pump(root, 0.05)
+        for theme, hc in (("Dark", False), ("Dark", True), ("Light", True),
+                          ("Light", False), ("Dark", False)):
+            app._apply_theme(theme, hc)
+            for name in app.tabs:
+                app._select_tab(name)
+                _gui_pump(root, 0.02)
+        leaks = dark_theme_leaks(root)
+        app._apply_theme("Light", False)
+        assert not leaks, f"{len(leaks)} light widgets in Dark: " + \
+            "; ".join(leaks[:6])
+
+    def s_details():
+        m = app.model
+        for key in list(m.registry.by_key)[:12]:
+            app.show_device(key)
+        for dom in list(m.websites)[:6]:
+            app.show_website(dom)
+        for ip in list(m.remote_hosts)[:4]:
+            app.show_remote(ip)
+        for f in list(m.flows.all_flows())[:4]:
+            app.show_flow(f.fid)
+        for aid in list(m.alerts.order)[:4]:
+            app.show_alert(aid)
+        _gui_pump(root, 0.2)
+        for w in root.winfo_children():
+            if isinstance(w, tk.Toplevel):
+                w.destroy()
+
+    def s_settings():
+        app._open_settings()
+        _gui_pump(root, 0.2)
+        sw = app._settings_win
+        for page in SETTINGS_PAGES:
+            sw.show_page(page["id"])
+            _gui_pump(root, 0.02)
+        sw.win.destroy()
+        app.open_diagnostics()
+        _gui_pump(root, 0.3)
+        app._diag_win.win.destroy()
+
+    def s_search():
+        for q in ("example", "ip:192.168.1.23", "port:443", "device:tv",
+                  "alert:cleartext"):
+            res = app.search_results(q)
+            assert isinstance(res, (list, dict))
+
+    def s_demo():
+        app.start_demo()
+        _gui_pump(root, 2.5)
+        assert app.data_mode == "demo" and app.model.demo
+        app.stop_demo()
+        _gui_pump(root, 0.3)
+        assert not any(d.ip.startswith("192.168.50.") for d in
+                       app.model.registry.by_key.values() if d.ip)
+
+    for name, fn in (("import scenario capture (golden checks)", s_import),
+                     ("visit every tab", s_tabs),
+                     ("modes and themes (dark leak audit)",
+                      s_modes_and_themes),
+                     ("detail views", s_details),
+                     ("settings and diagnostics", s_settings),
+                     ("global search", s_search)):
+        step(name, fn)
+    for name, fn in GUI_TEST_STEPS:
+        step(name, lambda fn=fn: fn(app, ctx))
+    step("demo mode starts and leaves no trace", s_demo)
+
+    def s_close():
+        app._on_close()
+        time.sleep(0.5)
+        bad = [t.name for t in threading.enumerate()
+               if t is not threading.main_thread() and not t.daemon]
+        assert not bad, f"non-daemon threads left: {bad}"
+    step("clean shutdown", s_close)
+    failed = [r for r in results if r[0] == "FAIL"]
+    print(f"\nGUI test: {len(results) - len(failed)} passed / "
+          f"{len(failed)} failed")
+    for _s, name, msg in failed:
+        print(f"\nFAILED: {name}\n{msg}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return 1 if failed else 0
+
+
+def write_raw_pcap(path, frames):
+    """Write (raw, ts, linktype) frames to a classic pcap file (stdlib)."""
+    lt = frames[0][2] if frames else 1
+    with open(path, "wb") as f:
+        f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 262144, lt))
+        for raw, ts, _lt in frames:
+            sec = int(ts)
+            usec = int(round((ts - sec) * 1e6)) % 1000000
+            f.write(struct.pack("<IIII", sec, usec, len(raw), len(raw)))
+            f.write(raw)
 
 
 def startup_sanity_checks():
@@ -18703,6 +19516,14 @@ if __name__ == "__main__":
         setup_logging()
         print(f"MiniWireshark {SCRIPT_VERSION} self-test")
         sys.exit(run_self_tests())
+    if GUI_TEST_MODE:
+        print(f"MiniWireshark {SCRIPT_VERSION} GUI test")
+        sys.exit(run_gui_test(live="--live" in sys.argv))
+    if BENCH_MODE:
+        setup_logging()
+        for k, v in bench_report().items():
+            print(f"  {k:28s} {v:12.1f}")
+        sys.exit(0)
     try:
         main()
     except KeyboardInterrupt:
