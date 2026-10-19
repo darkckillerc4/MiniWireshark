@@ -1,0 +1,18715 @@
+#!/usr/bin/env python3
+"""
+MiniWireshark 3.0 — your network, explained in plain English.
+
+A single-file, autonomous network observability, troubleshooting and
+defensive-monitoring workstation. A beginner can understand it; an
+advanced user can actually use it.
+
+Everything is automatic: elevation, dependency install, capture-driver
+install, optional reference-data downloads, picking the right network card
+and starting the capture. Once running it quietly discovers devices on
+your own Wi-Fi/LAN (ARP + mDNS + SSDP — never beyond your own subnet),
+self-heals if the capture dies, and explains what it sees without ever
+presenting a guess as a fact.
+
+Layout of this file (it is one file on purpose — search for the banners):
+
+    1.  Bootstrap / elevation / paths / logging
+    2.  Dependency manager (manifest, pip, Npcap, loader window)
+    3.  Optional data manager (vendor list, public suffixes, trackers, ASN)
+    4.  Constants, palettes and small helpers
+    5.  Protocol decoder (incl. TLS ClientHello, DNS, IPv6 ND, DHCP)
+    6.  Capture workers (sniffer, decoder, LAN discovery, PCAP import,
+        network watcher, health prober)
+    7.  Device identity model (evidence, confidence, fingerprinting)
+    8.  Website / domain model
+    9.  Remote-host model
+    10. Connection / flow model
+    11. Historical metrics (rolling buckets)
+    12. Anomaly / security engine (alerts, DNS health, baselines)
+    13. NetworkModel — the single analysis core every view reads from
+    14. Persistence (config, sessions, known devices, SQLite history)
+    15. Settings (one declarative schema drives the whole window)
+    16. GUI components (tables, charts, dialogs, tooltips)
+    17. Tabs
+    18. Export / reporting
+    19. Diagnostics, crash handling, self-update
+    20. Demo mode and self-tests
+    21. Application entry point
+
+Run  `python miniwireshark.py --self-test`  to run the built-in tests
+(no administrator rights or packet capture needed).
+"""
+
+from __future__ import annotations
+
+# ============================================================================
+#  1.  Bootstrap — imports, paths, logging, elevation
+# ============================================================================
+import array
+import bisect
+import collections
+import contextlib
+import csv
+import ctypes
+import dataclasses
+import gzip
+import hashlib
+import html
+import importlib
+import inspect
+import io
+import ipaddress
+import json
+import logging
+import logging.handlers
+import math
+import os
+import platform
+import queue
+import random
+import re
+import shlex
+import shutil
+import socket as _socket
+import sqlite3
+import statistics
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
+import uuid
+from collections import Counter, OrderedDict, defaultdict, deque
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+
+APP_NAME = "MiniWireshark"
+SCRIPT_VERSION = "3.0.0"
+SESSION_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 2
+
+ELEVATED_FLAG = "--miniwireshark-elevated"
+SELF_TEST_FLAG = "--self-test"
+DEMO_FLAG = "--demo"
+NO_ELEVATE_FLAG = "--no-elevate"
+NO_ELEVATE_ENV = "MINIWIRESHARK_NO_ELEVATE"
+
+IS_WINDOWS = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
+
+try:
+    SCRIPT_PATH = os.path.abspath(__file__)
+except NameError:                                   # pragma: no cover
+    SCRIPT_PATH = os.path.abspath(sys.argv[0])
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
+
+
+def _dir_writable(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+        probe = os.path.join(path, f".mw_write_test_{os.getpid()}")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _user_data_root():
+    if IS_WINDOWS:
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if base:
+            return os.path.join(base, APP_NAME)
+    elif IS_MAC:
+        return os.path.expanduser("~/Library/Application Support/" + APP_NAME)
+    xdg = os.environ.get("XDG_DATA_HOME") or os.path.expanduser(
+        "~/.local/share")
+    return os.path.join(xdg, "miniwireshark")
+
+
+class AppPaths:
+    """Every runtime-generated file lives under one data folder. The
+    application *source* stays a single .py file; caches, logs, history and
+    autosaves are allowed to be separate files. The folder sits next to the
+    script when that is writable (portable, and survives sudo changing
+    $HOME), otherwise in the platform's per-user data location."""
+
+    def __init__(self):
+        override = os.environ.get("MINIWIRESHARK_DATA")
+        candidates = [override] if override else []
+        candidates += [os.path.join(SCRIPT_DIR, "miniwireshark_data"),
+                       _user_data_root(),
+                       os.path.join(tempfile.gettempdir(), "miniwireshark")]
+        self.data = None
+        for c in candidates:
+            if c and _dir_writable(c):
+                self.data = c
+                break
+        if self.data is None:                        # pragma: no cover
+            self.data = tempfile.mkdtemp(prefix="miniwireshark_")
+        self.cache = os.path.join(self.data, "cache")
+        self.logs = os.path.join(self.data, "logs")
+        self.sessions = os.path.join(self.data, "sessions")
+        for d in (self.cache, self.logs, self.sessions):
+            try:
+                os.makedirs(d, exist_ok=True)
+            except OSError:
+                pass
+        self.log_file = os.path.join(self.logs, "miniwireshark.log")
+        self.history_db = os.path.join(self.data, "history.sqlite3")
+        self.known_devices = os.path.join(self.data, "known_devices.json")
+        self.autosave = os.path.join(self.sessions,
+                                     "autosave.mwsession.json")
+        self.bootstrap_state = os.path.join(self.data, "bootstrap_state.json")
+        self.update_marker = os.path.join(self.data, "update_pending.json")
+        self.crash_marker = os.path.join(self.data, "last_crash.txt")
+
+    def as_dict(self):
+        return {k: v for k, v in self.__dict__.items()
+                if isinstance(v, str)}
+
+
+PATHS = AppPaths()
+LOG = logging.getLogger("miniwireshark")
+
+
+def setup_logging(verbose=False):
+    """Small rotating log (standard library only). Never logs payloads."""
+    if getattr(setup_logging, "_done", False):
+        LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
+        return
+    LOG.setLevel(logging.DEBUG if verbose else logging.INFO)
+    try:
+        h = logging.handlers.RotatingFileHandler(
+            PATHS.log_file, maxBytes=512 * 1024, backupCount=3,
+            encoding="utf-8")
+        h.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s [%(threadName)s] %(message)s"))
+        LOG.addHandler(h)
+    except OSError:
+        LOG.addHandler(logging.NullHandler())
+    setup_logging._done = True
+
+
+def atomic_write_text(path, text, encoding="utf-8"):
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w", encoding=encoding) as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def atomic_write_json(path, obj):
+    atomic_write_text(path, json.dumps(obj, indent=2, default=str))
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def is_admin():
+    if IS_WINDOWS:
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except (AttributeError, OSError):
+            return False
+    try:
+        return os.geteuid() == 0
+    except AttributeError:
+        return True
+
+
+def _fatal_dialog(title, message):
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        r = _tk.Tk()
+        r.withdraw()
+        _mb.showerror(title, message)
+        r.destroy()
+    except Exception:                                # noqa: BLE001
+        sys.stderr.write(f"\n*** {title} ***\n{message}\n")
+
+
+def _relaunch_elevated():
+    script = SCRIPT_PATH
+    extra = [a for a in sys.argv[1:] if a != ELEVATED_FLAG]
+    if IS_WINDOWS:
+        params = subprocess.list2cmdline([script, ELEVATED_FLAG] + extra)
+        try:
+            rc = ctypes.windll.shell32.ShellExecuteW(
+                None, "runas", sys.executable, params, None, 1)
+            if int(rc) > 32:
+                return True
+        except (AttributeError, OSError):
+            pass
+        return False
+    if IS_MAC:
+        cmd = " ".join(shlex.quote(p) for p in
+                       [sys.executable, script, ELEVATED_FLAG] + extra)
+        ascript = f'do shell script "{cmd}" with administrator privileges'
+        try:
+            sys.exit(subprocess.call(["osascript", "-e", ascript]))
+        except OSError:
+            return False
+    env_pairs = [f"{v}={os.environ[v]}" for v in
+                 ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
+                  "XDG_RUNTIME_DIR", "HOME", "USER", "LANG", "PATH",
+                  "MINIWIRESHARK_DATA", "MINIWIRESHARK_CONFIG")
+                 if v in os.environ]
+    launchers = []
+    if shutil.which("pkexec"):
+        launchers.append(["pkexec", "env"] + env_pairs)
+    if shutil.which("sudo"):
+        launchers.append(["sudo", "-E"])
+        launchers.append(["sudo"])
+    if shutil.which("gksudo"):
+        launchers.append(["gksudo", "--"])
+    if shutil.which("kdesudo"):
+        launchers.append(["kdesudo", "--"])
+    for L in launchers:
+        try:
+            sys.exit(subprocess.call(L + [sys.executable, script,
+                                          ELEVATED_FLAG] + extra))
+        except OSError:
+            continue
+    return False
+
+
+SELF_TEST_MODE = SELF_TEST_FLAG in sys.argv
+START_IN_DEMO = DEMO_FLAG in sys.argv
+
+if ELEVATED_FLAG in sys.argv:
+    sys.argv.remove(ELEVATED_FLAG)
+    _ELEV = True
+else:
+    _ELEV = False
+
+if __name__ == "__main__" and not SELF_TEST_MODE and not _ELEV and \
+        not os.environ.get(NO_ELEVATE_ENV) and \
+        NO_ELEVATE_FLAG not in sys.argv and not is_admin():
+    if _relaunch_elevated():
+        sys.exit(0)
+    _fatal_dialog(
+        "Administrator required",
+        "MiniWireshark needs administrator / root rights to watch network "
+        "traffic.\n\n"
+        "•  Windows: click Yes on the UAC prompt.\n"
+        "•  Linux:  install pkexec or run with sudo.\n"
+        "•  macOS:  accept the password prompt.\n\n"
+        "The program will now close.")
+    sys.exit(1)
+
+
+# ---- Tk ---------------------------------------------------------------------
+try:
+    import tkinter as tk
+    import tkinter.font as tkfont
+    from tkinter import filedialog, messagebox, simpledialog, ttk
+except ImportError:                                  # pragma: no cover
+    sys.stderr.write(
+        "MiniWireshark needs Python's graphical toolkit (tkinter).\n"
+        "  Windows/macOS: reinstall Python from python.org (tick 'tcl/tk').\n"
+        "  Debian/Ubuntu: sudo apt install python3-tk\n"
+        "  Fedora:        sudo dnf install python3-tkinter\n")
+    sys.exit(1)
+
+
+# ============================================================================
+#  1b.  Scapy symbols (filled in by load_scapy once the dependency is ready)
+# ============================================================================
+AsyncSniffer = conf = get_if_list = hexdump = wrpcap = None
+sendp = get_if_addr = PcapReader = None
+DNS = DNSRR = DNSQR = IP = TCP = UDP = ICMP = ARP = Ether = Raw = None
+IPv6 = BOOTP = DHCP = None
+ICMPv6ND_NS = ICMPv6ND_NA = ICMPv6ND_RS = ICMPv6ND_RA = None
+ICMPv6NDOptSrcLLAddr = ICMPv6NDOptDstLLAddr = ICMPv6NDOptPrefixInfo = None
+ICMPv6EchoRequest = ICMPv6EchoReply = ICMPv6DestUnreach = None
+HAVE_IPV6 = HAVE_DHCP = HAVE_SCAPY = False
+
+
+def load_scapy():
+    global AsyncSniffer, conf, get_if_list, hexdump, wrpcap, PcapReader
+    global sendp, get_if_addr
+    global DNS, DNSRR, DNSQR, IP, TCP, UDP, ICMP, ARP, Ether, Raw
+    global IPv6, BOOTP, DHCP, HAVE_IPV6, HAVE_DHCP, HAVE_SCAPY
+    global ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6ND_RS, ICMPv6ND_RA
+    global ICMPv6NDOptSrcLLAddr, ICMPv6NDOptDstLLAddr, ICMPv6NDOptPrefixInfo
+    global ICMPv6EchoRequest, ICMPv6EchoReply, ICMPv6DestUnreach
+    logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+    from scapy.all import (AsyncSniffer, conf, get_if_list, hexdump, wrpcap,
+                           sendp, get_if_addr)
+    from scapy.utils import PcapReader
+    from scapy.layers.dns import DNS, DNSRR, DNSQR
+    from scapy.layers.inet import ICMP, IP, TCP, UDP
+    from scapy.layers.l2 import ARP, Ether
+    from scapy.packet import Raw
+    try:
+        from scapy.layers.inet6 import (
+            IPv6, ICMPv6ND_NS, ICMPv6ND_NA, ICMPv6ND_RS, ICMPv6ND_RA,
+            ICMPv6NDOptSrcLLAddr, ICMPv6NDOptDstLLAddr,
+            ICMPv6NDOptPrefixInfo, ICMPv6EchoRequest, ICMPv6EchoReply,
+            ICMPv6DestUnreach)
+        HAVE_IPV6 = True
+    except ImportError:
+        HAVE_IPV6 = False
+    try:
+        from scapy.layers.dhcp import BOOTP, DHCP
+        HAVE_DHCP = True
+    except ImportError:
+        HAVE_DHCP = False
+    try:
+        conf.verb = 0
+    except AttributeError:
+        pass
+    HAVE_SCAPY = True
+
+
+# ============================================================================
+#  2.  Dependency manager
+#
+#  One manifest says what the program needs. Required items stop startup
+#  with a friendly explanation when they truly can't be prepared; optional
+#  items are tried quietly (with an attempt budget so we never loop) and the
+#  feature that needs them is simply switched off if they fail.
+# ============================================================================
+DEPENDENCY_MANIFEST = [
+    {"key": "scapy", "pip": "scapy", "import": "scapy", "required": True,
+     "min_version": (2, 4, 5),
+     "friendly": "the packet capture engine",
+     "feature": "Packet capture and decoding"},
+    {"key": "psutil", "pip": "psutil", "import": "psutil", "required": False,
+     "min_version": None,
+     "friendly": "the adapter status and CPU monitor",
+     "feature": "Adapter link status, CPU-aware performance mode"},
+]
+
+OPTIONAL_MODULES = {}       # key -> imported module or None
+
+
+class BootstrapState:
+    """Remembers install attempts across launches so a broken network or a
+    pending reboot can never trap MiniWireshark in an install loop."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = read_json(path, {}) or {}
+        self.data.setdefault("attempts", {})
+        self.data.setdefault("npcap", {})
+
+    def save(self):
+        try:
+            atomic_write_json(self.path, self.data)
+        except OSError:
+            LOG.warning("Could not save bootstrap state")
+
+    def recent_attempts(self, key, window):
+        now = time.time()
+        lst = [t for t in self.data["attempts"].get(key, [])
+               if now - t < window]
+        self.data["attempts"][key] = lst
+        return len(lst)
+
+    def note_attempt(self, key):
+        self.data["attempts"].setdefault(key, []).append(time.time())
+        self.save()
+
+
+def _module_ok(name):
+    try:
+        importlib.invalidate_caches()
+        importlib.import_module(name)
+        return True
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+def _module_version(name):
+    try:
+        m = importlib.import_module(name)
+        return getattr(m, "__version__", "unknown")
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def _version_tuple(v):
+    out = []
+    for part in re.split(r"[.\-+]", str(v or "")):
+        if part.isdigit():
+            out.append(int(part))
+        else:
+            m = re.match(r"(\d+)", part)
+            if m:
+                out.append(int(m.group(1)))
+            break
+    return tuple(out)
+
+
+def _pip_available():
+    try:
+        r = subprocess.run([sys.executable, "-m", "pip", "--version"],
+                           capture_output=True, text=True, timeout=30)
+        return r.returncode == 0, (r.stdout or r.stderr).strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+
+
+def _pip_install(pkg, upgrade=False, timeout=900):
+    base = [sys.executable, "-m", "pip", "install",
+            "--disable-pip-version-check", "-q"]
+    if upgrade:
+        base.append("--upgrade")
+    last = ""
+    for cmd in (base + [pkg],
+                base + ["--user", pkg],
+                base + ["--break-system-packages", pkg],
+                base + ["--user", "--break-system-packages", pkg]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            if r.returncode == 0:
+                return True, ""
+            last = ((r.stdout or "") + (r.stderr or "")).strip()[-1400:]
+        except subprocess.TimeoutExpired:
+            last = f"timed out after {timeout}s"
+            break
+        except (OSError, subprocess.SubprocessError) as e:
+            last = str(e)
+    return False, last
+
+
+def _scapy_version():
+    return _module_version("scapy")
+
+
+def _npcap_present():
+    if not IS_WINDOWS:
+        return True
+    sd = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    return any(os.path.exists(p) for p in
+               (os.path.join(sd, "Npcap", "wpcap.dll"),
+                os.path.join(sd, "wpcap.dll"),
+                os.path.join(sd, "Packet.dll")))
+
+
+def _boot_time():
+    """Approximate machine boot time (used to tell whether a reboot that an
+    installer asked for has happened yet)."""
+    if IS_WINDOWS:
+        try:
+            k = ctypes.windll.kernel32
+            k.GetTickCount64.restype = ctypes.c_ulonglong
+            return time.time() - k.GetTickCount64() / 1000.0
+        except (AttributeError, OSError):
+            return 0.0
+    try:
+        with open("/proc/uptime") as f:
+            return time.time() - float(f.read().split()[0])
+    except (OSError, ValueError):
+        return 0.0
+
+
+NPCAP_FALLBACK_VERSION = "1.79"
+
+
+def _latest_npcap_version():
+    try:
+        req = urllib.request.Request("https://npcap.com/",
+                                     headers={"User-Agent": APP_NAME})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            page = r.read(600_000).decode("utf-8", "ignore")
+        vers = re.findall(r"dist/npcap-(\d+\.\d+)\.exe", page)
+        if vers:
+            return max(vers, key=_version_tuple)
+    except (OSError, urllib.error.URLError, ValueError):
+        pass
+    return NPCAP_FALLBACK_VERSION
+
+
+def _authenticode_status(path):
+    """Ask Windows whether the downloaded installer carries a valid digital
+    signature. Returns e.g. 'Valid', 'NotSigned', or '' if unknown."""
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             f"(Get-AuthenticodeSignature -LiteralPath '{path}').Status"],
+            capture_output=True, text=True, timeout=60)
+        return (r.stdout or "").strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _install_npcap(loader, state):
+    """Download and run the official Npcap installer. The free edition of
+    Npcap does not allow silent installs, so the installer window is shown
+    and the user clicks through it — we explain that first."""
+    if state.recent_attempts("npcap", 24 * 3600) >= 2:
+        return False, ("Npcap installation was already attempted twice "
+                       "today. Please install it manually from "
+                       "https://npcap.com and start MiniWireshark again.")
+    state.note_attempt("npcap")
+    ver = _latest_npcap_version()
+    url = f"https://npcap.com/dist/npcap-{ver}.exe"
+    exe = os.path.join(tempfile.gettempdir(), f"npcap-{ver}.exe")
+    loader.post_log(f"  Downloading the capture driver (Npcap {ver}) ...",
+                    None)
+    loader.post_log(f"  {url}", "detail")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+        with urllib.request.urlopen(req, timeout=120) as r, \
+                open(exe, "wb") as f:
+            shutil.copyfileobj(r, f)
+        if os.path.getsize(exe) < 200_000:
+            raise OSError("downloaded file is too small")
+    except (OSError, urllib.error.URLError) as e:
+        try:
+            import webbrowser
+            webbrowser.open("https://npcap.com/#download")
+        except Exception:                            # noqa: BLE001
+            pass
+        return False, (f"Could not download the capture driver ({e}). "
+                       "Your browser was opened on the Npcap download page.")
+    sig = _authenticode_status(exe)
+    loader.post_log(f"  Installer signature: {sig or 'unknown'}", "detail")
+    if sig and sig not in ("Valid",):
+        return False, (f"The downloaded installer's signature is '{sig}', so "
+                       "MiniWireshark refused to run it. Please install "
+                       "Npcap from https://npcap.com yourself.")
+    loader.post_log("  The Npcap installer window is opening — please click "
+                    "Next / I Agree / Install. Keep the default options.",
+                    None)
+    try:
+        r = subprocess.run([exe, "/winpcap_mode=yes"], timeout=1200)
+    except subprocess.TimeoutExpired:
+        return False, "The Npcap installer didn't finish within 20 minutes."
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, f"Installer failed to start: {e}"
+    LOG.info("Npcap installer exit code %s", r.returncode)
+    if r.returncode == 3010:
+        state.data["npcap"] = {"reboot_pending_since": time.time(),
+                               "boot_time": _boot_time()}
+        state.save()
+        return False, ("The capture driver was installed but Windows needs "
+                       "a restart. Please restart your computer, then open "
+                       "MiniWireshark again.")
+    if _npcap_present():
+        state.data["npcap"] = {}
+        state.save()
+        return True, f"Capture driver (Npcap {ver}) installed."
+    return False, (f"The Npcap installer ended (code {r.returncode}) but the "
+                   "driver isn't present. If you cancelled it, start "
+                   "MiniWireshark again to retry.")
+
+
+# ============================================================================
+#  2b.  Loading window (first-run / every-run preparation)
+# ============================================================================
+class LoaderWindow(ttk.Frame):
+    def __init__(self, master):
+        super().__init__(master)
+        self.q = queue.Queue()
+        self.details_var = tk.BooleanVar(value=False)
+        self._build()
+
+    def _build(self):
+        h = tk.Frame(self, bg="#2b3a55", padx=18, pady=16)
+        h.pack(fill="x")
+        tk.Label(h, text="MiniWireshark", fg="white", bg="#2b3a55",
+                 font=("TkDefaultFont", 16, "bold")).pack(anchor="w")
+        tk.Label(h, text="Getting everything ready — this is quick after "
+                         "the first time", fg="#c8d2e0",
+                 bg="#2b3a55").pack(anchor="w")
+        b = tk.Frame(self, bg="#f4f5f7", padx=18, pady=14)
+        b.pack(fill="both", expand=True)
+        self.status_var = tk.StringVar(value="Starting ...")
+        tk.Label(b, textvariable=self.status_var, bg="#f4f5f7",
+                 font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+        self.progress = ttk.Progressbar(b, mode="determinate",
+                                        length=560, maximum=100)
+        self.progress.pack(fill="x", pady=(8, 8))
+        tk.Checkbutton(b, text="Show technical details",
+                       variable=self.details_var, bg="#f4f5f7",
+                       activebackground="#f4f5f7",
+                       command=self._toggle_details).pack(anchor="w")
+        lf = tk.Frame(b, bg="#ffffff", bd=1, relief="solid")
+        lf.pack(fill="both", expand=True, pady=(4, 0))
+        self.log = tk.Text(lf, height=11, bg="#ffffff", relief="flat",
+                           font=("TkFixedFont", 9), state="disabled",
+                           wrap="word", padx=8, pady=6)
+        vs = ttk.Scrollbar(lf, orient="vertical", command=self.log.yview)
+        self.log.configure(yscrollcommand=vs.set)
+        self.log.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.log.tag_configure("step", foreground="#2b3a56",
+                               font=("TkFixedFont", 9, "bold"))
+        self.log.tag_configure("ok", foreground="#0b6b3a")
+        self.log.tag_configure("err", foreground="#a01a08")
+        self.log.tag_configure("warn", foreground="#8a5a00")
+        self.log.tag_configure("detail", foreground="#666666", elide=True)
+        self.footer = tk.Label(self, text="Please wait ...", bg="#e3e6eb",
+                               anchor="w", padx=12, pady=5)
+        self.footer.pack(side="bottom", fill="x")
+
+    def _toggle_details(self):
+        self.log.tag_configure("detail", elide=not self.details_var.get())
+
+    def post_log(self, t, tag=None):
+        self.q.put(("log", t, tag))
+        if tag in ("err", "warn"):
+            LOG.warning("bootstrap: %s", t)
+        else:
+            LOG.info("bootstrap: %s", t.strip())
+
+    def post_status(self, t):
+        self.q.put(("status", t))
+
+    def post_progress(self, p):
+        self.q.put(("progress", p))
+
+    def post_footer(self, t):
+        self.q.put(("footer", t))
+
+    def pump(self):
+        while True:
+            try:
+                it = self.q.get_nowait()
+            except queue.Empty:
+                break
+            k = it[0]
+            if k == "log":
+                self.log.config(state="normal")
+                if it[2]:
+                    self.log.insert("end", it[1] + "\n", it[2])
+                else:
+                    self.log.insert("end", it[1] + "\n")
+                self.log.see("end")
+                self.log.config(state="disabled")
+            elif k == "status":
+                self.status_var.set(it[1])
+            elif k == "progress":
+                self.progress["value"] = it[1]
+            elif k == "footer":
+                self.footer.config(text=it[1])
+        try:
+            self.update_idletasks()
+            self.update()
+        except tk.TclError:
+            pass
+
+    def show_fatal(self, m):
+        self.post_status("Setup could not finish")
+        self.post_log("", None)
+        self.post_log(m, "err")
+        self.post_footer("Close this window to exit. Details are in the log: "
+                         + PATHS.log_file)
+        self.pump()
+
+
+# ============================================================================
+#  2c.  Bootstrap steps (plain-English titles; package names only in details)
+# ============================================================================
+def step_python(l, state):
+    v = sys.version_info
+    l.post_log(f"  Python {v.major}.{v.minor}.{v.micro} at {sys.executable}",
+               "detail")
+    if v < (3, 7):
+        return False, f"Python {v.major}.{v.minor} is too old (3.7+ needed)."
+    return True, "Python is ready."
+
+
+def step_tkinter(l, state):
+    return True, f"Graphical toolkit ready (Tk {tk.TkVersion})."
+
+
+def step_pip(l, state):
+    ok, info = _pip_available()
+    if ok:
+        l.post_log(f"  {info}", "detail")
+        return True, "Package installer is ready."
+    if state.recent_attempts("ensurepip", 24 * 3600) >= 2:
+        return True, ("Package installer unavailable (already tried today) "
+                      "— continuing with what is installed.")
+    state.note_attempt("ensurepip")
+    l.post_log("  Repairing Python's package installer ...", None)
+    try:
+        r = subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade"],
+                           capture_output=True, text=True, timeout=180)
+        l.post_log("  " + (r.stdout or r.stderr or "").strip()[-300:],
+                   "detail")
+    except (OSError, subprocess.SubprocessError) as e:
+        l.post_log(f"  ensurepip: {e}", "detail")
+    ok, info = _pip_available()
+    return True, ("Package installer repaired." if ok else
+                  "Package installer unavailable — continuing with what is "
+                  "already installed.")
+
+
+def _cap(text):
+    return text[:1].upper() + text[1:]
+
+
+def _ensure_dependency(l, state, dep):
+    name = dep["import"]
+    if _module_ok(name):
+        ver = _module_version(name)
+        if dep.get("min_version") and _version_tuple(ver) and \
+                _version_tuple(ver) < dep["min_version"]:
+            l.post_log(f"  {dep['pip']} {ver} is older than needed; "
+                       f"updating ...", "detail")
+            if state.recent_attempts("pip:" + dep["key"], 24 * 3600) < 2:
+                state.note_attempt("pip:" + dep["key"])
+                _pip_install(dep["pip"], upgrade=True)
+        OPTIONAL_MODULES[dep["key"]] = importlib.import_module(name)
+        return True, f"{_cap(dep['friendly'])} is ready."
+    budget_window = 24 * 3600 if dep["required"] else 7 * 24 * 3600
+    budget = 3 if dep["required"] else 1
+    if state.recent_attempts("pip:" + dep["key"], budget_window) >= budget:
+        if dep["required"]:
+            return False, (f"Installing {dep['friendly']} failed several times "
+                           "today. Check your internet connection and start "
+                           "MiniWireshark again later.")
+        OPTIONAL_MODULES[dep["key"]] = None
+        return True, (f"{dep['feature']}: unavailable (will retry in a few "
+                      "days).")
+    state.note_attempt("pip:" + dep["key"])
+    l.post_log(f"  Installing {dep['friendly']} ...", None)
+    l.post_log(f"  pip install {dep['pip']}", "detail")
+    l.post_footer(f"Downloading {dep['friendly']} — please wait ...")
+    ok, err = _pip_install(dep["pip"],
+                           timeout=900 if dep["required"] else 240)
+    if not ok and dep["required"]:
+        # an outdated pip is the most common cause; upgrade it once, retry
+        l.post_log("  Updating the package installer and retrying ...", None)
+        _pip_install("pip", upgrade=True, timeout=300)
+        ok, err = _pip_install(dep["pip"])
+    if err:
+        l.post_log("  " + err[-600:], "detail")
+    if ok and _module_ok(name):
+        OPTIONAL_MODULES[dep["key"]] = importlib.import_module(name)
+        return True, f"{_cap(dep['friendly'])} installed."
+    if dep["required"]:
+        return False, (f"Couldn't install {dep['friendly']} automatically.\n"
+                       f"Technical detail: {err[-500:] if err else 'import failed'}")
+    OPTIONAL_MODULES[dep["key"]] = None
+    return True, f"{dep['feature']}: unavailable (optional)."
+
+
+def step_dependencies(l, state):
+    msgs = []
+    for dep in DEPENDENCY_MANIFEST:
+        ok, msg = _ensure_dependency(l, state, dep)
+        if not ok:
+            return False, msg
+        msgs.append(msg)
+        l.post_log("  " + msg, "ok" if "unavailable" not in msg else "warn")
+    return True, ""
+
+
+def step_npcap(l, state):
+    if not IS_WINDOWS:
+        return True, "Capture driver: built into this operating system."
+    if _npcap_present():
+        if state.data.get("npcap"):
+            state.data["npcap"] = {}
+            state.save()
+        return True, "Capture driver (Npcap) is ready."
+    pend = state.data.get("npcap", {})
+    if pend.get("reboot_pending_since"):
+        if abs(_boot_time() - pend.get("boot_time", 0)) < 120:
+            return False, ("The capture driver needs Windows to restart "
+                           "before it can work. Please restart your "
+                           "computer, then open MiniWireshark again.")
+        state.data["npcap"] = {}        # rebooted, but still missing → retry
+        state.save()
+    return _install_npcap(l, state)
+
+
+BOOTSTRAP_STEPS = [
+    ("Checking Python", step_python, 1),
+    ("Checking the graphical toolkit", step_tkinter, 1),
+    ("Checking the package installer", step_pip, 1),
+    ("Preparing the packet capture engine", step_dependencies, 8),
+    ("Preparing the capture driver", step_npcap, 6),
+    ("Finishing up", lambda l, s: (True, "Ready."), 1),
+]
+
+
+def run_bootstrap(loader):
+    done = threading.Event()
+    result = [None]
+    state = BootstrapState(PATHS.bootstrap_state)
+
+    def worker():
+        total = sum(s[2] for s in BOOTSTRAP_STEPS)
+        accum = 0
+        for title, fn, w in BOOTSTRAP_STEPS:
+            loader.post_status(title + " ...")
+            loader.post_log(f"→ {title}", "step")
+            try:
+                ok, msg = fn(loader, state)
+            except Exception as e:                   # noqa: BLE001
+                LOG.exception("bootstrap step %s", title)
+                ok, msg = False, f"{type(e).__name__}: {e}"
+            if not ok:
+                loader.post_log(f"✗ {msg}", "err")
+                result[0] = (False, msg)
+                done.set()
+                return
+            if msg:
+                loader.post_log(f"  {msg}", "ok")
+            accum += w
+            loader.post_progress(int(100 * accum / total))
+        result[0] = (True, "")
+        done.set()
+
+    threading.Thread(target=worker, daemon=True, name="bootstrap").start()
+    while not done.is_set():
+        loader.pump()
+        time.sleep(0.03)
+    loader.pump()
+    return result[0]
+
+
+# ============================================================================
+#  3.  Optional data manager
+#
+#  Public reference data downloaded into the cache folder: hardware-vendor
+#  prefixes, the Public Suffix List, an optional tracker/ad-domain list and
+#  an optional offline IP→country/provider database. Each resource has
+#  version/date metadata, a SHA-256 checksum (corruption detection), atomic
+#  replacement, a refresh interval and a retry back-off. Downloading these
+#  files sends nothing about your traffic — it is an ordinary file download.
+#  If a resource is unavailable, the feature using it falls back to built-in
+#  knowledge or switches off, and says so.
+# ============================================================================
+class OuiDB:
+    """Vendor lookup from the Wireshark 'manuf' file (/24, /28, /36)."""
+
+    def __init__(self):
+        self.tables = {24: {}, 28: {}, 36: {}}
+
+    @staticmethod
+    def _hex(mac):
+        return re.sub(r"[^0-9a-f]", "", (mac or "").lower())
+
+    def add(self, prefix, bits, vendor):
+        h = self._hex(prefix)[: bits // 4]
+        if len(h) == bits // 4 and bits in self.tables:
+            self.tables[bits][h] = vendor
+
+    def lookup(self, mac):
+        h = self._hex(mac)
+        if len(h) < 6:
+            return ""
+        for bits in (36, 28, 24):
+            v = self.tables[bits].get(h[: bits // 4])
+            if v:
+                return v
+        return ""
+
+    def __len__(self):
+        return sum(len(t) for t in self.tables.values())
+
+
+def load_oui(path):
+    db = OuiDB()
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 2:
+                continue
+            pref = parts[0].strip()
+            vendor = (parts[2] if len(parts) > 2 and parts[2].strip()
+                      else parts[1]).strip()
+            bits = 24
+            if "/" in pref:
+                pref, b = pref.split("/", 1)
+                try:
+                    bits = int(b)
+                except ValueError:
+                    continue
+            db.add(pref, bits, vendor)
+    return db
+
+
+def validate_oui(path):
+    db = load_oui(path)
+    return (len(db) > 5000, f"{len(db)} vendor prefixes")
+
+
+class PublicSuffixList:
+    """Minimal, correct implementation of the PSL algorithm (rules,
+    wildcards, exceptions) for grouping hostnames by registrable domain."""
+
+    def __init__(self):
+        self.rules, self.wild, self.exc = set(), set(), set()
+
+    def registrable(self, host):
+        labels = (host or "").strip(".").lower().split(".")
+        if len(labels) < 2:
+            return ".".join(labels)
+        best = 1                        # default rule "*": one label suffix
+        for i in range(len(labels)):
+            cand = ".".join(labels[i:])
+            n = len(labels) - i
+            if cand in self.exc:
+                best = max(best, n - 1)
+                break
+            if cand in self.rules:
+                best = max(best, n)
+            if i + 1 < len(labels) and ".".join(labels[i + 1:]) in self.wild:
+                best = max(best, n)
+        if best >= len(labels):
+            return ".".join(labels)
+        return ".".join(labels[-(best + 1):])
+
+
+def load_psl(path):
+    psl = PublicSuffixList()
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("//"):
+                continue
+            rule = line.split()[0].lower()
+            if rule.startswith("!"):
+                psl.exc.add(rule[1:])
+            elif rule.startswith("*."):
+                psl.wild.add(rule[2:])
+            else:
+                psl.rules.add(rule)
+    return psl
+
+
+def validate_psl(path):
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        text = f.read()
+    ok = "===BEGIN ICANN DOMAINS===" in text and text.count("\n") > 5000
+    return ok, f"{text.count(chr(10))} lines"
+
+
+TRACKER_CATEGORY_MAP = {
+    "advertising": "Advertising", "analytics": "Analytics",
+    "social": "Social", "content": "Content",
+    "cryptomining": "Tracking", "fingerprintinginvasive": "Tracking",
+    "fingerprintinggeneral": "Tracking", "email": "Tracking",
+    "emailstrict": "Tracking", "emailaggressive": "Tracking",
+    "disconnect": "Tracking", "anti-fraud": "Tracking",
+}
+
+
+class TrackerDB:
+    def __init__(self):
+        self.domains = {}       # domain -> (category, service)
+
+    def classify(self, host):
+        labels = (host or "").lower().strip(".").split(".")
+        for i in range(len(labels) - 1):
+            hit = self.domains.get(".".join(labels[i:]))
+            if hit:
+                return hit
+        return None
+
+    def __len__(self):
+        return len(self.domains)
+
+
+def load_trackers(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    db = TrackerDB()
+    for cat, entries in (data.get("categories") or {}).items():
+        label = TRACKER_CATEGORY_MAP.get(cat.lower(), "Tracking")
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            for service, sites in entry.items():
+                if not isinstance(sites, dict):
+                    continue
+                for _url, doms in sites.items():
+                    if isinstance(doms, list):
+                        for d in doms:
+                            if isinstance(d, str) and "." in d:
+                                db.domains.setdefault(d.lower(),
+                                                      (label, service))
+    return db
+
+
+def validate_trackers(path):
+    db = load_trackers(path)
+    return len(db) > 500, f"{len(db)} tracker/ad domains"
+
+
+class AsnDB:
+    """Offline IPv4 → (ASN, country, organisation) from iptoasn.com's
+    public-domain dataset. Compact arrays + bisect: a few MB of memory,
+    and lookups never leave this computer."""
+
+    def __init__(self):
+        self.starts = array.array("I")
+        self.ends = array.array("I")
+        self.asns = array.array("I")
+        self.cc = []
+        self.names = {}
+
+    def lookup(self, ip):
+        try:
+            n = int(ipaddress.IPv4Address(ip))
+        except (ValueError, ipaddress.AddressValueError):
+            return None
+        i = bisect.bisect_right(self.starts, n) - 1
+        if i < 0 or n > self.ends[i] or self.asns[i] == 0:
+            return None
+        asn = self.asns[i]
+        return asn, self.cc[i], self.names.get(asn, "")
+
+    def __len__(self):
+        return len(self.starts)
+
+
+def load_asn(path):
+    db = AsnDB()
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 5:
+                continue
+            try:
+                s = int(ipaddress.IPv4Address(parts[0]))
+                e = int(ipaddress.IPv4Address(parts[1]))
+                a = int(parts[2])
+            except ValueError:
+                continue
+            db.starts.append(s)
+            db.ends.append(e)
+            db.asns.append(a)
+            db.cc.append(parts[3][:2] if parts[3] != "None" else "")
+            if a and a not in db.names:
+                db.names[a] = parts[4][:80]
+    return db
+
+
+def validate_asn(path):
+    db = load_asn(path)
+    return len(db) > 100_000, f"{len(db)} address ranges"
+
+
+@dataclass
+class DataResource:
+    key: str
+    title: str
+    url: str
+    filename: str
+    refresh_days: int
+    max_bytes: int
+    validator: Callable
+    loader: Callable
+    enable_key: str          # config key that must be True to download/load
+    description: str
+    sends: str
+
+
+DATA_MANIFEST = [
+    DataResource(
+        "oui", "Hardware vendor list",
+        "https://www.wireshark.org/download/automated/data/manuf",
+        "manuf.txt", 30, 12_000_000, validate_oui, load_oui,
+        "privacy.auto_download_reference",
+        "Turns the first half of a MAC address into a manufacturer name.",
+        "Downloads a public file from wireshark.org. Nothing about your "
+        "network is sent."),
+    DataResource(
+        "psl", "Public Suffix List",
+        "https://publicsuffix.org/list/public_suffix_list.dat",
+        "public_suffix_list.dat", 30, 2_000_000, validate_psl, load_psl,
+        "privacy.auto_download_reference",
+        "Groups www.example.co.uk and mail.example.co.uk under "
+        "example.co.uk.",
+        "Downloads a public file from publicsuffix.org. Nothing about your "
+        "network is sent."),
+    DataResource(
+        "trackers", "Tracker / ad-domain list",
+        "https://raw.githubusercontent.com/disconnectme/"
+        "disconnect-tracking-protection/master/services.json",
+        "disconnect_services.json", 7, 8_000_000, validate_trackers,
+        load_trackers, "websites.tracker_classification",
+        "Labels domains as Advertising / Analytics / Social / Tracking "
+        "(informational only — nothing is blocked).",
+        "Downloads Disconnect's public list from GitHub. Domains you visit "
+        "are checked against it on this computer only."),
+    DataResource(
+        "asn", "Offline country & provider database",
+        "https://iptoasn.com/data/ip2asn-v4.tsv.gz",
+        "ip2asn-v4.tsv.gz", 14, 40_000_000, validate_asn, load_asn,
+        "privacy.local_asn_db",
+        "Shows the country and network provider (ASN) of Internet hosts "
+        "without asking any online service.",
+        "Downloads a public ~7 MB file from iptoasn.com. Lookups then happen "
+        "entirely on this computer."),
+]
+
+
+class DataManager:
+    """Loads cached resources at startup and refreshes them in the
+    background. Thread-safe; never touches Tk."""
+
+    def __init__(self, cache_dir, config):
+        self.cache_dir = cache_dir
+        self.config = config
+        self.lock = threading.Lock()
+        self.objects = {}
+        self.status = {r.key: {"state": "missing", "message": "Not loaded",
+                               "version": "", "size": 0}
+                       for r in DATA_MANIFEST}
+        self.on_change = None         # callable() — called from worker thread
+        self._busy = False
+        self._stop = False
+
+    def resource(self, key):
+        return next(r for r in DATA_MANIFEST if r.key == key)
+
+    def _paths(self, r):
+        p = os.path.join(self.cache_dir, r.filename)
+        return p, p + ".meta.json"
+
+    def enabled(self, r):
+        return bool(self.config.get(r.enable_key, False))
+
+    def get(self, key):
+        with self.lock:
+            return self.objects.get(key)
+
+    def _set_status(self, key, **kw):
+        with self.lock:
+            self.status[key].update(kw)
+
+    def status_text(self, key):
+        st = self.status.get(key, {})
+        r = self.resource(key)
+        if not self.enabled(r) and st.get("state") != "ready":
+            return f"{r.title}: off"
+        bits = [f"{r.title}: {st.get('message', '')}"]
+        if st.get("version"):
+            bits.append(f"(downloaded {st['version']})")
+        return " ".join(bits)
+
+    def summary_lines(self):
+        return [self.status_text(r.key) for r in DATA_MANIFEST]
+
+    # ---- loading --------------------------------------------------------
+    def _verify_and_load(self, r):
+        path, meta_path = self._paths(r)
+        if not os.path.exists(path):
+            return False
+        meta = read_json(meta_path, {}) or {}
+        try:
+            with open(path, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+        except OSError:
+            return False
+        if meta.get("sha256") and meta["sha256"] != digest:
+            LOG.warning("data %s: checksum mismatch, discarding", r.key)
+            for p in (path, meta_path):
+                with contextlib.suppress(OSError):
+                    os.remove(p)
+            self._set_status(r.key, state="error",
+                             message="Cached copy was damaged; will "
+                                     "download again.")
+            return False
+        try:
+            obj = r.loader(path)
+        except Exception as e:                       # noqa: BLE001
+            LOG.warning("data %s: load failed: %s", r.key, e)
+            self._set_status(r.key, state="error",
+                             message=f"Couldn't read cached copy ({e}).")
+            return False
+        with self.lock:
+            self.objects[r.key] = obj
+        self._set_status(r.key, state="ready",
+                         message=f"ready, {meta.get('summary', '')}".strip(", "),
+                         version=time.strftime(
+                             "%Y-%m-%d", time.localtime(meta.get("fetched", 0)))
+                         if meta.get("fetched") else "",
+                         size=os.path.getsize(path))
+        return True
+
+    def _due(self, r):
+        path, meta_path = self._paths(r)
+        meta = read_json(meta_path, {}) or {}
+        now = time.time()
+        if meta.get("next_retry", 0) > now:
+            return False
+        if not os.path.exists(path):
+            return True
+        return now - meta.get("fetched", 0) > r.refresh_days * 86400
+
+    def _download(self, r):
+        path, meta_path = self._paths(r)
+        meta = read_json(meta_path, {}) or {}
+        self._set_status(r.key, state="downloading", message="downloading…")
+        tmp = path + f".download{os.getpid()}"
+        try:
+            req = urllib.request.Request(r.url, headers={
+                "User-Agent": f"{APP_NAME}/{SCRIPT_VERSION}"})
+            total = 0
+            with urllib.request.urlopen(req, timeout=40) as resp, \
+                    open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > r.max_bytes:
+                        raise ValueError("file larger than expected")
+                    f.write(chunk)
+            ok, summary = r.validator(tmp)
+            if not ok:
+                raise ValueError(f"downloaded file failed validation "
+                                 f"({summary})")
+            with open(tmp, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            os.replace(tmp, path)
+            atomic_write_json(meta_path, {
+                "fetched": time.time(), "sha256": digest, "source": r.url,
+                "summary": summary, "fails": 0, "next_retry": 0,
+                "app_version": SCRIPT_VERSION})
+            LOG.info("data %s: downloaded (%s)", r.key, summary)
+            return True
+        except Exception as e:                       # noqa: BLE001
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            fails = int(meta.get("fails", 0)) + 1
+            backoff = min(86400, 3600 * (2 ** (fails - 1)))
+            meta.update({"fails": fails, "next_retry": time.time() + backoff,
+                         "last_error": str(e)[:200]})
+            with contextlib.suppress(OSError):
+                atomic_write_json(meta_path, meta)
+            LOG.info("data %s: download failed (%s); retry in %ss",
+                     r.key, e, backoff)
+            have = r.key in self.objects
+            self._set_status(
+                r.key, state="ready" if have else "error",
+                message=("ready (refresh failed — using cached copy)" if have
+                         else f"unavailable offline ({str(e)[:80]})"))
+            return False
+
+    def start(self, force=False):
+        """Load cached copies, then refresh anything due — all in the
+        background."""
+        if self._busy:
+            return
+        self._busy = True
+
+        def run():
+            try:
+                for r in DATA_MANIFEST:
+                    if self._stop:
+                        return
+                    if not self.enabled(r):
+                        if r.key not in self.objects:
+                            self._set_status(r.key, state="disabled",
+                                             message="off")
+                        continue
+                    if r.key not in self.objects:
+                        self._verify_and_load(r)
+                        self._notify()
+                    if force or self._due(r):
+                        if self._download(r):
+                            self._verify_and_load(r)
+                        self._notify()
+                    elif r.key not in self.objects:
+                        self._set_status(r.key, state="error",
+                                         message="waiting to retry download")
+            finally:
+                self._busy = False
+                self._notify()
+        threading.Thread(target=run, daemon=True, name="data-manager").start()
+
+    def unload_disabled(self):
+        for r in DATA_MANIFEST:
+            if not self.enabled(r):
+                with self.lock:
+                    self.objects.pop(r.key, None)
+                self._set_status(r.key, state="disabled", message="off")
+
+    def _notify(self):
+        cb = self.on_change
+        if cb:
+            try:
+                cb()
+            except Exception:                        # noqa: BLE001
+                LOG.exception("data manager callback")
+
+    def stop(self):
+        self._stop = True
+
+
+DATA = None   # the running DataManager (set by the app; None in self-tests)
+
+# ============================================================================
+#  4.  Constants, palettes and small helpers
+# ============================================================================
+PRIVATE_NETS = [ipaddress.ip_network(n) for n in
+                ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                 "169.254.0.0/16", "127.0.0.0/8", "100.64.0.0/10",
+                 "224.0.0.0/4", "fe80::/10", "fc00::/7", "::1/128",
+                 "ff00::/8")]
+
+KNOWN_DNS = {
+    "8.8.8.8": "Google DNS", "8.8.4.4": "Google DNS",
+    "1.1.1.1": "Cloudflare DNS", "1.0.0.1": "Cloudflare DNS",
+    "9.9.9.9": "Quad9 DNS", "149.112.112.112": "Quad9 DNS",
+    "208.67.222.222": "OpenDNS", "208.67.220.220": "OpenDNS",
+    "64.6.64.6": "Verisign DNS", "64.6.65.6": "Verisign DNS",
+    "77.88.8.8": "Yandex DNS", "77.88.8.1": "Yandex DNS",
+    "94.140.14.14": "AdGuard DNS", "94.140.15.15": "AdGuard DNS",
+}
+
+DOH_HOSTS = {
+    "cloudflare-dns.com": "Cloudflare (encrypted DNS)",
+    "dns.google": "Google (encrypted DNS)",
+    "dns.quad9.net": "Quad9 (encrypted DNS)",
+    "doh.opendns.com": "OpenDNS (encrypted DNS)",
+    "dns.nextdns.io": "NextDNS (encrypted DNS)",
+    "doh.adguard.com": "AdGuard (encrypted DNS)",
+}
+
+DNS_TYPES = {1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR",
+             15: "MX", 16: "TXT", 28: "AAAA", 33: "SRV", 43: "DS",
+             46: "RRSIG", 48: "DNSKEY", 65: "HTTPS", 255: "ANY"}
+DHCP_MSG = {1: "asking for an address", 2: "offering an address",
+            3: "accepting the offer", 4: "declining", 5: "confirmed",
+            6: "refused", 7: "releasing", 8: "asking for info"}
+
+FRIENDLY_PROTO = {
+    "DNS":    "Website lookup",
+    "mDNS":   "Local name lookup",
+    "LLMNR":  "Local name lookup",
+    "NBNS":   "Local name lookup",
+    "HTTP":   "Unsecured web request",
+    "TLS":    "Secure web connection",
+    "QUIC":   "Secure web connection",
+    "DHCP":   "Getting an IP address",
+    "SSDP":   "Device discovery",
+    "TCP":    "Internet connection",
+    "UDP":    "Quick message",
+    "ICMP":   "Ping / error reply",
+    "ARP":    "Finding a device",
+}
+
+# Well-known ports -> plain-English service names. Used to make generic
+# TCP/UDP rows ("Connecting ...") much more informative without having to
+# decode the payload.
+PORT_SERVICES = {
+    20: "File transfer (FTP data)", 21: "File transfer (FTP)",
+    22: "Remote terminal (SSH)", 23: "Remote terminal (Telnet, not secure)",
+    25: "Sending email (SMTP)", 587: "Sending email (SMTP)",
+    465: "Sending email (SMTP, secure)",
+    69: "File transfer (TFTP)",
+    80: "Web browsing", 8080: "Web browsing (alternate port)",
+    110: "Checking email (POP3)", 995: "Checking email (POP3, secure)",
+    111: "Remote file access (NFS)", 2049: "Remote file access (NFS)",
+    123: "Checking the time (NTP)",
+    137: "Local name lookup (NetBIOS)", 138: "Local name lookup (NetBIOS)",
+    139: "Windows file sharing (NetBIOS)",
+    143: "Checking email (IMAP)", 993: "Checking email (IMAP, secure)",
+    161: "Network monitoring (SNMP)", 162: "Network monitoring (SNMP)",
+    389: "Company directory lookup (LDAP)",
+    443: "Secure web browsing",
+    445: "Windows file sharing (SMB)",
+    514: "System log messages (syslog)",
+    546: "Getting an IP address (DHCPv6)",
+    547: "Getting an IP address (DHCPv6)",
+    554: "Streaming video (RTSP)",
+    631: "Printing (IPP)",
+    1433: "Database connection (SQL Server)",
+    1883: "Smart home messaging (MQTT)",
+    8883: "Smart home messaging (MQTT, secure)",
+    1900: "Device discovery (SSDP)",
+    3306: "Database connection (MySQL)",
+    3389: "Remote desktop (RDP)",
+    5060: "Internet calling (SIP)", 5061: "Internet calling (SIP, secure)",
+    5353: "Local name lookup (mDNS)",
+    5432: "Database connection (PostgreSQL)",
+    5900: "Remote screen sharing (VNC)",
+    6379: "In-memory database (Redis)",
+    7000: "Streaming to a speaker/TV (AirPlay)",
+    8443: "Secure web browsing (alternate port)",
+    9100: "Printing (raw / JetDirect)",
+    32400: "Media server (Plex)",
+}
+
+# mDNS service-type substrings -> the kind of device that usually offers
+# them. Purely for friendlier "what is this thing" guesses in the Devices
+# tab — nothing here changes what is captured, only how it's labeled.
+MDNS_SERVICE_HINTS = (
+    ("_googlecast", "tv"), ("_airplay", "speaker"), ("_raop", "speaker"),
+    ("_spotify-connect", "speaker"), ("_sonos", "speaker"),
+    ("_ipp", "printer"), ("_printer", "printer"),
+    ("_pdl-datastream", "printer"),
+    ("_homekit", "iot"), ("_hap", "iot"), ("_matter", "iot"),
+    ("_smartthings", "iot"),
+    ("_nvstream", "console"), ("_xbox", "console"),
+    ("_ps5", "console"), ("_ps4", "console"),
+    ("_ssh", "computer"), ("_smb", "computer"), ("_afpovertcp", "computer"),
+    ("_rdlink", "computer"), ("_workstation", "computer"),
+)
+
+# SERVER/ST/NT header keywords from SSDP announcements -> device kind.
+SSDP_HINTS = (
+    ("chromecast", "tv"), ("google cast", "tv"), ("roku", "tv"),
+    ("smarttv", "tv"), ("bravia", "tv"), ("androidtv", "tv"),
+    ("airplay", "speaker"), ("sonos", "speaker"), ("bose", "speaker"),
+    ("philips hue", "iot"), ("hue bridge", "iot"), ("wemo", "iot"),
+    ("printer", "printer"),
+    ("xbox", "console"), ("playstation", "console"), ("nintendo", "console"),
+    ("router", "router"), ("gateway", "router"),
+)
+
+# How often (seconds) the background LAN scanner nudges the network for
+# quiet/idle devices (ARP + mDNS + SSDP). Kept gentle — this only ever
+# touches your own local subnet.
+SCAN_INTERVAL = 40
+SCAN_MAX_HOSTS = 1024  # skip the active ARP sweep on unusually large subnets
+
+DEVICE_ICONS = {
+    "router": "🌐", "this-pc": "🖥️", "phone": "📱", "tablet": "📱",
+    "computer": "💻", "printer": "🖨️", "tv": "📺", "console": "🎮",
+    "iot": "🔌", "camera": "📷", "speaker": "🔊", "unknown": "❓",
+}
+
+TAG_COLORS = {
+    "DNS":   ("#6a2ca0", "#f6ecff"),
+    "mDNS":  ("#6a2ca0", "#f6ecff"),
+    "LLMNR": ("#6a2ca0", "#f6ecff"),
+    "HTTP":  ("#0b6b3a", "#eafaf0"),
+    "TLS":   ("#0b5394", "#eef4fb"),
+    "QUIC":  ("#0b5394", "#eef4fb"),
+    "DHCP":  ("#8a5a00", "#fff5e0"),
+    "NBNS":  ("#8a5a00", "#fff5e0"),
+    "SSDP":  ("#8a5a00", "#fff5e0"),
+    "TCP":   ("#124e8c", None),
+    "UDP":   ("#1d6b2e", None),
+    "ICMP":  ("#a01a08", None),
+    "ARP":   ("#8a5a00", None),
+    "OTHER": ("#3a3a3a", None),
+}
+
+# Every literal color used anywhere in this file's light-mode UI, mapped to
+# a deliberately-chosen (not just inverted) dark equivalent. Dark Mode is
+# applied by walking the widget tree and swapping any bg/fg that matches a
+# key here — new widgets automatically pick up theming as long as they're
+# built from this same palette, no per-widget registration needed. The
+# brand navy header (#2b3a55) and its light subtitle (#c8d2e0) are left
+# out on purpose: that chrome already reads fine unchanged in both themes.
+LIGHT_TO_DARK_HEX = {
+    # backgrounds / surfaces
+    "#ffffff": "#20232c", "#f4f5f7": "#161920", "#fbfbfb": "#1b1e26",
+    "#f6f7fa": "#252933", "#e6e8ec": "#242832", "#e3e6eb": "#1a1d24",
+    "#fff5e0": "#3a2c10", "#fff4e0": "#3b2d11", "#f6ecff": "#2a1f3a",
+    "#e8f0fe": "#1c2c40", "#eef4fb": "#1a2735", "#fbe9e7": "#3a1712",
+    "#eafaf0": "#132a1d", "#e6f4ea": "#173625",
+    # borders
+    "#cfd6e0": "#3a3f4a", "#e0e2e8": "#343945",
+    # text / accents (every value below is unique so Light<->Dark is lossless)
+    "#8a5a00": "#e0a83a", "#a05608": "#e6b04a", "#7a4a00": "#d99b30",
+    "#0b6b3a": "#4ad080", "#1d6b2e": "#58d88a", "#6a2ca0": "#c299e8",
+    "#333333": "#e2e5ea", "#222222": "#eceff3", "#3a3a3a": "#d8dbe2",
+    "#a01a08": "#ff7a63", "#8a1a08": "#ff8a72",
+    "#0b5394": "#6fb8f0", "#124e8c": "#79bff2", "#1a3a6b": "#bcd4f5",
+    "#666666": "#9aa3b2", "#888888": "#8f98a8",
+    # section-heading text: the brand navy (#2b3a55) is reserved for the
+    # header bar's *background*; headings use this 1-step-off twin so they
+    # can flip to a light blue in Dark mode without touching the bar
+    "#2b3a56": "#9db4dc",
+    # tooltips / soft highlight surfaces
+    "#fffbe6": "#2d2a1a",
+    # bookmarked packet row
+    "#fff2a8": "#4a4214",
+}
+DARK_TO_LIGHT_HEX = {v: k for k, v in LIGHT_TO_DARK_HEX.items()}
+_DEFAULT_FG_NAMES = {"black", "#000000", "systemwindowtext",
+                     "systembuttontext", "systemmenutext",
+                     "systemcaptiontext"}
+_RETHEME_COLOR_OPTS = ("bg", "background", "fg", "foreground",
+                       "activebackground", "activeforeground",
+                       "selectbackground", "selectforeground",
+                       "insertbackground", "highlightbackground")
+
+THEME_LIGHT = {
+    "window_bg": "#f4f5f7", "tab_bg": "#ffffff", "text_bg": "#fbfbfb",
+    "text_fg": "#222222", "muted_fg": "#666666",
+    "info_fg": "#333333", "warn_bg": "#fff5e0", "warn_fg": "#8a5a00",
+    "danger_bg": "#fbe9e7", "danger_fg": "#8a1a08",
+    "good_fg": "#0b6b3a", "card_bg": "#f6f7fa", "border": "#e0e2e8",
+    "mode_active_bg": "#e6f4ea", "mode_active_fg": "#0b6b3a",
+    "mode_quiet_bg": "#e8f0fe", "mode_quiet_fg": "#1a3a6b",
+    "accent": "#2b7de9", "side_bg": "#e6e8ec", "side_sel": "#ffffff",
+    # charts / map (drawn on canvases every redraw, so tokens not hex-maps)
+    "chart_down": "#2b7de9", "chart_up": "#e07b00", "chart_a": "#6a2ca0",
+    "chart_b": "#0b6b3a", "chart_c": "#a01a08", "chart_d": "#8a5a00",
+    "chart_e": "#0b5394", "grid": "#e6e8ec", "axis": "#888888",
+    "node_router": "#2b7de9", "node_remote": "#888888",
+    "node_site": "#0b6b3a", "line": "#cfd6e0", "line_hi": "#2b7de9",
+    "tooltip_bg": "#fffbe6", "tooltip_fg": "#333333",
+    "conf_high": "#0b6b3a", "conf_med": "#8a5a00", "conf_low": "#a05608",
+    "conf_none": "#888888", "focus": "#2b7de9",
+}
+THEME_DARK = {
+    "window_bg": "#161920", "tab_bg": "#20232c", "text_bg": "#1b1e26",
+    "text_fg": "#e2e5ea", "muted_fg": "#9aa3b2",
+    "info_fg": "#c7ccd6", "warn_bg": "#3a2c10", "warn_fg": "#e0a83a",
+    "danger_bg": "#3a1712", "danger_fg": "#ff7a63",
+    "good_fg": "#4ad080", "card_bg": "#252933", "border": "#343945",
+    "mode_active_bg": "#173625", "mode_active_fg": "#7be0a0",
+    "mode_quiet_bg": "#1c2c40", "mode_quiet_fg": "#8fc0ef",
+    "accent": "#2f6fc0", "side_bg": "#1a1d24", "side_sel": "#2b303c",
+    "chart_down": "#5aa7f5", "chart_up": "#f2a541", "chart_a": "#c299e8",
+    "chart_b": "#4ad080", "chart_c": "#ff7a63", "chart_d": "#e0a83a",
+    "chart_e": "#6fb8f0", "grid": "#2c313c", "axis": "#8f98a8",
+    "node_router": "#5aa7f5", "node_remote": "#8f98a8",
+    "node_site": "#4ad080", "line": "#3a3f4a", "line_hi": "#5aa7f5",
+    "tooltip_bg": "#2d2a1a", "tooltip_fg": "#e2e5ea",
+    "conf_high": "#4ad080", "conf_med": "#e0a83a", "conf_low": "#e6b04a",
+    "conf_none": "#8f98a8", "focus": "#5aa7f5",
+}
+
+
+# ---- High-contrast variants (Section 22 accessibility) ---------------------
+# Generated from the same canonical palette so every widget that themes for
+# Light/Dark themes for High Contrast too, and switching between any two
+# palettes is lossless (verified by a test: every palette is one-to-one).
+def _hex_rgb(h):
+    h = h.lstrip("#")
+    return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def _rgb_hex(r, g, b):
+    return "#%02x%02x%02x" % (max(0, min(255, int(r))),
+                              max(0, min(255, int(g))),
+                              max(0, min(255, int(b))))
+
+
+def _hex_lum(h):
+    r, g, b = (c / 255.0 for c in _hex_rgb(h))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _hex_mix(h, target, t):
+    a, b = _hex_rgb(h), _hex_rgb(target)
+    return _rgb_hex(*(a[i] + (b[i] - a[i]) * t for i in range(3)))
+
+
+def _build_hc_palettes():
+    used = set(LIGHT_TO_DARK_HEX) | set(LIGHT_TO_DARK_HEX.values())
+    light_hc, dark_hc = {}, {}
+
+    def unique(h):
+        r, g, b = _hex_rgb(h)
+        while h in used:
+            b = (b + 1) % 256
+            h = _rgb_hex(r, g, b)
+        used.add(h)
+        return h
+
+    borders = {"#cfd6e0": ("#4a5260", "#9aa3b2"),
+               "#e0e2e8": ("#4a5260", "#8a93a3")}
+    for canon, dk in LIGHT_TO_DARK_HEX.items():
+        lum = _hex_lum(canon)
+        if canon in borders:
+            light_hc[canon] = unique(borders[canon][0])
+            dark_hc[canon] = unique(borders[canon][1])
+        elif lum > 0.75:                      # surfaces
+            light_hc[canon] = canon           # identity: already max contrast
+            dark_hc[canon] = unique(_hex_mix(dk, "#000000", 0.65))
+        else:                                 # text and accent colours
+            light_hc[canon] = unique(_hex_mix(canon, "#000000", 0.5))
+            dark_hc[canon] = unique(_hex_mix(dk, "#ffffff", 0.55))
+    return light_hc, dark_hc
+
+
+HC_LIGHT_HEX, HC_DARK_HEX = _build_hc_palettes()
+PALETTES = {"Light": {}, "Dark": LIGHT_TO_DARK_HEX,
+            "Light HC": HC_LIGHT_HEX, "Dark HC": HC_DARK_HEX}
+
+# any known palette colour -> its canonical (light) colour
+_CANON = {}
+for _pname, _tbl in PALETTES.items():
+    for _canon, _val in _tbl.items():
+        if _val != _canon:
+            _CANON[_val] = _canon
+
+
+def palette_name(theme, high_contrast):
+    return f"{theme}{' HC' if high_contrast else ''}"
+
+
+def _theme_variant(base, palette):
+    """Derive a theme-token dict for `palette` from an existing one."""
+    table = PALETTES[palette]
+    out = {}
+    for k, v in base.items():
+        canon = _CANON.get(v, v)
+        if canon in table:
+            out[k] = table[canon]
+        elif palette.startswith("Dark") and palette.endswith("HC"):
+            out[k] = _hex_mix(v, "#000000", 0.65) if _hex_lum(v) < 0.2 \
+                else _hex_mix(v, "#ffffff", 0.55)
+        elif palette == "Light HC":
+            out[k] = _hex_mix(v, "#000000", 0.5) if _hex_lum(v) < 0.6 else v
+        else:
+            out[k] = v
+    return out
+
+
+THEMES = {
+    "Light": THEME_LIGHT, "Dark": THEME_DARK,
+    "Light HC": _theme_variant(THEME_LIGHT, "Light HC"),
+    "Dark HC": _theme_variant(THEME_DARK, "Dark HC"),
+}
+# accents used for selection/focus must stay readable in every palette
+THEMES["Light HC"]["accent"] = "#0a246a"
+THEMES["Dark HC"]["accent"] = "#ffd400"
+THEMES["Light HC"]["focus"] = "#0a246a"
+THEMES["Dark HC"]["focus"] = "#ffd400"
+THEMES["Light HC"]["line_hi"] = "#0a246a"
+THEMES["Dark HC"]["line_hi"] = "#ffd400"
+THEMES["Dark HC"]["grid"] = "#4a5260"
+THEMES["Light HC"]["grid"] = "#9aa3b2"
+
+
+def is_private_ip(ip):
+    if not ip:
+        return False
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for n in PRIVATE_NETS:
+        try:
+            if a in n:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _human_bytes(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def is_public_ip(ip):
+    if not ip:
+        return False
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not a.is_private and not a.is_multicast and not a.is_loopback \
+        and not a.is_link_local and not a.is_reserved and not a.is_unspecified
+
+
+def _int_to_ip(n):
+    try:
+        return _socket.inet_ntoa(struct.pack("!I", int(n) & 0xffffffff))
+    except Exception:
+        return "0.0.0.0"
+
+
+def local_subnet_for(iface, my_ip):
+    """Best-effort: the directly-connected IPv4 subnet for this interface,
+    so the active scan only ever touches your own local Wi-Fi/LAN — never
+    anything beyond your router."""
+    if not my_ip:
+        return None
+    iface_name = str(getattr(iface, "name", iface) or "")
+    try:
+        for entry in conf.route.routes:
+            try:
+                net, mask, gw, rif, addr = entry[0], entry[1], entry[2], \
+                    entry[3], entry[4]
+            except Exception:
+                continue
+            if addr != my_ip or not net:
+                continue
+            if gw not in ("0.0.0.0", "", "*", None):
+                continue
+            r_name = str(getattr(rif, "name", rif) or "")
+            if iface_name and r_name != iface_name:
+                continue
+            try:
+                return ipaddress.ip_network(
+                    f"{_int_to_ip(net)}/{_int_to_ip(mask)}", strict=False)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    try:
+        a, b, c, _d = my_ip.split(".")
+        return ipaddress.ip_network(f"{a}.{b}.{c}.0/24", strict=False)
+    except Exception:
+        return None
+
+
+def _name_bytes(raw):
+    if raw is None:
+        return ""
+    if isinstance(raw, bytes):
+        try:
+            return raw.decode("idna").rstrip(".")
+        except Exception:
+            try:
+                return raw.decode("latin-1").rstrip(".")
+            except Exception:
+                return ""
+    return str(raw).rstrip(".")
+
+
+def _iter_rrs(rr):
+    """Yield each DNSRR record from a DNS answer/ns/ar field. Handles both
+    how current scapy represents it (a plain list of DNSRR) and the older
+    linked '.payload' chain, so this keeps working across scapy versions."""
+    if rr is None:
+        return
+    if isinstance(rr, (list, tuple)):
+        for item in rr:
+            if isinstance(item, DNSRR):
+                yield item
+        return
+    while rr is not None and isinstance(rr, DNSRR):
+        yield rr
+        nxt = rr.payload
+        rr = nxt if isinstance(nxt, DNSRR) else None
+
+
+def _rdata_ip(rr):
+    """The plain IP string for an A/AAAA record, however this scapy
+    version represents it: a ready-made string (current scapy's
+    IPField/IP6Field) or raw bytes (older scapy)."""
+    rd = rr.rdata
+    if rr.type == 1:
+        if isinstance(rd, str):
+            return rd
+        if isinstance(rd, bytes) and len(rd) == 4:
+            return ".".join(str(b) for b in rd)
+    elif rr.type == 28:
+        if isinstance(rd, str):
+            return rd
+        if isinstance(rd, bytes) and len(rd) == 16:
+            return ":".join(f"{(rd[i] << 8) | rd[i + 1]:x}"
+                            for i in range(0, 16, 2))
+    return None
+
+
+def _rdata_str(rr):
+    rd = rr.rdata
+    if isinstance(rd, str):
+        return rd.rstrip(".")
+    if isinstance(rd, bytes):
+        if rr.type == 1 and len(rd) == 4:
+            return ".".join(str(b) for b in rd)
+        if rr.type == 28 and len(rd) == 16:
+            return ":".join(f"{(rd[i] << 8) | rd[i + 1]:x}"
+                            for i in range(0, 16, 2))
+        try:
+            return rd.decode("utf-8", "ignore").rstrip(".")
+        except Exception:
+            return rd.hex()
+    if isinstance(rd, (list, tuple)):  # e.g. TXT records
+        return " ".join(p.decode("utf-8", "ignore") if isinstance(p, bytes)
+                        else str(p) for p in rd)
+    return str(rd)
+
+
+def mac_vendor(mac):
+    """Manufacturer for a MAC: the downloaded vendor list first, then
+    scapy's bundled one. Randomized (private) MACs have no vendor."""
+    if not mac or is_randomized_mac(mac):
+        return ""
+    db = DATA.get("oui") if DATA is not None else None
+    if db is not None:
+        v = db.lookup(mac)
+        if v:
+            return v
+    try:
+        m = mac.lower().replace("-", ":")
+        v = conf.manufdb._get_manuf(m)
+        if v and v.lower() != m:
+            return v
+    except Exception:
+        pass
+    return ""
+
+
+def guess_device_type(hostname, vendor, ip, gateway_ip, my_ips):
+    h = (hostname or "").lower()
+    v = (vendor or "").lower()
+    if gateway_ip and ip == gateway_ip:
+        return "router"
+    if ip in my_ips:
+        return "this-pc"
+    checks = [
+        (("iphone", "ipad", "android", "galaxy", "pixel", "phone"),
+         "phone"),
+        (("ipad", "tablet", "tab"), "tablet"),
+        (("macbook", "imac", "mac-", "desktop", "laptop", "pc-",
+          "windows", "linux"), "computer"),
+        (("printer", "hp-", "canon", "epson", "brother"), "printer"),
+        (("tv", "roku", "chromecast", "appletv", "firetv", "bravia",
+          "samsung-tv", "smarttv"), "tv"),
+        (("xbox", "playstation", "ps4", "ps5", "nintendo", "switch"),
+         "console"),
+        (("echo", "alexa", "homepod", "google-home", "speaker"), "speaker"),
+        (("cam", "camera", "nest", "ring", "wyze"), "camera"),
+        (("espressif", "tuya", "sonoff", "shelly", "smart"),
+         "iot"),
+    ]
+    for keys, kind in checks:
+        if any(k in h for k in keys):
+            return kind
+    # vendor fallback
+    if any(x in v for x in ("apple",)):
+        return "phone"
+    if any(x in v for x in ("samsung", "huawei", "xiaomi", "oneplus",
+                            "oppo", "vivo", "motorola")):
+        return "phone"
+    if any(x in v for x in ("intel", "dell", "hp inc", "lenovo",
+                            "asus", "acer", "toshiba", "micro-star",
+                            "gigabyte")):
+        return "computer"
+    if any(x in v for x in ("brother", "canon", "epson", "hewlett")):
+        return "printer"
+    if any(x in v for x in ("sony", "lg electronics", "tcl", "vizio",
+                            "roku", "amazon")):
+        return "tv"
+    if any(x in v for x in ("espressif", "tuya", "sonoff", "shelly",
+                            "raspberr", "arduino")):
+        return "iot"
+    return "unknown"
+
+
+
+# ---- 4b.  More well-known services (added in 3.0) --------------------------
+PORT_SERVICES.update({
+    53: "Website lookup (DNS)", 67: "Getting an IP address (DHCP)",
+    68: "Getting an IP address (DHCP)", 88: "Windows sign-in (Kerberos)",
+    135: "Windows remote management (RPC)", 548: "Apple file sharing (AFP)",
+    636: "Company directory lookup (LDAP, secure)",
+    853: "Encrypted DNS (DNS-over-TLS)", 873: "File sync (rsync)",
+    989: "File transfer (FTPS)", 990: "File transfer (FTPS)",
+    1194: "VPN tunnel (OpenVPN)", 500: "VPN tunnel (IPsec)",
+    4500: "VPN tunnel (IPsec NAT-T)", 1701: "VPN tunnel (L2TP)",
+    1723: "VPN tunnel (PPTP, outdated)", 51820: "VPN tunnel (WireGuard)",
+    41641: "VPN mesh (Tailscale)", 9993: "VPN mesh (ZeroTier)",
+    1521: "Database connection (Oracle)", 27017: "Database connection (MongoDB)",
+    9200: "Search database (Elasticsearch)", 11211: "Cache server (memcached)",
+    5672: "Message queue (AMQP)", 5683: "Smart home messaging (CoAP)",
+    1935: "Live video streaming (RTMP)", 8554: "Streaming video (RTSP)",
+    3283: "Remote screen sharing (Apple Remote Desktop)",
+    5938: "Remote support (TeamViewer)", 5985: "Remote management (WinRM)",
+    5986: "Remote management (WinRM, secure)",
+    3478: "Video/voice call relay (STUN/TURN)",
+    3479: "Video/voice call relay (STUN/TURN)",
+    19302: "Video/voice call relay (Google STUN)",
+    5222: "Chat messaging (XMPP)", 5223: "Apple push notifications",
+    5228: "Android push notifications", 8009: "Casting control (Chromecast)",
+    62078: "iPhone/iPad sync", 3702: "Device discovery (WS-Discovery)",
+    5355: "Local name lookup (LLMNR)", 7680: "Windows Update sharing",
+    27015: "Online gaming (Steam)", 27036: "Steam in-home streaming",
+    3074: "Online gaming (Xbox Live)", 3659: "Online gaming",
+    25565: "Online gaming (Minecraft)", 19132: "Online gaming (Minecraft)",
+    9295: "Remote play (PlayStation)", 9308: "PlayStation network",
+    6881: "File sharing (BitTorrent)", 8000: "Web service (alternate port)",
+    8008: "Web service (alternate port)", 8888: "Web service (alternate port)",
+    10000: "Web admin (alternate port)", 1080: "Proxy server (SOCKS)",
+    3128: "Proxy server (HTTP)",
+})
+
+# Protocols that send their contents without encryption when used.
+CLEARTEXT_PORTS = {21: "FTP", 23: "Telnet", 69: "TFTP", 110: "POP3",
+                   143: "IMAP", 161: "SNMP", 513: "rlogin", 514: "rsh/syslog"}
+# Services that let someone control a device remotely.
+REMOTE_ACCESS_PORTS = {22: "SSH", 23: "Telnet", 3389: "Remote Desktop (RDP)",
+                       5900: "VNC screen sharing", 5938: "TeamViewer",
+                       3283: "Apple Remote Desktop", 5985: "WinRM",
+                       5986: "WinRM"}
+REMOTE_ACCESS_MDNS = ("_ssh._tcp", "_rfb._tcp", "_sftp-ssh._tcp",
+                      "_rdp._tcp", "_telnet._tcp", "_teamviewer")
+ENCRYPTED_PORTS = {22, 443, 465, 563, 636, 853, 989, 990, 993, 995, 3389,
+                   5061, 5223, 8443, 8883, 51820, 1194, 4500, 500, 41641}
+VPN_PORTS = {1194: "OpenVPN", 51820: "WireGuard", 500: "IPsec",
+             4500: "IPsec", 1701: "L2TP", 1723: "PPTP", 41641: "Tailscale",
+             9993: "ZeroTier"}
+
+# Public resolver addresses commonly used for encrypted DNS (DoH/DoT).
+DOH_IPS = {
+    "1.1.1.1": "Cloudflare", "1.0.0.1": "Cloudflare",
+    "8.8.8.8": "Google", "8.8.4.4": "Google", "9.9.9.9": "Quad9",
+    "149.112.112.112": "Quad9", "208.67.222.222": "OpenDNS",
+    "208.67.220.220": "OpenDNS", "94.140.14.14": "AdGuard",
+    "94.140.15.15": "AdGuard", "45.90.28.0": "NextDNS",
+    "45.90.30.0": "NextDNS", "2606:4700:4700::1111": "Cloudflare",
+    "2001:4860:4860::8888": "Google",
+}
+DOH_HOSTS.update({
+    "mozilla.cloudflare-dns.com": "Cloudflare for Firefox (encrypted DNS)",
+    "chrome.cloudflare-dns.com": "Cloudflare for Chrome (encrypted DNS)",
+    "one.one.one.one": "Cloudflare (encrypted DNS)",
+    "dns.adguard-dns.com": "AdGuard (encrypted DNS)",
+    "doh.cleanbrowsing.org": "CleanBrowsing (encrypted DNS)",
+    "dns.mullvad.net": "Mullvad (encrypted DNS)",
+    "doh.mullvad.net": "Mullvad (encrypted DNS)",
+    "dns.alidns.com": "AliDNS (encrypted DNS)",
+    "doh.pub": "DNSPod (encrypted DNS)",
+    "dns.twnic.tw": "TWNIC (encrypted DNS)",
+    "dns.controld.com": "Control D (encrypted DNS)",
+    "freedns.controld.com": "Control D (encrypted DNS)",
+})
+
+# Built-in CDN suffixes (always available, purely local).
+CDN_SUFFIXES = ("akamaiedge.net", "akamai.net", "akamaized.net",
+                "edgekey.net", "edgesuite.net", "cloudfront.net",
+                "fastly.net", "fastlylb.net", "cloudflare.net",
+                "azureedge.net", "azurefd.net", "llnwd.net", "gstatic.com",
+                "googleusercontent.com", "ggpht.com", "fbcdn.net",
+                "cdninstagram.com", "aaplimg.com", "cdn77.org",
+                "b-cdn.net", "jsdelivr.net", "unpkg.com", "cdnjs.cloudflare.com",
+                "msedge.net", "trafficmanager.net", "footprint.net",
+                "edgecastcdn.net", "stackpathdns.com", "bunnycdn.com")
+
+# Adapter names/descriptions that are probably virtual, tunnels or VPNs.
+VIRTUAL_IFACE_WORDS = ("vmware", "virtualbox", "vbox", "hyper-v", "vethernet",
+                       "docker", "veth", "virbr", "br-", "vmnet", "parallels",
+                       "npcap loopback", "loopback", "bluetooth", "wan miniport",
+                       "isatap", "teredo", "6to4", "kernel debug", "pseudo",
+                       "ifb", "dummy", "lxc", "lxd", "podman", "cni", "flannel",
+                       "kube", "wsl")
+VPN_IFACE_WORDS = ("tun", "tap", "wg", "wireguard", "vpn", "openvpn", "utun",
+                   "ppp", "ipsec", "tailscale", "zerotier", "nordlynx",
+                   "proton", "mullvad", "fortinet", "cisco anyconnect",
+                   "globalprotect", "pangp", "juniper", "pulse", "wintun")
+
+# Detailed device classes (shown as "Likely <class>").
+DEVICE_CLASSES = ("Router", "Access point", "Windows PC", "Linux PC", "Mac",
+                  "iPhone", "Android phone", "Tablet", "Printer", "Smart TV",
+                  "Streaming device", "Console", "Speaker", "Camera", "NAS",
+                  "Server", "Smart-home/IoT", "Virtual machine",
+                  "Container/virtual interface", "This computer", "Unknown")
+CLASS_TO_TYPE = {
+    "Router": "router", "Access point": "router", "Windows PC": "computer",
+    "Linux PC": "computer", "Mac": "computer", "iPhone": "phone",
+    "Android phone": "phone", "Tablet": "tablet", "Printer": "printer",
+    "Smart TV": "tv", "Streaming device": "tv", "Console": "console",
+    "Speaker": "speaker", "Camera": "camera", "NAS": "nas",
+    "Server": "server", "Smart-home/IoT": "iot",
+    "Virtual machine": "vm", "Container/virtual interface": "vm",
+    "This computer": "this-pc", "Unknown": "unknown",
+}
+DEVICE_ICONS.update({"nas": "🗄️", "server": "🗄️", "vm": "🧩",
+                     "access-point": "📶"})
+
+TAG_COLORS.update({
+    "ICMPv6": ("#a01a08", None), "NDP": ("#8a5a00", "#fff5e0"),
+    "DHCPv6": ("#8a5a00", "#fff5e0"), "NTP": ("#1d6b2e", None),
+    "SSH": ("#0b5394", None), "RDP": ("#0b5394", None),
+    "SMB": ("#124e8c", None), "MQTT": ("#1d6b2e", None),
+    "FTP": ("#0b6b3a", "#eafaf0"), "TELNET": ("#0b6b3a", "#eafaf0"),
+    "SMTP": ("#124e8c", None), "IMAP": ("#124e8c", None),
+    "POP3": ("#124e8c", None), "SIP": ("#1d6b2e", None),
+    "RTSP": ("#1d6b2e", None), "DoT": ("#0b5394", "#eef4fb"),
+    "IGMP": ("#8a5a00", None),
+})
+FRIENDLY_PROTO.update({
+    "ICMPv6": "Ping / error reply (IPv6)", "NDP": "Finding a device (IPv6)",
+    "DHCPv6": "Getting an IPv6 address", "NTP": "Checking the time",
+    "SSH": "Remote terminal (encrypted)", "RDP": "Remote desktop",
+    "SMB": "Windows file sharing", "MQTT": "Smart home messaging",
+    "DoT": "Encrypted website lookup",
+})
+PROTO_FILTERS = ("All", "DNS", "HTTP", "TLS", "QUIC", "TCP", "UDP", "ICMP",
+                 "ARP", "NDP", "DHCP", "SSDP", "mDNS")
+
+# Application protocol inferred from a port (only when nothing better was
+# decoded from the payload — shown as "Likely ..." in that case).
+PORT_APP = {22: "SSH", 23: "TELNET", 21: "FTP", 25: "SMTP", 587: "SMTP",
+            465: "SMTP", 110: "POP3", 995: "POP3", 143: "IMAP", 993: "IMAP",
+            445: "SMB", 139: "SMB", 3389: "RDP", 123: "NTP", 1883: "MQTT",
+            8883: "MQTT", 554: "RTSP", 5060: "SIP", 5061: "SIP", 853: "DoT"}
+
+DHCPV6_MSG = {1: "looking for an IPv6 address (Solicit)",
+              2: "offering an IPv6 address (Advertise)",
+              3: "requesting an IPv6 address", 4: "confirming its address",
+              5: "renewing its address", 6: "rebinding its address",
+              7: "reply from the DHCPv6 server", 8: "releasing its address",
+              9: "declining an address", 11: "asking for network settings"}
+
+
+def human_rate(bps):
+    """Bytes per second → friendly text."""
+    bps = float(bps or 0)
+    for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
+        if bps < 1024 or unit == "GB/s":
+            return f"{bps:.0f} {unit}" if unit == "B/s" else \
+                f"{bps:.1f} {unit}"
+        bps /= 1024
+    return f"{bps:.1f} GB/s"
+
+
+def human_duration(sec):
+    sec = int(max(0, sec or 0))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60:02d}s"
+    if sec < 86400:
+        return f"{sec // 3600}h {(sec % 3600) // 60:02d}m"
+    return f"{sec // 86400}d {(sec % 86400) // 3600}h"
+
+
+def fmt_clock(ts, with_date=False):
+    if not ts:
+        return "—"
+    return time.strftime("%Y-%m-%d %H:%M:%S" if with_date else "%H:%M:%S",
+                         time.localtime(ts))
+
+
+def is_unicast_mac(mac):
+    """A MAC that identifies one adapter (not broadcast/multicast/zero)."""
+    if not mac:
+        return False
+    try:
+        first = int(mac.split(":")[0].split("-")[0], 16)
+    except (ValueError, IndexError):
+        return False
+    if first & 0x01:
+        return False
+    return mac.lower() not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
+
+
+def ip_obj(ip):
+    try:
+        return ipaddress.ip_address(ip)
+    except (ValueError, TypeError):
+        return None
+
+
+def is_multicast_or_broadcast(ip):
+    a = ip_obj(ip)
+    if a is None:
+        return False
+    return a.is_multicast or ip == "255.255.255.255" or a.is_unspecified
+
+
+def iface_name(iface):
+    return str(getattr(iface, "name", iface) or "")
+
+
+def iface_desc(iface):
+    return str(getattr(iface, "description", "") or "")
+
+
+def is_vpn_iface(iface):
+    text = (iface_name(iface) + " " + iface_desc(iface)).lower()
+    for w in VPN_IFACE_WORDS:
+        if len(w) <= 3:
+            if re.search(r"(^|[^a-z])" + re.escape(w) + r"\d*($|[^a-z])",
+                         text):
+                return True
+        elif w in text:
+            return True
+    return False
+
+
+def is_virtual_iface(iface):
+    text = (iface_name(iface) + " " + iface_desc(iface)).lower()
+    return any(w in text for w in VIRTUAL_IFACE_WORDS)
+
+
+def domain_category(host):
+    """Optional classification: Advertising / Analytics / Social /
+    Tracking / Content from the tracker list, CDN from the built-in list.
+    Returns (category, source) or ("", "")."""
+    h = (host or "").lower().strip(".")
+    db = DATA.get("trackers") if DATA is not None else None
+    if db is not None:
+        hit = db.classify(h)
+        if hit:
+            return hit[0], f"Disconnect list ({hit[1]})"
+    for suf in CDN_SUFFIXES:
+        if h == suf or h.endswith("." + suf):
+            return "CDN", "built-in CDN list"
+    return "", ""
+
+
+def registrable_domain(name):
+    """eTLD+1 grouping: the downloaded Public Suffix List when available,
+    otherwise a small built-in heuristic."""
+    n = (name or "").strip(".").lower()
+    psl = DATA.get("psl") if DATA is not None else None
+    if psl is not None:
+        return psl.registrable(n)
+    labels = n.split(".")
+    if len(labels) <= 2:
+        return n
+    last_two = ".".join(labels[-2:])
+    if last_two in _MULTI_LABEL_SUFFIXES and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return last_two
+
+
+_MULTI_LABEL_SUFFIXES = {
+    "co.uk", "org.uk", "gov.uk", "ac.uk", "me.uk", "ltd.uk", "plc.uk",
+    "co.jp", "ne.jp", "or.jp", "co.kr", "co.in", "co.nz", "co.za",
+    "com.au", "net.au", "org.au", "com.br", "com.mx", "com.cn", "net.cn",
+    "com.tw", "com.sg", "com.hk", "co.il", "co.th", "qc.ca", "gc.ca",
+    "github.io", "blogspot.com", "herokuapp.com", "appspot.com",
+    "cloudfront.net", "amazonaws.com", "azurewebsites.net",
+}
+
+
+# ============================================================================
+#  5.  Protocol decoder
+#
+#  Turns a scapy packet into one plain dict. It runs on the decode worker
+#  thread, never touches Tk, and never decrypts anything: for encrypted
+#  traffic it only reads what is visible on the wire (e.g. the TLS
+#  ClientHello's server name), and it says "Likely … (by port)" whenever a
+#  label comes from a port number rather than from the payload itself.
+# ============================================================================
+TLS_VERSIONS = {0x0300: "SSL 3.0", 0x0301: "TLS 1.0", 0x0302: "TLS 1.1",
+                0x0303: "TLS 1.2", 0x0304: "TLS 1.3"}
+
+
+def parse_tls_hello(rec):
+    """Parse a TLS handshake record (ClientHello or ServerHello). Returns a
+    dict with whatever was visible: sni, version, alpn, ech, kind.
+    Tolerates truncation (returns what it got)."""
+    out = {"kind": "", "sni": "", "version": "", "alpn": [], "ech": False}
+    try:
+        if len(rec) < 6 or rec[0] != 0x16 or rec[1] != 0x03:
+            return None
+        hs_type = rec[5]
+        if hs_type not in (1, 2):
+            return None
+        out["kind"] = "client" if hs_type == 1 else "server"
+        pos = 9
+        legacy = struct.unpack(">H", rec[pos:pos + 2])[0]
+        out["version"] = TLS_VERSIONS.get(legacy, "")
+        pos += 2 + 32                                     # version + random
+        sid_len = rec[pos]
+        pos += 1 + sid_len
+        if hs_type == 1:
+            cs_len = struct.unpack(">H", rec[pos:pos + 2])[0]
+            pos += 2 + cs_len
+            cm_len = rec[pos]
+            pos += 1 + cm_len
+        else:
+            pos += 2 + 1                                  # cipher + method
+        if pos + 2 > len(rec):
+            return out
+        ext_len = struct.unpack(">H", rec[pos:pos + 2])[0]
+        pos += 2
+        end = min(pos + ext_len, len(rec))
+        while pos + 4 <= end:
+            et, el = struct.unpack(">HH", rec[pos:pos + 4])
+            pos += 4
+            body = rec[pos:pos + el]
+            if et == 0 and len(body) >= 5:                # server_name
+                nl = struct.unpack(">H", body[3:5])[0]
+                host = body[5:5 + nl].decode("ascii", "ignore")
+                if host and re.match(r"^[A-Za-z0-9._-]+$", host):
+                    out["sni"] = host.lower()
+            elif et == 16 and len(body) >= 2:             # ALPN
+                p = 2
+                while p < len(body):
+                    ln = body[p]
+                    out["alpn"].append(body[p + 1:p + 1 + ln].decode(
+                        "ascii", "ignore"))
+                    p += 1 + ln
+            elif et == 43 and body:                       # supported_versions
+                if hs_type == 1:
+                    vers = [struct.unpack(">H", body[i:i + 2])[0]
+                            for i in range(1, 1 + body[0], 2)
+                            if i + 2 <= len(body)]
+                    if 0x0304 in vers:
+                        out["version"] = "TLS 1.3"
+                elif len(body) >= 2:
+                    out["version"] = TLS_VERSIONS.get(
+                        struct.unpack(">H", body[:2])[0], out["version"])
+            elif et == 0xfe0d:                            # ECH
+                out["ech"] = True
+            pos += el
+    except (IndexError, struct.error):
+        pass
+    return out
+
+
+def _try_tls_sni(load):
+    """Backward-compatible helper: SNI from a single segment, or None."""
+    r = parse_tls_hello(load)
+    return (r or {}).get("sni") or None
+
+
+class TlsReassembler:
+    """Modern ClientHellos (post-quantum key shares, many extensions) are
+    often larger than one TCP segment, and browsers randomise extension
+    order, so the server name can sit in the *second* segment. This keeps a
+    tiny, bounded, short-lived buffer per connection to stitch the first
+    handshake record back together. Nothing else is buffered."""
+
+    MAX_ENTRIES = 1024
+    MAX_RECORD = 16384 + 5
+    TTL = 4.0
+
+    def __init__(self):
+        self.buf = OrderedDict()
+
+    def feed(self, key, seq, payload, ts):
+        if not payload:
+            return None
+        if payload[0] == 0x16 and len(payload) >= 6 and payload[1] == 0x03 \
+                and payload[5] in (1, 2):
+            need = struct.unpack(">H", payload[3:5])[0] + 5
+            if need > self.MAX_RECORD:
+                return payload
+            if len(payload) >= need:
+                self.buf.pop(key, None)
+                return payload
+            self.buf[key] = [bytearray(payload), (seq + len(payload))
+                             & 0xffffffff, need, ts]
+            self._trim(ts)
+            return None
+        ent = self.buf.get(key)
+        if ent is None:
+            return None
+        if seq != ent[1]:
+            if ((seq - ent[1]) & 0xffffffff) > 0x7fffffff:
+                return None                   # old retransmission: ignore
+            self.buf.pop(key, None)           # gap: give up on this one
+            return bytes(ent[0])
+        ent[0].extend(payload)
+        ent[1] = (seq + len(payload)) & 0xffffffff
+        if len(ent[0]) >= ent[2] or len(ent[0]) > self.MAX_RECORD:
+            self.buf.pop(key, None)
+            return bytes(ent[0])
+        return None
+
+    def _trim(self, now):
+        while len(self.buf) > self.MAX_ENTRIES:
+            self.buf.popitem(last=False)
+        for k in list(self.buf)[:32]:
+            if now - self.buf[k][3] > self.TTL:
+                self.buf.pop(k, None)
+
+
+def mdns_service_hint(name):
+    """Guess a device kind from an mDNS service-type string, e.g.
+    '_googlecast._tcp.local.' -> 'tv'. Empty string if no match."""
+    n = (name or "").lower()
+    for key, kind in MDNS_SERVICE_HINTS:
+        if key in n:
+            return kind
+    return ""
+
+
+_SERVICE_RE = re.compile(r"(_[a-z0-9-]+\._(?:tcp|udp))", re.I)
+
+
+def _decode_dns(d, kind):
+    """Returns (text, learns, hint, info). `info` carries structured data:
+    id, qr, qname, qtype, rcode, answers, plus mDNS names/services/TXT."""
+    learns = []
+    hint = ""
+    qname, qtype = "", 0
+    if d.qd is not None and getattr(d, "qdcount", 1):
+        try:
+            q = d.qd[0] if isinstance(d.qd, (list, tuple)) else d.qd
+        except (IndexError, TypeError):
+            q = None
+        if q is not None:
+            qname = _name_bytes(getattr(q, "qname", b""))
+            qtype = getattr(q, "qtype", 0) or 0
+    info = {"id": int(getattr(d, "id", 0) or 0), "qr": int(d.qr or 0),
+            "qname": qname, "qtype": qtype, "rcode": int(d.rcode or 0),
+            "answers": [], "services": [], "names": [], "txt": {},
+            "hostnames": []}
+    if kind == "mDNS":
+        hint = mdns_service_hint(qname)
+        m = _SERVICE_RE.search(qname or "")
+        if m and d.qr == 0:
+            info["services"].append(m.group(1).lower())
+
+    if d.qr == 0:
+        return (f"Looking up {qname}" if qname else "DNS query"), learns, \
+            hint, info
+
+    answers, cname = [], ""
+    records = list(_iter_rrs(d.an))
+    if kind == "mDNS":
+        records += list(_iter_rrs(getattr(d, "ar", None)))
+    for rr in records:
+        rrname = _name_bytes(getattr(rr, "rrname", b""))
+        if kind == "mDNS":
+            if not hint:
+                hint = mdns_service_hint(rrname)
+            m = _SERVICE_RE.search(rrname)
+            if m:
+                svc = m.group(1).lower()
+                if svc not in info["services"]:
+                    info["services"].append(svc)
+                inst = rrname.split("._", 1)[0]
+                if rr.type == 16 and inst and not inst.startswith("_"):
+                    info["names"].append(inst)
+            if rr.type == 12:                               # PTR → instance
+                target = _rdata_str(rr)
+                inst = target.split("._", 1)[0]
+                if inst and not inst.startswith("_") and \
+                        "._" in target and inst not in info["names"]:
+                    info["names"].append(inst)
+            if rr.type == 16:                               # TXT
+                for part in (rr.rdata if isinstance(rr.rdata, (list, tuple))
+                             else [rr.rdata]):
+                    s = part.decode("utf-8", "ignore") if \
+                        isinstance(part, bytes) else str(part)
+                    if "=" in s:
+                        k, _, v = s.partition("=")
+                        if k.lower() in ("model", "md", "am", "ty", "fn",
+                                         "usb_mdl", "product", "rpmd"):
+                            info["txt"][k.lower()] = v[:60]
+        if rr.type == 5:
+            cname = _rdata_str(rr)
+            continue
+        ip = _rdata_ip(rr)
+        if ip:
+            answers.append(ip)
+            if kind == "mDNS":
+                if rrname:
+                    learns.append((ip, rrname))
+                    info["hostnames"].append(rrname)
+            elif qname:
+                learns.append((ip, qname))
+                if cname:
+                    learns.append((ip, cname))
+        elif rr.type not in (12, 16, 33, 47):
+            answers.append(f"{DNS_TYPES.get(rr.type, rr.type)}="
+                           f"{_rdata_str(rr)[:60]}")
+    info["answers"] = [a for a in answers if "=" not in a]
+    head = qname or (info["names"][0] if info["names"] else "?")
+    if kind == "mDNS" and info["services"] and not answers:
+        return (f"Announced: {head} ({', '.join(info['services'][:3])})",
+                learns, hint, info)
+    if answers:
+        shown = ", ".join(answers[:3])
+        if len(answers) > 3:
+            shown += f" +{len(answers) - 3}"
+        return f"{head} → {shown}", learns, hint, info
+    if d.rcode == 3:
+        return f"{head} → does not exist", learns, hint, info
+    if d.rcode == 2:
+        return f"{head} → server failure", learns, hint, info
+    return f"{head} → no answer", learns, hint, info
+
+
+def _decode_dhcp(pkt):
+    learns = []
+    bootp = pkt[BOOTP]
+    dhcp = pkt[DHCP]
+    info = {"msgtype": None, "hostname": "", "vendor_class": "",
+            "requested_ip": "", "lease_time": None, "server_id": "",
+            "router": "", "dns_servers": [], "param_list": ""}
+    msg = "DHCP"
+    for opt in dhcp.options:
+        if not isinstance(opt, tuple) or len(opt) < 2:
+            continue
+        code, val = opt[0], opt[1]
+        try:
+            if code in (53, "message-type"):
+                info["msgtype"] = int(val)
+                msg = DHCP_MSG.get(int(val), str(val))
+            elif code in (12, "hostname"):
+                info["hostname"] = (val.decode("utf-8", "ignore")
+                                    if isinstance(val, bytes) else str(val))
+            elif code in (60, "vendor_class_id"):
+                info["vendor_class"] = (val.decode("utf-8", "ignore")
+                                        if isinstance(val, bytes)
+                                        else str(val))[:60]
+            elif code in (50, "requested_addr"):
+                info["requested_ip"] = str(val)
+            elif code in (51, "lease_time"):
+                info["lease_time"] = int(val)
+            elif code in (54, "server_id"):
+                info["server_id"] = str(val)
+            elif code in (3, "router"):
+                info["router"] = str(val)
+            elif code in (6, "name_server"):
+                info["dns_servers"] = [str(v) for v in opt[1:]]
+            elif code in (55, "param_req_list"):
+                info["param_list"] = ",".join(str(x) for x in val)[:80] \
+                    if isinstance(val, (list, tuple)) else str(val)[:80]
+        except (TypeError, ValueError):
+            continue
+    yiaddr = getattr(bootp, "yiaddr", "") or ""
+    if yiaddr == "0.0.0.0":
+        yiaddr = ""
+    chaddr = ""
+    try:
+        raw = bytes(bootp.chaddr)[:6]
+        if any(raw):
+            chaddr = ":".join(f"{b:02x}" for b in raw)
+    except (TypeError, ValueError):
+        pass
+    if info["hostname"] and yiaddr:
+        learns.append((yiaddr, info["hostname"]))
+    parts = [msg]
+    if info["hostname"]:
+        parts.append(f"as “{info['hostname']}”")
+    if yiaddr:
+        parts.append(f"got {yiaddr}")
+    if info["lease_time"]:
+        parts.append(f"for {human_duration(info['lease_time'])}")
+    info.update({"yiaddr": yiaddr, "client_mac": chaddr})
+    return "DHCP", "DHCP", " ".join(parts), learns, info
+
+
+def _ssdp_hint(text):
+    t = (text or "").lower()
+    for key, kind in SSDP_HINTS:
+        if key in t:
+            return kind
+    return ""
+
+
+def _decode_ssdp(load):
+    """Parse an SSDP (UPnP discovery) datagram into a friendly line, a
+    device-type hint and the headers that help identify the device."""
+    try:
+        text = load.decode("utf-8", "ignore")
+    except (AttributeError, UnicodeError):
+        return "Device announcement (SSDP)", "", {}
+    lines = text.split("\r\n")
+    first = (lines[0] if lines else "").strip()
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, _, v = line.partition(":")
+            headers[k.strip().upper()] = v.strip()
+    server = headers.get("SERVER", "")
+    st = headers.get("ST", headers.get("NT", ""))
+    info = {"server": server[:120], "st": st[:120],
+            "search": first.startswith("M-SEARCH"),
+            "friendly": headers.get("X-FRIENDLY-NAME", "")[:60]}
+    hint = _ssdp_hint(server + " " + st)
+    if info["search"]:
+        return "Looking for other devices on the network (SSDP)", hint, info
+    label = server or st or "Device announcement"
+    return f"Announced itself: {label}", hint, info
+
+
+def _try_nbns(load):
+    if len(load) < 12:
+        return None
+    try:
+        pos = 12
+        ll = load[pos]
+        pos += 1
+        raw = load[pos:pos + ll]
+        nm = ""
+        for i in range(0, len(raw) - 1, 2):
+            c = ((raw[i] - 0x41) << 4) | (raw[i + 1] - 0x41)
+            if 32 <= c < 127:
+                nm += chr(c)
+        return nm.strip() or None
+    except (IndexError, TypeError):
+        return None
+
+
+def _port_service(sport, dport):
+    """Plain-English service for a port pair, preferring the well-known
+    (lower / server-side) port."""
+    for p in sorted((dport or 0, sport or 0)):
+        if p and p in PORT_SERVICES:
+            return PORT_SERVICES[p], p
+    return "", None
+
+
+def _tcp_app_from_payload(load, sport, dport):
+    """Recognise a few cleartext/handshake banners. Returns (proto, text)."""
+    head = load[:16]
+    if head.startswith(b"SSH-"):
+        ver = load.split(b"\r\n", 1)[0][:40].decode("ascii", "ignore")
+        return "SSH", f"Remote terminal (SSH) handshake: {ver}"
+    if 21 in (sport, dport) and (head[:4] in (b"220 ", b"220-", b"USER",
+                                              b"PASS", b"230 ", b"331 ")):
+        return "FTP", "File transfer (FTP, not encrypted)"
+    if 23 in (sport, dport):
+        return "TELNET", "Remote terminal (Telnet, not encrypted)"
+    if len(load) > 8 and load[4:8] in (b"\xfeSMB", b"\xffSMB", b"\xfdSMB"):
+        return "SMB", "Windows file sharing (SMB)"
+    if 3389 in (sport, dport) and head[:2] == b"\x03\x00":
+        return "RDP", "Remote desktop (RDP)"
+    if 1883 in (sport, dport):
+        return "MQTT", "Smart home messaging (MQTT, not encrypted)"
+    if head.startswith(b"RTSP/") or b"rtsp://" in load[:64]:
+        return "RTSP", "Streaming video control (RTSP)"
+    if head.startswith(b"SIP/2.0") or re.match(rb"^(INVITE|REGISTER) sip:",
+                                                load[:24]):
+        return "SIP", "Internet calling (SIP)"
+    if 25 in (sport, dport) or 587 in (sport, dport):
+        if head[:4] in (b"220 ", b"EHLO", b"HELO", b"250-", b"250 "):
+            return "SMTP", "Sending email (SMTP)"
+    if 143 in (sport, dport) and (head[:4] == b"* OK" or b" LOGIN" in head):
+        return "IMAP", "Checking email (IMAP, not encrypted)"
+    if 110 in (sport, dport) and (head[:3] == b"+OK" or head[:4] == b"USER"):
+        return "POP3", "Checking email (POP3, not encrypted)"
+    return "", ""
+
+
+def _new_decoded(pkt):
+    return {"proto": "?", "tag": "OTHER", "text": "",
+            "src": "", "dst": "", "src_ip": "", "dst_ip": "",
+            "src_mac": "", "dst_mac": "", "ttl": "", "ttl_int": 0,
+            "sport": None, "dport": None, "ipver": 0, "transport": "",
+            "tcp_flags": None, "seq": None, "payload_len": 0,
+            "dns_names": [], "doh_hint": "", "plain_dns": False,
+            "type_hint": "", "dhcp_msgtype": None, "arp_op": None,
+            "dhcp_yiaddr": "", "dhcp_hostname": "", "dhcp_client_mac": "",
+            "dhcp": None, "dns": None, "tls": None, "nd": None,
+            "ssdp": None, "mdns": None, "http_host": "",
+            "service": "", "service_port": None, "app_conf": "",
+            "encrypted": "unknown", "cleartext": "",
+            "multicast": False, "l2_bcast": False,
+            "learns": [], "pkt": pkt,
+            "time": float(getattr(pkt, "time", time.time())),
+            "length": len(pkt)}
+
+
+def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
+    d = _new_decoded(pkt)
+
+    if pkt.haslayer(Ether):
+        e = pkt[Ether]
+        d["src_mac"], d["dst_mac"] = (e.src or "").lower(), \
+            (e.dst or "").lower()
+        d["l2_bcast"] = d["dst_mac"] == "ff:ff:ff:ff:ff:ff"
+        if d["dst_mac"] and not is_unicast_mac(d["dst_mac"]):
+            d["multicast"] = True
+
+    if pkt.haslayer(ARP):
+        a = pkt[ARP]
+        d["src_ip"], d["dst_ip"] = a.psrc, a.pdst
+        d["src_mac"], d["dst_mac"] = (a.hwsrc or "").lower(), \
+            (a.hwdst or "").lower()
+        d["proto"], d["tag"], d["transport"] = "ARP", "ARP", "ARP"
+        d["arp_op"] = int(a.op)
+        if a.op == 1:
+            if a.psrc == a.pdst:
+                d["text"] = f"{a.psrc} announced itself (gratuitous ARP)"
+            else:
+                d["text"] = f"Who has {a.pdst}? Tell {a.psrc}"
+        elif a.op == 2:
+            d["text"] = f"{a.psrc} is at {a.hwsrc}"
+        else:
+            d["text"] = f"ARP op={a.op}"
+        d["src"] = a.psrc or a.hwsrc
+        d["dst"] = a.pdst or a.hwdst
+        d["ipver"] = 4
+        return d
+
+    ipl = None
+    if pkt.haslayer(IP):
+        ipl = pkt[IP]
+        d["src_ip"], d["dst_ip"] = ipl.src, ipl.dst
+        d["ttl"] = str(ipl.ttl)
+        d["ttl_int"] = int(ipl.ttl or 0)
+        d["ipver"] = 4
+    elif HAVE_IPV6 and pkt.haslayer(IPv6):
+        ipl = pkt[IPv6]
+        d["src_ip"], d["dst_ip"] = ipl.src, ipl.dst
+        d["ttl"] = str(getattr(ipl, "hlim", ""))
+        d["ttl_int"] = int(getattr(ipl, "hlim", 0) or 0)
+        d["ipver"] = 6
+    if d["dst_ip"] and is_multicast_or_broadcast(d["dst_ip"]):
+        d["multicast"] = True
+
+    # --- TCP
+    if pkt.haslayer(TCP):
+        t = pkt[TCP]
+        d["sport"], d["dport"] = int(t.sport), int(t.dport)
+        d["transport"] = "TCP"
+        d["proto"], d["tag"] = "TCP", "TCP"
+        flags = int(t.flags)
+        d["tcp_flags"] = flags
+        d["seq"] = int(t.seq)
+        names = [n for b, n in ((0x01, "FIN"), (0x02, "SYN"), (0x04, "RST"),
+                                (0x08, "PSH"), (0x10, "ACK"), (0x20, "URG"))
+                 if flags & b]
+        svc, sport_ = _port_service(t.sport, t.dport)
+        d["service"], d["service_port"] = svc, sport_
+        if svc:
+            d["text"] = f"{svc} ({','.join(names) or 'data'})"
+            d["app_conf"] = "Likely (by port)"
+        else:
+            d["text"] = f"Connecting ({','.join(names) or 'data'})"
+        if sport_ in ENCRYPTED_PORTS:
+            d["encrypted"] = "likely"
+
+        if pkt.haslayer(DNS) and 53 in (t.sport, t.dport):
+            text, learns, hint, info = _decode_dns(pkt[DNS], "DNS")
+            info["transport"] = "TCP"
+            d.update({"proto": "DNS", "tag": "DNS", "text": text + " (TCP)",
+                      "dns": info, "app_conf": "Observed"})
+            d["learns"].extend(learns)
+            d["plain_dns"] = t.dport == 53
+            d["encrypted"] = "no"
+        else:
+            # Raw only: Ethernet padding (scapy's Padding layer) is not data
+            load = bytes(pkt[Raw].load) if pkt.haslayer(Raw) else b""
+            d["payload_len"] = len(load)
+            if load:
+                _decode_tcp_payload(d, load, reasm)
+            if not d["cleartext"] and d["payload_len"] and \
+                    sport_ in CLEARTEXT_PORTS:
+                d["cleartext"] = CLEARTEXT_PORTS[sport_]
+                d["encrypted"] = "no"
+
+    # --- UDP
+    elif pkt.haslayer(UDP):
+        u = pkt[UDP]
+        d["sport"], d["dport"] = int(u.sport), int(u.dport)
+        d["transport"] = "UDP"
+        ports = (u.sport, u.dport)
+        try:
+            load = bytes(pkt[Raw].load) if pkt.haslayer(Raw) else b""
+        except Exception:                            # noqa: BLE001
+            load = b""
+        d["payload_len"] = max(0, int(u.len or 8) - 8)
+        if pkt.haslayer(DNS) and any(p in (53, 5353, 5355) for p in ports):
+            name = "DNS"
+            if 5353 in ports:
+                name = "mDNS"
+            elif 5355 in ports:
+                name = "LLMNR"
+            if u.dport == 53:
+                d["plain_dns"] = True
+            text, learns, hint, info = _decode_dns(pkt[DNS], name)
+            info["transport"] = "UDP"
+            d.update({"proto": name, "tag": name, "text": text,
+                      "app_conf": "Observed", "encrypted": "no"})
+            if name == "mDNS":
+                d["mdns"] = info
+            else:
+                d["dns"] = info
+            d["learns"].extend(learns)
+            if hint:
+                d["type_hint"] = hint
+        elif HAVE_DHCP and pkt.haslayer(BOOTP) and \
+                any(p in (67, 68) for p in ports):
+            p, t2, text, learns, info = _decode_dhcp(pkt)
+            d.update({"proto": p, "tag": t2, "text": text, "dhcp": info,
+                      "app_conf": "Observed"})
+            d["learns"].extend(learns)
+            d["dhcp_msgtype"] = info["msgtype"]
+            d["dhcp_yiaddr"] = info["yiaddr"]
+            d["dhcp_hostname"] = info["hostname"]
+            d["dhcp_client_mac"] = info["client_mac"]
+        elif any(p in (546, 547) for p in ports) and load:
+            mt = load[0]
+            d.update({"proto": "DHCPv6", "tag": "DHCPv6",
+                      "text": "IPv6 address setup: " +
+                      DHCPV6_MSG.get(mt, f"message {mt}"),
+                      "app_conf": "Observed"})
+        elif 137 in ports and load:
+            d["proto"], d["tag"] = "NBNS", "NBNS"
+            nm = _try_nbns(load)
+            if nm and d["src_ip"] and u.sport == 137 and len(load) > 12 and \
+                    load[2] & 0x80:
+                d["text"] = f"{nm} is at {d['src_ip']} (Windows name)"
+                d["learns"].append((d["src_ip"], nm))
+            else:
+                d["text"] = f"Local name lookup{(': ' + nm) if nm else ''}"
+            d["app_conf"] = "Observed"
+        elif 1900 in ports and load:
+            text, hint, info = _decode_ssdp(load)
+            d.update({"proto": "SSDP", "tag": "SSDP", "text": text,
+                      "ssdp": info, "app_conf": "Observed"})
+            if hint:
+                d["type_hint"] = hint
+        elif 123 in ports and len(load) >= 48:
+            mode = load[0] & 0x07
+            d.update({"proto": "NTP", "tag": "NTP",
+                      "text": "Checking the time (NTP " +
+                      {3: "request", 4: "reply"}.get(mode, "message") + ")",
+                      "app_conf": "Observed", "encrypted": "no"})
+        elif 443 in ports and load and (load[0] & 0x80):
+            d.update({"proto": "QUIC", "tag": "QUIC",
+                      "text": "Secure web connection (QUIC — the site name "
+                              "is encrypted)",
+                      "app_conf": "Observed", "encrypted": "yes",
+                      "service": "Secure web browsing (QUIC)"})
+        elif 443 in ports and load:
+            d.update({"proto": "QUIC", "tag": "QUIC",
+                      "text": "Secure web connection (fast, encrypted)",
+                      "app_conf": "Likely (by port)", "encrypted": "yes"})
+        else:
+            svc, sp = _port_service(u.sport, u.dport)
+            d["service"], d["service_port"] = svc, sp
+            d["proto"], d["tag"] = "UDP", "UDP"
+            if sp in PORT_APP:
+                d["proto"] = d["tag"] = PORT_APP[sp]
+            d["text"] = (f"{svc} ({d['payload_len']} bytes)" if svc
+                         else f"Quick message ({d['payload_len']} bytes)")
+            d["app_conf"] = "Likely (by port)" if svc else ""
+            if sp in VPN_PORTS:
+                d["encrypted"] = "yes"
+            elif sp in CLEARTEXT_PORTS:
+                d["cleartext"] = CLEARTEXT_PORTS[sp]
+                d["encrypted"] = "no"
+
+    elif pkt.haslayer(ICMP):
+        c = pkt[ICMP]
+        d["proto"], d["tag"], d["transport"] = "ICMP", "ICMP", "ICMP"
+        d["sport"], d["dport"] = int(c.type), int(getattr(c, "code", 0) or 0)
+        d["text"] = {0: "Ping reply", 3: "Destination unreachable",
+                     8: "Ping request", 11: "Time exceeded",
+                     5: "Redirect (router suggests another path)"}.get(
+                         c.type, f"ICMP type {c.type}")
+    elif HAVE_IPV6 and ipl is not None and d["ipver"] == 6 and \
+            _decode_icmpv6(d, pkt):
+        pass
+    elif ipl is not None and d["ipver"] == 4 and int(ipl.proto) == 2:
+        d.update({"proto": "IGMP", "tag": "IGMP", "transport": "IGMP",
+                  "text": "Joining/leaving a multicast group (IGMP)"})
+    else:
+        ll = pkt.lastlayer()
+        d["proto"] = ll.name if ll else "?"
+        if d["proto"] and not d["text"]:
+            d["text"] = f"{d['proto']} frame"
+
+    d["src"] = d["src_ip"] or d["src_mac"]
+    d["dst"] = d["dst_ip"] or d["dst_mac"]
+    return d
+
+
+def _decode_tcp_payload(d, load, reasm):
+    # plain HTTP?
+    if load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
+                    b"OPTI", b"PATC", b"CONN") or load[:5] == b"HTTP/":
+        try:
+            head = load[:2048].decode("latin-1")
+        except UnicodeError:
+            head = ""
+        line = head.split("\r\n", 1)[0]
+        m = re.search(r"\r\nHost:\s*([^\r\n]+)", head, re.I)
+        host = m.group(1).strip().lower()[:120] if m else ""
+        if line:
+            d["proto"], d["tag"] = "HTTP", "HTTP"
+            d["app_conf"] = "Observed"
+            if line.startswith("CONNECT"):
+                d["text"] = f"Proxy tunnel request: {line[:100]}"
+                d["encrypted"] = "unknown"
+            else:
+                d["text"] = f"Unsecured web request: {line[:110]}"
+                if host:
+                    d["text"] += f"  (Host: {host})"
+                d["encrypted"] = "no"
+                d["cleartext"] = "HTTP"
+            if host and not line.startswith("HTTP/"):
+                d["http_host"] = host.split(":")[0]
+                d["dns_names"].append(d["http_host"])
+                if d["dst_ip"]:
+                    d["learns"].append((d["dst_ip"], d["http_host"]))
+        return
+    rec = None
+    if reasm is not None and d["seq"] is not None:
+        key = (d["src_ip"], d["sport"], d["dst_ip"], d["dport"])
+        rec = reasm.feed(key, d["seq"], load, d["time"])
+    elif load[:1] == b"\x16":
+        rec = load
+    if rec:
+        info = parse_tls_hello(rec)
+        if info and info.get("kind"):
+            d["tls"] = info
+            d["proto"], d["tag"] = "TLS", "TLS"
+            d["encrypted"] = "yes"
+            d["app_conf"] = "Observed"
+            sni = info.get("sni", "")
+            if info["kind"] == "client":
+                if sni:
+                    d["text"] = f"Secure connection to {sni}"
+                    if info.get("ech"):
+                        d["text"] += " (Encrypted Client Hello — the real " \
+                                     "site may be hidden behind this name)"
+                    d["dns_names"].append(sni)
+                    d["learns"].append((d["dst_ip"], sni))
+                    if sni in DOH_HOSTS:
+                        d["doh_hint"] = DOH_HOSTS[sni]
+                else:
+                    d["text"] = "Secure connection (site name not visible)"
+                if 853 in (d["sport"], d["dport"]):
+                    d["proto"] = d["tag"] = "DoT"
+                    d["doh_hint"] = d["doh_hint"] or "DNS-over-TLS"
+            else:
+                d["text"] = f"Secure connection accepted " \
+                            f"({info.get('version') or 'TLS'})"
+            return
+    if d["transport"] == "TCP" and load[:1] == b"\x17" and \
+            load[1:2] == b"\x03":
+        d["proto"], d["tag"] = "TLS", "TLS"
+        d["encrypted"] = "yes"
+        d["text"] = "Encrypted data (TLS)"
+        d["app_conf"] = "Observed"
+        return
+    proto, text = _tcp_app_from_payload(load, d["sport"], d["dport"])
+    if proto:
+        d["proto"] = d["tag"] = proto
+        d["text"] = text
+        d["app_conf"] = "Observed"
+        if proto in ("FTP", "TELNET", "IMAP", "POP3", "MQTT"):
+            d["encrypted"] = "no"
+            d["cleartext"] = proto
+        elif proto in ("SSH", "RDP"):
+            d["encrypted"] = "yes"
+
+
+def _decode_icmpv6(d, pkt):
+    """IPv6 control traffic: Neighbor Discovery (how IPv6 devices find each
+    other and their router), pings and errors. Returns True if handled."""
+    nd = None
+    if pkt.haslayer(ICMPv6ND_RA):
+        ra = pkt[ICMPv6ND_RA]
+        prefixes = []
+        opt = pkt.getlayer(ICMPv6NDOptPrefixInfo)
+        i = 1
+        while opt is not None and i < 8:
+            prefixes.append(f"{opt.prefix}/{opt.prefixlen}")
+            i += 1
+            opt = pkt.getlayer(ICMPv6NDOptPrefixInfo, i)
+        mac = ""
+        if pkt.haslayer(ICMPv6NDOptSrcLLAddr):
+            mac = (pkt[ICMPv6NDOptSrcLLAddr].lladdr or "").lower()
+        nd = {"kind": "RA", "target": d["src_ip"], "mac": mac or d["src_mac"],
+              "prefixes": prefixes,
+              "lifetime": int(getattr(ra, "routerlifetime", 0) or 0)}
+        d["text"] = "Router announcement (IPv6)" + (
+            f" — network {', '.join(prefixes)}" if prefixes else "")
+    elif pkt.haslayer(ICMPv6ND_RS):
+        nd = {"kind": "RS", "target": "", "mac": d["src_mac"], "prefixes": []}
+        d["text"] = "Looking for an IPv6 router (Router Solicitation)"
+    elif pkt.haslayer(ICMPv6ND_NS):
+        ns = pkt[ICMPv6ND_NS]
+        mac = ""
+        if pkt.haslayer(ICMPv6NDOptSrcLLAddr):
+            mac = (pkt[ICMPv6NDOptSrcLLAddr].lladdr or "").lower()
+        nd = {"kind": "NS", "target": str(ns.tgt), "mac": mac,
+              "prefixes": [], "dad": d["src_ip"] == "::"}
+        d["text"] = (f"Checking nobody else uses {ns.tgt} (duplicate check)"
+                     if nd["dad"] else f"Who has {ns.tgt}? (IPv6)")
+    elif pkt.haslayer(ICMPv6ND_NA):
+        na = pkt[ICMPv6ND_NA]
+        mac = ""
+        if pkt.haslayer(ICMPv6NDOptDstLLAddr):
+            mac = (pkt[ICMPv6NDOptDstLLAddr].lladdr or "").lower()
+        nd = {"kind": "NA", "target": str(na.tgt), "mac": mac or d["src_mac"],
+              "prefixes": [], "router": bool(getattr(na, "R", 0))}
+        d["text"] = f"{na.tgt} is at {nd['mac'] or '?'} (IPv6)"
+    if nd is not None:
+        d.update({"proto": "NDP", "tag": "NDP", "transport": "ICMPv6",
+                  "nd": nd, "app_conf": "Observed"})
+        return True
+    if pkt.haslayer(ICMPv6EchoRequest):
+        d.update({"proto": "ICMPv6", "tag": "ICMPv6", "transport": "ICMPv6",
+                  "text": "Ping request (IPv6)", "sport": 128, "dport": 0})
+        return True
+    if pkt.haslayer(ICMPv6EchoReply):
+        d.update({"proto": "ICMPv6", "tag": "ICMPv6", "transport": "ICMPv6",
+                  "text": "Ping reply (IPv6)", "sport": 129, "dport": 0})
+        return True
+    if pkt.haslayer(ICMPv6DestUnreach):
+        d.update({"proto": "ICMPv6", "tag": "ICMPv6", "transport": "ICMPv6",
+                  "text": "Destination unreachable (IPv6)", "sport": 1,
+                  "dport": 0})
+        return True
+    ll = pkt.lastlayer()
+    name = ll.name if ll else ""
+    if "ICMPv6" in name or "MLD" in name:
+        d.update({"proto": "ICMPv6", "tag": "ICMPv6", "transport": "ICMPv6",
+                  "text": ("Multicast group membership report (IPv6)"
+                           if "MLD" in name or "Listener" in name
+                           else name)})
+        return True
+    return False
+
+
+# ============================================================================
+#  6.  Capture workers
+#
+#  The capture callback only enqueues (it must stay extremely cheap); a
+#  decode thread turns packets into dicts; the GUI thread runs analysis in
+#  time-boxed batches. Every queue is bounded. When analysis falls behind,
+#  capture keeps going and the overflow is counted and shown honestly as
+#  "dropped analysis" rather than freezing the window.
+# ============================================================================
+PKT_QUEUE_MAX = 20000
+ROW_QUEUE_MAX = 20000
+
+
+def probe_l2_socket():
+    for mod_name, cls_name in (
+            ("scapy.arch.pcapdnet", "L2pcapListenSocket"),
+            ("scapy.arch.windows", "L2pcapListenSocket"),
+            ("scapy.arch.libpcap", "L2pcapListenSocket"),
+            ("scapy.arch.linux", "L2ListenSocket"),
+            ("scapy.arch.bsd", "L2ListenSocket")):
+        try:
+            mod = importlib.import_module(mod_name)
+            cls = getattr(mod, cls_name, None)
+            if cls is None:
+                continue
+            params = set(inspect.signature(cls.__init__).parameters)
+            return {"snaplen": "snaplen" in params,
+                    "promisc": "promisc" in params,
+                    "found": f"{mod_name}.{cls_name}"}
+        except Exception:                            # noqa: BLE001
+            continue
+    return {"snaplen": False, "promisc": False, "found": None}
+
+
+def build_sniffer(iface, prn, bpf, promisc=True):
+    """Start an AsyncSniffer, trying the richest options first and falling
+    back gracefully on older scapy/backends."""
+    p = probe_l2_socket()
+    if p["snaplen"] and p["promisc"]:
+        variants = [{"promisc": promisc, "snaplen": 262144},
+                    {"promisc": promisc}, {}]
+    elif p["promisc"]:
+        variants = [{"promisc": promisc}, {}]
+    else:
+        variants = [{}]
+    base = {"iface": iface, "prn": prn, "store": False}
+    if bpf:
+        base["filter"] = bpf
+    last = None
+    for extra in variants:
+        try:
+            s = AsyncSniffer(**dict(base, **extra))
+            s.start()
+        except Exception as e:                       # noqa: BLE001
+            last = e
+            continue
+        time.sleep(0.45)
+        if getattr(s, "exception", None) is None:
+            return s, None
+        last = s.exception
+        with contextlib.suppress(Exception):
+            s.stop()
+    return None, last
+
+
+class NameCache:
+    """IP → name learned from DNS answers, TLS SNI, DHCP, mDNS, NBNS and
+    reverse DNS. `sources` remembers where each name came from so a guess
+    from reverse DNS never outranks what a device announced itself."""
+
+    def __init__(self):
+        self.ip_to_name = {}
+        self.sources = {}
+        self.domain_to_ips = defaultdict(set)
+        self.lock = threading.Lock()
+        self.version = 0
+
+    def learn(self, ip, name, source="dns"):
+        if not ip or not name:
+            return False
+        name = str(name).strip().rstrip(".")
+        if not name:
+            return False
+        with self.lock:
+            if self.ip_to_name.get(ip) == name:
+                return False
+            if self.sources.get(ip) in ("dhcp", "mdns", "nbns") and \
+                    source == "rdns":
+                return False
+            self.ip_to_name[ip] = name
+            self.sources[ip] = source
+            ips = self.domain_to_ips[name.lower()]
+            ips.add(ip)
+            if len(ips) > 64:
+                ips.pop()
+            if len(self.ip_to_name) > 50000:
+                for k in list(self.ip_to_name)[:5000]:
+                    self.ip_to_name.pop(k, None)
+                    self.sources.pop(k, None)
+            self.version += 1
+            return True
+
+    def forget(self, ip):
+        with self.lock:
+            if self.ip_to_name.pop(ip, None) is not None:
+                self.sources.pop(ip, None)
+                self.version += 1
+
+    def get(self, ip):
+        return self.ip_to_name.get(ip, "")
+
+    def source(self, ip):
+        return self.sources.get(ip, "")
+
+
+class ReverseDNS:
+    """Background reverse-DNS for *local* addresses only. Results expire
+    (addresses get reused), lookups are deduplicated, and the queue is
+    bounded so a busy network can't pile up thousands of lookups."""
+
+    TTL = 1800
+
+    def __init__(self, cache, workers=3):
+        self.cache = cache
+        self.pending, self.done = set(), {}
+        self.lock = threading.Lock()
+        self.q = queue.Queue(maxsize=512)
+        self.delay = 0.0              # raised by the performance governor
+        self._stop = False
+        for i in range(workers):
+            threading.Thread(target=self._worker, daemon=True,
+                             name=f"rdns-{i}").start()
+
+    def lookup(self, ip):
+        if not ip or ":" in ip or not is_private_ip(ip):
+            return
+        now = time.time()
+        with self.lock:
+            if ip in self.pending:
+                return
+            if now - self.done.get(ip, 0) < self.TTL:
+                return
+            self.pending.add(ip)
+        try:
+            self.q.put_nowait(ip)
+        except queue.Full:
+            with self.lock:
+                self.pending.discard(ip)
+
+    def stop(self):
+        self._stop = True
+        for _ in range(4):
+            with contextlib.suppress(queue.Full):
+                self.q.put_nowait(None)
+
+    def _worker(self):
+        while not self._stop:
+            ip = self.q.get()
+            if ip is None:
+                return
+            if self.delay:
+                time.sleep(self.delay)
+            name = ""
+            try:
+                name = _socket.gethostbyaddr(ip)[0]
+            except (OSError, UnicodeError):
+                name = ""
+            with self.lock:
+                self.pending.discard(ip)
+                self.done[ip] = time.time()
+                if len(self.done) > 20000:
+                    self.done.clear()
+            if name and name != ip:
+                self.cache.learn(ip, name, source="rdns")
+
+
+class DecodeWorker(threading.Thread):
+    """Decodes captured packets off the GUI thread."""
+
+    def __init__(self, in_q, out_q, cache, gw, my_ips):
+        super().__init__(daemon=True, name="decoder")
+        self.in_q, self.out_q = in_q, out_q
+        self.cache = cache
+        self.gw = gw
+        self.my_ips = my_ips
+        self.stop_flag = False
+        self.lossless = False        # True while importing a PCAP
+        self.reasm = TlsReassembler()
+        self.decoded = 0
+        self.dropped = 0
+        self.errors = 0
+        self.last_error = ""
+
+    def run(self):
+        while not self.stop_flag:
+            try:
+                pkt = self.in_q.get(timeout=0.4)
+            except queue.Empty:
+                continue
+            if pkt is None:
+                continue
+            try:
+                d = decode_packet(pkt, self.gw, self.my_ips, self.reasm)
+            except Exception as e:                   # noqa: BLE001
+                self.errors += 1
+                if self.errors < 20:
+                    self.last_error = f"{type(e).__name__}: {e}"
+                    LOG.debug("decode error: %s", self.last_error)
+                continue
+            self.decoded += 1
+            for ip, name in d["learns"]:
+                src = "dns"
+                if d["proto"] == "mDNS":
+                    src = "mdns"
+                elif d["proto"] == "DHCP":
+                    src = "dhcp"
+                elif d["proto"] == "NBNS":
+                    src = "nbns"
+                elif d["proto"] in ("TLS", "HTTP"):
+                    src = "sni"
+                self.cache.learn(ip, name, source=src)
+            if self.lossless:
+                while not self.stop_flag:
+                    try:
+                        self.out_q.put(d, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+            else:
+                try:
+                    self.out_q.put_nowait(d)
+                except queue.Full:
+                    self.dropped += 1
+
+
+
+
+class LanScanner(threading.Thread):
+    """Quietly nudges devices on your own local Wi-Fi/LAN to speak up, so
+    idle/quiet devices show up too — not just the ones already talking.
+
+    This never touches anything beyond your local subnet and never probes
+    ports or services: it only sends the same three kinds of harmless,
+    standard "is anyone there?" broadcasts that phones, printers, smart
+    TVs and file-sharing apps send all the time (ARP, mDNS, SSDP). Every
+    reply is picked up by the normal capture pipeline like any other
+    packet — this thread only sends, it never needs to listen itself.
+    """
+
+    def __init__(self, iface, my_ip):
+        super().__init__(daemon=True, name="lan-discovery")
+        self.iface = iface
+        self.my_ip = my_ip
+        self.stop_flag = False
+        self.subnet = local_subnet_for(iface, my_ip) if my_ip else None
+        self.sweeps = 0
+        self.last_sweep = 0.0
+
+    def run(self):
+        # give the capture socket a moment to fully come up first
+        for _ in range(10):
+            if self.stop_flag:
+                return
+            time.sleep(0.2)
+        while not self.stop_flag:
+            try:
+                self._sweep()
+            except Exception:
+                pass
+            waited = 0.0
+            while waited < SCAN_INTERVAL:
+                if self.stop_flag:
+                    return
+                time.sleep(0.2)
+                waited += 0.2
+
+    def _sweep(self):
+        self.sweeps += 1
+        self.last_sweep = time.time()
+        self._arp_sweep()
+        self._mdns_browse()
+        self._ssdp_search()
+
+    def _arp_sweep(self):
+        if not self.subnet or not self.my_ip:
+            return
+        if self.subnet.num_addresses > SCAN_MAX_HOSTS:
+            return
+        try:
+            hosts = [str(h) for h in self.subnet.hosts() if str(h) != self.my_ip]
+        except Exception:
+            return
+        if not hosts:
+            return
+        try:
+            pkts = [Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=h) for h in hosts]
+            sendp(pkts, iface=self.iface, inter=0.003, verbose=False)
+        except Exception:
+            pass
+
+    def _mdns_browse(self):
+        if not self.my_ip:
+            return
+        try:
+            pkt = (Ether(dst="01:00:5e:00:00:fb") /
+                   IP(dst="224.0.0.251", src=self.my_ip) /
+                   UDP(sport=5353, dport=5353) /
+                   DNS(rd=0, qd=DNSQR(qname="_services._dns-sd._udp.local.",
+                                      qtype="PTR")))
+            sendp(pkt, iface=self.iface, verbose=False)
+        except Exception:
+            pass
+
+    def _ssdp_search(self):
+        if not self.my_ip:
+            return
+        try:
+            msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                   'MAN: "ssdp:discover"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n')
+            pkt = (Ether(dst="01:00:5e:7f:ff:fa") /
+                   IP(dst="239.255.255.250", src=self.my_ip) /
+                   UDP(sport=random.randint(20000, 60000), dport=1900) /
+                   Raw(load=msg.encode()))
+            sendp(pkt, iface=self.iface, verbose=False)
+        except Exception:
+            pass
+
+
+def _iface_ip(iface):
+    """Best-effort local IPv4 address for the chosen interface."""
+    try:
+        return get_if_addr(iface)
+    except Exception:
+        pass
+    try:
+        return get_if_addr(getattr(iface, "name", iface))
+    except Exception:
+        pass
+    return ""
+
+
+
+
+def _iface_ipv4(iface):
+    ip = str(getattr(iface, "ip", "") or "")
+    if not ip:
+        ip = _iface_ip(iface) if get_if_addr else ""
+    return "" if ip in ("0.0.0.0", "") else ip
+
+
+def _iface_is_up(iface):
+    """True/False when we can tell, None when we can't."""
+    ps = OPTIONAL_MODULES.get("psutil")
+    if ps is not None:
+        try:
+            stats = ps.net_if_stats()
+            for nm in (iface_name(iface), iface_desc(iface)):
+                if nm in stats:
+                    return bool(stats[nm].isup)
+        except Exception:                            # noqa: BLE001
+            pass
+    flags = getattr(iface, "flags", None)
+    if flags is not None and not IS_WINDOWS:
+        txt = str(flags)
+        if "UP" in txt:
+            return True
+        return False
+    return None
+
+
+def score_interfaces(default_iface_name="", gateway_ip=""):
+    """Score every adapter so the automatic choice is explainable.
+    Returns a list of dicts sorted best-first:
+    {iface, name, label, score, reasons, ip, vpn, virtual, up}."""
+    out = []
+    try:
+        ifaces = list(conf.ifaces.values())
+    except Exception:                                # noqa: BLE001
+        ifaces = []
+    for iface in ifaces:
+        name, desc = iface_name(iface), iface_desc(iface)
+        ip = _iface_ipv4(iface)
+        vpn, virt = is_vpn_iface(iface), is_virtual_iface(iface)
+        up = _iface_is_up(iface)
+        score, reasons = 0, []
+        is_default = bool(default_iface_name) and \
+            name == default_iface_name
+        if is_default:
+            score += 50
+            reasons.append("it carries your default Internet route")
+        if ip and not ip.startswith("169.254.") and not ip.startswith("127."):
+            score += 20
+            reasons.append(f"it has a usable address ({ip})")
+        elif ip.startswith("169.254."):
+            score -= 20
+            reasons.append("it only has a self-assigned address (no DHCP)")
+        else:
+            score -= 40
+            reasons.append("it has no IPv4 address")
+        if ip and gateway_ip:
+            with contextlib.suppress(ValueError):
+                if ipaddress.ip_address(gateway_ip) in \
+                        ipaddress.ip_network(f"{ip}/24", strict=False):
+                    score += 10
+                    reasons.append("your router is on the same network")
+        low = (name + " " + desc).lower()
+        if "loopback" in low or name in ("lo", "lo0") or ip.startswith("127."):
+            score -= 100
+            reasons.append("it is the loopback (internal) adapter")
+        elif vpn:
+            if is_default:
+                reasons.append("it is a VPN/tunnel adapter (and your traffic "
+                               "currently goes through it)")
+            else:
+                score -= 25
+                reasons.append("it looks like a VPN/tunnel adapter")
+        elif virt:
+            score -= 30
+            reasons.append("it looks like a virtual/host-only adapter")
+        if "bluetooth" in low:
+            score -= 30
+            reasons.append("it is a Bluetooth network adapter")
+        if up is False:
+            score -= 50
+            reasons.append("it is disconnected")
+        elif up is True:
+            score += 5
+        label = desc if desc and desc != name else name
+        if len(label) > 70:
+            label = label[:67] + "..."
+        out.append({"iface": iface, "name": name, "label": label,
+                    "score": score, "reasons": reasons, "ip": ip,
+                    "vpn": vpn, "virtual": virt, "up": up,
+                    "default": is_default})
+    out.sort(key=lambda r: -r["score"])
+    return out
+
+
+def explain_choice(rec):
+    if not rec:
+        return ""
+    good = [r for r in rec["reasons"] if not r.startswith(("it has no",
+                                                           "it looks",
+                                                           "it is the",
+                                                           "it is dis",
+                                                           "it only"))]
+    return "Picked because " + (", ".join(good) if good else
+                                "it was the best of the available cards")
+
+
+def system_dns_servers():
+    """Best-effort list of the DNS servers this computer is configured to
+    use (read from the OS; no network traffic)."""
+    servers = []
+    try:
+        if IS_WINDOWS:
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                 "Get-DnsClientServerAddress -AddressFamily IPv4 | "
+                 "Select-Object -ExpandProperty ServerAddresses"],
+                capture_output=True, text=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            servers = [ln.strip() for ln in r.stdout.splitlines()
+                       if re.match(r"^\d+\.\d+\.\d+\.\d+$", ln.strip())]
+        elif IS_MAC:
+            r = subprocess.run(["scutil", "--dns"], capture_output=True,
+                               text=True, timeout=10)
+            servers = re.findall(r"nameserver\[\d+\]\s*:\s*([0-9a-f.:]+)",
+                                 r.stdout)
+        else:
+            for path in ("/run/systemd/resolve/resolv.conf",
+                         "/etc/resolv.conf"):
+                if os.path.exists(path):
+                    with open(path) as f:
+                        servers = re.findall(r"^\s*nameserver\s+(\S+)",
+                                             f.read(), re.M)
+                    if servers and servers != ["127.0.0.53"]:
+                        break
+    except (OSError, subprocess.SubprocessError):
+        pass
+    seen, out = set(), []
+    for s in servers:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out[:6]
+
+
+class PcapImporter(threading.Thread):
+    """Feeds a .pcap/.pcapng file through the SAME decode/analysis pipeline
+    as live packets. Uses blocking puts (no drops) and can be cancelled."""
+
+    def __init__(self, path, out_q, on_progress, on_done):
+        super().__init__(daemon=True, name="pcap-import")
+        self.path = path
+        self.out_q = out_q
+        self.on_progress = on_progress
+        self.on_done = on_done
+        self.cancelled = False
+        self.count = 0
+
+    def run(self):
+        err = None
+        reader = None
+        try:
+            reader = PcapReader(self.path)
+            for pkt in reader:
+                if self.cancelled:
+                    break
+                while not self.cancelled:
+                    try:
+                        self.out_q.put(pkt, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+                self.count += 1
+                if self.count % 2000 == 0:
+                    self.on_progress(self.count)
+        except Exception as e:                       # noqa: BLE001
+            err = (f"{type(e).__name__}: {e}. The file may be damaged, or "
+                   "its format isn't supported by the installed capture "
+                   "engine.")
+            LOG.warning("pcap import failed: %s", err)
+        finally:
+            if reader is not None:
+                with contextlib.suppress(Exception):
+                    reader.close()
+        self.on_done(self.count, err, self.cancelled)
+
+
+class NetworkWatcher(threading.Thread):
+    """Notices the things that silently break a capture: the adapter
+    vanishing, Wi-Fi reconnecting with a new address, the router changing,
+    or the computer waking from sleep. Posts snapshots; never touches Tk."""
+
+    def __init__(self, on_snapshot, interval=15.0):
+        super().__init__(daemon=True, name="network-watcher")
+        self.on_snapshot = on_snapshot
+        self.interval = interval
+        self.stop_flag = False
+        self._wall = time.time()
+        self._mono = time.monotonic()
+
+    def run(self):
+        n = 0
+        while not self.stop_flag:
+            slept = 0.0
+            while slept < self.interval and not self.stop_flag:
+                time.sleep(0.5)
+                slept += 0.5
+            if self.stop_flag:
+                return
+            wall, mono = time.time(), time.monotonic()
+            resumed = (wall - self._wall) - (mono - self._mono) > 20 or \
+                (wall - self._wall) > self.interval + 60
+            self._wall, self._mono = wall, mono
+            snap = {"resumed": resumed, "time": wall}
+            try:
+                n += 1
+                if n % 2 == 0 or resumed:
+                    with contextlib.suppress(Exception):
+                        conf.ifaces.reload()
+                with contextlib.suppress(Exception):
+                    conf.route.resync()
+                iface, my_ip, gw = conf.route.route("0.0.0.0")
+                snap.update({"default_iface": iface_name(iface),
+                             "my_ip": my_ip if my_ip != "0.0.0.0" else "",
+                             "gateway": gw if gw != "0.0.0.0" else "",
+                             "ifaces": [iface_name(i)
+                                        for i in conf.ifaces.values()]})
+            except Exception as e:                   # noqa: BLE001
+                snap["error"] = str(e)
+            try:
+                self.on_snapshot(snap)
+            except Exception:                        # noqa: BLE001
+                LOG.exception("network watcher callback")
+
+
+def build_dns_query(name, qid):
+    hdr = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    q = b"".join(bytes([len(p)]) + p.encode("ascii")
+                 for p in name.strip(".").split(".")) + b"\x00"
+    return hdr + q + struct.pack(">HH", 1, 1)
+
+
+class HealthProber(threading.Thread):
+    """Conservative, transparent active health checks. Only runs when the
+    app allows it (never in Quiet Mode, never while viewing saved/offline/
+    demo data). Uses ordinary sockets: a TCP connect to the router (a
+    refusal still proves it's reachable), a TCP connect to one well-known
+    Internet address, and one DNS query to the system's DNS server."""
+
+    def __init__(self, on_result, get_params):
+        super().__init__(daemon=True, name="health-prober")
+        self.on_result = on_result
+        self.get_params = get_params      # () -> dict or None (not allowed)
+        self.stop_flag = False
+        self.run_now = threading.Event()
+
+    def run(self):
+        while not self.stop_flag:
+            params = self.get_params()
+            if params:
+                try:
+                    self.on_result(self.check(params))
+                except Exception:                    # noqa: BLE001
+                    LOG.exception("health probe")
+            interval = (params or {}).get("interval", 30)
+            self.run_now.wait(timeout=max(10, interval))
+            self.run_now.clear()
+
+    @staticmethod
+    def _tcp_rtt(host, port, timeout=2.0):
+        t0 = time.perf_counter()
+        s = _socket.socket(_socket.AF_INET6 if ":" in host
+                           else _socket.AF_INET, _socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect((host, port))
+            ok = True
+        except ConnectionRefusedError:
+            ok = True                       # it answered — reachable
+        except OSError:
+            ok = False
+        finally:
+            with contextlib.suppress(OSError):
+                s.close()
+        return ok, (time.perf_counter() - t0) * 1000.0
+
+    @staticmethod
+    def _dns_rtt(server, name="www.example.com", timeout=2.5):
+        qid = random.randint(1, 65535)
+        s = _socket.socket(_socket.AF_INET6 if ":" in server
+                           else _socket.AF_INET, _socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        t0 = time.perf_counter()
+        try:
+            s.sendto(build_dns_query(name, qid), (server, 53))
+            while True:
+                data, _ = s.recvfrom(2048)
+                if len(data) >= 4 and struct.unpack(">H", data[:2])[0] == qid:
+                    rcode = data[3] & 0x0F
+                    return rcode in (0, 3), \
+                        (time.perf_counter() - t0) * 1000.0, rcode
+        except OSError:
+            return False, None, None
+        finally:
+            with contextlib.suppress(OSError):
+                s.close()
+
+    def check(self, p):
+        res = {"time": time.time(), "probes": []}
+        gw = p.get("gateway")
+        if gw:
+            best = (False, None)
+            for port in (53, 80, 443):
+                ok, rtt = self._tcp_rtt(gw, port, timeout=1.5)
+                res["probes"].append((gw, port))
+                if ok:
+                    best = (True, rtt)
+                    break
+            res["gateway_ok"], res["gateway_ms"] = best
+        target = p.get("internet_target") or "1.1.1.1:443"
+        host, _, port = target.rpartition(":")
+        try:
+            ok, rtt = self._tcp_rtt(host, int(port), timeout=3.0)
+        except ValueError:
+            ok, rtt = False, None
+        res["probes"].append((host, int(port) if port.isdigit() else 0))
+        res["internet_ok"], res["internet_ms"] = ok, (rtt if ok else None)
+        dns = p.get("dns_server")
+        if dns:
+            ok, rtt, rcode = self._dns_rtt(dns)
+            res["probes"].append((dns, 53))
+            res["dns_ok"], res["dns_ms"], res["dns_server"] = ok, rtt, dns
+        return res
+
+
+# ============================================================================
+#  7.  Device identity model
+#
+#  "Never invent a device": something only becomes a Device because of
+#  accumulated LOCAL evidence (a unicast MAC seen on the LAN, an ARP or
+#  IPv6 Neighbor Discovery answer, a DHCP lease, an mDNS/SSDP announcement).
+#  Websites (domains) and Remote Hosts (public IPs) are entirely separate
+#  record types and can never become a Device. Public IPv4 addresses are
+#  never attached to a device; global IPv6 addresses only when they sit in
+#  a prefix your own network announced.
+# ============================================================================
+EVIDENCE_WEIGHTS = {
+    "mac_local":     40,   # a real (unicast) MAC seen directly on the LAN
+    "arp_reply":     25,   # answered "is-at" for its own IP
+    "ipv6_nd":       25,   # answered IPv6 Neighbor Discovery for itself
+    "dhcp_lease":    25,   # got/renewed a DHCP lease
+    "dhcp_client":   20,   # asked the DHCP server for an address itself
+    "mdns":          15,   # advertised itself over mDNS/Bonjour
+    "ssdp":          15,   # advertised itself over SSDP/UPnP
+    "nbns":          10,   # answered a Windows (NetBIOS) name query
+    "local_traffic": 10,   # ordinary local traffic
+    "oui_match":      5,   # MAC vendor prefix recognized
+    "rdns":           2,   # reverse-DNS name only
+}
+CONFIDENCE_UNCONFIRMED, CONFIDENCE_LOW = "Unconfirmed", "Low"
+CONFIDENCE_MEDIUM, CONFIDENCE_HIGH = "Medium", "High"
+CONFIDENCE_ORDER = {CONFIDENCE_UNCONFIRMED: 0, CONFIDENCE_LOW: 1,
+                    CONFIDENCE_MEDIUM: 2, CONFIDENCE_HIGH: 3}
+CONFIDENCE_ICON = {"High": "●●●", "Medium": "●●○",
+                   "Low": "●○○", "Unconfirmed": "○○○"}
+
+STATE_ACTIVE, STATE_IDLE, STATE_INACTIVE, STATE_EXPIRED = \
+    "ACTIVE", "IDLE", "INACTIVE", "EXPIRED"
+STATE_LABEL = {"ACTIVE": "● Active", "IDLE": "◐ Idle",
+               "INACTIVE": "○ Offline", "EXPIRED": "✕ Expired"}
+
+EVIDENCE_LABELS = {
+    "mac_local": "MAC seen locally", "arp_reply": "ARP reply",
+    "ipv6_nd": "IPv6 Neighbor Discovery", "dhcp_lease": "DHCP lease",
+    "dhcp_client": "DHCP request", "mdns": "mDNS advertisement",
+    "ssdp": "SSDP advertisement", "nbns": "Windows name (NetBIOS)",
+    "local_traffic": "Local traffic", "oui_match": "Vendor (OUI) match",
+    "rdns": "Reverse DNS",
+}
+HOSTNAME_PRIORITY = {"user": 5, "dhcp": 4, "mdns": 4, "nbns": 3,
+                     "ssdp": 3, "rdns": 1, "": 0}
+
+# Docker/typical container-bridge / common virtualization NAT ranges — seen
+# on the machine MiniWireshark itself runs on, not a separate LAN device.
+VIRTUAL_BRIDGE_NETS = [ipaddress.ip_network(n) for n in (
+    "172.17.0.0/16", "172.18.0.0/16", "172.19.0.0/16",
+    "10.0.75.0/24", "192.168.99.0/24",
+)]
+LOOPBACK_V4 = ipaddress.ip_network("127.0.0.0/8")
+
+
+def is_randomized_mac(mac):
+    """The U/L (locally-administered) bit is the 2nd-least-significant bit
+    of a MAC's first octet. Modern phones/laptops set it for a private,
+    per-network, rotating Wi-Fi address — a privacy *feature*, not missing
+    data, so it's surfaced as its own evidence-neutral fact."""
+    try:
+        first = int(mac.split(":")[0], 16)
+        return bool(first & 0x02)
+    except (ValueError, AttributeError, IndexError):
+        return False
+
+
+def confidence_tier(score):
+    if score >= 60:
+        return CONFIDENCE_HIGH
+    if score >= 30:
+        return CONFIDENCE_MEDIUM
+    if score >= 10:
+        return CONFIDENCE_LOW
+    return CONFIDENCE_UNCONFIRMED
+
+
+@dataclass
+class Evidence:
+    source: str
+    detail: str
+    weight: int
+    when: float = field(default_factory=time.time)
+
+
+def _push_bounded(lst, item, limit):
+    lst.append(item)
+    if len(lst) > limit:
+        del lst[:-limit]
+
+
+@dataclass
+class DeviceRecord:
+    """A LOCAL device. Keyed by MAC when one is known (the actual L2
+    identity), else by a synthetic 'ip:<addr>' key. Only ever created
+    from local evidence — never from a remote/public IP or a DNS answer."""
+    key: str
+    ip: str = ""
+    ipv6: set = field(default_factory=set)
+    ipv4s: set = field(default_factory=set)
+    mac: str = ""
+    vendor: str = ""
+    hostname: str = ""
+    hostname_source: str = ""
+    dhcp_hostname: str = ""
+    mdns_name: str = ""
+    ssdp_name: str = ""
+    ssdp_server: str = ""
+    model_hint: str = ""
+    dhcp_vendor_class: str = ""
+    dhcp_params: str = ""
+    type: str = "unknown"
+    type_hint: str = ""
+    device_class: str = "Unknown"
+    class_confidence: str = ""
+    class_reasons: list = field(default_factory=list)
+    services: set = field(default_factory=set)
+    evidence: list = field(default_factory=list)
+    score: int = 0
+    confidence: str = CONFIDENCE_UNCONFIRMED
+    state: str = STATE_ACTIVE
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    last_confirmed: float = field(default_factory=time.time)
+    last_active: float = 0.0
+    last_arp: float = 0.0
+    last_traffic: float = 0.0
+    packets: int = 0
+    packets_out: int = 0
+    packets_in: int = 0
+    bytes_up: int = 0          # bytes this device SENT
+    bytes_down: int = 0        # bytes this device RECEIVED
+    lan_bytes: int = 0
+    internet_bytes: int = 0
+    protocols: object = field(default_factory=Counter)
+    websites: set = field(default_factory=set)
+    remote_ips: set = field(default_factory=set)
+    alert_ids: list = field(default_factory=list)
+    randomized_mac: bool = False
+    identity_conflict: str = ""
+    pinned_no_merge: bool = False
+    never_merge: set = field(default_factory=set)
+    lease_ip: str = ""
+    lease_start: float = 0.0
+    lease_expiry: float = 0.0
+    link_local_only: bool = False
+    is_virtual: bool = False
+    expected: bool = False   # "mark as expected" silences future alerts
+    mine: bool = False
+    alias: str = ""
+    notes: str = ""
+    os_ttl: int = 0
+    ip_history: list = field(default_factory=list)       # [ip, first, last]
+    mac_history: list = field(default_factory=list)      # [mac, first, last]
+    dhcp_history: list = field(default_factory=list)     # [ip, when, secs, host]
+    hostname_history: list = field(default_factory=list)  # [name, src, when]
+    presence: list = field(default_factory=list)         # [start, end|None]
+    _rate_hist: list = field(default_factory=list)  # (minute_bucket, count)
+    reactivations: list = field(default_factory=list)  # times it came back
+    reactivated_now: bool = False
+    merge_note: str = ""     # why identities were merged, if they were
+    merged_from: list = field(default_factory=list)
+    merge_history: list = field(default_factory=list)
+    suggested: set = field(default_factory=set)   # keys already suggested
+    live: bool = True        # False for records loaded from a saved session
+    demo: bool = False
+    _last_conf_tier: str = CONFIDENCE_UNCONFIRMED
+
+    def add_evidence(self, source, detail, when=None):
+        w = EVIDENCE_WEIGHTS.get(source, 0)
+        ev = Evidence(source, detail, w, when or time.time())
+        # keep only the newest example of each source plus a short tail,
+        # so a chatty device can't push out its strong evidence
+        if self.evidence and self.evidence[-1].source == source:
+            self.evidence[-1] = ev
+        else:
+            self.evidence.append(ev)
+        if len(self.evidence) > 60:
+            seen, keep = set(), []
+            for e in reversed(self.evidence):
+                if e.source not in seen or len(keep) < 20:
+                    keep.append(e)
+                    seen.add(e.source)
+            self.evidence = list(reversed(keep))
+        self.recompute_score()
+
+    def recompute_score(self):
+        seen, total = set(), 0
+        for ev in reversed(self.evidence):
+            if ev.source in seen:
+                continue
+            seen.add(ev.source)
+            total += ev.weight
+        self.score = min(total, 100)
+        self.confidence = confidence_tier(self.score)
+
+    def evidence_summary(self):
+        sources = []
+        seen = set()
+        for ev in self.evidence:
+            if ev.source not in seen:
+                seen.add(ev.source)
+                sources.append(EVIDENCE_LABELS.get(ev.source, ev.source))
+        return sources
+
+    def confidence_reasons(self):
+        latest = {}
+        for ev in self.evidence:
+            latest[ev.source] = ev
+        rows = sorted(latest.values(), key=lambda e: -e.weight)
+        return [f"+{e.weight:>2}  {EVIDENCE_LABELS.get(e.source, e.source)}"
+                f" — {e.detail}" for e in rows]
+
+    def best_name(self):
+        """Most human-friendly announced name: user alias first, then names
+        that read like words, and machine-generated ones (BRW0080775…,
+        ESP_6A1B2C) last."""
+        if self.alias:
+            return self.alias
+        names = [n for n in (self.hostname, self.mdns_name,
+                             self.dhcp_hostname, self.ssdp_name) if n]
+        for n in names:
+            if not looks_generated(n):
+                return n
+        return names[0] if names else ""
+
+    def display_name(self):
+        n = self.best_name()
+        if n:
+            return n
+        if self.vendor:
+            return f"{self.vendor} device"
+        return self.ip or self.mac or self.key
+
+    def all_names(self):
+        return {n.lower() for n in (self.hostname, self.dhcp_hostname,
+                                    self.mdns_name, self.ssdp_name) if n}
+
+    def presence_open(self, when):
+        if not self.presence or self.presence[-1][1] is not None:
+            _push_bounded(self.presence, [when, None], 60)
+
+    def presence_close(self, when):
+        if self.presence and self.presence[-1][1] is None:
+            self.presence[-1][1] = max(when, self.presence[-1][0])
+
+    def presence_lines(self, now, limit=8):
+        out = []
+        prev_end = None
+        for start, end in self.presence[-limit:]:
+            if prev_end is not None and start - prev_end > 1:
+                out.append(f"Offline: {fmt_clock(prev_end)}–"
+                           f"{fmt_clock(start)} "
+                           f"({human_duration(start - prev_end)})")
+            out.append(f"Online:  {fmt_clock(start)}–"
+                       f"{'present' if end is None else fmt_clock(end)} "
+                       f"({human_duration((end or now) - start)})")
+            prev_end = end
+        if prev_end is not None:
+            out.append(f"Offline since {fmt_clock(prev_end)}")
+        return out
+
+    def traffic_baseline_flag(self, now, multiplier=4.0, min_avg=3):
+        """'Unusual for this device' — simple same-session baseline: compare
+        the current minute's packet count against the trailing average.
+        Never claims malice, only deviation from this device's own history."""
+        bucket = int(now // 60)
+        hist = self._rate_hist
+        if not hist or hist[-1][0] != bucket:
+            hist.append([bucket, 0])
+            if len(hist) > 30:
+                del hist[:-30]
+        hist[-1][1] += 1
+        if len(hist) < 6:
+            return False
+        past = [c for b, c in hist[:-1]]
+        avg = sum(past) / len(past)
+        cur = hist[-1][1]
+        return avg >= min_avg and cur > avg * multiplier
+
+
+DEVICE_SAVE_FIELDS = (
+    "key", "ip", "mac", "vendor", "hostname", "hostname_source",
+    "dhcp_hostname", "mdns_name", "ssdp_name", "ssdp_server", "model_hint",
+    "dhcp_vendor_class", "type", "type_hint", "device_class",
+    "class_confidence", "class_reasons", "score", "confidence", "state",
+    "first_seen", "last_seen", "last_confirmed", "last_active", "packets",
+    "packets_out", "packets_in", "bytes_up", "bytes_down", "lan_bytes",
+    "internet_bytes", "randomized_mac", "identity_conflict",
+    "pinned_no_merge", "lease_ip", "lease_expiry", "link_local_only",
+    "is_virtual", "expected", "mine", "alias", "notes", "os_ttl",
+    "ip_history", "mac_history", "dhcp_history", "hostname_history",
+    "presence", "merge_note", "merged_from", "demo")
+
+
+def looks_generated(name):
+    n = (name or "").lower()
+    digits = sum(c.isdigit() for c in n)
+    return bool(re.match(r"^(brw|npi|hp|esp[_-]|android-|galaxy-|"
+                         r"desktop-|laptop-|win-|ip-)[0-9a-f]{4,}", n)) or \
+        digits >= max(5, len(n) // 2)
+
+
+def device_to_dict(dev, include_history=True):
+    out = {}
+    for f in DEVICE_SAVE_FIELDS:
+        v = getattr(dev, f)
+        if not include_history and f == "merge_history":
+            continue
+        out[f] = v
+    out["ipv6"] = sorted(dev.ipv6)
+    out["ipv4s"] = sorted(dev.ipv4s)
+    out["services"] = sorted(dev.services)
+    out["never_merge"] = sorted(dev.never_merge)
+    out["protocols"] = dict(dev.protocols.most_common(20))
+    out["websites"] = sorted(dev.websites)[:200]
+    out["remote_ips"] = sorted(dev.remote_ips)[:200]
+    out["evidence"] = [[e.source, e.detail, e.weight, e.when]
+                       for e in dev.evidence[-30:]]
+    out["evidence_summary"] = dev.evidence_summary()
+    out["hostname_display"] = dev.display_name()
+    if include_history:
+        out["merge_history"] = [
+            {k: v for k, v in m.items()} for m in dev.merge_history[-10:]]
+    return out
+
+
+def device_from_dict(dd):
+    key = dd.get("key") or dd.get("mac") or f"ip:{dd.get('ip', '')}"
+    dev = DeviceRecord(key=key)
+    names = {f.name: f for f in dataclasses.fields(DeviceRecord)}
+    for k, v in dd.items():
+        if k not in names or k in ("evidence", "protocols", "ipv6",
+                                   "ipv4s", "services", "never_merge",
+                                   "websites", "remote_ips", "merge_history",
+                                   "suggested", "alert_ids"):
+            continue
+        cur = getattr(dev, k)
+        if isinstance(cur, bool):
+            v = bool(v)
+        elif isinstance(cur, int) and not isinstance(cur, bool):
+            try:
+                v = int(v)
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(cur, float):
+            try:
+                v = float(v)
+            except (TypeError, ValueError):
+                continue
+        elif isinstance(cur, list) and not isinstance(v, list):
+            continue
+        elif isinstance(cur, str) and not isinstance(v, str):
+            v = str(v)
+        setattr(dev, k, v)
+    for k in ("ipv6", "ipv4s", "services", "never_merge", "websites",
+              "remote_ips"):
+        v = dd.get(k)
+        if isinstance(v, (list, tuple, set)):
+            setattr(dev, k, set(v))
+    if isinstance(dd.get("protocols"), dict):
+        dev.protocols = Counter(dd["protocols"])
+    for e in dd.get("evidence", []) or []:
+        if isinstance(e, (list, tuple)) and len(e) >= 3:
+            dev.evidence.append(Evidence(str(e[0]), str(e[1]), int(e[2]),
+                                         float(e[3]) if len(e) > 3 else 0.0))
+    if not dev.evidence and dd.get("evidence"):
+        pass
+    # v1 sessions stored a list of evidence labels and the display name
+    if not dev.evidence and isinstance(dd.get("evidence_summary") or
+                                       dd.get("evidence"), list):
+        for label in (dd.get("evidence_summary") or []):
+            src = next((s for s, l in EVIDENCE_LABELS.items()
+                        if l == label), None)
+            if src:
+                dev.evidence.append(Evidence(src, "from saved session",
+                                             EVIDENCE_WEIGHTS.get(src, 0)))
+    if dev.evidence:
+        dev.recompute_score()
+        if dd.get("confidence") in CONFIDENCE_ORDER and \
+                not dd.get("evidence"):
+            dev.confidence = dd["confidence"]
+    mh = dd.get("merge_history")
+    if isinstance(mh, list):
+        dev.merge_history = [m for m in mh if isinstance(m, dict)]
+    if dev.ip:
+        dev.ipv4s.add(dev.ip)
+    if dev.mac:
+        dev.randomized_mac = is_randomized_mac(dev.mac)
+    return dev
+
+
+# ---- fingerprinting --------------------------------------------------------
+_HOST_PATTERNS = [
+    (r"iphone", "iPhone", 55), (r"ipad", "Tablet", 55),
+    (r"android|galaxy|pixel|^sm-[a-z]\d|oneplus|redmi|xiaomi|huawei|"
+     r"moto[- ]?g|nokia", "Android phone", 45),
+    (r"^desktop-[a-z0-9]{5,}|^laptop-[a-z0-9]{5,}|-pc$|^win-|windows",
+     "Windows PC", 45),
+    (r"macbook|imac|mac-?mini|mac-?pro|-mbp|-mba|s-mac", "Mac", 50),
+    (r"raspberrypi|ubuntu|debian|fedora|arch|linux|mint", "Linux PC", 35),
+    (r"synology|diskstation|qnap|truenas|nas\b|nas-|unraid|readynas",
+     "NAS", 50),
+    (r"printer|^hp[0-9a-f]{6}|officejet|laserjet|deskjet|canon|epson|"
+     r"brother|^brw|^npi[0-9a-f]", "Printer", 50),
+    (r"roku|chromecast|fire-?tv|firestick|apple-?tv|shield|androidtv",
+     "Streaming device", 50),
+    (r"\btv\b|bravia|webos|tizen|smarttv|-tv$|^tv-|vizio|hisense",
+     "Smart TV", 45),
+    (r"xbox|playstation|ps4|ps5|nintendo|switch", "Console", 50),
+    (r"echo|alexa|homepod|sonos|google-?home|nest-?(audio|mini|hub)|"
+     r"speaker", "Speaker", 45),
+    (r"cam\b|camera|ipcam|ring-|wyze|arlo|reolink|hikvision|dahua|eufy",
+     "Camera", 45),
+    (r"esp[-_]?[0-9a-f]{4,}|espressif|tasmota|shelly|tuya|sonoff|wled|"
+     r"hue|smartplug|plug|bulb|lifx|wemo|meross|tplink-?(hs|kp)",
+     "Smart-home/IoT", 40),
+    (r"^ap[-_]|unifi|uap|eap\d|deco|eero|orbi|mesh|repeater|extender",
+     "Access point", 40),
+    (r"server|srv|proxmox|esxi|pve|hypervisor", "Server", 35),
+]
+_VENDOR_PATTERNS = [
+    (r"apple", (("iPhone", 15), ("Mac", 10), ("Tablet", 6))),
+    (r"samsung|xiaomi|oneplus|oppo|vivo|motorola|huawei|honor|realme|nokia",
+     (("Android phone", 18), ("Smart TV", 4))),
+    (r"google", (("Android phone", 8), ("Streaming device", 8),
+                 ("Speaker", 6))),
+    (r"intel|realtek|liteon|azurewave|dell|lenovo|hp inc|hewlett packard enterprise|"
+     r"micro-star|gigabyte|asustek|clevo|rivet|killer|qualcomm atheros",
+     (("Windows PC", 15), ("Linux PC", 6))),
+    (r"brother|canon|seiko epson|epson|hewlett|lexmark|xerox|kyocera|ricoh",
+     (("Printer", 35),)),
+    (r"sony|lg electronics|lg innotek|tcl|vizio|hisense|panasonic|sharp|"
+     r"funai", (("Smart TV", 20), ("Console", 6))),
+    (r"roku", (("Streaming device", 40),)),
+    (r"amazon", (("Speaker", 15), ("Streaming device", 15))),
+    (r"sonos|bose|harman", (("Speaker", 45),)),
+    (r"espressif|tuya|shelly|sonoff|itead|signify|philips lighting|lifx|"
+     r"wyze|belkin|meross|ecobee|nest labs|ezviz|broadlink|wiz",
+     (("Smart-home/IoT", 35),)),
+    (r"raspberry", (("Linux PC", 30), ("Smart-home/IoT", 10))),
+    (r"synology|qnap|western digital|buffalo", (("NAS", 45),)),
+    (r"nintendo", (("Console", 50),)),
+    (r"ubiquiti|tp-link|netgear|cisco|aruba|ruckus|eero|linksys|zyxel|"
+     r"mikrotik|d-link|asus|arris|technicolor|sagemcom|avm|huawei device",
+     (("Access point", 18), ("Router", 12))),
+    (r"hikvision|dahua|axis|reolink|arlo|amcrest|hanwha|uniview",
+     (("Camera", 45),)),
+    (r"vmware|virtualbox|oracle|parallels|qemu|xensource|red hat",
+     (("Virtual machine", 50),)),
+]
+_SSDP_PATTERNS = [
+    (r"internetgatewaydevice|wanipconnection", "Router", 60),
+    (r"windows", "Windows PC", 12), (r"synology|qnap", "NAS", 50),
+    (r"roku|chromecast|google cast|fire ?tv", "Streaming device", 45),
+    (r"samsung|bravia|webos|lg |smarttv|dial", "Smart TV", 30),
+    (r"sonos|bose", "Speaker", 45), (r"xbox|playstation|nintendo",
+                                      "Console", 45),
+    (r"printer|ipp|hp |epson|canon|brother", "Printer", 40),
+    (r"hue|wemo|smartthings", "Smart-home/IoT", 40),
+    (r"mediarenderer", "Smart TV", 10), (r"mediaserver", "NAS", 10),
+    (r"camera|hikvision|dahua|onvif", "Camera", 40),
+]
+_MDNS_PATTERNS = [
+    ("_ipp._tcp", "Printer", 60), ("_printer._tcp", "Printer", 60),
+    ("_pdl-datastream", "Printer", 60), ("_scanner._tcp", "Printer", 40),
+    ("_uscan._tcp", "Printer", 40),
+    ("_googlecast", "Streaming device", 45), ("_airplay", "Streaming device", 15),
+    ("_raop", "Speaker", 20), ("_spotify-connect", "Speaker", 20),
+    ("_sonos", "Speaker", 50), ("_homekit", "Smart-home/IoT", 30),
+    ("_hap._tcp", "Smart-home/IoT", 35), ("_matter", "Smart-home/IoT", 35),
+    ("_hue", "Smart-home/IoT", 40), ("_esphomelib", "Smart-home/IoT", 50),
+    ("_smb._tcp", "NAS", 8), ("_afpovertcp", "NAS", 8),
+    ("_adisk._tcp", "NAS", 35), ("_device-info", "Mac", 5),
+    ("_companion-link", "iPhone", 10), ("_apple-mobdev2", "iPhone", 30),
+    ("_rdlink", "Mac", 25), ("_ssh._tcp", "Linux PC", 10),
+    ("_workstation._tcp", "Linux PC", 20), ("_nvstream", "Windows PC", 30),
+    ("_xbox", "Console", 50), ("_amzn-wplay", "Streaming device", 40),
+    ("_androidtvremote", "Streaming device", 45),
+]
+_MODEL_PATTERNS = [
+    (r"macbook|imac|macmini|macpro|mac\d", "Mac", 70),
+    (r"iphone", "iPhone", 70), (r"ipad", "Tablet", 70),
+    (r"appletv", "Streaming device", 70), (r"audioaccessory|homepod",
+                                           "Speaker", 70),
+    (r"chromecast|google tv", "Streaming device", 70),
+    (r"nest|google home", "Speaker", 50),
+]
+
+
+def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
+                    ra_routers=(), gw_macs=()):
+    """Best guess at what a device is, with the reasons. Never certain:
+    returns (class, confidence_word, reasons) where confidence_word is
+    'Likely', 'Possibly' or ''."""
+    if dev.ip and dev.ip in my_ips or (dev.mac and dev.mac in my_macs):
+        return "This computer", "", ["This is the computer running "
+                                     "MiniWireshark"]
+    score = defaultdict(int)
+    why = defaultdict(list)
+
+    def add(cls, pts, reason):
+        score[cls] += pts
+        why[cls].append(reason)
+
+    if gateway_ip and dev.ip == gateway_ip:
+        add("Router", 100, "It is your default gateway (router)")
+    if dev.mac and dev.mac in gw_macs:
+        add("Router", 80, "It answered for your router's address")
+    if dev.mac and dev.mac in ra_routers:
+        add("Router", 70, "It announces itself as an IPv6 router")
+    if dev.is_virtual:
+        add("Container/virtual interface", 80,
+            "Its address is in a typical container/virtual-network range")
+    names = " ".join(sorted(dev.all_names())).lower()
+    for pat, cls, pts in _HOST_PATTERNS:
+        if names and re.search(pat, names):
+            add(cls, pts, f"Its name (“{dev.display_name()}”) "
+                          f"looks like a {cls.lower()}")
+    model = (dev.model_hint or "").lower()
+    for pat, cls, pts in _MODEL_PATTERNS:
+        if model and re.search(pat, model):
+            add(cls, pts, f"It advertised the model “{dev.model_hint}”")
+    v = (dev.vendor or "").lower()
+    if dev.mac and dev.mac.startswith("00:15:5d"):
+        add("Virtual machine", 60, "Its MAC prefix belongs to Hyper-V "
+                                   "virtual machines")
+    for pat, pairs in _VENDOR_PATTERNS:
+        if v and re.search(pat, v):
+            for cls, pts in pairs:
+                add(cls, pts, f"Made by {dev.vendor}")
+    for svc in dev.services:
+        s = svc.lower()
+        for key, cls, pts in _MDNS_PATTERNS:
+            if key in s:
+                add(cls, pts, f"It advertises the “{svc}” service")
+    ssdp = (dev.ssdp_server + " " + " ".join(
+        s for s in dev.services if not s.startswith("_"))).lower()
+    for pat, cls, pts in _SSDP_PATTERNS:
+        mt = re.search(pat, ssdp) if ssdp.strip() else None
+        if mt:
+            add(cls, pts, "Its UPnP announcement mentions "
+                          f"“{mt.group(0).strip()}”")
+    vc = (dev.dhcp_vendor_class or "").lower()
+    if vc.startswith("msft"):
+        add("Windows PC", 40, "Its DHCP request identifies Windows (MSFT 5.0)")
+    elif vc.startswith("android-dhcp"):
+        add("Android phone", 45, "Its DHCP request identifies Android")
+    elif "dhcpcd" in vc or "udhcp" in vc:
+        add("Linux PC", 10, "Its DHCP client is a Linux one")
+        add("Smart-home/IoT", 10, "Its DHCP client is common on gadgets")
+    if dev.os_ttl:
+        if 65 <= dev.os_ttl <= 128:
+            add("Windows PC", 8, "Its packets start with TTL 128, typical of "
+                                 "Windows (weak hint)")
+        elif dev.os_ttl > 128:
+            add("Router", 5, "Its packets start with TTL 255, typical of "
+                             "network gear (weak hint)")
+    if dev.randomized_mac:
+        for cls in ("iPhone", "Android phone", "Tablet"):
+            add(cls, 6, "It uses a private (randomized) Wi-Fi address, "
+                        "which phones do by default")
+        add("Mac", 3, "It uses a private (randomized) Wi-Fi address")
+        add("Windows PC", 3, "It uses a private (randomized) Wi-Fi address")
+    sites = " ".join(list(dev.websites)[:300]).lower()
+    if sites:
+        if "xboxlive" in sites or "playstation" in sites or \
+                "nintendo" in sites:
+            add("Console", 5, "It contacts game-console services (very weak "
+                              "hint)")
+        if "icloud" in sites or "apple.com" in sites:
+            for cls in ("iPhone", "Mac"):
+                add(cls, 3, "It contacts Apple services (very weak hint)")
+    if not score:
+        return "Unknown", "", ["Not enough information yet — I cannot "
+                               "determine this from passive traffic alone"]
+    best = max(score, key=lambda c: score[c])
+    pts = score[best]
+    word = "Likely" if pts >= 60 else ("Possibly" if pts >= 20 else "")
+    if not word:
+        return "Unknown", "", (why[best][:3] + ["Too little evidence to "
+                                                "guess confidently"])
+    seen, reasons = set(), []
+    for r in why[best]:
+        if r not in seen:
+            seen.add(r)
+            reasons.append(r)
+    return best, word, reasons[:6]
+
+
+
+class DeviceRegistry:
+    """Owns every DeviceRecord: creation, evidence, lifecycle transitions,
+    presence history and identity merging. This is the single place that
+    decides whether something earns a spot in the Devices tab — nothing
+    else may fabricate a device from a bare IP sighting."""
+
+    def __init__(self, gateway_ip, my_ips, config, now_fn=None):
+        self.gateway_ip = gateway_ip
+        self.my_ips = set(my_ips)
+        self.my_macs = set()
+        self.config = config
+        self.now = now_fn or time.time
+        self.local_nets = []          # directly-connected IPv4 networks
+        self.v6_prefixes = []         # IPv6 prefixes announced on this LAN
+        self.by_key = {}
+        self.ip_to_key = {}
+        self.dhcp_leases = {}
+        self.ip_macs = defaultdict(set)
+        self.gw_macs = set()
+        self.ra_routers = set()
+        self.history = []
+        self.arp_claims = defaultdict(lambda: deque(maxlen=16))
+        self.labels = None            # KnownDevicesStore (aliases etc.)
+        # change notifications drained by the model/UI
+        self.rekeyed = []             # (old_key, new_key)
+        self.removed = []             # keys removed by merges
+        self.created = []             # keys created
+        self.events = []              # (kind, severity, text, key)
+
+    # ---- address rules ----------------------------------------------------
+    def classify_address(self, ip):
+        """Reason an address should NOT count as device-worthy evidence on
+        its own, or None if it's an ordinary candidate address."""
+        if not ip:
+            return None
+        a = ip_obj(ip)
+        if a is None:
+            return None
+        if a.is_multicast or ip == "255.255.255.255" or a.is_unspecified:
+            return "broadcast/multicast"
+        if a.is_link_local:
+            return "link-local"
+        if a.version == 4:
+            for net in VIRTUAL_BRIDGE_NETS:
+                if a in net:
+                    return "virtual-bridge"
+        return None
+
+    def eligible_ip(self, ip):
+        """May this address be attached to a LOCAL device?"""
+        a = ip_obj(ip)
+        if a is None or a.is_multicast or a.is_unspecified or a.is_loopback:
+            return False
+        if a.version == 4:
+            if ip == "255.255.255.255" or a in LOOPBACK_V4:
+                return False
+            for net in self.local_nets:
+                if a in net:
+                    if net.prefixlen < 31 and a in (net.network_address,
+                                                    net.broadcast_address):
+                        return False
+                    return True
+            return is_private_ip(ip)
+        if a.is_link_local:
+            return True
+        if a in ipaddress.ip_network("fc00::/7"):
+            return True
+        return any(a in p for p in self.v6_prefixes)
+
+    def _key_for(self, ip, mac):
+        if mac and is_unicast_mac(mac):
+            return mac.lower()
+        if ip:
+            return f"ip:{ip}"
+        return None
+
+    def arp_flip_count(self, ip, window=60):
+        """How many times the claimed MAC for `ip` changed within the last
+        `window` seconds. A single change is ordinary (router swapped);
+        repeated back-and-forth is what ARP spoofing looks like."""
+        now = self.now()
+        seq = [m for t, m in self.arp_claims.get(ip, ()) if now - t <= window]
+        return sum(1 for a, b in zip(seq, seq[1:]) if a != b)
+
+    # ---- creation / evidence ---------------------------------------------
+    def _apply_labels(self, dev):
+        if self.labels is None:
+            return
+        lab = self.labels.get(dev.key)
+        if not lab:
+            return
+        dev.alias = lab.get("alias", "") or dev.alias
+        dev.notes = lab.get("notes", "") or dev.notes
+        dev.mine = bool(lab.get("mine", dev.mine))
+        dev.expected = bool(lab.get("expected", dev.expected))
+        dev.pinned_no_merge = bool(lab.get("pinned", dev.pinned_no_merge))
+        dev.never_merge |= set(lab.get("never_merge", []))
+        if dev.alias:
+            dev.hostname_history.append([dev.alias, "user", self.now()])
+
+    def touch(self, ip, mac, source, detail, when=None):
+        when = when or self.now()
+        flag = self.classify_address(ip) if ip else None
+        if flag == "broadcast/multicast":
+            return None
+        if ip and not self.eligible_ip(ip):
+            ip = None
+        if mac and not is_unicast_mac(mac):
+            mac = None
+        if mac:
+            mac = mac.lower()
+        key = self._key_for(ip, mac)
+        if key is None:
+            return None
+        dev = self.by_key.get(key)
+        if dev is None and not mac and ip:
+            known = self.ip_to_key.get(ip)
+            if known and known in self.by_key:
+                dev = self.by_key[known]
+                key = known
+        if dev is None and mac and ip:
+            prior_key = self.ip_to_key.get(ip)
+            if prior_key and prior_key.startswith("ip:") and \
+                    prior_key in self.by_key:
+                dev = self.by_key.pop(prior_key)
+                dev.key = key
+                self.rekeyed.append((prior_key, key))
+        if dev is None:
+            dev = DeviceRecord(key=key, first_seen=when, last_seen=when,
+                               last_confirmed=when)
+            dev.presence_open(when)
+            self._apply_labels(dev)
+            self.created.append(key)
+        self.by_key[key] = dev
+        if ip:
+            self._assign_ip(dev, ip, when)
+            if ip.count(".") == 3:
+                dev.link_local_only = (flag == "link-local")
+            dev.is_virtual = dev.is_virtual or (flag == "virtual-bridge")
+        if mac and not dev.mac:
+            dev.mac = mac
+            dev.randomized_mac = is_randomized_mac(mac)
+            _push_bounded(dev.mac_history, [mac, when, when], 10)
+            v = mac_vendor(mac)
+            if v and not dev.vendor:
+                dev.vendor = v
+                dev.add_evidence("oui_match", f"Vendor prefix matches {v}",
+                                 when)
+        dev.add_evidence(source, detail, when)
+        dev.last_seen = max(dev.last_seen, when)
+        dev.last_confirmed = max(dev.last_confirmed, when)
+        if dev.state != STATE_ACTIVE:
+            if dev.state in (STATE_INACTIVE, STATE_EXPIRED):
+                _push_bounded(dev.reactivations, when, 30)
+                dev.reactivated_now = True
+                dev.presence_open(when)
+            dev.state = STATE_ACTIVE
+        if CONFIDENCE_ORDER[dev.confidence] > \
+                CONFIDENCE_ORDER[dev._last_conf_tier]:
+            if CONFIDENCE_ORDER[dev.confidence] >= 2 and \
+                    dev._last_conf_tier != CONFIDENCE_UNCONFIRMED and \
+                    when - dev.first_seen > 60 and dev.live:
+                self.events.append(
+                    ("identity", "INFO",
+                     f"{dev.display_name()}: identity confidence rose to "
+                     f"{dev.confidence}", dev.key))
+            dev._last_conf_tier = dev.confidence
+        return dev
+
+    def _assign_ip(self, dev, ip, when):
+        if ":" in ip:
+            if ip not in dev.ipv6:
+                dev.ipv6.add(ip)
+                if len(dev.ipv6) > 12:
+                    for old in sorted(dev.ipv6)[:len(dev.ipv6) - 12]:
+                        dev.ipv6.discard(old)
+                        if self.ip_to_key.get(old) == dev.key:
+                            self.ip_to_key.pop(old, None)
+            self.ip_to_key[ip] = dev.key
+            return
+        prior = self.ip_to_key.get(ip)
+        if prior and prior != dev.key and prior in self.by_key:
+            other = self.by_key[prior]
+            if other.ip == ip:
+                other.ip = ""
+                for h in reversed(other.ip_history):
+                    if h[0] == ip:
+                        h[2] = when
+                        break
+            other.ipv4s.discard(ip)
+        if dev.ip != ip:
+            old = dev.ip
+            dev.ip = ip
+            if old and when - dev.first_seen > 30 and dev.live:
+                self.events.append(
+                    ("ip changed", "INFO",
+                     f"{dev.display_name()} changed address {old} → {ip}",
+                     dev.key))
+            if dev.hostname_source == "rdns" and old:
+                dev.hostname, dev.hostname_source = "", ""
+        dev.ipv4s.add(ip)
+        if len(dev.ipv4s) > 16:
+            dev.ipv4s = set(list(dev.ipv4s)[-16:]) | {ip}
+        if dev.ip_history and dev.ip_history[-1][0] == ip:
+            dev.ip_history[-1][2] = when
+        else:
+            _push_bounded(dev.ip_history, [ip, when, when], 20)
+        self.ip_to_key[ip] = dev.key
+
+    def note_arp_reply(self, ip, mac, when=None):
+        when = when or self.now()
+        dev = self.touch(ip, mac, "arp_reply", f"Answered ARP for {ip}", when)
+        if dev:
+            dev.last_arp = when
+        is_conflict = False
+        if ip and mac:
+            self.arp_claims[ip].append((when, mac.lower()))
+            macs = self.ip_macs[ip]
+            is_new = mac.lower() not in macs
+            macs.add(mac.lower())
+            is_conflict = is_new and len(macs) > 1
+            if ip == self.gateway_ip:
+                self.gw_macs.add(mac.lower())
+        return dev, is_conflict
+
+    def note_dhcp_lease(self, ip, mac, hostname, lease_secs=None, when=None):
+        when = when or self.now()
+        dev = self.touch(ip, mac, "dhcp_lease",
+                         f"DHCP lease for {ip}" +
+                         (f' as “{hostname}”' if hostname else ""),
+                         when)
+        reused = False
+        if dev:
+            if hostname:
+                self._set_dhcp_hostname(dev, hostname, when)
+            prior = self.dhcp_leases.get(ip)
+            reused = bool(prior and prior[0] and mac and
+                          prior[0] != mac.lower())
+            dev.lease_ip = ip
+            dev.lease_start = when
+            dev.lease_expiry = when + lease_secs if lease_secs else 0.0
+            _push_bounded(dev.dhcp_history,
+                          [ip, when, lease_secs or 0, hostname or ""], 20)
+            self.dhcp_leases[ip] = ((mac or "").lower(), hostname, when,
+                                    dev.lease_expiry)
+        return dev, reused
+
+    def _set_dhcp_hostname(self, dev, hostname, when):
+        if hostname and hostname != dev.dhcp_hostname:
+            first = not dev.dhcp_hostname and not dev.hostname
+            dev.dhcp_hostname = hostname
+            _push_bounded(dev.hostname_history, [hostname, "dhcp", when], 20)
+            if first and dev.live and when - dev.first_seen > 8:
+                self.events.append(("hostname", "INFO",
+                                    f"Learned the name “{hostname}” "
+                                    f"for {dev.ip or dev.mac}", dev.key))
+
+    def note_dhcp_client(self, mac, hostname, vendor_class, params="",
+                         when=None):
+        """A client asked for an address (DISCOVER/REQUEST). The MAC is
+        authoritative; the requested IP is NOT assigned until the server
+        confirms it."""
+        when = when or self.now()
+        dev = self.touch(None, mac, "dhcp_client",
+                         "Asked the DHCP server for an address" +
+                         (f' as “{hostname}”' if hostname else ""),
+                         when)
+        if dev:
+            if hostname:
+                self._set_dhcp_hostname(dev, hostname, when)
+            if vendor_class:
+                dev.dhcp_vendor_class = vendor_class
+            if params:
+                dev.dhcp_params = params
+        return dev
+
+    def note_service(self, ip, mac, source, service_name, friendly="",
+                     when=None):
+        dev = self.touch(ip, mac, source,
+                         f"Advertised via {source.upper()}: {service_name}",
+                         when)
+        new = False
+        if dev:
+            if service_name and service_name not in dev.services:
+                if len(dev.services) < 60:
+                    dev.services.add(service_name)
+                    new = True
+            if friendly:
+                if source == "mdns" and friendly != dev.mdns_name:
+                    if not dev.mdns_name:
+                        _push_bounded(dev.hostname_history,
+                                      [friendly, "mdns", self.now()], 20)
+                    dev.mdns_name = friendly
+                elif source == "ssdp" and not dev.ssdp_name:
+                    dev.ssdp_name = friendly
+                    _push_bounded(dev.hostname_history,
+                                  [friendly, "ssdp", self.now()], 20)
+        return dev, new
+
+    def note_nd(self, ip, mac, kind, when=None):
+        when = when or self.now()
+        label = {"NA": "Answered IPv6 Neighbor Discovery for itself",
+                 "NS": "Asked IPv6 Neighbor Discovery with its own address",
+                 "RA": "Announced itself as an IPv6 router",
+                 "RS": "Looked for an IPv6 router"}.get(kind, "IPv6 ND")
+        dev = self.touch(ip, mac, "ipv6_nd" if kind in ("NA", "NS", "RA")
+                         else "local_traffic", label, when)
+        if dev and kind == "RA" and dev.mac:
+            self.ra_routers.add(dev.mac)
+        return dev
+
+    def note_traffic(self, ip, mac, nbytes, proto, direction, internet,
+                     when=None):
+        when = when or self.now()
+        dev = self.touch(ip, mac, "mac_local" if (mac and direction ==
+                                                   "sent") else
+                         "local_traffic",
+                         "Sent traffic on the local network" if
+                         direction == "sent" else
+                         "Received traffic on the local network", when)
+        if dev:
+            dev.last_traffic = when
+            if direction == "sent":
+                dev.last_active = when
+                dev.packets += 1
+                dev.packets_out += 1
+                dev.bytes_up += max(nbytes, 0)
+                dev.protocols[proto] += 1
+            else:
+                dev.packets_in += 1
+                dev.bytes_down += max(nbytes, 0)
+            if internet:
+                dev.internet_bytes += max(nbytes, 0)
+            else:
+                dev.lan_bytes += max(nbytes, 0)
+        return dev
+
+    def set_hostname(self, ip, name, source="rdns"):
+        key = self.ip_to_key.get(ip)
+        dev = self.by_key.get(key) if key else None
+        if not dev or not name:
+            return None
+        if HOSTNAME_PRIORITY.get(source, 0) >= \
+                HOSTNAME_PRIORITY.get(dev.hostname_source, 0) and \
+                name != dev.hostname:
+            first = not dev.hostname and not dev.dhcp_hostname and \
+                not dev.mdns_name
+            dev.hostname, dev.hostname_source = name, source
+            _push_bounded(dev.hostname_history, [name, source, self.now()],
+                          20)
+            if source == "rdns":
+                dev.add_evidence("rdns", f"Reverse DNS name {name}")
+            if first and dev.live:
+                self.events.append(("hostname", "INFO",
+                                    f"Learned the name “{name}” for "
+                                    f"{dev.ip or dev.mac}", dev.key))
+            return dev
+        return None
+
+    # ---- lifecycle ----------------------------------------------------------
+    def tick_lifecycle(self, now=None):
+        now = now or self.now()
+        idle_after = self.config.get("devices.idle_minutes", 2) * 60
+        inactive_after = max(idle_after + 1,
+                             self.config.get("devices.inactive_minutes",
+                                             10) * 60)
+        expire_after = max(inactive_after + 1,
+                           self.config.get("devices.expire_minutes",
+                                           1440) * 60)
+        newly_inactive, newly_expired = [], []
+        for key, dev in list(self.by_key.items()):
+            if not dev.live:
+                continue
+            age = now - dev.last_confirmed
+            if age >= expire_after and dev.state != STATE_EXPIRED:
+                if dev.state != STATE_INACTIVE:
+                    dev.presence_close(dev.last_confirmed)
+                dev.state = STATE_EXPIRED
+                newly_expired.append(dev)
+                try:
+                    self.history.append(device_to_dict(dev, False))
+                except (TypeError, ValueError):
+                    pass
+                if len(self.history) > 300:
+                    del self.history[:-300]
+            elif age >= inactive_after and dev.state not in (STATE_INACTIVE,
+                                                              STATE_EXPIRED):
+                dev.state = STATE_INACTIVE
+                dev.presence_close(dev.last_confirmed)
+                newly_inactive.append(dev)
+            elif age >= idle_after and dev.state == STATE_ACTIVE:
+                dev.state = STATE_IDLE
+        for ip, lease in list(self.dhcp_leases.items()):
+            if lease[3] and lease[3] < now:
+                self.dhcp_leases.pop(ip, None)
+                k = self.ip_to_key.get(ip)
+                dev = self.by_key.get(k) if k else None
+                if dev and dev.lease_ip == ip and \
+                        dev.last_confirmed < lease[3]:
+                    dev.lease_ip = ""
+        return newly_inactive, newly_expired
+
+    def visible_devices(self):
+        show_inactive = self.config.get("devices.show_inactive", False)
+        show_expired = self.config.get("devices.show_expired", False)
+        out = []
+        for dev in self.by_key.values():
+            if not dev.live:
+                out.append(dev)            # saved-session view shows all
+                continue
+            if dev.state == STATE_EXPIRED and not show_expired:
+                continue
+            if dev.state == STATE_INACTIVE and not show_inactive:
+                continue
+            out.append(dev)
+        return out
+
+    # ---- identity correlation ------------------------------------------------
+    _GENERIC_NAME = re.compile(
+        r"^(iphone|ipad|android|galaxy|pixel|macbook|laptop|desktop|phone|"
+        r"tablet|unknown|localhost|device|host|router|windows|linux|esp|"
+        r"espressif|android-[0-9a-f]+)[-_ ]?[a-z0-9]{0,3}$")
+
+    @staticmethod
+    def stable_name(dev):
+        """A name the device announced itself (DHCP hostname / mDNS) —
+        never a reverse-DNS guess."""
+        return (dev.dhcp_hostname or dev.mdns_name or "").strip().lower()
+
+    def distinctive(self, name):
+        return len(name) >= 6 and not self._GENERIC_NAME.match(name)
+
+    @staticmethod
+    def overlapped(a, b, slack=60):
+        """True if two identities were ever active at the same time."""
+        for s1, e1 in a.presence or [[a.first_seen, a.last_confirmed]]:
+            e1 = e1 if e1 is not None else a.last_confirmed
+            for s2, e2 in b.presence or [[b.first_seen, b.last_confirmed]]:
+                e2 = e2 if e2 is not None else b.last_confirmed
+                if s1 < e2 - slack and s2 < e1 - slack:
+                    return True
+        return False
+
+    def can_pair(self, a, b):
+        return not (a.key == b.key or a.pinned_no_merge or b.pinned_no_merge
+                    or b.key in a.never_merge or a.key in b.never_merge
+                    or a.live != b.live)
+
+    def merge_candidates(self, dev):
+        """Possible duplicates of `dev` with the reasons. Based only on
+        identity evidence (announced names, DHCP client details, timing) —
+        never on similar websites or traffic."""
+        out = []
+        name = self.stable_name(dev)
+        for other in self.by_key.values():
+            if not self.can_pair(dev, other):
+                continue
+            reasons, pts = [], 0
+            oname = self.stable_name(other)
+            if name and oname and name == oname:
+                pts += 40 if self.distinctive(name) else 15
+                reasons.append(f"both announced the name “{name}”")
+            elif dev.alias and dev.alias == other.alias:
+                pts += 30
+                reasons.append("you gave both the same name")
+            if not reasons:
+                continue
+            if dev.randomized_mac or other.randomized_mac:
+                pts += 15
+                reasons.append("at least one uses a private (rotating) "
+                               "Wi-Fi address")
+            if dev.dhcp_vendor_class and \
+                    dev.dhcp_vendor_class == other.dhcp_vendor_class:
+                pts += 10
+                reasons.append("their DHCP clients identify the same way")
+            if self.overlapped(dev, other):
+                pts -= 60
+                reasons.append("but they were online at the same time")
+            else:
+                pts += 15
+                reasons.append("they were never online at the same time")
+            if pts >= 30:
+                conf = "Medium" if pts >= 60 else "Low"
+                out.append((other, conf, reasons))
+        out.sort(key=lambda t: (t[1] != "Medium", -t[0].last_seen))
+        return out
+
+    def auto_merge_pass(self):
+        """Settings → Devices → 'Combine identities automatically'.
+        Deliberately conservative — merges only when ALL hold: exactly two
+        candidates share a distinctive self-announced name; at least one
+        uses a private/randomized MAC; their activity never overlapped; the
+        older one is no longer active; neither is pinned. If any doubt
+        remains, nothing is merged and the pair is offered as "Possibly the
+        same device" instead. Returns list of (keep, other) merged."""
+        if not self.config.get("devices.auto_merge", True):
+            return []
+        groups = defaultdict(list)
+        for dev in self.by_key.values():
+            if dev.pinned_no_merge or dev.state == STATE_EXPIRED or \
+                    not dev.live:
+                continue
+            name = self.stable_name(dev)
+            if not self.distinctive(name):
+                continue
+            groups[name].append(dev)
+        merged = []
+        for name, devs in groups.items():
+            if len(devs) != 2:
+                continue
+            older, newer = sorted(devs, key=lambda d: d.first_seen)
+            if not self.can_pair(older, newer):
+                continue
+            if not (older.randomized_mac or newer.randomized_mac):
+                continue
+            if older.state == STATE_ACTIVE or self.overlapped(older, newer):
+                continue
+            if older.dhcp_vendor_class and newer.dhcp_vendor_class and \
+                    older.dhcp_vendor_class != newer.dhcp_vendor_class:
+                continue
+            self.merge(newer.key, older.key, auto=True,
+                       reason=f"both announced the name “{name}”, "
+                              f"at least one uses a private address, and "
+                              f"they were never online at the same time")
+            merged.append((newer.key, older.key))
+        return merged
+
+    def merge(self, keep_key, other_key, auto=False, reason=""):
+        keep = self.by_key.get(keep_key)
+        other = self.by_key.get(other_key)
+        if not keep or not other or keep is other:
+            return None
+        snapshot = device_to_dict(other, include_history=False)
+        keep.first_seen = min(keep.first_seen, other.first_seen)
+        keep.last_seen = max(keep.last_seen, other.last_seen)
+        for f in ("packets", "packets_out", "packets_in", "bytes_up",
+                  "bytes_down", "lan_bytes", "internet_bytes"):
+            setattr(keep, f, getattr(keep, f) + getattr(other, f))
+        keep.services |= other.services
+        keep.websites |= other.websites
+        keep.remote_ips |= other.remote_ips
+        keep.ipv6 |= other.ipv6
+        keep.ipv4s |= other.ipv4s
+        keep.protocols.update(other.protocols)
+        for f in ("hostname", "dhcp_hostname", "mdns_name", "ssdp_name",
+                  "vendor", "alias", "notes", "model_hint",
+                  "dhcp_vendor_class", "ssdp_server"):
+            if not getattr(keep, f):
+                setattr(keep, f, getattr(other, f))
+        keep.mine = keep.mine or other.mine
+        keep.expected = keep.expected or other.expected
+        keep.ip_history = sorted(keep.ip_history + other.ip_history,
+                                 key=lambda h: h[1])[-20:]
+        keep.mac_history = sorted(keep.mac_history + other.mac_history,
+                                  key=lambda h: h[1])[-10:]
+        keep.dhcp_history = sorted(keep.dhcp_history + other.dhcp_history,
+                                   key=lambda h: h[1])[-20:]
+        keep.hostname_history = sorted(
+            keep.hostname_history + other.hostname_history,
+            key=lambda h: h[2])[-20:]
+        keep.presence = sorted(other.presence + keep.presence,
+                               key=lambda p: p[0])[-60:]
+        keep.evidence = sorted(keep.evidence + other.evidence,
+                               key=lambda e: e.when)[-60:]
+        keep.recompute_score()
+        for ip in list(other.ipv4s | other.ipv6):
+            if self.ip_to_key.get(ip) == other_key:
+                self.ip_to_key[ip] = keep.key
+        if other.ip and not keep.ip:
+            keep.ip = other.ip
+        del self.by_key[other_key]
+        self.removed.append(other_key)
+        name = (keep.dhcp_hostname or keep.mdns_name or keep.hostname
+                or keep.display_name())
+        keep.merged_from.append(other.key)
+        keep.merge_history.append({
+            "key": other.key, "when": self.now(), "auto": bool(auto),
+            "reason": reason or f"name “{name}”",
+            "snapshot": snapshot})
+        keep.merge_note = (
+            f"Merged with an earlier identity ({other.key}) "
+            f"{'automatically' if auto else 'by you'}"
+            f"{': ' + reason if reason else ''}. "
+            f"Correlation confidence: Medium. You can split them again "
+            f"from this device's details.")
+        return keep
+
+    def split(self, keep_key, index):
+        """Undo a merge: recreate the absorbed identity from the snapshot
+        taken at merge time. Traffic since the merge stays where it is."""
+        keep = self.by_key.get(keep_key)
+        if not keep or not (0 <= index < len(keep.merge_history)):
+            return None
+        entry = keep.merge_history.pop(index)
+        snap = entry.get("snapshot") or {}
+        restored = device_from_dict(snap)
+        if restored.key in self.by_key:
+            restored.key = restored.key + f"#split{int(self.now())}"
+        restored.state = STATE_INACTIVE
+        restored.presence_close(restored.last_confirmed)
+        for f in ("packets", "packets_out", "packets_in", "bytes_up",
+                  "bytes_down", "lan_bytes", "internet_bytes"):
+            setattr(keep, f, max(0, getattr(keep, f) -
+                                 getattr(restored, f)))
+        keep.never_merge.add(restored.key)
+        restored.never_merge.add(keep.key)
+        if restored.key in keep.merged_from:
+            keep.merged_from.remove(restored.key)
+        keep.merge_note = ""
+        self.by_key[restored.key] = restored
+        for ip in restored.ipv4s | restored.ipv6:
+            if ip not in keep.ipv4s and ip not in keep.ipv6:
+                self.ip_to_key.setdefault(ip, restored.key)
+        self.created.append(restored.key)
+        return restored
+
+
+# ============================================================================
+#  8.  Website / domain model  — a name, never a device
+# ============================================================================
+@dataclass
+class WebsiteRecord:
+    """A domain name learned from DNS, TLS SNI or an HTTP Host header.
+    MiniWireshark normally knows only the *hostname* of HTTPS sites
+    (e.g. example.com) — never the full private URL path."""
+    domain: str
+    registrable: str = ""
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    sources: set = field(default_factory=set)   # "DNS" | "TLS SNI" | "HTTP Host"
+    resolved_ips: set = field(default_factory=set)
+    requests: int = 0            # lookups + connection starts observed
+    connections: int = 0
+    bytes: int = 0
+    devices: set = field(default_factory=set)   # device keys that contacted it
+    third_party_of: set = field(default_factory=set)
+    countries: set = field(default_factory=set)
+    asns: set = field(default_factory=set)
+    encrypted: int = 0           # connections seen encrypted (TLS/QUIC)
+    cleartext: int = 0           # connections seen unencrypted (HTTP)
+    category: str = ""
+    category_source: str = ""
+    live: bool = True
+
+    def encryption_text(self):
+        if self.cleartext and self.encrypted:
+            return "Mixed"
+        if self.cleartext:
+            return "⚠ Not encrypted"
+        if self.encrypted:
+            return "\U0001F512 Encrypted"
+        return "Unknown"
+
+
+def website_to_dict(rec):
+    return {"domain": rec.domain, "registrable": rec.registrable,
+            "resolved_ips": sorted(rec.resolved_ips)[:20],
+            "requests": rec.requests, "connections": rec.connections,
+            "bytes": rec.bytes, "sources": sorted(rec.sources),
+            "devices": sorted(rec.devices)[:50],
+            "countries": sorted(rec.countries), "asns": sorted(rec.asns),
+            "encrypted": rec.encrypted, "cleartext": rec.cleartext,
+            "category": rec.category,
+            "first_seen": rec.first_seen, "last_seen": rec.last_seen}
+
+
+def website_from_dict(wd):
+    rec = WebsiteRecord(domain=str(wd.get("domain", "")).lower(),
+                        registrable=wd.get("registrable", "") or "",
+                        first_seen=float(wd.get("first_seen") or time.time()))
+    rec.resolved_ips = set(wd.get("resolved_ips", []) or [])
+    rec.requests = int(wd.get("requests", 0) or 0)
+    rec.connections = int(wd.get("connections", 0) or 0)
+    rec.bytes = int(wd.get("bytes", 0) or 0)
+    rec.sources = set(wd.get("sources", []) or [])
+    rec.devices = set(wd.get("devices", []) or [])
+    rec.countries = set(wd.get("countries", []) or [])
+    rec.asns = set(wd.get("asns", []) or [])
+    rec.encrypted = int(wd.get("encrypted", 0) or 0)
+    rec.cleartext = int(wd.get("cleartext", 0) or 0)
+    rec.category = wd.get("category", "") or ""
+    rec.last_seen = float(wd.get("last_seen") or rec.first_seen)
+    if not rec.registrable:
+        rec.registrable = registrable_domain(rec.domain)
+    return rec
+
+
+# ============================================================================
+#  9.  Remote-host model  — a public Internet address, never a device
+# ============================================================================
+@dataclass
+class RemoteHostRecord:
+    """A public IP address contacted directly, or the address behind a
+    website — tracked separately from Devices."""
+    ip: str
+    domain: str = ""
+    domains: set = field(default_factory=set)
+    first_seen: float = field(default_factory=time.time)
+    last_seen: float = field(default_factory=time.time)
+    ports: set = field(default_factory=set)
+    protocols: set = field(default_factory=set)
+    devices: set = field(default_factory=set)
+    bytes_total: int = 0
+    bytes_out: int = 0        # sent by your devices to this host
+    bytes_in: int = 0         # received by your devices from this host
+    packets: int = 0
+    connections: int = 0
+    country: str = ""        # ISO code; "" until looked up (opt-in)
+    country_name: str = ""
+    asn: int = 0
+    org: str = ""
+    geo_source: str = ""
+    vpn_endpoint: str = ""   # "WireGuard" etc. when it looks like a VPN server
+    live: bool = True
+
+    def location_text(self):
+        if self.country and self.country_name:
+            return f"{self.country} · {self.country_name}"
+        return self.country or ""
+
+    def provider_text(self):
+        if self.asn:
+            return f"AS{self.asn} {self.org}".strip()
+        return self.org
+
+
+def remote_to_dict(rec):
+    return {"ip": rec.ip, "domain": rec.domain,
+            "domains": sorted(rec.domains)[:20],
+            "ports": sorted(rec.ports)[:40],
+            "protocols": sorted(rec.protocols),
+            "devices": sorted(rec.devices)[:50],
+            "packets": rec.packets, "bytes": rec.bytes_total,
+            "bytes_out": rec.bytes_out, "bytes_in": rec.bytes_in,
+            "connections": rec.connections,
+            "country": rec.country, "country_name": rec.country_name,
+            "asn": rec.asn, "org": rec.org, "vpn_endpoint": rec.vpn_endpoint,
+            "first_seen": rec.first_seen, "last_seen": rec.last_seen}
+
+
+def remote_from_dict(rd):
+    rec = RemoteHostRecord(ip=str(rd.get("ip", "")),
+                           domain=rd.get("domain", "") or "")
+    rec.domains = set(rd.get("domains", []) or ([rec.domain] if rec.domain
+                                                 else []))
+    rec.ports = set(int(p) for p in rd.get("ports", []) or []
+                    if str(p).isdigit())
+    rec.protocols = set(rd.get("protocols", []) or [])
+    rec.devices = set(rd.get("devices", []) or [])
+    rec.packets = int(rd.get("packets", 0) or 0)
+    rec.bytes_total = int(rd.get("bytes", 0) or 0)
+    rec.bytes_out = int(rd.get("bytes_out", 0) or 0)
+    rec.bytes_in = int(rd.get("bytes_in", 0) or 0)
+    rec.connections = int(rd.get("connections", 0) or 0)
+    rec.country = rd.get("country", "") or ""
+    rec.country_name = rd.get("country_name", "") or ""
+    rec.asn = int(rd.get("asn", 0) or 0)
+    rec.org = rd.get("org", "") or ""
+    rec.vpn_endpoint = rd.get("vpn_endpoint", "") or ""
+    rec.first_seen = float(rd.get("first_seen") or time.time())
+    rec.last_seen = float(rd.get("last_seen") or rec.first_seen)
+    return rec
+
+
+# ============================================================================
+#  10.  Connection / flow model
+#
+#  A flow is one conversation: (transport, local endpoint, remote endpoint).
+#  Active flows live in a bounded table; idle/closed ones are expired into
+#  a bounded archive, so memory stays flat however long you watch.
+# ============================================================================
+TCP_FLAG = {"FIN": 0x01, "SYN": 0x02, "RST": 0x04, "PSH": 0x08, "ACK": 0x10}
+FLOW_TIMEOUTS = {"TCP": 300.0, "TCP_CLOSED": 15.0, "UDP": 60.0,
+                 "ICMP": 30.0, "ICMPv6": 30.0, "OTHER": 60.0}
+
+
+class FlowRecord:
+    __slots__ = ("fid", "key", "transport", "local_ip", "local_port",
+                 "remote_ip", "remote_port", "device_key", "remote_public",
+                 "lan", "first_seen", "last_seen", "packets_out",
+                 "packets_in", "bytes_out", "bytes_in", "state", "syn",
+                 "synack", "fin_out", "fin_in", "rst", "rst_by", "retrans",
+                 "app", "service", "domain", "domain_conf", "tls_version",
+                 "alpn", "encrypted", "interp_conf", "country", "asn", "org",
+                 "closed", "note", "seq_out", "seq_in", "initiator",
+                 "cleartext", "live")
+
+    def __init__(self, fid, key, transport, local_ip, local_port, remote_ip,
+                 remote_port, ts):
+        self.fid = fid
+        self.key = key
+        self.transport = transport
+        self.local_ip, self.local_port = local_ip, local_port
+        self.remote_ip, self.remote_port = remote_ip, remote_port
+        self.device_key = ""
+        self.remote_public = is_public_ip(remote_ip)
+        self.lan = False
+        self.first_seen = self.last_seen = ts
+        self.packets_out = self.packets_in = 0
+        self.bytes_out = self.bytes_in = 0
+        self.state = "New"
+        self.syn = self.synack = False
+        self.fin_out = self.fin_in = False
+        self.rst = 0
+        self.rst_by = ""
+        self.retrans = 0
+        self.app = ""
+        self.service = ""
+        self.domain = ""
+        self.domain_conf = ""
+        self.tls_version = ""
+        self.alpn = ""
+        self.encrypted = "unknown"
+        self.interp_conf = ""
+        self.country = ""
+        self.asn = 0
+        self.org = ""
+        self.closed = False
+        self.note = ""
+        self.seq_out = None
+        self.seq_in = None
+        self.initiator = "?"
+        self.cleartext = ""
+        self.live = True
+
+    @property
+    def duration(self):
+        return max(0.0, self.last_seen - self.first_seen)
+
+    @property
+    def total_bytes(self):
+        return self.bytes_out + self.bytes_in
+
+    @property
+    def packets(self):
+        return self.packets_out + self.packets_in
+
+    def purpose(self):
+        if self.note:
+            return self.note
+        if self.app in ("TLS", "QUIC"):
+            return "Secure web connection"
+        if self.app == "HTTP":
+            return "Unsecured web browsing"
+        if self.app == "DNS":
+            return "Website lookup (DNS)"
+        if self.app in FRIENDLY_PROTO and self.app not in ("TCP", "UDP"):
+            return FRIENDLY_PROTO[self.app]
+        if self.service:
+            return self.service + ("" if self.interp_conf == "Observed"
+                                   else " (likely)")
+        return "Unknown purpose"
+
+    def status_text(self):
+        if self.transport != "TCP":
+            return "Ended" if self.closed else "Active"
+        if self.rst:
+            who = {"local": "your device", "remote": "the other side"}.get(
+                self.rst_by, "")
+            return f"Reset{(' by ' + who) if who else ''}"
+        if self.closed and (self.fin_out or self.fin_in):
+            return "Closed normally"
+        if self.closed:
+            return "Timed out"
+        if self.fin_out or self.fin_in:
+            return "Closing"
+        if self.syn and not self.synack and self.packets_in == 0:
+            return "Trying to connect…"
+        return "Open"
+
+    def encryption_text(self):
+        return {"yes": "\U0001F512 Encrypted", "likely":
+                "\U0001F512 Likely encrypted", "no": "⚠ Not encrypted"
+                }.get(self.encrypted, "Unknown")
+
+    def to_dict(self):
+        return {s: getattr(self, s) for s in self.__slots__
+                if s not in ("seq_out", "seq_in")}
+
+    @classmethod
+    def from_dict(cls, d):
+        f = cls(int(d.get("fid", 0) or 0), tuple(d.get("key") or ()),
+                d.get("transport", ""), d.get("local_ip", ""),
+                d.get("local_port"), d.get("remote_ip", ""),
+                d.get("remote_port"), float(d.get("first_seen") or 0))
+        for s in cls.__slots__:
+            if s in d and s not in ("fid", "key", "seq_out", "seq_in"):
+                with contextlib.suppress(AttributeError, TypeError):
+                    setattr(f, s, d[s])
+        f.closed = True
+        f.live = False
+        return f
+
+
+class FlowTable:
+    def __init__(self, max_active=5000, archive_size=2000):
+        self.max_active = max_active
+        self.active = OrderedDict()       # key -> FlowRecord (LRU order)
+        self.archive = deque(maxlen=archive_size)
+        self.by_id = {}
+        self.next_id = 1
+        self.evicted = 0
+        self.total_flows = 0
+        self.dirty = set()
+        self.closed_now = []
+
+    def resize(self, max_active, archive_size):
+        self.max_active = max(200, int(max_active))
+        if self.archive.maxlen != archive_size:
+            self.archive = deque(self.archive, maxlen=max(100,
+                                                          int(archive_size)))
+
+    def get(self, fid):
+        return self.by_id.get(fid)
+
+    def all_flows(self):
+        return list(self.active.values()) + list(self.archive)
+
+    def _archive(self, f):
+        f.closed = True
+        if f.state not in ("Reset",):
+            f.state = "Closed"
+        if len(self.archive) == self.archive.maxlen and self.archive:
+            old = self.archive[0]
+            self.by_id.pop(old.fid, None)
+        self.archive.append(f)
+        self.closed_now.append(f)
+        self.dirty.add(f.fid)
+
+    def lookup_or_create(self, key, transport, lip, lport, rip, rport, ts):
+        f = self.active.get(key)
+        if f is not None:
+            self.active.move_to_end(key)
+            return f, False
+        f = FlowRecord(self.next_id, key, transport, lip, lport, rip, rport,
+                       ts)
+        self.next_id += 1
+        self.total_flows += 1
+        self.active[key] = f
+        self.by_id[f.fid] = f
+        while len(self.active) > self.max_active:
+            _k, old = self.active.popitem(last=False)
+            self.evicted += 1
+            self._archive(old)
+        return f, True
+
+    def expire(self, now):
+        out = []
+        for key, f in list(self.active.items()):
+            if f.transport == "TCP":
+                done = f.rst or (f.fin_out and f.fin_in)
+                limit = FLOW_TIMEOUTS["TCP_CLOSED"] if done else \
+                    FLOW_TIMEOUTS["TCP"]
+            else:
+                limit = FLOW_TIMEOUTS.get(f.transport, FLOW_TIMEOUTS["OTHER"])
+            if now - f.last_seen > limit:
+                del self.active[key]
+                self._archive(f)
+                out.append(f)
+        return out
+
+    def clear(self):
+        self.active.clear()
+        self.archive.clear()
+        self.by_id.clear()
+        self.dirty.clear()
+        self.closed_now.clear()
+
+
+# ============================================================================
+#  11.  Historical metrics — bounded rolling buckets
+#
+#  Three resolutions: 1 s for the last 5 minutes, 10 s for the last hour,
+#  1 min for the last day. Memory is fixed regardless of session length.
+#  Timestamps are packet times, so imported captures chart correctly too.
+# ============================================================================
+METRIC_TIERS = ((1, 300), (10, 360), (60, 1440))
+
+
+class TimeSeries:
+    __slots__ = ("tiers", "gauge")
+
+    def __init__(self, gauge=False):
+        self.tiers = {res: OrderedDict() for res, _n in METRIC_TIERS}
+        self.gauge = gauge
+
+    def add(self, ts, value=1):
+        for res, n in METRIC_TIERS:
+            od = self.tiers[res]
+            b = int(ts // res) * res
+            if self.gauge:
+                od[b] = max(od.get(b, 0), value)
+            else:
+                od[b] = od.get(b, 0) + value
+            if len(od) > n:
+                # bounded: drop the oldest buckets (handles out-of-order too)
+                while len(od) > n:
+                    od.popitem(last=False)
+
+    def series(self, res, count, now):
+        od = self.tiers[res]
+        end = int(now // res) * res
+        return [(b, od.get(b, 0)) for b in
+                range(end - (count - 1) * res, end + res, res)]
+
+    def total_window(self, res, count, now, skip_current=False):
+        end = int(now // res) * res
+        if skip_current:
+            end -= res
+        od = self.tiers[res]
+        return sum(od.get(b, 0) for b in
+                   range(end - (count - 1) * res, end + res, res))
+
+    def to_dict(self):
+        return {str(res): list(od.items()) for res, od in self.tiers.items()}
+
+    def load(self, d):
+        for res, _n in METRIC_TIERS:
+            items = d.get(str(res)) or []
+            od = self.tiers[res]
+            for b, v in items[-_n:]:
+                with contextlib.suppress(TypeError, ValueError):
+                    od[int(b)] = v
+
+
+class MetricsEngine:
+    NAMES = ("bytes_up", "bytes_down", "bytes_lan", "bytes_other",
+             "packets", "dns_queries", "new_connections", "alerts",
+             "new_devices", "bcast_packets", "tcp_resets")
+
+    def __init__(self):
+        self.series = {n: TimeSeries() for n in self.NAMES}
+        self.series["active_devices"] = TimeSeries(gauge=True)
+        self.totals = Counter()
+        self.proto_bytes = Counter()
+        self.proto_minutes = OrderedDict()     # minute -> Counter(proto bytes)
+        self.first_ts = 0.0
+        self.last_ts = 0.0
+        self.peak = {"up": 0.0, "down": 0.0, "pps": 0.0}
+        self._peak_bucket = None
+
+    def add(self, name, ts, value=1):
+        self.series[name].add(ts, value)
+        self.totals[name] += value
+
+    def observe_packet(self, ts, nbytes, direction, proto):
+        if not self.first_ts or ts < self.first_ts:
+            self.first_ts = ts
+        if ts > self.last_ts:
+            self._roll_peak(ts)
+            self.last_ts = ts
+        self.add("packets", ts, 1)
+        if direction == "up":
+            self.add("bytes_up", ts, nbytes)
+        elif direction == "down":
+            self.add("bytes_down", ts, nbytes)
+        elif direction == "lan":
+            self.add("bytes_lan", ts, nbytes)
+        else:
+            self.add("bytes_other", ts, nbytes)
+        self.proto_bytes[proto] += nbytes
+        m = int(ts // 60) * 60
+        c = self.proto_minutes.get(m)
+        if c is None:
+            c = self.proto_minutes[m] = Counter()
+            while len(self.proto_minutes) > 60:
+                self.proto_minutes.popitem(last=False)
+        c[proto] += nbytes
+
+    def _roll_peak(self, ts):
+        b = int(ts)
+        if self._peak_bucket is not None and b > self._peak_bucket:
+            prev = self._peak_bucket
+            for key, name in (("up", "bytes_up"), ("down", "bytes_down"),
+                              ("pps", "packets")):
+                v = self.series[name].tiers[1].get(prev, 0)
+                if v > self.peak[key]:
+                    self.peak[key] = float(v)
+        self._peak_bucket = b
+
+    def rate(self, name, window, now):
+        """Average per second over the last `window` complete seconds."""
+        if window <= 0:
+            return 0.0
+        return self.series[name].total_window(1, window, now,
+                                              skip_current=True) / window
+
+    def current(self, name, now):
+        return self.rate(name, 3, now)
+
+    def session_avg(self, name, now):
+        dur = max(1.0, (min(now, self.last_ts or now) - self.first_ts)
+                  if self.first_ts else 1.0)
+        return self.totals[name] / dur
+
+    def top_protocols(self, recent_minutes=None, n=8):
+        if recent_minutes:
+            c = Counter()
+            for m in list(self.proto_minutes)[-recent_minutes:]:
+                c.update(self.proto_minutes[m])
+            return c.most_common(n)
+        return self.proto_bytes.most_common(n)
+
+    def duration(self, now):
+        if not self.first_ts:
+            return 0.0
+        return max(0.0, min(now, self.last_ts or now) - self.first_ts)
+
+    def to_dict(self):
+        return {"totals": dict(self.totals),
+                "proto_bytes": dict(self.proto_bytes.most_common(40)),
+                "first_ts": self.first_ts, "last_ts": self.last_ts,
+                "peak": dict(self.peak),
+                "series": {n: s.to_dict() for n, s in self.series.items()}}
+
+    def load(self, d):
+        if not isinstance(d, dict):
+            return
+        self.totals.update({k: v for k, v in (d.get("totals") or {}).items()
+                            if isinstance(v, (int, float))})
+        self.proto_bytes.update(d.get("proto_bytes") or {})
+        self.first_ts = float(d.get("first_ts") or 0)
+        self.last_ts = float(d.get("last_ts") or 0)
+        self.peak.update({k: float(v) for k, v in
+                          (d.get("peak") or {}).items()
+                          if isinstance(v, (int, float))})
+        for n, sd in (d.get("series") or {}).items():
+            if n in self.series and isinstance(sd, dict):
+                self.series[n].load(sd)
+
+
+# ============================================================================
+#  12.  Anomaly / security engine
+#
+#  Alerts describe ANOMALIES, not compromises. Every alert separates what
+#  was observed from what it might mean, carries a confidence, innocent
+#  explanations, suggested checks and the evidence behind it. DANGER is
+#  reserved for strong, specific evidence — never for "unusual" alone.
+# ============================================================================
+ALERT_TYPES = {
+    "new_device":       ("New device", "INFO"),
+    "arp_spoof":        ("Possible ARP spoofing", "DANGER"),
+    "gateway_change":   ("Gateway identity changed", "WARNING"),
+    "dhcp_anomaly":     ("DHCP anomaly", "WARNING"),
+    "chatty_device":    ("Unusually chatty device", "WARNING"),
+    "unknown_device":   ("Unknown / unconfirmed device", "WARNING"),
+    "reconnect_cycle":  ("Rapid reconnect/disconnect", "WARNING"),
+    "duplicate_ip":     ("Duplicate IP address", "WARNING"),
+    "dns_server_change": ("DNS server changed", "WARNING"),
+    "dns_failures":     ("Many DNS failures", "WARNING"),
+    "dns_slow":         ("Slow DNS", "WARNING"),
+    "dns_multi":        ("Several DNS servers in use", "INFO"),
+    "many_destinations": ("Unusually many destinations", "WARNING"),
+    "many_connections": ("Unusually many new connections", "WARNING"),
+    "upload_spike":     ("Unusual upload spike", "WARNING"),
+    "download_spike":   ("Unusual download spike", "INFO"),
+    "tcp_resets":       ("Repeated connection resets", "WARNING"),
+    "new_service":      ("New advertised service", "INFO"),
+    "cleartext":        ("Unencrypted protocol in use", "INFO"),
+    "remote_access":    ("Remote-access service seen", "WARNING"),
+    "new_country":      ("New country contacted", "INFO"),
+    "broadcast_storm":  ("Excessive broadcast traffic", "WARNING"),
+    "scan_pattern":     ("Possible scanning pattern", "WARNING"),
+}
+
+# default confidence + "why was this flagged" for each kind
+ALERT_META = {
+    "new_device": ("High", "A device appeared that I haven't seen in this "
+                           "session."),
+    "arp_spoof": ("High", "The same address was claimed by different "
+                          "hardware back and forth within a minute."),
+    "gateway_change": ("Medium", "Your router's hardware (MAC) address "
+                                 "changed during this session."),
+    "dhcp_anomaly": ("High", "More than one device answered DHCP requests."),
+    "chatty_device": ("Medium", "Traffic this minute is far above this "
+                                "device's own recent average."),
+    "unknown_device": ("Medium", "The device stayed hard to identify after "
+                                 "sending a number of packets."),
+    "reconnect_cycle": ("Medium", "The device went offline and came back "
+                                  "many times in a short window."),
+    "duplicate_ip": ("Medium", "Two different hardware addresses claimed "
+                               "the same IP address."),
+}
+
+
+@dataclass
+class Alert:
+    id: str
+    kind: str
+    severity: str
+    device_key: str
+    reason: str
+    observed: str
+    interpretation: str
+    possible_explanations: str
+    when: float = field(default_factory=time.time)
+    acknowledged: bool = False
+    confidence: str = "Medium"
+    why: str = ""
+    subject: str = ""
+    first_seen: float = 0.0
+    last_seen: float = 0.0
+    count: int = 1
+    evidence: list = field(default_factory=list)
+    refs: dict = field(default_factory=dict)
+    updated: bool = False
+    live: bool = True
+
+
+def alert_to_dict(a):
+    return {"id": a.id, "severity": a.severity, "kind": a.kind,
+            "device_key": a.device_key, "reason": a.reason,
+            "observed": a.observed, "interpretation": a.interpretation,
+            "possible_explanations": a.possible_explanations,
+            "when": a.when, "acknowledged": a.acknowledged,
+            "confidence": a.confidence, "why": a.why, "subject": a.subject,
+            "first_seen": a.first_seen, "last_seen": a.last_seen,
+            "count": a.count, "evidence": a.evidence[:20],
+            "refs": a.refs}
+
+
+def alert_from_dict(ad):
+    when = float(ad.get("when") or time.time())
+    a = Alert(id=ad.get("id") or uuid.uuid4().hex[:8],
+              kind=ad.get("kind", ""), severity=ad.get("severity", "INFO"),
+              device_key=ad.get("device_key", "") or "",
+              reason=ad.get("reason", ""), observed=ad.get("observed", ""),
+              interpretation=ad.get("interpretation", ""),
+              possible_explanations=ad.get("possible_explanations", ""),
+              when=when)
+    a.acknowledged = bool(ad.get("acknowledged", False))
+    a.confidence = ad.get("confidence", "Medium") or "Medium"
+    a.why = ad.get("why", "") or ""
+    a.subject = ad.get("subject", "") or a.device_key
+    a.first_seen = float(ad.get("first_seen") or when)
+    a.last_seen = float(ad.get("last_seen") or when)
+    a.count = int(ad.get("count", 1) or 1)
+    a.evidence = list(ad.get("evidence") or [])
+    a.refs = dict(ad.get("refs") or {})
+    a.live = False
+    return a
+
+
+
+SERVICE_DESCRIPTIONS = {
+    "_airplay._tcp": "Can receive AirPlay audio/video from Apple devices.",
+    "_raop._tcp": "Can receive streamed audio (AirPlay-compatible speaker).",
+    "_googlecast._tcp": "Can receive casted audio/video (Chromecast-compatible).",
+    "_spotify-connect._tcp": "Can be used as a Spotify Connect speaker.",
+    "_sonos": "This looks like a Sonos speaker.",
+    "_ipp._tcp": "This is a network printer.",
+    "_printer._tcp": "This is a network printer.",
+    "_pdl-datastream._tcp": "This is a network printer.",
+    "_homekit._tcp": "Supports Apple HomeKit smart-home control.",
+    "_hap._tcp": "Supports Apple HomeKit smart-home control.",
+    "_matter._tcp": "Supports the Matter smart-home standard.",
+    "_ssh._tcp": "Can be controlled remotely over SSH \u2014 make sure that's expected.",
+    "_smb._tcp": "Shares files over the network (Windows/SMB file sharing).",
+    "_afpovertcp._tcp": "Shares files over the network (Apple file sharing).",
+    "_workstation._tcp": "A computer sharing its presence on the network.",
+    "_nvstream._tcp": "Supports NVIDIA GameStream.",
+    "_xbox": "This looks like an Xbox console.",
+    "_ps4": "This looks like a PlayStation console.",
+    "_ps5": "This looks like a PlayStation console.",
+}
+
+
+def service_description(service_name):
+    n = (service_name or "").lower()
+    for key, desc in SERVICE_DESCRIPTIONS.items():
+        if key in n:
+            return desc
+    return ""
+
+
+ALERT_CHECKLIST = {
+    "new_device": ["Open your router's connected-devices list and look for "
+                   "this device.",
+                   "If it isn't yours or a guest's, change your Wi-Fi "
+                   "password and re-check."],
+    "arp_spoof": ["Disconnect from this network on any device you're "
+                  "unsure about.",
+                  "Open your router's admin page from a device you trust "
+                  "and check its connected devices.",
+                  "Restart the router; if this returns immediately, look "
+                  "for a device that shouldn't be there."],
+    "gateway_change": ["Did you just restart, update or replace the "
+                       "router? If yes, this is expected.",
+                       "If not, check the router's admin page and its "
+                       "connected devices before trusting this network."],
+    "dhcp_anomaly": ["Check whether a second router or access point was "
+                     "plugged in recently.",
+                     "Unplug anything you don't recognize and see whether "
+                     "the second DHCP server disappears."],
+    "chatty_device": ["Is the device downloading an update, streaming or "
+                      "on a video call?",
+                      "If it should be idle, restart it or look at what "
+                      "it is running."],
+    "unknown_device": ["Give it time \u2014 confidence rises as more "
+                       "evidence arrives.",
+                       "Compare its MAC address with the labels on your "
+                       "devices or your router's list."],
+    "reconnect_cycle": ["Check the device's Wi-Fi signal and its distance "
+                        "from the router.",
+                        "Look for power-saving or roaming settings on the "
+                        "device."],
+    "duplicate_ip": ["Check for two devices set to the same fixed IP.",
+                     "Renew the lease (reconnect the device) and see if "
+                     "it stops."],
+}
+
+
+
+ALERT_CHECKLIST.update({
+    "dns_server_change": ["Did you (or an app/VPN) just change DNS "
+                          "settings? Then this is expected.",
+                          "Otherwise, check the DNS settings in your router "
+                          "and on the device."],
+    "dns_failures": ["Check whether websites load normally right now.",
+                     "If not, restart the router; if it persists, try a "
+                     "different DNS server or contact your provider."],
+    "dns_slow": ["Run the Health tab's checks to compare router and Internet "
+                 "response times.",
+                 "Slow DNS is often your provider's — a different DNS "
+                 "server can help."],
+    "dns_multi": ["Usually harmless: VPNs, browsers with secure DNS, and "
+                  "some apps use their own DNS servers."],
+    "many_destinations": ["Is the device updating, syncing a cloud folder, "
+                          "or running a peer-to-peer app?",
+                          "If it should be idle, look at what it is "
+                          "running."],
+    "many_connections": ["Browsers, games and updates open many "
+                         "connections; check what the device is doing.",
+                         "Restart the device if it should be idle."],
+    "upload_spike": ["Is the device backing up photos, uploading video, or "
+                     "on a video call?",
+                     "If not, check what it is running — large "
+                     "unexpected uploads are worth understanding."],
+    "download_spike": ["Usually an update, a game download or streaming."],
+    "tcp_resets": ["A website or service may be refusing connections.",
+                   "Firewalls and ad-blockers also cause resets; check if "
+                   "something isn't working."],
+    "new_service": ["Did you just install or enable something on that "
+                    "device (e.g. file sharing, casting)?"],
+    "cleartext": ["Avoid entering passwords on services that are not "
+                  "encrypted.",
+                  "Check whether the device/app offers a secure (TLS) "
+                  "option."],
+    "remote_access": ["Make sure remote access on that device is something "
+                      "you set up on purpose.",
+                      "Use strong passwords and turn the service off if "
+                      "you don't need it."],
+    "new_country": ["Usually normal: content networks and cloud services "
+                    "live in many countries.",
+                    "Only worth a look if the device should rarely use the "
+                    "Internet."],
+    "broadcast_storm": ["A misbehaving device or a network loop can flood "
+                        "the network.",
+                        "Unplug recently added network cables/switches and "
+                        "see if it stops."],
+    "scan_pattern": ["If you ran a network scanner yourself, this is "
+                     "expected.",
+                     "Otherwise, find that device and check what software "
+                     "it is running."],
+})
+
+
+class AlertEngine:
+    def __init__(self, config, now_fn=None):
+        self.config = config
+        self.now = now_fn or time.time
+        self.alerts = {}
+        self.order = []
+        self._debounce = {}
+        self._open = {}            # (kind, subject) -> alert id
+        self.suppressed = 0
+
+    def enabled(self, kind):
+        return bool(self.config.get(f"alerts.{kind}", True))
+
+    def is_muted(self, kind, device_key, subject):
+        muted = self.config.get("alerts.muted_devices", []) or []
+        expected = self.config.get("alerts.expected", []) or []
+        return (f"{kind}|{device_key}" in muted or
+                f"{kind}|{subject}" in expected)
+
+    def _add(self, kind, severity, device_key, reason, observed, interp, poss,
+             confidence=None, why=None, evidence=None, refs=None,
+             subject=None):
+        if not self.enabled(kind):
+            return None
+        subject = subject or device_key
+        if self.is_muted(kind, device_key, subject):
+            self.suppressed += 1
+            return None
+        now = self.now()
+        # same thing still happening and not acknowledged: update, don't spam
+        oid = self._open.get((kind, subject))
+        if oid and oid in self.alerts:
+            a = self.alerts[oid]
+            if not a.acknowledged and now - a.last_seen < 1800:
+                a.count += 1
+                a.last_seen = now
+                a.observed = observed
+                if evidence:
+                    a.evidence = (a.evidence + list(evidence))[-20:]
+                a.updated = True
+                return a
+        meta_conf, meta_why = ALERT_META.get(kind, ("Medium", ""))
+        a = Alert(id=uuid.uuid4().hex[:8], kind=kind, severity=severity,
+                  device_key=device_key, reason=reason, observed=observed,
+                  interpretation=interp, possible_explanations=poss,
+                  when=now, confidence=confidence or meta_conf,
+                  why=why or meta_why, subject=subject, first_seen=now,
+                  last_seen=now, evidence=list(evidence or [])[:20],
+                  refs=dict(refs or {}))
+        if device_key and not a.refs.get("device") and \
+                not device_key.startswith("ip:"):
+            a.refs["device"] = device_key
+        self.alerts[a.id] = a
+        self.order.insert(0, a.id)
+        self._open[(kind, subject)] = a.id
+        if len(self.order) > 500:
+            for old in self.order[500:]:
+                self.alerts.pop(old, None)
+            del self.order[500:]
+        return a
+
+    def _debounced(self, key, seconds):
+        now = self.now()
+        last = self._debounce.get(key)
+        if last is not None and now - last < seconds:
+            return True
+        self._debounce[key] = now
+        return False
+
+    def acknowledge(self, aid):
+        a = self.alerts.get(aid)
+        if a:
+            a.acknowledged = True
+        return a
+
+    def counts(self, include_ack=False):
+        c = Counter()
+        for aid in self.order:
+            a = self.alerts.get(aid)
+            if a and (include_ack or not a.acknowledged):
+                c[a.severity] += 1
+        return c
+
+    def new_device(self, dev):
+        if dev.expected:
+            return None
+        return self._add(
+            "new_device", "INFO", dev.key,
+            f"{dev.display_name()} joined your network",
+            f"A device with {dev.confidence.lower()}-confidence identity "
+            f"evidence ({', '.join(dev.evidence_summary()) or 'minimal'}) "
+            f"appeared.",
+            "This is a new local device on your network.",
+            "Normal if you just added a device (phone, guest, smart-home "
+            "gadget). Worth checking if you don't recognize it.")
+
+    def gateway_change(self, gw_ip, n_macs):
+        if self._debounced(f"gw:{gw_ip}", 120):
+            return None
+        return self._add(
+            "gateway_change", "WARNING", f"ip:{gw_ip}",
+            "Your router's MAC address changed",
+            f"Your gateway ({gw_ip}) has answered ARP from {n_macs} "
+            f"different MAC addresses in this session.",
+            "The device claiming to be your router is not consistent.",
+            "Often normal right after a router reboot or firmware update. "
+            "It is also the classic sign of ARP spoofing \u2014 a device "
+            "pretending to be your router. If you didn't just restart "
+            "your router, investigate.")
+
+    def duplicate_ip(self, ip, n_macs):
+        if self._debounced(f"dupip:{ip}", 120):
+            return None
+        return self._add(
+            "duplicate_ip", "WARNING", f"ip:{ip}",
+            f"{ip} has answered from more than one device",
+            f"{n_macs} different MAC addresses have claimed {ip}.",
+            "Two devices currently disagree about who owns this address.",
+            "Often harmless \u2014 Wi-Fi privacy MAC rotation or a device "
+            "reconnecting and briefly overlapping the old lease. Worth a "
+            "look if it keeps happening.")
+
+    def dhcp_anomaly(self, servers):
+        if self._debounced("dhcp_anomaly", 300):
+            return None
+        return self._add(
+            "dhcp_anomaly", "WARNING", "",
+            "More than one device is handing out IP addresses",
+            f"{len(servers)} different DHCP servers seen: "
+            f"{', '.join(sorted(servers))}.",
+            "Normally only your router does this.",
+            "Could be a second router plugged in by mistake, or \u2014 "
+            "less commonly \u2014 a rogue DHCP server. If you don't "
+            "recognize one of these addresses, unplug that device and "
+            "check your network.")
+
+    def arp_spoof(self, ip, n_macs, flips, is_gateway):
+        if self._debounced(f"arpspoof:{ip}", 120):
+            return None
+        who = "Your router's address" if is_gateway else f"The address {ip}"
+        return self._add(
+            "arp_spoof", "DANGER", f"ip:{ip}",
+            f"{who} keeps switching between devices",
+            f"{ip} was claimed by {n_macs} different MAC addresses and "
+            f"flipped back and forth {flips} times within a minute.",
+            "Two devices are repeatedly fighting over the same network "
+            "address.",
+            "A device normally answers for its address consistently. Rapid "
+            "flip-flopping is the signature of ARP spoofing \u2014 one "
+            "device impersonating another so traffic passes through it. It "
+            "can also happen if two devices were accidentally given the "
+            "same fixed IP. If this is your router's address, treat it "
+            "seriously: disconnect and check the router's device list.")
+
+    def chatty_device(self, dev):
+        if self._debounced(f"chatty:{dev.key}", 600):
+            return None
+        return self._add(
+            "chatty_device", "WARNING", dev.key,
+            f"{dev.display_name()} is unusually active right now",
+            "This device's traffic this minute is well above its own "
+            "recent average.",
+            "Its behavior changed compared to its own baseline this "
+            "session.",
+            "Often normal \u2014 a big download, a video call, a software "
+            "update. Worth a glance if you don't expect that device to be "
+            "busy right now.")
+
+    def unknown_device(self, dev):
+        if self._debounced(f"unknown:{dev.key}", 600):
+            return None
+        return self._add(
+            "unknown_device", "WARNING", dev.key,
+            f"{dev.display_name()} has very little identifying information",
+            f"Only {', '.join(dev.evidence_summary()) or 'minimal'} "
+            f"evidence is available for this device.",
+            "MiniWireshark can't confidently say what this device is.",
+            "Common for devices that stay quiet or use a randomized MAC. "
+            "Confidence usually improves the longer it's on the network.")
+
+    def reconnect_cycle(self, dev, n, window_s):
+        if self._debounced(f"reconnect:{dev.key}", 600):
+            return None
+        return self._add(
+            "reconnect_cycle", "WARNING", dev.key,
+            f"{dev.display_name()} has joined/left {n} times recently",
+            f"{n} reconnects in the last {int(window_s / 60)} minutes.",
+            "This device is repeatedly reconnecting.",
+            "Usually Wi-Fi interference, a weak signal, or a device with "
+            "power-saving/roaming quirks \u2014 rarely an attack.")
+
+
+    # ---- 3.0 detections (all phrased as anomalies) -----------------------
+    def dns_server_change(self, dev_name, dev_key, old, new):
+        if self._debounced(f"dnschg:{dev_key}:{new}", 1800):
+            return None
+        return self._add(
+            "dns_server_change", "WARNING", dev_key,
+            f"{dev_name} switched to a different DNS server",
+            f"It had been using {old} for its lookups and is now using "
+            f"{new}.",
+            "The service that turns website names into addresses changed "
+            "for this device.",
+            "Common and harmless when a VPN connects, a browser enables "
+            "secure DNS, or you change settings. Worth checking if you "
+            "didn't change anything, because DNS decides which servers "
+            "your device talks to.",
+            confidence="Medium",
+            why="This device consistently used one DNS server, then moved "
+                "to another.",
+            evidence=[f"Previous server: {old}", f"New server: {new}"],
+            subject=f"{dev_key}|{new}")
+
+    def dns_failures(self, rate, n, servers):
+        if self._debounced("dnsfail", 900):
+            return None
+        return self._add(
+            "dns_failures", "WARNING", "",
+            "Many website lookups are failing",
+            f"{rate:.0%} of the last {n} DNS lookups failed or got no "
+            f"answer (servers: {', '.join(servers) or 'unknown'}).",
+            "Website names aren't being resolved reliably right now.",
+            "Often a temporary problem at your Internet provider or router, "
+            "or an ad-blocker deliberately refusing some names.",
+            confidence="Medium" if n >= 40 else "Low",
+            why="The share of failed lookups is well above normal.",
+            subject="dns")
+
+    def dns_slow(self, median_ms, n, server):
+        if self._debounced("dnsslow", 1800):
+            return None
+        return self._add(
+            "dns_slow", "WARNING", "",
+            "Website lookups are slow",
+            f"The typical DNS answer took {median_ms:.0f} ms over the last "
+            f"{n} lookups ({server or 'various servers'}).",
+            "Pages may feel slow to start loading.",
+            "Usually your provider's DNS being slow or a congested "
+            "connection; it isn't a security problem.",
+            confidence="Medium", why="Median DNS latency exceeded the "
+                                     "slow-DNS threshold.",
+            subject="dns")
+
+    def dns_multi(self, servers):
+        if self._debounced("dnsmulti", 3600):
+            return None
+        return self._add(
+            "dns_multi", "INFO", "",
+            f"{len(servers)} different DNS servers are in use",
+            f"Lookups went to: {', '.join(sorted(servers)[:8])}.",
+            "Devices on your network don't all use the same DNS service.",
+            "Normal with VPNs, browsers that use their own secure DNS, or "
+            "gadgets with hard-coded DNS. Public DNS services are not "
+            "harmful in themselves.",
+            confidence="High", why="More than three DNS servers were "
+                                   "contacted.",
+            subject="dnsmulti")
+
+    def baseline_anomaly(self, dev, feature, value, mean):
+        kind = {"bytes_up": "upload_spike", "bytes_down": "download_spike",
+                "destinations": "many_destinations",
+                "new_conns": "many_connections"}.get(feature)
+        if not kind or self._debounced(f"{kind}:{dev.key}", 1800):
+            return None
+        label = {"bytes_up": ("uploaded", _human_bytes(value),
+                              _human_bytes(mean)),
+                 "bytes_down": ("downloaded", _human_bytes(value),
+                                _human_bytes(mean)),
+                 "destinations": ("contacted", f"{int(value)} different "
+                                  f"Internet hosts", f"{mean:.0f}"),
+                 "new_conns": ("opened", f"{int(value)} new connections",
+                               f"{mean:.0f}")}[feature]
+        title = ALERT_TYPES[kind][0]
+        return self._add(
+            kind, ALERT_TYPES[kind][1], dev.key,
+            f"{dev.display_name()}: {title.lower()}",
+            f"In one minute it {label[0]} {label[1]}; its usual minute is "
+            f"about {label[2]}.",
+            "This behavior is unusual compared with this device's recent "
+            "activity.",
+            "Updates, backups, video calls, game downloads and cloud sync "
+            "all cause bursts like this. It only matters if the device "
+            "shouldn't be doing anything right now.",
+            confidence="Medium",
+            why="Compared with this device's own learned baseline (not "
+                "with other devices).",
+            evidence=[f"This minute: {label[1]}", f"Usual: {label[2]}"])
+
+    def tcp_resets(self, dev, n, window_s, top_remote):
+        if self._debounced(f"rst:{dev.key}", 1800):
+            return None
+        return self._add(
+            "tcp_resets", "WARNING", dev.key,
+            f"{dev.display_name()}: many connections are being reset",
+            f"{n} connections were abruptly reset in the last "
+            f"{int(window_s / 60)} minutes" +
+            (f" (most often with {top_remote})." if top_remote else "."),
+            "Connections are being refused or cut off.",
+            "Often a service that's down, a firewall/ad-blocker refusing "
+            "connections, or a flaky connection. Rarely a security issue.",
+            confidence="Medium", why="The reset count crossed the "
+                                     "threshold for this window.")
+
+    def new_service(self, dev, service):
+        if self._debounced(f"svc:{dev.key}:{service}", 86400):
+            return None
+        desc = service_description(service)
+        return self._add(
+            "new_service", "INFO", dev.key,
+            f"{dev.display_name()} started advertising “{service}”",
+            f"A device I already knew began announcing a new network "
+            f"service: {service}." + (f" {desc}" if desc else ""),
+            "This device now offers something new on your network.",
+            "Normal after enabling sharing, casting or a new app. Worth a "
+            "look only if you didn't change anything.",
+            confidence="High", why="A known device advertised a service it "
+                                   "hadn't advertised before.",
+            subject=f"{dev.key}|{service}")
+
+    def cleartext(self, dev_name, dev_key, proto, remote, is_public):
+        if self._debounced(f"clear:{dev_key}:{proto}", 3600):
+            return None
+        sev = "WARNING" if proto in ("TELNET", "FTP", "POP3", "IMAP") and \
+            is_public else "INFO"
+        return self._add(
+            "cleartext", sev, dev_key,
+            f"{dev_name} used an unencrypted protocol ({proto})",
+            f"Unencrypted {proto} traffic with {remote} was observed.",
+            "Anyone on the same network path could read this traffic.",
+            "Common for old devices, local printers and some smart-home "
+            "gear. It's worth avoiding for anything with a password.",
+            confidence="High", why="The protocol was recognised from the "
+                                   "traffic itself.",
+            subject=f"{dev_key}|{proto}")
+
+    def remote_access(self, dev_name, dev_key, service, how):
+        if self._debounced(f"ra:{dev_key}:{service}", 86400):
+            return None
+        return self._add(
+            "remote_access", "WARNING", dev_key,
+            f"{dev_name} offers remote access ({service})",
+            f"{how}",
+            "This device can probably be controlled over the network.",
+            "Fine if you set it up (e.g. SSH on a Raspberry Pi, Remote "
+            "Desktop on your PC). Make sure it's intended and protected "
+            "by a strong password.",
+            confidence="Medium", why="A remote-access service was "
+                                     "advertised or accepted connections.",
+            subject=f"{dev_key}|{service}")
+
+    def new_country(self, dev, country, remote):
+        if self._debounced(f"cc:{dev.key}:{country}", 86400):
+            return None
+        return self._add(
+            "new_country", "INFO", dev.key,
+            f"{dev.display_name()} contacted a new country ({country})",
+            f"It connected to {remote}, located in {country} (per the "
+            f"lookup database), after its usual destinations were learned.",
+            "A destination country this device hadn't used this session.",
+            "Very often normal: cloud and content services are spread "
+            "across many countries. Location databases can also be wrong.",
+            confidence="Low", why="New country after the baseline period.",
+            subject=f"{dev.key}|{country}")
+
+    def broadcast_storm(self, pps, top):
+        if self._debounced("bstorm", 1800):
+            return None
+        return self._add(
+            "broadcast_storm", "WARNING", "",
+            "A lot of broadcast/multicast traffic",
+            f"About {pps:.0f} broadcast/multicast packets per second" +
+            (f", mostly from {top}." if top else "."),
+            "The local network is being flooded with 'to everyone' "
+            "messages.",
+            "Can be a misbehaving gadget, a network loop (a cable plugged "
+            "into two switch ports), or heavy discovery traffic.",
+            confidence="Medium", why="Broadcast rate stayed above the "
+                                     "threshold.",
+            subject="bstorm")
+
+    def scan_pattern(self, dev, what, n):
+        if self._debounced(f"scan:{dev.key}", 3600):
+            return None
+        return self._add(
+            "scan_pattern", "WARNING", dev.key,
+            f"{dev.display_name()} shows a scanning-like pattern",
+            f"Within a minute it tried {n} {what}, most without an answer.",
+            "This looks like what network-scanning tools do.",
+            "Expected if you run a scanner (or IT tools, printers/NAS "
+            "discovery) on purpose. Otherwise, check what software the "
+            "device runs.",
+            confidence="Medium", why="Many distinct connection attempts "
+                                     "with few successful replies.")
+
+
+# ---- DNS health / intelligence ---------------------------------------------
+class DnsTracker:
+    """Matches DNS queries to responses (latency), counts failures per
+    server, tracks which server each device uses, and notices changes.
+    Bounded everywhere."""
+
+    def __init__(self):
+        self.servers = {}
+        self.pending = OrderedDict()
+        self.domains = Counter()
+        self.device_servers = defaultdict(Counter)
+        self.device_last = {}           # dev_key -> (server, since_ts)
+        self.recent = deque(maxlen=400)  # (ts, ok)
+        self.latencies = deque(maxlen=200)
+        self.slow = deque(maxlen=40)
+        self.queries = self.responses = self.nxdomain = self.servfail = 0
+        self.timeouts = 0
+        self.encrypted_seen = Counter()   # provider/method -> count
+        self.dot_flows = 0
+
+    def _srv(self, ip):
+        s = self.servers.get(ip)
+        if s is None:
+            s = self.servers[ip] = {"queries": 0, "responses": 0, "nx": 0,
+                                    "servfail": 0, "timeouts": 0,
+                                    "lat": deque(maxlen=60), "first": 0.0,
+                                    "last": 0.0, "clients": set()}
+        return s
+
+    def on_query(self, ts, client_ip, server_ip, info, dev_key=""):
+        self.queries += 1
+        s = self._srv(server_ip)
+        s["queries"] += 1
+        s["first"] = s["first"] or ts
+        s["last"] = ts
+        if len(s["clients"]) < 200 and dev_key:
+            s["clients"].add(dev_key)
+        q = (info.get("qname") or "").lower()
+        if q:
+            self.domains[q] += 1
+            if len(self.domains) > 8000:
+                self.domains = Counter(dict(self.domains.most_common(4000)))
+        key = (client_ip, server_ip, info.get("id"), q)
+        self.pending[key] = (ts, dev_key)
+        while len(self.pending) > 4096:
+            self.pending.popitem(last=False)
+        change = None
+        if dev_key:
+            c = self.device_servers[dev_key]
+            c[server_ip] += 1
+            last = self.device_last.get(dev_key)
+            if last is None:
+                self.device_last[dev_key] = (server_ip, ts, 1)
+            elif last[0] == server_ip:
+                self.device_last[dev_key] = (server_ip, last[1], last[2] + 1)
+            else:
+                # a change only counts if the old server was well
+                # established and the new one is used consistently
+                prev_total = c[last[0]]
+                if prev_total >= 20 and c[server_ip] >= 10:
+                    change = (last[0], server_ip)
+                    self.device_last[dev_key] = (server_ip, ts, 1)
+        return change
+
+    def on_response(self, ts, client_ip, server_ip, info):
+        self.responses += 1
+        s = self._srv(server_ip)
+        s["responses"] += 1
+        s["last"] = ts
+        rc = info.get("rcode", 0)
+        if rc == 3:
+            self.nxdomain += 1
+            s["nx"] += 1
+        elif rc == 2:
+            self.servfail += 1
+            s["servfail"] += 1
+        key = (client_ip, server_ip, info.get("id"),
+               (info.get("qname") or "").lower())
+        ent = self.pending.pop(key, None)
+        ok = rc in (0, 3)
+        self.recent.append((ts, ok))
+        if ent is None:
+            return None
+        ms = max(0.0, (ts - ent[0]) * 1000.0)
+        s["lat"].append(ms)
+        self.latencies.append((ts, ms))
+        if ms > 1000:
+            self.slow.append((info.get("qname", ""), ms, ts, server_ip))
+        return ms
+
+    def expire(self, now, timeout=5.0):
+        n = 0
+        for key in list(self.pending)[:2048]:
+            ts, _dk = self.pending[key]
+            if now - ts > timeout:
+                self.pending.pop(key, None)
+                srv = self.servers.get(key[1])
+                if srv:
+                    srv["timeouts"] += 1
+                self.timeouts += 1
+                self.recent.append((ts, False))
+                n += 1
+            else:
+                break
+        return n
+
+    def failure_rate(self, now, window=300):
+        rows = [ok for ts, ok in self.recent if now - ts <= window]
+        if not rows:
+            return 0.0, 0
+        return 1.0 - (sum(rows) / len(rows)), len(rows)
+
+    def median_latency(self, now=None, window=300):
+        vals = [ms for ts, ms in self.latencies
+                if now is None or now - ts <= window]
+        return (statistics.median(vals), len(vals)) if vals else (None, 0)
+
+    def summary_rows(self):
+        out = []
+        for ip, s in sorted(self.servers.items(),
+                            key=lambda kv: -kv[1]["queries"]):
+            lat = statistics.median(s["lat"]) if s["lat"] else None
+            out.append((ip, s["queries"], s["responses"], s["nx"],
+                        s["servfail"] + s["timeouts"], lat))
+        return out
+
+    def to_dict(self):
+        return {"servers": {ip: {k: (list(v) if isinstance(v, (deque, set))
+                                     else v) for k, v in s.items()}
+                            for ip, s in list(self.servers.items())[:50]},
+                "top_domains": self.domains.most_common(100),
+                "queries": self.queries, "responses": self.responses,
+                "nxdomain": self.nxdomain, "servfail": self.servfail,
+                "timeouts": self.timeouts,
+                "encrypted": dict(self.encrypted_seen)}
+
+    def load(self, d):
+        if not isinstance(d, dict):
+            return
+        for k in ("queries", "responses", "nxdomain", "servfail",
+                  "timeouts"):
+            setattr(self, k, int(d.get(k, 0) or 0))
+        for ip, s in (d.get("servers") or {}).items():
+            srv = self._srv(ip)
+            for k in ("queries", "responses", "nx", "servfail", "timeouts"):
+                srv[k] = int(s.get(k, 0) or 0)
+            srv["lat"].extend(float(x) for x in (s.get("lat") or [])[-60:])
+            srv["first"] = float(s.get("first") or 0)
+            srv["last"] = float(s.get("last") or 0)
+        for name, n in d.get("top_domains") or []:
+            self.domains[name] = n
+        self.encrypted_seen.update(d.get("encrypted") or {})
+
+
+# ---- per-device behavioral baseline -----------------------------------------
+class DeviceBaseline:
+    """Lightweight statistics (no ML): exponentially-weighted mean/variance
+    of per-minute features over this device's ACTIVE minutes, plus its
+    usual hours, protocols, services and countries."""
+
+    FEATURES = ("packets", "bytes_up", "bytes_down", "destinations",
+                "dns", "new_conns")
+    ALPHA = 0.05
+
+    def __init__(self):
+        self.n = 0
+        self.mean = {f: 0.0 for f in self.FEATURES}
+        self.var = {f: 0.0 for f in self.FEATURES}
+        self.hours = [0] * 24
+        self.protocols = Counter()
+        self.services = Counter()
+        self.countries = set()
+        self.cur_min = None
+        self.cur = None
+        self.cur_dests = set()
+
+    def _reset_cur(self, minute):
+        self.cur_min = minute
+        self.cur = {f: 0 for f in self.FEATURES}
+        self.cur_dests = set()
+
+    def observe(self, ts, nbytes, direction, remote_ip="", is_dns=False,
+                proto="", service_port=None, new_conn=False):
+        minute = int(ts // 60)
+        finished = None
+        if self.cur_min is None:
+            self._reset_cur(minute)
+        elif minute != self.cur_min:
+            finished = self.finish()
+            self._reset_cur(minute)
+        c = self.cur
+        if direction == "sent":
+            c["packets"] += 1
+            c["bytes_up"] += nbytes
+        else:
+            c["bytes_down"] += nbytes
+        if remote_ip and len(self.cur_dests) < 5000:
+            self.cur_dests.add(remote_ip)
+        if is_dns:
+            c["dns"] += 1
+        if new_conn:
+            c["new_conns"] += 1
+        if proto and len(self.protocols) < 40:
+            self.protocols[proto] += 1
+        elif proto in self.protocols:
+            self.protocols[proto] += 1
+        if service_port and (len(self.services) < 40 or
+                             service_port in self.services):
+            self.services[service_port] += 1
+        return finished
+
+    def finish(self):
+        """Close the current minute: returns (values, mean, std, n) BEFORE
+        updating, so the caller can compare against the old baseline."""
+        if self.cur is None:
+            return None
+        vals = dict(self.cur)
+        vals["destinations"] = len(self.cur_dests)
+        snapshot = (vals, dict(self.mean),
+                    {f: math.sqrt(max(0.0, self.var[f]))
+                     for f in self.FEATURES}, self.n)
+        self.n += 1
+        a = max(self.ALPHA, 1.0 / self.n)
+        for f in self.FEATURES:
+            x = vals[f]
+            diff = x - self.mean[f]
+            self.mean[f] += a * diff
+            self.var[f] = (1 - a) * (self.var[f] + a * diff * diff)
+        with contextlib.suppress(ValueError, OverflowError, OSError):
+            self.hours[time.localtime(self.cur_min * 60).tm_hour] += 1
+        self.cur = None
+        return snapshot
+
+    def to_dict(self):
+        return {"n": self.n, "mean": self.mean, "var": self.var,
+                "hours": self.hours,
+                "protocols": dict(self.protocols.most_common(20)),
+                "services": {str(k): v for k, v in
+                             self.services.most_common(20)},
+                "countries": sorted(self.countries)[:60]}
+
+    @classmethod
+    def from_dict(cls, d):
+        b = cls()
+        with contextlib.suppress(TypeError, ValueError, AttributeError):
+            b.n = int(d.get("n", 0))
+            for f in cls.FEATURES:
+                b.mean[f] = float((d.get("mean") or {}).get(f, 0.0))
+                b.var[f] = float((d.get("var") or {}).get(f, 0.0))
+            hrs = d.get("hours") or []
+            if len(hrs) == 24:
+                b.hours = [int(x) for x in hrs]
+            b.protocols = Counter(d.get("protocols") or {})
+            b.services = Counter({int(k): v for k, v in
+                                  (d.get("services") or {}).items()
+                                  if str(k).isdigit()})
+            b.countries = set(d.get("countries") or [])
+        return b
+
+    def usual_hours_text(self):
+        if self.n < 30:
+            return "still learning"
+        top = sorted(range(24), key=lambda h: -self.hours[h])[:4]
+        return ", ".join(f"{h:02d}:00" for h in sorted(top))
+
+
+class BaselineEngine:
+    # minimum absolute values per minute before anything is called unusual
+    FLOORS = {"bytes_up": 5 * 1024 * 1024, "bytes_down": 50 * 1024 * 1024,
+              "destinations": 40, "new_conns": 80}
+
+    def __init__(self, config):
+        self.config = config
+        self.devices = {}
+
+    def get(self, key):
+        b = self.devices.get(key)
+        if b is None:
+            b = self.devices[key] = DeviceBaseline()
+        return b
+
+    def check(self, snapshot):
+        """Return [(feature, value, mean)] that look unusual for this
+        device. Requires enough history and a big deviation in BOTH ratio
+        and standard deviations, plus an absolute floor."""
+        if not snapshot:
+            return []
+        vals, mean, std, n = snapshot
+        need = int(self.config.get("alerts.baseline_min_minutes", 15))
+        if n < need:
+            return []
+        mult = float(self.config.get("alerts.chatty_multiplier", 4))
+        out = []
+        for f, floor in self.FLOORS.items():
+            v, m, s = vals.get(f, 0), mean.get(f, 0.0), std.get(f, 0.0)
+            if v >= floor and v > m * mult and v > m + 4 * max(s, 1.0):
+                out.append((f, v, m))
+        return out
+
+    def reset(self):
+        self.devices.clear()
+
+    def to_dict(self):
+        return {k: b.to_dict() for k, b in list(self.devices.items())[:500]}
+
+    def load(self, d):
+        for k, bd in (d or {}).items():
+            if isinstance(bd, dict):
+                self.devices[k] = DeviceBaseline.from_dict(bd)
+
+
+class ScanTracker:
+    """Per-device sliding minute of connection attempts, to notice
+    scanning-like behaviour (many distinct targets, few replies)."""
+
+    def __init__(self):
+        self.attempts = defaultdict(deque)   # dev -> (ts, target, port)
+        self.replied = defaultdict(set)      # dev -> {(target, port)}
+
+    def attempt(self, dev_key, ts, target, port):
+        dq = self.attempts[dev_key]
+        dq.append((ts, target, port))
+        while dq and ts - dq[0][0] > 60:
+            dq.popleft()
+        if len(dq) > 3000:
+            dq.popleft()
+
+    def reply(self, dev_key, target, port):
+        s = self.replied[dev_key]
+        s.add((target, port))
+        if len(s) > 5000:
+            s.clear()
+
+    def evaluate(self, dev_key, port_threshold, host_threshold):
+        dq = self.attempts.get(dev_key)
+        if not dq:
+            return None
+        rep = self.replied.get(dev_key, set())
+        per_host = defaultdict(set)
+        per_port = defaultdict(set)
+        for _ts, tgt, port in dq:
+            if (tgt, port) in rep:
+                continue
+            per_host[tgt].add(port)
+            per_port[port].add(tgt)
+        if per_host:
+            tgt, ports = max(per_host.items(), key=lambda kv: len(kv[1]))
+            if len(ports) >= port_threshold:
+                return (f"different ports on {tgt}", len(ports))
+        if per_port:
+            port, hosts = max(per_port.items(), key=lambda kv: len(kv[1]))
+            if len(hosts) >= host_threshold:
+                return (f"different hosts on port {port}", len(hosts))
+        return None
+
+    def forget(self, dev_key):
+        self.attempts.pop(dev_key, None)
+        self.replied.pop(dev_key, None)
+
+
+# ============================================================================
+#  13.  NetworkModel — the single analysis core
+#
+#  Every view (tabs, map, reports, exports, sessions) reads from this one
+#  object. It has no Tk dependency, so the self-tests and Demo Mode drive
+#  exactly the same logic as live capture. The GUI drains its small event
+#  "outboxes" (feed lines, timeline entries, alerts, dirty rows) in batches.
+# ============================================================================
+COUNTRY_NAMES = dict(p.split(":", 1) for p in (
+    "US:United States|CA:Canada|MX:Mexico|BR:Brazil|AR:Argentina|CL:Chile|"
+    "CO:Colombia|PE:Peru|GB:United Kingdom|IE:Ireland|FR:France|DE:Germany|"
+    "NL:Netherlands|BE:Belgium|LU:Luxembourg|CH:Switzerland|AT:Austria|"
+    "IT:Italy|ES:Spain|PT:Portugal|SE:Sweden|NO:Norway|DK:Denmark|"
+    "FI:Finland|IS:Iceland|PL:Poland|CZ:Czechia|SK:Slovakia|HU:Hungary|"
+    "RO:Romania|BG:Bulgaria|GR:Greece|TR:Türkiye|UA:Ukraine|RU:Russia|"
+    "BY:Belarus|LT:Lithuania|LV:Latvia|EE:Estonia|RS:Serbia|HR:Croatia|"
+    "SI:Slovenia|BA:Bosnia and Herzegovina|AL:Albania|MK:North Macedonia|"
+    "MD:Moldova|CY:Cyprus|MT:Malta|IL:Israel|AE:United Arab Emirates|"
+    "SA:Saudi Arabia|QA:Qatar|KW:Kuwait|BH:Bahrain|OM:Oman|IR:Iran|IQ:Iraq|"
+    "JO:Jordan|LB:Lebanon|EG:Egypt|MA:Morocco|DZ:Algeria|TN:Tunisia|"
+    "NG:Nigeria|GH:Ghana|KE:Kenya|ZA:South Africa|ET:Ethiopia|TZ:Tanzania|"
+    "UG:Uganda|SN:Senegal|CI:Côte d'Ivoire|CM:Cameroon|IN:India|PK:Pakistan|"
+    "BD:Bangladesh|LK:Sri Lanka|NP:Nepal|CN:China|HK:Hong Kong|TW:Taiwan|"
+    "JP:Japan|KR:South Korea|KP:North Korea|MN:Mongolia|SG:Singapore|"
+    "MY:Malaysia|ID:Indonesia|TH:Thailand|VN:Vietnam|PH:Philippines|"
+    "KH:Cambodia|LA:Laos|MM:Myanmar|AU:Australia|NZ:New Zealand|"
+    "KZ:Kazakhstan|UZ:Uzbekistan|AZ:Azerbaijan|GE:Georgia|AM:Armenia|"
+    "VE:Venezuela|EC:Ecuador|BO:Bolivia|PY:Paraguay|UY:Uruguay|CR:Costa Rica|"
+    "PA:Panama|GT:Guatemala|HN:Honduras|SV:El Salvador|NI:Nicaragua|"
+    "DO:Dominican Republic|CU:Cuba|JM:Jamaica|PR:Puerto Rico|TT:Trinidad "
+    "and Tobago|BS:Bahamas|BZ:Belize|SC:Seychelles|MU:Mauritius|"
+    "EU:European Union|ZZ:Unknown").split("|"))
+
+
+def _initial_ttl(ttl):
+    if ttl <= 0:
+        return 0
+    if ttl <= 64:
+        return 64
+    if ttl <= 128:
+        return 128
+    return 255
+
+
+class NetworkModel:
+    DISCOVERY_SECONDS = 8
+
+    def __init__(self, config, gateway_ip="", my_ips=(), my_macs=(),
+                 now_fn=None):
+        self.config = config
+        self._clock = now_fn
+        self.use_packet_clock = False
+        self.offline_now = 0.0
+        self.gateway_ip = gateway_ip
+        self.my_ips = set(my_ips)
+        self.my_macs = {m.lower() for m in my_macs if m}
+        self.local_nets = []
+        self.v6_prefixes = []
+        self.cache = NameCache()
+        self.registry = DeviceRegistry(gateway_ip, self.my_ips, config,
+                                       self.now)
+        self.registry.my_macs = self.my_macs
+        self.alerts = AlertEngine(config, self.now)
+        self.flows = FlowTable(config.get("connections.max_active", 5000),
+                               config.get("connections.archive_size", 2000))
+        self.metrics = MetricsEngine()
+        self.dns = DnsTracker()
+        self.baselines = BaselineEngine(config)
+        self.scans = ScanTracker()
+        self.websites = {}
+        self.remote_hosts = {}
+        self.ip_to_domains = {}
+        self.timeline = deque(maxlen=3000)
+        self.count = 0
+        self.dhcp_servers = defaultdict(int)
+        self.dhcp_routers = Counter()
+        self.dhcp_dns = set()
+        self.doh_seen = defaultdict(set)
+        self.http_count = 0
+        self.http_hosts = Counter()
+        self.cleartext_seen = Counter()
+        self.bcast_talkers = deque(maxlen=5000)
+        self.gw_mac_traffic = Counter()
+        self.vpn_bytes = Counter()
+        self.vpn = {"iface": "", "endpoint": "", "kind": ""}
+        self.resets = defaultdict(deque)
+        self.own_probe_targets = {}
+        self.health = {}
+        self.health_history = deque(maxlen=120)
+        self.capture_started = 0.0
+        self.announce_new = True
+        self.demo = False
+        self._spoof_warned = False
+        self._cache_version = -1
+        self._classify_dirty = set()
+        self._pending_new = []
+        # outboxes drained by the GUI
+        self.ev_feed = []
+        self.ev_timeline = []
+        self.ev_alerts = []
+        self.ev_banner = []
+        self.ev_geo = set()
+        self.dirty_devices = set()
+        self.dirty_websites = set()
+        self.dirty_remotes = set()
+
+    # ---- clock / identity --------------------------------------------------
+    def now(self):
+        if self.use_packet_clock:
+            return self.offline_now or time.time()
+        return self._clock() if self._clock else time.time()
+
+    def set_identity(self, gateway_ip=None, my_ips=None, my_macs=None,
+                     local_nets=None, v6_prefixes=None):
+        if gateway_ip is not None:
+            self.gateway_ip = gateway_ip
+            self.registry.gateway_ip = gateway_ip
+        if my_ips is not None:
+            self.my_ips = set(my_ips)
+            self.registry.my_ips = self.my_ips
+        if my_macs is not None:
+            self.my_macs = {m.lower() for m in my_macs if m}
+            self.registry.my_macs = self.my_macs
+        if local_nets is not None:
+            self.local_nets = list(local_nets)
+            self.registry.local_nets = self.local_nets
+        if v6_prefixes is not None:
+            self.v6_prefixes = list(v6_prefixes)
+            self.registry.v6_prefixes = self.v6_prefixes
+
+    def is_local(self, ip):
+        return bool(ip) and (ip in self.my_ips or
+                             self.registry.eligible_ip(ip))
+
+    def in_discovery(self):
+        return self.now() - self.capture_started < self.DISCOVERY_SECONDS
+
+    # ---- outbox helpers ----------------------------------------------------
+    def push_timeline(self, kind, severity, text, ref=None, device=""):
+        entry = {"when": self.now(), "kind": kind, "severity": severity,
+                 "text": text, "ref": ref, "device": device,
+                 "live": not self.use_packet_clock}
+        self.timeline.append(entry)
+        self.ev_timeline.append(entry)
+        if len(self.ev_timeline) > 2000:
+            del self.ev_timeline[:-2000]
+        return entry
+
+    def _alert(self, a):
+        if a is None:
+            return None
+        self.ev_alerts.append(a)
+        if not a.updated:
+            self.metrics.add("alerts", self.now(), 1)
+            ref = ("alert", a.id)
+            self.push_timeline("alert", a.severity, a.reason, ref,
+                               a.device_key)
+        return a
+
+    def feed(self, tag, who, did, when=None):
+        self.ev_feed.append({"tag": tag, "who": who, "did": did,
+                             "when": when or fmt_clock(self.now())})
+        if len(self.ev_feed) > 1500:
+            del self.ev_feed[:-1500]
+
+    def banner(self, text, kind="info"):
+        self.ev_banner.append((text, kind))
+
+    def _dirty_dev(self, dev):
+        if dev is not None:
+            self.dirty_devices.add(dev.key)
+            self._classify_dirty.add(dev.key)
+
+    # ---- ingest -----------------------------------------------------------
+    def ingest(self, d):
+        """Analyse one decoded packet. Returns the flow id (or None)."""
+        ts = d["time"]
+        if self.use_packet_clock and ts > self.offline_now:
+            self.offline_now = ts
+        self.count += 1
+        src_ip, dst_ip = d["src_ip"], d["dst_ip"]
+        src_local = self.is_local(src_ip)
+        dst_local = self.is_local(dst_ip)
+        if d["multicast"]:
+            direction = "bcast"
+        elif src_local and dst_local:
+            direction = "lan"
+        elif src_local and is_public_ip(dst_ip):
+            direction = "up"
+        elif dst_local and is_public_ip(src_ip):
+            direction = "down"
+        elif not src_ip and not dst_ip:
+            direction = "lan"
+        else:
+            direction = "other"
+        d["direction"] = direction
+        nbytes = d["length"]
+        self.metrics.observe_packet(ts, nbytes, direction, d["proto"])
+        if direction == "bcast":
+            self.metrics.add("bcast_packets", ts, 1)
+            self.bcast_talkers.append((ts, d["src_mac"] or src_ip))
+        elif direction == "up" and d["dst_mac"]:
+            self.gw_mac_traffic[d["dst_mac"]] += nbytes
+        elif direction == "down" and d["src_mac"]:
+            self.gw_mac_traffic[d["src_mac"]] += nbytes
+
+        src_dev, dst_dev = self._observe_devices(d, src_local, dst_local,
+                                                 direction, ts)
+
+        if d["arp_op"] == 2 and src_ip and d["src_mac"]:
+            self._observe_arp(src_ip, d["src_mac"], ts)
+        elif d["arp_op"] == 1 and src_ip and src_ip == dst_ip and \
+                d["src_mac"]:
+            self._observe_arp(src_ip, d["src_mac"], ts)   # gratuitous
+        if d["dhcp"]:
+            self._observe_dhcp(d, ts)
+        if d["nd"]:
+            self._observe_nd(d, ts)
+        if d["mdns"] and src_local:
+            self._observe_mdns(d, ts)
+        if d["ssdp"] and src_local and not d["ssdp"].get("search"):
+            self._observe_ssdp(d, ts)
+        if d["proto"] == "NBNS" and d["learns"] and src_local:
+            for ip, name in d["learns"]:
+                if ip == src_ip:
+                    dev = self.registry.touch(src_ip, d["src_mac"], "nbns",
+                                              f"Answered the Windows name "
+                                              f"query for {name}", ts)
+                    if dev:
+                        self.registry.set_hostname(src_ip, name, "nbns")
+                        self._dirty_dev(dev)
+        if d["dns"]:
+            self._observe_dns(d, ts, src_dev, dst_dev)
+        if d["doh_hint"] and self.config.get("dns.detect_encrypted_dns",
+                                             True):
+            self.doh_seen[src_ip].add(d["doh_hint"])
+            self.dns.encrypted_seen[d["doh_hint"]] += 1
+
+        flow, new_flow = self._observe_flow(d, src_local, dst_local, ts,
+                                            src_dev, dst_dev)
+        self._observe_websites(d, ts, src_dev, dst_dev, flow, new_flow)
+        self._observe_remote(d, ts, direction, src_dev, dst_dev, new_flow)
+        if d["cleartext"]:
+            self._observe_cleartext(d, src_dev, dst_dev, direction)
+        self._baseline_observe(d, ts, src_dev, dst_dev, direction, flow,
+                               new_flow)
+        self._announce_created()
+        self._feed_add(d)
+        d["flow_id"] = flow.fid if flow is not None else None
+        return d["flow_id"]
+
+    # ---- devices ----------------------------------------------------------
+    def _observe_devices(self, d, src_local, dst_local, direction, ts):
+        out = [None, None]
+        proto, nbytes = d["proto"], d["length"]
+        internet = direction in ("up", "down")
+        for idx, (ip, mac, local, role) in enumerate(
+                ((d["src_ip"], d["src_mac"], src_local, "sent"),
+                 (d["dst_ip"], d["dst_mac"], dst_local, "recv"))):
+            if role == "recv" and d["multicast"]:
+                continue
+            if ip:
+                if not local:
+                    continue           # public address: never a device
+            elif role == "recv" or not mac:
+                continue
+            use_mac = mac if is_unicast_mac(mac) else None
+            if use_mac and ip and ip != self.gateway_ip and \
+                    use_mac in self.registry.gw_macs and \
+                    self._routed_private_v4(ip):
+                use_mac = None      # routed from elsewhere via the router
+            dev = self.registry.note_traffic(ip or None, use_mac, nbytes,
+                                             proto, role, internet, ts)
+            if dev is None:
+                continue
+            out[idx] = dev
+            self._dirty_dev(dev)
+            if role == "sent" and d["ttl_int"] and use_mac:
+                dev.os_ttl = max(dev.os_ttl, _initial_ttl(d["ttl_int"]))
+            if d["type_hint"] and role == "sent" and not dev.type_hint:
+                dev.type_hint = d["type_hint"]
+            if internet:
+                rip = d["dst_ip"] if role == "sent" else d["src_ip"]
+                if rip and len(dev.remote_ips) < 500:
+                    dev.remote_ips.add(rip)
+            if role == "sent":
+                if dev.live and dev.traffic_baseline_flag(
+                        ts, float(self.config.get("alerts.chatty_multiplier",
+                                                  4)),
+                        float(self.config.get("alerts.chatty_min_rate", 3))):
+                    a = self._alert(self.alerts.chatty_device(dev))
+                    if a and not a.updated:
+                        self.push_timeline(
+                            "traffic spike", "WARNING",
+                            f"{dev.display_name()} is unusually active",
+                            ("device", dev.key), dev.key)
+            if dev.reactivated_now:
+                dev.reactivated_now = False
+                window = float(self.config.get(
+                    "alerts.reconnect_window_minutes", 30)) * 60
+                recent = [t for t in dev.reactivations if ts - t <= window]
+                if dev.live:
+                    self.push_timeline("device back", "INFO",
+                                       f"{dev.display_name()} came back "
+                                       f"online", ("device", dev.key),
+                                       dev.key)
+                if len(recent) >= int(self.config.get(
+                        "alerts.reconnect_count", 5)):
+                    self._alert(self.alerts.reconnect_cycle(
+                        dev, len(recent), window))
+        return out[0], out[1]
+
+    def _routed_private_v4(self, ip):
+        """A private IPv4 address outside our own subnets arrives through
+        the router, so the frame's MAC is the router's, not that host's."""
+        a = ip_obj(ip)
+        if a is None or a.version != 4:
+            return False
+        nets = [n for n in self.local_nets if n.version == 4]
+        return bool(nets) and not any(a in n for n in nets)
+
+    def _announce_created(self, flush=False):
+        """New devices are announced a few seconds after they appear, so
+        the names they announce (DHCP, mDNS) are already known."""
+        created = self.registry.created
+        if created:
+            self.registry.created = []
+            due = self.now() + (0 if self.use_packet_clock else 4)
+            for key in created:
+                dev = self.registry.by_key.get(key)
+                if dev is None:
+                    continue
+                self._dirty_dev(dev)
+                if dev.live and self.announce_new and not self.in_discovery():
+                    self._pending_new.append((due, key))
+        if not self._pending_new:
+            return
+        now = self.now()
+        ready = [k for t, k in self._pending_new if t <= now or flush]
+        if not ready:
+            return
+        self._pending_new = [(t, k) for t, k in self._pending_new
+                             if not (t <= now or flush)]
+        for key in ready:
+            dev = self.registry.by_key.get(key)
+            if dev is None:
+                continue
+            self._classify_dirty.add(key)
+            self._classify()
+            self.metrics.add("new_devices", self.now(), 1)
+            who = self.friendly_who(dev.ip, dev.mac)
+            self.feed("device", who, "🆕 joined your network (new device)")
+            own = (dev.ip and (dev.ip == self.gateway_ip or
+                               dev.ip in self.my_ips)) or \
+                (dev.mac and dev.mac in self.my_macs)
+            a = None if own else self._alert(self.alerts.new_device(dev))
+            if a is None:
+                self.push_timeline("new device", "INFO",
+                                   f"{dev.display_name()} joined your "
+                                   f"network", ("device", dev.key), dev.key)
+
+    def _observe_arp(self, ip, mac, ts):
+        dev, conflict = self.registry.note_arp_reply(ip, mac, ts)
+        self._dirty_dev(dev)
+        flips = self.registry.arp_flip_count(ip)
+        if flips >= int(self.config.get("alerts.arp_flip_threshold", 4)):
+            a = self._alert(self.alerts.arp_spoof(
+                ip, len(self.registry.ip_macs.get(ip, ())), flips,
+                ip == self.gateway_ip))
+            if a and not a.updated:
+                a.evidence = [f"{t:.0f}: {ip} claimed by {m}" for t, m in
+                              list(self.registry.arp_claims.get(ip, ()))[-8:]]
+                if ip == self.gateway_ip:
+                    self.banner("\U0001F6A8  Your router's address keeps "
+                                "flipping between two devices — see the "
+                                "Alerts tab.", "bad")
+        if not conflict:
+            return
+        if ip == self.gateway_ip:
+            a = self._alert(self.alerts.gateway_change(
+                ip, len(self.registry.gw_macs)))
+            if a and not a.updated and not self._spoof_warned:
+                self._spoof_warned = True
+                self.banner("⚠️  Your router's hardware address (MAC) "
+                            "changed. That's normal after a router reboot or "
+                            "replacement, but worth a look otherwise — "
+                            "see Alerts.", "warn")
+        else:
+            self._alert(self.alerts.duplicate_ip(
+                ip, len(self.registry.ip_macs.get(ip, ()))))
+
+    def _observe_dhcp(self, d, ts):
+        info = d["dhcp"]
+        mt = info.get("msgtype")
+        client_mac = info.get("client_mac") or d["src_mac"]
+        if mt in (2, 5) and d["src_ip"]:
+            server = info.get("server_id") or d["src_ip"]
+            if mt in (2, 5):
+                self.dhcp_servers[server] += 1
+                if len(self.dhcp_servers) > 1:
+                    self._alert(self.alerts.dhcp_anomaly(
+                        set(self.dhcp_servers)))
+            if info.get("router"):
+                self.dhcp_routers[info["router"]] += 1
+            for s in info.get("dns_servers") or []:
+                if len(self.dhcp_dns) < 8:
+                    self.dhcp_dns.add(s)
+        if mt in (1, 3, 8) and client_mac:
+            dev = self.registry.note_dhcp_client(
+                client_mac, info.get("hostname", ""),
+                info.get("vendor_class", ""), info.get("param_list", ""), ts)
+            self._dirty_dev(dev)
+        if mt == 5 and info.get("yiaddr"):            # ACK = a real lease
+            existing = self.registry.by_key.get((client_mac or "").lower())
+            host = info.get("hostname") or (existing.dhcp_hostname
+                                            if existing else "")
+            dev, reused = self.registry.note_dhcp_lease(
+                info["yiaddr"], client_mac, host, info.get("lease_time"), ts)
+            if dev:
+                self._dirty_dev(dev)
+                self.push_timeline("dhcp lease", "INFO",
+                                   f"{dev.display_name()} got address "
+                                   f"{info['yiaddr']} from DHCP",
+                                   ("device", dev.key), dev.key)
+
+    def _observe_nd(self, d, ts):
+        nd = d["nd"]
+        kind = nd.get("kind")
+        mac = nd.get("mac") or d["src_mac"]
+        if kind == "RA":
+            for pfx in nd.get("prefixes", []):
+                with contextlib.suppress(ValueError):
+                    net = ipaddress.ip_network(pfx, strict=False)
+                    if net.version == 6 and net.is_global and \
+                            net not in self.v6_prefixes and \
+                            len(self.v6_prefixes) < 8:
+                        self.v6_prefixes.append(net)
+                        self.registry.v6_prefixes = self.v6_prefixes
+            dev = self.registry.note_nd(d["src_ip"], mac, "RA", ts)
+        elif kind == "NA":
+            dev = self.registry.note_nd(nd.get("target"), mac, "NA", ts)
+        elif kind == "NS" and not nd.get("dad") and nd.get("mac"):
+            dev = self.registry.note_nd(d["src_ip"], nd["mac"], "NS", ts)
+        else:
+            dev = self.registry.touch(None, d["src_mac"], "local_traffic",
+                                      "IPv6 neighbor/router discovery", ts) \
+                if d["src_mac"] else None
+        self._dirty_dev(dev)
+
+    def _observe_mdns(self, d, ts):
+        info = d["mdns"]
+        if not info.get("qr"):
+            return
+        ip, mac = d["src_ip"], d["src_mac"]
+        name = info["names"][0] if info.get("names") else ""
+        dev = None
+        for svc in (info.get("services") or [])[:6]:
+            if svc.startswith("_services._dns-sd"):
+                continue
+            dev, new = self.registry.note_service(ip, mac, "mdns", svc,
+                                                  friendly=name, when=ts)
+            if dev and new:
+                self._service_added(dev, svc, "mDNS")
+        if dev is None:
+            dev = self.registry.touch(ip, mac, "mdns",
+                                      "Answered a local name lookup (mDNS)",
+                                      ts)
+        if dev is None:
+            return
+        for h in info.get("hostnames") or []:
+            short = h[:-6] if h.lower().endswith(".local") else h
+            if short and not dev.mdns_name:
+                dev.mdns_name = short
+                _push_bounded(dev.hostname_history, [short, "mdns", ts], 20)
+        txt = info.get("txt") or {}
+        for k in ("model", "md", "am", "usb_mdl", "ty", "product", "rpmd"):
+            if txt.get(k):
+                dev.model_hint = txt[k]
+                break
+        if txt.get("fn") and not dev.mdns_name:
+            dev.mdns_name = txt["fn"]
+        self._dirty_dev(dev)
+
+    def _observe_ssdp(self, d, ts):
+        info = d["ssdp"]
+        label = info.get("st") or info.get("server") or "UPnP device"
+        dev, new = self.registry.note_service(
+            d["src_ip"], d["src_mac"], "ssdp", label[:80],
+            friendly=info.get("friendly", ""), when=ts)
+        if dev:
+            if info.get("server"):
+                dev.ssdp_server = info["server"]
+            if new and len(dev.services) > 1:
+                self._service_added(dev, label[:60], "SSDP")
+            self._dirty_dev(dev)
+
+    def _service_added(self, dev, svc, how):
+        if not dev.live:
+            return
+        old = self.now() - dev.first_seen > 600
+        if old:
+            self.push_timeline("service", "INFO",
+                               f"{dev.display_name()} started advertising "
+                               f"{svc}", ("device", dev.key), dev.key)
+            self._alert(self.alerts.new_service(dev, svc))
+        low = svc.lower()
+        if any(k in low for k in REMOTE_ACCESS_MDNS):
+            self._alert(self.alerts.remote_access(
+                dev.display_name(), dev.key, svc,
+                f"It advertises the remote-access service “{svc}” "
+                f"over {how}."))
+
+    def _observe_dns(self, d, ts, src_dev, dst_dev):
+        info = d["dns"]
+        if info.get("qr") == 0 and d["dport"] == 53:
+            self.metrics.add("dns_queries", ts, 1)
+            key = src_dev.key if src_dev else ""
+            change = self.dns.on_query(ts, d["src_ip"], d["dst_ip"], info,
+                                       key)
+            if change and src_dev and src_dev.live:
+                self.push_timeline("dns change", "WARNING",
+                                   f"{src_dev.display_name()} now uses DNS "
+                                   f"server {change[1]} (was {change[0]})",
+                                   ("device", src_dev.key), src_dev.key)
+                self._alert(self.alerts.dns_server_change(
+                    src_dev.display_name(), src_dev.key, change[0],
+                    change[1]))
+        elif info.get("qr") == 1 and d["sport"] == 53:
+            self.dns.on_response(ts, d["dst_ip"], d["src_ip"], info)
+
+    # ---- flows ------------------------------------------------------------
+    def _observe_flow(self, d, src_local, dst_local, ts, src_dev, dst_dev):
+        tr = d["transport"]
+        if d["multicast"] or tr not in ("TCP", "UDP", "ICMP", "ICMPv6") or \
+                not d["src_ip"] or not d["dst_ip"]:
+            return None, False
+        sip, dip = d["src_ip"], d["dst_ip"]
+        sp, dp = (d["sport"] or 0), (d["dport"] or 0)
+        if tr in ("ICMP", "ICMPv6"):
+            sp = dp = 0
+        if src_local and not dst_local:
+            out_dir = True
+        elif dst_local and not src_local:
+            out_dir = False
+        elif src_local and dst_local:
+            out_dir = (tr, dip, dp, sip, sp) not in self.flows.active
+        elif sip in self.my_ips:
+            out_dir = True
+        elif dip in self.my_ips:
+            out_dir = False
+        else:
+            out_dir = (tr, dip, dp, sip, sp) not in self.flows.active
+        if out_dir:
+            key = (tr, sip, sp, dip, dp)
+            f, new = self.flows.lookup_or_create(key, tr, sip, sp, dip, dp,
+                                                 ts)
+        else:
+            key = (tr, dip, dp, sip, sp)
+            f, new = self.flows.lookup_or_create(key, tr, dip, dp, sip, sp,
+                                                 ts)
+        f.last_seen = max(f.last_seen, ts)
+        n = d["length"]
+        if out_dir:
+            f.packets_out += 1
+            f.bytes_out += n
+            dev = src_dev
+        else:
+            f.packets_in += 1
+            f.bytes_in += n
+            dev = dst_dev
+        if dev is not None and not f.device_key:
+            f.device_key = dev.key
+        if new:
+            f.lan = src_local and dst_local
+            f.initiator = "local" if out_dir else "remote"
+            self.metrics.add("new_connections", ts, 1)
+            probe = self.own_probe_targets.get((f.remote_ip, f.remote_port))
+            if probe and ts <= probe:
+                f.note = "MiniWireshark health check"
+            if f.remote_port == 853:
+                self.dns.encrypted_seen["DNS-over-TLS (port 853)"] += 1
+            if f.remote_port == 443 and f.remote_ip in DOH_IPS and \
+                    self.config.get("dns.detect_encrypted_dns", True):
+                self.dns.encrypted_seen[
+                    f"Likely encrypted DNS to {DOH_IPS[f.remote_ip]}"] += 1
+            if tr == "UDP" and f.remote_port in VPN_PORTS:
+                f.app = f.app or "VPN"
+                f.service = PORT_SERVICES.get(f.remote_port, "VPN tunnel")
+        if tr == "TCP" and d["tcp_flags"] is not None:
+            fl = d["tcp_flags"]
+            if fl & 0x02 and not fl & 0x10:
+                f.syn = True
+                f.initiator = "local" if out_dir else "remote"
+                if out_dir and dev is not None:
+                    self.scans.attempt(dev.key, ts, f.remote_ip,
+                                       f.remote_port)
+            elif fl & 0x02 and fl & 0x10:
+                f.synack = True
+                if not out_dir and f.device_key:
+                    self.scans.reply(f.device_key, f.remote_ip,
+                                     f.remote_port)
+                # whoever sends the SYN-ACK is the server for this port
+                if sp in REMOTE_ACCESS_PORTS and src_dev is not None and \
+                        src_dev.live:
+                    svc = REMOTE_ACCESS_PORTS[sp]
+                    self._alert(self.alerts.remote_access(
+                        src_dev.display_name(), src_dev.key, svc,
+                        f"It accepted a {svc} connection (port {sp}) from "
+                        f"{dip}."))
+            if fl & 0x01:
+                if out_dir:
+                    f.fin_out = True
+                else:
+                    f.fin_in = True
+            if fl & 0x04:
+                f.rst += 1
+                f.rst_by = "local" if out_dir else "remote"
+                f.state = "Reset"
+                self.metrics.add("tcp_resets", ts, 1)
+                if f.device_key:
+                    self._note_reset(f, ts)
+            elif f.state not in ("Reset",):
+                f.state = "Open" if f.synack or f.packets_in else "Opening"
+            if d["payload_len"] and d["seq"] is not None:
+                end = (d["seq"] + d["payload_len"]) & 0xffffffff
+                prev = f.seq_out if out_dir else f.seq_in
+                if prev is not None:
+                    delta = (end - prev) & 0xffffffff
+                    if delta == 0 or delta > 0x7fffffff:
+                        f.retrans += 1
+                    else:
+                        prev = end
+                else:
+                    prev = end
+                if out_dir:
+                    f.seq_out = prev
+                else:
+                    f.seq_in = prev
+        proto = d["proto"]
+        if proto not in ("TCP", "UDP", "?", "") and (
+                not f.app or f.app in ("TCP", "UDP", "VPN") or
+                d["app_conf"] == "Observed" and f.interp_conf != "Observed"):
+            f.app = proto
+            f.interp_conf = d["app_conf"] or f.interp_conf
+        if not f.service and d["service"]:
+            f.service = d["service"]
+            if not f.interp_conf:
+                f.interp_conf = d["app_conf"] or "Likely (by port)"
+        tls = d["tls"]
+        if tls:
+            if tls.get("version"):
+                f.tls_version = tls["version"]
+            if tls.get("alpn"):
+                f.alpn = ",".join(tls["alpn"][:3])
+            if tls.get("sni"):
+                f.domain, f.domain_conf = tls["sni"], "Observed"
+        if d["http_host"]:
+            f.domain, f.domain_conf = d["http_host"], "Observed"
+        if not f.domain and f.remote_public:
+            names = self.ip_to_domains.get(f.remote_ip)
+            if names:
+                f.domain = next(reversed(names))
+                f.domain_conf = "Likely" if len(names) == 1 else \
+                    f"Possibly (one of {len(names)} names)"
+        enc = d["encrypted"]
+        if enc == "no":
+            f.encrypted = "no"
+            f.cleartext = d["cleartext"] or f.cleartext
+        elif enc == "yes" and f.encrypted != "no":
+            f.encrypted = "yes"
+        elif enc == "likely" and f.encrypted == "unknown":
+            f.encrypted = "likely"
+        rec = self.remote_hosts.get(f.remote_ip)
+        if rec is not None and (rec.country or rec.asn) and not f.country:
+            f.country, f.asn, f.org = rec.country, rec.asn, rec.org
+        self.flows.dirty.add(f.fid)
+        return f, new
+
+    def _note_reset(self, f, ts):
+        dq = self.resets[f.device_key]
+        dq.append((ts, f.remote_ip))
+        while dq and ts - dq[0][0] > 600:
+            dq.popleft()
+        thr = int(self.config.get("alerts.reset_threshold", 40))
+        if len(dq) >= thr:
+            dev = self.registry.by_key.get(f.device_key)
+            if dev and dev.live:
+                top = Counter(r for _t, r in dq).most_common(1)
+                self._alert(self.alerts.tcp_resets(
+                    dev, len(dq), 600, top[0][0] if top else ""))
+
+    # ---- websites / remote hosts ---------------------------------------------
+    def _observe_websites(self, d, ts, src_dev, dst_dev, flow, new_flow):
+        dns = d["dns"]
+        if dns and dns.get("qr") == 1 and d["sport"] == 53:
+            for ip, name in d["learns"]:
+                if is_public_ip(ip) and name:
+                    self.register_website(name, ip, dst_dev, "DNS", ts)
+        tls = d["tls"]
+        if tls and tls.get("sni") and tls.get("kind") == "client" and \
+                is_public_ip(d["dst_ip"]):
+            self.register_website(tls["sni"], d["dst_ip"], src_dev,
+                                  "TLS SNI", ts, connection=True,
+                                  encrypted=True)
+        if d["http_host"] and is_public_ip(d["dst_ip"]):
+            self.register_website(d["http_host"], d["dst_ip"], src_dev,
+                                  "HTTP Host", ts, connection=True,
+                                  encrypted=False)
+        if flow is not None and flow.domain and flow.remote_public:
+            rec = self.websites.get(flow.domain)
+            if rec is not None:
+                rec.bytes += d["length"]
+                if new_flow and flow.domain_conf != "Observed":
+                    rec.connections += 1
+                self.dirty_websites.add(flow.domain)
+
+    def register_website(self, domain, ip, dev, source, ts=None,
+                         connection=False, encrypted=None):
+        ts = ts or self.now()
+        key = domain.lower().strip(".")
+        if not key or "." not in key:
+            return None
+        rec = self.websites.get(key)
+        is_new = rec is None
+        if rec is None:
+            reg = registrable_domain(key)
+            new_root = not any(w.registrable == reg
+                               for w in list(self.websites.values())[-3000:])
+            rec = WebsiteRecord(domain=key, registrable=reg, first_seen=ts,
+                                last_seen=ts)
+            cat, src = domain_category(key)
+            if cat == "CDN" or self.config.get(
+                    "websites.tracker_classification", False):
+                rec.category, rec.category_source = cat, src
+            self.websites[key] = rec
+            if len(self.websites) > 20000:
+                for old in sorted(self.websites.values(),
+                                  key=lambda w: w.last_seen)[:2000]:
+                    self.websites.pop(old.domain, None)
+            if new_root and not self.in_discovery() and \
+                    not self.use_packet_clock:
+                self.push_timeline("website", "INFO",
+                                   f"First visit to {reg}",
+                                   ("website", key),
+                                   dev.key if dev else "")
+        if ip:
+            if len(rec.resolved_ips) < 64:
+                rec.resolved_ips.add(ip)
+            names = self.ip_to_domains.get(ip)
+            if names is None:
+                names = self.ip_to_domains[ip] = OrderedDict()
+                if len(self.ip_to_domains) > 60000:
+                    for k in list(self.ip_to_domains)[:6000]:
+                        self.ip_to_domains.pop(k, None)
+            names.pop(key, None)
+            names[key] = ts
+            while len(names) > 8:
+                names.popitem(last=False)
+            rh = self.remote_hosts.get(ip)
+            if rh is not None:
+                if len(rh.domains) < 20:
+                    rh.domains.add(key)
+                rh.domain = key
+                self.dirty_remotes.add(ip)
+                if rh.country:
+                    rec.countries.add(rh.country)
+                if rh.asn:
+                    rec.asns.add(rh.asn)
+        if dev is not None:
+            if len(rec.devices) < 200:
+                rec.devices.add(dev.key)
+            if len(dev.websites) < 500:
+                dev.websites.add(key)
+        rec.requests += 1
+        if connection:
+            rec.connections += 1
+            if encrypted is True:
+                rec.encrypted += 1
+            elif encrypted is False:
+                rec.cleartext += 1
+        rec.last_seen = max(rec.last_seen, ts)
+        rec.sources.add(source)
+        if source == "HTTP Host":
+            self.http_count += 1
+            self.http_hosts[key] += 1
+        if key in DOH_HOSTS and self.config.get("dns.detect_encrypted_dns",
+                                                True):
+            self.dns.encrypted_seen[DOH_HOSTS[key]] += 1
+        self.dirty_websites.add(key)
+        return rec
+
+    def _observe_remote(self, d, ts, direction, src_dev, dst_dev, new_flow):
+        if direction == "up":
+            pub, rport, dev, out = d["dst_ip"], d["dport"], src_dev, True
+        elif direction == "down":
+            pub, rport, dev, out = d["src_ip"], d["sport"], dst_dev, False
+        elif direction == "other":
+            if is_public_ip(d["dst_ip"]):
+                pub, rport, dev, out = d["dst_ip"], d["dport"], src_dev, True
+            elif is_public_ip(d["src_ip"]):
+                pub, rport, dev, out = d["src_ip"], d["sport"], dst_dev, False
+            else:
+                return
+        else:
+            return
+        if not pub:
+            return
+        rec = self.remote_hosts.get(pub)
+        if rec is None:
+            rec = RemoteHostRecord(ip=pub, first_seen=ts, last_seen=ts)
+            self.remote_hosts[pub] = rec
+            self._geo_fill(rec)
+            if len(self.remote_hosts) > 30000:
+                for old in sorted(self.remote_hosts.values(),
+                                  key=lambda r: r.last_seen)[:3000]:
+                    self.remote_hosts.pop(old.ip, None)
+        rec.last_seen = max(rec.last_seen, ts)
+        rec.packets += 1
+        rec.bytes_total += d["length"]
+        if out:
+            rec.bytes_out += d["length"]
+        else:
+            rec.bytes_in += d["length"]
+        if rport and len(rec.ports) < 40 and d["transport"] in ("TCP", "UDP"):
+            rec.ports.add(rport)
+        if d["proto"] and len(rec.protocols) < 20:
+            rec.protocols.add(d["proto"])
+        if new_flow:
+            rec.connections += 1
+        if dev is not None:
+            if len(rec.devices) < 100:
+                rec.devices.add(dev.key)
+        names = self.ip_to_domains.get(pub)
+        if names:
+            dom = next(reversed(names))
+            rec.domain = dom
+            if len(rec.domains) < 20:
+                rec.domains.update(names)
+        if rport in VPN_PORTS and d["transport"] == "UDP":
+            self.vpn_bytes[pub] += d["length"]
+        self.dirty_remotes.add(pub)
+        if not rec.country:
+            self.ev_geo.add(pub)
+
+    def _geo_fill(self, rec):
+        if not self.config.get("privacy.local_asn_db", False):
+            return
+        db = DATA.get("asn") if DATA is not None else None
+        if db is None:
+            return
+        hit = db.lookup(rec.ip)
+        if hit:
+            rec.asn, cc, rec.org = hit
+            if cc and not rec.country:
+                rec.country = cc
+                rec.country_name = COUNTRY_NAMES.get(cc, "")
+            rec.geo_source = "offline database"
+
+    def apply_country(self, ip, code, name, provider=""):
+        rec = self.remote_hosts.get(ip)
+        if rec is None:
+            return
+        rec.country = code
+        rec.country_name = name or COUNTRY_NAMES.get(code, "")
+        rec.geo_source = provider
+        self.dirty_remotes.add(ip)
+        for dk in rec.devices:
+            dev = self.registry.by_key.get(dk)
+            b = self.baselines.devices.get(dk)
+            if dev is None or b is None or not dev.live:
+                continue
+            if code not in b.countries:
+                if b.n >= 30 and len(b.countries) >= 3:
+                    self._alert(self.alerts.new_country(
+                        dev, rec.country_name or code, ip))
+                if len(b.countries) < 80:
+                    b.countries.add(code)
+
+    def _observe_cleartext(self, d, src_dev, dst_dev, direction):
+        proto = d["cleartext"]
+        self.cleartext_seen[proto] += 1
+        dev = src_dev or dst_dev
+        if dev is None or not dev.live:
+            return
+        remote = d["dst_ip"] if dev is src_dev else d["src_ip"]
+        if proto == "HTTP" and direction != "up":
+            return              # plain-web is very common; only flag uploads
+        if proto in ("HTTP", "SNMP") and not self.config.get(
+                "alerts.flag_http", False):
+            return
+        self._alert(self.alerts.cleartext(
+            dev.display_name(), dev.key, proto, remote,
+            is_public_ip(remote)))
+
+    def _baseline_observe(self, d, ts, src_dev, dst_dev, direction, flow,
+                          new_flow):
+        if direction not in ("up", "down", "lan"):
+            return
+        for dev, role in ((src_dev, "sent"), (dst_dev, "recv")):
+            if dev is None or not dev.live:
+                continue
+            remote = (d["dst_ip"] if role == "sent" else d["src_ip"]) \
+                if direction in ("up", "down") else ""
+            b = self.baselines.get(dev.key)
+            snap = b.observe(ts, d["length"], role, remote,
+                             is_dns=bool(d["dns"]) and role == "sent",
+                             proto=d["proto"],
+                             service_port=(flow.remote_port if flow and
+                                           flow.device_key == dev.key
+                                           and new_flow else None),
+                             new_conn=bool(new_flow and flow and
+                                           flow.device_key == dev.key))
+            self._baseline_check(dev, snap)
+
+    def _baseline_check(self, dev, snap):
+        for feat, v, m in self.baselines.check(snap):
+            self._alert(self.alerts.baseline_anomaly(dev, feat, v, m))
+
+    # ---- friendly feed ------------------------------------------------------
+    def friendly_who(self, ip, mac):
+        if ip and ip in self.my_ips or (mac and mac in self.my_macs):
+            return "💻  This computer"
+        if ip and ip == self.gateway_ip:
+            return "🌐  Your router"
+        dev = self.device_for(ip, mac)
+        if dev is not None and dev.alias:
+            return f"{DEVICE_ICONS.get(dev.type, '❓')}  {dev.alias}"
+        name = self.cache.get(ip) if ip else ""
+        kind = dev.type if dev else "unknown"
+        icon = DEVICE_ICONS.get(kind, "❓")
+        label = (dev.display_name() if dev and (dev.hostname or
+                                                 dev.dhcp_hostname or
+                                                 dev.mdns_name) else "") or \
+            name or (dev.vendor if dev else "") or ip or mac
+        if dev is None and ip and is_public_ip(ip):
+            return f"☁️  {name or ip}"
+        return f"{icon}  {label}" if label else "❓  Unknown device"
+
+    def device_for(self, ip, mac=None):
+        key = self.registry.ip_to_key.get(ip) if ip else None
+        if key is None and mac:
+            key = mac.lower() if mac.lower() in self.registry.by_key else None
+        return self.registry.by_key.get(key) if key else None
+
+    def _feed_add(self, d):
+        proto = d["proto"]
+        if proto in ("TCP", "UDP") and not d["dns_names"]:
+            if d["transport"] == "TCP" and d["tcp_flags"] is not None and \
+                    d["tcp_flags"] & 0x02 and not d["tcp_flags"] & 0x10 and \
+                    d["direction"] == "up":
+                svc = d["service"] or "a service"
+                who = self.friendly_who(d["src_ip"], d["src_mac"])
+                dst = self.ip_to_domains.get(d["dst_ip"])
+                tgt = next(reversed(dst)) if dst else d["dst_ip"]
+                self.feed("other", who, f"🔗 connecting to {tgt} ({svc})")
+            return
+        who = self.friendly_who(d["src_ip"], d["src_mac"])
+        tag, did = "other", d["text"]
+        if proto == "mDNS" and d["mdns"] and d["mdns"].get("qr") == 1:
+            if not (d["mdns"].get("services") or d["mdns"].get("names")):
+                return
+            tag, did = "device", f"📣 {d['text']}"
+        elif proto in ("DNS", "mDNS", "LLMNR"):
+            if proto == "DNS" and d["dns"] and d["dns"].get("qr") == 1:
+                return                    # answers repeat the question
+            tag = "dns"
+            did = f"🔍 looked up  {d['text']}" if d["text"] else "🔍 DNS lookup"
+        elif proto in ("TLS", "DoT"):
+            if not (d["tls"] and d["tls"].get("kind") == "client"):
+                return
+            tag = "secure"
+            did = f"🔐 {d['text']}"
+        elif proto == "QUIC":
+            if not (d["tcp_flags"] is None and d["payload_len"] > 1000):
+                return
+            tag = "secure"
+            did = "🔐 opened a fast secure connection (QUIC)"
+        elif proto == "HTTP":
+            tag = "unsecure"
+            did = f"⚠️ {d['text']}"
+        elif proto in ("DHCP", "DHCPv6"):
+            tag = "device"
+            did = f"🆔 {d['text']}"
+        elif proto in ("ARP", "NDP"):
+            if d["arp_op"] == 1 and d["src_ip"] in self.my_ips:
+                return                    # our own discovery sweep
+            tag = "device"
+            did = f"🔎 {d['text']}"
+        elif proto == "SSDP":
+            tag = "device"
+            did = f"📣 {d['text']}"
+        elif proto in ("ICMP", "ICMPv6"):
+            did = f"📡 {d['text']}"
+        elif proto in ("SSH", "RDP", "TELNET", "FTP", "SMB"):
+            tag = "unsecure" if proto in ("TELNET", "FTP") else "other"
+            did = f"🖥  {d['text']}"
+        elif proto in ("NTP", "IGMP", "NBNS"):
+            did = f"🕑 {d['text']}" if proto == "NTP" else d["text"]
+        self.feed(tag, who, did, fmt_clock(d["time"]))
+
+    # ---- periodic work --------------------------------------------------------
+    def tick(self, now=None):
+        now = now or self.now()
+        newly_inactive, newly_expired = self.registry.tick_lifecycle(now)
+        for dev in newly_inactive:
+            self._dirty_dev(dev)
+            self.push_timeline("device left", "INFO",
+                               f"{dev.display_name()} went offline",
+                               ("device", dev.key), dev.key)
+        for dev in newly_expired:
+            self._dirty_dev(dev)
+            self.push_timeline("device expired", "INFO",
+                               f"{dev.display_name()} moved to history "
+                               f"(expired)", ("device", dev.key), dev.key)
+        for f in self.flows.expire(now):
+            pass
+        self.dns.expire(now)
+        self._check_dns(now)
+        self._check_broadcast(now)
+        self._check_scans(now)
+        for dev in list(self.registry.by_key.values()):
+            if dev.state != STATE_ACTIVE or not dev.live:
+                continue
+            if dev.confidence in (CONFIDENCE_LOW, CONFIDENCE_UNCONFIRMED) \
+                    and dev.packets >= int(self.config.get(
+                        "alerts.unknown_min_packets", 5)) and \
+                    not dev.expected:
+                self._alert(self.alerts.unknown_device(dev))
+        for keep, other in self.registry.auto_merge_pass():
+            dev = self.registry.by_key.get(keep)
+            self.dirty_devices.add(keep)
+            if dev:
+                self.push_timeline("identity merged", "INFO",
+                                   f"{dev.display_name()}: two identities "
+                                   f"combined (automatic)",
+                                   ("device", keep), keep)
+        if self.config.get("devices.suggest_merges", True):
+            self._suggest_merges()
+        self._apply_cache_names()
+        self._classify()
+        active = sum(1 for d in self.registry.by_key.values()
+                     if d.live and d.state in (STATE_ACTIVE, STATE_IDLE))
+        self.metrics.series["active_devices"].add(now, active)
+        self._detect_vpn()
+        for key, b in list(self.baselines.devices.items()):
+            if b.cur_min is not None and int(now // 60) > b.cur_min + 1:
+                dev = self.registry.by_key.get(key)
+                snap = b.finish()
+                b.cur_min = None
+                if dev is not None and dev.live:
+                    self._baseline_check(dev, snap)
+        for k, exp in list(self.own_probe_targets.items()):
+            if exp < now:
+                self.own_probe_targets.pop(k, None)
+        for kind, sev, text, key in self.registry.events:
+            self.push_timeline(kind, sev, text, ("device", key), key)
+            self.dirty_devices.add(key)
+        self.registry.events = []
+        self._announce_created()
+
+    def _check_dns(self, now):
+        rate, n = self.dns.failure_rate(now)
+        if n >= 20 and rate >= 0.3:
+            servers = [ip for ip, *_ in self.dns.summary_rows()[:3]]
+            self._alert(self.alerts.dns_failures(rate, n, servers))
+        med, n = self.dns.median_latency(now)
+        slow = float(self.config.get("dns.slow_ms", 800))
+        if med is not None and n >= 10 and med >= slow:
+            rows = self.dns.summary_rows()
+            self._alert(self.alerts.dns_slow(med, n, rows[0][0] if rows
+                                             else ""))
+        ext = [ip for ip in self.dns.servers
+               if ip != self.gateway_ip and ip not in self.dhcp_dns]
+        if len(ext) > 3:
+            self._alert(self.alerts.dns_multi(ext))
+
+    def _check_broadcast(self, now):
+        thr = float(self.config.get("alerts.broadcast_pps_threshold", 400))
+        pps = self.metrics.series["bcast_packets"].total_window(
+            1, 10, now, skip_current=True) / 10.0
+        if pps >= thr:
+            recent = Counter(src for t, src in self.bcast_talkers
+                             if now - t <= 10)
+            top = recent.most_common(1)
+            who = ""
+            if top:
+                dev = self.registry.by_key.get(top[0][0]) or \
+                    self.device_for(top[0][0])
+                who = dev.display_name() if dev else top[0][0]
+            self._alert(self.alerts.broadcast_storm(pps, who))
+
+    def _check_scans(self, now):
+        pt = int(self.config.get("alerts.scan_ports_threshold", 60))
+        ht = int(self.config.get("alerts.scan_hosts_threshold", 40))
+        for key, dq in list(self.scans.attempts.items()):
+            while dq and now - dq[0][0] > 60:
+                dq.popleft()
+            if len(dq) < min(pt, ht):
+                if not dq:
+                    self.scans.forget(key)
+                continue
+            res = self.scans.evaluate(key, pt, ht)
+            dev = self.registry.by_key.get(key)
+            if res and dev is not None and dev.live:
+                self._alert(self.alerts.scan_pattern(dev, res[0], res[1]))
+
+    def _suggest_merges(self):
+        for dev in list(self.registry.by_key.values()):
+            if not dev.live or dev.pinned_no_merge:
+                continue
+            if not (dev.dhcp_hostname or dev.mdns_name or dev.alias):
+                continue
+            for other, conf, reasons in self.registry.merge_candidates(dev):
+                pair = other.key
+                if pair in dev.suggested or dev.key in other.suggested:
+                    continue
+                dev.suggested.add(pair)
+                other.suggested.add(dev.key)
+                self.push_timeline(
+                    "possible duplicate", "INFO",
+                    f"Possibly the same device: {dev.display_name()} and "
+                    f"{other.display_name()} ({conf} confidence) — open "
+                    f"either device to merge them", ("device", dev.key),
+                    dev.key)
+
+    def _apply_cache_names(self):
+        if self.cache.version == self._cache_version:
+            return
+        self._cache_version = self.cache.version
+        for dev in list(self.registry.by_key.values()):
+            for ip in [dev.ip] + sorted(dev.ipv6)[:2]:
+                if not ip:
+                    continue
+                name = self.cache.get(ip)
+                if not name:
+                    continue
+                src = self.cache.source(ip)
+                src = {"dns": "rdns", "sni": ""}.get(src, src)
+                if not src:
+                    continue
+                if src == "mdns":
+                    short = name[:-6] if name.lower().endswith(".local") \
+                        else name
+                    if not dev.mdns_name and short:
+                        dev.mdns_name = short
+                        self._dirty_dev(dev)
+                    break
+                if self.registry.set_hostname(ip, name, src):
+                    self._dirty_dev(dev)
+                break
+
+    def _classify(self):
+        keys, self._classify_dirty = self._classify_dirty, set()
+        for key in keys:
+            dev = self.registry.by_key.get(key)
+            if dev is None:
+                continue
+            cls, word, reasons = classify_device(
+                dev, self.gateway_ip, self.my_ips, self.my_macs,
+                self.registry.ra_routers, self.registry.gw_macs)
+            if cls != dev.device_class or word != dev.class_confidence:
+                dev.device_class, dev.class_confidence = cls, word
+                dev.class_reasons = reasons
+                dev.type = CLASS_TO_TYPE.get(cls, "unknown")
+                if dev.type == "unknown" and dev.type_hint:
+                    dev.type = dev.type_hint
+                self.dirty_devices.add(key)
+            else:
+                dev.class_reasons = reasons
+
+    def _detect_vpn(self):
+        total = self.metrics.totals["bytes_up"] + \
+            self.metrics.totals["bytes_down"]
+        if not self.vpn_bytes or total < 512 * 1024:
+            return
+        ip, b = self.vpn_bytes.most_common(1)[0]
+        if b >= 0.5 * total and b >= 512 * 1024:
+            rec = self.remote_hosts.get(ip)
+            kind = ""
+            if rec:
+                for p in rec.ports:
+                    if p in VPN_PORTS:
+                        kind = VPN_PORTS[p]
+                        break
+                if rec.vpn_endpoint != (kind or "VPN"):
+                    rec.vpn_endpoint = kind or "VPN"
+                    self.dirty_remotes.add(ip)
+            if self.vpn.get("endpoint") != ip:
+                self.vpn.update({"endpoint": ip, "kind": kind or "VPN"})
+                self.push_timeline("vpn", "INFO",
+                                   f"Most Internet traffic goes to {ip}, "
+                                   f"which looks like a {kind or 'VPN'} "
+                                   f"server", ("remote", ip))
+
+    def infer_gateway(self):
+        """For imported captures: work out which address is the router,
+        from DHCP 'router' options or from where Internet traffic flows."""
+        if self.dhcp_routers:
+            return self.dhcp_routers.most_common(1)[0][0]
+        if self.gw_mac_traffic:
+            mac = self.gw_mac_traffic.most_common(1)[0][0]
+            dev = self.registry.by_key.get(mac)
+            if dev is not None and dev.ip:
+                return dev.ip
+        return ""
+
+    def note_probes(self, probes, until):
+        for host, port in probes:
+            self.own_probe_targets[(host, port)] = until
+
+    # ---- clearing -------------------------------------------------------------
+    def has_data(self):
+        return bool(self.count or self.registry.by_key or self.websites)
+
+
+# ============================================================================
+#  14.  Persistence — configuration, sessions, known devices, history
+# ============================================================================
+DEFAULT_SHORTCUTS = {
+    "start": "<Control-r>", "stop": "<Control-period>",
+    "clear": "<Control-l>", "export": "<Control-e>", "find": "<Control-f>",
+}
+
+DEFAULT_FILTER_PRESETS = {
+    "My phone": {"expr": "device:@mine-phone"},
+    "DNS only": {"proto": "DNS"},
+    "Web traffic": {"expr": "proto:tls or proto:http or proto:quic"},
+    "Local discovery": {"expr": "proto:arp or proto:mdns or proto:ssdp or "
+                                "proto:ndp or proto:dhcp or proto:nbns"},
+    "Remote desktop": {"expr": "port:3389 or port:5900 or port:22 or "
+                               "port:5938"},
+    "Suspicious events": {"expr": "sev:warning"},
+}
+
+
+def _default_config():
+    return {
+        "config_version": CONFIG_SCHEMA_VERSION,
+        "general": {"auto_start_capture": True, "confirm_before_clear": False,
+                    "beginner_explanations": True,
+                    "explanation_verbosity": "Normal", "language": "English"},
+        "appearance": {"theme": "Light", "beginner_mode": True,
+                       "high_contrast": False, "text_size": "Normal"},
+        "capture": {"max_stored_events": 5000, "promiscuous": True,
+                    "auto_select_interface": True,
+                    "preferred_interface": "", "follow_newest": True},
+        "devices": {"idle_minutes": 2, "inactive_minutes": 10,
+                    "expire_minutes": 1440, "auto_merge": True,
+                    "suggest_merges": True,
+                    "show_inactive": False, "show_expired": False},
+        "dns": {"detect_encrypted_dns": True, "slow_ms": 800},
+        "websites": {"group_subdomains": True,
+                     "tracker_classification": False},
+        "connections": {"max_active": 5000, "archive_size": 2000,
+                        "hide_short_beginner": True},
+        "health": {"active_checks": True, "interval_seconds": 30,
+                   "internet_target": "1.1.1.1:443"},
+        "alerts": {"new_device": True, "arp_spoof": True,
+                   "gateway_change": True, "dhcp_anomaly": True,
+                   "chatty_device": True, "unknown_device": True,
+                   "reconnect_cycle": True, "duplicate_ip": True,
+                   "dns_server_change": True, "dns_failures": True,
+                   "dns_slow": True, "dns_multi": True,
+                   "many_destinations": True, "many_connections": True,
+                   "upload_spike": True, "download_spike": True,
+                   "tcp_resets": True, "new_service": True,
+                   "cleartext": True, "remote_access": True,
+                   "new_country": True, "broadcast_storm": True,
+                   "scan_pattern": True,
+                   "chatty_multiplier": 4, "chatty_min_rate": 3,
+                   "unknown_min_packets": 5, "reconnect_count": 5,
+                   "reconnect_window_minutes": 30, "arp_flip_threshold": 4,
+                   "baseline_min_minutes": 15, "reset_threshold": 40,
+                   "broadcast_pps_threshold": 400,
+                   "scan_ports_threshold": 60, "scan_hosts_threshold": 40,
+                   "flag_http": False,
+                   "muted_devices": [], "expected": []},
+        "notifications": {"feed_alerts": True, "danger_only": False},
+        "performance": {"cpu_friendly_mode": False, "mode": "Automatic"},
+        "export": {"default_dir": ""},
+        "mode": {"active_scanning": True},
+        "shortcuts": dict(DEFAULT_SHORTCUTS),
+        "updates": {"check_automatically": False, "repo": "",
+                    "allow_self_update": False},
+        "privacy": {"geoip_enabled": False, "local_asn_db": False,
+                    "auto_download_reference": True},
+        "history": {"enabled": False, "retention": "30 days",
+                    "custom_days": 14, "save_raw_packets": False},
+        "filters": {"presets": json.loads(json.dumps(DEFAULT_FILTER_PRESETS))},
+        "diagnostics": {"verbose_logging": False},
+    }
+
+
+def migrate_config(data):
+    """Bring an older settings file up to the current schema without
+    losing anything the user chose."""
+    ver = int(data.get("config_version", 1) or 1)
+    if ver < 2:
+        perf = data.setdefault("performance", {})
+        if "mode" not in perf:
+            perf["mode"] = "Low CPU" if perf.get("cpu_friendly_mode") \
+                else "Automatic"
+        data["config_version"] = 2
+    return data
+
+
+class AppConfig:
+    """JSON-backed settings. Degrades to defaults on any read/parse problem
+    rather than crashing (keeping a backup of the damaged file); migrates
+    old schemas; never stores credentials."""
+
+    def __init__(self, path=None):
+        default_path = os.path.join(SCRIPT_DIR, "miniwireshark_config.json")
+        if path is None:
+            path = os.environ.get("MINIWIRESHARK_CONFIG")
+        if path is None:
+            if os.path.exists(default_path) or _dir_writable(SCRIPT_DIR):
+                path = default_path
+            else:
+                path = os.path.join(PATHS.data, "miniwireshark_config.json")
+        self.path = path
+        self.warning = ""
+        self.data = self._load()
+
+    def _load(self):
+        defaults = _default_config()
+        try:
+            if not os.path.exists(self.path):
+                return defaults
+            with open(self.path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("config is not an object")
+            data = migrate_config(data)
+            merged = _default_config()
+            for section, vals in data.items():
+                if section in merged and isinstance(vals, dict) and \
+                        isinstance(merged[section], dict):
+                    merged[section].update(vals)
+            merged["config_version"] = CONFIG_SCHEMA_VERSION
+            return merged
+        except (OSError, ValueError) as e:
+            LOG.warning("config unreadable (%s); using defaults", e)
+            with contextlib.suppress(OSError):
+                shutil.copyfile(self.path, self.path + ".damaged")
+            self.warning = ("Your settings file looked damaged, so I reset "
+                            "it to defaults (a copy was kept as "
+                            "“.damaged”).")
+            return defaults
+
+    def get(self, dotted, default=None):
+        section, _, key = dotted.partition(".")
+        return self.data.get(section, {}).get(key, default)
+
+    def set(self, dotted, value):
+        section, _, key = dotted.partition(".")
+        self.data.setdefault(section, {})[key] = value
+
+    def save(self):
+        try:
+            atomic_write_json(self.path, self.data)
+            return True
+        except OSError:
+            LOG.warning("could not save settings to %s", self.path)
+            return False
+
+    def reset(self, section=None):
+        fresh = _default_config()
+        if section:
+            self.data[section] = fresh.get(section, {})
+        else:
+            self.data = fresh
+        self.save()
+
+
+def config_defaults_flat():
+    out = {}
+    for sec, vals in _default_config().items():
+        if isinstance(vals, dict):
+            for k in vals:
+                out[f"{sec}.{k}"] = vals[k]
+    return out
+
+
+class KnownDevicesStore:
+    """What YOU told MiniWireshark about your devices (names, notes,
+    'mine', 'expected', 'never merge'). Kept locally in the data folder so
+    it survives restarts, independently of the optional history mode."""
+
+    def __init__(self, path):
+        self.path = path
+        self.data = read_json(path, {}) or {}
+        if not isinstance(self.data, dict):
+            self.data = {}
+
+    def get(self, key):
+        return self.data.get(key)
+
+    def update_from(self, dev):
+        entry = {"alias": dev.alias, "notes": dev.notes, "mine": dev.mine,
+                 "expected": dev.expected, "pinned": dev.pinned_no_merge,
+                 "never_merge": sorted(dev.never_merge),
+                 "vendor": dev.vendor, "last_ip": dev.ip,
+                 "updated": time.time()}
+        if not any((dev.alias, dev.notes, dev.mine, dev.expected,
+                    dev.pinned_no_merge, dev.never_merge)):
+            self.data.pop(dev.key, None)
+        else:
+            self.data[dev.key] = entry
+        self.save()
+
+    def forget(self, key):
+        if self.data.pop(key, None) is not None:
+            self.save()
+
+    def save(self):
+        try:
+            atomic_write_json(self.path, self.data)
+        except OSError:
+            LOG.warning("could not save known devices")
+
+
+class SessionCodec:
+    """Session file format v2 (.mwsession.json). Old v1 files (3.0's
+    predecessor) still load; missing fields simply take defaults."""
+
+    @staticmethod
+    def serialize(model, meta=None):
+        meta = dict(meta or {})
+        now = model.now()
+        flows = sorted(model.flows.all_flows(), key=lambda f: -f.total_bytes)
+        payload = {
+            "schema_version": SESSION_SCHEMA_VERSION,
+            "app": {"name": APP_NAME, "version": SCRIPT_VERSION},
+            "exported_at": time.time(),
+            "packet_count": model.count,
+            "session": {
+                "started": meta.get("started") or model.metrics.first_ts,
+                "ended": model.metrics.last_ts or now,
+                "data_source": meta.get("data_source", "live"),
+                "interface": meta.get("interface", ""),
+                "gateway": model.gateway_ip,
+                "my_ips": sorted(model.my_ips),
+                "demo": bool(model.demo),
+                "vpn": dict(model.vpn),
+            },
+            "devices": [device_to_dict(d) for d in
+                        model.registry.by_key.values()],
+            "websites": [website_to_dict(w) for w in model.websites.values()],
+            "remote_hosts": [remote_to_dict(r) for r in
+                             sorted(model.remote_hosts.values(),
+                                    key=lambda r: -r.bytes_total)[:5000]],
+            "flows_summary": [f.to_dict() for f in flows[:2000]],
+            "alerts": [alert_to_dict(model.alerts.alerts[aid])
+                       for aid in model.alerts.order
+                       if aid in model.alerts.alerts],
+            "timeline": [{k: v for k, v in e.items()
+                          if k in ("when", "kind", "severity", "text",
+                                   "ref", "device")}
+                         for e in list(model.timeline)[-2000:]],
+            "metrics": model.metrics.to_dict(),
+            "dns": model.dns.to_dict(),
+            "baselines": model.baselines.to_dict(),
+            "dhcp_servers": dict(model.dhcp_servers),
+            "doh_seen": {k: sorted(v) for k, v in model.doh_seen.items()},
+            "health": {k: v for k, v in model.health.items()
+                       if isinstance(v, (str, int, float, bool, type(None)))},
+        }
+        return payload
+
+    @staticmethod
+    def migrate(payload):
+        if not isinstance(payload, dict):
+            raise ValueError("not a MiniWireshark session (no object)")
+        ver = int(payload.get("schema_version", 1) or 1)
+        if ver > SESSION_SCHEMA_VERSION:
+            LOG.info("session from a newer version (%s); loading what we "
+                     "understand", ver)
+        if ver < 2:
+            # v1: devices[].hostname was the display name; nothing else
+            for dd in payload.get("devices", []) or []:
+                if isinstance(dd, dict) and "hostname_display" not in dd:
+                    dd["hostname_display"] = dd.get("hostname", "")
+            payload["schema_version"] = 2
+        if not any(k in payload for k in ("devices", "websites",
+                                          "remote_hosts", "alerts")):
+            raise ValueError("this file has no devices, websites, remote "
+                             "hosts or alerts")
+        return payload
+
+    @staticmethod
+    def load(payload, model):
+        """Populate an EMPTY model from a payload. Everything loaded is
+        marked live=False so it can never be mistaken for live data."""
+        payload = SessionCodec.migrate(payload)
+        sess = payload.get("session") or {}
+        model.use_packet_clock = True
+        model.offline_now = float(sess.get("ended") or
+                                  payload.get("exported_at") or time.time())
+        model.set_identity(gateway_ip=sess.get("gateway", "") or "",
+                           my_ips=sess.get("my_ips") or [])
+        model.demo = bool(sess.get("demo"))
+        for dd in payload.get("devices", []) or []:
+            if not isinstance(dd, dict):
+                continue
+            dev = device_from_dict(dd)
+            dev.live = False
+            if dev.state not in (STATE_ACTIVE, STATE_IDLE, STATE_INACTIVE,
+                                 STATE_EXPIRED):
+                dev.state = STATE_EXPIRED
+            model.registry.by_key[dev.key] = dev
+            for ip in dev.ipv4s | dev.ipv6 | ({dev.ip} if dev.ip else set()):
+                model.registry.ip_to_key[ip] = dev.key
+            if dev.device_class == "Unknown":
+                model._classify_dirty.add(dev.key)
+        for wd in payload.get("websites", []) or []:
+            if isinstance(wd, dict) and wd.get("domain"):
+                rec = website_from_dict(wd)
+                rec.live = False
+                model.websites[rec.domain] = rec
+        for rd in payload.get("remote_hosts", []) or []:
+            if isinstance(rd, dict) and rd.get("ip"):
+                rec = remote_from_dict(rd)
+                rec.live = False
+                model.remote_hosts[rec.ip] = rec
+        for fd in payload.get("flows_summary", []) or []:
+            if isinstance(fd, dict):
+                f = FlowRecord.from_dict(fd)
+                f.fid = model.flows.next_id
+                model.flows.next_id += 1
+                model.flows.archive.append(f)
+                model.flows.by_id[f.fid] = f
+        for ad in payload.get("alerts", []) or []:
+            if isinstance(ad, dict):
+                a = alert_from_dict(ad)
+                model.alerts.alerts[a.id] = a
+                model.alerts.order.append(a.id)
+        for e in payload.get("timeline", []) or []:
+            if isinstance(e, dict) and "text" in e:
+                ref = e.get("ref")
+                model.timeline.append({
+                    "when": float(e.get("when") or 0), "kind": e.get("kind",
+                                                                    ""),
+                    "severity": e.get("severity", "INFO"),
+                    "text": e.get("text", ""),
+                    "ref": tuple(ref) if isinstance(ref, list) else ref,
+                    "device": e.get("device", ""), "live": False})
+        model.metrics.load(payload.get("metrics") or {})
+        model.dns.load(payload.get("dns") or {})
+        model.baselines.load(payload.get("baselines") or {})
+        for k, v in (payload.get("dhcp_servers") or {}).items():
+            with contextlib.suppress(TypeError, ValueError):
+                model.dhcp_servers[k] = int(v)
+        for k, v in (payload.get("doh_seen") or {}).items():
+            model.doh_seen[k] = set(v or [])
+        model.count = int(payload.get("packet_count", 0) or 0)
+        vpn = sess.get("vpn")
+        if isinstance(vpn, dict):
+            model.vpn.update(vpn)
+        model._classify()
+        return payload
+
+
+# ---- optional local history (SQLite) ----------------------------------------
+HISTORY_RETENTION = {"Session only": 0, "7 days": 7, "30 days": 30,
+                     "90 days": 90, "Custom": None}
+
+
+class HistoryStore:
+    """Optional, compact long-term memory: device summaries, presence,
+    daily traffic, alerts, domain summaries and baselines. No packet
+    contents. Writes happen on a background thread with its own
+    connection; the GUI only hands over small snapshots."""
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
+    CREATE TABLE IF NOT EXISTS devices(key TEXT PRIMARY KEY, data TEXT,
+        first_seen REAL, last_seen REAL);
+    CREATE TABLE IF NOT EXISTS presence(device_key TEXT, start REAL,
+        end REAL, PRIMARY KEY(device_key, start));
+    CREATE TABLE IF NOT EXISTS traffic(device_key TEXT, day TEXT,
+        bytes_up INTEGER, bytes_down INTEGER, packets INTEGER,
+        PRIMARY KEY(device_key, day));
+    CREATE TABLE IF NOT EXISTS alerts(id TEXT PRIMARY KEY, kind TEXT,
+        severity TEXT, device_key TEXT, reason TEXT, at REAL);
+    CREATE TABLE IF NOT EXISTS domains(domain TEXT, day TEXT,
+        requests INTEGER, bytes INTEGER, PRIMARY KEY(domain, day));
+    CREATE TABLE IF NOT EXISTS baselines(device_key TEXT PRIMARY KEY,
+        data TEXT, updated REAL);
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.q = queue.Queue(maxsize=50)
+        self.error = ""
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="history-writer")
+        self._thread.start()
+
+    def _connect(self):
+        con = sqlite3.connect(self.path, timeout=10)
+        con.executescript(self.SCHEMA)
+        con.execute("INSERT OR REPLACE INTO meta VALUES('schema','1')")
+        return con
+
+    def _run(self):
+        try:
+            con = self._connect()
+        except sqlite3.Error as e:
+            self.error = str(e)
+            LOG.warning("history db unavailable: %s", e)
+            return
+        while not self._stop:
+            try:
+                job = self.q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if job is None:
+                break
+            try:
+                job(con)
+                con.commit()
+            except sqlite3.Error as e:
+                self.error = str(e)
+                LOG.warning("history write failed: %s", e)
+        with contextlib.suppress(sqlite3.Error):
+            con.close()
+
+    def submit(self, job):
+        try:
+            self.q.put_nowait(job)
+            return True
+        except queue.Full:
+            return False
+
+    def write_snapshot(self, snap):
+        def job(con):
+            day = time.strftime("%Y-%m-%d")
+            for key, data, fs, ls, presence, tr in snap["devices"]:
+                con.execute("INSERT OR REPLACE INTO devices VALUES(?,?,?,?)",
+                            (key, json.dumps(data, default=str), fs, ls))
+                for start, end in presence:
+                    con.execute("INSERT OR REPLACE INTO presence "
+                                "VALUES(?,?,?)", (key, start, end))
+                con.execute("INSERT OR REPLACE INTO traffic "
+                            "VALUES(?,?,?,?,?)", (key, day) + tuple(tr))
+            for a in snap["alerts"]:
+                con.execute("INSERT OR IGNORE INTO alerts VALUES(?,?,?,?,?,?)",
+                            a)
+            for dom, req, b in snap["domains"]:
+                con.execute("INSERT OR REPLACE INTO domains "
+                            "VALUES(?,?,?,?)", (dom, day, req, b))
+            for key, data in snap["baselines"]:
+                con.execute("INSERT OR REPLACE INTO baselines VALUES(?,?,?)",
+                            (key, json.dumps(data), time.time()))
+        return self.submit(job)
+
+    def prune(self, days):
+        if not days:
+            return False
+        cutoff = time.time() - days * 86400
+        cday = time.strftime("%Y-%m-%d", time.localtime(cutoff))
+
+        def job(con):
+            con.execute("DELETE FROM presence WHERE start < ?", (cutoff,))
+            con.execute("DELETE FROM alerts WHERE at < ?", (cutoff,))
+            con.execute("DELETE FROM traffic WHERE day < ?", (cday,))
+            con.execute("DELETE FROM domains WHERE day < ?", (cday,))
+            con.execute("DELETE FROM devices WHERE last_seen < ?", (cutoff,))
+        return self.submit(job)
+
+    def clear(self, device_key=None):
+        def job(con):
+            if device_key:
+                for t, col in (("devices", "key"), ("presence", "device_key"),
+                               ("traffic", "device_key"),
+                               ("alerts", "device_key"),
+                               ("baselines", "device_key")):
+                    con.execute(f"DELETE FROM {t} WHERE {col}=?",
+                                (device_key,))
+            else:
+                for t in ("devices", "presence", "traffic", "alerts",
+                          "domains", "baselines"):
+                    con.execute(f"DELETE FROM {t}")
+                con.commit()
+                con.execute("VACUUM")
+        return self.submit(job)
+
+    def load_baselines(self):
+        """Synchronous read used once at startup (separate connection)."""
+        out = {}
+        try:
+            con = sqlite3.connect(self.path, timeout=5)
+            for key, data in con.execute("SELECT device_key, data FROM "
+                                         "baselines"):
+                with contextlib.suppress(ValueError):
+                    out[key] = json.loads(data)
+            con.close()
+        except sqlite3.Error as e:
+            self.error = str(e)
+        return out
+
+    def known_device_rows(self, limit=500):
+        rows = []
+        try:
+            con = sqlite3.connect(self.path, timeout=5)
+            for key, data, fs, ls in con.execute(
+                    "SELECT key, data, first_seen, last_seen FROM devices "
+                    "ORDER BY last_seen DESC LIMIT ?", (limit,)):
+                with contextlib.suppress(ValueError):
+                    rows.append((key, json.loads(data), fs, ls))
+            con.close()
+        except sqlite3.Error as e:
+            self.error = str(e)
+        return rows
+
+    def size_bytes(self):
+        total = 0
+        for suffix in ("", "-wal", "-journal"):
+            with contextlib.suppress(OSError):
+                total += os.path.getsize(self.path + suffix)
+        return total
+
+    def stop(self):
+        self._stop = True
+        with contextlib.suppress(queue.Full):
+            self.q.put_nowait(None)
+
+
+# ============================================================================
+#  15.  Strings, glossary, country lookup, tooltips
+# ============================================================================
+
+# Pacing presets for the friendly "What's happening" feed. Each flush cycle
+# takes whatever happened since the last one and, in "digest" modes, groups
+# repeats together and caps how many new lines appear at once — this is
+# what keeps a busy network from scrolling past faster than a beginner can
+# read. Advanced users can switch to "Full speed" for the old firehose.
+FEED_SPEEDS = {
+    "🐢 Calm":       {"interval": 2500, "max_rows": 8,  "digest": True},
+    "🚶 Normal":      {"interval": 700,  "max_rows": 10, "digest": True},
+    "🐇 Full speed":  {"interval": 120,  "max_rows": 999, "digest": False},
+}
+DEFAULT_FEED_SPEED = "🐢 Calm"
+
+# ---------------------------------------------------------------------------
+# i18n scaffolding (Section 22 "Additional settings"). Only English strings
+# exist today, but every string routed through tr() can gain translations
+# later by adding a new top-level locale dict here — no call sites change.
+# Given the size of this file, only the highest-traffic UI strings (window
+# chrome, tab names, primary buttons, the mode banner, the severity legend)
+# are actually routed through tr() so far; it's a real, working foundation
+# rather than a claim that the whole app is translated.
+# ---------------------------------------------------------------------------
+STRINGS = {
+    "en": {
+        "app_title": "\U0001F310 MiniWireshark",
+        "app_subtitle": "   Your network, explained in plain English",
+        "btn_settings": "\u2699\ufe0e Settings",
+        "btn_help": "? Help / About",
+        "btn_start": "\u25b6  Start watching",
+        "btn_stop": "\u25a0  Stop",
+        "btn_clear": "Clear",
+        "tab_dashboard": "\U0001f4ca Dashboard",
+        "tab_feed": "\U0001f4d6 Happening",
+        "tab_timeline": "\U0001f553 Timeline",
+        "tab_devices": "\U0001f3e0 Devices",
+        "tab_websites": "\U0001f30d Websites",
+        "tab_remote": "\U0001f5a5 Remote hosts",
+        "tab_alerts": "\U0001f514 Alerts",
+        "tab_map": "\U0001f5fa Map",
+        "tab_security": "\U0001f512 Security",
+        "tab_raw": "\u2699\ufe0f Packets",
+        "tab_connections": "\U0001f517 Connections",
+        "tab_health": "\U0001fa7a Health",
+        "tab_about": "\u2753 Help",
+        "legend_info": "INFO \u2014 normal activity",
+        "legend_warning": "WARNING \u2014 worth a look",
+        "legend_danger": "DANGER \u2014 strong evidence of a real problem",
+        "mode_active": "\U0001F7E2 ACTIVE SCANNING \u2014 MiniWireshark is "
+                       "also sending harmless discovery probes "
+                       "(ARP/mDNS/SSDP) on your own local network to find "
+                       "quiet devices.",
+        "mode_quiet": "\U0001F535 QUIET MODE \u2014 PASSIVE ONLY \u2014 "
+                     "MiniWireshark is only listening to traffic that "
+                     "already exists; it is not sending anything itself.",
+    },
+}
+CURRENT_LOCALE = "en"
+LOCALE_NAMES = {"en": "English"}   # display name -> add more as they're built
+
+
+def tr(key, **kwargs):
+    """Translate a UI string. Falls back to English, then to the raw key,
+    so a missing translation never breaks the UI."""
+    text = STRINGS.get(CURRENT_LOCALE, {}).get(key) or \
+        STRINGS["en"].get(key, key)
+    return text.format(**kwargs) if kwargs else text
+
+
+def set_locale(name):
+    global CURRENT_LOCALE
+    for code, display in LOCALE_NAMES.items():
+        if display == name:
+            CURRENT_LOCALE = code
+            return
+    CURRENT_LOCALE = "en"
+
+
+GLOSSARY = [
+    ("What MiniWireshark does",
+    "It watches network traffic on the card you choose and explains it in "
+    "plain English \u2014 which devices are on your Wi-Fi, which websites "
+    "were visited, and whether anything looks unusual. It only shows you "
+    "your own local network, not anyone else's."),
+    ("MAC address",
+    "A hardware address burned into (or randomized by) a network adapter. "
+    "It's the strongest evidence MiniWireshark has that something is a "
+    "real local device, since it can't come from the public Internet."),
+    ("IP address",
+    "A network address a device is currently using. Unlike a MAC, an IP "
+    "alone is never treated as proof of a device \u2014 addresses get "
+    "reused, and remote/public IPs belong to websites, not your devices."),
+    ("ARP",
+    "\u201cAddress Resolution Protocol\u201d \u2014 how devices on the "
+    "same local network find each other's MAC address. An ARP reply is "
+    "strong evidence a device is really there."),
+    ("DNS",
+    "The system that turns website names (like example.com) into IP "
+    "addresses. Watching DNS is how MiniWireshark learns which websites "
+    "were visited."),
+    ("DHCP",
+    "How your router automatically hands out IP addresses to devices "
+    "joining the network. A DHCP lease is strong evidence of a real "
+    "device."),
+    ("mDNS / SSDP",
+    "Two ways devices announce themselves on a local network (Bonjour "
+    "and UPnP) \u2014 often naming themselves ('Living Room TV') and "
+    "listing what they can do."),
+    ("Website vs. Remote Host",
+    "A Website is a domain name you looked up or connected to (like "
+    "example.com). A Remote Host is a raw public IP address contacted "
+    "directly. Neither is ever shown as a device on your network."),
+    ("Quiet Mode vs. Active Scanning",
+    "Active Scanning means MiniWireshark also sends a few harmless "
+    "discovery probes (ARP/mDNS/SSDP) on your own network to find quiet "
+    "devices. Quiet Mode turns that off and only listens. Neither mode "
+    "hides MiniWireshark's activity from your network \u2014 that's not "
+    "what this is for."),
+    ("Severity colors",
+    "INFO (neutral) is normal activity. WARNING (amber) is unusual and "
+    "worth a look. DANGER (red) means strong, specific evidence of a "
+    "real problem \u2014 never assigned just because something is "
+    "unusual."),
+    ("Confidence",
+    "How much local evidence supports a device's identity: High, "
+    "Medium, Low, or Unconfirmed. It only goes up with real signals "
+    "(ARP, DHCP, mDNS/SSDP, vendor match) \u2014 never from guessing."),
+    ("Why some information may be missing",
+    "Permissions, a missing driver, or an interface that goes away can "
+    "all limit what MiniWireshark can see. It's built to keep working "
+    "with whatever sources are actually available, and to say so "
+    "plainly rather than guessing."),
+    ("Connections",
+    "A connection (or \u201cflow\u201d) is one conversation between a device "
+    "and something else \u2014 for example your laptop talking to a video "
+    "site. Upload means data your device sent; download means data it "
+    "received. Only shown in Advanced view."),
+    ("What MiniWireshark can and can't see about websites",
+    "For secure (https) sites MiniWireshark usually sees only the site's "
+    "NAME, such as example.com \u2014 never the page you opened, what you "
+    "typed, or the full address like https://example.com/private/page. "
+    "Plain http:// pages are visible in full, which is why they're flagged."),
+    ("Health",
+    "The Health tab checks whether your router and the Internet respond, "
+    "how fast website lookups (DNS) are, and whether connections are being "
+    "reset. Active checks send a handful of tiny test connections and are "
+    "switched off in Quiet Mode."),
+    ("Baselines",
+    "MiniWireshark learns what is normal for EACH device (how much it "
+    "usually sends, how many places it talks to) and only calls something "
+    "unusual compared with that device's own history \u2014 a smart bulb is "
+    "never compared with a gaming PC. Nothing here uses AI; it's simple "
+    "averages."),
+    ("Offline captures, saved sessions and demo data",
+    "Opening a .pcap file, loading a saved session, or starting Demo Mode "
+    "shows a banner saying the data is NOT live. Starting live capture "
+    "always begins a fresh session, so saved or demo records never mix "
+    "with what's really happening on your network."),
+    ("VPNs",
+    "If a VPN is active, your Internet traffic travels inside an encrypted "
+    "tunnel, so MiniWireshark can see less about individual destinations "
+    "\u2014 often just the VPN server itself. That's the VPN doing its job."),
+    ("Why encrypted DNS limits visibility",
+    "DNS-over-HTTPS/TLS hides the website name from anyone watching the "
+    "network \u2014 including MiniWireshark. That's the encryption "
+    "working as intended, a privacy feature, not a bug."),
+]
+
+
+# ============================================================================
+#  9c.  Country lookup (opt-in) — a small self-contained service
+#
+#  Why this is a service and not a one-liner: free geolocation providers
+#  rate-limit hard (~45 requests/minute), some networks block plain HTTP or
+#  individual hosts, and one failed attempt must never mean "unknown
+#  forever". So: one background worker, a request queue, a global pacing
+#  interval, provider fallback (three HTTPS providers, then one HTTP one as a
+#  last resort), a retry schedule, a circuit-breaker when the whole network
+#  is unreachable, and honest status/error text the UI can show. Nothing is
+#  ever sent unless the user has switched the feature on.
+# ============================================================================
+def _geo_parse_ipwho(d):
+    if not d.get("success", False):
+        raise ValueError(d.get("message") or "lookup failed")
+    return d.get("country_code", ""), d.get("country", "")
+
+
+def _geo_parse_geojs(d):
+    code = d.get("country", "")
+    if not code or len(code) != 2:
+        raise ValueError("no country in reply")
+    return code, d.get("name", "")
+
+
+def _geo_parse_ipapico(d):
+    if d.get("error"):
+        raise ValueError(d.get("reason") or d.get("message") or "lookup failed")
+    return d.get("country_code", ""), d.get("country_name", "")
+
+
+def _geo_parse_ipapi(d):
+    if d.get("status") != "success":
+        raise ValueError(d.get("message") or "lookup failed")
+    return d.get("countryCode", ""), d.get("country", "")
+
+
+GEOIP_PROVIDERS = [
+    ("ipwho.is", "https://ipwho.is/{ip}?fields=success,message,country,"
+                 "country_code", _geo_parse_ipwho),
+    ("geojs.io", "https://get.geojs.io/v1/ip/country/{ip}.json",
+     _geo_parse_geojs),
+    ("ipapi.co", "https://ipapi.co/{ip}/json/", _geo_parse_ipapico),
+    ("ip-api.com", "http://ip-api.com/json/{ip}?fields=status,message,"
+                   "country,countryCode", _geo_parse_ipapi),
+]
+
+
+class GeoIPService:
+    """Thread-safe, rate-limited country lookups with fallback and retry.
+
+    on_result(ip, code, name, provider) is called from the worker thread
+    for each success — the GUI passes something that only enqueues work for
+    the main thread, never touches Tk directly."""
+
+    def __init__(self, on_result, providers=None, timeout=5.0,
+                 min_interval=1.5, retry_after=300, max_attempts=3):
+        self.on_result = on_result
+        self.providers = list(providers or GEOIP_PROVIDERS)
+        self.timeout = timeout
+        self.min_interval = min_interval
+        self.retry_after = retry_after
+        self.max_attempts = max_attempts
+        self.enabled = False
+        self.results = {}     # ip -> (code, name, provider)
+        self.failures = {}    # ip -> [attempts, last_time, last_error]
+        self.pending = set()
+        self.q = queue.Queue()
+        self.lock = threading.Lock()
+        self.last_error = ""
+        self.last_provider = ""
+        self.request_times = []          # for pacing tests / diagnostics
+        self._last_call = 0.0
+        self._first_provider = 0
+        self._consecutive_total_failures = 0
+        self._paused_until = 0.0
+        self._thread = None
+        self._stop = False
+
+    # ---- public API ---------------------------------------------------
+    def set_enabled(self, on):
+        self.enabled = bool(on)
+        if self.enabled:
+            self._ensure_thread()
+
+    def request(self, ip):
+        """Queue `ip` if it's worth asking about. Returns True if queued."""
+        if not self.enabled or not is_public_ip(ip):
+            return False
+        with self.lock:
+            if ip in self.results or ip in self.pending:
+                return False
+            fail = self.failures.get(ip)
+            if fail and (fail[0] >= self.max_attempts or
+                         time.time() - fail[1] < self.retry_after):
+                return False
+            self.pending.add(ip)
+        self._ensure_thread()
+        self.q.put(ip)
+        return True
+
+    def retry_failed(self):
+        """Forget failure history and try every failed IP again now."""
+        with self.lock:
+            ips = list(self.failures)
+            self.failures.clear()
+            self._paused_until = 0.0
+            self._consecutive_total_failures = 0
+        n = 0
+        for ip in ips:
+            n += 1 if self.request(ip) else 0
+        return n
+
+    def status(self):
+        with self.lock:
+            return {"enabled": self.enabled, "resolved": len(self.results),
+                    "pending": len(self.pending),
+                    "failed": len(self.failures),
+                    "last_error": self.last_error,
+                    "provider": self.last_provider,
+                    "paused": max(0, int(self._paused_until - time.time()))}
+
+    def lookup_now(self, ip):
+        """Blocking single lookup for the 'Test' button. Returns
+        (code, name, provider, errors) — code is '' when everything failed;
+        errors is a list of 'provider: reason' strings."""
+        code, name, provider, errors = self._try_providers(ip)
+        return code, name, provider, errors
+
+    def stop(self):
+        self._stop = True
+
+    # ---- internals ------------------------------------------------------
+    def _ensure_thread(self):
+        if self._thread is None or not self._thread.is_alive():
+            self._stop = False
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def _fetch(self, url):
+        req = urllib.request.Request(
+            url, headers={"User-Agent": "MiniWireshark",
+                          "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            return json.loads(resp.read().decode("utf-8", "ignore"))
+
+    def _pace(self):
+        wait = self.min_interval - (time.time() - self._last_call)
+        if wait > 0:
+            time.sleep(wait)
+        self._last_call = time.time()
+        self.request_times.append(self._last_call)
+        del self.request_times[:-200]
+
+    def _try_providers(self, ip):
+        errors = []
+        n = len(self.providers)
+        for step in range(n):
+            idx = (self._first_provider + step) % n
+            name, template, parser = self.providers[idx]
+            self._pace()
+            try:
+                data = self._fetch(template.format(ip=ip))
+                code, cname = parser(data)
+                code = (code or "").upper()
+                if len(code) != 2:
+                    raise ValueError("no country code in reply")
+                self._first_provider = idx    # start here next time
+                return code, cname or "", name, errors
+            except urllib.error.HTTPError as e:
+                errors.append(f"{name}: HTTP {e.code}"
+                              f"{' (rate limited)' if e.code == 429 else ''}")
+            except urllib.error.URLError as e:
+                errors.append(f"{name}: {getattr(e, 'reason', e)}")
+            except (ValueError, KeyError) as e:
+                errors.append(f"{name}: {e}")
+            except Exception as e:
+                errors.append(f"{name}: {type(e).__name__}: {e}")
+        return "", "", "", errors
+
+    def _run(self):
+        while not self._stop:
+            try:
+                ip = self.q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if not self.enabled:
+                with self.lock:
+                    self.pending.discard(ip)
+                continue
+            wait = self._paused_until - time.time()
+            if wait > 0:                       # circuit breaker is open
+                time.sleep(min(wait, 1.0))
+                self.q.put(ip)
+                continue
+            code, name, provider, errors = self._try_providers(ip)
+            with self.lock:
+                self.pending.discard(ip)
+                if code:
+                    self.results[ip] = (code, name, provider)
+                    self.failures.pop(ip, None)
+                    self.last_provider = provider
+                    self.last_error = ""
+                    self._consecutive_total_failures = 0
+                else:
+                    f = self.failures.setdefault(ip, [0, 0.0, ""])
+                    f[0] += 1
+                    f[1] = time.time()
+                    f[2] = "; ".join(errors)
+                    self.last_error = f[2]
+                    self._consecutive_total_failures += 1
+                    if self._consecutive_total_failures >= 4:
+                        # every provider failed for several IPs in a row:
+                        # the network (or a firewall) is the problem, so stop
+                        # hammering it and try again in a minute
+                        self._paused_until = time.time() + 60
+                        self._consecutive_total_failures = 0
+            if code:
+                try:
+                    self.on_result(ip, code, name, provider)
+                except Exception:
+                    pass
+
+
+class Tooltip:
+    """Minimal beginner-friendly tooltip: hover a widget, see a short
+    explanation after a brief delay. Follows the current theme."""
+    _active = None
+    theme = None          # set by the app so tooltips follow the theme
+
+    def set_text(self, text):
+        self.text = text
+
+    def __init__(self, widget, text, delay_ms=500):
+        self.widget = widget
+        self.text = text
+        self.delay_ms = delay_ms
+        self._after_id = None
+        self._tip = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._cancel()
+        try:
+            self._after_id = self.widget.after(self.delay_ms, self._show)
+        except tk.TclError:
+            pass
+
+    def _cancel(self):
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self):
+        if self._tip is not None:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+        except tk.TclError:
+            return
+        tip = tk.Toplevel(self.widget)
+        tip.wm_overrideredirect(True)
+        try:
+            tip.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        tip.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(tip, text=self.text, justify="left",
+                       background=(Tooltip.theme or THEME_LIGHT)[
+                           "tooltip_bg"],
+                       foreground=(Tooltip.theme or THEME_LIGHT)[
+                           "tooltip_fg"],
+                       relief="solid", borderwidth=1,
+                       font=("TkDefaultFont", 9), wraplength=320,
+                       padx=8, pady=5)
+        lbl.pack()
+        self._tip = tip
+
+    def _hide(self, _event=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
+
+
+
+# ============================================================================
+#  16.  Settings — one declarative schema drives the whole window
+#
+#  Every option the app has appears here exactly once, grouped by what a
+#  person is trying to do (not by which code uses it). Because the window is
+#  generated from this table, the self-tests can prove that no option is
+#  orphaned (shown but without a default) or phantom.
+# ============================================================================
+_SEV_CHIP = {"INFO": "INFO", "WARNING": "WARNING", "DANGER": "DANGER"}
+
+
+def _alert_control(kind, help_text):
+    title, sev = ALERT_TYPES[kind]
+    return {"key": f"alerts.{kind}", "type": "bool", "label": title,
+            "badge": sev, "help": help_text}
+
+
+SETTINGS_PAGES = [
+    {"id": "general", "icon": "⚙", "title": "General",
+     "blurb": "How MiniWireshark starts up and how much it explains.",
+     "sections": [
+         {"title": "Startup", "controls": [
+             {"key": "general.auto_start_capture", "type": "bool",
+              "label": "Start watching automatically when MiniWireshark opens",
+              "help": "Picks the best network card for you and begins right "
+                      "away. Turn off to choose a card and press Start "
+                      "yourself."},
+             {"key": "general.confirm_before_clear", "type": "bool",
+              "label": "Ask before clearing data",
+              "help": "Shows a confirmation before Clear wipes the devices, "
+                      "websites and alerts collected so far."},
+         ]},
+         {"title": "Explanations", "controls": [
+             {"key": "general.beginner_explanations", "type": "bool",
+              "label": "Include plain-English guidance",
+              "help": "Adds “what should I check?” advice to device "
+                      "cards, alerts and the Security check. Turn off for "
+                      "just the facts."},
+             {"key": "general.explanation_verbosity", "type": "choice",
+              "choices": ["Short", "Normal", "Detailed"],
+              "label": "Detail level",
+              "help": "Short: the essentials. Normal: what was seen and "
+                      "what it means. Detailed: also shows how confidence "
+                      "was scored, protocols, websites and step-by-step "
+                      "checks."},
+         ]},
+         {"title": "Language", "controls": [
+             {"key": "general.language", "type": "choice",
+              "choices": "@locales", "label": "Language",
+              "help": "Only English exists today. The app is built so more "
+                      "languages can be added without changing any code."},
+         ]},
+     ]},
+    {"id": "appearance", "icon": "\U0001F3A8", "title": "Appearance",
+     "blurb": "Make it comfortable to look at.",
+     "sections": [
+         {"title": "Look", "controls": [
+             {"key": "appearance.theme", "type": "choice",
+              "choices": ["Light", "Dark"], "label": "Theme",
+              "help": "Applies to every window, table, chart and dialog."},
+             {"key": "appearance.high_contrast", "type": "bool",
+              "label": "High contrast",
+              "help": "Stronger text and borders for easier reading. Works "
+                      "with both the Light and Dark themes."},
+             {"key": "appearance.text_size", "type": "choice",
+              "choices": ["Small", "Normal", "Large", "Extra large"],
+              "label": "Text size",
+              "help": "Scales text and table rows throughout the app."},
+         ]},
+         {"title": "Layout", "controls": [
+             {"key": "appearance.beginner_mode", "type": "bool",
+              "label": "Beginner view",
+              "help": "Hides the technical Connections, Remote hosts and "
+                      "Packets tabs and the advanced filter fields. Nothing "
+                      "is removed — switch this off any time to see "
+                      "everything."},
+         ]},
+     ]},
+    {"id": "capture", "icon": "\U0001F4E1", "title": "Capture",
+     "blurb": "What MiniWireshark listens to.",
+     "sections": [
+         {"title": "Scanning", "controls": [
+             {"key": "mode.active_scanning", "type": "bool",
+              "label": "Actively look for devices (Active Scanning)",
+              "help": "Sends a few harmless ARP / mDNS / SSDP probes on your "
+                      "own network about every 40 seconds to find quiet "
+                      "devices. Off is Quiet Mode: listen only, send "
+                      "nothing (health checks pause too). The banner at the "
+                      "top always shows which mode is on."},
+         ]},
+         {"title": "Network card", "controls": [
+             {"key": "capture.auto_select_interface", "type": "bool",
+              "label": "Choose the network card automatically",
+              "help": "Scores every adapter (default route, real address, "
+                      "not virtual/VPN/loopback) and explains its choice. "
+                      "Turn off to always use the card you pick."},
+             {"key": "capture.promiscuous", "type": "bool",
+              "label": "Listen to all traffic the card can see",
+              "help": "“Promiscuous mode.” On most Wi-Fi networks "
+                      "you'll still mainly see this computer's traffic plus "
+                      "broadcasts — that's how Wi-Fi works."},
+         ]},
+         {"title": "Memory", "controls": [
+             {"key": "capture.max_stored_events", "type": "int",
+              "min": 500, "max": 100000, "step": 500, "unit": "packets",
+              "label": "Packets kept in memory",
+              "help": "Older packets are dropped beyond this. Higher means "
+                      "a longer history for the Packets tab and .pcap "
+                      "export, at the cost of memory."},
+             {"key": "capture.follow_newest", "type": "bool",
+              "label": "Packets tab follows the newest packet",
+              "help": "Keeps the newest packet in view. You can also toggle "
+                      "this on the Packets tab."},
+         ]},
+     ]},
+    {"id": "devices", "icon": "\U0001F5A5", "title": "Devices & Identity",
+     "blurb": "When a device counts as gone, and how identities are "
+              "combined.",
+     "sections": [
+         {"title": "Device lifetime", "controls": [
+             {"key": "devices.idle_minutes", "type": "int", "min": 0,
+              "max": 120, "step": 1, "unit": "minutes",
+              "label": "Idle after",
+              "help": "No traffic for this long and a device shows as "
+                      "“Idle”. It's still counted as online."},
+             {"key": "devices.inactive_minutes", "type": "int", "min": 1,
+              "max": 1440, "step": 1, "unit": "minutes",
+              "label": "Offline after",
+              "help": "Silent this long and it's treated as offline (its "
+                      "presence history records when it left)."},
+             {"key": "devices.expire_minutes", "type": "int", "min": 5,
+              "max": 100000, "step": 5, "unit": "minutes",
+              "label": "Expire after",
+              "help": "Gone this long and it moves into history. An old "
+                      "ARP entry is never treated as proof a device is "
+                      "still there."},
+         ]},
+         {"title": "What the Devices tab shows", "controls": [
+             {"key": "devices.show_inactive", "type": "bool",
+              "label": "Show offline devices",
+              "help": "Include devices that have gone quiet."},
+             {"key": "devices.show_expired", "type": "bool",
+              "label": "Show expired devices",
+              "help": "Include devices not seen for a long time."},
+         ]},
+         {"title": "Identity", "controls": [
+             {"key": "devices.auto_merge", "type": "bool",
+              "label": "Combine identities automatically (only when certain)",
+              "help": "Phones and laptops rotate their Wi-Fi address for "
+                      "privacy. Two entries are combined only when they "
+                      "announce the same distinctive name, at least one uses "
+                      "a private address, and they were never online at the "
+                      "same time. Never based on traffic similarity."},
+             {"key": "devices.suggest_merges", "type": "bool",
+              "label": "Suggest “Possibly the same device”",
+              "help": "When MiniWireshark isn't sure, it doesn't merge — "
+                      "it adds a suggestion to the Timeline and the device "
+                      "card so you can decide."},
+         ]},
+     ]},
+    {"id": "websites", "icon": "\U0001F30D", "title": "Websites & DNS",
+     "blurb": "How websites and name lookups are shown.",
+     "sections": [
+         {"title": "Websites", "controls": [
+             {"key": "websites.group_subdomains", "type": "bool",
+              "label": "Group sub-sites under their main domain",
+              "help": "Shows www.example.com and mail.example.com under "
+                      "example.com. Only a display choice — nothing is "
+                      "merged or lost."},
+             {"key": "websites.tracker_classification", "type": "bool",
+              "label": "Label advertising / analytics / tracking domains",
+              "help": "Downloads a public tracker list (Disconnect) to this "
+                      "computer and labels domains locally. Informational "
+                      "only: nothing is blocked, and being on the list "
+                      "doesn't mean a domain is malicious."},
+         ]},
+         {"title": "DNS", "controls": [
+             {"key": "dns.detect_encrypted_dns", "type": "bool",
+              "label": "Detect encrypted DNS (DoH / DoT)",
+              "help": "Notices when a device hides its website lookups "
+                      "behind encryption, and explains why some names can't "
+                      "be seen. Detection only — never decryption."},
+             {"key": "dns.slow_ms", "type": "int", "min": 100, "max": 10000,
+              "step": 50, "unit": "ms", "label": "Call DNS slow above",
+              "help": "The typical lookup time above which DNS is reported "
+                      "as slow on the Health tab and in alerts."},
+         ]},
+     ]},
+    {"id": "connections", "icon": "\U0001F517", "title": "Connections",
+     "blurb": "The higher-level view of who talks to whom.",
+     "sections": [
+         {"title": "Memory", "controls": [
+             {"key": "connections.max_active", "type": "int", "min": 200,
+              "max": 50000, "step": 100, "unit": "connections",
+              "label": "Open connections tracked at once",
+              "help": "When more than this are open, the least recently "
+                      "used are closed into the archive."},
+             {"key": "connections.archive_size", "type": "int", "min": 100,
+              "max": 50000, "step": 100, "unit": "connections",
+              "label": "Finished connections remembered",
+              "help": "How many ended connections stay in the Connections "
+                      "tab and session files."},
+         ]},
+         {"title": "Display", "controls": [
+             {"key": "connections.hide_short_beginner", "type": "bool",
+              "label": "Hide tiny one-off connections in Beginner view",
+              "help": "Hides connections under one second with fewer than 3 "
+                      "packets, which are mostly background noise."},
+         ]},
+     ]},
+    {"id": "health", "icon": "\U0001FA7A", "title": "Network Health",
+     "blurb": "Checks that your router, DNS and Internet are working.",
+     "sections": [
+         {"title": "Active checks", "controls": [
+             {"key": "health.active_checks", "type": "bool",
+              "label": "Run small, periodic health checks",
+              "help": "A TCP connection attempt to your router, one to an "
+                      "Internet address, and one DNS lookup — a few "
+                      "hundred bytes each time. Never run in Quiet Mode or "
+                      "while viewing offline/saved/demo data."},
+             {"key": "health.interval_seconds", "type": "int", "min": 10,
+              "max": 3600, "step": 5, "unit": "seconds",
+              "label": "Check every",
+              "requires": "health.active_checks",
+              "help": "How often the checks run."},
+             {"key": "health.internet_target", "type": "text", "width": 22,
+              "pattern": r"^[0-9a-fA-F:.]+:\d{1,5}$",
+              "pattern_msg": "Use address:port, e.g. 1.1.1.1:443",
+              "label": "Internet test address",
+              "requires": "health.active_checks",
+              "help": "An always-on public address and port used to test "
+                      "Internet reachability (only a connection attempt is "
+                      "made; no data is sent)."},
+         ]},
+     ]},
+    {"id": "alerts", "icon": "\U0001F514", "title": "Alerts",
+     "blurb": "Choose what gets flagged and how sensitive it is. Alerts "
+              "describe unusual behaviour — never a verdict that "
+              "something is hacked.",
+     "sections": [
+         {"title": "Devices", "controls": [
+             _alert_control("new_device",
+                            "A device you haven't seen before joins."),
+             _alert_control("unknown_device",
+                            "A device stays hard to identify after a while."),
+             _alert_control("chatty_device",
+                            "A device gets much busier than its own normal."),
+             _alert_control("reconnect_cycle",
+                            "A device keeps dropping off and coming back."),
+             _alert_control("new_service",
+                            "A known device starts advertising a new "
+                            "service."),
+             _alert_control("remote_access",
+                            "A device offers remote control (SSH, Remote "
+                            "Desktop, VNC…)."),
+         ]},
+         {"title": "Network integrity", "controls": [
+             _alert_control("duplicate_ip",
+                            "Two devices claim the same address."),
+             _alert_control("dhcp_anomaly",
+                            "More than one device hands out addresses."),
+             _alert_control("gateway_change",
+                            "Your router's hardware address changes."),
+             _alert_control("arp_spoof",
+                            "An address keeps flipping between two devices "
+                            "— the signature of ARP spoofing."),
+             _alert_control("broadcast_storm",
+                            "The network is flooded with broadcast "
+                            "traffic."),
+             _alert_control("scan_pattern",
+                            "A device tries many hosts/ports with few "
+                            "answers."),
+         ]},
+         {"title": "DNS", "controls": [
+             _alert_control("dns_server_change",
+                            "A device switches to a different DNS server."),
+             _alert_control("dns_failures", "Many lookups fail."),
+             _alert_control("dns_slow", "Lookups are slow."),
+             _alert_control("dns_multi",
+                            "Several different DNS servers are in use."),
+         ]},
+         {"title": "Traffic (compared with each device's own baseline)",
+          "controls": [
+              _alert_control("upload_spike", "A device uploads far more "
+                                             "than usual."),
+              _alert_control("download_spike", "A device downloads far "
+                                               "more than usual."),
+              _alert_control("many_destinations", "A device talks to far "
+                                                  "more places than usual."),
+              _alert_control("many_connections", "A device opens far more "
+                                                 "connections than usual."),
+              _alert_control("tcp_resets", "Many connections are being "
+                                           "reset."),
+              _alert_control("cleartext", "Unencrypted protocols such as "
+                                          "Telnet or FTP are used."),
+              _alert_control("new_country", "A device contacts a country "
+                                            "it hasn't before (needs "
+                                            "country lookup)."),
+          ]},
+         {"title": "Sensitivity", "controls": [
+             {"key": "alerts.chatty_multiplier", "type": "int", "min": 2,
+              "max": 50, "step": 1, "unit": "× its usual rate",
+              "label": "Busy-device threshold",
+              "help": "A device is “unusual” when this minute "
+                      "exceeds this multiple of its own recent average."},
+             {"key": "alerts.chatty_min_rate", "type": "int", "min": 1,
+              "max": 1000, "step": 1, "unit": "packets/min",
+              "label": "Ignore quiet devices below",
+              "help": "Devices averaging less than this are never flagged "
+                      "as chatty, so sleepy gadgets don't cause noise."},
+             {"key": "alerts.baseline_min_minutes", "type": "int", "min": 5,
+              "max": 1440, "step": 5, "unit": "active minutes",
+              "label": "Learn for at least",
+              "help": "Traffic-spike alerts only start after a device has "
+                      "been observed this long, so its normal is known."},
+             {"key": "alerts.unknown_min_packets", "type": "int", "min": 1,
+              "max": 500, "step": 1, "unit": "packets",
+              "label": "Wait before flagging unknown devices",
+              "help": "How many packets a device must send while still "
+                      "poorly identified before it's flagged."},
+             {"key": "alerts.reconnect_count", "type": "int", "min": 2,
+              "max": 50, "step": 1, "unit": "times",
+              "label": "Reconnects that count as cycling",
+              "help": "Number of come-backs within the window below."},
+             {"key": "alerts.reconnect_window_minutes", "type": "int",
+              "min": 5, "max": 240, "step": 5, "unit": "minutes",
+              "label": "Reconnect window",
+              "help": "Time span used for counting reconnects."},
+             {"key": "alerts.arp_flip_threshold", "type": "int", "min": 2,
+              "max": 20, "step": 1, "unit": "flips in a minute",
+              "label": "ARP flip-flop threshold",
+              "help": "How many times an address must swap between devices "
+                      "within a minute before it's called possible ARP "
+                      "spoofing. One change is normal."},
+             {"key": "alerts.reset_threshold", "type": "int", "min": 5,
+              "max": 1000, "step": 5, "unit": "resets / 10 min",
+              "label": "Connection-reset threshold",
+              "help": "Resets per device in 10 minutes before it's "
+                      "flagged."},
+             {"key": "alerts.broadcast_pps_threshold", "type": "int",
+              "min": 50, "max": 100000, "step": 50, "unit": "packets/sec",
+              "label": "Broadcast flood threshold",
+              "help": "Broadcast/multicast packets per second (10-second "
+                      "average) that count as a flood."},
+             {"key": "alerts.scan_ports_threshold", "type": "int", "min": 10,
+              "max": 5000, "step": 10, "unit": "ports/min",
+              "label": "Scanning: ports on one host",
+              "help": "Unanswered attempts to this many different ports on "
+                      "one host within a minute looks like a port scan."},
+             {"key": "alerts.scan_hosts_threshold", "type": "int",
+              "min": 10, "max": 5000, "step": 10, "unit": "hosts/min",
+              "label": "Scanning: hosts on one port",
+              "help": "Unanswered attempts to this many different hosts on "
+                      "one port within a minute looks like a sweep."},
+             {"key": "alerts.flag_http", "type": "bool",
+              "label": "Also flag unencrypted web (http://) uploads",
+              "help": "Off by default because plain web is still common on "
+                      "local gadgets."},
+         ]},
+         {"title": "Where alerts appear", "controls": [
+             {"key": "notifications.feed_alerts", "type": "bool",
+              "label": "Also show alerts in the live feed",
+              "help": "Alerts always appear in the Alerts and Timeline tabs."},
+             {"key": "notifications.danger_only", "type": "bool",
+              "label": "In the feed, only show DANGER alerts",
+              "requires": "notifications.feed_alerts",
+              "help": "Keeps the feed calm; warnings stay in the Alerts "
+                      "tab."},
+             {"type": "action", "actions": [
+                 ("Un-mute all alerts", "unmute_alerts")]},
+         ]},
+     ]},
+    {"id": "privacy", "icon": "\U0001F512", "title": "Privacy & Lookups",
+     "blurb": "Every feature that contacts an outside service is listed "
+              "here, with exactly what it sends. Nothing is uploaded "
+              "silently and there is no telemetry.",
+     "sections": [
+         {"title": "Reference data (no personal data sent)", "controls": [
+             {"key": "privacy.auto_download_reference", "type": "bool",
+              "label": "Download public reference lists",
+              "help": "Fetches the hardware-vendor list (wireshark.org) and "
+                      "the Public Suffix List (publicsuffix.org) about once a "
+                      "month. These are ordinary file downloads: nothing "
+                      "about your network is sent. Built-in lists are used "
+                      "when this is off or offline."},
+             {"type": "info", "text_fn": "data_status_text"},
+             {"type": "action", "actions": [
+                 ("Refresh now", "refresh_data")]},
+         ]},
+         {"title": "Country & provider lookup", "controls": [
+             {"key": "privacy.local_asn_db", "type": "bool",
+              "label": "Offline country/provider database (recommended)",
+              "help": "Downloads a public ~7 MB database (iptoasn.com) once, "
+                      "then looks up each Internet host's country and "
+                      "network provider ON THIS COMPUTER. Nothing is sent "
+                      "per lookup. IPv4 only."},
+             {"key": "privacy.geoip_enabled", "type": "bool",
+              "label": "Online country lookup (fallback)",
+              "help": "Sends each remote (Internet) IP address — never "
+                      "your own devices' addresses, MAC addresses, packet "
+                      "contents or website names — to a public "
+                      "geolocation service (ipwho.is, geojs.io, ipapi.co, "
+                      "ip-api.com) to find its country."},
+             {"type": "geo_status"},
+             {"type": "action", "actions": [
+                 ("Test lookup", "geoip_test"),
+                 ("Retry failed", "geoip_retry")]},
+         ]},
+         {"title": "What MiniWireshark keeps", "controls": [
+             {"type": "info", "text":
+              "Captured network information is processed on this computer "
+              "and stays here unless you export it. Raw packets are never "
+              "written to disk unless you export them or enable it under "
+              "History. Settings live in a small file next to the program; "
+              "names you give devices are kept in the data folder."},
+         ]},
+     ]},
+    {"id": "history", "icon": "\U0001F4DA", "title": "History",
+     "blurb": "Optional long-term memory, stored only on this computer.",
+     "sections": [
+         {"title": "Local history", "controls": [
+             {"key": "history.enabled", "type": "bool",
+              "label": "Remember devices and summaries between sessions",
+              "help": "Saves compact summaries (devices, presence, daily "
+                      "traffic totals, alerts, domains, learned baselines) "
+                      "in a local database. No packet contents."},
+             {"key": "history.retention", "type": "choice",
+              "choices": ["Session only", "7 days", "30 days", "90 days",
+                          "Custom"],
+              "label": "Keep history for", "requires": "history.enabled",
+              "help": "Older summaries are deleted automatically. "
+                      "“Session only” keeps nothing after you "
+                      "close MiniWireshark."},
+             {"key": "history.custom_days", "type": "int", "min": 1,
+              "max": 3650, "step": 1, "unit": "days",
+              "label": "Custom retention", "requires": "history.enabled",
+              "help": "Used when “Keep history for” is Custom."},
+             {"key": "history.save_raw_packets", "type": "bool",
+              "label": "Also save raw packets when closing (off by default)",
+              "help": "Writes the packets still in memory to a .pcap file in "
+                      "the data folder when you close MiniWireshark. Raw "
+                      "packets can contain private information."},
+             {"type": "info", "text_fn": "history_size_text"},
+             {"type": "action", "actions": [
+                 ("Clear history", "clear_history"),
+                 ("Reset learned baselines", "reset_baseline"),
+                 ("Open data folder", "open_data_folder")]},
+         ]},
+     ]},
+    {"id": "performance", "icon": "⚡", "title": "Performance",
+     "blurb": "Keep MiniWireshark light on busy networks or slow computers.",
+     "sections": [
+         {"title": "Refresh speed", "controls": [
+             {"key": "performance.mode", "type": "choice",
+              "choices": ["Automatic", "Normal", "Low CPU"],
+              "label": "Performance mode",
+              "help": "Automatic slows screen refreshes when traffic is "
+                      "heavy or the window lags. Low CPU always refreshes "
+                      "about 2.5× less often. Neither changes what is "
+                      "captured or any alert threshold."},
+         ]},
+     ]},
+    {"id": "shortcuts", "icon": "⌨", "title": "Keyboard Shortcuts",
+     "blurb": "Click Change, then press the new key combination. "
+              "Ctrl+Tab / Ctrl+Shift+Tab also switch tabs.",
+     "sections": [
+         {"title": "Actions", "controls": [
+             {"key": "shortcuts.start", "type": "shortcut",
+              "label": "Start watching"},
+             {"key": "shortcuts.stop", "type": "shortcut", "label": "Stop"},
+             {"key": "shortcuts.clear", "type": "shortcut",
+              "label": "Clear"},
+             {"key": "shortcuts.export", "type": "shortcut",
+              "label": "Open the export menu"},
+             {"key": "shortcuts.find", "type": "shortcut",
+              "label": "Jump to search"},
+         ]},
+     ]},
+    {"id": "data", "icon": "\U0001F4BE", "title": "Data & Export",
+     "blurb": "Where files go, and where your settings live.",
+     "sections": [
+         {"title": "Exports", "controls": [
+             {"key": "export.default_dir", "type": "path",
+              "label": "Default folder for exports and sessions",
+              "help": "File dialogs open here. Leave empty to use the "
+                      "system default."},
+         ]},
+         {"title": "Files", "controls": [
+             {"type": "info", "text_fn": "config_path_text"},
+             {"type": "action", "actions": [
+                 ("Open settings folder", "open_config_folder"),
+                 ("Open data folder", "open_data_folder")]},
+         ]},
+     ]},
+    {"id": "updates", "icon": "⬆", "title": "Updates & Dependencies",
+     "blurb": "Keep MiniWireshark and its helpers up to date — only "
+              "when you ask.",
+     "sections": [
+         {"title": "Update checks", "controls": [
+             {"key": "updates.repo", "type": "text", "width": 26,
+              "pattern": r"^[\w.-]+/[\w.-]+$",
+              "pattern_msg": "Use the form owner/name, e.g. yourname/"
+                             "miniwireshark",
+              "label": "GitHub repository",
+              "help": "Where new releases are published, as owner/name. "
+                      "Leave empty and MiniWireshark never checks."},
+             {"key": "updates.check_automatically", "type": "bool",
+              "label": "Check when MiniWireshark opens",
+              "requires": "updates.repo",
+              "help": "Asks GitHub for the latest release number only."},
+             {"key": "updates.allow_self_update", "type": "bool",
+              "label": "Offer to install updates (keeps a backup)",
+              "requires": "updates.repo",
+              "help": "Downloads the new .py from the release, checks it, "
+                      "saves a backup of this version, then replaces it "
+                      "atomically. If the new version fails to start, the "
+                      "backup is restored automatically."},
+             {"type": "action", "actions": [
+                 ("Check for updates now", "check_updates")]},
+         ]},
+         {"title": "Helpers", "controls": [
+             {"type": "info", "text_fn": "deps_status_text"},
+             {"type": "action", "actions": [
+                 ("Repair dependencies", "repair_deps")]},
+         ]},
+     ]},
+    {"id": "diagnostics", "icon": "\U0001F6E0", "title": "Diagnostics",
+     "blurb": "Information for troubleshooting — no terminal needed.",
+     "sections": [
+         {"title": "Troubleshooting", "controls": [
+             {"key": "diagnostics.verbose_logging", "type": "bool",
+              "label": "Detailed logging",
+              "help": "Writes more detail to the log file. Packet contents "
+                      "are never logged."},
+             {"type": "info", "text_fn": "diag_summary_text"},
+             {"type": "action", "actions": [
+                 ("Open diagnostics", "open_diagnostics"),
+                 ("Open logs", "open_logs"),
+                 ("Run self-test", "run_self_test")]},
+         ]},
+     ]},
+]
+
+
+def settings_schema_keys():
+    """Every config key the settings window exposes."""
+    out = []
+    for page in SETTINGS_PAGES:
+        for sec in page["sections"]:
+            for c in sec["controls"]:
+                if c.get("key"):
+                    out.append(c["key"])
+    return out
+
+
+def settings_conflicts(values):
+    """Non-blocking explanations when two settings pull against each
+    other. `values` is {dotted_key: value}."""
+    out = []
+    if values.get("health.active_checks") and \
+            not values.get("mode.active_scanning"):
+        out.append("Health checks are on, but Quiet Mode is selected, so "
+                   "they will stay paused (Quiet Mode never sends anything).")
+    if values.get("privacy.geoip_enabled") and \
+            values.get("privacy.local_asn_db"):
+        out.append("Both country lookups are on: the offline database is "
+                   "used first; the online service only for addresses it "
+                   "doesn't cover.")
+    if values.get("notifications.danger_only") and \
+            not values.get("notifications.feed_alerts"):
+        out.append("“Only DANGER in the feed” has no effect while "
+                   "alerts are not shown in the feed.")
+    if values.get("history.save_raw_packets") and \
+            not values.get("history.enabled"):
+        out.append("Saving raw packets works even with history off; it "
+                   "writes a .pcap to the data folder on exit.")
+    if values.get("history.enabled") and \
+            values.get("history.retention") == "Session only":
+        out.append("History is on but set to “Session only”, so "
+                   "nothing will be kept after you close MiniWireshark.")
+    return out
+
+
+def _pretty_seq(seq):
+    names = {"Control": "Ctrl", "period": ".", "comma": ",",
+             "Return": "Enter", "space": "Space", "slash": "/",
+             "minus": "-", "plus": "+", "Escape": "Esc", "Delete": "Del",
+             "BackSpace": "Backspace", "Prior": "PageUp", "Next": "PageDown"}
+    parts = (seq or "").strip("<>").split("-")
+    return "+".join(names.get(p, p.upper() if len(p) == 1 else p)
+                    for p in parts if p)
+
+
+def _open_path(path):
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(path)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+        return True
+    except Exception:
+        return False
+
+
+
+class SettingsWindow:
+    """Two-pane settings: categories on the left, one page of grouped
+    options on the right, with search, per-page reset, inline validation
+    and Apply / OK / Cancel. Built entirely from SETTINGS_PAGES."""
+
+    F_BASE = ("TkDefaultFont", 10)
+    F_HELP = ("TkDefaultFont", 9)
+    F_SECTION = ("TkDefaultFont", 11, "bold")
+    F_TITLE = ("TkDefaultFont", 15, "bold")
+
+    def __init__(self, app, page="general"):
+        self.app = app
+        self.cfg = app.config
+        self.defaults = _default_config()
+        self.vars = {}
+        self.controls = {}
+        for pg in SETTINGS_PAGES:
+            for sec in pg["sections"]:
+                for c in sec["controls"]:
+                    if c.get("key"):
+                        self.controls[c["key"]] = c
+        self.errors = {}
+        self._wrap = []
+        self._deps = []
+        self._nav = {}
+        self._shortcut_prev = {}
+        self.page_id = page if any(p["id"] == page for p in SETTINGS_PAGES) \
+            else "general"
+        self.searching = False
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Settings")
+        sw_, sh_ = app.root.winfo_screenwidth(), app.root.winfo_screenheight()
+        w_, h_ = min(940, sw_ - 80), min(720, sh_ - 100)
+        x_ = max(0, app.root.winfo_rootx() + (app.root.winfo_width() - w_) // 2)
+        y_ = max(0, app.root.winfo_rooty() + 40)
+        self.win.geometry(f"{w_}x{h_}+{x_}+{y_}")
+        self.win.minsize(min(760, w_), min(520, h_))
+        self.win.transient(app.root)
+        self._create_vars()
+        self.baseline = self._snapshot()
+        self._build_chrome()
+        self.show_page(self.page_id)
+        self.win.bind("<Escape>", lambda e: self.cancel())
+        self.win.protocol("WM_DELETE_WINDOW", self.cancel)
+        self._tick()
+
+    # ---------------------------------------------------------------- state
+    def alive(self):
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def sync_key(self, key, value):
+        """Another part of the app changed `key`: show it here without
+        marking the window as having unsaved changes."""
+        var = self.vars.get(key)
+        if var is None:
+            return
+        var.set(value if isinstance(var, tk.BooleanVar) else str(value))
+        # this key now matches what's saved; any OTHER pending edits stay
+        self.baseline[key] = str(var.get())
+        self._refresh_footer()
+
+    @property
+    def t(self):
+        return self.app.theme
+
+    def _default_for(self, key):
+        section, _, name = key.partition(".")
+        return self.defaults.get(section, {}).get(name)
+
+    def _create_vars(self):
+        for key, c in self.controls.items():
+            cur = self.cfg.get(key, self._default_for(key))
+            if c["type"] == "bool":
+                self.vars[key] = tk.BooleanVar(value=bool(cur))
+            else:
+                self.vars[key] = tk.StringVar(value="" if cur is None
+                                              else str(cur))
+            if c["type"] == "shortcut":
+                self._shortcut_prev[key] = self.vars[key].get()
+            self.vars[key].trace_add(
+                "write", lambda *a, k=key: self._on_change(k))
+
+    def _snapshot(self):
+        return {k: str(v.get()) for k, v in self.vars.items()}
+
+    def _value_of(self, key):
+        c, v = self.controls[key], self.vars[key]
+        if c["type"] == "bool":
+            return bool(v.get())
+        raw = str(v.get()).strip()
+        if c["type"] == "int":
+            try:
+                n = int(float(raw))
+            except ValueError:
+                n = int(self._default_for(key) or 0)
+            return max(c["min"], min(c["max"], n))
+        return raw
+
+    def _validate(self, key):
+        c, v = self.controls[key], self.vars[key]
+        if c["type"] == "int":
+            raw = str(v.get()).strip()
+            try:
+                n = float(raw)
+            except ValueError:
+                return "Enter a whole number."
+            if n != int(n):
+                return "Enter a whole number."
+            if not c["min"] <= n <= c["max"]:
+                return f"Choose a value from {c['min']} to {c['max']}."
+        elif c["type"] == "text" and c.get("pattern"):
+            raw = str(v.get()).strip()
+            if raw and not re.match(c["pattern"], raw):
+                return c.get("pattern_msg", "That doesn't look right.")
+        elif c["type"] == "path":
+            raw = str(v.get()).strip()
+            if raw and not os.path.isdir(raw):
+                return "That folder doesn't exist."
+        elif c["type"] == "shortcut":
+            seq = str(v.get()).strip()
+            for other, ov in self.vars.items():
+                if other != key and self.controls[other]["type"] == "shortcut" \
+                        and str(ov.get()).strip() == seq and seq:
+                    return (f"Already used by "
+                            f"\u201c{self.controls[other]['label']}\u201d.")
+        return ""
+
+    def _validate_all(self):
+        self.errors = {}
+        for key in self.controls:
+            msg = self._validate(key)
+            if msg:
+                self.errors[key] = msg
+        msg = self._cross_check()
+        if msg:
+            self.errors["devices.inactive_minutes"] = msg
+        return self.errors
+
+    def _cross_check(self):
+        try:
+            idle = int(float(self.vars["devices.idle_minutes"].get()))
+            off = int(float(self.vars["devices.inactive_minutes"].get()))
+            exp = int(float(self.vars["devices.expire_minutes"].get()))
+        except (ValueError, KeyError):
+            return ""
+        if not idle < off < exp:
+            return ("\u201cIdle\u201d must be shorter than \u201cOffline\u201d, "
+                    "which must be shorter than \u201cExpire\u201d.")
+        return ""
+
+    def _current_values(self):
+        return {k: self._value_of(k) for k in self.controls}
+
+    def _update_conflicts(self):
+        lbl = getattr(self, "_conflict_lbl", None)
+        if lbl is None:
+            return
+        try:
+            msgs = settings_conflicts(self._current_values())
+            if msgs:
+                lbl.configure(text="\u2139  " + "\n\u2139  ".join(msgs))
+                first = getattr(self, "_first_section", None)
+                if first is not None and first.winfo_exists():
+                    lbl.pack(fill="x", pady=(12, 0), before=first)
+                else:
+                    lbl.pack(fill="x", pady=(12, 0))
+            else:
+                lbl.pack_forget()
+        except tk.TclError:
+            pass
+
+    def dirty(self):
+        return self._snapshot() != self.baseline
+
+    def _on_change(self, key):
+        if key is not None and key in self.controls:
+            msg = self._validate(key)
+            if msg:
+                self.errors[key] = msg
+            else:
+                self.errors.pop(key, None)
+            self._show_error(key)
+            if self.controls[key]["type"] == "shortcut" and not msg:
+                self._shortcut_prev[key] = self.vars[key].get()
+        self._refresh_deps()
+        self._refresh_footer()
+        self._update_conflicts()
+
+    # --------------------------------------------------------------- chrome
+    def _build_chrome(self):
+        t = self.t
+        for w in self.win.winfo_children():
+            w.destroy()
+        self._wrap, self._deps, self._nav = [], [], {}
+        self.win.configure(bg=t["window_bg"])
+
+        # ---- sidebar
+        side = tk.Frame(self.win, bg=t["side_bg"], width=220)
+        side.pack(side="left", fill="y")
+        side.pack_propagate(False)
+        tk.Label(side, text="Settings", bg=t["side_bg"], fg=t["text_fg"],
+                 font=self.F_TITLE, anchor="w").pack(fill="x", padx=16,
+                                                     pady=(16, 8))
+        self.search_var = tk.StringVar()
+        se = ttk.Entry(side, textvariable=self.search_var)
+        se.pack(fill="x", padx=14, pady=(0, 10))
+        self.search_entry = se
+        self.search_var.trace_add("write", lambda *a: self._on_search())
+        self._placeholder(se, self.search_var, "\U0001F50D Search settings")
+        for pg in SETTINGS_PAGES:
+            self._add_nav_row(side, pg)
+        tk.Frame(side, bg=t["side_bg"]).pack(fill="both", expand=True)
+        ttk.Button(side, text="Reset all settings\u2026",
+                   command=self.reset_all).pack(fill="x", padx=14,
+                                                pady=(0, 6))
+        tk.Label(side, text=f"MiniWireshark {SCRIPT_VERSION}",
+                 bg=t["side_bg"], fg=t["muted_fg"], font=self.F_HELP
+                 ).pack(pady=(0, 12))
+
+        # ---- right side: header / scrolling body / footer
+        right = tk.Frame(self.win, bg=t["tab_bg"])
+        right.pack(side="left", fill="both", expand=True)
+        head = tk.Frame(right, bg=t["tab_bg"], padx=24, pady=16)
+        head.pack(fill="x")
+        self.title_lbl = tk.Label(head, bg=t["tab_bg"], fg=t["text_fg"],
+                                  font=self.F_TITLE, anchor="w")
+        self.title_lbl.pack(fill="x")
+        self.blurb_lbl = tk.Label(head, bg=t["tab_bg"], fg=t["muted_fg"],
+                                  font=self.F_BASE, anchor="w",
+                                  justify="left")
+        self.blurb_lbl.pack(fill="x", pady=(2, 0))
+        self._wrap.append((self.blurb_lbl, 60))
+        tk.Frame(right, bg=t["border"], height=1).pack(fill="x")
+
+        foot = tk.Frame(right, bg=t["window_bg"], padx=16, pady=10)
+        foot.pack(side="bottom", fill="x")
+        tk.Frame(right, bg=t["border"], height=1).pack(side="bottom",
+                                                       fill="x")
+        self.dirty_lbl = tk.Label(foot, bg=t["window_bg"], fg=t["muted_fg"],
+                                  font=self.F_HELP, anchor="w")
+        self.dirty_lbl.pack(side="left")
+        self.ok_btn = ttk.Button(foot, text="OK", width=9,
+                                 style="Accent.TButton", command=self.ok)
+        self.ok_btn.pack(side="right")
+        self.apply_btn = ttk.Button(foot, text="Apply", width=9,
+                                    command=self.apply)
+        self.apply_btn.pack(side="right", padx=6)
+        ttk.Button(foot, text="Cancel", width=9,
+                   command=self.cancel).pack(side="right")
+        self.reset_btn = ttk.Button(foot, text="Reset this page",
+                                    command=self.reset_page)
+        self.reset_btn.pack(side="right", padx=(0, 16))
+
+        body = tk.Frame(right, bg=t["tab_bg"])
+        body.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(body, bg=t["tab_bg"], highlightthickness=0)
+        vs = ttk.Scrollbar(body, orient="vertical",
+                           command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vs.set)
+        vs.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.content = tk.Frame(self.canvas, bg=t["tab_bg"], padx=24,
+                                pady=6)
+        self._cwin = self.canvas.create_window((0, 0), window=self.content,
+                                               anchor="nw")
+        self.content.bind("<Configure>", lambda e: self.canvas.configure(
+            scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+        for w in (self.canvas, self.content):
+            w.bind("<Enter>", self._bind_wheel)
+            w.bind("<Leave>", self._unbind_wheel)
+        self.win.bind("<Destroy>", self._on_destroy, add="+")
+        self._refresh_footer()
+
+    def _add_nav_row(self, parent, page):
+        t = self.t
+        row = tk.Frame(parent, bg=t["side_bg"], cursor="hand2")
+        row.pack(fill="x")
+        bar = tk.Frame(row, bg=t["side_bg"], width=4)
+        bar.pack(side="left", fill="y")
+        icon = tk.Label(row, text=page["icon"], bg=t["side_bg"],
+                        fg=t["text_fg"], font=self.F_BASE, width=3, pady=5)
+        icon.pack(side="left")
+        lbl = tk.Label(row, text=page["title"], bg=t["side_bg"],
+                       fg=t["text_fg"], font=self.F_BASE, anchor="w",
+                       pady=5)
+        lbl.pack(side="left", fill="x", expand=True)
+        for w in (row, lbl, bar, icon):
+            w.bind("<Button-1>", lambda e, p=page["id"]: self._go(p))
+        self._nav[page["id"]] = (row, bar, lbl, icon)
+
+    def _placeholder(self, entry, var, text):
+        """Grey hint text inside an empty entry that vanishes on focus."""
+        state = {"on": False}
+
+        def show(_e=None):
+            if not var.get():
+                state["on"] = True
+                var.set(text)
+                entry.configure(foreground=self.t["muted_fg"])
+
+        def hide(_e=None):
+            if state["on"]:
+                state["on"] = False
+                var.set("")
+                entry.configure(foreground=self.t["text_fg"])
+        entry.bind("<FocusIn>", hide)
+        entry.bind("<FocusOut>", show)
+        self._search_placeholder = (state, text)
+        show()
+
+    def _go(self, page_id):
+        state, _t = self._search_placeholder
+        if self.search_var.get() and not state["on"]:
+            self.search_var.set("")
+        self.show_page(page_id)
+
+    def _mark_nav(self, page_id):
+        t = self.t
+        for pid, (row, bar, lbl, icon) in self._nav.items():
+            sel = (pid == page_id)
+            bg = t["side_sel"] if sel else t["side_bg"]
+            for w in (row, lbl, icon):
+                w.configure(bg=bg)
+            bar.configure(bg=t["accent"] if sel else bg)
+            lbl.configure(font=(self.F_BASE[0], self.F_BASE[1], "bold")
+                          if sel else self.F_BASE)
+
+    # -------------------------------------------------------------- scrolling
+    def _on_canvas_resize(self, e):
+        self.canvas.itemconfigure(self._cwin, width=e.width)
+        for lbl, reserve in self._wrap:
+            try:
+                lbl.configure(wraplength=max(240, e.width - reserve - 48))
+            except tk.TclError:
+                pass
+
+    def _bind_wheel(self, _e=None):
+        self.win.bind_all("<MouseWheel>", self._wheel)
+        self.win.bind_all("<Button-4>", self._wheel)
+        self.win.bind_all("<Button-5>", self._wheel)
+
+    def _unbind_wheel(self, _e=None):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                self.win.unbind_all(seq)
+            except tk.TclError:
+                pass
+
+    def _on_destroy(self, e):
+        if e.widget is self.win:
+            self._unbind_wheel()
+
+    def _wheel(self, e):
+        if not self.alive():
+            return
+        if getattr(e, "num", None) == 4:
+            step = -3
+        elif getattr(e, "num", None) == 5:
+            step = 3
+        else:
+            step = -1 * (1 if e.delta > 0 else -1) * 3 if abs(e.delta) < 120 \
+                else -int(e.delta / 120) * 3
+        self.canvas.yview_scroll(step, "units")
+
+    # ---------------------------------------------------------------- pages
+    def _clear_content(self):
+        for w in self.content.winfo_children():
+            w.destroy()
+        self._wrap = [(l, r) for l, r in self._wrap if l is self.blurb_lbl]
+        self._deps = []
+        self._err_labels = {}
+
+    def show_page(self, page_id):
+        self.page_id = page_id
+        self.searching = False
+        page = next(p for p in SETTINGS_PAGES if p["id"] == page_id)
+        self._clear_content()
+        self.title_lbl.configure(text=f"{page['icon']}  {page['title']}")
+        self.blurb_lbl.configure(text=page.get("blurb", ""))
+        self._mark_nav(page_id)
+        self._conflict_lbl = tk.Label(
+            self.content, text="", bg=self.t["warn_bg"], fg=self.t["warn_fg"],
+            font=self.F_HELP, justify="left", anchor="w", padx=10, pady=8)
+        self._wrap.append((self._conflict_lbl, 60))
+        self._first_section = None
+        for sec in page["sections"]:
+            self._render_section(sec["title"], sec["controls"])
+        self._finish_render()
+        self._update_conflicts()
+
+    def _finish_render(self):
+        self.canvas.yview_moveto(0)
+        self._refresh_deps()
+        self._refresh_footer()
+        self.win.update_idletasks()
+        self._on_canvas_resize(type("E", (), {
+            "width": max(self.canvas.winfo_width(), 400)})())
+        scale = self.app.TEXT_SIZES.get(
+            self.cfg.get("appearance.text_size", "Normal"), 1.0)
+        if scale != 1.0:
+            self.app._scale_explicit_fonts(self.win, scale)
+
+    def _on_search(self):
+        state, text = getattr(self, "_search_placeholder", ({"on": False}, ""))
+        if state["on"]:
+            return
+        q = self.search_var.get().strip().lower()
+        if len(q) < 2:
+            if self.searching:
+                self.show_page(self.page_id)
+            return
+        self.searching = True
+        self._clear_content()
+        self.title_lbl.configure(text="\U0001F50D  Search results")
+        self.blurb_lbl.configure(text=f"Settings matching \u201c{q}\u201d")
+        self._mark_nav(None)
+        found = 0
+        for page in SETTINGS_PAGES:
+            for sec in page["sections"]:
+                hits = [c for c in sec["controls"] if c.get("key") and
+                        q in " ".join([c.get("label", ""), c.get("help", ""),
+                                       sec["title"], page["title"]]).lower()]
+                if hits:
+                    found += len(hits)
+                    self._render_section(
+                        f"{page['title']}  \u203a  {sec['title']}", hits)
+        if not found:
+            tk.Label(self.content, text="No settings match that search.",
+                     bg=self.t["tab_bg"], fg=self.t["muted_fg"],
+                     font=self.F_BASE).pack(anchor="w", pady=20)
+        self._finish_render()
+
+    # ------------------------------------------------------------- rendering
+    def _render_section(self, title, controls):
+        t = self.t
+        hdr = tk.Frame(self.content, bg=t["tab_bg"])
+        hdr.pack(fill="x", pady=(16, 4))
+        if getattr(self, "_first_section", None) is None:
+            self._first_section = hdr
+        tk.Label(hdr, text=title, bg=t["tab_bg"], fg=t["text_fg"],
+                 font=self.F_SECTION, anchor="w").pack(fill="x")
+        tk.Frame(hdr, bg=t["border"], height=1).pack(fill="x", pady=(3, 0))
+        for c in controls:
+            self._render_control(c)
+
+    def _help(self, parent, text, indent=0, reserve=60):
+        lbl = tk.Label(parent, text=text, bg=self.t["tab_bg"],
+                       fg=self.t["muted_fg"], font=self.F_HELP,
+                       justify="left", anchor="w")
+        lbl.pack(fill="x", padx=(indent, 0))
+        self._wrap.append((lbl, reserve))
+        return lbl
+
+    def _render_control(self, c):
+        t, typ = self.t, c["type"]
+        row = tk.Frame(self.content, bg=t["tab_bg"], pady=7)
+        row.pack(fill="x")
+        key = c.get("key")
+        widgets = []
+
+        if typ == "bool":
+            top = tk.Frame(row, bg=t["tab_bg"])
+            top.pack(fill="x")
+            cb = ttk.Checkbutton(top, text=c["label"],
+                                 variable=self.vars[key])
+            cb.pack(side="left")
+            widgets.append(cb)
+            if c.get("badge"):
+                self._badge(top, c["badge"])
+            self._help(row, c.get("help", ""), indent=24, reserve=40)
+
+        elif typ in ("choice", "int", "text", "path", "shortcut"):
+            left = tk.Frame(row, bg=t["tab_bg"])
+            left.pack(side="left", fill="x", expand=True)
+            tk.Label(left, text=c["label"], bg=t["tab_bg"], fg=t["text_fg"],
+                     font=self.F_BASE, anchor="w").pack(fill="x")
+            if c.get("help"):
+                self._help(left, c["help"], reserve={
+                    "choice": 200, "int": 300, "text": 260, "path": 400,
+                    "shortcut": 340}.get(typ, 260))
+            right = tk.Frame(row, bg=t["tab_bg"])
+            right.pack(side="right", anchor="n", padx=(12, 0))
+            widgets += self._render_input(right, c)
+
+        elif typ == "info":
+            text = c.get("text") or getattr(self, c["text_fn"])()
+            self._help(row, text, reserve=40)
+
+        elif typ == "geo_status":
+            self.geo_var = tk.StringVar(value=self.app._geoip_status_text())
+            lbl = tk.Label(row, textvariable=self.geo_var, bg=t["card_bg"],
+                           fg=t["text_fg"], font=self.F_HELP, justify="left",
+                           anchor="w", padx=10, pady=8)
+            lbl.pack(fill="x")
+            self._wrap.append((lbl, 60))
+
+        elif typ == "action":
+            bar = tk.Frame(row, bg=t["tab_bg"])
+            bar.pack(fill="x")
+            for text, name in c["actions"]:
+                b = ttk.Button(bar, text=text, style="Settings.TButton",
+                               command=lambda n=name: self._act(n))
+                b.pack(side="left", padx=(0, 8))
+
+        if key:
+            err = tk.Label(row, text="", bg=t["tab_bg"], fg=t["danger_fg"],
+                           font=self.F_HELP, anchor="w", justify="left")
+            self._err_labels[key] = err
+            self._show_error(key)
+        if c.get("requires"):
+            self._deps.append((c["requires"], widgets))
+
+    def _badge(self, parent, sev):
+        t = self.t
+        fg, bg = {"INFO": (t["info_fg"], t["card_bg"]),
+                  "WARNING": (t["warn_fg"], t["warn_bg"]),
+                  "DANGER": (t["danger_fg"], t["danger_bg"])}[sev]
+        icon = self.app.SEVERITY_ICON.get(sev, "")
+        tk.Label(parent, text=f" {icon} {sev} ", bg=bg, fg=fg,
+                 font=(self.F_HELP[0], 8, "bold")).pack(side="left",
+                                                        padx=(10, 0))
+
+    def _render_input(self, parent, c):
+        key, typ, var = c["key"], c["type"], self.vars[c["key"]]
+        if typ == "choice":
+            vals = c["choices"]
+            if vals == "@locales":
+                vals = list(LOCALE_NAMES.values())
+            w = ttk.Combobox(parent, textvariable=var, values=vals,
+                             state="readonly", width=16)
+            w.pack(anchor="e")
+            return [w]
+        if typ == "int":
+            box = tk.Frame(parent, bg=self.t["tab_bg"])
+            box.pack(anchor="e")
+            w = ttk.Spinbox(box, from_=c["min"], to=c["max"],
+                            increment=c.get("step", 1), textvariable=var,
+                            width=8, justify="right")
+            w.pack(side="left")
+            tk.Label(box, text=c.get("unit", ""), bg=self.t["tab_bg"],
+                     fg=self.t["muted_fg"], font=self.F_HELP, anchor="w",
+                     width=16).pack(side="left", padx=(6, 0))
+            return [w]
+        if typ == "text":
+            w = ttk.Entry(parent, textvariable=var, width=c.get("width", 24))
+            w.pack(anchor="e")
+            return [w]
+        if typ == "path":
+            box = tk.Frame(parent, bg=self.t["tab_bg"])
+            box.pack(anchor="e")
+            w = ttk.Entry(box, textvariable=var, width=26)
+            w.pack(side="left")
+            b = ttk.Button(box, text="Browse\u2026", width=9,
+                           command=lambda: self._browse(var))
+            b.pack(side="left", padx=(6, 0))
+            return [w, b]
+        if typ == "shortcut":
+            box = tk.Frame(parent, bg=self.t["tab_bg"])
+            box.pack(anchor="e")
+            shown = tk.StringVar(value=_pretty_seq(var.get()))
+            var.trace_add("write", lambda *a: shown.set(
+                _pretty_seq(var.get())))
+            tk.Label(box, textvariable=shown, bg=self.t["card_bg"],
+                     fg=self.t["text_fg"], font=self.F_BASE, width=14,
+                     padx=6, pady=3).pack(side="left")
+            b1 = ttk.Button(box, text="Change", width=8,
+                            command=lambda: self._change_shortcut(key))
+            b1.pack(side="left", padx=(6, 0))
+            b2 = ttk.Button(box, text="Default", width=8,
+                            command=lambda: var.set(
+                                DEFAULT_SHORTCUTS.get(key.split(".")[1], "")))
+            b2.pack(side="left", padx=(4, 0))
+            return [b1, b2]
+        return []
+
+    # ------------------------------------------------------- dynamic pieces
+    def _show_error(self, key):
+        lbl = getattr(self, "_err_labels", {}).get(key)
+        if lbl is None:
+            return
+        try:
+            msg = self.errors.get(key, "")
+            if msg:
+                lbl.configure(text="\u26a0 " + msg)
+                lbl.pack(fill="x")
+            else:
+                lbl.pack_forget()
+        except tk.TclError:
+            pass
+
+    def _refresh_deps(self):
+        for req, widgets in self._deps:
+            v = self.vars.get(req)
+            on = bool(v.get()) if isinstance(v, tk.BooleanVar) else \
+                bool(str(v.get()).strip()) if v is not None else True
+            if isinstance(v, tk.StringVar) and req == "updates.repo":
+                on = on and not self.errors.get(req)
+            for w in widgets:
+                try:
+                    w.state(["!disabled"] if on else ["disabled"])
+                except tk.TclError:
+                    pass
+
+    def _refresh_footer(self):
+        try:
+            bad = bool(self.errors)
+            dirty = self.dirty()
+            if bad:
+                self.dirty_lbl.configure(
+                    text="\u26a0 Some settings need attention",
+                    fg=self.t["danger_fg"])
+            elif dirty:
+                self.dirty_lbl.configure(text="\u25cf Unsaved changes",
+                                         fg=self.t["warn_fg"])
+            else:
+                self.dirty_lbl.configure(text="All changes saved",
+                                         fg=self.t["muted_fg"])
+            state = ["!disabled"] if (dirty and not bad) else ["disabled"]
+            self.apply_btn.state(state)
+            self.reset_btn.state(["disabled"] if self.searching
+                                 else ["!disabled"])
+        except tk.TclError:
+            pass
+
+    def _tick(self):
+        if not self.alive():
+            return
+        try:
+            if hasattr(self, "geo_var"):
+                self.geo_var.set(self.app._geoip_status_text())
+        except tk.TclError:
+            pass
+        self.win.after(1000, self._tick)
+
+    # ------------------------------------------------------------- actions
+    def _browse(self, var):
+        d = filedialog.askdirectory(parent=self.win,
+                                    initialdir=var.get() or None)
+        if d:
+            var.set(d)
+
+    def _change_shortcut(self, key):
+        self.app._capture_shortcut(self.win, key.split(".")[1],
+                                   self.vars[key])
+
+    def config_path_text(self):
+        return (f"Settings are saved in:\n{self.cfg.path}\n\n"
+                f"Data folder (caches, logs, history, sessions):\n"
+                f"{PATHS.data}")
+
+    def data_status_text(self):
+        return self.app.data_status_text()
+
+    def history_size_text(self):
+        return self.app.history_status_text()
+
+    def deps_status_text(self):
+        return self.app.deps_status_text()
+
+    def diag_summary_text(self):
+        return self.app.diag_summary_text()
+
+    def _act(self, name):
+        if name == "open_config_folder":
+            folder = os.path.dirname(self.cfg.path)
+            if not _open_path(folder):
+                messagebox.showinfo("Settings folder", folder,
+                                    parent=self.win)
+        elif name == "check_updates":
+            self.app._check_for_updates(manual=True)
+        elif name == "geoip_test":
+            self.app._geoip_test(self.win)
+        elif name == "geoip_retry":
+            self.app._geoip_retry()
+        elif name == "refresh_data":
+            self.app.refresh_reference_data(force=True)
+        elif name == "repair_deps":
+            self.app.repair_dependencies(self.win)
+        elif name == "clear_history":
+            self.app.clear_history(self.win)
+        elif name == "reset_baseline":
+            self.app.reset_baselines(self.win)
+        elif name == "open_data_folder":
+            if not _open_path(PATHS.data):
+                messagebox.showinfo("Data folder", PATHS.data,
+                                    parent=self.win)
+        elif name == "open_logs":
+            if not _open_path(PATHS.logs):
+                messagebox.showinfo("Logs", PATHS.logs, parent=self.win)
+        elif name == "open_diagnostics":
+            self.app.open_diagnostics()
+        elif name == "run_self_test":
+            self.app.run_self_test_window()
+        elif name == "unmute_alerts":
+            self.cfg.set("alerts.muted_devices", [])
+            self.cfg.set("alerts.expected", [])
+            self.cfg.save()
+            self.app._set_banner("\U0001F514  All alert mutes were cleared.")
+
+    def reset_page(self):
+        if self.searching:
+            return
+        page = next(p for p in SETTINGS_PAGES if p["id"] == self.page_id)
+        for sec in page["sections"]:
+            for c in sec["controls"]:
+                k = c.get("key")
+                if not k:
+                    continue
+                d = self._default_for(k)
+                self.vars[k].set(bool(d) if c["type"] == "bool"
+                                 else ("" if d is None else str(d)))
+
+    def reset_all(self):
+        if not messagebox.askyesno(
+                "Reset all settings",
+                "Restore every setting to its default?\n\nYour captured "
+                "data isn't affected.", parent=self.win):
+            return
+        self.cfg.reset()
+        self.app._apply_runtime_settings()
+        for key, c in self.controls.items():
+            d = self._default_for(key)
+            self.vars[key].set(bool(d) if c["type"] == "bool"
+                               else ("" if d is None else str(d)))
+        self.errors = {}
+        self.baseline = self._snapshot()
+        self._build_chrome()
+        self.show_page(self.page_id)
+
+    def apply(self):
+        errs = self._validate_all()
+        if errs:
+            self._refresh_footer()
+            for k in errs:
+                self._show_error(k)
+            return False
+        before = (self.cfg.get("appearance.theme"),
+                  self.cfg.get("appearance.high_contrast"),
+                  self.cfg.get("appearance.text_size"))
+        for key in self.controls:
+            self.cfg.set(key, self._value_of(key))
+        self.cfg.save()
+        self.app._apply_runtime_settings()
+        # show the values as actually stored (e.g. numbers clamped)
+        for key in self.controls:
+            v = self._value_of(key)
+            self.vars[key].set(v if isinstance(v, bool) else str(v))
+        self.baseline = self._snapshot()
+        after = (self.cfg.get("appearance.theme"),
+                 self.cfg.get("appearance.high_contrast"),
+                 self.cfg.get("appearance.text_size"))
+        if before != after:
+            self._build_chrome()
+            self.show_page(self.page_id)
+        else:
+            self._refresh_footer()
+        self.app._set_banner("\u2699\ufe0e  Settings saved.")
+        return True
+
+    def ok(self):
+        if self.apply():
+            self.win.destroy()
+
+    def cancel(self):
+        if self.dirty() and not messagebox.askyesno(
+                "Discard changes?", "You have unsaved changes. Close "
+                "without saving?", parent=self.win):
+            return
+        self.win.destroy()
+
+
+
+
+# ============================================================================
+#  17.  GUI components — tables, charts, dialogs, menus
+#
+#  Small reusable builders so every tab looks and behaves the same, and so
+#  every new widget is themed through the same palette (no hard-coded white
+#  panels in Dark mode).
+# ============================================================================
+_UNIT_MULT = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3,
+              "B/s": 1, "KB/s": 1024, "MB/s": 1024 ** 2, "GB/s": 1024 ** 3}
+
+
+def sort_key(v):
+    """Numeric-aware sort for table cells ("1.2 MB", "350", "12:01:05")."""
+    s = str(v).strip()
+    m = re.match(r"^[^\d\-]*(-?[\d,]*\.?\d+)\s*([KMG]?B(?:/s)?)?", s)
+    if m and (m.group(2) or re.match(r"^-?[\d,]*\.?\d+$", s.replace(" ", ""))):
+        try:
+            n = float(m.group(1).replace(",", ""))
+            return (0, n * _UNIT_MULT.get(m.group(2) or "", 1), "")
+        except ValueError:
+            pass
+    return (1, 0, s.lower())
+
+
+def enable_sorting(tree, on_sort=None):
+    state = {"col": None, "rev": False}
+
+    def do_sort(col):
+        rev = state["rev"] if state["col"] == col else False
+        state["col"], state["rev"] = col, not rev
+        for parent in ("",) + tuple(tree.get_children("")):
+            kids = list(tree.get_children(parent))
+            if not kids:
+                continue
+            kids.sort(key=lambda k: sort_key(tree.set(k, col)), reverse=rev)
+            for i, k in enumerate(kids):
+                tree.move(k, parent, i)
+        for c in tree["columns"]:
+            txt = tree.heading(c, "text").rstrip(" ▲▼")
+            if c == col:
+                txt += " ▼" if rev else " ▲"
+            tree.heading(c, text=txt)
+        if on_sort:
+            on_sort(col, rev)
+
+    for c in tree["columns"]:
+        tree.heading(c, command=lambda cc=c: do_sort(cc))
+    return state
+
+
+def make_tree(parent, columns, bg="#ffffff", show="headings",
+              selectmode="browse", hscroll=False, sortable=True):
+    """columns: list of (id, title, width, anchor, stretch)."""
+    frame = tk.Frame(parent, bg=bg)
+    tree = ttk.Treeview(frame, columns=[c[0] for c in columns], show=show,
+                        selectmode=selectmode)
+    for cid, title, width, anchor, stretch in columns:
+        tree.heading(cid, text=title, anchor=anchor if anchor != "e"
+                     else "e")
+        tree.column(cid, width=width, anchor=anchor, stretch=stretch,
+                    minwidth=30)
+    vs = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=vs.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vs.grid(row=0, column=1, sticky="ns")
+    if hscroll:
+        hs = ttk.Scrollbar(frame, orient="horizontal", command=tree.xview)
+        tree.configure(xscrollcommand=hs.set)
+        hs.grid(row=1, column=0, sticky="ew")
+    frame.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
+    if sortable:
+        enable_sorting(tree)
+    return frame, tree
+
+
+def tree_upsert(tree, iid_map, key, values, tags=(), parent="", index="end"):
+    """Insert or update one row; returns its iid. Never redraws the whole
+    table."""
+    iid = iid_map.get(key)
+    if iid is not None:
+        try:
+            tree.item(iid, values=values, tags=tags)
+            return iid
+        except tk.TclError:
+            iid_map.pop(key, None)
+    try:
+        iid = tree.insert(parent, index, values=values, tags=tags)
+        iid_map[key] = iid
+        return iid
+    except tk.TclError:
+        return None
+
+
+def tree_remove(tree, iid_map, key):
+    iid = iid_map.pop(key, None)
+    if iid is not None:
+        with contextlib.suppress(tk.TclError):
+            tree.delete(iid)
+
+
+def key_for_iid(iid_map, iid):
+    for k, v in iid_map.items():
+        if v == iid:
+            return k
+    return None
+
+
+def themed_menu(app):
+    t = app.theme
+    return tk.Menu(app.root, tearoff=0, bg=t["tab_bg"], fg=t["text_fg"],
+                   activebackground=t["accent"],
+                   activeforeground="#000000" if app.high_contrast and
+                   app.theme_name == "Dark" else "#ffffff")
+
+
+def popup_menu(app, event, items):
+    """items: list of (label, callback) or None for a separator."""
+    m = themed_menu(app)
+    for it in items:
+        if it is None:
+            m.add_separator()
+        else:
+            label, cb = it[0], it[1]
+            state = "normal" if (len(it) < 3 or it[2]) else "disabled"
+            m.add_command(label=label, command=cb, state=state)
+    try:
+        m.tk_popup(event.x_root, event.y_root)
+    finally:
+        m.grab_release()
+
+
+def copy_to_clipboard(app, text):
+    try:
+        app.root.clipboard_clear()
+        app.root.clipboard_append(text)
+        app.root.update_idletasks()
+        app._set_banner("\U0001F4CB  Copied to the clipboard.")
+        return True
+    except tk.TclError:
+        return False
+
+
+class DetailDialog:
+    """A themed, scrollable report window used for devices, connections,
+    alerts, websites and remote hosts. `sections` is a list of
+    (heading, text) and `actions` a list of (label, callback)."""
+
+    def __init__(self, app, title, sections, actions=None, size="560x620",
+                 extra=None):
+        self.app = app
+        t = app.theme
+        self.win = tk.Toplevel(app.root)
+        self.win.title(title)
+        self.win.geometry(size)
+        self.win.minsize(420, 320)
+        self.win.configure(bg=t["tab_bg"])
+        self.win.transient(app.root)
+        top = tk.Frame(self.win, bg=t["tab_bg"], padx=14, pady=10)
+        top.pack(fill="x")
+        tk.Label(top, text=title, bg=t["tab_bg"], fg=t["text_fg"],
+                 font=("TkDefaultFont", 13, "bold"), anchor="w",
+                 justify="left", wraplength=500).pack(fill="x")
+        if extra is not None:
+            extra(self.win)
+        body = tk.Frame(self.win, bg=t["tab_bg"])
+        body.pack(fill="both", expand=True, padx=8)
+        self.txt = tk.Text(body, wrap="word", bg=t["text_bg"],
+                           fg=t["text_fg"], relief="flat", padx=12, pady=10,
+                           font=("TkDefaultFont", 10),
+                           insertbackground=t["text_fg"],
+                           highlightthickness=0)
+        vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=vs.set)
+        self.txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.txt.tag_configure("h", font=("TkDefaultFont", 11, "bold"),
+                               spacing1=6, spacing3=3)
+        self.txt.tag_configure("muted", foreground=t["muted_fg"])
+        self.set_sections(sections)
+        self.btns = tk.Frame(self.win, bg=t["tab_bg"], padx=8, pady=8)
+        self.btns.pack(fill="x")
+        ttk.Button(self.btns, text="Close", command=self.win.destroy).pack(
+            side="right")
+        ttk.Button(self.btns, text="Copy report",
+                   command=self.copy).pack(side="right", padx=6)
+        for label, cb in actions or []:
+            ttk.Button(self.btns, text=label, command=cb).pack(
+                side="left", padx=(0, 6))
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        scale = app.TEXT_SIZES.get(app.config.get("appearance.text_size",
+                                                  "Normal"), 1.0)
+        if scale != 1.0:
+            app._scale_explicit_fonts(self.win, scale)
+
+    def set_sections(self, sections):
+        self.sections = sections
+        self.txt.config(state="normal")
+        self.txt.delete("1.0", "end")
+        for heading, text in sections:
+            self.txt.insert("end", heading + "\n", ("h",))
+            self.txt.insert("end", (text or "—") + "\n\n")
+        self.txt.config(state="disabled")
+
+    def copy(self):
+        title = self.win.title()
+        body = "\n\n".join(f"{h}\n{t}" for h, t in self.sections)
+        copy_to_clipboard(self.app, f"{title}\n{'=' * len(title)}\n\n{body}")
+
+
+def ask_text(app, title, prompt, initial="", multiline=False, parent=None):
+    """Small themed input dialog. Returns the text or None if cancelled."""
+    t = app.theme
+    res = {"v": None}
+    win = tk.Toplevel(parent or app.root)
+    win.title(title)
+    win.configure(bg=t["tab_bg"])
+    win.transient(parent or app.root)
+    win.resizable(True, multiline)
+    tk.Label(win, text=prompt, bg=t["tab_bg"], fg=t["text_fg"],
+             justify="left", wraplength=380).pack(anchor="w", padx=14,
+                                                  pady=(12, 6))
+    if multiline:
+        w = tk.Text(win, height=6, width=48, bg=t["text_bg"], fg=t["text_fg"],
+                    insertbackground=t["text_fg"], wrap="word")
+        w.insert("1.0", initial or "")
+    else:
+        var = tk.StringVar(value=initial or "")
+        w = ttk.Entry(win, textvariable=var, width=44)
+    w.pack(fill="both", expand=True, padx=14)
+    w.focus_set()
+
+    def ok(_e=None):
+        res["v"] = (w.get("1.0", "end").strip() if multiline
+                    else var.get().strip())
+        win.destroy()
+    bar = tk.Frame(win, bg=t["tab_bg"])
+    bar.pack(fill="x", padx=14, pady=12)
+    ttk.Button(bar, text="OK", style="Accent.TButton", command=ok).pack(
+        side="right")
+    ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="right",
+                                                             padx=6)
+    if not multiline:
+        win.bind("<Return>", ok)
+    win.bind("<Escape>", lambda e: win.destroy())
+    win.grab_set()
+    win.wait_window()
+    return res["v"]
+
+
+def choose_from_list(app, title, prompt, options, parent=None):
+    """options: list of (label, value). Returns the chosen value or None."""
+    t = app.theme
+    res = {"v": None}
+    win = tk.Toplevel(parent or app.root)
+    win.title(title)
+    win.configure(bg=t["tab_bg"])
+    win.geometry("440x380")
+    win.transient(parent or app.root)
+    tk.Label(win, text=prompt, bg=t["tab_bg"], fg=t["text_fg"],
+             justify="left", wraplength=400).pack(anchor="w", padx=14,
+                                                  pady=(12, 6))
+    lb = tk.Listbox(win, bg=t["text_bg"], fg=t["text_fg"],
+                    selectbackground=t["accent"], activestyle="dotbox",
+                    highlightthickness=1)
+    for label, _v in options:
+        lb.insert("end", label)
+    lb.pack(fill="both", expand=True, padx=14)
+
+    def ok(_e=None):
+        sel = lb.curselection()
+        if sel:
+            res["v"] = options[sel[0]][1]
+        win.destroy()
+    lb.bind("<Double-1>", ok)
+    bar = tk.Frame(win, bg=t["tab_bg"])
+    bar.pack(fill="x", padx=14, pady=12)
+    ttk.Button(bar, text="Choose", style="Accent.TButton", command=ok).pack(
+        side="right")
+    ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="right",
+                                                             padx=6)
+    win.bind("<Escape>", lambda e: win.destroy())
+    win.grab_set()
+    win.wait_window()
+    return res["v"]
+
+
+class Charts:
+    """Tiny native Tk canvas charts. Colours come from the active theme;
+    every series also differs by dash pattern and has a text legend, so
+    nothing relies on colour alone."""
+
+    DASHES = ((), (6, 3), (2, 2), (8, 2, 2, 2))
+
+    @staticmethod
+    def nice_max(v):
+        if v <= 0:
+            return 1
+        exp = 10 ** int(math.floor(math.log10(v)))
+        for m in (1, 2, 2.5, 5, 10):
+            if v <= m * exp:
+                return m * exp
+        return 10 * exp
+
+    @classmethod
+    def line(cls, c, x, y, w, h, series, t, title="", fmt=str,
+             xlabels=("", ""), empty="No data yet"):
+        c.create_text(x, y, anchor="nw", text=title, fill=t["text_fg"],
+                      font=("TkDefaultFont", 10, "bold"))
+        top = y + 22
+        ph = max(20, h - 40)
+        left = x + 64
+        pw = max(40, w - 74)
+        vmax = max((max(vals) if vals else 0) for _l, vals, _c in series) \
+            if series else 0
+        nm = cls.nice_max(vmax)
+        for i in range(5):
+            gy = top + ph - ph * i / 4
+            c.create_line(left, gy, left + pw, gy, fill=t["grid"])
+            c.create_text(left - 6, gy, anchor="e", fill=t["muted_fg"],
+                          text=fmt(nm * i / 4), font=("TkDefaultFont", 8))
+        c.create_text(left, top + ph + 4, anchor="nw", fill=t["muted_fg"],
+                      text=xlabels[0], font=("TkDefaultFont", 8))
+        c.create_text(left + pw, top + ph + 4, anchor="ne", fill=t["muted_fg"],
+                      text=xlabels[1], font=("TkDefaultFont", 8))
+        if vmax <= 0:
+            c.create_text(left + pw / 2, top + ph / 2, text=empty,
+                          fill=t["muted_fg"], font=("TkDefaultFont", 9))
+        lx = left + pw
+        for i, (label, vals, color) in enumerate(series):
+            if not vals:
+                continue
+            n = len(vals)
+            pts = []
+            for j, v in enumerate(vals):
+                pts += [left + pw * j / max(1, n - 1),
+                        top + ph - ph * min(v, nm) / nm]
+            if len(pts) >= 4 and vmax > 0:
+                c.create_line(*pts, fill=color, width=2,
+                              dash=cls.DASHES[i % len(cls.DASHES)])
+            # legend (right-aligned, top)
+            txt = c.create_text(lx, y + 2, anchor="ne", text=label,
+                                fill=t["text_fg"], font=("TkDefaultFont", 8))
+            bx = c.bbox(txt)
+            sx = (bx[0] if bx else lx) - 6
+            c.create_line(sx - 22, y + 9, sx, y + 9, fill=color, width=2,
+                          dash=cls.DASHES[i % len(cls.DASHES)])
+            lx = sx - 34
+
+    @classmethod
+    def hbars(cls, c, x, y, w, h, items, t, title="", color=None,
+              empty="Nothing yet", tags_prefix=""):
+        """items: list of (label, value, value_text, click_key)."""
+        c.create_text(x, y, anchor="nw", text=title, fill=t["text_fg"],
+                      font=("TkDefaultFont", 10, "bold"))
+        if not items:
+            c.create_text(x, y + 30, anchor="nw", text=empty,
+                          fill=t["muted_fg"], font=("TkDefaultFont", 9))
+            return
+        items = items[:max(1, int((h - 26) // 16))]
+        rowh = max(16, min(24, (h - 26) / max(1, len(items))))
+        top = y + 24
+        labw = min(170, w * 0.42)
+        vmax = max(v for _l, v, _t, _k in items) or 1
+        barw = max(20, w - labw - 90)
+        for i, (label, v, vt, key) in enumerate(items):
+            yy = top + i * rowh
+            tag = f"{tags_prefix}{i}" if tags_prefix else ""
+            c.create_text(x, yy + rowh / 2, anchor="w",
+                          text=label[:28], fill=t["text_fg"],
+                          font=("TkDefaultFont", 9), tags=(tag,) if tag
+                          else ())
+            bw = max(3, barw * v / vmax)
+            c.create_rectangle(x + labw, yy + 3, x + labw + bw,
+                               yy + rowh - 3, fill=color or t["chart_down"],
+                               outline="", tags=(tag,) if tag else ())
+            c.create_text(x + labw + bw + 6, yy + rowh / 2, anchor="w",
+                          text=vt, fill=t["muted_fg"],
+                          font=("TkDefaultFont", 8))
+
+
+
+# ============================================================================
+#  18.  Tabs
+#
+#  Each tab is a small class with build() / refresh() / reset(). They all
+#  read from app.model (the single NetworkModel) — Beginner and Advanced
+#  views are different presentations of the same data, not separate apps.
+# ============================================================================
+WHITE = "#ffffff"
+
+
+class BaseTab:
+    name = ""
+    label_key = ""
+    advanced = False
+
+    def __init__(self, app):
+        self.app = app
+        self.frame = tk.Frame(app.nb, bg=WHITE)
+        self.build()
+
+    @property
+    def model(self):
+        return self.app.model
+
+    @property
+    def t(self):
+        return self.app.theme
+
+    def is_visible(self):
+        try:
+            return self.app.nb.select() == str(self.frame)
+        except tk.TclError:
+            return False
+
+    def header(self, text, sub=None):
+        top = tk.Frame(self.frame, bg=WHITE, padx=12, pady=8)
+        top.pack(fill="x")
+        lbl = tk.Label(top, text=text, bg=WHITE, fg="#333333",
+                       wraplength=1000, justify="left",
+                       font=("TkDefaultFont", 11))
+        lbl.pack(anchor="w")
+        if sub:
+            tk.Label(top, text=sub, bg=WHITE, fg="#666666",
+                     wraplength=1000, justify="left",
+                     font=("TkDefaultFont", 9)).pack(anchor="w",
+                                                     pady=(2, 0))
+        return top
+
+    def toolbar(self):
+        bar = tk.Frame(self.frame, bg=WHITE, padx=12)
+        bar.pack(fill="x", pady=(0, 6))
+        return bar
+
+    def lbl(self, parent, text, muted=False, **kw):
+        w = tk.Label(parent, text=text, bg=WHITE,
+                     fg="#888888" if muted else "#333333", **kw)
+        return w
+
+    def build(self):
+        pass
+
+    def refresh(self):
+        pass
+
+    def reset(self):
+        pass
+
+    def on_theme(self):
+        pass
+
+    def device_choices(self):
+        devs = sorted(self.model.registry.by_key.values(),
+                      key=lambda d: d.display_name().lower())
+        return ["All devices"] + [f"{d.display_name()}  [{d.ip or d.mac}]"
+                                  for d in devs][:400]
+
+    def device_key_from_choice(self, choice):
+        if not choice or choice == "All devices":
+            return None
+        m = re.search(r"\[([^\]]+)\]\s*$", choice)
+        if not m:
+            return None
+        ident = m.group(1)
+        dev = self.model.device_for(ident, ident)
+        return dev.key if dev else None
+
+
+# ---- Dashboard ---------------------------------------------------------------
+class DashboardTab(BaseTab):
+    name, label_key = "dash", "tab_dashboard"
+    CARDS = (
+        ("internet", "INTERNET", "health"),
+        ("capture", "CAPTURE", "help"),
+        ("active", "ACTIVE DEVICES", "devices"),
+        ("known", "KNOWN DEVICES", "devices_all"),
+        ("down", "DOWNLOAD NOW", "connections"),
+        ("up", "UPLOAD NOW", "connections"),
+        ("pps", "PACKETS / SEC", "packets"),
+        ("dns", "DNS HEALTH", "health"),
+        ("alerts", "ALERTS", "alerts"),
+        ("topdev", "MOST ACTIVE DEVICE", "topdev"),
+        ("topsite", "MOST CONTACTED WEBSITE", "topsite"),
+        ("duration", "CAPTURE DURATION", "timeline"),
+    )
+    RANGES = {"Last 5 minutes": (1, 300), "Last hour": (10, 360),
+              "Last 24 hours": (60, 1440)}
+
+    def build(self):
+        outer = tk.Frame(self.frame, bg=WHITE, padx=14, pady=10)
+        outer.pack(fill="both", expand=True)
+        head = tk.Frame(outer, bg=WHITE)
+        head.pack(fill="x")
+        tk.Label(head, text="\U0001F4CA  Dashboard", bg=WHITE, fg="#2b3a56",
+                 font=("TkDefaultFont", 14, "bold")).pack(side="left")
+        self.range_var = tk.StringVar(value="Last 5 minutes")
+        cb = ttk.Combobox(head, textvariable=self.range_var,
+                          values=list(self.RANGES), width=14,
+                          state="readonly")
+        cb.pack(side="right")
+        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh(force=True))
+        tk.Label(head, text="Charts:", bg=WHITE, fg="#666666").pack(
+            side="right", padx=6)
+        tk.Label(outer, text="A quick overview — click any card to open "
+                             "the full picture.", bg=WHITE,
+                 fg="#666666").pack(anchor="w", pady=(0, 8))
+        self.state_var = tk.StringVar(value="Getting started …")
+        self.state_lbl = tk.Label(outer, textvariable=self.state_var,
+                                  bg="#eef4fb", fg="#0b5394", anchor="w",
+                                  justify="left", wraplength=1100, padx=12,
+                                  pady=8, font=("TkDefaultFont", 11))
+        self.state_lbl.pack(fill="x", pady=(0, 8))
+        grid = tk.Frame(outer, bg=WHITE)
+        grid.pack(fill="x")
+        self.vars, self.card_widgets = {}, []
+        for i, (key, title, target) in enumerate(self.CARDS):
+            card = tk.Frame(grid, bg="#f6f7fa", padx=12, pady=8,
+                            highlightbackground="#e0e2e8",
+                            highlightthickness=1, cursor="hand2",
+                            takefocus=1)
+            card.grid(row=i // 6, column=i % 6, sticky="nsew", padx=4,
+                      pady=4)
+            tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#888888",
+                          font=("TkDefaultFont", 8, "bold"), anchor="w")
+            tl.pack(anchor="w")
+            v = tk.StringVar(value="—")
+            vl = tk.Label(card, textvariable=v, bg="#f6f7fa", fg="#222222",
+                          font=("TkDefaultFont", 12, "bold"), justify="left",
+                          anchor="w", wraplength=170)
+            vl.pack(anchor="w", pady=(2, 0))
+            self.vars[key] = v
+            for w in (card, tl, vl):
+                w.bind("<Button-1>", lambda e, tg=target: self.app.goto(tg))
+            card.bind("<Return>", lambda e, tg=target: self.app.goto(tg))
+            Tooltip(card, "Click to open the details.")
+        for c in range(6):
+            grid.columnconfigure(c, weight=1)
+        self.canvas = tk.Canvas(outer, bg=WHITE, highlightthickness=0,
+                                height=260)
+        self.canvas.pack(fill="both", expand=True, pady=(10, 0))
+        self.canvas.bind("<Configure>", lambda e: self.refresh(force=True))
+        self.canvas.bind("<Button-1>", self._on_chart_click)
+        self._click_items = {}
+
+    def _on_chart_click(self, event):
+        ids = self.canvas.find_overlapping(event.x - 2, event.y - 2,
+                                           event.x + 2, event.y + 2)
+        for i in ids:
+            for tag in self.canvas.gettags(i):
+                if tag in self._click_items:
+                    kind, key = self._click_items[tag]
+                    if kind == "device":
+                        self.app.show_device(key)
+                    elif kind == "website":
+                        self.app.goto("websites", key)
+                    return
+
+    def refresh(self, force=False):
+        if not force and not self.is_visible():
+            return
+        m, t, app = self.model, self.t, self.app
+        now = m.now()
+        devs = [d for d in m.registry.visible_devices()]
+        active = sum(1 for d in devs if d.state in (STATE_ACTIVE, STATE_IDLE))
+        self.vars["active"].set(str(active))
+        self.vars["known"].set(f"{len(m.registry.by_key)}")
+        down = m.metrics.current("bytes_down", now)
+        up = m.metrics.current("bytes_up", now)
+        self.vars["down"].set(human_rate(down))
+        self.vars["up"].set(human_rate(up))
+        self.vars["pps"].set(f"{m.metrics.current('packets', now):.0f}")
+        c = m.alerts.counts()
+        self.vars["alerts"].set(f"‼ {c['DANGER']}  ⚠ {c['WARNING']}  "
+                                f"ℹ {c['INFO']}")
+        self.vars["capture"].set(app.capture_status_short())
+        self.vars["internet"].set(app.internet_status_short())
+        self.vars["dns"].set(app.dns_status_short())
+        top = max((d for d in m.registry.by_key.values()),
+                  key=lambda d: d.bytes_up + d.bytes_down, default=None)
+        self.vars["topdev"].set(app.device_label(top)[:24] if top and
+                                (top.bytes_up + top.bytes_down) else "—")
+        site = max(m.websites.values(), key=lambda w: w.requests,
+                   default=None)
+        self.vars["topsite"].set(site.registrable[:26] if site else "—")
+        self.vars["duration"].set(human_duration(m.metrics.duration(now))
+                                  if m.metrics.first_ts else "—")
+        state, bg, fg = app.network_state_text()
+        self.state_var.set(state)
+        with contextlib.suppress(tk.TclError):
+            self.state_lbl.configure(bg=bg, fg=fg)
+        self._draw_charts(now)
+
+    def _draw_charts(self, now):
+        c, t, m = self.canvas, self.t, self.model
+        try:
+            c.delete("all")
+            w = max(600, c.winfo_width())
+            h = max(300, c.winfo_height())
+        except tk.TclError:
+            return
+        c.configure(bg=t["tab_bg"])
+        res, n = self.RANGES.get(self.range_var.get(), (1, 300))
+        span = res * n
+        xl = (f"-{human_duration(span)}", "now")
+        down = [v / res for _b, v in m.metrics.series["bytes_down"].series(
+            res, n, now)]
+        up = [v / res for _b, v in m.metrics.series["bytes_up"].series(
+            res, n, now)]
+        pps = [v / res for _b, v in m.metrics.series["packets"].series(
+            res, n, now)]
+        half = w / 2
+        top_h = h * 0.48
+        Charts.line(c, 8, 4, half - 20, top_h,
+                    [("Download", down, t["chart_down"]),
+                     ("Upload", up, t["chart_up"])], t,
+                    "Internet traffic", fmt=human_rate, xlabels=xl,
+                    empty="No Internet traffic measured yet")
+        Charts.line(c, half + 8, 4, half - 20, top_h,
+                    [("Packets/sec", pps, t["chart_a"])], t,
+                    "Packets per second", fmt=lambda v: f"{v:.0f}",
+                    xlabels=xl, empty="No packets yet")
+        y2 = top_h + 16
+        third = w / 3
+        bh = h - y2 - 4
+        protos = m.metrics.top_protocols(
+            recent_minutes=None if res > 1 else 5, n=7)
+        Charts.hbars(c, 8, y2, third - 16, bh,
+                     [(p, b, _human_bytes(b), None) for p, b in protos], t,
+                     "Protocols (by volume)", color=t["chart_e"])
+        devs = sorted(m.registry.by_key.values(),
+                      key=lambda d: -(d.bytes_up + d.bytes_down))[:7]
+        self._click_items = {}
+        items = []
+        for i, d in enumerate(devs):
+            if d.bytes_up + d.bytes_down <= 0:
+                continue
+            items.append((self.app.device_label(d), d.bytes_up + d.bytes_down,
+                          f"↑{_human_bytes(d.bytes_up)} "
+                          f"↓{_human_bytes(d.bytes_down)}", d.key))
+            self._click_items[f"dev{i}"] = ("device", d.key)
+        Charts.hbars(c, third + 8, y2, third - 16, bh, items, t,
+                     "Top devices (click to open)", color=t["chart_b"],
+                     tags_prefix="dev")
+        groups = Counter()
+        for wrec in m.websites.values():
+            groups[wrec.registrable] += wrec.requests
+        sites = groups.most_common(7)
+        for i, (dom, _n) in enumerate(sites):
+            self._click_items[f"site{i}"] = ("website", dom)
+        Charts.hbars(c, 2 * third + 8, y2, third - 16, bh,
+                     [(dom, n, f"{n} hits", dom) for dom, n in sites], t,
+                     "Top websites (click to open)", color=t["chart_d"],
+                     tags_prefix="site")
+
+
+# ---- Happening (friendly feed) -------------------------------------------------
+class FeedTab(BaseTab):
+    name, label_key = "feed", "tab_feed"
+
+    def build(self):
+        self.speed = DEFAULT_FEED_SPEED
+        self.paused = False
+        self.buffer = []
+        ctrl = tk.Frame(self.frame, bg=WHITE, padx=10)
+        ctrl.pack(fill="x", pady=(8, 4))
+        tk.Label(ctrl, text="Feed speed:", bg=WHITE, fg="#333333").pack(
+            side="left")
+        self.speed_var = tk.StringVar(value=self.speed)
+        sb = ttk.Combobox(ctrl, textvariable=self.speed_var,
+                          values=list(FEED_SPEEDS.keys()), width=12,
+                          state="readonly")
+        sb.pack(side="left", padx=(6, 14))
+        sb.bind("<<ComboboxSelected>>",
+                lambda e: setattr(self, "speed", self.speed_var.get()))
+        self.pause_btn = ttk.Button(ctrl, text="⏸  Pause feed",
+                                    command=self.toggle_pause)
+        self.pause_btn.pack(side="left")
+        tk.Label(ctrl, text="   “Calm” groups busy moments so they're "
+                            "easy to read — “Full speed” shows "
+                            "every line as it happens.",
+                 bg=WHITE, fg="#888888", font=("TkDefaultFont", 9)).pack(
+            side="left", padx=(12, 0))
+        wrap, self.tree = make_tree(
+            self.frame, [("who", "Who", 260, "w", False),
+                         ("did", "What they did", 760, "w", True),
+                         ("when", "When", 110, "center", False)],
+            sortable=False)
+        wrap.pack(fill="both", expand=True)
+        self.restyle()
+
+    def restyle(self):
+        table = PALETTES[palette_name(self.app.theme_name,
+                                      self.app.high_contrast)]
+        for tag, hexcolor in {"dns": "#6a2ca0", "secure": "#0b5394",
+                              "unsecure": "#0b6b3a", "device": "#8a5a00",
+                              "other": "#333333", "alert": "#a01a08"}.items():
+            with contextlib.suppress(tk.TclError):
+                self.tree.tag_configure(tag, foreground=table.get(hexcolor,
+                                                                  hexcolor))
+
+    on_theme = restyle
+
+    def push(self, events):
+        self.buffer.extend(events)
+        if len(self.buffer) > 1500:
+            del self.buffer[:-1500]
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        self.update_pause_label()
+
+    def update_pause_label(self):
+        if self.paused:
+            n = len(self.buffer)
+            label = f"▶  Resume ({n} waiting)" if n else "▶  Resume"
+        else:
+            label = "⏸  Pause feed"
+        with contextlib.suppress(tk.TclError):
+            self.pause_btn.config(text=label)
+
+    def flush(self):
+        """Called on the feed's own timer. Returns the next delay in ms."""
+        cfg = FEED_SPEEDS.get(self.speed, FEED_SPEEDS[DEFAULT_FEED_SPEED])
+        if self.paused:
+            self.update_pause_label()
+            return 300
+        buf, self.buffer = self.buffer, []
+        if buf:
+            if cfg["digest"] or len(buf) > cfg["max_rows"] or \
+                    self.app.perf_level >= 2:
+                rows = self.digest(buf, cfg["max_rows"])
+            else:
+                rows = [(b["tag"], b["who"], b["did"], b["when"])
+                        for b in buf]
+            for tag, who, did, when in rows:
+                with contextlib.suppress(tk.TclError):
+                    self.tree.insert("", 0, tags=(tag,),
+                                     values=(who, did, when))
+            kids = self.tree.get_children()
+            if len(kids) > 500:
+                self.tree.delete(*kids[500:])
+        return cfg["interval"]
+
+    @staticmethod
+    def digest(buf, cap):
+        """Collapse exact repeats and cap how many lines appear in one go,
+        so a burst reads as a short summary instead of a wall of text."""
+        counts, order = {}, []
+        for b in buf:
+            key = (b["who"], b["tag"], b["did"])
+            if key not in counts:
+                counts[key] = 0
+                order.append(key)
+            counts[key] += 1
+        rows = []
+        for key in order[:cap]:
+            who, tag, did = key
+            n = counts[key]
+            rows.append((tag, who, did if n == 1 else f"{did}  (×{n})",
+                         buf[-1]["when"]))
+        leftover = order[cap:]
+        if leftover:
+            extra = sum(counts[k] for k in leftover)
+            rows.append(("other", "…",
+                         f"+{extra} more thing(s) just happened — switch "
+                         f"to “Full speed” to see every line",
+                         buf[-1]["when"]))
+        return rows
+
+    def reset(self):
+        self.buffer.clear()
+        with contextlib.suppress(tk.TclError):
+            self.tree.delete(*self.tree.get_children())
+
+
+# ---- Timeline v2 -------------------------------------------------------------
+TIMELINE_CATEGORY = {
+    "new device": "Devices", "device left": "Devices",
+    "device back": "Devices", "device expired": "Devices",
+    "ip changed": "Devices", "dhcp lease": "Devices",
+    "hostname": "Devices", "identity": "Devices",
+    "identity merged": "Devices", "possible duplicate": "Devices",
+    "service": "Devices", "traffic spike": "Devices",
+    "website": "Websites", "alert": "Alerts", "dns change": "DNS",
+    "capture": "Network & capture", "interface": "Network & capture",
+    "internet": "Network & capture", "vpn": "Network & capture",
+}
+
+
+class TimelineTab(BaseTab):
+    name, label_key = "timeline", "tab_timeline"
+
+    def build(self):
+        self.header("\U0001F553  Timeline — devices joining and leaving, "
+                    "address and name changes, first visits to websites, DNS "
+                    "changes, capture events and alerts, in order. "
+                    "Double-click a row to jump to it.")
+        bar = self.toolbar()
+        self.search_var = tk.StringVar()
+        self.lbl(bar, "Search:").pack(side="left")
+        e = ttk.Entry(bar, textvariable=self.search_var, width=18)
+        e.pack(side="left", padx=(4, 10))
+        e.bind("<KeyRelease>", lambda ev: self._schedule_rebuild())
+        self.type_var = tk.StringVar(value="All types")
+        self._combo(bar, "Type:", self.type_var,
+                    ["All types", "Devices", "Websites", "Alerts", "DNS",
+                     "Network & capture"], 16)
+        self.sev_var = tk.StringVar(value="All")
+        self._combo(bar, "Severity:", self.sev_var,
+                    ["All", "INFO", "WARNING", "DANGER"], 9)
+        self.dev_var = tk.StringVar(value="All devices")
+        self.dev_box = self._combo(bar, "Device:", self.dev_var,
+                                   ["All devices"], 22)
+        self.dev_box.bind("<Button-1>", lambda e: self.dev_box.configure(
+            values=self.device_choices()), add="+")
+        self.zoom_var = tk.StringVar(value="Full session")
+        self._combo(bar, "Show:", self.zoom_var,
+                    ["Last 5 minutes", "Last hour", "Full session"], 13)
+        self.pause_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bar, text="Pause live updates",
+                        variable=self.pause_var,
+                        command=self._on_pause).pack(side="left", padx=(8, 0))
+        wrap, self.tree = make_tree(
+            self.frame, [("sev", "Severity", 100, "w", False),
+                         ("when", "Time", 80, "center", False),
+                         ("kind", "Type", 130, "w", False),
+                         ("text", "What happened", 700, "w", True)])
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree.bind("<Double-1>", self._on_double)
+        self.refs = {}
+        self.pending = []
+        self._rebuild_job = None
+        self.on_theme()
+
+    def _combo(self, bar, label, var, values, width):
+        self.lbl(bar, label).pack(side="left")
+        cb = ttk.Combobox(bar, textvariable=var, values=values, width=width,
+                          state="readonly")
+        cb.pack(side="left", padx=(4, 10))
+        cb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
+        return cb
+
+    def on_theme(self):
+        for sev, (fg, bg) in self.app._severity_colors().items():
+            with contextlib.suppress(tk.TclError):
+                self.tree.tag_configure(sev, foreground=fg,
+                                        background=bg or "")
+
+    def _schedule_rebuild(self):
+        if self._rebuild_job:
+            with contextlib.suppress(tk.TclError):
+                self.frame.after_cancel(self._rebuild_job)
+        self._rebuild_job = self.frame.after(300, self.rebuild)
+
+    def _on_pause(self):
+        if not self.pause_var.get():
+            self.rebuild()
+
+    def _matches(self, e, cutoff, dev_key, q):
+        if e["when"] < cutoff:
+            return False
+        if self.sev_var.get() != "All" and self.sev_var.get() != \
+                e["severity"]:
+            return False
+        typ = self.type_var.get()
+        if typ != "All types" and TIMELINE_CATEGORY.get(e["kind"],
+                                                        "Devices") != typ:
+            return False
+        if dev_key and e.get("device") != dev_key:
+            return False
+        if q and q not in (e["text"] + " " + e["kind"]).lower():
+            return False
+        return True
+
+    def _filters(self):
+        zoom = self.zoom_var.get()
+        now = self.model.now()
+        cutoff = {"Last 5 minutes": now - 300,
+                  "Last hour": now - 3600}.get(zoom, 0)
+        return cutoff, self.device_key_from_choice(self.dev_var.get()), \
+            self.search_var.get().strip().lower()
+
+    def add(self, entries):
+        if self.pause_var.get():
+            return
+        cutoff, dev_key, q = self._filters()
+        for e in entries:
+            if self._matches(e, cutoff, dev_key, q):
+                self._insert(e, index=0)
+        kids = self.tree.get_children()
+        if len(kids) > 1500:
+            for old in kids[1500:]:
+                self.refs.pop(old, None)
+            self.tree.delete(*kids[1500:])
+
+    def _insert(self, e, index="end"):
+        icon = self.app.SEVERITY_ICON.get(e["severity"], "•")
+        try:
+            iid = self.tree.insert(
+                "", index, tags=(e["severity"],),
+                values=(f"{icon} {e['severity']}", fmt_clock(e["when"]),
+                        e["kind"], e["text"]))
+            self.refs[iid] = e.get("ref")
+        except tk.TclError:
+            pass
+
+    def rebuild(self):
+        self._rebuild_job = None
+        self.tree.delete(*self.tree.get_children())
+        self.refs.clear()
+        cutoff, dev_key, q = self._filters()
+        rows = [e for e in self.model.timeline
+                if self._matches(e, cutoff, dev_key, q)]
+        for e in reversed(rows[-1500:]):
+            self._insert(e)
+
+    def _on_double(self, _e=None):
+        sel = self.tree.selection()
+        if sel:
+            self.app.open_ref(self.refs.get(sel[0]))
+
+    def reset(self):
+        self.tree.delete(*self.tree.get_children())
+        self.refs.clear()
+
+
+
+# ---- Devices -----------------------------------------------------------------
+class DevicesTab(BaseTab):
+    name, label_key = "devices", "tab_devices"
+    COLS = [("icon", "", 40, "center", False),
+            ("name", "Device", 200, "w", True),
+            ("cls", "What it likely is", 170, "w", False),
+            ("ip", "Local IP", 115, "w", False),
+            ("mac", "MAC address", 135, "w", False),
+            ("vendor", "Made by", 140, "w", True),
+            ("conf", "Confidence", 110, "w", False),
+            ("status", "Status", 95, "w", False),
+            ("traffic", "Traffic ↑/↓", 150, "w", False),
+            ("last", "Last seen", 80, "center", False),
+            ("ipv6", "IPv6", 200, "w", False),
+            ("packets", "Packets", 70, "e", False)]
+
+    def build(self):
+        self.header("🏠  The devices on your local network. Confidence shows "
+                    "how much local evidence supports each one — an IP "
+                    "address alone is never enough to count as a device.",
+                    "Double-click a device for details, or right-click for "
+                    "actions (rename, mark as yours, merge…).")
+        bar = self.toolbar()
+        self.show_inactive_var = tk.BooleanVar(
+            value=self.app.config.get("devices.show_inactive", False))
+        self.show_expired_var = tk.BooleanVar(
+            value=self.app.config.get("devices.show_expired", False))
+        ttk.Checkbutton(bar, text="Show offline", command=self._vis_changed,
+                        variable=self.show_inactive_var).pack(side="left")
+        ttk.Checkbutton(bar, text="Show expired", command=self._vis_changed,
+                        variable=self.show_expired_var).pack(side="left",
+                                                             padx=(10, 0))
+        self.lbl(bar, "   Filter:").pack(side="left")
+        self.filter_var = tk.StringVar()
+        fe = ttk.Entry(bar, textvariable=self.filter_var, width=18)
+        fe.pack(side="left", padx=4)
+        fe.bind("<KeyRelease>", lambda e: self.rebuild())
+        ttk.Button(bar, text="Merge devices…",
+                   command=self.merge_dialog).pack(side="right")
+        ttk.Button(bar, text="Details", command=self._details).pack(
+            side="right", padx=6)
+        self.count_lbl = self.lbl(bar, "", muted=True)
+        self.count_lbl.pack(side="right", padx=10)
+        wrap, self.tree = make_tree(self.frame, self.COLS,
+                                    selectmode="extended")
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree.bind("<Double-1>", lambda e: self._details())
+        self.tree.bind("<Return>", lambda e: self._details())
+        self.tree.bind("<Button-3>", self._context)
+        self.tree.bind("<Button-2>", self._context)
+        self.iids = {}
+        self.apply_mode()
+
+    def apply_mode(self):
+        cols = [c[0] for c in self.COLS]
+        if self.app.beginner_mode:
+            cols = [c for c in cols if c not in ("ipv6", "packets")]
+        with contextlib.suppress(tk.TclError):
+            self.tree.configure(displaycolumns=cols)
+
+    def _vis_changed(self):
+        cfg = self.app.config
+        cfg.set("devices.show_inactive", self.show_inactive_var.get())
+        cfg.set("devices.show_expired", self.show_expired_var.get())
+        cfg.save()
+        self.rebuild()
+
+    def _visible(self, dev):
+        if not dev.live:
+            return True
+        if dev.state == STATE_EXPIRED and not self.show_expired_var.get():
+            return False
+        if dev.state == STATE_INACTIVE and not self.show_inactive_var.get():
+            return False
+        q = self.filter_var.get().strip().lower()
+        if q:
+            hay = " ".join([dev.display_name(), dev.ip, dev.mac, dev.vendor,
+                            dev.device_class, dev.alias, dev.notes]).lower()
+            if q not in hay:
+                return False
+        return True
+
+    def values(self, dev):
+        app = self.app
+        icon = DEVICE_ICONS.get(dev.type, "❓")
+        label = app.device_label(dev)
+        if dev.mine:
+            label = "★ " + label
+        cls = (f"{dev.class_confidence} {dev.device_class}".strip()
+               if dev.device_class != "Unknown" else "Unknown")
+        conf = f"{CONFIDENCE_ICON.get(dev.confidence, '')} {dev.confidence}"
+        status = STATE_LABEL.get(dev.state, dev.state)
+        if not dev.live:
+            status += " (saved)"
+        vendor = dev.vendor or ("Private address" if dev.randomized_mac
+                                else "—")
+        traffic = (f"↑{_human_bytes(dev.bytes_up)}  "
+                   f"↓{_human_bytes(dev.bytes_down)}")
+        return (icon, label, cls, dev.ip or "—", dev.mac or "—",
+                vendor, conf, status, traffic, fmt_clock(dev.last_seen),
+                ", ".join(sorted(dev.ipv6)[:2]) or "—", dev.packets)
+
+    def update_keys(self, keys):
+        reg = self.model.registry
+        for key in keys:
+            dev = reg.by_key.get(key)
+            if dev is None or not self._visible(dev):
+                tree_remove(self.tree, self.iids, key)
+                continue
+            tree_upsert(self.tree, self.iids, key, self.values(dev))
+        self._count()
+
+    def rekey(self, old, new):
+        iid = self.iids.pop(old, None)
+        if iid is not None:
+            if new in self.iids:
+                with contextlib.suppress(tk.TclError):
+                    self.tree.delete(iid)
+            else:
+                self.iids[new] = iid
+
+    def rebuild(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+        self.update_keys(list(self.model.registry.by_key))
+
+    def _count(self):
+        n = len(self.iids)
+        total = len(self.model.registry.by_key)
+        self.count_lbl.configure(
+            text=f"{n} shown" + (f" of {total}" if total != n else ""))
+
+    def selected_keys(self):
+        return [k for k in (key_for_iid(self.iids, i)
+                            for i in self.tree.selection()) if k]
+
+    def select(self, key):
+        iid = self.iids.get(key)
+        if iid is None:
+            dev = self.model.registry.by_key.get(key)
+            if dev is not None and dev.state == STATE_INACTIVE:
+                self.show_inactive_var.set(True)
+                self._vis_changed()
+            elif dev is not None and dev.state == STATE_EXPIRED:
+                self.show_expired_var.set(True)
+                self._vis_changed()
+            iid = self.iids.get(key)
+        if iid:
+            with contextlib.suppress(tk.TclError):
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+                self.tree.focus(iid)
+
+    def _details(self):
+        keys = self.selected_keys()
+        if keys:
+            self.app.show_device(keys[0])
+
+    def _context(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        key = key_for_iid(self.iids, iid)
+        dev = self.model.registry.by_key.get(key)
+        if dev is None:
+            return
+        app = self.app
+        popup_menu(app, event, app.device_menu_items(dev))
+
+    def merge_dialog(self):
+        keys = self.selected_keys()
+        if len(keys) == 2:
+            self.app.merge_devices_ui(keys[0], keys[1])
+            return
+        if len(keys) == 1:
+            self.app.merge_with_ui(keys[0])
+            return
+        messagebox.showinfo(
+            "Merge devices", "Select one device (to choose what to merge it "
+            "with) or two devices (Ctrl+click), then click Merge.",
+            parent=self.app.root)
+
+    def reset(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+        self._count()
+
+
+# ---- Websites -----------------------------------------------------------------
+class WebsitesTab(BaseTab):
+    name, label_key = "websites", "tab_websites"
+    COLS = [("hits", "Lookups / visits", 110, "e", False),
+            ("traffic", "Traffic", 90, "e", False),
+            ("who", "Contacted by", 200, "w", True),
+            ("security", "Security", 120, "w", False),
+            ("category", "Category", 120, "w", False),
+            ("source", "Seen via", 130, "w", False),
+            ("first", "First seen", 80, "center", False),
+            ("last", "Last seen", 80, "center", False),
+            ("where", "Where", 110, "w", False),
+            ("ips", "Server IPs", 160, "w", False)]
+    SORTS = ("Most contacted", "Most traffic", "Recently seen",
+             "First seen")
+
+    def build(self):
+        self.header("🌍  Websites and online services your devices looked up "
+                    "or connected to.",
+                    "For secure (https) sites MiniWireshark sees only the "
+                    "site NAME (e.g. example.com) — never the page or full "
+                    "address like https://example.com/private/page. Lookups "
+                    "hidden by encrypted DNS or a VPN can't be listed.")
+        bar = self.toolbar()
+        self.lbl(bar, "Search:").pack(side="left")
+        self.q_var = tk.StringVar()
+        e = ttk.Entry(bar, textvariable=self.q_var, width=16)
+        e.pack(side="left", padx=(4, 8))
+        e.bind("<KeyRelease>", lambda ev: self.schedule())
+        self.dev_var = tk.StringVar(value="All devices")
+        self.dev_box = self._combo(bar, "Device:", self.dev_var,
+                                   ["All devices"], 20)
+        self.dev_box.bind("<Button-1>", lambda e: self.dev_box.configure(
+            values=self.device_choices()), add="+")
+        self.src_var = tk.StringVar(value="Any source")
+        self._combo(bar, "Seen via:", self.src_var,
+                    ["Any source", "DNS", "TLS SNI", "HTTP Host"], 11)
+        self.enc_var = tk.StringVar(value="Any")
+        self._combo(bar, "Security:", self.enc_var,
+                    ["Any", "Encrypted", "Not encrypted"], 12)
+        self.cat_var = tk.StringVar(value="Any category")
+        self._combo(bar, "Category:", self.cat_var,
+                    ["Any category", "Advertising", "Analytics", "Tracking",
+                     "Social", "CDN", "Content", "Uncategorised"], 13)
+        self.sort_var = tk.StringVar(value="Most contacted")
+        self._combo(bar, "Sort:", self.sort_var, list(self.SORTS), 13)
+        wrap, self.tree = make_tree(self.frame, self.COLS,
+                                    show="tree headings")
+        self.tree.heading("#0", text="Website (grouped by main domain)")
+        self.tree.column("#0", width=280, stretch=True)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree.bind("<Double-1>", self._details)
+        self.tree.bind("<Button-3>", self._context)
+        self.tree.bind("<Button-2>", self._context)
+        self.iid_to_key = {}
+        self.key_to_iid = {}
+        self.group_iid = {}
+        self._job = None
+        self._dirty = False
+        self.count_lbl = self.lbl(bar, "", muted=True)
+        self.count_lbl.pack(side="right")
+
+    def _combo(self, bar, label, var, values, width):
+        self.lbl(bar, label).pack(side="left")
+        cb = ttk.Combobox(bar, textvariable=var, values=values, width=width,
+                          state="readonly")
+        cb.pack(side="left", padx=(4, 8))
+        cb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
+        return cb
+
+    def schedule(self):
+        if self._job:
+            with contextlib.suppress(tk.TclError):
+                self.frame.after_cancel(self._job)
+        self._job = self.frame.after(350, self.rebuild)
+
+    def set_filter(self, text):
+        self.q_var.set(text or "")
+        self.rebuild()
+
+    def _match(self, w, dev_key):
+        q = self.q_var.get().strip().lower()
+        if q and q not in w.domain and q not in w.registrable:
+            return False
+        if dev_key and dev_key not in w.devices:
+            return False
+        src = self.src_var.get()
+        if src != "Any source" and src not in w.sources:
+            return False
+        enc = self.enc_var.get()
+        if enc == "Encrypted" and not (w.encrypted and not w.cleartext):
+            return False
+        if enc == "Not encrypted" and not w.cleartext:
+            return False
+        cat = self.cat_var.get()
+        if cat == "Uncategorised" and w.category:
+            return False
+        if cat not in ("Any category", "Uncategorised") and \
+                w.category != cat:
+            return False
+        return True
+
+    def _values(self, w):
+        who = ", ".join(self.app.short_device_name(k)
+                        for k in sorted(w.devices)[:3]) or "—"
+        if len(w.devices) > 3:
+            who += f" +{len(w.devices) - 3}"
+        where = ", ".join(sorted(w.countries)[:3])
+        return (w.requests, _human_bytes(w.bytes) if w.bytes else "—",
+                who, w.encryption_text(), w.category or "",
+                ", ".join(sorted(w.sources)), fmt_clock(w.first_seen),
+                fmt_clock(w.last_seen), where,
+                ", ".join(sorted(w.resolved_ips)[:2]))
+
+    def _sorted(self, recs):
+        s = self.sort_var.get()
+        if s == "Most traffic":
+            return sorted(recs, key=lambda w: -w.bytes)
+        if s == "Recently seen":
+            return sorted(recs, key=lambda w: -w.last_seen)
+        if s == "First seen":
+            return sorted(recs, key=lambda w: w.first_seen)
+        return sorted(recs, key=lambda w: -w.requests)
+
+    def rebuild(self):
+        self._job = None
+        self._dirty = False
+        self.tree.delete(*self.tree.get_children())
+        self.iid_to_key.clear()
+        self.key_to_iid.clear()
+        self.group_iid.clear()
+        dev_key = self.device_key_from_choice(self.dev_var.get())
+        recs = [w for w in self.model.websites.values()
+                if self._match(w, dev_key)]
+        grouped = self.app.config.get("websites.group_subdomains", True)
+        if grouped:
+            groups = defaultdict(list)
+            for w in recs:
+                groups[w.registrable or w.domain].append(w)
+            order = sorted(groups.items(), key=lambda kv: self._group_key(
+                kv[1]))
+            for reg, members in order[:3000]:
+                if len(members) == 1 and members[0].domain == reg:
+                    self._row("", members[0])
+                    continue
+                agg = self._agg(members)
+                giid = self.tree.insert("", "end", text=f"{reg}  "
+                                        f"({len(members)})", values=agg,
+                                        open=False)
+                self.group_iid[reg] = giid
+                self.iid_to_key[giid] = ("group", reg)
+                for w in self._sorted(members)[:300]:
+                    self._row(giid, w)
+        else:
+            for w in self._sorted(recs)[:5000]:
+                self._row("", w)
+        self.count_lbl.configure(text=f"{len(recs)} sites")
+
+    def _group_key(self, members):
+        s = self.sort_var.get()
+        if s == "Most traffic":
+            return -sum(w.bytes for w in members)
+        if s == "Recently seen":
+            return -max(w.last_seen for w in members)
+        if s == "First seen":
+            return min(w.first_seen for w in members)
+        return -sum(w.requests for w in members)
+
+    def _agg(self, members):
+        devs = set()
+        for w in members:
+            devs |= w.devices
+        enc = any(w.encrypted for w in members)
+        clear = any(w.cleartext for w in members)
+        sec = "Mixed" if enc and clear else ("⚠ Not encrypted" if clear
+                                             else ("\U0001F512 Encrypted"
+                                                   if enc else "Unknown"))
+        cats = {w.category for w in members if w.category}
+        who = ", ".join(self.app.short_device_name(k)
+                        for k in sorted(devs)[:3]) or "—"
+        b = sum(w.bytes for w in members)
+        return (sum(w.requests for w in members),
+                _human_bytes(b) if b else "—", who, sec,
+                ", ".join(sorted(cats)), "",
+                fmt_clock(min(w.first_seen for w in members)),
+                fmt_clock(max(w.last_seen for w in members)), "", "")
+
+    def _row(self, parent, w):
+        iid = self.tree.insert(parent, "end", text=w.domain,
+                               values=self._values(w))
+        self.iid_to_key[iid] = ("site", w.domain)
+        self.key_to_iid[w.domain] = iid
+
+    def update_keys(self, keys):
+        """Incremental: update rows that exist; anything new triggers a
+        throttled rebuild (new rows must land in the right group/order)."""
+        for k in keys:
+            w = self.model.websites.get(k)
+            iid = self.key_to_iid.get(k)
+            if w is None:
+                continue
+            if iid is None:
+                self._dirty = True
+                continue
+            with contextlib.suppress(tk.TclError):
+                self.tree.item(iid, values=self._values(w))
+
+    def refresh(self):
+        if self._dirty and self.is_visible() and self._job is None:
+            self._job = self.frame.after(10, self.rebuild)
+
+    def selected(self):
+        sel = self.tree.selection()
+        return self.iid_to_key.get(sel[0]) if sel else None
+
+    def _details(self, _e=None):
+        k = self.selected()
+        if k and k[0] == "site":
+            self.app.show_website(k[1])
+
+    def _context(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        k = self.iid_to_key.get(iid)
+        if not k:
+            return
+        dom = k[1]
+        app = self.app
+        items = []
+        if k[0] == "site":
+            items.append(("Details", lambda: app.show_website(dom)))
+        items += [("Copy domain", lambda: copy_to_clipboard(app, dom)),
+                  ("Filter to this site", lambda: self.set_filter(dom)),
+                  ("Show contacting devices",
+                   lambda: app.show_website_devices(dom)),
+                  ("Show remote hosts", lambda: app.goto("remote", dom)),
+                  ("Show its packets", lambda: app.goto("packets",
+                                                        f"site:{dom}"))]
+        popup_menu(app, event, items)
+
+    def select(self, dom):
+        self.q_var.set("")
+        if dom not in self.key_to_iid:
+            self.rebuild()
+        iid = self.key_to_iid.get(dom) or self.group_iid.get(dom)
+        if iid:
+            with contextlib.suppress(tk.TclError):
+                parent = self.tree.parent(iid)
+                if parent:
+                    self.tree.item(parent, open=True)
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+        else:
+            self.set_filter(dom)
+
+    def reset(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iid_to_key.clear()
+        self.key_to_iid.clear()
+        self.group_iid.clear()
+
+
+# ---- Connections (Advanced) ---------------------------------------------------
+class ConnectionsTab(BaseTab):
+    name, label_key, advanced = "connections", "tab_connections", True
+    COLS = [("device", "Device", 160, "w", False),
+            ("to", "Connected to", 220, "w", True),
+            ("purpose", "Purpose", 190, "w", True),
+            ("up", "Upload", 80, "e", False),
+            ("down", "Download", 80, "e", False),
+            ("dur", "Duration", 80, "e", False),
+            ("status", "Status", 120, "w", False),
+            ("local", "Local endpoint", 160, "w", False),
+            ("remote", "Remote endpoint", 170, "w", False),
+            ("transport", "Transport", 70, "w", False),
+            ("port", "Port", 60, "e", False),
+            ("packets", "Packets", 70, "e", False),
+            ("tcp", "TCP state", 110, "w", False),
+            ("security", "Security", 120, "w", False),
+            ("domain", "Domain (how known)", 200, "w", False),
+            ("asn", "Provider / country", 170, "w", False),
+            ("id", "ID", 60, "e", False)]
+    BEGINNER = ("device", "to", "purpose", "up", "down", "dur", "status")
+
+    def build(self):
+        self.header("\U0001F517  Connections — each row is one "
+                    "conversation between a device and something else. "
+                    "Upload is what the device sent; download is what it "
+                    "received.",
+                    "Double-click for a plain-English report. “Domain "
+                    "(how known)” says whether the name was seen in the "
+                    "connection itself or inferred from an earlier lookup.")
+        bar = self.toolbar()
+        self.lbl(bar, "Search:").pack(side="left")
+        self.q_var = tk.StringVar()
+        e = ttk.Entry(bar, textvariable=self.q_var, width=16)
+        e.pack(side="left", padx=(4, 8))
+        e.bind("<KeyRelease>", lambda ev: self.rebuild())
+        self.dev_var = tk.StringVar(value="All devices")
+        self.lbl(bar, "Device:").pack(side="left")
+        self.dev_box = ttk.Combobox(bar, textvariable=self.dev_var, width=22,
+                                    values=["All devices"], state="readonly")
+        self.dev_box.pack(side="left", padx=(4, 8))
+        self.dev_box.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
+        self.dev_box.bind("<Button-1>", lambda e: self.dev_box.configure(
+            values=self.device_choices()), add="+")
+        self.status_var = tk.StringVar(value="All")
+        self.lbl(bar, "Status:").pack(side="left")
+        sb = ttk.Combobox(bar, textvariable=self.status_var, width=10,
+                          values=["All", "Open", "Finished", "Reset",
+                                  "Not encrypted"], state="readonly")
+        sb.pack(side="left", padx=(4, 8))
+        sb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
+        self.tech_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="Technical columns", variable=self.tech_var,
+                        command=self.apply_mode).pack(side="left")
+        self.count_lbl = self.lbl(bar, "", muted=True)
+        self.count_lbl.pack(side="right")
+        wrap, self.tree = make_tree(self.frame, self.COLS, hscroll=True)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree.bind("<Double-1>", self._details)
+        self.tree.bind("<Button-3>", self._context)
+        self.tree.bind("<Button-2>", self._context)
+        self.iids = {}
+        self.apply_mode()
+
+    def apply_mode(self):
+        cols = [c[0] for c in self.COLS]
+        if not self.tech_var.get():
+            cols = list(self.BEGINNER)
+        with contextlib.suppress(tk.TclError):
+            self.tree.configure(displaycolumns=cols)
+
+    def set_filter(self, text=None, device_key=None):
+        if text is not None:
+            self.q_var.set(text)
+        if device_key:
+            dev = self.model.registry.by_key.get(device_key)
+            if dev:
+                self.dev_var.set(f"{dev.display_name()}  [{dev.ip or dev.mac}]")
+        self.rebuild()
+
+    def _match(self, f, dev_key, q):
+        if dev_key and f.device_key != dev_key:
+            return False
+        st = self.status_var.get()
+        if st == "Open" and f.closed:
+            return False
+        if st == "Finished" and not f.closed:
+            return False
+        if st == "Reset" and not f.rst:
+            return False
+        if st == "Not encrypted" and f.encrypted != "no":
+            return False
+        if self.app.beginner_mode and self.app.config.get(
+                "connections.hide_short_beginner", True) and \
+                f.closed and f.duration < 1 and f.packets < 3:
+            return False
+        if q:
+            hay = " ".join(str(x) for x in (
+                f.local_ip, f.remote_ip, f.domain, f.app, f.service,
+                f.remote_port, self.app.short_device_name(f.device_key),
+                f.org)).lower()
+            if q not in hay:
+                return False
+        return True
+
+    def values(self, f):
+        to = f.domain or f.remote_ip
+        if f.domain and f.domain_conf and f.domain_conf != "Observed":
+            to += "  (likely)"
+        port = f.remote_port if f.transport in ("TCP", "UDP") else ""
+        tcp = ""
+        if f.transport == "TCP":
+            bits = []
+            if f.syn:
+                bits.append("SYN")
+            if f.synack:
+                bits.append("SYN-ACK")
+            if f.fin_out or f.fin_in:
+                bits.append("FIN")
+            if f.rst:
+                bits.append(f"RST×{f.rst}")
+            if f.retrans:
+                bits.append(f"retx×{f.retrans}")
+            tcp = " ".join(bits)
+        prov = " · ".join(x for x in (f"AS{f.asn} {f.org}".strip()
+                                           if f.asn else f.org,
+                                           f.country) if x)
+        return (self.app.short_device_name(f.device_key) if f.device_key
+                else f.local_ip, to, f.purpose(),
+                _human_bytes(f.bytes_out), _human_bytes(f.bytes_in),
+                human_duration(f.duration), f.status_text(),
+                f"{f.local_ip}:{f.local_port}" if f.local_port else
+                f.local_ip,
+                f"{f.remote_ip}:{f.remote_port}" if f.remote_port else
+                f.remote_ip,
+                f.transport, port, f.packets, tcp, f.encryption_text(),
+                f"{f.domain} ({f.domain_conf})" if f.domain else "—",
+                prov, f.fid)
+
+    def update_ids(self, fids):
+        if not self.is_visible():
+            self._pending = True
+            return
+        dev_key = self.device_key_from_choice(self.dev_var.get())
+        q = self.q_var.get().strip().lower()
+        for fid in fids:
+            f = self.model.flows.get(fid)
+            if f is None or not self._match(f, dev_key, q):
+                tree_remove(self.tree, self.iids, fid)
+                continue
+            tree_upsert(self.tree, self.iids, fid, self.values(f),
+                        index=0 if fid not in self.iids else "end")
+        if len(self.iids) > 3000:
+            for fid in sorted(self.iids)[:len(self.iids) - 3000]:
+                tree_remove(self.tree, self.iids, fid)
+        self.count_lbl.configure(text=f"{len(self.iids)} shown")
+
+    def refresh(self):
+        if getattr(self, "_pending", False) and self.is_visible():
+            self._pending = False
+            self.rebuild()
+
+    def rebuild(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+        dev_key = self.device_key_from_choice(self.dev_var.get())
+        q = self.q_var.get().strip().lower()
+        flows = [f for f in self.model.flows.all_flows()
+                 if self._match(f, dev_key, q)]
+        flows.sort(key=lambda f: -f.last_seen)
+        for f in flows[:3000]:
+            tree_upsert(self.tree, self.iids, f.fid, self.values(f))
+        self.count_lbl.configure(text=f"{len(self.iids)} shown")
+
+    def select(self, fid):
+        if fid not in self.iids:
+            self.status_var.set("All")
+            self.q_var.set("")
+            self.dev_var.set("All devices")
+            self.rebuild()
+        iid = self.iids.get(fid)
+        if iid:
+            with contextlib.suppress(tk.TclError):
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+
+    def selected(self):
+        sel = self.tree.selection()
+        return key_for_iid(self.iids, sel[0]) if sel else None
+
+    def _details(self, _e=None):
+        fid = self.selected()
+        if fid is not None:
+            self.app.show_flow(fid)
+
+    def _context(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        fid = key_for_iid(self.iids, iid)
+        f = self.model.flows.get(fid)
+        if f is None:
+            return
+        app = self.app
+        items = [("Details", lambda: app.show_flow(fid)),
+                 ("Copy remote address",
+                  lambda: copy_to_clipboard(app, f"{f.remote_ip}:"
+                                                 f"{f.remote_port}")),
+                 ("Show its packets", lambda: app.goto("packets",
+                                                       f"stream:{fid}"))]
+        if f.device_key:
+            items.append(("Go to device", lambda: app.goto("device",
+                                                           f.device_key)))
+        if f.domain:
+            items.append(("Go to website", lambda: app.goto("websites",
+                                                            f.domain)))
+        if f.remote_public:
+            items.append(("Go to remote host", lambda: app.goto(
+                "remote", f.remote_ip)))
+        popup_menu(app, event, items)
+
+    def reset(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+
+
+# ---- Remote hosts (Advanced) -------------------------------------------------
+class RemoteTab(BaseTab):
+    name, label_key, advanced = "remote", "tab_remote", True
+    COLS = [("ip", "Remote IP", 130, "w", False),
+            ("country", "Country", 150, "w", False),
+            ("asn", "Provider (ASN)", 190, "w", True),
+            ("domain", "Known name(s)", 210, "w", True),
+            ("ports", "Ports", 90, "w", False),
+            ("protocols", "Protocol(s)", 100, "w", False),
+            ("who", "Contacted by", 170, "w", True),
+            ("traffic", "Traffic ↑/↓", 150, "w", False),
+            ("conns", "Connections", 85, "e", False),
+            ("packets", "Packets", 70, "e", False),
+            ("first", "First seen", 80, "center", False),
+            ("last", "Last seen", 80, "center", False)]
+
+    def build(self):
+        self.header("\U0001F5A5  REMOTE HOSTS — public Internet addresses "
+                    "your devices talked to. These are never devices on your "
+                    "network — they live somewhere out on the Internet.")
+        geo = self.toolbar()
+        self.geoip_var = tk.BooleanVar(
+            value=self.app.config.get("privacy.geoip_enabled", False))
+        cb = ttk.Checkbutton(geo, text="Online country lookup",
+                             variable=self.geoip_var,
+                             command=lambda: self.app._set_geoip_enabled(
+                                 self.geoip_var.get()))
+        cb.pack(side="left")
+        Tooltip(cb, "Sends each remote IP address (never your own devices, "
+                    "never packet contents) to a public geolocation service "
+                    "to find its country. Off by default. The offline "
+                    "database (Settings → Privacy) needs no online "
+                    "lookups.")
+        ttk.Button(geo, text="Test", width=6,
+                   command=self.app._geoip_test).pack(side="left",
+                                                       padx=(10, 0))
+        ttk.Button(geo, text="Retry failed", width=12,
+                   command=self.app._geoip_retry).pack(side="left",
+                                                        padx=(6, 0))
+        self.lbl(geo, "   Search:").pack(side="left")
+        self.q_var = tk.StringVar()
+        e = ttk.Entry(geo, textvariable=self.q_var, width=16)
+        e.pack(side="left", padx=4)
+        e.bind("<KeyRelease>", lambda ev: self.rebuild())
+        self.status_var = tk.StringVar()
+        tk.Label(self.frame, textvariable=self.status_var, bg=WHITE,
+                 fg="#666666", justify="left", anchor="w", wraplength=1100,
+                 font=("TkDefaultFont", 9)).pack(fill="x", padx=12)
+        wrap, self.tree = make_tree(self.frame, self.COLS)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(4, 6))
+        self.tree.bind("<Double-1>", self._details)
+        self.tree.bind("<Button-3>", self._context)
+        self.tree.bind("<Button-2>", self._context)
+        self.iids = {}
+
+    def _match(self, r):
+        q = self.q_var.get().strip().lower()
+        if not q:
+            return True
+        hay = " ".join([r.ip, r.domain, " ".join(r.domains), r.country,
+                        r.country_name, r.org, str(r.asn)]).lower()
+        return q in hay
+
+    def values(self, r):
+        app = self.app
+        who = ", ".join(app.short_device_name(k)
+                        for k in sorted(r.devices)[:3]) or "—"
+        names = r.domain or ""
+        if len(r.domains) > 1:
+            names += f" +{len(r.domains) - 1}"
+        if r.vpn_endpoint:
+            names = f"(likely {r.vpn_endpoint} VPN server) " + names
+        return (r.ip, r.location_text() or "—",
+                r.provider_text() or "—", names or "(no name seen)",
+                ", ".join(str(p) for p in sorted(r.ports)[:4]) or "—",
+                ", ".join(sorted(r.protocols)[:4]) or "—", who,
+                f"↑{_human_bytes(r.bytes_out)} "
+                f"↓{_human_bytes(r.bytes_in)}", r.connections,
+                r.packets, fmt_clock(r.first_seen), fmt_clock(r.last_seen))
+
+    def update_keys(self, ips):
+        if not self.is_visible():
+            self._pending = True
+            return
+        for ip in ips:
+            r = self.model.remote_hosts.get(ip)
+            if r is None or not self._match(r):
+                tree_remove(self.tree, self.iids, ip)
+                continue
+            tree_upsert(self.tree, self.iids, ip, self.values(r))
+
+    def refresh(self):
+        self.status_var.set(self.app._geoip_status_text())
+        if getattr(self, "_pending", False) and self.is_visible():
+            self._pending = False
+            self.rebuild()
+
+    def rebuild(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+        recs = sorted(self.model.remote_hosts.values(),
+                      key=lambda r: -r.bytes_total)
+        for r in recs[:5000]:
+            if self._match(r):
+                tree_upsert(self.tree, self.iids, r.ip, self.values(r))
+
+    def set_filter(self, text):
+        self.q_var.set(text or "")
+        self.rebuild()
+
+    def select(self, ip):
+        if ip not in self.iids:
+            self.set_filter(ip)
+        iid = self.iids.get(ip)
+        if iid:
+            with contextlib.suppress(tk.TclError):
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+
+    def _details(self, _e=None):
+        sel = self.tree.selection()
+        if sel:
+            ip = key_for_iid(self.iids, sel[0])
+            if ip:
+                self.app.show_remote(ip)
+
+    def _context(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        ip = key_for_iid(self.iids, iid)
+        r = self.model.remote_hosts.get(ip)
+        if r is None:
+            return
+        app = self.app
+        popup_menu(app, event, [
+            ("Details", lambda: app.show_remote(ip)),
+            ("Copy IP", lambda: copy_to_clipboard(app, ip)),
+            ("Filter to this host", lambda: self.set_filter(ip)),
+            ("Show devices that contacted it",
+             lambda: app.show_remote(ip)),
+            ("Show domain associations",
+             lambda: app.goto("websites", r.domain) if r.domain else
+             app._set_banner("No website names were seen for this "
+                             "address.")),
+            ("Show its connections",
+             lambda: app.goto("connections", ip)),
+        ])
+
+    def reset(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+
+
+
+# ---- Alerts ------------------------------------------------------------------
+class AlertsTab(BaseTab):
+    name, label_key = "alerts", "tab_alerts"
+
+    def build(self):
+        top = self.header("\U0001F514  Alerts — every alert separates "
+                          "what was observed from what it might mean. These "
+                          "are ANOMALIES (unusual behaviour), never a "
+                          "verdict that something is hacked.")
+        legend = tk.Frame(top, bg=WHITE)
+        legend.pack(anchor="w", pady=(6, 0))
+        for icon, name, fg in (("ℹ", tr("legend_info"), "#333333"),
+                               ("⚠", tr("legend_warning"), "#8a5a00"),
+                               ("‼", tr("legend_danger"), "#a01a08")):
+            tk.Label(legend, text=f"{icon} {name}", bg=WHITE, fg=fg,
+                     font=("TkDefaultFont", 9)).pack(side="left",
+                                                     padx=(0, 16))
+        bar = self.toolbar()
+        self.show_ack_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bar, text="Show acknowledged", command=self.rebuild,
+                        variable=self.show_ack_var).pack(side="left")
+        self.sev_var = tk.StringVar(value="All")
+        self.lbl(bar, "  Severity:").pack(side="left")
+        sb = ttk.Combobox(bar, textvariable=self.sev_var, width=10,
+                          values=["All", "DANGER", "WARNING", "INFO"],
+                          state="readonly")
+        sb.pack(side="left", padx=4)
+        sb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
+        for label, fn in (("Copy report", self.copy_report),
+                          ("Go to related", self.goto_related),
+                          ("Mute for this device", self.mute_device),
+                          ("Mute this type", self.mute_type),
+                          ("Mark expected", self.mark_expected),
+                          ("Acknowledge", self.acknowledge),
+                          ("Details", self._details)):
+            ttk.Button(bar, text=label, command=fn).pack(side="right",
+                                                         padx=(4, 0))
+        wrap, self.tree = make_tree(
+            self.frame, [("sev", "Severity", 100, "w", False),
+                         ("when", "Last seen", 80, "center", False),
+                         ("reason", "What happened", 440, "w", True),
+                         ("device", "Related to", 190, "w", False),
+                         ("conf", "Confidence", 85, "w", False),
+                         ("count", "Times", 55, "e", False),
+                         ("status", "Status", 110, "w", False)],
+            selectmode="extended")
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.tree.bind("<Double-1>", self._details)
+        self.tree.bind("<Return>", self._details)
+        self.tree.bind("<Button-3>", self._context)
+        self.tree.bind("<Button-2>", self._context)
+        self.iids = {}
+        self.on_theme()
+
+    def on_theme(self):
+        for sev, (fg, bg) in self.app._severity_colors().items():
+            with contextlib.suppress(tk.TclError):
+                self.tree.tag_configure(sev, foreground=fg,
+                                        background=bg or "")
+        with contextlib.suppress(tk.TclError):
+            self.tree.tag_configure("ack", foreground=self.t["muted_fg"],
+                                    background="")
+
+    def _visible(self, a):
+        if a.acknowledged and not self.show_ack_var.get():
+            return False
+        if self.sev_var.get() != "All" and a.severity != self.sev_var.get():
+            return False
+        return True
+
+    def values(self, a):
+        dev = self.model.registry.by_key.get(a.device_key)
+        who = dev.display_name() if dev else (a.device_key.replace(
+            "ip:", "") or "—")
+        icon = self.app.SEVERITY_ICON.get(a.severity, "")
+        status = "Acknowledged" if a.acknowledged else "New"
+        if not a.live:
+            status += " (saved)"
+        return (f"{icon} {a.severity}", fmt_clock(a.last_seen or a.when),
+                a.reason, who, a.confidence, a.count, status)
+
+    def upsert(self, a):
+        if not self._visible(a):
+            tree_remove(self.tree, self.iids, a.id)
+            return
+        tags = ("ack",) if a.acknowledged else (a.severity,)
+        tree_upsert(self.tree, self.iids, a.id, self.values(a), tags=tags,
+                    index=0)
+
+    def rebuild(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+        for aid in reversed(self.model.alerts.order):
+            a = self.model.alerts.alerts.get(aid)
+            if a:
+                self.upsert(a)
+
+    def selected(self):
+        out = []
+        for iid in self.tree.selection():
+            aid = key_for_iid(self.iids, iid)
+            a = self.model.alerts.alerts.get(aid)
+            if a:
+                out.append(a)
+        return out
+
+    def select(self, aid):
+        if aid not in self.iids:
+            self.show_ack_var.set(True)
+            self.sev_var.set("All")
+            self.rebuild()
+        iid = self.iids.get(aid)
+        if iid:
+            with contextlib.suppress(tk.TclError):
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+
+    def _details(self, _e=None):
+        sel = self.selected()
+        if sel:
+            self.app.show_alert(sel[0].id)
+
+    def acknowledge(self):
+        for a in self.selected():
+            a.acknowledged = True
+            self.upsert(a)
+
+    def mark_expected(self):
+        for a in self.selected():
+            self.app.alert_mark_expected(a)
+            self.upsert(a)
+
+    def mute_type(self):
+        sel = self.selected()
+        if sel:
+            self.app.alert_mute_type(sel[0])
+
+    def mute_device(self):
+        for a in self.selected():
+            self.app.alert_mute_device(a)
+            self.upsert(a)
+
+    def goto_related(self):
+        sel = self.selected()
+        if sel:
+            self.app.alert_goto_related(sel[0])
+
+    def copy_report(self):
+        sel = self.selected()
+        if sel:
+            copy_to_clipboard(self.app, self.app.alert_text(sel[0]))
+
+    def _context(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        popup_menu(self.app, event, [
+            ("Details", self._details), ("Acknowledge", self.acknowledge),
+            ("Mark expected", self.mark_expected),
+            ("Mute this alert type", self.mute_type),
+            ("Mute for this device", self.mute_device), None,
+            ("Go to related item", self.goto_related),
+            ("Copy report", self.copy_report)])
+
+    def reset(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+
+
+# ---- Network map v2 ----------------------------------------------------------
+class MapTab(BaseTab):
+    name, label_key = "map", "tab_map"
+
+    def build(self):
+        top = tk.Frame(self.frame, bg=WHITE, padx=10, pady=6)
+        top.pack(fill="x")
+        tk.Label(top, text="\U0001F5FA  Network map", bg=WHITE, fg="#333333",
+                 font=("TkDefaultFont", 11, "bold")).pack(side="left")
+        tk.Label(top, text="   Click a node to select it, double-click for "
+                           "details, drag the background to move, scroll or "
+                           "use +/− to zoom.", bg=WHITE, fg="#888888",
+                 font=("TkDefaultFont", 9)).pack(side="left")
+        ctrl = self.toolbar()
+        self.mode_var = tk.StringVar(value="Topology")
+        ttk.Radiobutton(ctrl, text="Topology (your LAN)",
+                        variable=self.mode_var, value="Topology",
+                        command=self.redraw).pack(side="left")
+        ttk.Radiobutton(ctrl, text="Connections (device → website → "
+                                   "remote host)", variable=self.mode_var,
+                        value="Connections",
+                        command=self.redraw).pack(side="left", padx=(12, 0))
+        self.lbl(ctrl, "   Device:").pack(side="left")
+        self.dev_var = tk.StringVar(value="All devices")
+        self.dev_box = ttk.Combobox(ctrl, textvariable=self.dev_var,
+                                    state="readonly", width=24,
+                                    values=["All devices"])
+        self.dev_box.pack(side="left", padx=4)
+        self.dev_box.bind("<<ComboboxSelected>>", lambda e: self.redraw())
+        self.dev_box.bind("<Button-1>", lambda e: self.dev_box.configure(
+            values=self.device_choices()), add="+")
+        self.inactive_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctrl, text="Include offline devices",
+                        variable=self.inactive_var,
+                        command=self.redraw).pack(side="left", padx=(8, 0))
+        ttk.Button(ctrl, text="Reset view", command=self.reset_view).pack(
+            side="right")
+        ttk.Button(ctrl, text="−", width=3,
+                   command=lambda: self.zoom(0.8)).pack(side="right", padx=2)
+        ttk.Button(ctrl, text="+", width=3,
+                   command=lambda: self.zoom(1.25)).pack(side="right", padx=2)
+        self.info_var = tk.StringVar(value="")
+        tk.Label(self.frame, textvariable=self.info_var, bg=WHITE,
+                 fg="#666666", anchor="w", font=("TkDefaultFont", 9)).pack(
+            fill="x", padx=12)
+        self.c = tk.Canvas(self.frame, bg=WHITE, highlightthickness=0)
+        self.c.pack(fill="both", expand=True, padx=10, pady=6)
+        self.scale, self.ox, self.oy = 1.0, 0.0, 0.0
+        self.nodes = {}            # canvas item id -> (kind, key, label, info)
+        self.selected = None
+        self._drag = None
+        self._hover_items = []
+        self._last_sig = None
+        self.c.bind("<Configure>", lambda e: self.redraw())
+        self.c.bind("<ButtonPress-1>", self._press)
+        self.c.bind("<B1-Motion>", self._motion)
+        self.c.bind("<ButtonRelease-1>", self._release)
+        self.c.bind("<Double-1>", self._double)
+        self.c.bind("<Motion>", self._hover)
+        self.c.bind("<Button-3>", self._context)
+        self.c.bind("<Button-2>", self._context)
+        self.c.bind("<MouseWheel>", lambda e: self.zoom(1.1 if e.delta > 0
+                                                        else 0.9))
+        self.c.bind("<Button-4>", lambda e: self.zoom(1.1))
+        self.c.bind("<Button-5>", lambda e: self.zoom(0.9))
+
+    # ---- view transform
+    def P(self, x, y):
+        w, h = self.c.winfo_width(), self.c.winfo_height()
+        return (w / 2 + (x - w / 2) * self.scale + self.ox,
+                h / 2 + (y - h / 2) * self.scale + self.oy)
+
+    def zoom(self, f):
+        self.scale = max(0.4, min(3.0, self.scale * f))
+        self.redraw(force=True)
+
+    def reset_view(self):
+        self.scale, self.ox, self.oy = 1.0, 0.0, 0.0
+        self.selected = None
+        self.redraw(force=True)
+
+    def _press(self, e):
+        self._drag = (e.x, e.y, self.ox, self.oy, False)
+
+    def _motion(self, e):
+        if self._drag:
+            x0, y0, ox, oy, _m = self._drag
+            if abs(e.x - x0) + abs(e.y - y0) > 3:
+                self.ox, self.oy = ox + e.x - x0, oy + e.y - y0
+                self._drag = (x0, y0, ox, oy, True)
+                self.redraw(force=True)
+
+    def _release(self, e):
+        moved = self._drag[4] if self._drag else False
+        self._drag = None
+        if moved:
+            return
+        node = self._node_at(e.x, e.y)
+        self.selected = (node[0], node[1]) if node else None
+        if node:
+            self.info_var.set(f"Selected: {node[2]} — {node[3]}  "
+                              f"(double-click for details)")
+        else:
+            self.info_var.set("")
+        self.redraw(force=True)
+
+    def _double(self, e):
+        node = self._node_at(e.x, e.y)
+        if node:
+            self._open(node[0], node[1])
+
+    def _open(self, kind, key):
+        app = self.app
+        if kind == "device":
+            app.show_device(key)
+        elif kind == "website":
+            app.show_website(key)
+        elif kind == "remote":
+            app.show_remote(key)
+        elif kind == "router" and app.model.gateway_ip:
+            dev = app.model.device_for(app.model.gateway_ip)
+            if dev:
+                app.show_device(dev.key)
+
+    def _context(self, e):
+        node = self._node_at(e.x, e.y)
+        if not node:
+            return
+        kind, key = node[0], node[1]
+        app = self.app
+        items = [("Details", lambda: self._open(kind, key))]
+        if kind == "device":
+            dev = app.model.registry.by_key.get(key)
+            if dev:
+                items = app.device_menu_items(dev)
+                items.insert(1, ("Focus the map on this device",
+                                 lambda: self._focus(dev)))
+        elif kind == "website":
+            items += [("Copy domain", lambda: copy_to_clipboard(app, key)),
+                      ("Show in Websites", lambda: app.goto("websites",
+                                                            key))]
+        elif kind == "remote":
+            items += [("Copy IP", lambda: copy_to_clipboard(app, key)),
+                      ("Show in Remote hosts", lambda: app.goto("remote",
+                                                                key))]
+        popup_menu(app, e, items)
+
+    def _focus(self, dev):
+        self.dev_var.set(f"{dev.display_name()}  [{dev.ip or dev.mac}]")
+        self.mode_var.set("Connections")
+        self.redraw(force=True)
+
+    def _node_at(self, x, y):
+        for item in reversed(self.c.find_overlapping(x - 3, y - 3, x + 3,
+                                                     y + 3)):
+            if item in self.nodes:
+                return self.nodes[item]
+        return None
+
+    def _hover(self, e):
+        for it in self._hover_items:
+            self.c.delete(it)
+        self._hover_items = []
+        node = self._node_at(e.x, e.y)
+        if not node:
+            self.c.configure(cursor="")
+            return
+        self.c.configure(cursor="hand2")
+        t = self.t
+        txt = self.c.create_text(e.x + 14, e.y + 12, anchor="nw",
+                                 text=f"{node[2]}\n{node[3]}",
+                                 fill=t["tooltip_fg"],
+                                 font=("TkDefaultFont", 9))
+        bb = self.c.bbox(txt)
+        if bb:
+            rect = self.c.create_rectangle(bb[0] - 5, bb[1] - 4, bb[2] + 5,
+                                           bb[3] + 4, fill=t["tooltip_bg"],
+                                           outline=t["border"])
+            self.c.tag_raise(txt, rect)
+            self._hover_items = [rect, txt]
+
+    # ---- drawing
+    def refresh(self):
+        if self.is_visible():
+            self.redraw()
+
+    def _devices(self):
+        devs = [d for d in self.model.registry.by_key.values()
+                if (not d.live) or d.state in (STATE_ACTIVE, STATE_IDLE) or
+                (self.inactive_var.get() and d.state == STATE_INACTIVE)]
+        key = self.device_key_from_choice(self.dev_var.get())
+        if key:
+            devs = [d for d in devs if d.key == key]
+        return devs
+
+    def redraw(self, force=False):
+        c = self.c
+        try:
+            w, h = c.winfo_width(), c.winfo_height()
+        except tk.TclError:
+            return
+        if w < 40 or h < 40:
+            return
+        m = self.model
+        sig = (self.mode_var.get(), self.dev_var.get(), self.scale, self.ox,
+               self.oy, self.selected, len(m.registry.by_key),
+               len(m.websites), len(m.remote_hosts), w, h,
+               self.inactive_var.get(), self.app.theme_name,
+               self.app.high_contrast, int(m.now() // 10))
+        if sig == self._last_sig and not force:
+            return
+        self._last_sig = sig
+        c.delete("all")
+        self.nodes.clear()
+        self._hover_items = []
+        c.configure(bg=self.t["tab_bg"])
+        if self.mode_var.get() == "Topology":
+            self._topology(w, h)
+        else:
+            self._connections(w, h)
+        c.tag_lower("edge")
+
+    def _conf_color(self, conf):
+        t = self.t
+        return {"High": t["conf_high"], "Medium": t["conf_med"],
+                "Low": t["conf_low"]}.get(conf, t["conf_none"])
+
+    def _node(self, x, y, r, fill, kind, key, label, info, hollow=False,
+              letter=""):
+        t = self.t
+        X, Y = self.P(x, y)
+        R = r * max(0.7, min(1.6, self.scale))
+        sel = self.selected == (kind, key)
+        oid = self.c.create_oval(X - R, Y - R, X + R, Y + R,
+                                 fill="" if hollow else fill,
+                                 outline=t["focus"] if sel else fill,
+                                 width=3 if sel else 2)
+        self.nodes[oid] = (kind, key, label, info)
+        if letter:
+            lid = self.c.create_text(X, Y, text=letter,
+                                     fill=t["tab_bg"] if not hollow
+                                     else fill,
+                                     font=("TkDefaultFont", 8, "bold"))
+            self.nodes[lid] = (kind, key, label, info)
+        tid = self.c.create_text(X, Y + R + 8, text=label[:22],
+                                 fill=t["text_fg"],
+                                 font=("TkDefaultFont", 8,
+                                       "bold" if sel else "normal"))
+        self.nodes[tid] = (kind, key, label, info)
+        return X, Y
+
+    def _line(self, a, b, weight=0, dash=(), hi=False):
+        t = self.t
+        width = 1 + min(5, int(math.log10(max(weight, 1)) / 1.5)) \
+            if weight else 1
+        self.c.create_line(a[0], a[1], b[0], b[1],
+                           fill=t["line_hi"] if hi else t["line"],
+                           width=width + (1 if hi else 0), dash=dash,
+                           tags=("edge",))
+
+    def _topology(self, w, h):
+        t, m = self.t, self.model
+        cx, cy = w * 0.36, h / 2
+        devs = sorted(self._devices(), key=lambda d: d.display_name())[:40]
+        gw = m.gateway_ip
+        devs = [d for d in devs if d.ip != gw or not gw]
+        radius = max(80, min(h, w * 0.6) * 0.40)
+        X0, Y0 = self.P(cx, cy)
+        R0 = radius * self.scale
+        self.c.create_oval(X0 - R0, Y0 - R0, X0 + R0, Y0 + R0,
+                           outline=t["muted_fg"], dash=(4, 3))
+        self.c.create_text(X0, Y0 - R0 - 12, text="YOUR LOCAL NETWORK",
+                           fill=t["muted_fg"],
+                           font=("TkDefaultFont", 9, "bold"))
+        n = max(len(devs), 1)
+        rpos = (cx, cy)
+        sel_key = self.selected[1] if self.selected and \
+            self.selected[0] == "device" else None
+        for i, dev in enumerate(devs):
+            ang = (2 * math.pi * i) / n - math.pi / 2
+            x = cx + radius * 0.72 * math.cos(ang)
+            y = cy + radius * 0.72 * math.sin(ang)
+            weight = dev.bytes_up + dev.bytes_down
+            self._line(self.P(*rpos), self.P(x, y), weight,
+                       hi=(dev.key == sel_key))
+            hollow = dev.live and dev.state not in (STATE_ACTIVE, STATE_IDLE)
+            letter = dev.confidence[:1] if dev.confidence != \
+                CONFIDENCE_UNCONFIRMED else "?"
+            info = (f"{dev.class_confidence} {dev.device_class}".strip() +
+                    f" · {dev.ip or dev.mac} · "
+                    f"{dev.confidence} confidence · "
+                    f"{STATE_LABEL.get(dev.state, dev.state)} · "
+                    f"↑{_human_bytes(dev.bytes_up)} "
+                    f"↓{_human_bytes(dev.bytes_down)}")
+            self._node(x, y, 10, self._conf_color(dev.confidence), "device",
+                       dev.key, f"{DEVICE_ICONS.get(dev.type, '')} "
+                                f"{self.app.device_label(dev)}", info,
+                       hollow=hollow, letter=letter)
+        self._node(cx, cy, 18, t["node_router"], "router", "router",
+                   "Your router", gw or "router address not known yet",
+                   letter="R")
+        remotes = sorted(m.remote_hosts.values(),
+                         key=lambda r: -r.bytes_total)[:8]
+        if sel_key:
+            remotes = [r for r in remotes if sel_key in r.devices] or remotes
+        rx = cx + radius + max(90, (w - cx - radius) * 0.55)
+        X, _ = self.P(rx, 0)
+        if remotes:
+            self.c.create_text(X, self.P(0, cy - len(remotes) * 14 - 24)[1],
+                               text="INTERNET (outside your network)",
+                               fill=t["muted_fg"],
+                               font=("TkDefaultFont", 9, "bold"))
+        for i, r in enumerate(remotes):
+            ry = cy + (i - (len(remotes) - 1) / 2) * 30
+            hi = bool(sel_key and sel_key in r.devices)
+            self._line(self.P(cx + radius, cy), self.P(rx, ry),
+                       r.bytes_total, dash=(2, 2), hi=hi)
+            label = r.domain or r.ip
+            self._node(rx, ry, 7, t["node_remote"], "remote", r.ip, label,
+                       f"{r.ip} · {r.location_text() or 'location unknown'}"
+                       f" · {_human_bytes(r.bytes_total)}")
+        if not devs and not remotes:
+            self.c.create_text(20, 20, anchor="nw", fill=t["muted_fg"],
+                               text="Nothing to show yet — start watching "
+                                    "and browse for a bit.")
+        self.c.create_text(10, h - 10, anchor="sw", fill=t["muted_fg"],
+                           font=("TkDefaultFont", 8),
+                           text="Letters show confidence: H=High M=Medium "
+                                "L=Low ?=Unconfirmed. Hollow = offline. "
+                                "Thicker lines = more traffic.")
+
+    def _connections(self, w, h):
+        t, m = self.t, self.model
+        devs = self._devices()
+        sel_dev = self.selected[1] if self.selected and \
+            self.selected[0] == "device" else None
+        devs = sorted(devs, key=lambda d: -(d.bytes_up + d.bytes_down))[:12]
+        dkeys = {d.key for d in devs}
+        focused = self.dev_var.get() != "All devices"
+        sites = sorted(m.websites.values(), key=lambda s: -(s.bytes or
+                                                            s.requests))
+        remotes = sorted(m.remote_hosts.values(), key=lambda r:
+                         -r.bytes_total)
+        if focused or sel_dev:
+            keyset = {sel_dev} if sel_dev else dkeys
+            sites = [s for s in sites if s.devices & keyset]
+            remotes = [r for r in remotes if r.devices & keyset]
+        sites, remotes = sites[:14], remotes[:14]
+        cols = (w * 0.14, w * 0.5, w * 0.86)
+        for label, x in zip(("Devices", "Websites", "Remote hosts"), cols):
+            X, Y = self.P(x, 16)
+            self.c.create_text(X, Y, text=label, fill=t["muted_fg"],
+                               font=("TkDefaultFont", 9, "bold"))
+
+        def positions(items, keyfn):
+            n = max(len(items), 1)
+            step = (h - 50) / n
+            return {keyfn(it): 40 + step * (i + 0.5)
+                    for i, it in enumerate(items)}
+        dy = positions(devs, lambda d: d.key)
+        sy = positions(sites, lambda s: s.domain)
+        ry = positions(remotes, lambda r: r.ip)
+        for s in sites:
+            for dk in s.devices:
+                if dk in dy:
+                    self._line(self.P(cols[0], dy[dk]),
+                               self.P(cols[1], sy[s.domain]),
+                               s.bytes or s.requests * 1000,
+                               hi=(dk == sel_dev))
+        for r in remotes:
+            for dk in r.devices:
+                if dk in dy:
+                    self._line(self.P(cols[0], dy[dk]),
+                               self.P(cols[2], ry[r.ip]), r.bytes_total,
+                               dash=(3, 3), hi=(dk == sel_dev))
+            for s in sites:
+                if r.ip in s.resolved_ips:
+                    self._line(self.P(cols[1], sy[s.domain]),
+                               self.P(cols[2], ry[r.ip]), 0, dash=(1, 3))
+        for d in devs:
+            self._node(cols[0], dy[d.key], 9,
+                       self._conf_color(d.confidence), "device", d.key,
+                       self.app.device_label(d),
+                       f"{d.ip or d.mac} · ↑{_human_bytes(d.bytes_up)}"
+                       f" ↓{_human_bytes(d.bytes_down)}",
+                       letter=d.confidence[:1])
+        for s in sites:
+            self._node(cols[1], sy[s.domain], 7, t["node_site"], "website",
+                       s.domain, s.domain,
+                       f"{s.requests} lookups/visits · "
+                       f"{s.encryption_text()}")
+        for r in remotes:
+            self._node(cols[2], ry[r.ip], 7, t["node_remote"], "remote",
+                       r.ip, r.domain or r.ip,
+                       f"{r.ip} · {r.location_text() or 'location unknown'}")
+        if not devs and not sites and not remotes:
+            self.c.create_text(20, 40, anchor="nw", fill=t["muted_fg"],
+                               text="Nothing to show yet — start watching "
+                                    "and browse for a bit.")
+
+    def reset(self):
+        self.selected = None
+        self._last_sig = None
+        with contextlib.suppress(tk.TclError):
+            self.c.delete("all")
+
+
+# ---- Health ------------------------------------------------------------------
+class HealthTab(BaseTab):
+    name, label_key = "health", "tab_health"
+    CHECKS = (("overall", "Overall"), ("gateway", "Router reachable"),
+              ("internet", "Internet reachable"), ("dns", "Website lookups "
+                                                         "(DNS)"),
+              ("loss", "Packet loss (from checks)"),
+              ("resets", "Connection resets"),
+              ("retrans", "Re-sent data (retransmissions)"),
+              ("dhcp", "Address assignment (DHCP)"),
+              ("dupip", "Duplicate addresses"),
+              ("reconnects", "Devices reconnecting"),
+              ("link", "Network card"), ("driver", "Capture driver"),
+              ("vpn", "VPN"))
+
+    def build(self):
+        outer = tk.Frame(self.frame, bg=WHITE, padx=14, pady=10)
+        outer.pack(fill="both", expand=True)
+        head = tk.Frame(outer, bg=WHITE)
+        head.pack(fill="x")
+        tk.Label(head, text="\U0001FA7A  Network health", bg=WHITE,
+                 fg="#2b3a56", font=("TkDefaultFont", 14, "bold")).pack(
+            side="left")
+        self.run_btn = ttk.Button(head, text="Run checks now",
+                                  command=self.app.run_health_checks)
+        self.run_btn.pack(side="right")
+        self.note_var = tk.StringVar()
+        tk.Label(outer, textvariable=self.note_var, bg=WHITE, fg="#666666",
+                 justify="left", anchor="w", wraplength=1100).pack(
+            fill="x", pady=(2, 8))
+        body = tk.Frame(outer, bg=WHITE)
+        body.pack(fill="both", expand=True)
+        left = tk.Frame(body, bg=WHITE)
+        left.pack(side="left", fill="both", expand=True)
+        self.rows = {}
+        for key, title in self.CHECKS:
+            row = tk.Frame(left, bg="#f6f7fa", padx=10, pady=6,
+                           highlightbackground="#e0e2e8",
+                           highlightthickness=1)
+            row.pack(fill="x", pady=2)
+            st = tk.Label(row, text="?", bg="#f6f7fa", fg="#666666",
+                          width=18, anchor="w",
+                          font=("TkDefaultFont", 10, "bold"))
+            st.pack(side="left")
+            tk.Label(row, text=title, bg="#f6f7fa", fg="#222222", width=26,
+                     anchor="w", font=("TkDefaultFont", 10, "bold")).pack(
+                side="left")
+            ex = tk.Label(row, text="", bg="#f6f7fa", fg="#333333",
+                          anchor="w", justify="left", wraplength=560)
+            ex.pack(side="left", fill="x", expand=True)
+            self.rows[key] = (st, ex, row)
+        right = tk.Frame(body, bg=WHITE, padx=12)
+        right.pack(side="left", fill="both")
+        tk.Label(right, text="Your connection", bg=WHITE, fg="#2b3a56",
+                 font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+        self.info_var = tk.StringVar()
+        tk.Label(right, textvariable=self.info_var, bg=WHITE, fg="#333333",
+                 justify="left", anchor="w", wraplength=420,
+                 font=("TkFixedFont", 9)).pack(
+            anchor="w", pady=(2, 10))
+        tk.Label(right, text="DNS servers seen", bg=WHITE, fg="#2b3a56",
+                 font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+        wrap, self.dns_tree = make_tree(
+            right, [("srv", "Server", 120, "w", False),
+                    ("q", "Queries", 65, "e", False),
+                    ("lat", "Typical ms", 75, "e", False),
+                    ("fail", "Failed", 55, "e", False),
+                    ("nx", "Not found", 70, "e", False)])
+        self.dns_tree.configure(height=8)
+        wrap.pack(fill="both", expand=True)
+
+    STATUS_STYLE = {"Healthy": ("✔ Healthy", "good_fg"),
+                    "Degraded": ("⚠ Degraded", "warn_fg"),
+                    "Needs attention": ("✖ Needs attention",
+                                        "danger_fg"),
+                    "Unknown": ("? Unknown", "muted_fg"),
+                    "Info": ("ℹ Info", "info_fg")}
+
+    def refresh(self):
+        if not self.is_visible():
+            return
+        app = self.app
+        results = app.health_summary()
+        for key, (status, text) in results.items():
+            if key not in self.rows:
+                continue
+            st, ex, _row = self.rows[key]
+            label, tok = self.STATUS_STYLE.get(status,
+                                               self.STATUS_STYLE["Unknown"])
+            with contextlib.suppress(tk.TclError):
+                st.configure(text=label, fg=self.t[tok])
+                ex.configure(text=text)
+        self.note_var.set(app.health_note())
+        self.info_var.set(app.connection_info_text())
+        allowed = app.health_checks_allowed()
+        with contextlib.suppress(tk.TclError):
+            self.run_btn.state(["!disabled"] if allowed else ["disabled"])
+        self.dns_tree.delete(*self.dns_tree.get_children())
+        for ip, q, resp, nx, fail, lat in self.model.dns.summary_rows()[:20]:
+            self.dns_tree.insert("", "end", values=(
+                ip, q, f"{lat:.0f}" if lat is not None else "—",
+                fail, nx))
+
+
+
+# ---- Security check ----------------------------------------------------------
+class SecurityTab(BaseTab):
+    name, label_key = "security", "tab_security"
+
+    def build(self):
+        outer = tk.Frame(self.frame, bg=WHITE)
+        outer.pack(fill="both", expand=True, padx=14, pady=12)
+        tk.Label(outer, text="🔒  Security check", bg=WHITE, fg="#2b3a56",
+                 font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+        tk.Label(outer, text="Friendly explanations of what I've noticed. "
+                             "Unusual is not the same as dangerous.",
+                 bg=WHITE, fg="#666666").pack(anchor="w", pady=(0, 8))
+        self.text = tk.Text(outer, wrap="word", bg="#fbfbfb", fg="#222222",
+                            relief="flat", padx=14, pady=12,
+                            font=("TkDefaultFont", 11), state="disabled",
+                            highlightthickness=0)
+        vs = ttk.Scrollbar(outer, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=vs.set)
+        self.text.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.text.tag_configure("h1", font=("TkDefaultFont", 12, "bold"),
+                                foreground="#2b3a56", spacing1=10,
+                                spacing3=4)
+        self.text.tag_configure("good", foreground="#0b6b3a",
+                                font=("TkDefaultFont", 11))
+        self.text.tag_configure("warn", foreground="#a05608",
+                                font=("TkDefaultFont", 11))
+        self.text.tag_configure("bad", foreground="#a01a08",
+                                font=("TkDefaultFont", 11))
+        self.text.tag_configure("dim", foreground="#666666")
+        self.text.tag_configure("body", foreground="#222222", spacing3=4)
+
+    def refresh(self):
+        if self.is_visible():
+            y = self.text.yview()[0]
+            self.render()
+            self.text.yview_moveto(y)
+
+    def reset(self):
+        self.refresh()
+
+
+    def render(self):
+        t = self.text
+        m, app = self.model, self.app
+        t.config(state="normal")
+        t.delete("1.0", "end")
+
+        def h1(s): t.insert("end", s + "\n", "h1")
+        def good(s): t.insert("end", "✔  " + s + "\n", "good")
+        def warn(s): t.insert("end", "⚠  " + s + "\n", "warn")
+        def bad(s): t.insert("end", "✘  " + s + "\n", "bad")
+        guidance = app.config.get("general.beginner_explanations", True)
+        def body(s):
+            if guidance:
+                t.insert("end", "    " + s + "\n", "body")
+        def dim(s): t.insert("end", "    " + s + "\n", "dim")
+
+        h1("What is this?")
+        body("This page explains what I've seen on your network in plain "
+             "English. Nothing leaves your computer — everything here is "
+             "based on packets I've captured.")
+
+        h1("Your gateway / router")
+        if m.gateway_ip:
+            good(f"Your router is at {m.gateway_ip}. All your internet "
+                 f"traffic goes through it.")
+            body("If you didn't recognize this number, someone may have "
+                 "changed your Wi-Fi router. Your router's admin page is "
+                 "usually at http://" + m.gateway_ip)
+        else:
+            warn("I couldn't detect your router yet. Start watching and "
+                 "then open a website — I'll figure it out.")
+
+        h1("Device identity checks (ARP)")
+        if m.gateway_ip and len(m.registry.gw_macs) > 1:
+            bad(f"Your router's address has answered from "
+                f"{len(m.registry.gw_macs)} different MAC addresses. "
+                f"That can happen after a router reboot or firmware "
+                f"update, but it's also the classic sign of ARP spoofing "
+                f"— a device on your Wi-Fi pretending to be your router "
+                f"so it can see your traffic.")
+            body("If you didn't just restart your router, disconnect from "
+                 "this Wi-Fi and check your router's admin page from a "
+                 "device you trust.")
+        elif m.gateway_ip:
+            good("Your router's address has stayed consistent — no signs "
+                 "of ARP spoofing so far.")
+        else:
+            dim("Watching for this once I know where your router is.")
+        odd = {ip: macs for ip, macs in m.registry.ip_macs.items()
+              if len(macs) > 1 and ip != m.gateway_ip}
+        if odd:
+            shown = list(odd.items())[:5]
+            names = ", ".join(app.short_device_name_ip(ip) for ip, _ in shown)
+            warn(f"{len(odd)} local address(es) have answered from more "
+                 f"than one device: {names}.")
+            body("This is usually harmless — phones and laptops often "
+                 "rotate their Wi-Fi address for privacy, and a device "
+                 "reconnecting can pick up the same IP as before. It's "
+                 "only worth worrying about if it happens a lot, all at "
+                 "once, right when something on your network starts "
+                 "acting strangely.")
+
+        h1("Who is handing out addresses (DHCP)?")
+        if not m.dhcp_servers:
+            dim("No DHCP activity seen yet.")
+        elif len(m.dhcp_servers) > 1:
+            servers = ", ".join(sorted(m.dhcp_servers))
+            bad(f"{len(m.dhcp_servers)} different devices are handing "
+                f"out IP addresses: {servers}.")
+            body("Normally only your router does this. More than one "
+                 "usually means either a second router plugged into the "
+                 "network by mistake, or — less commonly — a rogue DHCP "
+                 "server. If a device you don't recognize is on that "
+                 "list, unplug it and check your network.")
+        else:
+            server_ip = next(iter(m.dhcp_servers))
+            if server_ip == m.gateway_ip or not m.gateway_ip:
+                good(f"Your router ({server_ip}) is the one handing out "
+                     f"addresses. Normal setup.")
+            else:
+                warn(f"{server_ip} is handing out addresses, which isn't "
+                     f"your router ({m.gateway_ip}).")
+                body("Unusual, but not necessarily bad — some home setups "
+                     "use a separate DHCP server on purpose.")
+
+        h1("Who is doing your DNS lookups (finding website addresses)?")
+        if not m.dns.servers:
+            dim("No DNS traffic seen yet. Open a website and check again.")
+        else:
+            for server_ip, count in sorted({ip: s['queries'] for ip, s in m.dns.servers.items()}.items(),
+                                           key=lambda x: -x[1])[:6]:
+                if server_ip == m.gateway_ip:
+                    good(f"Your router ({server_ip}) is handling DNS "
+                         f"lookups. {count} queries so far.")
+                    body("This is the normal setup at home: your router "
+                         "looks up websites on your behalf. Whatever DNS "
+                         "service your router uses (often your ISP's, "
+                         "sometimes a custom one), that's what you get.")
+                elif is_private_ip(server_ip):
+                    warn(f"A local device at {server_ip} is acting as a "
+                         f"DNS server ({count} queries).")
+                    body("This is unusual unless you set up a Pi-hole, AdGuard "
+                         "Home, or a similar DNS filter. If you didn't set "
+                         "that up, someone might have added a device to your "
+                         "Wi-Fi.")
+                else:
+                    known = KNOWN_DNS.get(server_ip, "")
+                    if known:
+                        warn(f"Someone is using {known} directly "
+                             f"({server_ip}), {count} queries.")
+                        body("This means a device on your Wi-Fi is bypassing "
+                             "your router's DNS and asking a public DNS "
+                             "provider directly. It usually means either: "
+                             "(a) the device has a custom DNS setting, "
+                             "or (b) your router itself was configured to "
+                             "use this DNS service. On its own, this isn't "
+                             "dangerous — it's a choice about privacy and "
+                             "speed.")
+                    else:
+                        warn(f"Someone is using a custom DNS server at "
+                             f"{server_ip} ({count} queries).")
+                        body("I don't recognize this DNS server. It might be "
+                             "your ISP, or a company VPN, or something "
+                             "unusual. If you didn't set this up yourself, "
+                             "it's worth checking your router's settings.")
+
+        h1("Encrypted DNS (DoH) — the private option")
+        if not app.config.get("dns.detect_encrypted_dns", True):
+            dim("Encrypted-DNS detection is turned off in Settings.")
+        elif m.doh_seen:
+            for dev, hosts in m.doh_seen.items():
+                who = app.short_device_name_ip(dev)
+                for h in sorted(hosts):
+                    good(f"{who} is using {h}.")
+            body("Encrypted DNS (DoH) hides your website lookups even from "
+                 "your router. It's good for privacy, but it also means "
+                 "I can't see your browsing history. That's fine — I just "
+                 "want you to know it's happening.")
+        else:
+            dim("No encrypted DNS detected so far. Website lookups are "
+                "visible in plain text on your network.")
+
+        h1("Unencrypted web traffic")
+        if m.http_count:
+            warn(f"I saw {m.http_count} unencrypted (http://) web "
+                 f"requests.")
+            body("These send the web page contents in plain text. Anyone on "
+                 "the same Wi-Fi could read them. Modern sites use https:// "
+                 "which is encrypted. If you see a lot of these, it might be "
+                 "an old website or an app that needs updating.")
+            hosts = [h for h, _n in m.http_hosts.most_common(6)]
+            if hosts:
+                body("Examples: " + ", ".join(hosts))
+        else:
+            good("No unencrypted web traffic seen so far.")
+
+        h1("Other unencrypted protocols")
+        others = {k: v for k, v in m.cleartext_seen.items() if k != "HTTP"}
+        if others:
+            warn("Seen: " + ", ".join(f"{k} ({v} packets)" for k, v in
+                                      sorted(others.items())))
+            body("Telnet, FTP, plain POP3/IMAP and similar protocols send "
+                 "everything \u2014 sometimes including passwords \u2014 "
+                 "without encryption. Prefer their secure versions.")
+        else:
+            good("No Telnet, FTP or other unencrypted logins seen.")
+
+        h1("What I can and can't see")
+        hidden = []
+        if m.doh_seen or m.dns.encrypted_seen:
+            hidden.append("some devices use encrypted DNS")
+        quic = m.metrics.proto_bytes.get("QUIC", 0)
+        if quic:
+            hidden.append("QUIC connections hide the site name unless an "
+                          "earlier lookup revealed it")
+        if m.vpn.get("endpoint") or m.vpn.get("iface"):
+            hidden.append("a VPN tunnel hides individual destinations")
+        if hidden:
+            warn("Visibility is reduced because " + "; ".join(hidden) + ".")
+            body("That's privacy technology working as intended. "
+                 "MiniWireshark never tries to decrypt anything; it reports "
+                 "only what is visible.")
+        else:
+            good("Nothing is currently hiding website names from me.")
+        body("For secure (https) sites I see only the site name \u2014 never "
+             "the pages, searches or passwords.")
+
+        h1("VPN")
+        if m.vpn.get("iface"):
+            warn(f"The selected network card looks like a VPN/tunnel "
+                 f"adapter ({m.vpn['iface']}).")
+            body("Traffic may be encrypted inside a VPN tunnel, so "
+                 "MiniWireshark can see less about individual Internet "
+                 "destinations.")
+        if m.vpn.get("endpoint"):
+            warn(f"Most Internet traffic goes to {m.vpn['endpoint']}, which "
+                 f"looks like a {m.vpn.get('kind') or 'VPN'} server.")
+            body("The VPN server is not counted as a website you visited.")
+        if not (m.vpn.get("iface") or m.vpn.get("endpoint")):
+            dim("No VPN detected.")
+
+        if app.config.get("websites.tracker_classification", False):
+            h1("Advertising & tracking domains (informational)")
+            cats = Counter(w.category for w in m.websites.values()
+                           if w.category and w.category not in ("CDN",
+                                                                "Content"))
+            if cats:
+                body(", ".join(f"{c}: {n}" for c, n in cats.most_common()))
+                body("Being on a tracker list doesn't make a domain "
+                     "malicious \u2014 it describes what the service is "
+                     "used for. Nothing is blocked.")
+            else:
+                dim("No listed tracker domains seen yet.")
+
+        h1("Devices on your Wi-Fi")
+        if not m.registry.by_key:
+            dim("No local devices seen yet.")
+        else:
+            unknown = [d for d in m.registry.by_key.values()
+                      if d.type == "unknown" and not d.vendor]
+            if unknown:
+                warn(f"{len(unknown)} device(s) couldn't be identified.")
+                body("Their MAC addresses don't match any known manufacturer. "
+                     "This is common for cheap IoT devices, phones with "
+                     "privacy MAC randomization, and some virtual machines. "
+                     "Check the Devices tab to see them.")
+            else:
+                good("Every device I've seen can be identified.")
+
+        h1("The honest summary")
+        if app.sniffer is None and app.data_mode == 'idle':
+            dim("I'm not watching right now. Click “Start watching” and "
+                "browse the web for a minute to get real results.")
+        else:
+            body(f"I've seen {m.count} packets, "
+                 f"{len(m.registry.by_key)} device(s), "
+                 f"and {len(m.websites)} website(s).")
+        t.config(state="disabled")
+
+
+
+
+# ---- Display filters (independent of the capture BPF filter) ----------------
+class DisplayFilter:
+    """A friendly display filter. GUI fields AND an optional text
+    expression:  terms are ANDed, `or` separates alternatives, `-term` or
+    `not term` negates. Fields: proto: ip: src: dst: port: sport: dport:
+    site: device: dir: mac: stream: sev: len>N len<N, the word `marked`,
+    or any bare word (searched everywhere). A bad expression raises
+    ValueError at compile time and never affects capture."""
+
+    FIELDS = {"proto", "ip", "src", "dst", "port", "sport", "dport", "site",
+              "host", "domain", "device", "dir", "mac", "stream", "sev",
+              "text"}
+
+    def __init__(self, proto="All", device_key=None, site="", direction="Both",
+                 port="", severity="Any", marked_only=False, expr=""):
+        self.groups = self.compile(expr)
+        self.proto = proto
+        self.device_key = device_key
+        self.site = site.strip().lower()
+        self.direction = direction
+        self.port = None
+        if str(port).strip():
+            if not str(port).strip().isdigit():
+                raise ValueError("Port must be a number, e.g. 443")
+            self.port = int(port)
+        self.severity = severity
+        self.marked_only = marked_only
+        self.expr = expr.strip()
+
+    @classmethod
+    def compile(cls, expr):
+        expr = (expr or "").strip()
+        if not expr:
+            return []
+        try:
+            tokens = shlex.split(expr)
+        except ValueError as e:
+            raise ValueError(f"Check your quotes ({e}).")
+        groups, cur, neg = [], [], False
+        for tok in tokens:
+            low = tok.lower()
+            if low == "or":
+                if not cur:
+                    raise ValueError("“or” needs something on both "
+                                     "sides.")
+                groups.append(cur)
+                cur = []
+                continue
+            if low == "and":
+                continue
+            if low == "not":
+                neg = True
+                continue
+            if tok.startswith("-") and len(tok) > 1:
+                neg, tok, low = True, tok[1:], low[1:]
+            m = re.match(r"^len\s*([<>]=?)\s*(\d+)$", low)
+            if m:
+                cur.append((neg, "len", (m.group(1), int(m.group(2)))))
+            elif ":" in tok and tok.split(":", 1)[0].lower() in cls.FIELDS:
+                f, v = tok.split(":", 1)
+                if not v:
+                    raise ValueError(f"“{f}:” needs a value.")
+                f = f.lower()
+                if f in ("port", "sport", "dport", "stream") and \
+                        not v.isdigit():
+                    raise ValueError(f"“{f}:” needs a number.")
+                if f == "dir" and v.lower() not in ("up", "down", "lan",
+                                                    "bcast", "other"):
+                    raise ValueError("dir: must be up, down, lan, bcast or "
+                                     "other.")
+                if f == "sev" and v.lower() not in ("info", "warning",
+                                                    "danger"):
+                    raise ValueError("sev: must be info, warning or "
+                                     "danger.")
+                cur.append((neg, f, v.lower()))
+            elif ":" in tok:
+                raise ValueError(f"Unknown field “{tok.split(':')[0]}”. "
+                                 f"Try proto:, ip:, port:, site:, device:, "
+                                 f"dir:, sev:.")
+            else:
+                cur.append((neg, "word", low))
+            neg = False
+        if cur:
+            groups.append(cur)
+        elif groups:
+            raise ValueError("“or” needs something on both sides.")
+        return groups
+
+    def describe(self):
+        bits = []
+        if self.proto != "All":
+            bits.append(f"protocol {self.proto}")
+        if self.device_key:
+            bits.append("one device")
+        if self.site:
+            bits.append(f"site “{self.site}”")
+        if self.direction != "Both":
+            bits.append(self.direction.lower())
+        if self.port:
+            bits.append(f"port {self.port}")
+        if self.severity != "Any":
+            bits.append(f"devices with {self.severity} alerts")
+        if self.marked_only:
+            bits.append("bookmarked")
+        if self.expr:
+            bits.append(f"“{self.expr}”")
+        return ", ".join(bits) if bits else "showing everything"
+
+    def active(self):
+        return self.describe() != "showing everything"
+
+    # ---- matching
+    def match(self, d, ctx):
+        if self.proto != "All" and d["tag"] != self.proto and \
+                d["proto"] != self.proto:
+            return False
+        if self.device_key and self.device_key not in ctx.device_keys(d):
+            return False
+        if self.site and not any(self.site in n for n in ctx.names(d)):
+            return False
+        if self.direction != "Both":
+            want = {"Upload": "up", "Download": "down",
+                    "Local only": "lan"}.get(self.direction)
+            if want and d.get("direction") != want:
+                return False
+        if self.port and self.port not in (d["sport"], d["dport"]):
+            return False
+        if self.severity != "Any" and not ctx.has_alert(
+                d, "DANGER" if self.severity == "DANGER" else "WARNING"):
+            return False
+        if self.marked_only and not ctx.is_marked(d):
+            return False
+        if not self.groups:
+            return True
+        return any(all(self._term(d, ctx, t) != t[0] for t in g)
+                   for g in self.groups)
+
+    @staticmethod
+    def _term(d, ctx, term):
+        _neg, f, v = term
+        if f == "len":
+            op, n = v
+            L = d["length"]
+            return {"<": L < n, "<=": L <= n, ">": L > n, ">=": L >= n}[op]
+        if f == "proto":
+            return v in (d["proto"].lower(), d["tag"].lower(),
+                         (d["transport"] or "").lower())
+        if f in ("ip", "src", "dst"):
+            ips = {"ip": (d["src_ip"], d["dst_ip"]), "src": (d["src_ip"],),
+                   "dst": (d["dst_ip"],)}[f]
+            if "/" in v:
+                try:
+                    net = ipaddress.ip_network(v, strict=False)
+                except ValueError:
+                    return False
+                return any(ip and ip_obj(ip) in net for ip in ips
+                           if ip_obj(ip) and ip_obj(ip).version ==
+                           net.version)
+            return any(ip and (ip == v or (v.endswith(".") and
+                                           ip.startswith(v))) for ip in ips)
+        if f == "port":
+            return int(v) in (d["sport"], d["dport"])
+        if f == "sport":
+            return int(v) == d["sport"]
+        if f == "dport":
+            return int(v) == d["dport"]
+        if f in ("site", "host", "domain"):
+            return any(v in n for n in ctx.names(d))
+        if f == "device":
+            return ctx.device_matches(d, v)
+        if f == "dir":
+            return d.get("direction") == v
+        if f == "mac":
+            return v in (d["src_mac"], d["dst_mac"])
+        if f == "stream":
+            return d.get("flow_id") == int(v)
+        if f == "sev":
+            return ctx.has_alert(d, v.upper())
+        if f == "word" and v == "marked":
+            return ctx.is_marked(d)
+        hay = " ".join([d["src_ip"], d["dst_ip"], d["proto"], d["text"],
+                        str(d["sport"] or ""), str(d["dport"] or ""),
+                        d["src_mac"], d["dst_mac"]] +
+                       list(ctx.names(d))).lower()
+        return v in hay
+
+
+class FilterContext:
+    """What a display filter needs to know about the model."""
+
+    SEV_RANK = {"INFO": 0, "WARNING": 1, "DANGER": 2}
+
+    def __init__(self, app):
+        self.app = app
+        self._alert_cache = None
+
+    def device_keys(self, d):
+        m = self.app.model
+        out = set()
+        for ip, mac in ((d["src_ip"], d["src_mac"]),
+                        (d["dst_ip"], d["dst_mac"])):
+            dev = m.device_for(ip, mac if is_unicast_mac(mac) else None)
+            if dev is not None:
+                out.add(dev.key)
+        return out
+
+    def names(self, d):
+        m = self.app.model
+        out = [n.lower() for n in d["dns_names"]]
+        if d["dns"] and d["dns"].get("qname"):
+            out.append(d["dns"]["qname"].lower())
+        f = m.flows.get(d.get("flow_id")) if d.get("flow_id") else None
+        if f is not None and f.domain:
+            out.append(f.domain)
+        for ip in (d["src_ip"], d["dst_ip"]):
+            n = m.cache.get(ip)
+            if n:
+                out.append(n.lower())
+        return out
+
+    def device_matches(self, d, v):
+        reg = self.app.model.registry
+        for key in self.device_keys(d):
+            dev = reg.by_key.get(key)
+            if dev is None:
+                continue
+            if v == "@mine" and dev.mine:
+                return True
+            if v == "@mine-phone" and dev.mine and dev.device_class in (
+                    "iPhone", "Android phone", "Tablet"):
+                return True
+            hay = " ".join([dev.display_name(), dev.alias, dev.ip, dev.mac,
+                            dev.device_class]).lower()
+            if not v.startswith("@") and v in hay:
+                return True
+        return False
+
+    def has_alert(self, d, sev):
+        if self._alert_cache is None:
+            c = defaultdict(int)
+            am = self.app.model.alerts
+            for aid in am.order:
+                a = am.alerts.get(aid)
+                if a and not a.acknowledged:
+                    c[a.device_key] = max(c[a.device_key],
+                                          self.SEV_RANK.get(a.severity, 0))
+                    for ip in (a.device_key.replace("ip:", ""),):
+                        c[ip] = max(c[ip], self.SEV_RANK.get(a.severity, 0))
+            self._alert_cache = c
+        need = self.SEV_RANK.get(sev, 1)
+        keys = self.device_keys(d) | {d["src_ip"], d["dst_ip"]}
+        return any(self._alert_cache.get(k, -1) >= need for k in keys)
+
+    def is_marked(self, d):
+        return d.get("no") in self.app.bookmarks
+
+
+# ---- Packets (Advanced) -------------------------------------------------------
+class PacketsTab(BaseTab):
+    name, label_key, advanced = "packets", "tab_raw", True
+
+    def build(self):
+        app = self.app
+        pills = tk.Frame(self.frame, bg=WHITE, padx=10, pady=6)
+        pills.pack(fill="x")
+        self.lbl(pills, "Show only:").pack(side="left", padx=(0, 6))
+        self.pill_buttons = {}
+        self.proto = "All"
+        for n in PROTO_FILTERS:
+            b = tk.Button(pills, text=n, relief="flat", bd=1, padx=8, pady=2,
+                          fg="#333333", bg="#e6e8ec",
+                          activebackground="#cfd6e0",
+                          command=lambda nn=n: self.set_proto(nn))
+            b.pack(side="left", padx=1)
+            self.pill_buttons[n] = b
+        row = tk.Frame(self.frame, bg=WHITE, padx=10)
+        row.pack(fill="x")
+        self.dev_var = tk.StringVar(value="All devices")
+        self.lbl(row, "Device:").pack(side="left")
+        self.dev_box = ttk.Combobox(row, textvariable=self.dev_var, width=20,
+                                    values=["All devices"], state="readonly")
+        self.dev_box.pack(side="left", padx=(4, 8))
+        self.dev_box.bind("<<ComboboxSelected>>", lambda e: self.apply())
+        self.dev_box.bind("<Button-1>", lambda e: self.dev_box.configure(
+            values=self.device_choices()), add="+")
+        self.site_var = tk.StringVar()
+        self.lbl(row, "Website:").pack(side="left")
+        se = ttk.Entry(row, textvariable=self.site_var, width=16)
+        se.pack(side="left", padx=(4, 8))
+        se.bind("<Return>", lambda e: self.apply())
+        se.bind("<FocusOut>", lambda e: self.apply())
+        self.dir_var = tk.StringVar(value="Both")
+        self.lbl(row, "Direction:").pack(side="left")
+        db = ttk.Combobox(row, textvariable=self.dir_var, width=10,
+                          values=["Both", "Upload", "Download", "Local only"],
+                          state="readonly")
+        db.pack(side="left", padx=(4, 8))
+        db.bind("<<ComboboxSelected>>", lambda e: self.apply())
+        self.port_var = tk.StringVar()
+        self.lbl(row, "Port:").pack(side="left")
+        pe = ttk.Entry(row, textvariable=self.port_var, width=7)
+        pe.pack(side="left", padx=(4, 8))
+        pe.bind("<Return>", lambda e: self.apply())
+        pe.bind("<FocusOut>", lambda e: self.apply())
+        self.sev_var = tk.StringVar(value="Any")
+        self.lbl(row, "Alerts:").pack(side="left")
+        sb = ttk.Combobox(row, textvariable=self.sev_var, width=9,
+                          values=["Any", "WARNING", "DANGER"],
+                          state="readonly")
+        sb.pack(side="left", padx=(4, 8))
+        sb.bind("<<ComboboxSelected>>", lambda e: self.apply())
+        self.marked_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row, text="★ Bookmarked only",
+                        variable=self.marked_var,
+                        command=self.apply).pack(side="left")
+        self.adv_row = tk.Frame(self.frame, bg=WHITE, padx=10)
+        self.adv_row.pack(fill="x", pady=(4, 0))
+        self.lbl(self.adv_row, "Expression:").pack(side="left")
+        self.expr_var = tk.StringVar()
+        ee = ttk.Entry(self.adv_row, textvariable=self.expr_var, width=46)
+        ee.pack(side="left", padx=(4, 6))
+        ee.bind("<Return>", lambda e: self.apply())
+        Tooltip(ee, "Examples:  proto:tls site:example.com    "
+                    "port:53 or port:853    ip:192.168.1.0/24 -proto:arp    "
+                    "len>1000 dir:up    device:@mine    stream:12    marked")
+        ttk.Button(self.adv_row, text="Apply",
+                   command=self.apply).pack(side="left")
+        ttk.Button(self.adv_row, text="Clear filter",
+                   command=self.clear_filter).pack(side="left", padx=4)
+        self.preset_var = tk.StringVar(value="Presets…")
+        self.preset_box = ttk.Combobox(self.adv_row, width=18,
+                                       textvariable=self.preset_var,
+                                       state="readonly")
+        self.preset_box.pack(side="left", padx=(12, 4))
+        self.preset_box.bind("<<ComboboxSelected>>", self._load_preset)
+        ttk.Button(self.adv_row, text="Save as preset…",
+                   command=self._save_preset).pack(side="left")
+        ttk.Button(self.adv_row, text="Delete preset",
+                   command=self._delete_preset).pack(side="left", padx=4)
+        self.err_var = tk.StringVar()
+        tk.Label(self.frame, textvariable=self.err_var, bg=WHITE,
+                 fg="#a01a08", anchor="w").pack(fill="x", padx=12)
+        stat = tk.Frame(self.frame, bg=WHITE, padx=10)
+        stat.pack(fill="x")
+        self.pause_btn = ttk.Button(stat, text="⏸ Pause display",
+                                    command=self.toggle_pause)
+        self.pause_btn.pack(side="left")
+        self.follow_var = tk.BooleanVar(
+            value=app.config.get("capture.follow_newest", True))
+        ttk.Checkbutton(stat, text="Follow newest packet",
+                        variable=self.follow_var).pack(side="left",
+                                                       padx=(8, 0))
+        self.ind_var = tk.StringVar(value="Display filter: showing "
+                                          "everything")
+        tk.Label(stat, textvariable=self.ind_var, bg=WHITE, fg="#0b5394",
+                 anchor="w").pack(side="left", padx=(16, 0))
+        self.count_var = tk.StringVar()
+        tk.Label(stat, textvariable=self.count_var, bg=WHITE, fg="#888888"
+                 ).pack(side="right")
+        vert = ttk.PanedWindow(self.frame, orient="vertical")
+        vert.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        lf = tk.Frame(vert, bg=WHITE)
+        vert.add(lf, weight=3)
+        wrap, self.tree = make_tree(
+            lf, [("no", "No.", 60, "e", False), ("mark", "★", 26,
+                                                   "center", False),
+                 ("time", "Time", 95, "center", False),
+                 ("src", "Source", 180, "w", False),
+                 ("dst", "Destination", 180, "w", False),
+                 ("proto", "Protocol", 80, "center", False),
+                 ("length", "Length", 60, "e", False),
+                 ("stream", "Conn.", 55, "e", False),
+                 ("info", "Info", 520, "w", True)], hscroll=True)
+        enable_sorting(self.tree, on_sort=lambda c, r:
+                       self.follow_var.set(False))
+        self.tree.configure(height=14)
+        wrap.pack(fill="both", expand=True)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Button-3>", self._context)
+        self.tree.bind("<Button-2>", self._context)
+        bottom = tk.Frame(vert, bg=WHITE)
+        vert.add(bottom, weight=2)
+        nb = ttk.Notebook(bottom)
+        nb.pack(fill="both", expand=True)
+        tf = tk.Frame(nb, bg=WHITE)
+        self.dtree = ttk.Treeview(tf, columns=("value",), show="tree headings")
+        self.dtree.heading("#0", text="Field")
+        self.dtree.heading("value", text="Value")
+        self.dtree.column("#0", width=260)
+        self.dtree.column("value", width=600, stretch=True)
+        self.dtree.configure(height=7)
+        dvs = ttk.Scrollbar(tf, orient="vertical", command=self.dtree.yview)
+        self.dtree.configure(yscrollcommand=dvs.set)
+        self.dtree.pack(side="left", fill="both", expand=True)
+        dvs.pack(side="right", fill="y")
+        df, self.details = self._scrolled(nb)
+        hf, self.hexview = self._scrolled(nb)
+        nb.add(tf, text="Packet details")
+        nb.add(df, text="Text dump")
+        nb.add(hf, text="Hex dump")
+        self.iids = deque()
+        self.rows_by_iid = {}
+        self.iid_by_no = {}
+        self.paused = False
+        self.filter = DisplayFilter()
+        self.ctx = FilterContext(app)
+        self._dirty = False
+        self.set_proto("All", redraw=False)
+        self.refresh_presets()
+        self.apply_mode()
+
+    def _scrolled(self, parent):
+        f = tk.Frame(parent, bg=WHITE)
+        txt = tk.Text(f, wrap="none", font=self.app.mono, state="disabled",
+                      fg="#222222", bg=WHITE, relief="flat", padx=6, pady=6,
+                      highlightthickness=0, height=8)
+        vs = ttk.Scrollbar(f, orient="vertical", command=txt.yview)
+        hs = ttk.Scrollbar(f, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        txt.grid(row=0, column=0, sticky="nsew")
+        vs.grid(row=0, column=1, sticky="ns")
+        hs.grid(row=1, column=0, sticky="ew")
+        f.rowconfigure(0, weight=1)
+        f.columnconfigure(0, weight=1)
+        return f, txt
+
+    def apply_mode(self):
+        with contextlib.suppress(tk.TclError):
+            if self.app.beginner_mode:
+                self.adv_row.pack_forget()
+            else:
+                self.adv_row.pack(fill="x", pady=(4, 0),
+                                  before=self.adv_row.master.winfo_children()
+                                  [3])
+
+    def on_theme(self):
+        self.set_proto(self.proto, redraw=False)
+        t = self.t
+        with contextlib.suppress(tk.TclError):
+            self.tree.tag_configure("marked", background=PALETTES[
+                palette_name(self.app.theme_name, self.app.high_contrast)
+            ].get("#fff2a8", "#fff2a8"))
+        for tag, (fg, bg) in TAG_COLORS.items():
+            table = PALETTES[palette_name(self.app.theme_name,
+                                          self.app.high_contrast)]
+            with contextlib.suppress(tk.TclError):
+                self.tree.tag_configure(tag, foreground=table.get(fg, fg),
+                                        background=table.get(bg, bg) if bg
+                                        else "")
+        _ = t
+
+    def set_proto(self, name, redraw=True):
+        self.proto = name
+        t = self.t
+        for n, b in self.pill_buttons.items():
+            sel = n == name
+            with contextlib.suppress(tk.TclError):
+                b.config(bg=t["accent"] if sel else t["side_bg"],
+                         fg=("#000000" if self.app.high_contrast and
+                             self.app.theme_name == "Dark" else "#ffffff")
+                         if sel else t["text_fg"],
+                         activebackground=t["border"],
+                         relief="sunken" if sel else "flat")
+        if redraw:
+            self.apply()
+
+    def _build_filter(self):
+        return DisplayFilter(
+            proto=self.proto,
+            device_key=self.device_key_from_choice(self.dev_var.get()),
+            site=self.site_var.get(), direction=self.dir_var.get(),
+            port=self.port_var.get(), severity=self.sev_var.get(),
+            marked_only=self.marked_var.get(),
+            expr=self.expr_var.get() if not self.app.beginner_mode else "")
+
+    def apply(self):
+        try:
+            self.filter = self._build_filter()
+            self.err_var.set("")
+        except ValueError as e:
+            self.err_var.set(f"⚠ {e}  (Capture continues normally; the "
+                             f"previous filter is still in use.)")
+            return
+        self.ind_var.set("Display filter: " + self.filter.describe())
+        self.rebuild()
+
+    def clear_filter(self):
+        self.dev_var.set("All devices")
+        for v in (self.site_var, self.port_var, self.expr_var):
+            v.set("")
+        self.dir_var.set("Both")
+        self.sev_var.set("Any")
+        self.marked_var.set(False)
+        self.set_proto("All", redraw=False)
+        self.apply()
+
+    def set_expression(self, expr):
+        if self.app.beginner_mode and expr:
+            m = re.match(r"^site:(.+)$", expr)
+            if m:
+                self.site_var.set(m.group(1))
+                self.apply()
+                return
+        self.expr_var.set(expr)
+        self.apply()
+
+    def refresh_presets(self):
+        presets = self.app.config.get("filters.presets", {}) or {}
+        self.preset_box.configure(values=sorted(presets))
+
+    def _load_preset(self, _e=None):
+        name = self.preset_var.get()
+        p = (self.app.config.get("filters.presets", {}) or {}).get(name)
+        if not isinstance(p, dict):
+            return
+        self.clear_filter_fields()
+        self.set_proto(p.get("proto", "All"), redraw=False)
+        self.site_var.set(p.get("site", ""))
+        self.port_var.set(p.get("port", ""))
+        self.dir_var.set(p.get("direction", "Both"))
+        self.sev_var.set(p.get("severity", "Any"))
+        self.expr_var.set(p.get("expr", ""))
+        if p.get("expr") and self.app.beginner_mode:
+            self.app._set_banner("This preset uses an advanced expression; "
+                                 "switch to Advanced view to see it.",
+                                 kind="warn")
+        self.apply()
+        if p.get("expr") and self.app.beginner_mode:
+            try:
+                self.filter = DisplayFilter(proto=self.proto,
+                                            expr=p.get("expr", ""))
+                self.ind_var.set("Display filter: " +
+                                 self.filter.describe())
+                self.rebuild()
+            except ValueError as e:
+                self.err_var.set(f"⚠ {e}")
+
+    def clear_filter_fields(self):
+        self.dev_var.set("All devices")
+        for v in (self.site_var, self.port_var, self.expr_var):
+            v.set("")
+        self.dir_var.set("Both")
+        self.sev_var.set("Any")
+        self.marked_var.set(False)
+
+    def _save_preset(self):
+        name = ask_text(self.app, "Save filter preset",
+                        "Name for this display filter:")
+        if not name:
+            return
+        presets = dict(self.app.config.get("filters.presets", {}) or {})
+        presets[name] = {"proto": self.proto, "site": self.site_var.get(),
+                         "port": self.port_var.get(),
+                         "direction": self.dir_var.get(),
+                         "severity": self.sev_var.get(),
+                         "expr": self.expr_var.get()}
+        self.app.config.set("filters.presets", presets)
+        self.app.config.save()
+        self.refresh_presets()
+        self.preset_var.set(name)
+
+    def _delete_preset(self):
+        name = self.preset_var.get()
+        presets = dict(self.app.config.get("filters.presets", {}) or {})
+        if name in presets and messagebox.askyesno(
+                "Delete preset", f"Delete the preset “{name}”?",
+                parent=self.app.root):
+            presets.pop(name)
+            self.app.config.set("filters.presets", presets)
+            self.app.config.save()
+            self.refresh_presets()
+            self.preset_var.set("Presets…")
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+        self.pause_btn.configure(text="▶ Resume display" if self.paused
+                                 else "⏸ Pause display")
+        if not self.paused:
+            self.rebuild()
+
+    # ---- rows
+    def _values(self, d):
+        app = self.app
+        return (d["no"], "★" if d["no"] in app.bookmarks else "",
+                datetime.fromtimestamp(d["time"]).strftime("%H:%M:%S.%f")[:-3],
+                app.disp_addr(d["src_ip"], d["src_mac"]),
+                app.disp_addr(d["dst_ip"], d["dst_mac"]), d["proto"],
+                d["length"], d.get("flow_id") or "", d["text"])
+
+    def add_rows(self, rows):
+        if self.paused or not self.is_visible():
+            self._dirty = True
+            return
+        self.ctx._alert_cache = None
+        last = None
+        for d in rows:
+            try:
+                ok = self.filter.match(d, self.ctx)
+            except Exception:                        # noqa: BLE001
+                ok = True
+            if ok:
+                last = self._insert(d)
+        self._trim()
+        if last and self.follow_var.get():
+            with contextlib.suppress(tk.TclError):
+                self.tree.see(last)
+        self.count_var.set(f"{len(self.iids)} shown · "
+                           f"{len(self.app.all_rows)} in memory")
+
+    def _insert(self, d):
+        tags = (d["tag"],) + (("marked",) if d["no"] in self.app.bookmarks
+                              else ())
+        try:
+            iid = self.tree.insert("", "end", tags=tags,
+                                   values=self._values(d))
+        except tk.TclError:
+            return None
+        self.rows_by_iid[iid] = d
+        self.iid_by_no[d["no"]] = iid
+        self.iids.append(iid)
+        return iid
+
+    def _trim(self):
+        limit = self.app.max_rows
+        while len(self.iids) > limit:
+            old = self.iids.popleft()
+            d = self.rows_by_iid.pop(old, None)
+            if d:
+                self.iid_by_no.pop(d["no"], None)
+            with contextlib.suppress(tk.TclError):
+                self.tree.delete(old)
+
+    def refresh(self):
+        if self._dirty and not self.paused and self.is_visible():
+            self._dirty = False
+            self.rebuild()
+
+    def rebuild(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+        self.rows_by_iid.clear()
+        self.iid_by_no.clear()
+        self.ctx._alert_cache = None
+        rows = list(self.app.all_rows)
+        shown = 0
+        for d in reversed(rows):
+            try:
+                ok = self.filter.match(d, self.ctx)
+            except Exception:                        # noqa: BLE001
+                ok = True
+            if ok:
+                shown += 1
+                if shown > self.app.max_rows:
+                    break
+        start = 0
+        if shown > self.app.max_rows:
+            start = len(rows) - shown
+        for d in rows[max(0, start):]:
+            try:
+                ok = self.filter.match(d, self.ctx)
+            except Exception:                        # noqa: BLE001
+                ok = True
+            if ok:
+                self._insert(d)
+        self._trim()
+        if self.iids and self.follow_var.get():
+            with contextlib.suppress(tk.TclError):
+                self.tree.see(self.iids[-1])
+        self.count_var.set(f"{len(self.iids)} shown · "
+                           f"{len(self.app.all_rows)} in memory")
+
+    def refresh_names(self):
+        for iid, d in list(self.rows_by_iid.items())[-800:]:
+            with contextlib.suppress(tk.TclError):
+                self.tree.set(iid, "src", self.app.disp_addr(d["src_ip"],
+                                                             d["src_mac"]))
+                self.tree.set(iid, "dst", self.app.disp_addr(d["dst_ip"],
+                                                             d["dst_mac"]))
+
+    # ---- details
+    def _selected_row(self):
+        sel = self.tree.selection()
+        return self.rows_by_iid.get(sel[0]) if sel else None
+
+    def _on_select(self, _e=None):
+        d = self._selected_row()
+        if not d:
+            return
+        pkt = d["pkt"]
+        self.dtree.delete(*self.dtree.get_children())
+        summary = self.dtree.insert("", "end", text="Summary", open=True,
+                                    values=(d["text"],))
+        for k, v in (("Direction", {"up": "Upload (to the Internet)",
+                                    "down": "Download (from the Internet)",
+                                    "lan": "Local network",
+                                    "bcast": "Broadcast / multicast"}.get(
+            d.get("direction"), d.get("direction") or "")),
+                     ("Connection", d.get("flow_id") or "—"),
+                     ("Interpretation", d.get("app_conf") or "—"),
+                     ("Encryption", d.get("encrypted"))):
+            self.dtree.insert(summary, "end", text=k, values=(v,))
+        try:
+            layer = pkt
+            depth = 0
+            while layer is not None and depth < 12:
+                name = getattr(layer, "name", type(layer).__name__)
+                node = self.dtree.insert("", "end", text=name, open=depth < 4,
+                                         values=("",))
+                for fdesc in getattr(layer, "fields_desc", [])[:60]:
+                    fname = fdesc.name
+                    try:
+                        val = fdesc.i2repr(layer, layer.getfieldval(fname))
+                    except Exception:                # noqa: BLE001
+                        val = "?"
+                    sval = str(val)
+                    if len(sval) > 200:
+                        sval = sval[:200] + "…"
+                    self.dtree.insert(node, "end", text=fname,
+                                      values=(sval,))
+                layer = layer.payload if layer.payload and \
+                    type(layer.payload).__name__ != "NoPayload" else None
+                depth += 1
+        except Exception as e:                       # noqa: BLE001
+            self.dtree.insert("", "end", text="(could not decode)",
+                              values=(str(e),))
+        for w, fn in ((self.details, lambda: pkt.show(dump=True)),
+                      (self.hexview, lambda: hexdump(pkt, dump=True))):
+            w.config(state="normal")
+            w.delete("1.0", "end")
+            try:
+                w.insert("end", fn())
+            except Exception as e:                   # noqa: BLE001
+                w.insert("end", f"<cannot show: {e}>")
+            w.config(state="disabled")
+
+    def select_no(self, no):
+        iid = self.iid_by_no.get(no)
+        if iid:
+            with contextlib.suppress(tk.TclError):
+                self.tree.selection_set(iid)
+                self.tree.see(iid)
+
+    def _context(self, event):
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        self.tree.selection_set(iid)
+        d = self.rows_by_iid.get(iid)
+        if not d:
+            return
+        app = self.app
+        src = f"{d['src_ip'] or d['src_mac']}" + (
+            f":{d['sport']}" if d["sport"] is not None else "")
+        dst = f"{d['dst_ip'] or d['dst_mac']}" + (
+            f":{d['dport']}" if d["dport"] is not None else "")
+        summary = (f"#{d['no']} {fmt_clock(d['time'])} {src} → {dst} "
+                   f"{d['proto']} {d['length']}B  {d['text']}")
+        devs = list(self.ctx.device_keys(d))
+        names = [n for n in self.ctx.names(d) if "." in n]
+        items = [("Copy summary", lambda: copy_to_clipboard(app, summary)),
+                 ("Copy source", lambda: copy_to_clipboard(app, src)),
+                 ("Copy destination", lambda: copy_to_clipboard(app, dst)),
+                 ("Remove bookmark" if d["no"] in app.bookmarks
+                  else "Bookmark this packet", lambda: self.toggle_mark(d)),
+                 None,
+                 ("Show this connection only",
+                  lambda: self.set_expression(f"stream:{d['flow_id']}"),
+                  bool(d.get("flow_id"))),
+                 ("Go to connection",
+                  lambda: app.goto("connection", d.get("flow_id")),
+                  bool(d.get("flow_id")))]
+        for k in devs[:2]:
+            dev = app.model.registry.by_key.get(k)
+            if dev:
+                items.append((f"Go to device: {dev.display_name()[:30]}",
+                              lambda kk=k: app.goto("device", kk)))
+        if names:
+            items.append((f"Go to website: {names[0][:30]}",
+                          lambda: app.goto("websites", names[0])))
+        popup_menu(app, event, items)
+
+    def toggle_mark(self, d):
+        app = self.app
+        if d["no"] in app.bookmarks:
+            app.bookmarks.discard(d["no"])
+        else:
+            app.bookmarks.add(d["no"])
+        iid = self.iid_by_no.get(d["no"])
+        if iid:
+            tags = (d["tag"],) + (("marked",) if d["no"] in app.bookmarks
+                                  else ())
+            with contextlib.suppress(tk.TclError):
+                self.tree.item(iid, tags=tags, values=self._values(d))
+
+    def reset(self):
+        self.tree.delete(*self.tree.get_children())
+        self.iids.clear()
+        self.rows_by_iid.clear()
+        self.iid_by_no.clear()
+        self.dtree.delete(*self.dtree.get_children())
+        for w in (self.details, self.hexview):
+            w.config(state="normal")
+            w.delete("1.0", "end")
+            w.config(state="disabled")
+
+
+# ---- Help --------------------------------------------------------------------
+class HelpTab(BaseTab):
+    name, label_key = "help", "tab_about"
+
+    def build(self):
+        outer = tk.Frame(self.frame, bg=WHITE)
+        outer.pack(fill="both", expand=True, padx=14, pady=12)
+        head = tk.Frame(outer, bg=WHITE)
+        head.pack(fill="x")
+        tk.Label(head, text=f"❓  Help / About — MiniWireshark "
+                            f"{SCRIPT_VERSION}", bg=WHITE, fg="#2b3a56",
+                 font=("TkDefaultFont", 14, "bold")).pack(side="left")
+        bar = tk.Frame(outer, bg=WHITE)
+        bar.pack(fill="x", pady=(8, 8))
+        self.demo_btn = ttk.Button(bar, text="\U0001F3AE Try Demo Mode",
+                                   command=self.app.toggle_demo)
+        self.demo_btn.pack(side="left")
+        Tooltip(self.demo_btn, "Explore every tab with simulated, clearly "
+                               "labelled sample data. No real capture "
+                               "happens and nothing mixes with your real "
+                               "session.")
+        ttk.Button(bar, text="\U0001F6E0 Diagnostics",
+                   command=self.app.open_diagnostics).pack(side="left",
+                                                           padx=6)
+        ttk.Button(bar, text="Run self-test",
+                   command=self.app.run_self_test_window).pack(side="left")
+        ttk.Button(bar, text="Open data folder",
+                   command=lambda: _open_path(PATHS.data)).pack(side="left",
+                                                                padx=6)
+        ttk.Button(bar, text="Open logs",
+                   command=lambda: _open_path(PATHS.logs)).pack(side="left")
+        txt = tk.Text(outer, wrap="word", bg="#fbfbfb", fg="#222222",
+                      relief="flat", padx=14, pady=12,
+                      font=("TkDefaultFont", 10), highlightthickness=0)
+        vs = ttk.Scrollbar(outer, orient="vertical", command=txt.yview)
+        txt.configure(yscrollcommand=vs.set)
+        txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        txt.tag_configure("h", font=("TkDefaultFont", 12, "bold"),
+                          foreground="#2b3a56", spacing1=8, spacing3=3)
+        for term, defn in GLOSSARY:
+            txt.insert("end", term + "\n", ("h",))
+            txt.insert("end", defn + "\n\n")
+        txt.insert("end", "Privacy\n", ("h",))
+        txt.insert("end",
+                   "MiniWireshark processes captured network information "
+                   "locally on this computer unless you explicitly export it. "
+                   "It never uploads packet contents, browsing history, MAC "
+                   "addresses or your local IP addresses, has no telemetry, "
+                   "accounts or cloud sync. Optional online features (country "
+                   "lookup, reference-data downloads, update checks) are "
+                   "listed in Settings → Privacy with exactly what each "
+                   "one sends.\n\n")
+        txt.insert("end", "What MiniWireshark will never do\n", ("h",))
+        txt.insert("end",
+                   "It is a visibility and defensive-monitoring tool. It never "
+                   "intercepts passwords, decrypts HTTPS, poisons ARP/DNS, "
+                   "injects attack traffic, deauthenticates Wi-Fi clients or "
+                   "scans beyond your own directly-connected network. Active "
+                   "Scanning only sends standard discovery messages (ARP, "
+                   "mDNS, SSDP) on your own LAN, and the banner at the top "
+                   "always tells you whether it is on.\n\n")
+        txt.insert("end", "Files\n", ("h",))
+        txt.insert("end", f"Program: {SCRIPT_PATH}\nData folder: "
+                          f"{PATHS.data}\nLog: {PATHS.log_file}\n")
+        txt.config(state="disabled")
+
+    def refresh(self):
+        with contextlib.suppress(tk.TclError):
+            self.demo_btn.configure(
+                text="⏹ Stop Demo Mode" if self.app.data_mode == "demo"
+                else "\U0001F3AE Try Demo Mode")
+
+
+
+# ============================================================================
+#  19.  The application window
+# ============================================================================
+DATA_MODE_TEXT = {
+    "offline": "\U0001F4C2  OFFLINE CAPTURE — not live. You're looking at "
+               "packets from a file.",
+    "session": "\U0001F4C2  SAVED SESSION — not live. You're looking at a "
+               "previously saved session.",
+    "demo": "\U0001F3AE  DEMO DATA — NOT LIVE TRAFFIC. Everything shown is "
+            "simulated sample data.",
+}
+
+
+class MiniWireshark:
+    MAX_ROWS = 5000
+    SEVERITY_ICON = {"INFO": "ℹ", "WARNING": "⚠", "DANGER": "‼"}
+    TEXT_SIZES = {"Small": 0.9, "Normal": 1.0, "Large": 1.15,
+                  "Extra large": 1.3}
+
+    def __init__(self, root, gateway_ip, my_ips, my_macs,
+                 default_iface_name="", config=None):
+        global DATA
+        self.root = root
+        self.real_identity = (gateway_ip, set(my_ips), set(my_macs))
+        self.default_iface_name = default_iface_name
+        root.title("MiniWireshark")
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.geometry(f"{min(1440, sw - 40)}x{min(900, sh - 80)}")
+        root.minsize(min(1020, sw - 40), min(640, sh - 80))
+        root.configure(background="#f4f5f7")
+
+        self.config = config or AppConfig()
+        setup_logging(self.config.get("diagnostics.verbose_logging", False))
+        self.theme_name = self.config.get("appearance.theme", "Light")
+        self.high_contrast = bool(self.config.get("appearance.high_contrast",
+                                                  False))
+        self.theme = THEMES[palette_name(self.theme_name, self.high_contrast)]
+        Tooltip.theme = self.theme
+        self.beginner_mode = bool(self.config.get("appearance.beginner_mode",
+                                                  True))
+        set_locale(self.config.get("general.language", "English"))
+
+        # ---- services
+        self.data = DataManager(PATHS.cache, self.config)
+        DATA = self.data
+        self.data.on_change = lambda: self._async_results.put(
+            self._on_data_changed)
+        self.known = KnownDevicesStore(PATHS.known_devices)
+        self.history = HistoryStore(PATHS.history_db) \
+            if self.config.get("history.enabled", False) else None
+        self.geoip = GeoIPService(self._geoip_on_result)
+        self.geoip.set_enabled(self.config.get("privacy.geoip_enabled",
+                                               False))
+        self._async_results = queue.Queue()
+
+        # ---- capture pipeline state
+        self.pkt_q = queue.Queue(maxsize=PKT_QUEUE_MAX)
+        self.row_q = queue.Queue(maxsize=ROW_QUEUE_MAX)
+        self.worker = None
+        self.sniffer = None
+        self.rdns = None
+        self.lan_scanner = None
+        self.prober = None
+        self.watcher = None
+        self.importer = None
+        self.demo = None
+        self.dropped_capture = 0
+        self.count = 0
+        self.max_rows = max(500, int(self.config.get(
+            "capture.max_stored_events", self.MAX_ROWS)))
+        self.all_rows = deque(maxlen=self.max_rows)
+        self.bookmarks = set()
+        self.data_mode = "idle"        # idle | live | offline | session | demo
+        self.data_label = ""
+        self.iface_map = {}
+        self.iface_scores = []
+        self.iface_reason = ""
+        self.current_iface_label = ""
+        self._capture_started_at = 0.0
+        self._restart_attempts = 0
+        self._restart_job = None
+        self._last_packet_wall = 0.0
+        self._last_snapshot = {}
+        self.perf_level = 0
+        self._gui_lag = 0.0
+        self._last_tick_wall = time.monotonic()
+        self._rate_window = deque(maxlen=10)
+        self._analysis_errors = 0
+        self._settings_win = None
+        self._diag_win = None
+        self.system_dns = []
+        self.session_started = time.time()
+        self.model = self._new_model()
+        self._baselines_from_history()
+
+        self._apply_style()
+        mono = tkfont.nametofont("TkFixedFont").copy()
+        mono.configure(size=9)
+        self.mono = mono
+        self._build_ui()
+        self._populate_ifaces()
+        self._apply_theme()
+        self._apply_text_size()
+        self._apply_shortcuts()
+        self.data.start()
+        threading.Thread(target=self._discover_dns, daemon=True,
+                         name="dns-discovery").start()
+
+        if self.config.warning:
+            self.root.after(1500, lambda: self._set_banner(
+                f"⚠️  {self.config.warning}", kind="warn"))
+
+        self.root.after(60, self._drain_decoded)
+        self.root.after(700, self._flush_ui)
+        self.root.after(1000, self._tick_status)
+        self.root.after(2000, self._refresh_insights)
+        self.root.after(300, self._flush_feed)
+        self.root.after(3000, self._tick_model)
+        self.root.after(200, self._drain_async_results)
+        self.root.after(60000, self._history_tick)
+        self.root.after(20000, self._confirm_startup_ok)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.report_callback_exception = self._tk_exception
+
+        self.watcher = NetworkWatcher(lambda snap: self._async_results.put(
+            lambda: self._on_network_snapshot(snap)))
+        self.watcher.start()
+        self.prober = HealthProber(
+            lambda res: self._async_results.put(
+                lambda: self._on_health_result(res)),
+            self._health_params)
+        self.prober.start()
+
+        if START_IN_DEMO:
+            self.root.after(800, self.start_demo)
+        elif self.config.get("general.auto_start_capture", True):
+            self.root.after(700, self._auto_start_once)
+        else:
+            self.status_var.set("Ready. Click “Start watching” when "
+                                "you'd like to begin.")
+        if self.config.get("updates.check_automatically", False) and \
+                self.config.get("updates.repo", "").strip():
+            self.root.after(4000, lambda: self._check_for_updates(
+                manual=False))
+        LOG.info("GUI started (version %s, %s)", SCRIPT_VERSION,
+                 platform.platform())
+
+    # ---- model lifecycle ----------------------------------------------------
+    def _new_model(self, offline=False, identity=None):
+        gw, ips, macs = identity or self.real_identity
+        m = NetworkModel(self.config, gw, ips, macs)
+        m.registry.labels = self.known
+        if not offline and identity is None:
+            m.set_identity(local_nets=self._local_nets(),
+                           v6_prefixes=self._local_v6_prefixes())
+        m.use_packet_clock = offline
+        return m
+
+    def _local_nets(self):
+        nets = []
+        try:
+            for entry in conf.route.routes:
+                net, mask, gw, _iface, addr = entry[:5]
+                if gw not in ("0.0.0.0", "", None) or not net or \
+                        addr in ("127.0.0.1", "0.0.0.0", ""):
+                    continue
+                with contextlib.suppress(ValueError):
+                    n = ipaddress.ip_network(
+                        f"{_int_to_ip(net)}/{_int_to_ip(mask)}", strict=False)
+                    if 8 <= n.prefixlen < 32 and not n.is_loopback and \
+                            not n.is_multicast and n not in nets:
+                        nets.append(n)
+        except Exception:                            # noqa: BLE001
+            pass
+        return nets[:16]
+
+    def _local_v6_prefixes(self):
+        out = []
+        try:
+            from scapy.arch import in6_getifaddr
+            for addr, _scope, _iface in in6_getifaddr():
+                a = ip_obj(addr)
+                if a is not None and a.is_global:
+                    n = ipaddress.ip_network(f"{addr}/64", strict=False)
+                    if n not in out:
+                        out.append(n)
+        except Exception:                            # noqa: BLE001
+            pass
+        return out[:8]
+
+    def _baselines_from_history(self):
+        if self.history is not None:
+            self.model.baselines.load(self.history.load_baselines())
+
+    def replace_model(self, model):
+        """Swap in a fresh model (Clear / New session / offline / demo).
+        Every tab is reset so no old row can linger."""
+        self.model = model
+        self.all_rows.clear()
+        self.bookmarks.clear()
+        self.count = 0
+        self.dropped_capture = 0
+        if self.worker is not None:
+            self.worker.cache = model.cache
+        if self.rdns is not None:
+            self.rdns.cache = model.cache
+        for tab in self.tabs.values():
+            try:
+                tab.reset()
+            except tk.TclError:
+                pass
+        self.tabs["devices"].rebuild()
+        self.tabs["websites"].rebuild()
+        self.tabs["timeline"].rebuild()
+        self.tabs["alerts"].rebuild()
+        self.tabs["connections"].rebuild()
+        self.tabs["remote"].rebuild()
+
+    # ---- UI construction -------------------------------------------------------
+    def _build_ui(self):
+        header = tk.Frame(self.root, bg="#2b3a55", padx=16, pady=10)
+        header.pack(fill="x")
+        self.hdr_title = tk.Label(header, text=tr("app_title"), fg="white",
+                                  bg="#2b3a55", font=("TkDefaultFont", 16,
+                                                      "bold"))
+        self.hdr_title.pack(side="left")
+        self.hdr_subtitle = tk.Label(header, text=tr("app_subtitle"),
+                                     fg="#c8d2e0", bg="#2b3a55")
+        self.hdr_subtitle.pack(side="left")
+        self.btn_settings_w = ttk.Button(header, text=tr("btn_settings"),
+                                         command=self._open_settings)
+        self.btn_settings_w.pack(side="right", padx=4)
+        self.btn_help_w = ttk.Button(header, text=tr("btn_help"),
+                                     command=self._open_help_menu)
+        self.btn_help_w.pack(side="right", padx=4)
+        self.mode_ui_var = tk.StringVar(
+            value="Beginner" if self.beginner_mode else "Advanced")
+        mode_box = ttk.Combobox(header, textvariable=self.mode_ui_var,
+                                values=("Beginner", "Advanced"), width=9,
+                                state="readonly")
+        mode_box.pack(side="right", padx=(0, 8))
+        mode_box.bind("<<ComboboxSelected>>", self._on_ui_mode_change)
+        Tooltip(mode_box, "Beginner shows the essentials. Advanced adds the "
+                          "Connections, Remote hosts and Packets tabs, "
+                          "technical columns and filter expressions. Same "
+                          "data either way.")
+        tk.Label(header, text="View", bg="#2b3a55", fg="#c8d2e0").pack(
+            side="right", padx=(10, 4))
+        ttk.Button(header, text="\U0001F50D", width=3,
+                   command=self._run_global_search).pack(side="right",
+                                                         padx=(0, 6))
+        self.global_search_var = tk.StringVar()
+        se = ttk.Entry(header, textvariable=self.global_search_var, width=20)
+        se.pack(side="right")
+        self.search_entry = se
+        se.bind("<Return>", lambda e: self._run_global_search())
+        Tooltip(se, "Search devices, names, MACs, IPs, vendors, websites, "
+                    "remote hosts, countries, providers, alerts, timeline "
+                    "and ports. Tokens: device: site: ip: port: alert: "
+                    "(Ctrl+F)")
+        tk.Label(header, text="Search", bg="#2b3a55", fg="#c8d2e0").pack(
+            side="right", padx=(10, 4))
+
+        # persistent, always-truthful Active/Quiet banner
+        self.mode_banner = tk.Frame(self.root, padx=14, pady=5)
+        self.mode_banner.pack(fill="x")
+        self.mode_lbl = tk.Label(self.mode_banner, anchor="w",
+                                 justify="left", wraplength=1100,
+                                 font=("TkDefaultFont", 10, "bold"))
+        self.mode_lbl.pack(side="left", fill="x", expand=True)
+        self.mode_toggle_btn = ttk.Button(
+            self.mode_banner, text="Switch to Quiet Mode",
+            command=self._toggle_active_scanning)
+        self.mode_toggle_btn.pack(side="right")
+        Tooltip(self.mode_lbl,
+                "This banner always tells the truth about whether "
+                "MiniWireshark is sending discovery probes and health checks "
+                "on your network or only listening. It can never be hidden "
+                "— that's a transparency guarantee, not a setting.")
+
+        # data-source banner (offline / saved / demo) — hidden when live
+        self.data_banner = tk.Frame(self.root, padx=14, pady=6)
+        self.data_lbl = tk.Label(self.data_banner, anchor="w",
+                                 font=("TkDefaultFont", 10, "bold"))
+        self.data_lbl.pack(side="left")
+        self.data_btn = ttk.Button(self.data_banner, text="Return to live "
+                                   "capture", command=self._return_to_live)
+        self.data_btn.pack(side="right")
+
+        # friendly (transient) status banner
+        self.banner = tk.Frame(self.root, bg="#e8f0fe", padx=14, pady=8)
+        self.banner.pack(fill="x")
+        self.banner_lbl = tk.Label(
+            self.banner,
+            text="👋  Welcome! I'll pick your network card and start "
+                 "watching. I'll explain everything in plain English.",
+            bg="#e8f0fe", fg="#1a3a6b", anchor="w", justify="left",
+            wraplength=1200, font=("TkDefaultFont", 11))
+        self.banner_lbl.pack(side="left", fill="x", expand=True)
+
+        bar = ttk.Frame(self.root, padding=(12, 8, 12, 2))
+        bar.pack(fill="x")
+        ttk.Button(bar, text="Session ▾",
+                   command=self._open_session_menu).pack(side="right")
+        ttk.Button(bar, text="Export ▾",
+                   command=self._open_export_menu).pack(side="right",
+                                                        padx=(0, 6))
+        self.clear_btn = ttk.Button(bar, text=tr("btn_clear"),
+                                    command=self.clear)
+        self.clear_btn.pack(side="right", padx=(0, 6))
+        ttk.Label(bar, text="Network card:").pack(side="left")
+        self.iface_var = tk.StringVar()
+        self.iface_box = ttk.Combobox(bar, textvariable=self.iface_var,
+                                      width=30, state="readonly")
+        self.iface_box.pack(side="left", padx=(6, 2))
+        self.iface_tip = Tooltip(self.iface_box, "")
+        self.iface_box.bind("<<ComboboxSelected>>", self._on_iface_picked)
+        ttk.Button(bar, text="↻", width=3, command=self.refresh_adapters
+                   ).pack(side="left", padx=(0, 12))
+        ttk.Label(bar, text="Capture filter:").pack(side="left")
+        self.filter_var = tk.StringVar()
+        fe = ttk.Entry(bar, textvariable=self.filter_var, width=12)
+        fe.pack(side="left", padx=(6, 12))
+        Tooltip(fe, "Optional (advanced): only CAPTURE packets matching a "
+                    "BPF filter, e.g. “host 192.168.1.20”. Leave "
+                    "empty to see everything. For viewing, use the display "
+                    "filters on the Packets tab instead.")
+        self.start_btn = ttk.Button(bar, text=tr("btn_start"),
+                                    style="Accent.TButton",
+                                    command=self.start)
+        self.start_btn.pack(side="left")
+        self.stop_btn = ttk.Button(bar, text=tr("btn_stop"), command=self.stop,
+                                   state="disabled")
+        self.stop_btn.pack(side="left", padx=6)
+
+        self.nb = ttk.Notebook(self.root)
+        self.nb.pack(fill="both", expand=True, padx=12, pady=(6, 4))
+        self.nb.enable_traversal()
+        self.tabs = OrderedDict()
+        for cls in (DashboardTab, FeedTab, TimelineTab, DevicesTab,
+                    WebsitesTab, ConnectionsTab, RemoteTab, AlertsTab,
+                    MapTab, HealthTab, SecurityTab, PacketsTab, HelpTab):
+            tab = cls(self)
+            self.tabs[cls.name] = tab
+            self.nb.add(tab.frame, text=tr(cls.label_key))
+        self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        self._apply_ui_mode()
+
+        self.status_var = tk.StringVar(
+            value="Getting ready — I'll pick a network card and start "
+                  "watching automatically.")
+        tk.Label(self.root, textvariable=self.status_var, anchor="w",
+                 fg="#222222", bg="#e3e6eb", padx=10, pady=4).pack(
+            side="bottom", fill="x")
+        self._restyle_mode_banner()
+
+    def _on_tab_changed(self, _e=None):
+        for tab in self.tabs.values():
+            if tab.is_visible():
+                with contextlib.suppress(tk.TclError):
+                    tab.refresh()
+
+    def _open_help_menu(self):
+        menu = themed_menu(self)
+        menu.add_command(label="Help & glossary",
+                         command=lambda: self.goto("help"))
+        menu.add_command(label="Diagnostics…",
+                         command=self.open_diagnostics)
+        menu.add_command(label=("Stop Demo Mode" if self.data_mode == "demo"
+                                else "Try Demo Mode"),
+                         command=self.toggle_demo)
+        menu.add_command(label="Run self-test",
+                         command=self.run_self_test_window)
+        menu.add_separator()
+        menu.add_command(label="Check for updates",
+                         command=lambda: self._check_for_updates(True))
+        menu.add_command(label="Open data folder",
+                         command=lambda: _open_path(PATHS.data))
+        try:
+            menu.tk_popup(self.btn_help_w.winfo_rootx(),
+                          self.btn_help_w.winfo_rooty() +
+                          self.btn_help_w.winfo_height())
+        finally:
+            menu.grab_release()
+
+    # ---- banners --------------------------------------------------------------
+    def _set_banner(self, text, kind="info"):
+        colors = {"info": ("#e8f0fe", "#1a3a6b"),
+                  "warn": ("#fff4e0", "#7a4a00"),
+                  "bad": ("#fbe9e7", "#8a1a08"),
+                  "good": ("#e6f4ea", "#0b6b3a")}
+        bg, fg = colors.get(kind, colors["info"])
+        table = PALETTES[palette_name(self.theme_name, self.high_contrast)]
+        bg, fg = table.get(bg, bg), table.get(fg, fg)
+        with contextlib.suppress(tk.TclError):
+            self.banner.config(bg=bg)
+            self.banner_lbl.config(bg=bg, fg=fg, text=text)
+
+    def _restyle_mode_banner(self):
+        if not hasattr(self, "mode_banner"):
+            return
+        t = self.theme
+        active = self.config.get("mode.active_scanning", True)
+        if active:
+            bg, fg = t["mode_active_bg"], t["mode_active_fg"]
+            text = tr("mode_active")
+            btn_text = "Switch to Quiet Mode"
+        else:
+            bg, fg = t["mode_quiet_bg"], t["mode_quiet_fg"]
+            text = tr("mode_quiet")
+            btn_text = "Switch to Active Scanning"
+        if active and self.data_mode != "live":
+            text += "  (Nothing is being sent right now: not capturing live.)"
+        self.mode_banner.configure(bg=bg)
+        self.mode_lbl.configure(bg=bg, fg=fg, text=text)
+        self.mode_toggle_btn.configure(text=btn_text)
+        self._restyle_data_banner()
+
+    def _restyle_data_banner(self):
+        t = self.theme
+        text = DATA_MODE_TEXT.get(self.data_mode)
+        if not text:
+            self.data_banner.pack_forget()
+            return
+        if self.data_label:
+            text += f"   [{self.data_label}]"
+        bg, fg = ((t["mode_quiet_bg"], t["mode_quiet_fg"])
+                  if self.data_mode == "demo" else
+                  (t["warn_bg"], t["warn_fg"]))
+        self.data_banner.configure(bg=bg)
+        self.data_lbl.configure(bg=bg, fg=fg, text=text)
+        self.data_btn.configure(text="Exit demo" if self.data_mode == "demo"
+                                else "Return to live capture")
+        self.data_banner.pack(fill="x", after=self.mode_banner)
+
+    def _toggle_active_scanning(self):
+        cur = self.config.get("mode.active_scanning", True)
+        self.config.set("mode.active_scanning", not cur)
+        self.config.save()
+        self._restyle_mode_banner()
+        if cur:
+            if self.lan_scanner is not None:
+                self.lan_scanner.stop_flag = True
+                self.lan_scanner = None
+            self._set_banner("\U0001F535 Switched to Quiet Mode — I stopped "
+                             "sending discovery probes and health checks. I'm "
+                             "still listening normally.")
+        else:
+            self._start_lan_scanner()
+            self._set_banner("\U0001F7E2 Switched to Active Scanning — "
+                             "I'll periodically look for quiet devices on "
+                             "your own network again.")
+        self.model.push_timeline("capture", "INFO",
+                                 "Quiet Mode on" if cur else
+                                 "Active Scanning on")
+        sw = self._settings_win
+        if sw is not None and sw.alive():
+            sw.sync_key("mode.active_scanning", not cur)
+
+    def _on_ui_mode_change(self, _e=None):
+        self.beginner_mode = (self.mode_ui_var.get() == "Beginner")
+        self.config.set("appearance.beginner_mode", self.beginner_mode)
+        self.config.save()
+        self._apply_ui_mode()
+
+    def _apply_ui_mode(self):
+        """Beginner hides the technical tabs and fields; Advanced shows
+        them. Nothing is removed and the data is identical."""
+        for tab in self.tabs.values():
+            if not tab.advanced:
+                continue
+            try:
+                if self.beginner_mode:
+                    self.nb.hide(tab.frame)
+                else:
+                    self.nb.add(tab.frame)
+            except tk.TclError:
+                pass
+        for name in ("devices", "packets"):
+            tab = self.tabs.get(name)
+            if tab is not None and hasattr(tab, "apply_mode"):
+                tab.apply_mode()
+
+    def _apply_locale(self):
+        try:
+            self.hdr_title.configure(text=tr("app_title"))
+            self.hdr_subtitle.configure(text=tr("app_subtitle"))
+            self.btn_settings_w.configure(text=tr("btn_settings"))
+            self.btn_help_w.configure(text=tr("btn_help"))
+            self.start_btn.configure(text=tr("btn_start"))
+            self.stop_btn.configure(text=tr("btn_stop"))
+            self.clear_btn.configure(text=tr("btn_clear"))
+            for tab in self.tabs.values():
+                self.nb.tab(tab.frame, text=tr(tab.label_key))
+        except (tk.TclError, AttributeError):
+            pass
+        self._restyle_mode_banner()
+
+    def _apply_theme(self, name=None, high_contrast=None):
+        if name:
+            self.theme_name = name
+        if high_contrast is not None:
+            self.high_contrast = bool(high_contrast)
+        dark = (self.theme_name == "Dark")
+        pal = palette_name(self.theme_name, self.high_contrast)
+        self.theme = THEMES[pal]
+        Tooltip.theme = self.theme
+        self._retheme_widget_tree(self.root, pal)
+        self._restyle_ttk(dark, self.high_contrast)
+        with contextlib.suppress(tk.TclError):
+            self.root.configure(background=self.theme["window_bg"])
+        for tab in self.tabs.values():
+            with contextlib.suppress(tk.TclError):
+                tab.on_theme()
+        self._restyle_mode_banner()
+        for tab in self.tabs.values():
+            if tab.is_visible():
+                with contextlib.suppress(tk.TclError):
+                    tab.refresh()
+        mt = self.tabs.get("map")
+        if mt:
+            mt.redraw(force=True)
+        self.config.set("appearance.theme", self.theme_name)
+        self.config.set("appearance.high_contrast", self.high_contrast)
+        self.config.save()
+
+
+    def _apply_style(self):
+        s = ttk.Style()
+        try:
+            s.theme_use("clam")
+        except Exception:
+            pass
+        s.configure("TButton", padding=(10, 6))
+        s.configure("Accent.TButton", padding=(14, 8),
+                    font=("TkDefaultFont", 11, "bold"))
+        s.configure("Treeview", rowheight=26, font=("TkDefaultFont", 10))
+        s.configure("Treeview.Heading", font=("TkDefaultFont", 10, "bold"))
+        s.configure("TNotebook.Tab", padding=(10, 7),
+                    font=("TkDefaultFont", 10, "bold"))
+
+    # ---------- severity system (INFO / WARNING / DANGER) ----------------
+    SEVERITY_ICON = {"INFO": "\u2139", "WARNING": "\u26a0", "DANGER": "\u203c"}
+
+    def _severity_colors(self):
+        t = getattr(self, "theme", None) or THEME_LIGHT
+        return {
+            "INFO": (t["info_fg"], None),
+            "WARNING": (t["warn_fg"], t["warn_bg"]),
+            "DANGER": (t["danger_fg"], t["danger_bg"]),
+        }
+
+    # ---------- themes: Light / Dark, each with a High-Contrast variant ----
+    def _retheme_widget_tree(self, widget, palette):
+        """Swap every known palette colour on `widget` and its descendants
+        for the same colour in `palette`. Colours are mapped via their
+        canonical light value, so any palette -> any palette is lossless."""
+        table = PALETTES[palette]
+        try:
+            keys = widget.keys()
+        except Exception:
+            keys = []
+        for opt in _RETHEME_COLOR_OPTS:
+            if opt not in keys:
+                continue
+            try:
+                cur = str(widget.cget(opt)).lower()
+            except Exception:
+                continue
+            if opt in ("fg", "foreground", "insertbackground") and \
+                    cur in _DEFAULT_FG_NAMES:
+                # still on the platform's default text colour (which can't
+                # be themed by hex lookup, e.g. "SystemWindowText" on
+                # Windows): adopt this palette's text colour explicitly
+                try:
+                    widget.configure(**{opt: THEMES[palette]["text_fg"]})
+                except tk.TclError:
+                    pass
+                continue
+            canon = _CANON.get(cur, cur)
+            new = table.get(canon, canon)
+            if new != cur and canon in LIGHT_TO_DARK_HEX:
+                try:
+                    widget.configure(**{opt: new})
+                except tk.TclError:
+                    pass
+        if isinstance(widget, tk.Text):
+            for tag in widget.tag_names():
+                for opt in ("foreground", "background"):
+                    try:
+                        cur = str(widget.tag_cget(tag, opt)).lower()
+                    except tk.TclError:
+                        continue
+                    canon = _CANON.get(cur, cur)
+                    new = table.get(canon, canon)
+                    if new != cur and canon in LIGHT_TO_DARK_HEX:
+                        try:
+                            widget.tag_configure(tag, **{opt: new})
+                        except tk.TclError:
+                            pass
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            children = []
+        for child in children:
+            self._retheme_widget_tree(child, palette)
+
+    def _restyle_ttk(self, dark, hc=False):
+        style = ttk.Style()
+        pal = palette_name("Dark" if dark else "Light", hc)
+        frame = THEMES[pal]["window_bg"]      # window chrome
+        surface = THEMES[pal]["tab_bg"]       # cards / tab content
+        if hc and dark:
+            bg, fg, field, sel, selfg = ("#0b0c0f", "#ffffff", "#000000",
+                                         "#ffd400", "#000000")
+            tabsel = "#ffd400"
+        elif hc:
+            bg, fg, field, sel, selfg = ("#ffffff", "#000000", "#ffffff",
+                                         "#0a246a", "#ffffff")
+            tabsel = "#0a246a"
+        elif dark:
+            bg, fg, field, sel, selfg = ("#20232c", "#e2e5ea", "#181b22",
+                                         "#2f5f8f", "#ffffff")
+            tabsel = "#2f5f8f"
+        else:
+            bg, fg, field, sel, selfg = ("#e8e8ec", "#000000", "#ffffff",
+                                         "#cfe3ff", "#000000")
+            tabsel = "#ffffff"
+        tabsel_fg = selfg if (dark or hc) else "#000000"
+        head = "#242832" if (dark and not hc) else (
+            "#000000" if (dark and hc) else ("#ffffff" if hc else "#f0f0f0"))
+        style.configure("TFrame", background=frame)
+        style.configure("TLabel", background=frame, foreground=fg)
+        style.configure("TButton", background=bg, foreground=fg)
+        style.map("TButton",
+                  background=[("disabled",
+                               frame if (dark or hc) else "#ececec")],
+                  foreground=[("disabled", "#7a808c" if dark else "#8a8a8a")])
+        style.configure("TCheckbutton", background=surface, foreground=fg)
+        style.configure("TRadiobutton", background=surface, foreground=fg)
+        style.map("TCheckbutton", background=[("active", surface)])
+        style.map("TRadiobutton", background=[("active", surface)])
+        style.configure("TNotebook", background=frame)
+        style.configure("TNotebook.Tab", background=bg if not hc else frame,
+                        foreground=fg)
+        style.map("TNotebook.Tab", background=[("selected", tabsel)],
+                  foreground=[("selected", tabsel_fg)])
+        style.configure("Treeview", background=field, fieldbackground=field,
+                        foreground=fg)
+        style.configure("Treeview.Heading", background=head, foreground=fg)
+        style.map("Treeview", background=[("selected", sel)],
+                  foreground=[("selected", selfg)])
+        style.configure("TCombobox", fieldbackground=field, foreground=fg,
+                        background=bg, arrowcolor=fg)
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", field), ("disabled", bg)],
+                  foreground=[("readonly", fg), ("disabled", "#888888")],
+                  selectbackground=[("readonly", field)],
+                  selectforeground=[("readonly", fg)])
+        for opt, val in (("background", field), ("foreground", fg),
+                         ("selectBackground", sel),
+                         ("selectForeground", selfg)):
+            self.root.option_add(f"*TCombobox*Listbox.{opt}", val)
+        style.configure("TEntry", fieldbackground=field, foreground=fg)
+        style.configure("TSpinbox", fieldbackground=field, foreground=fg)
+        style.configure("TScrollbar", background=bg, troughcolor=frame,
+                        arrowcolor=fg, bordercolor=frame,
+                        lightcolor=bg, darkcolor=bg)
+        accent = {"Dark HC": "#ffd400", "Light HC": "#0a246a"}.get(
+            pal, "#2f6fc0" if dark else "#2b7de9")
+        style.configure("Accent.TButton", background=accent,
+                        foreground="#000000" if (dark and hc) else "#ffffff")
+        style.configure("Settings.TButton", padding=(10, 4))
+        style.configure("Card.TLabel", background=surface, foreground=fg)
+        style.configure("TLabelframe", background=surface)
+        style.configure("TLabelframe.Label", background=surface,
+                        foreground=fg)
+        style.configure("TPanedwindow", background=frame)
+        style.configure("Horizontal.TProgressbar", background=accent)
+        focus = THEMES[pal]["focus"]
+        for w in ("TButton", "TCheckbutton", "TRadiobutton", "TEntry",
+                  "TCombobox", "Treeview"):
+            style.configure(w, focuscolor=focus)
+        style.map("Treeview.Heading",
+                  background=[("active", bg)], foreground=[("active", fg)])
+        style.configure("TMenubutton", background=bg, foreground=fg)
+
+
+    TEXT_SIZES = {"Small": 0.9, "Normal": 1.0, "Large": 1.15,
+                  "Extra large": 1.3}
+
+    def _apply_text_size(self, label=None):
+        label = label or self.config.get("appearance.text_size", "Normal")
+        scale = self.TEXT_SIZES.get(label, 1.0)
+        base = getattr(self, "_base_font_sizes", None)
+        if base is None:
+            base = self._base_font_sizes = {}
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                     "TkHeadingFont", "TkCaptionFont", "TkSmallCaptionFont",
+                     "TkIconFont", "TkTooltipFont", "TkFixedFont"):
+            try:
+                f = tkfont.nametofont(name)
+            except tk.TclError:
+                continue
+            if name not in base:
+                base[name] = f.cget("size")
+            size = base[name]
+            f.configure(size=(-1 if size < 0 else 1) *
+                        max(6, int(round(abs(size) * scale))))
+        try:
+            ttk.Style().configure("Treeview", rowheight=int(24 * scale))
+        except tk.TclError:
+            pass
+        self._scale_explicit_fonts(self.root, scale)
+
+    def _scale_explicit_fonts(self, widget, scale):
+        """Widgets built with an explicit ("TkDefaultFont", 11, "bold")
+        style font don't follow the named fonts, so scale those directly
+        (remembering each widget's original size so scaling never compounds)."""
+        try:
+            has_font = "font" in widget.keys()
+        except Exception:
+            has_font = False
+        if has_font:
+            try:
+                raw = getattr(widget, "_mw_orig_font", None)
+                if raw is None:
+                    raw = widget._mw_orig_font = str(widget.cget("font"))
+                if raw not in tkfont.names():
+                    f = tkfont.Font(root=self.root, font=raw)
+                    a = f.actual()
+                    size = a["size"]
+                    new = (-1 if size < 0 else 1) * max(
+                        6, int(round(abs(size) * scale)))
+                    parts = [a["family"], new]
+                    if a.get("weight") == "bold":
+                        parts.append("bold")
+                    if a.get("slant") == "italic":
+                        parts.append("italic")
+                    widget.configure(font=tuple(parts))
+            except Exception:
+                pass
+        try:
+            children = widget.winfo_children()
+        except Exception:
+            children = []
+        for child in children:
+            self._scale_explicit_fonts(child, scale)
+
+
+    def _focus_search(self, _event=None):
+        try:
+            self.search_entry.focus_set()
+            self.search_entry.selection_range(0, "end")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _apply_shortcuts(self):
+        """(Re)binds every configurable keyboard shortcut. Safe to call
+        repeatedly \u2014 always unbinds its own previous bindings first,
+        so remapping in Settings never leaves a stale accelerator active."""
+        for seq in getattr(self, "_bound_shortcuts", []):
+            try:
+                self.root.unbind_all(seq)
+            except Exception:
+                pass
+        self._bound_shortcuts = []
+        actions = {
+            "start": lambda e=None: self.start(),
+            "stop": lambda e=None: self.stop(),
+            "clear": lambda e=None: self.clear(),
+            "export": lambda e=None: self._open_export_menu(),
+            "find": self._focus_search,
+        }
+        shortcuts = self.config.data.get("shortcuts", DEFAULT_SHORTCUTS)
+        for name, seq in shortcuts.items():
+            fn = actions.get(name)
+            if not fn or not seq:
+                continue
+            try:
+                self.root.bind_all(seq, fn)
+                self._bound_shortcuts.append(seq)
+            except tk.TclError:
+                pass
+
+    def _capture_shortcut(self, parent, name, display_var):
+        win = tk.Toplevel(parent)
+        win.title("New shortcut")
+        win.geometry("320x110")
+        win.transient(parent)
+        tk.Label(win, text="Press the new key combination now\n"
+                          "(Esc to cancel)", pady=24,
+                bg=self.theme["tab_bg"], fg=self.theme["text_fg"]).pack(
+            fill="both", expand=True)
+        win.configure(bg=self.theme["tab_bg"])
+
+        def on_key(event):
+            if event.keysym == "Escape":
+                win.destroy(); return
+            if event.keysym in ("Control_L", "Control_R", "Shift_L",
+                               "Shift_R", "Alt_L", "Alt_R"):
+                return
+            mods = []
+            if event.state & 0x4:
+                mods.append("Control")
+            if event.state & 0x1:
+                mods.append("Shift")
+            if event.state & 0x20000 or event.state & 0x0008:
+                mods.append("Alt")
+            seq = "<" + "-".join(mods + [event.keysym]) + ">"
+            display_var.set(seq)
+            win.destroy()
+        win.bind("<KeyPress>", on_key)
+        win.focus_set()
+        win.grab_set()
+
+    # ---------- feed tab -------------------------------------------------
+
+
+    # ======================================================================
+    #  Network cards
+    # ======================================================================
+    def _populate_ifaces(self, keep=None):
+        try:
+            self.iface_scores = score_interfaces(self.default_iface_name,
+                                                 self.real_identity[0])
+        except Exception as e:                       # noqa: BLE001
+            LOG.warning("adapter scoring failed: %s", e)
+            self.iface_scores = []
+        self.iface_map = {}
+        labels, seen = [], set()
+        for rec in self.iface_scores:
+            label = rec["label"]
+            base, i = label, 2
+            while label in seen:
+                label = f"{base} ({i})"
+                i += 1
+            seen.add(label)
+            rec["display"] = label
+            self.iface_map[label] = rec["iface"]
+            labels.append(label)
+        if not labels:
+            try:
+                for n in get_if_list():
+                    self.iface_map[n] = n
+                    labels.append(n)
+            except Exception:                        # noqa: BLE001
+                pass
+        if not labels:
+            self.iface_map["Default"] = None
+            labels = ["Default"]
+        self.iface_box["values"] = labels
+        chosen = labels[0]
+        pref = (self.config.get("capture.preferred_interface", "") or "")
+        auto = self.config.get("capture.auto_select_interface", True)
+        if keep and keep in self.iface_map:
+            chosen = keep
+        elif pref and not auto:
+            for rec in self.iface_scores:
+                if rec["name"] == pref:
+                    chosen = rec["display"]
+        rec = self._score_for(chosen)
+        self.iface_reason = explain_choice(rec) if rec else ""
+        self.iface_var.set(chosen)
+        self.iface_tip.set_text(self._iface_tooltip())
+        LOG.info("adapters: %s; chose %s (%s)",
+                 [(r["name"], r["score"]) for r in self.iface_scores[:6]],
+                 chosen, self.iface_reason)
+
+    def _score_for(self, label):
+        return next((r for r in self.iface_scores
+                     if r.get("display") == label), None)
+
+    def _iface_tooltip(self):
+        lines = [self.iface_reason or "Choose which network card to watch."]
+        for r in self.iface_scores[:6]:
+            lines.append(f"• {r['display']}: score {r['score']}"
+                         f"{' (VPN)' if r['vpn'] else ''}"
+                         f"{' (virtual)' if r['virtual'] else ''}")
+        return "\n".join(lines)
+
+    def refresh_adapters(self):
+        cur = self.iface_var.get()
+        with contextlib.suppress(Exception):
+            conf.ifaces.reload()
+        self._populate_ifaces(keep=cur)
+        self._set_banner("\U0001F504  Network cards refreshed. " +
+                         (self.iface_reason or ""))
+        if self.sniffer is not None and cur not in self.iface_map:
+            self._handle_sniffer_died(RuntimeError("adapter disappeared"))
+
+    def _on_iface_picked(self, _e=None):
+        label = self.iface_var.get()
+        rec = self._score_for(label)
+        if rec:
+            self.config.set("capture.preferred_interface", rec["name"])
+            self.config.save()
+            self.iface_reason = "You picked this card."
+            self.iface_tip.set_text(self._iface_tooltip())
+        if self.sniffer is not None and label != self.current_iface_label:
+            self.model.push_timeline("interface", "INFO",
+                                     f"Switched capture to “{label}”")
+            self._stop_capture_only()
+            self._start_capture([label], keep_data=True)
+
+    # ======================================================================
+    #  Capture control
+    # ======================================================================
+    def _auto_start_once(self):
+        if self.sniffer is not None or self.data_mode != "idle":
+            return
+        self._set_banner("🤖  Getting started automatically — picking your "
+                         "best network card ...")
+        self.start(auto=True)
+
+    def _confirm_leave_nonlive(self, action):
+        if self.data_mode in ("offline", "session", "demo"):
+            what = {"offline": "the opened capture file",
+                    "session": "the loaded session",
+                    "demo": "the demo data"}[self.data_mode]
+            return messagebox.askyesno(
+                action, f"{action} starts a fresh live session, so {what} "
+                f"will be cleared from view.\n\nSave it first (Session ▾ "
+                f"Save session) if you want to keep it. Continue?",
+                parent=self.root)
+        return True
+
+    def start(self, auto=False):
+        if self.sniffer is not None:
+            return
+        if not auto and not self._confirm_leave_nonlive("Start watching"):
+            return
+        self._leave_nonlive()
+        if not HAVE_SCAPY:
+            self._set_banner("❌  The capture engine isn't available.",
+                             kind="bad")
+            return
+        label = self.iface_var.get()
+        others = [l for l in self.iface_box["values"] if l != label]
+        if self.config.get("capture.auto_select_interface", True):
+            ordered = [r["display"] for r in self.iface_scores
+                       if r.get("display") in others and r["score"] > -60]
+        else:
+            ordered = []
+        self._start_capture(([label] + ordered)[:5], auto=auto)
+
+    def _leave_nonlive(self):
+        """Make sure nothing saved/offline/demo can mix with live data."""
+        if self.demo is not None:
+            self.demo.stop()
+            self.demo = None
+        if self.importer is not None:
+            self.importer.cancelled = True
+            self.importer = None
+        if self.data_mode in ("offline", "session", "demo") or \
+                any(not d.live for d in self.model.registry.by_key.values()):
+            self.real_identity = (self.real_identity[0],
+                                  self.real_identity[1],
+                                  self.real_identity[2])
+            self.replace_model(self._new_model())
+            self._baselines_from_history()
+        self.data_mode = "idle"
+        self.data_label = ""
+        if self.worker is not None:
+            self.worker.lossless = False
+        self._restyle_mode_banner()
+
+    def _ensure_worker(self):
+        if self.worker is None or not self.worker.is_alive():
+            self.worker = DecodeWorker(self.pkt_q, self.row_q,
+                                       self.model.cache,
+                                       self.real_identity[0],
+                                       self.real_identity[1])
+            self.worker.start()
+        self.worker.cache = self.model.cache
+        if self.rdns is None:
+            self.rdns = ReverseDNS(self.model.cache)
+        self.rdns.cache = self.model.cache
+
+    def _start_capture(self, candidates, auto=False, keep_data=False):
+        self._ensure_worker()
+        bpf = self.filter_var.get().strip() or None
+        promisc = bool(self.config.get("capture.promiscuous", True))
+        self.status_var.set("Starting ...")
+        self.root.update_idletasks()
+        sniffer, err, used = None, None, None
+        for lbl in candidates:
+            iface = self.iface_map.get(lbl)
+            sniffer, err = build_sniffer(iface, self._sniff_cb, bpf, promisc)
+            if sniffer is not None:
+                used = lbl
+                break
+            LOG.info("capture failed on %s: %s", lbl, err)
+        if sniffer is None:
+            self.status_var.set("Could not start watching on any network card.")
+            hint = ""
+            if IS_WINDOWS and not _npcap_present():
+                hint = " The capture driver (Npcap) seems to be missing — " \
+                       "use Diagnostics → Repair dependencies."
+            self._set_banner(
+                f"❌  I couldn't start watching ({err}).{hint} Try running as "
+                f"Administrator / root, or pick a different network card "
+                f"and click “Start watching”.", kind="bad")
+            LOG.warning("capture could not start: %s", err)
+            return False
+        self.sniffer = sniffer
+        self.current_iface_label = used
+        self._capture_started_at = time.time()
+        self._last_packet_wall = time.time()
+        if not keep_data:
+            self.model.capture_started = time.time()
+        if used != self.iface_var.get():
+            self.iface_var.set(used)
+        iface_obj = self.iface_map.get(used)
+        ip = _iface_ip(iface_obj) if iface_obj is not None else ""
+        if ip:
+            ips = set(self.real_identity[1]) | {ip}
+            self.real_identity = (self.real_identity[0], ips,
+                                  self.real_identity[2])
+            self.model.set_identity(my_ips=ips, local_nets=self._local_nets())
+        self.model.vpn["iface"] = used if (iface_obj is not None and
+                                           is_vpn_iface(iface_obj)) else ""
+        self.data_mode = "live"
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+        self._start_lan_scanner()
+        self._restyle_mode_banner()
+        rec = self._score_for(used)
+        why = explain_choice(rec) if (rec and auto) else ""
+        self.model.push_timeline("capture", "INFO",
+                                 f"Started watching “{used}”" +
+                                 (f" ({why})" if why else ""))
+        LOG.info("capture started on %s (bpf=%s, promisc=%s)", used, bpf,
+                 promisc)
+        if candidates and used != candidates[0]:
+            self._set_banner(
+                f"👀  “{candidates[0]}” didn't work, so I switched to "
+                f"“{used}” automatically.")
+        else:
+            scan = (" I'm also quietly looking for other devices on your "
+                    "network." if self.lan_scanner else
+                    " I'm in Quiet Mode, so I'm only listening.")
+            self._set_banner(f"👀  Watching “{used}”.{scan} "
+                             f"{why + '.' if why else ''}")
+        if self.model.vpn.get("iface"):
+            self._set_banner("\U0001F512  This looks like a VPN/tunnel adapter. "
+                             "Traffic may be encrypted inside the tunnel, so "
+                             "I can see less about individual Internet "
+                             "destinations.", kind="warn")
+        self.status_var.set(f"👀 Watching “{used}”.")
+        if self.prober:
+            self.prober.run_now.set()
+        return True
+
+    def _start_lan_scanner(self):
+        if self.lan_scanner is not None or self.data_mode != "live" or \
+                not self.config.get("mode.active_scanning", True):
+            return
+        iface_obj = self.iface_map.get(self.current_iface_label)
+        my_ip = _iface_ip(iface_obj) if iface_obj is not None else ""
+        if not my_ip and self.real_identity[1]:
+            my_ip = next(iter(self.real_identity[1]))
+        if iface_obj is not None and is_vpn_iface(iface_obj):
+            return                       # never probe through a tunnel
+        self.lan_scanner = LanScanner(iface_obj, my_ip)
+        self.lan_scanner.start()
+
+    def _sniff_cb(self, pkt):
+        try:
+            self.pkt_q.put_nowait(pkt)
+        except queue.Full:
+            self.dropped_capture += 1
+
+    def _stop_capture_only(self):
+        s, self.sniffer = self.sniffer, None
+        if s is not None:
+            try:
+                s.stop()
+            except Exception as e:                   # noqa: BLE001
+                LOG.debug("sniffer stop: %s", e)
+        if self.lan_scanner is not None:
+            self.lan_scanner.stop_flag = True
+            self.lan_scanner = None
+
+    def stop(self):
+        was_live = self.sniffer is not None
+        self._stop_capture_only()
+        if self._restart_job:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(self._restart_job)
+            self._restart_job = None
+        self.start_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        if self.data_mode == "live":
+            self.data_mode = "idle"
+        if was_live:
+            self.model.push_timeline("capture", "INFO", "Stopped watching")
+            LOG.info("capture stopped by user")
+            self.status_var.set(f"Stopped. Saw {self.count} packets.")
+            self._set_banner("⏸️  Stopped watching.")
+        self._restyle_mode_banner()
+
+    # ---- self-healing ----------------------------------------------------------
+    def _handle_sniffer_died(self, exc):
+        """The capture died on its own (adapter reset, driver hiccup, Wi-Fi
+        reconnect, sleep…). Heal with exponential backoff, keeping all
+        session data."""
+        if self.sniffer is None and self._restart_job:
+            return
+        LOG.warning("capture stopped unexpectedly: %s", exc)
+        self._stop_capture_only()
+        self.start_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
+        self._restart_attempts += 1
+        n = self._restart_attempts
+        delay = min(60, 2 ** min(n - 1, 6))
+        self.model.push_timeline("capture", "WARNING",
+                                 f"Capture stopped unexpectedly "
+                                 f"({exc or 'unknown reason'}); retrying in "
+                                 f"{delay}s")
+        if n > 12:
+            self.data_mode = "idle"
+            self._set_banner(f"⏸️  The watcher kept stopping ({exc}). Click "
+                             f"“Start watching” to try again, or open "
+                             f"Diagnostics.", kind="bad")
+            self.status_var.set("Stopped after repeated errors.")
+            self._restyle_mode_banner()
+            return
+        self._set_banner(f"🔧  The watcher stopped unexpectedly — I'll restart "
+                         f"it in {delay}s (attempt {n}). Your data is kept.",
+                         kind="warn")
+        self._restart_job = self.root.after(int(delay * 1000),
+                                            self._heal_attempt)
+
+    def _heal_attempt(self):
+        self._restart_job = None
+        if self.data_mode not in ("live", "idle") or self.sniffer is not None:
+            return
+        prev = self.current_iface_label
+        prev_name = iface_name(self.iface_map.get(prev)) if prev else ""
+        with contextlib.suppress(Exception):
+            conf.ifaces.reload()
+        with contextlib.suppress(Exception):
+            conf.route.resync()
+            iface, my_ip, gw = conf.route.route("0.0.0.0")
+            self.default_iface_name = iface_name(iface)
+            gw = gw if gw != "0.0.0.0" else ""
+            if gw and gw != self.real_identity[0]:
+                self.model.push_timeline("interface", "INFO",
+                                         f"Router address is now {gw}")
+            ips = set(self.real_identity[1])
+            if my_ip and my_ip != "0.0.0.0":
+                ips.add(my_ip)
+            self.real_identity = (gw or self.real_identity[0], ips,
+                                  self.real_identity[2])
+            self.model.set_identity(gateway_ip=self.real_identity[0],
+                                    my_ips=ips, local_nets=self._local_nets())
+        self._populate_ifaces()
+        cands = []
+        for r in self.iface_scores:
+            if r["name"] == prev_name and r["score"] > -60:
+                cands.append(r["display"])
+        cands += [r["display"] for r in self.iface_scores
+                  if r["display"] not in cands and r["score"] > -60]
+        if not cands:
+            cands = list(self.iface_box["values"])[:1]
+        if cands and self._start_capture(cands[:4], keep_data=True):
+            self.model.push_timeline("capture", "INFO",
+                                     f"Capture restarted on "
+                                     f"“{self.current_iface_label}”")
+            self.root.after(120000, self._reset_restart_counter)
+        else:
+            self._handle_sniffer_died(RuntimeError("restart failed"))
+
+    def _reset_restart_counter(self):
+        if self.sniffer is not None:
+            self._restart_attempts = 0
+
+    def _on_network_snapshot(self, snap):
+        self._last_snapshot = snap
+        if self.data_mode != "live":
+            return
+        if snap.get("resumed"):
+            self.model.push_timeline("interface", "INFO",
+                                     "The computer seems to have woken from "
+                                     "sleep")
+            if time.time() - self._last_packet_wall > 15:
+                self._handle_sniffer_died(RuntimeError("resumed from sleep"))
+                return
+        gw, my_ip = snap.get("gateway", ""), snap.get("my_ip", "")
+        if gw and gw != self.real_identity[0]:
+            old = self.real_identity[0]
+            self.real_identity = (gw, self.real_identity[1],
+                                  self.real_identity[2])
+            self.model.set_identity(gateway_ip=gw)
+            self.model.push_timeline("interface", "WARNING" if old else
+                                     "INFO",
+                                     f"Your router address changed "
+                                     f"{old or '?'} → {gw} (new network or "
+                                     f"router?)")
+        if my_ip and my_ip not in self.real_identity[1]:
+            ips = set(self.real_identity[1]) | {my_ip}
+            self.real_identity = (self.real_identity[0], ips,
+                                  self.real_identity[2])
+            self.model.set_identity(my_ips=ips, local_nets=self._local_nets())
+            self.model.push_timeline("interface", "INFO",
+                                     f"This computer's address is now "
+                                     f"{my_ip}")
+        cur = iface_name(self.iface_map.get(self.current_iface_label))
+        names = snap.get("ifaces")
+        if self.sniffer is not None and names and cur and cur not in names:
+            self.model.push_timeline("interface", "WARNING",
+                                     f"The network card “{cur}” "
+                                     f"disappeared")
+            self._handle_sniffer_died(RuntimeError("adapter disappeared"))
+
+    # ======================================================================
+    #  Main loops (all on the Tk thread, all time-boxed)
+    # ======================================================================
+    def _ms(self, base):
+        mode = self.config.get("performance.mode", "Automatic")
+        if mode == "Low CPU" or self.config.get(
+                "performance.cpu_friendly_mode", False) and mode != "Normal":
+            mult = 2.5
+        elif mode == "Normal":
+            mult = 1.0
+        else:
+            mult = {0: 1.0, 1: 1.6, 2: 2.5}.get(self.perf_level, 1.0)
+        return int(base * mult)
+
+    def _drain_decoded(self):
+        t0 = time.perf_counter()
+        budget = 0.030 if self.perf_level < 2 else 0.040
+        batch = []
+        rdns_ok = self.rdns is not None and self.data_mode == "live"
+        while time.perf_counter() - t0 < budget:
+            try:
+                d = self.row_q.get_nowait()
+            except queue.Empty:
+                break
+            self.count += 1
+            d["no"] = self.count
+            try:
+                self.model.ingest(d)
+            except Exception:                        # noqa: BLE001
+                self._analysis_errors += 1
+                if self._analysis_errors <= 5:
+                    LOG.exception("analysis error")
+            self.all_rows.append(d)
+            batch.append(d)
+            if rdns_ok:
+                for ip in (d["src_ip"], d["dst_ip"]):
+                    if ip and not self.model.cache.get(ip) and \
+                            is_private_ip(ip):
+                        self.rdns.lookup(ip)
+        if batch:
+            self._last_packet_wall = time.time()
+            self.tabs["packets"].add_rows(batch)
+        more = not self.row_q.empty()
+        self.root.after(1 if more else self._ms(50), self._drain_decoded)
+
+    def _flush_ui(self):
+        m = self.model
+        try:
+            if m.ev_feed:
+                ev, m.ev_feed = m.ev_feed, []
+                self.tabs["feed"].push(ev)
+            if m.ev_timeline:
+                ev, m.ev_timeline = m.ev_timeline, []
+                self.tabs["timeline"].add(ev)
+            if m.ev_alerts:
+                ev, m.ev_alerts = m.ev_alerts, []
+                self._show_alerts(ev)
+            if m.ev_banner:
+                ev, m.ev_banner = m.ev_banner, []
+                self._set_banner(*ev[-1])
+            reg = m.registry
+            if reg.rekeyed or reg.removed:
+                for old, new in reg.rekeyed:
+                    self.tabs["devices"].rekey(old, new)
+                for key in reg.removed:
+                    tree_remove(self.tabs["devices"].tree,
+                                self.tabs["devices"].iids, key)
+                reg.rekeyed, reg.removed = [], []
+            if m.dirty_devices:
+                keys, m.dirty_devices = m.dirty_devices, set()
+                self.tabs["devices"].update_keys(keys)
+            if m.dirty_websites:
+                keys, m.dirty_websites = m.dirty_websites, set()
+                self.tabs["websites"].update_keys(keys)
+            if m.dirty_remotes:
+                keys, m.dirty_remotes = m.dirty_remotes, set()
+                self.tabs["remote"].update_keys(keys)
+            if m.flows.dirty:
+                ids, m.flows.dirty = m.flows.dirty, set()
+                m.flows.closed_now = []
+                self.tabs["connections"].update_ids(ids)
+            if m.ev_geo:
+                ips, m.ev_geo = m.ev_geo, set()
+                if self.data_mode == "live":
+                    for ip in ips:
+                        self.geoip.request(ip)
+        except Exception:                            # noqa: BLE001
+            LOG.exception("UI flush")
+        self.root.after(self._ms(700), self._flush_ui)
+
+    def _show_alerts(self, alerts):
+        tab = self.tabs["alerts"]
+        for a in alerts:
+            tab.upsert(a)
+            if a.updated:
+                a.updated = False
+                continue
+            if a.severity in ("WARNING", "DANGER") and \
+                    self.config.get("notifications.feed_alerts", True) and \
+                    (a.severity == "DANGER" or not self.config.get(
+                        "notifications.danger_only", False)):
+                dev = self.model.registry.by_key.get(a.device_key)
+                who = dev.display_name() if dev else (a.device_key or "Network")
+                self.tabs["feed"].push([{
+                    "tag": "alert" if a.severity == "DANGER" else "other",
+                    "who": who, "did": f"{self.SEVERITY_ICON[a.severity]} "
+                                       f"{a.reason}",
+                    "when": fmt_clock(a.when)}])
+
+    def _flush_feed(self):
+        delay = 300
+        with contextlib.suppress(tk.TclError):
+            delay = self.tabs["feed"].flush()
+        self.root.after(self._ms(delay), self._flush_feed)
+
+    def _tick_model(self):
+        try:
+            self.model.tick()
+            if self.data_mode == "offline":
+                gw = self.model.infer_gateway()
+                if gw and gw != self.model.gateway_ip:
+                    self.model.set_identity(gateway_ip=gw)
+            self._update_perf()
+            cv = self.model.cache.version
+            if cv != getattr(self, "_names_version", -1):
+                self._names_version = cv
+                self.tabs["packets"].refresh_names()
+        except Exception:                            # noqa: BLE001
+            LOG.exception("model tick")
+        self.root.after(self._ms(5000), self._tick_model)
+
+    def _update_perf(self):
+        now = time.time()
+        self._rate_window.append((now, self.count))
+        rate = 0.0
+        if len(self._rate_window) >= 2:
+            (t0, c0), (t1, c1) = self._rate_window[0], self._rate_window[-1]
+            rate = (c1 - c0) / max(0.5, t1 - t0)
+        q = self.row_q.qsize()
+        level = 0
+        if rate > 800 or self._gui_lag > 0.3 or q > 2000:
+            level = 1
+        if rate > 3000 or self._gui_lag > 0.8 or q > 8000:
+            level = 2
+        self.perf_level = level
+        self.perf_rate = rate
+        if self.rdns is not None:
+            self.rdns.delay = 0.5 if level >= 2 else 0.0
+
+    def _refresh_insights(self):
+        for tab in self.tabs.values():
+            if tab.is_visible() and not isinstance(tab, (DevicesTab,
+                                                         TimelineTab)):
+                try:
+                    tab.refresh()
+                except tk.TclError:
+                    pass
+                except Exception:                    # noqa: BLE001
+                    LOG.exception("refresh %s", tab.name)
+        self.root.after(self._ms(2000), self._refresh_insights)
+
+    def _tick_status(self):
+        now = time.monotonic()
+        self._gui_lag = max(0.0, now - self._last_tick_wall - 1.0)
+        self._last_tick_wall = now
+        if self.sniffer is not None:
+            if not getattr(self.sniffer, "running", True) or \
+                    getattr(self.sniffer, "exception", None) is not None:
+                self._handle_sniffer_died(getattr(self.sniffer, "exception",
+                                                  None))
+            else:
+                self.status_var.set(self.status_text())
+        elif self.data_mode == "offline" and self.importer is not None:
+            self.status_var.set(f"\U0001F4C2 Reading {self.data_label}: "
+                                f"{self.importer.count} packets so far "
+                                f"({self.count} analysed)…")
+        self.root.after(1000, self._tick_status)
+
+    def status_text(self):
+        m = self.model
+        drops = []
+        if self.dropped_capture:
+            drops.append(f"capture overflow {self.dropped_capture}")
+        if self.worker is not None and self.worker.dropped:
+            drops.append(f"analysis skipped {self.worker.dropped}")
+        d = ("  ⚠ " + ", ".join(drops) +
+             " (busy network: capture kept going; some packets weren't "
+             "analysed)") if drops else ""
+        perf = ""
+        if self.perf_level and self.config.get("performance.mode",
+                                               "Automatic") == "Automatic":
+            perf = "  · ⚡ busy: slower screen refresh"
+        return (f"👀 Watching “{self.current_iface_label}”.  "
+                f"{self.count} packets, {len(m.registry.by_key)} devices, "
+                f"{len(m.websites)} websites, "
+                f"{len(m.flows.active)} open connections{d}{perf}")
+
+    def _drain_async_results(self):
+        """The only hand-off point from background threads back to Tk."""
+        try:
+            while True:
+                fn = self._async_results.get_nowait()
+                try:
+                    fn()
+                except Exception:                    # noqa: BLE001
+                    LOG.exception("async callback")
+        except queue.Empty:
+            pass
+        self.root.after(200, self._drain_async_results)
+
+    def _on_data_changed(self):
+        if self.model is not None:
+            for w in self.model.websites.values():
+                if not w.category and self.config.get(
+                        "websites.tracker_classification", False):
+                    w.category, w.category_source = domain_category(w.domain)
+        sw = self._settings_win
+        if sw is not None and sw.alive() and sw.page_id == "privacy" and \
+                not sw.dirty():
+            with contextlib.suppress(tk.TclError):
+                sw.show_page("privacy")
+
+    def _discover_dns(self):
+        servers = system_dns_servers()
+        self._async_results.put(lambda: setattr(self, "system_dns", servers))
+
+    # ======================================================================
+    #  Health
+    # ======================================================================
+    def health_checks_allowed(self):
+        return (self.data_mode == "live" and
+                self.config.get("mode.active_scanning", True) and
+                self.config.get("health.active_checks", True))
+
+    def _dns_target(self):
+        for s in self.system_dns + sorted(self.model.dhcp_dns):
+            if s and not s.startswith("127.") and s != "::1":
+                return s
+        return self.model.gateway_ip
+
+    def _health_params(self):
+        """Called from the prober thread."""
+        if not self.health_checks_allowed():
+            return None
+        gw = self.model.gateway_ip
+        target = self.config.get("health.internet_target", "1.1.1.1:443")
+        dns = self._dns_target()
+        host, _, port = target.rpartition(":")
+        probes = [(gw, 53), (gw, 80), (gw, 443), (dns, 53)]
+        with contextlib.suppress(ValueError):
+            probes.append((host, int(port)))
+        self.model.note_probes(probes, time.time() + 20)
+        return {"gateway": gw, "internet_target": target, "dns_server": dns,
+                "interval": int(self.config.get("health.interval_seconds",
+                                                30))}
+
+    def _on_health_result(self, res):
+        m = self.model
+        prev = m.health.get("internet_ok")
+        m.health = res
+        m.health_history.append(res)
+        if prev is not None and prev != res.get("internet_ok"):
+            m.push_timeline("internet", "INFO" if res.get("internet_ok")
+                            else "WARNING",
+                            "Internet connection restored" if
+                            res.get("internet_ok") else
+                            "Internet connection test failed")
+
+    def run_health_checks(self):
+        if not self.health_checks_allowed():
+            self._set_banner("Health checks send a few tiny test connections, "
+                             "so they only run while watching live with "
+                             "Active Scanning on (not in Quiet Mode).",
+                             kind="warn")
+            return
+        self.prober.run_now.set()
+        self._set_banner("\U0001FA7A  Running health checks…")
+
+    def health_note(self):
+        if self.data_mode in ("offline", "session", "demo"):
+            return ("Showing what can be worked out from the "
+                    f"{'demo data' if self.data_mode == 'demo' else 'saved data'}"
+                    " — active checks don't run on data that isn't "
+                    "live.")
+        if not self.config.get("mode.active_scanning", True):
+            return ("Quiet Mode: no test traffic is sent, so router/Internet "
+                    "checks show what passive listening can tell. Switch to "
+                    "Active Scanning (banner above) to run them.")
+        if not self.config.get("health.active_checks", True):
+            return "Active checks are switched off in Settings → Network "\
+                   "Health; passive indicators only."
+        return ("Every ~{}s I make one connection attempt to your router, one "
+                "to {} and one DNS lookup — a few hundred bytes. "
+                "They're labelled “MiniWireshark health check” in "
+                "Connections.").format(
+            self.config.get("health.interval_seconds", 30),
+            self.config.get("health.internet_target", "1.1.1.1:443"))
+
+    def health_summary(self):
+        m = self.model
+        h = m.health
+        hist = list(m.health_history)[-20:]
+        now = m.now()
+        out = {}
+        live = self.data_mode == "live"
+        if "gateway_ok" in h:
+            ok, ms = h["gateway_ok"], h.get("gateway_ms")
+            out["gateway"] = ("Healthy" if ok and ms is not None and ms < 50
+                              else "Degraded" if ok else "Needs attention",
+                              f"Answered in {ms:.0f} ms." if ok and ms
+                              is not None else
+                              "Your router didn't answer the last check.")
+        elif m.gateway_ip and m.registry.gw_macs:
+            out["gateway"] = ("Info", f"Your router ({m.gateway_ip}) is "
+                                      f"visible on the network (passive).")
+        else:
+            out["gateway"] = ("Unknown", "No router check has run yet.")
+        down = m.metrics.totals["bytes_down"]
+        if "internet_ok" in h:
+            ok, ms = h["internet_ok"], h.get("internet_ms")
+            out["internet"] = ("Healthy" if ok and (ms or 0) < 150 else
+                               "Degraded" if ok else "Needs attention",
+                               f"Reached the Internet in {ms:.0f} ms." if ok
+                               and ms else "The Internet test address "
+                                           "didn't answer.")
+        elif down:
+            out["internet"] = ("Info", f"Data is arriving from the Internet "
+                                       f"({_human_bytes(down)} so far), so "
+                                       f"it's reachable.")
+        else:
+            out["internet"] = ("Unknown", "No Internet traffic or checks "
+                                          "yet.")
+        med, n = m.dns.median_latency(now)
+        rate, nq = m.dns.failure_rate(now)
+        slow = float(self.config.get("dns.slow_ms", 800))
+        if "dns_ok" in h and not h["dns_ok"]:
+            out["dns"] = ("Needs attention", f"The DNS server "
+                                             f"{h.get('dns_server')} didn't "
+                                             f"answer the test lookup.")
+        elif nq >= 10 and rate >= 0.3:
+            out["dns"] = ("Needs attention", f"{rate:.0%} of recent lookups "
+                                             f"failed.")
+        elif med is not None and med >= slow:
+            out["dns"] = ("Degraded", f"Lookups are slow (typically "
+                                      f"{med:.0f} ms).")
+        elif med is not None:
+            out["dns"] = ("Healthy", f"Typical lookup {med:.0f} ms over "
+                                     f"{n} recent lookups; "
+                                     f"{rate:.0%} failed.")
+        elif "dns_ms" in h and h.get("dns_ms"):
+            out["dns"] = ("Healthy", f"Test lookup answered in "
+                                     f"{h['dns_ms']:.0f} ms.")
+        elif m.dns.encrypted_seen:
+            out["dns"] = ("Info", "Lookups seem to be encrypted (DoH/DoT), "
+                                  "so I can't time them.")
+        else:
+            out["dns"] = ("Unknown", "No DNS lookups seen yet.")
+        probes = [r for r in hist if "gateway_ok" in r]
+        if len(probes) >= 3:
+            lost = sum(1 for r in probes if not r.get("gateway_ok"))
+            pct = lost / len(probes)
+            out["loss"] = ("Healthy" if pct == 0 else "Degraded" if pct < 0.2
+                           else "Needs attention",
+                           f"{lost} of the last {len(probes)} router checks "
+                           f"failed ({pct:.0%}). Estimated from occasional "
+                           f"checks, so treat it as rough.")
+        else:
+            out["loss"] = ("Unknown", "Needs a few active checks first.")
+        flows = m.flows.all_flows()
+        tcp = [f for f in flows if f.transport == "TCP"]
+        rst = sum(1 for f in tcp if f.rst)
+        if len(tcp) >= 20:
+            pct = rst / len(tcp)
+            out["resets"] = ("Healthy" if pct < 0.1 else "Degraded" if
+                             pct < 0.3 else "Needs attention",
+                             f"{rst} of {len(tcp)} connections were reset "
+                             f"({pct:.0%}). Some resets are normal.")
+        else:
+            out["resets"] = ("Unknown", "Not enough connections yet.")
+        retx = sum(f.retrans for f in tcp)
+        pk = sum(f.packets for f in tcp) or 1
+        if pk > 500:
+            pct = retx / pk
+            out["retrans"] = ("Healthy" if pct < 0.02 else "Degraded" if
+                              pct < 0.06 else "Needs attention",
+                              f"About {pct:.1%} of TCP data packets looked "
+                              f"re-sent (possible congestion or weak Wi-Fi). "
+                              f"Detected approximately.")
+        else:
+            out["retrans"] = ("Unknown", "Not enough traffic yet.")
+        if len(m.dhcp_servers) > 1:
+            out["dhcp"] = ("Needs attention", f"{len(m.dhcp_servers)} DHCP "
+                                              f"servers answered: "
+                                              f"{', '.join(m.dhcp_servers)}.")
+        elif m.dhcp_servers:
+            out["dhcp"] = ("Healthy", f"One DHCP server "
+                                      f"({next(iter(m.dhcp_servers))}).")
+        else:
+            out["dhcp"] = ("Unknown", "No address assignments seen yet "
+                                      "(they happen when devices join).")
+        dups = [ip for ip, macs in m.registry.ip_macs.items()
+                if len(macs) > 1]
+        out["dupip"] = (("Degraded", f"{len(dups)} address(es) claimed by "
+                                     f"more than one device: "
+                                     f"{', '.join(dups[:4])}.")
+                        if dups else ("Healthy", "No conflicts seen."))
+        cyc = [d for d in m.registry.by_key.values()
+               if len([t for t in d.reactivations if now - t < 1800]) >= 3]
+        out["reconnects"] = (("Degraded", f"{len(cyc)} device(s) dropped "
+                                          f"off and returned 3+ times in 30 "
+                                          f"minutes (often weak Wi-Fi).")
+                             if cyc else ("Healthy", "No devices are cycling "
+                                                     "on and off."))
+        rec = self._score_for(self.current_iface_label)
+        if live and rec:
+            up = rec.get("up")
+            out["link"] = ("Healthy" if up is not False else
+                           "Needs attention",
+                           f"{self.current_iface_label} — "
+                           f"{'connected' if up else 'status unknown' if up is None else 'disconnected'}"
+                           f", address {rec.get('ip') or '?'}.")
+        else:
+            out["link"] = ("Unknown", "Not capturing live.")
+        if IS_WINDOWS:
+            out["driver"] = (("Healthy", "Npcap capture driver present.")
+                             if _npcap_present() else
+                             ("Needs attention", "Npcap is missing."))
+        else:
+            out["driver"] = ("Healthy" if live else "Info",
+                             "Built-in packet capture"
+                             + (" is working." if live else "."))
+        if m.vpn.get("iface") or m.vpn.get("endpoint"):
+            out["vpn"] = ("Info", "VPN detected" + (
+                f" (adapter {m.vpn['iface']})" if m.vpn.get("iface") else "")
+                + (f", tunnel to {m.vpn['endpoint']}" if
+                   m.vpn.get("endpoint") else "") +
+                ". Traffic may be encrypted inside the tunnel, so I can see "
+                "less about individual Internet destinations.")
+        else:
+            out["vpn"] = ("Info", "No VPN detected.")
+        worst = "Healthy"
+        order = {"Healthy": 0, "Info": 0, "Unknown": 0, "Degraded": 1,
+                 "Needs attention": 2}
+        bad = [k for k, (s, _t) in out.items() if order.get(s, 0) >= 1]
+        for k, (s, _t) in out.items():
+            if order.get(s, 0) > order.get(worst, 0):
+                worst = s
+        known = sum(1 for s, _t in out.values() if s not in ("Unknown",
+                                                              "Info"))
+        if known == 0:
+            worst = "Unknown"
+        names = {k: t for k, t in HealthTab.CHECKS}
+        out["overall"] = (worst, "Everything checked looks fine." if
+                          worst == "Healthy" else
+                          "Not enough information yet." if worst == "Unknown"
+                          else "Look at: " + ", ".join(names[k] for k in bad))
+        return out
+
+    def connection_info_text(self):
+        m = self.model
+        rec = self._score_for(self.current_iface_label)
+        lines = ["Network card : " + (self.current_iface_label or "—"),
+                 "This computer: " + (", ".join(sorted(m.my_ips)) or "—"),
+                 "Subnet(s)    : " + (", ".join(str(n) for n in
+                                                m.local_nets[:3]) or "—"),
+                 "Router       : " + (m.gateway_ip or "—"),
+                 "DNS servers  : " + (", ".join(
+                     (self.system_dns[:3] if self.data_mode == "live"
+                      else []) or sorted(m.dhcp_dns)[:3]) or "—"),
+                 "IPv6 prefix  : " + (", ".join(str(p) for p in
+                                               m.v6_prefixes[:2]) or "—"),
+                 "Why this card: " + (explain_choice(rec)[15:] if rec
+                                      else "—")]
+        return "\n".join(lines)
+
+    # ---- one-line summaries for the dashboard ---------------------------------
+    def capture_status_short(self):
+        return {"live": "\U0001F7E2 Watching", "idle": "⏸ Stopped",
+                "offline": "\U0001F4C2 File (not live)",
+                "session": "\U0001F4C2 Saved (not live)",
+                "demo": "\U0001F3AE Demo (not live)"}.get(self.data_mode,
+                                                         self.data_mode)
+
+    def internet_status_short(self):
+        h = self.model.health
+        if "internet_ok" in h:
+            return ("✔ Reachable" if h["internet_ok"] else
+                    "✖ Not reachable")
+        if self.model.metrics.totals["bytes_down"]:
+            return "✔ Traffic flowing"
+        return "? Unknown"
+
+    def dns_status_short(self):
+        s = self.health_summary().get("dns", ("Unknown", ""))[0]
+        return HealthTab.STATUS_STYLE.get(s, ("? Unknown", ""))[0]
+
+    def network_state_text(self):
+        t = self.theme
+        c = self.model.alerts.counts()
+        if c["DANGER"]:
+            state, bg, fg = ("‼ Investigate — one or more DANGER alerts "
+                             "need a look.", t["danger_bg"], t["danger_fg"])
+        elif c["WARNING"]:
+            state, bg, fg = ("⚠ Attention — a few unusual things are "
+                             "worth a glance; nothing is necessarily wrong.",
+                             t["warn_bg"], t["warn_fg"])
+        elif self.data_mode == "idle":
+            state, bg, fg = ("⏸ Not watching right now.", t["tab_bg"],
+                             t["muted_fg"])
+        else:
+            state, bg, fg = ("✔ Healthy — nothing unusual noticed so "
+                             "far.", t["mode_active_bg"], t["good_fg"])
+        if self.data_mode == "live" and self.model.in_discovery():
+            state = "Discovering your network … " + state
+        if self.data_mode in DATA_MODE_TEXT:
+            state = "(Not live) " + state
+        return state, bg, fg
+
+    # ======================================================================
+    #  Names and labels
+    # ======================================================================
+    def device_label(self, dev):
+        if dev.alias:
+            return dev.alias
+        if dev.device_class == "This computer" or (dev.ip and dev.ip in
+                                                   self.model.my_ips):
+            return "This computer"
+        if dev.ip and dev.ip == self.model.gateway_ip:
+            return "Your router / gateway"
+        n = dev.best_name()
+        if n:
+            return n
+        if dev.vendor:
+            kind = dev.device_class if dev.device_class != "Unknown" \
+                else "Device"
+            return f"{kind} ({dev.vendor})"
+        if dev.confidence == CONFIDENCE_UNCONFIRMED:
+            return "Unconfirmed device"
+        return dev.device_class if dev.device_class != "Unknown" else \
+            (dev.ip or dev.mac)
+
+    def short_device_name(self, key):
+        dev = self.model.registry.by_key.get(key)
+        if not dev:
+            return str(key).replace("ip:", "")
+        return self.device_label(dev)
+
+    def short_device_name_ip(self, ip):
+        if ip in self.model.my_ips:
+            return "This computer"
+        if ip == self.model.gateway_ip:
+            return "Router"
+        dev = self.model.device_for(ip)
+        if dev:
+            return self.device_label(dev)
+        return self.model.cache.get(ip) or ip
+
+    def disp_addr(self, ip, mac):
+        if ip:
+            n = self.model.cache.get(ip)
+            return n if n else ip
+        return mac or ""
+
+    # ======================================================================
+    #  Navigation
+    # ======================================================================
+    def _select_tab(self, name):
+        tab = self.tabs[name]
+        if tab.advanced and self.beginner_mode:
+            self.mode_ui_var.set("Advanced")
+            self._on_ui_mode_change()
+            self._set_banner("Switched to Advanced view to show that.")
+        with contextlib.suppress(tk.TclError):
+            self.nb.select(tab.frame)
+        return tab
+
+    def goto(self, target, arg=None):
+        if target in ("devices", "devices_all"):
+            tab = self._select_tab("devices")
+            if target == "devices_all":
+                tab.show_inactive_var.set(True)
+                tab._vis_changed()
+        elif target == "device":
+            self._select_tab("devices").select(arg)
+        elif target == "topdev":
+            devs = sorted(self.model.registry.by_key.values(),
+                          key=lambda d: -(d.bytes_up + d.bytes_down))
+            if devs:
+                self._select_tab("devices").select(devs[0].key)
+                self.show_device(devs[0].key)
+        elif target in ("websites", "topsite"):
+            tab = self._select_tab("websites")
+            if target == "topsite":
+                groups = Counter()
+                for w in self.model.websites.values():
+                    groups[w.registrable] += w.requests
+                if groups:
+                    tab.select(groups.most_common(1)[0][0])
+            elif arg:
+                tab.select(arg)
+        elif target == "connections":
+            tab = self._select_tab("connections")
+            tab.set_filter(text=arg or "")
+        elif target == "connection":
+            if arg:
+                self._select_tab("connections").select(arg)
+        elif target == "remote":
+            tab = self._select_tab("remote")
+            if arg:
+                tab.select(arg) if arg in self.model.remote_hosts else \
+                    tab.set_filter(arg)
+        elif target == "packets":
+            tab = self._select_tab("packets")
+            if arg:
+                tab.set_expression(arg)
+        elif target in self.tabs:
+            self._select_tab(target)
+
+    def open_ref(self, ref):
+        if not ref:
+            return
+        kind, key = ref[0], ref[1]
+        if kind == "device":
+            if key in self.model.registry.by_key:
+                self.goto("device", key)
+                self.show_device(key)
+        elif kind == "alert":
+            self._select_tab("alerts").select(key)
+            self.show_alert(key)
+        elif kind == "website":
+            self.goto("websites", key)
+        elif kind == "remote":
+            self.goto("remote", key)
+        elif kind == "flow":
+            self.goto("connection", key)
+
+    # ======================================================================
+    #  Device actions and report
+    # ======================================================================
+    def device_menu_items(self, dev):
+        k = dev.key
+        return [
+            ("Details", lambda: self.show_device(k)),
+            ("Rename…", lambda: self.rename_device(k)),
+            ("Unmark as mine" if dev.mine else "Mark as mine",
+             lambda: self.toggle_flag(k, "mine")),
+            ("Unmark expected" if dev.expected else "Mark as expected",
+             lambda: self.toggle_flag(k, "expected")),
+            ("Add / edit note…", lambda: self.edit_note(k)),
+            None,
+            ("Copy IP", lambda: copy_to_clipboard(self, dev.ip), bool(dev.ip)),
+            ("Copy MAC", lambda: copy_to_clipboard(self, dev.mac),
+             bool(dev.mac)),
+            ("Filter packets to this device",
+             lambda: self.goto("packets", f'device:"{dev.ip or dev.mac}"')),
+            ("Show connections", lambda: self.goto_connections_for(k)),
+            ("Merge with…", lambda: self.merge_with_ui(k)),
+            ("Allow merging" if dev.pinned_no_merge else "Never merge this "
+             "device", lambda: self.toggle_flag(k, "pinned_no_merge")),
+            ("Export device report…", lambda: self.export_report(
+                "device", k)),
+        ]
+
+    def goto_connections_for(self, key):
+        tab = self._select_tab("connections")
+        tab.set_filter(text="", device_key=key)
+
+    def _labels_changed(self, dev):
+        self.known.update_from(dev)
+        self.model.dirty_devices.add(dev.key)
+        self.model._classify_dirty.add(dev.key)
+
+    def rename_device(self, key, parent=None):
+        dev = self.model.registry.by_key.get(key)
+        if not dev:
+            return
+        name = ask_text(self, "Rename device",
+                        f"A name for {dev.ip or dev.mac} (leave empty to use "
+                        f"the detected name):", dev.alias, parent=parent)
+        if name is None:
+            return
+        dev.alias = name.strip()[:60]
+        if dev.alias:
+            _push_bounded(dev.hostname_history,
+                          [dev.alias, "user", time.time()], 20)
+        self._labels_changed(dev)
+
+    def edit_note(self, key, parent=None):
+        dev = self.model.registry.by_key.get(key)
+        if not dev:
+            return
+        note = ask_text(self, "Device note", "Notes (only stored on this "
+                        "computer):", dev.notes, multiline=True,
+                        parent=parent)
+        if note is not None:
+            dev.notes = note[:2000]
+            self._labels_changed(dev)
+
+    def toggle_flag(self, key, flag):
+        dev = self.model.registry.by_key.get(key)
+        if not dev:
+            return
+        setattr(dev, flag, not getattr(dev, flag))
+        self._labels_changed(dev)
+
+    def merge_with_ui(self, key, parent=None):
+        dev = self.model.registry.by_key.get(key)
+        if not dev:
+            return
+        cands = self.model.registry.merge_candidates(dev)
+        opts = [(f"★ {self.device_label(o)} [{o.ip or o.mac}] — "
+                 f"possibly the same ({c})", o.key) for o, c, _r in cands]
+        seen = {o.key for o, _c, _r in cands}
+        for o in sorted(self.model.registry.by_key.values(),
+                        key=lambda d: self.device_label(d).lower()):
+            if o.key != key and o.key not in seen and \
+                    self.model.registry.can_pair(dev, o):
+                opts.append((f"{self.device_label(o)} [{o.ip or o.mac}]",
+                             o.key))
+        if not opts:
+            messagebox.showinfo("Merge devices", "There is no other device "
+                                "this one can be merged with.",
+                                parent=parent or self.root)
+            return
+        other = choose_from_list(
+            self, "Merge devices",
+            f"Which device is the same physical device as "
+            f"“{self.device_label(dev)}”? Suggestions are marked "
+            f"★. You can split them again later.", opts, parent=parent)
+        if other:
+            self.merge_devices_ui(key, other, parent=parent)
+
+    def merge_devices_ui(self, a, b, parent=None):
+        reg = self.model.registry
+        da, db = reg.by_key.get(a), reg.by_key.get(b)
+        if not da or not db:
+            return
+        if not reg.can_pair(da, db):
+            messagebox.showinfo("Merge devices", "These two can't be merged "
+                                "(one is marked “never merge”, or one "
+                                "is from a saved session).",
+                                parent=parent or self.root)
+            return
+        warn = ""
+        if reg.overlapped(da, db):
+            warn = ("\n\n⚠ They were online at the same time, which "
+                    "usually means they are different devices.")
+        if not messagebox.askyesno(
+                "Merge devices",
+                f"Treat “{self.device_label(da)}” and "
+                f"“{self.device_label(db)}” as one device?{warn}",
+                parent=parent or self.root):
+            return
+        keep, other = (a, b) if da.last_seen >= db.last_seen else (b, a)
+        reg.merge(keep, other, auto=False, reason="you merged them")
+        self.model.dirty_devices.add(keep)
+        self.model.push_timeline("identity merged", "INFO",
+                                 f"{self.short_device_name(keep)}: two "
+                                 f"identities combined (by you)",
+                                 ("device", keep), keep)
+        self._labels_changed(reg.by_key[keep])
+        self._set_banner(f"\U0001F517  Merged into "
+                         f"{self.short_device_name(keep)}.")
+
+    def split_device(self, key, index, win=None):
+        restored = self.model.registry.split(key, index)
+        if restored:
+            self.model.dirty_devices |= {key, restored.key}
+            self.model.push_timeline("identity", "INFO",
+                                     f"Split {restored.display_name()} back "
+                                     f"out of {self.short_device_name(key)}",
+                                     ("device", key), key)
+            self._labels_changed(self.model.registry.by_key[key])
+            if win is not None:
+                with contextlib.suppress(tk.TclError):
+                    win.destroy()
+            self.show_device(key)
+
+    def device_report(self, dev):
+        """Sections for the device card, shaped by the explanation
+        settings (Short / Normal / Detailed, guidance on/off)."""
+        verbosity = self.config.get("general.explanation_verbosity", "Normal")
+        guidance = self.config.get("general.beginner_explanations", True)
+        m = self.model
+        now = m.now()
+        cls = (f"{dev.class_confidence} {dev.device_class}".strip()
+               if dev.device_class != "Unknown" else
+               "I cannot determine this from passive traffic alone yet")
+        sections = [("What is it?",
+                     f"{self.device_label(dev)} — {cls}.\n" +
+                     ("\n".join(f"• Based on: {r}" for r in
+                                dev.class_reasons[:5])))]
+        conf = f"{dev.confidence} (score {dev.score}/100)."
+        if guidance:
+            conf += " " + (
+                "Strongly supported by several independent local signals."
+                if dev.confidence == "High" else
+                "Take the identity with a grain of salt until more evidence "
+                "arrives." if dev.confidence in ("Low", "Unconfirmed") else
+                "Reasonably supported; it could still firm up further.")
+        sections.append(("How confident is MiniWireshark?", conf))
+        if not dev.live:
+            sections.insert(0, ("Saved data", "This device comes from a "
+                                              "saved session or file — "
+                                              "it is not live."))
+        if verbosity == "Short":
+            return sections
+        sections.insert(2, ("What did MiniWireshark see?",
+            "IP: " + (dev.ip or "—") +
+            ("   IPv6: " + ", ".join(sorted(dev.ipv6)[:3]) if dev.ipv6
+             else "") +
+            "\nMAC: " + (dev.mac or "—") +
+            ("  (private / randomized address)" if dev.randomized_mac
+             else "") +
+            "\nVendor: " + (dev.vendor or "Unknown") +
+            "\nFirst seen: " + fmt_clock(dev.first_seen, True) +
+            "    Last seen: " + fmt_clock(dev.last_seen, True) +
+            f"\nStatus: {STATE_LABEL.get(dev.state, dev.state)}" +
+            f"\nSent: {_human_bytes(dev.bytes_up)} ({dev.packets_out} "
+            f"packets)    Received: {_human_bytes(dev.bytes_down)}" +
+            f"\nLocal: {_human_bytes(dev.lan_bytes)}    Internet: "
+            f"{_human_bytes(dev.internet_bytes)}"))
+        sections.append(("Presence (online / offline)",
+                         "\n".join(dev.presence_lines(now)) or "—"))
+        if dev.identity_conflict:
+            sections.append(("Identity conflict", dev.identity_conflict))
+        if dev.merge_note:
+            sections.append(("Identity correlation", dev.merge_note))
+        descs = {service_description(s) for s in dev.services} - {""}
+        if descs:
+            sections.append(("What can this device do?",
+                             "\n".join(f"• {d}" for d in sorted(descs))))
+        if dev.notes:
+            sections.append(("Your notes", dev.notes))
+        b = m.baselines.devices.get(dev.key)
+        if b is not None and b.n:
+            sections.append(("Normal behaviour (learned)",
+                f"Learned from {b.n} active minute(s). Typically sends "
+                f"{_human_bytes(b.mean['bytes_up'])}/min and receives "
+                f"{_human_bytes(b.mean['bytes_down'])}/min, talking to about "
+                f"{b.mean['destinations']:.0f} Internet hosts per minute. "
+                f"Usual hours: {b.usual_hours_text()}."))
+        if guidance:
+            sections.append(("What should I check?", (
+                "If you don't recognize this device, check your router's "
+                "connected-devices list and, if needed, change your Wi-Fi "
+                "password." if dev.confidence in ("Medium", "High") else
+                "Confidence is still low — keep watching; it improves "
+                "as more evidence arrives, or fades if the signal doesn't "
+                "repeat.")))
+        if verbosity == "Detailed":
+            sections.append(("How the score was calculated",
+                             "\n".join(dev.confidence_reasons()) +
+                             f"\n= {dev.score}/100 (each kind of evidence "
+                             f"counts once)"))
+            hist = []
+            for ip, a, b2 in dev.ip_history[-6:]:
+                hist.append(f"IP {ip}: {fmt_clock(a)}–{fmt_clock(b2)}")
+            for n, src, w in dev.hostname_history[-6:]:
+                hist.append(f"Name “{n}” via {src} at {fmt_clock(w)}")
+            for ip, w, secs, h in dev.dhcp_history[-4:]:
+                hist.append(f"DHCP lease {ip} at {fmt_clock(w)}"
+                            f"{' for ' + human_duration(secs) if secs else ''}")
+            if hist:
+                sections.append(("Identity history", "\n".join(hist)))
+            if dev.protocols:
+                sections.append(("Protocols seen", ", ".join(
+                    f"{p} ×{n}" for p, n in
+                    dev.protocols.most_common(8))))
+            sites = sorted(dev.websites)[:12]
+            if sites:
+                sections.append(("Websites contacted", ", ".join(sites)))
+            if dev.services:
+                sections.append(("Advertised services",
+                                 ", ".join(sorted(dev.services)[:12])))
+            if guidance:
+                sections.append(("Could this be normal?",
+                    "Yes, in most cases: new phones, guests, smart-home "
+                    "gadgets and laptops waking from sleep all look like "
+                    "this. It only matters if you don't recognize the "
+                    "device."))
+        return sections
+
+    def show_device(self, key):
+        dev = self.model.registry.by_key.get(key)
+        if not dev:
+            return
+        app = self
+        cands = self.model.registry.merge_candidates(dev)
+
+        def extra(win):
+            t = self.theme
+            box = tk.Frame(win, bg=t["tab_bg"], padx=14)
+            box.pack(fill="x")
+            row = tk.Frame(box, bg=t["tab_bg"])
+            row.pack(fill="x")
+            v1 = tk.BooleanVar(value=dev.mine)
+            v2 = tk.BooleanVar(value=dev.expected)
+            v3 = tk.BooleanVar(value=dev.pinned_no_merge)
+
+            def sync():
+                dev.mine, dev.expected = v1.get(), v2.get()
+                dev.pinned_no_merge = v3.get()
+                app._labels_changed(dev)
+            ttk.Checkbutton(row, text="★ This is mine", variable=v1,
+                            command=sync).pack(side="left")
+            ttk.Checkbutton(row, text="Expected / known", variable=v2,
+                            command=sync).pack(side="left", padx=10)
+            ttk.Checkbutton(row, text="Never merge", variable=v3,
+                            command=sync).pack(side="left")
+            if dev.presence:
+                cv = tk.Canvas(box, height=34, bg=t["tab_bg"],
+                               highlightthickness=0)
+                cv.pack(fill="x", pady=(6, 0))
+                win.after(50, lambda: self._draw_presence(cv, dev))
+            for other, conf, reasons in cands[:3]:
+                f = tk.Frame(box, bg=t["warn_bg"], padx=8, pady=4)
+                f.pack(fill="x", pady=(6, 0))
+                tk.Label(f, text=f"Possibly the same device as "
+                                 f"“{self.device_label(other)}” "
+                                 f"({conf} confidence): "
+                                 f"{'; '.join(reasons)}.",
+                         bg=t["warn_bg"], fg=t["warn_fg"], justify="left",
+                         wraplength=440).pack(side="left", fill="x",
+                                              expand=True)
+                ttk.Button(f, text="Merge…", command=lambda o=other:
+                           self.merge_devices_ui(dev.key, o.key, win)).pack(
+                    side="right")
+            for i, mh in enumerate(dev.merge_history[-3:]):
+                idx = len(dev.merge_history) - min(3, len(
+                    dev.merge_history)) + i
+                f = tk.Frame(box, bg=t["card_bg"], padx=8, pady=4)
+                f.pack(fill="x", pady=(6, 0))
+                tk.Label(f, text=f"Merged with {mh.get('key')} "
+                                 f"({'automatically' if mh.get('auto') else 'by you'}"
+                                 f", {fmt_clock(mh.get('when', 0))})",
+                         bg=t["card_bg"], fg=t["text_fg"]).pack(side="left")
+                ttk.Button(f, text="Split", command=lambda ix=idx:
+                           self.split_device(dev.key, ix, dlg.win)).pack(
+                    side="right")
+
+        dlg = DetailDialog(self, f"Device: {self.device_label(dev)}",
+                           self.device_report(dev),
+                           actions=[("Rename…", lambda: (
+                               self.rename_device(dev.key, dlg.win),
+                               dlg.set_sections(self.device_report(dev)))),
+                                    ("Note…", lambda: (
+                                        self.edit_note(dev.key, dlg.win),
+                                        dlg.set_sections(
+                                            self.device_report(dev)))),
+                                    ("Connections", lambda:
+                                     self.goto_connections_for(dev.key)),
+                                    ("Report…", lambda:
+                                     self.export_report("device", dev.key))],
+                           size="720x740", extra=extra)
+        return dlg
+
+    def _draw_presence(self, cv, dev):
+        t = self.theme
+        try:
+            w = max(200, cv.winfo_width())
+        except tk.TclError:
+            return
+        now = self.model.now()
+        start = min(p[0] for p in dev.presence)
+        span = max(60.0, now - start)
+        cv.create_rectangle(0, 8, w, 22, fill=t["grid"], outline="")
+        for s, e in dev.presence:
+            x0 = (s - start) / span * w
+            x1 = ((e or now) - start) / span * w
+            cv.create_rectangle(x0, 8, max(x0 + 2, x1), 22,
+                                fill=t["conf_high"], outline="")
+        cv.create_text(0, 30, anchor="w", text=fmt_clock(start),
+                       fill=t["muted_fg"], font=("TkDefaultFont", 7))
+        cv.create_text(w, 30, anchor="e", text="now (green = online)",
+                       fill=t["muted_fg"], font=("TkDefaultFont", 7))
+
+    # ======================================================================
+    #  Website / remote / flow / alert reports
+    # ======================================================================
+    def show_website(self, dom):
+        w = self.model.websites.get(dom)
+        if not w:
+            return
+        sources = ", ".join(sorted(w.sources)) or "—"
+        how = []
+        if "TLS SNI" in w.sources:
+            how.append("seen in the secure-connection handshake (the site "
+                       "name only)")
+        if "DNS" in w.sources:
+            how.append("looked up through DNS")
+        if "HTTP Host" in w.sources:
+            how.append("visited over unencrypted http://")
+        devs = "\n".join(f"• {self.short_device_name(k)}"
+                         for k in sorted(w.devices)) or "—"
+        sections = [
+            ("What is it?", f"{w.domain} (part of {w.registrable}). "
+                            f"MiniWireshark {'; '.join(how) or 'saw this name'}"
+                            f". For https sites only the NAME is visible "
+                            f"— not the pages or full address."),
+            ("Activity", f"Lookups/visits: {w.requests}    Connections: "
+                         f"{w.connections}\nTraffic attributed: "
+                         f"{_human_bytes(w.bytes)}\nFirst seen: "
+                         f"{fmt_clock(w.first_seen, True)}    Last seen: "
+                         f"{fmt_clock(w.last_seen, True)}\nSeen via: "
+                         f"{sources}\nSecurity: {w.encryption_text()}"),
+            ("Contacted by", devs),
+            ("Server addresses", ", ".join(sorted(w.resolved_ips)[:12]) or
+             "—"),
+        ]
+        if w.countries or w.asns:
+            sections.append(("Where", ", ".join(
+                f"{c} {COUNTRY_NAMES.get(c, '')}".strip()
+                for c in sorted(w.countries)) or "—"))
+        if w.category:
+            sections.append(("Category (informational)",
+                             f"{w.category} — from the {w.category_source}"
+                             f". Being on such a list doesn't mean a domain "
+                             f"is malicious."))
+        DetailDialog(self, f"Website: {w.domain}", sections, actions=[
+            ("Show packets", lambda: self.goto("packets", f"site:{dom}")),
+            ("Remote hosts", lambda: self.goto("remote", dom))])
+
+    def show_website_devices(self, dom):
+        groups = [w for w in self.model.websites.values()
+                  if w.domain == dom or w.registrable == dom]
+        keys = set()
+        for w in groups:
+            keys |= w.devices
+        lines = "\n".join(f"• {self.short_device_name(k)}"
+                          for k in sorted(keys)) or "No device recorded."
+        DetailDialog(self, f"Devices that contacted {dom}",
+                     [("Devices", lines)], size="440x360")
+
+    def show_remote(self, ip):
+        r = self.model.remote_hosts.get(ip)
+        if not r:
+            return
+        devs = "\n".join(f"• {self.short_device_name(k)}"
+                         for k in sorted(r.devices)) or "—"
+        loc = r.location_text() or ("not looked up (turn on a country lookup "
+                                    "in Settings → Privacy)")
+        sections = [
+            ("What is it?", f"{ip} is an address on the Internet — not a "
+                            f"device on your network." +
+             (f" It looks like a {r.vpn_endpoint} VPN server (most traffic "
+              f"goes through it)." if r.vpn_endpoint else "")),
+            ("Known names", ", ".join(sorted(r.domains)) or
+             "No website name was seen for it (it may have been contacted "
+             "directly, or the lookup was encrypted)."),
+            ("Location & provider", f"{loc}\n{r.provider_text() or ''}"
+                                    f"{(' (via ' + r.geo_source + ')') if r.geo_source else ''}"),
+            ("Activity", f"Sent to it: {_human_bytes(r.bytes_out)}    "
+                         f"Received from it: {_human_bytes(r.bytes_in)}\n"
+                         f"Packets: {r.packets}    Connections: "
+                         f"{r.connections}\nPorts: "
+                         f"{', '.join(str(p) for p in sorted(r.ports)[:12])}"
+                         f"\nProtocols: {', '.join(sorted(r.protocols))}\n"
+                         f"First seen: {fmt_clock(r.first_seen, True)}    "
+                         f"Last seen: {fmt_clock(r.last_seen, True)}"),
+            ("Contacted by", devs)]
+        DetailDialog(self, f"Remote host: {ip}", sections, actions=[
+            ("Connections", lambda: self.goto("connections", ip)),
+            ("Packets", lambda: self.goto("packets", f"ip:{ip}"))])
+
+    def flow_report(self, f):
+        who = self.short_device_name(f.device_key) if f.device_key \
+            else f.local_ip
+        to = f.domain or f.remote_ip
+        conf = {"Observed": "seen directly in this connection",
+                "Likely": "inferred from an earlier DNS lookup by the same "
+                          "network"}.get(f.domain_conf, f.domain_conf or "")
+        story = (f"{who} {'opened' if f.initiator == 'local' else 'accepted'}"
+                 f" a {f.transport} connection to {to}"
+                 f"{(' (port ' + str(f.remote_port) + ')') if f.remote_port else ''}"
+                 f". Purpose: {f.purpose()}.")
+        sections = [
+            ("In plain English", story),
+            ("Traffic", f"Upload (sent by your device): "
+                        f"{_human_bytes(f.bytes_out)} in {f.packets_out} "
+                        f"packets\nDownload (received): "
+                        f"{_human_bytes(f.bytes_in)} in {f.packets_in} "
+                        f"packets\nDuration: {human_duration(f.duration)}  "
+                        f"({fmt_clock(f.first_seen)}–"
+                        f"{fmt_clock(f.last_seen)})"),
+            ("Status", f.status_text() + (
+                f"\nRe-sent data detected {f.retrans} time(s) (approximate)."
+                if f.retrans else "")),
+            ("Security", f.encryption_text() + (
+                f" — {f.tls_version}" if f.tls_version else "") +
+             (f"; application protocol {f.alpn}" if f.alpn else "") +
+             ("\nThe contents can't be read; only the site name was visible."
+              if f.encrypted == "yes" and f.domain_conf == "Observed" else "")
+             + (f"\nThis {f.cleartext or 'protocol'} traffic is NOT encrypted."
+                if f.encrypted == "no" else "")),
+            ("Destination", f"{f.remote_ip}:{f.remote_port or ''}\n"
+                            f"Name: {f.domain or 'unknown'}"
+                            +
+             (f" ({conf})" if conf else "") +
+             (f"\nProvider/country: {('AS' + str(f.asn) + ' ') if f.asn else ''}"
+              f"{f.org} {f.country}".rstrip() if (f.asn or f.country) else "")),
+            ("How sure is this?", "The protocol was " + (
+                "recognised from the traffic itself." if
+                f.interp_conf == "Observed" else
+                "guessed from the port number, so treat it as likely, not "
+                "certain." if f.interp_conf else "not identified."))]
+        if f.note:
+            sections.insert(1, ("Note", f.note + " — this connection "
+                                "was made by MiniWireshark itself."))
+        return sections
+
+    def show_flow(self, fid):
+        f = self.model.flows.get(fid)
+        if not f:
+            return
+        DetailDialog(self, f"Connection #{fid}", self.flow_report(f),
+                     actions=[("Show packets", lambda: self.goto(
+                         "packets", f"stream:{fid}"))])
+
+    def alert_report(self, a):
+        verbosity = self.config.get("general.explanation_verbosity", "Normal")
+        guidance = self.config.get("general.beginner_explanations", True)
+        dev = self.model.registry.by_key.get(a.device_key)
+        who = (f"{self.device_label(dev)} ({dev.ip or dev.mac})" if dev else
+               a.device_key.replace("ip:", "") or "Your network")
+        sections = [("OBSERVED", a.observed),
+                    ("WHY IT WAS FLAGGED", a.why or "—"),
+                    ("CONFIDENCE", a.confidence)]
+        if verbosity != "Short":
+            sections.append(("INTERPRETATION", a.interpretation))
+            if guidance:
+                sections.append(("POSSIBLE INNOCENT EXPLANATIONS",
+                                 a.possible_explanations))
+            steps = ALERT_CHECKLIST.get(a.kind)
+            if steps and guidance:
+                sections.append(("WHAT TO CHECK", "\n".join(
+                    f"{i}. {s}" for i, s in enumerate(steps, 1))))
+        sections.append(("DETAILS", "\n".join([
+            f"Severity: {a.severity}",
+            f"Type: {ALERT_TYPES.get(a.kind, (a.kind,))[0]}",
+            f"Involves: {who}",
+            f"First: {fmt_clock(a.first_seen or a.when, True)}",
+            f"Last: {fmt_clock(a.last_seen or a.when, True)}",
+            f"Times: {a.count}"])))
+        if a.evidence and verbosity == "Detailed":
+            sections.append(("RELATED EVIDENCE", "\n".join(
+                str(e) for e in a.evidence[-12:])))
+        return sections
+
+    def alert_text(self, a):
+        title = f"[{a.severity}] {a.reason}"
+        return title + "\n" + "=" * len(title) + "\n\n" + "\n\n".join(
+            f"{h}\n{t}" for h, t in self.alert_report(a))
+
+    def show_alert(self, aid):
+        a = self.model.alerts.alerts.get(aid)
+        if not a:
+            return
+
+        def ack():
+            a.acknowledged = True
+            self.tabs["alerts"].upsert(a)
+        DetailDialog(self, f"{self.SEVERITY_ICON.get(a.severity, '')} "
+                           f"{a.reason}", self.alert_report(a), actions=[
+            ("Acknowledge", ack),
+            ("Mark expected", lambda: self.alert_mark_expected(a)),
+            ("Go to related", lambda: self.alert_goto_related(a))],
+            size="560x560")
+
+    def alert_mark_expected(self, a):
+        exp = list(self.config.get("alerts.expected", []) or [])
+        tag = f"{a.kind}|{a.subject or a.device_key}"
+        if tag not in exp:
+            exp.append(tag)
+            self.config.set("alerts.expected", exp[-500:])
+            self.config.save()
+        a.acknowledged = True
+        dev = self.model.registry.by_key.get(a.device_key)
+        if dev and a.kind in ("new_device", "unknown_device"):
+            dev.expected = True
+            self._labels_changed(dev)
+        self.tabs["alerts"].upsert(a)
+        self._set_banner("✔  Marked as expected — I won't alert on "
+                         "this again.")
+
+    def alert_mute_type(self, a):
+        title = ALERT_TYPES.get(a.kind, (a.kind,))[0]
+        if messagebox.askyesno("Mute alert type", f"Stop all "
+                               f"“{title}” alerts? You can turn "
+                               f"them back on in Settings → Alerts.",
+                               parent=self.root):
+            self.config.set(f"alerts.{a.kind}", False)
+            self.config.save()
+            self._set_banner(f"\U0001F515  “{title}” alerts muted.")
+
+    def alert_mute_device(self, a):
+        if not a.device_key:
+            self._set_banner("This alert isn't about one device; use "
+                             "“Mute this type” instead.", kind="warn")
+            return
+        muted = list(self.config.get("alerts.muted_devices", []) or [])
+        tag = f"{a.kind}|{a.device_key}"
+        if tag not in muted:
+            muted.append(tag)
+            self.config.set("alerts.muted_devices", muted[-500:])
+            self.config.save()
+        a.acknowledged = True
+        self._set_banner("\U0001F515  Muted this alert type for that device.")
+
+    def alert_goto_related(self, a):
+        refs = a.refs or {}
+        if refs.get("device") and refs["device"] in \
+                self.model.registry.by_key:
+            self.goto("device", refs["device"])
+            self.show_device(refs["device"])
+        elif refs.get("flow"):
+            self.goto("connection", refs["flow"])
+        elif refs.get("website"):
+            self.goto("websites", refs["website"])
+        elif a.device_key.startswith("ip:"):
+            ip = a.device_key[3:]
+            dev = self.model.device_for(ip)
+            if dev:
+                self.goto("device", dev.key)
+            else:
+                self.goto("packets", f"ip:{ip}")
+        elif a.kind.startswith("dns"):
+            self.goto("health")
+        else:
+            self._set_banner("There's no single related item for this alert.")
+
+    # ======================================================================
+    #  Clearing / sessions / offline data / demo
+    # ======================================================================
+    def clear(self):
+        if self.config.get("general.confirm_before_clear", False):
+            if not messagebox.askyesno(
+                    "Clear everything?",
+                    "This clears all packets, devices, websites, connections, "
+                    "alerts and the timeline from this session. Continue?",
+                    parent=self.root):
+                return
+        live = self.data_mode == "live"
+        if self.data_mode in ("offline", "session", "demo"):
+            self._leave_nonlive()
+        else:
+            self.replace_model(self._new_model())
+            self._baselines_from_history()
+        if live:
+            self.model.capture_started = time.time()
+            self.model.vpn["iface"] = self.current_iface_label if \
+                is_vpn_iface(self.iface_map.get(self.current_iface_label)) \
+                else ""
+        self.status_var.set("Cleared.")
+        self._set_banner("🧹  Cleared. " + ("Still watching." if live else
+                                          "Ready to start again."))
+        self._restyle_mode_banner()
+
+    def _new_session(self):
+        self.stop()
+        self.clear()
+
+    def _return_to_live(self):
+        if self.data_mode == "demo":
+            self.stop_demo()
+            return
+        self._leave_nonlive()
+        self.start(auto=True)
+
+    def session_meta(self):
+        return {"started": self.model.metrics.first_ts or self.session_started,
+                "data_source": self.data_mode,
+                "interface": self.current_iface_label if
+                self.data_mode == "live" else self.data_label}
+
+    def _save_session(self):
+        path = filedialog.asksaveasfilename(
+            parent=self.root, initialdir=self._dialog_dir(),
+            defaultextension=".mwsession.json",
+            initialfile=time.strftime("miniwireshark-%Y%m%d-%H%M.mwsession."
+                                      "json"),
+            filetypes=[("MiniWireshark session", "*.json"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            atomic_write_json(path, SessionCodec.serialize(
+                self.model, self.session_meta()))
+        except (OSError, TypeError, ValueError) as e:
+            messagebox.showerror("Save session error", str(e),
+                                 parent=self.root)
+            return
+        LOG.info("session saved to %s", path)
+        self.status_var.set(f"Session saved to {path}")
+
+    def autosave(self, reason="exit"):
+        if self.data_mode not in ("live", "idle") or not \
+                self.model.has_data():
+            return None
+        try:
+            atomic_write_json(PATHS.autosave, SessionCodec.serialize(
+                self.model, self.session_meta()))
+            LOG.info("autosaved session (%s)", reason)
+            return PATHS.autosave
+        except (OSError, TypeError, ValueError) as e:
+            LOG.warning("autosave failed: %s", e)
+            return None
+
+    def _load_session(self, path=None):
+        path = path or filedialog.askopenfilename(
+            parent=self.root, initialdir=self._dialog_dir(),
+            filetypes=[("MiniWireshark session", "*.json"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Load session error",
+                                 f"I couldn't read that file: {e}",
+                                 parent=self.root)
+            return
+        if not self._confirm_leave_live("Loading a session"):
+            return
+        self.stop()
+        self._leave_nonlive()
+        m = self._new_model(offline=True, identity=("", set(), set()))
+        try:
+            SessionCodec.load(payload, m)
+        except (ValueError, TypeError, KeyError, AttributeError) as e:
+            messagebox.showerror(
+                "Load session error",
+                f"That file didn't look like a MiniWireshark session: {e}",
+                parent=self.root)
+            return
+        self.replace_model(m)
+        self.data_mode = "session"
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(
+            payload.get("exported_at", time.time())))
+        self.data_label = f"{os.path.basename(path)} ({when})"
+        self._restyle_mode_banner()
+        self._set_banner(f"\U0001F4C2  Loaded a saved session — this is NOT "
+                         f"live. Click “Return to live capture” when "
+                         f"you're done.", kind="warn")
+        self.status_var.set(f"\U0001F4C2 Viewing saved session: "
+                            f"{self.data_label} (not live)")
+        LOG.info("session loaded from %s", path)
+
+    def _confirm_leave_live(self, action):
+        if self.data_mode == "live" and self.model.has_data():
+            return messagebox.askyesno(
+                action, f"{action} stops live capture and replaces what's on "
+                f"screen. Save the current session first if you want to keep "
+                f"it. Continue?", parent=self.root)
+        return self._confirm_leave_nonlive(action)
+
+    def open_pcap(self):
+        path = filedialog.askopenfilename(
+            parent=self.root, initialdir=self._dialog_dir(),
+            filetypes=[("Packet captures", "*.pcap *.pcapng *.cap"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        if not self._confirm_leave_live("Opening a capture file"):
+            return
+        self.stop()
+        self._leave_nonlive()
+        self._ensure_worker()
+        with contextlib.suppress(queue.Empty):
+            while True:
+                self.row_q.get_nowait()
+        m = self._new_model(offline=True, identity=("", set(), set()))
+        m.announce_new = True
+        m.capture_started = 0
+        self.replace_model(m)
+        self.worker.cache = m.cache
+        self.worker.reasm = TlsReassembler()
+        self.worker.lossless = True
+        self.data_mode = "offline"
+        self.data_label = os.path.basename(path)
+        self._restyle_mode_banner()
+        self._set_banner(f"\U0001F4C2  Reading {self.data_label} through the "
+                         f"normal analysis — this is NOT live.", kind="warn")
+        LOG.info("importing pcap %s", path)
+
+        def progress(n):
+            self._async_results.put(lambda: self.status_var.set(
+                f"\U0001F4C2 Reading {self.data_label}: {n} packets…"))
+
+        def done(n, err, cancelled):
+            self._async_results.put(lambda: self._pcap_done(n, err,
+                                                            cancelled))
+        self.importer = PcapImporter(path, self.pkt_q, progress, done)
+        self.importer.start()
+
+    def _pcap_done(self, n, err, cancelled):
+        if self.data_mode != "offline":
+            return
+        self.importer = None
+        if err:
+            self._set_banner(f"⚠️  Stopped reading the file: {err}",
+                             kind="bad")
+        gw = self.model.infer_gateway()
+        if gw:
+            self.model.set_identity(gateway_ip=gw)
+        self.root.after(1500, self._pcap_finalize, n, cancelled)
+
+    def _pcap_finalize(self, n, cancelled):
+        if not self.row_q.empty():
+            self.root.after(500, self._pcap_finalize, n, cancelled)
+            return
+        if self.worker is not None:
+            self.worker.lossless = False
+        self.model.tick()
+        self.model._classify_dirty |= set(self.model.registry.by_key)
+        self.model._classify()
+        self.tabs["devices"].rebuild()
+        self.tabs["websites"].rebuild()
+        gw = self.model.gateway_ip
+        self._set_banner(
+            f"\U0001F4C2  OFFLINE CAPTURE — finished reading {n} packets "
+            f"from {self.data_label}{' (stopped early)' if cancelled else ''}"
+            f". {('Router identified from the capture (likely): ' + gw + '.') if gw else ''}"
+            f" Nothing here is live.", kind="warn")
+        self.status_var.set(f"\U0001F4C2 Offline capture: {self.data_label} "
+                            f"— {n} packets (not live)")
+
+    def toggle_demo(self):
+        if self.data_mode == "demo":
+            self.stop_demo()
+        else:
+            self.start_demo()
+
+    def start_demo(self):
+        if self.data_mode == "live" and self.model.has_data():
+            if not messagebox.askyesno(
+                    "Demo Mode", "Demo Mode stops live capture and shows "
+                    "simulated data instead. Your live data on screen will be "
+                    "cleared (save it first if you want it). Continue?",
+                    parent=self.root):
+                return
+        self.stop()
+        self._leave_nonlive()
+        self._ensure_worker()
+        ident = ("192.168.50.1", {"192.168.50.10"}, {"02:00:5e:10:00:10"})
+        m = self._new_model(identity=ident)
+        m.set_identity(local_nets=[ipaddress.ip_network("192.168.50.0/24")])
+        m.demo = True
+        m.capture_started = time.time() - 60
+        m.registry.labels = None           # demo never reads/writes labels
+        self.replace_model(m)
+        self.data_mode = "demo"
+        self.data_label = "simulated"
+        self.demo = DemoGenerator(self.pkt_q)
+        self.demo.start()
+        self._restyle_mode_banner()
+        self._set_banner("\U0001F3AE  DEMO DATA — NOT LIVE TRAFFIC. Explore "
+                         "the tabs; nothing here is real and nothing mixes "
+                         "with your real session.", kind="warn")
+        self.goto("dash")
+        LOG.info("demo mode started")
+
+    def stop_demo(self):
+        if self.demo is not None:
+            self.demo.stop()
+            self.demo = None
+        self._leave_nonlive()
+        self._set_banner("Demo Mode ended — all demo data was discarded.")
+        LOG.info("demo mode stopped")
+        if self.config.get("general.auto_start_capture", True):
+            self.start(auto=True)
+
+    # ======================================================================
+    #  Menus, export and reports
+    # ======================================================================
+    def _dialog_dir(self):
+        d = (self.config.get("export.default_dir", "") or "").strip()
+        return d if d and os.path.isdir(d) else None
+
+    def _popup_at_pointer(self, menu):
+        try:
+            menu.tk_popup(self.root.winfo_pointerx(),
+                          self.root.winfo_pointery())
+        finally:
+            menu.grab_release()
+
+    def _open_session_menu(self):
+        m = themed_menu(self)
+        m.add_command(label="New session (stop → clear)",
+                      command=self._new_session)
+        m.add_command(label="Save session…", command=self._save_session)
+        m.add_command(label="Load session…",
+                      command=self._load_session)
+        m.add_separator()
+        m.add_command(label="Open PCAP / PCAPNG file…",
+                      command=self.open_pcap)
+        if self.data_mode in ("offline", "session"):
+            m.add_command(label="Return to live capture",
+                          command=self._return_to_live)
+        if os.path.exists(PATHS.autosave):
+            m.add_command(label="Open last autosave",
+                          command=lambda: self._load_session(PATHS.autosave))
+        self._popup_at_pointer(m)
+
+    def _open_export_menu(self):
+        m = themed_menu(self)
+        m.add_command(label="Full report (HTML)…",
+                      command=lambda: self.export_report("full"))
+        m.add_command(label="Security report (HTML)…",
+                      command=lambda: self.export_report("security"))
+        m.add_command(label="Network health report (HTML)…",
+                      command=lambda: self.export_report("health"))
+        m.add_command(label="Device report (HTML)…",
+                      command=lambda: self.export_report("device"))
+        m.add_separator()
+        m.add_command(label="Packets in current view as CSV…",
+                      command=lambda: self._export_csv(current_view=True))
+        m.add_command(label="All packets as CSV…",
+                      command=lambda: self._export_csv(current_view=False))
+        m.add_command(label="Devices as CSV…",
+                      command=self._export_devices_csv)
+        m.add_command(label="Connections as CSV…",
+                      command=self._export_flows_csv)
+        m.add_command(label="Everything as JSON…",
+                      command=self._export_json)
+        m.add_command(label="Packets as .pcap…", command=self.save_pcap)
+        self._popup_at_pointer(m)
+
+    def _ask_save(self, ext, types, name):
+        return filedialog.asksaveasfilename(
+            parent=self.root, initialdir=self._dialog_dir(),
+            defaultextension=ext, initialfile=name, filetypes=types)
+
+    def save_pcap(self):
+        if not self.all_rows:
+            messagebox.showinfo("Save .pcap", "No packets to save yet.",
+                                parent=self.root)
+            return
+        path = self._ask_save(".pcap", [("PCAP files", "*.pcap"),
+                                        ("All files", "*.*")],
+                              time.strftime("capture-%Y%m%d-%H%M.pcap"))
+        if not path:
+            return
+        try:
+            wrpcap(path, [d["pkt"] for d in self.all_rows])
+        except Exception as e:                       # noqa: BLE001
+            messagebox.showerror("Save error", str(e), parent=self.root)
+            return
+        self.status_var.set(f"Saved {len(self.all_rows)} packets to {path}")
+
+    def _export_csv(self, current_view):
+        tab = self.tabs["packets"]
+        rows = [tab.rows_by_iid[i] for i in tab.iids
+                if i in tab.rows_by_iid] if current_view else \
+            list(self.all_rows)
+        if not rows:
+            messagebox.showinfo("Export CSV", "Nothing to export yet." +
+                                (" (Open the Packets tab to build the "
+                                 "current view.)" if current_view else ""),
+                                parent=self.root)
+            return
+        path = self._ask_save(".csv", [("CSV files", "*.csv")],
+                              "packets.csv")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["no", "time", "protocol", "direction", "src_ip",
+                            "src_mac", "dst_ip", "dst_mac", "sport", "dport",
+                            "length", "connection", "text"])
+                for d in rows:
+                    w.writerow([d.get("no"), datetime.fromtimestamp(
+                        d["time"]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                        d.get("proto", ""), d.get("direction", ""),
+                        d.get("src_ip", ""), d.get("src_mac", ""),
+                        d.get("dst_ip", ""), d.get("dst_mac", ""),
+                        d.get("sport", "") or "", d.get("dport", "") or "",
+                        d.get("length", ""), d.get("flow_id") or "",
+                        d.get("text", "")])
+        except OSError as e:
+            messagebox.showerror("Export error", str(e), parent=self.root)
+            return
+        self.status_var.set(f"Exported {len(rows)} rows to {path}")
+
+    def _export_devices_csv(self):
+        path = self._ask_save(".csv", [("CSV files", "*.csv")], "devices.csv")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["name", "class", "ip", "ipv6", "mac", "vendor",
+                            "confidence", "score", "status", "first_seen",
+                            "last_seen", "bytes_sent", "bytes_received",
+                            "mine", "expected", "notes"])
+                for d in self.model.registry.by_key.values():
+                    w.writerow([self.device_label(d),
+                                f"{d.class_confidence} {d.device_class}"
+                                .strip(), d.ip, " ".join(sorted(d.ipv6)),
+                                d.mac, d.vendor, d.confidence, d.score,
+                                d.state, fmt_clock(d.first_seen, True),
+                                fmt_clock(d.last_seen, True), d.bytes_up,
+                                d.bytes_down, d.mine, d.expected, d.notes])
+        except OSError as e:
+            messagebox.showerror("Export error", str(e), parent=self.root)
+            return
+        self.status_var.set(f"Exported devices to {path}")
+
+    def _export_flows_csv(self):
+        path = self._ask_save(".csv", [("CSV files", "*.csv")],
+                              "connections.csv")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["id", "device", "transport", "local", "remote",
+                            "domain", "domain_confidence", "purpose",
+                            "bytes_up", "bytes_down", "packets", "duration_s",
+                            "status", "encryption", "first_seen",
+                            "last_seen"])
+                for fl in self.model.flows.all_flows():
+                    w.writerow([fl.fid, self.short_device_name(fl.device_key)
+                                if fl.device_key else "", fl.transport,
+                                f"{fl.local_ip}:{fl.local_port}",
+                                f"{fl.remote_ip}:{fl.remote_port}",
+                                fl.domain, fl.domain_conf, fl.purpose(),
+                                fl.bytes_out, fl.bytes_in, fl.packets,
+                                round(fl.duration, 1), fl.status_text(),
+                                fl.encrypted, fmt_clock(fl.first_seen, True),
+                                fmt_clock(fl.last_seen, True)])
+        except OSError as e:
+            messagebox.showerror("Export error", str(e), parent=self.root)
+            return
+        self.status_var.set(f"Exported connections to {path}")
+
+    def _export_json(self):
+        path = self._ask_save(".json", [("JSON files", "*.json")],
+                              "miniwireshark-export.json")
+        if not path:
+            return
+        try:
+            atomic_write_json(path, SessionCodec.serialize(
+                self.model, self.session_meta()))
+        except (OSError, TypeError, ValueError) as e:
+            messagebox.showerror("Export error", str(e), parent=self.root)
+            return
+        self.status_var.set(f"Exported full session data to {path}")
+
+    def export_report(self, kind, device_key=None):
+        if kind == "device" and not device_key:
+            devs = sorted(self.model.registry.by_key.values(),
+                          key=lambda d: self.device_label(d).lower())
+            if not devs:
+                messagebox.showinfo("Device report", "No devices yet.",
+                                    parent=self.root)
+                return
+            sel = self.tabs["devices"].selected_keys()
+            device_key = sel[0] if sel else choose_from_list(
+                self, "Device report", "Which device?",
+                [(f"{self.device_label(d)} [{d.ip or d.mac}]", d.key)
+                 for d in devs])
+            if not device_key:
+                return
+        name = {"full": "network-report", "security": "security-report",
+                "health": "health-report",
+                "device": "device-report"}.get(kind, "report")
+        path = self._ask_save(".html", [("Web page", "*.html")],
+                              time.strftime(f"{name}-%Y%m%d-%H%M.html"))
+        if not path:
+            return
+        try:
+            html_text = ReportBuilder(self).build(kind, device_key)
+            atomic_write_text(path, html_text)
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Report error", str(e), parent=self.root)
+            return
+        LOG.info("report %s written to %s", kind, path)
+        self._set_banner(f"\U0001F4C4  Report saved: {path}", kind="good")
+        if messagebox.askyesno("Report saved", "Open the report now?",
+                               parent=self.root):
+            _open_path(path)
+
+    # ======================================================================
+    #  Search v2
+    # ======================================================================
+    def search_results(self, query):
+        q = query.strip()
+        if not q:
+            return {}
+        m = re.match(r"^(device|site|ip|port|alert|mac|country):(.+)$", q,
+                     re.I)
+        token, term = (m.group(1).lower(), m.group(2).strip().lower()) if m \
+            else (None, q.lower())
+        res = OrderedDict((k, []) for k in ("Devices", "Websites",
+                                            "Remote hosts", "Connections",
+                                            "Alerts", "Timeline"))
+        mod = self.model
+        if token in (None, "device", "ip", "mac"):
+            for d in mod.registry.by_key.values():
+                fields = {"device": [self.device_label(d), d.alias,
+                                     d.hostname, d.dhcp_hostname,
+                                     d.mdns_name, d.vendor, d.device_class,
+                                     d.notes],
+                          "ip": [d.ip] + sorted(d.ipv6),
+                          "mac": [d.mac]}.get(token) or \
+                    [self.device_label(d), d.alias, d.ip, d.mac, d.vendor,
+                     d.device_class, d.notes] + sorted(d.ipv6)
+                if any(term in (f or "").lower() for f in fields):
+                    res["Devices"].append(
+                        (f"{self.device_label(d)}  ({d.ip or d.mac}) — "
+                         f"{d.device_class}", ("device", d.key)))
+        if token in (None, "site"):
+            for w in mod.websites.values():
+                if term in w.domain:
+                    res["Websites"].append((f"{w.domain}  ({w.requests} "
+                                            f"hits)", ("website", w.domain)))
+        if token in (None, "ip", "country", "site"):
+            for r in mod.remote_hosts.values():
+                hay = {"ip": r.ip, "country": f"{r.country} "
+                       f"{r.country_name}"}.get(token) or \
+                    " ".join([r.ip, r.domain, " ".join(r.domains), r.country,
+                              r.country_name, r.org, f"as{r.asn}"])
+                if term in hay.lower():
+                    res["Remote hosts"].append(
+                        (f"{r.ip}  {r.domain}  {r.location_text()}  "
+                         f"{r.provider_text()}", ("remote", r.ip)))
+        if token in (None, "port", "ip", "site"):
+            for f in mod.flows.all_flows()[-5000:]:
+                hay = {"port": f"{f.remote_port} {f.local_port} "
+                               f"{f.service}".lower()}.get(token)
+                if token == "port":
+                    ok = term.isdigit() and int(term) in (f.remote_port,
+                                                          f.local_port) or \
+                        (not term.isdigit() and term in (hay or ""))
+                else:
+                    ok = term in " ".join(str(x) for x in (
+                        f.remote_ip, f.local_ip, f.domain, f.service,
+                        f.remote_port)).lower()
+                if ok:
+                    res["Connections"].append(
+                        (f"#{f.fid} {self.short_device_name(f.device_key)} "
+                         f"→ {f.domain or f.remote_ip}:{f.remote_port} "
+                         f"({f.purpose()})", ("flow", f.fid)))
+                if len(res["Connections"]) > 200:
+                    break
+        if token in (None, "alert"):
+            for aid in mod.alerts.order:
+                a = mod.alerts.alerts.get(aid)
+                if a and (term in a.reason.lower() or
+                          term in a.kind.lower()):
+                    res["Alerts"].append((f"[{a.severity}] {a.reason}",
+                                          ("alert", a.id)))
+        if token is None:
+            for e in list(mod.timeline)[-3000:]:
+                if term in e["text"].lower():
+                    res["Timeline"].append(
+                        (f"{fmt_clock(e['when'])}  {e['text']}",
+                         e.get("ref")))
+        return OrderedDict((k, v[:200]) for k, v in res.items() if v)
+
+    def _run_global_search(self):
+        q = self.global_search_var.get().strip()
+        if not q:
+            return
+        res = self.search_results(q)
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title(f"Search results for “{q}”")
+        win.geometry("620x480")
+        win.configure(bg=t["tab_bg"])
+        win.transient(self.root)
+        tk.Label(win, text=f"{sum(len(v) for v in res.values())} result(s). "
+                           f"Double-click to jump there.", bg=t["tab_bg"],
+                 fg=t["muted_fg"]).pack(anchor="w", padx=10, pady=(8, 0))
+        frame, tree = make_tree(win, [("what", "Result", 560, "w", True)],
+                                show="tree", sortable=False)
+        frame.configure(bg=t["tab_bg"])
+        frame.pack(fill="both", expand=True, padx=10, pady=10)
+        refs = {}
+        if not res:
+            tree.insert("", "end", text="No matches found. Tip: try device:, "
+                                        "site:, ip:, port: or alert:")
+        for group, items in res.items():
+            g = tree.insert("", "end", text=f"{group} ({len(items)})",
+                            open=True)
+            for label, ref in items:
+                iid = tree.insert(g, "end", text=label)
+                refs[iid] = ref
+
+        def go(_e=None):
+            sel = tree.selection()
+            if sel and refs.get(sel[0]):
+                self.open_ref(refs[sel[0]])
+        tree.bind("<Double-1>", go)
+        tree.bind("<Return>", go)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    # ======================================================================
+    #  Settings glue
+    # ======================================================================
+    def _open_settings(self, page=None):
+        win = self._settings_win
+        if win is not None and win.alive():
+            win.win.lift()
+            win.win.focus_force()
+            if page:
+                win._go(page)
+            return win
+        self._settings_win = SettingsWindow(self, page or "general")
+        return self._settings_win
+
+    def _apply_runtime_settings(self):
+        cfg = self.config
+        setup_logging(cfg.get("diagnostics.verbose_logging", False))
+        new_max = max(500, int(cfg.get("capture.max_stored_events",
+                                       self.MAX_ROWS)))
+        if new_max != self.max_rows:
+            self.max_rows = new_max
+            self.all_rows = deque(self.all_rows, maxlen=new_max)
+            self.tabs["packets"]._trim()
+        self.model.flows.resize(cfg.get("connections.max_active", 5000),
+                                cfg.get("connections.archive_size", 2000))
+        self.beginner_mode = bool(cfg.get("appearance.beginner_mode", True))
+        self.mode_ui_var.set("Beginner" if self.beginner_mode else
+                             "Advanced")
+        self._apply_ui_mode()
+        set_locale(cfg.get("general.language", "English"))
+        self._apply_locale()
+        self._apply_shortcuts()
+        theme = cfg.get("appearance.theme", "Light")
+        hc = bool(cfg.get("appearance.high_contrast", False))
+        if theme != self.theme_name or hc != self.high_contrast:
+            self._apply_theme(theme, hc)
+        self._apply_text_size(cfg.get("appearance.text_size", "Normal"))
+        self._restyle_mode_banner()
+        if self.lan_scanner is None:
+            self._start_lan_scanner()
+        elif not cfg.get("mode.active_scanning", True):
+            self.lan_scanner.stop_flag = True
+            self.lan_scanner = None
+        dt = self.tabs["devices"]
+        dt.show_inactive_var.set(cfg.get("devices.show_inactive", False))
+        dt.show_expired_var.set(cfg.get("devices.show_expired", False))
+        dt.rebuild()
+        self.tabs["websites"].rebuild()
+        self.tabs["packets"].follow_var.set(cfg.get("capture.follow_newest",
+                                                    True))
+        self.tabs["packets"].refresh_presets()
+        self._set_geoip_enabled(cfg.get("privacy.geoip_enabled", False),
+                                save=False)
+        if cfg.get("history.enabled", False) and self.history is None:
+            self.history = HistoryStore(PATHS.history_db)
+        elif not cfg.get("history.enabled", False) and self.history:
+            self.history.stop()
+            self.history = None
+        self.data.unload_disabled()
+        self.data.start()
+        for w in self.model.websites.values():
+            cat, src = domain_category(w.domain)
+            if cat == "CDN" or cfg.get("websites.tracker_classification",
+                                       False):
+                w.category, w.category_source = cat, src
+            else:
+                w.category = w.category_source = ""
+
+    def data_status_text(self):
+        return "\n".join(self.data.summary_lines())
+
+    def history_status_text(self):
+        if self.history is None:
+            return ("History is off. Nothing is kept after you close "
+                    "MiniWireshark except names you give devices.")
+        size = self.history.size_bytes()
+        err = f"\n⚠ {self.history.error}" if self.history.error else ""
+        return (f"History database: {_human_bytes(size)} at "
+                f"{PATHS.history_db}{err}")
+
+    def deps_status_text(self):
+        lines = []
+        for dep in DEPENDENCY_MANIFEST:
+            ver = _module_version(dep["import"])
+            lines.append(f"{dep['feature']}: " + (f"ready ({dep['pip']} "
+                                                  f"{ver})" if ver else
+                                                  "not available"))
+        if IS_WINDOWS:
+            lines.append("Capture driver (Npcap): " +
+                         ("present" if _npcap_present() else "MISSING"))
+        return "\n".join(lines)
+
+    def diag_summary_text(self):
+        return (f"Version {SCRIPT_VERSION} · Python "
+                f"{platform.python_version()} · {platform.system()} "
+                f"{platform.release()} · admin: "
+                f"{'yes' if is_admin() else 'no'}\nLog file: "
+                f"{PATHS.log_file}")
+
+    def refresh_reference_data(self, force=False):
+        self.data.start(force=force)
+        self._set_banner("\U0001F504  Refreshing reference data in the "
+                         "background…")
+
+    def repair_dependencies(self, parent=None):
+        if not messagebox.askyesno(
+                "Repair dependencies",
+                "Reinstall/upgrade the packet capture engine (scapy) and "
+                "optional helpers now? This needs an Internet connection and "
+                "may take a minute. MiniWireshark keeps running.",
+                parent=parent or self.root):
+            return
+        self._set_banner("\U0001F527  Repairing dependencies in the "
+                         "background…")
+
+        def work():
+            msgs = []
+            for dep in DEPENDENCY_MANIFEST:
+                ok, err = _pip_install(dep["pip"], upgrade=True, timeout=600)
+                msgs.append(f"{dep['pip']}: {'ok' if ok else 'failed'}"
+                            f"{(' (' + err[-160:] + ')') if err else ''}")
+            npcap = ""
+            if IS_WINDOWS and not _npcap_present():
+                npcap = ("\n\nNpcap is missing: restart MiniWireshark and it "
+                         "will offer to install it, or get it from "
+                         "https://npcap.com.")
+            text = "\n".join(msgs) + npcap
+            LOG.info("dependency repair: %s", text)
+            self._async_results.put(lambda: messagebox.showinfo(
+                "Repair dependencies", text + "\n\nRestart MiniWireshark to "
+                "use updated components.", parent=self.root))
+        threading.Thread(target=work, daemon=True, name="repair").start()
+
+    def clear_history(self, parent=None):
+        if self.history is None:
+            if os.path.exists(PATHS.history_db) and messagebox.askyesno(
+                    "Clear history", "History is off, but an old history "
+                    "file exists. Delete it?", parent=parent or self.root):
+                with contextlib.suppress(OSError):
+                    os.remove(PATHS.history_db)
+            return
+        choice = messagebox.askyesnocancel(
+            "Clear history", "Yes = delete ALL stored history.\nNo = delete "
+            "only the selected device's history (Devices tab).",
+            parent=parent or self.root)
+        if choice is None:
+            return
+        if choice:
+            self.history.clear()
+            self._set_banner("\U0001F5D1  History cleared.")
+        else:
+            keys = self.tabs["devices"].selected_keys()
+            if not keys:
+                messagebox.showinfo("Clear history", "Select a device in "
+                                    "the Devices tab first.",
+                                    parent=parent or self.root)
+                return
+            for k in keys:
+                self.history.clear(k)
+            self._set_banner("\U0001F5D1  That device's history was deleted.")
+
+    def reset_baselines(self, parent=None):
+        if messagebox.askyesno("Reset learned baselines",
+                               "Forget what's normal for every device? "
+                               "Traffic-spike alerts pause until each device "
+                               "has been observed again.",
+                               parent=parent or self.root):
+            self.model.baselines.reset()
+            if self.history is not None:
+                self.history.submit(lambda con: con.execute(
+                    "DELETE FROM baselines"))
+            self._set_banner("\U0001F9F9  Learned baselines reset.")
+
+    def _history_tick(self):
+        try:
+            if self.history is not None and self.data_mode in ("live",
+                                                               "idle"):
+                self._write_history()
+        except Exception:                            # noqa: BLE001
+            LOG.exception("history snapshot")
+        self.root.after(60000, self._history_tick)
+
+    def _write_history(self):
+        m = self.model
+        devs = []
+        for d in m.registry.by_key.values():
+            if not d.live or d.demo:
+                continue
+            devs.append((d.key, device_to_dict(d, False), d.first_seen,
+                         d.last_seen, [(s, e) for s, e in d.presence[-10:]],
+                         (d.bytes_up, d.bytes_down, d.packets)))
+        alerts = [(a.id, a.kind, a.severity, a.device_key, a.reason, a.when)
+                  for a in (m.alerts.alerts.get(i) for i in m.alerts.order)
+                  if a and a.live]
+        domains = [(w.registrable, w.requests, w.bytes)
+                   for w in m.websites.values()][:5000]
+        base = list(m.baselines.to_dict().items())
+        self.history.write_snapshot({"devices": devs, "alerts": alerts,
+                                     "domains": domains, "baselines": base})
+        ret = self.config.get("history.retention", "30 days")
+        days = HISTORY_RETENTION.get(ret)
+        if days is None:
+            days = int(self.config.get("history.custom_days", 14))
+        if days:
+            self.history.prune(days)
+
+    # ======================================================================
+    #  Country lookup glue (opt-in)
+    # ======================================================================
+    def _geoip_on_result(self, ip, code, name, provider):
+        self._async_results.put(
+            lambda: self.model.apply_country(ip, code, name, provider))
+
+    def _set_geoip_enabled(self, on, save=True):
+        on = bool(on)
+        self.config.set("privacy.geoip_enabled", on)
+        if save:
+            self.config.save()
+        self.geoip.set_enabled(on)
+        rt = self.tabs.get("remote")
+        if rt is not None and rt.geoip_var.get() != on:
+            rt.geoip_var.set(on)
+        sw = self._settings_win
+        if sw is not None and sw.alive():
+            sw.sync_key("privacy.geoip_enabled", on)
+        if on and self.data_mode == "live":
+            for ip, rec in self.model.remote_hosts.items():
+                if not rec.country:
+                    self.geoip.request(ip)
+
+    def _geoip_status_text(self):
+        local = ""
+        if self.config.get("privacy.local_asn_db", False):
+            local = self.data.status_text("asn") + "\n"
+        st = self.geoip.status()
+        if not st["enabled"]:
+            return local + ("Online country lookup is off" +
+                            (" (the offline database is used instead)." if
+                             local else ". Turn on the offline database in "
+                             "Settings → Privacy for private, local "
+                             "lookups."))
+        parts = [f"{st['resolved']} looked up"]
+        if st["pending"]:
+            parts.append(f"{st['pending']} waiting")
+        if st["failed"]:
+            parts.append(f"{st['failed']} failed")
+        head = local + "Online country lookup ON — " + ", ".join(parts)
+        if st["provider"]:
+            head += f"  · via {st['provider']}"
+        if st["paused"]:
+            head += (f"\n⚠ Can't reach any lookup service right now; "
+                     f"trying again in {st['paused']}s.")
+        elif st["last_error"] and st["failed"]:
+            head += f"\n⚠ {st['last_error'][:230]}"
+        return head
+
+    def _geoip_retry(self):
+        n = self.geoip.retry_failed()
+        for ip, rec in self.model.remote_hosts.items():
+            if not rec.country:
+                self.geoip.request(ip)
+        self._set_banner(f"\U0001F30D  Retrying country lookups ({n} that had "
+                         f"failed).")
+
+    def _geoip_test(self, parent=None):
+        if not self.config.get("privacy.geoip_enabled", False):
+            if not messagebox.askyesno(
+                    "Test country lookup",
+                    "Online country lookup is off. The test sends one "
+                    "well-known public address (8.8.8.8) to the lookup "
+                    "service. Run the test?", parent=parent or self.root):
+                return
+        self._set_banner("\U0001F30D  Testing country lookup…")
+
+        def worker():
+            code, name, provider, errors = self.geoip.lookup_now("8.8.8.8")
+            self._async_results.put(lambda: self._geoip_test_done(
+                code, name, provider, errors, parent))
+        threading.Thread(target=worker, daemon=True, name="geo-test").start()
+
+    def _geoip_test_done(self, code, name, provider, errors, parent):
+        parent = parent if parent is not None else self.root
+        try:
+            if code:
+                self._set_banner(f"✅  Country lookup works ({provider}: "
+                                 f"8.8.8.8 → {code}).")
+                messagebox.showinfo("Test country lookup",
+                                    f"Working.\n\n{provider} answered: "
+                                    f"8.8.8.8 is in {name or code} ({code}).",
+                                    parent=parent)
+            else:
+                self._set_banner("⚠️  Country lookup can't reach any "
+                                 "service.", kind="warn")
+                messagebox.showwarning(
+                    "Test country lookup",
+                    "None of the lookup services answered:\n\n" +
+                    "\n".join(f"• {e}" for e in errors) +
+                    "\n\nCommon causes: no internet, a firewall or proxy "
+                    "blocking these sites, or a very restrictive network.",
+                    parent=parent)
+        except tk.TclError:
+            pass
+
+    # ======================================================================
+    #  Updates (opt-in) and safe self-update
+    # ======================================================================
+    def _check_for_updates(self, manual=True):
+        repo = self.config.get("updates.repo", "").strip()
+        if not repo:
+            if manual:
+                messagebox.showinfo(
+                    "Check for updates",
+                    "No update source is configured. If you host this "
+                    "script's releases on GitHub, set “owner/repo” "
+                    "in Settings → Updates & Dependencies — "
+                    "MiniWireshark never guesses one.", parent=self.root)
+            return
+
+        def worker():
+            try:
+                url = f"https://api.github.com/repos/{repo}/releases/latest"
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": APP_NAME,
+                    "Accept": "application/vnd.github+json"})
+                with urllib.request.urlopen(req, timeout=8) as resp:
+                    data = json.loads(resp.read().decode("utf-8", "ignore"))
+                tag = str(data.get("tag_name", "")).lstrip("v")
+                assets = [a.get("browser_download_url", "")
+                          for a in data.get("assets", []) or []
+                          if str(a.get("name", "")).endswith(".py")]
+                self._async_results.put(lambda: self._report_update_result(
+                    tag, data.get("html_url", ""), assets, None, manual))
+            except (OSError, ValueError, urllib.error.URLError) as e:
+                msg = str(e)
+                self._async_results.put(lambda: self._report_update_result(
+                    None, "", [], msg, manual))
+        threading.Thread(target=worker, daemon=True, name="update-check"
+                         ).start()
+
+    def _report_update_result(self, tag, url, assets, err, manual):
+        if err is not None:
+            if manual:
+                self._set_banner(f"⚠️  Couldn't check for updates "
+                                 f"({err}).", kind="warn")
+            return
+        if tag and _version_tuple(tag) > _version_tuple(SCRIPT_VERSION):
+            self._set_banner(f"⬆️  A newer version ({tag}) is "
+                             f"available. Release notes: {url}", kind="warn")
+            if self.config.get("updates.allow_self_update", False) and \
+                    assets and messagebox.askyesno(
+                        "Update available",
+                        f"MiniWireshark {tag} is available (you have "
+                        f"{SCRIPT_VERSION}).\n\nDownload and install it now? "
+                        f"A backup of this version is kept and restored "
+                        f"automatically if the new one fails to start.",
+                        parent=self.root):
+                self._self_update(assets[0], tag)
+        elif manual:
+            self._set_banner(f"✅  You're on the latest version "
+                             f"({SCRIPT_VERSION}).")
+
+    def _self_update(self, url, tag):
+        def work():
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": APP_NAME})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    data = r.read(20_000_000)
+                msg = apply_self_update(data, tag)
+            except (OSError, ValueError, urllib.error.URLError) as e:
+                msg = f"Update failed, nothing was changed: {e}"
+            self._async_results.put(lambda: messagebox.showinfo(
+                "Update", msg, parent=self.root))
+        threading.Thread(target=work, daemon=True, name="self-update").start()
+
+    def _confirm_startup_ok(self):
+        """20 s after a successful start, an update is considered good."""
+        marker = read_json(PATHS.update_marker, None)
+        if marker:
+            with contextlib.suppress(OSError):
+                os.remove(PATHS.update_marker)
+            LOG.info("update to %s confirmed working", marker.get("version"))
+
+    # ======================================================================
+    #  Diagnostics, self-test, crash handling, shutdown
+    # ======================================================================
+    def open_diagnostics(self):
+        if self._diag_win is not None and self._diag_win.alive():
+            self._diag_win.win.lift()
+            return
+        self._diag_win = DiagnosticsWindow(self)
+
+    def run_self_test_window(self):
+        self._set_banner("\U0001F9EA  Running the built-in self-test…")
+
+        def work():
+            try:
+                r = subprocess.run([sys.executable, SCRIPT_PATH,
+                                    SELF_TEST_FLAG], capture_output=True,
+                                   text=True, timeout=300,
+                                   creationflags=getattr(
+                                       subprocess, "CREATE_NO_WINDOW", 0))
+                out = (r.stdout + r.stderr)[-6000:]
+                ok = r.returncode == 0
+            except (OSError, subprocess.SubprocessError) as e:
+                out, ok = str(e), False
+            self._async_results.put(lambda: DetailDialog(
+                self, "Self-test " + ("passed ✔" if ok else
+                                      "found problems ✖"),
+                [("Output", out)], size="720x560"))
+        threading.Thread(target=work, daemon=True, name="self-test").start()
+
+    def _tk_exception(self, exc, val, tb):
+        text = "".join(traceback.format_exception(exc, val, tb))
+        LOG.error("unhandled GUI exception:\n%s", text)
+        CrashDialog.show(self, text)
+
+    def _on_close(self):
+        LOG.info("shutting down")
+        try:
+            if self.history is not None and self.data_mode in ("live",
+                                                               "idle"):
+                self._write_history()
+            if self.config.get("history.save_raw_packets", False) and \
+                    self.all_rows and self.data_mode in ("live", "idle"):
+                path = os.path.join(PATHS.sessions, time.strftime(
+                    "packets-%Y%m%d-%H%M%S.pcap"))
+                with contextlib.suppress(Exception):
+                    wrpcap(path, [d["pkt"] for d in self.all_rows])
+            if self.config.get("history.retention") != "Session only":
+                self.autosave("exit")
+        except Exception:                            # noqa: BLE001
+            LOG.exception("while saving on exit")
+        self._stop_capture_only()
+        for w in (self.worker, self.watcher, self.prober):
+            if w is not None:
+                w.stop_flag = True
+        if self.prober is not None:
+            self.prober.run_now.set()
+        if self.demo is not None:
+            self.demo.stop()
+        if self.importer is not None:
+            self.importer.cancelled = True
+        if self.rdns is not None:
+            self.rdns.stop()
+        self.geoip.stop()
+        self.data.stop()
+        if self.history is not None:
+            self.history.stop()
+        with contextlib.suppress(tk.TclError):
+            self.root.destroy()
+        for w in (self.worker, self.watcher, self.prober, self.demo,
+                  self.importer):
+            if w is not None and w.is_alive():
+                w.join(timeout=1.0)
+
+
+
+# ============================================================================
+#  18b.  Export / reporting — self-contained HTML (inline SVG charts, no
+#  external assets)
+# ============================================================================
+def _svg_line(series, w=760, h=200, fmt=human_rate, labels=("", "")):
+    """series: list of (label, values, color, dash)."""
+    vmax = max((max(v) if v else 0) for _l, v, _c, _d in series) or 0
+    nm = Charts.nice_max(vmax)
+    left, top, pw, ph = 70, 18, w - 80, h - 40
+    out = [f'<svg viewBox="0 0 {w} {h}" width="100%" role="img" '
+           f'xmlns="http://www.w3.org/2000/svg" class="chart">']
+    for i in range(5):
+        y = top + ph - ph * i / 4
+        out.append(f'<line x1="{left}" y1="{y:.1f}" x2="{left + pw}" '
+                   f'y2="{y:.1f}" class="grid"/>')
+        out.append(f'<text x="{left - 6}" y="{y + 4:.1f}" text-anchor="end" '
+                   f'class="axis">{html.escape(fmt(nm * i / 4))}</text>')
+    out.append(f'<text x="{left}" y="{h - 4}" class="axis">'
+               f'{html.escape(labels[0])}</text>')
+    out.append(f'<text x="{left + pw}" y="{h - 4}" text-anchor="end" '
+               f'class="axis">{html.escape(labels[1])}</text>')
+    lx = left + pw
+    for label, vals, color, dash in series:
+        if vals and vmax > 0:
+            n = len(vals)
+            pts = " ".join(f"{left + pw * j / max(1, n - 1):.1f},"
+                           f"{top + ph - ph * min(v, nm) / nm:.1f}"
+                           for j, v in enumerate(vals))
+            out.append(f'<polyline fill="none" stroke="{color}" '
+                       f'stroke-width="2" stroke-dasharray="{dash}" '
+                       f'points="{pts}"/>')
+        out.append(f'<text x="{lx}" y="12" text-anchor="end" class="legend">'
+                   f'{html.escape(label)}</text>')
+        lx -= 8 * len(label) + 40
+        out.append(f'<line x1="{lx + 8}" y1="8" x2="{lx + 30}" y2="8" '
+                   f'stroke="{color}" stroke-width="2" '
+                   f'stroke-dasharray="{dash}"/>')
+    if vmax <= 0:
+        out.append(f'<text x="{left + pw / 2}" y="{top + ph / 2}" '
+                   f'text-anchor="middle" class="axis">No data</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _svg_bars(items, w=380, color="#2b7de9"):
+    """items: list of (label, value, text)."""
+    if not items:
+        return '<p class="muted">Nothing recorded.</p>'
+    rowh = 22
+    h = rowh * len(items) + 6
+    vmax = max(v for _l, v, _t in items) or 1
+    out = [f'<svg viewBox="0 0 {w} {h}" width="100%" '
+           f'xmlns="http://www.w3.org/2000/svg" class="chart">']
+    for i, (label, v, txt) in enumerate(items):
+        y = i * rowh + 3
+        bw = max(2, (w - 230) * v / vmax)
+        out.append(f'<text x="0" y="{y + 14}" class="axis">'
+                   f'{html.escape(label[:26])}</text>')
+        out.append(f'<rect x="150" y="{y + 3}" width="{bw:.1f}" height="14" '
+                   f'fill="{color}" rx="2"/>')
+        out.append(f'<text x="{156 + bw:.1f}" y="{y + 14}" class="axis">'
+                   f'{html.escape(txt)}</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+REPORT_CSS = """
+:root{--bg:#f4f5f7;--card:#ffffff;--fg:#222;--muted:#666;--line:#e0e2e8;
+--navy:#2b3a55;--info:#333;--warn:#8a5a00;--warnbg:#fff5e0;--danger:#8a1a08;
+--dangerbg:#fbe9e7;--good:#0b6b3a}
+@media (prefers-color-scheme: dark){:root{--bg:#161920;--card:#20232c;
+--fg:#e2e5ea;--muted:#9aa3b2;--line:#343945;--info:#c7ccd6;--warn:#e0a83a;
+--warnbg:#3a2c10;--danger:#ff7a63;--dangerbg:#3a1712;--good:#4ad080}}
+body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.45 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+header{background:#2b3a55;color:#fff;padding:18px 28px}
+header h1{margin:0;font-size:22px}header p{margin:4px 0 0;color:#c8d2e0}
+main{max-width:1100px;margin:0 auto;padding:18px}
+section{background:var(--card);border:1px solid var(--line);border-radius:8px;
+padding:14px 18px;margin:14px 0}
+h2{font-size:17px;margin:0 0 10px;color:var(--fg)}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);
+vertical-align:top}th{color:var(--muted);font-weight:600}
+.muted{color:var(--muted)}.grid{stroke:var(--line)}
+.axis,.legend{fill:var(--muted);font-size:11px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+gap:10px}.card{border:1px solid var(--line);border-radius:6px;padding:8px}
+.card b{display:block;font-size:18px}.card span{font-size:11px;
+color:var(--muted);text-transform:uppercase}
+.sev-DANGER{color:var(--danger);background:var(--dangerbg)}
+.sev-WARNING{color:var(--warn);background:var(--warnbg)}
+.sev-INFO{color:var(--info)}
+.badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:12px;
+font-weight:600}.two{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:800px){.two{grid-template-columns:1fr}}
+footer{color:var(--muted);font-size:12px;text-align:center;padding:20px}
+"""
+
+
+class ReportBuilder:
+    def __init__(self, app):
+        self.app = app
+        self.m = app.model
+
+    def build(self, kind="full", device_key=None):
+        e = html.escape
+        m, app = self.m, self.app
+        title = {"full": "Network report", "security": "Security report",
+                 "health": "Network health report",
+                 "device": "Device report"}.get(kind, "Report")
+        now = m.now()
+        src = {"live": "Live capture", "idle": "Live capture (stopped)",
+               "offline": "Offline capture file (not live)",
+               "session": "Saved session (not live)",
+               "demo": "DEMO DATA — NOT LIVE TRAFFIC"}.get(app.data_mode,
+                                                            app.data_mode)
+        parts = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+                 f"<meta name='viewport' content='width=device-width,"
+                 f"initial-scale=1'><title>MiniWireshark — {e(title)}"
+                 f"</title><style>{REPORT_CSS}</style></head><body>"
+                 f"<header><h1>\U0001F310 MiniWireshark — {e(title)}</h1>"
+                 f"<p>Your network, explained in plain English · "
+                 f"generated {e(fmt_clock(time.time(), True))} · "
+                 f"{e(src)}</p></header><main>"]
+        if kind == "device" and device_key:
+            parts.append(self._device_section(device_key))
+        else:
+            parts.append(self._summary())
+            if kind in ("full", "health"):
+                parts.append(self._health())
+            if kind in ("full",):
+                parts.append(self._traffic(now))
+                parts.append(self._devices())
+                parts.append(self._websites())
+                parts.append(self._remotes())
+            if kind in ("full", "security"):
+                parts.append(self._alerts())
+                parts.append(self._security())
+            if kind == "security":
+                parts.append(self._devices(compact=True))
+            parts.append(self._timeline())
+        parts.append("<footer>Generated locally by MiniWireshark "
+                     f"{SCRIPT_VERSION}. Observations, not verdicts: "
+                     "“likely” and “possibly” mean exactly "
+                     "that. For HTTPS sites only names are visible, never "
+                     "pages or contents.</footer></main></body></html>")
+        return "".join(parts)
+
+    def _summary(self):
+        m, app, e = self.m, self.app, html.escape
+        now = m.now()
+        c = m.alerts.counts(include_ack=True)
+        cards = [("Packets", m.count), ("Devices", len(m.registry.by_key)),
+                 ("Websites", len(m.websites)),
+                 ("Remote hosts", len(m.remote_hosts)),
+                 ("Connections", m.flows.total_flows or
+                  len(m.flows.all_flows())),
+                 ("Downloaded", _human_bytes(m.metrics.totals["bytes_down"])),
+                 ("Uploaded", _human_bytes(m.metrics.totals["bytes_up"])),
+                 ("Duration", human_duration(m.metrics.duration(now))),
+                 ("Alerts", f"‼{c['DANGER']} ⚠{c['WARNING']} "
+                            f"ℹ{c['INFO']}")]
+        info = [("Router", m.gateway_ip or "—"),
+                ("This computer", ", ".join(sorted(m.my_ips)) or "—"),
+                ("Subnets", ", ".join(str(n) for n in m.local_nets) or
+                 "—"),
+                ("Network card", app.current_iface_label or app.data_label or
+                 "—"),
+                ("VPN", m.vpn.get("endpoint") or m.vpn.get("iface") or
+                 "none detected"),
+                ("Period", f"{fmt_clock(m.metrics.first_ts, True)} – "
+                           f"{fmt_clock(m.metrics.last_ts, True)}")]
+        state = app.network_state_text()[0]
+        return ("<section><h2>Session summary</h2><p>" + e(state) +
+                "</p><div class='cards'>" + "".join(
+                    f"<div class='card'><span>{e(k)}</span><b>{e(str(v))}</b>"
+                    f"</div>" for k, v in cards) + "</div><h2 style='margin-"
+                "top:14px'>Network information</h2><table>" + "".join(
+                    f"<tr><th>{e(k)}</th><td>{e(str(v))}</td></tr>"
+                    for k, v in info) + "</table></section>")
+
+    def _traffic(self, now):
+        m, t = self.m, THEME_LIGHT
+        res, n = (10, 360) if m.metrics.duration(now) > 600 else (1, 300)
+        down = [v / res for _b, v in m.metrics.series["bytes_down"].series(
+            res, n, now)]
+        up = [v / res for _b, v in m.metrics.series["bytes_up"].series(
+            res, n, now)]
+        chart = _svg_line([("Download", down, t["chart_down"], ""),
+                           ("Upload", up, t["chart_up"], "6 3")],
+                          labels=(f"-{human_duration(res * n)}", "end"))
+        protos = [(p, b, _human_bytes(b)) for p, b in
+                  m.metrics.top_protocols(n=8)]
+        devs = sorted(m.registry.by_key.values(),
+                      key=lambda d: -(d.bytes_up + d.bytes_down))[:8]
+        dv = [(self.app.device_label(d), d.bytes_up + d.bytes_down,
+               f"↑{_human_bytes(d.bytes_up)} ↓"
+               f"{_human_bytes(d.bytes_down)}") for d in devs
+              if d.bytes_up + d.bytes_down]
+        tot = m.metrics.totals
+        return ("<section><h2>Traffic</h2>" + chart +
+                f"<p class='muted'>Internet: ↓{_human_bytes(tot['bytes_down'])}"
+                f" ↑{_human_bytes(tot['bytes_up'])} · local network "
+                f"{_human_bytes(tot['bytes_lan'])} · peak download "
+                f"{human_rate(m.metrics.peak['down'])}, peak upload "
+                f"{human_rate(m.metrics.peak['up'])}</p><div class='two'>"
+                "<div><h2>Protocols</h2>" + _svg_bars(protos,
+                                                       color=t["chart_e"]) +
+                "</div><div><h2>Top devices</h2>" +
+                _svg_bars(dv, color=t["chart_b"]) + "</div></div></section>")
+
+    def _devices(self, compact=False):
+        e, app = html.escape, self.app
+        rows = []
+        for d in sorted(self.m.registry.by_key.values(),
+                        key=lambda d: app.device_label(d).lower()):
+            evid = ", ".join(d.evidence_summary())
+            rows.append(
+                f"<tr><td>{e(app.device_label(d))}</td><td>"
+                f"{e((d.class_confidence + ' ' + d.device_class).strip())}"
+                f"</td><td>{e(d.ip or '')}</td><td>{e(d.mac or '')}</td>"
+                f"<td>{e(d.vendor or ('private address' if d.randomized_mac else ''))}"
+                f"</td><td>{e(d.confidence)} ({d.score})</td>" +
+                ("" if compact else
+                 f"<td>{e(evid)}</td><td>↑{_human_bytes(d.bytes_up)} "
+                 f"↓{_human_bytes(d.bytes_down)}</td>") +
+                f"<td>{e(d.state.title())}</td></tr>")
+        head = ("<tr><th>Device</th><th>Likely type</th><th>IP</th><th>MAC"
+                "</th><th>Vendor</th><th>Confidence</th>" +
+                ("" if compact else "<th>Evidence</th><th>Traffic</th>") +
+                "<th>Status</th></tr>")
+        return ("<section><h2>Devices</h2><p class='muted'>Confidence reflects"
+                " local evidence (MAC, ARP/ND, DHCP, mDNS/SSDP); an IP address "
+                "alone never counts as a device.</p><table>" + head +
+                "".join(rows) + "</table></section>")
+
+    def _websites(self):
+        e = html.escape
+        groups = defaultdict(lambda: [0, 0, set(), set()])
+        for w in self.m.websites.values():
+            g = groups[w.registrable]
+            g[0] += w.requests
+            g[1] += w.bytes
+            g[2] |= w.devices
+            g[3] |= w.sources
+        rows = sorted(groups.items(), key=lambda kv: -kv[1][0])[:40]
+        return ("<section><h2>Top websites</h2><p class='muted'>Names only "
+                "— for HTTPS, pages and contents are never visible.</p>"
+                "<table><tr><th>Site</th><th>Hits</th><th>Traffic</th><th>"
+                "Devices</th><th>Seen via</th></tr>" + "".join(
+                    f"<tr><td>{e(k)}</td><td>{v[0]}</td><td>"
+                    f"{_human_bytes(v[1]) if v[1] else ''}</td><td>"
+                    f"{e(', '.join(self.app.short_device_name(x) for x in sorted(v[2])[:4]))}"
+                    f"</td><td>{e(', '.join(sorted(v[3])))}</td></tr>"
+                    for k, v in rows) + "</table></section>")
+
+    def _remotes(self):
+        e = html.escape
+        rows = sorted(self.m.remote_hosts.values(),
+                      key=lambda r: -r.bytes_total)[:30]
+        return ("<section><h2>Top remote hosts</h2><table><tr><th>Address"
+                "</th><th>Name</th><th>Country</th><th>Provider</th><th>"
+                "Traffic</th><th>Connections</th></tr>" + "".join(
+                    f"<tr><td>{e(r.ip)}</td><td>{e(r.domain)}</td><td>"
+                    f"{e(r.location_text())}</td><td>{e(r.provider_text())}"
+                    f"</td><td>{_human_bytes(r.bytes_total)}</td><td>"
+                    f"{r.connections}</td></tr>" for r in rows) +
+                "</table></section>")
+
+    def _alerts(self):
+        e = html.escape
+        rows = []
+        for aid in self.m.alerts.order[:200]:
+            a = self.m.alerts.alerts.get(aid)
+            if not a:
+                continue
+            rows.append(
+                f"<tr><td><span class='badge sev-{a.severity}'>"
+                f"{e(a.severity)}</span></td><td>{e(fmt_clock(a.when, True))}"
+                f"</td><td><b>{e(a.reason)}</b><br>{e(a.observed)}<br>"
+                f"<span class='muted'>Why: {e(a.why)} · Confidence: "
+                f"{e(a.confidence)} · Possibly innocent: "
+                f"{e(a.possible_explanations)}</span></td><td>{a.count}</td>"
+                f"</tr>")
+        return ("<section><h2>Alerts</h2><p class='muted'>Anomalies, not "
+                "verdicts.</p>" + ("<table><tr><th>Severity</th><th>When</th>"
+                                   "<th>What</th><th>Times</th></tr>" +
+                                   "".join(rows) + "</table>" if rows else
+                                   "<p>No alerts.</p>") + "</section>")
+
+    def _health(self):
+        e = html.escape
+        res = self.app.health_summary()
+        names = dict(HealthTab.CHECKS)
+        return ("<section><h2>Network health</h2><table>" + "".join(
+            f"<tr><th>{e(names.get(k, k))}</th><td>{e(s)}</td><td>{e(t)}</td>"
+            f"</tr>" for k, (s, t) in res.items()) +
+            "</table><h2 style='margin-top:12px'>DNS servers</h2><table><tr>"
+            "<th>Server</th><th>Queries</th><th>Typical ms</th><th>Failed"
+            "</th></tr>" + "".join(
+                f"<tr><td>{e(ip)}</td><td>{q}</td><td>"
+                f"{'' if lat is None else f'{lat:.0f}'}</td><td>{fail}</td>"
+                f"</tr>" for ip, q, _r, _nx, fail, lat in
+                self.m.dns.summary_rows()[:12]) + "</table></section>")
+
+    def _security(self):
+        e = html.escape
+        tab = self.app.tabs["security"]
+        tab.render()
+        text = tab.text.get("1.0", "end").strip()
+        return f"<section><h2>Security check</h2><pre style='white-space:" \
+               f"pre-wrap;font:inherit'>{e(text)}</pre></section>"
+
+    def _timeline(self):
+        e = html.escape
+        rows = [x for x in self.m.timeline if x["severity"] != "INFO" or
+                x["kind"] in ("new device", "capture", "internet",
+                              "identity merged", "dns change", "vpn")][-60:]
+        return ("<section><h2>Timeline highlights</h2><table>" + "".join(
+            f"<tr><td>{e(fmt_clock(x['when'], True))}</td><td>"
+            f"<span class='badge sev-{x['severity']}'>{e(x['severity'])}"
+            f"</span></td><td>{e(x['kind'])}</td><td>{e(x['text'])}</td></tr>"
+            for x in reversed(rows)) + "</table></section>")
+
+    def _device_section(self, key):
+        e = html.escape
+        dev = self.m.registry.by_key.get(key)
+        if dev is None:
+            return "<section><p>Device not found.</p></section>"
+        secs = self.app.device_report(dev)
+        flows = sorted((f for f in self.m.flows.all_flows()
+                        if f.device_key == key),
+                       key=lambda f: -f.total_bytes)[:25]
+        out = [f"<section><h2>{e(self.app.device_label(dev))}</h2>"]
+        for h, t in secs:
+            out.append(f"<h3>{e(h)}</h3><p style='white-space:pre-wrap'>"
+                       f"{e(t)}</p>")
+        out.append("</section><section><h2>Top connections</h2><table><tr>"
+                   "<th>To</th><th>Purpose</th><th>Up</th><th>Down</th><th>"
+                   "Status</th></tr>" + "".join(
+                       f"<tr><td>{e(f.domain or f.remote_ip)}</td><td>"
+                       f"{e(f.purpose())}</td><td>{_human_bytes(f.bytes_out)}"
+                       f"</td><td>{_human_bytes(f.bytes_in)}</td><td>"
+                       f"{e(f.status_text())}</td></tr>" for f in flows) +
+                   "</table></section>")
+        alerts = [self.m.alerts.alerts[a] for a in self.m.alerts.order
+                  if a in self.m.alerts.alerts and
+                  self.m.alerts.alerts[a].device_key == key]
+        if alerts:
+            out.append("<section><h2>Alerts for this device</h2><ul>" +
+                       "".join(f"<li><b>{e(a.severity)}</b> {e(a.reason)} "
+                               f"— {e(a.observed)}</li>"
+                               for a in alerts) + "</ul></section>")
+        return "".join(out)
+
+
+# ============================================================================
+#  19b.  Diagnostics window, crash dialog, self-update
+# ============================================================================
+class DiagnosticsWindow:
+    def __init__(self, app):
+        self.app = app
+        t = app.theme
+        self.win = tk.Toplevel(app.root)
+        self.win.title("MiniWireshark diagnostics")
+        self.win.geometry("760x640")
+        self.win.configure(bg=t["tab_bg"])
+        top = tk.Frame(self.win, bg=t["tab_bg"], padx=12, pady=8)
+        top.pack(fill="x")
+        tk.Label(top, text="\U0001F6E0  Troubleshooting & diagnostics",
+                 bg=t["tab_bg"], fg=t["text_fg"],
+                 font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+        tk.Label(top, text="Nothing here needs a terminal. Copy or export "
+                           "this information if you ask someone for help "
+                           "(it contains no packet contents).",
+                 bg=t["tab_bg"], fg=t["muted_fg"]).pack(anchor="w")
+        bars = tk.Frame(self.win, bg=t["tab_bg"], padx=12)
+        bars.pack(fill="x")
+        row1 = tk.Frame(bars, bg=t["tab_bg"])
+        row1.pack(fill="x", pady=2)
+        row2 = tk.Frame(bars, bg=t["tab_bg"])
+        row2.pack(fill="x", pady=2)
+        for row, items in ((row1, (("Copy diagnostics", self.copy),
+                                   ("Export report…", self.export),
+                                   ("Open logs", lambda: _open_path(
+                                       PATHS.logs)),
+                                   ("Refresh adapters",
+                                    app.refresh_adapters),
+                                   ("Repair dependencies", lambda:
+                                    app.repair_dependencies(self.win)))),
+                           (row2, (("Test capture engine", self.test_capture),
+                                   ("Test DNS", self.test_dns),
+                                   ("Test Internet", self.test_internet),
+                                   ("Test country lookup", lambda:
+                                    app._geoip_test(self.win))))):
+            for label, fn in items:
+                ttk.Button(row, text=label, command=fn).pack(side="left",
+                                                             padx=(0, 6))
+        self.result_var = tk.StringVar()
+        tk.Label(self.win, textvariable=self.result_var, bg=t["tab_bg"],
+                 fg=t["info_fg"], anchor="w", justify="left",
+                 wraplength=720).pack(fill="x", padx=12, pady=(6, 0))
+        body = tk.Frame(self.win, bg=t["tab_bg"])
+        body.pack(fill="both", expand=True, padx=12, pady=8)
+        self.txt = tk.Text(body, wrap="none", bg=t["text_bg"],
+                           fg=t["text_fg"], font=app.mono, relief="flat",
+                           padx=8, pady=6, highlightthickness=0)
+        vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
+        self.txt.configure(yscrollcommand=vs.set)
+        self.txt.pack(side="left", fill="both", expand=True)
+        vs.pack(side="right", fill="y")
+        self.win.bind("<Escape>", lambda e: self.win.destroy())
+        self.refresh()
+
+    def alive(self):
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def info(self):
+        app, m = self.app, self.app.model
+        probe = {}
+        with contextlib.suppress(Exception):
+            probe = probe_l2_socket()
+        backend = probe.get("found") or "unknown"
+        with contextlib.suppress(Exception):
+            backend += f" (libpcap: {'yes' if conf.use_pcap else 'no'})"
+        rec = app._score_for(app.current_iface_label)
+        up = time.time() - app._capture_started_at if app.sniffer else 0
+        threads = sorted(t.name for t in threading.enumerate())
+        w = app.worker
+        lines = [
+            f"MiniWireshark       {SCRIPT_VERSION}",
+            f"Python              {platform.python_version()} "
+            f"({sys.executable})",
+            f"Operating system    {platform.platform()}",
+            f"Administrator/root  {'yes' if is_admin() else 'no'}",
+            f"Scapy               {_module_version('scapy') or 'missing'}",
+            f"psutil (optional)   {_module_version('psutil') or 'not installed'}",
+            f"Capture backend     {backend}",
+            f"Npcap/libpcap       " + ("Npcap present" if IS_WINDOWS and
+                                       _npcap_present() else
+                                       "Npcap MISSING" if IS_WINDOWS else
+                                       "system libpcap / raw sockets"),
+            f"Data mode           {app.data_mode} {app.data_label}",
+            f"Selected adapter    {app.current_iface_label or app.iface_var.get()}",
+            "Adapter IP          " + ((rec or {}).get("ip", "") or "—"),
+            "Why chosen          " + (app.iface_reason or "—"),
+            "Subnets             " + (", ".join(str(n) for n in
+                                                m.local_nets) or "—"),
+            "Gateway             " + (m.gateway_ip or "—"),
+            "DNS servers         " + (", ".join(app.system_dns) or
+                                      "—"),
+            f"Raw queue           {app.pkt_q.qsize()} / {PKT_QUEUE_MAX}",
+            f"Decoder queue       {app.row_q.qsize()} / {ROW_QUEUE_MAX}",
+            f"Dropped (capture)   {app.dropped_capture}",
+            f"Dropped (analysis)  {w.dropped if w else 0}",
+            f"Decode errors       {w.errors if w else 0} "
+            f"{(w.last_error if w else '')[:80]}",
+            f"Analysis errors     {app._analysis_errors}",
+            f"Packets captured    {app.count}",
+            "Capture uptime      " +
+            (human_duration(up) if up else "—"),
+            f"Auto-restarts       {app._restart_attempts}",
+            f"Performance         mode "
+            f"{app.config.get('performance.mode', 'Automatic')}, level "
+            f"{app.perf_level}, GUI lag {app._gui_lag * 1000:.0f} ms",
+            f"Open connections    {len(m.flows.active)} (evicted "
+            f"{m.flows.evicted})",
+            f"Active threads      {len(threads)}: {', '.join(threads)}",
+            f"Data folder         {PATHS.data}",
+            f"Cache folder        {PATHS.cache}",
+            f"Log file            {PATHS.log_file}",
+            f"Config file         {app.config.path}",
+            f"History             " + (app.history_status_text()
+                                       .replace("\n", " ")),
+            "Optional databases:"] + [f"   {s}" for s in
+                                      app.data.summary_lines()]
+        return "\n".join(lines)
+
+    def refresh(self):
+        if not self.alive():
+            return
+        y = self.txt.yview()[0]
+        self.txt.config(state="normal")
+        self.txt.delete("1.0", "end")
+        self.txt.insert("end", self.info())
+        self.txt.config(state="disabled")
+        self.txt.yview_moveto(y)
+        self.win.after(2000, self.refresh)
+
+    def copy(self):
+        copy_to_clipboard(self.app, self.info())
+
+    def export(self):
+        path = filedialog.asksaveasfilename(
+            parent=self.win, defaultextension=".txt",
+            initialfile=time.strftime("miniwireshark-diagnostics-%Y%m%d.txt"))
+        if not path:
+            return
+        tail = ""
+        with contextlib.suppress(OSError):
+            with open(PATHS.log_file, "r", encoding="utf-8",
+                      errors="ignore") as f:
+                tail = "".join(f.readlines()[-300:])
+        try:
+            atomic_write_text(path, self.info() + "\n\n--- recent log ---\n" +
+                              tail)
+            self.result_var.set(f"Saved {path}")
+        except OSError as e:
+            self.result_var.set(f"Couldn't save: {e}")
+
+    def _bg(self, fn, label):
+        self.result_var.set(f"{label}…")
+
+        def run():
+            try:
+                msg = fn()
+            except Exception as e:                   # noqa: BLE001
+                msg = f"{label} failed: {e}"
+            self.app._async_results.put(lambda: self.result_var.set(msg)
+                                        if self.alive() else None)
+        threading.Thread(target=run, daemon=True, name="diag-test").start()
+
+    def _quiet_ok(self):
+        if self.app.config.get("mode.active_scanning", True):
+            return True
+        return messagebox.askyesno(
+            "Quiet Mode", "Quiet Mode is on. This test sends a tiny amount of "
+            "traffic (you asked for it). Run it anyway?", parent=self.win)
+
+    def test_capture(self):
+        app = self.app
+        if app.sniffer is not None:
+            start = app.count
+            self.result_var.set("Counting packets for 5 seconds…")
+            self.win.after(5000, lambda: self.result_var.set(
+                f"Capture is running: {app.count - start} packets in 5 s "
+                f"on “{app.current_iface_label}”.") if self.alive()
+                else None)
+            return
+        iface = app.iface_map.get(app.iface_var.get())
+
+        def run():
+            box = []
+            s, err = build_sniffer(iface, lambda p: box.append(1), None)
+            if s is None:
+                return f"Capture engine could not start: {err}"
+            time.sleep(3)
+            with contextlib.suppress(Exception):
+                s.stop()
+            return (f"Capture engine works: {len(box)} packets in 3 s on "
+                    f"“{app.iface_var.get()}”." if box else
+                    "The engine started but saw no packets in 3 s — the "
+                    "card may be idle or the wrong one.")
+        self._bg(run, "Testing the capture engine")
+
+    def test_dns(self):
+        if not self._quiet_ok():
+            return
+
+        def run():
+            t0 = time.perf_counter()
+            infos = _socket.getaddrinfo("www.example.com", 443,
+                                        proto=_socket.IPPROTO_TCP)
+            ms = (time.perf_counter() - t0) * 1000
+            return (f"DNS works: www.example.com → {infos[0][4][0]} in "
+                    f"{ms:.0f} ms (may be cached by your computer).")
+        self._bg(run, "Testing DNS")
+
+    def test_internet(self):
+        if not self._quiet_ok():
+            return
+        target = self.app.config.get("health.internet_target", "1.1.1.1:443")
+
+        def run():
+            host, _, port = target.rpartition(":")
+            ok, ms = HealthProber._tcp_rtt(host, int(port), timeout=4)
+            return (f"Internet reachable: {target} answered in {ms:.0f} ms."
+                    if ok else f"Could not reach {target}.")
+        self._bg(run, "Testing the Internet connection")
+
+
+class CrashDialog:
+    _open = False
+
+    @classmethod
+    def show(cls, app, text):
+        with contextlib.suppress(OSError):
+            atomic_write_text(PATHS.crash_marker, text)
+        if cls._open:
+            return
+        cls._open = True
+        try:
+            path = app.autosave("crash")
+        except Exception:                            # noqa: BLE001
+            path = None
+        t = app.theme
+        win = tk.Toplevel(app.root)
+        win.title("Something went wrong")
+        win.geometry("620x420")
+        win.configure(bg=t["tab_bg"])
+        tk.Label(win, text="\U0001F915  MiniWireshark hit an unexpected problem",
+                 bg=t["tab_bg"], fg=t["text_fg"],
+                 font=("TkDefaultFont", 13, "bold")).pack(anchor="w",
+                                                          padx=14, pady=(12, 2))
+        tk.Label(win, text="It's usually safe to keep going. The details "
+                           "below are also in the log file." +
+                           (f" Your session was saved to {path}." if path
+                            else ""),
+                 bg=t["tab_bg"], fg=t["muted_fg"], wraplength=580,
+                 justify="left").pack(anchor="w", padx=14)
+        txt = tk.Text(win, height=12, bg=t["text_bg"], fg=t["text_fg"],
+                      font=app.mono, relief="flat", highlightthickness=0)
+        txt.insert("1.0", text[-4000:])
+        txt.config(state="disabled")
+        txt.pack(fill="both", expand=True, padx=14, pady=8)
+        bar = tk.Frame(win, bg=t["tab_bg"])
+        bar.pack(fill="x", padx=14, pady=(0, 12))
+
+        def close():
+            cls._open = False
+            win.destroy()
+
+        def restart():
+            LOG.info("restart requested from crash dialog")
+            try:
+                subprocess.Popen([sys.executable, SCRIPT_PATH] +
+                                 [a for a in sys.argv[1:]
+                                  if a != SELF_TEST_FLAG] + [ELEVATED_FLAG])
+            except OSError as e:
+                messagebox.showerror("Restart", str(e), parent=win)
+                return
+            app._on_close()
+        ttk.Button(bar, text="Continue", style="Accent.TButton",
+                   command=close).pack(side="right")
+        ttk.Button(bar, text="Restart MiniWireshark",
+                   command=restart).pack(side="right", padx=6)
+        ttk.Button(bar, text="Open log",
+                   command=lambda: _open_path(PATHS.logs)).pack(side="left")
+        ttk.Button(bar, text="Copy error", command=lambda: copy_to_clipboard(
+            app, text)).pack(side="left", padx=6)
+        win.protocol("WM_DELETE_WINDOW", close)
+
+
+def apply_self_update(data, tag):
+    """Validate, back up, atomically replace. Never destroys the only
+    working copy: the backup stays until the new version has run fine."""
+    if not data or len(data) < 50_000:
+        raise ValueError("the downloaded file is too small to be "
+                         "MiniWireshark")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as e:
+        raise ValueError(f"the download isn't a text file ({e})")
+    if "MiniWireshark" not in text or "def main" not in text:
+        raise ValueError("the download doesn't look like MiniWireshark")
+    compile(text, "miniwireshark_update.py", "exec")
+    backup = f"{SCRIPT_PATH}.v{SCRIPT_VERSION}.bak"
+    shutil.copy2(SCRIPT_PATH, backup)
+    tmp = SCRIPT_PATH + ".new"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+    os.replace(tmp, SCRIPT_PATH)
+    atomic_write_json(PATHS.update_marker, {
+        "backup": backup, "version": tag, "from": SCRIPT_VERSION,
+        "time": time.time(), "attempts": 0})
+    LOG.info("installed update %s (backup %s)", tag, backup)
+    return (f"MiniWireshark {tag} was installed. Restart it to use the new "
+            f"version. A backup of {SCRIPT_VERSION} is at:\n{backup}\nIf the "
+            f"new version fails to start, the backup is restored "
+            f"automatically.")
+
+
+def rollback_update_if_needed(force=False):
+    """Called at startup (and on a startup crash). Returns a message if a
+    rollback happened."""
+    marker = read_json(PATHS.update_marker, None)
+    if not marker:
+        return ""
+    marker["attempts"] = int(marker.get("attempts", 0)) + 1
+    with contextlib.suppress(OSError):
+        atomic_write_json(PATHS.update_marker, marker)
+    if not force and marker["attempts"] < 3:
+        return ""
+    backup = marker.get("backup", "")
+    if backup and os.path.exists(backup):
+        try:
+            shutil.copy2(backup, SCRIPT_PATH)
+            os.remove(PATHS.update_marker)
+            LOG.warning("rolled back update %s", marker.get("version"))
+            return (f"The update to {marker.get('version')} didn't start "
+                    f"correctly, so the previous version "
+                    f"({marker.get('from')}) was restored. Please start "
+                    f"MiniWireshark again.")
+        except OSError as e:
+            return f"Rolling back the update failed: {e}. Backup: {backup}"
+    return ""
+
+
+
+# ============================================================================
+#  20.  Demo mode — simulated, clearly-labelled, never mixed with real data
+#
+#  The generator builds ordinary packets and pushes them through the SAME
+#  decoder and analysis as live capture, so every tab behaves for real.
+#  Domains use the reserved ".example" names. Nothing is transmitted.
+# ============================================================================
+def build_client_hello(sni, alpn=("h2", "http/1.1"), pad=600):
+    """A syntactically valid TLS 1.3-style ClientHello (used by Demo Mode
+    and the self-tests)."""
+    host = sni.encode("ascii")
+    ext_sni = struct.pack(">HHHBH", 0, len(host) + 5, len(host) + 3, 0,
+                          len(host)) + host
+    al = b"".join(bytes([len(a)]) + a.encode() for a in alpn)
+    ext_alpn = struct.pack(">HHH", 16, len(al) + 2, len(al)) + al
+    ext_ver = struct.pack(">HHB", 43, 5, 4) + b"\x03\x04\x03\x03"
+    ext_pad = struct.pack(">HH", 21, pad) + b"\x00" * pad
+    exts = ext_ver + ext_pad + ext_alpn + ext_sni
+    body = (b"\x03\x03" + os.urandom(32) + b"\x00" + b"\x00\x04\x13\x01\x13"
+            b"\x02" + b"\x01\x00" + struct.pack(">H", len(exts)) + exts)
+    hs = b"\x01" + struct.pack(">I", len(body))[1:] + body
+    return b"\x16\x03\x01" + struct.pack(">H", len(hs)) + hs
+
+
+class DemoGenerator(threading.Thread):
+    GW = ("192.168.50.1", "02:00:5e:10:00:01")
+    ME = ("192.168.50.10", "02:00:5e:10:00:10")
+    DEVICES = [
+        # ip, mac, dhcp hostname, vendor class, mdns service/name/txt
+        ("192.168.50.23", "da:a1:19:23:45:67", "Alex-iPhone", "", None),
+        ("192.168.50.40", "f4:f5:d8:40:00:40", "", "",
+         ("_googlecast._tcp", "Living Room TV", {"md": "Chromecast",
+                                                 "fn": "Living Room TV"})),
+        ("192.168.50.50", "00:80:77:50:00:50", "BRW008077500050", "",
+         ("_ipp._tcp", "Brother HL-L2350DW", {"ty": "Brother HL-L2350DW"})),
+        ("192.168.50.60", "24:0a:c4:60:00:60", "ESP_6A1B2C", "udhcp 1.30",
+         None),
+        ("192.168.50.70", "00:11:32:70:00:70", "family-nas", "",
+         ("_smb._tcp", "family-nas", {"model": "DS220+"})),
+    ]
+    LATE = ("192.168.50.88", "3c:22:fb:88:00:88", "DESKTOP-GUEST7Q",
+            "MSFT 5.0")
+    SITES = [("www.example.com", "93.184.215.14"),
+             ("news.example.org", "151.101.65.69"),
+             ("video.example.net", "142.250.80.46"),
+             ("cdn.example.net", "104.18.32.47"),
+             ("api.example.com", "34.117.59.81"),
+             ("updates.example.com", "52.84.150.39"),
+             ("photos.example.org", "185.199.108.153"),
+             ("mail.example.com", "23.215.0.136")]
+
+    def __init__(self, out_q):
+        super().__init__(daemon=True, name="demo")
+        self.q = out_q
+        self.stop_flag = False
+        self.t0 = time.time()
+        self.port = 40000
+
+    def stop(self):
+        self.stop_flag = True
+
+    def _emit(self, p):
+        try:
+            pkt = Ether(bytes(p))
+            pkt.time = time.time()
+            self.q.put(pkt, timeout=0.5)
+        except queue.Full:
+            pass
+
+    def _eth(self, src, dst):
+        return Ether(src=src[1], dst=dst[1] if isinstance(dst, tuple)
+                     else dst)
+
+    def _dhcp(self, ip, mac, host, vc):
+        chaddr = bytes.fromhex(mac.replace(":", ""))
+        opts = [("message-type", "request"), ("requested_addr", ip)]
+        if host:
+            opts.append(("hostname", host.encode()))
+        if vc:
+            opts.append(("vendor_class_id", vc.encode()))
+        self._emit(Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+                   IP(src="0.0.0.0", dst="255.255.255.255") /
+                   UDP(sport=68, dport=67) / BOOTP(chaddr=chaddr) /
+                   DHCP(options=opts + ["end"]))
+        self._emit(Ether(src=self.GW[1], dst=mac) /
+                   IP(src=self.GW[0], dst=ip) / UDP(sport=67, dport=68) /
+                   BOOTP(op=2, yiaddr=ip, chaddr=chaddr) /
+                   DHCP(options=[("message-type", "ack"),
+                                 ("lease_time", 86400),
+                                 ("router", self.GW[0]),
+                                 ("name_server", self.GW[0]), "end"]))
+
+    def _mdns(self, ip, mac, svc, name, txt):
+        txtv = [f"{k}={v}".encode() for k, v in txt.items()]
+        self._emit(Ether(src=mac, dst="01:00:5e:00:00:fb") /
+                   IP(src=ip, dst="224.0.0.251", ttl=255) /
+                   UDP(sport=5353, dport=5353) /
+                   DNS(qr=1, aa=1, qd=None,
+                       an=DNSRR(rrname=f"{svc}.local", type="PTR",
+                                rdata=f"{name}.{svc}.local"),
+                       ar=[DNSRR(rrname=f"{name}.{svc}.local", type="TXT",
+                                 rdata=txtv),
+                           DNSRR(rrname=f"{name.replace(' ', '-')}.local",
+                                 rdata=ip)]))
+
+    def _visit(self, dev, site, sip, size=40000):
+        ip, mac = dev[0], dev[1]
+        self.port += 1
+        sp = self.port
+        qid = random.randint(1, 65000)
+        self._emit(Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=self.GW[0])
+                   / UDP(sport=sp, dport=53) /
+                   DNS(id=qid, rd=1, qd=DNSQR(qname=site)))
+        time.sleep(0.02)
+        self._emit(Ether(src=self.GW[1], dst=mac) / IP(src=self.GW[0], dst=ip)
+                   / UDP(sport=53, dport=sp) /
+                   DNS(id=qid, qr=1, qd=DNSQR(qname=site),
+                       an=DNSRR(rrname=site, rdata=sip, ttl=300)))
+        seq = random.randint(1000, 10 ** 9)
+        base = Ether(src=mac, dst=self.GW[1]) / IP(src=ip, dst=sip)
+        back = Ether(src=self.GW[1], dst=mac) / IP(src=sip, dst=ip, ttl=54)
+        self._emit(base / TCP(sport=sp, dport=443, flags="S", seq=seq))
+        self._emit(back / TCP(sport=443, dport=sp, flags="SA", seq=7,
+                              ack=seq + 1))
+        hello = build_client_hello(site)
+        self._emit(base / TCP(sport=sp, dport=443, flags="PA", seq=seq + 1) /
+                   Raw(hello))
+        sent = 0
+        s2 = 8
+        while sent < size and not self.stop_flag:
+            chunk = min(1400, size - sent)
+            self._emit(back / TCP(sport=443, dport=sp, flags="A", seq=s2) /
+                       Raw(b"\x17\x03\x03" + b"\x00" * (chunk - 3)))
+            s2 += chunk
+            sent += chunk
+        self._emit(base / TCP(sport=sp, dport=443, flags="FA",
+                              seq=seq + 1 + len(hello)))
+        self._emit(back / TCP(sport=443, dport=sp, flags="FA", seq=s2))
+
+    def run(self):
+        try:
+            self._run()
+        except Exception:                            # noqa: BLE001
+            LOG.exception("demo generator")
+
+    def _run(self):
+        gw, me = self.GW, self.ME
+        for dev in [me] + self.DEVICES:
+            self._emit(Ether(src=dev[1], dst="ff:ff:ff:ff:ff:ff") /
+                       ARP(op=1, psrc=dev[0], pdst=gw[0], hwsrc=dev[1]))
+            self._emit(Ether(src=gw[1], dst=dev[1]) /
+                       ARP(op=2, psrc=gw[0], hwsrc=gw[1], pdst=dev[0],
+                           hwdst=dev[1]))
+            self._emit(Ether(src=dev[1], dst=gw[1]) /
+                       ARP(op=2, psrc=dev[0], hwsrc=dev[1], pdst=gw[0],
+                           hwdst=gw[1]))
+        for ip, mac, host, vc, md in self.DEVICES:
+            self._dhcp(ip, mac, host, vc)
+            if md:
+                self._mdns(ip, mac, *md)
+        self._emit(Ether(src=gw[1], dst="33:33:00:00:00:01") /
+                   IPv6(src="fe80::1", dst="ff02::1") / ICMPv6ND_RA() /
+                   ICMPv6NDOptSrcLLAddr(lladdr=gw[1]))
+        tv = self.DEVICES[1]
+        self._emit(Ether(src=tv[1], dst="01:00:5e:7f:ff:fa") /
+                   IP(src=tv[0], dst="239.255.255.250") /
+                   UDP(sport=1900, dport=1900) /
+                   Raw(b"NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
+                       b"NT: urn:dial-multiscreen-org:service:dial:1\r\n"
+                       b"SERVER: Linux/4.9 UPnP/1.0 Chromecast/1.56\r\n\r\n"))
+        tick = 0
+        late_done = ftp_done = ssh_done = False
+        while not self.stop_flag:
+            tick += 1
+            people = [me, self.DEVICES[0], self.DEVICES[1]]
+            dev = random.choice(people)
+            site, sip = random.choice(self.SITES)
+            big = dev is self.DEVICES[1] and site.startswith("video")
+            self._visit(dev, site, sip, size=random.choice(
+                (8000, 20000, 60000)) * (8 if big else 1))
+            if tick % 4 == 0:
+                plug = self.DEVICES[3]
+                self._emit(Ether(src=plug[1], dst=gw[1]) /
+                           IP(src=plug[0], dst="129.6.15.28") /
+                           UDP(sport=12345, dport=123) / Raw(b"\x1b" +
+                                                              b"\x00" * 47))
+            if tick % 6 == 0:
+                for dv in self.DEVICES:
+                    self._emit(Ether(src=dv[1], dst=me[1]) /
+                               ARP(op=2, psrc=dv[0], hwsrc=dv[1],
+                                   pdst=me[0], hwdst=me[1]))
+            elapsed = time.time() - self.t0
+            if elapsed > 45 and not late_done:
+                late_done = True
+                ip, mac, host, vc = self.LATE
+                self._dhcp(ip, mac, host, vc)
+                self._visit((ip, mac), "www.example.com", "93.184.215.14")
+            if elapsed > 25 and not ftp_done:
+                ftp_done = True
+                pr = self.DEVICES[2]
+                b = Ether(src=pr[1], dst=gw[1]) / IP(src=pr[0],
+                                                     dst="34.117.59.81")
+                self._emit(b / TCP(sport=40500, dport=21, flags="S"))
+                self._emit(Ether(src=gw[1], dst=pr[1]) /
+                           IP(src="34.117.59.81", dst=pr[0]) /
+                           TCP(sport=21, dport=40500, flags="SA"))
+                self._emit(b / TCP(sport=40500, dport=21, flags="PA") /
+                           Raw(b"USER scanner\r\n"))
+            if elapsed > 35 and not ssh_done:
+                ssh_done = True
+                ph = self.DEVICES[0]
+                self._emit(Ether(src=ph[1], dst=me[1]) /
+                           IP(src=ph[0], dst=me[0]) /
+                           TCP(sport=50022, dport=22, flags="S"))
+                self._emit(Ether(src=me[1], dst=ph[1]) /
+                           IP(src=me[0], dst=ph[0]) /
+                           TCP(sport=22, dport=50022, flags="SA"))
+                self._emit(Ether(src=me[1], dst=ph[1]) /
+                           IP(src=me[0], dst=ph[0]) /
+                           TCP(sport=22, dport=50022, flags="PA") /
+                           Raw(b"SSH-2.0-OpenSSH_9.6\r\n"))
+            for _ in range(int(random.uniform(8, 20))):
+                if self.stop_flag:
+                    return
+                time.sleep(0.1)
+
+
+# ============================================================================
+#  20b.  Self-tests  —  python miniwireshark.py --self-test
+#
+#  No administrator rights and no packet capture needed. Packet-based tests
+#  build synthetic packets with scapy and are skipped if it's missing.
+# ============================================================================
+class _FakeClock:
+    def __init__(self, t=1_700_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def run_self_tests(verbose=True):
+    results = []
+    tmp = tempfile.mkdtemp(prefix="mw_selftest_")
+
+    def cfg(extra=None):
+        c = AppConfig(path=os.path.join(tmp, f"cfg_{uuid.uuid4().hex}.json"))
+        for k, v in (extra or {}).items():
+            c.set(k, v)
+        return c
+
+    def test(fn):
+        name = fn.__name__[2:].replace("_", " ")
+        t0 = time.perf_counter()
+        try:
+            r = fn()
+            status = "SKIP" if r == "skip" else "PASS"
+            msg = "" if status == "PASS" else "scapy not available"
+        except Exception as e:                       # noqa: BLE001
+            status, msg = "FAIL", f"{type(e).__name__}: {e}\n" + \
+                traceback.format_exc(limit=4)
+        results.append((status, name, msg, time.perf_counter() - t0))
+        if verbose:
+            print(f"  [{status}] {name} ({(time.perf_counter() - t0) * 1000:.0f}"
+                  f" ms){(' — ' + msg.splitlines()[0]) if msg else ''}")
+
+    scapy_ok = True
+    try:
+        load_scapy()
+    except Exception:                                # noqa: BLE001
+        scapy_ok = False
+
+    def need_scapy():
+        return not scapy_ok
+
+    # ---- configuration --------------------------------------------------------
+    def t_config_migration():
+        p = os.path.join(tmp, "old.json")
+        with open(p, "w") as f:
+            json.dump({"config_version": 1, "performance":
+                       {"cpu_friendly_mode": True},
+                       "appearance": {"theme": "Dark"},
+                       "shortcuts": {"start": "<Control-g>"}}, f)
+        c = AppConfig(path=p)
+        assert c.get("performance.mode") == "Low CPU"
+        assert c.get("appearance.theme") == "Dark"
+        assert c.get("shortcuts.start") == "<Control-g>"
+        assert c.get("shortcuts.stop") == DEFAULT_SHORTCUTS["stop"]
+        assert c.get("history.enabled") is False
+        assert c.data["config_version"] == CONFIG_SCHEMA_VERSION
+        with open(p, "w") as f:
+            f.write("{broken")
+        c2 = AppConfig(path=p)
+        assert c2.warning and c2.get("appearance.theme") == "Light"
+        assert os.path.exists(p + ".damaged")
+
+    def t_settings_schema_has_defaults():
+        flat = config_defaults_flat()
+        for key in settings_schema_keys():
+            assert key in flat, f"settings control without default: {key}"
+        for page in SETTINGS_PAGES:
+            for sec in page["sections"]:
+                for c in sec["controls"]:
+                    if c.get("type") == "action":
+                        for _label, name in c["actions"]:
+                            assert name, "empty action"
+        msgs = settings_conflicts({"health.active_checks": True,
+                                   "mode.active_scanning": False})
+        assert msgs and "Quiet" in msgs[0]
+
+    def t_theme_mappings():
+        for name, table in PALETTES.items():
+            vals = list(table.values())
+            assert len(vals) == len(set(vals)), f"{name} not one-to-one"
+        keys = set(THEME_LIGHT)
+        for name, th in THEMES.items():
+            assert set(th) == keys, f"theme {name} missing tokens"
+            for k, v in th.items():
+                assert re.match(r"^#[0-9a-f]{6}$", v), f"{name}.{k}={v}"
+        assert _CANON[LIGHT_TO_DARK_HEX["#ffffff"]] == "#ffffff"
+
+    def t_confidence_scoring():
+        d = DeviceRecord(key="aa:bb:cc:00:00:01")
+        assert d.confidence == CONFIDENCE_UNCONFIRMED
+        d.add_evidence("local_traffic", "x")
+        d.add_evidence("local_traffic", "y")
+        assert d.score == 10 and d.confidence == CONFIDENCE_LOW
+        d.add_evidence("mac_local", "z")
+        assert d.score == 50 and d.confidence == CONFIDENCE_MEDIUM
+        d.add_evidence("arp_reply", "a")
+        assert d.score == 75 and d.confidence == CONFIDENCE_HIGH
+        for _ in range(200):
+            d.add_evidence("local_traffic", "spam")
+            d.add_evidence("rdns", "spam")
+        assert d.score == 77, d.score       # strong evidence never pushed out
+
+    def t_mac_randomization():
+        assert is_randomized_mac("da:a1:19:23:45:67")
+        assert is_randomized_mac("02:00:00:00:00:01")
+        assert not is_randomized_mac("00:11:22:33:44:55")
+        assert not is_unicast_mac("01:00:5e:00:00:fb")
+        assert not is_unicast_mac("ff:ff:ff:ff:ff:ff")
+        assert is_unicast_mac("00:11:22:33:44:55")
+        assert mac_vendor("da:a1:19:23:45:67") == ""
+
+    def t_device_lifecycle():
+        clk = _FakeClock()
+        c = cfg({"devices.idle_minutes": 2, "devices.inactive_minutes": 10,
+                 "devices.expire_minutes": 60})
+        reg = DeviceRegistry("192.168.1.1", [], c, clk)
+        reg.local_nets = [ipaddress.ip_network("192.168.1.0/24")]
+        d = reg.touch("192.168.1.5", "00:11:22:33:44:55", "mac_local", "x")
+        assert d.state == STATE_ACTIVE and d.presence[-1][1] is None
+        clk.t += 180
+        reg.tick_lifecycle()
+        assert d.state == STATE_IDLE
+        clk.t += 600
+        inact, _ = reg.tick_lifecycle()
+        assert d.state == STATE_INACTIVE and inact == [d]
+        assert d.presence[-1][1] is not None
+        clk.t += 60
+        reg.touch("192.168.1.5", "00:11:22:33:44:55", "arp_reply", "y")
+        assert d.state == STATE_ACTIVE and d.reactivated_now
+        assert len(d.presence) == 2 and d.presence[-1][1] is None
+        clk.t += 4000
+        _, exp = reg.tick_lifecycle()
+        assert d.state == STATE_EXPIRED and exp == [d]
+        # lease expiry
+        reg.note_dhcp_lease("192.168.1.9", "00:11:22:33:44:66", "pc", 100)
+        clk.t += 200
+        reg.tick_lifecycle()
+        assert "192.168.1.9" not in reg.dhcp_leases
+
+    def t_public_ip_never_a_device():
+        c = cfg()
+        m = NetworkModel(c, "192.168.1.1", ["192.168.1.20"],
+                         ["00:00:00:00:00:20"], now_fn=_FakeClock())
+        m.set_identity(local_nets=[ipaddress.ip_network("192.168.1.0/24")])
+        reg = m.registry
+        dev = reg.touch("8.8.8.8", "00:11:22:33:44:01", "mac_local", "x")
+        assert dev is not None and dev.ip == "" and \
+            "8.8.8.8" not in reg.ip_to_key
+        assert reg.touch("224.0.0.251", None, "mac_local", "x") is None
+        assert reg.touch(None, "01:00:5e:00:00:fb", "mac_local", "x") is None
+        assert not reg.eligible_ip("192.168.1.255")
+        assert reg.eligible_ip("fe80::1")
+        assert not reg.eligible_ip("2001:4860::1")
+        reg.v6_prefixes = [ipaddress.ip_network("2a01:4f8:1::/64")]
+        assert reg.eligible_ip("2a01:4f8:1::5")
+        if not scapy_ok:
+            return
+        p = Ether(src="00:11:22:33:44:01", dst="00:00:00:00:00:20") / \
+            IP(src="93.184.215.14", dst="192.168.1.20") / \
+            TCP(sport=443, dport=5555, flags="A")
+        d = decode_packet(Ether(bytes(p)))
+        m.ingest(d)
+        assert all(not (dv.ip and is_public_ip(dv.ip))
+                   for dv in reg.by_key.values())
+        assert "93.184.215.14" in m.remote_hosts
+        assert "93.184.215.14" not in reg.ip_to_key
+
+    def t_device_merge_rules():
+        clk = _FakeClock()
+        c = cfg()
+        reg = DeviceRegistry("", [], c, clk)
+        a = reg.touch("192.168.1.30", "da:00:00:00:00:01", "mac_local", "x")
+        reg._set_dhcp_hostname(a, "Alexs-MacBook-Pro", clk.t)
+        clk.t += 100
+        a.state = STATE_INACTIVE
+        a.presence_close(clk.t)
+        clk.t += 900
+        b = reg.touch("192.168.1.31", "da:00:00:00:00:02", "mac_local", "x")
+        reg._set_dhcp_hostname(b, "Alexs-MacBook-Pro", clk.t)
+        assert reg.merge_candidates(b)
+        merged = reg.auto_merge_pass()
+        assert merged == [(b.key, a.key)], merged
+        assert a.key not in reg.by_key and b.merge_history
+        restored = reg.split(b.key, 0)
+        assert restored is not None and restored.key in reg.by_key
+        assert restored.key in b.never_merge
+        assert reg.auto_merge_pass() == []          # never re-merged
+        # overlapping activity → never auto-merged
+        c2 = cfg()
+        reg2 = DeviceRegistry("", [], c2, clk)
+        x = reg2.touch("192.168.1.40", "da:00:00:00:00:03", "mac_local", "x")
+        y = reg2.touch("192.168.1.41", "da:00:00:00:00:04", "mac_local", "x")
+        clk.t += 300
+        for dv in (x, y):
+            reg2.touch(dv.ip, dv.mac, "mac_local", "again")
+            reg2._set_dhcp_hostname(dv, "kitchen-tablet-7", clk.t)
+        x.state = STATE_INACTIVE
+        x.presence_close(clk.t)
+        clk.t += 600
+        assert reg2.auto_merge_pass() == []
+        # generic names never merge
+        reg3 = DeviceRegistry("", [], cfg(), clk)
+        g1 = reg3.touch("10.0.0.2", "da:00:00:00:00:05", "mac_local", "x")
+        reg3._set_dhcp_hostname(g1, "iPhone", clk.t)
+        g1.state = STATE_INACTIVE
+        g1.presence_close(clk.t)
+        clk.t += 500
+        g2 = reg3.touch("10.0.0.3", "da:00:00:00:00:06", "mac_local", "x")
+        reg3._set_dhcp_hostname(g2, "iPhone", clk.t)
+        assert reg3.auto_merge_pass() == []
+
+    def t_registrable_domain():
+        assert registrable_domain("www.example.co.uk") == "example.co.uk"
+        assert registrable_domain("a.b.example.com") == "example.com"
+        assert registrable_domain("example.com") == "example.com"
+        p = os.path.join(tmp, "psl.dat")
+        with open(p, "w") as f:
+            f.write("// ===BEGIN ICANN DOMAINS===\ncom\nuk\nco.uk\n*.ck\n"
+                    "!www.ck\ngithub.io\n")
+        psl = load_psl(p)
+        assert psl.registrable("x.y.example.co.uk") == "example.co.uk"
+        assert psl.registrable("foo.bar.ck") == "foo.bar.ck"
+        assert psl.registrable("a.www.ck") == "www.ck"
+        assert psl.registrable("me.github.io") == "me.github.io"
+        assert psl.registrable("cdn.me.github.io") == "me.github.io"
+
+    def t_dns_parsing():
+        if need_scapy():
+            return "skip"
+        q = Ether(bytes(Ether() / IP(src="192.168.1.5", dst="192.168.1.1") /
+                        UDP(sport=5000, dport=53) /
+                        DNS(id=7, rd=1, qd=DNSQR(qname="www.example.com"))))
+        d = decode_packet(q)
+        assert d["proto"] == "DNS" and d["dns"]["qr"] == 0 and \
+            d["dns"]["qname"] == "www.example.com"
+        r = Ether(bytes(Ether() / IP(src="192.168.1.1", dst="192.168.1.5") /
+                        UDP(sport=53, dport=5000) /
+                        DNS(id=7, qr=1, qd=DNSQR(qname="www.example.com"),
+                            an=[DNSRR(rrname="www.example.com",
+                                      type="CNAME", rdata="edge.example.net"),
+                                DNSRR(rrname="edge.example.net",
+                                      rdata="93.184.215.14")])))
+        d = decode_packet(r)
+        assert d["dns"]["answers"] == ["93.184.215.14"], d["dns"]
+        assert ("93.184.215.14", "www.example.com") in d["learns"]
+        nx = Ether(bytes(Ether() / IP() / UDP(sport=53, dport=5000) /
+                         DNS(id=8, qr=1, rcode=3,
+                             qd=DNSQR(qname="nope.example"))))
+        assert "does not exist" in decode_packet(nx)["text"]
+        t = Ether(bytes(Ether() / IP(src="192.168.1.5", dst="9.9.9.9") /
+                        TCP(sport=5001, dport=53, flags="PA") /
+                        Raw(b"\x00\x1d" + bytes(DNS(rd=1, qd=DNSQR(
+                            qname="example.com"))))))
+        d = decode_packet(t)
+        assert d["proto"] == "DNS" and d["dns"]["transport"] == "TCP"
+        md = Ether(bytes(Ether(src="00:11:22:33:44:66",
+                               dst="01:00:5e:00:00:fb") /
+                         IP(src="192.168.1.60", dst="224.0.0.251") /
+                         UDP(sport=5353, dport=5353) /
+                         DNS(qr=1, qd=None,
+                             an=DNSRR(rrname="_googlecast._tcp.local",
+                                      type="PTR",
+                                      rdata="TV._googlecast._tcp.local"),
+                             ar=DNSRR(rrname="TV._googlecast._tcp.local",
+                                      type="TXT", rdata=[b"md=Chromecast"]))))
+        d = decode_packet(md)
+        assert d["mdns"] and "_googlecast._tcp" in d["mdns"]["services"]
+        assert d["mdns"]["txt"].get("md") == "Chromecast"
+        assert "TV" in d["mdns"]["names"]
+
+    def t_tls_sni_parser():
+        ch = build_client_hello("secure.example.com", pad=1400)
+        info = parse_tls_hello(ch)
+        assert info["sni"] == "secure.example.com"
+        assert info["version"] == "TLS 1.3" and "h2" in info["alpn"]
+        assert _try_tls_sni(ch) == "secure.example.com"
+        r = TlsReassembler()
+        key = ("1.1.1.1", 1, "2.2.2.2", 443)
+        assert r.feed(key, 1000, ch[:700], 0.0) is None
+        assert r.feed(key, 1700, ch[700:1400], 0.1) is None
+        full = r.feed(key, 2400, ch[1400:], 0.2)
+        assert full == ch and parse_tls_hello(full)["sni"] == \
+            "secure.example.com"
+        assert parse_tls_hello(b"\x17\x03\x03\x00\x05hello") is None
+        assert parse_tls_hello(ch[:60]) is not None   # truncated: no crash
+        if need_scapy():
+            return
+        base = Ether() / IP(src="192.168.1.5", dst="93.184.215.14")
+        rs = TlsReassembler()
+        p1 = Ether(bytes(base / TCP(sport=4000, dport=443, flags="PA",
+                                    seq=10) / Raw(ch[:1000])))
+        p2 = Ether(bytes(base / TCP(sport=4000, dport=443, flags="PA",
+                                    seq=1010) / Raw(ch[1000:])))
+        assert decode_packet(p1, reasm=rs)["tls"] is None
+        d2 = decode_packet(p2, reasm=rs)
+        assert d2["tls"]["sni"] == "secure.example.com", d2["tls"]
+
+    def t_flow_aggregation():
+        if need_scapy():
+            return "skip"
+        clk = _FakeClock(1000.0)
+        c = cfg()
+        m = NetworkModel(c, "192.168.1.1", ["192.168.1.20"], [], clk)
+        m.set_identity(local_nets=[ipaddress.ip_network("192.168.1.0/24")])
+        L, R = ("192.168.1.20", "00:00:00:00:00:20"), ("8.8.4.4", "00:00:"
+                                                       "00:00:00:01")
+        seq = [0]
+
+        def pkt(out, flags, payload=b"", s=None):
+            src, dst = (L, R) if out else (R, L)
+            p = Ether(src=src[1] if out else R[1], dst=R[1] if out else L[1]) \
+                / IP(src=src[0], dst=dst[0]) / \
+                TCP(sport=5555 if out else 443, dport=443 if out else 5555,
+                    flags=flags, seq=s if s is not None else 1)
+            if payload:
+                p = p / Raw(payload)
+            d = decode_packet(Ether(bytes(p)))
+            seq[0] += 1
+            d["time"] = 1000.0 + seq[0]
+            clk.t = d["time"]
+            m.ingest(d)
+            return d
+        pkt(True, "S", s=100)
+        pkt(False, "SA", s=900)
+        pkt(True, "PA", b"x" * 100, s=101)
+        pkt(False, "A", b"y" * 1000, s=901)
+        pkt(False, "A", b"y" * 1000, s=901)            # retransmission
+        f = next(iter(m.flows.active.values()))
+        assert f.local_ip == L[0] and f.remote_port == 443
+        assert f.packets_out == 2 and f.packets_in == 3
+        assert f.bytes_in > f.bytes_out and f.retrans == 1
+        assert f.status_text() == "Open" and f.initiator == "local"
+        dev = m.device_for(L[0])
+        assert dev.bytes_up > 0 and dev.bytes_down > dev.bytes_up
+        assert m.metrics.totals["bytes_down"] > m.metrics.totals["bytes_up"]
+        pkt(True, "R", s=201)
+        assert f.rst and f.status_text().startswith("Reset")
+        clk.t += 100
+        m.flows.expire(clk.t)
+        assert f.closed and not m.flows.active and f in m.flows.archive
+
+    def t_alert_debounce():
+        clk = _FakeClock()
+        c = cfg()
+        ae = AlertEngine(c, clk)
+        dev = DeviceRecord(key="00:11:22:33:44:55", ip="192.168.1.9")
+        a1 = ae.new_device(dev)
+        a2 = ae.new_device(dev)
+        assert a1 is a2 and a1.count == 2 and len(ae.order) == 1
+        assert ae.gateway_change("192.168.1.1", 2) is not None
+        assert ae.gateway_change("192.168.1.1", 2) is None     # debounced
+        clk.t += 200
+        assert ae.gateway_change("192.168.1.1", 3) is not None
+        c.set("alerts.muted_devices", [f"new_device|{dev.key}"])
+        a1.acknowledged = True
+        assert ae.new_device(dev) is None
+        c.set("alerts.chatty_device", False)
+        assert ae.chatty_device(dev) is None
+        dev.expected = True
+        assert AlertEngine(cfg(), clk).new_device(dev) is None
+
+    def t_session_roundtrip():
+        clk = _FakeClock()
+        c = cfg()
+        m = NetworkModel(c, "192.168.1.1", ["192.168.1.20"], [], clk)
+        d = m.registry.touch("192.168.1.5", "00:11:22:33:44:55",
+                             "arp_reply", "x")
+        d.alias, d.mine = "Kitchen Pi", True
+        m.register_website("www.example.com", "93.184.215.14", d, "DNS")
+        m.alerts.new_device(d)
+        m.push_timeline("new device", "INFO", "Kitchen Pi joined",
+                        ("device", d.key), d.key)
+        payload = json.loads(json.dumps(SessionCodec.serialize(m),
+                                        default=str))
+        assert payload["schema_version"] == SESSION_SCHEMA_VERSION
+        m2 = NetworkModel(c)
+        SessionCodec.load(payload, m2)
+        d2 = m2.registry.by_key["00:11:22:33:44:55"]
+        assert d2.alias == "Kitchen Pi" and d2.mine and not d2.live
+        assert d2.confidence == d.confidence
+        assert "www.example.com" in m2.websites and m2.alerts.order
+        assert m2.timeline and m2.timeline[-1]["ref"] == ("device", d.key)
+        v1 = {"exported_at": 1.0, "packet_count": 3,
+              "devices": [{"key": "aa:bb:cc:dd:ee:ff", "ip": "10.0.0.4",
+                           "mac": "aa:bb:cc:dd:ee:ff", "hostname": "nas",
+                           "confidence": "High", "score": 80,
+                           "evidence": ["ARP reply", "MAC seen locally"]}],
+              "websites": [{"domain": "Example.ORG", "requests": 2}],
+              "remote_hosts": [{"ip": "1.2.3.4", "ports": [443]}],
+              "alerts": [{"severity": "INFO", "kind": "new_device",
+                          "reason": "nas joined"}]}
+        m3 = NetworkModel(c)
+        SessionCodec.load(v1, m3)
+        d3 = m3.registry.by_key["aa:bb:cc:dd:ee:ff"]
+        assert d3.score > 0 and not d3.live and "example.org" in m3.websites
+        try:
+            SessionCodec.load({"hello": 1}, NetworkModel(c))
+            raise AssertionError("bad session accepted")
+        except ValueError:
+            pass
+
+    def t_display_filters():
+        class Ctx:
+            def device_keys(self, d):
+                return {"dev1"} if d["src_ip"] == "192.168.1.5" else set()
+
+            def names(self, d):
+                return ["www.example.com"] if d["dport"] == 443 else []
+
+            def device_matches(self, d, v):
+                return v == "laptop" and d["src_ip"] == "192.168.1.5"
+
+            def has_alert(self, d, sev):
+                return sev == "WARNING" and d["dst_ip"] == "10.0.0.9"
+
+            def is_marked(self, d):
+                return d.get("no") == 3
+        base = {"proto": "TLS", "tag": "TLS", "transport": "TCP",
+                "src_ip": "192.168.1.5", "dst_ip": "93.184.215.14",
+                "src_mac": "", "dst_mac": "", "sport": 5555, "dport": 443,
+                "length": 1500, "text": "Secure connection", "direction":
+                "up", "flow_id": 12, "no": 3, "dns_names": [], "dns": None}
+        ctx = Ctx()
+        F = DisplayFilter
+        assert F(expr="proto:tls site:example").match(base, ctx)
+        assert not F(expr="proto:dns").match(base, ctx)
+        assert F(expr="proto:dns or port:443").match(base, ctx)
+        assert F(expr="-proto:arp len>1000 dir:up").match(base, ctx)
+        assert not F(expr="not proto:tls").match(base, ctx)
+        assert F(expr="ip:192.168.1.0/24 stream:12 marked").match(base, ctx)
+        assert F(expr='device:laptop').match(base, ctx)
+        assert F(port="443", direction="Upload").match(base, ctx)
+        assert not F(direction="Download").match(base, ctx)
+        assert F(device_key="dev1", site="example").match(base, ctx)
+        assert not F(severity="WARNING").match(base, ctx)
+        for bad in ("port:abc", "dir:sideways", "bogus:1", "or proto:tls",
+                    'site:"unclosed'):
+            try:
+                F(expr=bad)
+                raise AssertionError(f"accepted bad filter {bad}")
+            except ValueError:
+                pass
+
+    def t_historical_buckets():
+        ts = TimeSeries()
+        for i in range(1000):
+            ts.add(1000 + i, 2)
+        assert len(ts.tiers[1]) == 300 and len(ts.tiers[60]) <= 1440
+        s = ts.series(1, 10, 1999)
+        assert len(s) == 10 and all(v == 2 for _b, v in s)
+        assert ts.total_window(10, 6, 1999) == 120
+        m = MetricsEngine()
+        for i in range(120):
+            m.observe_packet(5000 + i, 1000, "down", "TLS")
+            m.observe_packet(5000 + i, 100, "up", "TLS")
+        assert abs(m.rate("bytes_down", 60, 5120) - 1000) < 1
+        assert m.peak["down"] >= 1000 and m.top_protocols()[0][0] == "TLS"
+        g = TimeSeries(gauge=True)
+        g.add(10, 5)
+        g.add(10, 3)
+        assert g.series(1, 1, 10)[0][1] == 5
+
+    def t_dns_tracker():
+        t = DnsTracker()
+        for i in range(25):
+            t.on_query(i, "192.168.1.5", "192.168.1.1",
+                       {"id": i, "qname": "a.example"}, "dev")
+            ms = t.on_response(i + 0.05, "192.168.1.5", "192.168.1.1",
+                               {"id": i, "qname": "a.example", "rcode": 0})
+            assert ms is not None and 49 < ms < 51
+        change = None
+        for i in range(12):
+            c = t.on_query(100 + i, "192.168.1.5", "8.8.8.8",
+                           {"id": 900 + i, "qname": "b.example"}, "dev")
+            change = change or c
+        assert change == ("192.168.1.1", "8.8.8.8"), change
+        assert t.expire(200) == 12 and t.timeouts == 12
+        med, n = t.median_latency()
+        assert n == 25 and 49 < med < 51
+
+    def t_baseline():
+        c = cfg({"alerts.baseline_min_minutes": 10})
+        be = BaselineEngine(c)
+        b = be.get("dev")
+        snaps = []
+        for minute in range(20):
+            for _ in range(30):
+                s = b.observe(minute * 60 + 1, 1000, "sent", "1.1.1.1")
+                if s:
+                    snaps.append(s)
+        assert all(not be.check(s) for s in snaps)
+        for _ in range(9000):
+            b.observe(20 * 60 + 1, 1000, "sent", "1.1.1.1")
+        spike = b.observe(21 * 60 + 1, 10, "sent")
+        found = be.check(spike)
+        assert any(f == "bytes_up" for f, _v, _m in found), found
+        fresh = BaselineEngine(c).get("x")
+        for _ in range(9000):
+            fresh.observe(1, 1000, "sent")
+        assert not be.check(fresh.observe(61, 1, "sent"))
+
+    def t_data_loaders():
+        p = os.path.join(tmp, "manuf_src.txt")
+        with open(p, "w") as f:
+            f.write("# test\n00:11:22\tCimsys\tCIMSYS Inc\n"
+                    "00:1B:C5:00:00:00/36\tTiny\tTiny Corp\n")
+        db = load_oui(p)
+        assert db.lookup("00:11:22:33:44:55") == "CIMSYS Inc"
+        assert db.lookup("00:1b:c5:00:00:01") == "Tiny Corp"
+        dm = DataManager(tmp, cfg({"privacy.auto_download_reference": True}))
+        r = dm.resource("oui")
+        dest, meta = dm._paths(r)
+        shutil.copy(p, dest)
+        atomic_write_json(meta, {"fetched": time.time(), "sha256": "0" * 64})
+        assert dm._verify_and_load(r) is False      # corruption detected
+        assert not os.path.exists(dest)
+        a = os.path.join(tmp, "asn.tsv")
+        with open(a, "w") as f:
+            f.write("1.0.0.0\t1.0.0.255\t13335\tUS\tCLOUDFLARENET\n"
+                    "8.8.8.0\t8.8.8.255\t15169\tUS\tGOOGLE\n")
+        adb = load_asn(a)
+        assert adb.lookup("8.8.8.8") == (15169, "US", "GOOGLE")
+        assert adb.lookup("9.9.9.9") is None
+
+    def t_history_store():
+        hs = HistoryStore(os.path.join(tmp, "h.sqlite3"))
+        hs.write_snapshot({"devices": [("k1", {"a": 1}, 1.0, 2.0, [(1.0,
+                                                                   2.0)],
+                                        (10, 20, 3))],
+                           "alerts": [("x", "new_device", "INFO", "k1", "r",
+                                       time.time())],
+                           "domains": [("example.com", 3, 100)],
+                           "baselines": [("k1", {"n": 5})]})
+        for _ in range(50):
+            if hs.q.empty():
+                break
+            time.sleep(0.05)
+        time.sleep(0.3)
+        assert hs.known_device_rows()[0][0] == "k1"
+        assert hs.load_baselines() == {"k1": {"n": 5}}
+        hs.clear("k1")
+        time.sleep(0.4)
+        assert hs.known_device_rows() == []
+        hs.stop()
+
+    def t_fingerprinting():
+        d = DeviceRecord(key="aa", vendor="Brother Industries")
+        d.services.add("_ipp._tcp")
+        cls, word, why = classify_device(d)
+        assert cls == "Printer" and word == "Likely" and why
+        e = DeviceRecord(key="bb", dhcp_vendor_class="MSFT 5.0",
+                         dhcp_hostname="DESKTOP-AB12CD3")
+        assert classify_device(e)[0] == "Windows PC"
+        f = DeviceRecord(key="cc")
+        assert classify_device(f)[0] == "Unknown"
+        g = DeviceRecord(key="dd", ip="192.168.1.1")
+        assert classify_device(g, gateway_ip="192.168.1.1")[0] == "Router"
+
+    def t_busy_workload():
+        if need_scapy():
+            return "skip"
+        c = cfg()
+        m = NetworkModel(c, "192.168.1.1", ["192.168.1.20"], [])
+        m.set_identity(local_nets=[ipaddress.ip_network("192.168.1.0/24")])
+        protos = []
+        for i in range(60):
+            p = Ether(src=f"00:00:00:00:01:{i:02x}", dst="00:00:00:00:00:01")\
+                / IP(src=f"192.168.1.{30 + i % 50}",
+                     dst=f"34.{i}.{i % 7}.{i % 251}") / \
+                TCP(sport=40000 + i, dport=443, flags="PA") / Raw(b"z" * 500)
+            protos.append(decode_packet(Ether(bytes(p))))
+        t0 = time.perf_counter()
+        n = 20000
+        now = time.time()
+        for i in range(n):
+            d = dict(protos[i % len(protos)])
+            d["time"] = now + i / 1000.0
+            d["sport"] = 40000 + i % 4000
+            m.ingest(d)
+            if i % 2000 == 0:
+                m.tick()
+        dt = time.perf_counter() - t0
+        assert len(m.flows.active) <= m.flows.max_active
+        assert len(m.ev_feed) <= 1500 and len(m.timeline) <= 3000
+        assert dt < 60, f"too slow: {dt:.1f}s for {n} packets"
+        print(f"      ({n / dt:.0f} packets/sec analysed)")
+
+    def t_interface_scoring():
+        if need_scapy():
+            return "skip"
+        recs = score_interfaces("", "")
+        assert isinstance(recs, list)
+        for r in recs:
+            if r["name"] in ("lo", "lo0"):
+                assert r["score"] < 0
+
+    for fn in (t_config_migration, t_settings_schema_has_defaults,
+               t_theme_mappings, t_confidence_scoring, t_mac_randomization,
+               t_device_lifecycle, t_public_ip_never_a_device,
+               t_device_merge_rules, t_registrable_domain, t_dns_parsing,
+               t_tls_sni_parser, t_flow_aggregation, t_alert_debounce,
+               t_session_roundtrip, t_display_filters, t_historical_buckets,
+               t_dns_tracker, t_baseline, t_data_loaders, t_history_store,
+               t_fingerprinting, t_interface_scoring, t_busy_workload):
+        test(fn)
+    shutil.rmtree(tmp, ignore_errors=True)
+    failed = [r for r in results if r[0] == "FAIL"]
+    if verbose:
+        print(f"\n{len(results) - len(failed)} passed / {len(failed)} failed"
+              f" / {sum(1 for r in results if r[0] == 'SKIP')} skipped")
+        for status, name, msg, _t in failed:
+            print(f"\nFAILED: {name}\n{msg}")
+    return 1 if failed else 0
+
+
+def startup_sanity_checks():
+    """Cheap checks at GUI start (the full suite is --self-test)."""
+    problems = []
+    flat = config_defaults_flat()
+    for key in settings_schema_keys():
+        if key not in flat:
+            problems.append(f"setting without default: {key}")
+    for name, table in PALETTES.items():
+        if len(set(table.values())) != len(table):
+            problems.append(f"palette {name} is not one-to-one")
+    for p in problems:
+        LOG.warning("sanity: %s", p)
+    return problems
+
+
+
+# ============================================================================
+#  21.  Application entry point
+# ============================================================================
+def detect_gateway_and_self():
+    """Return (gateway_ip, my_ips, my_macs, default_iface_name)."""
+    gw = ""
+    my_ips, my_macs = set(), set()
+    default_iface_name = ""
+    try:
+        try:
+            # scapy's route() returns (iface, output_ip, gateway_ip)
+            def_iface, my_ip, gw_ip = conf.route.route("0.0.0.0")
+            gw = gw_ip if gw_ip and gw_ip != "0.0.0.0" else ""
+            default_iface_name = iface_name(def_iface)
+            if my_ip and my_ip != "0.0.0.0":
+                my_ips.add(my_ip)
+        except Exception as e:                       # noqa: BLE001
+            LOG.info("default route lookup failed: %s", e)
+        for route in conf.route.routes:
+            with contextlib.suppress(ValueError, TypeError, IndexError):
+                addr = route[4]
+                if addr and addr not in ("0.0.0.0", "127.0.0.1"):
+                    my_ips.add(addr)
+        for iface in conf.ifaces.values():
+            mac = getattr(iface, "mac", None)
+            if mac and is_unicast_mac(mac):
+                my_macs.add(mac.lower())
+    except Exception as e:                           # noqa: BLE001
+        LOG.warning("identity detection failed: %s", e)
+    return gw, my_ips, my_macs, default_iface_name
+
+
+def _install_thread_excepthook():
+    def hook(args):
+        if args.exc_type is SystemExit:
+            return
+        LOG.error("unhandled exception in thread %s:\n%s",
+                  getattr(args.thread, "name", "?"),
+                  "".join(traceback.format_exception(
+                      args.exc_type, args.exc_value, args.exc_traceback)))
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = hook
+
+
+def main():
+    setup_logging()
+    LOG.info("MiniWireshark %s starting (python %s, %s, admin=%s)",
+             SCRIPT_VERSION, platform.python_version(), platform.platform(),
+             is_admin())
+    _install_thread_excepthook()
+    rolled = rollback_update_if_needed()
+    root = tk.Tk()
+    root.title("MiniWireshark")
+    root.geometry("640x500")
+    root.resizable(False, False)
+    root.configure(background="#f4f5f7")
+    with contextlib.suppress(tk.TclError):
+        root.eval("tk::PlaceWindow . center")
+    if rolled:
+        messagebox.showwarning("Update rolled back", rolled)
+
+    loader = LoaderWindow(root)
+    loader.pack(fill="both", expand=True)
+    root.update()
+
+    ok, err = run_bootstrap(loader)
+    if not ok:
+        loader.show_fatal(err)
+        root.mainloop()
+        return
+
+    loader.post_status("Loading the packet engine ...")
+    loader.post_progress(100)
+    loader.pump()
+    try:
+        load_scapy()
+    except Exception as e:                           # noqa: BLE001
+        LOG.exception("scapy import")
+        loader.show_fatal(f"Could not load the capture engine (scapy): {e}\n\n"
+                          f"{traceback.format_exc()}")
+        root.mainloop()
+        return
+    loader.post_status("Looking at your network adapters ...")
+    loader.pump()
+    gw, my_ips, my_macs, default_iface_name = detect_gateway_and_self()
+    LOG.info("default iface=%s gateway=%s my_ips=%s", default_iface_name, gw,
+             sorted(my_ips))
+    startup_sanity_checks()
+
+    loader.destroy()
+    root.resizable(True, True)
+    root.title("MiniWireshark")
+    try:
+        MiniWireshark(root, gw, my_ips, my_macs, default_iface_name)
+    except Exception:                                # noqa: BLE001
+        text = traceback.format_exc()
+        LOG.error("startup error:\n%s", text)
+        rolled = rollback_update_if_needed(force=True) \
+            if os.path.exists(PATHS.update_marker) else ""
+        messagebox.showerror("Startup error",
+                             (rolled + "\n\n" if rolled else "") +
+                             "MiniWireshark couldn't start its window.\n\n" +
+                             text[-2500:] + f"\n\nLog: {PATHS.log_file}")
+        root.destroy()
+        return
+    root.mainloop()
+    LOG.info("MiniWireshark closed")
+
+
+if __name__ == "__main__":
+    if SELF_TEST_MODE:
+        setup_logging()
+        print(f"MiniWireshark {SCRIPT_VERSION} self-test")
+        sys.exit(run_self_tests())
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass
+    except Exception:                                # noqa: BLE001
+        LOG.exception("fatal error")
+        _fatal_dialog("MiniWireshark stopped unexpectedly",
+                      traceback.format_exc()[-2500:] +
+                      f"\n\nDetails were written to {PATHS.log_file}")
+        raise
