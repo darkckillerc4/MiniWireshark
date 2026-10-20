@@ -1,0 +1,14 @@
+Checking which network this is before sending anything… ¦ Vérification du réseau avant tout envoi… ¦ Comprobando qué red es antes de enviar nada…
+(Nothing is being sent right now: not capturing live.) ¦ (Rien n'est envoyé en ce moment : pas de capture en direct.) ¦ (Ahora no se envía nada: no hay captura en directo.)
+I'm also quietly looking for other devices on your network. ¦ Je cherche aussi discrètement les autres appareils de votre réseau. ¦ También busco discretamente otros dispositivos en su red.
+I'm in Quiet Mode, so I'm only listening. ¦ Je suis en mode discret : j'écoute seulement. ¦ Estoy en modo silencioso: solo escucho.
+packet ¦ paquet ¦ paquete
+⚡ busy: slower screen refresh ¦ ⚡ occupé : affichage ralenti ¦ ⚡ ocupado: pantalla más lenta
+· ⚡ busy: slower screen refresh ¦ · ⚡ occupé : affichage ralenti ¦ · ⚡ ocupado: pantalla más lenta
+it was the best of the available cards ¦ c'était la meilleure des cartes disponibles ¦ era la mejor de las tarjetas disponibles
+it carries your default Internet route ¦ elle porte votre route Internet par défaut ¦ lleva su ruta a Internet predeterminada
+your router is on the same network ¦ votre box est sur le même réseau ¦ su router está en la misma red
+Pick another card in the list, or click “Refresh”. ¦ Choisissez une autre carte dans la liste, ou cliquez sur « Actualiser ». ¦ Elija otra tarjeta de la lista o pulse «Actualizar».
+No address assignments seen yet (they happen when devices join). ¦ Aucune attribution d'adresse vue pour l'instant (elles ont lieu quand des appareils arrivent). ¦ Aún no se han visto asignaciones de direcciones (ocurren cuando se conectan dispositivos).
+Built-in packet capture is working. ¦ La capture de paquets intégrée fonctionne. ¦ La captura de paquetes integrada funciona.
+Not on Wi-Fi (or the system didn't report it). ¦ Pas en Wi-Fi (ou le système ne l'a pas indiqué). ¦ No está en Wi-Fi (o el sistema no lo indicó).
