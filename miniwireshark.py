@@ -99,7 +99,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 _T_START = time.perf_counter()
 LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
-SCRIPT_VERSION = "5.0.0"
+SCRIPT_VERSION = "5.0.1"
 SESSION_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 2
 
@@ -1713,6 +1713,11 @@ class LoaderWindow(tk.Frame):
          "Tabs, settings, devices, filters and ready-made workspaces from "
          "one search box. Starting up is also more reliable, with Safe "
          "Mode if a start fails twice."),
+        ("\U0001F6E0", "Fixes and small additions (5.0.1)",
+         "Expert findings open their packets and export to CSV, Copy as "
+         "filter in more places, Follow stream can save, step ◀ ▶ and pick "
+         "a direction, Ctrl+G goes to a packet, three time formats and "
+         "coloured expert rows."),
     )
 
     def __init__(self, master, config=None, mode="startup"):
@@ -2139,7 +2144,8 @@ class LoaderWindow(tk.Frame):
                 first_tile = tile
         news = tk.Frame(top, bg=self.card_bg, padx=12, pady=8)
         news.pack(fill="both", expand=True, pady=(10, 0))
-        tk.Label(news, text="What's new in 4.0", bg=self.card_bg,
+        tk.Label(news, text="What's new in " + ".".join(
+                     SCRIPT_VERSION.split(".")[:2]), bg=self.card_bg,
                  fg=self.fg, font=("TkDefaultFont", 10, "bold"),
                  anchor="w").pack(fill="x")
         for icon, title, text in self.WHATS_NEW:
@@ -5760,7 +5766,13 @@ def human_rate(bps):
 
 
 def human_duration(sec):
-    sec = int(max(0, sec or 0))
+    try:
+        raw = max(0.0, float(sec or 0))
+    except (TypeError, ValueError):
+        raw = 0.0
+    if 0 < raw < 1:
+        return "<1s"            # was "0s" for a connection that lasted 0.4 s
+    sec = int(raw)
     if sec < 60:
         return f"{sec}s"
     if sec < 3600:
@@ -16934,7 +16946,7 @@ DEFAULT_SHORTCUTS = {
     "start": "<Control-r>", "stop": "<Control-period>",
     "clear": "<Control-l>", "export": "<Control-e>", "find": "<Control-f>",
     "undo": "<Control-z>", "inspector": "<F2>",
-    "palette": "<Control-k>",
+    "palette": "<Control-k>", "goto_packet": "<Control-g>",
 }
 
 DEFAULT_FILTER_PRESETS = {
@@ -16963,7 +16975,8 @@ def _default_config():
                        "inspector": None},
         "capture": {"max_stored_events": 5000, "promiscuous": True,
                     "auto_select_interface": True,
-                    "preferred_interface": "", "follow_newest": True},
+                    "preferred_interface": "", "follow_newest": True,
+                    "time_format": "Time of day", "color_expert": True},
         "devices": {"learn_types": True, "idle_minutes": 2, "inactive_minutes": 10,
                     "expire_minutes": 1440, "auto_merge": True,
                     "suggest_merges": True,
@@ -19521,6 +19534,54 @@ Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
 Automatic (MiniWireshark decides) ¦ Automatique (MiniWireshark décide) ¦ Automático (MiniWireshark decide)
 You set this type ¦ Vous avez choisi ce type ¦ Usted eligió este tipo
 detected ¦ détecté ¦ detectado
+Packet capture and decoding ¦ Capture et décodage des paquets ¦ Captura y decodificación de paquetes
+Adapter link status, CPU-aware performance mode ¦ État de la liaison de la carte, mode de performance selon le processeur ¦ Estado del enlace del adaptador, modo de rendimiento según la CPU
+This finding is about a whole connection or session, not single packets, so there is nothing to show in the packet list. ¦ Ce constat porte sur une connexion ou une session entière, pas sur des paquets précis : il n'y a rien à afficher dans la liste des paquets. ¦ Este hallazgo se refiere a una conexión o sesión completa, no a paquetes concretos, así que no hay nada que mostrar en la lista de paquetes.
+blind spots: ¦ angles morts : ¦ puntos ciegos:
+Time: ¦ Heure : ¦ Hora:
+Time of day ¦ Heure du jour ¦ Hora del día
+Seconds since start ¦ Secondes depuis le début ¦ Segundos desde el inicio
+Since previous shown ¦ Depuis le précédent affiché ¦ Desde el anterior mostrado
+Colour expert findings ¦ Colorer les constats d'expert ¦ Colorear hallazgos de experto
+Filter on this conversation ¦ Filtrer sur cette conversation ¦ Filtrar por esta conversación
+Copy conversation as filter ¦ Copier la conversation comme filtre ¦ Copiar la conversación como filtro
+Copy source as filter ¦ Copier la source comme filtre ¦ Copiar el origen como filtro
+Copy destination as filter ¦ Copier la destination comme filtre ¦ Copiar el destino como filtro
+Exclude this conversation ¦ Exclure cette conversation ¦ Excluir esta conversación
+Filter on this address ¦ Filtrer sur cette adresse ¦ Filtrar por esta dirección
+Exclude this address ¦ Exclure cette adresse ¦ Excluir esta dirección
+Go to device ¦ Aller à l'appareil ¦ Ir al dispositivo
+Go to host ¦ Aller à l'hôte ¦ Ir al host
+Go to packet ¦ Aller au paquet ¦ Ir al paquete
+Go to packet… ¦ Aller au paquet… ¦ Ir al paquete…
+Go to packet number ¦ Aller au paquet numéro ¦ Ir al paquete número
+Packet number: ¦ Numéro du paquet : ¦ Número de paquete:
+Both directions ¦ Les deux sens ¦ Ambos sentidos
+Client → server ¦ Client → serveur ¦ Cliente → servidor
+Server → client ¦ Serveur → client ¦ Servidor → cliente
+Filter on this stream ¦ Filtrer sur ce flux ¦ Filtrar por este flujo
+Pick a connection to follow first. ¦ Choisissez d'abord une connexion à suivre. ¦ Elija primero una conexión para seguir.
+Show these packets ¦ Afficher ces paquets ¦ Mostrar estos paquetes
+Export CSV… ¦ Exporter en CSV… ¦ Exportar CSV…
+No expert findings to export at this level. ¦ Aucun constat d'expert à exporter à ce niveau. ¦ No hay hallazgos de experto para exportar en este nivel.
+Open the first packet ¦ Ouvrir le premier paquet ¦ Abrir el primer paquete
+Open the last packet ¦ Ouvrir le dernier paquet ¦ Abrir el último paquete
+Copy finding ¦ Copier le constat ¦ Copiar el hallazgo
+Text files ¦ Fichiers texte ¦ Archivos de texto
+CSV files ¦ Fichiers CSV ¦ Archivos CSV
+Packet number ¦ Numéro du paquet ¦ Número de paquete
+IPv4 address, either direction ¦ Adresse IPv4, dans les deux sens ¦ Dirección IPv4, en ambos sentidos
+IPv6 address, either direction ¦ Adresse IPv6, dans les deux sens ¦ Dirección IPv6, en ambos sentidos
+TCP port, either direction ¦ Port TCP, dans les deux sens ¦ Puerto TCP, en ambos sentidos
+UDP port, either direction ¦ Port UDP, dans les deux sens ¦ Puerto UDP, en ambos sentidos
+MAC address, either direction ¦ Adresse MAC, dans les deux sens ¦ Dirección MAC, en ambos sentidos
+Worst expert finding on the packet (chat, note, warning, error) ¦ Pire constat d'expert sur le paquet (chat, note, warning, error) ¦ Peor hallazgo de experto del paquete (chat, note, warning, error)
+Expert finding group (Sequence, Malformed, Protocol, Security, Checksum, Response code) ¦ Groupe du constat d'expert (Sequence, Malformed, Protocol, Security, Checksum, Response code) ¦ Grupo del hallazgo de experto (Sequence, Malformed, Protocol, Security, Checksum, Response code)
+Expert finding text ¦ Texte du constat d'expert ¦ Texto del hallazgo de experto
+Seconds since the first packet ¦ Secondes depuis le premier paquet ¦ Segundos desde el primer paquete
+Connection number ¦ Numéro de connexion ¦ Número de conexión
+Fixes and small additions (5.0.1) ¦ Corrections et petits ajouts (5.0.1) ¦ Correcciones y pequeñas mejoras (5.0.1)
+Expert findings open their packets and export to CSV, Copy as filter in more places, Follow stream can save, step ◀ ▶ and pick a direction, Ctrl+G goes to a packet, three time formats and coloured expert rows. ¦ Les constats d'expert ouvrent leurs paquets et s'exportent en CSV, « Copier comme filtre » à plus d'endroits, le suivi de flux peut enregistrer, passer ◀ ▶ et choisir un sens, Ctrl+G va à un paquet, trois formats d'heure et des lignes colorées pour les constats. ¦ Los hallazgos de experto abren sus paquetes y se exportan a CSV, «Copiar como filtro» en más lugares, seguir flujo puede guardar, pasar ◀ ▶ y elegir un sentido, Ctrl+G va a un paquete, tres formatos de hora y filas coloreadas para los hallazgos.
 High ¦ Élevée ¦ Alta
 Medium ¦ Moyenne ¦ Media
 Low ¦ Faible ¦ Baja
@@ -19957,6 +20018,54 @@ _i18n_load()
 
 # Dynamic strings: (English pattern, French, Spanish); groups are kept.
 I18N_PATTERNS = [
+    # ---- V5.0.1: health info block and runtime status, line by line
+    (r"Network card : ([^\n]*)", r"Carte réseau   : \1", r"Tarjeta de red : \1"),
+    (r"This computer: ([^\n]*)", r"Cet ordinateur : \1", r"Este equipo    : \1"),
+    (r"Subnet\(s\)    : ([^\n]*)", r"Sous-réseau(x) : \1",
+     r"Subred(es)     : \1"),
+    (r"Router       : ([^\n]*)", r"Box / routeur  : \1", r"Router         : \1"),
+    (r"DNS servers  : ([^\n]*)", r"Serveurs DNS   : \1",
+     r"Servidores DNS : \1"),
+    (r"IPv6 prefix  : ([^\n]*)", r"Préfixe IPv6   : \1",
+     r"Prefijo IPv6   : \1"),
+    (r"Why this card: ([^\n]*)", r"Pourquoi cette carte : {t1}",
+     r"Por qué esta tarjeta: {t1}"),
+    (r"Wi-Fi        : ([^\n]*)", r"Wi-Fi          : \1", r"Wi-Fi          : \1"),
+    (r"Switch port  : ([^\n]*)", r"Port du switch : \1",
+     r"Puerto del switch: \1"),
+    (r"Running on Python (\S+) \((.+)\) — the Python that started "
+     r"MiniWireshark\. It is never modified\.",
+     r"Exécuté avec Python \1 (\2) — le Python qui a lancé MiniWireshark. "
+     r"Il n'est jamais modifié.",
+     r"Ejecutándose con Python \1 (\2) — el Python que inició "
+     r"MiniWireshark. Nunca se modifica."),
+    (r"Running on MiniWireshark's managed Python (\S+) \((.+)\)\.",
+     r"Exécuté avec le Python géré de MiniWireshark \1 (\2).",
+     r"Ejecutándose con el Python gestionado de MiniWireshark \1 (\2)."),
+    (r"Private packages folder \((.+)\): empty",
+     r"Dossier des paquets privés (\1) : vide",
+     r"Carpeta de paquetes privados (\1): vacía"),
+    (r"Private packages folder \((.+)\): (.+)",
+     r"Dossier des paquets privés (\1) : \2",
+     r"Carpeta de paquetes privados (\1): \2"),
+    # ---- V5.0.1
+    (r"What's new in (\d+\.\d+)", r"Nouveautés de la \1",
+     r"Novedades de la \1"),
+    (r"“(.+)” is not a packet number\.",
+     r"« \1 » n'est pas un numéro de paquet.",
+     r"«\1» no es un número de paquete."),
+    (r"Saved connection #(\d+) to (.+?) \(redacted: mail, web or login "
+     r"protocol\)\.",
+     r"Connexion n° \1 enregistrée dans \2 (masquée : messagerie, web ou "
+     r"protocole de connexion).",
+     r"Conexión n.º \1 guardada en \2 (ocultada: correo, web o protocolo "
+     r"de inicio de sesión)."),
+    (r"Saved connection #(\d+) to (.+)\.",
+     r"Connexion n° \1 enregistrée dans \2.",
+     r"Conexión n.º \1 guardada en \2."),
+    (r"Exported ([\d,]+) expert findings to (.+)\.",
+     r"\1 constats d'expert exportés dans \2.",
+     r"\1 hallazgos de experto exportados a \2."),
     (r"(\d[\d,]*) shown", r"\1 affichés", r"\1 mostrados"),
     (r"(\d[\d,]*) of (\d[\d,]*) shown", r"\1 sur \2 affichés",
      r"\1 de \2 mostrados"),
@@ -20585,13 +20694,20 @@ class DisplayVar(tk.StringVar):
     whatever is set is shown in the current language. Never use it for a
     value the program reads back as a setting."""
 
+    @staticmethod
+    def shown(value):
+        if not isinstance(value, str):
+            return value
+        out = translate_text(value)
+        if out == value and "\n" in value:     # an info block: line by line
+            out = translate_lines(value)
+        return out
+
     def __init__(self, master=None, value=None, name=None):
-        super().__init__(master, translate_text(value)
-                         if isinstance(value, str) else value, name)
+        super().__init__(master, self.shown(value), name)
 
     def set(self, value):
-        return super().set(translate_text(value)
-                           if isinstance(value, str) else value)
+        return super().set(self.shown(value))
 
 
 install_i18n_hooks()
@@ -21586,6 +21702,8 @@ SETTINGS_PAGES = [
               "label": "Undo your last device change"},
              {"key": "shortcuts.palette", "type": "shortcut",
               "label": "Go to anything (command palette)"},
+             {"key": "shortcuts.goto_packet", "type": "shortcut",
+              "label": "Go to packet number"},
              {"key": "shortcuts.inspector", "type": "shortcut",
               "label": "Show / hide the inspector"},
          ]},
@@ -22836,6 +22954,30 @@ def popup_menu(app, event, items):
         m.tk_popup(event.x_root, event.y_root)
     finally:
         m.grab_release()
+
+
+class _SafeCsv:
+    """csv.writer whose text cells can never start a spreadsheet formula
+    (device names, DHCP host names and packet text come from the
+    network)."""
+
+    BAD = ("=", "+", "-", "@", "\t", "\r")
+
+    def __init__(self, f):
+        self.w = csv.writer(f)
+
+    @classmethod
+    def cell(cls, v):
+        if isinstance(v, str) and v.startswith(cls.BAD):
+            return "'" + v
+        return v
+
+    def writerow(self, row):
+        return self.w.writerow([self.cell(v) for v in row])
+
+
+def safe_csv_writer(f):
+    return _SafeCsv(f)
 
 
 def copy_to_clipboard(app, text):
@@ -26678,7 +26820,51 @@ SPECIAL_FIELDS = {
     "frame.number": "int", "ip.addr": "ipv4", "ipv6.addr": "ipv6",
     "tcp.port": "int", "udp.port": "int", "eth.addr": "mac",
     "expert.severity": "severity", "frame.time_relative": "float",
-    "tcp.stream": "int"}
+    "tcp.stream": "int", "expert.group": "str", "expert.message": "str"}
+SPECIAL_DESC = {
+    "frame.number": "Packet number",
+    "ip.addr": "IPv4 address, either direction",
+    "ipv6.addr": "IPv6 address, either direction",
+    "tcp.port": "TCP port, either direction",
+    "udp.port": "UDP port, either direction",
+    "eth.addr": "MAC address, either direction",
+    "expert.severity": "Worst expert finding on the packet (chat, note, "
+                       "warning, error)",
+    "expert.group": "Expert finding group (Sequence, Malformed, Protocol, "
+                    "Security, Checksum, Response code)",
+    "expert.message": "Expert finding text",
+    "frame.time_relative": "Seconds since the first packet",
+    "tcp.stream": "Connection number"}
+
+
+def conversation_filter(src, dst, sport=None, dport=None, transport=None,
+                        ipver=None, src_mac="", dst_mac=""):
+    """The field expression for one conversation (both directions)."""
+    parts = []
+    fam = "ip" if ipver == 4 else "ipv6" if ipver == 6 else None
+    if fam is None and src and dst:
+        fam = "ipv6" if ":" in src else "ip" if "." in src else None
+    if fam and src and dst:
+        parts += [f"{fam}.addr == {src}", f"{fam}.addr == {dst}"]
+    elif src_mac and dst_mac:
+        parts += [f"eth.addr == {src_mac}", f"eth.addr == {dst_mac}"]
+    tr = (transport or "").lower()
+    if tr in ("tcp", "udp") and sport is not None and dport is not None:
+        parts += [f"{tr}.port == {sport}", f"{tr}.port == {dport}"]
+    return " and ".join(parts)
+
+
+def address_filter(addr):
+    """The field expression for one address (either direction)."""
+    if not addr:
+        return ""
+    if re.match(r"^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$", addr, re.I):
+        return f"eth.addr == {addr}"
+    return f"{'ipv6' if ':' in addr else 'ip'}.addr == {addr}"
+
+
+def filter_quote(text):
+    return '"' + str(text).replace("\\", " ").replace('"', '\\"') + '"'
 
 
 def _row_field(d, key):
@@ -26831,6 +27017,12 @@ class FieldFilter:
     def _values(self, field):
         if field == "expert.severity":
             return lambda d, c: c.expert_severities(d)
+        if field in ("expert.group", "expert.message"):
+            i = 1 if field == "expert.group" else 2
+            return lambda d, c: c.expert_info(d, i)
+        if field == "frame.time_relative":
+            return lambda d, c: [round(d["time"] - c.time_zero(), 6)] if \
+                d.get("time") is not None else []
         fast = field in ("frame.len", "frame.number", "ip.src", "ip.dst",
                          "ip.addr", "ipv6.src", "ipv6.dst", "ipv6.addr",
                          "tcp.srcport", "tcp.dstport", "tcp.port",
@@ -27150,16 +27342,40 @@ class FilterContext:
                 self._dis.popitem(last=False)
         return got
 
-    def expert_severities(self, d):
+    def _expert_index(self):
         store = self.app.deep.store
         ver, idx = self._sev
         if ver != store.version:
             idx = {}
             with store.lock:
                 for f in store.findings:
-                    idx.setdefault(f[0], []).append(f[2])
+                    idx.setdefault(f[0], []).append((f[2], f[3], f[4]))
             self._sev = (store.version, idx)
-        return idx.get(d.get("no"), [])
+        return idx
+
+    def expert_severities(self, d):
+        return [x[0] for x in self._expert_index().get(d.get("no"), ())]
+
+    def expert_info(self, d, i):
+        """i = 0 severity, 1 group, 2 message."""
+        return [x[i] for x in self._expert_index().get(d.get("no"), ())]
+
+    def worst_expert(self, d):
+        """'error', 'warn' or None — for row colours."""
+        sev = self.expert_severities(d)
+        if not sev:
+            return None
+        best = max(EXPERT_RANK.get(x, 0) for x in sev)
+        return "error" if best >= 3 else "warn" if best == 2 else None
+
+    def time_zero(self):
+        """frame.time_relative counts from the first packet of the
+        session (or the oldest one still in memory)."""
+        t0 = getattr(self.app.model.metrics, "first_ts", 0) or 0
+        rows = self.app.all_rows
+        if rows and (not t0 or rows[0]["time"] < t0):
+            t0 = rows[0]["time"]
+        return t0
 
     def device_keys(self, d):
         m = self.app.model
@@ -27223,6 +27439,24 @@ class FilterContext:
 
 
 # ---- Packets (Advanced) -------------------------------------------------------
+TIME_FORMATS = ("Time of day", "Seconds since start",
+                "Since previous shown")
+EXPERT_ROW_COLORS = {"x_error": ("#8a1a08", "#fbe9e7"),
+                     "x_warn": ("#7a4a00", "#fff4e0")}
+
+
+def format_packet_time(ts, fmt, t0=0.0, prev=None):
+    """Time column: clock time, seconds since the first packet, or the
+    gap since the previous packet in the list (like Wireshark's View →
+    Time Display Format)."""
+    if fmt == "Seconds since start":
+        return f"{max(0.0, ts - (t0 or ts)):.6f}"
+    if fmt == "Since previous shown":
+        return f"{max(0.0, ts - prev):.6f}" if prev is not None else \
+            "0.000000"
+    return datetime.fromtimestamp(ts).strftime("%H:%M:%S.%f")[:-3]
+
+
 class PacketsTab(BaseTab):
     name, label_key, advanced = "packets", "tab_raw", True
     SUBVIEWS = ("Packets", "Streams", "Exchanges", "Statistics", "Expert")
@@ -27351,6 +27585,18 @@ class PacketsTab(BaseTab):
         ttk.Checkbutton(stat, text="Follow newest packet",
                         variable=self.follow_var).pack(side="left",
                                                        padx=(8, 0))
+        self.lbl(stat, "Time:").pack(side="left", padx=(12, 2))
+        self.time_var = tk.StringVar(value=app.config.get(
+            "capture.time_format", "Time of day"))
+        tb = ttk.Combobox(stat, textvariable=self.time_var, width=17,
+                          state="readonly", values=list(TIME_FORMATS))
+        tb.pack(side="left")
+        tb.bind("<<ComboboxSelected>>", lambda e: self._time_format())
+        self.xcolor_var = tk.BooleanVar(value=app.config.get(
+            "capture.color_expert", True))
+        ttk.Checkbutton(stat, text="Colour expert findings",
+                        variable=self.xcolor_var,
+                        command=self._xcolor).pack(side="left", padx=(8, 0))
         self.ind_var = DisplayVar(value="Display filter: showing "
                                           "everything")
         tk.Label(stat, textvariable=self.ind_var, bg=WHITE, fg="#0b5394",
@@ -27484,6 +27730,13 @@ class PacketsTab(BaseTab):
             self.tree.tag_configure("marked", background=PALETTES[
                 palette_name(self.app.theme_name, self.app.high_contrast)
             ].get("#fff2a8", "#fff2a8"))
+        # created after "marked" so a bookmark still shows on top
+        for tag, (fg, bg) in EXPERT_ROW_COLORS.items():
+            table = PALETTES[palette_name(self.app.theme_name,
+                                          self.app.high_contrast)]
+            with contextlib.suppress(tk.TclError):
+                self.tree.tag_configure(tag, foreground=table.get(fg, fg),
+                                        background=table.get(bg, bg))
         for tag, (fg, bg) in TAG_COLORS.items():
             table = PALETTES[palette_name(self.app.theme_name,
                                           self.app.high_contrast)]
@@ -27560,8 +27813,8 @@ class PacketsTab(BaseTab):
                 if k in FIELD_REGISTRY:
                     ftype, unit, desc, _p = FIELD_REGISTRY[k]
                 elif k in SPECIAL_FIELDS:
-                    ftype, desc = SPECIAL_FIELDS[k], "Either direction / " \
-                        "special"
+                    ftype, desc = SPECIAL_FIELDS[k], SPECIAL_DESC.get(
+                        k, "Either direction / special")
                 else:
                     ftype, desc = "protocol", "Packets of this protocol"
                 if s and s not in k and s not in desc.lower():
@@ -27709,10 +27962,27 @@ class PacketsTab(BaseTab):
     # ---- rows (virtual table: only the visible rows exist as Treeview
     #      items; the scrollbar, wheel and keys move a window over
     #      self.matched, which holds the filtered rows in view order)
-    def _values(self, d):
+    def _time_format(self):
+        self.app.config.set("capture.time_format", self.time_var.get())
+        self.app.config.save()
+        self.render()
+
+    def _xcolor(self):
+        self.app.config.set("capture.color_expert", self.xcolor_var.get())
+        self.app.config.save()
+        self.render()
+
+    def time_text(self, d, prev=None):
+        """The Time column in the chosen format."""
+        fmt = self.time_var.get() if hasattr(self, "time_var") else \
+            "Time of day"
+        return format_packet_time(d["time"], fmt, self.ctx.time_zero(),
+                                  prev["time"] if prev else None)
+
+    def _values(self, d, prev=None):
         app = self.app
         return (d["no"], "★" if d["no"] in app.bookmarks else "",
-                datetime.fromtimestamp(d["time"]).strftime("%H:%M:%S.%f")[:-3],
+                self.time_text(d, prev),
                 app.disp_addr(d["src_ip"], d["src_mac"]),
                 app.disp_addr(d["dst_ip"], d["dst_mac"]), d["proto"],
                 d["length"], d.get("flow_id") or "", d["text"])
@@ -27824,9 +28094,14 @@ class PacketsTab(BaseTab):
                 tree.delete(self.slots.pop())
             bm = self.app.bookmarks
             sel_iid = None
-            for iid, d in zip(self.slots, rows):
-                tags = (d["tag"],) + (("marked",) if d["no"] in bm else ())
-                tree.item(iid, values=self._values(d), tags=tags)
+            xcol = self.xcolor_var.get()
+            for k, (iid, d) in enumerate(zip(self.slots, rows)):
+                i = self.top + k
+                prev = m[i - 1] if i > 0 else None
+                x = self.ctx.worst_expert(d) if xcol else None
+                tags = ((f"x_{x}",) if x else (d["tag"],)) + (
+                    ("marked",) if d["no"] in bm else ())
+                tree.item(iid, values=self._values(d, prev), tags=tags)
                 if d["no"] == self.sel_no:
                     sel_iid = iid
             self.slot_rows = dict(zip(self.slots, rows))
@@ -28254,8 +28529,23 @@ class PacketsTab(BaseTab):
                    f"{d['proto']} {d['length']}B  {d['text']}")
         devs = list(self.ctx.device_keys(d))
         names = [n for n in self.ctx.names(d) if "." in n]
+        conv = conversation_filter(d["src_ip"], d["dst_ip"], d["sport"],
+                                   d["dport"], d.get("transport"),
+                                   d.get("ipver"), d["src_mac"],
+                                   d["dst_mac"])
+        a_src = address_filter(d["src_ip"] or d["src_mac"])
+        a_dst = address_filter(d["dst_ip"] or d["dst_mac"])
         items = [("Follow stream", lambda: app.follow_stream(
                      d.get("flow_id")), bool(d.get("flow_id"))),
+                 ("Filter on this conversation",
+                  lambda: app.apply_filter(conv), bool(conv)),
+                 ("Copy conversation as filter",
+                  lambda: copy_to_clipboard(app, conv), bool(conv)),
+                 ("Copy source as filter",
+                  lambda: copy_to_clipboard(app, a_src), bool(a_src)),
+                 ("Copy destination as filter",
+                  lambda: copy_to_clipboard(app, a_dst), bool(a_dst)),
+                 None,
                  ("Copy summary", lambda: copy_to_clipboard(app, summary)),
                  ("Copy source", lambda: copy_to_clipboard(app, src)),
                  ("Copy destination", lambda: copy_to_clipboard(app, dst)),
@@ -28511,6 +28801,53 @@ class _SubView:
         self._version = None
 
 
+STREAM_DIRECTIONS = ("Both directions", "Client → server",
+                     "Server → client")
+
+
+def stream_segments(res, redact=True, hexmode=False,
+                    direction="Both directions"):
+    """[(text, kind, packet no)]; kind is 0 (client), 1 (server) or
+    "gap". The window shows exactly this and Save as… writes exactly
+    this, so what you save is what you saw. A redacted stream stays
+    redacted in Hex too (5.0.0 showed the raw bytes there)."""
+    out = []
+    want = {"Client → server": 0, "Server → client": 1}.get(direction)
+    for d, off, data, no in res.chunks:
+        if want is not None and d != want:
+            continue
+        if data is None:
+            out.append((f"\n[… bytes {off}–{no} of "
+                        f"{'the client' if d == 0 else 'the server'}"
+                        f" side were never captured …]\n", "gap", None))
+            continue
+        if redact:
+            body = "".join(redact_stream_line(line, res) + "\n"
+                           for line in data.splitlines(True))
+            if hexmode:
+                body = hex_dump_lines(body.encode("utf-8")) + "\n"
+        elif hexmode:
+            body = hex_dump_lines(data) + "\n"
+        else:
+            body = data.decode("utf-8", "replace")
+            body = "".join(ch if ch.isprintable() or ch in "\r\n\t"
+                           else "." for ch in body)
+        out.append((body, d, no))
+    return out
+
+
+def stream_text(res, redact=True, hexmode=False,
+                direction="Both directions"):
+    """The followed stream as plain text, with a short header."""
+    c, sv = res.client, res.server
+    head = (f"{res.transport} stream {c[0]}:{c[1]} ↔ {sv[0]}:{sv[1]} · "
+            f"{direction}" + (" · redacted (mail, web or login protocol)"
+                              if redact and res.sensitive() else "") +
+            "\n" + "=" * 72 + "\n")
+    return head + "".join(t for t, _k, _n in stream_segments(
+        res, redact and res.sensitive(), hexmode, direction))
+
+
 class StreamsView(_SubView):
     """Follow one connection: both directions in colour, gaps marked,
     retransmissions folded, sensitive protocols redacted by default."""
@@ -28519,9 +28856,15 @@ class StreamsView(_SubView):
         b = self.bar()
         self.label(b, "Connection:").pack(side="left")
         self.flow_var = tk.StringVar()
-        self.box = ttk.Combobox(b, textvariable=self.flow_var, width=60,
+        ttk.Button(b, text="◀", width=3,
+                   command=lambda: self.step(-1)).pack(side="left",
+                                                       padx=(4, 0))
+        self.box = ttk.Combobox(b, textvariable=self.flow_var, width=56,
                                 state="readonly")
-        self.box.pack(side="left", padx=(4, 8))
+        self.box.pack(side="left", padx=2)
+        ttk.Button(b, text="▶", width=3,
+                   command=lambda: self.step(1)).pack(side="left",
+                                                      padx=(0, 8))
         self.box.bind("<Button-1>", lambda e: self.box.configure(
             values=self.choices()), add="+")
         self.box.bind("<<ComboboxSelected>>", lambda e: self.show())
@@ -28529,6 +28872,11 @@ class StreamsView(_SubView):
         for m in ("Text", "Hex"):
             ttk.Radiobutton(b, text=m, value=m, variable=self.mode_var,
                             command=self.render).pack(side="left")
+        self.dir_var = tk.StringVar(value=STREAM_DIRECTIONS[0])
+        db = ttk.Combobox(b, textvariable=self.dir_var, width=16,
+                          state="readonly", values=list(STREAM_DIRECTIONS))
+        db.pack(side="left", padx=(8, 0))
+        db.bind("<<ComboboxSelected>>", lambda e: self.render())
         self.raw_btn = ttk.Button(b, text="Show raw text…",
                                   command=self.ask_raw)
         b2 = self.bar()
@@ -28538,6 +28886,10 @@ class StreamsView(_SubView):
         fe.pack(side="left", padx=(4, 6))
         fe.bind("<Return>", lambda e: self.find())
         ttk.Button(b2, text="Find", command=self.find).pack(side="left")
+        ttk.Button(b2, text="Filter on this stream",
+                   command=self.filter_on).pack(side="left", padx=(10, 0))
+        ttk.Button(b2, text="Save as…",
+                   command=self.save_as).pack(side="left", padx=4)
         self.info = self.label(b2, "", muted=True)
         self.info.pack(side="left", padx=10)
         f = tk.Frame(self.frame, bg=WHITE)
@@ -28562,20 +28914,42 @@ class StreamsView(_SubView):
                                    font=("TkDefaultFont", 9, "italic"))
             self.txt.tag_configure("found", background=t["border"])
 
-    def choices(self):
-        out = []
+    def _flows(self):
         ids = {d.get("flow_id") for d in self.app.all_rows
                if d.get("flow_id")}
-        for f in sorted((self.app.model.flows.get(i) for i in ids),
-                        key=lambda f: -(f.last_seen if f else 0)):
-            if f is None or f.transport not in ("TCP", "UDP"):
-                continue
+        return [f for f in (self.app.model.flows.get(i) for i in ids)
+                if f is not None and f.transport in ("TCP", "UDP")]
+
+    def choices(self):
+        out = []
+        for f in sorted(self._flows(), key=lambda f: -(f.last_seen or 0)):
             out.append(f"#{f.fid}  {f.local_ip}:{f.local_port} ↔ "
                        f"{f.domain or f.remote_ip}:{f.remote_port}  "
                        f"{f.transport} {f.service or ''}".strip())
             if len(out) >= 400:
                 break
         return out
+
+    def step(self, delta):
+        """◀ / ▶: the previous or next connection by number (Wireshark's
+        stream index spinner)."""
+        ids = sorted(f.fid for f in self._flows())
+        if not ids:
+            return None
+        cur = self.flow_id
+        if cur is None:
+            fid = ids[0] if delta > 0 else ids[-1]
+        else:
+            i = bisect.bisect_left(ids, cur)
+            if delta > 0:
+                i = i + 1 if i < len(ids) and ids[i] == cur else i
+            else:
+                i -= 1
+            if not 0 <= i < len(ids):
+                return None
+            fid = ids[i]
+        self.open_flow(fid)
+        return fid
 
     def open_flow(self, fid):
         f = self.app.model.flows.get(fid)
@@ -28602,6 +28976,11 @@ class StreamsView(_SubView):
             self.app.raw_streams_ok = True
             self.render()
 
+    def redacting(self):
+        r = self.result
+        return bool(r is not None and r.sensitive() and
+                    not getattr(self.app, "raw_streams_ok", False))
+
     def render(self):
         r = self.result
         txt = self.txt
@@ -28619,31 +28998,21 @@ class StreamsView(_SubView):
             txt.configure(state="disabled")
             self.info.configure(text="")
             return
-        redact = r.sensitive() and not getattr(self.app, "raw_streams_ok",
-                                               False)
+        redact = self.redacting()
         if redact:
             self.raw_btn.pack(side="left", padx=(8, 0))
-        hexmode = self.mode_var.get() == "Hex"
         sizes = [0, 0]
-        for i, (direction, off, data, no) in enumerate(r.chunks):
-            if data is None:
-                txt.insert("end", f"\n[… bytes {off}–{no} of "
-                           f"{'the client' if direction == 0 else 'the server'}"
-                           f" side were never captured …]\n", ("gap",))
+        for d, _o, data, _n in r.chunks:
+            if data is not None:
+                sizes[d] += len(data)
+        for i, (body, kind, no) in enumerate(stream_segments(
+                r, redact, self.mode_var.get() == "Hex", self.dir_var.get())):
+            if kind == "gap":
+                txt.insert("end", body, ("gap",))
                 continue
-            sizes[direction] += len(data)
             ptag = f"p_{i}"
             txt.tag_bind(ptag, "<Double-1>", lambda e, n=no: self.jump(n))
-            if hexmode:
-                body = hex_dump_lines(data) + "\n"
-            elif redact:
-                body = "".join(redact_stream_line(line, r) + "\n"
-                               for line in data.splitlines(True))
-            else:
-                body = data.decode("utf-8", "replace")
-                body = "".join(ch if ch.isprintable() or ch in "\r\n\t"
-                               else "." for ch in body)
-            txt.insert("end", body, (f"d{direction}", ptag))
+            txt.insert("end", body, (f"d{kind}", ptag))
         txt.configure(state="disabled")
         c, s = r.client, r.server
         self.info.configure(text=(
@@ -28653,6 +29022,38 @@ class StreamsView(_SubView):
                else "")
             + (" · redacted (mail, web or login protocol)" if redact else "")
             + " · double-click text to open its packet"))
+
+    def filter_on(self):
+        if self.flow_id:
+            self.app.apply_filter(f"stream:{self.flow_id}")
+
+    def save_as(self, path=None):
+        """Save the stream as text. Mail, web and login streams are
+        always saved redacted, even when the raw text is shown."""
+        r = self.result
+        if r is None or not r.chunks:
+            self.app._set_banner("Pick a connection to follow first.",
+                                 kind="warn")
+            return None
+        if path is None:
+            path = self.app._ask_save(".txt", [("Text files", "*.txt"),
+                                               ("All files", "*.*")],
+                                      f"stream-{self.flow_id}.txt")
+        if not path:
+            return None
+        text = stream_text(r, True, self.mode_var.get() == "Hex",
+                           self.dir_var.get())
+        try:
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+        except OSError as e:
+            messagebox.showerror("Save error", str(e), parent=self.app.root)
+            return None
+        self.app._set_banner(
+            f"Saved connection #{self.flow_id} to {path}" +
+            (" (redacted: mail, web or login protocol)." if r.sensitive()
+             else "."))
+        return path
 
     def find(self):
         q = self.find_var.get()
@@ -28677,6 +29078,7 @@ class StreamsView(_SubView):
 
     def reset(self):
         self.result = None
+        self.flow_id = None
         with contextlib.suppress(tk.TclError):
             self.render()
 
@@ -28771,6 +29173,33 @@ EXPERT_ADVICE = {
 }
 
 
+def expert_group_filter(g):
+    """A field expression that shows the packets of one finding group."""
+    sev = {"warn": "warning"}.get(g["sev"], g["sev"])
+    expr = (f"expert.severity == {sev} and expert.group == "
+            f"{filter_quote(g['group'])}")
+    # the longest run of words without numbers (addresses and counts
+    # differ between the members of a group)
+    pieces = re.split(r"\S*\d\S*", g["summary"])
+    prefix = max((p.strip(" :(-,#") for p in pieces), key=len, default="")
+    if len(prefix) >= 4:
+        expr += f" and expert.message contains {filter_quote(prefix)}"
+    return expr
+
+
+def write_expert_csv(f, findings):
+    """Findings as CSV: packet, time, severity, group, finding, field."""
+    w = safe_csv_writer(f)
+    w.writerow(["packet", "time", "severity", "group", "finding", "field"])
+    n = 0
+    for x in findings:
+        w.writerow([x[0] or "", datetime.fromtimestamp(x[1]).strftime(
+            "%Y-%m-%d %H:%M:%S.%f")[:-3] if x[1] else "",
+            {"warn": "warning"}.get(x[2], x[2]), x[3], x[4], x[5] or ""])
+        n += 1
+    return n
+
+
 class ExpertView(_SubView):
     """Expert findings, grouped so repeats count instead of flooding."""
 
@@ -28792,6 +29221,10 @@ class ExpertView(_SubView):
                                "Errors"])
         box.pack(side="left", padx=(4, 8))
         box.bind("<<ComboboxSelected>>", lambda e: self.refresh(force=True))
+        ttk.Button(b, text="Show these packets",
+                   command=self.show_packets).pack(side="left", padx=(4, 0))
+        ttk.Button(b, text="Export CSV…",
+                   command=self.export_csv).pack(side="left", padx=4)
         self.hint = self.label(b, "", muted=True)
         self.hint.pack(side="left", padx=8)
         pw = ttk.PanedWindow(self.frame, orient="vertical")
@@ -28802,6 +29235,8 @@ class ExpertView(_SubView):
         wrap.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._select)
         self.tree.bind("<Double-1>", self._open)
+        self.tree.bind("<Button-3>", self._menu)
+        self.tree.bind("<Button-2>", self._menu)
         self.detail = tk.Label(pw, text="", bg=WHITE, fg="#333333",
                                justify="left", anchor="nw", wraplength=900,
                                padx=8, pady=6)
@@ -28837,8 +29272,7 @@ class ExpertView(_SubView):
         self._version = store.version
         with store.lock:
             fs = list(store.findings)
-        rank = {"All": 3, "Note and above": 2, "Warning and above": 1,
-                "Errors": 0}.get(self.sev_var.get(), 2)
+        rank = self.rank()
         gs = self.grouped(fs, rank)
         self.groups = {}
         with contextlib.suppress(tk.TclError):
@@ -28871,6 +29305,79 @@ class ExpertView(_SubView):
         g = self.groups.get(sel[0]) if sel else None
         if g:
             self.jump(g["first"])
+
+    def rank(self):
+        return {"All": 3, "Note and above": 2, "Warning and above": 1,
+                "Errors": 0}.get(self.sev_var.get(), 2)
+
+    def selected(self):
+        sel = self.tree.selection()
+        return self.groups.get(sel[0]) if sel else None
+
+    def show_packets(self, g=None):
+        """Packets list filtered to the selected group (or to every packet
+        with a finding at the chosen level)."""
+        g = g or self.selected()
+        if g and not (g["first"] or g["last"]):
+            self.app._set_banner("This finding is about a whole connection "
+                                 "or session, not single packets, so there "
+                                 "is nothing to show in the packet list.",
+                                 kind="warn")
+            return None
+        if g:
+            expr = expert_group_filter(g)
+        else:
+            expr = "expert.severity >= " + {
+                3: "chat", 2: "note", 1: "warning", 0: "error"}[self.rank()]
+        self.app.apply_filter(expr)
+        return expr
+
+    def visible_findings(self):
+        store = self.app.deep.store
+        rank = self.rank()
+        with store.lock:
+            fs = list(store.findings)
+        return [f for f in fs if self.SEV_ORDER.get(f[2], 3) <= rank]
+
+    def export_csv(self, path=None):
+        fs = self.visible_findings()
+        if not fs:
+            self.app._set_banner("No expert findings to export at this "
+                                 "level.", kind="warn")
+            return None
+        if path is None:
+            path = self.app._ask_save(".csv", [("CSV files", "*.csv")],
+                                      "expert-findings.csv")
+        if not path:
+            return None
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                n = write_expert_csv(f, fs)
+        except OSError as e:
+            messagebox.showerror("Export error", str(e),
+                                 parent=self.app.root)
+            return None
+        self.app._set_banner(f"Exported {n:,} expert findings to {path}.")
+        return path
+
+    def _menu(self, e):
+        iid = self.tree.identify_row(e.y)
+        g = self.groups.get(iid)
+        if not g:
+            return
+        self.tree.selection_set(iid)
+        app = self.app
+        expr = expert_group_filter(g)
+        popup_menu(app, e, [
+            ("Open the first packet", lambda: self.jump(g["first"]),
+             bool(g["first"])),
+            ("Open the last packet", lambda: self.jump(g["last"]),
+             bool(g["last"])),
+            ("Show these packets", lambda: self.show_packets(g),
+             bool(g["first"] or g["last"])),
+            ("Copy as filter", lambda: copy_to_clipboard(app, expr)),
+            ("Copy finding", lambda: copy_to_clipboard(
+                app, f"{g['group']}: {g['summary']} (×{g['count']})"))])
 
 
 class StatisticsView(_SubView):
@@ -29020,6 +29527,8 @@ class StatisticsView(_SubView):
                 "reset" if f.rst else "closed" if f.closed else "open"))
             self._conv[iid] = f.fid
         tree.bind("<Double-1>", lambda e: self._open_conv(tree))
+        tree.bind("<Button-3>", lambda e: self._conv_menu(tree, e))
+        tree.bind("<Button-2>", lambda e: self._conv_menu(tree, e))
         self.note.configure(text=f"{len(flows):,} conversations among the "
                                  f"{len(rows):,} packets in memory. "
                                  f"Double-click one to follow it.")
@@ -29029,6 +29538,29 @@ class StatisticsView(_SubView):
         fid = self._conv.get(sel[0]) if sel else None
         if fid:
             self.app.follow_stream(fid)
+
+    def conv_filter(self, fid):
+        f = self.app.model.flows.get(fid)
+        if f is None:
+            return f"stream:{fid}"
+        return conversation_filter(f.local_ip, f.remote_ip, f.local_port,
+                                   f.remote_port, f.transport) or \
+            f"stream:{fid}"
+
+    def _conv_menu(self, tree, e):
+        iid = tree.identify_row(e.y)
+        fid = self._conv.get(iid)
+        if not fid:
+            return
+        tree.selection_set(iid)
+        expr = self.conv_filter(fid)
+        app = self.app
+        popup_menu(app, e, [
+            ("Follow stream", lambda: app.follow_stream(fid)),
+            ("Filter on this conversation", lambda: app.apply_filter(expr)),
+            ("Exclude this conversation",
+             lambda: app.apply_filter(f"not ({expr})")),
+            ("Copy as filter", lambda: copy_to_clipboard(app, expr))])
 
     # ---- endpoints
     def _endpoints(self, rows):
@@ -29045,7 +29577,7 @@ class StatisticsView(_SubView):
                     st[ip][0] += 1
                     st[ip][i] += n
         m = self.app.model
-        self._ep = {}
+        self._ep, self._ep_addr = {}, {}
         for ip, (pk, tx, rx) in sorted(st.items(), key=lambda x: -x[1][0])[
                 :3000]:
             if is_public_ip(ip):
@@ -29064,7 +29596,10 @@ class StatisticsView(_SubView):
                                                  _human_bytes(tx),
                                                  _human_bytes(rx)))
             self._ep[iid] = key
+            self._ep_addr[iid] = ip
         tree.bind("<Double-1>", lambda e: self._open_ep(tree))
+        tree.bind("<Button-3>", lambda e: self._ep_menu(tree, e))
+        tree.bind("<Button-2>", lambda e: self._ep_menu(tree, e))
         self.note.configure(text=f"{len(st):,} addresses in {len(rows):,} "
                                  f"packets in memory. A remote host is "
                                  f"never counted as a device on your "
@@ -29075,6 +29610,23 @@ class StatisticsView(_SubView):
         k = self._ep.get(sel[0]) if sel else None
         if k:
             self.app.goto(*k)
+
+    def _ep_menu(self, tree, e):
+        iid = tree.identify_row(e.y)
+        ip = self._ep_addr.get(iid)
+        if not ip:
+            return
+        tree.selection_set(iid)
+        expr = address_filter(ip)
+        app, k = self.app, self._ep.get(iid)
+        popup_menu(app, e, [
+            ("Filter on this address", lambda: app.apply_filter(expr)),
+            ("Exclude this address",
+             lambda: app.apply_filter(f"not {expr}")),
+            ("Copy as filter", lambda: copy_to_clipboard(app, expr)),
+            None,
+            ("Go to device" if k and k[0] == "device" else "Go to host",
+             lambda: app.goto(*k), bool(k))])
 
     # ---- DNS resolvers
     def _dns(self, rows):
@@ -30360,6 +30912,7 @@ class MiniWireshark:
                 ("Privacy posture…", self.open_privacy_posture),
                 ("What changed recently", self.open_changes),
                 ("Show / hide the inspector", self.toggle_inspector),
+                ("Go to packet…", self.go_to_packet),
                 ("Full Power on", lambda: self.set_perf_mode("Full Power")),
                 ("Full Power off (Automatic)",
                  lambda: self.set_perf_mode("Automatic")),
@@ -30668,6 +31221,31 @@ class MiniWireshark:
         tab.streams.open_flow(fid)
         return tab.streams
 
+    def apply_filter(self, expr):
+        """Packets list filtered by a field expression (switches to the
+        advanced view when needed, as Wireshark's Apply as Filter)."""
+        if self.beginner_mode:
+            self.mode_ui_var.set("Advanced")
+            self._on_ui_mode_change()
+        tab = self._select_tab("packets")
+        tab.show_subview("Packets")
+        tab.set_expression(expr)
+        return tab
+
+    def go_to_packet(self, no=None):
+        """Ctrl+G: jump to a packet number."""
+        if no is None:
+            text = ask_text(self, "Go to packet", "Packet number:")
+            if not text:
+                return None
+            try:
+                no = int(text.strip().lstrip("#"))
+            except ValueError:
+                self._set_banner(f"“{text.strip()}” is not a packet number.",
+                                 kind="warn")
+                return False
+        return self.jump_to_packet(no)
+
     def address_label(self, ip):
         """Device name for a local address, else the address."""
         dev = self.model.device_for(ip, None) if ip else None
@@ -30836,7 +31414,7 @@ class MiniWireshark:
         tr = translate_text
         return ((pill + "  ·  ") if pill else "") + (
                 f"{tr(VANTAGE_TEXT[v][0])}"
-                f"{' · ' + tr('blind spots') + ': ' + str(len(spots)) if spots else ''}"
+                f"{' · ' + tr('blind spots:') + ' ' + str(len(spots)) if spots else ''}"
                 f"  ·  {tr('◉ observed ◎ correlated ◌ inferred ? unknown')}"
                 f"  ·  {tr('F2 inspector')}")
 
@@ -32151,6 +32729,7 @@ class MiniWireshark:
             "undo": self._undo_shortcut,
             "inspector": lambda e=None: self.toggle_inspector(),
             "palette": lambda e=None: self.open_palette(),
+            "goto_packet": lambda e=None: self.go_to_packet(),
         }
         shortcuts = self.config.data.get("shortcuts", DEFAULT_SHORTCUTS)
         for name, seq in shortcuts.items():
@@ -35168,7 +35747,7 @@ class MiniWireshark:
             return
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
+                w = safe_csv_writer(f)
                 w.writerow(["no", "time", "protocol", "direction", "src_ip",
                             "src_mac", "dst_ip", "dst_mac", "sport", "dport",
                             "length", "connection", "text"])
@@ -35192,7 +35771,7 @@ class MiniWireshark:
             return
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
+                w = safe_csv_writer(f)
                 w.writerow(["name", "class", "ip", "ipv6", "mac", "vendor",
                             "confidence", "score", "status", "first_seen",
                             "last_seen", "bytes_sent", "bytes_received",
@@ -35217,7 +35796,7 @@ class MiniWireshark:
             return
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f)
+                w = safe_csv_writer(f)
                 w.writerow(["id", "device", "transport", "local", "remote",
                             "domain", "domain_confidence", "purpose",
                             "bytes_up", "bytes_down", "packets", "duration_s",
@@ -41504,8 +42083,14 @@ def deep_worker_main(inp=None, out=None):
     """Entry point of `python miniwireshark.py --mw-worker`: reads batches
     of frames on stdin, writes compact results on stdout. Never touches
     the network, the GUI or any file."""
-    inp = inp or sys.stdin.buffer
-    out = out or sys.stdout.buffer
+    if inp is None:
+        inp = getattr(sys.stdin, "buffer", None) or os.fdopen(0, "rb")
+    if out is None:
+        out = getattr(sys.stdout, "buffer", None) or os.fdopen(1, "wb")
+        # anything a library prints from now on goes to stderr, never into
+        # the binary result stream
+        sys.stdout = sys.stderr if sys.stderr is not None else \
+            open(os.devnull, "w")
     an = DeepAnalyzer()
     _wire_send(out, ("ready", SCRIPT_VERSION, os.getpid()))
     while True:
@@ -41626,14 +42211,17 @@ class _DeepWorkerProc:
         script = os.path.abspath(__file__)
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
-        log = open(os.path.join(PATHS.logs, f"deep-worker-{self.idx}.log"),
-                   "ab")
+        lp = os.path.join(PATHS.logs, f"deep-worker-{self.idx}.log")
+        with contextlib.suppress(OSError):          # keep the log small
+            if os.path.getsize(lp) > 1024 * 1024:
+                os.replace(lp, lp + ".1")
         kw = {}
         if IS_WINDOWS:
             kw["creationflags"] = 0x08000000          # CREATE_NO_WINDOW
-        self.proc = subprocess.Popen(
-            [sys.executable, script, WORKER_FLAG], stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=log, env=env, **kw)
+        with open(lp, "ab") as log:     # the child keeps its own handle
+            self.proc = subprocess.Popen(
+                [sys.executable, script, WORKER_FLAG], stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE, stderr=log, env=env, **kw)
         log.close()
         hello = _wire_recv(self.proc.stdout)
         if not hello or hello[0] != "ready":
@@ -47634,7 +48222,15 @@ class _FilterCtx:
         return dissect(d["raw"], d.get("linktype", 1))
 
     def expert_severities(self, d):
-        return self._f.get(d["no"], [])
+        return [x if isinstance(x, str) else x[0]
+                for x in self._f.get(d["no"], [])]
+
+    def expert_info(self, d, i):
+        return [x[i] for x in self._f.get(d["no"], [])
+                if not isinstance(x, str)]
+
+    def time_zero(self):
+        return SCENARIO_T0
 
 
 @self_test(slow=False)
@@ -47767,6 +48363,127 @@ def test_palette_matcher_resolvers_posture(ctx):
         assert any("HTTP" in k for k in mine) and \
             any("IMAP login" in k for k in mine), pp
     assert calibrate(0.2) > 100
+
+@self_test(slow=False)
+def test_v501_fixes_and_filters(ctx):
+    """5.0.1: sub-second durations, conversation / address / expert
+    filters, frame.time_relative (was always empty), time formats, CSV
+    cells that cannot run as formulas, and the stream text that is saved
+    exactly as shown (redacted in Hex too)."""
+    assert human_duration(0.4) == "<1s" and human_duration(0) == "0s"
+    assert human_duration(None) == "0s" and human_duration(75) == "1m 15s"
+    frames = ScenarioBuilder().home_network() + \
+        ScenarioBuilder(t0=SCENARIO_T0 + 9000).protocol_exchanges() + \
+        ScenarioBuilder(t0=SCENARIO_T0 + 9500).mail_sessions()
+    rows = _deep_rows(frames)
+    d = next(r for r in rows if r["transport"] == "TCP" and r["sport"])
+    expr = conversation_filter(d["src_ip"], d["dst_ip"], d["sport"],
+                               d["dport"], d["transport"], d["ipver"])
+    f = FieldFilter(expr)
+    key = {d["src_ip"], d["dst_ip"]}, {d["sport"], d["dport"]}
+    got = [r for r in rows if f.match(r, _FilterCtx())]
+    assert d in got and all(({r["src_ip"], r["dst_ip"]},
+                             {r["sport"], r["dport"]}) == key
+                            for r in got), expr
+    arp = next(r for r in rows if r.get("proto") == "ARP")
+    assert conversation_filter("", "", src_mac=arp["src_mac"],
+                               dst_mac=arp["dst_mac"]).startswith("eth.addr")
+    assert address_filter("192.168.1.5") == "ip.addr == 192.168.1.5"
+    assert address_filter("fe80::1") == "ipv6.addr == fe80::1"
+    assert address_filter("aa:bb:cc:dd:ee:ff").startswith("eth.addr")
+    FieldFilter(address_filter("fe80::1"))
+    # expert.group / expert.message and the group filter of the list
+    c = _FilterCtx({rows[3]["no"]: [("warn", "Sequence",
+                                     "TCP retransmission of 1460 bytes")],
+                    rows[5]["no"]: [("note", "Protocol", 'Say "hi" 2')]})
+    g = {"sev": "warn", "group": "Sequence",
+         "summary": "TCP retransmission of 1460 bytes"}
+    ge = expert_group_filter(g)
+    assert 'contains "TCP retransmission of"' in ge, ge
+    hits = [r["no"] for r in rows if FieldFilter(ge).match(r, c)]
+    assert hits == [rows[3]["no"]], hits
+    q = FieldFilter("expert.message contains " + filter_quote('Say "hi"'))
+    assert [r["no"] for r in rows if q.match(r, c)] == [rows[5]["no"]]
+    assert sum(1 for r in rows if FieldFilter(
+        'expert.group == "protocol"').match(r, c)) == 1
+    # frame.time_relative
+    late = [r for r in rows if FieldFilter(
+        "frame.time_relative > 9000").match(r, _FilterCtx())]
+    assert late and all(r["time"] - SCENARIO_T0 > 9000 for r in late)
+    assert len(late) < len(rows)
+    # time formats
+    assert format_packet_time(100.25, "Seconds since start", 100.0) == \
+        "0.250000"
+    assert format_packet_time(100.25, "Since previous shown", 0,
+                              100.0) == "0.250000"
+    assert format_packet_time(100.25, "Since previous shown") == "0.000000"
+    assert len(format_packet_time(time.time(), "Time of day")) == 12
+    # CSV cells
+    buf = io.StringIO()
+    w = safe_csv_writer(buf)
+    w.writerow(["=HYPERLINK(1)", "+1", "-x", "@a", "ok", 5, -3, "a=b"])
+    assert buf.getvalue().strip() == "'=HYPERLINK(1),'+1,'-x,'@a,ok,5,-3,a=b"
+    buf = io.StringIO()
+    n = write_expert_csv(buf, [(7, SCENARIO_T0, "warn", "Security",
+                                "=cmd", None)])
+    assert n == 1 and ",warning,Security,'=cmd," in buf.getvalue()
+    # followed streams: saved text == shown text; Hex stays redacted
+    secret = ScenarioBuilder.CANARY
+    fids = {}
+    for r in rows:
+        if r.get("sport") is None:
+            continue
+        k = frozenset([(r["src_ip"], r["sport"]), (r["dst_ip"], r["dport"])])
+        r["flow_id"] = fids.setdefault(k, len(fids) + 1)
+    leaked_raw = False
+    for fid in set(fids.values()):
+        res = follow_stream(rows, fid)
+        if not res.chunks:
+            continue
+        raw_all = b"".join(c[2] for c in res.chunks if c[2])
+        if not res.sensitive():
+            continue
+        leaked_raw = leaked_raw or secret.encode() in raw_all
+        for hexmode in (False, True):
+            for dr in STREAM_DIRECTIONS:
+                txt = stream_text(res, True, hexmode, dr)
+                assert secret not in txt, (fid, hexmode, dr)
+                if hexmode:
+                    flat = bytes.fromhex("".join(
+                        ln[10:57].replace(" ", "") for ln in
+                        txt.splitlines()[2:] if re.match(
+                            r"^[0-9a-f]{8}  ", ln)))
+                    assert secret.encode() not in flat, fid
+        both = stream_segments(res, True, False, STREAM_DIRECTIONS[0])
+        cli = stream_segments(res, True, False, STREAM_DIRECTIONS[1])
+        assert all(k in (0, "gap") for _t, k, _n in cli)
+        assert len(cli) <= len(both)
+    assert leaked_raw, "the scenario must carry the canary to prove this"
+
+
+@self_test(slow=False)
+def test_v501_translations(ctx):
+    """5.0.1: multi-line info blocks are translated line by line, the
+    runtime line is no longer shadowed by a generic pattern, French puts
+    a space before a colon, and the new messages have translations."""
+    fr = lambda t: translate_text(t, "fr")
+    assert fr("blind spots:") == "angles morts :"
+    assert fr("Running on Python 3.12.3 (/x/python) — the Python that "
+              "started MiniWireshark. It is never modified.").startswith(
+        "Exécuté avec Python 3.12.3 (/x/python)")
+    assert fr("Exported 3 expert findings to /tmp/a.csv.").startswith("3 ")
+    assert fr("What's new in 5.0") == "Nouveautés de la 5.0"
+    block = "Network card : eth0\nRouter       : 192.168.1.1"
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        assert DisplayVar.shown(block) == ("Carte réseau   : eth0\n"
+                                           "Box / routeur  : 192.168.1.1")
+    finally:
+        set_locale(old)
+    for t in TIME_FORMATS + STREAM_DIRECTIONS:
+        assert fr(t) != t or t == "Client → server", t
+
 
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
@@ -48966,6 +49683,139 @@ def _gs_m10(app, ctx):
     assert len(app.model.registry.by_key) == n_dev
     assert not os.path.exists(path)
     app.data_mode = "idle"
+
+
+@gui_test_step("5.0.1: expert list, copy as filter, follow stream, go to packet")
+def _gs_v501(app, ctx):
+    root = app.root
+    app.config.set("performance.mode", "Full Power")
+    app.config.set("performance.deep_runner", "Thread")
+    tmp = tempfile.mkdtemp()
+    try:
+        ident = scenario_identity()
+        m = app._new_model(identity=ident[:3])
+        m.set_identity(local_nets=ident[3])
+        app.replace_model(m)
+        app.data_mode = "offline"
+        sink = app.lossless_sink()
+        frames = ScenarioBuilder().home_network() + \
+            ScenarioBuilder(t0=SCENARIO_T0 + 2000).protocol_exchanges() + \
+            ScenarioBuilder(t0=SCENARIO_T0 + 3000).mail_sessions()
+        for raw, ts, lt in frames:
+            sink(raw, ts, lt)
+        _gui_pump(root, until=lambda: app.count >= len(frames), timeout=30)
+        assert app.deep.drain(20)
+        app.deep.flush(final=True)
+        _gui_pump(root, 0.5)
+        tab = app._select_tab("packets")
+        tab.rebuild()
+        # expert list → packets, CSV export, row colours
+        tab.show_subview("Expert")
+        ev = tab.expert
+        ev.sev_var.set("All")
+        ev.refresh(force=True)
+        kids = ev.tree.get_children()
+        assert kids, "no expert groups"
+        loose = next((k for k in kids if not ev.groups[k]["first"]), None)
+        if loose:
+            ev.tree.selection_set(loose)
+            assert ev.show_packets() is None
+        k = next(k for k in kids if ev.groups[k]["first"])
+        ev.tree.selection_set(k)
+        g = ev.selected()
+        expr = ev.show_packets()
+        _gui_pump(root, 0.3)
+        assert tab.subview == "Packets" and tab.expr_var.get() == expr
+        assert tab.matched, expr
+        assert g["first"] in {d["no"] for d in tab.matched}, (expr, g)
+        assert len(tab.matched) <= max(g["count"], 1) * 3 + 5
+        tab.render()
+        tags = [t for iid in tab.slots for t in tab.tree.item(iid, "tags")]
+        sev = {d["no"]: tab.ctx.worst_expert(d) for d in tab.matched}
+        if any(sev.values()):
+            assert any(t.startswith("x_") for t in tags), tags
+        tab.xcolor_var.set(False)
+        tab._xcolor()
+        tags = [t for iid in tab.slots for t in tab.tree.item(iid, "tags")]
+        assert not any(t.startswith("x_") for t in tags)
+        tab.xcolor_var.set(True)
+        tab._xcolor()
+        out = ev.export_csv(os.path.join(tmp, "expert.csv"))
+        text = open(out, encoding="utf-8").read()
+        assert text.startswith("packet,time,severity,group,finding")
+        assert text.count("\n") >= len(kids) + 1
+        tab.clear_filter()
+        # time display formats
+        tab.time_var.set("Seconds since start")
+        tab._time_format()
+        first = tab.tree.item(tab.slots[0], "values")[2]
+        assert re.match(r"^\d+\.\d{6}$", str(first)), first
+        tab.time_var.set("Since previous shown")
+        tab._time_format()
+        assert re.match(r"^\d+\.\d{6}$",
+                        str(tab.tree.item(tab.slots[1], "values")[2]))
+        tab.time_var.set("Time of day")
+        tab._time_format()
+        assert ":" in str(tab.tree.item(tab.slots[0], "values")[2])
+        assert app.config.get("capture.time_format") == "Time of day"
+        # copy as filter / filter on conversation
+        row = next(d for d in app.all_rows if d.get("transport") == "TCP"
+                   and d.get("flow_id"))
+        conv = conversation_filter(row["src_ip"], row["dst_ip"],
+                                   row["sport"], row["dport"],
+                                   row["transport"], row["ipver"])
+        app.apply_filter(conv)
+        assert tab.matched and all(d.get("flow_id") == row["flow_id"]
+                                   for d in tab.matched), conv
+        tab.clear_filter()
+        tab.show_subview("Statistics")
+        tab.stats.kind_var.set("Conversations")
+        tab.stats.refresh(force=True)
+        assert tab.stats.conv_filter(row["flow_id"]).count("==") == 4
+        tab.stats.kind_var.set("Endpoints")
+        tab.stats.refresh(force=True)
+        assert tab.stats._ep_addr
+        # follow stream: ◀ ▶, direction, save (redacted), filter
+        sv = app.follow_stream(row["flow_id"])
+        _gui_pump(root, 0.2)
+        nxt = sv.step(1)
+        assert nxt is None or nxt > row["flow_id"]
+        if nxt:
+            assert sv.flow_id == nxt
+            assert sv.step(-1) == row["flow_id"]
+        sv.dir_var.set("Server → client")
+        sv.render()
+        sv.dir_var.set("Both directions")
+        sv.render()
+        mail = next(d for d in app.all_rows if d.get("dport") == 25 and
+                    d.get("flow_id"))
+        sv = app.follow_stream(mail["flow_id"])
+        app.raw_streams_ok = True
+        sv.render()
+        path = sv.save_as(os.path.join(tmp, "s.txt"))
+        saved = open(path, encoding="utf-8").read()
+        assert ScenarioBuilder.CANARY not in saved and "redacted" in saved
+        sv.mode_var.set("Hex")
+        app.raw_streams_ok = False
+        sv.render()
+        body = sv.txt.get("1.0", "end")
+        assert ScenarioBuilder.CANARY.encode().hex()[:16] not in \
+            body.replace(" ", "")
+        sv.mode_var.set("Text")
+        sv.filter_on()
+        assert tab.subview == "Packets" and \
+            tab.expr_var.get() == f"stream:{mail['flow_id']}"
+        tab.clear_filter()
+        # go to packet (Ctrl+G)
+        target = app.all_rows[len(app.all_rows) // 2]["no"]
+        assert app.go_to_packet(target)
+        assert tab.sel_no == target
+        assert app.config.get("shortcuts.goto_packet") == "<Control-g>"
+        assert any(x[0] == "Go to packet…" for x in app.palette_items())
+    finally:
+        app.raw_streams_ok = False
+        app.config.set("performance.mode", "Automatic")
+        app.config.set("performance.deep_runner", "Automatic")
 
 
 @gui_test_step("corrections: rename, merge, undo from the window")

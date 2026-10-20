@@ -1,0 +1,48 @@
+blind spots: ¦ angles morts : ¦ puntos ciegos:
+Time: ¦ Heure : ¦ Hora:
+Time of day ¦ Heure du jour ¦ Hora del día
+Seconds since start ¦ Secondes depuis le début ¦ Segundos desde el inicio
+Since previous shown ¦ Depuis le précédent affiché ¦ Desde el anterior mostrado
+Colour expert findings ¦ Colorer les constats d'expert ¦ Colorear hallazgos de experto
+Filter on this conversation ¦ Filtrer sur cette conversation ¦ Filtrar por esta conversación
+Copy conversation as filter ¦ Copier la conversation comme filtre ¦ Copiar la conversación como filtro
+Copy source as filter ¦ Copier la source comme filtre ¦ Copiar el origen como filtro
+Copy destination as filter ¦ Copier la destination comme filtre ¦ Copiar el destino como filtro
+Exclude this conversation ¦ Exclure cette conversation ¦ Excluir esta conversación
+Filter on this address ¦ Filtrer sur cette adresse ¦ Filtrar por esta dirección
+Exclude this address ¦ Exclure cette adresse ¦ Excluir esta dirección
+Go to device ¦ Aller à l'appareil ¦ Ir al dispositivo
+Go to host ¦ Aller à l'hôte ¦ Ir al host
+Go to packet ¦ Aller au paquet ¦ Ir al paquete
+Go to packet… ¦ Aller au paquet… ¦ Ir al paquete…
+Go to packet number ¦ Aller au paquet numéro ¦ Ir al paquete número
+Packet number: ¦ Numéro du paquet : ¦ Número de paquete:
+Both directions ¦ Les deux sens ¦ Ambos sentidos
+Client → server ¦ Client → serveur ¦ Cliente → servidor
+Server → client ¦ Serveur → client ¦ Servidor → cliente
+Filter on this stream ¦ Filtrer sur ce flux ¦ Filtrar por este flujo
+Pick a connection to follow first. ¦ Choisissez d'abord une connexion à suivre. ¦ Elija primero una conexión para seguir.
+Show these packets ¦ Afficher ces paquets ¦ Mostrar estos paquetes
+Export CSV… ¦ Exporter en CSV… ¦ Exportar CSV…
+No expert findings to export at this level. ¦ Aucun constat d'expert à exporter à ce niveau. ¦ No hay hallazgos de experto para exportar en este nivel.
+Open the first packet ¦ Ouvrir le premier paquet ¦ Abrir el primer paquete
+Open the last packet ¦ Ouvrir le dernier paquet ¦ Abrir el último paquete
+Copy finding ¦ Copier le constat ¦ Copiar el hallazgo
+Text files ¦ Fichiers texte ¦ Archivos de texto
+CSV files ¦ Fichiers CSV ¦ Archivos CSV
+Packet number ¦ Numéro du paquet ¦ Número de paquete
+IPv4 address, either direction ¦ Adresse IPv4, dans les deux sens ¦ Dirección IPv4, en ambos sentidos
+IPv6 address, either direction ¦ Adresse IPv6, dans les deux sens ¦ Dirección IPv6, en ambos sentidos
+TCP port, either direction ¦ Port TCP, dans les deux sens ¦ Puerto TCP, en ambos sentidos
+UDP port, either direction ¦ Port UDP, dans les deux sens ¦ Puerto UDP, en ambos sentidos
+MAC address, either direction ¦ Adresse MAC, dans les deux sens ¦ Dirección MAC, en ambos sentidos
+Worst expert finding on the packet (chat, note, warning, error) ¦ Pire constat d'expert sur le paquet (chat, note, warning, error) ¦ Peor hallazgo de experto del paquete (chat, note, warning, error)
+Expert finding group (Sequence, Malformed, Protocol, Security, Checksum, Response code) ¦ Groupe du constat d'expert (Sequence, Malformed, Protocol, Security, Checksum, Response code) ¦ Grupo del hallazgo de experto (Sequence, Malformed, Protocol, Security, Checksum, Response code)
+Expert finding text ¦ Texte du constat d'expert ¦ Texto del hallazgo de experto
+Seconds since the first packet ¦ Secondes depuis le premier paquet ¦ Segundos desde el primer paquete
+Connection number ¦ Numéro de connexion ¦ Número de conexión
+Fixes and small additions (5.0.1) ¦ Corrections et petits ajouts (5.0.1) ¦ Correcciones y pequeñas mejoras (5.0.1)
+Expert findings open their packets and export to CSV, Copy as filter in more places, Follow stream can save, step ◀ ▶ and pick a direction, Ctrl+G goes to a packet, three time formats and coloured expert rows. ¦ Les constats d'expert ouvrent leurs paquets et s'exportent en CSV, « Copier comme filtre » à plus d'endroits, le suivi de flux peut enregistrer, passer ◀ ▶ et choisir un sens, Ctrl+G va à un paquet, trois formats d'heure et des lignes colorées pour les constats. ¦ Los hallazgos de experto abren sus paquetes y se exportan a CSV, «Copiar como filtro» en más lugares, seguir flujo puede guardar, pasar ◀ ▶ y elegir un sentido, Ctrl+G va a un paquete, tres formatos de hora y filas coloreadas para los hallazgos.
+This finding is about a whole connection or session, not single packets, so there is nothing to show in the packet list. ¦ Ce constat porte sur une connexion ou une session entière, pas sur des paquets précis : il n'y a rien à afficher dans la liste des paquets. ¦ Este hallazgo se refiere a una conexión o sesión completa, no a paquetes concretos, así que no hay nada que mostrar en la lista de paquetes.
+Packet capture and decoding ¦ Capture et décodage des paquets ¦ Captura y decodificación de paquetes
+Adapter link status, CPU-aware performance mode ¦ État de la liaison de la carte, mode de performance selon le processeur ¦ Estado del enlace del adaptador, modo de rendimiento según la CPU
