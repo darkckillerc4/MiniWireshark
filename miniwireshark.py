@@ -1694,22 +1694,25 @@ class LoaderWindow(tk.Frame):
     thread-safe (a queue drained on the Tk thread)."""
 
     WHATS_NEW = (
-        ("\U0001F50E", "Evidence you can check",
-         "Every statement says how it's known (◉ observed, ◎ correlated, "
-         "◌ inferred) and links to the packets behind it. Press F2 for the "
-         "Inspector."),
-        ("⚡", "Ten times faster capture",
-         "A new capture pipeline keeps up with busy networks without "
-         "freezing the window."),
-        ("\U0001F6E1", "Quiet on new networks",
-         "Networks you haven't marked as yours start in Quiet Mode — "
-         "nothing is sent until you trust them."),
-        ("\U0001F552", "History and “what changed”",
-         "Optional history keeps evidence across restarts and tells you "
-         "what's new since yesterday."),
-        ("\U0001F6E0", "One-click Repair",
-         "Something wrong? Settings → Repair MiniWireshark checks and "
-         "fixes the usual problems for you."),
+        ("\U0001F52C", "A packet workspace like Wireshark's",
+         "Every field with its exact bytes, Follow stream, request and "
+         "reply pairs, statistics and expert findings — each packet also "
+         "explained in one plain sentence."),
+        ("⚡", "Full Power",
+         "A deeper pass inside a budget you set: every decoder, rebuilt "
+         "connections and expert findings. It never changes what is "
+         "captured or sends anything."),
+        ("✉", "Email Traffic",
+         "How mail connections behave — encryption, logins, failures — "
+         "never what anyone wrote, and never a password."),
+        ("\U0001F9E9", "Components Center",
+         "Optional, verified downloads (vendor names, encrypted-DNS lists, "
+         "public blocklists), offline packs and one click back to the "
+         "built-in data."),
+        ("⌨", "Ctrl+K goes anywhere",
+         "Tabs, settings, devices, filters and ready-made workspaces from "
+         "one search box. Starting up is also more reliable, with Safe "
+         "Mode if a start fails twice."),
     )
 
     def __init__(self, master, config=None, mode="startup"):
@@ -19518,6 +19521,226 @@ Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
 Automatic (MiniWireshark decides) ¦ Automatique (MiniWireshark décide) ¦ Automático (MiniWireshark decide)
 You set this type ¦ Vous avez choisi ce type ¦ Usted eligió este tipo
 detected ¦ détecté ¦ detectado
+High ¦ Élevée ¦ Alta
+Medium ¦ Moyenne ¦ Media
+Low ¦ Faible ¦ Baja
+Unconfirmed ¦ Non confirmée ¦ Sin confirmar
+still learning ¦ encore en apprentissage ¦ todavía aprendiendo
+Still measuring ¦ Mesure en cours ¦ Midiendo todavía
+This computer's view ¦ Vue de cet ordinateur ¦ Vista de este equipo
+Partial view ¦ Vue partielle ¦ Vista parcial
+Imported capture ¦ Capture importée ¦ Captura importada
+‼ Investigate — one or more DANGER alerts need a look. ¦ ‼ À examiner — une ou plusieurs alertes DANGER méritent un coup d'œil. ¦ ‼ Investigar — una o más alertas de PELIGRO merecen una revisión.
+⚠ Attention — a few unusual things are worth a glance; nothing is necessarily wrong. ¦ ⚠ Attention — quelques éléments inhabituels méritent un coup d'œil ; rien n'est forcément anormal. ¦ ⚠ Atención — algunas cosas inusuales merecen un vistazo; nada está necesariamente mal.
+⏸ Not watching right now. ¦ ⏸ Pas de surveillance en ce moment. ¦ ⏸ Sin vigilar ahora mismo.
+✔ Healthy — nothing unusual noticed so far. ¦ ✔ Tout va bien — rien d'inhabituel jusqu'ici. ¦ ✔ Todo bien — nada inusual por ahora.
+No router check has run yet. ¦ Aucune vérification de la box n'a encore été faite. ¦ Aún no se ha hecho ninguna comprobación del router.
+Sent since start, by feature: ¦ Envoyé depuis le démarrage, par fonction : ¦ Enviado desde el inicio, por función:
+Nothing sent yet. ¦ Rien n'a encore été envoyé. ¦ Aún no se ha enviado nada.
+Settings are saved in: ¦ Les réglages sont enregistrés dans : ¦ Los ajustes se guardan en:
+Data folder (caches, logs, history, sessions): ¦ Dossier de données (caches, journaux, historique, sessions) : ¦ Carpeta de datos (cachés, registros, historial, sesiones):
+◉ observed ◎ correlated ◌ inferred ? unknown ¦ ◉ observé ◎ corrélé ◌ déduit ? inconnu ¦ ◉ observado ◎ correlacionado ◌ deducido ? desconocido
+F2 inspector ¦ F2 inspecteur ¦ F2 inspector
+About its ports ¦ À propos de ses ports ¦ Sobre sus puertos
+Advertised services ¦ Services annoncés ¦ Servicios anunciados
+Blind spots right now ¦ Angles morts actuels ¦ Puntos ciegos ahora
+Category (informational) ¦ Catégorie (pour information) ¦ Categoría (informativa)
+Could this be normal? ¦ Est-ce que ça peut être normal ? ¦ ¿Puede ser normal?
+DETAILS ¦ DÉTAILS ¦ DETALLES
+From this computer ¦ Depuis cet ordinateur ¦ Desde este equipo
+How confident is MiniWireshark? ¦ À quel point MiniWireshark est-il sûr ? ¦ ¿Qué seguridad tiene MiniWireshark?
+How much of it MiniWireshark can see ¦ Ce que MiniWireshark peut en voir ¦ Cuánto puede ver MiniWireshark
+How sure is this? ¦ À quel point est-ce sûr ? ¦ ¿Qué tan seguro es?
+How the score was calculated ¦ Comment le score a été calculé ¦ Cómo se calculó la puntuación
+How to see more ¦ Comment en voir plus ¦ Cómo ver más
+INTERPRETATION ¦ INTERPRÉTATION ¦ INTERPRETACIÓN
+Identity conflict ¦ Conflit d'identité ¦ Conflicto de identidad
+Identity correlation ¦ Corrélation d'identité ¦ Correlación de identidad
+Identity history ¦ Historique d'identité ¦ Historial de identidad
+Normal behaviour (learned) ¦ Comportement habituel (appris) ¦ Comportamiento habitual (aprendido)
+OBSERVED ¦ OBSERVÉ ¦ OBSERVADO
+POSSIBLE INNOCENT EXPLANATIONS ¦ EXPLICATIONS INNOCENTES POSSIBLES ¦ POSIBLES EXPLICACIONES INOCENTES
+Presence (online / offline) ¦ Présence (en ligne / hors ligne) ¦ Presencia (en línea / desconectado)
+Protocols seen ¦ Protocoles vus ¦ Protocolos vistos
+RELATED EVIDENCE ¦ PREUVES LIÉES ¦ PRUEBAS RELACIONADAS
+Regular check-ins (repeating connections) ¦ Contacts réguliers (connexions répétées) ¦ Contactos regulares (conexiones repetidas)
+Saved data ¦ Données enregistrées ¦ Datos guardados
+WHAT TO CHECK ¦ CE QU'IL FAUT VÉRIFIER ¦ QUÉ COMPROBAR
+Websites contacted ¦ Sites contactés ¦ Sitios contactados
+What can this device do? ¦ Que peut faire cet appareil ? ¦ ¿Qué puede hacer este dispositivo?
+What did MiniWireshark see? ¦ Qu'a vu MiniWireshark ? ¦ ¿Qué vio MiniWireshark?
+What is it? ¦ Qu'est-ce que c'est ? ¦ ¿Qué es?
+What should I check? ¦ Que dois-je vérifier ? ¦ ¿Qué debo comprobar?
+Your notes ¦ Vos notes ¦ Sus notas
+⚠ Reputation ¦ ⚠ Réputation ¦ ⚠ Reputación
+Strongly supported by several independent local signals. ¦ Solidement étayé par plusieurs signaux locaux indépendants. ¦ Respaldado por varias señales locales independientes.
+Take the identity with a grain of salt until more evidence arrives. ¦ Prenez cette identité avec prudence en attendant plus de preuves. ¦ Tome esta identidad con cautela hasta que lleguen más pruebas.
+Reasonably supported; it could still firm up further. ¦ Raisonnablement étayé ; cela peut encore se confirmer. ¦ Razonablemente respaldado; aún puede confirmarse más.
+This device comes from a saved session or file — it is not live. ¦ Cet appareil vient d'une session enregistrée ou d'un fichier — ce n'est pas en direct. ¦ Este dispositivo viene de una sesión guardada o de un archivo — no es en directo.
+I cannot determine this from passive traffic alone yet ¦ Je ne peux pas encore le déterminer à partir du seul trafic observé ¦ Todavía no puedo determinarlo solo con el tráfico observado
+If you don't recognize this device, check your router's connected-devices list and, if needed, change your Wi-Fi password. ¦ Si vous ne reconnaissez pas cet appareil, consultez la liste des appareils connectés de votre box et, si besoin, changez le mot de passe Wi-Fi. ¦ Si no reconoce este dispositivo, revise la lista de dispositivos conectados de su router y, si hace falta, cambie la contraseña del Wi-Fi.
+Confidence is still low — keep watching; it improves as more evidence arrives, or fades if the signal doesn't repeat. ¦ La confiance est encore faible — continuez d'observer ; elle augmente avec de nouvelles preuves, ou diminue si le signal ne se répète pas. ¦ La confianza aún es baja — siga observando; mejora a medida que llegan pruebas, o se desvanece si la señal no se repite.
+Yes, in most cases: new phones, guests, smart-home gadgets and laptops waking from sleep all look like this. It only matters if you don't recognize the device. ¦ Oui, dans la plupart des cas : nouveaux téléphones, invités, objets connectés et portables qui sortent de veille ressemblent tous à ça. Ça ne compte que si vous ne reconnaissez pas l'appareil. ¦ Sí, en la mayoría de los casos: teléfonos nuevos, invitados, aparatos domésticos inteligentes y portátiles que salen de suspensión se ven así. Solo importa si no reconoce el dispositivo.
+All of it: this is the computer MiniWireshark runs on. ¦ Tout : c'est l'ordinateur sur lequel MiniWireshark tourne. ¦ Todo: es el equipo donde se ejecuta MiniWireshark.
+Only what it broadcasts or sends to this computer (announcements, name lookups shared on the network). Its private connections go straight to the router and are not visible from here. ¦ Seulement ce qu'il diffuse ou envoie à cet ordinateur (annonces, recherches de noms partagées sur le réseau). Ses connexions privées vont directement à la box et ne sont pas visibles d'ici. ¦ Solo lo que difunde o envía a este equipo (anuncios, búsquedas de nombres compartidas en la red). Sus conexiones privadas van directamente al router y no se ven desde aquí.
+Seen through local announcements and the traffic that passes this computer; no Internet connections of its own were visible. ¦ Vu par ses annonces locales et le trafic qui passe par cet ordinateur ; aucune de ses propres connexions Internet n'était visible. ¦ Visto por sus anuncios locales y el tráfico que pasa por este equipo; no se vio ninguna conexión a Internet propia.
+present ¦ maintenant ¦ ahora
+Note… ¦ Note… ¦ Nota…
+Report… ¦ Rapport… ¦ Informe…
+📂 File (not live) ¦ 📂 Fichier (pas en direct) ¦ 📂 Archivo (no en directo)
+Session ▾ ¦ Session ▾ ¦ Sesión ▾
+🔌 Sources ¦ 🔌 Sources ¦ 🔌 Fuentes
+Type: ¦ Type : ¦ Tipo:
+Source: ¦ Source : ¦ Fuente:
+Port: ¦ Port : ¦ Puerto:
+Mail ¦ Courrier ¦ Correo
+Mail server ¦ Serveur de courrier ¦ Servidor de correo
+Encryption ¦ Chiffrement ¦ Cifrado
+Logins (ok / failed) ¦ Connexions (réussies / échouées) ¦ Inicios de sesión (correctos / fallidos)
+Messages / recipients ¦ Messages / destinataires ¦ Mensajes / destinatarios
+Bytes up / down ¦ Octets envoyés / reçus ¦ Bytes enviados / recibidos
+Ended ¦ Fin ¦ Fin
+Streams ¦ Flux ¦ Flujos
+Exchanges ¦ Échanges ¦ Intercambios
+Statistics ¦ Statistiques ¦ Estadísticas
+Expert ¦ Expert ¦ Experto
+Expression: ¦ Expression : ¦ Expresión:
+Fields… ¦ Champs… ¦ Campos…
+Connection: ¦ Connexion : ¦ Conexión:
+Text ¦ Texte ¦ Texto
+Hex ¦ Hexa ¦ Hex
+Find: ¦ Rechercher : ¦ Buscar:
+Find ¦ Rechercher ¦ Buscar
+Client ¦ Client ¦ Cliente
+Took ¦ Durée ¦ Duración
+Kind: ¦ Type : ¦ Tipo:
+Show: ¦ Afficher : ¦ Mostrar:
+Note and above ¦ Notes et plus ¦ Notas y superior
+Warning and above ¦ Avertissements et plus ¦ Advertencias y superior
+Errors ¦ Erreurs ¦ Errores
+Protocol hierarchy ¦ Hiérarchie des protocoles ¦ Jerarquía de protocolos
+Conversations ¦ Conversations ¦ Conversaciones
+Endpoints ¦ Points de terminaison ¦ Extremos
+I/O graph ¦ Graphique E/S ¦ Gráfico de E/S
+DNS resolvers ¦ Résolveurs DNS ¦ Resolutores DNS
+Group ¦ Groupe ¦ Grupo
+Finding ¦ Constat ¦ Hallazgo
+Count ¦ Nombre ¦ Cantidad
+First packet ¦ Premier paquet ¦ Primer paquete
+Last packet ¦ Dernier paquet ¦ Último paquete
+% of packets ¦ % des paquets ¦ % de paquetes
+Bytes ¦ Octets ¦ Bytes
+% of bytes ¦ % des octets ¦ % de bytes
+Address A ¦ Adresse A ¦ Dirección A
+Address B ¦ Adresse B ¦ Dirección B
+Average rate ¦ Débit moyen ¦ Velocidad media
+State ¦ État ¦ Estado
+What it is ¦ Ce que c'est ¦ Qué es
+Sent ¦ Envoyé ¦ Enviado
+Received ¦ Reçu ¦ Recibido
+Resolver ¦ Résolveur ¦ Resolutor
+Lookups ¦ Recherches ¦ Búsquedas
+Answered ¦ Répondues ¦ Respondidas
+Typical ¦ Habituel ¦ Típico
+Slowest 5 % ¦ 5 % les plus lents ¦ 5 % más lentas
+No answer ¦ Sans réponse ¦ Sin respuesta
+Retries ¦ Nouvelles tentatives ¦ Reintentos
+Packet history ¦ Historique des paquets ¦ Historial de paquetes
+What MiniWireshark learned over time (devices, sites, events). ¦ Ce que MiniWireshark a appris au fil du temps (appareils, sites, événements). ¦ Lo que MiniWireshark aprendió con el tiempo (dispositivos, sitios, eventos).
+Raw packets kept on disk (off unless you turned it on). ¦ Paquets bruts conservés sur le disque (désactivé sauf si vous l'avez activé). ¦ Paquetes sin procesar guardados en disco (desactivado salvo que lo active).
+Optional data (Components Center) ¦ Données facultatives (Centre des composants) ¦ Datos opcionales (Centro de componentes)
+Vendor, port, encrypted-DNS and reputation lists you downloaded. ¦ Listes de fabricants, de ports, de DNS chiffré et de réputation que vous avez téléchargées. ¦ Listas de fabricantes, puertos, DNS cifrado y reputación que descargó.
+Private packages folder ¦ Dossier des paquets privés ¦ Carpeta de paquetes privados
+The capture engine and optional helpers installed for this Python. ¦ Le moteur de capture et les outils facultatifs installés pour ce Python. ¦ El motor de captura y las herramientas opcionales instaladas para este Python.
+Saved sessions, autosave and crash journal ¦ Sessions enregistrées, sauvegarde automatique et journal de secours ¦ Sesiones guardadas, autoguardado y diario de recuperación
+Sessions you saved and the automatic copies. ¦ Les sessions que vous avez enregistrées et les copies automatiques. ¦ Las sesiones que guardó y las copias automáticas.
+Logs and startup history ¦ Journaux et historique des démarrages ¦ Registros e historial de inicios
+Diagnostics text; nothing captured from the network. ¦ Texte de diagnostic ; rien de capturé sur le réseau. ¦ Texto de diagnóstico; nada capturado de la red.
+Meaning ¦ Signification ¦ Significado
+📡  Capture ¦ 📡  Capture ¦ 📡  Captura
+cores ¦ cœurs ¦ núcleos
+ℹ INFO ¦ ℹ INFO ¦ ℹ INFO
+‼ DANGER ¦ ‼ DANGER ¦ ‼ PELIGRO
+Timed from matched question/answer pairs (Full Power). One slow resolver makes every site feel slow. ¦ Mesuré sur des paires question/réponse appariées (pleine puissance). Un seul résolveur lent rend chaque site lent. ¦ Medido con pares pregunta/respuesta emparejados (máxima potencia). Un solo resolutor lento hace que todos los sitios parezcan lentos.
+No DNS timings yet: they are measured in Full Power mode. ¦ Pas encore de temps DNS : ils sont mesurés en mode pleine puissance. ¦ Aún no hay tiempos DNS: se miden en el modo de máxima potencia.
+No DNS timings (turn on Full Power) ¦ Pas de temps DNS (activez la pleine puissance) ¦ Sin tiempos DNS (active la máxima potencia)
+packets/s ¦ paquets/s ¦ paquetes/s
+upload bits/s ¦ bits/s envoyés ¦ bits/s enviados
+download bits/s ¦ bits/s reçus ¦ bits/s recibidos
+DNS latency ms ¦ latence DNS ms ¦ latencia DNS ms
+Showing what can be worked out from the saved data — active checks don't run on data that isn't live. ¦ Affiche ce qu'on peut déduire des données enregistrées — les vérifications actives ne s'exécutent pas sur des données qui ne sont pas en direct. ¦ Muestra lo que se puede deducir de los datos guardados — las comprobaciones activas no se ejecutan con datos que no son en directo.
+Lookups seem to be encrypted (DoH/DoT), so I can't time them. ¦ Les recherches semblent chiffrées (DoH/DoT), je ne peux donc pas les chronométrer. ¦ Las búsquedas parecen cifradas (DoH/DoT), así que no puedo medirlas.
+Pick a connection (or right-click a packet → Follow stream). Only packets still in memory can be shown. ¦ Choisissez une connexion (ou clic droit sur un paquet → Suivre le flux). Seuls les paquets encore en mémoire peuvent être affichés. ¦ Elija una conexión (o clic derecho en un paquete → Seguir flujo). Solo se pueden mostrar los paquetes que siguen en memoria.
+Follow stream ¦ Suivre le flux ¦ Seguir flujo
+Apply as filter ¦ Appliquer comme filtre ¦ Aplicar como filtro
+Exclude from the view ¦ Exclure de la vue ¦ Excluir de la vista
+Copy field name ¦ Copier le nom du champ ¦ Copiar el nombre del campo
+Copy value ¦ Copier la valeur ¦ Copiar el valor
+Copy as filter ¦ Copier comme filtre ¦ Copiar como filtro
+Show the connection ¦ Afficher la connexion ¦ Mostrar la conexión
+Bookmark this packet ¦ Marquer ce paquet ¦ Marcar este paquete
+Go to… ¦ Aller à… ¦ Ir a…
+Save workspace ¦ Enregistrer l'espace de travail ¦ Guardar espacio de trabajo
+Name for this view (tab, sub-view, filter and mode): ¦ Nom de cette vue (onglet, sous-vue, filtre et mode) : ¦ Nombre de esta vista (pestaña, subvista, filtro y modo):
+Slow Internet ¦ Internet lent ¦ Internet lento
+Mail problem ¦ Problème de courrier ¦ Problema de correo
+Who is new on my network ¦ Qui est nouveau sur mon réseau ¦ Quién es nuevo en mi red
+Is my router OK ¦ Ma box va-t-elle bien ¦ ¿Está bien mi router?
+Health tab with the Wi-Fi and router checks, so the likely culprit is on screen. ¦ L'onglet Santé avec les vérifications Wi-Fi et box, pour avoir le coupable probable à l'écran. ¦ La pestaña Salud con las comprobaciones de Wi-Fi y router, para tener al culpable probable en pantalla.
+Full Power on, then Connections → Mail, which shows which mail server failed and how. ¦ Pleine puissance activée, puis Connexions → Courrier, qui montre quel serveur de courrier a échoué et comment. ¦ Máxima potencia activada y luego Conexiones → Correo, que muestra qué servidor de correo falló y cómo.
+The Devices tab plus what changed in the last hour. ¦ L'onglet Appareils et ce qui a changé dans la dernière heure. ¦ La pestaña Dispositivos y lo que cambió en la última hora.
+The Health tab's router answers and the Security tab's router checks. ¦ Les réponses de la box dans l'onglet Santé et ses vérifications dans l'onglet Sécurité. ¦ Las respuestas del router en la pestaña Salud y sus comprobaciones en la pestaña Seguridad.
+What this shows ¦ Ce que cela montre ¦ Qué muestra
+Result ¦ Résultat ¦ Resultado
+Logins ¦ Connexions ¦ Inicios de sesión
+Mail sent ¦ Courrier envoyé ¦ Correo enviado
+No login seen. ¦ Aucune connexion vue. ¦ No se vio ningún inicio de sesión.
+Passwords and login data are never read. ¦ Les mots de passe et les données de connexion ne sont jamais lus. ¦ Las contraseñas y los datos de inicio de sesión nunca se leen.
+Mail sessions are followed in Full Power mode (Settings → Performance). Nothing is collected until you turn it on. ¦ Les sessions de courrier sont suivies en mode pleine puissance (Réglages → Performances). Rien n'est collecté tant que vous ne l'activez pas. ¦ Las sesiones de correo se siguen en el modo de máxima potencia (Ajustes → Rendimiento). No se recoge nada hasta que lo active.
+No mail traffic seen yet. ¦ Aucun trafic de courrier vu pour l'instant. ¦ Aún no se ha visto tráfico de correo.
+Export report… ¦ Exporter le rapport… ¦ Exportar informe…
+This view fills in Full Power mode (Settings → Performance). ¦ Cette vue se remplit en mode pleine puissance (Réglages → Performances). ¦ Esta vista se llena en el modo de máxima potencia (Ajustes → Rendimiento).
+● Active ¦ ● Actif ¦ ● Activo
+◐ Idle ¦ ◐ Inactif ¦ ◐ Inactivo
+○ Offline ¦ ○ Hors ligne ¦ ○ Desconectado
+✕ Expired ¦ ✕ Expiré ¦ ✕ Caducado
+blind spots ¦ angles morts ¦ puntos ciegos
+rotated automatically ¦ renouvelés automatiquement ¦ rotados automáticamente
+the capture engine's bundled vendor list ¦ la liste de fabricants fournie avec le moteur de capture ¦ la lista de fabricantes incluida con el motor de captura
+Encrypted DNS lookups ¦ Recherches DNS chiffrées ¦ Búsquedas DNS cifradas
+DNS latency (Full Power) ¦ Latence DNS (pleine puissance) ¦ Latencia DNS (máxima potencia)
+Delete these files? ¦ Supprimer ces fichiers ? ¦ ¿Eliminar estos archivos?
+Destination unreachable (IPv6) ¦ Destination inaccessible (IPv6) ¦ Destino inalcanzable (IPv6)
+Export mail report ¦ Exporter le rapport de messagerie ¦ Exportar el informe de correo
+Filter fields ¦ Champs de filtre ¦ Campos de filtro
+Multicast group membership report (IPv6) ¦ Rapport d'appartenance multicast (IPv6) ¦ Informe de pertenencia multicast (IPv6)
+Ping reply (IPv6) ¦ Réponse ping (IPv6) ¦ Respuesta ping (IPv6)
+Ping request (IPv6) ¦ Requête ping (IPv6) ¦ Solicitud ping (IPv6)
+Privacy posture… ¦ Confidentialité des échanges… ¦ Privacidad de las conexiones…
+Privacy posture ¦ Confidentialité des échanges ¦ Privacidad de las conexiones
+Private packages ¦ Paquets privés ¦ Paquetes privados
+Restore the interrupted session ¦ Restaurer la session interrompue ¦ Restaurar la sesión interrumpida
+Save what led to this ¦ Enregistrer ce qui a précédé ¦ Guardar lo que llevó a esto
+Save what led to this… ¦ Enregistrer ce qui a précédé… ¦ Guardar lo que llevó a esto…
+Show raw text ¦ Afficher le texte brut ¦ Mostrar el texto sin procesar
+Show raw text… ¦ Afficher le texte brut… ¦ Mostrar el texto sin procesar…
+Storage used ¦ Espace utilisé ¦ Espacio utilizado
+Storage used… ¦ Espace utilisé… ¦ Espacio utilizado…
+The packets from before this alert are no longer in memory. ¦ Les paquets d'avant cette alerte ne sont plus en mémoire. ¦ Los paquetes de antes de esta alerta ya no están en memoria.
+These are needed to capture. Use Diagnostics → Repair to reinstall them instead of deleting them. ¦ Ils sont nécessaires pour capturer. Utilisez Diagnostics → Réparer pour les réinstaller plutôt que de les supprimer. ¦ Son necesarios para capturar. Use Diagnóstico → Reparar para reinstalarlos en lugar de eliminarlos.
+This connection can contain passwords, cookies or private mail. The raw text stays in this window only and is never saved unless you export the packets yourself. Show it for this session? ¦ Cette connexion peut contenir des mots de passe, des cookies ou du courrier privé. Le texte brut reste dans cette fenêtre et n'est jamais enregistré, sauf si vous exportez vous-même les paquets. L'afficher pour cette session ? ¦ Esta conexión puede contener contraseñas, cookies o correo privado. El texto sin procesar se queda en esta ventana y nunca se guarda salvo que usted exporte los paquetes. ¿Mostrarlo durante esta sesión?
+Turn on Full Power ¦ Activer la pleine puissance ¦ Activar la máxima potencia
+Where MiniWireshark's disk space goes. Nothing is sent anywhere. ¦ Où va l'espace disque de MiniWireshark. Rien n'est envoyé nulle part. ¦ En qué usa MiniWireshark el espacio en disco. No se envía nada a ningún sitio.
+✉  Email Traffic — which mail servers your devices use, whether the connection was encrypted, and where it failed. What anyone wrote is never shown. ¦ ✉  Trafic de messagerie — quels serveurs de courrier vos appareils utilisent, si la connexion était chiffrée et où elle a échoué. Ce que quelqu'un a écrit n'est jamais affiché. ¦ ✉  Tráfico de correo — qué servidores de correo usan sus dispositivos, si la conexión estaba cifrada y dónde falló. Nunca se muestra lo que alguien escribió.
+🛟  The last session ended unexpectedly. Session → “Restore the interrupted session” brings it back (up to its last 30 seconds). ¦ 🛟  La dernière session s'est terminée de façon inattendue. Session → « Restaurer la session interrompue » la récupère (jusqu'à ses 30 dernières secondes). ¦ 🛟  La última sesión terminó de forma inesperada. Sesión → «Restaurar la sesión interrumpida» la recupera (hasta sus últimos 30 segundos).
+A packet workspace like Wireshark's ¦ Un espace paquets à la Wireshark ¦ Un espacio de paquetes como el de Wireshark
+Every field with its exact bytes, Follow stream, request and reply pairs, statistics and expert findings — each packet also explained in one plain sentence. ¦ Chaque champ avec ses octets exacts, le suivi de flux, les paires requête-réponse, les statistiques et les constats d'expert — et chaque paquet expliqué en une phrase simple. ¦ Cada campo con sus bytes exactos, seguir flujo, pares de solicitud y respuesta, estadísticas y hallazgos de experto — y cada paquete explicado en una frase sencilla.
+A deeper pass inside a budget you set: every decoder, rebuilt connections and expert findings. It never changes what is captured or sends anything. ¦ Une analyse plus poussée dans un budget que vous fixez : tous les décodeurs, les connexions reconstruites et les constats d'expert. Elle ne change jamais ce qui est capturé et n'envoie rien. ¦ Un análisis más profundo dentro de un presupuesto que usted fija: todos los decodificadores, conexiones reconstruidas y hallazgos de experto. Nunca cambia lo que se captura ni envía nada.
+Email Traffic ¦ Trafic de messagerie ¦ Tráfico de correo
+How mail connections behave — encryption, logins, failures — never what anyone wrote, and never a password. ¦ Comment se comportent les connexions de messagerie — chiffrement, connexions, échecs — jamais ce que quelqu'un a écrit, et jamais un mot de passe. ¦ Cómo se comportan las conexiones de correo — cifrado, inicios de sesión, fallos — nunca lo que alguien escribió, y nunca una contraseña.
+Optional, verified downloads (vendor names, encrypted-DNS lists, public blocklists), offline packs and one click back to the built-in data. ¦ Des téléchargements facultatifs et vérifiés (noms de fabricants, listes DNS chiffré, listes de blocage publiques), des packs hors ligne et un clic pour revenir aux données intégrées. ¦ Descargas opcionales y verificadas (nombres de fabricantes, listas de DNS cifrado, listas de bloqueo públicas), paquetes sin conexión y un clic para volver a los datos integrados.
+Ctrl+K goes anywhere ¦ Ctrl+K mène partout ¦ Ctrl+K lleva a cualquier parte
+Tabs, settings, devices, filters and ready-made workspaces from one search box. Starting up is also more reliable, with Safe Mode if a start fails twice. ¦ Onglets, réglages, appareils, filtres et espaces de travail prêts à l'emploi depuis une seule zone de recherche. Le démarrage est aussi plus fiable, avec un mode sans échec si un démarrage échoue deux fois. ¦ Pestañas, ajustes, dispositivos, filtros y espacios de trabajo listos desde un solo cuadro de búsqueda. El inicio también es más fiable, con modo seguro si un inicio falla dos veces.
 Go to anything (command palette) ¦ Aller n'importe où (palette de commandes) ¦ Ir a cualquier parte (paleta de comandos)
 Full Power ¦ Pleine puissance ¦ Máxima potencia
 Full Power budget ¦ Budget de la pleine puissance ¦ Presupuesto de máxima potencia
@@ -19774,6 +19997,235 @@ I18N_PATTERNS = [
      r"\1 dBm ({t2}), enlace \3, canal \4. {t5}"),
     (r"Router answered in (\d+) ms", r"La box a répondu en \1 ms",
      r"El router respondió en \1 ms"),
+    # ---- V5 M11: reports, workspace, statistics and the explain line
+    (r"Discovering your network … (.+)", "Découverte de votre réseau … {t1}",
+     "Descubriendo su red … {t1}"),
+    (r"(.+): not downloaded \(get it in Components\)",
+     "{t1} : non téléchargé (à obtenir dans Composants)",
+     "{t1}: no descargado (consígalo en Componentes)"),
+    (r"(.+): off", "{t1} : désactivé", "{t1}: desactivado"),
+    (r"(.+): ready \((.+)\)", "{t1} : prêt (\\2)", "{t1}: listo (\\2)"),
+    (r"📂  OFFLINE CAPTURE — not live\. You're looking at packets from a "
+     r"file\.   \[(.+)\]",
+     r"📂  CAPTURE HORS LIGNE — pas en direct. Vous regardez des paquets "
+     r"d'un fichier.   [\1]",
+     r"📂  CAPTURA SIN CONEXIÓN — no es en directo. Está viendo paquetes de "
+     r"un archivo.   [\1]"),
+    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets from (.+?)"
+     r"( \(stopped early\))?\. Router identified from the capture "
+     r"\(likely\): (\S+)\. Nothing here is live\.",
+     r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Box "
+     r"identifiée dans la capture (probable) : \4. Rien n'est en direct.",
+     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
+     r"Router identificado en la captura (probable): \4. Nada es en "
+     r"directo."),
+    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets from (.+?)"
+     r"( \(stopped early\))?\.\s+Nothing here is live\.",
+     r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Rien "
+     r"n'est en direct.",
+     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
+     r"Nada es en directo."),
+    (r"📂 Offline capture: (.+) — (\d+) packets \(not live\)",
+     r"📂 Capture hors ligne : \1 — \2 paquets (pas en direct)",
+     r"📂 Captura sin conexión: \1 — \2 paquetes (no en directo)"),
+    (r"\(Not live\) (.+)", "(Pas en direct) {t1}", "(No en directo) {t1}"),
+    (r"Imported capture\. Blind spots: (.+)\.  \(click for details\)",
+     "Capture importée. Angles morts : {t1}.  (cliquez pour les détails)",
+     "Captura importada. Puntos ciegos: {t1}.  (clic para detalles)"),
+    (r"(\d+) new devices? · (\d+) new websites? · (\d+) devices? left · "
+     r"(\d+) warnings?  \(click for details\)",
+     r"\1 nouveaux appareils · \2 nouveaux sites · \3 appareils partis · "
+     r"\4 avertissements  (cliquez pour les détails)",
+     r"\1 dispositivos nuevos · \2 sitios nuevos · \3 dispositivos se "
+     r"fueron · \4 avisos  (clic para detalles)"),
+    (r"(\d[\d,]*) shown of (\d[\d,]*)", r"\1 affichés sur \2",
+     r"\1 mostrados de \2"),
+    (r"⚡ Full Power (\d+) %", r"⚡ Pleine puissance \1 %",
+     r"⚡ Máxima potencia \1 %"),
+    (r"encrypted (\d+) of (\d+)", r"chiffrées : \1 sur \2",
+     r"cifradas: \1 de \2"),
+    (r"(\d+) failed login\(s\)", r"\1 connexion(s) échouée(s)",
+     r"\1 inicio(s) de sesión fallido(s)"),
+    (r"(\d+) login\(s\) sent before encryption",
+     r"\1 connexion(s) envoyée(s) avant le chiffrement",
+     r"\1 inicio(s) de sesión enviado(s) antes del cifrado"),
+    (r"(\d+) of (\d+) connections were reset \((\d+)%\)\. Some resets are "
+     r"normal\.",
+     r"\1 connexions sur \2 ont été réinitialisées (\3 %). Certaines "
+     r"réinitialisations sont normales.",
+     r"\1 de \2 conexiones se reiniciaron (\3 %). Algunos reinicios son "
+     r"normales."),
+    (r"(\d+) DHCP servers answered: (.+)\.",
+     r"\1 serveurs DHCP ont répondu : \2.",
+     r"\1 servidores DHCP respondieron: \2."),
+    (r"(\d+) address\(es\) claimed by more than one device: (.+)\.",
+     r"\1 adresse(s) revendiquée(s) par plusieurs appareils : \2.",
+     r"\1 dirección(es) reclamada(s) por más de un dispositivo: \2."),
+    (r"([\d,]+) exchanges · double-click to open the first packet",
+     r"\1 échanges · double-cliquez pour ouvrir le premier paquet",
+     r"\1 intercambios · doble clic para abrir el primer paquete"),
+    (r"([\d,]+) findings in ([\d,]+) groups · double-click to open the "
+     r"first packet",
+     r"\1 constats en \2 groupes · double-cliquez pour ouvrir le premier "
+     r"paquet",
+     r"\1 hallazgos en \2 grupos · doble clic para abrir el primer "
+     r"paquete"),
+    (r"Out of ([\d,]+) packets in memory \((.+)\)\. Double-click a protocol "
+     r"to filter the packet list\.",
+     r"Sur \1 paquets en mémoire (\2). Double-cliquez sur un protocole pour "
+     r"filtrer la liste.",
+     r"De \1 paquetes en memoria (\2). Doble clic en un protocolo para "
+     r"filtrar la lista."),
+    (r"([\d,]+) conversations among the ([\d,]+) packets in memory\. "
+     r"Double-click one to follow it\.",
+     r"\1 conversations parmi les \2 paquets en mémoire. Double-cliquez "
+     r"pour en suivre une.",
+     r"\1 conversaciones entre los \2 paquetes en memoria. Doble clic para "
+     r"seguir una."),
+    (r"([\d,]+) addresses in ([\d,]+) packets in memory\. A remote host is "
+     r"never counted as a device on your network\.",
+     r"\1 adresses dans \2 paquets en mémoire. Un hôte distant n'est "
+     r"jamais compté comme un appareil de votre réseau.",
+     r"\1 direcciones en \2 paquetes en memoria. Un host remoto nunca se "
+     r"cuenta como dispositivo de su red."),
+    (r"([\d,]+) packets in memory, (\S+) s per point\. Double-click the "
+     r"chart to open the packets at that moment\.",
+     r"\1 paquets en mémoire, \2 s par point. Double-cliquez sur le "
+     r"graphique pour ouvrir les paquets de ce moment.",
+     r"\1 paquetes en memoria, \2 s por punto. Doble clic en el gráfico "
+     r"para abrir los paquetes de ese momento."),
+    (r"(.+?)   \(limit: (.+)\)", "\\1   (limite : {t2})",
+     "\\1   (límite: {t2})"),
+    (r"(\d+) optional data sources? in use, (\d+) private packages?; (.+) "
+     r"of downloaded data\. Updates: (.+)\.",
+     "\\1 source(s) de données facultative(s) utilisée(s), \\2 paquet(s) "
+     "privé(s) ; \\3 de données téléchargées. Mises à jour : {t4}.",
+     "\\1 fuente(s) de datos opcional(es) en uso, \\2 paquete(s) "
+     "privado(s); \\3 de datos descargados. Actualizaciones: {t4}."),
+    (r"Device: (.+)", r"Appareil : \1", r"Dispositivo: \1"),
+    (r"Mail session: (.+)", r"Session de courrier : \1",
+     r"Sesión de correo: \1"),
+    (r"Based on: (.+)", "D'après : {t1}", "Según: {t1}"),
+    (r"(High|Medium|Low|Unconfirmed) \(score (\d+)/100\)\. (.+)",
+     "{t1} (score \\2/100). {t3}", "{t1} (puntuación \\2/100). {t3}"),
+    (r"(High|Medium|Low|Unconfirmed) \(score (\d+)/100\)\.",
+     "{t1} (score \\2/100).", "{t1} (puntuación \\2/100)."),
+    (r"(.+) — Likely (.+)\.", "\\1 — {t2} (probable).",
+     "\\1 — {t2} (probable)."),
+    (r"(.+) — Possibly (.+)\.", "\\1 — {t2} (possible).",
+     "\\1 — {t2} (posible)."),
+    (r"(.+) — (.+)\.", "\\1 — {t2}.", "\\1 — {t2}."),
+    (r"MAC: (\S+)  \(private / randomized address\)",
+     r"MAC : \1  (adresse privée / aléatoire)",
+     r"MAC: \1  (dirección privada / aleatoria)"),
+    (r"MAC: (.+)", r"MAC : \1", r"MAC: \1"),
+    (r"IP: (.+)", r"IP : \1", r"IP: \1"),
+    (r"Vendor: (.+?) \(from (.+)\)", "Fabricant : \\1 (source : {t2})",
+     "Fabricante: \\1 (fuente: {t2})"),
+    (r"Vendor: (.+)", "Fabricant : {t1}", "Fabricante: {t1}"),
+    (r"First seen: (.+?)    Last seen: (.+)",
+     r"Vu la première fois : \1    Vu la dernière fois : \2",
+     r"Visto por primera vez: \1    Visto por última vez: \2"),
+    (r"Status: (.+)", "État : {t1}", "Estado: {t1}"),
+    (r"Sent: (.+?) \((\d+) packets\)    Received: (.+)",
+     r"Envoyé : \1 (\2 paquets)    Reçu : \3",
+     r"Enviado: \1 (\2 paquetes)    Recibido: \3"),
+    (r"Local: (.+?)    Internet: (.+)", r"Local : \1    Internet : \2",
+     r"Local: \1    Internet: \2"),
+    (r"Online:  (.+?)–(.+?) \((.+)\)", "En ligne :  \\1–{t2} (\\3)",
+     "En línea:  \\1–{t2} (\\3)"),
+    (r"Offline: (.+?)–(.+?) \((.+)\)", r"Hors ligne : \1–\2 (\3)",
+     r"Desconectado: \1–\2 (\3)"),
+    (r"Offline since (.+)", r"Hors ligne depuis \1",
+     r"Desconectado desde \1"),
+    (r"Its own Internet connections are visible here \((\d+) seen\), so "
+     r"this computer sees its traffic \(a mirrored port, a hub, or it is "
+     r"this computer's router path\)\.",
+     r"Ses propres connexions Internet sont visibles ici (\1 vues) : cet "
+     r"ordinateur voit donc son trafic (port miroir, concentrateur, ou il "
+     r"passe par cet ordinateur).",
+     r"Sus propias conexiones a Internet se ven aquí (\1 vistas): este "
+     r"equipo ve su tráfico (puerto espejo, concentrador o pasa por este "
+     r"equipo)."),
+    (r"Learned from (\d+) active minute\(s\)\. Typically sends (.+?)/min "
+     r"and receives (.+?)/min, talking to about (\d+) Internet hosts per "
+     r"minute\. Usual hours: (.+)\.",
+     r"Appris sur \1 minute(s) d'activité. Envoie en général \2/min et "
+     r"reçoit \3/min, en parlant à environ \4 hôtes Internet par minute. "
+     r"Heures habituelles : \5.",
+     r"Aprendido en \1 minuto(s) de actividad. Suele enviar \2/min y "
+     r"recibir \3/min, hablando con unos \4 hosts de Internet por minuto. "
+     r"Horas habituales: \5."),
+    (r"(\d+) attempt\(s\) using (.+?): (\d+) accepted, (\d+) refused\. A "
+     r"login was sent before the connection was encrypted\. Passwords and "
+     r"login data are never read\.",
+     r"\1 tentative(s) avec \2 : \3 acceptée(s), \4 refusée(s). Une "
+     r"connexion a été envoyée avant le chiffrement. Les mots de passe et "
+     r"les données de connexion ne sont jamais lus.",
+     r"\1 intento(s) con \2: \3 aceptado(s), \4 rechazado(s). Se envió un "
+     r"inicio de sesión antes del cifrado. Las contraseñas y los datos de "
+     r"inicio de sesión nunca se leen."),
+    (r"(\d+) attempt\(s\) using (.+?): (\d+) accepted, (\d+) refused\. "
+     r"Passwords and login data are never read\.",
+     r"\1 tentative(s) avec \2 : \3 acceptée(s), \4 refusée(s). Les mots "
+     r"de passe et les données de connexion ne sont jamais lus.",
+     r"\1 intento(s) con \2: \3 aceptado(s), \4 rechazado(s). Las "
+     r"contraseñas y los datos de inicio de sesión nunca se leen."),
+    (r"(\d+) message\(s\) to (\d+) recipient\(s\), (\d+) bytes\. "
+     r"Addresses, subjects and contents are never kept\.",
+     r"\1 message(s) à \2 destinataire(s), \3 octets. Les adresses, sujets "
+     r"et contenus ne sont jamais conservés.",
+     r"\1 mensaje(s) a \2 destinatario(s), \3 bytes. Las direcciones, los "
+     r"asuntos y el contenido nunca se guardan."),
+    (r"(.+) asked the local network who has (.+) \(ARP\)\.",
+     r"\1 a demandé au réseau local qui a \2 (ARP).",
+     r"\1 preguntó a la red local quién tiene \2 (ARP)."),
+    (r"(.+) answered that it has (.+) \(ARP\)\.",
+     r"\1 a répondu qu'il a \2 (ARP).", r"\1 respondió que tiene \2 (ARP)."),
+    (r"(.+) asked (.+) for the address of (.+) \(DNS\)\.",
+     r"\1 a demandé à \2 l'adresse de \3 (DNS).",
+     r"\1 pidió a \2 la dirección de \3 (DNS)."),
+    (r"(.+) answered the name lookup for (.+?): (.+)\. \(DNS\)",
+     "\\1 a répondu à la recherche de \\2 : {t3}. (DNS)",
+     "\\1 respondió a la búsqueda de \\2: {t3}. (DNS)"),
+    (r"(.+) started an encrypted connection \(TLS\) to (.+); the site name "
+     r"is visible, the content will not be\.",
+     r"\1 a ouvert une connexion chiffrée (TLS) vers \2 ; le nom du site "
+     r"est visible, pas le contenu.",
+     r"\1 inició una conexión cifrada (TLS) con \2; el nombre del sitio se "
+     r"ve, el contenido no."),
+    (r"Encrypted data between (.+) and (.+) \(TLS\); the content is not "
+     r"visible\.",
+     r"Données chiffrées entre \1 et \2 (TLS) ; le contenu n'est pas "
+     r"visible.",
+     r"Datos cifrados entre \1 y \2 (TLS); el contenido no se ve."),
+    (r"(.+) asked (.+) for (.+) over plain HTTP \(not encrypted\)\.",
+     r"\1 a demandé \3 à \2 en HTTP simple (non chiffré).",
+     r"\1 pidió \3 a \2 por HTTP simple (sin cifrar)."),
+    (r"(.+) opened a connection to (.+) port (\d+) \((.+)\)\.",
+     "\\1 a ouvert une connexion vers \\2 port \\3 ({t4}).",
+     "\\1 abrió una conexión con \\2 puerto \\3 ({t4})."),
+    (r"(.+) abruptly closed \(reset\) its connection with (.+)\.",
+     r"\1 a brutalement fermé (réinitialisé) sa connexion avec \2.",
+     r"\1 cerró bruscamente (reinició) su conexión con \2."),
+    (r"(.+) finished sending on its connection with (.+)\.",
+     r"\1 a fini d'envoyer sur sa connexion avec \2.",
+     r"\1 terminó de enviar en su conexión con \2."),
+    (r"(.+) sent (\d+) bytes to (.+) \((.+)\)\.",
+     "\\1 a envoyé \\2 octets à \\3 ({t4}).",
+     "\\1 envió \\2 bytes a \\3 ({t4})."),
+    (r"(.+) acknowledged data from (.+)\.",
+     r"\1 a accusé réception des données de \2.",
+     r"\1 confirmó la recepción de datos de \2."),
+    (r"(.+) sent a (\d+)-byte datagram to (.+) port (\d+)\.",
+     r"\1 a envoyé un datagramme de \2 octets à \3 port \4.",
+     r"\1 envió un datagrama de \2 bytes a \3 puerto \4."),
+    (r"(.+) and (.+) exchanged the time \(NTP\)\.",
+     r"\1 et \2 ont échangé l'heure (NTP).",
+     r"\1 y \2 intercambiaron la hora (NTP)."),
+    (r"(.+) and (.+) talk over QUIC \(HTTP/3, encrypted\)\.",
+     r"\1 et \2 communiquent en QUIC (HTTP/3, chiffré).",
+     r"\1 y \2 se comunican por QUIC (HTTP/3, cifrado)."),
     # V5 teach-once device types
     (r"What is (.+?)\? Look-alike devices will get the same suggestion "
      r"\(learned on this computer only\)\.",
@@ -19931,6 +20383,15 @@ def translate_text(s, locale=None):
                 I18N_REVERSE.clear()
             I18N_REVERSE[out] = s
     return out
+
+
+def translate_lines(text, locale=None):
+    """Translate a multi-line report line by line (values stay as they
+    are; lines without a translation stay English)."""
+    if (locale or CURRENT_LOCALE) == "en" or not isinstance(text, str):
+        return text
+    return "\n".join(translate_text(line, locale) if line.strip() else line
+                     for line in text.split("\n"))
 
 
 def untranslate_text(s):
@@ -21779,7 +22240,7 @@ class SettingsWindow:
 
         elif typ == "info":
             text = c.get("text") or getattr(self, c["text_fn"])()
-            self._help(row, text, reserve=40)
+            self._help(row, translate_lines(text), reserve=40)
 
         elif typ == "cvd_preview":
             self._cvd_preview(row)
@@ -22445,8 +22906,8 @@ class DetailDialog:
         self.txt.config(state="normal")
         self.txt.delete("1.0", "end")
         for heading, text in sections:
-            self.txt.insert("end", heading + "\n", ("h",))
-            self.txt.insert("end", (text or "—") + "\n\n")
+            self.txt.insert("end", translate_text(heading) + "\n", ("h",))
+            self.txt.insert("end", translate_lines(text or "—") + "\n\n")
         self.txt.config(state="disabled")
 
     def copy(self):
@@ -24523,7 +24984,7 @@ class MailView:
             parts.append(f"{failed} failed login(s)")
         if early:
             parts.append(f"{early} login(s) sent before encryption")
-        return " · ".join(parts)
+        return " · ".join(translate_text(p) for p in parts)
 
     def values(self, r):
         name = self.app.short_device_name
@@ -30371,12 +30832,13 @@ class MiniWireshark:
         v = self.model.vantage.classify(
             offline=self.data_mode in ("offline", "session"))
         spots = blind_spots(self.model, self.data_mode, self.active_mode())
-        pill = self.mode_pill_text()
+        pill = translate_text(self.mode_pill_text())
+        tr = translate_text
         return ((pill + "  ·  ") if pill else "") + (
-                f"{VANTAGE_TEXT[v][0]}"
-                f"{' · blind spots: ' + str(len(spots)) if spots else ''}"
-                f"  ·  ◉ observed ◎ correlated ◌ inferred ? unknown  "
-                f"·  F2 inspector")
+                f"{tr(VANTAGE_TEXT[v][0])}"
+                f"{' · ' + tr('blind spots') + ': ' + str(len(spots)) if spots else ''}"
+                f"  ·  {tr('◉ observed ◎ correlated ◌ inferred ? unknown')}"
+                f"  ·  {tr('F2 inspector')}")
 
     # ---- what changed --------------------------------------------------------
     def _digest(self, period):
