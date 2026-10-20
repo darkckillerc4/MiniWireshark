@@ -99,7 +99,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 _T_START = time.perf_counter()
 LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
-SCRIPT_VERSION = "4.0.0"
+SCRIPT_VERSION = "5.0.0"
 SESSION_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 2
 
