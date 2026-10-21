@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-MiniWireshark 3.0 — your network, explained in plain English.
+MiniWireshark 5 — your network, explained in plain English.
 
 A single-file, autonomous network observability, troubleshooting and
 defensive-monitoring workstation. A beginner can understand it; an
@@ -13,33 +13,58 @@ your own Wi-Fi/LAN (ARP + mDNS + SSDP — never beyond your own subnet),
 self-heals if the capture dies, and explains what it sees without ever
 presenting a guess as a fact.
 
-Layout of this file (it is one file on purpose — search for the banners):
+Layout of this file. It is one file on purpose; every region starts with a
+banner ("# ====" then "#  <id>.  <title>"), listed here in file order. The
+self-test t_toc_matches_banners keeps this list and the banners in step.
 
-    1.  Bootstrap / elevation / paths / logging
-    2.  Dependency manager (manifest, pip, Npcap, loader window)
-    3.  Optional data manager (vendor list, public suffixes, trackers, ASN)
-    4.  Constants, palettes and small helpers
-    5.  Protocol decoder (incl. TLS ClientHello, DNS, IPv6 ND, DHCP)
-    6.  Capture workers (sniffer, decoder, LAN discovery, PCAP import,
-        network watcher, health prober)
-    7.  Device identity model (evidence, confidence, fingerprinting)
-    8.  Website / domain model
-    9.  Remote-host model
-    10. Connection / flow model
-    11. Historical metrics (rolling buckets)
-    12. Anomaly / security engine (alerts, DNS health, baselines)
-    13. NetworkModel — the single analysis core every view reads from
-    14. Persistence (config, sessions, known devices, SQLite history)
-    15. Settings (one declarative schema drives the whole window)
-    16. GUI components (tables, charts, dialogs, tooltips)
-    17. Tabs
-    18. Export / reporting
-    19. Diagnostics, crash handling, self-update
-    20. Demo mode and self-tests
-    21. Application entry point
+    1.    Bootstrap — imports, paths, logging, elevation
+    1a.   Layer 1 — wide-entry launcher and runtime hand-off
+    1b.   Scapy symbols (filled in by load_scapy once the dependency is ready)
+    2.    Dependency manager
+    2a.   Everything MiniWireshark itself sends — one gate, one ledger
+    2b.   Loading window (first-run / every-run preparation)
+    2c.   Bootstrap steps (plain-English titles; package names only in details)
+    2d.   Layer 2 — the private Python runtime (RuntimeManager)
+    3.    Optional data manager
+    4.    Constants, palettes and small helpers
+    5.    Protocol decoder
+    5b.   Fast wire decoder
+    5c.   QUIC Initial packets — the site name a browser sends in its first
+    6.    Capture workers
+    6b.   Capture pipeline v2
+    7.    Device identity model
+    7b.   Identity over time — address bindings, corrections, networks
+    8.    Website / domain model  — a name, never a device
+    9.    Remote-host model  — a public Internet address, never a device
+    10.   Connection / flow model
+    11.   Historical metrics — bounded rolling buckets
+    12.   Anomaly / security engine
+    9b.   This computer: which program owns each connection, which programs
+    9d.   Connected helpers (optional, for power users): Pi-hole and AdGuard
+    12b.  Evidence levels, observations and lookup correlation
+    12c.  Coverage and claims — "what can I actually see from here?"
+    12d.  Insights: narratives that cannot overclaim, periodicity, episodes
+    13.   NetworkModel — the single analysis core
+    14.   Persistence — configuration, sessions, known devices, history
+    14c.  History views — what changed, sessions, packet history
+    15.   Strings, glossary, country lookup, tooltips
+    9c.   Country lookup (opt-in) — a small self-contained service
+    16.   Settings — one declarative schema drives the whole window
+    17.   GUI components — tables, charts, dialogs, menus
+    18.   Tabs
+    19.   The application window
+    18b.  Export / reporting — self-contained HTML (inline SVG charts, no
+    19b.  Diagnostics window, crash dialog, self-update
+    21b.  Signed updates and data packs (Ed25519)
+    20.   Demo mode — simulated, clearly-labelled, never mixed with real data
+    20a.  Replay scenarios — deterministic synthetic captures
+    20b.  Self-tests  —  python miniwireshark.py --self-test
+    20c.  GUI test — drives the real window under a (virtual) display
+    21.   Application entry point
 
 Run  `python miniwireshark.py --self-test`  to run the built-in tests
-(no administrator rights or packet capture needed).
+(no administrator rights or packet capture needed), `--gui-test` for the
+window tests and `--bench-gui` for the window performance benchmark.
 """
 
 from __future__ import annotations
@@ -56,6 +81,7 @@ import base64
 import ctypes
 import dataclasses
 import functools
+import gc
 import gzip
 import hashlib
 import html
@@ -849,13 +875,14 @@ def _npcap_admin_only():
 SELF_TEST_MODE = SELF_TEST_FLAG in sys.argv
 GUI_TEST_MODE = "--gui-test" in sys.argv
 BENCH_MODE = "--bench" in sys.argv
+BENCH_GUI_MODE = "--bench-gui" in sys.argv
 RELEASE_FLAGS = ("--release-check", "--make-release-key", "--sign-release",
                  "--sign-datapack")
 RELEASE_MODE = any(f in sys.argv for f in RELEASE_FLAGS)
 BOOT_CHECK_MODE = BOOT_CHECK_FLAG in sys.argv
 WORKER_MODE = "--mw-worker" in sys.argv      # a Full Power worker process
 TOOL_MODE = SELF_TEST_MODE or GUI_TEST_MODE or BENCH_MODE or \
-    RELEASE_MODE or BOOT_CHECK_MODE or WORKER_MODE
+    RELEASE_MODE or BOOT_CHECK_MODE or WORKER_MODE or BENCH_GUI_MODE
 START_IN_DEMO = DEMO_FLAG in sys.argv
 
 if ELEVATED_FLAG in sys.argv:
@@ -1473,7 +1500,7 @@ NPCAP_LICENSE_NOTE = (
 
 
 # ============================================================================
-#  1b.  Everything MiniWireshark itself sends — one gate, one ledger
+#  2a.  Everything MiniWireshark itself sends — one gate, one ledger
 #
 #  Every network send the app makes (downloads, update checks, health
 #  checks, discovery probes, reverse lookups, the router check) passes
@@ -8797,6 +8824,135 @@ class GuiGate:
             self.acquire()
 
 
+# Internal switches for the 5.1.2 work. Each risky new subsystem has one, so
+# Safe Mode (or a developer) can fall back to exactly the 5.0.2 behaviour.
+FEATURES = {
+    "fair_gate": True,       # the analysis thread hands the gate to Tk (M1)
+}
+
+
+def callback_name(cw):
+    """Readable name of the Python function behind a Tk callback wrapper
+    (an after() callback is wrapped in a closure; name what it calls)."""
+    f = getattr(cw, "func", cw)
+    name = getattr(f, "__qualname__", None) or repr(f)
+    if name.endswith("callit") and getattr(f, "__closure__", None):
+        for cell in f.__closure__:
+            try:
+                v = cell.cell_contents
+            except ValueError:
+                continue
+            q = getattr(v, "__qualname__", "")
+            if callable(v) and q and not q.endswith("callit"):
+                f, name = v, "after:" + q
+                break
+    if name.endswith("<lambda>"):
+        code = getattr(f, "__code__", None)
+        if code is not None:
+            name += f"@{code.co_firstlineno}"
+    return name
+
+
+class PerfProbe:
+    """How long every Tk callback waited for the GuiGate and how long it
+    worked. Off by default: then the only cost is one list read per
+    callback. Turned on by MW_PERF=1, by --bench-gui, or by perf_start().
+
+    Callbacks run on the Tk thread only, so no lock is needed; nested
+    callbacks (update() inside a callback) are recorded on their own and
+    their time is also part of the outer one."""
+
+    SLOW = 0.040                       # seconds: recorded with its name
+    EDGES = (0.005, 0.010, 0.020, 0.040, 0.100, 0.250, 1.0)
+
+    def __init__(self, keep_seconds=60.0):
+        self.keep = keep_seconds
+        self.reset()
+
+    def reset(self):
+        self.n = 0
+        self.work = self.wait = 0.0
+        self.max_work = (0.0, "")
+        self.max_wait = (0.0, "")
+        self.max_total = (0.0, "")
+        self.hist = [0] * (len(self.EDGES) + 1)
+        self.totals = deque(maxlen=50000)
+        self.slow = deque(maxlen=2000)  # (wall, phase, name, work, wait)
+        self.phase = ""
+
+    def record(self, cw, t0, t1, t2):
+        wait, work = t1 - t0, t2 - t1
+        total = wait + work
+        self.n += 1
+        self.wait += wait
+        self.work += work
+        self.totals.append(total)
+        for i, edge in enumerate(self.EDGES):
+            if total < edge:
+                self.hist[i] += 1
+                break
+        else:
+            self.hist[-1] += 1
+        if total < self.SLOW:
+            return
+        name = callback_name(cw)
+        if work > self.max_work[0]:
+            self.max_work = (work, name)
+        if wait > self.max_wait[0]:
+            self.max_wait = (wait, name)
+        if total > self.max_total[0]:
+            self.max_total = (total, name)
+        now = time.time()
+        self.slow.append((now, self.phase, name, work, wait))
+        while self.slow and now - self.slow[0][0] > self.keep and \
+                len(self.slow) > 200:
+            self.slow.popleft()
+
+    def percentile(self, p):
+        if not self.totals:
+            return 0.0
+        xs = sorted(self.totals)
+        return xs[min(len(xs) - 1, int(len(xs) * p))]
+
+    def summary(self):
+        """Plain numbers in milliseconds."""
+        return {"callbacks": self.n,
+                "p50_ms": round(self.percentile(0.50) * 1000, 1),
+                "p95_ms": round(self.percentile(0.95) * 1000, 1),
+                "p99_ms": round(self.percentile(0.99) * 1000, 1),
+                "max_ms": round(self.max_total[0] * 1000, 1),
+                "max_name": self.max_total[1],
+                "max_work_ms": round(self.max_work[0] * 1000, 1),
+                "max_work_name": self.max_work[1],
+                "max_wait_ms": round(self.max_wait[0] * 1000, 1),
+                "max_wait_name": self.max_wait[1],
+                "over_100ms": sum(self.hist[5:]),
+                "over_250ms": sum(self.hist[6:])}
+
+    def slow_lines(self, limit=40):
+        """The slowest recent callbacks, for the debug bundle."""
+        rows = sorted(self.slow, key=lambda r: -(r[3] + r[4]))[:limit]
+        return [f"{time.strftime('%H:%M:%S', time.localtime(w))} "
+                f"{(wk + wt) * 1000:7.1f} ms (work {wk * 1000:.1f}, "
+                f"waiting for the gate {wt * 1000:.1f})  {name}"
+                f"{'  [' + ph + ']' if ph else ''}"
+                for w, ph, name, wk, wt in rows]
+
+
+PERF = [None]          # the active PerfProbe, or None (the usual case)
+
+
+def perf_start():
+    if PERF[0] is None:
+        PERF[0] = PerfProbe()
+    return PERF[0]
+
+
+def perf_stop():
+    probe, PERF[0] = PERF[0], None
+    return probe
+
+
 GUI_GATE = GuiGate()
 _GATE_INSTALLED = [False]
 
@@ -8810,12 +8966,24 @@ def install_gui_gate(gate=None):
     _GATE_INSTALLED[0] = True
     orig_call = tk.CallWrapper.__call__
 
+    clock = time.perf_counter
+
     def gated_call(self, *args):
+        probe = PERF[0]
+        if probe is None:
+            gate.acquire()
+            try:
+                return orig_call(self, *args)
+            finally:
+                gate.release()
+        t0 = clock()
         gate.acquire()
+        t1 = clock()
         try:
             return orig_call(self, *args)
         finally:
             gate.release()
+            probe.record(self, t0, t1, clock())
     tk.CallWrapper.__call__ = gated_call
 
     def releasing(fn):
@@ -13252,7 +13420,7 @@ def upnp_audit(gateway_ip, timeout=3.0, port=1900, max_entries=64,
 
 
 # ============================================================================
-#  10.  Connected helpers (optional, for power users): Pi-hole and AdGuard
+#  9d.  Connected helpers (optional, for power users): Pi-hole and AdGuard
 #       Home. Read-only: MiniWireshark only ASKS them for their query log
 #       and device names. What they say is "Reported" evidence — shown
 #       beside what was observed on the wire, never added to it.
@@ -33874,7 +34042,13 @@ class MiniWireshark:
                             indent=1), "",
                  "== Settings (no secrets are stored in settings) ==",
                  json.dumps(self.config.data, indent=1, default=str)[:20000],
-                 "", "== Log (newest last) =="]
+                 ""]
+        probe = PERF[0]
+        if probe is not None:
+            parts += ["== Window responsiveness (perf probe) ==",
+                      json.dumps(probe.summary(), indent=1)]
+            parts += probe.slow_lines() + [""]
+        parts.append("== Log (newest last) ==")
         try:
             with open(PATHS.log_file, encoding="utf-8",
                       errors="replace") as f:
@@ -40254,10 +40428,11 @@ def release_check(path=None):
     checks = []
     try:
         import ast
+        ast.parse(text, feature_version=(3, 7))
         ast.parse(text, feature_version=(3, 8))
-        checks.append(("Python 3.8 grammar", True, ""))
+        checks.append(("Python 3.7 and 3.8 grammar", True, ""))
     except SyntaxError as e:
-        checks.append(("Python 3.8 grammar", False, str(e)))
+        checks.append(("Python 3.7 and 3.8 grammar", False, str(e)))
     m = re.search(r'^SCRIPT_VERSION = "([^"]+)"', text, re.M)
     checks.append(("Version string", bool(m), m.group(1) if m else ""))
     checks.append(("Release keys listed", bool(RELEASE_KEYS),
@@ -46008,12 +46183,81 @@ def model_summary(model):
 
 @self_test()
 def t_python38_grammar(ctx):
-    """The launcher stage must parse on Python 3.8 (old installs hand over
-    to the managed runtime, so the whole file keeps 3.8 syntax)."""
+    """The launcher stage must parse on old Pythons (old installs hand over
+    to the managed runtime, so the whole file keeps their syntax).
+    step_python still accepts 3.7, so 3.7 grammar is checked too."""
     import ast
     with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
         src = f.read()
-    ast.parse(src, feature_version=(3, 8))
+    for ver in ((3, 7), (3, 8)):
+        ast.parse(src, feature_version=ver)
+
+
+def toc_and_banners(src):
+    """(table of contents in the module docstring, banners in the file):
+    two lists of (id, title) that must be identical."""
+    lines = src.split("\n")
+    banners = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^#  (\d+[a-z]?)\.  (.+)$", line)
+        if m and i and lines[i - 1].startswith("# ===="):
+            banners.append((m.group(1), m.group(2).strip()))
+    start = src.index('"""') + 3
+    doc = src[start:src.index('"""', start)]
+    toc = [(m.group(1), m.group(2).strip()) for m in re.finditer(
+        r"^    (\d+[a-z]?)\.\s+(.+)$", doc, re.M)]
+    return toc, banners
+
+
+@self_test()
+def t_toc_matches_banners(ctx):
+    """The file's table of contents lists every region banner, in order,
+    and every banner id is unique."""
+    with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    toc, banners = toc_and_banners(src)
+    assert banners, "no banners found"
+    assert toc == banners, (
+        "table of contents and banners differ: " + repr(
+            [(a, b) for a, b in zip(toc, banners) if a != b][:3] or
+            (len(toc), len(banners))))
+    ids = [b[0] for b in banners]
+    assert len(ids) == len(set(ids)), "duplicate banner ids"
+
+
+@self_test()
+def t_perf_probe(ctx):
+    """The window perf probe separates waiting for the GuiGate from work,
+    names only slow callbacks, names an after() callback by what it calls,
+    and is off unless asked for."""
+    class CW:
+        pass
+
+    def handler():
+        return None
+
+    def make_callit(fn):
+        def callit():          # how tkinter wraps an after() callback
+            fn()
+        return callit
+    cw = CW()
+    cw.func = handler
+    p = PerfProbe()
+    p.record(cw, 0.0, 0.001, 0.003)          # 3 ms: counted, not named
+    p.record(cw, 1.0, 1.2, 1.25)             # 200 ms waiting, 50 working
+    sm = p.summary()
+    assert sm["callbacks"] == 2 and sm["over_100ms"] == 1, sm
+    assert sm["max_wait_ms"] == 200.0 and sm["max_work_ms"] == 50.0, sm
+    assert "handler" in sm["max_name"], sm
+    assert len(p.slow) == 1 and "waiting for the gate" in p.slow_lines()[0]
+    cw2 = CW()
+    cw2.func = make_callit(handler)
+    assert callback_name(cw2) == "after:" + handler.__qualname__
+    assert PERF[0] is None
+    assert bench_check({"S1": {"import.max_ms": 50.0}},
+                       {"S1": {"import.max_ms": 100,
+                               "theme.max_ms": 10}}) == [
+        ("S1", "import.max_ms", 50.0, 100, True)]
 
 
 @self_test()
@@ -50257,6 +50501,459 @@ def bench_report(seconds=2.0):
     return out
 
 
+
+# ---- window benchmark (--bench-gui) -----------------------------------------
+# The 5.1.2 plan's measuring stick: a synthetic home network built with
+# ScenarioBuilder, read through the normal offline path, then every window
+# action that matters timed with the PerfProbe (work time and time spent
+# waiting for the GuiGate, per Tk callback). Each scenario runs in its own
+# process so one cannot disturb the next.
+BENCH_SCENARIOS = OrderedDict([
+    ("S1", {"title": "Medium home", "devices": 300, "flows": 5000,
+            "sites": 1500, "geometry": "1440x900", "language": "English",
+            "text_size": "Normal"}),
+    ("S2", {"title": "Stress", "devices": 1000, "flows": 20000,
+            "sites": 5000, "geometry": "1440x900", "language": "English",
+            "text_size": "Normal"}),
+    ("S3", {"title": "Paced replay at 2,000 packets/s", "devices": 300,
+            "flows": 5000, "sites": 1500, "geometry": "1440x900",
+            "language": "English", "text_size": "Normal",
+            "replay_pps": 2000, "replay_seconds": 15}),
+    ("S4", {"title": "Small laptop, French, large text", "devices": 300,
+            "flows": 5000, "sites": 1500, "geometry": "1366x768",
+            "language": "Français", "text_size": "Large"}),
+])
+
+# Regression guards for --bench-gui --check: the 5.0.2 baseline measured in
+# the Linux test environment (Oct 2026) plus 25 % for run-to-run noise.
+# PROVISIONAL until the M0 run on the reference laptop; each milestone that
+# reaches a 5.1.2 target tightens its row (targets: BENCH_TARGETS).
+BENCH_LIMITS = {
+    # 5.0.2 medians of three runs (Linux test environment, Oct 2026):
+    # import 509, session load 548, save 332, text size 326, theme 137,
+    # tab switch 74 ms; idle Dashboard 4.1 %; 331 MB; search 8.7 ms.
+    # Limit = the larger of median + 25 % and the worst run + 10 %;
+    # memory: median + 10 %.
+    "S1": {"import.stall_ms": 725, "session_load.stall_ms": 735,
+           "session_save.stall_ms": 415, "text_size.stall_ms": 410,
+           "theme.stall_ms": 175, "switch.stall_ms": 115,
+           "idle_cpu_dash_pct": 5.2, "rss_loaded_mb": 365,
+           "search_ms": 11.5},
+}
+BENCH_LIMITS_PROVISIONAL = True
+BENCH_TARGETS = {
+    "S1": {"import.stall_ms": 100, "import.p99_ms": 40,
+           "session_load.stall_ms": 100, "session_save.stall_ms": 100,
+           "text_size.stall_ms": 100, "theme.stall_ms": 200,
+           "switch.stall_ms": 150, "search_ms": 10},
+}
+
+
+def bench_capture(devices, flows, sites):
+    """Frames of a synthetic network: `devices` hosts announce themselves
+    and take a DHCP lease, then make `flows` TLS connections to `sites`
+    websites (the first 2 x sites with a DNS lookup first)."""
+    b = ScenarioBuilder()
+    hosts = []
+    for i in range(devices):
+        hosts.append((f"192.168.{1 + i // 250}.{2 + i % 250}",
+                      "02:00:%02x:%02x:07:09" % (i >> 8 & 255, i & 255),
+                      f"host-{i:04d}"))
+    for h in hosts:
+        b.arp_announce(h)
+        b.dhcp(h)
+    names = [(f"s{j}.site{j % 400}.example{j % 7}.com",
+              f"{20 + j // 62500}.{(j // 250) % 250}.{j % 250 + 1}."
+              f"{7 + j % 3}") for j in range(sites)]
+    for k in range(flows):
+        h = hosts[k % devices]
+        name, rip = names[(k * 7) % sites]
+        if k < sites * 2:
+            b.dns(h, name, rip)
+        b.tls(h, name, rip, size=1400 * (1 + k % 3))
+        if b.port > 64000:         # source ports wrap, as they do for real
+            b.port = 30000
+    return b.frames
+
+
+def _rss_mb():
+    """Resident memory of this process in MB (0 when unknown)."""
+    with contextlib.suppress(OSError, ValueError):
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS"):
+                    return int(line.split()[1]) / 1024
+    with contextlib.suppress(Exception):
+        import resource
+        r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return r / (1024 * 1024) if sys.platform == "darwin" else r / 1024
+    return 0.0
+
+
+def _bench_child(sid, out_path, pcap):
+    """One scenario, in this process (started by bench_gui), reading the
+    capture file the parent built (so building it does not count)."""
+    spec = BENCH_SCENARIOS[sid]
+    setup_logging()
+    load_scapy()
+    _patch_dialogs_for_tests()
+    tmp = tempfile.mkdtemp(prefix="mw_bench_")
+    res = {"scenario": sid, "title": spec["title"],
+           "version": SCRIPT_VERSION, "python": platform.python_version(),
+           "platform": platform.platform(), "tk": str(tk.TkVersion),
+           "features": dict(FEATURES)}
+    frames = list(iter_raw_capture(pcap)) if spec.get("replay_pps") \
+        else None
+    res["capture"] = {"bytes": os.path.getsize(pcap)}
+    cfg = AppConfig(path=os.path.join(tmp, "config.json"))
+    for key, val in (("general.auto_start_capture", False),
+                     ("general.show_welcome", False),
+                     ("appearance.beginner_mode", False),
+                     ("appearance.inspector", True),
+                     ("general.language", spec["language"]),
+                     ("appearance.text_size", spec["text_size"])):
+        cfg.set(key, val)
+    set_locale(spec["language"])
+    install_gui_gate()
+    probe = perf_start()
+    root = tk.Tk()
+    root.geometry(spec["geometry"])
+    rss0 = _rss_mb()
+    t0 = time.perf_counter()
+    app = MiniWireshark(root, "", set(), set(), "", config=cfg)
+    _gui_pump(root, 0.5)
+    res["window_ready_s"] = round(time.perf_counter() - t0, 2)
+    res["rss_start_mb"] = round(rss0, 1)
+    res["rss_empty_mb"] = round(_rss_mb(), 1)
+
+    def busy():
+        jobs = getattr(app, "jobs", None)
+        return bool(app.importer is not None or len(app.ring) or
+                    app.pending_rows or (app.worker and app.worker.busy) or
+                    (jobs is not None and jobs.busy()))
+
+    beat = {"on": False, "last": 0.0, "gaps": []}
+
+    def heartbeat():
+        now = time.perf_counter()
+        beat["gaps"].append(now - beat["last"])
+        beat["last"] = now
+        if beat["on"]:
+            root.after(10, heartbeat)
+
+    def beat_start():
+        beat["gaps"] = []
+        beat["last"] = time.perf_counter()
+        if not beat["on"]:
+            beat["on"] = True
+            root.after(10, heartbeat)
+
+    def beat_stall():
+        """Longest time the window could not run a 10 ms timer: callbacks
+        plus Tk's own redraw and geometry work after them."""
+        beat["on"] = False
+        gaps = beat["gaps"] or [0.0]
+        return round(max(gaps) * 1000, 1)
+
+    def measure(name, action, until=None, settle=0.3, timeout=120.0):
+        """Run `action` as a Tk callback and wait until it is done.
+        stall_ms = the longest the window was unresponsive meanwhile;
+        max_ms = the longest single Python callback (work + gate wait)."""
+        _gui_pump(root, 0.05)
+        probe.reset()
+        probe.phase = name
+        beat_start()
+        t_start = time.perf_counter()
+        root.after(0, action)
+        _gui_pump(root, settle, until, timeout)
+        elapsed = time.perf_counter() - t_start
+        sm = probe.summary()
+        return {"stall_ms": beat_stall(),
+                "elapsed_ms": round(elapsed * 1000, 1),
+                "max_ms": sm["max_ms"], "max_name": sm["max_name"],
+                "max_wait_ms": sm["max_wait_ms"], "p99_ms": sm["p99_ms"],
+                "over_100ms": sm["over_100ms"]}
+
+    def cpu_s():
+        t = os.times()
+        return t.user + t.system
+
+    if spec.get("replay_pps"):
+        app._select_tab("dash")
+        _gui_pump(root, 1)
+        sink, pps = app.live_sink(), spec["replay_pps"]
+        dropped0 = app.ring.dropped
+        stop = threading.Event()
+
+        def replay():
+            t_begin = time.perf_counter()
+            for i, (raw, ts, lt) in enumerate(frames):
+                if stop.is_set():
+                    break
+                sink(raw, ts, lt)
+                due = t_begin + (i + 1) / pps
+                lag = due - time.perf_counter()
+                if lag > 0:
+                    time.sleep(lag)
+        th = threading.Thread(target=replay, daemon=True, name="replay")
+        probe.reset()
+        probe.phase = "replay"
+        c0 = cpu_s()
+        beat_start()
+        th.start()
+        _gui_pump(root, float(spec.get("replay_seconds", 15)))
+        stop.set()
+        th.join(5)
+        res["replay"] = dict(probe.summary(), stall_ms=beat_stall(),
+                             cpu_pct=round(
+            (cpu_s() - c0) / float(spec.get("replay_seconds", 15)) * 100,
+            1), ring_dropped=app.ring.dropped - dropped0)
+    else:
+        app._select_tab("packets")
+        _gui_pump(root, 0.5)
+        probe.reset()
+        probe.phase = "import"
+        c0 = cpu_s()
+        beat_start()
+        t_start = time.perf_counter()
+        app.import_pcap_path(pcap)
+        _gui_pump(root, 2, until=lambda: not busy(), timeout=1800)
+        _gui_pump(root, 3)
+        res["import"] = dict(probe.summary(), stall_ms=beat_stall(),
+                             seconds=round(time.perf_counter() - t_start, 1),
+                             cpu_s=round(cpu_s() - c0, 1))
+    m = app.model
+    res["model"] = {"devices": len(m.registry.by_key),
+                    "websites": len(m.websites),
+                    "connections": len(list(m.flows.all_flows())),
+                    "remote_hosts": len(m.remote_hosts),
+                    "alerts": len(m.alerts.alerts),
+                    "packet_rows": len(app.all_rows)}
+    res["rss_loaded_mb"] = round(_rss_mb(), 1)
+
+    sw = {}
+    for name in list(app.tabs):
+        sw[name] = measure("switch:" + name,
+                           lambda n=name: app._select_tab(n), settle=0.6)
+    res["switch"] = sw
+    res["switch.stall_ms"] = max(v["stall_ms"] for v in sw.values())
+    reb = {}
+    for name in ("devices", "websites", "connections", "remote", "timeline",
+                 "alerts"):
+        app._select_tab(name)
+        _gui_pump(root, 0.3)
+        reb[name] = measure("rebuild:" + name, app.tabs[name].rebuild)
+    res["rebuild"] = reb
+
+    def flush_all():
+        m.dirty_devices |= set(m.registry.by_key)
+        m.dirty_websites |= set(m.websites)
+        m.dirty_remotes |= set(m.remote_hosts)
+        m.flows.dirty |= {f.fid for f in m.flows.all_flows()}
+        for part in (app._flush_events, app._flush_devices,
+                     app._flush_websites, app._flush_remotes,
+                     app._flush_flows):
+            part(m)
+    app._select_tab("dash")
+    _gui_pump(root, 0.5)
+    res["flush_all_dirty"] = measure("flush_all_dirty", flush_all)
+    res["dashboard_refresh"] = measure(
+        "dashboard_refresh", lambda: app.tabs["dash"].refresh(force=True))
+    res["model_tick"] = measure("model_tick", lambda: app.model.tick())
+    res["layout_pass"] = measure("layout_pass", app._layout_pass)
+
+    def set_theme(name):
+        app.config.set("appearance.theme", name)
+        app.theme_name = name
+        app._apply_theme()
+    th = [measure("theme", lambda: set_theme("Dark"), settle=0.5),
+          measure("theme", lambda: set_theme("Light"), settle=0.5)]
+    res["theme"] = th[0]
+    res["theme.stall_ms"] = max(x["stall_ms"] for x in th)
+    other = "Normal" if spec["text_size"] != "Normal" else "Large"
+
+    def set_size(name):
+        app.config.set("appearance.text_size", name)
+        app._apply_text_size()
+    ts = [measure("text_size", lambda: set_size(other), settle=0.5),
+          measure("text_size", lambda: set_size(spec["text_size"]),
+                  settle=0.5)]
+    res["text_size"] = ts[0]
+    res["text_size.stall_ms"] = max(x["stall_ms"] for x in ts)
+
+    xs = []
+    for _ in range(3):
+        t = time.perf_counter()
+        app.search_results("host-01")
+        xs.append(time.perf_counter() - t)
+    res["search_ms"] = round(statistics.median(xs) * 1000, 1)
+
+    def palette():
+        pal = app.open_palette()
+        root.update_idletasks()
+        with contextlib.suppress(Exception):
+            pal.win.destroy()
+    res["palette"] = measure("palette", palette)
+
+    sess = os.path.join(tmp, "bench.mwsession.json")
+    filedialog.asksaveasfilename = lambda *a, **k: sess
+    res["session_save"] = measure(
+        "session_save", app._save_session,
+        until=lambda: os.path.exists(sess) and not busy(), settle=0.3)
+    with contextlib.suppress(OSError):
+        res["session_save"]["bytes"] = os.path.getsize(sess)
+    res["session_save.stall_ms"] = res["session_save"]["stall_ms"]
+    res["session_load"] = measure(
+        "session_load", lambda: app._load_session(sess),
+        until=lambda: app.data_mode == "session" and not busy(),
+        settle=1.0)
+    res["session_load.stall_ms"] = res["session_load"]["stall_ms"]
+    res["rss_after_reload_mb"] = round(_rss_mb(), 1)
+    csvp = os.path.join(tmp, "flows.csv")
+    app._ask_save = lambda *a, **k: csvp
+    res["export_flows_csv"] = measure(
+        "export_flows_csv", app._export_flows_csv,
+        until=lambda: os.path.exists(csvp) and not busy())
+    for name, key in (("dash", "idle_cpu_dash_pct"),
+                      ("devices", "idle_cpu_devices_pct")):
+        app._select_tab(name)
+        _gui_pump(root, 1)
+        probe.reset()
+        probe.phase = "idle:" + name
+        c0 = cpu_s()
+        _gui_pump(root, 8)
+        res[key] = round((cpu_s() - c0) / 8 * 100, 1)
+        res["idle_" + name] = probe.summary()
+    res["import.stall_ms"] = res.get("import", {}).get("stall_ms")
+    res["import.p99_ms"] = res.get("import", {}).get("p99_ms")
+    res["replay.stall_ms"] = res.get("replay", {}).get("stall_ms")
+    res["rss_end_mb"] = round(_rss_mb(), 1)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(res, f, indent=1)
+    with contextlib.suppress(Exception):
+        app._on_close()
+    shutil.rmtree(tmp, ignore_errors=True)
+    return 0
+
+
+BENCH_SUMMARY_KEYS = (
+    ("import.stall_ms", "Longest freeze while reading the capture (ms)"),
+    ("import.p99_ms", "  p99 callback while reading (ms)"),
+    ("replay.stall_ms", "Longest freeze during paced replay (ms)"),
+    ("session_load.stall_ms", "Longest freeze loading a session (ms)"),
+    ("session_save.stall_ms", "Longest freeze saving a session (ms)"),
+    ("text_size.stall_ms", "Longest freeze changing text size (ms)"),
+    ("theme.stall_ms", "Longest freeze changing theme (ms)"),
+    ("switch.stall_ms", "Slowest tab switch (ms)"),
+    ("idle_cpu_dash_pct", "Idle CPU, Dashboard (% of a core)"),
+    ("idle_cpu_devices_pct", "Idle CPU, Devices (% of a core)"),
+    ("rss_loaded_mb", "Memory with data loaded (MB)"),
+    ("rss_after_reload_mb", "Memory after save and reload (MB)"),
+    ("search_ms", "Global search (ms)"),
+    ("window_ready_s", "Window ready (s)"),
+)
+
+
+def bench_check(results, table=None, label="limit"):
+    """[(scenario, metric, value, limit, ok)] for every metric that has a
+    limit in `table` and was measured."""
+    table = BENCH_LIMITS if table is None else table
+    out = []
+    for sid, res in results.items():
+        for key, lim in (table.get(sid) or {}).items():
+            val = res.get(key)
+            if val is None:
+                continue
+            out.append((sid, key, val, lim, val <= lim))
+    return out
+
+
+def bench_gui(argv):
+    """python miniwireshark.py --bench-gui [S1 S2 S3 S4 | all] [--check]
+    [--targets] [--out FILE]. Needs a display (Linux: inside xvfb-run)."""
+    if "--child" in argv:
+        i = argv.index("--child")
+        return _bench_child(argv[i + 1], argv[argv.index("--out") + 1],
+                            argv[argv.index("--pcap") + 1])
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY") \
+            and not os.environ.get("WAYLAND_DISPLAY"):
+        print("--bench-gui opens the real window and needs a display. On a "
+              "server, run it inside xvfb-run.")
+        return 2
+    wanted = [a.upper() for a in argv if a.upper() in BENCH_SCENARIOS]
+    if "all" in argv:
+        wanted = list(BENCH_SCENARIOS)
+    wanted = wanted or ["S1"]
+    out_path = argv[argv.index("--out") + 1] if "--out" in argv else \
+        os.path.join(PATHS.data, time.strftime("bench-gui-%Y%m%d-%H%M.json"))
+    results = OrderedDict()
+    work = tempfile.mkdtemp(prefix="mw_bench_")
+    captures = {}
+    for sid in wanted:
+        spec = BENCH_SCENARIOS[sid]
+        print(f"{sid} {spec['title']}: {spec['devices']} devices, "
+              f"{spec['flows']} connection attempts, {spec['sites']} "
+              f"websites ...", flush=True)
+        size = (spec["devices"], spec["flows"], spec["sites"])
+        if size not in captures:
+            load_scapy()
+            frames = bench_capture(*size)
+            captures[size] = os.path.join(work, "%d-%d-%d.pcap" % size)
+            write_raw_pcap(captures[size], frames)
+            print(f"  capture: {len(frames):,} packets", flush=True)
+            del frames
+        part = os.path.join(work, f"{sid}.json")
+        env = dict(os.environ)
+        env["MINIWIRESHARK_DATA"] = tempfile.mkdtemp(prefix="mw_benchdata_")
+        t0 = time.time()
+        try:
+            rc = subprocess.run([sys.executable, SCRIPT_PATH, "--bench-gui",
+                                 "--child", sid, "--out", part, "--pcap",
+                                 captures[size]], env=env,
+                                timeout=3600).returncode
+        except subprocess.TimeoutExpired:
+            rc = -1
+        if rc != 0 or not os.path.exists(part):
+            print(f"  {sid} did not finish (exit code {rc}).")
+            results[sid] = {"error": f"exit code {rc}"}
+            continue
+        with open(part, encoding="utf-8") as f:
+            results[sid] = json.load(f)
+        print(f"  done in {time.time() - t0:.0f} s", flush=True)
+    print()
+    print(f"{'':44s}" + "".join(f"{sid:>10s}" for sid in results))
+    for key, label in BENCH_SUMMARY_KEYS:
+        vals = [results[sid].get(key) for sid in results]
+        if all(v is None for v in vals):
+            continue
+        print(f"{label:44s}" + "".join(
+            f"{'—' if v is None else v:>10}" for v in vals))
+    for sid, res in results.items():
+        rp = res.get("replay")
+        if rp:
+            print(f"{sid} replay: longest stall {rp['max_ms']} ms, ring "
+                  f"drops {rp['ring_dropped']}, CPU {rp['cpu_pct']} %")
+    atomic_write_json(out_path, results)
+    shutil.rmtree(work, ignore_errors=True)
+    print(f"\nFull results: {out_path}")
+    rc = 0
+    for flag, table, word in (("--check", BENCH_LIMITS, "limit"),
+                              ("--targets", BENCH_TARGETS, "5.1.2 target")):
+        if flag not in argv:
+            continue
+        rows = bench_check(results, table)
+        print(f"\nAgainst each {word}"
+              + (" (provisional limits)" if flag == "--check" and
+                 BENCH_LIMITS_PROVISIONAL else "") + ":")
+        for sid, key, val, lim, ok in rows:
+            print(f"  [{'PASS' if ok else 'FAIL'}] {sid} {key}: {val} "
+                  f"(<= {lim})")
+        if flag == "--check" and not all(r[4] for r in rows):
+            rc = 1
+    if any("error" in r for r in results.values()):
+        rc = rc or 1
+    return rc
+
 # ============================================================================
 #  20c.  GUI test — drives the real window under a (virtual) display
 #
@@ -52054,6 +52751,405 @@ def startup_sanity_checks():
 
 
 
+# ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
+# Labels that change with the state of the row a menu was opened on are
+# folded to one name, so the snapshot does not depend on which row was first.
+REACHABLE_ALTERNATES = {
+    "Unmark as mine": "Mark as mine", "Unmark expected": "Mark as expected",
+    "Allow merging": "Never merge this device",
+    "Remove bookmark": "Bookmark this packet",
+    "Stop Demo Mode": "Try Demo Mode",
+}
+# Old entry -> its new name, for actions a later milestone renames or moves.
+REACHABLE_RENAMES = {}
+# Menu entries that exist only in some states (a file open, an autosave
+# present); they are not part of the comparison.
+REACHABLE_CONDITIONAL = {
+    "menu:session:Return to live capture",
+    "menu:session:Open last autosave",
+    "menu:session:Restore the interrupted session",
+}
+
+
+def _menu_labels(menu, seen=None):
+    seen = set() if seen is None else seen
+    out = []
+    if str(menu) in seen:
+        return out
+    seen.add(str(menu))
+    try:
+        end = menu.index("end")
+    except tk.TclError:
+        return out
+    for i in range(0 if end is None else end + 1):
+        try:
+            kind = menu.type(i)
+            if kind in ("separator", "tearoff"):
+                continue
+            label = str(menu.entrycget(i, "label"))
+            # "Go to device: Alex-iPhone" -> "Go to device: …" (data-made)
+            label = re.sub(r"^(Go to [a-z ]+): .+$", "\\1: …", label)
+            out.append(REACHABLE_ALTERNATES.get(label, label))
+            if kind == "cascade":
+                sub = menu.nametowidget(menu.entrycget(i, "menu"))
+                out += [f"{label} > {x}" for x in _menu_labels(sub, seen)]
+        except (tk.TclError, KeyError):
+            continue
+    return out
+
+
+def reachable_actions(app):
+    """Every action a user can reach, as stable strings: tabs, sub-views,
+    Ctrl+K entries (not the ones made from the data), the Help, Session
+    and Export menus, the right-click menus of the main tables, every
+    setting and every keyboard shortcut. Menus are captured, never shown."""
+    out = set()
+    for name, tab in app.tabs.items():
+        out.add(f"tab:{name}")
+        for sv in getattr(tab, "_sub_frames", None) or {}:
+            out.add(f"subview:{name}/{sv}")
+    data_made = {"device", "your workspace", "recent filter"}
+    for label, cat, _fn in app.palette_items():
+        if cat not in data_made:
+            out.add(f"palette:{cat}:{label}")
+    shown = []
+    orig = tk.Menu.tk_popup
+    tk.Menu.tk_popup = lambda menu, *a, **k: shown.append(menu)
+    try:
+        for key, opener in (("help", app._open_help_menu),
+                            ("session", app._open_session_menu),
+                            ("export", app._open_export_menu)):
+            del shown[:]
+            opener()
+            for menu in shown:
+                out.update(f"menu:{key}:{x}" for x in _menu_labels(menu))
+        for name in ("devices", "websites", "connections", "remote",
+                     "alerts", "packets"):
+            tab = app.tabs[name]
+            app._select_tab(name)
+            if name == "packets":
+                tab.show_subview("Packets")
+            app.root.update()
+            tree = tab.tree
+            kids = tree.get_children()
+            box = tree.bbox(kids[0]) if kids else None
+            if not box:
+                out.add(f"rowmenu:{name}:(no rows to open a menu on)")
+                continue
+            ev = types.SimpleNamespace(x=box[0] + 4, y=box[1] + 2,
+                                       x_root=0, y_root=0, widget=tree)
+            del shown[:]
+            tab._context(ev)
+            for menu in shown:
+                out.update(f"rowmenu:{name}:{x}"
+                           for x in _menu_labels(menu))
+    finally:
+        tk.Menu.tk_popup = orig
+    out.update(f"setting:{k}" for k in settings_schema_keys())
+    out.update(f"shortcut:{k}" for k in DEFAULT_SHORTCUTS)
+    return sorted(out - REACHABLE_CONDITIONAL)
+
+
+@gui_test_step("every action 5.0.2 could reach is still reachable")
+def gt_reachable(app, ctx):
+    app.mode_ui_var.set("Advanced")
+    app._on_ui_mode_change()
+    _gui_pump(app.root, 0.3)
+    now = reachable_actions(app)
+    dump = os.environ.get("MW_REACH_DUMP")
+    if dump:
+        with open(dump, "w", encoding="utf-8") as f:
+            json.dump(now, f, indent=0, ensure_ascii=False)
+    have = set(now)
+    missing = [x for x in REACHABLE_502 if x not in have and
+               REACHABLE_RENAMES.get(x) not in have]
+    assert len(REACHABLE_502) > 200, "the 5.0.2 snapshot is missing"
+    assert not missing, (f"{len(missing)} action(s) no longer reachable: "
+                         + "; ".join(missing[:8]))
+
+
+# What 5.0.2 could reach (generated by gt_reachable with MW_REACH_DUMP on
+# the 5.0.2 window, Advanced view, after the scenario capture).
+REACHABLE_502 = (
+    "menu:export:All packets as CSV…",
+    "menu:export:Connections as CSV…",
+    "menu:export:Device inventory (printable)…",
+    "menu:export:Device report (HTML)…",
+    "menu:export:Devices as CSV…",
+    "menu:export:Everything as JSON…",
+    "menu:export:Full report (HTML)…",
+    "menu:export:Network health report (HTML)…",
+    "menu:export:Packets as .pcap…",
+    "menu:export:Packets in current view as CSV…",
+    "menu:export:Security report (HTML)…",
+    "menu:export:Shareable report (personal details hidden)…",
+    "menu:help:Check for updates",
+    "menu:help:Diagnostics…",
+    "menu:help:Help & glossary",
+    "menu:help:Open data folder",
+    "menu:help:Quick Start Guide",
+    "menu:help:Run self-test",
+    "menu:help:Runtime Manager…",
+    "menu:help:Try Demo Mode",
+    "menu:help:Your device corrections (undo)…",
+    "menu:help:Your networks…",
+    "menu:help:🛠 Repair MiniWireshark…",
+    "menu:session:Load session…",
+    "menu:session:New session (stop → clear)",
+    "menu:session:Open PCAP / PCAPNG file…",
+    "menu:session:Save session…",
+    "palette:action:Components Center",
+    "palette:action:Demo mode",
+    "palette:action:Diagnostics",
+    "palette:action:Full Power off (Automatic)",
+    "palette:action:Full Power on",
+    "palette:action:Go to packet…",
+    "palette:action:Measure this computer's speed again",
+    "palette:action:Open a capture file…",
+    "palette:action:Privacy posture…",
+    "palette:action:Save session…",
+    "palette:action:Save this view as a workspace…",
+    "palette:action:Shareable report…",
+    "palette:action:Show / hide the inspector",
+    "palette:action:Start watching",
+    "palette:action:Stop watching",
+    "palette:action:Storage used…",
+    "palette:action:What changed recently",
+    "palette:filter:Filter: DNS only",
+    "palette:filter:Filter: Local discovery",
+    "palette:filter:Filter: My phone",
+    "palette:filter:Filter: Remote desktop",
+    "palette:filter:Filter: Suspicious events",
+    "palette:filter:Filter: Web traffic",
+    "palette:setting:Settings: Accessibility",
+    "palette:setting:Settings: Alerts",
+    "palette:setting:Settings: Appearance",
+    "palette:setting:Settings: Capture",
+    "palette:setting:Settings: Components",
+    "palette:setting:Settings: Connections",
+    "palette:setting:Settings: Data & Export",
+    "palette:setting:Settings: Devices & Identity",
+    "palette:setting:Settings: Diagnostics",
+    "palette:setting:Settings: General",
+    "palette:setting:Settings: History",
+    "palette:setting:Settings: Keyboard Shortcuts",
+    "palette:setting:Settings: Network Health",
+    "palette:setting:Settings: Performance",
+    "palette:setting:Settings: Privacy & Lookups",
+    "palette:setting:Settings: Updates & Dependencies",
+    "palette:setting:Settings: Websites & DNS",
+    "palette:tab:alerts",
+    "palette:tab:connections",
+    "palette:tab:dash",
+    "palette:tab:devices",
+    "palette:tab:feed",
+    "palette:tab:health",
+    "palette:tab:help",
+    "palette:tab:map",
+    "palette:tab:packets",
+    "palette:tab:remote",
+    "palette:tab:security",
+    "palette:tab:sources",
+    "palette:tab:timeline",
+    "palette:tab:websites",
+    "palette:view:Connections → Mail",
+    "palette:view:Packets → Exchanges",
+    "palette:view:Packets → Expert",
+    "palette:view:Packets → Packets",
+    "palette:view:Packets → Statistics",
+    "palette:view:Packets → Streams",
+    "palette:workspace:Workspace: Is my router OK",
+    "palette:workspace:Workspace: Mail problem",
+    "palette:workspace:Workspace: Slow Internet",
+    "palette:workspace:Workspace: Who is new on my network",
+    "rowmenu:alerts:Acknowledge",
+    "rowmenu:alerts:Copy report",
+    "rowmenu:alerts:Details",
+    "rowmenu:alerts:Go to related item",
+    "rowmenu:alerts:Mark expected",
+    "rowmenu:alerts:Mute for this device",
+    "rowmenu:alerts:Mute this alert type",
+    "rowmenu:connections:Copy remote address",
+    "rowmenu:connections:Details",
+    "rowmenu:connections:Go to device",
+    "rowmenu:connections:Go to remote host",
+    "rowmenu:connections:Go to website",
+    "rowmenu:connections:Show its packets",
+    "rowmenu:devices:Add / edit note…",
+    "rowmenu:devices:Copy IP",
+    "rowmenu:devices:Copy MAC",
+    "rowmenu:devices:Details",
+    "rowmenu:devices:Export device report…",
+    "rowmenu:devices:Filter packets to this device",
+    "rowmenu:devices:Mark as expected",
+    "rowmenu:devices:Mark as mine",
+    "rowmenu:devices:Merge with…",
+    "rowmenu:devices:Never merge this device",
+    "rowmenu:devices:Rename…",
+    "rowmenu:devices:Set device type…",
+    "rowmenu:devices:Show connections",
+    "rowmenu:devices:Undo my last change",
+    "rowmenu:packets:Bookmark this packet",
+    "rowmenu:packets:Copy conversation as filter",
+    "rowmenu:packets:Copy destination",
+    "rowmenu:packets:Copy destination as filter",
+    "rowmenu:packets:Copy source",
+    "rowmenu:packets:Copy source as filter",
+    "rowmenu:packets:Copy summary",
+    "rowmenu:packets:Filter on this conversation",
+    "rowmenu:packets:Follow stream",
+    "rowmenu:packets:Go to connection",
+    "rowmenu:packets:Go to device: …",
+    "rowmenu:packets:Show this connection only",
+    "rowmenu:remote:Copy IP",
+    "rowmenu:remote:Details",
+    "rowmenu:remote:Filter to this host",
+    "rowmenu:remote:Show devices that contacted it",
+    "rowmenu:remote:Show domain associations",
+    "rowmenu:remote:Show its connections",
+    "rowmenu:websites:Copy domain",
+    "rowmenu:websites:Filter to this site",
+    "rowmenu:websites:Show contacting devices",
+    "rowmenu:websites:Show its packets",
+    "rowmenu:websites:Show remote hosts",
+    "setting:accessibility.colorblind",
+    "setting:alerts.arp_flip_threshold",
+    "setting:alerts.arp_spoof",
+    "setting:alerts.baseline_min_minutes",
+    "setting:alerts.broadcast_pps_threshold",
+    "setting:alerts.broadcast_storm",
+    "setting:alerts.chatty_device",
+    "setting:alerts.chatty_min_rate",
+    "setting:alerts.chatty_multiplier",
+    "setting:alerts.cleartext",
+    "setting:alerts.dhcp_anomaly",
+    "setting:alerts.dns_failures",
+    "setting:alerts.dns_multi",
+    "setting:alerts.dns_server_change",
+    "setting:alerts.dns_slow",
+    "setting:alerts.download_spike",
+    "setting:alerts.duplicate_ip",
+    "setting:alerts.flag_http",
+    "setting:alerts.gateway_change",
+    "setting:alerts.many_connections",
+    "setting:alerts.many_destinations",
+    "setting:alerts.new_country",
+    "setting:alerts.new_device",
+    "setting:alerts.new_service",
+    "setting:alerts.reconnect_count",
+    "setting:alerts.reconnect_cycle",
+    "setting:alerts.reconnect_window_minutes",
+    "setting:alerts.remote_access",
+    "setting:alerts.reputation",
+    "setting:alerts.reset_threshold",
+    "setting:alerts.rogue_ra",
+    "setting:alerts.scan_hosts_threshold",
+    "setting:alerts.scan_pattern",
+    "setting:alerts.scan_ports_threshold",
+    "setting:alerts.tcp_resets",
+    "setting:alerts.unknown_device",
+    "setting:alerts.unknown_min_packets",
+    "setting:alerts.upload_spike",
+    "setting:appearance.beginner_mode",
+    "setting:appearance.high_contrast",
+    "setting:appearance.text_size",
+    "setting:appearance.theme",
+    "setting:capture.auto_select_interface",
+    "setting:capture.follow_newest",
+    "setting:capture.max_stored_events",
+    "setting:capture.promiscuous",
+    "setting:components.policy",
+    "setting:connections.archive_size",
+    "setting:connections.hide_short_beginner",
+    "setting:connections.max_active",
+    "setting:devices.auto_merge",
+    "setting:devices.expire_minutes",
+    "setting:devices.idle_minutes",
+    "setting:devices.inactive_minutes",
+    "setting:devices.learn_types",
+    "setting:devices.show_expired",
+    "setting:devices.show_inactive",
+    "setting:devices.suggest_merges",
+    "setting:diagnostics.verbose_logging",
+    "setting:dns.detect_encrypted_dns",
+    "setting:dns.slow_ms",
+    "setting:export.default_dir",
+    "setting:general.auto_start_capture",
+    "setting:general.beginner_explanations",
+    "setting:general.confirm_before_clear",
+    "setting:general.explanation_verbosity",
+    "setting:general.language",
+    "setting:general.show_welcome",
+    "setting:health.active_checks",
+    "setting:health.internet_target",
+    "setting:health.interval_seconds",
+    "setting:history.custom_days",
+    "setting:history.enabled",
+    "setting:history.packet_ring",
+    "setting:history.packet_ring_mb",
+    "setting:history.retention",
+    "setting:history.save_raw_packets",
+    "setting:mode.active_scanning",
+    "setting:notifications.danger_only",
+    "setting:notifications.feed_alerts",
+    "setting:performance.battery_aware",
+    "setting:performance.deep_runner",
+    "setting:performance.full_power_cores",
+    "setting:performance.mode",
+    "setting:performance.ram_cap_mb",
+    "setting:performance.shedding",
+    "setting:privacy.auto_download_reference",
+    "setting:privacy.geoip_enabled",
+    "setting:privacy.kill_switch",
+    "setting:privacy.local_asn_db",
+    "setting:privacy.quic_names",
+    "setting:shortcuts.clear",
+    "setting:shortcuts.export",
+    "setting:shortcuts.find",
+    "setting:shortcuts.goto_packet",
+    "setting:shortcuts.inspector",
+    "setting:shortcuts.palette",
+    "setting:shortcuts.start",
+    "setting:shortcuts.stop",
+    "setting:shortcuts.undo",
+    "setting:updates.allow_self_update",
+    "setting:updates.check_automatically",
+    "setting:updates.repo",
+    "setting:websites.group_subdomains",
+    "setting:websites.tracker_classification",
+    "shortcut:clear",
+    "shortcut:export",
+    "shortcut:find",
+    "shortcut:goto_packet",
+    "shortcut:inspector",
+    "shortcut:palette",
+    "shortcut:start",
+    "shortcut:stop",
+    "shortcut:undo",
+    "subview:connections/Connections",
+    "subview:connections/Mail",
+    "subview:packets/Exchanges",
+    "subview:packets/Expert",
+    "subview:packets/Packets",
+    "subview:packets/Statistics",
+    "subview:packets/Streams",
+    "tab:alerts",
+    "tab:connections",
+    "tab:dash",
+    "tab:devices",
+    "tab:feed",
+    "tab:health",
+    "tab:help",
+    "tab:map",
+    "tab:packets",
+    "tab:remote",
+    "tab:security",
+    "tab:sources",
+    "tab:timeline",
+    "tab:websites",
+)
+
+
 # ============================================================================
 #  21.  Application entry point
 # ============================================================================
@@ -52106,6 +53202,8 @@ def main():
              MW_STAGE or "launcher")
     _install_thread_excepthook()
     install_gui_gate()
+    if os.environ.get("MW_PERF"):
+        perf_start()             # measure every window callback (debugging)
     rolled = rollback_update_if_needed()
     if MW_STAGE == "app":
         RuntimeManager().apply_pending_switch()
@@ -52388,6 +53486,8 @@ if __name__ == "__main__":
     if GUI_TEST_MODE:
         print(f"MiniWireshark {SCRIPT_VERSION} GUI test")
         sys.exit(run_gui_test(live="--live" in sys.argv))
+    if BENCH_GUI_MODE:
+        sys.exit(bench_gui(sys.argv[1:]))
     if BENCH_MODE:
         setup_logging()
         for k, v in bench_report().items():
