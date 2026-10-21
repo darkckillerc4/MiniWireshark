@@ -435,6 +435,47 @@ for fn in ("open_diagnostics", "open_storage", "open_privacy_posture",
     if f is not None:
         visit(f"dialog:{fn}", f)
 
+extra = [
+    ("investigate:slow", lambda: app.investigate("slow")),
+    ("connector:pihole", lambda: app.connector_dialog(kind="pihole")),
+    ("search:example", lambda: (app.global_search_var.set("example"),
+                                app._run_global_search())),
+    ("website-devices", lambda: app.show_website_devices(sites[0])
+     if sites else None),
+    ("redaction-preview", lambda: app.redaction_preview(
+        "Report", "line one\nline two 192.168.1.10", "r.txt")),
+    ("crash-dialog", lambda: mw.CrashDialog.show(app, "Traceback: test")),
+]
+for name, fn in extra:
+    visit(f"dialog:{name}", fn)
+mw.CrashDialog._open = False
+
+
+def modal(name, fn):
+    """ask_text and friends wait for an answer: check, then close."""
+    def later():
+        for t in toplevels():
+            try:
+                check(t, name)
+                shot(t, name)
+                t.destroy()
+            except tk.TclError:
+                pass
+    root.after(700, later)
+    WHERE[0] = name
+    try:
+        fn()
+    except Exception:
+        ERRORS.append((name, "action", traceback.format_exc()))
+
+
+modal("dialog:ask_text", lambda: mw.ask_text(
+    app, "Rename device", "New name for this device (leave empty to use "
+    "the automatic name):", "Alex-iPhone"))
+modal("dialog:choose_from_list", lambda: mw.choose_from_list(
+    app, "Set device type", "What kind of device is this?",
+    ["Phone", "Laptop", "Printer", "Smart TV", "Router"]))
+
 # the window itself after everything
 visit("main:final", lambda: app._select_tab("dash"))
 

@@ -99,7 +99,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 _T_START = time.perf_counter()
 LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
-SCRIPT_VERSION = "5.0.1"
+SCRIPT_VERSION = "5.0.2"
 SESSION_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 2
 
@@ -1713,11 +1713,11 @@ class LoaderWindow(tk.Frame):
          "Tabs, settings, devices, filters and ready-made workspaces from "
          "one search box. Starting up is also more reliable, with Safe "
          "Mode if a start fails twice."),
-        ("\U0001F6E0", "Fixes and small additions (5.0.1)",
-         "Expert findings open their packets and export to CSV, Copy as "
-         "filter in more places, Follow stream can save, step ◀ ▶ and pick "
-         "a direction, Ctrl+G goes to a packet, three time formats and "
-         "coloured expert rows."),
+        ("\U0001F6E0", "Fixes for small screens and long translations (5.0.2)",
+         "No more cut-off or overlapping text: tabs and toolbars wrap "
+         "instead of hiding buttons, dialogs fit the screen, charts and the "
+         "map measure their labels, and views that looked empty now fill "
+         "in or say why."),
     )
 
     def __init__(self, master, config=None, mode="startup"):
@@ -19554,6 +19554,10 @@ Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
 Automatic (MiniWireshark decides) ¦ Automatique (MiniWireshark décide) ¦ Automático (MiniWireshark decide)
 You set this type ¦ Vous avez choisi ce type ¦ Usted eligió este tipo
 detected ¦ détecté ¦ detectado
+Fixes for small screens and long translations (5.0.2) ¦ Corrections pour petits écrans et longues traductions (5.0.2) ¦ Correcciones para pantallas pequeñas y traducciones largas (5.0.2)
+No more cut-off or overlapping text: tabs and toolbars wrap instead of hiding buttons, dialogs fit the screen, charts and the map measure their labels, and views that looked empty now fill in or say why. ¦ Plus de texte coupé ou superposé : les onglets et les barres d'outils passent à la ligne au lieu de cacher des boutons, les fenêtres tiennent dans l'écran, les graphiques et la carte mesurent leurs libellés, et les vues qui semblaient vides se remplissent ou disent pourquoi. ¦ No más texto cortado o superpuesto: las pestañas y barras de herramientas pasan a otra línea en lugar de ocultar botones, las ventanas caben en la pantalla, los gráficos y el mapa miden sus etiquetas, y las vistas que parecían vacías se llenan o explican por qué.
+For example: ¦ Par exemple : ¦ Por ejemplo:
+(leave the password empty to keep the saved one) ¦ (laissez le mot de passe vide pour garder celui enregistré) ¦ (deje la contraseña vacía para conservar la guardada)
 Checking which network this is before sending anything… ¦ Vérification du réseau avant tout envoi… ¦ Comprobando qué red es antes de enviar nada…
 (Nothing is being sent right now: not capturing live.) ¦ (Rien n'est envoyé en ce moment : pas de capture en direct.) ¦ (Ahora no se envía nada: no hay captura en directo.)
 I'm also quietly looking for other devices on your network. ¦ Je cherche aussi discrètement les autres appareils de votre réseau. ¦ También busco discretamente otros dispositivos en su red.
@@ -21113,6 +21117,14 @@ def install_layout_hooks():
                     self._mw_wrap0 = 0
                 if self._mw_wrap0 > 0:
                     _autowrap_install(self.master)
+                    # set on a label already on screen: its width will not
+                    # change, so no <Configure> comes — check it once
+                    try:
+                        if self.winfo_exists():
+                            self.after_idle(lambda w=self: _autowrap(
+                                _WrapEvent(w)))
+                    except tk.TclError:
+                        pass
         return out
     tk.Misc._options = _options
 
@@ -21213,6 +21225,15 @@ def _is_flexible(w):
     except (tk.TclError, KeyError):
         pass
     return False
+
+
+class _WrapEvent:
+    def __init__(self, w):
+        self.widget = w
+        try:
+            self.width = w.winfo_width()
+        except tk.TclError:
+            self.width = 0
 
 
 def _autowrap(e):
@@ -22970,6 +22991,9 @@ class SettingsWindow:
         self.canvas.pack(side="left", fill="both", expand=True)
         self.content = tk.Frame(self.canvas, bg=t["tab_bg"], padx=24,
                                 pady=6)
+        with contextlib.suppress(tk.TclError):
+            ttk.Style().configure("SettingsWrap.TCheckbutton",
+                                  wraplength=560)
         self._cwin = self.canvas.create_window((0, 0), window=self.content,
                                                anchor="nw")
         self.content.bind("<Configure>", lambda e: self.canvas.configure(
@@ -23041,6 +23065,10 @@ class SettingsWindow:
     # -------------------------------------------------------------- scrolling
     def _on_canvas_resize(self, e):
         self.canvas.itemconfigure(self._cwin, width=e.width)
+        # long check box labels wrap too (ttk takes it from the style)
+        with contextlib.suppress(tk.TclError):
+            ttk.Style().configure("SettingsWrap.TCheckbutton",
+                                  wraplength=max(240, e.width - 110))
         for lbl, reserve in self._wrap:
             try:
                 # 80: indicators and paddings grow with the text size;
@@ -23177,7 +23205,8 @@ class SettingsWindow:
             top = tk.Frame(row, bg=t["tab_bg"])
             top.pack(fill="x")
             cb = ttk.Checkbutton(top, text=c["label"],
-                                 variable=self.vars[key])
+                                 variable=self.vars[key],
+                                 style="SettingsWrap.TCheckbutton")
             cb.pack(side="left")
             widgets.append(cb)
             if c.get("badge"):
@@ -26884,10 +26913,13 @@ class MapTab(BaseTab):
         self._last_sig = sig
         c.delete("all")
         self.nodes.clear()
+        self._label_boxes = []
+        self._label_ids = []
         self._hover_items = []
         c.configure(bg=self.t["tab_bg"])
         if self.mode_var.get() == "Topology":
             self._topology(w, h)
+            self.after_draw_declutter()
         else:
             self._connections(w, h)
         c.tag_lower("edge")
@@ -26911,6 +26943,11 @@ class MapTab(BaseTab):
                                  outline=t["focus"] if sel else fill,
                                  width=3 if sel else 2, tags=tag)
         self.nodes[oid] = (kind, key, label, info)
+        # labels placed later keep clear of this node too
+        boxes = getattr(self, "_label_boxes", None)
+        if boxes is None:
+            boxes = self._label_boxes = []
+        boxes.append((X - R, Y - R, X + R, Y + R, f"n:{key}"))
         if letter:
             lid = self.c.create_text(X, Y, text=letter,
                                      fill=t["tab_bg"] if not hollow
@@ -26923,7 +26960,80 @@ class MapTab(BaseTab):
                                      font=("TkDefaultFont", 8,
                                            "bold" if sel else "normal"))
             self.nodes[tid] = (kind, key, label, info)
+            self._place_label(tid, X, Y, R, label, sel)
+            self._label_ids.append((tid, X, Y, R, label, sel))
         return X, Y
+
+    def after_draw_declutter(self):
+        """Second pass once everything is drawn (stars, rings, the router
+        and titles come after some names): every name keeps clear of
+        every other text and node."""
+        c = self.c
+        labels = {t[0] for t in getattr(self, "_label_ids", ())}
+        fixed = []
+        for i in c.find_all():
+            if i in labels:
+                continue
+            kind = c.type(i)
+            if kind in ("text", "oval") and str(c.itemcget(i, "state")) \
+                    != "hidden":
+                b = c.bbox(i)
+                # nodes, letters, stars and titles; not the big dashed
+                # ring around the local network
+                if b and (kind == "text" or (b[2] - b[0] < 80 and
+                                             b[3] - b[1] < 80)):
+                    # a node's own circles do not block its name; its
+                    # star and other texts do
+                    own = next((t for t in c.gettags(i)
+                                if t.startswith("n:")), "") \
+                        if kind == "oval" else ""
+                    fixed.append(tuple(b) + (own,))
+        self._label_boxes = fixed
+        for tid, X, Y, R, label, sel in getattr(self, "_label_ids", ()):
+            c.itemconfigure(tid, state="normal")
+            self._place_label(tid, X, Y, R, label, sel)
+
+    def _place_label(self, tid, X, Y, R, label, sel):
+        """Names of neighbouring nodes were written over each other on a
+        small map: try below, then above, then a shorter name; if none
+        fits, the name shows on hover only (the selected one always
+        shows)."""
+        boxes = getattr(self, "_label_boxes", None)
+        if boxes is None:
+            boxes = self._label_boxes = []
+        c = self.c
+
+        own = next((t for t in c.gettags(tid) if t.startswith("n:")), "")
+
+        def free():
+            b = c.bbox(tid)
+            if not b:
+                return True
+            for o in boxes:
+                if len(o) > 4 and o[4] == own:
+                    continue        # its own node, ring and star
+                if b[0] < o[2] and o[0] < b[2] and b[1] < o[3] and \
+                        o[1] < b[3]:
+                    return False
+            return True
+        tries = ((X, Y + R + 8, label[:22]), (X, Y - R - 8, label[:22]),
+                 (X, Y + R + 8, label[:10] + ("…" if len(label) > 10
+                                              else "")),
+                 (X, Y - R - 8, label[:10] + ("…" if len(label) > 10
+                                              else "")))
+        ok = False
+        for x, y, text in tries:
+            c.coords(tid, x, y)
+            c.itemconfigure(tid, text=text)
+            if free() or sel:
+                ok = True
+                break
+        if not ok:
+            c.itemconfigure(tid, state="hidden")
+            return
+        b = c.bbox(tid)
+        if b:
+            boxes.append(tuple(b) + (own,))
 
     def _line(self, a, b, weight=0, dash=(), hi=False, tag=None):
         t = self.t
@@ -27004,9 +27114,18 @@ class MapTab(BaseTab):
         self.c.create_oval(X0 - R0, Y0 - R0, X0 + R0, Y0 + R0,
                            outline=t["muted_fg"], dash=(4, 3),
                            tags=("deco",))
-        self.c.create_text(X0, Y0 - R0 - 12, text="YOUR LOCAL NETWORK",
-                           fill=t["muted_fg"], tags=("deco",),
-                           font=("TkDefaultFont", int(9 * ui), "bold"))
+        if radius >= 60:          # small ring: the title would sit on a node
+            tt = self.c.create_text(X0, Y0 - R0 - 12,
+                                    text="YOUR LOCAL NETWORK",
+                                    fill=t["muted_fg"], tags=("deco",),
+                                    font=("TkDefaultFont", int(9 * ui),
+                                          "bold"))
+            if self.c.bbox(tt):
+                self._label_boxes = [self.c.bbox(tt)]
+        # the router is drawn last, in the middle: keep names off it
+        rr_ = 18 * ui * max(0.7, min(1.6, self.scale)) + 4
+        self._label_boxes = getattr(self, "_label_boxes", []) + [
+            (X0 - rr_, Y0 - rr_, X0 + rr_, Y0 + rr_)]
         sel_key = self.selected[1] if self.selected and \
             self.selected[0] == "device" else None
         alerted = {a.device_key for a in m.alerts.alerts.values()
@@ -27099,10 +27218,14 @@ class MapTab(BaseTab):
         sp = min(30 * ui, max(14 * ui, (h - 70) / max(1, len(remotes))))
         if remotes:
             ty = max(12, cy - (len(remotes) - 1) / 2 * sp - 34 * ui)
-            self.c.create_text(X, self.P(0, ty)[1],
-                               text="INTERNET (outside your network)",
-                               fill=t["muted_fg"], tags=("deco",),
-                               font=("TkDefaultFont", int(9 * ui), "bold"))
+            it = self.c.create_text(X, self.P(0, ty)[1],
+                                    text="INTERNET (outside your network)",
+                                    fill=t["muted_fg"], tags=("deco",),
+                                    font=("TkDefaultFont", int(9 * ui),
+                                          "bold"))
+            if self.c.bbox(it):
+                self._label_boxes = getattr(self, "_label_boxes", []) + [
+                    self.c.bbox(it)]
         for i, r in enumerate(remotes):
             ry = cy + (i - (len(remotes) - 1) / 2) * sp
             hi = bool(sel_key and sel_key in r.devices)
@@ -27414,7 +27537,7 @@ class HealthTab(BaseTab):
                 want = max(200, width - 30)
             else:
                 ex.grid_configure(row=0, column=2, columnspan=1, pady=0)
-                want = max(200, width - 400)
+                want = max(200, width - 440)
             if abs(int(float(str(ex.cget("wraplength")) or 0)) - want) > 4:
                 ex.configure(wraplength=want)
         except (tk.TclError, ValueError):
@@ -28601,7 +28724,8 @@ class PacketsTab(BaseTab):
         self.lbl(self.adv_row, "Expression:").pack(side="left")
         self.expr_var = tk.StringVar()
         ee = ttk.Entry(self.adv_row, textvariable=self.expr_var, width=46)
-        ee.pack(side="left", padx=(4, 6))
+        # stretches with the window (and gives way on a narrow one)
+        ee.pack(side="left", padx=(4, 6), fill="x", expand=True)
         ee.bind("<Return>", lambda e: self.apply())
         ee.bind("<KeyRelease>", lambda e: self._validate_expr(), add="+")
         self.expr_entry = ee
@@ -28763,6 +28887,7 @@ class PacketsTab(BaseTab):
         if want is None:              # until you choose: folded when short
             want = app.root.winfo_screenheight() >= 900
         self.toggle_quick_filters(bool(want), remember=False)
+        self.fit_time_column()
 
     def _show_err(self):
         try:
@@ -29071,7 +29196,22 @@ class PacketsTab(BaseTab):
     def _time_format(self):
         self.app.config.set("capture.time_format", self.time_var.get())
         self.app.config.save()
+        self.fit_time_column()
         self.render()
+
+    def fit_time_column(self):
+        """Wide enough for the chosen time format at the current text
+        size ("09:43:20.33" lost its last digit)."""
+        try:
+            f = tkfont.Font(font=ttk.Style().lookup("Treeview", "font") or
+                            "TkDefaultFont")
+            sample = {"Time of day": "00:00:00.000",
+                      "Seconds since start": "00000.000000",
+                      "Since previous shown": "000.000000"}.get(
+                self.time_var.get(), "00:00:00.000")
+            self.tree.column("time", width=f.measure(sample) + 18)
+        except (tk.TclError, AttributeError):
+            pass
 
     def _xcolor(self):
         self.app.config.set("capture.color_expert", self.xcolor_var.get())
@@ -31856,6 +31996,13 @@ class MiniWireshark:
             limit = w.winfo_screenheight() - 80
             wlimit = w.winfo_screenwidth() - 20
             cw = w.winfo_width()
+            # a form that needs a little more width (larger text, longer
+            # words) gets it; windows with a text area keep their width
+            rw = w.winfo_reqwidth()
+            if cw + 4 < rw <= cw + 300 and rw <= wlimit and not any(
+                    True for _t in _walk_class(w, tk.Text)):
+                w.geometry(f"{rw}x{ch}")
+                cw = rw
             if ch > limit + 20 or cw > wlimit:   # bigger than the screen
                 nw, nh = min(cw, wlimit), min(ch, limit)
                 w.geometry(f"{nw}x{nh}+{max(0, min(w.winfo_x(), wlimit - nw))}"
@@ -34153,9 +34300,16 @@ class MiniWireshark:
             f.configure(size=(-1 if size < 0 else 1) *
                         max(6, int(round(abs(size) * scale))))
         try:
-            ttk.Style().configure("Treeview", rowheight=int(24 * scale))
+            # table text follows the text size too (it stayed at 10 pt)
+            st = ttk.Style()
+            st.configure("Treeview", rowheight=int(24 * scale),
+                         font=("TkDefaultFont", int(round(10 * scale))))
+            st.configure("Treeview.Heading", font=(
+                "TkDefaultFont", int(round(10 * scale)), "bold"))
         except tk.TclError:
             pass
+        with contextlib.suppress(KeyError, AttributeError, tk.TclError):
+            self.tabs["packets"].fit_time_column()
         self._scale_explicit_fonts(self.root, scale)
         # bigger text: table headings widen so they are not cut
         fit_all_headings(self.root)
@@ -35215,13 +35369,16 @@ class MiniWireshark:
         for i, (lab, var) in enumerate(rows, 2):
             tk.Label(body, text=lab, bg=t["tab_bg"], fg=t["text_fg"]).grid(
                 row=i, column=0, sticky="w", pady=3)
-            e = ttk.Entry(body, textvariable=var, width=46,
+            e = ttk.Entry(body, textvariable=var, width=34,
                           show="•" if var is pw_v else "")
             e.grid(row=i, column=1, sticky="we", pady=3)
+        body.columnconfigure(1, weight=1)
         r = len(rows) + 2
-        tk.Label(body, text=f"e.g. {cls.PATH_HINT}" + (
-            "  (leave the password empty to keep the saved one)" if cid
-            else ""), bg=t["tab_bg"], fg=t["muted_fg"]).grid(
+        tk.Label(body, text=translate_text("For example:") +
+                 f" {cls.PATH_HINT}" + ("  " + translate_text(
+                     "(leave the password empty to keep the saved one)")
+                     if cid else ""), bg=t["tab_bg"], fg=t["muted_fg"],
+                 justify="left", wraplength=380).grid(
             row=r, column=1, sticky="w")
         ttk.Checkbutton(body, text="Check the certificate (https)",
                         variable=ver_v).grid(row=r + 1, column=1,
@@ -38056,8 +38213,8 @@ class MiniWireshark:
             buttons[name] = b
         status_var = DisplayVar(value="")
         tk.Label(win, textvariable=status_var, bg=t["tab_bg"],
-                 fg=t["info_fg"], anchor="w").pack(fill="x", padx=14,
-                                                   pady=(0, 10))
+                 fg=t["info_fg"], anchor="w", justify="left",
+                 wraplength=900).pack(fill="x", padx=14, pady=(0, 10))
 
         def show(cid):
             sel["id"] = cid
@@ -50047,6 +50204,28 @@ def test_v501_translations(ctx):
         assert fr(t) != t or t == "Client → server", t
 
 
+@self_test(slow=False)
+def test_v502_live_texts_translated(ctx):
+    """5.0.2: the texts seen only while capturing live (status line, mode
+    banner pieces, start banner) have French and Spanish, and counts say
+    "1 device", not "1 devices"."""
+    for loc in ("fr", "es"):
+        for en in ("👀 Watching “eth0”.", "1,234 packets", "1 packet",
+                   "3 devices", "1 device", "2 websites", "1 website",
+                   "5 open connections", "1 open connection",
+                   "Network: Maison.", "I'm in Quiet Mode, so I'm only "
+                   "listening.", "Checking which network this is before "
+                   "sending anything…", "Picked because it carries your "
+                   "default Internet route.", "Nothing is being sent.",
+                   "Welcome to MiniWireshark 5!", "Presets…"):
+            out = translate_text(en, loc)
+            assert out != en, (loc, en)
+    rec = {"reasons": ["it carries your default Internet route",
+                       "it has no IPv4 address"]}
+    assert explain_reasons(rec) == "it carries your default Internet route"
+    assert explain_choice(rec).startswith("Picked because it carries")
+
+
 def bench_report(seconds=2.0):
     """Measured numbers for this machine (python miniwireshark.py --bench)."""
     load_scapy()
@@ -51443,6 +51622,101 @@ def _gs_v502_layout(app, ctx):
         app._on_ui_mode_change()
         root.geometry(old_geo)
         _gui_pump(root, 0.3)
+
+
+@gui_test_step("5.0.2 behaviour: loops survive errors, tabs, banners, tooltips")
+def _gs_v502_behaviour(app, ctx):
+    root = app.root
+    # the packet list keeps updating after an error in one batch
+    tab = app.tabs["packets"]
+    orig = tab.add_rows
+    calls = []
+
+    def boom(rows):
+        calls.append(len(rows))
+        if len(calls) == 1:
+            raise RuntimeError("test: one bad batch")
+        return orig(rows)
+    tab.add_rows = boom
+    try:
+        app.pending_rows.append(dict(app.all_rows[0]) if app.all_rows
+                                else {"no": 1})
+        _gui_pump(root, 0.5)
+        app.pending_rows.append(dict(app.all_rows[0]) if app.all_rows
+                                else {"no": 2})
+        _gui_pump(root, 0.5)
+        assert len(calls) >= 2, "the packet loop stopped after an error"
+    finally:
+        tab.add_rows = orig
+        app.pending_rows.clear()
+    # one failing part of the UI flush does not block the others
+    feed = app.tabs["feed"]
+    fpush = feed.push
+    feed.push = lambda ev: (_ for _ in ()).throw(RuntimeError("test"))
+    try:
+        app.model.ev_feed.append(("x", "y", "z"))
+        app.model.dirty_devices.update(app.model.registry.by_key)
+        _gui_pump(root, 1.6)
+        assert not app.model.dirty_devices, "devices not flushed"
+    finally:
+        feed.push = fpush
+        app.model.ev_feed.clear()
+    # Ctrl+Tab works with the focus in the search box (outside the tabs)
+    app._select_tab("dash")
+    _gui_pump(root, 0.2)
+    first = app.nb.index("current")
+    app.search_entry.focus_set()
+    _gui_pump(root, 0.1)
+    app.search_entry.event_generate("<Control-Tab>")
+    _gui_pump(root, 0.2)
+    assert app.nb.index("current") != first, "Ctrl+Tab did nothing"
+    app._select_tab("dash")
+    # short information banners go away; warnings stay
+    app.BANNER_SECONDS = 1
+    try:
+        app._set_banner("test info")
+        _gui_pump(root, 1.5)
+        assert not app.banner.winfo_manager(), "info banner stayed"
+        app._set_banner("test warning", kind="warn")
+        _gui_pump(root, 1.5)
+        assert app.banner.winfo_manager(), "warning banner went away"
+    finally:
+        app.BANNER_SECONDS = 20
+    # not live: one banner says it (no second "not capturing live" one)
+    saved = app.data_mode
+    app.data_mode = "offline"
+    app._restyle_mode_banner()
+    _gui_pump(root, 0.1)
+    assert not app.mode_banner.winfo_manager() and \
+        app.data_banner.winfo_manager()
+    assert "Nothing is being sent" in app.data_lbl.cget("text")
+    app.data_mode = "idle"
+    app._restyle_mode_banner()
+    _gui_pump(root, 0.1)
+    assert app.mode_banner.winfo_manager() or LEDGER.killed
+    app.data_mode = saved
+    app._restyle_mode_banner()
+    # a tooltip whose widget disappears goes too
+    holder = tk.Toplevel(root)
+    lbl = tk.Label(holder, text="tip test")
+    lbl.pack()
+    _gui_pump(root, 0.3)
+    tip = Tooltip(lbl, "hello")
+    tip._tip = tk.Toplevel(root)
+    lbl.pack_forget()
+    _gui_pump(root, 0.2)
+    assert tip._tip is None, "tooltip stayed after its widget was hidden"
+    holder.destroy()
+    # the main window fits on the screen
+    root.update_idletasks()
+    assert root.winfo_x() >= 0 and root.winfo_y() >= 0
+    # quick filters fold away and come back
+    pt = app.tabs["packets"]
+    pt.toggle_quick_filters(False)
+    assert not pt.pills_frame.winfo_manager()
+    pt.toggle_quick_filters(True)
+    assert pt.pills_frame.winfo_manager()
+    app.config.set("capture.quick_filters", None)
 
 
 @gui_test_step("corrections: rename, merge, undo from the window")
