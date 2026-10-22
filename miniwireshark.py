@@ -52,6 +52,7 @@ self-test t_toc_matches_banners keeps this list and the banners in step.
     16.   Settings — one declarative schema drives the whole window
     17.   GUI components — tables, charts, dialogs, menus
     18.   Tabs
+    18c.  Background jobs — slow work that must not freeze the window
     19.   The application window
     18b.  Export / reporting — self-contained HTML (inline SVG charts, no
     19b.  Diagnostics window, crash dialog, self-update
@@ -275,8 +276,15 @@ def atomic_write_text(path, text, encoding="utf-8"):
     os.replace(tmp, path)
 
 
-def atomic_write_json(path, obj):
-    atomic_write_text(path, json.dumps(obj, indent=2, default=str))
+def atomic_write_json(path, obj, compact=False):
+    """compact=True: no indentation. json only uses its fast C encoder
+    without indent, so this is several times quicker for big files
+    (a 300-device session: 103 ms instead of 242 ms)."""
+    if compact:
+        text = json.dumps(obj, separators=(",", ":"), default=str)
+    else:
+        text = json.dumps(obj, indent=2, default=str)
+    atomic_write_text(path, text)
 
 
 def read_json(path, default=None):
@@ -1786,7 +1794,7 @@ class LoaderWindow(tk.Frame):
         left = tk.Frame(hdr, bg="#2b3a55")
         left.pack(side="left", fill="x", expand=True)
         tk.Label(left, text=f"MiniWireshark {SCRIPT_VERSION}", fg="white",
-                 bg="#2b3a55", font=("TkDefaultFont", 16, "bold")).pack(
+                 bg="#2b3a55", font=mw_font(16, "bold")).pack(
             anchor="w")
         self.sub_var = DisplayVar(
             value="Runtime Manager — checking everything is ready"
@@ -1796,7 +1804,7 @@ class LoaderWindow(tk.Frame):
                  bg="#2b3a55").pack(anchor="w")
         self.health_lbl = tk.Label(hdr, text="● Checking", fg="#2b3a55",
                                    bg="#c8d2e0", padx=10, pady=4,
-                                   font=("TkDefaultFont", 10, "bold"))
+                                   font=mw_font(10, "bold"))
         self.health_lbl.pack(side="right")
         body = tk.Frame(self, bg=self.bg, padx=18, pady=10)
         body.pack(fill="both", expand=True)
@@ -1806,7 +1814,7 @@ class LoaderWindow(tk.Frame):
         self.stage_lbls = {}
         for i, name in enumerate(RuntimeManager.STAGES):
             lb = tk.Label(stages, text=f"○ {name}", bg=self.bg, fg=self.muted,
-                          font=("TkDefaultFont", 9))
+                          font=mw_font(9))
             lb.pack(side="left", padx=(0, 4))
             if i < len(RuntimeManager.STAGES) - 1:
                 tk.Label(stages, text="›", bg=self.bg,
@@ -1814,7 +1822,7 @@ class LoaderWindow(tk.Frame):
             self.stage_lbls[name] = lb
         self.status_var = DisplayVar(value="Starting …")
         tk.Label(body, textvariable=self.status_var, bg=self.bg, fg=self.fg,
-                 font=("TkDefaultFont", 11, "bold"), anchor="w",
+                 font=mw_font(11, "bold"), anchor="w",
                  justify="left", wraplength=600).pack(fill="x")
         self.progress = ttk.Progressbar(body, mode="determinate",
                                         maximum=100)
@@ -1895,7 +1903,7 @@ class LoaderWindow(tk.Frame):
                                                             "#e0e2e8"))
         f.pack(fill="both", expand=True)
         tk.Label(f, text=title, bg=self.card_bg, fg=self.fg,
-                 font=("TkDefaultFont", 12, "bold"), anchor="w",
+                 font=mw_font(12, "bold"), anchor="w",
                  justify="left", wraplength=620).pack(fill="x")
         if text:
             tk.Label(f, text=text, bg=self.card_bg, fg=self.fg, anchor="w",
@@ -2165,7 +2173,7 @@ class LoaderWindow(tk.Frame):
             tiles.columnconfigure(i, weight=1, uniform="tile")
             a = tk.Label(tile, text=f"{icon}  {translate_text(title)}",
                          bg=self.card_bg, fg=self.fg, wraplength=150,
-                         font=("TkDefaultFont", 11, "bold"),
+                         font=mw_font(11, "bold"),
                          anchor="w", justify="left")
             a.pack(anchor="w")
             b = tk.Label(tile, text=text, bg=self.card_bg, fg=self.muted,
@@ -2181,7 +2189,7 @@ class LoaderWindow(tk.Frame):
         news.pack(fill="both", expand=True, pady=(10, 0))
         tk.Label(news, text="What's new in " + ".".join(
                      SCRIPT_VERSION.split(".")[:2]), bg=self.card_bg,
-                 fg=self.fg, font=("TkDefaultFont", 10, "bold"),
+                 fg=self.fg, font=mw_font(10, "bold"),
                  anchor="w").pack(fill="x")
         for icon, title, text in self.WHATS_NEW:
             tk.Label(news, text=f"{icon}  {translate_text(title)} — "
@@ -2206,7 +2214,7 @@ class LoaderWindow(tk.Frame):
                        activebackground=self.bg).pack(side="left")
         rep = tk.Label(row, text="Something wrong? Repair…", bg=self.bg,
                        fg=self.accent, cursor="hand2",
-                       font=("TkDefaultFont", 10, "underline"))
+                       font=mw_font(10, "underline"))
         rep.pack(side="right")
         rep.bind("<Button-1>", lambda e: self._choose("repair"))
         self.footer.config(text="Enter = Start Monitoring · Tab moves "
@@ -8876,7 +8884,23 @@ class GuiGate:
 # Safe Mode (or a developer) can fall back to exactly the 5.0.2 behaviour.
 FEATURES = {
     "fair_gate": True,       # the analysis thread hands the gate to Tk (M1)
+    "chunked": True,         # tables refill in short slices after a swap (M2)
+    "gc_freeze": True,       # startup objects leave the cycle collector (M2)
 }
+
+
+def freeze_startup_objects():
+    """Once the window is built: the module, its tables and the window's
+    widgets live as long as the program, so the cycle collector stops
+    re-scanning them (gc.freeze). Its full passes, which hold the GIL and
+    freeze the window, then cover only the network data: 135,000 fewer
+    objects each time. A frozen object that dies later is still freed by
+    reference counting; only a cycle among such objects would stay (the
+    startup screen's few, once)."""
+    if FEATURES.get("gc_freeze", True) and hasattr(gc, "freeze"):
+        with contextlib.suppress(Exception):
+            gc.collect()
+            gc.freeze()
 
 
 def callback_name(cw):
@@ -11010,13 +11034,15 @@ class DeviceRegistry:
                     or b.key in a.never_merge or a.key in b.never_merge
                     or a.live != b.live)
 
-    def merge_candidates(self, dev):
+    def merge_candidates(self, dev, pool=None):
         """Possible duplicates of `dev` with the reasons. Based only on
         identity evidence (announced names, DHCP client details, timing) —
-        never on similar websites or traffic."""
+        never on similar websites or traffic. `pool`: the only devices that
+        can match (same name or alias), from merge_pool(); every device
+        when None."""
         out = []
         name = self.stable_name(dev)
-        for other in self.by_key.values():
+        for other in (self.by_key.values() if pool is None else pool):
             if not self.can_pair(dev, other):
                 continue
             reasons, pts = [], 0
@@ -11059,6 +11085,36 @@ class DeviceRegistry:
                 out.append((other, conf, reasons))
         out.sort(key=lambda t: (t[1] != "Medium", -t[0].last_seen))
         return out
+
+    def merge_pool(self):
+        """dev -> the devices merge_candidates() can pair it with: only a
+        shared announced name or a shared alias can, so one index replaces
+        comparing every device with every other (5.1.2: 660 ms every 5 s
+        at 1,000 devices). Kept in by_key order, so the result is the same
+        as the full scan."""
+        by_name, by_alias = defaultdict(list), defaultdict(list)
+        for other in self.by_key.values():
+            n = self.stable_name(other)
+            if n:
+                by_name[n].append(other)
+            if other.alias:
+                by_alias[other.alias].append(other)
+        pos = {}
+
+        def pool(dev):
+            group = by_name.get(self.stable_name(dev) or None, []) + \
+                by_alias.get(dev.alias or None, [])
+            if len(group) < 2:
+                return []
+            if not pos:
+                pos.update((k, i) for i, k in enumerate(self.by_key))
+            seen, out = set(), []
+            for o in sorted(group, key=lambda d: pos.get(d.key, 0)):
+                if o.key not in seen:
+                    seen.add(o.key)
+                    out.append(o)
+            return out
+        return pool
 
     def auto_merge_pass(self):
         """Settings → Devices → 'Combine identities automatically'.
@@ -16986,6 +17042,14 @@ class NetworkModel:
 
     # ---- periodic work --------------------------------------------------------
     def tick(self, now=None):
+        """All upkeep at once (tests, file imports)."""
+        for _name in self.tick_steps(now):
+            pass
+
+    def tick_steps(self, now=None):
+        """The same upkeep as named steps: the window runs one step per
+        callback, so a large network never freezes it for the whole pass
+        (5.0.2: one 40-60 ms callback every 5 s at 300 devices)."""
         now = now or self.now()
         newly_inactive, newly_expired = self.registry.tick_lifecycle(now)
         for dev in newly_inactive:
@@ -16998,12 +17062,15 @@ class NetworkModel:
             self.push_timeline("device expired", "INFO",
                                f"{dev.display_name()} moved to history "
                                f"(expired)", ("device", dev.key), dev.key)
+        yield "lifecycle"
         for f in self.flows.expire(now):
             pass
         self.dns.expire(now)
+        yield "expiry"
         self._check_dns(now)
         self._check_broadcast(now)
         self._check_scans(now)
+        yield "checks"
         for dev in list(self.registry.by_key.values()):
             if dev.state != STATE_ACTIVE or not dev.live:
                 continue
@@ -17012,6 +17079,7 @@ class NetworkModel:
                         "alerts.unknown_min_packets", 5)) and \
                     not dev.expected:
                 self._alert(self.alerts.unknown_device(dev))
+        yield "unknown devices"
         for keep, other in self.registry.auto_merge_pass():
             dev = self.registry.by_key.get(keep)
             self.dirty_devices.add(keep)
@@ -17020,14 +17088,19 @@ class NetworkModel:
                                    f"{dev.display_name()}: two identities "
                                    f"combined (automatic)",
                                    ("device", keep), keep)
+        yield "merges"
         if self.config.get("devices.suggest_merges", True):
             self._suggest_merges()
+        yield "merge suggestions"
         self._apply_cache_names()
+        yield "names"
         self._classify()
+        yield "classify"
         active = sum(1 for d in self.registry.by_key.values()
                      if d.live and d.state in (STATE_ACTIVE, STATE_IDLE))
         self.metrics.series["active_devices"].add(now, active)
         self._detect_vpn()
+        yield "vpn"
         for key, b in list(self.baselines.devices.items()):
             if b.cur_min is not None and int(now // 60) > b.cur_min + 1:
                 dev = self.registry.by_key.get(key)
@@ -17091,12 +17164,14 @@ class NetworkModel:
                 self._alert(self.alerts.scan_pattern(dev, res[0], res[1]))
 
     def _suggest_merges(self):
+        pool = self.registry.merge_pool()
         for dev in list(self.registry.by_key.values()):
             if not dev.live or dev.pinned_no_merge:
                 continue
             if not (dev.dhcp_hostname or dev.mdns_name or dev.alias):
                 continue
-            for other, conf, reasons in self.registry.merge_candidates(dev):
+            for other, conf, reasons in self.registry.merge_candidates(
+                    dev, pool(dev)):
                 pair = other.key
                 if pair in dev.suggested or dev.key in other.suggested:
                     continue
@@ -17616,6 +17691,80 @@ class SessionCodec:
             "network_id": getattr(model, "network_id", ""),
         }
         return payload
+
+    @staticmethod
+    def iter_json(model, meta=None, chunk=300):
+        """The same session as serialize(), as compact JSON text in pieces.
+        Each piece is computed when it is asked for (next()), so a caller
+        can hold the GuiGate for one piece at a time and the window stays
+        responsive while a large session is saved. ''.join() of the pieces
+        parses to what serialize() returns (exported_at aside)."""
+        enc = json.JSONEncoder(separators=(",", ":"), default=str).encode
+        meta = dict(meta or {})
+        now = model.now()
+        head = {
+            "schema_version": SESSION_SCHEMA_VERSION,
+            "app": {"name": APP_NAME, "version": SCRIPT_VERSION},
+            "exported_at": time.time(),
+            "packet_count": model.count,
+            "session": {
+                "started": meta.get("started") or model.metrics.first_ts,
+                "ended": model.metrics.last_ts or now,
+                "data_source": meta.get("data_source", "live"),
+                "interface": meta.get("interface", ""),
+                "gateway": model.gateway_ip,
+                "my_ips": sorted(model.my_ips),
+                "demo": bool(model.demo),
+                "vpn": dict(model.vpn),
+            },
+        }
+        yield enc(head)[:-1]
+
+        def section(key, objs, conv):
+            yield f',"{key}":['
+            first = True
+            for i in range(0, len(objs), chunk):
+                part = enc([conv(o) for o in objs[i:i + chunk]])[1:-1]
+                if part:
+                    yield part if first else "," + part
+                    first = False
+            yield "]"
+        yield from section("devices", list(model.registry.by_key.values()),
+                           device_to_dict)
+        yield from section("websites", list(model.websites.values()),
+                           website_to_dict)
+        yield from section("remote_hosts", sorted(
+            model.remote_hosts.values(), key=lambda r: -r.bytes_total)[:5000],
+            remote_to_dict)
+        yield from section("flows_summary", sorted(
+            model.flows.all_flows(), key=lambda f: -f.total_bytes)[:2000],
+            lambda f: f.to_dict())
+        alerts = model.alerts
+        yield from section("alerts", [alerts.alerts[aid] for aid in
+                                      alerts.order if aid in alerts.alerts],
+                           alert_to_dict)
+        keep = ("when", "kind", "severity", "text", "ref", "device")
+        yield from section("timeline", list(model.timeline)[-2000:],
+                           lambda e: {k: v for k, v in e.items()
+                                      if k in keep})
+        yield ',"metrics":' + enc(model.metrics.to_dict())
+        yield ',"dns":' + enc(model.dns.to_dict())
+        yield ',"baselines":' + enc(model.baselines.to_dict())
+        rest = {
+            "dhcp_servers": dict(model.dhcp_servers),
+            "doh_seen": {k: sorted(v) for k, v in model.doh_seen.items()},
+            "health": {k: v for k, v in model.health.items()
+                       if isinstance(v, (str, int, float, bool,
+                                         type(None)))}}
+        yield "," + enc(rest)[1:-1]
+        yield from section("observations", list(model.obs_recent)[-3000:],
+                           list)
+        yield from section("epochs", model.epochs[-500:], list)
+        rest = {"bindings": model.registry.bindings.to_list(3000),
+                "aliases": dict(list(model.registry.alias.items())[-2000:]),
+                "corrections": model.journal.to_list(),
+                "network_id": getattr(model, "network_id", "")}
+        yield "," + enc(rest)[1:-1] + "}"
 
     @staticmethod
     def migrate(payload):
@@ -20287,6 +20436,14 @@ Automatic capture, history, helpers and downloads are off for this session. Repa
 The managed Python couldn't open its window, so MiniWireshark is using the Python you started it with. ¦ Le Python géré n'a pas pu ouvrir sa fenêtre : MiniWireshark utilise le Python avec lequel vous l'avez démarré. ¦ El Python gestionado no pudo abrir su ventana, así que MiniWireshark usa el Python con el que lo inició.
 Live capture is off because the capture engine (scapy) isn't available. Opening capture files still works, and Repair can fix it. ¦ La capture en direct est désactivée car le moteur de capture (scapy) n'est pas disponible. L'ouverture de fichiers de capture fonctionne toujours, et la réparation peut corriger cela. ¦ La captura en directo está desactivada porque el motor de captura (scapy) no está disponible. Abrir archivos de captura sigue funcionando y la reparación puede arreglarlo.
 Running on this Python ¦ Fonctionne sur ce Python ¦ Funciona con este Python
+Saving the session ¦ Enregistrement de la session ¦ Guardando la sesión
+Opening the session ¦ Ouverture de la session ¦ Abriendo la sesión
+Keeping a crash-safe copy ¦ Copie de secours en cours ¦ Guardando una copia de seguridad
+Saving the packets ¦ Enregistrement des paquets ¦ Guardando los paquetes
+already running. ¦ déjà en cours. ¦ ya en curso.
+Saving the session was cancelled. ¦ L'enregistrement de la session a été annulé. ¦ Se canceló el guardado de la sesión.
+Opening the session was cancelled. ¦ L'ouverture de la session a été annulée. ¦ Se canceló la apertura de la sesión.
+Work running in the background. Click to cancel it. ¦ Travail en cours en arrière-plan. Cliquez pour l'annuler. ¦ Trabajo en segundo plano. Haga clic para cancelarlo.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -21043,7 +21200,17 @@ class DisplayVar(tk.StringVar):
         super().__init__(master, self.shown(value), name)
 
     def set(self, value):
-        return super().set(self.shown(value))
+        # 5.1.2: setting the same text again made Tk lay out and redraw
+        # its label anyway; the Dashboard alone does this ~15 times every
+        # 2 s, so an unchanged text is not written again
+        shown = self.shown(value)
+        try:
+            if isinstance(shown, str) and super().get() == shown and \
+                    not self.trace_info():
+                return None
+        except (tk.TclError, RuntimeError):
+            pass
+        return super().set(shown)
 
 
 # ---- V5.0.2: layout that survives small screens, long translations and
@@ -21404,26 +21571,46 @@ def install_layout_hooks():
     ttk.Treeview.column = column
 
 
+_HEADING_W = {}         # (heading font size, text) -> pixels (5.1.2)
+
+
+def heading_width(text):
+    """Pixel width of a heading text. Measuring took about 1 ms per call
+    (on X), and the same few heading texts repeat across tables."""
+    f = tkfont.nametofont("TkHeadingFont")
+    key = (f.cget("size"), f.cget("family"), text)
+    w = _HEADING_W.get(key)
+    if w is None:
+        if len(_HEADING_W) > 4000:
+            _HEADING_W.clear()
+        w = _HEADING_W[key] = f.measure(text)
+    return w
+
+
 def fit_heading(tree, col):
     try:
         text = str(tree.heading(col, "text") or "")
         if not text:
             return
-        need = tkfont.nametofont("TkHeadingFont").measure(text) + 20
+        need = heading_width(text) + 20
         if int(tree.column(col, "width")) < need:
             tree.column(col, width=need, minwidth=min(need, 60))
     except (tk.TclError, ValueError, TypeError, RuntimeError):
         pass
 
 
+def fit_tree_headings(tree):
+    try:
+        cols = ("#0",) + tuple(tree["columns"])
+    except tk.TclError:
+        return
+    for c in cols:
+        fit_heading(tree, c)
+
+
 def fit_all_headings(root):
     for tree in _walk_class(root, ttk.Treeview):
-        try:
-            cols = ("#0",) + tuple(tree["columns"])
-        except tk.TclError:
-            continue
-        for c in cols:
-            fit_heading(tree, c)
+        fit_tree_headings(tree)
 
 
 def _walk_class(root, cls):
@@ -22166,7 +22353,7 @@ class Tooltip:
                        foreground=(Tooltip.theme or THEME_LIGHT)[
                            "tooltip_fg"],
                        relief="solid", borderwidth=1,
-                       font=("TkDefaultFont", 9), wraplength=320,
+                       font=mw_font(9), wraplength=320,
                        padx=8, pady=5)
         lbl.pack()
         self._tip = tip
@@ -24078,6 +24265,60 @@ def key_for_iid(iid_map, iid):
     return None
 
 
+# ---- named fonts (5.1.2) -------------------------------------------------------
+# Widgets used to carry their own ("TkDefaultFont", 11, "bold") tuples, so a
+# text-size change had to walk every widget and build a Font object for
+# each (0.33 s). They now share named fonts, one per size and style; a
+# text-size change re-sizes these few fonts and Tk updates every widget.
+MW_FONTS = {}          # name -> (base size, style tuple)
+MW_FONT_OBJ = {}       # name -> tkfont.Font (keeps the named font alive)
+
+
+def mw_font(size, *style):
+    """Name of the shared font that looks exactly like the old
+    ("TkDefaultFont", size, *style) tuple, created on first use and
+    scaled with the current text size."""
+    name = "MW%d%s" % (size, "".join(x[0] for x in style))
+    try:
+        tkfont.nametofont(name)
+        return name
+    except (tk.TclError, RuntimeError):
+        pass
+    actual = tkfont.Font(font=("TkDefaultFont", size) + tuple(style)).actual()
+    scale = MW_FONT_SCALE[0]
+    # keep the Font object: when it is garbage-collected, Tk deletes the
+    # named font
+    MW_FONT_OBJ[name] = tkfont.Font(
+        name=name, family=actual["family"],
+        size=(-1 if size < 0 else 1) * max(6, int(round(abs(size) * scale))),
+        weight=actual["weight"], slant=actual["slant"],
+        underline=actual["underline"], overstrike=actual["overstrike"])
+    MW_FONTS[name] = (size, tuple(style))
+    return name
+
+
+MW_FONT_SCALE = [1.0]
+
+
+def scale_mw_fonts(scale):
+    """Text size: every shared font follows at once."""
+    for _name in scale_mw_fonts_steps(scale):
+        pass
+
+
+def scale_mw_fonts_steps(scale):
+    """The same, one font per step: Tk re-lays out every widget using a
+    font when it changes (10-70 ms each at S1), so a caller can let the
+    window breathe between fonts."""
+    MW_FONT_SCALE[0] = scale
+    for name, (size, _style) in list(MW_FONTS.items()):
+        with contextlib.suppress(tk.TclError, RuntimeError):
+            tkfont.nametofont(name).configure(
+                size=(-1 if size < 0 else 1) * max(
+                    6, int(round(abs(size) * scale))))
+        yield name
+
+
 def themed_menu(app):
     t = app.theme
     return tk.Menu(app.root, tearoff=0, bg=t["tab_bg"], fg=t["text_fg"],
@@ -24155,7 +24396,7 @@ class DetailDialog:
         top = tk.Frame(self.win, bg=t["tab_bg"], padx=14, pady=10)
         top.pack(fill="x")
         tk.Label(top, text=title, bg=t["tab_bg"], fg=t["text_fg"],
-                 font=("TkDefaultFont", 13, "bold"), anchor="w",
+                 font=mw_font(13, "bold"), anchor="w",
                  justify="left", wraplength=500).pack(fill="x")
         if extra is not None:
             extra(self.win)
@@ -24163,14 +24404,14 @@ class DetailDialog:
         body.pack(fill="both", expand=True, padx=8)
         self.txt = tk.Text(body, wrap="word", bg=t["text_bg"],
                            fg=t["text_fg"], relief="flat", padx=12, pady=10,
-                           font=("TkDefaultFont", 10),
+                           font=mw_font(10),
                            insertbackground=t["text_fg"],
                            highlightthickness=0)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set)
         self.txt.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
-        self.txt.tag_configure("h", font=("TkDefaultFont", 11, "bold"),
+        self.txt.tag_configure("h", font=mw_font(11, "bold"),
                                spacing1=6, spacing3=3)
         self.txt.tag_configure("muted", foreground=t["muted_fg"])
         self.set_sections(sections)
@@ -24485,12 +24726,12 @@ class BaseTab:
         top.pack(fill="x")
         lbl = tk.Label(top, text=text, bg=WHITE, fg="#333333",
                        wraplength=1000, justify="left",
-                       font=("TkDefaultFont", 11))
+                       font=mw_font(11))
         lbl.pack(anchor="w")
         if sub:
             tk.Label(top, text=sub, bg=WHITE, fg="#666666",
                      wraplength=1000, justify="left",
-                     font=("TkDefaultFont", 9)).pack(anchor="w",
+                     font=mw_font(9)).pack(anchor="w",
                                                      pady=(2, 0))
         return top
 
@@ -24584,7 +24825,7 @@ class Inspector:
         head.pack(fill="x")
         self.title_var = DisplayVar(value="Inspector")
         tk.Label(head, textvariable=self.title_var, bg=WHITE, fg="#2b3a56",
-                 font=("TkDefaultFont", 11, "bold"), anchor="w",
+                 font=mw_font(11, "bold"), anchor="w",
                  justify="left", wraplength=self.WIDTH - 40).pack(
             side="left", fill="x", expand=True)
         close = tk.Label(head, text="✕", bg=WHITE, fg="#666666",
@@ -24597,7 +24838,7 @@ class Inspector:
         self.txt = tk.Text(body, wrap="word", bg=WHITE, fg="#222222",
                            relief="flat", highlightthickness=0, padx=4,
                            pady=4, cursor="arrow", width=40,
-                           font=("TkDefaultFont", 10))
+                           font=mw_font(10))
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set, state="disabled")
         self.txt.pack(side="left", fill="both", expand=True)
@@ -24605,7 +24846,7 @@ class Inspector:
         self.legend = tk.Label(
             self.frame, text="◉ observed  ◈ reported  ◎ correlated  "
                              "◌ inferred  ? unknown", bg=WHITE,
-            fg="#666666", font=("TkDefaultFont", 8), anchor="w",
+            fg="#666666", font=mw_font(8), anchor="w",
             justify="left", wraplength=self.WIDTH - 30)
         self.legend.pack(fill="x", padx=10, pady=(0, 6))
         self.frame.bind("<Configure>", self._on_resize)
@@ -24628,13 +24869,13 @@ class Inspector:
         with contextlib.suppress(tk.TclError):
             self.txt.configure(bg=t["tab_bg"], fg=t["text_fg"],
                                insertbackground=t["text_fg"])
-            self.txt.tag_configure("h", font=("TkDefaultFont", 10, "bold"),
+            self.txt.tag_configure("h", font=mw_font(10, "bold"),
                                    foreground=t["text_fg"], spacing1=6)
             self.txt.tag_configure("muted", foreground=t["muted_fg"],
-                                   font=("TkDefaultFont", 9))
+                                   font=mw_font(9))
             self.txt.tag_configure("chip", foreground=t["accent"],
                                    underline=True,
-                                   font=("TkDefaultFont", 9))
+                                   font=mw_font(9))
             self.txt.tag_configure("link", foreground=t["accent"],
                                    underline=True)
             self.txt.tag_configure("warn", foreground=t["warn_fg"])
@@ -24920,7 +25161,7 @@ class DashboardTab(BaseTab):
         head = tk.Frame(outer, bg=WHITE)
         head.pack(fill="x")
         tk.Label(head, text="\U0001F4CA  Dashboard", bg=WHITE, fg="#2b3a56",
-                 font=("TkDefaultFont", 14, "bold")).pack(side="left")
+                 font=mw_font(14, "bold")).pack(side="left")
         self.range_var = tk.StringVar(value="Last 5 minutes")
         cb = ttk.Combobox(head, textvariable=self.range_var,
                           values=list(self.RANGES), width=14,
@@ -24936,7 +25177,7 @@ class DashboardTab(BaseTab):
         self.state_lbl = tk.Label(outer, textvariable=self.state_var,
                                   bg="#eef4fb", fg="#0b5394", anchor="w",
                                   justify="left", wraplength=1100, padx=12,
-                                  pady=8, font=("TkDefaultFont", 11))
+                                  pady=8, font=mw_font(11))
         self.state_lbl.pack(fill="x", pady=(0, 8))
         self.big = tk.Frame(outer, bg=WHITE)
         self.big.pack(fill="x", pady=(0, 4))
@@ -24952,11 +25193,11 @@ class DashboardTab(BaseTab):
                             takefocus=1)
             card.grid(row=0, column=i, sticky="nsew", padx=4)
             tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#888888",
-                          font=("TkDefaultFont", 8, "bold"), anchor="w")
+                          font=mw_font(8, "bold"), anchor="w")
             tl.pack(anchor="w")
             v = DisplayVar(value="—")
             vl = tk.Label(card, textvariable=v, bg="#f6f7fa", fg="#222222",
-                          font=("TkDefaultFont", 10), justify="left",
+                          font=mw_font(10), justify="left",
                           anchor="w", wraplength=520)
             vl.pack(anchor="w", fill="x", pady=(2, 0))
             self.big_vars[key] = v
@@ -24977,12 +25218,12 @@ class DashboardTab(BaseTab):
                       pady=4)
             self.card_frames.append(card)
             tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#888888",
-                          font=("TkDefaultFont", 8, "bold"), anchor="w",
+                          font=mw_font(8, "bold"), anchor="w",
                           justify="left", wraplength=170)
             tl.pack(anchor="w")
             v = DisplayVar(value="—")
             vl = tk.Label(card, textvariable=v, bg="#f6f7fa", fg="#222222",
-                          font=("TkDefaultFont", 12, "bold"), justify="left",
+                          font=mw_font(12, "bold"), justify="left",
                           anchor="w", wraplength=170)
             vl.pack(anchor="w", pady=(2, 0))
             self.vars[key] = v
@@ -25084,14 +25325,12 @@ class DashboardTab(BaseTab):
     def _draw_charts(self, now):
         c, t, m = self.canvas, self.t, self.model
         try:
-            c.delete("all")
             # the real size: drawing for at least 600 × 300 cut the right
             # and bottom off on small windows
             w = max(320, c.winfo_width())
             h = max(120, c.winfo_height())
         except tk.TclError:
             return
-        c.configure(bg=t["tab_bg"])
         res, n = self.RANGES.get(self.range_var.get(), (1, 300))
         span = res * n
         xl = (f"-{human_duration(span)}", "now")
@@ -25101,6 +25340,22 @@ class DashboardTab(BaseTab):
             res, n, now)]
         pps = [v / res for _b, v in m.metrics.series["packets"].series(
             res, n, now)]
+        # 5.1.2: nothing to redraw when the data, size and theme are the
+        # same as last time (the whole canvas was redrawn every 2 s)
+        sig = (w, h, res, self.app.theme_name, self.app.high_contrast,
+               CVD_STATE["mode"], tuple(down), tuple(up), tuple(pps),
+               len(m.registry.by_key), len(m.websites), m.cache.version,
+               m.journal._next, sum(1 for e in m.journal.entries
+                                    if e["undone"]),
+               m.metrics.duration(now) // 5 if m.metrics.first_ts else 0)
+        if sig == getattr(self, "_chart_sig", None):
+            return
+        self._chart_sig = sig
+        try:
+            c.delete("all")
+        except tk.TclError:
+            return
+        c.configure(bg=t["tab_bg"])
         half = w / 2
         bars = h >= 260                 # room for the three lists too?
         top_h = h * 0.48 if bars else h - 8
@@ -25177,7 +25432,7 @@ class FeedTab(BaseTab):
         tk.Label(ctrl, text="   “Calm” groups busy moments so they're "
                             "easy to read — “Full speed” shows "
                             "every line as it happens.",
-                 bg=WHITE, fg="#888888", font=("TkDefaultFont", 9)).pack(
+                 bg=WHITE, fg="#888888", font=mw_font(9)).pack(
             side="left", padx=(12, 0))
         self.hint_var = DisplayVar(value="")
         self.hint = tk.Label(self.frame, textvariable=self.hint_var,
@@ -25521,6 +25776,11 @@ class TimelineTab(BaseTab):
             pass
 
     def rebuild(self):
+        for _ in self.rebuild_steps():
+            pass
+
+    def rebuild_steps(self):
+        my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self._rebuild_job = None
         self.tree.delete(*self.tree.get_children())
         self.refs.clear()
@@ -25534,7 +25794,11 @@ class TimelineTab(BaseTab):
         if self.episodes_var.get():
             self._insert_episodes(rows[-1500:])
         else:
-            for e in reversed(rows[-1500:]):
+            for i, e in enumerate(reversed(rows[-1500:])):
+                if i and i % 300 == 0:
+                    yield
+                    if self._fill_gen != my:
+                        return
                 self._insert(e)
         self._update_status()
 
@@ -25718,9 +25982,24 @@ class DevicesTab(BaseTab):
                 self.iids[new] = iid
 
     def rebuild(self):
+        for _ in self.rebuild_steps():
+            pass
+
+    def rebuild_steps(self):
+        """The refill in slices; rebuild() runs them all at once. A newer
+        refill ends an older one."""
+        my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
-        self.update_keys(list(self.model.registry.by_key))
+        keys = list(self.model.registry.by_key)
+        for i in range(0, len(keys), 150):
+            if i:
+                yield
+                if self._fill_gen != my:
+                    return
+            self.update_keys(keys[i:i + 150])
+        if not keys:
+            self._count()
 
     def _count(self):
         n = len(self.iids)
@@ -25942,6 +26221,11 @@ class WebsitesTab(BaseTab):
         return sorted(recs, key=lambda w: -w.requests)
 
     def rebuild(self):
+        for _ in self.rebuild_steps():
+            pass
+
+    def rebuild_steps(self):
+        my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self._job = None
         self._dirty = False
         self.tree.delete(*self.tree.get_children())
@@ -25951,6 +26235,7 @@ class WebsitesTab(BaseTab):
         dev_key = self.device_key_from_choice(self.dev_var.get())
         recs = [w for w in self.model.websites.values()
                 if self._match(w, dev_key)]
+        self.count_lbl.configure(text=f"{len(recs)} sites")
         grouped = self.app.config.get("websites.group_subdomains", True)
         if grouped:
             groups = defaultdict(list)
@@ -25958,7 +26243,14 @@ class WebsitesTab(BaseTab):
                 groups[w.registrable or w.domain].append(w)
             order = sorted(groups.items(), key=lambda kv: self._group_key(
                 kv[1]))
+            done = 0
             for reg, members in order[:3000]:
+                if done >= 150:
+                    done = 0
+                    yield
+                    if self._fill_gen != my:
+                        return
+                done += len(members)
                 if len(members) == 1 and members[0].domain == reg:
                     self._row("", members[0])
                     continue
@@ -25971,9 +26263,12 @@ class WebsitesTab(BaseTab):
                 for w in self._sorted(members)[:300]:
                     self._row(giid, w)
         else:
-            for w in self._sorted(recs)[:5000]:
+            for i, w in enumerate(self._sorted(recs)[:5000]):
+                if i and i % 150 == 0:
+                    yield
+                    if self._fill_gen != my:
+                        return
                 self._row("", w)
-        self.count_lbl.configure(text=f"{len(recs)} sites")
 
     def _group_key(self, members):
         s = self.sort_var.get()
@@ -26273,6 +26568,11 @@ class ConnectionsTab(BaseTab):
             self.rebuild()
 
     def rebuild(self):
+        for _ in self.rebuild_steps():
+            pass
+
+    def rebuild_steps(self):
+        my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
         dev_key = self.device_key_from_choice(self.dev_var.get())
@@ -26280,7 +26580,13 @@ class ConnectionsTab(BaseTab):
         flows = [f for f in self.model.flows.all_flows()
                  if self._match(f, dev_key, q)]
         flows.sort(key=lambda f: -f.last_seen)
-        for f in flows[:3000]:
+        for i, f in enumerate(flows[:3000]):
+            if i and i % 200 == 0:
+                self.count_lbl.configure(text=f"{len(self.iids)} shown")
+                yield
+                if self._fill_gen != my:
+                    return
+            # appended after rows that arrived while filling
             tree_upsert(self.tree, self.iids, f.fid, self.values(f))
         self.count_lbl.configure(text=f"{len(self.iids)} shown")
 
@@ -26368,10 +26674,10 @@ class MailView:
                  "devices use, whether the connection was encrypted, and "
                  "where it failed. What anyone wrote is never shown.",
                  bg=WHITE, fg="#333333", wraplength=1000, justify="left",
-                 font=("TkDefaultFont", 11)).pack(anchor="w")
+                 font=mw_font(11)).pack(anchor="w")
         self.summary = tk.Label(top, text="", bg=WHITE, fg="#666666",
                                 wraplength=1000, justify="left",
-                                font=("TkDefaultFont", 9))
+                                font=mw_font(9))
         self.summary.pack(anchor="w", pady=(2, 0))
         bar = tk.Frame(frame, bg=WHITE, padx=12)
         bar.pack(fill="x", pady=(0, 6))
@@ -26563,7 +26869,7 @@ class RemoteTab(BaseTab):
         self.status_var = DisplayVar()
         tk.Label(self.frame, textvariable=self.status_var, bg=WHITE,
                  fg="#666666", justify="left", anchor="w", wraplength=1100,
-                 font=("TkDefaultFont", 9)).pack(fill="x", padx=12)
+                 font=mw_font(9)).pack(fill="x", padx=12)
         wrap, self.tree = make_tree(self.frame, self.COLS)
         wrap.pack(fill="both", expand=True, padx=6, pady=(4, 6))
         self.tree.bind("<Double-1>", self._details)
@@ -26614,11 +26920,20 @@ class RemoteTab(BaseTab):
             self.rebuild()
 
     def rebuild(self):
+        for _ in self.rebuild_steps():
+            pass
+
+    def rebuild_steps(self):
+        my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
         recs = sorted(self.model.remote_hosts.values(),
                       key=lambda r: -r.bytes_total)
-        for r in recs[:5000]:
+        for i, r in enumerate(recs[:5000]):
+            if i and i % 200 == 0:
+                yield
+                if self._fill_gen != my:
+                    return
             if self._match(r):
                 tree_upsert(self.tree, self.iids, r.ip, self.values(r))
 
@@ -26692,7 +27007,7 @@ class AlertsTab(BaseTab):
                                ("⚠", tr("legend_warning"), "#8a5a00"),
                                ("‼", tr("legend_danger"), "#a01a08")):
             tk.Label(legend, text=f"{icon} {name}", bg=WHITE, fg=fg,
-                     font=("TkDefaultFont", 9)).pack(side="left",
+                     font=mw_font(9)).pack(side="left",
                                                      padx=(0, 16))
         bar = self.toolbar()
         self.show_ack_var = tk.BooleanVar(value=True)
@@ -26775,9 +27090,18 @@ class AlertsTab(BaseTab):
                     index=0)
 
     def rebuild(self):
+        for _ in self.rebuild_steps():
+            pass
+
+    def rebuild_steps(self):
+        my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
-        for aid in reversed(self.model.alerts.order):
+        for i, aid in enumerate(list(reversed(self.model.alerts.order))):
+            if i and i % 200 == 0:
+                yield
+                if self._fill_gen != my:
+                    return
             a = self.model.alerts.alerts.get(aid)
             if a:
                 self.upsert(a)
@@ -26869,11 +27193,11 @@ class MapTab(BaseTab):
         top = tk.Frame(self.frame, bg=WHITE, padx=10, pady=6)
         top.pack(fill="x")
         tk.Label(top, text="\U0001F5FA  Network map", bg=WHITE, fg="#333333",
-                 font=("TkDefaultFont", 11, "bold")).pack(side="left")
+                 font=mw_font(11, "bold")).pack(side="left")
         tk.Label(top, text="   Click a node to select it, double-click for "
                            "details, drag the background to move, scroll or "
                            "use +/− to zoom.", bg=WHITE, fg="#888888",
-                 font=("TkDefaultFont", 9), justify="left",
+                 font=mw_font(9), justify="left",
                  wraplength=900).pack(side="left")
         ctrl = self.toolbar()
         self.mode_var = tk.StringVar(value="Topology")
@@ -26925,11 +27249,11 @@ class MapTab(BaseTab):
                    command=lambda: self.zoom(1.25)).pack(side="right", padx=2)
         self.info_var = DisplayVar(value="")
         tk.Label(self.frame, textvariable=self.info_var, bg=WHITE,
-                 fg="#666666", anchor="w", font=("TkDefaultFont", 9)).pack(
+                 fg="#666666", anchor="w", font=mw_font(9)).pack(
             fill="x", padx=12)
         self.legend_lbl = tk.Label(
             self.frame, bg=WHITE, fg="#888888", anchor="w", justify="left",
-            wraplength=1100, font=("TkDefaultFont", 8),
+            wraplength=1100, font=mw_font(8),
             text="Letters = confidence (H M L ?) · hollow = offline · ─ seen "
                  "(switch said so) · ┄ logical (inferred) · ★ new this hour "
                  "· red ring = open alert · drag a device to place it")
@@ -27709,7 +28033,7 @@ class HealthTab(BaseTab):
         head = tk.Frame(outer, bg=WHITE)
         head.pack(fill="x")
         tk.Label(head, text="\U0001FA7A  Network health", bg=WHITE,
-                 fg="#2b3a56", font=("TkDefaultFont", 14, "bold")).pack(
+                 fg="#2b3a56", font=mw_font(14, "bold")).pack(
             side="left")
         self.run_btn = ttk.Button(head, text="Run checks now",
                                   command=self.app.run_health_checks)
@@ -27739,11 +28063,11 @@ class HealthTab(BaseTab):
                            highlightthickness=1)
             row.pack(fill="x", pady=2)
             st = tk.Label(row, text="?", bg="#f6f7fa", fg="#666666",
-                          anchor="w", font=("TkDefaultFont", 10, "bold"))
+                          anchor="w", font=mw_font(10, "bold"))
             st.grid(row=0, column=0, sticky="nw")
             tl = tk.Label(row, text=title, bg="#f6f7fa", fg="#222222",
                           anchor="w", justify="left", wraplength=210,
-                          font=("TkDefaultFont", 10, "bold"))
+                          font=mw_font(10, "bold"))
             tl.grid(row=0, column=1, sticky="nw", padx=(8, 8))
             ex = tk.Label(row, text="", bg="#f6f7fa", fg="#333333",
                           anchor="w", justify="left")
@@ -27755,14 +28079,14 @@ class HealthTab(BaseTab):
                 r, lb, e.width), add="+")
             self.rows[key] = (st, ex, row)
         tk.Label(right, text="Your connection", bg=WHITE, fg="#2b3a56",
-                 font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+                 font=mw_font(11, "bold")).pack(anchor="w")
         self.info_var = DisplayVar()
         tk.Label(right, textvariable=self.info_var, bg=WHITE, fg="#333333",
                  justify="left", anchor="w", wraplength=420,
                  font=("TkFixedFont", 9)).pack(
             anchor="w", pady=(2, 10))
         tk.Label(right, text="DNS servers seen", bg=WHITE, fg="#2b3a56",
-                 font=("TkDefaultFont", 11, "bold")).pack(anchor="w")
+                 font=mw_font(11, "bold")).pack(anchor="w")
         wrap, self.dns_tree = make_tree(
             right, [("srv", "Server", 120, "w", False),
                     ("q", "Queries", 65, "e", False),
@@ -27774,7 +28098,7 @@ class HealthTab(BaseTab):
         self.dns_tree.bind("<<TreeviewSelect>>", lambda e: self._draw_hist())
         self.hist_title = tk.Label(right, text="Lookup times (all servers)",
                                    bg=WHITE, fg="#2b3a56",
-                                   font=("TkDefaultFont", 11, "bold"))
+                                   font=mw_font(11, "bold"))
         self.hist_title.pack(anchor="w", pady=(10, 0))
         self.hist = tk.Canvas(right, width=430, height=112, bg=WHITE,
                               highlightthickness=0)
@@ -27893,7 +28217,7 @@ class SecurityTab(BaseTab):
         outer = tk.Frame(self.frame, bg=WHITE)
         outer.pack(fill="both", expand=True, padx=14, pady=12)
         tk.Label(outer, text="🔒  Security check", bg=WHITE, fg="#2b3a56",
-                 font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+                 font=mw_font(14, "bold")).pack(anchor="w")
         tk.Label(outer, text="Friendly explanations of what I've noticed. "
                              "Unusual is not the same as dangerous.",
                  bg=WHITE, fg="#666666").pack(anchor="w", pady=(0, 4))
@@ -27909,21 +28233,21 @@ class SecurityTab(BaseTab):
                    command=self.app.open_privacy_posture).pack(side="left")
         self.text = tk.Text(outer, wrap="word", bg="#fbfbfb", fg="#222222",
                             relief="flat", padx=14, pady=12,
-                            font=("TkDefaultFont", 11), state="disabled",
+                            font=mw_font(11), state="disabled",
                             highlightthickness=0)
         vs = ttk.Scrollbar(outer, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=vs.set)
         self.text.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
-        self.text.tag_configure("h1", font=("TkDefaultFont", 12, "bold"),
+        self.text.tag_configure("h1", font=mw_font(12, "bold"),
                                 foreground="#2b3a56", spacing1=10,
                                 spacing3=4)
         self.text.tag_configure("good", foreground="#0b6b3a",
-                                font=("TkDefaultFont", 11))
+                                font=mw_font(11))
         self.text.tag_configure("warn", foreground="#a05608",
-                                font=("TkDefaultFont", 11))
+                                font=mw_font(11))
         self.text.tag_configure("bad", foreground="#a01a08",
-                                font=("TkDefaultFont", 11))
+                                font=mw_font(11))
         self.text.tag_configure("dim", foreground="#666666")
         self.text.tag_configure("body", foreground="#222222", spacing3=4)
 
@@ -29112,12 +29436,12 @@ class PacketsTab(BaseTab):
         nb.add(df, text="Text dump")
         nb.add(hf, text="Hex dump")
         tk.Label(bottom, textvariable=self.field_var, anchor="w", bg=WHITE,
-                 fg="#555555", font=("TkDefaultFont", 9)).pack(
+                 fg="#555555", font=mw_font(9)).pack(
             side="bottom", fill="x", before=nb)
         self.explain_var = DisplayVar(value="")
         tk.Label(bottom, textvariable=self.explain_var, anchor="w",
                  bg=WHITE, fg="#2b3a56", justify="left", wraplength=1000,
-                 font=("TkDefaultFont", 10)).pack(side="top", fill="x",
+                 font=mw_font(10)).pack(side="top", fill="x",
                                                   before=nb, padx=4)
         self.dtree.bind("<Button-3>", self._field_menu)
         self.dtree.bind("<Button-2>", self._field_menu)
@@ -30418,7 +30742,7 @@ class StreamsView(_SubView):
             self.txt.tag_configure("d0", foreground=t["accent"])
             self.txt.tag_configure("d1", foreground=t["warn_fg"])
             self.txt.tag_configure("gap", foreground=t["muted_fg"],
-                                   font=("TkDefaultFont", 9, "italic"))
+                                   font=mw_font(9, "italic"))
             self.txt.tag_configure("found", background=t["border"])
 
     def _flows(self):
@@ -31284,13 +31608,13 @@ class SourcesTab(BaseTab):
         wrap.pack(fill="x", padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", lambda e: self._edit())
         self.lbl(self.frame, "Reported vs observed", muted=False,
-                 font=("TkDefaultFont", 11, "bold")).pack(anchor="w",
+                 font=mw_font(11, "bold")).pack(anchor="w",
                                                           padx=10)
         self.recon = tk.Text(self.frame, height=10, wrap="word",
                              bg=self.t["text_bg"], fg=self.t["text_fg"],
                              relief="flat", padx=10, pady=8,
                              highlightthickness=0,
-                             font=("TkDefaultFont", 10))
+                             font=mw_font(10))
         self.recon.pack(fill="both", expand=True, padx=6, pady=(2, 6))
 
     def _sel(self):
@@ -31395,7 +31719,7 @@ class HelpTab(BaseTab):
         head.pack(fill="x")
         tk.Label(head, text=f"❓  Help / About — MiniWireshark "
                             f"{SCRIPT_VERSION}", bg=WHITE, fg="#2b3a56",
-                 font=("TkDefaultFont", 14, "bold")).pack(side="left")
+                 font=mw_font(14, "bold")).pack(side="left")
         bar = tk.Frame(outer, bg=WHITE)
         bar.pack(fill="x", pady=(8, 8))
         self.demo_btn = ttk.Button(bar, text="\U0001F3AE Try Demo Mode",
@@ -31417,12 +31741,12 @@ class HelpTab(BaseTab):
                    command=lambda: _open_path(PATHS.logs)).pack(side="left")
         txt = tk.Text(outer, wrap="word", bg="#fbfbfb", fg="#222222",
                       relief="flat", padx=14, pady=12,
-                      font=("TkDefaultFont", 10), highlightthickness=0)
+                      font=mw_font(10), highlightthickness=0)
         vs = ttk.Scrollbar(outer, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vs.set)
         txt.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
-        txt.tag_configure("h", font=("TkDefaultFont", 12, "bold"),
+        txt.tag_configure("h", font=mw_font(12, "bold"),
                           foreground="#2b3a56", spacing1=8, spacing3=3)
         for term, defn in GLOSSARY:
             txt.insert("end", term + "\n", ("h",))
@@ -31457,6 +31781,133 @@ class HelpTab(BaseTab):
                 text="⏹ Stop Demo Mode" if self.app.data_mode == "demo"
                 else "\U0001F3AE Try Demo Mode")
 
+
+
+# ============================================================================
+#  18c.  Background jobs — slow work that must not freeze the window
+#
+#  One "jobs" thread runs them in order. A job never touches Tk; when it
+#  needs the model it takes the GuiGate for one short piece at a time and
+#  gives the window its turn in between (GuiGate.yield_to_tk). Its result
+#  comes back to the Tk thread through the app's _async_results queue.
+# ============================================================================
+class JobCancelled(Exception):
+    """Raised inside a job's run() when the user cancelled it."""
+
+
+class Job:
+    def __init__(self, kind, title, run, done=None, failed=None):
+        self.kind, self.title = kind, title
+        self.run, self.done, self.failed = run, done, failed
+        self.cancelled = False
+        self.frac = None              # 0..1 or None (unknown)
+        self.started = time.monotonic()
+
+    def progress(self, frac=None):
+        self.frac = frac
+        if self.cancelled:
+            raise JobCancelled()
+
+    def pieces_under_gate(self, gate, pieces, total=None):
+        """Take items from the iterator `pieces`, each one while holding
+        the gate, giving the window its turn between them. -> list."""
+        out = []
+        it = iter(pieces)
+        while True:
+            with gate:
+                try:
+                    out.append(next(it))
+                except StopIteration:
+                    break
+                seen = gate.tk_entries
+            gate.yield_to_tk(seen)
+            if total:
+                self.progress(min(0.95, len(out) / total))
+            elif self.cancelled:
+                raise JobCancelled()
+        return out
+
+
+class JobRunner:
+    """At most one job of each kind; a second request says it is already
+    running. busy() is what tests and the benchmark wait on."""
+
+    def __init__(self, app):
+        self.app = app
+        self.q = queue.Queue()
+        self.active = OrderedDict()     # kind -> Job (queued or running)
+        self.thread = threading.Thread(target=self._loop, daemon=True,
+                                       name="jobs")
+        self.thread.start()
+
+    # jobs whose garbage is plain text, lists and dicts (freed without the
+    # cycle collector): it is paused while they run. Its full pass over the
+    # session being saved or the JSON just read took 90-130 ms holding the
+    # GIL, a freeze of the window, and found nothing such a job made.
+    NO_GC = ("session_save", "journal", "pcap_save", "session_load")
+
+    def submit(self, kind, title, run, done=None, failed=None):
+        if kind in self.active:
+            with contextlib.suppress(Exception):
+                self.app._set_banner(f"{translate_text(title)} — "
+                                     f"{translate_text('already running.')}")
+            return None
+        job = Job(kind, title, run, done, failed)
+        self.active[kind] = job
+        self.q.put(job)
+        self._changed()
+        return job
+
+    def busy(self):
+        return bool(self.active)
+
+    def cancel_all(self):
+        for job in self.active.values():
+            job.cancelled = True
+
+    def stop(self):
+        self.cancel_all()
+        self.q.put(None)
+
+    def _changed(self):
+        fn = getattr(self.app, "_show_jobs", None)
+        if fn is not None:
+            with contextlib.suppress(Exception):
+                fn()
+
+    def _loop(self):
+        while True:
+            job = self.q.get()
+            if job is None:
+                return
+            paused = job.kind in self.NO_GC and gc.isenabled()
+            if paused:
+                gc.disable()
+            try:
+                if job.cancelled:
+                    raise JobCancelled()
+                res, ok = job.run(job), True
+            except JobCancelled as e:
+                res, ok = e, False
+            except Exception as e:                   # noqa: BLE001
+                LOG.exception("background job %s", job.kind)
+                res, ok = e, False
+            finally:
+                if paused:
+                    gc.enable()
+            self.app._async_results.put(
+                lambda job=job, ok=ok, res=res: self._finish(job, ok, res))
+
+    def _finish(self, job, ok, res):
+        """On the Tk thread."""
+        self.active.pop(job.kind, None)
+        try:
+            if ok and job.done is not None:
+                job.done(res)
+            elif not ok and job.failed is not None:
+                job.failed(res)
+        finally:
+            self._changed()
 
 
 # ============================================================================
@@ -31534,7 +31985,7 @@ class TabStrip:
         bar = tk.Frame(outer, height=3, bg=side, bd=0)
         bar.pack(fill="x")
         lbl = tk.Label(outer, bg=side, fg=fg, padx=7, pady=3,
-                       font=("TkDefaultFont", 10, "bold"), takefocus=1)
+                       font=mw_font(10, "bold"), takefocus=1)
         lbl.pack(fill="both", expand=True)
         for w in (outer, bar, lbl):
             w.bind("<Button-1>", lambda e, t=tid: self.select(t))
@@ -31750,6 +32201,7 @@ class MiniWireshark:
         self.geoip.set_enabled(self.config.get("privacy.geoip_enabled",
                                                False))
         self._async_results = queue.Queue()
+        self.jobs = JobRunner(self)
 
         # ---- capture pipeline state (see section 6b)
         install_gui_gate()
@@ -31814,7 +32266,7 @@ class MiniWireshark:
         self._build_ui()
         self._populate_ifaces()
         self._apply_theme()
-        self._apply_text_size()
+        self._apply_text_size(defer=False)
         self._layout_pass()
         self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map,
                              add="+")
@@ -31886,6 +32338,31 @@ class MiniWireshark:
                 manual=False))
         LOG.info("GUI started (version %s, %s)", SCRIPT_VERSION,
                  platform.platform())
+
+    # ---- background jobs (section 18c) ------------------------------------------
+    def _show_jobs(self):
+        """Shows what runs in the background in the status bar, updated
+        while anything runs."""
+        jobs = list(self.jobs.active.values())
+        try:
+            if not jobs:
+                self.job_var.set("")
+                self.job_lbl.pack_forget()
+                return
+            job = jobs[0]
+            pct = f" {job.frac * 100:.0f} %" if job.frac is not None else ""
+            more = f" (+{len(jobs) - 1})" if len(jobs) > 1 else ""
+            self.job_var.set(f"⏳ {translate_text(job.title)}…{pct}{more}  ✕")
+            if not self.job_lbl.winfo_manager():
+                self.job_lbl.pack(side="right", after=self.footer_lbl)
+        except (tk.TclError, AttributeError):
+            return
+        if not getattr(self, "_jobs_tick", None):
+            def tick():
+                self._jobs_tick = None
+                if self.jobs.busy():
+                    self._show_jobs()
+            self._jobs_tick = self.root.after(250, tick)
 
     # ---- model lifecycle ----------------------------------------------------
     def _new_model(self, offline=False, identity=None):
@@ -31965,12 +32442,59 @@ class MiniWireshark:
                 tab.reset()
             except tk.TclError:
                 pass
-        self.tabs["devices"].rebuild()
-        self.tabs["websites"].rebuild()
-        self.tabs["timeline"].rebuild()
-        self.tabs["alerts"].rebuild()
-        self.tabs["connections"].rebuild()
-        self.tabs["remote"].rebuild()
+        self._rebuild_tables_soon()
+
+    REBUILD_ORDER = ("devices", "websites", "timeline", "alerts",
+                     "connections", "remote")
+
+    def _rebuild_tables_soon(self):
+        """Refill the main tables from the model one table per callback
+        (all six in one took up to 0.2 s after loading a session). The
+        visible table goes first. A newer model swap cancels the rest."""
+        gen = self.gen
+        cur = self.current_tab_name()
+        order = sorted(self.REBUILD_ORDER, key=lambda n: n != cur)
+        if not FEATURES.get("chunked", True):
+            for name in order:                       # 5.0.2: all at once
+                try:
+                    self.tabs[name].rebuild()
+                except tk.TclError:
+                    pass
+                except Exception:                    # noqa: BLE001
+                    LOG.exception("rebuild %s", name)
+            return
+
+        def step(i=0, it=None):
+            # each table refills in slices of about REBUILD_SLICE (a
+            # 5,000-row table took 150 ms in one go at S2)
+            if self.gen != gen:
+                return
+            try:
+                if it is None:
+                    tab = self.tabs[order[i]]
+                    fill = getattr(tab, "rebuild_steps", None)
+                    if fill is None:
+                        tab.rebuild()
+                        it = iter(())
+                    else:
+                        it = fill()
+                end = time.perf_counter() + self.REBUILD_SLICE
+                while True:
+                    next(it)
+                    if time.perf_counter() >= end:
+                        self.root.after(1, step, i, it)
+                        return
+            except StopIteration:
+                pass
+            except tk.TclError:
+                pass
+            except Exception:                        # noqa: BLE001
+                LOG.exception("rebuild %s", order[i])
+            if i + 1 < len(order):
+                self.root.after(1, step, i + 1)
+        step()
+
+    REBUILD_SLICE = 0.03         # s of table refill per callback
 
     # ---- UI construction -------------------------------------------------------
     def _build_ui(self):
@@ -32030,7 +32554,7 @@ class MiniWireshark:
         self.mode_banner.pack(fill="x")
         self.mode_lbl = tk.Label(self.mode_banner, anchor="w",
                                  justify="left", wraplength=1100,
-                                 font=("TkDefaultFont", 10, "bold"))
+                                 font=mw_font(10, "bold"))
         self.mode_lbl.pack(side="left", fill="x", expand=True)
         self.mode_toggle_btn = ttk.Button(
             self.mode_banner, text="Switch to Quiet Mode",
@@ -32046,7 +32570,7 @@ class MiniWireshark:
         self.data_banner = tk.Frame(self.root, padx=14, pady=6)
         self.data_lbl = tk.Label(self.data_banner, anchor="w",
                                  justify="left", wraplength=1100,
-                                 font=("TkDefaultFont", 10, "bold"))
+                                 font=mw_font(10, "bold"))
         self.data_lbl.pack(side="left")
         self.data_btn = ttk.Button(self.data_banner, text="Return to live "
                                    "capture", command=self._return_to_live)
@@ -32060,11 +32584,11 @@ class MiniWireshark:
             text="👋  Welcome! I'll pick your network card and start "
                  "watching. I'll explain everything in plain English.",
             bg="#e8f0fe", fg="#1a3a6b", anchor="w", justify="left",
-            wraplength=1200, font=("TkDefaultFont", 11))
+            wraplength=1200, font=mw_font(11))
         self.banner_lbl.pack(side="left", fill="x", expand=True)
         self.banner_close = tk.Label(self.banner, text="✕", bg="#e8f0fe",
                                      fg="#1a3a6b", cursor="hand2", padx=6,
-                                     font=("TkDefaultFont", 11))
+                                     font=mw_font(11))
         self.banner_close.pack(side="right")
         self.banner_close.bind("<Button-1>", lambda e: self._hide_banner())
         Tooltip(self.banner_close, "Hide this message")
@@ -32155,6 +32679,14 @@ class MiniWireshark:
                         cursor="hand2")
         foot.pack(side="right")
         self.footer_lbl = foot
+        # background jobs: "Saving the session… 40 %  ✕" (hidden when idle)
+        self.job_var = DisplayVar(value="")
+        self.job_lbl = tk.Label(status, textvariable=self.job_var,
+                                fg="#1a3a6b", bg="#e3e6eb", padx=8, pady=4,
+                                cursor="hand2")
+        self.job_lbl.bind("<Button-1>", lambda e: self.jobs.cancel_all())
+        Tooltip(self.job_lbl, "Work running in the background. Click to "
+                              "cancel it.")
         tk.Label(status, textvariable=self.status_var, anchor="w",
                  justify="left", wraplength=2000, fg="#222222",
                  bg="#e3e6eb", padx=10, pady=4).pack(
@@ -32167,6 +32699,16 @@ class MiniWireshark:
     def _on_tab_changed(self, _e=None):
         with contextlib.suppress(AttributeError):
             self.tabstrip.sync()
+        # 5.1.2: the switch is drawn first and the new tab filled 1 ms
+        # later, so the click answers at once even on a slow refresh
+        job = getattr(self, "_tab_refresh_job", None)
+        if job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(job)
+        self._tab_refresh_job = self.root.after(1, self._refresh_shown_tab)
+
+    def _refresh_shown_tab(self):
+        self._tab_refresh_job = None
         for tab in self.tabs.values():
             if tab.is_visible():
                 try:
@@ -32983,14 +33525,14 @@ class MiniWireshark:
         win.configure(bg=t["tab_bg"])
         tk.Label(win, text="Where MiniWireshark's disk space goes. Nothing "
                  "is sent anywhere.", bg=t["tab_bg"], fg=t["text_fg"],
-                 font=("TkDefaultFont", 11)).pack(anchor="w", padx=14,
+                 font=mw_font(11)).pack(anchor="w", padx=14,
                                                   pady=(12, 6))
         body = tk.Frame(win, bg=t["tab_bg"])
         body.pack(fill="both", expand=True, padx=14)
         rows = self.storage_rows()
         for i, (key, title, desc, size, cap) in enumerate(rows):
             tk.Label(body, text=title, bg=t["tab_bg"], fg=t["text_fg"],
-                     font=("TkDefaultFont", 10, "bold"), anchor="w",
+                     font=mw_font(10, "bold"), anchor="w",
                      justify="left", wraplength=420).grid(
                 row=i * 2, column=0, sticky="w", pady=(6, 0))
             tk.Label(body, text=_human_bytes(size) + (f"   (limit: {cap})"
@@ -33001,7 +33543,7 @@ class MiniWireshark:
                 self.clear_storage(k, win), win.destroy(),
                 self.open_storage())).grid(row=i * 2, column=2, rowspan=2)
             tk.Label(body, text=desc, bg=t["tab_bg"], fg=t["muted_fg"],
-                     font=("TkDefaultFont", 9), anchor="w", justify="left",
+                     font=mw_font(9), anchor="w", justify="left",
                      wraplength=560).grid(
                 row=i * 2 + 1, column=0, columnspan=2, sticky="w")
         body.columnconfigure(0, weight=1)
@@ -33010,45 +33552,81 @@ class MiniWireshark:
 
     def _journal_tick(self):
         """Every 30 s while live: a crash-safe copy of the session (removed
-        on a clean exit)."""
+        on a clean exit). Written by a background job: in 5.0.2 it froze
+        the window for about half a second every 30 s on a busy network."""
         try:
             if self.data_mode == "live" and self.model.has_data() and \
                     self.count != getattr(self, "_journal_count", -1):
-                self.write_journal()
+                self.write_journal(background=True)
         except Exception:                            # noqa: BLE001
             LOG.exception("session journal")
         with contextlib.suppress(tk.TclError):
             self.root.after(30000, self._journal_tick)
 
-    def write_journal(self, path=None):
+    def write_journal(self, path=None, background=False):
+        """Journal v2: the session as compact JSON at `path`, and its
+        fingerprint in `path`.sha256 (written last, so a half-written
+        journal is detected). background=True: as a job."""
         path = path or PATHS.journal
-        payload = SessionCodec.serialize(self.model, self.session_meta())
-        body = json.dumps(payload, default=str, sort_keys=True)
-        atomic_write_json(path, {"journal": 1, "saved_at": time.time(),
-                                 "sha256": hashlib.sha256(
-                                     body.encode()).hexdigest(),
-                                 "session": payload})
-        self._journal_count = self.count
-        self._journal_written = True
+        count = self.count
+        body = self.session_text_job(path + ".part")
+
+        def run(job):
+            body(job)
+            with open(path + ".part", "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            os.replace(path + ".part", path)
+            atomic_write_json(path + ".sha256", {
+                "journal": 2, "saved_at": time.time(), "sha256": digest})
+            return path
+
+        def ok(_p):
+            self._journal_count = count
+            self._journal_written = True
+        if background:
+            return self.jobs.submit("journal", "Keeping a crash-safe copy",
+                                    run, ok)
+        job = Job("journal", "", None)
+        run_inline = self.session_text_job(path + ".part")
+        parts_done = run_inline(job)
+        with open(parts_done, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        os.replace(parts_done, path)
+        atomic_write_json(path + ".sha256", {
+            "journal": 2, "saved_at": time.time(), "sha256": digest})
+        ok(path)
         return path
 
     def restore_journal(self, path=None):
+        """Journal v2 (5.1.2) is the session text plus a .sha256 file;
+        journal v1 (5.0.x) is one JSON object holding both."""
         path = path or getattr(self, "_journal_found", "") or PATHS.journal
+        tmp = os.path.join(PATHS.sessions, "restored.mwsession.json")
         try:
-            with open(path, encoding="utf-8") as f:
-                j = json.load(f)
-            body = json.dumps(j["session"], default=str, sort_keys=True)
-            if hashlib.sha256(body.encode()).hexdigest() != j["sha256"]:
-                raise ValueError("the journal is damaged")
+            side = read_json(path + ".sha256")
+            if isinstance(side, dict) and side.get("journal") == 2:
+                with open(path, "rb") as f:
+                    raw = f.read()
+                if hashlib.sha256(raw).hexdigest() != side.get("sha256"):
+                    raise ValueError("the journal is damaged")
+                with open(tmp + ".part", "wb") as f:
+                    f.write(raw)
+                os.replace(tmp + ".part", tmp)
+            else:
+                with open(path, encoding="utf-8") as f:
+                    j = json.load(f)
+                body = json.dumps(j["session"], default=str, sort_keys=True)
+                if hashlib.sha256(body.encode()).hexdigest() != j["sha256"]:
+                    raise ValueError("the journal is damaged")
+                atomic_write_json(tmp, j["session"], compact=True)
         except (OSError, ValueError, KeyError, TypeError) as e:
             messagebox.showerror("Restore", f"The interrupted session could "
                                  f"not be read: {e}", parent=self.root)
             return False
-        tmp = os.path.join(PATHS.sessions, "restored.mwsession.json")
-        atomic_write_json(tmp, j["session"])
         self._load_session(tmp)
-        with contextlib.suppress(OSError):
-            os.remove(path)
+        for p_ in (path, path + ".sha256"):
+            with contextlib.suppress(OSError):
+                os.remove(p_)
         self._journal_found = ""
         return True
 
@@ -33374,7 +33952,7 @@ class MiniWireshark:
         body.pack(fill="both", expand=True)
         tk.Label(body, text="Show what changed between two sessions.",
                  bg=t["tab_bg"], fg=t["text_fg"],
-                 font=("TkDefaultFont", 11, "bold")).grid(
+                 font=mw_font(11, "bold")).grid(
                      row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         for r, (txt, var) in enumerate((("Older session:", a_var),
                                         ("Newer session:", b_var)), 1):
@@ -33470,7 +34048,7 @@ class MiniWireshark:
         win.configure(bg=t["card_bg"])
         win.transient(parent or self.root)
         tk.Label(win, text="\U0001F6E0  Repair MiniWireshark", bg=t["card_bg"],
-                 fg=t["text_fg"], font=("TkDefaultFont", 13, "bold"),
+                 fg=t["text_fg"], font=mw_font(13, "bold"),
                  anchor="w").pack(fill="x", padx=14, pady=(12, 2))
         tk.Label(win, text="I'm checking the usual suspects and fixing what "
                            "I can. Your captured data and settings stay as "
@@ -33484,7 +34062,7 @@ class MiniWireshark:
             r = tk.Frame(lst, bg=t["card_bg"])
             r.pack(fill="x", pady=2)
             icon = tk.Label(r, text="○", bg=t["card_bg"], fg=t["muted_fg"],
-                            width=2, font=("TkDefaultFont", 11))
+                            width=2, font=mw_font(11))
             icon.pack(side="left")
             tk.Label(r, text=title, bg=t["card_bg"], fg=t["text_fg"],
                      anchor="w", width=34).pack(side="left")
@@ -33496,7 +34074,7 @@ class MiniWireshark:
         bar.pack(fill="x", padx=14, pady=(0, 12))
         summary = tk.Label(bar, text="Working…", bg=t["card_bg"],
                            fg=t["text_fg"], anchor="w",
-                           font=("TkDefaultFont", 10, "bold"))
+                           font=mw_font(10, "bold"))
         summary.pack(side="left", fill="x", expand=True)
         close = ttk.Button(bar, text="Close", command=win.destroy,
                            state="disabled")
@@ -34209,7 +34787,7 @@ class MiniWireshark:
         win.transient(self.root)
         state = {"i": 0}
         title = tk.Label(win, bg=t["card_bg"], fg=t["text_fg"],
-                         font=("TkDefaultFont", 13, "bold"), anchor="w")
+                         font=mw_font(13, "bold"), anchor="w")
         title.pack(fill="x", padx=16, pady=(14, 4))
         body = tk.Label(win, bg=t["card_bg"], fg=t["text_fg"], anchor="nw",
                         justify="left", wraplength=580)
@@ -34375,16 +34953,16 @@ class MiniWireshark:
             pass
         s.configure("TButton", padding=(10, 6))
         s.configure("Accent.TButton", padding=(14, 8),
-                    font=("TkDefaultFont", 11, "bold"))
-        s.configure("Treeview", rowheight=26, font=("TkDefaultFont", 10))
-        s.configure("Treeview.Heading", font=("TkDefaultFont", 10, "bold"))
+                    font=mw_font(11, "bold"))
+        s.configure("Treeview", rowheight=26, font=mw_font(10))
+        s.configure("Treeview.Heading", font=mw_font(10, "bold"))
         s.configure("TNotebook.Tab", padding=(8, 6),
-                    font=("TkDefaultFont", 10, "bold"))
+                    font=mw_font(10, "bold"))
         # sub-view switches: lighter than the big Accent buttons (they
         # took 40 pixels of height above every packet list)
         s.configure("Sub.TButton", padding=(10, 3))
         s.configure("Sub.Accent.TButton", padding=(10, 3),
-                    font=("TkDefaultFont", 10, "bold"))
+                    font=mw_font(10, "bold"))
         # the main notebook's tabs are drawn by TabStrip (they wrap)
         with contextlib.suppress(tk.TclError):
             s.layout("Main.TNotebook.Tab", [])
@@ -34542,7 +35120,11 @@ class MiniWireshark:
     TEXT_SIZES = {"Small": 0.9, "Normal": 1.0, "Large": 1.15,
                   "Extra large": 1.3}
 
-    def _apply_text_size(self, label=None):
+    def _apply_text_size(self, label=None, defer=True):
+        """Tk's own fonts change at once; MiniWireshark's shared fonts, the
+        few explicit fonts and the table headings follow in later short
+        callbacks, so Tk re-lays the window out in parts (all in one froze
+        it for 0.2-0.3 s at S1). defer=False does everything now."""
         label = label or self.config.get("appearance.text_size", "Normal")
         scale = self.TEXT_SIZES.get(label, 1.0)
         base = getattr(self, "_base_font_sizes", None)
@@ -34569,11 +35151,42 @@ class MiniWireshark:
                 "TkDefaultFont", int(round(10 * scale)), "bold"))
         except tk.TclError:
             pass
+        job = getattr(self, "_text_size_job", None)
+        if job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(job)
+            self._text_size_job = None
+        steps = self._text_size_steps(scale)
+        if not defer:
+            for _ in steps:
+                pass
+            return
+
+        def step():
+            self._text_size_job = None
+            try:
+                next(steps)
+            except StopIteration:
+                return
+            except tk.TclError:
+                return
+            self._text_size_job = self.root.after(1, step)
+        self._text_size_job = self.root.after(1, step)
+
+    def _text_size_steps(self, scale):
+        for _name in scale_mw_fonts_steps(scale):
+            yield
         with contextlib.suppress(KeyError, AttributeError, tk.TclError):
             self.tabs["packets"].fit_time_column()
         self._scale_explicit_fonts(self.root, scale)
-        # bigger text: table headings widen so they are not cut
-        fit_all_headings(self.root)
+        yield
+        # bigger text: table headings widen so they are not cut, a few
+        # tables per callback
+        trees = list(_walk_class(self.root, ttk.Treeview))
+        for i in range(0, len(trees), 4):
+            for tree in trees[i:i + 4]:
+                fit_tree_headings(tree)
+            yield
 
     def _scale_explicit_fonts(self, widget, scale):
         """Widgets built with an explicit ("TkDefaultFont", 11, "bold")
@@ -35192,6 +35805,10 @@ class MiniWireshark:
         callback, so a burst never freezes the window; the rest follows
         1 ms later."""
         pr = self.pending_rows
+        if self.minimized():
+            with contextlib.suppress(tk.TclError):
+                self.root.after(self._ms(500), self._drain_decoded)
+            return
         try:
             batch = []
             while pr and len(batch) < self.DRAIN_ROWS:
@@ -35214,11 +35831,24 @@ class MiniWireshark:
                 self.root.after(1 if pr else self._ms(80),
                                 self._drain_decoded)
 
+    def minimized(self):
+        """True while the main window is minimised: tables and charts are
+        not updated (nobody can see them); the model keeps everything and
+        the window catches up when it is shown again."""
+        try:
+            return self.root.state() == "iconic"
+        except tk.TclError:
+            return False
+
     def _flush_ui(self):
         """Hands model changes to the tabs. Each part is guarded on its
         own: in 5.0.1 one failing part (say the feed) skipped the device,
         website and connection updates of that round, and the rows it had
         already taken were never shown ("sometimes stuff doesn't load")."""
+        if self.minimized():
+            with contextlib.suppress(tk.TclError):
+                self.root.after(self._ms(700), self._flush_ui)
+            return
         m = self.model
         for part in (self._flush_events, self._flush_devices,
                      self._flush_websites, self._flush_remotes,
@@ -35328,20 +35958,44 @@ class MiniWireshark:
         self.root.after(self._ms(delay), self._flush_feed)
 
     def _tick_model(self):
-        try:
-            self.model.tick()
-            if self.data_mode == "offline":
-                gw = self.model.infer_gateway()
-                if gw and gw != self.model.gateway_ip:
-                    self.model.set_identity(gateway_ip=gw)
-            self._update_perf()
-            cv = self.model.cache.version
-            if cv != getattr(self, "_names_version", -1):
-                self._names_version = cv
-                self.tabs["packets"].refresh_names()
-        except Exception:                            # noqa: BLE001
-            LOG.exception("model tick")
-        self.root.after(self._ms(5000), self._tick_model)
+        self.tick_model_stepped(
+            lambda: self.root.after(self._ms(5000), self._tick_model))
+
+    def tick_model_stepped(self, then=None):
+        """Model upkeep, one named step per Tk callback (1 ms apart), then
+        the window-side upkeep, then `then()`. A model swap mid-way ends
+        the old model's steps."""
+        model = self.model
+        steps = model.tick_steps()
+
+        def finish():
+            try:
+                if self.data_mode == "offline":
+                    gw = self.model.infer_gateway()
+                    if gw and gw != self.model.gateway_ip:
+                        self.model.set_identity(gateway_ip=gw)
+                self._update_perf()
+                cv = self.model.cache.version
+                if cv != getattr(self, "_names_version", -1):
+                    self._names_version = cv
+                    self.tabs["packets"].refresh_names()
+            except Exception:                        # noqa: BLE001
+                LOG.exception("model tick")
+            if then is not None:
+                then()
+
+        def step():
+            if self.model is model:
+                try:
+                    next(steps)
+                    self.root.after(1, step)
+                    return
+                except StopIteration:
+                    pass
+                except Exception:                    # noqa: BLE001
+                    LOG.exception("model tick")
+            finish()
+        step()
 
     def _update_perf(self):
         now = time.time()
@@ -35362,6 +36016,9 @@ class MiniWireshark:
             self.rdns.delay = 0.5 if level >= 2 else 0.0
 
     def _refresh_insights(self):
+        if self.minimized():
+            self.root.after(self._ms(2000), self._refresh_insights)
+            return
         for tab in self.tabs.values():
             if tab.is_visible() and not isinstance(tab, (DevicesTab,
                                                          TimelineTab)):
@@ -35412,10 +36069,36 @@ class MiniWireshark:
             with contextlib.suppress(tk.TclError):
                 self.root.after(1000, self._tick_status)
 
+    FREEZE_LIMIT = 0.25          # s: the 1 s status tick came this late
+
+    def _note_freeze(self, lag, now):
+        """Three freezes over FREEZE_LIMIT within a minute: start the perf
+        probe (so the debug bundle can show what froze) and, once per
+        session, say what can help."""
+        if lag < self.FREEZE_LIMIT or self.minimized():
+            return
+        recent = getattr(self, "_freezes", None)
+        if recent is None:
+            recent = self._freezes = deque(maxlen=10)
+        recent.append(now)
+        while recent and now - recent[0] > 60:
+            recent.popleft()
+        if len(recent) >= 3 and not getattr(self, "_freeze_told", False):
+            self._freeze_told = True
+            perf_start()
+            LOG.warning("the window fell behind %d times in a minute; "
+                        "perf probe started", len(recent))
+            self._set_banner(
+                "\U0001F422  The window fell behind a few times in the last "
+                "minute. If it keeps happening, Settings → Performance → "
+                "Low CPU can help. A freeze report is now being kept for "
+                "Help → Diagnostics → Export debug bundle.", kind="info")
+
     def _tick_status_once(self):
         now = time.monotonic()
         self._gui_lag = max(0.0, now - self._last_tick_wall - 1.0)
         self._last_tick_wall = now
+        self._note_freeze(self._gui_lag, now)
         if self.worker is None or not self.worker.is_alive() or \
                 now - self.worker.beat > 10:
             self._ensure_worker()
@@ -35612,7 +36295,7 @@ class MiniWireshark:
         body.pack(fill="both", expand=True)
         tk.Label(body, text=f"Connect your {cls.title} (read-only)",
                  bg=t["tab_bg"], fg=t["text_fg"],
-                 font=("TkDefaultFont", 13, "bold")).grid(
+                 font=mw_font(13, "bold")).grid(
             row=0, column=0, columnspan=2, sticky="w")
         tk.Label(body, text="MiniWireshark only reads its query log and "
                             "device names, about once a minute. Nothing is "
@@ -35795,7 +36478,7 @@ class MiniWireshark:
         top = tk.Frame(win, bg=t["tab_bg"], padx=14, pady=10)
         top.pack(fill="x")
         tk.Label(top, text=win.title(), bg=t["tab_bg"], fg=t["text_fg"],
-                 font=("TkDefaultFont", 14, "bold")).pack(anchor="w")
+                 font=mw_font(14, "bold")).pack(anchor="w")
         sub = tk.Label(top, text="", bg=t["tab_bg"], fg=t["muted_fg"],
                        wraplength=720, justify="left")
         sub.pack(anchor="w")
@@ -35831,11 +36514,11 @@ class MiniWireshark:
                     head.pack(fill="x")
                     tk.Label(head, text=h["status"], bg=t["card_bg"],
                              fg=color, width=11, anchor="w",
-                             font=("TkDefaultFont", 10, "bold")).pack(
+                             font=mw_font(10, "bold")).pack(
                         side="left")
                     tk.Label(head, text=h["title"], bg=t["card_bg"],
                              fg=t["text_fg"], anchor="w",
-                             font=("TkDefaultFont", 11, "bold")).pack(
+                             font=mw_font(11, "bold")).pack(
                         side="left")
                     for pre, items in (("For: ", h["for"]),
                                        ("Against: ", h["against"])):
@@ -35863,7 +36546,7 @@ class MiniWireshark:
                                    "separately — never guessed.")
                 tk.Label(inner, text=res["conclusion"], bg=t["tab_bg"],
                          fg=t["text_fg"], wraplength=700, justify="left",
-                         font=("TkDefaultFont", 11, "bold")).pack(
+                         font=mw_font(11, "bold")).pack(
                     anchor="w", pady=(4, 8), padx=4)
                 for line in res["rows"]:
                     tk.Label(inner, text=line, bg=t["tab_bg"],
@@ -37306,15 +37989,39 @@ class MiniWireshark:
                        ("All files", "*.*")])
         if not path:
             return
-        try:
-            atomic_write_json(path, SessionCodec.serialize(
-                self.model, self.session_meta()))
-        except (OSError, TypeError, ValueError) as e:
+        return self.save_session_to(path)
+
+    def session_text_job(self, path, title="Saving the session"):
+        """A job body that writes this session to `path` as compact JSON,
+        reading the model one short piece at a time (5.1.2: saving froze
+        the window for about 0.3 s at 300 devices)."""
+        model, meta, gate = self.model, self.session_meta(), self.gate
+        n = max(1, (len(model.registry.by_key) + len(model.websites) +
+                    min(5000, len(model.remote_hosts)) + 2000 + 5000)
+                // 300 + 14)
+
+        def run(job):
+            parts = job.pieces_under_gate(
+                gate, SessionCodec.iter_json(model, meta), total=n)
+            atomic_write_text(path, "".join(parts))
+            return path
+        return run
+
+    def save_session_to(self, path, done=None):
+        def ok(p):
+            LOG.info("session saved to %s", p)
+            self.status_var.set(f"Session saved to {p}")
+            if done is not None:
+                done(p)
+
+        def bad(e):
+            if isinstance(e, JobCancelled):
+                self.status_var.set("Saving the session was cancelled.")
+                return
             messagebox.showerror("Save session error", str(e),
                                  parent=self.root)
-            return
-        LOG.info("session saved to %s", path)
-        self.status_var.set(f"Session saved to {path}")
+        return self.jobs.submit("session_save", "Saving the session",
+                                self.session_text_job(path), ok, bad)
 
     def autosave(self, reason="exit"):
         if self.data_mode not in ("live", "idle") or not \
@@ -37322,7 +38029,7 @@ class MiniWireshark:
             return None
         try:
             atomic_write_json(PATHS.autosave, SessionCodec.serialize(
-                self.model, self.session_meta()))
+                self.model, self.session_meta()), compact=True)
             LOG.info("autosaved session (%s)", reason)
             return PATHS.autosave
         except (OSError, TypeError, ValueError) as e:
@@ -37330,37 +38037,62 @@ class MiniWireshark:
             return None
 
     def _load_session(self, path=None):
+        """Reading and rebuilding the session happen on the job thread
+        (a model that is not shared yet needs no gate); only the swap and
+        the table refill run on the Tk thread, in short steps."""
         path = path or filedialog.askopenfilename(
             parent=self.root, initialdir=self._dialog_dir(),
             filetypes=[("MiniWireshark session", "*.json"),
                        ("All files", "*.*")])
         if not path:
-            return
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-        except (OSError, ValueError) as e:
+            return None
+        if not os.path.isfile(path):
             messagebox.showerror("Load session error",
-                                 f"I couldn't read that file: {e}",
+                                 f"I couldn't read that file: {path}",
                                  parent=self.root)
-            return
+            return None
         if not self._confirm_leave_live("Loading a session"):
-            return
+            return None
         self.stop()
         self._leave_nonlive()
-        m = self._new_model(offline=True, identity=("", set(), set()))
-        try:
+        gen = self.gen
+
+        def run(job):
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            job.progress(0.4)
+            m = self._new_model(offline=True, identity=("", set(), set()))
             SessionCodec.load(payload, m)
-        except (ValueError, TypeError, KeyError, AttributeError) as e:
-            messagebox.showerror(
-                "Load session error",
-                f"That file didn't look like a MiniWireshark session: {e}",
-                parent=self.root)
-            return
+            return m, payload.get("exported_at", time.time())
+
+        def bad(e):
+            if isinstance(e, JobCancelled):
+                self.status_var.set("Opening the session was cancelled.")
+            elif isinstance(e, (OSError, json.JSONDecodeError,
+                                UnicodeDecodeError)):
+                messagebox.showerror("Load session error",
+                                     f"I couldn't read that file: {e}",
+                                     parent=self.root)
+            else:
+                messagebox.showerror(
+                    "Load session error",
+                    f"That file didn't look like a MiniWireshark session: "
+                    f"{e}", parent=self.root)
+
+        def ok(res):
+            if self.gen != gen or self.data_mode not in ("idle",):
+                LOG.info("session load superseded; not shown")
+                return
+            m, exported = res
+            self._show_loaded_session(path, m, exported)
+        return self.jobs.submit("session_load", "Opening the session", run,
+                                ok, bad)
+
+    def _show_loaded_session(self, path, m, exported_at):
         self.replace_model(m)
         self.data_mode = "session"
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(
-            payload.get("exported_at", time.time())))
+            exported_at or time.time()))
         self.data_label = f"{os.path.basename(path)} ({when})"
         self._restyle_mode_banner()
         self._set_banner(f"\U0001F4C2  Loaded a saved session — this is NOT "
@@ -37642,9 +38374,9 @@ class MiniWireshark:
                      else (6, 0))
             panes.columnconfigure(i, weight=1)
             tk.Label(col, text=head, bg=t["tab_bg"], fg=t["text_fg"],
-                     font=("TkDefaultFont", 10, "bold")).pack(anchor="w")
+                     font=mw_font(10, "bold")).pack(anchor="w")
             tx = tk.Text(col, wrap="word", bg=t["text_bg"], fg=t["text_fg"],
-                         relief="flat", font=("TkDefaultFont", 9),
+                         relief="flat", font=mw_font(9),
                          highlightthickness=0)
             tx.pack(fill="both", expand=True)
             texts.append(tx)
@@ -37712,13 +38444,19 @@ class MiniWireshark:
                                         ("All files", "*.*")],
                               time.strftime("capture-%Y%m%d-%H%M.pcap"))
         if not path:
-            return
-        try:
-            self.save_pcap_to(path, self.all_rows)
-        except (OSError, ValueError) as e:
-            messagebox.showerror("Save error", str(e), parent=self.root)
-            return
-        self.status_var.set(f"Saved {len(self.all_rows)} packets to {path}")
+            return None
+        rows = list(self.all_rows)
+
+        def run(job):
+            return self.save_pcap_to(path, rows)
+
+        def bad(e):
+            if not isinstance(e, JobCancelled):
+                messagebox.showerror("Save error", str(e), parent=self.root)
+        return self.jobs.submit(
+            "pcap_save", "Saving the packets", run,
+            lambda n: self.status_var.set(f"Saved {n} packets to {path}"),
+            bad)
 
     @staticmethod
     def save_pcap_to(path, rows):
@@ -37827,14 +38565,9 @@ class MiniWireshark:
         path = self._ask_save(".json", [("JSON files", "*.json")],
                               "miniwireshark-export.json")
         if not path:
-            return
-        try:
-            atomic_write_json(path, SessionCodec.serialize(
-                self.model, self.session_meta()))
-        except (OSError, TypeError, ValueError) as e:
-            messagebox.showerror("Export error", str(e), parent=self.root)
-            return
-        self.status_var.set(f"Exported full session data to {path}")
+            return None
+        return self.save_session_to(path, done=lambda p: self.status_var.set(
+            f"Exported full session data to {p}"))
 
     def export_report(self, kind, device_key=None):
         if kind == "device" and not device_key:
@@ -38415,7 +39148,7 @@ class MiniWireshark:
         win.minsize(820, 560)
         win.configure(bg=t["tab_bg"])
         tk.Label(win, text="\U0001F9E9  Components Center", bg=t["tab_bg"],
-                 fg=t["text_fg"], font=("TkDefaultFont", 14, "bold"),
+                 fg=t["text_fg"], font=mw_font(14, "bold"),
                  anchor="w").pack(fill="x", padx=14, pady=(12, 0))
         tk.Label(win, text="Optional data, packages and helpers. "
                            "MiniWireshark watches your network without any "
@@ -38479,13 +39212,13 @@ class MiniWireshark:
         body.add(right, weight=2)
         title_var = DisplayVar(value="Select a component")
         tk.Label(right, textvariable=title_var, bg=t["card_bg"],
-                 fg=t["text_fg"], font=("TkDefaultFont", 12, "bold"),
+                 fg=t["text_fg"], font=mw_font(12, "bold"),
                  anchor="w").pack(fill="x", padx=10, pady=(8, 4))
         txt = tk.Text(right, wrap="word", bg=t["card_bg"], fg=t["text_fg"],
                       relief="flat", height=18, padx=10, pady=4,
                       highlightthickness=0)
         txt.pack(fill="both", expand=True)
-        txt.tag_configure("k", font=("TkDefaultFont", 9, "bold"),
+        txt.tag_configure("k", font=mw_font(9, "bold"),
                           foreground=t["muted_fg"])
         acts = tk.Frame(right, bg=t["card_bg"])
         acts.pack(fill="x", padx=10, pady=8)
@@ -38634,7 +39367,7 @@ class MiniWireshark:
         top.pack(fill="x")
         tk.Label(top, text="\U0001F4E4  What MiniWireshark itself sent",
                  bg=t["tab_bg"], fg=t["text_fg"],
-                 font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+                 font=mw_font(13, "bold")).pack(anchor="w")
         tk.Label(top, text="Every probe, lookup and download this app made, "
                            "newest first. Packets it only listened to are "
                            "not here — this is only what it sent. Nothing "
@@ -39136,6 +39869,8 @@ class MiniWireshark:
 
     def _on_close(self):
         LOG.info("shutting down")
+        with contextlib.suppress(Exception):
+            self.jobs.stop()
         try:
             if self.history is not None and self.data_mode in ("live",
                                                                "idle"):
@@ -39158,6 +39893,9 @@ class MiniWireshark:
                 elif os.path.exists(PATHS.journal) and \
                         getattr(self, "_journal_written", False):
                     os.remove(PATHS.journal)
+                if not os.path.exists(PATHS.journal) and \
+                        os.path.exists(PATHS.journal + ".sha256"):
+                    os.remove(PATHS.journal + ".sha256")
         except Exception:                            # noqa: BLE001
             LOG.exception("while saving on exit")
         self._stop_capture_only()
@@ -39761,7 +40499,7 @@ class DiagnosticsWindow:
         top.pack(fill="x")
         tk.Label(top, text="\U0001F6E0  Troubleshooting & diagnostics",
                  bg=t["tab_bg"], fg=t["text_fg"],
-                 font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+                 font=mw_font(13, "bold")).pack(anchor="w")
         tk.Label(top, text="Nothing here needs a terminal. Copy or export "
                            "this information if you ask someone for help "
                            "(it contains no packet contents).",
@@ -40097,7 +40835,7 @@ class CommandPalette:
         self.lb = tk.Listbox(self.win, bg=t["text_bg"], fg=t["text_fg"],
                              selectbackground=t["accent"],
                              activestyle="none", highlightthickness=0,
-                             font=("TkDefaultFont", 11))
+                             font=mw_font(11))
         self.lb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.shown = []
         self.q.trace_add("write", lambda *a: self.filter())
@@ -40257,7 +40995,7 @@ class CrashDialog:
         win.configure(bg=t["tab_bg"])
         tk.Label(win, text="\U0001F915  MiniWireshark hit an unexpected problem",
                  bg=t["tab_bg"], fg=t["text_fg"],
-                 font=("TkDefaultFont", 13, "bold")).pack(anchor="w",
+                 font=mw_font(13, "bold")).pack(anchor="w",
                                                           padx=14, pady=(12, 2))
         tk.Label(win, text="It's usually safe to keep going. The details "
                            "below are also in the log file." +
@@ -45827,6 +46565,27 @@ def run_self_tests(verbose=True):
         g2 = reg3.touch("10.0.0.3", "da:00:00:00:00:06", "mac_local", "x")
         reg3._set_dhcp_hostname(g2, "iPhone", clk.t)
         assert reg3.auto_merge_pass() == []
+        # 5.1.2: the name/alias index finds exactly what the full scan finds
+        reg4 = DeviceRegistry("", [], cfg(), clk)
+        devs = []
+        for i in range(40):
+            d = reg4.touch(f"10.1.0.{i + 2}", "da:00:00:00:01:%02x" % i,
+                           "mac_local", "x")
+            if i % 3 == 0:
+                reg4._set_dhcp_hostname(d, f"living-room-tv-{i % 4}", clk.t)
+            if i % 5 == 0:
+                d.alias = f"Kid laptop {i % 2}"
+            d.state = STATE_INACTIVE
+            d.presence_close(clk.t)
+            clk.t += 50
+            devs.append(d)
+        pool = reg4.merge_pool()
+        for d in devs:
+            full = [(o.key, cf, r) for o, cf, r in reg4.merge_candidates(d)]
+            fast = [(o.key, cf, r) for o, cf, r in
+                    reg4.merge_candidates(d, pool(d))]
+            assert full == fast, (d.key, full, fast)
+        assert any(reg4.merge_candidates(d) for d in devs)
 
     def t_registrable_domain():
         assert registrable_domain("www.example.co.uk") == "example.co.uk"
@@ -46395,6 +47154,79 @@ def t_gate_handoff(ctx):
         assert apply_feature_switches(True, {}) == {k: False for k in saved}
     finally:
         FEATURES.update(saved)
+
+
+@self_test()
+def t_session_iter_json(ctx):
+    """The piece-by-piece session writer produces the same session as
+    serialize(), and the pieces join into valid JSON."""
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    meta = {"started": 1.0, "data_source": "offline", "interface": "t"}
+    a = json.loads(json.dumps(SessionCodec.serialize(m, meta),
+                              default=str))
+    pieces = list(SessionCodec.iter_json(m, meta, chunk=7))
+    assert len(pieces) > 20, len(pieces)
+    b = json.loads("".join(pieces))
+    a.pop("exported_at")
+    b.pop("exported_at")
+    assert a == b, sorted(k for k in a if a.get(k) != b.get(k))
+    m2 = NetworkModel(ctx.cfg(), "", set(), set())
+    SessionCodec.load(json.loads("".join(pieces)), m2)
+    assert set(m2.registry.by_key) == set(m.registry.by_key)
+
+
+@self_test()
+def t_job_runner(ctx):
+    """Jobs run one at a time off the caller's thread, report back through
+    the results queue, refuse a second job of the same kind, and can be
+    cancelled; pieces_under_gate gives the gate back between pieces."""
+    class FakeApp:
+        def __init__(self):
+            self._async_results = queue.Queue()
+            self.banners = []
+
+        def _set_banner(self, text, kind="info"):
+            self.banners.append(text)
+    app = FakeApp()
+    jobs = JobRunner(app)
+    seen = {}
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow(job):
+        started.set()
+        release.wait(5)
+        return threading.current_thread().name
+
+    def drain(timeout=5.0):
+        t_end = time.time() + timeout
+        while jobs.busy() and time.time() < t_end:
+            try:
+                app._async_results.get(timeout=0.05)()
+            except queue.Empty:
+                pass
+    jobs.submit("a", "Test", slow, lambda r: seen.update(done=r))
+    assert started.wait(5)
+    assert jobs.submit("a", "Test", slow) is None and app.banners
+    release.set()
+    drain()
+    assert seen.get("done") == "jobs", seen
+
+    def endless(job):
+        while True:
+            job.progress(0.5)
+            time.sleep(0.01)
+    jobs.submit("b", "Test", endless, None,
+                lambda e: seen.update(failed=type(e).__name__))
+    time.sleep(0.05)
+    jobs.cancel_all()
+    drain()
+    assert seen.get("failed") == "JobCancelled", seen
+    gate = GuiGate()
+    job = Job("c", "", None)
+    assert job.pieces_under_gate(gate, iter("abc")) == ["a", "b", "c"]
+    assert not gate.held() and gate._count == 0
+    jobs.stop()
 
 
 @self_test()
@@ -50707,11 +51539,16 @@ BENCH_LIMITS = {
     # Limit = the larger of median + 25 % and the worst run + 10 %;
     # memory: median + 10 %.
     # M1 (fair gate): import freeze median 291 ms -> limit 365.
-    "S1": {"import.stall_ms": 365, "session_load.stall_ms": 735,
-           "session_save.stall_ms": 415, "text_size.stall_ms": 410,
-           "theme.stall_ms": 175, "switch.stall_ms": 115,
-           "idle_cpu_dash_pct": 5.2, "rss_loaded_mb": 365,
-           "search_ms": 11.5},
+    # M2 (work off the Tk thread), medians: import 206, session load 102
+    # (worst 203: a cycle-collector pass), save 33, text size 82, theme
+    # 113, model upkeep 11.5 ms; idle Dashboard 3.4 %. Freeze limits are
+    # not set below 60 ms (heartbeat jitter on a busy machine), except
+    # model upkeep (30), which is split into steps of a few ms.
+    "S1": {"import.stall_ms": 260, "session_load.stall_ms": 225,
+           "session_save.stall_ms": 60, "text_size.stall_ms": 105,
+           "theme.stall_ms": 145, "switch.stall_ms": 115,
+           "model_tick.stall_ms": 30, "idle_cpu_dash_pct": 4.3,
+           "rss_loaded_mb": 365, "search_ms": 12.5},
 }
 BENCH_LIMITS_PROVISIONAL = True
 BENCH_TARGETS = {
@@ -50794,6 +51631,7 @@ def _bench_child(sid, out_path, pcap):
     rss0 = _rss_mb()
     t0 = time.perf_counter()
     app = MiniWireshark(root, "", set(), set(), "", config=cfg)
+    freeze_startup_objects()
     _gui_pump(root, 0.5)
     res["window_ready_s"] = round(time.perf_counter() - t0, 2)
     res["rss_start_mb"] = round(rss0, 1)
@@ -50932,7 +51770,11 @@ def _bench_child(sid, out_path, pcap):
     res["flush_all_dirty"] = measure("flush_all_dirty", flush_all)
     res["dashboard_refresh"] = measure(
         "dashboard_refresh", lambda: app.tabs["dash"].refresh(force=True))
-    res["model_tick"] = measure("model_tick", lambda: app.model.tick())
+    tick_done = threading.Event()
+    res["model_tick"] = measure(
+        "model_tick", lambda: app.tick_model_stepped(tick_done.set),
+        until=tick_done.is_set)
+    res["model_tick.stall_ms"] = res["model_tick"]["stall_ms"]
     res["layout_pass"] = measure("layout_pass", app._layout_pass)
 
     def set_theme(name):
@@ -51018,6 +51860,7 @@ BENCH_SUMMARY_KEYS = (
     ("text_size.stall_ms", "Longest freeze changing text size (ms)"),
     ("theme.stall_ms", "Longest freeze changing theme (ms)"),
     ("switch.stall_ms", "Slowest tab switch (ms)"),
+    ("model_tick.stall_ms", "Longest freeze in model upkeep (ms)"),
     ("idle_cpu_dash_pct", "Idle CPU, Dashboard (% of a core)"),
     ("idle_cpu_devices_pct", "Idle CPU, Devices (% of a core)"),
     ("rss_loaded_mb", "Memory with data loaded (MB)"),
@@ -52290,7 +53133,8 @@ def _gs_m10(app, ctx):
     path = app.write_journal(ctx.path("journal.json"))
     n_dev = len(app.model.registry.by_key)
     assert app.restore_journal(path)
-    _gui_pump(root, 0.5)
+    _gui_pump(root, 0.5, until=lambda: not app.jobs.busy(), timeout=30)
+    _gui_pump(root, 0.3)
     assert len(app.model.registry.by_key) == n_dev
     assert not os.path.exists(path)
     app.data_mode = "idle"
@@ -52924,6 +53768,84 @@ def startup_sanity_checks():
 
 
 
+@gui_test_step("5.1.2 M2: background save and load, journal v2, upkeep steps, fonts")
+def gt_m2_background(app, ctx):
+    root = app.root
+    m = app.model
+    n_dev = len(m.registry.by_key)
+    assert n_dev, "the scenario should have devices"
+    # save in the background: the window keeps running meanwhile
+    path = ctx.path("bg.mwsession.json")
+    beats = []
+    root.after(0, lambda: app.save_session_to(path))
+    t_end = time.time() + 30
+    while time.time() < t_end:
+        beats.append(time.perf_counter())
+        _gui_pump(root, 0.0)
+        if os.path.exists(path) and not app.jobs.busy():
+            break
+    assert os.path.exists(path) and not app.jobs.busy()
+    with open(path, encoding="utf-8") as f:
+        saved = json.load(f)
+    assert len(saved["devices"]) == n_dev
+    # a second save of the same kind while one runs is refused
+    assert app.save_session_to(path) is not None
+    assert app.save_session_to(path) is None
+    _gui_pump(root, 0.2, until=lambda: not app.jobs.busy(), timeout=30)
+    # load in the background, tables refilled step by step
+    app._load_session(path)
+    _gui_pump(root, 0.3, until=lambda: not app.jobs.busy() and
+              app.data_mode == "session", timeout=30)
+    _gui_pump(root, 0.3)
+    assert app.data_mode == "session"
+    assert len(app.model.registry.by_key) == n_dev
+    dev_rows = len(app.tabs["devices"].tree.get_children())
+    assert dev_rows, "the Devices table was not refilled"
+    # journal v2: compact text + fingerprint, restorable; v1 still restores
+    jp = app.write_journal(ctx.path("j2.json"))
+    side = read_json(jp + ".sha256")
+    assert side and side["journal"] == 2
+    with open(jp, "rb") as f:
+        assert hashlib.sha256(f.read()).hexdigest() == side["sha256"]
+    # upkeep in steps reaches the end and calls back
+    done = []
+    app.tick_model_stepped(lambda: done.append(1))
+    _gui_pump(root, 0.1, until=lambda: done, timeout=10)
+    assert done, "stepped model upkeep did not finish"
+    # shared fonts look exactly like the tuples they replaced
+    app._apply_text_size("Normal")
+    _gui_pump(root, 0.1, until=lambda: app._text_size_job is None, timeout=5)
+    for name, (size, style) in MW_FONTS.items():
+        a = tkfont.nametofont(name).actual()
+        b = tkfont.Font(font=("TkDefaultFont", size) + style).actual()
+        assert a == b, (name, a, b)
+    assert len(MW_FONTS) >= 8, sorted(MW_FONTS)
+    app._apply_text_size("Large")
+    _gui_pump(root, 0.1, until=lambda: app._text_size_job is None, timeout=5)
+    big = tkfont.nametofont(mw_font(11, "bold")).actual()["size"]
+    app._apply_text_size("Normal")
+    _gui_pump(root, 0.1, until=lambda: app._text_size_job is None, timeout=5)
+    assert abs(big) > 11, big
+    # nothing is drawn while minimised; drawing resumes afterwards
+    app.minimized = lambda: True
+    try:
+        before = app.model.dirty_devices
+        app.model.dirty_devices = set(app.model.registry.by_key)
+        app._flush_ui()
+        assert app.model.dirty_devices, "flushed while minimised"
+    finally:
+        del app.minimized
+        app.model.dirty_devices = before
+    # back to the scenario capture for the steps that follow (a session
+    # has no packets)
+    frames = ctx.frames()
+    app.import_pcap_path(ctx.path("scenario.pcap"))
+    assert _gui_pump(root, 0.5, lambda: app.importer is None and
+                     app.data_mode == "offline" and
+                     app.model.count >= len(frames), timeout=60)
+    _gui_pump(root, 1.0)
+
+
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
 # Labels that change with the state of the row a menu was opened on are
 # folded to one name, so the snapshot does not depend on which row was first.
@@ -53002,7 +53924,10 @@ def reachable_actions(app):
             app._select_tab(name)
             if name == "packets":
                 tab.show_subview("Packets")
-            app.root.update()
+            # the new tab fills 1 ms after it is shown (5.1.2)
+            _gui_pump(app.root, 0.05, until=lambda: getattr(
+                app, "_tab_refresh_job", None) is None, timeout=5)
+            _gui_pump(app.root, 0.3)
             tree = tab.tree
             kids = tree.get_children()
             box = tree.bbox(kids[0]) if kids else None
@@ -53473,6 +54398,7 @@ def main():
     try:
         MiniWireshark(root, gw, my_ips, my_macs, default_iface_name,
                       config=cfg, start_action=action)
+        freeze_startup_objects()
         boot_step("main window", True, f"{time.perf_counter() - _T_START:.2f}"
                                        f" s after launch")
         if BOOT is not None:
