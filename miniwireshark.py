@@ -8781,13 +8781,61 @@ class HealthProber(threading.Thread):
 # ============================================================================
 class GuiGate:
     """Re-entrant lock with the ability to step out of a nested hold
-    completely (for modal waits) and step back in afterwards."""
+    completely (for modal waits) and step back in afterwards.
+
+    Fair handoff (5.1.2): a lock released and taken straight back by the
+    analysis thread does not let a waiting Tk callback in (Python locks
+    are not fair), and the window froze for up to 0.6 s while a large file
+    was read. Tk callbacks now say they are waiting (`enter_tk`), and the
+    analysis thread, between its slices, waits until the window has had
+    its turn (`yield_to_tk`), for at most 50 ms."""
 
     def __init__(self):
         self._lock = threading.RLock()
         self._owner = None
         self._count = 0
         self.wait_ms = 0.0            # time the worker spent waiting
+        self.tk_waiting = 0           # Tk callbacks waiting to enter
+        self.tk_entries = 0           # Tk callbacks that got in
+        self.yield_ms = 0.0           # time the worker gave way to Tk
+        self._yielding = False
+        self._cv = threading.Condition(threading.Lock())
+
+    def enter_tk(self):
+        """The Tk thread's way in: announce, take the gate, wake a worker
+        that is giving way. Only the Tk thread writes these counters."""
+        self.tk_waiting += 1
+        try:
+            self.acquire()
+        finally:
+            self.tk_waiting -= 1
+        self.tk_entries += 1
+        if self._yielding:
+            with self._cv:
+                self._cv.notify_all()
+
+    def yield_to_tk(self, seen, limit=0.05):
+        """Called by a worker right after releasing the gate. `seen` is
+        tk_entries read while it still held the gate. If a Tk callback is
+        waiting, wait (at most `limit` s) until one has entered."""
+        if not FEATURES.get("fair_gate", True) or self.tk_waiting <= 0:
+            time.sleep(0)
+            return 0.0
+        t0 = time.perf_counter()
+        deadline = t0 + limit
+        with self._cv:
+            self._yielding = True
+            try:
+                while self.tk_entries == seen and self.tk_waiting > 0:
+                    left = deadline - time.perf_counter()
+                    if left <= 0:
+                        break
+                    self._cv.wait(left)
+            finally:
+                self._yielding = False
+        spent = time.perf_counter() - t0
+        self.yield_ms += spent * 1000
+        return spent
 
     def acquire(self):
         self._lock.acquire()
@@ -8942,6 +8990,18 @@ class PerfProbe:
 PERF = [None]          # the active PerfProbe, or None (the usual case)
 
 
+def apply_feature_switches(safe_mode=False, env=None):
+    """Safe Mode turns every 5.1.2 switch off (exactly the 5.0.2
+    behaviour); MW_FEATURES_OFF="a,b" turns chosen ones off."""
+    env = os.environ if env is None else env
+    off = {x.strip() for x in env.get("MW_FEATURES_OFF", "").split(",")
+           if x.strip()}
+    for name in FEATURES:
+        if safe_mode or name in off:
+            FEATURES[name] = False
+    return dict(FEATURES)
+
+
 def perf_start():
     if PERF[0] is None:
         PERF[0] = PerfProbe()
@@ -8971,13 +9031,13 @@ def install_gui_gate(gate=None):
     def gated_call(self, *args):
         probe = PERF[0]
         if probe is None:
-            gate.acquire()
+            gate.enter_tk()
             try:
                 return orig_call(self, *args)
             finally:
                 gate.release()
         t0 = clock()
-        gate.acquire()
+        gate.enter_tk()
         t1 = clock()
         try:
             return orig_call(self, *args)
@@ -9416,8 +9476,29 @@ class AnalysisWorker(threading.Thread):
         self.decoded = self.errors = self.stale = self.deep = 0
         self.last_error = ""
 
+    # While packets are being analysed, Python hands the interpreter to
+    # another thread every 1 ms instead of every 5 ms, so the window gets
+    # its turn sooner (S1 import freeze 385 -> about 220 ms, same import
+    # time). Back to the default after 1 s without work, so an idle window
+    # does not pay for the extra switching.
+    FAST_SWITCH = 0.001
+
+    def _switch_interval(self, busy, now):
+        if not FEATURES.get("fair_gate", True):
+            return
+        if busy:
+            self._last_work = now
+            if not self._fast:
+                sys.setswitchinterval(self.FAST_SWITCH)
+                self._fast = True
+        elif self._fast and now - self._last_work > 1.0:
+            sys.setswitchinterval(self._normal_switch)
+            self._fast = False
+
     def run(self):
         ring = self.app.ring
+        self._fast, self._last_work = False, 0.0
+        self._normal_switch = sys.getswitchinterval()
         while not self.stop_flag:
             self.beat = now = time.monotonic()
             wd = getattr(self.app, "watchdog", None)
@@ -9428,6 +9509,7 @@ class AnalysisWorker(threading.Thread):
                                 "%.0f s", frozen)
                 self.window_frozen = frozen
             batch = ring.drain(self.BATCH, timeout=0.02)
+            self._switch_interval(bool(batch), now)
             if not batch:
                 self.busy = False
                 continue
@@ -9440,6 +9522,8 @@ class AnalysisWorker(threading.Thread):
                 if self.errors <= 20:
                     LOG.exception("analysis batch")
         self.busy = False
+        if self._fast:
+            sys.setswitchinterval(self._normal_switch)
 
     def _process(self, batch):
         app = self.app
@@ -9503,7 +9587,10 @@ class AnalysisWorker(threading.Thread):
                 app.pending_rows.extend(rows)
                 self.decoded += len(rows)
                 app.on_rows_analysed(rows)
-            time.sleep(0)           # let the Tk thread in between slices
+                seen = self.gate.tk_entries
+            # let a waiting Tk callback in before the next slice (a bare
+            # sleep(0) did not: the lock was taken straight back)
+            self.gate.yield_to_tk(seen)
 
 
 def _layer2num(cls):
@@ -35097,13 +35184,17 @@ class MiniWireshark:
             mult = {0: 1.0, 1: 1.6, 2: 2.5}.get(self.perf_level, 1.0)
         return int(base * mult)
 
+    DRAIN_ROWS = 1000          # packet rows handed to the list per callback
+
     def _drain_decoded(self):
         """Hands freshly analysed rows to the Packets tab (the analysis
-        itself happens on the worker thread)."""
+        itself happens on the worker thread). At most DRAIN_ROWS per
+        callback, so a burst never freezes the window; the rest follows
+        1 ms later."""
         pr = self.pending_rows
         try:
             batch = []
-            while pr and len(batch) < 4000:
+            while pr and len(batch) < self.DRAIN_ROWS:
                 batch.append(pr.popleft())
             if getattr(self, "_rows_overflowed", False):
                 self._rows_overflowed = False
@@ -37341,13 +37432,34 @@ class MiniWireshark:
                               self.worker.busy) or self.pending_rows:
             self.root.after(300, self._pcap_finalize, n, cancelled)
             return
-        self.model.tick()
-        self.model._classify_dirty |= set(self.model.registry.by_key)
-        self.model._classify()
-        if self.deep.active():
-            self.deep.flush(final=True)
-        self.tabs["devices"].rebuild()
-        self.tabs["websites"].rebuild()
+        # 5.1.2: the closing work runs as separate short callbacks (all in
+        # one took up to 150 ms and froze the window at the end of a file)
+        m, gen = self.model, self.gen
+
+        def classify():
+            m._classify_dirty |= set(m.registry.by_key)
+            m._classify()
+
+        def deep_flush():
+            if self.deep.active():
+                self.deep.flush(final=True)
+        steps = [m.tick, classify, deep_flush,
+                 self.tabs["devices"].rebuild,
+                 self.tabs["websites"].rebuild,
+                 lambda: self._pcap_finished(n, cancelled)]
+
+        def run(i=0):
+            if self.gen != gen or self.model is not m:
+                return                    # another source took over
+            try:
+                steps[i]()
+            except Exception:                        # noqa: BLE001
+                LOG.exception("finishing the capture import (step %d)", i)
+            if i + 1 < len(steps):
+                self.root.after(1, run, i + 1)
+        run()
+
+    def _pcap_finished(self, n, cancelled):
         gw = self.model.gateway_ip
         self._set_banner(
             f"\U0001F4C2  OFFLINE CAPTURE — finished reading {n} packets "
@@ -46225,6 +46337,66 @@ def t_toc_matches_banners(ctx):
     assert len(ids) == len(set(ids)), "duplicate banner ids"
 
 
+def _gate_handoff_run(fair, seconds=1.5, slice_s=0.025):
+    """A worker holding a GuiGate in 25 ms slices, a 'Tk' thread asking
+    for it every 10 ms. -> (sorted Tk waits in s, worker slices done)."""
+    gate = GuiGate()
+    saved = FEATURES.get("fair_gate", True)
+    FEATURES["fair_gate"] = fair
+    stop = threading.Event()
+    slices = [0]
+    waits = []
+
+    def worker():
+        while not stop.is_set():
+            with gate:
+                t_end = time.perf_counter() + slice_s
+                while time.perf_counter() < t_end:
+                    pass
+                seen = gate.tk_entries
+            slices[0] += 1
+            gate.yield_to_tk(seen)
+
+    def tk_side():
+        while not stop.is_set():
+            t0 = time.perf_counter()
+            gate.enter_tk()
+            waits.append(time.perf_counter() - t0)
+            gate.release()
+            time.sleep(0.010)
+    try:
+        threads = [threading.Thread(target=worker, daemon=True),
+                   threading.Thread(target=tk_side, daemon=True)]
+        for th in threads:
+            th.start()
+        time.sleep(seconds)
+        stop.set()
+        for th in threads:
+            th.join(2)
+    finally:
+        FEATURES["fair_gate"] = saved
+    return sorted(waits), slices[0]
+
+
+@self_test()
+def t_gate_handoff(ctx):
+    """With fair handoff a Tk callback never waits much more than one
+    25 ms analysis slice for the GuiGate, and analysis keeps going."""
+    waits, slices = _gate_handoff_run(True)
+    assert len(waits) > 20, f"the Tk side got in only {len(waits)} times"
+    p90 = waits[int(len(waits) * 0.9)]
+    assert p90 < 0.040 and waits[-1] < 0.120, (
+        f"Tk waited p90 {p90 * 1000:.0f} ms, max {waits[-1] * 1000:.0f} ms")
+    assert slices > 20, f"analysis only ran {slices} slices"
+    saved = dict(FEATURES)
+    assert apply_feature_switches(
+        False, {"MW_FEATURES_OFF": "no_such_switch"}) == saved
+    try:
+        assert apply_feature_switches(True, {}) == {k: False for k in saved}
+    finally:
+        FEATURES.update(saved)
+
+
 @self_test()
 def t_perf_probe(ctx):
     """The window perf probe separates waiting for the GuiGate from work,
@@ -50534,7 +50706,8 @@ BENCH_LIMITS = {
     # tab switch 74 ms; idle Dashboard 4.1 %; 331 MB; search 8.7 ms.
     # Limit = the larger of median + 25 % and the worst run + 10 %;
     # memory: median + 10 %.
-    "S1": {"import.stall_ms": 725, "session_load.stall_ms": 735,
+    # M1 (fair gate): import freeze median 291 ms -> limit 365.
+    "S1": {"import.stall_ms": 365, "session_load.stall_ms": 735,
            "session_save.stall_ms": 415, "text_size.stall_ms": 410,
            "theme.stall_ms": 175, "switch.stall_ms": 115,
            "idle_cpu_dash_pct": 5.2, "rss_loaded_mb": 365,
@@ -53202,6 +53375,7 @@ def main():
              MW_STAGE or "launcher")
     _install_thread_excepthook()
     install_gui_gate()
+    apply_feature_switches(SAFE_MODE)
     if os.environ.get("MW_PERF"):
         perf_start()             # measure every window callback (debugging)
     rolled = rollback_update_if_needed()
