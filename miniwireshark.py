@@ -8886,6 +8886,7 @@ FEATURES = {
     "fair_gate": True,       # the analysis thread hands the gate to Tk (M1)
     "chunked": True,         # tables refill in short slices after a swap (M2)
     "gc_freeze": True,       # startup objects leave the cycle collector (M2)
+    "sticky_sort": True,     # tables keep their sort and columns (M3)
 }
 
 
@@ -17322,7 +17323,7 @@ def _default_config():
         "accessibility": {"colorblind": "Off"},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal",
-                       "inspector": None},
+                       "inspector": None, "tables": {}},
         "capture": {"max_stored_events": 5000, "promiscuous": True,
                     "auto_select_interface": True,
                     "preferred_interface": "", "follow_newest": True,
@@ -20444,6 +20445,55 @@ already running. ¦ déjà en cours. ¦ ya en curso.
 Saving the session was cancelled. ¦ L'enregistrement de la session a été annulé. ¦ Se canceló el guardado de la sesión.
 Opening the session was cancelled. ¦ L'ouverture de la session a été annulée. ¦ Se canceló la apertura de la sesión.
 Work running in the background. Click to cancel it. ¦ Travail en cours en arrière-plan. Cliquez pour l'annuler. ¦ Trabajo en segundo plano. Haga clic para cancelarlo.
+The order changed while a row was selected. Re-sort ¦ L'ordre a changé pendant qu'une ligne était sélectionnée. Retrier ¦ El orden cambió mientras había una fila seleccionada. Reordenar
+Columns ¦ Colonnes ¦ Columnas
+Reset columns ¦ Rétablir les colonnes ¦ Restablecer columnas
+Clear the sort ¦ Annuler le tri ¦ Quitar el orden
+Export this table… ¦ Exporter ce tableau… ¦ Exportar esta tabla…
+Export this table ¦ Exporter ce tableau ¦ Exportar esta tabla
+Exporting the table ¦ Exportation du tableau ¦ Exportando la tabla
+(icon) ¦ (icône) ¦ (icono)
+Copy cell ¦ Copier la cellule ¦ Copiar la celda
+Copy row ¦ Copier la ligne ¦ Copiar la fila
+Copy selected rows as CSV ¦ Copier les lignes sélectionnées en CSV ¦ Copiar las filas seleccionadas como CSV
+Filter to this ¦ Filtrer sur ceci ¦ Filtrar por esto
+Show its packets ¦ Afficher ses paquets ¦ Mostrar sus paquetes
+Go to ¦ Aller à ¦ Ir a
+Clear the filter ¦ Effacer le filtre ¦ Borrar el filtro
+Clear the filters ¦ Effacer les filtres ¦ Borrar los filtros
+just now ¦ à l'instant ¦ ahora mismo
+No devices to show. Offline and expired devices are hidden. ¦ Aucun appareil à afficher. Les appareils hors ligne et expirés sont masqués. ¦ No hay dispositivos que mostrar. Los dispositivos desconectados y caducados están ocultos.
+No devices in this file. ¦ Aucun appareil dans ce fichier. ¦ No hay dispositivos en este archivo.
+No devices yet. They appear as soon as they send something on your network. ¦ Aucun appareil pour l'instant. Ils apparaissent dès qu'ils envoient quelque chose sur votre réseau. ¦ Aún no hay dispositivos. Aparecen en cuanto envían algo en su red.
+Its websites ¦ Ses sites web ¦ Sus sitios web
+Copy IP ¦ Copier l'IP ¦ Copiar la IP
+Copy MAC ¦ Copier l'adresse MAC ¦ Copiar la MAC
+Copy domain ¦ Copier le domaine ¦ Copiar el dominio
+Copy remote address ¦ Copier l'adresse distante ¦ Copiar la dirección remota
+Copy name ¦ Copier le nom ¦ Copiar el nombre
+No websites match these filters. ¦ Aucun site web ne correspond à ces filtres. ¦ Ningún sitio web coincide con estos filtros.
+No websites yet. Names appear when a device looks one up or connects. ¦ Aucun site web pour l'instant. Les noms apparaissent quand un appareil en recherche un ou s'y connecte. ¦ Aún no hay sitios web. Los nombres aparecen cuando un dispositivo busca uno o se conecta.
+Group by: ¦ Regrouper par : ¦ Agrupar por:
+None ¦ Aucun ¦ Ninguno
+No connections match these filters. ¦ Aucune connexion ne correspond à ces filtres. ¦ Ninguna conexión coincide con estos filtros.
+No connections in this view. Short ones are hidden in Beginner. ¦ Aucune connexion dans cette vue. Les connexions courtes sont masquées en mode Débutant. ¦ No hay conexiones en esta vista. Las cortas se ocultan en modo Principiante.
+Show short connections ¦ Afficher les connexions courtes ¦ Mostrar las conexiones cortas
+No connections yet. ¦ Aucune connexion pour l'instant. ¦ Aún no hay conexiones.
+(no name seen) ¦ (aucun nom vu) ¦ (no se vio ningún nombre)
+Internet host ¦ Hôte Internet ¦ Host de Internet
+No Internet hosts yet. They appear when a device talks to a public address. ¦ Aucun hôte Internet pour l'instant. Ils apparaissent quand un appareil communique avec une adresse publique. ¦ Aún no hay hosts de Internet. Aparecen cuando un dispositivo habla con una dirección pública.
+Search: ¦ Rechercher : ¦ Buscar:
+More ¦ Plus ¦ Más
+No alerts match these filters. ¦ Aucune alerte ne correspond à ces filtres. ¦ Ninguna alerta coincide con estos filtros.
+Show all ¦ Tout afficher ¦ Mostrar todo
+Nothing unusual so far. That is good news, not a sign that checks are off. ¦ Rien d'inhabituel jusqu'ici. C'est une bonne nouvelle, pas le signe que les vérifications sont désactivées. ¦ Nada inusual por ahora. Es una buena noticia, no una señal de que las comprobaciones estén desactivadas.
+Alert settings ¦ Réglages des alertes ¦ Ajustes de alertas
+Only this session is shown. Turn on History to keep earlier days. ¦ Seule cette session est affichée. Activez l'historique pour garder les jours précédents. ¦ Solo se muestra esta sesión. Active el historial para conservar los días anteriores.
+History settings ¦ Réglages de l'historique ¦ Ajustes del historial
+Nothing in this view yet. ¦ Rien dans cette vue pour l'instant. ¦ Aún no hay nada en esta vista.
+Jump to now ¦ Revenir au présent ¦ Ir al momento actual
+Show only: ¦ Afficher seulement : ¦ Mostrar solo:
+Paused while the pointer is over the list — move it away to resume ¦ En pause tant que le pointeur est sur la liste — éloignez-le pour reprendre ¦ En pausa mientras el puntero está sobre la lista: apártelo para continuar
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -20909,6 +20959,25 @@ I18N_PATTERNS = [
      r"Compruebe qué hace {t1} (streaming, copias de seguridad, "
      r"actualizaciones)."),
     (r"(.+)/s right now", r"\1/s en ce moment", r"\1/s ahora mismo"),
+    # 5.1.2 table kit
+    (r"(\d+) s ago", r"il y a \1 s", r"hace \1 s"),
+    (r"(\d+) min ago", r"il y a \1 min", r"hace \1 min"),
+    (r"(\d+) h ago", r"il y a \1 h", r"hace \1 h"),
+    (r"(\d+) d ago", r"il y a \1 j", r"hace \1 d"),
+    (r"No rows match “(.+)”\.", r"Aucune ligne ne correspond à « \1 ».",
+     r"Ninguna fila coincide con «\1»."),
+    (r"(\d[\d,]*) new since you last looked",
+     r"\1 nouveaux depuis votre dernière visite",
+     r"\1 nuevos desde su última visita"),
+    (r"Exported (\d[\d,]*) rows to (.+)", r"\1 lignes exportées vers \2",
+     r"\1 filas exportadas a \2"),
+    (r"(\d[\d,]*) open", r"\1 ouvertes", r"\1 abiertas"),
+    (r"Paused while the pointer is over the list — move it away to resume "
+     r"\((\d+) waiting\)",
+     r"En pause tant que le pointeur est sur la liste — éloignez-le pour "
+     r"reprendre (\1 en attente)",
+     r"En pausa mientras el puntero está sobre la lista: apártelo para "
+     r"continuar (\1 en espera)"),
     (r"(\d+)\. (.+)", None, None),         # numbered title: translate rest
 ]
 _I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
@@ -24187,29 +24256,44 @@ def make_tree(parent, columns, bg="#ffffff", show="headings",
     return frame, tree
 
 
-def tree_upsert(tree, iid_map, key, values, tags=(), parent="", index="end"):
+def tree_upsert(tree, iid_map, key, values, tags=(), parent="", index="end",
+                kit=None):
     """Insert or update one row; returns its iid. Never redraws the whole
-    table."""
+    table. With a TableKit, the row keeps its sorted place and shows the
+    new-row dot and "4 min ago"."""
     iid = iid_map.get(key)
+    if kit is not None:
+        values = kit.decorate(key, values)
     if iid is not None:
         try:
             tree.item(iid, values=values, tags=tags)
+            if kit is not None:
+                kit.updated(iid, key, values)
             return iid
         except tk.TclError:
             iid_map.pop(key, None)
+            if kit is not None:
+                kit.removed(iid)
+    slot = None
+    if kit is not None:
+        index, slot = kit.insert_index(parent, key, values, default=index)
     try:
         iid = tree.insert(parent, index, values=values, tags=tags)
         iid_map[key] = iid
+        if kit is not None:
+            kit.inserted(parent, iid, slot, key)
         return iid
     except tk.TclError:
         return None
 
 
-def tree_remove(tree, iid_map, key):
+def tree_remove(tree, iid_map, key, kit=None):
     iid = iid_map.pop(key, None)
     if iid is not None:
         with contextlib.suppress(tk.TclError):
             tree.delete(iid)
+        if kit is not None:
+            kit.removed(iid)
 
 
 class IidMap(dict):
@@ -24263,6 +24347,906 @@ def key_for_iid(iid_map, iid):
         if v == iid:
             return k
     return None
+
+
+# ---- Table kit (5.1.2 F4) -----------------------------------------------------
+#  One set of table behaviours for Devices, Websites, Connections, Internet
+#  hosts, Alerts, Timeline and the feed: remembered columns, widths and sort;
+#  a sort that holds while rows update; a sentence instead of a blank table;
+#  the same right-click layout everywhere; copy and export of what is shown;
+#  rows that are new since you last looked; "4 min ago" while watching live.
+# ============================================================================
+ROW_DOT = "• "              # marks a row that is new since you last looked
+
+
+def relative_age(ts, now):
+    """'just now', '4 min ago'... (translated); the clock time stays in
+    the tooltip and in copies and exports."""
+    if not ts:
+        return "—"
+    d = max(0.0, now - ts)
+    if d < 10:
+        s = "just now"
+    elif d < 60:
+        s = "%d s ago" % int(d)
+    elif d < 3600:
+        s = "%d min ago" % int(d // 60)
+    elif d < 86400:
+        s = "%d h ago" % int(d // 3600)
+    else:
+        s = "%d d ago" % int(d // 86400)
+    return translate_text(s)
+
+
+def debounce(widget, fn, ms=150):
+    """A callable that runs fn() once, `ms` after the last call (typing in
+    a filter box rebuilt the whole table on every key)."""
+    state = {"job": None}
+
+    def fire():
+        state["job"] = None
+        fn()
+
+    def call(*_a):
+        job = state["job"]
+        if job is not None:
+            with contextlib.suppress(tk.TclError):
+                widget.after_cancel(job)
+        state["job"] = widget.after(ms, fire)
+    return call
+
+
+class _Desc:
+    """Wraps a sort key so that bisect keeps a descending list."""
+    __slots__ = ("v",)
+
+    def __init__(self, v):
+        self.v = v
+
+    def __lt__(self, other):
+        return other.v < self.v
+
+    def __eq__(self, other):
+        return self.v == other.v
+
+
+class TableKit:
+    """Shared behaviour of one ttk.Treeview (F4).
+
+    key_of(iid) -> the row's key (None for rows the kit should ignore).
+    empty_state() -> None or (sentence, button text or None, callback).
+    default_cols() -> the column ids shown by default (the view decides).
+    sort_values: {col: fn(key)} raw values to sort by instead of the text.
+    relative: {col: fn(key) -> timestamp}: "4 min ago" while live.
+    dot_col: the column (or "#0") that carries the new-row dot.
+    menu(key) -> {"open", "filter", "packets", "goto": [(label, fn)],
+                  "own": [items]} for the right-click menu.
+    all_keys() -> every key the table could show (for the new-row dots).
+    """
+
+    SAVE_EVERY = 2.0
+    REL_EVERY = 20000            # ms between "min ago" refreshes
+
+    def __init__(self, tab, tree, wrap, table_id, key_of, empty_state=None,
+                 default_cols=None, sort_values=None, relative=None,
+                 dot_col=None, menu=None, all_keys=None, sortable=True,
+                 on_sort=None):
+        app = tab.app
+        self.tab, self.app, self.tree, self.wrap = tab, app, tree, wrap
+        self.table_id = table_id
+        self.key_of = key_of
+        self.empty_state = empty_state
+        self.default_cols = default_cols
+        self.sort_values = dict(sort_values or {})
+        self.relative = dict(relative or {})
+        self.dot_col = dot_col
+        self.menu = menu
+        self.all_keys = all_keys
+        self.sortable = sortable
+        self.on_sort = on_sort
+        self.columns = tuple(tree["columns"])
+        self.col_index = {c: i for i, c in enumerate(self.columns)}
+        self.titles = {c: str(tree.heading(c, "text") or "")
+                       for c in self.columns}
+        self.sort_col, self.sort_desc = None, False
+        self._order = {}           # parent iid -> sorted [(k, seq, iid)]
+        self._ent = {}             # iid -> (parent, entry)
+        self._seq = iter(range(1 << 62))
+        self.stale = False
+        self.snapshot = None       # keys present when you last left the tab
+        self.dotted = {}           # iid -> key currently showing the dot
+        self._empty_job = None
+        self._save_job = None
+        self._rel_text = {}
+        self._press_region = ""
+        self._tip = None
+        self._tip_job = None
+        self._tip_cell = None
+        self._build_overlays()
+        tree.bind("<Button-3>", self._right_click)
+        tree.bind("<Button-2>", self._right_click)
+        tree.bind("<ButtonPress-1>", self._press, add="+")
+        tree.bind("<Configure>", lambda e: self.empty_soon(), add="+")
+        tree.bind("<Map>", lambda e: self.empty_soon(), add="+")
+        tree.bind("<ButtonRelease-1>", self._release, add="+")
+        if self.relative:
+            tree.bind("<Motion>", self._motion, add="+")
+            tree.bind("<Leave>", lambda e: self._hide_tip(), add="+")
+        for c in ("#0",) + self.columns:
+            with contextlib.suppress(tk.TclError):
+                tree.heading(c, command=lambda cc=c: self.sort_by(cc))
+        self.load()
+        app.kits.append(self)
+        self.empty_soon()
+
+    # ---- settings ----------------------------------------------------------
+    @property
+    def sticky(self):
+        return FEATURES.get("sticky_sort", True)
+
+    def _saved(self):
+        tables = self.app.config.get("appearance.tables") or {}
+        return tables.get(self.table_id) or {}
+
+    def load(self):
+        """Saved columns, widths and sort (none when the switch is off:
+        the 5.0.2 defaults)."""
+        st = self._saved() if self.sticky else {}
+        self.apply_columns()
+        widths = st.get("widths") or {}
+        ratio = 1.0
+        with contextlib.suppress(TypeError, ValueError, ZeroDivisionError):
+            ratio = MW_FONT_SCALE[0] / float(st.get("scale") or 1.0)
+        for c, w in widths.items():
+            if c in self.col_index or c == "#0":
+                with contextlib.suppress(tk.TclError, TypeError, ValueError):
+                    self.tree.column(c, width=max(30, int(int(w) * ratio)))
+        sort = st.get("sort")
+        if self.sortable and isinstance(sort, list) and len(sort) == 2 and \
+                (sort[0] in self.col_index or sort[0] == "#0"):
+            self.sort_col, self.sort_desc = sort[0], bool(sort[1])
+            self._arrows()
+
+    def save_soon(self):
+        if self._save_job is not None or not self.sticky:
+            return
+        with contextlib.suppress(tk.TclError):
+            self._save_job = self.tree.after(int(self.SAVE_EVERY * 1000),
+                                             self.save)
+
+    def save(self):
+        self._save_job = None
+        cfg = self.app.config
+        tables = dict(cfg.get("appearance.tables") or {})
+        st = dict(tables.get(self.table_id) or {})
+        if self.user_cols is None:
+            st.pop("cols", None)
+        else:
+            st["cols"] = list(self.user_cols)
+        widths = {}
+        for c in ("#0",) + self.columns:
+            with contextlib.suppress(tk.TclError, ValueError):
+                widths[c] = int(self.tree.column(c, "width"))
+        st["widths"], st["scale"] = widths, MW_FONT_SCALE[0]
+        if self.sort_col:
+            st["sort"] = [self.sort_col, self.sort_desc]
+        else:
+            st.pop("sort", None)
+        tables[self.table_id] = st
+        cfg.set("appearance.tables", tables)
+        cfg.save()
+
+    # ---- columns -----------------------------------------------------------
+    @property
+    def user_cols(self):
+        cols = self._saved().get("cols") if self.sticky else None
+        if getattr(self, "_cols_override", "unset") != "unset":
+            cols = self._cols_override
+        if cols is None:
+            return None
+        return [c for c in cols if c in self.col_index] or None
+
+    def defaults(self):
+        cols = self.default_cols() if self.default_cols else None
+        return list(cols) if cols else list(self.columns)
+
+    def shown_cols(self):
+        return self.user_cols or self.defaults()
+
+    def apply_columns(self):
+        with contextlib.suppress(tk.TclError):
+            self.tree.configure(displaycolumns=self.shown_cols())
+
+    def set_column_shown(self, col, shown):
+        cols = list(self.shown_cols())
+        if shown and col not in cols:
+            # back in its usual place
+            cols.append(col)
+            cols.sort(key=lambda c: self.col_index.get(c, 999))
+        elif not shown and col in cols and len(cols) > 1:
+            cols.remove(col)
+        self._cols_override = cols
+        self.apply_columns()
+        self.save_soon()
+
+    def reset_columns(self):
+        """Back to the view's default columns and widths."""
+        self._cols_override = None
+        cfg = self.app.config
+        tables = dict(cfg.get("appearance.tables") or {})
+        st = dict(tables.get(self.table_id) or {})
+        st.pop("cols", None)
+        st.pop("widths", None)
+        tables[self.table_id] = st
+        cfg.set("appearance.tables", tables)
+        cfg.save()
+        self.apply_columns()
+
+    def _press(self, e):
+        with contextlib.suppress(tk.TclError):
+            self._press_region = self.tree.identify_region(e.x, e.y)
+
+    def _release(self, _e):
+        if self._press_region == "separator":
+            self.save_soon()          # a column was resized
+        self._press_region = ""
+
+    # ---- sort that holds while rows update --------------------------------
+    def _raw_key(self, key, values, col):
+        fn = self.sort_values.get(col) or self.relative.get(col)
+        if fn is not None:
+            try:
+                v = fn(key)
+            except Exception:                        # noqa: BLE001
+                v = None
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return (0, float(v), "")
+            return (1, 0, str(v if v is not None else "").lower())
+        if col == "#0":
+            return sort_key(values)
+        i = self.col_index.get(col)
+        v = values[i] if values is not None and i is not None and \
+            i < len(values) else ""
+        if isinstance(v, str) and v.startswith(ROW_DOT):
+            v = v[len(ROW_DOT):]
+        return sort_key(v)
+
+    def _k(self, key, values):
+        k = self._raw_key(key, values, self.sort_col)
+        return _Desc(k) if self.sort_desc else k
+
+    def _row_values(self, iid):
+        if self.sort_col == "#0":
+            return self.tree.item(iid, "text")
+        return self.tree.item(iid, "values")
+
+    def _list(self, parent):
+        lst = self._order.get(parent)
+        if lst is None:
+            lst = []
+            for iid in self.tree.get_children(parent):
+                e = (self._k(self.key_of(iid), self._row_values(iid)),
+                     next(self._seq), iid)
+                lst.append(e)
+                self._ent[iid] = (parent, e)
+            lst.sort()
+            self._order[parent] = lst
+        return lst
+
+    def active(self):
+        return bool(self.sort_col) and self.sticky
+
+    def insert_index(self, parent, key, values, text=None, default="end"):
+        """Where a new row goes: its sorted place while a sort is set."""
+        if not self.active():
+            return default, None
+        try:
+            lst = self._list(parent)
+            e = (self._k(key, text if self.sort_col == "#0" else values),
+                 next(self._seq), "")
+            pos = bisect.bisect_left(lst, e)
+            if pos >= len(lst):
+                return "end", (e, pos)
+            return self.tree.index(lst[pos][2]), (e, pos)
+        except (tk.TclError, TypeError):
+            self.invalidate()
+            return default, None
+
+    def inserted(self, parent, iid, slot, key=None):
+        self.note_row(iid, key)
+        self.empty_soon()
+        if slot is None or not self.active():
+            return
+        e, pos = slot
+        lst = self._order.get(parent)
+        if lst is None:
+            return
+        e = (e[0], e[1], iid)
+        lst.insert(pos, e)
+        self._ent[iid] = (parent, e)
+
+    def updated(self, iid, key, values):
+        """A row's values changed: keep it in its sorted place, except the
+        selected row, which stays where the user is looking."""
+        self.note_row(iid, key)
+        if not self.active() or self.sort_col == "#0":
+            return
+        got = self._ent.get(iid)
+        if got is None:
+            self.invalidate()
+            return
+        parent, old = got
+        new_k = self._k(key, values)
+        if new_k == old[0]:
+            return
+        lst = self._order.get(parent)
+        if lst is None:
+            return
+        i = bisect.bisect_left(lst, old)
+        if i >= len(lst) or lst[i][2] != iid:
+            self.invalidate()
+            return
+        del lst[i]
+        e = (new_k, old[1], iid)
+        j = bisect.bisect_left(lst, e)
+        lst.insert(j, e)
+        self._ent[iid] = (parent, e)
+        if j == i:
+            return                    # same neighbours, same place
+        try:
+            if iid in self.tree.selection():
+                self._set_stale(True)
+                return
+            if j + 1 < len(lst):
+                target = self.tree.index(lst[j + 1][2])
+                if self.tree.index(iid) < target:
+                    target -= 1
+            else:
+                target = "end"
+            self.tree.move(iid, parent, target)
+        except tk.TclError:
+            self.invalidate()
+
+    def removed(self, iid):
+        got = self._ent.pop(iid, None)
+        self.dotted.pop(iid, None)
+        self._rel_text.pop(iid, None)
+        if got is not None:
+            parent, e = got
+            lst = self._order.get(parent)
+            if lst is not None:
+                i = bisect.bisect_left(lst, e)
+                if i < len(lst) and lst[i][2] == iid:
+                    del lst[i]
+                else:
+                    self._order.pop(parent, None)
+        self.empty_soon()
+
+    def invalidate(self):
+        """The order lists no longer match the table (rows added or
+        removed elsewhere): rebuilt from the table when next needed."""
+        self._order.clear()
+        self._ent.clear()
+
+    def clear(self):
+        """The table was emptied."""
+        self.invalidate()
+        self.dotted.clear()
+        self._rel_text.clear()
+        self._set_stale(False)
+        self.empty_soon()
+
+    def sort_by(self, col):
+        if not self.sortable:
+            return
+        if self.sort_col == col:
+            self.sort_desc = not self.sort_desc
+        else:
+            self.sort_col, self.sort_desc = col, False
+        self.resort()
+        self.save_soon()
+        if self.on_sort is not None:
+            self.on_sort(col, self.sort_desc)
+
+    def clear_sort(self):
+        self.sort_col, self.sort_desc = None, False
+        self.invalidate()
+        self._arrows()
+        self._set_stale(False)
+        self.save_soon()
+
+    def resort(self):
+        """Put every row in order now (also ends 'order changed')."""
+        self.invalidate()
+        self._set_stale(False)
+        self._arrows()
+        if not self.sort_col:
+            return
+        parents = [""] + [p for p in self.tree.get_children("")
+                          if self.tree.get_children(p)]
+        for parent in parents:
+            lst = self._list(parent)
+            for i, (_k, _s, iid) in enumerate(lst):
+                with contextlib.suppress(tk.TclError):
+                    self.tree.move(iid, parent, i)
+        if not self.sticky:
+            self.invalidate()
+
+    def _arrows(self):
+        for c in ("#0",) + self.columns:
+            with contextlib.suppress(tk.TclError):
+                txt = str(self.tree.heading(c, "text")).rstrip(" ▲▼")
+                if c == self.sort_col:
+                    txt += " ▼" if self.sort_desc else " ▲"
+                self.tree.heading(c, text=txt)
+
+    # ---- overlays: empty state, "order changed" ----------------------------
+    def _build_overlays(self):
+        t = self.app.theme
+        # a child of the table, drawn over its empty body
+        self.empty = tk.Frame(self.tree, bg=t["tab_bg"])
+        self.empty_lbl = tk.Label(self.empty, text="", bg=t["tab_bg"],
+                                  fg=t["muted_fg"], wraplength=420,
+                                  justify="center", font=mw_font(10))
+        self.empty_lbl.pack(padx=12, pady=(10, 4))
+        # the kit sizes this label itself: the automatic re-wrapping (made
+        # for labels laid out by their parents) would narrow it in a loop,
+        # since its frame takes its size from it
+        self.empty_lbl._mw_wrap0 = 0
+        self.empty_lbl._mw_wrapping = True
+        self.empty_btn = ttk.Button(self.empty, text="")
+        self.stale_lbl = tk.Label(
+            self.wrap, text="The order changed while a row was selected. "
+                            "Re-sort", bg=t["tab_bg"], fg=t["accent"],
+            cursor="hand2", anchor="w", font=mw_font(9))
+        self.stale_lbl.bind("<Button-1>", lambda e: self.resort())
+        self.fresh_lbl = tk.Label(self.wrap, text="", bg=t["tab_bg"],
+                                  fg=t["muted_fg"], anchor="w",
+                                  font=mw_font(9))
+
+    def on_theme(self):
+        t = self.app.theme
+        with contextlib.suppress(tk.TclError):
+            self.empty.configure(bg=t["tab_bg"])
+            self.empty_lbl.configure(bg=t["tab_bg"], fg=t["muted_fg"])
+            self.stale_lbl.configure(bg=t["tab_bg"], fg=t["accent"])
+            self.fresh_lbl.configure(bg=t["tab_bg"], fg=t["muted_fg"])
+
+    def _set_stale(self, on):
+        self.stale = on
+        with contextlib.suppress(tk.TclError):
+            if on and not self.stale_lbl.winfo_manager():
+                self.stale_lbl.grid(row=2, column=0, columnspan=2,
+                                    sticky="ew", padx=4)
+            elif not on and self.stale_lbl.winfo_manager():
+                self.stale_lbl.grid_forget()
+
+    def empty_soon(self):
+        if self._empty_job is None:
+            with contextlib.suppress(tk.TclError):
+                self._empty_job = self.tree.after(60, self.update_empty)
+
+    def update_empty(self):
+        self._empty_job = None
+        self._show_fresh()
+        try:
+            has_rows = bool(self.tree.get_children(""))
+        except tk.TclError:
+            return
+        spec = None if has_rows or self.empty_state is None else \
+            self.empty_state()
+        try:
+            if not spec:
+                if self.empty.winfo_manager():
+                    self.empty.place_forget()
+                return
+            text, button, fn = (tuple(spec) + (None, None))[:3]
+            tw, th = self.tree.winfo_width(), self.tree.winfo_height()
+            if not self.tree.winfo_ismapped() or tw <= 1:
+                return                # placed when the table is shown
+            head = tkfont.nametofont("TkHeadingFont").metrics(
+                "linespace") + 14
+            self.empty_lbl.configure(
+                text=text, wraplength=max(160, min(520, tw - 60)))
+            if button and fn:
+                self.empty_btn.configure(text=button, command=fn)
+                if not self.empty_btn.winfo_manager():
+                    self.empty_btn.pack(pady=(0, 10))
+            elif self.empty_btn.winfo_manager():
+                self.empty_btn.pack_forget()
+            # below the headings; the button goes when the table is too
+            # short for both
+            room = th - head - 8
+            need = self.empty_lbl.winfo_reqheight() + 14
+            if self.empty_btn.winfo_manager():
+                if th > 1 and need + self.empty_btn.winfo_reqheight() + \
+                        10 > room:
+                    self.empty_btn.pack_forget()
+                else:
+                    need += self.empty_btn.winfo_reqheight() + 10
+            if th > 1 and need > room:
+                # a table too short for the sentence shows nothing rather
+                # than half of it
+                self.empty.place_forget()
+                return
+            y = head + max(0, (room - need) // 3)
+            self.empty.place(relx=0.5, y=y, anchor="n")
+            self.empty.lift()
+        except tk.TclError:
+            pass
+
+    def empty_text(self):
+        """What the empty state says now ('' when rows are shown)."""
+        with contextlib.suppress(tk.TclError):
+            if self.empty.winfo_manager():
+                return str(self.empty_lbl.cget("text"))
+        return ""
+
+    @staticmethod
+    def filtered(q, clear):
+        """The empty state of a table whose filter matches nothing."""
+        return (f"No rows match “{q}”.", "Clear the filter", clear)
+
+    # ---- rows new since you last looked; relative "last seen" ---------------
+    def fresh(self, key):
+        return self.snapshot is not None and key is not None and \
+            key not in self.snapshot
+
+    def decorate(self, key, values):
+        """The values to show: the dot on new rows, "4 min ago" while live."""
+        if values is None:
+            return values
+        out = None
+        if self.dot_col and self.dot_col != "#0" and self.fresh(key):
+            i = self.col_index.get(self.dot_col)
+            if i is not None and i < len(values):
+                out = list(values)
+                v = str(out[i])
+                if not v.startswith(ROW_DOT):
+                    out[i] = ROW_DOT + v
+        if self.relative and self.app.data_mode == "live":
+            now = time.time()
+            for col, fn in self.relative.items():
+                i = self.col_index.get(col)
+                if i is None or i >= len(values):
+                    continue
+                if out is None:
+                    out = list(values)
+                with contextlib.suppress(Exception):
+                    out[i] = relative_age(fn(key), now)
+        return tuple(out) if out is not None else values
+
+    def decorate_text(self, key, text):
+        if self.dot_col == "#0" and self.fresh(key) and \
+                not str(text).startswith(ROW_DOT):
+            return ROW_DOT + str(text)
+        return text
+
+    def note_row(self, iid, key):
+        """Remember dotted rows so leaving the tab can clear the dots."""
+        if self.dot_col and self.fresh(key) and iid not in self.dotted:
+            self.dotted[iid] = key
+            self.empty_soon()
+
+    def fresh_count(self):
+        return len(self.dotted)
+
+    def _show_fresh(self):
+        n = len(self.dotted)
+        try:
+            if n:
+                self.fresh_lbl.configure(
+                    text=f"{ROW_DOT}{n} new since you last looked")
+                if not self.fresh_lbl.winfo_manager():
+                    self.fresh_lbl.grid(row=3, column=0, columnspan=2,
+                                        sticky="ew", padx=4)
+            elif self.fresh_lbl.winfo_manager():
+                self.fresh_lbl.grid_forget()
+        except tk.TclError:
+            pass
+
+    def on_show(self):
+        self.refresh_relative()
+        self.empty_soon()
+
+    def on_hide(self):
+        """Leaving the tab: what you saw is no longer new."""
+        for iid in list(self.dotted):
+            with contextlib.suppress(tk.TclError):
+                if self.dot_col == "#0":
+                    txt = str(self.tree.item(iid, "text"))
+                    if txt.startswith(ROW_DOT):
+                        self.tree.item(iid, text=txt[len(ROW_DOT):])
+                else:
+                    v = str(self.tree.set(iid, self.dot_col))
+                    if v.startswith(ROW_DOT):
+                        self.tree.set(iid, self.dot_col, v[len(ROW_DOT):])
+        self.dotted.clear()
+        self._show_fresh()
+        if self.all_keys is not None:
+            try:
+                self.snapshot = set(self.all_keys())
+            except Exception:                        # noqa: BLE001
+                self.snapshot = None
+
+    def forget_snapshot(self):
+        """A new capture or session: nothing is 'new since you looked'."""
+        self.snapshot = None
+        self.dotted.clear()
+        self._show_fresh()
+
+    def refresh_relative(self, chunk=400):
+        """Re-word "min ago" cells (only what changed), a slice at a time."""
+        if not self.relative or self.app.data_mode != "live":
+            return
+        try:
+            kids = list(self.tree.get_children(""))
+        except tk.TclError:
+            return
+        now = time.time()
+
+        def run(i=0):
+            for iid in kids[i:i + chunk]:
+                key = self.key_of(iid)
+                if key is None:
+                    continue
+                for col, fn in self.relative.items():
+                    try:
+                        txt = relative_age(fn(key), now)
+                    except Exception:                # noqa: BLE001
+                        continue
+                    seen = self._rel_text.setdefault(iid, {})
+                    if seen.get(col) != txt:
+                        seen[col] = txt
+                        with contextlib.suppress(tk.TclError):
+                            self.tree.set(iid, col, txt)
+            if i + chunk < len(kids):
+                with contextlib.suppress(tk.TclError):
+                    self.tree.after(1, run, i + chunk)
+        run()
+
+    # ---- the clock time behind "4 min ago" ---------------------------------
+    def _motion(self, e):
+        try:
+            iid = self.tree.identify_row(e.y)
+            col = self._col_at(e.x)
+        except tk.TclError:
+            return
+        cell = (iid, col) if iid and col in self.relative and \
+            self.app.data_mode == "live" else None
+        if cell == self._tip_cell:
+            return
+        self._hide_tip()
+        self._tip_cell = cell
+        if cell:
+            with contextlib.suppress(tk.TclError):
+                self._tip_job = self.tree.after(
+                    500, lambda: self._show_tip(e.x_root, e.y_root))
+
+    def _show_tip(self, x, y):
+        self._tip_job = None
+        if not self._tip_cell:
+            return
+        iid, col = self._tip_cell
+        key = self.key_of(iid)
+        try:
+            ts = self.relative[col](key)
+        except Exception:                            # noqa: BLE001
+            return
+        if not ts:
+            return
+        t = Tooltip.theme or THEME_LIGHT
+        try:
+            tip = tk.Toplevel(self.tree)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x + 12}+{y + 16}")
+            tk.Label(tip, text=fmt_clock(ts, True), bg=t["tooltip_bg"],
+                     fg=t["tooltip_fg"], relief="solid", borderwidth=1,
+                     font=mw_font(9), padx=6, pady=3).pack()
+            self._tip = tip
+        except tk.TclError:
+            pass
+
+    def _hide_tip(self):
+        self._tip_cell = None
+        if self._tip_job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.tree.after_cancel(self._tip_job)
+            self._tip_job = None
+        if self._tip is not None:
+            with contextlib.suppress(tk.TclError):
+                self._tip.destroy()
+            self._tip = None
+
+    # ---- copy and export what is shown -------------------------------------
+    def _col_at(self, x):
+        c = self.tree.identify_column(x)
+        if not c or c == "#0":
+            return "#0" if c == "#0" else None
+        try:
+            n = int(c[1:]) - 1
+        except ValueError:
+            return None
+        shown = list(self.tree["displaycolumns"])
+        if not shown or shown[0] == "#all":
+            shown = list(self.columns)
+        return shown[n] if 0 <= n < len(shown) else None
+
+    def visible_cols(self):
+        shown = list(self.tree["displaycolumns"])
+        if not shown or shown[0] == "#all":
+            shown = list(self.columns)
+        tree_col = "tree" in str(self.tree.cget("show"))
+        return (["#0"] if tree_col else []) + shown
+
+    def cell_text(self, iid, col):
+        """A cell as text for copies and exports: no new-row dot, and the
+        clock time instead of "4 min ago"."""
+        key = self.key_of(iid)
+        if col in self.relative:
+            with contextlib.suppress(Exception):
+                ts = self.relative[col](key)
+                return fmt_clock(ts, True) if ts else "—"
+        if col == "#0":
+            v = str(self.tree.item(iid, "text"))
+        else:
+            v = str(self.tree.set(iid, col))
+        if v.startswith(ROW_DOT):
+            v = v[len(ROW_DOT):]
+        return v
+
+    def header_row(self):
+        return [str(self.tree.heading(c, "text")).rstrip(" ▲▼")
+                for c in self.visible_cols()]
+
+    def row_cells(self, iid):
+        return [self.cell_text(iid, c) for c in self.visible_cols()]
+
+    def all_iids(self):
+        out = []
+        for iid in self.tree.get_children(""):
+            out.append(iid)
+            out.extend(self.tree.get_children(iid))
+        return out
+
+    def copy_cell(self, iid, col):
+        if col:
+            copy_to_clipboard(self.app, self.cell_text(iid, col))
+
+    def copy_row(self, iid):
+        copy_to_clipboard(self.app, "\t".join(self.row_cells(iid)))
+
+    def csv_text(self, iids):
+        buf = io.StringIO()
+        w = safe_csv_writer(buf)
+        w.writerow(self.header_row())
+        for iid in iids:
+            w.writerow(self.row_cells(iid))
+        return buf.getvalue()
+
+    def copy_selection(self):
+        sel = list(self.tree.selection())
+        if sel:
+            copy_to_clipboard(self.app, self.csv_text(sel))
+
+    def export(self, path=None, done=None):
+        """This table as you see it (filter, sort, columns) to a CSV file.
+        The rows are read on the Tk thread a slice at a time (Tk may only
+        be used there); the job runner writes the file."""
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                parent=self.app.root, title="Export this table",
+                defaultextension=".csv",
+                initialfile=f"{self.table_id}.csv",
+                filetypes=[("CSV", "*.csv")])
+        if not path:
+            return None
+        iids = self.all_iids()
+        rows = [self.header_row()]
+
+        def read(i=0):
+            for iid in iids[i:i + 300]:
+                with contextlib.suppress(tk.TclError):
+                    rows.append(self.row_cells(iid))
+            if i + 300 < len(iids):
+                self.tree.after(1, read, i + 300)
+            else:
+                self._export_write(path, rows, done)
+        read()
+        return path
+
+    def _export_write(self, path, rows, done):
+        def run(job):
+            buf = io.StringIO()
+            w = safe_csv_writer(buf)
+            for r in rows:
+                w.writerow(r)
+            tmp = path + ".part"
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(buf.getvalue())
+            os.replace(tmp, path)
+            return len(rows) - 1
+
+        def ok(n):
+            self.app.status_var.set(f"Exported {n} rows to {path}")
+            if done is not None:
+                done(path)
+
+        def bad(e):
+            if not isinstance(e, JobCancelled):
+                messagebox.showerror("Export error", str(e),
+                                     parent=self.app.root)
+        return self.app.jobs.submit("table_export", "Exporting the table",
+                                    run, ok, bad)
+
+    # ---- menus --------------------------------------------------------------
+    def _right_click(self, e):
+        try:
+            region = self.tree.identify_region(e.x, e.y)
+        except tk.TclError:
+            return
+        if region == "heading":
+            popup_menu(self.app, e, self.header_items())
+            return "break"
+        iid = self.tree.identify_row(e.y)
+        if not iid:
+            return
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        items = self.row_items(iid, self._col_at(e.x))
+        if items:
+            popup_menu(self.app, e, items)
+        return "break"
+
+    def header_items(self):
+        shown = set(self.shown_cols())
+        cols = []
+        for c in self.columns:
+            title = str(self.tree.heading(c, "text")).rstrip(" ▲▼") or \
+                translate_text("(icon)")
+            cols.append((title, lambda cc=c, on=(c not in shown):
+                         self.set_column_shown(cc, on), True,
+                         c in shown))
+        items = [("Columns", cols), ("Reset columns", self.reset_columns)]
+        if self.sortable and self.sort_col:
+            items.append(("Clear the sort", self.clear_sort))
+        items += [None, ("Export this table…", lambda: self.export())]
+        return items
+
+    def row_items(self, iid, col=None):
+        """Open · Copy ▸ · Filter to this · Show its packets · Go to ▸ ·
+        then the row's own actions, the same order in every table."""
+        key = self.key_of(iid)
+        spec = self.menu(key) if (self.menu and key is not None) else {}
+        spec = spec or {}
+        items = []
+        if spec.get("open"):
+            items.append(("Open", spec["open"]))
+        copy = []
+        if col:
+            copy.append(("Copy cell", lambda: self.copy_cell(iid, col)))
+        copy.append(("Copy row", lambda: self.copy_row(iid)))
+        copy.append(("Copy selected rows as CSV", self.copy_selection))
+        copy += spec.get("copy") or []
+        items.append(("Copy", copy))
+        if spec.get("filter"):
+            items.append(("Filter to this", spec["filter"]))
+        if spec.get("packets") and not self.app.beginner_mode:
+            items.append(("Show its packets", spec["packets"]))
+        goto = [g for g in (spec.get("goto") or []) if g]
+        if goto:
+            items.append(("Go to", goto))
+        own = spec.get("own") or []
+        if own:
+            items.append(None)
+            items += own
+        return items
+
+
+def kit_menu_labels(items):
+    """The top-level labels of a kit menu (tests)."""
+    return [it[0] for it in items if it]
 
 
 # ---- named fonts (5.1.2) -------------------------------------------------------
@@ -24328,19 +25312,40 @@ def themed_menu(app):
 
 
 def popup_menu(app, event, items):
-    """items: list of (label, callback) or None for a separator."""
+    """items: list of (label, callback[, enabled[, checked]]) or None for
+    a separator; (label, [items]) opens a submenu."""
     m = themed_menu(app)
-    for it in items:
-        if it is None:
-            m.add_separator()
-        else:
-            label, cb = it[0], it[1]
-            state = "normal" if (len(it) < 3 or it[2]) else "disabled"
-            m.add_command(label=label, command=cb, state=state)
+    fill_menu(m, items)
     try:
         m.tk_popup(event.x_root, event.y_root)
     finally:
         m.grab_release()
+
+
+def fill_menu(m, items):
+    m._mw_vars = getattr(m, "_mw_vars", [])
+    for it in items:
+        if it is None:
+            m.add_separator()
+            continue
+        label, cb = it[0], it[1]
+        if isinstance(cb, list):
+            sub = tk.Menu(m, tearoff=0)
+            with contextlib.suppress(tk.TclError):
+                sub.configure(**{k: m.cget(k) for k in (
+                    "bg", "fg", "activebackground", "activeforeground")})
+            fill_menu(sub, cb)
+            m.add_cascade(label=label, menu=sub,
+                          state="normal" if cb else "disabled")
+            continue
+        state = "normal" if (len(it) < 3 or it[2]) else "disabled"
+        if len(it) >= 4:
+            var = tk.BooleanVar(master=m, value=bool(it[3]))
+            m._mw_vars.append(var)
+            m.add_checkbutton(label=label, variable=var, command=cb,
+                              state=state)
+        else:
+            m.add_command(label=label, command=cb, state=state)
 
 
 class _SafeCsv:
@@ -25429,6 +26434,17 @@ class FeedTab(BaseTab):
         self.pause_btn = ttk.Button(ctrl, text="⏸  Pause feed",
                                     command=self.toggle_pause)
         self.pause_btn.pack(side="left")
+        ttk.Button(ctrl, text="Jump to now", command=self.jump_to_now).pack(
+            side="left", padx=(6, 0))
+        tk.Label(ctrl, text="   Show only:", bg=WHITE, fg="#333333").pack(
+            side="left")
+        self.q_var = tk.StringVar()
+        qe = ttk.Entry(ctrl, textvariable=self.q_var, width=14)
+        qe.pack(side="left", padx=(4, 0))
+        self._filter_soon = debounce(self.frame, self.refilter, 150)
+        qe.bind("<KeyRelease>", lambda e: self._filter_soon())
+        self.rows = deque(maxlen=500)
+        self.hover = False
         tk.Label(ctrl, text="   “Calm” groups busy moments so they're "
                             "easy to read — “Full speed” shows "
                             "every line as it happens.",
@@ -25438,6 +26454,10 @@ class FeedTab(BaseTab):
         self.hint = tk.Label(self.frame, textvariable=self.hint_var,
                              bg=WHITE, fg="#888888", anchor="w",
                              justify="left", wraplength=900, padx=12)
+        # one line that is always there (a line appearing under the
+        # pointer would move the list it is pointing at)
+        self.hint.pack(fill="x", pady=(0, 4))
+        self.hover_var = self.hint_var
         wrap, self.tree = make_tree(
             self.frame, [("who", "Who", 260, "w", False),
                          ("did", "What they did", 760, "w", True),
@@ -25445,12 +26465,52 @@ class FeedTab(BaseTab):
             sortable=False)
         wrap.pack(fill="both", expand=True)
         self._wrap = wrap
+        # the list holds still while the pointer is over it
+        self.tree.bind("<Enter>", lambda e: self._set_hover(True), add="+")
+        self.tree.bind("<Leave>", lambda e: self._set_hover(False), add="+")
+        self.kit = TableKit(self, self.tree, wrap, "feed",
+                            key_of=lambda iid: iid, menu=self.menu_spec,
+                            sortable=False)
         self.restyle()
         self.refresh()
+
+    def _set_hover(self, on):
+        self.hover = on
+        self.update_pause_label()
+
+    def menu_spec(self, iid):
+        try:
+            who = str(self.tree.set(iid, "who"))
+        except tk.TclError:
+            return {}
+        return {"filter": lambda: (self.q_var.set(who), self.refilter())}
+
+    def _match(self, row):
+        q = self.q_var.get().strip().lower()
+        return not q or q in f"{row[1]} {row[2]}".lower()
+
+    def refilter(self):
+        with contextlib.suppress(tk.TclError):
+            self.tree.delete(*self.tree.get_children())
+            for tag, who, did, when in reversed(
+                    [r for r in self.rows if self._match(r)]):
+                self.tree.insert("", "end", tags=(tag,),
+                                 values=(who, did, when))
+        self.refresh()
+
+    def jump_to_now(self):
+        self.paused = False
+        self.hover = False
+        self.update_pause_label()
+        self.flush()
+        with contextlib.suppress(tk.TclError):
+            self.tree.yview_moveto(0)
 
     def refresh(self):
         """An empty feed says why (it looked broken after opening a file
         or a saved session, which have no live feed)."""
+        if getattr(self, "hover", False) and not self.paused:
+            return                    # the "paused under the pointer" line
         try:
             empty = not self.tree.get_children()
             mode = self.app.data_mode
@@ -25464,10 +26524,6 @@ class FeedTab(BaseTab):
                 text = ("Nothing yet — this feed fills in as soon as "
                         "MiniWireshark is watching and devices do something.")
             self.hint_var.set(text)
-            if text and not self.hint.winfo_manager():
-                self.hint.pack(fill="x", pady=(0, 4), before=self._wrap)
-            elif not text and self.hint.winfo_manager():
-                self.hint.pack_forget()
         except (tk.TclError, AttributeError):
             pass
 
@@ -25500,11 +26556,20 @@ class FeedTab(BaseTab):
             label = "⏸  Pause feed"
         with contextlib.suppress(tk.TclError):
             self.pause_btn.config(text=label)
+        hold = getattr(self, "hover", False) and not self.paused
+        with contextlib.suppress(AttributeError):
+            n = len(self.buffer)
+            if hold:
+                self.hint_var.set(
+                    "Paused while the pointer is over the list — move it "
+                    "away to resume" + (f" ({n} waiting)" if n else ""))
+            else:
+                self.refresh()
 
     def flush(self):
         """Called on the feed's own timer. Returns the next delay in ms."""
         cfg = FEED_SPEEDS.get(self.speed, FEED_SPEEDS[DEFAULT_FEED_SPEED])
-        if self.paused:
+        if self.paused or getattr(self, "hover", False):
             self.update_pause_label()
             return 300
         buf, self.buffer = self.buffer, []
@@ -25515,7 +26580,11 @@ class FeedTab(BaseTab):
             else:
                 rows = [(b["tag"], b["who"], b["did"], b["when"])
                         for b in buf]
-            for tag, who, did, when in rows:
+            for row in rows:
+                self.rows.append(row)
+                if not self._match(row):
+                    continue
+                tag, who, did, when = row
                 with contextlib.suppress(tk.TclError):
                     self.tree.insert("", 0, tags=(tag,),
                                      values=(who, did, when))
@@ -25552,6 +26621,7 @@ class FeedTab(BaseTab):
 
     def reset(self):
         self.buffer.clear()
+        self.rows.clear()
         with contextlib.suppress(tk.TclError):
             self.tree.delete(*self.tree.get_children())
 
@@ -25640,6 +26710,12 @@ class TimelineTab(BaseTab):
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", self._on_double)
         self.refs = {}
+        # always in time order: no column sort here
+        self.kit = TableKit(self, self.tree, wrap, "timeline",
+                            key_of=lambda iid: iid if iid in self.refs
+                            else None,
+                            empty_state=self.empty_state,
+                            menu=self.menu_spec, sortable=False)
         self.pending = []
         self._rebuild_job = None
         self.on_theme()
@@ -25760,6 +26836,7 @@ class TimelineTab(BaseTab):
             for old in kids[1500:]:
                 self.refs.pop(old, None)
             self.tree.delete(*kids[1500:])
+        self.kit.empty_soon()
 
     def _insert(self, e, index="end"):
         icon = self.app.SEVERITY_ICON.get(e["severity"], "•")
@@ -25784,6 +26861,7 @@ class TimelineTab(BaseTab):
         self._rebuild_job = None
         self.tree.delete(*self.tree.get_children())
         self.refs.clear()
+        self.kit.clear()
         self.oldest_ts, self.cursor, self.exhausted = None, None, False
         if self.history_mode():
             self.load_older()
@@ -25801,6 +26879,7 @@ class TimelineTab(BaseTab):
                         return
                 self._insert(e)
         self._update_status()
+        self.kit.empty_soon()
 
     def _insert_episodes(self, rows):
         eps = build_episodes(rows)
@@ -25827,13 +26906,58 @@ class TimelineTab(BaseTab):
             for e in reversed(ep["events"]):
                 self._insert(dict(e, text="    ↳ " + e["text"]))
 
+    def empty_state(self):
+        q = self.search_var.get().strip()
+        if q:
+            return TableKit.filtered(q, lambda: (self.search_var.set(""),
+                                                 self.rebuild()))
+        if self.app.history is None:
+            return ("Only this session is shown. Turn on History to keep "
+                    "earlier days.", "History settings",
+                    lambda: self.app._open_settings("History"))
+        return ("Nothing in this view yet.", None, None)
+
+    def menu_spec(self, iid):
+        e = self.refs.get(iid)
+        if not e:
+            return {}
+        app = self.app
+        ref = e.get("ref") or ()
+        dev_key = e.get("device") or (ref[1] if ref and ref[0] == "device"
+                                      else None)
+        goto = []
+        if dev_key and dev_key in self.model.registry.by_key:
+            goto.append((f"{translate_text('Device')} — "
+                         f"{app.short_device_name(dev_key)}",
+                         lambda: app.goto("device", dev_key)))
+        if ref and ref[0] == "website":
+            goto.append((f"{translate_text('Website')} — {ref[1]}",
+                         lambda: app.goto("websites", ref[1])))
+        dev = self.model.registry.by_key.get(dev_key) if dev_key else None
+
+        def filt():
+            if dev is not None:
+                self.dev_var.set(f"{dev.display_name()}  "
+                                 f"[{dev.ip or dev.mac}]")
+            else:
+                self.search_var.set(e.get("kind") or "")
+            self.rebuild()
+        spec = {"open": lambda: self._open_event(e), "filter": filt,
+                "goto": goto}
+        if dev is not None:
+            spec["packets"] = lambda: app.goto(
+                "packets", f'device:"{dev.ip or dev.mac}"')
+        return spec
+
     def _on_double(self, _e=None):
         sel = self.tree.selection()
         if not sel:
             return
         e = self.refs.get(sel[0])
-        if not e:
-            return
+        if e:
+            self._open_event(e)
+
+    def _open_event(self, e):
         ref = e.get("ref")
         st = self.app.history
         this_session = e.get("live", True) is not False or (
@@ -25852,6 +26976,7 @@ class TimelineTab(BaseTab):
     def reset(self):
         self.tree.delete(*self.tree.get_children())
         self.refs.clear()
+        self.kit.clear()
         self.oldest_ts, self.cursor, self.exhausted = None, None, False
 
 
@@ -25893,7 +27018,9 @@ class DevicesTab(BaseTab):
         self.filter_var = tk.StringVar()
         fe = ttk.Entry(bar, textvariable=self.filter_var, width=18)
         fe.pack(side="left", padx=4)
-        fe.bind("<KeyRelease>", lambda e: self.rebuild())
+        # 5.1.2: the table follows 150 ms after the last key, not on each
+        self._filter_soon = debounce(self.frame, self.rebuild, 150)
+        fe.bind("<KeyRelease>", lambda e: self._filter_soon())
         ttk.Button(bar, text="Merge devices…",
                    command=self.merge_dialog).pack(side="right")
         ttk.Button(bar, text="Details", command=self._details).pack(
@@ -25905,17 +27032,80 @@ class DevicesTab(BaseTab):
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", lambda e: self._details())
         self.tree.bind("<Return>", lambda e: self._details())
-        self.tree.bind("<Button-3>", self._context)
-        self.tree.bind("<Button-2>", self._context)
         self.iids = IidMap()
+        dev = self._dev
+        self.kit = TableKit(
+            self, self.tree, wrap, "devices",
+            key_of=lambda iid: key_for_iid(self.iids, iid),
+            empty_state=self.empty_state, default_cols=self.default_cols,
+            sort_values={
+                "traffic": lambda k: dev(k, lambda d: d.bytes_up +
+                                         d.bytes_down),
+                "packets": lambda k: dev(k, lambda d: d.packets)},
+            relative={"last": lambda k: dev(k, lambda d: d.last_seen)},
+            dot_col="name", menu=self.menu_spec,
+            all_keys=lambda: list(self.model.registry.by_key))
         self.apply_mode()
 
-    def apply_mode(self):
+    def _dev(self, key, fn):
+        d = self.model.registry.by_key.get(key)
+        return fn(d) if d is not None else None
+
+    def default_cols(self):
+        """Beginner's shorter column set is the default, not a lock: the
+        heading's right-click menu shows any column."""
         cols = [c[0] for c in self.COLS]
         if self.app.beginner_mode:
             cols = [c for c in cols if c not in ("ipv6", "packets")]
-        with contextlib.suppress(tk.TclError):
-            self.tree.configure(displaycolumns=cols)
+        return cols
+
+    def apply_mode(self):
+        self.kit.apply_columns()
+
+    def empty_state(self):
+        q = self.filter_var.get().strip()
+        if q:
+            return TableKit.filtered(q, lambda: (self.filter_var.set(""),
+                                                 self.rebuild()))
+        app = self.app
+        if self.model.registry.by_key:
+            return ("No devices to show. Offline and expired devices are "
+                    "hidden.", "Show offline", lambda: (
+                        self.show_inactive_var.set(True),
+                        self.show_expired_var.set(True),
+                        self._vis_changed()))
+        if app.data_mode in ("offline", "session"):
+            return ("No devices in this file.", "Return to live capture",
+                    app._return_to_live)
+        if app.data_mode == "live":
+            return ("No devices yet. They appear as soon as they send "
+                    "something on your network.", None, None)
+        return ("No devices yet. They appear as soon as they send "
+                "something on your network.", "Start watching",
+                lambda: app.start())
+
+    def menu_spec(self, key):
+        dev = self.model.registry.by_key.get(key)
+        if dev is None:
+            return {}
+        app = self.app
+        moved = ("Details", "Filter packets to this device", "Copy IP",
+                 "Copy MAC")
+        own = [it for it in app.device_menu_items(dev)
+               if it is None or it[0] not in moved]
+        while own and own[0] is None:
+            own.pop(0)
+        ident = dev.ip or dev.mac
+        return {
+            "open": lambda: app.show_device(key),
+            "copy": [("Copy IP", lambda: copy_to_clipboard(app, dev.ip),
+                      bool(dev.ip)),
+                     ("Copy MAC", lambda: copy_to_clipboard(app, dev.mac),
+                      bool(dev.mac))],
+            "filter": lambda: (self.filter_var.set(ident), self.rebuild()),
+            "packets": lambda: app.goto("packets", f'device:"{ident}"'),
+            "goto": [("Its websites", lambda: app.show_websites_of(key))],
+            "own": own}
 
     def _vis_changed(self):
         cfg = self.app.config
@@ -25967,9 +27157,10 @@ class DevicesTab(BaseTab):
         for key in keys:
             dev = reg.by_key.get(key)
             if dev is None or not self._visible(dev):
-                tree_remove(self.tree, self.iids, key)
+                tree_remove(self.tree, self.iids, key, kit=self.kit)
                 continue
-            tree_upsert(self.tree, self.iids, key, self.values(dev))
+            tree_upsert(self.tree, self.iids, key, self.values(dev),
+                        kit=self.kit)
         self._count()
 
     def rekey(self, old, new):
@@ -25978,6 +27169,7 @@ class DevicesTab(BaseTab):
             if new in self.iids:
                 with contextlib.suppress(tk.TclError):
                     self.tree.delete(iid)
+                self.kit.removed(iid)
             else:
                 self.iids[new] = iid
 
@@ -25991,6 +27183,7 @@ class DevicesTab(BaseTab):
         my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
+        self.kit.clear()
         keys = list(self.model.registry.by_key)
         for i in range(0, len(keys), 150):
             if i:
@@ -26042,17 +27235,7 @@ class DevicesTab(BaseTab):
             self.app.show_device(keys[0])
 
     def _context(self, event):
-        iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
-        if iid not in self.tree.selection():
-            self.tree.selection_set(iid)
-        key = key_for_iid(self.iids, iid)
-        dev = self.model.registry.by_key.get(key)
-        if dev is None:
-            return
-        app = self.app
-        popup_menu(app, event, app.device_menu_items(dev))
+        return self.kit._right_click(event)
 
     def merge_dialog(self):
         keys = self.selected_keys()
@@ -26070,6 +27253,7 @@ class DevicesTab(BaseTab):
     def reset(self):
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
+        self.kit.clear()
         self._count()
 
 
@@ -26106,6 +27290,7 @@ class WebsitesTab(BaseTab):
         self.dev_var = tk.StringVar(value="All devices")
         self.dev_box = self._combo(bar, "Device:", self.dev_var,
                                    ["All devices"], 20)
+        self.sort_box = None
         self.dev_box.bind("<Button-1>", lambda e: self.dev_box.configure(
             values=self.device_choices()), add="+")
         self.src_var = tk.StringVar(value="Any source")
@@ -26124,18 +27309,30 @@ class WebsitesTab(BaseTab):
                     ["Any category", "Advertising", "Analytics", "Tracking",
                      "Social", "CDN", "Content", "Uncategorised"], 13)
         self.sort_var = tk.StringVar(value="Most contacted")
-        self._combo(bar, "Sort:", self.sort_var, list(self.SORTS), 13)
+        self.sort_box = self._combo(bar, "Sort:", self.sort_var,
+                                    list(self.SORTS), 13)
+        # choosing a sort here replaces a sort set by a column heading
+        self.sort_box.bind("<<ComboboxSelected>>",
+                           lambda e: (self.kit.clear_sort(), self.rebuild()))
         wrap, self.tree = make_tree(self.frame, self.COLS,
                                     show="tree headings")
         self.tree.heading("#0", text="Website (grouped by main domain)")
         self.tree.column("#0", width=280, stretch=True)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", self._details)
-        self.tree.bind("<Button-3>", self._context)
-        self.tree.bind("<Button-2>", self._context)
         self.iid_to_key = {}
         self.key_to_iid = {}
         self.group_iid = {}
+        self.group_last = {}
+        self.kit = TableKit(
+            self, self.tree, wrap, "websites",
+            key_of=lambda iid: self.iid_to_key.get(iid),
+            empty_state=self.empty_state,
+            sort_values={"traffic": lambda k: self._site_num(k, "bytes"),
+                         "hits": lambda k: self._site_num(k, "requests"),
+                         "first": lambda k: self._site_num(k, "first_seen")},
+            relative={"last": self._site_last}, dot_col="#0",
+            menu=self.menu_spec, all_keys=self._all_keys)
         self._job = None
         self._dirty = False
         self.count_lbl = self.lbl(bar, "", muted=True)
@@ -26148,6 +27345,74 @@ class WebsitesTab(BaseTab):
         cb.pack(side="left", padx=(4, 8))
         cb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
         return cb
+
+    def _site_num(self, key, attr):
+        kind, name = key
+        if kind == "site":
+            w = self.model.websites.get(name)
+            return getattr(w, attr) if w is not None else None
+        members = self.group_members.get(name, ())
+        vals = [getattr(w, attr) for w in members]
+        if not vals:
+            return None
+        return min(vals) if attr == "first_seen" else sum(vals)
+
+    def _site_last(self, key):
+        kind, name = key
+        if kind == "site":
+            w = self.model.websites.get(name)
+            return w.last_seen if w is not None else None
+        return self.group_last.get(name)
+
+    def _all_keys(self):
+        out = [("site", d) for d in self.model.websites]
+        out += [("group", w.registrable or w.domain)
+                for w in self.model.websites.values()]
+        return out
+
+    def _filters_on(self):
+        return (self.dev_var.get() != "All devices" or
+                self.src_var.get() != "Any source" or
+                self.ev_var.get() != "Any evidence" or
+                self.enc_var.get() != "Any" or
+                self.cat_var.get() != "Any category")
+
+    def clear_filters(self):
+        self.q_var.set("")
+        self.dev_var.set("All devices")
+        self.src_var.set("Any source")
+        self.ev_var.set("Any evidence")
+        self.enc_var.set("Any")
+        self.cat_var.set("Any category")
+        self.rebuild()
+
+    def empty_state(self):
+        q = self.q_var.get().strip()
+        if q:
+            return TableKit.filtered(q, self.clear_filters)
+        if self._filters_on():
+            return ("No websites match these filters.", "Clear the filters",
+                    self.clear_filters)
+        return ("No websites yet. Names appear when a device looks one up "
+                "or connects.", None, None)
+
+    def menu_spec(self, key):
+        kind, dom = key
+        app = self.app
+        spec = {"copy": [("Copy domain", lambda: copy_to_clipboard(app, dom))],
+                "filter": lambda: self.set_filter(dom),
+                "packets": lambda: app.goto("packets", f"site:{dom}"),
+                "own": [("Show contacting devices",
+                         lambda: app.show_website_devices(dom)),
+                        ("Show remote hosts",
+                         lambda: app.goto("remote", dom))]}
+        if kind == "site":
+            spec["open"] = lambda: app.show_website(dom)
+        else:
+            iid = self.group_iid.get(dom)
+            spec["open"] = lambda: self.tree.item(
+                iid, open=not self.tree.item(iid, "open")) if iid else None
+        return spec
 
     def schedule(self):
         if self._job:
@@ -26232,6 +27497,9 @@ class WebsitesTab(BaseTab):
         self.iid_to_key.clear()
         self.key_to_iid.clear()
         self.group_iid.clear()
+        self.group_last.clear()
+        self.group_members = {}
+        self.kit.clear()
         dev_key = self.device_key_from_choice(self.dev_var.get())
         recs = [w for w in self.model.websites.values()
                 if self._match(w, dev_key)]
@@ -26254,12 +27522,18 @@ class WebsitesTab(BaseTab):
                 if len(members) == 1 and members[0].domain == reg:
                     self._row("", members[0])
                     continue
-                agg = self._agg(members)
-                giid = self.tree.insert("", "end", text=f"{reg}  "
-                                        f"({len(members)})", values=agg,
+                self.group_members[reg] = members
+                self.group_last[reg] = max(w.last_seen for w in members)
+                key = ("group", reg)
+                agg = self.kit.decorate(key, self._agg(members))
+                text = self.kit.decorate_text(key, f"{reg}  "
+                                                   f"({len(members)})")
+                idx, slot = self.kit.insert_index("", key, agg, text=text)
+                giid = self.tree.insert("", idx, text=text, values=agg,
                                         open=False)
                 self.group_iid[reg] = giid
-                self.iid_to_key[giid] = ("group", reg)
+                self.iid_to_key[giid] = key
+                self.kit.inserted("", giid, slot, key)
                 for w in self._sorted(members)[:300]:
                     self._row(giid, w)
         else:
@@ -26303,10 +27577,14 @@ class WebsitesTab(BaseTab):
                 fmt_clock(max(w.last_seen for w in members)), "", "")
 
     def _row(self, parent, w):
-        iid = self.tree.insert(parent, "end", text=w.domain,
-                               values=self._values(w))
-        self.iid_to_key[iid] = ("site", w.domain)
+        key = ("site", w.domain)
+        vals = self.kit.decorate(key, self._values(w))
+        text = self.kit.decorate_text(key, w.domain)
+        idx, slot = self.kit.insert_index(parent, key, vals, text=text)
+        iid = self.tree.insert(parent, idx, text=text, values=vals)
+        self.iid_to_key[iid] = key
         self.key_to_iid[w.domain] = iid
+        self.kit.inserted(parent, iid, slot, key)
 
     def update_keys(self, keys):
         """Incremental: update rows that exist; anything new triggers a
@@ -26319,8 +27597,11 @@ class WebsitesTab(BaseTab):
             if iid is None:
                 self._dirty = True
                 continue
+            key = ("site", k)
+            vals = self.kit.decorate(key, self._values(w))
             with contextlib.suppress(tk.TclError):
-                self.tree.item(iid, values=self._values(w))
+                self.tree.item(iid, values=vals)
+                self.kit.updated(iid, key, vals)
 
     def refresh(self):
         if self._dirty and self.is_visible() and self._job is None:
@@ -26340,26 +27621,7 @@ class WebsitesTab(BaseTab):
             self.app.show_website(k[1])
 
     def _context(self, event):
-        iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
-        self.tree.selection_set(iid)
-        k = self.iid_to_key.get(iid)
-        if not k:
-            return
-        dom = k[1]
-        app = self.app
-        items = []
-        if k[0] == "site":
-            items.append(("Details", lambda: app.show_website(dom)))
-        items += [("Copy domain", lambda: copy_to_clipboard(app, dom)),
-                  ("Filter to this site", lambda: self.set_filter(dom)),
-                  ("Show contacting devices",
-                   lambda: app.show_website_devices(dom)),
-                  ("Show remote hosts", lambda: app.goto("remote", dom)),
-                  ("Show its packets", lambda: app.goto("packets",
-                                                        f"site:{dom}"))]
-        popup_menu(app, event, items)
+        return self.kit._right_click(event)
 
     def select(self, dom):
         self.q_var.set("")
@@ -26381,6 +27643,7 @@ class WebsitesTab(BaseTab):
         self.iid_to_key.clear()
         self.key_to_iid.clear()
         self.group_iid.clear()
+        self.kit.clear()
 
 
 # ---- Connections (Advanced) ---------------------------------------------------
@@ -26434,7 +27697,8 @@ class ConnectionsTab(BaseTab):
         self.q_var = tk.StringVar()
         e = ttk.Entry(bar, textvariable=self.q_var, width=16)
         e.pack(side="left", padx=(4, 8))
-        e.bind("<KeyRelease>", lambda ev: self.rebuild())
+        self._filter_soon = debounce(self.frame, self.rebuild, 150)
+        e.bind("<KeyRelease>", lambda ev: self._filter_soon())
         self.dev_var = tk.StringVar(value="All devices")
         self.lbl(bar, "Device:").pack(side="left")
         self.dev_box = ttk.Combobox(bar, textvariable=self.dev_var, width=22,
@@ -26450,25 +27714,149 @@ class ConnectionsTab(BaseTab):
                                   "Not encrypted"], state="readonly")
         sb.pack(side="left", padx=(4, 8))
         sb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
+        self.group_var = tk.StringVar(value=self.app.config.get(
+            "connections.group_by", "None"))
+        self.lbl(bar, "Group by:").pack(side="left")
+        gb = ttk.Combobox(bar, textvariable=self.group_var, width=9,
+                          values=list(self.GROUPS), state="readonly")
+        gb.pack(side="left", padx=(4, 8))
+        gb.bind("<<ComboboxSelected>>", lambda e: self._group_changed())
         self.tech_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="Technical columns", variable=self.tech_var,
-                        command=self.apply_mode).pack(side="left")
+                        command=self._tech_changed).pack(side="left")
         self.count_lbl = self.lbl(bar, "", muted=True)
         self.count_lbl.pack(side="right")
         wrap, self.tree = make_tree(self.frame, self.COLS, hscroll=True)
+        self.tree.heading("#0", text="Group")
+        self.tree.column("#0", width=230, stretch=False)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", self._details)
-        self.tree.bind("<Button-3>", self._context)
-        self.tree.bind("<Button-2>", self._context)
         self.iids = IidMap()
+        self.group_rows = {}         # parent iid -> (kind, group key)
+        self._group_dirty = False
+        self._group_built = 0.0
+        flow = self._flow
+        self.kit = TableKit(
+            self, self.tree, wrap, "connections",
+            key_of=self._key_of, empty_state=self.empty_state,
+            default_cols=self.default_cols,
+            sort_values={"up": lambda k: flow(k, "bytes_out"),
+                         "down": lambda k: flow(k, "bytes_in"),
+                         "dur": lambda k: flow(k, "duration"),
+                         "packets": lambda k: flow(k, "packets"),
+                         "id": lambda k: k if isinstance(k, int) else None},
+            menu=self.menu_spec)
+        self._apply_grouping()
         self.apply_mode()
 
-    def apply_mode(self):
-        cols = [c[0] for c in self.COLS]
+    GROUPS = ("None", "Device", "Website")
+
+    def _flow(self, key, attr):
+        f = self.model.flows.get(key) if isinstance(key, int) else None
+        return getattr(f, attr) if f is not None else None
+
+    def _key_of(self, iid):
+        g = self.group_rows.get(iid)
+        if g is not None:
+            return g
+        return key_for_iid(self.iids, iid)
+
+    def default_cols(self):
         if not self.tech_var.get():
-            cols = list(self.BEGINNER)
+            return list(self.BEGINNER)
+        return [c[0] for c in self.COLS]
+
+    def _tech_changed(self):
+        # the checkbox picks a column set: it replaces columns chosen by
+        # hand (widths stay)
+        self.kit._cols_override = None
+        self.kit.apply_columns()
+        self.kit.save_soon()
+
+    def apply_mode(self):
+        self.kit.apply_columns()
+
+    def grouping(self):
+        g = self.group_var.get()
+        return g if g in ("Device", "Website") else None
+
+    def _apply_grouping(self):
         with contextlib.suppress(tk.TclError):
-            self.tree.configure(displaycolumns=cols)
+            self.tree.configure(show="tree headings" if self.grouping()
+                                else "headings")
+
+    def _group_changed(self):
+        self.app.config.set("connections.group_by", self.group_var.get())
+        self.app.config.save()
+        self._apply_grouping()
+        self.rebuild()
+
+    def empty_state(self):
+        q = self.q_var.get().strip()
+        clear = lambda: (self.q_var.set(""), self.status_var.set("All"),  # noqa: E731
+                         self.dev_var.set("All devices"), self.rebuild())
+        if q:
+            return TableKit.filtered(q, clear)
+        if self.status_var.get() != "All" or \
+                self.dev_var.get() != "All devices":
+            return ("No connections match these filters.",
+                    "Clear the filters", clear)
+        if self.app.beginner_mode and self.app.config.get(
+                "connections.hide_short_beginner", True):
+            return ("No connections in this view. Short ones are hidden in "
+                    "Beginner.", "Show short connections",
+                    self._show_short)
+        return ("No connections yet.", None, None)
+
+    def _show_short(self):
+        self.app.config.set("connections.hide_short_beginner", False)
+        self.app.config.save()
+        self.rebuild()
+
+    def menu_spec(self, key):
+        app = self.app
+        if isinstance(key, tuple):              # a group row
+            kind, gk = key
+            iid = next((i for i, g in self.group_rows.items() if g == key),
+                       None)
+            label = self.tree.item(iid, "text") if iid else str(gk)
+            spec = {"open": lambda: self.tree.item(
+                        iid, open=not self.tree.item(iid, "open"))
+                    if iid else None,
+                    "copy": [("Copy name", lambda: copy_to_clipboard(
+                        app, label))]}
+            if kind == "device" and gk:
+                spec["filter"] = lambda: self.set_filter(text="",
+                                                         device_key=gk)
+                spec["goto"] = [(f"{translate_text('Device')} — {label}",
+                                 lambda: app.goto("device", gk))]
+            elif kind == "website" and gk:
+                spec["filter"] = lambda: self.set_filter(text=gk)
+                spec["goto"] = [(f"{translate_text('Website')} — {gk}",
+                                 lambda: app.goto("websites", gk))]
+            return spec
+        f = self.model.flows.get(key)
+        if f is None:
+            return {}
+        goto = []
+        if f.device_key:
+            goto.append((f"{translate_text('Device')} — "
+                         f"{app.short_device_name(f.device_key)}",
+                         lambda: app.goto("device", f.device_key)))
+        if f.domain:
+            goto.append((f"{translate_text('Website')} — {f.domain}",
+                         lambda: app.goto("websites", f.domain)))
+        if f.remote_public:
+            goto.append((f"{translate_text('Internet host')} — "
+                         f"{f.remote_ip}",
+                         lambda: app.goto("remote", f.remote_ip)))
+        return {"open": lambda: app.show_flow(key),
+                "copy": [("Copy remote address", lambda: copy_to_clipboard(
+                    app, f"{f.remote_ip}:{f.remote_port}"))],
+                "filter": lambda: self.set_filter(
+                    text=f.domain or f.remote_ip),
+                "packets": lambda: app.goto("packets", f"stream:{key}"),
+                "goto": goto}
 
     def set_filter(self, text=None, device_key=None):
         if text is not None:
@@ -26548,16 +27936,30 @@ class ConnectionsTab(BaseTab):
             return
         dev_key = self.device_key_from_choice(self.dev_var.get())
         q = self.q_var.get().strip().lower()
+        if self.grouping():
+            # grouped: rows already shown update in place; new ones come
+            # with the next regrouping (at most every 3 s)
+            for fid in fids:
+                f = self.model.flows.get(fid)
+                iid = self.iids.get(fid)
+                if f is None or iid is None:
+                    if f is not None and self._match(f, dev_key, q):
+                        self._group_dirty = True
+                    continue
+                with contextlib.suppress(tk.TclError):
+                    self.tree.item(iid, values=self.values(f))
+            return
         for fid in fids:
             f = self.model.flows.get(fid)
             if f is None or not self._match(f, dev_key, q):
-                tree_remove(self.tree, self.iids, fid)
+                tree_remove(self.tree, self.iids, fid, kit=self.kit)
                 continue
             tree_upsert(self.tree, self.iids, fid, self.values(f),
-                        index=0 if fid not in self.iids else "end")
+                        index=0 if fid not in self.iids else "end",
+                        kit=self.kit)
         if len(self.iids) > 3000:
             for fid in sorted(self.iids)[:len(self.iids) - 3000]:
-                tree_remove(self.tree, self.iids, fid)
+                tree_remove(self.tree, self.iids, fid, kit=self.kit)
         self.count_lbl.configure(text=f"{len(self.iids)} shown")
 
     def refresh(self):
@@ -26566,20 +27968,74 @@ class ConnectionsTab(BaseTab):
         if getattr(self, "_pending", False) and self.is_visible():
             self._pending = False
             self.rebuild()
+        elif self._group_dirty and self.is_visible() and \
+                time.monotonic() - self._group_built > 3:
+            self.rebuild()
 
     def rebuild(self):
         for _ in self.rebuild_steps():
             pass
 
+    def _group_of(self, f):
+        if self.grouping() == "Device":
+            return ("device", f.device_key or ""), (
+                self.app.short_device_name(f.device_key) if f.device_key
+                else f.local_ip)
+        reg = registrable_domain(f.domain) if f.domain else ""
+        return ("website", reg), (reg or translate_text("(no name seen)"))
+
+    def _group_values(self, flows):
+        up = sum(f.bytes_out for f in flows)
+        down = sum(f.bytes_in for f in flows)
+        n_open = sum(1 for f in flows if not f.closed)
+        vals = [""] * len(self.COLS)
+        idx = {c[0]: i for i, c in enumerate(self.COLS)}
+        vals[idx["to"]] = translate_text(f"{len(flows)} connections")
+        vals[idx["up"]] = _human_bytes(up)
+        vals[idx["down"]] = _human_bytes(down)
+        vals[idx["status"]] = translate_text(f"{n_open} open")
+        vals[idx["packets"]] = sum(f.packets for f in flows)
+        return vals
+
     def rebuild_steps(self):
         my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
+        self.group_rows.clear()
+        self.kit.clear()
+        self._group_dirty = False
+        self._group_built = time.monotonic()
         dev_key = self.device_key_from_choice(self.dev_var.get())
         q = self.q_var.get().strip().lower()
         flows = [f for f in self.model.flows.all_flows()
                  if self._match(f, dev_key, q)]
         flows.sort(key=lambda f: -f.last_seen)
+        if self.grouping():
+            groups, names = OrderedDict(), {}
+            for f in flows[:3000]:
+                gk, name = self._group_of(f)
+                groups.setdefault(gk, []).append(f)
+                names[gk] = name
+            done = 0
+            for gk, members in groups.items():
+                if done >= 200:
+                    done = 0
+                    yield
+                    if self._fill_gen != my:
+                        return
+                giid = self.tree.insert(
+                    "", "end", text=f"{names[gk]}  ({len(members)})",
+                    values=self._group_values(members), open=False)
+                self.group_rows[giid] = gk
+                for f in members:
+                    self.iids[f.fid] = self.tree.insert(
+                        giid, "end", values=self.values(f))
+                done += len(members) + 1
+            if self.kit.sort_col:
+                self.kit.resort()
+            self.kit.empty_soon()
+            self.count_lbl.configure(text=f"{len(self.iids)} shown")
+            return
         for i, f in enumerate(flows[:3000]):
             if i and i % 200 == 0:
                 self.count_lbl.configure(text=f"{len(self.iids)} shown")
@@ -26587,7 +28043,9 @@ class ConnectionsTab(BaseTab):
                 if self._fill_gen != my:
                     return
             # appended after rows that arrived while filling
-            tree_upsert(self.tree, self.iids, f.fid, self.values(f))
+            tree_upsert(self.tree, self.iids, f.fid, self.values(f),
+                        kit=self.kit)
+        self.kit.empty_soon()
         self.count_lbl.configure(text=f"{len(self.iids)} shown")
 
     def select(self, fid):
@@ -26599,6 +28057,9 @@ class ConnectionsTab(BaseTab):
         iid = self.iids.get(fid)
         if iid:
             with contextlib.suppress(tk.TclError):
+                parent = self.tree.parent(iid)
+                if parent:
+                    self.tree.item(parent, open=True)
                 self.tree.selection_set(iid)
                 self.tree.see(iid)
 
@@ -26616,35 +28077,13 @@ class ConnectionsTab(BaseTab):
             self.app.show_flow(fid)
 
     def _context(self, event):
-        iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
-        self.tree.selection_set(iid)
-        fid = key_for_iid(self.iids, iid)
-        f = self.model.flows.get(fid)
-        if f is None:
-            return
-        app = self.app
-        items = [("Details", lambda: app.show_flow(fid)),
-                 ("Copy remote address",
-                  lambda: copy_to_clipboard(app, f"{f.remote_ip}:"
-                                                 f"{f.remote_port}")),
-                 ("Show its packets", lambda: app.goto("packets",
-                                                       f"stream:{fid}"))]
-        if f.device_key:
-            items.append(("Go to device", lambda: app.goto("device",
-                                                           f.device_key)))
-        if f.domain:
-            items.append(("Go to website", lambda: app.goto("websites",
-                                                            f.domain)))
-        if f.remote_public:
-            items.append(("Go to remote host", lambda: app.goto(
-                "remote", f.remote_ip)))
-        popup_menu(app, event, items)
+        return self.kit._right_click(event)
 
     def reset(self):
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
+        self.group_rows.clear()
+        self.kit.clear()
         self.mail.reset()
 
 
@@ -26865,7 +28304,8 @@ class RemoteTab(BaseTab):
         self.q_var = tk.StringVar()
         e = ttk.Entry(geo, textvariable=self.q_var, width=16)
         e.pack(side="left", padx=4)
-        e.bind("<KeyRelease>", lambda ev: self.rebuild())
+        self._filter_soon = debounce(self.frame, self.rebuild, 150)
+        e.bind("<KeyRelease>", lambda ev: self._filter_soon())
         self.status_var = DisplayVar()
         tk.Label(self.frame, textvariable=self.status_var, bg=WHITE,
                  fg="#666666", justify="left", anchor="w", wraplength=1100,
@@ -26873,9 +28313,54 @@ class RemoteTab(BaseTab):
         wrap, self.tree = make_tree(self.frame, self.COLS)
         wrap.pack(fill="both", expand=True, padx=6, pady=(4, 6))
         self.tree.bind("<Double-1>", self._details)
-        self.tree.bind("<Button-3>", self._context)
-        self.tree.bind("<Button-2>", self._context)
         self.iids = IidMap()
+        host = self._host
+        self.kit = TableKit(
+            self, self.tree, wrap, "remote",
+            key_of=lambda iid: key_for_iid(self.iids, iid),
+            empty_state=self.empty_state,
+            # the name, not the flag in front of it
+            sort_values={
+                "country": lambda k: host(k, lambda r: r.country_name or
+                                          r.country or ""),
+                "asn": lambda k: host(k, lambda r: r.org or ""),
+                "traffic": lambda k: host(k, lambda r: r.bytes_total),
+                "first": lambda k: host(k, lambda r: r.first_seen)},
+            relative={"last": lambda k: host(k, lambda r: r.last_seen)},
+            menu=self.menu_spec)
+
+    def _host(self, ip, fn):
+        r = self.model.remote_hosts.get(ip)
+        return fn(r) if r is not None else None
+
+    def empty_state(self):
+        q = self.q_var.get().strip()
+        if q:
+            return TableKit.filtered(q, lambda: self.set_filter(""))
+        return ("No Internet hosts yet. They appear when a device talks to "
+                "a public address.", None, None)
+
+    def menu_spec(self, ip):
+        r = self.model.remote_hosts.get(ip)
+        if r is None:
+            return {}
+        app = self.app
+        return {
+            "open": lambda: app.show_remote(ip),
+            "copy": [("Copy IP", lambda: copy_to_clipboard(app, ip))],
+            "filter": lambda: self.set_filter(ip),
+            "packets": lambda: app.goto("packets", ip),
+            "goto": [(f"{translate_text('Website')} — {r.domain}",
+                      lambda: app.goto("websites", r.domain))]
+            if r.domain else [],
+            "own": [("Show devices that contacted it",
+                     lambda: app.show_remote(ip)),
+                    ("Show domain associations",
+                     lambda: app.goto("websites", r.domain) if r.domain else
+                     app._set_banner("No website names were seen for this "
+                                     "address.")),
+                    ("Show its connections",
+                     lambda: app.goto("connections", ip))]}
 
     def _match(self, r):
         q = self.q_var.get().strip().lower()
@@ -26909,9 +28394,10 @@ class RemoteTab(BaseTab):
         for ip in ips:
             r = self.model.remote_hosts.get(ip)
             if r is None or not self._match(r):
-                tree_remove(self.tree, self.iids, ip)
+                tree_remove(self.tree, self.iids, ip, kit=self.kit)
                 continue
-            tree_upsert(self.tree, self.iids, ip, self.values(r))
+            tree_upsert(self.tree, self.iids, ip, self.values(r),
+                        kit=self.kit)
 
     def refresh(self):
         self.status_var.set(self.app._geoip_status_text())
@@ -26927,6 +28413,7 @@ class RemoteTab(BaseTab):
         my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
+        self.kit.clear()
         recs = sorted(self.model.remote_hosts.values(),
                       key=lambda r: -r.bytes_total)
         for i, r in enumerate(recs[:5000]):
@@ -26935,7 +28422,9 @@ class RemoteTab(BaseTab):
                 if self._fill_gen != my:
                     return
             if self._match(r):
-                tree_upsert(self.tree, self.iids, r.ip, self.values(r))
+                tree_upsert(self.tree, self.iids, r.ip, self.values(r),
+                            kit=self.kit)
+        self.kit.empty_soon()
 
     def set_filter(self, text):
         self.q_var.set(text or "")
@@ -26963,32 +28452,12 @@ class RemoteTab(BaseTab):
                 self.app.show_remote(ip)
 
     def _context(self, event):
-        iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
-        self.tree.selection_set(iid)
-        ip = key_for_iid(self.iids, iid)
-        r = self.model.remote_hosts.get(ip)
-        if r is None:
-            return
-        app = self.app
-        popup_menu(app, event, [
-            ("Details", lambda: app.show_remote(ip)),
-            ("Copy IP", lambda: copy_to_clipboard(app, ip)),
-            ("Filter to this host", lambda: self.set_filter(ip)),
-            ("Show devices that contacted it",
-             lambda: app.show_remote(ip)),
-            ("Show domain associations",
-             lambda: app.goto("websites", r.domain) if r.domain else
-             app._set_banner("No website names were seen for this "
-                             "address.")),
-            ("Show its connections",
-             lambda: app.goto("connections", ip)),
-        ])
+        return self.kit._right_click(event)
 
     def reset(self):
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
+        self.kit.clear()
 
 
 
@@ -27028,12 +28497,25 @@ class AlertsTab(BaseTab):
                          command=lambda: self.app.investigate("bandwidth"))
         inv["menu"] = menu
         inv.pack(side="left", padx=(12, 0))
-        for label, fn in (("Copy report", self.copy_report),
-                          ("Go to related", self.goto_related),
-                          ("Mute for this device", self.mute_device),
+        self.lbl(bar, "  Search:").pack(side="left")
+        self.q_var = tk.StringVar()
+        qe = ttk.Entry(bar, textvariable=self.q_var, width=14)
+        qe.pack(side="left", padx=4)
+        self._filter_soon = debounce(self.frame, self.rebuild, 150)
+        qe.bind("<KeyRelease>", lambda e: self._filter_soon())
+        # 5.1.2: three buttons; the rest are under More and in the
+        # right-click menu, all still there
+        more = ttk.Menubutton(bar, text="More ▾")
+        mm = tk.Menu(more, tearoff=False)
+        for label, fn in (("Mark expected", self.mark_expected),
                           ("Mute this type", self.mute_type),
-                          ("Mark expected", self.mark_expected),
-                          ("Acknowledge", self.acknowledge),
+                          ("Mute for this device", self.mute_device),
+                          ("Go to related", self.goto_related),
+                          ("Copy report", self.copy_report)):
+            mm.add_command(label=label, command=fn)
+        more["menu"] = mm
+        more.pack(side="right", padx=(4, 0))
+        for label, fn in (("Acknowledge", self.acknowledge),
                           ("Details", self._details)):
             ttk.Button(bar, text=label, command=fn).pack(side="right",
                                                          padx=(4, 0))
@@ -27049,10 +28531,63 @@ class AlertsTab(BaseTab):
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", self._details)
         self.tree.bind("<Return>", self._details)
-        self.tree.bind("<Button-3>", self._context)
-        self.tree.bind("<Button-2>", self._context)
         self.iids = IidMap()
+        alert = self._alert
+        self.kit = TableKit(
+            self, self.tree, wrap, "alerts",
+            key_of=lambda iid: key_for_iid(self.iids, iid),
+            empty_state=self.empty_state,
+            sort_values={"count": lambda k: alert(k, lambda a: a.count)},
+            relative={"when": lambda k: alert(
+                k, lambda a: a.last_seen or a.when)},
+            dot_col="reason", menu=self.menu_spec,
+            all_keys=lambda: list(self.model.alerts.alerts))
         self.on_theme()
+
+    def _alert(self, aid, fn):
+        a = self.model.alerts.alerts.get(aid)
+        return fn(a) if a is not None else None
+
+    def empty_state(self):
+        q = self.q_var.get().strip()
+        if q:
+            return TableKit.filtered(q, lambda: (self.q_var.set(""),
+                                                 self.rebuild()))
+        if self.model.alerts.alerts:
+            return ("No alerts match these filters.", "Show all",
+                    self._show_all)
+        return ("Nothing unusual so far. That is good news, not a sign that "
+                "checks are off.", "Alert settings",
+                lambda: self.app._open_settings("Alerts"))
+
+    def _show_all(self):
+        self.q_var.set("")
+        self.show_ack_var.set(True)
+        self.sev_var.set("All")
+        self.rebuild()
+
+    def menu_spec(self, aid):
+        a = self.model.alerts.alerts.get(aid)
+        if a is None:
+            return {}
+        app = self.app
+        dev = self.model.registry.by_key.get(a.device_key)
+        who = dev.display_name() if dev else ""
+        spec = {"open": lambda: app.show_alert(aid),
+                "copy": [("Copy report", self.copy_report)],
+                "filter": lambda: (self.q_var.set(who or a.reason),
+                                   self.rebuild()),
+                "own": [("Acknowledge", self.acknowledge),
+                        ("Mark expected", self.mark_expected),
+                        ("Mute this alert type", self.mute_type),
+                        ("Mute for this device", self.mute_device), None,
+                        ("Go to related item", self.goto_related)]}
+        if dev is not None:
+            spec["packets"] = lambda: app.goto(
+                "packets", f'device:"{dev.ip or dev.mac}"')
+            spec["goto"] = [(f"{translate_text('Device')} — {who}",
+                             lambda: app.goto("device", dev.key))]
+        return spec
 
     def on_theme(self):
         for sev, (fg, bg) in self.app._severity_colors().items():
@@ -27068,6 +28603,14 @@ class AlertsTab(BaseTab):
             return False
         if self.sev_var.get() != "All" and a.severity != self.sev_var.get():
             return False
+        q = self.q_var.get().strip().lower() if hasattr(self, "q_var") \
+            else ""
+        if q:
+            dev = self.model.registry.by_key.get(a.device_key)
+            hay = " ".join([a.reason, a.kind, a.device_key,
+                            dev.display_name() if dev else ""]).lower()
+            if q not in hay:
+                return False
         return True
 
     def values(self, a):
@@ -27083,11 +28626,11 @@ class AlertsTab(BaseTab):
 
     def upsert(self, a):
         if not self._visible(a):
-            tree_remove(self.tree, self.iids, a.id)
+            tree_remove(self.tree, self.iids, a.id, kit=self.kit)
             return
         tags = ("ack",) if a.acknowledged else (a.severity,)
         tree_upsert(self.tree, self.iids, a.id, self.values(a), tags=tags,
-                    index=0)
+                    index=0, kit=self.kit)
 
     def rebuild(self):
         for _ in self.rebuild_steps():
@@ -27097,6 +28640,7 @@ class AlertsTab(BaseTab):
         my = self._fill_gen = getattr(self, "_fill_gen", 0) + 1
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
+        self.kit.clear()
         for i, aid in enumerate(list(reversed(self.model.alerts.order))):
             if i and i % 200 == 0:
                 yield
@@ -27167,22 +28711,12 @@ class AlertsTab(BaseTab):
             copy_to_clipboard(self.app, self.app.alert_text(sel[0]))
 
     def _context(self, event):
-        iid = self.tree.identify_row(event.y)
-        if not iid:
-            return
-        if iid not in self.tree.selection():
-            self.tree.selection_set(iid)
-        popup_menu(self.app, event, [
-            ("Details", self._details), ("Acknowledge", self.acknowledge),
-            ("Mark expected", self.mark_expected),
-            ("Mute this alert type", self.mute_type),
-            ("Mute for this device", self.mute_device), None,
-            ("Go to related item", self.goto_related),
-            ("Copy report", self.copy_report)])
+        return self.kit._right_click(event)
 
     def reset(self):
         self.tree.delete(*self.tree.get_children())
         self.iids.clear()
+        self.kit.clear()
 
 
 # ---- Network map v2 ----------------------------------------------------------
@@ -31844,7 +33378,8 @@ class JobRunner:
     # cycle collector): it is paused while they run. Its full pass over the
     # session being saved or the JSON just read took 90-130 ms holding the
     # GIL, a freeze of the window, and found nothing such a job made.
-    NO_GC = ("session_save", "journal", "pcap_save", "session_load")
+    NO_GC = ("session_save", "journal", "pcap_save", "session_load",
+             "table_export")
 
     def submit(self, kind, title, run, done=None, failed=None):
         if kind in self.active:
@@ -32263,7 +33798,9 @@ class MiniWireshark:
         mono = tkfont.nametofont("TkFixedFont").copy()
         mono.configure(size=9)
         self.mono = mono
+        self.kits = []                # every TableKit (5.1.2 M3)
         self._build_ui()
+        self.root.after(TableKit.REL_EVERY, self._kits_tick)
         self._populate_ifaces()
         self._apply_theme()
         self._apply_text_size(defer=False)
@@ -32437,6 +33974,8 @@ class MiniWireshark:
             self.worker.reset()
         if self.rdns is not None:
             self.rdns.cache = model.cache
+        for kit in getattr(self, "kits", ()):
+            kit.forget_snapshot()     # a new source: nothing is "new"
         for tab in self.tabs.values():
             try:
                 tab.reset()
@@ -32699,6 +34238,18 @@ class MiniWireshark:
     def _on_tab_changed(self, _e=None):
         with contextlib.suppress(AttributeError):
             self.tabstrip.sync()
+        cur = self.current_tab_name()
+        prev = getattr(self, "_shown_tab_name", None)
+        if cur != prev:
+            self._shown_tab_name = cur
+            for kit in getattr(self, "kits", ()):
+                try:
+                    if kit.tab.name == prev:
+                        kit.on_hide()        # what you saw is not new now
+                    elif kit.tab.name == cur:
+                        kit.on_show()
+                except tk.TclError:
+                    pass
         # 5.1.2: the switch is drawn first and the new tab filled 1 ms
         # later, so the click answers at once even on a slow refresh
         job = getattr(self, "_tab_refresh_job", None)
@@ -32706,6 +34257,17 @@ class MiniWireshark:
             with contextlib.suppress(tk.TclError):
                 self.root.after_cancel(job)
         self._tab_refresh_job = self.root.after(1, self._refresh_shown_tab)
+
+    def _kits_tick(self):
+        """Every 20 s: "4 min ago" cells of the shown table move on."""
+        try:
+            if not self.minimized():
+                for kit in self.kits:
+                    if kit.tab.is_visible():
+                        kit.refresh_relative()
+        finally:
+            with contextlib.suppress(tk.TclError):
+                self.root.after(TableKit.REL_EVERY, self._kits_tick)
 
     def _refresh_shown_tab(self):
         self._tab_refresh_job = None
@@ -34927,6 +36489,8 @@ class MiniWireshark:
         for tab in self.tabs.values():
             with contextlib.suppress(tk.TclError):
                 tab.on_theme()
+        for kit in getattr(self, "kits", ()):
+            kit.on_theme()
         if hasattr(self, "inspector"):
             self.inspector.on_theme()
             self.inspector.refresh()
@@ -37301,6 +38865,14 @@ class MiniWireshark:
             ("Export device report…", lambda: self.export_report(
                 "device", k)),
         ]
+
+    def show_websites_of(self, key):
+        tab = self._select_tab("websites")
+        dev = self.model.registry.by_key.get(key)
+        if dev is not None:
+            tab.q_var.set("")
+            tab.dev_var.set(f"{dev.display_name()}  [{dev.ip or dev.mac}]")
+            tab.rebuild()
 
     def goto_connections_for(self, key):
         tab = self._select_tab("connections")
@@ -53846,6 +55418,174 @@ def gt_m2_background(app, ctx):
     _gui_pump(root, 1.0)
 
 
+@gui_test_step("5.1.2 M3: table kit (sort that holds, columns, menus, empty "
+               "states, export, new rows)")
+def gt_m3_table_kit(app, ctx):
+    root = app.root
+    reg = app.model.registry
+    dt = app.tabs["devices"]
+    app._select_tab("devices")
+    dt.show_inactive_var.set(True)
+    dt.show_expired_var.set(True)
+    dt._vis_changed()
+    _gui_pump(root, 0.3)
+    kit = dt.kit
+    kit.clear_sort()
+    rnd = random.Random(7)
+    # sorted by traffic (descending) while 300 updates arrive: stays sorted
+    kit.sort_by("traffic")
+    kit.sort_by("traffic")
+    assert kit.sort_col == "traffic" and kit.sort_desc
+    keys = list(dt.iids)
+    assert len(keys) >= 3, keys
+    dt.tree.selection_set(())
+
+    def traffic_order():
+        return [kit._raw_key(key_for_iid(dt.iids, i), None, "traffic")
+                for i in dt.tree.get_children("")]
+    for _ in range(300):
+        k = keys[rnd.randrange(len(keys))]
+        reg.by_key[k].bytes_down += rnd.randrange(0, 5000000)
+        dt.update_keys([k])
+    got = traffic_order()
+    assert got == sorted(got, reverse=True), "the sorted list fell out of order"
+    # the selected row stays where you are looking; "order changed" shows
+    last = dt.tree.get_children("")[-1]
+    dt.tree.selection_set(last)
+    reg.by_key[key_for_iid(dt.iids, last)].bytes_down += 10 ** 13
+    dt.update_keys([key_for_iid(dt.iids, last)])
+    assert dt.tree.get_children("")[-1] == last, "the selected row moved"
+    _gui_pump(root, 0.1)
+    assert kit.stale and kit.stale_lbl.winfo_manager(), "no re-sort line"
+    kit.resort()
+    assert dt.tree.get_children("")[0] == last and not kit.stale
+    dt.tree.selection_set(())
+    # hide two columns, "restart": still hidden (and the sort is kept);
+    # Reset columns gives the defaults back
+    kit.set_column_shown("vendor", False)
+    kit.set_column_shown("mac", False)
+    kit.save()
+    saved = AppConfig(path=app.config.path).get("appearance.tables")
+    assert "vendor" not in saved["devices"]["cols"], saved
+    kit._cols_override = "unset"
+    kit.sort_col = None
+    kit.load()
+    shown = list(dt.tree["displaycolumns"])
+    assert "vendor" not in shown and "mac" not in shown, shown
+    assert kit.sort_col == "traffic" and kit.sort_desc
+    kit.reset_columns()
+    assert list(dt.tree["displaycolumns"]) == dt.default_cols()
+    # the switch off is 5.0.2: no remembered columns or sort
+    kit.set_column_shown("vendor", False)
+    FEATURES["sticky_sort"] = False
+    try:
+        kit._cols_override = "unset"
+        assert kit.user_cols is None
+    finally:
+        FEATURES["sticky_sort"] = True
+    kit.reset_columns()
+    # every main table's menu: Open, Copy, Filter to this, in that order
+    app.mode_ui_var.set("Advanced")
+    app._on_ui_mode_change()
+    for name in ("devices", "websites", "connections", "remote", "alerts",
+                 "timeline"):
+        tab = app.tabs[name]
+        app._select_tab(name)
+        tab.rebuild()
+        _gui_pump(root, 0.1)
+        kids = tab.tree.get_children("")
+        assert kids, f"{name}: no rows to test the menu on"
+        labels = kit_menu_labels(tab.kit.row_items(kids[0], None))
+        assert labels[:3] == ["Open", "Copy", "Filter to this"], \
+            (name, labels)
+    # a heading's menu: columns, reset, export
+    hl = kit_menu_labels(kit.header_items())
+    assert hl[:2] == ["Columns", "Reset columns"] and \
+        "Export this table…" in hl, hl
+    # 300 upserts into a sorted 1,500-row table
+    top = tk.Toplevel(root)
+    try:
+        wrap, tree = make_tree(top, [("name", "Name", 120, "w", True),
+                                     ("n", "Number", 80, "e", False)])
+        wrap.pack(fill="both", expand=True)
+        fake = types.SimpleNamespace(app=app, name="(test)",
+                                     is_visible=lambda: False)
+        iids = IidMap()
+        k2 = TableKit(fake, tree, wrap, "(test)",
+                      key_of=lambda i: key_for_iid(iids, i))
+        k2.save_soon = lambda: None
+        for i in range(1500):
+            tree_upsert(tree, iids, i, (f"row {i}", rnd.randrange(10 ** 6)),
+                        kit=k2)
+        k2.sort_by("n")
+        t0 = time.perf_counter()
+        for _ in range(300):
+            i = rnd.randrange(1500)
+            tree_upsert(tree, iids, i, (f"row {i}", rnd.randrange(10 ** 6)),
+                        kit=k2)
+        took = (time.perf_counter() - t0) * 1000
+        vals = [int(tree.set(x, "n")) for x in tree.get_children("")]
+        assert vals == sorted(vals), "bisect placement broke the order"
+        print(f"      300 sorted upserts into 1,500 rows: {took:.1f} ms",
+              flush=True)
+        slack = float(os.environ.get("MW_SLOW", "1") or 1)
+        assert took < 30 * slack, f"{took:.1f} ms for 300 upserts"
+        app.kits.remove(k2)
+    finally:
+        top.destroy()
+    # empty states
+    app._select_tab("devices")
+    _gui_pump(root, 0.3)
+    dt.filter_var.set("zzz-no-such-device")
+    dt.rebuild()
+    _gui_pump(root, 0.3)
+    assert "No rows match" in kit.empty_text(), kit.empty_text()
+    dt.filter_var.set("")
+    dt.rebuild()
+    _gui_pump(root, 0.3)
+    assert kit.empty_text() == ""
+    # export this table: the rows as shown, clock times
+    path = ctx.path("devices.csv")
+    done = []
+    assert kit.export(path, done=done.append) is not None
+    _gui_pump(root, 0.1, until=lambda: done, timeout=30)
+    with open(path, encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == kit.header_row(), rows[0]
+    assert len(rows) == 1 + len(kit.all_iids()), len(rows)
+    # new since you last looked; "just now" while live
+    mode = app.data_mode
+    app.data_mode = "live"
+    try:
+        kit.on_hide()
+        new = reg.touch("192.168.1.250", "da:00:00:00:99:01", "mac_local",
+                        "test")
+        dt.update_keys([new.key])
+        iid = dt.iids.get(new.key)
+        assert iid and str(dt.tree.set(iid, "name")).startswith(ROW_DOT)
+        assert kit.fresh_count() == 1
+        rel = str(dt.tree.set(iid, "last"))
+        assert rel == relative_age(new.last_seen, time.time()), rel
+        assert kit.cell_text(iid, "last") == fmt_clock(new.last_seen, True)
+        kit.on_hide()
+        assert not str(dt.tree.set(iid, "name")).startswith(ROW_DOT)
+    finally:
+        kit.forget_snapshot()
+        app.data_mode = mode
+    kit.clear_sort()
+    kit.reset_columns()
+    # the feed holds still under the pointer
+    ft = app.tabs["feed"]
+    ft._set_hover(True)
+    ft.push([{"tag": "other", "who": "test", "did": "something",
+              "when": "now"}])
+    ft.flush()
+    assert ft.buffer and ft.hover_var.get(), "the feed did not hold"
+    ft._set_hover(False)
+    ft.flush()
+    assert not ft.buffer
+
+
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
 # Labels that change with the state of the row a menu was opened on are
 # folded to one name, so the snapshot does not depend on which row was first.
@@ -53856,7 +55596,31 @@ REACHABLE_ALTERNATES = {
     "Stop Demo Mode": "Try Demo Mode",
 }
 # Old entry -> its new name, for actions a later milestone renames or moves.
-REACHABLE_RENAMES = {}
+REACHABLE_RENAMES = {
+    # M3: every table menu starts Open · Copy ▸ · Filter to this ·
+    # Show its packets · Go to ▸
+    "rowmenu:alerts:Details": "rowmenu:alerts:Open",
+    "rowmenu:alerts:Copy report": "rowmenu:alerts:Copy > Copy report",
+    "rowmenu:connections:Details": "rowmenu:connections:Open",
+    "rowmenu:connections:Copy remote address":
+        "rowmenu:connections:Copy > Copy remote address",
+    "rowmenu:connections:Go to device":
+        "rowmenu:connections:Go to > Device — …",
+    "rowmenu:connections:Go to website":
+        "rowmenu:connections:Go to > Website — …",
+    "rowmenu:connections:Go to remote host":
+        "rowmenu:connections:Go to > Internet host — …",
+    "rowmenu:devices:Details": "rowmenu:devices:Open",
+    "rowmenu:devices:Copy IP": "rowmenu:devices:Copy > Copy IP",
+    "rowmenu:devices:Copy MAC": "rowmenu:devices:Copy > Copy MAC",
+    "rowmenu:remote:Copy IP": "rowmenu:remote:Copy > Copy IP",
+    "rowmenu:websites:Copy domain": "rowmenu:websites:Copy > Copy domain",
+    "rowmenu:devices:Filter packets to this device":
+        "rowmenu:devices:Show its packets",
+    "rowmenu:remote:Details": "rowmenu:remote:Open",
+    "rowmenu:remote:Filter to this host": "rowmenu:remote:Filter to this",
+    "rowmenu:websites:Filter to this site": "rowmenu:websites:Filter to this",
+}
 # Menu entries that exist only in some states (a file open, an autosave
 # present); they are not part of the comparison.
 REACHABLE_CONDITIONAL = {
@@ -53884,6 +55648,8 @@ def _menu_labels(menu, seen=None):
             label = str(menu.entrycget(i, "label"))
             # "Go to device: Alex-iPhone" -> "Go to device: …" (data-made)
             label = re.sub(r"^(Go to [a-z ]+): .+$", "\\1: …", label)
+            label = re.sub(r"^(Device|Website|Internet host) — .+$",
+                           "\\1 — …", label)
             out.append(REACHABLE_ALTERNATES.get(label, label))
             if kind == "cascade":
                 sub = menu.nametowidget(menu.entrycget(i, "menu"))
