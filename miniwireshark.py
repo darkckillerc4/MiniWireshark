@@ -21654,6 +21654,164 @@ Forward ¦ Suivant ¦ Adelante
 Explain inline (on / off) ¦ Explications en ligne (activer / désactiver) ¦ Explicaciones en línea (activar / desactivar)
 Each fact and how it is known ¦ Chaque fait et comment il est connu ¦ Cada dato y cómo se sabe
 ★ not shown: most devices are new this hour ¦ ★ non affichées : la plupart des appareils sont nouveaux cette heure ¦ ★ no se muestran: la mayoría de los dispositivos son nuevos en esta hora
+What is this? ¦ Qu'est-ce que c'est ? ¦ ¿Qué es esto?
+This page explains what I've seen on your network in plain English. Nothing leaves your computer — everything here is based on packets I've captured. ¦ Cette page explique simplement ce que j'ai vu sur votre réseau. Rien ne quitte votre ordinateur — tout ici repose sur les paquets que j'ai capturés. ¦ Esta página explica con palabras sencillas lo que he visto en su red. Nada sale de su ordenador: todo lo que aparece aquí se basa en los paquetes que he capturado.
+Your gateway / router ¦ Votre passerelle / box ¦ Su puerta de enlace / router
+I couldn't detect your router yet. Start watching and then open a website — I'll figure it out. ¦ Je n'ai pas encore détecté votre box. Lancez l'observation puis ouvrez un site web — je la trouverai. ¦ Aún no he detectado su router. Empiece a observar y abra un sitio web: lo averiguaré.
+Device identity checks (ARP) ¦ Vérification de l'identité des appareils (ARP) ¦ Comprobación de la identidad de los dispositivos (ARP)
+If you didn't just restart your router, disconnect from this Wi-Fi and check your router's admin page from a device you trust. ¦ Si vous ne venez pas de redémarrer votre box, déconnectez-vous de ce Wi-Fi et vérifiez la page d'administration de la box depuis un appareil de confiance. ¦ Si no acaba de reiniciar el router, desconéctese de esta Wi-Fi y revise la página de administración del router desde un dispositivo de confianza.
+Your router's address has stayed consistent — no signs of ARP spoofing so far. ¦ L'adresse de votre box n'a pas changé — aucun signe d'usurpation ARP pour l'instant. ¦ La dirección de su router no ha cambiado: ninguna señal de suplantación ARP por ahora.
+Watching for this once I know where your router is. ¦ Je surveillerai cela dès que je saurai où se trouve votre box. ¦ Lo vigilaré en cuanto sepa dónde está su router.
+This is usually harmless — phones and laptops often rotate their Wi-Fi address for privacy, and a device reconnecting can pick up the same IP as before. It's only worth worrying about if it happens a lot, all at once, right when something on your network starts acting strangely. ¦ C'est généralement sans danger — les téléphones et les ordinateurs portables changent souvent d'adresse Wi-Fi pour préserver la confidentialité, et un appareil qui se reconnecte peut reprendre la même IP qu'avant. Cela ne mérite d'inquiétude que si cela arrive souvent, d'un coup, au moment précis où quelque chose sur votre réseau commence à se comporter bizarrement. ¦ Normalmente no es nada: los teléfonos y portátiles cambian a menudo su dirección Wi-Fi por privacidad, y un dispositivo que se reconecta puede recibir la misma IP que antes. Solo merece preocuparse si ocurre mucho, todo a la vez, justo cuando algo en su red empieza a comportarse de forma extraña.
+Who is handing out addresses (DHCP)? ¦ Qui distribue les adresses (DHCP) ? ¦ ¿Quién reparte las direcciones (DHCP)?
+No DHCP activity seen yet. ¦ Aucune activité DHCP vue pour l'instant. ¦ Aún no se ha visto actividad DHCP.
+Normally only your router does this. More than one usually means either a second router plugged into the network by mistake, or — less commonly — a rogue DHCP server. If a device you don't recognize is on that list, unplug it and check your network. ¦ Normalement, seule votre box le fait. Plusieurs signifient en général soit qu'un second routeur a été branché par erreur sur le réseau, soit — plus rarement — qu'un serveur DHCP pirate est présent. Si un appareil que vous ne reconnaissez pas figure dans cette liste, débranchez-le et vérifiez votre réseau. ¦ Normalmente solo lo hace su router. Más de uno suele significar que se conectó por error un segundo router a la red o, con menos frecuencia, que hay un servidor DHCP no autorizado. Si en la lista hay un dispositivo que no reconoce, desconéctelo y revise su red.
+Unusual, but not necessarily bad — some home setups use a separate DHCP server on purpose. ¦ Inhabituel, mais pas forcément grave — certaines installations domestiques utilisent volontairement un serveur DHCP séparé. ¦ Poco habitual, pero no necesariamente malo: algunas instalaciones domésticas usan a propósito un servidor DHCP aparte.
+Who is doing your DNS lookups (finding website addresses)? ¦ Qui fait vos recherches DNS (trouver l'adresse des sites) ? ¦ ¿Quién hace sus búsquedas DNS (encontrar las direcciones de los sitios)?
+No DNS traffic seen yet. Open a website and check again. ¦ Aucun trafic DNS vu pour l'instant. Ouvrez un site web et revenez voir. ¦ Aún no se ha visto tráfico DNS. Abra un sitio web y vuelva a mirar.
+This is the normal setup at home: your router looks up websites on your behalf. Whatever DNS service your router uses (often your ISP's, sometimes a custom one), that's what you get. ¦ C'est l'installation habituelle à la maison : votre box recherche les sites pour vous. Quel que soit le service DNS qu'utilise votre box (souvent celui de votre fournisseur, parfois un autre), c'est celui-là que vous obtenez. ¦ Es la configuración habitual en casa: su router busca los sitios web por usted. Sea cual sea el servicio DNS que use su router (a menudo el de su proveedor, a veces otro), es el que usted obtiene.
+This is unusual unless you set up a Pi-hole, AdGuard Home, or a similar DNS filter. If you didn't set that up, someone might have added a device to your Wi-Fi. ¦ C'est inhabituel, sauf si vous avez installé un Pi-hole, AdGuard Home ou un filtre DNS similaire. Sinon, quelqu'un a peut-être ajouté un appareil à votre Wi-Fi. ¦ Es poco habitual, salvo que haya instalado un Pi-hole, AdGuard Home o un filtro DNS parecido. Si no lo hizo usted, puede que alguien haya añadido un dispositivo a su Wi-Fi.
+This means a device on your Wi-Fi is bypassing your router's DNS and asking a public DNS provider directly. It usually means either: (a) the device has a custom DNS setting, or (b) your router itself was configured to use this DNS service. On its own, this isn't dangerous — it's a choice about privacy and speed. ¦ Cela signifie qu'un appareil de votre Wi-Fi contourne le DNS de votre box et interroge directement un fournisseur DNS public. En général : (a) l'appareil a un réglage DNS personnalisé, ou (b) votre box elle-même est configurée pour utiliser ce service DNS. En soi, ce n'est pas dangereux — c'est un choix de confidentialité et de vitesse. ¦ Significa que un dispositivo de su Wi-Fi se salta el DNS del router y pregunta directamente a un proveedor DNS público. Suele significar que: (a) el dispositivo tiene una configuración DNS propia, o (b) el propio router está configurado para usar ese servicio DNS. Por sí solo no es peligroso: es una elección de privacidad y velocidad.
+I don't recognize this DNS server. It might be your ISP, or a company VPN, or something unusual. If you didn't set this up yourself, it's worth checking your router's settings. ¦ Je ne reconnais pas ce serveur DNS. Il peut s'agir de votre fournisseur, d'un VPN d'entreprise ou de quelque chose d'inhabituel. Si vous ne l'avez pas configuré vous-même, vérifiez les réglages de votre box. ¦ No reconozco este servidor DNS. Puede ser su proveedor, una VPN de empresa o algo poco habitual. Si no lo configuró usted, conviene revisar los ajustes del router.
+Encrypted DNS (DoH) — the private option ¦ DNS chiffré (DoH) — l'option confidentielle ¦ DNS cifrado (DoH): la opción privada
+Encrypted-DNS detection is turned off in Settings. ¦ La détection du DNS chiffré est désactivée dans les Paramètres. ¦ La detección de DNS cifrado está desactivada en la Configuración.
+Encrypted DNS (DoH) hides your website lookups even from your router. It's good for privacy, but it also means I can't see your browsing history. That's fine — I just want you to know it's happening. ¦ Le DNS chiffré (DoH) cache vos recherches de sites même à votre box. C'est bon pour la confidentialité, mais cela veut aussi dire que je ne vois pas votre historique de navigation. Ce n'est pas un problème — je veux juste que vous le sachiez. ¦ El DNS cifrado (DoH) oculta sus búsquedas de sitios incluso a su router. Es bueno para la privacidad, pero también significa que no puedo ver su historial de navegación. No pasa nada: solo quiero que lo sepa.
+No encrypted DNS detected so far. Website lookups are visible in plain text on your network. ¦ Aucun DNS chiffré détecté pour l'instant. Les recherches de sites sont visibles en clair sur votre réseau. ¦ Por ahora no se ha detectado DNS cifrado. Las búsquedas de sitios se ven en texto claro en su red.
+Unencrypted web traffic ¦ Trafic web non chiffré ¦ Tráfico web sin cifrar
+These send the web page contents in plain text. Anyone on the same Wi-Fi could read them. Modern sites use https:// which is encrypted. If you see a lot of these, it might be an old website or an app that needs updating. ¦ Elles envoient le contenu des pages en clair. N'importe qui sur le même Wi-Fi pourrait le lire. Les sites modernes utilisent https://, qui est chiffré. Si vous en voyez beaucoup, il s'agit peut-être d'un vieux site ou d'une application à mettre à jour. ¦ Envían el contenido de las páginas en texto claro. Cualquiera en la misma Wi-Fi podría leerlo. Los sitios modernos usan https://, que está cifrado. Si ve muchas, puede ser un sitio antiguo o una aplicación que necesita actualizarse.
+No unencrypted web traffic seen so far. ¦ Aucun trafic web non chiffré vu pour l'instant. ¦ Por ahora no se ha visto tráfico web sin cifrar.
+Other unencrypted protocols ¦ Autres protocoles non chiffrés ¦ Otros protocolos sin cifrar
+Telnet, FTP, plain POP3/IMAP and similar protocols send everything — sometimes including passwords — without encryption. Prefer their secure versions. ¦ Telnet, FTP, POP3/IMAP sans chiffrement et les protocoles similaires envoient tout — parfois même les mots de passe — sans chiffrement. Préférez leurs versions sécurisées. ¦ Telnet, FTP, POP3/IMAP sin cifrar y protocolos parecidos lo envían todo (a veces incluso las contraseñas) sin cifrar. Use sus versiones seguras.
+No Telnet, FTP or other unencrypted logins seen. ¦ Aucune connexion Telnet, FTP ou autre connexion non chiffrée vue. ¦ No se han visto inicios de sesión Telnet, FTP ni otros sin cifrar.
+What I can and can't see ¦ Ce que je peux voir et ce que je ne peux pas voir ¦ Lo que puedo ver y lo que no
+That's privacy technology working as intended. MiniWireshark never tries to decrypt anything; it reports only what is visible. ¦ C'est la technologie de confidentialité qui fonctionne comme prévu. MiniWireshark n'essaie jamais de déchiffrer quoi que ce soit ; il ne rapporte que ce qui est visible. ¦ Es la tecnología de privacidad funcionando como debe. MiniWireshark nunca intenta descifrar nada; solo informa de lo que es visible.
+Nothing is currently hiding website names from me. ¦ Rien ne me cache actuellement le nom des sites. ¦ Ahora mismo nada me oculta los nombres de los sitios.
+For secure (https) sites I see only the site name — never the pages, searches or passwords. ¦ Pour les sites sécurisés (https), je ne vois que le nom du site — jamais les pages, les recherches ni les mots de passe. ¦ De los sitios seguros (https) solo veo el nombre del sitio, nunca las páginas, las búsquedas ni las contraseñas.
+Traffic may be encrypted inside a VPN tunnel, so MiniWireshark can see less about individual Internet destinations. ¦ Le trafic peut être chiffré dans un tunnel VPN, donc MiniWireshark voit moins de choses sur chaque destination Internet. ¦ El tráfico puede ir cifrado dentro de un túnel VPN, así que MiniWireshark ve menos de cada destino de Internet.
+The VPN server is not counted as a website you visited. ¦ Le serveur VPN n'est pas compté comme un site que vous avez visité. ¦ El servidor VPN no se cuenta como un sitio que haya visitado.
+Advertising & tracking domains (informational) ¦ Domaines de publicité et de pistage (pour information) ¦ Dominios de publicidad y rastreo (informativo)
+Being on a tracker list doesn't make a domain malicious — it describes what the service is used for. Nothing is blocked. ¦ Figurer sur une liste de pisteurs ne rend pas un domaine malveillant — cela décrit à quoi sert le service. Rien n'est bloqué. ¦ Estar en una lista de rastreadores no hace malicioso a un dominio: describe para qué se usa el servicio. No se bloquea nada.
+No listed tracker domains seen yet. ¦ Aucun domaine de pistage répertorié vu pour l'instant. ¦ Aún no se ha visto ningún dominio de rastreo de la lista.
+Devices on your Wi-Fi ¦ Appareils sur votre Wi-Fi ¦ Dispositivos en su Wi-Fi
+No local devices seen yet. ¦ Aucun appareil local vu pour l'instant. ¦ Aún no se ha visto ningún dispositivo local.
+Their MAC addresses don't match any known manufacturer. This is common for cheap IoT devices, phones with privacy MAC randomization, and some virtual machines. Check the Devices tab to see them. ¦ Leurs adresses MAC ne correspondent à aucun fabricant connu. C'est courant pour les objets connectés bon marché, les téléphones qui changent leur adresse MAC pour la confidentialité et certaines machines virtuelles. Consultez l'onglet Appareils pour les voir. ¦ Sus direcciones MAC no coinciden con ningún fabricante conocido. Es habitual en dispositivos IoT baratos, teléfonos que cambian su MAC por privacidad y algunas máquinas virtuales. Véalos en la pestaña Dispositivos.
+Every device I've seen can be identified. ¦ Tous les appareils que j'ai vus peuvent être identifiés. ¦ Todos los dispositivos que he visto se pueden identificar.
+This computer: programs that accept connections ¦ Cet ordinateur : programmes qui acceptent des connexions ¦ Este ordenador: programas que aceptan conexiones
+Usually fine (file sharing, games, development tools). New ones are reported on the timeline as they appear. ¦ Généralement sans problème (partage de fichiers, jeux, outils de développement). Les nouveaux sont signalés dans la chronologie dès qu'ils apparaissent. ¦ Normalmente no hay problema (compartir archivos, juegos, herramientas de desarrollo). Los nuevos se anotan en la cronología cuando aparecen.
+No program on this computer accepts connections from the network. ¦ Aucun programme de cet ordinateur n'accepte de connexions venant du réseau. ¦ Ningún programa de este ordenador acepta conexiones desde la red.
+Some programs couldn't be named without administrator rights. ¦ Certains programmes n'ont pas pu être nommés sans droits d'administrateur. ¦ Algunos programas no se pudieron identificar sin permisos de administrador.
+Needs the optional psutil component (Settings → Repair). ¦ Nécessite le composant facultatif psutil (Paramètres → Réparer). ¦ Necesita el componente opcional psutil (Configuración → Reparar).
+Router port forwarding (UPnP) ¦ Redirection de ports de la box (UPnP) ¦ Redirección de puertos del router (UPnP)
+Not checked. Use “Check my router's port forwarding” above (Active Mode, on a network you trust). It asks your router only, and every request appears in the ledger. ¦ Non vérifié. Utilisez « Vérifier les redirections de ports de ma box » ci-dessus (mode actif, sur un réseau de confiance). Seule votre box est interrogée, et chaque requête apparaît dans le registre. ¦ Sin comprobar. Use «Comprobar la redirección de puertos de mi router» arriba (modo activo, en una red de confianza). Solo se pregunta a su router y cada petición aparece en el registro.
+Each one lets the Internet reach a device here. Remove the ones you don't recognise in the router's settings, and turn UPnP off if you don't need it. ¦ Chacune permet à Internet d'atteindre un appareil d'ici. Supprimez celles que vous ne reconnaissez pas dans les réglages de la box, et désactivez UPnP si vous n'en avez pas besoin. ¦ Cada una permite que Internet llegue a un dispositivo de aquí. Quite las que no reconozca en los ajustes del router y desactive UPnP si no lo necesita.
+UPnP is on, but no ports are forwarded right now. ¦ UPnP est activé, mais aucun port n'est redirigé pour le moment. ¦ UPnP está activado, pero ahora mismo no se redirige ningún puerto.
+The honest summary ¦ Le résumé honnête ¦ El resumen sincero
+I'm not watching right now. Click “Start watching” and browse the web for a minute to get real results. ¦ Je n'observe rien pour le moment. Cliquez sur « Commencer à observer » et naviguez une minute pour obtenir de vrais résultats. ¦ Ahora mismo no estoy observando. Pulse «Empezar a observar» y navegue un minuto para obtener resultados reales.
+some devices use encrypted DNS ¦ certains appareils utilisent un DNS chiffré ¦ algunos dispositivos usan DNS cifrado
+QUIC connections hide the site name unless an earlier lookup revealed it ¦ les connexions QUIC cachent le nom du site, sauf si une recherche précédente l'a révélé ¦ las conexiones QUIC ocultan el nombre del sitio salvo que una búsqueda anterior lo revelara
+a VPN tunnel hides individual destinations ¦ un tunnel VPN cache les destinations individuelles ¦ un túnel VPN oculta los destinos individuales
+It sent traffic on your local network. ¦ Il a envoyé du trafic sur votre réseau local. ¦ Envió tráfico en su red local.
+Is on your network ¦ Est sur votre réseau ¦ Está en su red
+It answered or announced itself. ¦ Il a répondu ou s'est annoncé. ¦ Respondió o se anunció.
+Only heard about: other traffic was addressed to it, but it hasn't been seen sending anything itself. ¦ Seulement entendu parler : du trafic lui était adressé, mais on ne l'a pas vu envoyer quoi que ce soit lui-même. ¦ Solo se ha oído hablar de él: había tráfico dirigido a él, pero no se le ha visto enviar nada.
+High confidence ¦ Confiance élevée ¦ Confianza alta
+Medium confidence ¦ Confiance moyenne ¦ Confianza media
+Low confidence ¦ Confiance faible ¦ Confianza baja
+Unconfirmed confidence ¦ Non confirmé ¦ Sin confirmar
+Kind of device ¦ Type d'appareil ¦ Tipo de dispositivo
+Not enough clues yet. ¦ Pas encore assez d'indices. ¦ Aún no hay suficientes pistas.
+Seen in its own traffic or its DHCP lease. ¦ Vu dans son propre trafic ou dans son bail DHCP. ¦ Visto en su propio tráfico o en su concesión DHCP.
+Recent traffic or replies. ¦ Trafic ou réponses récents. ¦ Tráfico o respuestas recientes.
+Not seeing a device doesn't prove it's off — it may just be quiet. ¦ Ne pas voir un appareil ne prouve pas qu'il est éteint — il est peut-être juste silencieux. ¦ No ver un dispositivo no demuestra que esté apagado: puede que simplemente esté en silencio.
+Connected = name seen in its connection or right after its own lookup. ¦ Connecté = nom vu dans sa connexion ou juste après sa propre recherche. ¦ Conectado = nombre visto en su conexión o justo después de su propia búsqueda.
+Combined weak hints. ¦ Plusieurs indices faibles combinés. ¦ Varias pistas débiles combinadas.
+proof ¦ preuve ¦ prueba
+Select a device, website, connection or alert to see what MiniWireshark knows about it — and how it knows. ¦ Sélectionnez un appareil, un site, une connexion ou une alerte pour voir ce que MiniWireshark en sait — et comment il le sait. ¦ Seleccione un dispositivo, sitio, conexión o alerta para ver lo que MiniWireshark sabe de él y cómo lo sabe.
+Every statement carries a mark ¦ Chaque affirmation porte une marque ¦ Cada afirmación lleva una marca
+Open full details… ¦ Ouvrir tous les détails… ¦ Abrir todos los detalles…
+Best evidence ¦ Meilleure preuve ¦ Mejor prueba
+A lookup alone doesn't prove a visit; HTTPS shows only the site name, never the page. ¦ Une recherche seule ne prouve pas une visite ; HTTPS ne montre que le nom du site, jamais la page. ¦ Una búsqueda sola no demuestra una visita; HTTPS solo muestra el nombre del sitio, nunca la página.
+Server addresses ¦ Adresses du serveur ¦ Direcciones del servidor
+From DNS answers or the connection itself. ¦ D'après les réponses DNS ou la connexion elle-même. ¦ Según las respuestas DNS o la propia conexión.
+Names for this address ¦ Noms pour cette adresse ¦ Nombres de esta dirección
+Names come from DNS answers and secure-connection names; shared (CDN) addresses serve many sites. ¦ Les noms viennent des réponses DNS et des noms des connexions sécurisées ; les adresses partagées (CDN) servent de nombreux sites. ¦ Los nombres vienen de respuestas DNS y de los nombres de conexiones seguras; las direcciones compartidas (CDN) sirven muchos sitios.
+Never a local device ¦ Jamais un appareil local ¦ Nunca un dispositivo local
+it's on the Internet ¦ il est sur Internet ¦ está en Internet
+Public addresses are kept separate from your devices. ¦ Les adresses publiques sont tenues à part de vos appareils. ¦ Las direcciones públicas se mantienen aparte de sus dispositivos.
+Other side ¦ Autre côté ¦ Otro extremo
+What was observed ¦ Ce qui a été observé ¦ Lo que se observó
+Innocent explanations ¦ Explications anodines ¦ Explicaciones inocentes
+Merged identities ¦ Identités fusionnées ¦ Identidades fusionadas
+This address over time ¦ Cette adresse au fil du temps ¦ Esta dirección a lo largo del tiempo
+(no device tied to it — e.g. the router's own lookup) ¦ (aucun appareil associé — par ex. une recherche de la box elle-même) ¦ (ningún dispositivo asociado: p. ej., una búsqueda del propio router)
+none seen ¦ aucun vu ¦ ninguno visto
+Location / provider ¦ Emplacement / fournisseur ¦ Ubicación / proveedor
+No name was visible and no lookup preceded it. ¦ Aucun nom n'était visible et aucune recherche ne l'a précédée. ¦ No había ningún nombre visible y ninguna búsqueda la precedió.
+Go to the device ¦ Aller à l'appareil ¦ Ir al dispositivo
+this device ¦ cet appareil ¦ este dispositivo
+Two separate observations line up — for example a device looked a name up and connected to the answer a moment later. ¦ Deux observations distinctes concordent — par exemple, un appareil a recherché un nom et s'est connecté à la réponse un instant plus tard. ¦ Dos observaciones distintas coinciden: por ejemplo, un dispositivo buscó un nombre y se conectó a la respuesta un momento después.
+You named it. ¦ Vous l'avez nommé. ¦ Usted le puso este nombre.
+It announced this name via DHCP. ¦ Il a annoncé ce nom via DHCP. ¦ Anunció este nombre por DHCP.
+It announced this name via mDNS. ¦ Il a annoncé ce nom via mDNS. ¦ Anunció este nombre por mDNS.
+It answered a Windows name query. ¦ Il a répondu à une requête de nom Windows. ¦ Respondió a una consulta de nombre de Windows.
+It announced itself via UPnP. ¦ Il s'est annoncé via UPnP. ¦ Se anunció por UPnP.
+Your DNS server's reverse lookup. ¦ La recherche inverse de votre serveur DNS. ¦ La búsqueda inversa de su servidor DNS.
+Your Pi-hole / AdGuard Home knows it by this name. ¦ Votre Pi-hole / AdGuard Home le connaît sous ce nom. ¦ Su Pi-hole / AdGuard Home lo conoce con este nombre.
+Guessed from the maker and device type. ¦ Deviné d'après le fabricant et le type d'appareil. ¦ Deducido del fabricante y del tipo de dispositivo.
+No name seen. ¦ Aucun nom vu. ¦ No se ha visto ningún nombre.
+Unknown device ¦ Appareil inconnu ¦ Dispositivo desconocido
+Checking email (IMAP) ¦ Relève du courrier (IMAP) ¦ Consulta del correo (IMAP)
+Checking email (IMAP, secure) ¦ Relève du courrier (IMAP, sécurisé) ¦ Consulta del correo (IMAP, seguro)
+Checking email (POP3) ¦ Relève du courrier (POP3) ¦ Consulta del correo (POP3)
+Checking email (POP3, secure) ¦ Relève du courrier (POP3, sécurisé) ¦ Consulta del correo (POP3, seguro)
+Checking the time (NTP) ¦ Mise à l'heure (NTP) ¦ Consulta de la hora (NTP)
+Company directory lookup (LDAP) ¦ Annuaire d'entreprise (LDAP) ¦ Directorio de empresa (LDAP)
+Database connection (MySQL) ¦ Connexion à une base de données (MySQL) ¦ Conexión a base de datos (MySQL)
+Database connection (PostgreSQL) ¦ Connexion à une base de données (PostgreSQL) ¦ Conexión a base de datos (PostgreSQL)
+Database connection (SQL Server) ¦ Connexion à une base de données (SQL Server) ¦ Conexión a base de datos (SQL Server)
+Device discovery ¦ Découverte d'appareils ¦ Descubrimiento de dispositivos
+Device discovery (SSDP) ¦ Découverte d'appareils (SSDP) ¦ Descubrimiento de dispositivos (SSDP)
+File transfer (FTP data) ¦ Transfert de fichiers (données FTP) ¦ Transferencia de archivos (datos FTP)
+File transfer (FTP) ¦ Transfert de fichiers (FTP) ¦ Transferencia de archivos (FTP)
+File transfer (TFTP) ¦ Transfert de fichiers (TFTP) ¦ Transferencia de archivos (TFTP)
+Finding a device ¦ Recherche d'un appareil ¦ Búsqueda de un dispositivo
+Getting an IP address ¦ Obtention d'une adresse IP ¦ Obtención de una dirección IP
+Getting an IP address (DHCPv6) ¦ Obtention d'une adresse IP (DHCPv6) ¦ Obtención de una dirección IP (DHCPv6)
+In-memory database (Redis) ¦ Base de données en mémoire (Redis) ¦ Base de datos en memoria (Redis)
+Internet calling (SIP) ¦ Appels par Internet (SIP) ¦ Llamadas por Internet (SIP)
+Internet calling (SIP, secure) ¦ Appels par Internet (SIP, sécurisé) ¦ Llamadas por Internet (SIP, seguro)
+Internet connection ¦ Connexion Internet ¦ Conexión a Internet
+Local name lookup ¦ Recherche de nom locale ¦ Búsqueda de nombre local
+Local name lookup (NetBIOS) ¦ Recherche de nom locale (NetBIOS) ¦ Búsqueda de nombre local (NetBIOS)
+Local name lookup (mDNS) ¦ Recherche de nom locale (mDNS) ¦ Búsqueda de nombre local (mDNS)
+Media server (Plex) ¦ Serveur multimédia (Plex) ¦ Servidor multimedia (Plex)
+Network monitoring (SNMP) ¦ Supervision réseau (SNMP) ¦ Supervisión de red (SNMP)
+Ping / error reply ¦ Ping / réponse d'erreur ¦ Ping / respuesta de error
+Printing (IPP) ¦ Impression (IPP) ¦ Impresión (IPP)
+Printing (raw / JetDirect) ¦ Impression (brute / JetDirect) ¦ Impresión (directa / JetDirect)
+Quick message ¦ Message rapide ¦ Mensaje rápido
+Remote desktop (RDP) ¦ Bureau à distance (RDP) ¦ Escritorio remoto (RDP)
+Remote file access (NFS) ¦ Accès distant aux fichiers (NFS) ¦ Acceso remoto a archivos (NFS)
+Remote screen sharing (VNC) ¦ Partage d'écran à distance (VNC) ¦ Compartir pantalla a distancia (VNC)
+Remote terminal (SSH) ¦ Terminal à distance (SSH) ¦ Terminal remoto (SSH)
+Remote terminal (Telnet, not secure) ¦ Terminal à distance (Telnet, non sécurisé) ¦ Terminal remoto (Telnet, no seguro)
+Secure web browsing ¦ Navigation web sécurisée ¦ Navegación web segura
+Secure web browsing (alternate port) ¦ Navigation web sécurisée (port alternatif) ¦ Navegación web segura (puerto alternativo)
+Secure web connection ¦ Connexion web sécurisée ¦ Conexión web segura
+Sending email (SMTP) ¦ Envoi de courrier (SMTP) ¦ Envío de correo (SMTP)
+Sending email (SMTP, secure) ¦ Envoi de courrier (SMTP, sécurisé) ¦ Envío de correo (SMTP, seguro)
+Smart home messaging (MQTT) ¦ Messagerie domotique (MQTT) ¦ Mensajería domótica (MQTT)
+Smart home messaging (MQTT, secure) ¦ Messagerie domotique (MQTT, sécurisé) ¦ Mensajería domótica (MQTT, seguro)
+Streaming to a speaker/TV (AirPlay) ¦ Diffusion vers une enceinte/TV (AirPlay) ¦ Transmisión a un altavoz/TV (AirPlay)
+Streaming video (RTSP) ¦ Vidéo en continu (RTSP) ¦ Vídeo en streaming (RTSP)
+System log messages (syslog) ¦ Messages du journal système (syslog) ¦ Mensajes del registro del sistema (syslog)
+Unsecured web request ¦ Requête web non sécurisée ¦ Petición web no segura
+Web browsing ¦ Navigation web ¦ Navegación web
+Web browsing (alternate port) ¦ Navigation web (port alternatif) ¦ Navegación web (puerto alternativo)
+Website lookup ¦ Recherche de site web ¦ Búsqueda de sitio web
+Windows file sharing (NetBIOS) ¦ Partage de fichiers Windows (NetBIOS) ¦ Uso compartido de archivos de Windows (NetBIOS)
+Windows file sharing (SMB) ¦ Partage de fichiers Windows (SMB) ¦ Uso compartido de archivos de Windows (SMB)
+Private address ¦ Adresse privée ¦ Dirección privada
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -22206,6 +22364,120 @@ I18N_PATTERNS = [
 ]
 # the device story's presence sentences go first: a 5.0.2 pattern for
 # "Offline since …" would take them (the sort keeps the rest in order)
+# 5.1.2: the Security page's sentences with values in them
+I18N_PATTERNS += [
+    (r"Your router is at (\S+)\. All your internet traffic goes through "
+     r"it\.", r"Votre box est à l'adresse \1. Tout votre trafic Internet "
+     r"passe par elle.", r"Su router está en \1. Todo su tráfico de "
+     r"Internet pasa por él."),
+    (r"If you didn't recognize this number, someone may have changed your "
+     r"Wi-Fi router\. Your router's admin page is usually at (\S+)",
+     r"Si vous ne reconnaissez pas ce numéro, quelqu'un a peut-être changé "
+     r"votre box Wi-Fi. La page d'administration de la box est en général "
+     r"à l'adresse \1", r"Si no reconoce este número, puede que alguien "
+     r"haya cambiado su router Wi-Fi. La página de administración del "
+     r"router suele estar en \1"),
+    (r"Your router's address has answered from (\d+) different MAC "
+     r"addresses\. That can happen after a router reboot or firmware "
+     r"update, but it's also the classic sign of ARP spoofing — a device "
+     r"on your Wi-Fi pretending to be your router so it can see your "
+     r"traffic\.",
+     r"L'adresse de votre box a répondu depuis \1 adresses MAC différentes. "
+     r"Cela peut arriver après un redémarrage ou une mise à jour de la box, "
+     r"mais c'est aussi le signe classique d'une usurpation ARP — un "
+     r"appareil de votre Wi-Fi qui se fait passer pour votre box afin de "
+     r"voir votre trafic.",
+     r"La dirección de su router ha respondido desde \1 direcciones MAC "
+     r"distintas. Puede pasar tras reiniciar o actualizar el router, pero "
+     r"también es la señal clásica de una suplantación ARP: un dispositivo "
+     r"de su Wi-Fi que se hace pasar por el router para ver su tráfico."),
+    (r"(\d+) local address\(es\) have answered from more than one device: "
+     r"(.+)\.", r"\1 adresse(s) locale(s) ont répondu depuis plus d'un "
+     r"appareil : \2.", r"\1 dirección(es) local(es) han respondido desde "
+     r"más de un dispositivo: \2."),
+    (r"(\d+) different devices are handing out IP addresses: (.+)\.",
+     r"\1 appareils différents distribuent des adresses IP : \2.",
+     r"\1 dispositivos distintos reparten direcciones IP: \2."),
+    (r"Your router \((\S+)\) is the one handing out addresses\. Normal "
+     r"setup\.", r"C'est votre box (\1) qui distribue les adresses. "
+     r"Installation normale.", r"Es su router (\1) quien reparte las "
+     r"direcciones. Configuración normal."),
+    (r"(\S+) is handing out addresses, which isn't your router \((\S+)\)\.",
+     r"\1 distribue des adresses, et ce n'est pas votre box (\2).",
+     r"\1 reparte direcciones y no es su router (\2)."),
+    (r"Your router \((\S+)\) is handling DNS lookups\. (\d+) queries so "
+     r"far\.", r"Votre box (\1) s'occupe des recherches DNS. \2 requêtes "
+     r"jusqu'ici.", r"Su router (\1) se encarga de las búsquedas DNS. \2 "
+     r"consultas hasta ahora."),
+    (r"A local device at (\S+) is acting as a DNS server \((\d+) "
+     r"queries\)\.", r"Un appareil local à l'adresse \1 joue le rôle de "
+     r"serveur DNS (\2 requêtes).", r"Un dispositivo local en \1 actúa "
+     r"como servidor DNS (\2 consultas)."),
+    (r"Someone is using a custom DNS server at (\S+) \((\d+) queries\)\.",
+     r"Quelqu'un utilise un serveur DNS personnalisé à l'adresse \1 (\2 "
+     r"requêtes).", r"Alguien usa un servidor DNS propio en \1 (\2 "
+     r"consultas)."),
+    (r"Someone is using (.+) directly \((\S+)\), (\d+) queries\.",
+     r"Quelqu'un utilise directement \1 (\2), \3 requêtes.",
+     r"Alguien usa directamente \1 (\2), \3 consultas."),
+    (r"(.+) is using (\S+\.\S+)\.", r"\1 utilise \2.", r"\1 usa \2."),
+    (r"I saw (\d+) unencrypted \(http://\) web requests\.",
+     r"J'ai vu \1 requêtes web non chiffrées (http://).",
+     r"He visto \1 peticiones web sin cifrar (http://)."),
+    (r"Examples: (.+)", r"Exemples : \1", r"Ejemplos: \1"),
+    (r"Seen: (.+)", r"Vu : \1", r"Visto: \1"),
+    (r"Visibility is reduced because (.+)\.",
+     r"La visibilité est réduite car \1.",
+     r"La visibilidad es menor porque \1."),
+    (r"The selected network card looks like a VPN/tunnel adapter "
+     r"\((.+)\)\.", r"La carte réseau choisie ressemble à un adaptateur "
+     r"VPN/tunnel (\1).", r"La tarjeta de red elegida parece un "
+     r"adaptador VPN/túnel (\1)."),
+    (r"Most Internet traffic goes to (\S+), which looks like a (.+) "
+     r"server\.", r"La plupart du trafic Internet va vers \1, qui "
+     r"ressemble à un serveur \2.", r"La mayor parte del tráfico de "
+     r"Internet va a \1, que parece un servidor \2."),
+    (r"(\d+) device\(s\) couldn't be identified\.",
+     r"\1 appareil(s) n'ont pas pu être identifiés.",
+     r"\1 dispositivo(s) no se pudieron identificar."),
+    (r"(\d+) program\(s\) on this computer can be reached from the "
+     r"network:", r"\1 programme(s) de cet ordinateur sont joignables "
+     r"depuis le réseau :", r"\1 programa(s) de este ordenador son "
+     r"accesibles desde la red:"),
+    (r"(.+) — (\S+) port (\d+)", r"\1 — \2 port \3", r"\1 — \2 puerto \3"),
+    (r"Your router forwards (\d+) port\(s\) from the Internet into your "
+     r"network:", r"Votre box redirige \1 port(s) d'Internet vers votre "
+     r"réseau :", r"Su router redirige \1 puerto(s) de Internet a su "
+     r"red:"),
+    (r"Checked (\d.+)\.", r"Vérifié \1.", r"Comprobado \1."),
+    (r"I've seen (\d+) packets, (\d+) device\(s\), and (\d+) "
+     r"website\(s\)\.", r"J'ai vu \1 paquets, \2 appareil(s) et \3 "
+     r"site(s) web.", r"He visto \1 paquetes, \2 dispositivo(s) y \3 "
+     r"sitio(s) web."),
+]
+# 5.1.2: the Inspector's claims with values in them
+I18N_PATTERNS += [
+    (r"yes — seen (.+) ago", r"oui — vu il y a \1", r"sí — visto hace \1"),
+    (r"not seen for (.+)", r"pas vu depuis \1", r"sin ver desde hace \1"),
+    (r"(\d+) connected · (\d+) looked up only · (\d+) possibly",
+     r"\1 connectés · \2 seulement recherchés · \3 peut-être",
+     r"\1 conectados · \2 solo buscados · \3 posiblemente"),
+    (r"↑(\S+ \S+) ↓(\S+ \S+) · (\d+) connections",
+     r"↑\1 ↓\2 · \3 connexions", r"↑\1 ↓\2 · \3 conexiones"),
+    (r"↑(\S+ \S+) ↓(\S+ \S+) · (\d+) packets · (.+)",
+     r"↑\1 ↓\2 · \3 paquets · \4", r"↑\1 ↓\2 · \3 paquetes · \4"),
+    (r"🔗 Connection #(\d+)", r"🔗 Connexion n° \1", r"🔗 Conexión n.º \1"),
+    (r"Confidence: (\S+)\. (.+)", r"Confiance : {t1}. {t2}",
+     r"Confianza: {t1}. {t2}"),
+    (r"From (.+); an estimate\.", r"D'après \1 ; une estimation.",
+     r"Según \1; una estimación."),
+]
+_CLASS_RX = "(" + "|".join(re.escape(c) for c in DEVICE_CLASSES) + ")"
+I18N_PATTERNS += [
+    (r"Likely " + _CLASS_RX, r"{t1} probable", r"{t1} probable"),
+    (r"Possibly " + _CLASS_RX, r"{t1} possible", r"{t1} posible"),
+    (r"([A-Z][^—:.;]*) device", r"appareil \1", r"dispositivo \1"),
+]
 I18N_PATTERNS.sort(key=lambda x: 0 if x[0].startswith(
     ("Online now", r"Offline since (\d\d")) else 1)
 _I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
@@ -22293,6 +22565,49 @@ def translate_lines(text, locale=None):
                      for line in text.split("\n"))
 
 
+_CELL_WORDS = []
+_CELL_CACHE = {}
+
+
+def translate_cell(v):
+    """A table cell in the current language — only the fixed words a
+    table shows (states, confidence, device kinds, what a connection is
+    for, "Private address"), never names, addresses or numbers: those
+    are the user's data and filters read them back. Exact lookups only,
+    so a table of thousands of rows costs a dictionary hit per cell."""
+    loc = CURRENT_LOCALE
+    if loc == "en" or not isinstance(v, str) or not v or len(v) > 60:
+        return v
+    key = (loc, v)
+    out = _CELL_CACHE.get(key)
+    if out is not None:
+        return out
+    if not _CELL_WORDS:
+        words = {"High", "Medium", "Low", "Unconfirmed", "Unknown",
+                 "Private address", "Your router / gateway", "Active",
+                 "Idle", "Offline", "Expired", "Online", "Closing",
+                 "Closed", "Open", "Encrypted", "Not encrypted"}
+        words.update(FRIENDLY_PROTO.values())
+        words.update(PORT_SERVICES.values())
+        words.update(DEVICE_CLASSES)
+        for c in DEVICE_CLASSES:
+            words.update((f"Likely {c}", f"Possibly {c}"))
+        _CELL_WORDS.append(frozenset(words))
+    m = _I18N_CORE.match(v)
+    core = m.group(2) if m else v
+    out = translate_text(v, loc) if core in _CELL_WORDS[0] else v
+    if len(_CELL_CACHE) > 20000:
+        _CELL_CACHE.clear()
+    _CELL_CACHE[key] = out
+    return out
+
+
+def translate_cells(values):
+    if CURRENT_LOCALE == "en" or not isinstance(values, (list, tuple)):
+        return values
+    return [translate_cell(x) for x in values]
+
+
 def untranslate_text(s):
     """Shown text -> its English source (unchanged when not a translation)."""
     if not isinstance(s, str):
@@ -22369,6 +22684,18 @@ def install_i18n_hooks():
     for cls, name in ((ttk.Notebook, "add"), (ttk.Notebook, "insert"),
                       (ttk.Notebook, "tab"), (ttk.Treeview, "heading")):
         wrap_kw(cls, name)
+
+    # 5.1.2: table cells with fixed words ("Active", "High", what a
+    # connection is for) in the current language
+    for name in ("insert", "item"):
+        orig_tv = getattr(ttk.Treeview, name)
+
+        def tv_method(self, *a, _orig=orig_tv, **kw):
+            if CURRENT_LOCALE != "en" and "values" in kw:
+                kw["values"] = translate_cells(kw["values"])
+            return _orig(self, *a, **kw)
+        tv_method.__doc__ = orig_tv.__doc__
+        setattr(ttk.Treeview, name, tv_method)
 
     orig_column = ttk.Treeview.column
 
@@ -22871,11 +23198,33 @@ def install_layout_hooks():
 _HEADING_W = {}         # (heading font size, text) -> pixels (5.1.2)
 
 
+_HEADING_FONT = {}
+
+
+def heading_font():
+    """The font table headings are really drawn in: the Treeview.Heading
+    style's (5.1.2: measuring TkHeadingFont left headings tight or cut
+    at 150 %, where the two differ), TkHeadingFont when it names none."""
+    try:
+        spec = ttk.Style().lookup("Treeview.Heading", "font")
+    except tk.TclError:
+        spec = ""
+    if not spec:
+        return tkfont.nametofont("TkHeadingFont"), "TkHeadingFont"
+    f = _HEADING_FONT.get(spec)
+    if f is None:
+        try:
+            f = _HEADING_FONT[spec] = tkfont.Font(font=spec)
+        except (tk.TclError, RuntimeError):
+            return tkfont.nametofont("TkHeadingFont"), "TkHeadingFont"
+    return f, spec
+
+
 def heading_width(text):
     """Pixel width of a heading text. Measuring took about 1 ms per call
     (on X), and the same few heading texts repeat across tables."""
-    f = tkfont.nametofont("TkHeadingFont")
-    key = (f.cget("size"), f.cget("family"), text)
+    f, spec = heading_font()
+    key = (spec, f.cget("size"), f.cget("family"), UI_SCALE[0], text)
     w = _HEADING_W.get(key)
     if w is None:
         if len(_HEADING_W) > 4000:
@@ -23283,14 +23632,7 @@ def layout_audit(top):
             if cls == "Treeview":
                 # the font the headings are really drawn in (the style's;
                 # TkHeadingFont only when the style names none)
-                spec = ttk.Style().lookup(
-                    (str(w.cget("style")) or "Treeview") + ".Heading",
-                    "font") or ttk.Style().lookup("Treeview.Heading", "font")
-                try:
-                    hf = tkfont.Font(root=w, font=spec) if spec else \
-                        tkfont.nametofont("TkHeadingFont")
-                except tk.TclError:
-                    hf = tkfont.nametofont("TkHeadingFont")
+                hf = heading_font()[0]
                 cols = (["#0"] if "tree" in str(w.cget("show")) else []) + \
                     list(w["columns"])
                 disp = w["displaycolumns"]
@@ -25698,6 +26040,9 @@ def tree_upsert(tree, iid_map, key, values, tags=(), parent="", index="end",
     table. With a TableKit, the row keeps its sorted place and shows the
     new-row dot and "4 min ago"."""
     iid = iid_map.get(key)
+    # in the shown language before the kit sorts by it (the tree holds
+    # the shown words; see translate_cell)
+    values = translate_cells(values)
     if kit is not None:
         values = kit.decorate(key, values)
     if iid is not None:
@@ -27713,12 +28058,13 @@ class Inspector:
         self.txt.configure(state="disabled")
 
     def _w(self, text, *tags):
-        self.txt.insert("end", text, tags)
+        # 5.1.2: in the current language (it stayed English in French)
+        self.txt.insert("end", translate_lines(text), tags)
 
     def _clickable(self, text, fn, base="link"):
         self._chip += 1
         tag = f"c_{self._chip}"
-        self.txt.insert("end", text, (base, tag))
+        self.txt.insert("end", translate_text(text), (base, tag))
         self.txt.tag_bind(tag, "<Button-1>", lambda e: fn())
         self.txt.tag_bind(tag, "<Enter>",
                           lambda e: self.txt.configure(cursor="hand2"))
@@ -27726,7 +28072,10 @@ class Inspector:
                           lambda e: self.txt.configure(cursor="arrow"))
 
     def _claim(self, label, value, level, why=""):
-        self._w(f"{LEVEL_GLYPH.get(level, '?')} {label}: ", "h")
+        # French puts a space before the colon
+        colon = " : " if CURRENT_LOCALE == "fr" else ": "
+        self._w(f"{LEVEL_GLYPH.get(level, '?')} {translate_text(label)}"
+                f"{colon}", "h")
         self._w(f"{value}\n")
         if why:
             self._w(f"   {why}\n", "muted")
@@ -32198,9 +32547,9 @@ class SecurityTab(BaseTab):
         def full(sec):
             title, lines, _w = sec
             if title:
-                t.insert("end", title + "\n", "h1")
+                t.insert("end", tr(title) + "\n", "h1")
             for tag, text in lines:
-                t.insert("end", text, tag)
+                t.insert("end", translate_lines(text), tag)
         calm = [x for x in secs if not x[2] and x[0] not in self.ALWAYS]
         self.folded_titles = [x[0] for x in calm] if closed else []
         with contextlib.suppress(tk.TclError):
@@ -32221,10 +32570,11 @@ class SecurityTab(BaseTab):
             for title, lines, _w in calm:
                 first = next(((tag, text) for tag, text in lines
                               if tag in ("good", "dim")), None)
-                t.insert("end", "    " + title + "  ", "fold_h")
+                t.insert("end", "    " + tr(title) + "  ", "fold_h")
                 if first:
-                    t.insert("end", first[1].strip().lstrip("✔").strip() +
-                             "\n", "good" if first[0] == "good" else "dim")
+                    t.insert("end", tr(first[1].strip().lstrip("✔")
+                                       .strip()) + "\n",
+                             "good" if first[0] == "good" else "dim")
                 else:
                     t.insert("end", "\n")
         for sec in tail:
@@ -32411,8 +32761,9 @@ class SecurityTab(BaseTab):
         h1("Other unencrypted protocols")
         others = {k: v for k, v in m.cleartext_seen.items() if k != "HTTP"}
         if others:
-            warn("Seen: " + ", ".join(f"{k} ({v} packets)" for k, v in
-                                      sorted(others.items())))
+            warn("Seen: " + ", ".join(f"{k} ({v} "
+                                      f"{translate_text('packets')})"
+                                      for k, v in sorted(others.items())))
             body("Telnet, FTP, plain POP3/IMAP and similar protocols send "
                  "everything \u2014 sometimes including passwords \u2014 "
                  "without encryption. Prefer their secure versions.")
@@ -32430,7 +32781,8 @@ class SecurityTab(BaseTab):
         if m.vpn.get("endpoint") or m.vpn.get("iface"):
             hidden.append("a VPN tunnel hides individual destinations")
         if hidden:
-            warn("Visibility is reduced because " + "; ".join(hidden) + ".")
+            warn("Visibility is reduced because " + "; ".join(
+                translate_text(x) for x in hidden) + ".")
             body("That's privacy technology working as intended. "
                  "MiniWireshark never tries to decrypt anything; it reports "
                  "only what is visible.")
@@ -36500,6 +36852,7 @@ class HelpTab(BaseTab):
         if tp is None:
             return False
         self.topic = tp
+        self._topic_locale = CURRENT_LOCALE
         txt = self.txt
         txt.config(state="normal")
         txt.delete("1.0", "end")
@@ -36507,7 +36860,7 @@ class HelpTab(BaseTab):
             if tag.startswith("lk_"):
                 txt.tag_delete(tag)
         txt.insert("end", translate_text(tp["title"]) + "\n", ("h1",))
-        txt.insert("end", help_body(tp, self.app) + "\n")
+        txt.insert("end", translate_lines(help_body(tp, self.app)) + "\n")
         for label, tab, attr in tp["show"]:
             self._links += 1
             tag = f"lk_{self._links}"
@@ -36530,6 +36883,13 @@ class HelpTab(BaseTab):
             self.demo_btn.configure(
                 text="⏹ Stop Demo Mode" if self.app.data_mode == "demo"
                 else "\U0001F3AE Try Demo Mode")
+        # the topic was written in the language of the moment: again in
+        # the new one after a language change (and the list with it)
+        if getattr(self, "_topic_locale", CURRENT_LOCALE) != CURRENT_LOCALE \
+                and getattr(self, "topic", None):
+            with contextlib.suppress(tk.TclError):
+                self.refill()
+                self.open_topic(self.topic["title"])
 
 
 
@@ -41544,6 +41904,11 @@ class MiniWireshark:
         if shown != CURRENT_LOCALE:
             self._locale_shown = CURRENT_LOCALE
             i18n_retranslate(self.root)
+            with contextlib.suppress(AttributeError, tk.TclError):
+                if self.inspector.current:
+                    self.inspector.refresh()
+                else:
+                    self.inspector._empty()
         try:
             self.hdr_title.configure(text=tr("app_title"))
             self.hdr_subtitle.configure(text=tr("app_subtitle"))
@@ -63354,6 +63719,69 @@ def gt_rc2_polish(app, ctx):
             win.destroy()
         app.inspector.show("none", "")
         app.toggle_inspector(vis0)
+
+
+@gui_test_step("5.1.2 rc.5: French in the Security page, Inspector, Help "
+               "and table words")
+def gt_rc5_french(app, ctx):
+    root = app.root
+    lang0 = app.config.get("general.language", "English")
+    vis0 = app.inspector_visible
+    try:
+        app.config.set("general.language", "Français")
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.3)
+        app._select_tab("security")
+        _gui_pump(root, 0.3)
+        st = app.tabs["security"]
+        st.refresh()
+        text = st.text.get("1.0", "end")
+        for fr in ("Qu'est-ce que c'est ?", "Le résumé honnête",
+                   "Vérification de l'identité des appareils (ARP)"):
+            assert fr in text, (fr, text[:400])
+        assert "The honest summary" not in text
+        # the Inspector: labels, values and the empty view
+        reg = app.model.registry
+        key = next(k for k, d in reg.by_key.items() if d.ip)
+        app.inspect("device", key)
+        _gui_pump(root, 0.2)
+        body = app.inspector.txt.get("1.0", "end")
+        assert "Est sur votre réseau : " in body, body[:400]
+        assert "Is on your network" not in body
+        app.inspector.show("none", "")
+        assert "Chaque affirmation porte une marque" in \
+            app.inspector.txt.get("1.0", "end")
+        # a Help topic's body
+        app._select_tab("help")
+        _gui_pump(root, 0.2)
+        ht = app.tabs["help"]
+        ht.refresh()           # the topic shown before the change, again
+        _gui_pump(root, 0.2)
+        app.open_help("Start here")
+        _gui_pump(root, 0.2)
+        assert "Commencez ici" in ht.txt.get("1.0", "end"), \
+            ht.txt.get("1.0", "end")[:300]
+        # fixed words in tables; names stay as they are
+        assert translate_cell("● Active") == "● " + translate_text("Active")
+        assert translate_cell("●●● High").endswith(translate_text("High"))
+        assert translate_cell("Secure web connection") == \
+            "Connexion web sécurisée"
+        assert translate_cell("host-0001") == "host-0001"
+        assert translate_cell("This computer's files") == \
+            "This computer's files"
+        app._select_tab("devices")
+        _gui_pump(root, 0.5)
+        dt = app.tabs["devices"]
+        cells = [str(v) for iid in dt.tree.get_children("")[:20]
+                 for v in dt.tree.item(iid, "values")]
+        assert not any(c.endswith(" Active") or c.endswith(" High")
+                       for c in cells), cells[:12]
+    finally:
+        app.config.set("general.language", lang0)
+        app._apply_runtime_settings()
+        app.inspector.show("none", "")
+        app.toggle_inspector(vis0)
+        _gui_pump(root, 0.3)
 
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
 # Labels that change with the state of the row a menu was opened on are
