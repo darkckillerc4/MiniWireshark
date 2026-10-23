@@ -8887,6 +8887,8 @@ FEATURES = {
     "chunked": True,         # tables refill in short slices after a swap (M2)
     "gc_freeze": True,       # startup objects leave the cycle collector (M2)
     "sticky_sort": True,     # tables keep their sort and columns (M3)
+    "tab_groups": True,      # tabs in four groups, new order (M4)
+    "state_line": True,      # one truthful state line, not two banners (M4)
 }
 
 
@@ -17298,6 +17300,10 @@ DEFAULT_SHORTCUTS = {
     "clear": "<Control-l>", "export": "<Control-e>", "find": "<Control-f>",
     "undo": "<Control-z>", "inspector": "<F2>",
     "palette": "<Control-k>", "goto_packet": "<Control-g>",
+    # 5.1.2: back / forward through the views you visited; the tab groups
+    "back": "<Alt-Left>", "forward": "<Alt-Right>",
+    "group1": "<Control-Key-1>", "group2": "<Control-Key-2>",
+    "group3": "<Control-Key-3>", "group4": "<Control-Key-4>",
 }
 
 DEFAULT_FILTER_PRESETS = {
@@ -17323,7 +17329,8 @@ def _default_config():
         "accessibility": {"colorblind": "Off"},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal",
-                       "inspector": None, "tables": {}},
+                       "inspector": None, "tables": {}, "window": "",
+                       "last_tab": ""},
         "capture": {"max_stored_events": 5000, "promiscuous": True,
                     "auto_select_interface": True,
                     "preferred_interface": "", "follow_newest": True,
@@ -18871,7 +18878,7 @@ STRINGS = {
         "tab_timeline": "\U0001f553 Timeline",
         "tab_devices": "\U0001f3e0 Devices",
         "tab_websites": "\U0001f30d Websites",
-        "tab_remote": "\U0001f5a5 Remote hosts",
+        "tab_remote": "\U0001f5a5 Internet hosts",
         "tab_alerts": "\U0001f514 Alerts",
         "tab_map": "\U0001f5fa Map",
         "tab_security": "\U0001f512 Security",
@@ -20480,7 +20487,7 @@ No connections in this view. Short ones are hidden in Beginner. ¦ Aucune connex
 Show short connections ¦ Afficher les connexions courtes ¦ Mostrar las conexiones cortas
 No connections yet. ¦ Aucune connexion pour l'instant. ¦ Aún no hay conexiones.
 (no name seen) ¦ (aucun nom vu) ¦ (no se vio ningún nombre)
-Internet host ¦ Hôte Internet ¦ Host de Internet
+Internet host ¦ Hôte Internet ¦ Equipo de Internet
 No Internet hosts yet. They appear when a device talks to a public address. ¦ Aucun hôte Internet pour l'instant. Ils apparaissent quand un appareil communique avec une adresse publique. ¦ Aún no hay hosts de Internet. Aparecen cuando un dispositivo habla con una dirección pública.
 Search: ¦ Rechercher : ¦ Buscar:
 More ¦ Plus ¦ Más
@@ -20493,6 +20500,56 @@ History settings ¦ Réglages de l'historique ¦ Ajustes del historial
 Nothing in this view yet. ¦ Rien dans cette vue pour l'instant. ¦ Aún no hay nada en esta vista.
 Jump to now ¦ Revenir au présent ¦ Ir al momento actual
 Show only: ¦ Afficher seulement : ¦ Mostrar solo:
+INTERNET HOSTS — public Internet addresses your devices talked to. These are never devices on your network — they live somewhere out on the Internet. ¦ HÔTES INTERNET — adresses Internet publiques avec lesquelles vos appareils ont communiqué. Ce ne sont jamais des appareils de votre réseau — ils sont quelque part sur Internet. ¦ EQUIPOS DE INTERNET — direcciones públicas de Internet con las que hablaron sus dispositivos. Nunca son dispositivos de su red — están en algún lugar de Internet.
+Hides the technical Connections, Internet hosts and Packets tabs and the advanced filter fields. Nothing is removed — switch this off any time to see everything. ¦ Masque les onglets techniques Connexions, Hôtes Internet et Paquets ainsi que les filtres avancés. Rien n'est supprimé — désactivez à tout moment pour tout voir. ¦ Oculta las pestañas técnicas Conexiones, Equipos de Internet y Paquetes y los filtros avanzados. No se elimina nada — desactívelo cuando quiera para verlo todo.
+Beginner shows the essentials. Advanced adds the Connections, Internet hosts and Packets tabs, technical columns and filter expressions. Same data either way. ¦ Débutant montre l'essentiel. Avancé ajoute les onglets Connexions, Hôtes Internet et Paquets, les colonnes techniques et les expressions de filtre. Mêmes données dans les deux cas. ¦ Principiante muestra lo esencial. Avanzado añade las pestañas Conexiones, Equipos de Internet y Paquetes, columnas técnicas y expresiones de filtro. Los mismos datos en ambos casos.
+Back (Alt+Left) ¦ Retour (Alt+Gauche) ¦ Atrás (Alt+Izquierda)
+Forward (Alt+Right) ¦ Suivant (Alt+Droite) ¦ Adelante (Alt+Derecha)
+Back to ¦ Revenir à ¦ Volver a
+Forward to ¦ Aller à ¦ Ir a
+Nowhere to go yet ¦ Rien à afficher pour l'instant ¦ Aún no hay adónde ir
+filter ¦ filtre ¦ filtro
+Overview ¦ Vue d'ensemble ¦ Resumen
+Your network ¦ Votre réseau ¦ Su red
+Internet ¦ Internet ¦ Internet
+Tools and help ¦ Outils et aide ¦ Herramientas y ayuda
+Back to the previous view ¦ Revenir à la vue précédente ¦ Volver a la vista anterior
+Forward again ¦ Avancer de nouveau ¦ Avanzar de nuevo
+Overview tabs ¦ Onglets Vue d'ensemble ¦ Pestañas de Resumen
+Your network tabs ¦ Onglets Votre réseau ¦ Pestañas de Su red
+Internet tabs ¦ Onglets Internet ¦ Pestañas de Internet
+Tools and help tabs ¦ Onglets Outils et aide ¦ Pestañas de Herramientas y ayuda
+Clear and start fresh… ¦ Tout effacer et repartir de zéro… ¦ Borrar todo y empezar de nuevo…
+Undo ¦ Annuler ¦ Deshacer
+Cleared. Still watching. ¦ Effacé. L'observation continue. ¦ Borrado. Sigue observando.
+Cleared. Ready to start again. ¦ Effacé. Prêt à recommencer. ¦ Borrado. Listo para empezar de nuevo.
+Brought back what was cleared. ¦ Ce qui avait été effacé est revenu. ¦ Se recuperó lo que se había borrado.
+Messages ¦ Messages ¦ Mensajes
+The last 50 messages ¦ Les 50 derniers messages ¦ Los últimos 50 mensajes
+The last 50 messages, newest first ¦ Les 50 derniers messages, les plus récents d'abord ¦ Los últimos 50 mensajes, los más recientes primero
+No messages yet. ¦ Aucun message pour l'instant. ¦ Aún no hay mensajes.
+What the capture is doing. Click for Diagnostics. ¦ Ce que fait la capture. Cliquez pour les diagnostics. ¦ Lo que está haciendo la captura. Haga clic para ver el diagnóstico.
+MiniWireshark health ¦ État de MiniWireshark ¦ Estado de MiniWireshark
+Startup history… ¦ Historique des démarrages… ¦ Historial de inicios…
+Network: not identified yet. ¦ Réseau : pas encore identifié. ¦ Red: aún sin identificar.
+Network: ¦ Réseau : ¦ Red:
+unnamed ¦ sans nom ¦ sin nombre
+trusted (yours) ¦ de confiance (le vôtre) ¦ de confianza (la suya)
+not marked as yours ¦ non marqué comme le vôtre ¦ no marcada como suya
+Sent by MiniWireshark in the last 10 minutes: ¦ Envoyé par MiniWireshark ces 10 dernières minutes : ¦ Enviado por MiniWireshark en los últimos 10 minutos:
+Nothing was sent in the last 10 minutes. ¦ Rien n'a été envoyé ces 10 dernières minutes. ¦ No se envió nada en los últimos 10 minutos.
+What this computer cannot see: ¦ Ce que cet ordinateur ne peut pas voir : ¦ Lo que este equipo no puede ver:
+No known blind spots right now. ¦ Aucun angle mort connu pour l'instant. ¦ Ningún punto ciego conocido por ahora.
+What can I see from here? ¦ Que puis-je voir d'ici ? ¦ ¿Qué puedo ver desde aquí?
+Keep open ¦ Garder ouvert ¦ Mantener abierta
+Show in the inspector ¦ Afficher dans l'inspecteur ¦ Mostrar en el inspector
+capture file ¦ fichier de capture ¦ archivo de captura
+saved session ¦ session enregistrée ¦ sesión guardada
+demo data ¦ données de démonstration ¦ datos de demostración
+No longer listed ¦ N'est plus dans la liste ¦ Ya no está en la lista
+This device is no longer listed (it expired, or the data was cleared). ¦ Cet appareil n'est plus dans la liste (il a expiré, ou les données ont été effacées). ¦ Este dispositivo ya no está en la lista (caducó o se borraron los datos).
+This item is no longer listed (it expired, or the data was cleared or replaced). ¦ Cet élément n'est plus dans la liste (il a expiré, ou les données ont été effacées ou remplacées). ¦ Este elemento ya no está en la lista (caducó o los datos se borraron o se reemplazaron).
+Open it ¦ L'ouvrir ¦ Abrirlo
 Paused while the pointer is over the list — move it away to resume ¦ En pause tant que le pointeur est sur la liste — éloignez-le pour reprendre ¦ En pausa mientras el puntero está sobre la lista: apártelo para continuar
 """
 
@@ -20972,6 +21029,13 @@ I18N_PATTERNS = [
     (r"Exported (\d[\d,]*) rows to (.+)", r"\1 lignes exportées vers \2",
      r"\1 filas exportadas a \2"),
     (r"(\d[\d,]*) open", r"\1 ouvertes", r"\1 abiertas"),
+    (r"Undo — the last (\d+) s will be lost",
+     r"Annuler — les \1 dernières secondes seront perdues",
+     r"Deshacer — se perderán los últimos \1 s"),
+    (r"This device was merged into (.+)\.", r"Cet appareil a été fusionné "
+     r"avec \1.", r"Este dispositivo se fusionó con \1."),
+    (r"Internet host: (.+)", r"Hôte Internet : \1",
+     r"Equipo de Internet: \1"),
     (r"Paused while the pointer is over the list — move it away to resume "
      r"\((\d+) waiting\)",
      r"En pause tant que le pointeur est sur la liste — éloignez-le pour "
@@ -22532,7 +22596,7 @@ SETTINGS_PAGES = [
          {"title": "Layout", "controls": [
              {"key": "appearance.beginner_mode", "type": "bool",
               "label": "Beginner view",
-              "help": "Hides the technical Connections, Remote hosts and "
+              "help": "Hides the technical Connections, Internet hosts and "
                       "Packets tabs and the advanced filter fields. Nothing "
                       "is removed — switch this off any time to see "
                       "everything."},
@@ -23059,6 +23123,18 @@ SETTINGS_PAGES = [
               "label": "Go to packet number"},
              {"key": "shortcuts.inspector", "type": "shortcut",
               "label": "Show / hide the inspector"},
+             {"key": "shortcuts.back", "type": "shortcut",
+              "label": "Back to the previous view"},
+             {"key": "shortcuts.forward", "type": "shortcut",
+              "label": "Forward again"},
+             {"key": "shortcuts.group1", "type": "shortcut",
+              "label": "Overview tabs"},
+             {"key": "shortcuts.group2", "type": "shortcut",
+              "label": "Your network tabs"},
+             {"key": "shortcuts.group3", "type": "shortcut",
+              "label": "Internet tabs"},
+             {"key": "shortcuts.group4", "type": "shortcut",
+              "label": "Tools and help tabs"},
          ]},
      ]},
     {"id": "data", "icon": "\U0001F4BE", "title": "Data & Export",
@@ -25437,12 +25513,25 @@ class DetailDialog:
 
     def set_sections(self, sections):
         self.sections = sections
+        try:
+            y = self.txt.yview()[0]
+        except tk.TclError:
+            y = 0.0
         self.txt.config(state="normal")
         self.txt.delete("1.0", "end")
         for heading, text in sections:
             self.txt.insert("end", translate_text(heading) + "\n", ("h",))
             self.txt.insert("end", translate_lines(text or "—") + "\n\n")
         self.txt.config(state="disabled")
+        if y:
+            with contextlib.suppress(tk.TclError):
+                self.txt.yview_moveto(y)
+
+    def alive(self):
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
 
     def copy(self):
         title = self.win.title()
@@ -25761,6 +25850,87 @@ class BaseTab:
 
     def on_theme(self):
         pass
+
+    # what Back restores (F2): sub-view, filter fields, selected row,
+    # scroll position. VIEW_VARS names the tab's filter variables, the
+    # free-text one first.
+    VIEW_VARS = ()
+
+    def view_state(self):
+        st = {"subview": getattr(self, "subview", None)}
+        vals = {}
+        for name in self.VIEW_VARS:
+            var = getattr(self, name, None)
+            if var is not None:
+                with contextlib.suppress(tk.TclError):
+                    vals[name] = var.get()
+        st["vars"] = vals
+        if self.VIEW_VARS:
+            st["query"] = str(vals.get(self.VIEW_VARS[0], "") or "").strip()
+        kit = getattr(self, "kit", None)
+        tree = getattr(self, "tree", None)
+        if kit is not None and tree is not None:
+            with contextlib.suppress(tk.TclError):
+                sel = tree.selection()
+                st["sel"] = kit.key_of(sel[0]) if sel else None
+                st["y"] = tree.yview()[0]
+        return st
+
+    def apply_view_state(self, st):
+        if st.get("subview") and hasattr(self, "_sub_frames") and \
+                st["subview"] != getattr(self, "subview", None):
+            self.show_subview(st["subview"])
+        changed = False
+        for name, val in (st.get("vars") or {}).items():
+            var = getattr(self, name, None)
+            if var is not None and var.get() != val:
+                var.set(val)
+                changed = True
+        if changed:
+            self.apply_filters()
+        kit = getattr(self, "kit", None)
+        tree = getattr(self, "tree", None)
+        if kit is None or tree is None:
+            return
+        want = st.get("sel")
+        if want is not None:
+            for iid in kit.all_iids():
+                if kit.key_of(iid) == want:
+                    with contextlib.suppress(tk.TclError):
+                        parent = tree.parent(iid)
+                        if parent:
+                            tree.item(parent, open=True)
+                        tree.selection_set(iid)
+                        tree.focus(iid)
+                    break
+        if st.get("y") is not None:
+            with contextlib.suppress(tk.TclError):
+                tree.yview_moveto(st["y"])
+
+    def rebuild_in_slices(self):
+        """rebuild_steps() a slice (~30 ms) per callback, so showing a tab
+        that has to catch up does not freeze the window (a 3,000-row
+        Connections refill took 110 ms in one go)."""
+        steps = self.rebuild_steps()
+        app = self.app
+
+        def step():
+            end = time.perf_counter() + app.REBUILD_SLICE
+            try:
+                while time.perf_counter() < end:
+                    next(steps)
+            except StopIteration:
+                return
+            except tk.TclError:
+                return
+            app.root.after(1, step)
+        step()
+
+    def apply_filters(self):
+        """The filter fields changed from outside (Back): show it."""
+        fn = getattr(self, "rebuild", None)
+        if fn is not None:
+            fn()
 
     def make_subviews(self, names, on_switch=None):
         """A row of buttons at the top of the tab that switches between
@@ -26643,6 +26813,7 @@ TIMELINE_CATEGORY = {
 
 class TimelineTab(BaseTab):
     name, label_key = "timeline", "tab_timeline"
+    VIEW_VARS = ("search_var", "type_var", "sev_var", "dev_var")
 
     def build(self):
         self.header("\U0001F553  Timeline — devices joining and leaving, "
@@ -26984,6 +27155,7 @@ class TimelineTab(BaseTab):
 # ---- Devices -----------------------------------------------------------------
 class DevicesTab(BaseTab):
     name, label_key = "devices", "tab_devices"
+    VIEW_VARS = ("filter_var",)
     COLS = [("icon", "", 40, "center", False),
             ("name", "Device", 200, "w", True),
             ("cls", "What it likely is", 170, "w", False),
@@ -27260,6 +27432,8 @@ class DevicesTab(BaseTab):
 # ---- Websites -----------------------------------------------------------------
 class WebsitesTab(BaseTab):
     name, label_key = "websites", "tab_websites"
+    VIEW_VARS = ("q_var", "dev_var", "src_var", "ev_var", "enc_var",
+                 "cat_var", "sort_var")
     COLS = [("hits", "Lookups / visits", 110, "e", False),
             ("evidence", "How we know", 170, "w", False),
             ("traffic", "Traffic", 90, "e", False),
@@ -27649,6 +27823,7 @@ class WebsitesTab(BaseTab):
 # ---- Connections (Advanced) ---------------------------------------------------
 class ConnectionsTab(BaseTab):
     name, label_key, advanced = "connections", "tab_connections", True
+    VIEW_VARS = ("q_var", "dev_var", "status_var")
     COLS = [("device", "Device", 160, "w", False),
             ("to", "Connected to", 220, "w", True),
             ("purpose", "Purpose", 190, "w", True),
@@ -27967,10 +28142,10 @@ class ConnectionsTab(BaseTab):
             self.mail.refresh()
         if getattr(self, "_pending", False) and self.is_visible():
             self._pending = False
-            self.rebuild()
+            self.rebuild_in_slices()
         elif self._group_dirty and self.is_visible() and \
                 time.monotonic() - self._group_built > 3:
-            self.rebuild()
+            self.rebuild_in_slices()
 
     def rebuild(self):
         for _ in self.rebuild_steps():
@@ -28264,6 +28439,7 @@ class MailView:
 # ---- Remote hosts (Advanced) -------------------------------------------------
 class RemoteTab(BaseTab):
     name, label_key, advanced = "remote", "tab_remote", True
+    VIEW_VARS = ("q_var",)
     COLS = [("ip", "Remote IP", 130, "w", False),
             ("country", "Country", 150, "w", False),
             ("asn", "Provider (ASN)", 190, "w", True),
@@ -28278,7 +28454,7 @@ class RemoteTab(BaseTab):
             ("last", "Last seen", 80, "center", False)]
 
     def build(self):
-        self.header("\U0001F5A5  REMOTE HOSTS — public Internet addresses "
+        self.header("\U0001F5A5  INTERNET HOSTS — public Internet addresses "
                     "your devices talked to. These are never devices on your "
                     "network — they live somewhere out on the Internet.")
         geo = self.toolbar()
@@ -28403,7 +28579,7 @@ class RemoteTab(BaseTab):
         self.status_var.set(self.app._geoip_status_text())
         if getattr(self, "_pending", False) and self.is_visible():
             self._pending = False
-            self.rebuild()
+            self.rebuild_in_slices()
 
     def rebuild(self):
         for _ in self.rebuild_steps():
@@ -28464,6 +28640,7 @@ class RemoteTab(BaseTab):
 # ---- Alerts ------------------------------------------------------------------
 class AlertsTab(BaseTab):
     name, label_key = "alerts", "tab_alerts"
+    VIEW_VARS = ("q_var", "sev_var")
 
     def build(self):
         top = self.header("\U0001F514  Alerts — every alert separates "
@@ -30745,6 +30922,10 @@ def format_packet_time(ts, fmt, t0=0.0, prev=None):
 
 class PacketsTab(BaseTab):
     name, label_key, advanced = "packets", "tab_raw", True
+    VIEW_VARS = ("expr_var", "site_var")
+
+    def apply_filters(self):
+        self.apply()
     SUBVIEWS = ("Packets", "Streams", "Exchanges", "Statistics", "Expert")
 
     def build(self):
@@ -33491,6 +33672,118 @@ QUICK_START = (
 )
 
 
+class ViewRouter:
+    """Back and forward through the views you visited (F2). One entry per
+    visit of a tab, holding what you had there when you left it (filter,
+    selection, scroll), so Back returns to the same rows. Quick hops
+    (Ctrl+Tab through several tabs within a second) count as one step.
+    At most 50 entries."""
+
+    MAX = 50
+    MERGE_S = 1.0
+
+    def __init__(self, app):
+        self.app = app
+        self.stack = []
+        self.pos = -1
+        self._target = None
+
+    def current(self):
+        return self.stack[self.pos] if 0 <= self.pos < len(self.stack) \
+            else None
+
+    def visited(self, name):
+        if not name:
+            return
+        if self._target is not None:
+            hit, self._target = name == self._target, None
+            if hit:
+                return
+        cur = self.current()
+        if cur is not None:
+            if cur["tab"] == name:
+                return
+            self._capture(cur)
+        now = time.monotonic()
+        del self.stack[self.pos + 1:]
+        if cur is not None and len(self.stack) > 1 and \
+                now - cur["t"] < self.MERGE_S:
+            self.stack.pop()
+        self.stack.append({"tab": name, "state": None, "t": now})
+        del self.stack[:-self.MAX]
+        self.pos = len(self.stack) - 1
+        self.app._sync_nav()
+
+    def _capture(self, entry):
+        tab = self.app.tabs.get(entry["tab"])
+        if tab is not None:
+            try:
+                entry["state"] = tab.view_state()
+            except Exception:                        # noqa: BLE001
+                LOG.debug("view state of %s", entry["tab"], exc_info=True)
+
+    def can_back(self):
+        return self.pos > 0
+
+    def can_forward(self):
+        return self.pos + 1 < len(self.stack)
+
+    def back(self):
+        if self.can_back():
+            self._capture(self.stack[self.pos])
+            self.pos -= 1
+            self._apply(self.stack[self.pos])
+
+    def forward(self):
+        if self.can_forward():
+            self._capture(self.stack[self.pos])
+            self.pos += 1
+            self._apply(self.stack[self.pos])
+
+    def _apply(self, entry):
+        entry["t"] = 0.0               # a place you went back to stays
+        app = self.app
+        if app.current_tab_name() != entry["tab"]:
+            self._target = entry["tab"]
+        tab = app._select_tab(entry["tab"])
+        if entry.get("state"):
+            try:
+                tab.apply_view_state(entry["state"])
+            except Exception:                        # noqa: BLE001
+                LOG.debug("apply view state", exc_info=True)
+        app._sync_nav()
+
+    def describe(self, entry):
+        """'Devices — filter: printer'"""
+        app = self.app
+        tab = app.tabs.get(entry["tab"])
+        try:
+            label = str(app.nb.tab(tab.frame, "text")).strip()
+        except (tk.TclError, AttributeError):
+            label = entry["tab"]
+        label = re.sub(r"^[^\w(]+", "", label, flags=re.U).strip() or label
+        st = entry.get("state") or {}
+        q = st.get("query") or ""
+        if q:
+            return f"{label} — {translate_text('filter')}: {q}"
+        return label
+
+
+# the tab strip's groups (F2): caption, tabs in order
+TAB_GROUPS = (("Overview", ("dash", "feed", "timeline")),
+              ("Your network", ("devices", "map", "health", "alerts")),
+              ("Internet", ("websites", "connections", "remote")),
+              ("Tools and help", ("packets", "security", "sources", "help")))
+TAB_ORDER = tuple(n for _g, names in TAB_GROUPS for n in names)
+
+
+def tab_group_of(name):
+    for i, (_g, names) in enumerate(TAB_GROUPS):
+        if name in names:
+            return i
+    return len(TAB_GROUPS) - 1
+
+
 class TabStrip:
     """The main tabs, drawn as a strip that wraps onto a second row when
     they do not fit. ttk.Notebook cuts tab names off instead ("Tableau
@@ -33506,6 +33799,9 @@ class TabStrip:
         self.order = []
         self._job = None
         self._w = None
+        self.captions = {}       # group index -> label
+        self.dividers = []
+        self.show_captions = True
         self.frame.bind("<Configure>", self._on_conf, add="+")
 
     def _colors(self):
@@ -33604,6 +33900,64 @@ class TabStrip:
             with contextlib.suppress(tk.TclError, RuntimeError):
                 self._job = self.frame.after_idle(self.relayout)
 
+    def _group(self, tid):
+        for name, tab in self.app.tabs.items():
+            if str(tab.frame) == tid:
+                return tab_group_of(name)
+        return len(TAB_GROUPS) - 1
+
+    def _caption(self, gi):
+        lbl = self.captions.get(gi)
+        if lbl is None:
+            _win, _side, _sel, _fg, _acc, _border = self._colors()
+            lbl = tk.Label(self.frame,
+                           text=translate_text(TAB_GROUPS[gi][0]).upper(),
+                           font=mw_font(7, "bold"), padx=2, pady=0,
+                           bg=self.app.theme["window_bg"],
+                           fg=self.app.theme["muted_fg"])
+            self.captions[gi] = lbl
+        return lbl
+
+    def group_rows(self, width, captions=True):
+        """Rows of [(group, [tab ids])] segments: a group starts a new row
+        rather than splitting, unless it alone is wider than the strip."""
+        GAP = 11                          # 5 + 1 px divider + 5
+        segs = []
+        for tid in self.order:
+            gi = self._group(tid)
+            if segs and segs[-1][0] == gi:
+                segs[-1][1].append(tid)
+            else:
+                segs.append((gi, [tid]))
+        rows, x = [[]], 0
+        for gi, tids in segs:
+            cw = self._caption(gi).winfo_reqwidth() + 4 if captions else 0
+            ws = [self.tabs[t][0].winfo_reqwidth() + 2 for t in tids]
+            gw = cw + sum(ws)
+            lead = GAP if rows[-1] else 0
+            if rows[-1] and x + lead + gw > width:
+                rows.append([])
+                x, lead = 0, 0
+            if gw <= width or not tids:
+                rows[-1].append((gi, tids, captions))
+                x += lead + gw
+                continue
+            # the group alone is wider than the window: split it
+            part, px = [], lead + cw
+            for t, w in zip(tids, ws):
+                if part and x + px + w > width:
+                    rows[-1].append((gi, part, captions and
+                                     not any(s[0] == gi for r in rows
+                                             for s in r)))
+                    rows.append([])
+                    part, px, x = [], 0, 0
+                part.append(t)
+                px += w
+            rows[-1].append((gi, part, captions and not any(
+                s[0] == gi for r in rows for s in r)))
+            x += px
+        return [r for r in rows if r]
+
     def rows(self, width):
         """[[tab id, …], …] for this width: as few rows as needed, filled
         evenly (not ten tabs above and two below)."""
@@ -33630,6 +33984,9 @@ class TabStrip:
 
     def relayout(self):
         self._job = None
+        if FEATURES.get("tab_groups", True):
+            self._relayout_groups()
+            return
         try:
             if not self.frame.winfo_exists():
                 return
@@ -33657,6 +34014,64 @@ class TabStrip:
             if _int(self.frame.cget("height")) != y:
                 self.frame.configure(height=max(1, y))
         except (tk.TclError, KeyError):
+            pass
+
+    def _relayout_groups(self):
+        """Groups with a small caption, 10 px and a 1 px line between
+        them. When the captions would need a third row, only the lines
+        stay."""
+        try:
+            if not self.frame.winfo_exists():
+                return
+            W = self.frame.winfo_width()
+            if W <= 1:
+                W = sum(self.tabs[t][0].winfo_reqwidth() + 2
+                        for t in self.order) + 400
+            rows = self.group_rows(W, captions=True)
+            self.show_captions = len(rows) <= 2
+            if not self.show_captions:
+                rows = self.group_rows(W, captions=False)
+            t = self.app.theme
+            used_caps, n_div, y = set(), 0, 0
+            for r in rows:
+                h = max(self.tabs[tid][0].winfo_reqheight()
+                        for _g, tids, _c in r for tid in tids)
+                x = 0
+                for i, (gi, tids, cap) in enumerate(r):
+                    if i:
+                        x += 5
+                        if n_div >= len(self.dividers):
+                            self.dividers.append(tk.Frame(
+                                self.frame, width=1, bd=0,
+                                highlightthickness=0))
+                        d = self.dividers[n_div]
+                        n_div += 1
+                        d.configure(bg=t["border"])
+                        d.place(x=x, y=y + 3, width=1, height=max(4, h - 6))
+                        x += 6
+                    if cap:
+                        lbl = self._caption(gi)
+                        lbl.configure(bg=t["window_bg"], fg=t["muted_fg"],
+                                      text=translate_text(
+                                          TAB_GROUPS[gi][0]).upper())
+                        lbl.place(x=x, y=y + max(0, (
+                            h - lbl.winfo_reqheight()) // 2))
+                        used_caps.add(gi)
+                        x += lbl.winfo_reqwidth() + 4
+                    for tid in tids:
+                        o = self.tabs[tid][0]
+                        wd = o.winfo_reqwidth()
+                        o.place(x=x, y=y, width=wd, height=h)
+                        x += wd + 2
+                y += h + (1 if len(rows) > 1 else 0)
+            for gi, lbl in self.captions.items():
+                if gi not in used_caps:
+                    lbl.place_forget()
+            for d in self.dividers[n_div:]:
+                d.place_forget()
+            if _int(self.frame.cget("height")) != y:
+                self.frame.configure(height=max(1, y))
+        except (tk.TclError, KeyError, ValueError):
             pass
 
 
@@ -33804,6 +34219,7 @@ class MiniWireshark:
         self._populate_ifaces()
         self._apply_theme()
         self._apply_text_size(defer=False)
+        self._restore_window()
         self._layout_pass()
         self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map,
                              add="+")
@@ -33953,6 +34369,10 @@ class MiniWireshark:
     def replace_model(self, model):
         """Swap in a fresh model (Clear / New session / offline / demo).
         Every tab is reset so no old row can linger."""
+        if getattr(self, "_clear_undo", None) is not None and \
+                getattr(self, "_clear_undo", {}).get("model") is not model:
+            self._keep_undo(None)     # another source: no Undo of Clear
+            self._banner_action(None)
         self.gen += 1                 # frames of the old source are dropped
         self.ring.clear()
         self.ring.reset_counters()
@@ -34061,17 +34481,19 @@ class MiniWireshark:
         view_grp.pack(side="right", padx=(0, 8))
         search_grp = tk.Frame(header, bg="#2b3a55")
         search_grp.pack(side="right")
-        tk.Label(view_grp, text="View", bg="#2b3a55", fg="#c8d2e0").pack(
-            side="left", padx=(10, 4))
-        mode_box = ttk.Combobox(view_grp, textvariable=self.mode_ui_var,
-                                values=("Beginner", "Advanced"), width=12,
-                                state="readonly")
-        mode_box.pack(side="left")
-        mode_box.bind("<<ComboboxSelected>>", self._on_ui_mode_change)
-        Tooltip(mode_box, "Beginner shows the essentials. Advanced adds the "
-                          "Connections, Remote hosts and Packets tabs, "
-                          "technical columns and filter expressions. Same "
-                          "data either way.")
+        # 5.1.2: two joined buttons instead of a drop-down (they name
+        # themselves, so the "View" word is not needed; the header keeps
+        # its one row at 1000 px)
+        for value in ("Beginner", "Advanced"):
+            rb = ttk.Radiobutton(view_grp, text=value, value=value,
+                                 variable=self.mode_ui_var,
+                                 style="View.Toolbutton",
+                                 command=self._on_ui_mode_change)
+            rb.pack(side="left")
+            Tooltip(rb, "Beginner shows the essentials. Advanced adds the "
+                        "Connections, Internet hosts and Packets tabs, "
+                        "technical columns and filter expressions. Same "
+                        "data either way.")
         tk.Label(search_grp, text="Search", bg="#2b3a55",
                  fg="#c8d2e0").pack(side="left", padx=(10, 4))
         self.global_search_var = tk.StringVar()
@@ -34099,6 +34521,12 @@ class MiniWireshark:
             self.mode_banner, text="Switch to Quiet Mode",
             command=self._toggle_active_scanning)
         self.mode_toggle_btn.pack(side="right")
+        # 5.1.2 state line: Full Power on the right; the sentence opens
+        # a short panel with the details and every action
+        self.mode_power_lbl = tk.Label(self.mode_banner, text="",
+                                       font=mw_font(9, "bold"))
+        self.mode_lbl.bind("<Button-1>", lambda e: self.toggle_state_panel())
+        self.state_panel = None
         Tooltip(self.mode_lbl,
                 "This banner always tells the truth about whether "
                 "MiniWireshark is sending discovery probes and health checks "
@@ -34145,7 +34573,9 @@ class MiniWireshark:
                                                         padx=(0, 6))
         self.clear_btn = ttk.Button(rgrp, text=tr("btn_clear"), width=-8,
                                     command=self.clear)
-        self.clear_btn.pack(side="right", padx=(0, 6))
+        if not FEATURES.get("state_line", True):
+            # 5.1.2: Clear lives in the Session menu, with Undo
+            self.clear_btn.pack(side="right", padx=(0, 6))
         ttk.Label(bar, text="Network card:").pack(side="left")
         self.iface_var = tk.StringVar()
         self.iface_box = ttk.Combobox(bar, textvariable=self.iface_var,
@@ -34155,10 +34585,12 @@ class MiniWireshark:
         self.iface_box.bind("<<ComboboxSelected>>", self._on_iface_picked)
         ttk.Button(bar, text="↻", width=3, command=self.refresh_adapters
                    ).pack(side="left", padx=(0, 12))
-        ttk.Label(bar, text="Capture filter:").pack(side="left")
+        self.cap_filter_lbl = ttk.Label(bar, text="Capture filter:")
+        self.cap_filter_lbl.pack(side="left")
         self.filter_var = tk.StringVar()
         fe = ttk.Entry(bar, textvariable=self.filter_var, width=10)
         fe.pack(side="left", padx=(6, 12))
+        self.cap_filter_entry = fe
         Tooltip(fe, "Optional (advanced): only CAPTURE packets matching a "
                     "BPF filter, e.g. “host 192.168.1.20”. Leave "
                     "empty to see everything. For viewing, use the display "
@@ -34176,20 +34608,51 @@ class MiniWireshark:
         left = tk.Frame(self.body, bd=0, highlightthickness=0,
                         bg="#f4f5f7")
         self.body.add(left, weight=4)
-        self.tabstrip = TabStrip(self, left)
-        self.tabstrip.frame.pack(fill="x")
+        strip_row = tk.Frame(left, bd=0, highlightthickness=0,
+                             bg="#f4f5f7")
+        strip_row.pack(fill="x")
+        self.strip_row = strip_row
+        self.router = ViewRouter(self)
+        self._group_last = {}
+        nav = tk.Frame(strip_row, bd=0, highlightthickness=0, bg="#f4f5f7")
+        nav.pack(side="left", anchor="n", padx=(0, 4))
+        self.nav_frame = nav
+        self.nav_back = tk.Label(nav, text="◀", padx=5, pady=3,
+                                 font=mw_font(10, "bold"), cursor="hand2")
+        self.nav_fwd = tk.Label(nav, text="▶", padx=5, pady=3,
+                                font=mw_font(10, "bold"), cursor="hand2")
+        self.nav_back.pack(side="left")
+        self.nav_fwd.pack(side="left")
+        self.nav_back.bind("<Button-1>", lambda e: self.router.back())
+        self.nav_fwd.bind("<Button-1>", lambda e: self.router.forward())
+        self.nav_back_tip = Tooltip(self.nav_back, "Back (Alt+Left)")
+        self.nav_fwd_tip = Tooltip(self.nav_fwd, "Forward (Alt+Right)")
+        self.tabstrip = TabStrip(self, strip_row)
+        self.tabstrip.frame.pack(side="left", fill="x", expand=True)
         self.nb = ttk.Notebook(left, style="Main.TNotebook")
         self.nb.pack(fill="both", expand=True)
         self.nb.enable_traversal()
         self.tabs = OrderedDict()
-        for cls in (DashboardTab, FeedTab, TimelineTab, DevicesTab,
-                    WebsitesTab, ConnectionsTab, RemoteTab, AlertsTab,
-                    MapTab, HealthTab, SecurityTab, SourcesTab, PacketsTab,
-                    HelpTab):
+        classes = {c.name: c for c in (
+            DashboardTab, FeedTab, TimelineTab, DevicesTab, WebsitesTab,
+            ConnectionsTab, RemoteTab, AlertsTab, MapTab, HealthTab,
+            SecurityTab, SourcesTab, PacketsTab, HelpTab)}
+        # 5.1.2: in the order of the strip's groups (5.0.2's order when
+        # the groups are switched off)
+        order = TAB_ORDER if FEATURES.get("tab_groups", True) else (
+            "dash", "feed", "timeline", "devices", "websites",
+            "connections", "remote", "alerts", "map", "health", "security",
+            "sources", "packets", "help")
+        for name in order:
+            cls = classes[name]
             tab = cls(self)
             self.tabs[cls.name] = tab
             self.nb.add(tab.frame, text=tr(cls.label_key))
         self.nb.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        for seq, fn in (("<Button-8>", self.router.back),
+                        ("<Button-9>", self.router.forward)):
+            with contextlib.suppress(tk.TclError):
+                self.root.bind(seq, lambda e, f=fn: f())
         self.tabstrip.sync()
         for seq, step in (("<Control-Tab>", 1), ("<Control-Shift-Tab>", -1),
                           ("<Control-ISO_Left_Tab>", -1)):
@@ -34226,10 +34689,21 @@ class MiniWireshark:
         self.job_lbl.bind("<Button-1>", lambda e: self.jobs.cancel_all())
         Tooltip(self.job_lbl, "Work running in the background. Click to "
                               "cancel it.")
-        tk.Label(status, textvariable=self.status_var, anchor="w",
-                 justify="left", wraplength=2000, fg="#222222",
-                 bg="#e3e6eb", padx=10, pady=4).pack(
-            side="left", fill="x", expand=True)
+        # 5.1.2: messages history; the status text opens Diagnostics
+        self.msg_btn = tk.Label(status, text="✉", fg="#1a3a6b",
+                                bg="#e3e6eb", padx=8, pady=4, cursor="hand2")
+        self.msg_btn.pack(side="left")
+        self.msg_btn.bind("<Button-1>", lambda e: self.open_messages())
+        Tooltip(self.msg_btn, "The last 50 messages")
+        self._sync_messages_btn()
+        self.status_lbl = tk.Label(
+            status, textvariable=self.status_var, anchor="w",
+            justify="left", wraplength=2000, fg="#222222", bg="#e3e6eb",
+            padx=10, pady=4, cursor="hand2")
+        self.status_lbl.pack(side="left", fill="x", expand=True)
+        self.status_lbl.bind("<Button-1>", lambda e: self.open_diagnostics())
+        Tooltip(self.status_lbl, "What the capture is doing. Click for "
+                                 "Diagnostics.")
         foot.bind("<Button-1>", lambda e: self.open_coverage())
         Tooltip(foot, "What this computer can and can't see. Click for "
                       "the full coverage report.")
@@ -34242,6 +34716,9 @@ class MiniWireshark:
         prev = getattr(self, "_shown_tab_name", None)
         if cur != prev:
             self._shown_tab_name = cur
+            with contextlib.suppress(AttributeError):
+                self.router.visited(cur)
+                self._group_last[tab_group_of(cur)] = cur
             for kit in getattr(self, "kits", ()):
                 try:
                     if kit.tab.name == prev:
@@ -34257,6 +34734,77 @@ class MiniWireshark:
             with contextlib.suppress(tk.TclError):
                 self.root.after_cancel(job)
         self._tab_refresh_job = self.root.after(1, self._refresh_shown_tab)
+
+    def _remember_window(self):
+        """Size, place and the tab you were on, for the next start."""
+        with contextlib.suppress(tk.TclError, AttributeError):
+            if self.root.state() == "normal":
+                self.config.set("appearance.window", self.root.geometry())
+            self.config.set("appearance.last_tab", self.current_tab_name())
+            self.config.save()
+
+    def _restore_window(self):
+        geo = self.config.get("appearance.window", "")
+        m = re.match(r"^(\d+)x(\d+)\+(-?\d+)\+(-?\d+)$", str(geo or ""))
+        if m:
+            w, h, x, y = (int(v) for v in m.groups())
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            # only if it still fits this screen (a laptop off its monitor)
+            if 600 <= w <= sw and 400 <= h <= sh and 0 <= x <= sw - 200 \
+                    and 0 <= y <= sh - 200:
+                with contextlib.suppress(tk.TclError):
+                    self.root.geometry(geo)
+        last = self.config.get("appearance.last_tab", "")
+        tab = self.tabs.get(last)
+        if tab is not None and not (tab.advanced and self.beginner_mode):
+            with contextlib.suppress(tk.TclError):
+                self._select_tab(last)
+
+    def _nav_key(self, fn):
+        # Alt+Left/Right belong to a text field that has the focus
+        w = self.root.focus_get()
+        if isinstance(w, (tk.Entry, ttk.Entry, tk.Text, ttk.Combobox)):
+            return None
+        fn()
+        return "break"
+
+    def _sync_nav(self):
+        r = getattr(self, "router", None)
+        if r is None or not hasattr(self, "nav_back"):
+            return
+        t = self.theme
+        for lbl, ok, tip, step, word in (
+                (self.nav_back, r.can_back(), self.nav_back_tip, -1,
+                 "Back to"),
+                (self.nav_fwd, r.can_forward(), self.nav_fwd_tip, 1,
+                 "Forward to")):
+            with contextlib.suppress(tk.TclError):
+                lbl.configure(bg=t["window_bg"],
+                              fg=t["text_fg"] if ok else t["border"],
+                              cursor="hand2" if ok else "arrow")
+            if ok:
+                dest = r.stack[r.pos + step]
+                tip.set_text(f"{translate_text(word)} "
+                             f"{r.describe(dest)}")
+            else:
+                tip.set_text(translate_text("Nowhere to go yet"))
+        with contextlib.suppress(tk.TclError):
+            self.nav_frame.configure(bg=t["window_bg"])
+            self.strip_row.configure(bg=t["window_bg"])
+
+    def select_group(self, i):
+        """Ctrl+1..4: the tab you last used in that group, else its first
+        tab that the current view shows."""
+        if not 0 <= i < len(TAB_GROUPS):
+            return "break"
+        names = [n for n in TAB_GROUPS[i][1] if n in self.tabs and not (
+            self.tabs[n].advanced and self.beginner_mode)]
+        if not names:
+            return "break"
+        last = self._group_last.get(i)
+        self._select_tab(last if last in names else names[0])
+        return "break"
 
     def _kits_tick(self):
         """Every 20 s: "4 min ago" cells of the shown table move on."""
@@ -34388,17 +34936,25 @@ class MiniWireshark:
                          command=self.open_quick_start)
         menu.add_command(label="Help & glossary",
                          command=lambda: self.goto("help"))
-        menu.add_command(label="Diagnostics…",
-                         command=self.open_diagnostics)
-        menu.add_command(label="\U0001F6E0 Repair MiniWireshark…",
-                         command=self.repair_everything)
-        menu.add_command(label="Runtime Manager…",
-                         command=self.open_runtime_manager)
+        # 5.1.2: everything about MiniWireshark's own health, together
+        health = tk.Menu(menu, tearoff=0)
+        with contextlib.suppress(tk.TclError):
+            health.configure(**{k: menu.cget(k) for k in (
+                "bg", "fg", "activebackground", "activeforeground")})
+        health.add_command(label="Diagnostics…",
+                           command=self.open_diagnostics)
+        health.add_command(label="\U0001F6E0 Repair MiniWireshark…",
+                           command=self.repair_everything)
+        health.add_command(label="Runtime Manager…",
+                           command=self.open_runtime_manager)
+        health.add_command(label="Startup history…",
+                           command=self.open_boot_history)
+        health.add_command(label="Run self-test",
+                           command=self.run_self_test_window)
+        menu.add_cascade(label="MiniWireshark health", menu=health)
         menu.add_command(label=("Stop Demo Mode" if self.data_mode == "demo"
                                 else "Try Demo Mode"),
                          command=self.toggle_demo)
-        menu.add_command(label="Run self-test",
-                         command=self.run_self_test_window)
         menu.add_separator()
         menu.add_command(label="Your networks…",
                          command=self.open_networks_dialog)
@@ -34417,7 +34973,9 @@ class MiniWireshark:
             menu.grab_release()
 
     # ---- banners --------------------------------------------------------------
-    def _set_banner(self, text, kind="info"):
+    def _set_banner(self, text, kind="info", action=None):
+        self._remember_message(text, kind)
+        self._banner_action(action)
         colors = {"info": ("#e8f0fe", "#1a3a6b"),
                   "warn": ("#fff4e0", "#7a4a00"),
                   "bad": ("#fbe9e7", "#8a1a08"),
@@ -34430,6 +34988,10 @@ class MiniWireshark:
             self.banner_lbl.config(bg=bg, fg=fg, text=text)
             if hasattr(self, "banner_close"):
                 self.banner_close.config(bg=bg, fg=fg)
+            ab = getattr(self, "banner_action_btn", None)
+            if ab is not None and ab.winfo_manager():
+                # an Undo offer keeps the message up as long as it lasts
+                kind = "warn" if kind in ("info", "good") else kind
             # a short message does not keep a line of the screen forever:
             # information goes away after a while, warnings stay until
             # closed or replaced
@@ -34445,6 +35007,55 @@ class MiniWireshark:
 
     BANNER_SECONDS = 20
 
+    def _banner_action(self, action):
+        """One button in the message line ("Undo"), or none."""
+        btn = getattr(self, "banner_action_btn", None)
+        if btn is None:
+            if action is None or not hasattr(self, "banner_close"):
+                return
+            btn = self.banner_action_btn = ttk.Button(self.banner)
+        with contextlib.suppress(tk.TclError):
+            if action is None:
+                if btn.winfo_manager():
+                    btn.pack_forget()
+                return
+            btn.configure(text=action[0], command=action[1])
+            if not btn.winfo_manager():
+                btn.pack(side="right", padx=(8, 4), before=self.banner_lbl)
+
+    MESSAGES_KEPT = 50
+
+    def _remember_message(self, text, kind):
+        """The last 50 messages, for the ✉ button in the status bar."""
+        log = getattr(self, "messages", None)
+        if log is None:
+            log = self.messages = deque(maxlen=self.MESSAGES_KEPT)
+        text = str(text or "").strip()
+        if not text or (log and log[-1][2] == text):
+            return
+        log.append((time.time(), kind, text))
+        self._unread = getattr(self, "_unread", 0) + 1
+        self._sync_messages_btn()
+
+    def _sync_messages_btn(self):
+        btn = getattr(self, "msg_btn", None)
+        if btn is None:
+            return
+        n = getattr(self, "_unread", 0)
+        with contextlib.suppress(tk.TclError):
+            btn.configure(text=f"✉ {n}" if n else "✉")
+
+    def open_messages(self):
+        """The last 50 messages that appeared in the message line."""
+        self._unread = 0
+        self._sync_messages_btn()
+        rows = list(getattr(self, "messages", ()))
+        text = "\n".join(f"{fmt_clock(ts)}  {translate_text(msg)}"
+                         for ts, _k, msg in reversed(rows)) or \
+            translate_text("No messages yet.")
+        DetailDialog(self, "Messages", [("The last 50 messages, newest "
+                                         "first", text)], size="620x480")
+
     def _hide_banner(self):
         self._banner_job = None
         with contextlib.suppress(tk.TclError):
@@ -34454,6 +35065,9 @@ class MiniWireshark:
         """Always truthful: says whether anything is being SENT right now
         and, on a network you haven't trusted, why not."""
         if not hasattr(self, "mode_banner"):
+            return
+        if FEATURES.get("state_line", True):
+            self._restyle_state_line()
             return
         t = self.theme
         wanted = self.config.get("mode.active_scanning", True)
@@ -34512,6 +35126,166 @@ class MiniWireshark:
             elif not self.mode_banner.winfo_manager():
                 self.mode_banner.pack(fill="x", after=self.header_frame)
         self._restyle_data_banner()
+
+    def state_line_parts(self):
+        """(text, bg key, fg key, button text, command, actions): the
+        state line's sentence and its one button, by priority: kill
+        switch, not live, untrusted network, then Active/Quiet. `actions`
+        is every action that applies (the details panel lists them)."""
+        wanted = self.config.get("mode.active_scanning", True)
+        live = self.data_mode == "live"
+        prof = getattr(self, "network_profile", None)
+        name = prof.get("name", "") if prof else ""
+        data = DATA_MODE_TEXT.get(self.data_mode)
+        actions = []
+        if LEDGER.killed:
+            actions.append(("Turn the kill switch off", self._kill_switch_off))
+        if data:
+            actions.append(("Exit demo" if self.data_mode == "demo" else
+                            "Return to live capture", self._return_to_live))
+        if prof is not None and not prof.get("trusted") and wanted:
+            actions.append(("Trust this network", self.trust_network))
+        actions.append(("Switch to Quiet Mode" if wanted else
+                        "Switch to Active Scanning",
+                        self._toggle_active_scanning))
+        if LEDGER.killed:
+            text = ("\U0001F6D1 KILL SWITCH ON — MiniWireshark sends nothing "
+                    "at all (no probes, lookups, downloads or update "
+                    "checks). It only listens.")
+            colors = ("mode_quiet_bg", "mode_quiet_fg")
+        elif data:
+            text = data + (f"   [{self.data_label}]" if self.data_label
+                           else "") + "  ·  Nothing is being sent."
+            colors = ("mode_quiet_bg", "mode_quiet_fg") if \
+                self.data_mode == "demo" else ("warn_bg", "warn_fg")
+        elif wanted and live and prof is None:
+            text = (tr("mode_quiet") + "  Checking which network this is "
+                    "before sending anything…")
+            colors = ("mode_quiet_bg", "mode_quiet_fg")
+        elif wanted and prof is not None and not prof.get("trusted"):
+            text = (f"\U0001F535 QUIET MODE — “{name}” is a network you "
+                    f"haven't marked as yours, so MiniWireshark is only "
+                    f"listening and sends nothing.")
+            colors = ("mode_quiet_bg", "mode_quiet_fg")
+        elif wanted:
+            text = tr("mode_active") + (f"  Network: {name}." if name
+                                        else "")
+            if not live:
+                text += ("  (Nothing is being sent right now: not capturing "
+                         "live.)")
+            colors = ("mode_active_bg", "mode_active_fg")
+        else:
+            text = tr("mode_quiet") + (f"  Network: {name}." if name else "")
+            colors = ("mode_quiet_bg", "mode_quiet_fg")
+        if wanted and live and prof is None and not LEDGER.killed:
+            first = ("Stay in Quiet Mode", self._toggle_active_scanning)
+        else:
+            first = actions[0]
+        return text, colors[0], colors[1], first[0], first[1], actions
+
+    def _restyle_state_line(self):
+        """One line under the header that is never hidden: whether
+        anything is being sent, whether this is live, and one button."""
+        t = self.theme
+        text, bgk, fgk, btn_text, cmd, _acts = self.state_line_parts()
+        text = "  ".join(translate_text(p) for p in text.split("  "))
+        bg, fg = t[bgk], t[fgk]
+        power = translate_text(self.mode_pill_text())
+        with contextlib.suppress(tk.TclError):
+            self.mode_banner.configure(bg=bg)
+            self.mode_lbl.configure(bg=bg, fg=fg, text=text,
+                                    cursor="hand2")
+            self.mode_toggle_btn.configure(text=btn_text, command=cmd)
+            self.mode_power_lbl.configure(text=power, bg=bg, fg=fg)
+            if power and not self.mode_power_lbl.winfo_manager():
+                self.mode_power_lbl.pack(side="right", padx=(0, 10),
+                                         before=self.mode_lbl)
+            elif not power and self.mode_power_lbl.winfo_manager():
+                self.mode_power_lbl.pack_forget()
+            if not self.mode_banner.winfo_manager():
+                self.mode_banner.pack(fill="x", after=self.header_frame)
+            self.data_banner.pack_forget()
+            # the old second banner's label follows the line (an alias)
+            self.data_banner.configure(bg=bg)
+            self.data_lbl.configure(text=text, bg=bg, fg=fg)
+        self._mode_merged = bool(DATA_MODE_TEXT.get(self.data_mode))
+        if self.state_panel is not None:
+            self._fill_state_panel()
+
+    def toggle_state_panel(self, show=None):
+        if not FEATURES.get("state_line", True):
+            return
+        is_open = self.state_panel is not None
+        show = (not is_open) if show is None else show
+        if not show:
+            if is_open:
+                with contextlib.suppress(tk.TclError):
+                    self.state_panel.destroy()
+                self.state_panel = None
+            return
+        if is_open:
+            return
+        t = self.theme
+        self.state_panel = tk.Frame(self.root, bg=t["card_bg"], padx=16,
+                                    pady=8, highlightthickness=1,
+                                    highlightbackground=t["border"])
+        self.state_panel.pack(fill="x", after=self.mode_banner)
+        self.state_panel.bind("<Escape>", lambda e: self.toggle_state_panel(
+            False))
+        self._fill_state_panel()
+        with contextlib.suppress(tk.TclError):
+            self.state_panel.focus_set()
+
+    def state_panel_lines(self):
+        """The details under the state line, already in your language."""
+        tr_ = translate_text
+        prof = getattr(self, "network_profile", None)
+        if prof is None:
+            net = tr_("Network: not identified yet.")
+        else:
+            net = (f"{tr_('Network:')} {prof.get('name', '') or tr_('unnamed')}"
+                   f" — {tr_('trusted (yours)') if prof.get('trusted') else tr_('not marked as yours')}.")
+        now = time.time()
+        recent = [e for e in LEDGER.snapshot() if now - e["ts"] < 600]
+        by = Counter()
+        for e in recent:
+            if e["allowed"]:
+                by[tr_(OUTBOUND_FEATURES.get(e["feature"], e["feature"]))]                     += e["count"]
+        sent = sum(by.values())
+        if sent:
+            sent_txt = (f"{tr_('Sent by MiniWireshark in the last 10 minutes:')}"
+                        f" {sent} (" + ", ".join(
+                            f"{k} {n}" for k, n in by.most_common(4)) + ").")
+        else:
+            sent_txt = tr_("Nothing was sent in the last 10 minutes.")
+        spots = blind_spots(self.model, self.data_mode, self.active_mode())
+        see = (f"{tr_('What this computer cannot see:')} "
+               + "; ".join(tr_(x) for x in spots) + "."
+               if spots else tr_("No known blind spots right now."))
+        return [net, sent_txt, see]
+
+    def _fill_state_panel(self):
+        panel = self.state_panel
+        if panel is None:
+            return
+        t = self.theme
+        with contextlib.suppress(tk.TclError):
+            for w in panel.winfo_children():
+                w.destroy()
+            for line in self.state_panel_lines():
+                tk.Label(panel, text=line, bg=t["card_bg"],
+                         fg=t["text_fg"], anchor="w", justify="left",
+                         wraplength=1100).pack(fill="x")
+            row = tk.Frame(panel, bg=t["card_bg"])
+            row.pack(fill="x", pady=(6, 0))
+            for label, fn in self.state_line_parts()[5]:
+                ttk.Button(row, text=label, command=lambda f=fn: (
+                    f(), self._restyle_mode_banner())).pack(side="left",
+                                                            padx=(0, 6))
+            ttk.Button(row, text="What can I see from here?",
+                       command=self.open_coverage).pack(side="left")
+            ttk.Button(row, text="Close", command=lambda:
+                       self.toggle_state_panel(False)).pack(side="right")
 
     def _kill_switch_off(self):
         self.config.set("privacy.kill_switch", False)
@@ -35422,7 +36196,8 @@ class MiniWireshark:
         v = self.model.vantage.classify(
             offline=self.data_mode in ("offline", "session"))
         spots = blind_spots(self.model, self.data_mode, self.active_mode())
-        pill = translate_text(self.mode_pill_text())
+        pill = "" if FEATURES.get("state_line", True) else \
+            translate_text(self.mode_pill_text())
         tr = translate_text
         try:
             narrow = self.root.winfo_width() < 1500
@@ -36450,6 +37225,19 @@ class MiniWireshark:
             tab = self.tabs.get(name)
             if tab is not None and hasattr(tab, "apply_mode"):
                 tab.apply_mode()
+        # 5.1.2: the capture filter (an expert BPF field) is Advanced only;
+        # a filter already typed stays in use and keeps it visible
+        with contextlib.suppress(AttributeError, tk.TclError):
+            show = not self.beginner_mode or bool(
+                self.filter_var.get().strip()) or \
+                not FEATURES.get("state_line", True)
+            lbl, ent = self.cap_filter_lbl, self.cap_filter_entry
+            if show and not ent.winfo_manager():
+                lbl.pack(side="left", before=self.start_btn)
+                ent.pack(side="left", padx=(6, 12), before=self.start_btn)
+            elif not show and ent.winfo_manager():
+                lbl.pack_forget()
+                ent.pack_forget()
         with contextlib.suppress(AttributeError):
             self.tabstrip.sync()
 
@@ -36497,6 +37285,7 @@ class MiniWireshark:
         self._restyle_mode_banner()
         with contextlib.suppress(AttributeError):
             self.tabstrip.sync()
+        self._sync_nav()
         for tab in self.tabs.values():
             if tab.is_visible():
                 with contextlib.suppress(tk.TclError):
@@ -36631,6 +37420,12 @@ class MiniWireshark:
                   foreground=[("disabled", "#7a808c" if dark else "#8a8a8a")])
         style.configure("TCheckbutton", background=surface, foreground=fg)
         style.configure("TRadiobutton", background=surface, foreground=fg)
+        # the header's Beginner | Advanced buttons (5.1.2)
+        style.configure("View.Toolbutton", background="#3a4a68",
+                        foreground="#dde4ee", padding=(6, 1))
+        style.map("View.Toolbutton",
+                  background=[("selected", "#f4f5f7"), ("active", "#4a5d80")],
+                  foreground=[("selected", "#1a2a44"), ("active", "#ffffff")])
         style.map("TCheckbutton", background=[("active", surface)])
         style.map("TRadiobutton", background=[("active", surface)])
         style.configure("TNotebook", background=frame)
@@ -36815,8 +37610,15 @@ class MiniWireshark:
             "inspector": lambda e=None: self.toggle_inspector(),
             "palette": lambda e=None: self.open_palette(),
             "goto_packet": lambda e=None: self.go_to_packet(),
+            "back": lambda e=None: self._nav_key(self.router.back),
+            "forward": lambda e=None: self._nav_key(self.router.forward),
+            "group1": lambda e=None: self.select_group(0),
+            "group2": lambda e=None: self.select_group(1),
+            "group3": lambda e=None: self.select_group(2),
+            "group4": lambda e=None: self.select_group(3),
         }
-        shortcuts = self.config.data.get("shortcuts", DEFAULT_SHORTCUTS)
+        shortcuts = dict(DEFAULT_SHORTCUTS)
+        shortcuts.update(self.config.data.get("shortcuts") or {})
         for name, seq in shortcuts.items():
             fn = actions.get(name)
             if not fn or not seq:
@@ -39121,7 +39923,150 @@ class MiniWireshark:
                     "device."))
         return sections
 
+    # ---- detail cards (F3) -----------------------------------------------------
+    CARD_KINDS = ("device", "website", "remote", "flow", "alert")
+
     def show_device(self, key):
+        return self.open_card("device", key)
+
+    def show_website(self, dom):
+        return self.open_card("website", dom)
+
+    def show_remote(self, ip):
+        return self.open_card("remote", ip)
+
+    def show_flow(self, fid):
+        return self.open_card("flow", fid)
+
+    def show_alert(self, aid):
+        return self.open_card("alert", aid)
+
+    def open_card(self, kind, key):
+        """The item's card in a window. One window per kind is reused for
+        the next item (20 devices opened = one window), at the place and
+        size you gave it; a pinned window stays and the next item opens
+        a new one."""
+        build = {"device": self._device_card, "website": self._website_card,
+                 "remote": self._remote_card, "flow": self._flow_card,
+                 "alert": self._alert_card}.get(kind)
+        if build is None:
+            return None
+        cards = self.__dict__.setdefault("_cards", {})
+        old = cards.get(kind)
+        geo = None
+        if old is not None and old.alive() and not old.pinned:
+            with contextlib.suppress(tk.TclError):
+                geo = old.win.geometry()
+                old.win.destroy()
+        dlg = build(key)
+        if dlg is None:
+            return None
+        dlg.card, dlg.pinned = (kind, key), False
+        if geo:
+            with contextlib.suppress(tk.TclError):
+                dlg.win.geometry(geo)
+        if self.data_mode in ("offline", "session", "demo"):
+            with contextlib.suppress(tk.TclError):
+                dlg.win.title(dlg.win.title() + " — " + translate_text(
+                    {"offline": "capture file", "session": "saved session",
+                     "demo": "demo data"}[self.data_mode]))
+        cards[kind] = dlg
+        self.__dict__.setdefault("_card_wins", []).append(dlg)
+        pin_var = tk.BooleanVar(master=dlg.win, value=False)
+
+        def pin():
+            dlg.pinned = pin_var.get()
+            if dlg.pinned and cards.get(kind) is dlg:
+                cards.pop(kind, None)       # the next item: a new window
+            elif not dlg.pinned:
+                cards[kind] = dlg
+        dlg.pin_var, dlg.pin_toggle = pin_var, pin
+        ttk.Checkbutton(dlg.btns, text="\U0001F4CC Keep open",
+                        variable=pin_var, command=pin).pack(side="right",
+                                                             padx=6)
+        ttk.Button(dlg.btns, text="Show in the inspector",
+                   command=lambda: self._card_to_inspector(dlg)).pack(
+            side="right", padx=(6, 0))
+        if not getattr(self, "_cards_job", None):
+            self._cards_job = self.root.after(2000, self._cards_tick)
+        return dlg
+
+    def _card_to_inspector(self, dlg):
+        kind, key = dlg.card
+        self.toggle_inspector(True)
+        self.inspect(kind, key)
+        with contextlib.suppress(tk.TclError):
+            dlg.win.destroy()
+
+    def card_sections(self, kind, key):
+        """The card's text now, or None when the item is gone."""
+        m = self.model
+        if kind == "device":
+            dev = m.registry.by_key.get(key)
+            return self.device_report(dev) if dev else None
+        if kind == "website":
+            w = m.websites.get(key)
+            return self.website_report(w) if w else None
+        if kind == "remote":
+            r = m.remote_hosts.get(key)
+            return self.remote_report(r) if r else None
+        if kind == "flow":
+            f = m.flows.get(key)
+            return self.flow_report(f) if f else None
+        if kind == "alert":
+            a = m.alerts.alerts.get(key)
+            return self.alert_report(a) if a else None
+        return None
+
+    def gone_text(self, kind, key):
+        """What became of an item that is no longer listed."""
+        m = self.model
+        if kind == "device":
+            new = m.registry.resolve(key)
+            dev = m.registry.by_key.get(new) if new != key else None
+            if dev is not None:
+                return (f"This device was merged into "
+                        f"{self.device_label(dev)}.", new)
+            return ("This device is no longer listed (it expired, or the "
+                    "data was cleared).", None)
+        return ("This item is no longer listed (it expired, or the data "
+                "was cleared or replaced).", None)
+
+    def _cards_tick(self):
+        """Open cards follow the data: at most every 2 s, only when their
+        text changed."""
+        self._cards_job = None
+        wins = [d for d in getattr(self, "_card_wins", []) if d.alive()]
+        self._card_wins = wins
+        if not wins:
+            return
+        if not self.minimized():
+            for dlg in wins:
+                kind, key = dlg.card
+                try:
+                    new = self.card_sections(kind, key)
+                    if new is None:
+                        if getattr(dlg, "gone", False):
+                            continue
+                        dlg.gone = True
+                        text, other = self.gone_text(kind, key)
+                        dlg.set_sections([("No longer listed", text)])
+                        if other is not None:
+                            ttk.Button(dlg.btns, text="Open it",
+                                       command=lambda o=other:
+                                       self.open_card("device", o)).pack(
+                                side="left", padx=(0, 6))
+                    elif new != dlg.sections:
+                        dlg.gone = False
+                        dlg.set_sections(new)
+                except tk.TclError:
+                    pass
+                except Exception:                    # noqa: BLE001
+                    LOG.debug("card refresh", exc_info=True)
+        with contextlib.suppress(tk.TclError):
+            self._cards_job = self.root.after(2000, self._cards_tick)
+
+    def _device_card(self, key):
         dev = self.model.registry.by_key.get(key)
         if not dev:
             return
@@ -39138,16 +40083,23 @@ class MiniWireshark:
             v2 = tk.BooleanVar(value=dev.expected)
             v3 = tk.BooleanVar(value=dev.pinned_no_merge)
 
-            def sync():
-                dev.mine, dev.expected = v1.get(), v2.get()
-                dev.pinned_no_merge = v3.get()
-                app._labels_changed(dev)
+            def flip(flag, var):
+                # 5.1.2: through the corrections journal, so Ctrl+Z (and
+                # Help → Your device corrections) can undo it
+                cur = app.model.registry.by_key.get(
+                    app.model.registry.resolve(key))
+                if cur is not None and bool(getattr(cur, flag)) != \
+                        bool(var.get()):
+                    app.toggle_flag(cur.key, flag)
             ttk.Checkbutton(row, text="★ This is mine", variable=v1,
-                            command=sync).pack(side="left")
+                            command=lambda: flip("mine", v1)).pack(
+                side="left")
             ttk.Checkbutton(row, text="Expected / known", variable=v2,
-                            command=sync).pack(side="left", padx=10)
+                            command=lambda: flip("expected", v2)).pack(
+                side="left", padx=10)
             ttk.Checkbutton(row, text="Never merge", variable=v3,
-                            command=sync).pack(side="left")
+                            command=lambda: flip("pinned_no_merge",
+                                                 v3)).pack(side="left")
             if dev.presence:
                 cv = tk.Canvas(box, height=34, bg=t["tab_bg"],
                                highlightthickness=0)
@@ -39218,10 +40170,16 @@ class MiniWireshark:
     # ======================================================================
     #  Website / remote / flow / alert reports
     # ======================================================================
-    def show_website(self, dom):
+    def _website_card(self, dom):
         w = self.model.websites.get(dom)
         if not w:
-            return
+            return None
+        return DetailDialog(self, f"Website: {w.domain}",
+                            self.website_report(w), actions=[
+            ("Show packets", lambda: self.goto("packets", f"site:{dom}")),
+            ("Internet hosts", lambda: self.goto("remote", dom))])
+
+    def website_report(self, w):
         sources = ", ".join(sorted(w.sources)) or "—"
         how = []
         if "TLS SNI" in w.sources:
@@ -39270,9 +40228,7 @@ class MiniWireshark:
                              f"{w.category} — from the {w.category_source}"
                              f". Being on such a list doesn't mean a domain "
                              f"is malicious."))
-        DetailDialog(self, f"Website: {w.domain}", sections, actions=[
-            ("Show packets", lambda: self.goto("packets", f"site:{dom}")),
-            ("Remote hosts", lambda: self.goto("remote", dom))])
+        return sections
 
     def show_website_devices(self, dom):
         groups = [w for w in self.model.websites.values()
@@ -39285,10 +40241,17 @@ class MiniWireshark:
         DetailDialog(self, f"Devices that contacted {dom}",
                      [("Devices", lines)], size="440x360")
 
-    def show_remote(self, ip):
+    def _remote_card(self, ip):
         r = self.model.remote_hosts.get(ip)
         if not r:
-            return
+            return None
+        return DetailDialog(self, f"Internet host: {ip}",
+                            self.remote_report(r), actions=[
+            ("Connections", lambda: self.goto("connections", ip)),
+            ("Packets", lambda: self.goto("packets", f"ip:{ip}"))])
+
+    def remote_report(self, r):
+        ip = r.ip
         devs = "\n".join(f"• {self.short_device_name(k)}"
                          for k in sorted(r.devices)) or "—"
         loc = r.location_text() or ("not looked up (turn on a country lookup "
@@ -39320,9 +40283,7 @@ class MiniWireshark:
         if ports:
             sections.append(("About its ports", "\n\n".join(
                 explain_port_text(p) for p in ports)))
-        DetailDialog(self, f"Remote host: {ip}", sections, actions=[
-            ("Connections", lambda: self.goto("connections", ip)),
-            ("Packets", lambda: self.goto("packets", f"ip:{ip}"))])
+        return sections
 
     def flow_report(self, f):
         who = self.short_device_name(f.device_key) if f.device_key \
@@ -39386,13 +40347,13 @@ class MiniWireshark:
                                 "was made by MiniWireshark itself."))
         return sections
 
-    def show_flow(self, fid):
+    def _flow_card(self, fid):
         f = self.model.flows.get(fid)
         if not f:
-            return
-        DetailDialog(self, f"Connection #{fid}", self.flow_report(f),
-                     actions=[("Show packets", lambda: self.goto(
-                         "packets", f"stream:{fid}"))])
+            return None
+        return DetailDialog(self, f"Connection #{fid}", self.flow_report(f),
+                            actions=[("Show packets", lambda: self.goto(
+                                "packets", f"stream:{fid}"))])
 
     def alert_report(self, a):
         verbosity = self.config.get("general.explanation_verbosity", "Normal")
@@ -39429,16 +40390,16 @@ class MiniWireshark:
         return title + "\n" + "=" * len(title) + "\n\n" + "\n\n".join(
             f"{h}\n{t}" for h, t in self.alert_report(a))
 
-    def show_alert(self, aid):
+    def _alert_card(self, aid):
         a = self.model.alerts.alerts.get(aid)
         if not a:
-            return
+            return None
 
         def ack():
             a.acknowledged = True
             self.tabs["alerts"].upsert(a)
-        DetailDialog(self, f"{self.SEVERITY_ICON.get(a.severity, '')} "
-                           f"{a.reason}", self.alert_report(a), actions=[
+        return DetailDialog(self, f"{self.SEVERITY_ICON.get(a.severity, '')} "
+                            f"{a.reason}", self.alert_report(a), actions=[
             ("Acknowledge", ack),
             ("Mark expected", lambda: self.alert_mark_expected(a)),
             ("Go to related", lambda: self.alert_goto_related(a)),
@@ -39519,9 +40480,14 @@ class MiniWireshark:
                     parent=self.root):
                 return
         live = self.data_mode == "live"
+        undo = None
         if self.data_mode in ("offline", "session", "demo"):
             self._leave_nonlive()
         else:
+            # 5.1.2: what was cleared stays in memory for 30 s (Undo)
+            undo = {"model": self.model, "rows": list(self.all_rows),
+                    "count": self.count, "at": time.monotonic(),
+                    "live": live}
             self.replace_model(self._new_model())
             self._baselines_from_history()
         if live:
@@ -39531,8 +40497,58 @@ class MiniWireshark:
                 else ""
         self.status_var.set("Cleared.")
         self._set_banner("🧹  Cleared. " + ("Still watching." if live else
-                                          "Ready to start again."))
+                                          "Ready to start again."),
+                         action=("Undo", self.undo_clear) if undo else None)
+        self._keep_undo(undo)
         self._restyle_mode_banner()
+
+    UNDO_CLEAR_S = 30
+
+    def _keep_undo(self, undo):
+        self._clear_undo = undo
+        job = getattr(self, "_clear_undo_job", None)
+        if job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(job)
+        self._clear_undo_job = None
+        if undo is None:
+            return
+
+        def tick():
+            u = self._clear_undo
+            if u is None:
+                return
+            left = self.UNDO_CLEAR_S - (time.monotonic() - u["at"])
+            if left <= 0:
+                self._clear_undo = None    # the old data can go now
+                self._clear_undo_job = None
+                self._banner_action(None)
+                return
+            if u["live"]:
+                lost = int(time.monotonic() - u["at"])
+                self._banner_action((translate_text(
+                    "Undo — the last %d s will be lost") % lost
+                    if lost >= 2 else translate_text("Undo"),
+                    self.undo_clear))
+            self._clear_undo_job = self.root.after(1000, tick)
+        self._clear_undo_job = self.root.after(1000, tick)
+
+    def undo_clear(self):
+        """Bring back what Clear removed (within 30 s). Packets captured
+        since the clear are dropped; the button said so."""
+        u = getattr(self, "_clear_undo", None)
+        if u is None:
+            return False
+        self._keep_undo(None)
+        self.replace_model(u["model"])
+        self.all_rows.extend(u["rows"])
+        self.count = u["count"]
+        with contextlib.suppress(tk.TclError, KeyError, AttributeError):
+            self.tabs["packets"].rebuild()
+        self._banner_action(None)
+        self._set_banner("↩  Brought back what was cleared.", kind="good")
+        self._restyle_mode_banner()
+        return True
 
     def _new_session(self):
         self.stop()
@@ -39834,6 +40850,7 @@ class MiniWireshark:
 
     def _open_session_menu(self):
         m = themed_menu(self)
+        m.add_command(label="Clear and start fresh…", command=self.clear)
         m.add_command(label="New session (stop → clear)",
                       command=self._new_session)
         m.add_command(label="Save session…", command=self._save_session)
@@ -41443,6 +42460,7 @@ class MiniWireshark:
         LOG.info("shutting down")
         with contextlib.suppress(Exception):
             self.jobs.stop()
+        self._remember_window()
         try:
             if self.history is not None and self.data_mode in ("live",
                                                                "idle"):
@@ -54231,8 +55249,15 @@ def _gs_languages(app, ctx):
         boxes = [w for w in _all_widgets(app.root)
                  if getattr(w, "_mw_i18n", None) and
                  w._mw_i18n["var"] is app.mode_ui_var]
-        assert boxes and boxes[0].get() == translate_text(mode, "fr"), \
-            boxes and boxes[0].get()
+        if boxes:
+            assert boxes[0].get() == translate_text(mode, "fr"), \
+                boxes[0].get()
+        else:
+            # 5.1.2: two buttons, each named in French
+            btns = [str(w.cget("text")) for w in _all_widgets(app.root)
+                    if isinstance(w, ttk.Radiobutton) and
+                    str(w.cget("variable")) == str(app.mode_ui_var)]
+            assert translate_text(mode, "fr") in btns, btns
         # a status line set later is shown in French too
         app.status_var.set("Ready. Click “Start watching” when you'd like "
                            "to begin.")
@@ -54242,13 +55267,20 @@ def _gs_languages(app, ctx):
         app._apply_runtime_settings()
         _gui_pump(app.root, 0.3)
         assert "Panel" in app.nb.tab(tab.frame, "text")
-        assert boxes[0].get() == translate_text(mode, "es")
+
+        def shown():
+            if boxes:
+                return [boxes[0].get()]
+            return [str(w.cget("text")) for w in _all_widgets(app.root)
+                    if isinstance(w, ttk.Radiobutton) and
+                    str(w.cget("variable")) == str(app.mode_ui_var)]
+        assert translate_text(mode, "es") in shown(), shown()
     finally:
         app.config.set("general.language", "English")
         app._apply_runtime_settings()
         _gui_pump(app.root, 0.3)
     assert app.nb.tab(tab.frame, "text") == english
-    assert boxes[0].get() == mode and app.mode_ui_var.get() == mode
+    assert mode in shown() and app.mode_ui_var.get() == mode
     assert CURRENT_LOCALE == "en"
 
 
@@ -54467,7 +55499,12 @@ def _gs_full_power(app, ctx):
         assert app.deep.offered == len(frames) == app.deep.done
         pill = app.mode_pill_text()
         assert "Full Power 100 %" in pill, pill
-        assert pill in app.footer_text()
+        if FEATURES.get("state_line", True):
+            app._restyle_mode_banner()
+            assert pill == str(app.mode_power_lbl.cget("text")), \
+                app.mode_power_lbl.cget("text")
+        else:
+            assert pill in app.footer_text()
         info = DiagnosticsWindow.collect(app)
         assert "Runs in             thread" in info and \
             "Cost per packet     dissect" in info, info
@@ -54968,13 +56005,18 @@ def _gs_v502_behaviour(app, ctx):
         assert app.banner.winfo_manager(), "warning banner went away"
     finally:
         app.BANNER_SECONDS = 20
-    # not live: one banner says it (no second "not capturing live" one)
+    # not live: one line says it (no second "not capturing live" one)
     saved = app.data_mode
     app.data_mode = "offline"
     app._restyle_mode_banner()
     _gui_pump(root, 0.1)
-    assert not app.mode_banner.winfo_manager() and \
-        app.data_banner.winfo_manager()
+    if FEATURES.get("state_line", True):
+        assert app.mode_banner.winfo_manager() and \
+            not app.data_banner.winfo_manager()
+        assert "Nothing is being sent" in app.mode_lbl.cget("text")
+    else:
+        assert not app.mode_banner.winfo_manager() and \
+            app.data_banner.winfo_manager()
     assert "Nothing is being sent" in app.data_lbl.cget("text")
     app.data_mode = "idle"
     app._restyle_mode_banner()
@@ -55586,6 +56628,165 @@ def gt_m3_table_kit(app, ctx):
     assert not ft.buffer
 
 
+@gui_test_step("5.1.2 M4: back/forward, tab groups, state line, cards, "
+               "Clear with undo")
+def gt_m4_shell(app, ctx):
+    root = app.root
+    reg = app.model.registry
+    app.mode_ui_var.set("Advanced")
+    app._on_ui_mode_change()
+    _gui_pump(root, 0.2)
+    # back and forward return to the same view, filter included
+    dt = app.tabs["devices"]
+    app._select_tab("devices")
+    _gui_pump(root, 1.2)
+    dt.filter_var.set("192.168")
+    dt.rebuild()
+    app._select_tab("websites")
+    _gui_pump(root, 1.2)
+    app.router.back()
+    _gui_pump(root, 0.3)
+    assert app.current_tab_name() == "devices", app.current_tab_name()
+    assert dt.filter_var.get() == "192.168"
+    app.router.forward()
+    _gui_pump(root, 0.3)
+    assert app.current_tab_name() == "websites"
+    dt.filter_var.set("")
+    dt.rebuild()
+    # Ctrl+1..4 go to a tab of that group
+    for i in range(len(TAB_GROUPS)):
+        app.select_group(i)
+        _gui_pump(root, 0.1)
+        assert app.current_tab_name() in TAB_GROUPS[i][1]
+    # no group split across rows at 1366 px, in all three languages
+    old_geo = root.geometry()
+    old_lang = app.config.get("general.language", "English")
+    try:
+        for lang in ("English", "Français", "Español"):
+            app.config.set("general.language", lang)
+            app._apply_runtime_settings()
+            root.geometry("1366x768")
+            _gui_pump(root, 0.6)
+            ts = app.tabstrip
+            ts.relayout()
+            rows = ts.group_rows(ts.frame.winfo_width(),
+                                 captions=ts.show_captions)
+            where = {}
+            for ri, r in enumerate(rows):
+                for gi, _tids, _c in r:
+                    assert gi not in where, (lang, "group split", rows)
+                    where[gi] = ri
+            assert len(rows) <= 2, (lang, rows)
+    finally:
+        app.config.set("general.language", old_lang)
+        app._apply_runtime_settings()
+        root.geometry(old_geo)
+        _gui_pump(root, 0.3)
+    # the state line: shown and truthful in seven states
+    saved_mode, saved_prof = app.data_mode, app.network_profile
+    saved_kill = LEDGER.killed
+    expect = {"idle": "not capturing live", "live": None,
+              "offline": "OFFLINE CAPTURE", "session": "SAVED SESSION",
+              "demo": "DEMO DATA", "kill": "KILL SWITCH",
+              "untrusted": "CafeWiFi"}
+    try:
+        for state, words in expect.items():
+            LEDGER.killed = state == "kill"
+            app.network_profile = {"name": "CafeWiFi", "trusted": False} \
+                if state == "untrusted" else None
+            app.data_mode = state if state in (
+                "idle", "live", "offline", "session", "demo") else "live"
+            app._restyle_mode_banner()
+            _gui_pump(root, 0.05)
+            assert app.mode_banner.winfo_manager(), state
+            text = str(app.mode_lbl.cget("text"))
+            if words:
+                assert words in text, (state, text)
+            btn = str(app.mode_toggle_btn.cget("text"))
+            if state == "kill":
+                assert "kill switch off" in btn, btn
+            elif state in ("offline", "session"):
+                assert "Return to live" in btn, btn
+            elif state == "demo":
+                assert "Exit demo" in btn, btn
+            elif state == "untrusted":
+                assert "Trust this network" in btn, btn
+        app.toggle_state_panel(True)
+        _gui_pump(root, 0.1)
+        assert app.state_panel is not None and \
+            app.state_panel.winfo_manager()
+        assert any("CafeWiFi" in x for x in app.state_panel_lines())
+        app.toggle_state_panel(False)
+        assert app.state_panel is None
+    finally:
+        LEDGER.killed = saved_kill
+        app.network_profile = saved_prof
+        app.data_mode = saved_mode
+        app._restyle_mode_banner()
+    # cards: 20 devices opened, one window; a kept window stays
+    keys = list(reg.by_key)
+    assert keys
+    for i in range(20):
+        app.show_device(keys[i % len(keys)])
+    _gui_pump(root, 0.3)
+    cards = [d for d in app._card_wins if d.alive() and
+             d.card[0] == "device"]
+    assert len(cards) == 1, len(cards)
+    first = cards[0]
+    first.pin_var.set(True)
+    first.pin_toggle()
+    second = app.show_device(keys[0])
+    _gui_pump(root, 0.2)
+    assert first.alive() and second.alive() and first is not second
+    # a toggle in a card is journaled: Ctrl+Z undoes it
+    dev = reg.by_key[keys[0]]
+    before = dev.mine
+    box = [w for w in _walk_class(second.win, ttk.Checkbutton)
+           if "mine" in str(w.cget("text"))]
+    assert box, "no 'This is mine' box in the card"
+    box[0].invoke()
+    assert dev.mine != before, "the toggle did nothing"
+    app.undo_last_correction()
+    assert reg.by_key[keys[0]].mine == before, "Ctrl+Z did not undo it"
+    for d in list(app._card_wins):
+        with contextlib.suppress(tk.TclError):
+            d.win.destroy()
+    # messages are kept for the ✉ button
+    app._set_banner("M4 test message")
+    assert app.messages and app.messages[-1][2] == "M4 test message"
+    # Clear, then Undo: everything back, exactly (a file's data is not
+    # kept: Clear leaves the file; here the data counts as this session's)
+    app.data_mode = "idle"
+    counts = (len(reg.by_key), len(app.model.websites),
+              len(app.model.alerts.alerts))
+    app.clear()
+    assert len(app.model.registry.by_key) < counts[0] or not counts[0]
+    assert app.banner_action_btn.winfo_manager()
+    assert app.undo_clear()
+    m = app.model
+    assert (len(m.registry.by_key), len(m.websites),
+            len(m.alerts.alerts)) == counts
+    # the Undo goes after its time, and the old data with it
+    app.UNDO_CLEAR_S = 1
+    try:
+        app.clear()
+        _gui_pump(root, 2.5)
+        assert app._clear_undo is None
+        assert not app.banner_action_btn.winfo_manager()
+    finally:
+        app.UNDO_CLEAR_S = 30
+    # the window's size, place and tab are remembered
+    app._remember_window()
+    assert app.config.get("appearance.window")
+    # back to the scenario capture for the steps that follow
+    frames = ctx.frames()
+    app.import_pcap_path(ctx.path("scenario.pcap"))
+    assert _gui_pump(root, 0.5, lambda: app.importer is None and
+                     app.data_mode == "offline" and
+                     app.model.count >= len(frames), timeout=60)
+    _gui_pump(root, 1.0)
+
+
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
 # Labels that change with the state of the row a menu was opened on are
 # folded to one name, so the snapshot does not depend on which row was first.
@@ -55620,6 +56821,13 @@ REACHABLE_RENAMES = {
     "rowmenu:remote:Details": "rowmenu:remote:Open",
     "rowmenu:remote:Filter to this host": "rowmenu:remote:Filter to this",
     "rowmenu:websites:Filter to this site": "rowmenu:websites:Filter to this",
+    # M4: the health windows under one Help submenu
+    "menu:help:Diagnostics…": "menu:help:MiniWireshark health > Diagnostics…",
+    "menu:help:Runtime Manager…":
+        "menu:help:MiniWireshark health > Runtime Manager…",
+    "menu:help:Run self-test": "menu:help:MiniWireshark health > Run self-test",
+    "menu:help:🛠 Repair MiniWireshark…":
+        "menu:help:MiniWireshark health > 🛠 Repair MiniWireshark…",
 }
 # Menu entries that exist only in some states (a file open, an autosave
 # present); they are not part of the comparison.
