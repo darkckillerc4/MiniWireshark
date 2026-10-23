@@ -296,13 +296,89 @@ def session_is_gz(path):
         return False
 
 
+_JSON_WS = " \t\n\r"
+
+
+def json_loads_pieces(text, depth=2):
+    """json.loads, but arrays and objects near the top are read one
+    element at a time. json.loads holds the interpreter for the whole
+    text (about 100 ms for a 5 MB session), and the window waited that
+    long while a session opened on the job thread; between elements
+    other threads get their turn. Same result as json.loads; raises
+    ValueError on invalid JSON."""
+    dec = json.JSONDecoder()
+    ws = _JSON_WS
+    n = len(text)
+
+    def skip(i):
+        while i < n and text[i] in ws:
+            i += 1
+        return i
+
+    def value(i, d):
+        i = skip(i)
+        if i >= n:
+            raise ValueError("unexpected end of JSON")
+        c = text[i]
+        if d <= 0 or c not in "[{":
+            return dec.raw_decode(text, i)
+        if c == "[":
+            out = []
+            i = skip(i + 1)
+            if i < n and text[i] == "]":
+                return out, i + 1
+            while True:
+                v, i = value(i, d - 1)
+                out.append(v)
+                i = skip(i)
+                if i < n and text[i] == ",":
+                    i += 1
+                    continue
+                if i < n and text[i] == "]":
+                    return out, i + 1
+                raise ValueError(f"expected , or ] at {i}")
+        out = {}
+        i = skip(i + 1)
+        if i < n and text[i] == "}":
+            return out, i + 1
+        while True:
+            i = skip(i)
+            if i >= n or text[i] != '"':
+                raise ValueError(f"expected a key at {i}")
+            k, i = dec.raw_decode(text, i)
+            i = skip(i)
+            if i >= n or text[i] != ":":
+                raise ValueError(f"expected : at {i}")
+            v, i = value(i + 1, d - 1)
+            out[k] = v
+            i = skip(i)
+            if i < n and text[i] == ",":
+                i += 1
+                continue
+            if i < n and text[i] == "}":
+                return out, i + 1
+            raise ValueError(f"expected , or }} at {i}")
+    obj, end = value(0, depth)
+    if skip(end) != n:
+        raise ValueError(f"extra data at {skip(end)}")
+    return obj
+
+
 def read_session_payload(path):
-    """A session file's JSON, plain or gzip-compressed."""
+    """A session file's JSON, plain or gzip-compressed, read in pieces
+    (json_loads_pieces) so the window keeps its turn."""
     if session_is_gz(path):
         with gzip.open(path, "rt", encoding="utf-8") as f:
-            return json.load(f)
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+            text = f.read()
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            text = f.read()
+    try:
+        return json_loads_pieces(text)
+    except ValueError as e:
+        if isinstance(e, json.JSONDecodeError):
+            raise
+        raise json.JSONDecodeError(str(e), text, 0)
 
 
 def atomic_write_json(path, obj, compact=False):
@@ -9117,6 +9193,29 @@ class HealthProber(threading.Thread):
 #  window stays responsive. Drops can only happen at the ring, are counted
 #  per cause and are shown in the status bar and Diagnostics.
 # ============================================================================
+_FAST_SWITCH_USERS = set()
+_FAST_SWITCH_LOCK = threading.Lock()
+_NORMAL_SWITCH = [None]
+
+
+def fast_switch(who, on, interval=0.001):
+    """While `who` (the analysis worker, a background job) has work,
+    Python hands the interpreter to another thread every 1 ms instead of
+    every 5 ms: each Tk callback waits for the interpreter, and against a
+    busy thread one redraw of many callbacks waited 5 ms per callback. The
+    default comes back when nobody needs it."""
+    with _FAST_SWITCH_LOCK:
+        if _NORMAL_SWITCH[0] is None:
+            _NORMAL_SWITCH[0] = sys.getswitchinterval()
+        if on:
+            _FAST_SWITCH_USERS.add(who)
+        else:
+            _FAST_SWITCH_USERS.discard(who)
+        want = interval if _FAST_SWITCH_USERS else _NORMAL_SWITCH[0]
+        if abs(sys.getswitchinterval() - want) > 1e-6:
+            sys.setswitchinterval(want)
+
+
 class GuiGate:
     """Re-entrant lock with the ability to step out of a nested hold
     completely (for modal waits) and step back in afterwards.
@@ -9952,16 +10051,15 @@ class AnalysisWorker(threading.Thread):
         if busy:
             self._last_work = now
             if not self._fast:
-                sys.setswitchinterval(self.FAST_SWITCH)
+                fast_switch("analysis", True, self.FAST_SWITCH)
                 self._fast = True
         elif self._fast and now - self._last_work > 1.0:
-            sys.setswitchinterval(self._normal_switch)
+            fast_switch("analysis", False)
             self._fast = False
 
     def run(self):
         ring = self.app.ring
         self._fast, self._last_work = False, 0.0
-        self._normal_switch = sys.getswitchinterval()
         while not self.stop_flag:
             self.beat = now = time.monotonic()
             wd = getattr(self.app, "watchdog", None)
@@ -9986,7 +10084,7 @@ class AnalysisWorker(threading.Thread):
                     LOG.exception("analysis batch")
         self.busy = False
         if self._fast:
-            sys.setswitchinterval(self._normal_switch)
+            fast_switch("analysis", False)
 
     def _process(self, batch):
         app = self.app
@@ -37284,6 +37382,7 @@ class JobRunner:
             paused = job.kind in self.NO_GC and gc.isenabled()
             if paused:
                 gc.disable()
+            fast_switch("jobs", True)
             try:
                 if job.cancelled:
                     raise JobCancelled()
@@ -37294,6 +37393,7 @@ class JobRunner:
                 LOG.exception("background job %s", job.kind)
                 res, ok = e, False
             finally:
+                fast_switch("jobs", False)
                 if paused:
                     gc.enable()
             self.app._async_results.put(
@@ -59827,6 +59927,45 @@ def test_deep_worker_protocol(ctx):
     for i, (raw, ts, lt) in enumerate(frames):
         ref += an.process(i + 1, ts, lt, raw)[0]
     assert sorted(map(tuple, msgs[1][3])) == sorted(ref)
+
+
+@self_test()
+def t_json_pieces_and_fast_switch(ctx):
+    """Reading a session in pieces gives exactly json.loads' result (and
+    its errors); the 1 ms switch interval is held while anyone needs it
+    and given back after."""
+    cases = [{}, [], "s", 3, None, [[], [[]], {}],
+             {"a": [1, 2, {"b": []}], "c": "x\\\"y", "d": None,
+              "e": {"f": {"g": [1.5, -2e3, True]}}, "é": "ü"}]
+    for c in cases:
+        for text in (json.dumps(c), json.dumps(c, indent=2),
+                     json.dumps(c, ensure_ascii=False)):
+            assert json_loads_pieces(text) == json.loads(text), text
+    for bad in ("{", "[1,", '{"a" 1}', "[1 2]", "{} x", "", '{"a":1,}'):
+        try:
+            json_loads_pieces(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    text = json.dumps(SessionCodec.serialize(m), separators=(",", ":"))
+    assert json_loads_pieces(text) == json.loads(text)
+    p = ctx.path("s.mwsession.json")
+    atomic_write_text(p, text)
+    assert read_session_payload(p) == json.loads(text)
+    before = sys.getswitchinterval()
+    try:
+        fast_switch("t1", True)
+        fast_switch("t2", True)
+        assert abs(sys.getswitchinterval() - 0.001) < 1e-6
+        fast_switch("t1", False)
+        assert abs(sys.getswitchinterval() - 0.001) < 1e-6
+        fast_switch("t2", False)
+        assert abs(sys.getswitchinterval() - _NORMAL_SWITCH[0]) < 1e-6
+    finally:
+        _FAST_SWITCH_USERS.discard("t1")
+        _FAST_SWITCH_USERS.discard("t2")
+        sys.setswitchinterval(before)
 
 
 @self_test()
