@@ -21812,6 +21812,57 @@ Website lookup ¦ Recherche de site web ¦ Búsqueda de sitio web
 Windows file sharing (NetBIOS) ¦ Partage de fichiers Windows (NetBIOS) ¦ Uso compartido de archivos de Windows (NetBIOS)
 Windows file sharing (SMB) ¦ Partage de fichiers Windows (SMB) ¦ Uso compartido de archivos de Windows (SMB)
 Private address ¦ Adresse privée ¦ Dirección privada
+A lot of broadcast/multicast traffic ¦ Beaucoup de trafic broadcast/multicast ¦ Mucho tráfico de difusión/multidifusión
+Many website lookups are failing ¦ Beaucoup de recherches de sites échouent ¦ Muchas búsquedas de sitios fallan
+More than one device is handing out IP addresses ¦ Plusieurs appareils distribuent des adresses IP ¦ Más de un dispositivo reparte direcciones IP
+Website lookups are slow ¦ Les recherches de sites sont lentes ¦ Las búsquedas de sitios son lentas
+Your router's MAC address changed ¦ L'adresse MAC de votre box a changé ¦ La dirección MAC de su router cambió
+Stopped watching ¦ Observation arrêtée ¦ Observación detenida
+joined your network (new device) ¦ a rejoint votre réseau (nouvel appareil) ¦ se ha unido a su red (dispositivo nuevo)
+Secure connection (site name not visible) ¦ Connexion sécurisée (nom du site non visible) ¦ Conexión segura (nombre del sitio no visible)
+Secure connection (HTTP/3 — site name not visible) ¦ Connexion sécurisée (HTTP/3 — nom du site non visible) ¦ Conexión segura (HTTP/3: nombre del sitio no visible)
+Encrypted data (TLS) ¦ Données chiffrées (TLS) ¦ Datos cifrados (TLS)
+New ¦ Nouvelle ¦ Nueva
+Acknowledged ¦ Prise en compte ¦ Reconocida
+New (saved) ¦ Nouvelle (enregistrée) ¦ Nueva (guardada)
+Acknowledged (saved) ¦ Prise en compte (enregistrée) ¦ Reconocida (guardada)
+This is the computer running MiniWireshark ¦ C'est l'ordinateur sur lequel tourne MiniWireshark ¦ Es el ordenador en el que se ejecuta MiniWireshark
+It is your default gateway (router) ¦ C'est votre passerelle par défaut (la box) ¦ Es su puerta de enlace predeterminada (el router)
+It answered for your router's address ¦ Il a répondu pour l'adresse de votre box ¦ Respondió por la dirección de su router
+It announces itself as an IPv6 router ¦ Il s'annonce comme routeur IPv6 ¦ Se anuncia como router IPv6
+Its address is in a typical container/virtual-network range ¦ Son adresse est dans une plage typique des conteneurs / réseaux virtuels ¦ Su dirección está en un rango típico de contenedores / redes virtuales
+Its MAC prefix belongs to Hyper-V virtual machines ¦ Son préfixe MAC appartient aux machines virtuelles Hyper-V ¦ Su prefijo MAC pertenece a máquinas virtuales Hyper-V
+Its DHCP request identifies Windows (MSFT 5.0) ¦ Sa requête DHCP l'identifie comme Windows (MSFT 5.0) ¦ Su petición DHCP lo identifica como Windows (MSFT 5.0)
+Its DHCP request identifies Android ¦ Sa requête DHCP l'identifie comme Android ¦ Su petición DHCP lo identifica como Android
+Its DHCP client is a Linux one ¦ Son client DHCP est celui de Linux ¦ Su cliente DHCP es de Linux
+Its DHCP client is common on gadgets ¦ Son client DHCP est courant sur les objets connectés ¦ Su cliente DHCP es habitual en aparatos conectados
+Its packets start with TTL 128, typical of Windows (weak hint) ¦ Ses paquets partent avec un TTL de 128, typique de Windows (indice faible) ¦ Sus paquetes salen con TTL 128, típico de Windows (pista débil)
+Its packets start with TTL 255, typical of network gear (weak hint) ¦ Ses paquets partent avec un TTL de 255, typique du matériel réseau (indice faible) ¦ Sus paquetes salen con TTL 255, típico de equipos de red (pista débil)
+It uses a private (randomized) Wi-Fi address, which phones do by default ¦ Il utilise une adresse Wi-Fi privée (aléatoire), comme les téléphones par défaut ¦ Usa una dirección Wi-Fi privada (aleatoria), como hacen los teléfonos por defecto
+It uses a private (randomized) Wi-Fi address ¦ Il utilise une adresse Wi-Fi privée (aléatoire) ¦ Usa una dirección Wi-Fi privada (aleatoria)
+It contacts game-console services (very weak hint) ¦ Il contacte des services de consoles de jeu (indice très faible) ¦ Contacta con servicios de consolas (pista muy débil)
+It contacts Apple services (very weak hint) ¦ Il contacte des services Apple (indice très faible) ¦ Contacta con servicios de Apple (pista muy débil)
+Not enough information yet — I cannot determine this from passive traffic alone ¦ Pas encore assez d'informations — je ne peux pas le déterminer à partir du seul trafic observé ¦ Aún no hay suficiente información: no puedo determinarlo solo con el tráfico observado
+Too little evidence to guess confidently ¦ Trop peu d'indices pour deviner avec assurance ¦ Muy pocas pruebas para adivinar con seguridad
+This computer's network card ¦ La carte réseau de cet ordinateur ¦ La tarjeta de red de este ordenador
+Packets on the wire ¦ Paquets qui circulent sur le réseau ¦ Paquetes que circulan por la red
+This computer's operating system ¦ Le système d'exploitation de cet ordinateur ¦ El sistema operativo de este ordenador
+Programs, listening ports, ARP cache, Wi-Fi ¦ Programmes, ports en écoute, cache ARP, Wi-Fi ¦ Programas, puertos a la escucha, caché ARP, Wi-Fi
+Lookups and device names of every client ¦ Recherches et noms d'appareil de chaque client ¦ Búsquedas y nombres de dispositivo de cada cliente
+Watching ¦ En observation ¦ Observando
+Stopped ¦ Arrêté ¦ Detenido
+Available ¦ Disponible ¦ Disponible
+Needs live capture ¦ Nécessite la capture en direct ¦ Necesita la captura en directo
+Needs live capture and the optional psutil component ¦ Nécessite la capture en direct et le composant facultatif psutil ¦ Necesita la captura en directo y el componente opcional psutil
+Reading a file, not live ¦ Lecture d'un fichier, pas en direct ¦ Leyendo un archivo, no en directo
+Saved session, not live ¦ Session enregistrée, pas en direct ¦ Sesión guardada, no en directo
+Demo data ¦ Données de démonstration ¦ Datos de demostración
+Wrong password ¦ Mot de passe incorrect ¦ Contraseña incorrecta
+Certificate ¦ Certificat ¦ Certificado
+Unreachable ¦ Injoignable ¦ Inaccesible
+Unexpected answer ¦ Réponse inattendue ¦ Respuesta inesperada
+Waiting ¦ En attente ¦ En espera
+Paused ¦ En pause ¦ En pausa
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -22478,6 +22529,188 @@ I18N_PATTERNS += [
     (r"Possibly " + _CLASS_RX, r"{t1} possible", r"{t1} posible"),
     (r"([A-Z][^—:.;]*) device", r"appareil \1", r"dispositivo \1"),
 ]
+# 5.1.2: Timeline, Live feed and alert sentences. Also searched alone
+# (translate_event) so a table of thousands of events stays quick.
+EVENT_PATTERNS = [
+    (r"Capture gap (.+) – (.+) \((.+), (.+)\): nothing was observed in "
+     r"that time", r"Interruption de capture \1 – \2 (\3, \4) : rien n'a "
+     r"été observé pendant ce temps", r"Interrupción de la captura \1 – \2 "
+     r"(\3, \4): no se observó nada en ese tiempo"),
+    (r"Capture restarted on “(.+)”", r"Capture relancée sur « \1 »",
+     r"Captura reiniciada en «\1»"),
+    (r"Capture stopped unexpectedly: (.+); retrying in (\d+)s",
+     r"La capture s'est arrêtée de façon inattendue : \1 ; nouvel essai "
+     r"dans \2 s", r"La captura se detuvo de forma inesperada: \1; "
+     r"reintento en \2 s"),
+    (r"Capture stopped: (.+)", r"Capture arrêtée : \1",
+     r"Captura detenida: \1"),
+    (r"Most Internet traffic goes to (\S+), which looks like a (.+) server",
+     r"La plupart du trafic Internet va vers \1, qui ressemble à un "
+     r"serveur \2", r"La mayor parte del tráfico de Internet va a \1, que "
+     r"parece un servidor \2"),
+    (r"New network: (.+) — Quiet Mode until you say it's yours",
+     r"Nouveau réseau : \1 — mode discret jusqu'à ce que vous disiez qu'il "
+     r"est à vous", r"Red nueva: \1 — modo silencioso hasta que diga que "
+     r"es suya"),
+    (r"New service on this computer: (.+) on (\S+) port (\d+) \(reachable "
+     r"from (.+)\)", r"Nouveau service sur cet ordinateur : \1 sur \2 port "
+     r"\3 (joignable depuis \4)", r"Servicio nuevo en este ordenador: \1 en "
+     r"\2 puerto \3 (accesible desde \4)"),
+    (r"Possibly the same device: (.+) and (.+) \((\S+) confidence\) — open "
+     r"either device to merge them", r"Peut-être le même appareil : \1 et "
+     r"\2 (confiance : {t3}) — ouvrez l'un des deux pour les fusionner",
+     r"Posiblemente el mismo dispositivo: \1 y \2 (confianza: {t3}) — abra "
+     r"cualquiera de los dos para fusionarlos"),
+    (r"Router address is now (\S+)", r"L'adresse de la box est "
+     r"maintenant \1", r"La dirección del router es ahora \1"),
+    (r"Router forwards (\d+) port\(s\) from the Internet \(UPnP check\)",
+     r"La box redirige \1 port(s) depuis Internet (vérification UPnP)",
+     r"El router redirige \1 puerto(s) desde Internet (comprobación "
+     r"UPnP)"),
+    (r"Split (.+) back out of (.+)", r"\1 séparé à nouveau de \2",
+     r"\1 separado de nuevo de \2"),
+    (r"Started watching “(.+)”(.*)", r"Observation commencée sur « \1 »\2",
+     r"Observación iniciada en «\1»\2"),
+    (r"Switched capture to “(.+)”", r"Capture basculée sur « \1 »",
+     r"Captura cambiada a «\1»"),
+    (r"The network card “(.+)” disappeared", r"La carte réseau « \1 » a "
+     r"disparu", r"La tarjeta de red «\1» ha desaparecido"),
+    (r"The operating system dropped (\d+) packets before MiniWireshark "
+     r"could read them \(its capture buffer was full\)",
+     r"Le système d'exploitation a perdu \1 paquets avant que MiniWireshark "
+     r"puisse les lire (son tampon de capture était plein)",
+     r"El sistema operativo descartó \1 paquetes antes de que MiniWireshark "
+     r"pudiera leerlos (su búfer de captura estaba lleno)"),
+    (r"This computer's Wi-Fi signal became weak \((-?\d+) dBm, was "
+     r"(-?\d+) dBm\)", r"Le signal Wi-Fi de cet ordinateur est devenu "
+     r"faible (\1 dBm, contre \2 dBm)", r"La señal Wi-Fi de este ordenador "
+     r"se ha debilitado (\1 dBm, antes \2 dBm)"),
+    (r"This computer's address is now (\S+)", r"L'adresse de cet "
+     r"ordinateur est maintenant \1", r"La dirección de este ordenador es "
+     r"ahora \1"),
+    (r"Watchdog: (.+) has not moved for (\d+) s although work is waiting",
+     r"Surveillance : \1 n'a pas avancé depuis \2 s alors que du travail "
+     r"attend", r"Vigilancia: \1 no ha avanzado en \2 s aunque hay trabajo "
+     r"pendiente"),
+    (r"Wi-Fi signal recovered \((-?\d+) dBm\)", r"Signal Wi-Fi rétabli "
+     r"(\1 dBm)", r"Señal Wi-Fi recuperada (\1 dBm)"),
+    (r"You are on (.+)", r"Vous êtes sur \1", r"Está en \1"),
+    (r"You undid: (.+)", r"Vous avez annulé : \1", r"Ha deshecho: \1"),
+    (r"Your router address changed (\S+) → (\S+) \(new network or "
+     r"router\?\)", r"L'adresse de votre box a changé \1 → \2 (nouveau "
+     r"réseau ou nouvelle box ?)", r"La dirección de su router cambió \1 → "
+     r"\2 (¿red o router nuevos?)"),
+    (r"A program on this computer started accepting connections: (.+) on "
+     r"(\S+) port (\d+)", r"Un programme de cet ordinateur a commencé à "
+     r"accepter des connexions : \1 sur \2 port \3", r"Un programa de este "
+     r"ordenador empezó a aceptar conexiones: \1 en \2 puerto \3"),
+    (r"This computer's ARP cache disagrees about (\S+)", r"Le cache ARP de "
+     r"cet ordinateur n'est pas d'accord sur \1", r"La caché ARP de este "
+     r"ordenador no coincide sobre \1"),
+    (r"(\d+) different DNS servers are in use", r"\1 serveurs DNS "
+     r"différents sont utilisés", r"Se usan \1 servidores DNS distintos"),
+    # the "+" before the number stays outside (it is not a letter)
+    (r"(\d+) more thing\(s\) just happened — switch to “Full speed” to "
+     r"see every line", r"\1 autre(s) événement(s) à l'instant — passez "
+     r"en « Pleine vitesse » pour voir chaque ligne",
+     r"\1 cosa(s) más acaba(n) de pasar: cambie a «Velocidad máxima» "
+     r"para ver cada línea"),
+    (r"Secure connection to (.+)", r"Connexion sécurisée à \1",
+     r"Conexión segura con \1"),
+    (r"Local name lookup: (.+)", r"Recherche de nom locale : \1",
+     r"Búsqueda de nombre local: \1"),
+    (r"Unsecured web request: (.+)", r"Requête web non sécurisée : \1",
+     r"Petición web no segura: \1"),
+    (r"Who has (\S+)\? Tell (\S+)", r"Qui a \1 ? Répondre à \2",
+     r"¿Quién tiene \1? Avisar a \2"),
+    (r"connecting to (.+) \((.+)\)", r"connexion à \1 (\2)",
+     r"conectando con \1 (\2)"),
+    # "<device> ...": the most specific endings first
+    (r"(.+) is unusually active right now", r"\1 est anormalement actif en "
+     r"ce moment", r"\1 está inusualmente activo ahora mismo"),
+    (r"(.+) is unusually active", r"\1 est anormalement actif",
+     r"\1 está inusualmente activo"),
+    (r"(.+) announced itself as an IPv6 router", r"\1 s'est annoncé comme "
+     r"routeur IPv6", r"\1 se anunció como router IPv6"),
+    (r"(.+) came back online", r"\1 est de nouveau en ligne",
+     r"\1 vuelve a estar en línea"),
+    (r"(.+) connected: reporting lookups for (\d+) device\(s\)",
+     r"\1 connecté : signale les recherches de \2 appareil(s)",
+     r"\1 conectado: informa de las búsquedas de \2 dispositivo(s)"),
+    (r"(.+) got address (\S+) from DHCP", r"\1 a obtenu l'adresse \2 par "
+     r"DHCP", r"\1 obtuvo la dirección \2 por DHCP"),
+    (r"(.+) joined your network", r"\1 a rejoint votre réseau",
+     r"\1 se ha unido a su red"),
+    (r"(.+) moved to history \(expired\)", r"\1 passé dans l'historique "
+     r"(expiré)", r"\1 pasado al historial (caducado)"),
+    (r"(.+) now uses DNS server (\S+) \(was (\S+)\)", r"\1 utilise "
+     r"maintenant le serveur DNS \2 (avant : \3)", r"\1 usa ahora el "
+     r"servidor DNS \2 (antes: \3)"),
+    (r"(.+) started advertising “(.+)”", r"\1 a commencé à annoncer « \2 »",
+     r"\1 empezó a anunciar «\2»"),
+    (r"(.+) started advertising (.+)", r"\1 a commencé à annoncer \2",
+     r"\1 empezó a anunciar \2"),
+    (r"(.+) went offline", r"\1 s'est déconnecté", r"\1 se desconectó"),
+    (r"(.+): two identities combined \(automatic\)", r"\1 : deux identités "
+     r"fusionnées (automatiquement)", r"\1: dos identidades combinadas "
+     r"(automáticamente)"),
+    (r"(.+): two identities combined \(by you\)", r"\1 : deux identités "
+     r"fusionnées (par vous)", r"\1: dos identidades combinadas (por "
+     r"usted)"),
+    (r"(.+): many connections are being reset", r"\1 : beaucoup de "
+     r"connexions sont réinitialisées", r"\1: muchas conexiones se están "
+     r"restableciendo"),
+    (r"(.+) contacted a new country \((.+)\)", r"\1 a contacté un nouveau "
+     r"pays (\2)", r"\1 contactó con un país nuevo (\2)"),
+    (r"(.+) contacted an address on (.+)", r"\1 a contacté une adresse de "
+     r"\2", r"\1 contactó con una dirección de \2"),
+    (r"(.+) has answered from more than one device", r"\1 a répondu depuis "
+     r"plus d'un appareil", r"\1 ha respondido desde más de un "
+     r"dispositivo"),
+    (r"(.+) has joined/left (\d+) times recently", r"\1 a rejoint/quitté "
+     r"le réseau \2 fois récemment", r"\1 ha entrado/salido \2 veces "
+     r"recientemente"),
+    (r"(.+) has very little identifying information", r"\1 a très peu "
+     r"d'informations d'identification", r"\1 tiene muy poca información "
+     r"identificativa"),
+    (r"(.+) keeps switching between devices", r"\1 passe sans cesse d'un "
+     r"appareil à l'autre", r"\1 cambia continuamente entre dispositivos"),
+    (r"(.+) offers remote access \((.+)\)", r"\1 propose un accès à "
+     r"distance (\2)", r"\1 ofrece acceso remoto (\2)"),
+    (r"(.+) shows a scanning-like pattern", r"\1 présente un comportement "
+     r"qui ressemble à un balayage", r"\1 muestra un patrón parecido a un "
+     r"escaneo"),
+    (r"(.+) switched to a different DNS server", r"\1 est passé à un autre "
+     r"serveur DNS", r"\1 cambió a otro servidor DNS"),
+    (r"(.+) used an unencrypted protocol \((.+)\)", r"\1 a utilisé un "
+     r"protocole non chiffré (\2)", r"\1 usó un protocolo sin cifrar (\2)"),
+    (r"(.+) marked as (.+)", r"\1 marqué comme {t2}",
+     r"\1 marcado como {t2}"),
+    (r"(\S+) announced itself \(gratuitous ARP\)", r"\1 s'est annoncé (ARP "
+     r"gratuit)", r"\1 se anunció (ARP gratuito)"),
+    (r"(\S+) is at (\S+)", r"\1 est à \2", r"\1 está en \2"),
+]
+I18N_PATTERNS += EVENT_PATTERNS
+I18N_PATTERNS += [
+    (r"Its name \(“(.+)”\) looks like a (.+)", r"Son nom (« \1 ») "
+     r"ressemble à : {t2}", r"Su nombre («\1») parece de: {t2}"),
+    (r"It advertised the model “(.+)”", r"Il a annoncé le modèle « \1 »",
+     r"Anunció el modelo «\1»"),
+    (r"Made by (.+)", r"Fabriqué par \1", r"Fabricado por \1"),
+    (r"It advertises the “(.+)” service", r"Il annonce le service « \1 »",
+     r"Anuncia el servicio «\1»"),
+    (r"Its UPnP announcement mentions “(.+)”", r"Son annonce UPnP "
+     r"mentionne « \1 »", r"Su anuncio UPnP menciona «\1»"),
+    (r"Detection alone suggests: (.+)", r"La détection seule suggère : "
+     r"{t1}", r"La detección por sí sola sugiere: {t1}"),
+    (r"No helper connected\. Observed lookups so far: (\d+) \(only the "
+     r"ones that crossed this computer's network card\)\.",
+     r"Aucun assistant connecté. Recherches observées jusqu'ici : \1 "
+     r"(seulement celles qui sont passées par la carte réseau de cet "
+     r"ordinateur).", r"Ningún asistente conectado. Búsquedas observadas "
+     r"hasta ahora: \1 (solo las que pasaron por la tarjeta de red de "
+     r"este ordenador)."),
+]
 I18N_PATTERNS.sort(key=lambda x: 0 if x[0].startswith(
     ("Online now", r"Offline since (\d\d")) else 1)
 _I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
@@ -22586,7 +22819,9 @@ def translate_cell(v):
         words = {"High", "Medium", "Low", "Unconfirmed", "Unknown",
                  "Private address", "Your router / gateway", "Active",
                  "Idle", "Offline", "Expired", "Online", "Closing",
-                 "Closed", "Open", "Encrypted", "Not encrypted"}
+                 "Closed", "Open", "Encrypted", "Not encrypted", "INFO",
+                 "WARNING", "DANGER", "New", "Acknowledged", "New (saved)",
+                 "Acknowledged (saved)"}
         words.update(FRIENDLY_PROTO.values())
         words.update(PORT_SERVICES.values())
         words.update(DEVICE_CLASSES)
@@ -22606,6 +22841,49 @@ def translate_cells(values):
     if CURRENT_LOCALE == "en" or not isinstance(values, (list, tuple)):
         return values
     return [translate_cell(x) for x in values]
+
+
+_EVENT_RX = []
+_EVENT_CACHE = {}
+
+
+def translate_event(text):
+    """A Timeline / Live feed / alert sentence in the current language:
+    the catalog, then only EVENT_PATTERNS (not every pattern), cached.
+    Names and addresses inside stay as they are."""
+    loc = CURRENT_LOCALE
+    if loc == "en" or not isinstance(text, str) or not text or \
+            len(text) > 400:
+        return text
+    key = (loc, text)
+    out = _EVENT_CACHE.get(key)
+    if out is not None:
+        return out
+    if not _EVENT_RX:
+        _EVENT_RX.extend((re.compile(r"\A" + p + r"\Z", re.S), fr, es)
+                         for p, fr, es in EVENT_PATTERNS)
+    table = I18N.get(loc) or {}
+    m = _I18N_CORE.match(text)
+    pre, core, post = (m.group(1), m.group(2), m.group(3)) if m else \
+        ("", text, "")
+    hit = table.get(core)
+    if hit is None:
+        for rx, fr, es in _EVENT_RX:
+            mm = rx.match(core)
+            if not mm:
+                continue
+            hit = mm.expand(fr if loc == "fr" else es)
+            if "{t" in hit:
+                for i, g in enumerate(mm.groups(), 1):
+                    tok = "{t%d}" % i
+                    if tok in hit:
+                        hit = hit.replace(tok, table.get(g or "", g or ""))
+            break
+    out = pre + hit + post if hit is not None else text
+    if len(_EVENT_CACHE) > 20000:
+        _EVENT_CACHE.clear()
+    _EVENT_CACHE[key] = out
+    return out
 
 
 def untranslate_text(s):
@@ -28078,6 +28356,8 @@ class Inspector:
                 f"{colon}", "h")
         self._w(f"{value}\n")
         if why:
+            if "; " in why and CURRENT_LOCALE != "en":
+                why = "; ".join(translate_text(x) for x in why.split("; "))
             self._w(f"   {why}\n", "muted")
         if self.app.explain_on():
             self._w(f"   {LEVEL_GLYPH.get(level, '?')} "
@@ -28840,7 +29120,7 @@ class FeedTab(BaseTab):
             for tag, who, did, when in reversed(
                     [r for r in self.rows if self._match(r)]):
                 self.tree.insert("", "end", tags=(tag,),
-                                 values=(who, did, when))
+                                 values=(who, translate_event(did), when))
         self.refresh()
 
     def jump_to_now(self):
@@ -28938,7 +29218,8 @@ class FeedTab(BaseTab):
                 tag, who, did, when = row
                 with contextlib.suppress(tk.TclError):
                     self.tree.insert("", 0, tags=(tag,),
-                                     values=(who, did, when))
+                                     values=(who, translate_event(did),
+                                             when))
             if anchor:
                 with contextlib.suppress(tk.TclError):
                     n = len(self.tree.get_children())
@@ -29317,7 +29598,7 @@ class TimelineTab(BaseTab):
                 "", index, tags=(e["severity"],),
                 values=(f"{icon} {e['severity']}",
                         fmt_clock(e["when"], with_date=old),
-                        e["kind"], e["text"]))
+                        e["kind"], translate_event(e["text"])))
             self.refs[iid] = e
         except tk.TclError:
             pass
@@ -31172,7 +31453,8 @@ class AlertsTab(BaseTab):
         if not a.live:
             status += " (saved)"
         return (f"{icon} {a.severity}", fmt_clock(a.last_seen or a.when),
-                a.reason, who, a.confidence, a.count, status)
+                translate_event(a.reason), who, a.confidence, a.count,
+                status)
 
     def upsert(self, a):
         if not self._visible(a):
@@ -36318,11 +36600,15 @@ class SourcesTab(BaseTab):
         self.tree.delete(*self.tree.get_children())
         v = m.vantage.classify(offline=app.data_mode in ("offline",
                                                          "session"))
-        self.tree.insert("", "end", iid="cap", values=(
+        tr = translate_text
+        self.tree.insert("", "end", iid="cap", values=tuple(tr(x) for x in (
             "This computer's network card", "Packets on the wire",
-            "◉ Observed", {"live": "✔ Watching", "idle": "Stopped"}.get(
+            "◉ Observed", {"live": "✔ Watching", "idle": "Stopped",
+                           "offline": "Reading a file, not live",
+                           "session": "Saved session, not live",
+                           "demo": "Demo data"}.get(
                 app.data_mode, app.data_mode), "now" if app.data_mode ==
-            "live" else "—", VANTAGE_TEXT.get(v, ("",))[0]))
+            "live" else "—", VANTAGE_TEXT.get(v, ("",))[0])))
         pm = app.procmap
         bits = []
         if pm.available:
@@ -36333,13 +36619,13 @@ class SourcesTab(BaseTab):
             bits.append(f"ARP cache ({n} entr{'y' if n == 1 else 'ies'})")
         if app.wifi.last:
             bits.append("Wi-Fi link")
-        self.tree.insert("", "end", iid="os", values=(
+        self.tree.insert("", "end", iid="os", values=tuple(tr(x) for x in (
             "This computer's operating system",
             "Programs, listening ports, ARP cache, Wi-Fi",
             "◉ Observed", "✔ Available" if bits else "—",
             fmt_clock(pm.at) if pm.at else "—", ", ".join(bits) or
             "Needs live capture" + ("" if pm.available else
-                                    " and the optional psutil component")))
+                                    " and the optional psutil component"))))
         st_all = app.connectors.status if app.connectors else {}
         for sp in app.config.get("connectors.list", []) or []:
             st = st_all.get(sp["id"], {})
@@ -36355,8 +36641,8 @@ class SourcesTab(BaseTab):
             self.tree.insert("", "end", iid="c:" + sp["id"], values=(
                 f"{sp.get('name') or (kind.title if kind else '?')} — "
                 f"{sp.get('url', '')}",
-                "Lookups and device names of every client",
-                "◈ Reported", label,
+                tr("Lookups and device names of every client"),
+                tr("◈ Reported"), tr(label),
                 fmt_clock(st["last_ok"]) if st.get("last_ok") else "—",
                 st.get("message", "")))
         with contextlib.suppress(tk.TclError):
@@ -36364,7 +36650,7 @@ class SourcesTab(BaseTab):
                 self.tree.selection_set(sel)
         self.recon.configure(state="normal")
         self.recon.delete("1.0", "end")
-        self.recon.insert("end", app.reconciliation_text())
+        self.recon.insert("end", translate_lines(app.reconciliation_text()))
         self.recon.configure(state="disabled")
 
     def on_theme(self):
@@ -63767,6 +64053,24 @@ def gt_rc5_french(app, ctx):
         assert translate_cell("Secure web connection") == \
             "Connexion web sécurisée"
         assert translate_cell("host-0001") == "host-0001"
+        # event sentences: the sentence in French, the names untouched
+        assert translate_event("host-7 got address 10.0.0.9 from DHCP") \
+            == "host-7 a obtenu l'adresse 10.0.0.9 par DHCP"
+        assert translate_event("🔐 Secure connection to a.example.com") \
+            == "🔐 Connexion sécurisée à a.example.com"
+        assert translate_event("+12 more thing(s) just happened — switch "
+                               "to “Full speed” to see every line"
+                               ).startswith("+12 autre(s)")
+        assert translate_event("no such sentence") == "no such sentence"
+        app._select_tab("timeline")
+        _gui_pump(root, 0.3)
+        tl = app.tabs["timeline"]
+        tl.rebuild()
+        _gui_pump(root, 0.3)
+        texts = [str(tl.tree.item(i, "values")[3])
+                 for i in tl.tree.get_children("")[:200]]
+        assert not any(t.endswith(" joined your network") for t in texts), \
+            texts[:5]
         assert translate_cell("This computer's files") == \
             "This computer's files"
         app._select_tab("devices")
