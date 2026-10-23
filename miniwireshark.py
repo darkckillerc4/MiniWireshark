@@ -621,6 +621,138 @@ SAFE_FLAG = "--safe"
 BOOT_CHECK_FLAG = "--boot-check"
 READY_ARG = "--mw-ready="
 STAGE_ARG = "--mw-stage=app"
+
+# 5.1.2: started as "python miniwireshark.py", Python compiles the whole
+# file first: about 2.5 s, and ~150 MB the process keeps for its whole
+# life (Linux, Python 3.12: 196 MB before the window, against 40 MB for
+# the same program loaded from a compiled copy). So the compiled code is
+# kept in MiniWireshark's cache folder (one file per Python version,
+# checked against the script's time and size like any .pyc), and a second
+# process of this file (the managed-Python hand-off, a Full Power worker)
+# loads it. CACHED_RUN is the few lines that do that; a missing or stale
+# copy means the file is compiled as usual.
+CACHED_RUN = "\n".join((
+    "import sys,os,types,marshal,importlib.util as U",
+    "p=os.path.abspath(sys.argv[1]);sys.argv=sys.argv[1:]",
+    "sys.path[0]=os.path.dirname(p);c=None;q=os.environ.get('MW_PYC','')",
+    "try:",
+    " s=os.stat(p);h=open(q,'rb').read() if q else b''",
+    " if h[:4]==U.MAGIC_NUMBER and h[4:8]==bytes(4) and "
+    "int.from_bytes(h[8:12],'little')==int(s.st_mtime)&0xFFFFFFFF and "
+    "int.from_bytes(h[12:16],'little')==s.st_size&0xFFFFFFFF:"
+    "c=marshal.loads(h[16:])",
+    "except Exception:c=None",
+    "if c is None:c=compile(open(p,'rb').read(),p,'exec')",
+    "m=types.ModuleType('__main__');m.__file__=p",
+    "m.__builtins__=__builtins__;sys.modules['__main__']=m",
+    "exec(c,m.__dict__)"))
+
+
+def compiled_copy_path():
+    tag = getattr(sys.implementation, "cache_tag", None) or "py"
+    key = hashlib.sha256(os.path.normcase(SCRIPT_PATH).encode(
+        "utf-8", "replace")).hexdigest()[:12]
+    stem = os.path.splitext(os.path.basename(SCRIPT_PATH))[0][:40]
+    return os.path.join(PATHS.cache, "bytecode", f"{stem}-{key}.{tag}.pyc")
+
+
+def cached_cmd(python, script, args=()):
+    """[python, -c, CACHED_RUN, script, *args]: the same program as
+    [python, script, *args], loaded from the compiled copy (MW_PYC)."""
+    return [python, "-c", CACHED_RUN, script] + list(args)
+
+
+def cached_env(env):
+    env = dict(env)
+    env.setdefault("MW_PYC", compiled_copy_path())
+    env["MW_CACHED"] = "1"
+    return env
+
+
+def _pyc_fresh(path, st):
+    """The compiled copy at `path` matches the file (Python's own check:
+    magic number, time and size)."""
+    import importlib.util as iu
+    try:
+        with open(path, "rb") as f:
+            head = f.read(16)
+    except OSError:
+        return False
+    return (len(head) == 16 and head[:4] == iu.MAGIC_NUMBER and
+            head[4:8] == bytes(4) and
+            int.from_bytes(head[8:12], "little") ==
+            (int(st.st_mtime) & 0xFFFFFFFF) and
+            int.from_bytes(head[12:16], "little") ==
+            (st.st_size & 0xFFFFFFFF))
+
+
+def keep_compiled_copy(code, target=None):
+    """Write this module's compiled code where CACHED_RUN looks, unless a
+    fresh copy is there already (one stat and a 16-byte read). -> path or
+    None."""
+    target = target or compiled_copy_path()
+    try:
+        st = os.stat(SCRIPT_PATH)
+        if _pyc_fresh(target, st):
+            return target
+        import importlib._bootstrap_external as be
+        import _imp
+        # tracebacks and inspect find the file wherever the next process
+        # starts (the code holds the path Python was given, maybe relative)
+        _imp._fix_co_filename(code, SCRIPT_PATH)
+        data = be._code_to_timestamp_pyc(code, st.st_mtime, st.st_size)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = f"{target}.{os.getpid()}.tmp"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, target)
+        return target
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def start_from_compiled_copy(code, argv=None, environ=None, execute=True,
+                             target=None):
+    """On Linux and macOS a process started as "python miniwireshark.py"
+    keeps its compiled code (keep_compiled_copy) and replaces itself
+    (exec: same process, same terminal) with one that loads it, which
+    leaves the compiler's memory behind. Not on Windows (exec starts a
+    second process there), not in Safe Mode, never twice (MW_CACHED), and
+    on any problem it carries on as it is. -> the command (execute=False:
+    the one it would run), or None."""
+    environ = os.environ if environ is None else environ
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if IS_WINDOWS or environ.get("MW_CACHED") or \
+            environ.get("MINIWIRESHARK_NO_CACHED_START") or \
+            SAFE_FLAG in argv:
+        return None
+    target = keep_compiled_copy(code, target)
+    if not target:
+        return None
+    cmd = cached_cmd(sys.executable, SCRIPT_PATH, argv)
+    if not execute:
+        return cmd
+    env = dict(environ)
+    env["MW_CACHED"] = "1"
+    env["MW_PYC"] = target
+    try:
+        with contextlib.suppress(Exception):
+            sys.stdout.flush()
+            sys.stderr.flush()
+        os.execve(sys.executable, cmd, env)
+    except OSError:
+        return None
+    return None
+
+
+if __name__ == "__main__":
+    if os.environ.get("MW_CACHED"):
+        # loaded from the copy: keep it fresh for the processes it starts,
+        # and let a process started the plain way do the same as this one
+        os.environ.pop("MW_CACHED", None)
+        keep_compiled_copy(sys._getframe(0).f_code)
+    else:
+        start_from_compiled_copy(sys._getframe(0).f_code)
 HANDSHAKE_TIMEOUT = 25.0          # seconds for the managed Python's window
 HANDSHAKE_ELEVATION_TIMEOUT = 180.0   # if it is waiting for a UAC click
 HANDOFF_NOTE = [""]               # why a hand-off failed (shown at startup)
@@ -917,11 +1049,11 @@ def runtime_handoff(argv=None, environ=None, execute=True, suitable=None,
         runtime_state_write(state)
     ready = os.path.join(BOOT_DIR, f"ready-{os.getpid()}-"
                                    f"{uuid.uuid4().hex[:8]}")
-    cmd = [env["python"], SCRIPT_PATH] + argv + [STAGE_ARG,
-                                                 READY_ARG + ready]
+    cmd = cached_cmd(env["python"], SCRIPT_PATH,
+                     argv + [STAGE_ARG, READY_ARG + ready])
     if not execute:
         return cmd[:len(cmd) - 2]
-    child_env = dict(environ)
+    child_env = cached_env(environ)
     child_env["MW_STAGE"] = "app"
     child_env["MW_READY_FILE"] = ready
     log_path = _child_log_path()
@@ -53724,8 +53856,9 @@ class _DeepWorkerProc:
             kw["creationflags"] = 0x08000000          # CREATE_NO_WINDOW
         with open(lp, "ab") as log:     # the child keeps its own handle
             self.proc = subprocess.Popen(
-                [sys.executable, script, WORKER_FLAG], stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE, stderr=log, env=env, **kw)
+                cached_cmd(sys.executable, script, [WORKER_FLAG]),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
+                env=cached_env(env), **kw)
         hello = _wire_recv(self.proc.stdout)
         if not hello or hello[0] != "ready":
             raise RuntimeError("deep worker did not start")
@@ -57102,7 +57235,7 @@ def t_runtime_state_and_handoff(ctx):
                             suitable=(False, "test")) is None
         cmd = runtime_handoff(["--demo"], env, False,
                             suitable=(False, "test"))
-        assert cmd == [fake, SCRIPT_PATH, "--demo"], cmd
+        assert cmd == cached_cmd(fake, SCRIPT_PATH, ["--demo"]), cmd
         assert runtime_state_read()["pending_starts"] == 1
         runtime_handoff([], env, False,
                             suitable=(False, "test"))            # 2 unconfirmed starts
@@ -58835,8 +58968,8 @@ def test_v5_handoff_policy_and_handshake(ctx):
             "b": {"python": launcher, "selftest_ok": True}}})
         assert runtime_handoff([], {}, False, suitable=(True, "")) is None
         assert runtime_handoff(["--x"], {}, False,
-                               suitable=(False, "no Tk"))[:2] == \
-            [launcher, SCRIPT_PATH]
+                               suitable=(False, "no Tk"))[:5] == \
+            [launcher, "-c", CACHED_RUN, SCRIPT_PATH, "--x"]
     finally:
         HANDOFF_NOTE[0] = ""
         globals()["BOOT_DIR"] = old_boot
@@ -60099,6 +60232,46 @@ def t_big_file_flush_parts(ctx):
         assert gc.get_threshold() == (_GC_NORMAL[0] or t0)
     finally:
         gc.set_threshold(*t0)
+
+
+@self_test()
+def t_compiled_copy_start(ctx):
+    """A second process loads the kept compiled copy (and still works
+    when the copy is missing, stale or broken); the plain start would
+    replace itself with that command, never twice, never in Safe Mode
+    and never on Windows."""
+    code = compile("x = 1\n", SCRIPT_PATH, "exec")
+    target = ctx.path("copy.pyc")
+    assert keep_compiled_copy(code, target) == target
+    st = os.stat(SCRIPT_PATH)
+    assert _pyc_fresh(target, st)
+    real = compiled_copy_path()
+    assert real.endswith(".pyc") and \
+        getattr(sys.implementation, "cache_tag", "py") in real
+    # a worker started from the copy answers; then from a broken copy
+    for pyc in (None, ctx.path("broken.pyc")):
+        env = cached_env(os.environ)
+        if pyc:
+            with open(pyc, "wb") as f:
+                f.write(b"not a pyc at all")
+            env["MW_PYC"] = pyc
+        r = subprocess.run(cached_cmd(sys.executable, SCRIPT_PATH,
+                                      [WORKER_FLAG]),
+                           input=b"", capture_output=True, env=env,
+                           timeout=120)
+        assert r.returncode == 0, r.stderr[-400:]
+        assert r.stdout, "the worker said nothing"
+    env = {"PATH": os.environ.get("PATH", "")}
+    cmd = start_from_compiled_copy(code, ["--demo"], env, execute=False,
+                                   target=ctx.path("copy2.pyc"))
+    if IS_WINDOWS:
+        assert cmd is None
+    else:
+        assert cmd == cached_cmd(sys.executable, SCRIPT_PATH, ["--demo"])
+    assert start_from_compiled_copy(code, ["--demo"], {"MW_CACHED": "1"},
+                                    False, target) is None
+    assert start_from_compiled_copy(code, [SAFE_FLAG], env, False,
+                                    target) is None
 
 
 @self_test()
