@@ -9371,6 +9371,33 @@ class PerfProbe:
 PERF = [None]          # the active PerfProbe, or None (the usual case)
 
 
+FEATURE_HELP = {
+    "fair_gate": "the analysis thread lets the window in between slices",
+    "chunked": "tables refill a slice at a time after a file or session",
+    "gc_freeze": "startup objects are left out of the cycle collector",
+    "sticky_sort": "tables keep their sort, columns and selection",
+    "tab_groups": "tabs in four groups, with Back and Forward",
+    "state_line": "one state line instead of two banners",
+    "answer_cards": "three answer cards on the Dashboard",
+    "dpi": "sharp text at 125 % and more on Windows",
+}
+
+
+def feature_switch_lines():
+    """For Diagnostics: each 5.1.2 switch, on or off, and how to change
+    it (the review board's condition for keeping two code paths)."""
+    off = [k for k, v in FEATURES.items() if not v]
+    out = ["5.1.2 switches      " + (
+        "all on" if not off else "off: " + ", ".join(off)) +
+        (" (Safe Mode)" if SAFE_MODE else "")]
+    for k, v in FEATURES.items():
+        out.append(f"   {k:<13} {'on ' if v else 'off'}  "
+                   f"{FEATURE_HELP.get(k, '')}")
+    out.append("   Safe Mode turns them all off (the 5.0.2 behaviour); "
+               "MW_FEATURES_OFF=name,name turns chosen ones off.")
+    return out
+
+
 def apply_feature_switches(safe_mode=False, env=None):
     """Safe Mode turns every 5.1.2 switch off (exactly the 5.0.2
     behaviour); MW_FEATURES_OFF="a,b" turns chosen ones off."""
@@ -21616,9 +21643,12 @@ Everything from 5.0 is still here ¦ Tout ce que contenait la 5.0 est toujours l
 The packet workspace, Full Power, Email Traffic, the Components Center and Safe Mode work as before. ¦ L'espace de travail des paquets, la pleine puissance, le trafic e-mail, le centre des composants et le mode sans échec fonctionnent comme avant. ¦ El espacio de trabajo de paquetes, la potencia máxima, el tráfico de correo, el centro de componentes y el modo seguro funcionan como antes.
 Check again ¦ Vérifier à nouveau ¦ Comprobar de nuevo
 Open in a window… ¦ Ouvrir dans une fenêtre… ¦ Abrir en una ventana…
-Show in the Inspector ¦ Afficher dans l'inspecteur ¦ Mostrar en el inspector
 A ranked list, not a verdict. ¦ Une liste classée, pas un verdict. ¦ Una lista ordenada, no un veredicto.
 Nothing to report ¦ Rien à signaler ¦ Nada que señalar
+Export… ¦ Exporter… ¦ Exportar…
+Forward ¦ Suivant ¦ Adelante
+Explain inline (on / off) ¦ Explications en ligne (activer / désactiver) ¦ Explicaciones en línea (activar / desactivar)
+Each fact and how it is known ¦ Chaque fait et comment il est connu ¦ Cada dato y cómo se sabe
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -24495,7 +24525,7 @@ def _pretty_seq(seq):
              "Return": "Enter", "space": "Space", "slash": "/",
              "minus": "-", "plus": "+", "Escape": "Esc", "Delete": "Del",
              "BackSpace": "Backspace", "Prior": "PageUp", "Next": "PageDown"}
-    parts = (seq or "").strip("<>").split("-")
+    parts = [p for p in (seq or "").strip("<>").split("-") if p != "Key"]
     return "+".join(names.get(p, p.upper() if len(p) == 1 else p)
                     for p in parts if p)
 
@@ -39141,6 +39171,11 @@ class MiniWireshark:
                 ("Review new alerts", self.review_alerts),
                 ("Show / hide the inspector", self.toggle_inspector),
                 ("Go to packet…", self.go_to_packet),
+                ("Clear and start fresh…", self.clear),
+                ("Export…", self._open_export_menu),
+                ("Back", lambda: self.router.back()),
+                ("Forward", lambda: self.router.forward()),
+                ("Explain inline (on / off)", self.set_explain),
                 ("Full Power on", lambda: self.set_perf_mode("Full Power")),
                 ("Full Power off (Automatic)",
                  lambda: self.set_perf_mode("Automatic")),
@@ -39202,15 +39237,21 @@ class MiniWireshark:
     # what Ctrl+K shows next to an action: its keyboard shortcut
     PALETTE_KEYS = {"Start watching": "start", "Stop watching": "stop",
                     "Show / hide the inspector": "inspector",
-                    "Go to packet…": "goto_packet"}
+                    "Go to packet…": "goto_packet",
+                    "Clear and start fresh…": "clear", "Export…": "export",
+                    "Back": "back", "Forward": "forward",
+                    "Explain inline (on / off)": "explain"}
 
-    def palette_key(self, label):
-        name = self.PALETTE_KEYS.get(label)
-        if not name:
-            return ""
+    def shortcut_text(self, name):
+        """The key for a configurable shortcut as people read it
+        ("Ctrl+L"), after any change in Settings; "" when there is none."""
         seq = (self.config.get("shortcuts", {}) or {}).get(name) or \
             DEFAULT_SHORTCUTS.get(name, "")
         return _pretty_seq(seq) if seq else ""
+
+    def palette_key(self, label):
+        name = self.PALETTE_KEYS.get(label)
+        return self.shortcut_text(name) if name else ""
 
     def _apply_preset(self, name):
         tab = self._select_tab("packets")
@@ -43249,7 +43290,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                 self.inspect("slow", "")
                 win.destroy()
             win._mw_dock = dock
-            ttk.Button(bar, text="Show in the Inspector",
+            ttk.Button(bar, text="Show in the inspector",
                        command=dock).pack(side="left")
         ttk.Button(bar, text="Close", command=win.destroy).pack(
             side="right")
@@ -44586,6 +44627,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                                               "saved session or file — "
                                               "it is not live."))
         if verbosity == "Short":
+            sections.append(self._facts_section(dev))
             return sections
         sections.insert(2, ("What did MiniWireshark see?",
             "IP: " + (dev.ip or "—") +
@@ -44684,7 +44726,17 @@ proc ::mw_retheme {w map fgnew deffg} {
                     "gadgets and laptops waking from sleep all look like "
                     "this. It only matters if you don't recognize the "
                     "device."))
+        sections.append(self._facts_section(dev))
         return sections
+
+    def _facts_section(self, dev):
+        """5.1.2: the Inspector's facts, word for word, so the card and
+        the docked view never tell different stories (review condition
+        F3). Last in the card, at every explanation length."""
+        return ("Each fact and how it is known", "\n".join(
+            f"{LEVEL_GLYPH.get(lv, '?')} {lab}: {val}" +
+            (f" — {why}" if why else "")
+            for lab, val, lv, why, _k in device_claims(self.model, dev)))
 
     # ---- detail cards (F3) -----------------------------------------------------
     CARD_KINDS = ("device", "website", "remote", "flow", "alert")
@@ -45855,7 +45907,8 @@ proc ::mw_retheme {w map fgnew deffg} {
 
     def _open_session_menu(self):
         m = themed_menu(self)
-        m.add_command(label="Clear and start fresh…", command=self.clear)
+        m.add_command(label="Clear and start fresh…", command=self.clear,
+                      accelerator=self.shortcut_text("clear"))
         m.add_command(label="New session (stop → clear)",
                       command=self._new_session)
         m.add_command(label="Save session…", command=self._save_session)
@@ -48437,7 +48490,7 @@ class DiagnosticsWindow:
             f"{app.config.get('performance.mode', 'Automatic')}, level "
             f"{app.perf_level}, GUI lag {app._gui_lag * 1000:.0f} ms",
             f"Open connections    {len(m.flows.active)} (evicted "
-            f"{m.flows.evicted})",
+            f"{m.flows.evicted})"] + feature_switch_lines() + [
             f"Active threads      {len(threads)}: {', '.join(threads)}",
             f"Data folder         {PATHS.data}",
             f"Cache folder        {PATHS.cache}",
@@ -55142,8 +55195,15 @@ def t_gate_handoff(ctx):
         False, {"MW_FEATURES_OFF": "no_such_switch"}) == saved
     try:
         assert apply_feature_switches(True, {}) == {k: False for k in saved}
+        lines = feature_switch_lines()
+        assert "off: " in lines[0] and all(
+            any(ln.strip().startswith(k + " ") for ln in lines)
+            for k in FEATURES), lines
+        assert set(FEATURE_HELP) == set(FEATURES)
     finally:
         FEATURES.update(saved)
+    if all(FEATURES.values()):
+        assert feature_switch_lines()[0].endswith("all on")
 
 
 @self_test()
@@ -62244,6 +62304,9 @@ def gt_m5_find(app, ctx):
     cats = {c for _l, c, _f in items}
     assert {"setting", "help", "website"} <= cats, cats
     assert app.palette_key("Start watching")
+    assert app.palette_key("Clear and start fresh…") == "Ctrl+L"
+    assert app.palette_key("Back") == "Alt+Left"
+    assert _pretty_seq("<Control-Key-1>") == "Ctrl+1"
     win = app.open_setting("general.confirm_before_clear")
     _gui_pump(root, 0.4)
     assert "Ask before clearing data" in win.search_var.get() or \
@@ -62889,6 +62952,22 @@ def gt_rc2_polish(app, ctx):
     finally:
         app.beginner_mode = beg0
         app.config.set("appearance.folds", folds0)
+    # the Inspector and the device card tell the same facts: every claim
+    # the Inspector shows is in the card's copied text, with its value
+    reg = app.model.registry
+    for key in list(reg.by_key)[:8]:
+        dev = reg.by_key[key]
+        card = app.show_device(key)
+        _gui_pump(root, 0.1)
+        # the card's plain-text export (Copy report), folded or not
+        text = "\n".join(sec[0] + "\n" + card.section_text(sec[1])
+                         for sec in card.sections)
+        missing = [(lab, val) for lab, val, _lv, _w, _k in
+                   device_claims(app.model, dev)
+                   if str(val) not in text]
+        assert not missing, (dev.display_name(), missing)
+        with contextlib.suppress(tk.TclError):
+            card.win.destroy()
     # Why slow: the window's ranking docks in the Inspector
     vis0 = app.inspector_visible
     win = app.investigate("slow")
