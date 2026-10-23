@@ -1168,7 +1168,8 @@ RELEASE_FLAGS = ("--release-check", "--make-release-key", "--sign-release",
 RELEASE_MODE = any(f in sys.argv for f in RELEASE_FLAGS)
 BOOT_CHECK_MODE = BOOT_CHECK_FLAG in sys.argv
 WORKER_MODE = "--mw-worker" in sys.argv      # a Full Power worker process
-GATE_MODE = "--release-gate" in sys.argv or "--gui-shots" in sys.argv
+GATE_MODE = "--release-gate" in sys.argv or "--gui-shots" in sys.argv or \
+    "--start-check" in sys.argv
 TOOL_MODE = SELF_TEST_MODE or GUI_TEST_MODE or BENCH_MODE or \
     RELEASE_MODE or BOOT_CHECK_MODE or WORKER_MODE or BENCH_GUI_MODE or \
     GATE_MODE
@@ -2610,6 +2611,241 @@ class LoaderWindow(tk.Frame):
 
     def _choose(self, key):
         self.choice = key
+
+    # ---- rc.11: warm start --------------------------------------------------------
+    def show_progress_again(self, title="Opening MiniWireshark"):
+        """After the Welcome Center: back to a status line and a bar."""
+        with contextlib.suppress(tk.TclError):
+            self._clear_card()
+            self.winfo_toplevel().unbind("<Return>")
+            self.progress.pack(fill="x", pady=(6, 2), before=self.card)
+            self.progress["value"] = 0
+            self.sub_var.set(title)
+            self.speed_var.set("")
+            self.footer.config(text="Please wait …")
+
+    def cover(self):
+        """Lie over the whole window, so the main window can be built and
+        laid out underneath and appear finished (rc.11)."""
+        with contextlib.suppress(tk.TclError):
+            self.pack_forget()
+            self.place(x=0, y=0, relwidth=1, relheight=1)
+            self.lift()
+
+    def warm_step(self, text, pct=None, live=True):
+        """rc.11: the next line of the start-up checklist; the line before
+        it gets its tick and its time. live=False while the main window is
+        built underneath: redraws only (no events, no timers run)."""
+        now = time.perf_counter()
+        steps = self.__dict__.setdefault("_warm", [])
+        if steps and steps[-1][2] is None:
+            steps[-1][2] = now - steps[-1][1]
+        if text:
+            steps.append([text, now, None])
+        lines = []
+        for t, _t0, took in steps:
+            mark = "\u2713" if took is not None else "\u25b8"
+            lines.append(f"{mark}  {translate_text(t)}" + (
+                f"   {took:.2f} s" if took is not None and took >= 0.05
+                else ""))
+        try:
+            for lb in self.stage_lbls.values():   # the Runtime Manager's
+                lb.master.pack_forget()           # stages: not these
+                break
+            lbl = getattr(self, "_warm_lbl", None)
+            if lbl is None or not lbl.winfo_exists():
+                lbl = self._warm_lbl = tk.Label(
+                    self.card, bg=self.bg, fg=self.muted, anchor="nw",
+                    justify="left", font=mw_font(10))
+                lbl.pack(fill="x", anchor="w", pady=(8, 0))
+            lbl.configure(text="\n".join(lines))
+            if text:
+                self.status_var.set(text + " …")
+            if pct is not None:
+                self.progress["value"] = pct
+            if live:
+                self.pump()
+            else:
+                self.lift()
+                self.update_idletasks()
+                # the window grew to its real size: its exposed parts are
+                # drawn only on window events (timers wait for the end)
+                flags = tk._tkinter.WINDOW_EVENTS | tk._tkinter.DONT_WAIT
+                for _ in range(400):
+                    if not self.tk.dooneevent(flags):
+                        break
+                self.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def build_step(self, text, pct):
+        """The main window's own steps (MiniWireshark(progress=…))."""
+        self.warm_step(text, pct, live=False)
+
+
+def warm_up_before_window(loader, cfg):
+    """rc.11: first-time work done on the loading screen instead of in the
+    first minute of the window: the remembered text widths are read, and
+    on the first start (or on a computer with another number of cores)
+    this computer's speed is measured — 1.5 s of synthetic packets through
+    the real decoder, which used to run 6 s after the window opened and
+    compete with the first capture. → what was done, for the log."""
+    done = {}
+    if not FEATURES.get("warm_start", True) or SAFE_MODE:
+        return done
+    t0 = time.perf_counter()
+    loader.post_health("degraded" if CAPTURE_LIMITED[0] or HANDOFF_NOTE[0]
+                       else "healthy")
+    loader.warm_step("Remembering text sizes from last time", 0)
+    done["text_widths"] = TEXT_WIDTHS.load(loader)
+    if needs_calibration(cfg) and not os.environ.get("MW_NO_CALIBRATION"):
+        loader.warm_step("Measuring this computer's speed — only on the "
+                         "first start (about 2 seconds)", 0)
+        box = []
+
+        def run():
+            try:
+                box.append(calibrate(1.5))
+            except Exception:                        # noqa: BLE001
+                LOG.exception("calibration")
+        th = threading.Thread(target=run, daemon=True, name="calibrate")
+        tc = time.perf_counter()
+        th.start()
+        while th.is_alive():
+            loader.post_progress(min(99, int(
+                (time.perf_counter() - tc) / 1.6 * 100)))
+            loader.pump()
+            th.join(0.04)
+        loader.post_progress(100)
+        if box and store_calibration(cfg, box[0]):
+            done["calibration_pps"] = round(box[0])
+    # Windows (and a start with the compiled copy turned off) never keeps
+    # the compiled copy itself: a short helper writes it now, so the first
+    # Full Power worker starts in 0.2 s, not 1 s. Waited for here (up to
+    # 20 s), so it does not compete with building the window
+    proc = prepare_compiled_copy()
+    if proc is not None:
+        loader.warm_step("Preparing the helper processes — once per "
+                         "version", 0)
+        tc = time.perf_counter()
+        while proc.poll() is None and time.perf_counter() - tc < 20:
+            loader.post_progress(min(99, int(
+                (time.perf_counter() - tc) / 3.0 * 100)))
+            loader.pump()
+            time.sleep(0.04)
+        loader.post_progress(100)
+        done["compiled_copy"] = proc.poll()
+    loader.warm_step(None)
+    done["ms"] = round((time.perf_counter() - t0) * 1000)
+    LOG.info("warm-up before the window: %s", done)
+    return done
+
+
+def prepare_compiled_copy(popen=None):
+    """Start a helper that writes the compiled copy (and exits at once) if
+    the copy is missing or older than the file. -> the process, or None."""
+    if SAFE_MODE or not FEATURES.get("warm_start", True):
+        return None
+    try:
+        if _pyc_fresh(compiled_copy_path(), os.stat(SCRIPT_PATH)):
+            return None
+        return (popen or subprocess.Popen)(
+            cached_cmd(sys.executable, SCRIPT_PATH, [WORKER_FLAG]),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, env=cached_env(os.environ),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        LOG.debug("compiled copy helper", exc_info=True)
+        return None
+
+
+def warm_heading_widths(root, current_scale=1.0, budget_s=3.0):
+    """rc.11: measure every table heading at the other text sizes too, so
+    the first change of text size finds them remembered (the coldest step
+    of that change was one Tk measure per heading, ~80 ms at S1). Only the
+    texts not yet remembered are measured: the first start, or a new
+    language. -> how many were measured."""
+    if not TEXT_WIDTHS.on():
+        return 0
+    texts = set()
+    for tree in _walk_class(root, ttk.Treeview):
+        try:
+            for c in ("#0",) + tuple(tree["columns"]):
+                t = str(tree.heading(c, "text") or "")
+                if t:
+                    texts.add(t)
+        except tk.TclError:
+            continue
+    fonts = []
+    scales = sorted(set(MiniWireshark.TEXT_SIZES.values()))
+    for scale in scales:
+        if abs(scale - current_scale) < 1e-6:
+            continue
+        with contextlib.suppress(tk.TclError):
+            fonts.append(tkfont.Font(root=root, font=(
+                "TkDefaultFont", int(round(10 * scale)), "bold")))
+    if CURRENT_LOCALE != "en":      # _i18n_fit_heading's named font
+        with contextlib.suppress(tk.TclError, KeyError):
+            a = tkfont.nametofont("TkHeadingFont").actual()
+            base = a["size"] / max(0.1, current_scale)
+            for scale in scales:
+                if abs(scale - current_scale) < 1e-6:
+                    continue
+                fonts.append(tkfont.Font(
+                    root=root, family=a["family"], weight=a["weight"],
+                    slant=a["slant"], size=(-1 if base < 0 else 1) * max(
+                        6, int(round(abs(base) * scale)))))
+    before = TEXT_WIDTHS.misses
+    t_end = time.perf_counter() + budget_s
+    for f in fonts:
+        for t in sorted(texts):
+            text_width(f, t)
+            if time.perf_counter() > t_end:
+                return TEXT_WIDTHS.misses - before
+    return TEXT_WIDTHS.misses - before
+
+
+def open_main_window(root, loader, cfg, ident, action, welcomed=False):
+    """Build the main window. With warm_start on, it is built under the
+    loading screen (which shows each step) and appears finished: the old
+    order removed the loader first and showed a blank, frozen window for
+    the whole build (0.5 s here, seconds on a slow laptop)."""
+    gw, my_ips, my_macs, iface = ident
+    covered = FEATURES.get("warm_start", True) and not SAFE_MODE
+    root.resizable(True, True)
+    root.title("MiniWireshark")
+    if not covered:
+        loader.destroy()
+        return MiniWireshark(root, gw, my_ips, my_macs, iface, config=cfg,
+                             start_action=action)
+    if welcomed:
+        loader.show_progress_again()
+    loader.cover()
+    loader.build_step("Opening the main window", 10)
+    t0 = time.perf_counter()
+    try:
+        app = MiniWireshark(root, gw, my_ips, my_macs, iface, config=cfg,
+                            start_action=action, progress=loader.build_step)
+        loader.build_step("Measuring table headings for every text size",
+                          95)
+        try:
+            n = warm_heading_widths(root, MiniWireshark.TEXT_SIZES.get(
+                cfg.get("appearance.text_size", "Normal"), 1.0))
+            if n:
+                LOG.info("heading widths measured ahead: %d", n)
+                TEXT_WIDTHS.save()
+        except Exception:                            # noqa: BLE001
+            LOG.debug("heading widths", exc_info=True)
+        loader.warm_step(None, 100, live=False)
+        with contextlib.suppress(tk.TclError):
+            root.update_idletasks()       # sizes settle before it shows
+    finally:
+        with contextlib.suppress(tk.TclError):
+            loader.destroy()
+    LAUNCH_TIMES["window_built"] = time.perf_counter() - t0
+    with contextlib.suppress(tk.TclError):
+        root.update()              # paint at once: no blank frame between
+    return app
 
 
 def mask_sensitive(text):
@@ -9536,6 +9772,7 @@ FEATURES = {
     "state_line": True,      # one truthful state line, not two banners (M4)
     "answer_cards": True,    # three answers on the Dashboard (M6)
     "dpi": True,             # Windows draws sharp text at 125 %+ (M8)
+    "warm_start": True,      # the window is built behind the loading screen
 }
 
 
@@ -9673,6 +9910,8 @@ FEATURE_HELP = {
     "state_line": "one state line instead of two banners",
     "answer_cards": "three answer cards on the Dashboard",
     "dpi": "sharp text at 125 % and more on Windows",
+    "warm_start": "the window is built and warmed behind the loading "
+                  "screen; text widths are remembered between starts",
 }
 
 
@@ -10369,6 +10608,9 @@ class RawCapture(threading.Thread):
         self.exception = None
         self.received = 0
         self.started = threading.Event()
+        # rc.11: set once the first wait for a packet has ended (a packet,
+        # 20 ms of quiet, or an error), so the start need not sleep 0.2 s
+        self.first_cycle = threading.Event()
         self.sock = None
         self.kind = "raw socket"
 
@@ -10391,19 +10633,23 @@ class RawCapture(threading.Thread):
         except Exception as e:                       # noqa: BLE001
             self.exception = e
             self.started.set()
+            self.first_cycle.set()
             return
         self.running = True
         self.started.set()
         sock = self.sock
         lt_cache = {}
         select = getattr(type(sock), "select", None)
+        first = self.first_cycle
         try:
             while not self.stop_flag:
                 if select is not None:
-                    ready = select([sock], 0.25)
+                    ready = select([sock], 0.25 if first.is_set() else 0.02)
                     if not ready:
+                        first.set()
                         continue
                 r = sock.recv_raw(65535)
+                first.set()
                 if not r:
                     continue
                 cls, raw, ts = r[0], r[1], r[2] if len(r) > 2 else None
@@ -10419,6 +10665,7 @@ class RawCapture(threading.Thread):
                 self.exception = e
         finally:
             self.running = False
+            first.set()
             with contextlib.suppress(Exception):
                 sock.close()
 
@@ -10459,7 +10706,10 @@ def start_capture_source(iface, bpf, promisc, sink):
     rc = RawCapture(iface, bpf, promisc, sink)
     rc.start()
     rc.started.wait(3.0)
-    time.sleep(0.2)
+    # was a fixed 0.2 s sleep on the window's thread (the freeze when
+    # watching starts, 0.7 s after the window opens): now until the first
+    # wait for a packet ends, 0.2 s at most (sockets without select)
+    rc.first_cycle.wait(0.2)        # an error is stored before it is set
     if rc.exception is None and rc.is_alive():
         return rc, None
     err = rc.exception
@@ -22154,6 +22404,17 @@ Unreachable ¦ Injoignable ¦ Inaccesible
 Unexpected answer ¦ Réponse inattendue ¦ Respuesta inesperada
 Waiting ¦ En attente ¦ En espera
 Paused ¦ En pause ¦ En pausa
+Remembering text sizes from last time ¦ Rappel des tailles de texte de la dernière fois ¦ Recuperando los tamaños de texto de la última vez
+Measuring this computer's speed — only on the first start (about 2 seconds) ¦ Mesure de la vitesse de cet ordinateur — seulement au premier démarrage (environ 2 secondes) ¦ Midiendo la velocidad de este ordenador — solo en el primer inicio (unos 2 segundos)
+Opening the main window ¦ Ouverture de la fenêtre principale ¦ Abriendo la ventana principal
+Building the tabs and tables ¦ Construction des onglets et des tableaux ¦ Construyendo las pestañas y las tablas
+Listing your network adapters ¦ Liste de vos cartes réseau ¦ Listando sus adaptadores de red
+Applying your colours and text size ¦ Application de vos couleurs et de la taille du texte ¦ Aplicando sus colores y el tamaño del texto
+Laying out the window ¦ Mise en page de la fenêtre ¦ Organizando la ventana
+Starting the background helpers ¦ Démarrage des assistants en arrière-plan ¦ Iniciando los asistentes en segundo plano
+Opening MiniWireshark ¦ Ouverture de MiniWireshark ¦ Abriendo MiniWireshark
+Measuring table headings for every text size ¦ Mesure des en-têtes de tableau pour chaque taille de texte ¦ Midiendo los encabezados de tabla para cada tamaño de texto
+Preparing the helper processes — once per version ¦ Préparation des processus d'aide — une fois par version ¦ Preparando los procesos auxiliares — una vez por versión
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -23206,7 +23467,7 @@ def _i18n_cnf(cnf):
 def _i18n_fit_heading(tree, column, text):
     """Widen a table column so a longer translated heading isn't cut."""
     try:
-        need = tkfont.nametofont("TkHeadingFont").measure(text) + 18
+        need = text_width(tkfont.nametofont("TkHeadingFont"), text) + 18
         if int(tree.column(column, "width")) < need:
             tree.column(column, width=need)
     except (tk.TclError, ValueError, TypeError):
@@ -23801,8 +24062,167 @@ def heading_width(text):
     if w is None:
         if len(_HEADING_W) > 4000:
             _HEADING_W.clear()
-        w = _HEADING_W[key] = f.measure(text)
+        w = _HEADING_W[key] = text_width(f, text)
     return w
+
+
+class TextWidths:
+    """5.1.2 rc.11: the pixel widths of interface texts (table headings,
+    Settings page titles), remembered between starts. Tk measures a text
+    in about 0.9 ms on Linux (Xft), and a start measured ~200 headings in
+    English and ~500 in French (0.2-0.5 s of the window's build).
+
+    Kept per font (its family, size, weight and slant as Tk resolved
+    them) and per screen setup (Tk's scaling, windowing system and
+    version). On the first use of a font in a process, one probe text is
+    measured: a different width (another font installed under the same
+    name) throws that font's widths away. Only texts the caller marks as
+    interface text are written to disk, never names or addresses seen on
+    the network; Safe Mode and the warm_start switch turn it off."""
+
+    PROBE = "MiniWireshark Ag 0123 \u00c9\u00e9\u00d1 \u2014 W"
+    MAX_PER_FONT = 3000
+    MAX_FONTS = 32
+    VERSION = 1
+
+    def __init__(self, path=None):
+        self.path = path
+        self.fonts = {}          # sig -> {"probe": px, "w": {text: px}}
+        self.session = {}        # (sig, text) -> px, not kept
+        self.checked = set()
+        self.env = None
+        self.loaded = False
+        self.dirty = False
+        self.hits = self.misses = 0
+
+    def on(self):
+        return FEATURES.get("warm_start", True) and not SAFE_MODE
+
+    def _path(self):
+        return self.path or os.path.join(PATHS.cache, "text_widths.json")
+
+    @staticmethod
+    def env_key(widget=None):
+        try:
+            tkapp = (widget or tk._default_root).tk
+            return "|".join(str(x) for x in (
+                round(float(tkapp.call("tk", "scaling")), 4),
+                tkapp.call("tk", "windowingsystem"),
+                tkapp.call("info", "patchlevel"), sys.platform))
+        except Exception:                            # noqa: BLE001
+            return ""
+
+    _SIGS = {}
+
+    @classmethod
+    def font_sig(cls, font):
+        """What Tk resolved the font to. `font actual` costs as much as a
+        measure (~0.85 ms on Xft), so it is asked once per font name and
+        requested options (`font configure`, a few microseconds)."""
+        try:
+            key = (font.name, tuple(sorted(font.configure().items())))
+        except (tk.TclError, AttributeError, RuntimeError):
+            key = None
+        sig = cls._SIGS.get(key) if key is not None else None
+        if sig is not None:
+            return sig
+        try:
+            a = font.actual()
+            sig = f"{a.get('family')}|{a.get('size')}|{a.get('weight')}" \
+                  f"|{a.get('slant')}"
+        except (tk.TclError, AttributeError, RuntimeError):
+            return ""
+        if key is not None:
+            if len(cls._SIGS) > 500:
+                cls._SIGS.clear()
+            cls._SIGS[key] = sig
+        return sig
+
+    def load(self, widget=None):
+        """Read the remembered widths (once). → how many."""
+        if self.loaded:
+            return sum(len(b.get("w", {})) for b in self.fonts.values())
+        self.loaded = True
+        if not self.on():
+            return 0
+        self.env = self.env_key(widget)
+        data = read_json(self._path(), None)
+        if not isinstance(data, dict) or data.get("v") != self.VERSION or \
+                data.get("env") != self.env or not self.env:
+            return 0
+        fonts = data.get("fonts")
+        if not isinstance(fonts, dict):
+            return 0
+        n = 0
+        for sig, b in list(fonts.items())[:self.MAX_FONTS]:
+            if isinstance(b, dict) and isinstance(b.get("w"), dict) and \
+                    isinstance(b.get("probe"), int):
+                w = {k: v for k, v in b["w"].items()
+                     if isinstance(k, str) and isinstance(v, int)}
+                self.fonts[str(sig)] = {"probe": b["probe"], "w": w}
+                n += len(w)
+        return n
+
+    def width(self, font, text, keep=True):
+        if not self.loaded:
+            self.load()
+        if not self.on():
+            return font.measure(text)
+        sig = self.font_sig(font)
+        if not sig:
+            return font.measure(text)
+        bucket = self.fonts.get(sig)
+        if sig not in self.checked:
+            self.checked.add(sig)
+            probe = font.measure(self.PROBE)
+            if bucket is None or bucket.get("probe") != probe:
+                if bucket is not None:
+                    self.dirty = True
+                bucket = self.fonts[sig] = {"probe": probe, "w": {}}
+        got = bucket["w"].get(text)
+        if got is None:
+            got = self.session.get((sig, text))
+        if got is not None:
+            self.hits += 1
+            return got
+        self.misses += 1
+        got = font.measure(text)
+        if keep and len(text) <= 120 and \
+                len(bucket["w"]) < self.MAX_PER_FONT:
+            bucket["w"][text] = got
+            self.dirty = True
+        else:
+            if len(self.session) > 20000:
+                self.session.clear()
+            self.session[(sig, text)] = got
+        return got
+
+    def save(self):
+        """Write the widths when something new was measured. Quiet."""
+        if not self.dirty or not self.on() or not self.env:
+            return False
+        fonts = dict(list(self.fonts.items())[-self.MAX_FONTS:])
+        data = {"v": self.VERSION, "env": self.env, "fonts": fonts}
+        try:
+            os.makedirs(os.path.dirname(self._path()), exist_ok=True)
+            atomic_write_text(self._path(), json.dumps(
+                data, ensure_ascii=False, separators=(",", ":")))
+        except (OSError, TypeError, ValueError):
+            return False
+        self.dirty = False
+        return True
+
+
+TEXT_WIDTHS = TextWidths()
+
+
+def text_width(font, text, keep=True):
+    """Pixel width of an interface text in `font`, remembered (between
+    starts when keep=True: only for fixed interface texts)."""
+    try:
+        return TEXT_WIDTHS.width(font, text, keep)
+    except (tk.TclError, RuntimeError):
+        return font.measure(text)
 
 
 def fit_heading(tree, col):
@@ -25673,7 +26093,7 @@ class SettingsWindow:
 
         # ---- sidebar
         f_base = tkfont.Font(root=self.win, font=self.F_BASE)
-        longest = max(f_base.measure(translate_text(p["title"]))
+        longest = max(text_width(f_base, translate_text(p["title"]))
                       for p in SETTINGS_PAGES)
         side_w = max(220, min(330, longest + 60))
         side = tk.Frame(self.win, bg=t["side_bg"], width=side_w)
@@ -34865,7 +35285,7 @@ class PacketsTab(BaseTab):
                       "Seconds since start": "00000.000000",
                       "Since previous shown": "000.000000"}.get(
                 self.time_var.get(), "00:00:00.000")
-            self.tree.column("time", width=f.measure(sample) + 18)
+            self.tree.column("time", width=text_width(f, sample) + 18)
         except (tk.TclError, AttributeError):
             pass
 
@@ -38488,9 +38908,13 @@ class MiniWireshark:
                   "Extra large": 1.3}
 
     def __init__(self, root, gateway_ip, my_ips, my_macs,
-                 default_iface_name="", config=None, start_action=None):
+                 default_iface_name="", config=None, start_action=None,
+                 progress=None):
         global DATA
         self.root = root
+        # rc.11: (text, percent) for the loading screen the window is built
+        # behind; None when built directly (tests, the benchmark)
+        self._progress = progress
         self.real_identity = (gateway_ip, set(my_ips), set(my_macs))
         self.default_iface_name = default_iface_name
         root.title("MiniWireshark")
@@ -38621,11 +39045,15 @@ class MiniWireshark:
         mono.configure(size=9)
         self.mono = mono
         self.kits = []                # every TableKit (5.1.2 M3)
+        self._startup_step("Building the tabs and tables", 20)
         self._build_ui()
         self.root.after(TableKit.REL_EVERY, self._kits_tick)
+        self._startup_step("Listing your network adapters", 55)
         self._populate_ifaces()
+        self._startup_step("Applying your colours and text size", 65)
         self._apply_theme()
         self._apply_text_size(defer=False)
+        self._startup_step("Laying out the window", 80)
         self._restore_window()
         self._layout_pass()
         self._away_since = None
@@ -38638,6 +39066,7 @@ class MiniWireshark:
         self._compact = None
         self.root.bind("<Configure>", self._on_root_configure, add="+")
         self._apply_shortcuts()
+        self._startup_step("Starting the background helpers", 90)
         self.data.start()
         self._ensure_worker()
         threading.Thread(target=self._discover_dns, daemon=True,
@@ -38659,8 +39088,9 @@ class MiniWireshark:
                 "“Restore the interrupted session” brings it back (up to "
                 "its last 30 seconds).", kind="warn"))
         self.root.after(30000, self._journal_tick)
-        if not TOOL_MODE and not self.config.get(
-                "performance.calibration", {}).get("pps"):
+        if not TOOL_MODE and needs_calibration(self.config):
+            # the loading screen measures it first (rc.11); this is for
+            # the warm_start switch off, Safe Mode, or a failed measure
             self.root.after(6000, self.start_calibration)
         self.root.after(300, self._flush_feed)
         self.root.after(3000, self._tick_model)
@@ -38703,6 +39133,16 @@ class MiniWireshark:
                 manual=False))
         LOG.info("GUI started (version %s, %s)", SCRIPT_VERSION,
                  platform.platform())
+
+    def _startup_step(self, text, pct):
+        """One line on the loading screen while the window is built behind
+        it (rc.11). Draws only: no events or timers run in between."""
+        if self._progress is None:
+            return
+        try:
+            self._progress(text, pct)
+        except Exception:                            # noqa: BLE001
+            LOG.debug("startup progress", exc_info=True)
 
     # ---- background jobs (section 18c) ------------------------------------------
     def _show_jobs(self):
@@ -40593,16 +41033,7 @@ class MiniWireshark:
 
     def _calibrated(self, pps):
         self._calibrating = False
-        if not pps:
-            return
-        cores = os.cpu_count() or 1
-        self.config.set("performance.calibration", {
-            "pps": round(pps), "when": time.time(), "cores": cores})
-        if self.config.get("performance.full_power_cores", 2) == 2:
-            self.config.set("performance.full_power_cores",
-                            max(1, min(4, cores - 1)))
-        self.config.save()
-        LOG.info("calibration: %.0f packets/s on %d cores", pps, cores)
+        store_calibration(self.config, pps)
 
     def follow_stream(self, fid):
         """Packets → Streams on one connection (any mode)."""
@@ -42910,7 +43341,15 @@ proc ::mw_retheme {w map fgnew deffg} {
             yield
         with contextlib.suppress(KeyError, AttributeError, tk.TclError):
             self.tabs["packets"].fit_time_column()
-        self._scale_explicit_fonts(self.root, scale)
+        # rc.11: at Normal size with nothing scaled yet, every explicit font
+        # is already its own size: the walk over all ~4,000 widgets (0.1 s
+        # of each start) set each one to what it was
+        if scale != 1.0 or getattr(self, "_explicit_scale", 1.0) != 1.0 \
+                or not FEATURES.get("warm_start", True):
+            # a few hundred widgets per callback (all ~4,000 in one was
+            # the longest step of a text size change, 50-70 ms at S1)
+            yield from self._scale_explicit_fonts_steps(self.root, scale)
+        self._explicit_scale = scale
         yield
         # bigger text: table headings widen so they are not cut, a few
         # tables per callback
@@ -42924,6 +43363,30 @@ proc ::mw_retheme {w map fgnew deffg} {
         """Widgets built with an explicit ("TkDefaultFont", 11, "bold")
         style font don't follow the named fonts, so scale those directly
         (remembering each widget's original size so scaling never compounds)."""
+        for _ in self._scale_explicit_fonts_steps(widget, scale, every=0):
+            pass
+
+    def _scale_explicit_fonts_steps(self, widget, scale, every=600):
+        """The same, yielding after every `every` widgets (0: never).
+        Widgets destroyed in between are skipped."""
+        stack, n = [widget], 0
+        try:
+            names = set(tkfont.names(self.root))
+        except tk.TclError:
+            names = set()
+        memo = {}             # original font -> scaled font, this walk
+        while stack:
+            w = stack.pop()
+            self._scale_one_font(w, scale, names, memo)
+            try:
+                stack.extend(reversed(w.winfo_children()))
+            except Exception:                        # noqa: BLE001
+                pass
+            n += 1
+            if every and n % every == 0:
+                yield
+
+    def _scale_one_font(self, widget, scale, names=None, memo=None):
         try:
             has_font = "font" in widget.keys()
         except Exception:
@@ -42933,26 +43396,27 @@ proc ::mw_retheme {w map fgnew deffg} {
                 raw = getattr(widget, "_mw_orig_font", None)
                 if raw is None:
                     raw = widget._mw_orig_font = str(widget.cget("font"))
-                if raw not in tkfont.names():
-                    f = tkfont.Font(root=self.root, font=raw)
-                    a = f.actual()
-                    size = a["size"]
-                    new = (-1 if size < 0 else 1) * max(
-                        6, int(round(abs(size) * scale)))
-                    parts = [a["family"], new]
-                    if a.get("weight") == "bold":
-                        parts.append("bold")
-                    if a.get("slant") == "italic":
-                        parts.append("italic")
-                    widget.configure(font=tuple(parts))
+                if names is None:
+                    names = tkfont.names()
+                if raw not in names:
+                    parts = memo.get(raw) if memo is not None else None
+                    if parts is None:
+                        f = tkfont.Font(root=self.root, font=raw)
+                        a = f.actual()
+                        size = a["size"]
+                        new = (-1 if size < 0 else 1) * max(
+                            6, int(round(abs(size) * scale)))
+                        parts = [a["family"], new]
+                        if a.get("weight") == "bold":
+                            parts.append("bold")
+                        if a.get("slant") == "italic":
+                            parts.append("italic")
+                        parts = tuple(parts)
+                        if memo is not None:
+                            memo[raw] = parts
+                    widget.configure(font=parts)
             except (tk.TclError, KeyError, TypeError):
                 pass
-        try:
-            children = widget.winfo_children()
-        except Exception:
-            children = []
-        for child in children:
-            self._scale_explicit_fonts(child, scale)
 
 
     def _focus_search(self, _event=None):
@@ -48693,6 +49157,7 @@ proc ::mw_retheme {w map fgnew deffg} {
     def _confirm_startup_ok(self):
         """20 s after a successful start, an update (and the private
         runtime) is considered good."""
+        TEXT_WIDTHS.save()
         if runtime_confirm_started():
             LOG.info("private runtime start confirmed")
         marker = read_json(PATHS.update_marker, None)
@@ -48739,6 +49204,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         LOG.info("shutting down")
         with contextlib.suppress(Exception):
             self.jobs.stop()
+        TEXT_WIDTHS.save()
         self._remember_window()
         try:
             if self.history is not None and self.data_mode in ("live",
@@ -49849,19 +50315,48 @@ def calibrate(seconds=1.5):
     """A short synthetic replay through the real decode and model path
     (no network traffic). → packets per second on this computer."""
     frames = ScenarioBuilder().busy_mix(4000)
-    cfg = AppConfig(path=os.path.join(tempfile.mkdtemp(), "cal.json"))
-    m = NetworkModel(cfg, *scenario_identity()[:3])
-    m.set_identity(local_nets=scenario_identity()[3])
-    m.use_packet_clock = True
-    reasm = TlsReassembler()
-    n = 0
-    t0 = time.perf_counter()
-    while time.perf_counter() - t0 < seconds:
-        for raw, ts, lt in frames[:1000]:
-            d = fast_decode(raw, ts, lt, reasm)
-            m.ingest(d)
-            n += 1
-    return n / max(1e-6, time.perf_counter() - t0)
+    tmp = tempfile.mkdtemp(prefix="mw_cal_")
+    try:
+        cfg = AppConfig(path=os.path.join(tmp, "cal.json"))
+        m = NetworkModel(cfg, *scenario_identity()[:3])
+        m.set_identity(local_nets=scenario_identity()[3])
+        m.use_packet_clock = True
+        reasm = TlsReassembler()
+        n = 0
+        t0 = time.perf_counter()
+        while time.perf_counter() - t0 < seconds:
+            for raw, ts, lt in frames[:1000]:
+                d = fast_decode(raw, ts, lt, reasm)
+                m.ingest(d)
+                n += 1
+        return n / max(1e-6, time.perf_counter() - t0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def store_calibration(cfg, pps):
+    """Keep a speed measurement in the settings (and size Full Power from
+    the cores when that is still the default)."""
+    if not pps:
+        return False
+    cores = os.cpu_count() or 1
+    cfg.set("performance.calibration", {
+        "pps": round(pps), "when": time.time(), "cores": cores})
+    if cfg.get("performance.full_power_cores", 2) == 2:
+        cfg.set("performance.full_power_cores", max(1, min(4, cores - 1)))
+    cfg.save()
+    LOG.info("calibration: %.0f packets/s on %d cores", pps, cores)
+    return True
+
+
+def needs_calibration(cfg):
+    """No speed measurement yet, or one made with another number of cores
+    (a new computer, or the data folder copied over)."""
+    cal = cfg.get("performance.calibration", {}) or {}
+    if not isinstance(cal, dict) or not cal.get("pps"):
+        return True
+    return bool(cal.get("cores")) and cal.get("cores") != (os.cpu_count()
+                                                           or 1)
 
 
 class CrashDialog:
@@ -60235,6 +60730,191 @@ def t_big_file_flush_parts(ctx):
 
 
 @self_test()
+def t_text_widths_remembered(ctx):
+    """rc.11: interface text widths are kept between starts per font and
+    screen setup; another font under the same name (probe width differs)
+    or another screen setup starts afresh; data texts are never written;
+    off with the warm_start switch."""
+    class FakeFont:
+        def __init__(self, family="Sans", k=7):
+            self.family, self.k, self.calls = family, k, 0
+
+        def actual(self):
+            return {"family": self.family, "size": 10, "weight": "normal",
+                    "slant": "roman"}
+
+        def measure(self, text):
+            self.calls += 1
+            return len(text) * self.k
+    path = ctx.path("tw.json")
+    tw = TextWidths(path)
+    tw.loaded, tw.env = True, "scaling|x11|8.6|linux"
+    f = FakeFont()
+    assert tw.width(f, "Device") == 42
+    assert tw.width(f, "Device") == 42 and f.calls == 2     # probe + one
+    assert tw.width(f, "nas-kitchen.local", keep=False) == 17 * 7
+    assert tw.save() and not tw.save()              # only when changed
+    data = read_json(path, {})
+    kept = next(iter(data["fonts"].values()))["w"]
+    assert "Device" in kept and "nas-kitchen.local" not in kept
+    # the next start: no measuring but the probe
+    tw2 = TextWidths(path)
+    tw2.env_key = staticmethod(lambda widget=None: "scaling|x11|8.6|linux")
+    assert tw2.load() == 1
+    f2 = FakeFont()
+    assert tw2.width(f2, "Device") == 42 and f2.calls == 1
+    assert tw2.hits == 1 and tw2.misses == 0
+    # same name, different font: thrown away and measured again
+    tw3 = TextWidths(path)
+    tw3.env_key = staticmethod(lambda widget=None: "scaling|x11|8.6|linux")
+    tw3.load()
+    f3 = FakeFont(k=8)
+    assert tw3.width(f3, "Device") == 48 and tw3.misses == 1
+    # another screen setup: nothing is used
+    tw4 = TextWidths(path)
+    tw4.env_key = staticmethod(lambda widget=None: "2.0|win32|8.6|win32")
+    assert tw4.load() == 0
+    # broken file: ignored
+    with open(path, "w") as fh:
+        fh.write("{not json")
+    tw5 = TextWidths(path)
+    tw5.env_key = staticmethod(lambda widget=None: "scaling|x11|8.6|linux")
+    assert tw5.load() == 0 and tw5.width(FakeFont(), "Ab") == 14
+    # switched off: plain measuring, nothing written
+    old = FEATURES["warm_start"]
+    try:
+        FEATURES["warm_start"] = False
+        tw6 = TextWidths(ctx.path("tw6.json"))
+        f6 = FakeFont()
+        assert tw6.width(f6, "Device") == 42 and f6.calls == 1
+        tw6.dirty = True
+        assert not tw6.save() and not os.path.exists(ctx.path("tw6.json"))
+    finally:
+        FEATURES["warm_start"] = old
+
+
+@self_test()
+def t_warm_up_on_the_loading_screen(ctx):
+    """rc.11: the first start measures the computer's speed on the loading
+    screen (not 6 s into the window); later starts do not, unless the
+    number of cores changed; the capture start no longer sleeps 0.2 s."""
+    class FakeLoader:
+        def __init__(self):
+            self.steps, self.health, self.pumps = [], None, 0
+
+        def warm_step(self, text, pct=None, live=True):
+            self.steps.append(text)
+
+        def pump(self):
+            self.pumps += 1
+
+        def post_progress(self, p):
+            pass
+
+        def post_health(self, kind):
+            self.health = kind
+    cfg = AppConfig(path=ctx.path("warm.json"))
+    assert needs_calibration(cfg)
+    real = globals()["calibrate"]
+    ran = []
+
+    def fake(seconds=1.5):
+        ran.append(seconds)
+        time.sleep(0.05)
+        return 12345.0
+    globals()["calibrate"] = fake
+    real_tw = globals()["TEXT_WIDTHS"]
+    globals()["TEXT_WIDTHS"] = TextWidths(ctx.path("tw.json"))
+    real_prep = globals()["prepare_compiled_copy"]
+    globals()["prepare_compiled_copy"] = lambda popen=None: None
+    try:
+        ld = FakeLoader()
+        done = warm_up_before_window(ld, cfg)
+        assert ran == [1.5] and done.get("calibration_pps") == 12345
+        assert any("speed" in (t or "") for t in ld.steps), ld.steps
+        assert ld.pumps >= 1 and ld.health in ("healthy", "degraded")
+        cal = cfg.get("performance.calibration")
+        assert cal["pps"] == 12345 and cal["cores"] == (os.cpu_count() or 1)
+        assert not needs_calibration(cfg)
+        assert read_json(ctx.path("warm.json"), {})["performance"][
+            "calibration"]["pps"] == 12345            # saved
+        warm_up_before_window(FakeLoader(), cfg)
+        assert ran == [1.5]                            # not again
+        cfg.set("performance.calibration", dict(cal, cores=999))
+        assert needs_calibration(cfg)                  # another computer
+        old = FEATURES["warm_start"]
+        try:
+            FEATURES["warm_start"] = False
+            assert warm_up_before_window(FakeLoader(), cfg) == {}
+            assert ran == [1.5]
+        finally:
+            FEATURES["warm_start"] = old
+    finally:
+        globals()["calibrate"] = real
+        globals()["TEXT_WIDTHS"] = real_tw
+        globals()["prepare_compiled_copy"] = real_prep
+    assert not store_calibration(cfg, 0)
+    # the compiled copy for helpers: written by a helper only when missing
+    started = []
+    real_path = globals()["compiled_copy_path"]
+    try:
+        globals()["compiled_copy_path"] = lambda: ctx.path("none.pyc")
+        assert prepare_compiled_copy(
+            popen=lambda cmd, **kw: started.append((cmd, kw)) or "proc") \
+            == "proc"
+        assert WORKER_FLAG in started[0][0]
+        assert started[0][1]["env"]["MW_CACHED"] == "1"
+        assert started[0][1]["stdin"] == subprocess.DEVNULL
+        fresh = ctx.path("fresh.pyc")
+        keep_compiled_copy(compile("x = 1\n", SCRIPT_PATH, "exec"), fresh)
+        globals()["compiled_copy_path"] = lambda: fresh
+        assert prepare_compiled_copy(
+            popen=lambda cmd, **kw: started.append(cmd)) is None
+        assert len(started) == 1
+    finally:
+        globals()["compiled_copy_path"] = real_path
+    # the capture start: the first quiet wait ends it, not a 0.2 s sleep
+    if not ctx.scapy_ok or conf is None:
+        return
+
+    class QuietSock:
+        closed = False
+
+        @staticmethod
+        def select(socks, timeout):
+            time.sleep(min(timeout, 0.02))
+            return []
+
+        def recv_raw(self, n):
+            return None
+
+        def close(self):
+            self.closed = True
+
+    class BadSock(QuietSock):
+        @staticmethod
+        def select(socks, timeout):
+            raise OSError("adapter went away")
+    real_listen = conf.L2listen
+    try:
+        conf.L2listen = lambda **kw: QuietSock()
+        t0 = time.perf_counter()
+        src, err = start_capture_source("lo", None, False, lambda *a: None)
+        took = time.perf_counter() - t0
+        assert src is not None and err is None
+        assert took < 0.15, took
+        src.stop()
+        rc = RawCapture("lo", None, False, lambda *a: None)
+        conf.L2listen = lambda **kw: BadSock()
+        rc.start()
+        assert rc.first_cycle.wait(2.0)
+        assert isinstance(rc.exception, OSError)
+        rc.stop()
+    finally:
+        conf.L2listen = real_listen
+
+
+@self_test()
 def t_compiled_copy_start(ctx):
     """A second process loads the kept compiled copy (and still works
     when the copy is missing, stale or broken); the plain start would
@@ -60904,6 +61584,7 @@ def _bench_child(sid, out_path, pcap):
     rss0 = _rss_mb()
     t0 = time.perf_counter()
     app = MiniWireshark(root, "", set(), set(), "", config=cfg)
+    warm_heading_widths(root)        # what a real start does (rc.11)
     freeze_startup_objects()
     _gui_pump(root, 0.5)
     res["window_ready_s"] = round(time.perf_counter() - t0, 2)
@@ -61447,6 +62128,52 @@ def _gate_run(out_dir, name, args, timeout):
     return rc, time.time() - t0, text
 
 
+def start_check(out=print):
+    """`--start-check` (rc.11): two real starts with a fresh data folder
+    and settings (the first measures the computer's speed on the loading
+    screen, the second uses what the first remembered); each window runs
+    3 s, watching nothing, then closes. Needs a display."""
+    tmp = tempfile.mkdtemp(prefix="mw_startcheck_")
+    cfgp = os.path.join(tmp, "settings.json")
+    atomic_write_text(cfgp, json.dumps({"general": {
+        "show_welcome": False, "welcome_version": SCRIPT_VERSION,
+        "auto_start_capture": False}}))
+    env = dict(os.environ, MINIWIRESHARK_DATA=tmp,
+               MINIWIRESHARK_CONFIG=cfgp, MW_START_AND_EXIT="3", MW_PERF="1")
+    ok, got = True, []
+    try:
+        for label in ("First start", "Next start"):
+            t0 = time.perf_counter()
+            try:
+                r = subprocess.run([sys.executable, SCRIPT_PATH], env=env,
+                                   capture_output=True, text=True,
+                                   timeout=300)
+                text = r.stdout
+            except (OSError, subprocess.SubprocessError) as e:
+                text = f"could not start: {e}"
+            wall = time.perf_counter() - t0
+            line = next((x for x in text.splitlines()
+                         if x.startswith("START_OK")), "")
+            perf = next((x for x in text.splitlines()
+                         if x.startswith("START_PERF")), "")
+            out(f"  {label}: {line or 'FAILED'}")
+            if perf:
+                out(f"    {perf}")
+            if not line or "loader_gone=True" not in line:
+                ok = False
+                out("    " + text[-800:].replace("\n", "\n    "))
+                continue
+            win = line.split("window=")[1].split("s")[0]
+            longest = perf.split("longest=")[1].split(" ")[0] if perf \
+                else "?"
+            got.append(f"{label.lower()} {win} s (process {wall:.1f} s), "
+                       f"longest freeze {longest} ms")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    out("Result: " + ("; ".join(got) if ok else "a start failed"))
+    return 0 if ok else 1
+
+
 def release_gate(argv):
     """python miniwireshark.py --release-gate [--out DIR] [--runs N]
     [--quick]. Runs the boot check, self-test, GUI test, the S1 window
@@ -61491,6 +62218,7 @@ def release_gate(argv):
                 bench.append(json.load(f))
     step("shots", ["--gui-shots", os.path.join(out_dir, "shots")] +
          (["--quick"] if quick else []), 1800, "Tab pictures and layout check")
+    step("start", ["--start-check"], 900, "Real start, twice")
     step("release", ["--release-check"], 900, "Release check")
     lines = [f"MiniWireshark {SCRIPT_VERSION} release gate, "
              f"{time.strftime('%Y-%m-%d %H:%M')}", ""]
@@ -64757,6 +65485,65 @@ def reachable_actions(app):
     return sorted(out - REACHABLE_CONDITIONAL)
 
 
+@gui_test_step("5.1.2 rc.11: warm start — the loading screen's checklist, "
+               "and a real start built behind it")
+def gt_rc11_warm_start(app, ctx):
+    root = app.root
+    top = tk.Toplevel(root)
+    try:
+        top.geometry("700x500")
+        ld = LoaderWindow(top, app.config)
+        ld.pack(fill="both", expand=True)
+        _gui_pump(root, 0.1)
+        ld.warm_step("Remembering text sizes from last time", 5)
+        ld.warm_step("Building the tabs and tables", 40, live=False)
+        ld.warm_step(None, 100, live=False)
+        text = ld._warm_lbl.cget("text")
+        assert text.count("\u2713") == 2, text
+        assert int(float(ld.progress["value"])) == 100
+        ld.show_progress_again()
+        assert not ld._warm_lbl.winfo_exists()      # the card was cleared
+        assert ld.progress.winfo_manager() == "pack"
+        ld.warm_step("Laying out the window", 80)
+        assert ld._warm_lbl.winfo_exists()          # rebuilt, all lines
+        assert "Building the tabs" in ld._warm_lbl.cget("text")
+        ld.cover()
+        assert ld.winfo_manager() == "place"
+    finally:
+        top.destroy()
+    # every heading at every other text size: measured once, then known
+    warm_heading_widths(root)
+    assert warm_heading_widths(root) == 0
+    f = tkfont.Font(root=root, font=("TkDefaultFont", 13, "bold"))
+    assert TextWidths.font_sig(f) == TextWidths.font_sig(f)
+    # a real start: built behind the loader, the loader gone, measured
+    # once, and the second start measures no heading text
+    d = ctx.path("warmstart")
+    os.makedirs(d, exist_ok=True)
+    cfgp = os.path.join(d, "cfg.json")
+    with open(cfgp, "w", encoding="utf-8") as fh:
+        json.dump({"general": {"show_welcome": False,
+                               "welcome_version": SCRIPT_VERSION,
+                               "auto_start_capture": False}}, fh)
+    env = dict(os.environ, MINIWIRESHARK_DATA=d, MINIWIRESHARK_CONFIG=cfgp,
+               MW_START_AND_EXIT="0.5", MINIWIRESHARK_NO_CACHED_START="1")
+    env.pop("MW_FEATURES_OFF", None)
+    outs = []
+    for _ in range(2):
+        r = subprocess.run([sys.executable, SCRIPT_PATH], env=env,
+                           capture_output=True, text=True, timeout=180)
+        line = next((x for x in r.stdout.splitlines()
+                     if x.startswith("START_OK")), "")
+        assert line, (r.returncode, r.stdout[-600:], r.stderr[-1200:])
+        outs.append(line)
+    for line in outs:
+        assert "mapped=True" in line and "loader_gone=True" in line, line
+        assert "calibrated=True" in line, line
+    misses = int(outs[1].split("widths=")[1].split("/")[1].split()[0])
+    assert misses == 0, outs
+    assert os.path.exists(os.path.join(d, "cache", "text_widths.json"))
+
+
 @gui_test_step("every action 5.0.2 could reach is still reachable")
 def gt_reachable(app, ctx):
     app.mode_ui_var.set("Advanced")
@@ -65194,10 +65981,15 @@ def main():
     LOG.info("default iface=%s gateway=%s my_ips=%s", default_iface_name, gw,
              sorted(my_ips))
     startup_sanity_checks()
+    try:
+        warm_up_before_window(loader, cfg)
+    except Exception:                                # noqa: BLE001
+        LOG.exception("warm-up before the window")
     t_ready = time.perf_counter() - _T_START
     LAUNCH_TIMES["ready"] = t_ready
 
     action = None
+    welcomed = False
     first_time = cfg.get("general.welcome_version", "") != SCRIPT_VERSION
     if START_IN_DEMO:
         action = "demo"
@@ -65209,6 +66001,7 @@ def main():
         summary = welcome_summary(cfg)
         action = loader.show_welcome(summary, health, first_time,
                                      notice=startup_notice())
+        welcomed = True
         if action == "exit":
             if BOOT is not None:
                 BOOT.mark(outcome="user_exit")
@@ -65216,13 +66009,13 @@ def main():
                 root.destroy()
             return
 
-    loader.destroy()
-    root.resizable(True, True)
-    root.title("MiniWireshark")
     try:
-        MiniWireshark(root, gw, my_ips, my_macs, default_iface_name,
-                      config=cfg, start_action=action)
+        app = open_main_window(root, loader, cfg, (
+            gw, my_ips, my_macs, default_iface_name), action,
+            welcomed=welcomed)
         freeze_startup_objects()
+        if os.environ.get("MW_START_AND_EXIT"):
+            _start_and_exit(root, app)
         boot_step("main window", True, f"{time.perf_counter() - _T_START:.2f}"
                                        f" s after launch")
         if BOOT is not None:
@@ -65245,6 +66038,38 @@ def main():
     if BOOT is not None:
         BOOT.mark(outcome="closed")
     LOG.info("MiniWireshark closed")
+
+
+def _start_and_exit(root, app):
+    """MW_START_AND_EXIT=1 (the start test): print how the start went once
+    the window has shown and run for a second, then close it normally."""
+    t_shown = time.perf_counter() - _T_START
+
+    def done():
+        try:
+            mapped = bool(root.winfo_ismapped())
+            print(f"START_OK window={t_shown:.2f}s "
+                  f"built={LAUNCH_TIMES.get('window_built', 0):.2f}s "
+                  f"mapped={mapped} loader_gone="
+                  f"{not any(isinstance(w, LoaderWindow) for w in root.winfo_children())} "
+                  f"calibrated={bool((app.config.get('performance.calibration', {}) or {}).get('pps'))} "
+                  f"widths={TEXT_WIDTHS.hits}/{TEXT_WIDTHS.misses}",
+                  flush=True)
+            if PERF[0] is not None:
+                sm = PERF[0].summary()
+                print(f"START_PERF longest="
+                      f"{sm['max_ms'] or '<%d' % (PerfProbe.SLOW * 1000)} ms "
+                      f"({sm['max_name']}) p99={sm['p99_ms']} ms "
+                      f"over_100ms={sm['over_100ms']}", flush=True)
+                for line in PERF[0].slow_lines(8):
+                    print("  " + line, flush=True)
+        finally:
+            app._on_close()
+    try:
+        secs = min(30.0, max(0.2, float(os.environ["MW_START_AND_EXIT"])))
+    except (KeyError, ValueError):
+        secs = 1.0
+    root.after(int(secs * 1000), done)
 
 
 def _center_window(win, w, h):
@@ -65418,6 +66243,8 @@ if __name__ == "__main__":
                            quick="--quick" in sys.argv))
     if "--release-gate" in sys.argv:
         sys.exit(release_gate(sys.argv[1:]))
+    if "--start-check" in sys.argv:
+        sys.exit(start_check())
     if BENCH_MODE:
         setup_logging()
         for k, v in bench_report().items():
