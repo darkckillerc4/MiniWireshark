@@ -5472,6 +5472,8 @@ def apply_ui_scale(root, choice="Automatic"):
     else:
         scale = auto
     UI_SCALE[0] = max(1.0, min(3.0, scale))
+    with contextlib.suppress(NameError):
+        Charts.forget_fonts()
     return UI_SCALE[0]
 
 
@@ -9132,6 +9134,8 @@ class GuiGate:
         self.yield_ms = 0.0           # time the worker gave way to Tk
         self._yielding = False
         self._cv = threading.Condition(threading.Lock())
+        self._tk_ident = None
+        self.tk_last = 0.0            # when a Tk callback last left
 
     def enter_tk(self):
         """The Tk thread's way in: announce, take the gate, wake a worker
@@ -9142,14 +9146,26 @@ class GuiGate:
         finally:
             self.tk_waiting -= 1
         self.tk_entries += 1
+        self._tk_ident = threading.get_ident()
         if self._yielding:
             with self._cv:
                 self._cv.notify_all()
 
+    def leave_tk(self):
+        self.tk_last = time.perf_counter()
+        self.release()
+
+    BURST_S = 0.03
+    QUIET_S = 0.003
+
     def yield_to_tk(self, seen, limit=0.05):
         """Called by a worker right after releasing the gate. `seen` is
         tk_entries read while it still held the gate. If a Tk callback is
-        waiting, wait (at most `limit` s) until one has entered."""
+        waiting, wait (at most `limit` s) until one has entered; then let
+        the rest of that burst of callbacks run too (at most BURST_S): one
+        Tk update runs several callbacks, each of which used to wait for a
+        whole worker slice, and the window froze for 0.2-0.3 s while a
+        large file was read."""
         if not FEATURES.get("fair_gate", True) or self.tk_waiting <= 0:
             time.sleep(0)
             return 0.0
@@ -9163,6 +9179,18 @@ class GuiGate:
                     if left <= 0:
                         break
                     self._cv.wait(left)
+                if self.tk_entries != seen:
+                    end = time.perf_counter() + self.BURST_S
+                    while True:
+                        now = time.perf_counter()
+                        if now >= end:
+                            break
+                        if not (self.tk_waiting > 0 or
+                                (self._owner is not None and
+                                 self._owner == self._tk_ident) or
+                                now - self.tk_last < self.QUIET_S):
+                            break
+                        self._cv.wait(0.002)
             finally:
                 self._yielding = False
         spent = time.perf_counter() - t0
@@ -9370,10 +9398,61 @@ GUI_GATE = GuiGate()
 _GATE_INSTALLED = [False]
 
 
+AFTER_GUARD = {"on": False, "cancelled": 0}
+
+
+def install_after_guard():
+    """5.1.2: `widget.after(ms, f)` registers f as a Tcl command owned by
+    the widget. Destroy the widget before it fires and the command is
+    deleted while Tcl's timer still names it; a later callback that lands
+    at the same address gets the same name and the old timer runs *it*
+    (seen in the GUI test: a card's Rename… opened by itself). Pending
+    timers now go with their widget."""
+    if AFTER_GUARD["on"]:
+        return
+    AFTER_GUARD["on"] = True
+    orig_after = tk.Misc.after
+    orig_destroy = tk.BaseWidget.destroy
+
+    def after(self, ms, func=None, *args):
+        aid = orig_after(self, ms, func, *args)
+        if func is not None and not isinstance(self, tk.Tk):
+            try:
+                pend = self.__dict__.setdefault("_mw_afters", [])
+                pend.append(aid)
+                if len(pend) > 48:
+                    live = set(str(x) for x in self.tk.splitlist(
+                        self.tk.call("after", "info")))
+                    pend[:] = [x for x in pend if x in live]
+            except (tk.TclError, AttributeError, TypeError):
+                pass
+        return aid
+    after.__doc__ = orig_after.__doc__
+
+    def destroy(self):
+        pend = self.__dict__.pop("_mw_afters", None)
+        if pend:
+            for aid in pend:
+                try:
+                    self.tk.call("after", "info", aid)
+                except tk.TclError:
+                    continue            # already ran or cancelled
+                try:
+                    self.after_cancel(aid)
+                    AFTER_GUARD["cancelled"] += 1
+                except (tk.TclError, ValueError):
+                    pass
+        orig_destroy(self)
+    destroy.__doc__ = orig_destroy.__doc__
+    tk.Misc.after = after
+    tk.BaseWidget.destroy = destroy
+
+
 def install_gui_gate(gate=None):
     """Every Tk callback runs holding the gate; modal waits step out of it
     so analysis continues while a dialog is open."""
     gate = gate or GUI_GATE
+    install_after_guard()
     if _GATE_INSTALLED[0]:
         return gate
     _GATE_INSTALLED[0] = True
@@ -9388,14 +9467,14 @@ def install_gui_gate(gate=None):
             try:
                 return orig_call(self, *args)
             finally:
-                gate.release()
+                gate.leave_tk()
         t0 = clock()
         gate.enter_tk()
         t1 = clock()
         try:
             return orig_call(self, *args)
         finally:
-            gate.release()
+            gate.leave_tk()
             probe.record(self, t0, t1, clock())
     tk.CallWrapper.__call__ = gated_call
 
@@ -21535,6 +21614,11 @@ Faster, steadier, easier to read ¦ Plus rapide, plus stable, plus lisible ¦ M�
 Shorter freezes when saving, loading and changing text size; sharp text on Windows at 125 % and more; an interface scale; Reduce motion; a visible keyboard focus everywhere. ¦ Des blocages plus courts à l'enregistrement, au chargement et au changement de taille du texte ; un texte net sous Windows à 125 % et plus ; une échelle de l'interface ; Réduire les animations ; un focus clavier visible partout. ¦ Bloqueos más cortos al guardar, cargar y cambiar el tamaño del texto; texto nítido en Windows al 125 % o más; una escala de la interfaz; Reducir el movimiento; un foco de teclado visible en todas partes.
 Everything from 5.0 is still here ¦ Tout ce que contenait la 5.0 est toujours là ¦ Todo lo de la 5.0 sigue aquí
 The packet workspace, Full Power, Email Traffic, the Components Center and Safe Mode work as before. ¦ L'espace de travail des paquets, la pleine puissance, le trafic e-mail, le centre des composants et le mode sans échec fonctionnent comme avant. ¦ El espacio de trabajo de paquetes, la potencia máxima, el tráfico de correo, el centro de componentes y el modo seguro funcionan como antes.
+Check again ¦ Vérifier à nouveau ¦ Comprobar de nuevo
+Open in a window… ¦ Ouvrir dans une fenêtre… ¦ Abrir en una ventana…
+Show in the Inspector ¦ Afficher dans l'inspecteur ¦ Mostrar en el inspector
+A ranked list, not a verdict. ¦ Une liste classée, pas un verdict. ¦ Una lista ordenada, no un veredicto.
+Nothing to report ¦ Rien à signaler ¦ Nada que señalar
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -27029,12 +27113,43 @@ class Charts:
 
     _FONTS = {}
 
+    class _Measured:
+        """A chart font whose measure() and metrics() are remembered: the
+        Dashboard asked Tk ~30 times per redraw (a theme change spent
+        ~35 ms there). Charts.forget_fonts() empties it when the text size
+        or the scale changes."""
+        __slots__ = ("font", "_w", "_m")
+
+        def __init__(self, font):
+            self.font, self._w, self._m = font, {}, {}
+
+        def measure(self, text):
+            got = self._w.get(text)
+            if got is None:
+                if len(self._w) > 4000:
+                    self._w.clear()
+                got = self._w[text] = self.font.measure(text)
+            return got
+
+        def metrics(self, *opts):
+            got = self._m.get(opts)
+            if got is None:
+                got = self._m[opts] = self.font.metrics(*opts)
+            return got
+
     @classmethod
     def font(cls, c, spec):
         f = cls._FONTS.get(spec)
         if f is None:
-            f = cls._FONTS[spec] = tkfont.Font(root=c, font=spec)
+            f = cls._FONTS[spec] = cls._Measured(
+                tkfont.Font(root=c, font=spec))
         return f
+
+    @classmethod
+    def forget_fonts(cls):
+        for f in cls._FONTS.values():
+            f._w.clear()
+            f._m.clear()
 
     @classmethod
     def elide(cls, c, text, spec, width):
@@ -27607,7 +27722,7 @@ class Inspector:
         self.current = (kind, key)
         fn = {"device": self._show_device, "website": self._show_website,
               "remote": self._show_remote, "flow": self._show_flow,
-              "alert": self._show_alert}.get(kind)
+              "alert": self._show_alert, "slow": self._show_slow}.get(kind)
         try:
             if fn is None or not fn(key):
                 self._empty()
@@ -27617,6 +27732,63 @@ class Inspector:
     def refresh(self):
         if self.current:
             self.show(*self.current)
+
+    # ---- 5.1.2: "Why is it slow?" docked here (the window's "Show in the
+    # Inspector"); the same ranking, narrower
+    SLOW_TAG = {"Likely": "warn", "Possible": "warn", "Can't tell": "muted",
+                "Unlikely": "good"}
+
+    def _show_slow(self, _key=""):
+        app, tr = self.app, translate_text
+        hyps = investigate_slow(app.collect_slow_facts())
+        self._begin(tr("Why is it slow?"))
+        self._w(tr("A ranked list, not a verdict.") + " " +
+                app.slow_freshness() + "\n", "muted")
+        for h in hyps:
+            st = h["status"]
+            self._w(tr(h["title"]) + "\n", "h")
+            self._w("   " + tr(st) + "\n", self.SLOW_TAG.get(st, "muted"))
+            if st == "Unlikely":
+                for it in h["against"][:1]:
+                    self._w("   " + tr("Against: " + it) + "\n", "muted")
+                continue
+            for it in h["for"]:
+                self._w("   " + tr("For: " + it) + "\n")
+            for it in h["against"]:
+                self._w("   " + tr("Against: " + it) + "\n", "muted")
+            if h["fix"]:
+                self._w("   " + tr("What to try: " + h["fix"]) + "\n",
+                        "muted")
+        self._w("\n")
+        self._clickable(tr("Check again"), self._slow_again)
+        self._w("    ")
+        self._clickable(tr("Open in a window…"),
+                        lambda: app.investigate("slow"))
+        self._end()
+        return True
+
+    def _slow_again(self):
+        """Ask for a check where checks may be sent, then rank again when
+        it lands (or after a few seconds)."""
+        app = self.app
+        if app.health_checks_allowed():
+            with contextlib.suppress(AttributeError):
+                app.prober.run_now.set()
+            n0 = len(app.model.health_history)
+            t0 = time.monotonic()
+
+            def wait():
+                if self.current != ("slow", ""):
+                    return
+                if len(app.model.health_history) > n0 or \
+                        time.monotonic() - t0 > app.CHECK_WAIT_S:
+                    self.refresh()
+                    return
+                self.frame.after(250, wait)
+            self.title_var.set(translate_text("Checking the router…"))
+            self.frame.after(250, wait)
+        else:
+            self.refresh()
 
     # ---- entity views
     def _show_device(self, key):
@@ -30817,7 +30989,10 @@ class MapTab(BaseTab):
         self._drag = None
         self._hover_items = []
         self._last_sig = None
-        self.c.bind("<Configure>", lambda e: self.redraw())
+        # hidden, the map is drawn when shown (a text-size change re-laid
+        # out the hidden canvas and drew 300 devices for nothing)
+        self.c.bind("<Configure>", lambda e: self.redraw()
+                    if self.is_visible() else None)
         self.c.bind("<ButtonPress-1>", self._press)
         self.c.bind("<B1-Motion>", self._motion)
         self.c.bind("<ButtonRelease-1>", self._release)
@@ -31022,7 +31197,8 @@ class MapTab(BaseTab):
                len(m.websites), len(m.remote_hosts), w, h,
                self.inactive_var.get(), self.app.theme_name,
                self.app.high_contrast, CVD_STATE["mode"],
-               int(m.now() // 10))
+               int(m.now() // 10), UI_SCALE[0],
+               self.app.config.get("appearance.text_size", "Normal"))
         if sig == self._last_sig and not force:
             return
         self._last_sig = sig
@@ -31131,18 +31307,29 @@ class MapTab(BaseTab):
                         o[1] < b[3]:
                     return False
             return True
-        tries = ((X, Y + R + 8, label[:22]), (X, Y - R - 8, label[:22]),
-                 (X, Y + R + 8, label[:10] + ("…" if len(label) > 10
-                                              else "")),
-                 (X, Y - R - 8, label[:10] + ("…" if len(label) > 10
-                                              else "")))
+        short = label[:10] + ("…" if len(label) > 10 else "")
+        # below, above, then (5.1.2) right and left of the node, then the
+        # short name; the selected name always shows, in the first free
+        # place or else below
+        tries = ((X, Y + R + 8, label[:22], "center"),
+                 (X, Y - R - 8, label[:22], "center"),
+                 (X + R + 6, Y, label[:22], "w"),
+                 (X - R - 6, Y, label[:22], "e"),
+                 (X, Y + R + 8, short, "center"),
+                 (X, Y - R - 8, short, "center"),
+                 (X + R + 6, Y, short, "w"),
+                 (X - R - 6, Y, short, "e"))
         ok = False
-        for x, y, text in tries:
+        for x, y, text, anchor in tries:
             c.coords(tid, x, y)
-            c.itemconfigure(tid, text=text)
-            if free() or sel:
+            c.itemconfigure(tid, text=text, anchor=anchor)
+            if free():
                 ok = True
                 break
+        if not ok and sel:
+            c.coords(tid, X, Y + R + 8)
+            c.itemconfigure(tid, text=label[:22], anchor="center")
+            ok = True
         if not ok:
             c.itemconfigure(tid, state="hidden")
             return
@@ -31292,8 +31479,10 @@ class MapTab(BaseTab):
                                    tags=(f"n:{dev.key}", "ov"))
             if self.ov_new.get() and now - dev.first_seen < 3600 and \
                     dev.live:
-                self.c.create_text(X + R + 4, Y - R - 4, text="★",
-                                   fill=t["warn_fg"],
+                # anchored at the circle's top-right edge: at 150 % the
+                # centred star reached the node's letter
+                self.c.create_text(X + R * 0.7, Y - R * 0.7, text="★",
+                                   anchor="sw", fill=t["warn_fg"],
                                    tags=(f"n:{dev.key}", "ov"),
                                    font=("TkDefaultFont", 10))
             self._list_rows.append((dev.key, label.strip(),
@@ -31577,6 +31766,12 @@ class HealthTab(BaseTab):
         ttk.Button(head, text="\U0001F50E Why is it slow?",
                    command=lambda: self.app.investigate("slow")).pack(
             side="right", padx=6)
+        # 5.1.2: the checks that are fine and not about the connection
+        # itself fold away (folded in Beginner, open in Advanced)
+        self.fold_btn = ttk.Button(head, text="", style="Sub.TButton",
+                                   command=self.toggle_fold)
+        self.fold_btn.pack(side="right")
+        self._fold_sig = None
         self.note_var = DisplayVar()
         tk.Label(outer, textvariable=self.note_var, bg=WHITE, fg="#666666",
                  justify="left", anchor="w", wraplength=1100).pack(
@@ -31775,6 +31970,40 @@ class HealthTab(BaseTab):
                                  translate_text("now")),
                         empty=translate_text(empty))
 
+    CORE = ("overall", "wifi", "gateway", "internet", "dns", "loss",
+            "latency")
+    PROBLEM = ("Degraded", "Needs attention")
+
+    def folded_keys(self, results):
+        """The rows the fold hides: not a core check and not a problem."""
+        if not self.app.fold_closed("health"):
+            return set()
+        return {k for k, _t in self.CHECKS
+                if k not in self.CORE and
+                (results.get(k) or ("Unknown", ""))[0] not in self.PROBLEM}
+
+    def toggle_fold(self):
+        self.app.set_fold("health", not self.app.fold_closed("health"))
+        self.refresh()
+
+    def _apply_fold(self, results):
+        hidden = self.folded_keys(results)
+        closed = self.app.fold_closed("health")
+        sig = (frozenset(hidden), closed)
+        if sig == self._fold_sig:
+            return
+        self._fold_sig = sig
+        with contextlib.suppress(tk.TclError):
+            for key, _t in self.CHECKS:
+                self.rows[key][2].pack_forget()
+            for key, _t in self.CHECKS:
+                if key not in hidden:
+                    self.rows[key][2].pack(fill="x", pady=2)
+            self.fold_btn.configure(
+                text=("\u25B8 " + translate_text("More detail") +
+                      (f" ({len(hidden)})" if hidden else "")) if closed
+                else ("\u25BE " + translate_text("Less detail")))
+
     STATUS_STYLE = {"Healthy": ("✔ Healthy", "good_fg"),
                     "Degraded": ("⚠ Degraded", "warn_fg"),
                     "Needs attention": ("✖ Needs attention",
@@ -31789,6 +32018,7 @@ class HealthTab(BaseTab):
         with contextlib.suppress(Exception):
             self._draw_strip()
         results = app.health_summary()
+        self._apply_fold(results)
         for key, (status, text) in results.items():
             if key not in self.rows:
                 continue
@@ -31844,6 +32074,12 @@ class SecurityTab(BaseTab):
                    command=self.app.open_ledger).pack(side="left", padx=8)
         ttk.Button(bar, text="Privacy posture…",
                    command=self.app.open_privacy_posture).pack(side="left")
+        # 5.1.2: sections with nothing to report fold to one line each
+        # (folded in Beginner, open in Advanced)
+        self.fold_btn = ttk.Button(bar, text="", style="Sub.TButton",
+                                   command=self.toggle_fold)
+        self.fold_btn.pack(side="right")
+        self.folded_titles = []
         self.text = tk.Text(outer, wrap="word", bg="#fbfbfb", fg="#222222",
                             relief="flat", padx=14, pady=12,
                             font=mw_font(11), state="disabled",
@@ -31863,6 +32099,56 @@ class SecurityTab(BaseTab):
                                 font=mw_font(11))
         self.text.tag_configure("dim", foreground="#666666")
         self.text.tag_configure("body", foreground="#222222", spacing3=4)
+        self.text.tag_configure("fold_h", foreground="#2b3a56",
+                                font=mw_font(11, "bold"))
+
+    def toggle_fold(self):
+        self.app.set_fold("security", not self.app.fold_closed("security"))
+        self.refresh()
+
+    ALWAYS = ("What is this?", "The honest summary")
+
+    def emit(self, secs):
+        """Write the sections. Open: as built. Folded: the sections with
+        something to look at first, in full; then the others one line
+        each under "Nothing to report"."""
+        t, tr = self.text, translate_text
+        closed = self.app.fold_closed("security")
+
+        def full(sec):
+            title, lines, _w = sec
+            if title:
+                t.insert("end", title + "\n", "h1")
+            for tag, text in lines:
+                t.insert("end", text, tag)
+        calm = [x for x in secs if not x[2] and x[0] not in self.ALWAYS]
+        self.folded_titles = [x[0] for x in calm] if closed else []
+        with contextlib.suppress(tk.TclError):
+            self.fold_btn.configure(
+                text=("\u25B8 " + tr("More detail") +
+                      (f" ({len(calm)})" if calm else "")) if closed
+                else ("\u25BE " + tr("Less detail")))
+        if not closed:
+            for sec in secs:
+                full(sec)
+            return
+        tail = [x for x in secs if x[0] == "The honest summary"]
+        for sec in secs:
+            if sec[0] != "The honest summary" and sec not in calm:
+                full(sec)
+        if calm:
+            t.insert("end", tr("Nothing to report") + "\n", "h1")
+            for title, lines, _w in calm:
+                first = next(((tag, text) for tag, text in lines
+                              if tag in ("good", "dim")), None)
+                t.insert("end", "    " + title + "  ", "fold_h")
+                if first:
+                    t.insert("end", first[1].strip().lstrip("✔").strip() +
+                             "\n", "good" if first[0] == "good" else "dim")
+                else:
+                    t.insert("end", "\n")
+        for sec in tail:
+            full(sec)
 
     def refresh(self):
         if self.is_visible():
@@ -31880,15 +32166,27 @@ class SecurityTab(BaseTab):
         t.config(state="normal")
         t.delete("1.0", "end")
 
-        def h1(s): t.insert("end", s + "\n", "h1")
-        def good(s): t.insert("end", "✔  " + s + "\n", "good")
-        def warn(s): t.insert("end", "⚠  " + s + "\n", "warn")
-        def bad(s): t.insert("end", "✘  " + s + "\n", "bad")
+        secs = []          # [title, [(tag, text)], something to look at]
+        cur = [None]
+
+        def h1(s):
+            cur[0] = [s, [], False]
+            secs.append(cur[0])
+
+        def add(tag, text, worry=False):
+            if cur[0] is None:
+                h1("")
+            cur[0][1].append((tag, text))
+            if worry:
+                cur[0][2] = True
+        def good(s): add("good", "✔  " + s + "\n")
+        def warn(s): add("warn", "⚠  " + s + "\n", True)
+        def bad(s): add("bad", "✘  " + s + "\n", True)
         guidance = app.config.get("general.beginner_explanations", True)
         def body(s):
             if guidance:
-                t.insert("end", "    " + s + "\n", "body")
-        def dim(s): t.insert("end", "    " + s + "\n", "dim")
+                add("body", "    " + s + "\n")
+        def dim(s): add("dim", "    " + s + "\n")
 
         h1("What is this?")
         body("This page explains what I've seen on your network in plain "
@@ -32154,6 +32452,7 @@ class SecurityTab(BaseTab):
             body(f"I've seen {m.count} packets, "
                  f"{len(m.registry.by_key)} device(s), "
                  f"and {len(m.websites)} website(s).")
+        self.emit(secs)
         t.config(state="disabled")
 
 
@@ -37770,6 +38069,7 @@ class MiniWireshark:
         if want:
             self.body.add(self.inspector.frame, weight=1)
             self.inspector_visible = True
+            self.root.after(400, self._inspector_width)
         self._bind_inspector()
         self._apply_ui_mode()
 
@@ -38760,6 +39060,20 @@ class MiniWireshark:
         self.inspector_visible = show
         self.config.set("appearance.inspector", show)
         self.config.save()
+        if show:
+            self.root.after_idle(self._inspector_width)
+
+    def _inspector_width(self):
+        """5.1.2: opened beside a wide tab the Inspector got what was left
+        (80 pixels at 1366 wide); give it its own width, at most a third
+        of the window."""
+        with contextlib.suppress(tk.TclError, AttributeError):
+            if not self.inspector_visible:
+                return
+            total = self.body.winfo_width()
+            want = min(px(Inspector.WIDTH), total // 3)
+            if total > 300 and self.inspector.frame.winfo_width() < want - 20:
+                self.body.sashpos(0, total - want)
 
     # ---- M9/M10 ---------------------------------------------------------------
     def device_visibility(self, dev):
@@ -41184,7 +41498,7 @@ class MiniWireshark:
                 with contextlib.suppress(tk.TclError):
                     tab.refresh()
         mt = self.tabs.get("map")
-        if mt:
+        if mt and mt.is_visible():
             mt.redraw(force=True)
         self.config.set("appearance.theme", self.theme_name)
         self.config.set("appearance.high_contrast", self.high_contrast)
@@ -41226,7 +41540,91 @@ class MiniWireshark:
         }
 
     # ---------- themes: Light / Dark, each with a High-Contrast variant ----
+    # 5.1.2: the walk runs in Tcl, one call for the whole tree. The
+    # Python walk below made ~5,000 Tk calls (keys, cget, configure per
+    # widget) for a 700-widget window, about 70 ms of a theme change.
+    _RETHEME_TCL = r"""
+proc ::mw_retheme {w map fgnew deffg} {
+    if {[catch {$w configure} specs] == 0} {
+        foreach spec $specs {
+            if {[llength $spec] != 5} continue
+            set opt [lindex $spec 0]
+            switch -- $opt {
+                -background - -activebackground - -selectbackground -
+                -selectforeground - -activeforeground -
+                -highlightbackground {set isfg 0}
+                -foreground - -insertbackground {set isfg 1}
+                default continue
+            }
+            set cur [string tolower [lindex $spec 4]]
+            if {$isfg && [dict exists $deffg $cur]} {
+                catch {$w configure $opt $fgnew}
+                continue
+            }
+            if {[dict exists $map $cur]} {
+                catch {$w configure $opt [dict get $map $cur]}
+            }
+        }
+    }
+    if {[catch {winfo class $w} cls] == 0 && $cls eq "Text"} {
+        foreach tag [$w tag names] {
+            foreach opt {-foreground -background} {
+                if {[catch {$w tag cget $tag $opt} cur]} continue
+                set cur [string tolower $cur]
+                if {[dict exists $map $cur]} {
+                    catch {$w tag configure $tag $opt [dict get $map $cur]}
+                }
+            }
+        }
+    }
+    foreach c [winfo children $w] {
+        ::mw_retheme $c $map $fgnew $deffg
+    }
+}
+"""
+    _retheme_maps = {}
+
+    @staticmethod
+    def retheme_map(palette):
+        """{current colour: colour in `palette`} for every colour the
+        theme walk changes; the same rule as the Python walk (map via the
+        canonical light value, only colours in LIGHT_TO_DARK_HEX)."""
+        got = MiniWireshark._retheme_maps.get(palette)
+        if got is None:
+            table = PALETTES[palette]
+            got = {}
+            for cur in set(_CANON) | set(LIGHT_TO_DARK_HEX) | set(table.values()):
+                canon = _CANON.get(cur, cur)
+                if canon not in LIGHT_TO_DARK_HEX:
+                    continue
+                new = table.get(canon, canon)
+                if new != cur:
+                    got[cur] = new
+            MiniWireshark._retheme_maps[palette] = got
+        return got
+
     def _retheme_widget_tree(self, widget, palette):
+        """The whole tree in one Tcl call; the Python walk if that fails."""
+        tkapp = widget.tk
+        try:
+            if not getattr(self, "_retheme_tcl_ok", False):
+                tkapp.eval(self._RETHEME_TCL)
+                self._retheme_tcl_ok = True
+            mp = self.retheme_map(palette)
+            flat = []
+            for k, v in mp.items():
+                flat += [k, v]
+            deffg = []
+            for k in _DEFAULT_FG_NAMES:
+                deffg += [k, 1]
+            tkapp.call("::mw_retheme", widget._w, tuple(flat),
+                       THEMES[palette]["text_fg"], tuple(deffg))
+            return
+        except tk.TclError:
+            self._retheme_tcl_ok = False
+        self._retheme_widget_tree_py(widget, palette)
+
+    def _retheme_widget_tree_py(self, widget, palette):
         """Swap every known palette colour on `widget` and its descendants
         for the same colour in `palette`. Colours are mapped via their
         canonical light value, so any palette -> any palette is lossless."""
@@ -41278,7 +41676,7 @@ class MiniWireshark:
         except Exception:
             children = []
         for child in children:
-            self._retheme_widget_tree(child, palette)
+            self._retheme_widget_tree_py(child, palette)
 
     def _restyle_ttk(self, dark, hc=False):
         style = ttk.Style()
@@ -41379,6 +41777,7 @@ class MiniWireshark:
         it for 0.2-0.3 s at S1). defer=False does everything now."""
         label = label or self.config.get("appearance.text_size", "Normal")
         scale = self.TEXT_SIZES.get(label, 1.0)
+        Charts.forget_fonts()
         base = getattr(self, "_base_font_sizes", None)
         if base is None:
             base = self._base_font_sizes = {}
@@ -42845,6 +43244,13 @@ class MiniWireshark:
         ttk.Button(bar, text="Copy result", command=lambda:
                    copy_to_clipboard(self, result["text"])).pack(
             side="left", padx=6)
+        if which == "slow":
+            def dock():
+                self.inspect("slow", "")
+                win.destroy()
+            win._mw_dock = dock
+            ttk.Button(bar, text="Show in the Inspector",
+                       command=dock).pack(side="left")
         ttk.Button(bar, text="Close", command=win.destroy).pack(
             side="right")
         win._mw_result = result
@@ -61341,6 +61747,8 @@ def run_gui_test(live=False):
         assert not bad, f"non-daemon threads left: {bad}"
     step("clean shutdown", s_close)
     failed = [r for r in results if r[0] == "FAIL"]
+    print(f"  (timers cancelled with their widget: "
+          f"{AFTER_GUARD['cancelled']})")
     print(f"\nGUI test: {len(results) - len(failed)} passed / "
           f"{len(failed)} failed")
     for _s, name, msg in failed:
@@ -62381,6 +62789,135 @@ def gt_m9_loader(app, ctx):
         with contextlib.suppress(tk.TclError):
             top.destroy()
 
+
+
+@gui_test_step("5.1.2 rc.2: theme walk in Tcl, folds, Why slow docked")
+def gt_rc2_polish(app, ctx):
+    root = app.root
+    opts = ("background", "foreground", "activebackground",
+            "selectbackground", "insertbackground", "highlightbackground")
+
+    def snap():
+        d = {}
+        for w in _all_widgets(root):
+            for o in opts:
+                with contextlib.suppress(Exception):
+                    d[(str(w), o)] = str(w.cget(o)).lower()
+        return d
+    theme0 = app.theme_name
+    # the Tcl walk gives what the Python walk gave, both ways
+    try:
+        for name in ("Dark", "Light"):
+            app._apply_theme(name)
+            _gui_pump(root, 0.2)
+            tcl = snap()
+            other = "Light" if name == "Dark" else "Dark"
+            app._apply_theme(other)
+            real = app._retheme_widget_tree
+            app._retheme_widget_tree = app._retheme_widget_tree_py
+            try:
+                app._apply_theme(name)
+            finally:
+                del app._retheme_widget_tree
+            assert app._retheme_widget_tree == real
+            _gui_pump(root, 0.2)
+            py = snap()
+            diff = [k for k in set(tcl) | set(py) if tcl.get(k) != py.get(k)]
+            assert not diff, diff[:5]
+        assert getattr(app, "_retheme_tcl_ok", False)
+    finally:
+        app._apply_theme(theme0)
+    # a timer goes with its widget (its command name can't be reused)
+    fr = tk.Frame(root)
+    ran = []
+    aid = fr.after(150, lambda: ran.append(1))
+    assert aid in root.tk.splitlist(root.tk.call("after", "info"))
+    fr.destroy()
+    assert aid not in root.tk.splitlist(root.tk.call("after", "info"))
+    _gui_pump(root, 0.3)
+    assert not ran
+    # chart text widths are remembered and forgotten with the text size
+    c = tk.Canvas(root)
+    f = Charts.font(c, ("TkDefaultFont", 8))
+    w1 = f.measure("Router 123 ms")
+    assert f._w.get("Router 123 ms") == w1
+    Charts.forget_fonts()
+    assert not f._w
+    c.destroy()
+    # Health: the fine, non-core checks fold away in Beginner
+    folds0 = dict(app.config.get("appearance.folds", {}) or {})
+    try:
+        app.config.set("appearance.folds", {})
+        beg0 = app.beginner_mode
+        app.beginner_mode = True
+        app._select_tab("health")
+        _gui_pump(root, 0.3)
+        ht = app.tabs["health"]
+        ht.refresh()
+        hidden = ht.folded_keys(app.health_summary())
+        assert hidden and not (hidden & set(ht.CORE)), hidden
+        packed = {k for k, (_s, _e, row) in ht.rows.items()
+                  if row.winfo_manager()}
+        assert not (packed & hidden) and set(ht.CORE) <= packed, packed
+        assert "(" in str(ht.fold_btn.cget("text"))
+        ht.fold_btn.invoke()
+        _gui_pump(root, 0.2)
+        packed = {k for k, (_s, _e, row) in ht.rows.items()
+                  if row.winfo_manager()}
+        assert packed == set(ht.rows), packed
+        assert app.config.get("appearance.folds")["health"] == "open"
+        order = [k for k, _t in ht.CHECKS]
+        shown = sorted(ht.rows, key=lambda k: ht.rows[k][2].winfo_y())
+        assert shown == order, shown
+        # Security: calm sections one line each under Nothing to report
+        app.config.set("appearance.folds", {})
+        app._select_tab("security")
+        _gui_pump(root, 0.3)
+        st = app.tabs["security"]
+        st.refresh()
+        text = st.text.get("1.0", "end")
+        assert st.folded_titles, text[:300]
+        assert translate_text("Nothing to report") in text
+        assert text.index(translate_text("Nothing to report")) > \
+            text.index("What is this?")
+        st.fold_btn.invoke()
+        _gui_pump(root, 0.2)
+        text = st.text.get("1.0", "end")
+        assert not st.folded_titles
+        assert translate_text("Nothing to report") not in text
+        assert app.config.get("appearance.folds")["security"] == "open"
+    finally:
+        app.beginner_mode = beg0
+        app.config.set("appearance.folds", folds0)
+    # Why slow: the window's ranking docks in the Inspector
+    vis0 = app.inspector_visible
+    win = app.investigate("slow")
+    try:
+        _gui_pump(root, 0.3, until=lambda: not getattr(
+            win, "_mw_checking", False), timeout=12)
+        win._mw_dock()
+        _gui_pump(root, 0.2)
+        assert not win.winfo_exists()
+        assert app.inspector_visible
+        assert app.inspector.current == ("slow", "")
+        _gui_pump(root, 0.3)
+        want = min(px(Inspector.WIDTH), app.body.winfo_width() // 3)
+        assert app.inspector.frame.winfo_width() >= want - 30, (
+            app.inspector.frame.winfo_width(), want)
+        body = app.inspector.txt.get("1.0", "end")
+        assert translate_text("Check again") in body, body[:300]
+        hyps = investigate_slow(app.collect_slow_facts())
+        assert translate_text(hyps[0]["title"]) in body
+        app.inspector._slow_again()
+        _gui_pump(root, 0.3, until=lambda: app.inspector.title_var.get()
+                  == translate_text("Why is it slow?"), timeout=12)
+        assert app.inspector.title_var.get() == \
+            translate_text("Why is it slow?")
+    finally:
+        with contextlib.suppress(tk.TclError):
+            win.destroy()
+        app.inspector.show("none", "")
+        app.toggle_inspector(vis0)
 
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
 # Labels that change with the state of the row a menu was opened on are
