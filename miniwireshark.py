@@ -126,7 +126,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 _T_START = time.perf_counter()
 LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
-SCRIPT_VERSION = "5.0.2"
+SCRIPT_VERSION = "5.1.2"
 SESSION_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 2
 
@@ -1196,6 +1196,11 @@ def fetch_to_file(url, dest, expected_sha=None, feature="packages",
                 raise RuntimeError_("other", f"{total} bytes is more than "
                                              f"the {max_bytes} limit")
             got = have
+            if have and progress:
+                # 5.1.2: say that a broken download is being continued
+                progress("Download", have / total if total else 0.0,
+                         f"Resuming from {have / 1e6:.1f} MB",
+                         {"resumed": have})
             with open(part, "ab" if have else "wb") as f:
                 while True:
                     if cancel():
@@ -1756,30 +1761,27 @@ class LoaderWindow(tk.Frame):
     thread-safe (a queue drained on the Tk thread)."""
 
     WHATS_NEW = (
-        ("\U0001F52C", "A packet workspace like Wireshark's",
-         "Every field with its exact bytes, Follow stream, request and "
-         "reply pairs, statistics and expert findings — each packet also "
-         "explained in one plain sentence."),
-        ("⚡", "Full Power",
-         "A deeper pass inside a budget you set: every decoder, rebuilt "
-         "connections and expert findings. It never changes what is "
-         "captured or sends anything."),
-        ("✉", "Email Traffic",
-         "How mail connections behave — encryption, logins, failures — "
-         "never what anyone wrote, and never a password."),
-        ("\U0001F9E9", "Components Center",
-         "Optional, verified downloads (vendor names, encrypted-DNS lists, "
-         "public blocklists), offline packs and one click back to the "
-         "built-in data."),
-        ("⌨", "Ctrl+K goes anywhere",
-         "Tabs, settings, devices, filters and ready-made workspaces from "
-         "one search box. Starting up is also more reliable, with Safe "
-         "Mode if a start fails twice."),
-        ("\U0001F6E0", "Fixes for small screens and long translations (5.0.2)",
-         "No more cut-off or overlapping text: tabs and toolbars wrap "
-         "instead of hiding buttons, dialogs fit the screen, charts and the "
-         "map measure their labels, and views that looked empty now fill "
-         "in or say why."),
+        ("\U0001F4AC", "Answers first",
+         "The Dashboard answers three questions — is anything wrong, who "
+         "is using the Internet, what is new — each saying what it could "
+         "not see. Device cards tell a short story; the ? button (F1) "
+         "explains what every mark means, right where it is."),
+        ("\U0001F50E", "Find anything, go back",
+         "Results as you type, Ctrl+K for every setting and Help topic, "
+         "Back and Forward between views, tabs in four groups, and a Help "
+         "with Show me. Every 5.0.2 action is still where you can reach "
+         "it."),
+        ("\u270E", "Correct it, compare it, look back",
+         "Fix a website's category, tag a device's place and owner, undo "
+         "any of it; pin two devices side by side; see the session as of "
+         "any minute on the Timeline."),
+        ("\u23F1", "Faster, steadier, easier to read",
+         "Shorter freezes when saving, loading and changing text size; "
+         "sharp text on Windows at 125 % and more; an interface scale; "
+         "Reduce motion; a visible keyboard focus everywhere."),
+        ("\U0001F52C", "Everything from 5.0 is still here",
+         "The packet workspace, Full Power, Email Traffic, the Components "
+         "Center and Safe Mode work as before."),
     )
 
     def __init__(self, master, config=None, mode="startup"):
@@ -2089,6 +2091,45 @@ class LoaderWindow(tk.Frame):
             ttk.Button(row, text="Exit", command=lambda: answer("cancel")
                        ).pack(side="right")
             b.focus_set()
+        elif kind == "preflight":
+            f = self._card_frame(
+                "Before anything is downloaded",
+                "MiniWireshark needs these to watch your network live. "
+                "Nothing else is downloaded, and your own Python is not "
+                "changed.")
+            for it in kw.get("items", []):
+                tk.Label(f, text=f"• {it['name']} {it['version']} — "
+                                 f"{it['size']} from {it['host']}, "
+                                 f"{it['check']}; goes to {it['where']}."
+                                 + (f" {it['note']}" if it["note"] else ""),
+                         bg=self.card_bg, fg=self.fg, anchor="w",
+                         justify="left", wraplength=640).pack(fill="x")
+            row = tk.Frame(f, bg=self.card_bg)
+            row.pack(fill="x", pady=(8, 0))
+            go = ttk.Button(row, text="Download and continue",
+                            style="Accent.TButton",
+                            command=lambda: answer("continue"))
+            go.pack(side="left")
+            ttk.Button(row, text="Start without live capture",
+                       command=lambda: answer("without")).pack(
+                side="left", padx=8)
+            left = {"n": int(kw.get("wait", PREFLIGHT_WAIT_S))}
+            cd = tk.Label(row, text="", bg=self.card_bg, fg=self.muted)
+            cd.pack(side="right")
+
+            def tick():
+                if box[0] is not None or ev.is_set():
+                    return
+                if left["n"] <= 0:
+                    answer("continue")
+                    return
+                with contextlib.suppress(tk.TclError):
+                    cd.configure(text=f"Continuing in {left['n']} s")
+                left["n"] -= 1
+                self.after(1000, tick)
+            tick()
+            go.focus_set()
+            self.preflight_card = f
         elif kind == "error":
             title, what = RUNTIME_ERRORS.get(kw.get("err", "other"),
                                              RUNTIME_ERRORS["other"])
@@ -2131,7 +2172,11 @@ class LoaderWindow(tk.Frame):
         except tk.TclError:
             pass
 
-    def show_fatal(self, m):
+    def show_fatal(self, m, can_skip=False, wait=False):
+        """The recovery card: what went wrong, one plain next step, and
+        Try again / Start without live capture (when only capture is
+        missing) / Copy details. With wait=True it returns the choice:
+        "retry", "without" or "exit" (the window was closed)."""
         self.post_status("Setup could not finish")
         self.post_health("failed")
         self.post_log("", None)
@@ -2139,12 +2184,42 @@ class LoaderWindow(tk.Frame):
         self.post_footer("Close this window to exit. Details are in the "
                          "log: " + PATHS.log_file)
         self.pump()
+        choice = {"v": None}
         try:
-            f = self._card_frame("✖ Setup could not finish", m[-900:])
-            ttk.Button(f, text="Copy details",
-                       command=self._copy_details).pack(anchor="w")
+            kind = classify_runtime_error(Exception(m))
+            head = "✖ Setup could not finish"
+            text = m[-900:]
+            if kind != "other":
+                title, what = RUNTIME_ERRORS[kind]
+                text = f"{title}. {what}\n\n{text}"
+            f = self._card_frame(head, text)
+            row = tk.Frame(f, bg=self.card_bg)
+            row.pack(fill="x", pady=(6, 0))
+            if wait:
+                ttk.Button(row, text="Try again", style="Accent.TButton",
+                           command=lambda: choice.update(v="retry")).pack(
+                    side="left")
+                if can_skip:
+                    ttk.Button(row, text="Start without live capture",
+                               command=lambda: choice.update(
+                                   v="without")).pack(side="left", padx=8)
+            ttk.Button(row, text="Copy details",
+                       command=self._copy_details).pack(side="right")
+            self.fatal_choice = choice
         except tk.TclError:
             pass
+        if not wait:
+            return None
+        while choice["v"] is None:
+            try:
+                if not self.winfo_exists():
+                    return "exit"
+                self.update()
+            except tk.TclError:
+                return "exit"
+            time.sleep(0.03)
+        self._clear_card()
+        return choice["v"]
 
     # ---- Welcome Center ----------------------------------------------------------
     def show_welcome(self, summary="", health="healthy", first_time=False,
@@ -2168,7 +2243,7 @@ class LoaderWindow(tk.Frame):
                          "English")
         self.status_var.set("Welcome back!" if not first_time else
                             f"Welcome to MiniWireshark "
-                            f"{SCRIPT_VERSION.split('.')[0]}!")
+                            f"{'.'.join(SCRIPT_VERSION.split('.')[:2])}!")
         self._clear_card()
         top = tk.Frame(self.card, bg=self.bg)
         top.pack(fill="both", expand=True)
@@ -2310,8 +2385,91 @@ def step_python(l, state):
     return True, "Python is ready."
 
 
+def tk_version_note(version=None):
+    """A warning when Tk is older than 8.6 (old macOS system Pythons), or
+    ''. It never blocks."""
+    v = float(version if version is not None else tk.TkVersion)
+    if v >= 8.6:
+        return ""
+    return (f"This Python's graphical toolkit is Tk {v}, older than the "
+            f"8.6 MiniWireshark is made for: some windows may draw badly. "
+            f"The Runtime Manager (Settings → Diagnostics) can add a "
+            f"managed Python {RUNTIME_PYTHON} with a current Tk.")
+
+
 def step_tkinter(l, state):
+    note = tk_version_note()
+    if note:
+        l.post_log("  " + note, "warn")
+        return True, f"Graphical toolkit Tk {tk.TkVersion} (old; see above)."
     return True, f"Graphical toolkit ready (Tk {tk.TkVersion})."
+
+
+# ---- the pre-flight card: what will be downloaded, before the first byte ------
+SKIP_DOWNLOADS = [False]
+PREFLIGHT_WAIT_S = 10
+
+
+def preflight_items(state):
+    """Everything this start would download: [dict(name, version, size,
+    host, check, where, note)]. Empty when nothing is missing."""
+    out = []
+    for dep in DEPENDENCY_MANIFEST:
+        if not dep["required"] or dep["key"] not in PURE_WHEELS:
+            continue
+        ok, _info = _required_ready(dep)
+        if ok or state.recent_attempts("pkg:" + dep["key"],
+                                       24 * 3600) >= 3:
+            continue
+        version, filename, _sha, size = PURE_WHEELS[dep["key"]]
+        out.append({"name": _cap(dep["friendly"]), "version": version,
+                    "size": f"{size / 1e6:.1f} MB",
+                    "host": "files.pythonhosted.org",
+                    "check": "fingerprint-checked (SHA-256)",
+                    "where": "MiniWireshark's own packages folder (your "
+                             "Python is not changed)", "note": ""})
+    if IS_WINDOWS and not _npcap_present() and \
+            state.recent_attempts("npcap", 24 * 3600) < 2 and \
+            not (state.data.get("npcap") or {}).get("reboot_pending_since"):
+        out.append({"name": "Capture driver (Npcap)",
+                    "version": f"{NPCAP_FALLBACK_VERSION} or newer",
+                    "size": "about 1 MB", "host": "npcap.com",
+                    "check": f"signature checked ({NPCAP_SIGNER})",
+                    "where": "installed by its own installer",
+                    "note": "Windows will ask for your permission."})
+    return out
+
+
+def preflight_unattended():
+    return ("--yes" in sys.argv or bool(os.environ.get("MW_UNATTENDED"))
+            or TOOL_MODE)
+
+
+def step_preflight(l, state):
+    """Before the first byte: list each download and let the person
+    choose; continues by itself after 10 s (a countdown is shown), at once
+    with --yes or an unattended start."""
+    items = preflight_items(state)
+    if not items:
+        return True, ""
+    for it in items:
+        l.post_log(f"  To download: {it['name']} {it['version']} "
+                   f"({it['size']}) from {it['host']}, {it['check']} → "
+                   f"{it['where']}" + (f". {it['note']}" if it["note"]
+                                       else ""), "detail")
+    if preflight_unattended():
+        return True, "Downloading what is missing (unattended start)."
+    answer = l.ask("preflight", items=items, wait=PREFLIGHT_WAIT_S)
+    if answer == "without":
+        SKIP_DOWNLOADS[0] = True
+        CAPTURE_LIMITED[0] = ("You chose to start without live capture; "
+                              "nothing was downloaded. Repair (Help → "
+                              "MiniWireshark health) can download it later.")
+        l.post_health("degraded")
+        return True, "Starting without live capture (your choice)."
+    if answer == "cancel":
+        return False, "Setup was closed."
+    return True, ""
 
 
 def _cap(text):
@@ -2350,6 +2508,8 @@ def step_dependencies(l, state):
         if ok:
             l.post_log(f"  {_cap(dep['friendly'])} {info} is ready.", "ok")
             continue
+        if SKIP_DOWNLOADS[0]:
+            continue
         if state.recent_attempts("pkg:" + dep["key"], 24 * 3600) >= 3:
             CAPTURE_LIMITED[0] = (f"{_cap(dep['friendly'])} is {info}, and "
                                   f"installing it already failed 3 times "
@@ -2364,10 +2524,18 @@ def step_dependencies(l, state):
         l.post_log(f"  {filename} ({size / 1e6:.1f} MB) from "
                    f"files.pythonhosted.org, fingerprint-checked", "detail")
 
+        later = sum(1 for x in preflight_items(state)
+                    if x["host"] == "npcap.com") * 1_000_000
+
         def prog(stage, frac, text, extra, _l=l):
             speed = extra.get("speed") if extra else None
+            eta = (extra.get("eta") or 0) if extra else 0
+            if speed and later:
+                eta += later / speed           # what is still to come
             _l.post_footer(f"{dep['friendly'].capitalize()}: {text}"
-                           + (f" — {speed / 1e6:.1f} MB/s" if speed else ""))
+                           + (f" — {speed / 1e6:.1f} MB/s" if speed else "")
+                           + (f" — about {human_duration(eta)} left in all"
+                              if eta else ""))
         try:
             PRIVATE_PACKAGES.install_pure(dep["key"], prog,
                                           lambda: l.cancel_requested)
@@ -2375,8 +2543,12 @@ def step_dependencies(l, state):
             importlib.invalidate_caches()
         except Exception as e:                       # noqa: BLE001
             kind = getattr(e, "kind", "") or classify_runtime_error(e)
+            part = os.path.join(PRIVATE_PACKAGES.cache, filename) + ".part"
             CAPTURE_LIMITED[0] = (f"Couldn't install {dep['friendly']} "
-                                  f"({kind}: {str(e)[:160]}).")
+                                  f"({kind}: {str(e)[:160]})." + (
+                                      " The next start resumes the "
+                                      "download where it stopped."
+                                      if os.path.exists(part) else ""))
             l.post_log("  " + CAPTURE_LIMITED[0], "warn")
             boot_step("install " + dep["key"], False, error=e)
             continue
@@ -2398,6 +2570,9 @@ def step_dependencies(l, state):
 def step_npcap(l, state):
     if not IS_WINDOWS:
         return True, "Capture driver: built into this operating system."
+    if SKIP_DOWNLOADS[0] and not _npcap_present():
+        return True, ("Capture driver not installed (you chose to start "
+                      "without live capture).")
     if _npcap_present():
         if state.data.get("npcap"):
             state.data["npcap"] = {}
@@ -2494,10 +2669,17 @@ BOOTSTRAP_STEPS = [
     ("Checking Python", step_python, 1),
     ("Checking which Python to use", step_runtime, 1),
     ("Checking the graphical toolkit", step_tkinter, 1),
+    ("Checking what has to be downloaded", step_preflight, 1),
     ("Preparing the packet capture engine", step_dependencies, 8),
     ("Preparing the capture driver", step_npcap, 6),
     ("Finishing up", lambda l, s: (True, "Ready."), 1),
 ]
+
+
+BOOTSTRAP_FAILED_STEP = [""]
+# a failure here means only live capture is missing: the app can start
+CAPTURE_ONLY_STEPS = ("Preparing the capture driver",
+                      "Preparing the packet capture engine")
 
 
 def run_bootstrap(loader):
@@ -2521,6 +2703,7 @@ def run_bootstrap(loader):
             if not ok:
                 loader.post_log(f"✗ {msg}", "err")
                 result[0] = (False, msg)
+                BOOTSTRAP_FAILED_STEP[0] = title
                 done.set()
                 return
             if msg:
@@ -21338,6 +21521,20 @@ A row's menu ¦ Le menu d'une ligne ¦ El menú de una fila
 Close a window or a list ¦ Fermer une fenêtre ou une liste ¦ Cerrar una ventana o una lista
 Move the Timeline time ¦ Déplacer l'heure de la Chronologie ¦ Mover la hora de la Cronología
 Complete a field name in a filter ¦ Compléter un nom de champ dans un filtre ¦ Completar un nombre de campo en un filtro
+Download and continue ¦ Télécharger et continuer ¦ Descargar y continuar
+Start without live capture ¦ Démarrer sans capture en direct ¦ Empezar sin captura en directo
+Before anything is downloaded ¦ Avant tout téléchargement ¦ Antes de descargar nada
+MiniWireshark needs these to watch your network live. Nothing else is downloaded, and your own Python is not changed. ¦ MiniWireshark en a besoin pour observer votre réseau en direct. Rien d'autre n'est téléchargé, et votre propre Python n'est pas modifié. ¦ MiniWireshark los necesita para observar su red en directo. No se descarga nada más y su propio Python no se modifica.
+Answers first ¦ Les réponses d'abord ¦ Primero las respuestas
+The Dashboard answers three questions — is anything wrong, who is using the Internet, what is new — each saying what it could not see. Device cards tell a short story; the ? button (F1) explains what every mark means, right where it is. ¦ Le tableau de bord répond à trois questions — y a-t-il un problème, qui utilise Internet, quoi de neuf — en disant chaque fois ce qu'il n'a pas pu voir. Les fiches d'appareil racontent une courte histoire ; le bouton ? (F1) explique chaque marque à l'endroit même. ¦ El panel responde a tres preguntas —¿algo va mal?, ¿quién usa Internet?, ¿qué hay de nuevo?— y cada una dice lo que no pudo ver. Las fichas de dispositivo cuentan una breve historia; el botón ? (F1) explica cada marca justo donde está.
+Find anything, go back ¦ Tout trouver, revenir en arrière ¦ Encontrarlo todo, volver atrás
+Results as you type, Ctrl+K for every setting and Help topic, Back and Forward between views, tabs in four groups, and a Help with Show me. Every 5.0.2 action is still where you can reach it. ¦ Des résultats pendant la frappe, Ctrl+K pour chaque paramètre et chaque rubrique d'aide, Retour et Avance entre les vues, des onglets en quatre groupes et une aide avec « Montrer ». Chaque action de la 5.0.2 reste accessible. ¦ Resultados mientras escribe, Ctrl+K para cada ajuste y tema de ayuda, Atrás y Adelante entre vistas, pestañas en cuatro grupos y una ayuda con «Mostrar». Todas las acciones de la 5.0.2 siguen a su alcance.
+Correct it, compare it, look back ¦ Corriger, comparer, remonter le temps ¦ Corregir, comparar, mirar atrás
+Fix a website's category, tag a device's place and owner, undo any of it; pin two devices side by side; see the session as of any minute on the Timeline. ¦ Corrigez la catégorie d'un site, indiquez le lieu et le propriétaire d'un appareil, annulez n'importe laquelle de ces corrections ; épinglez deux appareils côte à côte ; voyez la session à n'importe quelle minute dans la Chronologie. ¦ Corrija la categoría de un sitio, indique el lugar y el propietario de un dispositivo, deshaga cualquiera de ellas; fije dos dispositivos uno al lado del otro; vea la sesión en cualquier minuto en la Cronología.
+Faster, steadier, easier to read ¦ Plus rapide, plus stable, plus lisible ¦ Más rápido, más estable, más legible
+Shorter freezes when saving, loading and changing text size; sharp text on Windows at 125 % and more; an interface scale; Reduce motion; a visible keyboard focus everywhere. ¦ Des blocages plus courts à l'enregistrement, au chargement et au changement de taille du texte ; un texte net sous Windows à 125 % et plus ; une échelle de l'interface ; Réduire les animations ; un focus clavier visible partout. ¦ Bloqueos más cortos al guardar, cargar y cambiar el tamaño del texto; texto nítido en Windows al 125 % o más; una escala de la interfaz; Reducir el movimiento; un foco de teclado visible en todas partes.
+Everything from 5.0 is still here ¦ Tout ce que contenait la 5.0 est toujours là ¦ Todo lo de la 5.0 sigue aquí
+The packet workspace, Full Power, Email Traffic, the Components Center and Safe Mode work as before. ¦ L'espace de travail des paquets, la pleine puissance, le trafic e-mail, le centre des composants et le mode sans échec fonctionnent comme avant. ¦ El espacio de trabajo de paquetes, la potencia máxima, el tráfico de correo, el centro de componentes y el modo seguro funcionan como antes.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -21403,7 +21600,8 @@ I18N_PATTERNS = [
     (r"it has a usable address \((.+)\)", r"elle a une adresse utilisable "
      r"(\1)", r"tiene una dirección utilizable (\1)"),
     # ---- V5.0.2
-    (r"Welcome to MiniWireshark (\d+)!", r"Bienvenue dans MiniWireshark \1 !",
+    (r"Welcome to MiniWireshark ([\d.]+)!",
+     r"Bienvenue dans MiniWireshark \1 !",
      r"¡Bienvenido a MiniWireshark \1!"),
     # ---- V5.0.1: health info block and runtime status, line by line
     (r"Network card : ([^\n]*)", r"Carte réseau   : \1", r"Tarjeta de red : \1"),
@@ -54068,6 +54266,59 @@ def run_self_tests(verbose=True):
         for text in ("(ip.src == 1.2.3.4)", "tcp.port == 443", "foo bar"):
             assert builder_rows(text) is None, text
 
+    def t_m9_bootstrap():
+        """5.1.2 M9: a broken download resumes and still passes its
+        fingerprint; the Tk check warns and never blocks; an unattended
+        start skips the pre-flight wait."""
+        import http.server
+        import socketserver
+        payload = os.urandom(300_000)
+        sha = hashlib.sha256(payload).hexdigest()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                rng = self.headers.get("Range", "")
+                m = re.match(r"bytes=(\d+)-", rng)
+                start = int(m.group(1)) if m else 0
+                body = payload[start:]
+                self.send_response(206 if start else 200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+        srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        old_np = os.environ.get("no_proxy"), os.environ.get("NO_PROXY")
+        os.environ["no_proxy"] = os.environ["NO_PROXY"] = "127.0.0.1"
+        try:
+            dest = os.path.join(tmp, "dl", "pkg.whl")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest + ".part", "wb") as f:      # cut at 50 %
+                f.write(payload[:150_000])
+            seen = []
+            got = fetch_to_file(f"http://127.0.0.1:{srv.server_address[1]}"
+                                f"/pkg.whl", dest, sha,
+                                progress=lambda *a: seen.append(a[2]))
+            assert got == dest and sha256_file(dest) == sha
+            assert any("Resuming from 0.1 MB" in x for x in seen), seen
+            assert not os.path.exists(dest + ".part")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            for k, v in zip(("no_proxy", "NO_PROXY"), old_np):
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        assert tk_version_note(8.5) and "8.6" in tk_version_note(8.5)
+        assert tk_version_note(8.6) == ""
+        assert preflight_unattended()                 # a test run
+        assert "Preparing the capture driver" in CAPTURE_ONLY_STEPS
+        assert SCRIPT_VERSION == "5.1.2"
+
     def t_session_roundtrip():
         clk = _FakeClock()
         c = cfg()
@@ -54308,7 +54559,7 @@ def run_self_tests(verbose=True):
                t_device_lifecycle, t_public_ip_never_a_device,
                t_device_merge_rules, t_registrable_domain, t_dns_parsing,
                t_explain_registry, t_m6_corrections,
-               t_m7_asof_and_builder,
+               t_m7_asof_and_builder, t_m9_bootstrap,
                t_tls_sni_parser, t_flow_aggregation, t_alert_debounce,
                t_session_roundtrip, t_display_filters, t_historical_buckets,
                t_dns_tracker, t_baseline, t_data_loaders, t_history_store,
@@ -58798,7 +59049,8 @@ def test_v502_live_texts_translated(ctx):
                    "listening.", "Checking which network this is before "
                    "sending anything…", "Picked because it carries your "
                    "default Internet route.", "Nothing is being sent.",
-                   "Welcome to MiniWireshark 5!", "Presets…"):
+                   "Welcome to MiniWireshark 5!",
+                   "Welcome to MiniWireshark 5.1!", "Presets…"):
             out = translate_text(en, loc)
             assert out != en, (loc, en)
     rec = {"reasons": ["it carries your default Internet route",
@@ -62085,6 +62337,51 @@ def gt_m8_access(app, ctx):
         set_colorblind_mode(cvd or "Off")
 
 
+@gui_test_step("5.1.2 M9: pre-flight card, recovery card, What's new")
+def gt_m9_loader(app, ctx):
+    root = app.root
+    top = tk.Toplevel(root)
+    try:
+        lw = LoaderWindow(top, app.config)
+        lw.pack(fill="both", expand=True)
+        item = {"name": "Packet capture engine", "version": "2.8.0",
+                "size": "2.8 MB", "host": "files.pythonhosted.org",
+                "check": "fingerprint-checked (SHA-256)",
+                "where": "MiniWireshark's own packages folder", "note": ""}
+        # nobody answers: it continues by itself after the countdown
+        ev, box = threading.Event(), [None]
+        lw._show_question("preflight", {"items": [item], "wait": 1}, ev,
+                          box)
+        _gui_pump(root, 0.2)
+        texts = [str(x.cget("text")) for x in _walk_class(top, tk.Label)]
+        assert any("files.pythonhosted.org" in t and "fingerprint" in t
+                   for t in texts), texts
+        assert _gui_pump(root, 0.2, until=ev.is_set, timeout=5)
+        assert box[0] == "continue"
+        # Start without live capture is one click
+        ev, box = threading.Event(), [None]
+        lw._show_question("preflight", {"items": [item], "wait": 60}, ev,
+                          box)
+        _gui_pump(root, 0.2)
+        b = [x for x in _walk_class(top, ttk.Button)
+             if "without" in str(x.cget("text"))]
+        assert b
+        b[0].invoke()
+        assert box[0] == "without" and ev.is_set()
+        # the recovery card: Try again / Start without live capture
+        root.after(400, lambda: lw.fatal_choice.update(v="retry"))
+        got = lw.show_fatal("The capture driver isn't present. timed out",
+                            can_skip=True, wait=True)
+        assert got == "retry", got
+        texts = [str(x.cget("text")) for x in _walk_class(top, tk.Label)]
+        del texts
+        # What's new is short enough for the Welcome Center
+        assert len(LoaderWindow.WHATS_NEW) <= 5
+    finally:
+        with contextlib.suppress(tk.TclError):
+            top.destroy()
+
+
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
 # Labels that change with the state of the row a menu was opened on are
 # folded to one name, so the snapshot does not depend on which row was first.
@@ -62610,12 +62907,23 @@ def main():
         BOOT.mark(reached_window=True)
     signal_ready()
 
-    ok, err = run_bootstrap(loader)
-    if not ok:
+    while True:
+        ok, err = run_bootstrap(loader)
+        if ok:
+            break
         if BOOT is not None:
             BOOT.mark(outcome="fatal")
-        loader.show_fatal(err)
-        root.mainloop()
+        choice = loader.show_fatal(
+            err, can_skip=BOOTSTRAP_FAILED_STEP[0] in CAPTURE_ONLY_STEPS,
+            wait=True)
+        if choice == "retry":
+            loader.post_log("→ Trying again", "step")
+            continue
+        if choice == "without":
+            CAPTURE_LIMITED[0] = err
+            break
+        with contextlib.suppress(tk.TclError):
+            root.destroy()
         return
     if loader.handoff:
         # the private Python is ready: continue inside it
