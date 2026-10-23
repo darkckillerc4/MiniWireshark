@@ -1,7 +1,4 @@
 [
-"Destination unreachable (IPv6)",
-"Examples:  proto:tls site:example.com    port:53 or port:853    ip:192.168.1.0/24 -proto:arp    len>1000 dir:up    device:@mine    stream:12    marked",
-"Multicast group membership report (IPv6)",
-"Ping reply (IPv6)",
-"Ping request (IPv6)"
+"M4 test message",
+"🐢  The window fell behind a few times in the last minute. If it keeps happening, Settings → Performance → Low CPU can help. A freeze report is now being kept for Help → Diagnostics → Export debug bundle."
 ]

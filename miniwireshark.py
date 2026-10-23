@@ -12414,6 +12414,68 @@ ALERT_CHECKLIST.update({
 })
 
 
+ALERT_CHECKLIST.setdefault("reputation", [
+    "Look at which device contacted it and whether that was expected (an "
+    "app, an update, a link someone opened).",
+    "A list entry is a reason to look, not proof: shared servers and old "
+    "entries are common."])
+
+ALERT_MEANS = {
+    "new_device": "Usually a phone, laptop or gadget of someone in the "
+                  "house, or a guest joining the Wi-Fi.",
+    "arp_spoof": "Sometimes a router restart or a device with two network "
+                 "cards; rarely, a machine trying to sit between devices "
+                 "and the router.",
+    "gateway_change": "Usually a router restart, firmware update or a "
+                      "replaced router.",
+    "dhcp_anomaly": "Usually a second router or access point handing out "
+                    "addresses by mistake.",
+    "chatty_device": "Usually an update, a backup, streaming or a video "
+                     "call.",
+    "unknown_device": "Usually a quiet gadget that hasn't said much yet; "
+                      "confidence grows as it talks.",
+    "reconnect_cycle": "Usually weak Wi-Fi or power saving on the "
+                       "device.",
+    "duplicate_ip": "Usually two devices set to the same fixed address, or "
+                    "a device that kept an old lease.",
+    "dns_server_change": "Usually a VPN, a new router setting or an app "
+                         "with its own DNS.",
+    "dns_failures": "Usually a provider or router hiccup; sometimes an "
+                    "app asking for names that don't exist.",
+    "dns_slow": "Usually your provider's DNS being slow at the moment.",
+    "dns_multi": "Usually browsers, VPNs or apps with their own DNS.",
+    "many_destinations": "Usually updates, cloud sync or peer-to-peer "
+                         "apps.",
+    "many_connections": "Usually browsers, games or updates opening many "
+                        "connections at once.",
+    "upload_spike": "Usually a photo backup, a video upload or a call.",
+    "download_spike": "Usually an update, a game download or streaming.",
+    "tcp_resets": "Usually a service refusing connections, a firewall or "
+                  "an ad-blocker.",
+    "new_service": "Usually something you just enabled: file sharing, "
+                   "casting, a printer.",
+    "cleartext": "Usually older devices or simple home gear that doesn't "
+                 "encrypt.",
+    "remote_access": "Usually remote-desktop or SSH you set up on "
+                     "purpose.",
+    "new_country": "Usually a content network or cloud service hosted "
+                   "abroad.",
+    "broadcast_storm": "Usually a misbehaving device or a network cable "
+                       "loop.",
+    "scan_pattern": "Usually a network scanner you ran yourself, or a "
+                    "device's own discovery feature.",
+    "rogue_ra": "Usually a second router, a mesh node or a shared "
+                "connection (phone hotspot, VM host).",
+    "reputation": "Usually a shared server or an old list entry; "
+                  "sometimes a link to a site known for trouble.",
+}
+
+
+def _explain_alerts():
+    for kind, (title, _sev) in ALERT_TYPES.items():
+        EXPLAIN[("alert", kind)] = (title, ALERT_MEANS.get(kind, ""))
+
+
 class AlertEngine:
     def __init__(self, config, now_fn=None):
         self.config = config
@@ -14543,6 +14605,53 @@ LEVEL_HELP = {
                  "listed.",
     LV_UNKNOWN: "Nothing seen either way. Not seeing something does not "
                 "mean it didn't happen."}
+
+
+# ---- EXPLAIN (5.1.2 F7): one place for every "what does this mean" ------
+# (kind, key) -> (short, long). Used by tooltips, Explain inline, Help and
+# search. The self-test fails when an alert type, a device state, a
+# confidence word or an evidence level has no entry.
+EXPLAIN = {}
+
+
+def explain(kind, key, long=True):
+    e = EXPLAIN.get((kind, key))
+    if e is None:
+        return ""
+    return e[1] if long else e[0]
+
+
+def _explain_init():
+    for lv in (LV_OBSERVED, LV_REPORTED, LV_CORRELATED, LV_INFERRED,
+               LV_UNKNOWN):
+        EXPLAIN[("level", lv)] = (LEVEL_WORD[lv], LEVEL_HELP[lv])
+    EXPLAIN[("confidence", "High")] = (
+        "High", "Several independent local signals agree: it sent traffic "
+        "of its own and its identity comes from more than one source.")
+    EXPLAIN[("confidence", "Medium")] = (
+        "Medium", "It sent traffic, but its name or type comes from one "
+        "source only.")
+    EXPLAIN[("confidence", "Low")] = (
+        "Low", "Only a little evidence so far, for example an address seen "
+        "in someone else's traffic. More will come as it talks.")
+    EXPLAIN[("confidence", "Unconfirmed")] = (
+        "Unconfirmed", "Nothing yet proves it is a real device on your "
+        "network; it may be a passing address.")
+    EXPLAIN[("state", "ACTIVE")] = (
+        "Active", "Sent something in the last few minutes.")
+    EXPLAIN[("state", "IDLE")] = (
+        "Idle", "Still here, but quiet for a couple of minutes (phones and "
+        "smart devices sleep a lot).")
+    EXPLAIN[("state", "INACTIVE")] = (
+        "Offline", "Not heard from for a while. It may be switched off, "
+        "asleep, or out of range.")
+    EXPLAIN[("state", "EXPIRED")] = (
+        "Expired", "Not seen for a long time; kept so you can see its "
+        "history.")
+
+
+_explain_init()
+_explain_alerts()
 
 
 def level_label(level, word=True):
@@ -17301,7 +17410,7 @@ DEFAULT_SHORTCUTS = {
     "undo": "<Control-z>", "inspector": "<F2>",
     "palette": "<Control-k>", "goto_packet": "<Control-g>",
     # 5.1.2: back / forward through the views you visited; the tab groups
-    "back": "<Alt-Left>", "forward": "<Alt-Right>",
+    "back": "<Alt-Left>", "forward": "<Alt-Right>", "explain": "<F1>",
     "group1": "<Control-Key-1>", "group2": "<Control-Key-2>",
     "group3": "<Control-Key-3>", "group4": "<Control-Key-4>",
 }
@@ -17325,11 +17434,12 @@ def _default_config():
                     "beginner_explanations": True,
                     "explanation_verbosity": "Normal", "language": "English",
                     "upgraded_from_3": False, "show_welcome": True,
-                    "welcome_version": ""},
+                    "welcome_version": "", "tours_done": []},
         "accessibility": {"colorblind": "Off"},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal",
                        "inspector": None, "tables": {}, "window": "",
+                       "explain_inline": False, "folds": {},
                        "last_tab": ""},
         "capture": {"max_stored_events": 5000, "promiscuous": True,
                     "auto_select_interface": True,
@@ -20551,6 +20661,168 @@ This device is no longer listed (it expired, or the data was cleared). ¦ Cet ap
 This item is no longer listed (it expired, or the data was cleared or replaced). ¦ Cet élément n'est plus dans la liste (il a expiré, ou les données ont été effacées ou remplacées). ¦ Este elemento ya no está en la lista (caducó o los datos se borraron o se reemplazaron).
 Open it ¦ L'ouvrir ¦ Abrirlo
 Paused while the pointer is over the list — move it away to resume ¦ En pause tant que le pointeur est sur la liste — éloignez-le pour reprendre ¦ En pausa mientras el puntero está sobre la lista: apártelo para continuar
+Start here ¦ Commencer ici ¦ Empieza aquí
+The device list ¦ La liste des appareils ¦ La lista de dispositivos
+How we know column ¦ La colonne « Comment on le sait » ¦ La columna «Cómo lo sabemos»
+The state line ¦ La ligne d'état ¦ La línea de estado
+What this computer can see ¦ Ce que cet ordinateur peut voir ¦ Lo que este equipo puede ver
+The alert list ¦ La liste des alertes ¦ La lista de alertas
+Tours ¦ Visites guidées ¦ Recorridos guiados
+Find out what a device is ¦ Savoir ce qu'est un appareil ¦ Averiguar qué es un dispositivo
+Something looks wrong ¦ Quelque chose semble anormal ¦ Algo parece ir mal
+See inside a connection ¦ Voir l'intérieur d'une connexion ¦ Ver el interior de una conexión
+Dashboard tab ¦ Onglet Tableau de bord ¦ Pestaña Panel
+The tabs ¦ Les onglets ¦ Las pestañas
+Live feed tab ¦ Onglet En direct ¦ Pestaña En directo
+Timeline tab ¦ Onglet Chronologie ¦ Pestaña Cronología
+Devices tab ¦ Onglet Appareils ¦ Pestaña Dispositivos
+Websites tab ¦ Onglet Sites web ¦ Pestaña Sitios web
+Connections tab ¦ Onglet Connexions ¦ Pestaña Conexiones
+Internet hosts tab ¦ Onglet Hôtes Internet ¦ Pestaña Equipos de Internet
+Alerts tab ¦ Onglet Alertes ¦ Pestaña Alertas
+Map tab ¦ Onglet Carte ¦ Pestaña Mapa
+Health tab ¦ Onglet Santé ¦ Pestaña Salud
+Security tab ¦ Onglet Sécurité ¦ Pestaña Seguridad
+Sources tab ¦ Onglet Sources ¦ Pestaña Fuentes
+Packets tab ¦ Onglet Paquets ¦ Pestaña Paquetes
+Privacy and safety ¦ Vie privée et sécurité ¦ Privacidad y seguridad
+Settings → Privacy ¦ Paramètres → Vie privée ¦ Configuración → Privacidad
+What MiniWireshark will never do ¦ Ce que MiniWireshark ne fera jamais ¦ Lo que MiniWireshark nunca hará
+Search and Ctrl+K ¦ Recherche et Ctrl+K ¦ Búsqueda y Ctrl+K
+Using MiniWireshark ¦ Utiliser MiniWireshark ¦ Usar MiniWireshark
+The search box ¦ La zone de recherche ¦ El cuadro de búsqueda
+Back and forward ¦ Retour et avance ¦ Atrás y adelante
+Tables ¦ Tableaux ¦ Tablas
+A table ¦ Un tableau ¦ Una tabla
+Workspaces ¦ Espaces de travail ¦ Espacios de trabajo
+Explanations (the ? button) ¦ Explications (le bouton ?) ¦ Explicaciones (el botón ?)
+The ? button ¦ Le bouton ? ¦ El botón ?
+Keyboard map ¦ Raccourcis clavier ¦ Mapa del teclado
+ARP ¦ ARP ¦ ARP
+Glossary A–Z ¦ Glossaire A–Z ¦ Glosario A–Z
+Baselines ¦ Références habituelles ¦ Líneas base
+DHCP ¦ DHCP ¦ DHCP
+DNS ¦ DNS ¦ DNS
+IP address ¦ Adresse IP ¦ Dirección IP
+mDNS / SSDP ¦ mDNS / SSDP ¦ mDNS / SSDP
+Offline captures, saved sessions and demo data ¦ Captures hors ligne, sessions enregistrées et données de démonstration ¦ Capturas sin conexión, sesiones guardadas y datos de demostración
+Quiet Mode vs. Active Scanning ¦ Mode discret ou analyse active ¦ Modo silencioso frente a análisis activo
+Severity colors ¦ Couleurs de gravité ¦ Colores de gravedad
+VPNs ¦ VPN ¦ VPN
+Website vs. Remote Host ¦ Site web ou hôte distant ¦ Sitio web frente a equipo remoto
+What MiniWireshark can and can't see about websites ¦ Ce que MiniWireshark peut et ne peut pas voir des sites web ¦ Lo que MiniWireshark puede y no puede ver de los sitios web
+What MiniWireshark does ¦ Ce que fait MiniWireshark ¦ Qué hace MiniWireshark
+Why encrypted DNS limits visibility ¦ Pourquoi le DNS chiffré limite la visibilité ¦ Por qué el DNS cifrado limita la visibilidad
+Why some information may be missing ¦ Pourquoi certaines informations peuvent manquer ¦ Por qué puede faltar información
+About ¦ À propos ¦ Acerca de
+You opened a device. A 1-minute tour shows how to find out what it is. ¦ Vous avez ouvert un appareil. Une visite d'une minute montre comment savoir ce que c'est. ¦ Ha abierto un dispositivo. Un recorrido de un minuto muestra cómo averiguar qué es.
+The card ¦ La fiche ¦ La ficha
+Every fact MiniWireshark has about the device, each with its evidence mark: ◉ seen in a packet, ◌ a reasonable guess. ¦ Tout ce que MiniWireshark sait de l'appareil, chaque fait avec sa marque de preuve : ◉ vu dans un paquet, ◌ une supposition raisonnable. ¦ Todo lo que MiniWireshark sabe del dispositivo, cada dato con su marca de evidencia: ◉ visto en un paquete, ◌ una suposición razonable.
+Name it ¦ Nommez-le ¦ Póngale nombre
+Right-click it → Rename, or mark it as yours. Names stay on this computer. ¦ Clic droit → Renommer, ou marquez-le comme le vôtre. Les noms restent sur cet ordinateur. ¦ Clic derecho → Cambiar nombre, o márquelo como suyo. Los nombres se quedan en este equipo.
+The Inspector ¦ L'inspecteur ¦ El inspector
+Press F2: the Inspector shows each claim and the packets that prove it. ¦ Appuyez sur F2 : l'inspecteur montre chaque affirmation et les paquets qui la prouvent. ¦ Pulse F2: el inspector muestra cada afirmación y los paquetes que la prueban.
+Still not sure? ¦ Toujours pas sûr ? ¦ ¿Aún no está seguro?
+Unknown means not seen either way. Leave it running a while: phones, TVs and printers announce themselves (mDNS, SSDP, DHCP). ¦ Inconnu signifie que rien n'a été vu dans un sens ou dans l'autre. Laissez tourner un moment : téléphones, téléviseurs et imprimantes s'annoncent (mDNS, SSDP, DHCP). ¦ Desconocido significa que no se ha visto nada en ningún sentido. Déjelo funcionar un rato: teléfonos, televisores e impresoras se anuncian (mDNS, SSDP, DHCP).
+A warning was raised. A 1-minute tour shows how to read it. ¦ Un avertissement a été émis. Une visite d'une minute montre comment le lire. ¦ Se ha emitido una advertencia. Un recorrido de un minuto muestra cómo leerla.
+Read the reason ¦ Lisez la raison ¦ Lea el motivo
+Each alert says what was seen, in one line. It means “worth a look”, never “hacked”. ¦ Chaque alerte dit ce qui a été vu, en une ligne. Elle veut dire « à regarder », jamais « piraté ». ¦ Cada alerta dice lo que se vio, en una línea. Significa «vale la pena mirarlo», nunca «hackeado».
+What it usually means ¦ Ce que cela veut dire d'habitude ¦ Lo que suele significar
+The ? button (F1) adds what this kind usually means and what to check, under the list. ¦ Le bouton ? (F1) ajoute sous la liste ce que ce type veut dire d'habitude et quoi vérifier. ¦ El botón ? (F1) añade bajo la lista lo que suele significar este tipo y qué comprobar.
+Check, then decide ¦ Vérifiez, puis décidez ¦ Compruebe y luego decida
+Open it for innocent explanations and the packets behind it. Acknowledge it when you've looked, or mute the kind. ¦ Ouvrez-la pour voir les explications innocentes et les paquets à l'origine. Marquez-la comme vue une fois vérifiée, ou mettez ce type en sourdine. ¦ Ábrala para ver explicaciones inocentes y los paquetes que hay detrás. Márquela como vista cuando la haya revisado, o silencie ese tipo.
+Full Power is on. A 1-minute tour shows what it adds. ¦ La pleine puissance est activée. Une visite d'une minute montre ce qu'elle ajoute. ¦ La potencia máxima está activada. Un recorrido de un minuto muestra lo que añade.
+Each connection is followed in more depth. It never decrypts HTTPS or reads passwords. ¦ Chaque connexion est suivie plus en détail. Elle ne déchiffre jamais le HTTPS et ne lit jamais les mots de passe. ¦ Cada conexión se sigue con más detalle. Nunca descifra HTTPS ni lee contraseñas.
+Every conversation, who to where; double-click one for its details. ¦ Chaque conversation, qui vers où ; double-cliquez pour les détails. ¦ Cada conversación, quién hacia dónde; haga doble clic para ver los detalles.
+The packets themselves, with filter expressions; proof chips elsewhere open them here. ¦ Les paquets eux-mêmes, avec des expressions de filtre ; les puces de preuve ailleurs les ouvrent ici. ¦ Los paquetes en sí, con expresiones de filtro; las marcas de prueba de otras partes los abren aquí.
+Observed ¦ Observé ¦ Observado
+Seen directly in a packet (you can open that packet). ¦ Vu directement dans un paquet (vous pouvez ouvrir ce paquet). ¦ Visto directamente en un paquete (puede abrir ese paquete).
+Reported ¦ Signalé ¦ Informado
+Reported by another system you connected (for example your Pi-hole), not seen by this computer itself. ¦ Signalé par un autre système que vous avez connecté (par exemple votre Pi-hole), pas vu par cet ordinateur lui-même. ¦ Informado por otro sistema que conectó (por ejemplo su Pi-hole), no visto por este equipo.
+Correlated ¦ Corrélé ¦ Correlacionado
+Inferred ¦ Déduit ¦ Deducido
+A reasonable guess. It could be wrong; the reasons are listed. ¦ Une supposition raisonnable. Elle peut être fausse ; les raisons sont indiquées. ¦ Una suposición razonable. Puede ser errónea; se indican los motivos.
+Nothing seen either way. Not seeing something does not mean it didn't happen. ¦ Rien de vu dans un sens ou dans l'autre. Ne pas voir quelque chose ne veut pas dire que cela n'a pas eu lieu. ¦ No se ha visto nada en ningún sentido. No ver algo no significa que no haya ocurrido.
+Several independent local signals agree: it sent traffic of its own and its identity comes from more than one source. ¦ Plusieurs signaux locaux indépendants concordent : il a envoyé son propre trafic et son identité vient de plus d'une source. ¦ Varias señales locales independientes coinciden: envió tráfico propio y su identidad procede de más de una fuente.
+It sent traffic, but its name or type comes from one source only. ¦ Il a envoyé du trafic, mais son nom ou son type ne vient que d'une source. ¦ Envió tráfico, pero su nombre o tipo procede de una sola fuente.
+Only a little evidence so far, for example an address seen in someone else's traffic. More will come as it talks. ¦ Peu d'indices pour l'instant, par exemple une adresse vue dans le trafic d'un autre. Il y en aura plus à mesure qu'il communique. ¦ Pocas pruebas por ahora, por ejemplo una dirección vista en el tráfico de otro. Habrá más a medida que se comunique.
+Nothing yet proves it is a real device on your network; it may be a passing address. ¦ Rien ne prouve encore que c'est un vrai appareil de votre réseau ; ce peut être une adresse de passage. ¦ Nada demuestra aún que sea un dispositivo real de su red; puede ser una dirección de paso.
+Active ¦ Actif ¦ Activo
+Sent something in the last few minutes. ¦ A envoyé quelque chose ces dernières minutes. ¦ Envió algo en los últimos minutos.
+Still here, but quiet for a couple of minutes (phones and smart devices sleep a lot). ¦ Toujours là, mais silencieux depuis quelques minutes (téléphones et objets connectés dorment beaucoup). ¦ Sigue aquí, pero en silencio desde hace un par de minutos (los teléfonos y dispositivos inteligentes duermen mucho).
+Not heard from for a while. It may be switched off, asleep, or out of range. ¦ Pas de nouvelles depuis un moment. Il est peut-être éteint, en veille ou hors de portée. ¦ Sin noticias desde hace un rato. Puede estar apagado, en reposo o fuera de alcance.
+Not seen for a long time; kept so you can see its history. ¦ Pas vu depuis longtemps ; conservé pour que vous puissiez voir son historique. ¦ No se ve desde hace mucho; se conserva para que pueda ver su historial.
+Usually a phone, laptop or gadget of someone in the house, or a guest joining the Wi-Fi. ¦ D'habitude un téléphone, un portable ou un gadget de quelqu'un de la maison, ou un invité qui rejoint le Wi-Fi. ¦ Normalmente un teléfono, portátil o aparato de alguien de la casa, o un invitado que se une al Wi-Fi.
+Sometimes a router restart or a device with two network cards; rarely, a machine trying to sit between devices and the router. ¦ Parfois un redémarrage du routeur ou un appareil à deux cartes réseau ; rarement, une machine qui tente de se placer entre les appareils et le routeur. ¦ A veces un reinicio del router o un dispositivo con dos tarjetas de red; rara vez, una máquina que intenta situarse entre los dispositivos y el router.
+Usually a router restart, firmware update or a replaced router. ¦ D'habitude un redémarrage du routeur, une mise à jour du micrologiciel ou un routeur remplacé. ¦ Normalmente un reinicio del router, una actualización de firmware o un router sustituido.
+Usually a second router or access point handing out addresses by mistake. ¦ D'habitude un deuxième routeur ou point d'accès qui distribue des adresses par erreur. ¦ Normalmente un segundo router o punto de acceso que reparte direcciones por error.
+Usually an update, a backup, streaming or a video call. ¦ D'habitude une mise à jour, une sauvegarde, du streaming ou un appel vidéo. ¦ Normalmente una actualización, una copia de seguridad, streaming o una videollamada.
+Usually a quiet gadget that hasn't said much yet; confidence grows as it talks. ¦ D'habitude un gadget discret qui n'a pas encore dit grand-chose ; la confiance augmente à mesure qu'il communique. ¦ Normalmente un aparato discreto que aún no ha dicho mucho; la confianza crece a medida que se comunica.
+Usually weak Wi-Fi or power saving on the device. ¦ D'habitude un Wi-Fi faible ou l'économie d'énergie de l'appareil. ¦ Normalmente un Wi-Fi débil o el ahorro de energía del dispositivo.
+Usually two devices set to the same fixed address, or a device that kept an old lease. ¦ D'habitude deux appareils réglés sur la même adresse fixe, ou un appareil qui a gardé un ancien bail. ¦ Normalmente dos dispositivos con la misma dirección fija, o uno que conservó una concesión antigua.
+Usually a VPN, a new router setting or an app with its own DNS. ¦ D'habitude un VPN, un nouveau réglage du routeur ou une application avec son propre DNS. ¦ Normalmente una VPN, un nuevo ajuste del router o una aplicación con su propio DNS.
+Usually a provider or router hiccup; sometimes an app asking for names that don't exist. ¦ D'habitude un raté du fournisseur ou du routeur ; parfois une application qui demande des noms inexistants. ¦ Normalmente un fallo del proveedor o del router; a veces una aplicación que pide nombres que no existen.
+Usually your provider's DNS being slow at the moment. ¦ D'habitude le DNS de votre fournisseur qui est lent en ce moment. ¦ Normalmente el DNS de su proveedor, lento en este momento.
+Usually browsers, VPNs or apps with their own DNS. ¦ D'habitude des navigateurs, des VPN ou des applications avec leur propre DNS. ¦ Normalmente navegadores, VPN o aplicaciones con su propio DNS.
+Usually updates, cloud sync or peer-to-peer apps. ¦ D'habitude des mises à jour, une synchronisation cloud ou des applications pair à pair. ¦ Normalmente actualizaciones, sincronización en la nube o aplicaciones entre pares.
+Usually browsers, games or updates opening many connections at once. ¦ D'habitude des navigateurs, des jeux ou des mises à jour qui ouvrent beaucoup de connexions à la fois. ¦ Normalmente navegadores, juegos o actualizaciones que abren muchas conexiones a la vez.
+Usually a photo backup, a video upload or a call. ¦ D'habitude une sauvegarde de photos, l'envoi d'une vidéo ou un appel. ¦ Normalmente una copia de fotos, la subida de un vídeo o una llamada.
+Usually an update, a game download or streaming. ¦ D'habitude une mise à jour, le téléchargement d'un jeu ou du streaming. ¦ Normalmente una actualización, la descarga de un juego o streaming.
+Usually a service refusing connections, a firewall or an ad-blocker. ¦ D'habitude un service qui refuse les connexions, un pare-feu ou un bloqueur de publicités. ¦ Normalmente un servicio que rechaza conexiones, un cortafuegos o un bloqueador de anuncios.
+Usually something you just enabled: file sharing, casting, a printer. ¦ D'habitude quelque chose que vous venez d'activer : partage de fichiers, diffusion, imprimante. ¦ Normalmente algo que acaba de activar: compartir archivos, enviar a la pantalla, una impresora.
+Usually older devices or simple home gear that doesn't encrypt. ¦ D'habitude des appareils anciens ou du matériel domestique simple qui ne chiffre pas. ¦ Normalmente dispositivos antiguos o equipos domésticos sencillos que no cifran.
+Usually remote-desktop or SSH you set up on purpose. ¦ D'habitude un bureau à distance ou un SSH que vous avez configuré exprès. ¦ Normalmente un escritorio remoto o SSH que configuró a propósito.
+Usually a content network or cloud service hosted abroad. ¦ D'habitude un réseau de diffusion de contenu ou un service cloud hébergé à l'étranger. ¦ Normalmente una red de contenidos o un servicio en la nube alojado en el extranjero.
+Usually a misbehaving device or a network cable loop. ¦ D'habitude un appareil qui se comporte mal ou une boucle de câble réseau. ¦ Normalmente un dispositivo que funciona mal o un bucle de cable de red.
+Usually a network scanner you ran yourself, or a device's own discovery feature. ¦ D'habitude un scanner réseau que vous avez lancé vous-même, ou la fonction de découverte d'un appareil. ¦ Normalmente un escáner de red que ejecutó usted mismo, o la función de descubrimiento de un dispositivo.
+Usually a second router, a mesh node or a shared connection (phone hotspot, VM host). ¦ D'habitude un deuxième routeur, un nœud maillé ou une connexion partagée (point d'accès du téléphone, hôte de machines virtuelles). ¦ Normalmente un segundo router, un nodo de malla o una conexión compartida (punto de acceso del teléfono, anfitrión de máquinas virtuales).
+Usually a shared server or an old list entry; sometimes a link to a site known for trouble. ¦ D'habitude un serveur partagé ou une ancienne entrée de liste ; parfois un lien vers un site connu pour poser problème. ¦ Normalmente un servidor compartido o una entrada antigua de la lista; a veces un enlace a un sitio conocido por dar problemas.
+Whether the Internet answers from here, measured passively from your own traffic. ¦ Si Internet répond d'ici, mesuré passivement à partir de votre propre trafic. ¦ Si Internet responde desde aquí, medido de forma pasiva con su propio tráfico.
+What MiniWireshark is listening to right now. ¦ Ce que MiniWireshark écoute en ce moment. ¦ Lo que MiniWireshark está escuchando ahora mismo.
+Devices that sent something in the last few minutes. ¦ Les appareils qui ont envoyé quelque chose ces dernières minutes. ¦ Dispositivos que enviaron algo en los últimos minutos.
+Every device seen, including those now offline. ¦ Tous les appareils vus, y compris ceux maintenant hors ligne. ¦ Todos los dispositivos vistos, incluidos los que ahora están desconectados.
+What is arriving from the Internet right now. ¦ Ce qui arrive d'Internet en ce moment. ¦ Lo que llega de Internet ahora mismo.
+What is leaving for the Internet right now. ¦ Ce qui part vers Internet en ce moment. ¦ Lo que sale hacia Internet ahora mismo.
+How busy the network card is. ¦ À quel point la carte réseau est occupée. ¦ Lo ocupada que está la tarjeta de red.
+How quickly names (like example.com) are answered. ¦ À quelle vitesse les noms (comme example.com) obtiennent une réponse. ¦ Con qué rapidez se responden los nombres (como example.com).
+Unusual things worth a look; none means 'hacked'. ¦ Des choses inhabituelles à regarder ; aucune ne veut dire « piraté ». ¦ Cosas inusuales que vale la pena mirar; ninguna significa «hackeado».
+The device moving the most data right now. ¦ L'appareil qui échange le plus de données en ce moment. ¦ El dispositivo que mueve más datos ahora mismo.
+The website most looked up or connected to. ¦ Le site web le plus recherché ou contacté. ¦ El sitio web más consultado o al que más se conecta.
+How long this capture has been running. ¦ Depuis combien de temps cette capture tourne. ¦ Cuánto tiempo lleva en marcha esta captura.
+website ¦ site web ¦ sitio web
+alert ¦ alerte ¦ alerta
+setting ¦ paramètre ¦ ajuste
+help ¦ aide ¦ ayuda
+recent ¦ récent ¦ reciente
+Take the tour ¦ Faire la visite ¦ Hacer el recorrido
+Skip ¦ Passer ¦ Omitir
+More detail ¦ Plus de détails ¦ Más detalles
+Less detail ¦ Moins de détails ¦ Menos detalles
+More in Help ¦ Plus dans l'aide ¦ Más en la ayuda
+No topic matches. ¦ Aucune rubrique ne correspond. ¦ Ningún tema coincide.
+Show all results ¦ Afficher tous les résultats ¦ Mostrar todos los resultados
+No matches. Tip: device:, site:, ip:, port: or alert: ¦ Aucun résultat. Astuce : device:, site:, ip:, port: ou alert: ¦ Sin resultados. Consejo: device:, site:, ip:, port: o alert:
+Rename a workspace ¦ Renommer un espace de travail ¦ Cambiar el nombre de un espacio de trabajo
+Which workspace? ¦ Quel espace de travail ? ¦ ¿Qué espacio de trabajo?
+New name: ¦ Nouveau nom : ¦ Nuevo nombre:
+Change them in Settings → Shortcuts. ¦ Modifiez-les dans Paramètres → Raccourcis. ¦ Cámbielos en Configuración → Atajos.
+Changed from default ¦ Paramètres modifiés ¦ Ajustes cambiados
+Delete a workspace ¦ Supprimer un espace de travail ¦ Eliminar un espacio de trabajo
+Delete a workspace… ¦ Supprimer un espace de travail… ¦ Eliminar un espacio de trabajo…
+Every setting you changed, each with its own Reset. ¦ Chaque paramètre que vous avez modifié, chacun avec sa propre réinitialisation. ¦ Cada ajuste que cambió, cada uno con su propio restablecimiento.
+Everything is at its default. ¦ Tout est à sa valeur par défaut. ¦ Todo está en su valor predeterminado.
+Explain inline (F1): write out what marks, states and alerts mean, right where they are ¦ Explications sur place (F1) : écrire ce que veulent dire les marques, les états et les alertes, à l'endroit même ¦ Explicar en el sitio (F1): escribir lo que significan las marcas, los estados y las alertas, justo donde están
+Rename a workspace… ¦ Renommer un espace de travail… ¦ Cambiar el nombre de un espacio de trabajo…
+Reset to default ¦ Rétablir la valeur par défaut ¦ Restablecer el valor predeterminado
+Save this view as a workspace… ¦ Enregistrer cette vue comme espace de travail… ¦ Guardar esta vista como espacio de trabajo…
+Search devices, names, MACs, IPs, vendors, websites, Internet hosts, countries, providers, alerts, timeline, settings and help — or Ctrl+K for anything. Tokens: device: site: ip: port: alert: ¦ Rechercher des appareils, noms, MAC, IP, fabricants, sites web, hôtes Internet, pays, fournisseurs, alertes, chronologie, paramètres et aide — ou Ctrl+K pour tout. Mots-clés : device: site: ip: port: alert: ¦ Buscar dispositivos, nombres, MAC, IP, fabricantes, sitios web, equipos de Internet, países, proveedores, alertas, cronología, ajustes y ayuda — o Ctrl+K para todo. Prefijos: device: site: ip: port: alert:
+Search help ¦ Rechercher dans l'aide ¦ Buscar en la ayuda
+✎  Changed from default ¦ ✎  Modifié par rapport au défaut ¦ ✎  Cambiado respecto al valor predeterminado
+Open: ¦ Ouvrir : ¦ Abrir:
+🐢  The window fell behind a few times in the last minute. If it keeps happening, Settings → Performance → Low CPU can help. A freeze report is now being kept for Help → Diagnostics → Export debug bundle. ¦ 🐢  La fenêtre a pris du retard plusieurs fois au cours de la dernière minute. Si cela continue, Paramètres → Performances → Faible CPU peut aider. Un rapport de blocage est maintenant conservé pour Aide → Diagnostics → Exporter le paquet de débogage. ¦ 🐢  La ventana se retrasó varias veces en el último minuto. Si sigue pasando, Configuración → Rendimiento → Bajo uso de CPU puede ayudar. Ahora se guarda un informe de bloqueos para Ayuda → Diagnóstico → Exportar paquete de depuración.
+Explain inline on / off ¦ Explications sur place oui / non ¦ Explicaciones en el sitio sí / no
+Shows what marks, states and alerts mean right under them (the Inspector, the selected row of a table, the Dashboard cards). Off: they stay in tooltips. The ? button in the header and F1 switch it too. ¦ Affiche ce que veulent dire les marques, les états et les alertes juste en dessous (l'inspecteur, la ligne sélectionnée d'un tableau, les cartes du tableau de bord). Désactivé : elles restent dans les infobulles. Le bouton ? de l'en-tête et F1 l'activent aussi. ¦ Muestra lo que significan las marcas, los estados y las alertas justo debajo (el inspector, la fila seleccionada de una tabla, las tarjetas del panel). Desactivado: se quedan en las descripciones emergentes. El botón ? de la cabecera y F1 también lo cambian.
+Write explanations out in place ¦ Écrire les explications sur place ¦ Escribir las explicaciones en el sitio
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -22565,6 +22837,12 @@ SETTINGS_PAGES = [
                       "websites and alerts collected so far."},
          ]},
          {"title": "Explanations", "controls": [
+             {"key": "appearance.explain_inline", "type": "bool",
+              "label": "Write explanations out in place",
+              "help": "Shows what marks, states and alerts mean right under "
+                      "them (the Inspector, the selected row of a table, "
+                      "the Dashboard cards). Off: they stay in tooltips. "
+                      "The ? button in the header and F1 switch it too."},
              {"key": "general.beginner_explanations", "type": "bool",
               "label": "Include plain-English guidance",
               "help": "Adds “what should I check?” advice to device "
@@ -23125,6 +23403,8 @@ SETTINGS_PAGES = [
               "label": "Show / hide the inspector"},
              {"key": "shortcuts.back", "type": "shortcut",
               "label": "Back to the previous view"},
+             {"key": "shortcuts.explain", "type": "shortcut",
+              "label": "Explain inline on / off"},
              {"key": "shortcuts.forward", "type": "shortcut",
               "label": "Forward again"},
              {"key": "shortcuts.group1", "type": "shortcut",
@@ -23528,6 +23808,9 @@ class SettingsWindow:
         ttk.Button(side, text="Reset all settings\u2026",
                    command=self.reset_all).pack(side="bottom", fill="x",
                                                 padx=14, pady=(0, 4))
+        ttk.Button(side, text="Changed from default",
+                   command=self.show_changed).pack(side="bottom", fill="x",
+                                                   padx=14, pady=(0, 4))
         # the page list scrolls if it still does not fit (very large text)
         nav_outer, nav = make_scrollable(side, t["side_bg"])
         nav_outer.pack(fill="both", expand=True)
@@ -23729,6 +24012,68 @@ class SettingsWindow:
             self.cfg.get("appearance.text_size", "Normal"), 1.0)
         if scale != 1.0:
             self.app._scale_explicit_fonts(self.win, scale)
+
+    def find_setting(self, key):
+        """Show one setting (Ctrl+K, header search): search its label."""
+        c = self.controls.get(key)
+        if c is None:
+            return
+        state, _text = getattr(self, "_search_placeholder",
+                               ({"on": False}, ""))
+        state["on"] = False
+        with contextlib.suppress(tk.TclError):
+            self.search_entry.configure(foreground=self.t["text_fg"])
+        self.search_var.set(translate_text(c.get("label", key)))
+
+    def _is_changed(self, key):
+        var = self.vars.get(key)
+        if var is None:
+            return False
+        d = self._default_for(key)
+        if isinstance(var, tk.BooleanVar):
+            return bool(var.get()) != bool(d)
+        return str(var.get()) != str("" if d is None else d)
+
+    def changed_keys(self):
+        return [k for k in self.controls if self._is_changed(k)]
+
+    def show_changed(self):
+        """Every setting that differs from its default, each with Reset
+        (useful when asking for help)."""
+        self.searching = True
+        self._clear_content()
+        self.title_lbl.configure(text="\u270E  Changed from default")
+        self.blurb_lbl.configure(text="Every setting you changed, each "
+                                      "with its own Reset.")
+        self._mark_nav(None)
+        keys = set(self.changed_keys())
+        found = 0
+        for page in SETTINGS_PAGES:
+            for sec in page["sections"]:
+                hits = [c for c in sec["controls"] if c.get("key") in keys]
+                if not hits:
+                    continue
+                found += len(hits)
+                self._render_section(f"{page['title']}  \u203a  "
+                                     f"{sec['title']}", [])
+                for c in hits:
+                    self._render_control(c)
+                    ttk.Button(self.content, text="Reset to default",
+                               command=lambda k=c["key"]:
+                               self._reset_key(k)).pack(anchor="e")
+        if not found:
+            tk.Label(self.content, text="Everything is at its default.",
+                     bg=self.t["tab_bg"], fg=self.t["muted_fg"],
+                     font=self.F_BASE).pack(anchor="w", pady=20)
+        self._finish_render()
+
+    def _reset_key(self, key):
+        var, d = self.vars.get(key), self._default_for(key)
+        if var is None:
+            return
+        var.set(bool(d) if isinstance(var, tk.BooleanVar) else
+                str("" if d is None else d))
+        self._on_change(key)
 
     def _on_search(self):
         state, text = getattr(self, "_search_placeholder", ({"on": False}, ""))
@@ -24506,7 +24851,7 @@ class TableKit:
     def __init__(self, tab, tree, wrap, table_id, key_of, empty_state=None,
                  default_cols=None, sort_values=None, relative=None,
                  dot_col=None, menu=None, all_keys=None, sortable=True,
-                 on_sort=None):
+                 on_sort=None, explain=None):
         app = tab.app
         self.tab, self.app, self.tree, self.wrap = tab, app, tree, wrap
         self.table_id = table_id
@@ -24520,6 +24865,7 @@ class TableKit:
         self.all_keys = all_keys
         self.sortable = sortable
         self.on_sort = on_sort
+        self.explain = explain
         self.columns = tuple(tree["columns"])
         self.col_index = {c: i for i, c in enumerate(self.columns)}
         self.titles = {c: str(tree.heading(c, "text") or "")
@@ -24544,6 +24890,8 @@ class TableKit:
         tree.bind("<ButtonPress-1>", self._press, add="+")
         tree.bind("<Configure>", lambda e: self.empty_soon(), add="+")
         tree.bind("<Map>", lambda e: self.empty_soon(), add="+")
+        tree.bind("<<TreeviewSelect>>", lambda e: self.update_explain(),
+                  add="+")
         tree.bind("<ButtonRelease-1>", self._release, add="+")
         if self.relative:
             tree.bind("<Motion>", self._motion, add="+")
@@ -24879,6 +25227,10 @@ class TableKit:
         self.fresh_lbl = tk.Label(self.wrap, text="", bg=t["tab_bg"],
                                   fg=t["muted_fg"], anchor="w",
                                   font=mw_font(9))
+        self.explain_lbl = tk.Label(self.wrap, text="", bg=t["tab_bg"],
+                                    fg=t["accent"], anchor="w",
+                                    justify="left", font=mw_font(9),
+                                    wraplength=1100)
 
     def on_theme(self):
         t = self.app.theme
@@ -24887,6 +25239,7 @@ class TableKit:
             self.empty_lbl.configure(bg=t["tab_bg"], fg=t["muted_fg"])
             self.stale_lbl.configure(bg=t["tab_bg"], fg=t["accent"])
             self.fresh_lbl.configure(bg=t["tab_bg"], fg=t["muted_fg"])
+            self.explain_lbl.configure(bg=t["tab_bg"], fg=t["accent"])
 
     def _set_stale(self, on):
         self.stale = on
@@ -24896,6 +25249,34 @@ class TableKit:
                                     sticky="ew", padx=4)
             elif not on and self.stale_lbl.winfo_manager():
                 self.stale_lbl.grid_forget()
+
+    def update_explain(self):
+        """Explain inline: one line under the table about the selected row
+        (never a line per row)."""
+        text = ""
+        if self.explain is not None and self.app.explain_on():
+            with contextlib.suppress(tk.TclError):
+                sel = self.tree.selection()
+                key = self.key_of(sel[0]) if sel else None
+                if key is not None:
+                    try:
+                        text = self.explain(key) or ""
+                    except Exception:                # noqa: BLE001
+                        text = ""
+        with contextlib.suppress(tk.TclError):
+            if text:
+                self.explain_lbl.configure(text=text)
+                if not self.explain_lbl.winfo_manager():
+                    self.explain_lbl.grid(row=4, column=0, columnspan=2,
+                                          sticky="ew", padx=4, pady=(2, 0))
+            elif self.explain_lbl.winfo_manager():
+                self.explain_lbl.grid_forget()
+
+    def explain_text(self):
+        with contextlib.suppress(tk.TclError):
+            if self.explain_lbl.winfo_manager():
+                return str(self.explain_lbl.cget("text"))
+        return ""
 
     def empty_soon(self):
         if self._empty_job is None:
@@ -25495,6 +25876,14 @@ class DetailDialog:
         self.txt.tag_configure("h", font=mw_font(11, "bold"),
                                spacing1=6, spacing3=3)
         self.txt.tag_configure("muted", foreground=t["muted_fg"])
+        self.txt.tag_configure("fold", foreground=t["accent"],
+                               spacing1=4, spacing3=8)
+        self.txt.tag_bind("fold", "<Button-1>", lambda e: self.toggle_fold())
+        self.txt.tag_bind("fold", "<Enter>",
+                          lambda e: self.txt.configure(cursor="hand2"))
+        self.txt.tag_bind("fold", "<Leave>",
+                          lambda e: self.txt.configure(cursor=""))
+        self.fold_kind = None
         self.set_sections(sections)
         self.btns = tk.Frame(self.win, bg=t["tab_bg"], padx=8, pady=8)
         self.btns.pack(fill="x")
@@ -25519,9 +25908,25 @@ class DetailDialog:
             y = 0.0
         self.txt.config(state="normal")
         self.txt.delete("1.0", "end")
-        for heading, text in sections:
+        kind = getattr(self, "fold_kind", None)
+        keep = len(sections)
+        if kind and len(sections) > self.FOLD_KEEP + 1:
+            keep = self.FOLD_KEEP
+        self.folded = keep < len(sections) and self.app.fold_closed(kind)
+        for i, (heading, text) in enumerate(sections):
+            if i == keep:
+                more = len(sections) - keep
+                self.txt.insert("end", ("\u25B8 " + translate_text(
+                    "More detail") + f" ({more})") if self.folded else
+                    ("\u25BE " + translate_text("Less detail")) + "",
+                    ("fold",))
+                self.txt.insert("end", "\n")
+                if self.folded:
+                    break
             self.txt.insert("end", translate_text(heading) + "\n", ("h",))
             self.txt.insert("end", translate_lines(text or "—") + "\n\n")
+        with contextlib.suppress(Exception):
+            gloss_mark(self.txt, self.app)
         self.txt.config(state="disabled")
         if y:
             with contextlib.suppress(tk.TclError):
@@ -25532,6 +25937,15 @@ class DetailDialog:
             return bool(self.win.winfo_exists())
         except tk.TclError:
             return False
+
+    FOLD_KEEP = 3
+
+    def toggle_fold(self):
+        kind = getattr(self, "fold_kind", None)
+        if not kind:
+            return
+        self.app.set_fold(kind, not self.folded)
+        self.set_sections(self.sections)
 
     def copy(self):
         title = self.win.title()
@@ -25874,6 +26288,8 @@ class BaseTab:
                 sel = tree.selection()
                 st["sel"] = kit.key_of(sel[0]) if sel else None
                 st["y"] = tree.yview()[0]
+            st["sort"] = [kit.sort_col, kit.sort_desc]
+            st["cols"] = list(kit.shown_cols())
         return st
 
     def apply_view_state(self, st):
@@ -25892,6 +26308,14 @@ class BaseTab:
         tree = getattr(self, "tree", None)
         if kit is None or tree is None:
             return
+        if st.get("cols") and list(st["cols"]) != list(kit.shown_cols()):
+            kit._cols_override = list(st["cols"])
+            kit.apply_columns()
+        srt = st.get("sort")
+        if isinstance(srt, list) and len(srt) == 2 and \
+                (srt[0], bool(srt[1])) != (kit.sort_col, kit.sort_desc):
+            kit.sort_col, kit.sort_desc = srt[0], bool(srt[1])
+            kit.resort()
         want = st.get("sel")
         if want is not None:
             for iid in kit.all_iids():
@@ -26055,6 +26479,9 @@ class Inspector:
                                    underline=True)
             self.txt.tag_configure("warn", foreground=t["warn_fg"])
             self.txt.tag_configure("good", foreground=t["good_fg"])
+            self.txt.tag_configure("explain", foreground=t["accent"],
+                                   font=mw_font(9), lmargin1=18,
+                                   lmargin2=18)
 
     def _begin(self, title):
         self.title_var.set(title)
@@ -26065,6 +26492,8 @@ class Inspector:
                 self.txt.tag_delete(tag)
 
     def _end(self):
+        with contextlib.suppress(Exception):
+            gloss_mark(self.txt, self.app)
         self.txt.configure(state="disabled")
 
     def _w(self, text, *tags):
@@ -26085,6 +26514,11 @@ class Inspector:
         self._w(f"{value}\n")
         if why:
             self._w(f"   {why}\n", "muted")
+        if self.app.explain_on():
+            self._w(f"   {LEVEL_GLYPH.get(level, '?')} "
+                    f"{translate_text(LEVEL_WORD.get(level, 'Unknown'))}: "
+                    f"{translate_text(explain('level', level))}\n",
+                    "explain")
 
     def _chips(self, obs, limit=5):
         obs = [o for o in obs if o[5]][-limit:]
@@ -26324,6 +26758,22 @@ class DashboardTab(BaseTab):
     )
     RANGES = {"Last 5 minutes": (1, 300), "Last hour": (10, 360),
               "Last 24 hours": (60, 1440)}
+    # Explain inline: one grey line under each card title
+    CARD_EXPLAIN = {
+        "internet": "Whether the Internet answers from here, measured "
+                    "passively from your own traffic.",
+        "capture": "What MiniWireshark is listening to right now.",
+        "active": "Devices that sent something in the last few minutes.",
+        "known": "Every device seen, including those now offline.",
+        "down": "What is arriving from the Internet right now.",
+        "up": "What is leaving for the Internet right now.",
+        "pps": "How busy the network card is.",
+        "dns": "How quickly names (like example.com) are answered.",
+        "alerts": "Unusual things worth a look; none means 'hacked'.",
+        "topdev": "The device moving the most data right now.",
+        "topsite": "The website most looked up or connected to.",
+        "duration": "How long this capture has been running.",
+    }
 
     def build(self):
         # scrolls on a short screen (the second row of cards was cut off
@@ -26396,6 +26846,11 @@ class DashboardTab(BaseTab):
                           font=mw_font(8, "bold"), anchor="w",
                           justify="left", wraplength=170)
             tl.pack(anchor="w")
+            ex = tk.Label(card, text=self.CARD_EXPLAIN.get(key, ""),
+                          bg="#f6f7fa", fg="#666666", font=mw_font(8),
+                          anchor="w", justify="left", wraplength=170)
+            self.explain_lbls = getattr(self, "explain_lbls", [])
+            self.explain_lbls.append((ex, tl))
             v = DisplayVar(value="—")
             vl = tk.Label(card, textvariable=v, bg="#f6f7fa", fg="#222222",
                           font=mw_font(12, "bold"), justify="left",
@@ -26409,12 +26864,21 @@ class DashboardTab(BaseTab):
         for c in range(6):
             grid.columnconfigure(c, weight=1, uniform="card")
         grid.bind("<Configure>", self._reflow_cards, add="+")
+        self.show_explain(self.app.explain_on())
         self.canvas = tk.Canvas(outer, bg=WHITE, highlightthickness=0,
                                 height=140)
         self.canvas.pack(fill="both", expand=True, pady=(10, 0))
         self.canvas.bind("<Configure>", lambda e: self.refresh(force=True))
         self.canvas.bind("<Button-1>", self._on_chart_click)
         self._click_items = {}
+
+    def show_explain(self, on):
+        for ex, tl in getattr(self, "explain_lbls", ()):
+            with contextlib.suppress(tk.TclError):
+                if on and not ex.winfo_manager():
+                    ex.pack(anchor="w", after=tl)
+                elif not on and ex.winfo_manager():
+                    ex.pack_forget()
 
     def _fit_charts(self, e):
         try:
@@ -26610,6 +27074,7 @@ class FeedTab(BaseTab):
             side="left")
         self.q_var = tk.StringVar()
         qe = ttk.Entry(ctrl, textvariable=self.q_var, width=14)
+        self.filter_entry = qe
         qe.pack(side="left", padx=(4, 0))
         self._filter_soon = debounce(self.frame, self.refilter, 150)
         qe.bind("<KeyRelease>", lambda e: self._filter_soon())
@@ -26824,6 +27289,7 @@ class TimelineTab(BaseTab):
         self.search_var = tk.StringVar()
         self.lbl(bar, "Search:").pack(side="left")
         e = ttk.Entry(bar, textvariable=self.search_var, width=18)
+        self.filter_entry = e
         e.pack(side="left", padx=(4, 10))
         e.bind("<KeyRelease>", lambda ev: self._schedule_rebuild())
         self.type_var = tk.StringVar(value="All types")
@@ -27189,6 +27655,7 @@ class DevicesTab(BaseTab):
         self.lbl(bar, "   Filter:").pack(side="left")
         self.filter_var = tk.StringVar()
         fe = ttk.Entry(bar, textvariable=self.filter_var, width=18)
+        self.filter_entry = fe
         fe.pack(side="left", padx=4)
         # 5.1.2: the table follows 150 ms after the last key, not on each
         self._filter_soon = debounce(self.frame, self.rebuild, 150)
@@ -27216,8 +27683,19 @@ class DevicesTab(BaseTab):
                 "packets": lambda k: dev(k, lambda d: d.packets)},
             relative={"last": lambda k: dev(k, lambda d: d.last_seen)},
             dot_col="name", menu=self.menu_spec,
-            all_keys=lambda: list(self.model.registry.by_key))
+            all_keys=lambda: list(self.model.registry.by_key),
+            explain=self.explain_row)
         self.apply_mode()
+
+    def explain_row(self, key):
+        d = self.model.registry.by_key.get(key)
+        if d is None:
+            return ""
+        tr_ = translate_text
+        return (f"{tr_(d.confidence)} {tr_('confidence')}: "
+                f"{tr_(explain('confidence', d.confidence))}   ·   "
+                f"{tr_(explain('state', d.state, long=False))}: "
+                f"{tr_(explain('state', d.state))}")
 
     def _dev(self, key, fn):
         d = self.model.registry.by_key.get(key)
@@ -27459,6 +27937,7 @@ class WebsitesTab(BaseTab):
         self.lbl(bar, "Search:").pack(side="left")
         self.q_var = tk.StringVar()
         e = ttk.Entry(bar, textvariable=self.q_var, width=16)
+        self.filter_entry = e
         e.pack(side="left", padx=(4, 8))
         e.bind("<KeyRelease>", lambda ev: self.schedule())
         self.dev_var = tk.StringVar(value="All devices")
@@ -27506,11 +27985,22 @@ class WebsitesTab(BaseTab):
                          "hits": lambda k: self._site_num(k, "requests"),
                          "first": lambda k: self._site_num(k, "first_seen")},
             relative={"last": self._site_last}, dot_col="#0",
-            menu=self.menu_spec, all_keys=self._all_keys)
+            menu=self.menu_spec, all_keys=self._all_keys,
+            explain=self.explain_row)
         self._job = None
         self._dirty = False
         self.count_lbl = self.lbl(bar, "", muted=True)
         self.count_lbl.pack(side="right")
+
+    def explain_row(self, key):
+        kind, dom = key
+        w = self.model.websites.get(dom)
+        if w is None:
+            return ""
+        lv = ASSOC_LEVEL.get(w.best_assoc, LV_UNKNOWN)
+        return (f"{translate_text(ASSOC_TEXT.get(w.best_assoc, 'unknown'))}"
+                f" — {translate_text(explain('level', lv))}  "
+                f"{translate_text('A lookup alone does not prove a visit.')}")
 
     def _combo(self, bar, label, var, values, width):
         self.lbl(bar, label).pack(side="left")
@@ -27871,6 +28361,7 @@ class ConnectionsTab(BaseTab):
         self.lbl(bar, "Search:").pack(side="left")
         self.q_var = tk.StringVar()
         e = ttk.Entry(bar, textvariable=self.q_var, width=16)
+        self.filter_entry = e
         e.pack(side="left", padx=(4, 8))
         self._filter_soon = debounce(self.frame, self.rebuild, 150)
         e.bind("<KeyRelease>", lambda ev: self._filter_soon())
@@ -28479,6 +28970,7 @@ class RemoteTab(BaseTab):
         self.lbl(geo, "   Search:").pack(side="left")
         self.q_var = tk.StringVar()
         e = ttk.Entry(geo, textvariable=self.q_var, width=16)
+        self.filter_entry = e
         e.pack(side="left", padx=4)
         self._filter_soon = debounce(self.frame, self.rebuild, 150)
         e.bind("<KeyRelease>", lambda ev: self._filter_soon())
@@ -28677,6 +29169,7 @@ class AlertsTab(BaseTab):
         self.lbl(bar, "  Search:").pack(side="left")
         self.q_var = tk.StringVar()
         qe = ttk.Entry(bar, textvariable=self.q_var, width=14)
+        self.filter_entry = qe
         qe.pack(side="left", padx=4)
         self._filter_soon = debounce(self.frame, self.rebuild, 150)
         qe.bind("<KeyRelease>", lambda e: self._filter_soon())
@@ -28718,8 +29211,21 @@ class AlertsTab(BaseTab):
             relative={"when": lambda k: alert(
                 k, lambda a: a.last_seen or a.when)},
             dot_col="reason", menu=self.menu_spec,
-            all_keys=lambda: list(self.model.alerts.alerts))
+            all_keys=lambda: list(self.model.alerts.alerts),
+            explain=self.explain_row)
         self.on_theme()
+
+    def explain_row(self, aid):
+        a = self.model.alerts.alerts.get(aid)
+        if a is None:
+            return ""
+        tr_ = translate_text
+        means = tr_(explain("alert", a.kind))
+        steps = ALERT_CHECKLIST.get(a.kind) or []
+        out = f"{tr_('What it usually means:')} {means}" if means else ""
+        if steps:
+            out += f"\n{tr_('What to check:')} {tr_(steps[0])}"
+        return out
 
     def _alert(self, aid, fn):
         a = self.model.alerts.alerts.get(aid)
@@ -31018,6 +31524,7 @@ class PacketsTab(BaseTab):
         self.lbl(self.adv_row, "Expression:").pack(side="left")
         self.expr_var = tk.StringVar()
         ee = ttk.Entry(self.adv_row, textvariable=self.expr_var, width=46)
+        self.filter_entry = ee
         # stretches with the window (and gives way on a narrow one)
         ee.pack(side="left", padx=(4, 6), fill="x", expand=True)
         ee.bind("<Return>", lambda e: self.apply())
@@ -33424,6 +33931,317 @@ class SourcesTab(BaseTab):
 
 
 # ---- Help --------------------------------------------------------------------
+# ---- Help topics (5.1.2 F7) ----------------------------------------------------
+# Every topic: title, group, body (text, or a function of the app for the
+# ones that show your own settings), and Show me links (label, tab, widget
+# attribute). A Show me with tab "do" calls the app method named, "tour"
+# runs a tour. The 5.0.2 Help text is inside these topics word for word.
+HELP_PRIVACY = (
+    "MiniWireshark processes captured network information "
+    "locally on this computer unless you explicitly export it. "
+    "It never uploads packet contents, browsing history, MAC "
+    "addresses or your local IP addresses, has no telemetry, "
+    "accounts or cloud sync. Optional online features (country "
+    "lookup, reference-data downloads, update checks) are "
+    "listed in Settings → Privacy with exactly what each "
+    "one sends.")
+HELP_NEVER = (
+    "It is a visibility and defensive-monitoring tool. It never "
+    "intercepts passwords, decrypts HTTPS, poisons ARP/DNS, "
+    "injects attack traffic, deauthenticates Wi-Fi clients or "
+    "scans beyond your own directly-connected network. Active "
+    "Scanning only sends standard discovery messages (ARP, "
+    "mDNS, SSDP) on your own LAN, and the banner at the top "
+    "always tells you whether it is on.")
+
+HELP_TAB_TEXT = (
+    ("Dashboard tab", "dash", "card_grid",
+     "The cards show what's happening right now. The two big cards say "
+     "what this computer can see from where it is, and what changed in "
+     "the last hour. Click any card to open the tab behind it."),
+    ("Live feed tab", "feed", "tree",
+     "Everything as it happens, newest first, in plain words. Moving the "
+     "pointer over the list pauses it so a line doesn't run away while "
+     "you read it; move away (or press Jump to now) to resume."),
+    ("Timeline tab", "timeline", "tree",
+     "The history of the session: devices arriving and leaving, sites "
+     "visited, alerts raised. Filter by type, severity, device or text; "
+     "older days come from the history database."),
+    ("Devices tab", "devices", "tree",
+     "Every device seen on your network, with how sure MiniWireshark is "
+     "of each fact. Double-click for its card; right-click to rename it, "
+     "mark it as yours or merge two entries that are the same device."),
+    ("Websites tab", "websites", "tree",
+     "The websites devices looked up or connected to, with the category, "
+     "whether the connection was encrypted and the evidence mark that "
+     "says how MiniWireshark knows."),
+    ("Connections tab", "connections", "tree",
+     "(Advanced view.) Every conversation between two addresses: who, to "
+     "where, which protocol, how much. Group them by device, protocol or "
+     "status from the Group by box."),
+    ("Internet hosts tab", "remote", "tree",
+     "(Advanced view.) The far ends of connections on the Internet, with "
+     "country and provider when the optional lookup is on. A host is not "
+     "a website: one website often uses many hosts and the other way "
+     "round."),
+    ("Alerts tab", "alerts", "tree",
+     "Unusual things worth a look, each with innocent explanations and "
+     "what to check. Acknowledge one when you've looked; mute a kind "
+     "you don't want to hear about."),
+    ("Map tab", "map", None,
+     "Where connections go, drawn by country, and how the devices on your "
+     "network connect to each other."),
+    ("Health tab", "health", None,
+     "Checks on your network (gateway, DNS, Wi-Fi, address conflicts) "
+     "and on MiniWireshark itself, each with what it means and what to "
+     "do."),
+    ("Security tab", "security", None,
+     "Plain-language checks: unencrypted logins, old protocols, devices "
+     "that expose services, and where your privacy settings stand."),
+    ("Sources tab", "sources", "tree",
+     "(Advanced view.) Where the data comes from: the capture card, files, "
+     "the LAN scanner and optional connectors, and how much each one has "
+     "delivered."),
+    ("Packets tab", "packets", "tree",
+     "(Advanced view.) The packets themselves, with filter expressions "
+     "such as proto:dns, port:443 or device:@name. Proof chips (#123) "
+     "everywhere else open the packet here."),
+)
+
+HELP_USING = (
+    ("Search and Ctrl+K",
+     "The search box at the top lists matches as you type: devices, "
+     "websites, Internet hosts, connections, alerts, timeline, settings "
+     "and Help. Down enters the list, Enter opens, Escape closes. Tokens "
+     "narrow it: device:, site:, ip:, port:, alert:.\n\nCtrl+K opens "
+     "the command palette: every action, device, website, open alert, "
+     "setting and Help topic, with the ones you used lately first and "
+     "each action's shortcut shown. Ctrl+F jumps to the shown tab's own "
+     "filter box.", (("The search box", "app", "search_entry"),)),
+    ("Back and forward",
+     "Alt+Left and Alt+Right (or the mouse's side buttons, or ◀ ▶ next "
+     "to the tabs) go back and forward through the views you visited — "
+     "the tab with its filter, selection and scroll position.",
+     (("The tabs", "app", "tabstrip.frame"),)),
+    ("Tables",
+     "Click a heading to sort; click again to reverse. Right-click a "
+     "heading for the columns, Reset columns and Export this table…; "
+     "right-click a row to copy a cell or the row, filter to it or show "
+     "its packets. New rows are marked • for a while. When a selected "
+     "row would move, it stays put and a Re-sort line appears.",
+     (("A table", "devices", "tree"),)),
+    ("Workspaces",
+     "A workspace remembers a view: the tab, its filter, sort, columns "
+     "and selection. Session → Workspaces opens one, saves the current "
+     "view, renames or deletes yours.", ()),
+    ("Explanations (the ? button)",
+     "The ? button at the top right (F1, or Settings → General → "
+     "Explanations) adds a short explanation under each fact in the "
+     "Inspector and cards, under the table for the selected row, and "
+     "under each Dashboard card. Off by default.",
+     (("The ? button", "app", "explain_btn"),)),
+    ("Messages",
+     "Short messages appear in the line under the header and go away "
+     "after a while; warnings stay until closed. The ✉ button in the "
+     "status bar keeps the last 50.", (("Messages", "app", "msg_btn"),)),
+    ("Troubleshooting",
+     "Nothing appears: check the network card at the top, and that "
+     "watching is started. On Windows, Npcap must be installed; on Linux "
+     "and macOS capturing needs permission. Help → MiniWireshark health → "
+     "Diagnostics checks all of this and says what to do; Repair fixes "
+     "the program's own files; the debug bundle (masked by default) is "
+     "what to attach when asking for help.",
+     (("Diagnostics", "do", "open_diagnostics"),)),
+    ("Kill switch",
+     "Settings → Privacy → Kill switch stops every optional network "
+     "request MiniWireshark makes (country lookup, downloads, update "
+     "checks). Watching continues, and nothing else changes.", ()),
+)
+
+# glossary notes: a word in a text -> its glossary topic (acronyms read
+# the same in all three languages)
+GLOSS_TERMS = OrderedDict((
+    ("MAC", "MAC address"), ("ARP", "ARP"), ("DHCP", "DHCP"),
+    ("mDNS", "mDNS / SSDP"), ("SSDP", "mDNS / SSDP"), ("DNS", "DNS"),
+    ("VPN", "VPNs"),
+))
+
+
+def _glossary_def(title):
+    for term, defn in GLOSSARY:
+        if term == title:
+            return defn
+    return ""
+
+
+def help_topics():
+    """[topic dict]; built once."""
+    cached = globals().get("_HELP_TOPICS")
+    if cached is not None:
+        return cached
+    out = []
+
+    def add(title, group, body, show=(), terms=""):
+        out.append({"title": title, "group": group, "body": body,
+                    "show": tuple(show), "terms": terms})
+    g = "Getting started"
+    qs = {step[0]: step for step in QUICK_START}
+    add("Start here", g, qs["The Dashboard"][1] + "\n\nThe Quick Start "
+        "Guide walks through five steps with Show me buttons. Demo Mode "
+        "fills every tab with clearly labelled sample data, apart from "
+        "your real session.",
+        (("The Dashboard", "dash", "card_grid"),
+         ("Quick Start Guide", "do", "open_quick_start")), "welcome begin")
+    add("Devices and the Inspector", g, qs["Devices and the Inspector"][1],
+        (("The device list", "devices", "tree"),), "inspector f2")
+
+    def levels(_app):
+        lines = [qs["Evidence marks"][1], ""]
+        for lv in (LV_OBSERVED, LV_REPORTED, LV_CORRELATED, LV_INFERRED,
+                   LV_UNKNOWN):
+            lines.append(f"{LEVEL_GLYPH[lv]} {LEVEL_WORD[lv]} — "
+                         f"{LEVEL_HELP[lv]}")
+        return "\n".join(lines)
+    add("Evidence marks", g, levels,
+        (("How we know column", "websites", "tree"),),
+        "observed correlated inferred unknown reported proof")
+    add("Quiet and Active", g, qs["Quiet and Active"][1] + "\n\n" +
+        _glossary_def("Quiet Mode vs. Active Scanning"),
+        (("The state line", "app", "mode_banner"),), "scanning probes")
+    add("Full Power", g, "Full Power follows each connection in more "
+        "depth (packet details, mail sessions, deeper checks) and uses "
+        "more memory and processor time. It is a performance setting, "
+        "not a privacy switch: MiniWireshark still never decrypts HTTPS "
+        "or reads passwords. Turn it on in Settings → Performance or "
+        "from the state line.",
+        (("The state line", "app", "mode_banner"),), "performance deep")
+    add("What this computer can see", g, "From one computer, "
+        "MiniWireshark sees its own traffic plus what the network sends "
+        "to everyone (discovery, ARP, DHCP, broadcast names). On Wi-Fi it "
+        "usually cannot see other devices' private traffic; on a "
+        "mirrored switch port it can. The Dashboard card “What can I see "
+        "from here?” explains your setup.\n\n" +
+        _glossary_def("Why some information may be missing"),
+        (("The Dashboard", "dash", "card_grid"),), "visibility wifi")
+    add("Alerts", g, qs["Alerts"][1],
+        (("The alert list", "alerts", "tree"),), "warning")
+    add("Tours", g, "Three short tours, each offered once when it first "
+        "applies. You can take them again here.",
+        tuple((TOURS[k][0], "tour", k) for k in TOURS), "tour")
+    for title, tab, attr, body in HELP_TAB_TEXT:
+        add(title, "The tabs", body, ((title, tab, attr),))
+    add("Privacy", "Privacy and safety", HELP_PRIVACY,
+        (("Settings → Privacy", "do", "open_privacy_settings"),),
+        "telemetry upload")
+    add("What MiniWireshark will never do", "Privacy and safety",
+        HELP_NEVER, (), "safety never")
+    for title, body, show in HELP_USING:
+        add(title, "Using MiniWireshark", body, show)
+
+    def keymap(app):
+        cur = app.config.get("shortcuts", {}) or {}
+        lines = []
+        for page in SETTINGS_PAGES:
+            for sec in page["sections"]:
+                for c in sec["controls"]:
+                    if c.get("type") != "shortcut":
+                        continue
+                    name = c["key"].split(".", 1)[1]
+                    seq = cur.get(name) or DEFAULT_SHORTCUTS.get(name, "")
+                    lines.append(f"{translate_text(c.get('label', name))}"
+                                 f"  —  {_pretty_seq(seq) if seq else '—'}")
+        lines.append("")
+        lines.append("Change them in Settings → Shortcuts.")
+        return "\n".join(lines)
+    add("Keyboard map", "Using MiniWireshark", keymap, (),
+        "shortcuts keys")
+    for term, defn in sorted(GLOSSARY, key=lambda x: x[0].lower()):
+        add(term, "Glossary A–Z", defn, (), "glossary")
+    add("Files", "About", lambda _app: f"Program: {SCRIPT_PATH}\nData "
+        f"folder: {PATHS.data}\nLog: {PATHS.log_file}",
+        (("Open data folder", "do", "open_data_folder"),), "folder log")
+    globals()["_HELP_TOPICS"] = out
+    return out
+
+
+def help_body(topic, app):
+    b = topic["body"]
+    return b(app) if callable(b) else b
+
+
+TOURS = OrderedDict((
+    ("device", ("Find out what a device is",
+                "You opened a device. A 1-minute tour shows how to find "
+                "out what it is.", (
+        ("The card", "Every fact MiniWireshark has about the device, each "
+         "with its evidence mark: ◉ seen in a packet, ◌ a reasonable "
+         "guess.", "devices", "tree"),
+        ("Name it", "Right-click it → Rename, or mark it as yours. Names "
+         "stay on this computer.", "devices", "tree"),
+        ("The Inspector", "Press F2: the Inspector shows each claim and "
+         "the packets that prove it.", "devices", "tree"),
+        ("Still not sure?", "Unknown means not seen either way. Leave it "
+         "running a while: phones, TVs and printers announce themselves "
+         "(mDNS, SSDP, DHCP).", "devices", "filter_entry")))),
+    ("alert", ("Something looks wrong",
+               "A warning was raised. A 1-minute tour shows how to read "
+               "it.", (
+        ("Read the reason", "Each alert says what was seen, in one line. "
+         "It means “worth a look”, never “hacked”.", "alerts", "tree"),
+        ("What it usually means", "The ? button (F1) adds what this kind "
+         "usually means and what to check, under the list.",
+         "app", "explain_btn"),
+        ("Check, then decide", "Open it for innocent explanations and the "
+         "packets behind it. Acknowledge it when you've looked, or mute "
+         "the kind.", "alerts", "tree")))),
+    ("inside", ("See inside a connection",
+                "Full Power is on. A 1-minute tour shows what it adds.", (
+        ("Full Power", "Each connection is followed in more depth. It "
+         "never decrypts HTTPS or reads passwords.", "app", "mode_banner"),
+        ("Connections", "Every conversation, who to where; double-click "
+         "one for its details.", "connections", "tree"),
+        ("Packets", "The packets themselves, with filter expressions; "
+         "proof chips elsewhere open them here.", "packets", "tree")))),
+))
+
+
+def gloss_mark(txt, app, start="1.0"):
+    """Underline the first use of each glossary word in a Text; a click
+    shows a short note with More in Help."""
+    t = app.theme
+    try:
+        txt.tag_configure("gloss", underline=True)
+        with contextlib.suppress(tk.TclError):
+            txt.tag_configure("gloss", underlinefg=t["muted_fg"])
+    except tk.TclError:
+        return 0
+    n = 0
+    for word, title in GLOSS_TERMS.items():
+        tag = "gl_" + word
+        with contextlib.suppress(tk.TclError):
+            txt.tag_remove(tag, "1.0", "end")
+            idx = txt.search(r"\m" + word + r"\M", start, "end",
+                             regexp=True)
+            if not idx:
+                continue
+            end = f"{idx}+{len(word)}c"
+            txt.tag_add("gloss", idx, end)
+            txt.tag_add(tag, idx, end)
+            if not getattr(txt, "_mw_gloss_bound", None) or \
+                    tag not in txt._mw_gloss_bound:
+                txt.tag_bind(tag, "<Button-1>", lambda e, tt=title:
+                             app.gloss_note(txt, tt, e))
+                txt.tag_bind(tag, "<Enter>",
+                             lambda e: txt.configure(cursor="hand2"))
+                txt.tag_bind(tag, "<Leave>",
+                             lambda e: txt.configure(cursor=""))
+                bound = getattr(txt, "_mw_gloss_bound", None) or set()
+                bound.add(tag)
+                txt._mw_gloss_bound = bound
+            n += 1
+    return n
+
+
 class HelpTab(BaseTab):
     name, label_key = "help", "tab_about"
 
@@ -33454,41 +34272,142 @@ class HelpTab(BaseTab):
                                                                 padx=6)
         ttk.Button(bar, text="Open logs",
                    command=lambda: _open_path(PATHS.logs)).pack(side="left")
-        txt = tk.Text(outer, wrap="word", bg="#fbfbfb", fg="#222222",
-                      relief="flat", padx=14, pady=12,
+        body = tk.Frame(outer, bg=WHITE)
+        body.pack(fill="both", expand=True)
+        left = tk.Frame(body, bg=WHITE, width=262)
+        left.pack(side="left", fill="y")
+        left.pack_propagate(False)
+        tk.Label(left, text="Search help", bg=WHITE, fg="#666666",
+                 anchor="w").pack(fill="x")
+        self.q_var = tk.StringVar()
+        qe = ttk.Entry(left, textvariable=self.q_var)
+        qe.pack(fill="x", pady=(2, 6))
+        self.filter_entry = qe
+        soon = debounce(qe, self.refill, 150)
+        qe.bind("<KeyRelease>", lambda e: soon())
+        qe.bind("<Return>", lambda e: self._open_first())
+        lw = tk.Frame(left, bg=WHITE)
+        lw.pack(fill="both", expand=True)
+        self.lb = tk.Listbox(lw, activestyle="none", highlightthickness=0,
+                             relief="flat", exportselection=False,
+                             bg="#f6f7fa", fg="#222222",
+                             selectbackground="#0b5394",
+                             selectforeground="#ffffff")
+        lvs = ttk.Scrollbar(lw, orient="vertical", command=self.lb.yview)
+        self.lb.configure(yscrollcommand=lvs.set)
+        self.lb.pack(side="left", fill="both", expand=True)
+        lvs.pack(side="right", fill="y")
+        self.lb.bind("<<ListboxSelect>>", self._picked)
+        right = tk.Frame(body, bg=WHITE)
+        right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+        txt = tk.Text(right, wrap="word", bg="#fbfbfb", fg="#222222",
+                      relief="flat", padx=14, pady=12, cursor="arrow",
                       font=mw_font(10), highlightthickness=0)
-        vs = ttk.Scrollbar(outer, orient="vertical", command=txt.yview)
+        vs = ttk.Scrollbar(right, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vs.set)
         txt.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
         txt.tag_configure("h", font=mw_font(12, "bold"),
                           foreground="#2b3a56", spacing1=8, spacing3=3)
-        for term, defn in GLOSSARY:
-            txt.insert("end", term + "\n", ("h",))
-            txt.insert("end", defn + "\n\n")
-        txt.insert("end", "Privacy\n", ("h",))
-        txt.insert("end",
-                   "MiniWireshark processes captured network information "
-                   "locally on this computer unless you explicitly export it. "
-                   "It never uploads packet contents, browsing history, MAC "
-                   "addresses or your local IP addresses, has no telemetry, "
-                   "accounts or cloud sync. Optional online features (country "
-                   "lookup, reference-data downloads, update checks) are "
-                   "listed in Settings → Privacy with exactly what each "
-                   "one sends.\n\n")
-        txt.insert("end", "What MiniWireshark will never do\n", ("h",))
-        txt.insert("end",
-                   "It is a visibility and defensive-monitoring tool. It never "
-                   "intercepts passwords, decrypts HTTPS, poisons ARP/DNS, "
-                   "injects attack traffic, deauthenticates Wi-Fi clients or "
-                   "scans beyond your own directly-connected network. Active "
-                   "Scanning only sends standard discovery messages (ARP, "
-                   "mDNS, SSDP) on your own LAN, and the banner at the top "
-                   "always tells you whether it is on.\n\n")
-        txt.insert("end", "Files\n", ("h",))
-        txt.insert("end", f"Program: {SCRIPT_PATH}\nData folder: "
-                          f"{PATHS.data}\nLog: {PATHS.log_file}\n")
+        txt.tag_configure("h1", font=mw_font(14, "bold"),
+                          foreground="#2b3a56", spacing3=6)
+        txt.tag_configure("show", foreground="#0b5394", underline=True,
+                          spacing1=4)
+        txt.tag_configure("muted", foreground="#666666")
+        self.txt = txt
+        self.rows = []              # listbox row -> topic or None
+        self.topic = None
+        self._links = 0
+        self.refill()
+        self.open_topic("Start here")
+
+    # ---- the list
+    def refill(self):
+        q = self.q_var.get().strip()
+        topics = help_topics()
+        self.lb.delete(0, "end")
+        self.rows = []
+        if q:
+            by = {tp["title"]: tp for tp in topics}
+            hits = [by[t] for t in self.app.help_matches(q)]
+            for tp in hits:
+                self.lb.insert("end", "  " + translate_text(tp["title"]))
+                self.rows.append(tp)
+            if not hits:
+                self.lb.insert("end", translate_text("No topic matches."))
+                self.lb.itemconfigure(0, foreground="#888888")
+                self.rows.append(None)
+            return
+        group = None
+        for tp in topics:
+            if tp["group"] != group:
+                group = tp["group"]
+                self.lb.insert("end", translate_text(group).upper())
+                self.lb.itemconfigure("end", foreground="#888888")
+                self.rows.append(None)
+            self.lb.insert("end", "  " + translate_text(tp["title"]))
+            self.rows.append(tp)
+        self._mark_current()
+
+    def shown_titles(self):
+        return [tp["title"] for tp in self.rows if tp]
+
+    def _mark_current(self):
+        for i, tp in enumerate(self.rows):
+            if tp is not None and tp is self.topic:
+                with contextlib.suppress(tk.TclError):
+                    self.lb.selection_clear(0, "end")
+                    self.lb.selection_set(i)
+                    self.lb.see(i)
+                return
+
+    def _picked(self, _e=None):
+        sel = self.lb.curselection()
+        if not sel:
+            return
+        tp = self.rows[sel[0]] if sel[0] < len(self.rows) else None
+        if tp is None:
+            self._mark_current()
+            return
+        self.open_topic(tp["title"])
+
+    def _open_first(self):
+        for tp in self.rows:
+            if tp:
+                self.open_topic(tp["title"])
+                break
+        return "break"
+
+    # ---- the topic
+    def open_topic(self, title):
+        tp = next((x for x in help_topics() if x["title"] == title), None)
+        if tp is None:
+            return False
+        self.topic = tp
+        txt = self.txt
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        for tag in txt.tag_names():
+            if tag.startswith("lk_"):
+                txt.tag_delete(tag)
+        txt.insert("end", translate_text(tp["title"]) + "\n", ("h1",))
+        txt.insert("end", help_body(tp, self.app) + "\n")
+        for label, tab, attr in tp["show"]:
+            self._links += 1
+            tag = f"lk_{self._links}"
+            word = "Take the tour" if tab == "tour" else "Show me"
+            txt.insert("end", f"\n\u25B6 {translate_text(word)}: "
+                              f"{translate_text(label)}", ("show", tag))
+            txt.tag_bind(tag, "<Button-1>", lambda e, tb=tab, at=attr:
+                         self.app.show_me(tb, at))
+            txt.tag_bind(tag, "<Enter>",
+                         lambda e: txt.configure(cursor="hand2"))
+            txt.tag_bind(tag, "<Leave>",
+                         lambda e: txt.configure(cursor="arrow"))
+        gloss_mark(txt, self.app, "2.0")
         txt.config(state="disabled")
+        self._mark_current()
+        return True
 
     def refresh(self):
         with contextlib.suppress(tk.TclError):
@@ -33670,6 +34589,169 @@ QUICK_START = (
      "what to check. Nothing here means “hacked” — it means “worth a "
      "look”.", "alerts", "Alerts explain what was seen and what to check."),
 )
+
+
+# what each Quick Start step's Show me outlines (5.1.2)
+QUICK_START_SPOT = {
+    "The Dashboard": ("dash", "card_grid"),
+    "Devices and the Inspector": ("devices", "tree"),
+    "Evidence marks": ("websites", "tree"),
+    "Quiet and Active": ("app", "mode_banner"),
+    "Alerts": ("alerts", "tree"),
+}
+
+
+class SearchDrop:
+    """The header search's results as you type: up to 8 per group, under
+    the box, in a frame placed over the window (pop-up windows behave
+    differently on Windows, macOS and XWayland). Down enters the list,
+    Enter opens, Escape closes."""
+
+    PER_GROUP = 8
+    MAX_ROWS = 22
+
+    def __init__(self, app, entry):
+        self.app, self.entry = app, entry
+        self.frame = None
+        self.rows = []              # (label widget, action)
+        self.sel = -1
+        self._soon = debounce(entry, self.update, 150)
+        entry.bind("<KeyRelease>", self._key, add="+")
+        entry.bind("<Down>", lambda e: self.move(1))
+        entry.bind("<Up>", lambda e: self.move(-1))
+        entry.bind("<Escape>", lambda e: self.close())
+        entry.bind("<FocusOut>", lambda e: entry.after(250,
+                                                        self._focus_gone))
+
+    def _key(self, e):
+        if e.keysym in ("Down", "Up", "Return", "KP_Enter", "Escape",
+                        "Tab"):
+            return
+        self._soon()
+
+    def _focus_gone(self):
+        with contextlib.suppress(tk.TclError, KeyError):
+            w = self.app.root.focus_get()
+            if w is self.entry:
+                return
+        self.close()
+
+    def results(self, q):
+        """[(group, [(text, action)])] — the window's own search, then
+        Settings and Help."""
+        app = self.app
+        out = []
+        for group, items in app.search_results(q).items():
+            out.append((group, [(label, lambda r=ref: app.open_ref(r))
+                                for label, ref in items[:self.PER_GROUP]
+                                if ref]))
+        for group, items in app.search_extras(q).items():
+            if items:
+                out.append((group, items[:self.PER_GROUP]))
+        return [(g, it) for g, it in out if it]
+
+    def update(self):
+        q = self.app.global_search_var.get().strip()
+        if len(q) < 2:
+            self.close()
+            return
+        try:
+            groups = self.results(q)
+        except Exception:                            # noqa: BLE001
+            LOG.debug("search", exc_info=True)
+            return
+        self._show(groups, q)
+
+    def _show(self, groups, q):
+        app, t = self.app, self.app.theme
+        self.close()
+        root = app.root
+        fr = tk.Frame(root, bg=t["card_bg"], highlightthickness=1,
+                      highlightbackground=t["border"], padx=2, pady=2)
+        self.frame, self.rows, self.sel = fr, [], -1
+        n = 0
+        if not groups:
+            tk.Label(fr, text=translate_text("No matches. Tip: device:, "
+                                             "site:, ip:, port: or alert:"),
+                     bg=t["card_bg"], fg=t["muted_fg"], anchor="w",
+                     padx=8, pady=4).pack(fill="x")
+        for group, items in groups:
+            if n >= self.MAX_ROWS:
+                break
+            tk.Label(fr, text=translate_text(group).upper(), bg=t["card_bg"],
+                     fg=t["muted_fg"], font=mw_font(7, "bold"), anchor="w",
+                     padx=8).pack(fill="x", pady=(4, 0))
+            for text, action in items:
+                if n >= self.MAX_ROWS:
+                    break
+                lbl = tk.Label(fr, text=text, bg=t["card_bg"],
+                               fg=t["text_fg"], anchor="w", padx=14, pady=1,
+                               cursor="hand2")
+                lbl.pack(fill="x")
+                i = len(self.rows)
+                lbl.bind("<Button-1>", lambda e, a=action: self._run(a))
+                lbl.bind("<Enter>", lambda e, k=i: self._mark(k))
+                self.rows.append((lbl, action))
+                n += 1
+        more = tk.Label(fr, text=translate_text("Show all results"),
+                        bg=t["card_bg"], fg=t["accent"], anchor="w",
+                        padx=8, pady=3, cursor="hand2")
+        more.pack(fill="x", pady=(4, 0))
+        more.bind("<Button-1>", lambda e: self._run(app._run_global_search))
+        self.rows.append((more, app._run_global_search))
+        try:
+            x = self.entry.winfo_rootx() - root.winfo_rootx()
+            y = self.entry.winfo_rooty() - root.winfo_rooty() + \
+                self.entry.winfo_height() + 2
+            w = max(420, self.entry.winfo_width() + 120)
+            x = max(4, min(x, root.winfo_width() - w - 4))
+            fr.place(x=x, y=y, width=w)
+            fr.lift()
+        except tk.TclError:
+            pass
+
+    def _mark(self, i):
+        t = self.app.theme
+        for k, (lbl, _a) in enumerate(self.rows):
+            with contextlib.suppress(tk.TclError):
+                lbl.configure(bg=t["accent"] if k == i else t["card_bg"],
+                              fg="#ffffff" if k == i else (
+                                  t["accent"] if k == len(self.rows) - 1
+                                  else t["text_fg"]))
+        self.sel = i
+
+    def move(self, d):
+        if self.frame is None:
+            self.update()
+            return "break"
+        if self.rows:
+            self._mark(max(0, min(len(self.rows) - 1, self.sel + d)))
+        return "break"
+
+    def open_selected(self):
+        if self.frame is None:
+            return False
+        if 0 <= self.sel < len(self.rows):
+            self._run(self.rows[self.sel][1])
+            return True
+        if self.rows and len(self.rows) > 1:
+            self._run(self.rows[0][1])     # Enter: the first result
+            return True
+        return False
+
+    def _run(self, action):
+        self.close()
+        with contextlib.suppress(tk.TclError):
+            action()
+
+    def close(self):
+        if self.frame is not None:
+            with contextlib.suppress(tk.TclError):
+                self.frame.destroy()
+        self.frame, self.rows, self.sel = None, [], -1
+
+    def shown(self):
+        return [str(lbl.cget("text")) for lbl, _a in self.rows]
 
 
 class ViewRouter:
@@ -34470,6 +35552,17 @@ class MiniWireshark:
         self.btn_settings_w = ttk.Button(header, text=tr("btn_settings"),
                                          command=self._open_settings)
         self.btn_settings_w.pack(side="right", padx=4)
+        # 5.1.2: Explain inline on / off (F1)
+        self.explain_var = tk.BooleanVar(
+            value=bool(self.config.get("appearance.explain_inline", False)))
+        self.explain_btn = ttk.Checkbutton(
+            header, text="?", variable=self.explain_var,
+            style="View.Toolbutton", command=lambda: self.set_explain(
+                self.explain_var.get()))
+        self.explain_btn.pack(side="right", padx=(0, 4))
+        Tooltip(self.explain_btn, "Explain inline (F1): write out what "
+                                  "marks, states and alerts mean, right "
+                                  "where they are")
         self.btn_help_w = ttk.Button(header, text=tr("btn_help"),
                                      command=self._open_help_menu)
         self.btn_help_w.pack(side="right", padx=4)
@@ -34504,11 +35597,12 @@ class MiniWireshark:
                    command=self._run_global_search).pack(side="left",
                                                          padx=(0, 6))
         self.search_entry = se
-        se.bind("<Return>", lambda e: self._run_global_search())
+        se.bind("<Return>", lambda e: self._search_enter())
+        self.search_drop = SearchDrop(self, se)
         Tooltip(se, "Search devices, names, MACs, IPs, vendors, websites, "
-                    "remote hosts, countries, providers, alerts, timeline "
-                    "and ports. Tokens: device: site: ip: port: alert: "
-                    "(Ctrl+F)")
+                    "Internet hosts, countries, providers, alerts, timeline, "
+                    "settings and help — or Ctrl+K for anything. Tokens: "
+                    "device: site: ip: port: alert:")
 
         # persistent, always-truthful Active/Quiet banner
         self.mode_banner = tk.Frame(self.root, padx=14, pady=5)
@@ -34761,6 +35855,23 @@ class MiniWireshark:
             with contextlib.suppress(tk.TclError):
                 self._select_tab(last)
 
+    def explain_on(self):
+        return bool(self.config.get("appearance.explain_inline", False))
+
+    def set_explain(self, on=None):
+        on = (not self.explain_on()) if on is None else bool(on)
+        self.config.set("appearance.explain_inline", on)
+        self.config.save()
+        with contextlib.suppress(AttributeError, tk.TclError):
+            self.explain_var.set(on)
+        with contextlib.suppress(AttributeError, tk.TclError):
+            self.inspector.refresh()
+        for kit in getattr(self, "kits", ()):
+            kit.update_explain()
+        with contextlib.suppress(KeyError, AttributeError, tk.TclError):
+            self.tabs["dash"].show_explain(on)
+        return on
+
     def _nav_key(self, fn):
         # Alt+Left/Right belong to a text field that has the focus
         w = self.root.focus_get()
@@ -34813,6 +35924,8 @@ class MiniWireshark:
                 for kit in self.kits:
                     if kit.tab.is_visible():
                         kit.refresh_relative()
+            with contextlib.suppress(Exception):
+                self._tours_check()
         finally:
             with contextlib.suppress(tk.TclError):
                 self.root.after(TableKit.REL_EVERY, self._kits_tick)
@@ -34988,8 +36101,7 @@ class MiniWireshark:
             self.banner_lbl.config(bg=bg, fg=fg, text=text)
             if hasattr(self, "banner_close"):
                 self.banner_close.config(bg=bg, fg=fg)
-            ab = getattr(self, "banner_action_btn", None)
-            if ab is not None and ab.winfo_manager():
+            if self.banner_action_shown():
                 # an Undo offer keeps the message up as long as it lasts
                 kind = "warn" if kind in ("info", "good") else kind
             # a short message does not keep a line of the screen forever:
@@ -35014,14 +36126,23 @@ class MiniWireshark:
             if action is None or not hasattr(self, "banner_close"):
                 return
             btn = self.banner_action_btn = ttk.Button(self.banner)
+        # a flag, not winfo_manager(): when the message line wraps (large
+        # text, French), its flow layout places the button a moment later
         with contextlib.suppress(tk.TclError):
             if action is None:
-                if btn.winfo_manager():
+                if btn.winfo_manager() or getattr(btn, "_mw_on", False):
                     btn.pack_forget()
+                btn._mw_on = False
                 return
             btn.configure(text=action[0], command=action[1])
-            if not btn.winfo_manager():
+            if not getattr(btn, "_mw_on", False) or \
+                    not btn.winfo_manager():
                 btn.pack(side="right", padx=(8, 4), before=self.banner_lbl)
+            btn._mw_on = True
+
+    def banner_action_shown(self):
+        btn = getattr(self, "banner_action_btn", None)
+        return bool(btn is not None and getattr(btn, "_mw_on", False))
 
     MESSAGES_KEPT = 50
 
@@ -35686,7 +36807,51 @@ class MiniWireshark:
         for dev in list(self.model.registry.by_key.values())[:300]:
             items.append((f"Device: {self.device_label(dev)}", "device",
                           lambda k=dev.key: self.show_device(k)))
+        # 5.1.2: websites, open alerts, every setting, Help topics, and
+        # the cards you opened last
+        sites = sorted(self.model.websites.values(),
+                       key=lambda w: -w.requests)[:300]
+        for w in sites:
+            items.append((f"Website: {w.domain}", "website",
+                          lambda d=w.domain: self.show_website(d)))
+        n = 0
+        for aid in self.model.alerts.order:
+            a = self.model.alerts.alerts.get(aid)
+            if a is None or a.acknowledged:
+                continue
+            items.append((f"Alert: {a.reason}", "alert",
+                          lambda i=aid: self.show_alert(i)))
+            n += 1
+            if n >= 100:
+                break
+        for page in SETTINGS_PAGES:
+            for sec in page["sections"]:
+                for c in sec["controls"]:
+                    if c.get("key") and c.get("label"):
+                        items.append((f"Setting: {c['label']}", "setting",
+                                      lambda k=c["key"]:
+                                      self.open_setting(k)))
+        for title in getattr(self, "help_titles", lambda: [])():
+            items.append((f"Help: {title}", "help",
+                          lambda tt=title: self.open_help(tt)))
+        for kind, key, label in list(getattr(self, "_recent_cards",
+                                             ()))[-10:]:
+            items.append((f"Recent: {label}", "recent",
+                          lambda k=kind, kk=key: self.open_card(k, kk)))
         return items
+
+    # what Ctrl+K shows next to an action: its keyboard shortcut
+    PALETTE_KEYS = {"Start watching": "start", "Stop watching": "stop",
+                    "Show / hide the inspector": "inspector",
+                    "Go to packet…": "goto_packet"}
+
+    def palette_key(self, label):
+        name = self.PALETTE_KEYS.get(label)
+        if not name:
+            return ""
+        seq = (self.config.get("shortcuts", {}) or {}).get(name) or \
+            DEFAULT_SHORTCUTS.get(name, "")
+        return _pretty_seq(seq) if seq else ""
 
     def _apply_preset(self, name):
         tab = self._select_tab("packets")
@@ -35702,6 +36867,8 @@ class MiniWireshark:
         self.config.set("performance.mode", mode)
         self.config.save()
         self._set_banner(f"⚡ Performance mode: {translate_text(mode)}.")
+        if mode == "Full Power":
+            self.root.after(1500, self._tours_check)
 
     def run_workspace(self, name):
         saved = (self.config.get("workspaces.saved", {}) or {}).get(name)
@@ -35714,6 +36881,9 @@ class MiniWireshark:
                 tab.set_expression(saved["expr"])
             if saved.get("mode"):
                 self.set_perf_mode(saved["mode"])
+            if saved.get("view"):
+                with contextlib.suppress(Exception):
+                    tab.apply_view_state(saved["view"])
             return tab
         if name == "Slow Internet":
             tab = self._select_tab("health")
@@ -35743,6 +36913,10 @@ class MiniWireshark:
                        "expr": self.tabs["packets"].expr_var.get()
                        if cur == "packets" else None,
                        "mode": self.config.get("performance.mode")}
+        # 5.1.2: the tab's whole view (filter, sort, columns, selection);
+        # 5.0.2 reads only the keys above and still opens the workspace
+        with contextlib.suppress(Exception):
+            saved[name]["view"] = tab.view_state()
         self.config.set("workspaces.saved", saved)
         self.config.save()
         return saved[name]
@@ -37114,6 +38288,302 @@ class MiniWireshark:
         fill()
         return win
 
+    # ---- Help topics, Show me, tours (5.1.2 F7) -------------------------------------
+    def help_titles(self):
+        return [tp["title"] for tp in help_topics()]
+
+    def help_matches(self, q):
+        """Topic titles for `q`, best first: title (English or shown
+        language), then key words, then the text."""
+        ql = q.strip().lower()
+        if not ql:
+            return []
+        scored = []
+        for i, tp in enumerate(help_topics()):
+            title = tp["title"].lower()
+            shown = translate_text(tp["title"]).lower()
+            if title.startswith(ql) or shown.startswith(ql):
+                sc = 10
+            elif ql in title or ql in shown:
+                sc = 6
+            elif ql in tp["terms"]:
+                sc = 4
+            elif ql in help_body(tp, self).lower():
+                sc = 1
+            else:
+                continue
+            scored.append((-sc, i, tp["title"]))
+        scored.sort()
+        return [t for _s, _i, t in scored]
+
+    def open_help(self, title=None):
+        tab = self._select_tab("help")
+        if title:
+            with contextlib.suppress(tk.TclError):
+                tab.q_var.set("")
+                tab.refill()
+                tab.open_topic(title)
+        return tab
+
+    def open_data_folder(self):
+        _open_path(PATHS.data)
+
+    def open_privacy_settings(self):
+        return self._open_settings("privacy")
+
+    def resolve_target(self, tab, attr):
+        """The widget a Show me points at (after showing its tab)."""
+        if tab == "app":
+            obj = self
+        else:
+            obj = self._select_tab(tab)
+            with contextlib.suppress(tk.TclError):
+                self.root.update_idletasks()
+            if not attr:
+                return obj.frame
+        for part in (attr or "").split("."):
+            obj = getattr(obj, part, None)
+            if obj is None:
+                break
+        if obj is None or not hasattr(obj, "winfo_ismapped"):
+            obj = self.tabs[tab].frame if tab in self.tabs else None
+        return obj
+
+    def show_me(self, tab, attr=None):
+        """Help's Show me: go there and outline the thing for 3 s."""
+        if tab == "tour":
+            return self.run_tour(attr)
+        if tab == "do":
+            fn = getattr(self, attr, None)
+            return fn() if fn else None
+        w = self.resolve_target(tab, attr)
+        if w is None:
+            return None
+        with contextlib.suppress(tk.TclError):
+            self.root.update_idletasks()
+            if not w.winfo_ismapped() and tab in self.tabs:
+                w = self.tabs[tab].frame
+        self.spotlight(w)
+        return w
+
+    SPOT_MS = 3000
+
+    def spotlight(self, widget, ms=None):
+        """A 2 px accent outline around `widget` for 3 s (four thin frames
+        over its window; nothing under them changes)."""
+        self._spot_off()
+        try:
+            top = widget.winfo_toplevel()
+            top.update_idletasks()
+            x = widget.winfo_rootx() - top.winfo_rootx()
+            y = widget.winfo_rooty() - top.winfo_rooty()
+            w, h = widget.winfo_width(), widget.winfo_height()
+        except tk.TclError:
+            return None
+        c = self.theme.get("accent", "#3a6fd8")
+        bars = []
+        # outside the widget where there is room, inside at the window's
+        # edges (a full-width line keeps all four sides)
+        tw, th = top.winfo_width(), top.winfo_height()
+        left, right = max(0, x - 2), min(tw, x + w + 2)
+        top_y, bottom = max(0, y - 2), min(th, y + h + 2)
+        for bx, by, bw, bh in ((left, top_y, right - left, 2),
+                               (left, bottom - 2, right - left, 2),
+                               (left, top_y, 2, bottom - top_y),
+                               (right - 2, top_y, 2, bottom - top_y)):
+            f = tk.Frame(top, bg=c, highlightthickness=0, bd=0)
+            f._mw_wrapping = True
+            f.place(x=bx, y=by, width=max(1, bw), height=max(1, bh))
+            f.lift()
+            bars.append(f)
+        self._spot = (widget, bars)
+        self._spot_job = self.root.after(ms or self.SPOT_MS, self._spot_off)
+        return bars
+
+    def _spot_off(self):
+        job = getattr(self, "_spot_job", None)
+        if job:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(job)
+        self._spot_job = None
+        _w, bars = getattr(self, "_spot", (None, ()))
+        for f in bars:
+            with contextlib.suppress(tk.TclError):
+                f.destroy()
+        self._spot = (None, ())
+
+    def gloss_note(self, txt, title, event=None):
+        """A small note for a glossary word, with More in Help."""
+        self._gloss_off()
+        t = self.theme
+        try:
+            top = txt.winfo_toplevel()
+            x = (event.x_root if event else txt.winfo_rootx() + 20) - \
+                top.winfo_rootx()
+            y = (event.y_root if event else txt.winfo_rooty() + 20) - \
+                top.winfo_rooty() + 14
+        except tk.TclError:
+            return None
+        defn = _glossary_def(title)
+        short = " ".join(re.split(r"(?<=[.!?])\s+", defn)[:2])
+        fr = tk.Frame(top, bg=t["card_bg"], highlightthickness=1,
+                      highlightbackground=t["border"], padx=10, pady=6)
+        fr._mw_wrapping = True
+        head = tk.Frame(fr, bg=t["card_bg"])
+        head.pack(fill="x")
+        tk.Label(head, text=translate_text(title), bg=t["card_bg"],
+                 fg=t["text_fg"], font=mw_font(10, "bold"),
+                 anchor="w").pack(side="left")
+        x_btn = tk.Label(head, text="✕", bg=t["card_bg"], fg=t["muted_fg"],
+                         cursor="hand2")
+        x_btn.pack(side="right")
+        x_btn.bind("<Button-1>", lambda e: self._gloss_off())
+        body = tk.Label(fr, text=short, bg=t["card_bg"], fg=t["text_fg"],
+                        justify="left", anchor="w", wraplength=300)
+        body._mw_wrap0, body._mw_wrapping = 0, True
+        body.pack(fill="x", pady=(2, 4))
+        more = tk.Label(fr, text=translate_text("More in Help"),
+                        bg=t["card_bg"], fg=t["accent"], cursor="hand2",
+                        anchor="w")
+        more.pack(fill="x")
+        more.bind("<Button-1>", lambda e: (self._gloss_off(),
+                                           self.open_help(title)))
+        try:
+            tw = max(200, top.winfo_width())
+            x = max(4, min(x, tw - 330))
+            fr.place(x=x, y=y, width=324)
+            fr.lift()
+        except tk.TclError:
+            return None
+        self._gloss = fr
+        self._gloss_job = self.root.after(15000, self._gloss_off)
+        top.bind("<Escape>", lambda e: self._gloss_off(), add="+")
+        return fr
+
+    def _gloss_off(self):
+        fr = getattr(self, "_gloss", None)
+        job = getattr(self, "_gloss_job", None)
+        if job:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(job)
+        self._gloss_job = self._gloss = None
+        if fr is not None:
+            with contextlib.suppress(tk.TclError):
+                fr.destroy()
+
+    # tours: each offered once, by one line in the message bar
+    def offer_tour(self, name):
+        done = list(self.config.get("general.tours_done", []) or [])
+        if name in done or name not in TOURS or self.data_mode == "demo" \
+                and name != "device":
+            return False
+        done.append(name)
+        self.config.set("general.tours_done", done)
+        self.config.save()
+        title, offer, _steps = TOURS[name]
+        self._set_banner("\U0001F9ED  " + translate_text(offer), "info",
+                         action=(translate_text("Take the tour"),
+                                 lambda n=name: self.run_tour(n)))
+        return True
+
+    def _tours_check(self):
+        """A warning alert or Full Power for the first time: offer its
+        tour (each only once)."""
+        done = set(self.config.get("general.tours_done", []) or [])
+        if "alert" not in done:
+            for a in self.model.alerts.alerts.values():
+                if a.severity in ("WARNING", "DANGER") and \
+                        not a.acknowledged:
+                    self.offer_tour("alert")
+                    return
+        if "inside" not in done:
+            with contextlib.suppress(Exception):
+                if self.effective_perf_mode()[0] == "Full Power":
+                    self.offer_tour("inside")
+
+    def run_tour(self, name):
+        title, _offer, steps = TOURS[name]
+        return self._stepper(title, steps, tour=name)
+
+    def _stepper(self, title_text, steps, tour=None):
+        """A small window going through `steps` (title, body, tab, attr)
+        with Back, Show me, Next and — for a tour — Skip."""
+        t = self.theme
+        win = tk.Toplevel(self.root)
+        win.title(title_text)
+        win.geometry("560x330")
+        win.configure(bg=t["card_bg"])
+        win.transient(self.root)
+        state = {"i": 0}
+        title = tk.Label(win, bg=t["card_bg"], fg=t["text_fg"],
+                         font=mw_font(13, "bold"), anchor="w")
+        title.pack(fill="x", padx=16, pady=(14, 4))
+        body = tk.Label(win, bg=t["card_bg"], fg=t["text_fg"], anchor="nw",
+                        justify="left", wraplength=520)
+        body.pack(fill="both", expand=True, padx=16)
+        dots = tk.Label(win, bg=t["card_bg"], fg=t["muted_fg"])
+        dots.pack()
+        bar = tk.Frame(win, bg=t["card_bg"])
+        bar.pack(fill="x", padx=16, pady=12)
+
+        def render():
+            i = state["i"]
+            st = steps[i]
+            title.configure(text=f"{i + 1}. {translate_text(st[0])}")
+            body.configure(text=translate_text(st[1]))
+            dots.configure(text="  ".join("●" if j == i else "○"
+                                          for j in range(len(steps))))
+            back.configure(state="normal" if i else "disabled")
+            nxt.configure(text="Finish" if i == len(steps) - 1
+                          else "Next ›")
+            self.show_me(st[2], st[3])
+
+        def go(d):
+            j = state["i"] + d
+            if j >= len(steps):
+                win.destroy()
+                return
+            state["i"] = max(0, j)
+            render()
+
+        def skip():
+            if tour:
+                done = list(self.config.get("general.tours_done", [])
+                            or [])
+                if tour not in done:
+                    done.append(tour)
+                    self.config.set("general.tours_done", done)
+                    self.config.save()
+            win.destroy()
+        back = ttk.Button(bar, text="‹ Back", command=lambda: go(-1))
+        back.pack(side="left")
+        ttk.Button(bar, text="Show me", command=lambda: self.show_me(
+            steps[state["i"]][2], steps[state["i"]][3])).pack(
+            side="left", padx=8)
+        nxt = ttk.Button(bar, text="Next ›", style="Accent.TButton",
+                         command=lambda: go(1))
+        nxt.pack(side="right")
+        if tour:
+            ttk.Button(bar, text="Skip", command=skip).pack(side="right",
+                                                            padx=8)
+        win.after(10, render)
+        win.go, win.skip = go, skip
+        return win
+
+    # More detail folds in cards: folded in Beginner, open in Advanced,
+    # remembered per kind
+    def fold_closed(self, kind):
+        st = (self.config.get("appearance.folds", {}) or {}).get(kind)
+        if st in ("open", "closed"):
+            return st == "closed"
+        return bool(self.beginner_mode)
+
+    def set_fold(self, kind, closed):
+        folds = dict(self.config.get("appearance.folds", {}) or {})
+        folds[kind] = "closed" if closed else "open"
+        self.config.set("appearance.folds", folds)
+        self.config.save()
+
     # ---- Quick Start Guide ------------------------------------------------------
     def open_quick_start(self):
         t = self.theme
@@ -37149,6 +38619,9 @@ class MiniWireshark:
             step = QUICK_START[state["i"]]
             self.goto(step[2])
             self._set_banner("\U0001F4D6  " + step[3])
+            spot = QUICK_START_SPOT.get(step[0])
+            if spot:
+                self.show_me(*spot)
 
         def go(d):
             j = state["i"] + d
@@ -37583,9 +39056,17 @@ class MiniWireshark:
 
 
     def _focus_search(self, _event=None):
+        """Ctrl+F: the shown tab's own filter box when it has one (5.1.2),
+        else the header search."""
+        tab = self.tabs.get(self.current_tab_name())
+        ent = getattr(tab, "filter_entry", None)
+        if ent is None or not FEATURES.get("state_line", True):
+            ent = self.search_entry
         try:
-            self.search_entry.focus_set()
-            self.search_entry.selection_range(0, "end")
+            if not ent.winfo_ismapped():
+                ent = self.search_entry
+            ent.focus_set()
+            ent.selection_range(0, "end")
         except tk.TclError:
             pass
         return "break"
@@ -37611,6 +39092,7 @@ class MiniWireshark:
             "palette": lambda e=None: self.open_palette(),
             "goto_packet": lambda e=None: self.go_to_packet(),
             "back": lambda e=None: self._nav_key(self.router.back),
+            "explain": lambda e=None: (self.set_explain(), "break")[1],
             "forward": lambda e=None: self._nav_key(self.router.forward),
             "group1": lambda e=None: self.select_group(0),
             "group2": lambda e=None: self.select_group(1),
@@ -39972,6 +41454,13 @@ class MiniWireshark:
                      "demo": "demo data"}[self.data_mode]))
         cards[kind] = dlg
         self.__dict__.setdefault("_card_wins", []).append(dlg)
+        rc = self.__dict__.setdefault("_recent_cards", deque(maxlen=10))
+        label = re.sub(r"^\W+\s*", "", str(dlg.win.title()))
+        rc.append((kind, key, label))
+        dlg.fold_kind = kind
+        dlg.set_sections(dlg.sections)
+        if kind == "device":
+            self.offer_tour("device")
         pin_var = tk.BooleanVar(master=dlg.win, value=False)
 
         def pin():
@@ -40869,7 +42358,61 @@ class MiniWireshark:
                 os.path.exists(self._journal_found):
             m.add_command(label="Restore the interrupted session",
                           command=self.restore_journal)
+        m.add_separator()
+        ws = tk.Menu(m, tearoff=0)
+        with contextlib.suppress(tk.TclError):
+            ws.configure(**{k: m.cget(k) for k in (
+                "bg", "fg", "activebackground", "activeforeground")})
+        mine = list(self.config.get("workspaces.saved", {}) or {})
+        for name in list(TASK_WORKSPACES) + mine:
+            ws.add_command(label=f"{translate_text('Open:')} {name}",
+                           command=lambda n=name: self.run_workspace(n))
+        ws.add_separator()
+        ws.add_command(label="Save this view as a workspace…",
+                       command=self.save_workspace)
+        ws.add_command(label="Rename a workspace…",
+                       command=self.rename_workspace,
+                       state="normal" if mine else "disabled")
+        ws.add_command(label="Delete a workspace…",
+                       command=self.delete_workspace,
+                       state="normal" if mine else "disabled")
+        m.add_cascade(label="Workspaces", menu=ws)
         self._popup_at_pointer(m)
+
+    def rename_workspace(self, old=None, new=None):
+        saved = dict(self.config.get("workspaces.saved", {}) or {})
+        if not saved:
+            return None
+        old = old or choose_from_list(
+            self, "Rename a workspace", "Which workspace?",
+            [(n, n) for n in saved])
+        if not old or old not in saved:
+            return None
+        new = new or ask_text(self, "Rename a workspace", "New name:", old)
+        if not new or new == old:
+            return None
+        saved[new] = saved.pop(old)
+        self.config.set("workspaces.saved", saved)
+        self.config.save()
+        return new
+
+    def delete_workspace(self, name=None):
+        saved = dict(self.config.get("workspaces.saved", {}) or {})
+        if not saved:
+            return None
+        name = name or choose_from_list(
+            self, "Delete a workspace", "Which workspace?",
+            [(n, n) for n in saved])
+        if not name or name not in saved:
+            return None
+        if not messagebox.askyesno("Delete a workspace",
+                                   f"Delete the workspace “{name}”?",
+                                   parent=self.root):
+            return None
+        saved.pop(name)
+        self.config.set("workspaces.saved", saved)
+        self.config.save()
+        return name
 
     def _open_export_menu(self):
         m = themed_menu(self)
@@ -41204,10 +42747,17 @@ class MiniWireshark:
         token, term = (m.group(1).lower(), m.group(2).strip().lower()) if m \
             else (None, q.lower())
         res = OrderedDict((k, []) for k in ("Devices", "Websites",
-                                            "Remote hosts", "Connections",
+                                            "Internet hosts", "Connections",
                                             "Alerts", "Timeline"))
         mod = self.model
-        if token in (None, "device", "ip", "mac"):
+        cache = self._search_hay()
+        if token is None:
+            # 5.1.2: the words of each device and connection are joined
+            # once (kept 3 s), not on every key
+            for key, (label, words) in cache["dev"].items():
+                if term in words:
+                    res["Devices"].append((label, ("device", key)))
+        if token in ("device", "ip", "mac"):
             for d in mod.registry.by_key.values():
                 fields = {"device": [self.device_label(d), d.alias,
                                      d.hostname, d.dhcp_hostname,
@@ -41216,7 +42766,8 @@ class MiniWireshark:
                           "ip": [d.ip] + sorted(d.ipv6),
                           "mac": [d.mac]}.get(token) or \
                     [self.device_label(d), d.alias, d.ip, d.mac, d.vendor,
-                     d.device_class, d.notes] + sorted(d.ipv6)
+                     d.device_class, translate_text(d.device_class),
+                     d.notes] + sorted(d.ipv6)
                 if any(term in (f or "").lower() for f in fields):
                     res["Devices"].append(
                         (f"{self.device_label(d)}  ({d.ip or d.mac}) — "
@@ -41233,7 +42784,7 @@ class MiniWireshark:
                     " ".join([r.ip, r.domain, " ".join(r.domains), r.country,
                               r.country_name, r.org, f"as{r.asn}"])
                 if term in hay.lower():
-                    res["Remote hosts"].append(
+                    res["Internet hosts"].append(
                         (f"{r.ip}  {r.domain}  {r.location_text()}  "
                          f"{r.provider_text()}", ("remote", r.ip)))
         if token in (None, "port", "ip", "site"):
@@ -41245,9 +42796,13 @@ class MiniWireshark:
                                                           f.local_port) or \
                         (not term.isdigit() and term in (hay or ""))
                 else:
-                    ok = term in " ".join(str(x) for x in (
-                        f.remote_ip, f.local_ip, f.domain, f.service,
-                        f.remote_port)).lower()
+                    words = cache["flow"].get(f.fid)
+                    if words is None:
+                        words = cache["flow"][f.fid] = " ".join(
+                            str(x) for x in (f.remote_ip, f.local_ip,
+                                             f.domain, f.service,
+                                             f.remote_port)).lower()
+                    ok = term in words
                 if ok:
                     res["Connections"].append(
                         (f"#{f.fid} {self.short_device_name(f.device_key)} "
@@ -41269,6 +42824,68 @@ class MiniWireshark:
                         (f"{fmt_clock(e['when'])}  {e['text']}",
                          e.get("ref")))
         return OrderedDict((k, v[:200]) for k, v in res.items() if v)
+
+    def _search_enter(self):
+        drop = getattr(self, "search_drop", None)
+        if drop is not None and drop.open_selected():
+            return "break"
+        self._run_global_search()
+        return "break"
+
+    SEARCH_HAY_S = 3.0
+
+    def _search_hay(self):
+        """Lower-cased words of each device (and, filled as met, each
+        connection) for search as you type; rebuilt after 3 s or when
+        the data is replaced."""
+        h = getattr(self, "_hay", None)
+        now = time.monotonic()
+        if h is not None and h["model"] is self.model and \
+                now - h["t"] < self.SEARCH_HAY_S and \
+                h["n"] == len(self.model.registry.by_key):
+            return h
+        dev = {}
+        for d in self.model.registry.by_key.values():
+            label = self.device_label(d)
+            words = " ".join(x for x in (
+                label, d.alias, d.ip, d.mac, d.vendor, d.device_class,
+                translate_text(d.device_class), d.notes) if x)
+            words += " " + " ".join(sorted(d.ipv6))
+            dev[d.key] = (f"{label}  ({d.ip or d.mac}) — {d.device_class}",
+                          words.lower())
+        h = self._hay = {"model": self.model, "t": now, "dev": dev,
+                         "flow": {}, "n": len(self.model.registry.by_key)}
+        return h
+
+    def search_extras(self, q):
+        """Settings and Help that match `q` (for the result list)."""
+        ql = q.strip().lower()
+        out = OrderedDict((("Settings", []), ("Help", [])))
+        if len(ql) < 2:
+            return out
+        for page in SETTINGS_PAGES:
+            for sec in page["sections"]:
+                for c in sec["controls"]:
+                    lab = c.get("label") or ""
+                    if c.get("key") and (ql in lab.lower() or ql in
+                                         translate_text(lab).lower()):
+                        out["Settings"].append(
+                            (f"{translate_text(page['title'])} › "
+                             f"{translate_text(lab)}",
+                             lambda k=c["key"]: self.open_setting(k)))
+        fn = getattr(self, "help_matches", None)
+        if fn is not None:
+            for title in fn(q)[:8]:
+                out["Help"].append((translate_text(title),
+                                    lambda tt=title: self.open_help(tt)))
+        return out
+
+    def open_setting(self, key):
+        """Settings, showing the one control (by search)."""
+        win = self._open_settings()
+        with contextlib.suppress(AttributeError, tk.TclError):
+            win.find_setting(key)
+        return win
 
     def _run_global_search(self):
         q = self.global_search_var.get().strip()
@@ -43439,16 +45056,21 @@ class CommandPalette:
 
     def filter(self):
         q = self.q.get()
+        recent = list(getattr(self.app, "_palette_recent", ()))
         scored = []
         for label, cat, fn in self.items:
             s = fuzzy_score(q, f"{label} {cat}")
             if s is not None:
+                if label in recent:          # used lately: a small boost
+                    s += 3 + recent.index(label) * 0.1
                 scored.append((-s, label, cat, fn))
         scored.sort(key=lambda x: x[0])
         self.shown = scored[:60]
         self.lb.delete(0, "end")
         for _s, label, cat, _fn in self.shown:
-            self.lb.insert("end", f"{label}    — {cat}")
+            key = self.app.palette_key(label)
+            self.lb.insert("end", f"{label}    — {translate_text(cat)}"
+                           + (f"    [{key}]" if key else ""))
         if self.shown:
             self.lb.selection_set(0)
 
@@ -43464,7 +45086,12 @@ class CommandPalette:
         sel = self.lb.curselection()
         if not sel or sel[0] >= len(self.shown):
             return
-        fn = self.shown[sel[0]][3]
+        label, fn = self.shown[sel[0]][1], self.shown[sel[0]][3]
+        rec = self.app.__dict__.setdefault("_palette_recent", deque(
+            maxlen=20))
+        if label in rec:
+            rec.remove(label)
+        rec.append(label)
         self.win.destroy()
         fn()
 
@@ -49177,6 +50804,29 @@ def run_self_tests(verbose=True):
             assert full == fast, (d.key, full, fast)
         assert any(reg4.merge_candidates(d) for d in devs)
 
+    def t_explain_registry():
+        """5.1.2 F7: nothing that can be shown is left unexplained."""
+        for kind in ALERT_TYPES:
+            assert explain("alert", kind), f"alert {kind} has no EXPLAIN"
+            assert ALERT_CHECKLIST.get(kind), f"alert {kind}: no checklist"
+        for st in (STATE_ACTIVE, STATE_IDLE, STATE_INACTIVE, STATE_EXPIRED):
+            assert explain("state", st), st
+        for lv in LEVEL_WORD:
+            assert explain("level", lv), lv
+        for c in CONFIDENCE_ORDER:
+            assert explain("confidence", c), c
+        # Help: one topic per title, the 5.0.2 text kept, every topic and
+        # tour named in all three languages
+        titles = [tp["title"] for tp in help_topics()]
+        assert len(titles) == len(set(titles)) >= 40
+        for term, defn in GLOSSARY:
+            assert term in titles and defn in str(next(
+                tp["body"] for tp in help_topics() if tp["title"] == term))
+        for lang in ("fr", "es"):
+            for t in titles + [v[0] for v in TOURS.values()]:
+                assert _i18n_lookup(t, I18N[lang], lang) is not None, \
+                    (lang, t)
+
     def t_registrable_domain():
         assert registrable_domain("www.example.co.uk") == "example.co.uk"
         assert registrable_domain("a.b.example.com") == "example.com"
@@ -49566,6 +51216,7 @@ def run_self_tests(verbose=True):
                t_theme_mappings, t_confidence_scoring, t_mac_randomization,
                t_device_lifecycle, t_public_ip_never_a_device,
                t_device_merge_rules, t_registrable_domain, t_dns_parsing,
+               t_explain_registry,
                t_tls_sni_parser, t_flow_aggregation, t_alert_debounce,
                t_session_roundtrip, t_display_filters, t_historical_buckets,
                t_dns_tracker, t_baseline, t_data_loaders, t_history_store,
@@ -56761,7 +58412,7 @@ def gt_m4_shell(app, ctx):
               len(app.model.alerts.alerts))
     app.clear()
     assert len(app.model.registry.by_key) < counts[0] or not counts[0]
-    assert app.banner_action_btn.winfo_manager()
+    assert app.banner_action_shown()
     assert app.undo_clear()
     m = app.model
     assert (len(m.registry.by_key), len(m.websites),
@@ -56772,7 +58423,7 @@ def gt_m4_shell(app, ctx):
         app.clear()
         _gui_pump(root, 2.5)
         assert app._clear_undo is None
-        assert not app.banner_action_btn.winfo_manager()
+        assert not app.banner_action_shown()
     finally:
         app.UNDO_CLEAR_S = 30
     # the window's size, place and tab are remembered
@@ -56785,6 +58436,169 @@ def gt_m4_shell(app, ctx):
                      app.data_mode == "offline" and
                      app.model.count >= len(frames), timeout=60)
     _gui_pump(root, 1.0)
+
+
+@gui_test_step("5.1.2 M5: explain inline, search as you type, Ctrl+K, "
+               "workspaces, Help topics, Show me, tours, folds")
+def gt_m5_find(app, ctx):
+    root = app.root
+    app.mode_ui_var.set("Advanced")
+    app._on_ui_mode_change()
+    _gui_pump(root, 0.3)
+    # Explain inline: the Dashboard's lines and the Inspector's come and go
+    dash = app._select_tab("dash")
+    _gui_pump(root, 0.8)
+    app.set_explain(True)
+    _gui_pump(root, 0.3)
+    assert any(lbl.winfo_ismapped() for lbl, _t in dash.explain_lbls)
+    dev = next(iter(app.model.registry.by_key))
+    app.toggle_inspector(True)
+    app.inspect("device", dev)
+    _gui_pump(root, 0.3)
+    assert app.inspector.txt.tag_ranges("explain")
+    app.set_explain(False)
+    _gui_pump(root, 0.3)
+    assert not any(lbl.winfo_ismapped()
+                   for lbl, _t in dash.explain_lbls)
+    app.inspect("device", dev)
+    assert not app.inspector.txt.tag_ranges("explain")
+    app.toggle_inspector(False)
+    # search as you type: grouped, fast, Down + Enter opens
+    drop = app.search_drop
+    t0 = time.perf_counter()
+    for q in ("br", "bro", "brot", "broth"):
+        drop.results(q)
+    per_key = (time.perf_counter() - t0) * 1000 / 4
+    assert per_key < 10, f"search {per_key:.1f} ms per key"
+    app.global_search_var.set("192.168.1")
+    drop.update()
+    _gui_pump(root, 0.2)
+    assert drop.frame is not None and drop.frame.winfo_ismapped()
+    assert any("192.168.1" in t for t in drop.shown())
+    drop.move(1)
+    app._search_enter()
+    _gui_pump(root, 0.5)
+    assert drop.frame is None
+    with contextlib.suppress(tk.TclError):
+        for w in list(getattr(app, "_card_wins", [])):
+            if w.alive():
+                w.win.destroy()
+    groups = dict(drop.results("ask before"))
+    assert any("Ask before clearing data" in t for t, _a in
+               groups.get("Settings", [])), groups
+    app.global_search_var.set("")
+    # Ctrl+K: settings, websites, help; a setting opens found
+    items = app.palette_items()
+    cats = {c for _l, c, _f in items}
+    assert {"setting", "help", "website"} <= cats, cats
+    assert app.palette_key("Start watching")
+    win = app.open_setting("general.confirm_before_clear")
+    _gui_pump(root, 0.4)
+    assert "Ask before clearing data" in win.search_var.get() or \
+        translate_text("Ask before clearing data") in win.search_var.get()
+    before = set(win.changed_keys())
+    var = win.vars["general.confirm_before_clear"]
+    var.set(not var.get())
+    win._on_change("general.confirm_before_clear")
+    assert "general.confirm_before_clear" in set(win.changed_keys()) ^ before
+    win.show_changed()
+    _gui_pump(root, 0.2)
+    win._reset_key("general.confirm_before_clear")
+    assert set(win.changed_keys()) == before
+    win.win.destroy()
+    # a workspace keeps the view: sort and filter come back
+    ct = app._select_tab("connections")
+    _gui_pump(root, 1.2)
+    col = ct.kit.shown_cols()[1]
+    ct.kit.sort_by(col)
+    ct.kit.sort_by(col)
+    _gui_pump(root, 0.5)
+    rows = list(ct.tree.get_children())[:20]
+    app.save_workspace("M5 test")
+    ct.kit.clear_sort()
+    app._select_tab("dash")
+    _gui_pump(root, 0.5)
+    app.run_workspace("M5 test")
+    _gui_pump(root, 1.5)
+    assert app.current_tab_name() == "connections"
+    assert (ct.kit.sort_col, ct.kit.sort_desc) == (col, True), \
+        (ct.kit.sort_col, ct.kit.sort_desc)
+    assert list(ct.tree.get_children())[:20] == rows
+    assert app.rename_workspace("M5 test", "M5 renamed") == "M5 renamed"
+    saved = app.config.get("workspaces.saved")
+    assert "M5 renamed" in saved and "M5 test" not in saved
+    # Help: search in three languages; every Show me reaches a widget
+    lang = app.config.get("general.language", "English")
+    try:
+        for name in ("English", "Français", "Español"):
+            app.config.set("general.language", name)
+            app._apply_runtime_settings()
+            _gui_pump(root, 0.2)
+            assert app.help_matches("quiet")[0] == "Quiet and Active", \
+                (name, app.help_matches("quiet")[:3])
+    finally:
+        app.config.set("general.language", lang)
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.2)
+    ht = app.open_help("Evidence marks")
+    _gui_pump(root, 0.5)
+    assert len(ht.shown_titles()) >= 40
+    assert "Evidence marks" in ht.txt.get("1.0", "2.0")
+    ht.q_var.set("passwords")
+    ht.refill()
+    assert ht.shown_titles()
+    ht.q_var.set("")
+    ht.refill()
+    targets = [(tab, attr) for tp in help_topics()
+               for _l, tab, attr in tp["show"] if tab not in ("tour", "do")]
+    targets += [(st[2], st[3]) for _t, _o, steps in TOURS.values()
+                for st in steps]
+    targets += list(QUICK_START_SPOT.values())
+    for tab, attr in targets:
+        w = app.show_me(tab, attr)
+        _gui_pump(root, 0.05)
+        assert w is not None and w.winfo_ismapped(), (tab, attr)
+        assert app._spot[1] and all(f.winfo_ismapped()
+                                    for f in app._spot[1])
+    app._spot_off()
+    # glossary words: underlined, and a click shows a note
+    ht.open_topic("ARP")
+    assert ht.txt.tag_ranges("gloss")
+    note = app.gloss_note(ht.txt, "MAC address")
+    _gui_pump(root, 0.2)
+    assert note.winfo_ismapped()
+    app._gloss_off()
+    # tours: each offered once; Skip marks one done
+    app.config.set("general.tours_done", [])
+    assert app.offer_tour("device") and not app.offer_tour("device")
+    tw = app.run_tour("alert")
+    _gui_pump(root, 0.3)
+    tw.go(1)
+    _gui_pump(root, 0.2)
+    tw.skip()
+    assert set(app.config.get("general.tours_done")) == {"device", "alert"}
+    app._hide_banner()
+    # a card folds its long part; the choice is kept per kind
+    app.config.set("appearance.folds", {})
+    card = app.show_device(dev)
+    _gui_pump(root, 0.3)
+    if len(card.sections) > card.FOLD_KEEP + 1:
+        was = card.folded
+        n = card.txt.get("1.0", "end").count("\n")
+        card.toggle_fold()
+        assert card.folded != was
+        assert card.txt.get("1.0", "end").count("\n") != n
+        assert app.config.get("appearance.folds")["device"] == (
+            "closed" if card.folded else "open")
+    card.win.destroy()
+    # Beginner <-> Advanced keeps the tab when both views have it
+    app._select_tab("alerts")
+    for _ in range(20):
+        for v in ("Beginner", "Advanced"):
+            app.mode_ui_var.set(v)
+            app._on_ui_mode_change()
+    _gui_pump(root, 0.3)
+    assert app.current_tab_name() == "alerts", app.current_tab_name()
 
 
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
@@ -56877,7 +58691,8 @@ def reachable_actions(app):
         out.add(f"tab:{name}")
         for sv in getattr(tab, "_sub_frames", None) or {}:
             out.add(f"subview:{name}/{sv}")
-    data_made = {"device", "your workspace", "recent filter"}
+    data_made = {"device", "your workspace", "recent filter", "website",
+                 "alert", "recent"}
     for label, cat, _fn in app.palette_items():
         if cat not in data_made:
             out.add(f"palette:{cat}:{label}")
