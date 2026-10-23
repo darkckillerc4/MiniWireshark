@@ -90,6 +90,7 @@ import hashlib
 import html
 import importlib
 import inspect
+import itertools
 import io
 import ipaddress
 import json
@@ -362,6 +363,47 @@ def json_loads_pieces(text, depth=2):
     if skip(end) != n:
         raise ValueError(f"extra data at {skip(end)}")
     return obj
+
+
+def capture_over_bytes(buf, size, limit):
+    """capture_over on a buffer (bytes or mmap) of `size` bytes."""
+    magic = bytes(buf[:4])
+    n = 0
+    if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1",
+                 b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+        fmt = "<I" if magic[0] in (0xd4, 0x4d) else ">I"
+        unpack = struct.Struct(fmt).unpack_from
+        pos = 24
+        while n <= limit:
+            if pos + 16 > size:
+                return False
+            pos += 16 + unpack(buf, pos + 8)[0]
+            n += 1
+        return True
+    if magic == b"\x0a\x0d\x0d\x0a":
+        pos, little = 0, True
+        while n <= limit:
+            if pos + 8 > size:
+                return False
+            btype, blen = struct.unpack_from("<II" if little else ">II",
+                                             buf, pos)
+            if btype == 0x0A0D0D0A:
+                if pos + 12 > size:
+                    return False
+                little = bytes(buf[pos + 8:pos + 12]) == b"\x4d\x3c\x2b\x1a"
+                blen = struct.unpack_from("<I" if little else ">I", buf,
+                                          pos + 4)[0]
+                if blen < 12:
+                    return None
+                pos += blen
+                continue
+            if blen < 12:
+                return None
+            if btype in (3, 6):
+                n += 1
+            pos += blen
+        return True
+    return None
 
 
 def read_session_payload(path):
@@ -9216,6 +9258,22 @@ def fast_switch(who, on, interval=0.001):
             sys.setswitchinterval(want)
 
 
+_GC_NORMAL = [None]
+
+
+def busy_gc(on, gen2=50):
+    """While packets pour in, the cycle collector's full pass (over every
+    device, connection and website: 110-160 ms at 1,000 devices, holding
+    the interpreter) runs a fifth as often; normal again when idle. Garbage
+    that is not in a cycle is freed at once either way."""
+    if not FEATURES.get("gc_freeze", True):
+        return
+    if _GC_NORMAL[0] is None:
+        _GC_NORMAL[0] = gc.get_threshold()
+    t0, t1, t2 = _GC_NORMAL[0]
+    gc.set_threshold(t0, t1, max(t2, gen2) if on else t2)
+
+
 class GuiGate:
     """Re-entrant lock with the ability to step out of a nested hold
     completely (for modal waits) and step back in afterwards.
@@ -10052,9 +10110,11 @@ class AnalysisWorker(threading.Thread):
             self._last_work = now
             if not self._fast:
                 fast_switch("analysis", True, self.FAST_SWITCH)
+                busy_gc(True)
                 self._fast = True
         elif self._fast and now - self._last_work > 1.0:
             fast_switch("analysis", False)
+            busy_gc(False)
             self._fast = False
 
     def run(self):
@@ -10085,6 +10145,7 @@ class AnalysisWorker(threading.Thread):
         self.busy = False
         if self._fast:
             fast_switch("analysis", False)
+            busy_gc(False)
 
     def _process(self, batch):
         app = self.app
@@ -43457,7 +43518,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                 tree_remove(self.tabs["devices"].tree,
                             self.tabs["devices"].iids, key)
         if m.dirty_devices:
-            keys, m.dirty_devices = m.dirty_devices, set()
+            keys = self._take_dirty(m, "dirty_devices")
             self.tabs["devices"].update_keys(keys)
             cur = self.inspector.current if self.inspector_visible \
                 else None
@@ -43466,13 +43527,29 @@ proc ::mw_retheme {w map fgnew deffg} {
 
     def _flush_websites(self, m):
         if m.dirty_websites:
-            keys, m.dirty_websites = m.dirty_websites, set()
+            keys = self._take_dirty(m, "dirty_websites")
             self.tabs["websites"].update_keys(keys)
 
     def _flush_remotes(self, m):
         if m.dirty_remotes:
-            keys, m.dirty_remotes = m.dirty_remotes, set()
+            keys = self._take_dirty(m, "dirty_remotes")
             self.tabs["remote"].update_keys(keys)
+
+    FLUSH_MAX = 250
+
+    @classmethod
+    def _take_dirty(cls, m, attr):
+        """The changed rows for one table refresh, at most FLUSH_MAX; the
+        rest stay for the next tick. 5.1.2: reading a file with 1,000
+        devices put them all in one callback, which froze the window for
+        0.4-0.6 s while they were inserted."""
+        keys = getattr(m, attr)
+        if len(keys) <= cls.FLUSH_MAX:
+            setattr(m, attr, set())
+            return keys
+        now = set(itertools.islice(keys, cls.FLUSH_MAX))
+        setattr(m, attr, keys - now)
+        return now
 
     def _flush_flows(self, m):
         if m.flows.dirty:
@@ -46567,49 +46644,19 @@ proc ::mw_retheme {w map fgnew deffg} {
     def capture_over(self, path, limit):
         """True when the capture file holds more than `limit` packets
         (counted from the record headers only, stopping at limit + 1);
-        None when the format isn't recognised."""
+        None when the format isn't recognised. 5.1.2: the headers are read
+        from the file mapped in memory — a read and a seek per packet took
+        about 0.2 s on the Tk thread before a large capture opened."""
+        import mmap
         try:
             with open(path, "rb") as f:
-                magic = f.read(4)
-                n = 0
-                if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1",
-                             b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
-                    little = magic[0] in (0xd4, 0x4d)
-                    fmt = "<I" if little else ">I"
-                    f.seek(24)
-                    while n <= limit:
-                        hdr = f.read(16)
-                        if len(hdr) < 16:
-                            return False
-                        cap = struct.unpack(fmt, hdr[8:12])[0]
-                        f.seek(cap, 1)
-                        n += 1
-                    return True
-                if magic == b"\x0a\x0d\x0d\x0a":
-                    f.seek(0)
-                    little = True
-                    while n <= limit:
-                        hdr = f.read(8)
-                        if len(hdr) < 8:
-                            return False
-                        btype, blen = struct.unpack("<II" if little else ">II",
-                                                    hdr)
-                        if btype == 0x0A0D0D0A:
-                            bom = f.read(4)
-                            little = bom == b"\x4d\x3c\x2b\x1a"
-                            blen = struct.unpack("<I" if little else ">I",
-                                                 hdr[4:8])[0]
-                            f.seek(blen - 12, 1)
-                            continue
-                        if blen < 12:
-                            return None
-                        if btype in (3, 6):
-                            n += 1
-                        f.seek(blen - 8, 1)
-                    return True
-        except (OSError, struct.error):
+                size = os.fstat(f.fileno()).st_size
+                if size < 4:
+                    return None
+                with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+                    return capture_over_bytes(mm, size, limit)
+        except (OSError, ValueError, struct.error):
             return None
-        return None
 
     def import_pcap_path(self, path):
         cap = int(self.config.get("capture.max_stored_events", 5000))
@@ -46639,9 +46686,21 @@ proc ::mw_retheme {w map fgnew deffg} {
                          kind="warn")
         LOG.info("importing pcap %s", path)
 
+        # 5.1.2: one status update waiting at a time, showing the latest
+        # count (the reader posted one per batch; a backlog of hundreds ran
+        # in one callback and froze the window for 0.4 s on a big file)
+        latest = {"n": 0, "posted": False}
+
+        def show():
+            latest["posted"] = False
+            self.status_var.set(f"\U0001F4C2 Reading {self.data_label}: "
+                                f"{latest['n']} packets…")
+
         def progress(n):
-            self._async_results.put(lambda: self.status_var.set(
-                f"\U0001F4C2 Reading {self.data_label}: {n} packets…"))
+            latest["n"] = n
+            if not latest["posted"]:
+                latest["posted"] = True
+                self._async_results.put(show)
 
         def done(n, err, cancelled):
             self._async_results.put(lambda: self._pcap_done(n, err,
@@ -59966,6 +60025,80 @@ def t_json_pieces_and_fast_switch(ctx):
         _FAST_SWITCH_USERS.discard("t1")
         _FAST_SWITCH_USERS.discard("t2")
         sys.setswitchinterval(before)
+
+
+@self_test()
+def t_capture_over_bytes(ctx):
+    """Counting a capture's packets from the record headers in memory:
+    pcap (both byte orders) and pcapng, at the limit, over it, and a
+    file cut short."""
+    def pcap(n, big=False):
+        e = ">" if big else "<"
+        out = struct.pack(e + "IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 65535, 1)
+        for i in range(n):
+            data = bytes(60 + i % 7)
+            out += struct.pack(e + "IIII", i, 0, len(data), len(data)) + data
+        return out
+
+    def pcapng(n):
+        shb = struct.pack("<IIIHHqI", 0x0A0D0D0A, 28, 0x1A2B3C4D, 1, 0, -1,
+                          28)
+        idb = struct.pack("<IIHHII", 1, 20, 1, 0, 65535, 20)
+        out = shb + idb
+        for i in range(n):
+            data = bytes(61 + i % 5)
+            pad = (-len(data)) % 4
+            blen = 32 + len(data) + pad
+            out += struct.pack("<IIIIIII", 6, blen, 0, 0, i, len(data),
+                               len(data)) + data + bytes(pad) + \
+                struct.pack("<I", blen)
+        return out
+    for make in (pcap, lambda n: pcap(n, True), pcapng):
+        for n, limit, want in ((10, 10, False), (11, 10, True),
+                               (0, 0, False), (500, 3, True)):
+            b = make(n)
+            assert capture_over_bytes(b, len(b), limit) is want, (n, limit)
+        b = make(30)
+        assert capture_over_bytes(b[:-7], len(b) - 7, 100) is False
+    assert capture_over_bytes(b"nope", 4, 3) is None
+    p = ctx.path("c.pcap")
+    with open(p, "wb") as f:
+        f.write(pcap(12))
+    class _A:
+        pass
+    a = _A()
+    assert MiniWireshark.capture_over(a, p, 11) is True
+    assert MiniWireshark.capture_over(a, p, 12) is False
+
+
+@self_test()
+def t_big_file_flush_parts(ctx):
+    """A table refresh takes at most FLUSH_MAX changed rows and leaves the
+    rest for the next tick (none lost, none twice); the cycle collector's
+    full pass is rarer while packets pour in and normal again after."""
+    class M:
+        pass
+    m = M()
+    m.dirty_devices = set(range(600))
+    seen = set()
+    while m.dirty_devices:
+        part = MiniWireshark._take_dirty(m, "dirty_devices")
+        assert len(part) <= MiniWireshark.FLUSH_MAX
+        assert not (part & seen)
+        seen |= part
+    assert seen == set(range(600))
+    m.dirty_devices = {1, 2}
+    assert MiniWireshark._take_dirty(m, "dirty_devices") == {1, 2}
+    assert m.dirty_devices == set()
+    t0 = gc.get_threshold()
+    try:
+        busy_gc(True)
+        if FEATURES.get("gc_freeze", True):
+            assert gc.get_threshold()[2] >= 50
+        busy_gc(False)
+        assert gc.get_threshold() == (_GC_NORMAL[0] or t0)
+    finally:
+        gc.set_threshold(*t0)
 
 
 @self_test()
