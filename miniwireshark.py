@@ -1784,8 +1784,8 @@ class LoaderWindow(tk.Frame):
 
     def __init__(self, master, config=None, mode="startup"):
         self.config = config
-        theme = (config.get("appearance.theme", "Light") if config
-                 else "Light")
+        theme = resolve_theme(config.get("appearance.theme", "Light")
+                              if config else "Light")
         hc = bool(config.get("appearance.high_contrast", False)) if config \
             else False
         try:
@@ -5234,8 +5234,103 @@ for _pname, _tbl in PALETTES.items():
             _CANON[_val] = _canon
 
 
+# 5.1.2 M8: the interface scale. px(n) is a size in pixels at 100 %;
+# fixed window sizes and widths go through it.
+UI_SCALE = [1.0]
+
+
+def px(n):
+    return int(round(n * UI_SCALE[0]))
+
+
+def px_geo(geo):
+    """'560x620' (or '560x620+10+20') at the interface scale."""
+    m = re.match(r"^(\d+)x(\d+)(.*)$", str(geo))
+    if not m or UI_SCALE[0] == 1.0:
+        return geo
+    return f"{px(int(m.group(1)))}x{px(int(m.group(2)))}{m.group(3)}"
+
+
+def enable_dpi_awareness():
+    """Windows only, before the first window: draw at the real resolution
+    (system-aware; Tk 8.6 can't re-scale per monitor). Any failure keeps
+    today's behaviour. → True when the call worked."""
+    if not IS_WINDOWS or not FEATURES.get("dpi", True):
+        return False
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+            return True
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()
+            return True
+    except Exception:                               # noqa: BLE001
+        LOG.debug("DPI awareness", exc_info=True)
+        return False
+
+
+UI_SCALE_CHOICES = ("Automatic", "100 %", "125 %", "150 %", "200 %")
+
+
+def apply_ui_scale(root, choice="Automatic"):
+    """Automatic: the screen's own DPI (Windows after the DPI call; most
+    Linux desktops); a percentage: that, also for text (tk scaling) —
+    which helps a desktop that reports the wrong DPI."""
+    try:
+        auto = float(root.winfo_fpixels("1i")) / 96.0
+    except (tk.TclError, ValueError):
+        auto = 1.0
+    m = re.match(r"^(\d+)\s*%$", str(choice or ""))
+    if m:
+        scale = int(m.group(1)) / 100.0
+        with contextlib.suppress(tk.TclError):
+            root.tk.call("tk", "scaling", scale * 96.0 / 72.0)
+    else:
+        scale = auto
+    UI_SCALE[0] = max(1.0, min(3.0, scale))
+    return UI_SCALE[0]
+
+
+_SYSTEM_THEME = []
+
+
+def system_theme():
+    """Light or Dark as the operating system is set (read once)."""
+    if _SYSTEM_THEME:
+        return _SYSTEM_THEME[0]
+    dark = False
+    try:
+        if IS_WINDOWS:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion"
+                                r"\Themes\Personalize") as k:
+                dark = winreg.QueryValueEx(k, "AppsUseLightTheme")[0] == 0
+        elif IS_MAC:
+            r = subprocess.run(["defaults", "read", "-g",
+                                "AppleInterfaceStyle"], capture_output=True,
+                               text=True, timeout=3)
+            dark = "dark" in (r.stdout or "").lower()
+        else:
+            r = subprocess.run(["gsettings", "get",
+                                "org.gnome.desktop.interface",
+                                "color-scheme"], capture_output=True,
+                               text=True, timeout=3)
+            dark = "dark" in (r.stdout or "").lower()
+    except Exception:                               # noqa: BLE001
+        dark = False
+    _SYSTEM_THEME.append("Dark" if dark else "Light")
+    return _SYSTEM_THEME[0]
+
+
+def resolve_theme(name):
+    return system_theme() if name == "System" else (name or "Light")
+
+
 def palette_name(theme, high_contrast, cvd=None):
     """Light/Dark, + " HC", + " deutan|protan|tritan" (colour-blind)."""
+    theme = resolve_theme(theme)
     cvd = CVD_STATE["mode"] if cvd is None else cvd
     return f"{theme}{' HC' if high_contrast else ''}" + \
         (f" {cvd}" if cvd else "")
@@ -8936,6 +9031,7 @@ FEATURES = {
     "tab_groups": True,      # tabs in four groups, new order (M4)
     "state_line": True,      # one truthful state line, not two banners (M4)
     "answer_cards": True,    # three answers on the Dashboard (M6)
+    "dpi": True,             # Windows draws sharp text at 125 %+ (M8)
 }
 
 
@@ -17637,12 +17733,12 @@ def _default_config():
                     "upgraded_from_3": False, "show_welcome": True,
                     "welcome_version": "", "tours_done": [],
                     "tips": True},
-        "accessibility": {"colorblind": "Off"},
+        "accessibility": {"colorblind": "Off", "ui_scale": "Automatic"},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal",
                        "inspector": None, "tables": {}, "window": "",
                        "explain_inline": False, "folds": {},
-                       "panes": {},
+                       "panes": {}, "reduce_motion": False,
                        "last_tab": ""},
         "capture": {"max_stored_events": 5000, "promiscuous": True,
                     "auto_select_interface": True,
@@ -21220,6 +21316,28 @@ is ¦ est ¦ es
 is not ¦ n'est pas ¦ no es
 greater than ¦ supérieur à ¦ mayor que
 less than ¦ inférieur à ¦ menor que
+Applies to every window, table, chart and dialog. System follows your computer's light or dark setting (read when MiniWireshark starts). ¦ S'applique à toutes les fenêtres, tableaux, graphiques et boîtes de dialogue. Système suit le réglage clair ou sombre de votre ordinateur (lu au démarrage de MiniWireshark). ¦ Se aplica a todas las ventanas, tablas, gráficos y diálogos. Sistema sigue el ajuste claro u oscuro de su equipo (se lee al iniciar MiniWireshark).
+Automatic follows the screen. Choose a size when everything looks too small or too large (some Linux desktops report the wrong screen density). Takes full effect after restarting MiniWireshark. ¦ Automatique suit l'écran. Choisissez une taille si tout paraît trop petit ou trop grand (certains bureaux Linux indiquent une mauvaise densité d'écran). Prend pleinement effet après le redémarrage de MiniWireshark. ¦ Automático sigue la pantalla. Elija un tamaño si todo se ve demasiado pequeño o grande (algunos escritorios Linux informan mal la densidad de pantalla). Surte pleno efecto al reiniciar MiniWireshark.
+Interface scale ¦ Échelle de l'interface ¦ Escala de la interfaz
+Nothing moves by itself: the Happening feed is calm and keeps its place, the packet list doesn't follow new packets, messages stay until you close them, highlights stay until your next click, and table rows never move under the pointer. ¦ Rien ne bouge tout seul : le fil En direct est calme et garde sa place, la liste des paquets ne suit pas les nouveaux paquets, les messages restent jusqu'à ce que vous les fermiez, les mises en évidence restent jusqu'à votre prochain clic, et les lignes des tableaux ne bougent jamais sous le pointeur. ¦ Nada se mueve solo: el directo es tranquilo y conserva su sitio, la lista de paquetes no sigue a los nuevos, los mensajes se quedan hasta que los cierre, los resaltados se quedan hasta el siguiente clic y las filas de las tablas nunca se mueven bajo el puntero.
+Reduce motion ¦ Réduire les animations ¦ Reducir el movimiento
+Movement and keyboard ¦ Mouvement et clavier ¦ Movimiento y teclado
+Every action can be reached with the keyboard: Tab moves between controls, Enter runs a dialog's main button and Escape closes it. Help → Keyboard map lists every shortcut. Screen readers: Tk, the toolkit MiniWireshark is built on, shows them very little, so MiniWireshark doesn't claim to support them; every report can be copied as plain text. ¦ Chaque action est accessible au clavier : Tab passe d'une commande à l'autre, Entrée lance le bouton principal d'une boîte de dialogue et Échap la ferme. Aide → Raccourcis clavier les liste tous. Lecteurs d'écran : Tk, la boîte à outils sur laquelle MiniWireshark est construit, leur montre très peu de choses, donc MiniWireshark ne prétend pas les prendre en charge ; chaque rapport peut être copié en texte brut. ¦ Todas las acciones se pueden hacer con el teclado: Tab pasa de un control a otro, Intro ejecuta el botón principal de un diálogo y Escape lo cierra. Ayuda → Mapa del teclado lista todos los atajos. Lectores de pantalla: Tk, el kit sobre el que está hecho MiniWireshark, les muestra muy poco, así que MiniWireshark no afirma ser compatible con ellos; todos los informes se pueden copiar como texto sin formato.
+100 % ¦ 100 % ¦ 100 %
+125 % ¦ 125 % ¦ 125 %
+150 % ¦ 150 % ¦ 150 %
+200 % ¦ 200 % ¦ 200 %
+Print this list ¦ Imprimer cette liste ¦ Imprimir esta lista
+Keyboard and screen readers ¦ Clavier et lecteurs d'écran ¦ Teclado y lectores de pantalla
+Settings → Accessibility ¦ Paramètres → Accessibilité ¦ Configuración → Accesibilidad
+Next / previous tab ¦ Onglet suivant / précédent ¦ Pestaña siguiente / anterior
+Move between controls ¦ Passer d'une commande à l'autre ¦ Moverse entre controles
+Move in a list ¦ Se déplacer dans une liste ¦ Moverse por una lista
+Open the selected row ¦ Ouvrir la ligne sélectionnée ¦ Abrir la fila seleccionada
+A row's menu ¦ Le menu d'une ligne ¦ El menú de una fila
+Close a window or a list ¦ Fermer une fenêtre ou une liste ¦ Cerrar una ventana o una lista
+Move the Timeline time ¦ Déplacer l'heure de la Chronologie ¦ Mover la hora de la Cronología
+Complete a field name in a filter ¦ Compléter un nom de champ dans un filtre ¦ Completar un nombre de campo en un filtro
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -22475,6 +22593,57 @@ def fit_all_headings(root):
         fit_tree_headings(tree)
 
 
+def dialog_contract(win):
+    """Every window: Escape closes it, Enter runs its main button (the
+    one accent button), unless the window already says otherwise."""
+    try:
+        if not win.winfo_exists() or win.wm_overrideredirect():
+            return False
+        if not win.bind("<Escape>"):
+            win.bind("<Escape>", lambda e: win.destroy())
+        if not win.bind("<Return>"):
+            main = [b for b in _walk_class(win, ttk.Button)
+                    if str(b.cget("style")) == "Accent.TButton"]
+            if len(main) == 1:
+                def run(e, b=main[0]):
+                    if isinstance(e.widget, tk.Text):
+                        return None
+                    with contextlib.suppress(tk.TclError):
+                        if b.instate(["!disabled"]):
+                            b.invoke()
+                    return "break"
+                win.bind("<Return>", run)
+                win.bind("<KP_Enter>", run)
+        return True
+    except tk.TclError:
+        return False
+
+
+def focus_ring(widget, color="#2b7de9", width=2):
+    """A visible ring when a plain widget (a label used as a tab) has the
+    keyboard focus. The ring takes the place of padding, so nothing
+    moves or grows."""
+    try:
+        padx = int(str(widget.cget("padx")))
+        pady = int(str(widget.cget("pady")))
+    except (tk.TclError, ValueError):
+        return
+
+    def on(_e=None):
+        with contextlib.suppress(tk.TclError):
+            widget.configure(highlightthickness=width, highlightcolor=color,
+                             highlightbackground=color,
+                             padx=max(0, padx - width),
+                             pady=max(0, pady - width))
+
+    def off(_e=None):
+        with contextlib.suppress(tk.TclError):
+            widget.configure(highlightthickness=0, padx=padx, pady=pady)
+    widget.bind("<FocusIn>", on, add="+")
+    widget.bind("<FocusOut>", off, add="+")
+    off()
+
+
 def _walk_class(root, cls):
     stack = [root]
     while stack:
@@ -23330,8 +23499,10 @@ SETTINGS_PAGES = [
      "sections": [
          {"title": "Look", "controls": [
              {"key": "appearance.theme", "type": "choice",
-              "choices": ["Light", "Dark"], "label": "Theme",
-              "help": "Applies to every window, table, chart and dialog."},
+              "choices": ["Light", "Dark", "System"], "label": "Theme",
+              "help": "Applies to every window, table, chart and dialog. "
+                      "System follows your computer's light or dark "
+                      "setting (read when MiniWireshark starts)."},
          ]},
          {"title": "Layout", "controls": [
              {"key": "appearance.beginner_mode", "type": "bool",
@@ -23368,6 +23539,28 @@ SETTINGS_PAGES = [
               "choices": ["Small", "Normal", "Large", "Extra large"],
               "label": "Text size",
               "help": "Scales text and table rows throughout the app."},
+             {"key": "accessibility.ui_scale", "type": "choice",
+              "choices": list(UI_SCALE_CHOICES), "label": "Interface scale",
+              "help": "Automatic follows the screen. Choose a size when "
+                      "everything looks too small or too large (some Linux "
+                      "desktops report the wrong screen density). Takes "
+                      "full effect after restarting MiniWireshark."},
+         ]},
+         {"title": "Movement and keyboard", "controls": [
+             {"key": "appearance.reduce_motion", "type": "bool",
+              "label": "Reduce motion",
+              "help": "Nothing moves by itself: the Happening feed is calm "
+                      "and keeps its place, the packet list doesn't follow "
+                      "new packets, messages stay until you close them, "
+                      "highlights stay until your next click, and table "
+                      "rows never move under the pointer."},
+             {"type": "info", "text":
+              "Every action can be reached with the keyboard: Tab moves "
+              "between controls, Enter runs a dialog's main button and "
+              "Escape closes it. Help → Keyboard map lists every shortcut. "
+              "Screen readers: Tk, the toolkit MiniWireshark is built on, "
+              "shows them very little, so MiniWireshark doesn't claim to "
+              "support them; every report can be copied as plain text."},
          ]},
      ]},
     {"id": "capture", "icon": "\U0001F4E1", "title": "Capture",
@@ -25591,6 +25784,11 @@ class TableKit:
         self.note_row(iid, key)
         if not self.active() or self.sort_col == "#0":
             return
+        if getattr(self, "quiet", False):
+            # Reduce motion: rows never move under the pointer; the
+            # Re-sort line offers the new order
+            self._set_stale(True)
+            return
         got = self._ent.get(iid)
         if got is None:
             self.invalidate()
@@ -26347,8 +26545,8 @@ class DetailDialog:
         t = app.theme
         self.win = tk.Toplevel(app.root)
         self.win.title(title)
-        self.win.geometry(size)
-        self.win.minsize(420, 320)
+        self.win.geometry(px_geo(size))
+        self.win.minsize(px(420), px(320))
         self.win.configure(bg=t["tab_bg"])
         self.win.transient(app.root)
         top = tk.Frame(self.win, bg=t["tab_bg"], padx=14, pady=10)
@@ -26584,7 +26782,7 @@ def choose_from_list(app, title, prompt, options, parent=None):
     win = tk.Toplevel(parent or app.root)
     win.title(title)
     win.configure(bg=t["tab_bg"])
-    win.geometry("440x380")
+    win.geometry(px_geo("440x380"))
     win.transient(parent or app.root)
     tk.Label(win, text=prompt, bg=t["tab_bg"], fg=t["text_fg"],
              justify="left", wraplength=400).pack(anchor="w", padx=14,
@@ -26828,10 +27026,11 @@ class Charts:
                           fill=t["muted_fg"], font=norm)
             return
         line = cls.font(c, norm).metrics("linespace")
+        head = max(24, cls.font(c, bold).metrics("linespace") + 8)
         rowh_min = max(16, line + 2)
-        items = items[:max(1, int((h - 26) // rowh_min))]
-        rowh = max(rowh_min, min(24, (h - 26) / max(1, len(items))))
-        top = y + 24
+        items = items[:max(1, int((h - head - 2) // rowh_min))]
+        rowh = max(rowh_min, min(24, (h - head - 2) / max(1, len(items))))
+        top = y + head
         fsm = cls.font(c, small)
         valw = min(w * 0.35, max(fsm.measure(str(vt))
                                  for _l, _v, vt, _k in items) + 8)
@@ -27079,7 +27278,7 @@ class Inspector:
 
     def __init__(self, app, parent):
         self.app = app
-        self.frame = tk.Frame(parent, bg=WHITE, width=self.WIDTH)
+        self.frame = tk.Frame(parent, bg=WHITE, width=px(self.WIDTH))
         head = tk.Frame(self.frame, bg=WHITE, padx=10, pady=6)
         head.pack(fill="x")
         self.title_var = DisplayVar(value="Inspector")
@@ -27506,6 +27705,7 @@ class DashboardTab(BaseTab):
                             takefocus=1)
             card.grid(row=i // 6, column=i % 6, sticky="nsew", padx=4,
                       pady=4)
+            card.configure(highlightcolor="#2b7de9")
             self.card_frames.append(card)
             tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#888888",
                           font=mw_font(8, "bold"), anchor="w",
@@ -27556,6 +27756,7 @@ class DashboardTab(BaseTab):
                             highlightthickness=1, cursor="hand2",
                             takefocus=1)
             card.grid(row=0, column=i, sticky="nsew", padx=4)
+            card.configure(highlightcolor="#2b7de9")
             q = tk.Label(card, text=question, bg="#f6f7fa", fg="#2b3a56",
                          font=mw_font(10, "bold"), anchor="w",
                          justify="left")
@@ -27961,6 +28162,12 @@ class FeedTab(BaseTab):
             else:
                 rows = [(b["tag"], b["who"], b["did"], b["when"])
                         for b in buf]
+            anchor = None
+            if self.app.reduce_motion():
+                # keep the line you are reading where it is
+                with contextlib.suppress(tk.TclError):
+                    if self.tree.yview()[0] > 0:
+                        anchor = self.tree.identify_row(4)
             for row in rows:
                 self.rows.append(row)
                 if not self._match(row):
@@ -27969,6 +28176,11 @@ class FeedTab(BaseTab):
                 with contextlib.suppress(tk.TclError):
                     self.tree.insert("", 0, tags=(tag,),
                                      values=(who, did, when))
+            if anchor:
+                with contextlib.suppress(tk.TclError):
+                    n = len(self.tree.get_children())
+                    self.tree.yview_moveto(self.tree.index(anchor) /
+                                           max(1, n))
             kids = self.tree.get_children()
             if len(kids) > 500:
                 self.tree.delete(*kids[500:])
@@ -30823,7 +31035,7 @@ class MapTab(BaseTab):
             tt = self.c.create_text(X0, Y0 - R0 - 12,
                                     text="YOUR LOCAL NETWORK",
                                     fill=t["muted_fg"], tags=("deco",),
-                                    font=("TkDefaultFont", int(9 * ui),
+                                    font=("TkDefaultFont", 9,
                                           "bold"))
             if self.c.bbox(tt):
                 self._label_boxes = [self.c.bbox(tt)]
@@ -30885,7 +31097,7 @@ class MapTab(BaseTab):
                 self.c.create_text(X + R + 4, Y - R - 4, text="★",
                                    fill=t["warn_fg"],
                                    tags=(f"n:{dev.key}", "ov"),
-                                   font=("TkDefaultFont", int(10 * ui)))
+                                   font=("TkDefaultFont", 10))
             self._list_rows.append((dev.key, label.strip(),
                                     f"{dev.class_confidence} "
                                     f"{dev.device_class}".strip(),
@@ -30926,7 +31138,7 @@ class MapTab(BaseTab):
             it = self.c.create_text(X, self.P(0, ty)[1],
                                     text="INTERNET (outside your network)",
                                     fill=t["muted_fg"], tags=("deco",),
-                                    font=("TkDefaultFont", int(9 * ui),
+                                    font=("TkDefaultFont", 9,
                                           "bold"))
             if self.c.bbox(it):
                 self._label_boxes = getattr(self, "_label_boxes", []) + [
@@ -31226,7 +31438,7 @@ class HealthTab(BaseTab):
                                    bg=WHITE, fg="#2b3a56",
                                    font=mw_font(11, "bold"))
         self.hist_title.pack(anchor="w", pady=(10, 0))
-        self.hist = tk.Canvas(right, width=430, height=112, bg=WHITE,
+        self.hist = tk.Canvas(right, width=px(430), height=px(112), bg=WHITE,
                               highlightthickness=0)
         self.hist.pack(anchor="w")
         self.hist.bind("<Configure>", lambda e: self._draw_hist())
@@ -31234,7 +31446,7 @@ class HealthTab(BaseTab):
         tk.Label(right, text="Answer times (last hour)", bg=WHITE,
                  fg="#2b3a56", font=mw_font(11, "bold")).pack(
             anchor="w", pady=(10, 0))
-        self.strip = tk.Canvas(right, width=430, height=120, bg=WHITE,
+        self.strip = tk.Canvas(right, width=px(430), height=px(120), bg=WHITE,
                                highlightthickness=0)
         self.strip.pack(anchor="w")
         self.strip.bind("<Configure>", lambda e: self._draw_strip(True))
@@ -31279,6 +31491,10 @@ class HealthTab(BaseTab):
             top = max(counts)
             bw = (w - 20) / n
             base = h - 22
+            # labels that would touch: show every second (or third) one
+            fnt = Charts.font(c, ("TkDefaultFont", 7))
+            widest = max(fnt.measure(x) for x in DNS_BUCKET_LABELS) + 6
+            step = max(1, int(math.ceil(widest / max(1.0, bw))))
             slow = float(self.app.config.get("dns.slow_ms", 800))
             for i, v in enumerate(counts):
                 x0 = 10 + i * bw + 3
@@ -31293,10 +31509,12 @@ class HealthTab(BaseTab):
                     c.create_text((x0 + x1) / 2, base - bh - 7,
                                   text=f"{v / total:.0%}", fill=t["text_fg"],
                                   font=("TkDefaultFont", 7))
-                c.create_text((x0 + x1) / 2, base + 9,
-                              text=DNS_BUCKET_LABELS[i], fill=t["muted_fg"],
-                              font=("TkDefaultFont", 7))
-            c.create_text(w - 10, h - 4, text="ms", anchor="se",
+                if i % step == 0:
+                    c.create_text((x0 + x1) / 2, base + 9,
+                                  text=DNS_BUCKET_LABELS[i],
+                                  fill=t["muted_fg"],
+                                  font=("TkDefaultFont", 7))
+            c.create_text(w - 4, 2, text="ms", anchor="ne",
                           fill=t["muted_fg"], font=("TkDefaultFont", 7))
             Charts.record(c, (c.find_all() or (None,))[0],
                           self.hist_title.cget("text"),
@@ -32953,7 +33171,7 @@ class PacketsTab(BaseTab):
         t = self.app.theme
         win = tk.Toplevel(self.app.root)
         win.title("Filter fields")
-        win.geometry("720x520")
+        win.geometry(px_geo("720x520"))
         win.configure(bg=t["tab_bg"])
         bar = tk.Frame(win, bg=t["tab_bg"], padx=10, pady=8)
         bar.pack(fill="x")
@@ -35445,11 +35663,24 @@ def help_topics():
                     seq = cur.get(name) or DEFAULT_SHORTCUTS.get(name, "")
                     lines.append(f"{translate_text(c.get('label', name))}"
                                  f"  —  {_pretty_seq(seq) if seq else '—'}")
+        for name, keys in KEYMAP_FIXED:
+            lines.append(f"{translate_text(name)}  —  {keys}")
         lines.append("")
         lines.append("Change them in Settings → Shortcuts.")
         return "\n".join(lines)
-    add("Keyboard map", "Using MiniWireshark", keymap, (),
-        "shortcuts keys")
+    add("Keyboard map", "Using MiniWireshark", keymap,
+        (("Print this list", "do", "export_keymap"),), "shortcuts keys")
+    add("Keyboard and screen readers", "Using MiniWireshark",
+        "Every action can be reached with the keyboard: Tab and Shift+Tab "
+        "move between controls, the arrow keys move in lists and tabs, "
+        "Enter runs a dialog's main button and Escape closes it. The "
+        "focused control has a blue ring.\n\nScreen readers: Tk, the "
+        "toolkit MiniWireshark is built on, shows them very little on "
+        "Windows and macOS, so MiniWireshark doesn't claim to support "
+        "them. Every report and card can be copied as plain text (Copy "
+        "report), and every chart's numbers too (right-click it).",
+        (("Settings → Accessibility", "do", "open_accessibility_settings"),),
+        "accessibility keyboard focus screen reader")
     for term, defn in sorted(GLOSSARY, key=lambda x: x[0].lower()):
         add(term, "Glossary A–Z", defn, (), "glossary")
     add("Files", "About", lambda _app: f"Program: {SCRIPT_PATH}\nData "
@@ -35457,6 +35688,19 @@ def help_topics():
         (("Open data folder", "do", "open_data_folder"),), "folder log")
     globals()["_HELP_TOPICS"] = out
     return out
+
+
+# keys that are not settings, for the keyboard map
+KEYMAP_FIXED = (
+    ("Next / previous tab", "Ctrl+Tab / Ctrl+Shift+Tab"),
+    ("Move between controls", "Tab / Shift+Tab"),
+    ("Move in a list", "Up / Down / Page Up / Page Down / Home / End"),
+    ("Open the selected row", "Enter (double-click)"),
+    ("A row's menu", "Right-click (or the Menu key)"),
+    ("Close a window or a list", "Escape"),
+    ("Move the Timeline time", "Left / Right (Shift: ten minutes)"),
+    ("Complete a field name in a filter", "Tab"),
+)
 
 
 def help_body(topic, app):
@@ -36458,6 +36702,7 @@ class TabStrip:
         bar.pack(fill="x")
         lbl = tk.Label(outer, bg=side, fg=fg, padx=7, pady=3,
                        font=mw_font(10, "bold"), takefocus=1)
+        focus_ring(lbl)             # 5.1.2: the focus can be seen
         lbl.pack(fill="both", expand=True)
         for w in (outer, bar, lbl):
             w.bind("<Button-1>", lambda e, t=tid: self.select(t))
@@ -36742,7 +36987,8 @@ class MiniWireshark:
 
         self.config = config or AppConfig()
         setup_logging(self.config.get("diagnostics.verbose_logging", False))
-        self.theme_name = self.config.get("appearance.theme", "Light")
+        self.theme_name = resolve_theme(self.config.get("appearance.theme",
+                                                        "Light"))
         set_colorblind_mode(self.config.get("accessibility.colorblind",
                                             "Off"))
         self.high_contrast = bool(self.config.get("appearance.high_contrast",
@@ -36866,6 +37112,7 @@ class MiniWireshark:
         self.asof = None
         self.root.bind("<FocusOut>", self._on_root_focus_out, add="+")
         self.root.bind("<FocusIn>", self._on_root_focus_in, add="+")
+        self.apply_reduce_motion()
         self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map,
                              add="+")
         self._compact = None
@@ -37420,6 +37667,27 @@ class MiniWireshark:
             with contextlib.suppress(tk.TclError):
                 self._select_tab(last)
 
+    def reduce_motion(self):
+        return bool(self.config.get("appearance.reduce_motion", False))
+
+    def apply_reduce_motion(self):
+        """Things that move on their own stop doing so."""
+        on = self.reduce_motion()
+        with contextlib.suppress(Exception):
+            feed = self.tabs["feed"]
+            if on:
+                feed.speed = "🐢 Calm"
+                feed.speed_var.set(feed.speed)
+        with contextlib.suppress(Exception):
+            if on:
+                self.tabs["packets"].follow_var.set(False)
+        for kit in getattr(self, "kits", []):
+            kit.quiet = on
+        if on and getattr(self, "_banner_job", None):
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(self._banner_job)
+            self._banner_job = None
+
     def explain_on(self):
         return bool(self.config.get("appearance.explain_inline", False))
 
@@ -37567,6 +37835,7 @@ class MiniWireshark:
             w._mw_flowed = True
             w.after_idle(lambda: self._layout_pass(w))
             w.after(150, lambda: self._fit_toplevel(w))
+            w.after(200, lambda: dialog_contract(w))
 
     @staticmethod
     def _fit_toplevel(w):
@@ -37678,7 +37947,8 @@ class MiniWireshark:
             if getattr(self, "_banner_job", None):
                 self.root.after_cancel(self._banner_job)
                 self._banner_job = None
-            if kind in ("info", "good") and hasattr(self, "banner_close"):
+            if kind in ("info", "good") and hasattr(self, "banner_close") \
+                    and not self.reduce_motion():
                 self._banner_job = self.root.after(self.BANNER_SECONDS *
                                                    1000, self._hide_banner)
 
@@ -38127,7 +38397,7 @@ class MiniWireshark:
     def open_networks_dialog(self, parent=None):
         win = tk.Toplevel(parent or self.root)
         win.title("Your networks")
-        win.geometry("720x380")
+        win.geometry(px_geo("720x380"))
         win.transient(parent or self.root)
         t = self.theme
         win.configure(bg=t["card_bg"])
@@ -38234,7 +38504,7 @@ class MiniWireshark:
     def open_corrections(self, parent=None):
         win = tk.Toplevel(parent or self.root)
         win.title("Your identity corrections")
-        win.geometry("760x380")
+        win.geometry(px_geo("760x380"))
         t = self.theme
         win.configure(bg=t["card_bg"])
         tk.Label(win, text="Everything you changed about device identities "
@@ -38608,7 +38878,7 @@ class MiniWireshark:
         t = self.theme
         win = tk.Toplevel(self.root)
         win.title("Storage used")
-        win.geometry("760x420")
+        win.geometry(px_geo("760x420"))
         win.configure(bg=t["tab_bg"])
         tk.Label(win, text="Where MiniWireshark's disk space goes. Nothing "
                  "is sent anywhere.", bg=t["tab_bg"], fg=t["text_fg"],
@@ -39309,7 +39579,7 @@ class MiniWireshark:
         t = self.theme
         win = tk.Toplevel(self.root)
         win.title("Compare sessions")
-        win.geometry("620x230")
+        win.geometry(px_geo("620x230"))
         win.configure(bg=t["tab_bg"])
         win.transient(self.root)
         labels = [session_label(x) for x in sessions]
@@ -39412,7 +39682,7 @@ class MiniWireshark:
         win = tk.Toplevel(parent or self.root)
         self._repair_win = win
         win.title("Repair MiniWireshark")
-        win.geometry("640x460")
+        win.geometry(px_geo("640x460"))
         win.configure(bg=t["card_bg"])
         win.transient(parent or self.root)
         tk.Label(win, text="\U0001F6E0  Repair MiniWireshark", bg=t["card_bg"],
@@ -40034,7 +40304,7 @@ class MiniWireshark:
         t = self.theme
         win = tk.Toplevel(parent or self.root)
         win.title("Startup history")
-        win.geometry("820x560")
+        win.geometry(px_geo("820x560"))
         win.configure(bg=t["card_bg"])
         tk.Label(win, text="Each start of MiniWireshark writes what it did "
                            "and how long it took. If starting ever fails, "
@@ -40099,7 +40369,7 @@ class MiniWireshark:
         t = self.theme
         win = tk.Toplevel(parent)
         win.title("Export debug bundle")
-        win.geometry("760x560")
+        win.geometry(px_geo("760x560"))
         win.configure(bg=t["card_bg"])
         mask_var = tk.BooleanVar(value=True)
         tk.Label(win, text="Preview — this is exactly what will be saved. "
@@ -40236,6 +40506,36 @@ class MiniWireshark:
                 tab.open_topic(title)
         return tab
 
+    def open_accessibility_settings(self):
+        return self._open_settings("accessibility")
+
+    def keymap_html(self):
+        e = html.escape
+        cur = self.config.get("shortcuts", {}) or {}
+        rows = []
+        for page in SETTINGS_PAGES:
+            for sec in page["sections"]:
+                for c in sec["controls"]:
+                    if c.get("type") != "shortcut":
+                        continue
+                    name = c["key"].split(".", 1)[1]
+                    seq = cur.get(name) or DEFAULT_SHORTCUTS.get(name, "")
+                    rows.append((translate_text(c.get("label", name)),
+                                 _pretty_seq(seq) if seq else "—"))
+        rows += [(translate_text(a), b) for a, b in KEYMAP_FIXED]
+        return (f"<!doctype html><html><head><meta charset='utf-8'><title>"
+                f"{e(translate_text('Keyboard map'))}</title><style>"
+                f"{REPORT_CSS}</style></head><body><header><h1>"
+                f"{e(translate_text('Keyboard map'))}</h1><p>MiniWireshark "
+                f"{SCRIPT_VERSION}</p></header><main><section><table>" +
+                "".join(f"<tr><td>{e(a)}</td><td><b>{e(b)}</b></td></tr>"
+                        for a, b in rows) +
+                "</table></section></main></body></html>")
+
+    def export_keymap(self):
+        return self.redaction_preview("Keyboard map", self.keymap_html(),
+                                      "keyboard-map.html", redact=False)
+
     def open_data_folder(self):
         _open_path(PATHS.data)
 
@@ -40308,7 +40608,16 @@ class MiniWireshark:
             f.lift()
             bars.append(f)
         self._spot = (widget, bars)
-        self._spot_job = self.root.after(ms or self.SPOT_MS, self._spot_off)
+        if self.reduce_motion():
+            # still, until the next click anywhere
+            self._spot_job = None
+            self.root.after(300, lambda: self.root.bind_all(
+                "<Button-1>", lambda e: (self._spot_off(),
+                                         self.root.unbind_all("<Button-1>")),
+                "+"))
+        else:
+            self._spot_job = self.root.after(ms or self.SPOT_MS,
+                                             self._spot_off)
         return bars
 
     def _spot_off(self):
@@ -40424,7 +40733,7 @@ class MiniWireshark:
         t = self.theme
         win = tk.Toplevel(self.root)
         win.title(title_text)
-        win.geometry("560x330")
+        win.geometry(px_geo("560x330"))
         win.configure(bg=t["card_bg"])
         win.transient(self.root)
         state = {"i": 0}
@@ -40502,7 +40811,7 @@ class MiniWireshark:
         t = self.theme
         win = tk.Toplevel(self.root)
         win.title("Quick Start Guide")
-        win.geometry("620x420")
+        win.geometry(px_geo("620x420"))
         win.configure(bg=t["card_bg"])
         win.transient(self.root)
         state = {"i": 0}
@@ -40649,7 +40958,7 @@ class MiniWireshark:
 
     def _apply_theme(self, name=None, high_contrast=None):
         if name:
-            self.theme_name = name
+            self.theme_name = resolve_theme(name)
         if high_contrast is not None:
             self.high_contrast = bool(high_contrast)
         dark = (self.theme_name == "Dark")
@@ -41035,7 +41344,7 @@ class MiniWireshark:
     def _capture_shortcut(self, parent, name, display_var):
         win = tk.Toplevel(parent)
         win.title("New shortcut")
-        win.geometry("320x110")
+        win.geometry(px_geo("320x110"))
         win.transient(parent)
         tk.Label(win, text="Press the new key combination now\n"
                           "(Esc to cancel)", pady=24,
@@ -42049,7 +42358,7 @@ class MiniWireshark:
         cls = CONNECTOR_KINDS.get(kind or "pihole")
         win = tk.Toplevel(self.root)
         win.title(("Edit " if cid else "Add ") + cls.title)
-        win.geometry("600x470")
+        win.geometry(px_geo("600x470"))
         win.configure(bg=t["tab_bg"])
         win.transient(self.root)
         body = tk.Frame(win, bg=t["tab_bg"], padx=16, pady=12)
@@ -42234,7 +42543,7 @@ class MiniWireshark:
         win = tk.Toplevel(self.root)
         win.title("Why is my Internet slow?" if which == "slow" else
                   "What is using my bandwidth?")
-        win.geometry("760x640")
+        win.geometry(px_geo("760x640"))
         win.configure(bg=t["tab_bg"])
         top = tk.Frame(win, bg=t["tab_bg"], padx=14, pady=10)
         top.pack(fill="x")
@@ -43272,7 +43581,7 @@ class MiniWireshark:
                 old.destroy()
         win = tk.Toplevel(self.root)
         win.title(tr("Compare devices"))
-        win.geometry("760x520")
+        win.geometry(px_geo("760x520"))
         win.configure(bg=t["card_bg"])
         win.transient(self.root)
         self._compare_win = win
@@ -44358,7 +44667,7 @@ class MiniWireshark:
             return None
         win = tk.Toplevel(self.root)
         win.title(tr("Review alerts"))
-        win.geometry("620x420")
+        win.geometry(px_geo("620x420"))
         win.configure(bg=t["card_bg"])
         win.transient(self.root)
         self._review_win = win
@@ -45118,7 +45427,7 @@ class MiniWireshark:
         t = self.theme
         win = tk.Toplevel(self.root)
         win.title(f"{title} — preview")
-        win.geometry("1100x700")
+        win.geometry(px_geo("1100x700"))
         win.configure(bg=t["tab_bg"])
         bar = tk.Frame(win, bg=t["tab_bg"], padx=12, pady=8)
         bar.pack(fill="x")
@@ -45537,7 +45846,7 @@ class MiniWireshark:
         t = self.theme
         win = tk.Toplevel(self.root)
         win.title(f"Search results for “{q}”")
-        win.geometry("620x480")
+        win.geometry(px_geo("620x480"))
         win.configure(bg=t["tab_bg"])
         win.transient(self.root)
         tk.Label(win, text=f"{sum(len(v) for v in res.values())} result(s). "
@@ -45618,7 +45927,7 @@ class MiniWireshark:
         set_locale(cfg.get("general.language", "English"))
         self._apply_locale()
         self._apply_shortcuts()
-        theme = cfg.get("appearance.theme", "Light")
+        theme = resolve_theme(cfg.get("appearance.theme", "Light"))
         hc = bool(cfg.get("appearance.high_contrast", False))
         cvd_before = CVD_STATE["mode"]
         set_colorblind_mode(cfg.get("accessibility.colorblind", "Off"))
@@ -45626,6 +45935,7 @@ class MiniWireshark:
                 cvd_before != CVD_STATE["mode"]:
             self._apply_theme(theme, hc)
         self._apply_text_size(cfg.get("appearance.text_size", "Normal"))
+        self.apply_reduce_motion()
         self._restyle_mode_banner()
         if self.lan_scanner is None:
             self._start_lan_scanner()
@@ -45996,7 +46306,7 @@ class MiniWireshark:
         win = tk.Toplevel(parent or self.root)
         self._cc_win = win
         win.title("Components Center")
-        win.geometry("980x680")
+        win.geometry(px_geo("980x680"))
         win.minsize(820, 560)
         win.configure(bg=t["tab_bg"])
         tk.Label(win, text="\U0001F9E9  Components Center", bg=t["tab_bg"],
@@ -46213,7 +46523,7 @@ class MiniWireshark:
         t = self.theme
         win = tk.Toplevel(parent or self.root)
         win.title("What MiniWireshark itself sent")
-        win.geometry("900x560")
+        win.geometry(px_geo("900x560"))
         win.configure(bg=t["tab_bg"])
         top = tk.Frame(win, bg=t["tab_bg"], padx=12, pady=8)
         top.pack(fill="x")
@@ -47357,7 +47667,7 @@ class DiagnosticsWindow:
         t = app.theme
         self.win = tk.Toplevel(app.root)
         self.win.title("MiniWireshark diagnostics")
-        self.win.geometry("760x640")
+        self.win.geometry(px_geo("760x640"))
         self.win.configure(bg=t["tab_bg"])
         top = tk.Frame(self.win, bg=t["tab_bg"], padx=12, pady=8)
         top.pack(fill="x")
@@ -47689,7 +47999,7 @@ class CommandPalette:
         self.items = app.palette_items()
         self.win = tk.Toplevel(app.root)
         self.win.title("Go to…")
-        self.win.geometry("620x420")
+        self.win.geometry(px_geo("620x420"))
         self.win.configure(bg=t["tab_bg"])
         self.win.transient(app.root)
         self.q = tk.StringVar()
@@ -47865,7 +48175,7 @@ class CrashDialog:
         t = app.theme
         win = tk.Toplevel(app.root)
         win.title("Something went wrong")
-        win.geometry("620x420")
+        win.geometry(px_geo("620x420"))
         win.configure(bg=t["tab_bg"])
         tk.Label(win, text="\U0001F915  MiniWireshark hit an unexpected problem",
                  bg=t["tab_bg"], fg=t["text_fg"],
@@ -59568,7 +59878,7 @@ def _gs_map3(app, ctx):
     app.replace_model(m)
     app.mode_ui_var.set("Advanced")
     app._on_ui_mode_change()
-    root.geometry("1400x900")
+    root.geometry(px_geo("1400x900"))
     tab = app._select_tab("map")
     _gui_pump(root, 0.3)
     t0 = time.perf_counter()
@@ -61098,7 +61408,7 @@ def gt_m4_shell(app, ctx):
         for lang in ("English", "Français", "Español"):
             app.config.set("general.language", lang)
             app._apply_runtime_settings()
-            root.geometry("1366x768")
+            root.geometry(px_geo("1366x768"))
             _gui_pump(root, 0.6)
             ts = app.tabstrip
             ts.relayout()
@@ -61616,6 +61926,165 @@ def gt_m7_expert(app, ctx):
         assert not app.tabs["connections"]._asof_note.winfo_ismapped()
 
 
+_KB_CONTROLS = (ttk.Button, ttk.Entry, ttk.Combobox, ttk.Checkbutton,
+                ttk.Radiobutton, ttk.Treeview, ttk.Menubutton, tk.Button,
+                tk.Entry, tk.Text, tk.Listbox)
+
+
+def keyboard_walk(app):
+    """{tab: [controls Tab can't reach]} for the view shown (5.1.2 M8):
+    every visible, enabled control and every tab label must be reached
+    by Tab from the header search box."""
+    root = app.root
+    out = {}
+    for name, tab in app.tabs.items():
+        if app.beginner_mode and tab.advanced:
+            continue
+        app._select_tab(name)
+        _gui_pump(root, 0.4)
+        seen, w = set(), app.search_entry
+        for _ in range(4000):
+            w = w.tk_focusNext()
+            if w is None or w in seen:
+                break
+            seen.add(w)
+        miss = []
+        for x in _all_widgets(root):
+            if not isinstance(x, _KB_CONTROLS):
+                continue
+            try:
+                if not x.winfo_viewable() or x.winfo_toplevel() is not root:
+                    continue
+                if isinstance(x, ttk.Widget) and x.instate(["disabled"]):
+                    continue
+                if not isinstance(x, ttk.Widget) and \
+                        str(x.cget("state")) == "disabled":
+                    continue
+            except tk.TclError:
+                continue
+            if x not in seen:
+                miss.append(str(x))
+        for _o, _b, lbl in app.tabstrip.tabs.values():
+            with contextlib.suppress(tk.TclError):
+                if lbl.winfo_viewable() and lbl not in seen:
+                    miss.append(str(lbl))
+        if miss:
+            out[name] = miss
+    return out
+
+
+@gui_test_step("5.1.2 M8: keyboard walk, focus rings, dialog contract, "
+               "reduce motion, interface scale, System theme, colour "
+               "never alone")
+def gt_m8_access(app, ctx):
+    root = app.root
+    mode = app.mode_ui_var.get()
+    try:
+        for view in ("Advanced", "Beginner"):
+            app.mode_ui_var.set(view)
+            app._on_ui_mode_change()
+            _gui_pump(root, 0.3)
+            miss = keyboard_walk(app)
+            assert not miss, (view, {k: v[:4] for k, v in miss.items()})
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+    # a tab label shows the focus without growing
+    _o, _b, lbl = next(iter(app.tabstrip.tabs.values()))
+    w0 = lbl.winfo_reqwidth()
+    lbl.focus_force()
+    _gui_pump(root, 0.2)
+    assert int(lbl.cget("highlightthickness")) == 2
+    assert abs(lbl.winfo_reqwidth() - w0) <= 1
+    app.search_entry.focus_force()
+    _gui_pump(root, 0.1)
+    assert int(lbl.cget("highlightthickness")) == 0
+    # dialogs: Escape closes, Enter runs the main button
+    q = app.open_quick_start()
+    _gui_pump(root, 0.5)
+    assert q.bind("<Escape>") and q.bind("<Return>")
+    title = [x for x in _walk_class(q, tk.Label)
+             if "1." in str(x.cget("text"))]
+    q.focus_force()
+    _gui_pump(root, 0.1)
+    q.event_generate("<Return>")
+    _gui_pump(root, 0.2)
+    assert not title or "2." in str(title[0].cget("text"))
+    q.event_generate("<Escape>")
+    _gui_pump(root, 0.2)
+    assert not q.winfo_exists()
+    # reduce motion: nothing moves by itself
+    app.config.set("appearance.reduce_motion", True)
+    try:
+        app.apply_reduce_motion()
+        assert app.tabs["feed"].speed == "🐢 Calm"
+        assert not app.tabs["packets"].follow_var.get()
+        assert all(getattr(k, "quiet", False) for k in app.kits)
+        app._set_banner("M8 still message")
+        assert not getattr(app, "_banner_job", None)
+        app.show_me("devices", "tree")
+        assert getattr(app, "_spot_job", None) is None and app._spot[1]
+        app._spot_off()
+        root.unbind_all("<Button-1>")
+    finally:
+        app.config.set("appearance.reduce_motion", False)
+        app.apply_reduce_motion()
+        app.tabs["packets"].follow_var.set(
+            app.config.get("capture.follow_newest", True))
+    app._hide_banner()
+    # interface scale
+    old = UI_SCALE[0]
+    try:
+        UI_SCALE[0] = 1.5
+        assert px(100) == 150 and px_geo("560x620") == "840x930"
+        assert px_geo("560x620+10+20") == "840x930+10+20"
+    finally:
+        UI_SCALE[0] = old
+    assert px_geo("560x620") == px_geo("560x620")
+    # the window at 150 %: nothing cut off or drawn over (the Linux stand-in
+    # for the Windows 125-200 % check, which needs a Windows machine)
+    sc0 = float(root.tk.call("tk", "scaling"))
+    geo0 = root.geometry()
+    found = []
+    try:
+        apply_ui_scale(root, "150 %")
+        root.geometry(px_geo("1366x768"))
+        app._apply_text_size(defer=False)
+        _gui_pump(root, 0.8)
+        for name in ("dash", "devices", "health", "alerts", "map"):
+            app._select_tab(name)
+            _gui_pump(root, 0.6)
+            found += [(name,) + x for x in layout_audit(root)
+                      if x[0] in ("canvas-text-overlap", "overlap")]
+    finally:
+        root.tk.call("tk", "scaling", sc0)
+        UI_SCALE[0] = old
+        root.geometry(geo0)
+        app._apply_text_size(defer=False)
+        _gui_pump(root, 0.5)
+    assert not found, found[:5]
+    # System theme: resolved to Light or Dark, never a palette of its own
+    assert resolve_theme("System") in ("Light", "Dark")
+    assert palette_name("System", False) in PALETTES
+    # colour never alone: status cells carry a word or a symbol in every
+    # colour-blind mode
+    cvd = CVD_STATE["mode"]
+    try:
+        for label in CVD_LABELS:
+            set_colorblind_mode(label)
+            for name, cols in (("alerts", ("sev",)),
+                               ("devices", ("conf", "status",
+                                            "evidence"))):
+                tree = app.tabs[name].tree
+                for iid in tree.get_children()[:50]:
+                    for c in cols:
+                        v = str(tree.set(iid, c)).strip()
+                        assert re.search(r"[A-Za-z◉◈◎◌?●○✔⚠‼ℹ]", v), \
+                            (label, name, c, v)
+    finally:
+        set_colorblind_mode(cvd or "Off")
+
+
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
 # Labels that change with the state of the row a menu was opened on are
 # folded to one name, so the snapshot does not depend on which row was first.
@@ -62120,7 +62589,11 @@ def main():
     LEDGER.killed = bool(cfg.get("privacy.kill_switch", False))
     set_colorblind_mode(cfg.get("accessibility.colorblind", "Off"))
     set_locale(cfg.get("general.language", "English"))
+    if not SAFE_MODE:
+        enable_dpi_awareness()
     root = tk.Tk()
+    apply_ui_scale(root, "Automatic" if SAFE_MODE else
+                   cfg.get("accessibility.ui_scale", "Automatic"))
     root.title("MiniWireshark")
     root.minsize(640, 520)
     _center_window(root, 760, 680)
@@ -62259,6 +62732,7 @@ SAFE_MODE_OVERRIDES = {
     "connectors.list": [],
     "updates.check_automatically": False,
     "privacy.auto_download_reference": False,
+    "accessibility.ui_scale": "Automatic",
 }
 
 
