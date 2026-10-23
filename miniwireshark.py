@@ -276,6 +276,33 @@ def atomic_write_text(path, text, encoding="utf-8"):
     os.replace(tmp, path)
 
 
+def atomic_write_bytes(path, data):
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def session_is_gz(path):
+    """A compressed session (5.1.2): by its name or its first bytes."""
+    if str(path).lower().endswith(".gz"):
+        return True
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
+
+
+def read_session_payload(path):
+    """A session file's JSON, plain or gzip-compressed."""
+    if session_is_gz(path):
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            return json.load(f)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def atomic_write_json(path, obj, compact=False):
     """compact=True: no indentation. json only uses its fast C encoder
     without indent, so this is several times quicker for big files
@@ -17615,6 +17642,7 @@ def _default_config():
                        "high_contrast": False, "text_size": "Normal",
                        "inspector": None, "tables": {}, "window": "",
                        "explain_inline": False, "folds": {},
+                       "panes": {},
                        "last_tab": ""},
         "capture": {"max_stored_events": 5000, "promiscuous": True,
                     "auto_select_interface": True,
@@ -17956,6 +17984,7 @@ class SessionCodec:
                 "my_ips": sorted(model.my_ips),
                 "demo": bool(model.demo),
                 "vpn": dict(model.vpn),
+                "bookmarks": list(meta.get("bookmarks") or []),
             },
             "devices": [device_to_dict(d) for d in
                         model.registry.by_key.values()],
@@ -18011,6 +18040,8 @@ class SessionCodec:
                 "my_ips": sorted(model.my_ips),
                 "demo": bool(model.demo),
                 "vpn": dict(model.vpn),
+                # 5.1.2: packet bookmarks (5.0.2 ignores the key)
+                "bookmarks": list(meta.get("bookmarks") or []),
             },
         }
         yield enc(head)[:-1]
@@ -18097,6 +18128,9 @@ class SessionCodec:
         model.set_identity(gateway_ip=sess.get("gateway", "") or "",
                            my_ips=sess.get("my_ips") or [])
         model.demo = bool(sess.get("demo"))
+        with contextlib.suppress(TypeError, ValueError):
+            model.loaded_bookmarks = sorted(
+                int(x) for x in (sess.get("bookmarks") or [])[:5000])
         for dd in payload.get("devices", []) or []:
             if not isinstance(dd, dict):
                 continue
@@ -18790,6 +18824,25 @@ def change_digest(model, store=None, since=0.0, until=None):
               "dns_changes", "network", "alerts"):
         out[k].sort(key=lambda t: t[0])
     return out
+
+
+def device_online_at(dev, t):
+    """Was the device online at time t? From its presence intervals —
+    exact for this session (no interval: only first/last seen)."""
+    if dev.first_seen > t:
+        return False
+    if not dev.presence:
+        return dev.first_seen <= t <= (dev.last_seen or t)
+    for start, end in dev.presence:
+        if start <= t and (end is None or end >= t):
+            return True
+    return False
+
+
+def website_known_at(w, t):
+    """First seen by t. It does not claim the site was in use at t: only
+    the first and last times are kept."""
+    return w.first_seen <= t
 
 
 def timeline_match(e, since=0.0, severity="All", category="All types",
@@ -21126,6 +21179,47 @@ Set its category… ¦ Définir sa catégorie… ¦ Definir su categoría…
 Website category ¦ Catégorie du site ¦ Categoría del sitio
 No checks in the last hour (they need live watching with Active Scanning) ¦ Aucune vérification au cours de la dernière heure (il faut observer en direct avec l'analyse active) ¦ Ninguna comprobación en la última hora (hace falta observar en directo con el análisis activo)
 No checks yet ¦ Pas encore de vérification ¦ Aún no hay comprobaciones
++ and ¦ + et ¦ + y
++ or ¦ + ou ¦ + o
+All packets are analysed; the Packets list keeps the last %d. ¦ Tous les paquets sont analysés ; la liste des paquets garde les %d derniers. ¦ Se analizan todos los paquetes; la lista de paquetes conserva los últimos %d.
+Back to now ¦ Revenir à maintenant ¦ Volver a ahora
+Build… ¦ Construire… ¦ Construir…
+Compare devices ¦ Comparer des appareils ¦ Comparar dispositivos
+Compare one device across two days… ¦ Comparer un appareil sur deux jours… ¦ Comparar un dispositivo entre dos días…
+Compressed session (smaller; MiniWireshark 5.0.2 can't open it) ¦ Session compressée (plus petite ; MiniWireshark 5.0.2 ne peut pas l'ouvrir) ¦ Sesión comprimida (más pequeña; MiniWireshark 5.0.2 no puede abrirla)
+Device inventory ¦ Inventaire des appareils ¦ Inventario de dispositivos
+Network sheet (printable)… ¦ Fiche du réseau (imprimable)… ¦ Ficha de la red (para imprimir)…
+Network sheet ¦ Fiche du réseau ¦ Ficha de la red
+Pinned %s. Pin a second device to compare. ¦ %s épinglé. Épinglez un deuxième appareil pour comparer. ¦ %s fijado. Fije un segundo dispositivo para comparar.
+Pinned %s; %s was unpinned (two at a time). ¦ %s épinglé ; %s a été désépinglé (deux à la fois). ¦ %s fijado; %s se ha desfijado (dos a la vez).
+Showing %s, not now ¦ Affichage de %s, pas de maintenant ¦ Mostrando %s, no ahora
+Showing now; the time on Timeline applies to Timeline, Devices and Websites. ¦ Affichage de maintenant ; l'heure choisie dans la Chronologie s'applique à la Chronologie, aux Appareils et aux Sites web. ¦ Mostrando ahora; la hora de la Cronología se aplica a Cronología, Dispositivos y Sitios web.
+Sorting by a field column works up to 5,000 rows; filter the list first. ¦ Le tri par une colonne de champ fonctionne jusqu'à 5 000 lignes ; filtrez d'abord la liste. ¦ Ordenar por una columna de campo funciona hasta 5.000 filas; filtre antes la lista.
+Top websites ¦ Principaux sites web ¦ Sitios web principales
+Unpinned ¦ Désépinglé ¦ Desfijado
+shared ¦ en commun ¦ en común
+● = both use it. Counted from this session's data only. ¦ ● = les deux l'utilisent. Compté uniquement d'après les données de cette session. ¦ ● = ambos lo usan. Contado solo con los datos de esta sesión.
+Pin to compare ¦ Épingler pour comparer ¦ Fijar para comparar
+Unpin ¦ Désépingler ¦ Desfijar
+Show as a column ¦ Afficher comme colonne ¦ Mostrar como columna
+Remove the column ¦ Retirer la colonne ¦ Quitar la columna
+Online this session ¦ En ligne pendant cette session ¦ Conectado en esta sesión
+Usual hours ¦ Heures habituelles ¦ Horario habitual
+Compare days ¦ Comparer des jours ¦ Comparar días
+First day: ¦ Premier jour : ¦ Primer día:
+Second day: ¦ Deuxième jour : ¦ Segundo día:
+Sorting the packets ¦ Tri des paquets ¦ Ordenando los paquetes
+Events per minute. Click or drag to see Timeline, Devices and Websites as of that minute; Left/Right move a minute, Shift ten, Escape goes back to now. ¦ Événements par minute. Cliquez ou faites glisser pour voir la Chronologie, les Appareils et les Sites web à cette minute ; Gauche/Droite avancent d'une minute, Maj de dix, Échap revient à maintenant. ¦ Eventos por minuto. Haga clic o arrastre para ver Cronología, Dispositivos y Sitios web en ese minuto; Izquierda/Derecha mueven un minuto, Mayús diez, Escape vuelve a ahora.
+Needs the saved history (Settings → History), which keeps traffic per device per day. ¦ Nécessite l'historique enregistré (Paramètres → Historique), qui garde le trafic par appareil et par jour. ¦ Necesita el historial guardado (Configuración → Historial), que guarda el tráfico por dispositivo y por día.
+Comparing days needs the saved history (Settings → History). ¦ Comparer des jours nécessite l'historique enregistré (Paramètres → Historique). ¦ Comparar días necesita el historial guardado (Configuración → Historial).
+There is only one saved day for this device so far. ¦ Il n'y a qu'un jour enregistré pour cet appareil pour l'instant. ¦ Por ahora solo hay un día guardado para este dispositivo.
+Only Length can be greater or less than. ¦ Seule la longueur peut être supérieure ou inférieure. ¦ Solo la longitud puede ser mayor o menor que.
+Length needs a number. ¦ La longueur demande un nombre. ¦ La longitud necesita un número.
+Connection ¦ Connexion ¦ Conexión
+is ¦ est ¦ es
+is not ¦ n'est pas ¦ no es
+greater than ¦ supérieur à ¦ mayor que
+less than ¦ inférieur à ¦ menor que
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -27991,6 +28085,25 @@ class TimelineTab(BaseTab):
         self.changes_btn.pack(side="right", padx=6)
         self.oldest_ts = self.cursor = None
         self.exhausted = False
+        # 5.1.2: events per minute; click or drag to see the session as of
+        # that minute (Left/Right: a minute, Shift: ten, Escape: now)
+        self.strip = tk.Canvas(self.frame, height=28, bg=WHITE,
+                               highlightthickness=0, takefocus=1,
+                               cursor="hand2")
+        self.strip.pack(fill="x", padx=8, pady=(0, 2))
+        self.strip.bind("<Button-1>", self._strip_click)
+        self.strip.bind("<B1-Motion>", self._strip_click)
+        self.strip.bind("<Configure>", lambda e: self.draw_strip(True))
+        for seq, d in (("<Left>", -60), ("<Right>", 60),
+                       ("<Shift-Left>", -600), ("<Shift-Right>", 600)):
+            self.strip.bind(seq, lambda e, dd=d: self._strip_step(dd))
+        self.strip.bind("<Escape>", lambda e: self.app.set_asof(None))
+        Tooltip(self.strip, "Events per minute. Click or drag to see "
+                            "Timeline, Devices and Websites as of that "
+                            "minute; Left/Right move a minute, Shift ten, "
+                            "Escape goes back to now.")
+        self._strip_sig = None
+        self.asof_bar = AsofBar(self)
         wrap, self.tree = make_tree(
             self.frame, [("sev", "Severity", 100, "w", False),
                          ("when", "Time", 80, "center", False),
@@ -28016,6 +28129,96 @@ class TimelineTab(BaseTab):
         cb.pack(side="left", padx=(4, 10))
         cb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
         return cb
+
+    STRIP_MAX_BARS = 1440
+
+    def strip_span(self):
+        """The session's time range on the strip (the Timeline's own
+        events decide; live, it runs to now)."""
+        m = self.model
+        now = m.now()
+        tl = m.timeline
+        if tl:
+            start, end = tl[0]["when"], tl[-1]["when"]
+        elif m.metrics.first_ts:
+            start, end = m.metrics.first_ts, m.metrics.last_ts or now
+        else:
+            start, end = now - 60, now
+        if self.app.data_mode == "live":
+            end = max(end, now)
+        return start, max(end, start + 60)
+
+    def strip_bins(self):
+        start, end = self.strip_span()
+        width = max(60.0, (end - start) / self.STRIP_MAX_BARS)
+        width = 60.0 * math.ceil(width / 60.0)
+        n = max(1, int(math.ceil((end - start) / width)))
+        bins = [0] * n
+        for e in self.model.timeline:
+            i = int((e["when"] - start) // width)
+            if 0 <= i < n:
+                bins[i] += 1
+        return start, width, bins
+
+    def draw_strip(self, force=False):
+        c, t = self.strip, self.t
+        try:
+            w, h = max(100, c.winfo_width()), int(c.cget("height"))
+        except tk.TclError:
+            return
+        start, width, bins = self.strip_bins()
+        asof = getattr(self.app, "asof", None)
+        sig = (w, len(bins), sum(bins), asof, self.app.theme_name)
+        if not force and sig == self._strip_sig:
+            return
+        self._strip_sig = sig
+        with contextlib.suppress(tk.TclError):
+            c.configure(bg=t["tab_bg"])
+            c.delete("all")
+            top = max(bins) or 1
+            bw = w / len(bins)
+            bar = max(1, min(bw - 1, 8))     # a short session: thin bars
+            for i, v in enumerate(bins):
+                if v:
+                    bh = max(2, (h - 6) * v / top)
+                    x0 = i * bw + (bw - bar) / 2
+                    c.create_rectangle(x0, h - 2 - bh, x0 + bar, h - 2,
+                                       fill=t["chart_a"], outline="")
+            c.create_line(0, h - 1, w, h - 1, fill=t["grid"])
+            if asof is not None:
+                x = (asof - start) / (width * len(bins)) * w
+                c.create_line(x, 0, x, h, fill=t["warn_fg"], width=2)
+                c.create_text(min(w - 30, x + 4), 2, anchor="nw",
+                              text=hm_clock(asof), fill=t["warn_fg"],
+                              font=("TkDefaultFont", 8, "bold"))
+
+    def _strip_click(self, e):
+        with contextlib.suppress(tk.TclError):
+            self.strip.focus_set()
+        start, width, bins = self.strip_bins()
+        w = max(1, self.strip.winfo_width())
+        t = start + max(0, min(1, e.x / w)) * width * len(bins)
+        self.app.set_asof(t)
+
+    def _strip_step(self, d):
+        cur = getattr(self.app, "asof", None)
+        cur = cur if cur is not None else self.model.now()
+        self.app.set_asof(cur + d)
+        return "break"
+
+    def mark_asof(self, t):
+        """Scroll to the last event at or before t and select it."""
+        best = None
+        for iid in self.tree.get_children():
+            e = self.refs.get(iid)
+            if e and e["when"] <= t:
+                best = iid
+                break
+        if best is not None:
+            with contextlib.suppress(tk.TclError):
+                self.tree.see(best)
+                self.tree.selection_set(best)
+        return best
 
     LIVE_ZOOMS = ["Last 5 minutes", "Last hour", "Full session"]
     HISTORY_ZOOMS = ["Last hour", "Last 24 hours", "Last 7 days",
@@ -28114,6 +28317,9 @@ class TimelineTab(BaseTab):
             self.search_var.get().strip().lower()
 
     def add(self, entries):
+        with contextlib.suppress(Exception):
+            if self.is_visible():
+                self.draw_strip()
         if self.pause_var.get() or self.history_mode():
             return
         cutoff, dev_key, q = self._filters()
@@ -28431,11 +28637,17 @@ class DevicesTab(BaseTab):
         self.rebuild()
 
     def _visible(self, dev):
-        if not dev.live:
+        asof = getattr(self.app, "asof", None)
+        if asof is not None:
+            if not device_online_at(dev, asof):
+                return False
+        elif not dev.live:
             return True
-        if dev.state == STATE_EXPIRED and not self.show_expired_var.get():
+        elif dev.state == STATE_EXPIRED and \
+                not self.show_expired_var.get():
             return False
-        if dev.state == STATE_INACTIVE and not self.show_inactive_var.get():
+        elif dev.state == STATE_INACTIVE and \
+                not self.show_inactive_var.get():
             return False
         q = self.filter_var.get().strip().lower()
         if q:
@@ -28761,6 +28973,9 @@ class WebsitesTab(BaseTab):
         self.rebuild()
 
     def _match(self, w, dev_key):
+        asof = getattr(self.app, "asof", None)
+        if asof is not None and not website_known_at(w, asof):
+            return False
         q = self.q_var.get().strip().lower()
         if q and q not in w.domain and q not in w.registrable:
             return False
@@ -31864,6 +32079,90 @@ def _in_net(v, net):
         return False
 
 
+# 5.1.2 M7: plain-word filter rows → DisplayFilter's own syntax (no new
+# language: every expression it writes is one DisplayFilter accepts)
+BUILDER_FIELDS = OrderedDict((
+    ("Device", "device"), ("Website", "site"), ("Address", "ip"),
+    ("Source", "src"), ("Destination", "dst"), ("Port", "port"),
+    ("Protocol", "proto"), ("Direction", "dir"), ("Severity", "sev"),
+    ("Length", "len"), ("Text", "text"), ("Connection", "stream"),
+))
+BUILDER_OPS = ("is", "is not", "greater than", "less than")
+BUILDER_VALUES = {"dir": ("up", "down", "lan", "bcast", "other"),
+                  "sev": ("info", "warning", "danger")}
+
+
+def builder_term(field, op, value):
+    """One row → one term, or raise ValueError."""
+    key = BUILDER_FIELDS.get(field, field)
+    value = str(value or "").strip()
+    if not value:
+        raise ValueError(f"“{field}” needs a value.")
+    if key == "len" or op in ("greater than", "less than"):
+        if key != "len":
+            raise ValueError("Only Length can be greater or less than.")
+        if not value.isdigit():
+            raise ValueError("Length needs a number.")
+        return ("len>" if op == "greater than" else
+                "len<" if op == "less than" else "len>=") + value \
+            if op != "is" else f"len>={value} len<={value}"
+    v = value if re.match(r"^[^\s\"']+$", value) else \
+        '"' + value.replace('"', "") + '"'
+    term = f"{key}:{v}"
+    return "-" + term if op == "is not" else term
+
+
+def builder_expression(rows):
+    """rows: [(join, field, op, value)] (join of the first row ignored:
+    "and" / "or") → the expression text."""
+    out = []
+    for i, (join, fname, op, value) in enumerate(rows):
+        term = builder_term(fname, op, value)
+        if i:
+            out.append("or" if join == "or" else "and")
+        out.append(term)
+    return " ".join(out)
+
+
+def builder_rows(expr):
+    """The expression as rows, or None when the builder can't show it
+    (parentheses, field syntax, bare words): then it says “Edit as
+    text” instead of guessing."""
+    expr = (expr or "").strip()
+    if not expr:
+        return []
+    if FieldFilter.looks_like(expr):
+        return None
+    try:
+        toks = shlex.split(expr)
+    except ValueError:
+        return None
+    names = {v: k for k, v in BUILDER_FIELDS.items()}
+    rows, join, pending_len = [], "and", None
+    for tok in toks:
+        low = tok.lower()
+        if low in ("and", "or"):
+            join = low
+            continue
+        neg = tok.startswith("-") and len(tok) > 1
+        body = tok[1:] if neg else tok
+        m = re.match(r"^len\s*([<>])=?\s*(\d+)$", body.lower())
+        if m and not neg:
+            rows.append((join, "Length", "greater than" if m.group(1) == ">"
+                         else "less than", m.group(2)))
+            join = "and"
+            continue
+        if ":" not in body:
+            return None
+        f, v = body.split(":", 1)
+        if f.lower() not in names or not v:
+            return None
+        rows.append((join, names[f.lower()], "is not" if neg else "is", v))
+        join = "and"
+    del pending_len
+    return rows
+
+
 class DisplayFilter:
     """A friendly display filter. GUI fields AND an optional text
     expression:  terms are ANDed, `or` separates alternatives, `-term` or
@@ -32303,6 +32602,11 @@ class PacketsTab(BaseTab):
                     "smtp    expert.severity >= warning    frame.len > 1000")
         ttk.Button(self.adv_row, text="Fields…",
                    command=self.open_fields).pack(side="left", padx=(0, 4))
+        ttk.Button(self.adv_row, text="Build…",
+                   command=self.toggle_builder).pack(side="left",
+                                                     padx=(0, 4))
+        self.builder = None
+        self.suggest = FieldSuggest(self, ee)
         ttk.Button(self.adv_row, text="Apply",
                    command=self.apply).pack(side="left")
         ttk.Button(self.adv_row, text="Clear filter",
@@ -32358,6 +32662,7 @@ class PacketsTab(BaseTab):
                  ).pack(side="right")
         vert = ttk.PanedWindow(self.frame, orient="vertical")
         vert.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        self.vert_pane = vert
         lf = tk.Frame(vert, bg=WHITE)
         vert.add(lf, weight=3)
         wrap, self.tree = make_tree(
@@ -32369,8 +32674,15 @@ class PacketsTab(BaseTab):
                  ("proto", "Protocol", 80, "center", False),
                  ("length", "Length", 60, "e", False),
                  ("stream", "Conn.", 55, "e", False),
-                 ("info", "Info", 520, "w", True)], hscroll=True,
+                 ("info", "Info", 520, "w", True),
+                 # 5.1.2: up to three packet fields shown as columns
+                 ("f1", "", 120, "w", False), ("f2", "", 120, "w", False),
+                 ("f3", "", 120, "w", False)], hscroll=True,
             sortable=False)
+        self.custom = []                 # field keys in f1..f3
+        self._custom_keys = {}
+        self.tree.bind("<Button-3>", self._heading_menu, add="+")
+        self.apply_columns()
         self.tree.configure(height=14)
         wrap.pack(fill="both", expand=True)
         self.vbar = next(w for w in wrap.winfo_children()
@@ -32396,6 +32708,13 @@ class PacketsTab(BaseTab):
         tf = tk.Frame(nb, bg=WHITE)
         dpane = ttk.PanedWindow(tf, orient="horizontal")
         dpane.pack(fill="both", expand=True)
+        self.detail_pane = dpane
+        # 5.1.2: where you put the dividers is kept (appearance.panes)
+        for pw, name in ((vert, "packets.list"), (dpane, "packets.detail")):
+            pw.bind("<ButtonRelease-1>", lambda e, w=pw, n=name:
+                    self._pane_moved(w, n), add="+")
+            pw.bind("<Map>", lambda e, w=pw, n=name: self._pane_restore(
+                w, n), add="+")
         tleft = tk.Frame(dpane, bg=WHITE)
         dpane.add(tleft, weight=3)
         self.dtree = ttk.Treeview(tleft, columns=("value",),
@@ -32454,6 +32773,53 @@ class PacketsTab(BaseTab):
             want = app.root.winfo_screenheight() >= 900
         self.toggle_quick_filters(bool(want), remember=False)
         self.fit_time_column()
+
+    def _pane_moved(self, pw, name):
+        try:
+            total = pw.winfo_height() if str(pw.cget("orient")) == \
+                "vertical" else pw.winfo_width()
+            pos = pw.sashpos(0)
+        except tk.TclError:
+            return
+        if total <= 40:
+            return
+        panes = dict(self.app.config.get("appearance.panes", {}) or {})
+        frac = round(pos / total, 3)
+        if panes.get(name) != frac:
+            panes[name] = frac
+            self.app.config.set("appearance.panes", panes)
+            self.app.config.save()
+
+    def _pane_restore(self, pw, name):
+        if getattr(pw, "_mw_restored", False):
+            return
+        frac = (self.app.config.get("appearance.panes", {}) or {}).get(name)
+        if not isinstance(frac, (int, float)) or not 0.1 <= frac <= 0.9:
+            pw._mw_restored = True
+            return
+
+        def place():
+            try:
+                total = pw.winfo_height() if str(pw.cget("orient")) == \
+                    "vertical" else pw.winfo_width()
+                if total > 40:
+                    pw.sashpos(0, int(total * frac))
+                    pw._mw_restored = True
+            except tk.TclError:
+                pass
+        pw.after_idle(place)
+
+    # ---- the plain-word filter builder (5.1.2 M7) ------------------------
+    def toggle_builder(self, show=None):
+        b = self.builder
+        if b is not None and (show is None or show is False):
+            with contextlib.suppress(tk.TclError):
+                b.frame.destroy()
+            self.builder = None
+            return None
+        if b is None and show is not False:
+            self.builder = FilterBuilder(self)
+        return self.builder
 
     def _show_err(self):
         try:
@@ -32793,11 +33159,166 @@ class PacketsTab(BaseTab):
 
     def _values(self, d, prev=None):
         app = self.app
-        return (d["no"], "★" if d["no"] in app.bookmarks else "",
+        base = (d["no"], "★" if d["no"] in app.bookmarks else "",
                 self.time_text(d, prev),
                 app.disp_addr(d["src_ip"], d["src_mac"]),
                 app.disp_addr(d["dst_ip"], d["dst_mac"]), d["proto"],
                 d["length"], d.get("flow_id") or "", d["text"])
+        if not self.custom:
+            return base
+        return base + tuple(self.field_text(d, f) for f in self.custom)
+
+    # ---- columns (5.1.2 M7) -------------------------------------------------
+    BASE_COLS = ("no", "mark", "time", "src", "dst", "proto", "length",
+                 "stream", "info")
+    SLOTS = ("f1", "f2", "f3")
+
+    def field_values(self, d, field, ctx=None):
+        ctx = ctx or self.ctx
+        if field in ("frame.len", "frame.number", "ip.src", "ip.dst",
+                     "ip.addr", "ipv6.src", "ipv6.dst", "ipv6.addr",
+                     "tcp.srcport", "tcp.dstport", "tcp.port",
+                     "udp.srcport", "udp.dstport", "udp.port",
+                     "eth.src", "eth.dst", "eth.addr", "tcp.stream"):
+            return [v for v in _row_field(d, field) if v is not None]
+        try:
+            return list(ctx.dissection(d).values(field))
+        except Exception:                            # noqa: BLE001
+            return []
+
+    def field_text(self, d, field):
+        vals = self.field_values(d, field)
+        return ", ".join(str(v) for v in vals[:4])[:80]
+
+    def _cols_cfg(self):
+        tables = self.app.config.get("appearance.tables") or {}
+        return dict(tables.get("packets") or {})
+
+    def _save_cols(self, cols):
+        cfg = self.app.config
+        tables = dict(cfg.get("appearance.tables") or {})
+        st = dict(tables.get("packets") or {})
+        st["cols"], st["custom"] = list(cols), list(self.custom)
+        tables["packets"] = st
+        cfg.set("appearance.tables", tables)
+        cfg.save()
+
+    def shown_cols(self):
+        cols = self._cols_cfg().get("cols")
+        valid = set(self.BASE_COLS) | set(self.SLOTS[:len(self.custom)])
+        cols = [c for c in (cols or self.BASE_COLS) if c in valid]
+        return cols or list(self.BASE_COLS)
+
+    def apply_columns(self):
+        self.custom = [f for f in (self._cols_cfg().get("custom") or [])
+                       if isinstance(f, str)][:3]
+        for slot, f in zip(self.SLOTS, self.custom):
+            with contextlib.suppress(tk.TclError):
+                self.tree.heading(slot, text=f, command=lambda c=slot:
+                                  self._sort_by(c))
+        with contextlib.suppress(tk.TclError):
+            self.tree.configure(displaycolumns=self.shown_cols())
+
+    def set_column(self, col, shown):
+        cols = list(self.shown_cols())
+        if shown and col not in cols:
+            cols.append(col)
+            order = list(self.BASE_COLS[:-1]) + list(self.SLOTS) + ["info"]
+            cols.sort(key=order.index)
+        elif not shown and col in cols and len(cols) > 1:
+            cols.remove(col)
+        self._save_cols(cols)
+        self.apply_columns()
+        self.render()
+
+    def add_field_column(self, field):
+        """“Show as a column”: the field's value for the rows on screen
+        (about 30 at a time), so a column costs a few ms per screen."""
+        if not field:
+            return False
+        if field in self.custom:
+            return True
+        custom = (self.custom + [field])[-3:]
+        self.custom = custom
+        self._save_cols(self._with_slots(len(custom)))
+        self.apply_columns()
+        self.render()
+        return True
+
+    def remove_field_column(self, field):
+        if field not in self.custom:
+            return
+        self.custom.remove(field)
+        self._save_cols(self._with_slots(len(self.custom)))
+        if self.sort_col in self.SLOTS:
+            self.sort_col = None
+            self._resort()
+        self.apply_columns()
+        self.render()
+
+    def _with_slots(self, n):
+        """The shown columns with the field columns just before Info, so
+        they are on screen."""
+        cols = [c for c in self.shown_cols() if c not in self.SLOTS]
+        at = cols.index("info") if "info" in cols else len(cols)
+        return cols[:at] + list(self.SLOTS[:n]) + cols[at:]
+
+    def reset_columns(self):
+        self.custom = []
+        self._save_cols(list(self.BASE_COLS))
+        self.apply_columns()
+        self.render()
+
+    def _heading_menu(self, e):
+        try:
+            if self.tree.identify_region(e.x, e.y) != "heading":
+                return None
+        except tk.TclError:
+            return None
+        names = {c: self.tree.heading(c, "text").rstrip(" ▲▼")
+                 for c in self.BASE_COLS}
+        shown = set(self.shown_cols())
+        items = [(translate_text("Columns"), [
+            (names[c] or c, lambda c=c: self.set_column(c, c not in shown),
+             True, c in shown) for c in self.BASE_COLS])]
+        for slot, f in zip(self.SLOTS, self.custom):
+            items.append((f"{translate_text('Remove the column')} {f}",
+                          lambda f=f: self.remove_field_column(f)))
+        items.append(("Reset columns", self.reset_columns))
+        popup_menu(self.app, e, items)
+        return "break"
+
+    def _sort_custom(self, col):
+        """Sort by a field column: up to 5,000 rows, worked out on the job
+        runner (each packet's fields are read once)."""
+        i = self.SLOTS.index(col)
+        if i >= len(self.custom):
+            return
+        field = self.custom[i]
+        rows = list(self.matched)
+        if len(rows) > 5000:
+            self.app._set_banner(translate_text(
+                "Sorting by a field column works up to 5,000 rows; filter "
+                "the list first."), kind="warn")
+            return
+        ctx = FilterContext(self.app)
+
+        def run(job):
+            keys = {}
+            for k, d in enumerate(rows):
+                vals = self.field_values(d, field, ctx)
+                v = vals[0] if vals else None
+                keys[d["no"]] = (0, v, "") if isinstance(
+                    v, (int, float)) and not isinstance(v, bool) else \
+                    (1, 0, str(v if v is not None else "").lower())
+                if k % 200 == 0:
+                    job.progress(k / max(1, len(rows)))
+            return keys
+
+        def done(keys):
+            self._custom_keys = keys
+            self._sort_by(col, ready=True)
+        self.app.jobs.submit("packet_sort", "Sorting the packets", run, done)
 
     def _keep(self, d):
         try:
@@ -33021,12 +33542,19 @@ class PacketsTab(BaseTab):
         if self.sort_col is None:
             self.matched.sort(key=lambda d: d["no"])
             return
+        if self.sort_col in self.SLOTS:
+            keys = self._custom_keys
+            self.matched.sort(key=lambda d: (keys.get(d["no"], (2, 0, "")),
+                                             d["no"]), reverse=self.sort_rev)
+            return
         fn = self.SORTERS.get(self.sort_col, self.SORTERS["no"])
         self.matched.sort(key=lambda d: fn(self, d), reverse=self.sort_rev)
 
-    def _sort_by(self, col):
+    def _sort_by(self, col, ready=False):
         """Click a heading: sort by it; click again to reverse. Sorting by
         No. ascending returns to the normal (live) order."""
+        if col in self.SLOTS and not ready:
+            return self._sort_custom(col)
         if self.sort_col == col or (self.sort_col is None and col == "no"):
             self.sort_rev = not self.sort_rev
             self.sort_col = col
@@ -33236,6 +33764,8 @@ class PacketsTab(BaseTab):
         val = self.dtree.item(iid, "values")
         items = [("Apply as filter", lambda: self.set_expression(expr),
                   bool(expr)),
+                 ("Show as a column", lambda: self.add_field_column(key),
+                  bool(key) and key not in FILTER_PROTOCOLS),
                  ("Exclude from the view", lambda: self.set_expression(
                      f"not ({expr})"), bool(expr)),
                  ("Copy field name", lambda: copy_to_clipboard(app, key),
@@ -35366,6 +35896,270 @@ QUICK_START_SPOT = {
 }
 
 
+class FilterBuilder:
+    """One row per condition under the Expression box: [Field] [is / is
+    not / greater than / less than] [value], joined by and / or. The
+    expression appears in the box as you pick, so the syntax is learned by
+    watching; each one is checked by _validate_expr before it applies."""
+
+    def __init__(self, tab):
+        self.tab = tab
+        t = tab.t
+        self.frame = tk.Frame(tab.frame, bg=WHITE, padx=10, pady=4,
+                              highlightthickness=1,
+                              highlightbackground="#e0e2e8")
+        self.frame.pack(fill="x", padx=10, pady=(2, 2), after=tab.adv_row)
+        self.rows_frame = tk.Frame(self.frame, bg=WHITE)
+        self.rows_frame.pack(fill="x")
+        bar = tk.Frame(self.frame, bg=WHITE)
+        bar.pack(fill="x", pady=(4, 0))
+        ttk.Button(bar, text="+ and", command=lambda: self.add("and")).pack(
+            side="left")
+        ttk.Button(bar, text="+ or", command=lambda: self.add("or")).pack(
+            side="left", padx=4)
+        ttk.Button(bar, text="Apply", style="Accent.TButton",
+                   command=self.apply).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text="Close", command=lambda: tab.toggle_builder(
+            False)).pack(side="right")
+        self.note = tk.Label(bar, text="", bg=WHITE, fg="#666666",
+                             anchor="w")
+        self.note.pack(side="left", padx=10)
+        self.rows = []
+        got = builder_rows(tab.expr_var.get())
+        if got is None:
+            self.note.configure(text=translate_text(
+                "This expression is beyond the builder — edit it as text."))
+            self.text_only = True
+            self.add("and", ("and", "Protocol", "is", ""), write=False)
+        else:
+            self.text_only = False
+            for r in got or [("and", "Protocol", "is", "")]:
+                self.add(r[0], r, write=False)
+        del t
+
+    def add(self, join="and", row=None, write=True):
+        row = row or (join, "Protocol", "is", "")
+        f = tk.Frame(self.rows_frame, bg=WHITE)
+        f.pack(fill="x", pady=1)
+        jv = tk.StringVar(value=row[0])
+        fv = tk.StringVar(value=row[1])
+        ov = tk.StringVar(value=row[2])
+        vv = tk.StringVar(value=row[3])
+        if self.rows:
+            jb = ttk.Combobox(f, textvariable=jv, values=["and", "or"],
+                              width=4, state="readonly")
+            jb.pack(side="left", padx=(0, 4))
+            jb.bind("<<ComboboxSelected>>", lambda e: self.write())
+        else:
+            tk.Label(f, text="", bg=WHITE, width=6).pack(side="left")
+        fb = ttk.Combobox(f, textvariable=fv, values=list(BUILDER_FIELDS),
+                          width=12, state="readonly")
+        fb.pack(side="left")
+        ob = ttk.Combobox(f, textvariable=ov, values=list(BUILDER_OPS),
+                          width=12, state="readonly")
+        ob.pack(side="left", padx=4)
+        ve = ttk.Combobox(f, textvariable=vv, width=24)
+        ve.pack(side="left")
+
+        def fit_values(_e=None):
+            key = BUILDER_FIELDS.get(fv.get(), "")
+            vals = list(BUILDER_VALUES.get(key, ()))
+            if key == "proto":
+                vals = sorted(FILTER_PROTOCOLS)[:80]
+            elif key == "device":
+                vals = ["@mine"] + [d.display_name() for d in
+                                    self.tab.model.registry.by_key.values()
+                                    ][:200]
+            ve.configure(values=vals)
+        fit_values()
+        for w in (fb, ob):
+            w.bind("<<ComboboxSelected>>", lambda e: (fit_values(),
+                                                      self.write()))
+        ve.bind("<<ComboboxSelected>>", lambda e: self.write())
+        ve.bind("<KeyRelease>", lambda e: self.write())
+        x = tk.Label(f, text="✕", bg=WHITE, fg="#888888", cursor="hand2")
+        x.pack(side="left", padx=6)
+        rec = {"frame": f, "join": jv, "field": fv, "op": ov, "value": vv}
+        x.bind("<Button-1>", lambda e, r=rec: self.remove(r))
+        self.rows.append(rec)
+        if write:
+            self.write()
+        return rec
+
+    def remove(self, rec):
+        if len(self.rows) <= 1:
+            return
+        self.rows.remove(rec)
+        with contextlib.suppress(tk.TclError):
+            rec["frame"].destroy()
+        self.write()
+
+    def values(self):
+        return [(r["join"].get(), r["field"].get(), r["op"].get(),
+                 r["value"].get()) for r in self.rows]
+
+    def expression(self):
+        rows = [r for r in self.values() if str(r[3]).strip()]
+        return builder_expression(rows) if rows else ""
+
+    def write(self):
+        """The expression in the box as you pick (not yet applied)."""
+        try:
+            text = self.expression()
+        except ValueError as e:
+            self.note.configure(text=str(e), fg="#a01a08")
+            return None
+        self.text_only = False
+        self.note.configure(text="", fg="#666666")
+        self.tab.expr_var.set(text)
+        with contextlib.suppress(Exception):
+            self.tab._validate_expr()
+        return text
+
+    def apply(self):
+        if self.write() is not None:
+            self.tab.apply()
+
+
+class FieldSuggest:
+    """Field names that match what you are typing, under the filter box;
+    Tab completes, Down/Up choose, Escape closes."""
+
+    def __init__(self, tab, entry):
+        self.tab, self.entry = tab, entry
+        self.frame, self.items, self.sel = None, [], 0
+        entry.bind("<KeyRelease>", self._key, add="+")
+        entry.bind("<Tab>", self.complete)
+        entry.bind("<Escape>", lambda e: self.close(), add="+")
+        entry.bind("<FocusOut>", lambda e: entry.after(200, self.close),
+                   add="+")
+
+    @staticmethod
+    def names():
+        got = getattr(FieldSuggest, "_names", None)
+        if got is None:
+            got = FieldSuggest._names = sorted(
+                set(FIELD_REGISTRY) | set(SPECIAL_FIELDS) |
+                set(FILTER_PROTOCOLS))
+        return got
+
+    def word(self):
+        text = self.entry.get()
+        try:
+            pos = self.entry.index("insert")
+        except tk.TclError:
+            pos = len(text)
+        m = re.search(r"[A-Za-z][\w.]*$", text[:pos])
+        return (m.group(0), m.start(), pos) if m else ("", pos, pos)
+
+    def matches(self, word):
+        if len(word) < 2 or ":" in word:
+            return []
+        w = word.lower()
+        hits = [n for n in self.names() if n.startswith(w) and n != w]
+        return hits[:8]
+
+    def _key(self, e):
+        if e.keysym in ("Tab", "Escape", "Return"):
+            return
+        if e.keysym in ("Down", "Up") and self.frame is not None:
+            self.sel = max(0, min(len(self.items) - 1,
+                                  self.sel + (1 if e.keysym == "Down"
+                                              else -1)))
+            self._paint()
+            return
+        word, _a, _b = self.word()
+        self.show(self.matches(word))
+
+    def show(self, items):
+        self.close()
+        if not items:
+            return
+        t = self.tab.t
+        top = self.entry.winfo_toplevel()
+        fr = tk.Frame(top, bg=t["card_bg"], highlightthickness=1,
+                      highlightbackground=t["border"])
+        self.frame, self.items, self.sel = fr, items, 0
+        self.labels = []
+        for i, n in enumerate(items):
+            lb = tk.Label(fr, text=n, bg=t["card_bg"], fg=t["text_fg"],
+                          anchor="w", padx=8, cursor="hand2")
+            lb.pack(fill="x")
+            lb.bind("<Button-1>", lambda e, k=i: (setattr(self, "sel", k),
+                                                  self.complete()))
+            self.labels.append(lb)
+        self._paint()
+        try:
+            x = self.entry.winfo_rootx() - top.winfo_rootx()
+            y = self.entry.winfo_rooty() - top.winfo_rooty() + \
+                self.entry.winfo_height() + 1
+            fr.place(x=x, y=y, width=max(220, min(360,
+                                                   self.entry.winfo_width())))
+            fr.lift()
+        except tk.TclError:
+            pass
+
+    def _paint(self):
+        t = self.tab.t
+        for i, lb in enumerate(getattr(self, "labels", [])):
+            with contextlib.suppress(tk.TclError):
+                lb.configure(bg=t["accent"] if i == self.sel else
+                             t["card_bg"], fg="#ffffff" if i == self.sel
+                             else t["text_fg"])
+
+    def complete(self, _e=None):
+        if self.frame is None or not self.items:
+            return None              # Tab moves the focus as usual
+        name = self.items[self.sel]
+        word, a, b = self.word()
+        text = self.entry.get()
+        new = text[:a] + name + text[b:]
+        self.tab.expr_var.set(new)
+        with contextlib.suppress(tk.TclError):
+            self.entry.icursor(a + len(name))
+        self.close()
+        with contextlib.suppress(Exception):
+            self.tab._validate_expr()
+        return "break"
+
+    def close(self):
+        if self.frame is not None:
+            with contextlib.suppress(tk.TclError):
+                self.frame.destroy()
+        self.frame, self.items = None, []
+
+
+class AsofBar:
+    """“Showing 14:32, not now — Back to now”, above a table that follows
+    the Timeline's time (Timeline, Devices, Websites)."""
+
+    def __init__(self, tab):
+        self.tab = tab
+        app = tab.app
+        self.frame = tk.Frame(tab.frame, bg="#fff4e0", padx=10, pady=3)
+        self.lbl = tk.Label(self.frame, text="", bg="#fff4e0", fg="#7a4a00",
+                            anchor="w", font=mw_font(9, "bold"))
+        self.lbl.pack(side="left")
+        back = tk.Label(self.frame, text="Back to now", bg="#fff4e0",
+                        fg="#0b5394", cursor="hand2")
+        back.pack(side="left", padx=(10, 0))
+        back.bind("<Button-1>", lambda e: app.set_asof(None))
+        self.back = back
+
+    def show(self, t, before):
+        try:
+            if t is None:
+                if self.frame.winfo_manager():
+                    self.frame.pack_forget()
+                return
+            self.lbl.configure(text=translate_text("Showing %s, not now")
+                               % hm_clock(t) + " —")
+            if not self.frame.winfo_manager():
+                self.frame.pack(fill="x", padx=6, pady=(0, 2), before=before)
+        except tk.TclError:
+            pass
+
+
 class SearchDrop:
     """The header search's results as you type: up to 8 per group, under
     the box, in a frame placed over the window (pop-up windows behave
@@ -36069,6 +36863,7 @@ class MiniWireshark:
         self._restore_window()
         self._layout_pass()
         self._away_since = None
+        self.asof = None
         self.root.bind("<FocusOut>", self._on_root_focus_out, add="+")
         self.root.bind("<FocusIn>", self._on_root_focus_in, add="+")
         self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map,
@@ -36238,6 +37033,8 @@ class MiniWireshark:
         self.model = model
         self.all_rows.clear()
         self.bookmarks.clear()
+        if getattr(self, "asof", None) is not None:
+            self.root.after_idle(lambda: self.set_asof(None))
         self.count = 0
         self.dropped_capture = 0
         if self.worker is not None:
@@ -39349,6 +40146,60 @@ class MiniWireshark:
         return win
 
     # ---- Help topics, Show me, tours (5.1.2 F7) -------------------------------------
+    # ---- "as of" a time (the Timeline strip, 5.1.2 M7) ------------------------
+    ASOF_FOLLOW = ("timeline", "devices", "websites")
+    ASOF_NOTE_TABS = ("connections", "remote", "packets", "map", "dash")
+
+    def set_asof(self, t):
+        """Timeline, Devices and Websites show the session as of time t
+        (None = now); the other views say they show now."""
+        m = self.model
+        if t is not None:
+            tab = self.tabs["timeline"]
+            start, end = tab.strip_span()
+            t = max(start, min(float(t), end))
+            if end - t < 30:
+                t = None
+        if t == getattr(self, "asof", None):
+            return t
+        self.asof = t
+        for name in self.ASOF_FOLLOW:
+            tab = self.tabs[name]
+            with contextlib.suppress(tk.TclError, AttributeError):
+                bar = getattr(tab, "asof_bar", None)
+                if bar is None:
+                    bar = tab.asof_bar = AsofBar(tab)
+                tab.asof_bar.show(t, tab.tree.master)
+        for name in self.ASOF_NOTE_TABS:
+            tab = self.tabs.get(name)
+            if tab is None:
+                continue
+            with contextlib.suppress(tk.TclError):
+                note = getattr(tab, "_asof_note", None)
+                if t is None:
+                    if note is not None and note.winfo_manager():
+                        note.pack_forget()
+                    continue
+                if note is None:
+                    note = tab._asof_note = tk.Label(
+                        tab.frame, bg=WHITE, fg="#666666", anchor="w",
+                        text=translate_text(
+                            "Showing now; the time on Timeline applies to "
+                            "Timeline, Devices and Websites."))
+                if not note.winfo_manager():
+                    kids = [k for k in tab.frame.pack_slaves()
+                            if k is not note]
+                    note.pack(fill="x", padx=12, pady=(2, 0),
+                              before=kids[0] if kids else None)
+        tl = self.tabs["timeline"]
+        with contextlib.suppress(tk.TclError):
+            tl.draw_strip(True)
+        self.tabs["devices"].rebuild()
+        self.tabs["websites"].rebuild()
+        if t is not None:
+            tl.mark_asof(t)
+        return t
+
     def help_titles(self):
         return [tp["title"] for tp in help_topics()]
 
@@ -42270,6 +43121,8 @@ class MiniWireshark:
              lambda: self.toggle_flag(k, "expected")),
             ("Add / edit note…", lambda: self.edit_note(k)),
             ("Place and owner…", lambda: self.set_device_tags(k)),
+            ("Unpin" if k in self.pins else "Pin to compare",
+             lambda: self.pin_device(k)),
             ("Set device type…", lambda: self.set_device_type(k)),
             None,
             ("Copy IP", lambda: copy_to_clipboard(self, dev.ip), bool(dev.ip)),
@@ -42347,6 +43200,185 @@ class MiniWireshark:
 
     def toggle_flag(self, key, flag):
         self._apply_correction_result(self.model.correct_flag(key, flag))
+
+    # ---- pin and compare (5.1.2 M7) --------------------------------------
+    @property
+    def pins(self):
+        p = self.__dict__.get("_pins")
+        if p is None:
+            p = self._pins = []
+        return p
+
+    def pin_device(self, key):
+        """Two pinned devices side by side; a third pin replaces the
+        oldest, and says so."""
+        tr = translate_text
+        pins = self.pins
+        if key in pins:
+            pins.remove(key)
+            self._set_banner(tr("Unpinned") + f" {self.short_device_name(key)}.")
+            return None
+        dropped = None
+        if len(pins) >= 2:
+            dropped = pins.pop(0)
+        pins.append(key)
+        if dropped is not None:
+            self._set_banner(tr("Pinned %s; %s was unpinned (two at a "
+                                "time).") % (self.short_device_name(key),
+                                             self.short_device_name(
+                                                 dropped)))
+        if len(pins) == 2:
+            return self.open_compare_pins()
+        self._set_banner(tr("Pinned %s. Pin a second device to compare.")
+                         % self.short_device_name(key))
+        return None
+
+    def device_compare_facts(self, dev):
+        """What two devices are compared on: [(label, value)] plus the
+        set of sites."""
+        m = self.model
+        now = m.now()
+        online = sum(((end or now) - start) for start, end in dev.presence)
+        sites = Counter()
+        for dom in dev.websites:
+            w = m.websites.get(dom)
+            if w is not None:
+                tie = w.ties.get(dev.key)
+                sites[w.registrable or w.domain] += (
+                    tie[3] if tie and len(tie) > 3 else 1)
+        b = m.baselines.devices.get(dev.key)
+        hours = translate_text("still learning") if b is None or             b.n < 30 else b.usual_hours_text()
+        open_ = sum(1 for a in dev.alert_ids if a in m.alerts.alerts and
+                    not m.alerts.alerts[a].acknowledged)
+        cls = (f"{dev.class_confidence} {dev.device_class}".strip()
+               if dev.device_class != "Unknown" else "Unknown")
+        return [("Kind", cls),
+                ("Online this session", span_words(online) if online
+                 else "—"),
+                ("Sent", _human_bytes(dev.bytes_up)),
+                ("Received", _human_bytes(dev.bytes_down)),
+                ("Websites", str(len(sites))),
+                ("Usual hours", hours),
+                ("Open alerts", str(open_))], sites
+
+    def open_compare_pins(self):
+        keys = [k for k in self.pins if k in self.model.registry.by_key]
+        if len(keys) < 2:
+            return None
+        t, tr = self.theme, translate_text
+        old = getattr(self, "_compare_win", None)
+        if old is not None:
+            with contextlib.suppress(tk.TclError):
+                old.destroy()
+        win = tk.Toplevel(self.root)
+        win.title(tr("Compare devices"))
+        win.geometry("760x520")
+        win.configure(bg=t["card_bg"])
+        win.transient(self.root)
+        self._compare_win = win
+        grid = tk.Frame(win, bg=t["card_bg"], padx=14, pady=10)
+        grid.pack(fill="both", expand=True)
+        devs = [self.model.registry.by_key[k] for k in keys]
+        facts = [self.device_compare_facts(d) for d in devs]
+        shared = set(facts[0][1]) & set(facts[1][1])
+        tk.Label(grid, text="", bg=t["card_bg"]).grid(row=0, column=0)
+        for c, d in enumerate(devs, 1):
+            tk.Label(grid, text=self.device_label(d), bg=t["card_bg"],
+                     fg=t["text_fg"], font=mw_font(11, "bold"),
+                     anchor="w").grid(row=0, column=c, sticky="w",
+                                      padx=8)
+        labels = [lab for lab, _v in facts[0][0]]
+        for r, lab in enumerate(labels, 1):
+            tk.Label(grid, text=tr(lab), bg=t["card_bg"], fg=t["muted_fg"],
+                     anchor="w").grid(row=r, column=0, sticky="w")
+            for c, (rows, _s) in enumerate(facts, 1):
+                val = rows[r - 1][1]
+                if lab == "Websites" and shared:
+                    val += f"  ({len(shared)} " + tr("shared") + ")"
+                tk.Label(grid, text=tr(val), bg=t["card_bg"],
+                         fg=t["text_fg"], anchor="w", justify="left").grid(
+                    row=r, column=c, sticky="w", padx=8)
+        r = len(labels) + 1
+        tk.Label(grid, text=tr("Top websites"), bg=t["card_bg"],
+                 fg=t["muted_fg"], anchor="nw").grid(row=r, column=0,
+                                                     sticky="nw")
+        for c, (_rows, sites) in enumerate(facts, 1):
+            lines = [("● " if dom in shared else "   ") + dom
+                     for dom, _n in sites.most_common(5)] or ["—"]
+            tk.Label(grid, text="\n".join(lines), bg=t["card_bg"],
+                     fg=t["text_fg"], anchor="nw", justify="left").grid(
+                row=r, column=c, sticky="nw", padx=8)
+        tk.Label(grid, text=tr("● = both use it. Counted from this "
+                               "session's data only."), bg=t["card_bg"],
+                 fg=t["muted_fg"], anchor="w").grid(
+            row=r + 1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        for c in (1, 2):
+            grid.columnconfigure(c, weight=1, uniform="cmp")
+        bar = tk.Frame(win, bg=t["card_bg"], padx=14, pady=10)
+        bar.pack(fill="x")
+        days = ttk.Button(bar, text="Compare one device across two days…",
+                          command=lambda: self.compare_days(keys[0]))
+        days.pack(side="left")
+        if self.history is None:
+            days.state(["disabled"])
+            Tooltip(days, "Needs the saved history (Settings → History), "
+                          "which keeps traffic per device per day.")
+        ttk.Button(bar, text="Close", command=win.destroy).pack(side="right")
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.devs, win.facts, win.shared = devs, facts, shared
+        win.days_btn = days
+        return win
+
+    def day_facts(self, key, day):
+        """One device on one day, from the saved history."""
+        st = self.history
+        if st is None:
+            return None
+        row = st.query("SELECT bytes_up, bytes_down, packets FROM traffic "
+                       "WHERE device_key=? AND day=?", (key, day))
+        try:
+            t0 = time.mktime(time.strptime(day, "%Y-%m-%d"))
+        except ValueError:
+            return None
+        sites = st.query(
+            "SELECT domain, SUM(n) FROM site_ties WHERE device=? AND "
+            "first<? AND last>=? GROUP BY domain ORDER BY 2 DESC LIMIT 5",
+            (key, t0 + 86400, t0))
+        up, down, pk = (row[0] if row else (0, 0, 0))
+        return {"Sent": _human_bytes(up or 0),
+                "Received": _human_bytes(down or 0),
+                "Packets": str(pk or 0),
+                "Top websites": "\n".join(d for d, _n in sites) or "—"}
+
+    def compare_days(self, key, a=None, b=None):
+        st = self.history
+        if st is None:
+            self._set_banner("Comparing days needs the saved history "
+                             "(Settings → History).", kind="info")
+            return None
+        days = [r[0] for r in st.query(
+            "SELECT day FROM traffic WHERE device_key=? ORDER BY day DESC "
+            "LIMIT 60", (key,))]
+        if len(days) < 2 and (a is None or b is None):
+            self._set_banner("There is only one saved day for this device "
+                             "so far.", kind="info")
+            return None
+        a = a or choose_from_list(self, "Compare days", "First day:",
+                                  [(d, d) for d in days])
+        if not a:
+            return None
+        b = b or choose_from_list(self, "Compare days", "Second day:",
+                                  [(d, d) for d in days if d != a])
+        if not b:
+            return None
+        fa, fb = self.day_facts(key, a), self.day_facts(key, b)
+        name = self.short_device_name(key)
+        sections = [(k, f"{a}: {fa.get(k, '—')}\n{b}: {fb.get(k, '—')}")
+                    for k in ("Sent", "Received", "Packets")]
+        sections.append((f"Top websites — {a}", fa["Top websites"]))
+        sections.append((f"Top websites — {b}", fb["Top websites"]))
+        return DetailDialog(self, f"{name}: {a} and {b}", sections,
+                            size="560x520")
 
     def known_tags(self):
         places, owners = set(), set()
@@ -43555,7 +44587,8 @@ class MiniWireshark:
         return {"started": self.model.metrics.first_ts or self.session_started,
                 "data_source": self.data_mode,
                 "interface": self.current_iface_label if
-                self.data_mode == "live" else self.data_label}
+                self.data_mode == "live" else self.data_label,
+                "bookmarks": sorted(self.bookmarks)[:5000]}
 
     def _save_session(self):
         path = filedialog.asksaveasfilename(
@@ -43564,6 +44597,9 @@ class MiniWireshark:
             initialfile=time.strftime("miniwireshark-%Y%m%d-%H%M.mwsession."
                                       "json"),
             filetypes=[("MiniWireshark session", "*.json"),
+                       (translate_text("Compressed session (smaller; "
+                                       "MiniWireshark 5.0.2 can't open "
+                                       "it)"), "*.gz"),
                        ("All files", "*.*")])
         if not path:
             return
@@ -43581,7 +44617,13 @@ class MiniWireshark:
         def run(job):
             parts = job.pieces_under_gate(
                 gate, SessionCodec.iter_json(model, meta), total=n)
-            atomic_write_text(path, "".join(parts))
+            text = "".join(parts)
+            if str(path).lower().endswith(".gz"):
+                # 5.1.2: opt-in, several times smaller
+                atomic_write_bytes(path, gzip.compress(text.encode("utf-8"),
+                                                       compresslevel=6))
+            else:
+                atomic_write_text(path, text)
             return path
         return run
 
@@ -43620,7 +44662,7 @@ class MiniWireshark:
         the table refill run on the Tk thread, in short steps."""
         path = path or filedialog.askopenfilename(
             parent=self.root, initialdir=self._dialog_dir(),
-            filetypes=[("MiniWireshark session", "*.json"),
+            filetypes=[("MiniWireshark session", "*.json *.gz"),
                        ("All files", "*.*")])
         if not path:
             return None
@@ -43636,8 +44678,7 @@ class MiniWireshark:
         gen = self.gen
 
         def run(job):
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
+            payload = read_session_payload(path)
             job.progress(0.4)
             m = self._new_model(offline=True, identity=("", set(), set()))
             SessionCodec.load(payload, m)
@@ -43647,7 +44688,7 @@ class MiniWireshark:
             if isinstance(e, JobCancelled):
                 self.status_var.set("Opening the session was cancelled.")
             elif isinstance(e, (OSError, json.JSONDecodeError,
-                                UnicodeDecodeError)):
+                                UnicodeDecodeError, EOFError)):
                 messagebox.showerror("Load session error",
                                      f"I couldn't read that file: {e}",
                                      parent=self.root)
@@ -43668,6 +44709,7 @@ class MiniWireshark:
 
     def _show_loaded_session(self, path, m, exported_at):
         self.replace_model(m)
+        self.bookmarks.update(getattr(m, "loaded_bookmarks", ()) or ())
         self.data_mode = "session"
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(
             exported_at or time.time()))
@@ -43699,7 +44741,60 @@ class MiniWireshark:
             return
         self.import_pcap_path(path)
 
+    def capture_over(self, path, limit):
+        """True when the capture file holds more than `limit` packets
+        (counted from the record headers only, stopping at limit + 1);
+        None when the format isn't recognised."""
+        try:
+            with open(path, "rb") as f:
+                magic = f.read(4)
+                n = 0
+                if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1",
+                             b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
+                    little = magic[0] in (0xd4, 0x4d)
+                    fmt = "<I" if little else ">I"
+                    f.seek(24)
+                    while n <= limit:
+                        hdr = f.read(16)
+                        if len(hdr) < 16:
+                            return False
+                        cap = struct.unpack(fmt, hdr[8:12])[0]
+                        f.seek(cap, 1)
+                        n += 1
+                    return True
+                if magic == b"\x0a\x0d\x0d\x0a":
+                    f.seek(0)
+                    little = True
+                    while n <= limit:
+                        hdr = f.read(8)
+                        if len(hdr) < 8:
+                            return False
+                        btype, blen = struct.unpack("<II" if little else ">II",
+                                                    hdr)
+                        if btype == 0x0A0D0D0A:
+                            bom = f.read(4)
+                            little = bom == b"\x4d\x3c\x2b\x1a"
+                            blen = struct.unpack("<I" if little else ">I",
+                                                 hdr[4:8])[0]
+                            f.seek(blen - 12, 1)
+                            continue
+                        if blen < 12:
+                            return None
+                        if btype in (3, 6):
+                            n += 1
+                        f.seek(blen - 8, 1)
+                    return True
+        except (OSError, struct.error):
+            return None
+        return None
+
     def import_pcap_path(self, path):
+        cap = int(self.config.get("capture.max_stored_events", 5000))
+        big = False
+        with contextlib.suppress(Exception):
+            big = bool(os.path.getsize(path) > cap * 40 and
+                       self.capture_over(path, cap))
+        self._pcap_big = big
         self.stop()
         self._leave_nonlive()
         self._ensure_worker()
@@ -43711,7 +44806,14 @@ class MiniWireshark:
         self.data_label = os.path.basename(path)
         self._restyle_mode_banner()
         self._set_banner(f"\U0001F4C2  Reading {self.data_label} through the "
-                         f"normal analysis — this is NOT live.", kind="warn")
+                         f"normal analysis — this is NOT live." + (
+                             "  " + translate_text(
+                                 "All packets are analysed; the Packets "
+                                 "list keeps the last %d.") %
+                             int(self.config.get(
+                                 "capture.max_stored_events", 5000))
+                             if getattr(self, "_pcap_big", False) else ""),
+                         kind="warn")
         LOG.info("importing pcap %s", path)
 
         def progress(n):
@@ -43925,7 +45027,7 @@ class MiniWireshark:
                       command=lambda: self.export_report("health"))
         m.add_command(label="Device report (HTML)…",
                       command=lambda: self.export_report("device"))
-        m.add_command(label="Device inventory (printable)…",
+        m.add_command(label="Network sheet (printable)…",
                       command=self.export_inventory)
         m.add_command(label="Shareable report (personal details "
                             "hidden)…", command=self.export_shareable)
@@ -43963,9 +45065,47 @@ class MiniWireshark:
             f"generated {fmt_clock(time.time(), True)}"
         return inventory_html(rows, "Device inventory", sub)
 
+    def sheet_facts(self):
+        """The network sheet's lines above the table: health, alerts,
+        what this computer could see."""
+        h = {}
+        with contextlib.suppress(Exception):
+            h = self.health_summary()
+        lines = []
+        for key, name in (("gateway", "Router"), ("internet", "Internet"),
+                          ("dns", "Website lookups (DNS)")):
+            st, text = h.get(key, ("Unknown", "—"))
+            lines.append((name, f"{st} — {text}"))
+        m = self.model
+        open_ = [a for a in m.alerts.alerts.values() if not a.acknowledged
+                 and a.severity in ("WARNING", "DANGER")]
+        lines.append(("Open alerts", "; ".join(
+            f"{a.severity}: {a.reason}" for a in open_[:6]) +
+            (f" (+{len(open_) - 6} more)" if len(open_) > 6 else "")
+            or "None"))
+        v = m.vantage.classify(offline=self.data_mode in ("offline",
+                                                          "session"))
+        spots = blind_spots(m, self.data_mode, self.active_mode())
+        lines.append(("What this computer could see",
+                      f"{VANTAGE_TEXT[v][0]}. " + (
+                          "Blind spots: " + "; ".join(spots) + "." if spots
+                          else "No known blind spots.")))
+        return lines
+
+    def sheet_document(self):
+        """The printable network sheet: the device table plus the router,
+        Internet and DNS lines, open alerts, the date and what this
+        computer could see — one page up to about 40 devices."""
+        rows = inventory_rows(self.model, self.device_label)
+        net = self.network_name()
+        sub = (f"{net} · " if net else "") + \
+            f"{fmt_clock(time.time(), True)}"
+        return inventory_html(rows, "Network sheet", sub,
+                              facts=self.sheet_facts())
+
     def export_inventory(self):
-        self.redaction_preview("Device inventory", self.inventory_document(),
-                               "device-inventory.html", redact=False)
+        self.redaction_preview("Network sheet", self.sheet_document(),
+                               "network-sheet.html", redact=False)
 
     def export_shareable(self):
         self.redaction_preview("Shareable network report",
@@ -45898,18 +47038,23 @@ def inventory_rows(model, namer=None):
             "confidence": d.confidence, "evidence": LEVEL_GLYPH.get(lvl, "?")
             + " " + LEVEL_WORD.get(lvl, "Unknown"),
             "mine": "★" if d.mine else "", "expected": "✓" if d.expected
-            else "", "notes": d.notes or ""})
+            else "", "notes": d.notes or "",
+            "tags": tag_text(d.place, d.owner)})
     return out
 
 
-def inventory_html(rows, title="Device inventory", subtitle=""):
+def inventory_html(rows, title="Device inventory", subtitle="", facts=None):
     e = html.escape
-    head = ("<tr><th></th><th>Device</th><th>Kind</th><th>Maker</th>"
+    tags = any(r.get("tags") for r in rows)
+    head = ("<tr><th></th><th>Device</th>" +
+            ("<th>Place / owner</th>" if tags else "") +
+            "<th>Kind</th><th>Maker</th>"
             "<th>Address</th><th>Hardware address</th><th>Status</th>"
             "<th>Evidence</th><th>First seen</th><th>Last seen</th>"
             "<th>Expected</th><th>Notes</th></tr>")
     body = "".join(
-        f"<tr><td>{e(r['mine'])}</td><td><b>{e(r['name'])}</b></td>"
+        f"<tr><td>{e(r['mine'])}</td><td><b>{e(r['name'])}</b></td>" +
+        (f"<td>{e(r.get('tags', ''))}</td>" if tags else "") +
         f"<td>{e(r['kind'])}</td><td>{e(r['maker'])}</td>"
         f"<td>{e(r['ip'])}</td><td class='mono'>{e(r['mac'])}</td>"
         f"<td>{e(r['status'])}</td><td>{e(r['evidence'])}</td>"
@@ -45919,10 +47064,16 @@ def inventory_html(rows, title="Device inventory", subtitle=""):
     return (f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
             f"<title>{e(title)}</title><style>{REPORT_CSS}"
             f"@media print{{header{{background:none;color:#000}}"
-            f"table{{font-size:9pt}}tr{{page-break-inside:avoid}}}}"
+            f"table{{font-size:{'7.5' if facts else '9'}pt}}"
+            f"tr{{page-break-inside:avoid}}"
+            f"@page{{size:auto;margin:12mm}}}}"
+            f".facts th{{text-align:left;width:22%}}"
             f".mono{{font-family:monospace}}</style></head><body>"
             f"<header><h1>{e(title)}</h1><p>{e(subtitle)}</p></header>"
-            f"<main><section><p class='muted'>★ = marked as yours. "
+            f"<main>" + ("<section class='facts'><table>" + "".join(
+                f"<tr><th>{e(k)}</th><td>{e(v)}</td></tr>"
+                for k, v in facts) + "</table></section>" if facts else "") +
+            f"<section><p class='muted'>★ = marked as yours. "
             f"Evidence: ◉ observed ◈ reported ◎ correlated ◌ inferred. "
             f"{len(rows)} device(s).</p><table>{head}{body}</table>"
             f"</section></main><footer>Generated locally by MiniWireshark "
@@ -52542,6 +53693,71 @@ def run_self_tests(verbose=True):
         line = narrate("top_sites", sites=C("example.com", LV_CORRELATED))
         assert line.startswith("◎ Appears to talk"), line
 
+    def t_m7_asof_and_builder():
+        """5.1.2 M7: "as of" answers are exact for what is kept; the
+        filter builder writes what DisplayFilter already reads."""
+        clk = _FakeClock()
+        c = cfg()
+        reg = DeviceRegistry("", [], c, clk)
+        d = reg.touch("192.168.1.30", "da:00:00:00:00:31", "mac_local", "x")
+        base = 36000.0                       # 10:00 on the fake day
+        d.first_seen = base
+        d.presence = [[base, base + 300], [base + 1200, None]]
+        assert device_online_at(d, base + 60)
+        assert not device_online_at(d, base + 600)       # 10:10: away
+        assert device_online_at(d, base + 1260)          # 10:21: back
+        assert not device_online_at(d, base - 60)        # before it came
+        w = WebsiteRecord(domain="later.example", first_seen=base + 900)
+        assert not website_known_at(w, base + 600)
+        assert website_known_at(w, base + 900)
+        cases = [
+            ([("and", "Protocol", "is", "dns")], "proto:dns"),
+            ([("and", "Protocol", "is not", "arp")], "-proto:arp"),
+            ([("and", "Port", "is", "443"), ("or", "Port", "is", "853")],
+             "port:443 or port:853"),
+            ([("and", "Device", "is", "Living Room TV")],
+             'device:"Living Room TV"'),
+            ([("and", "Direction", "is", "up")], "dir:up"),
+            ([("and", "Severity", "is", "warning")], "sev:warning"),
+            ([("and", "Length", "greater than", "1000")], "len>1000"),
+            ([("and", "Length", "less than", "60")], "len<60"),
+            ([("and", "Website", "is", "example.com"),
+              ("and", "Direction", "is", "down")],
+             "site:example.com dir:down"),
+            ([("and", "Address", "is", "192.168.1.0/24"),
+              ("and", "Protocol", "is not", "arp")],
+             "ip:192.168.1.0/24 -proto:arp"),
+            ([("and", "Source", "is", "192.168.1.5")], "src:192.168.1.5"),
+            ([("and", "Destination", "is", "8.8.8.8")], "dst:8.8.8.8"),
+            ([("and", "Connection", "is", "12")], "stream:12"),
+            ([("and", "Text", "is", "hello")], "text:hello"),
+            ([("and", "Device", "is", "@mine"),
+              ("or", "Device", "is", "@guest")],
+             "device:@mine or device:@guest"),
+            ([("and", "Protocol", "is", "tls"), ("and", "Port", "is not",
+                                                  "443")],
+             "proto:tls -port:443"),
+            ([("and", "Port", "is", "53"), ("or", "Port", "is", "853"),
+              ("or", "Protocol", "is", "mdns")],
+             "port:53 or port:853 or proto:mdns"),
+            ([("and", "Severity", "is", "danger"),
+              ("and", "Direction", "is", "lan")], "sev:danger dir:lan"),
+            ([("and", "Website", "is not", "ads.example")],
+             "-site:ads.example"),
+            ([("and", "Length", "greater than", "1400"),
+              ("and", "Protocol", "is", "udp")], "len>1400 proto:udp"),
+        ]
+        assert len(cases) == 20
+        for rows, hand in cases:
+            got = builder_expression(rows)
+            assert DisplayFilter.compile(got) == \
+                DisplayFilter.compile(hand), (got, hand)
+            back = builder_rows(got)
+            assert back is not None and [r[1:] for r in back] == \
+                [r[1:] for r in rows], (got, back)
+        for text in ("(ip.src == 1.2.3.4)", "tcp.port == 443", "foo bar"):
+            assert builder_rows(text) is None, text
+
     def t_session_roundtrip():
         clk = _FakeClock()
         c = cfg()
@@ -52782,6 +53998,7 @@ def run_self_tests(verbose=True):
                t_device_lifecycle, t_public_ip_never_a_device,
                t_device_merge_rules, t_registrable_domain, t_dns_parsing,
                t_explain_registry, t_m6_corrections,
+               t_m7_asof_and_builder,
                t_tls_sni_parser, t_flow_aggregation, t_alert_debounce,
                t_session_roundtrip, t_display_filters, t_historical_buckets,
                t_dns_tracker, t_baseline, t_data_loaders, t_history_store,
@@ -60281,6 +61498,124 @@ def gt_m6_understand(app, ctx):
     assert "," in Charts.chart_text(dash.canvas, True)
 
 
+@gui_test_step("5.1.2 M7: compressed sessions with bookmarks, network sheet, "
+               "panes, pin and compare, as of, field columns, builder")
+def gt_m7_expert(app, ctx):
+    root = app.root
+    m = app.model
+    # a compressed session keeps the bookmarks
+    app.bookmarks.update({2, 4})
+    path = ctx.path("m7.mwsession.json.gz")
+    app.save_session_to(path)
+    assert _gui_pump(root, 0.2, until=lambda: not app.jobs.busy(),
+                     timeout=60)
+    assert session_is_gz(path)
+    payload = read_session_payload(path)
+    assert payload["session"]["bookmarks"] == [2, 4]
+    assert payload["devices"]
+    # the big-capture notice counts records only up to the limit
+    assert app.capture_over(ctx.path("scenario.pcap"), 3) is True
+    assert app.capture_over(ctx.path("scenario.pcap"), 10 ** 6) is False
+    # the network sheet: health lines, alerts, what could be seen, tags
+    phone = next(d for d in m.registry.by_key.values()
+                 if "iPhone" in app.device_label(d))
+    m.correct_tags(phone.key, "Kitchen", "")
+    sheet = app.sheet_document()
+    for word in ("Network sheet", "Router", "Open alerts",
+                 "What this computer could see", "Place / owner",
+                 "Kitchen"):
+        assert word in sheet, word
+    m.correct_tags(phone.key, "", "")
+    # Packets: a field as a column, kept, sortable; the column picker
+    pt = app._select_tab("packets")
+    pt.show_subview("Packets")
+    _gui_pump(root, 1.0)
+    assert pt.add_field_column("ip.src")
+    assert "f1" in pt.shown_cols()
+    _gui_pump(root, 0.3)
+    for iid in pt.slots[:30]:
+        d = pt.slot_rows.get(iid)
+        if d is None:
+            continue
+        want = ", ".join(str(v) for v in pt.field_values(d, "ip.src"))
+        assert str(pt.tree.set(iid, "f1")) == want[:80], (want, iid)
+    pt.custom = []
+    pt.apply_columns()                      # as after a restart
+    assert pt.custom == ["ip.src"]
+    pt._sort_by("f1")
+    assert _gui_pump(root, 0.2, until=lambda: not app.jobs.busy(),
+                     timeout=30)
+    _gui_pump(root, 0.3)
+    assert pt.sort_col == "f1"
+    pt.set_column("time", False)
+    assert "time" not in pt.shown_cols()
+    pt.reset_columns()
+    assert pt.shown_cols() == list(pt.BASE_COLS)
+    # remembered panes
+    vert = pt.vert_pane
+    total = vert.winfo_height()
+    if total > 100:
+        vert.sashpos(0, int(total * 0.4))
+        pt._pane_moved(vert, "packets.list")
+        frac = app.config.get("appearance.panes")["packets.list"]
+        assert 0.35 <= frac <= 0.45, frac
+    # the filter builder: two-way on simple expressions
+    pt.set_expression("port:443 or port:853")
+    b = pt.toggle_builder(True)
+    assert len(b.rows) == 2 and not b.text_only
+    b.rows[1]["value"].set("53")
+    assert b.write() == "port:443 or port:53"
+    assert pt.expr_var.get() == "port:443 or port:53"
+    pt.toggle_builder(False)
+    pt.set_expression("(ip.src == 192.168.1.5)")
+    b = pt.toggle_builder(True)
+    assert b.text_only
+    pt.toggle_builder(False)
+    pt.clear_filter()
+    assert pt.suggest.matches("dns.q")
+    # pin and compare: two at a time, a third replaces the oldest
+    keys = [k for k in m.registry.by_key][:3]
+    app._pins = []
+    app.pin_device(keys[0])
+    win = app.pin_device(keys[1])
+    _gui_pump(root, 0.2)
+    assert win is not None and len(win.devs) == 2
+    if app.history is None:
+        assert "disabled" in win.days_btn.state()
+    win.destroy()
+    app.pin_device(keys[2])
+    assert app.pins == [keys[1], keys[2]]
+    with contextlib.suppress(tk.TclError):
+        app._compare_win.destroy()
+    # as of: Timeline, Devices and Websites follow; the others say so
+    tl = app._select_tab("timeline")
+    _gui_pump(root, 0.5)
+    start, end = tl.strip_span()
+    t = start + (end - start) / 4
+    assert end - t >= 30, (start, end, m.now())
+    if True:
+        app.set_asof(t)
+        _gui_pump(root, 0.4)
+        assert app.asof is not None
+        app._select_tab("devices")
+        _gui_pump(root, 0.6)
+        dt = app.tabs["devices"]
+        assert dt.asof_bar.frame.winfo_ismapped()
+        shown = {key_for_iid(dt.iids, i) for i in dt.tree.get_children()}
+        for k in shown:
+            assert device_online_at(m.registry.by_key[k], app.asof), k
+        wt = app.tabs["websites"]
+        assert all(website_known_at(w, app.asof)
+                   for w in m.websites.values() if wt._match(w, None))
+        app._select_tab("connections")
+        _gui_pump(root, 0.4)
+        assert app.tabs["connections"]._asof_note.winfo_ismapped()
+        app.set_asof(None)
+        _gui_pump(root, 0.3)
+        assert not dt.asof_bar.frame.winfo_ismapped()
+        assert not app.tabs["connections"]._asof_note.winfo_ismapped()
+
+
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
 # Labels that change with the state of the row a menu was opened on are
 # folded to one name, so the snapshot does not depend on which row was first.
@@ -60292,6 +61627,9 @@ REACHABLE_ALTERNATES = {
 }
 # Old entry -> its new name, for actions a later milestone renames or moves.
 REACHABLE_RENAMES = {
+    # M7: the inventory became the network sheet
+    "menu:export:Device inventory (printable)…":
+        "menu:export:Network sheet (printable)…",
     # M3: every table menu starts Open · Copy ▸ · Filter to this ·
     # Show its packets · Go to ▸
     "rowmenu:alerts:Details": "rowmenu:alerts:Open",
