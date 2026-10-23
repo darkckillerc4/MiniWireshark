@@ -22703,6 +22703,9 @@ I18N_PATTERNS += [
      r"mentionne « \1 »", r"Su anuncio UPnP menciona «\1»"),
     (r"Detection alone suggests: (.+)", r"La détection seule suggère : "
      r"{t1}", r"La detección por sí sola sugiere: {t1}"),
+    (r"Offline capture: (.+) — (\d+) packets \(not live\)",
+     r"Capture hors ligne : \1 — \2 paquets (pas en direct)",
+     r"Captura sin conexión: \1 — \2 paquetes (no en directo)"),
     (r"No helper connected\. Observed lookups so far: (\d+) \(only the "
      r"ones that crossed this computer's network card\)\.",
      r"Aucun assistant connecté. Recherches observées jusqu'ici : \1 "
@@ -31571,6 +31574,9 @@ class AlertsTab(BaseTab):
 # ---- Network map v2 ----------------------------------------------------------
 class MapTab(BaseTab):
     name, label_key = "map", "tab_map"
+    LEGEND = ("Letters = confidence (H M L ?) · hollow = offline · ─ seen "
+              "(switch said so) · ┄ logical (inferred) · ★ new this hour "
+              "· red ring = open alert · drag a device to place it")
 
     def build(self):
         top = tk.Frame(self.frame, bg=WHITE, padx=10, pady=6)
@@ -31636,10 +31642,7 @@ class MapTab(BaseTab):
             fill="x", padx=12)
         self.legend_lbl = tk.Label(
             self.frame, bg=WHITE, fg="#888888", anchor="w", justify="left",
-            wraplength=1100, font=mw_font(8),
-            text="Letters = confidence (H M L ?) · hollow = offline · ─ seen "
-                 "(switch said so) · ┄ logical (inferred) · ★ new this hour "
-                 "· red ring = open alert · drag a device to place it")
+            wraplength=1100, font=mw_font(8), text=self.LEGEND)
         self.legend_lbl.pack(side="bottom", fill="x", padx=12, pady=(0, 4))
         self.c = tk.Canvas(self.frame, bg=WHITE, highlightthickness=0,
                            takefocus=1)
@@ -31939,13 +31942,14 @@ class MapTab(BaseTab):
         c, t = self.c, self.t
         stars = getattr(self, "_stars", [])
         total = len({v[1] for v in self.nodes.values() if v[0] == "device"})
-        if not stars:
-            return
-        if len(stars) > max(3, total // 2):
-            c.create_text(12, h - 8, anchor="sw", fill=t["muted_fg"],
-                          font=("TkDefaultFont", 8), tags=("deco",),
-                          text=translate_text("★ not shown: most devices "
-                                              "are new this hour"))
+        hide = bool(stars) and len(stars) > max(3, total // 2)
+        # the note goes in the legend line under the map (on the canvas
+        # it landed on a node in French)
+        with contextlib.suppress(tk.TclError, AttributeError):
+            self.legend_lbl.configure(text=translate_text(self.LEGEND) + (
+                "  ·  " + translate_text("★ not shown: most devices are new "
+                                         "this hour") if hide else ""))
+        if not stars or hide:
             return
         for X, Y, R, key in stars:
             k = R * 0.7
@@ -38789,6 +38793,7 @@ class MiniWireshark:
                 self.root.bind(seq, lambda e, s=step: self.tabstrip.cycle(s))
         self.inspector = Inspector(self, self.body)
         self.inspector_visible = False
+        self.body.bind("<Configure>", self._body_resized, add="+")
         want = self.config.get("appearance.inspector", None)
         if want is None:              # first run: only on wide screens
             want = self.root.winfo_screenwidth() >= 1700
@@ -39774,7 +39779,7 @@ class MiniWireshark:
             self.toggle_inspector(True)
         self.inspector.show(kind, key)
 
-    def toggle_inspector(self, show=None, _e=None):
+    def toggle_inspector(self, show=None, _e=None, remember=True):
         show = (not self.inspector_visible) if show is None else bool(show)
         try:
             if show and not self.inspector_visible:
@@ -39784,22 +39789,63 @@ class MiniWireshark:
         except tk.TclError:
             return
         self.inspector_visible = show
-        self.config.set("appearance.inspector", show)
-        self.config.save()
+        if remember:
+            # the person's choice: no automatic showing or hiding after it
+            self._insp_auto_hidden = False
+            self.config.set("appearance.inspector", show)
+            self.config.save()
         if show:
             self.root.after_idle(self._inspector_width)
 
-    def _inspector_width(self):
+    INSPECTOR_MIN_WINDOW = 1180
+
+    def _inspector_fit(self, total):
+        """5.1.2: below INSPECTOR_MIN_WINDOW pixels the tabs and the
+        Inspector don't both fit (cut-off toolbars in Spanish at 1000
+        wide). Made that narrow, the window lends the Inspector's room
+        to the tabs and gives it back when it is wide again; the setting
+        stays as the person left it."""
+        lim = px(self.INSPECTOR_MIN_WINDOW)
+        prev = getattr(self, "_body_w_prev", None)
+        self._body_w_prev = total
+        if prev is None or total < 300:
+            return
+        if self.inspector_visible and total < lim <= prev:
+            self.toggle_inspector(False, remember=False)
+            self._insp_auto_hidden = True
+        elif getattr(self, "_insp_auto_hidden", False) and \
+                prev < lim <= total:
+            self.toggle_inspector(True, remember=False)
+            self._insp_auto_hidden = False
+
+    def _inspector_width(self, floor=None):
         """5.1.2: opened beside a wide tab the Inspector got what was left
         (80 pixels at 1366 wide); give it its own width, at most a third
-        of the window."""
+        of the window. On a window resize (floor given) only an Inspector
+        squeezed below a usable width is widened again, so a divider the
+        person moved stays where they put it."""
         with contextlib.suppress(tk.TclError, AttributeError):
             if not self.inspector_visible:
                 return
             total = self.body.winfo_width()
             want = min(px(Inspector.WIDTH), total // 3)
-            if total > 300 and self.inspector.frame.winfo_width() < want - 20:
+            limit = want - 20 if floor is None else min(want, floor)
+            if total > 300 and self.inspector.frame.winfo_width() < limit:
                 self.body.sashpos(0, total - want)
+
+    def _body_resized(self, _e=None):
+        # a window made smaller squeezed the Inspector to a sliver (25
+        # pixels at 1000 wide, found by the release gate's GUI test)
+        job = getattr(self, "_insp_job", None)
+        if job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(job)
+        def run():
+            self._insp_job = None
+            with contextlib.suppress(tk.TclError):
+                self._inspector_fit(self.root.winfo_width())
+            self._inspector_width(floor=px(200))
+        self._insp_job = self.root.after(120, run)
 
     # ---- M9/M10 ---------------------------------------------------------------
     def device_visibility(self, dev):
@@ -44157,11 +44203,22 @@ proc ::mw_retheme {w map fgnew deffg} {
         pm, m = self.procmap, self.model
         mine = set(m.my_ips)
         n = 0
-        for f in list(m.flows.active.values())[-3000:]:
+        # 5.1.2: and the connections that closed since the last look (a
+        # short one closes before the process table is read again; the
+        # release gate's GUI test lost them when that read was slow)
+        # A closed one is named only by its exact address and port, never
+        # by the port alone (another program may have it by now).
+        active = list(m.flows.active.values())[-3000:]
+        recent = list(m.flows.archive)[-500:]
+        for i, f in enumerate(active + recent):
             if f.process or f.local_ip not in mine or \
                     f.transport not in ("TCP", "UDP"):
                 continue
-            ent = pm.lookup(f.transport, f.local_ip, f.local_port)
+            if i < len(active):
+                ent = pm.lookup(f.transport, f.local_ip, f.local_port)
+            else:
+                ent = pm.by_local.get((f.transport, f.local_ip,
+                                       f.local_port))
             if ent is not None:
                 f.process = program_label(ent)
                 n += 1
@@ -63976,6 +64033,35 @@ def gt_rc2_polish(app, ctx):
         assert not missing, (dev.display_name(), missing)
         with contextlib.suppress(tk.TclError):
             card.win.destroy()
+    # a narrow window lends the Inspector's room to the tabs, and gives
+    # it back; the setting is not touched
+    geo0 = root.geometry()
+    vis_before = app.inspector_visible
+    try:
+        app.toggle_inspector(True)
+        root.geometry(px_geo("1400x800"))
+        _gui_pump(root, 0.5)
+        assert app.inspector_visible
+        root.geometry(px_geo("1000x700"))
+        _gui_pump(root, 0.6)
+        assert not app.inspector_visible, "Inspector kept at 1000 wide"
+        assert app.config.get("appearance.inspector") is True
+        root.geometry(px_geo("1400x800"))
+        _gui_pump(root, 0.6)
+        assert app.inspector_visible, "Inspector not given back"
+        assert app.inspector.frame.winfo_width() >= px(200), \
+            app.inspector.frame.winfo_width()
+        # hidden by the person: stays hidden through a resize
+        app.toggle_inspector(False)
+        root.geometry(px_geo("1000x700"))
+        _gui_pump(root, 0.4)
+        root.geometry(px_geo("1400x800"))
+        _gui_pump(root, 0.6)
+        assert not app.inspector_visible
+    finally:
+        root.geometry(geo0)
+        _gui_pump(root, 0.4)
+        app.toggle_inspector(vis_before)
     # Why slow: the window's ranking docks in the Inspector
     vis0 = app.inspector_visible
     win = app.investigate("slow")
