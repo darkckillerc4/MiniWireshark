@@ -5899,11 +5899,30 @@ def is_virtual_iface(iface):
     return any(w in text for w in VIRTUAL_IFACE_WORDS)
 
 
+# 5.1.2: categories you corrected, by registrable domain (Settings keeps
+# them in websites.category_overrides; "-" = no category)
+CATEGORY_OVERRIDES = {}
+CAT_YOURS = "your correction"
+WEBSITE_CATEGORIES = ("Advertising", "Analytics", "Tracking", "Social",
+                      "CDN", "Content")
+
+
+def category_shown(cat, src, cfg):
+    """Whether a category is applied: CDN and your corrections always,
+    tracker categories when that option is on."""
+    return cat == "CDN" or src == CAT_YOURS or bool(
+        cfg.get("websites.tracker_classification", False))
+
+
 def domain_category(host):
     """Optional classification: Advertising / Analytics / Social /
-    Tracking / Content from the tracker list, CDN from the built-in list.
-    Returns (category, source) or ("", "")."""
+    Tracking / Content from the tracker list, CDN from the built-in list,
+    your own correction first. Returns (category, source) or ("", "")."""
     h = (host or "").lower().strip(".")
+    if CATEGORY_OVERRIDES:
+        mine = CATEGORY_OVERRIDES.get(registrable_domain(h))
+        if mine:
+            return ("" if mine == "-" else mine), CAT_YOURS
     db = DATA.get("trackers") if DATA is not None else None
     if db is not None:
         hit = db.classify(h)
@@ -8889,6 +8908,7 @@ FEATURES = {
     "sticky_sort": True,     # tables keep their sort and columns (M3)
     "tab_groups": True,      # tabs in four groups, new order (M4)
     "state_line": True,      # one truthful state line, not two banners (M4)
+    "answer_cards": True,    # three answers on the Dashboard (M6)
 }
 
 
@@ -10035,6 +10055,8 @@ class DeviceRecord:
     mine: bool = False
     alias: str = ""
     notes: str = ""
+    place: str = ""          # 5.1.2: "Kitchen" — yours, like the name
+    owner: str = ""          # 5.1.2: "Sam"
     os_ttl: int = 0
     ip_history: list = field(default_factory=list)       # [ip, first, last]
     mac_history: list = field(default_factory=list)      # [mac, first, last]
@@ -10171,7 +10193,7 @@ IFACE_STAT_FIELDS = ("packets", "packets_out", "packets_in", "bytes_up",
                      "bytes_down", "lan_bytes", "internet_bytes")
 _MERGE_COPIED = ("hostname", "hostname_source", "dhcp_hostname",
                  "mdns_name", "ssdp_name", "vendor", "alias", "notes",
-                 "model_hint", "dhcp_vendor_class", "ssdp_server",
+                 "place", "owner", "model_hint", "dhcp_vendor_class", "ssdp_server",
                  "dhcp_client_id", "mine", "expected")
 
 DEVICE_SAVE_FIELDS = (
@@ -10186,7 +10208,8 @@ DEVICE_SAVE_FIELDS = (
     "is_virtual", "expected", "mine", "alias", "notes", "os_ttl",
     "ip_history", "mac_history", "dhcp_history", "hostname_history",
     "presence", "merge_note", "merged_from", "demo", "dhcp_client_id",
-    "dhcp_params", "network_id", "iface_stats", "user_class")
+    "dhcp_params", "network_id", "iface_stats", "user_class", "place",
+    "owner")
 
 
 def looks_generated(name):
@@ -10630,6 +10653,8 @@ class DeviceRegistry:
             return
         dev.alias = sanitize_text(lab.get("alias", "")) or dev.alias
         dev.notes = sanitize_text(lab.get("notes", ""), 2000) or dev.notes
+        dev.place = sanitize_text(lab.get("place", ""), 40) or dev.place
+        dev.owner = sanitize_text(lab.get("owner", ""), 40) or dev.owner
         dev.mine = bool(lab.get("mine", dev.mine))
         dev.expected = bool(lab.get("expected", dev.expected))
         dev.pinned_no_merge = bool(lab.get("pinned", dev.pinned_no_merge))
@@ -11459,10 +11484,57 @@ class CorrectionJournal:
                     f"{p['old'] or 'detected'} → {p['new'] or 'detected'}")
         if op == "never_merge":
             return f"Never merge {namer(p['a'])} and {namer(p['b'])}"
+        if op == "tag":
+            return (f"Place / owner of {namer(p['key'])}: "
+                    f"{tag_text(*p['old']) or '—'} → "
+                    f"{tag_text(*p['new']) or '—'}")
+        if op == "category":
+            return (f"Category of {p['domain']}: "
+                    f"{cat_word(p['old'])} → {cat_word(p['new'])}")
         return op
+
+    def you_text(self, e, namer=lambda k: k):
+        """The timeline's line for a correction you made."""
+        p, op = e["payload"], e["op"]
+        if op == "rename":
+            return (f"You named {p['old'] or 'a device'} “{p['new']}”"
+                    if p["new"] else
+                    f"You removed the name “{p['old']}”")
+        if op == "flag":
+            word = {"mine": "yours", "expected": "expected",
+                    "pinned_no_merge": "never to be merged"}.get(
+                        p["flag"], p["flag"])
+            return (f"You marked {namer(p['key'])} as {word}" if p["new"]
+                    else f"You unmarked {namer(p['key'])} as {word}")
+        if op == "type":
+            return (f"You set the type of {namer(p['key'])} to {p['new']}"
+                    if p["new"] else
+                    f"You let MiniWireshark decide the type of "
+                    f"{namer(p['key'])}")
+        if op == "note":
+            return f"You edited the note on {namer(p['key'])}"
+        if op == "never_merge":
+            return (f"You said {namer(p['a'])} and {namer(p['b'])} are "
+                    f"different devices")
+        if op == "tag":
+            return (f"You set the place / owner of {namer(p['key'])} to "
+                    f"{tag_text(*p['new']) or '—'}")
+        if op == "category":
+            return (f"You set the category of {p['domain']} to "
+                    f"{cat_word(p['new'])}")
+        return self.describe(e, namer)
 
     def to_list(self):
         return [dict(e) for e in self.entries[-200:]]
+
+
+def tag_text(place, owner):
+    """“Kitchen · Sam”."""
+    return " · ".join(x for x in (place, owner) if x)
+
+
+def cat_word(cat):
+    return {"": "detected", "-": "no category"}.get(cat or "", cat)
 
 
 def network_fingerprint(router_mac, subnet):
@@ -15074,6 +15146,8 @@ VERBS = {
     "contacts": {LV_OBSERVED: "contacts", LV_REPORTED: "reportedly contacts",
                  LV_CORRELATED: "appears to contact",
                  LV_INFERRED: "may contact"},
+    "talks": {LV_OBSERVED: "talks", LV_REPORTED: "reportedly talks",
+              LV_CORRELATED: "appears to talk", LV_INFERRED: "may talk"},
 }
 
 
@@ -15138,6 +15212,21 @@ NARRATIVES = {t.key: t for t in (
                       "{program} on this computer {verb:is} using "
                       "{rate}.",
                       {"program": {LV_OBSERVED}, "rate": _SEEN}),
+    # 5.1.2: the device story
+    NarrativeTemplate("first_seen", "First seen {when} ({span}).",
+                      {"when": _SEEN, "span": _SEEN}),
+    NarrativeTemplate("presence", "{state}{offline}.",
+                      {"state": _SEEN, "offline": _SEEN},
+                      optional=("offline",)),
+    NarrativeTemplate("usual_hours", "Usually online {hours} ({basis}).",
+                      {"hours": {LV_CORRELATED, LV_INFERRED},
+                       "basis": _SEEN}),
+    NarrativeTemplate("learning", "Usual hours: still learning ({basis}).",
+                      {"basis": _SEEN}),
+    NarrativeTemplate("top_sites", "{verb:talks} mostly to {sites}.",
+                      {"sites": _ALL}),
+    NarrativeTemplate("new_today", "New {span}: {items}.",
+                      {"span": _SEEN, "items": _SEEN}),
 )}
 
 
@@ -15184,11 +15273,15 @@ def human_period(sec):
     return f"{sec / 3600:.1f} h"
 
 
-def periodic_findings(model, min_repeats=10):
-    """[(device_key, destination, period, repeats, narrative)]."""
+def periodic_findings(model, min_repeats=10, only=None):
+    """[(device_key, destination, period, repeats, narrative)]; `only`:
+    one device's (its card does not pay for every device)."""
     out = []
     reg = model.registry
     for (dev_key, remote), starts in list(model.flow_starts.items()):
+        if only is not None and dev_key != only and \
+                reg.resolve(dev_key) != only:
+            continue
         got = detect_periodic(starts, min_repeats)
         if not got:
             continue
@@ -15743,7 +15836,7 @@ class NetworkModel:
         name = sanitize_text(name or "", 60).strip()
         if name == dev.alias:
             return []
-        self.journal.add("rename", {"key": dev.key, "old": dev.alias,
+        self._journal("rename", {"key": dev.key, "old": dev.alias,
                                     "new": name})
         dev.alias = name
         if name:
@@ -15760,7 +15853,7 @@ class NetworkModel:
         new = (not old) if value is None else bool(value)
         if new == old:
             return []
-        self.journal.add("flag", {"key": dev.key, "flag": flag, "old": old,
+        self._journal("flag", {"key": dev.key, "flag": flag, "old": old,
                                   "new": new})
         setattr(dev, flag, new)
         self._dirty_dev(dev)
@@ -15775,7 +15868,7 @@ class NetworkModel:
             return []
         if cls == dev.user_class:
             return []
-        self.journal.add("type", {"key": dev.key, "old": dev.user_class,
+        self._journal("type", {"key": dev.key, "old": dev.user_class,
                                   "new": cls})
         dev.user_class = cls
         if not getattr(self, "demo", False) and dev.live and not dev.demo:
@@ -15795,10 +15888,72 @@ class NetworkModel:
         note = sanitize_text(note or "", 2000)
         if note == dev.notes:
             return []
-        self.journal.add("note", {"key": dev.key, "old": dev.notes,
+        self._journal("note", {"key": dev.key, "old": dev.notes,
                                   "new": note})
         dev.notes = note
         return [dev.key]
+
+    def _journal(self, op, payload):
+        """A correction: kept for Undo, and said on the timeline."""
+        e = self.journal.add(op, payload)
+        key = payload.get("key") or payload.get("a") or ""
+        name = (lambda k: (self._dev(k).display_name() if self._dev(k)
+                           else str(k).replace("ip:", "")))
+        with contextlib.suppress(Exception):
+            self.push_timeline("website" if op == "category" else
+                               "identity", "INFO",
+                               self.journal.you_text(e, name),
+                               ("website", payload["domain"])
+                               if op == "category" else ("device", key),
+                               key)
+        return e
+
+    def correct_tags(self, key, place, owner):
+        """Where a device is and whose it is (short words, yours)."""
+        dev = self._dev(key)
+        if dev is None:
+            return []
+        place = sanitize_text(place or "", 40).strip()
+        owner = sanitize_text(owner or "", 40).strip()
+        if (place, owner) == (dev.place, dev.owner):
+            return []
+        self._journal("tag", {"key": dev.key, "old": [dev.place, dev.owner],
+                              "new": [place, owner]})
+        dev.place, dev.owner = place, owner
+        self._dirty_dev(dev)
+        return [dev.key]
+
+    def correct_category(self, domain, cat):
+        """You say what kind of site a domain is ("" = let MiniWireshark
+        decide, "-" = no category). Kept by registrable domain."""
+        reg = registrable_domain(domain)
+        if not reg or (cat and cat != "-" and
+                       cat not in WEBSITE_CATEGORIES):
+            return []
+        old = CATEGORY_OVERRIDES.get(reg, "")
+        if cat == old:
+            return []
+        self._journal("category", {"domain": reg, "old": old, "new": cat})
+        self._set_category(reg, cat)
+        return [reg]
+
+    def _set_category(self, reg, cat):
+        if cat:
+            CATEGORY_OVERRIDES[reg] = cat
+        else:
+            CATEGORY_OVERRIDES.pop(reg, None)
+        with contextlib.suppress(Exception):
+            self.config.set("websites.category_overrides",
+                            dict(CATEGORY_OVERRIDES))
+        for w in list(self.websites.values()):
+            if w.registrable != reg and w.domain != reg:
+                continue
+            c, src = domain_category(w.domain)
+            if category_shown(c, src, self.config):
+                w.category, w.category_source = c, src
+            else:
+                w.category = w.category_source = ""
+            self.dirty_websites.add(w.domain)
 
     def correct_merge(self, keep, other, reason="you merged them"):
         reg = self.registry
@@ -15839,7 +15994,7 @@ class NetworkModel:
         da, db = self._dev(a), self._dev(b)
         if da is None or db is None or da is db:
             return []
-        self.journal.add("never_merge", {"a": da.key, "b": db.key})
+        self._journal("never_merge", {"a": da.key, "b": db.key})
         da.never_merge.add(db.key)
         db.never_merge.add(da.key)
         return [da.key, db.key]
@@ -15914,7 +16069,27 @@ class NetworkModel:
                 da.never_merge.discard(db.key)
                 db.never_merge.discard(da.key)
                 out = [da.key, db.key]
+        elif e["op"] == "tag":
+            dev = self._dev(p["key"])
+            if dev is not None:
+                dev.place, dev.owner = p["old"]
+                out = [dev.key]
+        elif e["op"] == "category":
+            self._set_category(p["domain"], p["old"])
+            e["undone"] = True
+            with contextlib.suppress(Exception):
+                self.push_timeline("website", "INFO",
+                                   f"You undid: {self.journal.describe(e)}",
+                                   ("website", p["domain"]))
+            return []
         e["undone"] = True
+        if out:
+            with contextlib.suppress(Exception):
+                self.push_timeline("identity", "INFO", "You undid: " +
+                                   self.journal.describe(
+                                       e, lambda k: self._dev(k).display_name()
+                                       if self._dev(k) else k),
+                                   ("device", out[0]), out[0])
         for k in out:
             self.dirty_devices.add(k)
             self._classify_dirty.add(k)
@@ -16823,8 +16998,7 @@ class NetworkModel:
             rec = WebsiteRecord(domain=key, registrable=reg, first_seen=ts,
                                 last_seen=ts)
             cat, src = domain_category(key)
-            if cat == "CDN" or self.config.get(
-                    "websites.tracker_classification", False):
+            if category_shown(cat, src, self.config):
                 rec.category, rec.category_source = cat, src
             self.websites[key] = rec
             if len(self.websites) > 20000:
@@ -16984,9 +17158,9 @@ class NetworkModel:
                 self.dirty_remotes.add(rec.ip)
         for w in list(self.websites.values()):
             cat, srcname = domain_category(w.domain)
-            if cat and (cat, srcname) != (w.category, w.category_source) \
-                    and (cat == "CDN" or self.config.get(
-                        "websites.tracker_classification", False)):
+            if (cat or srcname == CAT_YOURS) and \
+                    (cat, srcname) != (w.category, w.category_source) \
+                    and category_shown(cat, srcname, self.config):
                 w.category, w.category_source = cat, srcname
                 n["websites"] += 1
                 self.dirty_websites.add(w.domain)
@@ -17434,7 +17608,8 @@ def _default_config():
                     "beginner_explanations": True,
                     "explanation_verbosity": "Normal", "language": "English",
                     "upgraded_from_3": False, "show_welcome": True,
-                    "welcome_version": "", "tours_done": []},
+                    "welcome_version": "", "tours_done": [],
+                    "tips": True},
         "accessibility": {"colorblind": "Off"},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal",
@@ -17737,9 +17912,11 @@ class KnownDevicesStore:
                  "never_merge": sorted(dev.never_merge),
                  "vendor": dev.vendor, "last_ip": dev.ip,
                  "user_class": dev.user_class, "updated": time.time()}
+        if dev.place or dev.owner:
+            entry["place"], entry["owner"] = dev.place, dev.owner
         if not any((dev.alias, dev.notes, dev.mine, dev.expected,
                     dev.pinned_no_merge, dev.never_merge,
-                    dev.user_class)):
+                    dev.user_class, dev.place, dev.owner)):
             self.data.pop(dev.key, None)
         else:
             self.data[dev.key] = entry
@@ -18935,6 +19112,26 @@ class PacketRing:
             self.q.put_nowait(None)
         if wait:
             self._thread.join(wait)
+
+
+def hm_clock(ts):
+    """09:14 (the seconds are noise in a sentence)."""
+    try:
+        return time.strftime("%H:%M", time.localtime(ts))
+    except (ValueError, OverflowError, OSError, TypeError):
+        return "?"
+
+
+def span_words(sec):
+    """10 min, 3 h, 1.5 h — a span as said in a sentence."""
+    sec = max(0, float(sec or 0))
+    if sec < 90:
+        return f"{sec:.0f} s"
+    if sec < 90 * 60:
+        return f"{sec / 60:.0f} min"
+    h = sec / 3600
+    return f"{h:.0f} h" if h >= 10 or abs(h - round(h)) < 0.05 else \
+        f"{h:.1f} h"
 
 
 def digest_summary(dg):
@@ -20823,6 +21020,112 @@ Open: ¦ Ouvrir : ¦ Abrir:
 Explain inline on / off ¦ Explications sur place oui / non ¦ Explicaciones en el sitio sí / no
 Shows what marks, states and alerts mean right under them (the Inspector, the selected row of a table, the Dashboard cards). Off: they stay in tooltips. The ? button in the header and F1 switch it too. ¦ Affiche ce que veulent dire les marques, les états et les alertes juste en dessous (l'inspecteur, la ligne sélectionnée d'un tableau, les cartes du tableau de bord). Désactivé : elles restent dans les infobulles. Le bouton ? de l'en-tête et F1 l'activent aussi. ¦ Muestra lo que significan las marcas, los estados y las alertas justo debajo (el inspector, la fila seleccionada de una tabla, las tarjetas del panel). Desactivado: se quedan en las descripciones emergentes. El botón ? de la cabecera y F1 también lo cambian.
 Write explanations out in place ¦ Écrire les explications sur place ¦ Escribir las explicaciones en el sitio
+%d blind spots ¦ %d angles morts ¦ %d puntos ciegos
+%d of 30 active minutes ¦ %d sur 30 minutes actives ¦ %d de 30 minutos activos
+%d open alerts ¦ %d alertes ouvertes ¦ %d alertas abiertas
+%d warnings to look at. ¦ %d avertissements à regarder. ¦ %d advertencias que revisar.
+%d websites ¦ %d sites web ¦ %d sitios web
+%d without an answer ¦ %d sans réponse ¦ %d sin respuesta
+%d%% of recent website lookups failed ¦ %d %% des recherches de sites récentes ont échoué ¦ el %d %% de las búsquedas de sitios recientes falló
+(Settings → Alerts lists it, with Remove.) ¦ (Paramètres → Alertes l'affiche, avec Supprimer.) ¦ (Configuración → Alertas la muestra, con Eliminar.)
+1 blind spot ¦ 1 angle mort ¦ 1 punto ciego
+1 open alert ¦ 1 alerte ouverte ¦ 1 alerta abierta
+1 warning to look at. ¦ 1 avertissement à regarder. ¦ 1 advertencia que revisar.
+A ranked list of explanations with the evidence for and against each. It is not a verdict: the top one is the best fit for what this computer can see ¦ Une liste classée d'explications, avec les indices pour et contre chacune. Ce n'est pas un verdict : la première est celle qui colle le mieux à ce que cet ordinateur peut voir ¦ Una lista ordenada de explicaciones, con las pruebas a favor y en contra de cada una. No es un veredicto: la primera es la que mejor encaja con lo que este equipo puede ver
+Alerts you chose to look at later stay open in the Alerts tab. ¦ Les alertes que vous avez gardées pour plus tard restent ouvertes dans l'onglet Alertes. ¦ Las alertas que dejó para más tarde siguen abiertas en la pestaña Alertas.
+All reviewed. ¦ Tout est passé en revue. ¦ Todo revisado.
+Answer times (last hour) ¦ Temps de réponse (dernière heure) ¦ Tiempos de respuesta (última hora)
+Being on such a list doesn't mean a domain is malicious. ¦ Figurer sur une telle liste ne veut pas dire qu'un domaine est malveillant. ¦ Estar en una lista así no significa que un dominio sea malicioso.
+Can't tell right now. ¦ Impossible à dire pour l'instant. ¦ No se puede saber ahora mismo.
+Can't tell yet: MiniWireshark isn't watching. Press Start watching. ¦ Impossible à dire pour l'instant : MiniWireshark n'observe pas. Appuyez sur Commencer à observer. ¦ Aún no se puede saber: MiniWireshark no está observando. Pulse Empezar a observar.
+Checking the router… ¦ Vérification du routeur… ¦ Comprobando el router…
+Copy chart data as CSV ¦ Copier les données du graphique en CSV ¦ Copiar los datos del gráfico como CSV
+Copy chart data as text ¦ Copier les données du graphique en texte ¦ Copiar los datos del gráfico como texto
+Expected ¦ Attendu ¦ Esperado
+From here ¦ D'ici ¦ Desde aquí
+In the last hour ¦ Au cours de la dernière heure ¦ En la última hora
+In this file, last hour ¦ Dans ce fichier, dernière heure ¦ En este archivo, última hora
+Is anything wrong? ¦ Y a-t-il un problème ? ¦ ¿Algo va mal?
+Let MiniWireshark decide ¦ Laisser MiniWireshark décider ¦ Dejar que MiniWireshark decida
+Look later ¦ Voir plus tard ¦ Ver más tarde
+Maybe. %d alert(s) need a look ¦ Peut-être. %d alerte(s) à regarder ¦ Quizá. %d alerta(s) que revisar
+No category (an ordinary website) ¦ Pas de catégorie (un site ordinaire) ¦ Sin categoría (un sitio normal)
+No category: not on any list MiniWireshark has. ¦ Pas de catégorie : absent de toutes les listes de MiniWireshark. ¦ Sin categoría: no está en ninguna lista de MiniWireshark.
+No category: the tracker list is off (Settings → Privacy). CDNs are still marked. ¦ Pas de catégorie : la liste des traqueurs est désactivée (Paramètres → Vie privée). Les CDN restent signalés. ¦ Sin categoría: la lista de rastreadores está desactivada (Configuración → Privacidad). Los CDN siguen marcados.
+No more “%s” alerts for %s ¦ Plus d'alertes « %s » pour %s ¦ No más alertas «%s» para %s
+No open alerts to review. ¦ Aucune alerte ouverte à passer en revue. ¦ No hay alertas abiertas que revisar.
+No problem seen ¦ Aucun problème vu ¦ No se ha visto ningún problema
+No single device stands out. ¦ Aucun appareil ne se détache. ¦ Ningún dispositivo destaca.
+No. The Internet and website lookups answer normally ¦ Non. Internet et les recherches de sites répondent normalement ¦ No. Internet y las búsquedas de sitios responden con normalidad
+None yet. “Mark expected” and “Mute for this device” add one here. ¦ Aucune pour l'instant. « Marquer comme attendu » et « Mettre en sourdine pour cet appareil » en ajoutent une ici. ¦ Ninguna por ahora. «Marcar como esperado» y «Silenciar para este dispositivo» añaden una aquí.
+Nothing measured in the last ¦ Rien de mesuré au cours des dernières ¦ Nada medido en los últimos
+Offline since ¦ Hors ligne depuis ¦ Desconectado desde
+One line when you come back after a while (what happened while the window was in the background) and the short tours, each offered once. ¦ Une ligne quand vous revenez après un moment (ce qui s'est passé pendant que la fenêtre était en arrière-plan) et les courtes visites guidées, chacune proposée une fois. ¦ Una línea cuando vuelve tras un rato (lo que pasó mientras la ventana estaba en segundo plano) y los recorridos breves, cada uno ofrecido una vez.
+Online now ¦ En ligne maintenant ¦ Conectado ahora
+Other devices' Internet traffic is not visible from here. ¦ Le trafic Internet des autres appareils n'est pas visible d'ici. ¦ El tráfico de Internet de los demás dispositivos no es visible desde aquí.
+Place / owner ¦ Lieu / propriétaire ¦ Lugar / propietario
+Place and owner ¦ Lieu et propriétaire ¦ Lugar y propietario
+Place and owner… ¦ Lieu et propriétaire… ¦ Lugar y propietario…
+Quiet Mode (or a network not marked as yours): ranked only on what was overheard; nothing was sent to check. ¦ Mode discret (ou réseau non marqué comme le vôtre) : classé uniquement d'après ce qui a été entendu ; rien n'a été envoyé pour vérifier. ¦ Modo silencioso (o una red no marcada como suya): ordenado solo con lo que se ha escuchado; no se envió nada para comprobar.
+Review ¦ Passer en revue ¦ Revisar
+Review %d new ¦ Revoir %d nouvelles ¦ Revisar %d nuevas
+Review alerts ¦ Passer en revue les alertes ¦ Revisar alertas
+Review new alerts ¦ Passer en revue les nouvelles alertes ¦ Revisar las alertas nuevas
+Rule stored ¦ Règle enregistrée ¦ Regla guardada
+Since ¦ Depuis ¦ Desde
+Some devices' traffic may not be visible from here. ¦ Le trafic de certains appareils peut ne pas être visible d'ici. ¦ Puede que el tráfico de algunos dispositivos no sea visible desde aquí.
+This is wrong… ¦ C'est faux… ¦ Esto está mal…
+Tips and catch-up lines ¦ Astuces et lignes de rattrapage ¦ Consejos y líneas de puesta al día
+What is new? ¦ Quoi de neuf ? ¦ ¿Qué hay de nuevo?
+What kind of site is %s? Your answer is kept on this computer for every address of this site. ¦ Quel genre de site est %s ? Votre réponse est conservée sur cet ordinateur pour toutes les adresses de ce site. ¦ ¿Qué tipo de sitio es %s? Su respuesta se guarda en este equipo para todas las direcciones de este sitio.
+Where is %s, and whose is it? Two short words, kept on this computer only. ¦ Où se trouve %s, et à qui est-il ? Deux mots courts, conservés uniquement sur cet ordinateur. ¦ ¿Dónde está %s y de quién es? Dos palabras cortas, guardadas solo en este equipo.
+While this window was in the background ¦ Pendant que cette fenêtre était en arrière-plan ¦ Mientras esta ventana estaba en segundo plano
+Who is using the Internet? ¦ Qui utilise Internet ? ¦ ¿Quién usa Internet?
+Wi-Fi signal as last read by this computer ¦ signal Wi-Fi tel que lu en dernier par cet ordinateur ¦ señal Wi-Fi según la última lectura de este equipo
+Your rules ¦ Vos règles ¦ Sus reglas
+ago ¦ plus tôt ¦ antes
+answered ¦ a répondu ¦ respondió
+from the file, up to ¦ d'après le fichier, jusqu'à ¦ del archivo, hasta
+in the demo data ¦ dans les données de démonstration ¦ en los datos de demostración
+in the last ¦ au cours des dernières ¦ en los últimos
+in this file ¦ dans ce fichier ¦ en este archivo
+learned over %d active minutes ¦ appris sur %d minutes actives ¦ aprendido en %d minutos activos
+lookups are encrypted, so not timed ¦ les recherches sont chiffrées, donc non chronométrées ¦ las búsquedas están cifradas, así que no se cronometran
+no Internet traffic right now ¦ pas de trafic Internet en ce moment ¦ sin tráfico de Internet ahora mismo
+no answer ¦ pas de réponse ¦ sin respuesta
+no known blind spots ¦ aucun angle mort connu ¦ ningún punto ciego conocido
+no router or Internet check yet ¦ pas encore de vérification du routeur ou d'Internet ¦ aún no se ha comprobado el router ni Internet
+no website lookups timed yet ¦ aucune recherche de site chronométrée pour l'instant ¦ aún no se ha cronometrado ninguna búsqueda de sitios
+not tied to any device ¦ rattachés à aucun appareil ¦ sin vincular a ningún dispositivo
+nothing new ¦ rien de nouveau ¦ nada nuevo
+nothing new. ¦ rien de nouveau. ¦ nada nuevo.
+of what I can see ¦ de ce que je peux voir ¦ de lo que puedo ver
+router and Internet checks ¦ vérifications du routeur et d'Internet ¦ comprobaciones del router y de Internet
+seen by this computer ¦ vus par cet ordinateur ¦ vistos por este equipo
+since ¦ depuis ¦ desde
+the DNS server didn't answer the test lookup ¦ le serveur DNS n'a pas répondu à la recherche de test ¦ el servidor DNS no respondió a la búsqueda de prueba
+the Internet test address didn't answer the last check ¦ l'adresse de test Internet n'a pas répondu à la dernière vérification ¦ la dirección de prueba de Internet no respondió a la última comprobación
+the Internet… ¦ Internet… ¦ Internet…
+this session ¦ cette session ¦ esta sesión
+today ¦ aujourd'hui ¦ hoy
+website lookups and connections over the last ¦ recherches de sites et connexions des dernières ¦ búsquedas de sitios y conexiones de los últimos
+website lookups are slow (typically %d ms) ¦ les recherches de sites sont lentes (en général %d ms) ¦ las búsquedas de sitios son lentas (normalmente %d ms)
+your router didn't answer the last check ¦ votre routeur n'a pas répondu à la dernière vérification ¦ su router no respondió a la última comprobación
+“%s” about %s is expected ¦ « %s » au sujet de %s est attendu ¦ «%s» sobre %s es esperado
+Its story ¦ Son histoire ¦ Su historia
+your correction ¦ votre correction ¦ su corrección
+from the ¦ d'après la ¦ según la
+No category ¦ Pas de catégorie ¦ Sin categoría
+Category of ¦ Catégorie de ¦ Categoría de
+As of ¦ État au ¦ Datos de
+%d of %d ¦ %d sur %d ¦ %d de %d
+What was seen ¦ Ce qui a été vu ¦ Lo que se vio
+What it might mean ¦ Ce que cela pourrait signifier ¦ Lo que podría significar
+Usually ¦ D'habitude ¦ Normalmente
+Set its category… ¦ Définir sa catégorie… ¦ Definir su categoría…
+Website category ¦ Catégorie du site ¦ Categoría del sitio
+No checks in the last hour (they need live watching with Active Scanning) ¦ Aucune vérification au cours de la dernière heure (il faut observer en direct avec l'analyse active) ¦ Ninguna comprobación en la última hora (hace falta observar en directo con el análisis activo)
+No checks yet ¦ Pas encore de vérification ¦ Aún no hay comprobaciones
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -21314,8 +21617,68 @@ I18N_PATTERNS = [
      r"reprendre (\1 en attente)",
      r"En pausa mientras el puntero está sobre la lista: apártelo para "
      r"continuar (\1 en espera)"),
+    # 5.1.2 M6: the device story (built in English, translated whole)
+    (r"Usually online (\S+) \(learned over (\d+) active minutes\)\.",
+     r"Habituellement en ligne \1 (appris sur \2 minutes actives).",
+     r"Normalmente conectado \1 (aprendido en \2 minutos activos)."),
+    (r"Usual hours: still learning \((\d+) of 30 active minutes\)\.",
+     r"Heures habituelles : encore en apprentissage (\1 sur 30 minutes "
+     r"actives).",
+     r"Horario habitual: todavía aprendiendo (\1 de 30 minutos activos)."),
+    (r"Talks mostly to (.+)\.", r"Communique surtout avec \1.",
+     r"Habla sobre todo con \1."),
+    (r"Appears to talk mostly to (.+)\.",
+     r"Semble communiquer surtout avec \1.",
+     r"Parece hablar sobre todo con \1."),
+    (r"May talk mostly to (.+)\.", r"Communique peut-être surtout avec \1.",
+     r"Puede que hable sobre todo con \1."),
+    (r"Reportedly talks mostly to (.+)\.",
+     r"Communiquerait surtout avec \1.",
+     r"Según lo informado, habla sobre todo con \1."),
+    (r"New today: 1 website\.", r"Nouveau aujourd'hui : 1 site web.",
+     r"Nuevo hoy: 1 sitio web."),
+    (r"New today: (\d+) websites\.",
+     r"Nouveaux aujourd'hui : \1 sites web.",
+     r"Nuevos hoy: \1 sitios web."),
+    (r"1 open alert: (.+)", r"1 alerte ouverte : \1",
+     r"1 alerta abierta: \1"),
+    (r"(\d+) open alerts: (.+)", r"\1 alertes ouvertes : \2",
+     r"\1 alertas abiertas: \2"),
+] + [
+    # first seen: today / on a date × this session / in this file
+    (r"First seen " + w + r" \(" + sp + r"\)\.",
+     r"Vu pour la première fois " + wf + " (" + spf + ").",
+     r"Visto por primera vez " + we + " (" + spe + ").")
+    for w, wf, we in (
+        (r"today at (\d\d:\d\d)", r"aujourd'hui à \1", r"hoy a las \1"),
+        (r"on (\d\d/\d\d) at (\d\d:\d\d)", r"le \1 à \2",
+         r"el \1 a las \2"))
+    for sp, spf, spe in (("this session", "cette session", "esta sesión"),
+                         ("in this file", "dans ce fichier",
+                          "en este archivo"))
+] + [
+    # online / offline, and how often it went offline today
+    (st + off + r"\.", stf + offf + ".", ste + offe + ".")
+    for st, stf, ste, n in (
+        ("Online now", "En ligne maintenant", "Conectado ahora", 0),
+        (r"Offline since (\d\d:\d\d)", r"Hors ligne depuis \1",
+         r"Desconectado desde las \1", 1))
+    for off, offf, offe in (
+        ("", "", ""),
+        ("; offline once today", " ; hors ligne une fois aujourd'hui",
+         "; desconectado una vez hoy"),
+        ("; offline twice today", " ; hors ligne deux fois aujourd'hui",
+         "; desconectado dos veces hoy"),
+        (r"; offline (\d+) times today",
+         r" ; hors ligne \%d fois aujourd'hui" % (n + 1),
+         r"; desconectado \%d veces hoy" % (n + 1)))
+] + [
     (r"(\d+)\. (.+)", None, None),         # numbered title: translate rest
 ]
+# the device story's presence sentences go first: a 5.0.2 pattern for
+# "Offline since …" would take them (the sort keeps the rest in order)
+I18N_PATTERNS.sort(key=lambda x: 0 if x[0].startswith(
+    ("Online now", r"Offline since (\d\d")) else 1)
 _I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
                      for p, fr, es in I18N_PATTERNS]
 _I18N_CORE = re.compile(
@@ -22843,6 +23206,11 @@ SETTINGS_PAGES = [
                       "them (the Inspector, the selected row of a table, "
                       "the Dashboard cards). Off: they stay in tooltips. "
                       "The ? button in the header and F1 switch it too."},
+             {"key": "general.tips", "type": "bool",
+              "label": "Tips and catch-up lines",
+              "help": "One line when you come back after a while (what "
+                      "happened while the window was in the background) "
+                      "and the short tours, each offered once."},
              {"key": "general.beginner_explanations", "type": "bool",
               "label": "Include plain-English guidance",
               "help": "Adds “what should I check?” advice to device "
@@ -23214,6 +23582,7 @@ SETTINGS_PAGES = [
               "requires": "notifications.feed_alerts",
               "help": "Keeps the feed calm; warnings stay in the Alerts "
                       "tab."},
+             {"type": "alert_rules"},
              {"type": "action", "actions": [
                  ("Un-mute all alerts", "unmute_alerts")]},
          ]},
@@ -24013,6 +24382,16 @@ class SettingsWindow:
         if scale != 1.0:
             self.app._scale_explicit_fonts(self.win, scale)
 
+    def _rerender(self):
+        """The current page again (a rule was removed)."""
+        if getattr(self, "searching", False):
+            return
+        with contextlib.suppress(tk.TclError, AttributeError):
+            y = self.canvas.yview()[0] if hasattr(self, "canvas") else 0
+            self.show_page(self.page_id)
+            if y and hasattr(self, "canvas"):
+                self.canvas.yview_moveto(y)
+
     def find_setting(self, key):
         """Show one setting (Ctrl+K, header search): search its label."""
         c = self.controls.get(key)
@@ -24164,6 +24543,28 @@ class SettingsWindow:
 
         elif typ == "cvd_preview":
             self._cvd_preview(row)
+
+        elif typ == "alert_rules":
+            rules = self.app.alert_rules()
+            tk.Label(row, text=translate_text("Your rules"),
+                     bg=t["tab_bg"], fg=t["text_fg"], font=self.F_BASE,
+                     anchor="w").pack(fill="x")
+            if not rules:
+                self._help(row, translate_text(
+                    "None yet. “Mark expected” and “Mute for this device” "
+                    "add one here."), reserve=40)
+            for name, tag, words in rules[:200]:
+                line = tk.Frame(row, bg=t["tab_bg"])
+                line.pack(fill="x", pady=1)
+                ttk.Button(line, text="Remove", style="Settings.TButton",
+                           command=lambda n=name, tg=tag: (
+                               self.app.remove_alert_rule(n, tg),
+                               self._rerender())).pack(side="right")
+                lbl = tk.Label(line, text=words, bg=t["tab_bg"],
+                               fg=t["text_fg"], font=self.F_HELP,
+                               anchor="w", justify="left")
+                lbl.pack(side="left", fill="x", expand=True)
+                self._wrap.append((lbl, 140))
 
         elif typ == "geo_status":
             self.geo_var = DisplayVar(value=self.app._geoip_status_text())
@@ -24467,6 +24868,7 @@ class SettingsWindow:
             self.cfg.set("alerts.expected", [])
             self.cfg.save()
             self.app._set_banner("\U0001F514  All alert mutes were cleared.")
+            self._rerender()
 
     def reset_page(self):
         if self.searching:
@@ -25878,6 +26280,8 @@ class DetailDialog:
         self.txt.tag_configure("muted", foreground=t["muted_fg"])
         self.txt.tag_configure("fold", foreground=t["accent"],
                                spacing1=4, spacing3=8)
+        self.txt.tag_configure("lk", foreground=t["accent"], underline=True)
+        self._links = 0
         self.txt.tag_bind("fold", "<Button-1>", lambda e: self.toggle_fold())
         self.txt.tag_bind("fold", "<Enter>",
                           lambda e: self.txt.configure(cursor="hand2"))
@@ -25913,7 +26317,12 @@ class DetailDialog:
         if kind and len(sections) > self.FOLD_KEEP + 1:
             keep = self.FOLD_KEEP
         self.folded = keep < len(sections) and self.app.fold_closed(kind)
-        for i, (heading, text) in enumerate(sections):
+        for tag in self.txt.tag_names():
+            if tag.startswith("lk_"):
+                self.txt.tag_delete(tag)
+        for i, sec in enumerate(sections):
+            heading, text = sec[0], sec[1]
+            links = (getattr(self, "links", None) or {}).get(heading, ())
             if i == keep:
                 more = len(sections) - keep
                 self.txt.insert("end", ("\u25B8 " + translate_text(
@@ -25924,7 +26333,21 @@ class DetailDialog:
                 if self.folded:
                     break
             self.txt.insert("end", translate_text(heading) + "\n", ("h",))
-            self.txt.insert("end", translate_lines(text or "—") + "\n\n")
+            if isinstance(text, (list, tuple)):
+                # sentences, each with a link to its proof
+                for line, link in text:
+                    self.txt.insert("end", translate_lines(line))
+                    if link:
+                        self.txt.insert("end", "  ")
+                        self._link(link)
+                    self.txt.insert("end", "\n")
+                self.txt.insert("end", "\n")
+                continue
+            self.txt.insert("end", translate_lines(text or "—") + "\n")
+            for j, link in enumerate(links or ()):
+                self.txt.insert("end", "   " if j else "")
+                self._link(link)
+            self.txt.insert("end", "\n\n" if links else "\n")
         with contextlib.suppress(Exception):
             gloss_mark(self.txt, self.app)
         self.txt.config(state="disabled")
@@ -25940,6 +26363,27 @@ class DetailDialog:
 
     FOLD_KEEP = 3
 
+    def _link(self, link):
+        """(label, app method name, args): a link in the text."""
+        label, meth, args = link
+        self._links += 1
+        tag = f"lk_{self._links}"
+        self.txt.insert("end", translate_text(label), ("lk", tag))
+        fn = getattr(self.app, meth, None)
+        if fn is not None:
+            self.txt.tag_bind(tag, "<Button-1>",
+                              lambda e, f=fn, a=tuple(args): f(*a))
+        self.txt.tag_bind(tag, "<Enter>",
+                          lambda e: self.txt.configure(cursor="hand2"))
+        self.txt.tag_bind(tag, "<Leave>",
+                          lambda e: self.txt.configure(cursor=""))
+
+    @staticmethod
+    def section_text(text):
+        if isinstance(text, (list, tuple)):
+            return "\n".join(line for line, _l in text)
+        return text or "—"
+
     def toggle_fold(self):
         kind = getattr(self, "fold_kind", None)
         if not kind:
@@ -25949,7 +26393,8 @@ class DetailDialog:
 
     def copy(self):
         title = self.win.title()
-        body = "\n\n".join(f"{h}\n{t}" for h, t in self.sections)
+        body = "\n\n".join(f"{sec[0]}\n{self.section_text(sec[1])}"
+                           for sec in self.sections)
         copy_to_clipboard(self.app, f"{title}\n{'=' * len(title)}\n\n{body}")
 
 
@@ -25987,6 +26432,51 @@ def ask_text(app, title, prompt, initial="", multiline=False, parent=None):
                                                              padx=6)
     if not multiline:
         win.bind("<Return>", ok)
+    win.bind("<Escape>", lambda e: win.destroy())
+    win.grab_set()
+    win.wait_window()
+    return res["v"]
+
+
+def ask_tags(app, dev, places=(), owners=(), parent=None):
+    """Place and owner for a device: two short fields with what you
+    used before. → (place, owner) or None."""
+    t = app.theme
+    res = {"v": None}
+    win = tk.Toplevel(parent or app.root)
+    win.title(translate_text("Place and owner"))
+    win.configure(bg=t["tab_bg"])
+    win.transient(parent or app.root)
+    tk.Label(win, text=translate_text("Where is %s, and whose is it? Two "
+                                      "short words, kept on this computer "
+                                      "only.") % app.device_label(dev),
+             bg=t["tab_bg"], fg=t["text_fg"], justify="left",
+             wraplength=380).pack(anchor="w", padx=14, pady=(12, 6))
+    grid = tk.Frame(win, bg=t["tab_bg"])
+    grid.pack(fill="x", padx=14)
+    pv = tk.StringVar(value=dev.place)
+    ov = tk.StringVar(value=dev.owner)
+    for r, (label, var, vals) in enumerate((("Place:", pv, places),
+                                            ("Owner:", ov, owners))):
+        tk.Label(grid, text=label, bg=t["tab_bg"], fg=t["text_fg"]).grid(
+            row=r, column=0, sticky="w", pady=3)
+        cb = ttk.Combobox(grid, textvariable=var, values=list(vals),
+                          width=28)
+        cb.grid(row=r, column=1, sticky="ew", padx=(8, 0), pady=3)
+        if r == 0:
+            cb.focus_set()
+    grid.columnconfigure(1, weight=1)
+
+    def ok(_e=None):
+        res["v"] = (pv.get().strip()[:40], ov.get().strip()[:40])
+        win.destroy()
+    bar = tk.Frame(win, bg=t["tab_bg"])
+    bar.pack(fill="x", padx=14, pady=12)
+    ttk.Button(bar, text="OK", style="Accent.TButton", command=ok).pack(
+        side="right")
+    ttk.Button(bar, text="Cancel", command=win.destroy).pack(side="right",
+                                                             padx=6)
+    win.bind("<Return>", ok)
     win.bind("<Escape>", lambda e: win.destroy())
     win.grab_set()
     win.wait_window()
@@ -26085,8 +26575,14 @@ class Charts:
         fs, fb = cls.font(c, small), cls.font(c, bold)
         title = translate_text(title)
         tw = fb.measure(title) if title else 0
-        c.create_text(x, y, anchor="nw", text=title, fill=t["text_fg"],
-                      font=bold)
+        tid = c.create_text(x, y, anchor="nw", text=title, fill=t["text_fg"],
+                            font=bold)
+        n_pts = max((len(v) for _l, v, _c in series), default=0)
+        cls.record(c, tid, title, ["#"] + [lab for lab, _v, _c in series],
+                   [[i + 1] + [(v[i] if i < len(v) else "")
+                               for _l, v, _c in series]
+                    for i in range(n_pts)], fmt,
+                   note=f"{xlabels[0]} … {xlabels[1]}".strip(" …"))
         # legend: right-aligned rows above the plot, never over the title
         rows, row, rx = [], [], x + w
         for i, (label, vals, color) in enumerate(series):
@@ -26152,6 +26648,73 @@ class Charts:
                               dash=cls.DASHES[i % len(cls.DASHES)])
         return left, pw
 
+    # 5.1.2: each chart keeps the numbers it drew; right-click copies them
+    # as text or CSV (also for screen-reader users)
+    @classmethod
+    def record(cls, c, anchor, title, header, rows, fmt=None, texts=None,
+               note=""):
+        recs = getattr(c, "_mw_chart", None)
+        if recs is None:
+            recs = c._mw_chart = OrderedDict()
+            c.bind("<Button-3>", lambda e: cls.chart_menu(c, e), add="+")
+        recs[title or f"chart {len(recs) + 1}"] = {
+            "anchor": anchor, "header": header, "rows": rows,
+            "fmt": fmt, "texts": texts, "note": note}
+
+    @classmethod
+    def chart_data(cls, c):
+        """The charts now on the canvas (a cleared one's are dropped)."""
+        out = OrderedDict()
+        for title, r in (getattr(c, "_mw_chart", None) or {}).items():
+            try:
+                alive = r["anchor"] is None or bool(c.type(r["anchor"]))
+            except tk.TclError:
+                alive = False
+            if alive:
+                out[title] = r
+        return out
+
+    @classmethod
+    def chart_text(cls, c, csv_=False):
+        parts = []
+        for title, r in cls.chart_data(c).items():
+            head = [translate_text(h) for h in r["header"]]
+            if csv_:
+                buf = io.StringIO()
+                wr = csv.writer(buf)
+                wr.writerow([title] + ([r["note"]] if r["note"] else []))
+                wr.writerow(head)
+                for row in r["rows"]:
+                    wr.writerow(row)
+                parts.append(buf.getvalue().rstrip("\n"))
+                continue
+            lines = [title + (f"  ({r['note']})" if r["note"] else "")]
+            rows = r["texts"] or [
+                [x if i == 0 or r["fmt"] is None or x == "" else
+                 r["fmt"](x) for i, x in enumerate(row)]
+                for row in r["rows"]]
+            lines.append("\t".join(str(h) for h in head))
+            lines += ["\t".join(str(x) for x in row) for row in rows]
+            parts.append("\n".join(lines))
+        return "\n\n".join(parts)
+
+    @classmethod
+    def chart_menu(cls, c, e):
+        if not cls.chart_data(c):
+            return
+
+        def copy(csv_):
+            with contextlib.suppress(tk.TclError):
+                c.clipboard_clear()
+                c.clipboard_append(cls.chart_text(c, csv_))
+        m = tk.Menu(c, tearoff=0)
+        m.add_command(label=translate_text("Copy chart data as text"),
+                      command=lambda: copy(False))
+        m.add_command(label=translate_text("Copy chart data as CSV"),
+                      command=lambda: copy(True))
+        with contextlib.suppress(tk.TclError):
+            m.tk_popup(e.x_root, e.y_root)
+
     @classmethod
     def hbars(cls, c, x, y, w, h, items, t, title="", color=None,
               empty="Nothing yet", tags_prefix=""):
@@ -26160,9 +26723,12 @@ class Charts:
         value never runs into the chart beside it."""
         bold, norm, small = (("TkDefaultFont", 10, "bold"),
                              ("TkDefaultFont", 9), ("TkDefaultFont", 8))
-        c.create_text(x, y, anchor="nw", text=cls.elide(
+        tid = c.create_text(x, y, anchor="nw", text=cls.elide(
             c, translate_text(title), bold, w), fill=t["text_fg"],
             font=bold)
+        cls.record(c, tid, translate_text(title), ["", "Value"],
+                   [[lab, v] for lab, v, _vt, _k in items],
+                   texts=[[lab, vt] for lab, _v, vt, _k in items])
         if not items:
             c.create_text(x, y + 30, anchor="nw", text=translate_text(empty),
                           fill=t["muted_fg"], font=norm)
@@ -26803,9 +27369,14 @@ class DashboardTab(BaseTab):
                                   bg="#eef4fb", fg="#0b5394", anchor="w",
                                   justify="left", wraplength=1100, padx=12,
                                   pady=8, font=mw_font(11))
-        self.state_lbl.pack(fill="x", pady=(0, 8))
+        self.answers = FEATURES.get("answer_cards", True)
+        if self.answers:
+            self._build_answers(outer)
+        else:
+            self.state_lbl.pack(fill="x", pady=(0, 8))
         self.big = tk.Frame(outer, bg=WHITE)
-        self.big.pack(fill="x", pady=(0, 4))
+        if not self.answers:
+            self.big.pack(fill="x", pady=(0, 4))
         self.big_vars = {}
         for i, (key, title, cmd) in enumerate((
                 ("coverage", "WHAT I CAN SEE FROM HERE",
@@ -26871,6 +27442,83 @@ class DashboardTab(BaseTab):
         self.canvas.bind("<Configure>", lambda e: self.refresh(force=True))
         self.canvas.bind("<Button-1>", self._on_chart_click)
         self._click_items = {}
+
+    # 5.1.2: three questions answered in a sentence each, then the honesty
+    # line (what this computer can see); the number cards and charts follow
+    ANSWERS = (("wrong", "Is anything wrong?"),
+               ("usage", "Who is using the Internet?"),
+               ("new", "What is new?"))
+    ANSWER_FG = {"good": "#0b6b3a", "warn": "#8a5a00", "bad": "#8a1a08",
+                 "muted": "#666666", "": "#222222"}
+
+    def _build_answers(self, outer):
+        box = tk.Frame(outer, bg=WHITE)
+        box.pack(fill="x", pady=(0, 2))
+        self.answer_box = box
+        self.answer_lbls, self.answer_show = {}, {}
+        for i, (key, question) in enumerate(self.ANSWERS):
+            card = tk.Frame(box, bg="#f6f7fa", padx=12, pady=8,
+                            highlightbackground="#e0e2e8",
+                            highlightthickness=1, cursor="hand2",
+                            takefocus=1)
+            card.grid(row=0, column=i, sticky="nsew", padx=4)
+            q = tk.Label(card, text=question, bg="#f6f7fa", fg="#2b3a56",
+                         font=mw_font(10, "bold"), anchor="w",
+                         justify="left")
+            q.pack(anchor="w", fill="x")
+            a = tk.Label(card, text="…", bg="#f6f7fa", fg="#222222",
+                         font=mw_font(10), anchor="w", justify="left",
+                         wraplength=320)
+            a.pack(anchor="w", fill="x", pady=(3, 4))
+            more = tk.Label(card, text="Show me ›", bg="#f6f7fa",
+                            fg="#0b5394", anchor="w", cursor="hand2")
+            more.pack(anchor="w")
+            for w in (card, q, a, more):
+                w.bind("<Button-1>", lambda e, k=key: self._answer_show(k))
+            card.bind("<Return>", lambda e, k=key: self._answer_show(k))
+            card.bind("<Configure>", lambda e, lb=a: self._fit_answer(
+                lb, e.width), add="+")
+            self.answer_lbls[key] = a
+            box.columnconfigure(i, weight=1, uniform="answer")
+        self.honest_lbl = tk.Label(outer, text="", bg=WHITE, fg="#666666",
+                                   anchor="w", justify="left",
+                                   cursor="hand2")
+        self.honest_lbl.pack(fill="x", padx=4, pady=(2, 8))
+        self.honest_lbl.bind("<Button-1>",
+                             lambda e: self.app.open_coverage())
+        Tooltip(self.honest_lbl, "What this computer can and can't see "
+                                 "from where it is — click for details.")
+
+    @staticmethod
+    def _fit_answer(lbl, width):
+        want = max(160, width - 30)
+        with contextlib.suppress(tk.TclError, ValueError):
+            if abs(int(float(str(lbl.cget("wraplength")) or 0)) - want) > 4:
+                lbl.configure(wraplength=want)
+
+    def _answer_show(self, key):
+        fn = self.answer_show.get(key)
+        if fn is not None:
+            fn()
+
+    def _refresh_answers(self):
+        app = self.app
+        got = app.dashboard_answers()
+        for key, _q in self.ANSWERS:
+            text, kind, show = got[key]
+            self.answer_show[key] = show
+            lbl = self.answer_lbls[key]
+            fg = self.ANSWER_FG.get(kind, "#222222")
+            table = PALETTES[palette_name(app.theme_name,
+                                          app.high_contrast)]
+            fg = table.get(fg, fg)
+            with contextlib.suppress(tk.TclError):
+                if lbl.cget("text") != text or lbl.cget("fg") != fg:
+                    lbl.configure(text=text, fg=fg)
+        with contextlib.suppress(tk.TclError):
+            h = app.honesty_line()
+            if self.honest_lbl.cget("text") != h:
+                self.honest_lbl.configure(text=h)
 
     def show_explain(self, on):
         for ex, tl in getattr(self, "explain_lbls", ()):
@@ -26947,6 +27595,10 @@ class DashboardTab(BaseTab):
         self.vars["topsite"].set(site.registrable[:26] if site else "—")
         self.vars["duration"].set(human_duration(m.metrics.duration(now))
                                   if m.metrics.first_ts else "—")
+        if self.answers:
+            self._refresh_answers()
+            self._draw_charts(now)
+            return
         state, bg, fg = app.network_state_text()
         self.state_var.set(state)
         v = m.vantage.classify(offline=app.data_mode in ("offline",
@@ -27634,7 +28286,8 @@ class DevicesTab(BaseTab):
             ("traffic", "Traffic ↑/↓", 150, "w", False),
             ("last", "Last seen", 80, "center", False),
             ("ipv6", "IPv6", 200, "w", False),
-            ("packets", "Packets", 70, "e", False)]
+            ("packets", "Packets", 70, "e", False),
+            ("tags", "Place / owner", 130, "w", True)]
 
     def build(self):
         self.header("🏠  The devices on your local network. Confidence shows "
@@ -27704,10 +28357,23 @@ class DevicesTab(BaseTab):
     def default_cols(self):
         """Beginner's shorter column set is the default, not a lock: the
         heading's right-click menu shows any column."""
-        cols = [c[0] for c in self.COLS]
+        cols = [c[0] for c in self.COLS if c[0] != "tags"]
         if self.app.beginner_mode:
             cols = [c for c in cols if c not in ("ipv6", "packets")]
+        if any(d.place or d.owner
+               for d in self.model.registry.by_key.values()):
+            cols.insert(cols.index("name") + 1, "tags")
         return cols
+
+    def show_tags(self):
+        """The Place / owner column, next to the name, once you use it."""
+        cols = list(self.kit.shown_cols())
+        if "tags" in cols:
+            return
+        cols.insert(cols.index("name") + 1 if "name" in cols else 1, "tags")
+        self.kit._cols_override = cols
+        self.kit.apply_columns()
+        self.kit.save_soon()
 
     def apply_mode(self):
         self.kit.apply_columns()
@@ -27800,7 +28466,8 @@ class DevicesTab(BaseTab):
         return (icon, label, cls, dev.ip or "—", dev.mac or "—",
                 vendor, conf, device_weakest(self.model, dev), status,
                 traffic, fmt_clock(dev.last_seen),
-                ", ".join(sorted(dev.ipv6)[:2]) or "—", dev.packets)
+                ", ".join(sorted(dev.ipv6)[:2]) or "—", dev.packets,
+                tag_text(dev.place, dev.owner))
 
     def update_keys(self, keys):
         reg = self.model.registry
@@ -28000,7 +28667,10 @@ class WebsitesTab(BaseTab):
         lv = ASSOC_LEVEL.get(w.best_assoc, LV_UNKNOWN)
         return (f"{translate_text(ASSOC_TEXT.get(w.best_assoc, 'unknown'))}"
                 f" — {translate_text(explain('level', lv))}  "
-                f"{translate_text('A lookup alone does not prove a visit.')}")
+                f"{translate_text('A lookup alone does not prove a visit.')}"
+                + (f"   ·   {translate_text('Category')}: "
+                   f"{self.app.category_why(w)}" if w.category or
+                   w.category_source else ""))
 
     def _combo(self, bar, label, var, values, width):
         self.lbl(bar, label).pack(side="left")
@@ -28069,7 +28739,9 @@ class WebsitesTab(BaseTab):
                 "own": [("Show contacting devices",
                          lambda: app.show_website_devices(dom)),
                         ("Show remote hosts",
-                         lambda: app.goto("remote", dom))]}
+                         lambda: app.goto("remote", dom)),
+                        ("Set its category…",
+                         lambda: app.set_website_category(dom))]}
         if kind == "site":
             spec["open"] = lambda: app.show_website(dom)
         else:
@@ -29189,6 +29861,11 @@ class AlertsTab(BaseTab):
                           ("Details", self._details)):
             ttk.Button(bar, text=label, command=fn).pack(side="right",
                                                          padx=(4, 0))
+        # 5.1.2: one alert at a time, newest danger first
+        self.review_btn = ttk.Button(bar, text="Review",
+                                     command=self.app.review_alerts)
+        self.review_btn.pack(side="right", padx=(4, 0))
+        self._review_job = None
         wrap, self.tree = make_tree(
             self.frame, [("sev", "Severity", 100, "w", False),
                          ("when", "Last seen", 80, "center", False),
@@ -29314,6 +29991,23 @@ class AlertsTab(BaseTab):
         tags = ("ack",) if a.acknowledged else (a.severity,)
         tree_upsert(self.tree, self.iids, a.id, self.values(a), tags=tags,
                     index=0, kit=self.kit)
+        self.review_soon()
+
+    def review_soon(self):
+        if getattr(self, "_review_job", None):
+            return
+        with contextlib.suppress(tk.TclError):
+            self._review_job = self.frame.after(300, self._sync_review)
+
+    def _sync_review(self):
+        self._review_job = None
+        n = len(self.app.review_queue())
+        with contextlib.suppress(tk.TclError):
+            text = (translate_text("Review %d new") % n if n else
+                    translate_text("Review"))
+            if self.review_btn.cget("text") != text:
+                self.review_btn.configure(text=text)
+            self.review_btn.state(["!disabled"] if n else ["disabled"])
 
     def rebuild(self):
         for _ in self.rebuild_steps():
@@ -30321,6 +31015,15 @@ class HealthTab(BaseTab):
                               highlightthickness=0)
         self.hist.pack(anchor="w")
         self.hist.bind("<Configure>", lambda e: self._draw_hist())
+        # 5.1.2: when it got slow — the checks of the last hour
+        tk.Label(right, text="Answer times (last hour)", bg=WHITE,
+                 fg="#2b3a56", font=mw_font(11, "bold")).pack(
+            anchor="w", pady=(10, 0))
+        self.strip = tk.Canvas(right, width=430, height=120, bg=WHITE,
+                               highlightthickness=0)
+        self.strip.pack(anchor="w")
+        self.strip.bind("<Configure>", lambda e: self._draw_strip(True))
+        self._strip_sig = None
 
     def _fit_row(self, row, ex, width):
         """Wide: status | check | explanation on one line. Narrow: the
@@ -30380,6 +31083,66 @@ class HealthTab(BaseTab):
                               font=("TkDefaultFont", 7))
             c.create_text(w - 10, h - 4, text="ms", anchor="se",
                           fill=t["muted_fg"], font=("TkDefaultFont", 7))
+            Charts.record(c, (c.find_all() or (None,))[0],
+                          self.hist_title.cget("text"),
+                          ["ms", "Lookups"],
+                          [[DNS_BUCKET_LABELS[i], v]
+                           for i, v in enumerate(counts)])
+
+    STRIP_S = 3600
+
+    def strip_series(self):
+        """Router and Internet answer times (ms) of the checks in the last
+        hour, oldest first; a check that got no answer is left out (and
+        counted)."""
+        m = self.model
+        now = time.time()
+        rows = [r for r in m.health_history
+                if now - (r.get("time") or 0) <= self.STRIP_S]
+        gw = [float(r["gateway_ms"]) for r in rows
+              if r.get("gateway_ok") and r.get("gateway_ms") is not None]
+        inet = [float(r["internet_ms"]) for r in rows
+                if r.get("internet_ok") and r.get("internet_ms")
+                is not None]
+        lost = sum(1 for r in rows if r.get("gateway_ok") is False or
+                   r.get("internet_ok") is False)
+        first = rows[0]["time"] if rows else None
+        return gw, inet, lost, first
+
+    def _draw_strip(self, force=False):
+        c, t = self.strip, self.t
+        gw, inet, lost, first = self.strip_series()
+        try:
+            w = max(300, c.winfo_width())
+            h = int(c.cget("height"))
+        except tk.TclError:
+            return
+        sig = (w, h, len(gw), len(inet), lost, self.app.theme_name)
+        if not force and sig == self._strip_sig:
+            return
+        self._strip_sig = sig
+        with contextlib.suppress(tk.TclError):
+            c.configure(bg=t["tab_bg"])
+            c.delete("all")
+            empty = ("No checks in the last hour (they need live watching "
+                     "with Active Scanning)" if not self.app
+                     .health_checks_allowed() else "No checks yet")
+            if not gw and not inet:
+                # no grid and axis labels for nothing: the sentence alone
+                c.create_text(w // 2, h // 2, text=translate_text(empty) + (
+                    "\n" + translate_text("%d without an answer") % lost
+                    if lost else ""), fill=t["muted_fg"], width=w - 24,
+                    justify="center", font=("TkDefaultFont", 9))
+                return
+            Charts.line(c, 4, 2, w - 8, h - 4,
+                        [("Router", gw, t["chart_a"]),
+                         ("Internet", inet, t["chart_down"])], t,
+                        title=(translate_text("%d without an answer") % lost
+                               if lost else ""),
+                        fmt=lambda v: f"{v:.0f} ms",
+                        xlabels=(hm_clock(first) if first else "",
+                                 translate_text("now")),
+                        empty=translate_text(empty))
 
     STATUS_STYLE = {"Healthy": ("✔ Healthy", "good_fg"),
                     "Degraded": ("⚠ Degraded", "warn_fg"),
@@ -30392,6 +31155,8 @@ class HealthTab(BaseTab):
         if not self.is_visible():
             return
         app = self.app
+        with contextlib.suppress(Exception):
+            self._draw_strip()
         results = app.health_summary()
         for key, (status, text) in results.items():
             if key not in self.rows:
@@ -35303,6 +36068,9 @@ class MiniWireshark:
         self._apply_text_size(defer=False)
         self._restore_window()
         self._layout_pass()
+        self._away_since = None
+        self.root.bind("<FocusOut>", self._on_root_focus_out, add="+")
+        self.root.bind("<FocusIn>", self._on_root_focus_in, add="+")
         self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map,
                              add="+")
         self._compact = None
@@ -36653,6 +37421,13 @@ class MiniWireshark:
                              "device identities in this session.")
             return
         what = self.model.journal.describe(e, self.short_device_name)
+        if e["op"] == "category":
+            self.model.undo_correction(e["id"])
+            self.config.save()
+            with contextlib.suppress(Exception):
+                self.tabs["websites"].rebuild()
+            self._set_banner(f"↶  Undone: {what}")
+            return
         keys = self.model.undo_correction(e["id"])
         self._apply_correction_result(keys, f"↶  Undone: {what}")
         if not keys:
@@ -36780,6 +37555,11 @@ class MiniWireshark:
                 ("Storage used…", self.open_storage),
                 ("Privacy posture…", self.open_privacy_posture),
                 ("What changed recently", self.open_changes),
+                ("Why is my Internet slow?",
+                 lambda: self.investigate("slow")),
+                ("What is using my bandwidth?",
+                 lambda: self.investigate("bandwidth")),
+                ("Review new alerts", self.review_alerts),
                 ("Show / hide the inspector", self.toggle_inspector),
                 ("Go to packet…", self.go_to_packet),
                 ("Full Power on", lambda: self.set_perf_mode("Full Power")),
@@ -37366,6 +38146,286 @@ class MiniWireshark:
         DetailDialog(self, "What can I see from here?", sections,
                      size="680x560")
 
+    # ---- Dashboard answers (5.1.2 M6) ----------------------------------------
+    ANSWER_EVERY = 10.0
+    USAGE_WINDOW = 600
+
+    def dashboard_answers(self, force=False):
+        """{"wrong"|"usage"|"new": (sentence, kind, show_me)} — worked out
+        again after 10 s, or at once when the alerts, the checks or the
+        data source change (the usage and digest scans are the cost)."""
+        m = self.model
+        c = m.alerts.counts()
+        sig = (id(m), self.data_mode, c["DANGER"], c["WARNING"],
+               len(m.health_history), self.active_mode(),
+               bool(m.metrics.first_ts))
+        cache = getattr(self, "_answers", None)
+        now = time.monotonic()
+        if not force and cache is not None and cache["sig"] == sig and \
+                now - cache["t"] < self.ANSWER_EVERY:
+            return cache["vals"]
+        vals = {}
+        for key, fn in (("wrong", self.answer_wrong),
+                        ("usage", self.answer_usage),
+                        ("new", self.answer_new)):
+            try:
+                vals[key] = fn()
+            except Exception:                        # noqa: BLE001
+                LOG.exception("dashboard answer %s", key)
+                vals[key] = (translate_text("Can't tell right now."),
+                             "muted", None)
+        self._answers = {"sig": sig, "t": now, "vals": vals}
+        return vals
+
+    def _answer_span(self):
+        """“since 09:02” / “in this file” — every answer says its span."""
+        m = self.model
+        if self.data_mode in ("offline", "session"):
+            return translate_text("in this file")
+        if self.data_mode == "demo":
+            return translate_text("in the demo data")
+        if not m.metrics.first_ts:
+            return ""
+        return translate_text("since") + " " + hm_clock(m.metrics.first_ts)
+
+    def _top_open_alert(self):
+        rank = {"DANGER": 2, "WARNING": 1, "INFO": 0}
+        best = None
+        for a in self.model.alerts.alerts.values():
+            if a.acknowledged:
+                continue
+            k = (rank.get(a.severity, 0), a.last_seen or a.when)
+            if best is None or k > best[0]:
+                best = (k, a)
+        return best[1] if best else None
+
+    def answer_wrong(self):
+        """“Is anything wrong?” — alerts, the last checks and DNS, and
+        what could not be checked (never a silent “all good”)."""
+        tr = translate_text
+        m = self.model
+        if self.data_mode == "idle" and not m.count:
+            return (tr("Can't tell yet: MiniWireshark isn't watching. "
+                       "Press Start watching."), "muted", None)
+        now = m.now()
+        c = m.alerts.counts()
+        top = self._top_open_alert()
+        span = self._answer_span()
+        if c["DANGER"] and top is not None:
+            return (tr("Maybe. %d alert(s) need a look") % c["DANGER"] +
+                    f": {top.reason}", "bad",
+                    lambda a=top.id: self.show_alert(a))
+        h = m.health if self.data_mode == "live" else {}
+        when = hm_clock(h["time"]) if h.get("time") else ""
+        problem = None
+        if h.get("gateway_ok") is False:
+            problem = tr("your router didn't answer the last check")
+        elif h.get("internet_ok") is False:
+            problem = tr("the Internet test address didn't answer the last "
+                         "check")
+        elif h.get("dns_ok") is False:
+            problem = tr("the DNS server didn't answer the test lookup")
+        med, _n = m.dns.median_latency(now)
+        rate, nq = m.dns.failure_rate(now)
+        slow = float(self.config.get("dns.slow_ms", 800))
+        if problem is None and nq >= 10 and rate >= 0.3:
+            problem = tr("%d%% of recent website lookups failed") % \
+                round(rate * 100)
+        elif problem is None and med is not None and med >= slow:
+            problem = tr("website lookups are slow (typically %d ms)") % med
+        if problem:
+            return (tr("Possibly") + ": " + problem +
+                    (f" ({when})" if when else "") + ".", "warn",
+                    lambda: self.investigate("slow"))
+        inet_ok = h.get("internet_ok") is True or (
+            m.metrics.totals["bytes_down"] > 0 and
+            now - (m.metrics.last_ts or 0) < 120)
+        dns_ok = med is not None and med < slow
+        missing = []
+        if not dns_ok:
+            missing.append(tr("no website lookups timed yet")
+                           if not m.dns.encrypted_seen else
+                           tr("lookups are encrypted, so not timed"))
+        if not inet_ok:
+            missing.append(tr("no Internet traffic right now"))
+        if inet_ok and dns_ok:
+            text = tr("No. The Internet and website lookups answer "
+                      "normally")
+        else:
+            text = tr("No problem seen") + (" (" + "; ".join(missing) + ")"
+                                            if missing else "")
+        text += (f" {span}" if span else "") + "."
+        if c["WARNING"]:
+            text += " " + (tr("1 warning to look at.") if c["WARNING"] == 1
+                           else tr("%d warnings to look at.") % c["WARNING"])
+            return (text, "", lambda a=top.id if top else None:
+                    self.show_alert(a) if a else self.goto("alerts"))
+        return (text, "good", lambda: self.goto("health"))
+
+    def usage_by_device(self, window=None):
+        """Bytes per device over the last `window` seconds of
+        connections, and the bytes tied to no device."""
+        m = self.model
+        window = window or self.USAGE_WINDOW
+        now = m.now()
+        per, unatt = Counter(), 0
+        for x in m.flows.all_flows():
+            if now - x.last_seen > window:
+                continue
+            if x.device_key:
+                per[x.device_key] += x.total_bytes
+            else:
+                unatt += x.total_bytes
+        return per, unatt
+
+    def answer_usage(self):
+        """“Who is using the Internet?” — on an endpoint (a switched or
+        Wi-Fi network seen from one computer) it never ranks the other
+        devices: it says it cannot see them."""
+        tr = translate_text
+        m = self.model
+        per, unatt = self.usage_by_device()
+        win = span_words(self.USAGE_WINDOW)
+        show = lambda: self.investigate("bandwidth")        # noqa: E731
+        v = m.vantage.classify(offline=self.data_mode in ("offline",
+                                                          "session"))
+        total = sum(per.values()) + unatt
+        if v == "endpoint":
+            mine = per.get(m.my_device_key() or "", 0) or total
+            return (tr("This computer") + f": {_human_bytes(mine)} " +
+                    tr("in the last") + f" {win}. " +
+                    tr("Other devices' Internet traffic is not visible "
+                       "from here."), "", show)
+        if not total:
+            return (tr("Nothing measured in the last") + f" {win}.",
+                    "muted", show)
+        key, top = per.most_common(1)[0] if per else ("", 0)
+        if not top:
+            return (f"{_human_bytes(total)} " + tr("in the last") +
+                    f" {win}, " + tr("not tied to any device") + ".",
+                    "muted", show)
+        name = self.short_device_name(key)
+        share = top / total
+        text = (f"{name}: {_human_bytes(top)} " + tr("in the last") +
+                f" {win} ({share:.0%} " + tr("of what I can see") + ").")
+        if share < 0.4:
+            text = tr("No single device stands out.") + " " + text
+        if v in ("partial", "unknown"):
+            text += " " + tr("Some devices' traffic may not be visible "
+                             "from here.")
+        return text, "", show
+
+    def answer_new(self):
+        """“What is new?” — the change digest of the last hour."""
+        tr = translate_text
+        m = self.model
+        dg = self._digest("Last hour")
+        parts = []
+        for key, one, many in (
+                ("new_devices", "new device", "new devices"),
+                ("new_sites", "new website", "new websites"),
+                ("returned", "device came back", "devices came back"),
+                ("alerts", "warning", "warnings")):
+            n = len(dg[key])
+            if n:
+                parts.append(f"{n} {tr(one if n == 1 else many)}")
+        start = m.metrics.first_ts or 0
+        head = (tr("In the last hour") if not start or
+                m.now() - start >= 3600 else
+                tr("Since") + " " + hm_clock(start))
+        if self.data_mode in ("offline", "session"):
+            head = tr("In this file, last hour")
+        show = lambda: self.open_changes("Last hour")       # noqa: E731
+        if not parts:
+            return head + ": " + tr("nothing new.") , "muted", show
+        return head + ": " + ", ".join(parts) + ".", "", show
+
+    def honesty_line(self):
+        v = self.model.vantage.classify(
+            offline=self.data_mode in ("offline", "session"))
+        spots = blind_spots(self.model, self.data_mode, self.active_mode())
+        tr = translate_text
+        return (tr("From here") + ": " + tr(VANTAGE_TEXT[v][0]) +
+                (" · " + (tr("1 blind spot") if len(spots) == 1 else
+                          tr("%d blind spots") % len(spots))
+                 if spots else " · " + tr("no known blind spots")) +
+                "  ›")
+
+    # ---- while you were away (5.1.2 M6) --------------------------------------
+    AWAY_MIN_S = 30 * 60
+
+    def _on_root_focus_out(self, _e=None):
+        if getattr(self, "_away_check", None):
+            return
+        self._away_check = self.root.after(150, self._focus_maybe_gone)
+
+    def _focus_maybe_gone(self):
+        self._away_check = None
+        try:
+            gone = self.root.focus_get() is None
+        except (tk.TclError, KeyError):
+            gone = False
+        if gone:
+            self.note_focus_lost()
+
+    def _on_root_focus_in(self, _e=None):
+        if getattr(self, "_away_since", None) is not None:
+            self.note_focus_back()
+
+    def note_focus_lost(self, now=None):
+        if getattr(self, "_away_since", None) is None:
+            m = self.model
+            self._away_since = now if now is not None else time.time()
+            self._away_model_t = m.now() if now is None else now
+            self._away_bytes = (m.metrics.totals["bytes_down"] +
+                                m.metrics.totals["bytes_up"])
+
+    def note_focus_back(self, now=None):
+        """One catch-up line when the window was in the background for 30
+        minutes or more (no pop-up, no sound). → the line or None."""
+        since = getattr(self, "_away_since", None)
+        self._away_since = None
+        if since is None:
+            return None
+        now = now if now is not None else time.time()
+        away = now - since
+        if away < self.AWAY_MIN_S or not self.config.get("general.tips",
+                                                         True):
+            return None
+        if self.data_mode not in ("live", "demo"):
+            return None
+        tr = translate_text
+        m = self.model
+        start = getattr(self, "_away_model_t", m.now() - away)
+        store = self.history if self.data_mode == "live" else None
+        try:
+            dg = change_digest(m, store, start, m.now())
+        except Exception:                            # noqa: BLE001
+            LOG.exception("away digest")
+            return None
+        parts = []
+        for key, one, many in (
+                ("new_devices", "new device", "new devices"),
+                ("new_sites", "new website", "new websites"),
+                ("alerts", "warning", "warnings")):
+            n = len(dg[key])
+            if n:
+                parts.append(f"{n} {tr(one if n == 1 else many)}")
+        seen = (m.metrics.totals["bytes_down"] + m.metrics.totals["bytes_up"]
+                - getattr(self, "_away_bytes", 0))
+        if seen > 0:
+            parts.append(f"{_human_bytes(seen)} " +
+                         tr("seen by this computer"))
+        line = ("\U0001F553  " + tr("While this window was in the "
+                                    "background") +
+                f" ({span_words(away)}): " +
+                (", ".join(parts) if parts else tr("nothing new")) + ".")
+        self._away_digest = dg
+        self._set_banner(line, "info", action=(
+            tr("Show me"), lambda d=dg: self.open_changes(
+                "While you were away", digest=d)))
+        return line
+
     def footer_text(self):
         v = self.model.vantage.classify(
             offline=self.data_mode in ("offline", "session"))
@@ -37403,8 +38463,8 @@ class MiniWireshark:
             return "—"
         return digest_summary(dg) + "  (click for details)"
 
-    def open_changes(self, period="Last hour"):
-        dg = self._digest(period)
+    def open_changes(self, period="Last hour", digest=None):
+        dg = digest if digest is not None else self._digest(period)
         name = self.short_device_name
 
         def lines(items, fmt):
@@ -37434,8 +38494,8 @@ class MiniWireshark:
             ("Warnings", lines(dg["alerts"], lambda t, sev, x:
                                f"{fmt_clock(t)}  {sev}: {x}")),
         ]
-        DetailDialog(self, f"What changed — {period.lower()}", sections,
-                     size="700x600")
+        return DetailDialog(self, f"What changed — {period.lower()}",
+                            sections, size="700x600")
 
     def open_compare(self):
         """Pick two saved sessions and show what differs between them."""
@@ -38473,6 +39533,8 @@ class MiniWireshark:
 
     # tours: each offered once, by one line in the message bar
     def offer_tour(self, name):
+        if not self.config.get("general.tips", True):
+            return False
         done = list(self.config.get("general.tours_done", []) or [])
         if name in done or name not in TOURS or self.data_mode == "demo" \
                 and name != "device":
@@ -40334,6 +41396,10 @@ class MiniWireshark:
         outer.pack(fill="both", expand=True, padx=8)
         inner.configure(bg=t["tab_bg"])
         result = {"text": ""}
+        fresh = tk.Label(top, text="", bg=t["tab_bg"], fg=t["muted_fg"],
+                         wraplength=720, justify="left", anchor="w")
+        if which == "slow":
+            fresh.pack(anchor="w", fill="x")
 
         def run():
             for w in inner.winfo_children():
@@ -40343,11 +41409,19 @@ class MiniWireshark:
                 result["hyps"] = hyps
                 v = self.model.vantage.classify(
                     offline=self.data_mode in ("offline", "session"))
-                sub.configure(text="A ranked list of explanations with the "
-                                   "evidence for and against each. It is "
-                                   "not a verdict: the top one is the best "
-                                   "fit for what this computer can see "
-                                   f"({VANTAGE_TEXT.get(v, ('',))[0]}).")
+                quiet = "" if self.health_checks_allowed() or \
+                    self.data_mode != "live" else translate_text(
+                        "Quiet Mode (or a network not marked as yours): "
+                        "ranked only on what was overheard; nothing was "
+                        "sent to check.") + " "
+                sub.configure(text=quiet + translate_text(
+                    "A ranked list of explanations with the "
+                    "evidence for and against each. It is "
+                    "not a verdict: the top one is the best "
+                    "fit for what this computer can see") +
+                    f" ({translate_text(VANTAGE_TEXT.get(v, ('',))[0])}).")
+                with contextlib.suppress(tk.TclError):
+                    fresh.configure(text=self.slow_freshness())
                 lines = []
                 for h in hyps:
                     color = {"Likely": t["danger_fg"],
@@ -40415,9 +41489,71 @@ class MiniWireshark:
             side="left", padx=6)
         ttk.Button(bar, text="Close", command=win.destroy).pack(
             side="right")
-        run()
         win._mw_result = result
+        win._mw_run = run
+        if which == "slow" and self.health_checks_allowed():
+            self._check_then(win, sub, run)
+        else:
+            run()
         return win
+
+    CHECK_WAIT_S = 8.0
+
+    def _check_then(self, win, sub, run):
+        """Check now: the router, DNS and the Internet are checked first
+        (only where checks may be sent), each result shown as it lands,
+        then the ranking."""
+        m = self.model
+        n0 = len(m.health_history)
+        t0 = time.monotonic()
+        tr = translate_text
+        self.prober.run_now.set()
+        win._mw_checking = True
+
+        def wait():
+            if not win.winfo_exists():
+                return
+            h = m.health if len(m.health_history) > n0 else {}
+            parts = [tr("Checking the router…") + (
+                         " " + (tr("answered") if h.get("gateway_ok") else
+                                tr("no answer")) if h else ""),
+                     tr("DNS…") + (" " + (tr("answered") if h.get("dns_ok")
+                                         else tr("no answer"))
+                                   if h and "dns_ok" in h else ""),
+                     tr("the Internet…") + (
+                         " " + (tr("answered") if h.get("internet_ok")
+                                else tr("no answer")) if h else "")]
+            with contextlib.suppress(tk.TclError):
+                sub.configure(text="  ".join(parts))
+            if h or time.monotonic() - t0 > self.CHECK_WAIT_S:
+                win._mw_checking = False
+                run()
+                return
+            win.after(250, wait)
+        win.after(50, wait)
+
+    def slow_freshness(self):
+        """When each group of facts was true (“router answered 12 s
+        ago”)."""
+        m, tr = self.model, translate_text
+        now = m.now()
+        parts = []
+        h = m.health if self.data_mode == "live" else {}
+        if h.get("time"):
+            age = max(0, time.time() - h["time"])
+            parts.append(tr("router and Internet checks") + " " +
+                         span_words(age) + " " + tr("ago"))
+        else:
+            parts.append(tr("no router or Internet check yet"))
+        parts.append(tr("website lookups and connections over the last") +
+                     " " + span_words(600))
+        wp = self._wifi_view()
+        if wp is not None and wp.last:
+            parts.append(tr("Wi-Fi signal as last read by this computer"))
+        if self.data_mode in ("offline", "session"):
+            parts = [tr("from the file, up to") + " " +
+                     fmt_clock(m.metrics.last_ts or now, True)]
+        return tr("As of") + ": " + " · ".join(parts) + "."
 
 
     def upnp_mapping_text(self, x):
@@ -41133,6 +42269,7 @@ class MiniWireshark:
             ("Unmark expected" if dev.expected else "Mark as expected",
              lambda: self.toggle_flag(k, "expected")),
             ("Add / edit note…", lambda: self.edit_note(k)),
+            ("Place and owner…", lambda: self.set_device_tags(k)),
             ("Set device type…", lambda: self.set_device_type(k)),
             None,
             ("Copy IP", lambda: copy_to_clipboard(self, dev.ip), bool(dev.ip)),
@@ -41211,6 +42348,63 @@ class MiniWireshark:
     def toggle_flag(self, key, flag):
         self._apply_correction_result(self.model.correct_flag(key, flag))
 
+    def known_tags(self):
+        places, owners = set(), set()
+        for d in self.model.registry.by_key.values():
+            if d.place:
+                places.add(d.place)
+            if d.owner:
+                owners.add(d.owner)
+        for rec in (self.known.data or {}).values():
+            if isinstance(rec, dict):
+                places.add(rec.get("place") or "")
+                owners.add(rec.get("owner") or "")
+        return sorted(places - {""}), sorted(owners - {""})
+
+    def set_device_tags(self, key, parent=None, place=None, owner=None):
+        """Place and owner: two short words of yours, sortable in the
+        Devices table and kept on this computer only."""
+        dev = self.model.registry.by_key.get(key)
+        if not dev:
+            return None
+        if place is None or owner is None:
+            got = ask_tags(self, dev, *self.known_tags(), parent=parent)
+            if got is None:
+                return None
+            place, owner = got
+        keys = self.model.correct_tags(key, place, owner)
+        self._apply_correction_result(keys)
+        if keys and (place or owner):
+            self.tabs["devices"].show_tags()
+        return keys
+
+    def set_website_category(self, domain, parent=None, choice=None):
+        """You say what kind of site it is; kept for its registrable
+        domain, undoable, and said on the timeline."""
+        reg = registrable_domain(domain)
+        tr = translate_text
+        if choice is None:
+            opts = [(tr("Let MiniWireshark decide"), ""),
+                    (tr("No category (an ordinary website)"), "-")] + \
+                [(tr(c), c) for c in WEBSITE_CATEGORIES]
+            choice = choose_from_list(
+                self, "Website category", tr("What kind of site is %s? "
+                                             "Your answer is kept on this "
+                                             "computer for every address "
+                                             "of this site.") % reg, opts,
+                parent=parent)
+        if choice is None:
+            return None
+        got = self.model.correct_category(reg, choice)
+        if got:
+            self.config.save()
+            with contextlib.suppress(Exception):
+                self.tabs["websites"].rebuild()
+            self._set_banner(f"✎  {tr('Category of')} {reg}: "
+                             f"{tr(cat_word(choice))}.", action=(
+                                 tr("Undo"), self.undo_last_correction))
+        return got
+
     def merge_with_ui(self, key, parent=None):
         dev = self.model.registry.by_key.get(key)
         if not dev:
@@ -41277,6 +42471,139 @@ class MiniWireshark:
                     win.destroy()
             self.show_device(key)
 
+    # ---- the story of a device (5.1.2 M6) -------------------------------------
+    STORY_LINES = 8
+
+    @staticmethod
+    def _day_words(ts, now):
+        """“today at 09:14”, “on 03/10 at 09:14” (English: the sentence
+        is translated whole, by I18N_PATTERNS)."""
+        try:
+            a, b = time.localtime(ts), time.localtime(now)
+        except (ValueError, OverflowError, OSError):
+            return "?"
+        hm = time.strftime("%H:%M", a)
+        if a[:3] == b[:3]:
+            return "today at " + hm
+        return "on " + time.strftime("%d/%m", a) + " at " + hm
+
+    def device_story(self, dev):
+        """≤ 8 sentences, each with its evidence mark and, where there is
+        one, a link to its proof: [(text, (label, method, args) | None)].
+        Built from NarrativeTemplate, so no sentence states more than its
+        weakest evidence."""
+        m = self.model
+        now = m.now()
+        key = dev.key
+        out = []
+        timeline = ("Timeline", "timeline_of", (key,))
+        span = ("this session" if dev.live else "in this file")
+        line = narrate("first_seen",
+                       when=C(self._day_words(dev.first_seen, now),
+                              LV_OBSERVED),
+                       span=C(span, LV_OBSERVED))
+        if line:
+            out.append((line, timeline))
+        if dev.presence or dev.state:
+            online = dev.state in (STATE_ACTIVE, STATE_IDLE)
+            state = ("Online now" if online else
+                     "Offline since" + " " + hm_clock(dev.last_seen))
+            today = time.localtime(now)[:3]
+            drops = sum(1 for _s, e in dev.presence if e is not None and
+                        time.localtime(e)[:3] == today)
+            off = ""
+            if drops:
+                off = "; " + ("offline once today" if drops == 1 else
+                              "offline twice today" if drops == 2 else
+                              "offline %d times today" % drops)
+            line = narrate("presence", state=C(state, LV_OBSERVED),
+                           offline=C(off, LV_OBSERVED) if off else None)
+            if line:
+                out.append((line, timeline))
+        b = m.baselines.devices.get(key)
+        n = b.n if b is not None else 0
+        if n >= 30:
+            top = max(b.hours) or 1
+            on = [h for h in range(24) if b.hours[h] >= top * 0.2]
+            hours = f"{min(on):02d}:00–{(max(on) + 1) % 24:02d}:00"
+            line = narrate("usual_hours", hours=C(hours, LV_CORRELATED),
+                           basis=C("learned over %d active minutes" % n,
+                                   LV_OBSERVED))
+        else:
+            line = narrate("learning",
+                           basis=C("%d of 30 active minutes" % n,
+                                   LV_OBSERVED))
+        if line:
+            out.append((line, None))
+        sites = []
+        for dom in dev.websites:
+            w = m.websites.get(dom)
+            if w is None:
+                continue
+            tie = w.ties.get(key)
+            lv = ASSOC_LEVEL.get(tie[0], LV_CORRELATED) if tie else \
+                LV_CORRELATED
+            sites.append((-(tie[3] if tie and len(tie) > 3 else 0),
+                          -w.requests, w.registrable or w.domain, lv))
+        if sites:
+            sites.sort()
+            names, levels = [], []
+            for _a, _b, name, lv in sites:
+                if name not in names:
+                    names.append(name)
+                    levels.append(lv)
+                if len(names) == 3:
+                    break
+            weakest = min(levels, key=lambda lv: LEVEL_STRENGTH.get(lv, 0))
+            if weakest in (LV_OBSERVED, LV_REPORTED, LV_CORRELATED,
+                           LV_INFERRED):
+                line = narrate("top_sites", sites=C(", ".join(names),
+                                                    weakest))
+                if line:
+                    out.append((line, ("Its websites", "show_websites_of",
+                                       (key,))))
+        for r in periodic_findings(m, only=key)[:1]:
+            if r[4]:
+                out.append((r[4], ("Connections", "goto_connections_for",
+                                   (key,))))
+        today = time.localtime(now)[:3]
+        if time.localtime(dev.first_seen)[:3] != today:
+            new = 0
+            for dom in dev.websites:
+                w = m.websites.get(dom)
+                tie = w.ties.get(key) if w is not None else None
+                first = tie[1] if tie and len(tie) > 1 else (
+                    w.first_seen if w is not None else 0)
+                if first and time.localtime(first)[:3] == today:
+                    new += 1
+            if new:
+                line = narrate("new_today", span=C("today", LV_OBSERVED),
+                               items=C("1 website" if new == 1 else
+                                       "%d websites" % new,
+                                       LV_OBSERVED))
+                if line:
+                    out.append((line, ("Its websites", "show_websites_of",
+                                       (key,))))
+        open_ = [m.alerts.alerts[a] for a in dev.alert_ids
+                 if a in m.alerts.alerts and
+                 not m.alerts.alerts[a].acknowledged]
+        if open_:
+            a = max(open_, key=lambda x: x.last_seen or x.when)
+            out.append(("⚠ " + ("1 open alert" if len(open_) == 1 else
+                               "%d open alerts" % len(open_)) +
+                        f": {a.reason}", ("Open", "show_alert", (a.id,))))
+        return out[:self.STORY_LINES]
+
+    def timeline_of(self, key):
+        """The Timeline, showing one device."""
+        dev = self.model.registry.by_key.get(key)
+        tab = self._select_tab("timeline")
+        if dev is not None:
+            tab.dev_var.set(f"{dev.display_name()}  [{dev.ip or dev.mac}]")
+            fn = getattr(tab, "apply_filters", None) or tab.rebuild
+            fn()
+        return tab
+
     def device_report(self, dev):
         """Sections for the device card, shaped by the explanation
         settings (Short / Normal / Detailed, guidance on/off)."""
@@ -41291,6 +42618,15 @@ class MiniWireshark:
                      f"{self.device_label(dev)} — {cls}.\n" +
                      ("\n".join(f"• Based on: {r}" for r in
                                 dev.class_reasons[:5])))]
+        if dev.place or dev.owner:
+            sections[0] = (sections[0][0], sections[0][1].rstrip("\n") +
+                           "\n" +
+                           translate_text("Place / owner") + ": " +
+                           tag_text(dev.place, dev.owner))
+        with contextlib.suppress(Exception):
+            story = self.device_story(dev)
+            if story:
+                sections.append(("Its story", story))
         conf = f"{dev.confidence} (score {dev.score}/100)."
         if guidance:
             conf += " " + (
@@ -41335,7 +42671,7 @@ class MiniWireshark:
                              "\n".join(f"• {d}" for d in sorted(descs))))
         if dev.notes:
             sections.append(("Your notes", dev.notes))
-        per = [r for r in periodic_findings(m) if r[0] == dev.key]
+        per = periodic_findings(m, only=dev.key)
         if per:
             sections.append(("Regular check-ins (repeating connections)",
                              "\n".join(r[4] for r in per[:8] if r[4])))
@@ -41458,6 +42794,7 @@ class MiniWireshark:
         label = re.sub(r"^\W+\s*", "", str(dlg.win.title()))
         rc.append((kind, key, label))
         dlg.fold_kind = kind
+        dlg.links = self.card_links(kind, key)
         dlg.set_sections(dlg.sections)
         if kind == "device":
             self.offer_tour("device")
@@ -41712,12 +43049,39 @@ class MiniWireshark:
             sections.append(("Where", ", ".join(
                 f"{c} {COUNTRY_NAMES.get(c, '')}".strip()
                 for c in sorted(w.countries)) or "—"))
-        if w.category:
-            sections.append(("Category (informational)",
-                             f"{w.category} — from the {w.category_source}"
-                             f". Being on such a list doesn't mean a domain "
-                             f"is malicious."))
+        sections.append(("Category (informational)", self.category_why(w)))
         return sections
+
+    def card_links(self, kind, key):
+        """Links under a card's sections: {heading: [(label, method,
+        args)]} — "This is wrong…" next to each guess you can correct."""
+        if kind == "device":
+            return {"What is it?": [
+                ("This is wrong…", "set_device_type", (key,)),
+                ("Rename…", "rename_device", (key,)),
+                ("Place and owner…", "set_device_tags", (key,))]}
+        if kind == "website":
+            w = self.model.websites.get(key)
+            reg = (w.registrable or w.domain) if w is not None else key
+            return {"Category (informational)": [
+                ("This is wrong…", "set_website_category", (reg,))]}
+        return {}
+
+    def category_why(self, w):
+        """Why a website has its category (or none)."""
+        tr = translate_text
+        if w.category_source == CAT_YOURS:
+            return (f"{tr(w.category) if w.category else tr('No category')}"
+                    f" — {tr('your correction')}.")
+        if w.category:
+            return (f"{tr(w.category)} — {tr('from the')} "
+                    f"{w.category_source}. " +
+                    tr("Being on such a list doesn't mean a domain is "
+                       "malicious."))
+        if not self.config.get("websites.tracker_classification", False):
+            return tr("No category: the tracker list is off (Settings → "
+                      "Privacy). CDNs are still marked.")
+        return tr("No category: not on any list MiniWireshark has.")
 
     def show_website_devices(self, dom):
         groups = [w for w in self.model.websites.values()
@@ -41908,8 +43272,145 @@ class MiniWireshark:
             dev.expected = True
             self._labels_changed(dev)
         self.tabs["alerts"].upsert(a)
-        self._set_banner("✔  Marked as expected — I won't alert on "
-                         "this again.")
+        self._set_banner("✔  " + translate_text(
+            "Marked as expected — I won't alert on this again.") + " (" +
+            self.rule_text(tag) + ")")
+
+    def rule_text(self, tag, kind_of="expected"):
+        """A stored alert rule in words."""
+        kind, _, subject = str(tag).partition("|")
+        title = translate_text(ALERT_TYPES.get(kind, (kind,))[0])
+        dev = self.model.registry.by_key.get(subject)
+        who = self.device_label(dev) if dev is not None else \
+            (subject.replace("ip:", "") or "?")
+        if kind_of == "muted":
+            return translate_text("No more “%s” alerts for %s") % (title,
+                                                                   who)
+        return translate_text("“%s” about %s is expected") % (title, who)
+
+    def alert_rules(self):
+        """[(list name, tag, words)] for Settings → Alerts."""
+        out = []
+        for tag in self.config.get("alerts.expected", []) or []:
+            out.append(("alerts.expected", tag, self.rule_text(tag)))
+        for tag in self.config.get("alerts.muted_devices", []) or []:
+            out.append(("alerts.muted_devices", tag,
+                        self.rule_text(tag, "muted")))
+        return out
+
+    def remove_alert_rule(self, name, tag):
+        rules = [x for x in (self.config.get(name, []) or []) if x != tag]
+        self.config.set(name, rules)
+        self.config.save()
+        return True
+
+    def review_queue(self):
+        rank = {"DANGER": 2, "WARNING": 1, "INFO": 0}
+        q = [a for a in self.model.alerts.alerts.values()
+             if not a.acknowledged]
+        q.sort(key=lambda a: (-rank.get(a.severity, 0),
+                              -(a.last_seen or a.when)))
+        return q
+
+    def review_alerts(self):
+        """Review mode: one open alert at a time, newest danger first,
+        with three answers (Expected, Look later, Investigate)."""
+        queue = self.review_queue()
+        t, tr = self.theme, translate_text
+        old = getattr(self, "_review_win", None)
+        if old is not None:
+            with contextlib.suppress(tk.TclError):
+                old.destroy()
+        if not queue:
+            self._set_banner(tr("No open alerts to review."))
+            return None
+        win = tk.Toplevel(self.root)
+        win.title(tr("Review alerts"))
+        win.geometry("620x420")
+        win.configure(bg=t["card_bg"])
+        win.transient(self.root)
+        self._review_win = win
+        state = {"i": 0, "done": []}
+        count = tk.Label(win, bg=t["card_bg"], fg=t["muted_fg"], anchor="w")
+        count.pack(fill="x", padx=16, pady=(12, 0))
+        head = tk.Label(win, bg=t["card_bg"], fg=t["text_fg"],
+                        font=mw_font(12, "bold"), anchor="w",
+                        justify="left", wraplength=580)
+        head.pack(fill="x", padx=16, pady=(2, 4))
+        body = tk.Label(win, bg=t["card_bg"], fg=t["text_fg"], anchor="nw",
+                        justify="left", wraplength=580)
+        body.pack(fill="both", expand=True, padx=16)
+        note = tk.Label(win, bg=t["card_bg"], fg=t["good_fg"], anchor="w",
+                        justify="left", wraplength=580)
+        note.pack(fill="x", padx=16)
+        bar = tk.Frame(win, bg=t["card_bg"])
+        bar.pack(fill="x", padx=16, pady=12)
+
+        def cur():
+            return queue[state["i"]] if state["i"] < len(queue) else None
+
+        def render():
+            a = cur()
+            if a is None:
+                count.configure(text="")
+                head.configure(text=tr("All reviewed."))
+                body.configure(text=tr("Alerts you chose to look at later "
+                                       "stay open in the Alerts tab."))
+                for b in btns[:3]:
+                    b.state(["disabled"])
+                return
+            count.configure(text=tr("%d of %d") % (state["i"] + 1,
+                                                   len(queue)))
+            icon = self.SEVERITY_ICON.get(a.severity, "")
+            head.configure(text=f"{icon} {a.reason}")
+            means = explain("alert", a.kind)
+            body.configure(text=f"{tr('What was seen')}: {a.observed}\n\n"
+                                f"{tr('What it might mean')}: "
+                                f"{a.interpretation}" +
+                           (f"\n\n{tr('Usually')}: {tr(means)}" if means
+                            else ""))
+
+        def nxt():
+            state["i"] += 1
+            render()
+
+        def expected():
+            a = cur()
+            if a is None:
+                return
+            tag = f"{a.kind}|{a.subject or a.device_key}"
+            self.alert_mark_expected(a)
+            words = self.rule_text(tag)
+            note.configure(text="✔ " + tr("Rule stored") + ": " + words +
+                           " " + tr("(Settings → Alerts lists it, with "
+                                    "Remove.)"))
+            state["done"].append(("expected", a.id, tag))
+            nxt()
+
+        def later():
+            note.configure(text="")
+            state["done"].append(("later", cur().id if cur() else "", ""))
+            nxt()
+
+        def investigate():
+            a = cur()
+            if a is None:
+                return
+            self.show_alert(a.id)
+            with contextlib.suppress(Exception):
+                self.alert_goto_related(a)
+        btns = [ttk.Button(bar, text="Expected", command=expected),
+                ttk.Button(bar, text="Look later", command=later),
+                ttk.Button(bar, text="Investigate", command=investigate),
+                ttk.Button(bar, text="Close", command=win.destroy)]
+        for b in btns[:3]:
+            b.pack(side="left", padx=(0, 8))
+        btns[3].pack(side="right")
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.expected, win.later, win.state_ = expected, later, state
+        win.queue = queue
+        render()
+        return win
 
     def alert_mute_type(self, a):
         title = ALERT_TYPES.get(a.kind, (a.kind,))[0]
@@ -42849,7 +44350,8 @@ class MiniWireshark:
             label = self.device_label(d)
             words = " ".join(x for x in (
                 label, d.alias, d.ip, d.mac, d.vendor, d.device_class,
-                translate_text(d.device_class), d.notes) if x)
+                translate_text(d.device_class), d.notes, d.place,
+                d.owner) if x)
             words += " " + " ".join(sorted(d.ipv6))
             dev[d.key] = (f"{label}  ({d.ip or d.mac}) — {d.device_class}",
                           words.lower())
@@ -42941,6 +44443,11 @@ class MiniWireshark:
     def _apply_runtime_settings(self):
         cfg = self.config
         QUIC_NAMES["enabled"] = bool(cfg.get("privacy.quic_names", True))
+        CATEGORY_OVERRIDES.clear()
+        CATEGORY_OVERRIDES.update({
+            str(k): str(v) for k, v in (cfg.get(
+                "websites.category_overrides", {}) or {}).items()
+            if v == "-" or v in WEBSITE_CATEGORIES})
         was = LEDGER.killed
         LEDGER.killed = bool(cfg.get("privacy.kill_switch", False))
         with contextlib.suppress(Exception):
@@ -43005,8 +44512,7 @@ class MiniWireshark:
         self.data.start()
         for w in self.model.websites.values():
             cat, src = domain_category(w.domain)
-            if cat == "CDN" or cfg.get("websites.tracker_classification",
-                                       False):
+            if category_shown(cat, src, cfg):
                 w.category, w.category_source = cat, src
             else:
                 w.category = w.category_source = ""
@@ -44671,7 +46177,7 @@ class ReportBuilder:
         out = [f"<section><h2>{e(self.app.device_label(dev))}</h2>"]
         for h, t in secs:
             out.append(f"<h3>{e(h)}</h3><p style='white-space:pre-wrap'>"
-                       f"{e(t)}</p>")
+                       f"{e(DetailDialog.section_text(t))}</p>")
         out.append("</section><section><h2>Top connections</h2><table><tr>"
                    "<th>To</th><th>Purpose</th><th>Up</th><th>Down</th><th>"
                    "Status</th></tr>" + "".join(
@@ -50977,6 +52483,65 @@ def run_self_tests(verbose=True):
         dev.expected = True
         assert AlertEngine(cfg(), clk).new_device(dev) is None
 
+    def t_m6_corrections():
+        """5.1.2 M6: a category correction applies, is journaled, said on
+        the timeline, kept in a saved session and undone; the story
+        templates refuse a claim stronger than its evidence."""
+        clk = _FakeClock()
+        c = cfg()
+        m = NetworkModel(c, "192.168.1.1", ["192.168.1.20"], [], clk)
+        d = m.registry.touch("192.168.1.5", "00:11:22:33:44:55",
+                             "arp_reply", "x")
+        m.register_website("ads.example.com", "93.184.215.14", d, "DNS")
+        m.register_website("www.example.com", "93.184.215.14", d, "DNS")
+        saved = dict(CATEGORY_OVERRIDES)
+        try:
+            CATEGORY_OVERRIDES.clear()
+            assert m.correct_category("www.example.com", "Advertising") == \
+                ["example.com"]
+            for dom in ("ads.example.com", "www.example.com"):
+                w = m.websites[dom]
+                assert (w.category, w.category_source) == (
+                    "Advertising", CAT_YOURS), (w.category,
+                                                w.category_source)
+            assert c.get("websites.category_overrides") == {
+                "example.com": "Advertising"}
+            assert m.timeline[-1]["text"].startswith(
+                "You set the category of example.com")
+            # a new name of the same site gets it too
+            m.register_website("cdn.example.com", "93.184.215.15", d, "DNS")
+            assert m.websites["cdn.example.com"].category == "Advertising"
+            payload = json.loads(json.dumps(SessionCodec.serialize(m),
+                                            default=str))
+            m2 = NetworkModel(c)
+            SessionCodec.load(payload, m2)
+            assert m2.websites["www.example.com"].category == "Advertising"
+            assert m.undo_correction() == []
+            assert "example.com" not in CATEGORY_OVERRIDES
+            assert not m.websites["www.example.com"].category
+            assert m.timeline[-1]["text"].startswith("You undid")
+            # place and owner
+            assert m.correct_tags(d.key, "Kitchen", "Sam") == [d.key]
+            assert (d.place, d.owner) == ("Kitchen", "Sam")
+            m.undo_correction()
+            assert (d.place, d.owner) == ("", "")
+        finally:
+            CATEGORY_OVERRIDES.clear()
+            CATEGORY_OVERRIDES.update(saved)
+        for key, claims in (
+                ("top_sites", {"sites": C("example.com", LV_UNKNOWN)}),
+                ("first_seen", {"when": C("today", LV_INFERRED),
+                                "span": C("this session", LV_OBSERVED)}),
+                ("usual_hours", {"hours": C("07:00–23:00", LV_OBSERVED),
+                                 "basis": C("40 minutes", LV_OBSERVED)})):
+            try:
+                narrate(key, **claims)
+            except NarrativeRefused:
+                continue
+            raise AssertionError(f"{key} stated more than its evidence")
+        line = narrate("top_sites", sites=C("example.com", LV_CORRELATED))
+        assert line.startswith("◎ Appears to talk"), line
+
     def t_session_roundtrip():
         clk = _FakeClock()
         c = cfg()
@@ -51216,7 +52781,7 @@ def run_self_tests(verbose=True):
                t_theme_mappings, t_confidence_scoring, t_mac_randomization,
                t_device_lifecycle, t_public_ip_never_a_device,
                t_device_merge_rules, t_registrable_domain, t_dns_parsing,
-               t_explain_registry,
+               t_explain_registry, t_m6_corrections,
                t_tls_sni_parser, t_flow_aggregation, t_alert_debounce,
                t_session_roundtrip, t_display_filters, t_historical_buckets,
                t_dns_tracker, t_baseline, t_data_loaders, t_history_store,
@@ -57984,7 +59549,7 @@ def run_gui_test(live=False):
         step(name, fn)
     only = os.environ.get("MW_GUI_ONLY", "")     # developers: one step
     for name, fn in GUI_TEST_STEPS:
-        if only and only not in name:
+        if only and not any(o in name for o in only.split("|")):
             continue
         step(name, lambda fn=fn: fn(app, ctx))
     step("demo mode starts and leaves no trace", s_demo)
@@ -58599,6 +60164,121 @@ def gt_m5_find(app, ctx):
             app._on_ui_mode_change()
     _gui_pump(root, 0.3)
     assert app.current_tab_name() == "alerts", app.current_tab_name()
+
+
+@gui_test_step("5.1.2 M6: answer cards, while you were away, device story, "
+               "tags, category corrections, review mode, rules, chart data")
+def gt_m6_understand(app, ctx):
+    root = app.root
+    m = app.model
+    dash = app._select_tab("dash")
+    _gui_pump(root, 1.0)
+    got = app.dashboard_answers(force=True)
+    assert set(got) == {"wrong", "usage", "new"}
+    for key, (text, _kind, show) in got.items():
+        assert text and show is not None, key
+    assert dash.answer_lbls["wrong"].winfo_ismapped()
+    assert not dash.state_lbl.winfo_ismapped()
+    assert app.honesty_line().startswith(translate_text("From here"))
+    # endpoint vantage: the usage card names no other device
+    orig = m.vantage.classify
+    try:
+        m.vantage.classify = lambda offline=False: "endpoint"
+        text = app.answer_usage()[0]
+    finally:
+        m.vantage.classify = orig
+    assert "not visible" in text, text
+    others = [app.device_label(d) for d in m.registry.by_key.values()
+              if d.key != m.my_device_key()]
+    assert not any(n in text for n in others if len(n) > 3), text
+    # while you were away: exactly one line after 31 minutes
+    n0 = len(app.messages)
+    mode = app.data_mode
+    app.note_focus_lost(now=10000.0)
+    assert app.note_focus_back(now=10000.0 + 31 * 60) is None  # a file
+    app.data_mode = "live"
+    try:
+        app.note_focus_lost(now=10000.0)
+        line = app.note_focus_back(now=10000.0 + 31 * 60)
+        assert line and "background" in line, line
+        assert app.note_focus_back(now=10000.0 + 40 * 60) is None
+        assert len(app.messages) == n0 + 1
+        app.note_focus_lost(now=20000.0)
+        assert app.note_focus_back(now=20000.0 + 10 * 60) is None
+    finally:
+        app.data_mode = mode
+    app._hide_banner()
+    # the story of the phone: marks, still learning, links
+    phone = next(d for d in m.registry.by_key.values()
+                 if "iPhone" in app.device_label(d))
+    story = app.device_story(phone)
+    assert story and all(s[0][:1] in "◉◎◌?⚠" for s in story), story
+    assert any("still learning" in s[0] for s in story), story
+    assert any(link for _s, link in story)
+    card = app.show_device(phone.key)
+    _gui_pump(root, 0.3)
+    body = card.txt.get("1.0", "end")
+    assert "Its story" in body and "This is wrong" in body
+    card.win.destroy()
+    # place and owner: a column next to the name, kept, undone
+    app.set_device_tags(phone.key, place="Kitchen", owner="Sam")
+    dt = app.tabs["devices"]
+    assert dt.kit.shown_cols()[2] == "tags", dt.kit.shown_cols()
+    assert app.known.get(phone.key)["place"] == "Kitchen"
+    assert "Kitchen" in str(dict(app.search_drop.results("kitchen")))
+    app.undo_last_correction()
+    assert not phone.place and not (app.known.get(phone.key) or {}).get(
+        "place")
+    # a category you correct: applied, on the timeline, kept, undone
+    w = next(iter(m.websites.values()))
+    reg = w.registrable or w.domain
+    assert app.set_website_category(w.domain, choice="Social")
+    assert w.category == "Social" and w.category_source == CAT_YOURS
+    assert m.timeline[-1]["text"].startswith("You set the category")
+    CATEGORY_OVERRIDES.clear()
+    app._apply_runtime_settings()            # as after a restart
+    assert CATEGORY_OVERRIDES.get(reg) == "Social"
+    sec = dict(app.website_report(w))
+    assert "your correction" in sec["Category (informational)"]
+    app.undo_last_correction()
+    assert reg not in CATEGORY_OVERRIDES and w.category != "Social"
+    # Review mode: Expected stores one rule, Settings lists it, Remove
+    # deletes it and that alert can fire again
+    app.config.set("alerts.expected", [])
+    win = app.review_alerts()
+    _gui_pump(root, 0.2)
+    if win is not None:
+        a = win.queue[0]
+        win.expected()
+        rules = app.alert_rules()
+        assert len(rules) == 1 and rules[0][0] == "alerts.expected"
+        sw = app._open_settings("alerts")
+        _gui_pump(root, 0.4)
+        texts = [str(x.cget("text")) for x in _walk_class(sw.win, tk.Label)]
+        assert any(rules[0][2] in t for t in texts), rules[0][2]
+        app.remove_alert_rule(*rules[0][:2])
+        sw._rerender()
+        _gui_pump(root, 0.2)
+        assert not app.alert_rules()
+        assert not m.alerts.is_muted(a.kind, a.device_key,
+                                     a.subject or a.device_key)
+        sw.win.destroy()
+        win.destroy()
+    # Quiet Mode / not live: Why slow sends nothing
+    sent = len(LEDGER.entries)
+    if not app.health_checks_allowed():
+        app.prober.run_now.clear()
+        iw = app.investigate("slow")
+        _gui_pump(root, 0.3)
+        assert not app.prober.run_now.is_set()
+        assert len(LEDGER.entries) == sent
+        iw.destroy()
+    # a chart's numbers
+    app._select_tab("dash")
+    _gui_pump(root, 0.8)
+    text = Charts.chart_text(dash.canvas)
+    assert translate_text("Internet traffic") in text
+    assert "," in Charts.chart_text(dash.canvas, True)
 
 
 # ---- feature preservation: nothing 5.0.2 could reach may disappear ---------
