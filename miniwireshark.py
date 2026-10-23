@@ -66,6 +66,8 @@ self-test t_toc_matches_banners keeps this list and the banners in step.
 Run  `python miniwireshark.py --self-test`  to run the built-in tests
 (no administrator rights or packet capture needed), `--gui-test` for the
 window tests and `--bench-gui` for the window performance benchmark.
+On another computer, `--release-gate` runs all of them plus pictures of
+every tab and writes one folder to send back.
 """
 
 from __future__ import annotations
@@ -916,8 +918,10 @@ RELEASE_FLAGS = ("--release-check", "--make-release-key", "--sign-release",
 RELEASE_MODE = any(f in sys.argv for f in RELEASE_FLAGS)
 BOOT_CHECK_MODE = BOOT_CHECK_FLAG in sys.argv
 WORKER_MODE = "--mw-worker" in sys.argv      # a Full Power worker process
+GATE_MODE = "--release-gate" in sys.argv or "--gui-shots" in sys.argv
 TOOL_MODE = SELF_TEST_MODE or GUI_TEST_MODE or BENCH_MODE or \
-    RELEASE_MODE or BOOT_CHECK_MODE or WORKER_MODE or BENCH_GUI_MODE
+    RELEASE_MODE or BOOT_CHECK_MODE or WORKER_MODE or BENCH_GUI_MODE or \
+    GATE_MODE
 START_IN_DEMO = DEMO_FLAG in sys.argv
 
 if ELEVATED_FLAG in sys.argv:
@@ -21649,6 +21653,7 @@ Export… ¦ Exporter… ¦ Exportar…
 Forward ¦ Suivant ¦ Adelante
 Explain inline (on / off) ¦ Explications en ligne (activer / désactiver) ¦ Explicaciones en línea (activar / desactivar)
 Each fact and how it is known ¦ Chaque fait et comment il est connu ¦ Cada dato y cómo se sabe
+★ not shown: most devices are new this hour ¦ ★ non affichées : la plupart des appareils sont nouveaux cette heure ¦ ★ no se muestran: la mayoría de los dispositivos son nuevos en esta hora
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -23276,7 +23281,16 @@ def layout_audit(top):
                                         + " × " +
                                         w.itemcget(boxes[m][0], "text")[:30]))
             if cls == "Treeview":
-                hf = tkfont.nametofont("TkHeadingFont")
+                # the font the headings are really drawn in (the style's;
+                # TkHeadingFont only when the style names none)
+                spec = ttk.Style().lookup(
+                    (str(w.cget("style")) or "Treeview") + ".Heading",
+                    "font") or ttk.Style().lookup("Treeview.Heading", "font")
+                try:
+                    hf = tkfont.Font(root=w, font=spec) if spec else \
+                        tkfont.nametofont("TkHeadingFont")
+                except tk.TclError:
+                    hf = tkfont.nametofont("TkHeadingFont")
                 cols = (["#0"] if "tree" in str(w.cget("show")) else []) + \
                     list(w["columns"])
                 disp = w["displaycolumns"]
@@ -31240,6 +31254,7 @@ class MapTab(BaseTab):
         c.configure(bg=self.t["tab_bg"])
         if self.mode_var.get() == "Topology":
             self._topology(w, h)
+            self._draw_stars(w, h)
             self.after_draw_declutter()
         else:
             self._connections(w, h)
@@ -31284,6 +31299,45 @@ class MapTab(BaseTab):
             self._place_label(tid, X, Y, R, label, sel)
             self._label_ids.append((tid, X, Y, R, label, sel))
         return X, Y
+
+    def _draw_stars(self, w, h):
+        """★ = new this hour, drawn once every node is placed: at a corner
+        of its node that is free (the release-gate pictures showed stars
+        on the neighbours' letters and on the title); none, and a note,
+        when most devices are new (reading a file: every one is)."""
+        c, t = self.c, self.t
+        stars = getattr(self, "_stars", [])
+        total = len({v[1] for v in self.nodes.values() if v[0] == "device"})
+        if not stars:
+            return
+        if len(stars) > max(3, total // 2):
+            c.create_text(12, h - 8, anchor="sw", fill=t["muted_fg"],
+                          font=("TkDefaultFont", 8), tags=("deco",),
+                          text=translate_text("★ not shown: most devices "
+                                              "are new this hour"))
+            return
+        for X, Y, R, key in stars:
+            k = R * 0.7
+            sid = c.create_text(X + k, Y - k, text="★", anchor="sw",
+                                fill=t["warn_fg"], tags=(f"n:{key}", "ov"),
+                                font=("TkDefaultFont", 10))
+            for x, y, anchor in ((X + k, Y - k, "sw"), (X - k, Y - k, "se"),
+                                 (X + k, Y + k, "nw"), (X - k, Y + k, "ne")):
+                c.coords(sid, x, y)
+                c.itemconfigure(sid, anchor=anchor)
+                b = c.bbox(sid)
+                if not b:
+                    break
+                own = f"n:{key}"
+                if not any(i != sid and c.type(i) in ("text", "oval") and
+                           own not in c.gettags(i) and
+                           not (c.type(i) == "oval" and
+                                "deco" in c.gettags(i))
+                           for i in c.find_overlapping(*b)):
+                    break
+            else:
+                c.coords(sid, X + k, Y - k)
+                c.itemconfigure(sid, anchor="sw")
 
     def after_draw_declutter(self):
         """Second pass once everything is drawn (stars, rings, the router
@@ -31460,6 +31514,7 @@ class MapTab(BaseTab):
             (X0 - rr_, Y0 - rr_, X0 + rr_, Y0 + rr_)]
         sel_key = self.selected[1] if self.selected and \
             self.selected[0] == "device" else None
+        stars = self._stars = []
         alerted = {a.device_key for a in m.alerts.alerts.values()
                    if a.severity in ("WARNING", "DANGER") and
                    not getattr(a, "acknowledged", False)} \
@@ -31509,12 +31564,7 @@ class MapTab(BaseTab):
                                    tags=(f"n:{dev.key}", "ov"))
             if self.ov_new.get() and now - dev.first_seen < 3600 and \
                     dev.live:
-                # anchored at the circle's top-right edge: at 150 % the
-                # centred star reached the node's letter
-                self.c.create_text(X + R * 0.7, Y - R * 0.7, text="★",
-                                   anchor="sw", fill=t["warn_fg"],
-                                   tags=(f"n:{dev.key}", "ov"),
-                                   font=("TkDefaultFont", 10))
+                stars.append((X, Y, R, dev.key))
             self._list_rows.append((dev.key, label.strip(),
                                     f"{dev.class_confidence} "
                                     f"{dev.device_class}".strip(),
@@ -49136,8 +49186,9 @@ def release_check(path=None):
         print(f"  [{'OK' if ok else '!!'}] {name}" + (f": {detail}"
                                                       if detail else ""))
     print(f"  sha256 {hashlib.sha256(data).hexdigest()}  size {len(data)}")
-    print("  Manual: run --self-test and --gui-test on Windows, macOS and "
-          "Linux; sign with --sign-release; attach the .py and "
+    print("  Manual: run --release-gate on Windows, macOS and Linux (and "
+          "on the reference laptop) and read each summary.txt; sign with "
+          "--sign-release; attach the .py and "
           f"{MANIFEST_NAME} to the release.")
     return 0 if all(ok for name, ok, _d in checks
                     if name != "Release keys listed") else 1
@@ -59071,6 +59122,24 @@ def test_deep_worker_protocol(ctx):
 
 
 @self_test()
+def t_release_gate_parts(ctx):
+    """The release gate's pieces that need no window: the machine facts,
+    a step run in its own process with its output kept, and the medians
+    against the limits."""
+    facts = platform_facts()
+    assert facts["MiniWireshark"] == SCRIPT_VERSION and "Python" in facts
+    out = ctx.path("gate")
+    os.makedirs(out, exist_ok=True)
+    rc, secs, text = _gate_run(out, "version", ["--release-check"], 600)
+    assert os.path.exists(os.path.join(out, "version.txt"))
+    assert "Version string" in text, text[-300:]
+    assert GATE_MODE is False          # the self-test is not a gate run
+    rows = bench_check({"S1": {"theme.stall_ms": 40.0}})
+    assert rows == [("S1", "theme.stall_ms", 40.0,
+                     BENCH_LIMITS["S1"]["theme.stall_ms"], True)], rows
+
+
+@self_test()
 def test_deep_worker_process_and_mode_switching(ctx):
     """A real worker process gives the same findings as the thread; and
     switching Normal ↔ Full Power 50 times during a replay leaves the
@@ -60020,6 +60089,294 @@ def bench_gui(argv):
     if any("error" in r for r in results.values()):
         rc = rc or 1
     return rc
+
+# ---- release gate on another machine (--release-gate) ---------------------
+# The gates the Linux test environment can't close (the reference laptop,
+# Windows and macOS) in one command: every check runs in its own process,
+# the window is photographed tab by tab, and one folder comes back with a
+# summary. Nothing is sent anywhere; nothing is installed.
+GATE_SHOT_TABS = ("dash", "feed", "timeline", "devices", "map", "health",
+                  "alerts", "websites", "connections", "remote", "packets",
+                  "security", "sources", "help")
+
+
+def grab_window(root, path):
+    """A PNG of the window (what the person sees), with the platform's
+    own tool: screencapture on macOS, PowerShell on Windows, ImageMagick
+    `import` on Linux. -> (ok, how or why not)."""
+    path = os.path.abspath(path)       # .NET resolves its own way
+    try:
+        root.update_idletasks()
+        x, y = root.winfo_rootx(), root.winfo_rooty()
+        w, h = root.winfo_width(), root.winfo_height()
+    except tk.TclError as e:
+        return False, str(e)
+    try:
+        if sys.platform == "darwin":
+            if not shutil.which("screencapture"):
+                return False, "screencapture not found"
+            r = subprocess.run(["screencapture", "-x", "-R",
+                                f"{x},{y},{w},{h}", path],
+                               capture_output=True, timeout=30)
+            ok = r.returncode == 0 and os.path.exists(path)
+            return ok, ("screencapture" if ok else
+                        "screencapture failed (System Settings → Privacy → "
+                        "Screen Recording must allow the terminal)")
+        if IS_WINDOWS:
+            ps = shutil.which("powershell") or shutil.which("pwsh")
+            if not ps:
+                return False, "PowerShell not found"
+            script = (
+                "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
+                "Add-Type -Name D -Namespace W -MemberDefinition "
+                "'[DllImport(\"user32.dll\")] public static extern bool "
+                "SetProcessDPIAware();';[W.D]::SetProcessDPIAware()|Out-Null;"
+                f"$b=New-Object System.Drawing.Bitmap({w},{h});"
+                "$g=[System.Drawing.Graphics]::FromImage($b);"
+                f"$g.CopyFromScreen({x},{y},0,0,$b.Size);"
+                "$b.Save('" + path.replace("'", "''") +
+                "',[System.Drawing.Imaging.ImageFormat]::Png)")
+            # -EncodedCommand: Windows PowerShell drops the double quotes
+            # of a script passed as a plain argument
+            enc = base64.b64encode(script.encode("utf-16-le")).decode()
+            r = subprocess.run([ps, "-NoProfile", "-NonInteractive",
+                                "-EncodedCommand", enc], capture_output=True,
+                               timeout=60)
+            ok = r.returncode == 0 and os.path.exists(path)
+            return ok, "PowerShell" if ok else (
+                "PowerShell: " + r.stderr.decode("utf-8", "replace")[:200])
+        if shutil.which("import"):
+            r = subprocess.run(["import", "-window", str(root.winfo_id()),
+                                path], capture_output=True, timeout=30)
+            ok = r.returncode == 0 and os.path.exists(path)
+            return ok, "ImageMagick import" if ok else "import failed"
+        return False, "no screenshot tool (install ImageMagick for `import`)"
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+
+
+def platform_facts(root=None):
+    """What the machine is, for the gate summary."""
+    facts = OrderedDict()
+    facts["MiniWireshark"] = SCRIPT_VERSION
+    facts["Operating system"] = platform.platform()
+    facts["Python"] = f"{platform.python_version()} ({sys.executable})"
+    facts["Processors"] = str(os.cpu_count() or "?")
+    if root is not None:
+        with contextlib.suppress(tk.TclError):
+            facts["Tk"] = str(root.tk.call("info", "patchlevel"))
+            facts["Tk scaling"] = "%.2f pixels per point" % float(
+                root.tk.call("tk", "scaling"))
+            facts["Screen"] = (f"{root.winfo_screenwidth()}x"
+                               f"{root.winfo_screenheight()}")
+            facts["Interface scale"] = "%d %%" % round(UI_SCALE[0] * 100)
+    return facts
+
+
+def gui_shots(out_dir, quick=False):
+    """--gui-shots DIR: a small synthetic network read through the normal
+    path, then every tab photographed and checked by layout_audit in
+    English Light, English Dark, French Light and (when the screen is big
+    enough) English at 150 %. Writes DIR/audit.txt and DIR/*.png."""
+    global PATHS
+    os.makedirs(out_dir, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix="mw_shots_")
+    os.environ["MINIWIRESHARK_DATA"] = tmp
+    PATHS = AppPaths()
+    setup_logging()
+    load_scapy()
+    _patch_dialogs_for_tests()
+    install_gui_gate()
+    cfg = AppConfig(path=os.path.join(tmp, "config.json"))
+    for k, v in (("general.auto_start_capture", False),
+                 ("general.show_welcome", False),
+                 ("updates.check_automatically", False),
+                 ("privacy.auto_download_reference", False),
+                 ("appearance.beginner_mode", False)):
+        cfg.set(k, v)
+    cfg.save()
+    root = tk.Tk()
+    app = MiniWireshark(root, "", set(), set(), "", config=cfg)
+    app._apply_runtime_settings()
+    pcap = os.path.join(tmp, "shots.pcap")
+    frames = bench_capture(60, 900, 300)
+    write_raw_pcap(pcap, frames)
+    app.import_pcap_path(pcap)
+    _gui_pump(root, 0.5, lambda: app.importer is None and
+              app.model.count >= len(frames), timeout=300)
+    _gui_pump(root, 2.0)
+    lines = [f"{k:18s} {v}" for k, v in platform_facts(root).items()]
+    lines.append("")
+    shots, problems, tool = 0, 0, ""
+    passes = [("en-light", "English", "Light", None),
+              ("en-dark", "English", "Dark", None),
+              ("fr-light", "Français", "Light", None)]
+    if not quick and root.winfo_screenwidth() >= 2049 and \
+            root.winfo_screenheight() >= 1152:
+        passes.append(("en-150", "English", "Light", "150 %"))
+    elif not quick:
+        lines.append("150 %: skipped, the screen is smaller than "
+                     "2049x1152 (1366x768 at 150 %)")
+    sc0 = float(root.tk.call("tk", "scaling"))
+    for tag, lang, theme, scale in passes:
+        app.config.set("general.language", lang)
+        app._apply_runtime_settings()
+        app._apply_theme(theme)
+        if scale:
+            apply_ui_scale(root, scale)
+            app._apply_text_size(defer=False)
+        root.geometry(px_geo("1366x768") + "+0+0")
+        _gui_pump(root, 1.0)
+        lines.append(f"[{tag}] {lang}, {theme}" +
+                     (f", {scale}" if scale else "") + ", window " +
+                     f"{root.winfo_width()}x{root.winfo_height()}")
+        for name in (GATE_SHOT_TABS if not quick else GATE_SHOT_TABS[:4]):
+            if name not in app.tabs:
+                continue
+            app._select_tab(name)
+            _gui_pump(root, 0.8)
+            audit = layout_audit(root)
+            found = [x for x in audit
+                     if x[0] in ("canvas-text-overlap", "overlap", "cut-x",
+                                 "cut-y")]
+            # a heading within 10 pixels of its column's edge: listed to
+            # look at in the picture, not counted (it is usually whole)
+            tight = [x[2] for x in audit if x[0] == "heading-cut"]
+            problems += len(found)
+            path = os.path.join(out_dir, f"{tag}-{name}.png")
+            ok, how = grab_window(root, path)
+            shots += ok
+            tool = tool or (how if ok else "")
+            lines.append(f"  {name:12s} " + (
+                "picture saved" if ok else f"no picture ({how})") +
+                f"; {len(found)} layout problem(s)")
+            for kind, wpath, detail in found[:8]:
+                lines.append(f"      {kind}: {detail} ({wpath})")
+            if tight:
+                lines.append("      tight headings (check the picture): " +
+                             ", ".join(tight[:8]))
+        if scale:
+            root.tk.call("tk", "scaling", sc0)
+            apply_ui_scale(root, "Automatic")
+            app._apply_text_size(defer=False)
+    lines.append("")
+    lines.append(f"Pictures: {shots} ({tool or 'none'}); layout problems: "
+                 f"{problems}")
+    atomic_write_text(os.path.join(out_dir, "audit.txt"),
+                      "\n".join(lines) + "\n")
+    print("\n".join(lines))
+    with contextlib.suppress(Exception):
+        app._on_close()
+    with contextlib.suppress(Exception):
+        root.destroy()
+    shutil.rmtree(tmp, ignore_errors=True)
+    return 0 if problems == 0 else 1
+
+
+def _gate_run(out_dir, name, args, timeout):
+    """One gate step in its own process; output to DIR/<name>.txt."""
+    path = os.path.join(out_dir, f"{name}.txt")
+    t0 = time.time()
+    env = dict(os.environ)
+    env["MW_UNATTENDED"] = "1"
+    try:
+        r = subprocess.run([sys.executable, SCRIPT_PATH] + args,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout, env=env)
+        rc, text = r.returncode, r.stdout.decode("utf-8", "replace")
+    except subprocess.TimeoutExpired as e:
+        rc = -1
+        text = (e.stdout or b"").decode("utf-8", "replace") + \
+            f"\n(stopped after {timeout} s)"
+    except OSError as e:
+        rc, text = -1, str(e)
+    atomic_write_text(path, text)
+    return rc, time.time() - t0, text
+
+
+def release_gate(argv):
+    """python miniwireshark.py --release-gate [--out DIR] [--runs N]
+    [--quick]. Runs the boot check, self-test, GUI test, the S1 window
+    benchmark N times (median against the limits), the tab pictures and
+    the release check, each in its own process, and writes DIR/summary.txt.
+    Needs a display. Sends nothing; installs nothing."""
+    quick = "--quick" in argv
+    runs = 1 if quick else 3
+    if "--runs" in argv:
+        with contextlib.suppress(ValueError, IndexError):
+            runs = max(1, min(9, int(argv[argv.index("--runs") + 1])))
+    sysname = {"win32": "windows", "darwin": "macos"}.get(
+        sys.platform, "linux")
+    out_dir = argv[argv.index("--out") + 1] if "--out" in argv else \
+        os.path.abspath(time.strftime(f"mw-gate-{sysname}-%Y%m%d-%H%M"))
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"MiniWireshark {SCRIPT_VERSION} release gate -> {out_dir}")
+    print("Leave the computer alone while it runs (windows open and close "
+          "by themselves); about " + ("10" if quick else "45") +
+          " minutes.", flush=True)
+    rows = []
+
+    def step(name, args, timeout, label):
+        print(f"  {label}…", end=" ", flush=True)
+        rc, secs, text = _gate_run(out_dir, name, args, timeout)
+        last = [ln for ln in text.strip().splitlines() if ln.strip()]
+        rows.append((label, rc == 0, secs, last[-1][:100] if last else ""))
+        print(("PASS" if rc == 0 else "FAIL") + f" ({secs:.0f} s)",
+              flush=True)
+        return rc
+    step("boot", ["--boot-check"], 600, "Boot check")
+    step("selftest", ["--self-test"], 2400, "Self-test")
+    if not quick:
+        step("guitest", ["--gui-test"], 3000, "GUI test")
+    bench = []
+    for i in range(runs):
+        part = os.path.join(out_dir, f"bench-S1-{i + 1}.json")
+        step(f"bench-{i + 1}", ["--bench-gui", "S1", "--out", part], 3600,
+             f"Window benchmark S1, run {i + 1} of {runs}")
+        with contextlib.suppress(OSError, ValueError):
+            with open(part, encoding="utf-8") as f:
+                bench.append(json.load(f))
+    step("shots", ["--gui-shots", os.path.join(out_dir, "shots")] +
+         (["--quick"] if quick else []), 1800, "Tab pictures and layout check")
+    step("release", ["--release-check"], 900, "Release check")
+    lines = [f"MiniWireshark {SCRIPT_VERSION} release gate, "
+             f"{time.strftime('%Y-%m-%d %H:%M')}", ""]
+    head = []
+    with contextlib.suppress(OSError):
+        with open(os.path.join(out_dir, "shots", "audit.txt"),
+                  encoding="utf-8") as f:
+            for ln in f:
+                if not ln.strip():
+                    break
+                head.append(ln.rstrip("\n"))
+    lines += head or [f"{k:18s} {v}" for k, v in platform_facts().items()]
+    lines += ["", "Steps:"]
+    for label, ok, secs, last in rows:
+        lines.append(f"  [{'PASS' if ok else 'FAIL'}] {label} "
+                     f"({secs:.0f} s) {last}")
+    if bench:
+        lines += ["", f"S1 freezes, median of {len(bench)} (limit):"]
+        per = OrderedDict()
+        for res in bench:
+            for sid, key, val, lim, _ok in bench_check(res, BENCH_LIMITS):
+                if isinstance(val, (int, float)):
+                    per.setdefault((sid, key, lim), []).append(float(val))
+        for (sid, key, lim), vals in per.items():
+            med = statistics.median(vals)
+            lines.append(f"  [{'PASS' if med <= lim else 'FAIL'}] {sid} "
+                         f"{key}: {med:.1f} (<= {lim}) runs "
+                         + ", ".join(f"{v:.0f}" for v in vals))
+    lines += ["", "Send this whole folder back (zip it): the pictures are "
+                  "in shots/, every step's full output is next to this "
+                  "file. It contains no captured traffic from your network: "
+                  "every test uses made-up data."]
+    text = "\n".join(lines) + "\n"
+    atomic_write_text(os.path.join(out_dir, "summary.txt"), text)
+    print()
+    print(text)
+    return 0 if all(r[1] for r in rows) and all(
+        "[FAIL]" not in ln for ln in lines) else 1
+
 
 # ============================================================================
 #  20c.  GUI test — drives the real window under a (virtual) display
@@ -63793,6 +64150,11 @@ if __name__ == "__main__":
         sys.exit(run_gui_test(live="--live" in sys.argv))
     if BENCH_GUI_MODE:
         sys.exit(bench_gui(sys.argv[1:]))
+    if "--gui-shots" in sys.argv:
+        sys.exit(gui_shots(sys.argv[sys.argv.index("--gui-shots") + 1],
+                           quick="--quick" in sys.argv))
+    if "--release-gate" in sys.argv:
+        sys.exit(release_gate(sys.argv[1:]))
     if BENCH_MODE:
         setup_logging()
         for k, v in bench_report().items():
