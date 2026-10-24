@@ -155,7 +155,7 @@ def _dir_writable(path):
     try:
         os.makedirs(path, exist_ok=True)
         probe = os.path.join(path, f".mw_write_test_{os.getpid()}")
-        with open(probe, "w") as f:
+        with open(probe, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(probe)
         return True
@@ -1825,7 +1825,7 @@ def _boot_time():
         except (AttributeError, OSError):
             return 0.0
     try:
-        with open("/proc/uptime") as f:
+        with open("/proc/uptime", encoding="ascii", errors="replace") as f:
             return time.time() - float(f.read().split()[0])
     except (OSError, ValueError):
         return 0.0
@@ -9583,7 +9583,7 @@ def system_dns_servers():
             for path in ("/run/systemd/resolve/resolv.conf",
                          "/etc/resolv.conf"):
                 if os.path.exists(path):
-                    with open(path) as f:
+                    with open(path, encoding="ascii", errors="replace") as f:
                         servers = re.findall(r"^\s*nameserver\s+(\S+)",
                                              f.read(), re.M)
                     if servers and servers != ["127.0.0.53"]:
@@ -14236,6 +14236,16 @@ class AlertEngine:
 # ============================================================================
 #  This computer's Wi-Fi link (read-only questions to the operating system)
 # ============================================================================
+def _keychain_quotable(s):
+    return isinstance(s, str) and not any(c in s for c in "\r\n\0")
+
+
+def _keychain_quote(s):
+    """One argument for `security -i`: double quotes, with backslash and
+    double quote escaped."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _one_line_end(text):
     """`text` without its one trailing newline (5.2.3, B-41: rstrip("\\n")
     removed backslashes and the letter n, and kept the newline)."""
@@ -15009,11 +15019,17 @@ class CredentialVault:
 
     def set(self, cid, secret):
         register_secret(secret)
-        if self.backend == "keychain":
-            r = subprocess.run(["security", "add-generic-password", "-U",
-                                "-a", cid, "-s", self.SERVICE, "-w", secret],
+        if self.backend == "keychain" and _keychain_quotable(secret) and \
+                _keychain_quotable(cid):
+            # 5.2.3 (C-01): the command goes to `security -i` on stdin; on
+            # the command line any local program could read the secret
+            # from the process list while it ran
+            cmd = "add-generic-password -U -a {} -s {} -w {}\n".format(
+                _keychain_quote(cid), _keychain_quote(self.SERVICE),
+                _keychain_quote(secret))
+            r = subprocess.run(["security", "-i"], input=cmd.encode(),
                                capture_output=True, timeout=20)
-            if r.returncode == 0:
+            if r.returncode == 0 and b"error" not in r.stderr.lower():
                 return True
         elif self.backend == "secret-service":
             r = subprocess.run(["secret-tool", "store", "--label",
@@ -61077,6 +61093,26 @@ def test_b09_console_text_and_small_fixes(ctx):
     assert wifi_channel_from_mhz(5955) == (1, "6 GHz")
     assert wifi_channel_from_mhz(7115) == (233, "6 GHz")
     assert wifi_channel_from_mhz(5945) == (None, "")
+    # C-01: a keychain secret never appears on a command line
+    real, seen = subprocess.run, []
+
+    def fake(args, **kw):
+        seen.append((list(args), kw.get("input") or b""))
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+    vault = CredentialVault.__new__(CredentialVault)
+    vault.backend = "keychain"
+    subprocess.run = fake
+    try:
+        for secret in ('c01-pa"ss\\word\u00e9-Zq7', "c01-Plain-Zq7"):
+            assert vault.set("c1", secret)
+            args, data = seen[-1]
+            assert args == ["security", "-i"], args
+            assert all(secret not in a for a in args)
+            assert _keychain_quote(secret).encode() in data
+    finally:
+        subprocess.run = real
+    assert not _keychain_quotable("two\nlines")
+    assert _keychain_quote('a"b\\c') == '"a\\"b\\\\c"'
 
 
 @self_test(slow=False)
