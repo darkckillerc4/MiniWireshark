@@ -1,0 +1,46 @@
+name: Release
+
+# Publishes the version on main as soon as it is finished. A version is
+# finished when SCRIPT_VERSION in miniwireshark.py has its own
+# "## [x.y.z] — date" section in CHANGELOG.md (not "[Unreleased]").
+# The job then creates the tag and the GitHub release with the .py file
+# and a .sha256 file, and commits the new row to docs/VERSIONS.md, the
+# README and .github/archive-releases.json. If the release exists already,
+# it does nothing, so every push to main can run it safely.
+on:
+  push:
+    branches: [main]
+    paths: [miniwireshark.py, CHANGELOG.md]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print what would be published"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: python3 -m py_compile miniwireshark.py
+      - name: Publish and record
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/release_current.py ${{ inputs.dry_run && '--dry-run' || '' }}
+      - name: Commit the version index
+        if: ${{ !inputs.dry_run }}
+        run: |
+          if git diff --quiet; then echo "Nothing to record."; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898237+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Record release $(grep -oP '^SCRIPT_VERSION = "\K[^"]+' miniwireshark.py) in the version index"
+          git push
