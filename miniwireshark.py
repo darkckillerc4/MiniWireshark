@@ -77,7 +77,6 @@ from __future__ import annotations
 # ============================================================================
 import array
 import bisect
-import collections
 import contextlib
 import csv
 import base64
@@ -125,7 +124,7 @@ import uuid
 from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable
 
 _T_START = time.perf_counter()
 LAUNCH_TIMES = {}
@@ -1285,7 +1284,7 @@ if __name__ == "__main__" and not TOOL_MODE and not _ELEV and \
 try:
     import tkinter as tk
     import tkinter.font as tkfont
-    from tkinter import filedialog, messagebox, simpledialog, ttk
+    from tkinter import filedialog, messagebox, ttk
 except ImportError:                                  # pragma: no cover
     sys.stderr.write(
         "MiniWireshark needs Python's graphical toolkit (tkinter).\n"
@@ -18278,7 +18277,6 @@ class NetworkModel:
         if not key or "." not in key:
             return None
         rec = self.websites.get(key)
-        is_new = rec is None
         if rec is None:
             reg = registrable_domain(key)
             # 5.2.3 (B-24): was a scan of the last 3,000 websites for every
@@ -24226,7 +24224,6 @@ class FlowLayout:
             rows = [[]]          # each: list of (it, x, w)
             x = xmin = 0         # xmin: a stretching label may shrink
             for unit in self._units(lefts):
-                uw = sum(self._wid(it) for it in unit)
                 umin = sum(min(self._wid(it), 260) if it["expand"]
                            else self._wid(it) for it in unit)
                 if xmin > 0 and xmin + umin > W:
@@ -30007,7 +30004,7 @@ class DashboardTab(BaseTab):
     def refresh(self, force=False):
         if not force and not self.is_visible():
             return
-        m, t, app = self.model, self.t, self.app
+        m, app = self.model, self.app
         now = m.now()
         devs = [d for d in m.registry.visible_devices()]
         active = sum(1 for d in devs if d.state in (STATE_ACTIVE, STATE_IDLE))
@@ -42854,7 +42851,6 @@ class MiniWireshark:
     def set_asof(self, t):
         """Timeline, Devices and Websites show the session as of time t
         (None = now); the other views say they show now."""
-        m = self.model
         if t is not None:
             tab = self.tabs["timeline"]
             start, end = tab.strip_span()
@@ -45180,7 +45176,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                 try:
                     fp = connector_cert_fingerprint(sp["url"])
                 except (OSError, ValueError) as e:
-                    self._async_results.put(lambda: msg.configure(
+                    self._async_results.put(lambda e=e: msg.configure(
                         text=f"✖ Couldn't read the certificate: {e}"))
                     return
 
@@ -47785,9 +47781,9 @@ proc ::mw_retheme {w map fgnew deffg} {
             exported_at or time.time()))
         self.data_label = f"{os.path.basename(path)} ({when})"
         self._restyle_mode_banner()
-        self._set_banner(f"\U0001F4C2  Loaded a saved session — this is NOT "
-                         f"live. Click “Return to live capture” when "
-                         f"you're done.", kind="warn")
+        self._set_banner("\U0001F4C2  Loaded a saved session — this is NOT "
+                         "live. Click “Return to live capture” when "
+                         "you're done.", kind="warn")
         self.status_var.set(f"\U0001F4C2 Viewing saved session: "
                             f"{self.data_label} (not live)")
         LOG.info("session loaded from %s", path)
@@ -50580,7 +50576,7 @@ class DiagnosticsWindow:
             f"Scapy               {_module_version('scapy') or 'missing'}",
             f"psutil (optional)   {_module_version('psutil') or 'not installed'}",
             f"Capture backend     {backend}",
-            f"Npcap/libpcap       " + ("Npcap present" if IS_WINDOWS and
+            "Npcap/libpcap       " + ("Npcap present" if IS_WINDOWS and
                                        _npcap_present() else
                                        "Npcap MISSING" if IS_WINDOWS else
                                        "system libpcap / raw sockets"),
@@ -50642,7 +50638,7 @@ class DiagnosticsWindow:
             f"Cache folder        {PATHS.cache}",
             f"Log file            {PATHS.log_file}",
             f"Config file         {app.config.path}",
-            f"History             " + (app.history_status_text()
+            "History             " + (app.history_status_text()
                                        .replace("\n", " ")),
             "Optional databases:"] + [f"   {s}" for s in
                                       app.data.summary_lines()]
@@ -56032,7 +56028,7 @@ class ScenarioBuilder:
         Linux "cooked" capture frame."""
         self.vlan_ping()
         L = self.L
-        me, gw, nas = self.ME, self.GW, self.NAS
+        me = self.ME
         self._emit(L.Ether(src=me[1], dst="01:00:5e:00:00:16") /
                    L.IP(src=me[0], dst="224.0.0.22", ttl=1,
                         options=b"\x94\x04\x00\x00") /
@@ -60398,8 +60394,8 @@ def test_private_packages_folder(ctx):
     assert pp.install_wheel_file(w1) == ("mwfakepkg", "1.0")
     assert pp.activate() and root in sys.path
     try:
-        import mwfakepkg                               # noqa: F401
-        assert sys.modules["mwfakepkg"].VERSION == "1.0"
+        mwfakepkg = importlib.import_module("mwfakepkg")
+        assert mwfakepkg.VERSION == "1.0"
         w2 = _fake_wheel(ctx.path("mwfakepkg-2.0-py3-none-any.whl"),
                          "mwfakepkg", "2.0",
                          {"mwfakepkg/__init__.py": "VERSION = '2.0'\n",
@@ -61141,6 +61137,15 @@ def test_b09_console_text_and_small_fixes(ctx):
     assert wifi_channel_from_mhz(5945) == (None, "")
     assert abi_tag((3, 13), "win-amd64", "t") == "cp313t-win_amd64"
     assert abi_tag((3, 12), "linux-x86_64", "") == "cp312-linux_x86_64"
+    # B-40: several versions in one folder are told they share data
+    arch = ctx.path("b40archive")
+    os.makedirs(arch, exist_ok=True)
+    for name in ("miniwireshark V3.0.0.py", "miniwireshark-5.1.2.py"):
+        with open(os.path.join(arch, name), "w", encoding="utf-8") as f:
+            f.write("#\n")
+    shared = os.path.join(arch, "miniwireshark_data")
+    assert "2 MiniWireshark versions" in shared_data_note(arch, shared)
+    assert shared_data_note(arch, ctx.path("elsewhere")) == ""
     # B-07: no Npcap on Windows does not elevate the whole window
     g = globals()
     saved = {k: g[k] for k in ("IS_WINDOWS", "is_admin",
@@ -65115,8 +65120,6 @@ def _gs_loader(app, ctx):
     th = threading.Thread(target=lambda: got.append(
         lw.ask("consent", text="test")), daemon=True)
     th.start()
-    ok = _gui_pump(win, 0.1, lambda: bool(lw.card.winfo_children()),
-                   timeout=5) if False else None
     t_end = time.time() + 5
     btn = None
     while time.time() < t_end and btn is None:
@@ -67449,7 +67452,31 @@ def welcome_summary(cfg):
                      f"{'s' if len(pk) != 1 else ''}")
     if cfg.get("history.enabled", False):
         parts.append("history on")
+    note = shared_data_note()
+    if note:
+        parts.append(note)
     return " · ".join(parts)
+
+
+def shared_data_note(script_dir=None, data_dir=None):
+    """5.2.3 (B-40, verdict D): when several MiniWireshark files sit in one
+    folder (an archive of versions) they share the settings and history in
+    its miniwireshark_data folder. Say so in one line ("" otherwise)."""
+    script_dir = script_dir or SCRIPT_DIR
+    data_dir = data_dir or PATHS.data
+    if os.path.normcase(os.path.abspath(data_dir)) != os.path.normcase(
+            os.path.abspath(os.path.join(script_dir, "miniwireshark_data"))):
+        return ""
+    try:
+        n = sum(1 for f in os.listdir(script_dir)
+                if f.lower().startswith("miniwireshark")
+                and f.lower().endswith(".py"))
+    except OSError:
+        return ""
+    if n < 2:
+        return ""
+    return (f"{n} MiniWireshark versions in this folder share one data "
+            f"folder (set MINIWIRESHARK_DATA to keep one apart)")
 
 
 BOOT_TESTS = ("test_boot_receipts_and_crash_loop",
@@ -67491,7 +67518,6 @@ def boot_check(out=print):
         f"({'writable' if _dir_writable(PATHS.data) else 'NOT writable'})")
     if not _dir_writable(PATHS.data):
         ok_all = False
-    st = RuntimeManager().status()
     env = runtime_env(runtime_state_read()) or {}
     out(f"  Managed     {'installed' if env else 'none'}"
         + (f", window failed: {env.get('handshake_error')}"
