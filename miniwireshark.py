@@ -272,18 +272,41 @@ def setup_logging(verbose=False):
     setup_logging._done = True
 
 
+def _replace_retrying(tmp, path, tries=4):
+    """os.replace, retried briefly: on Windows an antivirus or the search
+    indexer holding the target for a moment makes it fail with
+    PermissionError (5.2.3, B-10). The temporary file never stays."""
+    try:
+        for i in range(tries):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if i == tries - 1:
+                    raise
+                time.sleep(0.05 * (i + 1))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
+def _tmp_name(path):
+    return f"{path}.tmp{os.getpid()}-{threading.get_ident() % 100000}"
+
+
 def atomic_write_text(path, text, encoding="utf-8"):
-    tmp = f"{path}.tmp{os.getpid()}"
+    tmp = _tmp_name(path)
     with open(tmp, "w", encoding=encoding) as f:
         f.write(text)
-    os.replace(tmp, path)
+    _replace_retrying(tmp, path)
 
 
 def atomic_write_bytes(path, data):
-    tmp = f"{path}.tmp{os.getpid()}"
+    tmp = _tmp_name(path)
     with open(tmp, "wb") as f:
         f.write(data)
-    os.replace(tmp, path)
+    _replace_retrying(tmp, path)
 
 
 def session_is_gz(path):
@@ -9674,6 +9697,26 @@ def fast_switch(who, on, interval=0.001):
         want = interval if _FAST_SWITCH_USERS else _NORMAL_SWITCH[0]
         if abs(sys.getswitchinterval() - want) > 1e-6:
             sys.setswitchinterval(want)
+        _windows_timer(bool(_FAST_SWITCH_USERS))
+
+
+_WIN_TIMER = [False]
+
+
+def _windows_timer(fine):
+    """5.2.3 (B-06): Windows rounds short waits (the 1-3 ms hand-offs
+    between the analysis thread and the window) up to its 15.6 ms timer
+    tick. While somebody needs fast switching the timer runs at 1 ms
+    (timeBeginPeriod), and is given back as soon as nobody does."""
+    if not IS_WINDOWS or fine == _WIN_TIMER[0] or \
+            (fine and not FEATURES.get("win_timer", True)):
+        return
+    try:
+        winmm = ctypes.WinDLL("winmm")
+        (winmm.timeBeginPeriod if fine else winmm.timeEndPeriod)(1)
+        _WIN_TIMER[0] = fine
+    except (OSError, AttributeError):
+        pass
 
 
 _GC_NORMAL = [None]
@@ -9823,6 +9866,7 @@ FEATURES = {
     "answer_cards": True,    # three answers on the Dashboard (M6)
     "dpi": True,             # Windows draws sharp text at 125 %+ (M8)
     "warm_start": True,      # the window is built behind the loading screen
+    "win_timer": True,       # 1 ms Windows timer while busy (5.2.3, B-06)
 }
 
 
@@ -9962,6 +10006,8 @@ FEATURE_HELP = {
     "dpi": "sharp text at 125 % and more on Windows",
     "warm_start": "the window is built and warmed behind the loading "
                   "screen; text widths are remembered between starts",
+    "win_timer": "Windows wakes the program every 1 ms (not 15.6 ms) "
+                 "only while the window is busy",
 }
 
 
@@ -13659,8 +13705,14 @@ class AlertEngine:
         self.order.appendleft(a.id)
         self._open[(kind, subject)] = a.id
         while len(self.order) > 500:
-            self.alerts.pop(self.order.pop(), None)
+            old = self.alerts.pop(self.order.pop(), None)
+            # 5.2.3 (B-27): forget it as "open" too (the map only grew)
+            if old is not None and \
+                    self._open.get((old.kind, old.subject)) == old.id:
+                del self._open[(old.kind, old.subject)]
         return a
+
+    DEBOUNCE_KEEP = 20000
 
     def _debounced(self, key, seconds):
         now = self.now()
@@ -13668,6 +13720,16 @@ class AlertEngine:
         if last is not None and now - last < seconds:
             return True
         self._debounce[key] = now
+        if len(self._debounce) > self.DEBOUNCE_KEEP:
+            # 5.2.3 (B-27): keys are per device and address, so this grew
+            # for ever; nothing waits longer than a day
+            for k in [k for k, t in self._debounce.items()
+                      if now - t > 86400]:
+                del self._debounce[k]
+            if len(self._debounce) > self.DEBOUNCE_KEEP:
+                for k in list(itertools.islice(self._debounce,
+                                               self.DEBOUNCE_KEEP // 10)):
+                    del self._debounce[k]
         return False
 
     def acknowledge(self, aid):
@@ -16718,6 +16780,7 @@ class NetworkModel:
         self.baselines = BaselineEngine(config)
         self.scans = ScanTracker()
         self.websites = {}
+        self._seen_roots = None          # registrable domains seen (B-24)
         self.remote_hosts = {}
         self.ip_to_domains = {}
         self.timeline = deque(maxlen=3000)
@@ -18043,8 +18106,19 @@ class NetworkModel:
         is_new = rec is None
         if rec is None:
             reg = registrable_domain(key)
-            new_root = not any(w.registrable == reg
-                               for w in list(self.websites.values())[-3000:])
+            # 5.2.3 (B-24): was a scan of the last 3,000 websites for every
+            # new one (up to 0.2 ms each), and a site first seen more than
+            # 3,000 websites ago got a second "First visit"
+            roots = self._seen_roots
+            if roots is None:
+                roots = self._seen_roots = dict.fromkeys(
+                    w.registrable for w in self.websites.values())
+            new_root = reg not in roots
+            if new_root:
+                roots[reg] = None
+                if len(roots) > 60000:
+                    for k in list(itertools.islice(roots, 6000)):
+                        del roots[k]
             rec = WebsiteRecord(domain=key, registrable=reg, first_seen=ts,
                                 last_seen=ts)
             cat, src = domain_category(key)
@@ -27116,14 +27190,21 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
         with contextlib.suppress(tk.TclError):
             canvas.yview_scroll(step * 2, "units")
 
+    # 5.2.3 (B-28): the wheel command is registered once; bind_all(fn)
+    # on every <Enter> registered a new Tcl command each time (a leak)
+    script = 'if {"[%s %s]" == "break"} break\n' % (
+        canvas._register(wheel, canvas._substitute, True),
+        canvas._subst_format_str)
+
     def bind(_e=None):
         for sq in seqs:
-            canvas.bind_all(sq, wheel)
+            with contextlib.suppress(tk.TclError):
+                canvas.tk.call("bind", "all", sq, script)
 
     def unbind(_e=None):
         for sq in seqs:
             with contextlib.suppress(tk.TclError):
-                canvas.unbind_all(sq)
+                canvas.tk.call("bind", "all", sq, "")
     outer.bind("<Enter>", bind)
     outer.bind("<Leave>", unbind)
     outer.canvas = canvas
@@ -32918,6 +32999,8 @@ class MapTab(BaseTab):
         except (tk.TclError, ValueError):
             return 1.0
 
+    KEEP_NETWORKS = 10
+
     def _positions_store(self):
         allpos = self.app.config.get("map.positions", {}) or {}
         return allpos.get(self.app.network_fp or "default", {})
@@ -32929,7 +33012,12 @@ class MapTab(BaseTab):
         cur[key] = [round(fx, 4), round(fy, 4)]
         if len(cur) > 2000:
             cur = dict(list(cur.items())[-2000:])
+        allpos.pop(net, None)              # most recently used last
         allpos[net] = cur
+        if len(allpos) > self.KEEP_NETWORKS:
+            # 5.2.3 (B-30): positions were kept for every network ever
+            # seen, and the whole settings file is rewritten on each drag
+            allpos = dict(list(allpos.items())[-self.KEEP_NETWORKS:])
         self.app.config.set("map.positions", allpos)
         self.app.config.save()
 
@@ -38107,9 +38195,20 @@ class JobRunner:
         for job in self.active.values():
             job.cancelled = True
 
-    def stop(self):
-        self.cancel_all()
+    def stop(self, finish=(), wait=0.0):
+        """Cancel the jobs and end the jobs thread. Kinds in `finish` (a
+        save the user asked for) may complete first, for up to `wait`
+        seconds (5.2.3, B-04: closing used to cancel a session save that
+        was under way)."""
+        keep = False
+        for job in self.active.values():
+            if job.kind in finish:
+                keep = True
+            else:
+                job.cancelled = True
         self.q.put(None)
+        if keep and wait:
+            self.thread.join(wait)
 
     def _changed(self):
         fn = getattr(self.app, "_show_jobs", None)
@@ -44284,6 +44383,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         website and connection updates of that round, and the rows it had
         already taken were never shown ("sometimes stuff doesn't load")."""
         if self.minimized():
+            self._trim_while_minimized(self.model)
             with contextlib.suppress(tk.TclError):
                 self.root.after(self._ms(700), self._flush_ui)
             return
@@ -44373,11 +44473,45 @@ proc ::mw_retheme {w map fgnew deffg} {
         setattr(m, attr, keys - now)
         return now
 
+    FLOW_BACKLOG = 4000
+    MINIMIZED_KEEP = 2000
+
+    def _trim_while_minimized(self, m):
+        """5.2.3 (B-21): nothing was taken from the model while the window
+        was minimised, so every finished connection stayed referenced and
+        the alert queue grew all night (~200 MB on a busy network), then
+        restoring the window pushed it all into the tables at once. Keep
+        only what the tables can still use; they catch up with a sliced
+        rebuild when the window is shown."""
+        try:
+            m.flows.closed_now.clear()
+            if len(m.flows.dirty) > self.MINIMIZED_KEEP:
+                m.flows.dirty = set()
+                self.tabs["connections"]._pending = True
+            if len(m.ev_alerts) > self.MINIMIZED_KEEP:
+                del m.ev_alerts[:-self.MINIMIZED_KEEP]
+            if len(m.ev_banner) > 1:
+                del m.ev_banner[:-1]
+        except Exception:                            # noqa: BLE001
+            LOG.debug("trim while minimised", exc_info=True)
+
     def _flush_flows(self, m):
-        if m.flows.dirty:
-            ids, m.flows.dirty = m.flows.dirty, set()
-            m.flows.closed_now = []
-            self.tabs["connections"].update_ids(ids)
+        m.flows.closed_now.clear()
+        if not m.flows.dirty:
+            return
+        tab = self.tabs["connections"]
+        now = time.monotonic()
+        if len(m.flows.dirty) > self.FLOW_BACKLOG and not tab.grouping() \
+                and now - getattr(self, "_flow_rebuild_at", 0.0) > 5:
+            # 5.2.3 (B-22): a big backlog (reading a capture) is one sliced
+            # refill of the newest rows, not 20,000 single-row upserts
+            m.flows.dirty = set()
+            self._flow_rebuild_at = now
+            tab._pending = True
+            tab.refresh()
+            return
+        # at most FLUSH_MAX rows per tick, like devices and websites
+        tab.update_ids(self._take_dirty(m.flows, "dirty"))
 
     def _flush_geo(self, m):
         if m.ev_geo:
@@ -45318,6 +45452,10 @@ proc ::mw_retheme {w map fgnew deffg} {
     def _drain_async_results(self):
         """The only hand-off point from background threads back to Tk."""
         drain_deferred_tk()
+        # 5.2.3 (B-29): at most ~20 ms per turn; a burst of lookups used to
+        # run in one callback. The rest follows straight away.
+        end = time.perf_counter() + 0.02
+        more = False
         try:
             while True:
                 fn = self._async_results.get_nowait()
@@ -45325,9 +45463,12 @@ proc ::mw_retheme {w map fgnew deffg} {
                     fn()
                 except Exception:                    # noqa: BLE001
                     LOG.exception("async callback")
+                if time.perf_counter() > end:
+                    more = True
+                    break
         except queue.Empty:
             pass
-        self.root.after(200, self._drain_async_results)
+        self.root.after(1 if more else 200, self._drain_async_results)
 
     def _on_data_changed(self):
         if self.model is not None:
@@ -47971,77 +48112,92 @@ proc ::mw_retheme {w map fgnew deffg} {
                               "packets.csv")
         if not path:
             return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
+
+        def table():
+            for d in rows:
+                yield [d.get("no"), datetime.fromtimestamp(
+                    d["time"]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                    d.get("proto", ""), d.get("direction", ""),
+                    d.get("src_ip", ""), d.get("src_mac", ""),
+                    d.get("dst_ip", ""), d.get("dst_mac", ""),
+                    d.get("sport", "") or "", d.get("dport", "") or "",
+                    d.get("length", ""), d.get("flow_id") or "",
+                    d.get("text", "")]
+        self._write_csv_job(
+            path, ["no", "time", "protocol", "direction", "src_ip",
+                   "src_mac", "dst_ip", "dst_mac", "sport", "dport",
+                   "length", "connection", "text"], table(), len(rows),
+            f"Exported {len(rows)} rows to {path}")
+
+    def _write_csv_job(self, path, header, rows, total, done_text):
+        """5.2.3 (B-26): the rows are taken here, on the Tk thread (packet
+        rows are plain dicts kept for the window); formatting and writing
+        them — seconds on a OneDrive or network folder — happen in a
+        background job. The file appears whole (written as .part, then
+        renamed)."""
+        def run(job):
+            tmp = path + ".part"
+            with open(tmp, "w", newline="", encoding="utf-8") as f:
                 w = safe_csv_writer(f)
-                w.writerow(["no", "time", "protocol", "direction", "src_ip",
-                            "src_mac", "dst_ip", "dst_mac", "sport", "dport",
-                            "length", "connection", "text"])
-                for d in rows:
-                    w.writerow([d.get("no"), datetime.fromtimestamp(
-                        d["time"]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                        d.get("proto", ""), d.get("direction", ""),
-                        d.get("src_ip", ""), d.get("src_mac", ""),
-                        d.get("dst_ip", ""), d.get("dst_mac", ""),
-                        d.get("sport", "") or "", d.get("dport", "") or "",
-                        d.get("length", ""), d.get("flow_id") or "",
-                        d.get("text", "")])
-        except OSError as e:
-            messagebox.showerror("Export error", str(e), parent=self.root)
-            return
-        self.status_var.set(f"Exported {len(rows)} rows to {path}")
+                w.writerow(header)
+                for i, r in enumerate(rows):
+                    w.writerow(r)
+                    if i % 2000 == 1999:
+                        job.progress(min(0.95, i / max(1, total)))
+            os.replace(tmp, path)
+            return path
+
+        def failed(e):
+            with contextlib.suppress(OSError):
+                os.remove(path + ".part")
+            if not isinstance(e, JobCancelled):
+                messagebox.showerror("Export error", str(e),
+                                     parent=self.root)
+        return self.jobs.submit("export", "Exporting CSV", run,
+                                lambda _p: self.status_var.set(done_text),
+                                failed)
 
     def _export_devices_csv(self):
         path = self._ask_save(".csv", [("CSV files", "*.csv")], "devices.csv")
         if not path:
             return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = safe_csv_writer(f)
-                w.writerow(["name", "class", "ip", "ipv6", "mac", "vendor",
-                            "confidence", "score", "status", "first_seen",
-                            "last_seen", "bytes_sent", "bytes_received",
-                            "mine", "expected", "notes"])
-                for d in self.model.registry.by_key.values():
-                    w.writerow([self.device_label(d),
-                                f"{d.class_confidence} {d.device_class}"
-                                .strip(), d.ip, " ".join(sorted(d.ipv6)),
-                                d.mac, d.vendor, d.confidence, d.score,
-                                d.state, fmt_clock(d.first_seen, True),
-                                fmt_clock(d.last_seen, True), d.bytes_up,
-                                d.bytes_down, d.mine, d.expected, d.notes])
-        except OSError as e:
-            messagebox.showerror("Export error", str(e), parent=self.root)
-            return
-        self.status_var.set(f"Exported devices to {path}")
+        rows = [[self.device_label(d),
+                 f"{d.class_confidence} {d.device_class}".strip(), d.ip,
+                 " ".join(sorted(d.ipv6)), d.mac, d.vendor, d.confidence,
+                 d.score, d.state, fmt_clock(d.first_seen, True),
+                 fmt_clock(d.last_seen, True), d.bytes_up, d.bytes_down,
+                 d.mine, d.expected, d.notes]
+                for d in self.model.registry.by_key.values()]
+        self._write_csv_job(
+            path, ["name", "class", "ip", "ipv6", "mac", "vendor",
+                   "confidence", "score", "status", "first_seen",
+                   "last_seen", "bytes_sent", "bytes_received", "mine",
+                   "expected", "notes"], rows, len(rows),
+            f"Exported devices to {path}")
 
     def _export_flows_csv(self):
         path = self._ask_save(".csv", [("CSV files", "*.csv")],
                               "connections.csv")
         if not path:
             return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = safe_csv_writer(f)
-                w.writerow(["id", "device", "transport", "local", "remote",
-                            "domain", "domain_confidence", "purpose",
-                            "bytes_up", "bytes_down", "packets", "duration_s",
-                            "status", "encryption", "first_seen",
-                            "last_seen"])
-                for fl in self.model.flows.all_flows():
-                    w.writerow([fl.fid, self.short_device_name(fl.device_key)
-                                if fl.device_key else "", fl.transport,
-                                f"{fl.local_ip}:{fl.local_port}",
-                                f"{fl.remote_ip}:{fl.remote_port}",
-                                fl.domain, fl.domain_conf, fl.purpose(),
-                                fl.bytes_out, fl.bytes_in, fl.packets,
-                                round(fl.duration, 1), fl.status_text(),
-                                fl.encrypted, fmt_clock(fl.first_seen, True),
-                                fmt_clock(fl.last_seen, True)])
-        except OSError as e:
-            messagebox.showerror("Export error", str(e), parent=self.root)
-            return
-        self.status_var.set(f"Exported connections to {path}")
+        # the values are read from the model here (it changes under the
+        # analysis worker); only the writing goes to the background job
+        rows = [[fl.fid, self.short_device_name(fl.device_key)
+                 if fl.device_key else "", fl.transport,
+                 f"{fl.local_ip}:{fl.local_port}",
+                 f"{fl.remote_ip}:{fl.remote_port}",
+                 fl.domain, fl.domain_conf, fl.purpose(),
+                 fl.bytes_out, fl.bytes_in, fl.packets,
+                 round(fl.duration, 1), fl.status_text(),
+                 fl.encrypted, fmt_clock(fl.first_seen, True),
+                 fmt_clock(fl.last_seen, True)]
+                for fl in self.model.flows.all_flows()]
+        self._write_csv_job(
+            path, ["id", "device", "transport", "local", "remote", "domain",
+                   "domain_confidence", "purpose", "bytes_up", "bytes_down",
+                   "packets", "duration_s", "status", "encryption",
+                   "first_seen", "last_seen"], rows, len(rows),
+            f"Exported connections to {path}")
 
     def _export_json(self):
         path = self._ask_save(".json", [("JSON files", "*.json")],
@@ -49162,34 +49318,63 @@ proc ::mw_retheme {w map fgnew deffg} {
         try:
             if self.history is not None and self.data_mode in ("live",
                                                                "idle"):
-                self._write_history()
+                self._write_history(background=True)
         except Exception:                            # noqa: BLE001
             LOG.exception("history snapshot")
         self.root.after(60000, self._history_tick)
 
-    def _write_history(self):
+    def _history_pieces(self):
+        """The history snapshot in small pieces (100 devices each).
+        5.2.3 (B-25): built in one go on the Tk thread every minute it
+        took 50-150 ms with 1,000 devices and 20,000 websites."""
         m = self.model
-        devs = []
-        for d in m.registry.by_key.values():
-            if not d.live or d.demo:
-                continue
-            devs.append((d.key, device_to_dict(d, False), d.first_seen,
-                         d.last_seen, [(s, e) for s, e in d.presence[-10:]],
-                         (d.bytes_up, d.bytes_down, d.packets)))
-        alerts = [(a.id, a.kind, a.severity, a.device_key, a.reason, a.when)
-                  for a in (m.alerts.alerts.get(i) for i in m.alerts.order)
-                  if a and a.live]
-        domains = [(w.registrable, w.requests, w.bytes)
-                   for w in m.websites.values()][:5000]
-        base = list(m.baselines.to_dict().items())
-        self.history.write_snapshot({"devices": devs, "alerts": alerts,
-                                     "domains": domains, "baselines": base})
-        ret = self.config.get("history.retention", "30 days")
-        days = HISTORY_RETENTION.get(ret)
-        if days is None:
-            days = int(self.config.get("history.custom_days", 14))
-        if days:
-            self.history.prune(days)
+        keys = list(m.registry.by_key)
+        for i in range(0, len(keys), 100):
+            batch = []
+            for k in keys[i:i + 100]:
+                d = m.registry.by_key.get(k)
+                if d is None or not d.live or d.demo:
+                    continue
+                batch.append(("devices", (
+                    d.key, device_to_dict(d, False), d.first_seen,
+                    d.last_seen, [(s, e) for s, e in d.presence[-10:]],
+                    (d.bytes_up, d.bytes_down, d.packets))))
+            yield batch
+        yield [("alerts", (a.id, a.kind, a.severity, a.device_key, a.reason,
+                           a.when))
+               for a in (m.alerts.alerts.get(i) for i in m.alerts.order)
+               if a and a.live]
+        yield [("domains", (w.registrable, w.requests, w.bytes))
+               for w in itertools.islice(m.websites.values(), 5000)]
+        yield [("baselines", kv) for kv in m.baselines.to_dict().items()]
+
+    def _write_history(self, background=False):
+        history = self.history
+
+        def store(pieces):
+            snap = {"devices": [], "alerts": [], "domains": [],
+                    "baselines": []}
+            for piece in pieces:
+                for kind, row in piece:
+                    snap[kind].append(row)
+            history.write_snapshot(snap)
+            ret = self.config.get("history.retention", "30 days")
+            days = HISTORY_RETENTION.get(ret)
+            if days is None:
+                days = int(self.config.get("history.custom_days", 14))
+            if days:
+                history.prune(days)
+
+        if background:
+            if "history" in self.jobs.active:
+                return None
+
+            def run(job):
+                store(job.pieces_under_gate(self.gate,
+                                            self._history_pieces()))
+            return self.jobs.submit("history", "Saving history", run)
+        store(self._history_pieces())
+        return None
 
     # ======================================================================
     #  Country lookup glue (opt-in)
@@ -49432,10 +49617,23 @@ proc ::mw_retheme {w map fgnew deffg} {
 
     def _on_close(self):
         LOG.info("shutting down")
-        with contextlib.suppress(Exception):
-            self.jobs.stop()
-        TEXT_WIDTHS.save()
         self._remember_window()
+        # 5.2.3 (B-04): the window goes away first; the saving below used
+        # to happen behind a "Not responding" window
+        with contextlib.suppress(tk.TclError):
+            self.root.withdraw()
+            self.root.update_idletasks()
+        # a save under way takes the gate piece by piece: step out of it
+        # while waiting, or the two would wait for each other
+        held = self.gate.release_all()
+        try:
+            with contextlib.suppress(Exception):
+                self.jobs.stop(finish=("session_save", "export",
+                                       "table_export", "pcap_save"),
+                               wait=20.0)
+        finally:
+            self.gate.reacquire(held)
+        TEXT_WIDTHS.save()
         try:
             if self.history is not None and self.data_mode in ("live",
                                                                "idle"):
@@ -49470,7 +49668,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         self.ring.clear()
         self.ring.wake()
         with contextlib.suppress(Exception):
-            self.deep.stop()
+            self.deep.stop(kill=True)
         if self.prober is not None:
             self.prober.run_now.set()
         if self.demo is not None:
@@ -54676,7 +54874,11 @@ class _DeepWorkerProc:
         self.costs = {}
         self.proc = None
 
-    def start(self, my_ips):
+    def start(self, my_ips, timeout=20.0):
+        self.launch()
+        self.handshake(my_ips, time.monotonic() + timeout)
+
+    def launch(self):
         script = os.path.abspath(__file__)
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
@@ -54692,7 +54894,22 @@ class _DeepWorkerProc:
                 cached_cmd(sys.executable, script, [WORKER_FLAG]),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
                 env=cached_env(env), **kw)
-        hello = _wire_recv(self.proc.stdout)
+
+    def handshake(self, my_ips, deadline):
+        """Wait for the child's "ready" until `deadline` (5.2.3, B-05:
+        the wait had no limit, so a child stuck at start — an antivirus
+        scan — stopped the analysis for good)."""
+        box = []
+        t = threading.Thread(target=lambda: box.append(
+            _wire_recv(self.proc.stdout)), daemon=True,
+            name=f"deep-w{self.idx}-hello")
+        t.start()
+        t.join(max(0.0, deadline - time.monotonic()))
+        if t.is_alive():
+            with contextlib.suppress(Exception):
+                self.proc.kill()
+            raise RuntimeError("deep worker did not answer in time")
+        hello = box[0] if box else None
         if not hello or hello[0] != "ready":
             raise RuntimeError("deep worker did not start")
         _wire_send(self.proc.stdin, ("config", sorted(my_ips)))
@@ -54763,18 +54980,32 @@ class _DeepWorkerProc:
                     pass
                 _wire_send(self.proc.stdin, ("flush", 0, now, final))
 
-    def stop(self):
+    def stop(self, kill=False, deadline=None):
+        """kill=True (closing the app): end the process at once; a worker
+        keeps no state, and one blocked writing results to a full pipe
+        never reads "stop" (5.2.3, B-04: up to 2 s per worker on the Tk
+        thread). deadline: shared time.monotonic() limit for the wait."""
         self.alive = False
         with self.cv:
             self.cv.notify_all()
-        if self.proc is not None:
+        if self.proc is None:
+            return
+        if not kill:
+            self.ask_stop()
+            left = 2.0 if deadline is None else \
+                max(0.0, deadline - time.monotonic())
+            with contextlib.suppress(Exception):
+                self.proc.wait(timeout=left)
+        if self.proc.poll() is None:
+            with contextlib.suppress(Exception):
+                self.proc.kill()
+            with contextlib.suppress(Exception):
+                self.proc.wait(timeout=0.5)
+
+    def ask_stop(self):
+        if self.proc is not None and self.proc.poll() is None:
             with contextlib.suppress(OSError, ValueError):
                 _wire_send(self.proc.stdin, ("stop",))
-            with contextlib.suppress(Exception):
-                self.proc.wait(timeout=2)
-            if self.proc.poll() is None:
-                with contextlib.suppress(Exception):
-                    self.proc.kill()
 
 
 class DeepEngine:
@@ -54784,6 +55015,7 @@ class DeepEngine:
     bucket: deep-analysed, skipped by budget, or lost with a worker."""
 
     QUEUE_CAP = 20000
+    START_TIMEOUT = 30.0            # all worker processes together
 
     def __init__(self, store=None):
         self.store = store or DeepStore()
@@ -54841,11 +55073,17 @@ class DeepEngine:
         n = max(1, min(self.cores, (os.cpu_count() or 1) - 1))
         if self.want_process and (os.cpu_count() or 1) > 1:
             try:
+                # 5.2.3 (B-05): all children start together (each one
+                # compiles or loads the program: ~2.5 s on Windows, which
+                # used to add up one after another on the analysis thread)
                 ws = []
                 for i in range(n):
                     w = _DeepWorkerProc(self, i)
-                    w.start(self.my_ips)
+                    w.launch()
                     ws.append(w)
+                deadline = time.monotonic() + self.START_TIMEOUT
+                for w in ws:
+                    w.handshake(self.my_ips, deadline)
                 self.workers, self.backend = ws, "process"
                 return
             except Exception as e:                   # noqa: BLE001
@@ -54853,7 +55091,7 @@ class DeepEngine:
                 LOG.warning("deep analysis: %s; using a thread",
                             self.last_error)
                 for w in locals().get("ws", []):
-                    w.stop()
+                    w.stop(kill=True)
         self.analyzer = DeepAnalyzer(self.my_ips,
                                      total=self.ram_mb * 1024 * 1024 // 2)
         self.thread = threading.Thread(target=self._thread_loop, daemon=True,
@@ -55023,12 +55261,18 @@ class DeepEngine:
                 w.stop()
             self.workers, self.backend = [], "off"
 
-    def stop(self):
+    def stop(self, kill=False):
+        """Stops every worker under one shared 2 s deadline (5.2.3: was
+        2 s each, one after another); kill=True when the app closes."""
         self.stop_flag = True
         with self.cv:
             self.cv.notify_all()
+        if not kill:
+            for w in self.workers:
+                w.ask_stop()
+        deadline = time.monotonic() + 2.0
         for w in self.workers:
-            w.stop()
+            w.stop(kill=kill, deadline=deadline)
         self.workers = []
         self.backend = "off"
 
@@ -60576,6 +60820,75 @@ def test_b02_promisc_refused_and_probe_order(ctx):
 
 
 @self_test(slow=False)
+def test_b10_atomic_write_retries_a_busy_target(ctx):
+    """5.2.3 (B-10): on Windows an antivirus holding the target for a
+    moment made os.replace fail and the save was lost, leaving a .tmp
+    file behind. The replace is retried briefly; on a real failure the
+    temporary file is removed and the error still reaches the caller."""
+    target = ctx.path("b10.json")
+    atomic_write_text(target, "old")
+    real, calls = os.replace, []
+
+    def flaky(a, b):
+        calls.append(a)
+        if len(calls) < 3:
+            raise PermissionError(13, "in use")
+        real(a, b)
+    os.replace = flaky
+    try:
+        atomic_write_text(target, "new")
+        assert len(calls) == 3
+        with open(target, encoding="utf-8") as f:
+            assert f.read() == "new"
+
+        def never(a, b):
+            raise PermissionError(13, "in use")
+        os.replace = never
+        try:
+            atomic_write_bytes(target, b"lost")
+            raise AssertionError("the failure must reach the caller")
+        except PermissionError:
+            pass
+    finally:
+        os.replace = real
+    left = [n for n in os.listdir(os.path.dirname(target))
+            if n.startswith("b10.json.tmp")]
+    assert not left, left
+    with open(target, encoding="utf-8") as f:
+        assert f.read() == "new"
+
+
+@self_test(slow=False)
+def test_b24_first_visit_once_and_bounded_maps(ctx):
+    """5.2.3 (B-24/B-27): "First visit to …" is said once per site, even
+    when 3,000+ other websites came in between (it was said again, and
+    every new website scanned the last 3,000); the alert engine's
+    debounce and open-alert maps stay bounded."""
+    t = [100000.0]
+    m = NetworkModel(ctx.cfg(), now_fn=lambda: t[0])
+    m.capture_started = t[0] - 100000
+    said = []
+    m.push_timeline = lambda kind, sev, text, *a, **k: said.append(text)
+    m.register_website("www.google.com", None, None, "DNS")
+    for i in range(3200):
+        m.register_website(f"host{i}.site{i}.example", None, None, "DNS")
+    m.register_website("mail.google.com", None, None, "DNS")
+    assert sum("google.com" in s for s in said) == 1, \
+        [s for s in said if "google" in s]
+    assert sum("site7.example" in s for s in said) == 1
+    ae = m.alerts
+    for i in range(ae.DEBOUNCE_KEEP + 50):
+        t[0] += 1
+        ae._debounced(f"dnschg:{i}", 600)
+    assert len(ae._debounce) <= ae.DEBOUNCE_KEEP
+    assert ae._debounced(f"dnschg:{ae.DEBOUNCE_KEEP + 49}", 600)
+    for i in range(600):
+        ae._add("test_kind", "INFO", "", f"r{i}", "", "", [],
+                subject=f"s{i}")
+    assert len(ae.order) == 500 and len(ae._open) == 500, len(ae._open)
+
+
+@self_test(slow=False)
 def test_kernel_counters_and_coverage(ctx):
     """Kernel drops are summed when the OS reports them and shown as "not
     reported" (never as zero) when it doesn't. Coverage puts every packet
@@ -62990,6 +63303,38 @@ def _gs_capture_start_async(app, ctx):
         app.last_fault = saved_fault
 
 
+@gui_test_step("minimised window keeps memory bounded (5.2.3, B-21/B-22)")
+def _gs_minimised_trim(app, ctx):
+    m = app.model
+    saved = (set(m.flows.dirty), list(m.ev_alerts), list(m.ev_banner))
+    try:
+        m.flows.dirty = set(range(10 ** 7, 10 ** 7 + app.MINIMIZED_KEEP + 5))
+        m.flows.closed_now.extend([object()] * 50)
+        m.ev_alerts.extend([object()] * (app.MINIMIZED_KEEP + 5))
+        m.ev_banner.extend([("a", "info"), ("b", "info")])
+        app._trim_while_minimized(m)
+        assert not m.flows.dirty and not m.flows.closed_now
+        assert len(m.ev_alerts) == app.MINIMIZED_KEEP
+        assert m.ev_banner == [("b", "info")]
+        assert app.tabs["connections"]._pending
+        # a backlog bigger than the table is one sliced refill
+        m.flows.dirty = set(range(10 ** 7, 10 ** 7 + app.FLOW_BACKLOG + 5))
+        app._flow_rebuild_at = 0.0
+        t0 = time.perf_counter()
+        app._flush_flows(m)
+        assert not m.flows.dirty
+        assert time.perf_counter() - t0 < 0.25
+        # a small one goes in pieces of at most FLUSH_MAX
+        m.flows.dirty = set(range(10 ** 7, 10 ** 7 + app.FLUSH_MAX + 7))
+        app._flow_rebuild_at = time.monotonic()
+        app._flush_flows(m)
+        assert len(m.flows.dirty) == 7
+        _gui_pump(app.root, 0.5)
+    finally:
+        m.flows.dirty, m.ev_alerts[:], m.ev_banner[:] = saved
+        m.flows.dirty = set()
+
+
 @gui_test_step("history store records live evidence (and survives reopen)")
 def _gs_history(app, ctx):
     root = app.root
@@ -63222,8 +63567,15 @@ def _gs_this_pc(app, ctx):
         sink(raw, time.time(), lt)
     assert _gui_pump(root, 0.3, lambda: not len(app.ring) and
                      not app.worker.busy, timeout=30)
+    # a network check started by an earlier step can land meanwhile and
+    # add this machine's real address to "my addresses", which replaces
+    # the scenario's; the step is about the scenario's computer
+    m.set_identity(my_ips=ident[1], local_nets=ident[3])
+
+    def _mine():
+        return [f for f in m.flows.all_flows() if f.local_ip in ident[1]]
     # programs: pretend the OS table names this computer's connections
-    mine = [f for f in m.flows.all_flows() if f.local_ip in m.my_ips]
+    mine = _mine()
     assert mine, "the scenario has connections from this computer"
     pm = app.procmap
     _gui_pump(root, 0.05, lambda: not pm.busy, timeout=10)
@@ -63842,6 +64194,8 @@ def _gs_mail_canary(app, ctx):
         outputs["html report"] = ReportBuilder(app).build("full")
         app._ask_save = lambda *a, **k: ctx.path("pk.csv")
         app._export_csv(False)
+        assert _gui_pump(root, 0, lambda: os.path.exists(ctx.path(
+            "pk.csv")) and not app.jobs.busy(), timeout=30)
         outputs["csv"] = open(ctx.path("pk.csv"), encoding="utf-8").read()
         outputs["debug bundle"] = app.debug_bundle_text(masked=False)
         outputs["diagnostics"] = DiagnosticsWindow.collect(app)
