@@ -20,12 +20,21 @@ The checksums match the owner's offline archive (`All_MiniWireshark_Version`).
 - Versions 1.x and 2.0.0 come from before this repository's history; their files are in [`legacy/`](../legacy/).
 - Every other version is taken straight from the listed commit.
 
-## Publishing the releases
+## How the releases are published
 
-The releases are created by the **Publish archived releases** workflow, which only runs when started by hand:
+All ten versions are published on the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases), each with its `.py` file and a `.sha256` file. 5.1.2 is marked *latest*; 4.0.0-dev and 5.1.2-rc.5 are pre-releases.
+
+They were created by the **Publish archived releases** workflow, which only runs when started by hand:
 
 1. Open **Actions → Publish archived releases → Run workflow** on `main`.
 2. Optionally tick **dry run** first: it checks every file against the checksums above and prints what it would publish.
-3. Run it for real. It creates each tag and release, oldest first, and attaches the `.py` file and a `.sha256` file. 5.1.2 is marked *latest*.
+3. Run it for real. It checks every file first and publishes nothing if one doesn't match. Then it creates each tag and release, oldest first.
 
-Releases that already exist are skipped, so the workflow can be run again safely. The list lives in [`.github/archive-releases.json`](../.github/archive-releases.json), and the notes in [`.github/release-notes/`](../.github/release-notes/).
+Releases that already exist are skipped, so the workflow can be run again safely, for example after adding a new version. The list lives in [`.github/archive-releases.json`](../.github/archive-releases.json), and the notes in [`.github/release-notes/`](../.github/release-notes/).
+
+### Adding a new version
+
+1. Add an entry to `.github/archive-releases.json` with its tag, commit, source path and SHA-256.
+2. Add its notes as `.github/release-notes/<tag>.md`, and move `"latest": true` to it.
+3. Add a row to the table above and a section to the [changelog](../CHANGELOG.md).
+4. After the change is merged, run the workflow.
