@@ -2723,7 +2723,7 @@ def warm_up_before_window(loader, cfg):
     # the compiled copy itself: a short helper writes it now, so the first
     # Full Power worker starts in 0.2 s, not 1 s. Waited for here (up to
     # 20 s), so it does not compete with building the window
-    proc = prepare_compiled_copy()
+    proc = prepare_compiled_copy(cfg=cfg)
     if proc is not None:
         loader.warm_step("Preparing the helper processes — once per "
                          "version", 0)
@@ -2741,14 +2741,24 @@ def warm_up_before_window(loader, cfg):
     return done
 
 
-def prepare_compiled_copy(popen=None):
+def prepare_compiled_copy(popen=None, cfg=None):
     """Start a helper that writes the compiled copy (and exits at once) if
-    the copy is missing or older than the file. -> the process, or None."""
+    the copy is missing or older than the file. Tried once per version of
+    the file (with `cfg`): a copy that cannot be written (a read-only data
+    folder) must not cost every start a wait. -> the process, or None."""
     if SAFE_MODE or not FEATURES.get("warm_start", True):
         return None
     try:
-        if _pyc_fresh(compiled_copy_path(), os.stat(SCRIPT_PATH)):
+        st = os.stat(SCRIPT_PATH)
+        if _pyc_fresh(compiled_copy_path(), st):
             return None
+        stamp = f"{int(st.st_mtime)}:{st.st_size}"
+        if cfg is not None:
+            if cfg.get("performance.compiled_copy_tried", "") == stamp:
+                return None
+            cfg.set("performance.compiled_copy_tried", stamp)
+            with contextlib.suppress(Exception):
+                cfg.save()
         return (popen or subprocess.Popen)(
             cached_cmd(sys.executable, SCRIPT_PATH, [WORKER_FLAG]),
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -60837,7 +60847,7 @@ def t_warm_up_on_the_loading_screen(ctx):
     real_tw = globals()["TEXT_WIDTHS"]
     globals()["TEXT_WIDTHS"] = TextWidths(ctx.path("tw.json"))
     real_prep = globals()["prepare_compiled_copy"]
-    globals()["prepare_compiled_copy"] = lambda popen=None: None
+    globals()["prepare_compiled_copy"] = lambda popen=None, cfg=None: None
     try:
         ld = FakeLoader()
         done = warm_up_before_window(ld, cfg)
@@ -60882,6 +60892,13 @@ def t_warm_up_on_the_loading_screen(ctx):
         assert prepare_compiled_copy(
             popen=lambda cmd, **kw: started.append(cmd)) is None
         assert len(started) == 1
+        # with the settings: one try per version of the file, not per start
+        globals()["compiled_copy_path"] = lambda: ctx.path("none2.pyc")
+        c2 = AppConfig(path=ctx.path("tried.json"))
+        fake = lambda cmd, **kw: started.append(cmd) or "proc"   # noqa: E731
+        assert prepare_compiled_copy(popen=fake, cfg=c2) == "proc"
+        assert prepare_compiled_copy(popen=fake, cfg=c2) is None
+        assert len(started) == 2
     finally:
         globals()["compiled_copy_path"] = real_path
     # the capture start: the first quiet wait ends it, not a 0.2 s sleep
@@ -61493,9 +61510,11 @@ BENCH_SCENARIOS = OrderedDict([
 ])
 
 # Regression guards for --bench-gui --check: the 5.0.2 baseline measured in
-# the Linux test environment (Oct 2026) plus 25 % for run-to-run noise.
-# PROVISIONAL until the M0 run on the reference laptop; each milestone that
-# reaches a 5.1.2 target tightens its row (targets: BENCH_TARGETS).
+# the Linux test environment (Oct 2026) plus 25 % for run-to-run noise;
+# each milestone that reached a 5.1.2 target tightened its row (targets:
+# BENCH_TARGETS). Frozen for the 5.1.2 release on that environment: the
+# owner released without the reference-laptop run, so a slower machine
+# may need its own --release-gate run before these are read as failures.
 BENCH_LIMITS = {
     # 5.0.2 medians of three runs (Linux test environment, Oct 2026):
     # import 509, session load 548, save 332, text size 326, theme 137,
@@ -61508,13 +61527,19 @@ BENCH_LIMITS = {
     # 113, model upkeep 11.5 ms; idle Dashboard 3.4 %. Freeze limits are
     # not set below 60 ms (heartbeat jitter on a busy machine), except
     # model upkeep (30), which is split into steps of a few ms.
+    # 5.1.2 release (rc.12 gate, medians): import 207 (runs 98-223),
+    # session load 91, save 27, text size 55, theme 34, switch 69, upkeep
+    # 11 ms; idle 2.6 %; 210 MB (rc.10 left the compiler's memory behind:
+    # 365 -> 265 MB, so that gain cannot slip back unnoticed; Windows
+    # keeps 365: there the window's own process still holds the compiler's
+    # memory, see start_from_compiled_copy); search 6 ms.
     "S1": {"import.stall_ms": 260, "session_load.stall_ms": 225,
            "session_save.stall_ms": 60, "text_size.stall_ms": 105,
            "theme.stall_ms": 145, "switch.stall_ms": 115,
            "model_tick.stall_ms": 30, "idle_cpu_dash_pct": 4.3,
-           "rss_loaded_mb": 365, "search_ms": 12.5},
+           "rss_loaded_mb": 365 if IS_WINDOWS else 265, "search_ms": 12.5},
 }
-BENCH_LIMITS_PROVISIONAL = True
+BENCH_LIMITS_PROVISIONAL = False
 BENCH_TARGETS = {
     "S1": {"import.stall_ms": 100, "import.p99_ms": 40,
            "session_load.stall_ms": 100, "session_save.stall_ms": 100,
@@ -66002,6 +66027,15 @@ def main():
         warm_up_before_window(loader, cfg)
     except Exception:                                # noqa: BLE001
         LOG.exception("warm-up before the window")
+    try:
+        alive = bool(root.winfo_exists())
+    except tk.TclError:
+        alive = False
+    if not alive:                     # closed during the loading screen
+        LOG.info("closed during the loading screen")
+        if BOOT is not None:
+            BOOT.mark(outcome="user_exit")
+        return
     t_ready = time.perf_counter() - _T_START
     LAUNCH_TIMES["ready"] = t_ready
 
