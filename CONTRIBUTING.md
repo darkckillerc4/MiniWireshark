@@ -31,3 +31,7 @@ Never commit captures, sessions, logs or `miniwireshark_config.json`. They can c
 ## Reporting bugs
 
 Use the issue templates. A **debug bundle** from the Diagnostics window masks addresses and secrets and is the most useful thing you can attach.
+
+## Releasing
+
+Releases are automatic. Set `SCRIPT_VERSION` in `miniwireshark.py`, change the changelog heading from `## [Unreleased] — x.y.z` to `## [x.y.z] — YYYY-MM-DD`, and merge to `main`. The **Release** workflow publishes the `.py` file and its `.sha256`, and records the version in the README and [docs/VERSIONS.md](docs/VERSIONS.md). Notes come from `.github/release-notes/vx.y.z.md` if you write one, otherwise from the changelog.

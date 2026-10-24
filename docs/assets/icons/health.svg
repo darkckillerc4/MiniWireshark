@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48" role="img" aria-label="health">
+  <rect width="48" height="48" rx="12" fill="#1b3354"/>
+  <g transform="translate(6 6) scale(0.75)" fill="none" stroke="#7fbaff" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M5 26h9l4-9 6 18 5-13 3 4h11"/>
+  </g>
+</svg>

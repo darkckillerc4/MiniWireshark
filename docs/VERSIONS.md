@@ -32,9 +32,13 @@ They were created by the **Publish archived releases** workflow, which only runs
 
 Releases that already exist are skipped, so the workflow can be run again safely, for example after adding a new version. The list lives in [`.github/archive-releases.json`](../.github/archive-releases.json), and the notes in [`.github/release-notes/`](../.github/release-notes/).
 
-### Adding a new version
+### New versions are published automatically
 
-1. Add an entry to `.github/archive-releases.json` with its tag, commit, source path and SHA-256.
-2. Add its notes as `.github/release-notes/<tag>.md`, and move `"latest": true` to it.
-3. Add a row to the table above and a section to the [changelog](../CHANGELOG.md).
-4. After the change is merged, run the workflow.
+The **Release** workflow ([`release.yml`](../.github/workflows/release.yml)) runs on every push to `main` that changes `miniwireshark.py` or `CHANGELOG.md`. It publishes `SCRIPT_VERSION` once that version is finished:
+
+1. `CHANGELOG.md` has a `## [x.y.z] — date` section for it. While the heading says `[Unreleased]`, nothing is published.
+2. No release `vx.y.z` exists yet.
+
+It then creates the tag and the release with `miniwireshark-x.y.z.py` and its `.sha256`, using `.github/release-notes/vx.y.z.md` as the notes when that file exists, or else the changelog section. Finally it commits the new row to this table, the README badge and version table, and `.github/archive-releases.json`. A version with a `-` in it (`5.3.0-rc.1`) becomes a pre-release and doesn't change *latest*.
+
+So releasing is: set `SCRIPT_VERSION`, turn `[Unreleased]` into `[x.y.z] — date` in the changelog, and merge. To check first, run **Actions → Release → Run workflow** with **dry run** ticked.
