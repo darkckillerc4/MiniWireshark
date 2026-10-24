@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/darkckillerc4/MiniWireshark/releases/latest"><img alt="Latest release 5.1.2" src="https://img.shields.io/badge/release-5.1.2-4ea1ff"></a>
+  <a href="https://github.com/darkckillerc4/MiniWireshark/releases/latest"><img alt="Latest release 5.2.3" src="https://img.shields.io/badge/release-5.2.3-4ea1ff"></a>
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-555">
   <img alt="Single file" src="https://img.shields.io/badge/distribution-one%20.py%20file-7fbaff">
@@ -148,7 +148,8 @@ Every release is a single `.py` file attached to its [GitHub release](https://gi
 
 | Version | Date | Highlights |
 |---|---|---|
-| **5.1.2** (latest) | 2026-10-24 | The window stays responsive under load, 150 MB less memory, warm start, release gate |
+| **5.2.3** (latest) | 2026-10-24 | A reliability release: capture starts without freezing, devices are identified correctly on PCs with VPN and virtual adapters, and copies of different versions can share a folder safely |
+| 5.1.2 | 2026-10-24 | The window stays responsive under load, 150 MB less memory, warm start, release gate |
 | 5.0.2 | 2026-10-21 | Layout and loading bug campaign across languages, themes and screen sizes |
 | 5.0.1 | 2026-10-20 | Expert-list actions, go-to-packet, safer exports |
 | 5.0.0 | 2026-10-20 | Packet workspace, Full Power, protocol exchanges, mail analysis, command palette |

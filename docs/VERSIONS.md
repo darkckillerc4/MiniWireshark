@@ -4,7 +4,8 @@ Every MiniWireshark release is a single Python file. The table lists each archiv
 
 | Version | Release | Lines | SHA-256 | Source |
 |---|---|---:|---|---|
-| **5.1.2** (latest) | [v5.1.2](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.1.2) | 66,318 | `2adadab93ce4f86938cd45e82be2f824163090fc660732b21ce8048efe327534` | `304948d` |
+| **5.2.3** (latest) | [v5.2.3](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.2.3) | 67,711 | `41bc3a1a0f0248c25d6dd98525940c9d5a2d3e39673ab81d92ec4aadacb9c388` | `d0832b8` |
+| 5.1.2 | [v5.1.2](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.1.2) | 66,318 | `2adadab93ce4f86938cd45e82be2f824163090fc660732b21ce8048efe327534` | `304948d` |
 | 5.1.2-rc.5 | [v5.1.2-rc.5](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.1.2-rc.5) (pre-release) | 64,605 | `6ac76e5e6655b66205cccba6100bfe1f23ba899b3e35e92797a0f0df23c11ff7` | `759be4b` |
 | 5.0.2 | [v5.0.2](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.0.2) | 52,410 | `77c1909a1451db4d1a60fd5a520a09be5df182ed8f4314cedcc85f7746bb6f67` | `49471fe` |
 | 5.0.1 | [v5.0.1](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.0.1) | 50,509 | `f55e195e21610e18d8b0b4c8f80e5bf74fd19d6840aedc54c6a4b02aa87cb93b` | `f1f0e24` |
