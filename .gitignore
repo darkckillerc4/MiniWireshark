@@ -218,3 +218,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# MiniWireshark runtime data and settings (never commit: may hold network data)
+miniwireshark_data/
+miniwireshark_config.json*
+*.mwsession.json
+*.pcap
+*.pcapng
