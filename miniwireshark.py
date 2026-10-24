@@ -6103,7 +6103,9 @@ def cvd_lab(hexcol, mode=""):
 
 
 def cvd_delta(a, b, mode=""):
-    return math.dist(cvd_lab(a, mode), cvd_lab(b, mode))
+    # math.dist is Python 3.8+; MiniWireshark runs on 3.7
+    return math.sqrt(sum((p - q) ** 2 for p, q in zip(
+        cvd_lab(a, mode), cvd_lab(b, mode))))
 
 
 def wcag_contrast(a, b):
@@ -44808,6 +44810,10 @@ proc ::mw_retheme {w map fgnew deffg} {
         if which == "slow":
             def dock():
                 self.inspect("slow", "")
+                # a ranking needs room: an Inspector left narrow by an
+                # earlier resize is widened (found on Tk 9 and in a GUI
+                # step run on its own)
+                self.root.after_idle(self._inspector_width)
                 win.destroy()
             win._mw_dock = dock
             ttk.Button(bar, text="Show in the inspector",
@@ -50663,11 +50669,14 @@ def release_check(path=None):
     checks = []
     try:
         import ast
-        ast.parse(text, feature_version=(3, 7))
-        ast.parse(text, feature_version=(3, 8))
+        ast.parse(text, feature_version=(3, 7))  # novermin (guarded)
+        ast.parse(text, feature_version=(3, 8))  # novermin (guarded)
         checks.append(("Python 3.7 and 3.8 grammar", True, ""))
     except SyntaxError as e:
         checks.append(("Python 3.7 and 3.8 grammar", False, str(e)))
+    except TypeError:            # Python 3.7: no feature_version
+        checks.append(("Python 3.7 and 3.8 grammar", False,
+                       "run the release check with Python 3.8 or newer"))
     m = re.search(r'^SCRIPT_VERSION = "([^"]+)"', text, re.M)
     checks.append(("Version string", bool(m), m.group(1) if m else ""))
     checks.append(("Release keys listed", bool(RELEASE_KEYS),
@@ -56647,10 +56656,12 @@ def t_python38_grammar(ctx):
     to the managed runtime, so the whole file keeps their syntax).
     step_python still accepts 3.7, so 3.7 grammar is checked too."""
     import ast
+    if sys.version_info < (3, 8):
+        return "skip"           # feature_version= arrived in Python 3.8
     with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
         src = f.read()
     for ver in ((3, 7), (3, 8)):
-        ast.parse(src, feature_version=ver)
+        ast.parse(src, feature_version=ver)  # novermin (guarded)
 
 
 def toc_and_banners(src):
@@ -60759,26 +60770,26 @@ def t_text_widths_remembered(ctx):
     assert "Device" in kept and "nas-kitchen.local" not in kept
     # the next start: no measuring but the probe
     tw2 = TextWidths(path)
-    tw2.env_key = staticmethod(lambda widget=None: "scaling|x11|8.6|linux")
+    tw2.env_key = lambda widget=None: "scaling|x11|8.6|linux"
     assert tw2.load() == 1
     f2 = FakeFont()
     assert tw2.width(f2, "Device") == 42 and f2.calls == 1
     assert tw2.hits == 1 and tw2.misses == 0
     # same name, different font: thrown away and measured again
     tw3 = TextWidths(path)
-    tw3.env_key = staticmethod(lambda widget=None: "scaling|x11|8.6|linux")
+    tw3.env_key = lambda widget=None: "scaling|x11|8.6|linux"
     tw3.load()
     f3 = FakeFont(k=8)
     assert tw3.width(f3, "Device") == 48 and tw3.misses == 1
     # another screen setup: nothing is used
     tw4 = TextWidths(path)
-    tw4.env_key = staticmethod(lambda widget=None: "2.0|win32|8.6|win32")
+    tw4.env_key = lambda widget=None: "2.0|win32|8.6|win32"
     assert tw4.load() == 0
     # broken file: ignored
     with open(path, "w") as fh:
         fh.write("{not json")
     tw5 = TextWidths(path)
-    tw5.env_key = staticmethod(lambda widget=None: "scaling|x11|8.6|linux")
+    tw5.env_key = lambda widget=None: "scaling|x11|8.6|linux"
     assert tw5.load() == 0 and tw5.width(FakeFont(), "Ab") == 14
     # switched off: plain measuring, nothing written
     old = FEATURES["warm_start"]
@@ -64137,7 +64148,9 @@ def gt_m2_background(app, ctx):
     assert len(MW_FONTS) >= 8, sorted(MW_FONTS)
     app._apply_text_size("Large")
     _gui_pump(root, 0.1, until=lambda: app._text_size_job is None, timeout=5)
-    big = tkfont.nametofont(mw_font(11, "bold")).actual()["size"]
+    # the size asked for (a Tk without scalable fonts, such as a build
+    # without Xft, draws every size with the same fixed font)
+    big = int(tkfont.nametofont(mw_font(11, "bold")).cget("size"))
     app._apply_text_size("Normal")
     _gui_pump(root, 0.1, until=lambda: app._text_size_job is None, timeout=5)
     assert abs(big) > 11, big
@@ -64281,7 +64294,8 @@ def gt_m3_table_kit(app, ctx):
     _gui_pump(root, 0.3)
     dt.filter_var.set("zzz-no-such-device")
     dt.rebuild()
-    _gui_pump(root, 0.3)
+    _gui_pump(root, 0.3, until=lambda: "No rows match" in kit.empty_text(),
+              timeout=5)
     assert "No rows match" in kit.empty_text(), kit.empty_text()
     dt.filter_var.set("")
     dt.rebuild()
@@ -65246,7 +65260,10 @@ def gt_rc2_polish(app, ctx):
         assert not win.winfo_exists()
         assert app.inspector_visible
         assert app.inspector.current == ("slow", "")
-        _gui_pump(root, 0.3)
+        want = min(px(Inspector.WIDTH), app.body.winfo_width() // 3)
+        _gui_pump(root, 0.3, until=lambda: app.inspector.frame.winfo_width()
+                  >= min(px(Inspector.WIDTH), app.body.winfo_width() // 3)
+                  - 30, timeout=5)
         want = min(px(Inspector.WIDTH), app.body.winfo_width() // 3)
         assert app.inspector.frame.winfo_width() >= want - 30, (
             app.inspector.frame.winfo_width(), want)
@@ -65885,7 +65902,7 @@ def _install_thread_excepthook():
                   "".join(traceback.format_exception(
                       args.exc_type, args.exc_value, args.exc_traceback)))
     if hasattr(threading, "excepthook"):
-        threading.excepthook = hook
+        threading.excepthook = hook  # novermin (guarded)
 
 
 def main():
