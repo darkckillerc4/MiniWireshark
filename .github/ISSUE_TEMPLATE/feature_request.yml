@@ -1,0 +1,19 @@
+name: Feature request
+description: An idea to make MiniWireshark more useful
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to understand or do?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would help?
+  - type: dropdown
+    id: who
+    attributes:
+      label: Who is it for?
+      options: [Beginners, Advanced users, Both]
