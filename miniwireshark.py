@@ -94,6 +94,7 @@ import itertools
 import io
 import ipaddress
 import json
+import locale
 import logging
 import logging.handlers
 import marshal
@@ -140,6 +141,7 @@ NO_ELEVATE_FLAG = "--no-elevate"
 NO_ELEVATE_ENV = "MINIWIRESHARK_NO_ELEVATE"
 
 IS_WINDOWS = platform.system() == "Windows"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # B-45
 IS_MAC = platform.system() == "Darwin"
 
 try:
@@ -1676,7 +1678,8 @@ class PrivatePackages:
     def _has_pip(self):
         try:
             r = subprocess.run([self.python, "-m", "pip", "--version"],
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, text=True, timeout=30,
+                               creationflags=NO_WINDOW)
             return r.returncode == 0
         except (OSError, subprocess.SubprocessError):
             return False
@@ -1705,7 +1708,7 @@ class PrivatePackages:
                 progress("Packages", 0.2, f"Installing {key} {ver}…", {})
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True,
-                                   timeout=timeout)
+                                   timeout=timeout, creationflags=NO_WINDOW)
             except subprocess.TimeoutExpired:
                 raise RuntimeError_("network", f"pip took more than "
                                                f"{timeout} s")
@@ -1974,6 +1977,43 @@ def _authenticode_status(path):
     return _authenticode_info(path)[0]
 
 
+def _run_as_admin_wait(exe, params, timeout):
+    """Run `exe` through the UAC prompt and wait for it (Windows only).
+    Returns its exit code; raises OSError when it can't start (the prompt
+    was declined) and subprocess.TimeoutExpired after `timeout` s."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _SEI(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
+                    ("hwnd", wintypes.HANDLE), ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD),
+                    ("hIcon", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE)]
+    sei = _SEI(cbSize=ctypes.sizeof(_SEI), fMask=0x40,  # NOCLOSEPROCESS
+               lpVerb="runas", lpFile=exe, lpParameters=params, nShow=1)
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)) or \
+            not sei.hProcess:
+        raise ctypes.WinError()
+    k32 = ctypes.windll.kernel32
+    try:
+        if k32.WaitForSingleObject(sei.hProcess,
+                                   int(timeout * 1000)) != 0:
+            raise subprocess.TimeoutExpired(exe, timeout)
+        code = wintypes.DWORD()
+        k32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code))
+        return int(code.value)
+    finally:
+        k32.CloseHandle(sei.hProcess)
+
+
 def _install_npcap(loader, state):
     """Download and run the official Npcap installer. The free edition of
     Npcap does not allow silent installs, so the installer window is shown
@@ -1985,7 +2025,11 @@ def _install_npcap(loader, state):
     state.note_attempt("npcap")
     ver = _latest_npcap_version()
     url = f"https://npcap.com/dist/npcap-{ver}.exe"
-    exe = os.path.join(tempfile.gettempdir(), f"npcap-{ver}.exe")
+    # 5.2.3 (B-08): a fresh folder with an unpredictable name, not a fixed
+    # name in TEMP that another program could swap between the signature
+    # check and the run
+    exe = os.path.join(tempfile.mkdtemp(prefix="mw-npcap-"),
+                       f"npcap-{ver}.exe")
     loader.post_log(f"  Downloading the capture driver (Npcap {ver}) ...",
                     None)
     loader.post_log(f"  {url}", "detail")
@@ -2020,12 +2064,25 @@ def _install_npcap(loader, state):
                     "Next / I Agree / Install. Keep the default options.",
                     None)
     try:
-        r = subprocess.run([exe, "/winpcap_mode=yes"], timeout=1200)
+        try:
+            code = subprocess.run([exe, "/winpcap_mode=yes"],
+                                  timeout=1200).returncode
+        except OSError as e:
+            if getattr(e, "winerror", None) != 740:
+                raise
+            # 5.2.3 (B-08): "requires elevation" — ask Windows to run it
+            # as administrator (the UAC prompt) instead of failing
+            code = _run_as_admin_wait(exe, "/winpcap_mode=yes", 1200)
     except subprocess.TimeoutExpired:
         return False, "The Npcap installer didn't finish within 20 minutes."
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"Installer failed to start: {e}"
-    LOG.info("Npcap installer exit code %s", r.returncode)
+    finally:
+        with contextlib.suppress(OSError):
+            os.remove(exe)
+            os.rmdir(os.path.dirname(exe))
+    LOG.info("Npcap installer exit code %s", code)
+    r = types.SimpleNamespace(returncode=code)
     if r.returncode == 3010:
         state.data["npcap"] = {"reboot_pending_since": time.time(),
                                "boot_time": _boot_time()}
@@ -3801,7 +3858,8 @@ class RuntimeManager:
         try:
             r = subprocess.run([exe, "-c", "import sys, tkinter, venv; "
                                 "print(sys.version_info[:2])"],
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, text=True, timeout=30,
+                               creationflags=NO_WINDOW)
             return r.returncode == 0 and "(3, 14)" in r.stdout
         except (OSError, subprocess.SubprocessError):
             return False
@@ -9486,11 +9544,6 @@ def score_interfaces(default_iface_name="", gateway_ip=""):
 def explain_choice(rec):
     if not rec:
         return ""
-    good = [r for r in rec["reasons"] if not r.startswith(("it has no",
-                                                           "it looks",
-                                                           "it is the",
-                                                           "it is dis",
-                                                           "it only"))]
     return "Picked because " + explain_reasons(rec)
 
 
@@ -12701,9 +12754,7 @@ def current_ssid():
                      r"^yes:(.+)$"))
     for cmd, pat in cmds:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=6, creationflags=getattr(
-                                   subprocess, "CREATE_NO_WINDOW", 0))
+            r = run_console(cmd, timeout=6)
         except (OSError, subprocess.SubprocessError):
             continue
         for line in (r.stdout or "").splitlines():
@@ -12721,9 +12772,7 @@ def os_neighbor_mac(ip):
             [["ip", "neigh", "show", ip], ["arp", "-n", ip]])
     for cmd in cmds:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=5, creationflags=getattr(
-                                   subprocess, "CREATE_NO_WINDOW", 0))
+            r = run_console(cmd, timeout=5)
         except (OSError, subprocess.SubprocessError):
             continue
         m = re.search(r"([0-9a-fA-F]{2}([:-])(?:[0-9a-fA-F]{2}\2){4}"
@@ -14187,6 +14236,40 @@ class AlertEngine:
 # ============================================================================
 #  This computer's Wi-Fi link (read-only questions to the operating system)
 # ============================================================================
+def _one_line_end(text):
+    """`text` without its one trailing newline (5.2.3, B-41: rstrip("\\n")
+    removed backslashes and the letter n, and kept the newline)."""
+    if text.endswith("\r\n"):
+        return text[:-2]
+    return text[:-1] if text.endswith("\n") else text
+
+
+def console_decode(data):
+    """Bytes from a console program as text. 5.2.3 (B-09): Windows tools
+    (netsh, arp) write in the OEM code page, not the ANSI one `text=True`
+    uses, so on French, German or Russian Windows the decode failed and
+    stopped the network-identity thread. Nothing here can raise."""
+    if isinstance(data, str) or data is None:
+        return data or ""
+    for enc in (("oem",) if IS_WINDOWS else ()) + (
+            locale.getpreferredencoding(False) or "utf-8",):
+        try:
+            return data.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def run_console(cmd, timeout=10):
+    """subprocess.run for a read-only console tool: no window flashes,
+    output decoded with console_decode."""
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                       creationflags=getattr(subprocess,
+                                             "CREATE_NO_WINDOW", 0))
+    r.stdout, r.stderr = console_decode(r.stdout), console_decode(r.stderr)
+    return r
+
+
 def wifi_channel_from_mhz(mhz):
     try:
         f = int(round(float(mhz)))
@@ -14198,7 +14281,9 @@ def wifi_channel_from_mhz(mhz):
         return (f - 2407) // 5, "2.4 GHz"
     if 5150 <= f <= 5895:
         return (f - 5000) // 5, "5 GHz"
-    if 5925 <= f <= 7125:
+    if f == 5935:                    # 6 GHz channel 2 (5.2.3, B-19)
+        return 2, "6 GHz"
+    if 5955 <= f <= 7125:
         return (f - 5950) // 5, "6 GHz"
     return None, ""
 
@@ -14392,11 +14477,7 @@ class WifiProbe:
     @staticmethod
     def _cmd(cmd, timeout=10):
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout,
-                               creationflags=getattr(
-                                   subprocess, "CREATE_NO_WINDOW", 0))
-            return r.stdout or ""
+            return run_console(cmd, timeout=timeout).stdout or ""
         except (OSError, subprocess.SubprocessError):
             return ""
 
@@ -14709,10 +14790,7 @@ def read_arp_cache():
     """This computer's ARP cache (read-only; nothing is sent)."""
     try:
         if IS_WINDOWS:
-            r = subprocess.run(["arp", "-a"], capture_output=True, text=True,
-                               timeout=10, creationflags=getattr(
-                                   subprocess, "CREATE_NO_WINDOW", 0))
-            return parse_arp_windows(r.stdout)
+            return parse_arp_windows(run_console(["arp", "-a"], 10).stdout)
         if os.path.exists("/proc/net/arp"):
             with open("/proc/net/arp", encoding="utf-8") as f:
                 return parse_proc_arp(f.read())
@@ -14963,14 +15041,14 @@ class CredentialVault:
                                    capture_output=True, text=True,
                                    timeout=20)
                 if r.returncode == 0:
-                    val = r.stdout.rstrip("\\n")
+                    val = _one_line_end(r.stdout)
             elif self.backend == "secret-service":
                 r = subprocess.run(["secret-tool", "lookup", "service",
                                     self.SERVICE, "account", cid],
                                    capture_output=True, text=True,
                                    timeout=20)
                 if r.returncode == 0 and r.stdout:
-                    val = r.stdout.rstrip("\\n")
+                    val = _one_line_end(r.stdout)
             if val is None:
                 ent = self._file().get(cid) or {}
                 if "dpapi" in ent and IS_WINDOWS:
@@ -54486,6 +54564,10 @@ class ProtocolTracker:
                        offset_ms=None if offset is None else
                        round(offset * 1000, 1),
                        latency_ms=round((ts - got[0]) * 1000.0, 2),
+                       # 5.2.3 (B-43): round trip minus the server's own
+                       # processing time, from the four NTP timestamps
+                       delay_ms=None if delay is None else
+                       round(delay * 1000.0, 2),
                        result="ok",
                        summary=f"time from {src} (stratum {b[1]})"
                                + (f", clock offset about "
@@ -60975,6 +61057,29 @@ def test_b11_identity_on_multi_adapter_pcs(ctx):
 
 
 @self_test(slow=False)
+def test_b09_console_text_and_small_fixes(ctx):
+    """5.2.3: console output in any code page decodes without raising
+    (B-09); a stored secret keeps its last letters and loses only its
+    newline (B-41); the 6 GHz band's low end has the right channels
+    (B-19)."""
+    assert console_decode("Wi-Fi \u00e9") == "Wi-Fi \u00e9"
+    assert console_decode(None) == ""
+    for raw in ("R\u00e9seau sans fil".encode("cp850"),
+                "\u0421\u0435\u0442\u044c".encode("cp866"),
+                b"\xff\xfe\x81\x8d"):
+        assert isinstance(console_decode(raw), str)
+    r = run_console([sys.executable, "-c", "print('ok')"], timeout=30)
+    assert r.returncode == 0 and r.stdout.strip() == "ok"
+    assert _one_line_end("token\\n\n") == "token\\n"
+    assert _one_line_end("passwordn\n") == "passwordn"
+    assert _one_line_end("x\r\n") == "x" and _one_line_end("y") == "y"
+    assert wifi_channel_from_mhz(5935) == (2, "6 GHz")
+    assert wifi_channel_from_mhz(5955) == (1, "6 GHz")
+    assert wifi_channel_from_mhz(7115) == (233, "6 GHz")
+    assert wifi_channel_from_mhz(5945) == (None, "")
+
+
+@self_test(slow=False)
 def test_b24_first_visit_once_and_bounded_maps(ctx):
     """5.2.3 (B-24/B-27): "First visit to …" is said once per site, even
     when 3,000+ other websites came in between (it was said again, and
@@ -62953,7 +63058,7 @@ def grab_window(root, path):
             enc = base64.b64encode(script.encode("utf-16-le")).decode()
             r = subprocess.run([ps, "-NoProfile", "-NonInteractive",
                                 "-EncodedCommand", enc], capture_output=True,
-                               timeout=60)
+                               timeout=60, creationflags=NO_WINDOW)
             ok = r.returncode == 0 and os.path.exists(path)
             return ok, "PowerShell" if ok else (
                 "PowerShell: " + r.stderr.decode("utf-8", "replace")[:200])
@@ -63094,7 +63199,8 @@ def _gate_run(out_dir, name, args, timeout):
     try:
         r = subprocess.run([sys.executable, SCRIPT_PATH] + args,
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=timeout, env=env)
+                           timeout=timeout, env=env,
+                           creationflags=NO_WINDOW)
         rc, text = r.returncode, r.stdout.decode("utf-8", "replace")
     except subprocess.TimeoutExpired as e:
         rc = -1
@@ -63125,7 +63231,7 @@ def start_check(out=print):
             try:
                 r = subprocess.run([sys.executable, SCRIPT_PATH], env=env,
                                    capture_output=True, text=True,
-                                   timeout=300)
+                                   timeout=300, creationflags=NO_WINDOW)
                 text = r.stdout
             except (OSError, subprocess.SubprocessError) as e:
                 text = f"could not start: {e}"
