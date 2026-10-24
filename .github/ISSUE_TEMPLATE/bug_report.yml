@@ -1,0 +1,39 @@
+name: Bug report
+description: Something doesn't work or looks wrong
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Please **don't paste real IP/MAC addresses, captures or passwords**. A debug bundle from the Diagnostics window masks them for you.
+  - type: input
+    id: version
+    attributes:
+      label: MiniWireshark version
+      placeholder: "5.1.2"
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: OS and Python
+      placeholder: "Windows 11, Python 3.13 (Microsoft Store)"
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: "1. Start MiniWireshark\n2. ..."
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error text or boot check
+      description: Output of `python miniwireshark.py --boot-check`, or the error dialog text.
+      render: text
