@@ -596,7 +596,25 @@ def runtime_healthy(env):
         return False
     exe = env.get("python", "")
     return bool(exe and os.path.isfile(exe) and env.get("selftest_ok")
-                and not env.get("handshake_failed"))
+                and not env.get("handshake_failed")
+                and _venv_base_present(exe))
+
+
+def _venv_base_present(exe):
+    """5.2.3 (B-39): a runtime made from a Microsoft Store Python points
+    at the Store's versioned folder, which a Store update removes; the
+    runtime's python.exe still exists but can't start. pyvenv.cfg names
+    that folder, so this stays a file check (no subprocess)."""
+    cfg = os.path.join(os.path.dirname(os.path.dirname(exe)), "pyvenv.cfg")
+    try:
+        with open(cfg, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                key, sep, val = line.partition("=")
+                if sep and key.strip().lower() == "home":
+                    return os.path.isdir(val.strip())
+    except OSError:
+        pass
+    return True                      # not a venv, or no "home": trust it
 
 
 def _same_interpreter(a, b):
@@ -1172,9 +1190,11 @@ def needs_elevation():
     if is_admin():
         return False
     if IS_WINDOWS:
-        if not _npcap_present_early():
-            return True
-        return _npcap_admin_only()
+        # 5.2.3 (B-07): a missing Npcap no longer elevates the whole
+        # window (through the Store Python alias that fails for another
+        # admin account, with a misleading error); the installer alone
+        # asks for administrator rights (_run_as_admin_wait)
+        return _npcap_present_early() and _npcap_admin_only()
     return True
 
 
@@ -1406,14 +1426,22 @@ def _version_tuple(v):
     return tuple(out)
 
 
-def abi_tag(version=None, plat=None):
+def abi_tag(version=None, plat=None, flags=None):
     """'cp312-win_amd64': one private packages folder per Python version
-    and platform, so binary packages never mix after a Python upgrade."""
+    and platform, so binary packages never mix after a Python upgrade.
+    5.2.3 (B-38): free-threaded ('cp313t') and debug ('cp312d') builds
+    can't load ordinary binary packages, so they get their own folder."""
     import sysconfig
     v = version or sys.version_info[:2]
     p = plat or sysconfig.get_platform()
     p = re.sub(r"[^A-Za-z0-9]+", "_", p).strip("_").lower()
-    return f"cp{v[0]}{v[1]}-{p}"
+    if flags is None and version is not None:
+        flags = ""
+    if flags is None:
+        flags = ("t" if sysconfig.get_config_var("Py_GIL_DISABLED")
+                 else "") + ("d" if hasattr(sys, "gettotalrefcount")
+                             else "")
+    return f"cp{v[0]}{v[1]}{flags}-{p}"
 
 
 PKG_ROOT = os.path.join(PATHS.data, "site")
@@ -44983,12 +45011,25 @@ proc ::mw_retheme {w map fgnew deffg} {
         if not spec.get("id"):
             spec["id"] = "c-" + uuid.uuid4().hex[:10]
         specs = [x for x in specs if x.get("id") != spec["id"]] + [spec]
-        if password:
-            self.vault.set(spec["id"], password)
         self.config.set("connectors.list", specs)
         self.config.save()
+        cid = spec["id"]
+        if password and self.vault.backend in ("keychain", "secret-service"):
+            # 5.2.3 (B-42): the system keychain can show a prompt and wait
+            # up to 20 s; that wait is no longer on the window's thread
+            def run(_job):
+                return self.vault.set(cid, password)
+
+            def failed(e):
+                LOG.warning("saving the helper's password: %s", e)
+                self._start_connectors()
+            self.jobs.submit("connector_save", "Saving the password", run,
+                             lambda _ok: self._start_connectors(), failed)
+            return cid
+        if password:
+            self.vault.set(cid, password)
         self._start_connectors()
-        return spec["id"]
+        return cid
 
     def reconciliation_text(self):
         m = self.model
@@ -50991,15 +51032,20 @@ class CrashDialog:
             win.destroy()
 
         def restart():
+            # 5.2.3 (B-37): close first (session, journal and history are
+            # released), then start the new copy as the same user; it was
+            # started first, marked "elevated", while this one still held
+            # the journal
             LOG.info("restart requested from crash dialog")
-            try:
-                subprocess.Popen([sys.executable, SCRIPT_PATH] +
-                                 [a for a in sys.argv[1:]
-                                  if a != SELF_TEST_FLAG] + [ELEVATED_FLAG])
-            except OSError as e:
-                messagebox.showerror("Restart", str(e), parent=win)
-                return
+            args = [sys.executable, SCRIPT_PATH] + [
+                a for a in sys.argv[1:]
+                if a not in (SELF_TEST_FLAG, ELEVATED_FLAG)]
+            cls._open = False
             app._on_close()
+            try:
+                subprocess.Popen(args)
+            except OSError as e:
+                LOG.error("restart failed: %s", e)
         ttk.Button(bar, text="Continue", style="Accent.TButton",
                    command=close).pack(side="right")
         ttk.Button(bar, text="Restart MiniWireshark",
@@ -61093,6 +61139,35 @@ def test_b09_console_text_and_small_fixes(ctx):
     assert wifi_channel_from_mhz(5955) == (1, "6 GHz")
     assert wifi_channel_from_mhz(7115) == (233, "6 GHz")
     assert wifi_channel_from_mhz(5945) == (None, "")
+    assert abi_tag((3, 13), "win-amd64", "t") == "cp313t-win_amd64"
+    assert abi_tag((3, 12), "linux-x86_64", "") == "cp312-linux_x86_64"
+    # B-07: no Npcap on Windows does not elevate the whole window
+    g = globals()
+    saved = {k: g[k] for k in ("IS_WINDOWS", "is_admin",
+                               "_npcap_present_early", "_npcap_admin_only")}
+    try:
+        g.update(IS_WINDOWS=True, is_admin=lambda: False,
+                 _npcap_present_early=lambda: False,
+                 _npcap_admin_only=lambda: True)
+        assert not needs_elevation()
+        g["_npcap_present_early"] = lambda: True
+        assert needs_elevation()                # admin-only Npcap mode
+    finally:
+        g.update(saved)
+    # B-39: a runtime whose base Python folder vanished is not healthy
+    venv = ctx.path("b39env")
+    os.makedirs(os.path.join(venv, "Scripts"), exist_ok=True)
+    exe = os.path.join(venv, "Scripts", "python.exe")
+    with open(exe, "wb") as f:
+        f.write(b"x")
+    env = {"python": exe, "selftest_ok": True}
+    assert runtime_healthy(env)                 # no pyvenv.cfg: trusted
+    with open(os.path.join(venv, "pyvenv.cfg"), "w", encoding="utf-8") as f:
+        f.write("home = " + ctx.path("gone-store-python") + "\n")
+    assert not runtime_healthy(env)
+    with open(os.path.join(venv, "pyvenv.cfg"), "w", encoding="utf-8") as f:
+        f.write("home = " + os.path.dirname(sys.executable) + "\n")
+    assert runtime_healthy(env)
     # C-01: a keychain secret never appears on a command line
     real, seen = subprocess.run, []
 
