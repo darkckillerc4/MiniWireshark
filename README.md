@@ -25,6 +25,7 @@ Under the beginner view is a real analysis workstation, with packet dissection, 
 
 - [Highlights](#highlights)
 - [Quick start](#quick-start)
+- [Documentation](#documentation)
 - [Requirements](#requirements)
 - [Privacy and safety](#privacy-and-safety)
 - [Testing](#testing)
@@ -79,6 +80,17 @@ Useful switches:
 | `--bench-gui S1 S2` | Window-performance benchmark against fixed budgets |
 | `--release-gate` | Everything above plus pictures of every tab, in one folder |
 
+## Documentation
+
+| | |
+|---|---|
+| [Installation](docs/INSTALL.md) | Download, verify, start, update and uninstall, on every platform |
+| [User guide](docs/USER-GUIDE.md) | The tabs, filters, command palette, shortcuts and settings |
+| [Features](docs/FEATURES.md) | Everything MiniWireshark can do, including every alert it raises |
+| [Architecture](docs/ARCHITECTURE.md) | How the single file is organised and how a packet becomes an answer |
+| [FAQ and troubleshooting](docs/FAQ.md) | Capture problems, Safe Mode, privacy questions |
+| [Version index](docs/VERSIONS.md) | Every release with its SHA-256 |
+
 ## Requirements
 
 - **Python 3.8 or newer** with Tk (included with the python.org and Microsoft Store installers on Windows and macOS; on Linux, `sudo apt install python3-tk`).
@@ -130,7 +142,7 @@ Every release is a single `.py` file attached to its [GitHub release](https://gi
 ```
 miniwireshark.py        the application: one file on purpose, ~66k lines in banner-marked regions
 legacy/                 versions 1.x and 2.0.0 (written before this repository's history began)
-docs/                   version index, images
+docs/                   installation, user guide, features, architecture, FAQ, version index
 .github/                CI, issue and PR templates, release notes, archive-release workflow
 ```
 
