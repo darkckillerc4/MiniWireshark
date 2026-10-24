@@ -148,6 +148,27 @@ try:
 except NameError:                                   # pragma: no cover
     SCRIPT_PATH = os.path.abspath(sys.argv[0])
 SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
+# 5.2.3 (M8): seams for a frozen build (PyInstaller). Frozen, the program is
+# the exe: there is no source file next to it, children are started as
+# [exe, *args], and data lives next to the exe, not in the unpack folder.
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_PATH = os.path.abspath(sys.executable) if FROZEN else SCRIPT_PATH
+APP_HOME = os.path.dirname(APP_PATH)
+HAS_SOURCE = not FROZEN and os.path.isfile(SCRIPT_PATH)
+
+
+def self_cmd(*args):
+    """The command that starts this program again with `args`."""
+    if FROZEN:
+        return [sys.executable] + list(args)
+    return [sys.executable, SCRIPT_PATH] + list(args)
+
+
+if FROZEN and "--mw-worker" not in sys.argv:
+    # a windowed exe has no console: writes to None would raise
+    for _name in ("stdout", "stderr"):
+        if getattr(sys, _name) is None:
+            setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
 
 
 def _dir_writable(path):
@@ -184,7 +205,7 @@ class AppPaths:
     def __init__(self):
         override = os.environ.get("MINIWIRESHARK_DATA")
         candidates = [override] if override else []
-        candidates += [os.path.join(SCRIPT_DIR, "miniwireshark_data"),
+        candidates += [os.path.join(APP_HOME, "miniwireshark_data"),
                        _user_data_root(),
                        os.path.join(tempfile.gettempdir(), "miniwireshark")]
         self.data = None
@@ -487,26 +508,26 @@ def _fatal_dialog(title, message):
         _mb.showerror(title, message)
         r.destroy()
     except Exception:                                # noqa: BLE001
-        sys.stderr.write(f"\n*** {title} ***\n{message}\n")
+        if sys.stderr is not None:
+            sys.stderr.write(f"\n*** {title} ***\n{message}\n")
 
 
 def _relaunch_elevated():
-    script = SCRIPT_PATH
     extra = [a for a in sys.argv[1:] if a != ELEVATED_FLAG] + \
         list(_HANDOFF_ARGS) + ([SAFE_FLAG] if SAFE_MODE else [])
+    argv = self_cmd(ELEVATED_FLAG, *extra)
     if IS_WINDOWS:
-        params = subprocess.list2cmdline([script, ELEVATED_FLAG] + extra)
+        params = subprocess.list2cmdline(argv[1:])
         try:
             rc = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, params, None, 1)
+                None, "runas", argv[0], params, None, 1)
             if int(rc) > 32:
                 return True
         except (AttributeError, OSError):
             pass
         return False
     if IS_MAC:
-        cmd = " ".join(shlex.quote(p) for p in
-                       [sys.executable, script, ELEVATED_FLAG] + extra)
+        cmd = " ".join(shlex.quote(p) for p in argv)
         ascript = f'do shell script "{cmd}" with administrator privileges'
         try:
             sys.exit(subprocess.call(["osascript", "-e", ascript]))
@@ -530,8 +551,7 @@ def _relaunch_elevated():
         launchers.append(["kdesudo", "--"])
     for L in launchers:
         try:
-            sys.exit(subprocess.call(L + [sys.executable, script,
-                                          ELEVATED_FLAG] + extra))
+            sys.exit(subprocess.call(L + argv))
         except OSError:
             continue
     return False
@@ -700,12 +720,17 @@ def compiled_copy_path():
 
 def cached_cmd(python, script, args=()):
     """[python, -c, CACHED_RUN, script, *args]: the same program as
-    [python, script, *args], loaded from the compiled copy (MW_PYC)."""
+    [python, script, *args], loaded from the compiled copy (MW_PYC).
+    Frozen: the exe itself, [exe, *args]."""
+    if FROZEN:
+        return [python] + list(args)
     return [python, "-c", CACHED_RUN, script] + list(args)
 
 
 def cached_env(env):
     env = dict(env)
+    if FROZEN:
+        return env
     env.setdefault("MW_PYC", compiled_copy_path())
     env["MW_CACHED"] = "1"
     return env
@@ -787,7 +812,7 @@ def start_from_compiled_copy(code, argv=None, environ=None, execute=True,
     return None
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not FROZEN:
     if os.environ.get("MW_CACHED"):
         # loaded from the copy: keep it fresh for the processes it starts,
         # and let a process started the plain way do the same as this one
@@ -1075,6 +1100,8 @@ def runtime_handoff(argv=None, environ=None, execute=True, suitable=None,
     managed Python in the Runtime Manager; never in Safe Mode; and the
     child must report its window within the handshake time, or this
     process stays and explains why."""
+    if FROZEN:
+        return None                   # the exe carries its own Python
     environ = os.environ if environ is None else environ
     argv = list(sys.argv[1:] if argv is None else argv)
     if environ.get("MW_STAGE") == "app" or MW_STAGE == "app" or \
@@ -1595,7 +1622,10 @@ class PrivatePackages:
         return dict(self.manifest()["packages"])
 
     def activate(self):
-        """Put the folder on sys.path (after the script's own folder)."""
+        """Put the folder on sys.path (after the script's own folder).
+        Frozen: never; the exe's bundled modules must not be shadowed."""
+        if FROZEN:
+            return False
         if os.path.isdir(self.root) and self.root not in sys.path:
             sys.path.insert(1 if sys.path else 0, self.root)
             importlib.invalidate_caches()
@@ -3251,6 +3281,8 @@ def step_runtime(l, state):
     """V5: run on this Python whenever it can run the app. The managed
     Python is never offered as a blocking question at startup; it lives in
     the Runtime Manager (and is used only after its window reports back)."""
+    if FROZEN:
+        return True, "Running from the standalone program (Python built in)."
     if MW_STAGE == "app":
         mgr = RuntimeManager()
         st = mgr.status()
@@ -9991,6 +10023,22 @@ FEATURES = {
     "warm_start": True,      # the window is built behind the loading screen
     "win_timer": True,       # 1 ms Windows timer while busy (5.2.3, B-06)
 }
+
+
+def release_freed_memory():
+    """5.2.3 (B-23): after a big model is replaced, glibc keeps the freed
+    pages (50-120 MB that looked like a leak after reloading a session);
+    malloc_trim hands them back. Linux with glibc only; a no-op
+    elsewhere."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+        import ctypes.util
+        name = ctypes.util.find_library("c") or "libc.so.6"
+        return bool(ctypes.CDLL(name).malloc_trim(0))
+    except (OSError, AttributeError):
+        return False
 
 
 def freeze_startup_objects():
@@ -18996,7 +19044,7 @@ class AppConfig:
     old schemas; never stores credentials."""
 
     def __init__(self, path=None):
-        default_path = os.path.join(SCRIPT_DIR, "miniwireshark_config.json")
+        default_path = os.path.join(APP_HOME, "miniwireshark_config.json")
         if path is None:
             path = os.environ.get("MINIWIRESHARK_CONFIG")
         if path is None:
@@ -39619,6 +39667,10 @@ class MiniWireshark:
             self._keep_undo(None)     # another source: no Undo of Clear
             self._banner_action(None)
         self.gen += 1                 # frames of the old source are dropped
+        self._hay = None              # 5.2.3 (B-23): the search index kept
+        #                               the old model (and its devices) alive
+        with contextlib.suppress(tk.TclError, AttributeError):
+            self.root.after(500, release_freed_memory)
         self.ring.clear()
         self.ring.reset_counters()
         if getattr(self, "deep", None) is not None:
@@ -42316,8 +42368,8 @@ class MiniWireshark:
 
     def _repair_selftest(self):
         try:
-            r = subprocess.run([sys.executable, SCRIPT_PATH, SELF_TEST_FLAG,
-                                "--quick"], capture_output=True, text=True,
+            r = subprocess.run(self_cmd(SELF_TEST_FLAG,
+                                        "--quick"), capture_output=True, text=True,
                                timeout=600, creationflags=getattr(
                                    subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, subprocess.SubprocessError) as e:
@@ -49794,8 +49846,8 @@ proc ::mw_retheme {w map fgnew deffg} {
 
         def work():
             try:
-                r = subprocess.run([sys.executable, SCRIPT_PATH,
-                                    SELF_TEST_FLAG], capture_output=True,
+                r = subprocess.run(self_cmd(SELF_TEST_FLAG),
+                                   capture_output=True,
                                    text=True, timeout=300,
                                    creationflags=getattr(
                                        subprocess, "CREATE_NO_WINDOW", 0))
@@ -51033,9 +51085,9 @@ class CrashDialog:
             # started first, marked "elevated", while this one still held
             # the journal
             LOG.info("restart requested from crash dialog")
-            args = [sys.executable, SCRIPT_PATH] + [
+            args = self_cmd(*[
                 a for a in sys.argv[1:]
-                if a not in (SELF_TEST_FLAG, ELEVATED_FLAG)]
+                if a not in (SELF_TEST_FLAG, ELEVATED_FLAG)])
             cls._open = False
             app._on_close()
             try:
@@ -51392,6 +51444,9 @@ def release_tool(argv):
 def apply_self_update(data, tag, script_path=None, marker_path=None):
     """Validate, back up, atomically replace. Never destroys the only
     working copy: the backup stays until the new version has run fine."""
+    if FROZEN and script_path is None:
+        raise UpdateRefused("the standalone program is updated by its "
+                            "installer, not by replacing a .py file")
     script_path = script_path or SCRIPT_PATH
     marker_path = marker_path or PATHS.update_marker
     if not data or len(data) < 50_000:
@@ -57384,10 +57439,19 @@ def run_self_tests(verbose=True):
 SELF_TESTS = []              # (function, slow)
 
 
-def self_test(slow=False):
+def self_test(slow=False, needs_source=False):
     """Register a module-level test: fn(ctx) raises on failure, may return
-    "skip". `slow` tests are skipped by --quick."""
+    "skip". `slow` tests are skipped by --quick. `needs_source` tests read
+    the .py file or start `python -c` children: skipped in a frozen build
+    (5.2.3, M8)."""
     def deco(fn):
+        if needs_source and not HAS_SOURCE:
+            def skipped(_ctx, _fn=fn):
+                return "skip"
+            skipped.__name__ = fn.__name__
+            skipped.__doc__ = fn.__doc__
+            SELF_TESTS.append((skipped, slow))
+            return fn
         SELF_TESTS.append((fn, slow))
         return fn
     return deco
@@ -57431,7 +57495,7 @@ def model_summary(model):
     }
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_python38_grammar(ctx):
     """The launcher stage must parse on old Pythons (old installs hand over
     to the managed runtime, so the whole file keeps their syntax).
@@ -57461,7 +57525,7 @@ def toc_and_banners(src):
     return toc, banners
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_toc_matches_banners(ctx):
     """The file's table of contents lists every region banner, in order,
     and every banner id is unique."""
@@ -57885,7 +57949,7 @@ def run_pipeline(model, frames, timeout=60):
     return h, w
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_reverse_dns_only_in_active_mode(ctx):
     src = inspect.getsource(MiniWireshark.on_rows_analysed)
     assert "self.active_mode()" in src
@@ -58494,7 +58558,7 @@ def _restore_runtime_dir(old):
     globals()["RUNTIME_DIR"], globals()["RUNTIME_STATE"] = old
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_runtime_state_and_handoff(ctx):
     old = _with_runtime_dir(ctx)
     try:
@@ -58649,7 +58713,7 @@ def t_mask_sensitive(ctx):
     assert "192.168.x.x" in m and "da:a1:xx" in m
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_least_privilege(ctx):
     src = inspect.getsource(needs_elevation)
     assert "_npcap_admin_only" in src
@@ -59331,7 +59395,7 @@ NET_SENDS = {"urlopen", "sendp", "sendto", "gethostbyaddr", "getaddrinfo",
              "create_connection", "sr1", "srp", "srp1", "sendall"}
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_every_send_goes_through_outbound(ctx):
     """Static check of this file: every network send happens in a function
     that first passes the outbound() gate (so the ledger and the kill
@@ -60294,7 +60358,7 @@ def test_b31_archived_copies_cannot_hurt_each_other(ctx):
     assert crash_loop_detected([old_ver, old_ver], script=a) is False
 
 
-@self_test(slow=False)
+@self_test(slow=False, needs_source=True)
 def test_v5_handoff_policy_and_handshake(ctx):
     """The managed Python is used only when chosen or needed, and only
     after its window reports back; a child that crashes or hangs is
@@ -60382,7 +60446,7 @@ def _fake_wheel(path, name, version, files):
     return path
 
 
-@self_test(slow=False)
+@self_test(slow=False, needs_source=True)
 def test_private_packages_folder(ctx):
     """Packages go into MiniWireshark's own folder: swapped in atomically,
     importable, removable, and never through the system Python's pip."""
@@ -61028,6 +61092,33 @@ def test_b02_promisc_refused_and_probe_order(ctx):
 
 
 @self_test(slow=False)
+def test_m8_frozen_seams(ctx):
+    """5.2.3 (M8): in a frozen build the program starts itself as
+    [exe, *args] (no script path, no compiled-copy loader), keeps its data
+    next to the exe, never loads private packages over its bundled ones,
+    and refuses a .py self-update."""
+    g = globals()
+    saved = {k: g[k] for k in ("FROZEN",)}
+    try:
+        g["FROZEN"] = True
+        exe = sys.executable
+        assert self_cmd("--demo") == [exe, "--demo"]
+        assert cached_cmd(exe, SCRIPT_PATH, ["--mw-worker"]) == \
+            [exe, "--mw-worker"]
+        assert "MW_CACHED" not in cached_env({"A": "1"})
+        assert runtime_handoff(argv=[], environ={}, execute=False) is None
+        assert PRIVATE_PACKAGES.activate() is False
+        try:
+            apply_self_update(b"x" * 60000, "v9")
+            raise AssertionError("a frozen build must refuse .py updates")
+        except UpdateRefused:
+            pass
+    finally:
+        g.update(saved)
+    assert self_cmd("--demo")[-2:] == [SCRIPT_PATH, "--demo"]
+
+
+@self_test(slow=False)
 def test_b10_atomic_write_retries_a_busy_target(ctx):
     """5.2.3 (B-10): on Windows an antivirus holding the target for a
     moment made os.replace fail and the save was lost, leaving a .tmp
@@ -61114,7 +61205,7 @@ def test_b11_identity_on_multi_adapter_pcs(ctx):
     assert all(ip != "172.25.0.9" for ip, _m in got), got
 
 
-@self_test(slow=False)
+@self_test(slow=False, needs_source=True)
 def test_b09_console_text_and_small_fixes(ctx):
     """5.2.3: console output in any code page decodes without raising
     (B-09); a stored secret keeps its last letters and loses only its
@@ -61331,7 +61422,7 @@ def test_capture_gaps_presence_and_lifecycle(ctx):
         assert m2.capture_gaps() == m.capture_gaps()
 
 
-@self_test()
+@self_test(needs_source=True)
 def test_scenarios_and_demo_without_scapy(ctx):
     """With scapy blocked: the scripted network builds, decodes and passes
     every golden check through the fast decoder, and Demo Mode's
@@ -62105,7 +62196,7 @@ def t_warm_up_on_the_loading_screen(ctx):
         conf.L2listen = real_listen
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_compiled_copy_start(ctx):
     """A second process loads the kept compiled copy (and still works
     when the copy is missing, stale or broken); the plain start would
@@ -62963,6 +63054,9 @@ def _bench_child(sid, out_path, pcap):
             pal.win.destroy()
     res["palette"] = measure("palette", palette)
 
+    # 5.2.3 (B-23): the benchmark's own reference kept the imported data
+    # alive through the reload, so "memory after reload" counted it twice
+    m = None
     sess = os.path.join(tmp, "bench.mwsession.json")
     filedialog.asksaveasfilename = lambda *a, **k: sess
     res["session_save"] = measure(
@@ -63076,9 +63170,9 @@ def bench_gui(argv):
         env["MINIWIRESHARK_DATA"] = tempfile.mkdtemp(prefix="mw_benchdata_")
         t0 = time.time()
         try:
-            rc = subprocess.run([sys.executable, SCRIPT_PATH, "--bench-gui",
-                                 "--child", sid, "--out", part, "--pcap",
-                                 captures[size]], env=env,
+            rc = subprocess.run(self_cmd("--bench-gui",
+                                         "--child", sid, "--out", part,
+                                         "--pcap", captures[size]), env=env,
                                 timeout=3600).returncode
         except subprocess.TimeoutExpired:
             rc = -1
@@ -63313,7 +63407,7 @@ def _gate_run(out_dir, name, args, timeout):
     env = dict(os.environ)
     env["MW_UNATTENDED"] = "1"
     try:
-        r = subprocess.run([sys.executable, SCRIPT_PATH] + args,
+        r = subprocess.run(self_cmd(*args),
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            timeout=timeout, env=env,
                            creationflags=NO_WINDOW)
@@ -63345,7 +63439,7 @@ def start_check(out=print):
         for label in ("First start", "Next start"):
             t0 = time.perf_counter()
             try:
-                r = subprocess.run([sys.executable, SCRIPT_PATH], env=env,
+                r = subprocess.run(self_cmd(), env=env,
                                    capture_output=True, text=True,
                                    timeout=300, creationflags=NO_WINDOW)
                 text = r.stdout
@@ -66810,7 +66904,7 @@ def gt_rc11_warm_start(app, ctx):
     env.pop("MW_FEATURES_OFF", None)
     outs = []
     for _ in range(2):
-        r = subprocess.run([sys.executable, SCRIPT_PATH], env=env,
+        r = subprocess.run(self_cmd(), env=env,
                            capture_output=True, text=True, timeout=180)
         line = next((x for x in r.stdout.splitlines()
                      if x.startswith("START_OK")), "")
@@ -67462,7 +67556,7 @@ def shared_data_note(script_dir=None, data_dir=None):
     """5.2.3 (B-40, verdict D): when several MiniWireshark files sit in one
     folder (an archive of versions) they share the settings and history in
     its miniwireshark_data folder. Say so in one line ("" otherwise)."""
-    script_dir = script_dir or SCRIPT_DIR
+    script_dir = script_dir or APP_HOME
     data_dir = data_dir or PATHS.data
     if os.path.normcase(os.path.abspath(data_dir)) != os.path.normcase(
             os.path.abspath(os.path.join(script_dir, "miniwireshark_data"))):
