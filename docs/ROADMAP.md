@@ -7,7 +7,7 @@
 
 MiniWireshark's promise is *"Your network, explained in plain English."* 5.2.3 makes the app dependable on Windows. The 5.x releases below spend that trust on three things, in this order:
 
-1. **Easy to start.** A faster, friendlier first run from the same single `.py` file (5.3).
+1. **Easy to start.** A faster start-up and a first-run screen, from the same single `.py` file (5.3).
 2. **Easy to understand.** Better names for devices, clearer answers and a story of what changed (5.4).
 3. **Easy to protect.** Calm, explained security insight that stays on the user's PC (5.5).
 
@@ -41,28 +41,33 @@ These come from the owner's rules and the 5.2.3 plan. No item in this roadmap ma
 
 ## Version numbers
 
-The owner's scheme is `X.Z.Y`:
+The owner's scheme is `X.Z.Y`, meaning big, medium and small:
 
-- **X (major):** changes a lot at once. Reserved for 6.0, which is not planned yet.
-- **Z (medium):** a new screen, a GUI change or a major optimisation. 5.3, 5.4 and 5.5.
-- **Y (fix):** bug fixes and small optimisations only. 5.2.4, 5.3.1 and so on.
+- **X (big):** changes a lot at once. Reserved for 6.0, which is not planned yet.
+- **Z (medium):** a new screen, a GUI change or a major optimisation. Each medium release in this roadmap carries only one or two of these.
+- **Y (small):** bug fixes, small optimisations, and small additions to screens that already exist (a new check, a new button, a new protocol label).
 
-A fix release can ship at any time between medium releases. Release candidates use `-rc.N`, as 5.1.2 did.
+Small items are listed under the medium release they follow, as its fix line (5.3.1, 5.3.2 and so on). They ship one or a few at a time, in any order, between medium releases. Release candidates use `-rc.N`, as 5.1.2 did.
+
+Project work that changes no user-facing behaviour (CI, release workflow, test budgets) needs no version number. It lands whenever it is ready.
 
 ## At a glance
 
-| Release | Theme | Headline for users | Size | Depends on |
-|---|---|---|---|---|
-| **5.2.x** | Fixes from Windows evidence | "It just works on my PC." | Small | 5.2.3 released |
-| **5.3.0** | Easy to start | "It opens fast and tells me what it needs." | Medium | 5.2.3 Windows numbers (M0) |
-| **5.4.0** | Understand your network | "I know what every device is, and what changed." | Medium | 5.2.3 M5 network identity |
-| **5.5.0** | Calm security insight | "It tells me when something is wrong, and why it might be fine." | Medium | 5.4 device profiles |
+| Release | Kind | What makes it this size | Depends on |
+|---|---|---|---|
+| **5.2.x** | Small | Fixes from the first Windows test run | 5.2.3 released |
+| **5.3.0** | Medium | Start-up rebuilt for speed, plus a new first-run screen | 5.2.3 Windows numbers (M0) |
+| **5.3.x** | Small | Small start-up and update improvements | 5.3.0 |
+| **5.4.0** | Medium | Device identification engine, plus a new "What changed?" screen | 5.2.3 M5 network identity |
+| **5.4.x** | Small | New device names, protocols and investigations, one at a time | 5.4.0 |
+| **5.5.0** | Medium | Per-device behaviour baseline, plus a new "Unusual activity" screen | 5.4.0 device kinds |
+| **5.5.x** | Small | New home network checks and alert tools, one at a time | 5.5.0 |
 
 5.4 and 5.5 can swap places if the owner prefers security first.
 
 ## 5.2.x: fixes from Windows evidence
 
-**Goal:** close whatever the first full Windows run (5.2.3 M0) and the first users find. Nothing new on screen.
+**Kind:** small. **Goal:** close whatever the first full Windows run (5.2.3 M0) and the first users find. Nothing new on screen.
 
 - Bugs found by the Windows test run that didn't fit into 5.2.3.
 - Windows `BENCH_LIMITS` tightened once there are several runs to compare.
@@ -73,65 +78,75 @@ A fix release can ship at any time between medium releases. Release candidates u
 
 ## 5.3.0: easy to start
 
-**Goal:** a Windows user downloads `miniwireshark.py`, opens it, and is capturing within a minute, with every question answered on screen. Still one Python file.
+**Kind:** medium. **Goal:** a Windows user opens `miniwireshark.py` and is capturing within a minute, with every question answered on screen. Still one Python file.
 
-### For users
+### The medium changes
 
-- **Faster start.** The 5.2.3 courtroom kept the "self-installed launcher that loads the cached compiled copy" (score 71) on hold until Windows numbers exist. If 5.2.3 M0 measures more than 2 s of compile time per start, 5.3 builds it. The launcher is written by the `.py` itself into the user's data folder, so the download stays one file.
-- **First-run guide.** A short, plain-words walk-through: which Python is running, what Npcap is and why capture needs it, which network card was picked and why, and what MiniWireshark will and won't send outside the PC.
-- **"Start here" checks.** One screen that says, in green or amber, whether capture, the history database and updates are ready, with a fix button next to each amber line.
-- **Clearer update prompts.** The signed-update check explains what changed in the new version (from its release notes) before asking.
+- **Start-up rebuilt for speed (major optimisation).** The 5.2.3 courtroom kept the "self-installed launcher that loads the cached compiled copy" (score 71) on hold until Windows numbers exist. If 5.2.3 M0 measures more than 2 s of compile time per start, 5.3 builds it. The launcher is written by the `.py` itself into the user's data folder, so the download stays one file. If M0 shows start-up is already fast, this item is dropped and 5.3.0 is the first-run screen alone.
+- **First-run screen (new screen).** One page that walks a new user through which Python is running, what Npcap is and why capture needs it, which network card was picked and why, and what MiniWireshark will and won't send outside the PC. Each line is green or amber, with a fix button next to each amber line.
 
-### For the project
+**Done when:** on a clean Windows PC with Python installed, a first-time user reaches a working capture without the command line, and start time meets its budget.
 
-- **Windows in CI.** `--self-test` runs on `windows-latest` for every pull request, next to the existing Linux jobs. GUI tests stay on Linux plus the owner's PC.
-- **Release from a tag.** A workflow takes the tagged `miniwireshark.py`, runs `--self-test` and `--boot-check` on it, and attaches it to the GitHub release with its `.sha256` and notes. The same file is never rebuilt or changed after testing.
+### 5.3.x (small)
+
+- The update prompt shows what changed in the new version (from its release notes) before asking.
+- A "Run first-run checks again" entry in the command palette and Help menu.
+- Start-time fixes found once real users run the new launcher.
+
+### Project work (no version)
+
+- **Windows in CI.** `--self-test` runs on `windows-latest` for every pull request, next to the existing Linux jobs.
+- **Release from a tag.** A workflow takes the tagged `miniwireshark.py`, runs `--self-test` and `--boot-check` on it, and attaches it to the GitHub release with its `.sha256` and notes.
 - **Start-time budget.** A start-time number joins `BENCH_LIMITS` for each OS, so a slow start fails the release gate.
-
-**Done when:** on a clean Windows PC with Python installed, a first-time user reaches a working capture without the command line, and start time meets its new budget.
 
 ## 5.4.0: understand your network
 
-**Goal:** fewer "Unknown device" rows, and an answer to "what changed?".
+**Kind:** medium. **Goal:** fewer "Unknown device" rows, and an answer to "what changed?".
 
 Builds on the 5.2.3 M5 fixes for PCs with several adapters. Everything here is passive: MiniWireshark listens to what devices already announce and never probes other people's devices.
 
-### For users
+### The medium changes
 
-- **Better device names.** Read the names devices already broadcast: mDNS/Bonjour, SSDP/UPnP, NetBIOS, LLMNR and DHCP host names and vendor classes. Combine them with the MAC vendor and show the evidence and confidence for each name, as today.
-- **Device kinds in plain words.** "Printer", "smart TV", "phone", "game console", "camera" and so on, with a reason ("it announced an IPP printer service").
-- **Rename and pin.** The user can name a device, and the name survives across sessions and IP changes.
-- **"What changed?" timeline.** A day-by-day story: new devices, devices that left, new websites, a new listening service, a change of router or DNS server. Each entry links to the evidence.
-- **Weekly summary.** An optional, local-only report (HTML or text) that answers the dashboard's three questions for the past week.
-- **Modern traffic explained.** Recognise QUIC and HTTP/3, encrypted DNS (DNS over HTTPS and DNS over TLS) and common VPN protocols, and say what can't be seen inside them and why.
-- **More investigations.** "Why is my Wi-Fi slow?" (signal, channel crowding where the OS reports it), "Is my DNS working?" and "Is IPv6 working?", each ending with "here is what to try" or "we can't tell from here".
-
-### For the project
-
-- A small, versioned data table for device kinds, kept inside the `.py` (no download at run time; it updates with releases).
-- Self-tests built from synthetic announcements only. No real network data in the repository.
-- File size watched: each release notes its line count and size, and any region that grows by more than 10% gets a review for dead code.
+- **Device identification engine (major change to analysis and the Devices view).** Read the names devices already broadcast (mDNS/Bonjour, SSDP/UPnP, NetBIOS, LLMNR, DHCP host names and vendor classes), combine them with the MAC vendor, and give each device a kind in plain words ("printer", "smart TV", "phone", "camera") with the evidence and confidence for it. The kinds come from a small, versioned table kept inside the `.py`; nothing is downloaded at run time.
+- **"What changed?" screen (new screen).** A day-by-day story: new devices, devices that left, new websites, a new listening service, a change of router or DNS server. Each entry links to the evidence.
 
 **Done when:** on the demo scenarios, the share of devices with a kind and a name goes up, with no wrong "high confidence" label, and the timeline matches a scripted sequence of changes.
 
+### 5.4.x (small)
+
+- Rename and pin a device, so its name survives across sessions and IP changes.
+- More device kinds and vendor names in the table.
+- Recognise QUIC and HTTP/3, encrypted DNS (DNS over HTTPS and DNS over TLS) and common VPN protocols, and say what can't be seen inside them.
+- One new investigation per release: "Is my DNS working?", "Is IPv6 working?", "Why is my Wi-Fi slow?" (signal and channel crowding where the OS reports it).
+- An optional, local-only weekly summary that answers the dashboard's three questions for the past week.
+
+### Project work (no version)
+
+- Self-tests built from synthetic announcements only. No real network data in the repository.
+- Each release notes the file's line count and size, and any region that grows by more than 10% gets a review for dead code.
+
 ## 5.5.0: calm security insight
 
-**Goal:** tell the user when something is really unusual, explain it, and offer the innocent explanation next to the worrying one. Never cry wolf.
+**Kind:** medium. **Goal:** tell the user when something is really unusual, explain it, and offer the innocent explanation next to the worrying one. Never cry wolf.
 
-### For users
+### The medium changes
 
-- **Normal-behaviour baseline per device.** After a learning period, notice when a device talks to new countries, sends far more than usual, or starts a service it never had. The baseline is simple statistics on the PC; nothing is uploaded.
-- **Home network checks.** Rogue DHCP server, a second router appearing, DNS answers that change for the same name, an evil-twin Wi-Fi network (same name, different access point, where the OS reports it), and certificates that are expired or self-signed on local devices.
-- **Optional threat lists.** The user can turn on well-known public blocklists for malware domains. Off by default, downloaded only through `outbound()`, matched on the PC, with the list's source and date shown on each alert.
-- **Incident report.** One click turns an alert into a short, shareable report: what happened, when, the evidence and the suggested next step, redacted by default.
-- **Alert tuning.** "Don't warn me about this device again" and "this is normal for my network", with an undo list.
+- **Per-device behaviour baseline (major change to the security engine).** After a learning period, notice when a device talks to new countries, sends far more than usual, or starts a service it never had. The baseline is simple statistics on the PC; nothing is uploaded. It uses the device kinds from 5.4, so a TV and a laptop are judged differently.
+- **"Unusual activity" screen (new screen).** One place that lists what the baseline found, each with the worrying reading, the innocent reading, the evidence and a suggested next step.
 
-### For the project
+**Done when:** on the demo scenarios, every planted problem raises one alert and the normal-traffic scenarios raise none.
+
+### 5.5.x (small)
+
+- One new home network check at a time: rogue DHCP server, a second router appearing, DNS answers that change for the same name, an evil-twin Wi-Fi network (where the OS reports it), expired or self-signed certificates on local devices.
+- Alert tuning: "don't warn me about this device again" and "this is normal for my network", with an undo list.
+- Incident report: one click turns an alert into a short, redacted report.
+- Optional threat lists: well-known public blocklists for malware domains, off by default, downloaded only through `outbound()`, matched on the PC, with the list's source and date on each alert. This one needs a privacy review before it ships.
+
+### Project work (no version)
 
 - Every new alert type ships with a self-test for the true alarm *and* a self-test for its innocent look-alike.
 - The privacy posture report lists every new optional download and when it last ran.
-
-**Done when:** on the demo scenarios, every planted problem raises one alert and the normal-traffic scenarios raise none.
 
 ## After 5.5
 
@@ -157,15 +172,15 @@ No item below is approved. Each gets the short evaluation from the governance ru
 
 | Candidate | For | Kind |
 |---|---|---|
-| Public malware-domain blocklists | 5.5 optional threat lists | Data, downloaded only when the user turns it on |
-| A device-kind data table (MAC vendor plus service names) | 5.4 device kinds | Data kept inside the `.py` |
+| Public malware-domain blocklists | 5.5.x optional threat lists | Data, downloaded only when the user turns it on |
+| A device-kind data table (MAC vendor plus service names) | 5.4.0 device kinds | Data kept inside the `.py` |
 
 ## Decisions for the owner
 
 | # | Decision | Default until answered |
 |---|---|---|
 | 1 | Order of 5.4 (understanding) and 5.5 (security) | 5.4 first |
-| 2 | Turn on the optional threat lists by default in 5.5 | Off by default |
+| 2 | Turn on the optional threat lists by default (5.5.x) | Off by default |
 | 3 | Any idea from [Ideas waiting for a vote](#ideas-waiting-for-a-vote) | Not scheduled |
 | 4 | When to open the 6.0 discussion | Not before the owner asks |
 
