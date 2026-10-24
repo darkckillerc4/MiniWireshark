@@ -129,7 +129,7 @@ from typing import Callable
 _T_START = time.perf_counter()
 LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
-SCRIPT_VERSION = "5.1.2"
+SCRIPT_VERSION = "5.2.3"
 SESSION_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 2
 
@@ -2103,14 +2103,14 @@ def _install_npcap(loader, state):
             webbrowser.open("https://npcap.com/#download")
         except Exception:                            # noqa: BLE001
             pass
+        shutil.rmtree(os.path.dirname(exe), ignore_errors=True)
         return False, (f"Could not download the capture driver ({e}). "
                        "Your browser was opened on the Npcap download page.")
     sig, signer = _authenticode_info(exe)
     loader.post_log(f"  Installer signature: {sig or 'unknown'} "
                     f"({signer or 'no signer'})", "detail")
     if sig != "Valid" or not signer_matches(signer, NPCAP_SIGNER):
-        with contextlib.suppress(OSError):
-            os.remove(exe)
+        shutil.rmtree(os.path.dirname(exe), ignore_errors=True)
         return False, ("The downloaded capture-driver installer is not "
                        f"signed by {NPCAP_SIGNER} (signature: "
                        f"{sig or 'unknown'}), so MiniWireshark refused to "
@@ -2135,9 +2135,7 @@ def _install_npcap(loader, state):
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"Installer failed to start: {e}"
     finally:
-        with contextlib.suppress(OSError):
-            os.remove(exe)
-            os.rmdir(os.path.dirname(exe))
+        shutil.rmtree(os.path.dirname(exe), ignore_errors=True)
     LOG.info("Npcap installer exit code %s", code)
     r = types.SimpleNamespace(returncode=code)
     if r.returncode == 3010:
@@ -2191,9 +2189,11 @@ class LoaderWindow(tk.Frame):
          "Shorter freezes when saving, loading and changing text size; "
          "sharp text on Windows at 125 % and more; an interface scale; "
          "Reduce motion; a visible keyboard focus everywhere."),
-        ("\U0001F52C", "Everything from 5.0 is still here",
-         "The packet workspace, Full Power, Email Traffic, the Components "
-         "Center and Safe Mode work as before."),
+        ("\U0001F6E1", "Steadier on real PCs",
+         "Capture starts without freezing the window, devices are told "
+         "apart on PCs with VPN and virtual adapters, memory stays bounded "
+         "while minimised, and closing is quick. Copies of different "
+         "versions in one folder no longer get in each other's way."),
     )
 
     def __init__(self, master, config=None, mode="startup"):
@@ -9374,7 +9374,7 @@ def learn_names_from(cache, d):
     """Feed the IP→name cache from one decoded packet (any thread)."""
     src = _LEARN_SOURCE.get(d["proto"], "dns")
     for ip, name in d["learns"]:
-        if src == "dns" and is_private_ip(ip):
+        if src == "dns" and d["proto"] != "LLMNR" and is_private_ip(ip):
             # 5.2.3 (B-15): a DNS answer pointing a name at a local
             # address says nothing about that device (a Pi-hole answers
             # its own address for every blocked ad server and became
@@ -15105,7 +15105,14 @@ class CredentialVault:
             r = subprocess.run(["security", "-i"], input=cmd.encode(),
                                capture_output=True, timeout=20)
             if r.returncode == 0 and b"error" not in r.stderr.lower():
-                return True
+                # `security -i` can exit 0 when the command inside failed
+                # (locked keychain): confirm the item exists (no -w, so
+                # the secret is never printed)
+                chk = subprocess.run(["security", "find-generic-password",
+                                      "-a", cid, "-s", self.SERVICE],
+                                     capture_output=True, timeout=20)
+                if chk.returncode == 0:
+                    return True
         elif self.backend == "secret-service":
             r = subprocess.run(["secret-tool", "store", "--label",
                                 f"{self.SERVICE} {cid}", "service",
@@ -17772,6 +17779,8 @@ class NetworkModel:
         a = ip_obj(ip)
         if a is None or a.version != 4:
             return False
+        if a.is_link_local:
+            return False          # 169.254/16 is never routed: same link
         nets = [n for n in self.local_nets if n.version == 4]
         return bool(nets) and not any(a in n for n in nets)
 
@@ -22608,6 +22617,8 @@ Results as you type, Ctrl+K for every setting and Help topic, Back and Forward b
 Correct it, compare it, look back ¦ Corriger, comparer, remonter le temps ¦ Corregir, comparar, mirar atrás
 Fix a website's category, tag a device's place and owner, undo any of it; pin two devices side by side; see the session as of any minute on the Timeline. ¦ Corrigez la catégorie d'un site, indiquez le lieu et le propriétaire d'un appareil, annulez n'importe laquelle de ces corrections ; épinglez deux appareils côte à côte ; voyez la session à n'importe quelle minute dans la Chronologie. ¦ Corrija la categoría de un sitio, indique el lugar y el propietario de un dispositivo, deshaga cualquiera de ellas; fije dos dispositivos uno al lado del otro; vea la sesión en cualquier minuto en la Cronología.
 Faster, steadier, easier to read ¦ Plus rapide, plus stable, plus lisible ¦ Más rápido, más estable, más legible
+Steadier on real PCs ¦ Plus solide sur les vrais PC ¦ Más estable en PC reales
+Capture starts without freezing the window, devices are told apart on PCs with VPN and virtual adapters, memory stays bounded while minimised, and closing is quick. Copies of different versions in one folder no longer get in each other's way. ¦ La capture démarre sans figer la fenêtre, les appareils sont bien distingués sur les PC avec VPN et cartes virtuelles, la mémoire reste limitée quand la fenêtre est réduite et la fermeture est rapide. Des copies de versions différentes dans un même dossier ne se gênent plus. ¦ La captura empieza sin congelar la ventana, los dispositivos se distinguen bien en PC con VPN y adaptadores virtuales, la memoria se mantiene limitada con la ventana minimizada y el cierre es rápido. Las copias de distintas versiones en una misma carpeta ya no se estorban.
 Shorter freezes when saving, loading and changing text size; sharp text on Windows at 125 % and more; an interface scale; Reduce motion; a visible keyboard focus everywhere. ¦ Des blocages plus courts à l'enregistrement, au chargement et au changement de taille du texte ; un texte net sous Windows à 125 % et plus ; une échelle de l'interface ; Réduire les animations ; un focus clavier visible partout. ¦ Bloqueos más cortos al guardar, cargar y cambiar el tamaño del texto; texto nítido en Windows al 125 % o más; una escala de la interfaz; Reducir el movimiento; un foco de teclado visible en todas partes.
 Everything from 5.0 is still here ¦ Tout ce que contenait la 5.0 est toujours là ¦ Todo lo de la 5.0 sigue aquí
 The packet workspace, Full Power, Email Traffic, the Components Center and Safe Mode work as before. ¦ L'espace de travail des paquets, la pleine puissance, le trafic e-mail, le centre des composants et le mode sans échec fonctionnent comme avant. ¦ El espacio de trabajo de paquetes, la potencia máxima, el tráfico de correo, el centro de componentes y el modo seguro funcionan como antes.
@@ -44218,6 +44229,8 @@ proc ::mw_retheme {w map fgnew deffg} {
             if sniffer is not None:
                 with contextlib.suppress(Exception):
                     sniffer.stop()
+            if on_done is not None:
+                on_done(False)        # a Repair waiting on it moves on
             return
         self._capture_starting = False
         ok = self._finish_start_capture(sniffer, err, used, candidates, bpf,
@@ -44617,6 +44630,9 @@ proc ::mw_retheme {w map fgnew deffg} {
             with contextlib.suppress(tk.TclError):
                 self.root.after(self._ms(700), self._flush_ui)
             return
+        if getattr(self, "_rebuild_on_restore", False):
+            self._rebuild_on_restore = False
+            self._rebuild_tables_soon()
         m = self.model
         for part in (self._flush_events, self._flush_devices,
                      self._flush_websites, self._flush_remotes,
@@ -44720,6 +44736,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                 self.tabs["connections"]._pending = True
             if len(m.ev_alerts) > self.MINIMIZED_KEEP:
                 del m.ev_alerts[:-self.MINIMIZED_KEEP]
+                self._rebuild_on_restore = True   # the Alerts table too
             if len(m.ev_banner) > 1:
                 del m.ev_banner[:-1]
         except Exception:                            # noqa: BLE001
@@ -44731,7 +44748,7 @@ proc ::mw_retheme {w map fgnew deffg} {
             return
         tab = self.tabs["connections"]
         now = time.monotonic()
-        if len(m.flows.dirty) > self.FLOW_BACKLOG and not tab.grouping() \
+        if len(m.flows.dirty) > self.FLOW_BACKLOG \
                 and now - getattr(self, "_flow_rebuild_at", 0.0) > 5:
             # 5.2.3 (B-22): a big backlog (reading a capture) is one sliced
             # refill of the newest rows, not 20,000 single-row upserts
@@ -45071,9 +45088,12 @@ proc ::mw_retheme {w map fgnew deffg} {
             def failed(e):
                 LOG.warning("saving the helper's password: %s", e)
                 self._start_connectors()
-            self.jobs.submit("connector_save", "Saving the password", run,
-                             lambda _ok: self._start_connectors(), failed)
-            return cid
+            if self.jobs.submit("connector_save", "Saving the password", run,
+                                lambda _ok: self._start_connectors(),
+                                failed) is not None:
+                return cid
+            # another save is still waiting on the keychain: never drop
+            # this password, save it here instead
         if password:
             self.vault.set(cid, password)
         self._start_connectors()
@@ -49879,7 +49899,8 @@ proc ::mw_retheme {w map fgnew deffg} {
         held = self.gate.release_all()
         try:
             with contextlib.suppress(Exception):
-                self.jobs.stop(finish=("session_save", "export",
+                self.jobs.stop(finish=("session_save", "connector_save",
+                                       "export",
                                        "table_export", "pcap_save"),
                                wait=20.0)
         finally:
@@ -57167,7 +57188,7 @@ def run_self_tests(verbose=True):
         assert tk_version_note(8.6) == ""
         assert preflight_unattended()                 # a test run
         assert "Preparing the capture driver" in CAPTURE_ONLY_STEPS
-        assert SCRIPT_VERSION == "5.1.2"
+        assert SCRIPT_VERSION == "5.2.3"
 
     def t_session_roundtrip():
         clk = _FakeClock()
@@ -61276,10 +61297,12 @@ def test_b09_console_text_and_small_fixes(ctx):
     try:
         for secret in ('c01-pa"ss\\word\u00e9-Zq7', "c01-Plain-Zq7"):
             assert vault.set("c1", secret)
-            args, data = seen[-1]
+            args, data = seen[-2]
             assert args == ["security", "-i"], args
-            assert all(secret not in a for a in args)
             assert _keychain_quote(secret).encode() in data
+            assert seen[-1][0][:2] == ["security", "find-generic-password"]
+            assert "-w" not in seen[-1][0]
+            assert all(secret not in a for c, _d in seen for a in c)
     finally:
         subprocess.run = real
     assert not _keychain_quotable("two\nlines")
