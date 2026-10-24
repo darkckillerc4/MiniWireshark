@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/darkckillerc4/MiniWireshark/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/darkckillerc4/MiniWireshark?label=release&color=4ea1ff"></a>
+  <a href="https://github.com/darkckillerc4/MiniWireshark/releases/latest"><img alt="Latest release 5.1.2" src="https://img.shields.io/badge/release-5.1.2-4ea1ff"></a>
   <img alt="Python 3.8+" src="https://img.shields.io/badge/python-3.8%2B-3776AB?logo=python&logoColor=white">
   <img alt="Platforms" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-555">
   <img alt="Single file" src="https://img.shields.io/badge/distribution-one%20.py%20file-7fbaff">
