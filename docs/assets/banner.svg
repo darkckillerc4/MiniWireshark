@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="320" viewBox="0 0 1280 320" role="img" aria-labelledby="t d">
+  <title id="t">MiniWireshark</title>
+  <desc id="d">MiniWireshark: your network, explained in plain English.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1b2d"/>
+      <stop offset="1" stop-color="#1b3354"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4ea1ff" stop-opacity="0"/>
+      <stop offset="0.25" stop-color="#4ea1ff" stop-opacity="0.9"/>
+      <stop offset="0.75" stop-color="#b48cff" stop-opacity="0.9"/>
+      <stop offset="1" stop-color="#b48cff" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M32 0H0V32" fill="none" stroke="#ffffff" stroke-opacity="0.05"/>
+    </pattern>
+  </defs>
+  <rect width="1280" height="320" fill="url(#bg)"/>
+  <rect width="1280" height="320" fill="url(#grid)"/>
+
+  <!-- network graph motif -->
+  <g stroke="#4ea1ff" stroke-opacity="0.35" stroke-width="2">
+    <line x1="980" y1="90" x2="1090" y2="150"/>
+    <line x1="1090" y1="150" x2="1200" y2="95"/>
+    <line x1="1090" y1="150" x2="1060" y2="250"/>
+    <line x1="1090" y1="150" x2="1190" y2="235"/>
+    <line x1="980" y1="90" x2="940" y2="200"/>
+  </g>
+  <g fill="#0f1b2d" stroke="#7fbaff" stroke-width="3">
+    <circle cx="1090" cy="150" r="18"/>
+    <circle cx="980" cy="90" r="11"/>
+    <circle cx="1200" cy="95" r="11"/>
+    <circle cx="1060" cy="250" r="11"/>
+    <circle cx="1190" cy="235" r="11"/>
+    <circle cx="940" cy="200" r="11"/>
+  </g>
+  <circle cx="1090" cy="150" r="6" fill="#7fbaff"/>
+
+  <!-- traffic wave -->
+  <path d="M0 268 L120 268 L140 250 L160 284 L180 240 L200 276 L230 268 L420 268 L440 236 L455 290 L470 252 L490 268 L700 268 L715 256 L730 280 L745 262 L760 268 L1280 268"
+        fill="none" stroke="url(#wave)" stroke-width="3" stroke-linejoin="round"/>
+
+  <!-- wordmark -->
+  <g font-family="Segoe UI, Inter, Helvetica Neue, Arial, sans-serif">
+    <text x="72" y="140" font-size="76" font-weight="700" fill="#ffffff" letter-spacing="-1">Mini<tspan fill="#7fbaff">Wireshark</tspan></text>
+    <text x="76" y="192" font-size="28" fill="#c9d6ea">Your network, explained in plain English.</text>
+    <text x="76" y="230" font-size="18" fill="#8aa0bf">Single-file · Python + Tk · Windows · Linux · macOS · Defensive by design</text>
+  </g>
+</svg>

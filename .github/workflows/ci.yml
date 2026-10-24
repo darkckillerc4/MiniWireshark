@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-22.04   # still has Python 3.8 builds
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.8", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Syntax check
+        run: python -m py_compile miniwireshark.py
+      - name: Install capture library
+        run: python -m pip install "scapy>=2.5" psutil
+      - name: Self-test
+        env:
+          MINIWIRESHARK_DATA: ${{ runner.temp }}/mw-data
+          MINIWIRESHARK_CONFIG: ${{ runner.temp }}/mw-config.json
+        run: xvfb-run -a python miniwireshark.py --self-test
