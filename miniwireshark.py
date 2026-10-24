@@ -77,7 +77,6 @@ from __future__ import annotations
 # ============================================================================
 import array
 import bisect
-import collections
 import contextlib
 import csv
 import base64
@@ -94,6 +93,7 @@ import itertools
 import io
 import ipaddress
 import json
+import locale
 import logging
 import logging.handlers
 import marshal
@@ -124,12 +124,12 @@ import uuid
 from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable
 
 _T_START = time.perf_counter()
 LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
-SCRIPT_VERSION = "5.1.2"
+SCRIPT_VERSION = "5.2.3"
 SESSION_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 2
 
@@ -140,6 +140,7 @@ NO_ELEVATE_FLAG = "--no-elevate"
 NO_ELEVATE_ENV = "MINIWIRESHARK_NO_ELEVATE"
 
 IS_WINDOWS = platform.system() == "Windows"
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # B-45
 IS_MAC = platform.system() == "Darwin"
 
 try:
@@ -147,13 +148,34 @@ try:
 except NameError:                                   # pragma: no cover
     SCRIPT_PATH = os.path.abspath(sys.argv[0])
 SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
+# 5.2.3 (M8): seams for a frozen build (PyInstaller). Frozen, the program is
+# the exe: there is no source file next to it, children are started as
+# [exe, *args], and data lives next to the exe, not in the unpack folder.
+FROZEN = bool(getattr(sys, "frozen", False))
+APP_PATH = os.path.abspath(sys.executable) if FROZEN else SCRIPT_PATH
+APP_HOME = os.path.dirname(APP_PATH)
+HAS_SOURCE = not FROZEN and os.path.isfile(SCRIPT_PATH)
+
+
+def self_cmd(*args):
+    """The command that starts this program again with `args`."""
+    if FROZEN:
+        return [sys.executable] + list(args)
+    return [sys.executable, SCRIPT_PATH] + list(args)
+
+
+if FROZEN and "--mw-worker" not in sys.argv:
+    # a windowed exe has no console: writes to None would raise
+    for _name in ("stdout", "stderr"):
+        if getattr(sys, _name) is None:
+            setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
 
 
 def _dir_writable(path):
     try:
         os.makedirs(path, exist_ok=True)
         probe = os.path.join(path, f".mw_write_test_{os.getpid()}")
-        with open(probe, "w") as f:
+        with open(probe, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(probe)
         return True
@@ -183,7 +205,7 @@ class AppPaths:
     def __init__(self):
         override = os.environ.get("MINIWIRESHARK_DATA")
         candidates = [override] if override else []
-        candidates += [os.path.join(SCRIPT_DIR, "miniwireshark_data"),
+        candidates += [os.path.join(APP_HOME, "miniwireshark_data"),
                        _user_data_root(),
                        os.path.join(tempfile.gettempdir(), "miniwireshark")]
         self.data = None
@@ -272,18 +294,41 @@ def setup_logging(verbose=False):
     setup_logging._done = True
 
 
+def _replace_retrying(tmp, path, tries=4):
+    """os.replace, retried briefly: on Windows an antivirus or the search
+    indexer holding the target for a moment makes it fail with
+    PermissionError (5.2.3, B-10). The temporary file never stays."""
+    try:
+        for i in range(tries):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if i == tries - 1:
+                    raise
+                time.sleep(0.05 * (i + 1))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+
+
+def _tmp_name(path):
+    return f"{path}.tmp{os.getpid()}-{threading.get_ident() % 100000}"
+
+
 def atomic_write_text(path, text, encoding="utf-8"):
-    tmp = f"{path}.tmp{os.getpid()}"
+    tmp = _tmp_name(path)
     with open(tmp, "w", encoding=encoding) as f:
         f.write(text)
-    os.replace(tmp, path)
+    _replace_retrying(tmp, path)
 
 
 def atomic_write_bytes(path, data):
-    tmp = f"{path}.tmp{os.getpid()}"
+    tmp = _tmp_name(path)
     with open(tmp, "wb") as f:
         f.write(data)
-    os.replace(tmp, path)
+    _replace_retrying(tmp, path)
 
 
 def session_is_gz(path):
@@ -463,26 +508,26 @@ def _fatal_dialog(title, message):
         _mb.showerror(title, message)
         r.destroy()
     except Exception:                                # noqa: BLE001
-        sys.stderr.write(f"\n*** {title} ***\n{message}\n")
+        if sys.stderr is not None:
+            sys.stderr.write(f"\n*** {title} ***\n{message}\n")
 
 
 def _relaunch_elevated():
-    script = SCRIPT_PATH
     extra = [a for a in sys.argv[1:] if a != ELEVATED_FLAG] + \
         list(_HANDOFF_ARGS) + ([SAFE_FLAG] if SAFE_MODE else [])
+    argv = self_cmd(ELEVATED_FLAG, *extra)
     if IS_WINDOWS:
-        params = subprocess.list2cmdline([script, ELEVATED_FLAG] + extra)
+        params = subprocess.list2cmdline(argv[1:])
         try:
             rc = ctypes.windll.shell32.ShellExecuteW(
-                None, "runas", sys.executable, params, None, 1)
+                None, "runas", argv[0], params, None, 1)
             if int(rc) > 32:
                 return True
         except (AttributeError, OSError):
             pass
         return False
     if IS_MAC:
-        cmd = " ".join(shlex.quote(p) for p in
-                       [sys.executable, script, ELEVATED_FLAG] + extra)
+        cmd = " ".join(shlex.quote(p) for p in argv)
         ascript = f'do shell script "{cmd}" with administrator privileges'
         try:
             sys.exit(subprocess.call(["osascript", "-e", ascript]))
@@ -506,8 +551,7 @@ def _relaunch_elevated():
         launchers.append(["kdesudo", "--"])
     for L in launchers:
         try:
-            sys.exit(subprocess.call(L + [sys.executable, script,
-                                          ELEVATED_FLAG] + extra))
+            sys.exit(subprocess.call(L + argv))
         except OSError:
             continue
     return False
@@ -571,7 +615,25 @@ def runtime_healthy(env):
         return False
     exe = env.get("python", "")
     return bool(exe and os.path.isfile(exe) and env.get("selftest_ok")
-                and not env.get("handshake_failed"))
+                and not env.get("handshake_failed")
+                and _venv_base_present(exe))
+
+
+def _venv_base_present(exe):
+    """5.2.3 (B-39): a runtime made from a Microsoft Store Python points
+    at the Store's versioned folder, which a Store update removes; the
+    runtime's python.exe still exists but can't start. pyvenv.cfg names
+    that folder, so this stays a file check (no subprocess)."""
+    cfg = os.path.join(os.path.dirname(os.path.dirname(exe)), "pyvenv.cfg")
+    try:
+        with open(cfg, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                key, sep, val = line.partition("=")
+                if sep and key.strip().lower() == "home":
+                    return os.path.isdir(val.strip())
+    except OSError:
+        pass
+    return True                      # not a venv, or no "home": trust it
 
 
 def _same_interpreter(a, b):
@@ -658,12 +720,17 @@ def compiled_copy_path():
 
 def cached_cmd(python, script, args=()):
     """[python, -c, CACHED_RUN, script, *args]: the same program as
-    [python, script, *args], loaded from the compiled copy (MW_PYC)."""
+    [python, script, *args], loaded from the compiled copy (MW_PYC).
+    Frozen: the exe itself, [exe, *args]."""
+    if FROZEN:
+        return [python] + list(args)
     return [python, "-c", CACHED_RUN, script] + list(args)
 
 
 def cached_env(env):
     env = dict(env)
+    if FROZEN:
+        return env
     env.setdefault("MW_PYC", compiled_copy_path())
     env["MW_CACHED"] = "1"
     return env
@@ -745,7 +812,7 @@ def start_from_compiled_copy(code, argv=None, environ=None, execute=True,
     return None
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and not FROZEN:
     if os.environ.get("MW_CACHED"):
         # loaded from the copy: keep it fresh for the processes it starts,
         # and let a process started the plain way do the same as this one
@@ -819,6 +886,7 @@ class BootReceipt:
         self._lock = threading.Lock()
         self.data = {
             "kind": kind, "version": SCRIPT_VERSION, "started": time.time(),
+            "script": SCRIPT_PATH,
             "pid": os.getpid(), "python": platform.python_version(),
             "executable": sys.executable, "platform": platform.platform(),
             "stage": MW_STAGE or "launcher",
@@ -895,6 +963,10 @@ class BootReceipt:
             return False
         if r.get("outcome") == "running" and _pid_alive(r.get("pid")):
             return False
+        if r.get("outcome") == "running" and r.get("on_welcome"):
+            # 5.2.3 (B-36): ended while the Welcome Center waited for a
+            # choice (console closed, logoff): the start itself worked
+            return False
         return True
 
     @staticmethod
@@ -916,10 +988,25 @@ class BootReceipt:
         return line
 
 
-def crash_loop_detected(receipts, current_path=""):
-    """True when the two newest previous starts both failed."""
+def _same_program(r, script=None, version=None):
+    """5.2.3 (B-35): archived versions run from one folder share the boot
+    receipts; only this file's own starts count."""
+    if r.get("script"):
+        a, b = r["script"], script or SCRIPT_PATH
+        return os.path.normcase(os.path.abspath(a)) == \
+            os.path.normcase(os.path.abspath(b))
+    if r.get("version"):
+        return r["version"] == (version or SCRIPT_VERSION)
+    return True
+
+
+def crash_loop_detected(receipts, current_path="", script=None,
+                        version=None):
+    """True when the two newest previous starts of this file both
+    failed."""
     prev = [r for r in receipts if r.get("_path") != current_path and
-            r.get("kind") == "start"][:2]
+            r.get("kind") == "start" and
+            _same_program(r, script, version)][:2]
     return len(prev) == 2 and all(BootReceipt.failed(r) for r in prev)
 
 
@@ -1013,6 +1100,8 @@ def runtime_handoff(argv=None, environ=None, execute=True, suitable=None,
     managed Python in the Runtime Manager; never in Safe Mode; and the
     child must report its window within the handshake time, or this
     process stays and explains why."""
+    if FROZEN:
+        return None                   # the exe carries its own Python
     environ = os.environ if environ is None else environ
     argv = list(sys.argv[1:] if argv is None else argv)
     if environ.get("MW_STAGE") == "app" or MW_STAGE == "app" or \
@@ -1127,9 +1216,11 @@ def needs_elevation():
     if is_admin():
         return False
     if IS_WINDOWS:
-        if not _npcap_present_early():
-            return True
-        return _npcap_admin_only()
+        # 5.2.3 (B-07): a missing Npcap no longer elevates the whole
+        # window (through the Store Python alias that fails for another
+        # admin account, with a misleading error); the installer alone
+        # asks for administrator rights (_run_as_admin_wait)
+        return _npcap_present_early() and _npcap_admin_only()
     return True
 
 
@@ -1220,7 +1311,7 @@ if __name__ == "__main__" and not TOOL_MODE and not _ELEV and \
 try:
     import tkinter as tk
     import tkinter.font as tkfont
-    from tkinter import filedialog, messagebox, simpledialog, ttk
+    from tkinter import filedialog, messagebox, ttk
 except ImportError:                                  # pragma: no cover
     sys.stderr.write(
         "MiniWireshark needs Python's graphical toolkit (tkinter).\n"
@@ -1361,14 +1452,22 @@ def _version_tuple(v):
     return tuple(out)
 
 
-def abi_tag(version=None, plat=None):
+def abi_tag(version=None, plat=None, flags=None):
     """'cp312-win_amd64': one private packages folder per Python version
-    and platform, so binary packages never mix after a Python upgrade."""
+    and platform, so binary packages never mix after a Python upgrade.
+    5.2.3 (B-38): free-threaded ('cp313t') and debug ('cp312d') builds
+    can't load ordinary binary packages, so they get their own folder."""
     import sysconfig
     v = version or sys.version_info[:2]
     p = plat or sysconfig.get_platform()
     p = re.sub(r"[^A-Za-z0-9]+", "_", p).strip("_").lower()
-    return f"cp{v[0]}{v[1]}-{p}"
+    if flags is None and version is not None:
+        flags = ""
+    if flags is None:
+        flags = ("t" if sysconfig.get_config_var("Py_GIL_DISABLED")
+                 else "") + ("d" if hasattr(sys, "gettotalrefcount")
+                             else "")
+    return f"cp{v[0]}{v[1]}{flags}-{p}"
 
 
 PKG_ROOT = os.path.join(PATHS.data, "site")
@@ -1523,7 +1622,10 @@ class PrivatePackages:
         return dict(self.manifest()["packages"])
 
     def activate(self):
-        """Put the folder on sys.path (after the script's own folder)."""
+        """Put the folder on sys.path (after the script's own folder).
+        Frozen: never; the exe's bundled modules must not be shadowed."""
+        if FROZEN:
+            return False
         if os.path.isdir(self.root) and self.root not in sys.path:
             sys.path.insert(1 if sys.path else 0, self.root)
             importlib.invalidate_caches()
@@ -1633,7 +1735,8 @@ class PrivatePackages:
     def _has_pip(self):
         try:
             r = subprocess.run([self.python, "-m", "pip", "--version"],
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, text=True, timeout=30,
+                               creationflags=NO_WINDOW)
             return r.returncode == 0
         except (OSError, subprocess.SubprocessError):
             return False
@@ -1662,7 +1765,7 @@ class PrivatePackages:
                 progress("Packages", 0.2, f"Installing {key} {ver}…", {})
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True,
-                                   timeout=timeout)
+                                   timeout=timeout, creationflags=NO_WINDOW)
             except subprocess.TimeoutExpired:
                 raise RuntimeError_("network", f"pip took more than "
                                                f"{timeout} s")
@@ -1779,7 +1882,7 @@ def _boot_time():
         except (AttributeError, OSError):
             return 0.0
     try:
-        with open("/proc/uptime") as f:
+        with open("/proc/uptime", encoding="ascii", errors="replace") as f:
             return time.time() - float(f.read().split()[0])
     except (OSError, ValueError):
         return 0.0
@@ -1931,6 +2034,43 @@ def _authenticode_status(path):
     return _authenticode_info(path)[0]
 
 
+def _run_as_admin_wait(exe, params, timeout):
+    """Run `exe` through the UAC prompt and wait for it (Windows only).
+    Returns its exit code; raises OSError when it can't start (the prompt
+    was declined) and subprocess.TimeoutExpired after `timeout` s."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _SEI(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("fMask", ctypes.c_ulong),
+                    ("hwnd", wintypes.HANDLE), ("lpVerb", wintypes.LPCWSTR),
+                    ("lpFile", wintypes.LPCWSTR),
+                    ("lpParameters", wintypes.LPCWSTR),
+                    ("lpDirectory", wintypes.LPCWSTR),
+                    ("nShow", ctypes.c_int), ("hInstApp", wintypes.HINSTANCE),
+                    ("lpIDList", ctypes.c_void_p),
+                    ("lpClass", wintypes.LPCWSTR),
+                    ("hkeyClass", wintypes.HKEY),
+                    ("dwHotKey", wintypes.DWORD),
+                    ("hIcon", wintypes.HANDLE),
+                    ("hProcess", wintypes.HANDLE)]
+    sei = _SEI(cbSize=ctypes.sizeof(_SEI), fMask=0x40,  # NOCLOSEPROCESS
+               lpVerb="runas", lpFile=exe, lpParameters=params, nShow=1)
+    if not ctypes.windll.shell32.ShellExecuteExW(ctypes.byref(sei)) or \
+            not sei.hProcess:
+        raise ctypes.WinError()
+    k32 = ctypes.windll.kernel32
+    try:
+        if k32.WaitForSingleObject(sei.hProcess,
+                                   int(timeout * 1000)) != 0:
+            raise subprocess.TimeoutExpired(exe, timeout)
+        code = wintypes.DWORD()
+        k32.GetExitCodeProcess(sei.hProcess, ctypes.byref(code))
+        return int(code.value)
+    finally:
+        k32.CloseHandle(sei.hProcess)
+
+
 def _install_npcap(loader, state):
     """Download and run the official Npcap installer. The free edition of
     Npcap does not allow silent installs, so the installer window is shown
@@ -1942,7 +2082,11 @@ def _install_npcap(loader, state):
     state.note_attempt("npcap")
     ver = _latest_npcap_version()
     url = f"https://npcap.com/dist/npcap-{ver}.exe"
-    exe = os.path.join(tempfile.gettempdir(), f"npcap-{ver}.exe")
+    # 5.2.3 (B-08): a fresh folder with an unpredictable name, not a fixed
+    # name in TEMP that another program could swap between the signature
+    # check and the run
+    exe = os.path.join(tempfile.mkdtemp(prefix="mw-npcap-"),
+                       f"npcap-{ver}.exe")
     loader.post_log(f"  Downloading the capture driver (Npcap {ver}) ...",
                     None)
     loader.post_log(f"  {url}", "detail")
@@ -1959,14 +2103,14 @@ def _install_npcap(loader, state):
             webbrowser.open("https://npcap.com/#download")
         except Exception:                            # noqa: BLE001
             pass
+        shutil.rmtree(os.path.dirname(exe), ignore_errors=True)
         return False, (f"Could not download the capture driver ({e}). "
                        "Your browser was opened on the Npcap download page.")
     sig, signer = _authenticode_info(exe)
     loader.post_log(f"  Installer signature: {sig or 'unknown'} "
                     f"({signer or 'no signer'})", "detail")
     if sig != "Valid" or not signer_matches(signer, NPCAP_SIGNER):
-        with contextlib.suppress(OSError):
-            os.remove(exe)
+        shutil.rmtree(os.path.dirname(exe), ignore_errors=True)
         return False, ("The downloaded capture-driver installer is not "
                        f"signed by {NPCAP_SIGNER} (signature: "
                        f"{sig or 'unknown'}), so MiniWireshark refused to "
@@ -1977,12 +2121,23 @@ def _install_npcap(loader, state):
                     "Next / I Agree / Install. Keep the default options.",
                     None)
     try:
-        r = subprocess.run([exe, "/winpcap_mode=yes"], timeout=1200)
+        try:
+            code = subprocess.run([exe, "/winpcap_mode=yes"],
+                                  timeout=1200).returncode
+        except OSError as e:
+            if getattr(e, "winerror", None) != 740:
+                raise
+            # 5.2.3 (B-08): "requires elevation" — ask Windows to run it
+            # as administrator (the UAC prompt) instead of failing
+            code = _run_as_admin_wait(exe, "/winpcap_mode=yes", 1200)
     except subprocess.TimeoutExpired:
         return False, "The Npcap installer didn't finish within 20 minutes."
     except (OSError, subprocess.SubprocessError) as e:
         return False, f"Installer failed to start: {e}"
-    LOG.info("Npcap installer exit code %s", r.returncode)
+    finally:
+        shutil.rmtree(os.path.dirname(exe), ignore_errors=True)
+    LOG.info("Npcap installer exit code %s", code)
+    r = types.SimpleNamespace(returncode=code)
     if r.returncode == 3010:
         state.data["npcap"] = {"reboot_pending_since": time.time(),
                                "boot_time": _boot_time()}
@@ -2034,9 +2189,11 @@ class LoaderWindow(tk.Frame):
          "Shorter freezes when saving, loading and changing text size; "
          "sharp text on Windows at 125 % and more; an interface scale; "
          "Reduce motion; a visible keyboard focus everywhere."),
-        ("\U0001F52C", "Everything from 5.0 is still here",
-         "The packet workspace, Full Power, Email Traffic, the Components "
-         "Center and Safe Mode work as before."),
+        ("\U0001F6E1", "Steadier on real PCs",
+         "Capture starts without freezing the window, devices are told "
+         "apart on PCs with VPN and virtual adapters, memory stays bounded "
+         "while minimised, and closing is quick. Copies of different "
+         "versions in one folder no longer get in each other's way."),
     )
 
     def __init__(self, master, config=None, mode="startup"):
@@ -3124,6 +3281,8 @@ def step_runtime(l, state):
     """V5: run on this Python whenever it can run the app. The managed
     Python is never offered as a blocking question at startup; it lives in
     the Runtime Manager (and is used only after its window reports back)."""
+    if FROZEN:
+        return True, "Running from the standalone program (Python built in)."
     if MW_STAGE == "app":
         mgr = RuntimeManager()
         st = mgr.status()
@@ -3758,7 +3917,8 @@ class RuntimeManager:
         try:
             r = subprocess.run([exe, "-c", "import sys, tkinter, venv; "
                                 "print(sys.version_info[:2])"],
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, text=True, timeout=30,
+                               creationflags=NO_WINDOW)
             return r.returncode == 0 and "(3, 14)" in r.stdout
         except (OSError, subprocess.SubprocessError):
             return False
@@ -5628,7 +5788,7 @@ def reputation_text(hits):
 # ============================================================================
 PRIVATE_NETS = [ipaddress.ip_network(n) for n in
                 ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                 "169.254.0.0/16", "127.0.0.0/8", "100.64.0.0/10",
+                 "169.254.0.0/16", "127.0.0.0/8",
                  "224.0.0.0/4", "fe80::/10", "fc00::/7", "::1/128",
                  "ff00::/8")]
 
@@ -6685,6 +6845,42 @@ def is_multicast_or_broadcast(ip):
 
 def iface_name(iface):
     return str(getattr(iface, "name", iface) or "")
+
+
+LAN_NETS = [ipaddress.ip_network(n) for n in
+            ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+             "169.254.0.0/16")]
+
+
+def local_nets_from_routes(routes, capture_iface=""):
+    """This computer's on-link IPv4 networks, from a scapy route table
+    ((net, mask, gw, iface, addr, ...) rows). 5.2.3 (B-11/B-12): only
+    private and link-local ranges count (a VPN or ZeroTier adapter with an
+    on-link public prefix turned websites into "devices"), and when the
+    capture adapter is known its networks come alone, so a virtual
+    switch's subnet is never taken for the LAN or its fingerprint."""
+    mine, other = [], []
+    want = iface_name(capture_iface)
+    for entry in routes or ():
+        try:
+            net, mask, gw, iface, addr = entry[:5]
+        except (TypeError, ValueError):
+            continue
+        if gw not in ("0.0.0.0", "", None) or not net or \
+                addr in ("127.0.0.1", "0.0.0.0", ""):
+            continue
+        try:
+            n = ipaddress.ip_network(
+                f"{_int_to_ip(net)}/{_int_to_ip(mask)}", strict=False)
+        except ValueError:
+            continue
+        if not 8 <= n.prefixlen < 32 or \
+                not any(n.subnet_of(p) for p in LAN_NETS):
+            continue
+        bucket = mine if want and iface_name(iface) == want else other
+        if n not in bucket:
+            bucket.append(n)
+    return (mine or other)[:16]
 
 
 def iface_desc(iface):
@@ -9023,20 +9219,38 @@ def build_sniffer(iface, prn, bpf, promisc=True):
     if bpf:
         base["filter"] = bpf
     last = None
-    for extra in variants:
+    refused = False
+    i = 0
+    while i < len(variants):
+        extra = variants[i]
+        i += 1
         try:
             s = AsyncSniffer(**dict(base, **extra))
             s.start()
         except Exception as e:                       # noqa: BLE001
             last = e
-            continue
-        time.sleep(0.45)
-        if getattr(s, "exception", None) is None:
-            return s, None
-        last = s.exception
-        with contextlib.suppress(Exception):
-            s.stop()
+        else:
+            time.sleep(0.45)
+            if getattr(s, "exception", None) is None:
+                if refused:
+                    s.mw_promisc_refused = True
+                return s, None
+            last = s.exception
+            with contextlib.suppress(Exception):
+                s.stop()
+        if promisc and p["promisc"] and not refused and \
+                refused_promisc(last):
+            # 5.2.3: some (mostly Wi-Fi) cards refuse to watch all
+            # traffic; "{}" would ask for promiscuous mode again
+            refused = True
+            variants, i = [{"promisc": False}], 0
     return None, last
+
+
+def refused_promisc(exc):
+    """True when a card refused promiscuous mode (Npcap: "failed to set
+    hardware filter to promiscuous mode")."""
+    return exc is not None and "promisc" in str(exc).lower()
 
 
 class NameCache:
@@ -9160,6 +9374,13 @@ def learn_names_from(cache, d):
     """Feed the IP→name cache from one decoded packet (any thread)."""
     src = _LEARN_SOURCE.get(d["proto"], "dns")
     for ip, name in d["learns"]:
+        if src == "dns" and d["proto"] != "LLMNR" and is_private_ip(ip):
+            # 5.2.3 (B-15): a DNS answer pointing a name at a local
+            # address says nothing about that device (a Pi-hole answers
+            # its own address for every blocked ad server and became
+            # "ads.doubleclick.net"); its own names come from DHCP, mDNS,
+            # NBNS and reverse lookups
+            continue
         cache.learn(ip, name, source=src)
 
 
@@ -9382,11 +9603,6 @@ def score_interfaces(default_iface_name="", gateway_ip=""):
 def explain_choice(rec):
     if not rec:
         return ""
-    good = [r for r in rec["reasons"] if not r.startswith(("it has no",
-                                                           "it looks",
-                                                           "it is the",
-                                                           "it is dis",
-                                                           "it only"))]
     return "Picked because " + explain_reasons(rec)
 
 
@@ -9426,7 +9642,7 @@ def system_dns_servers():
             for path in ("/run/systemd/resolve/resolv.conf",
                          "/etc/resolv.conf"):
                 if os.path.exists(path):
-                    with open(path) as f:
+                    with open(path, encoding="ascii", errors="replace") as f:
                         servers = re.findall(r"^\s*nameserver\s+(\S+)",
                                              f.read(), re.M)
                     if servers and servers != ["127.0.0.53"]:
@@ -9636,6 +9852,26 @@ def fast_switch(who, on, interval=0.001):
         want = interval if _FAST_SWITCH_USERS else _NORMAL_SWITCH[0]
         if abs(sys.getswitchinterval() - want) > 1e-6:
             sys.setswitchinterval(want)
+        _windows_timer(bool(_FAST_SWITCH_USERS))
+
+
+_WIN_TIMER = [False]
+
+
+def _windows_timer(fine):
+    """5.2.3 (B-06): Windows rounds short waits (the 1-3 ms hand-offs
+    between the analysis thread and the window) up to its 15.6 ms timer
+    tick. While somebody needs fast switching the timer runs at 1 ms
+    (timeBeginPeriod), and is given back as soon as nobody does."""
+    if not IS_WINDOWS or fine == _WIN_TIMER[0] or \
+            (fine and not FEATURES.get("win_timer", True)):
+        return
+    try:
+        winmm = ctypes.WinDLL("winmm")
+        (winmm.timeBeginPeriod if fine else winmm.timeEndPeriod)(1)
+        _WIN_TIMER[0] = fine
+    except (OSError, AttributeError):
+        pass
 
 
 _GC_NORMAL = [None]
@@ -9785,7 +10021,24 @@ FEATURES = {
     "answer_cards": True,    # three answers on the Dashboard (M6)
     "dpi": True,             # Windows draws sharp text at 125 %+ (M8)
     "warm_start": True,      # the window is built behind the loading screen
+    "win_timer": True,       # 1 ms Windows timer while busy (5.2.3, B-06)
 }
+
+
+def release_freed_memory():
+    """5.2.3 (B-23): after a big model is replaced, glibc keeps the freed
+    pages (50-120 MB that looked like a leak after reloading a session);
+    malloc_trim hands them back. Linux with glibc only; a no-op
+    elsewhere."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        import ctypes
+        import ctypes.util
+        name = ctypes.util.find_library("c") or "libc.so.6"
+        return bool(ctypes.CDLL(name).malloc_trim(0))
+    except (OSError, AttributeError):
+        return False
 
 
 def freeze_startup_objects():
@@ -9924,6 +10177,8 @@ FEATURE_HELP = {
     "dpi": "sharp text at 125 % and more on Windows",
     "warm_start": "the window is built and warmed behind the loading "
                   "screen; text widths are remembered between starts",
+    "win_timer": "Windows wakes the program every 1 ms (not 15.6 ms) "
+                 "only while the window is busy",
 }
 
 
@@ -10282,6 +10537,12 @@ def classify_capture_fault(exc):
                                     "libpcap not", "no libpcap",
                                     "packet.dll")):
             kind = "driver"
+        elif "promisc" in low or "error opening adapter" in low:
+            # 5.2.3: checked before "filter" ("failed to set hardware
+            # filter to promiscuous mode" is not a bad capture filter) and
+            # before "adapter" (Npcap's "Error opening adapter … (20)/(50)"
+            # means this card can't be opened, not that it went away)
+            kind = "wrong_adapter"
         elif any(w in low for w in ("syntax error", "filter", "bpf",
                                     "illegal token", "parse error in")):
             kind = "bad_filter"
@@ -10290,7 +10551,7 @@ def classify_capture_fault(exc):
         elif errno_ in (19, 6, 100, 50) or any(
                 w in low for w in ("disappeared", "no such device",
                                    "network is down", "device not",
-                                   "adapter", "interface went down",
+                                   "adapter went away", "interface went down",
                                    "enxio", "enodev", "restart failed")):
             kind = "adapter_gone"
         elif any(w in low for w in ("no such interface", "not found",
@@ -10625,18 +10886,31 @@ class RawCapture(threading.Thread):
         self.first_cycle = threading.Event()
         self.sock = None
         self.kind = "raw socket"
+        self.promisc_refused = False
 
     def _open(self):
         kwargs = {"iface": self.iface}
         if self.bpf:
             kwargs["filter"] = self.bpf
         last = None
-        for extra in ({"promisc": self.promisc}, {}):
+        tries = [{"promisc": self.promisc}, {}]
+        while tries:
+            extra = tries.pop(0)
             try:
                 return conf.L2listen(**dict(kwargs, **extra))
             except TypeError as e:
                 last = e
-                continue
+            except Exception as e:                   # noqa: BLE001
+                if not self.promisc or self.promisc_refused or \
+                        not refused_promisc(e):
+                    raise
+                # 5.2.3: the card refuses promiscuous mode; watch this
+                # computer's own traffic instead of not watching at all
+                LOG.info("%s refused promiscuous mode (%s); capturing "
+                         "without it", self.iface, e)
+                self.promisc_refused = True
+                last = e
+                tries = [{"promisc": False}]
         raise last or RuntimeError("could not open capture socket")
 
     def run(self):
@@ -10705,6 +10979,10 @@ class SnifferCapture:
     def exception(self):
         return getattr(self.sniffer, "exception", None)
 
+    @property
+    def promisc_refused(self):
+        return bool(getattr(self.sniffer, "mw_promisc_refused", False))
+
     def stop(self):
         with contextlib.suppress(Exception):
             self.sniffer.stop()
@@ -10737,6 +11015,26 @@ def start_capture_source(iface, bpf, promisc, sink):
     if sn is None:
         return None, err2 or err
     return SnifferCapture(sn), None
+
+
+def probe_capture_sources(candidates, bpf, promisc, sink,
+                          cancelled=lambda: False):
+    """Try (label, iface) pairs in order → (source, last_error, label).
+    Each card that refuses can take ~1.5 s (Windows), so callers run this
+    off the Tk thread (5.2.3)."""
+    err = None
+    for lbl, iface in candidates:
+        if cancelled():
+            break
+        src, err = start_capture_source(iface, bpf, promisc, sink)
+        if src is not None:
+            if cancelled():
+                with contextlib.suppress(Exception):
+                    src.stop()
+                return None, None, None
+            return src, None, lbl
+        LOG.info("capture failed on %s: %s", lbl, err)
+    return None, err, None
 
 
 # ---- capture files (stdlib reader for pcap and pcapng) ----------------------
@@ -12531,9 +12829,7 @@ def current_ssid():
                      r"^yes:(.+)$"))
     for cmd, pat in cmds:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=6, creationflags=getattr(
-                                   subprocess, "CREATE_NO_WINDOW", 0))
+            r = run_console(cmd, timeout=6)
         except (OSError, subprocess.SubprocessError):
             continue
         for line in (r.stdout or "").splitlines():
@@ -12551,9 +12847,7 @@ def os_neighbor_mac(ip):
             [["ip", "neigh", "show", ip], ["arp", "-n", ip]])
     for cmd in cmds:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=5, creationflags=getattr(
-                                   subprocess, "CREATE_NO_WINDOW", 0))
+            r = run_console(cmd, timeout=5)
         except (OSError, subprocess.SubprocessError):
             continue
         m = re.search(r"([0-9a-fA-F]{2}([:-])(?:[0-9a-fA-F]{2}\2){4}"
@@ -13578,8 +13872,14 @@ class AlertEngine:
         self.order.appendleft(a.id)
         self._open[(kind, subject)] = a.id
         while len(self.order) > 500:
-            self.alerts.pop(self.order.pop(), None)
+            old = self.alerts.pop(self.order.pop(), None)
+            # 5.2.3 (B-27): forget it as "open" too (the map only grew)
+            if old is not None and \
+                    self._open.get((old.kind, old.subject)) == old.id:
+                del self._open[(old.kind, old.subject)]
         return a
+
+    DEBOUNCE_KEEP = 20000
 
     def _debounced(self, key, seconds):
         now = self.now()
@@ -13587,6 +13887,16 @@ class AlertEngine:
         if last is not None and now - last < seconds:
             return True
         self._debounce[key] = now
+        if len(self._debounce) > self.DEBOUNCE_KEEP:
+            # 5.2.3 (B-27): keys are per device and address, so this grew
+            # for ever; nothing waits longer than a day
+            for k in [k for k, t in self._debounce.items()
+                      if now - t > 86400]:
+                del self._debounce[k]
+            if len(self._debounce) > self.DEBOUNCE_KEEP:
+                for k in list(itertools.islice(self._debounce,
+                                               self.DEBOUNCE_KEEP // 10)):
+                    del self._debounce[k]
         return False
 
     def acknowledge(self, aid):
@@ -14001,6 +14311,50 @@ class AlertEngine:
 # ============================================================================
 #  This computer's Wi-Fi link (read-only questions to the operating system)
 # ============================================================================
+def _keychain_quotable(s):
+    return isinstance(s, str) and not any(c in s for c in "\r\n\0")
+
+
+def _keychain_quote(s):
+    """One argument for `security -i`: double quotes, with backslash and
+    double quote escaped."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _one_line_end(text):
+    """`text` without its one trailing newline (5.2.3, B-41: rstrip("\\n")
+    removed backslashes and the letter n, and kept the newline)."""
+    if text.endswith("\r\n"):
+        return text[:-2]
+    return text[:-1] if text.endswith("\n") else text
+
+
+def console_decode(data):
+    """Bytes from a console program as text. 5.2.3 (B-09): Windows tools
+    (netsh, arp) write in the OEM code page, not the ANSI one `text=True`
+    uses, so on French, German or Russian Windows the decode failed and
+    stopped the network-identity thread. Nothing here can raise."""
+    if isinstance(data, str) or data is None:
+        return data or ""
+    for enc in (("oem",) if IS_WINDOWS else ()) + (
+            locale.getpreferredencoding(False) or "utf-8",):
+        try:
+            return data.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", "replace")
+
+
+def run_console(cmd, timeout=10):
+    """subprocess.run for a read-only console tool: no window flashes,
+    output decoded with console_decode."""
+    r = subprocess.run(cmd, capture_output=True, timeout=timeout,
+                       creationflags=getattr(subprocess,
+                                             "CREATE_NO_WINDOW", 0))
+    r.stdout, r.stderr = console_decode(r.stdout), console_decode(r.stderr)
+    return r
+
+
 def wifi_channel_from_mhz(mhz):
     try:
         f = int(round(float(mhz)))
@@ -14012,7 +14366,9 @@ def wifi_channel_from_mhz(mhz):
         return (f - 2407) // 5, "2.4 GHz"
     if 5150 <= f <= 5895:
         return (f - 5000) // 5, "5 GHz"
-    if 5925 <= f <= 7125:
+    if f == 5935:                    # 6 GHz channel 2 (5.2.3, B-19)
+        return 2, "6 GHz"
+    if 5955 <= f <= 7125:
         return (f - 5950) // 5, "6 GHz"
     return None, ""
 
@@ -14206,11 +14562,7 @@ class WifiProbe:
     @staticmethod
     def _cmd(cmd, timeout=10):
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout,
-                               creationflags=getattr(
-                                   subprocess, "CREATE_NO_WINDOW", 0))
-            return r.stdout or ""
+            return run_console(cmd, timeout=timeout).stdout or ""
         except (OSError, subprocess.SubprocessError):
             return ""
 
@@ -14352,6 +14704,14 @@ class ProcessMap:
         conns, partial = self._connections(ps)
         by_local, by_port, listening = {}, {}, {}
         unnamed = 0
+        # 5.2.3 (B-18): Windows reuses process numbers quickly; a name is
+        # kept only while its process number is still in the table, so a
+        # new program never inherits a finished one's name
+        live = {c[1] if isinstance(c, tuple) and len(c) == 2 and
+                not hasattr(c, "laddr") else getattr(c, "pid", None)
+                for c in conns}
+        for gone in [p for p in self.names if p not in live]:
+            del self.names[gone]
         for c in conns:
             pid = None
             if isinstance(c, tuple) and len(c) == 2 and not hasattr(
@@ -14515,10 +14875,7 @@ def read_arp_cache():
     """This computer's ARP cache (read-only; nothing is sent)."""
     try:
         if IS_WINDOWS:
-            r = subprocess.run(["arp", "-a"], capture_output=True, text=True,
-                               timeout=10, creationflags=getattr(
-                                   subprocess, "CREATE_NO_WINDOW", 0))
-            return parse_arp_windows(r.stdout)
+            return parse_arp_windows(run_console(["arp", "-a"], 10).stdout)
         if os.path.exists("/proc/net/arp"):
             with open("/proc/net/arp", encoding="utf-8") as f:
                 return parse_proc_arp(f.read())
@@ -14737,12 +15094,25 @@ class CredentialVault:
 
     def set(self, cid, secret):
         register_secret(secret)
-        if self.backend == "keychain":
-            r = subprocess.run(["security", "add-generic-password", "-U",
-                                "-a", cid, "-s", self.SERVICE, "-w", secret],
+        if self.backend == "keychain" and _keychain_quotable(secret) and \
+                _keychain_quotable(cid):
+            # 5.2.3 (C-01): the command goes to `security -i` on stdin; on
+            # the command line any local program could read the secret
+            # from the process list while it ran
+            cmd = "add-generic-password -U -a {} -s {} -w {}\n".format(
+                _keychain_quote(cid), _keychain_quote(self.SERVICE),
+                _keychain_quote(secret))
+            r = subprocess.run(["security", "-i"], input=cmd.encode(),
                                capture_output=True, timeout=20)
-            if r.returncode == 0:
-                return True
+            if r.returncode == 0 and b"error" not in r.stderr.lower():
+                # `security -i` can exit 0 when the command inside failed
+                # (locked keychain): confirm the item exists (no -w, so
+                # the secret is never printed)
+                chk = subprocess.run(["security", "find-generic-password",
+                                      "-a", cid, "-s", self.SERVICE],
+                                     capture_output=True, timeout=20)
+                if chk.returncode == 0:
+                    return True
         elif self.backend == "secret-service":
             r = subprocess.run(["secret-tool", "store", "--label",
                                 f"{self.SERVICE} {cid}", "service",
@@ -14769,14 +15139,14 @@ class CredentialVault:
                                    capture_output=True, text=True,
                                    timeout=20)
                 if r.returncode == 0:
-                    val = r.stdout.rstrip("\\n")
+                    val = _one_line_end(r.stdout)
             elif self.backend == "secret-service":
                 r = subprocess.run(["secret-tool", "lookup", "service",
                                     self.SERVICE, "account", cid],
                                    capture_output=True, text=True,
                                    timeout=20)
                 if r.returncode == 0 and r.stdout:
-                    val = r.stdout.rstrip("\\n")
+                    val = _one_line_end(r.stdout)
             if val is None:
                 ent = self._file().get(cid) or {}
                 if "dpapi" in ent and IS_WINDOWS:
@@ -16637,6 +17007,7 @@ class NetworkModel:
         self.baselines = BaselineEngine(config)
         self.scans = ScanTracker()
         self.websites = {}
+        self._seen_roots = None          # registrable domains seen (B-24)
         self.remote_hosts = {}
         self.ip_to_domains = {}
         self.timeline = deque(maxlen=3000)
@@ -17346,9 +17717,11 @@ class NetworkModel:
                 continue
             use_mac = mac if is_unicast_mac(mac) else None
             if use_mac and ip and ip != self.gateway_ip and \
-                    use_mac in self.registry.gw_macs and \
                     self._routed_private_v4(ip):
-                use_mac = None      # routed from elsewhere via the router
+                # routed from elsewhere via the router; 5.2.3 (B-13): also
+                # before the router's MAC is known, or the first such
+                # packet moved the router device to that address
+                use_mac = None
             dev = self.registry.note_traffic(ip or None, use_mac, nbytes,
                                              proto, role, internet, ts)
             if dev is None:
@@ -17406,6 +17779,8 @@ class NetworkModel:
         a = ip_obj(ip)
         if a is None or a.version != 4:
             return False
+        if a.is_link_local:
+            return False          # 169.254/16 is never routed: same link
         nets = [n for n in self.local_nets if n.version == 4]
         return bool(nets) and not any(a in n for n in nets)
 
@@ -17959,11 +18334,21 @@ class NetworkModel:
         if not key or "." not in key:
             return None
         rec = self.websites.get(key)
-        is_new = rec is None
         if rec is None:
             reg = registrable_domain(key)
-            new_root = not any(w.registrable == reg
-                               for w in list(self.websites.values())[-3000:])
+            # 5.2.3 (B-24): was a scan of the last 3,000 websites for every
+            # new one (up to 0.2 ms each), and a site first seen more than
+            # 3,000 websites ago got a second "First visit"
+            roots = self._seen_roots
+            if roots is None:
+                roots = self._seen_roots = dict.fromkeys(
+                    w.registrable for w in self.websites.values())
+            new_root = reg not in roots
+            if new_root:
+                roots[reg] = None
+                if len(roots) > 60000:
+                    for k in list(itertools.islice(roots, 6000)):
+                        del roots[k]
             rec = WebsiteRecord(domain=key, registrable=reg, first_seen=ts,
                                 last_seen=ts)
             cat, src = domain_category(key)
@@ -18668,7 +19053,7 @@ class AppConfig:
     old schemas; never stores credentials."""
 
     def __init__(self, path=None):
-        default_path = os.path.join(SCRIPT_DIR, "miniwireshark_config.json")
+        default_path = os.path.join(APP_HOME, "miniwireshark_config.json")
         if path is None:
             path = os.environ.get("MINIWIRESHARK_CONFIG")
         if path is None:
@@ -18695,7 +19080,20 @@ class AppConfig:
                 if section in merged and isinstance(vals, dict) and \
                         isinstance(merged[section], dict):
                     merged[section].update(vals)
-            merged["config_version"] = CONFIG_SCHEMA_VERSION
+                elif section not in merged:
+                    # 5.2.3 (B-32): a section this version doesn't know
+                    # (written by a newer one) is kept as it is, so running
+                    # an older copy no longer erases those settings
+                    merged[section] = vals
+            try:
+                ver = int(data.get("config_version", 0) or 0)
+            except (TypeError, ValueError):
+                ver = 0
+            if ver > CONFIG_SCHEMA_VERSION:
+                LOG.info("settings were written by a newer MiniWireshark "
+                         "(schema %s); keeping what this version doesn't "
+                         "know", ver)
+            merged["config_version"] = max(ver, CONFIG_SCHEMA_VERSION)
             return merged
         except (OSError, ValueError) as e:
             LOG.warning("config unreadable (%s); using defaults", e)
@@ -19296,10 +19694,34 @@ class Store:
                     "v TEXT)")
         row = con.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
         ver = int(row[0]) if row and str(row[0]).isdigit() else 0
+        if ver > STORE_SCHEMA_VERSION:
+            # 5.2.3 (B-34): written by a newer MiniWireshark; writing into
+            # tables this version doesn't know could damage it
+            con.close()
+            raise sqlite3.DatabaseError(
+                f"the history file was made by a newer MiniWireshark "
+                f"(schema {ver}); history is off for this version")
         if ver < STORE_SCHEMA_VERSION and ver > 0:
-            with contextlib.suppress(OSError):
-                con.commit()
-                shutil.copyfile(self.path, f"{self.path}.v{ver}.bak")
+            con.commit()
+            bak = f"{self.path}.v{ver}.bak"
+            try:
+                fresh = time.time() - os.path.getmtime(bak) < 20 * 3600
+            except OSError:
+                fresh = False
+            if not fresh:
+                # 5.2.3: sqlite's own backup includes what is still in the
+                # -wal file (a plain file copy missed it); at most one a
+                # day, so switching back and forth with 3.0.0 doesn't copy
+                # the whole file on every start
+                try:
+                    dst = sqlite3.connect(bak + ".tmp")
+                    try:
+                        con.backup(dst)
+                    finally:
+                        dst.close()
+                    os.replace(bak + ".tmp", bak)
+                except (sqlite3.Error, OSError) as e:
+                    LOG.warning("history backup before migrating: %s", e)
         for v in range(ver + 1, STORE_SCHEMA_VERSION + 1):
             self._migrate(con, v)
         con.execute("INSERT OR REPLACE INTO sessions VALUES(?,?,?,?,?,?,?)",
@@ -22195,6 +22617,8 @@ Results as you type, Ctrl+K for every setting and Help topic, Back and Forward b
 Correct it, compare it, look back ¦ Corriger, comparer, remonter le temps ¦ Corregir, comparar, mirar atrás
 Fix a website's category, tag a device's place and owner, undo any of it; pin two devices side by side; see the session as of any minute on the Timeline. ¦ Corrigez la catégorie d'un site, indiquez le lieu et le propriétaire d'un appareil, annulez n'importe laquelle de ces corrections ; épinglez deux appareils côte à côte ; voyez la session à n'importe quelle minute dans la Chronologie. ¦ Corrija la categoría de un sitio, indique el lugar y el propietario de un dispositivo, deshaga cualquiera de ellas; fije dos dispositivos uno al lado del otro; vea la sesión en cualquier minuto en la Cronología.
 Faster, steadier, easier to read ¦ Plus rapide, plus stable, plus lisible ¦ Más rápido, más estable, más legible
+Steadier on real PCs ¦ Plus solide sur les vrais PC ¦ Más estable en PC reales
+Capture starts without freezing the window, devices are told apart on PCs with VPN and virtual adapters, memory stays bounded while minimised, and closing is quick. Copies of different versions in one folder no longer get in each other's way. ¦ La capture démarre sans figer la fenêtre, les appareils sont bien distingués sur les PC avec VPN et cartes virtuelles, la mémoire reste limitée quand la fenêtre est réduite et la fermeture est rapide. Des copies de versions différentes dans un même dossier ne se gênent plus. ¦ La captura empieza sin congelar la ventana, los dispositivos se distinguen bien en PC con VPN y adaptadores virtuales, la memoria se mantiene limitada con la ventana minimizada y el cierre es rápido. Las copias de distintas versiones en una misma carpeta ya no se estorban.
 Shorter freezes when saving, loading and changing text size; sharp text on Windows at 125 % and more; an interface scale; Reduce motion; a visible keyboard focus everywhere. ¦ Des blocages plus courts à l'enregistrement, au chargement et au changement de taille du texte ; un texte net sous Windows à 125 % et plus ; une échelle de l'interface ; Réduire les animations ; un focus clavier visible partout. ¦ Bloqueos más cortos al guardar, cargar y cambiar el tamaño del texto; texto nítido en Windows al 125 % o más; una escala de la interfaz; Reducir el movimiento; un foco de teclado visible en todas partes.
 Everything from 5.0 is still here ¦ Tout ce que contenait la 5.0 est toujours là ¦ Todo lo de la 5.0 sigue aquí
 The packet workspace, Full Power, Email Traffic, the Components Center and Safe Mode work as before. ¦ L'espace de travail des paquets, la pleine puissance, le trafic e-mail, le centre des composants et le mode sans échec fonctionnent comme avant. ¦ El espacio de trabajo de paquetes, la potencia máxima, el tráfico de correo, el centro de componentes y el modo seguro funcionan como antes.
@@ -23859,7 +24283,6 @@ class FlowLayout:
             rows = [[]]          # each: list of (it, x, w)
             x = xmin = 0         # xmin: a stretching label may shrink
             for unit in self._units(lefts):
-                uw = sum(self._wid(it) for it in unit)
                 umin = sum(min(self._wid(it), 260) if it["expand"]
                            else self._wid(it) for it in unit)
                 if xmin > 0 and xmin + umin > W:
@@ -26998,14 +27421,21 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
         with contextlib.suppress(tk.TclError):
             canvas.yview_scroll(step * 2, "units")
 
+    # 5.2.3 (B-28): the wheel command is registered once; bind_all(fn)
+    # on every <Enter> registered a new Tcl command each time (a leak)
+    script = 'if {"[%s %s]" == "break"} break\n' % (
+        canvas._register(wheel, canvas._substitute, True),
+        canvas._subst_format_str)
+
     def bind(_e=None):
         for sq in seqs:
-            canvas.bind_all(sq, wheel)
+            with contextlib.suppress(tk.TclError):
+                canvas.tk.call("bind", "all", sq, script)
 
     def unbind(_e=None):
         for sq in seqs:
             with contextlib.suppress(tk.TclError):
-                canvas.unbind_all(sq)
+                canvas.tk.call("bind", "all", sq, "")
     outer.bind("<Enter>", bind)
     outer.bind("<Leave>", unbind)
     outer.canvas = canvas
@@ -29633,7 +30063,7 @@ class DashboardTab(BaseTab):
     def refresh(self, force=False):
         if not force and not self.is_visible():
             return
-        m, t, app = self.model, self.t, self.app
+        m, app = self.model, self.app
         now = m.now()
         devs = [d for d in m.registry.visible_devices()]
         active = sum(1 for d in devs if d.state in (STATE_ACTIVE, STATE_IDLE))
@@ -32800,6 +33230,8 @@ class MapTab(BaseTab):
         except (tk.TclError, ValueError):
             return 1.0
 
+    KEEP_NETWORKS = 10
+
     def _positions_store(self):
         allpos = self.app.config.get("map.positions", {}) or {}
         return allpos.get(self.app.network_fp or "default", {})
@@ -32811,7 +33243,12 @@ class MapTab(BaseTab):
         cur[key] = [round(fx, 4), round(fy, 4)]
         if len(cur) > 2000:
             cur = dict(list(cur.items())[-2000:])
+        allpos.pop(net, None)              # most recently used last
         allpos[net] = cur
+        if len(allpos) > self.KEEP_NETWORKS:
+            # 5.2.3 (B-30): positions were kept for every network ever
+            # seen, and the whole settings file is rewritten on each drag
+            allpos = dict(list(allpos.items())[-self.KEEP_NETWORKS:])
         self.app.config.set("map.positions", allpos)
         self.app.config.save()
 
@@ -37989,9 +38426,20 @@ class JobRunner:
         for job in self.active.values():
             job.cancelled = True
 
-    def stop(self):
-        self.cancel_all()
+    def stop(self, finish=(), wait=0.0):
+        """Cancel the jobs and end the jobs thread. Kinds in `finish` (a
+        save the user asked for) may complete first, for up to `wait`
+        seconds (5.2.3, B-04: closing used to cancel a session save that
+        was under way)."""
+        keep = False
+        for job in self.active.values():
+            if job.kind in finish:
+                keep = True
+            else:
+                job.cancelled = True
         self.q.put(None)
+        if keep and wait:
+            self.thread.join(wait)
 
     def _changed(self):
         fn = getattr(self.app, "_show_jobs", None)
@@ -39023,6 +39471,8 @@ class MiniWireshark:
         self.iface_reason = ""
         self.current_iface_label = ""
         self._capture_started_at = 0.0
+        self._capture_token = 0          # 5.2.3: bumped to cancel a start
+        self._capture_starting = False
         self._restart_attempts = 0
         self._restart_job = None
         self._last_packet_wall = 0.0
@@ -39092,8 +39542,8 @@ class MiniWireshark:
         self.root.after(700, self._flush_ui)
         self.root.after(1000, self._tick_status)
         self.root.after(2000, self._refresh_insights)
-        self._journal_found = PATHS.journal if os.path.exists(
-            PATHS.journal) else ""
+        self._journal_found = "" if TOOL_MODE else \
+            claim_interrupted_journal()
         if self._journal_found and not TOOL_MODE:
             self.root.after(2500, lambda: self._set_banner(
                 "\U0001F6DF  The last session ended unexpectedly. Session → "
@@ -39195,22 +39645,12 @@ class MiniWireshark:
         return m
 
     def _local_nets(self):
-        nets = []
         try:
-            for entry in conf.route.routes:
-                net, mask, gw, _iface, addr = entry[:5]
-                if gw not in ("0.0.0.0", "", None) or not net or \
-                        addr in ("127.0.0.1", "0.0.0.0", ""):
-                    continue
-                with contextlib.suppress(ValueError):
-                    n = ipaddress.ip_network(
-                        f"{_int_to_ip(net)}/{_int_to_ip(mask)}", strict=False)
-                    if 8 <= n.prefixlen < 32 and not n.is_loopback and \
-                            not n.is_multicast and n not in nets:
-                        nets.append(n)
+            cap = self.iface_map.get(self.current_iface_label) \
+                if self.sniffer is not None else None
+            return local_nets_from_routes(conf.route.routes, cap or "")
         except Exception:                            # noqa: BLE001
-            pass
-        return nets[:16]
+            return []
 
     def _local_v6_prefixes(self):
         out = []
@@ -39238,6 +39678,10 @@ class MiniWireshark:
             self._keep_undo(None)     # another source: no Undo of Clear
             self._banner_action(None)
         self.gen += 1                 # frames of the old source are dropped
+        self._hay = None              # 5.2.3 (B-23): the search index kept
+        #                               the old model (and its devices) alive
+        with contextlib.suppress(tk.TclError, AttributeError):
+            self.root.after(500, release_freed_memory)
         self.ring.clear()
         self.ring.reset_counters()
         if getattr(self, "deep", None) is not None:
@@ -40268,7 +40712,12 @@ class MiniWireshark:
         my_ip = next(iter(sorted(self.real_identity[1])), "")
         subnet = ""
         if nets:
-            subnet = str(nets[0])
+            # 5.2.3 (B-12): the router's subnet, not the first adapter in
+            # route order (a ZeroTier or Hyper-V switch subnet changed the
+            # fingerprint, so a known network looked new)
+            g = ip_obj(gw)
+            subnet = str(next((n for n in nets if g is not None and
+                               g.version == 4 and g in n), nets[0]))
         elif my_ip:
             subnet = str(ipaddress.ip_network(f"{my_ip}/24", strict=False))
         seen_gw_mac = ""
@@ -41895,6 +42344,13 @@ class MiniWireshark:
         return "ok", "Settings file is fine."
 
     def _repair_capture(self):
+        finished = threading.Event()
+        box = [False]
+
+        def done(ok):
+            box[0] = ok
+            finished.set()
+
         def act():
             was = self.sniffer is not None
             self.refresh_adapters()
@@ -41902,9 +42358,13 @@ class MiniWireshark:
                 self._stop_capture_only()
                 return self._start_capture(
                     [self.current_iface_label] + list(
-                        self.iface_box["values"])[:3], keep_data=True)
+                        self.iface_box["values"])[:3], keep_data=True,
+                    on_done=done)
             return None
         res = self._on_tk(act)
+        if res:
+            finished.wait(60)
+            res = box[0]
         n = len(self.iface_map)
         if IS_WINDOWS and not _npcap_present():
             return "failed", ("The capture driver (Npcap) is missing — "
@@ -41919,8 +42379,8 @@ class MiniWireshark:
 
     def _repair_selftest(self):
         try:
-            r = subprocess.run([sys.executable, SCRIPT_PATH, SELF_TEST_FLAG,
-                                "--quick"], capture_output=True, text=True,
+            r = subprocess.run(self_cmd(SELF_TEST_FLAG,
+                                        "--quick"), capture_output=True, text=True,
                                timeout=600, creationflags=getattr(
                                    subprocess, "CREATE_NO_WINDOW", 0))
         except (OSError, subprocess.SubprocessError) as e:
@@ -42454,7 +42914,6 @@ class MiniWireshark:
     def set_asof(self, t):
         """Timeline, Devices and Websites show the session as of time t
         (None = now); the other views say they show now."""
-        m = self.model
         if t is not None:
             tab = self.tabs["timeline"]
             start, end = tab.strip_span()
@@ -43532,13 +43991,16 @@ proc ::mw_retheme {w map fgnew deffg} {
     # ======================================================================
     #  Network cards
     # ======================================================================
-    def _populate_ifaces(self, keep=None):
-        try:
-            self.iface_scores = score_interfaces(self.default_iface_name,
-                                                 self.real_identity[0])
-        except Exception as e:                       # noqa: BLE001
-            LOG.warning("adapter scoring failed: %s", e)
-            self.iface_scores = []
+    def _populate_ifaces(self, keep=None, scores=None):
+        if scores is not None:
+            self.iface_scores = scores
+        else:
+            try:
+                self.iface_scores = score_interfaces(
+                    self.default_iface_name, self.real_identity[0])
+            except Exception as e:                   # noqa: BLE001
+                LOG.warning("adapter scoring failed: %s", e)
+                self.iface_scores = []
         self.iface_map = {}
         labels, seen = [], set()
         for rec in self.iface_scores:
@@ -43619,7 +44081,8 @@ proc ::mw_retheme {w map fgnew deffg} {
     #  Capture control
     # ======================================================================
     def _auto_start_once(self):
-        if self.sniffer is not None or self.data_mode != "idle":
+        if self.sniffer is not None or self.data_mode != "idle" or \
+                self._capture_starting:
             return
         self._set_banner("🤖  Getting started automatically — picking your "
                          "best network card ...")
@@ -43638,7 +44101,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         return True
 
     def start(self, auto=False):
-        if self.sniffer is not None:
+        if self.sniffer is not None or self._capture_starting:
             return
         if not auto and not self._confirm_leave_nonlive("Start watching"):
             return
@@ -43724,22 +44187,62 @@ proc ::mw_retheme {w map fgnew deffg} {
             self._rows_not_shown += extra
             self._rows_overflowed = True
 
-    def _start_capture(self, candidates, auto=False, keep_data=False):
+    def _start_capture(self, candidates, auto=False, keep_data=False,
+                       on_done=None):
+        """Start watching on the first card in `candidates` that opens.
+        5.2.3: the cards are tried on a helper thread (a card that refuses
+        costs up to ~1.5 s on Windows, five of them froze the window for
+        seconds); the result comes back through _async_results, then
+        on_done(ok) runs on the Tk thread. A newer start or a stop cancels
+        this one. Returns True once the attempt is under way."""
         self._ensure_worker()
         bpf = self.filter_var.get().strip() or None
         promisc = bool(self.config.get("capture.promiscuous", True))
         self.status_var.set("Starting ...")
-        self.root.update_idletasks()
-        sniffer, err, used = None, None, None
+        with contextlib.suppress(tk.TclError):
+            self.start_btn.config(state="disabled")
         sink = self.live_sink()
-        for lbl in candidates:
-            iface = self.iface_map.get(lbl)
-            sniffer, err = start_capture_source(iface, bpf, promisc, sink)
+        cands = [(lbl, self.iface_map.get(lbl)) for lbl in candidates]
+        self._capture_token += 1
+        token = self._capture_token
+        self._capture_starting = True
+
+        def work():
+            try:
+                res = probe_capture_sources(
+                    cands, bpf, promisc, sink,
+                    cancelled=lambda: token != self._capture_token)
+            except Exception as e:                   # noqa: BLE001
+                res = (None, e, None)
+            self._async_results.put(lambda: self._capture_probe_done(
+                token, res, candidates, bpf, promisc, auto, keep_data,
+                on_done))
+        threading.Thread(target=work, daemon=True,
+                         name="capture-start").start()
+        return True
+
+    def _capture_probe_done(self, token, res, candidates, bpf, promisc,
+                            auto, keep_data, on_done):
+        sniffer, err, used = res
+        if token != self._capture_token:
+            # stopped, closed or restarted while the cards were tried
             if sniffer is not None:
-                used = lbl
-                break
-            LOG.info("capture failed on %s: %s", lbl, err)
+                with contextlib.suppress(Exception):
+                    sniffer.stop()
+            if on_done is not None:
+                on_done(False)        # a Repair waiting on it moves on
+            return
+        self._capture_starting = False
+        ok = self._finish_start_capture(sniffer, err, used, candidates, bpf,
+                                        promisc, auto, keep_data)
+        if on_done is not None:
+            on_done(ok)
+
+    def _finish_start_capture(self, sniffer, err, used, candidates, bpf,
+                              promisc, auto, keep_data):
         if sniffer is None:
+            with contextlib.suppress(tk.TclError):
+                self.start_btn.config(state="normal")
             self.status_var.set("Could not start watching on any network card.")
             kind, title, fix, _retry, orig = classify_capture_fault(err)
             if IS_WINDOWS and not _npcap_present() and kind in (
@@ -43810,6 +44313,11 @@ proc ::mw_retheme {w map fgnew deffg} {
             self._set_banner(" ".join(translate_text(p) for p in (
                 f"👀  Watching “{used}”.", scan,
                 (why + ".") if why else "") if p))
+        if getattr(sniffer, "promisc_refused", False):
+            self.model.push_timeline(
+                "capture", "INFO",
+                f"“{used}” refused to watch all traffic (promiscuous "
+                f"mode), so only this computer's own traffic is seen")
         if self.model.vpn.get("iface"):
             self._set_banner("\U0001F512  This looks like a VPN/tunnel adapter. "
                              "Traffic may be encrypted inside the tunnel, so "
@@ -43834,6 +44342,8 @@ proc ::mw_retheme {w map fgnew deffg} {
         self.lan_scanner.start()
 
     def _stop_capture_only(self):
+        self._capture_token += 1            # cancels a start under way
+        self._capture_starting = False
         s, self.sniffer = self.sniffer, None
         if s is not None:
             try:
@@ -43868,7 +44378,8 @@ proc ::mw_retheme {w map fgnew deffg} {
         """The capture died on its own (adapter reset, driver hiccup, Wi-Fi
         reconnect, sleep…). Heal with exponential backoff, keeping all
         session data."""
-        if self.sniffer is None and self._restart_job:
+        if self.sniffer is None and (self._restart_job or
+                                     self._capture_starting):
             return
         kind, title, fix, retry, orig = classify_capture_fault(exc)
         LOG.warning("capture stopped unexpectedly: [%s] %s", kind,
@@ -43918,16 +44429,43 @@ proc ::mw_retheme {w map fgnew deffg} {
                                             self._heal_attempt)
 
     def _heal_attempt(self):
+        """Re-read the cards and routes on a helper thread (5.2.3: was on
+        the Tk thread), then restart capture."""
         self._restart_job = None
-        if self.data_mode not in ("live", "idle") or self.sniffer is not None:
+        if self.data_mode not in ("live", "idle") or \
+                self.sniffer is not None or self._capture_starting:
             return
         prev = self.current_iface_label
         prev_name = iface_name(self.iface_map.get(prev)) if prev else ""
-        with contextlib.suppress(Exception):
-            conf.ifaces.reload()
-        with contextlib.suppress(Exception):
-            conf.route.resync()
-            iface, my_ip, gw = conf.route.route("0.0.0.0")
+        token = self._capture_token
+
+        def work():
+            route, scores = None, None
+            with contextlib.suppress(Exception):
+                conf.ifaces.reload()
+            with contextlib.suppress(Exception):
+                conf.route.resync()
+                route = conf.route.route("0.0.0.0")
+            try:
+                gw0 = route[2] if route and route[2] != "0.0.0.0" else \
+                    self.real_identity[0]
+                scores = score_interfaces(
+                    iface_name(route[0]) if route else
+                    self.default_iface_name, gw0)
+            except Exception as e:                   # noqa: BLE001
+                LOG.warning("adapter scoring failed: %s", e)
+            self._async_results.put(lambda: self._heal_continue(
+                token, prev_name, route, scores))
+        threading.Thread(target=work, daemon=True,
+                         name="capture-heal").start()
+
+    def _heal_continue(self, token, prev_name, route, scores):
+        if token != self._capture_token or self.sniffer is not None or \
+                self._capture_starting or \
+                self.data_mode not in ("live", "idle"):
+            return
+        if route:
+            iface, my_ip, gw = route[:3]
             self.default_iface_name = iface_name(iface)
             gw = gw if gw != "0.0.0.0" else ""
             if gw and gw != self.real_identity[0]:
@@ -43940,7 +44478,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                                   self.real_identity[2])
             self.model.set_identity(gateway_ip=self.real_identity[0],
                                     my_ips=ips, local_nets=self._local_nets())
-        self._populate_ifaces()
+        self._populate_ifaces(scores=scores)
         cands = []
         for r in self.iface_scores:
             if r["name"] == prev_name and r["score"] > -60:
@@ -43949,13 +44487,19 @@ proc ::mw_retheme {w map fgnew deffg} {
                   if r["display"] not in cands and r["score"] > -60]
         if not cands:
             cands = list(self.iface_box["values"])[:1]
-        if cands and self._start_capture(cands[:4], keep_data=True):
-            self.model.push_timeline("capture", "INFO",
-                                     f"Capture restarted on "
-                                     f"“{self.current_iface_label}”")
-            self.root.after(120000, self._reset_restart_counter)
+
+        def done(ok):
+            if ok:
+                self.model.push_timeline("capture", "INFO",
+                                         f"Capture restarted on "
+                                         f"“{self.current_iface_label}”")
+                self.root.after(120000, self._reset_restart_counter)
+            else:
+                self._handle_sniffer_died(RuntimeError("restart failed"))
+        if cands:
+            self._start_capture(cands[:4], keep_data=True, on_done=done)
         else:
-            self._handle_sniffer_died(RuntimeError("restart failed"))
+            done(False)
 
     def _reset_restart_counter(self):
         if self.sniffer is not None:
@@ -43991,7 +44535,15 @@ proc ::mw_retheme {w map fgnew deffg} {
                                      f"{old or '?'} → {gw} (new network or "
                                      f"router?)")
         if my_ip and my_ip not in self.real_identity[1]:
-            ips = set(self.real_identity[1]) | {my_ip}
+            # 5.2.3 (B-16): the old address is dropped (the set only grew,
+            # so after a DHCP change the device that got our old address
+            # was shown as "This computer"); the capture card's own
+            # address stays
+            cap = self.iface_map.get(self.current_iface_label) \
+                if self.sniffer is not None else None
+            cap_ip = _iface_ip(cap) if cap is not None else ""
+            ips = {a for a in self.real_identity[1] if ":" in a} | \
+                {my_ip} | ({cap_ip} if cap_ip else set())
             self.real_identity = (self.real_identity[0], ips,
                                   self.real_identity[2])
             self.model.set_identity(my_ips=ips, local_nets=self._local_nets())
@@ -44030,6 +44582,10 @@ proc ::mw_retheme {w map fgnew deffg} {
         1 ms later."""
         pr = self.pending_rows
         if self.minimized():
+            if pr:
+                # 5.2.3 (B-17): packets still arrive while minimised; a
+                # later fault otherwise recorded a "gap" for all that time
+                self._last_packet_wall = time.time()
             with contextlib.suppress(tk.TclError):
                 self.root.after(self._ms(500), self._drain_decoded)
             return
@@ -44070,9 +44626,13 @@ proc ::mw_retheme {w map fgnew deffg} {
         website and connection updates of that round, and the rows it had
         already taken were never shown ("sometimes stuff doesn't load")."""
         if self.minimized():
+            self._trim_while_minimized(self.model)
             with contextlib.suppress(tk.TclError):
                 self.root.after(self._ms(700), self._flush_ui)
             return
+        if getattr(self, "_rebuild_on_restore", False):
+            self._rebuild_on_restore = False
+            self._rebuild_tables_soon()
         m = self.model
         for part in (self._flush_events, self._flush_devices,
                      self._flush_websites, self._flush_remotes,
@@ -44159,11 +44719,46 @@ proc ::mw_retheme {w map fgnew deffg} {
         setattr(m, attr, keys - now)
         return now
 
+    FLOW_BACKLOG = 4000
+    MINIMIZED_KEEP = 2000
+
+    def _trim_while_minimized(self, m):
+        """5.2.3 (B-21): nothing was taken from the model while the window
+        was minimised, so every finished connection stayed referenced and
+        the alert queue grew all night (~200 MB on a busy network), then
+        restoring the window pushed it all into the tables at once. Keep
+        only what the tables can still use; they catch up with a sliced
+        rebuild when the window is shown."""
+        try:
+            m.flows.closed_now.clear()
+            if len(m.flows.dirty) > self.MINIMIZED_KEEP:
+                m.flows.dirty = set()
+                self.tabs["connections"]._pending = True
+            if len(m.ev_alerts) > self.MINIMIZED_KEEP:
+                del m.ev_alerts[:-self.MINIMIZED_KEEP]
+                self._rebuild_on_restore = True   # the Alerts table too
+            if len(m.ev_banner) > 1:
+                del m.ev_banner[:-1]
+        except Exception:                            # noqa: BLE001
+            LOG.debug("trim while minimised", exc_info=True)
+
     def _flush_flows(self, m):
-        if m.flows.dirty:
-            ids, m.flows.dirty = m.flows.dirty, set()
-            m.flows.closed_now = []
-            self.tabs["connections"].update_ids(ids)
+        m.flows.closed_now.clear()
+        if not m.flows.dirty:
+            return
+        tab = self.tabs["connections"]
+        now = time.monotonic()
+        if len(m.flows.dirty) > self.FLOW_BACKLOG \
+                and now - getattr(self, "_flow_rebuild_at", 0.0) > 5:
+            # 5.2.3 (B-22): a big backlog (reading a capture) is one sliced
+            # refill of the newest rows, not 20,000 single-row upserts
+            m.flows.dirty = set()
+            self._flow_rebuild_at = now
+            tab._pending = True
+            tab.refresh()
+            return
+        # at most FLUSH_MAX rows per tick, like devices and websites
+        tab.update_ids(self._take_dirty(m.flows, "dirty"))
 
     def _flush_geo(self, m):
         if m.ev_geo:
@@ -44481,12 +45076,28 @@ proc ::mw_retheme {w map fgnew deffg} {
         if not spec.get("id"):
             spec["id"] = "c-" + uuid.uuid4().hex[:10]
         specs = [x for x in specs if x.get("id") != spec["id"]] + [spec]
-        if password:
-            self.vault.set(spec["id"], password)
         self.config.set("connectors.list", specs)
         self.config.save()
+        cid = spec["id"]
+        if password and self.vault.backend in ("keychain", "secret-service"):
+            # 5.2.3 (B-42): the system keychain can show a prompt and wait
+            # up to 20 s; that wait is no longer on the window's thread
+            def run(_job):
+                return self.vault.set(cid, password)
+
+            def failed(e):
+                LOG.warning("saving the helper's password: %s", e)
+                self._start_connectors()
+            if self.jobs.submit("connector_save", "Saving the password", run,
+                                lambda _ok: self._start_connectors(),
+                                failed) is not None:
+                return cid
+            # another save is still waiting on the keychain: never drop
+            # this password, save it here instead
+        if password:
+            self.vault.set(cid, password)
         self._start_connectors()
-        return spec["id"]
+        return cid
 
     def reconciliation_text(self):
         m = self.model
@@ -44637,7 +45248,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                 try:
                     fp = connector_cert_fingerprint(sp["url"])
                 except (OSError, ValueError) as e:
-                    self._async_results.put(lambda: msg.configure(
+                    self._async_results.put(lambda e=e: msg.configure(
                         text=f"✖ Couldn't read the certificate: {e}"))
                     return
 
@@ -45036,9 +45647,17 @@ proc ::mw_retheme {w map fgnew deffg} {
         """Addresses in this computer's ARP cache that haven't been seen on
         the wire (yet) — shown as Reported, not as devices."""
         reg = self.model.registry
+        # 5.2.3 (B-20): the cache lists every adapter (Hyper-V, VMware and
+        # WSL switches too); only the captured network's subnets count
+        nets = [n for n in self.model.local_nets if n.version == 4]
+
+        def on_lan(ip):
+            a = ip_obj(ip)
+            return a is None or a.version != 4 or not nets or \
+                any(a in n for n in nets)
         return [(ip, mac) for ip, mac, _i in self.arp_cache
                 if ip not in reg.ip_to_key and mac not in reg.by_key
-                and reg.eligible_ip(ip)]
+                and reg.eligible_ip(ip) and on_lan(ip)]
 
     def _tick_wifi(self):
         """Keep this computer's Wi-Fi reading fresh while watching live,
@@ -45104,6 +45723,10 @@ proc ::mw_retheme {w map fgnew deffg} {
     def _drain_async_results(self):
         """The only hand-off point from background threads back to Tk."""
         drain_deferred_tk()
+        # 5.2.3 (B-29): at most ~20 ms per turn; a burst of lookups used to
+        # run in one callback. The rest follows straight away.
+        end = time.perf_counter() + 0.02
+        more = False
         try:
             while True:
                 fn = self._async_results.get_nowait()
@@ -45111,9 +45734,12 @@ proc ::mw_retheme {w map fgnew deffg} {
                     fn()
                 except Exception:                    # noqa: BLE001
                     LOG.exception("async callback")
+                if time.perf_counter() > end:
+                    more = True
+                    break
         except queue.Empty:
             pass
-        self.root.after(200, self._drain_async_results)
+        self.root.after(1 if more else 200, self._drain_async_results)
 
     def _on_data_changed(self):
         if self.model is not None:
@@ -47227,9 +47853,9 @@ proc ::mw_retheme {w map fgnew deffg} {
             exported_at or time.time()))
         self.data_label = f"{os.path.basename(path)} ({when})"
         self._restyle_mode_banner()
-        self._set_banner(f"\U0001F4C2  Loaded a saved session — this is NOT "
-                         f"live. Click “Return to live capture” when "
-                         f"you're done.", kind="warn")
+        self._set_banner("\U0001F4C2  Loaded a saved session — this is NOT "
+                         "live. Click “Return to live capture” when "
+                         "you're done.", kind="warn")
         self.status_var.set(f"\U0001F4C2 Viewing saved session: "
                             f"{self.data_label} (not live)")
         LOG.info("session loaded from %s", path)
@@ -47757,77 +48383,92 @@ proc ::mw_retheme {w map fgnew deffg} {
                               "packets.csv")
         if not path:
             return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
+
+        def table():
+            for d in rows:
+                yield [d.get("no"), datetime.fromtimestamp(
+                    d["time"]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
+                    d.get("proto", ""), d.get("direction", ""),
+                    d.get("src_ip", ""), d.get("src_mac", ""),
+                    d.get("dst_ip", ""), d.get("dst_mac", ""),
+                    d.get("sport", "") or "", d.get("dport", "") or "",
+                    d.get("length", ""), d.get("flow_id") or "",
+                    d.get("text", "")]
+        self._write_csv_job(
+            path, ["no", "time", "protocol", "direction", "src_ip",
+                   "src_mac", "dst_ip", "dst_mac", "sport", "dport",
+                   "length", "connection", "text"], table(), len(rows),
+            f"Exported {len(rows)} rows to {path}")
+
+    def _write_csv_job(self, path, header, rows, total, done_text):
+        """5.2.3 (B-26): the rows are taken here, on the Tk thread (packet
+        rows are plain dicts kept for the window); formatting and writing
+        them — seconds on a OneDrive or network folder — happen in a
+        background job. The file appears whole (written as .part, then
+        renamed)."""
+        def run(job):
+            tmp = path + ".part"
+            with open(tmp, "w", newline="", encoding="utf-8") as f:
                 w = safe_csv_writer(f)
-                w.writerow(["no", "time", "protocol", "direction", "src_ip",
-                            "src_mac", "dst_ip", "dst_mac", "sport", "dport",
-                            "length", "connection", "text"])
-                for d in rows:
-                    w.writerow([d.get("no"), datetime.fromtimestamp(
-                        d["time"]).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3],
-                        d.get("proto", ""), d.get("direction", ""),
-                        d.get("src_ip", ""), d.get("src_mac", ""),
-                        d.get("dst_ip", ""), d.get("dst_mac", ""),
-                        d.get("sport", "") or "", d.get("dport", "") or "",
-                        d.get("length", ""), d.get("flow_id") or "",
-                        d.get("text", "")])
-        except OSError as e:
-            messagebox.showerror("Export error", str(e), parent=self.root)
-            return
-        self.status_var.set(f"Exported {len(rows)} rows to {path}")
+                w.writerow(header)
+                for i, r in enumerate(rows):
+                    w.writerow(r)
+                    if i % 2000 == 1999:
+                        job.progress(min(0.95, i / max(1, total)))
+            os.replace(tmp, path)
+            return path
+
+        def failed(e):
+            with contextlib.suppress(OSError):
+                os.remove(path + ".part")
+            if not isinstance(e, JobCancelled):
+                messagebox.showerror("Export error", str(e),
+                                     parent=self.root)
+        return self.jobs.submit("export", "Exporting CSV", run,
+                                lambda _p: self.status_var.set(done_text),
+                                failed)
 
     def _export_devices_csv(self):
         path = self._ask_save(".csv", [("CSV files", "*.csv")], "devices.csv")
         if not path:
             return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = safe_csv_writer(f)
-                w.writerow(["name", "class", "ip", "ipv6", "mac", "vendor",
-                            "confidence", "score", "status", "first_seen",
-                            "last_seen", "bytes_sent", "bytes_received",
-                            "mine", "expected", "notes"])
-                for d in self.model.registry.by_key.values():
-                    w.writerow([self.device_label(d),
-                                f"{d.class_confidence} {d.device_class}"
-                                .strip(), d.ip, " ".join(sorted(d.ipv6)),
-                                d.mac, d.vendor, d.confidence, d.score,
-                                d.state, fmt_clock(d.first_seen, True),
-                                fmt_clock(d.last_seen, True), d.bytes_up,
-                                d.bytes_down, d.mine, d.expected, d.notes])
-        except OSError as e:
-            messagebox.showerror("Export error", str(e), parent=self.root)
-            return
-        self.status_var.set(f"Exported devices to {path}")
+        rows = [[self.device_label(d),
+                 f"{d.class_confidence} {d.device_class}".strip(), d.ip,
+                 " ".join(sorted(d.ipv6)), d.mac, d.vendor, d.confidence,
+                 d.score, d.state, fmt_clock(d.first_seen, True),
+                 fmt_clock(d.last_seen, True), d.bytes_up, d.bytes_down,
+                 d.mine, d.expected, d.notes]
+                for d in self.model.registry.by_key.values()]
+        self._write_csv_job(
+            path, ["name", "class", "ip", "ipv6", "mac", "vendor",
+                   "confidence", "score", "status", "first_seen",
+                   "last_seen", "bytes_sent", "bytes_received", "mine",
+                   "expected", "notes"], rows, len(rows),
+            f"Exported devices to {path}")
 
     def _export_flows_csv(self):
         path = self._ask_save(".csv", [("CSV files", "*.csv")],
                               "connections.csv")
         if not path:
             return
-        try:
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                w = safe_csv_writer(f)
-                w.writerow(["id", "device", "transport", "local", "remote",
-                            "domain", "domain_confidence", "purpose",
-                            "bytes_up", "bytes_down", "packets", "duration_s",
-                            "status", "encryption", "first_seen",
-                            "last_seen"])
-                for fl in self.model.flows.all_flows():
-                    w.writerow([fl.fid, self.short_device_name(fl.device_key)
-                                if fl.device_key else "", fl.transport,
-                                f"{fl.local_ip}:{fl.local_port}",
-                                f"{fl.remote_ip}:{fl.remote_port}",
-                                fl.domain, fl.domain_conf, fl.purpose(),
-                                fl.bytes_out, fl.bytes_in, fl.packets,
-                                round(fl.duration, 1), fl.status_text(),
-                                fl.encrypted, fmt_clock(fl.first_seen, True),
-                                fmt_clock(fl.last_seen, True)])
-        except OSError as e:
-            messagebox.showerror("Export error", str(e), parent=self.root)
-            return
-        self.status_var.set(f"Exported connections to {path}")
+        # the values are read from the model here (it changes under the
+        # analysis worker); only the writing goes to the background job
+        rows = [[fl.fid, self.short_device_name(fl.device_key)
+                 if fl.device_key else "", fl.transport,
+                 f"{fl.local_ip}:{fl.local_port}",
+                 f"{fl.remote_ip}:{fl.remote_port}",
+                 fl.domain, fl.domain_conf, fl.purpose(),
+                 fl.bytes_out, fl.bytes_in, fl.packets,
+                 round(fl.duration, 1), fl.status_text(),
+                 fl.encrypted, fmt_clock(fl.first_seen, True),
+                 fmt_clock(fl.last_seen, True)]
+                for fl in self.model.flows.all_flows()]
+        self._write_csv_job(
+            path, ["id", "device", "transport", "local", "remote", "domain",
+                   "domain_confidence", "purpose", "bytes_up", "bytes_down",
+                   "packets", "duration_s", "status", "encryption",
+                   "first_seen", "last_seen"], rows, len(rows),
+            f"Exported connections to {path}")
 
     def _export_json(self):
         path = self._ask_save(".json", [("JSON files", "*.json")],
@@ -48948,34 +49589,63 @@ proc ::mw_retheme {w map fgnew deffg} {
         try:
             if self.history is not None and self.data_mode in ("live",
                                                                "idle"):
-                self._write_history()
+                self._write_history(background=True)
         except Exception:                            # noqa: BLE001
             LOG.exception("history snapshot")
         self.root.after(60000, self._history_tick)
 
-    def _write_history(self):
+    def _history_pieces(self):
+        """The history snapshot in small pieces (100 devices each).
+        5.2.3 (B-25): built in one go on the Tk thread every minute it
+        took 50-150 ms with 1,000 devices and 20,000 websites."""
         m = self.model
-        devs = []
-        for d in m.registry.by_key.values():
-            if not d.live or d.demo:
-                continue
-            devs.append((d.key, device_to_dict(d, False), d.first_seen,
-                         d.last_seen, [(s, e) for s, e in d.presence[-10:]],
-                         (d.bytes_up, d.bytes_down, d.packets)))
-        alerts = [(a.id, a.kind, a.severity, a.device_key, a.reason, a.when)
-                  for a in (m.alerts.alerts.get(i) for i in m.alerts.order)
-                  if a and a.live]
-        domains = [(w.registrable, w.requests, w.bytes)
-                   for w in m.websites.values()][:5000]
-        base = list(m.baselines.to_dict().items())
-        self.history.write_snapshot({"devices": devs, "alerts": alerts,
-                                     "domains": domains, "baselines": base})
-        ret = self.config.get("history.retention", "30 days")
-        days = HISTORY_RETENTION.get(ret)
-        if days is None:
-            days = int(self.config.get("history.custom_days", 14))
-        if days:
-            self.history.prune(days)
+        keys = list(m.registry.by_key)
+        for i in range(0, len(keys), 100):
+            batch = []
+            for k in keys[i:i + 100]:
+                d = m.registry.by_key.get(k)
+                if d is None or not d.live or d.demo:
+                    continue
+                batch.append(("devices", (
+                    d.key, device_to_dict(d, False), d.first_seen,
+                    d.last_seen, [(s, e) for s, e in d.presence[-10:]],
+                    (d.bytes_up, d.bytes_down, d.packets))))
+            yield batch
+        yield [("alerts", (a.id, a.kind, a.severity, a.device_key, a.reason,
+                           a.when))
+               for a in (m.alerts.alerts.get(i) for i in m.alerts.order)
+               if a and a.live]
+        yield [("domains", (w.registrable, w.requests, w.bytes))
+               for w in itertools.islice(m.websites.values(), 5000)]
+        yield [("baselines", kv) for kv in m.baselines.to_dict().items()]
+
+    def _write_history(self, background=False):
+        history = self.history
+
+        def store(pieces):
+            snap = {"devices": [], "alerts": [], "domains": [],
+                    "baselines": []}
+            for piece in pieces:
+                for kind, row in piece:
+                    snap[kind].append(row)
+            history.write_snapshot(snap)
+            ret = self.config.get("history.retention", "30 days")
+            days = HISTORY_RETENTION.get(ret)
+            if days is None:
+                days = int(self.config.get("history.custom_days", 14))
+            if days:
+                history.prune(days)
+
+        if background:
+            if "history" in self.jobs.active:
+                return None
+
+            def run(job):
+                store(job.pieces_under_gate(self.gate,
+                                            self._history_pieces()))
+            return self.jobs.submit("history", "Saving history", run)
+        store(self._history_pieces())
+        return None
 
     # ======================================================================
     #  Country lookup glue (opt-in)
@@ -49176,7 +49846,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         TEXT_WIDTHS.save()
         if runtime_confirm_started():
             LOG.info("private runtime start confirmed")
-        marker = read_json(PATHS.update_marker, None)
+        marker = update_marker_for()
         if marker:
             with contextlib.suppress(OSError):
                 os.remove(PATHS.update_marker)
@@ -49196,8 +49866,8 @@ proc ::mw_retheme {w map fgnew deffg} {
 
         def work():
             try:
-                r = subprocess.run([sys.executable, SCRIPT_PATH,
-                                    SELF_TEST_FLAG], capture_output=True,
+                r = subprocess.run(self_cmd(SELF_TEST_FLAG),
+                                   capture_output=True,
                                    text=True, timeout=300,
                                    creationflags=getattr(
                                        subprocess, "CREATE_NO_WINDOW", 0))
@@ -49218,10 +49888,24 @@ proc ::mw_retheme {w map fgnew deffg} {
 
     def _on_close(self):
         LOG.info("shutting down")
-        with contextlib.suppress(Exception):
-            self.jobs.stop()
-        TEXT_WIDTHS.save()
         self._remember_window()
+        # 5.2.3 (B-04): the window goes away first; the saving below used
+        # to happen behind a "Not responding" window
+        with contextlib.suppress(tk.TclError):
+            self.root.withdraw()
+            self.root.update_idletasks()
+        # a save under way takes the gate piece by piece: step out of it
+        # while waiting, or the two would wait for each other
+        held = self.gate.release_all()
+        try:
+            with contextlib.suppress(Exception):
+                self.jobs.stop(finish=("session_save", "connector_save",
+                                       "export",
+                                       "table_export", "pcap_save"),
+                               wait=20.0)
+        finally:
+            self.gate.reacquire(held)
+        TEXT_WIDTHS.save()
         try:
             if self.history is not None and self.data_mode in ("live",
                                                                "idle"):
@@ -49256,7 +49940,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         self.ring.clear()
         self.ring.wake()
         with contextlib.suppress(Exception):
-            self.deep.stop()
+            self.deep.stop(kill=True)
         if self.prober is not None:
             self.prober.run_now.set()
         if self.demo is not None:
@@ -49965,7 +50649,7 @@ class DiagnosticsWindow:
             f"Scapy               {_module_version('scapy') or 'missing'}",
             f"psutil (optional)   {_module_version('psutil') or 'not installed'}",
             f"Capture backend     {backend}",
-            f"Npcap/libpcap       " + ("Npcap present" if IS_WINDOWS and
+            "Npcap/libpcap       " + ("Npcap present" if IS_WINDOWS and
                                        _npcap_present() else
                                        "Npcap MISSING" if IS_WINDOWS else
                                        "system libpcap / raw sockets"),
@@ -50027,7 +50711,7 @@ class DiagnosticsWindow:
             f"Cache folder        {PATHS.cache}",
             f"Log file            {PATHS.log_file}",
             f"Config file         {app.config.path}",
-            f"History             " + (app.history_status_text()
+            "History             " + (app.history_status_text()
                                        .replace("\n", " ")),
             "Optional databases:"] + [f"   {s}" for s in
                                       app.data.summary_lines()]
@@ -50417,15 +51101,20 @@ class CrashDialog:
             win.destroy()
 
         def restart():
+            # 5.2.3 (B-37): close first (session, journal and history are
+            # released), then start the new copy as the same user; it was
+            # started first, marked "elevated", while this one still held
+            # the journal
             LOG.info("restart requested from crash dialog")
-            try:
-                subprocess.Popen([sys.executable, SCRIPT_PATH] +
-                                 [a for a in sys.argv[1:]
-                                  if a != SELF_TEST_FLAG] + [ELEVATED_FLAG])
-            except OSError as e:
-                messagebox.showerror("Restart", str(e), parent=win)
-                return
+            args = self_cmd(*[
+                a for a in sys.argv[1:]
+                if a not in (SELF_TEST_FLAG, ELEVATED_FLAG)])
+            cls._open = False
             app._on_close()
+            try:
+                subprocess.Popen(args)
+            except OSError as e:
+                LOG.error("restart failed: %s", e)
         ttk.Button(bar, text="Continue", style="Accent.TButton",
                    command=close).pack(side="right")
         ttk.Button(bar, text="Restart MiniWireshark",
@@ -50776,6 +51465,9 @@ def release_tool(argv):
 def apply_self_update(data, tag, script_path=None, marker_path=None):
     """Validate, back up, atomically replace. Never destroys the only
     working copy: the backup stays until the new version has run fine."""
+    if FROZEN and script_path is None:
+        raise UpdateRefused("the standalone program is updated by its "
+                            "installer, not by replacing a .py file")
     script_path = script_path or SCRIPT_PATH
     marker_path = marker_path or PATHS.update_marker
     if not data or len(data) < 50_000:
@@ -50794,8 +51486,13 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         f.write(text)
     os.replace(tmp, script_path)
+    # 5.2.3 (B-31): the marker names the file it belongs to and what was
+    # written, so another copy of MiniWireshark sharing this data folder
+    # (an archived version) never "rolls back" over itself
     atomic_write_json(marker_path, {
         "backup": backup, "version": tag, "from": SCRIPT_VERSION,
+        "script": os.path.abspath(script_path),
+        "sha256": sha256_file(script_path),
         "time": time.time(), "attempts": 0})
     LOG.info("installed update %s (backup %s)", tag, backup)
     return (f"MiniWireshark {tag} was installed. Restart it to use the new "
@@ -50804,13 +51501,113 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
             f"automatically.")
 
 
+def _norm_path(p):
+    return os.path.normcase(os.path.abspath(p))
+
+
+def update_marker_for(script_path=None, marker_path=None):
+    """The pending-update marker if it belongs to this very file, else
+    None. 5.2.3 (B-31): before, any copy of MiniWireshark started with the
+    same data folder counted the attempts and could copy the backup over
+    itself. A marker whose file has since been replaced by something else
+    is dropped."""
+    script_path = script_path or SCRIPT_PATH
+    marker_path = marker_path or PATHS.update_marker
+    marker = read_json(marker_path, None)
+    if not isinstance(marker, dict):
+        return None
+    me = _norm_path(script_path)
+    owner = marker.get("script") or ""
+    if owner:
+        if _norm_path(owner) != me:
+            return None
+    else:                     # written by 5.1.2 or older: judge the backup
+        backup = str(marker.get("backup") or "")
+        if not _norm_path(backup).startswith(me + ".v"):
+            return None
+    want = marker.get("sha256")
+    if want:
+        try:
+            have = sha256_file(script_path)
+        except OSError:
+            have = ""
+        if have and have != want:
+            LOG.info("update marker is for a file that has since been "
+                     "replaced; dropping it")
+            with contextlib.suppress(OSError):
+                os.remove(marker_path)
+            return None
+    return marker
+
+
+def update_start_not_counted(script_path=None, marker_path=None):
+    """The user left before the window (loading screen, Welcome Center):
+    that start says nothing about the update, so it doesn't count toward
+    the automatic rollback (5.2.3, B-31)."""
+    marker_path = marker_path or PATHS.update_marker
+    marker = update_marker_for(script_path, marker_path)
+    if marker and int(marker.get("attempts", 0)) > 0:
+        marker["attempts"] = int(marker["attempts"]) - 1
+        with contextlib.suppress(OSError):
+            atomic_write_json(marker_path, marker)
+
+
+def claim_interrupted_journal(path=None, now=None, keep=3):
+    """5.2.3 (B-33): a crash journal found at start-up is moved aside to
+    journal-interrupted-<time>.mwsession.json before anything else, so 30 s
+    of new capture can no longer overwrite the session it holds. Returns
+    the moved file ("" if none). A journal written in the last 45 s
+    belongs to a copy of MiniWireshark that is still running and is left
+    alone. A .sha256 file older than the journal was left by another
+    version (5.0.x writes no .sha256) and is not taken along."""
+    path = path or PATHS.journal
+    now = time.time() if now is None else now
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return ""
+    if now - mtime < 45:
+        return ""
+    folder = os.path.dirname(path)
+    dest = os.path.join(folder, time.strftime(
+        "journal-interrupted-%Y%m%d-%H%M%S", time.localtime(mtime)) +
+        f"-{os.getpid()}.mwsession.json")
+    side = path + ".sha256"
+    try:
+        side_ok = os.path.getmtime(side) >= mtime - 1
+    except OSError:
+        side_ok = False
+    try:
+        os.replace(path, dest)
+    except OSError as e:
+        LOG.warning("could not set the crash journal aside: %s", e)
+        return path
+    with contextlib.suppress(OSError):
+        if side_ok:
+            os.replace(side, dest + ".sha256")
+        else:
+            os.remove(side)
+    try:
+        olds = sorted((n for n in os.listdir(folder)
+                       if n.startswith("journal-interrupted-") and
+                       n.endswith(".mwsession.json")), reverse=True)
+    except OSError:
+        olds = []
+    for n in olds[keep:]:
+        for p_ in (os.path.join(folder, n), os.path.join(folder, n) +
+                   ".sha256"):
+            with contextlib.suppress(OSError):
+                os.remove(p_)
+    return dest
+
+
 def rollback_update_if_needed(force=False, script_path=None,
                               marker_path=None):
     """Called at startup (and on a startup crash). Returns a message if a
     rollback happened."""
     script_path = script_path or SCRIPT_PATH
     marker_path = marker_path or PATHS.update_marker
-    marker = read_json(marker_path, None)
+    marker = update_marker_for(script_path, marker_path)
     if not marker:
         return ""
     marker["attempts"] = int(marker.get("attempts", 0)) + 1
@@ -53901,6 +54698,10 @@ class ProtocolTracker:
                        offset_ms=None if offset is None else
                        round(offset * 1000, 1),
                        latency_ms=round((ts - got[0]) * 1000.0, 2),
+                       # 5.2.3 (B-43): round trip minus the server's own
+                       # processing time, from the four NTP timestamps
+                       delay_ms=None if delay is None else
+                       round(delay * 1000.0, 2),
                        result="ok",
                        summary=f"time from {src} (stratum {b[1]})"
                                + (f", clock offset about "
@@ -54357,7 +55158,11 @@ class _DeepWorkerProc:
         self.costs = {}
         self.proc = None
 
-    def start(self, my_ips):
+    def start(self, my_ips, timeout=20.0):
+        self.launch()
+        self.handshake(my_ips, time.monotonic() + timeout)
+
+    def launch(self):
         script = os.path.abspath(__file__)
         env = dict(os.environ)
         env["PYTHONIOENCODING"] = "utf-8"
@@ -54373,7 +55178,22 @@ class _DeepWorkerProc:
                 cached_cmd(sys.executable, script, [WORKER_FLAG]),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log,
                 env=cached_env(env), **kw)
-        hello = _wire_recv(self.proc.stdout)
+
+    def handshake(self, my_ips, deadline):
+        """Wait for the child's "ready" until `deadline` (5.2.3, B-05:
+        the wait had no limit, so a child stuck at start — an antivirus
+        scan — stopped the analysis for good)."""
+        box = []
+        t = threading.Thread(target=lambda: box.append(
+            _wire_recv(self.proc.stdout)), daemon=True,
+            name=f"deep-w{self.idx}-hello")
+        t.start()
+        t.join(max(0.0, deadline - time.monotonic()))
+        if t.is_alive():
+            with contextlib.suppress(Exception):
+                self.proc.kill()
+            raise RuntimeError("deep worker did not answer in time")
+        hello = box[0] if box else None
         if not hello or hello[0] != "ready":
             raise RuntimeError("deep worker did not start")
         _wire_send(self.proc.stdin, ("config", sorted(my_ips)))
@@ -54444,18 +55264,32 @@ class _DeepWorkerProc:
                     pass
                 _wire_send(self.proc.stdin, ("flush", 0, now, final))
 
-    def stop(self):
+    def stop(self, kill=False, deadline=None):
+        """kill=True (closing the app): end the process at once; a worker
+        keeps no state, and one blocked writing results to a full pipe
+        never reads "stop" (5.2.3, B-04: up to 2 s per worker on the Tk
+        thread). deadline: shared time.monotonic() limit for the wait."""
         self.alive = False
         with self.cv:
             self.cv.notify_all()
-        if self.proc is not None:
+        if self.proc is None:
+            return
+        if not kill:
+            self.ask_stop()
+            left = 2.0 if deadline is None else \
+                max(0.0, deadline - time.monotonic())
+            with contextlib.suppress(Exception):
+                self.proc.wait(timeout=left)
+        if self.proc.poll() is None:
+            with contextlib.suppress(Exception):
+                self.proc.kill()
+            with contextlib.suppress(Exception):
+                self.proc.wait(timeout=0.5)
+
+    def ask_stop(self):
+        if self.proc is not None and self.proc.poll() is None:
             with contextlib.suppress(OSError, ValueError):
                 _wire_send(self.proc.stdin, ("stop",))
-            with contextlib.suppress(Exception):
-                self.proc.wait(timeout=2)
-            if self.proc.poll() is None:
-                with contextlib.suppress(Exception):
-                    self.proc.kill()
 
 
 class DeepEngine:
@@ -54465,6 +55299,7 @@ class DeepEngine:
     bucket: deep-analysed, skipped by budget, or lost with a worker."""
 
     QUEUE_CAP = 20000
+    START_TIMEOUT = 30.0            # all worker processes together
 
     def __init__(self, store=None):
         self.store = store or DeepStore()
@@ -54522,11 +55357,17 @@ class DeepEngine:
         n = max(1, min(self.cores, (os.cpu_count() or 1) - 1))
         if self.want_process and (os.cpu_count() or 1) > 1:
             try:
+                # 5.2.3 (B-05): all children start together (each one
+                # compiles or loads the program: ~2.5 s on Windows, which
+                # used to add up one after another on the analysis thread)
                 ws = []
                 for i in range(n):
                     w = _DeepWorkerProc(self, i)
-                    w.start(self.my_ips)
+                    w.launch()
                     ws.append(w)
+                deadline = time.monotonic() + self.START_TIMEOUT
+                for w in ws:
+                    w.handshake(self.my_ips, deadline)
                 self.workers, self.backend = ws, "process"
                 return
             except Exception as e:                   # noqa: BLE001
@@ -54534,7 +55375,7 @@ class DeepEngine:
                 LOG.warning("deep analysis: %s; using a thread",
                             self.last_error)
                 for w in locals().get("ws", []):
-                    w.stop()
+                    w.stop(kill=True)
         self.analyzer = DeepAnalyzer(self.my_ips,
                                      total=self.ram_mb * 1024 * 1024 // 2)
         self.thread = threading.Thread(target=self._thread_loop, daemon=True,
@@ -54704,12 +55545,18 @@ class DeepEngine:
                 w.stop()
             self.workers, self.backend = [], "off"
 
-    def stop(self):
+    def stop(self, kill=False):
+        """Stops every worker under one shared 2 s deadline (5.2.3: was
+        2 s each, one after another); kill=True when the app closes."""
         self.stop_flag = True
         with self.cv:
             self.cv.notify_all()
+        if not kill:
+            for w in self.workers:
+                w.ask_stop()
+        deadline = time.monotonic() + 2.0
         for w in self.workers:
-            w.stop()
+            w.stop(kill=kill, deadline=deadline)
         self.workers = []
         self.backend = "off"
 
@@ -55257,7 +56104,7 @@ class ScenarioBuilder:
         Linux "cooked" capture frame."""
         self.vlan_ping()
         L = self.L
-        me, gw, nas = self.ME, self.GW, self.NAS
+        me = self.ME
         self._emit(L.Ether(src=me[1], dst="01:00:5e:00:00:16") /
                    L.IP(src=me[0], dst="224.0.0.22", ttl=1,
                         options=b"\x94\x04\x00\x00") /
@@ -56341,7 +57188,7 @@ def run_self_tests(verbose=True):
         assert tk_version_note(8.6) == ""
         assert preflight_unattended()                 # a test run
         assert "Preparing the capture driver" in CAPTURE_ONLY_STEPS
-        assert SCRIPT_VERSION == "5.1.2"
+        assert SCRIPT_VERSION == "5.2.3"
 
     def t_session_roundtrip():
         clk = _FakeClock()
@@ -56613,10 +57460,19 @@ def run_self_tests(verbose=True):
 SELF_TESTS = []              # (function, slow)
 
 
-def self_test(slow=False):
+def self_test(slow=False, needs_source=False):
     """Register a module-level test: fn(ctx) raises on failure, may return
-    "skip". `slow` tests are skipped by --quick."""
+    "skip". `slow` tests are skipped by --quick. `needs_source` tests read
+    the .py file or start `python -c` children: skipped in a frozen build
+    (5.2.3, M8)."""
     def deco(fn):
+        if needs_source and not HAS_SOURCE:
+            def skipped(_ctx, _fn=fn):
+                return "skip"
+            skipped.__name__ = fn.__name__
+            skipped.__doc__ = fn.__doc__
+            SELF_TESTS.append((skipped, slow))
+            return fn
         SELF_TESTS.append((fn, slow))
         return fn
     return deco
@@ -56660,7 +57516,7 @@ def model_summary(model):
     }
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_python38_grammar(ctx):
     """The launcher stage must parse on old Pythons (old installs hand over
     to the managed runtime, so the whole file keeps their syntax).
@@ -56690,7 +57546,7 @@ def toc_and_banners(src):
     return toc, banners
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_toc_matches_banners(ctx):
     """The file's table of contents lists every region banner, in order,
     and every banner id is unique."""
@@ -57114,7 +57970,7 @@ def run_pipeline(model, frames, timeout=60):
     return h, w
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_reverse_dns_only_in_active_mode(ctx):
     src = inspect.getsource(MiniWireshark.on_rows_analysed)
     assert "self.active_mode()" in src
@@ -57723,7 +58579,7 @@ def _restore_runtime_dir(old):
     globals()["RUNTIME_DIR"], globals()["RUNTIME_STATE"] = old
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_runtime_state_and_handoff(ctx):
     old = _with_runtime_dir(ctx)
     try:
@@ -57878,7 +58734,7 @@ def t_mask_sensitive(ctx):
     assert "192.168.x.x" in m and "da:a1:xx" in m
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_least_privilege(ctx):
     src = inspect.getsource(needs_elevation)
     assert "_npcap_admin_only" in src
@@ -58560,7 +59416,7 @@ NET_SENDS = {"urlopen", "sendp", "sendto", "gethostbyaddr", "getaddrinfo",
              "create_connection", "sr1", "srp", "srp1", "sendall"}
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_every_send_goes_through_outbound(ctx):
     """Static check of this file: every network send happens in a function
     that first passes the outbound() gate (so the ledger and the kill
@@ -59416,6 +60272,114 @@ def test_boot_receipts_and_crash_loop(ctx):
 
 
 @self_test(slow=False)
+def test_b31_archived_copies_cannot_hurt_each_other(ctx):
+    """5.2.3 (B-31/B-32/B-33/B-34/B-35/B-36): copies of MiniWireshark that
+    share one data folder (the archive of old versions) no longer roll an
+    update back over each other, erase each other's settings, overwrite an
+    interrupted session, write into a newer history file or put each other
+    into Safe Mode."""
+    d = ctx.path(f"arch_{uuid.uuid4().hex[:6]}")
+    os.makedirs(d)
+    body = b"# MiniWireshark\ndef main():\n    pass\n" + b"#" * 60000
+    a = os.path.join(d, "miniwireshark-5.2.3.py")
+    b = os.path.join(d, "miniwireshark-5.1.2.py")
+    for p_ in (a, b):
+        with open(p_, "wb") as f:
+            f.write(b"# MiniWireshark old " + os.path.basename(p_).encode() +
+                    b"\ndef main():\n    pass\n" + b"#" * 60000)
+    b_before = open(b, "rb").read()
+    marker = os.path.join(d, "update_pending.json")
+    apply_self_update(body, "9.9.9", a, marker)
+    # B-31: the other copy neither counts attempts nor restores over itself
+    for _ in range(4):
+        assert rollback_update_if_needed(script_path=b,
+                                         marker_path=marker) == ""
+    assert rollback_update_if_needed(force=True, script_path=b,
+                                     marker_path=marker) == ""
+    assert open(b, "rb").read() == b_before
+    assert read_json(marker)["attempts"] == 0
+    # leaving at the Welcome Center doesn't count either
+    assert rollback_update_if_needed(script_path=a, marker_path=marker) == ""
+    update_start_not_counted(a, marker)
+    assert read_json(marker)["attempts"] == 0
+    # a 5.1.2-style marker (no "script") is judged by its backup's name
+    legacy = dict(read_json(marker))
+    legacy.pop("script")
+    legacy.pop("sha256")
+    atomic_write_json(marker, legacy)
+    assert update_marker_for(b, marker) is None
+    assert update_marker_for(a, marker) is not None
+    # the file was replaced since (copied over by hand): marker dropped
+    apply_self_update(body, "9.9.9", a, marker)
+    with open(a, "ab") as f:
+        f.write(b"# edited\n")
+    assert update_marker_for(a, marker) is None
+    assert not os.path.exists(marker)
+    # B-32: settings this version doesn't know survive a load and save
+    cp = os.path.join(d, "cfg.json")
+    with open(cp, "w", encoding="utf-8") as f:
+        json.dump({"config_version": 9, "connectors": {"list": [1]},
+                   "zzz_future": {"x": 1}, "general": {"zzz_key": 2}}, f)
+    c = AppConfig(path=cp)
+    c.set("general.language", "English")
+    assert c.save()
+    back = read_json(cp)
+    assert back["zzz_future"] == {"x": 1}, back
+    assert back["connectors"].get("list") == [1], back
+    assert back["general"]["zzz_key"] == 2
+    assert back["config_version"] == 9
+    # B-33: an interrupted session is moved aside before anything else
+    jp = os.path.join(d, "journal.mwsession.json")
+    with open(jp, "w", encoding="utf-8") as f:
+        f.write("{}")
+    atomic_write_json(jp + ".sha256", {"journal": 2})
+    old = time.time() - 600
+    os.utime(jp, (old, old))
+    os.utime(jp + ".sha256", (old - 100, old - 100))   # left by 5.1.2
+    assert claim_interrupted_journal(jp, now=old + 30) == ""   # still live
+    moved = claim_interrupted_journal(jp)
+    assert moved and os.path.exists(moved) and not os.path.exists(jp)
+    assert not os.path.exists(moved + ".sha256"), "stale fingerprint kept"
+    assert not os.path.exists(jp + ".sha256")
+    for i in range(5):
+        p_ = os.path.join(d, f"journal-interrupted-2000010{i}-000000-1."
+                             f"mwsession.json")
+        with open(p_, "w") as f:
+            f.write("{}")
+    with open(jp, "w") as f:
+        f.write("{}")
+    os.utime(jp, (old, old))
+    claim_interrupted_journal(jp)
+    left = [n for n in os.listdir(d) if n.startswith("journal-interrupted-")
+            and n.endswith(".json")]
+    assert len(left) == 3, left
+    # B-34: a history file from a newer version is left alone
+    hp = os.path.join(d, "h.sqlite3")
+    con = sqlite3.connect(hp)
+    con.execute("CREATE TABLE meta(k TEXT PRIMARY KEY, v TEXT)")
+    con.execute("INSERT INTO meta VALUES('schema', ?)",
+                (str(STORE_SCHEMA_VERSION + 1),))
+    con.commit()
+    con.close()
+    st = Store(hp)
+    st._ready.wait(10)
+    assert "newer" in st.error, st.error
+    st.stop()
+    # B-35/B-36: other files' failed starts and a Welcome Center left
+    # open don't make a crash loop
+    other = {"kind": "start", "outcome": "crashed", "script": b,
+             "reached_main_window": False, "pid": 999999999}
+    mine = dict(other, script=a)
+    assert crash_loop_detected([other, other], script=a) is False
+    assert crash_loop_detected([mine, mine], script=a) is True
+    waiting = dict(mine, outcome="running", on_welcome=True)
+    assert crash_loop_detected([waiting, mine], script=a) is False
+    old_ver = {"kind": "start", "outcome": "fatal", "version": "5.0.2",
+               "reached_main_window": False}
+    assert crash_loop_detected([old_ver, old_ver], script=a) is False
+
+
+@self_test(slow=False, needs_source=True)
 def test_v5_handoff_policy_and_handshake(ctx):
     """The managed Python is used only when chosen or needed, and only
     after its window reports back; a child that crashes or hangs is
@@ -59503,7 +60467,7 @@ def _fake_wheel(path, name, version, files):
     return path
 
 
-@self_test(slow=False)
+@self_test(slow=False, needs_source=True)
 def test_private_packages_folder(ctx):
     """Packages go into MiniWireshark's own folder: swapped in atomically,
     importable, removable, and never through the system Python's pip."""
@@ -59515,8 +60479,8 @@ def test_private_packages_folder(ctx):
     assert pp.install_wheel_file(w1) == ("mwfakepkg", "1.0")
     assert pp.activate() and root in sys.path
     try:
-        import mwfakepkg                               # noqa: F401
-        assert sys.modules["mwfakepkg"].VERSION == "1.0"
+        mwfakepkg = importlib.import_module("mwfakepkg")
+        assert mwfakepkg.VERSION == "1.0"
         w2 = _fake_wheel(ctx.path("mwfakepkg-2.0-py3-none-any.whl"),
                          "mwfakepkg", "2.0",
                          {"mwfakepkg/__init__.py": "VERSION = '2.0'\n",
@@ -60053,6 +61017,12 @@ def test_capture_fault_classifier(ctx):
         (struct.error("unpack requires a buffer"), "parse", True),
         (RuntimeError("weird"), "unknown", True),
         (None, "unknown", True),
+        # 5.2.3 (B-02/B-03): a refused promiscuous mode is not a bad
+        # filter, and Npcap's "Error opening adapter" is not a card gone
+        (OSError("failed to set hardware filter to promiscuous mode"),
+         "wrong_adapter", True),
+        (OSError("Error opening adapter: The system cannot find the "
+                 "device specified. (20)"), "wrong_adapter", True),
     ]
     for exc, kind, retry in cases:
         k, title, fix, rt, orig = classify_capture_fault(exc)
@@ -60060,6 +61030,313 @@ def test_capture_fault_classifier(ctx):
         assert title and fix
         if exc is not None:
             assert str(exc) in orig and type(exc).__name__ in orig
+
+
+@self_test(slow=False)
+def test_b02_promisc_refused_and_probe_order(ctx):
+    """5.2.3 (B-01/B-02): a card that refuses promiscuous mode is opened
+    without it (raw socket and scapy sniffer) instead of failing as a
+    "bad filter"; other errors still surface; cards are probed in order,
+    stopping at the first that opens, and a cancel stops the probing."""
+    refusal = OSError("failed to set hardware filter to promiscuous mode")
+    calls = []
+
+    def l2listen(**kw):
+        calls.append(kw.get("promisc", "default"))
+        if kw.get("promisc", True):
+            raise refusal
+        return "sock"
+
+    def broken(**_kw):
+        raise OSError("No such device")
+
+    class FakeSniffer:
+        def __init__(self, **kw):
+            self.kw = kw
+            self.exception = None
+
+        def start(self):
+            if self.kw.get("promisc", True):
+                raise refusal
+
+        def stop(self):
+            pass
+
+    class Src:
+        def stop(self):
+            pass
+    tried = []
+
+    def fake_start(iface, _bpf, _promisc, _sink):
+        tried.append(iface)
+        if iface == "c":
+            return Src(), None
+        return None, OSError("Error opening adapter (20)")
+    g = globals()
+    old = {k: g.get(k) for k in ("conf", "AsyncSniffer", "probe_l2_socket",
+                                 "start_capture_source")}
+    try:
+        g["conf"] = types.SimpleNamespace(L2listen=l2listen)
+        rc = RawCapture("eth9", None, True, lambda *a: None)
+        assert rc._open() == "sock" and rc.promisc_refused
+        assert calls == [True, False], calls
+        calls.clear()
+        rc = RawCapture("eth9", None, False, lambda *a: None)
+        assert rc._open() == "sock" and not rc.promisc_refused
+        assert calls == [False], calls
+        g["conf"] = types.SimpleNamespace(L2listen=broken)
+        try:
+            RawCapture("eth9", None, True, lambda *a: None)._open()
+        except OSError as e:
+            assert "No such device" in str(e)
+        else:
+            raise AssertionError("a real open error was swallowed")
+        g["AsyncSniffer"] = FakeSniffer
+        g["probe_l2_socket"] = lambda: {"snaplen": True, "promisc": True,
+                                        "found": "test"}
+        s, err = build_sniffer("eth9", lambda p: None, None, True)
+        assert err is None and s.kw.get("promisc") is False, (s, err)
+        assert s.mw_promisc_refused
+        assert SnifferCapture(s).promisc_refused
+        g["start_capture_source"] = fake_start
+        cands = [("A", "a"), ("B", "b"), ("C", "c"), ("D", "d")]
+        src, err, used = probe_capture_sources(cands, None, True, None)
+        assert used == "C" and isinstance(src, Src) and err is None
+        assert tried == ["a", "b", "c"], tried
+        tried.clear()
+        src, err, used = probe_capture_sources(
+            cands, None, True, None, cancelled=lambda: len(tried) >= 1)
+        assert src is None and used is None and tried == ["a"], tried
+    finally:
+        for k, v in old.items():
+            g[k] = v
+
+
+@self_test(slow=False)
+def test_m8_frozen_seams(ctx):
+    """5.2.3 (M8): in a frozen build the program starts itself as
+    [exe, *args] (no script path, no compiled-copy loader), keeps its data
+    next to the exe, never loads private packages over its bundled ones,
+    and refuses a .py self-update."""
+    g = globals()
+    saved = {k: g[k] for k in ("FROZEN",)}
+    try:
+        g["FROZEN"] = True
+        exe = sys.executable
+        assert self_cmd("--demo") == [exe, "--demo"]
+        assert cached_cmd(exe, SCRIPT_PATH, ["--mw-worker"]) == \
+            [exe, "--mw-worker"]
+        assert "MW_CACHED" not in cached_env({"A": "1"})
+        assert runtime_handoff(argv=[], environ={}, execute=False) is None
+        assert PRIVATE_PACKAGES.activate() is False
+        try:
+            apply_self_update(b"x" * 60000, "v9")
+            raise AssertionError("a frozen build must refuse .py updates")
+        except UpdateRefused:
+            pass
+    finally:
+        g.update(saved)
+    assert self_cmd("--demo")[-2:] == [SCRIPT_PATH, "--demo"]
+
+
+@self_test(slow=False)
+def test_b10_atomic_write_retries_a_busy_target(ctx):
+    """5.2.3 (B-10): on Windows an antivirus holding the target for a
+    moment made os.replace fail and the save was lost, leaving a .tmp
+    file behind. The replace is retried briefly; on a real failure the
+    temporary file is removed and the error still reaches the caller."""
+    target = ctx.path("b10.json")
+    atomic_write_text(target, "old")
+    real, calls = os.replace, []
+
+    def flaky(a, b):
+        calls.append(a)
+        if len(calls) < 3:
+            raise PermissionError(13, "in use")
+        real(a, b)
+    os.replace = flaky
+    try:
+        atomic_write_text(target, "new")
+        assert len(calls) == 3
+        with open(target, encoding="utf-8") as f:
+            assert f.read() == "new"
+
+        def never(a, b):
+            raise PermissionError(13, "in use")
+        os.replace = never
+        try:
+            atomic_write_bytes(target, b"lost")
+            raise AssertionError("the failure must reach the caller")
+        except PermissionError:
+            pass
+    finally:
+        os.replace = real
+    left = [n for n in os.listdir(os.path.dirname(target))
+            if n.startswith("b10.json.tmp")]
+    assert not left, left
+    with open(target, encoding="utf-8") as f:
+        assert f.read() == "new"
+
+
+@self_test(slow=False)
+def test_b11_identity_on_multi_adapter_pcs(ctx):
+    """5.2.3 (B-11..B-20): a PC with Wi-Fi, ZeroTier, VMware and Tailscale
+    adapters. Only the captured card's private subnet is "the LAN"; CGNAT
+    addresses are not local; a DNS answer never names a local device; a
+    routed private host never moves the router; ARP entries of virtual
+    switches are not reported as devices; process names don't outlive
+    their process number."""
+    def r(net, mask, iface, addr="x"):
+        return (int(ipaddress.ip_address(net)),
+                int(ipaddress.ip_address(mask)), "0.0.0.0", iface, addr, 1)
+    routes = [r("172.25.0.0", "255.255.240.0", "vEthernet (WSL)"),
+              r("203.0.113.0", "255.255.255.0", "ZeroTier One"),
+              r("100.64.0.0", "255.192.0.0", "Tailscale"),
+              r("192.168.1.0", "255.255.255.0", "Wi-Fi"),
+              r("192.168.1.0", "255.255.255.0", "Wi-Fi"),
+              r("0.0.0.0", "0.0.0.0", "Wi-Fi"),
+              ("bad",)]
+    lan = ipaddress.ip_network("192.168.1.0/24")
+    wsl = ipaddress.ip_network("172.25.0.0/20")
+    assert local_nets_from_routes(routes, "Wi-Fi") == [lan]
+    assert local_nets_from_routes(routes) == [wsl, lan]
+    assert local_nets_from_routes(routes, "eth9") == [wsl, lan]
+    assert not is_private_ip("100.64.1.2") and is_private_ip("10.1.2.3")
+    if not ctx.scapy_ok:
+        return
+    sb = ScenarioBuilder()
+    me, gw = sb.ME, sb.GW
+    # before the router's MAC is known: replies from a host beyond it
+    sb.tls(me, "intranet.example", "10.20.0.5", size=2000)
+    sb.dns(me, "ads.doubleclick.example", "192.168.1.53")
+    sb.arp_announce(me)
+    m = scenario_model(ctx.cfg(), frames=sb.frames)
+    assert m.cache.get("192.168.1.53") in ("", None), \
+        m.cache.get("192.168.1.53")
+    key = m.registry.ip_to_key.get("10.20.0.5")
+    gdev = m.registry.by_key.get(m.registry.ip_to_key.get(gw[0]))
+    assert gdev is None or gdev.ip == gw[0], gdev.ip
+    assert key is None or key != getattr(gdev, "key", None)
+    # ARP cache: the WSL switch's neighbour is not a device on this LAN
+    app = types.SimpleNamespace(model=m, arp_cache=[
+        ("192.168.1.77", "02:00:00:00:00:77", "Wi-Fi"),
+        ("172.25.0.9", "02:00:00:00:00:09", "vEthernet (WSL)")])
+    got = MiniWireshark.arp_cache_only(app)
+    assert ("192.168.1.77", "02:00:00:00:00:77") in got, got
+    assert all(ip != "172.25.0.9" for ip, _m in got), got
+
+
+@self_test(slow=False, needs_source=True)
+def test_b09_console_text_and_small_fixes(ctx):
+    """5.2.3: console output in any code page decodes without raising
+    (B-09); a stored secret keeps its last letters and loses only its
+    newline (B-41); the 6 GHz band's low end has the right channels
+    (B-19)."""
+    assert console_decode("Wi-Fi \u00e9") == "Wi-Fi \u00e9"
+    assert console_decode(None) == ""
+    for raw in ("R\u00e9seau sans fil".encode("cp850"),
+                "\u0421\u0435\u0442\u044c".encode("cp866"),
+                b"\xff\xfe\x81\x8d"):
+        assert isinstance(console_decode(raw), str)
+    r = run_console([sys.executable, "-c", "print('ok')"], timeout=30)
+    assert r.returncode == 0 and r.stdout.strip() == "ok"
+    assert _one_line_end("token\\n\n") == "token\\n"
+    assert _one_line_end("passwordn\n") == "passwordn"
+    assert _one_line_end("x\r\n") == "x" and _one_line_end("y") == "y"
+    assert wifi_channel_from_mhz(5935) == (2, "6 GHz")
+    assert wifi_channel_from_mhz(5955) == (1, "6 GHz")
+    assert wifi_channel_from_mhz(7115) == (233, "6 GHz")
+    assert wifi_channel_from_mhz(5945) == (None, "")
+    assert abi_tag((3, 13), "win-amd64", "t") == "cp313t-win_amd64"
+    assert abi_tag((3, 12), "linux-x86_64", "") == "cp312-linux_x86_64"
+    # B-40: several versions in one folder are told they share data
+    arch = ctx.path("b40archive")
+    os.makedirs(arch, exist_ok=True)
+    for name in ("miniwireshark V3.0.0.py", "miniwireshark-5.1.2.py"):
+        with open(os.path.join(arch, name), "w", encoding="utf-8") as f:
+            f.write("#\n")
+    shared = os.path.join(arch, "miniwireshark_data")
+    assert "2 MiniWireshark versions" in shared_data_note(arch, shared)
+    assert shared_data_note(arch, ctx.path("elsewhere")) == ""
+    # B-07: no Npcap on Windows does not elevate the whole window
+    g = globals()
+    saved = {k: g[k] for k in ("IS_WINDOWS", "is_admin",
+                               "_npcap_present_early", "_npcap_admin_only")}
+    try:
+        g.update(IS_WINDOWS=True, is_admin=lambda: False,
+                 _npcap_present_early=lambda: False,
+                 _npcap_admin_only=lambda: True)
+        assert not needs_elevation()
+        g["_npcap_present_early"] = lambda: True
+        assert needs_elevation()                # admin-only Npcap mode
+    finally:
+        g.update(saved)
+    # B-39: a runtime whose base Python folder vanished is not healthy
+    venv = ctx.path("b39env")
+    os.makedirs(os.path.join(venv, "Scripts"), exist_ok=True)
+    exe = os.path.join(venv, "Scripts", "python.exe")
+    with open(exe, "wb") as f:
+        f.write(b"x")
+    env = {"python": exe, "selftest_ok": True}
+    assert runtime_healthy(env)                 # no pyvenv.cfg: trusted
+    with open(os.path.join(venv, "pyvenv.cfg"), "w", encoding="utf-8") as f:
+        f.write("home = " + ctx.path("gone-store-python") + "\n")
+    assert not runtime_healthy(env)
+    with open(os.path.join(venv, "pyvenv.cfg"), "w", encoding="utf-8") as f:
+        f.write("home = " + os.path.dirname(sys.executable) + "\n")
+    assert runtime_healthy(env)
+    # C-01: a keychain secret never appears on a command line
+    real, seen = subprocess.run, []
+
+    def fake(args, **kw):
+        seen.append((list(args), kw.get("input") or b""))
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+    vault = CredentialVault.__new__(CredentialVault)
+    vault.backend = "keychain"
+    subprocess.run = fake
+    try:
+        for secret in ('c01-pa"ss\\word\u00e9-Zq7', "c01-Plain-Zq7"):
+            assert vault.set("c1", secret)
+            args, data = seen[-2]
+            assert args == ["security", "-i"], args
+            assert _keychain_quote(secret).encode() in data
+            assert seen[-1][0][:2] == ["security", "find-generic-password"]
+            assert "-w" not in seen[-1][0]
+            assert all(secret not in a for c, _d in seen for a in c)
+    finally:
+        subprocess.run = real
+    assert not _keychain_quotable("two\nlines")
+    assert _keychain_quote('a"b\\c') == '"a\\"b\\\\c"'
+
+
+@self_test(slow=False)
+def test_b24_first_visit_once_and_bounded_maps(ctx):
+    """5.2.3 (B-24/B-27): "First visit to …" is said once per site, even
+    when 3,000+ other websites came in between (it was said again, and
+    every new website scanned the last 3,000); the alert engine's
+    debounce and open-alert maps stay bounded."""
+    t = [100000.0]
+    m = NetworkModel(ctx.cfg(), now_fn=lambda: t[0])
+    m.capture_started = t[0] - 100000
+    said = []
+    m.push_timeline = lambda kind, sev, text, *a, **k: said.append(text)
+    m.register_website("www.google.com", None, None, "DNS")
+    for i in range(3200):
+        m.register_website(f"host{i}.site{i}.example", None, None, "DNS")
+    m.register_website("mail.google.com", None, None, "DNS")
+    assert sum("google.com" in s for s in said) == 1, \
+        [s for s in said if "google" in s]
+    assert sum("site7.example" in s for s in said) == 1
+    ae = m.alerts
+    for i in range(ae.DEBOUNCE_KEEP + 50):
+        t[0] += 1
+        ae._debounced(f"dnschg:{i}", 600)
+    assert len(ae._debounce) <= ae.DEBOUNCE_KEEP
+    assert ae._debounced(f"dnschg:{ae.DEBOUNCE_KEEP + 49}", 600)
+    for i in range(600):
+        ae._add("test_kind", "INFO", "", f"r{i}", "", "", [],
+                subject=f"s{i}")
+    assert len(ae.order) == 500 and len(ae._open) == 500, len(ae._open)
 
 
 @self_test(slow=False)
@@ -60168,7 +61445,7 @@ def test_capture_gaps_presence_and_lifecycle(ctx):
         assert m2.capture_gaps() == m.capture_gaps()
 
 
-@self_test()
+@self_test(needs_source=True)
 def test_scenarios_and_demo_without_scapy(ctx):
     """With scapy blocked: the scripted network builds, decodes and passes
     every golden check through the fast decoder, and Demo Mode's
@@ -60942,7 +62219,7 @@ def t_warm_up_on_the_loading_screen(ctx):
         conf.L2listen = real_listen
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_compiled_copy_start(ctx):
     """A second process loads the kept compiled copy (and still works
     when the copy is missing, stale or broken); the plain start would
@@ -61800,6 +63077,9 @@ def _bench_child(sid, out_path, pcap):
             pal.win.destroy()
     res["palette"] = measure("palette", palette)
 
+    # 5.2.3 (B-23): the benchmark's own reference kept the imported data
+    # alive through the reload, so "memory after reload" counted it twice
+    m = None
     sess = os.path.join(tmp, "bench.mwsession.json")
     filedialog.asksaveasfilename = lambda *a, **k: sess
     res["session_save"] = measure(
@@ -61913,9 +63193,9 @@ def bench_gui(argv):
         env["MINIWIRESHARK_DATA"] = tempfile.mkdtemp(prefix="mw_benchdata_")
         t0 = time.time()
         try:
-            rc = subprocess.run([sys.executable, SCRIPT_PATH, "--bench-gui",
-                                 "--child", sid, "--out", part, "--pcap",
-                                 captures[size]], env=env,
+            rc = subprocess.run(self_cmd("--bench-gui",
+                                         "--child", sid, "--out", part,
+                                         "--pcap", captures[size]), env=env,
                                 timeout=3600).returncode
         except subprocess.TimeoutExpired:
             rc = -1
@@ -62011,7 +63291,7 @@ def grab_window(root, path):
             enc = base64.b64encode(script.encode("utf-16-le")).decode()
             r = subprocess.run([ps, "-NoProfile", "-NonInteractive",
                                 "-EncodedCommand", enc], capture_output=True,
-                               timeout=60)
+                               timeout=60, creationflags=NO_WINDOW)
             ok = r.returncode == 0 and os.path.exists(path)
             return ok, "PowerShell" if ok else (
                 "PowerShell: " + r.stderr.decode("utf-8", "replace")[:200])
@@ -62150,9 +63430,10 @@ def _gate_run(out_dir, name, args, timeout):
     env = dict(os.environ)
     env["MW_UNATTENDED"] = "1"
     try:
-        r = subprocess.run([sys.executable, SCRIPT_PATH] + args,
+        r = subprocess.run(self_cmd(*args),
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=timeout, env=env)
+                           timeout=timeout, env=env,
+                           creationflags=NO_WINDOW)
         rc, text = r.returncode, r.stdout.decode("utf-8", "replace")
     except subprocess.TimeoutExpired as e:
         rc = -1
@@ -62181,9 +63462,9 @@ def start_check(out=print):
         for label in ("First start", "Next start"):
             t0 = time.perf_counter()
             try:
-                r = subprocess.run([sys.executable, SCRIPT_PATH], env=env,
+                r = subprocess.run(self_cmd(), env=env,
                                    capture_output=True, text=True,
-                                   timeout=300)
+                                   timeout=300, creationflags=NO_WINDOW)
                 text = r.stdout
             except (OSError, subprocess.SubprocessError) as e:
                 text = f"could not start: {e}"
@@ -62442,6 +63723,73 @@ def _gs_live(app, ctx):
           f"{app.kernel.text()})")
 
 
+@gui_test_step("starting capture never blocks the window (5.2.3, B-01)")
+def _gs_capture_start_async(app, ctx):
+    g = globals()
+    old = g["start_capture_source"]
+    saved_fault = app.last_fault
+
+    def slow_fail(_iface, _bpf, _promisc, _sink):
+        time.sleep(0.3)
+        return None, OSError("Error opening adapter (20)")
+    g["start_capture_source"] = slow_fail
+    try:
+        labels = (list(app.iface_map)[:1] or ["Default"]) * 5
+        t0 = time.perf_counter()
+        assert app._start_capture(labels)
+        dt = time.perf_counter() - t0
+        assert dt < 0.15, f"starting capture blocked {dt * 1000:.0f} ms"
+        assert app._capture_starting
+        app.start()                        # a second click is ignored
+        assert _gui_pump(app.root, 0, lambda: not app._capture_starting,
+                         timeout=15), "the start never finished"
+        assert app.sniffer is None
+        assert app.last_fault[0] in ("wrong_adapter", "driver"), \
+            app.last_fault
+        assert str(app.start_btn.cget("state")) == "normal"
+        # a stop while the cards are tried cancels the start
+        assert app._start_capture(labels)
+        app.stop()
+        assert not app._capture_starting
+        _gui_pump(app.root, 1.0)
+        assert app.sniffer is None and not app._capture_starting
+    finally:
+        g["start_capture_source"] = old
+        app.last_fault = saved_fault
+
+
+@gui_test_step("minimised window keeps memory bounded (5.2.3, B-21/B-22)")
+def _gs_minimised_trim(app, ctx):
+    m = app.model
+    saved = (set(m.flows.dirty), list(m.ev_alerts), list(m.ev_banner))
+    try:
+        m.flows.dirty = set(range(10 ** 7, 10 ** 7 + app.MINIMIZED_KEEP + 5))
+        m.flows.closed_now.extend([object()] * 50)
+        m.ev_alerts.extend([object()] * (app.MINIMIZED_KEEP + 5))
+        m.ev_banner.extend([("a", "info"), ("b", "info")])
+        app._trim_while_minimized(m)
+        assert not m.flows.dirty and not m.flows.closed_now
+        assert len(m.ev_alerts) == app.MINIMIZED_KEEP
+        assert m.ev_banner == [("b", "info")]
+        assert app.tabs["connections"]._pending
+        # a backlog bigger than the table is one sliced refill
+        m.flows.dirty = set(range(10 ** 7, 10 ** 7 + app.FLOW_BACKLOG + 5))
+        app._flow_rebuild_at = 0.0
+        t0 = time.perf_counter()
+        app._flush_flows(m)
+        assert not m.flows.dirty
+        assert time.perf_counter() - t0 < 0.25
+        # a small one goes in pieces of at most FLUSH_MAX
+        m.flows.dirty = set(range(10 ** 7, 10 ** 7 + app.FLUSH_MAX + 7))
+        app._flow_rebuild_at = time.monotonic()
+        app._flush_flows(m)
+        assert len(m.flows.dirty) == 7
+        _gui_pump(app.root, 0.5)
+    finally:
+        m.flows.dirty, m.ev_alerts[:], m.ev_banner[:] = saved
+        m.flows.dirty = set()
+
+
 @gui_test_step("history store records live evidence (and survives reopen)")
 def _gs_history(app, ctx):
     root = app.root
@@ -62674,8 +64022,15 @@ def _gs_this_pc(app, ctx):
         sink(raw, time.time(), lt)
     assert _gui_pump(root, 0.3, lambda: not len(app.ring) and
                      not app.worker.busy, timeout=30)
+    # a network check started by an earlier step can land meanwhile and
+    # add this machine's real address to "my addresses", which replaces
+    # the scenario's; the step is about the scenario's computer
+    m.set_identity(my_ips=ident[1], local_nets=ident[3])
+
+    def _mine():
+        return [f for f in m.flows.all_flows() if f.local_ip in ident[1]]
     # programs: pretend the OS table names this computer's connections
-    mine = [f for f in m.flows.all_flows() if f.local_ip in m.my_ips]
+    mine = _mine()
     assert mine, "the scenario has connections from this computer"
     pm = app.procmap
     _gui_pump(root, 0.05, lambda: not pm.busy, timeout=10)
@@ -63294,6 +64649,8 @@ def _gs_mail_canary(app, ctx):
         outputs["html report"] = ReportBuilder(app).build("full")
         app._ask_save = lambda *a, **k: ctx.path("pk.csv")
         app._export_csv(False)
+        assert _gui_pump(root, 0, lambda: os.path.exists(ctx.path(
+            "pk.csv")) and not app.jobs.busy(), timeout=30)
         outputs["csv"] = open(ctx.path("pk.csv"), encoding="utf-8").read()
         outputs["debug bundle"] = app.debug_bundle_text(masked=False)
         outputs["diagnostics"] = DiagnosticsWindow.collect(app)
@@ -63880,8 +65237,6 @@ def _gs_loader(app, ctx):
     th = threading.Thread(target=lambda: got.append(
         lw.ask("consent", text="test")), daemon=True)
     th.start()
-    ok = _gui_pump(win, 0.1, lambda: bool(lw.card.winfo_children()),
-                   timeout=5) if False else None
     t_end = time.time() + 5
     btn = None
     while time.time() < t_end and btn is None:
@@ -65572,7 +66927,7 @@ def gt_rc11_warm_start(app, ctx):
     env.pop("MW_FEATURES_OFF", None)
     outs = []
     for _ in range(2):
-        r = subprocess.run([sys.executable, SCRIPT_PATH], env=env,
+        r = subprocess.run(self_cmd(), env=env,
                            capture_output=True, text=True, timeout=180)
         line = next((x for x in r.stdout.splitlines()
                      if x.startswith("START_OK")), "")
@@ -66033,11 +67388,16 @@ def main():
         alive = False
     if not alive:                     # closed during the loading screen
         LOG.info("closed during the loading screen")
+        update_start_not_counted()
         if BOOT is not None:
             BOOT.mark(outcome="user_exit")
         return
     t_ready = time.perf_counter() - _T_START
     LAUNCH_TIMES["ready"] = t_ready
+    # 5.2.3 (B-36): "main window" used to include the time spent reading
+    # the Welcome Center; the start-up time is this step
+    boot_step("ready", True, f"{t_ready:.2f} s after launch")
+    welcome_dwell = 0.0
 
     action = None
     welcomed = False
@@ -66050,10 +67410,17 @@ def main():
         if CAPTURE_LIMITED[0] or HANDOFF_NOTE[0] or SAFE_MODE:
             health = "degraded"
         summary = welcome_summary(cfg)
+        if BOOT is not None:
+            BOOT.mark(on_welcome=True)
+        t_w = time.perf_counter()
         action = loader.show_welcome(summary, health, first_time,
                                      notice=startup_notice())
+        welcome_dwell = time.perf_counter() - t_w
+        if BOOT is not None:
+            BOOT.mark(on_welcome=False)
         welcomed = True
         if action == "exit":
+            update_start_not_counted()
             if BOOT is not None:
                 BOOT.mark(outcome="user_exit")
             with contextlib.suppress(tk.TclError):
@@ -66067,8 +67434,11 @@ def main():
         freeze_startup_objects()
         if os.environ.get("MW_START_AND_EXIT"):
             _start_and_exit(root, app)
-        boot_step("main window", True, f"{time.perf_counter() - _T_START:.2f}"
-                                       f" s after launch")
+        total = time.perf_counter() - _T_START
+        boot_step("main window", True, f"{total:.2f} s after launch" + (
+            f" ({welcome_dwell:.2f} s of it on the Welcome Center; "
+            f"{total - welcome_dwell:.2f} s without)" if welcome_dwell
+            else ""))
         if BOOT is not None:
             BOOT.mark(reached_main_window=True)
     except Exception as e:                           # noqa: BLE001
@@ -66078,7 +67448,7 @@ def main():
         if BOOT is not None:
             BOOT.mark(outcome="fatal")
         rolled = rollback_update_if_needed(force=True) \
-            if os.path.exists(PATHS.update_marker) else ""
+            if update_marker_for() else ""
         messagebox.showerror("Startup error",
                              (rolled + "\n\n" if rolled else "") +
                              "MiniWireshark couldn't start its window.\n\n" +
@@ -66199,7 +67569,31 @@ def welcome_summary(cfg):
                      f"{'s' if len(pk) != 1 else ''}")
     if cfg.get("history.enabled", False):
         parts.append("history on")
+    note = shared_data_note()
+    if note:
+        parts.append(note)
     return " · ".join(parts)
+
+
+def shared_data_note(script_dir=None, data_dir=None):
+    """5.2.3 (B-40, verdict D): when several MiniWireshark files sit in one
+    folder (an archive of versions) they share the settings and history in
+    its miniwireshark_data folder. Say so in one line ("" otherwise)."""
+    script_dir = script_dir or APP_HOME
+    data_dir = data_dir or PATHS.data
+    if os.path.normcase(os.path.abspath(data_dir)) != os.path.normcase(
+            os.path.abspath(os.path.join(script_dir, "miniwireshark_data"))):
+        return ""
+    try:
+        n = sum(1 for f in os.listdir(script_dir)
+                if f.lower().startswith("miniwireshark")
+                and f.lower().endswith(".py"))
+    except OSError:
+        return ""
+    if n < 2:
+        return ""
+    return (f"{n} MiniWireshark versions in this folder share one data "
+            f"folder (set MINIWIRESHARK_DATA to keep one apart)")
 
 
 BOOT_TESTS = ("test_boot_receipts_and_crash_loop",
@@ -66241,7 +67635,6 @@ def boot_check(out=print):
         f"({'writable' if _dir_writable(PATHS.data) else 'NOT writable'})")
     if not _dir_writable(PATHS.data):
         ok_all = False
-    st = RuntimeManager().status()
     env = runtime_env(runtime_state_read()) or {}
     out(f"  Managed     {'installed' if env else 'none'}"
         + (f", window failed: {env.get('handshake_error')}"
