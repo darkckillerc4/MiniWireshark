@@ -5671,7 +5671,7 @@ def reputation_text(hits):
 # ============================================================================
 PRIVATE_NETS = [ipaddress.ip_network(n) for n in
                 ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
-                 "169.254.0.0/16", "127.0.0.0/8", "100.64.0.0/10",
+                 "169.254.0.0/16", "127.0.0.0/8",
                  "224.0.0.0/4", "fe80::/10", "fc00::/7", "::1/128",
                  "ff00::/8")]
 
@@ -6728,6 +6728,42 @@ def is_multicast_or_broadcast(ip):
 
 def iface_name(iface):
     return str(getattr(iface, "name", iface) or "")
+
+
+LAN_NETS = [ipaddress.ip_network(n) for n in
+            ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+             "169.254.0.0/16")]
+
+
+def local_nets_from_routes(routes, capture_iface=""):
+    """This computer's on-link IPv4 networks, from a scapy route table
+    ((net, mask, gw, iface, addr, ...) rows). 5.2.3 (B-11/B-12): only
+    private and link-local ranges count (a VPN or ZeroTier adapter with an
+    on-link public prefix turned websites into "devices"), and when the
+    capture adapter is known its networks come alone, so a virtual
+    switch's subnet is never taken for the LAN or its fingerprint."""
+    mine, other = [], []
+    want = iface_name(capture_iface)
+    for entry in routes or ():
+        try:
+            net, mask, gw, iface, addr = entry[:5]
+        except (TypeError, ValueError):
+            continue
+        if gw not in ("0.0.0.0", "", None) or not net or \
+                addr in ("127.0.0.1", "0.0.0.0", ""):
+            continue
+        try:
+            n = ipaddress.ip_network(
+                f"{_int_to_ip(net)}/{_int_to_ip(mask)}", strict=False)
+        except ValueError:
+            continue
+        if not 8 <= n.prefixlen < 32 or \
+                not any(n.subnet_of(p) for p in LAN_NETS):
+            continue
+        bucket = mine if want and iface_name(iface) == want else other
+        if n not in bucket:
+            bucket.append(n)
+    return (mine or other)[:16]
 
 
 def iface_desc(iface):
@@ -9221,6 +9257,13 @@ def learn_names_from(cache, d):
     """Feed the IP→name cache from one decoded packet (any thread)."""
     src = _LEARN_SOURCE.get(d["proto"], "dns")
     for ip, name in d["learns"]:
+        if src == "dns" and is_private_ip(ip):
+            # 5.2.3 (B-15): a DNS answer pointing a name at a local
+            # address says nothing about that device (a Pi-hole answers
+            # its own address for every blocked ad server and became
+            # "ads.doubleclick.net"); its own names come from DHCP, mDNS,
+            # NBNS and reverse lookups
+            continue
         cache.learn(ip, name, source=src)
 
 
@@ -14495,6 +14538,14 @@ class ProcessMap:
         conns, partial = self._connections(ps)
         by_local, by_port, listening = {}, {}, {}
         unnamed = 0
+        # 5.2.3 (B-18): Windows reuses process numbers quickly; a name is
+        # kept only while its process number is still in the table, so a
+        # new program never inherits a finished one's name
+        live = {c[1] if isinstance(c, tuple) and len(c) == 2 and
+                not hasattr(c, "laddr") else getattr(c, "pid", None)
+                for c in conns}
+        for gone in [p for p in self.names if p not in live]:
+            del self.names[gone]
         for c in conns:
             pid = None
             if isinstance(c, tuple) and len(c) == 2 and not hasattr(
@@ -17490,9 +17541,11 @@ class NetworkModel:
                 continue
             use_mac = mac if is_unicast_mac(mac) else None
             if use_mac and ip and ip != self.gateway_ip and \
-                    use_mac in self.registry.gw_macs and \
                     self._routed_private_v4(ip):
-                use_mac = None      # routed from elsewhere via the router
+                # routed from elsewhere via the router; 5.2.3 (B-13): also
+                # before the router's MAC is known, or the first such
+                # packet moved the router device to that address
+                use_mac = None
             dev = self.registry.note_traffic(ip or None, use_mac, nbytes,
                                              proto, role, internet, ts)
             if dev is None:
@@ -39414,22 +39467,12 @@ class MiniWireshark:
         return m
 
     def _local_nets(self):
-        nets = []
         try:
-            for entry in conf.route.routes:
-                net, mask, gw, _iface, addr = entry[:5]
-                if gw not in ("0.0.0.0", "", None) or not net or \
-                        addr in ("127.0.0.1", "0.0.0.0", ""):
-                    continue
-                with contextlib.suppress(ValueError):
-                    n = ipaddress.ip_network(
-                        f"{_int_to_ip(net)}/{_int_to_ip(mask)}", strict=False)
-                    if 8 <= n.prefixlen < 32 and not n.is_loopback and \
-                            not n.is_multicast and n not in nets:
-                        nets.append(n)
+            cap = self.iface_map.get(self.current_iface_label) \
+                if self.sniffer is not None else None
+            return local_nets_from_routes(conf.route.routes, cap or "")
         except Exception:                            # noqa: BLE001
-            pass
-        return nets[:16]
+            return []
 
     def _local_v6_prefixes(self):
         out = []
@@ -40487,7 +40530,12 @@ class MiniWireshark:
         my_ip = next(iter(sorted(self.real_identity[1])), "")
         subnet = ""
         if nets:
-            subnet = str(nets[0])
+            # 5.2.3 (B-12): the router's subnet, not the first adapter in
+            # route order (a ZeroTier or Hyper-V switch subnet changed the
+            # fingerprint, so a known network looked new)
+            g = ip_obj(gw)
+            subnet = str(next((n for n in nets if g is not None and
+                               g.version == 4 and g in n), nets[0]))
         elif my_ip:
             subnet = str(ipaddress.ip_network(f"{my_ip}/24", strict=False))
         seen_gw_mac = ""
@@ -44304,7 +44352,15 @@ proc ::mw_retheme {w map fgnew deffg} {
                                      f"{old or '?'} → {gw} (new network or "
                                      f"router?)")
         if my_ip and my_ip not in self.real_identity[1]:
-            ips = set(self.real_identity[1]) | {my_ip}
+            # 5.2.3 (B-16): the old address is dropped (the set only grew,
+            # so after a DHCP change the device that got our old address
+            # was shown as "This computer"); the capture card's own
+            # address stays
+            cap = self.iface_map.get(self.current_iface_label) \
+                if self.sniffer is not None else None
+            cap_ip = _iface_ip(cap) if cap is not None else ""
+            ips = {a for a in self.real_identity[1] if ":" in a} | \
+                {my_ip} | ({cap_ip} if cap_ip else set())
             self.real_identity = (self.real_identity[0], ips,
                                   self.real_identity[2])
             self.model.set_identity(my_ips=ips, local_nets=self._local_nets())
@@ -44343,6 +44399,10 @@ proc ::mw_retheme {w map fgnew deffg} {
         1 ms later."""
         pr = self.pending_rows
         if self.minimized():
+            if pr:
+                # 5.2.3 (B-17): packets still arrive while minimised; a
+                # later fault otherwise recorded a "gap" for all that time
+                self._last_packet_wall = time.time()
             with contextlib.suppress(tk.TclError):
                 self.root.after(self._ms(500), self._drain_decoded)
             return
@@ -45384,9 +45444,17 @@ proc ::mw_retheme {w map fgnew deffg} {
         """Addresses in this computer's ARP cache that haven't been seen on
         the wire (yet) — shown as Reported, not as devices."""
         reg = self.model.registry
+        # 5.2.3 (B-20): the cache lists every adapter (Hyper-V, VMware and
+        # WSL switches too); only the captured network's subnets count
+        nets = [n for n in self.model.local_nets if n.version == 4]
+
+        def on_lan(ip):
+            a = ip_obj(ip)
+            return a is None or a.version != 4 or not nets or \
+                any(a in n for n in nets)
         return [(ip, mac) for ip, mac, _i in self.arp_cache
                 if ip not in reg.ip_to_key and mac not in reg.by_key
-                and reg.eligible_ip(ip)]
+                and reg.eligible_ip(ip) and on_lan(ip)]
 
     def _tick_wifi(self):
         """Keep this computer's Wi-Fi reading fresh while watching live,
@@ -60856,6 +60924,54 @@ def test_b10_atomic_write_retries_a_busy_target(ctx):
     assert not left, left
     with open(target, encoding="utf-8") as f:
         assert f.read() == "new"
+
+
+@self_test(slow=False)
+def test_b11_identity_on_multi_adapter_pcs(ctx):
+    """5.2.3 (B-11..B-20): a PC with Wi-Fi, ZeroTier, VMware and Tailscale
+    adapters. Only the captured card's private subnet is "the LAN"; CGNAT
+    addresses are not local; a DNS answer never names a local device; a
+    routed private host never moves the router; ARP entries of virtual
+    switches are not reported as devices; process names don't outlive
+    their process number."""
+    def r(net, mask, iface, addr="x"):
+        return (int(ipaddress.ip_address(net)),
+                int(ipaddress.ip_address(mask)), "0.0.0.0", iface, addr, 1)
+    routes = [r("172.25.0.0", "255.255.240.0", "vEthernet (WSL)"),
+              r("203.0.113.0", "255.255.255.0", "ZeroTier One"),
+              r("100.64.0.0", "255.192.0.0", "Tailscale"),
+              r("192.168.1.0", "255.255.255.0", "Wi-Fi"),
+              r("192.168.1.0", "255.255.255.0", "Wi-Fi"),
+              r("0.0.0.0", "0.0.0.0", "Wi-Fi"),
+              ("bad",)]
+    lan = ipaddress.ip_network("192.168.1.0/24")
+    wsl = ipaddress.ip_network("172.25.0.0/20")
+    assert local_nets_from_routes(routes, "Wi-Fi") == [lan]
+    assert local_nets_from_routes(routes) == [wsl, lan]
+    assert local_nets_from_routes(routes, "eth9") == [wsl, lan]
+    assert not is_private_ip("100.64.1.2") and is_private_ip("10.1.2.3")
+    if not ctx.scapy_ok:
+        return
+    sb = ScenarioBuilder()
+    me, gw = sb.ME, sb.GW
+    # before the router's MAC is known: replies from a host beyond it
+    sb.tls(me, "intranet.example", "10.20.0.5", size=2000)
+    sb.dns(me, "ads.doubleclick.example", "192.168.1.53")
+    sb.arp_announce(me)
+    m = scenario_model(ctx.cfg(), frames=sb.frames)
+    assert m.cache.get("192.168.1.53") in ("", None), \
+        m.cache.get("192.168.1.53")
+    key = m.registry.ip_to_key.get("10.20.0.5")
+    gdev = m.registry.by_key.get(m.registry.ip_to_key.get(gw[0]))
+    assert gdev is None or gdev.ip == gw[0], gdev.ip
+    assert key is None or key != getattr(gdev, "key", None)
+    # ARP cache: the WSL switch's neighbour is not a device on this LAN
+    app = types.SimpleNamespace(model=m, arp_cache=[
+        ("192.168.1.77", "02:00:00:00:00:77", "Wi-Fi"),
+        ("172.25.0.9", "02:00:00:00:00:09", "vEthernet (WSL)")])
+    got = MiniWireshark.arp_cache_only(app)
+    assert ("192.168.1.77", "02:00:00:00:00:77") in got, got
+    assert all(ip != "172.25.0.9" for ip, _m in got), got
 
 
 @self_test(slow=False)
