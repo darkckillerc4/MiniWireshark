@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="t">
+  <title id="t">MiniWireshark logo</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0f1b2d"/>
+      <stop offset="1" stop-color="#1b3354"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#4ea1ff"/>
+      <stop offset="1" stop-color="#b48cff"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="108" fill="url(#bg)"/>
+  <rect x="16.5" y="16.5" width="479" height="479" rx="107.5" fill="none" stroke="#7fbaff" stroke-opacity="0.25"/>
+  <!-- network: a hub and four devices -->
+  <g stroke="#4ea1ff" stroke-opacity="0.55" stroke-width="10" stroke-linecap="round">
+    <line x1="256" y1="196" x2="136" y2="120"/>
+    <line x1="256" y1="196" x2="376" y2="120"/>
+    <line x1="256" y1="196" x2="124" y2="250"/>
+    <line x1="256" y1="196" x2="388" y2="250"/>
+  </g>
+  <g fill="#0f1b2d" stroke="#7fbaff" stroke-width="10">
+    <circle cx="136" cy="120" r="24"/>
+    <circle cx="376" cy="120" r="24"/>
+    <circle cx="124" cy="250" r="24"/>
+    <circle cx="388" cy="250" r="24"/>
+    <circle cx="256" cy="196" r="40"/>
+  </g>
+  <circle cx="256" cy="196" r="15" fill="#7fbaff"/>
+  <!-- traffic wave -->
+  <path d="M72 372 H168 L192 330 L218 410 L246 314 L274 396 L298 352 L318 372 H440"
+        fill="none" stroke="url(#wave)" stroke-width="18" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

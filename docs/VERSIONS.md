@@ -4,7 +4,8 @@ Every MiniWireshark release is a single Python file. The table lists each archiv
 
 | Version | Release | Lines | SHA-256 | Source |
 |---|---|---:|---|---|
-| **5.1.2** (latest) | [v5.1.2](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.1.2) | 66,318 | `2adadab93ce4f86938cd45e82be2f824163090fc660732b21ce8048efe327534` | `304948d` |
+| **5.2.3** (latest) | [v5.2.3](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.2.3) | 67,711 | `41bc3a1a0f0248c25d6dd98525940c9d5a2d3e39673ab81d92ec4aadacb9c388` | `d0832b8` |
+| 5.1.2 | [v5.1.2](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.1.2) | 66,318 | `2adadab93ce4f86938cd45e82be2f824163090fc660732b21ce8048efe327534` | `304948d` |
 | 5.1.2-rc.5 | [v5.1.2-rc.5](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.1.2-rc.5) (pre-release) | 64,605 | `6ac76e5e6655b66205cccba6100bfe1f23ba899b3e35e92797a0f0df23c11ff7` | `759be4b` |
 | 5.0.2 | [v5.0.2](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.0.2) | 52,410 | `77c1909a1451db4d1a60fd5a520a09be5df182ed8f4314cedcc85f7746bb6f67` | `49471fe` |
 | 5.0.1 | [v5.0.1](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.0.1) | 50,509 | `f55e195e21610e18d8b0b4c8f80e5bf74fd19d6840aedc54c6a4b02aa87cb93b` | `f1f0e24` |
@@ -20,12 +21,25 @@ The checksums match the owner's offline archive (`All_MiniWireshark_Version`).
 - Versions 1.x and 2.0.0 come from before this repository's history; their files are in [`legacy/`](../legacy/).
 - Every other version is taken straight from the listed commit.
 
-## Publishing the releases
+## How the releases are published
 
-The releases are created by the **Publish archived releases** workflow, which only runs when started by hand:
+All ten versions are published on the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases), each with its `.py` file and a `.sha256` file. 5.1.2 is marked *latest*; 4.0.0-dev and 5.1.2-rc.5 are pre-releases.
+
+They were created by the **Publish archived releases** workflow, which only runs when started by hand:
 
 1. Open **Actions → Publish archived releases → Run workflow** on `main`.
 2. Optionally tick **dry run** first: it checks every file against the checksums above and prints what it would publish.
-3. Run it for real. It creates each tag and release, oldest first, and attaches the `.py` file and a `.sha256` file. 5.1.2 is marked *latest*.
+3. Run it for real. It checks every file first and publishes nothing if one doesn't match. Then it creates each tag and release, oldest first.
 
-Releases that already exist are skipped, so the workflow can be run again safely. The list lives in [`.github/archive-releases.json`](../.github/archive-releases.json), and the notes in [`.github/release-notes/`](../.github/release-notes/).
+Releases that already exist are skipped, so the workflow can be run again safely, for example after adding a new version. The list lives in [`.github/archive-releases.json`](../.github/archive-releases.json), and the notes in [`.github/release-notes/`](../.github/release-notes/).
+
+### New versions are published automatically
+
+The **Release** workflow ([`release.yml`](../.github/workflows/release.yml)) runs on every push to `main` that changes `miniwireshark.py` or `CHANGELOG.md`. It publishes `SCRIPT_VERSION` once that version is finished:
+
+1. `CHANGELOG.md` has a `## [x.y.z] — date` section for it. While the heading says `[Unreleased]`, nothing is published.
+2. No release `vx.y.z` exists yet.
+
+It then creates the tag and the release with `miniwireshark-x.y.z.py` and its `.sha256`, using `.github/release-notes/vx.y.z.md` as the notes when that file exists, or else the changelog section. Finally it commits the new row to this table, the README badge and version table, and `.github/archive-releases.json`. A version with a `-` in it (`5.3.0-rc.1`) becomes a pre-release and doesn't change *latest*.
+
+So releasing is: set `SCRIPT_VERSION`, turn `[Unreleased]` into `[x.y.z] — date` in the changelog, and merge. To check first, run **Actions → Release → Run workflow** with **dry run** ticked.

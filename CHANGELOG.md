@@ -2,14 +2,26 @@
 
 All notable changes to MiniWireshark. Versions follow `MAJOR.MINOR.PATCH`; each release is one `.py` file attached to its [GitHub release](https://github.com/darkckillerc4/MiniWireshark/releases). Checksums are in [docs/VERSIONS.md](docs/VERSIONS.md).
 
-## [Unreleased] — 5.2.3
+## [5.2.3] — 2026-10-24
 
-A reliability release, in progress in [#1](https://github.com/darkckillerc4/MiniWireshark/pull/1).
+A reliability release: capture starts without freezing, devices are identified correctly on PCs with VPN and virtual adapters, and copies of different versions can share a folder safely.
 
-- Starting and recovering capture no longer freezes the window. Network cards are tried on a helper thread.
-- Cards that refuse promiscuous mode now open without it. Before, they failed with "capture filter is not valid".
-- Copies of MiniWireshark that share a folder can't damage each other's files any more. This covers update rollback, settings, the crash journal, the history database and Safe Mode.
-- Boot receipts now record start-up time separately from the time spent reading the Welcome Center.
+- **Capture:** starting and recovering capture runs on a helper thread, so the window never freezes. Cards that refuse promiscuous mode open without it.
+- **Network identity:** the LAN comes from the capture card only. VPN, ZeroTier, WSL, Hyper-V and VMware subnets are no longer taken for it. CGNAT addresses are not "local". Pi-hole answers no longer rename devices. The router never moves to a routed address. "This computer" follows an address change.
+- **Archive safety:** copies of different versions in one folder no longer damage each other's update rollback, settings, crash journal, history database or Safe Mode count. The Welcome Center says when versions share a data folder.
+- **Memory:** bounded while minimised. The previous data is freed after loading a session. Exports and history writes run in the background.
+- **Closing and workers:** closing waits only for saves and exports. Analysis workers start together, with a time limit.
+- **Windows:**
+  - non-English `netsh`/`arp` output is read correctly
+  - the Npcap installer alone asks for administrator rights
+  - a Store-Python runtime that broke after a Store update is detected
+  - saves retry a briefly locked file
+  - a 1 ms timer is used only while busy
+  - no console windows flash
+- **Security:** the macOS keychain secret is no longer passed on the command line.
+- **Fixes:** 6 GHz Wi-Fi channels, keychain newline handling, NTP delay, PID reuse in the program list, and a stale exception reference in the certificate dialog. pyflakes is clean.
+- **Groundwork** for a future standalone `.exe`: the program can start itself, its workers and its tests without a `.py` file. No exe is shipped.
+- Tested on Python 3.8, 3.12 and 3.13: 138 self-tests and 50 GUI steps.
 
 ## [5.1.2] — 2026-10-24
 
