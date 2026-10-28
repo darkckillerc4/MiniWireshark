@@ -5245,7 +5245,37 @@ class ReputationList:
         self.starts = array.array("Q")
         self.ends = array.array("Q")
         self.ids = []
+        self.reach = array.array("Q")   # the furthest end up to each row
+        self.v6 = ([], [], [], [])      # the same four for IPv6 ranges
+        self.skipped = 0
         self.updated = ""
+
+    def set_ranges(self, rows):
+        """rows: (first, last, id[, ip version]) (version 4 when left
+        out).
+        5.3.4 (BF-001): ranges may nest or overlap (10.0.0.0/8 holding
+        10.1.1.0/24): a look-up walks back while an earlier row can still
+        reach the address, where it used to check only the nearest row.
+        IPv6 ranges are kept, where they used to be dropped."""
+        v4 = sorted(r[:3] for r in rows if r[0] <= r[1] and
+                    (r[3] if len(r) > 3 else 4) == 4)
+        v6 = sorted(r[:3] for r in rows if r[0] <= r[1] and
+                    (r[3] if len(r) > 3 else 4) == 6)
+        self.starts, self.ends = array.array("Q"), array.array("Q")
+        self.ids, self.reach = [], array.array("Q")
+        for first, last, i in v4:
+            self.starts.append(first)
+            self.ends.append(last)
+            self.ids.append(i)
+            self.reach.append(max(last, self.reach[-1] if self.reach
+                                  else 0))
+        self.v6 = ([], [], [], [])
+        for first, last, i in v6:
+            self.v6[0].append(first)
+            self.v6[1].append(last)
+            self.v6[2].append(i)
+            self.v6[3].append(max(last, self.v6[3][-1] if self.v6[3]
+                                  else 0))
 
     def lookup(self, ip):
         """→ detail string (list id, range) or "" when not listed."""
@@ -5255,16 +5285,24 @@ class ReputationList:
             a = ipaddress.ip_address(ip)
         except ValueError:
             return ""
-        if a.version != 4 or not self.starts:
+        starts, ends, ids, reach = (
+            (self.starts, self.ends, self.ids, self.reach)
+            if a.version == 4 else self.v6)
+        if not starts:
             return ""
+        if len(reach) != len(starts):          # filled the old way
+            self.set_ranges(list(zip(self.starts, self.ends, self.ids)))
+            return self.lookup(ip)
         n = int(a)
-        i = bisect.bisect_right(self.starts, n) - 1
-        if i >= 0 and n <= self.ends[i]:
-            return self.ids[i]
+        i = bisect.bisect_right(starts, n) - 1
+        while i >= 0 and reach[i] >= n:
+            if ends[i] >= n:
+                return ids[i]
+            i -= 1
         return ""
 
     def __len__(self):
-        return len(self.ips) + len(self.starts)
+        return len(self.ips) + len(self.starts) + len(self.v6[0])
 
 
 def load_feodo(path):
@@ -5291,6 +5329,12 @@ def validate_feodo(path):
     return True, f"{len(rl)} listed addresses"
 
 
+_LAN_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8",
+    "169.254.0.0/16", "100.64.0.0/10", "0.0.0.0/8", "fc00::/7",
+    "fe80::/10", "::1/128"))
+
+
 def load_drop(path):
     rl = ReputationList("Spamhaus DROP")
     rows = []
@@ -5313,22 +5357,24 @@ def load_drop(path):
                                            strict=False)
             except ValueError:
                 continue
-            if net.version == 4:
-                rows.append((int(net.network_address),
-                             int(net.broadcast_address),
-                             sanitize_text(str(obj.get("sblid", "")), 20)
-                             + f" {net}"))
-    rows.sort()
-    for s, e, i in rows:
-        rl.starts.append(s)
-        rl.ends.append(e)
-        rl.ids.append(i)
+            if any(net.version == lan.version and net.overlaps(lan)
+                   for lan in _LAN_NETS):
+                rl.skipped += 1           # a list never names your LAN
+                continue
+            rows.append((int(net.network_address),
+                         int(net.broadcast_address),
+                         sanitize_text(str(obj.get("sblid", "")), 20)
+                         + f" {net}", net.version))
+    rl.set_ranges(rows)
     return rl
 
 
 def validate_drop(path):
     rl = load_drop(path)
-    return len(rl) > 100, f"{len(rl)} hijacked address blocks"
+    v6 = len(rl.v6[0])
+    return len(rl) > 100, f"{len(rl)} hijacked address blocks" + (
+        f" ({v6} of them IPv6)" if v6 else "") + (
+        f"; {rl.skipped} private ranges ignored" if rl.skipped else "")
 
 
 class ReputationDB:
@@ -14915,6 +14961,23 @@ def wifi_quality(rssi):
                                        "router or remove obstacles.")
 
 
+# 5.3.4 (BF-002): Windows 11 24H2 answers `netsh wlan show interfaces`
+# with a request for the Location permission instead of the reading
+WIFI_LOCATION_NOTE = ("Windows hides Wi-Fi details (signal, channel, "
+                      "network name) unless Location is allowed for apps. "
+                      "MiniWireshark never turns Location on or asks for it.")
+
+
+def netsh_location_hidden(text):
+    t = (text or "").lower()
+    if "privacy-location" in t:
+        return True
+    return bool(re.search(r"locat|locali|ubicaci", t)) and bool(
+        re.search(r"permission|autorisation|permiso|privacy|confidential|"
+                  r"privacidad", t)) and not re.search(
+        r"^\s*(ssid|bssid|state|état|etat|estado)\s*:", t, re.M)
+
+
 class WifiProbe:
     """Asks the operating system about THIS computer's Wi-Fi link every
     `interval` seconds, in the background. Read-only: nothing is sent on
@@ -14928,6 +14991,7 @@ class WifiProbe:
         self.error = ""
         self.history = deque(maxlen=240)     # (ts, rssi)
         self.seq = 0
+        self.hidden = ""      # why the OS gave no reading (BF-002)
 
     @staticmethod
     def _cmd(cmd, timeout=10):
@@ -14938,8 +15002,11 @@ class WifiProbe:
 
     def read(self, iface="", desc=""):
         if IS_WINDOWS:
-            return parse_netsh_wlan(self._cmd(["netsh", "wlan", "show",
-                                               "interfaces"]), desc or iface)
+            text = self._cmd(["netsh", "wlan", "show", "interfaces"])
+            self.hidden = WIFI_LOCATION_NOTE if netsh_location_hidden(
+                text) else ""
+            return None if self.hidden else parse_netsh_wlan(
+                text, desc or iface)
         if sys.platform == "darwin":
             return parse_macos_airport(self._cmd(
                 ["system_profiler", "SPAirPortDataType"], 30))
@@ -17090,12 +17157,14 @@ def _hyp(key, title, score, status, why_for=(), why_against=(), fix=""):
 
 
 def slow_facts(model, wifi=None, health=None, dns_slow_ms=800.0,
-               offline=False, namer=None, window=600):
+               offline=False, namer=None, window=600, wifi_hidden="",
+               coverage=None):
     """The facts investigate_slow() weighs, gathered from a model."""
     m = model
     now = m.now()
     namer = namer or (lambda k: k)
-    f = {"wifi": wifi, "wired": bool(m.switch_summary(now)),
+    f = {"wifi": wifi, "wifi_hidden": wifi_hidden,
+         "wired": bool(m.switch_summary(now)),
          "health": health or {}, "dns_slow_ms": dns_slow_ms,
          "dns_encrypted": bool(m.dns.encrypted_seen),
          "vpn": bool(m.vpn.get("iface") or m.vpn.get("endpoint")),
@@ -17107,6 +17176,13 @@ def slow_facts(model, wifi=None, health=None, dns_slow_ms=800.0,
     pk = sum(x.packets for x in tcp)
     f["tcp_packets"] = pk
     f["retrans_pct"] = (sum(x.retrans for x in tcp) / pk) if pk else None
+    # 5.3.4 (IP-002): what the capture itself missed, so its own overload
+    # is not blamed on the network; and receivers that said "I'm full"
+    cov = coverage or {}
+    seen = (cov.get("received") or 0) + (cov.get("kernel_dropped") or 0)
+    lost = (cov.get("dropped_app") or 0) + (cov.get("kernel_dropped") or 0)
+    f["capture_drop_pct"] = lost / seen if seen else None
+    f["zero_win"] = sum(x.zero_win for x in tcp)
     progs, others = Counter(), Counter()
     mine = set(m.my_ips)
     me = m.my_device_key()
@@ -17149,6 +17225,12 @@ def investigate_slow(f):
     elif f.get("wired"):
         H.append(_hyp("wifi", "Weak Wi-Fi on this computer", 0.0,
                       "Unlikely", (), ["◉ This computer uses a cable"]))
+    elif f.get("wifi_hidden"):
+        H.append(_hyp("wifi", "Weak Wi-Fi on this computer", 0.2,
+                      "Can't tell", ["○ " + f["wifi_hidden"]],
+                      fix="To include the Wi-Fi signal, allow Location for "
+                          "apps in Windows Settings (Privacy & security "
+                          "→ Location). This is optional."))
     h = f.get("health") or {}
     if "gateway_ok" in h:
         if not h["gateway_ok"]:
@@ -17209,6 +17291,16 @@ def investigate_slow(f):
                           "Unlikely", (), [f"◉ Connections open in "
                                            f"{rtt:.0f} ms"]))
     rp = f.get("retrans_pct")
+    cd = f.get("capture_drop_pct")
+    if rp is not None and rp >= 0.02 and cd is not None and cd >= 0.01:
+        H.append(_hyp("loss", "Packets getting lost on the way", 0.2,
+                      "Can't tell", [f"◉ {rp:.1%} of data was re-sent"],
+                      [f"◉ This capture itself missed {cd:.1%} of the "
+                       f"packets (the computer was too busy), so the "
+                       f"re-sent share can't be trusted"],
+                      fix="Close heavy programs or pick “Low CPU” in "
+                          "Settings → Performance, then look again."))
+        rp = None
     if rp is not None and (f.get("tcp_packets") or 0) > 500:
         wifi_weak = any(x["key"] == "wifi" and x["status"] == "Likely"
                         for x in H)
@@ -17225,6 +17317,15 @@ def investigate_slow(f):
         else:
             H.append(_hyp("loss", "Packets getting lost", 0.05, "Unlikely",
                           (), [f"◉ Only {rp:.1%} re-sent"]))
+    zw = f.get("zero_win") or 0
+    if zw >= 5:
+        H.append(_hyp("slow_reader", "Possibly this computer or an app is "
+                                     "slow to read what arrives", 0.4,
+                      "Possible", [f"◉ A receiver said “I'm full, wait” "
+                                   f"{zw} times (TCP zero window)"],
+                      fix="A busy disk, an antivirus scan or a frozen "
+                          "program can cause this; the network is not "
+                          "the bottleneck then."))
     top = f.get("this_pc_top") or []
     if top:
         prog, rate = top[0][0], top[0][1]
@@ -38177,6 +38278,8 @@ class SourcesTab(BaseTab):
             bits.append(f"ARP cache ({n} entr{'y' if n == 1 else 'ies'})")
         if app.wifi.last:
             bits.append("Wi-Fi link")
+        elif app.wifi.hidden:
+            bits.append("Wi-Fi details hidden by Windows (Location is off)")
         self.tree.insert("", "end", iid="os", values=tuple(tr(x) for x in (
             "This computer's operating system",
             "Programs, listening ports, ARP cache, Wi-Fi",
@@ -45697,7 +45800,10 @@ proc ::mw_retheme {w map fgnew deffg} {
             if self.data_mode == "live" else {},
             dns_slow_ms=float(self.config.get("dns.slow_ms", 800)),
             offline=self.data_mode in ("offline", "session"),
-            namer=self.short_device_name, window=window)
+            namer=self.short_device_name, window=window,
+            wifi_hidden=getattr(wp, "hidden", "") if wp is not None else "",
+            coverage=self.capture_coverage() if self.data_mode == "live"
+            else None)
 
     def collect_bandwidth_facts(self, window=600):
         m = self.model
@@ -58677,6 +58783,90 @@ def t_m1b_npcap_signature_path(ctx):
 
 
 @self_test()
+def t_bf001_reputation_ranges(ctx):
+    """5.3.4 (BF-001): an address inside a big range is found even when a
+    smaller range starts later inside it; IPv6 ranges are kept; a list
+    naming a private range is ignored there."""
+    rl = ReputationList("test")
+    rl.set_ranges([
+        (int(ipaddress.ip_address("10.0.0.0")),
+         int(ipaddress.ip_address("10.255.255.255")), "big"),
+        (int(ipaddress.ip_address("10.1.1.0")),
+         int(ipaddress.ip_address("10.1.1.255")), "small"),
+        (int(ipaddress.ip_address("2001:db8::")),
+         int(ipaddress.ip_address("2001:db8::ffff")), "six", 6)])
+    assert rl.lookup("10.200.0.1") == "big"
+    assert rl.lookup("10.1.1.9") in ("big", "small")
+    assert rl.lookup("11.0.0.1") == "" and rl.lookup("9.255.255.255") == ""
+    assert rl.lookup("2001:db8::5") == "six"
+    assert rl.lookup("2001:db9::5") == "" and len(rl) == 3
+    old = ReputationList("old way")          # filled like 5.2.3 did
+    for a, b, i in ((1, 100, "a"), (5, 6, "b")):
+        old.starts.append(a)
+        old.ends.append(b)
+        old.ids.append(i)
+    assert old.lookup("0.0.0.50") == "a"
+    path = ctx.path("drop.json")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write('{"type": "metadata", "timestamp": 1700000000}\n')
+        for cidr, sbl in (("1.10.16.0/20", "SBL1"), ("1.10.20.0/24", "SBL2"),
+                          ("2a06:e480::/29", "SBL3"),
+                          ("192.168.0.0/16", "SBL4")):
+            f.write(json.dumps({"cidr": cidr, "sblid": sbl}) + "\n")
+    rl = load_drop(path)
+    assert rl.lookup("1.10.30.1").startswith("SBL1")
+    assert rl.lookup("2a06:e480::1").startswith("SBL3")
+    assert rl.lookup("192.168.1.10") == "" and rl.skipped == 1
+    ok, msg = validate_drop(path)
+    assert "1 of them IPv6" in msg and "1 private" in msg, msg
+
+
+@self_test()
+def t_bf002_wifi_location_hidden(ctx):
+    """5.3.4 (BF-002): Windows 11 24H2's "needs Location" answer is told
+    apart from a real reading and said plainly, never read as "not on
+    Wi-Fi"; normal readings in three languages are not mistaken for it."""
+    msg = ("Network shell commands need location permission to access "
+           "WLAN information. Turn on Location services on the Location "
+           "page in Privacy & security settings.\n\nHere is the URI for "
+           "the Location page in the Settings app:\n"
+           "ms-settings:privacy-location\n")
+    assert netsh_location_hidden(msg)
+    for good in (NETSH_EN, NETSH_FR, NETSH_ES, ""):
+        assert not netsh_location_hidden(good)
+    p = WifiProbe()
+    real_win, real_cmd = IS_WINDOWS, WifiProbe._cmd
+    try:
+        globals()["IS_WINDOWS"] = True
+        WifiProbe._cmd = staticmethod(lambda cmd, timeout=10: msg)
+        assert p.read() is None and p.hidden == WIFI_LOCATION_NOTE
+        WifiProbe._cmd = staticmethod(lambda cmd, timeout=10: NETSH_EN)
+        assert p.read() and p.hidden == ""
+    finally:
+        globals()["IS_WINDOWS"] = real_win
+        WifiProbe._cmd = real_cmd
+    hyps = investigate_slow({"wifi": None, "wifi_hidden": WIFI_LOCATION_NOTE})
+    w = [h for h in hyps if h["key"] == "wifi"]
+    assert w and w[0]["status"] == "Can't tell", hyps
+
+
+@self_test()
+def t_ip004_adapter_pick_log(ctx):
+    """5.3.4 (IP-004): the route-aware pick is only logged, never used;
+    off Windows or on any failure it is empty and changes nothing."""
+    g = "{1A2B3C4D-0000-1111-2222-333344445555}"
+    assert npf_device_name(g.lower()) == "\\Device\\NPF_" + g
+    assert npf_device_name("bad") == "" and npf_device_name("") == ""
+    assert log_adapter_pick("\\Device\\NPF_" + g, npf_device_name(g)) \
+        == "same"
+    assert log_adapter_pick("\\Device\\NPF_{0}", npf_device_name(g)) \
+        == "different"
+    assert log_adapter_pick("x", "") == ""
+    if not IS_WINDOWS:
+        assert windows_best_adapter() == ""
+
+
+@self_test()
 def t_store_migrates_v1_file(ctx):
     path = ctx.path("old.sqlite3")
     con = sqlite3.connect(path)
@@ -60508,6 +60698,17 @@ def t_investigations_reach_planted_cause(ctx):
     assert h["key"] == "local_hog" and "steam.exe" in h["title"], h
     h = top()
     assert h["key"] == "cant_tell", h          # nothing visible explains it
+    # 5.3.4 (IP-002): the capture's own drops are not blamed on the path
+    h = top(retrans_pct=0.09, capture_drop_pct=0.05)
+    assert not (h["key"] == "loss" and h["status"] == "Likely"), h
+    hyps = investigate_slow(dict(base, retrans_pct=0.09,
+                                 capture_drop_pct=0.05))
+    assert [x["status"] for x in hyps if x["key"] == "loss"] == \
+        ["Can't tell"], hyps
+    assert top(retrans_pct=0.09)["key"] == "loss"
+    hyps = investigate_slow(dict(base, zero_win=12))
+    assert any(x["key"] == "slow_reader" and "slow to read" in x["title"]
+               for x in hyps), hyps
     hyps = investigate_slow(dict(base))
     assert any(x["key"] == "other_hog" and x["status"] == "Can't tell"
                for x in hyps)                  # blind spot stated
@@ -68057,6 +68258,72 @@ REACHABLE_502 = (
 # ============================================================================
 #  21.  Application entry point
 # ============================================================================
+def windows_best_adapter(dest="1.1.1.1"):
+    """5.3.4 (IP-004, experiment): the adapter Windows' own routing would
+    use to reach `dest` (GetBestInterfaceEx: a table look-up, no packet
+    is sent), as an Npcap device name `\\Device\\NPF_{GUID}`. Only logged
+    beside the pick in use until the logs show they agree; a full-tunnel
+    VPN returns the tunnel adapter. -> name, or "" on any failure."""
+    if not IS_WINDOWS:
+        return ""
+    try:
+        from ctypes import wintypes
+        ip = ctypes.windll.iphlpapi
+
+        class SockaddrIn(ctypes.Structure):
+            _fields_ = [("family", ctypes.c_ushort), ("port", ctypes.c_ushort),
+                        ("addr", ctypes.c_ubyte * 4),
+                        ("zero", ctypes.c_ubyte * 8)]
+
+        class Adapter(ctypes.Structure):
+            pass
+        Adapter._fields_ = [("length", wintypes.ULONG),
+                            ("if_index", wintypes.DWORD),
+                            ("next", ctypes.POINTER(Adapter)),
+                            ("name", ctypes.c_char_p)]
+        sa = SockaddrIn(2, 0, (ctypes.c_ubyte * 4)(
+            *[int(x) for x in dest.split(".")]))
+        index = wintypes.DWORD(0)
+        if ip.GetBestInterfaceEx(ctypes.byref(sa), ctypes.byref(index)):
+            return ""
+        size = wintypes.ULONG(16384)
+        for _ in range(3):
+            buf = ctypes.create_string_buffer(size.value)
+            rc = ip.GetAdaptersAddresses(2, 0, None, buf, ctypes.byref(size))
+            if rc != 111:                    # ERROR_BUFFER_OVERFLOW
+                break
+        if rc:
+            return ""
+        a = ctypes.cast(buf, ctypes.POINTER(Adapter))
+        while a:
+            if a.contents.if_index == index.value and a.contents.name:
+                return npf_device_name(a.contents.name.decode("ascii",
+                                                              "replace"))
+            a = a.contents.next
+    except Exception as e:                           # noqa: BLE001
+        LOG.debug("best adapter look-up: %s", e)
+    return ""
+
+
+def npf_device_name(guid):
+    g = (guid or "").strip()
+    if not re.fullmatch(r"\{[0-9A-Fa-f-]{36}\}", g):
+        return ""
+    return "\\Device\\NPF_" + g.upper()
+
+
+def log_adapter_pick(in_use, best=None):
+    """IP-004: write both picks to the log, so a later version can switch
+    to Windows' own choice once real logs show it is right."""
+    best = windows_best_adapter() if best is None else best
+    if not best:
+        return ""
+    agree = (in_use or "").upper().endswith(best[len("\\Device\\NPF_"):])
+    LOG.info("adapter pick: in use %s; Windows' route says %s (%s)",
+             in_use or "?", best, "same" if agree else "DIFFERENT")
+    return "same" if agree else "different"
+
+
 def detect_gateway_and_self():
     """Return (gateway_ip, my_ips, my_macs, default_iface_name)."""
     gw = ""
@@ -68068,6 +68335,9 @@ def detect_gateway_and_self():
             def_iface, my_ip, gw_ip = conf.route.route("0.0.0.0")
             gw = gw_ip if gw_ip and gw_ip != "0.0.0.0" else ""
             default_iface_name = iface_name(def_iface)
+            if IS_WINDOWS:
+                log_adapter_pick(getattr(def_iface, "network_name", "") or
+                                 default_iface_name)
             if my_ip and my_ip != "0.0.0.0":
                 my_ips.add(my_ip)
         except Exception as e:                       # noqa: BLE001
