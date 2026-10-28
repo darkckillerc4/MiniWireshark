@@ -12228,9 +12228,13 @@ class DeviceRegistry:
         self.dhcp_leases = {}
         self.ip_macs = defaultdict(set)
         self.gw_macs = set()
+        # 5.3.4 (CO-02): MACs that answered for the router's address while
+        # the router itself was still answering; never trusted as router
+        self.gw_candidates = set()
         self.ra_routers = set()
         self.history = []
         self.arp_claims = defaultdict(lambda: deque(maxlen=16))
+        self.arp_seen = defaultdict(dict)     # ip -> {mac: deque of times}
         self.labels = None            # KnownDevicesStore (aliases etc.)
         self.gaps = []                # (start, end) capture gaps
         # change notifications drained by the model/UI
@@ -12470,19 +12474,54 @@ class DeviceRegistry:
 
     def note_arp_reply(self, ip, mac, when=None):
         when = when or self.now()
-        dev = self.touch(ip, mac, "arp_reply", f"Answered ARP for {ip}", when)
+        steal = bool(ip and mac and ip == self.gateway_ip and self.gw_macs
+                     and mac.lower() not in self.gw_macs and
+                     self.router_answering(when, but=mac.lower()))
+        # 5.3.4 (CO-02): a MAC answering for the router's address while
+        # the router still answers does not get the address (it used to
+        # become "the Router" device)
+        dev = self.touch(None if steal else ip, mac, "arp_reply",
+                         f"Answered ARP for {ip}", when)
         if dev:
             dev.last_arp = when
         is_conflict = False
         if ip and mac:
-            self.arp_claims[ip].append((when, mac.lower()))
+            m = mac.lower()
+            self.arp_claims[ip].append((when, m))
+            seen = self.arp_seen[ip]
+            if m not in seen and len(seen) >= 8:
+                del seen[min(seen, key=lambda k: seen[k][-1])]
+            seen.setdefault(m, deque(maxlen=4)).append(when)
             macs = self.ip_macs[ip]
-            is_new = mac.lower() not in macs
-            macs.add(mac.lower())
+            is_new = m not in macs
+            macs.add(m)
             is_conflict = is_new and len(macs) > 1
             if ip == self.gateway_ip:
-                self.gw_macs.add(mac.lower())
+                if self.router_answering(when, but=m):
+                    self.gw_candidates.add(m)
+                else:
+                    self.gw_macs.add(m)
+                    self.gw_candidates.discard(m)
         return dev, is_conflict
+
+    def router_answering(self, when, but="", silent=300):
+        """True when a MAC already trusted as the router (other than
+        `but`) answered for its address in the last `silent` seconds: a
+        second MAC then is a candidate, not the router (CO-02). A router
+        that was replaced has gone quiet, so its successor is trusted."""
+        seen = self.arp_seen.get(self.gateway_ip) or {}
+        return any(m != but and m in self.gw_macs and t and
+                   when - t[-1] <= silent for m, t in seen.items())
+
+    def arp_claimants(self, ip, window=120):
+        """5.3.4 (CO-02): the MACs that answered for `ip` at least twice in
+        the last `window` seconds. Two at once is what ARP spoofing looks
+        like whatever the ratio between them; the flip count alone missed
+        an attacker answering every second against a router answering
+        every 30 s."""
+        now = self.now()
+        return sorted(m for m, t in (self.arp_seen.get(ip) or {}).items()
+                      if sum(1 for x in t if now - x <= window) >= 2)
 
     def note_dhcp_lease(self, ip, mac, hostname, lease_secs=None, when=None):
         when = when or self.now()
@@ -14399,7 +14438,7 @@ class AlertEngine:
                                            prefixes[:4]],
             subject=f"rogue_ra:{mac}")
 
-    def arp_spoof(self, ip, n_macs, flips, is_gateway):
+    def arp_spoof(self, ip, n_macs, flips, is_gateway, together=0):
         if self._debounced(f"arpspoof:{ip}", 120):
             return None
         who = "Your router's address" if is_gateway else f"The address {ip}"
@@ -14407,7 +14446,11 @@ class AlertEngine:
             "arp_spoof", "DANGER", f"ip:{ip}",
             f"{who} keeps switching between devices",
             f"{ip} was claimed by {n_macs} different MAC addresses and "
-            f"flipped back and forth {flips} times within a minute.",
+            f"flipped back and forth {flips} times within a minute."
+            if flips >= 4 or not together else
+            f"{ip} was claimed by {together} different MAC addresses "
+            f"answering at the same time (each more than once within "
+            f"2 minutes).",
             "Two devices are repeatedly fighting over the same network "
             "address.",
             "A device normally answers for its address consistently. Rapid "
@@ -18196,6 +18239,11 @@ class NetworkModel:
                 # before the router's MAC is known, or the first such
                 # packet moved the router device to that address
                 use_mac = None
+            reg = self.registry
+            if use_mac and ip and ip == self.gateway_ip and reg.gw_macs \
+                    and use_mac.lower() not in reg.gw_macs and \
+                    reg.router_answering(ts, but=use_mac.lower()):
+                ip = None     # 5.3.4 (CO-02): not the router's address
             dev = self.registry.note_traffic(ip or None, use_mac, nbytes,
                                              proto, role, internet, ts)
             if dev is None:
@@ -18304,10 +18352,12 @@ class NetworkModel:
         if dev is not None:
             self.observe("arp_reply", dev.key, ts, {"ip": ip, "mac": mac})
         flips = self.registry.arp_flip_count(ip)
-        if flips >= int(self.config.get("alerts.arp_flip_threshold", 4)):
+        both = self.registry.arp_claimants(ip)
+        if flips >= int(self.config.get("alerts.arp_flip_threshold", 4)) \
+                or len(both) >= 2:
             a = self._alert(self.alerts.arp_spoof(
                 ip, len(self.registry.ip_macs.get(ip, ())), flips,
-                ip == self.gateway_ip))
+                ip == self.gateway_ip, together=len(both)))
             if a and not a.updated:
                 a.evidence = [f"{t:.0f}: {ip} claimed by {m}" for t, m in
                               list(self.registry.arp_claims.get(ip, ()))[-8:]]
@@ -18382,10 +18432,16 @@ class NetworkModel:
         kind = nd.get("kind")
         mac = nd.get("mac") or d["src_mac"]
         if kind == "RA":
-            for pfx in nd.get("prefixes", []):
+            # 5.3.4 (CO-01): only the router's own announcement says what
+            # is "local", and only a normal LAN size (/48 to /64). One RA
+            # from any laptop for 2000::/3 made the whole IPv6 Internet
+            # local and gave it to the router device
+            from_router = self._is_router_mac(mac)
+            for pfx in nd.get("prefixes", []) if from_router else ():
                 with contextlib.suppress(ValueError):
                     net = ipaddress.ip_network(pfx, strict=False)
                     if net.version == 6 and net.is_global and \
+                            48 <= net.prefixlen <= 64 and \
                             net not in self.v6_prefixes and \
                             len(self.v6_prefixes) < 8:
                         self.v6_prefixes.append(net)
@@ -18409,10 +18465,27 @@ class NetworkModel:
                 if d["src_mac"] else None
         self._dirty_dev(dev)
 
+    def _is_router_mac(self, mac):
+        """The MAC is the router's (trusted gateway MAC, or the device that
+        holds the gateway address); with no IPv4 router known at all, an
+        IPv6-only LAN, the first announcer is believed."""
+        reg = self.registry
+        mac = (mac or "").lower()
+        if not mac:
+            return False
+        if mac in reg.gw_macs:
+            return True
+        gw_dev = reg.by_key.get(reg.ip_to_key.get(self.gateway_ip, ""))
+        if gw_dev is not None and gw_dev.mac:
+            return gw_dev.mac == mac
+        return not reg.gw_macs and not (reg.ra_routers - {mac})
+
     def _check_rogue_ra(self, mac, dev, nd, known_router):
         """IPv6 router announcements should come from the router. One from
-        another device is worth a (non-alarming) warning."""
-        if not mac or known_router or not nd.get("lifetime", 1):
+        another device is worth a (non-alarming) warning. 5.3.4 (CO-01):
+        also one with router lifetime 0 when it carries prefixes."""
+        if not mac or known_router or (not nd.get("lifetime", 1) and
+                                       not nd.get("prefixes")):
             return
         gw_macs = set(self.registry.gw_macs)
         gw_dev = self.registry.by_key.get(
@@ -34576,9 +34649,10 @@ class SecurityTab(BaseTab):
                  "then open a website — I'll figure it out.")
 
         h1("Device identity checks (ARP)")
-        if m.gateway_ip and len(m.registry.gw_macs) > 1:
+        gw_all = m.registry.gw_macs | m.registry.gw_candidates
+        if m.gateway_ip and len(gw_all) > 1:
             bad(f"Your router's address has answered from "
-                f"{len(m.registry.gw_macs)} different MAC addresses. "
+                f"{len(gw_all)} different MAC addresses. "
                 f"That can happen after a router reboot or firmware "
                 f"update, but it's also the classic sign of ARP spoofing "
                 f"— a device on your Wi-Fi pretending to be your router "
@@ -58864,6 +58938,63 @@ def t_ip004_adapter_pick_log(ctx):
     assert log_adapter_pick("x", "") == ""
     if not IS_WINDOWS:
         assert windows_best_adapter() == ""
+
+
+@self_test()
+def t_co01_co02_router_impersonation(ctx):
+    """5.3.4 (CO-02): a device answering for the router's address every
+    second while the router answers every 30 s is ARP spoofing (DANGER);
+    it never becomes "the Router" nor gets its IPv6 announcements
+    excused. (CO-01): an RA from anyone but the router, or for a huge
+    prefix, never makes Internet addresses "local"."""
+    S = ScenarioBuilder
+    ATT = ("192.168.1.66", "02:66:66:66:66:66")
+
+    def arp(b, ip, mac, dt):
+        b._emit(PK.Ether(src=mac, dst=S.PHONE[1]) /
+                PK.ARP(op=2, psrc=ip, hwsrc=mac, pdst=S.PHONE[0],
+                       hwdst=S.PHONE[1]), dt=dt)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    b = S()
+    b.home_network()
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    b.frames = []
+    arp(b, ATT[0], ATT[1], 1)
+    for sec in range(300):
+        arp(b, S.GW[0], ATT[1], 1.0)
+        if sec % 30 == 0:
+            arp(b, S.GW[0], S.GW[1], 0.01)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m), tick_every=20)
+    reg = m.registry
+    spoof = [a for a in m.alerts.alerts.values() if a.kind == "arp_spoof"]
+    assert spoof and spoof[0].severity == "DANGER"
+    assert reg.gw_macs == {S.GW[1].lower()} and \
+        ATT[1] in reg.gw_candidates, (reg.gw_macs, reg.gw_candidates)
+    att = reg.by_key[ATT[1]]
+    m._classify_dirty.add(att.key)
+    m._classify()
+    assert att.device_class != "Router", att.class_reasons
+    assert reg.ip_to_key.get(S.GW[0]) == S.GW[1].lower()
+    b.frames = []
+    b._emit(PK.Ether(src=ATT[1], dst="33:33:00:00:00:01") /
+            PK.IPv6(src="fe80::66", dst="ff02::1") /
+            PK.ICMPv6ND_RA(routerlifetime=0) /
+            PK.ICMPv6NDOptPrefixInfo(prefix="2000::", prefixlen=3) /
+            PK.ICMPv6NDOptSrcLLAddr(lladdr=ATT[1]))
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    assert all(str(p) != "2000::/3" for p in m.v6_prefixes), m.v6_prefixes
+    assert not reg.eligible_ip("2606:4700::6810:84e5")
+    assert [a for a in m.alerts.alerts.values() if a.kind == "rogue_ra"]
+    # a router replaced for good: the new one is trusted once the old one
+    # has been quiet for 5 minutes
+    reg2 = DeviceRegistry("192.168.1.1", set(), ctx.cfg({}),
+                          now_fn=lambda: 1000.0)
+    reg2.note_arp_reply("192.168.1.1", "00:11:22:00:00:01", 100.0)
+    reg2.note_arp_reply("192.168.1.1", "00:11:22:00:00:02", 1000.0)
+    assert "00:11:22:00:00:02" in reg2.gw_macs, reg2.gw_candidates
 
 
 @self_test()
