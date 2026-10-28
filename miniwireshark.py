@@ -1181,7 +1181,8 @@ def keep_compiled_copy(code, target=None):
             f.write(data)
         os.replace(tmp, target)
         return target
-    except Exception:                                # noqa: BLE001
+    except Exception as e:                           # noqa: BLE001
+        LOG.debug("compiled copy not kept: %s", e)
         return None
 
 
@@ -1868,7 +1869,9 @@ def _module_ok(name):
         importlib.invalidate_caches()
         importlib.import_module(name)
         return True
-    except Exception:                                # noqa: BLE001
+    except Exception as e:                           # noqa: BLE001
+        LOG.debug("module %s doesn't import: %s: %s", name,
+                  type(e).__name__, e)
         return False
 
 
@@ -2449,8 +2452,9 @@ def _latest_npcap_version():
         vers = re.findall(r"dist/npcap-(\d+\.\d+)\.exe", page)
         if vers:
             return max(vers, key=_version_tuple)
-    except (OSError, urllib.error.URLError, ValueError):
-        pass
+    except (OSError, urllib.error.URLError, ValueError) as e:
+        LOG.info("latest Npcap version unknown (%s); using %s", e,
+                 NPCAP_FALLBACK_VERSION)
     return NPCAP_FALLBACK_VERSION
 
 
@@ -2561,14 +2565,19 @@ def _install_npcap(loader, state):
         return False, (f"The capture driver was not downloaded ({e}). "
                        f"To install it yourself: https://npcap.com/#download")
     except (OSError, urllib.error.URLError) as e:
+        # 5.3.4 (S5): the message said the browser was opened even when
+        # it wasn't; say so only when it really was
+        opened = False
         try:
             import webbrowser
-            webbrowser.open("https://npcap.com/#download")
-        except Exception:                            # noqa: BLE001
-            pass
+            opened = bool(webbrowser.open("https://npcap.com/#download"))
+        except Exception as be:                      # noqa: BLE001
+            LOG.warning("couldn't open the browser on the Npcap page: %s",
+                        be)
         shutil.rmtree(os.path.dirname(exe), ignore_errors=True)
-        return False, (f"Could not download the capture driver ({e}). "
-                       "Your browser was opened on the Npcap download page.")
+        return False, (f"Could not download the capture driver ({e}). " + (
+            "Your browser was opened on the Npcap download page." if opened
+            else "Download it from https://npcap.com/#download"))
     sig, signer = _authenticode_info(exe)
     loader.post_log(f"  Installer signature: {sig or 'unknown'} "
                     f"({signer or 'no signer'})", "detail")
@@ -6715,7 +6724,8 @@ def system_theme():
                                 "color-scheme"], capture_output=True,
                                text=True, timeout=3)
             dark = "dark" in (r.stdout or "").lower()
-    except Exception:                               # noqa: BLE001
+    except Exception as e:                          # noqa: BLE001
+        LOG.debug("system theme unknown, using Light: %s", e)
         dark = False
     _SYSTEM_THEME.append("Dark" if dark else "Light")
     return _SYSTEM_THEME[0]
@@ -6989,8 +6999,8 @@ def local_subnet_for(iface, my_ip):
                     f"{_int_to_ip(net)}/{_int_to_ip(mask)}", strict=False)
             except Exception:
                 continue
-    except Exception:
-        pass
+    except Exception as e:                           # noqa: BLE001
+        LOG.debug("route table unreadable: %s", e)
     # 5.3.4 (LG-08): no "/24" guess: on a /28 hotel or a /30 link it swept
     # addresses outside your network. Unknown subnet, no ARP sweep
     return None
@@ -8786,7 +8796,8 @@ def _quic_crypto():
             except InvalidTag:
                 return None
         _QUIC_CRYPTO = (ecb, gcm_open, "cryptography")
-    except Exception:                                # noqa: BLE001
+    except Exception as e:                           # noqa: BLE001
+        LOG.debug("QUIC decryption uses pure Python: %s", e)
         _QUIC_CRYPTO = (aes128_ecb_encrypt,
                         lambda k, n, d, a: _aes_gcm_py(k, n, d, a, True),
                         "pure Python")
@@ -10071,12 +10082,12 @@ def _iface_ip(iface):
     """Best-effort local IPv4 address for the chosen interface."""
     try:
         return get_if_addr(iface)
-    except Exception:
-        pass
+    except Exception as e:                           # noqa: BLE001
+        LOG.debug("interface address (%s), retrying by name: %s", iface, e)
     try:
         return get_if_addr(getattr(iface, "name", iface))
-    except Exception:
-        pass
+    except Exception as e:                           # noqa: BLE001
+        LOG.debug("interface address (%s): %s", iface, e)
     return ""
 
 
@@ -10098,8 +10109,8 @@ def _iface_is_up(iface):
             for nm in (iface_name(iface), iface_desc(iface)):
                 if nm in stats:
                     return bool(stats[nm].isup)
-        except Exception:                            # noqa: BLE001
-            pass
+        except Exception as e:                       # noqa: BLE001
+            LOG.debug("interface state via psutil: %s", e)
     flags = getattr(iface, "flags", None)
     if flags is not None and not IS_WINDOWS:
         txt = str(flags)
@@ -10116,7 +10127,8 @@ def score_interfaces(default_iface_name="", gateway_ip=""):
     out = []
     try:
         ifaces = list(conf.ifaces.values())
-    except Exception:                                # noqa: BLE001
+    except Exception as e:                           # noqa: BLE001
+        LOG.warning("adapter list unreadable: %s", e)
         ifaces = []
     for iface in ifaces:
         name, desc = iface_name(iface), iface_desc(iface)
@@ -12926,8 +12938,9 @@ class DeviceRegistry:
                 newly_expired.append(dev)
                 try:
                     self.history.append(device_to_dict(dev, False))
-                except (TypeError, ValueError):
-                    pass
+                except (TypeError, ValueError) as e:
+                    LOG.debug("expired device %s not kept in history: %s",
+                              dev.key, e)
                 if len(self.history) > 300:
                     del self.history[:-300]
             elif age >= inactive_after and dev.state not in (STATE_INACTIVE,
@@ -21438,7 +21451,8 @@ class PacketRing:
                         return frame
                     if first + i > last:
                         break
-            except (OSError, ValueError, struct.error):
+            except (OSError, ValueError, struct.error) as e:
+                LOG.debug("packet ring segment %s unreadable: %s", path, e)
                 continue
         return None
 
@@ -27246,7 +27260,9 @@ def _open_path(path):
         else:
             subprocess.Popen(["xdg-open", path])
         return True
-    except Exception:
+    except Exception as e:                           # noqa: BLE001
+        # several "Open folder" buttons ignore the answer: leave a trace
+        LOG.warning("couldn't open %s: %s", path, e)
         return False
 
 
@@ -28985,6 +29001,7 @@ class TableKit:
                     try:
                         text = self.explain(key) or ""
                     except Exception:                # noqa: BLE001
+                        LOG.debug("explain row", exc_info=True)
                         text = ""
         with contextlib.suppress(tk.TclError):
             if text:
@@ -36523,6 +36540,7 @@ class PacketsTab(BaseTab):
     def apply(self):
         try:
             self.filter = self._build_filter()
+            self._filter_errors = 0
             self.err_var.set("")
         except ValueError as e:
             self.err_var.set(f"⚠ {e}  (Capture continues normally; the "
@@ -36844,7 +36862,20 @@ class PacketsTab(BaseTab):
     def _keep(self, d):
         try:
             return self.filter.match(d, self.ctx)
-        except Exception:                            # noqa: BLE001
+        except Exception as e:                       # noqa: BLE001
+            # 5.3.4 (S5): a filter that failed on a packet kept it with no
+            # word, so the list looked filtered when it wasn't. The packet
+            # is still shown; the first few failures are logged and the
+            # filter bar says so (count reset by apply()).
+            n = self._filter_errors = getattr(self, "_filter_errors", 0) + 1
+            if n <= 5:
+                LOG.warning("display filter failed on a packet: %s: %s",
+                            type(e).__name__, e)
+            if n == 1:
+                with contextlib.suppress(tk.TclError, RuntimeError):
+                    self.err_var.set(
+                        f"⚠ The filter couldn't be checked on some packets "
+                        f"({type(e).__name__}); those packets are shown.")
             return True
 
     def _count(self):
@@ -37174,6 +37205,7 @@ class PacketsTab(BaseTab):
                 self.explain_var.set("💬 " + explain_packet(
                     dis, self.app.address_label))
             except Exception:                        # noqa: BLE001
+                LOG.debug("packet explanation", exc_info=True)
                 self.explain_var.set("")
             layer = None
         else:
@@ -40651,7 +40683,8 @@ class MiniWireshark:
             cap = self.iface_map.get(self.current_iface_label) \
                 if self.sniffer is not None else None
             return local_nets_from_routes(conf.route.routes, cap or "")
-        except Exception:                            # noqa: BLE001
+        except Exception as e:                       # noqa: BLE001
+            LOG.debug("local networks unknown: %s", e)
             return []
 
     def _local_v6_prefixes(self):
@@ -40664,8 +40697,8 @@ class MiniWireshark:
                     n = ipaddress.ip_network(f"{addr}/64", strict=False)
                     if n not in out:
                         out.append(n)
-        except Exception:                            # noqa: BLE001
-            pass
+        except Exception as e:                       # noqa: BLE001
+            LOG.debug("IPv6 prefixes unknown: %s", e)
         return out[:8]
 
     def _baselines_from_history(self):
@@ -44885,8 +44918,8 @@ proc ::mw_retheme {w map fgnew deffg} {
             self._scale_one_font(w, scale, names, memo)
             try:
                 stack.extend(reversed(w.winfo_children()))
-            except Exception:                        # noqa: BLE001
-                pass
+            except Exception as e:                   # noqa: BLE001
+                LOG.debug("font walk skipped %s: %s", w, e)
             n += 1
             if every and n % every == 0:
                 yield
@@ -45052,8 +45085,9 @@ proc ::mw_retheme {w map fgnew deffg} {
                 for n in get_if_list():
                     self.iface_map[n] = n
                     labels.append(n)
-            except Exception:                        # noqa: BLE001
-                pass
+            except Exception as e:                   # noqa: BLE001
+                LOG.warning("adapter names unavailable, using the default "
+                            "adapter: %s", e)
         if not labels:
             self.iface_map["Default"] = None
             labels = ["Default"]
@@ -52173,6 +52207,7 @@ class CrashDialog:
         try:
             path = app.autosave("crash")
         except Exception:                            # noqa: BLE001
+            LOG.exception("autosave after a crash")
             path = None
         t = app.theme
         win = tk.Toplevel(app.root)
@@ -65004,6 +65039,52 @@ def bench_report(seconds=2.0):
             out.update(fn())
     return out
 
+
+@self_test(needs_source=True)
+def t_no_silent_broad_except(ctx):
+    """5.3.4 (S5): production code (everything outside the self-test and
+    GUI-test sections) has no bare `except:` and no broad handler
+    (`Exception`, `BaseException`) whose whole body is `pass`, so a failure
+    leaves at least a log line. And a display filter that throws on a packet
+    keeps the packet and says so on the filter bar instead of passing for a
+    working filter."""
+    import ast
+    with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    lines = src.splitlines()
+    lo = next(i for i, ln in enumerate(lines, 1) if ln.startswith("#  20b."))
+    hi = next(i for i, ln in enumerate(lines, 1) if ln.startswith("#  21."))
+    assert lo < hi, (lo, hi)
+    bad = []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.ExceptHandler) or lo <= node.lineno < hi:
+            continue
+        t = node.type
+        if t is None:
+            bad.append(f"line {node.lineno}: bare except")
+            continue
+        names = list(t.elts) if isinstance(t, ast.Tuple) else [t]
+        broad = any(isinstance(n, ast.Name) and
+                    n.id in ("Exception", "BaseException") for n in names)
+        if broad and all(isinstance(b, ast.Pass) for b in node.body):
+            bad.append(f"line {node.lineno}: broad except with only pass")
+    assert not bad, "silent handlers in production code:\n" + "\n".join(bad)
+
+    class _Var:
+        v = ""
+
+        def set(self, v):
+            self.v = v
+
+    class _Boom:
+        def match(self, d, c):
+            raise KeyError("field")
+    tab = PacketsTab.__new__(PacketsTab)
+    tab.filter, tab.ctx, tab.err_var = _Boom(), None, _Var()
+    assert tab._keep({}) is True
+    assert tab._keep({}) is True
+    assert tab._filter_errors == 2, tab._filter_errors
+    assert "couldn't be checked" in tab.err_var.v, tab.err_var.v
 
 
 # ---- window benchmark (--bench-gui) -----------------------------------------
