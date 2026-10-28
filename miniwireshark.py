@@ -623,6 +623,71 @@ def read_json(path, default=None):
         return default
 
 
+def load_json_store(path, kind=dict):
+    """5.3.4 (CO-07): a small store the user built (labels, trusted
+    networks, taught types). -> (data or None, problem): problem is ""
+    (fine or missing), "restored" (damaged; its backup was loaded),
+    "damaged" (set aside as .damaged-…, starting empty) or "unreadable"
+    (couldn't be opened: don't save over it). Before, any of these loaded
+    as empty and the next save erased everything."""
+    if not os.path.exists(path):
+        return None, ""
+    raw = None
+    for attempt in range(4):
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+            break
+        except OSError as e:
+            LOG.info("%s: read failed (%s), try %d", path, e, attempt + 1)
+            time.sleep(0.25)
+    if raw is None:
+        return None, "unreadable"
+    try:
+        data = json.loads(raw.decode("utf-8"))
+        if isinstance(data, kind):
+            return data, ""
+    except ValueError:
+        pass
+    try:
+        atomic_write_bytes(f"{path}.damaged-{int(time.time())}", raw)
+    except OSError:
+        return None, "unreadable"
+    bak = read_json(path + ".bak", None)
+    if isinstance(bak, kind):
+        LOG.warning("%s was damaged; its backup was loaded", path)
+        return bak, "restored"
+    LOG.warning("%s was damaged and set aside", path)
+    return None, "damaged"
+
+
+def store_problem_text(problem, what):
+    return {"restored": f"The file with {what} was damaged; the last good "
+                        f"copy was loaded (the damaged file was kept).",
+            "damaged": f"The file with {what} was damaged and had no "
+                       f"backup; it was set aside (kept as “.damaged”) "
+                       f"and a new one was started.",
+            "unreadable": f"The file with {what} couldn't be read just now; "
+                          f"this run leaves it unchanged (changes won't be "
+                          f"saved)."}.get(problem, "")
+
+
+def save_json_store(path, obj):
+    """Write a store with a backup of the previous version and an fsync,
+    so a power cut leaves the old or the new file, never half of one."""
+    if os.path.exists(path):
+        with contextlib.suppress(OSError):
+            if isinstance(read_json(path, None), (dict, list)):
+                shutil.copyfile(path, path + ".bak")
+    tmp = _tmp_name(path)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj, indent=2, default=str))
+        f.flush()
+        with contextlib.suppress(OSError):
+            os.fsync(f.fileno())
+    _replace_retrying(tmp, path)
+
+
 def is_admin():
     if IS_WINDOWS:
         try:
@@ -11982,6 +12047,34 @@ def device_to_dict(dev, include_history=True):
     return out
 
 
+# 5.3.4 (CO-12): a session file's values are checked by type as they
+# load. One wrong-typed value (a hand edit, another tool, bit rot) used to
+# load "fine" and crash later in a tick, the Inspector, a chart or the
+# next save.
+def _finite(v, default=0.0):
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return default
+    return x if math.isfinite(x) else default
+
+
+def _str_set(v):
+    return {x for x in v if isinstance(x, str)} \
+        if isinstance(v, (list, tuple, set)) else set()
+
+
+def _num_map(v):
+    """{str: finite number} from a loaded dict (bad entries dropped)."""
+    out = Counter()
+    if isinstance(v, dict):
+        for k, x in v.items():
+            if isinstance(x, (int, float)) and not isinstance(x, bool) and \
+                    math.isfinite(x):
+                out[str(k)] = x
+    return out
+
+
 def device_from_dict(dd):
     key = dd.get("key") or dd.get("mac") or f"ip:{dd.get('ip', '')}"
     dev = DeviceRecord(key=key)
@@ -12005,8 +12098,15 @@ def device_from_dict(dd):
                 v = float(v)
             except (TypeError, ValueError):
                 continue
+            if not math.isfinite(v):
+                continue
         elif isinstance(cur, list) and not isinstance(v, list):
             continue
+        elif isinstance(cur, list):
+            v = [x for x in v if isinstance(x, str)] \
+                if k == "class_reasons" else \
+                [x for x in v if x is not None and not (
+                    isinstance(x, float) and not math.isfinite(x))]
         elif isinstance(cur, str):
             v = sanitize_text(v, 2000 if k == "notes" else 200)
         elif isinstance(cur, dict):
@@ -12027,9 +12127,9 @@ def device_from_dict(dd):
               "remote_ips"):
         v = dd.get(k)
         if isinstance(v, (list, tuple, set)):
-            setattr(dev, k, set(v))
+            setattr(dev, k, _str_set(v))
     if isinstance(dd.get("protocols"), dict):
-        dev.protocols = Counter(dd["protocols"])
+        dev.protocols = _num_map(dd["protocols"])
     for e in dd.get("evidence", []) or []:
         if isinstance(e, (list, tuple)) and len(e) >= 3:
             dev.evidence.append(Evidence(str(e[0]), str(e[1]), int(e[2]),
@@ -13377,9 +13477,9 @@ class NetworkProfiles:
     def __init__(self, path):
         self.path = path
         existed = os.path.exists(path)
-        self.data = read_json(path, {}) if existed else {}
-        if not isinstance(self.data, dict):
-            self.data = {}
+        data, self.problem = load_json_store(path)
+        self.read_only = self.problem == "unreadable"
+        self.data = data if isinstance(data, dict) else {}
         self.data.setdefault("networks", {})
         self.fresh_install = not existed
 
@@ -13426,8 +13526,10 @@ class NetworkProfiles:
             self.save()
 
     def save(self):
+        if self.read_only:
+            return
         try:
-            atomic_write_json(self.path, self.data)
+            save_json_store(self.path, self.data)
         except OSError:
             LOG.warning("could not save network profiles")
 
@@ -13498,14 +13600,15 @@ def website_from_dict(wd):
                         registrable=sanitize_text(wd.get("registrable", ""),
                                                   255),
                         first_seen=float(wd.get("first_seen") or time.time()))
-    rec.resolved_ips = set(wd.get("resolved_ips", []) or [])
+    rec.resolved_ips = _str_set(wd.get("resolved_ips", []) or [])
     rec.requests = int(wd.get("requests", 0) or 0)
     rec.connections = int(wd.get("connections", 0) or 0)
     rec.bytes = int(wd.get("bytes", 0) or 0)
-    rec.sources = set(wd.get("sources", []) or [])
-    rec.devices = set(wd.get("devices", []) or [])
-    rec.countries = set(wd.get("countries", []) or [])
-    rec.asns = set(wd.get("asns", []) or [])
+    rec.sources = _str_set(wd.get("sources", []) or [])
+    rec.devices = _str_set(wd.get("devices", []) or [])
+    rec.countries = _str_set(wd.get("countries", []) or [])
+    rec.asns = {x for x in wd.get("asns", []) or []
+                if isinstance(x, int) and not isinstance(x, bool)}
     rec.encrypted = int(wd.get("encrypted", 0) or 0)
     rec.cleartext = int(wd.get("cleartext", 0) or 0)
     rec.category = wd.get("category", "") or ""
@@ -13580,12 +13683,12 @@ def remote_to_dict(rec):
 def remote_from_dict(rd):
     rec = RemoteHostRecord(ip=sanitize_text(rd.get("ip", ""), 64),
                            domain=sanitize_text(rd.get("domain", ""), 255))
-    rec.domains = set(rd.get("domains", []) or ([rec.domain] if rec.domain
-                                                 else []))
+    rec.domains = _str_set(rd.get("domains", []) or (
+        [rec.domain] if rec.domain else []))
     rec.ports = set(int(p) for p in rd.get("ports", []) or []
                     if str(p).isdigit())
-    rec.protocols = set(rd.get("protocols", []) or [])
-    rec.devices = set(rd.get("devices", []) or [])
+    rec.protocols = _str_set(rd.get("protocols", []) or [])
+    rec.devices = _str_set(rd.get("devices", []) or [])
     rec.packets = int(rd.get("packets", 0) or 0)
     rec.bytes_total = int(rd.get("bytes", 0) or 0)
     rec.bytes_out = int(rd.get("bytes_out", 0) or 0)
@@ -13761,8 +13864,17 @@ class FlowRecord:
                 d.get("remote_port"), float(d.get("first_seen") or 0))
         for s in cls.__slots__:
             if s in d and s not in ("fid", "key", "seq_out", "seq_in"):
+                v, cur = d[s], getattr(f, s, None)
+                # 5.3.4 (CO-12): numbers stay finite numbers, text text
+                if isinstance(cur, (int, float)) and \
+                        not isinstance(cur, bool):
+                    if isinstance(v, bool) or not isinstance(
+                            v, (int, float)) or not math.isfinite(v):
+                        continue
+                elif isinstance(cur, str) and not isinstance(v, str):
+                    continue
                 with contextlib.suppress(AttributeError, TypeError):
-                    setattr(f, s, d[s])
+                    setattr(f, s, v)
         f.closed = True
         f.live = False
         return f
@@ -13896,9 +14008,12 @@ class TimeSeries:
         for res, _n in METRIC_TIERS:
             items = d.get(str(res)) or []
             od = self.tiers[res]
-            for b, v in items[-_n:]:
+            for item in items[-_n:]:
                 with contextlib.suppress(TypeError, ValueError):
-                    od[int(b)] = v
+                    b, v = item
+                    if isinstance(v, (int, float)) and \
+                            not isinstance(v, bool) and math.isfinite(v):
+                        od[int(b)] = v
 
 
 class MetricsEngine:
@@ -13994,9 +14109,8 @@ class MetricsEngine:
     def load(self, d):
         if not isinstance(d, dict):
             return
-        self.totals.update({k: v for k, v in (d.get("totals") or {}).items()
-                            if isinstance(v, (int, float))})
-        self.proto_bytes.update(d.get("proto_bytes") or {})
+        self.totals.update(_num_map(d.get("totals")))
+        self.proto_bytes.update(_num_map(d.get("proto_bytes")))
         self.first_ts = float(d.get("first_ts") or 0)
         self.last_ts = float(d.get("last_ts") or 0)
         self.peak.update({k: float(v) for k, v in
@@ -16314,9 +16428,11 @@ class DnsTracker:
             hist = s.get("hist") or []
             if isinstance(hist, list) and len(hist) == len(DNS_BUCKETS):
                 srv["hist"] = [int(x or 0) for x in hist]
-        for name, n in d.get("top_domains") or []:
-            self.domains[name] = n
-        self.encrypted_seen.update(d.get("encrypted") or {})
+        for item in d.get("top_domains") or []:
+            if isinstance(item, (list, tuple)) and len(item) == 2 and \
+                    isinstance(item[0], str):
+                self.domains[item[0]] = int(_finite(item[1]))
+        self.encrypted_seen.update(_num_map(d.get("encrypted")))
 
 
 # ---- per-device behavioral baseline -----------------------------------------
@@ -16417,11 +16533,11 @@ class DeviceBaseline:
             hrs = d.get("hours") or []
             if len(hrs) == 24:
                 b.hours = [int(x) for x in hrs]
-            b.protocols = Counter(d.get("protocols") or {})
+            b.protocols = _num_map(d.get("protocols"))
             b.services = Counter({int(k): v for k, v in
-                                  (d.get("services") or {}).items()
+                                  _num_map(d.get("services")).items()
                                   if str(k).isdigit()})
-            b.countries = set(d.get("countries") or [])
+            b.countries = _str_set(d.get("countries") or [])
         return b
 
     def usual_hours_text(self):
@@ -19670,15 +19786,35 @@ class AppConfig:
         # the version that last showed the Welcome Center, as the file said
         # when it was read (before this start writes anything)
         self.from_version = ""
+        self.read_only = False
         self.data = self._load()
 
     def _load(self):
         defaults = _default_config()
+        if not os.path.exists(self.path):
+            return defaults
+        # 5.3.4 (CO-06): a file that can't be opened just now (an antivirus
+        # or indexer holding it on Windows) is retried, then left alone:
+        # before, it counted as damaged and the next save replaced the
+        # user's settings with the defaults
+        raw = None
+        for attempt in range(4):
+            try:
+                with open(self.path, "rb") as f:
+                    raw = f.read()
+                break
+            except OSError as e:
+                LOG.info("settings read failed (%s), try %d", e, attempt + 1)
+                time.sleep(0.25)
+        if raw is None:
+            self.read_only = True
+            self.warning = ("Your settings file couldn't be read just now "
+                            "(another program may be holding it). This run "
+                            "uses the defaults and leaves your file as it "
+                            "is.")
+            return defaults
         try:
-            if not os.path.exists(self.path):
-                return defaults
-            with open(self.path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = json.loads(raw.decode("utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("config is not an object")
             data = migrate_config(data)
@@ -19707,11 +19843,22 @@ class AppConfig:
             return merged
         except (OSError, ValueError) as e:
             LOG.warning("config unreadable (%s); using defaults", e)
-            with contextlib.suppress(OSError):
-                shutil.copyfile(self.path, self.path + ".damaged")
-            self.warning = ("Your settings file looked damaged, so I reset "
-                            "it to defaults (a copy was kept as "
-                            "“.damaged”).")
+            try:
+                with open(self.path + ".damaged", "wb") as f:
+                    f.write(raw)
+                kept = True
+            except OSError:
+                kept = False
+            if kept:
+                self.warning = ("Your settings file looked damaged, so I "
+                                "reset it to defaults (a copy was kept as "
+                                "“.damaged”).")
+            else:
+                # no copy, so the file must not be written over
+                self.read_only = True
+                self.warning = ("Your settings file looked damaged and no "
+                                "copy could be made, so this run uses the "
+                                "defaults and leaves the file as it is.")
             return defaults
 
     def get(self, dotted, default=None):
@@ -19729,6 +19876,9 @@ class AppConfig:
         self.data.setdefault(section, {})[key] = value
 
     def save(self):
+        if self.read_only:
+            LOG.info("settings not saved: the file is kept as it was")
+            return False
         try:
             bak = self.path + ".bak"
             if os.path.exists(self.path) and not self.warning:
@@ -19785,7 +19935,8 @@ class LearnedTypes:
 
     def __init__(self, path=None):
         self.path = path or os.path.join(PATHS.data, "learned_types.json")
-        d = read_json(self.path, None)
+        d, self.problem = load_json_store(self.path)
+        self.read_only = self.problem == "unreadable"
         self.items = d.get("items", []) if isinstance(d, dict) else []
 
     @staticmethod
@@ -19827,8 +19978,10 @@ class LearnedTypes:
         self.save()
 
     def save(self):
+        if self.read_only:
+            return
         try:
-            atomic_write_json(self.path, {"version": 1, "items": self.items})
+            save_json_store(self.path, {"version": 1, "items": self.items})
         except OSError:
             LOG.warning("could not save learned device types")
 
@@ -19877,9 +20030,9 @@ class KnownDevicesStore:
 
     def __init__(self, path):
         self.path = path
-        self.data = read_json(path, {}) or {}
-        if not isinstance(self.data, dict):
-            self.data = {}
+        data, self.problem = load_json_store(path)
+        self.read_only = self.problem == "unreadable"
+        self.data = data if isinstance(data, dict) else {}
 
     def get(self, key):
         return self.data.get(key)
@@ -19905,8 +20058,10 @@ class KnownDevicesStore:
             self.save()
 
     def save(self):
+        if self.read_only:
+            return
         try:
-            atomic_write_json(self.path, self.data)
+            save_json_store(self.path, self.data)
         except OSError:
             LOG.warning("could not save known devices")
 
@@ -20073,10 +20228,12 @@ class SessionCodec:
         payload = SessionCodec.migrate(payload)
         sess = payload.get("session") or {}
         model.use_packet_clock = True
-        model.offline_now = float(sess.get("ended") or
-                                  payload.get("exported_at") or time.time())
-        model.set_identity(gateway_ip=sess.get("gateway", "") or "",
-                           my_ips=sess.get("my_ips") or [])
+        model.offline_now = _finite(sess.get("ended") or
+                                    payload.get("exported_at"),
+                                    0.0) or time.time()
+        gw = sess.get("gateway", "")
+        model.set_identity(gateway_ip=gw if isinstance(gw, str) else "",
+                           my_ips=sorted(_str_set(sess.get("my_ips") or [])))
         model.demo = bool(sess.get("demo"))
         with contextlib.suppress(TypeError, ValueError):
             model.loaded_bookmarks = sorted(
@@ -20245,7 +20402,8 @@ class Store:
     def __init__(self, path, session_id=None, meta=None):
         self.path = path
         self.session = session_id if session_id is not None else \
-            int(time.time())
+            new_session_id()
+        self._wall0 = time.time() - time.monotonic()
         self.meta = dict(meta or {})
         self.q = queue.Queue(maxsize=400)
         self.error = ""
@@ -20272,6 +20430,14 @@ class Store:
             con.close()
             if not row or row[0] != "ok":
                 bad = str(row[0] if row else "no answer")
+        except sqlite3.OperationalError as e:
+            # 5.3.4 (CO-08): "locked" or "busy" is another copy writing (a
+            # 3.0.0 still running), not damage. Never set a live file
+            # aside; the writer's own connect waits or reports it
+            if _sqlite_busy(e):
+                LOG.info("history: file busy (%s); not checked now", e)
+                return
+            bad = str(e)
         except sqlite3.DatabaseError as e:
             bad = str(e)
         if not bad:
@@ -20593,6 +20759,14 @@ class Store:
 
     def prune(self, days):
         if not days:
+            return False
+        # 5.3.4 (CO-15): the wall clock jumped ahead of the steady clock
+        # since this run started (a wrong NTP answer, a clock set by hand
+        # a year ahead): pruning now would delete everything, so wait
+        if wall_clock_jump(self._wall0) > 86400:
+            LOG.warning("history not pruned: the clock jumped ahead by "
+                        "%.0f days during this run",
+                        wall_clock_jump(self._wall0) / 86400)
             return False
         cutoff = time.time() - days * 86400
         cday = time.strftime("%Y-%m-%d", time.localtime(cutoff))
@@ -20916,6 +21090,25 @@ def store_events_page(store, before=None, limit=200, **filters):
                     "text": text, "ref": ref, "device": dev or "",
                     "session": sess, "live": False, "rowid": rowid})
     return out
+
+
+def wall_clock_jump(wall0):
+    """Seconds the wall clock moved ahead of the steady clock since
+    `wall0` (= time.time() - time.monotonic() then)."""
+    return (time.time() - time.monotonic()) - wall0
+
+
+def _sqlite_busy(e):
+    t = str(e).lower()
+    return "locked" in t or "busy" in t
+
+
+def new_session_id():
+    """5.3.4 (CO-09): a history session id no other run gets: the start
+    in milliseconds and this process. The start second alone was shared
+    by two copies started together (or after the clock stepped back), and
+    each then overwrote the other's connections."""
+    return int(time.time() * 1000) * 1000 + os.getpid() % 1000
 
 
 def store_sessions(store, limit=60):
@@ -40105,6 +40298,12 @@ class MiniWireshark:
             self._on_data_changed)
         self.known = KnownDevicesStore(PATHS.known_devices)
         self.networks = NetworkProfiles(PATHS.networks)
+        for st, what in ((self.known, "your device names and notes"),
+                         (self.networks, "your trusted networks")):
+            msg = store_problem_text(st.problem, what)
+            if msg:
+                self.root.after(3000, lambda m=msg: self._set_banner(
+                    "⚠️  " + m, kind="warn"))
         self.network_fp = ""
         self.network_profile = None
         if self.networks.fresh_install and \
@@ -40116,7 +40315,7 @@ class MiniWireshark:
             # warm-up writes one on every new install, so every new install
             # trusted its first network and started Active Scanning unasked
             self.config.set("general.upgraded_from_3", True)
-        self.session_id = int(time.time())
+        self.session_id = new_session_id()
         self.history = self._open_store() \
             if self.config.get("history.enabled", False) else None
         self.packet_ring = None
@@ -42112,6 +42311,12 @@ class MiniWireshark:
             if self.data_mode == "live" and self.model.has_data() and \
                     self.count != getattr(self, "_journal_count", -1):
                 self.write_journal(background=True)
+            elif getattr(self, "_journal_written", False) and \
+                    journal_owner(PATHS.journal) == os.getpid():
+                # 5.3.4 (OS-07): "still running", for another copy that
+                # starts while this one is idle or paused
+                with contextlib.suppress(OSError):
+                    os.utime(PATHS.journal + ".sha256")
         except Exception:                            # noqa: BLE001
             LOG.exception("session journal")
         with contextlib.suppress(tk.TclError):
@@ -42123,15 +42328,17 @@ class MiniWireshark:
         journal is detected). background=True: as a job."""
         path = path or PATHS.journal
         count = self.count
-        body = self.session_text_job(path + ".part")
+        part = f"{path}.{os.getpid()}.part"     # 5.3.4 (OS-07): per copy
+        body = self.session_text_job(part)
 
         def run(job):
             body(job)
-            with open(path + ".part", "rb") as f:
+            with open(part, "rb") as f:
                 digest = hashlib.sha256(f.read()).hexdigest()
-            os.replace(path + ".part", path)
+            os.replace(part, path)
             atomic_write_json(path + ".sha256", {
-                "journal": 2, "saved_at": time.time(), "sha256": digest})
+                "journal": 2, "saved_at": time.time(), "sha256": digest,
+                "pid": os.getpid()})
             return path
 
         def ok(_p):
@@ -42141,13 +42348,14 @@ class MiniWireshark:
             return self.jobs.submit("journal", "Keeping a crash-safe copy",
                                     run, ok)
         job = Job("journal", "", None)
-        run_inline = self.session_text_job(path + ".part")
+        run_inline = self.session_text_job(part)
         parts_done = run_inline(job)
         with open(parts_done, "rb") as f:
             digest = hashlib.sha256(f.read()).hexdigest()
         os.replace(parts_done, path)
         atomic_write_json(path + ".sha256", {
-            "journal": 2, "saved_at": time.time(), "sha256": digest})
+            "journal": 2, "saved_at": time.time(), "sha256": digest,
+            "pid": os.getpid()})
         ok(path)
         return path
 
@@ -50689,7 +50897,12 @@ proc ::mw_retheme {w map fgnew deffg} {
             else:
                 self._forget_session_history()
             with contextlib.suppress(OSError):
-                if os.path.exists(PATHS.journal) and \
+                # 5.3.4 (OS-07): only this copy's own journal; a second
+                # copy running in the same folder keeps its crash copy
+                owner = journal_owner(PATHS.journal)
+                if owner and owner != os.getpid():
+                    pass
+                elif os.path.exists(PATHS.journal) and \
                         PATHS.journal != getattr(self, "_journal_found", ""):
                     os.remove(PATHS.journal)
                 elif os.path.exists(PATHS.journal) and \
@@ -52368,6 +52581,15 @@ def update_start_not_counted(script_path=None, marker_path=None):
             atomic_write_json(marker_path, marker)
 
 
+def journal_owner(path):
+    """The pid that wrote this crash journal (5.3.4), or 0."""
+    side = read_json(path + ".sha256", None)
+    try:
+        return int(side.get("pid") or 0) if isinstance(side, dict) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
 def claim_interrupted_journal(path=None, now=None, keep=3):
     """5.2.3 (B-33): a crash journal found at start-up is moved aside to
     journal-interrupted-<time>.mwsession.json before anything else, so 30 s
@@ -52383,6 +52605,16 @@ def claim_interrupted_journal(path=None, now=None, keep=3):
     except OSError:
         return ""
     if now - mtime < 45:
+        return ""
+    # 5.3.4 (OS-07): the copy that wrote it is still running (its pid is
+    # alive and it said so in the last 2 minutes, even when idle)
+    owner = journal_owner(path)
+    try:
+        beat = os.path.getmtime(path + ".sha256")
+    except OSError:
+        beat = 0.0
+    if owner and owner != os.getpid() and _pid_alive(owner) and \
+            now - beat < 120:
         return ""
     folder = os.path.dirname(path)
     dest = os.path.join(folder, time.strftime(
@@ -59284,6 +59516,171 @@ def t_lg08_roaming_reidentifies(ctx):
     finally:
         if conf is not None:
             conf.route.routes = real
+
+
+@self_test()
+def t_m2_history_two_copies_and_clock(ctx):
+    """5.3.4: a locked history file is busy, not damaged (CO-08); two
+    runs never share a session id (CO-09); a clock that jumps a year
+    ahead during a run doesn't prune everything (CO-15)."""
+    path = ctx.path("lock.sqlite3")
+    st = Store(path, session_id=1)
+    assert st.write_observations([(1, time.time(), "dns_answer", "a", {}, 1)])
+    assert st.flush_now(10)
+    st.stop(5)
+    other = sqlite3.connect(path, timeout=1, isolation_level=None)
+    other.execute("PRAGMA journal_mode=DELETE")
+    other.execute("BEGIN EXCLUSIVE")
+    try:
+        probe = Store.__new__(Store)
+        probe.path, probe.recovered = path, ""
+        real = sqlite3.connect
+        sqlite3.connect = lambda p, timeout=5, **kw: real(p, timeout=0.2,
+                                                           **kw)
+        try:
+            probe._check_integrity()
+        finally:
+            sqlite3.connect = real
+        assert probe.recovered == "", probe.recovered
+        assert not [f for f in os.listdir(os.path.dirname(path))
+                    if ".corrupt-" in f and f.startswith("lock.")]
+    finally:
+        other.execute("ROLLBACK")
+        other.close()
+    ids = {new_session_id() for _ in range(3)}
+    assert len({i // 1000 for i in ids}) >= 1 and all(
+        i % 1000 == os.getpid() % 1000 for i in ids)
+    st = Store(ctx.path("clock.sqlite3"), session_id=5)
+    assert st.write_observations([(1, time.time(), "dns_answer", "a", {}, 1)])
+    assert st.flush_now(10)
+    st._wall0 -= 365 * 86400               # the clock jumped a year ahead
+    assert st.prune(30) is False
+    assert st.counts()["observations"] == 1
+    st._wall0 += 365 * 86400
+    st.stop(5)
+
+
+@self_test()
+def t_m2_settings_and_stores_survive_damage(ctx):
+    """5.3.4 (CO-06, CO-07): a settings file that can't be opened is left
+    alone (not replaced by defaults); a damaged one is only reset when the
+    .damaged copy really exists. A damaged labels or networks file loads
+    its backup and is kept aside; the next save doesn't erase the rest."""
+    path = ctx.path("cfg-locked.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"appearance": {"theme": "Dark"}}, f)
+    real_open = open
+
+    def locked(p, *a, **kw):
+        if p == path:
+            raise PermissionError(13, "locked by another program")
+        return real_open(p, *a, **kw)
+    builtins = __builtins__ if isinstance(__builtins__, dict) else \
+        __builtins__.__dict__
+    builtins["open"] = locked
+    try:
+        c = AppConfig(path=path)
+    finally:
+        builtins["open"] = real_open
+    assert c.read_only and "couldn't be read" in c.warning
+    assert c.save() is False
+    assert read_json(path)["appearance"]["theme"] == "Dark"
+    bad = ctx.path("cfg-bad.json")
+    with open(bad, "w", encoding="utf-8") as f:
+        f.write('{"appearance": {"theme": "Da')
+    c = AppConfig(path=bad)
+    assert os.path.exists(bad + ".damaged") and "copy was kept" in c.warning
+    kd = ctx.path("known.json")
+    k = KnownDevicesStore(kd)
+    for i in range(30):
+        k.data[f"aa:bb:cc:00:00:{i:02x}"] = {"alias": f"Device {i}"}
+    k.save()
+    k.data["aa:bb:cc:00:00:00"]["alias"] = "Renamed"
+    k.save()                                   # .bak holds the 30 labels
+    with open(kd, "r+", encoding="utf-8") as f:
+        f.truncate(40)
+    k2 = KnownDevicesStore(kd)
+    assert k2.problem == "restored" and len(k2.data) == 30, len(k2.data)
+    assert [f for f in os.listdir(os.path.dirname(kd))
+            if f.startswith("known.json.damaged-")]
+    k2.data["aa:bb:cc:00:00:01"]["alias"] = "One change"
+    k2.save()
+    assert len(read_json(kd)) == 30
+    assert store_problem_text("restored", "x") and \
+        not store_problem_text("", "x")
+
+
+@self_test()
+def t_os07_second_copy_keeps_off_the_journal(ctx):
+    """5.3.4 (OS-07): a journal whose writer is still running (alive and
+    beating in the last 2 minutes, even idle) is not claimed as
+    "interrupted" by a second copy; once the writer is gone it is."""
+    folder = ctx.path("os07")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "journal.mwsession.json")
+    other = os.getppid() or 1
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("{}")
+    atomic_write_json(path + ".sha256", {"journal": 2, "pid": other,
+                                         "saved_at": time.time()})
+    old = time.time() - 600
+    os.utime(path, (old, old))
+    assert journal_owner(path) == other
+    assert claim_interrupted_journal(path) == ""
+    assert os.path.exists(path)
+    os.utime(path + ".sha256", (old, old))     # it stopped beating
+    got = claim_interrupted_journal(path)
+    assert got and got != path and not os.path.exists(path), got
+
+
+@self_test()
+def t_co12_bad_session_values(ctx):
+    """5.3.4 (CO-12): one wrong-typed value anywhere in a session file
+    either stops the load or is dropped: nothing crashes later in a tick,
+    the Inspector, the coverage rows or saving again (200 seeded
+    mutations of a real session)."""
+    import copy
+    base = json.loads("".join(SessionCodec.iter_json(
+        scenario_model(ctx.cfg({})))))
+
+    def leaves(o, path=()):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                yield from leaves(v, path + (k,))
+        elif isinstance(o, list):
+            for i, v in enumerate(o[:3]):
+                yield from leaves(v, path + (i,))
+        else:
+            yield path
+    paths = [p_ for p_ in leaves(base) if p_ and p_[0] not in (
+        "app", "exported_at")]
+    rnd = random.Random(1234)
+    bad = []
+    for _ in range(200):
+        path = rnd.choice(paths)
+        val = rnd.choice(["x", None, [], {}, -1e308, "1e999"])
+        pl = copy.deepcopy(base)
+        o = pl
+        for k in path[:-1]:
+            o = o[k]
+        o[path[-1]] = val
+        m = NetworkModel(ctx.cfg({}))
+        try:
+            SessionCodec.load(pl, m)
+        except Exception:                            # noqa: BLE001
+            continue                   # refused at load: the user is told
+        try:
+            m.tick()
+            for d in list(m.registry.by_key.values()):
+                device_claims(m, d)
+            m.metrics.rate("bytes_up", 10, m.now())
+            m.metrics.top_protocols(5)
+            coverage_rows(m, "session")
+            "".join(SessionCodec.iter_json(m))
+        except Exception as e:                       # noqa: BLE001
+            bad.append(f"{'/'.join(map(str, path))}={val!r}: "
+                       f"{type(e).__name__}: {e}")
+    assert not bad, bad[:5]
 
 
 @self_test()
