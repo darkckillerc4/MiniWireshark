@@ -138,6 +138,12 @@ SELF_TEST_FLAG = "--self-test"
 DEMO_FLAG = "--demo"
 NO_ELEVATE_FLAG = "--no-elevate"
 NO_ELEVATE_ENV = "MINIWIRESHARK_NO_ELEVATE"
+# 5.3.4 (LG-09): an elevated relaunch carries the data folder (plain sudo
+# drops the environment), what to do once it is up, and a file it creates
+# to say it really started
+DATA_ARG = "--mw-data="
+START_ARG = "--mw-start="
+ELEV_FLAG_ARG = "--mw-elev-flag="
 
 IS_WINDOWS = platform.system() == "Windows"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # B-45
@@ -171,6 +177,116 @@ if FROZEN and "--mw-worker" not in sys.argv:
             setattr(sys, _name, open(os.devnull, "w", encoding="utf-8"))
 
 
+# 5.3.4 (LG-10): everything MiniWireshark writes is private to the user —
+# history, sessions, logs, settings and the vault come out 0600, folders
+# 0700 (POSIX; Windows keeps the profile's own permissions)
+if not IS_WINDOWS:
+    os.umask(0o077)
+
+
+def _invoking_uid():
+    """The user who started an elevated run through sudo or pkexec, or
+    None."""
+    for v in ("PKEXEC_UID", "SUDO_UID"):
+        try:
+            return int(os.environ[v])
+        except (KeyError, ValueError):
+            continue
+    return None
+
+
+def trusted_uids():
+    """5.3.4 (RT-01, RT-02, RT-06, OS-04): whose folders this process may
+    load code and data from. Normally only its own. An elevated run also
+    trusts the user who started it, but only when that user owns this
+    very file: then they could change the program anyway, so their data
+    folder crosses no boundary. For a system-wide install (a file root
+    owns) the elevated run trusts root's folders only. None on Windows."""
+    if IS_WINDOWS:
+        return None
+    me = os.geteuid()
+    out = {me}
+    inv = _invoking_uid()
+    if me == 0 and inv is not None:
+        with contextlib.suppress(OSError):
+            if os.stat(APP_PATH).st_uid == inv:
+                out.add(inv)
+    return out
+
+
+def private_dir_ok(path, fix=False):
+    """POSIX: `path` is a folder owned by a trusted user (trusted_uids)
+    that nobody else can write to. With `fix`, a folder of our own that
+    others can read or enter is closed to 0700 first (5.2.3 and older
+    made them 0755). Windows: always True (per-user profile folders)."""
+    if IS_WINDOWS:
+        return True
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if not os.path.isdir(path) or st.st_uid not in trusted_uids():
+        return False
+    if fix and st.st_mode & 0o077 and st.st_uid == os.geteuid():
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o700)
+            st = os.stat(path)
+    return not st.st_mode & 0o022
+
+
+def private_file_ok(path):
+    """POSIX: a file of a trusted user that only its owner can read and
+    write (a key). Windows: it exists."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    if IS_WINDOWS:
+        return True
+    return st.st_uid in trusted_uids() and not st.st_mode & 0o077
+
+
+def _give_back_ids():
+    """(uid, gid) of the user an elevated run works for, when its files
+    should be theirs (trusted_uids), else None."""
+    if IS_WINDOWS or os.geteuid() != 0:
+        return None
+    inv = _invoking_uid()
+    if inv is None or inv not in trusted_uids():
+        return None
+    try:
+        gid = int(os.environ.get("SUDO_GID", ""))
+    except ValueError:
+        try:
+            import pwd
+            gid = pwd.getpwuid(inv).pw_gid
+        except (ImportError, KeyError):
+            gid = -1
+    return inv, gid
+
+
+def give_back(path):
+    """5.3.4 (OS-02): an elevated run writes into the user's own folders
+    (HOME is kept), so what it creates is handed back to that user: root-
+    owned files there could not be changed or deleted without sudo."""
+    ids = _give_back_ids()
+    if ids:
+        with contextlib.suppress(OSError):
+            os.chown(path, ids[0], ids[1])
+
+
+def give_back_tree(root):
+    """give_back() for a folder and everything in it (start and close)."""
+    ids = _give_back_ids()
+    if not ids or not os.path.isdir(root):
+        return
+    for dp, dn, fn in os.walk(root):
+        for n in [dp] + [os.path.join(dp, x) for x in dn + fn]:
+            with contextlib.suppress(OSError):
+                if os.lstat(n).st_uid == 0:
+                    os.chown(n, ids[0], ids[1], follow_symlinks=False)
+
+
 def _dir_writable(path):
     try:
         os.makedirs(path, exist_ok=True)
@@ -200,20 +316,28 @@ class AppPaths:
     application *source* stays a single .py file; caches, logs, history and
     autosaves are allowed to be separate files. The folder sits next to the
     script when that is writable (portable, and survives sudo changing
-    $HOME), otherwise in the platform's per-user data location."""
+    $HOME), otherwise in the platform's per-user data location.
+    5.3.4 (OS-04, LG-10): a folder someone else owns or can write to is
+    never used (code and the history are read from it), and the shared
+    fixed /tmp/miniwireshark fallback is gone: the last resort is a new
+    private folder for this run only."""
 
     def __init__(self):
-        override = os.environ.get("MINIWIRESHARK_DATA")
+        override = os.environ.get("MINIWIRESHARK_DATA") or next(
+            (a[len(DATA_ARG):] for a in sys.argv if a.startswith(DATA_ARG)),
+            "")
         candidates = [override] if override else []
         candidates += [os.path.join(APP_HOME, "miniwireshark_data"),
-                       _user_data_root(),
-                       os.path.join(tempfile.gettempdir(), "miniwireshark")]
+                       _user_data_root()]
         self.data = None
+        self.skipped = []
         for c in candidates:
             if c and _dir_writable(c):
-                self.data = c
-                break
-        if self.data is None:                        # pragma: no cover
+                if private_dir_ok(c, fix=True):
+                    self.data = c
+                    break
+                self.skipped.append(c)
+        if self.data is None:
             self.data = tempfile.mkdtemp(prefix="miniwireshark_")
         self.cache = os.path.join(self.data, "cache")
         self.logs = os.path.join(self.data, "logs")
@@ -242,6 +366,17 @@ class AppPaths:
 
 PATHS = AppPaths()
 LOG = logging.getLogger("miniwireshark")
+
+
+def _give_back_all():
+    give_back_tree(PATHS.data)
+    give_back_tree(os.path.join(os.path.expanduser("~"), ".cache", "scapy"))
+
+
+if _give_back_ids():
+    import atexit
+    _give_back_all()             # also mends files 5.2.3 left owned by root
+    atexit.register(_give_back_all)
 
 
 _SECRETS = set()                # passwords / tokens never to be shown
@@ -302,6 +437,7 @@ def _replace_retrying(tmp, path, tries=4):
         for i in range(tries):
             try:
                 os.replace(tmp, path)
+                give_back(path)
                 return
             except PermissionError:
                 if i == tries - 1:
@@ -512,10 +648,30 @@ def _fatal_dialog(title, message):
             sys.stderr.write(f"\n*** {title} ***\n{message}\n")
 
 
-def _relaunch_elevated():
-    extra = [a for a in sys.argv[1:] if a != ELEVATED_FLAG] + \
-        list(_HANDOFF_ARGS) + ([SAFE_FLAG] if SAFE_MODE else [])
+def _relaunch_elevated(more_args=()):
+    """Start this program again with administrator / root rights. Windows:
+    True once the UAC prompt was accepted (the caller exits). Linux and
+    macOS: waits for the elevated copy and exits with its code when it
+    really started; returns False when every way was refused or missing,
+    so the caller can carry on without capture (5.3.4, LG-09: before, a
+    refused password closed the program)."""
+    extra = [a for a in sys.argv[1:] if a != ELEVATED_FLAG and not
+             a.startswith((DATA_ARG, START_ARG, ELEV_FLAG_ARG))] + \
+        list(_HANDOFF_ARGS) + ([SAFE_FLAG] if SAFE_MODE else []) + \
+        list(more_args)
+    flag = ""
+    if not IS_WINDOWS:
+        flag = os.path.join(PATHS.data, f".elevated-{os.getpid()}")
+        with contextlib.suppress(OSError):
+            os.remove(flag)
+        extra += [DATA_ARG + PATHS.data, ELEV_FLAG_ARG + flag]
     argv = self_cmd(ELEVATED_FLAG, *extra)
+
+    def started():
+        ok = os.path.exists(flag)
+        with contextlib.suppress(OSError):
+            os.remove(flag)
+        return ok
     if IS_WINDOWS:
         params = subprocess.list2cmdline(argv[1:])
         try:
@@ -530,9 +686,12 @@ def _relaunch_elevated():
         cmd = " ".join(shlex.quote(p) for p in argv)
         ascript = f'do shell script "{cmd}" with administrator privileges'
         try:
-            sys.exit(subprocess.call(["osascript", "-e", ascript]))
+            rc = subprocess.call(["osascript", "-e", ascript])
         except OSError:
             return False
+        if started():
+            sys.exit(rc)
+        return False
     env_pairs = [f"{v}={os.environ[v]}" for v in
                  ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
                   "XDG_RUNTIME_DIR", "HOME", "USER", "LANG", "PATH",
@@ -551,10 +710,67 @@ def _relaunch_elevated():
         launchers.append(["kdesudo", "--"])
     for L in launchers:
         try:
-            sys.exit(subprocess.call(L + argv))
+            rc = subprocess.call(L + argv)
         except OSError:
             continue
+        if started():
+            sys.exit(rc)
+        if L[0] == "pkexec" and rc in (126, 127):
+            return False           # the user said no: don't ask again
     return False
+
+
+def wants_capture(action, cfg):
+    """Will the main window start capturing as soon as it opens?"""
+    if START_IN_DEMO or action == "demo":
+        return False
+    if action == "monitor":
+        return True
+    return action is None and bool(
+        cfg.get("general.auto_start_capture", True))
+
+
+def elevate_for_capture(root, cfg, action):
+    """5.3.4 (LG-09): on Linux and macOS, ask for root only now, when a
+    capture is about to start and this user can't capture. True when an
+    elevated copy ran and this one should stop. A refused or missing
+    password carries on without capture (the window says why when
+    capture is tried) instead of closing the program."""
+    if IS_WINDOWS or not elevation_allowed() or \
+            not wants_capture(action, cfg) or not needs_elevation():
+        return False
+    LOG.info("capture needs root: asking for the password")
+    os.environ.setdefault("MINIWIRESHARK_DATA", PATHS.data)
+    with contextlib.suppress(Exception):
+        root.withdraw()
+        root.update_idletasks()
+    try:
+        _relaunch_elevated((START_ARG + "monitor",))   # exits when it ran
+    except Exception as e:                           # noqa: BLE001
+        LOG.warning("elevated start failed: %s", e)
+    LOG.warning("no root: carrying on without capture")
+    CAPTURE_LIMITED[0] = ("live capture needs administrator (root) rights "
+                          "and the password was not given")
+    with contextlib.suppress(Exception):
+        root.deiconify()
+    return False
+
+
+def mark_elevated_start():
+    """In the elevated copy: create the file its parent waits for."""
+    for a in list(sys.argv):
+        if a.startswith(ELEV_FLAG_ARG):
+            sys.argv.remove(a)
+            path = a[len(ELEV_FLAG_ARG):]
+            if os.path.dirname(os.path.abspath(path)) == \
+                    os.path.abspath(PATHS.data):
+                with contextlib.suppress(OSError):
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(str(os.getpid()))
+                    give_back(path)
+    for a in list(sys.argv):
+        if a.startswith(DATA_ARG):
+            sys.argv.remove(a)
 
 
 # ============================================================================
@@ -693,21 +909,101 @@ STAGE_ARG = "--mw-stage=app"
 # process of this file (the managed-Python hand-off, a Full Power worker)
 # loads it. CACHED_RUN is the few lines that do that; a missing or stale
 # copy means the file is compiled as usual.
+# 5.3.4 (RT-01): the copy is code, so time and size are not enough. Its
+# body carries an HMAC made with this install's private key (MW_KEY), and
+# a copy is only loaded from a folder and with a key that nobody else can
+# write (POSIX: owned by this user, not group/other-writable; Windows:
+# only under the per-user LOCALAPPDATA), never by root. Anything else is
+# compiled from the file as usual.
+PYC_MAC_LEN = 32
 CACHED_RUN = "\n".join((
-    "import sys,os,types,marshal,importlib.util as U",
+    "import sys,os,types,marshal,hmac,hashlib,importlib.util as U",
     "p=os.path.abspath(sys.argv[1]);sys.argv=sys.argv[1:]",
     "sys.path[0]=os.path.dirname(p);c=None;q=os.environ.get('MW_PYC','')",
     "try:",
-    " s=os.stat(p);h=open(q,'rb').read() if q else b''",
-    " if h[:4]==U.MAGIC_NUMBER and h[4:8]==bytes(4) and "
+    " s=os.stat(p);e=os.environ;k=e.get('MW_KEY','')",
+    " if os.name=='nt':",
+    "  b=os.path.normcase(e.get('LOCALAPPDATA') or '?')+os.sep",
+    "  assert os.path.normcase(q).startswith(b)",
+    " else:",
+    "  u=os.geteuid();assert u",
+    "  for f,m in ((os.path.dirname(q),0o22),(k,0o77)):",
+    "   t=os.stat(f);assert t.st_uid==u and not t.st_mode&m",
+    " h=open(q,'rb').read();k=open(k,'rb').read();b=h[48:]",
+    " if len(k)>=32 and h[:4]==U.MAGIC_NUMBER and h[4:8]==bytes(4) and "
     "int.from_bytes(h[8:12],'little')==int(s.st_mtime)&0xFFFFFFFF and "
-    "int.from_bytes(h[12:16],'little')==s.st_size&0xFFFFFFFF:"
-    "c=marshal.loads(h[16:])",
+    "int.from_bytes(h[12:16],'little')==s.st_size&0xFFFFFFFF and "
+    "hmac.compare_digest(h[16:48],hmac.new(k,b,hashlib.sha256).digest()):"
+    "c=marshal.loads(b)",
     "except Exception:c=None",
     "if c is None:c=compile(open(p,'rb').read(),p,'exec')",
     "m=types.ModuleType('__main__');m.__file__=p",
     "m.__builtins__=__builtins__;sys.modules['__main__']=m",
     "exec(c,m.__dict__)"))
+
+
+def install_key_path():
+    return os.path.join(PATHS.data, "install.key")
+
+
+def install_key(create=True):
+    """5.3.4 (RT-01, RT-02): 32 random bytes only this user can read,
+    made once per data folder. It authenticates what MiniWireshark
+    leaves in the data folder and later trusts: the compiled copy and the
+    update marker. -> bytes, or None when there is none (or it can't be
+    trusted and can't be made)."""
+    path = install_key_path()
+    for _ in range(2):
+        if private_file_ok(path):
+            try:
+                with open(path, "rb") as f:
+                    key = f.read(64)
+                if len(key) >= 32:
+                    return key
+            except OSError:
+                return None
+        if not create:
+            return None
+        with contextlib.suppress(OSError):
+            if os.path.lexists(path):
+                os.remove(path)      # someone else's, or readable by others
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                         getattr(os, "O_BINARY", 0), 0o600)
+        except FileExistsError:
+            continue                 # another copy made it at this moment
+        except OSError:
+            return None
+        try:
+            os.write(fd, os.urandom(32))
+        finally:
+            os.close(fd)
+        give_back(path)
+    return None
+
+
+def compiled_copy_trusted(target=None):
+    """Whether a compiled copy may be written and used here (RT-01): never
+    by root, POSIX only in a folder nobody else can write, Windows only
+    under the per-user LOCALAPPDATA."""
+    target = target or compiled_copy_path()
+    folder = os.path.dirname(target)
+    if IS_WINDOWS:
+        base = os.path.normcase(os.environ.get("LOCALAPPDATA") or "?")
+        return os.path.normcase(os.path.abspath(target)).startswith(
+            base + os.sep)
+    if os.geteuid() == 0:
+        return False
+    try:
+        return private_dir_ok(folder) and \
+            os.stat(folder).st_uid == os.geteuid()
+    except OSError:
+        return False
+
+
+def _pyc_mac(key, body):
+    import hmac
+    return hmac.new(key, body, hashlib.sha256).digest()
 
 
 def compiled_copy_path():
@@ -732,25 +1028,34 @@ def cached_env(env):
     if FROZEN:
         return env
     env.setdefault("MW_PYC", compiled_copy_path())
+    env.setdefault("MW_KEY", install_key_path())
     env["MW_CACHED"] = "1"
     return env
 
 
-def _pyc_fresh(path, st):
+def _pyc_fresh(path, st, key=None):
     """The compiled copy at `path` matches the file (Python's own check:
-    magic number, time and size)."""
+    magic number, time and size) and carries a valid HMAC (5.3.4,
+    RT-01)."""
+    import hmac
     import importlib.util as iu
+    key = key or install_key(create=False)
+    if not key:
+        return False
     try:
         with open(path, "rb") as f:
-            head = f.read(16)
+            data = f.read()
     except OSError:
         return False
-    return (len(head) == 16 and head[:4] == iu.MAGIC_NUMBER and
+    head = data[:16]
+    return (len(data) > 16 + PYC_MAC_LEN and head[:4] == iu.MAGIC_NUMBER and
             head[4:8] == bytes(4) and
             int.from_bytes(head[8:12], "little") ==
             (int(st.st_mtime) & 0xFFFFFFFF) and
             int.from_bytes(head[12:16], "little") ==
-            (st.st_size & 0xFFFFFFFF))
+            (st.st_size & 0xFFFFFFFF) and
+            hmac.compare_digest(data[16:16 + PYC_MAC_LEN],
+                                _pyc_mac(key, data[16 + PYC_MAC_LEN:])))
 
 
 def keep_compiled_copy(code, target=None):
@@ -759,8 +1064,14 @@ def keep_compiled_copy(code, target=None):
     None."""
     target = target or compiled_copy_path()
     try:
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        if not compiled_copy_trusted(target):
+            return None
+        key = install_key()
+        if not key:
+            return None
         st = os.stat(SCRIPT_PATH)
-        if _pyc_fresh(target, st):
+        if _pyc_fresh(target, st, key):
             return target
         import importlib._bootstrap_external as be
         import _imp
@@ -768,7 +1079,8 @@ def keep_compiled_copy(code, target=None):
         # starts (the code holds the path Python was given, maybe relative)
         _imp._fix_co_filename(code, SCRIPT_PATH)
         data = be._code_to_timestamp_pyc(code, st.st_mtime, st.st_size)
-        os.makedirs(os.path.dirname(target), exist_ok=True)
+        data = bytes(data[:16]) + _pyc_mac(key, bytes(data[16:])) + \
+            bytes(data[16:])
         tmp = f"{target}.{os.getpid()}.tmp"
         with open(tmp, "wb") as f:
             f.write(data)
@@ -802,6 +1114,7 @@ def start_from_compiled_copy(code, argv=None, environ=None, execute=True,
     env = dict(environ)
     env["MW_CACHED"] = "1"
     env["MW_PYC"] = target
+    env["MW_KEY"] = install_key_path()
     try:
         with contextlib.suppress(Exception):
             sys.stdout.flush()
@@ -1221,7 +1534,27 @@ def needs_elevation():
         # admin account, with a misleading error); the installer alone
         # asks for administrator rights (_run_as_admin_wait)
         return _npcap_present_early() and _npcap_admin_only()
-    return True
+    return not has_capture_rights()
+
+
+def has_capture_rights():
+    """5.3.4 (LG-09): capture works without root when this Python has the
+    raw-socket capability (Linux: `setcap cap_net_raw,cap_net_admin+eip`)
+    or the BPF devices are open to this user (macOS: Wireshark's
+    ChmodBPF)."""
+    if is_admin():
+        return True
+    if IS_MAC:
+        return os.access("/dev/bpf0", os.R_OK | os.W_OK)
+    try:
+        with open("/proc/self/status", encoding="ascii",
+                  errors="replace") as f:
+            for line in f:
+                if line.startswith("CapEff:"):
+                    return bool(int(line.split()[1], 16) & (1 << 13))
+    except (OSError, ValueError, IndexError):
+        pass
+    return False
 
 
 def _npcap_present_early():
@@ -1271,6 +1604,10 @@ if ELEVATED_FLAG in sys.argv:
     _ELEV = True
 else:
     _ELEV = False
+mark_elevated_start()
+START_MONITOR = START_ARG + "monitor" in sys.argv
+if START_MONITOR:
+    sys.argv.remove(START_ARG + "monitor")
 
 if __name__ == "__main__" and not TOOL_MODE:
     BOOT = BootReceipt()
@@ -1286,9 +1623,18 @@ if __name__ == "__main__" and not TOOL_MODE:
 if __name__ == "__main__" and not TOOL_MODE and not _ELEV:
     runtime_handoff()          # managed Python only when chosen or needed
 
-if __name__ == "__main__" and not TOOL_MODE and not _ELEV and \
-        not os.environ.get(NO_ELEVATE_ENV) and \
-        NO_ELEVATE_FLAG not in sys.argv and needs_elevation():
+def elevation_allowed():
+    return not _ELEV and not os.environ.get(NO_ELEVATE_ENV) and \
+        NO_ELEVATE_FLAG not in sys.argv
+
+
+# Windows asks for administrator rights at start, and only when Npcap was
+# installed for administrators only. 5.3.4 (LG-09): Linux and macOS no
+# longer start as root for everything (demo, help, opening a file, the
+# Welcome Center): they ask when capture is about to start
+# (elevate_for_capture), and not at all with the capture capability.
+if __name__ == "__main__" and not TOOL_MODE and IS_WINDOWS and \
+        elevation_allowed() and needs_elevation():
     if BOOT is not None:
         BOOT.mark(outcome="elevated")
     if _relaunch_elevated():
@@ -1626,8 +1972,17 @@ class PrivatePackages:
         Frozen: never; the exe's bundled modules must not be shadowed."""
         if FROZEN:
             return False
+        # 5.3.4 (RT-06): appended after the system's own packages, not put
+        # in front of them, and only from a folder nobody else can write:
+        # a module planted there used to shadow `cryptography`, the very
+        # library that checks update signatures
         if os.path.isdir(self.root) and self.root not in sys.path:
-            sys.path.insert(1 if sys.path else 0, self.root)
+            if not private_dir_ok(self.root, fix=True) or \
+                    not private_dir_ok(os.path.dirname(self.root)):
+                LOG.warning("private packages folder %s is not private; "
+                            "not used", self.root)
+                return False
+            sys.path.append(self.root)
             importlib.invalidate_caches()
             return True
         return False
@@ -2907,7 +3262,8 @@ def prepare_compiled_copy(popen=None, cfg=None):
         return None
     try:
         st = os.stat(SCRIPT_PATH)
-        if _pyc_fresh(compiled_copy_path(), st):
+        if not compiled_copy_trusted() or _pyc_fresh(compiled_copy_path(),
+                                                     st):
             return None
         stamp = f"{int(st.st_mtime)}:{st.st_size}"
         if cfg is not None:
@@ -51489,11 +51845,13 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
     # 5.2.3 (B-31): the marker names the file it belongs to and what was
     # written, so another copy of MiniWireshark sharing this data folder
     # (an archived version) never "rolls back" over itself
-    atomic_write_json(marker_path, {
-        "backup": backup, "version": tag, "from": SCRIPT_VERSION,
-        "script": os.path.abspath(script_path),
-        "sha256": sha256_file(script_path),
-        "time": time.time(), "attempts": 0})
+    marker = {"backup": backup, "version": tag, "from": SCRIPT_VERSION,
+              "script": os.path.abspath(script_path),
+              "sha256": sha256_file(script_path),
+              "backup_sha256": sha256_file(backup),
+              "time": time.time(), "attempts": 0}
+    marker["mac"] = update_marker_mac(marker)
+    atomic_write_json(marker_path, marker)
     LOG.info("installed update %s (backup %s)", tag, backup)
     return (f"MiniWireshark {tag} was installed. Restart it to use the new "
             f"version. A backup of {SCRIPT_VERSION} is at:\n{backup}\nIf the "
@@ -51503,6 +51861,53 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
 
 def _norm_path(p):
     return os.path.normcase(os.path.abspath(p))
+
+
+_MARKER_SIGNED = ("backup", "version", "from", "script", "sha256",
+                  "backup_sha256", "time")
+
+
+def update_marker_mac(marker, key=None):
+    """5.3.4 (RT-02): an HMAC over the marker's fields (not `attempts`,
+    which changes every start) with the install key, or "" without one."""
+    import hmac
+    key = key or install_key()
+    if not key:
+        return ""
+    body = json.dumps({k: marker.get(k) for k in _MARKER_SIGNED},
+                      sort_keys=True).encode("utf-8")
+    return hmac.new(key, body, hashlib.sha256).hexdigest()
+
+
+def rollback_source_ok(marker, script_path):
+    """5.3.4 (RT-02): the backup a rollback may copy over the program.
+    Only the one this install wrote: next to the program, named after the
+    version it replaced, owned like the program, and (for a marker 5.3.4
+    wrote) under a valid HMAC with the sha256 it had then. Before, the
+    marker was plain JSON in the data folder, so anyone who could write
+    there chose what replaced the program. -> (ok, why)."""
+    import hmac
+    backup = str(marker.get("backup") or "")
+    want = f"{script_path}.v{marker.get('from')}.bak"
+    if not backup or _norm_path(backup) != _norm_path(want):
+        return False, "the backup isn't the one this program writes"
+    try:
+        bst, sst = os.stat(backup), os.stat(script_path)
+    except OSError:
+        return False, "the backup is missing"
+    if not IS_WINDOWS and (bst.st_uid != sst.st_uid or
+                           bst.st_mode & 0o022):
+        return False, "the backup is owned by someone else"
+    if marker.get("mac") or marker.get("backup_sha256"):
+        mac = update_marker_mac(marker)
+        if not mac or not hmac.compare_digest(mac, str(marker.get("mac"))):
+            return False, "the update marker isn't authentic"
+        try:
+            if sha256_file(backup) != marker.get("backup_sha256"):
+                return False, "the backup has changed since the update"
+        except OSError:
+            return False, "the backup can't be read"
+    return True, ""
 
 
 def update_marker_for(script_path=None, marker_path=None):
@@ -51616,6 +52021,12 @@ def rollback_update_if_needed(force=False, script_path=None,
     if not force and marker["attempts"] < 3:
         return ""
     backup = marker.get("backup", "")
+    ok, why = rollback_source_ok(marker, script_path)
+    if not ok:
+        LOG.warning("update rollback refused: %s", why)
+        with contextlib.suppress(OSError):
+            os.remove(marker_path)
+        return ""
     if backup and os.path.exists(backup):
         try:
             shutil.copy2(backup, script_path)
@@ -62157,6 +62568,12 @@ def t_warm_up_on_the_loading_screen(ctx):
     real_path = globals()["compiled_copy_path"]
     try:
         globals()["compiled_copy_path"] = lambda: ctx.path("none.pyc")
+        if not compiled_copy_trusted():
+            # root (or a shared folder) never keeps one: no helper either
+            assert prepare_compiled_copy(
+                popen=lambda cmd, **kw: started.append(cmd)) is None
+            assert not started
+            raise _NoCopyHere
         assert prepare_compiled_copy(
             popen=lambda cmd, **kw: started.append((cmd, kw)) or "proc") \
             == "proc"
@@ -62176,6 +62593,8 @@ def t_warm_up_on_the_loading_screen(ctx):
         assert prepare_compiled_copy(popen=fake, cfg=c2) == "proc"
         assert prepare_compiled_copy(popen=fake, cfg=c2) is None
         assert len(started) == 2
+    except _NoCopyHere:
+        pass
     finally:
         globals()["compiled_copy_path"] = real_path
     # the capture start: the first quiet wait ends it, not a 0.2 s sleep
@@ -62219,6 +62638,190 @@ def t_warm_up_on_the_loading_screen(ctx):
         conf.L2listen = real_listen
 
 
+class _NoCopyHere(Exception):
+    pass
+
+
+def _cached_run(script, pyc, key):
+    """Run CACHED_RUN on `script` with this copy and key -> its output."""
+    env = dict(os.environ, MW_PYC=pyc, MW_KEY=key)
+    r = subprocess.run([sys.executable, "-c", CACHED_RUN, script],
+                       capture_output=True, env=env, timeout=60)
+    return r.stdout.decode().strip()
+
+
+@self_test()
+def t_rt01_compiled_copy_forgery(ctx):
+    """5.3.4 (RT-01): a planted compiled copy with the right header but no
+    valid HMAC runs nothing: the source runs instead. So does a copy in a
+    folder others can write, a key others can read, and any copy at all
+    when the start is root. A copy MiniWireshark made itself still loads."""
+    if IS_WINDOWS:
+        return
+    import hmac
+    import importlib._bootstrap_external as be
+    folder = ctx.path("rt01")
+    os.makedirs(folder, mode=0o700, exist_ok=True)
+    os.chmod(folder, 0o700)
+    script = os.path.join(folder, "s.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("print('source')\n")
+    key_path = os.path.join(folder, "k")
+    key = os.urandom(32)
+    fd = os.open(key_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(key)
+    st = os.stat(script)
+    data = be._code_to_timestamp_pyc(
+        compile("print('cached')", script, "exec"), st.st_mtime, st.st_size)
+    head, body = bytes(data[:16]), bytes(data[16:])
+    good = os.path.join(folder, "good.pyc")
+    forged = os.path.join(folder, "forged.pyc")
+    with open(good, "wb") as f:
+        f.write(head + hmac.new(key, body, hashlib.sha256).digest() + body)
+    with open(forged, "wb") as f:
+        f.write(head + bytes(32) + body)
+    if os.geteuid() == 0:
+        assert _cached_run(script, good, key_path) == "source"
+        return
+    assert _cached_run(script, good, key_path) == "cached"
+    assert _cached_run(script, forged, key_path) == "source"
+    os.chmod(key_path, 0o644)
+    assert _cached_run(script, good, key_path) == "source"
+    os.chmod(key_path, 0o600)
+    os.chmod(folder, 0o770)
+    try:
+        assert _cached_run(script, good, key_path) == "source"
+        assert not compiled_copy_trusted(good)
+    finally:
+        os.chmod(folder, 0o700)
+    assert compiled_copy_trusted(good)
+
+
+@self_test()
+def t_m1a_data_trust(ctx):
+    """5.3.4 M1a: a data, packages or cache folder someone else owns or
+    can write to is refused (OS-04, LG-10, RT-06); a rollback copies only
+    the backup this install wrote, under an authentic marker (RT-02)."""
+    if IS_WINDOWS:
+        return
+    mine = ctx.path("m1a-mine")
+    os.makedirs(mine, exist_ok=True)
+    os.chmod(mine, 0o777)
+    assert not private_dir_ok(mine)
+    assert private_dir_ok(mine, fix=True)
+    assert os.stat(mine).st_mode & 0o777 == 0o700
+    assert not private_dir_ok(ctx.path("m1a-missing"))
+    if os.geteuid() == 0:
+        theirs = ctx.path("m1a-theirs")
+        os.makedirs(theirs, exist_ok=True)
+        os.chown(theirs, 65534, 65534)
+        assert not private_dir_ok(theirs, fix=True)
+        os.environ["MINIWIRESHARK_DATA"], old = theirs, \
+            os.environ.get("MINIWIRESHARK_DATA")
+        try:
+            p = AppPaths()
+            assert p.data != theirs and theirs in p.skipped
+        finally:
+            if old is None:
+                os.environ.pop("MINIWIRESHARK_DATA", None)
+            else:
+                os.environ["MINIWIRESHARK_DATA"] = old
+    # RT-06: packages from a folder whose parent others can write: unused
+    parent = ctx.path("m1a-site")
+    root = os.path.join(parent, "tag")
+    os.makedirs(root, exist_ok=True)
+    os.chmod(parent, 0o777)
+    before = list(sys.path)
+    try:
+        assert PrivatePackages(root=root).activate() is False
+        assert root not in sys.path
+        os.chmod(parent, 0o700)
+        assert PrivatePackages(root=root).activate() is True
+        assert sys.path[-1] == root and sys.path[:len(before)] == before
+    finally:
+        sys.path[:] = before
+        os.chmod(parent, 0o700)
+    # RT-02
+    script = ctx.path("m1a-mw.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("new\n")
+    backup = f"{script}.v1.0.0.bak"
+    with open(backup, "w", encoding="utf-8") as f:
+        f.write("old\n")
+    evil = ctx.path("m1a-evil.py")
+    with open(evil, "w", encoding="utf-8") as f:
+        f.write("evil\n")
+    m = {"script": script, "from": "1.0.0", "version": "2.0.0",
+         "backup": backup, "sha256": sha256_file(script),
+         "backup_sha256": sha256_file(backup)}
+    m["mac"] = update_marker_mac(m)
+    assert m["mac"] and rollback_source_ok(m, script)[0]
+    assert not rollback_source_ok(dict(m, backup=evil), script)[0]
+    assert not rollback_source_ok(dict(m, version="6.6.6"), script)[0]
+    assert not rollback_source_ok(dict(m, mac="0" * 64), script)[0]
+    legacy = {k: v for k, v in m.items() if k not in ("mac",
+                                                       "backup_sha256")}
+    assert rollback_source_ok(legacy, script)[0]
+    assert not rollback_source_ok(dict(legacy, backup=evil), script)[0]
+    with open(backup, "a", encoding="utf-8") as f:
+        f.write("planted\n")
+    assert not rollback_source_ok(m, script)[0]
+    os.chmod(backup, 0o666)
+    assert not rollback_source_ok(legacy, script)[0]
+
+
+@self_test()
+def t_m1a_elevation(ctx):
+    """5.3.4 (LG-09): Linux and macOS ask for root only when a capture is
+    about to start; with the capture capability not at all; a refused
+    password carries on (False) instead of closing the program, and asks
+    once; a copy that really started ends this one with its code."""
+    assert wants_capture("monitor", ctx.cfg({}))
+    assert not wants_capture("demo", ctx.cfg({}))
+    assert not wants_capture("guide", ctx.cfg({}))
+    assert wants_capture(None, ctx.cfg({"general.auto_start_capture":
+                                        True})) != START_IN_DEMO
+    assert not wants_capture(None, ctx.cfg({"general.auto_start_capture":
+                                            False}))
+    if IS_WINDOWS or IS_MAC:
+        return
+    assert isinstance(has_capture_rights(), bool)
+    assert needs_elevation() is (not has_capture_rights())
+    if os.geteuid() == 0:
+        assert has_capture_rights()
+    calls = []
+    real_which, real_call = shutil.which, subprocess.call
+
+    def refused(cmd, *a, **kw):
+        calls.append(cmd)
+        return 126
+
+    def accepted(cmd, *a, **kw):
+        calls.append(cmd)
+        flag = next(x for x in cmd if x.startswith(ELEV_FLAG_ARG))
+        assert DATA_ARG + PATHS.data in cmd and START_ARG + "monitor" in cmd
+        with open(flag[len(ELEV_FLAG_ARG):], "w", encoding="utf-8") as f:
+            f.write("1")
+        return 3
+    try:
+        shutil.which = lambda n: "/usr/bin/" + n if n in (
+            "pkexec", "sudo") else None
+        subprocess.call = refused
+        assert _relaunch_elevated((START_ARG + "monitor",)) is False
+        assert len(calls) == 1 and calls[0][0] == "pkexec"
+        subprocess.call = accepted
+        try:
+            _relaunch_elevated((START_ARG + "monitor",))
+            raise AssertionError("did not end after the elevated copy")
+        except SystemExit as e:
+            assert e.code == 3
+        assert not [f for f in os.listdir(PATHS.data)
+                    if f.startswith(".elevated-")]
+    finally:
+        shutil.which, subprocess.call = real_which, real_call
+
+
 @self_test(needs_source=True)
 def t_compiled_copy_start(ctx):
     """A second process loads the kept compiled copy (and still works
@@ -62227,6 +62830,12 @@ def t_compiled_copy_start(ctx):
     and never on Windows."""
     code = compile("x = 1\n", SCRIPT_PATH, "exec")
     target = ctx.path("copy.pyc")
+    if not compiled_copy_trusted(target):
+        # root never writes or loads one (RT-01); the start goes on as is
+        assert keep_compiled_copy(code, target) is None
+        assert start_from_compiled_copy(code, ["--demo"], {}, False,
+                                        target) is None
+        return
     assert keep_compiled_copy(code, target) == target
     st = os.stat(SCRIPT_PATH)
     assert _pyc_fresh(target, st)
@@ -67404,6 +68013,8 @@ def main():
     first_time = cfg.get("general.welcome_version", "") != SCRIPT_VERSION
     if START_IN_DEMO:
         action = "demo"
+    elif START_MONITOR:
+        action = "monitor"         # the elevated copy: straight to capture
     elif cfg.get("general.show_welcome", True) or first_time or \
             startup_notice():
         health = "healthy"
@@ -67426,6 +68037,8 @@ def main():
             with contextlib.suppress(tk.TclError):
                 root.destroy()
             return
+    if elevate_for_capture(root, cfg, action):
+        return
 
     try:
         app = open_main_window(root, loader, cfg, (
