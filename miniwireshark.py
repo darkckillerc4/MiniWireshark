@@ -599,12 +599,21 @@ def capture_over_bytes(buf, size, limit):
     return None
 
 
+SESSION_MAX_CHARS = 256 * 2**20
+
+
 def read_session_payload(path):
     """A session file's JSON, plain or gzip-compressed, read in pieces
     (json_loads_pieces) so the window keeps its turn."""
     if session_is_gz(path):
         with gzip.open(path, "rt", encoding="utf-8") as f:
-            text = f.read()
+            text = f.read(SESSION_MAX_CHARS + 1)
+        # 5.3.4 (RT-05): a small file that unpacks to gigabytes is refused
+        # before it can fill the memory
+        if len(text) > SESSION_MAX_CHARS:
+            raise OSError("it unpacks to more than "
+                          f"{SESSION_MAX_CHARS // 2**20} MB, which no saved "
+                          "session reaches")
     else:
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -7016,10 +7025,15 @@ def _name_bytes(raw):
     if raw is None:
         return ""
     if isinstance(raw, bytes):
+        # 5.3.4 (QA-08): names travel as UTF-8 ("café-laptop"); idna is
+        # only for xn-- labels, latin-1 only for bytes that aren't UTF-8
         try:
-            out = raw.decode("idna")
-        except (UnicodeError, ValueError):
+            out = raw.decode("utf-8")
+        except UnicodeError:
             out = raw.decode("latin-1")
+        if out.isascii() and "xn--" in out.lower():
+            with contextlib.suppress(UnicodeError, ValueError):
+                out = raw.decode("idna")
         return sanitize_text(out.rstrip("."), 255)
     return sanitize_text(str(raw).rstrip("."), 255)
 
@@ -7338,8 +7352,12 @@ def human_duration(sec):
 def fmt_clock(ts, with_date=False):
     if not ts:
         return "—"
-    return time.strftime("%Y-%m-%d %H:%M:%S" if with_date else "%H:%M:%S",
-                         time.localtime(ts))
+    try:
+        return time.strftime(
+            "%Y-%m-%d %H:%M:%S" if with_date else "%H:%M:%S",
+            time.localtime(ts))
+    except (ValueError, OverflowError, OSError, TypeError):    # QA-03
+        return "?"
 
 
 def is_unicast_mac(mac):
@@ -8917,7 +8935,10 @@ class QuicInitialReader:
     def feed(self, key, datagram, ts):
         """→ parse_tls_hello() dict once the ClientHello is complete
         (with "via": "quic"), else None."""
-        hdr = quic_long_header(datagram)
+        try:
+            hdr = quic_long_header(datagram)
+        except (ValueError, IndexError, struct.error):  # QA-10: cut short
+            return None
         if not hdr or not hdr.get("initial"):
             return None
         ck = (key, hdr["dcid"])
@@ -8936,12 +8957,12 @@ class QuicInitialReader:
         self.decrypted += 1
         ent = self.buf.get(ck)
         if ent is None:
-            ent = self.buf[ck] = {"parts": {}, "ts": ts}
+            ent = self.buf[ck] = {"hs": bytearray(), "parts": {}, "ts": ts}
             self._trim(ts)
         for off, data in frames:
             if off < self.MAX_BYTES:
-                ent["parts"][off] = data
-        hs = self._contiguous(ent["parts"])
+                self._add(ent, off, data)
+        hs = bytes(ent["hs"])
         if len(hs) < 4:
             return None
         if hs[0] != 1:                        # not a ClientHello
@@ -8963,18 +8984,27 @@ class QuicInitialReader:
         info["quic_version"] = "v2" if hdr["version"] == QUIC_V2 else "v1"
         return info
 
-    @staticmethod
-    def _contiguous(parts):
-        out = bytearray()
-        while True:
-            nxt = None
-            for off in parts:
-                if off <= len(out) < off + len(parts[off]):
-                    nxt = off
-                    break
+    MAX_PIECES = 64
+
+    @classmethod
+    def _add(cls, ent, off, data):
+        """5.3.4 (QA-04): keep the stitched prefix and only the pieces
+        that come after a gap (at most MAX_PIECES), so each packet costs
+        its own size instead of re-walking every piece seen so far."""
+        hs, parts = ent["hs"], ent["parts"]
+        if off > len(hs):
+            if len(parts) < cls.MAX_PIECES or off in parts:
+                parts[off] = data
+            return
+        if off + len(data) > len(hs):
+            hs += data[len(hs) - off:]
+        while parts:
+            nxt = next((o for o in parts if o <= len(hs)), None)
             if nxt is None:
-                return bytes(out)
-            out += parts[nxt][len(out) - nxt:]
+                return
+            d = parts.pop(nxt)
+            if nxt + len(d) > len(hs):
+                hs += d[len(hs) - nxt:]
 
     def _trim(self, ts):
         while len(self.buf) > self.MAX_ENTRIES:
@@ -11636,8 +11666,18 @@ def _iter_pcapng(f, first):
             return
         if block_type == b"\x0a\x0d\x0d\x0a":
             bom = f.read(4)
-            end = "<" if bom == b"\x4d\x3c\x2b\x1a" else ">"
+            # 5.3.4 (QA-02): an unknown byte-order magic or a section
+            # length outside the limits every other block has is damage,
+            # not "0 packets"
+            if bom == b"\x4d\x3c\x2b\x1a":
+                end = "<"
+            elif bom == b"\x1a\x2b\x3c\x4d":
+                end = ">"
+            else:
+                raise ValueError("corrupt pcapng section header")
             blen = struct.unpack(end + "I", lenb)[0]
+            if blen < 28 or blen > 64 * 1024 * 1024 or blen % 4:
+                raise ValueError("corrupt pcapng section header")
             body = f.read(blen - 12)
             ifaces = []
             block_type = None
@@ -11659,6 +11699,8 @@ def _iter_pcapng(f, first):
                 code, ln = struct.unpack_from(end + "HH", body, p)
                 if code == 0:
                     break
+                if p + 4 + ln > len(body):        # QA-01: cut-off option
+                    break
                 if code == 9 and ln >= 1:
                     v = body[p + 4]
                     scale = (2 ** -(v & 0x7F)) if v & 0x80 else 10 ** -v
@@ -11668,7 +11710,7 @@ def _iter_pcapng(f, first):
             iid, hi, lo, cap, _orig = struct.unpack_from(end + "IIIII", body,
                                                          0)
             lt, scale = ifaces[iid] if iid < len(ifaces) else (1, 1e-6)
-            ts = ((hi << 32) | lo) * scale
+            ts = _sane_ts(((hi << 32) | lo) * scale, last_ts)
             last_ts = ts
             yield bytes(body[20:20 + cap]), ts, lt
         elif btype == 3 and len(body) >= 4:            # simple packet
@@ -11679,9 +11721,16 @@ def _iter_pcapng(f, first):
             iid = struct.unpack_from(end + "H", body, 0)[0]
             hi, lo, cap = struct.unpack_from(end + "III", body, 4)
             lt, scale = ifaces[iid] if iid < len(ifaces) else (1, 1e-6)
-            ts = ((hi << 32) | lo) * scale
+            ts = _sane_ts(((hi << 32) | lo) * scale, last_ts)
             last_ts = ts
             yield bytes(body[20:20 + cap]), ts, lt
+
+
+def _sane_ts(ts, last):
+    """5.3.4 (QA-03): a corrupt packet time (beyond year 2100 or before
+    1970) takes the previous packet's time instead of breaking every clock
+    shown for the session."""
+    return ts if 0 <= ts < 4102444800 else last
 
 
 class RawPcapImporter(threading.Thread):
@@ -11712,6 +11761,12 @@ class RawPcapImporter(threading.Thread):
             err = (f"{e}. The file may be damaged, or it isn't a "
                    "pcap/pcapng capture.")
             LOG.warning("capture import failed: %s", err)
+        except Exception as e:                        # noqa: BLE001
+            # QA-01: any other reader failure still ends the import with
+            # a message instead of a "Reading…" banner forever
+            err = (f"{type(e).__name__}. The file may be damaged, or it "
+                   "isn't a pcap/pcapng capture.")
+            LOG.exception("capture import failed")
         self.on_done(self.count, err, self.cancelled)
 
 
@@ -54467,51 +54522,54 @@ class IpDefragmenter:
             return None, "fragment would make the packet too large"
         st = self.pending.get(key)
         if st is None:
-            st = self.pending[key] = {"first": now, "parts": {}, "bytes": 0,
-                                      "end": None, "warn": ""}
+            st = self.pending[key] = {"first": now, "out": bytearray(),
+                                      "filled": bytearray(), "covered": 0,
+                                      "bytes": 0, "end": None, "warn": ""}
+        # 5.3.4 (QA-06): one buffer per datagram, written once per byte;
+        # the first copy of a byte wins and the datagram is finished when
+        # the covered count reaches the end (no rebuild per fragment)
         warn = ""
-        for o, b in st["parts"].items():
-            lo, hi = max(o, offset), min(o + len(b), offset + len(data))
-            if lo < hi:
-                self.overlaps += 1
-                if b[lo - o:hi - o] != data[lo - offset:hi - offset]:
-                    self.conflicts += 1
-                    warn = st["warn"] = ("overlapping fragments with "
-                                         "different content (a known way "
-                                         "to hide traffic from monitors); "
-                                         "the first copy was kept")
-                elif not warn:
-                    warn = "overlapping fragments (identical content)"
-        if offset not in st["parts"]:
-            st["parts"][offset] = data
-            st["bytes"] += len(data)
-            self.total += len(data)
+        out, filled = st["out"], st["filled"]
+        hi = offset + len(data)
+        if hi > len(out):
+            grow = hi - len(out)
+            out += bytes(grow)
+            filled += bytes(grow)
+            st["bytes"] += grow
+            self.total += grow
+        seen = filled[offset:hi]
+        if not seen.count(1):
+            out[offset:hi] = data
+            filled[offset:hi] = b"\x01" * len(data)
+            st["covered"] += len(data)
+        else:
+            self.overlaps += 1
+            differ = False
+            for i, b in enumerate(data):
+                if seen[i]:
+                    differ = differ or out[offset + i] != b
+                else:
+                    out[offset + i] = b
+                    filled[offset + i] = 1
+                    st["covered"] += 1
+            if differ:
+                self.conflicts += 1
+                warn = st["warn"] = ("overlapping fragments with "
+                                     "different content (a known way "
+                                     "to hide traffic from monitors); "
+                                     "the first copy was kept")
+            else:
+                warn = "overlapping fragments (identical content)"
         if not more:
-            st["end"] = offset + len(data)
-        if st["end"] is None:
+            st["end"] = hi
+        end = st["end"]
+        if end is None or st["covered"] < end or \
+                filled[:end].count(0):
             return None, warn
-        buf = bytearray(st["end"])
-        have = bytearray(st["end"])
-        for o in sorted(st["parts"], reverse=True):     # first copy wins:
-            b = st["parts"][o]                         # lower offsets last
-            n = max(0, min(len(b), st["end"] - o))
-            buf[o:o + n] = b[:n]
-            have[o:o + n] = b"\x01" * n
-        if 0 in have:
-            return None, warn
-        # rebuild with first-arrival precedence
-        out = bytearray(st["end"])
-        filled = bytearray(st["end"])
-        for o, b in st["parts"].items():                # insertion order
-            n = max(0, min(len(b), st["end"] - o))
-            for i in range(n):
-                if not filled[o + i]:
-                    out[o + i] = b[i]
-                    filled[o + i] = 1
         self.pending.pop(key, None)
         self.total -= st["bytes"]
         self.completed += 1
-        return bytes(out), warn or st["warn"]
+        return bytes(out[:end]), warn or st["warn"]
 
 
 class StreamMessage:
@@ -54650,10 +54708,14 @@ class HttpFramer:
     """HTTP/1.x: headers, then a body by Content-Length or chunked."""
     kind = "http"
     MAX_HEAD = 65536
+    # 5.3.4 (QA-09): only this much of a body is kept; the rest of a big
+    # download is counted and dropped instead of growing with the file
+    BODY_KEEP = 65536
 
     def __init__(self):
         self.buf, self.start, self.gaps = bytearray(), 0, []
         self.lost = False
+        self.skip = 0
 
     def _message_len(self):
         i = self.buf.find(b"\r\n\r\n")
@@ -54663,7 +54725,8 @@ class HttpFramer:
         hl = i + 4
         m = re.search(rb"\r\ncontent-length:\s*(\d+)", head)
         if m:
-            return hl + int(m.group(1))
+            # QA-07: 4,300+ digits made int() raise and killed the worker
+            return hl + int(m.group(1)) if len(m.group(1)) <= 15 else hl
         if re.search(rb"\r\ntransfer-encoding:\s*chunked", head):
             p = hl
             while True:
@@ -54689,6 +54752,12 @@ class HttpFramer:
     def feed(self, off, data, out, direction):
         if self.lost:
             return
+        if self.skip:
+            k = min(self.skip, len(data))
+            self.skip -= k
+            data, off = data[k:], off + k
+            if not data:
+                return
         if not self.buf:
             self.start = off
         self.buf += data
@@ -54698,6 +54767,29 @@ class HttpFramer:
                 if len(self.buf) > self.MAX_HEAD and \
                         b"\r\n\r\n" not in self.buf:
                     self.lost = True
+                elif len(self.buf) > self.MAX_HEAD + self.BODY_KEEP:
+                    # chunked or unframed and huge: keep the start only
+                    out.append(StreamMessage(
+                        direction, self.start,
+                        bytes(self.buf[:self.MAX_HEAD + self.BODY_KEEP]),
+                        self.kind, self.gaps + [("too long", "")]))
+                    self.buf = bytearray()
+                    self.lost = True
+                return
+            hl = self.buf.find(b"\r\n\r\n") + 4
+            keep = hl + self.BODY_KEEP
+            if n > keep and len(self.buf) >= keep:
+                out.append(StreamMessage(direction, self.start,
+                                         bytes(self.buf[:keep]), self.kind,
+                                         self.gaps + [("too long", "")]))
+                rest = len(self.buf) - n
+                self.start += n
+                self.gaps = []
+                if rest >= 0:
+                    del self.buf[:n]
+                    continue
+                self.skip = -rest
+                self.buf = bytearray()
                 return
             if len(self.buf) < n:
                 return
@@ -54789,6 +54881,9 @@ class TcpReassembler:
     stream is closed first (its holes become gap markers)."""
 
     RECENT = 65536
+    # 5.3.4 (QA-05): a count cap next to the byte cap, so a hole that never
+    # fills can't make every new tiny segment walk thousands of held ones
+    MAX_HELD = 256
 
     SYN_WAIT = 3.0     # capture seconds to wait for a SYN seen out of order
 
@@ -54926,7 +55021,8 @@ class TcpReassembler:
         d.held_bytes += len(data)
         self.total += len(data)
         self._drain(st, di, d)
-        if d.held_bytes > self.per_stream:     # a hole that won't fill
+        if d.held_bytes > self.per_stream or \
+                len(d.held) > self.MAX_HELD:   # a hole that won't fill
             self._skip_hole(st, di, d)
         if self.total > self.total_cap:
             self._bound(st.last)
@@ -56156,7 +56252,13 @@ def deep_worker_main(inp=None, out=None):
             an.my_ips = set(msg[1])
             continue
         if msg[0] == "flush":
-            m2, t2, f2 = an.flush(msg[2], msg[3])
+            try:
+                m2, t2, f2 = an.flush(msg[2], msg[3])
+            except Exception as e:                    # noqa: BLE001
+                # QA-07: a dissector error at the end of a capture must
+                # not end the worker (its queued batches would be lost)
+                LOG.warning("deep flush failed: %s", type(e).__name__)
+                m2, t2, f2 = [], [], []
             _wire_send(out, ("flushed", msg[1], m2, an.costs_us(), t2, f2))
             continue
         if msg[0] == "batch":
@@ -59681,6 +59783,130 @@ def t_os07_second_copy_keeps_off_the_journal(ctx):
     os.utime(path + ".sha256", (old, old))     # it stopped beating
     got = claim_interrupted_journal(path)
     assert got and got != path and not os.path.exists(path), got
+
+
+@self_test()
+def t_m3_damaged_files_and_count_caps(ctx):
+    """5.3.4 M3: damaged capture files end with a message (QA-01, QA-02,
+    QA-03); crafted traffic costs linear time and bounded memory (QA-04,
+    QA-05, QA-06, QA-09); a huge Content-Length (QA-07), UTF-8 names
+    (QA-08), a cut QUIC Initial (QA-10) and a session gzip bomb (RT-05)."""
+    import gzip as _gz
+
+    def blk(t, body):
+        body += b"\0" * ((-len(body)) % 4)
+        n = 12 + len(body)
+        return struct.pack("<II", t, n) + body + struct.pack("<I", n)
+    shb = blk(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    frame = bytes(64)
+    epb = blk(6, struct.pack("<IIIII", 0, 0, 0, 64, 64) + frame)
+    # QA-01: IDB cut right after an option header
+    ib = struct.pack("<HHI", 1, 0, 65535) + struct.pack("<HH", 9, 1)
+    idb = struct.pack("<II", 1, 12 + len(ib)) + ib + struct.pack(
+        "<I", 12 + len(ib))
+    p = ctx.path("qa01.pcapng")
+    with open(p, "wb") as f:
+        f.write(shb + idb + epb)
+    assert len(list(iter_raw_capture(p))) == 1
+    done = []
+    imp = RawPcapImporter(p, lambda *a: True, lambda n: None,
+                          lambda *a: done.append(a))
+    imp.start()
+    imp.join(5)
+    assert done and done[0][0] == 1
+    # QA-02: bad section header length or byte-order magic
+    for bad in (struct.pack("<II", 0x0A0D0D0A, 11) + b"\x4d\x3c\x2b\x1a",
+                struct.pack("<II", 0x0A0D0D0A, 0xFFFFFFFF) +
+                b"\x4d\x3c\x2b\x1a",
+                shb[:8] + b"XXXX" + shb[12:]):
+        with open(p, "wb") as f:
+            f.write(bad + bytes(32) + epb)
+        try:
+            list(iter_raw_capture(p))
+            raise AssertionError("damaged header accepted")
+        except ValueError:
+            pass
+    # QA-03: a timestamp beyond time_t keeps the previous packet's time
+    idb2 = blk(1, struct.pack("<HHI", 1, 0, 65535) + struct.pack(
+        "<HHB", 9, 1, 0) + b"\0\0\0" + struct.pack("<HH", 0, 0))
+    e1 = blk(6, struct.pack("<IIIII", 0, 0, 1761600000, 64, 64) + frame)
+    e2 = blk(6, struct.pack("<IIIII", 0, 0xFFFFFFFF, 0xFFFFFFFF, 64, 64) +
+             frame)
+    with open(p, "wb") as f:
+        f.write(shb + idb2 + e1 + e2)
+    ts = [t for _r, t, _l in iter_raw_capture(p)]
+    assert ts == [1761600000.0, 1761600000.0], ts
+    assert fmt_clock(1e30) == "?"
+    # QA-04: thousands of tiny CRYPTO pieces stay cheap
+    r = QuicInitialReader(budget=10 ** 6)
+    ent = {"hs": bytearray(), "parts": {}}
+    t0 = time.perf_counter()
+    for i in range(20000, 0, -1):
+        QuicInitialReader._add(ent, i, b"x")
+    QuicInitialReader._add(ent, 0, b"x")
+    assert len(ent["parts"]) <= r.MAX_PIECES
+    assert time.perf_counter() - t0 < 1.0
+    # QA-05: a hole that never fills
+    tr = TcpReassembler(framer=LineFramer)
+    tr.segment("10.0.0.1", 1000, "10.0.0.2", 80, 0, 0x02, b"", 0.0)
+    t0 = time.perf_counter()
+    for i in range(20000):
+        tr.segment("10.0.0.1", 1000, "10.0.0.2", 80, 100 + i * 2, 0x10,
+                   b"a", 0.0)
+    assert time.perf_counter() - t0 < 5.0
+    # QA-06: one datagram in 8,000 tiny fragments, then completed
+    df = IpDefragmenter()
+    key = ("10.0.0.2", "10.0.0.1", 17, 1)
+    df.add(key, 65528, False, b"z" * 7, 0.0)
+    t0 = time.perf_counter()
+    for i in range(1, 8191):
+        assert df.add(key, i * 8, True, b"y" * 8, 0.0)[0] is None
+    got, _w = df.add(key, 0, True, b"a" * 8, 0.0)
+    assert got and len(got) == 65535 and got[:8] == b"a" * 8
+    assert time.perf_counter() - t0 < 2.0 and df.total == 0
+    df.add(key, 0, True, b"abcd", 0.0)
+    _g, w = df.add(key, 2, False, b"XX", 0.0)
+    assert "different content" in w
+    # QA-07 and QA-09: huge Content-Length, big download
+    fr = HttpFramer()
+    out = []
+    fr.feed(0, b"HTTP/1.1 200 OK\r\nContent-Length: " + b"9" * 5000 +
+            b"\r\n\r\n", out, 1)
+    fr = HttpFramer()
+    out = []
+    hdr = b"HTTP/1.1 200 OK\r\nContent-Length: 50000000\r\n\r\n"
+    fr.feed(0, hdr, out, 1)
+    off = len(hdr)
+    for _ in range(300):
+        fr.feed(off, bytes(131072), out, 1)
+        off += 131072
+        assert len(fr.buf) <= fr.MAX_HEAD + fr.BODY_KEEP
+    assert len(out) == 1 and out[0].partial
+    fr.feed(off, bytes(50000000 + len(hdr) - off) +
+            b"HTTP/1.1 204 No\r\n\r\n",
+            out, 1)
+    assert len(out) == 2 and out[1].data.startswith(b"HTTP/1.1 204"), out
+    # QA-08: UTF-8 and punycode names
+    assert _name_bytes("café-laptop".encode()) == "café-laptop"
+    assert _name_bytes(b"xn--caf-dma.example") == "café.example"
+    assert _name_bytes(b"\xff\xfe") == "ÿþ"
+    # QA-10: a QUIC Initial cut by the snap length
+    q = quic_build_initial(bytes(8), bytes(8),
+                           tls_client_hello("video.example.com"))[:25]
+    assert QuicInitialReader().feed(("a", 1), q, 0.0) is None
+    # RT-05: a session that unpacks to more than the cap is refused
+    global SESSION_MAX_CHARS
+    g = ctx.path("bomb.mwsession.gz")
+    with _gz.open(g, "wb") as f:
+        f.write(b"[" + b" " * 3 * 2**20 + b"]")
+    keep, SESSION_MAX_CHARS = SESSION_MAX_CHARS, 2 * 2**20
+    try:
+        read_session_payload(g)
+        raise AssertionError("gzip bomb accepted")
+    except OSError as e:
+        assert "unpacks to more than" in str(e)
+    finally:
+        SESSION_MAX_CHARS = keep
 
 
 @self_test(needs_source=True)
