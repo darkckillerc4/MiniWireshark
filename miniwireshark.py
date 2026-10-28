@@ -683,10 +683,8 @@ def _relaunch_elevated(more_args=()):
             pass
         return False
     if IS_MAC:
-        cmd = " ".join(shlex.quote(p) for p in argv)
-        ascript = f'do shell script "{cmd}" with administrator privileges'
         try:
-            rc = subprocess.call(["osascript", "-e", ascript])
+            rc = subprocess.call(mac_admin_cmd(argv))
         except OSError:
             return False
         if started():
@@ -754,6 +752,17 @@ def elevate_for_capture(root, cfg, action):
     with contextlib.suppress(Exception):
         root.deiconify()
     return False
+
+
+def mac_admin_cmd(argv):
+    """The osascript command that runs argv as administrator. 5.3.4 (RT-07,
+    OS-05): the shell command is passed as an argument to the script, not
+    pasted into the AppleScript text, so a quote or apostrophe in the
+    program's path ("Krystel's Mac") neither breaks it nor runs as code."""
+    return ["osascript", "-e", "on run argv",
+            "-e", "do shell script (item 1 of argv) with administrator "
+                  "privileges",
+            "-e", "end run", " ".join(shlex.quote(p) for p in argv)]
 
 
 def mark_elevated_start():
@@ -2356,17 +2365,22 @@ def _latest_npcap_version():
     return NPCAP_FALLBACK_VERSION
 
 
-def _authenticode_info(path):
+def _authenticode_info(path, run=None):
     """Ask Windows whether a downloaded installer carries a valid digital
     signature and who signed it. Returns (status, signer_subject); status
-    is e.g. 'Valid' or 'NotSigned', '' if Windows couldn't tell."""
-    ps = ("$s = Get-AuthenticodeSignature -LiteralPath $args[0]; "
-          "Write-Output $s.Status; "
+    is e.g. 'Valid' or 'NotSigned', '' if Windows couldn't tell.
+    5.3.4 (OS-03): the path goes in an environment variable. It used to
+    follow `-Command`, where PowerShell pastes it onto the script text
+    instead of filling $args, so the check never saw a file and every
+    Npcap install was refused as unsigned."""
+    ps = ("$s = Get-AuthenticodeSignature -LiteralPath $env:MW_SIGNED_FILE;"
+          " Write-Output $s.Status; "
           "Write-Output $s.SignerCertificate.Subject")
     try:
-        r = subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps,
-             path], capture_output=True, text=True, timeout=60,
+        r = (run or subprocess.run)(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=60,
+            env=dict(os.environ, MW_SIGNED_FILE=os.path.abspath(path)),
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         lines = [ln.strip() for ln in (r.stdout or "").splitlines()]
         lines += ["", ""]
@@ -15565,15 +15579,18 @@ def connector_http(method, url, headers=None, body=None, pin="",
         else:
             conn = http.client.HTTPConnection(host, port or 80,
                                               timeout=timeout)
-        conn.request(method, path, body=body, headers=dict(
-            {"User-Agent": APP_NAME, "Accept": "application/json"},
-            **(headers or {})))
+        # 5.3.4 (RT-04): the pin is checked right after the handshake,
+        # before a byte of the request (the helper's password) is sent
         if parts.scheme == "https" and pin:
+            conn.connect()
             der = conn.sock.getpeercert(binary_form=True) or b""
             if hashlib.sha256(der).hexdigest() != pin.lower():
                 conn.close()
                 raise ConnectorError("tls", "The helper's certificate "
                                             "changed since you accepted it.")
+        conn.request(method, path, body=body, headers=dict(
+            {"User-Agent": APP_NAME, "Accept": "application/json"},
+            **(headers or {})))
         resp = conn.getresponse()
         data = resp.read(16 * 1024 * 1024)
         hdrs = {k.lower(): v for k, v in resp.getheaders()}
@@ -19419,6 +19436,9 @@ class AppConfig:
                 path = os.path.join(PATHS.data, "miniwireshark_config.json")
         self.path = path
         self.warning = ""
+        # the version that last showed the Welcome Center, as the file said
+        # when it was read (before this start writes anything)
+        self.from_version = ""
         self.data = self._load()
 
     def _load(self):
@@ -19431,6 +19451,9 @@ class AppConfig:
             if not isinstance(data, dict):
                 raise ValueError("config is not an object")
             data = migrate_config(data)
+            gen = data.get("general")
+            if isinstance(gen, dict):
+                self.from_version = str(gen.get("welcome_version") or "")
             merged = _default_config()
             for section, vals in data.items():
                 if section in merged and isinstance(vals, dict) and \
@@ -20378,7 +20401,22 @@ class Store:
                     con.execute(f"DELETE FROM {t}")
                 con.commit()
                 con.execute("VACUUM")
+                # 5.3.4 (LG-13): "Delete ALL history" means the copies too:
+                # the -wal file, the nightly backup and the ones made
+                # before an upgrade or after damage
+                with contextlib.suppress(sqlite3.Error):
+                    con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                self.remove_copies()
         return self.submit(job)
+
+    def remove_copies(self):
+        """Delete every copy of the history next to the live file."""
+        import glob
+        for f in [self.path + ".bak", self.path + ".bak.tmp"] + \
+                glob.glob(glob.escape(self.path) + ".v*.bak") + \
+                glob.glob(glob.escape(self.path) + ".corrupt-*"):
+            with contextlib.suppress(OSError):
+                os.remove(f)
 
     # ---- reads (own read-only connection each time) ------------------------
     def _reader(self):
@@ -39771,9 +39809,13 @@ class MiniWireshark:
         self.network_fp = ""
         self.network_profile = None
         if self.networks.fresh_install and \
-                os.path.exists(self.config.path):
+                getattr(self.config, "from_version", "").startswith("3."):
             # first 4.0 start on a computer that already ran 3.0: the network
-            # it is on now keeps the Active Scanning the user had chosen
+            # it is on now keeps the Active Scanning the user had chosen.
+            # 5.3.4 (LG-01): decided from the version 3.x wrote in the
+            # settings, not from "a settings file exists": the start-up
+            # warm-up writes one on every new install, so every new install
+            # trusted its first network and started Active Scanning unasked
             self.config.set("general.upgraded_from_3", True)
         self.session_id = int(time.time())
         self.history = self._open_store() \
@@ -49884,10 +49926,22 @@ proc ::mw_retheme {w map fgnew deffg} {
                     "DELETE FROM baselines"))
             self._set_banner("\U0001F9F9  Learned baselines reset.")
 
+    def _session_only_history(self):
+        return self.config.get("history.retention") == "Session only"
+
+    def _forget_session_history(self):
+        """5.3.4 (CO-10): "Session only keeps nothing after you close".
+        Before, the history was kept on close, and never pruned."""
+        if self.history is not None and self._session_only_history():
+            self.history.clear()
+            self.history.flush_now(30.0)
+
     def _open_store(self):
         st = Store(PATHS.history_db, self.session_id,
                    {"source": "live",
                     "iface": getattr(self, "current_iface_label", "")})
+        if self._session_only_history():
+            st.clear()     # 5.3.4 (CO-10): what a crash or kill left behind
         if st.recovered:
             self.root.after(2500, lambda: self._set_banner(
                 "⚠️  " + st.recovered, kind="warn"))
@@ -50275,8 +50329,10 @@ proc ::mw_retheme {w map fgnew deffg} {
                     "packets-%Y%m%d-%H%M%S.pcap"))
                 with contextlib.suppress(OSError, ValueError):
                     self.save_pcap_to(path, self.all_rows)
-            if self.config.get("history.retention") != "Session only":
+            if not self._session_only_history():
                 self.autosave("exit")
+            else:
+                self._forget_session_history()
             with contextlib.suppress(OSError):
                 if os.path.exists(PATHS.journal) and \
                         PATHS.journal != getattr(self, "_journal_found", ""):
@@ -58539,6 +58595,88 @@ def t_store_roundtrip(ctx):
 
 
 @self_test()
+def t_m1b_history_delete_all(ctx):
+    """5.3.4 (LG-13, CO-10): "Delete ALL history" leaves no row and no
+    copy (backup, pre-upgrade backup, -wal); "Session only" history is
+    cleared on close and again at the next open, so a crash keeps nothing
+    either."""
+    path = ctx.path("h.sqlite3")
+    st = Store(path, session_id=7)
+    assert st.write_observations([(1, time.time(), "dns_answer", "aa:bb",
+                                   {"domain": "secret-clinic.example"}, 7)])
+    assert st.flush_now(10)
+    for extra in (".bak", ".v1.bak", ".corrupt-1"):
+        shutil.copyfile(path, path + extra)
+    assert st.clear()
+    assert st.flush_now(30)
+    assert st.counts()["observations"] == 0
+    left = [f for f in os.listdir(os.path.dirname(path))
+            if f.startswith("h.sqlite3") and f not in (
+                "h.sqlite3", "h.sqlite3-wal", "h.sqlite3-shm")]
+    assert left == [], left
+    with contextlib.suppress(OSError):
+        assert os.path.getsize(path + "-wal") == 0
+    with open(path, "rb") as f:
+        assert b"secret-clinic" not in f.read()
+    st.stop(5)
+    # the close, as CO-10's repro drives it: snapshot, then forget
+    cfg = ctx.cfg({"history.enabled": True,
+                   "history.retention": "Session only"})
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(cfg, gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, ScenarioBuilder().home_network(),
+                  decoder=fast_frame_decoder(m), tick_every=500)
+    for dev in m.registry.by_key.values():
+        dev.live = True
+    path = ctx.path("h2.sqlite3")
+    st = Store(path, session_id=8)
+    win = types.SimpleNamespace(history=st, config=cfg, model=m)
+    win._history_pieces = lambda: MiniWireshark._history_pieces(win)
+    win._session_only_history = \
+        lambda: MiniWireshark._session_only_history(win)
+    st.write_observations([(1, time.time(), "dns_answer", "aa:bb",
+                            {"domain": "secret-clinic.example"}, 7)])
+    MiniWireshark._write_history(win)
+    assert st.flush_now(10)
+    assert st.query("SELECT COUNT(*) FROM devices")[0][0] > 0
+    MiniWireshark._forget_session_history(win)
+    st.stop(5)
+    con = sqlite3.connect(path)
+    try:
+        for t in ("devices", "presence", "traffic", "domains",
+                  "observations"):
+            n = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            assert n == 0, (t, n)
+    finally:
+        con.close()
+    assert "_forget_session_history" in inspect.getsource(
+        MiniWireshark._on_close)
+    assert "st.clear()" in inspect.getsource(MiniWireshark._open_store)
+
+
+@self_test()
+def t_m1b_npcap_signature_path(ctx):
+    """5.3.4 (OS-03): the installer's path reaches PowerShell (in
+    MW_SIGNED_FILE, read by the script), not as text after -Command."""
+    seen = {}
+
+    def fake(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw.get("env") or {}
+        return subprocess.CompletedProcess(
+            cmd, 0, "Valid\nCN=Nmap Software LLC, O=Nmap Software LLC\n", "")
+    path = ctx.path("npcap 1.80 (Krystel's).exe")
+    st, who = _authenticode_info(path, run=fake)
+    assert (st, who) == ("Valid", "CN=Nmap Software LLC, O=Nmap Software LLC")
+    assert seen["cmd"][-2] == "-Command" and path not in " ".join(
+        seen["cmd"])
+    assert "$env:MW_SIGNED_FILE" in seen["cmd"][-1]
+    assert seen["env"]["MW_SIGNED_FILE"] == os.path.abspath(path)
+    assert signer_matches(who, "Nmap Software LLC")
+
+
+@self_test()
 def t_store_migrates_v1_file(ctx):
     path = ctx.path("old.sqlite3")
     con = sqlite3.connect(path)
@@ -62820,6 +62958,72 @@ def t_m1a_elevation(ctx):
                     if f.startswith(".elevated-")]
     finally:
         shutil.which, subprocess.call = real_which, real_call
+
+
+@self_test()
+def t_m1b_pin_and_applescript(ctx):
+    """5.3.4 (RT-04): a pinned helper whose certificate changed gets
+    nothing, not even the request line, let alone the password.
+    (RT-07, OS-05): the macOS password prompt never pastes the program's
+    path into AppleScript, so quotes and apostrophes are just text."""
+    import http.client
+    sent = []
+
+    class Sock:
+        @staticmethod
+        def getpeercert(binary_form=False):
+            return b"the attacker's certificate"
+
+    class FakeConn:
+        def __init__(self, *a, **kw):
+            self.sock = None
+
+        def connect(self):
+            self.sock = Sock()
+
+        def request(self, *a, **kw):
+            sent.append((a, kw))
+
+        def close(self):
+            pass
+    real = http.client.HTTPSConnection
+    try:
+        http.client.HTTPSConnection = FakeConn
+        try:
+            connector_http("POST", "https://192.168.1.2/api/auth",
+                           body=b'{"password": "secret"}', pin="ab" * 32)
+            raise AssertionError("a changed certificate was accepted")
+        except ConnectorError as e:
+            assert e.kind == "tls", (e.kind, e)
+    finally:
+        http.client.HTTPSConnection = real
+    assert sent == [], sent
+    path = '/Users/k/Krystel\'s "Mac"/a" & (do shell script "x") & "'
+    cmd = mac_admin_cmd(["/usr/bin/python3", path, "--x"])
+    assert cmd[:7] == ["osascript", "-e", "on run argv", "-e",
+                       "do shell script (item 1 of argv) with "
+                       "administrator privileges", "-e", "end run"]
+    assert len(cmd) == 8 and shlex.split(cmd[7]) == [
+        "/usr/bin/python3", path, "--x"]
+
+
+@self_test()
+def t_m1b_fresh_install_consent(ctx):
+    """5.3.4 (LG-01): only settings written by 3.x count as "upgraded from
+    3.x"; a settings file a new install wrote itself (the warm-up does
+    that before the window opens) does not."""
+    for ver, want in (("", False), ("5.2.3", False), ("4.0.0", False),
+                      ("3.0.0", True)):
+        path = ctx.path(f"lg01-{ver or 'new'}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"general": {"welcome_version": ver},
+                       "performance": {"calibrated": 1}}, f)
+        c = AppConfig(path=path)
+        assert c.from_version.startswith("3.") is want, ver
+        c.set("general.welcome_version", SCRIPT_VERSION)
+        c.save()
+        assert c.from_version == ver
+    assert AppConfig(path=ctx.path("lg01-none.json")).from_version == ""
 
 
 @self_test(needs_source=True)
