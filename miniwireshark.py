@@ -56073,7 +56073,9 @@ class DeepAnalyzer:
                 f.append((no, ts, "warn", "Security",
                           "Overlapping IP fragments with different "
                           "content", "ip.frag_offset"))
-        elif d.get("tcp.srcport") is not None and src:
+        elif d.get("tcp.srcport") is not None and src and \
+                d.get("tcp.seq_raw") is not None and \
+                d.get("tcp.flags") is not None:      # S4: cut-off header
             tcpn = next(n for n in d.nodes if n.key == "tcp")
             hl = d.get("tcp.hdr_len") or 20
             key = TcpReassembler.stream_key(src, d.get("tcp.srcport"), dst,
