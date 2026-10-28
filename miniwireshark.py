@@ -147,6 +147,18 @@ ELEV_FLAG_ARG = "--mw-elev-flag="
 
 IS_WINDOWS = platform.system() == "Windows"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # B-45
+
+
+def _run_hidden(cmd, **kw):
+    """subprocess.run that never flashes a console window on Windows
+    (5.3.4, C-03); the S8 self-test keeps every call on it or a helper."""
+    kw.setdefault("creationflags", NO_WINDOW)
+    return subprocess.run(cmd, **kw)
+
+
+def _popen_hidden(cmd, **kw):
+    kw.setdefault("creationflags", NO_WINDOW)
+    return subprocess.Popen(cmd, **kw)
 IS_MAC = platform.system() == "Darwin"
 
 try:
@@ -2564,7 +2576,7 @@ def _install_npcap(loader, state):
                     None)
     try:
         try:
-            code = subprocess.run([exe, "/winpcap_mode=yes"],
+            code = _run_hidden([exe, "/winpcap_mode=yes"],
                                   timeout=1200).returncode
         except OSError as e:
             if getattr(e, "winerror", None) != 740:
@@ -4183,9 +4195,8 @@ class RuntimeManager:
                     have = 0                       # server ignored Range
                 total = int(r.headers.get("Content-Length") or 0) + have
                 total = total or size_hint
-                mode = "ab" if have else "wb"
                 got = have
-                with open(part, mode) as f:
+                with open(part, "ab" if have else "wb") as f:
                     while True:
                         if cancel():
                             raise RuntimeError_("cancelled")
@@ -13428,11 +13439,12 @@ def current_ssid():
         cmds.append((["netsh", "wlan", "show", "interfaces"],
                      r"^\s*SSID\s*:\s*(.+)$"))
     elif IS_MAC:
-        cmds.append((["/System/Library/PrivateFrameworks/Apple80211."
-                      "framework/Versions/Current/Resources/airport", "-I"],
-                     r"^\s*SSID:\s*(.+)$"))
-        cmds.append((["networksetup", "-getairportnetwork", "en0"],
-                     r"Current Wi-Fi Network:\s*(.+)$"))
+        # 5.3.4 (OS-13): the `airport` tool is gone since macOS 14.4 and
+        # en0 is the cable port on desktop Macs: ask for the Wi-Fi port
+        for dev in mac_wifi_devices(_run_text(
+                ["networksetup", "-listallhardwareports"])) or ["en0"]:
+            cmds.append((["networksetup", "-getairportnetwork", dev],
+                         r"Current Wi-Fi Network:\s*(.+)$"))
     else:
         cmds.append((["iwgetid", "-r"], r"^(.+)$"))
         # --rescan no: reading the name must not make the Wi-Fi card send
@@ -13446,9 +13458,38 @@ def current_ssid():
             continue
         for line in (r.stdout or "").splitlines():
             m = re.match(pat, line.strip() if pat.startswith("^(") else line)
-            if m and m.group(1).strip() and "BSSID" not in line:
+            if m and m.group(1).strip() and "BSSID" not in line \
+                    and not mac_ssid_hidden(m.group(1)):
                 return sanitize_text(m.group(1).strip(), 64)
     return ""
+
+
+def _run_text(cmd, timeout=6):
+    try:
+        return run_console(cmd, timeout=timeout).stdout or ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def mac_wifi_devices(text):
+    """Wi-Fi device names (en1, ...) from `networksetup
+    -listallhardwareports`."""
+    out, port = [], ""
+    for line in (text or "").splitlines():
+        k, _s, v = line.partition(":")
+        k, v = k.strip().lower(), v.strip()
+        if k == "hardware port":
+            port = v.lower()
+        elif k == "device" and port in ("wi-fi", "airport") and v:
+            out.append(v)
+    return out
+
+
+def mac_ssid_hidden(name):
+    """macOS 14+ answers '<redacted>' (no Location permission) instead of
+    the network name; that is not a name."""
+    n = (name or "").strip().lower()
+    return n in ("<redacted>", "redacted") or n.startswith("you are not")
 
 
 def os_neighbor_mac(ip):
@@ -15181,6 +15222,10 @@ WIFI_LOCATION_NOTE = ("Windows hides Wi-Fi details (signal, channel, "
                       "network name) unless Location is allowed for apps. "
                       "MiniWireshark never turns Location on or asks for it.")
 
+MAC_WIFI_NOTE = ("macOS hides the Wi-Fi network name unless Location is "
+                 "allowed for this app. MiniWireshark never asks for it.")
+
+
 
 def netsh_location_hidden(text):
     t = (text or "").lower()
@@ -15222,8 +15267,13 @@ class WifiProbe:
             return None if self.hidden else parse_netsh_wlan(
                 text, desc or iface)
         if sys.platform == "darwin":
-            return parse_macos_airport(self._cmd(
+            got = parse_macos_airport(self._cmd(
                 ["system_profiler", "SPAirPortDataType"], 30))
+            self.hidden = MAC_WIFI_NOTE if got and mac_ssid_hidden(
+                got["ssid"]) else ""
+            if self.hidden:
+                got["ssid"] = ""
+            return got
         names = [iface] if iface and os.path.isdir(
             f"/sys/class/net/{iface}/wireless") else [
             n for n in sorted(os.listdir("/sys/class/net"))
@@ -25207,7 +25257,7 @@ def install_layout_hooks():
     _ORIG_PACK["info"] = tk.Pack.pack_info
     _ORIG_PLACE = tk.Place.place_configure
 
-    def pack_configure(self, cnf={}, **kw):
+    def pack_configure(self, cnf=None, **kw):
         kw = dict(tk._cnfmerge((cnf, kw))) if cnf else kw
         fl = _flow_of(self, kw)
         if fl is not None and kw.get("side", "left") in ("left", "right"):
@@ -52092,7 +52142,7 @@ class CrashDialog:
             cls._open = False
             app._on_close()
             try:
-                subprocess.Popen(args)
+                _popen_hidden(args)
             except OSError as e:
                 LOG.error("restart failed: %s", e)
         ttk.Button(bar, text="Continue", style="Accent.TButton",
@@ -56095,7 +56145,7 @@ def deep_worker_main(inp=None, out=None):
         # anything a library prints from now on goes to stderr, never into
         # the binary result stream
         sys.stdout = sys.stderr if sys.stderr is not None else \
-            open(os.devnull, "w")
+            open(os.devnull, "w", encoding="utf-8")
     an = DeepAnalyzer()
     _wire_send(out, ("ready", SCRIPT_VERSION, os.getpid()))
     while True:
@@ -59633,6 +59683,72 @@ def t_os07_second_copy_keeps_off_the_journal(ctx):
     assert got and got != path and not os.path.exists(path), got
 
 
+@self_test(needs_source=True)
+def t_s8_static_checks(ctx):
+    """5.3.4 (S8, C-03, C-05): outside the tests, text open() names an
+    encoding, Windows-reachable subprocess calls hide the console window,
+    no datetime.utcnow and no mutable default arguments."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    # functions that only run on macOS or Linux (no console to flash)
+    posix_only = {"_relaunch_elevated", "system_theme", "system_dns_servers",
+                  "read_arp_cache", "set", "get", "delete", "_open_path",
+                  "grab_window"}
+    calls = {"run", "Popen", "call", "check_output", "check_call"}
+    bad = []
+
+    def is_test(fn):
+        return fn.name.startswith(("t_", "test_", "gt_")) or any(
+            "self_test" in ast.unparse(d) for d in fn.decorator_list)
+
+    def walk(node, fn, in_test):
+        for ch in ast.iter_child_nodes(node):
+            f2, t2 = fn, in_test
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                f2, t2 = ch.name, in_test or is_test(ch) or \
+                    ch.name == "run_self_tests"
+                for d in ch.args.defaults + ch.args.kw_defaults:
+                    if isinstance(d, (ast.List, ast.Dict, ast.Set)):
+                        bad.append(f"L{ch.lineno} {ch.name}: mutable default")
+            if isinstance(ch, ast.Call) and not t2:
+                name = ast.unparse(ch.func)
+                kws = {k.arg for k in ch.keywords}
+                if name.endswith("utcnow"):
+                    bad.append(f"L{ch.lineno}: datetime.utcnow")
+                if name.startswith("subprocess.") and name.split(".")[1] in \
+                        calls and not kws & {"creationflags", None} \
+                        and f2 not in posix_only:
+                    bad.append(f"L{ch.lineno} {f2}: {name} shows a console")
+                if name == "open" and "encoding" not in kws:
+                    mode = ch.args[1] if len(ch.args) > 1 else next(
+                        (k.value for k in ch.keywords if k.arg == "mode"),
+                        None)
+                    text = (ast.unparse(mode) if mode is not None else "'r'")
+                    if "b" not in text:
+                        bad.append(f"L{ch.lineno} {f2}: text open() "
+                                   f"without encoding")
+            walk(ch, f2, t2)
+    walk(tree, "", False)
+    assert not bad, bad[:10]
+
+
+@self_test()
+def t_os13_mac_wifi_port(ctx):
+    """5.3.4 (OS-13): the Wi-Fi port is found by name, not assumed to be
+    en0, and macOS's '<redacted>' is never shown as a network name."""
+    ports = ("Hardware Port: Ethernet\nDevice: en0\nEthernet Address: x\n\n"
+             "Hardware Port: Wi-Fi\nDevice: en1\nEthernet Address: y\n")
+    assert mac_wifi_devices(ports) == ["en1"]
+    assert mac_wifi_devices("") == []
+    assert mac_ssid_hidden("<redacted>") and mac_ssid_hidden(
+        "You are not associated with an AirPort network.")
+    assert not mac_ssid_hidden("Home")
+    src = inspect.getsource(current_ssid)
+    assert "Apple80211" not in src and '"en0"]' not in src.replace(
+        'or ["en0"]', "")
+
+
 @self_test()
 def t_co12_bad_session_values(ctx):
     """5.3.4 (CO-12): one wrong-typed value anywhere in a session file
@@ -59768,13 +59884,13 @@ def bench_components():
             if is_public_ip(ip):
                 return ip
     feodo = os.path.join(tmp, "feodo.txt")
-    with open(feodo, "w") as f:
+    with open(feodo, "w", encoding="utf-8") as f:
         f.write("################\n# abuse.ch Feodo Tracker\n"
                 "# Last updated: 2026-10-19 00:00:00 UTC\n#\n")
         for _ in range(1000):
             f.write(pub_ip() + "\n")
     drop = os.path.join(tmp, "drop.json")
-    with open(drop, "w") as f:
+    with open(drop, "w", encoding="utf-8") as f:
         seen = set()
         while len(seen) < 1500:
             net = ipaddress.ip_network(pub_ip() + "/" +
@@ -63821,7 +63937,7 @@ class _NoCopyHere(Exception):
 def _cached_run(script, pyc, key):
     """Run CACHED_RUN on `script` with this copy and key -> its output."""
     env = dict(os.environ, MW_PYC=pyc, MW_KEY=key)
-    r = subprocess.run([sys.executable, "-c", CACHED_RUN, script],
+    r = _run_hidden([sys.executable, "-c", CACHED_RUN, script],
                        capture_output=True, env=env, timeout=60)
     return r.stdout.decode().strip()
 
@@ -64706,7 +64822,7 @@ def bench_capture(devices, flows, sites):
 def _rss_mb():
     """Resident memory of this process in MB (0 when unknown)."""
     with contextlib.suppress(OSError, ValueError):
-        with open("/proc/self/status") as f:
+        with open("/proc/self/status", encoding="utf-8") as f:
             for line in f:
                 if line.startswith("VmRSS"):
                     return int(line.split()[1]) / 1024
@@ -65044,7 +65160,7 @@ def bench_gui(argv):
         env["MINIWIRESHARK_DATA"] = tempfile.mkdtemp(prefix="mw_benchdata_")
         t0 = time.time()
         try:
-            rc = subprocess.run(self_cmd("--bench-gui",
+            rc = _run_hidden(self_cmd("--bench-gui",
                                          "--child", sid, "--out", part,
                                          "--pcap", captures[size]), env=env,
                                 timeout=3600).returncode
@@ -66276,7 +66392,7 @@ def _gs_components(app, ctx):
     # a source installed by hand behaves like a download
     r = app.data.resource("feodo")
     tmp = ctx.path("feodo-gui.txt")
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         f.write(FEODO_SAMPLE)
     app.data._install_file(r, tmp, "2 listed addresses", "test")
     app.data.set_enabled("feodo", True)
@@ -68782,7 +68898,7 @@ def gt_rc11_warm_start(app, ctx):
     env.pop("MW_FEATURES_OFF", None)
     outs = []
     for _ in range(2):
-        r = subprocess.run(self_cmd(), env=env,
+        r = _run_hidden(self_cmd(), env=env,
                            capture_output=True, text=True, timeout=180)
         line = next((x for x in r.stdout.splitlines()
                      if x.startswith("START_OK")), "")
