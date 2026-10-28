@@ -92,11 +92,11 @@ Thresholds that compare against "normal" wait for a baseline first, so a fresh s
 - No telemetry. Every send goes through `outbound()` and is listed in the self-traffic ledger.
 - A **kill switch** blocks everything MiniWireshark itself would send.
 - A **privacy posture** report lists what is on and what it sends.
-- Redaction replaces real names and addresses with documentation-range pseudonyms in reports and shared screenshots.
+- Redaction replaces real names and addresses with documentation-range pseudonyms in reports and exports.
 
 ## Looking after itself
 
-- Installs its own packages into a private folder, never the system Python. Downloads are checked against pinned SHA-256 fingerprints.
+- Installs its own packages into a private folder, never the system Python. The packages it needs to start, and the private runtime's packages, are checked against pinned SHA-256 fingerprints. Optional components (psutil, cryptography) come from PyPI over verified HTTPS through pip, without a pin.
 - Optional private Python runtime, so it works even when your Python is unusual.
 - Offers to install Npcap on Windows, picks the best network card, and restarts a capture that dies.
 - **Repair MiniWireshark:** one click fixes missing components, damaged lists or history, a broken settings file and a stuck capture.

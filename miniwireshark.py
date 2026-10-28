@@ -2088,7 +2088,10 @@ class PrivatePackages:
 
     def pip_command(self, specs, target):
         """The pip command line (never --user, never into the system)."""
-        base = ["install", "--target", target, "--only-binary=:all:",
+        # 5.3.4 (LG-05): --isolated, so a pip.conf or PIP_INDEX_URL can't
+        # send the request to another index than the one the ledger names
+        base = ["install", "--isolated", "--target", target,
+                "--only-binary=:all:",
                 "--no-input", "--disable-pip-version-check",
                 "--no-warn-script-location", "--upgrade"] + list(specs)
         if self._has_pip():
@@ -2466,6 +2469,11 @@ def _install_npcap(loader, state):
             shutil.copyfileobj(r, f)
         if os.path.getsize(exe) < 200_000:
             raise OSError("downloaded file is too small")
+    except OutboundBlocked as e:
+        # 5.3.4 (LG-06): the kill switch covers the browser too
+        shutil.rmtree(os.path.dirname(exe), ignore_errors=True)
+        return False, (f"The capture driver was not downloaded ({e}). "
+                       f"To install it yourself: https://npcap.com/#download")
     except (OSError, urllib.error.URLError) as e:
         try:
             import webbrowser
@@ -2894,21 +2902,10 @@ class LoaderWindow(tk.Frame):
             ttk.Button(row, text="Start without live capture",
                        command=lambda: answer("without")).pack(
                 side="left", padx=8)
-            left = {"n": int(kw.get("wait", PREFLIGHT_WAIT_S))}
-            cd = tk.Label(row, text="", bg=self.card_bg, fg=self.muted)
-            cd.pack(side="right")
-
-            def tick():
-                if box[0] is not None or ev.is_set():
-                    return
-                if left["n"] <= 0:
-                    answer("continue")
-                    return
-                with contextlib.suppress(tk.TclError):
-                    cd.configure(text=f"Continuing in {left['n']} s")
-                left["n"] -= 1
-                self.after(1000, tick)
-            tick()
+            # 5.3.4 (LG-12): no countdown. Waiting is not a yes; nothing is
+            # downloaded until a button is pressed
+            tk.Label(row, text="Waiting for your choice", bg=self.card_bg,
+                     fg=self.muted).pack(side="right")
             go.focus_set()
             self.preflight_card = f
         elif kind == "error":
@@ -3385,6 +3382,32 @@ def open_main_window(root, loader, cfg, ident, action, welcomed=False):
     return app
 
 
+_CRED_RES = (
+    # a request line's query string (GET /login?user=a&password=b HTTP/1.1)
+    (re.compile(r"\b([A-Z]{3,7} [^\s?]*)\?\S*( (?:HTTP|RTSP)/\d\.\d)"),
+     r"\1?(query hidden)\2"),
+    # a URL parameter that names a secret, anywhere
+    (re.compile(r"(?i)([?&;](?:pass(?:word|wd)?|pwd|token|access_token|"
+                r"api_?key|key|secret|auth|session|sid|code)=)[^&\s\"'<>]*"),
+     r"\1(hidden)"),
+    # credential headers, on their own line or inline
+    (re.compile(r"(?i)\b((?:proxy-)?authorization|cookie|set-cookie)"
+                r"\s*:[^\r\n]*"), r"\1: (hidden)"),
+    # user:password@ in a URL
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"),
+     r"\1(hidden)@"))
+
+
+def hide_credentials(text):
+    """5.3.4 (LG-03): what the streams view already hides (query strings,
+    login headers, passwords in URLs) is hidden in the packet info text,
+    CSV files and everything copied to the clipboard too."""
+    text = str(text)
+    for rx, sub in _CRED_RES:
+        text = rx.sub(sub, text)
+    return text
+
+
 def mask_sensitive(text):
     """Mask IPv4/IPv6 and MAC addresses in shareable text (debug bundles,
     copied details). Keeps the first part so different addresses stay
@@ -3434,7 +3457,6 @@ def step_tkinter(l, state):
 
 # ---- the pre-flight card: what will be downloaded, before the first byte ------
 SKIP_DOWNLOADS = [False]
-PREFLIGHT_WAIT_S = 10
 
 
 def preflight_items(state):
@@ -3473,12 +3495,19 @@ def preflight_unattended():
 
 
 def step_preflight(l, state):
-    """Before the first byte: list each download and let the person
-    choose; continues by itself after 10 s (a countdown is shown), at once
-    with --yes or an unattended start."""
+    """Before the first byte: list each download and wait for the person
+    to choose (5.3.4, LG-12: it used to continue by itself after 10 s);
+    at once with --yes or an unattended start. Demo Mode downloads
+    nothing."""
     items = preflight_items(state)
     if not items:
         return True, ""
+    if START_IN_DEMO:
+        SKIP_DOWNLOADS[0] = True
+        CAPTURE_LIMITED[0] = ("Demo Mode: nothing was downloaded. Start "
+                              "MiniWireshark normally to set up live "
+                              "capture.")
+        return True, "Demo Mode: nothing is downloaded."
     for it in items:
         l.post_log(f"  To download: {it['name']} {it['version']} "
                    f"({it['size']}) from {it['host']}, {it['check']} → "
@@ -3486,7 +3515,7 @@ def step_preflight(l, state):
                                        else ""), "detail")
     if preflight_unattended():
         return True, "Downloading what is missing (unattended start)."
-    answer = l.ask("preflight", items=items, wait=PREFLIGHT_WAIT_S)
+    answer = l.ask("preflight", items=items)
     if answer == "without":
         SKIP_DOWNLOADS[0] = True
         CAPTURE_LIMITED[0] = ("You chose to start without live capture; "
@@ -3929,6 +3958,9 @@ class RuntimeError_(Exception):
 
 # Friendly error taxonomy (shown by the installer and the Repair report)
 RUNTIME_ERRORS = {
+    "refused": ("Not downloaded: the kill switch is on",
+                "Nothing left this computer. Turn the kill switch off "
+                "(Settings → Privacy) to download, then try again."),
     "offline": ("No Internet connection",
                 "Check that this computer is online, then try again. "
                 "MiniWireshark keeps working on your current Python "
@@ -4316,8 +4348,15 @@ class RuntimeManager:
         with open(req, "w", encoding="utf-8") as f:
             f.write(req_text)
         if not offline_only:
+            # 5.3.4 (LG-04): pip's own download goes through the gate (the
+            # kill switch and the ledger) like every other request
+            try:
+                outbound("runtime", "https", "files.pythonhosted.org",
+                         "pip download (pinned components)")
+            except OutboundBlocked as e:
+                raise RuntimeError_("refused", str(e))
             prog("Packages", 0.1, "Downloading verified components…", {})
-            rc, out = self._run([exe, "-m", "pip", "download",
+            rc, out = self._run([exe, "-m", "pip", "download", "--isolated",
                                  "--require-hashes", "--only-binary=:all:",
                                  "--no-deps", "-d", self.wheels, "-r", req],
                                 900, cancel)
@@ -4598,9 +4637,17 @@ class RuntimeManager:
         prog("Packages", 0.2, "Updating pip from the copy bundled with "
              "Python…", {})
         self._run([exe, "-m", "ensurepip", "--upgrade"], 300, cancel)
+        try:
+            outbound("runtime", "https", "pypi.org", "newest pip")
+        except OutboundBlocked as e:
+            self._log(f"pip not updated online: {e}")
+            new = self.components(exe).get("pip", "")
+            prog("Packages", 1.0, f"pip {new or '?'} (bundled copy)", {})
+            return old, new
         prog("Packages", 0.6, "Asking PyPI for the newest pip…", {})
-        rc, out = self._run([exe, "-m", "pip", "install", "--upgrade",
-                             "--only-binary=:all:", "pip"], 300, cancel)
+        rc, out = self._run([exe, "-m", "pip", "install", "--isolated",
+                             "--upgrade", "--only-binary=:all:", "pip"],
+                            300, cancel)
         if rc != 0:
             self._log("pip could not be updated online (kept the bundled "
                       "version)")
@@ -5923,8 +5970,12 @@ class DataManager:
                     "file": r.filename, "sha256": sha256_file(path),
                     "fetched": meta.get("fetched", 0),
                     "source": meta.get("source", r.url),
-                    "summary": meta.get("summary", "")}
+                    "summary": meta.get("summary", ""),
+                    "publisher": r.publisher, "license": r.license}
             zf.writestr(self.PACK_MANIFEST, json.dumps(man, indent=1))
+            # 5.3.4 (LG-14): the licence and source of each list travel
+            # with it (GPL-3.0 §4, MPL-2.0 §3.2)
+            zf.writestr("NOTICE.txt", pack_notice(man["files"]))
         os.replace(tmp, dest)
         return sorted(man["files"]), skipped
 
@@ -6855,11 +6906,9 @@ def local_subnet_for(iface, my_ip):
                 continue
     except Exception:
         pass
-    try:
-        a, b, c, _d = my_ip.split(".")
-        return ipaddress.ip_network(f"{a}.{b}.{c}.0/24", strict=False)
-    except Exception:
-        return None
+    # 5.3.4 (LG-08): no "/24" guess: on a /28 hotel or a /30 link it swept
+    # addresses outside your network. Unknown subnet, no ARP sweep
+    return None
 
 
 _UNSAFE_TEXT = re.compile(
@@ -8092,7 +8141,8 @@ def _decode_tcp_payload(d, load, reasm):
                 d["text"] = f"Proxy tunnel request: {line[:100]}"
                 d["encrypted"] = "unknown"
             else:
-                d["text"] = f"Unsecured web request: {line[:110]}"
+                d["text"] = "Unsecured web request: " + \
+                    hide_credentials(line)[:110]
                 if host:
                     d["text"] += f"  (Host: {host})"
                 d["encrypted"] = "no"
@@ -9812,11 +9862,14 @@ class LanScanner(threading.Thread):
     packet — this thread only sends, it never needs to listen itself.
     """
 
-    def __init__(self, iface, my_ip):
+    def __init__(self, iface, my_ip, allowed=None):
         super().__init__(daemon=True, name="lan-discovery")
         self.iface = iface
         self.my_ip = my_ip
         self.stop_flag = False
+        # 5.3.4 (LG-08): asked before every sweep (the network may have
+        # changed under a running capture)
+        self.allowed = allowed or (lambda: True)
         self.subnet = local_subnet_for(iface, my_ip) if my_ip else None
         self.sweeps = 0
         self.last_sweep = 0.0
@@ -9848,6 +9901,8 @@ class LanScanner(threading.Thread):
                 waited += 0.2
 
     def _sweep(self):
+        if not self.allowed():
+            return
         self.sweeps += 1
         self.last_sweep = time.time()
         self._arp_sweep()
@@ -13280,8 +13335,10 @@ def current_ssid():
                      r"Current Wi-Fi Network:\s*(.+)$"))
     else:
         cmds.append((["iwgetid", "-r"], r"^(.+)$"))
-        cmds.append((["nmcli", "-t", "-f", "active,ssid", "dev", "wifi"],
-                     r"^yes:(.+)$"))
+        # --rescan no: reading the name must not make the Wi-Fi card send
+        # probe requests (nmcli rescans by default when its list is old)
+        cmds.append((["nmcli", "-t", "-f", "active,ssid", "dev", "wifi",
+                      "list", "--rescan", "no"], r"^yes:(.+)$"))
     for cmd, pat in cmds:
         try:
             r = run_console(cmd, timeout=6)
@@ -29184,6 +29241,8 @@ class _SafeCsv:
 
     @classmethod
     def cell(cls, v):
+        if isinstance(v, str):
+            v = hide_credentials(v)
         if isinstance(v, str) and v.startswith(cls.BAD):
             return "'" + v
         return v
@@ -29197,6 +29256,7 @@ def safe_csv_writer(f):
 
 
 def copy_to_clipboard(app, text):
+    text = hide_credentials(scrub_secrets(text))
     try:
         app.root.clipboard_clear()
         app.root.clipboard_append(text)
@@ -29677,7 +29737,7 @@ class Charts:
             head = [translate_text(h) for h in r["header"]]
             if csv_:
                 buf = io.StringIO()
-                wr = csv.writer(buf)
+                wr = safe_csv_writer(buf)       # 5.3.4 (RT-03)
                 wr.writerow([title] + ([r["note"]] if r["note"] else []))
                 wr.writerow(head)
                 for row in r["rows"]:
@@ -29702,7 +29762,7 @@ class Charts:
         def copy(csv_):
             with contextlib.suppress(tk.TclError):
                 c.clipboard_clear()
-                c.clipboard_append(cls.chart_text(c, csv_))
+                c.clipboard_append(hide_credentials(cls.chart_text(c, csv_)))
         m = tk.Menu(c, tearoff=0)
         m.add_command(label=translate_text("Copy chart data as text"),
                       command=lambda: copy(False))
@@ -37204,7 +37264,23 @@ class FollowResult:
 
     def sensitive(self):
         return bool({self.client[1], self.server[1]} &
-                    STREAM_SENSITIVE_PORTS)
+                    STREAM_SENSITIVE_PORTS) or self.kind() == "web"
+
+    def kind(self):
+        """How a redacted copy treats this stream (5.3.4, LG-02): "mail"
+        and "ftp" line by line, "web" (HTTP, RTSP, SIP: found by content,
+        whatever the port) with headers checked and request bodies hidden,
+        "opaque" (telnet, MQTT, anything else) with everything the client
+        sent hidden."""
+        ports = {self.client[1], self.server[1]}
+        if ports & {25, 587, 110, 143, 2525}:
+            return "mail"
+        if 21 in ports:
+            return "ftp"
+        first = next((c[2] for c in self.chunks if c[0] == 0 and c[2]), b"")
+        if _WEB_REQUEST.match(first or b""):
+            return "web"
+        return "opaque"
 
 
 def follow_stream(rows, flow_id):
@@ -37313,6 +37389,50 @@ class _SubView:
 
 STREAM_DIRECTIONS = ("Both directions", "Client → server",
                      "Server → client")
+_WEB_REQUEST = re.compile(
+    rb"^(?:GET|POST|HEAD|PUT|DELETE|OPTIONS|PATCH|CONNECT|DESCRIBE|SETUP|"
+    rb"PLAY|PAUSE|TEARDOWN|ANNOUNCE|RECORD|GET_PARAMETER|SET_PARAMETER|"
+    rb"REGISTER|INVITE|ACK|BYE|CANCEL|SUBSCRIBE|NOTIFY|MESSAGE) \S+ "
+    rb"(?:HTTP|RTSP|SIP)/\d\.\d\r?$", re.M)
+
+
+def _merged_chunks(chunks, want):
+    """Consecutive pieces from the same side joined, so a header split
+    over two TCP segments is redacted as one line."""
+    out = []
+    for d, off, data, no in chunks:
+        if want is not None and d != want:
+            continue
+        if data is not None and out and out[-1][2] is not None and \
+                out[-1][0] == d:
+            out[-1] = (d, out[-1][1], out[-1][2] + data, out[-1][3])
+        else:
+            out.append((d, off, data, no))
+    return out
+
+
+def redact_stream_piece(d, data, res, kind):
+    """One side's joined bytes, redacted for a saved or shown stream."""
+    if kind == "opaque" and d == 0:
+        return f"(what the client sent is hidden: {len(data)} bytes)\n"
+    out, body = [], 0
+    for line in data.splitlines(True):
+        clean = line.rstrip(b"\r\n")
+        if kind == "web" and d == 0:
+            if body and not _WEB_REQUEST.match(clean):
+                body += len(line)
+                continue
+            if body > 1:
+                out.append(f"(request body hidden: {body - 1} bytes)\n")
+            body = 0
+            if not clean and out:
+                body = 1                 # the blank line ends the headers
+                out.append("\n")
+                continue
+        out.append(redact_stream_line(line, res) + "\n")
+    if body > 1:
+        out.append(f"(request body hidden: {body - 1} bytes)\n")
+    return "".join(out)
 
 
 def stream_segments(res, redact=True, hexmode=False,
@@ -37323,7 +37443,9 @@ def stream_segments(res, redact=True, hexmode=False,
     redacted in Hex too (5.0.0 showed the raw bytes there)."""
     out = []
     want = {"Client → server": 0, "Server → client": 1}.get(direction)
-    for d, off, data, no in res.chunks:
+    kind = res.kind() if redact else ""
+    for d, off, data, no in (_merged_chunks(res.chunks, want) if redact
+                             else res.chunks):
         if want is not None and d != want:
             continue
         if data is None:
@@ -37332,8 +37454,7 @@ def stream_segments(res, redact=True, hexmode=False,
                         f" side were never captured …]\n", "gap", None))
             continue
         if redact:
-            body = "".join(redact_stream_line(line, res) + "\n"
-                           for line in data.splitlines(True))
+            body = redact_stream_piece(d, data, res, kind)
             if hexmode:
                 body = hex_dump_lines(body.encode("utf-8")) + "\n"
         elif hexmode:
@@ -37351,7 +37472,8 @@ def stream_text(res, redact=True, hexmode=False,
     """The followed stream as plain text, with a short header."""
     c, sv = res.client, res.server
     head = (f"{res.transport} stream {c[0]}:{c[1]} ↔ {sv[0]}:{sv[1]} · "
-            f"{direction}" + (" · redacted (mail, web or login protocol)"
+            f"{direction}" + (" · redacted (logins, request bodies and "
+                              "what a login client typed are hidden)"
                               if redact and res.sensitive() else "") +
             "\n" + "=" * 72 + "\n")
     return head + "".join(t for t, _k, _n in stream_segments(
@@ -40870,6 +40992,12 @@ class MiniWireshark:
             auto_flow(root or self.root)
             protect_bottom(root or self.root)
 
+    def open_about(self):
+        """5.3.4 (LG-15): version, licence and the trademark notice, inside
+        the program (a single .py file travels without the README)."""
+        messagebox.showinfo(tr("About MiniWireshark"), about_text(),
+                            parent=self.root)
+
     def _open_help_menu(self):
         menu = themed_menu(self)
         menu.add_command(label="Quick Start Guide",
@@ -40905,6 +41033,9 @@ class MiniWireshark:
                          command=lambda: self._check_for_updates(True))
         menu.add_command(label="Open data folder",
                          command=lambda: _open_path(PATHS.data))
+        menu.add_separator()
+        menu.add_command(label="About MiniWireshark",
+                         command=self.open_about)
         try:
             menu.tk_popup(self.btn_help_w.winfo_rootx(),
                           self.btn_help_w.winfo_rooty() +
@@ -41318,6 +41449,8 @@ class MiniWireshark:
                 attempt + 1))
             return
         fp = network_fingerprint(router_mac or "unknown", subnet)
+        self._roam_pending = False
+        self._net_signature = ((router_mac or "").lower(), ssid or "")
         first_ever = self.networks.fresh_install and \
             not self.networks.data["networks"]
         prof, new = self.networks.seen(fp, router_mac, subnet, ssid)
@@ -44743,11 +44876,12 @@ proc ::mw_retheme {w map fgnew deffg} {
     def on_rows_analysed(self, rows):
         """Called by the analysis worker (holding the gate) per slice."""
         if self.rdns is not None and self.data_mode == "live" and \
-                self.active_mode():
+                self.active_mode() and not self.model.vpn.get("iface"):
             cache = self.model.cache
             for d in rows:
                 for ip in (d["src_ip"], d["dst_ip"]):
-                    if ip and not cache.get(ip) and is_private_ip(ip):
+                    if ip and not cache.get(ip) and \
+                            rdns_in_scope(ip, self.model.local_nets):
                         self.rdns.lookup(ip)
         pr = self.packet_ring
         if pr is not None and self.data_mode == "live":
@@ -44913,8 +45047,48 @@ proc ::mw_retheme {w map fgnew deffg} {
             my_ip = next(iter(self.real_identity[1]))
         if iface_obj is not None and is_vpn_iface(iface_obj):
             return                       # never probe through a tunnel
-        self.lan_scanner = LanScanner(iface_obj, my_ip)
+        self.lan_scanner = LanScanner(iface_obj, my_ip,
+                                     allowed=self._scan_still_allowed)
         self.lan_scanner.start()
+
+    def _scan_still_allowed(self):
+        """From the scanner's thread: still live, still trusted, and the
+        network still the one that was trusted."""
+        return self.data_mode == "live" and self.active_mode() and \
+            not getattr(self, "_roam_pending", False)
+
+    def _network_signature(self):
+        """What identified the network: the router's MAC and the Wi-Fi
+        name, as seen now."""
+        reg = self.model.registry
+        gw = self.model.gateway_ip
+        gdev = reg.by_key.get(reg.ip_to_key.get(gw, "")) if gw else None
+        w = self.wifi.last or {}
+        return ((gdev.mac if gdev is not None else "") or "",
+                w.get("ssid") or "")
+
+    def _check_roam(self, now=None):
+        """5.3.4 (LG-08): the network is identified again when the router
+        or the Wi-Fi name changes under a running capture (a laptop
+        carried from home to a café keeps its capture), and scanning
+        stops until the new network is known. -> True when it changed."""
+        now = time.time() if now is None else now
+        sig = self._network_signature()
+        known = getattr(self, "_net_signature", None)
+        if known is None or not self.network_fp:
+            self._net_signature = sig
+            return False
+        changed = (sig[0] and known[0] and sig[0] != known[0]) or \
+            (sig[1] and known[1] and sig[1] != known[1])
+        if not changed or now - getattr(self, "_roam_at", 0.0) < 30:
+            return False
+        self._roam_at = now
+        self._net_signature = sig
+        self._roam_pending = True
+        self._stop_lan_scanner()
+        LOG.info("network changed under the capture: identifying it again")
+        self._identify_network_async()
+        return True
 
     def _stop_capture_only(self):
         self._capture_token += 1            # cancels a start under way
@@ -46242,6 +46416,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         and note roaming and a signal turning weak on the timeline."""
         if self.data_mode != "live":
             return
+        self._check_roam()
         obj = self.iface_map.get(self.current_iface_label) \
             if self.current_iface_label else None
         self.wifi.refresh(iface_name(obj), iface_desc(obj))
@@ -58998,6 +59173,120 @@ def t_co01_co02_router_impersonation(ctx):
 
 
 @self_test()
+def t_lg03_credentials_hidden_on_the_way_out(ctx):
+    """5.3.4 (LG-03, RT-03): a password in a URL, a query string or an
+    Authorization header never reaches the info text, a CSV file or the
+    clipboard; CSV cells still can't start a formula."""
+    canary = "LGCANARYpw9"
+    for text in (f"GET /login?user=alex&password={canary}&token={canary} "
+                 f"HTTP/1.1",
+                 f"Unsecured web request: POST /a?pwd={canary} HTTP/1.0",
+                 f"Authorization: Basic {canary}==",
+                 f"Host: x\r\nCookie: sid={canary}\r\n",
+                 f"see http://alex:{canary}@cam.local/live",
+                 f"https://x.example/cb?code={canary}&state=1",
+                 f"DESCRIBE rtsp://cam/s?token={canary} RTSP/1.0"):
+        out = hide_credentials(text)
+        assert canary not in out, out
+    assert hide_credentials("GET /index.html HTTP/1.1") == \
+        "GET /index.html HTTP/1.1"
+    assert hide_credentials("192.168.1.5 → example.com") == \
+        "192.168.1.5 → example.com"
+    buf = io.StringIO()
+    w = safe_csv_writer(buf)
+    w.writerow(["=HYPERLINK(1)", f"GET /?password={canary} HTTP/1.1", 3])
+    got = buf.getvalue()
+    assert canary not in got and got.startswith("'=HYPERLINK"), got
+    d = {"dns_names": [], "learns": [], "dst_ip": "", "seq": None}
+    _decode_tcp_payload(d, f"GET /login?password={canary} HTTP/1.1\r\n"
+                           f"Host: a.example\r\n\r\n".encode(), None)
+    assert canary not in d.get("text", "") and "query hidden" in d["text"]
+
+
+@self_test()
+def t_lg02_saved_streams_hold_no_password(ctx):
+    """5.3.4 (LG-02): the redacted stream (what Save as… writes, text or
+    hex) holds no password for an HTTP form, telnet, MQTT, a header split
+    over two segments, or HTTP on a port outside the usual list."""
+    C = b"LGCANARYpw9"
+    auth = b"Authorization: Basic " + base64.b64encode(b"alex:" + C)
+    cases = (
+        (80, [(0, b"POST /signin HTTP/1.1\r\nHost: a.example\r\n"
+                 b"Content-Length: 30\r\n\r\nuser=alex&password=" + C),
+              (1, b"HTTP/1.1 302 Found\r\n\r\n")]),
+        (23, [(1, b"login: "), (0, b"alex\r\n"), (1, b"Password: "),
+              (0, C + b"\r\n"), (1, b"$ ")]),
+        (1883, [(0, b"\x10\x25\x00\x04MQTT\x04\xc2\x00\x3c\x00\x04dev1"
+                   b"\x00\x04alex\x00\x0b" + C), (1, b"\x20\x02\x00\x00")]),
+        (80, [(0, b"GET / HTTP/1.1\r\nHost: a.example\r\n" + auth[:24]),
+              (0, auth[24:] + b"\r\n\r\n"),
+              (1, b"HTTP/1.1 200 OK\r\n\r\n")]),
+        (8000, [(0, b"GET / HTTP/1.1\r\nHost: a.example\r\n" + auth +
+                 b"\r\nCookie: sid=" + C + b"\r\n\r\n"),
+                (1, b"HTTP/1.1 200 OK\r\n\r\n")]))
+    forms = [C, base64.b64encode(b"alex:" + C), auth[24:].strip()]
+    for port, turns in cases:
+        sb = ScenarioBuilder()
+        sb._tcp_talk(sb.ME, "198.51.100.80", sb.GW[1], 43100, port, turns)
+        rows = []
+        for i, (raw, ts, lt) in enumerate(sb.frames):
+            d = fast_decode(raw, ts, lt)
+            d.update(no=i + 1, raw=raw, linktype=lt, flow_id=1)
+            rows.append(d)
+        res = follow_stream(rows, 1)
+        assert res.sensitive(), port
+        for hexmode in (False, True):
+            txt = stream_text(res, True, hexmode)
+            blob = txt.encode()
+            if hexmode:
+                blob = b"".join(bytes.fromhex(m.group(1).replace(" ", ""))
+                                for m in (re.match(
+                                    r"^[0-9a-f]{4,8}  ((?:[0-9a-f]{2} )*"
+                                    r"[0-9a-f]{2})", ln)
+                                    for ln in txt.splitlines()) if m)
+            assert not any(f in blob for f in forms), (port, txt)
+        assert any(f in b"".join(c[2] or b"" for c in res.chunks)
+                   for f in forms)        # the raw view still has them
+
+
+@self_test()
+def t_lg08_roaming_reidentifies(ctx):
+    """5.3.4 (LG-08): a new router or Wi-Fi name under a running capture
+    stops scanning and identifies the network again; the scanner asks
+    before every sweep; no /24 guess when the subnet is unknown."""
+    calls = []
+    app = types.SimpleNamespace(
+        network_fp="abc", data_mode="live", wifi=types.SimpleNamespace(
+            last={"ssid": "Home"}),
+        model=types.SimpleNamespace(gateway_ip="192.168.1.1"),
+        _stop_lan_scanner=lambda: calls.append("stop"),
+        _identify_network_async=lambda: calls.append("identify"),
+        active_mode=lambda: True)
+    reg = types.SimpleNamespace(by_key={}, ip_to_key={})
+    app.model.registry = reg
+    for name in ("_network_signature", "_check_roam", "_scan_still_allowed"):
+        setattr(app, name, types.MethodType(getattr(MiniWireshark, name),
+                                            app))
+    app._net_signature = ("", "Home")
+    assert not app._check_roam(1000.0) and calls == []
+    app.wifi.last = {"ssid": "Airport-Free-WiFi"}
+    assert app._check_roam(1001.0) and calls == ["stop", "identify"]
+    assert not app._scan_still_allowed()          # paused until known
+    assert not app._check_roam(1002.0)            # once, not every tick
+    sc = LanScanner("lo", "192.0.2.10", allowed=lambda: False)
+    sc._sweep()
+    assert sc.sweeps == 0
+    real = conf.route.routes if conf is not None else None
+    try:
+        if conf is not None:
+            conf.route.routes = []
+        assert local_subnet_for("eth9", "10.9.8.7") is None
+    finally:
+        if conf is not None:
+            conf.route.routes = real
+
+
+@self_test()
 def t_store_migrates_v1_file(ctx):
     path = ctx.path("old.sqlite3")
     con = sqlite3.connect(path)
@@ -60305,6 +60594,21 @@ def t_every_send_goes_through_outbound(ctx):
                     return True
         return False
 
+    def pip_online(call):
+        """5.3.4 (LG-04): a pip run that may download (a command list with
+        "pip" and "download" or "install", without --no-index)."""
+        for arg in call.args:
+            for lst in ast.walk(arg):
+                if not isinstance(lst, ast.List):
+                    continue
+                words = {e.value for e in lst.elts
+                         if isinstance(e, ast.Constant) and
+                         isinstance(e.value, str)}
+                if "pip" in words and words & {"download", "install"} and \
+                        "--no-index" not in words:
+                    return True
+        return False
+
     def visit(node, fn=None, top=""):
         for child in ast.iter_child_nodes(node):
             if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -60318,7 +60622,7 @@ def t_every_send_goes_through_outbound(ctx):
                 is_send = name in NET_SENDS or (
                     name == "connect" and isinstance(f, ast.Attribute) and
                     not (isinstance(f.value, ast.Name) and
-                         f.value.id == "sqlite3"))
+                         f.value.id == "sqlite3")) or pip_online(child)
                 if is_send:
                     owner = fn.name if fn is not None else "<module>"
                     exempt = owner in ("net_urlopen",) or \
@@ -61658,6 +61962,11 @@ def test_components_manager_lifecycle(ctx):
     pack = ctx.path("data.mwpack")
     keys, skipped = dm.export_pack(pack)
     assert keys == ["feodo"], keys
+    import zipfile
+    with zipfile.ZipFile(pack) as z:
+        notice = z.read("NOTICE.txt").decode()
+    assert "abuse.ch Feodo Tracker" in notice and "CC0" in notice and \
+        "creativecommons.org" in notice, notice      # LG-14
     assert "Hijacked address blocks" in skipped and \
         "Encrypted-DNS resolvers" in skipped, skipped
     cache2 = ctx.path("cc_lifecycle2")
@@ -67596,7 +67905,7 @@ def gt_m9_loader(app, ctx):
                 "size": "2.8 MB", "host": "files.pythonhosted.org",
                 "check": "fingerprint-checked (SHA-256)",
                 "where": "MiniWireshark's own packages folder", "note": ""}
-        # nobody answers: it continues by itself after the countdown
+        # 5.3.4 (LG-12): nobody answers, nothing is downloaded
         ev, box = threading.Event(), [None]
         lw._show_question("preflight", {"items": [item], "wait": 1}, ev,
                           box)
@@ -67604,8 +67913,12 @@ def gt_m9_loader(app, ctx):
         texts = [str(x.cget("text")) for x in _walk_class(top, tk.Label)]
         assert any("files.pythonhosted.org" in t and "fingerprint" in t
                    for t in texts), texts
-        assert _gui_pump(root, 0.2, until=ev.is_set, timeout=5)
-        assert box[0] == "continue"
+        assert not _gui_pump(root, 0.2, until=ev.is_set, timeout=2.5)
+        assert box[0] is None
+        b = [x for x in _walk_class(top, ttk.Button)
+             if "Download" in str(x.cget("text"))]
+        b[-1].invoke()
+        assert box[0] == "continue" and ev.is_set()
         # Start without live capture is one click
         ev, box = threading.Event(), [None]
         lw._show_question("preflight", {"items": [item], "wait": 60}, ev,
@@ -68453,6 +68766,66 @@ def log_adapter_pick(in_use, best=None):
     LOG.info("adapter pick: in use %s; Windows' route says %s (%s)",
              in_use or "?", best, "same" if agree else "DIFFERENT")
     return "same" if agree else "different"
+
+
+PACK_LICENCE_URLS = {
+    "GPL-3.0": "https://www.gnu.org/licenses/gpl-3.0.txt",
+    "MPL 2.0": "https://mozilla.org/MPL/2.0/",
+    "CC0": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "Public Domain (PDDL 1.0)":
+        "https://opendatacommons.org/licenses/pddl/1-0/"}
+
+
+def pack_notice(files):
+    """NOTICE.txt for an offline data pack: each file, who publishes it,
+    its licence (and where to read it) and where it came from."""
+    out = ["This MiniWireshark offline data pack re-shares the files below",
+           "unchanged. Each stays under its publisher's own licence; none",
+           "of them is covered by MiniWireshark's MIT licence.", ""]
+    for _key, f in sorted(files.items()):
+        lic = f.get("license") or "see the publisher"
+        out += [f"{f.get('file')}",
+                f"  publisher: {f.get('publisher') or '?'}",
+                f"  licence:   {lic}" + (
+                    f" ({PACK_LICENCE_URLS[lic]})"
+                    if lic in PACK_LICENCE_URLS else ""),
+                f"  source:    {f.get('source') or '?'}",
+                f"  sha256:    {f.get('sha256')}", ""]
+    return "\n".join(out)
+
+
+def about_text():
+    return "\n".join((
+        f"MiniWireshark {SCRIPT_VERSION}",
+        f"Python {platform.python_version()} · Tk {tk.TkVersion}",
+        "",
+        "MIT License. Copyright (c) 2026 darkckillerc4.",
+        "",
+        "MiniWireshark is an independent project. It is not affiliated "
+        "with, endorsed by or sponsored by the Wireshark Foundation. "
+        "\"Wireshark\" is a registered trademark of the Wireshark "
+        "Foundation.",
+        "",
+        "Reference data comes from its publishers, each under its own "
+        "licence: IANA, the Public "
+        "Suffix List (MPL-2.0), Disconnect (GPL-3.0), iptoasn (PDDL), "
+        "abuse.ch (CC0), Spamhaus and the Wireshark manufacturer list.",
+        "",
+        "To report a security problem, see SECURITY.md in the project."))
+
+
+def rdns_in_scope(ip, local_nets):
+    """5.3.4 (LG-07): reverse look-ups only for addresses on this
+    computer's own network: not every private address (a company network
+    behind a VPN, multicast, loopback) going to an outside resolver."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if a.is_multicast or a.is_loopback or a.is_unspecified:
+        return False
+    return any(a in n for n in local_nets or ()
+               if getattr(n, "version", 0) == a.version)
 
 
 def detect_gateway_and_self():

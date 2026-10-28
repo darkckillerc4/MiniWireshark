@@ -127,7 +127,7 @@ MiniWireshark is a **defensive** tool for networks you own or are allowed to mon
 
 - **No telemetry.** Everything MiniWireshark itself sends goes through one gate, `outbound()`, and is listed in a self-traffic ledger. A kill switch blocks all of it.
 - **Secrets are dropped inside the parsers.** Mail logins, passwords and message bodies are never stored. A canary test checks reports, sessions, CSV files, logs, history and the clipboard for leaks.
-- **Redaction.** Reports and shared screenshots can replace real names and addresses with documentation-range pseudonyms.
+- **Redaction.** Reports and exports can replace real names and addresses with documentation-range pseudonyms.
 - **Active scanning stays on your own subnet,** and Quiet Mode turns it off on networks you haven't trusted.
 
 Found a security issue? See [SECURITY.md](SECURITY.md).

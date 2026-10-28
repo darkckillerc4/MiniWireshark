@@ -86,7 +86,13 @@ Download the new release and replace the file. Settings, history and sessions ar
 
 ## Uninstalling
 
-Delete `miniwireshark.py` and the data folder above. If you installed Npcap only for MiniWireshark, remove it from Windows' *Installed apps*.
+Delete `miniwireshark.py` and the data folder above. A few things live outside that folder, so delete them too:
+
+- `miniwireshark_config.json` (and `miniwireshark_config.json.bak`) next to `miniwireshark.py`, when that folder is writable.
+- scapy's own cache: `~/.cache/scapy` on Linux and macOS, `%LOCALAPPDATA%\scapy` on Windows.
+- Passwords you saved for a Pi-hole or AdGuard Home helper are in your system's keychain (Windows Credential Manager, macOS Keychain, or the Linux secret service), under "MiniWireshark". Remove them there, or remove each helper in MiniWireshark before you uninstall (removing a helper deletes its saved password).
+
+If you installed Npcap only for MiniWireshark, remove it from Windows' *Installed apps*.
 
 ## Command-line switches
 
