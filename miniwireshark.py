@@ -7754,10 +7754,20 @@ def ip_obj(ip):
 
 
 def is_multicast_or_broadcast(ip):
+    if not isinstance(ip, str):
+        return _mcast_or_bcast(ip)
+    return _mcast_or_bcast_cached(ip)
+
+
+def _mcast_or_bcast(ip):
     a = ip_obj(ip)
     if a is None:
         return False
     return a.is_multicast or ip == "255.255.255.255" or a.is_unspecified
+
+
+# 5.3.4 (M13): asked for every packet's destination
+_mcast_or_bcast_cached = functools.lru_cache(maxsize=16384)(_mcast_or_bcast)
 
 
 def iface_name(iface):
@@ -8305,9 +8315,13 @@ def _try_nbns(load):
 def _port_service(sport, dport):
     """Plain-English service for a port pair, preferring the well-known
     (lower / server-side) port."""
-    for p in sorted((dport or 0, sport or 0)):
-        if p and p in PORT_SERVICES:
-            return PORT_SERVICES[p], p
+    lo, hi = (dport or 0), (sport or 0)
+    if lo > hi:
+        lo, hi = hi, lo
+    if lo and lo in PORT_SERVICES:
+        return PORT_SERVICES[lo], lo
+    if hi and hi in PORT_SERVICES:
+        return PORT_SERVICES[hi], hi
     return "", None
 
 
@@ -8881,6 +8895,8 @@ def _decode_icmpv6(d, pkt):
 # ============================================================================
 _U16 = struct.Struct(">H")
 _U32 = struct.Struct(">I")
+_TCP_HDR = struct.Struct(">HHIIBBH")     # ports, seq, ack, offset, flags, win
+_TCP_FLAG_TEXT = {}                      # flags -> "SYN,ACK" (at most 512)
 _TCP_FLAG_NAMES = ((0x01, "FIN"), (0x02, "SYN"), (0x04, "RST"),
                    (0x08, "PSH"), (0x10, "ACK"), (0x20, "URG"))
 _ETHER_NAMES = {0x88cc: "LLDP", 0x888e: "EAPOL", 0x8863: "PPPoE",
@@ -8903,12 +8919,35 @@ class NeedDeepParse(Exception):
     """The fast decoder declines this frame; use the scapy decoder."""
 
 
+# 5.3.4 (M13, MC10): the same few hundred addresses arrive in every
+# packet, so each one is formatted once and the text is shared by every
+# row that names it (faster, and one string per address in memory, not
+# one per packet). Bounded: cleared when it fills.
+_ADDR_TEXT_MAX = 16384
+_MAC_TEXT = {}
+_IP4_TEXT = {}
+
+
 def _mac(b):
-    return "%02x:%02x:%02x:%02x:%02x:%02x" % tuple(b[:6])
+    k = bytes(b[:6])
+    s = _MAC_TEXT.get(k)
+    if s is None:
+        s = "%02x:%02x:%02x:%02x:%02x:%02x" % tuple(k)
+        if len(_MAC_TEXT) >= _ADDR_TEXT_MAX:
+            _MAC_TEXT.clear()
+        _MAC_TEXT[k] = s
+    return s
 
 
 def _ip4(b):
-    return "%d.%d.%d.%d" % (b[0], b[1], b[2], b[3])
+    k = bytes(b[:4])
+    s = _IP4_TEXT.get(k)
+    if s is None:
+        s = "%d.%d.%d.%d" % (k[0], k[1], k[2], k[3])
+        if len(_IP4_TEXT) >= _ADDR_TEXT_MAX:
+            _IP4_TEXT.clear()
+        _IP4_TEXT[k] = s
+    return s
 
 
 def _ip6(b):
@@ -9799,6 +9838,16 @@ def _label_l2_discovery(d, info):
 
 
 def _fast_new(raw, ts, lt):
+    # 5.3.4 (M13): a copy of one template is about five times faster than
+    # building the 54 keys again; the two lists are new for every packet
+    d = _FAST_TEMPLATE.copy()
+    d["dns_names"], d["learns"] = [], []
+    d["raw"], d["linktype"], d["time"], d["length"] = raw, lt, ts, len(raw)
+    return d
+
+
+def _fast_template():
+    raw, ts, lt = b"", 0.0, 1
     return {"proto": "?", "tag": "OTHER", "text": "",
             "src": "", "dst": "", "src_ip": "", "dst_ip": "",
             "src_mac": "", "dst_mac": "", "ttl": "", "ttl_int": 0,
@@ -9815,6 +9864,10 @@ def _fast_new(raw, ts, lt):
             "multicast": False, "l2_bcast": False,
             "learns": [], "pkt": None, "raw": raw, "linktype": lt,
             "time": ts, "length": len(raw)}
+
+
+_FAST_TEMPLATE = _fast_template()
+_TTL_TEXT = tuple(str(i) for i in range(256))
 
 
 def fast_decode(raw, ts, lt=1, reasm=None, gateway_ip="", my_ips=()):
@@ -9986,7 +10039,7 @@ def _fast_ipv4(d, raw, off, reasm):
     ttl, proto = raw[off + 8], raw[off + 9]
     src, dst = _ip4(raw[off + 12:off + 16]), _ip4(raw[off + 16:off + 20])
     d["src_ip"], d["dst_ip"] = src, dst
-    d["ttl"], d["ttl_int"], d["ipver"] = str(ttl), ttl, 4
+    d["ttl"], d["ttl_int"], d["ipver"] = _TTL_TEXT[ttl], ttl, 4
     if is_multicast_or_broadcast(dst):
         d["multicast"] = True
     if frag & 0x1FFF or frag & 0x2000:
@@ -10006,7 +10059,7 @@ def _fast_ipv6(d, raw, off, reasm):
     nh, hlim = raw[off + 6], raw[off + 7]
     src, dst = _ip6(raw[off + 8:off + 24]), _ip6(raw[off + 24:off + 40])
     d["src_ip"], d["dst_ip"] = src, dst
-    d["ttl"], d["ttl_int"], d["ipver"] = str(hlim), hlim, 6
+    d["ttl"], d["ttl_int"], d["ipver"] = _TTL_TEXT[hlim], hlim, 6
     if is_multicast_or_broadcast(dst):
         d["multicast"] = True
     end = off + 40 + plen if off + 40 + plen <= n else n
@@ -10062,9 +10115,9 @@ def _fast_done(d):
 def _fast_tcp(d, raw, p, end, reasm):
     if end - p < 20:
         raise NeedDeepParse("short tcp")
-    sport, dport, seq = struct.unpack_from(">HHI", raw, p)
-    dataofs = (raw[p + 12] >> 4) * 4
-    flags = raw[p + 13] | ((raw[p + 12] & 1) << 8)
+    sport, dport, seq, ack, b12, b13, win = _TCP_HDR.unpack_from(raw, p)
+    dataofs = (b12 >> 4) * 4
+    flags = b13 | ((b12 & 1) << 8)
     if dataofs < 20 or p + dataofs > end:
         raise NeedDeepParse("bad tcp header")
     d["sport"], d["dport"] = sport, dport
@@ -10072,18 +10125,20 @@ def _fast_tcp(d, raw, p, end, reasm):
     d["proto"], d["tag"] = "TCP", "TCP"
     d["tcp_flags"] = flags
     d["seq"] = seq
-    d["ack"], d["win"] = struct.unpack_from(">I", raw, p + 8)[0], \
-        struct.unpack_from(">H", raw, p + 14)[0]
+    d["ack"], d["win"] = ack, win
     if flags & 0x02:                    # 5.3.4 (IP-017): SYN only
-        d["tcp_syn"] = tcp_syn_sig(d["win"], bytes(raw[p + 20:p + dataofs]))
-    names = [nm for b, nm in _TCP_FLAG_NAMES if flags & b]
+        d["tcp_syn"] = tcp_syn_sig(win, bytes(raw[p + 20:p + dataofs]))
+    names = _TCP_FLAG_TEXT.get(flags)
+    if names is None:
+        names = _TCP_FLAG_TEXT[flags] = ",".join(
+            nm for b, nm in _TCP_FLAG_NAMES if flags & b) or "data"
     svc, sport_ = _port_service(sport, dport)
     d["service"], d["service_port"] = svc, sport_
     if svc:
-        d["text"] = f"{svc} ({','.join(names) or 'data'})"
+        d["text"] = f"{svc} ({names})"
         d["app_conf"] = "Likely (by port)"
     else:
-        d["text"] = f"Connecting ({','.join(names) or 'data'})"
+        d["text"] = f"Connecting ({names})"
     if sport_ in ENCRYPTED_PORTS:
         d["encrypted"] = "likely"
     load = raw[p + dataofs:end]
@@ -11208,6 +11263,8 @@ FEATURES = {
     "own_blocklist": True,   # the user's own blocklist file (M9, IP-010)
     "login_warning": True,   # login sent without encryption (M9, IP-013)
     "investigations_v2": True,   # five more guided investigations (M11)
+    "overload_degrade": True,  # too busy: count only, then back (M13, IP-025)
+    "npcap_buffer": True,    # a bigger Npcap kernel buffer (M13, IP-024)
 }
 
 
@@ -11395,6 +11452,13 @@ FEATURE_HELP = {
                          "device that can't connect, Wi-Fi or the "
                          "Internet, a call that stutters), each saying "
                          "when it can't tell from here",
+    "overload_degrade": "when packets arrive faster than they can be "
+                        "inspected for a while, deep analysis pauses and "
+                        "packets are only counted, the state line says "
+                        "so, and it comes back on its own",
+    "npcap_buffer": "on Windows, Npcap is asked to keep 16 MB of packets "
+                    "waiting instead of 1 MB, so a burst is not lost "
+                    "while the program is busy",
 }
 
 
@@ -11929,6 +11993,77 @@ def coverage_summary(cov):
             LV_UNKNOWN if lost or cov["gaps"] else LV_INFERRED)
 
 
+OVERLOAD_TEXT = ("Too busy to inspect every packet: counting only. Deep "
+                 "analysis is paused and comes back on its own.")
+
+
+class OverloadGuard:
+    """5.3.4 (M13, MC10, IP-025): when a live capture's packets wait in
+    the hand-off queue above the high-water mark for HOLD_S seconds (a
+    file or the demo waits for room instead, and is never shed), the
+    analysis worker stops offering packets to deep analysis (the
+    optional, costly part) and only counts them, and the state line says
+    so; once the queue has stayed under the low-water mark for CALM_S
+    seconds it goes back on its own. Two marks and two delays, so it
+    does not flap."""
+
+    HIGH = 0.5          # fraction of the queue (frames or bytes)
+    LOW = 0.1
+    HOLD_S = 2.0
+    CALM_S = 5.0
+
+    def __init__(self):
+        self.active = False
+        self.since = 0.0
+        self.episodes = 0          # times it switched to counting only
+        self.shed = 0              # packets not offered to deep analysis
+        self._over = None
+        self._under = None
+
+    @staticmethod
+    def fill(ring):
+        """How full the queue is, 0..1 (the fuller of frames and bytes)."""
+        try:
+            return max(len(ring) / max(1, ring.max_frames),
+                       ring.bytes / max(1, ring.max_bytes))
+        except (AttributeError, TypeError):
+            return 0.0
+
+    def update(self, fill, now):
+        """-> True when the state changed."""
+        if not FEATURES.get("overload_degrade", True):
+            self._over = self._under = None
+            if self.active:
+                self.active = False
+                return True
+            return False
+        if not self.active:
+            if fill < self.HIGH:
+                self._over = None
+                return False
+            if self._over is None:
+                self._over = now
+            if now - self._over < self.HOLD_S:
+                return False
+            self.active, self.since, self._under = True, now, None
+            self.episodes += 1
+            LOG.warning("analysis overloaded (queue %.0f %% full): counting "
+                        "only", fill * 100)
+            return True
+        if fill > self.LOW:
+            self._under = None
+            return False
+        if self._under is None:
+            self._under = now
+        if now - self._under < self.CALM_S:
+            return False
+        self.active, self._over = False, None
+        LOG.info("analysis caught up after %.0f s; deep analysis resumes "
+                 "(%d packets were only counted)", now - self.since,
+                 self.shed)
+        return True
+
+
 class AnalysisWorker(threading.Thread):
     """The only thread that feeds packets into the model."""
 
@@ -11949,6 +12084,7 @@ class AnalysisWorker(threading.Thread):
         self.busy = False
         self.deep = 0              # frames the fast path handed to scapy
         self.window_frozen = 0.0   # seconds the Tk thread missed its checks
+        self.overload = OverloadGuard()      # 5.3.4 (M13, IP-025)
 
     def reset(self):
         """New session: fresh reassembly state and counters."""
@@ -11991,6 +12127,11 @@ class AnalysisWorker(threading.Thread):
                 self.window_frozen = frozen
             batch = ring.drain(self.BATCH, timeout=0.02)
             self._switch_interval(bool(batch), now)
+            # only a live capture can lose packets: a file or the demo
+            # waits for room, so its full queue is not an overload
+            self.overload.update(
+                OverloadGuard.fill(ring) if getattr(
+                    self.app, "data_mode", "") == "live" else 0.0, now)
             if not batch:
                 self.busy = False
                 continue
@@ -12019,6 +12160,13 @@ class AnalysisWorker(threading.Thread):
                 LOG.exception("deep analysis setup")
             if not deep.active():
                 deep = None
+        shed = 0
+        if deep is not None and self.overload.active and \
+                getattr(app, "data_mode", "") == "live":
+            shed, deep = len(batch), None      # IP-025: counting only
+            self.overload.shed += shed
+            with contextlib.suppress(Exception):
+                app.deep._count_shed(shed, "too busy")
         gw, my_ips = model.gateway_ip, model.my_ips
         decoded = []
         for raw, ts, lt, g in batch:
@@ -12082,6 +12230,36 @@ def _layer2num(cls):
         return 1
 
 
+NPCAP_BUFFER_BYTES = 16 * 1024 * 1024   # Npcap's own default is 1 MB
+
+
+def tune_capture_buffer(sock, windows=None, setbuff=None,
+                        size=NPCAP_BUFFER_BYTES):
+    """5.3.4 (M13, IP-024): ask Npcap for a bigger kernel buffer on an
+    open capture socket, so a burst waits in the driver instead of being
+    dropped while the program is busy (Npcap keeps 1 MB by default;
+    Wireshark asks for 2 MB, and 16 MB is a few seconds of a busy home
+    network). Windows and scapy's pcap socket only; it never fails the
+    capture. -> the size now set, in bytes, or 0."""
+    windows = IS_WINDOWS if windows is None else windows
+    if not windows or not FEATURES.get("npcap_buffer", True):
+        return 0
+    handle = getattr(getattr(sock, "pcap_fd", None), "pcap", None)
+    if handle is None:
+        return 0
+    try:
+        if setbuff is None:
+            from scapy.libs.winpcapy import pcap_setbuff as setbuff
+        if setbuff(handle, int(size)) != 0:
+            LOG.info("Npcap kept its own buffer size")
+            return 0
+    except Exception as e:                           # noqa: BLE001
+        LOG.info("Npcap buffer not changed: %s", e)
+        return 0
+    LOG.info("Npcap kernel buffer: %d MB", size // (1024 * 1024))
+    return int(size)
+
+
 class RawCapture(threading.Thread):
     """Live capture straight from a layer-2 socket: no scapy packet is
     built in the capture thread, just bytes + timestamp."""
@@ -12103,6 +12281,7 @@ class RawCapture(threading.Thread):
         self.sock = None
         self.kind = "raw socket"
         self.promisc_refused = False
+        self.kernel_buffer = 0         # bytes asked of Npcap (IP-024)
 
     def _open(self):
         kwargs = {"iface": self.iface}
@@ -12137,6 +12316,7 @@ class RawCapture(threading.Thread):
             self.started.set()
             self.first_cycle.set()
             return
+        self.kernel_buffer = tune_capture_buffer(self.sock)
         self.running = True
         self.started.set()
         sock = self.sock
@@ -12487,6 +12667,24 @@ def confidence_tier(score):
     return CONFIDENCE_UNCONFIRMED
 
 
+def _slotted(cls):
+    """dataclass(slots=True) for Python 3.8 and 3.9 (5.3.4, M13, MC10):
+    the same class rebuilt with __slots__ and no per-object __dict__, for
+    the records made per device, per website, per remote address and per
+    piece of evidence. Less memory and faster attribute access; setting an
+    attribute that is not a field now fails (none of these needs one).
+    The generated __init__ keeps its defaults (they live in the function,
+    not on the class)."""
+    names = tuple(f.name for f in dataclasses.fields(cls))
+    body = {k: v for k, v in cls.__dict__.items()
+            if k not in names and k not in ("__dict__", "__weakref__")}
+    body["__slots__"] = names
+    new = type(cls)(cls.__name__, cls.__bases__, body)
+    new.__qualname__ = cls.__qualname__
+    return new
+
+
+@_slotted
 @dataclass
 class Evidence:
     source: str
@@ -12501,6 +12699,7 @@ def _push_bounded(lst, item, limit):
         del lst[:-limit]
 
 
+@_slotted
 @dataclass
 class DeviceRecord:
     """A LOCAL device. Keyed by MAC when one is known (the actual L2
@@ -13229,6 +13428,9 @@ def dhcp_peers(devices):
     fingerprint shared by devices of different kinds is left out."""
     seen = {}
     for d in devices:
+        p = d.dhcp_params
+        if not p or p.count(",") < 3:
+            continue                   # (dhcp_fingerprint's test, inline)
         fp = dhcp_fingerprint(d)
         if fp is None:
             continue
@@ -13421,6 +13623,7 @@ class DeviceRegistry:
         self.rekeyed = []             # (old_key, new_key)
         self.removed = []             # keys removed by merges
         self.created = []             # keys created
+        self.pruned = OrderedDict()   # expired keys dropped (CO-03)
         self.events = []              # (kind, severity, text, key)
         self.moved_ips = []           # IPv4s that changed owner
         self._elig_sig = None
@@ -13619,9 +13822,11 @@ class DeviceRegistry:
             dev._last_conf_tier = dev.confidence
         return dev
 
+    _BIND_SOURCE = {"dhcp_lease": "dhcp", "arp_reply": "arp",
+                    "ipv6_nd": "nd"}
+
     def _assign_ip(self, dev, ip, when, source="traffic", mac=None):
-        src = {"dhcp_lease": "dhcp", "arp_reply": "arp",
-               "ipv6_nd": "nd"}.get(source, "traffic")
+        src = self._BIND_SOURCE.get(source, "traffic")
         self.bindings.bind(ip, (mac or dev.mac or dev.key).lower()
                            if (mac or dev.mac) else dev.key, when, src)
         if ":" in ip:
@@ -13922,6 +14127,41 @@ class DeviceRegistry:
                         dev.last_confirmed < lease[3]:
                     dev.lease_ip = ""
         return newly_inactive, newly_expired
+
+    EXPIRED_KEEP = 500       # 5.3.4 (M13, CO-03)
+
+    @staticmethod
+    def labelled(dev):
+        """Something you set on it (a name, notes, a kind, a flag)."""
+        return bool(dev.alias or dev.notes or dev.mine or dev.expected or
+                    dev.pinned_no_merge or dev.never_merge or
+                    dev.user_class or dev.place or dev.owner)
+
+    def prune_expired(self, keep=None):
+        """5.3.4 (M13, CO-03): expired devices were never dropped, so a
+        network with guests and rotating private addresses grew without
+        end. Past `keep` expired devices, the oldest ones you never
+        labelled leave memory (their expiry copy stays in history, and a
+        returning one is not announced as new). -> the keys dropped."""
+        keep = self.EXPIRED_KEEP if keep is None else keep
+        old = [d for d in self.by_key.values()
+               if d.live and d.state == STATE_EXPIRED and not
+               self.labelled(d)]
+        if len(old) <= keep:
+            return []
+        old.sort(key=lambda d: d.last_confirmed)
+        gone = []
+        for dev in old[:len(old) - keep]:
+            self.by_key.pop(dev.key, None)
+            for ip in list(dev.ipv4s | dev.ipv6) + [dev.ip]:
+                if ip and self.ip_to_key.get(ip) == dev.key:
+                    self.ip_to_key.pop(ip, None)
+            self.pruned[dev.key] = dev.last_confirmed
+            self.removed.append(dev.key)
+            gone.append(dev.key)
+        while len(self.pruned) > 20 * max(1, keep):
+            self.pruned.popitem(last=False)
+        return gone
 
     def visible_devices(self):
         show_inactive = self.config.get("devices.show_inactive", False)
@@ -14735,6 +14975,7 @@ class NetworkProfiles:
 # ============================================================================
 #  8.  Website / domain model  — a name, never a device
 # ============================================================================
+@_slotted
 @dataclass
 class WebsiteRecord:
     """A domain name learned from DNS, TLS SNI or an HTTP Host header.
@@ -14827,6 +15068,7 @@ def website_from_dict(wd):
 # ============================================================================
 #  9.  Remote-host model  — a public Internet address, never a device
 # ============================================================================
+@_slotted
 @dataclass
 class RemoteHostRecord:
     """A public IP address contacted directly, or the address behind a
@@ -15173,13 +15415,15 @@ class TimeSeries:
         self.gauge = gauge
 
     def add(self, ts, value=1):
+        tiers, gauge = self.tiers, self.gauge
         for res, n in METRIC_TIERS:
-            od = self.tiers[res]
+            od = tiers[res]
             b = int(ts // res) * res
-            if self.gauge:
-                od[b] = max(od.get(b, 0), value)
-            else:
-                od[b] = od.get(b, 0) + value
+            v = od.get(b)
+            if v is not None:
+                od[b] = (v if v > value else value) if gauge else v + value
+                continue
+            od[b] = max(0, value) if gauge else value
             if len(od) > n:
                 # bounded: drop the oldest buckets (handles out-of-order too)
                 while len(od) > n:
@@ -21442,7 +21686,22 @@ class NetworkModel:
 
     def _routed_private_v4(self, ip):
         """A private IPv4 address outside our own subnets arrives through
-        the router, so the frame's MAC is the router's, not that host's."""
+        the router, so the frame's MAC is the router's, not that host's.
+        (5.3.4, M13: remembered per address until the subnets change.)"""
+        nets = self.local_nets
+        sig = (id(nets), len(nets))
+        memo = getattr(self, "_routed_memo", None)
+        if memo is None or memo[0] != sig:
+            memo = self._routed_memo = (sig, {})
+        r = memo[1].get(ip)
+        if r is None:
+            r = self._routed_private_v4_uncached(ip)
+            if len(memo[1]) >= 50000:
+                memo[1].clear()
+            memo[1][ip] = r
+        return r
+
+    def _routed_private_v4_uncached(self, ip):
         a = ip_obj(ip)
         if a is None or a.version != 4:
             return False
@@ -21463,6 +21722,8 @@ class NetworkModel:
                 if dev is None:
                     continue
                 self._dirty_dev(dev)
+                if key in self.registry.pruned:
+                    continue      # CO-03: an expired device came back
                 if dev.live and self.announce_new and not self.in_discovery():
                     self._pending_new.append((due, key))
         if not self._pending_new:
@@ -22520,6 +22781,12 @@ class NetworkModel:
             self.push_timeline("device expired", "INFO",
                                f"{dev.display_name()} moved to history "
                                f"(expired)", ("device", dev.key), dev.key)
+        for key in self.registry.prune_expired():
+            self.baselines.devices.pop(key, None)       # CO-03
+            self.resets.pop(key, None)
+            self.scans.forget(key)
+            self.dirty_devices.discard(key)
+            self._classify_dirty.discard(key)
         yield "lifecycle"
         for f in self.flows.expire(now):
             pass
@@ -27489,6 +27756,7 @@ Call measuring is turned off. ¦ La mesure des appels est désactivée. ¦ La me
 A call on another device (a phone, a TV) isn't visible from this computer. ¦ Un appel sur un autre appareil (un téléphone, une télé) n'est pas visible depuis cet ordinateur. ¦ Una llamada en otro dispositivo (un teléfono, una tele) no se ve desde este equipo.
 No call was seen. Look again during a call. ¦ Aucun appel n'a été vu. Regardez de nouveau pendant un appel. ¦ No se vio ninguna llamada. Vuelva a mirar durante una llamada.
 Look again during the call, on the computer that makes it. ¦ Regardez de nouveau pendant l'appel, sur l'ordinateur qui le passe. ¦ Vuelva a mirar durante la llamada, en el equipo que la hace.
+Too busy to inspect every packet: counting only. Deep analysis is paused and comes back on its own. ¦ Trop occupé pour examiner chaque paquet : simple comptage. L'analyse approfondie est en pause et reprendra d'elle-même. ¦ Demasiado ocupado para examinar cada paquete: solo se cuentan. El análisis a fondo está en pausa y se reanudará solo.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -46107,11 +46375,33 @@ class MiniWireshark:
         else:
             text = tr("mode_quiet") + (f"  Network: {name}." if name else "")
             colors = ("mode_quiet_bg", "mode_quiet_fg")
+        if getattr(self, "_overload_shown", False):
+            # 5.3.4 (M13, IP-025): an honest line while only counting
+            text += "\n" + translate_text(OVERLOAD_TEXT)
+            if not LEDGER.killed:
+                colors = ("warn_bg", "warn_fg")
         if wanted and live and prof is None and not LEDGER.killed:
             first = ("Stay in Quiet Mode", self._toggle_active_scanning)
         else:
             first = actions[0]
         return text, colors[0], colors[1], first[0], first[1], actions
+
+    def _sync_overload_line(self):
+        """Show or clear the "counting only" line when the analysis worker
+        changes state (checked with the model upkeep). -> True if it
+        changed."""
+        w = getattr(self, "worker", None)
+        on = bool(w is not None and getattr(w, "overload", None) is not None
+                  and w.overload.active)
+        if on == getattr(self, "_overload_shown", False):
+            return False
+        self._overload_shown = on
+        if on:
+            self.model.push_timeline("too busy", "WARNING", OVERLOAD_TEXT)
+        if FEATURES.get("state_line", True):
+            with contextlib.suppress(tk.TclError, AttributeError):
+                self._restyle_state_line()
+        return True
 
     def _restyle_state_line(self):
         """One line under the header that is never hidden: whether
@@ -50517,8 +50807,31 @@ proc ::mw_retheme {w map fgnew deffg} {
                 self._rebuild_on_restore = True   # the Alerts table too
             if len(m.ev_banner) > 1:
                 del m.ev_banner[:-1]
+            # (by the class, so a stand-in window object can call it too)
+            MiniWireshark._trim_queues_minimized(self, m)
         except Exception:                            # noqa: BLE001
             LOG.debug("trim while minimised", exc_info=True)
+
+    def _trim_queues_minimized(self, m):
+        """5.3.4 (M13, CO-03, a hole in B-21): the address-lookup queue and
+        the changed-row sets were left to grow while minimised, and kept
+        addresses the model had already let go (40,005 over a 30,000 cap
+        in 16 h). Only addresses still known and still without a country
+        stay queued (the rest are queued again by their next packet);
+        a changed-row set over the cap becomes one rebuild on restore."""
+        keep = self.MINIMIZED_KEEP
+        if len(m.ev_geo) > keep:
+            live = m.remote_hosts
+            ips = [ip for ip in m.ev_geo
+                   if ip in live and not live[ip].country]
+            if len(ips) > keep:
+                ips.sort(key=lambda ip: live[ip].last_seen)
+                del ips[:-keep]
+            m.ev_geo = set(ips)
+        for attr in ("dirty_remotes", "dirty_websites", "dirty_devices"):
+            if len(getattr(m, attr)) > keep:
+                setattr(m, attr, set())
+                self._rebuild_on_restore = True
 
     def _flush_flows(self, m):
         m.flows.closed_now.clear()
@@ -50630,6 +50943,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                     if gw and gw != self.model.gateway_ip:
                         self.model.set_identity(gateway_ip=gw)
                 self._update_perf()
+                self._sync_overload_line()
                 cv = self.model.cache.version
                 if cv != getattr(self, "_names_version", -1):
                     self._names_version = cv
@@ -65562,6 +65876,320 @@ def t_call_decoder_fuzz(ctx):
             " | ".join(diffs[:3])
 
 
+# ---- 5.3.4 M13: MC10 performance, Npcap buffer (IP-024), overload (IP-025),
+#      memory bounded (CO-03) ---------------------------------------------------
+def _m13_tcp_frame(flags, win=0xfaf0, sport=51000, dport=443, opts=b""):
+    """Ethernet + IPv4 + TCP built by hand (no scapy needed)."""
+    off = (20 + len(opts)) // 4
+    tcp = struct.pack(">HHIIBBHHH", sport, dport, 5, 7, off << 4, flags, win,
+                      0, 0) + opts
+    ip = struct.pack(">BBHHHBBH4s4s", 0x45, 0, 20 + len(tcp), 1, 0x4000, 64,
+                     6, 0, bytes([192, 168, 1, 9]), bytes([93, 184, 215, 14]))
+    eth = bytes.fromhex("0011223344550a1b2c3d4e5f0800")
+    return eth + ip + tcp
+
+
+@self_test()
+def t_m13_hot_path_same_answers(ctx):
+    """5.3.4 (M13, MC10): the hot-path cuts give the same answers as
+    before: address text shared and bounded (a short field is still
+    refused), the TCP header read once, the flag text, the port pair, the
+    metric buckets, and new lists in every row."""
+    assert _mac(b"\x00\x1a\x2b\x3c\x4d\x5e\xff") == "00:1a:2b:3c:4d:5e"
+    assert _mac(bytearray(b"\xaa" * 6)) == "aa:aa:aa:aa:aa:aa"
+    assert _mac(memoryview(b"\x01\x02\x03\x04\x05\x06")) == \
+        "01:02:03:04:05:06"
+    a = _ip4(b"\xc0\xa8\x01\x02xx")
+    assert a == "192.168.1.2" and _ip4(b"\xc0\xa8\x01\x02") is a
+    for bad, fn in ((b"\x01\x02", _mac), (b"\x01\x02\x03", _ip4)):
+        try:
+            fn(bad)
+        except (TypeError, IndexError):
+            pass
+        else:
+            raise AssertionError(f"{fn.__name__} took a short field")
+    for i in range(_ADDR_TEXT_MAX + 10):
+        _ip4(struct.pack("!I", i))
+    assert len(_IP4_TEXT) <= _ADDR_TEXT_MAX
+    d1, d2 = _fast_new(b"ab", 1.0, 1), _fast_new(b"abc", 2.0, 113)
+    assert d1["learns"] is not d2["learns"]
+    assert d1["dns_names"] is not d2["dns_names"]
+    assert (d1["length"], d2["linktype"], d2["time"]) == (2, 113, 2.0)
+    assert not _FAST_TEMPLATE["learns"] and not _FAST_TEMPLATE["dns_names"]
+    assert _TTL_TEXT[64] == "64" and len(_TTL_TEXT) == 256
+
+    def old_port_service(sport, dport):
+        for p in sorted((dport or 0, sport or 0)):
+            if p and p in PORT_SERVICES:
+                return PORT_SERVICES[p], p
+        return "", None
+    for sp, dp in ((443, 51000), (51000, 443), (None, 53), (80, 443),
+                   (0, 0), (None, None), (22, 22), (5353, 53),
+                   (65000, 65001), (8080, None)):
+        assert _port_service(sp, dp) == old_port_service(sp, dp), (sp, dp)
+    d = fast_decode(_m13_tcp_frame(0x12, opts=b"\x02\x04\x05\xb4"), 5.0)
+    assert (d["seq"], d["ack"], d["win"], d["tcp_flags"]) == \
+        (5, 7, 0xfaf0, 0x12), d
+    assert "(SYN,ACK)" in d["text"] and d["ttl"] == "64" and d["tcp_syn"]
+    assert d["src_ip"] == "192.168.1.9" and d["src_mac"] == \
+        "0a:1b:2c:3d:4e:5f"
+    d = fast_decode(_m13_tcp_frame(0x00, dport=40000, sport=40001), 6.0)
+    assert d["text"] == "Connecting (data)", d["text"]
+    rng = random.Random(7)
+    pts = [(1000 + rng.random() * 4000, rng.randint(-2, 9))
+           for _ in range(3000)] + [(500.0, 3), (100000.0, 1)]
+    for gauge in (False, True):
+        ts = TimeSeries(gauge=gauge)
+        ref = {res: OrderedDict() for res, _n in METRIC_TIERS}
+        for t, v in pts:
+            ts.add(t, v)
+            for res, n in METRIC_TIERS:
+                od = ref[res]
+                b = int(t // res) * res
+                od[b] = max(od.get(b, 0), v) if gauge else od.get(b, 0) + v
+                while len(od) > n:
+                    od.popitem(last=False)
+        for res, _n in METRIC_TIERS:
+            assert list(ts.tiers[res].items()) == list(ref[res].items()), \
+                (gauge, res)
+
+
+@self_test()
+def t_m13_records_have_slots(ctx):
+    """5.3.4 (M13, MC10): devices, websites, remote addresses and evidence
+    have __slots__ (no per-object dict), keep their defaults and their
+    own lists and sets, refuse an attribute that is not a field, and go
+    through a session save and load unchanged."""
+    for cls in (Evidence, DeviceRecord, WebsiteRecord, RemoteHostRecord):
+        names = tuple(f.name for f in dataclasses.fields(cls))
+        assert getattr(cls, "__slots__", None) == names, cls.__name__
+        assert dataclasses.is_dataclass(cls)
+    dev = DeviceRecord(key="aa:bb:cc:dd:ee:01", ip="192.168.1.9")
+    other = DeviceRecord(key="k2")
+    assert not hasattr(dev, "__dict__")
+    try:
+        dev.not_a_field = 1
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("a device took an attribute that isn't a field")
+    assert dev.ipv6 is not other.ipv6 and dev.evidence is not other.evidence
+    assert other.type == "unknown" and other.state == STATE_ACTIVE and \
+        other.ip == "" and other.live is True
+    dev.alias, dev.mine = "Kitchen tablet", True
+    dev.add_evidence("arp_reply", "Answered ARP", 5.0)
+    dev.services.add("http")
+    dev.protocols["TCP"] += 3
+    back = device_from_dict(json.loads(json.dumps(device_to_dict(dev))))
+    assert (back.alias, back.mine, back.ip, back.score, back.services,
+            back.protocols["TCP"]) == ("Kitchen tablet", True,
+                                       "192.168.1.9", dev.score, {"http"}, 3)
+    w = WebsiteRecord(domain="example.com", requests=4)
+    w.devices.add(dev.key)
+    w2 = website_from_dict(json.loads(json.dumps(website_to_dict(w))))
+    assert (w2.domain, w2.requests, w2.devices) == ("example.com", 4,
+                                                    {dev.key})
+    assert w2.encryption_text() == "Unknown" and w2.best_assoc == ""
+    r = RemoteHostRecord(ip="93.184.215.14", ports={443}, country="NL")
+    r2 = remote_from_dict(json.loads(json.dumps(remote_to_dict(r))))
+    assert (r2.ip, r2.ports, r2.country) == ("93.184.215.14", {443}, "NL")
+    assert Evidence("a", "b", 1, 2.0) == Evidence("a", "b", 1, 2.0)
+    assert repr(Evidence("a", "b", 1, 2.0)).startswith("Evidence(")
+
+
+@self_test()
+def t_m13_npcap_buffer(ctx):
+    """5.3.4 (M13, IP-024): on Windows an open Npcap socket is asked for a
+    16 MB kernel buffer; a raw socket, another system, a refusal, an
+    error or the switch turned off change nothing and never stop the
+    capture, and the capture thread asks as soon as its socket is open."""
+    calls = []
+
+    def setbuff(handle, size):
+        calls.append((handle, size))
+        return 0
+    sock = types.SimpleNamespace(pcap_fd=types.SimpleNamespace(pcap="H"))
+    assert NPCAP_BUFFER_BYTES >= 8 * 1024 * 1024
+    assert tune_capture_buffer(sock, windows=True, setbuff=setbuff) == \
+        NPCAP_BUFFER_BYTES
+    assert calls == [("H", NPCAP_BUFFER_BYTES)]
+    assert tune_capture_buffer(sock, windows=False, setbuff=setbuff) == 0
+    assert tune_capture_buffer(object(), windows=True, setbuff=setbuff) == 0
+    assert len(calls) == 1
+    assert tune_capture_buffer(sock, windows=True,
+                               setbuff=lambda h, n: -1) == 0
+
+    def boom(h, n):
+        raise OSError("no such function")
+    assert tune_capture_buffer(sock, windows=True, setbuff=boom) == 0
+    old = FEATURES.get("npcap_buffer", True)
+    FEATURES["npcap_buffer"] = False
+    try:
+        assert tune_capture_buffer(sock, windows=True, setbuff=setbuff) == 0
+    finally:
+        FEATURES["npcap_buffer"] = old
+    assert len(calls) == 1
+    rc = RawCapture("eth9", "", False, lambda *a: None)
+
+    class _Sock:
+        def recv_raw(self, n):
+            rc.stop_flag = True
+            return None
+
+        def close(self):
+            pass
+    rc._open = _Sock
+    g = globals()
+    real = g["tune_capture_buffer"]
+    g["tune_capture_buffer"] = lambda s: 4096 if isinstance(s, _Sock) else 0
+    try:
+        rc.run()
+    finally:
+        g["tune_capture_buffer"] = real
+    assert rc.kernel_buffer == 4096 and rc.exception is None
+
+
+@self_test()
+def t_m13_overload_degrade(ctx):
+    """5.3.4 (M13, IP-025): when the hand-off queue stays over the
+    high-water mark, the analysis worker stops offering packets to deep
+    analysis and only counts them (the model still sees every packet),
+    and it goes back on its own after the queue stays calm: two marks and
+    two delays, so a short spike changes nothing. The switch turns it
+    off."""
+    g = OverloadGuard()
+    hi, lo = OverloadGuard.HIGH + 0.1, OverloadGuard.LOW / 2
+    assert not g.update(hi, 100.0) and not g.update(hi, 101.0)
+    assert not g.active
+    assert g.update(hi, 100.0 + OverloadGuard.HOLD_S + 0.1) and g.active
+    assert g.episodes == 1
+    mid = (OverloadGuard.HIGH + OverloadGuard.LOW) / 2
+    assert not g.update(mid, 103.0) and g.active          # between marks
+    assert not g.update(lo, 104.0)
+    assert not g.update(mid, 105.0)               # not calm yet: starts over
+    assert not g.update(lo, 106.0)
+    assert not g.update(lo, 106.0 + OverloadGuard.CALM_S - 0.5) and g.active
+    assert g.update(lo, 106.0 + OverloadGuard.CALM_S + 0.1)
+    assert not g.active
+    assert not g.update(0.99, 200.0) and not g.update(0.2, 201.0)
+    assert not g.update(0.99, 200.0 + OverloadGuard.HOLD_S + 0.5)
+    assert not g.active and g.episodes == 1        # a short spike: nothing
+    ring = RawRing(max_frames=10, max_bytes=1000)
+    ring.put(b"x" * 600, 0.0, 1, 1)
+    assert abs(OverloadGuard.fill(ring) - 0.6) < 1e-9
+    ring.put(b"x", 0.0, 1, 1)
+    assert OverloadGuard.fill(ring) >= 0.6
+    g.active = True
+    old = FEATURES.get("overload_degrade", True)
+    FEATURES["overload_degrade"] = False
+    try:
+        assert g.update(0.99, 300.0) and not g.active
+        assert not g.update(0.99, 400.0) and not g.active
+    finally:
+        FEATURES["overload_degrade"] = old
+
+    class _Deep:
+        offered = shed = 0
+        why = ""
+
+        def active(self):
+            return True
+
+        def offer(self, d, no):
+            self.offered += 1
+
+        def _count_shed(self, n, why):
+            self.shed += n
+            self.why = why
+    m = scenario_model(ctx.cfg(), [])
+    frames = ScenarioBuilder().home_network()[:120]
+    h = _PipelineHarness(m)
+    h.deep, h.sync_deep = _Deep(), lambda: None
+    h.data_mode = "live"
+    w = AnalysisWorker(h, GuiGate())
+    w._process([(r, t, lt, 1) for r, t, lt in frames[:40]])
+    assert h.deep.offered == h.count == 40 and h.deep.shed == 0
+    w.overload.active = True
+    w._process([(r, t, lt, 1) for r, t, lt in frames[40:80]])
+    assert h.deep.offered == 40 and h.count == 80, (h.deep.offered, h.count)
+    assert h.deep.shed == 40 and w.overload.shed == 40
+    assert h.deep.why == "too busy" and m.count == 80
+    h.data_mode = "offline"        # a file waits for room: never shed
+    w._process([(r, t, lt, 1) for r, t, lt in frames[80:]])
+    assert h.deep.offered == 80 and h.deep.shed == 40 and h.count == 120
+    assert "counting only" in OVERLOAD_TEXT
+    for loc in ("fr", "es"):
+        assert translate_text(OVERLOAD_TEXT, loc) != OVERLOAD_TEXT, loc
+
+
+@self_test()
+def t_co03_memory_bounded(ctx):
+    """5.3.4 (M13, CO-03, a hole in B-21): past EXPIRED_KEEP expired
+    devices the oldest unlabelled ones leave memory with their baselines,
+    resets and address entries (a named one stays, and one that comes
+    back is not announced as new), and while the window is minimised the
+    address-lookup queue keeps only addresses still known and still
+    without a country, at most MINIMIZED_KEEP, and a changed-row set over
+    the cap becomes one rebuild on restore."""
+    m = scenario_model(ctx.cfg(), [])
+    reg = m.registry
+    keep = reg.EXPIRED_KEEP
+    now = 2e9
+    m.offline_now = now
+    m.capture_started = now - 10 ** 6            # past discovery
+    n = keep + 40
+    macs = ["da:%02x:%02x:00:00:01" % (i >> 8, i & 255) for i in range(n)]
+    ips = ["10.20.%d.%d" % (i // 250, 1 + i % 250) for i in range(n)]
+    for i, (mac, ip) in enumerate(zip(macs, ips)):
+        t = now - 200000 + i
+        dev = DeviceRecord(key=mac, mac=mac, ip=ip, state=STATE_EXPIRED,
+                           first_seen=t, last_seen=t, last_confirmed=t)
+        dev.ipv4s.add(ip)
+        reg.by_key[mac] = dev
+        reg.ip_to_key[ip] = mac
+        m.baselines.get(mac)
+        m.resets[mac].append(t)
+    reg.by_key[macs[0]].alias = "Grandma's tablet"     # oldest, but named
+    steps = m.tick_steps(now)
+    assert next(steps) == "lifecycle"
+    left = [d for d in reg.by_key.values()
+            if d.state == STATE_EXPIRED and not reg.labelled(d)]
+    assert len(left) == keep, len(left)
+    assert macs[0] in reg.by_key and macs[-1] in reg.by_key
+    gone = macs[1:n - keep]
+    assert len(gone) == 39
+    for mac, ip in zip(gone, ips[1:n - keep]):
+        assert mac not in reg.by_key and mac not in m.baselines.devices
+        assert mac not in m.resets and reg.ip_to_key.get(ip) != mac
+        assert mac in reg.removed and mac in reg.pruned
+    assert reg.prune_expired() == []                    # nothing more
+    back = reg.touch(None, gone[-1], "arp_reply", "came back", now + 1)
+    assert back is not None
+    before = m.metrics.totals["new_devices"]
+    m._announce_created(flush=True)
+    assert m.metrics.totals["new_devices"] == before     # not "new"
+    fresh = reg.touch(None, "02:99:88:77:66:55", "arp_reply", "new", now + 1)
+    assert fresh is not None
+    m._announce_created(flush=True)
+    assert m.metrics.totals["new_devices"] == before + 1
+    win = types.SimpleNamespace(
+        MINIMIZED_KEEP=50, _rebuild_on_restore=False,
+        tabs={"connections": types.SimpleNamespace()})
+    for i in range(300):
+        ip = "34.1.%d.%d" % (i // 250, 1 + i % 250)
+        if i < 200:
+            m.remote_hosts[ip] = RemoteHostRecord(ip=ip, last_seen=float(i))
+        m.ev_geo.add(ip)
+        m.dirty_remotes.add(ip)
+    m.remote_hosts["34.1.0.200"].country = "NL"
+    MiniWireshark._trim_while_minimized(win, m)
+    assert len(m.ev_geo) == 50, len(m.ev_geo)
+    assert all(ip in m.remote_hosts and not m.remote_hosts[ip].country
+               for ip in m.ev_geo)
+    assert min(m.remote_hosts[ip].last_seen for ip in m.ev_geo) >= 149
+    assert not m.dirty_remotes and win._rebuild_on_restore
+
+
 class _PipelineHarness:
     """Just enough of the app for the analysis worker (tests, bench)."""
 
@@ -75105,6 +75733,40 @@ def _gs_capture_start_async(app, ctx):
     finally:
         g["start_capture_source"] = old
         app.last_fault = saved_fault
+
+
+@gui_test_step("too busy: the state line says counting only, then clears "
+               "(5.3.4, IP-025); minimised queues bounded (CO-03)")
+def _gs_overload_line(app, ctx):
+    saved = app.worker
+    m = app.model
+    try:
+        app.worker = types.SimpleNamespace(overload=OverloadGuard())
+        app.worker.overload.active = True
+        assert app._sync_overload_line()
+        assert not app._sync_overload_line()             # once
+        assert translate_text(OVERLOAD_TEXT) in app.state_line_parts()[0]
+        assert any(e["kind"] == "too busy" for e in list(m.timeline)[-5:])
+        _gui_pump(app.root, 0.2)
+        app.worker.overload.active = False
+        assert app._sync_overload_line()
+        assert translate_text(OVERLOAD_TEXT) not in app.state_line_parts()[0]
+        geo = set(m.ev_geo)
+        m.ev_geo |= {"203.0.113.%d" % i for i in range(1, 255)} | \
+            {"198.51.100.%d" % i for i in range(1, 255)} | \
+            {"192.0.2.%d" % i for i in range(1, 255)} | \
+            {f"100.64.{a}.{b}" for a in range(8) for b in range(1, 255)}
+        assert len(m.ev_geo) > app.MINIMIZED_KEEP
+        app._trim_while_minimized(m)
+        assert len(m.ev_geo) <= app.MINIMIZED_KEEP
+        assert all(ip in m.remote_hosts for ip in m.ev_geo)
+        m.ev_geo |= geo & set(m.remote_hosts)
+        app._rebuild_on_restore = False
+    finally:
+        app.worker = saved
+        app._overload_shown = False
+        with contextlib.suppress(tk.TclError, AttributeError):
+            app._restyle_state_line()
 
 
 @gui_test_step("minimised window keeps memory bounded (5.2.3, B-21/B-22)")
