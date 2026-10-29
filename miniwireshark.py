@@ -10933,6 +10933,7 @@ FEATURES = {
     "signatures_v2": True,   # device signature additions, pairing (5.3.4)
     "baseline_v2": True,     # day and night baselines, kind priors (5.3.4)
     "call_quality": True,    # STUN-gated RTP loss and jitter (5.3.4 M10)
+    "notify_minimised": True,  # title count, flash, tray; opt-in (M12)
 }
 
 
@@ -11102,6 +11103,11 @@ FEATURE_HELP = {
                    "learned after 14 days away, and shows what it learned",
     "call_quality": "a Calls card under Health: lost packets and jitter "
                     "of voice and video calls, from packet headers only",
+    "notify_minimised": "when you turn it on in Settings, new DANGER alerts "
+                        "that arrive while the window is minimised or in "
+                        "the background are counted in its title and "
+                        "flash its taskbar button (on Windows also a tray "
+                        "notification)",
 }
 
 
@@ -15295,6 +15301,320 @@ ALERT_MEANS = {
     "reputation": "Usually a shared server or an old list entry; "
                   "sometimes a link to a site known for trouble.",
 }
+
+
+# ---- 5.3.4 (M12, MC9, IP-027): notice alerts while the window is away -------
+NOTIFY_STALL_BUDGET_MS = 60   # the window budgets' floor (BENCH_LIMITS S1)
+
+
+def notify_icon_struct(wchar=ctypes.c_wchar):
+    """The Windows NOTIFYICONDATAW layout (version 3 and later: balloon
+    text, title, flags, GUID, balloon icon). `wchar` is a parameter so the
+    self-test can check the size on Linux, where c_wchar is 4 bytes."""
+    u32, ptr = ctypes.c_uint32, ctypes.c_void_p
+
+    class NOTIFYICONDATAW(ctypes.Structure):
+        _fields_ = [("cbSize", u32), ("hWnd", ptr), ("uID", u32),
+                    ("uFlags", u32), ("uCallbackMessage", u32),
+                    ("hIcon", ptr), ("szTip", wchar * 128),
+                    ("dwState", u32), ("dwStateMask", u32),
+                    ("szInfo", wchar * 256), ("uTimeoutOrVersion", u32),
+                    ("szInfoTitle", wchar * 64), ("dwInfoFlags", u32),
+                    ("guidItem", ctypes.c_ubyte * 16),
+                    ("hBalloonIcon", ptr)]
+    return NOTIFYICONDATAW
+
+
+class MinimisedNotifier:
+    """5.3.4 (M12, MC9, IP-027): while the window is minimised or in the
+    background, a new DANGER alert (and a WARNING one when the user asks)
+    is counted in the window title, "(3) MiniWireshark", the taskbar
+    button flashes (Windows: FlashWindowEx; macOS: the Dock's -notify
+    attribute where Tk has it; elsewhere the title alone), and on Windows
+    an optional tray notification says how many arrived. Opt-in, no sound,
+    cleared when the window is focused or the Alerts tab is opened.
+    Muted, snoozed, switched-off and acknowledged alerts never count.
+
+    Privacy: anything shown outside the window (the title, the tray
+    notification) holds counts and the alert type only; device names come
+    in only with the "show details" option, and addresses never do (the
+    alert's own sentence, which can carry one, is not used).
+
+    The tray: no new window and no second message loop. The icon belongs
+    to the Tk window itself and asks for no callback messages, so Tk's own
+    loop has nothing new to pump; the Shell_NotifyIconW calls (which wait
+    on Explorer and could stall if it hangs) run on one helper thread, in
+    order, so the Tk thread never waits for them. The pump test in the GUI
+    test holds that thread's call for 300 ms and checks the window kept
+    answering within NOTIFY_STALL_BUDGET_MS. Windows behaviour (the flash,
+    the tray) is not verifiable on Linux: it needs Windows evidence."""
+
+    RANK = {"INFO": 0, "WARNING": 1, "DANGER": 2}
+    KNOWN_KEEP = 2000
+    TOAST_GAP_S = 60.0
+    TRAY_ID = 0x4D57
+    TITLE_RE = re.compile(r"^\(\d+\) ")
+
+    def __init__(self, config, engine_fn=None, platform=None, now_fn=None):
+        self.config = config
+        self.engine_fn = engine_fn or (lambda: None)
+        self.platform = platform or sys.platform
+        self.now = now_fn or time.monotonic
+        self.count = 0
+        self.danger = 0
+        self.latest = None           # (kind, device_key) of the newest
+        self._known = OrderedDict()  # alert id -> highest severity seen
+        self._counted = set()
+        self.flashing = False
+        self.tray_shown = False
+        self._last_toast = -1e9
+        self.done = deque(maxlen=50)  # (what, detail): log and tests
+        # the platform calls; the tests replace them
+        self.win_flash = self._win_flash
+        self.shell_notify = self._shell_notify
+        self._tray_q = None
+
+    # ---- what counts ---------------------------------------------------------
+    def option(self, name):
+        return bool(self.config.get("notifications." + name, False))
+
+    def active(self):
+        return bool(FEATURES.get("notify_minimised", True) and
+                    self.option("minimised"))
+
+    def wants(self, a):
+        sev = getattr(a, "severity", "")
+        if sev != "DANGER" and not (sev == "WARNING" and
+                                    self.option("minimised_warnings")):
+            return False
+        if getattr(a, "acknowledged", False):
+            return False
+        eng = self.engine_fn()
+        if eng is not None:
+            # a mute or a snooze set after the alert was raised (while it
+            # waited for the window) is honoured too
+            if not eng.enabled(a.kind) or eng.is_muted(
+                    a.kind, a.device_key, a.subject or a.device_key):
+                return False
+        return True
+
+    def note(self, alerts, away):
+        """Every alert the window is handed passes here. → the ones newly
+        counted (none while the window is in use: they are remembered as
+        seen). An alert counts once; one already seen counts again only
+        when it rises to DANGER."""
+        if not self.active():
+            return []
+        new = []
+        for a in alerts:
+            aid = getattr(a, "id", None)
+            if not aid:
+                continue
+            rank = self.RANK.get(getattr(a, "severity", ""), 0)
+            before = self._known.pop(aid, None)
+            self._known[aid] = max(rank, before or 0)
+            if len(self._known) > self.KNOWN_KEEP:
+                old, _r = self._known.popitem(last=False)
+                self._counted.discard(old)
+            if not away or aid in self._counted:
+                continue
+            if before is not None and not (rank == 2 and before < 2):
+                continue
+            if not self.wants(a):
+                continue
+            self._counted.add(aid)
+            new.append(a)
+        if new:
+            self.count += len(new)
+            self.danger += sum(1 for a in new if a.severity == "DANGER")
+            self.latest = (new[-1].kind, new[-1].device_key)
+        return new
+
+    def title(self, base="MiniWireshark"):
+        base = self.TITLE_RE.sub("", base or "MiniWireshark")
+        return f"({self.count}) {base}" if self.count else base
+
+    def toast_text(self, name_fn=None):
+        """(title, body) for the tray: counts and the alert type; the
+        device's name only with "show details"."""
+        tr = translate_text
+        n = self.count
+        body = (tr("1 new alert while MiniWireshark was in the background.")
+                if n == 1 else
+                tr("%d new alerts while MiniWireshark was in the "
+                   "background.") % n)
+        if self.danger:
+            body += " " + (tr("1 is DANGER.") if self.danger == 1 else
+                           tr("%d are DANGER.") % self.danger)
+        if self.latest:
+            kind, key = self.latest
+            line = tr("Latest: %s") % tr(ALERT_TYPES.get(kind, (kind,))[0])
+            if self.option("minimised_details") and name_fn is not None:
+                with contextlib.suppress(Exception):
+                    who = name_fn(key)
+                    if who:
+                        line += " — " + str(who)
+            body += "\n" + line
+        return "MiniWireshark", body
+
+    # ---- what is done --------------------------------------------------------
+    def signal(self, root, new, name_fn=None):
+        """Tk thread, after `note` counted `new`: title, flash, tray."""
+        if not new:
+            return
+        self.retitle(root)
+        self.attention(root, True)
+        if self.platform == "win32" and self.option("minimised_tray"):
+            now = self.now()
+            if not self.tray_shown or now - self._last_toast >= \
+                    self.TOAST_GAP_S:
+                self._last_toast = now
+                head, body = self.toast_text(name_fn)
+                self._tray("modify" if self.tray_shown else "add",
+                           self._hwnd(root), head, body)
+                self.tray_shown = True
+
+    def clear(self, root):
+        """The user is back (focus, or the Alerts tab): count, title,
+        flash and tray go. → True when something was showing."""
+        had = bool(self.count or self.flashing or self.tray_shown)
+        self.count = self.danger = 0
+        self.latest = None
+        if not had:
+            return False
+        self.retitle(root)
+        if self.flashing:
+            self.attention(root, False)
+        if self.tray_shown:
+            self.tray_shown = False
+            self._tray("delete", self._hwnd(root), "", "")
+        return True
+
+    def retitle(self, root):
+        try:
+            cur = root.title()
+            want = self.title(cur)
+            if want != cur:
+                root.title(want)
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _hwnd(root):
+        try:
+            return int(root.wm_frame(), 16)
+        except (tk.TclError, ValueError, TypeError, AttributeError):
+            return 0
+
+    def attention(self, root, on):
+        """Flash the taskbar button (or stop). Windows: FlashWindowEx;
+        elsewhere the window manager's attention attribute when this Tk
+        has one (macOS -notify), else nothing (the title count stays)."""
+        self.flashing = bool(on)
+        how = "none"
+        try:
+            if self.platform == "win32":
+                hwnd = self._hwnd(root)
+                if hwnd and self.win_flash(hwnd, on):
+                    how = "FlashWindowEx"
+            else:
+                attrs = root.wm_attributes()
+                for name in ("-notify", "-urgent"):
+                    if name in attrs:
+                        root.wm_attributes(name, 1 if on else 0)
+                        how = name
+                        break
+        except (tk.TclError, OSError, AttributeError, ValueError,
+                TypeError) as e:
+            LOG.info("taskbar attention not available: %s", e)
+        self.done.append(("flash" if on else "unflash", how))
+        return how
+
+    @staticmethod
+    def _win_flash(hwnd, on):
+        """FlashWindowEx. Needs Windows evidence (not verifiable here)."""
+        if not IS_WINDOWS:
+            return False
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint32),
+                        ("hwnd", ctypes.c_void_p),
+                        ("dwFlags", ctypes.c_uint32),
+                        ("uCount", ctypes.c_uint32),
+                        ("dwTimeout", ctypes.c_uint32)]
+        # FLASHW_TRAY | FLASHW_TIMERNOFG (until the window comes to the
+        # front), or FLASHW_STOP
+        fi = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd,
+                        (0x2 | 0xC) if on else 0, 0, 0)
+        fn = ctypes.windll.user32.FlashWindowEx
+        fn.argtypes = [ctypes.POINTER(FLASHWINFO)]
+        fn.restype = ctypes.c_int
+        fn(ctypes.byref(fi))
+        return True
+
+    # ---- the tray (Windows) --------------------------------------------------
+    def _tray(self, op, hwnd, head, body):
+        if self._tray_q is None:
+            self._tray_q = queue.Queue()
+            threading.Thread(target=self._tray_loop, args=(self._tray_q,),
+                             daemon=True, name="tray-notify").start()
+        self._tray_q.put((op, hwnd, head, body))
+        self.done.append(("tray", op))
+
+    def _tray_loop(self, q):
+        while True:
+            item = q.get()
+            if item is None:
+                return
+            try:
+                ok = self.shell_notify(*item)
+            except Exception:                        # noqa: BLE001
+                LOG.exception("tray notification")
+                ok = False
+            if not ok:
+                LOG.info("tray notification %s: not shown", item[0])
+
+    def shutdown(self, root=None):
+        """At exit: the icon must not stay behind in the tray."""
+        q, self._tray_q = self._tray_q, None
+        if q is not None:
+            q.put(None)
+        if self.tray_shown:
+            self.tray_shown = False
+            try:
+                self.shell_notify("delete", self._hwnd(root), "", "")
+            except Exception:                        # noqa: BLE001
+                LOG.exception("tray notification at exit")
+
+    def _shell_notify(self, op, hwnd, head, body):
+        """Shell_NotifyIconW, on the helper thread. Needs Windows evidence
+        (not verifiable here)."""
+        if not IS_WINDOWS or not hwnd:
+            return False
+        nid_t = notify_icon_struct()
+        nid = nid_t()
+        nid.cbSize = ctypes.sizeof(nid_t)
+        nid.hWnd = hwnd
+        nid.uID = self.TRAY_ID
+        fn = ctypes.windll.shell32.Shell_NotifyIconW
+        fn.argtypes = [ctypes.c_uint32, ctypes.POINTER(nid_t)]
+        fn.restype = ctypes.c_int
+        if op == "delete":
+            return bool(fn(2, ctypes.byref(nid)))           # NIM_DELETE
+        load = ctypes.windll.user32.LoadIconW
+        load.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        load.restype = ctypes.c_void_p
+        nid.hIcon = load(None, ctypes.c_void_p(32515))      # IDI_WARNING
+        nid.uFlags = 0x2 | 0x4 | 0x10      # NIF_ICON | NIF_TIP | NIF_INFO
+        nid.szTip = "MiniWireshark"
+        nid.szInfo = body[:255]
+        nid.szInfoTitle = head[:63]
+        nid.uTimeoutOrVersion = 10000
+        nid.dwInfoFlags = 0x2 | 0x10       # NIIF_WARNING | NIIF_NOSOUND
+        if op == "add" and fn(0, ctypes.byref(nid)):        # NIM_ADD
+            return True
+        # NIM_MODIFY (also when an icon was left from an earlier run)
+        return bool(fn(1, ctypes.byref(nid)))
 
 
 def _explain_alerts():
@@ -21382,7 +21702,10 @@ def _default_config():
                    "scan_ports_threshold": 60, "scan_hosts_threshold": 40,
                    "flag_http": False,
                    "muted_devices": [], "expected": [], "snoozed": {}},
-        "notifications": {"feed_alerts": True, "danger_only": False},
+        "notifications": {"feed_alerts": True, "danger_only": False,
+                          "minimised": False, "minimised_warnings": False,
+                          "minimised_tray": False,
+                          "minimised_details": False},
         "performance": {"cpu_friendly_mode": False, "mode": "Automatic",
                         "full_power_cores": 2, "ram_cap_mb": 1536,
                         "shedding": "Smart", "battery_aware": True,
@@ -24089,6 +24412,19 @@ Also show alerts in the live feed ¦ Afficher aussi les alertes dans le fil en d
 Alerts always appear in the Alerts and Timeline tabs. ¦ Les alertes apparaissent toujours dans les onglets Alertes et Chronologie. ¦ Las alertas siempre aparecen en las pestañas Alertas y Cronología.
 In the feed, only show DANGER alerts ¦ Dans le fil, n'afficher que les alertes DANGER ¦ En el flujo, mostrar solo las alertas de PELIGRO
 Keeps the feed calm; warnings stay in the Alerts tab. ¦ Garde le fil calme ; les avertissements restent dans l'onglet Alertes. ¦ Mantiene el flujo tranquilo; los avisos quedan en la pestaña Alertas.
+Get my attention when a DANGER alert arrives while the window is minimised ¦ M'avertir quand une alerte DANGER arrive alors que la fenêtre est réduite ¦ Avisarme cuando llegue una alerta de PELIGRO con la ventana minimizada
+Off by default. The window's title counts the new alerts, like “(2) MiniWireshark”, and on Windows its taskbar button flashes. No sound. It clears when you come back to the window or open the Alerts tab. Muted and snoozed alerts never count. ¦ Désactivé par défaut. Le titre de la fenêtre compte les nouvelles alertes, comme « (2) MiniWireshark », et sous Windows son bouton clignote dans la barre des tâches. Aucun son. Tout s'efface quand vous revenez dans la fenêtre ou ouvrez l'onglet Alertes. Les alertes muettes ou en pause ne comptent jamais. ¦ Desactivado de forma predeterminada. El título de la ventana cuenta las alertas nuevas, como «(2) MiniWireshark», y en Windows su botón parpadea en la barra de tareas. Sin sonido. Se borra cuando vuelve a la ventana o abre la pestaña Alertas. Las alertas silenciadas o pospuestas nunca cuentan.
+Also for WARNING alerts ¦ Aussi pour les alertes AVERTISSEMENT ¦ También para las alertas de AVISO
+Off by default, so only DANGER alerts call you back. ¦ Désactivé par défaut : seules les alertes DANGER vous rappellent. ¦ Desactivado de forma predeterminada: solo las alertas de PELIGRO le llaman.
+Windows: also show a notification by the clock ¦ Windows : afficher aussi une notification près de l'horloge ¦ Windows: mostrar también una notificación junto al reloj
+A silent notification from the system tray, at most one a minute. Windows only; on Linux and macOS the title count is used. ¦ Une notification silencieuse de la zone de notification, une par minute au plus. Windows uniquement ; sous Linux et macOS, le compte dans le titre est utilisé. ¦ Una notificación silenciosa del área de notificación, como mucho una por minuto. Solo Windows; en Linux y macOS se usa el recuento del título.
+Show device names in that notification ¦ Afficher les noms des appareils dans cette notification ¦ Mostrar los nombres de los dispositivos en esa notificación
+Off by default for privacy: what is shown outside the window says how many alerts and what kind, never which device. Addresses are never shown there. ¦ Désactivé par défaut pour la confidentialité : ce qui s'affiche hors de la fenêtre indique combien d'alertes et de quel type, jamais quel appareil. Les adresses n'y sont jamais affichées. ¦ Desactivado de forma predeterminada por privacidad: lo que se muestra fuera de la ventana dice cuántas alertas y de qué tipo, nunca qué dispositivo. Las direcciones nunca se muestran ahí.
+1 new alert while MiniWireshark was in the background. ¦ 1 nouvelle alerte pendant que MiniWireshark était en arrière-plan. ¦ 1 alerta nueva mientras MiniWireshark estaba en segundo plano.
+%d new alerts while MiniWireshark was in the background. ¦ %d nouvelles alertes pendant que MiniWireshark était en arrière-plan. ¦ %d alertas nuevas mientras MiniWireshark estaba en segundo plano.
+1 is DANGER. ¦ 1 est DANGER. ¦ 1 es de PELIGRO.
+%d are DANGER. ¦ %d sont DANGER. ¦ %d son de PELIGRO.
+Latest: %s ¦ Dernière : %s ¦ Última: %s
 Un-mute all alerts ¦ Réactiver toutes les alertes ¦ Reactivar todas las alertas
 Every feature that contacts an outside service is listed here, with exactly what it sends. Nothing is uploaded silently and there is no telemetry. ¦ Chaque fonction qui contacte un service extérieur est listée ici, avec exactement ce qu'elle envoie. Rien n'est envoyé en silence et il n'y a aucune télémétrie. ¦ Cada función que contacta con un servicio externo aparece aquí, con exactamente lo que envía. No se sube nada en silencio y no hay telemetría.
 What MiniWireshark itself sends ¦ Ce que MiniWireshark envoie lui-même ¦ Lo que envía el propio MiniWireshark
@@ -29060,6 +29396,31 @@ SETTINGS_PAGES = [
               "requires": "notifications.feed_alerts",
               "help": "Keeps the feed calm; warnings stay in the Alerts "
                       "tab."},
+             {"key": "notifications.minimised", "type": "bool",
+              "label": "Get my attention when a DANGER alert arrives while "
+                       "the window is minimised",
+              "help": "Off by default. The window's title counts the new "
+                      "alerts, like “(2) MiniWireshark”, and on Windows its "
+                      "taskbar button flashes. No sound. It clears when you "
+                      "come back to the window or open the Alerts tab. "
+                      "Muted and snoozed alerts never count."},
+             {"key": "notifications.minimised_warnings", "type": "bool",
+              "label": "Also for WARNING alerts",
+              "requires": "notifications.minimised",
+              "help": "Off by default, so only DANGER alerts call you "
+                      "back."},
+             {"key": "notifications.minimised_tray", "type": "bool",
+              "label": "Windows: also show a notification by the clock",
+              "requires": "notifications.minimised",
+              "help": "A silent notification from the system tray, at most "
+                      "one a minute. Windows only; on Linux and macOS the "
+                      "title count is used."},
+             {"key": "notifications.minimised_details", "type": "bool",
+              "label": "Show device names in that notification",
+              "requires": "notifications.minimised",
+              "help": "Off by default for privacy: what is shown outside "
+                      "the window says how many alerts and what kind, never "
+                      "which device. Addresses are never shown there."},
              {"type": "alert_rules"},
              {"type": "action", "actions": [
                  ("Un-mute all alerts", "unmute_alerts")]},
@@ -42985,6 +43346,9 @@ class MiniWireshark:
         self.asof = None
         self.root.bind("<FocusOut>", self._on_root_focus_out, add="+")
         self.root.bind("<FocusIn>", self._on_root_focus_in, add="+")
+        # 5.3.4 (M12, MC9): the title count and flash while away (opt-in)
+        self.notifier = MinimisedNotifier(
+            self.config, lambda: getattr(self.model, "alerts", None))
         self.apply_reduce_motion()
         self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map,
                              add="+")
@@ -43504,6 +43868,8 @@ class MiniWireshark:
         prev = getattr(self, "_shown_tab_name", None)
         if cur != prev:
             self._shown_tab_name = cur
+            if cur == "alerts":
+                self.notify_clear()           # 5.3.4 (M12): seen now
             with contextlib.suppress(AttributeError):
                 self.router.visited(cur)
                 self._group_last[tab_group_of(cur)] = cur
@@ -45418,6 +45784,9 @@ class MiniWireshark:
     def _on_root_focus_in(self, _e=None):
         if getattr(self, "_away_since", None) is not None:
             self.note_focus_back()
+        n = getattr(self, "notifier", None)
+        if n is not None and (n.count or n.flashing or n.tray_shown):
+            self.notify_clear()
 
     def note_focus_lost(self, now=None):
         if getattr(self, "_away_since", None) is None:
@@ -48301,6 +48670,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         website and connection updates of that round, and the rows it had
         already taken were never shown ("sometimes stuff doesn't load")."""
         if self.minimized():
+            self._notify_pending(self.model)
             self._trim_while_minimized(self.model)
             with contextlib.suppress(tk.TclError):
                 self.root.after(self._ms(700), self._flush_ui)
@@ -48442,7 +48812,49 @@ proc ::mw_retheme {w map fgnew deffg} {
                 for ip in ips:
                     self.geoip.request(ip)
 
+    # ---- 5.3.4 (M12, MC9, IP-027): alerts while the window is away -------
+    def window_away(self):
+        """Minimised, or the focus is in another program."""
+        return self.minimized() or \
+            getattr(self, "_away_since", None) is not None
+
+    def _notify_alerts(self, alerts):
+        n = getattr(self, "notifier", None)
+        if n is None or not alerts or not n.active():
+            return []
+        try:
+            # a capture file being read is not something happening now
+            away = self.window_away() and self.data_mode in ("live", "demo")
+            new = n.note(alerts, away)
+            if new:
+                n.signal(self.root, new, self._notify_name)
+            return new
+        except Exception:                            # noqa: BLE001
+            LOG.exception("notify while minimised")
+            return []
+
+    def _notify_pending(self, m):
+        """While minimised the alerts wait in the model (nobody can see
+        the tabs); they are counted here before the trim."""
+        if m.ev_alerts:
+            self._notify_alerts(list(m.ev_alerts))
+
+    def _notify_name(self, key):
+        dev = self.model.registry.by_key.get(key) if key else None
+        return dev.display_name() if dev is not None else ""
+
+    def notify_clear(self):
+        n = getattr(self, "notifier", None)
+        if n is None:
+            return False
+        try:
+            return n.clear(self.root)
+        except Exception:                            # noqa: BLE001
+            LOG.exception("notify clear")
+            return False
+
     def _show_alerts(self, alerts):
+        self._notify_alerts(alerts)
         tab = self.tabs["alerts"]
         for a in alerts:
             tab.upsert(a)
@@ -53623,6 +54035,8 @@ proc ::mw_retheme {w map fgnew deffg} {
 
     def _on_close(self):
         LOG.info("shutting down")
+        if getattr(self, "notifier", None) is not None:
+            self.notifier.shutdown(self.root)    # guarded inside
         self._remember_window()
         # 5.2.3 (B-04): the window goes away first; the saving below used
         # to happen behind a "Not responding" window
@@ -63223,6 +63637,199 @@ def t_co01_co02_router_impersonation(ctx):
             if a.kind == "arp_spoof" and a.severity == "DANGER"]
     assert ATT[1] not in reg3.gw_macs, reg3.gw_macs
     assert reg3.ip_to_key.get(S.GW[0]) == S.GW[1].lower()
+
+
+class _FakeNotifyRoot:
+    """Just enough of a Tk root for MinimisedNotifier: a title, the
+    window-manager attributes, a frame id."""
+
+    def __init__(self, attrs=()):
+        self._title = "MiniWireshark"
+        self.attrs = {a: 0 for a in attrs}
+
+    def title(self, s=None):
+        if s is None:
+            return self._title
+        self._title = s
+        return ""
+
+    def wm_attributes(self, *a):
+        if not a:
+            out = ()
+            for k, v in self.attrs.items():
+                out += (k, v)
+            return out
+        self.attrs[a[0]] = a[1]
+        return ""
+
+    def wm_frame(self):
+        return "0x1234"
+
+
+def _mc9_alert(eng, kind, sev, key="aa:bb:cc:dd:ee:01",
+               reason="192.168.1.77 answered"):
+    return eng._add(kind, sev, key, reason, "obs", "interp", "poss")
+
+
+@self_test()
+def t_mc9_notify_count_title_and_clear(ctx):
+    """5.3.4 (M12, MC9): off by default; while away a new DANGER alert is
+    counted once in the title, a WARNING only when asked, INFO never; an
+    alert seen in the window counts again only when it rises to DANGER;
+    coming back clears the title and the flash; the tray text holds no
+    device name or address unless "show details" is on; the Windows calls
+    (mocked here) flash, add, modify at most once a minute, delete on
+    clear and at exit, and run off the Tk thread."""
+    cfg = ctx.cfg({})
+    eng = AlertEngine(cfg)
+    clock = [1000.0]
+    n = MinimisedNotifier(cfg, lambda: eng, platform="linux",
+                          now_fn=lambda: clock[0])
+    d1 = _mc9_alert(eng, "arp_spoof", "DANGER")
+    assert not n.active() and n.note([d1], True) == [] and n.count == 0
+    cfg.set("notifications.minimised", True)
+    old = FEATURES.get("notify_minimised", True)
+    try:
+        FEATURES["notify_minimised"] = False
+        assert n.note([d1], True) == []
+    finally:
+        FEATURES["notify_minimised"] = old
+    # in use: remembered as seen, not counted
+    w1 = _mc9_alert(eng, "gateway_change", "WARNING", key="ip:192.168.1.1")
+    assert n.note([w1], False) == [] and n.count == 0
+    # away
+    i1 = _mc9_alert(eng, "new_device", "INFO", key="aa:bb:cc:dd:ee:09")
+    w2 = _mc9_alert(eng, "dhcp_anomaly", "WARNING", key="")
+    assert n.note([d1, i1, w2], True) == [d1]
+    assert n.note([d1], True) == [] and n.count == 1     # once only
+    cfg.set("notifications.minimised_warnings", True)
+    w3 = _mc9_alert(eng, "dns_failures", "WARNING", key="")
+    assert n.note([w2, w3], True) == [w3] and n.count == 2
+    w3.severity = "DANGER"                 # counted already: not twice
+    assert n.note([w3], True) == [] and n.count == 2
+    w3.severity = "WARNING"
+    assert n.note([w1], True) == []                      # seen before
+    w1.severity = "DANGER"                               # it rose
+    assert n.note([w1], True) == [w1] and n.count == 3 and n.danger == 2
+    assert n.title("MiniWireshark") == "(3) MiniWireshark"
+    assert n.title("(2) MiniWireshark") == "(3) MiniWireshark"
+    # the tray text: counts and the kind, no name or address by default
+    head, body = n.toast_text(lambda key: "Kitchen tablet")
+    assert head == "MiniWireshark", head
+    assert body.startswith("3 new alerts while MiniWireshark was in the "
+                           "background. 2 are DANGER.\nLatest: "), body
+    assert "Kitchen" not in body and "192.168" not in body and \
+        "aa:bb" not in body, body
+    cfg.set("notifications.minimised_details", True)
+    assert n.toast_text(lambda key: "Kitchen tablet")[1].endswith(
+        " — Kitchen tablet")
+    cfg.set("notifications.minimised_details", False)
+    for loc in ("fr", "es"):
+        assert translate_text("%d new alerts while MiniWireshark was in "
+                              "the background.", loc) != \
+            "%d new alerts while MiniWireshark was in the background."
+    # Linux: the title count; no attention attribute in X11 Tk: nothing
+    root = _FakeNotifyRoot()
+    n.signal(root, [w1])
+    assert root.title() == "(3) MiniWireshark", root.title()
+    assert n.done[-1] == ("flash", "none"), list(n.done)
+    assert n.clear(root) and n.count == 0 and not n.flashing
+    assert root.title() == "MiniWireshark"
+    assert not n.clear(root)                             # nothing showing
+    # macOS: the Dock's -notify, set and taken back
+    mac = MinimisedNotifier(cfg, lambda: eng, platform="darwin")
+    mroot = _FakeNotifyRoot(("-alpha", "-notify"))
+    d2 = _mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:02")
+    mac.signal(mroot, mac.note([d2], True))
+    assert mroot.attrs["-notify"] == 1 and mac.done[-1] == ("flash",
+                                                            "-notify")
+    mac.clear(mroot)
+    assert mroot.attrs["-notify"] == 0 and mroot.title() == "MiniWireshark"
+    # Windows, mocked: FlashWindowEx and the tray on a helper thread
+    calls, flashes, done = [], [], threading.Event()
+
+    def fake_shell(op, hwnd, h, b):
+        calls.append((op, hwnd, threading.current_thread().name, b))
+        if op == "delete":
+            done.set()
+        return True
+    win = MinimisedNotifier(cfg, lambda: eng, platform="win32",
+                            now_fn=lambda: clock[0])
+    win.win_flash = lambda hwnd, on: flashes.append((hwnd, on)) or True
+    win.shell_notify = fake_shell
+    wroot = _FakeNotifyRoot()
+    d3 = _mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:03")
+    win.signal(wroot, win.note([d3], True))
+    assert flashes == [(0x1234, True)] and not win.tray_shown  # tray off
+    cfg.set("notifications.minimised_tray", True)
+    d4 = _mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:04")
+    win.signal(wroot, win.note([d4], True))
+    d5 = _mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:05")
+    win.signal(wroot, win.note([d5], True))          # within the minute
+    clock[0] += win.TOAST_GAP_S
+    d6 = _mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:06")
+    win.signal(wroot, win.note([d6], True))
+    assert wroot.title() == "(4) MiniWireshark"
+    win.clear(wroot)
+    assert done.wait(5), calls
+    assert [c[0] for c in calls] == ["add", "modify", "delete"], calls
+    assert all(c[1] == 0x1234 and c[2] == "tray-notify" for c in calls)
+    assert "4 new alerts" in calls[1][3] and "aa:bb" not in calls[1][3]
+    assert flashes[-1] == (0x1234, False)
+    win.signal(wroot, win.note(
+        [_mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:07")],
+        True))
+    assert win.tray_shown
+    t_end = time.time() + 5
+    while len(calls) < 4 and time.time() < t_end:
+        time.sleep(0.01)
+    win.shutdown(wroot)                              # at exit, directly
+    assert calls[-1][0] == "delete" and not win.tray_shown
+    # the NOTIFYICONDATAW layout Windows expects (976 / 956 bytes)
+    st = notify_icon_struct(ctypes.c_uint16)
+    want = 976 if ctypes.sizeof(ctypes.c_void_p) == 8 else 956
+    assert ctypes.sizeof(st) == want, ctypes.sizeof(st)
+    if not IS_WINDOWS:          # the real calls refuse off Windows
+        assert not MinimisedNotifier._win_flash(1, True)
+        assert not win._shell_notify("add", 1, "t", "b")
+
+
+@self_test()
+def t_mc9_notify_honours_mute_and_snooze(ctx):
+    """5.3.4 (M12, MC9): an alert muted, snoozed, marked expected,
+    switched off or acknowledged after it was raised (while it waited
+    for the minimised window) never counts or flashes; a snooze that
+    ended lets the next one through."""
+    cfg = ctx.cfg({"notifications.minimised": True,
+                   "notifications.minimised_warnings": True})
+    eng = AlertEngine(cfg)
+    n = MinimisedNotifier(cfg, lambda: eng, platform="linux")
+    root = _FakeNotifyRoot()
+    a = _mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:11")
+    b = _mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:12")
+    c = _mc9_alert(eng, "gateway_change", "WARNING", key="ip:10.0.0.1")
+    d = _mc9_alert(eng, "dhcp_anomaly", "WARNING", key="")
+    e = _mc9_alert(eng, "duplicate_ip", "WARNING", key="ip:10.0.0.9")
+    # the user acts while they wait
+    cfg.set("alerts.snoozed", {"arp_spoof|*": time.time() + 3600})
+    cfg.set("alerts.muted_devices", ["gateway_change|ip:10.0.0.1"])
+    cfg.set("alerts.dhcp_anomaly", False)
+    eng.acknowledge(e.id)
+    got = n.note([a, b, c, d, e], True)
+    n.signal(root, got)
+    assert got == [] and n.count == 0 and not n.flashing, got
+    assert root.title() == "MiniWireshark" and not n.done
+    # muted at the source: never raised, so nothing to count either
+    assert _mc9_alert(eng, "arp_spoof", "DANGER", key="x") is None
+    # one device's snooze only
+    cfg.set("alerts.snoozed", {"arp_spoof|aa:bb:cc:dd:ee:12":
+                               time.time() + 3600})
+    f = _mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:13")
+    assert n.note([f], True) == [f]
+    # the snooze is over: the next alert counts
+    cfg.set("alerts.snoozed", {"arp_spoof|*": time.time() - 1})
+    g = _mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:14")
+    assert n.note([g], True) == [g] and n.count == 2
 
 
 @self_test()
@@ -74400,6 +75007,146 @@ def gt_534_calls_card(app, ctx):
     finally:
         app.model.calls = old
         hl.refresh()
+
+
+@gui_test_step("5.3.4 M12: notifications while minimised — the window keeps "
+               "answering while the tray call runs (pump test); the title "
+               "count; focus and the Alerts tab clear it")
+def gt_534_notify_minimised(app, ctx):
+    """The pump test (IP-027). Off Windows the platform calls are mocked
+    (the tray call is held for 300 ms on its thread, as a hung Explorer
+    would hold it); on Windows the real FlashWindowEx and
+    Shell_NotifyIconW run, which is the Windows evidence this needs."""
+    root, m, n, cfg = app.root, app.model, app.notifier, app.config
+    keys = ("notifications.minimised", "notifications.minimised_tray",
+            "notifications.minimised_details")
+    saved_cfg = {k: cfg.get(k, False) for k in keys}
+    saved = (n.platform, n.win_flash, n.shell_notify, app.data_mode,
+             getattr(app, "_away_since", None))
+    real_shell = n.shell_notify
+    calls, flashes, mine = [], [], []
+    slack = float(os.environ.get("MW_SLOW", "1") or 1)
+
+    def shell(op, hwnd, head, body):
+        t0 = time.perf_counter()
+        if IS_WINDOWS:
+            ok = real_shell(op, hwnd, head, body)
+        else:
+            time.sleep(0.3)
+            ok = True
+        calls.append((op, threading.current_thread().name, body,
+                      time.perf_counter() - t0, ok))
+        return ok
+
+    def raise_alert(i):
+        a = m.alerts._add("arp_spoof", "DANGER", f"fe:00:00:00:12:{i:02x}",
+                          f"10.99.0.{i} claims the router's address",
+                          "obs", "interp", "poss")
+        assert a is not None
+        mine.append(a)
+        return a
+
+    beat = {"on": True, "last": time.perf_counter(), "gaps": []}
+
+    def heartbeat():
+        now = time.perf_counter()
+        beat["gaps"].append(now - beat["last"])
+        beat["last"] = now
+        if beat["on"]:
+            root.after(10, heartbeat)
+    try:
+        app._select_tab("dash")
+        _gui_pump(root, 0.2)
+        for k in keys[:2]:
+            cfg.set(k, True)
+        if not IS_WINDOWS:
+            n.platform = "win32"
+            n.win_flash = lambda hwnd, on: flashes.append((hwnd, on)) or True
+        n.shell_notify = shell
+        n.clear(root)
+        app.data_mode = "live"
+        app._away_since = time.time()           # the focus is elsewhere
+        assert app.window_away()
+        # 1. the pump test: the tray call runs while Tk keeps beating
+        batch = [raise_alert(i) for i in range(20)]
+        _gui_pump(root, 0.05)
+        beat["last"] = time.perf_counter()
+        root.after(10, heartbeat)
+        t0 = time.perf_counter()
+        got = app._notify_alerts(batch)
+        tk_ms = (time.perf_counter() - t0) * 1000
+        assert len(got) == 20, len(got)
+        assert root.title() == "(20) MiniWireshark", root.title()
+        assert tk_ms <= NOTIFY_STALL_BUDGET_MS * slack, tk_ms
+        _gui_pump(root, 0.1, lambda: len(calls) >= 1, timeout=10)
+        _gui_pump(root, 0.2)
+        beat["on"] = False
+        stall = max(beat["gaps"] or [0]) * 1000
+        assert calls and calls[0][0] == "add" and \
+            calls[0][1] == "tray-notify", calls
+        assert stall <= NOTIFY_STALL_BUDGET_MS * slack, \
+            f"the window stalled {stall:.0f} ms while the tray call ran"
+        assert len(beat["gaps"]) >= 15, len(beat["gaps"])   # kept beating
+        if not IS_WINDOWS:
+            assert calls[0][3] >= 0.29 and flashes[0][1] is True, calls
+        LOG.info("notify pump test: Tk side %.1f ms, longest stall %.0f ms "
+                 "while a %.0f ms tray call ran", tk_ms, stall,
+                 calls[0][3] * 1000)
+        # privacy: no address and no device name outside the window
+        assert "10.99.0" not in calls[0][2] and "fe:00" not in calls[0][2]
+        assert "20 new alerts" in calls[0][2] or CURRENT_LOCALE != "en"
+        # 2. minimised: the alerts wait in the model and are counted there
+        # before the trim; the window counts them once when it shows them
+        before = n.count
+        a = raise_alert(30)
+        m.ev_alerts.append(a)
+        app._notify_pending(m)
+        assert n.count == before + 1 and a.id in n._counted, n.count
+        _gui_pump(root, 0.2, lambda: not m.ev_alerts, timeout=10)
+        assert n.count <= before + 1, n.count       # never twice
+        # 3. the Alerts tab clears it, the tray icon goes
+        raise_alert(31)
+        n.signal(root, n.note([mine[-1]], True))
+        assert n.count >= 1 and root.title().startswith("(")
+        app._select_tab("alerts")
+        _gui_pump(root, 0.1)
+        assert n.count == 0 and root.title() == "MiniWireshark", \
+            root.title()
+        assert not n.flashing and ("tray", "delete") in n.done
+        if not IS_WINDOWS:
+            assert flashes[-1][1] is False, flashes
+        _gui_pump(root, 0.1, lambda: calls[-1][0] == "delete", timeout=10)
+        assert calls[-1][0] == "delete", [c[0] for c in calls]
+        # 4. coming back to the window clears it
+        app._select_tab("dash")
+        n.signal(root, n.note([raise_alert(32)], True))
+        assert root.title() == "(1) MiniWireshark", root.title()
+        app._on_root_focus_in()
+        assert n.count == 0 and root.title() == "MiniWireshark"
+        # 5. in use, the setting off: nothing happens
+        app._away_since = None
+        assert app._notify_alerts([raise_alert(33)]) == []
+        app._away_since = time.time()
+        cfg.set("notifications.minimised", False)
+        assert app._notify_alerts([raise_alert(34)]) == []
+        assert root.title() == "MiniWireshark"
+    finally:
+        beat["on"] = False
+        _gui_pump(root, 0.1, lambda: not calls or calls[-1][0] == "delete",
+                  timeout=5)
+        n.clear(root)
+        (n.platform, n.win_flash, n.shell_notify, app.data_mode,
+         app._away_since) = saved
+        for k, v in saved_cfg.items():
+            cfg.set(k, v)
+        for a in mine:
+            m.alerts.alerts.pop(a.id, None)
+            with contextlib.suppress(ValueError):
+                m.alerts.order.remove(a.id)
+            if m.alerts._open.get((a.kind, a.subject)) == a.id:
+                del m.alerts._open[(a.kind, a.subject)]
+        app.tabs["alerts"].rebuild()
+        root.title("MiniWireshark")
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
