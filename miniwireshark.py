@@ -17389,6 +17389,10 @@ BASELINE_PRIOR_MINUTES = 5       # a brand-new device settles this long
 BASELINE_PRIOR_WEIGHT = 5        # the prior counts as this many minutes
 BASELINE_SERVICE_MINUTES = 60    # services settled: no new one for this long
 # kinds that do one job, so a new service is worth a word
+# 5.3.4 review: routine services any device may reach now and then (name
+# lookups, clock, DHCP, discovery, call set-up): never "a new service"
+BASELINE_ROUTINE_PORTS = frozenset((53, 67, 68, 123, 1900, 3478, 5349, 5353,
+                                    19302))
 BASELINE_FIXED_KINDS = frozenset(("printer", "camera", "iot", "speaker",
                                   "tv", "nas"))
 # kind: ((packets, bytes up, bytes down, hosts, DNS, new connections) per
@@ -17459,6 +17463,7 @@ class DeviceBaseline:
         self.cur_dests = set()
         # baseline v2
         self.kind = ""              # KIND_PRIORS key, set by the model
+        self.kind_sure = True       # the kind is known well, not a guess
         self.prof = {}              # "day" | "night" -> {n, mean, var}
         self.first = 0.0            # first and last learned minute
         self.last = 0.0
@@ -17485,8 +17490,9 @@ class DeviceBaseline:
         """True when a device of a one-job kind that has settled (an hour
         of its own minutes, no new service for the last hour) reaches a
         service it has never used."""
-        if not port or port in self.services or len(self.services) >= 40:
-            return False
+        if not port or port in self.services or len(self.services) >= 40 \
+                or port >= 32768 or port in BASELINE_ROUTINE_PORTS:
+            return False                  # 5.3.4 review: not a service
         return (self.kind in BASELINE_FIXED_KINDS and
                 self.n >= BASELINE_SERVICE_MINUTES and bool(self.services) and
                 self.n - self.svc_at >= BASELINE_SERVICE_MINUTES)
@@ -17562,7 +17568,7 @@ class DeviceBaseline:
         info = {"period": period, "own": p["n"], "total": self.n,
                 "other": self.profile_n("night" if period == "day"
                                         else "day"),
-                "kind": self.kind or "unknown"}
+                "kind": self.kind or "unknown", "sure": self.kind_sure}
         snapshot = (vals, dict(p["mean"]),
                     {f: math.sqrt(max(0.0, p["var"][f]))
                      for f in self.FEATURES}, self.n, info)
@@ -17582,7 +17588,7 @@ class DeviceBaseline:
              "hours": self.hours,
              "protocols": dict(self.protocols.most_common(20)),
              "services": {str(k): v for k, v in
-                          self.services.most_common(20)},
+                          self.services.most_common(40)},
              "countries": sorted(self.countries)[:60]}
         if FEATURES.get("baseline_v2", True):
             # the 5.2.3 keys stay as they were (an older copy reads them
@@ -17661,14 +17667,17 @@ class DeviceBaseline:
     @classmethod
     def from_dict(cls, d):
         b = cls()
-        with contextlib.suppress(TypeError, ValueError, AttributeError):
-            b.n = int(d.get("n", 0))
+        # 5.3.4 review: a huge number (1e999 reads as inf) or NaN in a
+        # saved row is dropped, never carried on or allowed to stop loading
+        with contextlib.suppress(TypeError, ValueError, AttributeError,
+                                 OverflowError):
+            b.n = max(0, int(_finite(d.get("n", 0))))
             for f in cls.FEATURES:
-                b.mean[f] = float((d.get("mean") or {}).get(f, 0.0))
-                b.var[f] = float((d.get("var") or {}).get(f, 0.0))
+                b.mean[f] = max(0.0, _finite((d.get("mean") or {}).get(f)))
+                b.var[f] = max(0.0, _finite((d.get("var") or {}).get(f)))
             hrs = d.get("hours") or []
             if len(hrs) == 24:
-                b.hours = [int(x) for x in hrs]
+                b.hours = [max(0, int(_finite(x))) for x in hrs]
             b.protocols = _num_map(d.get("protocols"))
             b.services = Counter({int(k): v for k, v in
                                   _num_map(d.get("services")).items()
@@ -17738,9 +17747,11 @@ class BaselineEngine:
         for f, floor in self.FLOORS.items():
             k = s_up if f == "bytes_up" else s_down if f == "bytes_down" \
                 else s_n
-            # still on the prior: the full floor at least
-            floor = floor * (k if own else max(1.0, k))
             v, m, s = vals.get(f, 0), mean.get(f, 0.0), std.get(f, 0.0)
+            # still on the prior, or the kind is only a guess (a phone
+            # taken for a plug, 5.3.4 review): the full floor at least
+            floor = floor * (k if own and info.get("sure", True)
+                             else max(1.0, k))
             if v >= floor and v > m * mult and v > m + 4 * max(s, 1.0):
                 out.append((f, v, m))
         if out and info["own"] < BASELINE_PRIOR_MINUTES and info["other"]:
@@ -17764,7 +17775,10 @@ class BaselineEngine:
     def load(self, d):
         for k, bd in (d or {}).items():
             if isinstance(bd, dict):
-                self.devices[k] = DeviceBaseline.from_dict(bd)
+                try:
+                    self.devices[k] = DeviceBaseline.from_dict(bd)
+                except Exception as e:               # noqa: BLE001
+                    LOG.warning("baseline of %s not loaded: %s", k, e)
 
 
 class ScanTracker:
@@ -18982,8 +18996,9 @@ class RtpStream:
         span = p[-1][0] - p[0][0]
         if len(p) < self.RATE_PACKETS or span < self.RATE_SPAN:
             if len(p) >= 400:
-                self.rejected = True
-                self.pending = None
+                # 5.3.4 review: HD video sends more than 400 packets in
+                # 0.8 s; keep the first and the latest, never turn it away
+                del p[1:-199]
             return
         est = _rtp_ts_delta(p[0][1], p[-1][1]) / span
         want = RTP_CLOCK.get(self.pt)
@@ -20868,11 +20883,15 @@ class NetworkModel:
             svc = (flow.remote_port if flow and flow.device_key == dev.key
                    and new_flow else None)
             if FEATURES.get("baseline_v2", True):
-                b.kind = baseline_kind(dev.device_class)
+                b.kind = baseline_kind(dev.user_class or dev.device_class)
+                # 5.3.4 review: only a kind known well (you set it, or
+                # "Likely") lowers the floors below the usual
+                b.kind_sure = bool(dev.user_class or
+                                   dev.class_confidence == "Likely")
                 # 5.3.4 (MC5): a one-job device reaching a new service on
                 # the Internet (it opened the connection)
                 if svc and role == "sent" and direction == "up" and \
-                        svc < 49152 and b.is_new_service(svc):
+                        b.is_new_service(svc):
                     self._alert(self.alerts.unusual_service(
                         dev, svc, remote, sorted(b.services)[:8]))
             snap = b.observe(ts, d["length"], role, remote,
@@ -22537,8 +22556,14 @@ class Store:
             if v2 and _finite(updated) < cutoff:
                 stale.append(key)
                 continue
-            with contextlib.suppress(ValueError):
-                out[key] = json.loads(data)
+            with contextlib.suppress(ValueError, TypeError):
+                row = json.loads(data)
+                if v2 and isinstance(row, dict) and not row.get("last"):
+                    # 5.3.4 review: a row from before 5.3.4 was last
+                    # learned when it was saved, so it still expires
+                    row["last"] = row.get("first") or _finite(updated)
+                    row.setdefault("first", row["last"])
+                out[key] = row
         if stale:
             LOG.info("History: %d learned baseline(s) older than %d days "
                      "were dropped", len(stale), BASELINE_MAX_AGE_DAYS)
@@ -61692,7 +61717,9 @@ def run_self_tests(verbose=True):
             time.sleep(0.05)
         time.sleep(0.3)
         assert hs.known_device_rows()[0][0] == "k1"
-        assert hs.load_baselines() == {"k1": {"n": 5}}
+            # a row from before 5.3.4 comes back with when it was last learned
+        row = hs.load_baselines()["k1"]
+        assert row["n"] == 5 and 0 < row["last"] <= time.time() + 1, row
         hs.clear("k1")
         time.sleep(0.4)
         assert hs.known_device_rows() == []
@@ -62565,6 +62592,79 @@ def t_call_quality_switch_and_hot_path(ctx):
     finally:
         g["wire_rtc"] = orig
         FEATURES["call_quality"] = old
+
+
+@self_test()
+def t_m8_m10_review_fixes(ctx):
+    """5.3.4 review of M8 and M10: a pre-5.3.4 baseline row still expires;
+    a hostile or NaN row never stops loading; restarts, peer ports and
+    routine services are never "a new service"; a busy device taken for a
+    plug keeps the full floor; HD video is measured, not turned away."""
+    F = DeviceBaseline.FEATURES
+    hs = HistoryStore(ctx.path("h.sqlite3"))
+    try:
+        v1 = {"n": 50, "mean": {f: 100.0 for f in F},
+              "var": {f: 1.0 for f in F}, "hours": [2] * 24}
+        hs.write_snapshot({"devices": [], "alerts": [], "domains": [],
+                           "baselines": [("oldplug", v1)]})
+        hs.flush_now()
+        now = time.time()
+        eng = BaselineEngine({})
+        eng.load(hs.load_baselines(now=now))
+        assert 0 < eng.devices["oldplug"].last <= now
+        hs.write_snapshot({"devices": [], "alerts": [], "domains": [],
+                           "baselines": list(eng.to_dict().items())})
+        hs.flush_now()
+        assert hs.load_baselines(now=now + 15 * 86400) == {}   # expired
+    finally:
+        hs.stop()
+    eng = BaselineEngine({})
+    eng.load({"a": {"n": 1e999}, "b": {"n": 5, "mean": {"bytes_up": float("nan")},
+                                       "hours": [2] * 24}, "c": {"n": 3}})
+    assert sorted(eng.devices) == ["a", "b", "c"]
+    for p in eng.devices["b"].prof.values():
+        assert all(math.isfinite(x) for x in p["mean"].values())
+    b = DeviceBaseline()
+    b.kind, b.n, b.svc_at = "camera", 200, 0
+    b.services = Counter({1000 + i: 1 for i in range(25)})
+    again = DeviceBaseline.from_dict(json.loads(json.dumps(b.to_dict())))
+    assert len(again.services) == 25            # nothing lost on restart
+    assert not b.is_new_service(41234) and not b.is_new_service(123)
+    assert b.is_new_service(23)
+
+    def night_spike(kind, sure=True):
+        e = BaselineEngine({})
+        d = e.get("x")
+        d.kind, d.kind_sure = kind, sure
+        t0 = time.mktime((2027, 1, 1, 2, 0, 0, 0, 0, -1))
+        hits = []
+        for m in range(62):
+            snap = d.observe(t0 + m * 60, 6000000 if m == 40 else 200000,
+                             "received", "203.0.113.4")
+            if snap:
+                hits += e.check(snap)
+        return hits
+    old = FEATURES.get("baseline_v2", True)
+    FEATURES["baseline_v2"] = True
+    try:
+        assert night_spike("iot")                 # a plug: unusual
+        assert night_spike("iot", sure=False) == [] == night_spike("phone")
+    finally:
+        FEATURES["baseline_v2"] = old
+    stun = struct.pack(">HH", 1, 0) + RTC_STUN_COOKIE + bytes(12)
+    ct = CallTracker()
+
+    def frame(t, load):
+        return {"rtc": wire_rtc(load), "src_ip": "192.168.1.5",
+                "dst_ip": "198.51.100.4", "sport": 50000, "dport": 3478,
+                "time": t}
+    ct.feed(frame(1000.0, stun), True)
+    for i in range(1200):                       # 600 packets a second
+        ct.feed(frame(1000.001 + i / 600.0, struct.pack(
+            ">BBHII", 0x80, 96, i, int(i * 90000 / 600), 7) + bytes(40)),
+            True)
+    assert len(ct.streams) == 1 and next(iter(ct.streams.values())).rate \
+        == 90000, "HD video was turned away"
 
 
 @self_test()
@@ -69348,7 +69448,7 @@ def baseline_week(ctx, home, plants=(), seed=11):
         dev = m.registry.touch(ip, "02:00:5e:00:%02x:%02x" % (i // 256,
                                                              i % 256),
                                "arp", "test", t0)
-        dev.device_class = cls
+        dev.device_class, dev.class_confidence = cls, "Likely"
         pool = [f"203.0.{113 if j % 2 else 114}.{(i * 37 + j) % 250 + 1}"
                 for j in range(30)]
         devs.append((dev, kind, pool, i % 3 == 0))
