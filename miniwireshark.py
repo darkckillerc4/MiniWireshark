@@ -83,6 +83,7 @@ import csv
 import base64
 import ctypes
 import dataclasses
+import errno
 import functools
 import gc
 import gzip
@@ -106,6 +107,7 @@ import random
 import re
 import shlex
 import shutil
+import stat
 import socket as _socket
 import sqlite3
 import statistics
@@ -5668,7 +5670,61 @@ OWN_BLOCKLIST = [None]          # the loaded OwnBlocklist, or None
 _NOT_PUBLIC_NETS = _LAN_NETS + tuple(ipaddress.ip_network(n) for n in (
     "224.0.0.0/4", "240.0.0.0/4", "192.0.0.0/24", "192.0.2.0/24",
     "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "::/128",
-    "ff00::/8", "2001:db8::/32", "64:ff9b:1::/48"))
+    "ff00::/8", "2001:db8::/32", "64:ff9b:1::/48",
+    # 5.3.4: IPv4 written as IPv6 (mapped, 6to4): the list stays plain IPv4
+    "::ffff:0:0/96", "2002::/16"))
+# the same ranges as (version, first, last) integers: a 100,000-line list
+# is checked in a fraction of the time ipaddress's overlaps() takes
+_NOT_PUBLIC_SPANS = {v: tuple((int(n.network_address),
+                               int(n.broadcast_address))
+                              for n in _NOT_PUBLIC_NETS if n.version == v)
+                     for v in (4, 6)}
+# well-known second-level public suffixes: blocking one would block a
+# whole country's sites
+_OWN_WIDE_SUFFIXES = frozenset(
+    f"{a}.{cc}" for cc, names in (
+        ("uk", "co org ac gov me ltd plc net nhs sch police"),
+        ("au", "com net org edu gov asn id"),
+        ("jp", "co ne or ac go ed gr lg"),
+        ("br", "com net org gov edu art blog"),
+        ("nz", "co net org ac govt school geek gen"),
+        ("za", "co org net gov ac web"),
+        ("cn", "com net org gov edu ac"),
+        ("in", "co net org firm gen ind gov ac edu"),
+        ("kr", "co ne or go ac re"),
+        ("tw", "com net org gov edu idv"),
+        ("hk", "com net org gov edu idv"),
+        ("sg", "com net org gov edu per"),
+        ("mx", "com net org gob edu"),
+        ("ar", "com net org gob edu"),
+        ("tr", "com net org gov edu gen"),
+        ("il", "co net org ac gov muni"),
+        ("id", "co net or ac go web my"),
+        ("my", "com net org gov edu"),
+        ("ph", "com net org gov edu"),
+        ("vn", "com net org gov edu"),
+        ("ua", "com net org gov edu in"),
+        ("th", "co in or ac go net"),
+        ("eg", "com net org gov edu"),
+        ("pk", "com net org gov edu"),
+        ("ng", "com net org gov edu"),
+        ("pl", "com net org gov edu"),
+        ("ru", "com net org"),
+        ("fr", "gouv asso com"),
+        ("es", "com nom org gob edu"),
+        ("it", "gov edu"),
+        ("de", "com"),
+        ("eu", "com"))
+    for a in names.split())
+
+
+def _not_public_span(version, first, last):
+    for lo, hi in _NOT_PUBLIC_SPANS[version]:
+        if first <= hi and lo <= last:
+            return True
+    return False
+
+
 _OWN_DOMAIN_RX = re.compile(r"^(?=.{4,253}$)([a-z0-9_](?:[a-z0-9_-]{0,61}"
                             r"[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
 _LOCAL_SUFFIXES = (".local", ".lan", ".home", ".internal", ".localdomain",
@@ -5752,15 +5808,27 @@ def own_blocklist_entry(text):
     if len(parts) != 1:
         return ("reject", OWN_REASON_MANY)
     tok = parts[0].strip(",;")
-    if "/" in tok or _looks_like_ip(tok):
+    addr = None
+    if "/" not in tok and (":" in tok or tok[-1:].isdigit()):
+        try:                     # 5.3.4: a plain address, parsed once
+            addr = ipaddress.ip_address(tok)
+        except ValueError:
+            addr = None
+    if addr is not None:
+        n = int(addr)
+        if _not_public_span(addr.version, n, n) or \
+                not is_public_ip(str(addr)):
+            return ("reject", OWN_REASON_PRIVATE)
+        return ("ip", str(addr))
+    if "/" in tok or (":" in tok or tok[-1:].isdigit()):
         try:
             net = ipaddress.ip_network(tok, strict=False)
         except ValueError:
             return ("reject", OWN_REASON_BAD)
         if net.prefixlen < (8 if net.version == 4 else 16):
             return ("reject", OWN_REASON_WIDE)
-        if any(net.version == n.version and net.overlaps(n)
-               for n in _NOT_PUBLIC_NETS) or (
+        if _not_public_span(net.version, int(net.network_address),
+                            int(net.broadcast_address)) or (
                 net.num_addresses == 1 and
                 not is_public_ip(str(net.network_address))):
             return ("reject", OWN_REASON_PRIVATE)
@@ -5770,11 +5838,18 @@ def own_blocklist_entry(text):
     name = tok.lower().strip(".")
     if name.startswith("*."):
         name = name[2:]
+    if not name.isascii():
+        try:                     # 5.3.4: bücher.de → xn--bcher-kva.de
+            name = name.encode("idna").decode("ascii").lower()
+        except (UnicodeError, ValueError):
+            return ("reject", OWN_REASON_BAD)
     if name in ("localhost", "local", "lan", "home") or \
             name.endswith(_LOCAL_SUFFIXES):
         return ("reject", OWN_REASON_LOCAL)
     if not _OWN_DOMAIN_RX.match(name):
         return ("reject", OWN_REASON_BAD)
+    if name in _OWN_WIDE_SUFFIXES:
+        return ("reject", OWN_REASON_WIDE)
     return ("domain", name)
 
 
@@ -5785,7 +5860,19 @@ def load_own_blocklist(path, max_entries=None, max_bytes=None):
     max_entries = max_entries or OWN_BLOCKLIST_MAX_ENTRIES
     max_bytes = max_bytes or OWN_BLOCKLIST_MAX_BYTES
     bl = OwnBlocklist(path)
-    with open(path, "rb") as f:
+    # 5.3.4: only a regular file is read. A pipe or a device at the
+    # remembered path would block for ever or never end: opened without
+    # waiting, checked, then refused.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) |
+                 getattr(os, "O_BINARY", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not a regular file")
+        f = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+    with f:
         data = f.read(max_bytes + 1)
     if len(data) > max_bytes:
         cut = data.rfind(b"\n", 0, max_bytes)
@@ -5825,11 +5912,16 @@ def load_own_blocklist(path, max_entries=None, max_bytes=None):
 def use_own_blocklist(path):
     """Load `path` as your own blocklist and use it from now on (None
     stops using it). → the OwnBlocklist or None."""
-    bl = load_own_blocklist(path) if path else None
+    return install_own_blocklist(load_own_blocklist(path) if path else None)
+
+
+def install_own_blocklist(bl):
+    """Use `bl` (an OwnBlocklist already read, or None) from now on."""
     OWN_BLOCKLIST[0] = bl
     _REP_GEN[0] += 1
-    if bl is not None:
-        LOG.info("own blocklist: %s (%s)", path, bl.summary())
+    if bl is not None:           # 5.3.4: the file name only, not its path
+        LOG.info("own blocklist: %s (%s)", os.path.basename(bl.path),
+                 bl.summary())
     return bl
 
 
@@ -12641,6 +12733,17 @@ def looks_generated(name):
         digits >= max(5, len(n) // 2)
 
 
+def _copy_inner(x):
+    """One level of copy for a value inside a device's list or dict."""
+    if isinstance(x, list):
+        return list(x)
+    if isinstance(x, dict):
+        return dict(x)
+    if isinstance(x, set):
+        return set(x)
+    return x
+
+
 def device_to_dict(dev, include_history=True):
     out = {}
     for f in DEVICE_SAVE_FIELDS:
@@ -12650,8 +12753,11 @@ def device_to_dict(dev, include_history=True):
         # 5.3.4 (S6): copies, not the device's own lists and dicts: the
         # history writer encodes this row after the GuiGate is released,
         # while the analysis thread goes on changing the device
-        out[f] = list(v) if isinstance(v, list) else \
-            dict(v) if isinstance(v, dict) else v
+        # and one level deeper (the per-card counters, the history rows
+        # and the presence pairs are changed in place too)
+        out[f] = [_copy_inner(x) for x in v] if isinstance(v, list) else \
+            {k: _copy_inner(x) for k, x in v.items()} \
+            if isinstance(v, dict) else v
     out["ipv6"] = sorted(dev.ipv6)
     out["ipv4s"] = sorted(dev.ipv4s)
     out["services"] = sorted(dev.services)
@@ -13062,6 +13168,35 @@ APPLE_MODEL_NAMES = (
     (r"Watch\d", "Apple Watch"), (r"RealityDevice\d", "Apple Vision Pro"),
 )
 _APPLE_MODEL_RX = [(re.compile(p), n) for p, n in APPLE_MODEL_NAMES]
+
+
+_ADDRESS_LIKE_RX = re.compile(
+    r"^\s*(?:\d{1,3}(?:[.-]\d{1,3}){3}|[0-9a-f]{2}(?:[:-][0-9a-f]{2}){5}|"
+    r"[0-9a-f]{0,4}(?::[0-9a-f]{0,4}){2,7}(?:%\S+)?|ip:\S+)\s*$", re.I)
+
+
+def looks_like_address(text):
+    """An IP or hardware address (or a key made of one) rather than a
+    name."""
+    return bool(_ADDRESS_LIKE_RX.match(str(text or "")))
+
+
+def device_name_only(dev):
+    """5.3.4 (M12): a device's name for text shown outside the window: its
+    name, model or maker, never its address. "" when it has none."""
+    if dev is None:
+        return ""
+    with contextlib.suppress(Exception):
+        n = dev.best_name()
+        if n and not looks_like_address(n):
+            return n
+    hint = getattr(dev, "model_hint", "")
+    if hint and FEATURES.get("signatures_v2", True):
+        n = model_product_name(hint)
+        if n:
+            return n
+    vendor = getattr(dev, "vendor", "")
+    return f"{vendor} device" if vendor else ""
 
 
 def model_product_name(code):
@@ -15585,6 +15720,7 @@ class MinimisedNotifier:
         self.win_flash = self._win_flash
         self.shell_notify = self._shell_notify
         self._tray_q = None
+        self._tray_thread = None
 
     # ---- what counts ---------------------------------------------------------
     def option(self, name):
@@ -15664,7 +15800,7 @@ class MinimisedNotifier:
             if self.option("minimised_details") and name_fn is not None:
                 with contextlib.suppress(Exception):
                     who = name_fn(key)
-                    if who:
+                    if who and not looks_like_address(who):
                         line += " — " + str(who)
             body += "\n" + line
         return "MiniWireshark", body
@@ -15768,8 +15904,10 @@ class MinimisedNotifier:
     def _tray(self, op, hwnd, head, body):
         if self._tray_q is None:
             self._tray_q = queue.Queue()
-            threading.Thread(target=self._tray_loop, args=(self._tray_q,),
-                             daemon=True, name="tray-notify").start()
+            self._tray_thread = threading.Thread(
+                target=self._tray_loop, args=(self._tray_q,), daemon=True,
+                name="tray-notify")
+            self._tray_thread.start()
         self._tray_q.put((op, hwnd, head, body))
         self.done.append(("tray", op))
 
@@ -15786,17 +15924,28 @@ class MinimisedNotifier:
             if not ok:
                 LOG.info("tray notification %s: not shown", item[0])
 
-    def shutdown(self, root=None):
-        """At exit: the icon must not stay behind in the tray."""
+    def shutdown(self, root=None, wait=0.5):
+        """At exit: the icon must not stay behind in the tray. 5.3.4: the
+        delete goes last on the helper thread's queue (after any add or
+        modify still waiting there, so it can't be overtaken), and the
+        exit waits for it at most `wait` seconds, never on the Tk thread's
+        own call to a hung Explorer."""
         q, self._tray_q = self._tray_q, None
-        if q is not None:
-            q.put(None)
+        t, self._tray_thread = self._tray_thread, None
         if self.tray_shown:
             self.tray_shown = False
-            try:
-                self.shell_notify("delete", self._hwnd(root), "", "")
-            except Exception:                        # noqa: BLE001
-                LOG.exception("tray notification at exit")
+            item = ("delete", self._hwnd(root), "", "")
+            if q is None:        # no helper yet: one short-lived thread
+                q = queue.Queue()
+                t = threading.Thread(target=self._tray_loop, args=(q,),
+                                     daemon=True, name="tray-notify")
+                t.start()
+            q.put(item)
+            self.done.append(("tray", "delete"))
+        if q is not None:
+            q.put(None)
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=wait)
 
     def _shell_notify(self, op, hwnd, head, body):
         """Shell_NotifyIconW, on the helper thread. Needs Windows evidence
@@ -19652,6 +19801,20 @@ def connect_default_key(model, window=900):
     return model.my_device_key()
 
 
+def unique_choice_labels(items):
+    """(label, key, extra) rows → {label: key} where every label is
+    unique: a label already taken gets `extra` added (the hardware
+    address), then a number, so no device hides another in a picker."""
+    out = {}
+    for label, key, extra in items:
+        lab = label if label not in out else f"{label} · {extra}"
+        base, n = lab, 2
+        while lab in out:
+            lab, n = f"{base} ({n})", n + 1
+        out[lab] = key
+    return out
+
+
 def connect_facts(model, key, window=900, offline=False, namer=None):
     m = model
     reg = m.registry
@@ -19672,7 +19835,9 @@ def connect_facts(model, key, window=900, offline=False, namer=None):
     f.update({"discover": cnt[1], "offer": cnt[2], "request": cnt[3],
               "ack": cnt[5], "nak": cnt[6]})
     asks = m.gw_arp_asks.get(mac) if mac else None
-    f["arp_asks"] = asks[2] if asks and now - asks[1] <= window else 0
+    # 5.3.4: the questions asked inside the window, not since the start
+    f["arp_asks"] = sum(1 for t in asks[3] if now - t <= window) \
+        if asks else 0
     rep = m.gw_arp_replies.get(mac) if mac else None
     f["gw_replied"] = bool(rep and asks and rep >= asks[0])
     f["router_heard"] = reg.router_answering(now)
@@ -21064,11 +21229,22 @@ class NetworkModel:
                 d["src_ip"] != self.gateway_ip:
             mac = d["src_mac"].lower()
             a = self.gw_arp_asks.get(mac)
-            self._bounded_put(self.gw_arp_asks, mac, [a[0], ts, a[2] + 1]
-                              if a else [ts, ts, 1])
+            # [first, last, count, the last 64 times]: a new list each
+            # time (the window reads it from the Tk thread)
+            self._bounded_put(self.gw_arp_asks, mac, [
+                a[0], ts, a[2] + 1, (a[3] + (ts,))[-64:]]
+                if a else [ts, ts, 1, (ts,)])
         elif d["arp_op"] == 2 and d["src_ip"] == self.gateway_ip:
-            self._bounded_put(self.gw_arp_replies,
-                              (d["dst_mac"] or "").lower(), ts)
+            # 5.3.4: only a reply to another device is an answer; the
+            # router's own announcement (gratuitous ARP: broadcast or empty
+            # target, or its own address asked) answers nobody
+            to = (d["dst_mac"] or "").lower()
+            if not re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", to) or \
+                    int(to[:2], 16) & 1 or to == "00:00:00:00:00:00" or \
+                    to == (d["src_mac"] or "").lower() or \
+                    d["dst_ip"] == d["src_ip"]:
+                return
+            self._bounded_put(self.gw_arp_replies, to, ts)
 
     def rtt_stats(self, now=None, window=900):
         """Median / 90th percentile handshake round trip (ms) of recent
@@ -27199,6 +27375,7 @@ No list in use. ¦ Aucune liste utilisée. ¦ Ninguna lista en uso.
 Stopped using your own blocklist. ¦ Votre propre liste de blocage n'est plus utilisée. ¦ Se dejó de usar su propia lista de bloqueo.
 Lines not used, and why ¦ Lignes non utilisées, et pourquoi ¦ Líneas no usadas, y por qué
 Every line was used. ¦ Toutes les lignes ont été utilisées. ¦ Se usaron todas las líneas.
+Reading your own blocklist… ¦ Lecture de votre propre liste de blocage… ¦ Leyendo su propia lista de bloqueo…
 a private, local or special-use address: your own network is never checked against a blocklist ¦ une adresse privée, locale ou à usage spécial : votre propre réseau n'est jamais comparé à une liste de blocage ¦ una dirección privada, local o de uso especial: su propia red nunca se compara con una lista de bloqueo
 too wide: it would cover a large part of the Internet ¦ trop large : elle couvrirait une grande partie d'Internet ¦ demasiado amplio: cubriría una gran parte de Internet
 a local name: names on your own network are never listed ¦ un nom local : les noms de votre propre réseau ne sont jamais listés ¦ un nombre local: los nombres de su propia red nunca se incluyen
@@ -28043,6 +28220,12 @@ I18N_PATTERNS += [
     (r"typed text, (\d+) bytes \(hidden\)",
      r"texte tapé, \1 octets (masqué)",
      r"texto escrito, \1 bytes (oculto)"),
+    (r"Telnet: terminal text, (\d+) bytes \(hidden\)",
+     r"Telnet : texte du terminal, \1 octets (masqué)",
+     r"Telnet: texto del terminal, \1 bytes (oculto)"),
+    (r"terminal text, (\d+) bytes \(hidden\)",
+     r"texte du terminal, \1 octets (masqué)",
+     r"texto del terminal, \1 bytes (oculto)"),
     (r"(.+) contacted an address on your own blocklist",
      r"\1 a contacté une adresse de votre propre liste de blocage",
      r"\1 contactó con una dirección de su propia lista de bloqueo"),
@@ -39011,7 +39194,9 @@ class UnusualSection:
 
     def refresh(self, force=False):
         found = self.findings()
-        sig = (id(self.app.model), len(found),
+        # 5.3.4: the language is part of it: "What we saw: …" is put
+        # together already translated, so a switch must rebuild the cards
+        sig = (CURRENT_LOCALE, id(self.app.model), len(found),
                tuple((f["id"], f["count"]) for f in found[:self.SHOW]))
         if sig == self._sig and not force:
             return found
@@ -41508,8 +41693,13 @@ class PacketsTab(BaseTab):
             layer = pkt
         try:
             depth = 0
+            hidden = scapy_hidden_layer(layer) if layer is not None else None
             while layer is not None and depth < 12:
                 name = getattr(layer, "name", type(layer).__name__)
+                if layer is hidden:      # 5.3.4 (IP-013): a typed password
+                    self.dtree.insert("", "end", text=name, values=(
+                        "(hidden: may contain a password or session)",))
+                    break
                 node = self.dtree.insert("", "end", text=name, open=depth < 4,
                                          values=("",))
                 for fdesc in getattr(layer, "fields_desc", [])[:60]:
@@ -41530,17 +41720,9 @@ class PacketsTab(BaseTab):
             self.dtree.insert("", "end", text="(could not decode)",
                               values=(str(e),))
         def text_dump():
-            out = dis.text() if dis is not None else ""
             # the capture engine's raw view would show what our own tree
-            # hides (passwords, cookies, mail text): leave it out there
-            sensitive = dis is not None and (any(
-                n.key in ("text", "http") for n in dis.nodes) or bool(
-                {dis.get("tcp.srcport"), dis.get("tcp.dstport")} &
-                {21, 23, 25, 110, 143, 465, 587, 993, 995, 80, 8080}))
-            if pkt is not None and not sensitive:
-                out += ("\n\n— the capture engine's own view —\n"
-                        if out else "") + pkt.show(dump=True)
-            return out or "(nothing to show)"
+            # hides (passwords, cookies, mail text): left out there
+            return packet_details_text(dis, pkt)
 
         def hex_dump():
             if raw:
@@ -41963,19 +42145,27 @@ def redact_stream_line(line, res):
     clean = line.rstrip(b"\r\n")
     if ports & {25, 587, 110, 143, 2525}:
         return _mail_line_label(clean)
+    return safe_text_line(clean)
+
+
+def safe_text_line(clean, limit=None):
+    """One text line with what can sign in hidden: a PASS / AUTH / LOGIN
+    command, a web address's query, a login or cookie header."""
     m = _SECRET_CMDS.match(clean)
     if m:
         return ((m.group("tag") or b"") + m.group("cmd")).decode(
             "latin-1", "replace") + " (hidden: credentials)"
-    rq = re.match(rb"^([A-Z]+ \S*?)\?\S* ((HTTP|RTSP)/\d\.\d)$", clean)
+    rq = re.match(rb"^([A-Z]+ [^\s?]*)\?\S*?(?: ((?:HTTP|RTSP)/\d\.\d))?$",
+                  clean)
     if rq:
-        return (rq.group(1) + b"?(query hidden) " + rq.group(2)).decode(
+        return (rq.group(1) + b"?(query hidden)" + (
+            b" " + rq.group(2) if rq.group(2) else b"")).decode(
             "latin-1", "replace")
     k, sep, _v = clean.partition(b":")
     if sep and k.strip().lower().decode("latin-1", "replace") in \
             _HIDDEN_HEADERS:
         return k.decode("latin-1", "replace") + ": (hidden)"
-    return clean.decode("utf-8", "replace")
+    return hide_credentials(clean.decode("utf-8", "replace"))[:limit]
 
 
 class _SubView:
@@ -44865,8 +45055,10 @@ class MiniWireshark:
         self._layout_pass()
         self._away_since = None
         self.asof = None
-        self.root.bind("<FocusOut>", self._on_root_focus_out, add="+")
-        self.root.bind("<FocusIn>", self._on_root_focus_in, add="+")
+        # 5.3.4 (M12): on every window of the app, not only the main one:
+        # coming back to the Alerts window or a dialog is coming back too
+        self.root.bind_all("<FocusOut>", self._on_root_focus_out, add="+")
+        self.root.bind_all("<FocusIn>", self._on_root_focus_in, add="+")
         # 5.3.4 (M12, MC9): the title count and flash while away (opt-in)
         self.notifier = MinimisedNotifier(
             self.config, lambda: getattr(self.model, "alerts", None))
@@ -48936,6 +49128,10 @@ class MiniWireshark:
         if shown != CURRENT_LOCALE:
             self._locale_shown = CURRENT_LOCALE
             i18n_retranslate(self.root)
+            with contextlib.suppress(AttributeError, KeyError, tk.TclError):
+                sec_u = self.tabs["security"].unusual
+                if sec_u is not None:
+                    sec_u.refresh()      # its sig holds the language
             with contextlib.suppress(AttributeError, tk.TclError):
                 if self.inspector.current:
                     self.inspector.refresh()
@@ -50378,7 +50574,7 @@ proc ::mw_retheme {w map fgnew deffg} {
 
     def _notify_name(self, key):
         dev = self.model.registry.by_key.get(key) if key else None
-        return dev.display_name() if dev is not None else ""
+        return device_name_only(dev)
 
     def notify_clear(self):
         n = getattr(self, "notifier", None)
@@ -51054,8 +51250,9 @@ proc ::mw_retheme {w map fgnew deffg} {
                      fg=t["text_fg"]).pack(side="left")
             devs = sorted(self.model.registry.by_key.values(),
                           key=lambda d: d.display_name().lower())[:400]
-            by_choice = {f"{self.device_label(d)}  [{d.ip or d.mac}]": d.key
-                         for d in devs}
+            by_choice = unique_choice_labels(
+                (f"{self.device_label(d)}  [{d.ip or d.mac}]", d.key,
+                 d.mac or d.key) for d in devs)
             choices = list(by_choice)
             pick["key"] = connect_default_key(self.model)
             cur = next((c for c, k in by_choice.items()
@@ -55182,21 +55379,49 @@ proc ::mw_retheme {w map fgnew deffg} {
         t.start()
         return t
 
-    def own_blocklist_use(self, path):
-        """Read `path` (picked or reloaded by you) and check this session
-        against it. → (OwnBlocklist or None, message)."""
+    @staticmethod
+    def _own_blocklist_read(path):
+        """Any thread: → (OwnBlocklist, None) or (None, the error)."""
         try:
-            bl = use_own_blocklist(path)
+            return load_own_blocklist(path), None
         except (OSError, ValueError) as e:
+            return None, e
+
+    def _own_blocklist_apply(self, path, bl, err):
+        """Tk thread: use the list just read (or tell why it wasn't)."""
+        if err is not None:
             self.own_blocklist_error = (
                 "Your own blocklist could not be read: "
-                f"{os.path.basename(path)} ({type(e).__name__}).")
+                f"{os.path.basename(path)} ({type(err).__name__}).")
             return None, self.own_blocklist_error
+        install_own_blocklist(bl)
         self.own_blocklist_error = ""
         self.config.set("alerts.own_blocklist_path", path)
         self.config.save()
         self.own_blocklist_recheck()
         return bl, ""
+
+    def own_blocklist_use(self, path, done=None):
+        """Read `path` (picked or reloaded by you) and check this session
+        against it. → (OwnBlocklist or None, message). With `done`, the
+        file is read on a worker thread (5.3.4: a big list, or a pipe at
+        the remembered path, never freezes the window) and done(bl,
+        message) runs on the Tk thread; only the newest read is used."""
+        if done is None:
+            return self._own_blocklist_apply(path,
+                                             *self._own_blocklist_read(path))
+        self._own_bl_gen = gen = getattr(self, "_own_bl_gen", 0) + 1
+
+        def run():
+            res = self._own_blocklist_read(path)
+
+            def back():
+                if gen == self._own_bl_gen:
+                    done(*self._own_blocklist_apply(path, *res))
+            self._async_results.put(back)
+        threading.Thread(target=run, daemon=True,
+                         name="own-blocklist").start()
+        return None
 
     def own_blocklist_recheck(self):
         """The addresses and names this session already saw, checked
@@ -55213,6 +55438,8 @@ proc ::mw_retheme {w map fgnew deffg} {
         return n
 
     def own_blocklist_stop(self):
+        # a read still running is not used either
+        self._own_bl_gen = getattr(self, "_own_bl_gen", 0) + 1
         use_own_blocklist(None)
         self.own_blocklist_error = ""
         self.config.set("alerts.own_blocklist_path", "")
@@ -55285,18 +55512,28 @@ proc ::mw_retheme {w map fgnew deffg} {
                              self.config.get("alerts.own_blocklist_path")
                              else ["disabled"])
 
+        def read(path):
+            status.configure(text=translate_text(
+                "Reading your own blocklist…"))
+            win.reading = True
+
+            def done(_bl, msg):
+                win.reading = False
+                fill(msg)
+            self.own_blocklist_use(path, done)
+
         def choose(path=None):
             path = path or filedialog.askopenfilename(
                 parent=win, initialdir=self._dialog_dir(),
                 filetypes=[("Text files", "*.txt *.list *.conf *.hosts"),
                            ("All files", "*.*")])
             if path:
-                fill(self.own_blocklist_use(path)[1])
+                read(path)
 
         def reload():
             path = self.config.get("alerts.own_blocklist_path", "")
             if path:
-                fill(self.own_blocklist_use(path)[1])
+                read(path)
 
         def stop():
             self.own_blocklist_stop()
@@ -55311,7 +55548,7 @@ proc ::mw_retheme {w map fgnew deffg} {
             side="right")
         win.bind("<Escape>", lambda e: win.destroy())
         win.choose, win.reload, win.stop = choose, reload, stop
-        win.status, win.text = status, text
+        win.status, win.text, win.reading = status, text, False
         fill()
         return win
 
@@ -58838,8 +59075,11 @@ def _dissect_quic(d, off, end, how):
 
 def _dissect_http(d, off, end, how):
     data = d.raw[off:end]
-    head, sep, _body = data.partition(b"\r\n\r\n")
-    lines = head.split(b"\r\n")
+    # 5.3.4: headers may end lines with a bare LF; each line is cut there
+    mh = re.search(rb"\r?\n\r?\n", data)
+    head, sep = (data[:mh.start()], True) if mh else (data, False)
+    raw_lines = head.split(b"\n")
+    lines = [ln[:-1] if ln.endswith(b"\r") else ln for ln in raw_lines]
     first = lines[0].decode("latin-1", "replace")
     d.begin("http", off, end, how)
     m = re.match(r"^([A-Z]+) (\S+) (HTTP/\d\.\d)$", first)
@@ -58847,8 +59087,13 @@ def _dissect_http(d, off, end, how):
     if m:
         d.add("http.request.method", m.group(1), off, len(m.group(1)))
         uri = m.group(2)
-        d.add("http.request.uri", uri, off + len(m.group(1)) + 1, len(uri),
-              uri if len(uri) < 200 else uri[:200] + "…")
+        # 5.3.4 (IP-013): a query string can carry a password or a token,
+        # and a proxy request a user:password@ part
+        path, q, _query = uri.partition("?")
+        path = hide_credentials(path[:200])
+        safe = path + ("?(query hidden)" if q else "")
+        d.add("http.request.uri", safe, off + len(m.group(1)) + 1, len(uri),
+              safe)
         d.add("http.request.version", m.group(3), off + len(first) -
               len(m.group(3)), len(m.group(3)))
     elif r:
@@ -58857,14 +59102,15 @@ def _dissect_http(d, off, end, how):
         d.add("http.response.phrase", r.group(3), off + 13,
               max(0, len(first) - 13))
     else:
-        d.add("text.line", first[:200], off, len(lines[0]))
-    p = off + len(lines[0]) + 2
-    for line in lines[1:60]:
+        d.add("text.line", hide_credentials(first[:200]), off,
+              len(lines[0]))
+    p = off + len(raw_lines[0]) + 1
+    for raw_line, line in zip(raw_lines[1:60], lines[1:60]):
         k, _c, v = line.decode("latin-1", "replace").partition(":")
         v = v.strip()
         kl = k.strip().lower()
         shown = "(hidden: may contain a password or session)" \
-            if kl in _HIDDEN_HEADERS else v[:200]
+            if kl in _HIDDEN_HEADERS else hide_credentials(v[:200])
         key = {"host": "http.host", "user-agent": "http.user_agent",
                "server": "http.server",
                "content-length": "http.content_length"}.get(kl,
@@ -58873,7 +59119,7 @@ def _dissect_http(d, off, end, how):
             else (shown if key == "http.header" else v[:200])
         d.add(key, val, p, len(line), f"{k.strip()}: {shown}"
               if key == "http.header" else None)
-        p += len(line) + 2
+        p += len(raw_line) + 1
     if not sep:
         d.node.warning = "headers continue in the next segment"
 
@@ -58916,8 +59162,12 @@ def _dissect_text_lines(d, off, end, proto_name, how, dport=None):
                 "latin-1", "replace") + " (hidden: credentials)"
         elif proto_name == "Telnet" and dport == 23:
             # 5.3.4 (IP-013): what is typed into Telnet includes the
-            # password at its prompt; the server's side stays readable
+            # password at its prompt
             shown = f"typed text, {len(clean)} bytes (hidden)"
+        elif proto_name == "Telnet":
+            # and the server's side echoes what is typed (character mode),
+            # a password too on a device that echoes it
+            shown = f"terminal text, {len(clean)} bytes (hidden)"
         elif proto_name in ("SMTP", "POP3", "IMAP"):
             shown = _mail_line_label(clean)
         else:
@@ -59314,6 +59564,61 @@ def dissect(raw, linktype=1):
         if out.nodes:
             out.nodes[-1].warning = f"malformed ({e})"
     return out
+
+
+# 5.3.4 (IP-013): the capture engine's own view prints a packet's payload as
+# it is (Raw load), so it is shown only when our own tree ends on a layer
+# that can't carry a typed password, whatever the port.
+_RAW_VIEW_SAFE_LAST = {"frame", "eth", "sll", "vlan", "arp", "tcp", "udp",
+                       "icmp", "icmpv6", "dns", "dhcp", "ntp", "tls", "quic"}
+_RAW_VIEW_PORTS = {21, 23, 25, 110, 143, 465, 587, 993, 995, 80, 8080}
+_SCAPY_SAFE_APP = {"DNS", "BOOTP", "DHCP options", "NTPHeader", "NTP",
+                   "Padding"}
+
+
+def scapy_hidden_layer(pkt):
+    """The first scapy layer of `pkt` whose fields could hold what was
+    typed (a Raw load, anything above TCP or UDP but DNS, DHCP and NTP),
+    or None."""
+    layer, prev, depth = pkt, "", 0
+    while layer is not None and depth < 12:
+        name = getattr(layer, "name", type(layer).__name__)
+        if name == "Raw" or (prev in ("TCP", "UDP") and
+                             name not in _SCAPY_SAFE_APP):
+            return layer
+        prev = name
+        nxt = getattr(layer, "payload", None)
+        layer = nxt if nxt and type(nxt).__name__ != "NoPayload" else None
+        depth += 1
+    return None
+
+
+def raw_view_may_show_secrets(dis, pkt=None):
+    """True when the capture engine's own view of this packet could show
+    what our tree hides: a password, a cookie, mail text."""
+    if dis is None:
+        return pkt is not None and scapy_hidden_layer(pkt) is not None
+    keys = [n.key for n in dis.nodes]
+    if any(k in ("text", "http") for k in keys):
+        return True
+    lldp = 0x88CC in (dis.get("eth.type"), dis.get("vlan.etype"),
+                      dis.get("sll.etype"))
+    if "data" in keys and not lldp:
+        return True
+    if keys and keys[-1] not in _RAW_VIEW_SAFE_LAST and not lldp:
+        return True
+    return bool({dis.get("tcp.srcport"), dis.get("tcp.dstport")} &
+                _RAW_VIEW_PORTS)
+
+
+def packet_details_text(dis, pkt=None):
+    """The Packet details text: our own tree, then the capture engine's
+    view only where it can't show a secret."""
+    out = dis.text() if dis is not None else ""
+    if pkt is not None and not raw_view_may_show_secrets(dis, pkt):
+        out += ("\n\n— the capture engine's own view —\n"
+                if out else "") + pkt.show(dump=True)
+    return out or "(nothing to show)"
 
 
 def hex_dump_lines(raw):
@@ -60044,15 +60349,11 @@ DEEP_GROUPS = ("Malformed", "Sequence", "Protocol", "Security", "Checksum",
 
 def _deep_preview(kind, data):
     """A short, secret-free label for a reassembled message."""
-    if kind == "line":
+    if kind in ("line", "http"):
+        # 5.3.4 (IP-013): a header line of its own (a proxy or an odd
+        # port gets the line framer) and bare-LF requests stay hidden too
         line = data.split(b"\n", 1)[0].rstrip(b"\r")
-        m = _SECRET_CMDS.match(line)
-        if m:
-            return ((m.group("tag") or b"") + m.group("cmd")).decode(
-                "latin-1", "replace") + " (hidden: credentials)"
-        return line[:120].decode("utf-8", "replace")
-    if kind == "http":
-        return data.split(b"\r\n", 1)[0][:120].decode("latin-1", "replace")
+        return safe_text_line(line, 120)
     if kind == "tls":
         ct = data[0] if data else 0
         return f"TLS {_TLS_CT.get(ct, ct)} record, {len(data)} bytes"
@@ -60811,9 +61112,16 @@ class ProtocolTracker:
 
     # ---- reassembled messages -----------------------------------------------------
     # ---- 5.3.4 (IP-013): logins sent without encryption ---------------------------
-    LOGIN_PROMPT = re.compile(rb"pass(word|code|phrase)?\s*:\s*$", re.I)
-    HTTP_BASIC = re.compile(rb"\r\n(proxy-)?authorization:[ \t]*basic[ \t]",
-                            re.I)
+    # the prompt in English, German, French, Spanish, Portuguese, Dutch
+    # and Italian (UTF-8 or Latin-1), on any port
+    LOGIN_PROMPT = re.compile(
+        rb"(?:pass(?:word|code|phrase)?|passwort|kennwort|mot de passe|"
+        rb"contrase(?:\xc3\xb1|\xf1|n)a|senha|wachtwoord|parola)\s*:\s*$",
+        re.I)
+    # an Authorization header line (CRLF, bare LF, or one line of its own)
+    HTTP_BASIC = re.compile(rb"(?:^|\n)[ \t]*(proxy-)?authorization[ \t]*:"
+                            rb"[ \t]*basic[ \t]", re.I)
+    _TELNET_IAC = re.compile(rb"\xff[\xfb-\xfe]")
 
     @staticmethod
     def _ports(st):
@@ -60835,13 +61143,21 @@ class ProtocolTracker:
         if m.kind not in ("http", "line") or m.direction != 0:
             return
         ports = self._ports(st)
-        if m.kind == "http" and self.HTTP_BASIC.search(m.data[:8192]):
+        mail = bool(ports & set(MAIL_PORTS))   # told by the mail tracker
+        if self.HTTP_BASIC.search(m.data[:8192]):
             proto, how = "HTTP", "HTTP Basic sign-in"
-        elif m.kind == "line" and 21 in ports and \
-                m.data[:5].upper() == b"PASS ":
-            proto, how = "FTP", "USER and PASS commands"
-        elif m.kind == "line" and 23 in ports and self.LOGIN_PROMPT.search(
-                bytes(st.dirs[1].recent[-80:]).rstrip(b"\x00 ")):
+        elif m.kind != "line" or mail:
+            return
+        elif m.data[:5].upper() == b"PASS ":
+            # 5.3.4: recognised by content, off the usual ports too
+            last = self._server_said(st).rstrip(b"\r\n").rsplit(b"\n", 1)[-1]
+            if 21 in ports or re.match(rb"3\d\d[ -]", last):
+                proto, how = "FTP", "USER and PASS commands"
+            elif last.startswith(b"+OK"):
+                proto, how = "POP3", "USER and PASS commands"
+            else:
+                return
+        elif self.at_password_prompt(st):
             proto, how = "Telnet", "password typed at a Telnet prompt"
         else:
             return
@@ -60861,15 +61177,33 @@ class ProtocolTracker:
                               f"password itself is not read by "
                               f"MiniWireshark)", ""))
 
+    @staticmethod
+    def _server_said(st):
+        """The server's last few bytes, as delivered (prompts end there)."""
+        return bytes(st.dirs[1].recent[-80:]).rstrip(b"\x00 ")
+
+    def at_password_prompt(self, st):
+        """The server's last words were a password prompt (any port)."""
+        return bool(self.LOGIN_PROMPT.search(self._server_said(st)))
+
     def safe_preview(self, st, m):
         """A label for a reassembled message that can't hold what was
         typed into a Telnet session (a password at its prompt) nor a web
         address's query; None when the usual label is safe."""
-        if m.kind == "line" and 23 in self._ports(st) and m.direction == 0:
-            return f"Telnet: typed text, {len(m.data)} bytes (hidden)"
+        if m.kind == "line" and m.direction == 1 and \
+                23 in self._ports(st):   # 5.3.4: the echo of what is typed
+            return f"Telnet: terminal text, {len(m.data)} bytes (hidden)"
+        if m.kind == "line" and m.direction == 0:
+            if 23 in self._ports(st):
+                return f"Telnet: typed text, {len(m.data)} bytes (hidden)"
+            # 5.3.4: a terminal on another port, or an answer to a
+            # password prompt in any language
+            if self.at_password_prompt(st) or self._TELNET_IAC.search(
+                    bytes(st.dirs[1].recent)):
+                return f"typed text, {len(m.data)} bytes (hidden)"
         if m.kind == "http":
-            first = m.data.split(b"\r\n", 1)[0][:120].decode("latin-1",
-                                                             "replace")
+            first = m.data.split(b"\n", 1)[0].rstrip(b"\r")[:120].decode(
+                "latin-1", "replace")
             if "?" in first:
                 head, _q, rest = first.partition("?")
                 tail = rest.rsplit(" ", 1)[1] if " " in rest else ""
@@ -64420,6 +64754,19 @@ def t_thread_stress(ctx):
               if isinstance(row.get(f), (list, dict)) and
               row[f] is getattr(dev, f)]
     assert not shared, shared
+    for dev in m.registry.by_key.values():   # 5.3.4: one level deeper too
+        row = device_to_dict(dev, False)
+        for f in DEVICE_SAVE_FIELDS:
+            v, mine = row.get(f), getattr(dev, f)
+            if isinstance(v, list) and isinstance(mine, list):
+                inner = [x for x, y in zip(v, mine) if
+                         isinstance(x, (list, dict, set)) and x is y]
+            elif isinstance(v, dict) and isinstance(mine, dict):
+                inner = [k for k in v if isinstance(v[k], (list, dict, set))
+                         and v[k] is mine.get(k)]
+            else:
+                inner = []
+            assert not inner, (f, inner[:3])
     b = DeviceBaseline()
     bd = b.to_dict()
     assert bd["mean"] is not b.mean and bd["var"] is not b.var and \
@@ -65823,6 +66170,70 @@ def t_mc9_notify_count_title_and_clear(ctx):
 
 
 @self_test()
+def t_mc9_tray_name_and_exit_review(ctx):
+    """5.3.4 (M12 review): with "show details" the tray names a device
+    only by its name, model or maker, never by an address when it has no
+    name; at exit the tray icon's delete waits behind an add still on
+    the helper thread, runs there, and the exit waits for it briefly."""
+    cfg = ctx.cfg({"notifications.minimised": True,
+                   "notifications.minimised_tray": True,
+                   "notifications.minimised_details": True})
+    eng = AlertEngine(cfg)
+    nameless = DeviceRecord(key="02:00:00:aa:bb:cc", mac="02:00:00:aa:bb:cc",
+                            ip="192.168.1.37")
+    assert device_name_only(nameless) == "" and device_name_only(None) == ""
+    assert nameless.display_name() == "192.168.1.37"    # the window's own
+    maker = DeviceRecord(key="02:00:00:aa:bb:cd", mac="02:00:00:aa:bb:cd",
+                         ip="192.168.1.38")
+    maker.vendor = "Acme"
+    assert device_name_only(maker) == "Acme device"
+    n = MinimisedNotifier(cfg, lambda: eng, platform="win32")
+    n.win_flash = lambda hwnd, on: True
+    n.note([_mc9_alert(eng, "arp_spoof", "DANGER", key=nameless.key)], True)
+    body = n.toast_text(lambda k: device_name_only(nameless))[1]
+    assert "192.168" not in body and "02:00" not in body and \
+        body.rstrip().endswith(translate_text(ALERT_TYPES["arp_spoof"][0])), \
+        body
+    for addr in ("192.168.1.37", "02:00:00:aa:bb:cc", "fe80::1",
+                 "ip:192.168.1.37"):
+        assert addr not in n.toast_text(lambda k, a=addr: a)[1], addr
+    assert n.toast_text(lambda k: "Kitchen tablet")[1].endswith(
+        " — Kitchen tablet")
+    # exit: an add is still running on the helper thread
+    calls, started = [], threading.Event()
+
+    def slow_shell(op, hwnd, h, b):
+        if op == "add":
+            started.set()
+            time.sleep(0.2)
+        calls.append((op, threading.current_thread().name))
+        return True
+    n.shell_notify = slow_shell
+    n.signal(_FakeNotifyRoot(), n.note(
+        [_mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:41")],
+        True))
+    assert started.wait(5) and n.tray_shown
+    t0 = time.monotonic()
+    n.shutdown(_FakeNotifyRoot())
+    took = time.monotonic() - t0
+    assert [c[0] for c in calls] == ["add", "delete"], calls
+    assert all(c[1] == "tray-notify" for c in calls), calls
+    assert took < 0.5 + 0.3 and not n.tray_shown, took
+    # a hung Explorer: the exit gives up after `wait`, not for ever
+    hang = threading.Event()
+    n2 = MinimisedNotifier(cfg, lambda: eng, platform="win32")
+    n2.win_flash = lambda hwnd, on: True
+    n2.shell_notify = lambda op, hwnd, h, b: hang.wait(10) or True
+    n2.signal(_FakeNotifyRoot(), n2.note(
+        [_mc9_alert(eng, "arp_spoof", "DANGER", key="aa:bb:cc:dd:ee:42")],
+        True))
+    t0 = time.monotonic()
+    n2.shutdown(_FakeNotifyRoot(), wait=0.2)
+    assert time.monotonic() - t0 < 1.0
+    hang.set()
+
+
+@self_test()
 def t_mc9_notify_honours_mute_and_snooze(ctx):
     """5.3.4 (M12, MC9): an alert muted, snoozed, marked expected,
     switched off or acknowledged after it was raised (while it waited
@@ -66055,6 +66466,123 @@ def t_ip013_login_secret_never_stored(ctx):
         LOG.setLevel(old_level)
 
 
+def ip013_odd_port_frames():
+    """5.3.4 (IP-013 review): the same password on ports the usual rules
+    don't know: FTP on 2121, Telnet on 2323 to 2326 (English, French,
+    Spanish and German prompts), SMTP AUTH PLAIN on 2525, POP3 on 1110,
+    HTTP Proxy-Authorization through a proxy on 3128, HTTP Basic with
+    bare-LF lines on 8080, a password in a web address's query, and a
+    Telnet device that echoes the password back."""
+    sb = ScenarioBuilder()
+    sb.home_network()
+    c = IP013_CANARY.encode()
+    me, gw, w = sb.ME, sb.GW[1], "93.184.215.14"
+    basic = base64.b64encode(b"alex:" + c)
+    sb._tcp_talk(me, w, gw, 45001, 2121, [
+        (1, b"220 hi\r\n"), (0, b"USER alex\r\n"), (1, b"331 pw\r\n"),
+        (0, b"PASS " + c + b"\r\n"), (1, b"230 ok\r\n")])
+    for port, prompt in ((2323, b"Password: "), (2324, b"Mot de passe : "),
+                         (2325, b"Contrase\xc3\xb1a: "),
+                         (2326, b"\xff\xfb\x01Passwort:")):
+        sb._tcp_talk(me, w, gw, port + 40000, port, [
+            (1, b"login: "), (0, b"alex\r\n"), (1, prompt),
+            (0, c + b"\r\n"), (1, b"\r\n# ")])
+    sb._tcp_talk(me, w, gw, 45007, 23, [   # a device that echoes it back
+        (1, b"Password: "), (0, c + b"\r\n"), (1, c + b"\r\n# ")])
+    sb._tcp_talk(me, w, gw, 45002, 2525, [
+        (1, b"220 hi\r\n"), (0, b"EHLO x\r\n"), (1, b"250 AUTH PLAIN\r\n"),
+        (0, b"AUTH PLAIN " + base64.b64encode(b"\0alex\0" + c) + b"\r\n"),
+        (1, b"235 ok\r\n")])
+    sb._tcp_talk(me, w, gw, 45003, 1110, [
+        (1, b"+OK\r\n"), (0, b"USER alex\r\n"), (1, b"+OK\r\n"),
+        (0, b"PASS " + c + b"\r\n"), (1, b"+OK\r\n")])
+    sb._tcp_talk(me, w, gw, 45004, 3128, [
+        (0, b"GET http://a.example/ HTTP/1.1\r\nHost: a.example\r\n"),
+        (0, b"Proxy-Authorization: Basic " + basic + b"\r\n\r\n"),
+        (1, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")])
+    sb._tcp_talk(me, w, gw, 45005, 8080, [
+        (0, b"GET / HTTP/1.1\nHost: a.example\nAuthorization: Basic "
+            + basic + b"\n\n"),
+        (1, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")])
+    sb._tcp_talk(me, w, gw, 45006, 80, [
+        (0, b"GET /login?user=alex&pw=" + c + b" HTTP/1.1\r\n"
+            b"Host: a.example\r\n\r\n"),
+        (1, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")])
+    return sb.frames
+
+
+@self_test()
+def t_ip013_secret_hidden_on_odd_ports(ctx):
+    """5.3.4 (IP-013 review): a password on a port the usual rules don't
+    know (FTP 2121, Telnet 2323, SMTP 2525, a proxy on 3128, bare-LF HTTP
+    on 8080, a ?pw= query) is in none of: the Packet details text (our
+    tree and the capture engine's view), the packet rows, the packet
+    explanation, the deep store or the alerts; the sign-ins are still
+    recognised, by content, with prompts in four languages."""
+    c = IP013_CANARY.encode()
+    forms = ip013_secret_forms() + (
+        base64.b64encode(c).decode(),
+        base64.b64encode(b"\0alex\0" + c).decode())
+    frames = ip013_odd_port_frames()
+    assert sum(c in raw for raw, _t, _l in frames) == 9 and sum(
+        base64.b64encode(b"alex:" + c) in raw for raw, _t, _l in frames) == 2
+
+    class _RawView:
+        """Stands in for the capture engine's packet: its own view
+        prints the payload as it is, like scapy's Raw load."""
+        name = "Raw"
+        payload = None
+
+        def __init__(self, raw):
+            self.raw = raw
+
+        def show(self, dump=False):
+            return self.raw.decode("latin-1") + "\n" + self.raw.hex()
+    texts = []
+    for raw, ts, lt in frames:
+        d = fast_decode(raw, ts, lt)
+        texts.append(repr({k: v for k, v in d.items()
+                           if k not in ("raw", "pkt", "payload")}))
+        dis = dissect(raw, lt)
+        texts.append(dis.text())
+        texts.append(explain_packet(dis))
+        texts.append(packet_details_text(dis, _RawView(raw)))
+        texts.append(packet_details_text(None, _RawView(raw)))
+        if ctx.scapy_ok and Ether is not None:
+            pkt = packet_object({"raw": raw, "linktype": lt})
+            texts.append(packet_details_text(dis, pkt))
+            # the tree's fallback (no raw bytes) stops at this layer
+            assert c not in raw or scapy_hidden_layer(pkt) is not None
+            texts.append(packet_details_text(None, pkt))
+    for text in texts:
+        for form in forms:
+            assert form not in text, f"the password leaked: {text[:300]!r}"
+    store = ip013_deep_pass(frames, ())
+    logins = store.take_logins()
+    got = Counter(t["proto"] for t in logins)
+    assert got == Counter({"Telnet": 5, "HTTP": 2, "FTP": 1, "POP3": 1,
+                           "SMTP": 1}), got
+    with store.lock:
+        blob = repr((list(store.findings), list(store.messages),
+                     list(store.txns)))
+    assert blob.count("typed text, 15 bytes (hidden)") == 5, blob[:400]
+    assert "Telnet: terminal text, 25 bytes (hidden)" in blob
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    alerts = [m.deep_login(t) for t in logins]
+    assert alerts[0] is not None and m.alerts.alerts      # repeats fold
+    blob += json.dumps([alert_to_dict(a) for a in m.alerts.alerts.values()])
+    for form in forms:
+        assert form not in blob, f"the password reached the deep store or " \
+            f"an alert ({form})"
+    # the one-line labels on their own
+    assert _deep_preview("http", b"GET /a?pw=" + c + b"\nHost: x\n") == \
+        "GET /a?(query hidden)"
+    assert _deep_preview("line", b"Proxy-Authorization: Basic x\r\n") == \
+        "Proxy-Authorization: (hidden)"
+
+
 @self_test()
 def t_ip010_own_blocklist(ctx):
     """5.3.4 (IP-010): your own blocklist file: addresses, ranges (IPv4 and
@@ -66161,6 +66689,99 @@ def t_ip010_own_blocklist(ctx):
                  OWN_REASON_BAD, OWN_REASON_MANY):
         for loc in ("fr", "es"):
             assert translate_text(text, loc) != text, (loc, text)
+
+
+@self_test()
+def t_ip010_own_blocklist_file_and_entries(ctx):
+    """5.3.4 (IP-010 review): a pipe or a device at the path is refused
+    at once instead of blocking; a long list parses quickly; an
+    international name (bücher.de) is kept in its xn-- form; a public
+    suffix (co.uk) is too wide; IPv4 written as IPv6 (::ffff:0:0/96,
+    2002::/16) is special-use; the log names the file, not its folder."""
+    if hasattr(os, "mkfifo"):
+        fifo = ctx.path("blocklist.fifo")
+        os.mkfifo(fifo)
+        res = []
+
+        def run():
+            try:
+                load_own_blocklist(fifo)
+                res.append("read")
+            except OSError as e:
+                res.append(e)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(5)
+        if t.is_alive():         # let the stuck reader go before failing
+            with contextlib.suppress(OSError):
+                os.close(os.open(fifo, os.O_WRONLY | os.O_NONBLOCK))
+        assert not t.is_alive() and res and isinstance(res[0], OSError), res
+    if os.path.exists("/dev/zero"):
+        dev = ctx.path("zero.txt")
+        with contextlib.suppress(OSError):
+            os.symlink("/dev/zero", dev)
+        if os.path.islink(dev):
+            t0 = time.monotonic()
+            try:
+                load_own_blocklist(dev)
+                raise AssertionError("a device was read as a list")
+            except OSError:
+                pass
+            assert time.monotonic() - t0 < 0.5
+    # speed: compared with Python's own parsing of the same lines, so a
+    # slow machine doesn't matter (the overlap test made it about 7 times)
+    lines = [f"{11 + (i >> 8) % 80}.{i & 255}.{(i * 7) & 255}.7"
+             for i in range(6000)] + \
+        [f"{11 + (i >> 8) % 80}.{i & 255}.{(i * 7) & 255}.0/24"
+         for i in range(6000)]
+    ratios = []
+    for _ in range(3):
+        t0 = time.perf_counter()
+        for x in lines:
+            ipaddress.ip_network(x, strict=False)
+        cal = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        got = [own_blocklist_entry(x) for x in lines]
+        ratios.append((time.perf_counter() - t0) / max(cal, 1e-6))
+    assert all(g[0] in ("ip", "net") for g in got), got[:3]
+    assert min(ratios) < 4.5, ratios
+    E = own_blocklist_entry
+    assert E("bücher.de") == ("domain", "xn--bcher-kva.de")
+    assert E("*.BÜCHER.de") == ("domain", "xn--bcher-kva.de")
+    assert E("xn--bcher-kva.de") == ("domain", "xn--bcher-kva.de")
+    for wide in ("co.uk", "com.au", "co.jp", "com.br", "co.nz", "org.uk",
+                 "*.co.uk"):
+        assert E(wide) == ("reject", OWN_REASON_WIDE), wide
+    assert E("bbc.co.uk") == ("domain", "bbc.co.uk")
+    for special in ("::ffff:0:0/96", "::ffff:8.8.8.0/120", "2002::/16",
+                    "2002:808:808::/48", "::ffff:8.8.8.8"):
+        assert E(special) == ("reject", OWN_REASON_PRIVATE), special
+    assert E("2001:4860::/32")[0] == "net" and E("8.8.8.8") == \
+        ("ip", "8.8.8.8") and E("10.0.0.1") == ("reject", OWN_REASON_PRIVATE)
+    # the log names the file only
+    folder = ctx.path("Private-Folder-Name")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, "mine.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("45.9.20.1\n")
+    caught = []
+
+    class _Grab(logging.Handler):
+        def emit(self, record):
+            caught.append(record.getMessage())
+    grab = _Grab(logging.DEBUG)
+    old_level, old = LOG.level, OWN_BLOCKLIST[0]
+    LOG.addHandler(grab)
+    LOG.setLevel(logging.DEBUG)
+    try:
+        assert use_own_blocklist(path) is not None
+    finally:
+        LOG.removeHandler(grab)
+        LOG.setLevel(old_level)
+        OWN_BLOCKLIST[0] = old
+        _REP_GEN[0] += 1
+    said = "\n".join(caught)
+    assert "mine.txt" in said and "Private-Folder-Name" not in said, said
 
 
 @self_test()
@@ -69201,6 +69822,57 @@ def mc7_board(ctx, which, frames, decoder=None, **kw):
     else:
         f = call_facts(m, offline=off, **kw)
     return INVESTIGATORS[which](f), f, m
+
+
+@self_test()
+def t_mc7_connect_blind_spot_review(ctx):
+    """5.3.4 (MC7 review): the router's own gratuitous ARP (broadcast
+    target) is not an answer to another device, so a computer that sees
+    only its own traffic still says "can't tell"; the ARP questions are
+    counted inside the window; two devices with the same label and
+    address both stay in the device picker."""
+    def board(extra):
+        b = ScenarioBuilder()
+        b.arp_announce(b.ME)
+        b.tls(b.ME, "www.example.com", "93.184.215.14", size=400000)
+        L, nb = b.L, MC7_NEWBIE
+        for _i in range(3):
+            b._emit(L.Ether(src=nb, dst="ff:ff:ff:ff:ff:ff") / L.ARP(
+                op=1, hwsrc=nb, psrc="192.168.1.77", pdst=b.GW[0]), dt=1.0)
+        extra(b, L, nb)
+        m = _call_model(ctx, b.frames)
+        return m, connect_facts(m, nb)
+
+    def garp(b, L, nb):
+        for dst in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+            b._emit(L.Ether(src=b.GW[1], dst="ff:ff:ff:ff:ff:ff") / L.ARP(
+                op=2, hwsrc=b.GW[1], psrc=b.GW[0], hwdst=dst,
+                pdst=b.GW[0]), dt=1.0)
+    m, f = board(garp)
+    assert not f["sees_answers"] and not m.gw_arp_replies.get(
+        "ff:ff:ff:ff:ff:ff"), (f, dict(m.gw_arp_replies))
+    assert investigate_connect(f)[0]["key"] == "cant_tell", f
+
+    def other(b, L, nb):        # a real answer to another device counts
+        b._emit(L.Ether(src=b.GW[1], dst=b.PHONE[1]) / L.ARP(
+            op=2, hwsrc=b.GW[1], psrc=b.GW[0], hwdst=b.PHONE[1],
+            pdst=b.PHONE[0]), dt=1.0)
+    _m, f = board(other)
+    assert f["sees_answers"], f
+
+    def later(b, L, nb):        # 3 questions long ago, 2 just now
+        b.t += 2000
+        for _i in range(2):
+            b._emit(L.Ether(src=nb, dst="ff:ff:ff:ff:ff:ff") / L.ARP(
+                op=1, hwsrc=nb, psrc="192.168.1.77", pdst=b.GW[0]), dt=1.0)
+    m, f = board(later)
+    assert f["arp_asks"] == 2 and m.gw_arp_asks[MC7_NEWBIE][2] == 5, f
+    got = unique_choice_labels([("Phone  [192.168.1.5]", "k1", "aa"),
+                                ("Phone  [192.168.1.5]", "k2", "bb"),
+                                ("Phone  [192.168.1.5]", "k3", "bb"),
+                                ("TV  [192.168.1.6]", "k4", "cc")])
+    assert sorted(got.values()) == ["k1", "k2", "k3", "k4"], got
+    assert "Phone  [192.168.1.5] · bb" in got, got
 
 
 MC7_PLANTED = {"dns": "failing", "ipv6": "broken", "connect": "no_dhcp",
@@ -77966,6 +78638,31 @@ def gt_534_notify_minimised(app, ctx):
         root.title("MiniWireshark")
 
 
+@gui_test_step("5.3.4 M12 review: coming back to one of the app's own "
+               "windows (not the main one) ends the time away")
+def gt_534_focus_back_in_own_window(app, ctx):
+    root = app.root
+    saved = getattr(app, "_away_since", None)
+    win = tk.Toplevel(root)
+    entry = tk.Entry(win)
+    entry.pack()
+    try:
+        _gui_pump(root, 0.2)
+        app._away_since = time.time()          # the focus went elsewhere
+        assert app.window_away()
+        entry.focus_force()
+        _gui_pump(root, 0.1, lambda: getattr(app, "_away_since", 0) is None,
+                  timeout=5)
+        assert root.focus_get() is entry, root.focus_get()
+        assert app._away_since is None and (not app.window_away() or
+                                            app.minimized())
+    finally:
+        with contextlib.suppress(tk.TclError):
+            win.destroy()
+        app._away_since = saved
+        _gui_pump(root, 0.1)
+
+
 @gui_test_step("5.3.4 M9: Unusual activity — the Security section with both "
                "readings, acknowledge and snooze, the Dashboard card, your "
                "own blocklist, and a login password that is never stored")
@@ -78058,6 +78755,12 @@ def gt_534_unusual_activity(app, ctx):
             root.geometry(old[3])
             _gui_pump(root, 0.5)
         assert not found, "\n".join(found[:10])
+        # 5.3.4 (review): back in English the cards are English again, with
+        # no forced refresh (the section's sig holds the language)
+        if old[0] == "English" and sec_u.cards:
+            words = [t for _c, t in texts(sec_u.frame)]
+            assert any(t.startswith("Next step:") for t in words) and \
+                any(t.startswith("What we saw:") for t in words), words
         app._select_tab("security")
         sec_u.refresh(force=True)
         _gui_pump(root, 0.2)
@@ -78090,7 +78793,8 @@ def gt_534_unusual_activity(app, ctx):
     try:
         _gui_pump(root, 0.3)
         win.choose(path)
-        _gui_pump(root, 0.2)
+        assert win.reading          # 5.3.4: read on a worker, not here
+        _gui_pump(root, 0.05, lambda: not win.reading, timeout=10)
         st = str(win.status.cget("text"))
         assert "1 addresses, 0 ranges and 1 names" in st, st
         body = win.text.get("1.0", "end")
@@ -78100,7 +78804,20 @@ def gt_534_unusual_activity(app, ctx):
         with open(path, "a", encoding="utf-8") as fh:
             fh.write("45.9.20.2\n")
         win.reload()
+        _gui_pump(root, 0.05, lambda: not win.reading, timeout=10)
         assert "2 addresses" in str(win.status.cget("text"))
+        # 5.3.4: a pipe at the path is refused, and the window never waits
+        # on it (the reading happens on a worker thread)
+        if hasattr(os, "mkfifo"):
+            fifo = ctx.path("own-blocklist.fifo")
+            os.mkfifo(fifo)
+            t0 = time.monotonic()
+            win.choose(fifo)
+            assert time.monotonic() - t0 < 1.0
+            _gui_pump(root, 0.05, lambda: not win.reading, timeout=10)
+            assert "could not be read" in str(win.status.cget("text"))
+            assert OWN_BLOCKLIST[0] is not None      # the old list stays
+            assert app.config.get("alerts.own_blocklist_path") == path
         found = layout_audit(win)
         assert not found, found[:5]
         win.stop()
