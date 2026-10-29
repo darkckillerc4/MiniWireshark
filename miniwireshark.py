@@ -7527,7 +7527,18 @@ def local_nets_from_routes(routes, capture_iface=""):
         bucket = mine if want and iface_name(iface) == want else other
         if n not in bucket:
             bucket.append(n)
-    return (mine or other)[:16]
+    out = LocalNets((mine or other)[:16])
+    # 5.3.4 review (CO-05): only subnets of the capture adapter itself
+    # say which private addresses are behind the router; another
+    # adapter's subnet (a mirror port or tap with no address) does not
+    out.own = bool(mine) or not want
+    return out
+
+
+class LocalNets(list):
+    """local_nets_from_routes' result; `own` is False when the capture
+    adapter had no subnet of its own and another adapter's was used."""
+    own = True
 
 
 def iface_desc(iface):
@@ -13034,7 +13045,8 @@ class DeviceRegistry:
         """May this address be attached to a LOCAL device? (memoised; the
         memo resets whenever the local networks or IPv6 prefixes change)"""
         sig = (id(self.local_nets), len(self.local_nets),
-               id(self.v6_prefixes), len(self.v6_prefixes))
+               id(self.v6_prefixes), len(self.v6_prefixes),
+               getattr(self.local_nets, "own", True))
         if sig != self._elig_sig:
             self._elig_sig = sig
             self._elig = {}
@@ -13053,11 +13065,13 @@ class DeviceRegistry:
         if a.version == 4:
             if ip == "255.255.255.255" or a in LOOPBACK_V4:
                 return False
-            known = False
+            known, own = False, getattr(self.local_nets, "own", True)
             for net in self.local_nets:
                 if net.version != 4:
                     continue
-                known = True
+                # 5.3.4 review: a link-local-only adapter (DHCP failed)
+                # or another adapter's subnet doesn't know this wire
+                known = known or (own and not net.is_link_local)
                 if a in net:
                     if net.prefixlen < 31 and a in (net.network_address,
                                                     net.broadcast_address):
@@ -13557,8 +13571,12 @@ class DeviceRegistry:
         if ca and cb and ca != cb:
             return False
         fa = dhcp_fingerprint(a)
-        return bool(fa and a.randomized_mac and b.randomized_mac and
-                    fa == dhcp_fingerprint(b))
+        if not (fa and a.randomized_mac and b.randomized_mac and
+                fa == dhcp_fingerprint(b)):
+            return False
+        # 5.3.4 review: only when no third identity sends the same list
+        return sum(1 for d in self.by_key.values()
+                   if d.randomized_mac and dhcp_fingerprint(d) == fa) <= 2
 
     @staticmethod
     def _real_client_id(d):
@@ -13647,6 +13665,13 @@ class DeviceRegistry:
             if clues:
                 for c in self._clue_keys(other):
                     by_clue[c].append(other)
+        # 5.3.4 review: a DHCP request list alone is shared by every phone
+        # of one OS version, so it pairs only when exactly two identities
+        # on this network send it (else 50 guest iPhones made 1,225 pairs
+        # and an N² scan every tick)
+        for c in [c for c, v in by_clue.items()
+                  if c[0] == "fp" and len(v) != 2]:
+            del by_clue[c]
         pos = {}
 
         def pool(dev):
@@ -13697,7 +13722,7 @@ class DeviceRegistry:
             name = self.stable_name(dev)
             if self.distinctive(name):
                 groups[name].append(dev)
-            elif cids and self._real_client_id(dev):
+            if cids and self._real_client_id(dev):
                 # 5.3.4 (MC3): a phone that rotates its private address
                 # and announces no name keeps its DHCP client identifier
                 groups[("cid", self._real_client_id(dev))].append(dev)
@@ -13709,6 +13734,17 @@ class DeviceRegistry:
                 a, b = devs
                 if not self.same_client_id(a, b):
                     continue
+                # 5.3.4 review: a client identifier is broadcast, and
+                # cloned systems share one (systemd's comes from the
+                # machine-id), so it alone never merges: the DHCP request
+                # list must match as well
+                fa = dhcp_fingerprint(a)
+                if not fa or fa != dhcp_fingerprint(b):
+                    continue
+                if self.resolve(a.key) != a.key or \
+                        self.resolve(b.key) != b.key or \
+                        a.key not in self.by_key or b.key not in self.by_key:
+                    continue              # already merged by its name
             older, newer = sorted(devs, key=lambda d: d.first_seen)
             if not self.can_pair(older, newer):
                 continue
@@ -13723,6 +13759,7 @@ class DeviceRegistry:
                     older.network_id != newer.network_id:
                 continue                  # same name, different network
             self.merge(newer.key, older.key, auto=True,
+                       trust=not isinstance(name, tuple),
                        reason=(f"both announced the name “{name}”, "
                                if not isinstance(name, tuple) else
                                "both sent the same DHCP client "
@@ -13732,7 +13769,7 @@ class DeviceRegistry:
             merged.append((newer.key, older.key))
         return merged
 
-    def merge(self, keep_key, other_key, auto=False, reason=""):
+    def merge(self, keep_key, other_key, auto=False, reason="", trust=True):
         """Combine two identities. The absorbed key becomes an alias of the
         kept one, and enough is recorded to split them apart EXACTLY later:
         per-hardware-address counters, which labels were copied over, and
@@ -13784,7 +13821,11 @@ class DeviceRegistry:
         keep.protocols.update(other.protocols)
         for f in _MERGE_COPIED:
             if f in ("mine", "expected"):
-                setattr(keep, f, getattr(keep, f) or getattr(other, f))
+                # 5.3.4 review: a merge made only on DHCP clues never
+                # hands "mine" or "expected" to the newcomer, so a device
+                # copying an absent one's identifier stays an alert
+                if trust:
+                    setattr(keep, f, getattr(keep, f) or getattr(other, f))
             elif not getattr(keep, f):
                 setattr(keep, f, getattr(other, f))
         keep_after = {f: getattr(keep, f) for f in _MERGE_COPIED}
@@ -13868,8 +13909,16 @@ class DeviceRegistry:
         add = entry.get("added")
         if isinstance(add, dict):                    # 5.3.4 (CO-11)
             for f in ("services", "websites", "remote_ips"):
+                # 5.3.4 review: what another identity still merged here
+                # also brought stays
+                still = set()
+                for h in keep.merge_history:
+                    v = (h.get("snapshot") or {}).get(f)
+                    if isinstance(v, list):
+                        still.update(x for x in v if isinstance(x, str))
                 getattr(keep, f).difference_update(
-                    x for x in add.get(f) or () if isinstance(x, str))
+                    x for x in add.get(f) or ()
+                    if isinstance(x, str) and x not in still)
             for k, v in (add.get("protocols") or {}).items():
                 if isinstance(v, (int, float)) and k in keep.protocols:
                     keep.protocols[k] -= v
@@ -18452,6 +18501,7 @@ class NetworkModel:
         self.config = config
         self._clock = now_fn
         self.use_packet_clock = False
+        self._flow_marks = {}     # fid -> (out, in) when this minute began
         self.offline_now = 0.0
         self.gateway_ip = gateway_ip
         self.my_ips = set(my_ips)
@@ -18916,7 +18966,9 @@ class NetworkModel:
             self.my_macs = {m.lower() for m in my_macs if m}
             self.registry.my_macs = self.my_macs
         if local_nets is not None:
-            self.local_nets = list(local_nets)
+            nets = LocalNets(local_nets)
+            nets.own = getattr(local_nets, "own", True)
+            self.local_nets = nets
             self.registry.local_nets = self.local_nets
         if v6_prefixes is not None:
             self.v6_prefixes = list(v6_prefixes)
@@ -20111,6 +20163,21 @@ class NetworkModel:
             if a is not None and not a.updated and \
                     feat in ("bytes_up", "bytes_down"):
                 self._spike_story(dev, a, feat == "bytes_up", v)
+        if snap and not self.use_packet_clock and \
+                dev.key == self.my_device_key():
+            self._mark_flows(dev.key)
+
+    def _recent_flows(self):
+        return list(self.flows.active.values())[-3000:] + \
+            list(self.flows.archive)[-500:]
+
+    def _mark_flows(self, key):
+        """5.3.4 review (IP-022): each connection's byte counts as a new
+        minute begins, so a spike is put on the connection that sent the
+        most in that minute, not the one that sent the most in its life."""
+        self._flow_marks = {f.fid: (f.bytes_out, f.bytes_in)
+                            for f in self._recent_flows()
+                            if f.device_key == key}
 
     def spike_program(self, dev, upload, since):
         """5.3.4 (IP-022): the program behind this computer's busiest
@@ -20122,12 +20189,13 @@ class NetworkModel:
                 dev.key != self.my_device_key():
             return None
         best, most = None, 0
-        recent = list(self.flows.active.values())[-3000:] + \
-            list(self.flows.archive)[-500:]
-        for f in recent:
+        marks = self._flow_marks
+        for f in self._recent_flows():
             if f.device_key != dev.key or f.last_seen < since:
                 continue
-            b = f.bytes_out if upload else f.bytes_in
+            m = marks.get(f.fid)
+            b = (f.bytes_out if upload else f.bytes_in) - \
+                ((m[0] if upload else m[1]) if m else 0)
             if b > most:
                 best, most = f, b
         return program_short_name(best.process) if best is not None else ""
@@ -44671,8 +44739,18 @@ class MiniWireshark:
     def _story_done(self, story):
         """On the Tk thread: keep it, and redraw where it is shown."""
         self._story_at = time.monotonic()
-        if story.get("model_id") != id(self.model):
-            return                    # the data was replaced meanwhile
+        try:
+            seen = float(self.config.get("general.story_seen", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            seen = 0.0
+        last = story.get("last_looked")
+        if story.get("model_id") != id(self.model) or \
+                (last is not None and float(last) < seen):
+            # 5.3.4 review: the data was replaced, or the story was read,
+            # while this one was being written: write it again, else the
+            # Timeline stays on "Writing the story…" or calls old lines new
+            self.root.after(0, lambda: self.request_story(force=True))
+            return
         self.story = story
         tl = self.tabs.get("timeline")
         if tl is not None and tl.story_on():
@@ -67836,6 +67914,75 @@ def t_story_change_sequence(ctx):
 
 
 @self_test()
+def t_m6_review_merge_and_subnet_fixes(ctx):
+    """5.3.4 review of M6: a copied DHCP client identifier alone never
+    merges or hands over "mine"; one OS's request list shared by many
+    phones pairs nobody; a split keeps what another merged identity also
+    brought; CO-05 trusts only the capture adapter's own subnets."""
+    clk = _FakeClock()
+    cfg = ctx.cfg({})
+    reg = DeviceRegistry("", [], cfg, clk)
+    cid = "ffb1c2d3e400020000ab11f00dcafe12345678"
+    v = reg.touch("192.168.1.40", "3c:22:fb:00:00:01", "mac_local", "x")
+    v.alias, v.mine, v.expected = "Sam's laptop", True, True
+    v.dhcp_client_id, v.dhcp_params = cid, "1,3,6,15"
+    v.presence = [[clk.t - 5000, clk.t - 4000]]
+    v.state, v.first_seen = STATE_INACTIVE, clk.t - 5000
+    clk.t += 10
+    a = reg.touch("192.168.1.99", "da:11:22:33:44:55", "mac_local", "x")
+    a.dhcp_client_id, a.presence = cid, [[clk.t - 100, None]]
+    assert reg.auto_merge_pass() == []        # client id alone: no merge
+    a.dhcp_params = v.dhcp_params             # request list matches too
+    assert reg.auto_merge_pass() == [(a.key, v.key)]
+    kept = reg.by_key[reg.resolve(v.key)]
+    assert not kept.mine and not kept.expected   # never handed over
+    # option 55 shared by many phones: no pairs; exactly two: one pair
+    P = "1,121,3,6,15,108,114,119,252,95,44,46"
+    reg = DeviceRegistry("", [], cfg, clk)
+    devs = []
+    for i in range(30):
+        mac = "da:00:00:00:00:%02x" % i
+        d = reg.touch("192.168.1.%d" % (10 + i), mac, "mac_local", "x")
+        d.dhcp_params, d.dhcp_client_id = P, "01" + mac.replace(":", "")
+        d.presence = [[clk.t - 100000 + i * 50, clk.t - 100000 + i * 50
+                       + 40]]
+        devs.append(d)
+    pool = reg.merge_pool()
+    assert sum(len(reg.merge_candidates(d, pool(d))) for d in devs) == 0
+    for d in devs[2:]:
+        d.dhcp_params = "1,3,6,%d" % devs.index(d)
+    pool = reg.merge_pool()
+    assert [o.key for o, _c, _r in reg.merge_candidates(
+        devs[1], pool(devs[1]))] == [devs[0].key]
+    # chained merges: splitting B keeps what C (still merged) brought
+    reg = DeviceRegistry("", [], cfg, clk)
+    A, B, C = (reg.touch("192.168.1.%d" % (40 + i), "da:00:00:00:01:%02x"
+                         % i, "mac_local", "x") for i in range(3))
+    for d in (B, C):
+        d.websites.add("netflix.com")
+        d.services.add("_airplay._tcp")
+    reg.merge(A.key, B.key)
+    reg.merge(A.key, C.key)
+    reg.split(A.key, 0)
+    assert A.websites == {"netflix.com"} and A.services == {"_airplay._tcp"}
+    # CO-05: another adapter's subnet, or link-local only, decides nothing
+    ipi = lambda x: int(ipaddress.ip_address(x))       # noqa: E731
+    routes = [(ipi("10.0.0.0"), ipi("255.255.255.0"), "0.0.0.0", "eth0",
+               "10.0.0.5")]
+    nets = local_nets_from_routes(routes, "eth1")
+    assert not nets.own and local_nets_from_routes(routes, "eth0").own
+    for ln in (nets, [ipaddress.ip_network("169.254.0.0/16")]):
+        reg = DeviceRegistry("", [], cfg, clk)
+        reg.local_nets = ln
+        assert reg.eligible_ip("192.168.1.20"), ln
+    m = NetworkModel(cfg, *scenario_identity()[:3])
+    m.set_identity(local_nets=local_nets_from_routes(routes, "eth0"))
+    assert not m.registry.eligible_ip("192.168.1.20")   # routed: remote
+    m.set_identity(local_nets=nets)
+    assert m.registry.eligible_ip("192.168.1.20")
+
+
+@self_test()
 def t_story_spike_names_program(ctx):
     """5.3.4 (IP-022): a spike of this computer names the program stored on
     its busiest connection, live only; another device, or a file, is
@@ -67853,6 +68000,19 @@ def t_story_spike_names_program(ctx):
         f.device_key, f.bytes_out, f.process = "aa:me", out, proc
         m.flows.active[f.key] = f
     assert m.spike_program(me, True, now - 60) == "chrome.exe"
+    # review: a long connection with more bytes in its life, but few in
+    # this minute, is not the one that spiked
+    old = FlowRecord(9, ("TCP", 9), "TCP", ScenarioBuilder.ME[0], 50009,
+                     "93.184.215.15", 443, now)
+    old.device_key, old.bytes_out, old.process = "aa:me", 2 * 10 ** 9, \
+        "Dropbox.exe"
+    m.flows.active[old.key] = old
+    m._mark_flows("aa:me")
+    old.bytes_out += 100
+    m.flows.active[("TCP", 0)].bytes_out += 80 * 10 ** 6
+    assert m.spike_program(me, True, now - 60) == "chrome.exe"
+    del m.flows.active[old.key]
+    m._flow_marks = {}
     m.flows.active[("TCP", 0)].process = ""
     assert m.spike_program(me, True, now - 60) == ""      # unknown
     other = types.SimpleNamespace(key="aa:tv", display_name=lambda: "TV")
