@@ -10859,6 +10859,7 @@ FEATURES = {
     "ready_panel": True,     # "Ready?" lines in the Welcome Center (5.3.4)
     "story_mode": True,      # the Timeline tells what changed by day (M7)
     "signatures_v2": True,   # device signature additions, pairing (5.3.4)
+    "baseline_v2": True,     # day and night baselines, kind priors (5.3.4)
 }
 
 
@@ -11023,6 +11024,9 @@ FEATURE_HELP = {
     "signatures_v2": "more ways to tell what a device is (model names, how "
                      "it opens connections, look-alike devices) and DHCP "
                      "clues for spotting one device under a new address",
+    "baseline_v2": "each device learns a day and a night profile, starts "
+                   "from what is usual for its kind, forgets what it "
+                   "learned after 14 days away, and shows what it learned",
 }
 
 
@@ -14927,6 +14931,7 @@ ALERT_TYPES = {
     "download_spike":   ("Unusual download spike", "INFO"),
     "tcp_resets":       ("Repeated connection resets", "WARNING"),
     "new_service":      ("New advertised service", "INFO"),
+    "unusual_service":  ("New service used", "WARNING"),
     "cleartext":        ("Unencrypted protocol in use", "INFO"),
     "remote_access":    ("Remote-access service seen", "WARNING"),
     "new_country":      ("New country contacted", "INFO"),
@@ -15131,6 +15136,10 @@ ALERT_CHECKLIST.update({
                    "something isn't working."],
     "new_service": ["Did you just install or enable something on that "
                     "device (e.g. file sharing, casting)?"],
+    "unusual_service": ["Did the device update itself, or did you add a "
+                        "feature in its app?",
+                        "If not, restart it and check its app for an "
+                        "update; unplug it if it keeps happening."],
     "cleartext": ["Avoid entering passwords on services that are not "
                   "encrypted.",
                   "Check whether the device/app offers a secure (TLS) "
@@ -15194,6 +15203,8 @@ ALERT_MEANS = {
                   "an ad-blocker.",
     "new_service": "Usually something you just enabled: file sharing, "
                    "casting, a printer.",
+    "unusual_service": "Usually a firmware update or a new feature in the "
+                       "device's app.",
     "cleartext": "Usually older devices or simple home gear that doesn't "
                  "encrypt.",
     "remote_access": "Usually remote-desktop or SSH you set up on "
@@ -15532,7 +15543,7 @@ class AlertEngine:
                                    "contacted.",
             subject="dnsmulti")
 
-    def baseline_anomaly(self, dev, feature, value, mean):
+    def baseline_anomaly(self, dev, feature, value, mean, note=""):
         kind = {"bytes_up": "upload_spike", "bytes_down": "download_spike",
                 "destinations": "many_destinations",
                 "new_conns": "many_connections"}.get(feature)
@@ -15547,11 +15558,19 @@ class AlertEngine:
                  "new_conns": ("opened", f"{int(value)} new connections",
                                f"{mean:.0f}")}[feature]
         title = ALERT_TYPES[kind][0]
+        night = ""
+        if note == "first time active at night":
+            night = (" This is the first time it has been busy at night, "
+                     "so it was compared with what is usual for its kind.")
+        elif note:
+            night = (" This is the first time it has been busy during the "
+                     "day, so it was compared with what is usual for its "
+                     "kind.")
         return self._add(
             kind, ALERT_TYPES[kind][1], dev.key,
             f"{dev.display_name()}: {title.lower()}",
             f"In one minute it {label[0]} {label[1]}; its usual minute is "
-            f"about {label[2]}.",
+            f"about {label[2]}." + night,
             "This behavior is unusual compared with this device's recent "
             "activity.",
             "Updates, backups, video calls, game downloads and cloud sync "
@@ -15560,7 +15579,32 @@ class AlertEngine:
             confidence="Medium",
             why="Compared with this device's own learned baseline (not "
                 "with other devices).",
-            evidence=[f"This minute: {label[1]}", f"Usual: {label[2]}"])
+            evidence=[f"This minute: {label[1]}", f"Usual: {label[2]}"] +
+            ([f"Why now: {note}"] if note else []))
+
+    def unusual_service(self, dev, port, remote, usual):
+        """5.3.4 (MC5): a device that does one job (a plug, a camera, a
+        printer...) reached a service it never used before."""
+        if self._debounced(f"usvc:{dev.key}:{port}", 86400):
+            return None
+        name = PORT_SERVICES.get(port, "")
+        what = f"port {port}" + (f" ({name})" if name else "")
+        return self._add(
+            "unusual_service", ALERT_TYPES["unusual_service"][1], dev.key,
+            f"{dev.display_name()} used a new service: {what}",
+            f"It opened a connection to {remote or 'the Internet'} on "
+            f"{what}, which it had never used before.",
+            "Devices that do one job usually talk the same way every day.",
+            "A firmware update or a new feature in its app can add a "
+            "service. It matters if you didn't change anything and the "
+            "service is one used for remote control.",
+            confidence="Medium",
+            why="Compared with the services this device learned over at "
+                "least an hour.",
+            subject=f"{dev.key}|{port}",
+            evidence=[f"New: {what}",
+                      "Usual: " + (", ".join(str(x) for x in usual) or
+                                   "none")])
 
     def tcp_resets(self, dev, n, window_s, top_remote):
         if self._debounced(f"rst:{dev.key}", 1800):
@@ -17252,6 +17296,72 @@ class DnsTracker:
 
 
 # ---- per-device behavioral baseline -----------------------------------------
+# 5.3.4 (MC5, baseline v2, switch baseline_v2): each device keeps a day and
+# a night profile (local time), each starting from what an active minute
+# usually looks like for its kind (CLASS_TO_TYPE): packets, bytes up, bytes
+# down, Internet hosts, DNS lookups, new connections. The prior counts as
+# BASELINE_PRIOR_WEIGHT minutes and fades as the device's own minutes
+# arrive. The absolute floors scale by kind (smaller for a plug, larger
+# for a NAS that backs up at night), but while a profile is still judged
+# by its prior (fewer than alerts.baseline_min_minutes of its own) a floor
+# is never below its full size: a plug can still raise an alert once it
+# is known, a misnamed computer cannot. Rows older than
+# BASELINE_MAX_AGE_DAYS are not loaded.
+BASELINE_VERSION = 2
+BASELINE_NIGHT_HOURS = frozenset((23, 0, 1, 2, 3, 4, 5, 6))
+BASELINE_MAX_AGE_DAYS = 14
+BASELINE_PRIOR_MINUTES = 5       # a brand-new device settles this long
+BASELINE_PRIOR_WEIGHT = 5        # the prior counts as this many minutes
+BASELINE_SERVICE_MINUTES = 60    # services settled: no new one for this long
+# kinds that do one job, so a new service is worth a word
+BASELINE_FIXED_KINDS = frozenset(("printer", "camera", "iot", "speaker",
+                                  "tv", "nas"))
+# kind: ((packets, bytes up, bytes down, hosts, DNS, new connections) per
+# active minute, floor scale for bytes up, for bytes down (both include
+# local traffic: a print job, a scan, music to a speaker), for counts)
+KIND_PRIORS = {
+    "computer": ((80, 300e3, 3e6, 6, 4, 8), 1.0, 1.0, 1.0),
+    "phone": ((40, 150e3, 2e6, 5, 3, 5), 1.0, 1.0, 1.0),
+    "tablet": ((40, 150e3, 3e6, 5, 3, 5), 1.0, 1.0, 1.0),
+    "console": ((60, 200e3, 5e6, 4, 2, 3), 1.0, 2.0, 1.0),
+    "tv": ((150, 100e3, 15e6, 3, 2, 2), 1.0, 4.0, 0.5),
+    "nas": ((100, 2e6, 2e6, 3, 2, 3), 4.0, 4.0, 0.5),
+    "camera": ((120, 1.5e6, 50e3, 2, 1, 1), 1.0, 0.1, 0.25),
+    "speaker": ((20, 20e3, 400e3, 2, 1, 1), 0.25, 1.0, 0.25),
+    "printer": ((5, 5e3, 5e3, 1, 1, 1), 0.25, 1.0, 0.25),
+    "iot": ((5, 3e3, 3e3, 1, 1, 1), 0.1, 0.1, 0.2),
+}
+for _k in ("this-pc", "server", "vm", "router", "unknown"):
+    KIND_PRIORS[_k] = KIND_PRIORS["computer"]
+
+
+def baseline_kind(device_class):
+    """The KIND_PRIORS key for a device class ("Smart-home/IoT" -> iot)."""
+    k = CLASS_TO_TYPE.get(device_class or "Unknown", "unknown")
+    return k if k in KIND_PRIORS else "unknown"
+
+
+def baseline_period(ts):
+    """"night" (23:00-06:59 local time) or "day"."""
+    try:
+        h = time.localtime(ts).tm_hour
+    except (ValueError, OverflowError, OSError):
+        return "day"
+    return "night" if h in BASELINE_NIGHT_HOURS else "day"
+
+
+def baseline_updated(data, now=None):
+    """The `updated` time stored with a baseline row: when the device was
+    last learned (baseline v2), so an old row ages even if it is saved
+    again; the save time otherwise."""
+    now = time.time() if now is None else now
+    if FEATURES.get("baseline_v2", True) and isinstance(data, dict):
+        last = _finite(data.get("last"))
+        if 0 < last <= now:
+            return last
+    return now
+
+
 class DeviceBaseline:
     """Lightweight statistics (no ML): exponentially-weighted mean/variance
     of per-minute features over this device's ACTIVE minutes, plus its
@@ -17272,6 +17382,39 @@ class DeviceBaseline:
         self.cur_min = None
         self.cur = None
         self.cur_dests = set()
+        # baseline v2
+        self.kind = ""              # KIND_PRIORS key, set by the model
+        self.prof = {}              # "day" | "night" -> {n, mean, var}
+        self.first = 0.0            # first and last learned minute
+        self.last = 0.0
+        self.svc_at = 0             # self.n when a new service last appeared
+
+    def _profile(self, period):
+        """The day or night profile, started from the kind's prior."""
+        p = self.prof.get(period)
+        if p is None:
+            pm = KIND_PRIORS.get(self.kind or "unknown",
+                                 KIND_PRIORS["unknown"])[0]
+            p = self.prof[period] = {
+                "n": 0, "mean": {f: float(m) for f, m in
+                                 zip(self.FEATURES, pm)},
+                "var": {f: (1.5 * m + 1.0) ** 2 for f, m in
+                        zip(self.FEATURES, pm)}}
+        return p
+
+    def profile_n(self, period):
+        p = self.prof.get(period)
+        return p["n"] if p else 0
+
+    def is_new_service(self, port):
+        """True when a device of a one-job kind that has settled (an hour
+        of its own minutes, no new service for the last hour) reaches a
+        service it has never used."""
+        if not port or port in self.services or len(self.services) >= 40:
+            return False
+        return (self.kind in BASELINE_FIXED_KINDS and
+                self.n >= BASELINE_SERVICE_MINUTES and bool(self.services) and
+                self.n - self.svc_at >= BASELINE_SERVICE_MINUTES)
 
     def _reset_cur(self, minute):
         self.cur_min = minute
@@ -17305,6 +17448,8 @@ class DeviceBaseline:
             self.protocols[proto] += 1
         if service_port and (len(self.services) < 40 or
                              service_port in self.services):
+            if service_port not in self.services:
+                self.svc_at = self.n
             self.services[service_port] += 1
         return finished
 
@@ -17318,6 +17463,8 @@ class DeviceBaseline:
         snapshot = (vals, dict(self.mean),
                     {f: math.sqrt(max(0.0, self.var[f]))
                      for f in self.FEATURES}, self.n)
+        if FEATURES.get("baseline_v2", True):
+            snapshot = self._finish_v2(vals)
         self.n += 1
         a = max(self.ALPHA, 1.0 / self.n)
         for f in self.FEATURES:
@@ -17330,13 +17477,111 @@ class DeviceBaseline:
         self.cur = None
         return snapshot
 
+    def _finish_v2(self, vals):
+        """Compare with the day or night profile of this minute, then learn
+        it there. The snapshot's fifth item says which profile and how much
+        of it is the device's own."""
+        ts = self.cur_min * 60.0
+        period = baseline_period(ts)
+        p = self._profile(period)
+        info = {"period": period, "own": p["n"], "total": self.n,
+                "other": self.profile_n("night" if period == "day"
+                                        else "day"),
+                "kind": self.kind or "unknown"}
+        snapshot = (vals, dict(p["mean"]),
+                    {f: math.sqrt(max(0.0, p["var"][f]))
+                     for f in self.FEATURES}, self.n, info)
+        p["n"] += 1
+        a = max(self.ALPHA, 1.0 / (p["n"] + BASELINE_PRIOR_WEIGHT))
+        for f in self.FEATURES:
+            diff = vals[f] - p["mean"][f]
+            p["mean"][f] += a * diff
+            p["var"][f] = (1 - a) * (p["var"][f] + a * diff * diff)
+        if not self.first:
+            self.first = ts
+        self.last = max(self.last, ts)
+        return snapshot
+
     def to_dict(self):
-        return {"n": self.n, "mean": self.mean, "var": self.var,
-                "hours": self.hours,
-                "protocols": dict(self.protocols.most_common(20)),
-                "services": {str(k): v for k, v in
-                             self.services.most_common(20)},
-                "countries": sorted(self.countries)[:60]}
+        d = {"n": self.n, "mean": self.mean, "var": self.var,
+             "hours": self.hours,
+             "protocols": dict(self.protocols.most_common(20)),
+             "services": {str(k): v for k, v in
+                          self.services.most_common(20)},
+             "countries": sorted(self.countries)[:60]}
+        if FEATURES.get("baseline_v2", True):
+            # the 5.2.3 keys stay as they were (an older copy reads them
+            # and ignores the rest)
+            d.update({"v": BASELINE_VERSION, "kind": self.kind,
+                      "first": self.first, "last": self.last,
+                      "svc_at": self.svc_at,
+                      "profiles": {k: {"n": p["n"], "mean": dict(p["mean"]),
+                                       "var": dict(p["var"])}
+                                   for k, p in self.prof.items()}})
+        return d
+
+    def _load_v2(self, d):
+        if not FEATURES.get("baseline_v2", True):
+            return
+        kind = d.get("kind")
+        self.kind = kind if kind in KIND_PRIORS else ""
+        self.first = max(0.0, _finite(d.get("first")))
+        self.last = max(self.first, _finite(d.get("last")))
+        self.svc_at = min(self.n, max(0, int(_finite(d.get("svc_at")))))
+        profs = d.get("profiles")
+        if isinstance(profs, dict):
+            for period in ("day", "night"):
+                pd = profs.get(period)
+                if not isinstance(pd, dict):
+                    continue
+                mean, var = pd.get("mean") or {}, pd.get("var") or {}
+                if not isinstance(mean, dict) or not isinstance(var, dict):
+                    continue
+                self.prof[period] = {
+                    "n": max(0, int(_finite(pd.get("n")))),
+                    "mean": {f: max(0.0, _finite(mean.get(f)))
+                             for f in self.FEATURES},
+                    "var": {f: max(0.0, _finite(var.get(f)))
+                            for f in self.FEATURES}}
+        elif self.n:
+            # a row from before 5.3.4: both profiles start from what it
+            # learned over all hours, with the minutes its hours show
+            night = sum(self.hours[h] for h in BASELINE_NIGHT_HOURS)
+            for period, cnt in (("night", night),
+                                ("day", sum(self.hours) - night)):
+                if cnt > 0:
+                    self.prof[period] = {"n": min(cnt, self.n),
+                                         "mean": dict(self.mean),
+                                         "var": dict(self.var)}
+
+    def state_text(self, need=15):
+        """What the user sees: "Learning (9 of 15 min)" or "Knows this
+        device (3 days)"."""
+        if self.n < need:
+            return "Learning (%d of %d min)" % (self.n, need)
+        days = int(max(0.0, self.last - self.first) // 86400)
+        if days < 1:
+            return "Knows this device (less than a day)"
+        return ("Knows this device (1 day)" if days == 1 else
+                "Knows this device (%d days)" % days)
+
+    def learned_lines(self):
+        """What the day and night profiles learned, in words."""
+        out = []
+        for period, label in (("day", "During the day (07:00–23:00)"),
+                              ("night", "At night (23:00–07:00)")):
+            p = self.prof.get(period)
+            if not p or not p["n"]:
+                out.append(f"{label}: not active yet." +
+                           (" Its first busy minute there is compared "
+                            "with what is usual for its kind."
+                            if period == "night" else ""))
+                continue
+            out.append(f"{label}: usually sends "
+                       f"{_human_bytes(p['mean']['bytes_up'])}/min and "
+                       f"receives {_human_bytes(p['mean']['bytes_down'])}"
+                       f"/min ({p['n']} active minutes).")
+        return out
 
     @classmethod
     def from_dict(cls, d):
@@ -17354,6 +17599,9 @@ class DeviceBaseline:
                                   _num_map(d.get("services")).items()
                                   if str(k).isdigit()})
             b.countries = _str_set(d.get("countries") or [])
+        with contextlib.suppress(TypeError, ValueError, AttributeError,
+                                 OverflowError):
+            b._load_v2(d)
         return b
 
     def usual_hours_text(self):
@@ -17371,6 +17619,7 @@ class BaselineEngine:
     def __init__(self, config):
         self.config = config
         self.devices = {}
+        self.last_note = ""
 
     def get(self, key):
         b = self.devices.get(key)
@@ -17381,9 +17630,14 @@ class BaselineEngine:
     def check(self, snapshot):
         """Return [(feature, value, mean)] that look unusual for this
         device. Requires enough history and a big deviation in BOTH ratio
-        and standard deviations, plus an absolute floor."""
+        and standard deviations, plus an absolute floor. A v2 snapshot
+        (five items) is judged by its day or night profile; `last_note`
+        then holds a plain reason to add, or ""."""
+        self.last_note = ""
         if not snapshot:
             return []
+        if len(snapshot) == 5:
+            return self._check_v2(snapshot)
         vals, mean, std, n = snapshot
         need = int(self.config.get("alerts.baseline_min_minutes", 15))
         if n < need:
@@ -17395,6 +17649,36 @@ class BaselineEngine:
             if v >= floor and v > m * mult and v > m + 4 * max(s, 1.0):
                 out.append((f, v, m))
         return out
+
+    def _check_v2(self, snapshot):
+        vals, mean, std, _n, info = snapshot
+        if info["total"] < BASELINE_PRIOR_MINUTES:
+            return []                  # a brand-new device settles first
+        need = int(self.config.get("alerts.baseline_min_minutes", 15))
+        mult = float(self.config.get("alerts.chatty_multiplier", 4))
+        own = info["own"] >= need
+        _pm, s_up, s_down, s_n = KIND_PRIORS.get(info["kind"],
+                                                 KIND_PRIORS["unknown"])
+        out = []
+        for f, floor in self.FLOORS.items():
+            k = s_up if f == "bytes_up" else s_down if f == "bytes_down" \
+                else s_n
+            # still on the prior: the full floor at least
+            floor = floor * (k if own else max(1.0, k))
+            v, m, s = vals.get(f, 0), mean.get(f, 0.0), std.get(f, 0.0)
+            if v >= floor and v > m * mult and v > m + 4 * max(s, 1.0):
+                out.append((f, v, m))
+        if out and info["own"] < BASELINE_PRIOR_MINUTES and info["other"]:
+            self.last_note = ("first time active at night"
+                              if info["period"] == "night" else
+                              "first time active during the day")
+        return out
+
+    def state(self, key):
+        """The learning state of one device, in words."""
+        b = self.devices.get(key)
+        need = int(self.config.get("alerts.baseline_min_minutes", 15))
+        return (b or DeviceBaseline()).state_text(need)
 
     def reset(self):
         self.devices.clear()
@@ -20147,19 +20431,27 @@ class NetworkModel:
             remote = (d["dst_ip"] if role == "sent" else d["src_ip"]) \
                 if direction in ("up", "down") else ""
             b = self.baselines.get(dev.key)
+            svc = (flow.remote_port if flow and flow.device_key == dev.key
+                   and new_flow else None)
+            if FEATURES.get("baseline_v2", True):
+                b.kind = baseline_kind(dev.device_class)
+                # 5.3.4 (MC5): a one-job device reaching a new service on
+                # the Internet (it opened the connection)
+                if svc and role == "sent" and direction == "up" and \
+                        svc < 49152 and b.is_new_service(svc):
+                    self._alert(self.alerts.unusual_service(
+                        dev, svc, remote, sorted(b.services)[:8]))
             snap = b.observe(ts, d["length"], role, remote,
                              is_dns=bool(d["dns"]) and role == "sent",
-                             proto=d["proto"],
-                             service_port=(flow.remote_port if flow and
-                                           flow.device_key == dev.key
-                                           and new_flow else None),
+                             proto=d["proto"], service_port=svc,
                              new_conn=bool(new_flow and flow and
                                            flow.device_key == dev.key))
             self._baseline_check(dev, snap)
 
     def _baseline_check(self, dev, snap):
         for feat, v, m in self.baselines.check(snap):
-            a = self._alert(self.alerts.baseline_anomaly(dev, feat, v, m))
+            a = self._alert(self.alerts.baseline_anomaly(
+                dev, feat, v, m, self.baselines.last_note))
             if a is not None and not a.updated and \
                     feat in ("bytes_up", "bytes_down"):
                 self._spike_story(dev, a, feat == "bytes_up", v)
@@ -20625,6 +20917,7 @@ def _default_config():
                    "many_destinations": True, "many_connections": True,
                    "upload_spike": True, "download_spike": True,
                    "tcp_resets": True, "new_service": True,
+                   "unusual_service": True,
                    "cleartext": True, "remote_access": True,
                    "new_country": True, "broadcast_storm": True,
                    "scan_pattern": True, "reputation": True,
@@ -21663,7 +21956,7 @@ class Store:
                             "VALUES(?,?,?,?)", (dom, day, req, b))
             for key, data in snap["baselines"]:
                 con.execute("INSERT OR REPLACE INTO baselines VALUES(?,?,?)",
-                            (key, json.dumps(data), time.time()))
+                            (key, json.dumps(data), baseline_updated(data)))
         return self.submit(job)
 
     def prune(self, days):
@@ -21796,12 +22089,28 @@ class Store:
         r = self.query("SELECT v FROM meta WHERE k='schema'")
         return int(r[0][0]) if r and str(r[0][0]).isdigit() else 0
 
-    def load_baselines(self):
+    def load_baselines(self, now=None):
+        """{device key: baseline dict}. 5.3.4 (MC5, baseline_v2): a row
+        whose device was last learned more than BASELINE_MAX_AGE_DAYS ago
+        is dropped, so months-old habits never judge today's traffic."""
         out = {}
-        for key, data in self.query("SELECT device_key, data FROM "
-                                    "baselines"):
+        v2 = FEATURES.get("baseline_v2", True)
+        cutoff = (time.time() if now is None else now) - \
+            BASELINE_MAX_AGE_DAYS * 86400
+        stale = []
+        for key, data, updated in self.query(
+                "SELECT device_key, data, updated FROM baselines"):
+            if v2 and _finite(updated) < cutoff:
+                stale.append(key)
+                continue
             with contextlib.suppress(ValueError):
                 out[key] = json.loads(data)
+        if stale:
+            LOG.info("History: %d learned baseline(s) older than %d days "
+                     "were dropped", len(stale), BASELINE_MAX_AGE_DAYS)
+            self.submit(lambda con, keys=tuple(stale): con.executemany(
+                "DELETE FROM baselines WHERE device_key=?",
+                [(k,) for k in keys]))
         return out
 
     def known_device_rows(self, limit=500):
@@ -25070,6 +25379,16 @@ Nothing new since you last looked. ¦ Rien de nouveau depuis votre dernier coup 
 %d changes since you last looked. ¦ %d changements depuis votre dernier coup d'œil. ¦ %d cambios desde la última vez que miró.
 Story ¦ Récit ¦ Relato
 How many times ¦ Combien de fois ¦ Cuántas veces
+New service used ¦ Nouveau service utilisé ¦ Nuevo servicio utilizado
+A device that does one job (a plug, a camera, a printer) uses a service it never used before. ¦ Un appareil qui ne fait qu'une chose (une prise, une caméra, une imprimante) utilise un service qu'il n'avait jamais utilisé. ¦ Un dispositivo que hace una sola cosa (un enchufe, una cámara, una impresora) usa un servicio que nunca había usado.
+Usually a firmware update or a new feature in the device's app. ¦ D'habitude une mise à jour du micrologiciel ou une nouvelle fonction de l'application de l'appareil. ¦ Normalmente una actualización del firmware o una función nueva de la aplicación del dispositivo.
+Did the device update itself, or did you add a feature in its app? ¦ L'appareil s'est-il mis à jour, ou avez-vous ajouté une fonction dans son application ? ¦ ¿Se actualizó el dispositivo, o añadió una función en su aplicación?
+If not, restart it and check its app for an update; unplug it if it keeps happening. ¦ Sinon, redémarrez-le et cherchez une mise à jour dans son application ; débranchez-le si cela continue. ¦ Si no, reinícielo y busque una actualización en su aplicación; desenchúfelo si sigue ocurriendo.
+Devices that do one job usually talk the same way every day. ¦ Les appareils qui ne font qu'une chose communiquent d'habitude de la même façon chaque jour. ¦ Los dispositivos que hacen una sola cosa suelen comunicarse igual cada día.
+A firmware update or a new feature in its app can add a service. It matters if you didn't change anything and the service is one used for remote control. ¦ Une mise à jour du micrologiciel ou une nouvelle fonction de son application peut ajouter un service. C'est important si vous n'avez rien changé et que ce service sert au contrôle à distance. ¦ Una actualización del firmware o una función nueva de su aplicación puede añadir un servicio. Importa si no cambió nada y el servicio es de control remoto.
+Compared with the services this device learned over at least an hour. ¦ Comparé aux services que cet appareil a appris pendant au moins une heure. ¦ Comparado con los servicios que este dispositivo aprendió durante al menos una hora.
+Knows this device (less than a day) ¦ Connaît cet appareil (moins d'un jour) ¦ Conoce este dispositivo (menos de un día)
+Knows this device (1 day) ¦ Connaît cet appareil (1 jour) ¦ Conoce este dispositivo (1 día)
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -25729,6 +26048,39 @@ I18N_PATTERNS += [
      r"Confianza: {t1}. {t2}"),
     (r"From (.+); an estimate\.", r"D'après \1 ; une estimation.",
      r"Según \1; una estimación."),
+]
+# 5.3.4 (MC5): what the baseline learned, and its state
+I18N_PATTERNS += [
+    (r"Learning \((\d+) of (\d+) min\)",
+     r"En apprentissage (\1 sur \2 min)", r"Aprendiendo (\1 de \2 min)"),
+    (r"Knows this device \((\d+) days\)",
+     r"Connaît cet appareil (\1 jours)",
+     r"Conoce este dispositivo (\1 días)"),
+    (r"During the day \(07:00–23:00\): usually sends (.+?)/min and "
+     r"receives (.+?)/min \((\d+) active minutes\)\.",
+     r"En journée (07:00–23:00) : envoie en général \1/min et reçoit "
+     r"\2/min (\3 minutes actives).",
+     r"De día (07:00–23:00): suele enviar \1/min y recibir \2/min "
+     r"(\3 minutos activos)."),
+    (r"At night \(23:00–07:00\): usually sends (.+?)/min and "
+     r"receives (.+?)/min \((\d+) active minutes\)\.",
+     r"La nuit (23:00–07:00) : envoie en général \1/min et reçoit "
+     r"\2/min (\3 minutes actives).",
+     r"De noche (23:00–07:00): suele enviar \1/min y recibir \2/min "
+     r"(\3 minutos activos)."),
+    (r"During the day \(07:00–23:00\): not active yet\.",
+     r"En journée (07:00–23:00) : pas encore actif.",
+     r"De día (07:00–23:00): todavía no activo."),
+    (r"At night \(23:00–07:00\): not active yet\. Its first busy minute "
+     r"there is compared with what is usual for its kind\.",
+     r"La nuit (23:00–07:00) : pas encore actif. Sa première minute "
+     r"chargée y est comparée à ce qui est habituel pour ce type "
+     r"d'appareil.",
+     r"De noche (23:00–07:00): todavía no activo. Su primer minuto con "
+     r"actividad se compara con lo habitual para su tipo de dispositivo."),
+    (r"(.+) used a new service: (.+)",
+     r"\1 a utilisé un nouveau service : \2",
+     r"\1 usó un servicio nuevo: \2"),
 ]
 _CLASS_RX = "(" + "|".join(re.escape(c) for c in DEVICE_CLASSES) + ")"
 I18N_PATTERNS += [
@@ -28156,6 +28508,10 @@ SETTINGS_PAGES = [
                                                   "more places than usual."),
               _alert_control("many_connections", "A device opens far more "
                                                  "connections than usual."),
+              _alert_control("unusual_service", "A device that does one "
+                                                "job (a plug, a camera, a "
+                                                "printer) uses a service it "
+                                                "never used before."),
               _alert_control("tcp_resets", "Many connections are being "
                                            "reset."),
               _alert_control("cleartext", "Unencrypted protocols such as "
@@ -49684,12 +50040,17 @@ proc ::mw_retheme {w map fgnew deffg} {
                          self.device_visibility(dev)))
         b = m.baselines.devices.get(dev.key)
         if b is not None and b.n:
-            sections.append(("Normal behaviour (learned)",
-                f"Learned from {b.n} active minute(s). Typically sends "
-                f"{_human_bytes(b.mean['bytes_up'])}/min and receives "
-                f"{_human_bytes(b.mean['bytes_down'])}/min, talking to about "
-                f"{b.mean['destinations']:.0f} Internet hosts per minute. "
-                f"Usual hours: {b.usual_hours_text()}."))
+            body = (f"Learned from {b.n} active minute(s). Typically sends "
+                    f"{_human_bytes(b.mean['bytes_up'])}/min and receives "
+                    f"{_human_bytes(b.mean['bytes_down'])}/min, talking to "
+                    f"about {b.mean['destinations']:.0f} Internet hosts per "
+                    f"minute. Usual hours: {b.usual_hours_text()}.")
+            if FEATURES.get("baseline_v2", True):
+                # 5.3.4 (MC5): whether it is still learning, and what the
+                # day and night profiles learned
+                body = "\n".join([m.baselines.state(dev.key), body] +
+                                  b.learned_lines())
+            sections.append(("Normal behaviour (learned)", body))
         if guidance:
             sections.append(("What should I check?", (
                 "If you don't recognize this device, check your router's "
@@ -67913,6 +68274,451 @@ def t_story_change_sequence(ctx):
     assert program_short_name(program_label((None, ""))) == ""
 
 
+# ---- 5.3.4 (MC5): baseline v2, a synthetic week ---------------------------
+# The three normal homes are named after the demo and benchmark scenarios:
+# "Demo home" (DemoGenerator's devices and its late laptop), bench S1
+# "Medium home" (one or two of each kind) and bench S2 "Stress" (many
+# devices). Each device follows its kind's day for a week: phones and
+# computers by day with video calls, an update and a photo backup on the
+# charger at night, a TV streaming in the evening, a console downloading a
+# game, a NAS backing up to the cloud every night, plugs and a camera
+# around the clock. The planted problems are the plan's three (§1): a plug
+# sending a burst upload, a printer reaching a service it never used, and
+# a laptop busy at 03:10, a time it is never on.
+BASELINE_WEEK_HOMES = OrderedDict([
+    ("Demo home", (("phone", "iPhone"), ("tv", "Streaming device"),
+                   ("printer", "Printer"), ("iot", "Smart-home/IoT"),
+                   ("nas", "NAS"), ("this-pc", "This computer"),
+                   ("computer", "Windows PC"))),
+    ("Medium home", (("phone", "iPhone"), ("phone", "Android phone"),
+                     ("tablet", "Tablet"), ("computer", "Windows PC"),
+                     ("computer", "Mac"), ("this-pc", "This computer"),
+                     ("tv", "Smart TV"), ("console", "Console"),
+                     ("speaker", "Speaker"), ("camera", "Camera"),
+                     ("iot", "Smart-home/IoT"), ("iot", "Smart-home/IoT"),
+                     ("printer", "Printer"), ("nas", "NAS"))),
+    ("Stress", tuple((k, c) for _i in range(2) for k, c in (
+        ("phone", "iPhone"), ("phone", "Android phone"), ("tablet", "Tablet"),
+        ("computer", "Windows PC"), ("computer", "Linux PC"),
+        ("tv", "Smart TV"), ("console", "Console"), ("speaker", "Speaker"),
+        ("camera", "Camera"), ("iot", "Smart-home/IoT"),
+        ("iot", "Smart-home/IoT"), ("printer", "Printer"), ("nas", "NAS")))),
+])
+
+
+def _bw_minute(kind, day, mod, rng, quirk):
+    """One minute of a normal device: (bytes up, bytes down, hosts, DNS
+    lookups, new connections, ports) or None when it is quiet."""
+    h, U, ri = mod // 60, rng.uniform, rng.randint
+    weekend = day >= 5
+    if kind in ("phone", "tablet"):
+        if 7 <= h < 23 and rng.random() < 0.5:
+            if h == 20 and day % 2 == 0 and mod % 60 < 40:   # video call
+                return (U(1e6, 1.8e6), U(1.5e6, 2.5e6), 2, 1, 1, (443, 3478))
+            return (U(5e3, 120e3), U(50e3, 3e6), ri(1, 8), ri(0, 4),
+                    ri(0, 6), (443, 80, 5223))
+        if quirk and h == 2 and mod % 60 < 20:       # backup on the charger
+            return (U(2e6, 4.5e6), U(50e3, 200e3), 2, 1, 1, (443,))
+        if rng.random() < 0.03:
+            return (U(1e3, 5e3), U(1e3, 10e3), 1, 0, 0, (5223,))
+        return None
+    if kind in ("computer", "this-pc"):
+        start, end, p = (10, 22, 0.3) if weekend else (8, 19, 0.8)
+        if kind == "this-pc":
+            start, end = 9, 23
+        if start <= h < end and rng.random() < p:
+            if h == 10 and not weekend and mod % 60 < 45:      # video call
+                return (U(1e6, 2e6), U(1.5e6, 3e6), 3, 1, 1, (443, 3478))
+            if day == 2 and h == 12 and mod % 60 < 10:         # an update
+                return (U(20e3, 60e3), U(20e6, 40e6), 3, 2, 4, (443, 80))
+            return (U(20e3, 400e3), U(200e3, 6e6), ri(2, 15), ri(1, 8),
+                    ri(1, 15), (443, 80))
+        return None
+    if kind == "tv":
+        if 18 <= h < 23 or (weekend and 14 <= h < 17):
+            return (U(100e3, 400e3), U(20e6, 45e6), ri(1, 3), ri(0, 2),
+                    ri(0, 2), (443,))
+        if rng.random() < 0.05:
+            return (U(1e3, 4e3), U(2e3, 8e3), 1, 1, 0, (443,))
+        return None
+    if kind == "nas":
+        if h == 2 and mod % 60 < 40:                 # nightly cloud backup
+            return (U(6e6, 12e6), U(50e3, 150e3), 1, 1, 1, (443,))
+        if rng.random() < 0.3:
+            return (U(5e3, 30e3), U(5e3, 30e3), ri(1, 2), 1, ri(0, 1),
+                    (443,))
+        return None
+    if kind == "iot":
+        ports = (8883, 123) if mod % 360 == 0 else (8883,)
+        newc = (1 if mod % 60 == 0 else 0) + len(ports) - 1
+        return (U(600, 1500), U(400, 1200), len(ports), newc, newc, ports)
+    if kind == "printer":
+        if mod % 10 == 0:
+            return (U(1e3, 3e3), U(1e3, 4e3), 1, 1, 1, (443,))
+        return None
+    if kind == "camera":
+        if rng.random() < 0.004:                      # a motion clip
+            return (U(3e6, 4e6), U(20e3, 60e3), 1, 0, 1, (443,))
+        return (U(0.8e6, 1.6e6), U(10e3, 40e3), 1, 0,
+                1 if mod % 30 == 0 else 0, (443,))
+    if kind == "speaker":
+        if 17 <= h < 22 and rng.random() < 0.7:
+            return (U(5e3, 20e3), U(200e3, 600e3), 1, 1, ri(0, 1), (443,))
+        if rng.random() < 0.05:
+            return (U(500, 2e3), U(500, 2e3), 1, 0, 0, (443,))
+        return None
+    if kind == "console":
+        if 19 <= h < 22 and rng.random() < 0.8:
+            return (U(50e3, 200e3), U(300e3, 2e6), ri(1, 4), ri(0, 2),
+                    ri(0, 3), (443, 3074))
+        if day == 5 and h == 15 and mod % 60 < 30:    # a game download
+            return (U(30e3, 80e3), U(30e6, 45e6), 2, 1, 2, (443,))
+        return None
+    return None
+
+
+# the planted problems: (day, minute of the day, kind, name) -> minute
+BASELINE_WEEK_PLANTS = {
+    "burst upload": (4, 14 * 60, 4, "iot"),       # Friday 14:00, 4 minutes
+    "new service": (5, 11 * 60 + 5, 1, "printer"),   # Saturday 11:05
+    "night-time activity": (3, 3 * 60 + 10, 10, "computer"),  # Thu 03:10
+}
+
+
+def _bw_plant(name, rng):
+    if name == "burst upload":
+        return (rng.uniform(2.5e6, 3e6), rng.uniform(1e3, 3e3), 1, 0, 0,
+                (8883,))
+    if name == "new service":
+        return (400, 600, 1, 0, 1, (23,))
+    return (rng.uniform(10e6, 14e6), rng.uniform(100e3, 300e3), 6, 3, 6,
+            (443,))
+
+
+def baseline_week(ctx, home, plants=(), seed=11):
+    """Replay a week of `home` through the model's baseline path. Returns
+    (model, hits, devices): hits are (day, minute, device kind, feature)
+    for every minute the baseline found unusual, and new-service alerts
+    as feature "service"."""
+    t0 = time.mktime((2026, 6, 1, 0, 0, 0, 0, 0, -1))   # a Monday
+    m = NetworkModel(ctx.cfg(), *scenario_identity()[:3])
+    m.use_packet_clock = True
+    m.offline_now = t0
+    rng = random.Random(seed)
+    devs = []
+    for i, (kind, cls) in enumerate(BASELINE_WEEK_HOMES[home]):
+        ip = f"192.168.1.{100 + i}"
+        dev = m.registry.touch(ip, "02:00:5e:00:%02x:%02x" % (i // 256,
+                                                             i % 256),
+                               "arp", "test", t0)
+        dev.device_class = cls
+        pool = [f"203.0.{113 if j % 2 else 114}.{(i * 37 + j) % 250 + 1}"
+                for j in range(30)]
+        devs.append((dev, kind, pool, i % 3 == 0))
+    plant_at = {}
+    for name in plants:
+        day, mod, length, kind = BASELINE_WEEK_PLANTS[name]
+        dev = next(d for d, k, _p, _q in devs if k == kind)
+        for k in range(length):
+            plant_at[(day, mod + k, dev.key)] = name
+    hits = []
+    where = {}           # device -> (day, minute) of its last busy minute
+    real_check = m._baseline_check
+
+    def counting(dev, snap):
+        # a minute is judged when the device's next busy minute starts
+        for f, _v, _mean in m.baselines.check(snap):
+            hits.append(where.get(dev.key, (-1, -1)) + (dev.key, f))
+        real_check(dev, snap)
+    m._baseline_check = counting
+    flow = types.SimpleNamespace(remote_port=0, device_key="")
+    for day in range(7):
+        for mod in range(1440):
+            ts = t0 + (day * 1440 + mod) * 60
+            m.offline_now = ts + 1
+            for dev, kind, pool, quirk in devs:
+                plant = plant_at.get((day, mod, dev.key))
+                mn = _bw_plant(plant, rng) if plant else \
+                    _bw_minute(kind, day, mod, rng, quirk)
+                if mn is None:
+                    continue
+                up, down, hosts, dns, newc, ports = mn
+                remotes = (["198.51.100.7"] if plant == "new service"
+                           else rng.sample(pool, hosts))
+                sends = max(hosts, dns, newc, 1)
+                for j in range(sends):
+                    remote = remotes[j % len(remotes)]
+                    flow.device_key = dev.key
+                    flow.remote_port = ports[j % len(ports)]
+                    d = {"src_ip": dev.ip, "dst_ip": remote,
+                         "length": int(up / sends), "dns": j < dns,
+                         "proto": "TLS"}
+                    m._baseline_observe(d, ts + 1 + j * 0.01, dev, None,
+                                        "up", flow, j < newc)
+                d = {"src_ip": remotes[0], "dst_ip": dev.ip,
+                     "length": int(down), "dns": False, "proto": "TLS"}
+                m._baseline_observe(d, ts + 2, None, dev, "down", None,
+                                    False)
+                where[dev.key] = (day, mod)
+    for dev, _k, _p, _q in devs:
+        b = m.baselines.devices.get(dev.key)
+        if b is not None and b.cur is not None:
+            counting(dev, b.finish())
+    kinds = {d.key: k for d, k, _p, _q in devs}
+    out = [(day, mod, kinds[key], f) for day, mod, key, f in hits]
+    out += [(-1, -1, kinds.get(a.device_key, "?"), "service")
+            for a in m.alerts.alerts.values() if a.kind == "unusual_service"]
+    return m, out, devs
+
+
+@self_test(slow=True)
+def t_baseline_v2_synthetic_week(ctx):
+    """5.3.4 (MC5, §1): a synthetic week through the model's baseline path
+    gives 0 alarms on the three normal homes and finds 3 of 3 planted
+    problems, each at its own minute and device; the night one says it is
+    the first time the device was busy at night. With the switch off, the
+    5.2.3 baseline misses the plug's burst and the printer's new service,
+    and calls the NAS's nightly backup unusual (the reasons for v2)."""
+    old = FEATURES.get("baseline_v2", True)
+    try:
+        FEATURES["baseline_v2"] = True
+        for home in BASELINE_WEEK_HOMES:
+            _m, hits, devs = baseline_week(ctx, home)
+            assert not hits, (home, hits[:10])
+            assert all(_m.baselines.devices[d.key].n >= 15
+                       for d, _k, _p, _q in devs), home
+        m, hits, devs = baseline_week(ctx, "Demo home",
+                                      plants=tuple(BASELINE_WEEK_PLANTS))
+        found = set()
+        for day, mod, kind, f in hits:
+            for name, (pday, pmod, length, pkind) in \
+                    BASELINE_WEEK_PLANTS.items():
+                if kind == pkind and (
+                        f == "service" and name == "new service" or
+                        day == pday and pmod <= mod < pmod + length):
+                    found.add(name)
+                    break
+            else:
+                raise AssertionError(f"false alarm: {(day, mod, kind, f)}")
+        assert found == set(BASELINE_WEEK_PLANTS), (found, hits)
+        night = [a for a in m.alerts.alerts.values()
+                 if a.kind == "upload_spike" and
+                 "first time it has been busy at night" in a.observed]
+        assert len(night) == 1, [a.observed for a in
+                                 m.alerts.alerts.values()]
+        assert "Why now: first time active at night" in night[0].evidence
+        svc = [a for a in m.alerts.alerts.values()
+               if a.kind == "unusual_service"]
+        assert len(svc) == 1 and "port 23" in svc[0].reason, svc
+        # the switch off: today's baseline
+        FEATURES["baseline_v2"] = False
+        _m, hits, _d = baseline_week(ctx, "Demo home",
+                                     plants=tuple(BASELINE_WEEK_PLANTS))
+        kinds = {k for _dy, _mo, k, _f in hits}
+        assert "iot" not in kinds and "printer" not in kinds, hits
+        assert "nas" in kinds, hits      # and calls each night's backup odd
+    finally:
+        FEATURES["baseline_v2"] = old
+
+
+# 5.2.3's reader, copied unchanged from the v5.2.3 tag (DeviceBaseline.
+# from_dict, BaselineEngine.load and check, HistoryStore.load_baselines'
+# query), so a 5.3.4 row can be shown to load in an older copy.
+_BASELINE_523_FEATURES = ("packets", "bytes_up", "bytes_down",
+                          "destinations", "dns", "new_conns")
+
+
+def _baseline_523_read(rows):
+    """[(device_key, data)] as 5.2.3 reads them -> {key: fields}."""
+    out = {}
+    for key, data in rows:
+        with contextlib.suppress(ValueError):
+            out[key] = json.loads(data)
+    devices = {}
+    for k, d in (out or {}).items():
+        if not isinstance(d, dict):
+            continue
+        b = types.SimpleNamespace(
+            n=0, mean={f: 0.0 for f in _BASELINE_523_FEATURES},
+            var={f: 0.0 for f in _BASELINE_523_FEATURES}, hours=[0] * 24,
+            protocols=Counter(), services=Counter(), countries=set())
+        with contextlib.suppress(TypeError, ValueError, AttributeError):
+            b.n = int(d.get("n", 0))
+            for f in _BASELINE_523_FEATURES:
+                b.mean[f] = float((d.get("mean") or {}).get(f, 0.0))
+                b.var[f] = float((d.get("var") or {}).get(f, 0.0))
+            hrs = d.get("hours") or []
+            if len(hrs) == 24:
+                b.hours = [int(x) for x in hrs]
+            b.protocols = Counter(d.get("protocols") or {})
+            b.services = Counter({int(k): v for k, v in
+                                  (d.get("services") or {}).items()
+                                  if str(k).isdigit()})
+            b.countries = set(d.get("countries") or [])
+        devices[k] = b
+    return devices
+
+
+def _baseline_523_check(snapshot, need=15, mult=4.0):
+    floors = {"bytes_up": 5 * 1024 * 1024, "bytes_down": 50 * 1024 * 1024,
+              "destinations": 40, "new_conns": 80}
+    vals, mean, std, n = snapshot
+    if n < need:
+        return []
+    out = []
+    for f, floor in floors.items():
+        v, m, s = vals.get(f, 0), mean.get(f, 0.0), std.get(f, 0.0)
+        if v >= floor and v > m * mult and v > m + 4 * max(s, 1.0):
+            out.append((f, v, m))
+    return out
+
+
+@self_test()
+def t_baseline_v2_row_reads_in_523(ctx):
+    """5.3.4 (MC5): a 5.3.4 baseline row, written to the history's
+    `baselines` table, loads in 5.2.3's reader without an error and gives
+    it the same numbers (the old keys stay; "v" and the profiles are extra
+    keys it ignores). A 5.2.3 row loads in 5.3.4, its day and night
+    profiles started from its hours."""
+    old = FEATURES.get("baseline_v2", True)
+    FEATURES["baseline_v2"] = True
+    try:
+        b = DeviceBaseline()
+        b.kind = "iot"
+        t0 = time.time() - 3 * 3600
+        for minute in range(40):
+            b.observe(t0 + minute * 60, 900, "sent", "203.0.113.5",
+                      proto="TLS", service_port=8883)
+        b.finish()
+        hs = HistoryStore(ctx.path(f"h534_{uuid.uuid4().hex}.sqlite3"))
+        try:
+            hs.write_snapshot({"devices": [], "alerts": [], "domains": [],
+                               "baselines": [("plug", b.to_dict())]})
+            assert hs.flush_now(), "the history writer is stuck"
+            rows = hs.query("SELECT device_key, data FROM baselines")
+            assert json.loads(rows[0][1])["v"] == BASELINE_VERSION
+            old_b = _baseline_523_read(rows)["plug"]
+            assert old_b.n == b.n == 40 and old_b.hours == b.hours
+            assert old_b.mean == {f: float(b.mean[f])
+                                  for f in DeviceBaseline.FEATURES}
+            assert old_b.services == Counter({8883: 40})
+            snap = ({f: 0 for f in _BASELINE_523_FEATURES}, old_b.mean,
+                    {f: math.sqrt(max(0.0, old_b.var[f]))
+                     for f in _BASELINE_523_FEATURES}, old_b.n)
+            assert _baseline_523_check(snap) == []
+            # and back in 5.3.4, with its profiles
+            again = DeviceBaseline.from_dict(hs.load_baselines()["plug"])
+            assert again.kind == "iot" and again.n == 40
+            assert sum(p["n"] for p in again.prof.values()) == 40
+        finally:
+            hs.stop()
+        # a 5.2.3 row (no "v"): the profiles start from its hours
+        hours = [0] * 24
+        hours[3], hours[14] = 10, 30
+        legacy = {"n": 40, "mean": {"bytes_up": 1000.0},
+                  "var": {"bytes_up": 4.0}, "hours": hours}
+        nb = DeviceBaseline.from_dict(legacy)
+        assert nb.prof["night"]["n"] == 10 and nb.prof["day"]["n"] == 30
+        assert nb.prof["day"]["mean"]["bytes_up"] == 1000.0
+        assert DeviceBaseline.from_dict({"v": 2, "profiles": {
+            "day": {"n": "x", "mean": [1], "var": None}}}).prof == {}
+    finally:
+        FEATURES["baseline_v2"] = old
+
+
+@self_test()
+def t_baseline_v2_expiry(ctx):
+    """5.3.4 (MC5, risk table): load_baselines drops rows learned more than
+    14 days ago (today's code never read `updated`), and deletes them; the
+    time stored is when the device was last learned, so a row that is only
+    saved again still ages. With the switch off every row loads, as
+    before."""
+    old = FEATURES.get("baseline_v2", True)
+    now = time.time()
+    hs = HistoryStore(ctx.path(f"hexp_{uuid.uuid4().hex}.sqlite3"))
+    try:
+        FEATURES["baseline_v2"] = True
+        assert baseline_updated({"last": now - 86400}, now) == now - 86400
+        assert baseline_updated({"last": now + 999}, now) == now
+        assert baseline_updated({"n": 3}, now) == now
+        hs.write_snapshot({"devices": [], "alerts": [], "domains": [],
+                           "baselines": [
+                               ("fresh", {"n": 5, "last": now - 3 * 86400}),
+                               ("stale", {"n": 9, "last": now - 20 * 86400}),
+                               ("plain", {"n": 1})]})
+        assert hs.flush_now()
+        FEATURES["baseline_v2"] = False
+        assert set(hs.load_baselines()) == {"fresh", "stale", "plain"}
+        FEATURES["baseline_v2"] = True
+        got = hs.load_baselines()
+        assert set(got) == {"fresh", "plain"}, got
+        assert hs.flush_now()
+        keys = {r[0] for r in hs.query("SELECT device_key FROM baselines")}
+        assert keys == {"fresh", "plain"}, keys
+        assert set(hs.load_baselines(now=now + 12 * 86400)) == {"plain"}
+    finally:
+        hs.stop()
+        FEATURES["baseline_v2"] = old
+
+
+@self_test()
+def t_baseline_v2_priors_and_floors(ctx):
+    """5.3.4 (MC5): a new plug is judged after 5 minutes (not 15) from its
+    kind's profile, but with the full floor: 2.5 MB in a minute is not
+    called unusual while it is still learning, and is once the plug has
+    its own history (its floor is a tenth). The day and night profiles
+    are separate, and a device never seen at night gets the plain
+    reason. With the switch off, check() and to_dict() are 5.2.3's."""
+    old = FEATURES.get("baseline_v2", True)
+    t0 = time.mktime((2026, 6, 1, 12, 0, 0, 0, 0, -1))
+    try:
+        FEATURES["baseline_v2"] = True
+        be = BaselineEngine(ctx.cfg())
+
+        def run(b, start, count, nbytes):
+            snaps = []
+            for minute in range(start, start + count):
+                s = b.observe(t0 + minute * 60, nbytes, "sent",
+                              "203.0.113.9")
+                if s:
+                    snaps.append(s)
+            return snaps
+        plug = be.get("plug")
+        plug.kind = "iot"
+        assert all(not be.check(s) for s in run(plug, 0, 6, 1000))
+        snap = run(plug, 6, 2, 2_600_000)[-1]    # minute 6: still learning
+        assert len(snap) == 5 and snap[4]["own"] == 6 and not be.check(snap)
+        assert be.state("plug") == "Learning (7 of 15 min)"
+        run(plug, 8, 30, 1000)
+        hit = be.check(run(plug, 38, 2, 2_600_000)[-1])
+        assert [f for f, _v, _m in hit] == ["bytes_up"], hit
+        assert plug.profile_n("day") == 39 and plug.profile_n("night") == 0
+        # first time busy at night: judged by the prior, with a reason
+        night = t0 + 15 * 3600                 # 03:00 the next morning
+        for k in range(2):
+            s = plug.observe(night + k * 60, 9_000_000, "sent",
+                             "203.0.113.9")
+        assert s[4]["period"] == "night" and s[4]["own"] == 0
+        assert be.check(s) and be.last_note == "first time active at night"
+        assert be.devices["plug"].state_text() == \
+            "Knows this device (less than a day)"
+        lines = plug.learned_lines()
+        assert lines[0].startswith("During the day (07:00–23:00): usually")
+        assert translate_text(lines[0], "fr").startswith("En journée")
+        # the switch off: 5.2.3's snapshot, keys and decision
+        FEATURES["baseline_v2"] = False
+        b1 = BaselineEngine(ctx.cfg()).get("x")
+        snaps = [s for s in (b1.observe(t0 + i * 60, 1000, "sent")
+                             for i in range(20)) if s]
+        assert all(len(s) == 4 for s in snaps)
+        assert set(b1.to_dict()) == {"n", "mean", "var", "hours",
+                                     "protocols", "services", "countries"}
+        assert not DeviceBaseline.from_dict({"v": 2, "kind": "iot",
+                                             "profiles": {}}).kind
+    finally:
+        FEATURES["baseline_v2"] = old
+
+
 @self_test()
 def t_m6_review_merge_and_subnet_fixes(ctx):
     """5.3.4 review of M6: a copied DHCP client identifier alone never
@@ -72473,6 +73279,54 @@ def gt_534_story_mode(app, ctx):
         "story_mark" in tl.tree.item(i, "tags")
         for i in tl.tree.get_children())
     app.story = None
+
+
+@gui_test_step("5.3.4 M8: the device card says whether the baseline is still "
+               "learning and what it learned by day and by night")
+def gt_534_baseline_state(app, ctx):
+    m = app.model
+    S = ScenarioBuilder
+    plug = m.device_for(S.PLUG[0], S.PLUG[1])
+    assert plug is not None
+    saved = m.baselines.devices.get(plug.key)
+    old = FEATURES.get("baseline_v2", True)
+    t0 = time.mktime((2026, 6, 1, 12, 0, 0, 0, 0, -1))
+    try:
+        FEATURES["baseline_v2"] = True
+        b = m.baselines.devices[plug.key] = DeviceBaseline()
+        b.kind = "iot"
+        for minute in range(10):
+            b.observe(t0 + minute * 60, 900, "sent", "203.0.113.5")
+        body = dict(app.device_report(plug))["Normal behaviour (learned)"]
+        lines = body.split("\n")
+        assert lines[0] == "Learning (9 of 15 min)", lines
+        assert lines[2].startswith("During the day (07:00–23:00): usually "
+                                   "sends") and "(9 active minutes)" in \
+            lines[2], lines
+        assert lines[3].startswith("At night (23:00–07:00): not active yet")
+        for line in lines:
+            assert translate_text(line, "fr") != line, line
+            assert translate_text(line, "es") != line, line
+        for minute in range(10, 30):
+            b.observe(t0 + 86400 * 2 + minute * 60, 900, "sent",
+                      "203.0.113.5")
+        b.finish()
+        body = dict(app.device_report(plug))["Normal behaviour (learned)"]
+        assert body.startswith("Knows this device (2 days)\n"), body
+        # the card's text, as the window shows it, in French
+        assert translate_lines(body, "fr").startswith(
+            "Connaît cet appareil (2 jours)")
+        # the switch off: the 5.2.3 sentence alone
+        FEATURES["baseline_v2"] = False
+        body = dict(app.device_report(plug))["Normal behaviour (learned)"]
+        assert body.startswith("Learned from 30 active minute(s).") and \
+            "\n" not in body, body
+    finally:
+        FEATURES["baseline_v2"] = old
+        if saved is None:
+            m.baselines.devices.pop(plug.key, None)
+        else:
+            m.baselines.devices[plug.key] = saved
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
