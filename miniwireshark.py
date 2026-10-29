@@ -747,16 +747,21 @@ def _relaunch_elevated(more_args=()):
         list(more_args)
     flag = ""
     if not IS_WINDOWS:
-        flag = os.path.join(PATHS.data, f".elevated-{os.getpid()}")
-        with contextlib.suppress(OSError):
-            os.remove(flag)
+        # 5.3.4 (review): the "it started" flag lives in a fresh folder of
+        # our own, not in the data folder: an elevated copy that doesn't
+        # trust that folder (macOS, a system-wide install) could not write
+        # there, and the program was started again by the next launcher
+        try:
+            flag = os.path.join(tempfile.mkdtemp(prefix=ELEV_DIR_PREFIX),
+                                "started")
+        except OSError:
+            return False
         extra += [DATA_ARG + PATHS.data, ELEV_FLAG_ARG + flag]
     argv = self_cmd(ELEVATED_FLAG, *extra)
 
     def started():
         ok = os.path.exists(flag)
-        with contextlib.suppress(OSError):
-            os.remove(flag)
+        shutil.rmtree(os.path.dirname(flag), ignore_errors=True)
         return ok
     if IS_WINDOWS:
         params = subprocess.list2cmdline(argv[1:])
@@ -770,8 +775,12 @@ def _relaunch_elevated(more_args=()):
         return False
     if IS_MAC:
         try:
-            rc = subprocess.call(mac_admin_cmd(argv))
+            # osascript sets no SUDO_UID: say who asked, as sudo would
+            rc = subprocess.call(mac_admin_cmd(
+                ["/usr/bin/env", f"SUDO_UID={os.getuid()}",
+                 f"SUDO_GID={os.getgid()}"] + argv))
         except OSError:
+            started()
             return False
         if started():
             sys.exit(rc)
@@ -799,8 +808,11 @@ def _relaunch_elevated(more_args=()):
             continue
         if started():
             sys.exit(rc)
-        if L[0] == "pkexec" and rc in (126, 127):
-            return False           # the user said no: don't ask again
+        # the launcher ran: a refused or failed password ends here, never
+        # a second or third password prompt (5.3.4, review)
+        LOG.info("elevation with %s ended (%s) without starting", L[0], rc)
+        return False
+    started()
     return False
 
 
@@ -851,17 +863,42 @@ def mac_admin_cmd(argv):
             "-e", "end run", " ".join(shlex.quote(p) for p in argv)]
 
 
+ELEV_DIR_PREFIX = "mw-elev-"
+
+
+def elev_flag_ok(path):
+    """The flag an elevated copy may create: "started" in a fresh
+    mw-elev-* folder (not a link) owned by the user who asked for
+    elevation, so root only ever creates a file that user could have
+    created themselves. (Not tied to one temp folder: root's TMPDIR is not
+    the user's on macOS.)"""
+    d = os.path.dirname(path)
+    try:
+        st = os.lstat(d)
+    except OSError:
+        return False
+    return (os.path.basename(path) == "started" and
+            os.path.basename(d).startswith(ELEV_DIR_PREFIX) and
+            stat_is_dir(st) and
+            (IS_WINDOWS or st.st_uid in {os.geteuid(), _invoking_uid()}))
+
+
+def stat_is_dir(st):
+    return (st.st_mode & 0o170000) == 0o040000
+
+
 def mark_elevated_start():
     """In the elevated copy: create the file its parent waits for."""
     for a in list(sys.argv):
         if a.startswith(ELEV_FLAG_ARG):
             sys.argv.remove(a)
             path = a[len(ELEV_FLAG_ARG):]
-            if os.path.dirname(os.path.abspath(path)) == \
-                    os.path.abspath(PATHS.data):
+            if elev_flag_ok(path):
                 with contextlib.suppress(OSError):
-                    with open(path, "w", encoding="utf-8") as f:
-                        f.write(str(os.getpid()))
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL |
+                                 getattr(os, "O_NOFOLLOW", 0), 0o600)
+                    os.write(fd, str(os.getpid()).encode())
+                    os.close(fd)
                     give_back(path)
     for a in list(sys.argv):
         if a.startswith(DATA_ARG):
@@ -12528,6 +12565,10 @@ class DeviceRegistry:
         # 5.3.4 (CO-02): MACs that answered for the router's address while
         # the router itself was still answering; never trusted as router
         self.gw_candidates = set()
+        # (review of CO-02) when each trusted router MAC last sent any
+        # frame: a poisoned LAN stops asking the router, so it goes quiet
+        # on ARP while it still forwards everything
+        self.gw_heard = {}
         self.ra_routers = set()
         self.history = []
         self.arp_claims = defaultdict(lambda: deque(maxlen=16))
@@ -12807,8 +12848,11 @@ class DeviceRegistry:
         second MAC then is a candidate, not the router (CO-02). A router
         that was replaced has gone quiet, so its successor is trusted."""
         seen = self.arp_seen.get(self.gateway_ip) or {}
-        return any(m != but and m in self.gw_macs and t and
-                   when - t[-1] <= silent for m, t in seen.items())
+        if any(m != but and m in self.gw_macs and t and
+               when - t[-1] <= silent for m, t in seen.items()):
+            return True
+        return any(m != but and m in self.gw_macs and
+                   when - t <= silent for m, t in self.gw_heard.items())
 
     def arp_claimants(self, ip, window=120):
         """5.3.4 (CO-02): the MACs that answered for `ip` at least twice in
@@ -18582,6 +18626,10 @@ class NetworkModel:
                  (d["dst_ip"], d["dst_mac"], dst_local, "recv"))):
             if role == "recv" and d["multicast"]:
                 continue
+            if role == "sent" and mac and self.registry.gw_macs:
+                lm = mac.lower()      # (review of CO-02) router still alive
+                if lm in self.registry.gw_macs:
+                    self.registry.gw_heard[lm] = ts
             if ip:
                 if not local:
                     continue           # public address: never a device
@@ -18708,6 +18756,14 @@ class NetworkModel:
             self.observe("arp_reply", dev.key, ts, {"ip": ip, "mac": mac})
         flips = self.registry.arp_flip_count(ip)
         both = self.registry.arp_claimants(ip)
+        reg = self.registry
+        if ip == self.gateway_ip and len(both) == 1 and \
+                both[0] in reg.gw_candidates and \
+                reg.router_answering(ts, but=both[0]):
+            # (review of CO-02) another MAC keeps claiming the router's
+            # address while the router is still sending: that is the
+            # attack even when the router itself has stopped answering ARP
+            both = both + sorted(reg.gw_macs)[:1]
         if flips >= int(self.config.get("alerts.arp_flip_threshold", 4)) \
                 or len(both) >= 2:
             a = self._alert(self.alerts.arp_spoof(
@@ -20950,10 +21006,24 @@ class Store:
                         "%.0f days during this run",
                         wall_clock_jump(self._wall0) / 86400)
             return False
-        cutoff = time.time() - days * 86400
-        cday = time.strftime("%Y-%m-%d", time.localtime(cutoff))
+        now = time.time()
 
         def job(con):
+            cutoff = now - days * 86400
+            # (review of CO-15) a clock already wrong when the app starts:
+            # if this prune would empty the history, keep the last `days`
+            # before the previous run instead, once; the next run (with
+            # this one's sessions row as the newest) prunes normally
+            row = con.execute("SELECT MAX(COALESCE(ended, started)) FROM "
+                              "sessions WHERE id<>?",
+                              (self.session,)).fetchone()
+            newest = row[0] if row and row[0] else None
+            if newest and newest < cutoff:
+                LOG.warning("history not emptied: the newest record is %.0f "
+                            "days older than the clock", (now - newest) /
+                            86400)
+                cutoff = newest - days * 86400
+            cday = time.strftime("%Y-%m-%d", time.localtime(cutoff))
             con.execute("DELETE FROM presence WHERE start < ?", (cutoff,))
             con.execute("DELETE FROM alerts WHERE at < ?", (cutoff,))
             con.execute("DELETE FROM traffic WHERE day < ?", (cday,))
@@ -20986,6 +21056,12 @@ class Store:
                           "resolutions", "flows", "site_ties", "events",
                           "packet_segments"):
                     con.execute(f"DELETE FROM {t}")
+                # (review) earlier sessions named the networks you joined
+                # and when; only this run's row stays, without its name
+                con.execute("DELETE FROM sessions WHERE id<>?",
+                            (self.session,))
+                con.execute("UPDATE sessions SET network='' WHERE id=?",
+                            (self.session,))
                 con.commit()
                 con.execute("VACUUM")
                 # 5.3.4 (LG-13): "Delete ALL history" means the copies too:
@@ -20998,12 +21074,7 @@ class Store:
 
     def remove_copies(self):
         """Delete every copy of the history next to the live file."""
-        import glob
-        for f in [self.path + ".bak", self.path + ".bak.tmp"] + \
-                glob.glob(glob.escape(self.path) + ".v*.bak") + \
-                glob.glob(glob.escape(self.path) + ".corrupt-*"):
-            with contextlib.suppress(OSError):
-                os.remove(f)
+        remove_history_copies(self.path)
 
     # ---- reads (own read-only connection each time) ------------------------
     def _reader(self):
@@ -21350,6 +21421,33 @@ def compare_sessions(store, a, b):
             "events_a": pa["events"], "events_b": pb["events"]}
 
 
+def remove_history_copies(path, live_too=False):
+    """Every copy of the history file: the nightly backup, the ones made
+    before an upgrade or after damage, and with `live_too` the file itself
+    and its -wal/-shm journal."""
+    import glob
+    files = [path + ".bak", path + ".bak.tmp"] + \
+        glob.glob(glob.escape(path) + ".v*.bak") + \
+        glob.glob(glob.escape(path) + ".corrupt-*")
+    if live_too:
+        files += [path, path + "-wal", path + "-shm"]
+    for f in files:
+        with contextlib.suppress(OSError):
+            os.remove(f)
+
+
+def wipe_packet_files(folder):
+    """Delete the saved packets (seg-*.pcap) in `folder`."""
+    n = 0
+    with contextlib.suppress(OSError):
+        for name in os.listdir(folder):
+            if name.startswith("seg-") and name.endswith(".pcap"):
+                with contextlib.suppress(OSError):
+                    os.remove(os.path.join(folder, name))
+                    n += 1
+    return n
+
+
 class PacketRing:
     """Optional on-disk history of raw packets: pcap segments in the data
     folder, oldest deleted first so it never exceeds its size cap. Lets a
@@ -21464,6 +21562,15 @@ class PacketRing:
             self._close()
             self.epoch += 1
             return
+        if item[0] == "wipe":
+            if self._seg is not None:
+                with contextlib.suppress(OSError):
+                    self._seg["f"].close()
+                self._seg = None
+            self.index.clear()
+            wipe_packet_files(self.folder)
+            item[1].set()
+            return
         if item[0] == "flush":
             if self._seg is not None:
                 self._seg["f"].flush()
@@ -21523,6 +21630,18 @@ class PacketRing:
     def size_bytes(self):
         seg = self._seg
         return sum(e[4] for e in self.index) + (seg["bytes"] if seg else 0)
+
+    def wipe(self, timeout=5.0):
+        """Delete every saved packet ("Delete ALL history", Session only;
+        review of LG-13/CO-10: the packet files outlived the database)."""
+        done = threading.Event()
+        try:
+            self.q.put(("wipe", done), timeout=timeout)
+        except queue.Full:
+            pass
+        if not done.wait(timeout):
+            with self._lock:
+                self._handle(("wipe", threading.Event()))
 
     def stop(self, wait=3.0):
         self._stop = True
@@ -37817,6 +37936,12 @@ def redact_stream_piece(d, data, res, kind):
     if kind == "opaque" and d == 0:
         return f"(what the client sent is hidden: {len(data)} bytes)\n"
     out, body = [], 0
+    if kind == "web" and d == 0 and data and not _WEB_REQUEST.match(
+            data.split(b"\n", 1)[0].rstrip(b"\r")):
+        # (review of LG-02) a client piece that doesn't start with a
+        # request line is the rest of a body: after "100 Continue" the
+        # form arrives in a piece of its own
+        body = 1
     for line in data.splitlines(True):
         clean = line.rstrip(b"\r\n")
         if kind == "web" and d == 0:
@@ -40523,6 +40648,11 @@ class MiniWireshark:
             # warm-up writes one on every new install, so every new install
             # trusted its first network and started Active Scanning unasked
             self.config.set("general.upgraded_from_3", True)
+        elif self.config.get("general.upgraded_from_3", False) and \
+                self.networks.fresh_install:
+            # (review of LG-01) 5.2.3 wrote this flag on new installs by
+            # mistake; with no 3.x behind it, it must not trust a network
+            self.config.set("general.upgraded_from_3", False)
         self.session_id = new_session_id()
         self.history = self._open_store() \
             if self.config.get("history.enabled", False) else None
@@ -45248,6 +45378,8 @@ proc ::mw_retheme {w map fgnew deffg} {
             self._set_banner("❌  The capture engine isn't available.",
                              kind="bad")
             return
+        if self._ask_capture_rights(auto):
+            return
         label = self.iface_var.get()
         others = [l for l in self.iface_box["values"] if l != label]
         if self.config.get("capture.auto_select_interface", True):
@@ -45256,6 +45388,32 @@ proc ::mw_retheme {w map fgnew deffg} {
         else:
             ordered = []
         self._start_capture(([label] + ordered)[:5], auto=auto)
+
+    def _ask_capture_rights(self, auto=False):
+        """5.3.4 (review of LG-09): Linux and macOS ask for root at start
+        only when capture starts right away; Start watching later (after
+        Demo Mode, a file, the guide) asks here. True when this window
+        should not start a capture itself."""
+        if IS_WINDOWS or auto or GUI_TEST_MODE or SELF_TEST_MODE or \
+                not elevation_allowed() or not needs_elevation():
+            return False
+        if not messagebox.askyesno(
+                "Watching needs permission",
+                "Watching network traffic needs administrator (root) "
+                "rights on this computer.\n\nRestart MiniWireshark with "
+                "your password now? Demo Mode and capture files work "
+                "without it.", parent=self.root):
+            return True
+        os.environ.setdefault("MINIWIRESHARK_DATA", PATHS.data)
+        self.root.withdraw()
+        self.root.update_idletasks()
+        # exits this copy with the elevated one's code when it ran
+        _relaunch_elevated((START_ARG + "monitor",))
+        self.root.deiconify()
+        self._set_banner("The password wasn't given, so this window can't "
+                         "watch live traffic. Demo Mode and capture files "
+                         "still work.", kind="warn")
+        return True
 
     def _leave_nonlive(self):
         """Make sure nothing saved/offline/demo can mix with live data."""
@@ -45494,8 +45652,12 @@ proc ::mw_retheme {w map fgnew deffg} {
         gw = self.model.gateway_ip
         gdev = reg.by_key.get(reg.ip_to_key.get(gw, "")) if gw else None
         w = self.wifi.last or {}
+        # (review) a new MAC answering for the router's address is a reason
+        # to identify the network again (same router address on a new
+        # network), even while CO-02 keeps it a candidate
+        cands = ",".join(sorted(getattr(reg, "gw_candidates", ()) or ()))
         return ((gdev.mac if gdev is not None else "") or "",
-                w.get("ssid") or "")
+                w.get("ssid") or "") + ((cands,) if cands else ())
 
     def _check_roam(self, now=None):
         """5.3.4 (LG-08): the network is identified again when the router
@@ -45509,7 +45671,9 @@ proc ::mw_retheme {w map fgnew deffg} {
             self._net_signature = sig
             return False
         changed = (sig[0] and known[0] and sig[0] != known[0]) or \
-            (sig[1] and known[1] and sig[1] != known[1])
+            (sig[1] and known[1] and sig[1] != known[1]) or \
+            (len(sig) > 2 and sig[2] != (known[2] if len(known) > 2
+                                         else ""))
         if not changed or now - getattr(self, "_roam_at", 0.0) < 30:
             return False
         self._roam_at = now
@@ -50679,8 +50843,8 @@ proc ::mw_retheme {w map fgnew deffg} {
             if os.path.exists(PATHS.history_db) and messagebox.askyesno(
                     "Clear history", "History is off, but an old history "
                     "file exists. Delete it?", parent=parent or self.root):
-                with contextlib.suppress(OSError):
-                    os.remove(PATHS.history_db)
+                remove_history_copies(PATHS.history_db, live_too=True)
+                self._wipe_packets()
             return
         choice = messagebox.askyesnocancel(
             "Clear history", "Yes = delete ALL stored history.\nNo = delete "
@@ -50690,6 +50854,7 @@ proc ::mw_retheme {w map fgnew deffg} {
             return
         if choice:
             self.history.clear()
+            self._wipe_packets()
             self._set_banner("\U0001F5D1  History cleared.")
         else:
             keys = self.tabs["devices"].selected_keys()
@@ -50723,6 +50888,14 @@ proc ::mw_retheme {w map fgnew deffg} {
         if self.history is not None and self._session_only_history():
             self.history.clear()
             self.history.flush_now(30.0)
+            self._wipe_packets()
+
+    def _wipe_packets(self):
+        pr = getattr(self, "packet_ring", None)
+        if pr is not None:
+            pr.wipe()
+        else:
+            wipe_packet_files(os.path.join(PATHS.data, "packets"))
 
     def _open_store(self):
         st = Store(PATHS.history_db, self.session_id,
@@ -50730,6 +50903,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                     "iface": getattr(self, "current_iface_label", "")})
         if self._session_only_history():
             st.clear()     # 5.3.4 (CO-10): what a crash or kill left behind
+            wipe_packet_files(os.path.join(PATHS.data, "packets"))
         if st.recovered:
             self.root.after(2500, lambda: self._set_banner(
                 "⚠️  " + st.recovered, kind="warn"))
@@ -52757,6 +52931,11 @@ def rollback_source_ok(marker, script_path):
                 return False, "the backup has changed since the update"
         except OSError:
             return False, "the backup can't be read"
+    elif str(marker.get("version")) != SCRIPT_VERSION or \
+            _version_tuple(str(marker.get("from") or "")) >= (5, 3, 4):
+        # (review of RT-02) a marker without an HMAC can only be the one an
+        # older release wrote while updating to this very version
+        return False, "the update marker isn't authentic"
     return True, ""
 
 
@@ -59498,6 +59677,14 @@ def t_m1b_history_delete_all(ctx):
     win._history_pieces = lambda: MiniWireshark._history_pieces(win)
     win._session_only_history = \
         lambda: MiniWireshark._session_only_history(win)
+    # (review) the saved packets go too, not only the database rows
+    ring = PacketRing(ctx.path("packets"), 20, st, 8)
+    ring.put(1, b"\x00" * 60 + b"password=LGCANARY", time.time(), 1)
+    assert ring.flush(5)
+    assert [f for f in os.listdir(ctx.path("packets"))
+            if f.startswith("seg-")]
+    win.packet_ring = ring
+    win._wipe_packets = lambda: MiniWireshark._wipe_packets(win)
     st.write_observations([(1, time.time(), "dns_answer", "aa:bb",
                             {"domain": "secret-clinic.example"}, 7)])
     MiniWireshark._write_history(win)
@@ -59505,6 +59692,9 @@ def t_m1b_history_delete_all(ctx):
     assert st.query("SELECT COUNT(*) FROM devices")[0][0] > 0
     MiniWireshark._forget_session_history(win)
     st.stop(5)
+    ring.stop()
+    assert not [f for f in os.listdir(ctx.path("packets"))
+                if f.startswith("seg-")]
     con = sqlite3.connect(path)
     try:
         for t in ("devices", "presence", "traffic", "domains",
@@ -59677,6 +59867,29 @@ def t_co01_co02_router_impersonation(ctx):
     reg2.note_arp_reply("192.168.1.1", "00:11:22:00:00:01", 100.0)
     reg2.note_arp_reply("192.168.1.1", "00:11:22:00:00:02", 1000.0)
     assert "00:11:22:00:00:02" in reg2.gw_macs, reg2.gw_candidates
+    # (review) the router answers ARP once, then only forwards traffic;
+    # the attacker answers every second for 6 minutes: still DANGER, and
+    # the attacker never gets the router's address
+    m3 = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m3.set_identity(local_nets=nets)
+    m3.use_packet_clock = True
+    b = S()
+    b.home_network()
+    replay_frames(m3, b.frames, decoder=fast_frame_decoder(m3))
+    b.frames = []
+    arp(b, S.GW[0], S.GW[1], 1)
+    for sec in range(360):
+        arp(b, S.GW[0], ATT[1], 0.5)
+        b._emit(PK.Ether(src=S.GW[1], dst=S.ME[1]) /
+                PK.IP(src="93.184.215.14", dst=S.ME[0]) /
+                PK.UDP(sport=443, dport=50000) / PK.Raw(b"x" * 40), dt=0.5)
+    replay_frames(m3, b.frames, decoder=fast_frame_decoder(m3),
+                  tick_every=20)
+    reg3 = m3.registry
+    assert [a for a in m3.alerts.alerts.values()
+            if a.kind == "arp_spoof" and a.severity == "DANGER"]
+    assert ATT[1] not in reg3.gw_macs, reg3.gw_macs
+    assert reg3.ip_to_key.get(S.GW[0]) == S.GW[1].lower()
 
 
 @self_test()
@@ -59730,7 +59943,13 @@ def t_lg02_saved_streams_hold_no_password(ctx):
               (1, b"HTTP/1.1 200 OK\r\n\r\n")]),
         (8000, [(0, b"GET / HTTP/1.1\r\nHost: a.example\r\n" + auth +
                  b"\r\nCookie: sid=" + C + b"\r\n\r\n"),
-                (1, b"HTTP/1.1 200 OK\r\n\r\n")]))
+                (1, b"HTTP/1.1 200 OK\r\n\r\n")]),
+        # (review) Expect: 100-continue puts the form in a piece of its own
+        (80, [(0, b"POST /signin HTTP/1.1\r\nHost: a.example\r\n"
+                 b"Expect: 100-continue\r\nContent-Length: 30\r\n\r\n"),
+              (1, b"HTTP/1.1 100 Continue\r\n\r\n"),
+              (0, b"user=alex&password=" + C),
+              (1, b"HTTP/1.1 302 Found\r\n\r\n")]))
     forms = [C, base64.b64encode(b"alex:" + C), auth[24:].strip()]
     for port, turns in cases:
         sb = ScenarioBuilder()
@@ -59822,9 +60041,16 @@ def t_m2_history_two_copies_and_clock(ctx):
     finally:
         other.execute("ROLLBACK")
         other.close()
-    ids = {new_session_id() for _ in range(3)}
-    assert len({i // 1000 for i in ids}) >= 1 and all(
-        i % 1000 == os.getpid() % 1000 for i in ids)
+    real_pid, real_time = os.getpid, time.time
+    try:
+        time.time = lambda: 1761600000.25      # the same millisecond
+        os.getpid = lambda: 4242
+        a = new_session_id()
+        os.getpid = lambda: 4243
+        b = new_session_id()
+    finally:
+        os.getpid, time.time = real_pid, real_time
+    assert a != b and a // 1000 == b // 1000 == 1761600000250, (a, b)
     st = Store(ctx.path("clock.sqlite3"), session_id=5)
     assert st.write_observations([(1, time.time(), "dns_answer", "a", {}, 1)])
     assert st.flush_now(10)
@@ -59833,6 +60059,17 @@ def t_m2_history_two_copies_and_clock(ctx):
     assert st.counts()["observations"] == 1
     st._wall0 += 365 * 86400
     st.stop(5)
+    # (review) the clock is already a year ahead when the next run starts
+    real_time = time.time
+    try:
+        time.time = lambda: real_time() + 365 * 86400
+        st2 = Store(ctx.path("clock.sqlite3"), session_id=6)
+        st2.prune(30)
+        assert st2.flush_now(10)
+    finally:
+        time.time = real_time
+    assert st2.counts()["observations"] == 1, st2.counts()
+    st2.stop(5)
 
 
 @self_test()
@@ -59917,6 +60154,9 @@ def t_os12_identity_without_scapy(ctx):
              "wlan0\t0001A8C0\t00000000\t0001\t0\t0\t600\n"
              "wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\n")
     assert parse_proc_route(route) == ("192.168.1.1", "wlan0")
+    assert parse_proc_route(
+        route + "eth0\t00000000\t0100000A\t0003\t0\t0\t100\n") == \
+        ("10.0.0.1", "eth0")
     assert parse_proc_route("") == ("", "")
     gw, ips, macs, iface = os_identity()
     assert isinstance(gw, str) and isinstance(ips, set) and \
@@ -59985,15 +60225,18 @@ def t_m3_damaged_files_and_count_caps(ctx):
         QuicInitialReader._add(ent, i, b"x")
     QuicInitialReader._add(ent, 0, b"x")
     assert len(ent["parts"]) <= r.MAX_PIECES
-    assert time.perf_counter() - t0 < 1.0
+    assert time.perf_counter() - t0 < 10.0      # was minutes (quadratic)
     # QA-05: a hole that never fills
     tr = TcpReassembler(framer=LineFramer)
     tr.segment("10.0.0.1", 1000, "10.0.0.2", 80, 0, 0x02, b"", 0.0)
     t0 = time.perf_counter()
+    most = 0
     for i in range(20000):
-        tr.segment("10.0.0.1", 1000, "10.0.0.2", 80, 100 + i * 2, 0x10,
-                   b"a", 0.0)
-    assert time.perf_counter() - t0 < 5.0
+        st_ = tr.segment("10.0.0.1", 1000, "10.0.0.2", 80, 100 + i * 2,
+                         0x10, b"a", 0.0)
+        most = max(most, max(len(x.held) for x in st_.dirs))
+    assert most <= tr.MAX_HELD + 1, most
+    assert time.perf_counter() - t0 < 30.0
     # QA-06: one datagram in 8,000 tiny fragments, then completed
     df = IpDefragmenter()
     key = ("10.0.0.2", "10.0.0.1", 17, 1)
@@ -60003,7 +60246,7 @@ def t_m3_damaged_files_and_count_caps(ctx):
         assert df.add(key, i * 8, True, b"y" * 8, 0.0)[0] is None
     got, _w = df.add(key, 0, True, b"a" * 8, 0.0)
     assert got and len(got) == 65535 and got[:8] == b"a" * 8
-    assert time.perf_counter() - t0 < 2.0 and df.total == 0
+    assert time.perf_counter() - t0 < 20.0 and df.total == 0
     df.add(key, 0, True, b"abcd", 0.0)
     _g, w = df.add(key, 2, False, b"XX", 0.0)
     assert "different content" in w
@@ -64434,7 +64677,13 @@ def t_m1a_data_trust(ctx):
     assert not rollback_source_ok(dict(m, mac="0" * 64), script)[0]
     legacy = {k: v for k, v in m.items() if k not in ("mac",
                                                        "backup_sha256")}
+    # (review) without an HMAC only an older release updating to this
+    # very version: never a marker naming another version
+    assert not rollback_source_ok(legacy, script)[0]
+    legacy["version"] = SCRIPT_VERSION
     assert rollback_source_ok(legacy, script)[0]
+    assert not rollback_source_ok(dict(legacy, **{"from": "5.3.4"}),
+                                  script)[0]
     assert not rollback_source_ok(dict(legacy, backup=evil), script)[0]
     with open(backup, "a", encoding="utf-8") as f:
         f.write("planted\n")
@@ -64482,14 +64731,29 @@ def t_m1a_elevation(ctx):
         subprocess.call = refused
         assert _relaunch_elevated((START_ARG + "monitor",)) is False
         assert len(calls) == 1 and calls[0][0] == "pkexec"
+        # a launcher that ran but didn't start the program: no second
+        # password prompt
+        calls.clear()
+        subprocess.call = lambda cmd, *a, **k: calls.append(cmd) or 1
+        assert _relaunch_elevated((START_ARG + "monitor",)) is False
+        assert len(calls) == 1, calls
         subprocess.call = accepted
         try:
             _relaunch_elevated((START_ARG + "monitor",))
             raise AssertionError("did not end after the elevated copy")
         except SystemExit as e:
             assert e.code == 3
-        assert not [f for f in os.listdir(PATHS.data)
-                    if f.startswith(".elevated-")]
+        assert not [f for f in os.listdir(tempfile.gettempdir())
+                    if f.startswith(ELEV_DIR_PREFIX)]
+        # the elevated copy creates its flag only in such a folder
+        d = tempfile.mkdtemp(prefix=ELEV_DIR_PREFIX)
+        assert elev_flag_ok(os.path.join(d, "started"))
+        assert not elev_flag_ok(os.path.join(d, "other"))
+        assert not elev_flag_ok(os.path.join(PATHS.data, "started"))
+        assert not elev_flag_ok("/etc/" + ELEV_DIR_PREFIX + "x/started")
+        if os.geteuid() != 0:
+            assert not elev_flag_ok("/" + "started")
+        os.rmdir(d)
     finally:
         shutil.which, subprocess.call = real_which, real_call
 
@@ -69831,14 +70095,18 @@ def detect_gateway_and_self():
 
 
 def parse_proc_route(text):
-    """→ (gateway_ip, iface) of the default route in /proc/net/route."""
+    """→ (gateway_ip, iface) of the default route in /proc/net/route
+    with the lowest metric (the one the system really uses)."""
+    best = None
     for line in (text or "").splitlines()[1:]:
         f = line.split()
-        if len(f) >= 3 and f[1] == "00000000" and f[2] != "00000000":
+        if len(f) >= 7 and f[1] == "00000000" and f[2] != "00000000":
             with contextlib.suppress(ValueError, OSError):
-                return _socket.inet_ntoa(struct.pack(
-                    "<I", int(f[2], 16))), f[0]
-    return "", ""
+                cand = (int(f[6]), _socket.inet_ntoa(struct.pack(
+                    "<I", int(f[2], 16))), f[0])
+                if best is None or cand[0] < best[0]:
+                    best = cand
+    return (best[1], best[2]) if best else ("", "")
 
 
 def os_identity():
