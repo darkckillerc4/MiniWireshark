@@ -8366,6 +8366,10 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
             elif sp in CLEARTEXT_PORTS:
                 d["cleartext"] = CLEARTEXT_PORTS[sp]
                 d["encrypted"] = "no"
+            if _rtc_wanted(load):
+                rtc = wire_rtc(bytes(load))
+                if rtc is not None:
+                    d["rtc"] = rtc
 
     elif pkt.haslayer(ICMP):
         c = pkt[ICMP]
@@ -9837,6 +9841,70 @@ def _fast_tcp(d, raw, p, end, reasm):
     return _fast_done(d)
 
 
+# ---- 5.3.4 (MC8, IP-020): STUN, RTP and RTCP headers -------------------------
+#  Headers only: the media itself (and an SRTP payload) is never read. Both
+#  decoders call wire_rtc() on the same bytes, for UDP that no other branch
+#  claimed, and only while FEATURES["call_quality"] is on, so a frame that
+#  isn't UDP (or the switch being off) costs nothing. A header on its own
+#  proves nothing: CallTracker counts a stream as a call only after STUN on
+#  the same 5-tuple (or between the same two hosts in the last 60 s).
+RTC_STUN_COOKIE = b"\x21\x12\xa4\x42"
+_RTC_HDR = struct.Struct(">BBHII")
+
+
+def wire_rtc(load):
+    """UDP payload → {"kind": "STUN" | "RTP" | "RTCP", header fields} or
+    None. RFC 7983's first-byte split: 0-3 STUN, 128-191 RTP and RTCP
+    (RTCP when the second byte is 200-207, RFC 5761). Never raises."""
+    n = len(load)
+    if n < 8:
+        return None
+    b0 = load[0]
+    if b0 < 4:
+        # STUN (RFC 8489): the magic cookie and a length that fills the
+        # datagram exactly, in whole 4-byte words
+        if n < 20 or load[4:8] != RTC_STUN_COOKIE:
+            return None
+        mtype, mlen = struct.unpack_from(">HH", load, 0)
+        if mlen & 3 or mlen + 20 != n:
+            return None
+        method = (mtype & 0x000F) | ((mtype & 0x00E0) >> 1) | \
+            ((mtype & 0x3E00) >> 2)
+        cls = ((mtype >> 4) & 1) | ((mtype >> 7) & 2)
+        return {"kind": "STUN", "method": method, "class": cls,
+                "length": mlen}
+    if b0 & 0xC0 != 0x80:
+        return None
+    b1 = load[1]
+    if 192 <= b1 <= 223:
+        # RTCP: SR, RR, SDES, BYE, APP, RTPFB, PSFB, XR. SRTCP encrypts
+        # what follows the sender's SSRC, so only these 8 bytes are read
+        words = struct.unpack_from(">H", load, 2)[0]
+        if b1 < 200 or b1 > 207 or (words + 1) * 4 > n:
+            return None
+        return {"kind": "RTCP", "pt": b1, "count": b0 & 0x1F,
+                "length": words,
+                "ssrc": struct.unpack_from(">I", load, 4)[0]}
+    if n < 12:
+        return None
+    _b0, _b1, seq, rts, ssrc = _RTC_HDR.unpack_from(load, 0)
+    hdr = 12 + 4 * (b0 & 0x0F)               # CSRC list
+    if b0 & 0x10:                            # header extension
+        if hdr + 4 > n:
+            return None
+        hdr += 4 + 4 * struct.unpack_from(">H", load, hdr + 2)[0]
+    if hdr > n:
+        return None
+    return {"kind": "RTP", "pt": b1 & 0x7F, "marker": b1 >> 7, "seq": seq,
+            "ts": rts, "ssrc": ssrc, "header_len": hdr}
+
+
+def _rtc_wanted(load):
+    """The cheap first-byte test both decoders make before wire_rtc."""
+    return bool(load) and (load[0] < 4 or load[0] & 0xC0 == 0x80) and \
+        FEATURES.get("call_quality", True)
+
+
 def _fast_udp(d, raw, p, end, reasm=None):
     if end - p < 8:
         raise NeedDeepParse("short udp")
@@ -9924,6 +9992,10 @@ def _fast_udp(d, raw, p, end, reasm=None):
         elif sp in CLEARTEXT_PORTS:
             d["cleartext"] = CLEARTEXT_PORTS[sp]
             d["encrypted"] = "no"
+        if _rtc_wanted(load):
+            rtc = wire_rtc(load)
+            if rtc is not None:
+                d["rtc"] = rtc
     return _fast_done(d)
 
 
@@ -10860,6 +10932,7 @@ FEATURES = {
     "story_mode": True,      # the Timeline tells what changed by day (M7)
     "signatures_v2": True,   # device signature additions, pairing (5.3.4)
     "baseline_v2": True,     # day and night baselines, kind priors (5.3.4)
+    "call_quality": True,    # STUN-gated RTP loss and jitter (5.3.4 M10)
 }
 
 
@@ -11027,6 +11100,8 @@ FEATURE_HELP = {
     "baseline_v2": "each device learns a day and a night profile, starts "
                    "from what is usual for its kind, forgets what it "
                    "learned after 14 days away, and shows what it learned",
+    "call_quality": "a Calls card under Health: lost packets and jitter "
+                    "of voice and video calls, from packet headers only",
 }
 
 
@@ -18777,6 +18852,362 @@ def _initial_ttl(ttl):
     return 255
 
 
+# ---- 5.3.4 (MC8, IP-020): call quality ---------------------------------------
+#  Fed by the UDP flow updates of NetworkModel with the headers that
+#  wire_rtc() read. A 5-tuple becomes a call candidate after a STUN binding
+#  on it, or after STUN between the same two hosts in the previous 60 s (a
+#  call that was already running when the capture started). On a candidate,
+#  each RTP source (SSRC, one direction) is followed with RFC 3550's own
+#  rules: A.1 sequence checks, A.3 loss and A.8 interarrival jitter. A call
+#  app that never uses STUN is not measured, and the card says so.
+RTP_CLOCK = {0: 8000, 3: 8000, 4: 8000, 5: 8000, 7: 8000, 8: 8000, 9: 8000,
+             12: 8000, 13: 8000, 15: 8000, 18: 8000, 6: 16000, 16: 11025,
+             17: 22050, 10: 44100, 11: 44100, 14: 90000, 25: 90000,
+             26: 90000, 28: 90000, 31: 90000, 32: 90000, 33: 90000,
+             34: 90000}
+RTP_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000,
+             90000)
+CALL_JITTER_OK_MS = 30
+CALL_LOSS_OK_PCT = 1.0
+
+
+def _rtp_ts_delta(a, b):
+    """b - a for 32-bit RTP timestamps, across a wrap."""
+    dt = (b - a) & 0xFFFFFFFF
+    return dt - 0x100000000 if dt >= 0x80000000 else dt
+
+
+class RtpStream:
+    """One RTP source in one direction."""
+
+    __slots__ = ("key", "first", "last", "pt", "inbound", "rate",
+                 "base_seq", "max_seq", "bad_seq", "cycles", "received",
+                 "probation", "packets", "pending", "prev", "jitter",
+                 "jitter_sum", "jitter_n", "peak_jitter", "rejected",
+                 "ended", "win_start", "win_exp", "win_rcv", "windows")
+
+    MAX_DROPOUT, MAX_MISORDER, MIN_SEQUENTIAL = 3000, 100, 2
+    CALL_PACKETS = 25               # a "clear RTP pattern" from here on
+    RATE_PACKETS, RATE_SPAN = 50, 0.8
+    WINDOW = 30.0                   # seconds per loss and jitter window
+
+    def __init__(self, key, ts, seq, pt, inbound):
+        self.key = key
+        self.first = self.last = ts
+        self.pt = pt
+        self.inbound = inbound
+        self.rate = None
+        self._init_seq(seq)
+        self.max_seq = (seq - 1) & 0xFFFF
+        self.probation = self.MIN_SEQUENTIAL
+        self.packets = 0
+        self.pending = []           # (arrival, timestamp) until the rate
+        self.prev = None
+        self.jitter = self.jitter_sum = self.peak_jitter = 0.0
+        self.jitter_n = 0
+        self.rejected = self.ended = False
+        self.win_start = ts
+        self.win_exp = self.win_rcv = 0
+        self.windows = deque(maxlen=240)   # (start, end, expected, lost, j)
+
+    def _init_seq(self, seq):
+        self.base_seq = self.max_seq = seq
+        self.bad_seq = 0x10001
+        self.cycles = 0
+        self.received = 0
+
+    def _update_seq(self, seq):
+        """RFC 3550 A.1, as written there."""
+        udelta = (seq - self.max_seq) & 0xFFFF
+        if self.probation:
+            if seq == (self.max_seq + 1) & 0xFFFF:
+                self.probation -= 1
+                self.max_seq = seq
+                if self.probation == 0:
+                    self._init_seq(seq)
+                    self.received += 1
+                    return True
+            else:
+                self.probation = self.MIN_SEQUENTIAL - 1
+                self.max_seq = seq
+            return False
+        if udelta < self.MAX_DROPOUT:
+            if seq < self.max_seq:
+                self.cycles += 0x10000
+            self.max_seq = seq
+        elif udelta <= 0x10000 - self.MAX_MISORDER:
+            if seq == self.bad_seq:
+                self._init_seq(seq)      # the source restarted
+            else:
+                self.bad_seq = (seq + 1) & 0xFFFF
+                return False
+        self.received += 1
+        return True
+
+    def expected(self):
+        if self.probation:
+            return 0
+        return self.cycles + self.max_seq - self.base_seq + 1
+
+    def lost(self):
+        return max(0, self.expected() - self.received)
+
+    def loss_pct(self):
+        e = self.expected()
+        return 100.0 * self.lost() / e if e > 0 else 0.0
+
+    def is_call(self):
+        return not self.rejected and self.rate is not None and \
+            self.received >= self.CALL_PACKETS
+
+    def _jitter(self, arrival, rts):
+        """RFC 3550 A.8 (in seconds rather than timestamp units)."""
+        prev = self.prev
+        self.prev = (arrival, rts)
+        if prev is None:
+            return
+        d = (arrival - prev[0]) - _rtp_ts_delta(prev[1], rts) / self.rate
+        self.jitter += (abs(d) - self.jitter) / 16.0
+        self.jitter_sum += self.jitter
+        self.jitter_n += 1
+        if self.jitter > self.peak_jitter:
+            self.peak_jitter = self.jitter
+
+    def _guess_rate(self):
+        """The clock rate from timestamps against arrival times, snapped
+        to a usual rate (a static payload type: its own rate). None close
+        means it isn't RTP at all: a game's packet counter or millisecond
+        clock in the same place is turned away here."""
+        p = self.pending
+        span = p[-1][0] - p[0][0]
+        if len(p) < self.RATE_PACKETS or span < self.RATE_SPAN:
+            if len(p) >= 400:
+                self.rejected = True
+                self.pending = None
+            return
+        est = _rtp_ts_delta(p[0][1], p[-1][1]) / span
+        want = RTP_CLOCK.get(self.pt)
+        best = want or min(RTP_RATES, key=lambda r: abs(math.log(r / est))
+                           if est > 0 else 99)
+        if est <= 0 or abs(math.log(best / est)) > 0.2:
+            self.rejected = True
+            self.pending = None
+            return
+        self.rate = best
+        self.pending = None
+        for arrival, rts in p:
+            self._jitter(arrival, rts)
+
+    def packet(self, ts, seq, rts):
+        self.packets += 1
+        if ts > self.last:
+            self.last = ts
+        self._update_seq(seq)
+        if self.rejected:
+            return
+        if self.pending is not None:
+            self.pending.append((ts, rts))
+            self._guess_rate()
+        else:
+            self._jitter(ts, rts)
+        if ts - self.win_start >= self.WINDOW:
+            self.close_window(ts)
+
+    def close_window(self, ts):
+        e, r = self.expected(), self.received
+        exp, rcv = e - self.win_exp, r - self.win_rcv
+        if exp > 0:
+            self.windows.append((self.win_start, ts, exp,
+                                 max(0, exp - rcv), self.jitter))
+        self.win_start, self.win_exp, self.win_rcv = ts, e, r
+
+    def mean_jitter_ms(self):
+        return 1000.0 * self.jitter_sum / self.jitter_n \
+            if self.jitter_n else 0.0
+
+
+class CallTracker:
+    """Calls seen on the network: STUN-gated RTP streams, bounded."""
+
+    STUN_WINDOW = 60.0
+    MAX_TUPLES, MAX_STREAMS, MAX_PROBATION, MAX_UNGATED = 4096, 512, 256, \
+        1024
+    STUN_BINDING = 0x001
+
+    def __init__(self):
+        self.stun_tuples = OrderedDict()   # 5-tuple → last STUN binding
+        self.stun_pairs = OrderedDict()    # host pair → last STUN
+        self.streams = OrderedDict()       # (src, sp, dst, dp, ssrc) → s
+        self.probation = OrderedDict()     # streams not yet past A.1
+        self.not_rtp = OrderedDict()       # sources turned away (clock)
+        self.ungated = OrderedDict()       # (5-tuple, ssrc) → counting up
+        self.rtcp = Counter()              # 5-tuple → RTCP packets
+        self.counts = Counter()
+
+    @staticmethod
+    def _bound(od, n):
+        while len(od) > n:
+            od.popitem(last=False)
+
+    def feed(self, d, inbound=False):
+        rtc = d.get("rtc")
+        if rtc is None:
+            return
+        sip, dip = d["src_ip"], d["dst_ip"]
+        sp, dp = d["sport"] or 0, d["dport"] or 0
+        a, b = (sip, sp), (dip, dp)
+        tup = (a, b) if a <= b else (b, a)
+        pair = (sip, dip) if sip <= dip else (dip, sip)
+        ts = d["time"]
+        kind = rtc["kind"]
+        self.counts[kind] += 1
+        if kind == "STUN":
+            if rtc["method"] == self.STUN_BINDING:
+                self.stun_tuples[tup] = ts
+                self.stun_tuples.move_to_end(tup)
+                self.stun_pairs[pair] = ts
+                self.stun_pairs.move_to_end(pair)
+                self._bound(self.stun_tuples, self.MAX_TUPLES)
+                self._bound(self.stun_pairs, self.MAX_TUPLES)
+            return
+        if not self.admitted(tup, pair, ts):
+            if kind == "RTP":            # [seq, run, longest run]
+                uk = (tup, rtc["ssrc"])
+                u = self.ungated.get(uk)
+                if u is None:
+                    self.ungated[uk] = [rtc["seq"], 0, 0]
+                    self._bound(self.ungated, self.MAX_UNGATED)
+                elif 1 <= (rtc["seq"] - u[0]) & 0xFFFF <= 3:
+                    u[0], u[1] = rtc["seq"], u[1] + 1
+                    u[2] = max(u[2], u[1])
+                elif (u[0] - rtc["seq"]) & 0xFFFF > 10:   # not reordering
+                    u[0], u[1] = rtc["seq"], 0
+            return
+        if kind == "RTCP":
+            self.rtcp[tup] += 1
+            if len(self.rtcp) > self.MAX_TUPLES:
+                self.rtcp = Counter(dict(self.rtcp.most_common(
+                    self.MAX_TUPLES // 2)))
+            if rtc["pt"] == 203:                     # BYE: the source left
+                for s in self.streams.values():
+                    if s.key[4] == rtc["ssrc"] and \
+                            {s.key[0], s.key[2]} == {sip, dip}:
+                        s.ended = True
+            return
+        key = (sip, sp, dip, dp, rtc["ssrc"])
+        s = self.streams.get(key)
+        if s is not None:
+            self.streams.move_to_end(key)
+        else:
+            s = self.probation.get(key)
+            if s is None:
+                if key in self.not_rtp:
+                    return
+                s = self.probation[key] = RtpStream(key, ts, rtc["seq"],
+                                                    rtc["pt"], inbound)
+                self._bound(self.probation, self.MAX_PROBATION)
+        s.packet(ts, rtc["seq"], rtc["ts"])
+        if s.rejected:
+            self.probation.pop(key, None)
+            self.streams.pop(key, None)
+            self.not_rtp[key] = ts
+            self._bound(self.not_rtp, self.MAX_TUPLES)
+        elif key in self.probation and s.is_call():
+            del self.probation[key]
+            self.streams[key] = s
+            self._bound(self.streams, self.MAX_STREAMS)
+
+    def admitted(self, tup, pair, ts):
+        if tup in self.stun_tuples:
+            return True
+        t = self.stun_pairs.get(pair)
+        if t is not None and 0 <= ts - t <= self.STUN_WINDOW:
+            self.stun_tuples[tup] = ts    # the call goes on after 60 s
+            self._bound(self.stun_tuples, self.MAX_TUPLES)
+            return True
+        return False
+
+    def unmeasured(self):
+        """Connections that looked like a call (one source counting up
+        without a gap for a while) but had no STUN."""
+        return len({k[0] for k, u in list(self.ungated.items())
+                    if u[2] >= RtpStream.CALL_PACKETS})
+
+    def summary(self):
+        """One dict per call (a 5-tuple), the latest first. The numbers
+        are those of the streams that came in to this network when there
+        are any (loss on the way out happens after the capture point)."""
+        by = {}
+        for s in list(self.streams.values()):
+            if not s.is_call():
+                continue
+            k = s.key
+            a, b = (k[0], k[1]), (k[2], k[3])
+            by.setdefault((a, b) if a <= b else (b, a), []).append(s)
+        out = []
+        for tup, ss in by.items():
+            meas = [s for s in ss if s.inbound] or ss
+            exp = sum(s.expected() for s in meas)
+            lost = sum(s.lost() for s in meas)
+            worst = None
+            for s in meas:
+                for w in s.windows:
+                    if w[2] >= 20 and (worst is None or
+                                       w[3] / w[2] > worst[3] / worst[2]):
+                        worst = w
+            out.append({
+                "tuple": tup, "first": min(s.first for s in ss),
+                "last": max(s.last for s in ss),
+                "kind": "video" if any(s.rate == 90000 for s in ss)
+                else "voice",
+                "streams": len(ss), "expected": exp, "lost": lost,
+                "loss_pct": 100.0 * lost / exp if exp else 0.0,
+                "jitter_ms": max(s.mean_jitter_ms() for s in meas),
+                "peak_jitter_ms": 1000.0 * max(s.peak_jitter for s in meas),
+                "ended": all(s.ended for s in ss),
+                "rtcp": self.rtcp.get(tup, 0),
+                "worst": worst, "evidence": "Observed"})
+        out.sort(key=lambda c: -c["last"])
+        return out
+
+
+def calls_card_text(tracker, limit=3):
+    """The Calls card under Health (current language). No names and no
+    content: times, loss and jitter from the packet headers."""
+    tr = translate_text
+    calls = tracker.summary() if tracker is not None else []
+    lines = []
+    for c in calls[:limit]:
+        tpl = ("Your video call lost %s of packets between %s and %s; "
+               "jitter %d ms (usually fine below %d)." if c["kind"] ==
+               "video" else "Your voice call lost %s of packets between %s "
+               "and %s; jitter %d ms (usually fine below %d).")
+        lines.append(tr(tpl) % (f"{c['loss_pct']:.1f}%",
+                                hm_clock(c["first"]), hm_clock(c["last"]),
+                                round(c["jitter_ms"]), CALL_JITTER_OK_MS))
+        w = c["worst"]
+        if w and 100.0 * w[3] / w[2] >= max(CALL_LOSS_OK_PCT,
+                                            1.5 * c["loss_pct"]):
+            lines.append("  " + tr("Worst moment: %s lost around %s.") % (
+                f"{100.0 * w[3] / w[2]:.1f}%", hm_clock(w[0])))
+    more = len(calls) - limit
+    if more == 1:
+        lines.append(tr("And 1 more call."))
+    elif more > 1:
+        lines.append(tr("And %d more calls.") % more)
+    if not calls:
+        lines.append(tr("No calls seen yet."))
+    n = tracker.unmeasured() if tracker is not None else 0
+    if n:
+        lines.append(tr("%d connections looked like a call but had no "
+                        "connection check, so they are not measured.") % n)
+    lines.append(tr("Observed from packet headers only: no names, no "
+                    "sound or picture. Calls are measured after the call "
+                    "app checks its connection (STUN); some call apps "
+                    "can't be measured."))
+    return "\n".join(lines)
+
+
 class NetworkModel:
     DISCOVERY_SECONDS = 8
 
@@ -18803,6 +19234,7 @@ class NetworkModel:
         self.dns = DnsTracker()
         self.baselines = BaselineEngine(config)
         self.scans = ScanTracker()
+        self.calls = CallTracker()       # 5.3.4 (MC8)
         self.websites = {}
         self._seen_roots = None          # registrable domains seen (B-24)
         self.remote_hosts = {}
@@ -20070,6 +20502,8 @@ class NetworkModel:
         rec = self.remote_hosts.get(f.remote_ip)
         if rec is not None and (rec.country or rec.asn) and not f.country:
             f.country, f.asn, f.org = rec.country, rec.asn, rec.org
+        if tr == "UDP" and "rtc" in d:       # only set by the decoders
+            self.calls.feed(d, inbound=not out_dir)   # with the switch on
         self.flows.dirty.add(f.fid)
         return f, new
 
@@ -25389,6 +25823,15 @@ A firmware update or a new feature in its app can add a service. It matters if y
 Compared with the services this device learned over at least an hour. ¦ Comparé aux services que cet appareil a appris pendant au moins une heure. ¦ Comparado con los servicios que este dispositivo aprendió durante al menos una hora.
 Knows this device (less than a day) ¦ Connaît cet appareil (moins d'un jour) ¦ Conoce este dispositivo (menos de un día)
 Knows this device (1 day) ¦ Connaît cet appareil (1 jour) ¦ Conoce este dispositivo (1 día)
+Calls ¦ Appels ¦ Llamadas
+Your video call lost %s of packets between %s and %s; jitter %d ms (usually fine below %d). ¦ Votre appel vidéo a perdu %s des paquets entre %s et %s ; gigue %d ms (en général sans souci sous %d). ¦ Su videollamada perdió el %s de los paquetes entre las %s y las %s; fluctuación %d ms (suele ir bien por debajo de %d).
+Your voice call lost %s of packets between %s and %s; jitter %d ms (usually fine below %d). ¦ Votre appel audio a perdu %s des paquets entre %s et %s ; gigue %d ms (en général sans souci sous %d). ¦ Su llamada de voz perdió el %s de los paquetes entre las %s y las %s; fluctuación %d ms (suele ir bien por debajo de %d).
+Worst moment: %s lost around %s. ¦ Pire moment : %s perdus vers %s. ¦ Peor momento: %s perdido hacia las %s.
+And 1 more call. ¦ Et 1 autre appel. ¦ Y 1 llamada más.
+And %d more calls. ¦ Et %d autres appels. ¦ Y %d llamadas más.
+No calls seen yet. ¦ Aucun appel vu pour l'instant. ¦ Todavía no se ha visto ninguna llamada.
+%d connections looked like a call but had no connection check, so they are not measured. ¦ %d connexions ressemblaient à un appel mais sans vérification de connexion : elles ne sont pas mesurées. ¦ %d conexiones parecían una llamada pero no tenían comprobación de conexión, así que no se miden.
+Observed from packet headers only: no names, no sound or picture. Calls are measured after the call app checks its connection (STUN); some call apps can't be measured. ¦ Observé uniquement à partir des en-têtes des paquets : ni noms, ni son, ni image. Les appels sont mesurés après que l'application d'appel a vérifié sa connexion (STUN) ; certaines applications d'appel ne peuvent pas être mesurées. ¦ Observado solo a partir de las cabeceras de los paquetes: sin nombres, sin sonido ni imagen. Las llamadas se miden después de que la aplicación de llamadas compruebe su conexión (STUN); algunas aplicaciones de llamadas no se pueden medir.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -36551,6 +36994,22 @@ class HealthTab(BaseTab):
             row.bind("<Configure>", lambda e, r=row, lb=ex: self._fit_row(
                 r, lb, e.width), add="+")
             self.rows[key] = (st, ex, row)
+        # 5.3.4 (MC8): call quality, from the RTP headers of STUN-checked
+        # calls (evidence: Observed)
+        self.calls_var = None
+        if FEATURES.get("call_quality", True):
+            self.calls_card = tk.Frame(right, bg="#f6f7fa", padx=10, pady=6,
+                                       highlightbackground="#e0e2e8",
+                                       highlightthickness=1)
+            self.calls_card.pack(fill="x", pady=(0, 10))
+            tk.Label(self.calls_card, text="\U0001F4DE  Calls",
+                     bg="#f6f7fa", fg="#2b3a56",
+                     font=mw_font(11, "bold")).pack(anchor="w")
+            self.calls_var = DisplayVar(value="")
+            self.calls_lbl = tk.Label(
+                self.calls_card, textvariable=self.calls_var, bg="#f6f7fa",
+                fg="#333333", justify="left", anchor="w", wraplength=400)
+            self.calls_lbl.pack(anchor="w", fill="x")
         tk.Label(right, text="Your connection", bg=WHITE, fg="#2b3a56",
                  font=mw_font(11, "bold")).pack(anchor="w")
         self.info_var = DisplayVar()
@@ -36746,6 +37205,14 @@ class HealthTab(BaseTab):
                       (f" ({len(hidden)})" if hidden else "")) if closed
                 else ("\u25BE " + translate_text("Less detail")))
 
+    def show_calls(self):
+        """The Calls card's text (None when the switch is off)."""
+        if self.calls_var is None:
+            return None
+        text = calls_card_text(getattr(self.model, "calls", None))
+        self.calls_var.set(text)
+        return text
+
     STATUS_STYLE = {"Healthy": ("✔ Healthy", "good_fg"),
                     "Degraded": ("⚠ Degraded", "warn_fg"),
                     "Needs attention": ("✖ Needs attention",
@@ -36772,6 +37239,7 @@ class HealthTab(BaseTab):
                 ex.configure(text=text)
         self.note_var.set(app.health_note())
         self.info_var.set(app.connection_info_text())
+        self.show_calls()
         allowed = app.health_checks_allowed()
         with contextlib.suppress(tk.TclError):
             self.run_btn.state(["!disabled"] if allowed else ["disabled"])
@@ -59830,6 +60298,207 @@ def scenario_identity():
             [ipaddress.ip_network("192.168.1.0/24")])
 
 
+# ---- 5.3.4 (MC8): the synthetic call corpus ----------------------------------
+#  RTP sent on a fixed clock through a made-up network that delays
+#  (Gaussian jitter, so packets also arrive out of order), drops at random
+#  and in bursts, with a fixed seed. The truth (what arrived, in arrival
+#  order) is kept for the RFC 3550 reference computation in the tests.
+def rtp_payload(seq, rts, ssrc, pt=0, marker=0, size=160, csrc=0, ext=b""):
+    out = struct.pack(">BBHII", 0x80 | (0x10 if ext else 0) | csrc,
+                      (marker << 7) | pt, seq & 0xFFFF, rts & 0xFFFFFFFF,
+                      ssrc & 0xFFFFFFFF) + bytes(4 * csrc)
+    if ext:
+        out += struct.pack(">HH", 0xBEDE, len(ext) // 4) + ext
+    return out + bytes(size)
+
+
+def stun_payload(mtype=0x0001, tid=b"\x5a" * 12, attrs=b""):
+    return struct.pack(">HH", mtype, len(attrs)) + RTC_STUN_COOKIE + tid + \
+        attrs
+
+
+def rtcp_payload(pt=200, ssrc=1, words=6, count=0):
+    return struct.pack(">BBHI", 0x80 | count, pt, words, ssrc) + \
+        bytes(4 * words - 4)
+
+
+class CallScenario:
+    ME = ScenarioBuilder.ME
+    GW_MAC = ScenarioBuilder.GW[1]
+
+    def __init__(self, t0=SCENARIO_T0, seed=21):
+        self.t0 = t0
+        self.rng = random.Random(seed)
+        self.out = []
+        self.truth = {}           # ssrc → {"rate", "pkts", "inbound"}
+
+    def udp(self, ts, sip, sport, dip, dport, load):
+        smac, dmac = (self.ME[1], self.GW_MAC) if sip == self.ME[0] else \
+            (self.GW_MAC, self.ME[1])
+        self.out.append((bytes(PK.Ether(src=smac, dst=dmac) /
+                               PK.IP(src=sip, dst=dip, ttl=55) /
+                               PK.UDP(sport=sport, dport=dport) /
+                               PK.Raw(load)), round(ts, 6), 1))
+
+    def stun(self, ts, lport, rip, rport):
+        tid = bytes(self.rng.randrange(256) for _ in range(12))
+        self.udp(ts, self.ME[0], lport, rip, rport, stun_payload(0x0001, tid))
+        self.udp(ts + 0.03, rip, rport, self.ME[0], lport, stun_payload(
+            0x0101, tid, b"\x00\x20\x00\x08\x00\x01\xa1\x47\xe1\x12\xa6\x43"))
+
+    def stream(self, start, seconds, lport, rip, rport, inbound, pt, rate,
+               ptime, ssrc, loss=0.0, bursts=0, jitter_ms=0.0, seq0=1000,
+               ts0=5000, per_frame=1, size=160, base_ms=40.0):
+        rng = self.rng
+        n = int(seconds / ptime)
+        burst_at = {rng.randrange(n // 10, n) for _ in range(bursts)}
+        seq, drop_run, got = seq0, 0, []
+        for i in range(n):
+            send = start + i * ptime
+            rts = (ts0 + int(round(i * ptime * rate))) & 0xFFFFFFFF
+            if i in burst_at:
+                drop_run = rng.randint(5, 15) * per_frame
+            for k in range(per_frame):
+                s = seq & 0xFFFF
+                seq += 1
+                if drop_run:
+                    drop_run -= 1
+                    continue
+                if inbound and rng.random() < loss:
+                    continue
+                at = send + k * 0.0004
+                if inbound:     # through the network; outbound: captured
+                    at += max(0.001, (base_ms + rng.gauss(0, jitter_ms)) /
+                              1000.0)      # as it leaves this computer
+                got.append((at, s, rts, int(k == per_frame - 1)))
+        got.sort(key=lambda x: x[0])
+        for at, s, rts, mk in got:
+            load = rtp_payload(s, rts, ssrc, pt, mk, size)
+            if inbound:
+                self.udp(at, rip, rport, self.ME[0], lport, load)
+            else:
+                self.udp(at, self.ME[0], lport, rip, rport, load)
+        self.truth[ssrc] = {"rate": rate, "inbound": inbound,
+                            "pkts": [(at, s, rts) for at, s, rts, _m in got]}
+
+    def frames(self):
+        return sorted(self.out, key=lambda f: f[1])
+
+
+def call_corpus():
+    """Four calls: a voice call with random loss, an Opus call across a
+    sequence and timestamp wrap with bursts of loss and heavy jitter, a
+    video call that began before its STUN host check could be tied to the
+    5-tuple (the 60 s host rule), and a clean call. Returns the scenario
+    (frames(), truth); built once (the callers only read it)."""
+    if _CALL_CORPUS:
+        return _CALL_CORPUS[0]
+    cs = CallScenario()
+    t = cs.t0 + 5
+    r1, r2, r3, r4 = "203.0.113.50", "198.51.100.7", "192.0.2.80", \
+        "203.0.113.77"
+    cs.stun(t, 50000, r1, 3478)
+    for k in range(12):                         # ICE consent checks
+        cs.stun(t + 5 * k + 2.5, 50000, r1, 3478)
+    cs.stream(t + 0.2, 60, 50000, r1, 3478, True, 0, 8000, 0.02, 0x1111,
+              loss=0.02, jitter_ms=8)
+    cs.stream(t + 0.2, 60, 50000, r1, 3478, False, 0, 8000, 0.02, 0x2222)
+    for k in range(10):
+        cs.udp(t + 5 * k + 1, r1, 3478, cs.ME[0], 50000,
+               rtcp_payload(201, 0x1111))
+    t2 = t + 70
+    cs.stun(t2, 50100, r2, 19302)
+    cs.stream(t2 + 0.1, 45, 50100, r2, 19302, True, 111, 48000, 0.02,
+              0x3333, loss=0.03, bursts=3, jitter_ms=25, seq0=65300,
+              ts0=2 ** 32 - 96000, size=80)
+    t3 = t2 + 50
+    cs.stun(t3, 51000, r3, 19302)               # the host check
+    cs.stream(t3 + 20, 40, 51002, r3, 40000, True, 96, 90000, 1 / 30.0,
+              0x4444, loss=0.01, jitter_ms=5, per_frame=3, size=900)
+    cs.stream(t3 + 20, 40, 51002, r3, 40000, True, 111, 48000, 0.02,
+              0x5555, jitter_ms=5, size=80)
+    t4 = t3 + 65
+    cs.stun(t4, 52000, r4, 3478)
+    cs.stream(t4 + 0.1, 30, 52000, r4, 3478, True, 8, 8000, 0.02, 0x6666,
+              jitter_ms=1)
+    _CALL_CORPUS.append(cs)
+    return cs
+
+
+_CALL_CORPUS = []
+
+
+def non_call_scenarios():
+    """Three kinds of UDP that are not calls: name lookups, QUIC browsing
+    (also off port 443, with a STUN check on it) and game-like traffic
+    (random datagrams and an RTP-shaped header whose "timestamp" is a
+    packet counter or a millisecond clock, after a STUN check)."""
+    sb = ScenarioBuilder()
+    for i in range(400):
+        sb.dns(sb.ME, f"site{i}.example.com", "93.184.215.14")
+    dns = sb.home_network() + sb.frames
+    rng = random.Random(4)
+    cs = CallScenario(seed=5)
+    t, me = cs.t0, cs.ME[0]
+    for port in (443, 8443):
+        if port == 8443:
+            cs.stun(t, 41000, "142.250.80.46", port)
+        for i in range(1500):
+            first = rng.choice((0xC3, 0xC1, 0xE0)) if i < 6 else \
+                0x40 | rng.randrange(64)
+            load = bytes([first]) + bytes(rng.randrange(256) for _ in range(
+                rng.randint(20, 1200)))
+            if i % 3:
+                cs.udp(t + i * 0.004, "142.250.80.46", port, me, 41000, load)
+            else:
+                cs.udp(t + i * 0.004, me, 41000, "142.250.80.46", port, load)
+    quic = cs.frames()
+    gs = CallScenario(seed=6)
+    t = gs.t0
+    gs.stun(t, 27015, "203.0.113.99", 27015)
+    for i in range(1800):
+        load = bytes(rng.randrange(256) for _ in range(rng.randint(12,
+                                                                   200)))
+        gs.udp(t + 0.1 + i / 60.0, "203.0.113.99", 27015, me, 27015, load)
+        gs.udp(t + 0.11 + i / 60.0, me, 27015, "203.0.113.99", 27015,
+               rtp_payload(i, i, 0xABCD, 0, size=40))
+        gs.udp(t + 0.12 + i / 60.0, me, 27016, "203.0.113.99", 27016,
+               rtp_payload(i, int(i * 16.7), 0x1234, 100, size=40))
+    gs.stun(t, 27016, "203.0.113.99", 27016)
+    return {"DNS": dns, "QUIC browsing": quic, "game": gs.frames()}
+
+
+def rfc3550_reference(pkts, rate):
+    """The test's own RFC 3550 numbers for one source, from the packets
+    in arrival order: loss (A.3, extended highest sequence number against
+    the first) and the interarrival jitter estimate of A.8, worked in
+    timestamp units as the RFC does. → (loss %, final jitter ms, mean
+    jitter ms)."""
+    ext = last = None
+    hi = lo = None
+    j, js, prev = 0.0, [], None
+    for arrival, seq, rts in pkts:
+        if ext is None:
+            ext = seq
+        else:
+            step = (seq - last) % 65536
+            ext += step - 65536 if step >= 32768 else step
+        last = seq
+        hi = ext if hi is None else max(hi, ext)
+        lo = ext if lo is None else min(lo, ext)
+        if prev is not None:
+            dts = (rts - prev[1]) % 2 ** 32
+            if dts >= 2 ** 31:
+                dts -= 2 ** 32
+            d = (arrival - prev[0]) * rate - dts
+            j += (abs(d) - j) / 16.0
+            js.append(j)
+        prev = (arrival, rts)
+    expected = hi - lo + 1
+    return (100.0 * (expected - len(pkts)) / expected, 1000.0 * j / rate,
+            1000.0 * sum(js) / len(js) / rate)
+
+
 # ---- 5.3.4 (MC3): the labelled identification corpus ------------------------
 # Sixty-odd made-up devices, each announcing itself the way that kind of
 # device does on a home network (DHCP, mDNS, UPnP, the way it opens a
@@ -61425,7 +62094,7 @@ def t_fuzz_decoder_and_model(ctx):
     if not ctx.scapy_ok:
         return "skip"
     rng = random.Random(11)
-    frames = ctx.frames()
+    frames = ctx.frames() + call_corpus().frames()[::60]   # 5.3.4 (MC8)
     m = NetworkModel(ctx.cfg(), *scenario_identity()[:3])
     m.set_identity(local_nets=scenario_identity()[3])
     m.use_packet_clock = True
@@ -61535,7 +62204,7 @@ DIFF_FIELDS = ("proto", "tag", "text", "src", "dst", "src_ip", "dst_ip",
                "mdns", "http_host", "lldp", "service", "service_port",
                "app_conf",
                "encrypted", "cleartext", "multicast", "l2_bcast", "learns",
-               "length")
+               "length", "rtc")
 
 
 def decoder_differences(frames):
@@ -61565,7 +62234,10 @@ def decoder_differences(frames):
 def t_fast_decoder_matches_scapy(ctx):
     if not ctx.scapy_ok:
         return "skip"
-    frames = ctx.frames() + ScenarioBuilder().busy_mix(300)
+    calls = call_corpus().frames()                   # 5.3.4 (MC8)
+    frames = ctx.frames() + ScenarioBuilder().busy_mix(300) + \
+        calls[::40] + [f for f in calls if f[0][42] < 4 or
+                       192 <= f[0][43] <= 223]       # all STUN and RTCP
     diffs = decoder_differences(frames)
     assert not diffs, f"{len(diffs)} differences, e.g. " + \
         " | ".join(diffs[:4])
@@ -61583,7 +62255,7 @@ def t_fast_decoder_fuzz(ctx):
     if not ctx.scapy_ok:
         return "skip"
     rng = random.Random(5)
-    frames = ctx.frames()
+    frames = ctx.frames() + call_corpus().frames()[::60]   # 5.3.4 (MC8)
     for i in range(4000):
         raw = bytearray(frames[rng.randrange(len(frames))][0])
         for _ in range(rng.randint(1, 5)):
@@ -61734,6 +62406,271 @@ def t_fast_decoder_unusual_frames(ctx):
     assert fast_decode(both[11], 1.0)["proto"] == "ESP"
     assert fast_decode(both[14], 1.0)["length"] == len(both[14])
     assert fast_decode(declined[0], 1.0)["dport"] == 53
+
+
+# ---- 5.3.4 (MC8): call quality -----------------------------------------------
+def _call_model(ctx, frames, make_decoder=None):
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg(), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, frames, decoder=(make_decoder or fast_frame_decoder)(m))
+    return m
+
+
+def _call_decoders(ctx):
+    return [("fast", fast_frame_decoder)] + (
+        [("scapy", default_frame_decoder)] if ctx.scapy_ok else [])
+
+
+@self_test()
+def t_rtc_header_decoder(ctx):
+    """5.3.4 (MC8): STUN, RTP and RTCP headers are read, and what only
+    looks like one (QUIC, DTLS, lying lengths) is not."""
+    s = wire_rtc(stun_payload(0x0001))
+    assert s == {"kind": "STUN", "method": 1, "class": 0, "length": 0}, s
+    assert wire_rtc(stun_payload(0x0101, attrs=bytes(12)))["class"] == 2
+    assert wire_rtc(stun_payload(0x0111))["class"] == 3
+    assert wire_rtc(stun_payload(0x0003))["method"] == 3   # TURN Allocate
+    good = stun_payload(0x0001, attrs=bytes(8))
+    assert wire_rtc(good[:4] + b"\x21\x12\xa4\x43" + good[8:]) is None
+    assert wire_rtc(good[:24]) is None             # the length says 8
+    assert wire_rtc(struct.pack(">HH", 1, 6) + RTC_STUN_COOKIE +
+                    bytes(18)) is None             # not whole words
+    r = wire_rtc(rtp_payload(65535, 2 ** 32 - 1, 0xDEADBEEF, 111, 1,
+                             size=20))
+    assert r == {"kind": "RTP", "pt": 111, "marker": 1, "seq": 65535,
+                 "ts": 2 ** 32 - 1, "ssrc": 0xDEADBEEF,
+                 "header_len": 12}, r
+    assert wire_rtc(rtp_payload(1, 2, 3, csrc=2, ext=bytes(8), size=4))[
+        "header_len"] == 12 + 8 + 4 + 8
+    assert wire_rtc(rtp_payload(1, 2, 3, csrc=15, size=0)[:40]) is None
+    lie = bytearray(rtp_payload(1, 2, 3, ext=bytes(4), size=0))
+    lie[14:16] = b"\xff\xff"                       # extension too long
+    assert wire_rtc(bytes(lie)) is None
+    c = wire_rtc(rtcp_payload(200, 0x1111, words=6, count=1))
+    assert c == {"kind": "RTCP", "pt": 200, "count": 1, "length": 6,
+                 "ssrc": 0x1111}, c
+    assert wire_rtc(rtcp_payload(203, 5, words=1))["pt"] == 203
+    assert wire_rtc(rtcp_payload(200, 1, words=6)[:20]) is None
+    assert wire_rtc(rtcp_payload(195, 1, words=1)) is None
+    for load in (b"\xc3" + bytes(40), b"\x41" + bytes(40),
+                 b"\x16\xfe\xfd" + bytes(40), b"\x40\x00\x00\x10" +
+                 bytes(16), b"\x80\x00\x00", b"\x00\x01\x00\x00", b""):
+        assert wire_rtc(load) is None, load[:4]
+
+
+@self_test()
+def t_call_quality_matches_rfc3550(ctx):
+    """5.3.4 (MC8, the §1 target): on the synthetic call corpus, loss is
+    within ±0.5 points and jitter within ±10% of the test's own RFC 3550
+    reference (A.3, A.8), through both decoders. Every call is found, the
+    card says it, and without STUN nothing is measured."""
+    cs = call_corpus()
+    frames = cs.frames()
+    for name, mk in _call_decoders(ctx):
+        m = _call_model(ctx, frames, mk)
+        found = {s.key[4]: s for s in m.calls.streams.values()
+                 if s.is_call()}
+        assert set(found) == set(cs.truth), (name, sorted(found))
+        for ssrc, tr in cs.truth.items():
+            loss, jit, mean = rfc3550_reference(tr["pkts"], tr["rate"])
+            s = found[ssrc]
+            assert s.rate == tr["rate"], (name, hex(ssrc), s.rate)
+            assert abs(s.loss_pct() - loss) <= 0.5, (name, hex(ssrc),
+                                                    s.loss_pct(), loss)
+            for got, want in ((1000.0 * s.jitter, jit),
+                              (s.mean_jitter_ms(), mean)):
+                assert abs(got - want) <= max(0.1 * want, 0.01), \
+                    (name, hex(ssrc), got, want)
+        calls = m.calls.summary()
+        assert [c["kind"] for c in calls] == ["voice", "video", "voice",
+                                              "voice"], calls
+        assert all(c["evidence"] == "Observed" for c in calls)
+        pcmu = calls[-1]            # the incoming source's numbers only
+        loss, _j, mean = rfc3550_reference(cs.truth[0x1111]["pkts"], 8000)
+        assert pcmu["streams"] == 2 and pcmu["rtcp"] == 10, pcmu
+        assert abs(pcmu["loss_pct"] - loss) <= 0.5 and \
+            abs(pcmu["jitter_ms"] - mean) <= 0.1 * mean, pcmu
+        opus = calls[2]
+        loss, _j, mean = rfc3550_reference(cs.truth[0x3333]["pkts"], 48000)
+        assert loss > 3 and opus["jitter_ms"] > CALL_JITTER_OK_MS * 0.8
+        text = calls_card_text(m.calls)
+        assert text.startswith("Your voice call lost 0.0% of packets "
+                               "between "), text
+        assert ("lost %.1f%% of packets" % opus["loss_pct"]) in text
+        assert "And 1 more call." in text and "No calls" not in text
+        assert "can't be measured" in text, text
+    # the same calls with no STUN at all: not measured, and said so
+    m = _call_model(ctx, [f for f in frames if f[0][42] >= 4])
+    assert not m.calls.summary() and m.calls.unmeasured() == 4
+    text = calls_card_text(m.calls)
+    assert "No calls seen yet." in text and \
+        "4 connections looked like a call" in text, text
+
+
+@self_test()
+def t_call_quality_no_false_calls(ctx):
+    """5.3.4 (MC8, the §1 target): 0 calls on three kinds of UDP that are
+    not calls: name lookups, QUIC browsing, game-like traffic (with STUN
+    checks, and with RTP-shaped headers whose clock is not a media
+    clock)."""
+    for scen, frames in non_call_scenarios().items():
+        for name, mk in _call_decoders(ctx):
+            m = _call_model(ctx, frames, mk)
+            ct = m.calls
+            assert not ct.summary() and not ct.unmeasured(), (scen, name)
+            assert not ct.streams, (scen, name, list(ct.streams)[:3])
+            assert "No calls seen yet." in calls_card_text(ct)
+            if scen == "game":
+                assert ct.counts["RTP"] > 1000 and ct.counts["STUN"] == 4
+                assert len(ct.not_rtp) == 2, list(ct.not_rtp)
+
+
+@self_test()
+def t_call_quality_switch_and_hot_path(ctx):
+    """5.3.4 (MC8): with the switch off the call decoder is never called
+    and nothing is tracked; with it on, a frame that isn't UDP (or UDP
+    another decoder claims: DNS, DHCP, QUIC on 443…) never reaches it."""
+    g = globals()
+    orig = g["wire_rtc"]
+    seen = [0]
+
+    def counting(load):
+        seen[0] += 1
+        return orig(load)
+    old = FEATURES.get("call_quality", True)
+    calls = call_corpus().frames()[:600]
+    others = ctx.frames() + ScenarioBuilder().busy_mix(300) + [
+        f for f in non_call_scenarios()["QUIC browsing"][::5]
+        if 443 in struct.unpack(">HH", f[0][34:38])]
+    try:
+        g["wire_rtc"] = counting
+        FEATURES["call_quality"] = False
+        m = _call_model(ctx, calls)
+        assert seen[0] == 0 and not m.calls.counts, seen
+        for raw, ts, lt in calls[:50]:
+            assert "rtc" not in fast_decode(raw, ts, lt)
+            if ctx.scapy_ok:
+                assert "rtc" not in decode_packet(Ether(raw))
+        assert seen[0] == 0
+        FEATURES["call_quality"] = True
+        for raw, ts, lt in others:
+            d = fast_decode(raw, ts, lt)
+            if d["transport"] != "UDP" or d["proto"] != "UDP":
+                assert "rtc" not in d, d["proto"]
+        assert seen[0] == 0, f"{seen[0]} frames reached the call decoder"
+        m = _call_model(ctx, calls)
+        assert seen[0] == len(calls) and m.calls.counts["RTP"] > 500
+    finally:
+        g["wire_rtc"] = orig
+        FEATURES["call_quality"] = old
+
+
+@self_test()
+def t_call_tracker_rules_and_bounds(ctx):
+    """5.3.4 (MC8): RFC 3550 A.1 sequence rules (wrap, a restarted source,
+    duplicates), RTCP BYE, the 60 s host rule, and memory bounds when an
+    admitted 5-tuple sprays sources or a host sprays STUN."""
+    s = RtpStream(("a", 1, "b", 2, 9), 0.0, 65533, 0, True)
+    for i, seq in enumerate((65533, 65534, 65535, 0, 1, 1, 3)):
+        s.packet(i * 0.02, seq, i * 160)
+    assert s.cycles == 0x10000 and s.expected() == 6 and s.received == 6
+    assert s.lost() == 0                 # the duplicate fills the gap (A.3)
+    s.packet(1.0, 30000, 9000)                     # a jump: held as bad
+    assert s.max_seq == 3 and s.bad_seq == 30001
+    s.packet(1.02, 30001, 9160)                    # twice: a restart
+    assert s.base_seq == 30001 and s.received == 1 and s.cycles == 0
+    ct = CallTracker()
+
+    def feed(rtc, sip="192.168.1.10", sp=5000, dip="203.0.113.5", dp=3478,
+             ts=1000.0, inbound=False):
+        ct.feed({"rtc": rtc, "src_ip": sip, "dst_ip": dip, "sport": sp,
+                 "dport": dp, "time": ts}, inbound)
+    feed(wire_rtc(stun_payload(0x0001)), ts=1000.0)
+    for i in range(120):
+        feed(wire_rtc(rtp_payload(i, i * 160, 77)), ts=1000.1 + i * 0.02)
+    assert ct.summary() and ct.summary()[0]["streams"] == 1
+    feed(wire_rtc(rtcp_payload(203, 77, words=1)), ts=1003.0)
+    assert ct.summary()[0]["ended"]
+    # the host rule: STUN on another port, RTP within 60 s / after 60 s
+    feed(wire_rtc(rtp_payload(1, 160, 78)), sp=5002, ts=1050.0)
+    feed(wire_rtc(rtp_payload(1, 160, 79)), sp=5004, ts=1060.5)
+    assert ("192.168.1.10", 5002) in [k[0] for k in ct.stun_tuples]
+    assert not any(k[0] == ("192.168.1.10", 5004) for k in ct.stun_tuples)
+    rng = random.Random(3)
+    for i in range(5000):                          # sources sprayed
+        feed(wire_rtc(rtp_payload(i, i, rng.randrange(2 ** 32))),
+             ts=1004.0 + i * 0.001)
+        feed(wire_rtc(stun_payload(0x0001)), sp=10000 + i, ts=1004.0)
+        feed(wire_rtc(rtp_payload(i, i, 5)), dip="198.51.100.9",
+             sp=20000 + i, ts=1004.0)
+    assert len(ct.probation) <= CallTracker.MAX_PROBATION
+    assert len(ct.stun_tuples) <= CallTracker.MAX_TUPLES
+    assert len(ct.ungated) <= CallTracker.MAX_UNGATED
+    assert ct.summary() and ct.summary()[0]["streams"] == 1   # still there
+
+
+def _mutate_call_frame(rng, raw):
+    """S4 for the call decoder: bit flips, cuts, length-field lies (UDP,
+    STUN, RTCP, the CSRC count, the extension), steering bytes."""
+    b = bytearray(raw)
+    p = 42                                    # Ethernet + IPv4 + UDP
+    for _ in range(rng.randint(1, 4)):
+        op = rng.random()
+        n = len(b)
+        if op < 0.25 and n > p:
+            b[rng.randrange(p, n)] ^= 1 << rng.randrange(8)
+        elif op < 0.4 and n > p:
+            del b[rng.randrange(p, n):]
+        elif op < 0.5 and n >= p + 4:
+            b[p + 2:p + 4] = struct.pack(">H", rng.choice(
+                (0, 1, 4, 0xFFFF, rng.randrange(65536), (n - p) // 4)))
+        elif op < 0.6 and n > p:
+            b[p] = rng.choice((rng.randrange(4), 0x80 | rng.randrange(64),
+                               0x90 | rng.randrange(16)))
+        elif op < 0.7 and n > p + 1:
+            b[p + 1] = rng.choice((rng.randrange(192, 224),
+                                   rng.randrange(256)))
+        elif op < 0.8 and n > p + 15:
+            b[p + 14:p + 16] = struct.pack(">H", rng.randrange(65536))
+        elif op < 0.9 and n >= 40:
+            b[38:40] = struct.pack(">H", rng.randrange(65536))  # UDP len
+        else:
+            b.extend(bytes(rng.randrange(256) for _ in range(
+                rng.randint(1, 40))))
+    return bytes(b)
+
+
+@self_test(slow=True)
+def t_call_decoder_fuzz(ctx):
+    """5.3.4 (MC8, S4 and S12 for the new decoder): mutated call frames
+    never make wire_rtc, either decoder or the call tracker raise, none
+    takes over 50 ms, and both decoders agree on every field."""
+    rng = random.Random(1010)
+    frames = call_corpus().frames()
+    m = _call_model(ctx, frames[:4000])        # streams to be fed lies
+    slowest, mutated = 0.0, []
+    for i in range(12000):
+        raw, ts, lt = frames[rng.randrange(len(frames))]
+        b = _mutate_call_frame(rng, raw)
+        t0 = time.perf_counter()
+        r = wire_rtc(b[42:])
+        if r is not None and r["kind"] == "RTP":
+            assert r["header_len"] <= len(b) - 42, r
+        d = fast_decode(b, ts + 0.0001 * i, lt)
+        assert isinstance(d, dict) and "proto" in d
+        m.ingest(d)
+        slowest = max(slowest, time.perf_counter() - t0)
+        if i % 4 == 0:
+            mutated.append((b, ts, lt))
+    m.calls.summary()
+    calls_card_text(m.calls)
+    assert slowest < 0.050, f"one frame took {slowest * 1000:.0f} ms"
+    if ctx.scapy_ok:
+        diffs = decoder_differences(mutated)
+        assert not diffs, f"{len(diffs)} differences, e.g. " + \
+            " | ".join(diffs[:3])
 
 
 class _PipelineHarness:
@@ -73327,6 +74264,42 @@ def gt_534_baseline_state(app, ctx):
             m.baselines.devices.pop(plug.key, None)
         else:
             m.baselines.devices[plug.key] = saved
+
+
+@gui_test_step("5.3.4 M10: Calls card under Health — loss and jitter of "
+               "STUN-checked calls, in French too")
+def gt_534_calls_card(app, ctx):
+    root = app.root
+    hl = app._select_tab("health")
+    _gui_pump(root, 0.3)
+    assert hl.calls_var is not None and hl.calls_card.winfo_ismapped()
+    ct = CallTracker()
+    for raw, ts, lt in call_corpus().frames():
+        d = fast_decode(raw, ts, lt)
+        if "rtc" in d:
+            ct.feed(d, inbound=d["dst_ip"] == ScenarioBuilder.ME[0])
+    old = app.model.calls
+    try:
+        app.model.calls = CallTracker()
+        hl.refresh()
+        assert "No calls seen yet." in str(hl.calls_lbl.cget("text"))
+        app.model.calls = ct
+        hl.refresh()
+        text = str(hl.calls_lbl.cget("text"))
+        assert text == calls_card_text(ct), text
+        assert "Your video call lost" in text and "jitter" in text, text
+        assert "can't be measured" in text
+        fr = translate_text("Your video call lost %s of packets between %s "
+                            "and %s; jitter %d ms (usually fine below %d).",
+                            "fr")
+        assert fr.startswith("Votre appel vidéo a perdu"), fr
+        t0 = time.perf_counter()
+        hl.show_calls()
+        ms = (time.perf_counter() - t0) * 1000
+        assert ms < 50, f"the Calls card took {ms:.0f} ms"
+    finally:
+        app.model.calls = old
+        hl.refresh()
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
