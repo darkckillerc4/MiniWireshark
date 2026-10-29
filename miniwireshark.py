@@ -14776,7 +14776,23 @@ class AlertEngine:
         muted = self.config.get("alerts.muted_devices", []) or []
         expected = self.config.get("alerts.expected", []) or []
         return (f"{kind}|{device_key}" in muted or
-                f"{kind}|{subject}" in expected)
+                f"{kind}|{subject}" in expected or
+                self.snoozed_until(kind, device_key) > time.time())
+
+    def snoozed_until(self, kind, device_key=""):
+        """5.3.4 (IP-001): when a snooze of this alert type (for every
+        device, or for this one) ends; 0 when none. Snoozes run on the
+        wall clock and end by themselves, unlike a mute."""
+        sn = self.config.get("alerts.snoozed", {}) or {}
+        if not isinstance(sn, dict):
+            return 0.0
+        out = 0.0
+        for tag in (f"{kind}|*", f"{kind}|{device_key}" if device_key
+                    else None):
+            with contextlib.suppress(TypeError, ValueError):
+                if tag:
+                    out = max(out, float(sn.get(tag) or 0))
+        return out
 
     def _add(self, kind, severity, device_key, reason, observed, interp, poss,
              confidence=None, why=None, evidence=None, refs=None,
@@ -14832,7 +14848,9 @@ class AlertEngine:
     def _debounced(self, key, seconds):
         now = self.now()
         last = self._debounce.get(key)
-        if last is not None and now - last < seconds:
+        # 5.3.4 (CO-13): after the clock steps back, `now - last` is
+        # negative and the detection stayed silent for the whole step
+        if last is not None and 0 <= now - last < seconds:
             return True
         self._debounce[key] = now
         if len(self._debounce) > self.DEBOUNCE_KEEP:
@@ -15150,7 +15168,8 @@ class AlertEngine:
             subject=f"{dev_key}|{service}")
 
     def new_listener(self, dev_key, program, proto, port, scope):
-        if self._debounced(f"ls:{proto}:{port}:{scope}", 86400):
+        # 5.3.4 (CO-13): another program on the same port is news
+        if self._debounced(f"ls:{proto}:{port}:{scope}:{program}", 86400):
             return None
         net = scope == "the network"
         return self._add(
@@ -15807,7 +15826,16 @@ class ListenWatch:
                 rec["last"] = now
                 if prog and rec.get("program") != prog and \
                         "needs admin" not in prog:
+                    # 5.3.4 (CO-13): a different program took over a port
+                    # that was seen before: report it, don't just rename
+                    old = rec.get("program") or ""
                     rec["program"] = prog
+                    if old and "needs admin" not in old and \
+                            not self.learning and \
+                            re.sub(r" \(pid \d+\)$", "", old) != \
+                            re.sub(r" \(pid \d+\)$", "", prog):
+                        new.append((key, proto, ip, port, prog,
+                                    key.rsplit("/", 1)[1]))
         self.learning = False
         with contextlib.suppress(OSError):
             atomic_write_json(self.path, self.known)
@@ -20069,7 +20097,7 @@ def _default_config():
                    "broadcast_pps_threshold": 400,
                    "scan_ports_threshold": 60, "scan_hosts_threshold": 40,
                    "flag_http": False,
-                   "muted_devices": [], "expected": []},
+                   "muted_devices": [], "expected": [], "snoozed": {}},
         "notifications": {"feed_alerts": True, "danger_only": False},
         "performance": {"cpu_friendly_mode": False, "mode": "Automatic",
                         "full_power_cores": 2, "ram_cap_mb": 1536,
@@ -22894,6 +22922,13 @@ Getting started automatically — picking your best network card ¦ Démarrage a
 Running the built-in self-test ¦ Exécution de l'autotest intégré ¦ Ejecutando la autoprueba integrada
 Learned baselines reset. ¦ Habitudes apprises réinitialisées. ¦ Referencias aprendidas restablecidas.
 Running health checks ¦ Vérifications de santé en cours ¦ Ejecutando comprobaciones de salud
+%d held back (muted or snoozed) ¦ %d retenue(s) (muette(s) ou en pause) ¦ %d retenida(s) (silenciada(s) o pospuesta(s))
+Snooze ¦ Mettre en pause ¦ Posponer
+1 hour ¦ 1 heure ¦ 1 hora
+1 day ¦ 1 jour ¦ 1 día
+Snooze for 1 hour ¦ Mettre en pause 1 heure ¦ Posponer 1 hora
+Snooze for 1 day ¦ Mettre en pause 1 jour ¦ Posponer 1 día
+Until tomorrow ¦ Jusqu'à demain ¦ Hasta mañana
 Ready? ¦ Prêt ? ¦ ¿Listo?
 checking… ¦ vérification… ¦ comprobando…
 Python and window toolkit ¦ Python et boîte à outils graphique ¦ Python y kit de ventanas
@@ -33720,8 +33755,17 @@ class AlertsTab(BaseTab):
                           ("Go to related", self.goto_related),
                           ("Copy report", self.copy_report)):
             mm.add_command(label=label, command=fn)
+        snz = tk.Menu(mm, tearoff=False)            # 5.3.4 (IP-001)
+        for label, secs in MiniWireshark.SNOOZE_CHOICES:
+            snz.add_command(label=label, command=lambda s_=secs:
+                            self.snooze(s_))
+        mm.add_cascade(label="Snooze", menu=snz)
         more["menu"] = mm
         more.pack(side="right", padx=(4, 0))
+        # 5.3.4 (IP-001): what mute and snooze held back stays visible
+        self.held_var = tk.StringVar(value="")
+        self.lbl(bar, "", textvariable=self.held_var).pack(side="right",
+                                                           padx=(4, 0))
         for label, fn in (("Acknowledge", self.acknowledge),
                           ("Details", self._details)):
             ttk.Button(bar, text=label, command=fn).pack(side="right",
@@ -33805,7 +33849,10 @@ class AlertsTab(BaseTab):
                 "own": [("Acknowledge", self.acknowledge),
                         ("Mark expected", self.mark_expected),
                         ("Mute this alert type", self.mute_type),
-                        ("Mute for this device", self.mute_device), None,
+                        ("Mute for this device", self.mute_device),
+                        ("Snooze for 1 hour", lambda: self.snooze(3600)),
+                        ("Snooze for 1 day", lambda: self.snooze(86400)),
+                        None,
                         ("Go to related item", self.goto_related)]}
         if dev is not None:
             spec["packets"] = lambda: app.goto(
@@ -33874,6 +33921,10 @@ class AlertsTab(BaseTab):
             if self.review_btn.cget("text") != text:
                 self.review_btn.configure(text=text)
             self.review_btn.state(["!disabled"] if n else ["disabled"])
+            held = self.model.alerts.suppressed
+            self.held_var.set(translate_text("%d held back (muted or "
+                                             "snoozed)") % held
+                              if held else "")
 
     def rebuild(self):
         for _ in self.rebuild_steps():
@@ -33941,6 +33992,11 @@ class AlertsTab(BaseTab):
     def mute_device(self):
         for a in self.selected():
             self.app.alert_mute_device(a)
+            self.upsert(a)
+
+    def snooze(self, seconds):
+        for a in self.selected():
+            self.app.alert_snooze(a, seconds)
             self.upsert(a)
 
     def goto_related(self):
@@ -49044,6 +49100,33 @@ proc ::mw_retheme {w map fgnew deffg} {
             self.config.save()
             self._set_banner(f"\U0001F515  “{title}” alerts muted.")
 
+    SNOOZE_CHOICES = (("1 hour", 3600), ("1 day", 86400),
+                      ("Until tomorrow", None))
+
+    def alert_snooze(self, a, seconds, whole_type=False):
+        """5.3.4 (IP-001): quiet an alert type (for its device, or for
+        all) for a while. A DANGER alert is snoozed for a day at most, and
+        the Alerts tab keeps counting what was held back."""
+        now = time.time()
+        if seconds is None:              # until tomorrow (local midnight)
+            t = time.localtime(now + 86400)
+            seconds = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 0, 0,
+                                   0, 0, 0, -1)) - now
+        if a.severity == "DANGER":
+            seconds = min(seconds, 86400)
+        tag = f"{a.kind}|*" if whole_type or not a.device_key else \
+            f"{a.kind}|{a.device_key}"
+        sn = dict(self.config.get("alerts.snoozed", {}) or {})
+        sn = {k: v for k, v in sn.items()
+              if isinstance(v, (int, float)) and v > now}
+        sn[tag] = now + max(60.0, float(seconds))
+        self.config.set("alerts.snoozed", dict(list(sn.items())[-200:]))
+        self.config.save()
+        a.acknowledged = True
+        self._set_banner("\U0001F4A4  Snoozed until " + time.strftime(
+            "%a %H:%M", time.localtime(sn[tag])) + ". Held-back alerts "
+            "are still counted in the Alerts tab.")
+
     def alert_mute_device(self, a):
         if not a.device_key:
             self._set_banner("This alert isn't about one device; use "
@@ -60136,6 +60219,49 @@ def t_co01_co02_router_impersonation(ctx):
             if a.kind == "arp_spoof" and a.severity == "DANGER"]
     assert ATT[1] not in reg3.gw_macs, reg3.gw_macs
     assert reg3.ip_to_key.get(S.GW[0]) == S.GW[1].lower()
+
+
+@self_test()
+def t_ip001_snooze_and_co13_clock_step(ctx):
+    """5.3.4 (IP-001): a snoozed alert type stays quiet until the snooze
+    ends, then shows again; a DANGER snooze is a day at most; what was
+    held back is counted. (CO-13): a clock that steps back doesn't silence
+    debounced detections; another program on a known port is reported."""
+    cfg = ctx.cfg({})
+    clock = [1761600000.0]
+    eng = AlertEngine(cfg, now_fn=lambda: clock[0])
+    app = types.SimpleNamespace(config=cfg, _set_banner=lambda *a, **k: 0)
+    first = eng.arp_spoof("192.168.1.1", 2, 5, True)
+    assert first is not None and first.severity == "DANGER"
+    real_time = time.time
+    try:
+        time.time = lambda: clock[0]
+        MiniWireshark.alert_snooze(app, first, 7 * 86400, whole_type=True)
+        until = eng.snoozed_until("arp_spoof")
+        assert until - clock[0] == 86400, until - clock[0]   # capped
+        clock[0] += 3600
+        eng._debounce.clear()
+        assert eng.arp_spoof("192.168.1.1", 2, 5, True) is None
+        assert eng.suppressed == 1
+        clock[0] += 86400                         # the snooze is over
+        eng._debounce.clear()
+        again = eng.arp_spoof("192.168.1.1", 2, 5, True)
+        assert again is not None
+    finally:
+        time.time = real_time
+    # CO-13 (b): the clock steps back 3 hours; a new detection is not
+    # held back by the old timestamp
+    eng2 = AlertEngine(ctx.cfg({}), now_fn=lambda: clock[0])
+    assert not eng2._debounced("k", 120)
+    clock[0] -= 3 * 3600
+    assert not eng2._debounced("k", 120)
+    assert eng2._debounced("k", 120)
+    # CO-13 (a)
+    lw = ListenWatch(ctx.path("listening.json"))
+    lw.check({("TCP", "0.0.0.0", 8080): (10, "python")})
+    assert not lw.check({("TCP", "0.0.0.0", 8080): (11, "python")})
+    got = lw.check({("TCP", "0.0.0.0", 8080): (12, "nc")})
+    assert len(got) == 1 and "nc" in got[0][4], got
 
 
 @self_test()
