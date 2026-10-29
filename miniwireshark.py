@@ -11115,6 +11115,7 @@ FEATURES = {
     "unusual_section": True,  # Unusual activity in Security, Dashboard (M9)
     "own_blocklist": True,   # the user's own blocklist file (M9, IP-010)
     "login_warning": True,   # login sent without encryption (M9, IP-013)
+    "investigations_v2": True,   # five more guided investigations (M11)
 }
 
 
@@ -11298,6 +11299,10 @@ FEATURE_HELP = {
     "login_warning": "a warning when a password is sent without "
                      "encryption (Full Power only; the password itself is "
                      "never kept)",
+    "investigations_v2": "five more guided investigations (DNS, IPv6, a "
+                         "device that can't connect, Wi-Fi or the "
+                         "Internet, a call that stutters), each saying "
+                         "when it can't tell from here",
 }
 
 
@@ -19390,6 +19395,627 @@ def investigate_bandwidth(f):
     return out
 
 
+# ---- 5.3.4 (MC7): five more investigations -----------------------------------
+#  The same hypothesis board as investigate_slow: ranked explanations with
+#  the evidence for and against each, never a verdict. Each one reaches a
+#  cause only from what this computer overheard, and says "Can't tell from
+#  here", with the reason in plain words, when the evidence it needs is
+#  missing (a computer that can't see other devices' traffic, a call app
+#  that sends no STUN, a file without the packets). Passive only: none of
+#  them sends anything (t_investigations_passive_only checks that none of
+#  them calls the health check helpers or outbound()).
+INVESTIGATION_TITLES = {
+    "slow": "Why is my Internet slow?",
+    "bandwidth": "What is using my bandwidth?",
+    "dns": "Is my DNS working?",
+    "ipv6": "Is IPv6 working?",
+    "connect": "Why can't this device connect?",
+    "wifi_or_internet": "Is it my Wi-Fi or the Internet?",
+    "call": "Why does my call stutter?",
+}
+INVESTIGATIONS_V2 = ("dns", "ipv6", "connect", "wifi_or_internet", "call")
+MC7_TEMPLATES = set()      # every sentence the five used (the i18n test)
+
+
+def _t(tpl, *args):
+    """One sentence of an investigation in the current language: the
+    English template is looked up first, then filled in (names and
+    numbers are never translated)."""
+    MC7_TEMPLATES.add(tpl)
+    out = translate_text(tpl)
+    if not args:
+        return out
+    try:
+        return out % args
+    except (TypeError, ValueError):
+        LOG.debug("translation of %r does not fit its values", tpl)
+        return tpl % args
+
+
+def _board_finish(H, reasons=(), fix=""):
+    """Rank the board. When nothing reaches "Possible" at 0.5, "Can't tell
+    from here" leads, saying which evidence is missing."""
+    best = max((x["score"] for x in H if x["status"] in ("Likely",
+                                                         "Possible")),
+               default=0.0)
+    if best < 0.5:
+        H.append(_hyp("cant_tell", _t("Can't tell from here"), 0.49,
+                      "Can't tell", list(reasons) or [_t(
+                          "Nothing seen here explains it right now.")],
+                      fix=fix))
+    H.sort(key=lambda x: (-x["score"], -HYP_STATUS_ORDER[x["status"]]))
+    return H
+
+
+def _capture_drop_pct(coverage):
+    cov = coverage or {}
+    seen = (cov.get("received") or 0) + (cov.get("kernel_dropped") or 0)
+    lost = (cov.get("dropped_app") or 0) + (cov.get("kernel_dropped") or 0)
+    return lost / seen if seen else None
+
+
+# ---- "Is my DNS working?"
+def dns_facts(model, window=600, dns_slow_ms=800.0, offline=False):
+    m = model
+    now = m.now()
+    f = {"window": window, "dns_slow_ms": dns_slow_ms,
+         "vantage": m.vantage.classify(offline=offline)}
+    f["median_ms"], f["n"] = m.dns.median_latency(now, window)
+    f["fail_rate"], f["nq"] = m.dns.failure_rate(now, window)
+    f["encrypted_n"] = sum(m.dns.encrypted_seen.values())
+    dg = change_digest(m, since=now - window, until=now)
+    f["changes"] = [text for _w, _d, text in dg.get("dns_changes", ())][:3]
+    return f
+
+
+def investigate_dns(f):
+    """“Is my DNS working?” Failures and slow answers of the lookups that
+    were overheard, a DNS server change, and encrypted lookups (which
+    can't be timed)."""
+    H = []
+    n, nq = f.get("n") or 0, f.get("nq") or 0
+    fr, med = f.get("fail_rate") or 0.0, f.get("median_ms")
+    slow = f.get("dns_slow_ms") or 800.0
+    if nq >= 10:
+        line = _t("◉ %d%% of %d recent lookups got an error or no answer",
+                  round(fr * 100), nq)
+        if fr >= 0.2:
+            H.append(_hyp("failing", _t("Website lookups are failing"),
+                          0.85, "Likely", [line], fix=_t(
+                              "Restart the router. If it keeps happening, "
+                              "try another DNS server (in the router or "
+                              "this computer's settings).")))
+        elif fr >= 0.05:
+            H.append(_hyp("failing", _t("Some website lookups fail"), 0.4,
+                          "Possible", [line]))
+        else:
+            H.append(_hyp("failing", _t("Website lookups are failing"),
+                          0.05, "Unlikely", (), [line]))
+    if n >= 5 and med is not None:
+        if med >= slow:
+            H.append(_hyp("slow", _t("Website lookups are slow"), 0.8,
+                          "Likely", [_t("◉ A typical lookup took %d ms "
+                                        "(slow above %d ms)", round(med),
+                                        round(slow))],
+                          fix=_t("Restart the router, or try another DNS "
+                                 "server (in the router or this "
+                                 "computer's settings).")))
+        else:
+            line = _t("◉ A typical lookup took %d ms", round(med))
+            if med >= 250:
+                H.append(_hyp("slow", _t("Website lookups are slow"), 0.4,
+                              "Possible", [line]))
+            else:
+                H.append(_hyp("slow", _t("Website lookups are slow"), 0.05,
+                              "Unlikely", (), [line]))
+    trouble = any(x["status"] in ("Likely", "Possible") for x in H)
+    for text in (f.get("changes") or [])[:1]:
+        H.append(_hyp("changed", _t("A device switched to a different DNS "
+                                    "server"), 0.55 if trouble else 0.3,
+                      "Possible", ["◉ " + translate_text(text)] +
+                      ([_t("◎ The lookup trouble may have started with "
+                           "it")] if trouble else []),
+                      fix=_t("If you didn't change it, check the DNS "
+                             "setting in the router and in that device's "
+                             "network settings.")))
+    enc = f.get("encrypted_n") or 0
+    if enc:
+        H.append(_hyp("encrypted", _t("Some lookups are encrypted"), 0.1,
+                      "Can't tell", [_t("◉ %d connections looked like "
+                                        "encrypted lookups (DNS-over-HTTPS "
+                                        "or DNS-over-TLS)", enc)],
+                      [_t("○ Encrypted lookups can't be timed or checked "
+                          "from here")]))
+    if nq >= 10 and n >= 5 and not trouble:
+        H.append(_hyp("working", _t("DNS looks fine"), 0.6, "Likely",
+                      [_t("◉ %d lookups answered, typically in %d ms", n,
+                          round(med or 0))]))
+    reasons = []
+    if nq < 10 or n < 5:
+        if enc:
+            reasons.append(_t("Lookups here are encrypted (DNS-over-HTTPS "
+                              "or DNS-over-TLS), so they can't be timed or "
+                              "checked from here."))
+        if f.get("vantage") == "file":
+            reasons.append(_t("This file has too few name lookups (%d) to "
+                              "judge.", nq))
+        else:
+            reasons.append(_t("Too few name lookups were seen (%d) to "
+                              "judge.", nq))
+        if f.get("vantage") == "endpoint":
+            reasons.append(_t("Other devices' lookups aren't visible from "
+                              "this computer, only its own."))
+    return _board_finish(H, reasons, _t("Look again after browsing a few "
+                                        "websites."))
+
+
+# ---- "Is IPv6 working?"
+def ipv6_facts(model, window=900, offline=False):
+    m = model
+    now = m.now()
+    f = {"ra": bool(m.registry.ra_routers or m.v6_prefixes),
+         "vantage": m.vantage.classify(offline=offline)}
+    first = now
+    att = ok = fail = v4_ok = 0
+    b6 = b4 = 0
+    for x in m.flows.all_flows():
+        first = min(first, x.first_seen)
+        if not x.remote_public or now - x.last_seen > window:
+            continue
+        six = ":" in x.remote_ip
+        if six:
+            b6 += x.total_bytes
+        else:
+            b4 += x.total_bytes
+        if x.transport != "TCP" or not x.syn or x.initiator != "local":
+            continue
+        answered = x.synack or x.packets_in
+        if six:
+            att += 1
+            if answered:
+                ok += 1
+            elif now - (x.syn_ts or x.first_seen) >= 3.0:
+                fail += 1
+        elif answered:
+            v4_ok += 1
+    f.update({"v6_tries": att, "v6_ok": ok, "v6_fail": fail,
+              "v4_ok": v4_ok, "v6_share": b6 / (b6 + b4) if b6 + b4
+              else 0.0, "span": max(0.0, now - first)})
+    return f
+
+
+def investigate_ipv6(f):
+    """“Is IPv6 working?” The router's announcement, how much traffic went
+    over IPv6, and the broken-IPv6 pattern: IPv6 connections that get no
+    answer while IPv4 ones work (devices then fall back, often with a
+    delay)."""
+    H = []
+    att, ok, fail = f.get("v6_tries") or 0, f.get("v6_ok") or 0, \
+        f.get("v6_fail") or 0
+    v4 = f.get("v4_ok") or 0
+    lines = [_t("◉ %d of %d IPv6 connections got no answer", fail, att)]
+    if fail >= 3 and fail >= 0.5 * att and v4 >= 3:
+        H.append(_hyp("broken", _t("IPv6 is offered but doesn't work, so "
+                                   "devices fall back to IPv4"), 0.85,
+                      "Likely", lines + [_t("◉ %d IPv4 connections worked "
+                                            "meanwhile", v4)],
+                      fix=_t("Restart the router. If it keeps happening, "
+                             "turn IPv6 off in the router or ask your "
+                             "Internet provider; IPv4 keeps working "
+                             "meanwhile, sometimes with a short delay.")))
+    elif fail >= 2 and fail >= 0.3 * att:
+        H.append(_hyp("broken", _t("Some IPv6 connections fail"), 0.4,
+                      "Possible", lines))
+    if ok >= 3 and not any(x["status"] == "Likely" for x in H):
+        H.append(_hyp("working", _t("IPv6 is working"), 0.7, "Likely",
+                      [_t("◉ %d IPv6 connections opened normally", ok),
+                       _t("◉ %d%% of Internet traffic went over IPv6",
+                          round(100 * (f.get("v6_share") or 0)))]))
+    span = f.get("span") or 0
+    if not f.get("ra") and not att:
+        if span >= 600:
+            H.append(_hyp("not_offered", _t("Your network doesn't offer "
+                                            "IPv6 (common, and not a "
+                                            "problem)"), 0.6, "Likely",
+                          [_t("◉ No IPv6 router announcement in %d "
+                              "minutes", span // 60)],
+                          fix=_t("Nothing to fix: everything works over "
+                                 "IPv4. Your router or Internet provider "
+                                 "may offer IPv6 as an option.")))
+    elif f.get("ra") and not att:
+        H.append(_hyp("unused", _t("IPv6 is announced, but nothing used it "
+                                   "yet"), 0.3, "Possible",
+                      [_t("◉ The router announces IPv6")]))
+    reasons = []
+    if not f.get("ra") and not att and span < 600:
+        reasons.append(_t(
+            "This file has no IPv6 router announcement and no IPv6 "
+            "connections, and it is too short to tell that IPv6 is off.")
+            if f.get("vantage") == "file" else _t(
+            "No IPv6 router announcement was seen yet (routers send one "
+            "every few minutes) and no IPv6 traffic, so it can't be told "
+            "yet."))
+    return _board_finish(H, reasons, _t("Leave it watching for a few "
+                                        "minutes, then look again."))
+
+
+# ---- "Why can't this device connect?"
+def connect_default_key(model, window=900):
+    """The device the question is most likely about: the latest one whose
+    address request (DHCP) didn't end with an address, else this
+    computer."""
+    now = model.now()
+    for mac, ch in reversed(list(model.dhcp_chains.items())):
+        recent = [mt for ts, mt in ch if now - ts <= window]
+        if recent and 5 not in recent:
+            return model.registry.resolve(mac) or mac
+    return model.my_device_key()
+
+
+def connect_facts(model, key, window=900, offline=False, namer=None):
+    m = model
+    reg = m.registry
+    now = m.now()
+    key = (reg.resolve(key) or key) if key else ""
+    dev = reg.by_key.get(key)
+    mac = ((dev.mac if dev is not None else "") or
+           (key if re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}",
+                                str(key)) else "")).lower()
+    f = {"name": (namer or (lambda k: k))(key) if key else "",
+         "key": key, "window": window,
+         "is_me": bool(key and key == m.my_device_key()) or
+         mac in m.my_macs, "vantage": m.vantage.classify(offline=offline),
+         "seen": bool(dev is not None and now - dev.last_seen <= window),
+         "ip": dev.ip if dev is not None else ""}
+    cnt = Counter(mt for ts, mt in m.dhcp_chains.get(mac, ())
+                  if now - ts <= window)
+    f.update({"discover": cnt[1], "offer": cnt[2], "request": cnt[3],
+              "ack": cnt[5], "nak": cnt[6]})
+    asks = m.gw_arp_asks.get(mac) if mac else None
+    f["arp_asks"] = asks[2] if asks and now - asks[1] <= window else 0
+    rep = m.gw_arp_replies.get(mac) if mac else None
+    f["gw_replied"] = bool(rep and asks and rep >= asks[0])
+    f["router_heard"] = reg.router_answering(now)
+    # the router's answers to a device go to that device alone: they are
+    # visible here only if answers to other devices were seen too (a
+    # network-wide view, or a file captured at the router)
+    mine = set(m.my_macs) | {mac}
+    f["sees_answers"] = any(k and k not in mine for k in m.gw_arp_replies) \
+        or any(t in (2, 5, 6) for k, ch in m.dhcp_chains.items()
+               if k not in mine for _ts, t in ch)
+    tries = okn = 0
+    for x in m.flows.all_flows():
+        if key and x.device_key == key and x.remote_public and \
+                now - x.last_seen <= window:
+            tries += 1
+            okn += bool(x.packets_in)
+    f["internet_tries"], f["internet_ok"] = tries, okn
+    return f
+
+
+def investigate_connect(f):
+    """“Why can't this device connect?” The address request chain (DHCP
+    Discover, Offer, Request, Ack or Nak), whether the router answered its
+    ARP question, and whether its Internet connections got answers."""
+    H = []
+    mins = (f.get("window") or 900) // 60
+    visible = f.get("is_me") or f.get("sees_answers") or \
+        f.get("vantage") in ("mirror", "partial")
+    hidden_answer = _t("○ The router's answers may go only to that "
+                       "device, which this computer can't see")
+    asked = (f.get("discover") or 0) + (f.get("request") or 0)
+    offer, ack, nak = f.get("offer") or 0, f.get("ack") or 0, \
+        f.get("nak") or 0
+    if nak:
+        H.append(_hyp("dhcp_refused", _t("The router refused the address "
+                                         "it asked for"), 0.8, "Likely",
+                      [_t("◉ The address server said no (DHCP NAK) %d "
+                          "times", nak)],
+                      fix=_t("Turn the device's Wi-Fi off and on, or "
+                             "forget the network and join it again, so it "
+                             "asks for a fresh address.")))
+    if asked >= 2 and not offer and not ack:
+        line = _t("◉ It asked for an address %d times and got no offer",
+                  asked)
+        fix = _t("Restart the router (it hands out the addresses). If "
+                 "other devices still work, the router may have run out of "
+                 "addresses: restart it or remove old devices from its "
+                 "list.")
+        if visible:
+            H.append(_hyp("no_dhcp", _t("No address server answered, so it "
+                                        "has no address"), 0.85, "Likely",
+                          [line], fix=fix))
+        else:
+            H.append(_hyp("no_dhcp", _t("No address server answered, so it "
+                                        "has no address"), 0.4, "Possible",
+                          [line], [hidden_answer], fix=fix))
+    elif ack:
+        H.append(_hyp("no_dhcp", _t("It has no address"), 0.05, "Unlikely",
+                      (), [_t("◉ It got an address from the router (DHCP) "
+                              "%d times", ack)]))
+    elif offer and not f.get("request"):
+        H.append(_hyp("offer_ignored", _t("It was offered an address but "
+                                          "didn't take it"), 0.45,
+                      "Possible", [_t("◉ %d offers, and no request after "
+                                      "them", offer)],
+                      fix=_t("Forget the network on the device and join "
+                             "it again; check the Wi-Fi password.")))
+    asks = f.get("arp_asks") or 0
+    if asks >= 3 and not f.get("gw_replied"):
+        line = _t("◉ It asked for the router %d times and got no answer",
+                  asks)
+        if not f.get("router_heard"):
+            H.append(_hyp("router_silent", _t("The router isn't answering "
+                                              "on the home network"), 0.8,
+                          "Likely", [line, _t("◉ The router sent nothing "
+                                              "in the last 5 minutes")],
+                          fix=_t("Restart the router and check its power "
+                                 "and cables.")))
+        elif visible:
+            H.append(_hyp("router_ignores", _t("The router doesn't answer "
+                                               "this device"), 0.7,
+                          "Likely", [line, _t("◉ The router was answering "
+                                              "other devices meanwhile")],
+                          fix=_t("Check the router's settings for a "
+                                 "blocked-devices list or guest isolation, "
+                                 "then restart the device.")))
+        else:
+            H.append(_hyp("router_ignores", _t("The router doesn't answer "
+                                               "this device"), 0.35,
+                          "Possible", [line], [hidden_answer]))
+    elif asks and f.get("gw_replied"):
+        H.append(_hyp("router_silent", _t("The router doesn't answer"),
+                      0.05, "Unlikely", (), [_t("◉ The router answered "
+                                                "when it asked for it")]))
+    tries, okn = f.get("internet_tries") or 0, f.get("internet_ok") or 0
+    if okn:
+        H.append(_hyp("connected", _t("It is connected: it reached the "
+                                      "Internet"), 0.6, "Likely",
+                      [_t("◉ %d Internet connections got an answer in the "
+                          "last %d minutes", okn, mins)],
+                      fix=_t("If one app or website still fails, the "
+                             "trouble is that app or website, not the "
+                             "connection.")))
+    elif tries >= 3 and visible:
+        H.append(_hyp("beyond", _t("It has an address, but its Internet "
+                                   "connections get no answer"), 0.55,
+                      "Possible", [_t("◉ %d Internet connections got no "
+                                      "answer", tries)],
+                      fix=_t("Restart the router. If other devices work, "
+                             "check the device's date and time and its "
+                             "VPN or proxy settings.")))
+    reasons = []
+    if not (asked or offer or ack or nak or asks or tries or f.get("seen")):
+        reasons.append(_t("Nothing from this device was seen in the last "
+                          "%d minutes: it may be out of range, on another "
+                          "network, or not trying to connect.", mins))
+    if not visible:
+        reasons.append(_t("From this computer, only that device's "
+                          "broadcasts are visible, not the router's "
+                          "answers to it (they go straight to the "
+                          "device)."))
+    return _board_finish(H, reasons, _t(
+        "Try connecting the device again while this window is open, then "
+        "look again. The router's own list of devices shows more."))
+
+
+# ---- "Is it my Wi-Fi or the Internet?"
+def wifi_internet_facts(model, wifi=None, wifi_hidden="", window=900,
+                        offline=False):
+    m = model
+    now = m.now()
+    lan = [(r * 1000.0, ip) for t, r, ip in m.lan_rtt_samples
+           if now - t <= window and r is not None]
+    gw = [ms for ms, ip in lan if ip == m.gateway_ip]
+    use = gw if len(gw) >= 3 else [ms for ms, _ip in lan]
+    f = {"lan_ms": statistics.median(use) if use else None,
+         "lan_n": len(use), "lan_gw": len(gw) >= 3, "wifi": wifi,
+         "wifi_hidden": wifi_hidden, "wired": bool(m.switch_summary(now)),
+         "vantage": m.vantage.classify(offline=offline)}
+    f["wan_ms"], _p90, f["wan_n"] = m.rtt_stats(now, window)
+    return f
+
+
+def investigate_wifi_internet(f):
+    """“Is it my Wi-Fi or the Internet?” How long connections take to open
+    inside the home (to the router when there are enough) against how
+    long they take to Internet sites, both overheard, plus the Wi-Fi
+    signal when Windows lets it be read (BF-002)."""
+    H = []
+    lan_ms, lan_n = f.get("lan_ms"), f.get("lan_n") or 0
+    wan_ms, wan_n = f.get("wan_ms"), f.get("wan_n") or 0
+    w = f.get("wifi") or {}
+    r = w.get("rssi")
+    fix = _t("Move closer to the router or use a cable; if it is just as "
+             "slow on a cable, restart the router.")
+    weak = [_t("◉ Wi-Fi signal %d dBm (weak)", round(r))] \
+        if r is not None and r < -67 else []
+    if lan_n >= 3 and lan_ms is not None:
+        line = _t("◉ Connections to your router open in %d ms",
+                  round(lan_ms)) if f.get("lan_gw") else _t(
+            "◉ Connections to other devices at home open in %d ms",
+            round(lan_ms))
+        if lan_ms >= 30:
+            H.append(_hyp("home", _t("Your Wi-Fi or home network"), 0.8,
+                          "Likely", [line] + weak, fix=fix))
+        elif lan_ms >= 10:
+            H.append(_hyp("home", _t("Your Wi-Fi or home network"), 0.45,
+                          "Possible", [line] + weak, fix=fix))
+        else:
+            H.append(_hyp("home", _t("Your Wi-Fi or home network"), 0.05,
+                          "Unlikely", (), [line]))
+    elif r is not None:
+        if r < -75:
+            H.append(_hyp("home", _t("Your Wi-Fi or home network"), 0.75,
+                          "Likely", weak, fix=fix))
+        elif r < -67:
+            H.append(_hyp("home", _t("Your Wi-Fi or home network"), 0.45,
+                          "Possible", weak, fix=fix))
+        else:
+            H.append(_hyp("home", _t("Your Wi-Fi or home network"), 0.1,
+                          "Unlikely", (), [_t("◉ Wi-Fi signal %d dBm "
+                                              "(good)", round(r))]))
+    elif f.get("wired"):
+        H.append(_hyp("home", _t("Your Wi-Fi or home network"), 0.05,
+                      "Unlikely", (), [_t("◉ This computer uses a cable")]))
+    home_ok = any(x["key"] == "home" and x["status"] == "Unlikely"
+                  for x in H)
+    home_bad = any(x["key"] == "home" and x["status"] in ("Likely",
+                                                          "Possible")
+                   for x in H)
+    if wan_n >= 5 and wan_ms is not None:
+        extra = wan_ms - (lan_ms or 0.0)
+        line = _t("◉ Connections to Internet sites open in %d ms",
+                  round(wan_ms))
+        ifix = _t("Test again at another time; if it stays slow, contact "
+                  "your Internet provider.")
+        if extra >= 150 and home_ok:
+            H.append(_hyp("internet", _t("The Internet side (beyond your "
+                                         "router)"), 0.8, "Likely",
+                          [line, _t("◎ The home part is fast, so the delay "
+                                    "is further away")], fix=ifix))
+        elif extra >= 150:
+            H.append(_hyp("internet", _t("The Internet side (beyond your "
+                                         "router)"), 0.45 if not home_bad
+                          else 0.35, "Possible", [line],
+                          [_t("○ The home part couldn't be ruled out")],
+                          fix=ifix))
+        elif extra >= 80:
+            H.append(_hyp("internet", _t("The Internet side (beyond your "
+                                         "router)"), 0.3, "Possible",
+                          [line], fix=ifix))
+        else:
+            H.append(_hyp("internet", _t("The Internet side (beyond your "
+                                         "router)"), 0.05, "Unlikely", (),
+                          [line]))
+    reasons = []
+    if not any(x["key"] == "home" for x in H):
+        reasons.append(_t("No connections to your router or other home "
+                          "devices were timed, so the home part can't be "
+                          "measured."))
+        if f.get("wifi_hidden"):
+            reasons.append(translate_text(f["wifi_hidden"]))
+    if wan_n < 5:
+        reasons.append(_t("Too few Internet connections were timed (%d) to "
+                          "measure the Internet side.", wan_n))
+    return _board_finish(H, reasons, _t(
+        "While it's slow, open your router's page in a browser (that times "
+        "the home part), then look again."))
+
+
+# ---- "Why does my call stutter?" (uses MC8's call quality)
+def call_facts(model, wifi=None, coverage=None, offline=False):
+    tr = model.calls
+    on = FEATURES.get("call_quality", True)
+    return {"calls": tr.summary()[:5] if on else [],
+            "unmeasured": tr.unmeasured() if on else 0, "measuring": on,
+            "wifi": wifi, "wired": bool(model.switch_summary()),
+            "capture_drop_pct": _capture_drop_pct(coverage),
+            "vantage": model.vantage.classify(offline=offline)}
+
+
+def investigate_call(f):
+    """“Why does my call stutter?” Loss and jitter of the worst recent call
+    (RTP headers of a STUN-checked call, Observed), with what limits them:
+    the capture's own drops, streams seen only on the way out, a call app
+    that sends no STUN, a call on another device."""
+    H = []
+    calls = f.get("calls") or []
+    reasons = []
+    if calls:
+        c = max(calls, key=lambda c: (c["loss_pct"] / 3.0 + c["jitter_ms"] /
+                                      float(CALL_JITTER_OK_MS), c["last"]))
+        lp, jm = c["loss_pct"], c["jitter_ms"]
+        a, b = hm_clock(c["first"]), hm_clock(c["last"])
+        loss_line = _t("◉ Your video call (%s to %s) lost %s of the packets "
+                       "coming in", a, b, f"{lp:.1f}%") \
+            if c["kind"] == "video" else _t(
+            "◉ Your voice call (%s to %s) lost %s of the packets coming "
+            "in", a, b, f"{lp:.1f}%")
+        jit_line = _t("◉ Jitter %d ms (usually fine below %d)", round(jm),
+                      CALL_JITTER_OK_MS)
+        inbound = c.get("inbound", True)
+        cd = f.get("capture_drop_pct")
+        lfix = _t("Move closer to the router or use a cable. If it is the "
+                  "same on a cable, the loss is on the Internet side or at "
+                  "the other person's end.")
+        if not inbound:
+            H.append(_hyp("loss", _t("Packets lost on the way"), 0.15,
+                          "Can't tell", (),
+                          [_t("○ Only what this computer sent was seen; "
+                              "packets lost after they left can't be "
+                              "counted here")]))
+        elif cd is not None and cd >= 0.01:
+            H.append(_hyp("loss", _t("Packets lost on the way"), 0.2,
+                          "Can't tell", [loss_line],
+                          [_t("◉ This capture itself missed %s of the "
+                              "packets (the computer was too busy), so the "
+                              "loss can't be trusted", f"{cd:.1%}")],
+                          fix=_t("Close heavy programs, or pick “Low CPU” "
+                                 "in Settings → Performance, and look "
+                                 "again during the call.")))
+        elif lp >= 3.0:
+            H.append(_hyp("loss", _t("Packets lost on the way"), 0.8,
+                          "Likely", [loss_line], fix=lfix))
+        elif lp >= CALL_LOSS_OK_PCT:
+            H.append(_hyp("loss", _t("Packets lost on the way"), 0.45,
+                          "Possible", [loss_line], fix=lfix))
+        else:
+            H.append(_hyp("loss", _t("Packets lost on the way"), 0.05,
+                          "Unlikely", (), [loss_line]))
+        jfix = _t("Pause downloads, streaming and backups during calls, "
+                  "and move closer to the router or use a cable.")
+        if inbound and jm >= CALL_JITTER_OK_MS:
+            H.append(_hyp("jitter", _t("Packets arrive unevenly (jitter)"),
+                          0.75, "Likely", [jit_line], fix=jfix))
+        elif inbound and jm >= 20:
+            H.append(_hyp("jitter", _t("Packets arrive unevenly (jitter)"),
+                          0.4, "Possible", [jit_line], fix=jfix))
+        elif inbound:
+            H.append(_hyp("jitter", _t("Packets arrive unevenly (jitter)"),
+                          0.05, "Unlikely", (), [jit_line]))
+        bad = any(x["status"] in ("Likely", "Possible") for x in H)
+        r = (f.get("wifi") or {}).get("rssi")
+        if bad and r is not None and r < -67:
+            H.append(_hyp("wifi", _t("Weak Wi-Fi on this computer"), 0.55,
+                          "Possible", [_t("◉ Wi-Fi signal %d dBm (weak)",
+                                          round(r))],
+                          fix=_t("Move closer to the router, or use 5 GHz "
+                                 "or a cable for calls.")))
+        if not inbound:
+            reasons.append(_t("Only the packets this computer sent were "
+                              "seen, so loss on the way can't be counted "
+                              "here."))
+        elif not bad:
+            reasons.append(_t(
+                "The call's packets arrived complete and on time, so the "
+                "stutter isn't visible here: it may come from the other "
+                "person's connection, the call app or the computer "
+                "itself."))
+    else:
+        n = f.get("unmeasured") or 0
+        if not f.get("measuring", True):
+            reasons.append(_t("Call measuring is turned off."))
+        if n:
+            reasons.append(_t("%d connections looked like a call, but the "
+                              "call app sent no connection check (STUN), "
+                              "so they can't be measured.", n))
+        if f.get("vantage") == "endpoint":
+            reasons.append(_t("A call on another device (a phone, a TV) "
+                              "isn't visible from this computer."))
+        if not reasons:
+            reasons.append(_t("No call was seen. Look again during a "
+                              "call."))
+    return _board_finish(H, reasons, _t("Look again during the call, on the "
+                                        "computer that makes it."))
+
+
+INVESTIGATORS = {"dns": investigate_dns, "ipv6": investigate_ipv6,
+                 "connect": investigate_connect,
+                 "wifi_or_internet": investigate_wifi_internet,
+                 "call": investigate_call}
+
+
 
 # ============================================================================
 #  13.  NetworkModel — the single analysis core
@@ -19750,6 +20376,7 @@ class CallTracker:
                 "peak_jitter_ms": 1000.0 * max(s.peak_jitter for s in meas),
                 "ended": all(s.ended for s in ss),
                 "rtcp": self.rtcp.get(tup, 0),
+                "inbound": any(s.inbound for s in ss),
                 "worst": worst, "evidence": "Observed"})
         out.sort(key=lambda c: -c["last"])
         return out
@@ -19865,6 +20492,11 @@ class NetworkModel:
         self.reported = {}           # helper name → what it reported
         self.flow_starts = OrderedDict()   # (device, remote) → start times
         self.rtt_samples = deque(maxlen=2000)  # (ts, rtt, remote, dev, fid)
+        # 5.3.4 (MC7): passive evidence the investigations read, bounded
+        self.lan_rtt_samples = deque(maxlen=500)   # (ts, rtt, remote ip)
+        self.dhcp_chains = OrderedDict()   # client MAC → deque (ts, type)
+        self.gw_arp_asks = OrderedDict()   # MAC → [first, last, count]
+        self.gw_arp_replies = OrderedDict()   # to MAC → last reply ts
         self.obs_by_subject = {}
         self.obs_sink = False          # a history store wants observations
         self.obs_pending = []
@@ -20415,6 +21047,28 @@ class NetworkModel:
         if f.remote_public:
             self.rtt_samples.append((ts, f.rtt, f.remote_ip, f.device_key,
                                      f.fid))
+        elif f.lan and FEATURES.get("investigations_v2", True):
+            self.lan_rtt_samples.append((ts, f.rtt, f.remote_ip))
+
+    @staticmethod
+    def _bounded_put(od, key, value, n=512):
+        od[key] = value
+        od.move_to_end(key)
+        while len(od) > n:
+            od.popitem(last=False)
+
+    def _note_gw_arp(self, d, ts):
+        """5.3.4 (MC7): who asked for the router's address, and whom the
+        router answered (for "Why can't this device connect?")."""
+        if d["arp_op"] == 1 and d["dst_ip"] == self.gateway_ip and \
+                d["src_ip"] != self.gateway_ip:
+            mac = d["src_mac"].lower()
+            a = self.gw_arp_asks.get(mac)
+            self._bounded_put(self.gw_arp_asks, mac, [a[0], ts, a[2] + 1]
+                              if a else [ts, ts, 1])
+        elif d["arp_op"] == 2 and d["src_ip"] == self.gateway_ip:
+            self._bounded_put(self.gw_arp_replies,
+                              (d["dst_mac"] or "").lower(), ts)
 
     def rtt_stats(self, now=None, window=900):
         """Median / 90th percentile handshake round trip (ms) of recent
@@ -20475,6 +21129,9 @@ class NetworkModel:
         src_dev, dst_dev = self._observe_devices(d, src_local, dst_local,
                                                  direction, ts)
 
+        if d["arp_op"] and self.gateway_ip and d["src_mac"] and \
+                FEATURES.get("investigations_v2", True):
+            self._note_gw_arp(d, ts)
         if d["arp_op"] == 2 and src_ip and d["src_mac"]:
             self._observe_arp(src_ip, d["src_mac"], ts)
         elif d["arp_op"] == 1 and src_ip and src_ip == dst_ip and \
@@ -20704,6 +21361,13 @@ class NetworkModel:
         info = d["dhcp"]
         mt = info.get("msgtype")
         client_mac = info.get("client_mac") or d["src_mac"]
+        if mt and client_mac and FEATURES.get("investigations_v2", True):
+            cm = client_mac.lower()
+            ch = self.dhcp_chains.get(cm)
+            if ch is None:
+                ch = deque(maxlen=24)
+            ch.append((ts, mt))
+            self._bounded_put(self.dhcp_chains, cm, ch)
         if mt in (2, 5) and d["src_ip"]:
             server = info.get("server_id") or d["src_ip"]
             if mt in (2, 5):
@@ -26541,6 +27205,113 @@ a local name: names on your own network are never listed ¦ un nom local : les n
 not an address, a range or a domain name ¦ ni une adresse, ni une plage, ni un nom de domaine ¦ no es una dirección, un rango ni un nombre de dominio
 more than one entry on the line ¦ plus d'une entrée sur la ligne ¦ más de una entrada en la línea
 You put this on your own blocklist. ¦ Vous l'avez mis sur votre propre liste de blocage. ¦ Usted lo puso en su propia lista de bloqueo.
+Is my DNS working? ¦ Mon DNS fonctionne-t-il ? ¦ ¿Funciona mi DNS?
+Is IPv6 working? ¦ L'IPv6 fonctionne-t-il ? ¦ ¿Funciona IPv6?
+Why can't this device connect? ¦ Pourquoi cet appareil ne se connecte-t-il pas ? ¦ ¿Por qué no se conecta este dispositivo?
+Is it my Wi-Fi or the Internet? ¦ C'est mon Wi-Fi ou Internet ? ¦ ¿Es mi Wi-Fi o Internet?
+Why does my call stutter? ¦ Pourquoi mon appel saccade-t-il ? ¦ ¿Por qué se entrecorta mi llamada?
+More questions… ¦ Autres questions… ¦ Más preguntas…
+Device: ¦ Appareil : ¦ Dispositivo:
+Built only from what was overheard; nothing is sent to check. ¦ Établi uniquement à partir de ce qui a été entendu ; rien n'est envoyé pour vérifier. ¦ Basado solo en lo que se ha escuchado; no se envía nada para comprobar.
+Nothing seen here explains it right now. ¦ Rien de ce qui est visible ici ne l'explique pour l'instant. ¦ Nada de lo que se ve aquí lo explica por ahora.
+◉ %d%% of %d recent lookups got an error or no answer ¦ ◉ %d %% des %d recherches récentes ont reçu une erreur ou aucune réponse ¦ ◉ El %d %% de %d búsquedas recientes recibió un error o ninguna respuesta
+Website lookups are failing ¦ Les recherches de sites web échouent ¦ Las búsquedas de sitios web fallan
+Restart the router. If it keeps happening, try another DNS server (in the router or this computer's settings). ¦ Redémarrez le routeur. Si cela continue, essayez un autre serveur DNS (dans le routeur ou dans les réglages de cet ordinateur). ¦ Reinicie el router. Si sigue ocurriendo, pruebe otro servidor DNS (en el router o en los ajustes de este equipo).
+Some website lookups fail ¦ Certaines recherches de sites web échouent ¦ Algunas búsquedas de sitios web fallan
+◉ A typical lookup took %d ms (slow above %d ms) ¦ ◉ Une recherche habituelle a pris %d ms (lent au-delà de %d ms) ¦ ◉ Una búsqueda típica tardó %d ms (lento por encima de %d ms)
+Restart the router, or try another DNS server (in the router or this computer's settings). ¦ Redémarrez le routeur, ou essayez un autre serveur DNS (dans le routeur ou dans les réglages de cet ordinateur). ¦ Reinicie el router, o pruebe otro servidor DNS (en el router o en los ajustes de este equipo).
+◉ A typical lookup took %d ms ¦ ◉ Une recherche habituelle a pris %d ms ¦ ◉ Una búsqueda típica tardó %d ms
+A device switched to a different DNS server ¦ Un appareil est passé à un autre serveur DNS ¦ Un dispositivo cambió a otro servidor DNS
+◎ The lookup trouble may have started with it ¦ ◎ Les problèmes de recherche ont pu commencer avec ce changement ¦ ◎ Los problemas de búsqueda pueden haber empezado con ese cambio
+If you didn't change it, check the DNS setting in the router and in that device's network settings. ¦ Si vous ne l'avez pas changé, vérifiez le réglage DNS du routeur et les réglages réseau de cet appareil. ¦ Si no lo cambió usted, revise el ajuste de DNS del router y los ajustes de red de ese dispositivo.
+Some lookups are encrypted ¦ Certaines recherches sont chiffrées ¦ Algunas búsquedas están cifradas
+◉ %d connections looked like encrypted lookups (DNS-over-HTTPS or DNS-over-TLS) ¦ ◉ %d connexions ressemblaient à des recherches chiffrées (DNS-over-HTTPS ou DNS-over-TLS) ¦ ◉ %d conexiones parecían búsquedas cifradas (DNS-over-HTTPS o DNS-over-TLS)
+○ Encrypted lookups can't be timed or checked from here ¦ ○ Les recherches chiffrées ne peuvent être ni chronométrées ni vérifiées d'ici ¦ ○ Las búsquedas cifradas no se pueden cronometrar ni comprobar desde aquí
+DNS looks fine ¦ Le DNS a l'air de bien fonctionner ¦ El DNS parece funcionar bien
+◉ %d lookups answered, typically in %d ms ¦ ◉ %d recherches ont reçu une réponse, d'habitude en %d ms ¦ ◉ %d búsquedas recibieron respuesta, normalmente en %d ms
+Lookups here are encrypted (DNS-over-HTTPS or DNS-over-TLS), so they can't be timed or checked from here. ¦ Les recherches sont ici chiffrées (DNS-over-HTTPS ou DNS-over-TLS) : elles ne peuvent être ni chronométrées ni vérifiées d'ici. ¦ Aquí las búsquedas están cifradas (DNS-over-HTTPS o DNS-over-TLS), así que no se pueden cronometrar ni comprobar desde aquí.
+This file has too few name lookups (%d) to judge. ¦ Ce fichier contient trop peu de recherches de noms (%d) pour juger. ¦ Este archivo tiene demasiado pocas búsquedas de nombres (%d) para juzgar.
+Too few name lookups were seen (%d) to judge. ¦ Trop peu de recherches de noms ont été vues (%d) pour juger. ¦ Se vieron demasiado pocas búsquedas de nombres (%d) para juzgar.
+Other devices' lookups aren't visible from this computer, only its own. ¦ Les recherches des autres appareils ne sont pas visibles depuis cet ordinateur, seulement les siennes. ¦ Las búsquedas de otros dispositivos no se ven desde este equipo, solo las suyas.
+Look again after browsing a few websites. ¦ Regardez de nouveau après avoir visité quelques sites web. ¦ Vuelva a mirar después de visitar algunos sitios web.
+◉ %d of %d IPv6 connections got no answer ¦ ◉ %d connexions IPv6 sur %d n'ont reçu aucune réponse ¦ ◉ %d de %d conexiones IPv6 no recibieron respuesta
+IPv6 is offered but doesn't work, so devices fall back to IPv4 ¦ L'IPv6 est proposé mais ne fonctionne pas : les appareils se rabattent sur l'IPv4 ¦ IPv6 se ofrece pero no funciona, así que los dispositivos vuelven a IPv4
+◉ %d IPv4 connections worked meanwhile ¦ ◉ %d connexions IPv4 ont fonctionné pendant ce temps ¦ ◉ %d conexiones IPv4 funcionaron mientras tanto
+Restart the router. If it keeps happening, turn IPv6 off in the router or ask your Internet provider; IPv4 keeps working meanwhile, sometimes with a short delay. ¦ Redémarrez le routeur. Si cela continue, désactivez l'IPv6 dans le routeur ou demandez à votre fournisseur d'accès ; l'IPv4 continue de fonctionner en attendant, parfois avec un court délai. ¦ Reinicie el router. Si sigue ocurriendo, desactive IPv6 en el router o consulte a su proveedor de Internet; mientras tanto IPv4 sigue funcionando, a veces con un pequeño retraso.
+Some IPv6 connections fail ¦ Certaines connexions IPv6 échouent ¦ Algunas conexiones IPv6 fallan
+IPv6 is working ¦ L'IPv6 fonctionne ¦ IPv6 funciona
+◉ %d IPv6 connections opened normally ¦ ◉ %d connexions IPv6 se sont ouvertes normalement ¦ ◉ %d conexiones IPv6 se abrieron con normalidad
+◉ %d%% of Internet traffic went over IPv6 ¦ ◉ %d %% du trafic Internet est passé par l'IPv6 ¦ ◉ El %d %% del tráfico de Internet fue por IPv6
+Your network doesn't offer IPv6 (common, and not a problem) ¦ Votre réseau ne propose pas l'IPv6 (c'est courant, et sans problème) ¦ Su red no ofrece IPv6 (es habitual, y no es un problema)
+◉ No IPv6 router announcement in %d minutes ¦ ◉ Aucune annonce de routeur IPv6 en %d minutes ¦ ◉ Ningún anuncio de router IPv6 en %d minutos
+Nothing to fix: everything works over IPv4. Your router or Internet provider may offer IPv6 as an option. ¦ Rien à corriger : tout fonctionne en IPv4. Votre routeur ou votre fournisseur d'accès propose peut-être l'IPv6 en option. ¦ No hay nada que arreglar: todo funciona por IPv4. Su router o su proveedor de Internet quizá ofrezca IPv6 como opción.
+IPv6 is announced, but nothing used it yet ¦ L'IPv6 est annoncé, mais rien ne l'a encore utilisé ¦ IPv6 está anunciado, pero nada lo ha usado todavía
+◉ The router announces IPv6 ¦ ◉ Le routeur annonce l'IPv6 ¦ ◉ El router anuncia IPv6
+This file has no IPv6 router announcement and no IPv6 connections, and it is too short to tell that IPv6 is off. ¦ Ce fichier ne contient ni annonce de routeur IPv6 ni connexion IPv6, et il est trop court pour dire que l'IPv6 est désactivé. ¦ Este archivo no tiene ningún anuncio de router IPv6 ni conexiones IPv6, y es demasiado corto para saber si IPv6 está desactivado.
+No IPv6 router announcement was seen yet (routers send one every few minutes) and no IPv6 traffic, so it can't be told yet. ¦ Aucune annonce de routeur IPv6 n'a encore été vue (les routeurs en envoient une toutes les quelques minutes) et aucun trafic IPv6 : impossible de le dire pour l'instant. ¦ Todavía no se ha visto ningún anuncio de router IPv6 (los routers envían uno cada pocos minutos) ni tráfico IPv6, así que aún no se puede saber.
+Leave it watching for a few minutes, then look again. ¦ Laissez l'observation tourner quelques minutes, puis regardez de nuevo. ¦ Déjelo observando unos minutos y vuelva a mirar.
+○ The router's answers may go only to that device, which this computer can't see ¦ ○ Les réponses du routeur peuvent n'aller qu'à cet appareil, ce que cet ordinateur ne peut pas voir ¦ ○ Las respuestas del router pueden ir solo a ese dispositivo, y este equipo no las ve
+The router refused the address it asked for ¦ Le routeur a refusé l'adresse demandée ¦ El router rechazó la dirección que pidió
+◉ The address server said no (DHCP NAK) %d times ¦ ◉ Le serveur d'adresses a dit non (DHCP NAK) %d fois ¦ ◉ El servidor de direcciones dijo que no (DHCP NAK) %d veces
+Turn the device's Wi-Fi off and on, or forget the network and join it again, so it asks for a fresh address. ¦ Coupez puis rallumez le Wi-Fi de l'appareil, ou oubliez le réseau et reconnectez-vous, pour qu'il demande une nouvelle adresse. ¦ Apague y encienda el Wi-Fi del dispositivo, u olvide la red y vuelva a unirse, para que pida una dirección nueva.
+◉ It asked for an address %d times and got no offer ¦ ◉ Il a demandé une adresse %d fois sans recevoir d'offre ¦ ◉ Pidió una dirección %d veces y no recibió ninguna oferta
+Restart the router (it hands out the addresses). If other devices still work, the router may have run out of addresses: restart it or remove old devices from its list. ¦ Redémarrez le routeur (c'est lui qui distribue les adresses). Si les autres appareils fonctionnent encore, le routeur n'a peut-être plus d'adresses libres : redémarrez-le ou retirez d'anciens appareils de sa liste. ¦ Reinicie el router (es quien reparte las direcciones). Si los demás dispositivos siguen funcionando, puede que el router se haya quedado sin direcciones: reinícielo o quite dispositivos antiguos de su lista.
+No address server answered, so it has no address ¦ Aucun serveur d'adresses n'a répondu : il n'a donc pas d'adresse ¦ Ningún servidor de direcciones respondió, así que no tiene dirección
+It has no address ¦ Il n'a pas d'adresse ¦ No tiene dirección
+◉ It got an address from the router (DHCP) %d times ¦ ◉ Il a reçu une adresse du routeur (DHCP) %d fois ¦ ◉ Recibió una dirección del router (DHCP) %d veces
+It was offered an address but didn't take it ¦ Une adresse lui a été proposée mais il ne l'a pas prise ¦ Se le ofreció una dirección pero no la tomó
+◉ %d offers, and no request after them ¦ ◉ %d offres, et aucune demande ensuite ¦ ◉ %d ofertas, y ninguna petición después
+Forget the network on the device and join it again; check the Wi-Fi password. ¦ Oubliez le réseau sur l'appareil puis reconnectez-vous ; vérifiez le mot de passe Wi-Fi. ¦ Olvide la red en el dispositivo y vuelva a unirse; compruebe la contraseña del Wi-Fi.
+◉ It asked for the router %d times and got no answer ¦ ◉ Il a demandé le routeur %d fois sans réponse ¦ ◉ Preguntó por el router %d veces sin respuesta
+The router isn't answering on the home network ¦ Le routeur ne répond pas sur le réseau de la maison ¦ El router no responde en la red de casa
+◉ The router sent nothing in the last 5 minutes ¦ ◉ Le routeur n'a rien envoyé ces 5 dernières minutes ¦ ◉ El router no envió nada en los últimos 5 minutos
+Restart the router and check its power and cables. ¦ Redémarrez le routeur et vérifiez son alimentation et ses câbles. ¦ Reinicie el router y revise su alimentación y sus cables.
+The router doesn't answer this device ¦ Le routeur ne répond pas à cet appareil ¦ El router no responde a este dispositivo
+◉ The router was answering other devices meanwhile ¦ ◉ Le routeur répondait aux autres appareils pendant ce temps ¦ ◉ El router respondía a otros dispositivos mientras tanto
+Check the router's settings for a blocked-devices list or guest isolation, then restart the device. ¦ Cherchez dans les réglages du routeur une liste d'appareils bloqués ou une isolation des invités, puis redémarrez l'appareil. ¦ Busque en los ajustes del router una lista de dispositivos bloqueados o el aislamiento de invitados, y luego reinicie el dispositivo.
+The router doesn't answer ¦ Le routeur ne répond pas ¦ El router no responde
+◉ The router answered when it asked for it ¦ ◉ Le routeur a répondu quand il l'a demandé ¦ ◉ El router respondió cuando preguntó por él
+It is connected: it reached the Internet ¦ Il est connecté : il a atteint Internet ¦ Está conectado: llegó a Internet
+◉ %d Internet connections got an answer in the last %d minutes ¦ ◉ %d connexions Internet ont reçu une réponse ces %d dernières minutes ¦ ◉ %d conexiones a Internet recibieron respuesta en los últimos %d minutos
+If one app or website still fails, the trouble is that app or website, not the connection. ¦ Si une application ou un site échoue encore, le problème vient de cette application ou de ce site, pas de la connexion. ¦ Si una aplicación o un sitio web sigue fallando, el problema es esa aplicación o ese sitio, no la conexión.
+It has an address, but its Internet connections get no answer ¦ Il a une adresse, mais ses connexions Internet ne reçoivent aucune réponse ¦ Tiene dirección, pero sus conexiones a Internet no reciben respuesta
+◉ %d Internet connections got no answer ¦ ◉ %d connexions Internet n'ont reçu aucune réponse ¦ ◉ %d conexiones a Internet no recibieron respuesta
+Restart the router. If other devices work, check the device's date and time and its VPN or proxy settings. ¦ Redémarrez le routeur. Si les autres appareils fonctionnent, vérifiez la date et l'heure de l'appareil et ses réglages de VPN ou de proxy. ¦ Reinicie el router. Si los demás dispositivos funcionan, revise la fecha y la hora del dispositivo y sus ajustes de VPN o proxy.
+Nothing from this device was seen in the last %d minutes: it may be out of range, on another network, or not trying to connect. ¦ Rien n'a été vu de cet appareil ces %d dernières minutes : il est peut-être hors de portée, sur un autre réseau, ou il n'essaie pas de se connecter. ¦ No se vio nada de este dispositivo en los últimos %d minutos: puede estar fuera de alcance, en otra red o sin intentar conectarse.
+From this computer, only that device's broadcasts are visible, not the router's answers to it (they go straight to the device). ¦ Depuis cet ordinateur, seules les diffusions de cet appareil sont visibles, pas les réponses du routeur (elles vont directement à l'appareil). ¦ Desde este equipo solo se ven las difusiones de ese dispositivo, no las respuestas del router (van directamente al dispositivo).
+Try connecting the device again while this window is open, then look again. The router's own list of devices shows more. ¦ Essayez de reconnecter l'appareil pendant que cette fenêtre est ouverte, puis regardez de nouveau. La liste des appareils du routeur en montre davantage. ¦ Intente conectar el dispositivo de nuevo con esta ventana abierta y vuelva a mirar. La lista de dispositivos del propio router muestra más.
+Move closer to the router or use a cable; if it is just as slow on a cable, restart the router. ¦ Rapprochez-vous du routeur ou utilisez un câble ; si c'est aussi lent avec un câble, redémarrez le routeur. ¦ Acérquese al router o use un cable; si va igual de lento con cable, reinicie el router.
+◉ Wi-Fi signal %d dBm (weak) ¦ ◉ Signal Wi-Fi %d dBm (faible) ¦ ◉ Señal Wi-Fi %d dBm (débil)
+◉ Wi-Fi signal %d dBm (good) ¦ ◉ Signal Wi-Fi %d dBm (bon) ¦ ◉ Señal Wi-Fi %d dBm (buena)
+◉ Connections to your router open in %d ms ¦ ◉ Les connexions vers votre routeur s'ouvrent en %d ms ¦ ◉ Las conexiones con su router se abren en %d ms
+◉ Connections to other devices at home open in %d ms ¦ ◉ Les connexions vers les autres appareils de la maison s'ouvrent en %d ms ¦ ◉ Las conexiones con otros dispositivos de casa se abren en %d ms
+Your Wi-Fi or home network ¦ Votre Wi-Fi ou votre réseau domestique ¦ Su Wi-Fi o su red de casa
+◉ Connections to Internet sites open in %d ms ¦ ◉ Les connexions vers les sites Internet s'ouvrent en %d ms ¦ ◉ Las conexiones con sitios de Internet se abren en %d ms
+Test again at another time; if it stays slow, contact your Internet provider. ¦ Refaites le test à un autre moment ; si c'est toujours lent, contactez votre fournisseur d'accès. ¦ Vuelva a probar en otro momento; si sigue lento, contacte con su proveedor de Internet.
+The Internet side (beyond your router) ¦ Le côté Internet (au-delà de votre routeur) ¦ El lado de Internet (más allá de su router)
+◎ The home part is fast, so the delay is further away ¦ ◎ La partie maison est rapide : le délai vient de plus loin ¦ ◎ La parte de casa es rápida, así que el retraso está más lejos
+○ The home part couldn't be ruled out ¦ ○ La partie maison n'a pas pu être écartée ¦ ○ No se pudo descartar la parte de casa
+No connections to your router or other home devices were timed, so the home part can't be measured. ¦ Aucune connexion vers votre routeur ou d'autres appareils de la maison n'a été chronométrée : la partie maison ne peut pas être mesurée. ¦ No se cronometró ninguna conexión con su router u otros dispositivos de casa, así que la parte de casa no se puede medir.
+Too few Internet connections were timed (%d) to measure the Internet side. ¦ Trop peu de connexions Internet ont été chronométrées (%d) pour mesurer le côté Internet. ¦ Se cronometraron demasiado pocas conexiones a Internet (%d) para medir el lado de Internet.
+While it's slow, open your router's page in a browser (that times the home part), then look again. ¦ Pendant que c'est lent, ouvrez la page de votre routeur dans un navigateur (cela chronomètre la partie maison), puis regardez de nouveau. ¦ Mientras vaya lento, abra la página de su router en un navegador (así se cronometra la parte de casa) y vuelva a mirar.
+◉ Your video call (%s to %s) lost %s of the packets coming in ¦ ◉ Votre appel vidéo (%s à %s) a perdu %s des paquets entrants ¦ ◉ Su videollamada (de %s a %s) perdió el %s de los paquetes entrantes
+◉ Your voice call (%s to %s) lost %s of the packets coming in ¦ ◉ Votre appel audio (%s à %s) a perdu %s des paquets entrants ¦ ◉ Su llamada de voz (de %s a %s) perdió el %s de los paquetes entrantes
+◉ Jitter %d ms (usually fine below %d) ¦ ◉ Gigue %d ms (en général sans souci sous %d) ¦ ◉ Fluctuación %d ms (suele ir bien por debajo de %d)
+Move closer to the router or use a cable. If it is the same on a cable, the loss is on the Internet side or at the other person's end. ¦ Rapprochez-vous du routeur ou utilisez un câble. Si c'est pareil avec un câble, la perte vient du côté Internet ou de chez votre correspondant. ¦ Acérquese al router o use un cable. Si con cable pasa lo mismo, la pérdida está en el lado de Internet o en el extremo de la otra persona.
+Packets lost on the way ¦ Paquets perdus en route ¦ Paquetes perdidos por el camino
+○ Only what this computer sent was seen; packets lost after they left can't be counted here ¦ ○ Seul ce que cet ordinateur a envoyé a été vu ; les paquets perdus après leur départ ne peuvent pas être comptés ici ¦ ○ Solo se vio lo que envió este equipo; los paquetes perdidos después de salir no se pueden contar aquí
+◉ This capture itself missed %s of the packets (the computer was too busy), so the loss can't be trusted ¦ ◉ Cette capture a elle-même manqué %s des paquets (l'ordinateur était trop occupé) : la perte n'est donc pas fiable ¦ ◉ Esta captura se perdió el %s de los paquetes (el equipo estaba demasiado ocupado), así que la pérdida no es fiable
+Close heavy programs, or pick “Low CPU” in Settings → Performance, and look again during the call. ¦ Fermez les programmes lourds, ou choisissez « Économie de processeur » dans Paramètres → Performances, puis regardez de nouveau pendant l'appel. ¦ Cierre los programas pesados, o elija «Bajo consumo de CPU» en Ajustes → Rendimiento, y vuelva a mirar durante la llamada.
+Pause downloads, streaming and backups during calls, and move closer to the router or use a cable. ¦ Mettez en pause téléchargements, streaming et sauvegardes pendant les appels, et rapprochez-vous du routeur ou utilisez un câble. ¦ Pause las descargas, el streaming y las copias de seguridad durante las llamadas, y acérquese al router o use un cable.
+Packets arrive unevenly (jitter) ¦ Les paquets arrivent de façon irrégulière (gigue) ¦ Los paquetes llegan de forma irregular (fluctuación)
+Move closer to the router, or use 5 GHz or a cable for calls. ¦ Rapprochez-vous du routeur, ou utilisez le 5 GHz ou un câble pour les appels. ¦ Acérquese al router, o use 5 GHz o un cable para las llamadas.
+Only the packets this computer sent were seen, so loss on the way can't be counted here. ¦ Seuls les paquets envoyés par cet ordinateur ont été vus : la perte en route ne peut pas être comptée ici. ¦ Solo se vieron los paquetes que envió este equipo, así que la pérdida por el camino no se puede contar aquí.
+The call's packets arrived complete and on time, so the stutter isn't visible here: it may come from the other person's connection, the call app or the computer itself. ¦ Les paquets de l'appel sont arrivés complets et à l'heure : la saccade n'est pas visible ici. Elle peut venir de la connexion de votre correspondant, de l'application d'appel ou de l'ordinateur lui-même. ¦ Los paquetes de la llamada llegaron completos y a tiempo, así que el corte no se ve aquí: puede venir de la conexión de la otra persona, de la aplicación de llamadas o del propio equipo.
+Call measuring is turned off. ¦ La mesure des appels est désactivée. ¦ La medición de llamadas está desactivada.
+%d connections looked like a call, but the call app sent no connection check (STUN), so they can't be measured. ¦ %d connexions ressemblaient à un appel, mais l'application d'appel n'a envoyé aucune vérification de connexion (STUN) : elles ne peuvent pas être mesurées. ¦ %d conexiones parecían una llamada, pero la aplicación de llamadas no envió ninguna comprobación de conexión (STUN), así que no se pueden medir.
+A call on another device (a phone, a TV) isn't visible from this computer. ¦ Un appel sur un autre appareil (un téléphone, une télé) n'est pas visible depuis cet ordinateur. ¦ Una llamada en otro dispositivo (un teléfono, una tele) no se ve desde este equipo.
+No call was seen. Look again during a call. ¦ Aucun appel n'a été vu. Regardez de nouveau pendant un appel. ¦ No se vio ninguna llamada. Vuelva a mirar durante una llamada.
+Look again during the call, on the computer that makes it. ¦ Regardez de nouveau pendant l'appel, sur l'ordinateur qui le passe. ¦ Vuelva a mirar durante la llamada, en el equipo que la hace.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -36600,10 +37371,8 @@ class AlertsTab(BaseTab):
         sb.bind("<<ComboboxSelected>>", lambda e: self.rebuild())
         inv = ttk.Menubutton(bar, text="\U0001F50E Investigate…")
         menu = tk.Menu(inv, tearoff=False)
-        menu.add_command(label="Why is my Internet slow?",
-                         command=lambda: self.app.investigate("slow"))
-        menu.add_command(label="What is using my bandwidth?",
-                         command=lambda: self.app.investigate("bandwidth"))
+        for label, cmd in self.app.investigation_menu_items():
+            menu.add_command(label=label, command=cmd)
         inv["menu"] = menu
         inv.pack(side="left", padx=(12, 0))
         self.lbl(bar, "  Search:").pack(side="left")
@@ -37803,6 +38572,15 @@ class HealthTab(BaseTab):
         ttk.Button(head, text="\U0001F50E Why is it slow?",
                    command=lambda: self.app.investigate("slow")).pack(
             side="right", padx=6)
+        # 5.3.4 (MC7): the other guided investigations
+        self.inv_btn = None
+        if FEATURES.get("investigations_v2", True):
+            self.inv_btn = ttk.Menubutton(head, text="More questions…")
+            menu = tk.Menu(self.inv_btn, tearoff=False)
+            for label, cmd in self.app.investigation_menu_items()[2:]:
+                menu.add_command(label=label, command=cmd)
+            self.inv_btn["menu"] = menu
+            self.inv_btn.pack(side="right")
         # 5.1.2: the checks that are fine and not about the connection
         # itself fold away (folded in Beginner, open in Advanced)
         self.fold_btn = ttk.Button(head, text="", style="Sub.TButton",
@@ -37862,6 +38640,14 @@ class HealthTab(BaseTab):
                 self.calls_card, textvariable=self.calls_var, bg="#f6f7fa",
                 fg="#333333", justify="left", anchor="w", wraplength=400)
             self.calls_lbl.pack(anchor="w", fill="x")
+            self.calls_why = None
+            if FEATURES.get("investigations_v2", True):
+                # 5.3.4 (MC7): the card links to its investigation
+                self.calls_why = ttk.Button(
+                    self.calls_card, text="Why does my call stutter?",
+                    style="Sub.TButton",
+                    command=lambda: self.app.investigate("call"))
+                self.calls_why.pack(anchor="w", pady=(4, 0))
         tk.Label(right, text="Your connection", bg=WHITE, fg="#2b3a56",
                  font=mw_font(11, "bold")).pack(anchor="w")
         self.info_var = DisplayVar()
@@ -45680,10 +46466,7 @@ class MiniWireshark:
                 ("Storage used…", self.open_storage),
                 ("Privacy posture…", self.open_privacy_posture),
                 ("What changed recently", self.open_changes),
-                ("Why is my Internet slow?",
-                 lambda: self.investigate("slow")),
-                ("What is using my bandwidth?",
-                 lambda: self.investigate("bandwidth")),
+            ] + self.investigation_menu_items() + [
                 ("Review new alerts", self.review_alerts),
                 ("Show / hide the inspector", self.toggle_inspector),
                 ("Go to packet…", self.go_to_packet),
@@ -50162,12 +50945,88 @@ proc ::mw_retheme {w map fgnew deffg} {
                 "vantage": m.vantage.classify(
                     offline=self.data_mode in ("offline", "session"))}
 
+    def collect_investigation_facts(self, which, key=None):
+        """5.3.4 (MC7): the facts one of the five newer investigations
+        weighs, gathered from the model (nothing is sent)."""
+        m = self.model
+        offline = self.data_mode in ("offline", "session")
+        wp = self._wifi_view()
+        wifi = dict(wp.last) if wp is not None and wp.last else None
+        if which == "dns":
+            return dns_facts(m, dns_slow_ms=float(
+                self.config.get("dns.slow_ms", 800)), offline=offline)
+        if which == "ipv6":
+            return ipv6_facts(m, offline=offline)
+        if which == "connect":
+            return connect_facts(m, key or connect_default_key(m),
+                                 offline=offline,
+                                 namer=self.short_device_name)
+        if which == "wifi_or_internet":
+            return wifi_internet_facts(
+                m, wifi=wifi, offline=offline, wifi_hidden=getattr(
+                    wp, "hidden", "") if wp is not None else "")
+        return call_facts(m, wifi=wifi, offline=offline,
+                          coverage=self.capture_coverage()
+                          if self.data_mode == "live" else None)
+
+    def investigation_menu_items(self):
+        """(label, command) for every investigation that is switched on,
+        for the menus, the Health tab and the command palette."""
+        keys = ["slow", "bandwidth"] + (list(INVESTIGATIONS_V2) if
+                                        FEATURES.get("investigations_v2",
+                                                     True) else [])
+        return [(INVESTIGATION_TITLES[k], lambda k=k: self.investigate(k))
+                for k in keys]
+
+    def _board_cards(self, inner, hyps):
+        """One card per hypothesis (status, title, evidence for and
+        against, what to try); returns the board as plain text."""
+        t = self.theme
+        lines = []
+        for h in hyps:
+            color = {"Likely": t["danger_fg"],
+                     "Possible": t["warn_fg"],
+                     "Can't tell": t["info_fg"],
+                     "Unlikely": t["good_fg"]}[h["status"]]
+            card = tk.Frame(inner, bg=t["card_bg"], padx=12, pady=8,
+                            highlightthickness=1,
+                            highlightbackground=t["border"])
+            card.pack(fill="x", pady=4, padx=4)
+            head = tk.Frame(card, bg=t["card_bg"])
+            head.pack(fill="x")
+            tk.Label(head, text=h["status"], bg=t["card_bg"],
+                     fg=color, width=11, anchor="w",
+                     font=mw_font(10, "bold")).pack(side="left")
+            tk.Label(head, text=h["title"], bg=t["card_bg"],
+                     fg=t["text_fg"], anchor="w", justify="left",
+                     wraplength=540,
+                     font=mw_font(11, "bold")).pack(side="left")
+            for pre, items in (("For: ", h["for"]),
+                               ("Against: ", h["against"])):
+                for it in items:
+                    tk.Label(card, text=pre + it, bg=t["card_bg"],
+                             fg=t["text_fg"], anchor="w",
+                             justify="left", wraplength=640).pack(fill="x")
+            if h["fix"] and h["status"] != "Unlikely":
+                tk.Label(card, text="What to try: " + h["fix"],
+                         bg=t["card_bg"], fg=t["muted_fg"],
+                         anchor="w", justify="left",
+                         wraplength=640).pack(fill="x", pady=(2, 0))
+            lines.append(f"[{h['status']}] {h['title']}\n" + "".join(
+                f"   for: {x}\n" for x in h["for"]) + "".join(
+                f"   against: {x}\n" for x in h["against"]) +
+                (f"   try: {h['fix']}\n" if h["fix"] else ""))
+        return "\n".join(lines)
+
     def investigate(self, which="slow"):
         """Open the guided investigation window."""
+        if which not in INVESTIGATION_TITLES or (
+                which in INVESTIGATIONS_V2 and
+                not FEATURES.get("investigations_v2", True)):
+            which = "slow"
         t = self.theme
         win = tk.Toplevel(self.root)
-        win.title("Why is my Internet slow?" if which == "slow" else
-                  "What is using my bandwidth?")
+        win.title(INVESTIGATION_TITLES[which])
         win.geometry(px_geo("760x640"))
         win.configure(bg=t["tab_bg"])
         top = tk.Frame(win, bg=t["tab_bg"], padx=14, pady=10)
@@ -50185,6 +51044,33 @@ proc ::mw_retheme {w map fgnew deffg} {
                          wraplength=720, justify="left", anchor="w")
         if which == "slow":
             fresh.pack(anchor="w", fill="x")
+        pick = {"key": None}
+        if which == "connect":
+            # which device: the latest one that asked for an address and
+            # didn't get one, else this computer; any device can be picked
+            row = tk.Frame(top, bg=t["tab_bg"])
+            row.pack(anchor="w", fill="x", pady=(4, 0))
+            tk.Label(row, text="Device:", bg=t["tab_bg"],
+                     fg=t["text_fg"]).pack(side="left")
+            devs = sorted(self.model.registry.by_key.values(),
+                          key=lambda d: d.display_name().lower())[:400]
+            by_choice = {f"{self.device_label(d)}  [{d.ip or d.mac}]": d.key
+                         for d in devs}
+            choices = list(by_choice)
+            pick["key"] = connect_default_key(self.model)
+            cur = next((c for c, k in by_choice.items()
+                        if k == pick["key"]), "")
+            dv = tk.StringVar(value=cur)
+            cb = ttk.Combobox(row, textvariable=dv, values=choices,
+                              state="readonly", width=44)
+            cb.pack(side="left", padx=6)
+
+            def picked(_e=None):
+                pick["key"] = by_choice.get(dv.get(), pick["key"])
+                run()
+            cb.bind("<<ComboboxSelected>>", picked)
+            win._mw_pick = picked
+            win._mw_device = dv
 
         def run():
             for w in inner.winfo_children():
@@ -50207,43 +51093,23 @@ proc ::mw_retheme {w map fgnew deffg} {
                     f" ({translate_text(VANTAGE_TEXT.get(v, ('',))[0])}).")
                 with contextlib.suppress(tk.TclError):
                     fresh.configure(text=self.slow_freshness())
-                lines = []
-                for h in hyps:
-                    color = {"Likely": t["danger_fg"],
-                             "Possible": t["warn_fg"],
-                             "Can't tell": t["info_fg"],
-                             "Unlikely": t["good_fg"]}[h["status"]]
-                    card = tk.Frame(inner, bg=t["card_bg"], padx=12, pady=8,
-                                    highlightthickness=1,
-                                    highlightbackground=t["border"])
-                    card.pack(fill="x", pady=4, padx=4)
-                    head = tk.Frame(card, bg=t["card_bg"])
-                    head.pack(fill="x")
-                    tk.Label(head, text=h["status"], bg=t["card_bg"],
-                             fg=color, width=11, anchor="w",
-                             font=mw_font(10, "bold")).pack(
-                        side="left")
-                    tk.Label(head, text=h["title"], bg=t["card_bg"],
-                             fg=t["text_fg"], anchor="w",
-                             font=mw_font(11, "bold")).pack(
-                        side="left")
-                    for pre, items in (("For: ", h["for"]),
-                                       ("Against: ", h["against"])):
-                        for it in items:
-                            tk.Label(card, text=pre + it, bg=t["card_bg"],
-                                     fg=t["text_fg"], anchor="w",
-                                     justify="left", wraplength=640).pack(
-                                fill="x")
-                    if h["fix"] and h["status"] != "Unlikely":
-                        tk.Label(card, text="What to try: " + h["fix"],
-                                 bg=t["card_bg"], fg=t["muted_fg"],
-                                 anchor="w", justify="left",
-                                 wraplength=640).pack(fill="x", pady=(2, 0))
-                    lines.append(f"[{h['status']}] {h['title']}\n" + "".join(
-                        f"   for: {x}\n" for x in h["for"]) + "".join(
-                        f"   against: {x}\n" for x in h["against"]) +
-                        (f"   try: {h['fix']}\n" if h["fix"] else ""))
-                result["text"] = "\n".join(lines)
+                result["text"] = self._board_cards(inner, hyps)
+            elif which in INVESTIGATORS:
+                # 5.3.4 (MC7): passive only, so no "check now" first
+                hyps = INVESTIGATORS[which](self.collect_investigation_facts(
+                    which, pick["key"]))
+                result["hyps"] = hyps
+                v = self.model.vantage.classify(
+                    offline=self.data_mode in ("offline", "session"))
+                sub.configure(text=translate_text(
+                    "A ranked list of explanations with the "
+                    "evidence for and against each. It is "
+                    "not a verdict: the top one is the best "
+                    "fit for what this computer can see") +
+                    f" ({translate_text(VANTAGE_TEXT.get(v, ('',))[0])}). "
+                    + translate_text("Built only from what was overheard; "
+                                     "nothing is sent to check."))
+                result["text"] = self._board_cards(inner, hyps)
             else:
                 res = investigate_bandwidth(self.collect_bandwidth_facts())
                 result["bw"] = res
@@ -68216,6 +69082,419 @@ def t_investigations_reach_planted_cause(ctx):
     assert h["key"] == "dns" and h["status"] == "Likely", (h, f["dns_median_ms"])
 
 
+# ---- 5.3.4 (MC7): the five newer investigations -------------------------------
+def _mc7_handshake(sb, dst_ip, dst_mac, delay, port=443, answer=True):
+    """This computer opens a TCP connection; the answer (if any) comes
+    `delay` seconds after the SYN."""
+    L, me = sb.L, sb.ME
+    six = ":" in dst_ip
+    lo = ScenarioBuilder.V6_PREFIX + "::10" if six else me[0]
+    ipl = L.IPv6 if six else L.IP
+    sp = sb._next_port()
+    out = L.Ether(src=me[1], dst=dst_mac) / ipl(src=lo, dst=dst_ip)
+    sb._emit(out / L.TCP(sport=sp, dport=port, flags="S", seq=1))
+    if answer:
+        sb._emit(L.Ether(src=dst_mac, dst=me[1]) / ipl(src=dst_ip, dst=lo) /
+                 L.TCP(sport=port, dport=sp, flags="SA", seq=7, ack=2),
+                 dt=delay)
+        sb._emit(out / L.TCP(sport=sp, dport=port, flags="A", seq=2, ack=8))
+
+
+def _mc7_discover(sb, mac, n):
+    """A device asks for an address n times (DHCP Discover) and nobody
+    offers one."""
+    L = sb.L
+    chaddr = bytes.fromhex(mac.replace(":", "")) + bytes(10)
+    for _i in range(n):
+        sb._emit(L.Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+                 L.IP(src="0.0.0.0", dst="255.255.255.255") /
+                 L.UDP(sport=68, dport=67) / L.BOOTP(chaddr=chaddr, xid=777) /
+                 L.DHCP(options=[("message-type", "discover"), "end"]),
+                 dt=4.0)
+
+
+MC7_NEWBIE = "5c:aa:fd:00:00:99"
+
+
+def mc7_scenarios():
+    """name → (planted frames, blind-spot frames): a scripted cause for
+    each of the five newer investigations, and the same question asked
+    where the evidence is missing."""
+    S = ScenarioBuilder
+    gw = S.GW
+    out = {}
+    # DNS: the lookups fail (SERVFAIL) | only encrypted lookups
+    sb = S()
+    sb.home_network()
+    for i in range(24):
+        sb.dns(sb.ME, f"site{i}.example.com", None, rcode=2)
+    b = S()
+    b.arp_announce(b.ME)
+    for _i in range(3):
+        b.tls(b.ME, "dns.google", "8.8.8.8", size=3000)
+    out["dns"] = (sb.frames, b.frames)
+    # IPv6: announced, but IPv6 connections get no answer while IPv4
+    # works | a short capture with no announcement and no IPv6
+    sb = S()
+    sb.home_network()
+    for _i in range(5):
+        _mc7_handshake(sb, "2606:4700:4700::1111", gw[1], 0, answer=False)
+    sb.t += 5
+    for _i in range(4):
+        _mc7_handshake(sb, "93.184.215.14", gw[1], 0.03)
+    b = S()
+    b.arp_announce(b.ME)
+    for _i in range(4):
+        _mc7_handshake(b, "93.184.215.14", gw[1], 0.03)
+    out["ipv6"] = (sb.frames, b.frames)
+    # can't connect: a new device asks for an address and gets no offer,
+    # seen from a network-wide view | the same, seen from a computer that
+    # only sees its own traffic and broadcasts
+    sb = S()
+    sb.home_network()
+    _mc7_discover(sb, MC7_NEWBIE, 4)
+    b = S()
+    b.arp_announce(b.ME)
+    b.tls(b.ME, "www.example.com", "93.184.215.14", size=400000)
+    _mc7_discover(b, MC7_NEWBIE, 4)
+    out["connect"] = (sb.frames, b.frames)
+    # Wi-Fi or the Internet: the router answers in 3 ms, Internet sites in
+    # 320 ms | nothing inside the home was timed, Wi-Fi hidden
+    sb = S()
+    sb.arp_announce(sb.ME)
+    for _i in range(5):
+        _mc7_handshake(sb, gw[0], gw[1], 0.003, port=80)
+    for i in range(8):
+        _mc7_handshake(sb, f"93.184.215.{20 + i}", gw[1], 0.32)
+    b = S()
+    b.arp_announce(b.ME)
+    for i in range(8):
+        _mc7_handshake(b, f"93.184.215.{20 + i}", gw[1], 0.03)
+    out["wifi_or_internet"] = (sb.frames, b.frames)
+    # the call: a voice call loses 8% of what comes in | the same call
+    # with no STUN (some call apps): it can't be measured
+    cs = CallScenario(seed=5)
+    t = cs.t0 + 5
+    cs.stun(t, 50000, "203.0.113.50", 3478)
+    cs.stream(t + 0.2, 40, 50000, "203.0.113.50", 3478, True, 0, 8000,
+              0.02, 0x7101, loss=0.08, jitter_ms=4)
+    cs.stream(t + 0.2, 40, 50000, "203.0.113.50", 3478, False, 0, 8000,
+              0.02, 0x7102)
+    frames = cs.frames()
+    out["call"] = (frames, [f for f in frames if f[0][42] >= 4])
+    return out
+
+
+def mc7_board(ctx, which, frames, decoder=None, **kw):
+    """Replay frames into a model, gather that investigation's facts as
+    the app does, and rank them."""
+    m = _call_model(ctx, frames, decoder)
+    off = kw.pop("offline", False)
+    if which == "dns":
+        f = dns_facts(m, offline=off)
+    elif which == "ipv6":
+        f = ipv6_facts(m, offline=off)
+    elif which == "connect":
+        f = connect_facts(m, connect_default_key(m), offline=off)
+    elif which == "wifi_or_internet":
+        f = wifi_internet_facts(m, offline=off, **kw)
+    else:
+        f = call_facts(m, offline=off, **kw)
+    return INVESTIGATORS[which](f), f, m
+
+
+MC7_PLANTED = {"dns": "failing", "ipv6": "broken", "connect": "no_dhcp",
+               "wifi_or_internet": "internet", "call": "loss"}
+
+
+@self_test()
+def t_investigations_v2_planted_cause(ctx):
+    """5.3.4 (MC7, the §1 target): 7 of 7 investigations reach the cause
+    planted in a scripted capture: the five newer ones end to end (packets
+    → model → facts → board, through both decoders) and the two older
+    ones re-checked."""
+    reached = []
+    sc = mc7_scenarios()
+    for which, cause in MC7_PLANTED.items():
+        for name, mk in _call_decoders(ctx):
+            hyps, f, m = mc7_board(ctx, which, sc[which][0], mk)
+            top = hyps[0]
+            assert top["key"] == cause and top["status"] == "Likely", \
+                (which, name, top, f)
+            assert top["fix"] and top["for"], (which, top)
+        reached.append(which)
+    # the connect board is about the device that asked, not this computer
+    hyps, f, m = mc7_board(ctx, "connect", sc["connect"][0])
+    assert f["key"] == m.registry.resolve(MC7_NEWBIE) and \
+        f["discover"] == 4 and not f["offer"], f
+    assert "4 times and got no offer" in hyps[0]["for"][0], hyps[0]
+    # a file: the router's answers to the other devices are in it, so the
+    # missing offer counts; a file of one computer's own traffic: it can't
+    hyps, f, m = mc7_board(ctx, "connect", sc["connect"][0], offline=True)
+    assert f["vantage"] == "file" and f["sees_answers"] and \
+        hyps[0]["key"] == "no_dhcp" and hyps[0]["status"] == "Likely", f
+    hyps, f, m = mc7_board(ctx, "connect", sc["connect"][1], offline=True)
+    assert not f["sees_answers"] and hyps[0]["key"] == "cant_tell", f
+    # it got an address, but the router never answers its ARP question
+    # while it answers this computer: the router ignores that device
+    sb = ScenarioBuilder()
+    sb.home_network()
+    host = ("192.168.1.99", MC7_NEWBIE, "kids-tablet")
+    sb.dhcp(host)
+    for _i in range(4):
+        sb._emit(sb.L.Ether(src=host[1], dst="ff:ff:ff:ff:ff:ff") /
+                 sb.L.ARP(op=1, psrc=host[0], pdst=sb.GW[0],
+                          hwsrc=host[1]), dt=2.0)
+    sb.arp_announce(sb.ME)
+    m = _call_model(ctx, sb.frames)
+    f = connect_facts(m, m.registry.resolve(MC7_NEWBIE))
+    assert f["ack"] == 1 and f["arp_asks"] == 4 and not f["gw_replied"] \
+        and f["router_heard"], f
+    hyps = investigate_connect(f)
+    assert hyps[0]["key"] == "router_ignores" and \
+        hyps[0]["status"] == "Likely", hyps
+    assert any(x["key"] == "no_dhcp" and x["status"] == "Unlikely"
+               for x in hyps), hyps
+    me = connect_facts(m, m.my_device_key())
+    assert me["is_me"] and me["gw_replied"], me
+    # Wi-Fi or Internet: the router's own handshakes were timed
+    hyps, f, _m = mc7_board(ctx, "wifi_or_internet",
+                            sc["wifi_or_internet"][0])
+    assert f["lan_gw"] and f["lan_ms"] < 10 and f["wan_ms"] > 300, f
+    assert any(x["key"] == "home" and x["status"] == "Unlikely"
+               for x in hyps), hyps
+    # the call: the card's own numbers are the evidence
+    hyps, f, _m = mc7_board(ctx, "call", sc["call"][0])
+    assert f["calls"][0]["loss_pct"] > 5, f["calls"]
+    assert "lost" in hyps[0]["for"][0] and "voice call" in \
+        hyps[0]["for"][0], hyps[0]
+    # a call with jitter but no loss leads with jitter
+    cs = CallScenario(seed=6)
+    t = cs.t0 + 5
+    cs.stun(t, 50010, "198.51.100.9", 3478)
+    cs.stream(t + 0.2, 40, 50010, "198.51.100.9", 3478, True, 0, 8000,
+              0.02, 0x7201, jitter_ms=70)
+    hyps, f, _m = mc7_board(ctx, "call", cs.frames())
+    assert hyps[0]["key"] == "jitter" and hyps[0]["status"] == "Likely", \
+        (hyps[0], f["calls"])
+    # the two older investigations, re-checked: slow lookups planted in a
+    # replay, and one device using most of the bandwidth
+    sb = ScenarioBuilder()
+    sb.home_network()
+    S = ScenarioBuilder
+    for i in range(12):
+        L = sb.L
+        sp = sb._next_port()
+        sb._emit(L.Ether(src=S.ME[1], dst=S.GW[1]) /
+                 L.IP(src=S.ME[0], dst=S.GW[0]) / L.UDP(sport=sp, dport=53) /
+                 L.DNS(id=900 + i, rd=1, qd=L.DNSQR(
+                     qname=f"s{i}.example.com")), dt=2.0)
+        sb._emit(L.Ether(src=S.GW[1], dst=S.ME[1]) /
+                 L.IP(src=S.GW[0], dst=S.ME[0]) / L.UDP(sport=53, dport=sp) /
+                 L.DNS(id=900 + i, qr=1, qd=L.DNSQR(
+                     qname=f"s{i}.example.com"), an=L.DNSRR(
+                     rrname=f"s{i}.example.com", rdata="93.184.215.14")),
+                 dt=1.3)
+    m = _call_model(ctx, sb.frames)
+    h = investigate_slow(slow_facts(
+        m, wifi={"rssi": -50}, health={"gateway_ok": True,
+                                       "gateway_ms": 2}))[0]
+    assert h["key"] == "dns" and h["status"] == "Likely", h
+    reached.append("slow")
+    per = Counter()
+    for x in m.flows.all_flows():
+        if x.device_key:
+            per[x.device_key] += x.total_bytes
+    top_key = per.most_common(1)[0][0]
+    bw = investigate_bandwidth({"devices": [(k, b, LV_OBSERVED) for k, b in
+                                            per.items()],
+                                "vantage": "mirror", "unattributed": 0})
+    assert bw["conclusion"].startswith(f"{top_key} is using the most"), bw
+    reached.append("bandwidth")
+    assert len(reached) == 7 and set(reached) == set(INVESTIGATION_TITLES)
+
+
+@self_test()
+def t_investigations_v2_blind_spots(ctx):
+    """5.3.4 (MC7): every investigation says "Can't tell from here", with
+    the reason in plain words, where its evidence is missing: encrypted
+    lookups only, a short capture with no IPv6 at all, a computer that
+    can't see the router's answers to another device, nothing timed
+    inside the home with Windows hiding the Wi-Fi, a call app that sends
+    no STUN; and the two older ones on a computer's own view."""
+    sc = mc7_scenarios()
+    why = {"dns": "encrypted", "ipv6": "IPv6 router announcement",
+           "connect": "only that device's broadcasts",
+           "wifi_or_internet": "home part can't be measured",
+           "call": "no connection check (STUN)"}
+    for which, needle in why.items():
+        kw = {"wifi_hidden": WIFI_LOCATION_NOTE} \
+            if which == "wifi_or_internet" else {}
+        hyps, f, _m = mc7_board(ctx, which, sc[which][1], **kw)
+        top = hyps[0]
+        assert top["key"] == "cant_tell" and top["title"] == \
+            "Can't tell from here" and top["status"] == "Can't tell", \
+            (which, top, f)
+        assert any(needle in x for x in top["for"]), (which, top["for"])
+        assert not any(x["status"] == "Likely" for x in hyps), (which, hyps)
+    # the connect blind spot really is the computer's view
+    _h, f, _m = mc7_board(ctx, "connect", sc["connect"][1])
+    assert f["vantage"] == "endpoint" and f["discover"] == 4, f
+    # a file says so; the call board says when the call may be elsewhere
+    hyps, _f, _m = mc7_board(ctx, "ipv6", sc["ipv6"][1], offline=True)
+    assert "This file has no IPv6" in hyps[0]["for"][0], hyps[0]
+    h = investigate_call({"calls": [], "unmeasured": 0,
+                          "vantage": "endpoint"})[0]
+    assert h["key"] == "cant_tell" and "another device" in h["for"][0], h
+    h = investigate_call({"calls": [], "measuring": False})[0]
+    assert "turned off" in h["for"][0], h
+    # only outgoing streams: loss on the way can't be counted
+    c = {"tuple": (), "first": 0.0, "last": 60.0, "kind": "voice",
+         "loss_pct": 0.0, "jitter_ms": 1.0, "inbound": False,
+         "worst": None}
+    hyps = investigate_call({"calls": [c], "vantage": "mirror"})
+    assert hyps[0]["key"] == "cant_tell" and any(
+        x["key"] == "loss" and x["status"] == "Can't tell" for x in hyps)
+    # a capture that missed packets doesn't blame the network
+    c = dict(c, inbound=True, loss_pct=9.0)
+    hyps = investigate_call({"calls": [c], "capture_drop_pct": 0.05})
+    assert [x["status"] for x in hyps if x["key"] == "loss"] == \
+        ["Can't tell"] and hyps[0]["key"] == "cant_tell", hyps
+    # DNS that is fine says so, with no "can't tell"
+    hyps = investigate_dns({"n": 40, "nq": 40, "fail_rate": 0.0,
+                            "median_ms": 20})
+    assert hyps[0]["key"] == "working" and not any(
+        x["key"] == "cant_tell" for x in hyps), hyps
+    # the two older ones on the computer's own view
+    assert investigate_slow({"vantage": "endpoint"})[0]["key"] == \
+        "cant_tell"
+    bw = investigate_bandwidth({"devices": [("Laptop", 9e6, LV_OBSERVED)],
+                                "vantage": "endpoint"})
+    assert bw["conclusion"].startswith("Can't tell from here"), bw
+
+
+@self_test()
+def t_investigations_v2_french_spanish(ctx):
+    """5.3.4 (MC7): every sentence the five newer investigations can say,
+    their titles and their buttons have French and Spanish, with the same
+    placeholders; a board built in French is in French."""
+    sc = mc7_scenarios()
+    for which, (good, blind) in sc.items():
+        mc7_board(ctx, which, good)
+        mc7_board(ctx, which, blind, offline=True)
+        mc7_board(ctx, which, blind)
+    # every branch's sentences, from facts
+    investigate_dns({"nq": 20, "fail_rate": 0.1, "n": 20, "median_ms": 300,
+                     "changes": ["Laptop now uses DNS server 9.9.9.9 (was "
+                                 "192.168.1.1)"], "encrypted_n": 2})
+    investigate_dns({"nq": 20, "fail_rate": 0.0, "n": 20, "median_ms": 900,
+                     "vantage": "endpoint"})
+    investigate_dns({"nq": 20, "fail_rate": 0.01, "n": 20, "median_ms": 30})
+    investigate_ipv6({"v6_tries": 10, "v6_ok": 7, "v6_fail": 3, "ra": True})
+    investigate_ipv6({"v6_tries": 9, "v6_ok": 9, "ra": True, "v6_share": .4})
+    investigate_ipv6({"ra": True})
+    investigate_ipv6({"span": 1200})
+    investigate_ipv6({"span": 10})
+    investigate_connect({"nak": 1, "ack": 1, "arp_asks": 4,
+                         "router_heard": True, "is_me": True})
+    investigate_connect({"offer": 2, "arp_asks": 4, "vantage": "endpoint"})
+    investigate_connect({"discover": 3, "arp_asks": 5, "router_heard": False,
+                         "internet_ok": 2})
+    investigate_connect({"arp_asks": 2, "gw_replied": True,
+                         "internet_tries": 4, "is_me": True})
+    investigate_connect({})
+    for lan in (40, 15, 3):
+        for gwl in (True, False):
+            investigate_wifi_internet({"lan_ms": lan, "lan_n": 5,
+                                       "lan_gw": gwl, "wan_ms": 40 + lan,
+                                       "wan_n": 9, "wifi": {"rssi": -70}})
+    for r in (-80, -70, -50):
+        for wan in (400, 140):
+            investigate_wifi_internet({"wifi": {"rssi": r}, "wan_ms": wan,
+                                       "wan_n": 9})
+    investigate_wifi_internet({"wired": True, "wan_n": 9, "wan_ms": 30})
+    investigate_wifi_internet({"wifi_hidden": WIFI_LOCATION_NOTE})
+    base = {"tuple": (), "first": 0.0, "last": 60.0, "kind": "video",
+            "worst": None, "inbound": True}
+    for lp, jm in ((5, 40), (2, 25), (0.1, 3)):
+        investigate_call({"calls": [dict(base, loss_pct=lp, jitter_ms=jm)],
+                          "wifi": {"rssi": -72}})
+    investigate_call({"calls": [dict(base, loss_pct=5, jitter_ms=1)],
+                      "capture_drop_pct": 0.2})
+    investigate_call({"calls": [dict(base, loss_pct=0, jitter_ms=1,
+                                     inbound=False)]})
+    investigate_call({"calls": [], "unmeasured": 2, "measuring": False,
+                      "vantage": "endpoint"})
+    investigate_call({"calls": []})
+    must = set(MC7_TEMPLATES) | set(INVESTIGATION_TITLES.values()) | {
+        "More questions…", "Device:",
+        "Built only from what was overheard; nothing is sent to check."}
+    assert len(MC7_TEMPLATES) >= 90, len(MC7_TEMPLATES)
+    spec = re.compile(r"%[sd%]")
+    for loc in ("fr", "es"):
+        missing = sorted(s for s in must
+                         if _i18n_lookup(s, I18N[loc], loc) is None)
+        assert not missing, (loc, len(missing), missing[:6])
+        for s in MC7_TEMPLATES:
+            tr = I18N[loc].get(s)
+            assert tr is None or spec.findall(tr) == spec.findall(s), \
+                (loc, s, tr)
+    try:
+        set_locale("fr")
+        h = investigate_dns({"nq": 30, "fail_rate": 0.5})[0]
+        assert h["title"] == I18N["fr"]["Website lookups are failing"], h
+        assert h["for"][0].startswith("◉ 50 % ") or "50" in h["for"][0], h
+        set_locale("es")
+        h = investigate_call({"calls": []})[0]
+        assert h["title"] == "No se puede saber desde aquí", h
+    finally:
+        set_locale("English")
+
+
+@self_test(needs_source=True)
+def t_investigations_passive_only(ctx):
+    """5.3.4 (MC7): the investigations never send anything. None of their
+    functions (nor the window's fact gathering) calls the health check
+    helpers that open connections (_tcp_rtt, _dns_rtt), outbound(), or a
+    packet sender."""
+    import ast
+    import textwrap
+    banned = {"_tcp_rtt", "_dns_rtt", "outbound", "sendp", "send",
+              "run_health_checks", "_check_then", "sendto", "connect"}
+    fns = [investigate_slow, investigate_bandwidth, slow_facts,
+           _board_finish, connect_default_key, dns_facts, ipv6_facts,
+           connect_facts, wifi_internet_facts, call_facts,
+           MiniWireshark.collect_investigation_facts,
+           MiniWireshark.collect_slow_facts,
+           MiniWireshark.collect_bandwidth_facts] + list(
+        INVESTIGATORS.values())
+    for fn in fns:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(fn)))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                fn_node = node.func
+                name = fn_node.attr if isinstance(fn_node, ast.Attribute) \
+                    else getattr(fn_node, "id", "")
+                assert name not in banned, (fn.__name__, name)
+    # the switch: off, the five are not offered and fall back to "slow"
+    old = FEATURES.get("investigations_v2", True)
+    try:
+        FEATURES["investigations_v2"] = False
+        app = types.SimpleNamespace(investigate=lambda k: k)
+        items = MiniWireshark.investigation_menu_items(app)
+        assert [x[0] for x in items] == [INVESTIGATION_TITLES["slow"],
+                                         INVESTIGATION_TITLES["bandwidth"]]
+        m = _call_model(ctx, mc7_scenarios()["connect"][0])
+        assert not m.dhcp_chains and not m.gw_arp_asks, \
+            "the model kept investigation evidence with the switch off"
+        FEATURES["investigations_v2"] = True
+        items = MiniWireshark.investigation_menu_items(app)
+        assert [x[1]() for x in items] == ["slow", "bandwidth"] + list(
+            INVESTIGATIONS_V2)
+    finally:
+        FEATURES["investigations_v2"] = old
+
+
 @self_test()
 def t_colorblind_modes(ctx):
     """Each colour-blind mode keeps good / warning / danger far apart for
@@ -76903,6 +78182,76 @@ def gt_534_unusual_activity(app, ctx):
         app.config.set("performance.mode", "Automatic")
         app.config.set("performance.deep_runner", "Automatic")
         app.data_mode = "idle"
+
+
+@gui_test_step("5.3.4 M11: five more investigations — the planted causes, "
+               "a blind spot from the Calls card, the menus, French")
+def gt_534_investigations_v2(app, ctx):
+    root = app.root
+    sc = mc7_scenarios()
+    old_model, old_mode = app.model, app.data_mode
+    models = {}
+
+    def ask(which, frames, action=None):
+        """Open an investigation on a model of `frames`. The model is only
+        lent to the window while the board is built (that happens before
+        investigate() returns), so the tabs never see it."""
+        m = models.get(id(frames))
+        if m is None:
+            m = models[id(frames)] = _call_model(ctx, frames)
+        app.model, app.data_mode = m, "offline"
+        try:
+            w = (action or (lambda: app.investigate(which)))()
+        finally:
+            app.model, app.data_mode = old_model, old_mode
+        _gui_pump(root, 0.1)
+        return w, m
+
+    def windows(title):
+        return [w for w in root.winfo_children()
+                if isinstance(w, tk.Toplevel) and w.title() == title]
+    for which, cause in MC7_PLANTED.items():
+        w, m = ask(which, sc[which][0])
+        hyps = w._mw_result["hyps"]
+        assert hyps[0]["key"] == cause, (which, [h["key"] for h in hyps])
+        assert w.title() == INVESTIGATION_TITLES[which]
+        assert f"[Likely] {hyps[0]['title']}" in w._mw_result["text"]
+        if which == "connect":
+            # the device that asked for an address is picked for you
+            assert MC7_NEWBIE in w._mw_device.get(), w._mw_device.get()
+            ask(which, sc[which][0], w._mw_pick)
+            assert w._mw_result["hyps"][0]["key"] == cause
+        w.destroy()
+    # the Calls card opens "Why does my call stutter?"; a call app that
+    # sends no STUN: it can't tell, and says why
+    hl = app._select_tab("health")
+    _gui_pump(root, 0.2)
+    assert hl.calls_why is not None and hl.calls_why.winfo_ismapped()
+    ask("call", sc["call"][1], hl.calls_why.invoke)
+    ws = windows(INVESTIGATION_TITLES["call"])
+    assert ws, "the Calls card didn't open its investigation"
+    h = ws[-1]._mw_result["hyps"][0]
+    assert h["key"] == "cant_tell" and "STUN" in " ".join(h["for"]), h
+    for w in ws:
+        w.destroy()
+    # every investigation is in the palette, the Alerts menu and the
+    # Health tab's "More questions…"
+    labels = {x[0] for x in app.palette_items()}
+    assert set(INVESTIGATION_TITLES.values()) <= labels, labels
+    menu = root.nametowidget(hl.inv_btn["menu"])
+    got = [menu.entrycget(i, "label") for i in range(menu.index("end") + 1)]
+    assert got == [INVESTIGATION_TITLES[k] for k in INVESTIGATIONS_V2], got
+    # in French, the board and its window are French
+    try:
+        set_locale("fr")
+        w, _m = ask("dns", sc["dns"][0])
+        h = w._mw_result["hyps"][0]
+        assert h["title"] == "Les recherches de sites web échouent", h
+        assert w.title() == "Mon DNS fonctionne-t-il ?", w.title()
+        w.destroy()
+    finally:
+        set_locale("English")
+    assert app.model is old_model and app.data_mode == old_mode
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
