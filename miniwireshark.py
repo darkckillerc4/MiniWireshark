@@ -7146,6 +7146,15 @@ def _name_bytes(raw):
     return sanitize_text(str(raw).rstrip("."), 255)
 
 
+# NS, MD, MF, CNAME, PTR, DNAME: rdata that is a domain name
+_DNS_NAME_TYPES = (2, 3, 4, 5, 12, 39)
+# record types scapy parses into their own classes (DNSRRMX, DNSRRSOA,
+# DNSRRSRV, DNSRROPT, DNSRRHTTPS…), which _iter_rrs() doesn't yield; the
+# fast decoder skips them too, so both decoders show the same answers
+_DNS_SKIPPED_TYPES = frozenset((6, 13, 15, 33, 35, 41, 43, 46, 47, 48, 50,
+                                51, 64, 65, 250, 32769))
+
+
 def _iter_rrs(rr):
     """Yield each DNSRR record from a DNS answer/ns/ar field. Handles both
     how current scapy represents it (a plain list of DNSRR) and the older
@@ -7191,6 +7200,8 @@ def _rdata_str_raw(rr):
     if isinstance(rd, str):
         return rd.rstrip(".")
     if isinstance(rd, bytes):
+        if rr.type in _DNS_NAME_TYPES:   # a name: decode it like any other
+            return _name_bytes(rd)
         if rr.type == 1 and len(rd) == 4:
             return ".".join(str(b) for b in rd)
         if rr.type == 28 and len(rd) == 16:
@@ -7799,6 +7810,8 @@ def _decode_dns(d, kind):
         if kind == "mDNS":
             rrs += list(_iter_rrs(getattr(d, "ar", None)))
         for rr in rrs:
+            if int(rr.type) in _DNS_SKIPPED_TYPES:   # older scapy
+                continue
             rd = rr.rdata
             txt = []
             if rr.type == 16:
@@ -7907,6 +7920,8 @@ def dhcp_from_options(options, yiaddr, chaddr_bytes):
             "client_id": ""}
     msg = "DHCP"
     for opt in options:
+        if opt == "end":        # scapy reads on past it; what follows is
+            break               # padding, or garbage (5.3.4 S12)
         if not isinstance(opt, tuple) or len(opt) < 2:
             continue
         code, val = opt[0], opt[1]
@@ -8061,10 +8076,21 @@ def _l4_payload(pkt, l4):
         data = bytes(l4.payload)
     except Exception:                                # noqa: BLE001
         return b""
-    pad = pkt.getlayer(Padding) if Padding is not None else None
-    if pad is not None and getattr(pad, "load", None):
-        cut = len(pad.load)
-        if 0 < cut <= len(data) and data.endswith(pad.load):
+    # 5.3.4 (S12): cut where the IP packet ends. Not at a Padding layer:
+    # a layer with its own length (NBT, DNS over TCP…) makes one too, and
+    # that one is payload
+    ip = l4.underlayer
+    while ip is not None and type(ip).__name__ not in ("IP", "IPv6"):
+        ip = ip.underlayer
+    total = getattr(ip, "len" if type(ip).__name__ == "IP" else "plen",
+                    None)
+    if total is not None:
+        try:
+            cut = len(bytes(ip)) - (int(total) if type(ip).__name__ == "IP"
+                                    else 40 + int(total))
+        except Exception:                            # noqa: BLE001
+            cut = 0
+        if 0 < cut <= len(data):
             data = data[:-cut]
     return data
 
@@ -8086,7 +8112,10 @@ def _new_decoded(pkt):
             "multicast": False, "l2_bcast": False,
             "learns": [], "pkt": pkt,
             "time": float(getattr(pkt, "time", time.time())),
-            "length": len(pkt)}
+            # the wire length: rebuilding (len(pkt)) can drop bytes scapy
+            # did not keep, e.g. after an ICMP extension
+            "length": len(pkt.original) if getattr(pkt, "original", None)
+            else len(pkt)}
 
 
 def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
@@ -8314,13 +8343,36 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
                   "text": "Joining/leaving a multicast group (IGMP)"})
     else:
         ll = pkt.lastlayer()
-        d["proto"] = ll.name if ll else "?"
+        d["proto"] = _ip_proto_name(ipl) or (ll.name if ll else "?")
         if d["proto"] and not d["text"]:
             d["text"] = f"{d['proto']} frame"
 
     d["src"] = d["src_ip"] or d["src_mac"]
     d["dst"] = d["dst_ip"] or d["dst_mac"]
     return d
+
+
+def _ip_proto_name(ipl):
+    """'ESP', 'GRE'… for the IP protocol (after any IPv6 extension
+    headers), as the fast decoder names it; whatever scapy dissected the
+    payload into ('NON_ESP', 'Raw'…) says less."""
+    if ipl is None:
+        return None
+    nh = getattr(ipl, "proto", None)
+    if nh is None:
+        nh = _ipv6_upper(ipl)[0]
+    try:
+        return _IPPROTO_NAMES.get(int(nh))
+    except (TypeError, ValueError):
+        return None
+
+
+def _ipv6_upper(ipl):
+    """(next header, layer) after an IPv6 header's extension headers."""
+    nh, ly = getattr(ipl, "nh", None), ipl.payload
+    while type(ly).__name__.startswith("IPv6ExtHdr"):
+        nh, ly = getattr(ly, "nh", None), ly.payload
+    return nh, ly
 
 
 def _decode_tcp_payload(d, load, reasm):
@@ -8411,6 +8463,17 @@ def _decode_tcp_payload(d, load, reasm):
 def _decode_icmpv6(d, pkt):
     """IPv6 control traffic: Neighbor Discovery (how IPv6 devices find each
     other and their router), pings and errors. Returns True if handled."""
+    nh, top = _ipv6_upper(pkt[IPv6])
+    if type(top).__name__ in ("ICMPv6DestUnreach", "ICMPv6PacketTooBig",
+                              "ICMPv6TimeExceeded", "ICMPv6ParamProblem"):
+        # 5.3.4 (S12): an error quotes the packet that failed (a ping, a
+        # DNS query, an NS…): label the error, not what it quotes
+        d.update({"proto": "ICMPv6", "tag": "ICMPv6", "transport": "ICMPv6",
+                  "text": _ICMP6_NAMES.get(int(top.type), top.name)})
+        if int(top.type) == 1:
+            d.update({"text": "Destination unreachable (IPv6)", "sport": 1,
+                      "dport": 0})
+        return True
     nd = None
     if pkt.haslayer(ICMPv6ND_RA):
         ra = pkt[ICMPv6ND_RA]
@@ -8465,6 +8528,18 @@ def _decode_icmpv6(d, pkt):
         d.update({"proto": "ICMPv6", "tag": "ICMPv6", "transport": "ICMPv6",
                   "text": "Destination unreachable (IPv6)", "sport": 1,
                   "dport": 0})
+        return True
+    # by the type byte, as the fast decoder does: scapy leaves a short
+    # message as Raw, and trailing bytes make the last layer Raw too
+    t = None
+    if type(top).__name__.startswith("ICMPv6"):
+        t = int(getattr(top, "type", -1))
+    elif nh == 58 and isinstance(top, Raw) and top.load:
+        t = top.load[0]
+    if t in _MLD_TYPES or t in _ICMP6_NAMES:
+        d.update({"proto": "ICMPv6", "tag": "ICMPv6", "transport": "ICMPv6",
+                  "text": "Multicast group membership report (IPv6)"
+                  if t in _MLD_TYPES else _ICMP6_NAMES[t]})
         return True
     ll = pkt.lastlayer()
     name = ll.name if ll else ""
@@ -8523,6 +8598,12 @@ def _ip4(b):
 
 
 def _ip6(b):
+    # the system's inet_ntop, as scapy formats addresses ('::ffff:1.2.3.4',
+    # where ipaddress before Python 3.13 gives '::ffff:102:304')
+    try:
+        return _socket.inet_ntop(_socket.AF_INET6, bytes(b[:16]))
+    except (AttributeError, OSError, ValueError):
+        pass
     try:
         return str(ipaddress.IPv6Address(bytes(b[:16])))
     except (ValueError, ipaddress.AddressValueError):
@@ -8566,6 +8647,30 @@ def _wire_name(buf, pos, depth=0):
     return _name_bytes(raw), (nxt if jumped else pos)
 
 
+def _wire_rdata_name(buf, start, end):
+    """A name in a record's rdata, read as scapy reads it: within the
+    rdata, and stopping quietly (keeping what it has) at a cut-short label,
+    a bad pointer or a pointer loop instead of failing."""
+    s, pos, labels, seen = buf[start:end], 0, [], []
+    while pos < len(s):
+        ln = s[pos]
+        pos += 1
+        if ln & 0xC0:
+            if pos >= len(s) or len(seen) >= 20:
+                break
+            ptr = ((ln & 0x3F) << 8) | s[pos]
+            if ptr in seen:
+                break
+            seen.append(ptr)
+            s, pos = buf, ptr
+        elif ln:
+            labels.append(bytes(s[pos:pos + ln]))
+            pos += ln
+        else:
+            break
+    return _name_bytes(b".".join(labels))
+
+
 def wire_dns(buf, kind):
     """DNS message bytes → (text, learns, hint, info) via dns_summary()."""
     if len(buf) < 12:
@@ -8599,18 +8704,17 @@ def wire_dns(buf, kind):
             pos += rdlen
             in_an = i < an
             in_ar = i >= an + ns
-            if not (in_an or (kind == "mDNS" and in_ar)):
+            if not (in_an or (kind == "mDNS" and in_ar)) or \
+                    rtype in _DNS_SKIPPED_TYPES:
                 continue
             ip, rstr, txt = None, "", []
-            if rtype == 1 and rdlen == 4:
+            # like scapy, an address is the first 4/16 bytes of the rdata
+            if rtype == 1 and len(rdata) >= 4:
                 ip = rstr = _ip4(rdata)
-            elif rtype == 28 and rdlen == 16:
+            elif rtype == 28 and len(rdata) >= 16:
                 ip = rstr = _ip6(rdata)
-            elif rtype in (5, 12, 2):
-                try:
-                    rstr = _wire_name(buf, rstart)[0]
-                except ValueError:
-                    rstr = ""
+            elif rtype in _DNS_NAME_TYPES:
+                rstr = _wire_rdata_name(buf, rstart, rstart + rdlen)
             elif rtype == 16:
                 p = 0
                 while p < len(rdata):
@@ -8619,14 +8723,9 @@ def wire_dns(buf, kind):
                     p += 1 + ln
                 rstr = sanitize_text(" ".join(
                     t.decode("utf-8", "ignore") for t in txt), 255)
-            elif rtype == 33 and rdlen >= 7:
-                try:
-                    rstr = _wire_name(buf, rstart + 6)[0]
-                except ValueError:
-                    rstr = ""
             else:
-                rstr = sanitize_text(bytes(rdata).decode("utf-8", "ignore"),
-                                     255)
+                rstr = sanitize_text(bytes(rdata).decode(
+                    "utf-8", "ignore").rstrip("."), 255)
             records.append((rrname, rtype, ip, rstr, txt))
     return dns_summary(kind, qname, qtype, qid, qr, rcode, records)
 
@@ -8647,11 +8746,15 @@ def _wire_dhcp(load):
         if code == 0:
             p += 1
             continue
-        if p + 1 >= n:
-            break
+        if p + 1 >= n or p + 2 + load[p + 1] > n:
+            break                       # cut short: scapy drops it too
         ln = load[p + 1]
         val = bytes(load[p + 2:p + 2 + ln])
         p += 2 + ln
+        if (code == 53 and not ln) or \
+                (code in (50, 54, 3, 6, 51) and (not ln or ln % 4)):
+            # scapy can't parse it and keeps no option after it
+            raise NeedDeepParse("odd dhcp option")
         if code in (53,) and ln >= 1:
             opts.append((53, val[0]))
         elif code in (12, 60, 61):
@@ -9470,7 +9573,7 @@ def _fast_decode(raw, ts, lt, reasm):
         et = _U16.unpack_from(raw, 12)[0]
         off = 14
         vlans = 0
-        while et in (0x8100, 0x88a8, 0x9100) and vlans < 2:
+        while et in (0x8100, 0x88a8) and vlans < 2:   # (scapy: not 0x9100)
             if n < off + 4:
                 raise NeedDeepParse("vlan")
             et = _U16.unpack_from(raw, off + 2)[0]
@@ -9612,7 +9715,9 @@ def _fast_l4(d, raw, proto, p, end, reasm, ipver):
     if proto == 17:
         return _fast_udp(d, raw, p, end, reasm)
     if proto == 1 and ipver == 4:
-        if end - p < 4:
+        # (scapy leaves a timestamp/address-mask message cut short as Raw)
+        if end - p < 8 or \
+                end - p < {13: 20, 14: 20, 17: 12, 18: 12}.get(raw[p], 8):
             raise NeedDeepParse("short icmp")
         t, code = raw[p], raw[p + 1]
         d["proto"], d["tag"], d["transport"] = "ICMP", "ICMP", "ICMP"
@@ -9626,7 +9731,8 @@ def _fast_l4(d, raw, proto, p, end, reasm, ipver):
                   "text": "Joining/leaving a multicast group (IGMP)"})
         return _fast_done(d)
     name = _IPPROTO_NAMES.get(proto)
-    if name is None:
+    if name is None or proto in (4, 41, 47):
+        # tunnels: scapy decodes the inner packet
         raise NeedDeepParse(f"ip proto {proto}")
     d["proto"] = name
     d["text"] = f"{name} frame"
@@ -9665,7 +9771,9 @@ def _fast_tcp(d, raw, p, end, reasm):
     if sport_ in ENCRYPTED_PORTS:
         d["encrypted"] = "likely"
     load = raw[p + dataofs:end]
-    if 53 in (sport, dport) and len(load) > 2:
+    # scapy takes DNS over TCP only when the length prefix fits the segment
+    if 53 in (sport, dport) and len(load) > 2 and \
+            14 <= _U16.unpack_from(load, 0)[0] <= len(load):
         try:
             text, learns, hint, info = wire_dns(load[2:], "DNS")
         except ValueError:
@@ -9694,13 +9802,10 @@ def _fast_udp(d, raw, p, end, reasm=None):
     d["sport"], d["dport"] = sport, dport
     d["transport"] = "UDP"
     ports = (sport, dport)
-    load = raw[p + 8:end]
-    if ulen >= 8:
-        load = load[:ulen - 8]
-        d["payload_len"] = ulen - 8
-    else:
-        d["payload_len"] = len(load)
-    load = bytes(load)
+    if ulen < 8:
+        raise NeedDeepParse("bad udp length")    # scapy's own reading
+    load = bytes(raw[p + 8:end][:ulen - 8])
+    d["payload_len"] = ulen - 8
     if (53 in ports or 5353 in ports or 5355 in ports) and len(load) >= 12:
         name = "mDNS" if 5353 in ports else "LLMNR" if 5355 in ports \
             else "DNS"
@@ -9720,7 +9825,7 @@ def _fast_udp(d, raw, p, end, reasm=None):
         d["learns"].extend(learns)
         if hint:
             d["type_hint"] = hint
-    elif (67 in ports or 68 in ports) and len(load) >= 240:
+    elif ports in ((68, 67), (67, 68), (67, 67)) and len(load) >= 240:
         pr, t2, text, learns, info = _wire_dhcp(load)
         d.update({"proto": pr, "tag": t2, "text": text, "dhcp": info,
                   "app_conf": "Observed"})
@@ -9801,7 +9906,7 @@ def _nd_options(raw, p, end):
 
 
 def _fast_icmpv6(d, raw, p, end):
-    if end - p < 4:
+    if end - p < 8:
         raise NeedDeepParse("short icmpv6")
     t = raw[p]
     nd = None
@@ -59438,6 +59543,147 @@ def t_fast_decoder_fuzz(ctx):
                 del raw[rng.randrange(1, len(raw)):]
         d = fast_decode(bytes(raw), 1.0 + i)     # must never raise
         assert isinstance(d, dict) and "proto" in d
+
+
+def _unusual_frames():
+    """Valid-but-unusual (and a few cut-short) frames on which the two
+    decoders disagreed until 5.3.4 (S12, differential fuzzing). Returns
+    (frames that both decode, frames the fast decoder must decline)."""
+    me, gw = "3c:7c:3f:10:00:10", "00:1e:58:aa:00:01"
+    v6a, v6b = "2a01:e0a:1f:2c0::1", "2a01:e0a:1f:2c0:3e7c:3fff:fe10:10"
+
+    def nm(s):
+        return b"".join(bytes([len(x)]) + x
+                        for x in s.encode().split(b".")) + b"\x00"
+
+    def dns(flags, qs, ans, ar=()):
+        out = struct.pack(">6H", 0x1234, flags, len(qs), len(ans), 0,
+                          len(ar))
+        for q, t in qs:
+            out += nm(q) + struct.pack(">HH", t, 1)
+        for name, t, rdata in list(ans) + list(ar):
+            out += name + struct.pack(">HHIH", t, 1, 60, len(rdata)) + rdata
+        return out
+
+    def eth(ip, l4):
+        if ip is None:
+            ip = IP(src="1.1.1.1", dst="192.168.1.10")
+        return bytes(Ether(src=gw, dst=me) / ip / l4)
+
+    def icmp6(body):
+        return eth(IPv6(src=v6a, dst=v6b, nh=58), Raw(body))
+
+    ptr = b"\xc0\x0c"
+    query = dns(0x0100, [("q.example.com", 1)], [])
+    quoted6 = bytes(IPv6(src=v6b, dst=v6a) / UDP(sport=5000, dport=53) /
+                    Raw(query))
+    ping6 = bytes(IPv6(src=v6b, dst=v6a, nh=58) /
+                  Raw(b"\x80\x00\x00\x00\x00\x01\x00\x01"))
+
+    def dhcp(opts, sport=68):
+        load = b"\x01\x01\x06\x00\x00\x00\x00\x01" + bytes(20) + \
+            bytes.fromhex(me.replace(":", "")) + bytes(202) + \
+            b"\x63\x82\x53\x63" + opts
+        return eth(IP(src="0.0.0.0", dst="255.255.255.255"),
+                   UDP(sport=sport, dport=67) / Raw(load))
+    both = [
+        # MX / HTTPS records: scapy parses them into classes of their own
+        eth(None, UDP(sport=53, dport=5000) / Raw(dns(
+            0x8180, [("example.com", 15)],
+            [(ptr, 15, b"\x00\x0a\x04mail\xc0\x0c")]))),
+        eth(None, UDP(sport=53, dport=5000) / Raw(dns(
+            0x8180, [("example.com", 65)],
+            [(ptr, 65, b"\x00\x01\x00\x00\x01\x00\x03\x02h3")]))),
+        # a CNAME that isn't UTF-8; an A record with rdlength 6
+        eth(None, UDP(sport=53, dport=5000) / Raw(dns(
+            0x8180, [("www.example.com", 1)],
+            [(ptr, 5, b"\x03c\xe9n\xc0\x10"), (ptr, 1, b"\x01\x02\x03\x04"
+                                                  b"\x05\x06")]))),
+        # AAAA ::ffff:1.2.3.4 and ::187.0.0.1 (address formatting)
+        eth(None, UDP(sport=53, dport=5000) / Raw(dns(
+            0x8180, [("v6.example.com", 28)],
+            [(ptr, 28, bytes(10) + b"\xff\xff\x01\x02\x03\x04"),
+             (ptr, 28, bytes(12) + b"\xbb\x00\x00\x01")]))),
+        # mDNS: a PTR whose name stops short, SRV, OPT among additionals
+        eth(IP(src="192.168.1.40", dst="224.0.0.251"),
+            UDP(sport=5353, dport=5353) / Raw(dns(
+                0x8400, [], [(nm("_ipp._tcp.local"), 12,
+                              b"\x0bLiving Room\x04_ipp"),
+                             (nm("Desk._ipp._tcp.local"), 33,
+                              b"\x00\x00\x00\x00\x02\x77" + nm("d.local"))],
+                [(b"\x00", 41, b"")]))),
+        # DNS over TCP whose length prefix says more than the segment
+        eth(None, TCP(sport=53, dport=40000, flags="PA") /
+            Raw(b"\x00\xc8" + query)),
+        # ICMPv6 errors quoting a DNS query / a ping; MLD report with
+        # trailing bytes; a Redirect too short for scapy
+        icmp6(b"\x02\x00\x00\x00\x00\x00\x05\x00" + quoted6),
+        icmp6(b"\x03\x00\x00\x00\x00\x00\x00\x00" + ping6),
+        icmp6(b"\x01\x04\x00\x00\x00\x00\x00\x00" + ping6),
+        icmp6(b"\x83\x00\x00\x00" + bytes(20) + b"tail"),
+        icmp6(b"\x89\x00\x00\x00" + bytes(24)),
+        # IPsec, PIM (scapy: NON_ESP / Raw, AH / Raw, Raw)
+        eth(IP(src="1.1.1.1", dst="192.168.1.10", proto=50),
+            Raw(bytes(24))),
+        eth(IP(src="1.1.1.1", dst="192.168.1.10", proto=51),
+            Raw(bytes(24))),
+        eth(IPv6(src=v6b, dst=v6a, nh=103), Raw(bytes(12))),
+        # destination unreachable quoting > 128 bytes, and a trailer
+        # after the IP packet: scapy rebuilds the frame shorter
+        eth(None, ICMP(type=3, code=1) / Raw(
+            bytes(IP(src="192.168.1.10", dst="1.1.1.1") /
+                  UDP(sport=68, dport=67) / Raw(bytes(236))))) + bytes(10),
+        # NBT session message of length 0 with more data after it
+        eth(None, TCP(sport=41446, dport=445, flags="PA") /
+            Raw(bytes(4) + b"\x00SMB" + bytes(56))),
+        # DHCP: not 68→67; a hostname cut short; an option after END
+        dhcp(b"\x35\x01\x01\x0c\x01x\xff", sport=178),
+        dhcp(b"\x35\x01\x03\x0c\x0aLin"),
+        dhcp(b"\x35\x01\x01\xff\x0c\x04evil"),
+    ]
+    declined = [
+        # tunnels: scapy decodes the inner packet
+        eth(IP(src="1.1.1.1", dst="192.168.1.10"),
+            IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=5000, dport=53) /
+            Raw(query)),
+        eth(IPv6(src=v6b, dst=v6a), IPv6(src="fd00::1", dst="fd00::2") /
+            TCP(sport=5000, dport=443, flags="S")),
+        # UDP length 0; ICMP timestamp cut to 8 bytes; legacy QinQ 0x9100
+        eth(None, UDP(sport=5000, dport=53, len=0) / Raw(query)),
+        eth(IP(src="1.1.1.1", dst="192.168.1.10", proto=1),
+            Raw(b"\x0d\x00\xf2\xff\x00\x01\x00\x01")),
+        bytes.fromhex(gw.replace(":", "") + me.replace(":", "")) +
+        b"\x91\x00\x00\x63\x08\x00" + bytes(IP(src="1.1.1.1", dst="9.9.9.9") /
+                                            UDP(sport=1, dport=53) /
+                                            Raw(query)),
+    ]
+    return both, declined
+
+
+@self_test()
+def t_fast_decoder_unusual_frames(ctx):
+    """5.3.4 (S12): both decoders agree on the frames that differential
+    fuzzing found them disagreeing on."""
+    if not ctx.scapy_ok:
+        return "skip"
+    both, declined = _unusual_frames()
+    for i, raw in enumerate(both):
+        _fast_decode(raw, 1.0 + i, 1, TlsReassembler())   # must not decline
+    for raw in declined:
+        try:
+            _fast_decode(raw, 1.0, 1, TlsReassembler())
+            raise AssertionError(f"not declined: {Ether(raw).summary()}")
+        except NeedDeepParse:
+            pass
+    diffs = decoder_differences([(r, 1.0 + i, 1) for i, r in enumerate(
+        both + declined)])
+    assert not diffs, f"{len(diffs)} differences, e.g. " + \
+        " | ".join(diffs[:4])
+    d = fast_decode(both[6], 1.0)
+    assert d["text"] == "ICMPv6 Packet Too Big", d["text"]
+    assert fast_decode(both[11], 1.0)["proto"] == "ESP"
+    assert fast_decode(both[14], 1.0)["length"] == len(both[14])
+    assert fast_decode(declined[0], 1.0)["dport"] == 53
 
 
 class _PipelineHarness:
