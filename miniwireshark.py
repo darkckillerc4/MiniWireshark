@@ -7249,52 +7249,9 @@ def mac_vendor(mac):
     return ""
 
 
-def guess_device_type(hostname, vendor, ip, gateway_ip, my_ips):
-    h = (hostname or "").lower()
-    v = (vendor or "").lower()
-    if gateway_ip and ip == gateway_ip:
-        return "router"
-    if ip in my_ips:
-        return "this-pc"
-    checks = [
-        (("iphone", "ipad", "android", "galaxy", "pixel", "phone"),
-         "phone"),
-        (("ipad", "tablet", "tab"), "tablet"),
-        (("macbook", "imac", "mac-", "desktop", "laptop", "pc-",
-          "windows", "linux"), "computer"),
-        (("printer", "hp-", "canon", "epson", "brother"), "printer"),
-        (("tv", "roku", "chromecast", "appletv", "firetv", "bravia",
-          "samsung-tv", "smarttv"), "tv"),
-        (("xbox", "playstation", "ps4", "ps5", "nintendo", "switch"),
-         "console"),
-        (("echo", "alexa", "homepod", "google-home", "speaker"), "speaker"),
-        (("cam", "camera", "nest", "ring", "wyze"), "camera"),
-        (("espressif", "tuya", "sonoff", "shelly", "smart"),
-         "iot"),
-    ]
-    for keys, kind in checks:
-        if any(k in h for k in keys):
-            return kind
-    # vendor fallback
-    if any(x in v for x in ("apple",)):
-        return "phone"
-    if any(x in v for x in ("samsung", "huawei", "xiaomi", "oneplus",
-                            "oppo", "vivo", "motorola")):
-        return "phone"
-    if any(x in v for x in ("intel", "dell", "hp inc", "lenovo",
-                            "asus", "acer", "toshiba", "micro-star",
-                            "gigabyte")):
-        return "computer"
-    if any(x in v for x in ("brother", "canon", "epson", "hewlett")):
-        return "printer"
-    if any(x in v for x in ("sony", "lg electronics", "tcl", "vizio",
-                            "roku", "amazon")):
-        return "tv"
-    if any(x in v for x in ("espressif", "tuya", "sonoff", "shelly",
-                            "raspberr", "arduino")):
-        return "iot"
-    return "unknown"
-
+# 5.3.4 (C-02): guess_device_type, a second set of device rules that
+# nothing called (and that got iPads and network switches wrong), was
+# removed; classify_device and DEVICE_SIGNATURES are the only rules.
 
 
 # ---- 4b.  More well-known services (added in 3.0) --------------------------
@@ -7922,6 +7879,30 @@ def _decode_dhcp(pkt):
     return dhcp_from_options(pkt[DHCP].options, yiaddr, chaddr)
 
 
+def dhcp55_norm(val):
+    """DHCP option 55 (the list of settings a client asks for) as
+    "1,3,6,15": numbers 1-254 in the order sent, repeats dropped. The
+    order is the fingerprint, so it is never sorted."""
+    if isinstance(val, (bytes, bytearray)):
+        val = list(val)
+    elif isinstance(val, int):
+        val = [val]
+    elif isinstance(val, str):
+        val = re.findall(r"\d+", val)
+    elif not isinstance(val, (list, tuple)):
+        return ""
+    out, seen = [], set()
+    for x in val:
+        try:
+            n = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 0 < n < 255 and n not in seen:
+            seen.add(n)
+            out.append(str(n))
+    return ",".join(out[:120])
+
+
 def dhcp_from_options(options, yiaddr, chaddr_bytes):
     """Shared by the scapy decoder and the fast wire decoder. `options` is
     a list of tuples (code-or-scapy-name, value, ...)."""
@@ -7956,9 +7937,9 @@ def dhcp_from_options(options, yiaddr, chaddr_bytes):
             elif code in (6, "name_server"):
                 info["dns_servers"] = [str(v) for v in opt[1:]][:8]
             elif code in (55, "param_req_list"):
-                info["param_list"] = ",".join(str(x) for x in val)[:80] \
-                    if isinstance(val, (list, tuple, bytes)) \
-                    else str(val)[:80]
+                # 5.3.4 (MC3): the whole list, in order (it was cut to 80
+                # characters, which lost the tail that tells systems apart)
+                info["param_list"] = dhcp55_norm(val)
             elif code in (61, "client_id"):
                 if isinstance(val, bytes):
                     info["client_id"] = val[:32].hex()
@@ -8107,13 +8088,43 @@ def _l4_payload(pkt, l4):
     return data
 
 
+_SYN_OPT_LETTER = {0: "E", 1: "N", 2: "M", 3: "W", 4: "S", 8: "T"}
+
+
+def tcp_syn_sig(win, opts):
+    """5.3.4 (IP-017): how a SYN sets up its connection, as
+    "window:MSS:window scale:option order", e.g. "64240:1460:8:M,N,W,N,N,S".
+    Each operating system's network code has its own habits, so this is
+    a weak hint at the system (never more than "Possibly"). Shared by
+    both decoders; only SYN packets pay for it."""
+    order, mss, ws, p, n = [], 0, -1, 0, len(opts)
+    while p < n and len(order) < 20:
+        kind = opts[p]
+        order.append(_SYN_OPT_LETTER.get(kind, str(kind)))
+        if kind == 0:
+            break
+        if kind == 1:
+            p += 1
+            continue
+        if p + 1 >= n or opts[p + 1] < 2 or p + opts[p + 1] > n:
+            order.append("?")              # cut short or a bad length
+            break
+        ln = opts[p + 1]
+        if kind == 2 and ln == 4:
+            mss = (opts[p + 2] << 8) | opts[p + 3]
+        elif kind == 3 and ln == 3:
+            ws = opts[p + 2]
+        p += ln
+    return f"{win}:{mss}:{ws}:{','.join(order)}"
+
+
 def _new_decoded(pkt):
     return {"proto": "?", "tag": "OTHER", "text": "",
             "src": "", "dst": "", "src_ip": "", "dst_ip": "",
             "src_mac": "", "dst_mac": "", "ttl": "", "ttl_int": 0,
             "sport": None, "dport": None, "ipver": 0, "transport": "",
             "tcp_flags": None, "seq": None, "ack": None, "win": None,
-            "payload_len": 0,
+            "tcp_syn": "", "payload_len": 0,
             "dns_names": [], "doh_hint": "", "plain_dns": False,
             "type_hint": "", "dhcp_msgtype": None, "arp_op": None,
             "dhcp_yiaddr": "", "dhcp_hostname": "", "dhcp_client_mac": "",
@@ -8210,6 +8221,12 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
         d["seq"] = int(t.seq)
         d["ack"] = int(t.ack)
         d["win"] = int(t.window)
+        if flags & 0x02:
+            try:
+                hdr = bytes(t)[20:int(t.dataofs or 5) * 4]
+            except (TypeError, ValueError, struct.error):
+                hdr = b""
+            d["tcp_syn"] = tcp_syn_sig(d["win"], hdr)
         names = [n for b, n in ((0x01, "FIN"), (0x02, "SYN"), (0x04, "RST"),
                                 (0x08, "PSH"), (0x10, "ACK"), (0x20, "URG"))
                  if flags & b]
@@ -9502,7 +9519,7 @@ def _fast_new(raw, ts, lt):
             "src_mac": "", "dst_mac": "", "ttl": "", "ttl_int": 0,
             "sport": None, "dport": None, "ipver": 0, "transport": "",
             "tcp_flags": None, "seq": None, "ack": None, "win": None,
-            "payload_len": 0,
+            "tcp_syn": "", "payload_len": 0,
             "dns_names": [], "doh_hint": "", "plain_dns": False,
             "type_hint": "", "dhcp_msgtype": None, "arp_op": None,
             "dhcp_yiaddr": "", "dhcp_hostname": "", "dhcp_client_mac": "",
@@ -9772,6 +9789,8 @@ def _fast_tcp(d, raw, p, end, reasm):
     d["seq"] = seq
     d["ack"], d["win"] = struct.unpack_from(">I", raw, p + 8)[0], \
         struct.unpack_from(">H", raw, p + 14)[0]
+    if flags & 0x02:                    # 5.3.4 (IP-017): SYN only
+        d["tcp_syn"] = tcp_syn_sig(d["win"], bytes(raw[p + 20:p + dataofs]))
     names = [nm for b, nm in _TCP_FLAG_NAMES if flags & b]
     svc, sport_ = _port_service(sport, dport)
     d["service"], d["service_port"] = svc, sport_
@@ -10828,6 +10847,7 @@ FEATURES = {
     "win_timer": True,       # 1 ms Windows timer while busy (5.2.3, B-06)
     "ready_panel": True,     # "Ready?" lines in the Welcome Center (5.3.4)
     "story_mode": True,      # the Timeline tells what changed by day (M7)
+    "signatures_v2": True,   # device signature additions, pairing (5.3.4)
 }
 
 
@@ -10989,6 +11009,9 @@ FEATURE_HELP = {
                    "what isn't",
     "story_mode": "the Timeline can tell what changed as a story, day by "
                   "day, with a Dashboard card",
+    "signatures_v2": "more ways to tell what a device is (model names, how "
+                     "it opens connections, look-alike devices) and DHCP "
+                     "clues for spotting one device under a new address",
 }
 
 
@@ -12160,6 +12183,7 @@ class DeviceRecord:
     place: str = ""          # 5.1.2: "Kitchen" — yours, like the name
     owner: str = ""          # 5.1.2: "Sam"
     os_ttl: int = 0
+    tcp_stack: str = ""      # 5.3.4 (IP-017): tcp_syn_sig of its own SYN
     ip_history: list = field(default_factory=list)       # [ip, first, last]
     mac_history: list = field(default_factory=list)      # [mac, first, last]
     dhcp_history: list = field(default_factory=list)     # [ip, when, secs, host]
@@ -12240,6 +12264,10 @@ class DeviceRecord:
         n = self.best_name()
         if n:
             return n
+        if self.model_hint and FEATURES.get("signatures_v2", True):
+            n = model_product_name(self.model_hint)      # 5.3.4 (IP-016)
+            if n:
+                return n
         if self.vendor:
             return f"{self.vendor} device"
         return self.ip or self.mac or self.key
@@ -12296,7 +12324,7 @@ IFACE_STAT_FIELDS = ("packets", "packets_out", "packets_in", "bytes_up",
 _MERGE_COPIED = ("hostname", "hostname_source", "dhcp_hostname",
                  "mdns_name", "ssdp_name", "vendor", "alias", "notes",
                  "place", "owner", "model_hint", "dhcp_vendor_class", "ssdp_server",
-                 "dhcp_client_id", "mine", "expected")
+                 "dhcp_client_id", "mine", "expected", "tcp_stack")
 
 DEVICE_SAVE_FIELDS = (
     "key", "ip", "mac", "vendor", "hostname", "hostname_source",
@@ -12311,7 +12339,7 @@ DEVICE_SAVE_FIELDS = (
     "ip_history", "mac_history", "dhcp_history", "hostname_history",
     "presence", "merge_note", "merged_from", "demo", "dhcp_client_id",
     "dhcp_params", "network_id", "iface_stats", "user_class", "place",
-    "owner")
+    "owner", "tcp_stack")
 
 
 def looks_generated(name):
@@ -12460,117 +12488,350 @@ def device_from_dict(dd):
 
 
 # ---- fingerprinting --------------------------------------------------------
-_HOST_PATTERNS = [
-    (r"iphone", "iPhone", 55), (r"ipad", "Tablet", 55),
-    (r"android|galaxy|pixel|^sm-[a-z]\d|oneplus|redmi|xiaomi|huawei|"
-     r"moto[- ]?g|nokia", "Android phone", 45),
-    (r"^desktop-[a-z0-9]{5,}|^laptop-[a-z0-9]{5,}|-pc$|^win-|windows",
-     "Windows PC", 45),
-    (r"macbook|imac|mac-?mini|mac-?pro|-mbp|-mba|s-mac", "Mac", 50),
-    (r"raspberrypi|ubuntu|debian|fedora|arch|linux|mint", "Linux PC", 35),
-    (r"synology|diskstation|qnap|truenas|nas\b|nas-|unraid|readynas",
+# 5.3.4 (MC3): every rule that names a kind of device is one row of
+# DEVICE_SIGNATURES: (what it looks at, pattern, kind, points, why[, "v2"]).
+# One engine, classify_device, scores the rows; the corpus self-test
+# (t_identity_corpus_accuracy) measures them. What a row looks at:
+#   name    a regex on the names it announced (DHCP, mDNS, NetBIOS, UPnP)
+#   model   a regex on the model it advertised in mDNS
+#   vendor  a regex on the maker of its MAC prefix
+#   mac     the start of its MAC address
+#   mdns    a piece of a service type it advertised
+#   ssdp    a regex on its UPnP announcement
+#   dhcp60  a regex on its DHCP vendor class (option 60)
+#   dhcp55  its DHCP parameter request list (option 55), exactly. Such a
+#           row must name the real capture behind it in its reason, because
+#           iOS and macOS (and Windows 10 and 11) send the same lists; none
+#           ships until the owner's captures arrive (plan §9, decision 5).
+#           Devices on YOUR network are still compared with each other
+#           (dhcp_peers) and with the types you set (LearnedTypes).
+#   syn     a regex on how it opens connections (tcp_syn_sig)
+#   ttl     "low-high": the TTL its packets start with
+#   rand    it uses a private (randomized) Wi-Fi address
+#   sites   a regex on the websites it contacted
+#   seen    a kind of local evidence it gave (EVIDENCE_WEIGHTS keys)
+# Rules that need the network's context stay code in classify_device: the
+# gateway, the router's MACs, IPv6 router adverts, container ranges.
+# Rows marked "v2" are the 5.3.4 additions; they count only while the
+# signatures_v2 switch is on. No row is copied from a licensed database.
+DEVICE_SIGNATURES = (
+    ("name", r"iphone", "iPhone", 55), ("name", r"ipad", "Tablet", 55),
+    ("name", r"android|galaxy|pixel|^sm-[a-z]\d|oneplus|redmi|xiaomi|"
+             r"huawei|moto[- ]?g|nokia", "Android phone", 45),
+    ("name", r"^desktop-[a-z0-9]{5,}|^laptop-[a-z0-9]{5,}|-pc$|^win-|"
+             r"windows", "Windows PC", 45),
+    ("name", r"macbook|imac|mac-?mini|mac-?pro|-mbp|-mba|s-mac", "Mac", 50),
+    # 5.3.4 (C-02): whole words only, so "search" is not Arch Linux and
+    # "peppermint" not Mint
+    ("name", r"raspberrypi|ubuntu|debian|fedora|\barch\b|archlinux|linux|"
+             r"\bmint\b", "Linux PC", 35),
+    ("name", r"synology|diskstation|qnap|truenas|nas\b|nas-|unraid|readynas",
      "NAS", 50),
-    (r"printer|^hp[0-9a-f]{6}|officejet|laserjet|deskjet|canon|epson|"
-     r"brother|^brw|^npi[0-9a-f]", "Printer", 50),
-    (r"roku|chromecast|fire-?tv|firestick|apple-?tv|shield|androidtv",
+    ("name", r"printer|^hp[0-9a-f]{6}|officejet|laserjet|deskjet|canon|"
+             r"epson|brother|^brw|^npi[0-9a-f]", "Printer", 50),
+    ("name", r"roku|chromecast|fire-?tv|firestick|apple-?tv|shield|androidtv",
      "Streaming device", 50),
-    (r"\btv\b|bravia|webos|tizen|smarttv|-tv$|^tv-|vizio|hisense",
+    ("name", r"\btv\b|bravia|webos|tizen|smarttv|-tv$|^tv-|vizio|hisense",
      "Smart TV", 45),
-    (r"xbox|playstation|ps4|ps5|nintendo|switch", "Console", 50),
-    (r"echo|alexa|homepod|sonos|google-?home|nest-?(audio|mini|hub)|"
-     r"speaker", "Speaker", 45),
-    (r"cam\b|camera|ipcam|ring-|wyze|arlo|reolink|hikvision|dahua|eufy",
+    # 5.3.4 (C-02): not "switch", which network switches are called too
+    ("name", r"xbox|playstation|ps4|ps5|nintendo", "Console", 50),
+    ("name", r"\becho\b|alexa|homepod|sonos|google-?home|"
+             r"nest-?(audio|mini|hub)|speaker", "Speaker", 45),
+    ("name", r"cam\b|camera|ipcam|ring-|wyze|arlo|reolink|hikvision|dahua|"
+             r"eufy", "Camera", 45),
+    ("name", r"esp[-_]?[0-9a-f]{4,}|espressif|tasmota|shelly|tuya|sonoff|"
+             r"wled|\bhue\b|smartplug|plug|bulb|lifx|wemo|meross|"
+             r"tplink-?(hs|kp)", "Smart-home/IoT", 40),
+    ("name", r"^ap[-_]|unifi|uap|eap\d|deco|eero|orbi|mesh|repeater|"
+             r"extender", "Access point", 40),
+    ("name", r"server|srv|proxmox|esxi|pve|hypervisor", "Server", 35),
+    # TP-Link Kasa plugs and bulbs call themselves by their model
+    ("name", r"^(hs|kp|ep|kl)\d{3}\b", "Smart-home/IoT", 40, "", "v2"),
+    ("name", r"yeelink|chuangmi|zhimi|lumi-|roborock|roomba|irobot|ecobee|"
+             r"thermostat", "Smart-home/IoT", 40, "", "v2"),
+    # the model it advertised in mDNS (see APPLE_MODEL_NAMES for names)
+    ("model", r"macbook|imac|macmini|macpro|mac\d", "Mac", 70),
+    ("model", r"iphone", "iPhone", 70), ("model", r"ipad", "Tablet", 70),
+    ("model", r"appletv", "Streaming device", 70),
+    ("model", r"audioaccessory|homepod", "Speaker", 70),
+    ("model", r"chromecast|google tv", "Streaming device", 70),
+    ("model", r"nest|google home", "Speaker", 50),
+    ("model", r"nest (mini|audio|hub)|home mini", "Speaker", 20, "", "v2"),
+    ("model", r"^airport\d", "Access point", 70, "", "v2"),
+    # the maker of its MAC prefix
+    ("vendor", r"apple", "iPhone", 15), ("vendor", r"apple", "Mac", 10),
+    ("vendor", r"apple", "Tablet", 6),
+    ("vendor", r"samsung|xiaomi|oneplus|oppo|vivo|motorola|huawei|honor|"
+               r"realme|nokia", "Android phone", 18),
+    ("vendor", r"samsung|xiaomi|oneplus|oppo|vivo|motorola|huawei|honor|"
+               r"realme|nokia", "Smart TV", 4),
+    ("vendor", r"google", "Android phone", 8),
+    ("vendor", r"google", "Streaming device", 8),
+    ("vendor", r"google", "Speaker", 6),
+    ("vendor", r"intel|realtek|liteon|azurewave|dell|lenovo|hp inc|"
+               r"hewlett packard enterprise|micro-star|gigabyte|asustek|"
+               r"clevo|rivet|killer|qualcomm atheros", "Windows PC", 15),
+    ("vendor", r"intel|realtek|liteon|azurewave|dell|lenovo|hp inc|"
+               r"hewlett packard enterprise|micro-star|gigabyte|asustek|"
+               r"clevo|rivet|killer|qualcomm atheros", "Linux PC", 6),
+    ("vendor", r"brother|canon|seiko epson|epson|hewlett|lexmark|xerox|"
+               r"kyocera|ricoh", "Printer", 35),
+    ("vendor", r"sony|lg electronics|lg innotek|tcl|vizio|hisense|panasonic|"
+               r"sharp|funai", "Smart TV", 20),
+    ("vendor", r"sony|lg electronics|lg innotek|tcl|vizio|hisense|panasonic|"
+               r"sharp|funai", "Console", 6),
+    ("vendor", r"roku", "Streaming device", 40),
+    ("vendor", r"amazon", "Speaker", 15),
+    ("vendor", r"amazon", "Streaming device", 15),
+    ("vendor", r"sonos|bose|harman", "Speaker", 45),
+    ("vendor", r"espressif|tuya|shelly|sonoff|itead|signify|philips lighting|"
+               r"lifx|wyze|belkin|meross|ecobee|nest labs|ezviz|broadlink|wiz",
+     "Smart-home/IoT", 35),
+    ("vendor", r"raspberry", "Linux PC", 30),
+    ("vendor", r"raspberry", "Smart-home/IoT", 10),
+    ("vendor", r"synology|qnap|western digital|buffalo", "NAS", 45),
+    ("vendor", r"nintendo", "Console", 50),
+    ("vendor", r"ubiquiti|tp-link|netgear|cisco|aruba|ruckus|eero|linksys|"
+               r"zyxel|mikrotik|d-link|asus|arris|technicolor|sagemcom|avm|"
+               r"huawei device", "Access point", 18),
+    ("vendor", r"ubiquiti|tp-link|netgear|cisco|aruba|ruckus|eero|linksys|"
+               r"zyxel|mikrotik|d-link|asus|arris|technicolor|sagemcom|avm|"
+               r"huawei device", "Router", 12),
+    ("vendor", r"hikvision|dahua|axis|reolink|arlo|amcrest|hanwha|uniview",
      "Camera", 45),
-    (r"esp[-_]?[0-9a-f]{4,}|espressif|tasmota|shelly|tuya|sonoff|wled|"
-     r"hue|smartplug|plug|bulb|lifx|wemo|meross|tplink-?(hs|kp)",
-     "Smart-home/IoT", 40),
-    (r"^ap[-_]|unifi|uap|eap\d|deco|eero|orbi|mesh|repeater|extender",
-     "Access point", 40),
-    (r"server|srv|proxmox|esxi|pve|hypervisor", "Server", 35),
-]
-_VENDOR_PATTERNS = [
-    (r"apple", (("iPhone", 15), ("Mac", 10), ("Tablet", 6))),
-    (r"samsung|xiaomi|oneplus|oppo|vivo|motorola|huawei|honor|realme|nokia",
-     (("Android phone", 18), ("Smart TV", 4))),
-    (r"google", (("Android phone", 8), ("Streaming device", 8),
-                 ("Speaker", 6))),
-    (r"intel|realtek|liteon|azurewave|dell|lenovo|hp inc|hewlett packard enterprise|"
-     r"micro-star|gigabyte|asustek|clevo|rivet|killer|qualcomm atheros",
-     (("Windows PC", 15), ("Linux PC", 6))),
-    (r"brother|canon|seiko epson|epson|hewlett|lexmark|xerox|kyocera|ricoh",
-     (("Printer", 35),)),
-    (r"sony|lg electronics|lg innotek|tcl|vizio|hisense|panasonic|sharp|"
-     r"funai", (("Smart TV", 20), ("Console", 6))),
-    (r"roku", (("Streaming device", 40),)),
-    (r"amazon", (("Speaker", 15), ("Streaming device", 15))),
-    (r"sonos|bose|harman", (("Speaker", 45),)),
-    (r"espressif|tuya|shelly|sonoff|itead|signify|philips lighting|lifx|"
-     r"wyze|belkin|meross|ecobee|nest labs|ezviz|broadlink|wiz",
-     (("Smart-home/IoT", 35),)),
-    (r"raspberry", (("Linux PC", 30), ("Smart-home/IoT", 10))),
-    (r"synology|qnap|western digital|buffalo", (("NAS", 45),)),
-    (r"nintendo", (("Console", 50),)),
-    (r"ubiquiti|tp-link|netgear|cisco|aruba|ruckus|eero|linksys|zyxel|"
-     r"mikrotik|d-link|asus|arris|technicolor|sagemcom|avm|huawei device",
-     (("Access point", 18), ("Router", 12))),
-    (r"hikvision|dahua|axis|reolink|arlo|amcrest|hanwha|uniview",
-     (("Camera", 45),)),
-    (r"vmware|virtualbox|oracle|parallels|qemu|xensource|red hat",
-     (("Virtual machine", 50),)),
-]
-_SSDP_PATTERNS = [
-    (r"internetgatewaydevice|wanipconnection", "Router", 60),
-    (r"windows", "Windows PC", 12), (r"synology|qnap", "NAS", 50),
-    (r"roku|chromecast|google cast|fire ?tv", "Streaming device", 45),
-    (r"samsung|bravia|webos|lg |smarttv|dial", "Smart TV", 30),
-    (r"sonos|bose", "Speaker", 45), (r"xbox|playstation|nintendo",
-                                      "Console", 45),
-    (r"printer|ipp|hp |epson|canon|brother", "Printer", 40),
-    (r"hue|wemo|smartthings", "Smart-home/IoT", 40),
-    (r"mediarenderer", "Smart TV", 10), (r"mediaserver", "NAS", 10),
-    (r"camera|hikvision|dahua|onvif", "Camera", 40),
-]
-_MDNS_PATTERNS = [
-    ("_ipp._tcp", "Printer", 60), ("_printer._tcp", "Printer", 60),
-    ("_pdl-datastream", "Printer", 60), ("_scanner._tcp", "Printer", 40),
-    ("_uscan._tcp", "Printer", 40),
-    ("_googlecast", "Streaming device", 45), ("_airplay", "Streaming device", 15),
-    ("_raop", "Speaker", 20), ("_spotify-connect", "Speaker", 20),
-    ("_sonos", "Speaker", 50), ("_homekit", "Smart-home/IoT", 30),
-    ("_hap._tcp", "Smart-home/IoT", 35), ("_matter", "Smart-home/IoT", 35),
-    ("_hue", "Smart-home/IoT", 40), ("_esphomelib", "Smart-home/IoT", 50),
-    ("_smb._tcp", "NAS", 8), ("_afpovertcp", "NAS", 8),
-    ("_adisk._tcp", "NAS", 35), ("_device-info", "Mac", 5),
-    ("_companion-link", "iPhone", 10), ("_apple-mobdev2", "iPhone", 30),
-    ("_rdlink", "Mac", 25), ("_ssh._tcp", "Linux PC", 10),
-    ("_workstation._tcp", "Linux PC", 20), ("_nvstream", "Windows PC", 30),
-    ("_xbox", "Console", 50), ("_amzn-wplay", "Streaming device", 40),
-    ("_androidtvremote", "Streaming device", 45),
-]
-_MODEL_PATTERNS = [
-    (r"macbook|imac|macmini|macpro|mac\d", "Mac", 70),
-    (r"iphone", "iPhone", 70), (r"ipad", "Tablet", 70),
-    (r"appletv", "Streaming device", 70), (r"audioaccessory|homepod",
-                                           "Speaker", 70),
-    (r"chromecast|google tv", "Streaming device", 70),
-    (r"nest|google home", "Speaker", 50),
-]
+    ("vendor", r"vmware|virtualbox|oracle|parallels|qemu|xensource|red hat",
+     "Virtual machine", 50),
+    ("vendor", r"sony interactive", "Console", 45, "", "v2"),
+    # makers of several kinds: no points, but their make is no contradiction
+    # (no "But: made by Apple" under an Apple TV)
+    ("vendor", r"apple", "Streaming device", 0, "", "v2"),
+    ("vendor", r"apple", "Speaker", 0, "", "v2"),
+    ("vendor", r"apple", "Access point", 0, "", "v2"),
+    ("vendor", r"tp-link", "Smart-home/IoT", 0, "", "v2"),
+    ("vendor", r"microsoft", "Console", 0, "", "v2"),
+    # the start of its MAC address
+    ("mac", "00:15:5d", "Virtual machine", 60,
+     "Its MAC prefix belongs to Hyper-V virtual machines"),
+    ("mac", "08:00:27", "Virtual machine", 60,
+     "Its MAC prefix belongs to VirtualBox virtual machines", "v2"),
+    ("mac", "52:54:00", "Virtual machine", 60,
+     "Its MAC prefix is the one QEMU/KVM virtual machines use", "v2"),
+    # services it advertised over mDNS (Bonjour)
+    ("mdns", "_ipp._tcp", "Printer", 60),
+    ("mdns", "_printer._tcp", "Printer", 60),
+    ("mdns", "_pdl-datastream", "Printer", 60),
+    ("mdns", "_scanner._tcp", "Printer", 40),
+    ("mdns", "_uscan._tcp", "Printer", 40),
+    ("mdns", "_googlecast", "Streaming device", 45),
+    ("mdns", "_airplay", "Streaming device", 15),
+    ("mdns", "_raop", "Speaker", 20),
+    ("mdns", "_spotify-connect", "Speaker", 20),
+    ("mdns", "_sonos", "Speaker", 50),
+    ("mdns", "_homekit", "Smart-home/IoT", 30),
+    ("mdns", "_hap._tcp", "Smart-home/IoT", 35),
+    ("mdns", "_matter", "Smart-home/IoT", 35),
+    ("mdns", "_hue", "Smart-home/IoT", 40),
+    ("mdns", "_esphomelib", "Smart-home/IoT", 50),
+    ("mdns", "_smb._tcp", "NAS", 8), ("mdns", "_afpovertcp", "NAS", 8),
+    ("mdns", "_adisk._tcp", "NAS", 35), ("mdns", "_device-info", "Mac", 5),
+    ("mdns", "_companion-link", "iPhone", 10),
+    ("mdns", "_apple-mobdev2", "iPhone", 30),
+    ("mdns", "_rdlink", "Mac", 25), ("mdns", "_ssh._tcp", "Linux PC", 10),
+    ("mdns", "_workstation._tcp", "Linux PC", 20),
+    ("mdns", "_nvstream", "Windows PC", 30), ("mdns", "_xbox", "Console", 50),
+    ("mdns", "_amzn-wplay", "Streaming device", 40),
+    ("mdns", "_androidtvremote", "Streaming device", 45),
+    ("mdns", "_ipps._tcp", "Printer", 60, "", "v2"),
+    ("mdns", "_privet", "Printer", 30, "", "v2"),
+    ("mdns", "_mediaremotetv", "Streaming device", 40, "", "v2"),
+    ("mdns", "_shelly", "Smart-home/IoT", 50, "", "v2"),
+    ("mdns", "_wled", "Smart-home/IoT", 50, "", "v2"),
+    ("mdns", "_amzn-alexa", "Speaker", 40, "", "v2"),
+    ("mdns", "_axis-video", "Camera", 60, "", "v2"),
+    ("mdns", "_qdiscover", "NAS", 45, "", "v2"),
+    # its UPnP (SSDP) announcement
+    ("ssdp", r"internetgatewaydevice|wanipconnection", "Router", 60),
+    ("ssdp", r"windows", "Windows PC", 12),
+    ("ssdp", r"synology|qnap", "NAS", 50),
+    ("ssdp", r"roku|chromecast|google cast|fire ?tv", "Streaming device", 45),
+    ("ssdp", r"samsung|bravia|webos|lg |smarttv|dial", "Smart TV", 30),
+    ("ssdp", r"sonos|bose", "Speaker", 45),
+    ("ssdp", r"xbox|playstation|nintendo", "Console", 45),
+    ("ssdp", r"printer|ipp|hp |epson|canon|brother", "Printer", 40),
+    ("ssdp", r"hue|wemo|smartthings", "Smart-home/IoT", 40),
+    ("ssdp", r"mediarenderer", "Smart TV", 10),
+    ("ssdp", r"mediaserver", "NAS", 10),
+    ("ssdp", r"camera|hikvision|dahua|onvif", "Camera", 40),
+    ("ssdp", r"ipbridge", "Smart-home/IoT", 40, "", "v2"),
+    # its DHCP vendor class (option 60): rows from before the IP-014 rule
+    ("dhcp60", r"^msft", "Windows PC", 40,
+     "Its DHCP request identifies Windows (MSFT 5.0)"),
+    ("dhcp60", r"^android-dhcp", "Android phone", 45,
+     "Its DHCP request identifies Android"),
+    ("dhcp60", r"dhcpcd|udhcp", "Linux PC", 10,
+     "Its DHCP client is a Linux one"),
+    ("dhcp60", r"dhcpcd|udhcp", "Smart-home/IoT", 10,
+     "Its DHCP client is common on gadgets"),
+    # how it opens connections (IP-017): the network code of each system
+    # has its own habits; weak, never more than "Possibly" on its own
+    ("syn", r":8:M,N,W,N,N,S$", "Windows PC", 12,
+     "It opens connections the way Windows does (weak hint)", "v2"),
+    ("syn", r":M,S,T,N,W$", "Linux PC", 6,
+     "It opens connections the way Linux and Android do (weak hint)", "v2"),
+    ("syn", r":M,S,T,N,W$", "Android phone", 6,
+     "It opens connections the way Linux and Android do (weak hint)", "v2"),
+    ("syn", r":M,N,W,N,N,T,S,E", "Mac", 6,
+     "It opens connections the way Apple systems do (weak hint)", "v2"),
+    ("syn", r":M,N,W,N,N,T,S,E", "iPhone", 6,
+     "It opens connections the way Apple systems do (weak hint)", "v2"),
+    ("syn", r":M,N,W,N,N,T,S,E", "Tablet", 4,
+     "It opens connections the way Apple systems do (weak hint)", "v2"),
+    # the TTL its packets start with
+    ("ttl", "65-128", "Windows PC", 8,
+     "Its packets start with TTL 128, typical of Windows (weak hint)"),
+    ("ttl", "129-255", "Router", 5,
+     "Its packets start with TTL 255, typical of network gear (weak hint)"),
+    # a private (randomized) Wi-Fi address
+    ("rand", "", "iPhone", 6, "It uses a private (randomized) Wi-Fi address, "
+                              "which phones do by default"),
+    ("rand", "", "Android phone", 6, "It uses a private (randomized) Wi-Fi "
+                                     "address, which phones do by default"),
+    ("rand", "", "Tablet", 6, "It uses a private (randomized) Wi-Fi address, "
+                              "which phones do by default"),
+    ("rand", "", "Mac", 3, "It uses a private (randomized) Wi-Fi address"),
+    ("rand", "", "Windows PC", 3,
+     "It uses a private (randomized) Wi-Fi address"),
+    # the websites it contacted (very weak)
+    ("sites", r"xboxlive|playstation|nintendo", "Console", 5,
+     "It contacts game-console services (very weak hint)"),
+    ("sites", r"icloud|apple\.com", "iPhone", 3,
+     "It contacts Apple services (very weak hint)"),
+    ("sites", r"icloud|apple\.com", "Mac", 3,
+     "It contacts Apple services (very weak hint)"),
+    # the local evidence it gave
+    ("seen", "nbns", "Windows PC", 8,
+     "It answers Windows network name lookups (NetBIOS)", "v2"),
+)
+# Points from these never make a guess "Likely" on their own (IP-014,
+# IP-017): they can only tip a guess that other evidence already makes.
+_SIG_WEAK_V2 = frozenset(("syn", "dhcp55", "peer"))
+# Kinds that are often the same box, so evidence for one doesn't
+# contradict the other (no "But:" line, ST-12).
+_KIND_NEIGHBOURS = {frozenset(p) for p in (
+    ("Smart TV", "Streaming device"), ("Router", "Access point"),
+    ("Linux PC", "Server"), ("Linux PC", "NAS"), ("NAS", "Server"),
+    ("Linux PC", "Smart-home/IoT"), ("iPhone", "Tablet"),
+    ("Speaker", "Streaming device"), ("Speaker", "Smart-home/IoT"),
+    ("Camera", "Smart-home/IoT"),
+    ("Container/virtual interface", "Virtual machine"),
+    ("Virtual machine", "Linux PC"), ("Virtual machine", "Windows PC"),
+    ("Virtual machine", "Server"))}
+
+
+def _compile_signatures(rows, v2):
+    out = []
+    for row in rows:
+        field, pat, cls, pts = row[:4]
+        why = row[4] if len(row) > 4 else ""
+        if len(row) > 5 and row[5] == "v2" and not v2:
+            continue
+        rx = re.compile(pat) if field in ("name", "model", "vendor", "ssdp",
+                                          "dhcp60", "syn", "sites") else pat
+        out.append((field, rx, cls, pts, why))
+    return out
+
+
+_SIGS = {}
+
+
+def device_signatures():
+    """The compiled rows in use (with or without the 5.3.4 additions)."""
+    v2 = bool(FEATURES.get("signatures_v2", True))
+    rows = _SIGS.get(v2)
+    if rows is None:
+        rows = _SIGS[v2] = _compile_signatures(DEVICE_SIGNATURES, v2)
+    return rows
+
+
+# 5.3.4 (IP-016): Apple's model codes ("MacBookPro18,3") as the product
+# names on Apple's public "identify your model" pages. Several products
+# share an Apple-silicon "MacNN,N" code, so those stay just "Mac".
+APPLE_MODEL_NAMES = (
+    (r"MacBookPro\d", "MacBook Pro"), (r"MacBookAir\d", "MacBook Air"),
+    (r"MacBook\d", "MacBook"), (r"iMacPro\d", "iMac Pro"),
+    (r"iMac\d", "iMac"), (r"Macmini\d", "Mac mini"), (r"MacPro\d", "Mac Pro"),
+    (r"Mac\d+,\d", "Mac"), (r"iPhone\d", "iPhone"), (r"iPad\d", "iPad"),
+    (r"iPod\d", "iPod touch"), (r"AppleTV\d", "Apple TV"),
+    (r"AudioAccessory[56],", "HomePod mini"),
+    (r"AudioAccessory\d", "HomePod"), (r"AirPort\d", "AirPort base station"),
+    (r"Watch\d", "Apple Watch"), (r"RealityDevice\d", "Apple Vision Pro"),
+)
+_APPLE_MODEL_RX = [(re.compile(p), n) for p, n in APPLE_MODEL_NAMES]
+
+
+def model_product_name(code):
+    """'MacBookPro18,3' -> 'MacBook Pro'; '' when the code isn't one."""
+    c = (code or "").strip()
+    if not c or len(c) > 40:
+        return ""
+    for rx, name in _APPLE_MODEL_RX:
+        if rx.match(c):
+            return name
+    return ""
+
+
+def _a(kind):
+    return ("an " if kind[:1].lower() in "aeiou" else "a ") + kind
+
+
+def dhcp_fingerprint(dev):
+    """(option 55, option 60) when the request list is long enough to tell
+    systems apart, else None (IP-015, dhcp_peers)."""
+    p = dev.dhcp_params or ""
+    if p.count(",") < 3:
+        return None
+    return p, (dev.dhcp_vendor_class or "").lower()
+
+
+def dhcp_peers(devices):
+    """{dhcp fingerprint: (kind, name, key)} from the devices on this
+    network whose kind is known well (you set it, or "Likely"). A
+    fingerprint shared by devices of different kinds is left out."""
+    seen = {}
+    for d in devices:
+        fp = dhcp_fingerprint(d)
+        if fp is None:
+            continue
+        cls = d.user_class or (d.device_class if d.class_confidence ==
+                               "Likely" else "")
+        if not cls or cls in ("Unknown", "This computer", "Router",
+                              "Container/virtual interface"):
+            continue
+        cur = seen.get(fp)
+        if cur is None:
+            seen[fp] = (cls, d.display_name(), d.key)
+        elif cur and cur[0] != cls:
+            seen[fp] = ()                   # devices disagree: no hint
+    return {k: v for k, v in seen.items() if v}
 
 
 def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
-                    ra_routers=(), gw_macs=()):
+                    ra_routers=(), gw_macs=(), peers=None):
     """Best guess at what a device is, with the reasons. Never certain:
     returns (class, confidence_word, reasons) where confidence_word is
-    'Likely', 'Possibly' or ''."""
+    'Likely', 'Possibly' or ''. `peers` (from dhcp_peers) lets a device
+    that asks DHCP exactly like a known one share its kind (Possibly)."""
     if dev.ip and dev.ip in my_ips or (dev.mac and dev.mac in my_macs):
         return "This computer", "", ["This is the computer running "
                                      "MiniWireshark"]
     score = defaultdict(int)
-    why = defaultdict(list)
+    why = defaultdict(list)                 # cls -> [(field, reason)]
+    by_field = defaultdict(Counter)         # cls -> {field: points}
 
-    def add(cls, pts, reason):
+    def add(cls, pts, reason, fld="logic"):
         score[cls] += pts
-        why[cls].append(reason)
+        why[cls].append((fld, reason))
+        by_field[cls][fld] += pts
 
     if gateway_ip and dev.ip == gateway_ip:
         add("Router", 100, "It is your default gateway (router)")
@@ -12581,81 +12842,112 @@ def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
     if dev.is_virtual:
         add("Container/virtual interface", 80,
             "Its address is in a typical container/virtual-network range")
-    names = " ".join(sorted(dev.all_names())).lower()
-    for pat, cls, pts in _HOST_PATTERNS:
-        if names and re.search(pat, names):
-            add(cls, pts, f"Its name (“{dev.display_name()}”) "
-                          f"looks like a {cls.lower()}")
+    v2 = bool(FEATURES.get("signatures_v2", True))
+    names = [n for n in (dev.hostname, dev.mdns_name, dev.dhcp_hostname,
+                         dev.ssdp_name) if n]
+    low_names = [n.lower() for n in names]
     model = (dev.model_hint or "").lower()
-    for pat, cls, pts in _MODEL_PATTERNS:
-        if model and re.search(pat, model):
-            add(cls, pts, f"It advertised the model “{dev.model_hint}”")
-    v = (dev.vendor or "").lower()
-    if dev.mac and dev.mac.startswith("00:15:5d"):
-        add("Virtual machine", 60, "Its MAC prefix belongs to Hyper-V "
-                                   "virtual machines")
-    for pat, pairs in _VENDOR_PATTERNS:
-        if v and re.search(pat, v):
-            for cls, pts in pairs:
-                add(cls, pts, f"Made by {dev.vendor}")
-    for svc in dev.services:
-        s = svc.lower()
-        for key, cls, pts in _MDNS_PATTERNS:
-            if key in s:
-                add(cls, pts, f"It advertises the “{svc}” service")
+    vendor = (dev.vendor or "").lower()
+    mac = (dev.mac or "").lower()
+    svcs = [(s, s.lower()) for s in sorted(dev.services)]
     ssdp = (dev.ssdp_server + " " + " ".join(
         s for s in dev.services if not s.startswith("_"))).lower()
-    for pat, cls, pts in _SSDP_PATTERNS:
-        mt = re.search(pat, ssdp) if ssdp.strip() else None
-        if mt:
-            add(cls, pts, "Its UPnP announcement mentions "
-                          f"“{mt.group(0).strip()}”")
     vc = (dev.dhcp_vendor_class or "").lower()
-    if vc.startswith("msft"):
-        add("Windows PC", 40, "Its DHCP request identifies Windows (MSFT 5.0)")
-    elif vc.startswith("android-dhcp"):
-        add("Android phone", 45, "Its DHCP request identifies Android")
-    elif "dhcpcd" in vc or "udhcp" in vc:
-        add("Linux PC", 10, "Its DHCP client is a Linux one")
-        add("Smart-home/IoT", 10, "Its DHCP client is common on gadgets")
-    if dev.os_ttl:
-        if 65 <= dev.os_ttl <= 128:
-            add("Windows PC", 8, "Its packets start with TTL 128, typical of "
-                                 "Windows (weak hint)")
-        elif dev.os_ttl > 128:
-            add("Router", 5, "Its packets start with TTL 255, typical of "
-                             "network gear (weak hint)")
-    if dev.randomized_mac:
-        for cls in ("iPhone", "Android phone", "Tablet"):
-            add(cls, 6, "It uses a private (randomized) Wi-Fi address, "
-                        "which phones do by default")
-        add("Mac", 3, "It uses a private (randomized) Wi-Fi address")
-        add("Windows PC", 3, "It uses a private (randomized) Wi-Fi address")
+    stack = getattr(dev, "tcp_stack", "") or ""
     sites = " ".join(list(dev.websites)[:300]).lower()
-    if sites:
-        if "xboxlive" in sites or "playstation" in sites or \
-                "nintendo" in sites:
-            add("Console", 5, "It contacts game-console services (very weak "
-                              "hint)")
-        if "icloud" in sites or "apple.com" in sites:
-            for cls in ("iPhone", "Mac"):
-                add(cls, 3, "It contacts Apple services (very weak hint)")
+    seen_src = {e.source for e in dev.evidence} if v2 else set()
+    product = model_product_name(dev.model_hint) if v2 else ""
+    for fld, rx, cls, pts, text in device_signatures():
+        if fld == "name":
+            hit = next((n for n, low in zip(names, low_names)
+                        if rx.search(low)), None)
+            if hit:
+                # 5.3.4 (ST-12): the kind as it is written ("Windows PC",
+                # not "windows pc"), so it reads and translates right; and
+                # the name that matched, not whichever is shown
+                add(cls, pts, f"Its name (“{hit}”) looks like {_a(cls)}",
+                    fld)
+        elif fld == "model":
+            if model and rx.search(model):
+                add(cls, pts, f"It advertised the model “{dev.model_hint}”"
+                              + (f" ({product})" if product else ""), fld)
+        elif fld == "vendor":
+            if vendor and rx.search(vendor):
+                add(cls, pts, f"Made by {dev.vendor}", fld)
+        elif fld == "mac":
+            if mac.startswith(rx):
+                add(cls, pts, text, fld)
+        elif fld == "mdns":
+            for svc, low in svcs:
+                if rx in low:
+                    add(cls, pts, f"It advertises the “{svc}” service",
+                        fld)
+        elif fld == "ssdp":
+            mt = rx.search(ssdp) if ssdp.strip() else None
+            if mt:
+                add(cls, pts, "Its UPnP announcement mentions "
+                              f"“{mt.group(0).strip()}”", fld)
+        elif fld == "dhcp60":
+            if vc and rx.search(vc):
+                add(cls, pts, text, fld)
+        elif fld == "dhcp55":
+            if dev.dhcp_params and dev.dhcp_params == rx:
+                add(cls, pts, text, fld)
+        elif fld == "syn":
+            if stack and rx.search(stack):
+                add(cls, pts, text, fld)
+        elif fld == "ttl":
+            lo, _, hi = rx.partition("-")
+            if dev.os_ttl and int(lo) <= dev.os_ttl <= int(hi):
+                add(cls, pts, text, fld)
+        elif fld == "rand":
+            if dev.randomized_mac:
+                add(cls, pts, text, fld)
+        elif fld == "sites":
+            if sites and rx.search(sites):
+                add(cls, pts, text, fld)
+        elif fld == "seen":
+            if rx in seen_src:
+                add(cls, pts, text, fld)
+    if v2 and peers:
+        fp = dhcp_fingerprint(dev)
+        hit = peers.get(fp) if fp else None
+        if hit and hit[2] != dev.key:
+            add(hit[0], 25, f"It asks DHCP for the same settings, in the "
+                            f"same order, as “{hit[1]}”, which is likely "
+                            f"{_a(hit[0])}", "peer")
     if not score:
         return "Unknown", "", ["Not enough information yet — I cannot "
                                "determine this from passive traffic alone"]
     best = max(score, key=lambda c: score[c])
     pts = score[best]
-    word = "Likely" if pts >= 60 else ("Possibly" if pts >= 20 else "")
+    weak = sum(p for f, p in by_field[best].items() if f in _SIG_WEAK_V2)
+    word = "Likely" if pts - weak >= 60 else (
+        "Possibly" if pts >= 20 else "")
     if not word:
-        return "Unknown", "", (why[best][:3] + ["Too little evidence to "
-                                                "guess confidently"])
+        return "Unknown", "", ([r for _f, r in why[best]][:3] +
+                               ["Too little evidence to guess confidently"])
     seen, reasons = set(), []
-    for r in why[best]:
+    for _f, r in why[best]:
         if r not in seen:
             seen.add(r)
             reasons.append(r)
+    # 5.3.4 (ST-12): evidence for another kind, from a source the winner
+    # doesn't rest on, is said out loud instead of silently dropped
+    used = set(by_field[best])
+    for cls in sorted(score, key=lambda c: (-score[c], c)):
+        if cls == best or frozenset((cls, best)) in _KIND_NEIGHBOURS:
+            continue
+        other = [(f, r) for f, r in why[cls]
+                 if f not in used and f not in _SIG_WEAK_V2]
+        opts = sum(by_field[cls][f] for f in {f for f, _r in other})
+        if opts >= 10:
+            reasons = reasons[:5] + [f"But: {other[0][1]} — that hints at "
+                                     f"a different kind of device"]
+            if word == "Likely" and opts * 2 >= pts:
+                word = "Possibly"
+            break
     return best, word, reasons[:6]
-
 
 
 @functools.lru_cache(maxsize=65536)
@@ -12761,12 +13053,22 @@ class DeviceRegistry:
         if a.version == 4:
             if ip == "255.255.255.255" or a in LOOPBACK_V4:
                 return False
+            known = False
             for net in self.local_nets:
+                if net.version != 4:
+                    continue
+                known = True
                 if a in net:
                     if net.prefixlen < 31 and a in (net.network_address,
                                                     net.broadcast_address):
                         return False
                     return True
+            # 5.3.4 (CO-05): once this network's subnets are known, a
+            # private address outside them is reached through the router
+            # (a VPN, work or neighbour network): a remote host, never a
+            # device. 169.254/16 is never routed, so it stays local.
+            if known and not a.is_link_local:
+                return False
             return is_private_ip(ip)
         if a.is_link_local:
             return True
@@ -13241,6 +13543,30 @@ class DeviceRegistry:
                 return False
         return True
 
+    def dhcp_clue(self, a, b):
+        """5.3.4 (IP-015): DHCP clues that a rotated private address may
+        be the same device: the same client identifier (not one made from
+        the MAC), or, with private addresses on both, the same DHCP
+        request list and vendor class. Different real identifiers rule
+        it out."""
+        if not FEATURES.get("signatures_v2", True):
+            return False
+        if self.same_client_id(a, b):
+            return True
+        ca, cb = self._real_client_id(a), self._real_client_id(b)
+        if ca and cb and ca != cb:
+            return False
+        fa = dhcp_fingerprint(a)
+        return bool(fa and a.randomized_mac and b.randomized_mac and
+                    fa == dhcp_fingerprint(b))
+
+    @staticmethod
+    def _real_client_id(d):
+        c = d.dhcp_client_id
+        if not c or (d.mac and c.endswith(d.mac.replace(":", ""))):
+            return ""
+        return c
+
     def can_pair(self, a, b):
         return not (a.key == b.key or a.pinned_no_merge or b.pinned_no_merge
                     or b.key in a.never_merge or a.key in b.never_merge
@@ -13265,7 +13591,10 @@ class DeviceRegistry:
             elif dev.alias and dev.alias == other.alias:
                 pts += 30
                 reasons.append("you gave both the same name")
-            if not reasons:
+            # 5.3.4 (IP-015): with no shared name, DHCP clues alone can
+            # still say "possibly the same device", never more than Low
+            clue_only = not reasons and self.dhcp_clue(dev, other)
+            if not reasons and not clue_only:
                 continue
             if dev.randomized_mac or other.randomized_mac:
                 pts += 15
@@ -13292,8 +13621,10 @@ class DeviceRegistry:
             else:
                 pts += 15
                 reasons.append("they were never online at the same time")
+            if clue_only and pts >= 20:
+                pts = max(pts, 30)
             if pts >= 30:
-                conf = "Medium" if pts >= 60 else "Low"
+                conf = "Medium" if pts >= 60 and not clue_only else "Low"
                 out.append((other, conf, reasons))
         out.sort(key=lambda t: (t[1] != "Medium", -t[0].last_seen))
         return out
@@ -13305,17 +13636,25 @@ class DeviceRegistry:
         at 1,000 devices). Kept in by_key order, so the result is the same
         as the full scan."""
         by_name, by_alias = defaultdict(list), defaultdict(list)
+        by_clue = defaultdict(list)          # 5.3.4 (IP-015)
+        clues = FEATURES.get("signatures_v2", True)
         for other in self.by_key.values():
             n = self.stable_name(other)
             if n:
                 by_name[n].append(other)
             if other.alias:
                 by_alias[other.alias].append(other)
+            if clues:
+                for c in self._clue_keys(other):
+                    by_clue[c].append(other)
         pos = {}
 
         def pool(dev):
             group = by_name.get(self.stable_name(dev) or None, []) + \
                 by_alias.get(dev.alias or None, [])
+            if clues:
+                for c in self._clue_keys(dev):
+                    group = group + by_clue.get(c, [])
             if len(group) < 2:
                 return []
             if not pos:
@@ -13328,29 +13667,48 @@ class DeviceRegistry:
             return out
         return pool
 
+    def _clue_keys(self, d):
+        out = []
+        c = self._real_client_id(d)
+        if c:
+            out.append(("cid", c))
+        fp = dhcp_fingerprint(d) if d.randomized_mac else None
+        if fp:
+            out.append(("fp",) + fp)
+        return out
+
     def auto_merge_pass(self):
         """Settings → Devices → 'Combine identities automatically'.
         Deliberately conservative — merges only when ALL hold: exactly two
-        candidates share a distinctive self-announced name; at least one
-        uses a private/randomized MAC; their activity never overlapped; the
-        older one is no longer active; neither is pinned. If any doubt
-        remains, nothing is merged and the pair is offered as "Possibly the
-        same device" instead. Returns list of (keep, other) merged."""
+        candidates share a distinctive self-announced name (5.3.4: or the
+        same DHCP client identifier, when it isn't made from the MAC); at
+        least one uses a private/randomized MAC; their activity never
+        overlapped; the older one is no longer active; neither is pinned.
+        If any doubt remains, nothing is merged and the pair is offered as
+        "Possibly the same device" instead. Returns list of (keep, other) merged."""
         if not self.config.get("devices.auto_merge", True):
             return []
         groups = defaultdict(list)
+        cids = FEATURES.get("signatures_v2", True)
         for dev in self.by_key.values():
             if dev.pinned_no_merge or dev.state == STATE_EXPIRED or \
                     not dev.live:
                 continue
             name = self.stable_name(dev)
-            if not self.distinctive(name):
-                continue
-            groups[name].append(dev)
+            if self.distinctive(name):
+                groups[name].append(dev)
+            elif cids and self._real_client_id(dev):
+                # 5.3.4 (MC3): a phone that rotates its private address
+                # and announces no name keeps its DHCP client identifier
+                groups[("cid", self._real_client_id(dev))].append(dev)
         merged = []
         for name, devs in groups.items():
             if len(devs) != 2:
                 continue
+            if isinstance(name, tuple):
+                a, b = devs
+                if not self.same_client_id(a, b):
+                    continue
             older, newer = sorted(devs, key=lambda d: d.first_seen)
             if not self.can_pair(older, newer):
                 continue
@@ -13365,9 +13723,12 @@ class DeviceRegistry:
                     older.network_id != newer.network_id:
                 continue                  # same name, different network
             self.merge(newer.key, older.key, auto=True,
-                       reason=f"both announced the name “{name}”, "
-                              f"at least one uses a private address, and "
-                              f"they were never online at the same time")
+                       reason=(f"both announced the name “{name}”, "
+                               if not isinstance(name, tuple) else
+                               "both sent the same DHCP client "
+                               "identifier, ") +
+                       "at least one uses a private address, and "
+                       "they were never online at the same time")
             merged.append((newer.key, older.key))
         return merged
 
@@ -13383,6 +13744,20 @@ class DeviceRegistry:
             return None
         snapshot = device_to_dict(other, include_history=True)
         keep_before = {f: getattr(keep, f) for f in _MERGE_COPIED}
+        # 5.3.4 (CO-11): what only the absorbed identity brought, so a
+        # split takes it away again (its evidence inflated the kept
+        # device's confidence, its services changed its kind)
+        mine_ev = {(e.source, e.detail, e.when) for e in keep.evidence}
+        added = {"services": sorted(other.services - keep.services),
+                 "websites": sorted(other.websites - keep.websites)[:500],
+                 "remote_ips": sorted(other.remote_ips -
+                                      keep.remote_ips)[:500],
+                 "protocols": dict(other.protocols),
+                 "presence": [list(x) for x in other.presence
+                              if x not in keep.presence],
+                 "evidence": [[e.source, e.detail, e.when]
+                              for e in other.evidence
+                              if (e.source, e.detail, e.when) not in mine_ev]}
         absorbed = sorted(set(other.iface_stats) |
                           ({other.mac} if other.mac else set()) |
                           {other.key})
@@ -13444,7 +13819,8 @@ class DeviceRegistry:
             "key": other.key, "when": self.now(), "auto": bool(auto),
             "reason": reason or f"name “{name}”",
             "snapshot": snapshot, "absorbed": absorbed,
-            "keep_before": keep_before, "keep_after": keep_after})
+            "keep_before": keep_before, "keep_after": keep_after,
+            "added": added})
         keep.merge_note = (
             f"Merged with an earlier identity ({other.key}) "
             f"{'automatically' if auto else 'by you'}"
@@ -13489,6 +13865,23 @@ class DeviceRegistry:
                 setattr(keep, f, kb[f])
         keep.mac_history = [h for h in keep.mac_history
                             if h and h[0] not in absorbed]
+        add = entry.get("added")
+        if isinstance(add, dict):                    # 5.3.4 (CO-11)
+            for f in ("services", "websites", "remote_ips"):
+                getattr(keep, f).difference_update(
+                    x for x in add.get(f) or () if isinstance(x, str))
+            for k, v in (add.get("protocols") or {}).items():
+                if isinstance(v, (int, float)) and k in keep.protocols:
+                    keep.protocols[k] -= v
+                    if keep.protocols[k] <= 0:
+                        del keep.protocols[k]
+            gone = [x for x in add.get("presence") or ()
+                    if isinstance(x, list)]
+            keep.presence = [x for x in keep.presence if x not in gone]
+            ev = {tuple(x) for x in add.get("evidence") or ()
+                  if isinstance(x, list) and len(x) == 3}
+            keep.evidence = [e for e in keep.evidence
+                             if (e.source, e.detail, e.when) not in ev]
         for ak in absorbed:
             if self.alias.get(ak) == keep.key:
                 self.alias.pop(ak, None)
@@ -17455,6 +17848,11 @@ def device_claims(model, dev):
                        LV_UNKNOWN, "Not seeing a device doesn't prove it's "
                                    "off — it may just be quiet.", ()))
     conn = look = poss = 0
+    # 5.3.4 (CO-04): the row's level is the strongest level of the ties
+    # actually there. "Connected right after a lookup" is a correlation
+    # and was shown as Observed; "looked up only" is an observed fact
+    # and was shown as Correlated.
+    lvl = LV_INFERRED
     for dom in dev.websites:
         w = model.websites.get(dom)
         a = w.ties.get(dev.key, [""])[0] if w else ""
@@ -17464,11 +17862,12 @@ def device_claims(model, dev):
             look += 1
         else:
             poss += 1
+        la = ASSOC_LEVEL.get(a, LV_UNKNOWN)
+        if LEVEL_STRENGTH.get(la, 0) > LEVEL_STRENGTH.get(lvl, 0):
+            lvl = la
     if conn or look or poss:
         claims.append(("Websites", f"{conn} connected · {look} looked up "
-                                   f"only · {poss} possibly",
-                       LV_OBSERVED if conn else
-                       (LV_CORRELATED if look else LV_INFERRED),
+                                   f"only · {poss} possibly", lvl,
                        "Connected = name seen in its connection or right "
                        "after its own lookup.",
                        ("tls_sni", "http_host", "dns_answer")))
@@ -18575,6 +18974,13 @@ class NetworkModel:
         entry = {"when": self.now(), "kind": kind, "severity": severity,
                  "text": text, "ref": ref, "device": device,
                  "live": not self.use_packet_clock}
+        # 5.3.4 (MC3): the name the sentence uses, so the Timeline can show
+        # the device's current name instead of three names for one device
+        dv = self.registry.by_key.get(device) if device else None
+        if dv is not None:
+            nm = dv.display_name()
+            if nm and nm in text:
+                entry["name"] = nm
         self.timeline.append(entry)
         self.ev_timeline.append(entry)
         if len(self.ev_timeline) > 2000:
@@ -18803,6 +19209,9 @@ class NetworkModel:
             self._dirty_dev(dev)
             if role == "sent" and d["ttl_int"] and use_mac:
                 dev.os_ttl = max(dev.os_ttl, _initial_ttl(d["ttl_int"]))
+            if role == "sent" and use_mac and d.get("tcp_syn") and \
+                    not d["tcp_flags"] & 0x10:
+                dev.tcp_stack = d["tcp_syn"]     # 5.3.4 (IP-017)
             if d["type_hint"] and role == "sent" and not dev.type_hint:
                 dev.type_hint = d["type_hint"]
             if internet:
@@ -19795,7 +20204,10 @@ class NetworkModel:
             if d["tls"] and d["tls"].get("sni"):
                 tag = "secure"
                 did = f"🔐 {d['text']}"
-            elif not (d["tcp_flags"] is None and d["payload_len"] > 1000):
+            elif not (d["tcp_flags"] is None and d["payload_len"] > 1000 and
+                      d["direction"] == "up"):
+                # 5.3.4 (ST-06): only the device's own first flight; the
+                # website's large replies made the website the "Who"
                 return
             else:
                 tag = "secure"
@@ -19951,7 +20363,9 @@ class NetworkModel:
         for dev in list(self.registry.by_key.values()):
             if not dev.live or dev.pinned_no_merge:
                 continue
-            if not (dev.dhcp_hostname or dev.mdns_name or dev.alias):
+            if not (dev.dhcp_hostname or dev.mdns_name or dev.alias or (
+                    FEATURES.get("signatures_v2", True) and
+                    (dev.dhcp_client_id or dev.dhcp_params))):
                 continue
             for other, conf, reasons in self.registry.merge_candidates(
                     dev, pool(dev)):
@@ -19995,13 +20409,17 @@ class NetworkModel:
 
     def _classify(self):
         keys, self._classify_dirty = self._classify_dirty, set()
+        # 5.3.4 (MC3): devices that ask DHCP exactly like a device of a
+        # known kind on this network (option 55, used at last)
+        peers = dhcp_peers(self.registry.by_key.values()) \
+            if keys and FEATURES.get("signatures_v2", True) else None
         for key in keys:
             dev = self.registry.by_key.get(key)
             if dev is None:
                 continue
             cls, word, reasons = classify_device(
                 dev, self.gateway_ip, self.my_ips, self.my_macs,
-                self.registry.ra_routers, self.registry.gw_macs)
+                self.registry.ra_routers, self.registry.gw_macs, peers)
             if dev.user_class:
                 auto = f"{word} {cls}".strip()
                 reasons = ["You set this type"] + (
@@ -22715,7 +23133,7 @@ Show expired devices ¦ Afficher les appareils expirés ¦ Mostrar dispositivos 
 Include devices not seen for a long time. ¦ Inclure les appareils non vus depuis longtemps. ¦ Incluir dispositivos que no se ven desde hace mucho.
 Identity ¦ Identité ¦ Identidad
 Combine identities automatically (only when certain) ¦ Combiner les identités automatiquement (seulement en cas de certitude) ¦ Combinar identidades automáticamente (solo si es seguro)
-Phones and laptops rotate their Wi-Fi address for privacy. Two entries are combined only when they announce the same distinctive name, at least one uses a private address, and they were never online at the same time. Never based on traffic similarity. ¦ Les téléphones et portables changent d'adresse Wi-Fi pour la confidentialité. Deux entrées ne sont combinées que si elles annoncent le même nom distinctif, qu'au moins une utilise une adresse privée et qu'elles n'ont jamais été en ligne en même temps. Jamais sur la base d'un trafic similaire. ¦ Los teléfonos y portátiles cambian su dirección Wi-Fi por privacidad. Dos entradas solo se combinan si anuncian el mismo nombre distintivo, al menos una usa una dirección privada y nunca estuvieron conectadas a la vez. Nunca por similitud de tráfico.
+Phones and laptops rotate their Wi-Fi address for privacy. Two entries are combined only when they announce the same distinctive name (or send the same DHCP client identifier), at least one uses a private address, and they were never online at the same time. Never based on traffic similarity. ¦ Les téléphones et portables changent d'adresse Wi-Fi pour la confidentialité. Deux entrées ne sont combinées que si elles annoncent le même nom distinctif (ou envoient le même identifiant client DHCP), qu'au moins une utilise une adresse privée et qu'elles n'ont jamais été en ligne en même temps. Jamais sur la base d'un trafic similaire. ¦ Los teléfonos y portátiles cambian su dirección Wi-Fi por privacidad. Dos entradas solo se combinan si anuncian el mismo nombre distintivo (o envían el mismo identificador de cliente DHCP), al menos una usa una dirección privada y nunca estuvieron conectadas a la vez. Nunca por similitud de tráfico.
 Suggest “Possibly the same device” ¦ Suggérer « Peut-être le même appareil » ¦ Sugerir «Posiblemente el mismo dispositivo»
 When MiniWireshark isn't sure, it doesn't merge — it adds a suggestion to the Timeline and the device card so you can decide. ¦ Quand MiniWireshark n'est pas sûr, il ne fusionne pas — il ajoute une suggestion dans la chronologie et la fiche de l'appareil pour que vous décidiez. ¦ Cuando MiniWireshark no está seguro, no fusiona — añade una sugerencia a la cronología y a la ficha del dispositivo para que usted decida.
 How websites and name lookups are shown. ¦ Comment les sites et recherches de noms sont affichés. ¦ Cómo se muestran los sitios web y las búsquedas de nombres.
@@ -24504,6 +24922,13 @@ It uses a private (randomized) Wi-Fi address, which phones do by default ¦ Il u
 It uses a private (randomized) Wi-Fi address ¦ Il utilise une adresse Wi-Fi privée (aléatoire) ¦ Usa una dirección Wi-Fi privada (aleatoria)
 It contacts game-console services (very weak hint) ¦ Il contacte des services de consoles de jeu (indice très faible) ¦ Contacta con servicios de consolas (pista muy débil)
 It contacts Apple services (very weak hint) ¦ Il contacte des services Apple (indice très faible) ¦ Contacta con servicios de Apple (pista muy débil)
+Its MAC prefix belongs to VirtualBox virtual machines ¦ Son préfixe MAC appartient aux machines virtuelles VirtualBox ¦ Su prefijo MAC pertenece a máquinas virtuales VirtualBox
+Its MAC prefix is the one QEMU/KVM virtual machines use ¦ Son préfixe MAC est celui des machines virtuelles QEMU/KVM ¦ Su prefijo MAC es el que usan las máquinas virtuales QEMU/KVM
+It opens connections the way Windows does (weak hint) ¦ Il ouvre ses connexions comme Windows (indice faible) ¦ Abre sus conexiones como Windows (pista débil)
+It opens connections the way Linux and Android do (weak hint) ¦ Il ouvre ses connexions comme Linux et Android (indice faible) ¦ Abre sus conexiones como Linux y Android (pista débil)
+It opens connections the way Apple systems do (weak hint) ¦ Il ouvre ses connexions comme les systèmes Apple (indice faible) ¦ Abre sus conexiones como los sistemas de Apple (pista débil)
+It answers Windows network name lookups (NetBIOS) ¦ Il répond aux recherches de noms réseau Windows (NetBIOS) ¦ Responde a las búsquedas de nombres de red de Windows (NetBIOS)
+Device evidence ¦ Preuves de l'appareil ¦ Pruebas del dispositivo
 Not enough information yet — I cannot determine this from passive traffic alone ¦ Pas encore assez d'informations — je ne peux pas le déterminer à partir du seul trafic observé ¦ Aún no hay suficiente información: no puedo determinarlo solo con el tráfico observado
 Too little evidence to guess confidently ¦ Trop peu d'indices pour deviner avec assurance ¦ Muy pocas pruebas para adivinar con seguridad
 This computer's network card ¦ La carte réseau de cet ordinateur ¦ La tarjeta de red de este ordenador
@@ -25430,10 +25855,22 @@ EVENT_PATTERNS = [
 ]
 I18N_PATTERNS += EVENT_PATTERNS
 I18N_PATTERNS += [
-    (r"Its name \(“(.+)”\) looks like a (.+)", r"Son nom (« \1 ») "
+    (r"Its name \(“(.+)”\) looks like an? (.+)", r"Son nom (« \1 ») "
      r"ressemble à : {t2}", r"Su nombre («\1») parece de: {t2}"),
+    # 5.3.4 (MC3)
+    (r"It advertised the model “(.+)” \((.+)\)",
+     r"Il a annoncé le modèle « \1 » (\2)",
+     r"Anunció el modelo «\1» (\2)"),
     (r"It advertised the model “(.+)”", r"Il a annoncé le modèle « \1 »",
      r"Anunció el modelo «\1»"),
+    (r"But: (.+) — that hints at a different kind of device",
+     r"Mais : {t1} — cela laisse penser à un autre type d'appareil",
+     r"Pero: {t1} — eso apunta a otro tipo de dispositivo"),
+    (r"It asks DHCP for the same settings, in the same order, as “(.+)”, "
+     r"which is likely an? (.+)", r"Il demande au DHCP les mêmes réglages, "
+     r"dans le même ordre, que « \1 », qui est probablement : {t2}",
+     r"Pide al DHCP los mismos ajustes, en el mismo orden, que «\1», que "
+     r"probablemente es: {t2}"),
     (r"Made by (.+)", r"Fabriqué par \1", r"Fabricado por \1"),
     (r"It advertises the “(.+)” service", r"Il annonce le service « \1 »",
      r"Anuncia el servicio «\1»"),
@@ -25586,6 +26023,22 @@ def translate_cells(values):
 
 _EVENT_RX = []
 _EVENT_CACHE = {}
+
+
+def timeline_text(model, e):
+    """5.3.4 (MC3): a Timeline sentence with the device's name as it is
+    now. A printer first named "BRW008077500050", then "Brother
+    HL-L2350DW", used to appear under both names in one list."""
+    text = e.get("text") or ""
+    old, key = e.get("name"), e.get("device")
+    if not old or not key or model is None:
+        return text
+    reg = model.registry
+    dev = reg.by_key.get(reg.resolve(key))
+    if dev is None:
+        return text
+    new = dev.display_name()
+    return text.replace(old, new, 1) if new and new != old else text
 
 
 def translate_event(text):
@@ -27480,9 +27933,10 @@ SETTINGS_PAGES = [
               "label": "Combine identities automatically (only when certain)",
               "help": "Phones and laptops rotate their Wi-Fi address for "
                       "privacy. Two entries are combined only when they "
-                      "announce the same distinctive name, at least one uses "
-                      "a private address, and they were never online at the "
-                      "same time. Never based on traffic similarity."},
+                      "announce the same distinctive name (or send the same "
+                      "DHCP client identifier), at least one uses a private "
+                      "address, and they were never online at the same "
+                      "time. Never based on traffic similarity."},
              {"key": "devices.suggest_merges", "type": "bool",
               "label": "Suggest “Possibly the same device”",
               "help": "When MiniWireshark isn't sure, it doesn't merge — "
@@ -32695,7 +33149,8 @@ class TimelineTab(BaseTab):
                 "", index, tags=(e["severity"],),
                 values=(f"{icon} {e['severity']}",
                         fmt_clock(e["when"], with_date=old),
-                        e["kind"], translate_event(e["text"])))
+                        e["kind"], translate_event(
+                            timeline_text(self.model, e))))
             self.refs[iid] = e
         except tk.TclError:
             pass
@@ -32865,7 +33320,7 @@ class DevicesTab(BaseTab):
             ("ip", "Local IP", 115, "w", False),
             ("mac", "MAC address", 135, "w", False),
             ("vendor", "Made by", 140, "w", True),
-            ("conf", "Confidence", 110, "w", False),
+            ("conf", "Device evidence", 110, "w", False),
             ("evidence", "Evidence", 80, "center", False),
             ("status", "Status", 95, "w", False),
             ("traffic", "Traffic ↑/↓", 150, "w", False),
@@ -58391,18 +58846,21 @@ class ScenarioBuilder:
                    self.L.ARP(op=2, psrc=ip, hwsrc=mac, pdst=self.GW[0],
                        hwdst=self.GW[1]))
 
-    def dhcp(self, host, vendor_class="", client_id=True, lease=86400):
+    def dhcp(self, host, vendor_class="", client_id=True, lease=86400,
+             params=None):
         ip, mac, name = host[0], host[1], host[2]
         chaddr = bytes.fromhex(mac.replace(":", "")) + b"\x00" * 10
         opts = [("message-type", "request"), ("requested_addr", ip)]
-        if client_id:
+        if isinstance(client_id, bytes):      # one not made from the MAC
+            opts.append(("client_id", client_id))
+        elif client_id:
             opts.append(("client_id", b"\x01" + bytes.fromhex(
                 mac.replace(":", ""))))
         if name:
             opts.append(("hostname", name.encode()))
         if vendor_class:
             opts.append(("vendor_class_id", vendor_class.encode()))
-        opts.append(("param_req_list", [1, 3, 6, 15, 119, 252]))
+        opts.append(("param_req_list", params or [1, 3, 6, 15, 119, 252]))
         self._emit(self.L.Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
                    self.L.IP(src="0.0.0.0", dst="255.255.255.255") /
                    self.L.UDP(sport=68, dport=67) /
@@ -58931,6 +59389,275 @@ def scenario_identity():
     return (ScenarioBuilder.GW[0], {ScenarioBuilder.ME[0]},
             {ScenarioBuilder.ME[1]},
             [ipaddress.ip_network("192.168.1.0/24")])
+
+
+# ---- 5.3.4 (MC3): the labelled identification corpus ------------------------
+# Sixty-odd made-up devices, each announcing itself the way that kind of
+# device does on a home network (DHCP, mDNS, UPnP, the way it opens a
+# connection, its TTL). t_identity_corpus_accuracy replays it through the
+# capture path and measures how many get the right kind. Some are hard on
+# purpose (a Windows PC on Apple hardware, phones with private addresses
+# and no name). The makers are fixed here (CORPUS_VENDORS) so the score
+# doesn't depend on which vendor list this computer has.
+_C_IOS55 = [1, 121, 3, 6, 15, 108, 114, 119, 252, 95, 44, 46]
+_C_WIN55 = [1, 3, 6, 15, 31, 33, 43, 44, 46, 47, 119, 121, 249, 252]
+_C_AND55 = [1, 3, 6, 15, 26, 28, 51, 58, 59, 43, 114, 108]
+_C_LNX55 = [1, 28, 2, 3, 15, 6, 119, 12, 44, 47, 26, 121, 42]
+_C_IOT55 = [1, 3, 6, 12, 15, 28, 42]
+_C_GEN55 = [1, 3, 6, 15, 44, 46, 47, 12]
+_C_TS = b"\x08\x0a" + bytes(8)
+_C_SYN = {"win": (64240, b"\x02\x04\x05\xb4\x01\x03\x03\x08\x01\x01\x04\x02"),
+          "lnx": (64240, b"\x02\x04\x05\xb4\x04\x02" + _C_TS +
+                  b"\x01\x03\x03\x07"),
+          "apl": (65535, b"\x02\x04\x05\xb4\x01\x03\x03\x06\x01\x01" + _C_TS +
+                  b"\x04\x02\x00\x00")}
+_C_TTL = {"win": 128, "lnx": 64, "apl": 64, "net": 255}
+# kind, name, MAC, maker, then what it sends:
+#   d=(vendor class, option 55, client id), s=SYN stack,
+#   m=[(service, instance, TXT)], u=(UPnP NT, SERVER)
+IDENTITY_CORPUS = (
+    # phones (several with private, rotating addresses)
+    ("iPhone", "Sams-iPhone", "da:10:00:00:00:01", "",
+     {"d": ("", _C_IOS55, ""), "s": "apl",
+      "m": [("_companion-link._tcp", "Sam", {"rpmd": "iPhone15,2"})]}),
+    ("iPhone", "Leas-iPhone", "f0:18:98:00:00:02", "Apple, Inc.",
+     {"d": ("", _C_IOS55, ""), "s": "apl"}),
+    ("iPhone", "iPhone", "a6:10:00:00:00:03", "",
+     {"d": ("", _C_IOS55, ""), "s": "apl"}),
+    ("iPhone", "", "be:10:00:00:00:04", "",        # no name: DHCP alike
+     {"d": ("", _C_IOS55, ""), "s": "apl"}),
+    ("Android phone", "Pixel-7", "3a:10:00:00:00:05", "",
+     {"d": ("android-dhcp-13", _C_AND55, ""), "s": "lnx"}),
+    ("Android phone", "Galaxy-S23", "fa:10:00:00:00:06", "",
+     {"d": ("android-dhcp-14", _C_AND55, ""), "s": "lnx"}),
+    ("Android phone", "", "26:10:00:00:00:07", "",
+     {"d": ("android-dhcp-12", _C_AND55, ""), "s": "lnx"}),
+    ("Android phone", "SM-G991B", "8c:79:f5:00:00:08",
+     "Samsung Electronics Co.,Ltd", {"d": ("android-dhcp-13", _C_AND55, "")}),
+    ("Android phone", "OnePlus-11", "c2:10:00:00:00:09", "",
+     {"d": ("android-dhcp-14", _C_AND55, ""), "s": "lnx"}),
+    ("Android phone", "Redmi-Note-12", "64:cc:2e:00:00:0a",
+     "Xiaomi Communications Co Ltd", {"d": ("", _C_AND55, "")}),
+    ("Tablet", "Kids-iPad", "5e:10:00:00:00:0b", "",
+     {"d": ("", _C_IOS55, ""), "s": "apl"}),
+    ("Tablet", "", "a4:83:e7:00:00:0c", "Apple, Inc.",
+     {"m": [("_companion-link._tcp", "Kitchen", {"rpmd": "iPad13,18"})]}),
+    # computers
+    ("Windows PC", "DESKTOP-K3J9QX2", "f8:63:3f:00:00:0d", "Intel Corporate",
+     {"d": ("MSFT 5.0", _C_WIN55, ""), "s": "win"}),
+    ("Windows PC", "LAPTOP-7HG2KD1L", "92:10:00:00:00:0e", "",
+     {"d": ("MSFT 5.0", _C_WIN55, ""), "s": "win"}),
+    ("Windows PC", "DESKTOP-GUEST7Q", "3c:22:fb:00:00:0f", "Apple, Inc.",
+     {"d": ("MSFT 5.0", _C_WIN55, ""), "s": "win"}),    # ST-12: Boot Camp
+    ("Windows PC", "", "d8:bb:c1:00:00:10", "Micro-Star INTL CO., LTD.",
+     {"d": ("MSFT 5.0", _C_WIN55, ""), "s": "win"}),
+    ("Windows PC", "OFFICE-PC", "54:e1:ad:00:00:11", "LCFC(HeFei) Electronics",
+     {"d": ("MSFT 5.0", _C_WIN55, ""), "s": "win"}),
+    ("Mac", "Alexs-MacBook-Pro", "8c:85:90:00:00:12", "Apple, Inc.",
+     {"d": ("", _C_IOS55, ""), "s": "apl",
+      "m": [("_device-info._tcp", "Alexs-MacBook-Pro",
+             {"model": "MacBookPro18,3"})]}),
+    ("Mac", "Studio-Mac-mini", "14:98:77:00:00:13", "Apple, Inc.",
+     {"d": ("", _C_IOS55, ""), "s": "apl",
+      "m": [("_device-info._tcp", "Studio", {"model": "Macmini9,1"})]}),
+    ("Mac", "Family-iMac", "ac:87:a3:00:00:14", "Apple, Inc.",
+     {"d": ("", _C_IOS55, ""), "s": "apl"}),
+    ("Mac", "", "36:10:00:00:00:15", "",
+     {"s": "apl", "m": [("_device-info._tcp", "Office",
+                         {"model": "MacBookAir10,1"})]}),
+    ("Linux PC", "ubuntu-desktop", "f8:63:3f:00:00:16", "Intel Corporate",
+     {"d": ("", _C_LNX55, ""), "s": "lnx",
+      "m": [("_workstation._tcp", "ubuntu-desktop", {})]}),
+    ("Linux PC", "raspberrypi", "dc:a6:32:00:00:17",
+     "Raspberry Pi Trading Ltd",
+     {"d": ("dhcpcd-9.4.1", _C_LNX55, ""), "s": "lnx",
+      "m": [("_ssh._tcp", "raspberrypi", {})]}),
+    ("Linux PC", "fedora-laptop", "48:51:c5:00:00:18", "Intel Corporate",
+     {"d": ("", _C_LNX55, ""), "s": "lnx"}),
+    ("Server", "proxmox", "1c:69:7a:00:00:19", "EliteGroup Computer Systems",
+     {"d": ("", _C_LNX55, ""), "s": "lnx"}),
+    # printers
+    ("Printer", "BRW0080775000A1", "00:80:77:00:00:1a",
+     "Brother Industries, LTD.",
+     {"d": ("", _C_GEN55, ""),
+      "m": [("_ipp._tcp", "Brother HL-L2350DW",
+             {"ty": "Brother HL-L2350DW"})]}),
+    ("Printer", "HP3C2A1B", "a0:d3:c1:00:00:1b", "Hewlett Packard",
+     {"d": ("", _C_GEN55, ""), "m": [("_ipp._tcp", "HP OfficeJet 8010",
+                                      {"ty": "HP OfficeJet Pro 8010"}),
+                                     ("_pdl-datastream._tcp", "HP", {})]}),
+    ("Printer", "EPSON1A2B3C", "64:eb:8c:00:00:1c", "Seiko Epson Corporation",
+     {"m": [("_ipp._tcp", "EPSON ET-2850", {"ty": "EPSON ET-2850 Series"}),
+            ("_scanner._tcp", "EPSON", {})]}),
+    ("Printer", "Canon-TS6300", "f4:81:39:00:00:1d", "Canon Inc.",
+     {"m": [("_ipp._tcp", "Canon TS6300", {"ty": "Canon TS6300 series"})]}),
+    ("Printer", "", "00:80:77:00:00:1e", "Brother Industries, LTD.",
+     {"u": ("urn:schemas-upnp-org:device:Printer:1", "Brother NC-8300w")}),
+    # TVs and streaming boxes
+    ("Smart TV", "LGwebOSTV", "a8:23:fe:00:00:1f", "LG Electronics",
+     {"u": ("urn:schemas-upnp-org:device:MediaRenderer:1",
+            "WebOS/1.5 UPnP/1.0 webOS/6.0")}),
+    ("Smart TV", "Samsung", "8c:79:f5:00:00:20", "Samsung Electronics Co.,Ltd",
+     {"u": ("urn:samsung.com:device:RemoteControlReceiver:1",
+            "SHP, UPnP/1.0, Samsung UPnP SDK/1.0")}),
+    ("Smart TV", "BRAVIA-4K-GB", "fc:f1:52:00:00:21", "Sony Corporation",
+     {"m": [("_googlecast._tcp", "BRAVIA 4K GB", {"md": "BRAVIA 4K GB"})]}),
+    ("Smart TV", "Bedroom-TV", "20:3d:bd:00:00:22", "LG Innotek",
+     {"u": ("urn:schemas-upnp-org:device:MediaRenderer:1",
+            "Linux/4.4 UPnP/1.0 DLNADOC/1.50")}),
+    ("Streaming device", "", "f4:f5:d8:00:00:23", "Google, Inc.",
+     {"m": [("_googlecast._tcp", "Living Room", {"md": "Chromecast"})]}),
+    ("Streaming device", "Roku-Ultra", "d8:31:34:00:00:24", "Roku, Inc",
+     {"u": ("roku:ecp", "Roku/12.0.0 UPnP/1.0 Roku/12.0.0")}),
+    ("Streaming device", "Living-Room-Apple-TV", "f0:b3:ec:00:00:25",
+     "Apple, Inc.", {"m": [("_airplay._tcp", "Living Room",
+                             {"model": "AppleTV11,1"})]}),
+    ("Streaming device", "amazon-fire-tv", "fc:65:de:00:00:26",
+     "Amazon Technologies Inc.", {"m": [("_amzn-wplay._tcp", "Fire TV", {})]}),
+    # consoles
+    ("Console", "XBOX", "98:5f:d3:00:00:27", "Microsoft Corporation",
+     {"d": ("MSFT 5.0", _C_WIN55, ""), "s": "win",
+      "u": ("urn:schemas-microsoft-com:device:Xbox:1", "Xbox/10.0 UPnP/1.0")}),
+    ("Console", "PS5-123", "00:d9:d1:00:00:28",
+     "Sony Interactive Entertainment Inc.", {"d": ("", _C_GEN55, "")}),
+    ("Console", "", "98:b6:e9:00:00:29", "Nintendo Co.,Ltd", {}),
+    # speakers
+    ("Speaker", "", "48:a6:b8:00:00:2a", "Sonos, Inc.",
+     {"m": [("_sonos._tcp", "Kitchen", {})]}),
+    ("Speaker", "Kitchen-HomePod", "c0:95:6d:00:00:2b", "Apple, Inc.",
+     {"m": [("_airplay._tcp", "Kitchen", {"model": "AudioAccessory5,1"})]}),
+    ("Speaker", "", "f4:f5:d8:00:00:2c", "Google, Inc.",
+     {"m": [("_googlecast._tcp", "Bedroom speaker",
+             {"md": "Google Nest Mini"})]}),
+    ("Speaker", "Bose-SoundLink", "08:df:1f:00:00:2d", "Bose Corporation", {}),
+    # cameras
+    ("Camera", "", "c0:56:e3:00:00:2e",
+     "Hangzhou Hikvision Digital Technology Co.,Ltd.", {}),
+    ("Camera", "WYZE_CAKP2JFUS", "2c:aa:8e:00:00:2f", "Wyze Labs Inc", {}),
+    ("Camera", "RingStickUpCam-4c", "34:3e:a4:00:00:30", "Ring LLC", {}),
+    ("Camera", "Reolink-Front", "ec:71:db:00:00:31", "Reolink Innovation Ltd",
+     {"u": ("urn:schemas-upnp-org:device:Basic:1", "Reolink ONVIF camera")}),
+    # smart home
+    ("Smart-home/IoT", "ESP_6A1B00", "24:0a:c4:00:00:32", "Espressif Inc.",
+     {"d": ("udhcp 1.30", _C_IOT55, "")}),
+    ("Smart-home/IoT", "shellyplug-s-1A2B3C", "e8:db:84:00:00:33",
+     "Espressif Inc.", {"m": [("_shelly._tcp", "shellyplug-s-1A2B3C", {})]}),
+    ("Smart-home/IoT", "Philips-hue", "ec:b5:fa:00:00:34", "Signify B.V.",
+     {"m": [("_hue._tcp", "Hue Bridge", {})],
+      "u": ("upnp:rootdevice", "Hue/1.0 UPnP/1.0 IpBridge/1.60.0")}),
+    ("Smart-home/IoT", "HS110", "50:c7:bf:00:00:35",
+     "TP-LINK TECHNOLOGIES CO.,LTD.",
+     {"d": ("", _C_IOT55, "")}),
+    ("Smart-home/IoT", "wlan0", "d8:1f:12:00:00:36", "Tuya Smart Inc.",
+     {"d": ("", _C_IOT55, "")}),
+    ("Smart-home/IoT", "ecobee", "44:61:32:00:00:37", "ecobee inc", {}),
+    ("Smart-home/IoT", "", "cc:50:e3:00:00:40", "",        # same firmware
+     {"d": ("udhcp 1.30", _C_IOT55, "")}),               # as the ESP plug
+    # storage
+    ("NAS", "family-nas", "00:11:32:00:00:38", "Synology Incorporated",
+     {"m": [("_smb._tcp", "family-nas", {"model": "DS220+"})]}),
+    ("NAS", "NAS4A2B1C", "24:5e:be:00:00:39", "QNAP Systems, Inc.",
+     {"m": [("_qdiscover._tcp", "NAS4A2B1C", {})]}),
+    # network gear
+    ("Access point", "UAP-AC-Lite", "74:83:c2:00:00:3a", "Ubiquiti Inc", {}),
+    ("Access point", "Deco-M5", "50:c7:bf:00:00:3b",
+     "TP-LINK TECHNOLOGIES CO.,LTD.", {"t": "net"}),
+    # virtual machines
+    ("Virtual machine", "kali", "08:00:27:00:00:3c", "PCS Systemtechnik GmbH",
+     {"d": ("", _C_LNX55, ""), "s": "lnx"}),
+    ("Virtual machine", "ubuntu-vm", "00:0c:29:00:00:3d", "VMware, Inc.",
+     {"d": ("", _C_LNX55, ""), "s": "lnx"}),
+    ("Virtual machine", "", "52:54:00:00:00:3e", "", {"s": "lnx"}),
+)
+CORPUS_VENDORS = {row[2]: row[3] for row in IDENTITY_CORPUS if row[3]}
+
+
+def identity_corpus():
+    """(frames, {mac: kind}) for the corpus, plus the router and this
+    computer of the scripted network."""
+    b = ScenarioBuilder()
+    L, gw = b.L, ScenarioBuilder.GW
+    labels = {gw[1]: "Router", ScenarioBuilder.ME[1]: "This computer"}
+    b.arp_announce(ScenarioBuilder.ME)
+    b.arp_announce(gw)
+    for i, (kind, name, mac, _v, how) in enumerate(IDENTITY_CORPUS):
+        host = (f"192.168.1.{100 + i}", mac, name)
+        labels[mac] = kind
+        b.arp_announce(host)
+        vc, params, cid = how.get("d") or ("", _C_GEN55, "")
+        if "d" in how or name:          # a name comes with its DHCP request
+            b.dhcp(host, vendor_class=vc, params=params,
+                   client_id=cid.encode() if cid else True)
+        for svc, inst, txt in how.get("m", ()):
+            b.mdns(host, svc, inst, txt)
+        if "u" in how:
+            nt, server = how["u"]
+            b._emit(L.Ether(src=mac, dst="01:00:5e:7f:ff:fa") /
+                    L.IP(src=host[0], dst="239.255.255.250", ttl=4) /
+                    L.UDP(sport=1900, dport=1900) /
+                    L.Raw(("NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900"
+                           f"\r\nNT: {nt}\r\nSERVER: {server}\r\n\r\n")
+                          .encode()))
+        stack = how.get("s") or how.get("t")
+        ttl = _C_TTL.get(stack, 64)
+        win, opts = _C_SYN.get(how.get("s"), (29200, b""))
+        b._emit(L.Ether(src=mac, dst=gw[1]) /
+                L.IP(src=host[0], dst="93.184.215.14", ttl=ttl) /
+                L.TCP(sport=40000 + i, dport=443, flags="S", window=win,
+                      options=opts))
+    b.t += 30
+    return b.frames, labels
+
+
+def corpus_scores(model, labels):
+    """{"accuracy", "right", "total", "wrong": [(mac, want, got, word)],
+    "bad_likely": [...] (Likely labels on the router or this computer
+    that are wrong), "per_kind": {kind: (precision, recall)}}."""
+    reg = model.registry
+    got, wrong, bad = {}, [], []
+    for mac, want in labels.items():
+        dev = reg.by_key.get(reg.resolve(mac))
+        cls, word = (dev.device_class, dev.class_confidence) if dev else \
+            ("(missing)", "")
+        got[mac] = cls
+        if cls != want:
+            wrong.append((mac, want, cls, word))
+            if word == "Likely" and "Router" in (want, cls) or \
+                    "This computer" in (want, cls):
+                bad.append((mac, want, cls))
+    per = {}
+    for kind in sorted(set(labels.values())):
+        tp = sum(1 for m, w in labels.items() if w == kind and got[m] == kind)
+        said = sum(1 for g in got.values() if g == kind)
+        n = sum(1 for w in labels.values() if w == kind)
+        per[kind] = (tp / said if said else 0.0, tp / n if n else 0.0)
+    right = len(labels) - len(wrong)
+    return {"accuracy": right / len(labels), "right": right,
+            "total": len(labels), "wrong": wrong, "bad_likely": bad,
+            "per_kind": per}
+
+
+def run_identity_corpus(config):
+    """Replays the corpus through the fast capture path with the corpus's
+    own makers; returns (model, labels)."""
+    frames, labels = identity_corpus()
+    g = globals()
+    real = g["mac_vendor"]
+    g["mac_vendor"] = lambda mac: CORPUS_VENDORS.get((mac or "").lower(), "")
+    try:
+        gw, ips, macs, nets = scenario_identity()
+        m = NetworkModel(config, gw, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        replay_frames(m, frames, decoder=fast_frame_decoder(m))
+        for k in list(m.registry.by_key):
+            m._classify_dirty.add(k)
+        m._classify()
+        m._classify_dirty.update(m.registry.by_key)   # peers known now
+        m._classify()
+    finally:
+        g["mac_vendor"] = real
+    return m, labels
 
 
 def scenario_model(config, frames=None, decoder=None):
@@ -60362,7 +61089,7 @@ def t_iid_map_reverse_index(ctx):
 DIFF_FIELDS = ("proto", "tag", "text", "src", "dst", "src_ip", "dst_ip",
                "src_mac", "dst_mac", "ttl", "ttl_int", "sport", "dport",
                "ipver", "transport", "tcp_flags", "seq", "ack", "win",
-               "payload_len",
+               "tcp_syn", "payload_len",
                "dns_names", "doh_hint", "plain_dns", "type_hint",
                "dhcp_msgtype", "arp_op", "dhcp_yiaddr", "dhcp_hostname",
                "dhcp_client_mac", "dhcp", "dns", "tls", "nd", "ssdp",
@@ -61542,6 +62269,374 @@ def t_os13_mac_wifi_port(ctx):
     src = inspect.getsource(current_ssid)
     assert "Apple80211" not in src and '"en0"]' not in src.replace(
         'or ["en0"]', "")
+
+
+@self_test()
+def t_identity_corpus_accuracy(ctx):
+    """5.3.4 (MC3, M6): the labelled corpus meets the §1 targets: at least
+    90 % of devices get the right kind, and no wrong "Likely" label on the
+    router or this computer. The table stays small (≤ 40 KB), and every
+    DHCP option 55 row names the real capture behind it (IP-014 rule)."""
+    cfg = ctx.cfg({"devices.learn_types": False})
+    m, labels = run_identity_corpus(cfg)
+    r = corpus_scores(m, labels)
+    assert len(labels) >= 60, len(labels)
+    assert r["accuracy"] >= 0.90, (r["accuracy"], r["wrong"])
+    assert not r["bad_likely"], r["bad_likely"]
+    reg = m.registry
+    gw = reg.by_key[reg.resolve(ScenarioBuilder.GW[1])]
+    assert (gw.device_class, gw.class_confidence) == ("Router", "Likely")
+    for kind, (prec, _rec) in r["per_kind"].items():
+        assert prec >= 0.75 or kind == "Unknown", (kind, r["per_kind"])
+    assert len(repr(DEVICE_SIGNATURES)) <= 40000
+    for row in DEVICE_SIGNATURES:
+        assert row[2] in DEVICE_CLASSES, row
+        assert len(row) < 6 or row[5] == "v2", row
+        if row[0] == "dhcp55":
+            assert "capture" in row[4], row
+    # the switch off: the 5.3.2 rows only, still a working engine
+    old = FEATURES.get("signatures_v2", True)
+    FEATURES["signatures_v2"] = False
+    try:
+        m1, _l = run_identity_corpus(ctx.cfg({"devices.learn_types": False}))
+        r1 = corpus_scores(m1, labels)
+    finally:
+        FEATURES["signatures_v2"] = old
+    assert not r1["bad_likely"] and r1["accuracy"] <= r["accuracy"], r1
+    assert not any("connections the way" in x for d in
+                   m1.registry.by_key.values() for x in d.class_reasons)
+
+
+@self_test()
+def t_st12_conflicting_evidence_said(ctx):
+    """5.3.4 (ST-12): an Apple-made "DESKTOP-…" with Windows' DHCP class
+    stays "Windows PC", says "But: Made by Apple…", and names its kind as
+    written ("a Windows PC", not "a windows pc"). An Apple TV made by
+    Apple has no such line."""
+    m, _labels = run_identity_corpus(ctx.cfg({"devices.learn_types": False}))
+    reg = m.registry
+    guest = reg.by_key["3c:22:fb:00:00:0f"]
+    assert guest.device_class == "Windows PC", guest.class_reasons
+    assert any(x.startswith("But: Made by Apple") for x in
+               guest.class_reasons), guest.class_reasons
+    assert any("looks like a Windows PC" in x for x in guest.class_reasons)
+    atv = reg.by_key["f0:b3:ec:00:00:25"]
+    assert not any(x.startswith("But:") for x in atv.class_reasons), \
+        atv.class_reasons
+    assert "(Apple TV)" in " ".join(atv.class_reasons)
+    for loc in ("fr", "es"):
+        for x in guest.class_reasons:
+            assert translate_text(x, loc) != x, (loc, x)
+    assert {c[0]: c[1] for c in DevicesTab.COLS}["conf"] == \
+        "Device evidence"
+
+
+@self_test()
+def t_co05_routed_private_not_device(ctx):
+    """5.3.4 (CO-05): a private address outside the LAN (a VPN or work
+    network reached through the router) is a remote host: no MAC-less
+    device, no "unknown device" warning. Link-local stays local."""
+    S = ScenarioBuilder
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    b = S()
+    b.home_network()
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    b.frames = []
+    far = "10.7.235.58"
+    for i in range(20):
+        b._emit(PK.Ether(src=S.ME[1], dst=S.GW[1]) /
+                PK.IP(src=S.ME[0], dst=far) /
+                PK.TCP(sport=50000, dport=22, flags="PA", seq=1 + i) /
+                PK.Raw(b"x" * 50), dt=1)
+        b._emit(PK.Ether(src=S.GW[1], dst=S.ME[1]) /
+                PK.IP(src=far, dst=S.ME[0], ttl=62) /
+                PK.TCP(sport=22, dport=50000, flags="PA", seq=1 + i) /
+                PK.Raw(b"y" * 50), dt=1)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    m.tick()
+    reg = m.registry
+    assert far not in reg.ip_to_key, reg.ip_to_key.get(far)
+    assert not any(d.ip == far for d in reg.by_key.values())
+    assert not any(a.kind == "unknown_device" and far in a.reason
+                   for a in m.alerts.alerts.values())
+    assert not reg.eligible_ip(far) and reg.eligible_ip("169.254.10.2")
+    assert reg.eligible_ip("192.168.1.77")
+    reg2 = DeviceRegistry("", set(), ctx.cfg({}))   # subnets not known yet
+    assert reg2.eligible_ip(far)
+
+
+def _snap(v):
+    if isinstance(v, set):
+        return set(v)
+    if isinstance(v, list):
+        return [list(x) if isinstance(x, list) else x for x in v]
+    return v
+
+
+@self_test()
+def t_co11_split_undoes_merge_exactly(ctx):
+    """5.3.4 (CO-11): merge(a, b) then split gives a back exactly: the
+    absorbed identity's evidence (and so confidence), services, websites
+    and remote addresses leave with it."""
+    srcs = ["mac_local", "arp_reply", "dhcp_lease", "mdns", "ssdp", "nbns",
+            "local_traffic", "rdns"]
+    rng = random.Random(11)
+    fields = ("score", "confidence", "websites", "services", "remote_ips",
+              "presence")
+    for trial in range(120):
+        reg = DeviceRegistry("192.168.1.1", set(), ctx.cfg({}),
+                             now_fn=lambda: 1.8e9)
+        a = reg.touch("192.168.1.20", "aa:00:00:00:00:01", "local_traffic",
+                      "x", 1.7e9)
+        b = reg.touch("192.168.1.21", "da:00:00:00:00:02", "local_traffic",
+                      "x", 1.7e9 + 5000)
+        for s in rng.sample(srcs, rng.randint(0, 4)):
+            a.add_evidence(s, "a", 1.7e9)
+        for s in rng.sample(srcs, rng.randint(1, 4)):
+            b.add_evidence(s, "b", 1.7e9 + 5000)
+        a.websites |= set(rng.sample(["x.example", "z.example"],
+                                     rng.randint(0, 2)))
+        b.websites |= set(rng.sample(["x.example", "y.example"],
+                                     rng.randint(0, 2)))
+        b.services.add("_ssh._tcp")
+        b.remote_ips.add("93.184.215.14")
+        before = {f: _snap(getattr(a, f)) for f in fields}
+        reg.merge(a.key, b.key)
+        reg.split(a.key, 0)
+        after = {f: _snap(getattr(a, f)) for f in fields}
+        assert before == after, (trial, before, after)
+
+
+@self_test()
+def t_co04_websites_claim_level(ctx):
+    """5.3.4 (CO-04): the Inspector's Websites row is as strong as the
+    strongest tie actually there: guesses stay Correlated, and a lookup
+    with no connection (an observed fact) is Observed."""
+    m = scenario_model(ctx.cfg({}), decoder=None)
+    S = ScenarioBuilder
+    dev = m.registry.by_key[S.TV[1]]
+    dev.websites.clear()
+    for dom, assoc in (("cdn-a.example", AS_CONNECTED_AMBIG),
+                       ("cdn-b.example", AS_CONNECTED_LOOKUP)):
+        m.register_website(dom, "151.101.1.1", dev, "DNS", 1.76e9)
+        m.websites[dom].ties.clear()
+        m.tie(dev.key, dom, assoc, 1.76e9)
+    row = [c for c in device_claims(m, dev) if c[0] == "Websites"][0]
+    assert row[1].startswith("2 connected") and row[2] == LV_CORRELATED, row
+    dev2 = m.registry.by_key[S.NAS[1]]
+    dev2.websites.clear()
+    m.register_website("lookup.example", "151.101.2.2", dev2, "DNS", 1.76e9)
+    m.websites["lookup.example"].ties.clear()
+    m.tie(dev2.key, "lookup.example", AS_LOOKUP_ONLY, 1.76e9)
+    row = [c for c in device_claims(m, dev2) if c[0] == "Websites"][0]
+    assert row[2] == LV_OBSERVED, row
+
+
+@self_test()
+def t_st06_quic_feed_who_is_device(ctx):
+    """5.3.4 (ST-06): "opened a fast secure connection (QUIC)" is said
+    only of the device that sent its first flight, never of the website
+    whose large replies come back."""
+    S = ScenarioBuilder
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    b = S()
+    b.home_network()
+    for _ in range(6):
+        b._emit(PK.Ether(src=S.GW[1], dst=S.ME[1]) /
+                PK.IP(src="142.250.80.46", dst=S.ME[0], ttl=54) /
+                PK.UDP(sport=443, dport=51000) /
+                PK.Raw(b"\xc3" + bytes(1250)))
+        b._emit(PK.Ether(src=S.GW[1], dst=S.PHONE[1]) /
+                PK.IP(src="142.250.80.46", dst=S.PHONE[0], ttl=54) /
+                PK.UDP(sport=443, dport=52000) /
+                PK.Raw(b"\x40" + bytes(1250)))
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    who = [e["who"] for e in m.ev_feed if "(QUIC)" in e["did"] and
+           "opened a fast" in e["did"]]
+    assert who and set(who) == {m.friendly_who(S.ME[0], S.ME[1])}, who
+
+
+@self_test()
+def t_timeline_one_name_per_device(ctx):
+    """5.3.4 (student feedback): the Timeline shows one device under one
+    name, its current one, even for lines written before a better name
+    arrived ("BRW008077500050" then "Brother HL-L2350DW")."""
+    S = ScenarioBuilder
+    m = scenario_model(ctx.cfg({}), decoder=None)
+    pr = m.registry.by_key[S.PRINTER[1]]
+    old = pr.mdns_name
+    pr.mdns_name = ""
+    first = pr.display_name()
+    e = m.push_timeline("device left", "INFO", f"{first} left the network",
+                        ("device", pr.key), pr.key)
+    pr.mdns_name = old
+    assert first != pr.display_name()
+    assert timeline_text(m, e) == f"{pr.display_name()} left the network"
+    m.registry.merge(S.TV[1], pr.key)          # merged: the kept device
+    assert timeline_text(m, e).startswith(
+        m.registry.by_key[S.TV[1]].display_name())
+    plain = {"text": "Capture restarted", "device": ""}
+    assert timeline_text(m, plain) == "Capture restarted"
+
+
+def rotation_frames(name="", cid=b"", params=None, vc="", t0=None):
+    """A phone that leaves, then comes back 20 minutes later with a new
+    private address (5.3.4 MC3, measuring MAC rotation). Returns
+    (frames, old MAC, new MAC)."""
+    S = ScenarioBuilder
+    b = S() if t0 is None else S(t0=t0)
+    b.home_network()
+    old, new = "da:77:00:00:00:01", "ea:77:00:00:00:02"
+    for k, (ip, mac) in enumerate((("192.168.1.81", old),
+                                   ("192.168.1.82", new))):
+        host = (ip, mac, name)
+        b.arp_announce(host)
+        b.dhcp(host, vendor_class=vc, client_id=cid or True,
+               params=params or _C_AND55)
+        b.dns(host, "www.example.com", S.SITES["www.example.com"])
+        if k == 0:
+            for _ in range(25):                  # gone: only this PC talks
+                b.t += 60
+                b.dns(S.ME, "www.example.com", S.SITES["www.example.com"])
+    return b.frames, old, new
+
+
+def rotation_identities(ctx, frames, old, new):
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, frames, decoder=fast_frame_decoder(m), tick_every=20)
+    reg = m.registry
+    keys = {reg.resolve(old), reg.resolve(new)}
+    sugg = [e for e in m.timeline if e["kind"] == "possible duplicate"]
+    return len(keys & set(reg.by_key)), sugg, m
+
+
+@self_test()
+def t_mac_rotation_measured(ctx):
+    """5.3.4 (MC3, IP-015): measure how often a phone that changes its
+    private address shows up as a second device. With a distinctive name
+    it is combined (as before); with no name but a DHCP client identifier
+    that isn't made from the MAC it is now combined too; with only the
+    same DHCP request list it is offered as "Possibly the same device"
+    (Low), never combined. False merges: two such phones online at the
+    same time, or with different identifiers, are never paired."""
+    duid = b"\xff\x00\x00\x00\x01\x00\x01\x2c\x5f\x11\x22\x33\x44\x55\x66"
+    old_v2 = FEATURES.get("signatures_v2", True)
+    out = {}
+    try:
+        for v2 in (False, True):
+            FEATURES["signatures_v2"] = v2
+            for case, kw in (("name", {"name": "Alexs-Galaxy-S23"}),
+                             ("client id", {"cid": duid}),
+                             ("dhcp alike", {"vc": "android-dhcp-14"})):
+                fr, old, new = rotation_frames(**kw)
+                n, sugg, _m = rotation_identities(ctx, fr, old, new)
+                out[(v2, case)] = (n, len(sugg))
+    finally:
+        FEATURES["signatures_v2"] = old_v2
+    assert out[(False, "name")][0] == 1 and out[(True, "name")][0] == 1
+    assert out[(False, "client id")][0] == 2, out      # the measured gap
+    assert out[(True, "client id")][0] == 1, out       # ... closed
+    assert out[(False, "dhcp alike")] == (2, 0), out
+    assert out[(True, "dhcp alike")][0] == 2 and \
+        out[(True, "dhcp alike")][1] >= 1, out
+    fr, old, new = rotation_frames(vc="android-dhcp-14")
+    _n, sugg, m = rotation_identities(ctx, fr, old, new)
+    c = m.registry.merge_candidates(m.registry.by_key[new])
+    assert c and all(conf == "Low" for _o, conf, _r in c), c
+    # false merges: the same two phones online at the same time
+    reg = m.registry
+    a, b2 = reg.by_key[old], reg.by_key[new]
+    a.presence, b2.presence = [[1000.0, 5000.0]], [[2000.0, 6000.0]]
+    assert reg.dhcp_clue(a, b2) and not reg.merge_candidates(b2, [a])
+    # ... or each with its own real client identifier
+    a.presence = [[100.0, 200.0]]
+    assert reg.merge_candidates(b2, [a])
+    a.dhcp_client_id, b2.dhcp_client_id = "ff01aa", "ff02bb"
+    assert not reg.dhcp_clue(a, b2) and not reg.merge_candidates(b2, [a])
+    assert not reg.auto_merge_pass()
+
+
+@self_test()
+def t_ip017_syn_stack_and_option55(ctx):
+    """5.3.4 (IP-017, MC3): a SYN's window, MSS, window scale and option
+    order are read the same by both decoders (S12), kept on the device
+    that opened the connection, and never make a guess "Likely" alone.
+    Option 55 is kept whole and in order (it was cut to 80 characters)."""
+    S = ScenarioBuilder
+    b = S()
+    b.arp_announce(S.ME)
+    win, opts = _C_SYN["win"]
+    host = ("192.168.1.90", "f8:63:3f:00:00:90", "")
+    b.arp_announce(host)
+    for o in (opts, b"\x02\x04\x05", b"\x03\x00\x01", b"\x1e\x05abc"):
+        b._emit(PK.Ether(src=host[1], dst=S.GW[1]) /
+                PK.IP(src=host[0], dst="93.184.215.14") /
+                PK.TCP(sport=41000, dport=443, flags="S", window=win,
+                       options=o))
+    b._emit(PK.Ether(src=host[1], dst=S.GW[1]) /
+            PK.IP(src=host[0], dst="93.184.215.14") /
+            PK.TCP(sport=41000, dport=443, flags="S", window=win,
+                   options=opts))
+    sigs = [fast_decode(r, ts)["tcp_syn"] for r, ts, _l in b.frames[-5:]]
+    assert sigs[0] == "64240:1460:8:M,N,W,N,N,S", sigs
+    assert sigs[2].endswith(":W,?"), sigs
+    if ctx.scapy_ok:
+        diffs = decoder_differences(b.frames)
+        assert not diffs, diffs[:3]
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    dev = m.registry.by_key[host[1]]
+    assert dev.tcp_stack == sigs[0], dev.tcp_stack
+    # 40 points of real evidence plus 45 weak ones: "Possibly", not
+    # "Likely" (85 points)
+    d = DeviceRecord(key="x", tcp_stack=sigs[0], os_ttl=128,
+                     dhcp_vendor_class="MSFT 5.0")
+    peers = {("1,3,6,15", ""): ("Windows PC", "Desk", "y")}
+    d.dhcp_params = "1,3,6,15"
+    cls, word, _r = classify_device(d, peers=peers)
+    assert cls == "Windows PC" and word == "Possibly", (cls, word, _r)
+    long55 = list(range(1, 60))
+    assert dhcp55_norm(long55).split(",") == [str(x) for x in long55]
+    assert dhcp55_norm([121, 3, 3, 0, 255, 6]) == "121,3,6"
+    assert dhcp55_norm(b"\x01\x79") == "1,121" and dhcp55_norm(6) == "6"
+
+
+@self_test()
+def t_ip016_model_names_and_c02(ctx):
+    """5.3.4 (IP-016): Apple model codes read as product names, in the
+    reasons and as the name of a device that announced nothing else.
+    (C-02) the dead guess_device_type is gone."""
+    assert model_product_name("MacBookPro18,3") == "MacBook Pro"
+    assert model_product_name("MacBookAir10,1") == "MacBook Air"
+    assert model_product_name("Mac14,2") == "Mac"
+    assert model_product_name("iPad13,18") == "iPad"
+    assert model_product_name("AudioAccessory5,1") == "HomePod mini"
+    assert model_product_name("AppleTV11,1") == "Apple TV"
+    assert model_product_name("DS220+") == "" == model_product_name("")
+    d = DeviceRecord(key="k", vendor="Apple, Inc.",
+                     model_hint="MacBookPro18,3")
+    assert d.display_name() == "MacBook Pro"
+    cls, _w, why = classify_device(d)
+    assert cls == "Mac" and any("(MacBook Pro)" in x for x in why), why
+    old = FEATURES.get("signatures_v2", True)
+    FEATURES["signatures_v2"] = False
+    try:
+        assert d.display_name() == "Apple, Inc. device"
+    finally:
+        FEATURES["signatures_v2"] = old
+    assert "guess_device_type" not in globals()
 
 
 @self_test()
