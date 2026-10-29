@@ -12452,7 +12452,11 @@ def device_to_dict(dev, include_history=True):
         v = getattr(dev, f)
         if not include_history and f == "merge_history":
             continue
-        out[f] = v
+        # 5.3.4 (S6): copies, not the device's own lists and dicts: the
+        # history writer encodes this row after the GuiGate is released,
+        # while the analysis thread goes on changing the device
+        out[f] = list(v) if isinstance(v, list) else \
+            dict(v) if isinstance(v, dict) else v
     out["ipv6"] = sorted(dev.ipv6)
     out["ipv4s"] = sorted(dev.ipv4s)
     out["services"] = sorted(dev.services)
@@ -17904,8 +17908,9 @@ class DeviceBaseline:
         return snapshot
 
     def to_dict(self):
-        d = {"n": self.n, "mean": self.mean, "var": self.var,
-             "hours": self.hours,
+        # 5.3.4 (S6): copies (see device_to_dict)
+        d = {"n": self.n, "mean": dict(self.mean), "var": dict(self.var),
+             "hours": list(self.hours),
              "protocols": dict(self.protocols.most_common(20)),
              "services": {str(k): v for k, v in
                           self.services.most_common(40)},
@@ -59740,23 +59745,30 @@ class DeepEngine:
         self._tick(0, 0, n)
 
     def _lost(self, n):
-        self.lost += n
+        with self.cv:
+            self.lost += n
 
     def _results(self, n, findings, messages, txns=()):
-        self.done += n
-        self._tick(0, n, 0)
+        # 5.3.4 (S6): the deep thread (or one reader thread per worker
+        # process) counts here while the analysis thread counts in offer();
+        # unlocked, counts were lost (Python 3.8 stress: 7 % of "done"), so
+        # in_flight() never reached 0 and the 60 s coverage was too low
+        with self.cv:
+            self.done += n
+            self._tick(0, n, 0)
         self.store.add(findings, messages, txns)
 
     def _tick(self, off, done, shed):
         sec = int(time.monotonic())
-        w = self.window
-        if w and w[-1][0] == sec:
-            s, a, b, c = w[-1]
-            w[-1] = (s, a + off, b + done, c + shed)
-        else:
-            w.append((sec, off, done, shed))
-            while w and w[0][0] < sec - 60:
-                w.popleft()
+        with self.cv:                 # see _results
+            w = self.window
+            if w and w[-1][0] == sec:
+                s, a, b, c = w[-1]
+                w[-1] = (s, a + off, b + done, c + shed)
+            else:
+                w.append((sec, off, done, shed))
+                while w and w[0][0] < sec - 60:
+                    w.popleft()
 
     def coverage_60s(self):
         """→ (percent deep-analysed of eligible, offered, done, shed)."""
@@ -59822,10 +59834,10 @@ class DeepEngine:
         """A new session: fresh state, same backend."""
         with self.cv:
             self.pending.clear()
-        self.epoch += 1
-        self.offered = self.done = self.shed = self.lost = 0
-        self.shed_why.clear()
-        self.window.clear()
+            self.epoch += 1
+            self.offered = self.done = self.shed = self.lost = 0
+            self.shed_why.clear()
+            self.window.clear()
         self.store.clear()
         if self.backend == "thread" and self.analyzer is not None:
             self.analyzer.__init__(self.my_ips,
@@ -62419,6 +62431,146 @@ def t_session_iter_json(ctx):
     m2 = NetworkModel(ctx.cfg(), "", set(), set())
     SessionCodec.load(json.loads("".join(pieces)), m2)
     assert set(m2.registry.by_key) == set(m.registry.by_key)
+
+
+@self_test()
+def t_thread_stress(ctx):
+    """5.3.4 (S6): a short stress run. One thread feeds packets the way the
+    analysis worker does (slices, holding the GuiGate), a 'Tk' thread and
+    the jobs thread meanwhile do what the window does: stepped tick, the
+    inspector's claims, coverage, top protocols, the session writer and
+    the history snapshot and the story piece by piece, the Calls card.
+    Nothing may fail. Then the deep engine's counters, bumped from four
+    threads at once, must add up, and the history rows must be copies."""
+    gate = GuiGate()
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg(), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    frames = ctx.frames() + call_corpus().frames()[::4] + \
+        ScenarioBuilder().busy_mix(n=3000)
+    dec = fast_frame_decoder(m)
+    stop = threading.Event()
+    errors, ran = [], Counter()
+
+    def guard(name, fn):
+        try:
+            fn()
+            ran[name] += 1
+        except Exception as e:                       # noqa: BLE001
+            errors.append(f"{name}: {type(e).__name__}: {e}")
+
+    def feed(loop):
+        batch = []
+        for raw, ts, lt in frames:
+            if len(raw) > 34 and raw[12:14] == b"\x08\x00":
+                raw = raw[:11] + bytes([(raw[11] + loop) & 0xFF]) + raw[12:]
+            d = dec(raw, ts + loop * 900.0, lt)
+            if d is not None:
+                batch.append(d)
+            if len(batch) >= 200 or stop.is_set():
+                with gate:
+                    for d in batch:
+                        learn_names_from(m.cache, d)
+                        m.ingest(d)
+                    seen = gate.tk_entries
+                gate.yield_to_tk(seen)
+                batch = []
+            if stop.is_set():
+                return
+
+    def feeder():
+        for loop in range(1000):
+            if stop.is_set():
+                return
+            guard("ingest", lambda: feed(loop))
+
+    def tk_side():
+        def tick():
+            for _step in m.tick_steps():
+                gate.leave_tk()          # one step per callback
+                gate.enter_tk()
+
+        def claims():
+            for d in list(m.registry.by_key.values())[:50]:
+                device_claims(m, d)
+        calls = (("tick", tick), ("claims", claims),
+                 ("coverage", lambda: coverage_rows(m, "live")),
+                 ("protocols", lambda: m.metrics.top_protocols(5)),
+                 ("calls", lambda: calls_card_text(m.calls)))
+        while not stop.is_set():
+            for name, fn in calls:
+                gate.enter_tk()
+                try:
+                    guard(name, fn)
+                finally:
+                    gate.leave_tk()
+            time.sleep(0.002)
+
+    def jobs_side():
+        job = Job("history", "", None)
+        app = types.SimpleNamespace(model=m)
+        while not stop.is_set():
+            guard("session", lambda: json.loads("".join(
+                job.pieces_under_gate(gate, SessionCodec.iter_json(m)))))
+            guard("history", lambda: job.pieces_under_gate(
+                gate, MiniWireshark._history_pieces(app)))
+            guard("story", lambda: story_job_run(
+                job, gate, m, None, 0.0, m.now(), None))
+    ths = [threading.Thread(target=f, daemon=True)
+           for f in (feeder, tk_side, jobs_side)]
+    old = sys.getswitchinterval()
+    sys.setswitchinterval(1e-4)
+    try:
+        for th in ths:
+            th.start()
+        time.sleep(3.0)
+        stop.set()
+        for th in ths:
+            th.join(10)
+    finally:
+        sys.setswitchinterval(old)
+    assert not errors, errors[:5]
+    assert not any(th.is_alive() for th in ths), "a stress thread hung"
+    for name in ("ingest", "tick", "claims", "coverage", "protocols",
+                 "calls", "session", "history", "story"):
+        assert ran[name], (name, dict(ran))
+    assert len(m.registry.by_key) > 10, len(m.registry.by_key)
+    # the history writer encodes snapshot rows after the gate is released:
+    # they must not be the device's (or the baseline's) own lists and dicts
+    dev = next(iter(m.registry.by_key.values()))
+    row = device_to_dict(dev, False)
+    shared = [f for f in DEVICE_SAVE_FIELDS
+              if isinstance(row.get(f), (list, dict)) and
+              row[f] is getattr(dev, f)]
+    assert not shared, shared
+    b = DeviceBaseline()
+    bd = b.to_dict()
+    assert bd["mean"] is not b.mean and bd["var"] is not b.var and \
+        bd["hours"] is not b.hours
+    # the deep engine: the analysis thread ticks in offer() while the deep
+    # thread (or one reader per worker process) adds results
+    e, n = DeepEngine(), 4000
+
+    def offers():
+        for _ in range(n):
+            e._tick(1, 0, 0)
+
+    def results():
+        for _ in range(n):
+            e._results(1, [], [])
+    ths = [threading.Thread(target=offers, daemon=True)] + [
+        threading.Thread(target=results, daemon=True) for _ in range(3)]
+    sys.setswitchinterval(1e-4)
+    try:
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join(20)
+    finally:
+        sys.setswitchinterval(old)
+    got = (e.done, sum(w[1] for w in e.window), sum(w[2] for w in e.window))
+    assert got == (3 * n, n, 3 * n), f"counts lost: {got}"
 
 
 @self_test()
