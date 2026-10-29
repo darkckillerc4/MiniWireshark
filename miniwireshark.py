@@ -22592,6 +22592,7 @@ Getting started automatically — picking your best network card ¦ Démarrage a
 Running the built-in self-test ¦ Exécution de l'autotest intégré ¦ Ejecutando la autoprueba integrada
 Learned baselines reset. ¦ Habitudes apprises réinitialisées. ¦ Referencias aprendidas restablecidas.
 Running health checks ¦ Vérifications de santé en cours ¦ Ejecutando comprobaciones de salud
+Demo Mode — showing made-up traffic. Nothing is being captured. ¦ Mode démo — trafic inventé affiché. Rien n'est capturé. ¦ Modo demo — se muestra tráfico inventado. No se captura nada.
 Getting ready — I'll pick a network card and start watching automatically. ¦ Préparation — je vais choisir une carte réseau et commencer à observer automatiquement. ¦ Preparando — elegiré una tarjeta de red y empezaré a observar automáticamente.
 Components ¦ Composants ¦ Componentes
 Optional data, packages and helpers — nothing here is needed to watch your network. ¦ Données, paquets et outils facultatifs — rien ici n'est nécessaire pour surveiller votre réseau. ¦ Datos, paquetes y herramientas opcionales — nada de esto hace falta para vigilar su red.
@@ -42805,6 +42806,18 @@ class MiniWireshark:
             return (tr("Possibly") + ": " + problem +
                     (f" ({when})" if when else "") + ".", "warn",
                     lambda: self.investigate("slow"))
+        # 5.3.4 (ST-07): one answer everywhere: never "No." here while the
+        # Health tab's verdict says something needs a look
+        try:
+            worst, why = self.health_summary().get("overall", ("", ""))
+        except Exception:                            # noqa: BLE001
+            LOG.debug("health verdict for the answer", exc_info=True)
+            worst, why = "", ""
+        if worst in ("Needs attention", "Degraded"):
+            return (tr("Possibly") + ": " + (tr(why) if why else tr(
+                "the Health tab found something to look at")) +
+                    ("" if (why or "").endswith(".") else "."), "warn",
+                    lambda: self.goto("health"))
         inet_ok = h.get("internet_ok") is True or (
             m.metrics.totals["bytes_down"] > 0 and
             now - (m.metrics.last_ts or 0) < 120)
@@ -49099,6 +49112,9 @@ proc ::mw_retheme {w map fgnew deffg} {
         self._set_banner("\U0001F3AE  DEMO DATA — NOT LIVE TRAFFIC. Explore "
                          "the tabs; nothing here is real and nothing mixes "
                          "with your real session.", kind="warn")
+        # ST-04: the "I'll pick a network card" line is not true here
+        self.status_var.set("Demo Mode — showing made-up traffic. Nothing "
+                            "is being captured.")
         self.goto("dash")
         LOG.info("demo mode started")
 
@@ -59788,6 +59804,23 @@ def t_os07_second_copy_keeps_off_the_journal(ctx):
 
 
 @self_test()
+def t_os12_identity_without_scapy(ctx):
+    """5.3.4 (OS-12): limited mode still finds the router and this
+    computer from the OS (default route; a connected but unused UDP
+    socket), sending nothing."""
+    route = ("Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\n"
+             "wlan0\t0001A8C0\t00000000\t0001\t0\t0\t600\n"
+             "wlan0\t00000000\t0101A8C0\t0003\t0\t0\t600\n")
+    assert parse_proc_route(route) == ("192.168.1.1", "wlan0")
+    assert parse_proc_route("") == ("", "")
+    gw, ips, macs, iface = os_identity()
+    assert isinstance(gw, str) and isinstance(ips, set) and \
+        isinstance(macs, set) and isinstance(iface, str)
+    src = inspect.getsource(os_identity)
+    assert ".send" not in src and "outbound(" not in src
+
+
+@self_test()
 def t_m3_damaged_files_and_count_caps(ctx):
     """5.3.4 M3: damaged capture files end with a message (QA-01, QA-02,
     QA-03); crafted traffic costs linear time and bounded memory (QA-04,
@@ -59926,9 +59959,20 @@ def t_s8_static_checks(ctx):
     calls = {"run", "Popen", "call", "check_output", "check_call"}
     bad = []
 
+    def dotted(node):                  # ast.unparse needs Python 3.9
+        if isinstance(node, ast.Call):
+            node = node.func
+        parts = []
+        while isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        if isinstance(node, ast.Name):
+            parts.append(node.id)
+        return ".".join(reversed(parts))
+
     def is_test(fn):
         return fn.name.startswith(("t_", "test_", "gt_")) or any(
-            "self_test" in ast.unparse(d) for d in fn.decorator_list)
+            "self_test" in dotted(d) for d in fn.decorator_list)
 
     def walk(node, fn, in_test):
         for ch in ast.iter_child_nodes(node):
@@ -59940,7 +59984,7 @@ def t_s8_static_checks(ctx):
                     if isinstance(d, (ast.List, ast.Dict, ast.Set)):
                         bad.append(f"L{ch.lineno} {ch.name}: mutable default")
             if isinstance(ch, ast.Call) and not t2:
-                name = ast.unparse(ch.func)
+                name = dotted(ch.func)
                 kws = {k.arg for k in ch.keywords}
                 if name.endswith("utcnow"):
                     bad.append(f"L{ch.lineno}: datetime.utcnow")
@@ -59952,7 +59996,9 @@ def t_s8_static_checks(ctx):
                     mode = ch.args[1] if len(ch.args) > 1 else next(
                         (k.value for k in ch.keywords if k.arg == "mode"),
                         None)
-                    text = (ast.unparse(mode) if mode is not None else "'r'")
+                    text = "r" if mode is None else " ".join(
+                        str(n.value) for n in ast.walk(mode)
+                        if isinstance(n, ast.Constant))
                     if "b" not in text:
                         bad.append(f"L{ch.lineno} {f2}: text open() "
                                    f"without encoding")
@@ -61366,7 +61412,8 @@ def t_every_send_goes_through_outbound(ctx):
                          f.value.id == "sqlite3")) or pip_online(child)
                 if is_send:
                     owner = fn.name if fn is not None else "<module>"
-                    exempt = owner in ("net_urlopen",) or \
+                    # os_identity: connect() on a UDP socket sends nothing
+                    exempt = owner in ("net_urlopen", "os_identity") or \
                         top.startswith(("t_", "_gs_"))
                     if not exempt and not (fn is not None and
                                            calls_outbound(fn)):
@@ -66182,6 +66229,9 @@ def _gs_diag_depth(app, ctx):
     assert app.health_culprit == "wifi"
     assert "Likely culprit: Wi-Fi" in res["overall"][1], res["overall"]
     assert res["switch"][0] == "Healthy" and "core-sw1" in res["switch"][1]
+    # ST-07: the Dashboard's first answer agrees with the Health verdict
+    text, kind, _go = app.dashboard_answers(force=True)["wrong"]
+    assert kind == "warn" and not text.startswith("No"), (text, kind)
     tab = app._select_tab("health")
     tab.refresh()
     _gui_pump(root, 0.2)
@@ -69598,7 +69648,73 @@ def detect_gateway_and_self():
                 my_macs.add(mac.lower())
     except Exception as e:                           # noqa: BLE001
         LOG.warning("identity detection failed: %s", e)
+    if not gw or not my_ips:
+        # 5.3.4 (OS-12): without scapy (limited mode) ask the OS instead,
+        # so a capture file still marks "This computer" and the router
+        g2, ips2, macs2, if2 = os_identity()
+        gw = gw or g2
+        my_ips |= ips2
+        my_macs |= macs2
+        default_iface_name = default_iface_name or if2
     return gw, my_ips, my_macs, default_iface_name
+
+
+def parse_proc_route(text):
+    """→ (gateway_ip, iface) of the default route in /proc/net/route."""
+    for line in (text or "").splitlines()[1:]:
+        f = line.split()
+        if len(f) >= 3 and f[1] == "00000000" and f[2] != "00000000":
+            with contextlib.suppress(ValueError, OSError):
+                return _socket.inet_ntoa(struct.pack(
+                    "<I", int(f[2], 16))), f[0]
+    return "", ""
+
+
+def os_identity():
+    """(gateway_ip, my_ips, my_macs, iface) from the operating system,
+    without scapy and without sending anything: a UDP socket that is
+    connected but never used only asks the OS which address it would use.
+    """
+    gw, ips, macs, iface = "", set(), set(), ""
+    s = None
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("192.0.2.1", 9))            # TEST-NET: nothing is sent
+        ip = s.getsockname()[0]
+        if ip and not ip.startswith(("0.", "127.")):
+            ips.add(ip)
+    except OSError:
+        pass
+    finally:
+        if s is not None:
+            s.close()
+    try:
+        if os.path.exists("/proc/net/route"):
+            with open("/proc/net/route", encoding="utf-8") as f:
+                gw, iface = parse_proc_route(f.read())
+            if iface:
+                with open(f"/sys/class/net/{iface}/address",
+                          encoding="utf-8") as f:
+                    mac = f.read().strip().lower()
+                if is_unicast_mac(mac):
+                    macs.add(mac)
+        elif IS_MAC:
+            out = _run_text(["route", "-n", "get", "default"])
+            m = re.search(r"gateway:\s*(\d+\.\d+\.\d+\.\d+)", out)
+            gw = m.group(1) if m else ""
+            m = re.search(r"interface:\s*(\S+)", out)
+            iface = m.group(1) if m else ""
+        elif IS_WINDOWS:
+            out = _run_text(["route", "print", "-4", "0.0.0.0"])
+            m = re.search(r"^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+"
+                          r"(\d+\.\d+\.\d+\.\d+)", out, re.M)
+            gw = m.group(1) if m else ""
+    except OSError as e:
+        LOG.info("OS identity lookup: %s", e)
+    if gw:
+        LOG.info("identity from the OS (no scapy): gateway=%s ips=%s", gw,
+                 sorted(ips))
+    return gw, ips, macs, iface
 
 
 def _install_thread_excepthook():
