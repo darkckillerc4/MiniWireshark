@@ -3160,6 +3160,8 @@ class LoaderWindow(tk.Frame):
             tile.bind("<space>", lambda e, k=key: self._choose(k))
             if first_tile is None:
                 first_tile = tile
+        if FEATURES.get("ready_panel", True):
+            self._build_ready_panel(top)
         news = tk.Frame(top, bg=self.card_bg, padx=12, pady=8)
         news.pack(fill="both", expand=True, pady=(10, 0))
         tk.Label(news, text="What's new in " + ".".join(
@@ -3213,6 +3215,7 @@ class LoaderWindow(tk.Frame):
                                  f"{min(need, limit)}")
         while self.choice is None:
             drain_deferred_tk()
+            self._fill_ready_panel()
             try:
                 self.update()
             except tk.TclError:
@@ -3229,6 +3232,64 @@ class LoaderWindow(tk.Frame):
 
     def _choose(self, key):
         self.choice = key
+
+    # ---- 5.3.4 (MC2): Ready? ------------------------------------------------
+    def _build_ready_panel(self, parent):
+        """One line per READY_PROBES entry: "checking…" until its probe
+        (run on a helper thread; never on the window's thread) answers."""
+        box = tk.Frame(parent, bg=self.card_bg, padx=12, pady=6)
+        box.pack(fill="x", pady=(10, 0))
+        tk.Label(box, text=translate_text("Ready?"), bg=self.card_bg,
+                 fg=self.fg, font=mw_font(10, "bold"),
+                 anchor="w").grid(row=0, column=0, columnspan=4,
+                                  sticky="w")
+        self.ready_rows = {}
+        self.ready_results = {}
+        box.columnconfigure(2, weight=1)
+        for i, (key, title, _fn) in enumerate(READY_PROBES, start=1):
+            mark = tk.Label(box, text="…", bg=self.card_bg, fg=self.muted,
+                            width=2)
+            mark.grid(row=i, column=0, sticky="nw")
+            tk.Label(box, text=translate_text(title), bg=self.card_bg,
+                     fg=self.fg, anchor="w").grid(row=i, column=1,
+                                                  sticky="nw", padx=(0, 8))
+            text = tk.Label(box, text=translate_text("checking…"),
+                            bg=self.card_bg, fg=self.muted, anchor="w",
+                            justify="left", wraplength=380)
+            text.grid(row=i, column=2, sticky="nw")
+            self.ready_rows[key] = (mark, text, box, i)
+        cfg = self.config
+        results = self.ready_results
+
+        def run():
+            for key, _t, _f in READY_PROBES:
+                results[key] = ready_line(key, cfg)
+        threading.Thread(target=run, name="ready-probes",
+                         daemon=True).start()
+
+    def _fill_ready_panel(self):
+        rows = getattr(self, "ready_rows", None)
+        if not rows:
+            return
+        colors = {"ok": self.good, "warn": self.warn, "bad": self.bad,
+                  "info": self.muted}
+        for key in [k for k in list(self.ready_results) if k in rows]:
+            state, text, fix = self.ready_results[key]
+            mark, lbl, box, i = rows.pop(key)
+            with contextlib.suppress(tk.TclError):
+                mark.config(text=READY_MARK[state], fg=colors[state])
+                lbl.config(text=text, fg=self.fg)
+                if fix in READY_FIX_LABEL:
+                    ttk.Button(box, text=translate_text(
+                        READY_FIX_LABEL[fix]),
+                        command=lambda f=fix: self._ready_fix(f)).grid(
+                        row=i, column=3, sticky="ne", padx=(6, 0))
+
+    def _ready_fix(self, fix):
+        if fix == "folder":
+            _open_path(PATHS.data)
+        elif fix in ("repair", "monitor"):
+            self._choose(fix)
 
     # ---- rc.11: warm start --------------------------------------------------------
     def show_progress_again(self, title="Opening MiniWireshark"):
@@ -10611,6 +10672,7 @@ FEATURES = {
     "dpi": True,             # Windows draws sharp text at 125 %+ (M8)
     "warm_start": True,      # the window is built behind the loading screen
     "win_timer": True,       # 1 ms Windows timer while busy (5.2.3, B-06)
+    "ready_panel": True,     # "Ready?" lines in the Welcome Center (5.3.4)
 }
 
 
@@ -10768,6 +10830,8 @@ FEATURE_HELP = {
                   "screen; text widths are remembered between starts",
     "win_timer": "Windows wakes the program every 1 ms (not 15.6 ms) "
                  "only while the window is busy",
+    "ready_panel": "the Welcome Center lists what is ready and how to fix "
+                   "what isn't",
 }
 
 
@@ -22606,6 +22670,12 @@ Getting started automatically — picking your best network card ¦ Démarrage a
 Running the built-in self-test ¦ Exécution de l'autotest intégré ¦ Ejecutando la autoprueba integrada
 Learned baselines reset. ¦ Habitudes apprises réinitialisées. ¦ Referencias aprendidas restablecidas.
 Running health checks ¦ Vérifications de santé en cours ¦ Ejecutando comprobaciones de salud
+Ready? ¦ Prêt ? ¦ ¿Listo?
+checking… ¦ vérification… ¦ comprobando…
+Python and window toolkit ¦ Python et boîte à outils graphique ¦ Python y kit de ventanas
+Capture permission ¦ Autorisation de capture ¦ Permiso de captura
+Signed updates ¦ Mises à jour signées ¦ Actualizaciones firmadas
+What leaves this PC ¦ Ce qui quitte ce PC ¦ Lo que sale de este PC
 Demo Mode — showing made-up traffic. Nothing is being captured. ¦ Mode démo — trafic inventé affiché. Rien n'est capturé. ¦ Modo demo — se muestra tráfico inventado. No se captura nada.
 Getting ready — I'll pick a network card and start watching automatically. ¦ Préparation — je vais choisir une carte réseau et commencer à observer automatiquement. ¦ Preparando — elegiré una tarjeta de red y empezaré a observar automáticamente.
 Components ¦ Composants ¦ Componentes
@@ -66706,11 +66776,31 @@ def _gs_v5_startup(app, ctx):
     win = tk.Toplevel(root)
     lw = LoaderWindow(win, app.config)
     lw.pack(fill="both", expand=True)
-    win.after(300, lambda: lw._choose("exit"))
+    # MC2: every Ready? line fills from its probe while the window runs,
+    # with the same answer --boot-check prints
+    seen = {}
+
+    def peek():
+        seen.update({k: v for k, v in lw.ready_results.items()})
+        if len(seen) == len(READY_PROBES) and not lw.ready_rows:
+            lw._choose("exit")
+        else:
+            win.after(50, peek)
+    win.after(50, peek)
+    win.after(20000, lambda: lw._choose("exit"))
+    t0 = time.perf_counter()
     choice = lw.show_welcome("summary", "degraded", False,
                              notice="⚠ test notice")
     assert choice == "exit", choice
+    assert time.perf_counter() - t0 < 19, "Ready? lines never filled"
     assert lw.notice_lbl.cget("text") == "⚠ test notice"
+    report = {k: (st, tx) for k, _t, st, tx, _f in ready_report(app.config)}
+    for k, (st, tx, _f) in seen.items():
+        if k not in ("network", "outbound"):       # these may change
+            assert report[k][0] == st, (k, report[k], st)
+    lines = []
+    boot_check(out=lines.append)
+    assert any(x.strip() == "Ready?" for x in lines), lines
     win.destroy()
     old = globals()["BOOT_DIR"]
     globals()["BOOT_DIR"] = ctx.path("boot_hist")
@@ -70131,6 +70221,130 @@ BOOT_TESTS = ("test_boot_receipts_and_crash_loop",
               "t_runtime_state_and_handoff")
 
 
+# ---- 5.3.4 (MC2): "Ready?" — one list for the Welcome Center and
+# --boot-check, so the two can never disagree ---------------------------------
+READY_MARK = {"ok": "✓", "warn": "!", "bad": "✗", "info": "·"}
+
+
+def _ready_python(cfg):
+    ok, why = system_python_suitable()
+    text = f"Python {platform.python_version()}, Tk {tk.TkVersion}"
+    if ok:
+        return "ok", text, ""
+    return ("warn", f"{text} — {why}. A newer Python is at "
+            "https://www.python.org/downloads/", "")
+
+
+def _ready_driver(cfg):
+    dep = next(d for d in DEPENDENCY_MANIFEST if d["required"])
+    have, _info = _required_ready(dep)
+    if not have:
+        return ("warn", "The capture library (scapy) is missing, so only "
+                "capture files and Demo Mode work. Repair installs it.",
+                "repair")
+    if IS_WINDOWS and not _npcap_present():
+        return ("bad", "The capture driver (Npcap) is not installed. "
+                "Start Monitoring offers to install it.", "monitor")
+    return "ok", ("Npcap capture driver installed" if IS_WINDOWS else
+                  "Built-in packet capture"), ""
+
+
+def _ready_permission(cfg):
+    if has_capture_rights():
+        return "ok", "Allowed to watch network traffic", ""
+    return ("warn", "Needs permission to watch traffic; MiniWireshark asks "
+            "when you start monitoring (Demo Mode and files don't need "
+            "it).", "monitor")
+
+
+def _ready_network(cfg):
+    gw, ips, _macs, iface = os_identity()
+    if not gw and not ips:
+        return ("warn", "No network connection found right now.", "")
+    return ("info", f"Default network: {iface or 'unknown card'}"
+            + (f", router {gw}" if gw else "")
+            + (f", this computer {sorted(ips)[0]}" if ips else "")
+            + ". The best card is picked when you start.", "")
+
+
+def _ready_data(cfg):
+    if _dir_writable(PATHS.data):
+        return "ok", f"Data folder: {PATHS.data}", "folder"
+    return ("bad", f"The data folder can't be written: {PATHS.data}. "
+            "Settings and history won't be saved.", "folder")
+
+
+def _ready_history(cfg):
+    if not (cfg.get("history.enabled", True) if cfg is not None else True):
+        return "info", "History is turned off.", ""
+    path = PATHS.history_db
+    if not os.path.exists(path):
+        return "info", "No history saved yet.", ""
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        try:
+            row = con.execute("PRAGMA quick_check").fetchone()
+        finally:
+            con.close()
+    except sqlite3.OperationalError as e:
+        if _sqlite_busy(e):
+            return "info", "History is in use by another copy.", ""
+        return "bad", f"History can't be read ({e}).", "repair"
+    except sqlite3.DatabaseError as e:
+        return "bad", f"History is damaged ({e}).", "repair"
+    if row and row[0] == "ok":
+        return ("ok", f"History healthy "
+                f"({os.path.getsize(path) / 1e6:.1f} MB)", "")
+    return "bad", "History is damaged; Repair restores the backup.", "repair"
+
+
+def _ready_updates(cfg):
+    if RELEASE_KEYS:
+        return ("ok", "Updates install only when signed with the release "
+                "key.", "")
+    return ("info", "No release key in this copy, so updates are never "
+            "installed automatically.", "")
+
+
+def _ready_outbound(cfg):
+    if cfg is not None and cfg.get("privacy.kill_switch", False):
+        return "ok", "Nothing leaves this PC: the kill switch is on.", ""
+    sent = LEDGER.summary_lines()
+    return ("info", "What MiniWireshark itself sends is listed in "
+            "Privacy (Settings). So far: " + "; ".join(sent[:3]), "")
+
+
+READY_PROBES = (
+    ("python", "Python and window toolkit", _ready_python),
+    ("driver", "Capture driver", _ready_driver),
+    ("permission", "Capture permission", _ready_permission),
+    ("network", "Network card", _ready_network),
+    ("data", "Data folder", _ready_data),
+    ("history", "History", _ready_history),
+    ("updates", "Signed updates", _ready_updates),
+    ("outbound", "What leaves this PC", _ready_outbound),
+)
+READY_FIX_LABEL = {"repair": "Repair",
+                   "monitor": "Start Monitoring", "folder": "Open folder"}
+
+
+def ready_line(key, cfg=None):
+    """→ (state, text, fix) for one probe; a probe that fails says so
+    instead of guessing."""
+    fn = next(f for k, _t, f in READY_PROBES if k == key)
+    try:
+        return fn(cfg)
+    except Exception as e:                           # noqa: BLE001
+        LOG.warning("ready probe %s failed: %s", key, e)
+        return "warn", f"Couldn't check ({type(e).__name__}).", ""
+
+
+def ready_report(cfg=None):
+    """[(key, title, state, text, fix)] — what --boot-check prints and the
+    Welcome Center shows."""
+    return [(k, t) + tuple(ready_line(k, cfg)) for k, t, _f in READY_PROBES]
+
+
 def boot_check(out=print):
     """`--boot-check`: what this computer offers MiniWireshark at startup,
     the recent startup records, and the startup tests. Exit code 0 when the
@@ -70170,6 +70384,10 @@ def boot_check(out=print):
            if env.get("handshake_failed") else "")
         + (", chosen" if runtime_state_read().get("prefer") == "managed"
            else ""))
+    out("")
+    out("Ready?")
+    for _k, title, state, text, _fix in ready_report(AppConfig()):
+        out(f"  {READY_MARK[state]} {title}: {text}")
     out("")
     out("Recent starts:")
     for r in BootReceipt.recent(n=5):
