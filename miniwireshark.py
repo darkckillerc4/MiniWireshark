@@ -124,6 +124,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import weakref
 from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1035,6 +1036,145 @@ BOOT_CHECK_FLAG = "--boot-check"
 READY_ARG = "--mw-ready="
 STAGE_ARG = "--mw-stage=app"
 
+# 5.3.4 (ST-02, OS-06, ST-03): a small command-line front end. Before, -h,
+# --version and typos such as --self-tset all started the full program
+# (two tracebacks without a display, and each one counted as a crashed
+# start), and a tool flag with its value missing ended in an IndexError.
+# Each flag: (value it takes or "" for none, optional value?, help line).
+CLI_FLAGS = {
+    "--help": ("", False, "Show this help and exit."),
+    "-h": ("", False, ""),
+    "--version": ("", False, "Print the version and exit."),
+    "-V": ("", False, ""),
+    "--demo": ("", False, "Start in Demo Mode (simulated data, nothing "
+                          "real is shown)."),
+    "--safe": ("", False, "Start in Safe Mode (no automatic capture, "
+                          "history, helpers or downloads)."),
+    "--no-elevate": ("", False, "Never ask for administrator rights."),
+    "--no-runtime": ("", False, "Don't use MiniWireshark's private "
+                                "Python."),
+    "--yes": ("", False, "Answer setup questions with the recommended "
+                         "choice."),
+    "--boot-check": ("", False, "Check what this computer offers "
+                                "MiniWireshark and exit."),
+    "--self-test": ("", False, "Run the built-in tests and exit."),
+    "--quick": ("", False, "With --self-test, --gui-shots or "
+                           "--release-gate: the shorter run."),
+    "--gui-test": ("", False, "Drive the real window through its GUI "
+                              "test (needs a display)."),
+    "--live": ("", False, ""),
+    "--bench": ("", False, "Measure this computer's analysis speed."),
+    "--bench-gui": ("", False, "Developer: window benchmarks."),
+    "--check": ("", False, ""),
+    "--targets": ("", False, ""),
+    "--runs": ("N", False, ""),
+    "--child": ("ID", False, ""),
+    "--pcap": ("FILE", False, ""),
+    "--out": ("DIR", False, ""),
+    "--gui-shots": ("DIR", False, "Developer: take screenshots of every "
+                                  "tab into DIR."),
+    "--release-gate": ("", False, "Developer: the release checks."),
+    "--start-check": ("", False, "Developer: time a full start."),
+    "--release-check": ("FILE", True, "Developer: check a release file."),
+    "--make-release-key": ("KEYFILE", False, ""),
+    "--sign-release": ("FILE", False, ""),
+    "--sign-datapack": ("JSON", False, ""),
+    "--key": ("KEYFILE", False, ""),
+    "--key-id": ("ID", False, ""),
+    "--pack": ("NAME", False, ""),
+}
+# flags only MiniWireshark itself passes between its own processes
+CLI_INTERNAL = ("--mw-", "--miniwireshark-elevated", "-psn_")
+
+
+def cli_usage():
+    lines = [f"MiniWireshark {SCRIPT_VERSION} — your network, explained "
+             "in plain English.", "",
+             "Usage: python miniwireshark.py [options]", "",
+             "Options:"]
+    for flag, (val, opt, text) in CLI_FLAGS.items():
+        if not text:
+            continue
+        name = flag + ((f" [{val}]" if opt else f" {val}") if val else "")
+        if flag == "--help":
+            name = "-h, --help"
+        elif flag == "--version":
+            name = "-V, --version"
+        lines.append(f"  {name:<24} {text}")
+    lines += ["", "With no options the window opens. Settings live in the "
+              "data folder (set MINIWIRESHARK_DATA to move it)."]
+    return "\n".join(lines)
+
+
+def cli_check(argv):
+    """-> (exit code, message) when the command line ends the program
+    before anything starts (help, version, a mistake), else None. A
+    mistake exits with 2 and a one-line reason, never a traceback."""
+    argv = list(argv)
+    if any(a.startswith("--mw-worker") for a in argv):
+        return None                  # a worker reads its own input
+    free_words = "--bench-gui" in argv
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        i += 1
+        if a.startswith(CLI_INTERNAL):
+            continue
+        if a in ("-h", "--help"):
+            return 0, cli_usage()
+        if a in ("-V", "--version"):
+            if "--sign-release" in argv:   # a value of --sign-release
+                i += 1
+                continue
+            return 0, f"MiniWireshark {SCRIPT_VERSION}"
+        spec = CLI_FLAGS.get(a)
+        if spec is None:
+            if not a.startswith("-") and free_words:
+                continue
+            hint = ""
+            close = [f for f in CLI_FLAGS if f.startswith("--") and
+                     _cli_close(a, f)]
+            if close:
+                hint = f" Did you mean {close[0]}?"
+            what = "option" if a.startswith("-") else "argument"
+            return 2, (f"miniwireshark: unknown {what} “{a}”.{hint} "
+                       "Try --help.")
+        val, optional, _t = spec
+        if not val:
+            continue
+        nxt = argv[i] if i < len(argv) else None
+        if nxt is None or nxt.startswith("--") or nxt.startswith(
+                CLI_INTERNAL):
+            if optional:
+                continue
+            return 2, f"miniwireshark: {a} needs a value: {a} {val}"
+        i += 1
+    return None
+
+
+def _cli_close(a, b):
+    """True when a typed flag is one edit-ish step from a real one."""
+    a, b = a.lstrip("-"), b.lstrip("-")
+    if abs(len(a) - len(b)) > 2 or not a:
+        return False
+    return sorted(a) == sorted(b) or sum(
+        x != y for x, y in zip(a, b)) + abs(len(a) - len(b)) <= 2
+
+
+if __name__ == "__main__":
+    _CLI = cli_check(sys.argv[1:])
+    if _CLI is not None:
+        _out = sys.stdout if _CLI[0] == 0 else sys.stderr
+        if _out is None:                 # pythonw: no console to print to
+            _fatal_dialog("MiniWireshark", _CLI[1])
+        else:
+            try:
+                _out.write(_CLI[1] + "\n")
+            except UnicodeEncodeError:
+                _out.write(_CLI[1].encode("ascii", "replace").decode() +
+                           "\n")
+        sys.exit(_CLI[0])
+
 # 5.1.2: started as "python miniwireshark.py", Python compiles the whole
 # file first: about 2.5 s, and ~150 MB the process keeps for its whole
 # life (Linux, Python 3.12: 196 MB before the window, against 40 MB for
@@ -1800,6 +1940,10 @@ except ImportError:                                  # pragma: no cover
         "  Windows/macOS: reinstall Python from python.org (tick 'tcl/tk').\n"
         "  Debian/Ubuntu: sudo apt install python3-tk\n"
         "  Fedora:        sudo dnf install python3-tkinter\n")
+    if BOOT is not None:
+        # 5.3.4 (OS-06): a Python without Tk is not a crashed start, so it
+        # never puts the next start (on a Python with Tk) into Safe Mode
+        BOOT.mark(outcome="no_tk")
     sys.exit(1)
 
 
@@ -6931,8 +7075,12 @@ THEME_LIGHT = {
     "node_site": "#0b6b3a", "line": "#cfd6e0", "line_hi": "#2b7de9",
     "tooltip_bg": "#fffbe6", "tooltip_fg": "#333333",
     "conf_high": "#0b6b3a", "conf_med": "#8a5a00", "conf_low": "#a05608",
-    "conf_none": "#888888", "focus": "#2b7de9",
+    "conf_none": "#666666", "focus": "#2b7de9",
 }
+# 5.3.4 (ST-10): the main button and grey text meet WCAG AA (4.5:1);
+# t_st10_text_contrast_meets_aa checks every text colour pair
+ACCENT_BUTTON_BG = "#1f66c7"
+ACCENT_BUTTON_ACTIVE = "#1a56a8"
 THEME_DARK = {
     "window_bg": "#161920", "tab_bg": "#20232c", "text_bg": "#1b1e26",
     "text_fg": "#e2e5ea", "muted_fg": "#9aa3b2",
@@ -7033,6 +7181,92 @@ def px_geo(geo):
     if not m or UI_SCALE[0] == 1.0:
         return geo
     return f"{px(int(m.group(1)))}x{px(int(m.group(2)))}{m.group(3)}"
+
+
+# ---- 5.3.4 (IP-003): a dark title bar on Windows with the dark palette ------
+# DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE): attribute 20 on
+# Windows 10 build 18985 and later (and 11), 19 on the 1809-1903 builds
+# before it. Windows 7 and 8 refuse the call with an error code: nothing
+# happens. Every failure is silent (the title bar simply stays light).
+# Needs a visual check on Windows 10 1809, 10 21H2 and 11.
+DWMWA_DARK = 20
+DWMWA_DARK_OLD = 19
+TITLE_BAR = {"dark": False, "hooked": False,
+             # tests put (dwmapi, user32, build) here to run off Windows
+             "api": None}
+
+
+def _title_bar_api():
+    if TITLE_BAR["api"] is not None:
+        return TITLE_BAR["api"]
+    if not IS_WINDOWS:
+        return None
+    windll = getattr(ctypes, "windll", None)
+    if windll is None:
+        return None
+    try:
+        build = sys.getwindowsversion().build
+    except AttributeError:
+        build = 0
+    return windll.dwmapi, windll.user32, build
+
+
+def dark_title_bar(win, dark):
+    """Ask Windows to draw `win`'s title bar dark (or light again). Only
+    with the dark palette, behind FEATURES["dark_titlebar"]; a silent
+    no-op elsewhere and on any error. -> True when Windows accepted it."""
+    if not FEATURES.get("dark_titlebar", True):
+        return False
+    if not dark and not getattr(win, "_mw_dark_tb", False):
+        return False                # never touched: nothing to undo
+    try:
+        api = _title_bar_api()
+        if api is None:
+            return False
+        dwm, user32, build = api
+        win.update_idletasks()
+        hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+        attr = DWMWA_DARK if build >= 18985 else DWMWA_DARK_OLD
+        value = ctypes.c_int(1 if dark else 0)
+        rc = dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(value),
+                                       ctypes.sizeof(value))
+        ok = rc == 0
+        if ok:
+            win._mw_dark_tb = bool(dark)
+        return ok
+    except Exception as e:                           # noqa: BLE001
+        # keep: a light title bar is the harmless fallback
+        LOG.debug("dark title bar: %s", e)
+        return False
+
+
+def set_dark_title_bars(root, dark):
+    """The main window and every open dialog, now; dialogs opened later
+    follow through one <Map> binding on the Toplevel class (the 37
+    Toplevel dialogs need no change of their own)."""
+    TITLE_BAR["dark"] = bool(dark)
+    if not TITLE_BAR["hooked"]:
+        try:
+            root.bind_class("Toplevel", "<Map>", _title_bar_on_map, add="+")
+            TITLE_BAR["hooked"] = True
+        except Exception as e:                       # noqa: BLE001
+            LOG.debug("title bar hook: %s", e)
+    n = 0
+    stack = [root]
+    while stack:
+        w = stack.pop()
+        if isinstance(w, (tk.Tk, tk.Toplevel)):
+            n += bool(dark_title_bar(w, dark))
+        with contextlib.suppress(Exception):
+            stack.extend(w.winfo_children())
+    return n
+
+
+def _title_bar_on_map(event):
+    w = event.widget
+    if isinstance(w, tk.Toplevel) and \
+            getattr(w, "_mw_dark_tb", False) != TITLE_BAR["dark"]:
+        dark_title_bar(w, TITLE_BAR["dark"])
 
 
 def enable_dpi_awareness():
@@ -7170,11 +7404,12 @@ CVD_LABELS = {"Off": "",
 CVD_STATE = {"mode": ""}
 CVD_TRIPLES = {
     # (mode, dark): good, warn, danger
-    ("deutan", False): ("#1e74ae", "#a36a00", "#760a31"),
+    # 5.3.4 (ST-10): the light good/warn shades darkened to 4.5:1 text
+    ("deutan", False): ("#1a6aa0", "#8f5c00", "#760a31"),
     ("deutan", True): ("#1aacff", "#ffb81a", "#f15a91"),
-    ("protan", False): ("#1e74ae", "#a36a00", "#80001c"),
+    ("protan", False): ("#1a6aa0", "#8f5c00", "#80001c"),
     ("protan", True): ("#4dbfff", "#eee12a", "#f56c56"),
-    ("tritan", False): ("#1e8385", "#805800", "#cc002c"),
+    ("tritan", False): ("#17706f", "#805800", "#cc002c"),
     ("tritan", True): ("#4dffce", "#c8b45a", "#ff4d73"),
 }
 # canonical (light) colours that carry a meaning → which role they play
@@ -11266,6 +11501,8 @@ FEATURES = {
     "overload_degrade": True,  # too busy: count only, then back (M13, IP-025)
     "npcap_buffer": True,    # a bigger Npcap kernel buffer (M13, IP-024)
     "checkup_report": True,  # one-page Network check-up, redacted (M14)
+    "dark_titlebar": True,   # Windows draws a dark title bar (M16, IP-003)
+    "filter_english": True,  # a typed filter said in words (M16, IP-023)
 }
 
 
@@ -11463,6 +11700,10 @@ FEATURE_HELP = {
     "checkup_report": "a one-page Network check-up (ready, what changed, "
                       "unusual activity, common questions, devices) that "
                       "hides personal details unless you turn that off",
+    "dark_titlebar": "with the dark theme on Windows 10 and 11, the title "
+                     "bars of the window and its dialogs are dark too",
+    "filter_english": "a typed field filter is said in plain words under "
+                      "the filter box",
 }
 
 
@@ -22746,7 +22987,17 @@ class NetworkModel:
             if proto == "DNS" and d["dns"] and d["dns"].get("qr") == 1:
                 return                    # answers repeat the question
             tag = "dns"
-            did = f"🔍 looked up  {d['text']}" if d["text"] else "🔍 DNS lookup"
+            # 5.3.4 (ST-05): the name itself, not the decoder's sentence
+            # ("looked up  Looking up X" had a doubled verb)
+            name = ""
+            if proto == "DNS":
+                name = (d["dns"].get("qname") or "").strip(".") if \
+                    isinstance(d["dns"], dict) else ""
+                if not name and d["text"]:
+                    name = re.sub(r"^Looking up ", "", d["text"])
+                did = f"🔍 looked up {name}" if name else "🔍 DNS lookup"
+            else:
+                did = f"🔍 {d['text']}" if d["text"] else "🔍 DNS lookup"
         elif proto in ("TLS", "DoT"):
             if not (d["tls"] and d["tls"].get("kind") == "client"):
                 return
@@ -25225,6 +25476,16 @@ def span_words(sec):
         f"{h:.1f} h"
 
 
+def plural(n, one, many=None):
+    """“1 packet”, “2 packets”, “1,234 packets” (5.3.4, ST-09: the Security
+    page said “1 packets”)."""
+    try:
+        count = f"{int(n):,}"
+    except (TypeError, ValueError):
+        count = str(n)
+    return f"{count} {one if n == 1 else (many or one + 's')}"
+
+
 def digest_summary(dg):
     parts = []
     for key, one, many in (("new_devices", "new device", "new devices"),
@@ -25396,6 +25657,7 @@ Trust this network ¦ Faire confiance à ce réseau ¦ Confiar en esta red
 Stay in Quiet Mode ¦ Rester en mode discret ¦ Seguir en modo silencioso
 Turn the kill switch off ¦ Désactiver l'arrêt d'urgence ¦ Desactivar el interruptor de corte
 DEMO DATA — NOT LIVE TRAFFIC. Everything shown is simulated sample data.   [simulated] ¦ DONNÉES DE DÉMO — PAS DU TRAFIC RÉEL. Tout ce qui est affiché est simulé.   [simulé] ¦ DATOS DE DEMOSTRACIÓN — NO ES TRÁFICO REAL. Todo lo que se muestra es simulado.   [simulado]
+simulated ¦ simulé ¦ simulado
 Exit demo ¦ Quitter la démo ¦ Salir de la demo
 DEMO DATA — NOT LIVE TRAFFIC. Explore the tabs; nothing here is real and nothing mixes with your real session. ¦ DONNÉES DE DÉMO — PAS DU TRAFIC RÉEL. Explorez les onglets ; rien ici n'est réel et rien ne se mélange à votre vraie session. ¦ DATOS DE DEMOSTRACIÓN — NO ES TRÁFICO REAL. Explore las pestañas; nada de esto es real y nada se mezcla con su sesión real.
 Session ¦ Session ¦ Sesión
@@ -25988,7 +26250,7 @@ Username ¦ Nom d'utilisateur ¦ Usuario
 Check the certificate (https) ¦ Vérifier le certificat (https) ¦ Comprobar el certificado (https)
 Trust this certificate ¦ Faire confiance à ce certificat ¦ Confiar en este certificado
 Save ¦ Enregistrer ¦ Guardar
-Start here. The cards show what's happening right now; the two big cards say what this computer can see from where it is, and what changed in the last hour. Click any card to dig in. ¦ Commencez ici. Les cartes montrent ce qui se passe maintenant ; les deux grandes indiquent ce que cet ordinateur peut voir d'où il est, et ce qui a changé dans la dernière heure. Cliquez sur une carte pour approfondir. ¦ Empiece aquí. Las tarjetas muestran lo que pasa ahora mismo; las dos grandes dicen lo que este equipo puede ver desde donde está y qué cambió en la última hora. Haga clic en una tarjeta para profundizar.
+Start here. Three questions sit at the top: Is anything wrong? Who is using the Internet? What is new? Each answer has a “Show me” link. The cards below show what's happening right now; click any card to dig in. ¦ Commencez ici. Trois questions sont en haut : Y a-t-il un problème ? Qui utilise Internet ? Quoi de neuf ? Chaque réponse a un lien « Montrer ». Les cartes en dessous montrent ce qui se passe maintenant ; cliquez sur une carte pour approfondir. ¦ Empiece aquí. Arriba hay tres preguntas: ¿Algo va mal? ¿Quién usa Internet? ¿Qué hay de nuevo? Cada respuesta tiene un enlace «Muéstrame». Las tarjetas de abajo muestran lo que pasa ahora mismo; haga clic en una tarjeta para profundizar.
 Back ¦ Retour ¦ Atrás
 Show me ¦ Montrer ¦ Muéstrame
 Next ¦ Suivant ¦ Siguiente
@@ -26486,7 +26748,7 @@ Nothing sent yet. ¦ Rien n'a encore été envoyé. ¦ Aún no se ha enviado nad
 Settings are saved in: ¦ Les réglages sont enregistrés dans : ¦ Los ajustes se guardan en:
 Data folder (caches, logs, history, sessions): ¦ Dossier de données (caches, journaux, historique, sessions) : ¦ Carpeta de datos (cachés, registros, historial, sesiones):
 ◉ observed ◎ correlated ◌ inferred ? unknown ¦ ◉ observé ◎ corrélé ◌ déduit ? inconnu ¦ ◉ observado ◎ correlacionado ◌ deducido ? desconocido
-F2 inspector ¦ F2 inspecteur ¦ F2 inspector
+F2 inspector ¦ F2 inspecteur ¦ Inspector (F2)
 About its ports ¦ À propos de ses ports ¦ Sobre sus puertos
 Advertised services ¦ Services annoncés ¦ Servicios anunciados
 Blind spots right now ¦ Angles morts actuels ¦ Puntos ciegos ahora
@@ -27333,7 +27595,7 @@ Explain inline (on / off) ¦ Explications en ligne (activer / désactiver) ¦ Ex
 Each fact and how it is known ¦ Chaque fait et comment il est connu ¦ Cada dato y cómo se sabe
 ★ not shown: most devices are new this hour ¦ ★ non affichées : la plupart des appareils sont nouveaux cette heure ¦ ★ no se muestran: la mayoría de los dispositivos son nuevos en esta hora
 What is this? ¦ Qu'est-ce que c'est ? ¦ ¿Qué es esto?
-This page explains what I've seen on your network in plain English. Nothing leaves your computer — everything here is based on packets I've captured. ¦ Cette page explique simplement ce que j'ai vu sur votre réseau. Rien ne quitte votre ordinateur — tout ici repose sur les paquets que j'ai capturés. ¦ Esta página explica con palabras sencillas lo que he visto en su red. Nada sale de su ordenador: todo lo que aparece aquí se basa en los paquetes que he capturado.
+This page explains, in plain English, what this computer could see on your network. What you capture stays on this computer; “What MiniWireshark sent” lists the little the program sends itself. ¦ Cette page explique simplement ce que cet ordinateur a pu voir sur votre réseau. Ce que vous capturez reste sur cet ordinateur ; « Ce que MiniWireshark a envoyé » liste le peu que le programme envoie lui-même. ¦ Esta página explica con palabras sencillas lo que este equipo pudo ver en su red. Lo que captura se queda en este equipo; «Lo que envió MiniWireshark» enumera lo poco que envía el propio programa.
 Your gateway / router ¦ Votre passerelle / box ¦ Su puerta de enlace / router
 I couldn't detect your router yet. Start watching and then open a website — I'll figure it out. ¦ Je n'ai pas encore détecté votre box. Lancez l'observation puis ouvrez un site web — je la trouverai. ¦ Aún no he detectado su router. Empiece a observar y abra un sitio web: lo averiguaré.
 Device identity checks (ARP) ¦ Vérification de l'identité des appareils (ARP) ¦ Comprobación de la identidad de los dispositivos (ARP)
@@ -27784,6 +28046,94 @@ Call measuring is turned off. ¦ La mesure des appels est désactivée. ¦ La me
 A call on another device (a phone, a TV) isn't visible from this computer. ¦ Un appel sur un autre appareil (un téléphone, une télé) n'est pas visible depuis cet ordinateur. ¦ Una llamada en otro dispositivo (un teléfono, una tele) no se ve desde este equipo.
 No call was seen. Look again during a call. ¦ Aucun appel n'a été vu. Regardez de nouveau pendant un appel. ¦ No se vio ninguna llamada. Vuelva a mirar durante una llamada.
 Look again during the call, on the computer that makes it. ¦ Regardez de nouveau pendant l'appel, sur l'ordinateur qui le passe. ¦ Vuelva a mirar durante la llamada, en el equipo que la hace.
+# 5.3.4 (M16, ST-08): lines users saw in English after switching language
+DNS lookup ¦ Recherche DNS ¦ Búsqueda DNS
+opened a fast secure connection (QUIC) ¦ a ouvert une connexion sécurisée rapide (QUIC) ¦ abrió una conexión segura rápida (QUIC)
+opened a fast secure connection ¦ a ouvert une connexion sécurisée rapide ¦ abrió una conexión segura rápida
+Checking the time (NTP request) ¦ Mise à l'heure (requête NTP) ¦ Consulta de la hora (petición NTP)
+Checking the time (NTP reply) ¦ Mise à l'heure (réponse NTP) ¦ Consulta de la hora (respuesta NTP)
+Checking the time (NTP message) ¦ Mise à l'heure (message NTP) ¦ Consulta de la hora (mensaje NTP)
+File transfer (FTP, not encrypted) ¦ Transfert de fichiers (FTP, non chiffré) ¦ Transferencia de archivos (FTP, sin cifrar)
+Remote terminal (Telnet, not encrypted) ¦ Terminal à distance (Telnet, non chiffré) ¦ Terminal remoto (Telnet, sin cifrar)
+Smart home messaging (MQTT, not encrypted) ¦ Messagerie de maison connectée (MQTT, non chiffrée) ¦ Mensajería del hogar conectado (MQTT, sin cifrar)
+Checking email (IMAP, not encrypted) ¦ Relève du courrier (IMAP, non chiffré) ¦ Consulta del correo (IMAP, sin cifrar)
+Checking email (POP3, not encrypted) ¦ Relève du courrier (POP3, non chiffré) ¦ Consulta del correo (POP3, sin cifrar)
+Streaming video control (RTSP) ¦ Contrôle de flux vidéo (RTSP) ¦ Control de vídeo en streaming (RTSP)
+Router announcement (IPv6) ¦ Annonce du routeur (IPv6) ¦ Anuncio del router (IPv6)
+asking for an address ¦ demande une adresse ¦ pide una dirección
+offering an address ¦ propose une adresse ¦ ofrece una dirección
+accepting the offer ¦ accepte l'offre ¦ acepta la oferta
+declining ¦ refuse l'offre ¦ rechaza la oferta
+confirmed ¦ confirmé ¦ confirmado
+refused ¦ refusé ¦ rechazado
+releasing ¦ libère son adresse ¦ libera su dirección
+asking for info ¦ demande des informations ¦ pide información
+new device ¦ nouvel appareil ¦ dispositivo nuevo
+new devices ¦ nouveaux appareils ¦ dispositivos nuevos
+new website ¦ nouveau site web ¦ sitio web nuevo
+new websites ¦ nouveaux sites web ¦ sitios web nuevos
+device came back ¦ appareil revenu ¦ dispositivo que volvió
+devices came back ¦ appareils revenus ¦ dispositivos que volvieron
+device left ¦ appareil parti ¦ dispositivo que se fue
+devices left ¦ appareils partis ¦ dispositivos que se fueron
+warning ¦ avertissement ¦ aviso
+warnings ¦ avertissements ¦ avisos
+Hardware address ¦ Adresse matérielle ¦ Dirección de hardware
+Waiting for your choice ¦ En attente de votre choix ¦ Esperando su elección
+What this computer can and can't see from where it is — click for details. ¦ Ce que cet ordinateur peut et ne peut pas voir d'où il est — cliquez pour les détails. ¦ Lo que este equipo puede y no puede ver desde donde está — haga clic para ver los detalles.
+A lookup alone does not prove a visit. ¦ Une recherche seule ne prouve pas une visite. ¦ Una búsqueda por sí sola no demuestra una visita.
+This expression is beyond the builder — edit it as text. ¦ Cette expression dépasse l'assistant — modifiez-la comme texte. ¦ Esta expresión va más allá del asistente — edítela como texto.
+About MiniWireshark ¦ À propos de MiniWireshark ¦ Acerca de MiniWireshark
+the Health tab found something to look at ¦ l'onglet Santé a trouvé quelque chose à regarder ¦ la pestaña Salud encontró algo que revisar
+Compare ¦ Comparer ¦ Comparar
+Testing… ¦ Test en cours… ¦ Probando…
+Merge… ¦ Fusionner… ¦ Combinar…
+Split ¦ Séparer ¦ Separar
+Continue ¦ Continuer ¦ Continuar
+Undo — the last %d s will be lost ¦ Annuler — les %d dernières secondes seront perdues ¦ Deshacer — se perderán los últimos %d s
+Three questions open the page: Is anything wrong? Who is using the Internet? What is new? The “From here” line under them says what this computer can and can't see. The cards below show what's happening right now; click any card to open the tab behind it. ¦ Trois questions ouvrent la page : Y a-t-il un problème ? Qui utilise Internet ? Quoi de neuf ? La ligne « D'ici » en dessous dit ce que cet ordinateur peut et ne peut pas voir. Les cartes plus bas montrent ce qui se passe maintenant ; cliquez sur une carte pour ouvrir l'onglet correspondant. ¦ Tres preguntas abren la página: ¿Algo va mal? ¿Quién usa Internet? ¿Qué hay de nuevo? La línea «Desde aquí» debajo dice lo que este equipo puede y no puede ver. Las tarjetas de abajo muestran lo que pasa ahora mismo; haga clic en una tarjeta para abrir la pestaña correspondiente.
+# 5.3.4 (M16, IP-023): a typed filter in plain words
+TCP traffic ¦ Trafic TCP ¦ Tráfico TCP
+UDP traffic ¦ Trafic UDP ¦ Tráfico UDP
+IPv4 traffic ¦ Trafic IPv4 ¦ Tráfico IPv4
+IPv6 traffic ¦ Trafic IPv6 ¦ Tráfico IPv6
+All traffic ¦ Tout le trafic ¦ Todo el tráfico
+VLAN-tagged traffic ¦ Trafic marqué VLAN ¦ Tráfico con etiqueta VLAN
+Devices finding each other (ARP) ¦ Appareils qui se cherchent (ARP) ¦ Dispositivos que se buscan entre sí (ARP)
+Pings and network errors (ICMP) ¦ Pings et erreurs réseau (ICMP) ¦ Pings y errores de red (ICMP)
+Pings and network errors (ICMPv6) ¦ Pings et erreurs réseau (ICMPv6) ¦ Pings y errores de red (ICMPv6)
+Secure connections (TLS) ¦ Connexions sécurisées (TLS) ¦ Conexiones seguras (TLS)
+Fast secure connections (QUIC) ¦ Connexions sécurisées rapides (QUIC) ¦ Conexiones seguras rápidas (QUIC)
+Unencrypted web traffic (HTTP) ¦ Trafic web non chiffré (HTTP) ¦ Tráfico web sin cifrar (HTTP)
+Address requests (DHCP) ¦ Demandes d'adresse (DHCP) ¦ Peticiones de dirección (DHCP)
+Time checks (NTP) ¦ Mises à l'heure (NTP) ¦ Consultas de la hora (NTP)
+Local name lookups (mDNS) ¦ Recherches de noms locaux (mDNS) ¦ Búsquedas de nombres locales (mDNS)
+%s traffic ¦ Trafic %s ¦ Tráfico %s
+on port %s ¦ sur le port %s ¦ en el puerto %s
+from port %s ¦ depuis le port %s ¦ desde el puerto %s
+to port %s ¦ vers le port %s ¦ hacia el puerto %s
+to or from %s ¦ vers ou depuis %s ¦ hacia o desde %s
+from %s ¦ depuis %s ¦ desde %s
+to %s ¦ vers %s ¦ hacia %s
+to or from the device %s ¦ vers ou depuis l'appareil %s ¦ hacia o desde el dispositivo %s
+for %s ¦ pour %s ¦ de %s
+for names containing %s ¦ pour les noms contenant %s ¦ de nombres que contienen %s
+longer than %s bytes ¦ de plus de %s octets ¦ de más de %s bytes
+shorter than %s bytes ¦ de moins de %s octets ¦ de menos de %s bytes
+of at least %s bytes ¦ d'au moins %s octets ¦ de al menos %s bytes
+of at most %s bytes ¦ d'au plus %s octets ¦ de como máximo %s bytes
+of exactly %s bytes ¦ d'exactement %s octets ¦ de exactamente %s bytes
+not %s ¦ sauf %s ¦ excepto %s
+%s or %s ¦ %s ou %s ¦ %s o %s
+%s and %s ¦ %s et %s ¦ %s y %s
+Everything except %s ¦ Tout sauf %s ¦ Todo excepto %s
+that have %s ¦ qui ont : %s ¦ que tienen: %s
+where %s %s %s ¦ où %s %s %s ¦ donde %s %s %s
+is more than ¦ est supérieur à ¦ es mayor que
+is less than ¦ est inférieur à ¦ es menor que
+is at least ¦ est au moins ¦ es al menos
+is at most ¦ est au plus ¦ es como máximo
+contains ¦ contient ¦ contiene
 Too busy to inspect every packet: counting only. Deep analysis is paused and comes back on its own. ¦ Trop occupé pour examiner chaque paquet : simple comptage. L'analyse approfondie est en pause et reprendra d'elle-même. ¦ Demasiado ocupado para examinar cada paquete: solo se cuentan. El análisis a fondo está en pausa y se reanudará solo.
 Network check-up ¦ Bilan du réseau ¦ Revisión de la red
 Preparing the check-up ¦ Préparation du bilan ¦ Preparando la revisión
@@ -27820,7 +28170,11 @@ I18N = {"fr": {}, "es": {}}
 I18N_LOCALES = ("en", "fr", "es")
 
 
-def _i18n_load(text=None):
+# "%d", "%s", "%.1f", "%(name)s"; a "% " is text ("% des paquets")
+_I18N_PCT = re.compile(r"%(?:\([\w]+\))?[-#0+]*\d*(?:\.\d+)?[sdifrx%]")
+
+
+def _i18n_load(text=None, install=True):
     """Parse the catalog. Returns a list of problems (empty when clean) so
     the self-test can check it; the tables are filled either way."""
     problems = []
@@ -27839,8 +28193,13 @@ def _i18n_load(text=None):
             if set(re.findall(r"\{\w*\}", en)) != \
                     set(re.findall(r"\{\w*\}", val)):
                 problems.append(f"line {n}: placeholders differ in {code}")
+            # 5.3.4 (S9): "%d" / "%s" too, in the same order — a missing
+            # one raises when the program fills the sentence in
+            if _I18N_PCT.findall(en) != _I18N_PCT.findall(val):
+                problems.append(f"line {n}: %-placeholders differ in {code}")
             tables[code][en] = val
-    I18N["fr"], I18N["es"] = tables["fr"], tables["es"]
+    if install:
+        I18N["fr"], I18N["es"] = tables["fr"], tables["es"]
     return problems
 
 
@@ -28368,17 +28727,22 @@ I18N_PATTERNS = [
 # "Offline since …" would take them (the sort keeps the rest in order)
 # 5.1.2: the Security page's sentences with values in them
 I18N_PATTERNS += [
-    (r"Your router is at (\S+)\. All your internet traffic goes through "
-     r"it\.", r"Votre box est à l'adresse \1. Tout votre trafic Internet "
-     r"passe par elle.", r"Su router está en \1. Todo su tráfico de "
-     r"Internet pasa por él."),
-    (r"If you didn't recognize this number, someone may have changed your "
-     r"Wi-Fi router\. Your router's admin page is usually at (\S+)",
-     r"Si vous ne reconnaissez pas ce numéro, quelqu'un a peut-être changé "
-     r"votre box Wi-Fi. La page d'administration de la box est en général "
-     r"à l'adresse \1", r"Si no reconoce este número, puede que alguien "
-     r"haya cambiado su router Wi-Fi. La página de administración del "
-     r"router suele estar en \1"),
+    (r"Your router is at (\S+)\. Your traffic to the Internet normally goes "
+     r"through it\.", r"Votre box est à l'adresse \1. Votre trafic vers "
+     r"Internet passe normalement par elle.", r"Su router está en \1. Su "
+     r"tráfico hacia Internet pasa normalmente por él."),
+    (r"Your router is at (\S+)\. Your traffic to the Internet normally goes "
+     r"through it \(a VPN is in use, so some of it goes through the VPN "
+     r"first\)\.", r"Votre box est à l'adresse \1. Votre trafic vers "
+     r"Internet passe normalement par elle (un VPN est utilisé, donc une "
+     r"partie passe d'abord par le VPN).", r"Su router está en \1. Su "
+     r"tráfico hacia Internet pasa normalmente por él (hay una VPN en uso, "
+     r"así que una parte pasa antes por la VPN)."),
+    (r"It is the box that connects your home to the Internet\. Its settings "
+     r"page is usually at (\S+)", r"C'est le boîtier qui relie votre "
+     r"domicile à Internet. Sa page de réglages est en général à l'adresse "
+     r"\1", r"Es el aparato que conecta su casa a Internet. Su página de "
+     r"ajustes suele estar en \1"),
     (r"Your router's address has answered from (\d+) different MAC "
      r"addresses\. That can happen after a router reboot or firmware "
      r"update, but it's also the classic sign of ARP spoofing — a device "
@@ -28589,7 +28953,43 @@ I18N_PATTERNS += [
 ]
 # 5.1.2: Timeline, Live feed and alert sentences. Also searched alone
 # (translate_event) so a table of thousands of events stays quick.
+_DHCP_WORDS = (r"(asking for an address|offering an address|accepting the "
+               r"offer|declining|confirmed|refused|releasing|asking for "
+               r"info)")
 EVENT_PATTERNS = [
+    # 5.3.4 (M16, ST-05, ST-08): feed lines that stayed English
+    (r"looked up ([\w.-]+)", r"a cherché \1", r"buscó \1"),
+    (r"Looking up ([\w.-]+)", r"Recherche de \1", r"Buscando \1"),
+    (r"Secure connection to (.+) \(HTTP/3 — the name was read from the "
+     r"connection's first packet\)", r"Connexion sécurisée à \1 (HTTP/3 — "
+     r"le nom a été lu dans le premier paquet de la connexion)",
+     r"Conexión segura con \1 (HTTP/3 — el nombre se leyó del primer "
+     r"paquete de la conexión)"),
+    (r"(\S+) is at (\S+) \(Windows name\)", r"\1 est à \2 (nom Windows)",
+     r"\1 está en \2 (nombre de Windows)"),
+    (r"(\S+) is at (\S+) \(IPv6\)", r"\1 est à \2 (IPv6)",
+     r"\1 está en \2 (IPv6)"),
+    (r"Router announcement \(IPv6\) — network (.+)", r"Annonce du routeur "
+     r"(IPv6) — réseau \1", r"Anuncio del router (IPv6) — red \1"),
+    (r"Announced itself: (.+)", r"S'est annoncé : \1", r"Se anunció: \1"),
+    (r"Remote terminal \(SSH\) handshake: (.+)", r"Terminal à distance "
+     r"(SSH), début de connexion : \1", r"Terminal remoto (SSH), inicio de "
+     r"conexión: \1"),
+    (_DHCP_WORDS + r" as “(.+)” got (\S+) for (.+)", r"{t1} en tant que "
+     r"« \2 », a obtenu \3 pour \4", r"{t1} como «\2», obtuvo \3 durante "
+     r"\4"),
+    (_DHCP_WORDS + r" as “(.+)”", r"{t1} en tant que « \2 »",
+     r"{t1} como «\2»"),
+    (_DHCP_WORDS + r" got (\S+) for (.+)", r"{t1}, a obtenu \2 pour \3",
+     r"{t1}, obtuvo \2 durante \3"),
+    (_DHCP_WORDS + r" got (\S+)", r"{t1}, a obtenu \2", r"{t1}, obtuvo \2"),
+    # Beginner view's plain words (beginner_plain)
+    (r"(\S+) said which device it is", r"\1 a indiqué quel appareil il est",
+     r"\1 indicó qué dispositivo es"),
+    (r"asked the network which device has (\S+)", r"a demandé au réseau "
+     r"quel appareil a \1", r"preguntó a la red qué dispositivo tiene \1"),
+    (r"(\S+) announced itself on the network", r"\1 s'est annoncé sur le "
+     r"réseau", r"\1 se anunció en la red"),
     # 5.3.4 (IP-022): spikes in plain words; most specific first
     (r"At (\d\d:\d\d) an unknown program on this computer sent (.+) in one "
      r"minute", r"À \1, un programme inconnu de cet ordinateur a envoyé \2 "
@@ -28692,11 +29092,14 @@ EVENT_PATTERNS = [
     (r"(\d+) different DNS servers are in use", r"\1 serveurs DNS "
      r"différents sont utilisés", r"Se usan \1 servidores DNS distintos"),
     # the "+" before the number stays outside (it is not a letter)
-    (r"(\d+) more thing\(s\) just happened — switch to “Full speed” to "
-     r"see every line", r"\1 autre(s) événement(s) à l'instant — passez "
-     r"en « Pleine vitesse » pour voir chaque ligne",
-     r"\1 cosa(s) más acaba(n) de pasar: cambie a «Velocidad máxima» "
-     r"para ver cada línea"),
+    (r"1 more thing just happened — switch to “Full speed” to see every "
+     r"line", r"1 autre événement à l'instant — passez en « Pleine "
+     r"vitesse » pour voir chaque ligne", r"1 cosa más acaba de pasar: "
+     r"cambie a «Velocidad máxima» para ver cada línea"),
+    (r"([\d,]+) more things just happened — switch to “Full speed” to see "
+     r"every line", r"\1 autres événements à l'instant — passez en « Pleine "
+     r"vitesse » pour voir chaque ligne", r"\1 cosas más acaban de pasar: "
+     r"cambie a «Velocidad máxima» para ver cada línea"),
     (r"Secure connection to (.+)", r"Connexion sécurisée à \1",
      r"Conexión segura con \1"),
     (r"Local name lookup: (.+)", r"Recherche de nom locale : \1",
@@ -28705,8 +29108,8 @@ EVENT_PATTERNS = [
      r"Petición web no segura: \1"),
     (r"Who has (\S+)\? Tell (\S+)", r"Qui a \1 ? Répondre à \2",
      r"¿Quién tiene \1? Avisar a \2"),
-    (r"connecting to (.+) \((.+)\)", r"connexion à \1 (\2)",
-     r"conectando con \1 (\2)"),
+    (r"connecting to (.+) \((.+)\)", r"connexion à \1 ({t2})",
+     r"conectando con \1 ({t2})"),
     # "<device> ...": the most specific endings first
     (r"(.+) is unusually active right now", r"\1 est anormalement actif en "
      r"ce moment", r"\1 está inusualmente activo ahora mismo"),
@@ -28999,6 +29402,43 @@ def translate_event(text):
     return out
 
 
+# 5.3.4 (student feedback): Beginner view says what happened instead of
+# naming the protocol (ARP, QUIC, MAC). English in, English out; the
+# result goes through translate_event like any feed line.
+BEGINNER_PLAIN = [
+    (r"(\S+) is at (?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}(?: \(IPv6\))?",
+     r"\1 said which device it is"),
+    (r"Who has (\S+)\? Tell \S+", r"asked the network which device has \1"),
+    (r"Who has (\S+)\? \(IPv6\)", r"asked the network which device has \1"),
+    (r"(\S+) announced itself \(gratuitous ARP\)",
+     r"\1 announced itself on the network"),
+    (r"opened a fast secure connection \(QUIC\)",
+     r"opened a fast secure connection"),
+]
+_BEGINNER_RX = []
+BEGINNER_HEADINGS = {"MAC address": "Hardware address"}
+
+
+def beginner_plain(text):
+    """A feed sentence in plain words for Beginner view (unchanged when no
+    rule fits). The emoji in front stays."""
+    if not isinstance(text, str) or not text:
+        return text
+    if not _BEGINNER_RX:
+        _BEGINNER_RX.extend((re.compile(r"\A(\W*)" + p + r"\Z"), r"\g<1>" +
+                             re.sub(r"\\(\d)", lambda m: r"\g<%d>" % (
+                                 int(m.group(1)) + 1), out))
+                            for p, out in BEGINNER_PLAIN)
+    for rx, out in _BEGINNER_RX:
+        if rx.match(text):
+            return rx.sub(out, text, count=1)
+    return text
+
+
+def beginner_heading(text, beginner):
+    return BEGINNER_HEADINGS.get(text, text) if beginner else text
+
+
 def untranslate_text(s):
     """Shown text -> its English source (unchanged when not a translation)."""
     if not isinstance(s, str):
@@ -29211,13 +29651,39 @@ class DisplayVar(tk.StringVar):
             out = translate_lines(value)
         return out
 
+    # every live one (a Tk variable is unhashable, so keyed by id)
+    _ALL = weakref.WeakValueDictionary()
+
     def __init__(self, master=None, value=None, name=None):
+        self._src = value
         super().__init__(master, self.shown(value), name)
+        DisplayVar._ALL[id(self)] = self
+
+    @classmethod
+    def retranslate_all(cls):
+        """5.3.4 (ST-08): after a language switch, show every live text
+        again from its English source (the status bar kept the language
+        it was set in)."""
+        n = 0
+        for v in list(cls._ALL.values()):
+            src = getattr(v, "_src", None)
+            if not isinstance(src, str):
+                continue
+            with contextlib.suppress(tk.TclError, RuntimeError):
+                tk.StringVar.set(v, v.shown(src))
+                n += 1
+        return n
 
     def set(self, value):
         # 5.1.2: setting the same text again made Tk lay out and redraw
         # its label anyway; the Dashboard alone does this ~15 times every
         # 2 s, so an unchanged text is not written again
+        if isinstance(value, str):
+            # a text read back from the label and set again is a shown
+            # text: keep its English source
+            self._src = untranslate_text(value)
+        else:
+            self._src = value
         shown = self.shown(value)
         try:
             if isinstance(shown, str) and super().get() == shown and \
@@ -30098,12 +30564,15 @@ def _overlap_area(a, b):
     return max(0, x2 - x) * max(0, y2 - y)
 
 
-def layout_audit(top):
+def layout_audit(top, cells=False):
     """What a person would see as broken: text cut off by its own box or
     by its parent, widgets drawn over each other, chart texts on top of
     each other, table headings cut. → [(kind, widget path, detail)].
     Used by the GUI test (any language, text size and window size) and
-    by Diagnostics."""
+    by Diagnostics. cells=True (5.3.4, ST-11: --gui-shots said "0 layout
+    problems" over pictures with cut table cells) also lists table cells
+    wider than their column ("cell-cut") and columns that run past the
+    table's right edge ("column-cut")."""
     out = []
     stack = [top]
     while stack:
@@ -30192,9 +30661,59 @@ def layout_audit(top):
                     if txt and hf.measure(txt) + 10 > int(w.column(c,
                                                                    "width")):
                         out.append(("heading-cut", str(w), txt))
+                if cells:
+                    out += _audit_tree_cells(w, cols)
         except (tk.TclError, ValueError, TypeError):
             continue
     return out
+
+
+def _audit_tree_cells(tree, cols, rows=40):
+    """ST-11: cells of the first visible rows that are wider than their
+    column, and columns that start inside the table but end past it."""
+    out = []
+    try:
+        spec = ttk.Style().lookup("Treeview", "font") or "TkDefaultFont"
+        font = tkfont.nametofont(spec) if spec == "TkDefaultFont" else \
+            tkfont.Font(font=spec)
+    except (tk.TclError, RuntimeError):
+        font = tkfont.nametofont("TkDefaultFont")
+    visible = tree.winfo_width()
+    x = 0
+    for c in cols:
+        width = int(tree.column(c, "width"))
+        if x < visible < x + width - 4:
+            out.append(("column-cut", str(tree),
+                        str(tree.heading(c, "text")) or c))
+        x += width
+    names = list(tree["columns"])
+    seen = set()
+    for iid in tree.get_children()[:rows]:
+        vals = tree.item(iid, "values")
+        for c in cols:
+            if c == "#0" or c in seen or c not in names:
+                continue
+            i = names.index(c)
+            txt = str(vals[i]) if i < len(vals) else ""
+            if txt and font.measure(txt) + 12 > int(tree.column(c, "width")):
+                seen.add(c)
+                out.append(("cell-cut", str(tree),
+                            f"{tree.heading(c, 'text') or c}: {txt[:40]}"))
+    return out
+
+
+def park_pointer(root):
+    """ST-11: move the pointer off the window and close any tooltip before
+    a picture (a tooltip half-drawn under the pointer came out as a black
+    box in the French and Spanish pictures)."""
+    with contextlib.suppress(tk.TclError, AttributeError):
+        if Tooltip._active is not None:
+            Tooltip._active._hide()
+    with contextlib.suppress(tk.TclError):
+        x = root.winfo_screenwidth() - root.winfo_rootx() - 2
+        y = root.winfo_screenheight() - root.winfo_rooty() - 2
+        root.event_generate("<Motion>", warp=True, x=x, y=y)
+        root.update()
 
 
 def auto_flow(root):
@@ -34407,7 +34926,7 @@ class BaseTab:
 
     def lbl(self, parent, text, muted=False, **kw):
         w = tk.Label(parent, text=text, bg=WHITE,
-                     fg="#888888" if muted else "#333333", **kw)
+                     fg="#666666" if muted else "#333333", **kw)
         return w
 
     def build(self):
@@ -35048,7 +35567,7 @@ class DashboardTab(BaseTab):
                             highlightthickness=1, cursor="hand2",
                             takefocus=1)
             card.grid(row=0, column=i, sticky="nsew", padx=4)
-            tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#888888",
+            tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#666666",
                           font=mw_font(8, "bold"), anchor="w")
             tl.pack(anchor="w")
             v = DisplayVar(value="—")
@@ -35074,7 +35593,7 @@ class DashboardTab(BaseTab):
                       pady=4)
             card.configure(highlightcolor="#2b7de9")
             self.card_frames.append(card)
-            tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#888888",
+            tl = tk.Label(card, text=title, bg="#f6f7fa", fg="#666666",
                           font=mw_font(8, "bold"), anchor="w",
                           justify="left", wraplength=170)
             tl.pack(anchor="w")
@@ -35487,11 +36006,11 @@ class FeedTab(BaseTab):
         tk.Label(ctrl, text="   “Calm” groups busy moments so they're "
                             "easy to read — “Full speed” shows "
                             "every line as it happens.",
-                 bg=WHITE, fg="#888888", font=mw_font(9)).pack(
+                 bg=WHITE, fg="#666666", font=mw_font(9)).pack(
             side="left", padx=(12, 0))
         self.hint_var = DisplayVar(value="")
         self.hint = tk.Label(self.frame, textvariable=self.hint_var,
-                             bg=WHITE, fg="#888888", anchor="w",
+                             bg=WHITE, fg="#666666", anchor="w",
                              justify="left", wraplength=900, padx=12)
         # one line that is always there (a line appearing under the
         # pointer would move the list it is pointing at)
@@ -35526,7 +36045,17 @@ class FeedTab(BaseTab):
 
     def _match(self, row):
         q = self.q_var.get().strip().lower()
-        return not q or q in f"{row[1]} {row[2]}".lower()
+        return not q or q in f"{row[1]} {row[2]}".lower() or \
+            q in self.shown(row[2]).lower()
+
+    def shown(self, did):
+        """A feed line as shown: plain words in Beginner view (5.3.4,
+        student feedback: no "ARP", "QUIC" or "MAC" there) and in the
+        current language. The row keeps its English source, so a language
+        or view switch re-shows every line (ST-08)."""
+        if getattr(self.app, "beginner_mode", False):
+            did = beginner_plain(did)
+        return translate_event(did)
 
     def refilter(self):
         with contextlib.suppress(tk.TclError):
@@ -35534,8 +36063,13 @@ class FeedTab(BaseTab):
             for tag, who, did, when in reversed(
                     [r for r in self.rows if self._match(r)]):
                 self.tree.insert("", "end", tags=(tag,),
-                                 values=(who, translate_event(did), when))
+                                 values=(who, self.shown(did), when))
         self.refresh()
+
+    def on_locale(self):
+        self.refilter()
+
+    apply_mode = on_locale
 
     def jump_to_now(self):
         self.paused = False
@@ -35632,8 +36166,7 @@ class FeedTab(BaseTab):
                 tag, who, did, when = row
                 with contextlib.suppress(tk.TclError):
                     self.tree.insert("", 0, tags=(tag,),
-                                     values=(who, translate_event(did),
-                                             when))
+                                     values=(who, self.shown(did), when))
             if anchor:
                 with contextlib.suppress(tk.TclError):
                     n = len(self.tree.get_children())
@@ -35665,8 +36198,8 @@ class FeedTab(BaseTab):
         if leftover:
             extra = sum(counts[k] for k in leftover)
             rows.append(("other", "…",
-                         f"+{extra} more thing(s) just happened — switch "
-                         f"to “Full speed” to see every line",
+                         f"+{plural(extra, 'more thing')} just happened — "
+                         f"switch to “Full speed” to see every line",
                          buf[-1]["when"]))
         return rows
 
@@ -36415,6 +36948,10 @@ class DevicesTab(BaseTab):
 
     def apply_mode(self):
         self.kit.apply_columns()
+        # 5.3.4 (student feedback): plain words in Beginner view
+        with contextlib.suppress(tk.TclError):
+            self.tree.heading("mac", text=beginner_heading(
+                "MAC address", self.app.beginner_mode))
 
     def empty_state(self):
         q = self.filter_var.get().strip()
@@ -38177,7 +38714,7 @@ class MapTab(BaseTab):
                  font=mw_font(11, "bold")).pack(side="left")
         tk.Label(top, text="   Click a node to select it, double-click for "
                            "details, drag the background to move, scroll or "
-                           "use +/− to zoom.", bg=WHITE, fg="#888888",
+                           "use +/− to zoom.", bg=WHITE, fg="#666666",
                  font=mw_font(9), justify="left",
                  wraplength=900).pack(side="left")
         ctrl = self.toolbar()
@@ -38233,7 +38770,7 @@ class MapTab(BaseTab):
                  fg="#666666", anchor="w", font=mw_font(9)).pack(
             fill="x", padx=12)
         self.legend_lbl = tk.Label(
-            self.frame, bg=WHITE, fg="#888888", anchor="w", justify="left",
+            self.frame, bg=WHITE, fg="#666666", anchor="w", justify="left",
             wraplength=1100, font=mw_font(8), text=self.LEGEND)
         self.legend_lbl.pack(side="bottom", fill="x", padx=12, pady=(0, 4))
         self.c = tk.Canvas(self.frame, bg=WHITE, highlightthickness=0,
@@ -39815,17 +40352,26 @@ class SecurityTab(BaseTab):
         def dim(s): add("dim", "    " + s + "\n")
 
         h1("What is this?")
-        body("This page explains what I've seen on your network in plain "
-             "English. Nothing leaves your computer — everything here is "
-             "based on packets I've captured.")
+        # 5.3.4 (ST-09): no absolute claims. MiniWireshark itself does send
+        # a little (listed under “What MiniWireshark sent”), and in Demo
+        # Mode nothing was captured at all
+        body("This page explains, in plain English, what this computer "
+             "could see on your network. What you capture stays on this "
+             "computer; “What MiniWireshark sent” lists the little the "
+             "program sends itself.")
 
         h1("Your gateway / router")
         if m.gateway_ip:
-            good(f"Your router is at {m.gateway_ip}. All your internet "
-                 f"traffic goes through it.")
-            body("If you didn't recognize this number, someone may have "
-                 "changed your Wi-Fi router. Your router's admin page is "
-                 "usually at http://" + m.gateway_ip)
+            vpn = bool(m.vpn.get("iface") or m.vpn.get("endpoint"))
+            good(f"Your router is at {m.gateway_ip}. Your traffic to the "
+                 f"Internet normally goes through it" + (
+                     " (a VPN is in use, so some of it goes through the VPN "
+                     "first)." if vpn else "."))
+            # the line saying the router may have been swapped is gone: an
+            # unfamiliar number is not evidence of anything, and the real
+            # check (the router's hardware changing) is the next section
+            body("It is the box that connects your home to the Internet. "
+                 "Its settings page is usually at http://" + m.gateway_ip)
         else:
             warn("I couldn't detect your router yet. Start watching and "
                  "then open a website — I'll figure it out.")
@@ -39958,9 +40504,9 @@ class SecurityTab(BaseTab):
         h1("Other unencrypted protocols")
         others = {k: v for k, v in m.cleartext_seen.items() if k != "HTTP"}
         if others:
-            warn("Seen: " + ", ".join(f"{k} ({v} "
-                                      f"{translate_text('packets')})"
-                                      for k, v in sorted(others.items())))
+            warn("Seen: " + ", ".join(
+                f"{k} ({translate_text(plural(v, 'packet'))})"
+                for k, v in sorted(others.items())))
             body("Telnet, FTP, plain POP3/IMAP and similar protocols send "
                  "everything \u2014 sometimes including passwords \u2014 "
                  "without encryption. Prefer their secure versions.")
@@ -40128,6 +40674,201 @@ SPECIAL_DESC = {
     "expert.message": "Expert finding text",
     "frame.time_relative": "Seconds since the first packet",
     "tcp.stream": "Connection number"}
+
+
+# ---- 5.3.4 (IP-023): a typed field filter in plain words, under the box
+# ("tcp.port == 443 and ip.addr == 10.0.0.5" -> "TCP traffic on port 443
+# to or from 10.0.0.5"). Small on purpose: a filter it can't put in words
+# gets no line, never a wrong one. Every piece is a catalog phrase.
+FILTER_NOUNS = {
+    "tcp": "TCP traffic", "udp": "UDP traffic",
+    "dns": "Website lookups (DNS)", "mdns": "Local name lookups (mDNS)",
+    "arp": "Devices finding each other (ARP)",
+    "icmp": "Pings and network errors (ICMP)",
+    "icmpv6": "Pings and network errors (ICMPv6)",
+    "tls": "Secure connections (TLS)",
+    "quic": "Fast secure connections (QUIC)",
+    "http": "Unencrypted web traffic (HTTP)",
+    "dhcp": "Address requests (DHCP)", "ntp": "Time checks (NTP)",
+    "ip": "IPv4 traffic", "ipv6": "IPv6 traffic", "eth": "All traffic",
+    "vlan": "VLAN-tagged traffic"}
+# field -> (noun or "", phrase with %s for the value)
+FILTER_FIELD_WORDS = {
+    "tcp.port": ("TCP traffic", "on port %s"),
+    "udp.port": ("UDP traffic", "on port %s"),
+    "tcp.srcport": ("TCP traffic", "from port %s"),
+    "tcp.dstport": ("TCP traffic", "to port %s"),
+    "udp.srcport": ("UDP traffic", "from port %s"),
+    "udp.dstport": ("UDP traffic", "to port %s"),
+    "ip.addr": ("", "to or from %s"), "ipv6.addr": ("", "to or from %s"),
+    "ip.src": ("", "from %s"), "ipv6.src": ("", "from %s"),
+    "ip.dst": ("", "to %s"), "ipv6.dst": ("", "to %s"),
+    "eth.addr": ("", "to or from the device %s"),
+    "dns.qry.name": ("Website lookups (DNS)", "for %s"),
+}
+FILTER_LEN_WORDS = {">": "longer than %s bytes", "<": "shorter than %s bytes",
+                    ">=": "of at least %s bytes", "<=": "of at most %s bytes",
+                    "==": "of exactly %s bytes"}
+FILTER_OP_WORDS = {"==": "is", "!=": "is not", ">": "is more than",
+                   "<": "is less than", ">=": "is at least",
+                   "<=": "is at most", "contains": "contains"}
+
+
+def explain_filter(text):
+    """A field expression -> one sentence in the current language, or ""
+    when it can't be said simply (or isn't a field expression)."""
+    if not FEATURES.get("filter_english", True) or not text or \
+            not text.strip() or len(text) > 300:
+        return ""
+    try:
+        if not FieldFilter.looks_like(text):
+            return ""
+        toks = []
+        for m in _FTOK.finditer(text.strip()):
+            if m.group(1):
+                toks.append(("op", m.group(1)))
+            elif m.group(2) is not None:
+                toks.append(("str", m.group(2)))
+            elif m.group(3):
+                toks.append(("word", m.group(3)))
+        out, i = _fx_or(toks, 0)
+        if i != len(toks) or not out:
+            return ""
+    except (ValueError, IndexError, KeyError, TypeError):
+        return ""
+    phrase = _fx_say(out)
+    return phrase[:1].upper() + phrase[1:] if phrase else ""
+
+
+def _fx_lc(p):
+    return p[0].lower() + p[1:] if len(p) > 1 and p[1].islower() else p
+
+
+def _fx_say(node):
+    """(noun, [qualifiers], grouped) -> words."""
+    noun, quals = node[0], node[1]
+    tr = translate_text
+    noun = noun or tr("Traffic")
+    return " ".join([noun] + quals)
+
+
+def _fx_or(toks, i):
+    node, i = _fx_and(toks, i)
+    parts = [node]
+    while i < len(toks) and toks[i][1] in ("or", "||"):
+        nxt, i = _fx_and(toks, i + 1)
+        if not nxt:
+            return None, i
+        parts.append(nxt)
+    if not node:
+        return None, i
+    if len(parts) == 1:
+        return node, i
+    either = translate_text("%s or %s")
+    if len({p_[0] for p_ in parts}) == 1 and all(len(p_[1]) == 1
+                                                 for p_ in parts):
+        # "TCP traffic on port 80 or on port 443"
+        q = parts[0][1][0]
+        for p_ in parts[1:]:
+            q = either % (q, p_[1][0])
+        return (parts[0][0], [q], True), i
+    said = _fx_say(parts[0])
+    for p_ in parts[1:]:
+        said = either % (said, _fx_lc(_fx_say(p_)))
+    return (said, [], True), i
+
+
+def _fx_and(toks, i):
+    node, i = _fx_not(toks, i)
+    nodes = [node]
+    while i < len(toks) and toks[i][1] in ("and", "&&"):
+        nxt, i = _fx_not(toks, i + 1)
+        nodes.append(nxt)
+    if not all(nodes):
+        return None, i
+    if len(nodes) == 1:
+        return node, i
+    nouns, quals = [], []
+    for n, q, grouped in nodes:
+        if grouped and not q:          # "(a or b) and c": keep it apart
+            n = f"({n})"
+        if grouped and len(q) == 1:
+            q = [f"({q[0]})"]
+        if n and n not in nouns:
+            nouns.append(n)
+        quals += q
+    noun = nouns[0] if nouns else ""
+    for n in nouns[1:]:
+        noun = translate_text("%s and %s") % (noun, _fx_lc(n))
+    return (noun, quals, False), i
+
+
+def _fx_not(toks, i):
+    if i < len(toks) and toks[i][1] in ("not", "!"):
+        node, i = _fx_not(toks, i + 1)
+        if not node:
+            return None, i
+        return (translate_text("Everything except %s") %
+                _fx_lc(_fx_say(node)), [], False), i
+    return _fx_atom(toks, i)
+
+
+def _fx_atom(toks, i):
+    tr = translate_text
+    kind, val = toks[i]
+    if val == "(" and kind == "op":
+        node, i = _fx_or(toks, i + 1)
+        if i >= len(toks) or toks[i][1] != ")":
+            return None, i
+        return node, i + 1
+    if kind != "word":
+        return None, i
+    word = val.lower()
+    i += 1
+    op = toks[i][1] if i < len(toks) and (toks[i][0] == "op" and toks[i][1]
+                                          in FILTER_OP_WORDS or
+                                          toks[i][1] == "contains") else None
+    if op is None:
+        if word in FILTER_NOUNS:
+            return (tr(FILTER_NOUNS[word]), [], False), i
+        if word in FILTER_PORT_PROTOS:
+            return (tr("%s traffic") % word.upper(), [], False), i
+        desc = _fx_desc(word)
+        if desc:
+            return ("", [tr("that have %s") % _fx_lc(tr(desc))], False), i
+        return None, i
+    if i + 1 >= len(toks) or toks[i + 1][0] == "op":
+        return None, i
+    value = toks[i + 1][1]
+    i += 2
+    if word == "frame.len" and op in FILTER_LEN_WORDS:
+        return ("", [tr(FILTER_LEN_WORDS[op]) % value], False), i
+    if word in FILTER_FIELD_WORDS and op in ("==", "!=", "contains"):
+        noun, pat = FILTER_FIELD_WORDS[word]
+        if op == "contains":
+            if word != "dns.qry.name":
+                return None, i
+            pat = "for names containing %s"
+        q = tr(pat) % value
+        if op == "!=":
+            q = tr("not %s") % q
+        return (tr(noun) if noun else "", [q], False), i
+    desc = _fx_desc(word)
+    if not desc:
+        return None, i
+    return ("", [tr("where %s %s %s") % (_fx_lc(tr(desc)),
+                                         tr(FILTER_OP_WORDS[op]), value)],
+            False), i
+
+
+def _fx_desc(word):
+    """A field's description when it reads as plain words (no "(…)" lists
+    or "label:" forms), else ""."""
+    desc = SPECIAL_DESC.get(word) or (FIELD_REGISTRY.get(word) or
+                                      (None, None, ""))[2]
+    if not desc or len(desc) > 40 or re.search(r"[(:;]", desc):
+        return ""
+    return desc
 
 
 def conversation_filter(src, dst, sport=None, dport=None, transport=None,
@@ -40974,6 +41715,11 @@ class PacketsTab(BaseTab):
                                 bg=WHITE, fg="#a01a08", anchor="w",
                                 justify="left", wraplength=1000)
         self.err_var.trace_add("write", lambda *a: self._show_err())
+        # 5.3.4 (IP-023): what a typed field filter means, in plain words
+        self.means_var = tk.StringVar()
+        self.means_lbl = tk.Label(self.frame, textvariable=self.means_var,
+                                  bg=WHITE, fg="#666666", anchor="w",
+                                  justify="left", wraplength=1000)
         stat = tk.Frame(self.frame, bg=WHITE, padx=10)
         stat.pack(fill="x")
         self.stat_row = stat
@@ -41002,7 +41748,7 @@ class PacketsTab(BaseTab):
         tk.Label(stat, textvariable=self.ind_var, bg=WHITE, fg="#0b5394",
                  anchor="w").pack(side="left", padx=(16, 0))
         self.count_var = DisplayVar()
-        tk.Label(stat, textvariable=self.count_var, bg=WHITE, fg="#888888"
+        tk.Label(stat, textvariable=self.count_var, bg=WHITE, fg="#666666"
                  ).pack(side="right")
         vert = ttk.PanedWindow(self.frame, orient="vertical")
         vert.pack(fill="both", expand=True, padx=10, pady=(4, 8))
@@ -41289,6 +42035,15 @@ class PacketsTab(BaseTab):
             self.expr_entry.configure(style="TEntry" if ok or not text
                                       else "Bad.TEntry")
         self.err_var.set("" if ok else f"⚠ {msg}")
+        means = explain_filter(text) if ok else ""
+        self.means_var.set(("= " + means) if means else "")
+        try:
+            if means and not self.means_lbl.winfo_manager():
+                self.means_lbl.pack(fill="x", padx=12, before=self.stat_row)
+            elif not means and self.means_lbl.winfo_manager():
+                self.means_lbl.pack_forget()
+        except (tk.TclError, AttributeError):
+            pass
         return ok
 
     def open_fields(self):
@@ -42508,7 +43263,7 @@ class _SubView:
 
     def label(self, parent, text, muted=False, **kw):
         return tk.Label(parent, text=text, bg=WHITE,
-                        fg="#888888" if muted else "#333333", **kw)
+                        fg="#666666" if muted else "#333333", **kw)
 
     def jump(self, no):
         if no:
@@ -43688,10 +44443,13 @@ HELP_NEVER = (
     "always tells you whether it is on.")
 
 HELP_TAB_TEXT = (
+    # 5.3.4 (ST-13): the default Dashboard has three questions, not the
+    # "two big cards" of 5.1.1
     ("Dashboard tab", "dash", "card_grid",
-     "The cards show what's happening right now. The two big cards say "
-     "what this computer can see from where it is, and what changed in "
-     "the last hour. Click any card to open the tab behind it."),
+     "Three questions open the page: Is anything wrong? Who is using the "
+     "Internet? What is new? The “From here” line under them says what "
+     "this computer can and can't see. The cards below show what's "
+     "happening right now; click any card to open the tab behind it."),
     ("Live feed tab", "feed", "tree",
      "Everything as it happens, newest first, in plain words. Moving the "
      "pointer over the list pauses it so a line doesn't run away while "
@@ -44094,7 +44852,7 @@ class HelpTab(BaseTab):
                 self.rows.append(tp)
             if not hits:
                 self.lb.insert("end", translate_text("No topic matches."))
-                self.lb.itemconfigure(0, foreground="#888888")
+                self.lb.itemconfigure(0, foreground="#666666")
                 self.rows.append(None)
             return
         group = None
@@ -44102,7 +44860,7 @@ class HelpTab(BaseTab):
             if tp["group"] != group:
                 group = tp["group"]
                 self.lb.insert("end", translate_text(group).upper())
-                self.lb.itemconfigure("end", foreground="#888888")
+                self.lb.itemconfigure("end", foreground="#666666")
                 self.rows.append(None)
             self.lb.insert("end", "  " + translate_text(tp["title"]))
             self.rows.append(tp)
@@ -44348,9 +45106,10 @@ REPAIR_STEPS = (
 )
 
 QUICK_START = (
-    ("The Dashboard", "Start here. The cards show what's happening right "
-     "now; the two big cards say what this computer can see from where it "
-     "is, and what changed in the last hour. Click any card to dig in.",
+    ("The Dashboard", "Start here. Three questions sit at the top: Is "
+     "anything wrong? Who is using the Internet? What is new? Each answer "
+     "has a “Show me” link. The cards below show what's happening right "
+     "now; click any card to dig in.",
      "dash", "This is the Dashboard — click any card for details."),
     ("Devices and the Inspector", "Every device on your network, with how "
      "sure MiniWireshark is. Select one and press F2: the Inspector shows "
@@ -44462,7 +45221,7 @@ class FilterBuilder:
                                                       self.write()))
         ve.bind("<<ComboboxSelected>>", lambda e: self.write())
         ve.bind("<KeyRelease>", lambda e: self.write())
-        x = tk.Label(f, text="✕", bg=WHITE, fg="#888888", cursor="hand2")
+        x = tk.Label(f, text="✕", bg=WHITE, fg="#666666", cursor="hand2")
         x.pack(side="left", padx=6)
         rec = {"frame": f, "join": jv, "field": fv, "op": ov, "value": vv}
         x.bind("<Button-1>", lambda e, r=rec: self.remove(r))
@@ -46409,8 +47168,11 @@ class MiniWireshark:
                     "checks). It only listens.")
             colors = ("mode_quiet_bg", "mode_quiet_fg")
         elif data:
-            text = data + (f"   [{self.data_label}]" if self.data_label
-                           else "") + "  ·  Nothing is being sent."
+            # 5.3.4 (ST-08): each piece in the current language (the
+            # joined sentence was never in the catalog, so it stayed
+            # English with "[simulated]" in French and Spanish)
+            text = translate_text(data) + self._data_label_tag() + \
+                "  ·  " + translate_text("Nothing is being sent.")
             colors = ("mode_quiet_bg", "mode_quiet_fg") if \
                 self.data_mode == "demo" else ("warn_bg", "warn_fg")
         elif wanted and live and prof is None:
@@ -46570,17 +47332,21 @@ class MiniWireshark:
         self._apply_runtime_settings()
         self._restyle_mode_banner()
 
+    def _data_label_tag(self):
+        lab = self.data_label
+        if not lab:
+            return ""
+        return f"   [{translate_text(lab) if lab == 'simulated' else lab}]"
+
     def _restyle_data_banner(self):
         t = self.theme
         text = DATA_MODE_TEXT.get(self.data_mode)
         if not text:
             self.data_banner.pack_forget()
             return
-        if self.data_label:
-            text += f"   [{self.data_label}]"
+        text = translate_text(text) + self._data_label_tag()
         if getattr(self, "_mode_merged", False):
-            text = translate_text(text) + "  ·  " + translate_text(
-                "Nothing is being sent.")
+            text = text + "  ·  " + translate_text("Nothing is being sent.")
         bg, fg = ((t["mode_quiet_bg"], t["mode_quiet_fg"])
                   if self.data_mode == "demo" else
                   (t["warn_bg"], t["warn_fg"]))
@@ -47637,7 +48403,7 @@ class MiniWireshark:
         c = m.alerts.counts()
         sig = (id(m), self.data_mode, c["DANGER"], c["WARNING"],
                len(m.health_history), self.active_mode(),
-               bool(m.metrics.first_ts))
+               bool(m.metrics.first_ts), CURRENT_LOCALE)      # ST-08
         cache = getattr(self, "_answers", None)
         now = time.monotonic()
         if not force and cache is not None and cache["sig"] == sig and \
@@ -49452,7 +50218,7 @@ class MiniWireshark:
                     self.nb.add(tab.frame)
             except tk.TclError:
                 pass
-        for name in ("devices", "packets"):
+        for name in ("devices", "packets", "feed"):
             tab = self.tabs.get(name)
             if tab is not None and hasattr(tab, "apply_mode"):
                 tab.apply_mode()
@@ -49477,6 +50243,13 @@ class MiniWireshark:
         if shown != CURRENT_LOCALE:
             self._locale_shown = CURRENT_LOCALE
             i18n_retranslate(self.root)
+            # 5.3.4 (ST-08): status lines, card values and feed rows
+            # keep their English source and are shown again
+            DisplayVar.retranslate_all()
+            with contextlib.suppress(AttributeError, KeyError, tk.TclError):
+                self.tabs["feed"].on_locale()
+            with contextlib.suppress(AttributeError, KeyError, tk.TclError):
+                self.tabs["packets"]._validate_expr()       # IP-023
             with contextlib.suppress(AttributeError, KeyError, tk.TclError):
                 sec_u = self.tabs["security"].unusual
                 if sec_u is not None:
@@ -49512,6 +50285,7 @@ class MiniWireshark:
         Tooltip.theme = self.theme
         self._retheme_widget_tree(self.root, pal)
         self._restyle_ttk(dark, self.high_contrast)
+        set_dark_title_bars(self.root, dark)          # IP-003
         with contextlib.suppress(tk.TclError):
             self.root.configure(background=self.theme["window_bg"])
         for tab in self.tabs.values():
@@ -49780,8 +50554,9 @@ proc ::mw_retheme {w map fgnew deffg} {
         style.configure("TScrollbar", background=bg, troughcolor=frame,
                         arrowcolor=fg, bordercolor=frame,
                         lightcolor=bg, darkcolor=bg)
+        # 5.3.4 (ST-10): white on #2b7de9 was 4.0:1, under WCAG AA
         accent = {"Dark HC": "#ffd400", "Light HC": "#0a246a"}.get(
-            pal, "#2f6fc0" if dark else "#2b7de9")
+            pal, "#2f6fc0" if dark else ACCENT_BUTTON_BG)
         style.configure("Accent.TButton", background=accent,
                         foreground="#000000" if (dark and hc) else "#ffffff")
         style.configure("Settings.TButton", padding=(10, 4))
@@ -58481,9 +59256,11 @@ def release_check(path=None):
 
 
 def _arg(argv, name, default=None):
+    """The value after a flag; never another flag (5.3.4, ST-03:
+    "--gui-shots --quick" made a folder called "--quick")."""
     if name in argv:
         i = argv.index(name)
-        if i + 1 < len(argv):
+        if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
             return argv[i + 1]
     return default
 
@@ -75947,7 +76724,7 @@ def bench_gui(argv):
     if "all" in argv:
         wanted = list(BENCH_SCENARIOS)
     wanted = wanted or ["S1"]
-    out_path = argv[argv.index("--out") + 1] if "--out" in argv else \
+    out_path = _arg(argv, "--out") or \
         os.path.join(PATHS.data, time.strftime("bench-gui-%Y%m%d-%H%M.json"))
     results = OrderedDict()
     work = tempfile.mkdtemp(prefix="mw_bench_")
@@ -76134,7 +76911,7 @@ def gui_shots(out_dir, quick=False):
     _gui_pump(root, 2.0)
     lines = [f"{k:18s} {v}" for k, v in platform_facts(root).items()]
     lines.append("")
-    shots, problems, tool = 0, 0, ""
+    shots, problems, tool, cut_cells = 0, 0, "", 0
     passes = [("en-light", "English", "Light", None),
               ("en-dark", "English", "Dark", None),
               ("fr-light", "Français", "Light", None)]
@@ -76162,10 +76939,16 @@ def gui_shots(out_dir, quick=False):
                 continue
             app._select_tab(name)
             _gui_pump(root, 0.8)
-            audit = layout_audit(root)
+            park_pointer(root)
+            _gui_pump(root, 0.2)
+            audit = layout_audit(root, cells=True)
             found = [x for x in audit
                      if x[0] in ("canvas-text-overlap", "overlap", "cut-x",
                                  "cut-y")]
+            # 5.3.4 (ST-11): cut table cells and columns are counted and
+            # listed (they were invisible to the audit before)
+            cut = [x for x in audit if x[0] in ("cell-cut", "column-cut")]
+            cut_cells += len(cut)
             # a heading within 10 pixels of its column's edge: listed to
             # look at in the picture, not counted (it is usually whole)
             tight = [x[2] for x in audit if x[0] == "heading-cut"]
@@ -76176,8 +76959,10 @@ def gui_shots(out_dir, quick=False):
             tool = tool or (how if ok else "")
             lines.append(f"  {name:12s} " + (
                 "picture saved" if ok else f"no picture ({how})") +
-                f"; {len(found)} layout problem(s)")
-            for kind, wpath, detail in found[:8]:
+                f"; {len(found)} layout problem(s)" +
+                (f", {len(cut)} cut table cell(s) or column(s)" if cut
+                 else ""))
+            for kind, wpath, detail in (found + cut)[:8]:
                 lines.append(f"      {kind}: {detail} ({wpath})")
             if tight:
                 lines.append("      tight headings (check the picture): " +
@@ -76188,7 +76973,8 @@ def gui_shots(out_dir, quick=False):
             app._apply_text_size(defer=False)
     lines.append("")
     lines.append(f"Pictures: {shots} ({tool or 'none'}); layout problems: "
-                 f"{problems}")
+                 f"{problems}; cut table cells or columns: {cut_cells} "
+                 "(listed above: look at them in the pictures)")
     atomic_write_text(os.path.join(out_dir, "audit.txt"),
                       "\n".join(lines) + "\n")
     print("\n".join(lines))
@@ -76281,7 +77067,10 @@ def release_gate(argv):
             runs = max(1, min(9, int(argv[argv.index("--runs") + 1])))
     sysname = {"win32": "windows", "darwin": "macos"}.get(
         sys.platform, "linux")
-    out_dir = argv[argv.index("--out") + 1] if "--out" in argv else \
+    if "--out" in argv and not _arg(argv, "--out"):
+        print("--out needs a folder: --release-gate --out DIR")   # ST-03
+        return 2
+    out_dir = _arg(argv, "--out") or \
         os.path.abspath(time.strftime(f"mw-gate-{sysname}-%Y%m%d-%H%M"))
     os.makedirs(out_dir, exist_ok=True)
     print(f"MiniWireshark {SCRIPT_VERSION} release gate -> {out_dir}")
@@ -76351,6 +77140,511 @@ def release_gate(argv):
     print(text)
     return 0 if all(r[1] for r in rows) and all(
         "[FAIL]" not in ln for ln in lines) else 1
+
+
+
+# ---- 5.3.4 M16: words and polish ---------------------------------------------
+def _m16_tk():
+    """A hidden Tk root for a self-test, or None (no display: skip)."""
+    try:
+        r = tk.Tk()
+        r.withdraw()
+        return r
+    except tk.TclError:
+        return None
+
+
+# visible literals that are rightly the same in a language
+I18N_SAME = {"MiniWireshark": ("fr", "es"), "Session ▾": ("fr",),
+             "DNS…": ("fr", "es")}
+
+
+@self_test()
+def t_s9_translation_integrity(ctx):
+    """5.3.4 (S9): every catalog line has English, French and Spanish, the
+    {placeholders} and the %-placeholders match in all three (in order),
+    and every pattern compiles and only uses groups it has."""
+    assert _i18n_load(install=False) == [], _i18n_load(install=False)
+    # the check catches each kind of mistake (without touching the tables)
+    probs = _i18n_load("Sent %d packets ¦ %d paquets envoyés ¦ Enviados "
+                       "paquetes\n"
+                       "Hello {name} ¦ Bonjour {nom} ¦ Hola {name}\n"
+                       "Two parts ¦ Deux parties\n"
+                       "%s of %d ¦ %d sur %s ¦ %s de %d", install=False)
+    assert any("%-placeholders differ in es" in p for p in probs), probs
+    assert any("placeholders differ in fr" in p and "%" not in p
+               for p in probs), probs
+    assert any("needs English ¦ French ¦ Spanish" in p for p in probs), probs
+    assert sum("line 4" in p for p in probs) == 1, probs   # order counts
+    assert "Hello {name}" not in I18N["fr"]      # tables left alone
+    for en, fr, es in I18N_PATTERNS:
+        rx = re.compile(en)
+        assert (fr is None) == (es is None), en
+        if fr is None:
+            continue
+        for tpl in (fr, es):
+            refs = [int(x) for x in re.findall(r"\\(\d)", tpl)] + \
+                [int(x) for x in re.findall(r"\{t(\d)\}", tpl)]
+            assert all(1 <= r <= rx.groups for r in refs), (en, tpl)
+            assert set(re.findall(r"\{\w*\}", tpl)) <= {
+                "{t%d}" % r for r in range(1, 10)}, (en, tpl)
+    for en, out in BEGINNER_PLAIN:
+        rx = re.compile(en)
+        assert all(1 <= int(x) <= rx.groups
+                   for x in re.findall(r"\\(\d)", out)), en
+
+
+@self_test(needs_source=True)
+def t_s9_visible_literals_translated(ctx):
+    """5.3.4 (S9, ST-08): every literal the program shows (passed to
+    tr / translate_text / translate_event, or a widget's text, label,
+    title or tooltip) has French and Spanish; only names and acronyms
+    that read the same are allowed (I18N_SAME)."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        src = f.read()
+    stop = next(i for i, ln in enumerate(src.splitlines(), 1)
+                if ln.startswith("#  20b."))
+    widgets = {"Label", "Button", "Checkbutton", "Radiobutton",
+               "LabelFrame", "Labelframe", "Menubutton"}
+
+    def lit(node):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            a, b = lit(node.left), lit(node.right)
+            if a is not None and b is not None:
+                return a + b
+        return None
+    miss, total = [], 0
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.Call) or node.lineno >= stop:
+            continue
+        f = node.func
+        name = f.id if isinstance(f, ast.Name) else (
+            f.attr if isinstance(f, ast.Attribute) else "")
+        cands = []
+        if name in ("tr", "translate_text", "translate_event") and \
+                len(node.args) == 1:
+            s = lit(node.args[0])
+            if s is not None and not (name == "tr" and s in STRINGS["en"]):
+                cands.append(s)
+        if name in widgets or name in ("configure", "config", "title",
+                                       "add_command", "add_cascade",
+                                       "add_checkbutton", "add_radiobutton",
+                                       "Tooltip"):
+            cands += [lit(k.value) for k in node.keywords
+                      if k.arg in ("text", "label")]
+            if name == "Tooltip" and len(node.args) > 1:
+                cands.append(lit(node.args[1]))
+            if name == "title" and node.args:
+                cands.append(lit(node.args[0]))
+        for s in cands:
+            if s is None or not re.search(r"[A-Za-z]{3}", s) or \
+                    re.search(r"\{\w*\}", s):
+                continue
+            total += 1
+            for loc in ("fr", "es"):
+                if translate_text(s, loc) == s and \
+                        loc not in I18N_SAME.get(s, ()):
+                    miss.append((node.lineno, loc, s))
+    assert total > 400, total
+    assert not miss, miss[:12]
+
+
+@self_test()
+def t_st08_feed_lines_translated(ctx):
+    """5.3.4 (ST-05, ST-08): every Live feed line the home scenario makes,
+    with either decoder, reads in French and Spanish (as written and in
+    Beginner's plain words), and a DNS line names the site once:
+    "looked up www.example.com", not "looked up  Looking up …"."""
+    if not ctx.scapy_ok:
+        return "skip"
+    gw, ips, macs, nets = scenario_identity()
+    lines = []
+    for dec in (None, "fast"):
+        m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        replay_frames(m, ctx.frames(), decoder=fast_frame_decoder(m)
+                      if dec else None)
+        lines += [e["did"] for e in m.ev_feed]
+    dns = [d for d in lines if d.startswith("🔍 looked up")]
+    assert dns, "the scenario must look names up"
+    assert not any("Looking up" in d or "  " in d for d in dns), dns[:3]
+    assert "🔍 looked up www.example.com" in dns, dns[:5]
+    old = CURRENT_LOCALE
+    bad = []
+    try:
+        for loc in ("fr", "es"):
+            set_locale(loc)
+            for d in set(lines) | {beginner_plain(x) for x in lines}:
+                if re.search(r" → \S+$", d):     # a name and an address
+                    continue
+                if translate_event(d) == d:
+                    bad.append((loc, d))
+    finally:
+        set_locale(old)
+    assert not bad, bad[:8]
+
+
+@self_test()
+def t_st08_displayvar_follows_language(ctx):
+    """5.3.4 (ST-08): a status line set in one language is shown in the
+    next one after a switch (it stayed in the language it was set in),
+    and comes back to English."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    old = CURRENT_LOCALE
+    try:
+        v = DisplayVar(root, value="Nothing is being sent.")
+        set_locale("fr")
+        assert v.get() == "Nothing is being sent."   # not re-shown yet
+        assert DisplayVar.retranslate_all() >= 1
+        assert v.get() == "Rien n'est envoyé.", v.get()
+        set_locale("es")
+        DisplayVar.retranslate_all()
+        assert v.get() == "No se envía nada.", v.get()
+        v.set(v.get())                 # read back and set again: same source
+        set_locale("en")
+        DisplayVar.retranslate_all()
+        assert v.get() == "Nothing is being sent.", v.get()
+    finally:
+        set_locale(old)
+        root.destroy()
+
+
+@self_test(needs_source=True)
+def t_st02_command_line(ctx):
+    """5.3.4 (ST-02, OS-06, ST-03): --help and --version answer and exit 0,
+    an unknown flag or a flag missing its value exits 2 with one line
+    (never the window, never a traceback), and tool flags still pass."""
+    rc, text = cli_check(["--help"])
+    assert rc == 0 and "--demo" in text and "--self-test" in text and \
+        "--version" in text, text
+    assert cli_check(["-h"])[0] == 0
+    assert cli_check(["--version"]) == (0, f"MiniWireshark {SCRIPT_VERSION}")
+    rc, text = cli_check(["--self-tset"])
+    assert rc == 2 and "--self-tset" in text and "--self-test" in text
+    assert cli_check(["foo"])[0] == 2
+    for argv in (["--gui-shots"], ["--gui-shots", "--quick"],
+                 ["--release-gate", "--out"], ["--sign-release", "x",
+                                               "--key"]):
+        rc, text = cli_check(argv)
+        assert rc == 2 and "needs a value" in text, (argv, text)
+    for argv in ([], ["--demo"], ["--safe", "--no-elevate"],
+                 ["--self-test", "--quick"], ["--gui-test", "--live"],
+                 ["--gui-shots", "out"], ["--bench-gui", "S1", "--runs",
+                                          "2"], ["--release-check"],
+                 ["--sign-release", "f.py", "--key", "k", "--version", "9"],
+                 ["--mw-worker"], ["--mw-data=/x", "--demo"],
+                 ["--miniwireshark-elevated"]):
+        assert cli_check(argv) is None, argv
+    # _arg never takes the next flag as a value (a folder "--quick")
+    assert _arg(["--gui-shots", "--quick"], "--gui-shots") is None
+    assert _arg(["--out", "d"], "--out") == "d"
+    assert release_gate(["--out"]) == 2
+    # and for real: no window, no traceback
+    env = dict(os.environ, MINIWIRESHARK_DATA=ctx.path("cli"))
+    env.pop("DISPLAY", None)
+    for args, want_rc, want in ((["--version"], 0, SCRIPT_VERSION),
+                                (["--self-tset"], 2, "unknown option")):
+        r = _run_hidden(self_cmd(*args), capture_output=True, timeout=120,
+                        env=env)
+        out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        assert r.returncode == want_rc and want in out and \
+            "Traceback" not in out, (args, r.returncode, out[-400:])
+
+
+@self_test()
+def t_os06_no_display_never_forces_safe_mode(ctx):
+    """5.3.4 (OS-06, ST-02): a start that ends because there is no screen
+    (or no Tk) is marked as such, gives one line, and two of them never
+    put the next start into Safe Mode; two real crashes still do."""
+    global BOOT
+    d = ctx.path("boot_nd")
+    old = BOOT
+    try:
+        for _ in range(2):
+            BOOT = BootReceipt(directory=d, argv=["--demo"])
+            buf = io.StringIO()
+            try:
+                no_display_exit(tk.TclError("no display name"), out=buf)
+                raise AssertionError("no_display_exit returned")
+            except SystemExit as e:
+                assert e.code == 1
+            assert "couldn't open its window" in buf.getvalue()
+            assert "Traceback" not in buf.getvalue()
+            time.sleep(1.05)            # receipts are named by the second
+        recs = BootReceipt.recent(d)
+        assert [r["outcome"] for r in recs] == ["no_display"] * 2, recs
+        cur = BootReceipt(directory=d)
+        assert not crash_loop_detected(BootReceipt.recent(d), cur.path)
+        crashed = [dict(r, outcome="crashed") if r["_path"] != cur.path
+                   else r for r in BootReceipt.recent(d)]
+        assert crash_loop_detected(crashed, cur.path)
+        assert not BootReceipt.failed({"kind": "start", "outcome": "no_tk"})
+    finally:
+        BOOT = old
+
+
+@self_test()
+def t_st09_security_words(ctx):
+    """5.3.4 (ST-09): counts say "1 packet", the Security page's router
+    line is hedged and translated, and the alarming and absolute lines
+    are gone from the program."""
+    assert plural(1, "packet") == "1 packet"
+    assert plural(2, "packet") == "2 packets"
+    assert plural(1234, "packet") == "1,234 packets"
+    assert plural(3, "more thing") == "3 more things"
+    for loc, want in (("fr", "1 paquet"), ("es", "1 paquete")):
+        assert translate_text(plural(1, "packet"), loc) == want
+    line = ("Your router is at 192.168.1.1. Your traffic to the Internet "
+            "normally goes through it.")
+    assert translate_text(line, "fr").startswith("Votre box")
+    assert translate_text(line[:-1] + " (a VPN is in use, so some of it "
+                          "goes through the VPN first).", "es") \
+        .startswith("Su router")
+    assert translate_text("It is the box that connects your home to the "
+                          "Internet. Its settings page is usually at "
+                          "http://192.168.1.1", "fr").startswith("C'est")
+    src = inspect.getsource(SecurityTab)
+    for gone in ("Nothing leaves your computer", "someone may have "
+                 "changed", "All your internet", "translate_text('packets')"):
+        assert gone not in src, gone
+
+
+@self_test()
+def t_st10_text_contrast_meets_aa(ctx):
+    """5.3.4 (ST-10): every text colour of every palette (light, dark,
+    high contrast, the colour-blind modes) is at least 4.5:1 on the
+    surfaces it is drawn on, the main button too, and the grey #888888
+    is no longer used for text."""
+    fgs = ("text_fg", "muted_fg", "info_fg", "warn_fg", "danger_fg",
+           "good_fg", "mode_active_fg", "mode_quiet_fg", "tooltip_fg",
+           "conf_high", "conf_med", "conf_low", "conf_none")
+    own = {"warn_fg": "warn_bg", "danger_fg": "danger_bg",
+           "mode_active_fg": "mode_active_bg",
+           "mode_quiet_fg": "mode_quiet_bg", "tooltip_fg": "tooltip_bg"}
+    low = []
+    for name, t in THEMES.items():
+        for f in fgs:
+            for b in ("window_bg", "tab_bg", "text_bg", "card_bg") + (
+                    (own[f],) if f in own else ()):
+                r = wcag_contrast(t[f], t[b])
+                if r < 4.5:
+                    low.append((name, f, t[f], b, t[b], round(r, 2)))
+    assert not low, low[:6]
+    for pal in PALETTES.values():          # grey text on the light cards
+        for fg in ("#666666", "#333333", "#0b5394", "#8a5a00", "#0b6b3a",
+                   "#a01a08", "#2b3a56"):
+            for bg in ("#ffffff", "#f4f5f7", "#f6f7fa", "#fbfbfb"):
+                r = wcag_contrast(pal.get(fg, fg), pal.get(bg, bg))
+                assert r >= 4.5, (fg, bg, pal.get(fg, fg), r)
+    assert wcag_contrast("#ffffff", ACCENT_BUTTON_BG) >= 4.5
+    assert wcag_contrast("#ffffff", ACCENT_BUTTON_ACTIVE) >= 4.5
+    src = inspect.getsource(DashboardTab) + inspect.getsource(FeedTab)
+    assert 'fg="#888888"' not in src
+
+
+@self_test()
+def t_st13_help_matches_dashboard(ctx):
+    """5.3.4 (ST-13): the help and the Quick Start describe the default
+    Dashboard (three questions), not the two big cards it no longer
+    shows, in all three languages."""
+    dash = next(b for t, k, _a, b in HELP_TAB_TEXT if k == "dash")
+    quick = next(b for t, b, k, _h in QUICK_START if k == "dash")
+    for text in (dash, quick):
+        assert "two big cards" not in text
+        for _k, q in DashboardTab.ANSWERS:
+            assert q in text, (q, text)
+        for loc in ("fr", "es"):
+            assert translate_text(text, loc) != text, (loc, text[:40])
+
+
+@self_test()
+def t_beginner_plain_words(ctx):
+    """5.3.4 (student feedback): Beginner view says what happened, not
+    the protocol: no ARP, QUIC or MAC in the feed or the Devices
+    heading, in any language."""
+    cases = {
+        "🔎 192.168.1.40 is at f4:f5:d8:40:00:40":
+            "🔎 192.168.1.40 said which device it is",
+        "🔎 Who has 192.168.1.1? Tell 192.168.1.23":
+            "🔎 asked the network which device has 192.168.1.1",
+        "🔎 192.168.1.9 announced itself (gratuitous ARP)":
+            "🔎 192.168.1.9 announced itself on the network",
+        "🔐 opened a fast secure connection (QUIC)":
+            "🔐 opened a fast secure connection",
+        "🔍 looked up www.example.com": "🔍 looked up www.example.com"}
+    for src, want in cases.items():
+        got = beginner_plain(src)
+        assert got == want, (src, got)
+        for loc in ("fr", "es"):
+            old = CURRENT_LOCALE
+            try:
+                set_locale(loc)
+                shown = translate_event(got)
+            finally:
+                set_locale(old)
+            assert shown != got, (loc, got)
+            assert not re.search(r"\b(ARP|QUIC|MAC)\b", shown), shown
+    assert beginner_heading("MAC address", True) == "Hardware address"
+    assert beginner_heading("MAC address", False) == "MAC address"
+    for loc in ("fr", "es"):
+        assert translate_text("Hardware address", loc) != "Hardware address"
+
+
+@self_test()
+def t_ip003_dark_title_bar(ctx):
+    """5.3.4 (IP-003): the dark title bar asks Windows with attribute 20
+    (19 before build 18985), only with the dark palette, is silent when
+    the call fails (Windows 7/8) or the switch is off, and reaches every
+    dialog opened later. Mocked here: the real look needs a check on
+    Windows 10 1809, 10 21H2 and 11."""
+    calls = []
+
+    class Dwm:
+        rc = 0
+
+        def DwmSetWindowAttribute(self, hwnd, attr, ref, size):
+            calls.append((hwnd, attr, size))
+            if self.rc == "raise":
+                raise OSError("no DWM")
+            return self.rc
+
+    class User32:
+        @staticmethod
+        def GetParent(h):
+            return 4242
+
+    class Win:
+        def update_idletasks(self):
+            pass
+
+        def winfo_id(self):
+            return 7
+
+    old_api, old_feat = TITLE_BAR["api"], FEATURES.get("dark_titlebar")
+    dwm = Dwm()
+    try:
+        TITLE_BAR["api"] = (dwm, User32(), 22631)          # Windows 11
+        w = Win()
+        assert dark_title_bar(w, True) and calls[-1][:2] == (4242, 20)
+        TITLE_BAR["api"] = (dwm, User32(), 17763)          # 10 1809
+        assert dark_title_bar(Win(), True) and calls[-1][1] == 19
+        n = len(calls)
+        assert not dark_title_bar(Win(), False) and len(calls) == n
+        assert dark_title_bar(w, False) and len(calls) == n + 1  # undo
+        dwm.rc = -2147024809                     # E_INVALIDARG (7, 8)
+        assert dark_title_bar(Win(), True) is False
+        dwm.rc = "raise"
+        assert dark_title_bar(Win(), True) is False
+        dwm.rc = 0
+        FEATURES["dark_titlebar"] = False
+        n = len(calls)
+        assert dark_title_bar(Win(), True) is False and len(calls) == n
+        FEATURES["dark_titlebar"] = True
+        TITLE_BAR["api"] = None
+        if not IS_WINDOWS:
+            assert dark_title_bar(Win(), True) is False
+        root = _m16_tk()
+        if root is None:
+            return None
+        try:
+            TITLE_BAR["api"] = (dwm, User32(), 22631)
+            calls.clear()
+            top = tk.Toplevel(root)
+            assert set_dark_title_bars(root, True) == 2, calls
+            later = tk.Toplevel(root)
+            later.update()
+            root.update()
+            assert getattr(later, "_mw_dark_tb", False), calls
+            set_dark_title_bars(root, False)
+            assert not top._mw_dark_tb and not later._mw_dark_tb
+        finally:
+            TITLE_BAR["dark"] = False
+            root.destroy()
+    finally:
+        TITLE_BAR["api"] = old_api
+        FEATURES["dark_titlebar"] = old_feat
+
+
+@self_test()
+def t_ip023_filter_in_plain_words(ctx):
+    """5.3.4 (IP-023): a typed field filter is said in plain words, in
+    French and Spanish too; one it can't say simply gets no line, and
+    the switch turns it off."""
+    cases = {
+        "tcp.port == 443 and ip.addr == 10.0.0.5":
+            "TCP traffic on port 443 to or from 10.0.0.5",
+        "dns": "Website lookups (DNS)",
+        "not arp": "Everything except devices finding each other (ARP)",
+        "frame.len > 1000": "Traffic longer than 1000 bytes",
+        "ip.src == 192.168.1.5 && tcp.dstport == 22":
+            "TCP traffic from 192.168.1.5 to port 22",
+        "(tcp.port == 80 or tcp.port == 443) and ip.dst == 1.2.3.4":
+            "TCP traffic (on port 80 or on port 443) to 1.2.3.4",
+        "tcp.port != 22": "TCP traffic not on port 22",
+        "smtp": "SMTP traffic",
+        "port:53": "", "foo.bar == 3": "", "tcp.port ==": "",
+        "expert.severity >= warning": "", "": ""}
+    for text, want in cases.items():
+        assert explain_filter(text) == want, (text, explain_filter(text))
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        assert explain_filter("tcp.port == 443 and ip.addr == 10.0.0.5") \
+            == "Trafic TCP sur le port 443 vers ou depuis 10.0.0.5"
+        set_locale("es")
+        assert explain_filter("udp.port == 53 or tcp.port == 53") \
+            .startswith("Tráfico UDP en el puerto 53 o")
+        for loc in ("fr", "es"):
+            set_locale(loc)
+            for phrase in list(FILTER_NOUNS.values()) + [
+                    p for _n, p in FILTER_FIELD_WORDS.values()] + list(
+                    FILTER_LEN_WORDS.values()) + list(
+                    FILTER_OP_WORDS.values()) + [
+                    "%s traffic", "not %s", "%s or %s", "%s and %s",
+                    "Everything except %s", "that have %s",
+                    "where %s %s %s", "for names containing %s", "Traffic"]:
+                assert translate_text(phrase) != phrase, (loc, phrase)
+    finally:
+        set_locale(old)
+    FEATURES["filter_english"] = False
+    try:
+        assert explain_filter("tcp.port == 443") == ""
+    finally:
+        FEATURES["filter_english"] = True
+
+
+@self_test()
+def t_st11_audit_sees_cut_cells(ctx):
+    """5.3.4 (ST-11): the picture audit lists a table cell wider than its
+    column and a column that runs past the table's edge; the GUI test's
+    own audit (cells=False) is unchanged; the pointer can be parked."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        root.deiconify()
+        root.geometry("300x200")
+        tree = ttk.Treeview(root, columns=("a", "b"), show="headings")
+        tree.heading("a", text="Made by")
+        tree.heading("b", text="Last seen")
+        tree.column("a", width=60, stretch=False)
+        tree.column("b", width=400, stretch=False)
+        tree.insert("", "end", values=("Brother Industries, Ltd.", "now"))
+        tree.pack(fill="both", expand=True)
+        root.update()
+        kinds = {k for k, _p, _d in layout_audit(root, cells=True)}
+        assert "cell-cut" in kinds and "column-cut" in kinds, kinds
+        assert not {k for k, _p, _d in layout_audit(root)} & {
+            "cell-cut", "column-cut"}
+        park_pointer(root)
+    finally:
+        root.destroy()
 
 
 # ============================================================================
@@ -77141,6 +78435,19 @@ def _gs_languages(app, ctx):
     tab = app.tabs["dash"]
     english = app.nb.tab(tab.frame, "text")
     mode = app.mode_ui_var.get()
+    # 5.3.4 (ST-08): the lines already on screen must change language
+    # too (the step used to set the status line again after switching,
+    # which hid that the old line stayed English)
+    app.status_var.set("Ready. Click “Start watching” when you'd like to "
+                       "begin.")
+    feed = app.tabs["feed"]
+    feed.rows.append(("dns", "This computer", "🔍 looked up www.example.com",
+                      "10:00:00"))
+    feed.refilter()
+
+    def feed_shown():
+        return [str(feed.tree.set(i, "did"))
+                for i in feed.tree.get_children()]
     try:
         app.config.set("general.language", "Français")
         app._apply_runtime_settings()
@@ -77162,15 +78469,20 @@ def _gs_languages(app, ctx):
                     if isinstance(w, ttk.Radiobutton) and
                     str(w.cget("variable")) == str(app.mode_ui_var)]
             assert translate_text(mode, "fr") in btns, btns
-        # a status line set later is shown in French too
-        app.status_var.set("Ready. Click “Start watching” when you'd like "
-                           "to begin.")
+        # the status line set before the switch is shown in French
         assert app.status_var.get().startswith("Prêt."), \
             app.status_var.get()
+        assert "🔍 a cherché www.example.com" in feed_shown(), feed_shown()
         app.config.set("general.language", "Español")
         app._apply_runtime_settings()
         _gui_pump(app.root, 0.3)
         assert "Panel" in app.nb.tab(tab.frame, "text")
+        assert app.status_var.get().startswith("Listo."), \
+            app.status_var.get()
+        assert "🔍 buscó www.example.com" in feed_shown(), feed_shown()
+        # the Dashboard answers are worked out again in the new language
+        app.dashboard_answers()
+        assert app._answers["sig"][-1] == "es", app._answers["sig"]
 
         def shown():
             if boxes:
@@ -77186,6 +78498,8 @@ def _gs_languages(app, ctx):
     assert app.nb.tab(tab.frame, "text") == english
     assert mode in shown() and app.mode_ui_var.get() == mode
     assert CURRENT_LOCALE == "en"
+    assert app.status_var.get().startswith("Ready."), app.status_var.get()
+    assert "🔍 looked up www.example.com" in feed_shown(), feed_shown()
 
 
 @gui_test_step("V5 startup: notice, startup history, managed-Python choice")
@@ -79552,9 +80866,9 @@ def gt_rc5_french(app, ctx):
             == "host-7 a obtenu l'adresse 10.0.0.9 par DHCP"
         assert translate_event("🔐 Secure connection to a.example.com") \
             == "🔐 Connexion sécurisée à a.example.com"
-        assert translate_event("+12 more thing(s) just happened — switch "
+        assert translate_event("+12 more things just happened — switch "
                                "to “Full speed” to see every line"
-                               ).startswith("+12 autre(s)")
+                               ).startswith("+12 autres")
         assert translate_event("no such sentence") == "no such sentence"
         app._select_tab("timeline")
         _gui_pump(root, 0.3)
@@ -80510,6 +81824,98 @@ def gt_534_checkup_report(app, ctx):
         FEATURES["checkup_report"] = old
 
 
+@gui_test_step("5.3.4 M16: words and polish — the Security page, Beginner "
+               "plain words, a typed filter in words, dark title bars")
+def gt_534_words_and_polish(app, ctx):
+    root = app.root
+    m = app.model
+    # ST-09: hedged sentences, "1 packet", no alarming router line
+    old_clear = Counter(m.cleartext_seen)
+    m.cleartext_seen["FTP"] = 1
+    try:
+        sec = app._select_tab("security")
+        _gui_pump(root, 0.3)
+        sec.refresh()
+        text = sec.text.get("1.0", "end")
+        assert "FTP (1 packet)" in text, text[-600:]
+        for gone in ("Nothing leaves your computer", "someone may have "
+                     "changed", "1 packets", "All your internet"):
+            assert gone not in text, gone
+    finally:
+        m.cleartext_seen.clear()
+        m.cleartext_seen.update(old_clear)
+    # student feedback: plain words in Beginner, the protocol in Advanced
+    feed, dev = app.tabs["feed"], app.tabs["devices"]
+    row = ("device", "Living Room TV", "🔎 192.168.1.40 is at "
+           "f4:f5:d8:40:00:40", "10:00:00")
+    feed.rows.append(row)
+    mode = app.mode_ui_var.get()
+
+    def shown():
+        return [str(feed.tree.set(i, "did"))
+                for i in feed.tree.get_children()]
+    try:
+        app.mode_ui_var.set("Beginner")
+        app._on_ui_mode_change()
+        _gui_pump(root, 0.2)
+        assert "🔎 192.168.1.40 said which device it is" in shown(), shown()
+        assert dev.tree.heading("mac", "text") == "Hardware address"
+        app.mode_ui_var.set("Advanced")
+        app._on_ui_mode_change()
+        _gui_pump(root, 0.2)
+        assert row[2] in shown(), shown()
+        assert dev.tree.heading("mac", "text") == "MAC address"
+        # IP-023: what a typed filter means, under the box
+        pt = app._select_tab("packets")
+        _gui_pump(root, 0.2)
+        pt.expr_var.set("tcp.port == 443 and ip.addr == 10.0.0.5")
+        pt._validate_expr()
+        _gui_pump(root, 0.1)
+        assert pt.means_var.get() == ("= TCP traffic on port 443 to or "
+                                      "from 10.0.0.5"), pt.means_var.get()
+        assert pt.means_lbl.winfo_manager()
+        pt.expr_var.set("tcp.port ==")
+        pt._validate_expr()
+        assert not pt.means_var.get() and not pt.means_lbl.winfo_manager()
+        pt.expr_var.set("")
+        pt._validate_expr()
+    finally:
+        with contextlib.suppress(ValueError):
+            feed.rows.remove(row)
+        feed.refilter()
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+    # IP-003: with the dark palette, the window and a dialog opened later
+    # ask for a dark title bar (Windows mocked; the look needs Windows)
+    calls = []
+
+    class Dwm:
+        @staticmethod
+        def DwmSetWindowAttribute(hwnd, attr, ref, size):
+            calls.append(attr)
+            return 0
+
+    class User32:
+        @staticmethod
+        def GetParent(h):
+            return h
+    theme, old_api = app.theme_name, TITLE_BAR["api"]
+    TITLE_BAR["api"] = (Dwm(), User32(), 22631)
+    try:
+        app._apply_theme("Dark")
+        _gui_pump(root, 0.2)
+        assert getattr(root, "_mw_dark_tb", False) and 20 in calls, calls
+        dlg = tk.Toplevel(root)
+        dlg.title("x")
+        _gui_pump(root, 0.3)
+        assert getattr(dlg, "_mw_dark_tb", False), calls
+        dlg.destroy()
+    finally:
+        app._apply_theme(theme)
+        TITLE_BAR["api"] = old_api
+    assert not getattr(root, "_mw_dark_tb", False)
+
+
 @gui_test_step("every action 5.0.2 could reach is still reachable")
 def gt_reachable(app, ctx):
     app.mode_ui_var.set("Advanced")
@@ -81076,7 +82482,10 @@ def main():
     set_locale(cfg.get("general.language", "English"))
     if not SAFE_MODE:
         enable_dpi_awareness()
-    root = tk.Tk()
+    try:
+        root = tk.Tk()
+    except tk.TclError as e:
+        no_display_exit(e)
     apply_ui_scale(root, "Automatic" if SAFE_MODE else
                    cfg.get("accessibility.ui_scale", "Automatic"))
     root.title("MiniWireshark")
@@ -81233,6 +82642,25 @@ def main():
     LOG.info("MiniWireshark closed")
 
 
+def no_display_exit(error, out=None):
+    """5.3.4 (ST-02, OS-06): no screen to open the window on (no $DISPLAY,
+    a remote shell). One plain line instead of two tracebacks, and the
+    start is marked "no_display" so it never counts toward Safe Mode."""
+    LOG.warning("no display: %s", error)
+    if BOOT is not None:
+        BOOT.mark(outcome="no_display")
+    with contextlib.suppress(Exception):
+        update_start_not_counted()
+    msg = (f"MiniWireshark couldn't open its window ({error}). If there "
+           "is no screen here (a remote terminal), start it from your "
+           "desktop, or use --self-test or --boot-check.")
+    out = out or sys.stderr
+    if out is not None:
+        with contextlib.suppress(Exception):
+            out.write(msg + "\n")
+    raise SystemExit(1)
+
+
 def _start_and_exit(root, app):
     """MW_START_AND_EXIT=1 (the start test): print how the start went once
     the window has shown and run for a second, then close it normally."""
@@ -81282,8 +82710,8 @@ def base_ttk_style():
     s.configure("TButton", padding=(10, 6))
     s.configure("Accent.TButton", padding=(14, 8),
                 font=("TkDefaultFont", 11, "bold"), foreground="#ffffff",
-                background="#2b7de9")
-    s.map("Accent.TButton", background=[("active", "#1f66c7"),
+                background=ACCENT_BUTTON_BG)
+    s.map("Accent.TButton", background=[("active", ACCENT_BUTTON_ACTIVE),
                                         ("disabled", "#9bb8e8")])
     return s
 
@@ -81583,8 +83011,11 @@ if __name__ == "__main__":
     if BENCH_GUI_MODE:
         sys.exit(bench_gui(sys.argv[1:]))
     if "--gui-shots" in sys.argv:
-        sys.exit(gui_shots(sys.argv[sys.argv.index("--gui-shots") + 1],
-                           quick="--quick" in sys.argv))
+        _shots = _arg(sys.argv, "--gui-shots")
+        if not _shots:
+            print("--gui-shots needs a folder: --gui-shots DIR")
+            sys.exit(2)
+        sys.exit(gui_shots(_shots, quick="--quick" in sys.argv))
     if "--release-gate" in sys.argv:
         sys.exit(release_gate(sys.argv[1:]))
     if "--start-check" in sys.argv:
