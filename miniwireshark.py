@@ -5648,11 +5648,189 @@ class ReputationDB:
 
 
 def reputation_db():
-    if DATA is None:
-        return None
-    lists = [DATA.get("feodo"), DATA.get("drop")]
+    lists = [DATA.get("feodo"), DATA.get("drop")] if DATA is not None \
+        else []
+    if FEATURES.get("own_blocklist", True):
+        lists.append(OWN_BLOCKLIST[0])
     lists = [x for x in lists if x is not None]
     return ReputationDB(lists) if lists else None
+
+
+# ---- 5.3.4 (IP-010): your own blocklist file --------------------------------
+#  A plain text file you keep yourself: one address, range (CIDR) or
+#  domain name per line, "#" comments. It is read from this computer only
+#  when you pick it or press Reload (never fetched, never watched), and
+#  kept within a count and a size cap. Your own network is never on it.
+OWN_BLOCKLIST_SOURCE = "your own blocklist"
+OWN_BLOCKLIST_MAX_ENTRIES = 100000
+OWN_BLOCKLIST_MAX_BYTES = 4 * 1024 * 1024
+OWN_BLOCKLIST = [None]          # the loaded OwnBlocklist, or None
+_NOT_PUBLIC_NETS = _LAN_NETS + tuple(ipaddress.ip_network(n) for n in (
+    "224.0.0.0/4", "240.0.0.0/4", "192.0.0.0/24", "192.0.2.0/24",
+    "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "::/128",
+    "ff00::/8", "2001:db8::/32", "64:ff9b:1::/48"))
+_OWN_DOMAIN_RX = re.compile(r"^(?=.{4,253}$)([a-z0-9_](?:[a-z0-9_-]{0,61}"
+                            r"[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")
+_LOCAL_SUFFIXES = (".local", ".lan", ".home", ".internal", ".localdomain",
+                   ".home.arpa", ".localhost", ".arpa")
+OWN_REASON_PRIVATE = ("a private, local or special-use address: your own "
+                      "network is never checked against a blocklist")
+OWN_REASON_WIDE = "too wide: it would cover a large part of the Internet"
+OWN_REASON_LOCAL = "a local name: names on your own network are never listed"
+OWN_REASON_BAD = "not an address, a range or a domain name"
+OWN_REASON_MANY = "more than one entry on the line"
+
+
+class OwnBlocklist(ReputationList):
+    """Your own list: exact addresses, ranges (IPv4 and IPv6) and domain
+    names (a name also covers its subdomains)."""
+
+    KEEP_REJECTED = 200
+
+    def __init__(self, path=""):
+        super().__init__(OWN_BLOCKLIST_SOURCE)
+        self.path = path
+        self.domains = set()
+        self.rejected = []          # (line number, text, reason), bounded
+        self.rejected_count = 0
+        self.lines = 0
+        self.size = 0
+        self.capped = ""            # why reading stopped early, if it did
+        self.loaded_at = 0.0
+
+    def reject(self, n, text, reason):
+        self.rejected_count += 1
+        if len(self.rejected) < self.KEEP_REJECTED:
+            self.rejected.append((n, sanitize_text(text, 80), reason))
+
+    def lookup_domain(self, name):
+        """→ the listed name covering `name` (itself or a parent), or ""."""
+        if not self.domains or not name:
+            return ""
+        parts = name.lower().strip(".").split(".")
+        for i in range(len(parts) - 1):
+            cand = ".".join(parts[i:])
+            if cand in self.domains:
+                return cand
+        return ""
+
+    def __len__(self):
+        return super().__len__() + len(self.domains)
+
+    def counts(self):
+        return {"addresses": len(self.ips),
+                "ranges": len(self.starts) + len(self.v6[0]),
+                "ipv6": sum(1 for x in self.ips if ":" in x) +
+                len(self.v6[0]),
+                "domains": len(self.domains),
+                "rejected": self.rejected_count}
+
+    def summary_lines(self):
+        c = self.counts()
+        out = [f"{c['addresses']:,} addresses, {c['ranges']:,} ranges and "
+               f"{c['domains']:,} names"]
+        if c["rejected"]:
+            out.append(f"{c['rejected']:,} lines not used")
+        if self.capped:
+            out.append(self.capped)
+        return out
+
+    def summary(self):
+        return "; ".join(self.summary_lines())
+
+
+def own_blocklist_entry(text):
+    """One line's entry → ("ip", str) | ("net", network) | ("domain", str)
+    | ("reject", reason) | None (blank or comment only)."""
+    line = text.split("#", 1)[0].strip()
+    if not line or line.startswith(";") or line.startswith("!"):
+        return None
+    parts = line.split()
+    if len(parts) >= 2 and parts[0] in ("0.0.0.0", "127.0.0.1", "::",
+                                         "::1"):
+        parts = parts[1:]          # a hosts-file line: the name after it
+    if len(parts) != 1:
+        return ("reject", OWN_REASON_MANY)
+    tok = parts[0].strip(",;")
+    if "/" in tok or _looks_like_ip(tok):
+        try:
+            net = ipaddress.ip_network(tok, strict=False)
+        except ValueError:
+            return ("reject", OWN_REASON_BAD)
+        if net.prefixlen < (8 if net.version == 4 else 16):
+            return ("reject", OWN_REASON_WIDE)
+        if any(net.version == n.version and net.overlaps(n)
+               for n in _NOT_PUBLIC_NETS) or (
+                net.num_addresses == 1 and
+                not is_public_ip(str(net.network_address))):
+            return ("reject", OWN_REASON_PRIVATE)
+        if net.num_addresses == 1:
+            return ("ip", str(net.network_address))
+        return ("net", net)
+    name = tok.lower().strip(".")
+    if name.startswith("*."):
+        name = name[2:]
+    if name in ("localhost", "local", "lan", "home") or \
+            name.endswith(_LOCAL_SUFFIXES):
+        return ("reject", OWN_REASON_LOCAL)
+    if not _OWN_DOMAIN_RX.match(name):
+        return ("reject", OWN_REASON_BAD)
+    return ("domain", name)
+
+
+def load_own_blocklist(path, max_entries=None, max_bytes=None):
+    """Read your own blocklist from `path` on this computer (nothing is
+    downloaded). Stops at the count cap and reads at most the size cap.
+    → OwnBlocklist. Raises OSError when the file can't be read."""
+    max_entries = max_entries or OWN_BLOCKLIST_MAX_ENTRIES
+    max_bytes = max_bytes or OWN_BLOCKLIST_MAX_BYTES
+    bl = OwnBlocklist(path)
+    with open(path, "rb") as f:
+        data = f.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        cut = data.rfind(b"\n", 0, max_bytes)
+        data = data[:cut + 1 if cut >= 0 else max_bytes]
+        bl.capped = (f"only the first {max_bytes // (1024 * 1024)} MB of "
+                     f"the file were read")
+    bl.size = len(data)
+    rows, kept = {}, 0
+    text = data.decode("utf-8", "replace").lstrip("\ufeff")
+    for n, raw in enumerate(text.splitlines(), 1):
+        bl.lines = n
+        got = own_blocklist_entry(raw)
+        if got is None:
+            continue
+        kind, val = got
+        if kind == "reject":
+            bl.reject(n, raw.strip(), val)
+            continue
+        if kept >= max_entries:
+            bl.capped = (f"only the first {max_entries:,} entries were "
+                         f"kept")
+            break
+        kept += 1
+        if kind == "ip":
+            bl.ips.add(val)
+        elif kind == "domain":
+            bl.domains.add(val)
+        else:
+            rows[val] = (int(val.network_address),
+                         int(val.broadcast_address), f"range {val}",
+                         val.version)
+    bl.set_ranges(list(rows.values()))
+    bl.loaded_at = time.time()
+    return bl
+
+
+def use_own_blocklist(path):
+    """Load `path` as your own blocklist and use it from now on (None
+    stops using it). → the OwnBlocklist or None."""
+    bl = load_own_blocklist(path) if path else None
+    OWN_BLOCKLIST[0] = bl
+    _REP_GEN[0] += 1
+    if bl is not None:
+        LOG.info("own blocklist: %s (%s)", path, bl.summary())
+    return bl
 
 
 DNSCRYPT_MINISIGN_KEY = "RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3"
@@ -10934,6 +11112,9 @@ FEATURES = {
     "baseline_v2": True,     # day and night baselines, kind priors (5.3.4)
     "call_quality": True,    # STUN-gated RTP loss and jitter (5.3.4 M10)
     "notify_minimised": True,  # title count, flash, tray; opt-in (M12)
+    "unusual_section": True,  # Unusual activity in Security, Dashboard (M9)
+    "own_blocklist": True,   # the user's own blocklist file (M9, IP-010)
+    "login_warning": True,   # login sent without encryption (M9, IP-013)
 }
 
 
@@ -11108,6 +11289,15 @@ FEATURE_HELP = {
                         "the background are counted in its title and "
                         "flash its taskbar button (on Windows also a tray "
                         "notification)",
+    "unusual_section": "unusual activity shown in one place at the top of "
+                       "the Security tab, the worrying and the innocent "
+                       "reading side by side, with a Dashboard card",
+    "own_blocklist": "your own blocklist file (addresses, ranges and "
+                     "names, one per line), read only when you pick or "
+                     "reload it",
+    "login_warning": "a warning when a password is sent without "
+                     "encryption (Full Power only; the password itself is "
+                     "never kept)",
 }
 
 
@@ -15025,6 +15215,7 @@ ALERT_TYPES = {
     "rogue_ra":         ("Unexpected IPv6 router announcement", "WARNING"),
     "reputation":       ("Address on a public blocklist contacted",
                          "WARNING"),
+    "cleartext_login":  ("Login sent without encryption", "WARNING"),
 }
 
 # default confidence + "why was this flagged" for each kind
@@ -15041,6 +15232,9 @@ ALERT_META = {
     "reputation": ("Medium", "The address is on a public list of "
                              "malicious servers you turned on in the "
                              "Components Center."),
+    "cleartext_login": ("High", "A sign-in was recognised in a "
+                                "reassembled, unencrypted connection "
+                                "(Full Power)."),
     "chatty_device": ("Medium", "Traffic this minute is far above this "
                                 "device's own recent average."),
     "unknown_device": ("Medium", "The device stayed hard to identify after "
@@ -15248,6 +15442,12 @@ ALERT_CHECKLIST.update({
 })
 
 
+ALERT_CHECKLIST.setdefault("cleartext_login", [
+    "If it is your own router, camera or storage box, look in its settings "
+    "for a secure (HTTPS) way to sign in.",
+    "Use a password there that you don't use anywhere else, and change it "
+    "if this login crossed the Internet."])
+
 ALERT_CHECKLIST.setdefault("reputation", [
     "Look at which device contacted it and whether that was expected (an "
     "app, an update, a link someone opened).",
@@ -15304,6 +15504,9 @@ ALERT_MEANS = {
                 "connection (phone hotspot, VM host).",
     "reputation": "Usually a shared server or an old list entry; "
                   "sometimes a link to a site known for trouble.",
+    "cleartext_login": "Usually an older router, camera, printer or "
+                       "storage box on your own network that only offers "
+                       "a plain sign-in page.",
 }
 
 
@@ -16052,6 +16255,34 @@ class AlertEngine:
                                    "traffic itself.",
             subject=f"{dev_key}|{proto}")
 
+    def cleartext_login(self, dev_name, dev_key, proto, server, port,
+                        is_public, how=""):
+        """5.3.4 (IP-013): a sign-in travelled as plain text (seen in Full
+        Power, where connections are reassembled). Nothing of the login
+        itself is passed in or kept: only who, to where and how. Repeats
+        are folded into one open alert; snooze and "mute for this device"
+        quiet a router or camera that is always signed into this way."""
+        if not FEATURES.get("login_warning", True) or self._debounced(
+                f"clogin:{dev_key}:{proto}:{server}", 3600):
+            return None
+        where = "on the Internet" if is_public else "on your network"
+        return self._add(
+            "cleartext_login", "WARNING" if is_public else "INFO", dev_key,
+            f"{dev_name}: login sent without encryption ({proto})",
+            f"A {proto} login to {server} (port {port}) travelled as plain "
+            f"text. MiniWireshark noticed it but never reads or keeps the "
+            f"password.",
+            "Anyone who can see this traffic could read the password.",
+            "Older routers, cameras, printers and storage boxes often only "
+            "offer a plain sign-in page. It matters more when the server "
+            "is on the Internet.",
+            confidence="High",
+            why="A sign-in was recognised in a reassembled, unencrypted "
+                "connection (Full Power).",
+            evidence=[f"Server {where}: {server} (port {port})"] +
+            ([f"Kind of login: {how}"] if how else []),
+            refs={"remote": server}, subject=f"{dev_key}|{proto}|{server}")
+
     def remote_access(self, dev_name, dev_key, service, how):
         if self._debounced(f"ra:{dev_key}:{service}", 86400):
             return None
@@ -16107,22 +16338,35 @@ class AlertEngine:
                                      "seen in replies on the wire.",
             subject=f"arp|{ip}")
 
-    def reputation(self, dev, ip, port, hits):
+    def reputation(self, dev, ip, port, hits, domain=False):
         """A device contacted an address a public list names. One list:
         a warning; two independent lists agreeing: stronger. Never a
         verdict — lists go stale and shared hosting is common."""
         if not hits or self._debounced(f"rep:{dev.key}:{ip}", 86400):
             return None
         sources = sorted({h[0] for h in hits})
-        two = len(sources) >= 2
+        # 5.3.4 (IP-010): your own list is often copied from a public one,
+        # so it never makes a second, independent vote
+        own = OWN_BLOCKLIST_SOURCE in sources
+        public = [x for x in sources if x != OWN_BLOCKLIST_SOURCE]
+        two = len(public) >= 2
+        if own and not public:
+            where = "your own blocklist"
+        elif own:
+            where = ("your own blocklist and two public blocklists" if two
+                     else "your own blocklist and a public blocklist")
+        else:
+            where = "two public blocklists" if two else "a public blocklist"
+        did = "looked up a name on" if domain else "contacted an address on"
         return self._add(
             "reputation", "DANGER" if two else "WARNING", dev.key,
-            f"{dev.display_name()} contacted an address on "
-            f"{'two public blocklists' if two else 'a public blocklist'}",
-            f"It connected to {ip}" + (f" (port {port})" if port else "")
+            f"{dev.display_name()} {did} {where}",
+            (f"It looked up {ip}" if domain else f"It connected to {ip}")
+            + (f" (port {port})" if port else "")
             + f", which is {reputation_text(hits)}.",
             ("Two independent lists name this address, which makes a "
              "mistake less likely." if two else
+             "You put this on your own blocklist." if not public else
              "A public list names this address as malicious (for example "
              "a botnet command server or a hijacked network)."),
             "Lists can be out of date, and one address can host many "
@@ -21016,6 +21260,8 @@ class NetworkModel:
                 if rh.asn:
                     rec.asns.add(rh.asn)
         if dev is not None:
+            if dev.key not in rec.devices:
+                self._own_blocklist_name(dev, key)
             if len(rec.devices) < 200:
                 rec.devices.add(dev.key)
             if len(dev.websites) < 500:
@@ -21095,6 +21341,21 @@ class NetworkModel:
         self.dirty_remotes.add(pub)
         if not rec.country:
             self.ev_geo.add(pub)
+
+    def _own_blocklist_name(self, dev, name):
+        """5.3.4 (IP-010): a device looked up or reached a name on your own
+        blocklist (a listed name covers its subdomains)."""
+        bl = OWN_BLOCKLIST[0]
+        if bl is None or not bl.domains or not dev.live or \
+                not FEATURES.get("own_blocklist", True):
+            return None
+        hit = bl.lookup_domain(name)
+        if not hit:
+            return None
+        return self._alert(self.alerts.reputation(
+            dev, name, 0, [(OWN_BLOCKLIST_SOURCE,
+                            f"the name {hit}" if hit != name else "", "")],
+            domain=True))
 
     def _reputation_fill(self, rec):
         rdb = getattr(self, "_rep_db", None)
@@ -21178,6 +21439,30 @@ class NetworkModel:
                         dev, rec.country_name or code, ip))
                 if len(b.countries) < 80:
                     b.countries.add(code)
+
+    def deep_login(self, t):
+        """5.3.4 (IP-013): a login the deep pass saw sent without
+        encryption (a transaction dict: client, server, port, proto, how;
+        never the user name or password). → the alert or None."""
+        if not FEATURES.get("login_warning", True):
+            return None
+        client = str(t.get("client") or "")
+        server = str(t.get("server") or "")
+        if not client or not server:
+            return None
+        dev = self.device_for(client)
+        if dev is not None:
+            name, key = dev.display_name(), dev.key
+        else:
+            name, key = client, f"ip:{client}"
+        try:
+            port = int(t.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        return self._alert(self.alerts.cleartext_login(
+            name, key, sanitize_text(str(t.get("proto") or "?"), 12),
+            server, port, is_public_ip(server),
+            how=sanitize_text(str(t.get("how") or ""), 60)))
 
     def _observe_cleartext(self, d, src_dev, dst_dev, direction):
         proto = d["cleartext"]
@@ -21699,6 +21984,7 @@ def _default_config():
                    "cleartext": True, "remote_access": True,
                    "new_country": True, "broadcast_storm": True,
                    "scan_pattern": True, "reputation": True,
+                   "cleartext_login": True, "own_blocklist_path": "",
                    "chatty_multiplier": 4, "chatty_min_rate": 3,
                    "unknown_min_packets": 5, "reconnect_count": 5,
                    "reconnect_window_minutes": 30, "arp_flip_threshold": 4,
@@ -26198,6 +26484,63 @@ And %d more calls. ¦ Et %d autres appels. ¦ Y %d llamadas más.
 No calls seen yet. ¦ Aucun appel vu pour l'instant. ¦ Todavía no se ha visto ninguna llamada.
 %d connections looked like a call but had no connection check, so they are not measured. ¦ %d connexions ressemblaient à un appel mais sans vérification de connexion : elles ne sont pas mesurées. ¦ %d conexiones parecían una llamada pero no tenían comprobación de conexión, así que no se miden.
 Observed from packet headers only: no names, no sound or picture. Calls are measured after the call app checks its connection (STUN); some call apps can't be measured. ¦ Observé uniquement à partir des en-têtes des paquets : ni noms, ni son, ni image. Les appels sont mesurés après que l'application d'appel a vérifié sa connexion (STUN) ; certaines applications d'appel ne peuvent pas être mesurées. ¦ Observado solo a partir de las cabeceras de los paquetes: sin nombres, sin sonido ni imagen. Las llamadas se miden después de que la aplicación de llamadas compruebe su conexión (STUN); algunas aplicaciones de llamadas no se pueden medir.
+Login sent without encryption ¦ Connexion envoyée sans chiffrement ¦ Inicio de sesión enviado sin cifrar
+A password is sent without encryption (seen in Full Power; the password itself is never kept). ¦ Un mot de passe est envoyé sans chiffrement (vu en pleine puissance ; le mot de passe lui-même n'est jamais conservé). ¦ Se envía una contraseña sin cifrar (visto en máxima potencia; la contraseña en sí nunca se guarda).
+If it is your own router, camera or storage box, look in its settings for a secure (HTTPS) way to sign in. ¦ S'il s'agit de votre propre routeur, caméra ou boîtier de stockage, cherchez dans ses réglages une connexion sécurisée (HTTPS). ¦ Si es su propio router, cámara o equipo de almacenamiento, busque en sus ajustes una forma segura (HTTPS) de iniciar sesión.
+Use a password there that you don't use anywhere else, and change it if this login crossed the Internet. ¦ Utilisez-y un mot de passe que vous n'utilisez nulle part ailleurs, et changez-le si cette connexion a traversé Internet. ¦ Use allí una contraseña que no use en ningún otro sitio, y cámbiela si este inicio de sesión cruzó Internet.
+Usually an older router, camera, printer or storage box on your own network that only offers a plain sign-in page. ¦ D'habitude un ancien routeur, une caméra, une imprimante ou un boîtier de stockage de votre réseau qui ne propose qu'une page de connexion non chiffrée. ¦ Normalmente un router, una cámara, una impresora o un equipo de almacenamiento antiguo de su red que solo ofrece una página de inicio de sesión sin cifrar.
+A sign-in was recognised in a reassembled, unencrypted connection (Full Power). ¦ Une connexion a été reconnue dans une connexion réassemblée et non chiffrée (pleine puissance). ¦ Se reconoció un inicio de sesión en una conexión reensamblada y sin cifrar (máxima potencia).
+Anyone who can see this traffic could read the password. ¦ Toute personne qui voit ce trafic pourrait lire le mot de passe. ¦ Cualquiera que vea este tráfico podría leer la contraseña.
+Older routers, cameras, printers and storage boxes often only offer a plain sign-in page. It matters more when the server is on the Internet. ¦ Les anciens routeurs, caméras, imprimantes et boîtiers de stockage ne proposent souvent qu'une page de connexion non chiffrée. C'est plus important quand le serveur est sur Internet. ¦ Los routers, cámaras, impresoras y equipos de almacenamiento antiguos a menudo solo ofrecen una página de inicio de sesión sin cifrar. Importa más cuando el servidor está en Internet.
+password in plain text ¦ mot de passe en clair ¦ contraseña en texto claro
+user name and password ¦ nom d'utilisateur et mot de passe ¦ nombre de usuario y contraseña
+USER and PASS commands ¦ commandes USER et PASS ¦ comandos USER y PASS
+sign-in token ¦ jeton de connexion ¦ token de inicio de sesión
+HTTP Basic sign-in ¦ connexion HTTP Basic ¦ inicio de sesión HTTP Basic
+password typed at a Telnet prompt ¦ mot de passe tapé à une invite Telnet ¦ contraseña escrita en un aviso de Telnet
+A program you don't know may be sending data out from this device. ¦ Un programme que vous ne connaissez pas envoie peut-être des données depuis cet appareil. ¦ Puede que un programa que no conoce esté enviando datos desde este dispositivo.
+Something may be downloading a lot without you asking for it. ¦ Quelque chose télécharge peut-être beaucoup sans que vous l'ayez demandé. ¦ Puede que algo esté descargando mucho sin que usted lo haya pedido.
+A program on this device may be contacting many places on its own, as some malware does. ¦ Un programme de cet appareil contacte peut-être de nombreux endroits de lui-même, comme le font certains logiciels malveillants. ¦ Puede que un programa de este dispositivo esté contactando con muchos sitios por su cuenta, como hace algún malware.
+A program may be opening connections in bulk, for example scanning or spreading. ¦ Un programme ouvre peut-être des connexions en masse, par exemple pour balayer le réseau ou se propager. ¦ Puede que un programa esté abriendo conexiones en masa, por ejemplo para escanear o propagarse.
+The device may be doing something it was not asked to do. ¦ L'appareil fait peut-être quelque chose qu'on ne lui a pas demandé. ¦ Puede que el dispositivo esté haciendo algo que no se le pidió.
+Someone may be controlling the device, or its software was changed without you. ¦ Quelqu'un contrôle peut-être l'appareil, ou son logiciel a été modifié sans vous. ¦ Puede que alguien esté controlando el dispositivo, o que su software se haya cambiado sin usted.
+The device may be talking to a server it has no reason to use. ¦ L'appareil parle peut-être à un serveur qu'il n'a aucune raison d'utiliser. ¦ Puede que el dispositivo esté hablando con un servidor que no tiene motivo para usar.
+Check what the device was doing at that time (backup, video call, upload). ¦ Vérifiez ce que faisait l'appareil à ce moment-là (sauvegarde, appel vidéo, envoi). ¦ Compruebe qué hacía el dispositivo en ese momento (copia de seguridad, videollamada, subida).
+Check whether an update, a game or a film was downloading then. ¦ Vérifiez si une mise à jour, un jeu ou un film se téléchargeait à ce moment-là. ¦ Compruebe si en ese momento se descargaba una actualización, un juego o una película.
+Look at the device's connections to see which program made them. ¦ Regardez les connexions de l'appareil pour voir quel programme les a ouvertes. ¦ Mire las conexiones del dispositivo para ver qué programa las abrió.
+Open the device to see which websites and services it used then. ¦ Ouvrez l'appareil pour voir quels sites et services il a utilisés à ce moment-là. ¦ Abra el dispositivo para ver qué sitios y servicios usó en ese momento.
+Check the device's app for an update; restart it if nothing changed. ¦ Cherchez une mise à jour dans l'application de l'appareil ; redémarrez-le si rien n'a changé. ¦ Busque una actualización en la aplicación del dispositivo; reinícielo si nada cambió.
+Open the device and look at the remote hosts it contacted. ¦ Ouvrez l'appareil et regardez les hôtes distants qu'il a contactés. ¦ Abra el dispositivo y mire los hosts remotos con los que contactó.
+Open the alert for the details. ¦ Ouvrez l'alerte pour les détails. ¦ Abra la alerta para ver los detalles.
+Nothing unusual right now. ¦ Rien d'inhabituel pour le moment. ¦ Nada inusual por ahora.
+1 thing is unusual: see both readings. ¦ 1 chose est inhabituelle : voyez les deux lectures. ¦ 1 cosa es inusual: vea las dos lecturas.
+Unusual activity ¦ Activité inhabituelle ¦ Actividad inusual
+nothing to look at ¦ rien à examiner ¦ nada que revisar
+1 finding ¦ 1 constat ¦ 1 hallazgo
+All alerts ¦ Toutes les alertes ¦ Todas las alertas
+Nothing unusual right now. Each device is compared with what it usually does. ¦ Rien d'inhabituel pour le moment. Chaque appareil est comparé à ce qu'il fait d'habitude. ¦ Nada inusual por ahora. Cada dispositivo se compara con lo que hace normalmente.
+1 more finding in the Alerts tab. ¦ 1 constat de plus dans l'onglet Alertes. ¦ 1 hallazgo más en la pestaña Alertas.
+What we saw ¦ Ce que nous avons vu ¦ Lo que vimos
+Could be a problem ¦ Peut-être un problème ¦ Podría ser un problema
+Could be normal ¦ Peut-être normal ¦ Podría ser normal
+Next step ¦ Prochaine étape ¦ Siguiente paso
+See both readings ¦ Voir les deux lectures ¦ Ver las dos lecturas
+Things a device did that differ from what it usually does, each with the worrying and the innocent reading. ¦ Ce qu'un appareil a fait de différent de d'habitude, avec à chaque fois la lecture inquiétante et la lecture innocente. ¦ Lo que un dispositivo hizo distinto de lo habitual, cada cosa con la lectura preocupante y la inocente.
+Your own blocklist ¦ Votre propre liste de blocage ¦ Su propia lista de bloqueo
+A plain text file you keep yourself: one address, range (like 203.0.113.0/24) or domain name per line, and # for comments. IPv6 works too. It is read from this computer only when you choose it or press Reload; nothing is downloaded. Addresses of your own network are never used. ¦ Un fichier texte que vous tenez vous-même : une adresse, une plage (comme 203.0.113.0/24) ou un nom de domaine par ligne, et # pour les commentaires. L'IPv6 fonctionne aussi. Il est lu depuis cet ordinateur seulement quand vous le choisissez ou appuyez sur Recharger ; rien n'est téléchargé. Les adresses de votre propre réseau ne sont jamais utilisées. ¦ Un archivo de texto que usted mismo mantiene: una dirección, un rango (como 203.0.113.0/24) o un nombre de dominio por línea, y # para comentarios. IPv6 también funciona. Se lee desde este equipo solo cuando lo elige o pulsa Recargar; no se descarga nada. Las direcciones de su propia red nunca se usan.
+Choose file ¦ Choisir un fichier ¦ Elegir archivo
+Reload ¦ Recharger ¦ Recargar
+Stop using it ¦ Ne plus l'utiliser ¦ Dejar de usarla
+No list in use. ¦ Aucune liste utilisée. ¦ Ninguna lista en uso.
+Stopped using your own blocklist. ¦ Votre propre liste de blocage n'est plus utilisée. ¦ Se dejó de usar su propia lista de bloqueo.
+Lines not used, and why ¦ Lignes non utilisées, et pourquoi ¦ Líneas no usadas, y por qué
+Every line was used. ¦ Toutes les lignes ont été utilisées. ¦ Se usaron todas las líneas.
+a private, local or special-use address: your own network is never checked against a blocklist ¦ une adresse privée, locale ou à usage spécial : votre propre réseau n'est jamais comparé à une liste de blocage ¦ una dirección privada, local o de uso especial: su propia red nunca se compara con una lista de bloqueo
+too wide: it would cover a large part of the Internet ¦ trop large : elle couvrirait une grande partie d'Internet ¦ demasiado amplio: cubriría una gran parte de Internet
+a local name: names on your own network are never listed ¦ un nom local : les noms de votre propre réseau ne sont jamais listés ¦ un nombre local: los nombres de su propia red nunca se incluyen
+not an address, a range or a domain name ¦ ni une adresse, ni une plage, ni un nom de domaine ¦ no es una dirección, un rango ni un nombre de dominio
+more than one entry on the line ¦ plus d'une entrée sur la ligne ¦ más de una entrada en la línea
+You put this on your own blocklist. ¦ Vous l'avez mis sur votre propre liste de blocage. ¦ Usted lo puso en su propia lista de bloqueo.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -26890,6 +27233,74 @@ I18N_PATTERNS += [
     (r"(.+) used a new service: (.+)",
      r"\1 a utilisé un nouveau service : \2",
      r"\1 usó un servicio nuevo: \2"),
+    # 5.3.4 (M9): unusual activity, own blocklist, logins in plain text
+    (r"(\d+) things are unusual: see both readings\.",
+     r"\1 choses sont inhabituelles : voyez les deux lectures.",
+     r"\1 cosas son inusuales: vea las dos lecturas."),
+    (r"(\d+) findings", r"\1 constats", r"\1 hallazgos"),
+    (r"(\d+) more findings in the Alerts tab\.",
+     r"\1 constats de plus dans l'onglet Alertes.",
+     r"\1 hallazgos más en la pestaña Alertas."),
+    (r"(.+): login sent without encryption \((.+)\)",
+     r"\1 : connexion envoyée sans chiffrement (\2)",
+     r"\1: inicio de sesión enviado sin cifrar (\2)"),
+    (r"A (.+) login to (.+) \(port (\d+)\) travelled as plain text\. "
+     r"MiniWireshark noticed it but never reads or keeps the password\.",
+     r"Une connexion \1 vers \2 (port \3) a circulé en clair. "
+     r"MiniWireshark l'a remarquée mais ne lit ni ne garde jamais le mot "
+     r"de passe.",
+     r"Un inicio de sesión \1 hacia \2 (puerto \3) viajó en texto claro. "
+     r"MiniWireshark lo notó pero nunca lee ni guarda la contraseña."),
+    (r"Server on the Internet: (.+)", r"Serveur sur Internet : \1",
+     r"Servidor en Internet: \1"),
+    (r"Server on your network: (.+)", r"Serveur sur votre réseau : \1",
+     r"Servidor en su red: \1"),
+    (r"Kind of login: (.+)", "Type de connexion : {t1}",
+     "Tipo de inicio de sesión: {t1}"),
+    (r"(\S+) login to (.+) sent without encryption",
+     r"Connexion \1 vers \2 envoyée sans chiffrement",
+     r"Inicio de sesión \1 hacia \2 enviado sin cifrar"),
+    (r"(.+) sent a (\S+) login to (.+) without encryption \(the password "
+     r"itself is not read by MiniWireshark\)",
+     r"\1 a envoyé une connexion \2 vers \3 sans chiffrement (le mot de "
+     r"passe lui-même n'est pas lu par MiniWireshark)",
+     r"\1 envió un inicio de sesión \2 hacia \3 sin cifrar (MiniWireshark "
+     r"no lee la contraseña en sí)"),
+    (r"Telnet: typed text, (\d+) bytes \(hidden\)",
+     r"Telnet : texte tapé, \1 octets (masqué)",
+     r"Telnet: texto escrito, \1 bytes (oculto)"),
+    (r"typed text, (\d+) bytes \(hidden\)",
+     r"texte tapé, \1 octets (masqué)",
+     r"texto escrito, \1 bytes (oculto)"),
+    (r"(.+) contacted an address on your own blocklist",
+     r"\1 a contacté une adresse de votre propre liste de blocage",
+     r"\1 contactó con una dirección de su propia lista de bloqueo"),
+    (r"(.+) looked up a name on your own blocklist",
+     r"\1 a cherché un nom de votre propre liste de blocage",
+     r"\1 buscó un nombre de su propia lista de bloqueo"),
+    (r"(.+) contacted an address on your own blocklist and a public "
+     r"blocklist",
+     r"\1 a contacté une adresse de votre propre liste de blocage et d'une "
+     r"liste publique",
+     r"\1 contactó con una dirección de su propia lista de bloqueo y de "
+     r"una lista pública"),
+    (r"In use: (.+) \(read at (\S+)\)", r"Utilisée : \1 (lue à \2)",
+     r"En uso: \1 (leída a las \2)"),
+    (r"([\d,]+) addresses, ([\d,]+) ranges and ([\d,]+) names",
+     r"\1 adresses, \2 plages et \3 noms",
+     r"\1 direcciones, \2 rangos y \3 nombres"),
+    (r"([\d,]+) lines not used", r"\1 lignes non utilisées",
+     r"\1 líneas no usadas"),
+    (r"only the first (\d+) MB of the file were read",
+     r"seuls les \1 premiers Mo du fichier ont été lus",
+     r"solo se leyeron los primeros \1 MB del archivo"),
+    (r"only the first ([\d,]+) entries were kept",
+     r"seules les \1 premières entrées ont été gardées",
+     r"solo se conservaron las primeras \1 entradas"),
+    (r"… and ([\d,]+) more", r"… et \1 de plus", r"… y \1 más"),
+    (r"Your own blocklist could not be read: (.+) \((\w+)\)\.",
+     r"Votre propre liste de blocage n'a pas pu être lue : \1 (\2).",
+     r"No se pudo leer su propia lista de bloqueo: \1 (\2)."),
 ]
 _CLASS_RX = "(" + "|".join(re.escape(c) for c in DEVICE_CLASSES) + ")"
 I18N_PATTERNS += [
@@ -29331,6 +29742,10 @@ SETTINGS_PAGES = [
               _alert_control("reputation", "A device contacts an address on "
                                            "a public blocklist you turned "
                                            "on in the Components Center."),
+              _alert_control("cleartext_login", "A password is sent without "
+                                                "encryption (seen in Full "
+                                                "Power; the password itself "
+                                                "is never kept)."),
           ]},
          {"title": "Sensitivity", "controls": [
              {"key": "alerts.chatty_multiplier", "type": "int", "min": 2,
@@ -33337,6 +33752,9 @@ class DashboardTab(BaseTab):
         self.story_card = None
         if FEATURES.get("story_mode", True):
             self._build_story_card(outer)
+        self.unusual_card = None
+        if FEATURES.get("unusual_section", True):
+            self._build_unusual_card(outer)
         self.big = tk.Frame(outer, bg=WHITE)
         if not self.answers:
             self.big.pack(fill="x", pady=(0, 4))
@@ -33484,6 +33902,48 @@ class DashboardTab(BaseTab):
                       "with what is new since you last looked.")
         self.story_card = card
 
+    def _build_unusual_card(self, outer):
+        """5.3.4 (M9, MC6): how many things are unusual, opening the
+        Unusual activity section of the Security tab."""
+        card = tk.Frame(outer, bg="#f6f7fa", padx=12, pady=6,
+                        highlightbackground="#e0e2e8", highlightthickness=1,
+                        cursor="hand2", takefocus=1)
+        card.configure(highlightcolor="#2b7de9")
+        if self.story_card is not None:
+            where = {"after": self.story_card}
+        else:
+            where = {"before": self.honest_lbl} if self.answers else \
+                {"after": self.state_lbl}
+        card.pack(fill="x", padx=4, pady=(0, 6), **where)
+        title = tk.Label(card, text="\U0001F50E  Unusual activity",
+                         bg="#f6f7fa", fg="#2b3a56", font=mw_font(10, "bold"),
+                         anchor="w")
+        title.pack(side="left")
+        self.unusual_lbl = tk.Label(card, text="…", bg="#f6f7fa",
+                                    fg="#222222", font=mw_font(10),
+                                    anchor="w", justify="left")
+        self.unusual_lbl.pack(side="left", padx=(10, 0), fill="x",
+                              expand=True)
+        more = tk.Label(card, text="See both readings ›", bg="#f6f7fa",
+                        fg="#0b5394", anchor="e", cursor="hand2")
+        more.pack(side="right")
+        for w in (card, title, self.unusual_lbl, more):
+            w.bind("<Button-1>", lambda e: self.app.open_unusual())
+        card.bind("<Return>", lambda e: self.app.open_unusual())
+        Tooltip(card, "Things a device did that differ from what it "
+                      "usually does, each with the worrying and the "
+                      "innocent reading.")
+        self.unusual_card = card
+
+    def show_unusual_card(self):
+        if self.unusual_card is None:
+            return ""
+        text = unusual_card_text(len(unusual_findings(self.model.alerts)))
+        with contextlib.suppress(tk.TclError):
+            if self.unusual_lbl.cget("text") != translate_text(text):
+                self.unusual_lbl.configure(text=text)
+        return text
+
     def show_story_card(self):
         """The card's sentence from the last story (no work here)."""
         if self.story_card is None:
@@ -33582,6 +34042,7 @@ class DashboardTab(BaseTab):
         if self.story_card is not None:
             app.request_story()         # a job; at most once a minute
             self.show_story_card()
+        self.show_unusual_card()
         now = m.now()
         devs = [d for d in m.registry.visible_devices()]
         active = sum(1 for d in devs if d.state in (STATE_ACTIVE, STATE_IDLE))
@@ -37654,6 +38115,246 @@ class HealthTab(BaseTab):
 
 
 # ---- Security check ----------------------------------------------------------
+# ---- 5.3.4 (M9, MC6): Unusual activity --------------------------------------
+#  Findings that are a statistical judgment (a device doing more, or other,
+#  than it usually does) in one place, each with the worrying reading and
+#  the innocent one side by side, what was seen, and one next step.
+UNUSUAL_KINDS = ("upload_spike", "download_spike", "many_destinations",
+                 "many_connections", "chatty_device", "unusual_service",
+                 "new_country")
+UNUSUAL_PROBLEM = {
+    "upload_spike": "A program you don't know may be sending data out "
+                    "from this device.",
+    "download_spike": "Something may be downloading a lot without you "
+                      "asking for it.",
+    "many_destinations": "A program on this device may be contacting many "
+                         "places on its own, as some malware does.",
+    "many_connections": "A program may be opening connections in bulk, "
+                        "for example scanning or spreading.",
+    "chatty_device": "The device may be doing something it was not asked "
+                     "to do.",
+    "unusual_service": "Someone may be controlling the device, or its "
+                       "software was changed without you.",
+    "new_country": "The device may be talking to a server it has no "
+                   "reason to use.",
+}
+UNUSUAL_STEP = {
+    "upload_spike": "Check what the device was doing at that time (backup, "
+                    "video call, upload).",
+    "download_spike": "Check whether an update, a game or a film was "
+                      "downloading then.",
+    "many_destinations": "Look at the device's connections to see which "
+                         "program made them.",
+    "many_connections": "Look at the device's connections to see which "
+                        "program made them.",
+    "chatty_device": "Open the device to see which websites and services "
+                     "it used then.",
+    "unusual_service": "Check the device's app for an update; restart it "
+                       "if nothing changed.",
+    "new_country": "Open the device and look at the remote hosts it "
+                   "contacted.",
+}
+
+
+def unusual_findings(engine, limit=None):
+    """The open (not yet acknowledged) alerts whose kind is a statistical
+    judgment, newest first, as two-reading cards (plain values, no Tk)."""
+    out = []
+    for aid in list(engine.order):
+        a = engine.alerts.get(aid)
+        if a is None or a.acknowledged or a.kind not in UNUSUAL_KINDS:
+            continue
+        out.append({
+            "id": a.id, "kind": a.kind, "severity": a.severity,
+            "title": a.reason, "saw": a.observed,
+            "evidence": [str(e) for e in a.evidence[-3:]],
+            "problem": UNUSUAL_PROBLEM.get(a.kind) or a.interpretation,
+            "normal": ALERT_MEANS.get(a.kind) or a.possible_explanations,
+            "step": UNUSUAL_STEP.get(a.kind, "Open the alert for the "
+                                             "details."),
+            "when": a.last_seen or a.when, "count": a.count,
+            "device": a.device_key})
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def unusual_card_text(n):
+    """The Dashboard card's sentence."""
+    if not n:
+        return "Nothing unusual right now."
+    if n == 1:
+        return "1 thing is unusual: see both readings."
+    return f"{n} things are unusual: see both readings."
+
+
+class UnusualSection:
+    """The "Unusual activity" section at the top of the Security tab: a
+    card per finding with "Could be a problem" and "Could be normal" side
+    by side. Acknowledge, snooze and mute work as in the Alerts tab."""
+
+    SHOW = 2                      # cards shown; the rest are counted
+    SECTION_BG = "#fbfbfb"        # the Security text's own background
+
+    def __init__(self, tab, parent):
+        self.tab, self.app = tab, tab.app
+        self.frame = tk.Frame(parent, bg=self.SECTION_BG, padx=2, pady=4)
+        head = tk.Frame(self.frame, bg=self.SECTION_BG)
+        head.pack(fill="x")
+        tk.Label(head, text="\U0001F50E  Unusual activity", bg=self.SECTION_BG,
+                 fg="#2b3a56", font=mw_font(12, "bold")).pack(side="left")
+        self.count_lbl = tk.Label(head, text="", bg=self.SECTION_BG, fg="#666666")
+        self.count_lbl.pack(side="left", padx=8)
+        ttk.Button(head, text="All alerts ›", style="Sub.TButton",
+                   command=lambda: self.app._select_tab("alerts")).pack(
+            side="right")
+        self.body = tk.Frame(self.frame, bg=self.SECTION_BG)
+        self.body.pack(fill="x", pady=(2, 6))
+        # the frame sits inside the Security text (it scrolls with it): this
+        # strut gives it the text's width
+        self.strut = tk.Frame(self.frame, bg=self.SECTION_BG, height=1,
+                              width=900)
+        self.strut.pack(anchor="w")
+        self._sig = None
+        self.cards = []           # [(finding, frame, buttons)]
+        self._wrap = []           # (label, share of the width)
+        self.width = 900
+
+    def findings(self):
+        return unusual_findings(self.app.model.alerts)
+
+    def refresh(self, force=False):
+        found = self.findings()
+        sig = (id(self.app.model), len(found),
+               tuple((f["id"], f["count"]) for f in found[:self.SHOW]))
+        if sig == self._sig and not force:
+            return found
+        self._sig = sig
+        for w in self.body.winfo_children():
+            w.destroy()
+        self.cards, self._wrap = [], []
+        with contextlib.suppress(tk.TclError):
+            self.count_lbl.configure(text=(
+                "nothing to look at" if not found else
+                "1 finding" if len(found) == 1 else
+                f"{len(found)} findings"))
+        if not found:
+            lbl = tk.Label(self.body, text="✔  Nothing unusual right now. "
+                                           "Each device is compared with "
+                                           "what it usually does.",
+                           bg=self.SECTION_BG, fg="#0b6b3a", anchor="w",
+                           justify="left")
+            lbl.pack(fill="x")
+            self._wrap.append((lbl, 1.0))
+        for f in found[:self.SHOW]:
+            self._card(f)
+        more = len(found) - self.SHOW
+        if more > 0:
+            lbl = tk.Label(self.body, text=(
+                "1 more finding in the Alerts tab." if more == 1 else
+                f"{more} more findings in the Alerts tab."), bg=self.SECTION_BG,
+                fg="#0b5394", cursor="hand2", anchor="w")
+            lbl.pack(fill="x")
+            lbl.bind("<Button-1>", lambda e: self.app._select_tab("alerts"))
+        app = self.app
+        pal = palette_name(app.theme_name, app.high_contrast)
+        if pal != "Light":
+            with contextlib.suppress(tk.TclError, AttributeError):
+                app._retheme_widget_tree(self.body, pal)
+        self._fit()
+        return found
+
+    def _label(self, parent, text, share, bg, fg="#222222", bold=False):
+        lbl = tk.Label(parent, text=text, bg=bg, fg=fg, anchor="w",
+                       justify="left", font=mw_font(10, "bold") if bold
+                       else mw_font(10))
+        lbl.pack(fill="x", anchor="w")
+        self._wrap.append((lbl, share))
+        return lbl
+
+    def _card(self, f):
+        bg = "#f6f7fa"
+        card = tk.Frame(self.body, bg=bg, padx=10, pady=6,
+                        highlightbackground="#e0e2e8", highlightthickness=1)
+        card.pack(fill="x", pady=(0, 6))
+        top = tk.Frame(card, bg=bg)
+        top.pack(fill="x")
+        glyph = {"DANGER": "‼", "WARNING": "⚠"}.get(f["severity"], "ℹ")
+        tk.Label(top, text=f"{glyph}  {f['title']}", bg=bg, fg="#2b3a56",
+                 font=mw_font(10, "bold"), anchor="w").pack(side="left")
+        tk.Label(top, text=fmt_clock(f["when"]) + (
+            f"  ×{f['count']}" if f["count"] > 1 else ""), bg=bg,
+            fg="#666666").pack(side="right")
+        self._label(card, translate_text("What we saw:") + " " +
+                    translate_text(f["saw"]), 1.0, bg)
+        if f["evidence"]:
+            self._label(card, " · ".join(f["evidence"]), 1.0, bg,
+                        fg="#666666")
+        two = tk.Frame(card, bg=bg)
+        two.pack(fill="x", pady=(4, 2))
+        two.columnconfigure(0, weight=1, uniform="read")
+        two.columnconfigure(1, weight=1, uniform="read")
+        for col, (head, text, cbg, fg) in enumerate((
+                ("Could be a problem", f["problem"], "#fff5e0", "#8a5a00"),
+                ("Could be normal", f["normal"], "#eafaf0", "#0b6b3a"))):
+            box = tk.Frame(two, bg=cbg, padx=8, pady=4)
+            box.grid(row=0, column=col, sticky="nsew",
+                     padx=(0, 4) if col == 0 else (4, 0))
+            self._label(box, head, 0.5, cbg, fg=fg, bold=True)
+            self._label(box, text, 0.5, cbg)
+        self._label(card, translate_text("Next step:") + " " +
+                    translate_text(f["step"]), 1.0, bg, fg="#0b5394")
+        bar = tk.Frame(card, bg=bg)
+        bar.pack(fill="x", pady=(4, 0))
+        btns = {}
+        for key, label in (("details", "Details…"),
+                           ("ack", "Acknowledge"),
+                           ("snooze", "Snooze for 1 day"),
+                           ("mute", "Mute for this device")):
+            b = ttk.Button(bar, text=label, style="Sub.TButton",
+                           command=lambda k=key, i=f["id"]: self.act(i, k))
+            b.pack(side="left", padx=(0, 6))
+            btns[key] = b
+        self.cards.append((f, card, btns))
+
+    def act(self, aid, what):
+        """Acknowledge, snooze or mute work exactly as in the Alerts tab."""
+        app = self.app
+        a = app.model.alerts.alerts.get(aid)
+        if a is None:
+            return None
+        if what == "details":
+            app.show_alert(aid)
+            return a
+        if what == "ack":
+            app.model.alerts.acknowledge(aid)
+        elif what == "snooze":
+            app.alert_snooze(a, 86400)
+        elif what == "mute":
+            app.alert_mute_device(a)
+        with contextlib.suppress(Exception):
+            app.tabs["alerts"].upsert(a)
+        self.refresh(force=True)
+        return a
+
+    def set_width(self, width):
+        width = max(300, int(width))
+        if abs(width - self.width) < 4:
+            return
+        self.width = width
+        with contextlib.suppress(tk.TclError):
+            self.strut.configure(width=width)
+        self._fit()
+
+    def _fit(self, e=None):
+        for lbl, share in self._wrap:
+            want = max(140, int(self.width * share) - 40)
+            with contextlib.suppress(tk.TclError, ValueError):
+                if abs(int(float(str(lbl.cget("wraplength")) or 0)) -
+                       want) > 6:
+                    lbl.configure(wraplength=want)
+
+
 class SecurityTab(BaseTab):
     name, label_key = "security", "tab_security"
 
@@ -37675,6 +38376,10 @@ class SecurityTab(BaseTab):
                    command=self.app.open_ledger).pack(side="left", padx=8)
         ttk.Button(bar, text="Privacy posture…",
                    command=self.app.open_privacy_posture).pack(side="left")
+        if FEATURES.get("own_blocklist", True):
+            ttk.Button(bar, text="Your own blocklist…",
+                       command=self.app.open_own_blocklist).pack(
+                side="left", padx=8)
         # 5.1.2: sections with nothing to report fold to one line each
         # (folded in Beginner, open in Advanced)
         self.fold_btn = ttk.Button(bar, text="", style="Sub.TButton",
@@ -37685,6 +38390,13 @@ class SecurityTab(BaseTab):
                             relief="flat", padx=14, pady=12,
                             font=mw_font(11), state="disabled",
                             highlightthickness=0)
+        # 5.3.4 (M9, MC6): unusual activity in one place, at the top of the
+        # page (inside the text, so it scrolls with it on a short screen)
+        self.unusual = None
+        if FEATURES.get("unusual_section", True):
+            self.unusual = UnusualSection(self, self.text)
+            self.text.bind("<Configure>", lambda e: self.unusual.set_width(
+                e.width - 2 * 14 - 8), add="+")
         vs = ttk.Scrollbar(outer, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=vs.set)
         self.text.pack(side="left", fill="both", expand=True)
@@ -37754,6 +38466,8 @@ class SecurityTab(BaseTab):
 
     def refresh(self):
         if self.is_visible():
+            if self.unusual is not None:
+                self.unusual.refresh()
             y = self.text.yview()[0]
             self.render()
             self.text.yview_moveto(y)
@@ -37762,11 +38476,25 @@ class SecurityTab(BaseTab):
         self.refresh()
 
 
+    def _place_unusual(self):
+        """The section stays the first thing in the text; the rest of the
+        page is written after it (deleting it would destroy it)."""
+        t, u = self.text, self.unusual
+        if u is None:
+            t.delete("1.0", "end")
+            return
+        if str(u.frame) in [str(x) for x in t.window_names()]:
+            t.delete("2.0", "end")
+            return
+        t.delete("1.0", "end")
+        t.window_create("1.0", window=u.frame)
+        t.insert("end", "\n")
+
     def render(self):
         t = self.text
         m, app = self.model, self.app
         t.config(state="normal")
-        t.delete("1.0", "end")
+        self._place_unusual()
 
         secs = []          # [title, [(tag, text)], something to look at]
         cur = [None]
@@ -43222,6 +43950,8 @@ class MiniWireshark:
         DATA = self.data
         self.data.on_change = lambda: self._async_results.put(
             self._on_data_changed)
+        self.own_blocklist_error = ""
+        self._own_blocklist_at_start()
         self.known = KnownDevicesStore(PATHS.known_devices)
         self.networks = NetworkProfiles(PATHS.networks)
         for st, what in ((self.known, "your device names and notes"),
@@ -45498,6 +46228,25 @@ class MiniWireshark:
                                    "Automatic") != "Thread")
         if self.deep.active():
             self.deep._ensure_backend()
+
+    def open_unusual(self):
+        """5.3.4 (M9, MC6): the Unusual activity section of the Security
+        tab (the Dashboard card opens it)."""
+        tab = self._select_tab("security")
+        if getattr(tab, "unusual", None) is not None:
+            tab.unusual.refresh(force=True)
+            with contextlib.suppress(tk.TclError):
+                tab.unusual.frame.focus_set()
+        return tab
+
+    def drain_deep_logins(self):
+        """5.3.4 (IP-013): the logins the deep pass saw sent without
+        encryption become alerts (Tk thread, under the gate). → count."""
+        n = 0
+        for t in self.deep.store.take_logins():
+            if self.model.deep_login(t) is not None:
+                n += 1
+        return n
 
     def mode_pill_text(self):
         mode, why = self.effective_perf_mode()
@@ -53546,6 +54295,160 @@ proc ::mw_retheme {w map fgnew deffg} {
         self._ledger_win = win
         return win
 
+    # ---- 5.3.4 (IP-010): your own blocklist file --------------------------------
+    def _own_blocklist_at_start(self):
+        """Read the list you picked earlier once, off the Tk thread (it is
+        never fetched and never re-read on its own)."""
+        path = str(self.config.get("alerts.own_blocklist_path", "") or "")
+        if not path or not FEATURES.get("own_blocklist", True):
+            return None
+
+        def run():
+            try:
+                use_own_blocklist(path)
+            except (OSError, ValueError) as e:
+                LOG.warning("own blocklist not read: %s",
+                            type(e).__name__)
+                self.own_blocklist_error = (
+                    "Your own blocklist could not be read: "
+                    f"{os.path.basename(path)} ({type(e).__name__}).")
+        t = threading.Thread(target=run, daemon=True, name="own-blocklist")
+        t.start()
+        return t
+
+    def own_blocklist_use(self, path):
+        """Read `path` (picked or reloaded by you) and check this session
+        against it. → (OwnBlocklist or None, message)."""
+        try:
+            bl = use_own_blocklist(path)
+        except (OSError, ValueError) as e:
+            self.own_blocklist_error = (
+                "Your own blocklist could not be read: "
+                f"{os.path.basename(path)} ({type(e).__name__}).")
+            return None, self.own_blocklist_error
+        self.own_blocklist_error = ""
+        self.config.set("alerts.own_blocklist_path", path)
+        self.config.save()
+        self.own_blocklist_recheck()
+        return bl, ""
+
+    def own_blocklist_recheck(self):
+        """The addresses and names this session already saw, checked
+        against the list just read."""
+        m = self.model
+        with contextlib.suppress(Exception):
+            m.reenrich()
+        n = 0
+        for w in list(m.websites.values()):
+            for dk in sorted(w.devices)[:50]:
+                dev = m.registry.by_key.get(dk)
+                if dev is not None and m._own_blocklist_name(dev, w.domain):
+                    n += 1
+        return n
+
+    def own_blocklist_stop(self):
+        use_own_blocklist(None)
+        self.own_blocklist_error = ""
+        self.config.set("alerts.own_blocklist_path", "")
+        self.config.save()
+
+    def own_blocklist_text(self):
+        bl = OWN_BLOCKLIST[0]
+        if self.own_blocklist_error:
+            return self.own_blocklist_error
+        if bl is None:
+            return "No list in use."
+        return "\n".join([f"In use: {os.path.basename(bl.path)} (read at "
+                          f"{fmt_clock(bl.loaded_at)})"] +
+                         bl.summary_lines())
+
+    def open_own_blocklist(self, parent=None):
+        """Pick, reload or stop using your own blocklist, and see the lines
+        that were not used and why."""
+        t = self.theme
+        win = tk.Toplevel(parent or self.root)
+        win.title("Your own blocklist")
+        win.geometry(px_geo("760x520"))
+        win.configure(bg=t["tab_bg"])
+        top = tk.Frame(win, bg=t["tab_bg"], padx=12, pady=8)
+        top.pack(fill="x")
+        tk.Label(top, text="🚫  Your own blocklist", bg=t["tab_bg"],
+                 fg=t["text_fg"], font=mw_font(13, "bold")).pack(anchor="w")
+        tk.Label(top, text="A plain text file you keep yourself: one "
+                           "address, range (like 203.0.113.0/24) or domain "
+                           "name per line, and # for comments. IPv6 works "
+                           "too. It is read from this computer only when "
+                           "you choose it or press Reload; nothing is "
+                           "downloaded. Addresses of your own network are "
+                           "never used.",
+                 bg=t["tab_bg"], fg=t["muted_fg"], wraplength=720,
+                 justify="left").pack(anchor="w")
+        status = tk.Label(top, text="", bg=t["tab_bg"], fg=t["text_fg"],
+                          wraplength=720, justify="left", anchor="w")
+        status.pack(anchor="w", fill="x", pady=(6, 0))
+        bar = tk.Frame(win, bg=t["tab_bg"], padx=12)
+        bar.pack(fill="x")
+        text = tk.Text(win, height=12, wrap="word", relief="flat",
+                       bg=t["text_bg"], fg=t["text_fg"],
+                       font=mw_font(10), highlightthickness=0)
+        text.pack(fill="both", expand=True, padx=12, pady=8)
+
+        def fill(msg=""):
+            if not win.winfo_exists():
+                return
+            status.configure(text=translate_lines(
+                (msg + "\n" if msg else "") + self.own_blocklist_text()))
+            bl = OWN_BLOCKLIST[0]
+            text.configure(state="normal")
+            text.delete("1.0", "end")
+            if bl is not None and bl.rejected:
+                text.insert("end", translate_text(
+                    "Lines not used, and why:") + "\n")
+                for n, line, why in bl.rejected:
+                    text.insert("end", f"  {n}: {line} \u2014 "
+                                       f"{translate_text(why)}\n")
+                more = bl.rejected_count - len(bl.rejected)
+                if more > 0:
+                    text.insert("end", translate_text(
+                        f"… and {more:,} more") + "\n")
+            elif bl is not None:
+                text.insert("end", translate_text("Every line was used.") +
+                            "\n")
+            text.configure(state="disabled")
+            reload_btn.state(["!disabled"] if bl is not None or
+                             self.config.get("alerts.own_blocklist_path")
+                             else ["disabled"])
+
+        def choose(path=None):
+            path = path or filedialog.askopenfilename(
+                parent=win, initialdir=self._dialog_dir(),
+                filetypes=[("Text files", "*.txt *.list *.conf *.hosts"),
+                           ("All files", "*.*")])
+            if path:
+                fill(self.own_blocklist_use(path)[1])
+
+        def reload():
+            path = self.config.get("alerts.own_blocklist_path", "")
+            if path:
+                fill(self.own_blocklist_use(path)[1])
+
+        def stop():
+            self.own_blocklist_stop()
+            fill("Stopped using your own blocklist.")
+        ttk.Button(bar, text="Choose file…", command=choose).pack(
+            side="left")
+        reload_btn = ttk.Button(bar, text="Reload", command=reload)
+        reload_btn.pack(side="left", padx=8)
+        ttk.Button(bar, text="Stop using it", command=stop).pack(
+            side="left")
+        ttk.Button(bar, text="Close", command=win.destroy).pack(
+            side="right")
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.choose, win.reload, win.stop = choose, reload, stop
+        win.status, win.text = status, text
+        fill()
+        return win
+
     def history_status_text(self):
         if self.history is None:
             return ("History is off. Nothing is kept after you close "
@@ -53702,6 +54605,10 @@ proc ::mw_retheme {w map fgnew deffg} {
         """Once a second: hand the model's new observations, lookups,
         timeline events, site ties and finished connections to the store."""
         m = self.model
+        try:
+            self.drain_deep_logins()
+        except Exception:                            # noqa: BLE001
+            LOG.exception("deep logins")
         try:
             live = self._history_live()
             m.obs_sink = live
@@ -57132,7 +58039,7 @@ def _mail_line_label(line):
     return "(content hidden: Email Traffic shows metadata only)"
 
 
-def _dissect_text_lines(d, off, end, proto_name, how):
+def _dissect_text_lines(d, off, end, proto_name, how, dport=None):
     d.begin("text", off, end, how, title=f"{proto_name} (text)")
     p = off
     for line in d.raw[off:end].split(b"\n")[:30]:
@@ -57141,6 +58048,10 @@ def _dissect_text_lines(d, off, end, proto_name, how):
         if m:
             shown = ((m.group("tag") or b"") + m.group("cmd")).decode(
                 "latin-1", "replace") + " (hidden: credentials)"
+        elif proto_name == "Telnet" and dport == 23:
+            # 5.3.4 (IP-013): what is typed into Telnet includes the
+            # password at its prompt; the server's side stays readable
+            shown = f"typed text, {len(clean)} bytes (hidden)"
         elif proto_name in ("SMTP", "POP3", "IMAP"):
             shown = _mail_line_label(clean)
         else:
@@ -57184,7 +58095,7 @@ def _app_layer(d, off, end, transport, sport, dport):
         for p in ports:
             if p in _TEXT_PORTS:
                 return _dissect_text_lines(d, off, end, _TEXT_PORTS[p],
-                                           f"port {p}")
+                                           f"port {p}", dport)
         if data.startswith(b"SSH-"):
             return _dissect_text_lines(d, off, end, "SSH",
                                        "recognised from the content")
@@ -58344,6 +59255,7 @@ class MailSession:
         self.auth_mechs = []
         self.auth_attempts = self.auth_failures = self.auth_ok = 0
         self.auth_before_tls = False
+        self.login_told = False          # IP-013: told once per session
         self.mail_from = self.rcpt = self.messages_sent = 0
         self.data_bytes = 0
         self.commands = Counter()
@@ -58670,6 +59582,13 @@ class MailTracker:
                                 for x in text.split()[1:8]]
 
     # ---- shared -------------------------------------------------------------------
+    # 5.3.4 (IP-013): sign-in methods that put the password (or a token
+    # standing for it) on the wire as it is; challenge-response ones don't
+    CLEAR_MECHS = {"PLAIN": "password in plain text",
+                   "LOGIN": "user name and password",
+                   "USER": "USER and PASS commands",
+                   "XOAUTH2": "sign-in token", "OAUTHBEARER": "sign-in token"}
+
     def _auth(self, no, ts, s, mech):
         s.auth_attempts += 1
         if mech not in s.auth_mechs:
@@ -58677,6 +59596,14 @@ class MailTracker:
         s.note(ts, f"login ({mech})")
         if not s.tls:
             s.auth_before_tls = True
+            if mech in self.CLEAR_MECHS and not s.login_told and \
+                    FEATURES.get("login_warning", True):
+                s.login_told = True
+                self.emit(kind="login", ts=ts, no=no, client=s.client,
+                          server=s.server, port=s.port, proto=s.proto,
+                          how=self.CLEAR_MECHS[mech], result="plain text",
+                          summary=f"{s.proto} login to {s.server} sent "
+                                  f"without encryption")
             if s.auth_attempts == 1:
                 art = "a" if s.proto == "POP3" else "an"
                 self.finding(ts, "warn", "Security",
@@ -58764,6 +59691,7 @@ class ProtocolTracker:
         self.mqtt = {}             # stream -> counters
         self.counts = Counter()
         self.mail = MailTracker(self._emit_kw, self._finding)
+        self.logins = OrderedDict()    # stream -> state (IP-013)
 
     def _emit_kw(self, **t):
         self._emit(**t)
@@ -59016,7 +59944,75 @@ class ProtocolTracker:
                                       ""))
 
     # ---- reassembled messages -----------------------------------------------------
+    # ---- 5.3.4 (IP-013): logins sent without encryption ---------------------------
+    LOGIN_PROMPT = re.compile(rb"pass(word|code|phrase)?\s*:\s*$", re.I)
+    HTTP_BASIC = re.compile(rb"\r\n(proxy-)?authorization:[ \t]*basic[ \t]",
+                            re.I)
+
+    @staticmethod
+    def _ports(st):
+        return {st.key[0][1], st.key[1][1]}
+
+    def _login_state(self, st):
+        key = repr(st.key)
+        state = self.logins.get(key)
+        if state is None:
+            state = self.logins[key] = {"told": False}
+            self._bound(self.logins, self.MAX_PENDING)
+        return state
+
+    def login_watch(self, no, ts, st, m):
+        """Recognise a sign-in that travels as plain text: HTTP Basic, FTP
+        USER/PASS, a Telnet password prompt answered (POP3, IMAP and SMTP
+        are told by the mail tracker). Only that it happened is kept: who,
+        to where, which kind. The password is never copied anywhere."""
+        if m.kind not in ("http", "line") or m.direction != 0:
+            return
+        ports = self._ports(st)
+        if m.kind == "http" and self.HTTP_BASIC.search(m.data[:8192]):
+            proto, how = "HTTP", "HTTP Basic sign-in"
+        elif m.kind == "line" and 21 in ports and \
+                m.data[:5].upper() == b"PASS ":
+            proto, how = "FTP", "USER and PASS commands"
+        elif m.kind == "line" and 23 in ports and self.LOGIN_PROMPT.search(
+                bytes(st.dirs[1].recent[-80:]).rstrip(b"\x00 ")):
+            proto, how = "Telnet", "password typed at a Telnet prompt"
+        else:
+            return
+        state = self._login_state(st)
+        if state["told"]:
+            return
+        state["told"] = True
+        server = st.key[1] if st.a == st.key[0] else st.key[0]
+        self._emit(kind="login", ts=ts, no=no, client=st.a[0],
+                   server=server[0], port=server[1], proto=proto, how=how,
+                   result="plain text",
+                   summary=f"{proto} login to {server[0]} sent without "
+                           f"encryption")
+        self.findings.append((no, ts, "warn", "Security",
+                              f"{st.a[0]} sent a {proto} login to "
+                              f"{server[0]} without encryption (the "
+                              f"password itself is not read by "
+                              f"MiniWireshark)", ""))
+
+    def safe_preview(self, st, m):
+        """A label for a reassembled message that can't hold what was
+        typed into a Telnet session (a password at its prompt) nor a web
+        address's query; None when the usual label is safe."""
+        if m.kind == "line" and 23 in self._ports(st) and m.direction == 0:
+            return f"Telnet: typed text, {len(m.data)} bytes (hidden)"
+        if m.kind == "http":
+            first = m.data.split(b"\r\n", 1)[0][:120].decode("latin-1",
+                                                             "replace")
+            if "?" in first:
+                head, _q, rest = first.partition("?")
+                tail = rest.rsplit(" ", 1)[1] if " " in rest else ""
+                return f"{head}?(query hidden) {tail}".strip()
+        return None
+
     def message(self, no, ts, st, m):
+        if FEATURES.get("login_warning", True):
+            self.login_watch(no, ts, st, m)
         if self.mail.message(no, ts, st, m):
             return None
         key = repr(st.key)
@@ -59200,6 +60196,7 @@ class DeepAnalyzer:
             for m in new_msgs:
                 msgs.append((repr(st.key), m.direction, m.kind, m.start,
                              m.end, m.partial, self.proto.mail.preview(st, m)
+                             or self.proto.safe_preview(st, m)
                              or _deep_preview(m.kind, m.data), no))
             if st is not None and finished:
                 self.proto.closed(st, ts, "reset" if st.reset else "closed")
@@ -59284,6 +60281,7 @@ class DeepAnalyzer:
                     self.proto.message(0, now or 0.0, st, m)
                 msgs.append((repr(st.key), m.direction, m.kind, m.start,
                              m.end, m.partial, self.proto.mail.preview(st, m)
+                             or self.proto.safe_preview(st, m)
                              or _deep_preview(m.kind, m.data), 0))
             self._seen_msgs[st.key] = len(st.messages)
             with contextlib.suppress(ValueError, IndexError, KeyError):
@@ -59404,6 +60402,9 @@ class DeepStore:
         self.by_group = Counter()
         self.lock = threading.Lock()
         self.version = 0
+        # 5.3.4 (IP-013): logins sent without encryption, waiting to
+        # become alerts (who, where and how only)
+        self.logins = deque(maxlen=256)
 
     def add(self, findings, messages, txns=()):
         if not findings and not messages and not txns:
@@ -59412,6 +60413,8 @@ class DeepStore:
             for t in txns:
                 self.txns.append(t)
                 self.by_kind[t.get("kind", "?")] += 1
+                if t.get("kind") == "login":
+                    self.logins.append(t)
             for f in findings:
                 self.findings.append(tuple(f))
                 self.by_sev[f[2]] += 1
@@ -59419,11 +60422,18 @@ class DeepStore:
             self.messages.extend(tuple(m) for m in messages)
             self.version += 1
 
+    def take_logins(self):
+        with self.lock:
+            out = list(self.logins)
+            self.logins.clear()
+        return out
+
     def clear(self):
         with self.lock:
             self.findings.clear()
             self.messages.clear()
             self.txns.clear()
+            self.logins.clear()
             self.by_kind.clear()
             self.by_sev.clear()
             self.by_group.clear()
@@ -64025,6 +65035,382 @@ def t_ip001_snooze_and_co13_clock_step(ctx):
     assert not lw.check({("TCP", "0.0.0.0", 8080): (11, "python")})
     got = lw.check({("TCP", "0.0.0.0", 8080): (12, "nc")})
     assert len(got) == 1 and "nc" in got[0][4], got
+
+
+IP013_CANARY = "IP13CANARYpw7"
+
+
+def ip013_login_frames():
+    """5.3.4 (IP-013): fictional cleartext logins that carry a known
+    password: HTTP Basic, FTP USER/PASS, Telnet (to a plug on the home
+    network), POP3 USER/PASS and IMAP LOGIN."""
+    sb = ScenarioBuilder()
+    sb.home_network()
+    c = IP013_CANARY.encode()
+    me, gw = sb.ME, sb.GW[1]
+    basic = base64.b64encode(b"alex:" + c)
+    sb._tcp_talk(me, "93.184.215.14", gw, 44080, 80, [
+        (0, b"GET /admin HTTP/1.1\r\nHost: shop.example\r\n"
+            b"Authorization: Basic " + basic + b"\r\n\r\n"),
+        (1, b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.21", gw, 44021, 21, [
+        (1, b"220 ftp ready\r\n"), (0, b"USER alex\r\n"),
+        (1, b"331 password please\r\n"), (0, b"PASS " + c + b"\r\n"),
+        (1, b"230 logged in\r\n"), (0, b"QUIT\r\n"), (1, b"221 bye\r\n")])
+    sb._tcp_talk(me, sb.PLUG[0], sb.PLUG[1], 44023, 23, [
+        (1, b"login: "), (0, b"alex\r\n"), (1, b"Password: "),
+        (0, c + b"\r\n"), (1, b"\r\nBusyBox v1.30\r\n# "),
+        (0, b"exit\r\n")])
+    sb._tcp_talk(me, "93.184.215.110", gw, 44110, 110, [
+        (1, b"+OK POP3 ready\r\n"), (0, b"USER alex\r\n"), (1, b"+OK\r\n"),
+        (0, b"PASS " + c + b"\r\n"), (1, b"+OK logged in\r\n"),
+        (0, b"QUIT\r\n"), (1, b"+OK bye\r\n")])
+    sb._tcp_talk(me, "93.184.215.143", gw, 44143, 143, [
+        (1, b"* OK IMAP4rev1 ready\r\n"), (0, b"a1 LOGIN alex " + c + b"\r\n"),
+        (1, b"a1 OK LOGIN completed\r\n"), (0, b"a2 LOGOUT\r\n"),
+        (1, b"* BYE\r\na2 OK LOGOUT\r\n")])
+    return sb.frames
+
+
+def ip013_secret_forms():
+    c = IP013_CANARY.encode()
+    return (IP013_CANARY, base64.b64encode(b"alex:" + c).decode(),
+            c.hex())
+
+
+def ip013_deep_pass(frames, my_ips=()):
+    """The frames through the Full Power deep pass. → DeepStore."""
+    an = DeepAnalyzer(my_ips=my_ips)
+    store = DeepStore()
+    for no, (raw, ts, lt) in enumerate(frames, 1):
+        f, msgs, tx = an.process(no, ts, lt, raw)
+        store.add(f, msgs, tx)
+    m2, t2, f2 = an.flush(frames[-1][1], final=True)
+    store.add(f2, m2, t2)
+    return store
+
+
+@self_test()
+def t_ip013_login_secret_never_stored(ctx):
+    """5.3.4 (IP-013): a password sent without encryption (HTTP Basic,
+    FTP, Telnet, POP3, IMAP) raises "Login sent without encryption" in
+    Full Power, and the password is in no store: alerts, timeline,
+    history, the deep store, the saved session, an export, the log or
+    the packet details. Repeats fold, and "mute for this device" quiets
+    them."""
+    forms = ip013_secret_forms()
+    frames = ip013_login_frames()
+    assert any(IP013_CANARY.encode() in raw for raw, _t, _l in frames), \
+        "the scenario must carry the password to prove this"
+    caught = []
+
+    class _Grab(logging.Handler):
+        def emit(self, record):
+            with contextlib.suppress(Exception):
+                caught.append(self.format(record))
+    grab = _Grab(logging.DEBUG)
+    old_level = LOG.level
+    LOG.addHandler(grab)
+    LOG.setLevel(logging.DEBUG)
+    try:
+        gw, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        m.obs_sink = True                  # as when history is on
+        replay_frames(m, frames, decoder=fast_frame_decoder(m))
+        store = ip013_deep_pass(frames, ips)
+        logins = store.take_logins()
+        assert sorted(t["proto"] for t in logins) == \
+            ["FTP", "HTTP", "IMAP", "POP3", "Telnet"], logins
+        assert not store.take_logins()            # taken once
+        got = [m.deep_login(t) for t in logins]
+        assert all(a is not None and a.kind == "cleartext_login"
+                   for a in got), got
+        sev = {a.reason.rsplit("(", 1)[1].rstrip(")"): a.severity
+               for a in got}
+        assert sev["Telnet"] == "INFO" and sev["HTTP"] == "WARNING", sev
+        # repeats: folded by the debounce, then quieted per device
+        assert m.deep_login(logins[0]) is None
+        a0 = got[0]
+        m.config.set("alerts.muted_devices",
+                     [f"cleartext_login|{a0.device_key}"])
+        m.alerts._debounce.clear()
+        before = m.alerts.suppressed
+        assert m.deep_login(logins[0]) is None
+        assert m.alerts.suppressed == before + 1
+        blobs = {}
+        blobs["alerts"] = json.dumps([alert_to_dict(a) for a in
+                                      m.alerts.alerts.values()])
+        blobs["timeline"] = repr(list(m.timeline)) + repr(m.tl_pending)
+        blobs["feed"] = repr(m.ev_feed)
+        with store.lock:
+            blobs["deep store"] = repr((list(store.findings),
+                                        list(store.messages),
+                                        list(store.txns)))
+        buf = io.StringIO()
+        write_expert_csv(buf, list(store.findings))
+        blobs["expert export"] = buf.getvalue()
+        path = ctx.path("ip013-session.json")
+        atomic_write_json(path, SessionCodec.serialize(m, {}), compact=True)
+        with open(path, "rb") as f:
+            blobs["saved session"] = f.read().decode("latin-1")
+        st = Store(ctx.path("ip013.sqlite3"), session_id=7)
+        assert st.write_events(list(m.tl_pending))
+        assert st.flush_now(10)
+        st.stop(5)
+        hist = b""
+        for suffix in ("", "-wal"):
+            with contextlib.suppress(OSError):
+                with open(st.path + suffix, "rb") as f:
+                    hist += f.read()
+        assert b"login sent without encryption" in hist
+        blobs["history"] = hist.decode("latin-1")
+        rows = []
+        for raw, ts, lt in frames:
+            d = fast_decode(raw, ts, lt)
+            rows.append(repr({k: v for k, v in d.items()
+                              if k not in ("raw", "pkt", "payload")}))
+            rows.append(dissect(raw, lt).text())
+        blobs["packet rows and details"] = "\n".join(rows)
+        blobs["log"] = "\n".join(caught)
+        for where, text in blobs.items():
+            for form in forms:
+                assert form not in text, f"the password leaked into {where}"
+        # the switch off: no login is reported
+        old = FEATURES.get("login_warning", True)
+        FEATURES["login_warning"] = False
+        try:
+            assert not ip013_deep_pass(frames, ips).take_logins()
+        finally:
+            FEATURES["login_warning"] = old
+    finally:
+        LOG.removeHandler(grab)
+        LOG.setLevel(old_level)
+
+
+@self_test()
+def t_ip010_own_blocklist(ctx):
+    """5.3.4 (IP-010): your own blocklist file: addresses, ranges (IPv4 and
+    IPv6) and names, comments and hosts-file lines; private and local
+    entries refused with a reason; a count and a size cap; read only when
+    picked or reloaded; matches raise the usual reputation alert, never
+    DANGER on its own."""
+    path = ctx.path("my-blocklist.txt")
+    lines = ["# my list", "", "45.9.20.1", "45.9.30.0/24  # a range",
+             "2a06:e480::/29", "badsite.example", "*.tracker.example",
+             "0.0.0.0 ads.example", "; old style comment",
+             "192.168.1.0/24", "10.0.0.5", "fe80::1", "8.0.0.0/4",
+             "printer.local", "localhost", "not-an-entry!!", "a.example b",
+             "45.9.20.2 # inline comment", "2a06:e480::/29"]
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("﻿" + "\n".join(lines) + "\n")
+    bl = load_own_blocklist(path)
+    c = bl.counts()
+    assert c["addresses"] == 2 and c["ranges"] == 2 and c["domains"] == 3, c
+    assert c["ipv6"] == 1 and c["rejected"] == 8, (c, bl.rejected)
+    why = {line: reason for _n, line, reason in bl.rejected}
+    assert why["192.168.1.0/24"] == OWN_REASON_PRIVATE
+    assert why["10.0.0.5"] == why["fe80::1"] == OWN_REASON_PRIVATE
+    assert why["8.0.0.0/4"] == OWN_REASON_WIDE
+    assert why["printer.local"] == why["localhost"] == OWN_REASON_LOCAL
+    assert why["not-an-entry!!"] == OWN_REASON_BAD
+    assert why["a.example b"] == OWN_REASON_MANY
+    assert bl.lookup("45.9.30.7") == "range 45.9.30.0/24"
+    assert bl.lookup("45.9.20.2") == "45.9.20.2"
+    assert bl.lookup("2a06:e480::9").startswith("range")
+    assert bl.lookup("45.9.31.1") == "" and bl.lookup("192.168.1.5") == ""
+    assert bl.lookup_domain("www.badsite.example") == "badsite.example"
+    assert bl.lookup_domain("x.tracker.example") == "tracker.example"
+    assert bl.lookup_domain("ads.example") == "ads.example"
+    assert bl.lookup_domain("badsite.example.org") == ""
+    assert bl.lookup_domain("example") == ""
+    # the caps: a count and a size
+    small = load_own_blocklist(path, max_entries=2)
+    assert len(small) == 2 and "first 2 entries" in small.capped
+    big = ctx.path("big-blocklist.txt")
+    with open(big, "w", encoding="utf-8") as f:
+        for i in range(3000):
+            f.write(f"45.{i // 250}.{i % 250}.1\n")
+    cut = load_own_blocklist(big, max_bytes=4096)
+    assert cut.size <= 4096 and 0 < len(cut) < 3000 and cut.capped
+    assert cut.rejected_count == 0          # never half a line
+    # never fetched: nothing is sent, and nothing is read on its own
+    sent = len(LEDGER.snapshot())
+    gen = _REP_GEN[0]
+    old = OWN_BLOCKLIST[0]
+    try:
+        use_own_blocklist(path)
+        assert _REP_GEN[0] == gen + 1 and len(LEDGER.snapshot()) == sent
+        rdb = reputation_db()
+        hits = rdb.lookup("45.9.20.1")
+        assert hits and hits[0][0] == OWN_BLOCKLIST_SOURCE, hits
+        assert rdb.lookup("192.168.1.5") == []
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("45.9.99.9\n")
+        assert reputation_db().lookup("45.9.99.9") == []   # not re-read
+        use_own_blocklist(path)                             # Reload
+        assert reputation_db().lookup("45.9.99.9")
+        # a device contacts a listed address and looks up a listed name
+        gw, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        sb = ScenarioBuilder()
+        sb.home_network()
+        sb._tcp_talk(sb.PHONE, "45.9.20.1", sb.GW[1], 45001, 443,
+                     [(0, b"\x16\x03\x01\x00\x05hello")])
+        replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+        rep = [a for a in m.alerts.alerts.values() if a.kind == "reputation"]
+        assert len(rep) == 1 and rep[0].severity == "WARNING", rep
+        assert rep[0].reason.endswith("contacted an address on your own "
+                                      "blocklist"), rep[0].reason
+        phone = m.device_for(sb.PHONE[0])
+        m.register_website("cdn.badsite.example", "45.9.40.1", phone, "DNS")
+        named = [a for a in m.alerts.alerts.values()
+                 if a.kind == "reputation" and "name" in a.reason]
+        assert len(named) == 1 and named[0].reason.endswith(
+            "looked up a name on your own blocklist"), named
+        assert "badsite.example" in named[0].observed
+        # with a public list too: still a warning (your list may be a copy)
+        e = AlertEngine(ctx.cfg({}))
+        a = e.reputation(phone, "45.9.20.1", 443, [
+            (OWN_BLOCKLIST_SOURCE, "45.9.20.1", ""),
+            ("abuse.ch Feodo Tracker", "45.9.20.1", "")])
+        assert a.severity == "WARNING" and "your own blocklist and a " \
+            "public blocklist" in a.reason, a.reason
+        # the switch off: the list is not used
+        FEATURES["own_blocklist"] = False
+        try:
+            r = reputation_db()
+            assert r is None or not r.lookup("45.9.20.1")
+        finally:
+            FEATURES["own_blocklist"] = True
+        assert use_own_blocklist(None) is None and reputation_db() is None \
+            or not reputation_db().lookup("45.9.20.1")
+    finally:
+        OWN_BLOCKLIST[0] = old
+        _REP_GEN[0] += 1
+    for text in (OWN_REASON_PRIVATE, OWN_REASON_WIDE, OWN_REASON_LOCAL,
+                 OWN_REASON_BAD, OWN_REASON_MANY):
+        for loc in ("fr", "es"):
+            assert translate_text(text, loc) != text, (loc, text)
+
+
+@self_test()
+def t_m9_gateway_change_from_packets(ctx):
+    """5.3.4 (M9): the router's hardware address changes, told from
+    packets. A router replaced for good (the old one silent, the new one
+    answering and forwarding) gives one "Gateway identity changed"
+    warning and no ARP-spoofing alarm, and the new router is trusted; a
+    second device answering while the router still answers is ARP
+    spoofing (DANGER) and never trusted."""
+    S = ScenarioBuilder
+    NEW = "00:1e:58:bb:00:02"
+    ATT = "02:66:66:66:66:66"
+
+    def arp(b, mac, dt):
+        b._emit(PK.Ether(src=mac, dst=S.ME[1]) /
+                PK.ARP(op=2, psrc=S.GW[0], hwsrc=mac, pdst=S.ME[0],
+                       hwdst=S.ME[1]), dt=dt)
+
+    def forward(b, mac, dt):
+        b._emit(PK.Ether(src=mac, dst=S.ME[1]) /
+                PK.IP(src="93.184.215.14", dst=S.ME[0]) /
+                PK.UDP(sport=443, dport=50000) / PK.Raw(b"x" * 40), dt=dt)
+
+    def fresh():
+        gw, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        b = S()
+        b.home_network()
+        arp(b, S.GW[1], 1)
+        replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+        b.frames = []
+        return m, b
+
+    def kinds(m):
+        return Counter(a.kind for a in m.alerts.alerts.values())
+    # the replacement: the old router goes quiet, a new one takes over
+    m, b = fresh()
+    assert m.registry.gw_macs == {S.GW[1].lower()}
+    arp(b, NEW, 600)
+    for sec in range(120):
+        forward(b, NEW, 0.5)
+        if sec % 30 == 0:
+            arp(b, NEW, 0.01)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m), tick_every=20)
+    k = kinds(m)
+    assert k["gateway_change"] == 1 and not k["arp_spoof"], k
+    gc = [a for a in m.alerts.alerts.values() if a.kind == "gateway_change"]
+    assert gc[0].severity == "WARNING" and gc[0].device_key == \
+        f"ip:{S.GW[0]}"
+    assert NEW in m.registry.gw_macs, (m.registry.gw_macs,
+                                       m.registry.gw_candidates)
+    # the replacement marked as expected: it says nothing again
+    m.config.set("alerts.expected", [f"gateway_change|{gc[0].subject}"])
+    m.alerts._debounce.clear()
+    assert m.alerts.gateway_change(S.GW[0], 3) is None
+    # impersonation: the router keeps answering and forwarding
+    m, b = fresh()
+    for sec in range(120):
+        arp(b, ATT, 0.5)
+        forward(b, S.GW[1], 0.5)
+        if sec % 30 == 0:
+            arp(b, S.GW[1], 0.01)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m), tick_every=20)
+    spoof = [a for a in m.alerts.alerts.values() if a.kind == "arp_spoof"]
+    assert spoof and spoof[0].severity == "DANGER", kinds(m)
+    assert ATT not in m.registry.gw_macs, m.registry.gw_macs
+    assert m.registry.ip_to_key.get(S.GW[0]) == S.GW[1].lower()
+
+
+@self_test()
+def t_m9_unusual_findings(ctx):
+    """5.3.4 (M9, MC6): the Unusual activity section takes the open alerts
+    that are a statistical judgment (baseline findings, a new service...)
+    newest first, each with both readings and one next step; other
+    alerts and acknowledged ones stay out; every fixed sentence is
+    translated."""
+    clock = [1761600000.0]
+    e = AlertEngine(ctx.cfg({}), now_fn=lambda: clock[0])
+    reg = DeviceRegistry("192.168.1.1", set(), ctx.cfg({}),
+                         now_fn=lambda: clock[0])
+    dev = reg.touch("192.168.1.60", "24:0a:c4:60:00:60", "arp_reply", "x",
+                    clock[0])
+    assert e.new_device(dev) is not None                  # not unusual
+    up = e.baseline_anomaly(dev, "bytes_up", 5e6, 2e4,
+                            note="first time active at night")
+    clock[0] += 60
+    svc = e.unusual_service(dev, 23, "203.0.113.9", [443])
+    clock[0] += 60
+    spike = e.baseline_anomaly(dev, "new_conns", 300, 4)
+    found = unusual_findings(e)
+    assert [f["id"] for f in found] == [spike.id, svc.id, up.id], found
+    f = found[2]
+    assert f["problem"] == UNUSUAL_PROBLEM["upload_spike"]
+    assert f["normal"] == ALERT_MEANS["upload_spike"]
+    assert f["step"] == UNUSUAL_STEP["upload_spike"]
+    assert f["saw"] == up.observed and "Why now: first time active at " \
+        "night" in f["evidence"]
+    e.acknowledge(svc.id)
+    assert [x["id"] for x in unusual_findings(e)] == [spike.id, up.id]
+    assert len(unusual_findings(e, limit=1)) == 1
+    assert unusual_card_text(0) == "Nothing unusual right now."
+    assert unusual_card_text(1).startswith("1 thing is unusual")
+    assert unusual_card_text(3) == "3 things are unusual: see both " \
+        "readings."
+    assert set(UNUSUAL_PROBLEM) == set(UNUSUAL_STEP) == set(UNUSUAL_KINDS)
+    texts = (list(UNUSUAL_PROBLEM.values()) + list(UNUSUAL_STEP.values()) +
+             [ALERT_MEANS[k] for k in UNUSUAL_KINDS] +
+             [unusual_card_text(n) for n in (0, 1, 4)] +
+             ["Could be a problem", "Could be normal", "What we saw:",
+              "Next step:", "Unusual activity"])
+    for text in texts:
+        for loc in ("fr", "es"):
+            assert translate_text(text, loc) != text, (loc, text)
 
 
 @self_test()
@@ -75299,6 +76685,224 @@ def gt_534_notify_minimised(app, ctx):
                 del m.alerts._open[(a.kind, a.subject)]
         app.tabs["alerts"].rebuild()
         root.title("MiniWireshark")
+
+
+@gui_test_step("5.3.4 M9: Unusual activity — the Security section with both "
+               "readings, acknowledge and snooze, the Dashboard card, your "
+               "own blocklist, and a login password that is never stored")
+def gt_534_unusual_activity(app, ctx):
+    root = app.root
+    m = app.model
+    S = ScenarioBuilder
+    eng = m.alerts
+    plug = m.device_for(S.PLUG[0], S.PLUG[1])
+    assert plug is not None
+    snoozed0 = dict(app.config.get("alerts.snoozed", {}) or {})
+    eng._debounce.clear()
+    a1 = m._alert(eng.baseline_anomaly(plug, "bytes_up", 6e6, 2e4,
+                                       note="first time active at night"))
+    a2 = m._alert(eng.unusual_service(plug, 23, "203.0.113.9", [443]))
+    assert a1 is not None and a2 is not None
+    try:
+        # the Dashboard card counts them and opens the section
+        dash = app._select_tab("dash")
+        _gui_pump(root, 0.4)
+        assert dash.unusual_card is not None and \
+            dash.unusual_card.winfo_ismapped()
+        n = len(unusual_findings(eng))
+        assert n >= 2 and dash.show_unusual_card() == unusual_card_text(n)
+        dash.unusual_lbl.event_generate("<Button-1>")
+        _gui_pump(root, 0.3, lambda: app.current_tab_name() == "security",
+                  timeout=10)
+        sec = app.tabs["security"]
+        assert app.current_tab_name() == "security"
+        sec.refresh()
+        _gui_pump(root, 0.3)
+        sec_u = sec.unusual
+        assert sec_u is not None and sec_u.frame.winfo_ismapped()
+        assert sec.text.index(str(sec_u.frame)) == "1.0"          # on top
+        assert len(sec_u.cards) == min(n, sec_u.SHOW)
+        f, card, btns = sec_u.cards[0]
+        assert f["id"] in (a1.id, a2.id)
+
+        def texts(w):
+            out = []
+            for c in w.winfo_children():
+                if isinstance(c, tk.Label):
+                    out.append((c, str(c.cget("text"))))
+                out += texts(c)
+            return out
+        shown = texts(card)
+        words = [t for _c, t in shown]
+        assert "Could be a problem" in words and "Could be normal" in words
+        assert f["problem"] in words and f["normal"] in words, words
+        assert any(t.startswith("What we saw:") for t in words)
+        assert any(t.startswith("Next step:") for t in words)
+        # the two readings sit side by side
+        bad_lbl = next(c for c, t in shown if t == "Could be a problem")
+        good_lbl = next(c for c, t in shown if t == "Could be normal")
+        assert abs(bad_lbl.winfo_rooty() - good_lbl.winfo_rooty()) <= 2
+        assert good_lbl.winfo_rootx() > bad_lbl.winfo_rootx() + 100
+        # nothing cut off or drawn over, here and narrow, in French, Dark
+        old = (app.config.get("general.language"),
+               app.config.get("appearance.theme"),
+               app.config.get("appearance.text_size"), root.geometry())
+        found = []
+        try:
+            for lang, theme, size, geo in (
+                    ("English", "Light", "Normal", "1366x768"),
+                    ("Français", "Dark", "Large", "1024x768")):
+                app.config.set("general.language", lang)
+                app.config.set("appearance.theme", theme)
+                app.config.set("appearance.text_size", size)
+                app._apply_runtime_settings()
+                root.geometry(geo)
+                _gui_pump(root, 0.6)
+                for name, top in (("security", sec_u.frame),
+                                  ("dash", dash.unusual_card)):
+                    app._select_tab(name)
+                    if name == "security":
+                        sec_u.refresh(force=True)
+                    _gui_pump(root, 0.5)
+                    found += [f"{lang}/{geo} {name}: {k} {p[-50:]} {d}"
+                              for k, p, d in layout_audit(top)]
+                if lang == "Français":
+                    words = [t for _c, t in texts(sec_u.frame)]
+                    assert "Peut-être un problème" in words, words
+                    assert translate_text("Unusual activity") in " ".join(
+                        words)
+        finally:
+            app.config.set("general.language", old[0])
+            app.config.set("appearance.theme", old[1])
+            app.config.set("appearance.text_size", old[2])
+            app._apply_runtime_settings()
+            root.geometry(old[3])
+            _gui_pump(root, 0.5)
+        assert not found, "\n".join(found[:10])
+        app._select_tab("security")
+        sec_u.refresh(force=True)
+        _gui_pump(root, 0.2)
+        # acknowledge from the card: it leaves the section
+        f = sec_u.cards[0][0]
+        sec_u.cards[0][2]["ack"].invoke()
+        _gui_pump(root, 0.2)
+        assert eng.alerts[f["id"]].acknowledged
+        assert f["id"] not in [x["id"] for x in unusual_findings(eng)]
+        # snooze from the card: as in the Alerts tab (IP-001)
+        f = sec_u.cards[0][0]
+        sec_u.cards[0][2]["snooze"].invoke()
+        _gui_pump(root, 0.2)
+        tag = f"{f['kind']}|{f['device']}"
+        assert tag in (app.config.get("alerts.snoozed", {}) or {})
+        assert eng.alerts[f["id"]].acknowledged
+    finally:
+        app.config.set("alerts.snoozed", snoozed0)
+        for a in (a1, a2):
+            eng.alerts.pop(a.id, None)
+            with contextlib.suppress(ValueError):
+                eng.order.remove(a.id)
+    # your own blocklist: pick, rejected lines with reasons, reload, stop
+    path = ctx.path("own-blocklist.txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("# test\n45.9.20.1\n192.168.1.0/24\nbadsite.example\n")
+    old_bl, old_path = OWN_BLOCKLIST[0], app.config.get(
+        "alerts.own_blocklist_path", "")
+    win = app.open_own_blocklist()
+    try:
+        _gui_pump(root, 0.3)
+        win.choose(path)
+        _gui_pump(root, 0.2)
+        st = str(win.status.cget("text"))
+        assert "1 addresses, 0 ranges and 1 names" in st, st
+        body = win.text.get("1.0", "end")
+        assert "192.168.1.0/24" in body and OWN_REASON_PRIVATE in body
+        assert app.config.get("alerts.own_blocklist_path") == path
+        assert reputation_db().lookup("45.9.20.1")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("45.9.20.2\n")
+        win.reload()
+        assert "2 addresses" in str(win.status.cget("text"))
+        found = layout_audit(win)
+        assert not found, found[:5]
+        win.stop()
+        assert OWN_BLOCKLIST[0] is None and \
+            app.config.get("alerts.own_blocklist_path") == ""
+    finally:
+        with contextlib.suppress(tk.TclError):
+            win.destroy()
+        OWN_BLOCKLIST[0] = old_bl
+        app.config.set("alerts.own_blocklist_path", old_path)
+        _REP_GEN[0] += 1
+    # IP-013 through the real window in Full Power: the alert shows, the
+    # password is nowhere
+    forms = ip013_secret_forms()
+    app.config.set("performance.mode", "Full Power")
+    app.config.set("performance.deep_runner", "Thread")
+    try:
+        ident = scenario_identity()
+        m2 = app._new_model(identity=ident[:3])
+        m2.set_identity(local_nets=ident[3])
+        app.replace_model(m2)
+        app.data_mode = "live"
+        app._pump_store(reschedule=False)
+        sink = app.lossless_sink()
+        frames = ip013_login_frames()
+        for raw, ts, lt in frames:
+            sink(raw, ts, lt)
+        _gui_pump(root, until=lambda: app.count >= len(frames), timeout=30)
+        assert app.deep.drain(20)
+        app.deep.flush(final=True)
+        _gui_pump(root, 0.5)
+        app._pump_store(reschedule=False)
+        logins = [a for a in app.model.alerts.alerts.values()
+                  if a.kind == "cleartext_login"]
+        assert sorted(a.reason.rsplit("(", 1)[1].rstrip(")")
+                      for a in logins) == ["FTP", "HTTP", "IMAP", "POP3",
+                                           "Telnet"], [a.reason for a in
+                                                       logins]
+        atab = app._select_tab("alerts")
+        _gui_pump(root, 0.4)
+        app._pump_store(reschedule=False)
+        out = {}
+        out["alert texts"] = "\n".join(app.alert_text(a) for a in logins)
+        out["session"] = json.dumps(SessionCodec.serialize(
+            app.model, app.session_meta()), default=str)
+        out["html report"] = ReportBuilder(app).build("full")
+        app._ask_save = lambda *a, **k: ctx.path("ip013.csv")
+        app._export_csv(False)
+        assert _gui_pump(root, 0, lambda: os.path.exists(ctx.path(
+            "ip013.csv")) and not app.jobs.busy(), timeout=30)
+        with open(ctx.path("ip013.csv"), encoding="utf-8") as fh:
+            out["csv export"] = fh.read()
+        out["debug bundle"] = app.debug_bundle_text(masked=False)
+        out["diagnostics"] = DiagnosticsWindow.collect(app)
+        with open(PATHS.log_file, encoding="utf-8", errors="replace") as fh:
+            out["log"] = fh.read()
+        if app.history is not None:
+            for suffix in ("", "-wal"):
+                with contextlib.suppress(OSError):
+                    with open(app.history.path + suffix, "rb") as fh:
+                        out["history db" + suffix] = fh.read().decode(
+                            "latin-1")
+        out["timeline"] = repr(list(app.model.timeline))
+        with app.deep.store.lock:
+            out["deep store"] = repr((list(app.deep.store.findings),
+                                      list(app.deep.store.messages),
+                                      list(app.deep.store.txns)))
+        out["alerts table"] = repr([atab.tree.item(i, "values")
+                                    for i in atab.tree.get_children()])
+        ptab = app.tabs["packets"]
+        for d in list(app.all_rows)[-len(frames):]:
+            ptab.select_no(d["no"])
+            out["packet details"] = out.get("packet details", "") + \
+                ptab.details.get("1.0", "end")
+        for where, text in out.items():
+            for form in forms:
+                assert form not in text, f"the password leaked into {where}"
+    finally:
+        app.config.set("performance.mode", "Automatic")
+        app.config.set("performance.deep_runner", "Automatic")
+        app.data_mode = "idle"
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
