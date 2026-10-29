@@ -12086,11 +12086,24 @@ class AnalysisWorker(threading.Thread):
         self.window_frozen = 0.0   # seconds the Tk thread missed its checks
         self.overload = OverloadGuard()      # 5.3.4 (M13, IP-025)
 
+    def _overload_fill(self, ring):
+        """How full the queue counts as for OverloadGuard: only a live
+        capture with deep analysis running (5.3.4 review: the one thing
+        being too busy can pause); else 0."""
+        dp = getattr(self.app, "deep", None)
+        if getattr(self.app, "data_mode", "") != "live" or dp is None:
+            return 0.0
+        try:
+            return OverloadGuard.fill(ring) if dp.active() else 0.0
+        except Exception:                            # noqa: BLE001
+            return 0.0
+
     def reset(self):
         """New session: fresh reassembly state and counters."""
         self.reasm = TlsReassembler()
         self.decoded = self.errors = self.stale = self.deep = 0
         self.last_error = ""
+        self.overload = OverloadGuard()
 
     # While packets are being analysed, Python hands the interpreter to
     # another thread every 1 ms instead of every 5 ms, so the window gets
@@ -12129,9 +12142,7 @@ class AnalysisWorker(threading.Thread):
             self._switch_interval(bool(batch), now)
             # only a live capture can lose packets: a file or the demo
             # waits for room, so its full queue is not an overload
-            self.overload.update(
-                OverloadGuard.fill(ring) if getattr(
-                    self.app, "data_mode", "") == "live" else 0.0, now)
+            self.overload.update(self._overload_fill(ring), now)
             if not batch:
                 self.busy = False
                 continue
@@ -14135,7 +14146,9 @@ class DeviceRegistry:
         """Something you set on it (a name, notes, a kind, a flag)."""
         return bool(dev.alias or dev.notes or dev.mine or dev.expected or
                     dev.pinned_no_merge or dev.never_merge or
-                    dev.user_class or dev.place or dev.owner)
+                    dev.user_class or dev.place or dev.owner or
+                    # 5.3.4 review: a merge you made can still be undone
+                    any(not h.get("auto") for h in dev.merge_history))
 
     def prune_expired(self, keep=None):
         """5.3.4 (M13, CO-03): expired devices were never dropped, so a
@@ -14159,6 +14172,12 @@ class DeviceRegistry:
             self.pruned[dev.key] = dev.last_confirmed
             self.removed.append(dev.key)
             gone.append(dev.key)
+        if gone:
+            # 5.3.4 review: names merged into a dropped device no longer
+            # point at it (a returning address starts afresh)
+            dropped = set(gone)
+            for k in [k for k, v in self.alias.items() if v in dropped]:
+                del self.alias[k]
         while len(self.pruned) > 20 * max(1, keep):
             self.pruned.popitem(last=False)
         return gone
@@ -21311,6 +21330,11 @@ class NetworkModel:
             nets.own = getattr(local_nets, "own", True)
             self.local_nets = nets
             self.registry.local_nets = self.local_nets
+        if local_nets is not None or v6_prefixes is not None:
+            # 5.3.4 review: both memos start again; keyed by id() alone, a
+            # new list could reuse a freed one's id and keep old answers
+            self._routed_memo = None
+            self.registry._elig_sig = None
         if v6_prefixes is not None:
             self.v6_prefixes = list(v6_prefixes)
             self.registry.v6_prefixes = self.v6_prefixes
@@ -21689,7 +21713,7 @@ class NetworkModel:
         the router, so the frame's MAC is the router's, not that host's.
         (5.3.4, M13: remembered per address until the subnets change.)"""
         nets = self.local_nets
-        sig = (id(nets), len(nets))
+        sig = (id(nets), len(nets))         # reset by set_identity too
         memo = getattr(self, "_routed_memo", None)
         if memo is None or memo[0] != sig:
             memo = self._routed_memo = (sig, {})
@@ -50832,6 +50856,10 @@ proc ::mw_retheme {w map fgnew deffg} {
             if len(getattr(m, attr)) > keep:
                 setattr(m, attr, set())
                 self._rebuild_on_restore = True
+        gone = m.registry.removed            # 5.3.4 review: dropped keys
+        if len(gone) > keep:
+            del gone[:]
+            self._rebuild_on_restore = True
 
     def _flush_flows(self, m):
         m.flows.closed_now.clear()
@@ -66120,6 +66148,55 @@ def t_m13_overload_degrade(ctx):
     assert "counting only" in OVERLOAD_TEXT
     for loc in ("fr", "es"):
         assert translate_text(OVERLOAD_TEXT, loc) != OVERLOAD_TEXT, loc
+
+
+@self_test()
+def t_m13_review_memos_prune_overload(ctx):
+    """5.3.4 review of M13: new subnets reset both address memos (a new
+    list can reuse a freed one's id); a merge you made keeps a device in
+    memory, and a dropped device leaves no alias behind; "too busy" only
+    turns on while deep analysis runs."""
+    A, B, C = ([ipaddress.ip_network(n)] for n in
+               ("192.168.1.0/24", "172.16.0.0/24", "10.0.0.0/24"))
+    m = NetworkModel(ctx.cfg(), "192.168.1.1", {"192.168.1.5"}, set())
+    m.set_identity(local_nets=A)
+    assert m._routed_private_v4("10.0.0.7")
+    assert not m.registry.eligible_ip("10.0.0.7")
+    m.set_identity(local_nets=B)
+    m.set_identity(local_nets=C)
+    assert not m._routed_private_v4("10.0.0.7")
+    assert m.registry.eligible_ip("10.0.0.7")
+    m = NetworkModel(ctx.cfg(), "192.168.1.1", {"192.168.1.5"}, set())
+    m.set_identity(local_nets=A)
+    reg, now = m.registry, 2e9
+    m.offline_now, m.use_packet_clock = now, True
+    K, O, P = "02:00:00:00:00:0a", "02:00:00:00:00:0b", "02:00:00:00:00:0c"
+    for mac, ip in ((K, "192.168.1.20"), (O, "192.168.1.21"),
+                    (P, "192.168.1.22")):
+        reg.touch(ip, mac, "arp_reply", "x", now - 5000)
+    m.correct_merge(K, O)
+    reg.by_key[K].state = reg.by_key[P].state = STATE_EXPIRED
+    assert reg.labelled(reg.by_key[K]) and reg.prune_expired(keep=0) == [P]
+    reg.by_key[K].merge_history[0]["auto"] = True        # an automatic one
+    assert reg.prune_expired(keep=0) == [K] and O not in reg.alias
+    dev = reg.touch("192.168.1.21", O, "arp_reply", "back", now)
+    assert dev.key == O == dev.mac
+    h = _PipelineHarness(scenario_model(ctx.cfg(), []))
+    h.data_mode = "live"
+    w = AnalysisWorker(h, GuiGate())
+    class _Ring(list):
+        max_frames, bytes, max_bytes = 100, 0, 1
+    ring = _Ring(range(95))
+    h.deep = None
+    assert w._overload_fill(ring) == 0.0      # no deep analysis: never on
+    h.deep = types.SimpleNamespace(active=lambda: False)
+    assert w._overload_fill(ring) == 0.0
+    h.deep = types.SimpleNamespace(active=lambda: True)
+    assert w._overload_fill(ring) > 0.5
+    w.overload.update(0.9, 10.0)
+    w.overload.update(0.9, 13.0)
+    w.reset()
+    assert not w.overload.active              # a new session starts calm
 
 
 @self_test()
