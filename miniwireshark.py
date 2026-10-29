@@ -10827,6 +10827,7 @@ FEATURES = {
     "warm_start": True,      # the window is built behind the loading screen
     "win_timer": True,       # 1 ms Windows timer while busy (5.2.3, B-06)
     "ready_panel": True,     # "Ready?" lines in the Welcome Center (5.3.4)
+    "story_mode": True,      # the Timeline tells what changed by day (M7)
 }
 
 
@@ -10986,6 +10987,8 @@ FEATURE_HELP = {
                  "only while the window is busy",
     "ready_panel": "the Welcome Center lists what is ready and how to fix "
                    "what isn't",
+    "story_mode": "the Timeline can tell what changed as a story, day by "
+                  "day, with a Dashboard card",
 }
 
 
@@ -19695,7 +19698,44 @@ class NetworkModel:
 
     def _baseline_check(self, dev, snap):
         for feat, v, m in self.baselines.check(snap):
-            self._alert(self.alerts.baseline_anomaly(dev, feat, v, m))
+            a = self._alert(self.alerts.baseline_anomaly(dev, feat, v, m))
+            if a is not None and not a.updated and \
+                    feat in ("bytes_up", "bytes_down"):
+                self._spike_story(dev, a, feat == "bytes_up", v)
+
+    def spike_program(self, dev, upload, since):
+        """5.3.4 (IP-022): the program behind this computer's busiest
+        connection since `since`, from the name stored on the connection
+        when the operating system's table was read (live only). None: not
+        this computer, or not live; "": the program isn't known (a short
+        connection, no psutil, or no admin rights)."""
+        if self.use_packet_clock or not dev or \
+                dev.key != self.my_device_key():
+            return None
+        best, most = None, 0
+        recent = list(self.flows.active.values())[-3000:] + \
+            list(self.flows.archive)[-500:]
+        for f in recent:
+            if f.device_key != dev.key or f.last_seen < since:
+                continue
+            b = f.bytes_out if upload else f.bytes_in
+            if b > most:
+                best, most = f, b
+        return program_short_name(best.process) if best is not None else ""
+
+    def _spike_story(self, dev, a, upload, value):
+        """One plain sentence on the Timeline (kept in the history, so the
+        story of a past day still names the program): "At 14:02 chrome.exe
+        on this computer sent 80.0 MB in one minute"."""
+        start = (int(self.now() // 60) - 1) * 60.0
+        prog = self.spike_program(dev, upload, start)
+        if prog is not None:
+            a.refs["program"] = prog or "?"
+        text = spike_sentence(hm_clock(start), dev.display_name(), upload,
+                              _human_bytes(value), prog is not None,
+                              prog or "")
+        return self.push_timeline("traffic spike", "INFO", text,
+                                  ("device", dev.key), dev.key)
 
     # ---- friendly feed ------------------------------------------------------
     def friendly_who(self, ip, mac):
@@ -20066,7 +20106,7 @@ def _default_config():
                     "explanation_verbosity": "Normal", "language": "English",
                     "upgraded_from_3": False, "show_welcome": True,
                     "welcome_version": "", "tours_done": [],
-                    "tips": True},
+                    "tips": True, "story_seen": 0.0},
         "accessibility": {"colorblind": "Off", "ui_scale": "Automatic"},
         "appearance": {"theme": "Light", "beginner_mode": True,
                        "high_contrast": False, "text_size": "Normal",
@@ -21298,6 +21338,27 @@ class Store:
 HistoryStore = Store          # 3.0 name
 
 
+def history_domain_rows(websites, limit=5000):
+    """The daily "domains" snapshot: (site, requests, bytes), one row per
+    site. 5.3.4 (CO-14): the sub-domains of a site (www., m., a., b.) add
+    up; each was written under the site's name and replaced the one
+    before, so the day kept whichever came last. The busiest `limit`
+    sites are kept."""
+    per = {}
+    for w in list(websites.values()):
+        r = w.registrable or w.domain
+        if not r:
+            continue
+        got = per.get(r)
+        per[r] = (w.requests, w.bytes) if got is None else \
+            (got[0] + w.requests, got[1] + w.bytes)
+    rows = [(r, req, b) for r, (req, b) in per.items()]
+    if len(rows) > limit:
+        rows.sort(key=lambda x: (-x[1], -x[2], x[0]))
+        rows = rows[:limit]
+    return rows
+
+
 def bench_store(n=100000):
     tmp = tempfile.mkdtemp()
     st = Store(os.path.join(tmp, "b.sqlite3"))
@@ -21324,67 +21385,412 @@ CHANGE_PERIODS = {"Last hour": 3600, "Last 24 hours": 86400,
                   None}
 
 
+DIGEST_KEYS = ("new_devices", "returned", "left", "new_sites", "ip_changes",
+               "dns_changes", "network", "alerts", "spikes")
+DIGEST_KINDS = {"device back": "returned", "device left": "left",
+                "ip changed": "ip_changes", "dns change": "dns_changes",
+                "network": "network", "interface": "network",
+                "rogue router": "network", "internet": "network",
+                "traffic spike": "spikes"}
+
+
 def change_digest(model, store=None, since=0.0, until=None):
     """What changed between `since` and `until`: new / returning / gone
-    devices, first-seen websites, address and DNS changes, network events
-    and warnings. In-memory data first; older periods come from the
-    history store (if enabled)."""
+    devices, first-seen websites, address and DNS changes, network events,
+    traffic spikes and warnings. In-memory data first; older periods come
+    from the history store (if enabled)."""
     until = until or model.now()
+    out = digest_new(since, until)
+    for _ in digest_memory_steps(model, out):
+        pass
+    if store is not None:
+        digest_add_store(out, store)
+    return digest_sort(out)
+
+
+def digest_new(since, until):
+    out = {k: [] for k in DIGEST_KEYS}
+    out.update({"since": since, "until": until, "from_store": 0})
+    return out
+
+
+def digest_memory_steps(model, out, chunk=2000):
+    """The in-memory half of change_digest, a slice at a time. 5.3.4 (M7):
+    the Story job takes the GuiGate for one step and gives the window its
+    turn in between; the first step copies what it reads, so the analysis
+    thread may change the model meanwhile."""
+    since, until = out["since"], out["until"]
     reg = model.registry
     own = set(model.my_ips) | {model.gateway_ip}
-    out = {"since": since, "until": until, "new_devices": [],
-           "returned": [], "left": [], "new_sites": [], "ip_changes": [],
-           "dns_changes": [], "network": [], "alerts": [], "from_store": 0}
-    for d in reg.by_key.values():
-        if not d.live or not (since <= d.first_seen <= until):
-            continue
-        if d.ip in own or (d.mac and d.mac in model.my_macs):
-            continue
-        out["new_devices"].append((d.first_seen, d.key, d.display_name()))
+    my_macs = set(model.my_macs)
+    devs = list(reg.by_key.values())
+    sites = list(model.websites.values())
+    timeline = [e for e in model.timeline if since <= e["when"] <= until]
+    alerts = list(model.alerts.alerts.values())
+    yield "copied"
+    for i in range(0, len(devs), chunk):
+        for d in devs[i:i + chunk]:
+            if not d.live or not (since <= d.first_seen <= until):
+                continue
+            if d.ip in own or (d.mac and d.mac in my_macs):
+                continue
+            out["new_devices"].append((d.first_seen, d.key,
+                                       d.display_name()))
+        yield "devices"
     first_by_root = {}
-    for w in model.websites.values():
-        r = w.registrable or w.domain
-        if r not in first_by_root or w.first_seen < first_by_root[r][0]:
-            first_by_root[r] = (w.first_seen, w)
+    for i in range(0, len(sites), chunk * 4):
+        for w in sites[i:i + chunk * 4]:
+            r = w.registrable or w.domain
+            if r not in first_by_root or w.first_seen < first_by_root[r][0]:
+                first_by_root[r] = (w.first_seen, w)
+        yield "websites"
     for r, (fs, w) in first_by_root.items():
         if since <= fs <= until and w.live:
             out["new_sites"].append((fs, r, sorted(w.devices)[:3],
                                      w.best_assoc))
-    kinds = {"device back": "returned", "device left": "left",
-             "ip changed": "ip_changes", "dns change": "dns_changes",
-             "network": "network", "interface": "network",
-             "rogue router": "network", "internet": "network"}
-    for e in model.timeline:
-        k = kinds.get(e.get("kind"))
-        if k and since <= e["when"] <= until:
+    for e in timeline:
+        k = DIGEST_KINDS.get(e.get("kind"))
+        if k:
             out[k].append((e["when"], e.get("device", ""), e["text"]))
-    for a in model.alerts.alerts.values():
+    for a in alerts:
         if a.severity in ("WARNING", "DANGER") and \
                 since <= a.first_seen <= until:
             out["alerts"].append((a.first_seen, a.severity, a.reason))
-    if store is not None:
-        known_new = {k for _t, k, _n in out["new_devices"]}
-        rows = store.query(
-            "SELECT ts, kind, severity, text, device FROM events WHERE "
-            "ts>=? AND ts<=? AND session<>? ORDER BY ts LIMIT 5000",
-            (since, until, getattr(store, "session", -1)))
-        out["from_store"] = len(rows)
-        for ts, kind, sev, text, dev in rows:
-            k = kinds.get(kind)
-            if kind == "new device" and dev not in known_new:
-                out["new_devices"].append((ts, dev, text))
-                known_new.add(dev)
-            elif kind == "website":
-                out["new_sites"].append((ts, text.replace(
-                    "First visit to ", ""), [dev] if dev else [], ""))
-            elif k:
-                out[k].append((ts, dev, text))
-            elif kind == "alert" and sev in ("WARNING", "DANGER"):
-                out["alerts"].append((ts, sev, text))
-    for k in ("new_devices", "returned", "left", "new_sites", "ip_changes",
-              "dns_changes", "network", "alerts"):
+    yield "events"
+
+
+def digest_add_store(out, store, limit=5000):
+    """Events of earlier sessions from the history store (it opens a
+    read-only connection of its own, so no GuiGate is needed)."""
+    known_new = {k for _t, k, _n in out["new_devices"]}
+    # 5.3.4 (M7): the newest `limit` events, not the oldest (a busy week
+    # lost its last days)
+    rows = store.query(
+        "SELECT ts, kind, severity, text, device FROM events WHERE "
+        "ts>=? AND ts<=? AND session<>? ORDER BY ts DESC LIMIT ?",
+        (out["since"], out["until"], getattr(store, "session", -1),
+         int(limit)))
+    out["from_store"] = len(rows)
+    for ts, kind, sev, text, dev in reversed(rows):
+        k = DIGEST_KINDS.get(kind)
+        if kind == "new device" and dev not in known_new:
+            out["new_devices"].append((ts, dev, text))
+            known_new.add(dev)
+        elif kind == "website":
+            out["new_sites"].append((ts, text.replace(
+                "First visit to ", ""), [dev] if dev else [], ""))
+        elif k:
+            out[k].append((ts, dev, text))
+        elif kind == "alert" and sev in ("WARNING", "DANGER"):
+            out["alerts"].append((ts, sev, text))
+    return out
+
+
+def digest_sort(out):
+    for k in DIGEST_KEYS:
         out[k].sort(key=lambda t: t[0])
     return out
+
+
+# ---- Story mode (5.3.4 M7, MC4) ----------------------------------------------
+#  The change digest told as a story: grouped by day, newest first; repeats
+#  folded into one sentence ("Phone left and came back 6 times"); a line at
+#  "Since you last looked". Built by a JobRunner job (story_job_run), never
+#  on the Tk thread; the window only draws the result.
+STORY_DAYS = 7               # how far back the story goes with history on
+STORY_LIST_MAX = 3           # more new devices or websites a day: one line
+STORY_MAX_AGE = 60.0         # seconds before the Dashboard asks again
+STORY_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
+                  "Saturday", "Sunday")
+STORY_CATEGORY = {"presence": "Devices", "new_device": "Devices",
+                  "site": "Websites", "ip": "Devices", "dns": "DNS",
+                  "network": "Network & capture", "alert": "Alerts",
+                  "spike": "Devices"}
+
+
+def story_day(ts):
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(ts))
+    except (ValueError, OverflowError, OSError, TypeError):
+        return "?"
+
+
+def story_day_label(day, now=None):
+    """'Today', 'Yesterday' or 'Monday 2026-10-26', in the current
+    language."""
+    now = time.time() if now is None else now
+    tr = translate_text
+    if day == story_day(now):
+        return tr("Today")
+    if day == story_day(now - 86400):
+        return tr("Yesterday")
+    try:
+        wd = time.strptime(day, "%Y-%m-%d").tm_wday
+    except ValueError:
+        return day
+    return f"{tr(STORY_WEEKDAYS[wd])} {day}"
+
+
+def _story_name(names, key, text, cut):
+    """The device's name now; else the one in the event's text."""
+    if key and names.get(key):
+        return names[key]
+    if text and cut in text:
+        return text.split(cut, 1)[0]
+    return key or "?"
+
+
+def _story_say(tpl, args=(), ev=()):
+    """(template, arguments, which arguments are event sentences)."""
+    return (tpl, tuple(args), tuple(ev))
+
+
+def story_sentence(item):
+    """An item's sentence in the current language."""
+    tpl, args, ev = item["say"]
+    args = tuple(translate_event(a) if i in ev else a
+                 for i, a in enumerate(args))
+    if tpl == "%s":
+        return args[0] if args else ""
+    try:
+        return translate_text(tpl) % args
+    except (TypeError, ValueError):
+        return tpl % args
+
+
+def story_subjects(dg):
+    """Device keys the story will name (looked up under the gate)."""
+    keys = set()
+    for k in ("returned", "left", "ip_changes", "dns_changes", "spikes"):
+        keys.update(x[1] for x in dg.get(k, ()) if x[1])
+    keys.update(x[1] for x in dg.get("new_devices", ()) if x[1])
+    return keys
+
+
+def story_build(dg, names=None, last_looked=None, now=None):
+    """change_digest → the story: {"days": [(day, [item, …]), …] newest
+    day first, items newest first; "count": items; "fresh": items with
+    something after `last_looked` (None: no marker, e.g. a file)}.
+    Each item: when (last), first, count, kind, category, severity, say,
+    text (English), ref, device, fresh. Pure: no model, no Tk."""
+    names = names or {}
+    buckets = OrderedDict()
+
+    def put(ts, group, subject, fact):
+        key = (story_day(ts), group, subject)
+        b = buckets.get(key)
+        if b is None:
+            b = buckets[key] = []
+        b.append((ts,) + tuple(fact))
+    for ts, key, name in dg.get("new_devices", ()):
+        put(ts, "new_device", "", (key, name))
+    for ts, key, text in dg.get("left", ()):
+        put(ts, "presence", key, ("left", text))
+    for ts, key, text in dg.get("returned", ()):
+        put(ts, "presence", key, ("back", text))
+    for ts, root, devs, _assoc in dg.get("new_sites", ()):
+        put(ts, "site", "", (root, devs))
+    for ts, key, text in dg.get("ip_changes", ()):
+        put(ts, "ip", key, (text,))
+    for ts, key, text in dg.get("dns_changes", ()):
+        put(ts, "dns", key, (text,))
+    for ts, key, text in dg.get("network", ()):
+        put(ts, "network", text, (key,))
+    for ts, sev, reason in dg.get("alerts", ()):
+        put(ts, "alert", reason, (sev,))
+    for ts, key, text in dg.get("spikes", ()):
+        put(ts, "spike", (ts, text), (key, text))
+
+    days = OrderedDict()
+
+    def item(facts, group, say, ref=None, device="", severity="INFO"):
+        first = min(f[0] for f in facts)
+        last = max(f[0] for f in facts)
+        it = {"when": last, "first": first, "count": len(facts),
+              "kind": group, "category": STORY_CATEGORY.get(group, ""),
+              "severity": severity, "say": say,
+              "text": say[0] % say[1] if say[1] else say[0],
+              "ref": ref, "device": device,
+              "fresh": last_looked is not None and last > last_looked,
+              "live": True}
+        days.setdefault(story_day(last), []).append(it)
+        return it
+
+    for (_day, group, subject), facts in buckets.items():
+        n = len(facts)
+        if group == "presence":
+            key = subject
+            gone = [f for f in facts if f[1] == "left"]
+            back = [f for f in facts if f[1] == "back"]
+            name = _story_name(names, key, (gone or back)[0][2],
+                               " went offline" if gone else
+                               " came back online")
+            if gone and back:
+                k = max(len(gone), len(back))
+                say = _story_say("%s left and came back", (name,)) \
+                    if k == 1 else _story_say(
+                        "%s left and came back %d times", (name, k))
+            elif gone:
+                say = _story_say("%s", (f"{name} went offline",), (0,)) \
+                    if n == 1 else _story_say("%s went offline %d times",
+                                              (name, n))
+            else:
+                say = _story_say("%s", (f"{name} came back online",),
+                                 (0,)) if n == 1 else _story_say(
+                    "%s came back online %d times", (name, n))
+            item(facts, group, say, ("device", key), key)
+        elif group == "new_device":
+            if n <= STORY_LIST_MAX:
+                for f in facts:
+                    nm = names.get(f[1]) or f[2] or f[1]
+                    if nm.endswith(" joined your network"):
+                        nm = nm[:-len(" joined your network")]
+                    item([f], group, _story_say("New device: %s", (nm,)),
+                         ("device", f[1]), f[1])
+            else:
+                shown = [names.get(f[1]) or f[2] or f[1]
+                         for f in sorted(facts, key=lambda f: -f[0])]
+                item(facts, group, _story_say(
+                    "%d new devices joined, including %s",
+                    (n, ", ".join(shown[:STORY_LIST_MAX]))))
+        elif group == "site":
+            if n <= STORY_LIST_MAX:
+                for f in facts:
+                    item([f], group, _story_say("First visit to %s",
+                                                (f[1],)), ("website", f[1]))
+            else:
+                roots = [f[1] for f in sorted(facts, key=lambda f: -f[0])]
+                item(facts, group, _story_say(
+                    "%d websites visited for the first time, including %s",
+                    (n, ", ".join(roots[:STORY_LIST_MAX]))))
+        elif group == "ip":
+            text = facts[-1][1]
+            say = _story_say("%s", (text,), (0,)) if n == 1 else \
+                _story_say("%s changed its address %d times", (
+                    _story_name(names, subject, text, " changed address "),
+                    n))
+            item(facts, group, say, ("device", subject) if subject else
+                 None, subject)
+        elif group == "dns":
+            text = facts[-1][1]
+            say = _story_say("%s", (text,), (0,)) if n == 1 else \
+                _story_say("%s changed DNS server %d times", (
+                    _story_name(names, subject, text,
+                                " now uses DNS server "), n))
+            item(facts, group, say, ("device", subject) if subject else
+                 None, subject, "WARNING")
+        elif group == "network":
+            say = _story_say("%s", (subject,), (0,)) if n == 1 else \
+                _story_say("%s (%d times)", (subject, n), (0,))
+            item(facts, group, say)
+        elif group == "alert":
+            sev = "DANGER" if any(f[1] == "DANGER" for f in facts) \
+                else "WARNING"
+            say = _story_say("Warning: %s", (subject,), (0,)) if n == 1 \
+                else _story_say("Warning (%d times): %s", (n, subject),
+                                (1,))
+            item(facts, group, say, None, "", sev)
+        elif group == "spike":
+            key, text = facts[0][1], facts[0][2]
+            item(facts, group, _story_say("%s", (text,), (0,)),
+                 ("device", key) if key else None, key)
+    out = []
+    fresh = count = 0
+    for day in sorted(days, reverse=True):
+        items = sorted(days[day], key=lambda it: -it["when"])
+        fresh += sum(1 for it in items if it["fresh"])
+        count += len(items)
+        out.append((day, items))
+    sig = hash(tuple((day, it["text"], it["count"], it["fresh"])
+                     for day, items in out for it in items))
+    return {"days": out, "count": count, "fresh": fresh, "sig": sig,
+            "last_looked": last_looked, "since": dg.get("since"),
+            "until": dg.get("until"), "from_store": dg.get("from_store", 0),
+            "built": time.time() if now is None else now}
+
+
+def story_job_run(job, gate, model, store, since, until, last_looked,
+                  limit=5000):
+    """The Story builder (a JobRunner job): the in-memory digest a slice at
+    a time under the gate, the history store on its own connection, names
+    under the gate once, then the story itself with no lock held."""
+    t0 = time.perf_counter()
+    dg = digest_new(since, until)
+    job.pieces_under_gate(gate, digest_memory_steps(model, dg))
+    if store is not None:
+        digest_add_store(dg, store, limit)
+    digest_sort(dg)
+    keys = story_subjects(dg)
+
+    def names_step():
+        reg = model.registry
+        got = {}
+        for k in keys:
+            d = reg.by_key.get(k) or reg.by_key.get(reg.resolve(k))
+            if d is not None:
+                got[k] = d.display_name()
+        yield got
+    names = job.pieces_under_gate(gate, names_step())[0]
+    story = story_build(dg, names, last_looked)
+    story["build_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+    story["model_id"] = id(model)
+    return story
+
+
+def story_card_text(story, data_mode="live"):
+    """The Dashboard card's sentence (current language)."""
+    tr = translate_text
+    if story is None:
+        return tr("Writing the story…")
+    n = story["count"]
+    if data_mode in ("offline", "session", "demo"):
+        return (tr("1 change in this data.") if n == 1 else
+                tr("%d changes in this data.") % n) if n else \
+            tr("Nothing changed in this period.")
+    if story.get("last_looked") is None or not story["last_looked"]:
+        return (tr("1 change to read.") if n == 1 else
+                tr("%d changes to read.") % n) if n else \
+            tr("Nothing changed in this period.")
+    f = story["fresh"]
+    if not f:
+        return tr("Nothing new since you last looked.")
+    return tr("1 change since you last looked.") if f == 1 else \
+        tr("%d changes since you last looked.") % f
+
+
+# ---- spikes in plain words (5.3.4 IP-022) ------------------------------------
+def program_short_name(label):
+    """'chrome.exe (pid 4242)' → 'chrome.exe'; '' when the operating
+    system didn't say which program it is."""
+    label = str(label or "")
+    if not label or label.startswith("unknown program"):
+        return ""
+    return re.sub(r" \(pid \d+\)\Z", "", label)
+
+
+def spike_sentence(at, who, upload, amount, this_pc=False, program=""):
+    """'At 14:02 chrome.exe on this computer sent 80.0 MB in one minute'.
+    The program is named for this computer only (the others' programs
+    can't be seen from here)."""
+    verb = "sent" if upload else "received"
+    if this_pc:
+        who = f"{program} on this computer" if program else \
+            "an unknown program on this computer"
+    return f"At {at} {who} {verb} {amount} in one minute"
+
+
+def process_hit_rate(model, my_ips=None):
+    """(named, eligible): this computer's TCP and UDP connections that
+    carry the program behind them (IP-022's measured hit rate)."""
+    mine = set(my_ips if my_ips is not None else model.my_ips)
+    named = total = 0
+    for f in model.flows.all_flows():
+        if f.local_ip not in mine or f.transport not in ("TCP", "UDP"):
+            continue
+        total += 1
+        if program_short_name(f.process):
+            named += 1
+    return named, total
 
 
 def device_online_at(dev, t):
@@ -24130,6 +24536,47 @@ Starting the background helpers ¦ Démarrage des assistants en arrière-plan ¦
 Opening MiniWireshark ¦ Ouverture de MiniWireshark ¦ Abriendo MiniWireshark
 Measuring table headings for every text size ¦ Mesure des en-têtes de tableau pour chaque taille de texte ¦ Midiendo los encabezados de tabla para cada tamaño de texto
 Preparing the helper processes — once per version ¦ Préparation des processus d'aide — une fois par version ¦ Preparando los procesos auxiliares — una vez por versión
+Story mode ¦ Mode récit ¦ Modo relato
+Story mode tells what changed in plain sentences, day by day, with repeats folded into one line. A line marks what is new since you last looked. ¦ Le mode récit raconte ce qui a changé en phrases simples, jour par jour, les répétitions regroupées en une ligne. Une ligne marque ce qui est nouveau depuis votre dernier coup d'œil. ¦ El modo relato cuenta lo que cambió con frases sencillas, día a día, con las repeticiones agrupadas en una línea. Una línea marca lo nuevo desde la última vez que miró.
+Since you last looked ¦ Depuis votre dernier coup d'œil ¦ Desde la última vez que miró
+Writing the story ¦ Écriture du récit ¦ Escribiendo el relato
+Today ¦ Aujourd'hui ¦ Hoy
+Yesterday ¦ Hier ¦ Ayer
+Monday ¦ Lundi ¦ Lunes
+Tuesday ¦ Mardi ¦ Martes
+Wednesday ¦ Mercredi ¦ Miércoles
+Thursday ¦ Jeudi ¦ Jueves
+Friday ¦ Vendredi ¦ Viernes
+Saturday ¦ Samedi ¦ Sábado
+Sunday ¦ Dimanche ¦ Domingo
+1 change ¦ 1 changement ¦ 1 cambio
+%d changes ¦ %d changements ¦ %d cambios
+%s left and came back ¦ %s est parti puis revenu ¦ %s se fue y volvió
+%s left and came back %d times ¦ %s est parti puis revenu %d fois ¦ %s se fue y volvió %d veces
+%s went offline %d times ¦ %s s'est déconnecté %d fois ¦ %s se desconectó %d veces
+%s came back online %d times ¦ %s est revenu en ligne %d fois ¦ %s volvió a conectarse %d veces
+New device: %s ¦ Nouvel appareil : %s ¦ Dispositivo nuevo: %s
+%d new devices joined, including %s ¦ %d nouveaux appareils sont arrivés, dont %s ¦ Llegaron %d dispositivos nuevos, entre ellos %s
+First visit to %s ¦ Première visite sur %s ¦ Primera visita a %s
+%d websites visited for the first time, including %s ¦ %d sites web visités pour la première fois, dont %s ¦ %d sitios web visitados por primera vez, entre ellos %s
+%s changed its address %d times ¦ %s a changé d'adresse %d fois ¦ %s cambió de dirección %d veces
+%s changed DNS server %d times ¦ %s a changé de serveur DNS %d fois ¦ %s cambió de servidor DNS %d veces
+%s (%d times) ¦ %s (%d fois) ¦ %s (%d veces)
+Warning: %s ¦ Avertissement : %s ¦ Advertencia: %s
+Warning (%d times): %s ¦ Avertissement (%d fois) : %s ¦ Advertencia (%d veces): %s
+What changed: the story ¦ Ce qui a changé : le récit ¦ Qué cambió: el relato
+Read the story ¦ Lire le récit ¦ Leer el relato
+The changes of the last days in plain sentences, with what is new since you last looked. ¦ Les changements des derniers jours en phrases simples, avec ce qui est nouveau depuis votre dernier coup d'œil. ¦ Los cambios de los últimos días con frases sencillas, con lo nuevo desde la última vez que miró.
+1 change in this data. ¦ 1 changement dans ces données. ¦ 1 cambio en estos datos.
+%d changes in this data. ¦ %d changements dans ces données. ¦ %d cambios en estos datos.
+Nothing changed in this period. ¦ Rien n'a changé pendant cette période. ¦ No cambió nada en este periodo.
+1 change to read. ¦ 1 changement à lire. ¦ 1 cambio por leer.
+%d changes to read. ¦ %d changements à lire. ¦ %d cambios por leer.
+Nothing new since you last looked. ¦ Rien de nouveau depuis votre dernier coup d'œil. ¦ Nada nuevo desde la última vez que miró.
+1 change since you last looked. ¦ 1 changement depuis votre dernier coup d'œil. ¦ 1 cambio desde la última vez que miró.
+%d changes since you last looked. ¦ %d changements depuis votre dernier coup d'œil. ¦ %d cambios desde la última vez que miró.
+Story ¦ Récit ¦ Relato
+How many times ¦ Combien de fois ¦ Cuántas veces
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -24799,6 +25246,30 @@ I18N_PATTERNS += [
 # 5.1.2: Timeline, Live feed and alert sentences. Also searched alone
 # (translate_event) so a table of thousands of events stays quick.
 EVENT_PATTERNS = [
+    # 5.3.4 (IP-022): spikes in plain words; most specific first
+    (r"At (\d\d:\d\d) an unknown program on this computer sent (.+) in one "
+     r"minute", r"À \1, un programme inconnu de cet ordinateur a envoyé \2 "
+     r"en une minute", r"A las \1, un programa desconocido de este "
+     r"ordenador envió \2 en un minuto"),
+    (r"At (\d\d:\d\d) an unknown program on this computer received (.+) in "
+     r"one minute", r"À \1, un programme inconnu de cet ordinateur a reçu "
+     r"\2 en une minute", r"A las \1, un programa desconocido de este "
+     r"ordenador recibió \2 en un minuto"),
+    (r"At (\d\d:\d\d) (.+) on this computer sent (.+) in one minute",
+     r"À \1, \2 sur cet ordinateur a envoyé \3 en une minute",
+     r"A las \1, \2 en este ordenador envió \3 en un minuto"),
+    (r"At (\d\d:\d\d) (.+) on this computer received (.+) in one minute",
+     r"À \1, \2 sur cet ordinateur a reçu \3 en une minute",
+     r"A las \1, \2 en este ordenador recibió \3 en un minuto"),
+    (r"At (\d\d:\d\d) (.+) sent (.+) in one minute",
+     r"À \1, \2 a envoyé \3 en une minute",
+     r"A las \1, \2 envió \3 en un minuto"),
+    (r"At (\d\d:\d\d) (.+) received (.+) in one minute",
+     r"À \1, \2 a reçu \3 en une minute",
+     r"A las \1, \2 recibió \3 en un minuto"),
+    (r"First visit to (.+)", r"Première visite sur \1",
+     r"Primera visita a \1"),
+
     (r"Capture gap (.+) – (.+) \((.+), (.+)\): nothing was observed in "
      r"that time", r"Interruption de capture \1 – \2 (\3, \4) : rien n'a "
      r"été observé pendant ce temps", r"Interrupción de la captura \1 – \2 "
@@ -31151,6 +31622,9 @@ class DashboardTab(BaseTab):
             self._build_answers(outer)
         else:
             self.state_lbl.pack(fill="x", pady=(0, 8))
+        self.story_card = None
+        if FEATURES.get("story_mode", True):
+            self._build_story_card(outer)
         self.big = tk.Frame(outer, bg=WHITE)
         if not self.answers:
             self.big.pack(fill="x", pady=(0, 4))
@@ -31268,6 +31742,50 @@ class DashboardTab(BaseTab):
         Tooltip(self.honest_lbl, "What this computer can and can't see "
                                  "from where it is — click for details.")
 
+    def _build_story_card(self, outer):
+        """5.3.4 (M7, MC4): "3 changes since you last looked", opening the
+        Timeline in Story mode. Written by the jobs thread; this only
+        shows the sentence."""
+        card = tk.Frame(outer, bg="#f6f7fa", padx=12, pady=6,
+                        highlightbackground="#e0e2e8", highlightthickness=1,
+                        cursor="hand2", takefocus=1)
+        card.configure(highlightcolor="#2b7de9")
+        where = {"before": self.honest_lbl} if self.answers else \
+            {"after": self.state_lbl}
+        card.pack(fill="x", padx=4, pady=(0, 6), **where)
+        title = tk.Label(card, text="\U0001F4D6  What changed: the story",
+                         bg="#f6f7fa", fg="#2b3a56", font=mw_font(10, "bold"),
+                         anchor="w")
+        title.pack(side="left")
+        self.story_lbl = tk.Label(card, text="…", bg="#f6f7fa",
+                                  fg="#222222", font=mw_font(10), anchor="w",
+                                  justify="left")
+        self.story_lbl.pack(side="left", padx=(10, 0), fill="x",
+                            expand=True)
+        more = tk.Label(card, text="Read the story ›", bg="#f6f7fa",
+                        fg="#0b5394", anchor="e", cursor="hand2")
+        more.pack(side="right")
+        for w in (card, title, self.story_lbl, more):
+            w.bind("<Button-1>", lambda e: self.app.open_story())
+        card.bind("<Return>", lambda e: self.app.open_story())
+        Tooltip(card, "The changes of the last days in plain sentences, "
+                      "with what is new since you last looked.")
+        self.story_card = card
+
+    def show_story_card(self):
+        """The card's sentence from the last story (no work here)."""
+        if self.story_card is None:
+            return ""
+        app = self.app
+        st = app.story
+        if st is not None and st.get("model_id") != id(app.model):
+            st = None
+        text = story_card_text(st, app.data_mode)
+        with contextlib.suppress(tk.TclError):
+            if self.story_lbl.cget("text") != text:
+                self.story_lbl.configure(text=text)
+        return text
+
     @staticmethod
     def _fit_answer(lbl, width):
         want = max(160, width - 30)
@@ -31349,6 +31867,9 @@ class DashboardTab(BaseTab):
         if not force and not self.is_visible():
             return
         m, app = self.model, self.app
+        if self.story_card is not None:
+            app.request_story()         # a job; at most once a minute
+            self.show_story_card()
         now = m.now()
         devs = [d for d in m.registry.visible_devices()]
         active = sum(1 for d in devs if d.state in (STATE_ACTIVE, STATE_IDLE))
@@ -31756,6 +32277,18 @@ class TimelineTab(BaseTab):
                                          command=self._on_pause)
         self.pause_chk.pack(side="left", padx=(8, 0))
         bar2 = self.toolbar()
+        # 5.3.4 (M7, MC4): the same events told as a story, day by day
+        self.story_var = tk.BooleanVar(value=False)
+        self._story_shown = None
+        if FEATURES.get("story_mode", True):
+            self.story_chk = ttk.Checkbutton(
+                bar2, text="\U0001F4D6 Story mode", variable=self.story_var,
+                command=self._on_story)
+            self.story_chk.pack(side="left", padx=(0, 10))
+            Tooltip(self.story_chk, "Story mode tells what changed in plain "
+                                    "sentences, day by day, with repeats "
+                                    "folded into one line. A line marks "
+                                    "what is new since you last looked.")
         self.source_var = tk.StringVar(value="This session")
         self.source_box = self._combo(bar2, "Source:", self.source_var,
                                       ["This session", "Saved history"], 14)
@@ -31968,6 +32501,23 @@ class TimelineTab(BaseTab):
     def _update_status(self):
         hist = self.history_mode()
         n = len(self.tree.get_children())
+        if self.story_on():
+            st = self.app.story
+            with contextlib.suppress(tk.TclError):
+                self.older_btn.configure(state="disabled")
+                self.pause_chk.configure(state="disabled")
+                if st is None or st.get("model_id") != id(self.model):
+                    self.status_lbl.configure(text=translate_text(
+                        "Writing the story…"))
+                else:
+                    c = st["count"]
+                    txt = translate_text("1 change") if c == 1 else \
+                        translate_text("%d changes") % c
+                    if st.get("last_looked") and st["fresh"]:
+                        txt += " · " + translate_text(
+                            f"{st['fresh']} new since you last looked")
+                    self.status_lbl.configure(text=txt)
+            return
         with contextlib.suppress(tk.TclError):
             self.older_btn.configure(state="normal" if hist and not
                                      self.exhausted else "disabled")
@@ -31990,6 +32540,8 @@ class TimelineTab(BaseTab):
             self.tree.tag_configure("episode", font=("TkDefaultFont", 10,
                                                      "bold"),
                                     background=self.t["card_bg"])
+            self.tree.tag_configure("story_mark", foreground=self.t[
+                "warn_fg"], font=("TkDefaultFont", 9, "bold"))
 
     def _schedule_rebuild(self):
         if self._rebuild_job:
@@ -32013,10 +32565,114 @@ class TimelineTab(BaseTab):
         return cutoff, self.device_key_from_choice(self.dev_var.get()), \
             self.search_var.get().strip().lower()
 
+    # ---- Story mode (5.3.4 M7) -----------------------------------------------
+    def story_on(self):
+        try:
+            return bool(self.story_var.get()) and \
+                FEATURES.get("story_mode", True)
+        except (tk.TclError, AttributeError):
+            return False
+
+    def set_story(self, on=True):
+        if bool(self.story_var.get()) != bool(on):
+            self.story_var.set(bool(on))
+            self._on_story()
+        return self.story_on()
+
+    def _on_story(self):
+        if not self.story_on():
+            # leaving the story: what it showed has been read
+            self.app.story_seen()
+            self._story_shown = None
+        self.rebuild()
+
+    def refresh(self):
+        """Shown again: a story older than a minute is written again."""
+        if self.story_on():
+            if self.app.request_story() is None and \
+                    self.app.story is not None and \
+                    self._story_shown is not self.app.story:
+                self.show_story(self.app.story)
+
+    def _story_matches(self, it):
+        sev, cat = self.sev_var.get(), self.type_var.get()
+        if sev and sev != "All" and sev != it["severity"]:
+            return False
+        if cat and cat != "All types" and it["category"] != cat:
+            return False
+        dev = self.device_key_from_choice(self.dev_var.get())
+        if dev and it.get("device") != dev:
+            return False
+        q = self.search_var.get().strip().lower()
+        return not q or q in it["text"].lower() or \
+            q in story_sentence(it).lower()
+
+    def show_story(self, story):
+        """Draw a story: a heading row per day, the sentences newest first,
+        and the line at "Since you last looked". Tk time only: the story
+        was written by the jobs thread."""
+        self._story_shown = story
+        self.tree.delete(*self.tree.get_children())
+        self.refs.clear()
+        self.kit.clear()
+        tr = translate_text
+        shown = 0
+        marked = not story.get("last_looked") or not story["fresh"]
+        for day, items in story["days"]:
+            items = [it for it in items if self._story_matches(it)]
+            if not items:
+                continue
+            n = len(items)
+            with contextlib.suppress(tk.TclError):
+                iid = self.tree.insert(
+                    "", "end", tags=("episode",),
+                    values=("", "", tr("1 change") if n == 1 else
+                            tr("%d changes") % n, story_day_label(day)))
+                self.refs[iid] = None
+            for it in items:
+                if not marked and not it["fresh"]:
+                    marked = True
+                    self._insert_story_mark()
+                self._insert_story(it)
+                shown += 1
+        if not marked and shown:
+            self._insert_story_mark()
+        self._update_status()
+        self.kit.empty_soon()
+        return shown
+
+    def _insert_story_mark(self):
+        with contextlib.suppress(tk.TclError):
+            iid = self.tree.insert(
+                "", "end", tags=("story_mark",),
+                values=("", "", "", "▼  " + translate_text(
+                    "Since you last looked")))
+            self.refs[iid] = None
+
+    def _insert_story(self, it):
+        icon = self.app.SEVERITY_ICON.get(it["severity"], "•")
+        when = hm_clock(it["when"]) if it["count"] == 1 or \
+            hm_clock(it["first"]) == hm_clock(it["when"]) else \
+            f"{hm_clock(it['first'])}–{hm_clock(it['when'])}"
+        mark = ROW_DOT if it["fresh"] else ""
+        with contextlib.suppress(tk.TclError):
+            iid = self.tree.insert(
+                "", "end", tags=(it["severity"],),
+                values=(f"{icon} {it['severity']}", when,
+                        f"×{it['count']}" if it["count"] > 1 else "",
+                        mark + story_sentence(it)))
+            self.refs[iid] = it
+
     def add(self, entries):
         with contextlib.suppress(Exception):
             if self.is_visible():
                 self.draw_strip()
+        if self.story_on():
+            # the story is written again (at most once a minute), not
+            # appended to
+            if self.is_visible():
+                self.app.request_story()
+            return
         if self.pause_var.get() or self.history_mode():
             return
         cutoff, dev_key, q = self._filters()
@@ -32055,6 +32711,15 @@ class TimelineTab(BaseTab):
         self.refs.clear()
         self.kit.clear()
         self.oldest_ts, self.cursor, self.exhausted = None, None, False
+        if self.story_on():
+            st = self.app.story
+            job = self.app.request_story(
+                force=st is None or st.get("model_id") != id(self.model))
+            if st is not None and st.get("model_id") == id(self.model):
+                self.show_story(st)
+            elif job is not None or "story" in self.app.jobs.active:
+                self._update_status()
+            return
         if self.history_mode():
             self.load_older()
             return
@@ -32103,6 +32768,10 @@ class TimelineTab(BaseTab):
         if q:
             return TableKit.filtered(q, lambda: (self.search_var.set(""),
                                                  self.rebuild()))
+        if self.story_on():
+            if self.app.story is None:
+                return ("Writing the story…", None, None)
+            return ("Nothing changed in this period.", None, None)
         if self.app.history is None:
             return ("Only this session is shown. Turn on History to keep "
                     "earlier days.", "History settings",
@@ -32150,6 +32819,19 @@ class TimelineTab(BaseTab):
             self._open_event(e)
 
     def _open_event(self, e):
+        if e.get("say"):                     # a line of the story
+            ref = e.get("ref")
+            if ref and (ref[0] != "device" or
+                        ref[1] in self.model.registry.by_key):
+                self.app.open_ref(ref)
+                return
+            DetailDialog(self.app, "Story", [
+                ("What happened", story_sentence(e)),
+                ("When", fmt_clock(e["first"], True) + (
+                    " → " + fmt_clock(e["when"], True)
+                    if e["count"] > 1 else "")),
+                ("How many times", str(e["count"]))], size="520x360")
+            return
         ref = e.get("ref")
         st = self.app.history
         this_session = e.get("live", True) is not False or (
@@ -40835,6 +41517,8 @@ class MiniWireshark:
         self._wifi_seen = 0
         self.procmap = ProcessMap()
         self._proc_seen = 0
+        self.story = None            # the last story built (5.3.4 M7)
+        self._story_at = 0.0
         self.listen_watch = ListenWatch(os.path.join(PATHS.data,
                                                      "listening.json"))
         self.arp_cache = []
@@ -41459,6 +42143,10 @@ class MiniWireshark:
                         kit.on_show()
                 except tk.TclError:
                     pass
+            # 5.3.4 (M7): leaving the story: what you read is not new now
+            tl = self.tabs.get("timeline") if hasattr(self, "tabs") else None
+            if prev == "timeline" and tl is not None and tl.story_on():
+                self.story_seen()
         # 5.1.2: the switch is drawn first and the new tab filled 1 ms
         # later, so the click answers at once even on a slow refresh
         job = getattr(self, "_tab_refresh_job", None)
@@ -43483,6 +44171,95 @@ class MiniWireshark:
         ]
         return DetailDialog(self, f"What changed — {period.lower()}",
                             sections, size="700x600")
+
+    # ---- Story mode (5.3.4 M7) -----------------------------------------------
+    def story_period(self):
+        """(since, until, store, last_looked) of the story now: a week of
+        saved history when it is on, else everything in memory. "Since
+        you last looked" is only kept for live watching (a file has no
+        'last time')."""
+        m = self.model
+        now = m.now()
+        live = self.data_mode in ("live", "idle")
+        store = self.history if live else None
+        since = now - STORY_DAYS * 86400 if store is not None else 0.0
+        last = None
+        if live:
+            try:
+                last = float(self.config.get("general.story_seen", 0.0)
+                             or 0.0)
+            except (TypeError, ValueError):
+                last = 0.0
+        return since, now, store, last
+
+    def request_story(self, force=False):
+        """Ask the jobs thread for a new story. → the Job, or None (Story
+        mode is off, one is being written, or the last is recent)."""
+        if not FEATURES.get("story_mode", True):
+            return None
+        jobs = getattr(self, "jobs", None)
+        if jobs is None or "story" in jobs.active:
+            return None
+        st = self.story
+        if not force and st is not None and \
+                st.get("model_id") == id(self.model) and \
+                time.monotonic() - self._story_at < STORY_MAX_AGE:
+            return None
+        since, until, store, last = self.story_period()
+        m, gate = self.model, self.gate
+
+        def run(job):
+            return story_job_run(job, gate, m, store, since, until, last)
+        return jobs.submit("story", "Writing the story", run,
+                           done=self._story_done, failed=self._story_failed)
+
+    def _story_done(self, story):
+        """On the Tk thread: keep it, and redraw where it is shown."""
+        self._story_at = time.monotonic()
+        if story.get("model_id") != id(self.model):
+            return                    # the data was replaced meanwhile
+        self.story = story
+        tl = self.tabs.get("timeline")
+        if tl is not None and tl.story_on():
+            old = tl._story_shown
+            if old is None or old.get("sig") != story["sig"] or \
+                    old.get("model_id") != story["model_id"]:
+                tl.show_story(story)    # redrawn only when it changed
+            else:
+                tl._story_shown = story
+        dash = self.tabs.get("dash")
+        if dash is not None:
+            dash.show_story_card()
+
+    def _story_failed(self, err):
+        self._story_at = time.monotonic()
+        if not isinstance(err, JobCancelled):
+            LOG.warning("story not written: %s", err)
+
+    def story_seen(self):
+        """The story was read: what it showed is no longer new."""
+        st = self.story
+        if st is None or self.data_mode not in ("live", "idle"):
+            return False
+        built = float(st.get("built") or time.time())
+        self.config.set("general.story_seen", built)
+        with contextlib.suppress(Exception):
+            self.config.save()
+        st["last_looked"] = built
+        st["fresh"] = 0
+        for _day, items in st["days"]:
+            for it in items:
+                it["fresh"] = False
+        dash = self.tabs.get("dash")
+        if dash is not None:
+            dash.show_story_card()
+        return True
+
+    def open_story(self):
+        """The Dashboard card's link: the Timeline in Story mode."""
+        tl = self._select_tab("timeline")
+        tl.set_story(True)
+        return tl
 
     def open_compare(self):
         """Pick two saved sessions and show what differs between them."""
@@ -51187,8 +51964,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                            a.when))
                for a in (m.alerts.alerts.get(i) for i in m.alerts.order)
                if a and a.live]
-        yield [("domains", (w.registrable, w.requests, w.bytes))
-               for w in itertools.islice(m.websites.values(), 5000)]
+        yield [("domains", row) for row in history_domain_rows(m.websites)]
         yield [("baselines", kv) for kv in m.baselines.to_dict().items()]
 
     def _write_history(self, background=False):
@@ -52227,6 +53003,11 @@ class DiagnosticsWindow:
             f"Administrator/root  {'yes' if is_admin() else 'no'}",
             f"Scapy               {_module_version('scapy') or 'missing'}",
             f"psutil (optional)   {_module_version('psutil') or 'not installed'}",
+            # 5.3.4 (IP-022): how often the program is known
+            "Programs named      " + (lambda nt: f"{nt[0]} of {nt[1]} of "
+                                      f"this computer's connections"
+                                      if nt[1] else "—")(
+                process_hit_rate(m)),
             f"Capture backend     {backend}",
             "Npcap/libpcap       " + ("Npcap present" if IS_WINDOWS and
                                        _npcap_present() else
@@ -65820,6 +66601,313 @@ def t_no_silent_broad_except(ctx):
     assert "couldn't be checked" in tab.err_var.v, tab.err_var.v
 
 
+# ---- 5.3.4 M7: Story mode (MC4), spike story (IP-022), CO-14 -----------------
+def _story_noon(days_back=0):
+    """Noon, local time, `days_back` days ago (day grouping is local)."""
+    lt = time.localtime(time.time() - days_back * 86400)
+    return time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 12, 0, 0, 0, 0,
+                        -1))
+
+
+def _story_store(ctx, events, session=1):
+    """A history file holding `events` from an earlier session, opened
+    again as the current one (session 2), as after a restart."""
+    p = ctx.path(f"story_{uuid.uuid4().hex[:6]}.sqlite3")
+    old = Store(p, session_id=session)
+    assert old.write_events(events)
+    assert old.flush_now(10)
+    old.stop(5)
+    return Store(p, session_id=session + 1)
+
+
+@self_test()
+def t_story_change_sequence(ctx):
+    """5.3.4 (M7, MC4): a scripted three days of changes, told as a story:
+    one group per day, newest first; a phone that left and came back six
+    times is one sentence; five first visits are one line; a warning seen
+    twice is one line; the spike names the program; "since you last
+    looked" splits today from before; the store's newest events win when
+    there are too many; French and Spanish sentences."""
+    d2, d1, d0 = _story_noon(2), _story_noon(1), _story_noon(0)
+    ev = [{"when": d2 + 60, "kind": "new device", "severity": "INFO",
+           "text": "Old-TV joined your network", "device": "aa:tv"},
+          {"when": d2 + 120, "kind": "website", "severity": "INFO",
+           "text": "First visit to a-shop.example", "device": "aa:tv"},
+          {"when": d2 + 180, "kind": "website", "severity": "INFO",
+           "text": "First visit to b-news.example", "device": "aa:tv"}]
+    for i in range(6):
+        ev.append({"when": d1 + i * 600, "kind": "device left",
+                   "severity": "INFO", "text": "Phone went offline",
+                   "device": "aa:phone"})
+        ev.append({"when": d1 + i * 600 + 300, "kind": "device back",
+                   "severity": "INFO", "text": "Phone came back online",
+                   "device": "aa:phone"})
+    for i in range(5):
+        ev.append({"when": d1 + 4000 + i, "kind": "website",
+                   "severity": "INFO", "text": f"First visit to s{i}.example",
+                   "device": "aa:phone"})
+    for i in range(2):
+        ev.append({"when": d1 + 5000 + i * 60, "kind": "alert",
+                   "severity": "WARNING",
+                   "text": "Phone: unusual upload spike",
+                   "device": "aa:phone"})
+    st = _story_store(ctx, ev)
+    m = NetworkModel(ctx.cfg(), *scenario_identity()[:3])
+    spike = spike_sentence("14:02", "This computer", True, "80.0 MB", True,
+                           "chrome.exe")
+    for when, kind, text, dev in (
+            (d0 - 1800, "device left", "Printer went offline", "aa:prn"),
+            (d0 + 60, "traffic spike", spike, "aa:me"),
+            (d0 + 120, "ip changed", "Laptop changed address 192.168.1.20 "
+                                     "→ 192.168.1.21", "aa:lap")):
+        m.timeline.append({"when": when, "kind": kind, "severity": "INFO",
+                           "text": text, "ref": ("device", dev),
+                           "device": dev, "live": True})
+    try:
+        job = Job("story", "Writing the story", None)
+        story = story_job_run(job, GuiGate(), m, st, d2 - 3600, d0 + 3600,
+                              last_looked=d0 - 600)
+    finally:
+        st.stop(5)
+    days = [d for d, _items in story["days"]]
+    assert days == [story_day(d0), story_day(d1), story_day(d2)], days
+    assert story_day_label(days[0]) == translate_text("Today")
+    assert story_day_label(days[1]) == translate_text("Yesterday")
+    assert story_day_label(days[2]).endswith(days[2])
+    by_day = {d: [it["text"] for it in items] for d, items in story["days"]}
+    assert by_day[days[1]].count("Phone left and came back 6 times") == 1, \
+        by_day[days[1]]
+    assert not any("went offline" in t for t in by_day[days[1]])
+    assert "5 websites visited for the first time, including s4.example, "\
+           "s3.example, s2.example" in by_day[days[1]], by_day[days[1]]
+    assert "Warning (2 times): Phone: unusual upload spike" in \
+        by_day[days[1]], by_day[days[1]]
+    assert by_day[days[2]] == ["First visit to b-news.example",
+                               "First visit to a-shop.example",
+                               "New device: Old-TV"], by_day[days[2]]
+    today = by_day[days[0]]
+    assert today[0].startswith("Laptop changed address"), today
+    assert spike in today and "chrome.exe on this computer sent 80.0 MB" \
+        in spike, today
+    presence = next(it for it in story["days"][1][1]
+                    if it["kind"] == "presence")
+    assert presence["count"] == 12 and presence["ref"] == ("device",
+                                                           "aa:phone")
+    # since you last looked: today after the mark, the rest before it
+    fresh = [it["text"] for _d, items in story["days"] for it in items
+             if it["fresh"]]
+    assert fresh == today[:2] and story["fresh"] == 2, fresh
+    assert story["count"] == len(today) + len(by_day[days[1]]) + 3
+    assert story_card_text(story, "live") == \
+        "2 changes since you last looked."
+    assert story_card_text(story, "offline") == \
+        f"{story['count']} changes in this data."
+    assert story_card_text(None) == "Writing the story…"
+    seen = dict(story, fresh=0)
+    assert story_card_text(seen) == "Nothing new since you last looked."
+    # a file has no "last time": no marker, nothing is fresh
+    flat = story_build(change_digest(m, None, 0.0, d0 + 3600))
+    assert flat["fresh"] == 0 and flat["last_looked"] is None
+    # too many saved events: the newest are kept, not the oldest
+    st = _story_store(ctx, ev)
+    try:
+        dg = digest_add_store(digest_new(0, d0), st, limit=3)
+    finally:
+        st.stop(5)
+    assert dg["from_store"] == 3 and len(dg["alerts"]) == 2, dg
+    # the words in French and Spanish (names and amounts stay)
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        assert story_sentence(presence) == \
+            "Phone est parti puis revenu 6 fois", story_sentence(presence)
+        sp = next(it for it in story["days"][0][1] if it["kind"] == "spike")
+        assert story_sentence(sp) == ("À 14:02, chrome.exe sur cet "
+                                      "ordinateur a envoyé 80.0 MB en une "
+                                      "minute"), story_sentence(sp)
+        assert story_day_label(days[1]) == "Hier"
+        set_locale("es")
+        assert story_sentence(presence) == "Phone se fue y volvió 6 veces"
+        assert translate_event(spike_sentence(
+            "09:15", "Tablet", False, "2.0 GB")) == \
+            "A las 09:15, Tablet recibió 2.0 GB en un minuto"
+    finally:
+        set_locale(old if old != "en" else "English")
+    # IP-022: the fallback when the program isn't known
+    assert spike_sentence("14:02", "x", True, "1 MB", True, "") == \
+        "At 14:02 an unknown program on this computer sent 1 MB in one minute"
+    assert program_short_name("chrome.exe (pid 4242)") == "chrome.exe"
+    assert program_short_name(program_label((None, ""))) == ""
+
+
+@self_test()
+def t_story_spike_names_program(ctx):
+    """5.3.4 (IP-022): a spike of this computer names the program stored on
+    its busiest connection, live only; another device, or a file, is
+    named by the device; the sentence is on the Timeline."""
+    m = NetworkModel(ctx.cfg(), *scenario_identity()[:3])
+    m.use_packet_clock = False
+    me = types.SimpleNamespace(key="aa:me", display_name=lambda: "My-PC")
+    m.my_device_key = lambda: "aa:me"
+    now = m.now()
+    for fid, (port, out, proc) in enumerate(((50001, 9000, "chrome.exe "
+                                              "(pid 7)"),
+                                             (50002, 80, "zoom.exe"))):
+        f = FlowRecord(fid + 1, ("TCP", fid), "TCP", ScenarioBuilder.ME[0],
+                       port, "93.184.215.14", 443, now)
+        f.device_key, f.bytes_out, f.process = "aa:me", out, proc
+        m.flows.active[f.key] = f
+    assert m.spike_program(me, True, now - 60) == "chrome.exe"
+    m.flows.active[("TCP", 0)].process = ""
+    assert m.spike_program(me, True, now - 60) == ""      # unknown
+    other = types.SimpleNamespace(key="aa:tv", display_name=lambda: "TV")
+    assert m.spike_program(other, True, now - 60) is None
+    a = m.alerts.baseline_anomaly(me, "bytes_up", 80 * 1024 * 1024, 1000.0)
+    e = m._spike_story(me, a, True, 80 * 1024 * 1024)
+    assert e["kind"] == "traffic spike" and "an unknown program on this " \
+        "computer sent 80.0 MB in one minute" in e["text"], e["text"]
+    m.use_packet_clock = True                    # a file: no program
+    assert m.spike_program(me, True, 0) is None
+    e = m._spike_story(other, a, False, 5 * 1024 * 1024)
+    assert e["text"].endswith("TV received 5.0 MB in one minute"), e
+    assert TIMELINE_CATEGORY["traffic spike"] == "Devices"
+
+
+@self_test()
+def t_story_process_hit_rate(ctx):
+    """5.3.4 (IP-022 evaluation): how often this computer's connections get
+    their program from the connection table. Long connections are named;
+    short ones that closed before the table was read are not (they fall
+    back to "an unknown program")."""
+    if _psutil() is None:
+        return "skip"
+    srv = _socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+    port = srv.getsockname()[1]
+    keep, gone = [], []
+    for i in range(9):
+        cli = _socket.create_connection(("127.0.0.1", port), timeout=2)
+        acc, _ = srv.accept()
+        (keep if i < 6 else gone).append((cli, acc))
+    m = NetworkModel(ctx.cfg(), *scenario_identity()[:3])
+    m.set_identity(my_ips={"127.0.0.1"})
+    try:
+        for i, (cli, _acc) in enumerate(keep + gone):
+            f = FlowRecord(i + 1, ("TCP", i), "TCP", "127.0.0.1",
+                           cli.getsockname()[1], "127.0.0.1", port, m.now())
+            if i < len(keep):
+                m.flows.active[f.key] = f
+            else:
+                f.closed = True
+                m.flows.archive.append(f)
+        for pair in gone:
+            for s_ in pair:
+                s_.close()
+        pm = ProcessMap()
+        assert pm.read()
+        app = types.SimpleNamespace(procmap=pm, model=m)
+        MiniWireshark.attribute_processes(app)
+        named, total = process_hit_rate(m)
+        if named == 0:
+            return "skip"              # this OS hides the table from us
+        assert total == 9 and named == len(keep), (named, total)
+    finally:
+        for pair in keep + gone:
+            for s_ in pair:
+                s_.close()
+        srv.close()
+
+
+@self_test()
+def t_story_bench(ctx):
+    """5.3.4 (M7): writing the story of a busy week (5,000 saved events:
+    40 devices coming and going all day, first visits, warnings, address
+    changes) plus this session's home network takes at most 150 ms."""
+    ev = []
+    base = _story_noon(6) - 11 * 3600
+    for day in range(7):
+        t0 = base + day * 86400
+        for dev in range(40):
+            for k in range(9):
+                t = t0 + dev * 50 + k * 3000
+                ev.append({"when": t, "kind": "device left",
+                           "severity": "INFO", "device": f"aa:{dev:02d}",
+                           "text": f"Phone-{dev:02d} went offline"})
+                ev.append({"when": t + 900, "kind": "device back",
+                           "severity": "INFO", "device": f"aa:{dev:02d}",
+                           "text": f"Phone-{dev:02d} came back online"})
+        for k in range(60):
+            ev.append({"when": t0 + 30000 + k * 30, "kind": "website",
+                       "severity": "INFO", "device": f"aa:{k % 40:02d}",
+                       "text": f"First visit to site{day}-{k}.example"})
+        for k in range(4):
+            ev.append({"when": t0 + 40000 + k, "kind": "alert",
+                       "severity": "WARNING", "device": "aa:01",
+                       "text": f"Phone-01: unusual upload spike {k % 2}"})
+            ev.append({"when": t0 + 41000 + k, "kind": "ip changed",
+                       "severity": "INFO", "device": f"aa:{k:02d}",
+                       "text": f"Phone-{k:02d} changed address 10.0.0.{k} → "
+                               f"10.0.0.{k + 1}"})
+    st = _story_store(ctx, ev)
+    m = scenario_model(ctx.cfg(), ctx.frames()) if ctx.scapy_ok else \
+        NetworkModel(ctx.cfg(), *scenario_identity()[:3])
+    gate = GuiGate()
+    xs = []
+    try:
+        for _ in range(3):
+            t = time.perf_counter()
+            story = story_job_run(Job("story", "", None), gate, m, st,
+                                  base - 3600, time.time() + 3600,
+                                  last_looked=time.time() - 86400)
+            xs.append(time.perf_counter() - t)
+    finally:
+        st.stop(5)
+    ms = statistics.median(xs) * 1000
+    assert story["from_store"] == 5000 and len(story["days"]) >= 7, \
+        (story["from_store"], len(story["days"]))
+    assert story["count"] < 700, story["count"]     # folded, not 5,000
+    assert ms <= 150, f"story took {ms:.0f} ms (limit 150)"
+    BENCH_NOTES["story_build_ms"] = round(ms, 1)
+
+
+BENCH_NOTES = {}
+
+
+@self_test()
+def t_co14_domain_snapshot_adds_subdomains(ctx):
+    """5.3.4 (CO-14): the daily "domains" row of a site is the sum of its
+    sub-domains (a.example.com 500 + b.example.com 3 = 503), not whichever
+    came last, and writing the snapshot again doesn't add it twice."""
+    c = ctx.cfg({"history.enabled": True})
+    m = NetworkModel(c, *scenario_identity()[:3])
+    for name, n, b in (("a.example.com", 500, 7000),
+                       ("b.example.com", 3, 11), ("www.other.org", 9, 1)):
+        m.register_website(name, "93.184.215.14", None, "DNS")
+        m.websites[name].requests = n
+        m.websites[name].bytes = b
+    st = Store(ctx.path(f"co14_{uuid.uuid4().hex[:6]}.sqlite3"),
+               session_id=1)
+    win = types.SimpleNamespace(history=st, config=c, model=m)
+    win._history_pieces = lambda: MiniWireshark._history_pieces(win)
+    try:
+        for _ in range(2):
+            MiniWireshark._write_history(win)
+            assert st.flush_now(10)
+            got = st.query("SELECT domain, requests, bytes FROM domains "
+                           "ORDER BY domain")
+            assert got == [("example.com", 503, 7011),
+                           ("other.org", 9, 1)], got
+    finally:
+        st.stop(5)
+    many = {f"s{i}.x{i}.com": types.SimpleNamespace(
+        registrable=f"x{i}.com", domain=f"s{i}.x{i}.com", requests=i,
+        bytes=0) for i in range(30)}
+    rows = history_domain_rows(many, limit=5)
+    assert [r[0] for r in rows] == ["x29.com", "x28.com", "x27.com",
+                                    "x26.com", "x25.com"], rows
+
+
 # ---- window benchmark (--bench-gui) -----------------------------------------
 # The 5.1.2 plan's measuring stick: a synthetic home network built with
 # ScenarioBuilder, read through the normal offline path, then every window
@@ -65870,7 +66958,9 @@ BENCH_LIMITS = {
            "session_save.stall_ms": 60, "text_size.stall_ms": 105,
            "theme.stall_ms": 145, "switch.stall_ms": 115,
            "model_tick.stall_ms": 30, "idle_cpu_dash_pct": 4.3,
-           "rss_loaded_mb": 365 if IS_WINDOWS else 265, "search_ms": 12.5},
+           "rss_loaded_mb": 365 if IS_WINDOWS else 265, "search_ms": 12.5,
+           # 5.3.4 (M7, MC4): Story mode's Tk time for the whole story
+           "story.stall_ms": 150},
 }
 BENCH_LIMITS_PROVISIONAL = False
 BENCH_TARGETS = {
@@ -66078,6 +67168,14 @@ def _bench_child(sid, out_path, pcap):
         _gui_pump(root, 0.3)
         reb[name] = measure("rebuild:" + name, app.tabs[name].rebuild)
     res["rebuild"] = reb
+    # 5.3.4 (M7): Story mode, written by a job and drawn on the Tk thread
+    tl = app._select_tab("timeline")
+    _gui_pump(root, 0.3)
+    res["story"] = measure("story", lambda: tl.set_story(True),
+                           until=lambda: tl._story_shown is not None and
+                           "story" not in app.jobs.active)
+    res["story.stall_ms"] = res["story"]["stall_ms"]
+    tl.set_story(False)
 
     def flush_all():
         m.dirty_devices |= set(m.registry.by_key)
@@ -66192,6 +67290,7 @@ BENCH_SUMMARY_KEYS = (
     ("rss_loaded_mb", "Memory with data loaded (MB)"),
     ("rss_after_reload_mb", "Memory after save and reload (MB)"),
     ("search_ms", "Global search (ms)"),
+    ("story.stall_ms", "Longest freeze writing the story (ms)"),
     ("window_ready_s", "Window ready (s)"),
 )
 
@@ -70022,6 +71121,103 @@ def gt_rc11_warm_start(app, ctx):
     misses = int(outs[1].split("widths=")[1].split("/")[1].split()[0])
     assert misses == 0, outs
     assert os.path.exists(os.path.join(d, "cache", "text_widths.json"))
+
+
+@gui_test_step("5.3.4 M7: Story mode — the Dashboard card, the story job, "
+               "day groups, the since-you-last-looked line, marked as read")
+def gt_534_story_mode(app, ctx):
+    root = app.root
+    m = app.model
+    dash = app._select_tab("dash")
+    _gui_pump(root, 0.5)
+    assert dash.story_card is not None and dash.story_card.winfo_ismapped()
+    # written by the jobs thread, never on the Tk thread
+    _gui_pump(root, 0.05, lambda: "story" not in app.jobs.active, timeout=30)
+    app.story = None
+    assert dash.show_story_card() == translate_text("Writing the story…")
+    job = app.request_story(force=True)
+    assert job is not None and "story" in app.jobs.active
+    assert app.request_story(force=True) is None      # one at a time
+    _gui_pump(root, 0.05, lambda: app.story is not None and
+              "story" not in app.jobs.active, timeout=30)
+    st = app.story
+    assert st is not None and st["model_id"] == id(m), st
+    assert st["count"] > 0 and st["days"], "the scenario has changes"
+    text = dash.show_story_card()
+    assert text == story_card_text(st, app.data_mode), text
+    assert str(dash.story_lbl.cget("text")) == text
+    # the card opens the Timeline in Story mode
+    dash.story_lbl.event_generate("<Button-1>")
+    _gui_pump(root, 0.3, lambda: app.tabs["timeline"]._story_shown is not
+              None, timeout=30)
+    tl = app.tabs["timeline"]
+    assert app.current_tab_name() == "timeline" and tl.story_on()
+    # drawing a story is the window's only work: at most 150 ms
+    t0 = time.perf_counter()
+    shown = tl.show_story(st)
+    draw_ms = (time.perf_counter() - t0) * 1000
+    assert shown == st["count"], (shown, st["count"])
+    assert draw_ms <= 150, f"drawing the story took {draw_ms:.0f} ms"
+    print(f"    (story: {st['count']} lines written in {st['build_ms']} ms "
+          f"by the job, drawn in {draw_ms:.1f} ms)")
+    heads = [i for i in tl.tree.get_children()
+             if "episode" in tl.tree.item(i, "tags")]
+    assert [tl.tree.set(i, "text") for i in heads] == \
+        [story_day_label(d) for d, _its in st["days"]]
+    assert "Writing" not in str(tl.status_lbl.cget("text"))
+    # a scripted live story: the line falls between new and seen
+    now = _story_noon(0)
+    dg = digest_new(now - 7200, now)
+    for i in range(4):
+        dg["left"].append((now - 3000 + i * 600, "aa:ph", "Phone went "
+                                                          "offline"))
+        dg["returned"].append((now - 2700 + i * 600, "aa:ph",
+                               "Phone came back online"))
+    dg["new_devices"].append((now - 6000, "aa:tv", "Old-TV"))
+    fake = story_build(dg, {}, last_looked=now - 4000, now=now)
+    fake["model_id"] = id(m)
+    tl.show_story(fake)
+    rows = tl.tree.get_children()
+    kinds = [("mark" if "story_mark" in tl.tree.item(i, "tags") else
+              "head" if "episode" in tl.tree.item(i, "tags") else "item")
+             for i in rows]
+    assert kinds == ["head", "item", "mark", "item"], kinds
+    first = tl.refs[rows[1]]
+    assert tl.tree.set(rows[1], "text") == ROW_DOT + \
+        "Phone left and came back 4 times"
+    assert tl.tree.set(rows[1], "kind") == "×8" and first["fresh"]
+    tl.tree.selection_set(rows[1])
+    tl._on_double()                    # no such device: the sentence
+    _gui_pump(root, 0.1)
+    for w in root.winfo_children():
+        if isinstance(w, tk.Toplevel) and "Story" in w.title():
+            w.destroy()
+    # leaving the story while live: what it showed is no longer new
+    mode = app.data_mode
+    app.story = fake
+    try:
+        app.data_mode = "live"
+        assert story_card_text(fake, "live") == \
+            "1 change since you last looked."
+        app._select_tab("dash")
+        app._on_tab_changed()
+        assert float(app.config.get("general.story_seen")) == \
+            fake["built"]
+        assert fake["fresh"] == 0 and not any(
+            it["fresh"] for _d, its in fake["days"] for it in its)
+        assert dash.show_story_card() == translate_text(
+            "Nothing new since you last looked.")
+    finally:
+        app.data_mode = mode
+        app.config.set("general.story_seen", 0.0)
+    # back to the list
+    tl = app._select_tab("timeline")
+    tl.set_story(False)
+    _gui_pump(root, 0.2)
+    assert not tl.story_on() and not any(
+        "story_mark" in tl.tree.item(i, "tags")
+        for i in tl.tree.get_children())
+    app.story = None
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
