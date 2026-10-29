@@ -22,12 +22,12 @@ Check it with `python --version` (Windows: `py --version`).
 3. Check the file. The two values must match:
 
    ```bash
-   sha256sum miniwireshark-5.1.2.py          # Linux
-   shasum -a 256 miniwireshark-5.1.2.py      # macOS
+   sha256sum miniwireshark-<version>.py          # Linux
+   shasum -a 256 miniwireshark-<version>.py      # macOS
    ```
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\miniwireshark-5.1.2.py   # Windows
+   Get-FileHash -Algorithm SHA256 .\miniwireshark-<version>.py   # Windows
    ```
 
    Every version's checksum is also listed in the [version index](VERSIONS.md).

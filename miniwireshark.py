@@ -19,6 +19,7 @@ self-test t_toc_matches_banners keeps this list and the banners in step.
 
     1.    Bootstrap — imports, paths, logging, elevation
     1a.   Layer 1 — wide-entry launcher and runtime hand-off
+    1c.   V5 startup: boot receipts, Safe Mode, the handshake hand-off and
     1b.   Scapy symbols (filled in by load_scapy once the dependency is ready)
     2.    Dependency manager
     2a.   Everything MiniWireshark itself sends — one gate, one ledger
@@ -1010,7 +1011,7 @@ def runtime_confirm_started():
 
 
 # ============================================================================
-#  1a+.  V5 startup: boot receipts, Safe Mode, the handshake hand-off and
+#  1c.   V5 startup: boot receipts, Safe Mode, the handshake hand-off and
 #        the private packages folder
 #
 #  MiniWireshark 5 opens on the Python that started it whenever that Python
@@ -2260,7 +2261,7 @@ class PrivatePackages:
                 r = subprocess.run(cmd, capture_output=True, text=True,
                                    timeout=timeout, creationflags=NO_WINDOW)
             except subprocess.TimeoutExpired:
-                raise RuntimeError_("network", f"pip took more than "
+                raise RuntimeError_("offline", f"pip took more than "
                                                f"{timeout} s")
             if r.returncode != 0:
                 raise RuntimeError_("pip", ((r.stdout or "") +
@@ -3623,8 +3624,8 @@ def step_python(l, state):
     v = sys.version_info
     l.post_log(f"  Python {v.major}.{v.minor}.{v.micro} at {sys.executable}",
                "detail")
-    if v < (3, 7):
-        return False, f"Python {v.major}.{v.minor} is too old (3.7+ needed)."
+    if v < (3, 8):
+        return False, f"Python {v.major}.{v.minor} is too old (3.8+ needed)."
     return True, "Python is ready."
 
 
@@ -3791,10 +3792,9 @@ def step_dependencies(l, state):
             PRIVATE_PACKAGES.activate()
             importlib.invalidate_caches()
         except Exception as e:                       # noqa: BLE001
-            kind = getattr(e, "kind", "") or classify_runtime_error(e)
             part = os.path.join(PRIVATE_PACKAGES.cache, filename) + ".part"
-            CAPTURE_LIMITED[0] = (f"Couldn't install {dep['friendly']} "
-                                  f"({kind}: {str(e)[:160]})." + (
+            CAPTURE_LIMITED[0] = (f"Couldn't install {dep['friendly']}: "
+                                  f"{runtime_error_text(e)}." + (
                                       " The next start resumes the "
                                       "download where it stopped."
                                       if os.path.exists(part) else ""))
@@ -4193,6 +4193,18 @@ RUNTIME_ERRORS = {
             "copies."),
     "other": ("Something unexpected went wrong", "See the details."),
 }
+
+
+def runtime_error_text(exc, limit=160):
+    """One plain-English line for a failed runtime step: the friendly
+    title, then the raw detail in brackets. 5.3.4 (OS-11): the detail of
+    a RuntimeError_ is used as it is, so the kind is never said twice
+    ("offline: offline: ...")."""
+    kind = classify_runtime_error(exc)
+    title = RUNTIME_ERRORS.get(kind, RUNTIME_ERRORS["other"])[0]
+    detail = exc.detail if isinstance(exc, RuntimeError_) else str(exc)
+    detail = (detail or "").strip()[:limit]
+    return f"{title} ({detail})" if detail else title
 
 
 def classify_runtime_error(exc):
@@ -59232,9 +59244,17 @@ def toc_and_banners(src):
     lines = src.split("\n")
     banners = []
     for i, line in enumerate(lines):
-        m = re.match(r"^#  (\d+[a-z]?)\.  (.+)$", line)
-        if m and i and lines[i - 1].startswith("# ===="):
+        if not (i and lines[i - 1].startswith("# ====")
+                and line.startswith("#  ")):
+            continue
+        m = re.match(r"^#  (\d+[a-z]?)\.\s+(.+)$", line)
+        if m:
             banners.append((m.group(1), m.group(2).strip()))
+        elif re.match(r"^#  \S+\.\s", line):
+            # A banner-shaped line with an id the pattern does not allow
+            # is reported, never skipped, so the list cannot drift.
+            banners.append(("?" + line[3:].split(".")[0],
+                            line.strip()))
     start = src.index('"""') + 3
     doc = src[start:src.index('"""', start)]
     toc = [(m.group(1), m.group(2).strip()) for m in re.finditer(
@@ -61378,6 +61398,13 @@ def t_runtime_download_extract_errors(ctx):
     except RuntimeError_:
         pass
     assert not os.path.exists(ctx.path("escape.txt"))
+    # OS-11: the kind is never repeated in the message
+    line = runtime_error_text(RuntimeError_(
+        "offline", "<urlopen error [Errno -3]>"))
+    assert line == "No Internet connection (<urlopen error [Errno -3]>)", line
+    assert "offline:" not in runtime_error_text(RuntimeError_("offline"))
+    assert runtime_error_text(OSError("[Errno 28] No space left")
+                              ).startswith("Not enough free disk space")
     assert classify_runtime_error(PermissionError("x")) == "permission"
     assert classify_runtime_error(OSError("[Errno 28] No space left")) == \
         "disk"
