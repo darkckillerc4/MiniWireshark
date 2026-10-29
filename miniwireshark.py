@@ -11265,6 +11265,7 @@ FEATURES = {
     "investigations_v2": True,   # five more guided investigations (M11)
     "overload_degrade": True,  # too busy: count only, then back (M13, IP-025)
     "npcap_buffer": True,    # a bigger Npcap kernel buffer (M13, IP-024)
+    "checkup_report": True,  # one-page Network check-up, redacted (M14)
 }
 
 
@@ -11459,6 +11460,9 @@ FEATURE_HELP = {
     "npcap_buffer": "on Windows, Npcap is asked to keep 16 MB of packets "
                     "waiting instead of 1 MB, so a burst is not lost "
                     "while the program is busy",
+    "checkup_report": "a one-page Network check-up (ready, what changed, "
+                      "unusual activity, common questions, devices) that "
+                      "hides personal details unless you turn that off",
 }
 
 
@@ -27781,6 +27785,35 @@ A call on another device (a phone, a TV) isn't visible from this computer. ¦ Un
 No call was seen. Look again during a call. ¦ Aucun appel n'a été vu. Regardez de nouveau pendant un appel. ¦ No se vio ninguna llamada. Vuelva a mirar durante una llamada.
 Look again during the call, on the computer that makes it. ¦ Regardez de nouveau pendant l'appel, sur l'ordinateur qui le passe. ¦ Vuelva a mirar durante la llamada, en el equipo que la hace.
 Too busy to inspect every packet: counting only. Deep analysis is paused and comes back on its own. ¦ Trop occupé pour examiner chaque paquet : simple comptage. L'analyse approfondie est en pause et reprendra d'elle-même. ¦ Demasiado ocupado para examinar cada paquete: solo se cuentan. El análisis a fondo está en pausa y se reanudará solo.
+Network check-up ¦ Bilan du réseau ¦ Revisión de la red
+Preparing the check-up ¦ Préparation du bilan ¦ Preparando la revisión
+Live capture ¦ Capture en direct ¦ Captura en directo
+Live capture (stopped) ¦ Capture en direct (arrêtée) ¦ Captura en directo (detenida)
+Offline capture file (not live) ¦ Fichier de capture (pas en direct) ¦ Archivo de captura (no en directo)
+Saved session (not live) ¦ Session enregistrée (pas en direct) ¦ Sesión guardada (no en directo)
+Demo data, not live traffic ¦ Données de démo, pas du trafic réel ¦ Datos de demostración, no es tráfico real
+Personal details are hidden: device names, addresses, network names, user names and websites are replaced by stand-ins such as “Device 3” and “Network A”. ¦ Les détails personnels sont masqués : les noms d'appareils, les adresses, les noms de réseau, les noms d'utilisateur et les sites web sont remplacés par des substituts comme « Device 3 » et « Network A ». ¦ Los datos personales están ocultos: los nombres de dispositivos, las direcciones, los nombres de red, los nombres de usuario y los sitios web se sustituyen por marcadores como «Device 3» y «Network A».
+Personal details are shown. Turn hiding on before you send this page to anyone. ¦ Les détails personnels sont visibles. Activez le masquage avant d'envoyer cette page à qui que ce soit. ¦ Los datos personales están visibles. Active la ocultación antes de enviar esta página a nadie.
+One page about your network: is MiniWireshark ready, what changed, anything unusual, answers to common questions, and the devices seen. ¦ Une page sur votre réseau : MiniWireshark est-il prêt, ce qui a changé, ce qui est inhabituel, les réponses aux questions courantes et les appareils vus. ¦ Una página sobre su red: si MiniWireshark está listo, qué cambió, si hay algo inusual, respuestas a preguntas frecuentes y los dispositivos vistos.
+devices seen ¦ appareils vus ¦ dispositivos vistos
+unusual findings ¦ constats inhabituels ¦ hallazgos inusuales
+items to fix ¦ points à corriger ¦ puntos que corregir
+changes ¦ changements ¦ cambios
+What changed ¦ Ce qui a changé ¦ Qué cambió
+%d more not shown. ¦ %d de plus non affichés. ¦ %d más no mostrados.
+Other open alerts ¦ Autres alertes ouvertes ¦ Otras alertas abiertas
+Common questions ¦ Questions courantes ¦ Preguntas frecuentes
+This is a summary, not a verdict: each answer is the best fit for what this computer could see. ¦ C'est un résumé, pas un verdict : chaque réponse est la plus plausible d'après ce que cet ordinateur a pu voir. ¦ Es un resumen, no un veredicto: cada respuesta es la que mejor encaja con lo que este equipo pudo ver.
+What to try ¦ À essayer ¦ Qué probar
+Devices by kind ¦ Appareils par type ¦ Dispositivos por tipo
+Devices by kind: %s ¦ Appareils par type : %s ¦ Dispositivos por tipo: %s
+Most active devices ¦ Appareils les plus actifs ¦ Dispositivos más activos
+Most active devices: %s ¦ Appareils les plus actifs : %s ¦ Dispositivos más activos: %s
+Maker ¦ Fabricant ¦ Fabricante
+No devices seen yet. ¦ Aucun appareil vu pour l'instant. ¦ Aún no se ha visto ningún dispositivo.
+What this computer could see ¦ Ce que cet ordinateur pouvait voir ¦ Lo que este equipo podía ver
+Couldn't answer this one here. ¦ Impossible de répondre à celle-ci d'ici. ¦ No se puede responder a esta desde aquí.
+Made on this computer by MiniWireshark %s. To keep a copy, print this page or save it as a PDF from the browser's Print dialog. ¦ Créé sur cet ordinateur par MiniWireshark %s. Pour en garder une copie, imprimez cette page ou enregistrez-la en PDF depuis la boîte d'impression du navigateur. ¦ Creado en este equipo por MiniWireshark %s. Para guardar una copia, imprima esta página o guárdela como PDF desde el cuadro de impresión del navegador.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -46967,6 +47000,8 @@ class MiniWireshark:
                 ("Open a capture file…", self.open_pcap),
                 ("Save session…", self._save_session),
                 ("Shareable report…", self.export_shareable),
+            ] + ([("Network check-up…", self.export_checkup)]
+                 if FEATURES.get("checkup_report", True) else []) + [
                 ("Diagnostics", self.open_diagnostics),
                 ("Components Center", self.open_components_center),
                 ("Storage used…", self.open_storage),
@@ -54437,6 +54472,9 @@ proc ::mw_retheme {w map fgnew deffg} {
                       command=self.export_inventory)
         m.add_command(label="Shareable report (personal details "
                             "hidden)…", command=self.export_shareable)
+        if FEATURES.get("checkup_report", True):
+            m.add_command(label="Network check-up…",
+                          command=self.export_checkup)
         m.add_separator()
         m.add_command(label="Packets in current view as CSV…",
                       command=lambda: self._export_csv(current_view=True))
@@ -54513,14 +54551,68 @@ proc ::mw_retheme {w map fgnew deffg} {
         self.redaction_preview("Network sheet", self.sheet_document(),
                                "network-sheet.html", redact=False)
 
+    def make_checkup_redactor(self, options=None):
+        """5.3.4 (M14): the check-up's redactor, with this computer's
+        network names, Wi-Fi name and user name besides the model's."""
+        nets = []
+        for _fp, prof in self.networks.all():
+            nets += [prof.get("name", ""), prof.get("ssid", "")]
+        w = getattr(self.wifi, "last", None) or {}
+        nets.append(w.get("ssid", ""))
+        nets.append(self.network_name())
+        return CheckupRedactor(self.model, options, networks=nets)
+
+    def checkup_facts(self):
+        """The check-up's facts from the current model (Tk thread); the
+        Ready? probes are added off the Tk thread by export_checkup."""
+        return checkup_facts(self.model, app=self, data_mode=self.data_mode,
+                             namer=self.device_label,
+                             network=self.network_name())
+
+    def export_checkup(self):
+        """5.3.4 (M14, MC11): the one-page Network check-up. Personal
+        details are hidden unless turned off in the preview."""
+        if not FEATURES.get("checkup_report", True):
+            return None
+        facts = self.checkup_facts()
+        cfg = self.config
+
+        def run(job):
+            facts["ready"] = ready_report(cfg)
+            checkup_html(facts)          # a broken page fails here, not later
+            return facts
+
+        def done(f):
+            self._checkup_win = self.redaction_preview(
+                translate_text("Network check-up"), None,
+                time.strftime("network-checkup-%Y%m%d.html"), redact=True,
+                renderer=lambda red: checkup_html(f, red),
+                make_red=self.make_checkup_redactor,
+                defaults={k: True for k in REDACT_OPTIONS})
+
+        def bad(e):
+            if not isinstance(e, JobCancelled):
+                messagebox.showerror("Network check-up", str(e),
+                                     parent=self.root)
+        return self.jobs.submit("checkup", "Preparing the check-up", run,
+                                done, bad)
+
     def export_shareable(self):
         self.redaction_preview("Shareable network report",
                                ReportBuilder(self).build("full"),
                                "network-report-redacted.html", redact=True)
 
-    def redaction_preview(self, title, content, filename, redact=True):
+    def redaction_preview(self, title, content, filename, redact=True,
+                          renderer=None, make_red=None, defaults=None):
         """Side by side: what you have, and what will be saved. Options
-        re-render the right side; the original is never changed."""
+        re-render the right side; the original is never changed.
+        5.3.4 (M14): with `renderer(redactor or None)`, the page is built
+        again for each choice (values hidden where they are used) instead
+        of redacting the finished text; `make_red(options)` builds the
+        redactor and `defaults` sets the options' first state."""
+        if renderer is not None:
+            content = renderer(None)
+        make_red = make_red or self.make_redactor
         t = self.theme
         win = tk.Toplevel(self.root)
         win.title(f"{title} — preview")
@@ -54529,8 +54621,8 @@ proc ::mw_retheme {w map fgnew deffg} {
         bar = tk.Frame(win, bg=t["tab_bg"], padx=12, pady=8)
         bar.pack(fill="x")
         on = tk.BooleanVar(value=redact)
-        opts = {k: tk.BooleanVar(value=(k != "sites")) for k in
-                REDACT_OPTIONS}
+        opts = {k: tk.BooleanVar(value=(defaults or {}).get(k, k != "sites"))
+                for k in REDACT_OPTIONS}
         ttk.Checkbutton(bar, text="Hide personal details before saving",
                         variable=on, command=lambda: render()).pack(
             side="left")
@@ -54567,9 +54659,9 @@ proc ::mw_retheme {w map fgnew deffg} {
 
         def render():
             if on.get():
-                red = self.make_redactor({k: v.get()
-                                          for k, v in opts.items()})
-                out = red.text(content)
+                red = make_red({k: v.get() for k, v in opts.items()})
+                out = red.text(content) if renderer is None else \
+                    renderer(red)
                 info.configure(text=red.summary())
                 state["red"] = red
             else:
@@ -54607,6 +54699,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         render()
         win._mw_state, win._mw_opts, win._mw_on, win._mw_render = \
             state, opts, on, render
+        win._mw_save = save
         return win
 
     def _ask_save(self, ext, types, name):
@@ -57041,6 +57134,478 @@ class ReportBuilder:
                                f"— {e(a.observed)}</li>"
                                for a in alerts) + "</ul></section>")
         return "".join(out)
+
+
+# ============================================================================
+#  5.3.4 (M14, MC11): the one-page "Network check-up"
+#
+#  Built from the Ready? lines (MC2), the Story (MC4), Unusual activity
+#  (MC6), the guided investigations run passively on the current model
+#  (MC7) and the device list with kinds (MC3). Personal details are hidden
+#  by default: every value taken from the network goes through the
+#  redactor where it is used (before a chart label is cut short), and the
+#  finished page is scrubbed once more, text and attributes, so a name the
+#  first pass missed still can't reach the file. Self-contained: inline
+#  CSS and SVG, no script, no image, no outside file.
+# ============================================================================
+CHECKUP_KEEP_SITES = ("python.org", "www.python.org", "npcap.com",
+                      "nmap.org")
+CHECKUP_GENERIC_USERS = frozenset(("root", "user", "users", "admin",
+                                   "administrator", "guest", "owner",
+                                   "default", "public", "home"))
+CHECKUP_SOURCE = {"live": "Live capture", "idle": "Live capture (stopped)",
+                  "offline": "Offline capture file (not live)",
+                  "session": "Saved session (not live)",
+                  "demo": "Demo data, not live traffic"}
+
+
+def checkup_user_names():
+    """The sign-in name of this computer's user, as it shows in folder
+    paths (generic names such as "root" or "admin" identify nobody)."""
+    out = set()
+    for n in (os.environ.get("USERNAME"), os.environ.get("USER"),
+              os.path.basename(os.path.expanduser("~").rstrip("/\\"))):
+        n = (n or "").strip()
+        if len(n) >= 3 and n.lower() not in CHECKUP_GENERIC_USERS:
+            out.add(n)
+    return out
+
+
+class CheckupRedactor(Redactor):
+    """The check-up's redactor: everything personal is on by default,
+    websites included; stand-ins read "Device 3", "Network A", "User 1".
+    A stand-in run through it again stays the same, so redacting a value
+    and then the whole page never renumbers anything."""
+
+    def __init__(self, model=None, options=None, extra_names=(),
+                 networks=(), users=None):
+        self._n, self._rx, self._outs_all = {}, {}, set()
+        self.users = set()
+        opts = {"sites": True}
+        opts.update(options or {})
+        super().__init__(model, opts, extra_names)
+        self.maps["user"] = {}
+        for n in networks:
+            self._add_name(n, "networks")
+        for u in (checkup_user_names() if users is None else users):
+            u = str(u or "").strip()
+            if len(u) >= 3 and u.lower() not in CHECKUP_GENERIC_USERS:
+                self.users.add(u)
+
+    def learn(self, model):
+        super().learn(model)
+        for d in model.registry.by_key.values():
+            for n in (getattr(d, "owner", ""), getattr(d, "place", ""),
+                      getattr(d, "model_hint", "")):
+                if isinstance(n, str):
+                    self._add_name(n)
+        # visited names a domain pattern would not recognise (a bare
+        # word such as "printer"); the rest are caught by the pattern
+        doms = set(getattr(model, "websites", {}) or {})
+        with contextlib.suppress(Exception):
+            doms.update(fl.domain for fl in model.flows.all_flows()
+                        if fl.domain)
+        with contextlib.suppress(Exception):
+            doms.update(v for v in model.cache.values()
+                        if isinstance(v, str))
+        for dom in doms:
+            if dom and not _RX_DOMAIN.fullmatch(str(dom)):
+                self._add_name(dom)
+
+    def _pseudo(self, kind, key, fmt):
+        mp = self.maps[kind]
+        hit = mp.get(key)
+        if hit is not None:
+            return hit
+        if str(key).lower() in self._outs_all:
+            return key                       # already a stand-in
+        n = self._n[kind] = self._n.get(kind, 0) + 1
+        out = mp[key] = fmt(n)
+        self._outs_all.add(out.lower())
+        return out
+
+    def name(self, s):
+        return self._pseudo("name", s.lower(), lambda n: f"Device {n}")
+
+    def network(self, s):
+        return self._pseudo("net", s.lower(),
+                            lambda n: f"Network {self._letters(n)}")
+
+    def user(self, s):
+        return self._pseudo("user", s.lower(), lambda n: f"User {n}")
+
+    def _alt(self, kind, items, words=False):
+        key = (kind, len(items))
+        rx = self._rx.get(key)
+        if rx is None:
+            body = "|".join(re.escape(n) for n in sorted(items, key=len,
+                                                         reverse=True))
+            rx = self._rx[key] = re.compile(
+                r"(?<!\w)(?:%s)(?!\w)" % body if words else body, re.I)
+        return rx
+
+    def text(self, s):
+        s = str(s)
+        if self.opts["names"] and self.users:
+            s = self._alt("users", self.users, True).sub(
+                lambda m: self.user(m.group(0)), s)
+        if self.opts["names"] and self.names:
+            s = self._alt("names", self.names).sub(
+                lambda m: self.name(m.group(0)), s)
+        if self.opts["networks"] and self.networks:
+            s = self._alt("networks", self.networks).sub(
+                lambda m: self.network(m.group(0)), s)
+        if self.opts["hardware"]:
+            s = _RX_MAC.sub(lambda m: self.mac(m.group(0)), s)
+        if self.opts["addresses"]:
+            s = _RX_IP6.sub(lambda m: self.ip(m.group(0).split("%")[0])
+                            if ip_obj(m.group(0).split("%")[0]) is not None
+                            else m.group(0), s)
+            s = _RX_IP4.sub(lambda m: self.ip(m.group(0)) if ip_obj(
+                m.group(0)) is not None else m.group(0), s)
+        if self.opts["sites"]:
+            def site(m):
+                d = m.group(0).lower()
+                if d.endswith(".example") or d in CHECKUP_KEEP_SITES:
+                    return m.group(0)
+                return self.site(m.group(0))
+            s = _RX_DOMAIN.sub(site, s)
+        return s
+
+    def summary(self):
+        out = super().summary()
+        if self.maps["user"]:
+            out += f" · {len(self.maps['user'])} user name(s)"
+        return out
+
+
+_RX_TAG_ATTR = re.compile(r"""(\s[\w:-]+\s*=\s*)(["'])(.*?)\2""", re.S)
+_RX_HTML_SPLIT = re.compile(r"(<style\b[^>]*>.*?</style>|<[^>]*>)",
+                            re.S | re.I)
+
+
+def scrub_html(doc, red):
+    """The last pass over a finished page: drop comments, then run the
+    redactor over every text node and every attribute value (an SVG
+    <title>, an aria-label), leaving tag names and the style sheet
+    alone."""
+    doc = re.sub(r"<!--.*?-->", "", doc, flags=re.S)
+    out = []
+    for part in _RX_HTML_SPLIT.split(doc):
+        if not part:
+            continue
+        if part[:6].lower() == "<style" or part.startswith(("<!", "</")):
+            out.append(part)
+        elif part.startswith("<"):
+            out.append(_RX_TAG_ATTR.sub(
+                lambda m: m.group(1) + m.group(2) + html.escape(
+                    red.text(html.unescape(m.group(3)))) + m.group(2), part))
+        else:
+            out.append(html.escape(red.text(html.unescape(part)),
+                                   quote=False))
+    return "".join(out)
+
+
+def _checkup_board(which, hyps):
+    top = hyps[0] if hyps else None
+    if top is None:
+        return {"key": which, "q": INVESTIGATION_TITLES[which],
+                "status": "Can't tell", "answer": "Can't tell from here",
+                "why": [], "fix": ""}
+    return {"key": which, "q": INVESTIGATION_TITLES[which],
+            "status": top["status"], "answer": top["title"],
+            "why": list(top.get("for") or [])[:2],
+            "fix": top.get("fix", "") if top["status"] != "Unlikely" else ""}
+
+
+def _checkup_bandwidth_facts(model, offline):
+    """collect_bandwidth_facts without a window (the self-tests)."""
+    per, unatt = Counter(), 0
+    now = model.now()
+    for x in model.flows.all_flows():
+        if now - x.last_seen > 600:
+            continue
+        if x.device_key:
+            per[x.device_key] += x.total_bytes
+        else:
+            unatt += x.total_bytes
+    reg = model.registry
+    return {"devices": [(reg.by_key[k].display_name() if k in reg.by_key
+                         else k, b, LV_OBSERVED) for k, b in per.items()],
+            "unattributed": unatt, "window_text": human_duration(600),
+            "vantage": model.vantage.classify(offline=offline)}
+
+
+def checkup_investigations(model, app=None, offline=False):
+    """Every switched-on investigation, run passively on the model (the
+    facts the boards use; nothing is sent), → [{key, q, status, answer,
+    why, fix}]. A board that fails says it couldn't answer."""
+    keys = ["slow", "bandwidth"] + (list(INVESTIGATIONS_V2) if
+                                    FEATURES.get("investigations_v2", True)
+                                    else [])
+    m = model
+    out = []
+    for k in keys:
+        try:
+            if k == "bandwidth":
+                res = investigate_bandwidth(
+                    app.collect_bandwidth_facts() if app is not None else
+                    _checkup_bandwidth_facts(m, offline))
+                out.append({"key": k, "q": INVESTIGATION_TITLES[k],
+                            "status": "", "answer": res["conclusion"],
+                            "why": list(res["rows"][:2]), "fix": ""})
+                continue
+            if k == "slow":
+                hyps = investigate_slow(
+                    app.collect_slow_facts() if app is not None else
+                    slow_facts(m, offline=offline))
+            elif app is not None:
+                hyps = INVESTIGATORS[k](app.collect_investigation_facts(k))
+            else:
+                f = {"dns": lambda: dns_facts(m, offline=offline),
+                     "ipv6": lambda: ipv6_facts(m, offline=offline),
+                     "connect": lambda: connect_facts(
+                         m, connect_default_key(m), offline=offline),
+                     "wifi_or_internet": lambda: wifi_internet_facts(
+                         m, offline=offline),
+                     "call": lambda: call_facts(m, offline=offline)}[k]()
+                hyps = INVESTIGATORS[k](f)
+            out.append(_checkup_board(k, hyps))
+        except Exception as e:                       # noqa: BLE001
+            LOG.warning("check-up: investigation %s failed: %s", k, e)
+            out.append({"key": k, "q": INVESTIGATION_TITLES[k],
+                        "status": "Can't tell",
+                        "answer": "Couldn't answer this one here.",
+                        "why": [], "fix": ""})
+    return out
+
+
+def checkup_facts(model, app=None, data_mode="live", namer=None,
+                  network="", ready=None, now=None):
+    """Everything the check-up shows, as plain values (no Tk). `ready` is
+    filled in later when the probes run off the Tk thread."""
+    m = model
+    now = m.now() if now is None else now
+    namer = namer or (lambda d: d.display_name())
+    offline = data_mode in ("offline", "session")
+    facts = {"generated": time.time(), "source": CHECKUP_SOURCE.get(
+        data_mode, data_mode), "network": network or "",
+        "ready": list(ready or [])}
+    # MC4: the story, newest day first, at most 12 lines on the page
+    try:
+        dg = change_digest(m, None, 0.0, now)
+        names = {}
+        reg = m.registry
+        for k in story_subjects(dg):
+            d = reg.by_key.get(k) or reg.by_key.get(reg.resolve(k))
+            if d is not None:
+                names[k] = namer(d)
+        story = story_build(dg, names, None, now)
+        days, left = [], 12
+        for day, items in story["days"]:
+            if left <= 0:
+                break
+            days.append((story_day_label(day, now),
+                         [story_sentence(it) for it in items[:left]]))
+            left -= len(days[-1][1])
+        facts["story"], facts["story_count"] = days, story["count"]
+    except Exception as e:                           # noqa: BLE001
+        LOG.warning("check-up: story failed: %s", e)
+        facts["story"], facts["story_count"] = [], 0
+    # MC6: unusual activity, then the other open warnings
+    facts["unusual"] = unusual_findings(m.alerts, limit=5) if \
+        FEATURES.get("unusual_section", True) else []
+    found = [m.alerts.alerts[a] for a in list(m.alerts.order)
+             if a in m.alerts.alerts]
+    facts["alerts"] = [(a.severity, translate_event(a.reason))
+                       for a in found if not a.acknowledged and
+                       a.severity in ("WARNING", "DANGER") and
+                       a.kind not in UNUSUAL_KINDS][:5]
+    # MC7: the investigations, passively
+    facts["investigations"] = checkup_investigations(m, app, offline)
+    # MC3: the devices with their kinds
+    facts["devices"] = inventory_rows(m, namer)
+    devs = list(m.registry.by_key.values())
+    facts["kinds"] = Counter(d.device_class or "Unknown"
+                             for d in devs).most_common(8)
+    top = sorted(devs, key=lambda d: -(d.bytes_up + d.bytes_down))[:6]
+    facts["traffic"] = [(namer(d), d.bytes_up + d.bytes_down)
+                        for d in top if d.bytes_up + d.bytes_down > 0]
+    with contextlib.suppress(Exception):
+        facts["vantage"] = VANTAGE_TEXT[m.vantage.classify(
+            offline=offline)][0]
+    return facts
+
+
+def _svg_titled(svg, title):
+    """A chart that says what it shows: role, aria-label and <title>."""
+    if not svg.startswith("<svg "):
+        return svg
+    t = html.escape(title)
+    svg = svg.replace("<svg ", f'<svg role="img" aria-label="{t}" ', 1)
+    return svg.replace(">", f"><title>{t}</title>", 1)
+
+
+CHECKUP_CSS = (
+    ".mark{display:inline-block;width:1.4em;font-weight:700}"
+    ".m-ok{color:var(--good)}.m-warn{color:var(--warn)}"
+    ".m-bad{color:var(--danger)}.m-info{color:var(--muted)}"
+    ".read{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0}"
+    ".read div{border-radius:6px;padding:4px 8px}"
+    ".worry{background:var(--warnbg)}.fine{background:var(--card);"
+    "border:1px solid var(--line)}"
+    ".pill{display:inline-block;min-width:6.5em;font-weight:600}"
+    ".note{padding:6px 10px;border-radius:6px;margin:0 0 6px;"
+    "border:1px solid var(--line)}.shown{background:var(--warnbg)}"
+    "ul{margin:4px 0;padding-left:20px}li{margin:2px 0}"
+    "@media print{header{background:none;color:#000}header p{color:#333}"
+    "body{font-size:9pt;background:#fff}section{break-inside:avoid;"
+    "margin:6px 0;padding:6px 10px}main{padding:0}"
+    "@page{size:auto;margin:10mm}}")
+
+
+def checkup_html(facts, red=None):
+    """The check-up page from checkup_facts(); `red` (a CheckupRedactor)
+    hides personal details, None shows them. Pure: no model, no Tk."""
+    tr = translate_text
+    e = html.escape
+    R = red.text if red is not None else str
+
+    def E(s):                      # a value that came from the network
+        return e(R(str(s if s is not None else "")))
+    title = tr("Network check-up")
+    net = facts.get("network") or ""
+    sub = " · ".join(x for x in (
+        E(net) if net else "", e(fmt_clock(facts.get("generated") or
+                                           time.time(), True)),
+        e(tr(facts.get("source") or ""))) if x)
+    devices = facts.get("devices") or []
+    ready = facts.get("ready") or []
+    unusual = facts.get("unusual") or []
+    n_story = facts.get("story_count", 0)
+    fixes = sum(1 for r in ready if r[2] in ("warn", "bad"))
+    parts = [f"<!doctype html><html lang='{e(CURRENT_LOCALE)}'><head>"
+             f"<meta charset='utf-8'><meta name='viewport' "
+             f"content='width=device-width,initial-scale=1'>"
+             f"<title>MiniWireshark — {e(title)}</title><style>{REPORT_CSS}"
+             f"{CHECKUP_CSS}</style></head><body><header><h1>{e(title)}"
+             f"</h1><p>{sub}</p></header><main>"]
+    note = tr("Personal details are hidden: device names, addresses, "
+              "network names, user names and websites are replaced by "
+              "stand-ins such as “Device 3” and “Network A”.") \
+        if red is not None else tr(
+            "Personal details are shown. Turn hiding on before you send "
+            "this page to anyone.")
+    parts.append(
+        f"<section><p class='note{'' if red is not None else ' shown'}'>"
+        f"{e(note)}</p><p class='muted'>" + e(tr(
+            "One page about your network: is MiniWireshark ready, what "
+            "changed, anything unusual, answers to common questions, and "
+            "the devices seen.")) + "</p><div class='cards'>" +
+        "".join(f"<div class='card'><b>{n}</b><span>{e(tr(lbl))}</span>"
+                f"</div>" for n, lbl in (
+                    (len(devices), "devices seen"),
+                    (len(unusual), "unusual findings"),
+                    (fixes, "items to fix"), (n_story, "changes"))) +
+        "</div></section>")
+    # Ready? (MC2)
+    if ready:
+        parts.append(f"<section><h2>{e(tr('Ready?'))}</h2><ul>" + "".join(
+            f"<li><span class='mark m-{e(st)}'>{e(READY_MARK.get(st, '·'))}"
+            f"</span><b>{e(tr(t))}</b>: {E(tr(tx))}</li>"
+            for _k, t, st, tx, _f in ready) + "</ul></section>")
+    # What changed (MC4)
+    story = facts.get("story") or []
+    shown = sum(len(x[1]) for x in story)
+    more = tr("%d more not shown.")
+    parts.append(f"<section><h2>{e(tr('What changed'))}</h2>" + (
+        "".join(f"<p><b>{e(day)}</b></p><ul>" + "".join(
+            f"<li>{E(s)}</li>" for s in lines) + "</ul>"
+            for day, lines in story) if story else
+        f"<p class='muted'>{e(tr('Nothing changed in this period.'))}</p>")
+        + (f"<p class='muted'>{e(more % (n_story - shown))}</p>"
+           if n_story > shown else "") + "</section>")
+    # Unusual activity (MC6): both readings side by side
+    cards = []
+    for f in unusual:
+        cards.append(
+            f"<div><p><b>{E(f['title'])}</b></p><p>"
+            f"{e(tr('What we saw:'))} {E(tr(f.get('saw') or ''))}"
+            + (f" <span class='muted'>({E(' · '.join(f['evidence']))})"
+               f"</span>" if f.get("evidence") else "") +
+            f"</p><div class='read'><div class='worry'><b>"
+            f"{e(tr('Could be a problem'))}</b><br>{E(tr(f['problem']))}"
+            f"</div><div class='fine'><b>{e(tr('Could be normal'))}</b><br>"
+            f"{E(tr(f['normal']))}</div></div><p>{e(tr('Next step:'))} "
+            f"{E(tr(f['step']))}</p></div>")
+    alerts = facts.get("alerts") or []
+    parts.append(f"<section><h2>{e(tr('Unusual activity'))}</h2>" + (
+        "".join(cards) if cards else
+        f"<p class='muted'>{e(tr('Nothing unusual right now.'))}</p>") + (
+        f"<p><b>{e(tr('Other open alerts'))}</b></p><ul>" + "".join(
+            f"<li><span class='badge sev-{e(sev)}'>{e(tr(sev))}</span> "
+            f"{E(reason)}</li>" for sev, reason in alerts) + "</ul>"
+        if alerts else "") + "</section>")
+    # Common questions (MC7), including "Can't tell from here"
+    inv = facts.get("investigations") or []
+    if inv:
+        parts.append(
+            f"<section><h2>{e(tr('Common questions'))}</h2><p class='muted'>"
+            + e(tr("This is a summary, not a verdict: each answer is the "
+                   "best fit for what this computer could see.")) + " " +
+            e(tr("Built only from what was overheard; nothing is sent to "
+                 "check.")) + "</p><table>" + "".join(
+                f"<tr><td><b>{e(tr(q['q']))}</b></td><td>" +
+                (f"<span class='pill'>{e(tr(q['status']))}</span> "
+                 if q.get("status") else "") + E(tr(q["answer"])) +
+                "".join(f"<br><span class='muted'>{E(w)}</span>"
+                        for w in q.get("why") or ()) +
+                (f"<br>{e(tr('What to try:'))} {E(tr(q['fix']))}"
+                 if q.get("fix") else "") + "</td></tr>" for q in inv) +
+            "</table></section>")
+    # The devices with their kinds (MC3), and two small charts
+    kinds = facts.get("kinds") or []
+    traffic = facts.get("traffic") or []
+    charts = []
+    if kinds:
+        items = [(tr(k), n, str(n)) for k, n in kinds]
+        charts.append((tr("Devices by kind"), _svg_titled(
+            _svg_bars(items, color="#2b7de9"), tr("Devices by kind: %s") %
+            ", ".join(f"{k} {n}" for k, n, _t in items))))
+    if traffic:
+        # redacted before _svg_bars cuts a label short
+        items = [(R(n), b, _human_bytes(b)) for n, b in traffic]
+        charts.append((tr("Most active devices"), _svg_titled(
+            _svg_bars(items, color="#0b8a5a"), tr("Most active devices: %s")
+            % ", ".join(n for n, _b, _t in items))))
+    if charts:
+        parts.append("<section><div class='two'>" + "".join(
+            f"<div><h2>{e(h)}</h2>{c}</div>" for h, c in charts) +
+            "</div></section>")
+    rows = devices[:40]
+    parts.append(
+        f"<section><h2>{e(tr('Devices'))}</h2>" + (
+            "<table><tr>" + "".join(f"<th>{e(tr(h))}</th>" for h in (
+                "Device", "Kind", "Maker", "Address", "Status")) + "</tr>" +
+            "".join(f"<tr><td>{e(r['mine'])} <b>{E(r['name'])}</b></td>"
+                    f"<td>{e(translate_cell(r['kind']))}</td>"
+                    f"<td>{E(r['maker'])}</td><td>{E(r['ip'])}"
+                    + (f"<br><span class='muted'>{E(r['mac'])}</span>"
+                       if r["mac"] != "—" else "") +
+                    f"</td><td>{e(translate_cell(r['status']))}</td></tr>"
+                    for r in rows) + "</table>" if rows else
+            f"<p class='muted'>{e(tr('No devices seen yet.'))}</p>") +
+        (f"<p class='muted'>{e(more % (len(devices) - len(rows)))}</p>"
+         if len(devices) > len(rows) else "") +
+        (f"<p class='muted'>{e(tr('What this computer could see'))}: "
+         f"{e(tr(facts['vantage']))}</p>" if facts.get("vantage") else "") +
+        "</section>")
+    parts.append("<footer>" + e(tr(
+        "Made on this computer by MiniWireshark %s. To keep a copy, print "
+        "this page or save it as a PDF from the browser's Print dialog.")
+        % SCRIPT_VERSION) + "</footer></main></body></html>")
+    doc = "".join(parts)
+    return scrub_html(doc, red) if red is not None else doc
 
 
 # ============================================================================
@@ -70950,6 +71515,164 @@ def t_redaction_no_leaks(ctx):
 
 
 @self_test()
+def t_checkup_canary_redaction(ctx):
+    """5.3.4 (M14, MC11): canaries planted in every identifying field
+    (device, mDNS, DHCP and SSDP names, owner, Wi-Fi name, user name,
+    MACs, IPv4, IPv6, websites, alert texts, investigation evidence, story
+    lines, chart labels and chart titles) never reach the check-up page
+    while personal details are hidden: not in the text, not in an SVG
+    <text>, <title> or attribute, not in a comment, not escaped, not URL-
+    or base64-encoded. With hiding off, all of them are there."""
+    import urllib.parse
+    T = "cnry7f3a"                       # in every name-like canary
+    alias = "Cnry7f3a-Alias-Long-Device-Name"    # longer than a chart label
+    host, dhcp, mdns = "cnry7f3a-host", "CNRY7F3A-DHCP", "cnry7f3a-mdns"
+    ssdp, owner = "Cnry7f3a SSDP TV", "Cnry7f3aOwner"
+    ssid, user = "Cnry7f3a-HomeWiFi", "cnry7f3auser"
+    site = "cnry7f3a-shop.com"
+    ips = ["10.77.31.203", "10.77.31.204", "10.77.31.205", "10.77.31.206"]
+    macs = ["0a:7f:3a:c4:4a:11", "0a:7f:3a:c4:4a:12", "0a:7f:3a:c4:4a:13",
+            "0a:7f:3a:c4:4a:14"]
+    ip6, pub = "fd7f:3a00::c4a1", "93.184.77.13"
+    clk = _FakeClock()
+    m = NetworkModel(ctx.cfg(), "10.77.31.1", ["10.77.31.20"], [], clk)
+    devs = [m.registry.touch(ip, mac, "arp_reply", "x")
+            for ip, mac in zip(ips, macs)]
+    devs[0].alias, devs[0].owner, devs[0].place = alias, owner, "Cnry7f3a room"
+    devs[1].hostname, devs[1].dhcp_hostname = host, dhcp
+    devs[2].mdns_name, devs[3].ssdp_name = mdns, ssdp
+    devs[0].ipv6.add(ip6)
+    for i, d in enumerate(devs):
+        d.bytes_up, d.bytes_down = 9_000_000 - i * 1_000_000, 4_000_000
+    m.register_website(site, pub, devs[0], "DNS")
+    m.alerts._add("upload_spike", "WARNING", devs[0].key,
+                  f"{alias} sent a lot to {pub} ({site})",
+                  f"Seen from {macs[0]} and {ip6} on {ssid}", "x", "y",
+                  evidence=[f"{ips[0]} → {site}", f"{mdns} via {ssid}"])
+    m.alerts._add("new_device", "WARNING", devs[1].key,
+                  f"New device {host} ({ips[1]}, {macs[1]})", "seen", "x",
+                  "y")
+    facts = checkup_facts(m, data_mode="offline", network=ssid, ready=[
+        ("data", "Data folder", "ok",
+         f"Data folder: /home/{user}/.local/share/MiniWireshark", "folder"),
+        ("network", "Network card", "info",
+         f"Default network: wlan0, router {ips[2]}, this computer {ip6}",
+         "")])
+    facts["investigations"].append({
+        "key": "dns", "q": INVESTIGATION_TITLES["dns"], "status": "Likely",
+        "answer": f"The DNS server {ips[3]} answers slowly",
+        "why": [f"{site} took 2 s via {macs[2]}", f"{dhcp} asked {pub}"],
+        "fix": f"Restart {ssdp} or {owner}'s router"})
+    facts["story"].append(("Today", [f"{alias} joined {ssid} from {ip6} "
+                                     f"and visited {site}"]))
+    canaries = [alias, host, dhcp, mdns, ssdp, owner, ssid, user, site,
+                ip6, pub] + ips + macs
+    off = checkup_html(facts)
+    low = off.lower()
+    missing = [c for c in canaries if c.lower() not in low]
+    assert not missing, f"not planted: {missing}"
+    svgs = re.findall(r"(?s)<svg\b.*?</svg>", off)
+    assert any(alias[:20] in s and "<title>" in s for s in svgs), \
+        "the chart doesn't name the device"
+    assert any("aria-label" in s and alias in s for s in svgs)
+    # every investigation ran, and each one says something
+    keys = {q["key"] for q in facts["investigations"]}
+    assert {"slow", "bandwidth"} | set(INVESTIGATIONS_V2) <= keys, keys
+    assert "Can't tell" in html.unescape(off)
+    red = CheckupRedactor(m, networks=[ssid], users=[user])
+    on = checkup_html(facts, red)
+
+    def views(doc):
+        yield doc
+        yield html.unescape(doc)
+        yield urllib.parse.unquote(html.unescape(doc))
+        for run in re.findall(r"[A-Za-z0-9+/]{12,}={0,2}", doc):
+            for pad in ("", "=", "=="):
+                with contextlib.suppress(Exception):
+                    yield base64.b64decode(run + pad).decode(
+                        "utf-8", "ignore")
+                    break
+    leaks = set()
+    for v in views(on):
+        lv = v.lower()
+        if T in lv:
+            leaks.add(T)
+        leaks.update(c for c in canaries if c.lower() in lv or
+                     c.lower().replace(":", "-") in lv)
+        leaks.update(c for c in macs if c.replace(":", "").lower() in lv)
+    assert not leaks, f"leaked with details hidden: {sorted(leaks)}"
+    assert "<!--" not in on and "<script" not in on.lower()
+    # still a whole page, with stand-ins that stay the same everywhere
+    assert on.startswith("<!doctype html>") and on.rstrip().endswith(
+        "</html>") and on.count("<svg") == off.count("<svg") == 2
+    stand_in = red.name(alias)
+    assert stand_in.startswith("Device ") and red.text(stand_in) == stand_in
+    assert stand_in in "".join(re.findall(r"(?s)<svg\b.*?</svg>", on)), \
+        "the chart label isn't the device's stand-in"
+    assert re.search(r"<b>%s</b>" % re.escape(stand_in), on)
+    assert "Network A" in on and "User 1" in on
+    assert red.text(red.text(f"{ips[0]} {macs[0]} {ip6} {site}")) == \
+        red.text(f"{ips[0]} {macs[0]} {ip6} {site}"), "stand-ins renumbered"
+    # self-contained: nothing is fetched from anywhere
+    for doc in (on, off):
+        assert not re.search(r"(?i)\b(src|href)\s*=|<link|<img|<script|"
+                             r"url\(|@import", doc)
+    # the last pass catches what the first one missed: attributes, comments
+    sc = scrub_html(f"<p title='{host}' data-x=\"{ips[0]}\">{mdns}</p>"
+                    f"<!-- {alias} --><style>p{{color:red}}</style>", red)
+    assert T not in sc.lower() and ips[0] not in sc and "color:red" in sc
+    # in French too
+    try:
+        set_locale("fr")
+        fr = checkup_html(facts, red)
+        assert "Bilan du réseau" in fr and T not in fr.lower(), fr[:300]
+    finally:
+        set_locale("English")
+
+
+@self_test()
+def t_checkup_scenario_page(ctx):
+    """5.3.4 (M14, MC11): the check-up of the home-network scenario is one
+    self-contained page with the five parts, every investigation answered
+    passively (one of them "Can't tell from here" from a file), built
+    within its 2 s budget; the switch takes it out of the menus."""
+    if not ctx.scapy_ok:
+        return "skip"
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    t0 = time.perf_counter()
+    facts = checkup_facts(m, data_mode="offline", ready=ready_report(
+        ctx.cfg()))
+    red = CheckupRedactor(m)
+    page = checkup_html(facts, red)
+    ms = (time.perf_counter() - t0) * 1000
+    assert ms < 2000, f"check-up took {ms:.0f} ms"
+    for head in ("Ready?", "What changed", "Unusual activity",
+                 "Common questions", "Devices"):
+        assert f"<h2>{head}</h2>" in page, head
+    for k in ["slow", "bandwidth"] + list(INVESTIGATIONS_V2):
+        assert INVESTIGATION_TITLES[k] in html.unescape(page), k
+    assert any(q["status"] == "Can't tell" for q in facts["investigations"])
+    assert len(facts["devices"]) == len(m.registry.by_key)
+    for d in m.registry.by_key.values():
+        for o in (d.ip, d.mac, d.hostname, d.dhcp_hostname, d.mdns_name):
+            assert not o or len(o) < 3 or o.lower() not in page.lower(), o
+    assert "Alex-iPhone".lower() not in page.lower()
+    plain = checkup_html(facts)
+    assert "Alex-iPhone" in plain
+    assert len(page) < 400_000
+    old = FEATURES.get("checkup_report", True)
+    try:
+        FEATURES["checkup_report"] = False
+
+        class _App:
+            pass
+        a = _App()
+        assert MiniWireshark.export_checkup(a) is None
+    finally:
+        FEATURES["checkup_report"] = old
+
+
+@self_test()
 def t_ed25519_rfc8032(ctx):
     """RFC 8032 §7.1 test vectors 1 and 2, pure Python and library."""
     for sk, msg, pk, sig in (
@@ -79708,6 +80431,83 @@ def gt_534_investigations_v2(app, ctx):
     finally:
         set_locale("English")
     assert app.model is old_model and app.data_mode == old_mode
+
+
+@gui_test_step("5.3.4 M14: the Network check-up from the Export menu, "
+               "redacted by default, saved through the window; palette")
+def gt_534_checkup_report(app, ctx):
+    root = app.root
+    # the window's own model, as the scenario capture left it (swapping
+    # in another one would empty the tables the next steps read)
+    m = app.model
+    names = sorted({n for d in m.registry.by_key.values() for n in
+                    (d.hostname, d.dhcp_hostname, d.mdns_name)
+                    if n and len(n) >= 3})
+    assert names, "the scenario capture named no device"
+    # the palette offers it too
+    labels = {x[0] for x in app.palette_items()}
+    assert "Network check-up…" in labels, sorted(labels)[:20]
+    # the Export menu entry, invoked as a click would
+    shown = []
+    orig = tk.Menu.tk_popup
+    tk.Menu.tk_popup = lambda menu, *a, **k: shown.append(menu)
+    try:
+        app._open_export_menu()
+    finally:
+        tk.Menu.tk_popup = orig
+    menu = shown[-1]
+    idx = next(i for i in range(menu.index("end") + 1)
+               if menu.type(i) == "command" and
+               menu.entrycget(i, "label") == "Network check-up…")
+    app._checkup_win = None
+    menu.invoke(idx)
+    assert _gui_pump(root, 0.1, lambda: getattr(app, "_checkup_win", None)
+                     is not None, timeout=30), "the check-up didn't open"
+    w = app._checkup_win
+    try:
+        assert w.title().startswith("Network check-up"), w.title()
+        assert w._mw_on.get() and all(v.get() for v in
+                                      w._mw_opts.values())
+        out = w._mw_state["out"]
+        low = out.lower()
+        for n in names:
+            assert n.lower() not in low, n
+        for d in m.registry.by_key.values():
+            for o in (d.ip, d.mac):
+                assert not o or o not in out, o
+        assert "<h2>Common questions</h2>" in out and "<svg" in out
+        assert "Device 1" in out
+        # hiding off shows the names; on again hides them
+        w._mw_on.set(False)
+        w._mw_render()
+        assert any(n in w._mw_state["out"] for n in names), names
+        w._mw_on.set(True)
+        w._mw_render()
+        assert not any(n.lower() in w._mw_state["out"].lower()
+                       for n in names)
+        # Save… writes what the right side shows
+        path = ctx.path("checkup.html")
+        app._ask_save = lambda *a, **k: path
+        try:
+            w._mw_save()
+        finally:
+            del app._ask_save
+        with open(path, encoding="utf-8") as f:
+            saved = f.read()
+        assert saved.startswith("<!doctype html>") and not any(
+            n.lower() in saved.lower() for n in names), saved[:200]
+    finally:
+        with contextlib.suppress(tk.TclError):
+            w.destroy()
+    # switched off: neither the menu nor the palette offers it
+    old = FEATURES["checkup_report"]
+    try:
+        FEATURES["checkup_report"] = False
+        assert "Network check-up…" not in {x[0] for x in
+                                           app.palette_items()}
+        assert app.export_checkup() is None
+    finally:
+        FEATURES["checkup_report"] = old
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
