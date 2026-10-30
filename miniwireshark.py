@@ -1124,7 +1124,8 @@ def cli_check(argv):
             return 0, cli_usage()
         if a in ("-V", "--version"):
             if "--sign-release" in argv:   # a value of --sign-release
-                i += 1
+                if i < len(argv) and not argv[i].startswith("-"):
+                    i += 1                 # its value, never the next flag
                 continue
             return 0, f"MiniWireshark {SCRIPT_VERSION}"
         spec = CLI_FLAGS.get(a)
@@ -1132,8 +1133,8 @@ def cli_check(argv):
             if not a.startswith("-") and free_words:
                 continue
             hint = ""
-            close = [f for f in CLI_FLAGS if f.startswith("--") and
-                     _cli_close(a, f)]
+            close = [f for f, spec in CLI_FLAGS.items()
+                     if f.startswith("--") and spec[2] and _cli_close(a, f)]
             if close:
                 hint = f" Did you mean {close[0]}?"
             what = "option" if a.startswith("-") else "argument"
@@ -1153,12 +1154,16 @@ def cli_check(argv):
 
 
 def _cli_close(a, b):
-    """True when a typed flag is one edit-ish step from a real one."""
+    """True when a typed flag is one edit-ish step from a real one: the
+    same letters swapped, or at most two letters off on a word long
+    enough for that to still be the same word ("k" is not "--key")."""
     a, b = a.lstrip("-"), b.lstrip("-")
-    if abs(len(a) - len(b)) > 2 or not a:
+    if abs(len(a) - len(b)) > 2 or len(a) < 3:
         return False
-    return sorted(a) == sorted(b) or sum(
-        x != y for x, y in zip(a, b)) + abs(len(a) - len(b)) <= 2
+    if sorted(a) == sorted(b):
+        return True
+    import difflib
+    return difflib.SequenceMatcher(None, a, b).ratio() >= 0.75
 
 
 if __name__ == "__main__":
@@ -7193,7 +7198,25 @@ DWMWA_DARK = 20
 DWMWA_DARK_OLD = 19
 TITLE_BAR = {"dark": False, "hooked": False,
              # tests put (dwmapi, user32, build) here to run off Windows
-             "api": None}
+             "api": None,
+             # the api Windows refused once (7 and 8): never asked again,
+             # not on every dialog's <Map>
+             "refused": None}
+
+
+def _title_bar_types(dwm, user32):
+    """Declare the two calls' argument types once, so a window handle is
+    passed whole on 64-bit Windows and the HRESULT reads signed."""
+    from ctypes import wintypes
+    for fn, args, res in (
+            (getattr(dwm, "DwmSetWindowAttribute", None),
+             [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p,
+              wintypes.DWORD], ctypes.c_long),
+            (getattr(user32, "GetParent", None), [wintypes.HWND],
+             wintypes.HWND)):
+        if fn is not None and hasattr(fn, "argtypes") and \
+                fn.argtypes is None:
+            fn.argtypes, fn.restype = args, res
 
 
 def _title_bar_api():
@@ -7208,7 +7231,8 @@ def _title_bar_api():
         build = sys.getwindowsversion().build
     except AttributeError:
         build = 0
-    return windll.dwmapi, windll.user32, build
+    TITLE_BAR["api"] = (windll.dwmapi, windll.user32, build)
+    return TITLE_BAR["api"]
 
 
 def dark_title_bar(win, dark):
@@ -7221,18 +7245,26 @@ def dark_title_bar(win, dark):
         return False                # never touched: nothing to undo
     try:
         api = _title_bar_api()
-        if api is None:
+        if api is None or (TITLE_BAR["refused"] is not None and
+                           TITLE_BAR["refused"] == api):
             return False
         dwm, user32, build = api
+        _title_bar_types(dwm, user32)
         win.update_idletasks()
         hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
         attr = DWMWA_DARK if build >= 18985 else DWMWA_DARK_OLD
         value = ctypes.c_int(1 if dark else 0)
-        rc = dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(value),
-                                       ctypes.sizeof(value))
+        try:
+            rc = dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(value),
+                                           ctypes.sizeof(value))
+        except (OSError, AttributeError, ctypes.ArgumentError) as e:
+            LOG.debug("dark title bar refused: %s", e)
+            rc = -1
         ok = rc == 0
         if ok:
             win._mw_dark_tb = bool(dark)
+        else:
+            TITLE_BAR["refused"] = api
         return ok
     except Exception as e:                           # noqa: BLE001
         # keep: a light title bar is the harmless fallback
@@ -28219,6 +28251,8 @@ I18N_PATTERNS = [
     (r"Picked because (.+)\.", r"Choisie parce que \1.",
      r"Elegida porque \1."),
     (r"Picked because (.+)", r"Choisie parce que \1", r"Elegida porque \1"),
+    # French counts zero as one ("0 paquet"), Spanish as many
+    (r"0 packets", r"0 paquet", r"0 paquetes"),
     (r"([\d,]+) packets", r"\1 paquets", r"\1 paquetes"),
     (r"1 packet", r"1 paquet", r"1 paquete"),
     (r"([\d,]+) devices", r"\1 appareils", r"\1 dispositivos"),
@@ -29095,6 +29129,10 @@ EVENT_PATTERNS = [
     (r"1 more thing just happened — switch to “Full speed” to see every "
      r"line", r"1 autre événement à l'instant — passez en « Pleine "
      r"vitesse » pour voir chaque ligne", r"1 cosa más acaba de pasar: "
+     r"cambie a «Velocidad máxima» para ver cada línea"),
+    (r"0 more things just happened — switch to “Full speed” to see every "
+     r"line", r"0 autre événement à l'instant — passez en « Pleine "
+     r"vitesse » pour voir chaque ligne", r"0 cosas más acaban de pasar: "
      r"cambie a «Velocidad máxima» para ver cada línea"),
     (r"([\d,]+) more things just happened — switch to “Full speed” to see "
      r"every line", r"\1 autres événements à l'instant — passez en « Pleine "
@@ -40745,7 +40783,7 @@ def _fx_lc(p):
 
 
 def _fx_say(node):
-    """(noun, [qualifiers], grouped) -> words."""
+    """(noun, [qualifiers], grouped, negated) -> words."""
     noun, quals = node[0], node[1]
     tr = translate_text
     noun = noun or tr("Traffic")
@@ -40764,6 +40802,9 @@ def _fx_or(toks, i):
         return None, i
     if len(parts) == 1:
         return node, i
+    if any(p_[3] for p_ in parts):
+        # "not tcp or udp" would read "everything except TCP or UDP"
+        return None, i
     either = translate_text("%s or %s")
     if len({p_[0] for p_ in parts}) == 1 and all(len(p_[1]) == 1
                                                  for p_ in parts):
@@ -40771,11 +40812,11 @@ def _fx_or(toks, i):
         q = parts[0][1][0]
         for p_ in parts[1:]:
             q = either % (q, p_[1][0])
-        return (parts[0][0], [q], True), i
+        return (parts[0][0], [q], True, False), i
     said = _fx_say(parts[0])
     for p_ in parts[1:]:
         said = either % (said, _fx_lc(_fx_say(p_)))
-    return (said, [], True), i
+    return (said, [], True, False), i
 
 
 def _fx_and(toks, i):
@@ -40788,8 +40829,15 @@ def _fx_and(toks, i):
         return None, i
     if len(nodes) == 1:
         return node, i
+    # 5.3.4: when unsure, say nothing. "tcp and dns" is not "TCP traffic
+    # and DNS" (a packet that is both), "not tcp and udp" is not
+    # "everything except TCP and UDP", and two kinds of traffic can't
+    # share their qualifiers ("tcp.port == 80 and udp.port == 53").
+    # Plain "traffic" (an address, a length) narrows any one kind.
+    if any(n_[3] for n_ in nodes):
+        return None, i
     nouns, quals = [], []
-    for n, q, grouped in nodes:
+    for n, q, grouped, _neg in nodes:
         if grouped and not q:          # "(a or b) and c": keep it apart
             n = f"({n})"
         if grouped and len(q) == 1:
@@ -40797,10 +40845,9 @@ def _fx_and(toks, i):
         if n and n not in nouns:
             nouns.append(n)
         quals += q
-    noun = nouns[0] if nouns else ""
-    for n in nouns[1:]:
-        noun = translate_text("%s and %s") % (noun, _fx_lc(n))
-    return (noun, quals, False), i
+    if len(nouns) > 1:
+        return None, i
+    return (nouns[0] if nouns else "", quals, False, False), i
 
 
 def _fx_not(toks, i):
@@ -40809,7 +40856,7 @@ def _fx_not(toks, i):
         if not node:
             return None, i
         return (translate_text("Everything except %s") %
-                _fx_lc(_fx_say(node)), [], False), i
+                _fx_lc(_fx_say(node)), [], False, True), i
     return _fx_atom(toks, i)
 
 
@@ -40830,35 +40877,40 @@ def _fx_atom(toks, i):
                                           toks[i][1] == "contains") else None
     if op is None:
         if word in FILTER_NOUNS:
-            return (tr(FILTER_NOUNS[word]), [], False), i
+            return (tr(FILTER_NOUNS[word]), [], False, False), i
         if word in FILTER_PORT_PROTOS:
-            return (tr("%s traffic") % word.upper(), [], False), i
+            return (tr("%s traffic") % word.upper(), [], False, False), i
         desc = _fx_desc(word)
         if desc:
-            return ("", [tr("that have %s") % _fx_lc(tr(desc))], False), i
+            return ("", [tr("that have %s") % _fx_lc(tr(desc))], False,
+                    False), i
         return None, i
     if i + 1 >= len(toks) or toks[i + 1][0] == "op":
         return None, i
     value = toks[i + 1][1]
     i += 2
+    if op == "!=":
+        # 5.3.4: "!=" also matches every packet without the field (a UDP
+        # packet for "tcp.port != 80") and, on a two-way field, a packet
+        # with the address on one side ("ip.addr != X" matches X's own
+        # packets): no short sentence says that, so none is said
+        return None, i
     if word == "frame.len" and op in FILTER_LEN_WORDS:
-        return ("", [tr(FILTER_LEN_WORDS[op]) % value], False), i
-    if word in FILTER_FIELD_WORDS and op in ("==", "!=", "contains"):
+        return ("", [tr(FILTER_LEN_WORDS[op]) % value], False, False), i
+    if word in FILTER_FIELD_WORDS and op in ("==", "contains"):
         noun, pat = FILTER_FIELD_WORDS[word]
         if op == "contains":
             if word != "dns.qry.name":
                 return None, i
             pat = "for names containing %s"
-        q = tr(pat) % value
-        if op == "!=":
-            q = tr("not %s") % q
-        return (tr(noun) if noun else "", [q], False), i
+        return (tr(noun) if noun else "", [tr(pat) % value], False,
+                False), i
     desc = _fx_desc(word)
     if not desc:
         return None, i
     return ("", [tr("where %s %s %s") % (_fx_lc(tr(desc)),
                                          tr(FILTER_OP_WORDS[op]), value)],
-            False), i
+            False, False), i
 
 
 def _fx_desc(word):
@@ -57460,12 +57512,33 @@ REDACT_OPTIONS = {"addresses": "IP addresses",
                   "names": "Device names, notes and your labels",
                   "networks": "Network (Wi-Fi) names",
                   "sites": "Website names"}
-_RX_MAC = re.compile(r"\b[0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5}\b")
+# 5.3.4: a hardware address in any of its spellings: aa:bb:cc:dd:ee:ff,
+# AA-BB-CC-DD-EE-FF, aabbccddeeff and the dotted aabb.ccdd.eeff
+_RX_MAC = re.compile(r"\b(?:[0-9a-fA-F]{2}(?:[:-][0-9a-fA-F]{2}){5}|"
+                     r"[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4}|"
+                     r"[0-9a-fA-F]{12})\b")
 _RX_IP4 = re.compile(r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)")
+# an IPv6 address may end in a dotted quad (::ffff:192.168.1.5)
 _RX_IP6 = re.compile(r"(?<![0-9A-Za-z:])(?:[0-9a-fA-F]{0,4}:){2,7}"
-                     r"[0-9a-fA-F]{0,4}(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:])")
-_RX_DOMAIN = re.compile(r"\b(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
-                        r"[a-z]{2,24}\b", re.I)
+                     r"(?:(?:\d{1,3}\.){3}\d{1,3}(?!\.?\d)|[0-9a-fA-F]{0,4})"
+                     r"(?:%[0-9A-Za-z]+)?(?![0-9A-Za-z:])")
+# labels may hold any letter (bücher.de); the last one may be punycode
+_RX_DOMAIN = re.compile(r"\b(?:[^\W_](?:[\w-]{0,61}[^\W_])?\.)+"
+                        r"(?:xn--[a-z0-9-]{1,59}|[^\W\d_]{2,24})\b", re.I)
+
+
+def _ip_key(ip):
+    """One spelling per address, so that fe80::1 and FE80:0:0:0:0:0:0:1,
+    or 192.168.001.010 and 192.168.1.10, share one stand-in. None when it
+    is not an address at all."""
+    ip = str(ip or "").split("%")[0]
+    a = ip_obj(ip)
+    if a is None and ":" not in ip:
+        parts = ip.split(".")
+        if len(parts) == 4 and all(p.isdigit() and int(p) < 256
+                                   for p in parts):
+            a = ip_obj(".".join(str(int(p)) for p in parts))
+    return None if a is None else str(a)
 
 
 class Redactor:
@@ -57515,8 +57588,12 @@ class Redactor:
         return s
 
     def ip(self, ip):
+        ip = _ip_key(ip) or str(ip)
         if ":" in ip:
-            return self._pseudo("ip6", ip.lower(), lambda n: f"2001:db8::"
+            v4 = getattr(ip_obj(ip), "ipv4_mapped", None)
+            if v4 is not None:              # ::ffff:a.b.c.d is a.b.c.d
+                return "::ffff:" + self.ip(str(v4))
+            return self._pseudo("ip6", ip, lambda n: f"2001:db8::"
                                 f"{n:x}")
         if is_private_ip(ip) or ip.startswith(("169.254.", "100.")):
             return self._pseudo("ip4", ip, lambda n: f"192.0.2.{n % 254 + 1}"
@@ -57529,7 +57606,8 @@ class Redactor:
                             f"{n % 254 + 1}")
 
     def mac(self, mac):
-        m = mac.lower().replace("-", ":")
+        m = re.sub(r"[^0-9a-f]", "", mac.lower())
+        m = ":".join(m[i:i + 2] for i in range(0, len(m), 2))
         if m in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
             return m
         return self._pseudo("mac", m, lambda n: f"02:00:00:00:{n >> 8:02x}:"
@@ -57556,19 +57634,24 @@ class Redactor:
             rx = re.compile("|".join(re.escape(n) for n in sorted(
                 self.networks, key=len, reverse=True)), re.I)
             s = rx.sub(lambda m: self.network(m.group(0)), s)
-        if self.opts["hardware"]:
-            s = _RX_MAC.sub(lambda m: self.mac(m.group(0)), s)
-        if self.opts["addresses"]:
-            s = _RX_IP6.sub(lambda m: self.ip(m.group(0).split("%")[0])
-                            if ip_obj(m.group(0).split("%")[0]) is not None
-                            else m.group(0), s)
-            s = _RX_IP4.sub(lambda m: self.ip(m.group(0)) if ip_obj(
-                m.group(0)) is not None else m.group(0), s)
+        s = self._addresses(s)
         if self.opts["sites"]:
             s = _RX_DOMAIN.sub(lambda m: m.group(0) if m.group(0).lower(
             ).endswith((".example", ".local", ".lan", ".html", ".css")) or
                 m.group(0).lower() in ("miniwireshark",) else
                 self.site(m.group(0)), s)
+        return s
+
+    def _addresses(self, s):
+        """The hardware and IP address passes (shared by both redactors);
+        a match that isn't a real address is left as it is."""
+        def addr(m):
+            return m.group(0) if _ip_key(m.group(0)) is None else \
+                self.ip(m.group(0))
+        if self.opts["hardware"]:
+            s = _RX_MAC.sub(lambda m: self.mac(m.group(0)), s)
+        if self.opts["addresses"]:
+            s = _RX_IP4.sub(addr, _RX_IP6.sub(addr, s))
         return s
 
     def summary(self):
@@ -57977,12 +58060,33 @@ class CheckupRedactor(Redactor):
         # visited names a domain pattern would not recognise (a bare
         # word such as "printer"); the rest are caught by the pattern
         doms = set(getattr(model, "websites", {}) or {})
-        with contextlib.suppress(Exception):
+        try:
             doms.update(fl.domain for fl in model.flows.all_flows()
                         if fl.domain)
-        with contextlib.suppress(Exception):
-            doms.update(v for v in model.cache.values()
-                        if isinstance(v, str))
+        except (AttributeError, TypeError, RuntimeError):
+            LOG.warning("check-up: the flows' names weren't read",
+                        exc_info=True)
+        # 5.3.4: the name cache holds the names devices gave themselves
+        # (NetBIOS, mDNS, DHCP) and reverse-DNS answers ("KRYSS-NAS");
+        # those are device names in whatever shape they come
+        cache = getattr(model, "cache", None)
+        if cache is not None:
+            try:
+                with cache.lock:
+                    learned = [(ip, name, cache.sources.get(ip, ""))
+                               for ip, name in cache.ip_to_name.items()]
+            except (AttributeError, TypeError, RuntimeError):
+                learned = []
+                LOG.warning("check-up: the name cache wasn't read",
+                            exc_info=True)
+            for ip, name, src in learned:
+                if not isinstance(name, str):
+                    continue
+                if src in ("dhcp", "mdns", "nbns", "netbios", "rdns") or \
+                        is_private_ip(ip):
+                    self._add_name(name)
+                else:
+                    doms.add(name)
         for dom in doms:
             if dom and not _RX_DOMAIN.fullmatch(str(dom)):
                 self._add_name(dom)
@@ -58009,35 +58113,57 @@ class CheckupRedactor(Redactor):
     def user(self, s):
         return self._pseudo("user", s.lower(), lambda n: f"User {n}")
 
-    def _alt(self, kind, items, words=False):
+    @staticmethod
+    def _spellings(n, exact):
+        """The pattern for one name. 5.3.4: a name that is a plain word
+        ("Mac", "Home", "card") is matched in its own case or capitalised
+        only, so "MAC address" and "your home network" stay as written;
+        any other name ("KRYSS-NAS", "Kitchen TV") in any case."""
+        if not exact or not n.isalpha():
+            return "(?i:%s)" % re.escape(n)
+        return "|".join(re.escape(v) for v in sorted({n, n[:1].upper() +
+                                                      n[1:]}))
+
+    def _alt(self, kind, items, exact=True):
+        """Whole words only: a name never matches inside another word, so
+        "Sam" leaves "Same" alone and "vic" leaves "Device" alone."""
         key = (kind, len(items))
         rx = self._rx.get(key)
         if rx is None:
-            body = "|".join(re.escape(n) for n in sorted(items, key=len,
-                                                         reverse=True))
-            rx = self._rx[key] = re.compile(
-                r"(?<!\w)(?:%s)(?!\w)" % body if words else body, re.I)
+            body = "|".join(self._spellings(n, exact) for n in sorted(
+                items, key=len, reverse=True))
+            rx = self._rx[key] = re.compile(r"(?<!\w)(?:%s)(?!\w)" % body)
         return rx
+
+    # every shape of stand-in this redactor writes (the addresses are the
+    # ranges kept for documentation, so nothing real is ever in them)
+    _RX_STANDIN = re.compile(
+        r"((?<!\w)(?:Device \d+|Network [A-Z]{1,3}|User \d+|"
+        r"site-\d+\.example|(?:::ffff:)?192\.0\.2\.\d+(?:#\d+)?|"
+        r"(?:::ffff:)?198\.51\.100\.\d+|2001:db8::[0-9a-f]+|"
+        r"02:00:00:00:[0-9a-f]{2}:[0-9a-f]{2})(?![\w:.]\w|\w))")
+
+    def _outside_standins(self, s, fn):
+        """Run fn over the parts of s that aren't a stand-in already, so
+        a name never matches inside one ("vic" in "Device 1") and running
+        the page through again never renames anything."""
+        parts = self._RX_STANDIN.split(s)
+        return "".join(p if i % 2 else fn(p) for i, p in enumerate(parts))
 
     def text(self, s):
         s = str(s)
         if self.opts["names"] and self.users:
-            s = self._alt("users", self.users, True).sub(
-                lambda m: self.user(m.group(0)), s)
+            s = self._outside_standins(s, lambda p: self._alt(
+                "users", self.users, False).sub(
+                    lambda m: self.user(m.group(0)), p))
         if self.opts["names"] and self.names:
-            s = self._alt("names", self.names).sub(
-                lambda m: self.name(m.group(0)), s)
+            s = self._outside_standins(s, lambda p: self._alt(
+                "names", self.names).sub(lambda m: self.name(m.group(0)), p))
         if self.opts["networks"] and self.networks:
-            s = self._alt("networks", self.networks).sub(
-                lambda m: self.network(m.group(0)), s)
-        if self.opts["hardware"]:
-            s = _RX_MAC.sub(lambda m: self.mac(m.group(0)), s)
-        if self.opts["addresses"]:
-            s = _RX_IP6.sub(lambda m: self.ip(m.group(0).split("%")[0])
-                            if ip_obj(m.group(0).split("%")[0]) is not None
-                            else m.group(0), s)
-            s = _RX_IP4.sub(lambda m: self.ip(m.group(0)) if ip_obj(
-                m.group(0)) is not None else m.group(0), s)
+            s = self._outside_standins(s, lambda p: self._alt(
+                "networks", self.networks).sub(
+                    lambda m: self.network(m.group(0)), p))
+        s = self._outside_standins(s, self._addresses)
         if self.opts["sites"]:
             def site(m):
                 d = m.group(0).lower()
@@ -58059,22 +58185,45 @@ _RX_HTML_SPLIT = re.compile(r"(<style\b[^>]*>.*?</style>|<[^>]*>)",
                             re.S | re.I)
 
 
+# 5.3.4: the page's own markup (class names, the charset, roles, SVG
+# geometry) never holds anything personal and is never rewritten; every
+# other attribute (aria-label, title, alt, data-…) is read by people
+_SCRUB_KEEP_ATTRS = frozenset((
+    "class", "style", "charset", "role", "lang", "id", "for", "name",
+    "type", "dir", "xmlns", "viewbox", "width", "height", "x", "y", "x1",
+    "x2", "y1", "y2", "cx", "cy", "r", "rx", "ry", "d", "points",
+    "transform", "fill", "stroke", "stroke-width", "stroke-dasharray",
+    "stroke-linecap", "stroke-linejoin", "opacity", "fill-opacity",
+    "font-size", "font-weight", "text-anchor", "dominant-baseline",
+    "preserveaspectratio", "focusable", "aria-hidden", "tabindex",
+    "colspan", "rowspan", "scope", "http-equiv", "offset", "stop-color"))
+_RX_META_SETTING = re.compile(
+    r"""(?i)^<meta\b.*(?:\bhttp-equiv\s*=|\bname\s*=\s*["']?"""
+    r"""(?:viewport|color-scheme)\b)""", re.S)
+
+
 def scrub_html(doc, red):
     """The last pass over a finished page: drop comments, then run the
-    redactor over every text node and every attribute value (an SVG
-    <title>, an aria-label), leaving tag names and the style sheet
-    alone."""
+    redactor over every text node and every attribute people read (an
+    aria-label, a title), leaving tag names, the page's own markup and
+    the style sheet alone."""
     doc = re.sub(r"<!--.*?-->", "", doc, flags=re.S)
     out = []
+
+    def attr(m, setting):
+        name = m.group(1).strip().rstrip("=").strip().lower()
+        if name in _SCRUB_KEEP_ATTRS or (name == "content" and setting):
+            return m.group(0)
+        return m.group(1) + m.group(2) + html.escape(
+            red.text(html.unescape(m.group(3)))) + m.group(2)
     for part in _RX_HTML_SPLIT.split(doc):
         if not part:
             continue
         if part[:6].lower() == "<style" or part.startswith(("<!", "</")):
             out.append(part)
         elif part.startswith("<"):
-            out.append(_RX_TAG_ATTR.sub(
-                lambda m: m.group(1) + m.group(2) + html.escape(
-                    red.text(html.unescape(m.group(3)))) + m.group(2), part))
+            setting = bool(_RX_META_SETTING.match(part))
+            out.append(_RX_TAG_ATTR.sub(lambda m: attr(m, setting), part))
         else:
             out.append(html.escape(red.text(html.unescape(part)),
                                    quote=False))
@@ -72408,6 +72557,130 @@ def t_checkup_canary_redaction(ctx):
 
 
 @self_test()
+def t_checkup_redaction_shapes(ctx):
+    """5.3.4 (M14 review): the check-up hides a name held only in the name
+    cache (NetBIOS, reverse DNS), short names that are also ordinary words
+    ("Mac", "Home", "card", "Sam", "vic") without garbling those words or
+    the stand-ins, hardware addresses written without separators or with
+    dots, one IPv6 address written two ways (one stand-in), an
+    IPv4-mapped IPv6 address and a punycode website; and the page's own
+    markup (class names, charset, roles, chart geometry) is unchanged:
+    only the text differs."""
+    from html.parser import HTMLParser
+    T = "cnry9q2z"
+    nb, rdns = "CNRY9Q2Z-NAS", "cnry9q2z-rdns"   # only in the name cache
+    clk = _FakeClock()
+    m = NetworkModel(ctx.cfg(), "10.88.1.1", ["10.88.1.20"], [], clk)
+    d1 = m.registry.touch("10.88.1.10", "0a:9c:2e:00:00:01", "arp_reply",
+                          "x")
+    d2 = m.registry.touch("10.88.1.11", "0a:9c:2e:00:00:02", "arp_reply",
+                          "x")
+    d1.alias, d1.owner = "Mac", "Sam"
+    d2.alias, d2.place = "vic", "card"
+    d1.bytes_up, d2.bytes_up = 9_000_000, 5_000_000
+    m.cache.learn("10.88.1.40", nb, "nbns")
+    m.cache.learn("10.88.1.41", rdns, "rdns")
+    mac_bare, mac_dot = "0a9c2e00ab01", "0a9c.2e00.ab02"
+    v6a, v6b = "fd9c:2e00::ab03", "FD9C:2E00:0:0:0:0:0:AB03"
+    mapped, puny = "::ffff:10.88.1.42", "cnry9q2z.xn--p1ai"
+    prose = ("Same as before: your home network, the MAC address of this "
+             "machine, the cards and a discard, a victory for every Device")
+    line = (f"{nb} and {rdns} backed up to {mapped} via {mac_bare} / "
+            f"{mac_dot}, {v6a} and {v6b}, then opened {puny}; Mac joined "
+            f"Home, Sam's card, vic")
+    facts = checkup_facts(m, data_mode="offline", network="Home", ready=[
+        ("data", "Data folder", "ok", prose, "")])
+    facts["story"].append(("Today", [line]))
+    off = checkup_html(facts)
+    for c in (nb, rdns, mapped, mac_bare, mac_dot, v6a, v6b, puny, prose):
+        assert c in html.unescape(off), f"not planted: {c}"
+
+    class Skeleton(HTMLParser):
+        """Every tag with its attributes, minus the ones people read."""
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.tags, self.style, self._in_style = [], [], False
+
+        def handle_starttag(self, tag, attrs):
+            self.tags.append((tag, sorted(
+                (k, v) for k, v in attrs
+                if k not in ("aria-label", "title", "alt"))))
+            self._in_style = tag == "style"
+
+        def handle_endtag(self, tag):
+            self.tags.append(("/" + tag, []))
+            self._in_style = False
+
+        def handle_data(self, data):
+            if self._in_style:
+                self.style.append(data)
+
+    def skeleton(doc):
+        p = Skeleton()
+        p.feed(doc)
+        return p.tags, p.style
+    for opts in ({}, {"sites": False}):
+        red = CheckupRedactor(m, options=opts, networks=["Home"], users=[])
+        on = checkup_html(facts, red)
+        text = html.unescape(on)
+        low = text.lower()
+        leaks = [c for c in (nb, rdns, mac_bare, mac_dot, v6a, v6b,
+                             "10.88.1.42", "88.1.42", "fd9c:2e00")
+                 if c.lower() in low]
+        if opts.get("sites", True):
+            leaks += [c for c in (puny, "xn--", "p1ai", T) if c in low]
+        assert not leaks, (opts, leaks, red.names)
+        assert nb in red.names and rdns in red.names, red.names
+        # ordinary words and stand-ins are left as they were…
+        assert prose in text, (opts, re.findall(r"Same as.{0,160}", text))
+        # …and the names themselves, as whole words, are replaced
+        assert re.search(r"Device \d+ joined Network A, Device \d+'s "
+                         r"Device \d+, Device \d+", text), (opts, text[-900:])
+        # one stand-in per address, whatever its spelling
+        assert red.text(v6a) == red.text(v6b) and red.text(v6a).startswith(
+            "2001:db8::"), (red.text(v6a), red.text(v6b))
+        v4 = red.text("10.88.1.42")
+        assert v4.startswith("192.0.2.") and red.text(mapped) == \
+            "::ffff:" + v4, red.text(mapped)
+        assert red.text("0000:0000:0000:0000:0000:ffff:0a58:012a") == \
+            "::ffff:" + v4
+        want = red.text("0a:9c:2e:00:ab:01")
+        assert want.startswith("02:00:00:00:") and red.text(mac_bare) == \
+            want == red.text("0A9C.2E00.AB01") == red.text("0A-9C-2E-00-AB-01")
+        assert red.text(red.text(line)) == red.text(line), "renumbered"
+        # the markup is the same page: tags, class names, charset, roles,
+        # language, chart geometry and the style sheet (only the note on
+        # top says on purpose that details are shown)
+        same = off.replace("class='note shown'", "class='note'", 1)
+        assert skeleton(on) == skeleton(same), [
+            (a, b) for a, b in zip(skeleton(on)[0], skeleton(same)[0])
+            if a != b][:3]
+        assert on.count("<svg") == off.count("<svg") > 0
+        assert "<meta charset='utf-8'>" in on and on.count(
+            "class='card'") == off.count("class='card'") > 0
+    # the last pass leaves the page's own attributes alone, not the ones
+    # people read
+    red = CheckupRedactor(m, networks=["Home"], users=[])
+    sc = scrub_html("<div class='card' role='img' lang='en' data-n='Sam' "
+                    "aria-label='card for Sam'><title>Mac</title>Same</div>",
+                    red)
+    assert "class='card'" in sc and "role='img'" in sc and \
+        "lang='en'" in sc and "Same</div>" in sc, sc
+    assert "Sam'" not in sc and ">Mac<" not in sc, sc
+    # a stand-in is never redacted again, even by a name it contains
+    r3 = CheckupRedactor(extra_names=["User", "example", "Network"],
+                         users=["cnry9q2zusr"])
+    u = r3.text("cnry9q2zusr")
+    assert u == "User 1" and r3.text(f"{u} and Network A") == \
+        f"{u} and Network A", r3.text(f"{u} and Network A")
+    assert r3.text("site-1.example") == "site-1.example"
+    # a NetBIOS name reaches the redactor even when nothing else names it
+    m2 = NetworkModel(ctx.cfg(), "10.88.2.1", ["10.88.2.20"], [], clk)
+    m2.cache.learn("10.88.2.40", "CNRY9Q2Z-PC", "nbns")
+    assert "CNRY9Q2Z-PC" in CheckupRedactor(m2, users=[]).names
+
+
+@self_test()
 def t_checkup_scenario_page(ctx):
     """5.3.4 (M14, MC11): the check-up of the home-network scenario is one
     self-contained page with the five parts, every investigation answered
@@ -77586,7 +77859,7 @@ def t_ip023_filter_in_plain_words(ctx):
             "TCP traffic from 192.168.1.5 to port 22",
         "(tcp.port == 80 or tcp.port == 443) and ip.dst == 1.2.3.4":
             "TCP traffic (on port 80 or on port 443) to 1.2.3.4",
-        "tcp.port != 22": "TCP traffic not on port 22",
+        "tcp.port != 22": "",
         "smtp": "SMTP traffic",
         "port:53": "", "foo.bar == 3": "", "tcp.port ==": "",
         "expert.severity >= warning": "", "": ""}
@@ -77617,6 +77890,190 @@ def t_ip023_filter_in_plain_words(ctx):
         assert explain_filter("tcp.port == 443") == ""
     finally:
         FEATURES["filter_english"] = True
+
+
+@self_test()
+def t_ip023_filter_words_when_unsure(ctx):
+    """5.3.4 (IP-023 review): the filter in words says nothing rather than
+    something wrong. "!=" also matches packets without the field (and a
+    two-way field on one side), "and" between two kinds of traffic is
+    not a list of both, a negation joined to anything reads the wrong
+    way, and two kinds never share their qualifiers. Each case expects
+    no line or a sentence that is true of every packet it matches."""
+    cases = {
+        # said wrong things before: now nothing
+        "tcp.port != 80": "",                 # a UDP packet matches too
+        "tcp.port != 22": "",
+        "ip.addr != 10.0.0.5": "",            # 10.0.0.5's own packets match
+        "eth.addr != aa:bb:cc:dd:ee:ff": "",
+        "not tcp and udp": "",                # not "except TCP and UDP"
+        "!tcp && udp": "",
+        "not tcp.port == 80 and udp": "",
+        "tcp.port == 80 and not ip.addr == 1.2.3.4": "",
+        "not arp and ip.addr == 1.2.3.4": "",   # the address isn't ARP's
+        "frame.len > 100 and not tcp": "",
+        "not tcp or udp": "",
+        "tcp and dns": "",                    # not a union of the two
+        "tcp and udp": "", "ip and ipv6": "",
+        "tcp or udp and dns": "",
+        "udp and dns.qry.name contains foo": "",
+        "tcp.port == 80 and udp.port == 53": "",   # qualifiers not merged
+        "(tcp or udp) and dns": "",
+        # good ones stay
+        "tcp.port == 443 and ip.addr == 10.0.0.5":
+            "TCP traffic on port 443 to or from 10.0.0.5",
+        "dns": "Website lookups (DNS)",
+        "not arp": "Everything except devices finding each other (ARP)",
+        "frame.len > 1000": "Traffic longer than 1000 bytes",
+        "ip.src == 192.168.1.5 && tcp.dstport == 22":
+            "TCP traffic from 192.168.1.5 to port 22",
+        "(tcp.port == 80 or tcp.port == 443) and ip.dst == 1.2.3.4":
+            "TCP traffic (on port 80 or on port 443) to 1.2.3.4",
+        "tcp.port == 80 or tcp.port == 443":
+            "TCP traffic on port 80 or on port 443",
+        "frame.len > 100 and tcp": "TCP traffic longer than 100 bytes",
+        "not tcp.port == 80": "Everything except TCP traffic on port 80",
+        "!(ip.addr == 10.0.0.5)":
+            "Everything except traffic to or from 10.0.0.5",
+        "eth.addr == aa:bb:cc:dd:ee:ff":
+            "Traffic to or from the device aa:bb:cc:dd:ee:ff",
+        'dns.qry.name == "a b"': "Website lookups (DNS) for a b",
+        "(tcp or udp) and ip.addr == 1.2.3.4":
+            "(TCP traffic or UDP traffic) to or from 1.2.3.4",
+        "tcp or udp": "TCP traffic or UDP traffic",
+        "smtp": "SMTP traffic",
+        "port:53": "", "foo.bar == 3": "", "tcp.port ==": "",
+        "tcp.port == 80 or 443": "", "": ""}
+    bad = {t: explain_filter(t) for t, want in cases.items()
+           if explain_filter(t) != want}
+    assert not bad, bad
+    old = CURRENT_LOCALE
+    try:
+        for loc in ("fr", "es"):
+            set_locale(loc)
+            for t, want in cases.items():
+                if not want:
+                    assert explain_filter(t) == "", (loc, t)
+            assert explain_filter("tcp.port == 443") != ""
+    finally:
+        set_locale(old)
+
+
+@self_test()
+def t_st02_cli_value_and_hints(ctx):
+    """5.3.4 (ST-02 review): a --version with no value after --sign-release
+    never swallows the next flag, and "Did you mean" names only a public
+    flag that is really close (never --key for "k", never a hidden one)."""
+    assert cli_check(["--sign-release", "f", "--version", "--key",
+                      "k"]) is None
+    assert cli_check(["--sign-release", "f", "--version", "9", "--key",
+                      "k"]) is None
+    rc, text = cli_check(["--sign-release", "f", "--version", "--key"])
+    assert rc == 2 and "needs a value" in text, text
+    rc, text = cli_check(["k"])
+    assert rc == 2 and "Did you mean" not in text, text
+    for typo in ("--kye", "--liev", "--chek", "--pakc"):     # hidden flags
+        rc, text = cli_check([typo])
+        assert rc == 2 and "Did you mean" not in text, (typo, text)
+    for typo, want in (("--self-tset", "--self-test"), ("--dmeo", "--demo"),
+                       ("--vesion", "--version"), ("--saef", "--safe")):
+        rc, text = cli_check([typo])
+        assert rc == 2 and f"Did you mean {want}?" in text, (typo, text)
+    assert not _cli_close("--k", "--key") and not _cli_close("ab", "--ab")
+
+
+@self_test(needs_source=True)
+def t_os06_only_a_missing_screen_is_no_display(ctx):
+    """5.3.4 (OS-06 review): a Tk error at start counts as "no screen"
+    only when it says so, or on X11/Wayland with neither $DISPLAY nor
+    $WAYLAND_DISPLAY; any other one is a crash and is recorded as one."""
+    nd = is_no_display_error
+    assert nd(tk.TclError("no display name and no $DISPLAY environment "
+                          "variable"), "linux", {"DISPLAY": ":0"})
+    assert nd(tk.TclError("couldn't connect to display \":0\""), "linux",
+              {"DISPLAY": ":0"})
+    assert nd(tk.TclError("can't find a usable init.tcl"), "linux", {})
+    assert nd(tk.TclError("x"), "freebsd13", {})
+    for plat, env in (("linux", {"DISPLAY": ":0"}),
+                      ("linux", {"WAYLAND_DISPLAY": "wayland-0"}),
+                      ("win32", {}), ("darwin", {})):
+        assert not nd(tk.TclError("can't find a usable init.tcl"), plat,
+                      env), (plat, env)
+    src = inspect.getsource(main)
+    i = src.index("root = tk.Tk()")
+    guard = src[i:i + 300]
+    assert "is_no_display_error(e)" in guard and "raise" in guard, guard
+
+
+@self_test()
+def t_ip003_title_bar_asks_once(ctx):
+    """5.3.4 (IP-003 review): when Windows refuses the dark title bar
+    (7, 8) it is not asked again on every dialog's <Map>, and the two
+    calls get their argument types (a whole 64-bit window handle, a
+    signed HRESULT) once."""
+    calls = []
+
+    class Fn:
+        argtypes = restype = None
+
+        def __init__(self, rc):
+            self.rc = rc
+
+        def __call__(self, *a):
+            calls.append(a)
+            return self.rc
+
+    class Dwm:
+        DwmSetWindowAttribute = Fn(-2147024809)       # E_INVALIDARG
+
+    class User32:
+        GetParent = Fn(4242)
+
+    class Win:
+        def update_idletasks(self):
+            pass
+
+        def winfo_id(self):
+            return 7
+    old = dict(TITLE_BAR)
+    old_feat = FEATURES.get("dark_titlebar")
+    try:
+        FEATURES["dark_titlebar"] = True
+        api = (Dwm(), User32(), 22631)
+        TITLE_BAR.update(api=api, refused=None)
+        assert dark_title_bar(Win(), True) is False
+        n = len(calls)
+        assert n == 2, calls                  # GetParent, then the refusal
+        assert dark_title_bar(Win(), True) is False and len(calls) == n
+        assert Dwm.DwmSetWindowAttribute.argtypes is not None and \
+            Dwm.DwmSetWindowAttribute.restype is ctypes.c_long
+        assert User32.GetParent.argtypes is not None
+        Dwm.DwmSetWindowAttribute = Fn(0)
+        TITLE_BAR.update(api=(Dwm(), User32(), 22631))   # another window
+        assert dark_title_bar(Win(), True) is True
+    finally:
+        TITLE_BAR.clear()
+        TITLE_BAR.update(old)
+        FEATURES["dark_titlebar"] = old_feat
+
+
+@self_test()
+def t_st09_zero_is_singular_in_french(ctx):
+    """5.3.4 (ST-09 review): French counts zero as one ("0 paquet"),
+    Spanish and English as many; 10 and 100 stay plural."""
+    for n, en, fr, es in ((0, "0 packets", "0 paquet", "0 paquetes"),
+                          (1, "1 packet", "1 paquet", "1 paquete"),
+                          (10, "10 packets", "10 paquets", "10 paquetes"),
+                          (100, "100 packets", "100 paquets",
+                           "100 paquetes")):
+        s = plural(n, "packet")
+        assert s == en and translate_text(s, "fr") == fr and \
+            translate_text(s, "es") == es, (s, translate_text(s, "fr"))
+    s = (f"{plural(0, 'more thing')} just happened — switch to “Full "
+         f"speed” to see every line")
+    assert translate_text(s, "fr").startswith("0 autre événement "), \
+        translate_text(s, "fr")
+    assert translate_text(s, "es").startswith("0 cosas más acaban")
 
 
 @self_test()
@@ -82485,6 +82942,8 @@ def main():
     try:
         root = tk.Tk()
     except tk.TclError as e:
+        if not is_no_display_error(e):
+            raise                    # a real failure: counted as a crash
         no_display_exit(e)
     apply_ui_scale(root, "Automatic" if SAFE_MODE else
                    cfg.get("accessibility.ui_scale", "Automatic"))
@@ -82640,6 +83099,20 @@ def main():
     if BOOT is not None:
         BOOT.mark(outcome="closed")
     LOG.info("MiniWireshark closed")
+
+
+def is_no_display_error(error, platform=None, env=None):
+    """5.3.4: is this Tk error "there is no screen here"? Only when the
+    message says so ("no display name", "couldn't connect to display"),
+    or on a system that draws through X11 or Wayland with neither
+    $DISPLAY nor $WAYLAND_DISPLAY set. Any other Tk error at start is a
+    crash and counts as one."""
+    platform = sys.platform if platform is None else platform
+    env = os.environ if env is None else env
+    if "display" in str(error).lower():
+        return True
+    return not platform.startswith(("win", "darwin")) and \
+        not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY")
 
 
 def no_display_exit(error, out=None):
