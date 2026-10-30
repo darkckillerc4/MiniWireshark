@@ -127,7 +127,7 @@ import uuid
 import weakref
 from collections import Counter, OrderedDict, defaultdict, deque
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Callable
 
 _T_START = time.perf_counter()
@@ -1057,7 +1057,9 @@ CLI_FLAGS = {
                          "choice."),
     "--boot-check": ("", False, "Check what this computer offers "
                                 "MiniWireshark and exit."),
-    "--self-test": ("", False, "Run the built-in tests and exit."),
+    "--self-test": ("NAME", True, "Run the built-in tests (only the ones "
+                                  "called NAME, comma-separated, when "
+                                  "given) and exit."),
     "--quick": ("", False, "With --self-test, --gui-shots or "
                            "--release-gate: the shorter run."),
     "--gui-test": ("", False, "Drive the real window through its GUI "
@@ -11155,6 +11157,32 @@ def system_dns_servers():
     return out[:6]
 
 
+def awake_clock():
+    """Seconds on a steady clock that keeps counting while the computer
+    sleeps (Linux CLOCK_BOOTTIME, macOS CLOCK_MONOTONIC, Windows'
+    monotonic clock), or None."""
+    for name in ("CLOCK_BOOTTIME",) if sys.platform.startswith("linux") \
+            else ("CLOCK_MONOTONIC",) if sys.platform == "darwin" else ():
+        with contextlib.suppress(AttributeError, OSError):
+            return time.clock_gettime(getattr(time, name))
+    return time.monotonic() if IS_WINDOWS else None
+
+
+def wake_check(d_wall, d_mono, d_awake, interval):
+    """5.3.4 (S15): did the computer sleep during one watch interval, and
+    did the wall clock step? -> (slept, clock step in seconds). The wall
+    clock alone can't tell: a clock set ahead by a minute (by hand or by
+    the time service) was taken for a sleep and restarted the capture.
+    `d_awake` (time passed, sleep included; None when unknown) decides:
+    it is ahead of the steady clock after a sleep (Linux, macOS) or far
+    beyond the interval (Windows, whose steady clock counts sleep)."""
+    if d_awake is None:                  # the 5.2.3 rule
+        return ((d_wall - d_mono) > 20 or d_wall > interval + 60), 0.0
+    slept = (d_awake - d_mono) > 20 or d_awake > interval + 60
+    step = d_wall - d_awake
+    return slept, (step if abs(step) > 20 else 0.0)
+
+
 class NetworkWatcher(threading.Thread):
     """Notices the things that silently break a capture: the adapter
     vanishing, Wi-Fi reconnecting with a new address, the router changing,
@@ -11167,6 +11195,7 @@ class NetworkWatcher(threading.Thread):
         self.stop_flag = False
         self._wall = time.time()
         self._mono = time.monotonic()
+        self._awake = awake_clock()
 
     def run(self):
         n = 0
@@ -11177,12 +11206,15 @@ class NetworkWatcher(threading.Thread):
                 slept += 0.5
             if self.stop_flag:
                 return
-            wall, mono = time.time(), time.monotonic()
-            resumed = (wall - self._wall) - (mono - self._mono) > 20 or \
-                (wall - self._wall) > self.interval + 60
+            wall, mono, awake = time.time(), time.monotonic(), awake_clock()
+            resumed, step = wake_check(
+                wall - self._wall, mono - self._mono,
+                None if awake is None or self._awake is None else
+                awake - self._awake, self.interval)
             since = self._wall
-            self._wall, self._mono = wall, mono
-            snap = {"resumed": resumed, "time": wall, "since": since}
+            self._wall, self._mono, self._awake = wall, mono, awake
+            snap = {"resumed": resumed, "time": wall, "since": since,
+                    "clock_step": step}
             try:
                 n += 1
                 if n % 2 == 0 or resumed:
@@ -12194,9 +12226,7 @@ class PipelineWatchdog:
             prev = self.last.get(name)
             if prev is None or value != prev[0] or not has_work:
                 self.last[name] = (value, now)
-                if name in self.stuck and (prev is None or
-                                           value != prev[0] or
-                                           not has_work):
+                if name in self.stuck:
                     self.stuck.pop(name, None)
                     self.reports.append((now, name, "moving again"))
                 continue
@@ -17217,9 +17247,13 @@ def parse_netsh_wlan(text, want=""):
         return ""
     best = None
     for b in blocks:
-        state = pick(b, "state", "état", "etat", "estado").lower()
-        ok = state.startswith(("connected", "connect", "conectado"))
-        desc = pick(b, "description", "descripción", "descripcion")
+        # 5.3.4 (S15): German too ("Status : Verbunden"); it was read
+        # as no Wi-Fi at all
+        state = pick(b, "state", "état", "etat", "estado", "status").lower()
+        ok = state.startswith(("connected", "connect", "conectado",
+                               "verbunden"))
+        desc = pick(b, "description", "descripción", "descripcion",
+                    "beschreibung")
         if want and (want == b.get("name") or want == desc):
             best = b if ok else best
             if ok:
@@ -17234,8 +17268,8 @@ def parse_netsh_wlan(text, want=""):
     pct = int(sig.group(1)) if sig else None
     if rssi is None and pct is not None:
         rssi = pct / 2.0 - 100.0          # Windows' own mapping
-    ch = _num(pick(b, "channel", "canal"))
-    band = pick(b, "band", "bande", "banda")
+    ch = _num(pick(b, "channel", "canal", "kanal"))
+    band = pick(b, "band", "bande", "banda").replace(",", ".")
     return {"source": "netsh", "iface": b.get("name", ""),
             "ssid": pick(b, "ssid"),
             "bssid": pick(b, "ap bssid", "bssid", "bssid del punto",
@@ -17243,15 +17277,17 @@ def parse_netsh_wlan(text, want=""):
             "rssi": rssi, "signal_pct": pct,
             "rx_mbps": _num(pick(b, "receive rate", "réception",
                                  "reception", "velocidad de recepción",
-                                 "velocidad de recepcion")),
+                                 "velocidad de recepcion",
+                                 "empfangsrate")),
             "tx_mbps": _num(pick(b, "transmit rate", "transmission",
                                  "velocidad de transmisión",
-                                 "velocidad de transmision")),
+                                 "velocidad de transmision",
+                                 "übertragungsrate", "ubertragungsrate")),
             "channel": int(ch) if ch is not None else None,
             "band": band or ("2.4 GHz" if ch and ch <= 14 else
                              "5 GHz" if ch else ""),
             "standard": pick(b, "radio type", "type de radio",
-                             "tipo de radio")}
+                             "tipo de radio", "funktyp")}
 
 
 def parse_iw_link(text, iface=""):
@@ -17369,10 +17405,10 @@ def netsh_location_hidden(text):
     t = (text or "").lower()
     if "privacy-location" in t:
         return True
-    return bool(re.search(r"locat|locali|ubicaci", t)) and bool(
+    return bool(re.search(r"locat|locali|ubicaci|standort", t)) and bool(
         re.search(r"permission|autorisation|permiso|privacy|confidential|"
-                  r"privacidad", t)) and not re.search(
-        r"^\s*(ssid|bssid|state|état|etat|estado)\s*:", t, re.M)
+                  r"privacidad|berechtigung|datenschutz", t)) and not re.search(
+        r"^\s*(ssid|bssid|state|état|etat|estado|status)\s*:", t, re.M)
 
 
 class WifiProbe:
@@ -17488,6 +17524,11 @@ def _psutil():
     return ps
 
 
+# TCP states of a connection its program has already closed (psutil names)
+TCP_ENDED_STATES = frozenset(("TIME_WAIT", "CLOSE", "CLOSING", "LAST_ACK",
+                              "FIN_WAIT1", "FIN_WAIT2"))
+
+
 class ProcessMap:
     """A snapshot of this computer's connection table: local address and
     port → program. Refreshed in the background every few seconds while
@@ -17562,14 +17603,26 @@ class ProcessMap:
                 continue
             proto = "TCP" if getattr(c, "type", 1) == 1 else "UDP"
             ip, port = la[0], la[1]
+            status = getattr(c, "status", "")
+            # 5.3.4 (S16): what is left of a closed connection (TIME_WAIT
+            # and the like) has no program, even for an administrator. It
+            # said "needs admin rights", and when a new connection reused
+            # its port it took that connection's name away (the flaky
+            # story_process_hit_rate test). It tells nothing: skipped.
+            if pid is None and status in TCP_ENDED_STATES:
+                continue
             name = self._name(ps, pid) if pid else ""
             if pid is None:
                 unnamed += 1
             ent = (pid, name)
-            by_local[(proto, ip, port)] = ent
-            by_port.setdefault((proto, port), ent)
+            # a row with its program wins over one without
+            old = by_local.get((proto, ip, port))
+            if old is None or (old[0] is None and pid is not None):
+                by_local[(proto, ip, port)] = ent
+            old = by_port.get((proto, port))
+            if old is None or (old[0] is None and pid is not None):
+                by_port[(proto, port)] = ent
             ra = getattr(c, "raddr", None)
-            status = getattr(c, "status", "")
             if (proto == "TCP" and status == "LISTEN") or \
                     (proto == "UDP" and not ra):
                 listening[(proto, ip, port)] = ent
@@ -24222,6 +24275,24 @@ class Store:
         finally:
             con.isolation_level = old_level
 
+    # 5.3.4 (S14): what "Compare sessions" reads by session. Without them
+    # it read every observation and event of the history: 4.9 s on the Tk
+    # thread with 90 days. Built by the writer once the store is ready,
+    # so opening never waits for them (a first build of 90 days takes a
+    # few seconds there); older copies just don't use them.
+    LATE_INDEXES = (
+        "CREATE INDEX IF NOT EXISTS obs_session ON observations(session, "
+        "kind)",
+        "CREATE INDEX IF NOT EXISTS events_session ON events(session)")
+
+    def _late_indexes(self, con):
+        for sql in self.LATE_INDEXES:
+            try:
+                con.execute(sql)
+                con.commit()
+            except sqlite3.Error as e:
+                LOG.warning("history index not made: %s", e)
+
     def _backup_if_due(self, con):
         bak = self.path + ".bak"
         try:
@@ -24247,7 +24318,11 @@ class Store:
             LOG.warning("history db unavailable: %s", e)
             self._ready.set()
             return
+        self._idle.clear()            # flush_now waits for the indexes
         self._ready.set()
+        self._late_indexes(con)
+        if self.q.empty():
+            self._idle.set()
         self._backup_if_due(con)
         last_backup_check = time.time()
         while True:
@@ -24527,9 +24602,7 @@ class Store:
 
     # ---- reads (own read-only connection each time) ------------------------
     def _reader(self):
-        uri = "file:" + urllib.request.pathname2url(
-            os.path.abspath(self.path)) + "?mode=ro"
-        con = sqlite3.connect(uri, uri=True, timeout=5)
+        con = sqlite3.connect(sqlite_ro_uri(self.path), uri=True, timeout=5)
         con.execute("PRAGMA query_only=ON")
         return con
 
@@ -24794,6 +24867,13 @@ STORY_CATEGORY = {"presence": "Devices", "new_device": "Devices",
                   "spike": "Devices"}
 
 
+def sqlite_ro_uri(path):
+    """A read-only SQLite URI for a file path; every character of the path
+    quoted, so any folder name works."""
+    return "file:" + urllib.request.pathname2url(
+        os.path.abspath(path)) + "?mode=ro"
+
+
 def story_day(ts):
     try:
         return time.strftime("%Y-%m-%d", time.localtime(ts))
@@ -24808,7 +24888,14 @@ def story_day_label(day, now=None):
     tr = translate_text
     if day == story_day(now):
         return tr("Today")
-    if day == story_day(now - 86400):
+    # 5.3.4 (S15): the calendar's day before, not 24 hours before (on the
+    # day after a daylight-saving change that was two days back)
+    try:
+        yday = (datetime.fromtimestamp(now).date() -
+                timedelta(days=1)).strftime("%Y-%m-%d")
+    except (ValueError, OverflowError, OSError):
+        yday = story_day(now - 86400)
+    if day == yday:
         return tr("Yesterday")
     try:
         wd = time.strptime(day, "%Y-%m-%d").tm_wday
@@ -65433,8 +65520,19 @@ class _FakeClock:
         return self.t
 
 
-def run_self_tests(verbose=True):
+def self_test_wanted(only):
+    """5.3.4 (S16): `--self-test NAME[,NAME…]` runs only those tests (with
+    or without the t_ prefix). -> a test-name predicate, None for all."""
+    if not only:
+        return None
+    names = {n.strip() for n in str(only).split(",") if n.strip()}
+    names |= {"t_" + n for n in names if not n.startswith("t_")}
+    return lambda fn_name: fn_name in names
+
+
+def run_self_tests(verbose=True, only=None):
     results = []
+    wanted = self_test_wanted(only)
     tmp = tempfile.mkdtemp(prefix="mw_selftest_")
 
     def cfg(extra=None):
@@ -65444,6 +65542,8 @@ def run_self_tests(verbose=True):
         return c
 
     def test(fn):
+        if wanted is not None and not wanted(fn.__name__):
+            return
         name = fn.__name__[2:].replace("_", " ")
         t0 = time.perf_counter()
         try:
@@ -66267,6 +66367,10 @@ def run_self_tests(verbose=True):
         wrapped.__name__ = fn.__name__
         test(wrapped)
     shutil.rmtree(tmp, ignore_errors=True)
+    if wanted is not None and not results:
+        if verbose:
+            print(f"No self-test is called {only}.")
+        return 2
     failed = [r for r in results if r[0] == "FAIL"]
     if verbose:
         print(f"\n{len(results) - len(failed)} passed / {len(failed)} failed"
@@ -66564,10 +66668,18 @@ def t_thread_stress(ctx):
            for f in (feeder, tk_side, jobs_side)]
     old = sys.getswitchinterval()
     sys.setswitchinterval(1e-4)
+    sides = ("ingest", "tick", "claims", "coverage", "protocols", "calls",
+             "session", "history", "story")
     try:
         for th in ths:
             th.start()
-        time.sleep(3.0)
+        # 5.3.4 (S16): at least 3 s, and until every side ran and the
+        # feeder went through the frames once (at most 60 s). A fixed 3 s
+        # failed on a slow computer (8 devices seen, not the 10 asked)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 60 and not (
+                time.monotonic() - t0 >= 3.0 and all(ran[k] for k in sides)):
+            time.sleep(0.05)
         stop.set()
         for th in ths:
             th.join(10)
@@ -66575,8 +66687,7 @@ def t_thread_stress(ctx):
         sys.setswitchinterval(old)
     assert not errors, errors[:5]
     assert not any(th.is_alive() for th in ths), "a stress thread hung"
-    for name in ("ingest", "tick", "claims", "coverage", "protocols",
-                 "calls", "session", "history", "story"):
+    for name in sides:
         assert ran[name], (name, dict(ran))
     assert len(m.registry.by_key) > 10, len(m.registry.by_key)
     # the history writer encodes snapshot rows after the gate is released:
@@ -66770,7 +66881,9 @@ def t_fuzz_decoder_and_model(ctx):
         m.ingest(d)
         if i % 400 == 0:
             m.tick()
-    assert decode_errors < n * 0.05, f"{decode_errors} decode errors"
+    # 5.3.4 (S16): no allowance. It let 5% of the frames (125) raise, and
+    # the decoder raises on none of them (S4: 0 in a million)
+    assert decode_errors == 0, f"{decode_errors} decode errors"
 
 
 @self_test()
@@ -71286,7 +71399,171 @@ def t_tcp_measurements(ctx):
 
 
 NET_SENDS = {"urlopen", "sendp", "sendto", "gethostbyaddr", "getaddrinfo",
-             "create_connection", "sr1", "srp", "srp1", "sendall"}
+             "create_connection", "sr1", "srp", "srp1", "sendall",
+             "HTTPConnection", "HTTPSConnection"}
+# 5.3.4 (S16): programs that go on the network when this file starts them
+NET_TOOLS = {"curl", "wget", "ping", "ping6", "nslookup", "dig", "tracert",
+             "traceroute", "tracepath", "pathping", "Invoke-WebRequest",
+             "Invoke-RestMethod", "Test-NetConnection", "Resolve-DnsName",
+             "Start-BitsTransfer", "bitsadmin", "winget", "ssh", "scp", "sftp",
+             "ftp", "tftp", "telnet", "nc", "ncat", "nmap", "arping"}
+# calls that start another program (subprocess and this file's helpers)
+PROC_LAUNCHERS = {"run", "Popen", "call", "check_output", "check_call",
+                  "system", "popen", "startfile", "_run", "_run_hidden",
+                  "_popen_hidden", "run_console", "execve", "execv"}
+
+
+def outbound_bypasses(tree):
+    """-> ["function:line name()"] for every network send in `tree` that
+    is not in a function passing the outbound() gate (tests and the gate
+    itself are exempt). 5.3.4 (S16): a started program counts too: a
+    subprocess whose command (followed through local variables, `+=`,
+    .append/.extend/.insert and functions of this file that return a
+    command) is an online pip run or a network tool. Before, only a pip
+    list written inside the call itself was seen."""
+    import ast
+
+    def call_name(n):
+        f = n.func
+        return f.attr if isinstance(f, ast.Attribute) else \
+            getattr(f, "id", "")
+
+    gated = {}
+
+    def gate_line(fn):
+        """The first line of fn that calls the gate (0: none)."""
+        if id(fn) not in gated:
+            gated[id(fn)] = min([n.lineno for n in ast.walk(fn) if isinstance(
+                n, ast.Call) and call_name(n) in ("outbound", "net_urlopen")],
+                default=0)
+        return gated[id(fn)]
+
+    def calls_outbound(fn):
+        return gate_line(fn) > 0
+
+    def own_nodes(fn):
+        """The nodes of fn, without those of functions inside it."""
+        todo = list(ast.iter_child_nodes(fn))
+        while todo:
+            n = todo.pop()
+            yield n
+            if not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                  ast.Lambda)):
+                todo.extend(ast.iter_child_nodes(n))
+
+    def local_env(fn):
+        env = {}
+        for n in own_nodes(fn):
+            if isinstance(n, ast.Assign):
+                for t in n.targets:
+                    if isinstance(t, ast.Name):
+                        env.setdefault(t.id, []).append(n.value)
+            elif isinstance(n, ast.AugAssign) and isinstance(n.target,
+                                                             ast.Name):
+                env.setdefault(n.target.id, []).append(n.value)
+            elif isinstance(n, ast.Call) and isinstance(
+                    n.func, ast.Attribute) and n.func.attr in (
+                    "append", "extend", "insert") and isinstance(
+                    n.func.value, ast.Name):
+                env.setdefault(n.func.value.id, []).extend(n.args)
+        return env
+
+    def words(expr, env, seen=()):
+        out = set()
+        for n in ast.walk(expr):
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                out.add(n.value)
+                out.update(n.value.split())
+            elif isinstance(n, ast.Name) and n.id in env and \
+                    n.id not in seen:
+                for v in env[n.id]:
+                    out |= words(v, env, seen + (n.id,))
+            elif isinstance(n, ast.Call):
+                out |= builder_words(call_name(n))
+        return out
+
+    def online(ws):
+        return bool(ws & NET_TOOLS) or ("pip" in ws and bool(
+            ws & {"install", "download"}) and "--no-index" not in ws)
+
+    funcs, todo = [], [tree]         # functions sit in statement lists
+    while todo:
+        n = todo.pop()
+        for slot in ("body", "orelse", "finalbody", "handlers"):
+            for c in getattr(n, slot, None) or ():
+                if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    funcs.append(c)
+                if isinstance(c, ast.AST):
+                    todo.append(c)
+    envs = {}
+
+    def env_of(fn):
+        if id(fn) not in envs:
+            envs[id(fn)] = local_env(fn)
+        return envs[id(fn)]
+    by_name = {}
+    for fn in funcs:
+        by_name.setdefault(fn.name, []).append(fn)
+    builders = {}
+
+    def builder_words(name):
+        """The words of the command a function of this file returns, when
+        that command goes online (else none)."""
+        if name not in builders:
+            builders[name] = set()           # a function calling itself
+            ws = set()
+            for fn in by_name.get(name, ()):
+                for n in own_nodes(fn):
+                    if isinstance(n, ast.Return) and n.value is not None:
+                        ws |= words(n.value, env_of(fn))
+            builders[name] = ws if online(ws) else set()
+        return builders[name]
+    bad = []
+
+    def starts_online(call, fn):
+        if call_name(call) not in PROC_LAUNCHERS:
+            # any other call: a command list written in it (LG-04)
+            return any(online({e.value for e in lst.elts
+                               if isinstance(e, ast.Constant) and
+                               isinstance(e.value, str)})
+                       for a in call.args for lst in ast.walk(a)
+                       if isinstance(lst, ast.List))
+        env = env_of(fn) if fn is not None else {}
+        ws = set()
+        for a in list(call.args) + [k.value for k in call.keywords]:
+            ws |= words(a, env)
+        return online(ws)
+
+    def visit(node, fn=None, top="", near=None):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(child, child if fn is None or not calls_outbound(fn)
+                      else fn, top or child.name, child)
+                continue
+            if isinstance(child, ast.Call):
+                f = child.func
+                name = call_name(child)
+                is_send = name in NET_SENDS or (
+                    name == "connect" and isinstance(f, ast.Attribute) and
+                    not (isinstance(f.value, ast.Name) and
+                         f.value.id == "sqlite3")) or \
+                    starts_online(child, near)
+                if is_send:
+                    owner = fn.name if fn is not None else "<module>"
+                    # os_identity: connect() on a UDP socket sends nothing
+                    exempt = owner in ("net_urlopen", "os_identity") or \
+                        top.startswith(("t_", "_gs_"))
+                    if not exempt and not (fn is not None and
+                                           calls_outbound(fn)):
+                        bad.append(f"{owner}:{child.lineno} {name}()")
+                    elif not exempt and fn is near and \
+                            child.lineno < gate_line(fn):
+                        # 5.3.4 (S16): the gate first, then the send
+                        bad.append(f"{owner}:{child.lineno} {name}() "
+                                   "before outbound()")
+            visit(child, fn, top, near)
+    visit(tree)
+    return bad
 
 
 @self_test(needs_source=True)
@@ -71297,57 +71574,70 @@ def t_every_send_goes_through_outbound(ctx):
     import ast
     with open(SCRIPT_PATH, encoding="utf-8") as f:
         tree = ast.parse(f.read())
-    bad = []
-
-    def calls_outbound(fn):
-        for n in ast.walk(fn):
-            if isinstance(n, ast.Call):
-                name = n.func.attr if isinstance(n.func, ast.Attribute) \
-                    else getattr(n.func, "id", "")
-                if name in ("outbound", "net_urlopen"):
-                    return True
-        return False
-
-    def pip_online(call):
-        """5.3.4 (LG-04): a pip run that may download (a command list with
-        "pip" and "download" or "install", without --no-index)."""
-        for arg in call.args:
-            for lst in ast.walk(arg):
-                if not isinstance(lst, ast.List):
-                    continue
-                words = {e.value for e in lst.elts
-                         if isinstance(e, ast.Constant) and
-                         isinstance(e.value, str)}
-                if "pip" in words and words & {"download", "install"} and \
-                        "--no-index" not in words:
-                    return True
-        return False
-
-    def visit(node, fn=None, top=""):
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                visit(child, child if fn is None or not calls_outbound(fn)
-                      else fn, top or child.name)
-                continue
-            if isinstance(child, ast.Call):
-                f = child.func
-                name = f.attr if isinstance(f, ast.Attribute) else \
-                    getattr(f, "id", "")
-                is_send = name in NET_SENDS or (
-                    name == "connect" and isinstance(f, ast.Attribute) and
-                    not (isinstance(f.value, ast.Name) and
-                         f.value.id == "sqlite3")) or pip_online(child)
-                if is_send:
-                    owner = fn.name if fn is not None else "<module>"
-                    # os_identity: connect() on a UDP socket sends nothing
-                    exempt = owner in ("net_urlopen", "os_identity") or \
-                        top.startswith(("t_", "_gs_"))
-                    if not exempt and not (fn is not None and
-                                           calls_outbound(fn)):
-                        bad.append(f"{owner}:{child.lineno} {name}()")
-            visit(child, fn, top)
-    visit(tree)
+    bad = outbound_bypasses(tree)
     assert not bad, "sends that bypass outbound(): " + ", ".join(bad)
+
+
+@self_test()
+def t_s16_outbound_check_sees_subprocess(ctx):
+    """5.3.4 (S16): the outbound static check sees programs this file
+    starts, not only sockets: pip through a command built elsewhere or
+    grown with +=, network tools in a list or a shell string. Each is
+    flagged until its function passes outbound(); an offline pip run
+    (--no-index) and a local tool are not."""
+    import ast
+    import textwrap
+    bad_src = textwrap.dedent('''
+        def build(specs):
+            base = ["install", "--target", "x"] + list(specs)
+            return [sys.executable, "-m", "pip"] + base
+        def fetch():
+            cmd = build(["scapy"])
+            r = subprocess.run(cmd, capture_output=True)
+        def ping_it(host):
+            _run_hidden(["ping", "-c", "1", host])
+        def shell():
+            os.system("curl -s https://example.com/x")
+        def grown(exe):
+            cmd = [exe, "-m", "pip"]
+            cmd += ["download", "x"]
+            self._run(cmd, 900)
+        def appended(exe):
+            cmd = [exe]
+            cmd.extend(["-m", "pip", "install", "y"])
+            subprocess.Popen(cmd)
+        def page(host):
+            conn = http.client.HTTPSConnection(host)
+        def wrapped(exe):
+            step("Packages", [exe, "-m", "pip", "install", "z"], 900)
+        ''')
+    got = outbound_bypasses(ast.parse(bad_src))
+    owners = sorted({g.split(":")[0] for g in got})
+    assert owners == ["appended", "fetch", "grown", "page", "ping_it",
+                      "shell", "wrapped"], got
+    gated = bad_src.replace("):\n    ", "):\n    outbound('x', 'y', 'z')\n"
+                            "    ")
+    assert outbound_bypasses(ast.parse(gated)) == [], \
+        outbound_bypasses(ast.parse(gated))
+    ok_src = textwrap.dedent('''
+        def offline(exe, req):
+            cmd = [exe, "-m", "pip", "install", "--no-index", "-r", req]
+            subprocess.run(cmd)
+        def local():
+            subprocess.run(["arp", "-an"])
+            subprocess.run(["netsh", "wlan", "show", "interfaces"])
+        def t_test_only():
+            subprocess.run(["ping", "x"])
+        ''')
+    assert outbound_bypasses(ast.parse(ok_src)) == [], \
+        outbound_bypasses(ast.parse(ok_src))
+    late = textwrap.dedent('''
+        def late(host):
+            s = socket.create_connection((host, 443))
+            outbound("x", "tcp", host)
+        ''')
+    got = outbound_bypasses(ast.parse(late))
+    assert len(got) == 1 and "before outbound()" in got[0], got
 
 
 @self_test()
@@ -76445,50 +76735,109 @@ def t_story_spike_names_program(ctx):
     assert TIMELINE_CATEGORY["traffic spike"] == "Devices"
 
 
+class _FakeConnTable:
+    """A stand-in psutil with a fixed connection table (5.3.4, S16)."""
+    AccessDenied = PermissionError
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def net_connections(self, kind="inet"):
+        return list(self.rows)
+
+    def Process(self, pid):                      # noqa: N802 (psutil's)
+        return types.SimpleNamespace(name=lambda: f"app{pid}.exe")
+
+
+def _conn_row(port, pid, status="ESTABLISHED", ip="127.0.0.1",
+              rport=8080):
+    return types.SimpleNamespace(laddr=(ip, port), raddr=("127.0.0.1", rport),
+                                 pid=pid, status=status, type=1)
+
+
+def _with_conn_table(rows, fn):
+    """fn() with psutil replaced by a fixed connection table."""
+    had = "psutil" in OPTIONAL_MODULES
+    was = OPTIONAL_MODULES.get("psutil")
+    OPTIONAL_MODULES["psutil"] = _FakeConnTable(rows)
+    try:
+        return fn()
+    finally:
+        if had:
+            OPTIONAL_MODULES["psutil"] = was
+        else:
+            OPTIONAL_MODULES.pop("psutil", None)
+
+
 @self_test()
 def t_story_process_hit_rate(ctx):
     """5.3.4 (IP-022 evaluation): how often this computer's connections get
     their program from the connection table. Long connections are named;
     short ones that closed before the table was read are not (they fall
-    back to "an unknown program")."""
-    if _psutil() is None:
-        return "skip"
-    srv = _socket.socket()
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(16)
-    port = srv.getsockname()[1]
-    keep, gone = [], []
-    for i in range(9):
-        cli = _socket.create_connection(("127.0.0.1", port), timeout=2)
-        acc, _ = srv.accept()
-        (keep if i < 6 else gone).append((cli, acc))
+    back to "an unknown program").
+    5.3.4 (S16): deterministic. It read the real table and once counted 5
+    of 6 in a long run: a port left in TIME_WAIT by an earlier test had
+    been given out again, and its program-less row hid the live one. The
+    table is now a fixed one with that case in it; the real table is
+    checked by t_process_attribution."""
     m = NetworkModel(ctx.cfg(), *scenario_identity()[:3])
     m.set_identity(my_ips={"127.0.0.1"})
-    try:
-        for i, (cli, _acc) in enumerate(keep + gone):
-            f = FlowRecord(i + 1, ("TCP", i), "TCP", "127.0.0.1",
-                           cli.getsockname()[1], "127.0.0.1", port, m.now())
-            if i < len(keep):
-                m.flows.active[f.key] = f
-            else:
-                f.closed = True
-                m.flows.archive.append(f)
-        for pair in gone:
-            for s_ in pair:
-                s_.close()
+    rows = []
+    for i in range(9):
+        port = 50100 + i
+        f = FlowRecord(i + 1, ("TCP", i), "TCP", "127.0.0.1", port,
+                       "127.0.0.1", 8080, m.now())
+        if i < 6:
+            m.flows.active[f.key] = f
+            rows.append(_conn_row(port, 4242))
+        else:                     # closed before the table was read
+            f.closed = True
+            m.flows.archive.append(f)
+            rows.append(_conn_row(port, None, "TIME_WAIT"))
+    # connections of an hour ago left two of the ports in TIME_WAIT (to
+    # another address), and the operating system gave them out again
+    rows.append(_conn_row(50100, None, "TIME_WAIT", rport=443))
+    rows.insert(0, _conn_row(50101, None, "TIME_WAIT", rport=443))
+
+    def run():
         pm = ProcessMap()
         assert pm.read()
         app = types.SimpleNamespace(procmap=pm, model=m)
         MiniWireshark.attribute_processes(app)
-        named, total = process_hit_rate(m)
-        if named == 0:
-            return "skip"              # this OS hides the table from us
-        assert total == 9 and named == len(keep), (named, total)
-    finally:
-        for pair in keep + gone:
-            for s_ in pair:
-                s_.close()
-        srv.close()
+        return pm
+    pm = _with_conn_table(rows, run)
+    assert process_hit_rate(m) == (6, 9), process_hit_rate(m)
+    for f in m.flows.archive:
+        assert f.process == "", f.process       # not "needs admin rights"
+    assert not pm.needs_admin                   # TIME_WAIT has no program
+
+
+@self_test()
+def t_s16_ended_connections_never_hide_programs(ctx):
+    """5.3.4 (S16): in the connection table, what is left of a closed
+    connection (TIME_WAIT, no program, even for an administrator) neither
+    hides the live connection that reuses its port nor makes "some
+    programs need admin rights" appear; a real program-less row still
+    does."""
+    rows = [_conn_row(50001, 7), _conn_row(50001, None, "TIME_WAIT", rport=1),
+            _conn_row(50002, None, "TIME_WAIT"),
+            _conn_row(50003, None, "FIN_WAIT2"),
+            _conn_row(8080, 7, "LISTEN", ip="0.0.0.0")]
+    pm = _with_conn_table(rows, ProcessMap)
+    _with_conn_table(rows, pm.read)
+    assert pm.lookup("TCP", "127.0.0.1", 50001) == (7, "app7.exe"), \
+        pm.by_local
+    assert ("TCP", "127.0.0.1", 50002) not in pm.by_local
+    assert pm.lookup("TCP", "127.0.0.1", 50003) is None
+    assert pm.by_port[("TCP", 50001)] == (7, "app7.exe")
+    assert ("TCP", "0.0.0.0", 8080) in pm.listening
+    assert not pm.needs_admin, "a closed connection is not a hidden program"
+    rows.insert(0, _conn_row(50001, None, "TIME_WAIT", rport=2))
+    rows.append(_conn_row(50009, None))          # another user's, live
+    _with_conn_table(rows, pm.read)
+    assert pm.lookup("TCP", "127.0.0.1", 50001) == (7, "app7.exe")
+    assert pm.needs_admin and pm.lookup("TCP", "127.0.0.1", 50009) == \
+        (None, "")
 
 
 @self_test()
@@ -76626,6 +76975,10 @@ BENCH_LIMITS = {
     # 365 -> 265 MB, so that gain cannot slip back unnoticed; Windows
     # keeps 365: there the window's own process still holds the compiler's
     # memory, see start_from_compiled_copy); search 6 ms.
+    # 5.3.4 (S14): limits of the plan's section 7 that no window run
+    # measures; the long-history self-test reads them (ms)
+    "history": {"history_90d_open": 2000, "history_compare": 2000,
+                "story_build_7d": 150, "checkup_render": 2000},
     "S1": {"import.stall_ms": 260, "session_load.stall_ms": 225,
            "session_save.stall_ms": 60, "text_size.stall_ms": 105,
            "theme.stall_ms": 145, "switch.stall_ms": 115,
@@ -78102,6 +78455,768 @@ def t_st11_audit_sees_cut_cells(ctx):
         park_pointer(root)
     finally:
         root.destroy()
+
+
+# ---- 5.3.4 M15 (S13): mutation check ------------------------------------------
+#  Each test below kills mutants that survived the S13 run (a comparison or a
+#  constant flipped in one of the 30 most important functions and every test
+#  that covers it still passing). The mutants left alive are equivalent:
+#  S13_EQUIVALENT says why for each.
+S13_EQUIVALENT = (
+    ("PipelineWatchdog.check", "the second test of 'moving again' repeated "
+     "the first; it was removed (5.3.4, S13), and its mutants with it"),
+    ("ReputationList.set_ranges", "version 4 -> 5 as the default of a "
+     "three-item row: only 'is it 6' is asked of it"),
+    ("BaselineEngine.check", "the fallback 4 of alerts.chatty_multiplier "
+     "and 15 of baseline_min_minutes: the settings always hold a value"),
+    ("BaselineEngine.check", "the 0.0 defaults of mean.get / std.get: every "
+     "snapshot carries every feature, and max(s, 1.0) hides 0.0 -> 1.0"),
+    ("Store.load_baselines", "FEATURES.get('baseline_v2', True): the key "
+     "is always there"),
+    ("Redactor.ip", "254 -> 255 in n % 254 for n < 254: the same number"),
+    ("classify_device", "fld == 'dhcp55' -> !=: no signature row uses the "
+     "request list (it is matched through DHCP twins, IP-015)"),
+    ("RtpStream._update_seq", "the return values: packet() never reads "
+     "them (RFC 3550 A.1 returns them; kept as written there)"),
+    ("RtpStream.loss_pct", "e > 0 -> e > 1: one expected packet means it "
+     "arrived, so the loss is 0 either way"),
+    ("RtpStream._jitter", "peak: > -> >= sets the same value again"),
+    ("RtpStream._guess_rate", "> 0.2 -> >= 0.2 on a ratio of measured "
+     "floats: equality can't be reached"),
+    ("CallTracker.feed and summary", "a <= b -> a < b: for a == b both "
+     "orders give the same tuple"),
+    ("own_blocklist_entry", "the plain-address test ('/' not in, ':' in): "
+     "a single address that skips it gets the same answer from the "
+     "network branch (a /32 or /128 is one address)"),
+    ("load_own_blocklist", "the O_NONBLOCK fallback 0: only Windows lacks "
+     "the flag (the Windows run checks it there)"),
+)
+
+
+@self_test()
+def t_s13_capture_faults_and_watchdog(ctx):
+    """5.3.4 (S13): a fault named only by its words (no errno) is still
+    recognised, and the watchdog calls a stage stuck at exactly its limit
+    and says nothing about a stage that keeps moving."""
+    assert classify_capture_fault(RuntimeError(
+        "Operation not permitted"))[0] == "permission"
+    assert classify_capture_fault(RuntimeError(
+        "No buffer space available"))[0] == "overflow"
+    w = PipelineWatchdog()
+    assert w.check(0.0, {"a": (1, True)}) == []
+    assert w.check(w.LIMIT, {"a": (1, True)}) == ["a"]
+    w.check(w.LIMIT + 1, {"a": (2, True)})
+    assert [r[2] for r in w.reports] == [f"stuck {w.LIMIT:.0f} s",
+                                         "moving again"], list(w.reports)
+    w2 = PipelineWatchdog()
+    for i in range(30):
+        w2.check(float(i), {"b": (i, True), "c": (0, False)})
+    assert not w2.reports and not w2.stuck, list(w2.reports)
+
+
+@self_test()
+def t_s13_classify_device_edges(ctx):
+    """5.3.4 (S13): this computer by its hardware address alone; the DHCP
+    vendor class, request list, private-address and "seen" signatures
+    each count; a DHCP twin of another device counts, never the device
+    itself; evidence for a different kind (10 points is enough) is said
+    out loud, for a neighbouring kind it is not."""
+    me = DeviceRecord(key="aa:00:00:00:00:01", ip="192.168.1.77",
+                      mac="aa:00:00:00:00:01")
+    assert classify_device(me, "", ("192.168.1.20",),
+                           ("aa:00:00:00:00:01",))[0] == "This computer"
+
+    def dev(**kw):
+        d = DeviceRecord(key="bb:00:00:00:00:02", ip="192.168.1.9",
+                         mac="bb:00:00:00:00:02")
+        for k, v in kw.items():
+            setattr(d, k, v)
+        return d
+    cls, word, why = classify_device(dev(dhcp_vendor_class="MSFT 5.0"))
+    assert (cls, word) == ("Windows PC", "Possibly"), (cls, word, why)
+    nothing = classify_device(dev(dhcp_params="1,2"))
+    assert nothing[0] == "Unknown" and nothing[2][0].startswith(
+        "Not enough information"), nothing
+    got = classify_device(dev(randomized_mac=True))
+    assert any("randomized" in r for r in got[2]), got
+    d = dev()
+    d.add_evidence("nbns", "answered a Windows name query")
+    seen_row = next(r for r in device_signatures() if r[0] == "seen")
+    got = classify_device(d)
+    assert seen_row[4] in got[2], (seen_row, got)
+    params = "1,3,6,15,31,33,43,44"
+    twin = dev(dhcp_params=params)
+    fp = dhcp_fingerprint(twin)
+    peers = {fp: ("Smart TV", "Living room TV", "cc:00:00:00:00:03")}
+    got = classify_device(twin, peers=peers)
+    assert any("same settings" in r for r in got[2]), got
+    peers = {fp: ("Smart TV", "Living room TV", twin.key)}
+    got = classify_device(twin, peers=peers)
+    assert not any("same settings" in r for r in got[2]), got
+    # the winner rests on its name; DHCP (10 points each) hints at two
+    # other kinds, neither a neighbour of an iPhone
+    ph = dev(hostname="Annas-iPhone", dhcp_vendor_class="udhcp 1.30")
+    cls, word, why = classify_device(ph)
+    assert cls == "iPhone" and why[-1].startswith("But:"), (cls, why)
+    tv = dev(hostname="Living-Room-TV", ssdp_server="Roku/9.0 UPnP/1.0")
+    cls, word, why = classify_device(tv)
+    assert not why[-1].startswith("But:") or cls not in (
+        "Smart TV", "Streaming device"), (cls, why)
+
+
+@self_test()
+def t_s13_reputation_range_edges(ctx):
+    """5.3.4 (S13): a one-address range, and the last address of a range,
+    are listed."""
+    rl = ReputationList("t")
+    rl.set_ranges([(100, 100, "one"), (200, 300, "span"),
+                   (2 ** 64, 2 ** 64, "v6one", 6)])
+    assert rl.lookup(str(ipaddress.ip_address(100))) == "one"
+    assert rl.lookup(str(ipaddress.ip_address(300))) == "span"
+    assert rl.lookup(str(ipaddress.ip_address(301))) == ""
+    assert rl.lookup(str(ipaddress.ip_address(2 ** 64))) == "v6one"
+
+
+@self_test()
+def t_s13_baseline_edges(ctx):
+    """5.3.4 (S13): the baseline's edges, both versions. It judges from
+    exactly the minutes it needs; a value at the floor counts, one at
+    exactly 4x the usual or 4 standard deviations above it does not; a
+    settled one-job device uses its own (lower) floor; the "first time at
+    night" note needs an alert and a short profile; the kind's prior
+    starts the profile, its learning rate is 1/(n+5), its spread can
+    fall below 1; expired rows go, the edge stays, "last" is kept."""
+    eng = BaselineEngine(ctx.cfg())
+    mb = 1024 * 1024
+    feats = DeviceBaseline.FEATURES
+
+    def snap(v_up, m_up, s_up, n=15, info=None):
+        vals = {f: 0 for f in feats}
+        mean = {f: 0.0 for f in feats}
+        std = {f: 0.0 for f in feats}
+        vals["bytes_up"], mean["bytes_up"], std["bytes_up"] = v_up, m_up, s_up
+        return (vals, mean, std, n) + ((info,) if info else ())
+
+    def info(**kw):
+        d = {"period": "day", "own": 60, "total": 100, "other": 0,
+             "kind": "computer", "sure": True}
+        d.update(kw)
+        return d
+    for i in (None, info()):
+        assert eng.check(snap(10 * mb, mb, 0.1 * mb, info=i)), i
+        assert eng.check(snap(5 * mb, mb, 0.0, info=i)), i      # at floor
+        assert not eng.check(snap(8 * mb, 2 * mb, 0.0, info=i)), i  # 4x
+        assert not eng.check(snap(8 * mb, mb, 1.75 * mb, info=i)), i
+        assert eng.check(snap(9 * mb, mb, 1.75 * mb, info=i)), i
+    assert eng.check(snap(10 * mb, mb, 0.0, n=15))          # n == need
+    assert eng.check(snap(10 * mb, mb, 0.0, info=info(
+        total=BASELINE_PRIOR_MINUTES)))
+    assert eng.check(snap(mb, 0.0, 0.0, info=info(kind="iot", own=15)))
+    assert not eng.check(snap(mb, 0.0, 0.0, info=info(kind="iot", own=14)))
+    eng.check(snap(10 * mb, mb, 0.0, info=info(
+        own=BASELINE_PRIOR_MINUTES, other=10)))
+    assert eng.last_note == ""
+    eng.check(snap(0, mb, 0.0, info=info(own=2, other=3)))
+    assert eng.last_note == ""
+    eng.check(snap(10 * mb, mb, 0.0, info=info(own=2, other=3)))
+    assert eng.last_note == "first time active during the day"
+    b = DeviceBaseline()
+    b.kind = "tv"
+    p = b._profile("day")
+    prior = KIND_PRIORS["tv"][0]
+    for f, m in zip(feats, prior):
+        assert p["mean"][f] == float(m) and \
+            p["var"][f] == (1.5 * m + 1.0) ** 2, (f, p)
+    b = DeviceBaseline()
+    b.kind = "iot"
+    b.cur_min = 1000
+    zero = {f: 0.0 for f in feats}
+    b._finish_v2(zero)
+    pk = KIND_PRIORS["iot"][0][0]
+    a = 1.0 / (1 + BASELINE_PRIOR_WEIGHT)
+    pr = b.prof[baseline_period(1000 * 60.0)]
+    assert abs(pr["mean"]["packets"] - (pk - a * pk)) < 1e-9, pr["mean"]
+    while pr["var"]["packets"] >= 0.25:
+        b._finish_v2(zero)
+    var = pr["var"]["packets"]
+    s = b._finish_v2(zero)
+    assert abs(s[2]["packets"] - math.sqrt(var)) < 1e-12 and \
+        s[2]["packets"] < 0.5, (s[2], var)
+    hs = Store(ctx.path("s13_baselines.sqlite3"), session_id=3)
+    try:
+        now = 2_000_000_000.0
+        cutoff = now - BASELINE_MAX_AGE_DAYS * 86400
+        row = json.dumps({"first": 100.0, "last": 123.0})
+        hs.submit(lambda con: con.executemany(
+            "INSERT INTO baselines VALUES(?,?,?)",
+            [("edge", row, cutoff), ("gone", row, cutoff - 5),
+             ("keep", row, now)]))
+        assert hs.flush_now(10)
+        got = hs.load_baselines(now=now)
+        assert set(got) == {"edge", "keep"}, set(got)
+        assert got["keep"]["last"] == 123.0, got["keep"]
+    finally:
+        hs.stop(5)
+
+
+@self_test()
+def t_s13_redaction_edges(ctx):
+    """5.3.4 (S13): the stand-ins are fixed (10.x -> 192.0.2.2 first, the
+    254th 192.0.2.1#1; hardware 02:00:00:00:01:2c for the 300th); the
+    any-address and broadcast stay; names come out only when that
+    option is on, the longest first; a number that is no address stays;
+    documentation names stay when websites are hidden; the network's own
+    name is learned; the check-up learns a visited bare word and leaves a
+    real domain to the website rule; a user name only as a whole word,
+    a device name even inside a longer word."""
+    r = Redactor()
+    ips = [r.ip(f"10.0.{i // 250}.{i % 250 + 1}") for i in range(300)]
+    assert ips[0] == "192.0.2.2" and ips[252] == "192.0.2.254" and \
+        ips[253] == "192.0.2.1#1" and len(set(ips)) == 300, ips[250:256]
+    assert r.ip("0.0.0.0") == "0.0.0.0"
+    assert r.ip("255.255.255.255") == "255.255.255.255"
+    macs = [r.mac(f"aa:bb:cc:dd:{i >> 8:02x}:{i & 255:02x}")
+            for i in range(300)]
+    assert macs[0] == "02:00:00:00:00:01" and \
+        macs[299] == "02:00:00:00:01:2c", macs[299]
+    for cls in (Redactor, CheckupRedactor):
+        off = cls(options={"names": False}, extra_names=("Kitchen-PC",))
+        assert "Kitchen-PC" in off.text("Kitchen-PC is on")
+        r2 = cls(extra_names=("Living Room", "Living Room TV"))
+        out = r2.text("Living Room TV is on")
+        assert "TV" not in out and "Living" not in out, out
+        assert r2.text("version 999.1.1.1") == "version 999.1.1.1"
+    s = Redactor(options={"sites": True})
+    out = s.text("printer.example and evil.com")
+    assert "printer.example" in out and "evil.com" not in out, out
+    model = types.SimpleNamespace(
+        registry=types.SimpleNamespace(by_key={}),
+        network_names=["MyHomeWifi"], switch_ports={},
+        websites={"printerbox": None, "evil.com": None},
+        flows=types.SimpleNamespace(all_flows=lambda: []), cache={})
+    assert "MyHomeWifi" not in Redactor(model).text("on MyHomeWifi")
+    cr = CheckupRedactor(model, users=("anna",))
+    out = cr.text("printerbox, evil.com, python.org, x.example")
+    assert "printerbox" not in out and "Device" in out and \
+        "evil.com" not in out and "site-1.example" in out and \
+        "python.org" in out and "x.example" in out, out
+    assert cr.text("Savannah") == "Savannah"
+    assert "anna" not in cr.text(r"C:\\Users\\anna\\Documents")
+    cr2 = CheckupRedactor(extra_names=("lisa-pc",), users=())
+    assert "lisa-pc" not in cr2.text("lisa-pc_backup"), cr2.text(
+        "lisa-pc_backup")
+
+
+@self_test()
+def t_s13_stream_lines(ctx):
+    """5.3.4 (S13): an ordinary header line stays readable while a cookie
+    is hidden; SMTP on port 2525 gets the mail treatment (metadata only),
+    like 25 and 587."""
+    assert safe_text_line(b"Host: example.com") == "Host: example.com"
+    assert safe_text_line(b"Cookie: sid=abc") == "Cookie: (hidden)"
+    res = types.SimpleNamespace(client=("10.0.0.2", 50000),
+                                server=("10.0.0.1", 2525))
+    assert redact_stream_line(b"Subject: hello", res) == \
+        _mail_line_label(b"Subject: hello")
+    assert "hello" not in redact_stream_line(b"Subject: hello", res)
+
+
+@self_test()
+def t_s13_rtp_edges(ctx):
+    """5.3.4 (S13): RFC 3550's sequence rules at their edges (a jump of
+    exactly MAX_DROPOUT is not counted, 100 back is a bad sequence, 99
+    back a late packet); nothing expected and no loss before a stream
+    settles; one jitter step is |D|/16; a call from 25 packets; the clock
+    guessed from exactly 50 packets or exactly 0.8 s; 400 waiting packets
+    trimmed to 200; a frozen clock turned away without an error."""
+    s = RtpStream("k", 0.0, 100, 0, True)
+    assert s.expected() == 0 and s.loss_pct() == 0.0
+    s._update_seq(100)
+    s._update_seq(101)
+    assert s.received == 1 and s.max_seq == 101
+    s._update_seq(101 + s.MAX_DROPOUT)
+    assert s.received == 1 and s.max_seq == 101
+    s._update_seq(101 - s.MAX_MISORDER)
+    assert s.received == 1
+    s._update_seq(101 - s.MAX_MISORDER + 1)
+    assert s.received == 2
+    j = RtpStream("j", 0.0, 1, 0, True)
+    j.rate = 8000
+    j._jitter(0.0, 0)
+    j._jitter(0.030, 160)
+    assert abs(j.jitter - 0.010 / 16) < 1e-12, j.jitter
+    j.received = j.CALL_PACKETS
+    assert j.is_call()
+
+    def fed(times, rts, pt=96):
+        st = RtpStream("r", times[0], 1, pt, True)
+        for i, (t, r) in enumerate(zip(times, rts)):
+            st.packet(t, 1 + i, r)
+        return st
+    t50 = [k * 0.02 for k in range(50)]
+    assert fed(t50[:49], [int(t * 8000) for t in t50[:49]]).rate is None
+    assert fed(t50, [int(t * 8000) for t in t50]).rate == 8000
+    t60 = [k * 0.01 for k in range(59)] + [0.8]
+    assert fed(t60, [int(round(t * 8000)) for t in t60]).rate == 8000
+    t400 = [k * 0.001 for k in range(400)]
+    big = fed(t400, [k * 225 for k in range(400)])
+    assert big.rate is None and len(big.pending) == 200, len(big.pending)
+    t70 = [k * 0.02 for k in range(70)]
+    for pt in (96, 0):
+        frozen = fed(t70, [0] * 70, pt)
+        assert frozen.rejected and frozen.rate is None
+
+
+@self_test()
+def t_s13_call_tracker_edges(ctx):
+    """5.3.4 (S13): a stream is admitted right at its STUN and 60 s after
+    it, not later; a packet 10 behind is reordering, not a restart; 4,096
+    RTCP connections are all kept; the worst window needs 20 expected
+    packets, and of two equally bad the first is shown."""
+    tr = CallTracker()
+    pair = ("10.0.0.2", "52.1.1.1")
+    tr.stun_pairs[pair] = 100.0
+    ta = (("10.0.0.2", 5000), ("52.1.1.1", 3478))
+    tb = (("10.0.0.2", 5002), ("52.1.1.1", 3478))
+    tc = (("10.0.0.2", 5004), ("52.1.1.1", 3478))
+    assert tr.admitted(ta, pair, 100.0) is True
+    assert tr.admitted(tb, pair, 160.0) is True
+    assert tr.admitted(tc, pair, 160.5) is False
+
+    def rtp(seq, sp=6000, dst="99.1.1.1"):
+        return {"rtc": {"kind": "RTP", "ssrc": 7, "seq": seq, "ts": seq * 160,
+                        "pt": 0}, "src_ip": "10.0.0.3", "dst_ip": dst,
+                "sport": sp, "dport": 7000, "time": 1.0 + seq * 0.02}
+    for q in range(100, 131):
+        tr.feed(rtp(q))
+    u = next(iter(tr.ungated.values()))
+    assert u[1] == 30
+    tr.feed(rtp(120))
+    assert u[1] == 30, u
+    tr2 = CallTracker()
+    tr2.stun_pairs[("10.0.0.4", "52.2.2.2")] = 1.0
+    for port in range(4096):
+        tr2.feed({"rtc": {"kind": "RTCP", "pt": 200, "ssrc": 1},
+                  "src_ip": "10.0.0.4", "dst_ip": "52.2.2.2",
+                  "sport": 10000 + port, "dport": 3479, "time": 2.0})
+    assert len(tr2.rtcp) == 4096, len(tr2.rtcp)
+    tr3 = CallTracker()
+    st = RtpStream(("10.0.0.5", 5000, "52.3.3.3", 3478, 9), 0.0, 1, 0, True)
+    st.probation, st.rate, st.received = 0, 8000, 30
+    st.windows.extend([(0, 30, 19, 10, 0.0), (30, 60, 20, 2, 0.0),
+                       (60, 90, 20, 2, 0.0), (90, 120, 40, 3, 0.0)])
+    tr3.streams[st.key] = st
+    worst = tr3.summary()[0]["worst"]
+    assert worst == (30, 60, 20, 2, 0.0), worst
+
+
+@self_test()
+def t_s13_login_watch_edges(ctx):
+    """5.3.4 (S13): a sign-in is told only from the client's side, with the
+    client's address; PASS on port 21 is FTP even before the server's
+    3xx line was seen."""
+    def stream(sport, said=b""):
+        return types.SimpleNamespace(
+            key=(("10.0.0.2", 50000), ("10.0.0.1", sport)),
+            a=("10.0.0.2", 50000),
+            dirs=[None, types.SimpleNamespace(recent=bytearray(said))])
+    basic = b"GET / HTTP/1.1\r\nAuthorization: Basic eDp5\r\n\r\n"
+    pt = ProtocolTracker()
+    pt.login_watch(1, 1.0, stream(80), types.SimpleNamespace(
+        kind="http", direction=1, data=basic))
+    assert not pt.out
+    pt.login_watch(2, 2.0, stream(80), types.SimpleNamespace(
+        kind="http", direction=0, data=basic))
+    assert [(t["proto"], t["client"]) for t in pt.out] == \
+        [("HTTP", "10.0.0.2")], pt.out
+    pt2 = ProtocolTracker()
+    pt2.login_watch(3, 3.0, stream(21), types.SimpleNamespace(
+        kind="line", direction=0, data=b"PASS hunter2\r\n"))
+    assert [t["proto"] for t in pt2.out] == ["FTP"], pt2.out
+
+
+@self_test()
+def t_s13_own_blocklist_edges(ctx):
+    """5.3.4 (S13): a discard-only IPv6 address is refused; a /12 IPv4
+    range is accepted (the /8 limit is IPv4's, /16 IPv6's), a public
+    range is a range; a file of exactly the size cap is read whole, a cap
+    that cuts right after a first empty line keeps only that line, and the
+    message names the cap in MB."""
+    assert own_blocklist_entry("100::1")[0] == "reject"
+    got = own_blocklist_entry("45.0.0.0/12")
+    assert got[0] == "net", got
+    assert own_blocklist_entry("2a00::/12")[0] == "reject"
+    assert own_blocklist_entry("45.33.0.0/16")[0] == "net"
+    p = ctx.path("s13_cap.txt")
+    with open(p, "wb") as f:
+        f.write(b"8.8.8.8\n45.9.20.1\n")
+    bl = load_own_blocklist(p, max_bytes=18)
+    assert bl.capped == "" and bl.size == 18 and len(bl.ips) == 2, \
+        (bl.capped, bl.size)
+    with open(p, "wb") as f:
+        f.write(b"\n8.8.4.4" + b"x" * 20)
+    bl = load_own_blocklist(p, max_bytes=10)
+    assert bl.size == 1 and not bl.rejected, (bl.size, bl.rejected)
+    with open(p, "wb") as f:
+        f.write((b"#" * 1000 + b"\n") * 2200)
+    bl = load_own_blocklist(p, max_bytes=2 * 1024 * 1024)
+    assert bl.capped.startswith("only the first 2 MB"), bl.capped
+
+
+# ---- 5.3.4 M15 (S14): a long history ------------------------------------------
+def s14_history_db(path, days=90, obs_per_session=800, schema=None,
+                   now=None, seed=90):
+    """A synthetic history file of `days` days (two sessions a day: devices,
+    observations, lookups, connections, site ties, events, traffic,
+    presence, baselines), written straight with sqlite3 at `schema` (an
+    older one to test the migration). -> [(session id, start, end)]."""
+    schema = STORE_SCHEMA_VERSION if schema is None else schema
+    rng = random.Random(seed)
+    now = time.time() if now is None else now
+    day0 = now - days * 86400
+    con = sqlite3.connect(path)
+    con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+    for v in range(1, schema + 1):
+        Store._migrate(con, v)
+    devs = [f"aa:bb:cc:00:00:{i:02x}" for i in range(40)]
+    codes = sorted(OBS_KIND_CODES.values())
+    sessions = []
+    for d in range(days):
+        dday = time.strftime("%Y-%m-%d", time.localtime(day0 + d * 86400))
+        for half in range(2):
+            sid = len(sessions) + 1
+            s0 = day0 + d * 86400 + half * 43200
+            s1 = s0 + 43000
+            sessions.append((sid, s0, s1))
+            if schema < 2:
+                continue
+            con.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?)",
+                        (sid, s0, s1, "live", "eth0", "Home", "5.2.3"))
+            obs = [(s0 + rng.random() * 43000, sid, rng.choice(codes),
+                    rng.choice(devs), '{"hostname":"h%d"}' % (k % 40)
+                    if k % 9 == 0 else "", k)
+                   for k in range(obs_per_session)]
+            con.executemany("INSERT INTO observations VALUES(?,?,?,?,?,?)",
+                            obs)
+            con.executemany("INSERT INTO resolutions VALUES(?,?,?,?,?)",
+                            [(o[0], sid, o[3], "d%d.example" % (k % 300),
+                              "93.184.215.14")
+                             for k, o in enumerate(obs[::3])])
+            con.executemany(
+                "INSERT INTO flows VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(sid, k, o[0], o[0] + 30, o[3], "93.184.215.14", 443,
+                  "TCP", "HTTPS", "d.example", "observed", 1000, 5000, 20)
+                 for k, o in enumerate(obs[::2])])
+            con.executemany(
+                "INSERT OR REPLACE INTO site_ties VALUES(?,?,?,?,?,?,?)",
+                [(sid, rng.choice(devs), "d%d.example" % rng.randrange(300),
+                  "observed", s0, s1, 3) for _ in range(60)])
+            if schema >= 3:
+                con.executemany(
+                    "INSERT INTO events VALUES(?,?,?,?,?,?,?,?)",
+                    [(s0 + rng.random() * 43000, sid, rng.choice((
+                        "device left", "device back", "new device",
+                        "website", "ip changed")), "INFO",
+                      "Phone went offline", None, None, rng.choice(devs))
+                     for _ in range(30)])
+        con.executemany("INSERT OR REPLACE INTO traffic VALUES(?,?,?,?,?)",
+                        [(k, dday, 10 ** 6, 10 ** 7, 5000) for k in devs])
+        con.executemany("INSERT OR REPLACE INTO domains VALUES(?,?,?,?)",
+                        [("d%d.example" % i, dday, 5, 5000)
+                         for i in range(100)])
+        con.executemany("INSERT OR REPLACE INTO presence VALUES(?,?,?)",
+                        [(k, day0 + d * 86400 + 3600, day0 + d * 86400 +
+                          7200) for k in devs])
+    con.executemany("INSERT OR REPLACE INTO baselines VALUES(?,?,?)",
+                    [(k, json.dumps(DeviceBaseline().to_dict()), now - 60)
+                     for k in devs])
+    con.executemany("INSERT OR REPLACE INTO devices VALUES(?,?,?,?)",
+                    [(k, json.dumps({"key": k}), day0, now) for k in devs])
+    con.commit()
+    con.close()
+    return sessions
+
+
+@self_test(slow=True)
+def t_s14_long_history(ctx):
+    """5.3.4 (S14): 90 days of history. Opening (and migrating a file of
+    the first schema), Story mode, "Compare sessions" and the check-up
+    stay inside their limits; "Compare sessions" reads by index (it read
+    every observation and event of 90 days: 4.9 s on the Tk thread with a
+    585 MB file); clearing everything, VACUUM included, takes under 2 s
+    on the writer."""
+    lim = BENCH_LIMITS["history"]
+
+    def ms(fn, *a, **k):
+        t0 = time.perf_counter()
+        r = fn(*a, **k)
+        return r, (time.perf_counter() - t0) * 1000
+    old = ctx.path("s14_old.sqlite3")
+    s14_history_db(old, schema=1, obs_per_session=0)
+    st, took = ms(Store, old, session_id=10 ** 6)
+    try:
+        assert not st.error and st.schema_version() == STORE_SCHEMA_VERSION, \
+            st.error
+        assert took <= lim["history_90d_open"], f"migrating took {took:.0f}"
+        assert len(st.load_baselines()) == 40
+    finally:
+        st.stop(5)
+    path = ctx.path("s14.sqlite3")
+    sessions = s14_history_db(path)
+    st, took = ms(Store, path, session_id=10 ** 6)
+    try:
+        assert not st.error, st.error
+        assert took <= lim["history_90d_open"], f"opening took {took:.0f} ms"
+        assert st.flush_now(30)
+        idx = {r[0] for r in st.query(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        assert {"obs_session", "events_session"} <= idx, idx
+        a, b = sessions[-3][0], sessions[-2][0]
+        rd = st._reader()
+        for sql, args, want in (
+                ("SELECT subject, data FROM observations WHERE session=? "
+                 "AND kind IN (?,?)", (a, 1, 2), "obs_session"),
+                ("SELECT DISTINCT subject FROM observations WHERE "
+                 "session=?", (a,), "obs_session"),
+                ("SELECT kind, COUNT(*) FROM events WHERE session=? GROUP "
+                 "BY kind", (a,), "events_session")):
+            plan = [str(r[-1]) for r in rd.execute(
+                "EXPLAIN QUERY PLAN " + sql, args)]
+            assert any(want in p for p in plan), (sql, plan)
+        rd.close()
+        res, took = ms(compare_sessions, st, a, b)
+        assert res["both_devices"] and took <= lim["history_compare"], took
+        gw, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg(), gw, ips, macs)
+        m.set_identity(local_nets=nets)
+        now = time.time()
+        story, took = ms(story_job_run, Job("story", "", None), GuiGate(), m,
+                         st, now - STORY_DAYS * 86400, now, None)
+        # seven times 24 hours touch eight calendar days
+        assert len(story["days"]) in (STORY_DAYS, STORY_DAYS + 1), \
+            len(story["days"])
+        assert took <= lim["story_build_7d"], f"story took {took:.0f} ms"
+        facts, took = ms(checkup_facts, m)
+        html_, took2 = ms(checkup_html, facts, CheckupRedactor())
+        assert took + took2 <= lim["checkup_render"] and len(html_) > 500
+        t0 = time.perf_counter()
+        st.clear()
+        assert st.flush_now(30)
+        took = (time.perf_counter() - t0) * 1000
+        assert took <= 2000, f"clearing (VACUUM) took {took:.0f} ms"
+        assert st.query("SELECT COUNT(*) FROM observations")[0][0] == 0
+    finally:
+        st.stop(5)
+
+
+# ---- 5.3.4 M15 (S15): clocks and locales --------------------------------------
+NETSH_DE = """
+Es ist 1 Schnittstelle auf dem System vorhanden:
+
+    Name                   : WLAN
+    Beschreibung           : Intel(R) Wi-Fi 6 AX201 160MHz
+    Physische Adresse      : 3c:7c:3f:10:00:10
+    Schnittstellentyp      : Primär
+    Status                 : Verbunden
+    SSID                   : Zuhause
+    AP BSSID               : 7C:10:C9:AA:BB:CC
+    Band                   : 2,4 GHz
+    Kanal                  : 11
+    Netzwerktyp            : Infrastruktur
+    Funktyp                : 802.11n
+    Authentifizierung      : WPA2-Personal
+    Empfangsrate (MBit/s)  : 144,4
+    Übertragungsrate (MBit/s) : 72,2
+    Signal                 : 70 %
+    Profil                 : Zuhause
+"""
+NETSH_DE_LOCATION = """
+Für den Netzwerkshell-Befehl ist eine Standortberechtigung für den Zugriff auf
+WLAN-Informationen erforderlich. Aktivieren Sie die Standortdienste in den
+Datenschutz- und Sicherheitseinstellungen.
+"""
+ARP_WINDOWS_LANGS = {
+    "fr": """
+Interface : 192.168.1.10 --- 0x7
+  Adresse Internet      Adresse physique      Type
+  192.168.1.1           00-1e-58-aa-00-01     dynamique
+  192.168.1.23          da-a1-19-23-45-67     dynamique
+""",
+    "de": """
+Schnittstelle: 192.168.1.10 --- 0x7
+  Internetadresse       Physische Adresse     Typ
+  192.168.1.1           00-1e-58-aa-00-01     dynamisch
+  192.168.1.23          da-a1-19-23-45-67     dynamisch
+""",
+    "es": """
+Interfaz: 192.168.1.10 --- 0x7
+  Dirección de Internet          Dirección física      Tipo
+  192.168.1.1           00-1e-58-aa-00-01     dinámico
+  192.168.1.23          da-a1-19-23-45-67     dinámico
+"""}
+
+
+@self_test()
+def t_s15_windows_tools_in_other_languages(ctx):
+    """5.3.4 (S15): German Windows' `netsh wlan show interfaces` is read
+    (it was taken for no Wi-Fi at all), its location-permission message is
+    recognised, a band written "2,4 GHz" reads 2.4 GHz, and `arp -a` in
+    French, German and Spanish gives the same neighbours."""
+    w = parse_netsh_wlan(NETSH_DE)
+    assert w and w["ssid"] == "Zuhause" and w["channel"] == 11, w
+    assert w["band"] == "2.4 GHz" and w["standard"] == "802.11n", w
+    assert w["rx_mbps"] == 144.4 and w["tx_mbps"] == 72.2, w
+    assert w["signal_pct"] == 70 and w["rssi"] == -65.0, w
+    assert parse_netsh_wlan(NETSH_DE.replace("Verbunden", "Getrennt")) is None
+    assert parse_netsh_wlan(NETSH_DE, want="WLAN")["ssid"] == "Zuhause"
+    es = parse_netsh_wlan(NETSH_ES.replace(
+        "    Canal", "    Banda                  : 2,4 GHz\n    Canal"))
+    assert es["band"] == "2.4 GHz", es
+    assert netsh_location_hidden(NETSH_DE_LOCATION)
+    for text in (NETSH_DE, NETSH_EN, NETSH_FR, NETSH_ES):
+        assert not netsh_location_hidden(text)
+    want = parse_arp_windows(ARP_WINDOWS)[:2]
+    for lang, text in ARP_WINDOWS_LANGS.items():
+        assert parse_arp_windows(text) == want, (lang, parse_arp_windows(text))
+
+
+@self_test()
+def t_s15_clock_steps_are_not_sleep(ctx):
+    """5.3.4 (S15): the network watcher tells a sleep from a clock change.
+    The wall clock set ahead by two minutes (by hand or by the time
+    service) counted as waking from sleep and restarted the capture; a
+    real sleep is still seen on Linux (whose steady clock stops) and on
+    Windows (whose steady clock keeps going)."""
+    iv = 15.0
+    cases = (  # d_wall, d_mono, d_awake -> slept, step
+        ((15, 15, 15), (False, 0.0)),              # a normal interval
+        ((3615, 15, 3615), (True, 0.0)),           # Linux: slept an hour
+        ((3615, 3615, 3615), (True, 0.0)),         # Windows: slept an hour
+        ((135, 15, 15), (False, 120.0)),           # clock set ahead
+        ((-3585, 15, 15), (False, -3600.0)),       # clock set back
+        ((3735, 15, 3615), (True, 120.0)),         # both
+        ((25, 15, 15), (False, 0.0)))              # a small correction
+    for (dw, dm, da), want in cases:
+        got = wake_check(dw, dm, da, iv)
+        assert got == want, ((dw, dm, da), got, want)
+    # without a sleep-counting clock: the 5.2.3 rule
+    assert wake_check(3615, 15, None, iv)[0] and \
+        not wake_check(15, 15, None, iv)[0]
+    if awake_clock() is None:
+        return
+    got = []
+    w = NetworkWatcher(got.append, interval=0.5)
+    w._wall -= 120                       # the clock went ahead 2 minutes
+    w.start()
+    try:
+        for _ in range(100):
+            if got:
+                break
+            time.sleep(0.05)
+    finally:
+        w.stop_flag = True
+        w.join(5)
+    assert got and not got[0]["resumed"], got[:1]
+    assert got[0]["clock_step"] > 100, got[0]["clock_step"]
+
+
+@self_test()
+def t_s15_daylight_saving_days(ctx):
+    """5.3.4 (S15): on the day after a daylight-saving change, and late on
+    the 25-hour day, "Yesterday" is the calendar's day before (24 hours
+    back was two days back, or the same day); the day/night baseline
+    follows the local hour through both changes."""
+    if not hasattr(time, "tzset"):
+        return
+    old = os.environ.get("TZ")
+    try:
+        for tz, spring, autumn in (("Europe/Paris", (2026, 3, 29),
+                                    (2026, 10, 25)),
+                                   ("America/New_York", (2026, 3, 8),
+                                    (2026, 11, 1))):
+            if not os.path.exists(os.path.join("/usr/share/zoneinfo", tz)):
+                continue
+            os.environ["TZ"] = tz
+            time.tzset()
+
+            def at(ymd, h, m=30, dst=-1):
+                return time.mktime(ymd + (h, m, 0, 0, 0, dst))
+            sp = "%04d-%02d-%02d" % spring
+            au = "%04d-%02d-%02d" % autumn
+            after = at(spring, 24, 30)           # 00:30 the day after
+            assert story_day(after) != sp
+            assert story_day_label(sp, after) == translate_text(
+                "Yesterday"), (tz, story_day_label(sp, after))
+            late = at(autumn, 23, 30)            # 23:30 on the long day
+            assert story_day(late) == au
+            prev = story_day(at(autumn, 12) - 86400)
+            assert story_day_label(prev, late) == translate_text(
+                "Yesterday"), (tz, prev, story_day_label(prev, late))
+            assert story_day_label(au, late) == translate_text("Today")
+            # the local hour decides: 01:30 and 03:30 on the short day,
+            # both 01:30s on the long day are night; 07:30 is day
+            for ts in (at(spring, 1), at(spring, 3), at(autumn, 1, dst=1),
+                       at(autumn, 1, dst=1) + 3600, at(spring, 23, 0)):
+                assert baseline_period(ts) == "night", (tz, ts)
+            for ts in (at(spring, 7), at(autumn, 7), at(autumn, 22, 59)):
+                assert baseline_period(ts) == "day", (tz, ts)
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+
+
+@self_test()
+def t_s15_unusual_folder_and_user_names(ctx):
+    """5.3.4 (S15): a data folder and a user name with accents, spaces, "#"
+    and "%" work: settings save and load, the history opens and reads,
+    the readiness check reads it (the unquoted "#" cut the path: "History
+    can't be read"), your own blocklist loads, and the check-up hides the
+    user name."""
+    folder = ctx.path("Zoë Müller #1 50% Ünïcode")
+    os.makedirs(folder, exist_ok=True)
+    cfg = AppConfig(os.path.join(folder, "miniwireshark_config.json"))
+    cfg.set("ui.language", "fr")
+    cfg.save()
+    again = AppConfig(os.path.join(folder, "miniwireshark_config.json"))
+    assert again.get("ui.language") == "fr" and not again.warning, \
+        again.warning
+    path = os.path.join(folder, "history.sqlite3")
+    st = Store(path, session_id=1)
+    try:
+        assert not st.error, st.error
+        assert st.flush_now(10)
+        assert st.query("SELECT COUNT(*) FROM meta")[0][0] >= 1
+    finally:
+        st.stop(5)
+    broken = os.path.join(folder, "broken.sqlite3")
+    with open(broken, "wb") as f:
+        f.write(b"not a database " * 300)
+    before = sorted(os.listdir(ctx.tmp))
+    held = PATHS.history_db
+    try:
+        PATHS.history_db = path
+        state, text, _fix = _ready_history(None)
+        assert state == "ok", (state, text)
+        # unquoted, the "#" cut the path: SQLite made an empty file named
+        # "Zoë Müller " next to the folder and called it healthy
+        PATHS.history_db = broken
+        state, text, _fix = _ready_history(None)
+        assert state == "bad", (state, text)
+    finally:
+        PATHS.history_db = held
+    assert sorted(os.listdir(ctx.tmp)) == before, os.listdir(ctx.tmp)
+    bl_path = os.path.join(folder, "liste à moi.txt")
+    with open(bl_path, "w", encoding="utf-8") as f:
+        f.write("# Zoë's list\n203.0.113.9\nexample.org\n")
+    bl = load_own_blocklist(bl_path)
+    assert len(bl) == 1 and "example.org" in bl.domains, \
+        (len(bl), bl.domains)
+    r = CheckupRedactor(users={"Zoë", "Müller"})
+    out = r.text(f"Saved to {folder} by Zoë")
+    assert "Zoë" not in out and "Müller" not in out, out
 
 
 # ============================================================================
@@ -83335,7 +84450,10 @@ def _ready_history(cfg):
     if not os.path.exists(path):
         return "info", "No history saved yet.", ""
     try:
-        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+        # 5.3.4 (S15): quoted; a "#", "%" or "?" in the folder name (a
+        # user called "Zoë #1") cut the path and the check said "History
+        # can't be read"
+        con = sqlite3.connect(sqlite_ro_uri(path), uri=True, timeout=2)
         try:
             row = con.execute("PRAGMA quick_check").fetchone()
         finally:
@@ -83477,7 +84595,7 @@ if __name__ == "__main__":
     if SELF_TEST_MODE:
         setup_logging()
         print(f"MiniWireshark {SCRIPT_VERSION} self-test")
-        sys.exit(run_self_tests())
+        sys.exit(run_self_tests(only=_arg(sys.argv, SELF_TEST_FLAG)))
     if GUI_TEST_MODE:
         print(f"MiniWireshark {SCRIPT_VERSION} GUI test")
         sys.exit(run_gui_test(live="--live" in sys.argv))
