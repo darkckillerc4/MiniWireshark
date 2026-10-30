@@ -43,4 +43,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898237+github-actions[bot]@users.noreply.github.com"
           git commit -am "Record release $(grep -oP '^SCRIPT_VERSION = "\K[^"]+' miniwireshark.py) in the version index"
+          git pull --rebase
           git push

@@ -12,7 +12,6 @@ People run MiniWireshark on whatever Python they have: an old 3.8, a Store build
 
 - **Relocatable builds.** It uses [python-build-standalone](https://github.com/astral-sh/python-build-standalone) "install only, stripped" builds of CPython 3.14 for Windows (x86, x64, ARM64), macOS (Intel and Apple silicon) and Linux (x64, ARM64). They need no admin rights and include Tk.
 - **Every byte is pinned.** Each archive's SHA-256 is written into the source file. Wheels for the private runtime are hash-pinned too, and installed with `pip --require-hashes`.
-- **A signed fallback on Windows.** When the Visual C++ runtime is missing, it falls back to the official python.org installer (per user; PATH, launcher and file associations off), and accepts it only with a valid *Python Software Foundation* signature.
 - **Safe archive extraction.** Archives are extracted with path checks, so a crafted archive can't write outside its folder.
 - **Build next to, then switch.** A new environment is built beside the old one and tested before it is used. If the old one is still running, the switch happens on the next start.
 - **Repair without the network.** **Repair** reinstalls components from the cached downloads and re-tests them. If the interpreter itself is damaged, it rebuilds from the cached archive.
@@ -77,7 +76,7 @@ Verification uses `cryptography` when present, and otherwise **a pure-Python Ed2
 
 ## <img src="assets/icons/tests.svg" width="28" alt=""> A window that tests and measures itself
 
-- **131 self-tests** run without capture or admin rights, driven by **replay scenarios**: a scripted home network made of ordinary packets with `.example` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
+- **More than 160 self-tests** run without capture or admin rights, driven by **replay scenarios**: a scripted home network made of ordinary packets with `.example` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
 - **Two fuzzers** throw malformed packets at the decoders and the model.
 - **The GUI test** drives the real window through every tab (48 steps).
 - **A layout crawler** opened every tab, view, dialog and settings page in three languages, two themes, four text sizes and screen sizes from 1024×768 to 1920×1080, and flagged overlaps and cut-off text.

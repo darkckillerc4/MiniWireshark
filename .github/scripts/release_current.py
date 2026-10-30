@@ -125,9 +125,10 @@ def main():
         print(f"{version}: no '## [{version}]' section in CHANGELOG.md yet, "
               "so it isn't released. Nothing to do.")
         return
-    if not DRY and release_exists(tag):
-        print(f"{tag} is already released. Nothing to do.")
-        return
+    # 5.3.4 (OS-08): a release that exists still gets its index row (a
+    # failed push of the index used to lose it for good: the rerun stopped
+    # here); record() only adds what is missing
+    released = not DRY and release_exists(tag)
     date, body = section
     with open(path("miniwireshark.py"), "rb") as f:
         data = f.read()
@@ -160,7 +161,14 @@ def main():
         cmd.append("--prerelease")
     print(" ".join(cmd))
     print(f"sha256 {digest}, {lines:,} lines, commit {commit[:7]}")
-    if not DRY:
+    if DRY:
+        # 5.3.4 (OS-08): a dry run changes no file
+        print(f"dry run: would record {tag} in the manifest, "
+              "docs/VERSIONS.md and README.md")
+        return
+    if released:
+        print(f"{tag} is already released; checking the version index.")
+    else:
         subprocess.run(cmd, check=True)
     record(version, date, body, digest, lines, commit)
     print(f"recorded {tag} in the manifest, docs/VERSIONS.md and README.md")

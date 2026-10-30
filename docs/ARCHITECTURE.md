@@ -44,7 +44,8 @@ python miniwireshark.py
    │
    ├─ Loading window (2b, 2c): the bootstrap steps, in plain English.
    │     Missing packages go into a private per-Python folder, never the
-   │     system Python. Each download is checked against a pinned SHA-256.
+   │     system Python. Required packages are checked against a pinned
+   │     SHA-256; optional ones come from PyPI through pip, unpinned.
    │
    ├─ Load scapy, find the gateway, this computer's addresses and the
    │     best network card. Warm up the first views.

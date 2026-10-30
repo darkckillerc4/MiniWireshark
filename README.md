@@ -53,7 +53,7 @@ Under the beginner view is a real analysis workstation, with packet dissection, 
 | <img src="docs/assets/icons/accessibility.svg" width="36" alt=""> | **Accessible and multilingual** | English, French and Spanish. Light and dark themes, colour-blind palettes, adjustable text size, full keyboard control and a command palette (`Ctrl+K`). |
 | <img src="docs/assets/icons/self-maintaining.svg" width="36" alt=""> | **Self-maintaining** | Installs its own dependencies into a private folder and never into your system Python. Offers to install Npcap on Windows, picks the best network card, heals a capture that dies, and checks Ed25519-signed updates. |
 
-The engineering underneath (a self-installing private Python runtime, a decoder 15× faster than the obvious one, pure-Python AES and Ed25519 fallbacks, 131 self-tests) is described in [Under the hood](docs/UNDER-THE-HOOD.md).
+The engineering underneath (a self-installing private Python runtime, a decoder 15× faster than the obvious one, pure-Python AES and Ed25519 fallbacks, more than 160 self-tests) is described in [Under the hood](docs/UNDER-THE-HOOD.md).
 
 ## Screenshots
 
@@ -127,7 +127,7 @@ MiniWireshark is a **defensive** tool for networks you own or are allowed to mon
 
 - **No telemetry.** Everything MiniWireshark itself sends goes through one gate, `outbound()`, and is listed in a self-traffic ledger. A kill switch blocks all of it.
 - **Secrets are dropped inside the parsers.** Mail logins, passwords and message bodies are never stored. A canary test checks reports, sessions, CSV files, logs, history and the clipboard for leaks.
-- **Redaction.** Reports and shared screenshots can replace real names and addresses with documentation-range pseudonyms.
+- **Redaction.** Reports and exports can replace real names and addresses with documentation-range pseudonyms.
 - **Active scanning stays on your own subnet,** and Quiet Mode turns it off on networks you haven't trusted.
 
 Found a security issue? See [SECURITY.md](SECURITY.md).
@@ -135,7 +135,7 @@ Found a security issue? See [SECURITY.md](SECURITY.md).
 ## Testing
 
 ```bash
-python miniwireshark.py --self-test               # ~35 s, 131+ tests
+python miniwireshark.py --self-test               # about a minute, 160+ tests
 xvfb-run -a python miniwireshark.py --gui-test    # Linux without a display
 python miniwireshark.py --bench-gui S1 S2         # performance budgets
 ```
@@ -170,13 +170,12 @@ The file's docstring lists every region in order (bootstrap, capture pipeline, p
 
 ## Roadmap
 
-**5.2.3** is in progress ([pull request #1](https://github.com/darkckillerc4/MiniWireshark/pull/1)). It is a reliability release:
+**5.3.4** is in progress ([pull request #4](https://github.com/darkckillerc4/MiniWireshark/pull/4)). It is a security and bug-fix release:
 
-- Capture starts and recovers without freezing the window.
-- Archived versions can share a folder safely.
-- Memory stays bounded while the window is minimised.
-- Devices are identified correctly on PCs with VPN and virtual adapters.
-- Windows fixes, and groundwork for a standalone `.exe`.
+- Safer elevation, clearing and file handling, with every finding of the 5.2.3 bug hunt fixed and tested.
+- Damaged capture and session files are read safely, with bounded memory.
+- A "Ready?" panel at start that says what works and how to fix what doesn't.
+- Alert snooze, and clearer wording across the window.
 
 ## Contributing
 
