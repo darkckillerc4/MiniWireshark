@@ -58213,13 +58213,15 @@ class CheckupRedactor(Redactor):
 
     def _alt(self, kind, items, exact=True):
         """Whole words only: a name never matches inside another word, so
-        "Sam" leaves "Same" alone and "vic" leaves "Device" alone."""
+        "Sam" leaves "Same" alone and "vic" leaves "Device" alone. An
+        underscore counts as a break, so "lisa-pc_backup" still hides it."""
         key = (kind, len(items))
         rx = self._rx.get(key)
         if rx is None:
             body = "|".join(self._spellings(n, exact) for n in sorted(
                 items, key=len, reverse=True))
-            rx = self._rx[key] = re.compile(r"(?<!\w)(?:%s)(?!\w)" % body)
+            rx = self._rx[key] = re.compile(
+                r"(?<![^\W_])(?:%s)(?![^\W_])" % body)
         return rx
 
     # every shape of stand-in this redactor writes (the addresses are the
@@ -78693,7 +78695,7 @@ def t_s13_redaction_edges(ctx):
         registry=types.SimpleNamespace(by_key={}),
         network_names=["MyHomeWifi"], switch_ports={},
         websites={"printerbox": None, "evil.com": None},
-        flows=types.SimpleNamespace(all_flows=lambda: []), cache={})
+        flows=types.SimpleNamespace(all_flows=lambda: []), cache=None)
     assert "MyHomeWifi" not in Redactor(model).text("on MyHomeWifi")
     cr = CheckupRedactor(model, users=("anna",))
     out = cr.text("printerbox, evil.com, python.org, x.example")
