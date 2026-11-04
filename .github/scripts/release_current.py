@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -136,24 +137,23 @@ def main():
     lines = data.count(b"\n")
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 
-    work = tempfile.mkdtemp(prefix="mw-release-")
-    asset = os.path.join(work, f"miniwireshark-{version}.py")
-    with open(asset, "wb") as f:
-        f.write(data)
-    with open(asset + ".sha256", "w", encoding="ascii") as f:
-        f.write(f"{digest}  miniwireshark-{version}.py\n")
     notes_file = path(".github", "release-notes", tag + ".md")
-    if os.path.exists(notes_file):
+    own_notes = os.path.exists(notes_file)
+    if own_notes:
         notes = read(".github", "release-notes", tag + ".md")
     else:
         notes = (f"MiniWireshark **{version}** ({lines:,} lines).\n\n{body}\n\n---\n"
                  "**Run it:** download the `.py` file and run `python <file>` "
                  "(Python 3.8+ with Tk). Check the download against the attached "
                  f"`.sha256` file:\n\n```\n{digest}  miniwireshark-{version}.py\n```\n")
-        notes_file = os.path.join(work, "notes.md")
-        with open(notes_file, "w", encoding="utf-8") as f:
-            f.write(notes)
     pre = "-" in version
+    # 5.3.4 (M18, OS-08): the dry run writes nothing at all, not even the
+    # temporary copies (it used to leave a 3 MB copy in the temp folder on
+    # every run); a real run removes its temporary folder when it is done
+    work = "<temp>" if DRY else tempfile.mkdtemp(prefix="mw-release-")
+    asset = os.path.join(work, f"miniwireshark-{version}.py")
+    if not own_notes:
+        notes_file = os.path.join(work, "notes.md")
     cmd = ["gh", "release", "create", tag, asset, asset + ".sha256",
            "--target", commit, "--title", f"MiniWireshark {version}",
            "--notes-file", notes_file, "--latest=" + ("false" if pre else "true")]
@@ -162,14 +162,25 @@ def main():
     print(" ".join(cmd))
     print(f"sha256 {digest}, {lines:,} lines, commit {commit[:7]}")
     if DRY:
-        # 5.3.4 (OS-08): a dry run changes no file
+        print(f"notes: {len(notes):,} characters from "
+              + (f".github/release-notes/{tag}.md" if own_notes else "the changelog"))
         print(f"dry run: would record {tag} in the manifest, "
               "docs/VERSIONS.md and README.md")
         return
-    if released:
-        print(f"{tag} is already released; checking the version index.")
-    else:
-        subprocess.run(cmd, check=True)
+    try:
+        with open(asset, "wb") as f:
+            f.write(data)
+        with open(asset + ".sha256", "w", encoding="ascii") as f:
+            f.write(f"{digest}  miniwireshark-{version}.py\n")
+        if not own_notes:
+            with open(notes_file, "w", encoding="utf-8") as f:
+                f.write(notes)
+        if released:
+            print(f"{tag} is already released; checking the version index.")
+        else:
+            subprocess.run(cmd, check=True)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     record(version, date, body, digest, lines, commit)
     print(f"recorded {tag} in the manifest, docs/VERSIONS.md and README.md")
 

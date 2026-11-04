@@ -1,6 +1,6 @@
 # Architecture
 
-MiniWireshark is about 66,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
+MiniWireshark is about 86,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
 
 ## The map of the file
 
@@ -16,7 +16,7 @@ The module docstring at the top lists every region in file order, and the self-t
 
 | Group | Regions | What lives there |
 |---|---|---|
-| Start-up | 1, 1a, 1b, 2, 2b, 2c, 2d, 3 | Paths and logging, the launcher and private Python runtime, the dependency manager, the loading window and its steps, optional reference data |
+| Start-up | 1, 1a, 1c, 1b, 2, 2b, 2c, 2d, 3 | Paths and logging, the launcher and private Python runtime, the dependency manager, the loading window and its steps, optional reference data |
 | Outbound gate | 2a | `outbound()`, the single gate every network send passes through, and the self-traffic ledger |
 | Decoding | 4, 5, 5b, 5c | Constants and helpers, the protocol decoder, the fast wire decoder, QUIC Initial parsing |
 | Capture | 6, 6b | Capture workers and the v2 pipeline (ring buffer and analysis worker) |
@@ -55,7 +55,7 @@ python miniwireshark.py
 
 If a step that only capture needs fails, MiniWireshark continues in *limited mode* instead of stopping. You can still open files and the demo.
 
-From 5.1.2 the compiled code is cached per Python version in the data folder. Later processes of the same file (the private-Python hand-off and the Full Power workers) load that copy, which saves about 2.5 seconds and about 150 MB.
+From 5.1.2 the compiled code is cached per Python version in the data folder. Later processes of the same file (the private-Python hand-off and the Full Power workers) load that copy, which saves a few seconds and about 150 MB. From 5.3.4 the copy is signed with a per-install HMAC key and never used by a process running as root.
 
 ## How a packet becomes an answer
 
@@ -118,7 +118,7 @@ All test traffic comes from **replay scenarios** (20a): a scripted home network 
 
 | Command | What runs |
 |---|---|
-| `--self-test` | The built-in suite (region 20b), no capture or admin rights needed |
+| `--self-test [NAME]` | The built-in suite (region 20b), or only the named tests; no capture or admin rights needed |
 | `--gui-test` | The real window, driven through every tab (region 20c) |
 | `--bench-gui S1 S2` | Window-performance scenarios against fixed budgets (`BENCH_LIMITS`) |
 | `--release-gate` | All of the above plus pictures of every tab |

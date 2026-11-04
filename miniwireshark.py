@@ -133,7 +133,7 @@ from typing import Callable
 _T_START = time.perf_counter()
 LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
-SCRIPT_VERSION = "5.2.3"
+SCRIPT_VERSION = "5.3.4"
 SESSION_SCHEMA_VERSION = 3
 CONFIG_SCHEMA_VERSION = 2
 
@@ -774,6 +774,7 @@ def _relaunch_elevated(more_args=()):
                 None, "runas", argv[0], params, None, 1)
             if int(rc) > 32:
                 return True
+        # the prompt was refused or unavailable: False below says so
         except (AttributeError, OSError):
             pass
         return False
@@ -841,6 +842,7 @@ def elevate_for_capture(root, cfg, action):
         return False
     LOG.info("capture needs root: asking for the password")
     os.environ.setdefault("MINIWIRESHARK_DATA", PATHS.data)
+    # a window already gone has nothing to hide
     with contextlib.suppress(Exception):
         root.withdraw()
         root.update_idletasks()
@@ -851,6 +853,7 @@ def elevate_for_capture(root, cfg, action):
     LOG.warning("no root: carrying on without capture")
     CAPTURE_LIMITED[0] = ("live capture needs administrator (root) rights "
                           "and the password was not given")
+    # a window already gone has nothing to show again
     with contextlib.suppress(Exception):
         root.deiconify()
     return False
@@ -1835,6 +1838,7 @@ def has_capture_rights():
             for line in f:
                 if line.startswith("CapEff:"):
                     return bool(int(line.split()[1], 16) & (1 << 13))
+    # no /proc (not Linux) or an odd line: no capability, said below
     except (OSError, ValueError, IndexError):
         pass
     return False
@@ -1861,6 +1865,7 @@ def _npcap_admin_only():
                     return bool(v)
             except OSError:
                 continue
+    # winreg missing (not CPython on Windows): default below
     except ImportError:
         pass
     return False
@@ -2834,29 +2839,26 @@ class LoaderWindow(tk.Frame):
     thread-safe (a queue drained on the Tk thread)."""
 
     WHATS_NEW = (
-        ("\U0001F4AC", "Answers first",
-         "The Dashboard answers three questions — is anything wrong, who "
-         "is using the Internet, what is new — each saying what it could "
-         "not see. Device cards tell a short story; the ? button (F1) "
-         "explains what every mark means, right where it is."),
-        ("\U0001F50E", "Find anything, go back",
-         "Results as you type, Ctrl+K for every setting and Help topic, "
-         "Back and Forward between views, tabs in four groups, and a Help "
-         "with Show me. Every 5.0.2 action is still where you can reach "
-         "it."),
-        ("\u270E", "Correct it, compare it, look back",
-         "Fix a website's category, tag a device's place and owner, undo "
-         "any of it; pin two devices side by side; see the session as of "
-         "any minute on the Timeline."),
-        ("\u23F1", "Faster, steadier, easier to read",
-         "Shorter freezes when saving, loading and changing text size; "
-         "sharp text on Windows at 125 % and more; an interface scale; "
-         "Reduce motion; a visible keyboard focus everywhere."),
-        ("\U0001F6E1", "Steadier on real PCs",
-         "Capture starts without freezing the window, devices are told "
-         "apart on PCs with VPN and virtual adapters, memory stays bounded "
-         "while minimised, and closing is quick. Copies of different "
-         "versions in one folder no longer get in each other's way."),
+        ("\U0001F6E1", "Safer by default",
+         "Linux and macOS ask for administrator rights only when capture "
+         "starts. The data folder is closed to other users, Session only "
+         "history is really cleared, and passwords never reach a file."),
+        ("\U0001F4AC", "Ready? and Story mode",
+         "The Welcome Center says what is ready, with a fix button for "
+         "each problem. The Timeline tells what changed, day by day, in "
+         "plain sentences."),
+        ("\U0001F50E", "Unusual activity and more questions",
+         "The Security tab shows each unusual thing with a worrying and "
+         "an innocent reading side by side. Seven guided questions, "
+         "including DNS, IPv6, Wi-Fi or Internet, and calls."),
+        ("\u270E", "Calls, check-up and notifications",
+         "Call quality from packet headers only, a one-page Network "
+         "check-up that hides personal details, and alerts while the "
+         "window is minimised if you turn them on."),
+        ("\u23F1", "Faster and steadier",
+         "Packets are analysed about a fifth faster, memory stays "
+         "flatter over long runs, and every tab fits small screens in all "
+         "three languages."),
     )
 
     def __init__(self, master, config=None, mode="startup"):
@@ -10764,6 +10766,7 @@ def build_sniffer(iface, prn, bpf, promisc=True):
                     s.mw_promisc_refused = True
                 return s, None
             last = s.exception
+            # a sniffer that failed to start may fail to stop; it is dropped
             with contextlib.suppress(Exception):
                 s.stop()
         if promisc and p["promisc"] and not refused and \
@@ -12552,6 +12555,7 @@ class AnalysisWorker(threading.Thread):
                 getattr(app, "data_mode", "") == "live":
             shed, deep = len(batch), None      # IP-025: counting only
             self.overload.shed += shed
+            # the deep engine may be gone; the shed count is kept above
             with contextlib.suppress(Exception):
                 app.deep._count_shed(shed, "too busy")
         gw, my_ips = model.gateway_ip, model.my_ips
@@ -12735,6 +12739,7 @@ class RawCapture(threading.Thread):
         finally:
             self.running = False
             first.set()
+            # the socket may be closed already; the thread is ending
             with contextlib.suppress(Exception):
                 sock.close()
 
@@ -12767,6 +12772,7 @@ class SnifferCapture:
         return bool(getattr(self.sniffer, "mw_promisc_refused", False))
 
     def stop(self):
+        # stopping a sniffer that already died must not raise
         with contextlib.suppress(Exception):
             self.sniffer.stop()
 
@@ -12812,6 +12818,7 @@ def probe_capture_sources(candidates, bpf, promisc, sink,
         src, err = start_capture_source(iface, bpf, promisc, sink)
         if src is not None:
             if cancelled():
+                # a cancelled start: the source is dropped whatever stop says
                 with contextlib.suppress(Exception):
                     src.stop()
                 return None, None, None
@@ -21636,6 +21643,7 @@ class NetworkModel:
         key = payload.get("key") or payload.get("a") or ""
         name = (lambda k: (self._dev(k).display_name() if self._dev(k)
                            else str(k).replace("ip:", "")))
+        # the correction is kept for Undo even if the timeline line fails
         with contextlib.suppress(Exception):
             self.push_timeline("website" if op == "category" else
                                "identity", "INFO",
@@ -24493,6 +24501,7 @@ class Store:
             except Exception as e:                   # noqa: BLE001
                 ok = False
                 LOG.warning("history index not made: %s", e)
+                # rollback after a failed index; the failure is logged above
                 with contextlib.suppress(Exception):
                     con.rollback()
         return ok
@@ -25708,6 +25717,7 @@ class PacketRing:
             except (OSError, ValueError, TypeError, struct.error) as e:
                 LOG.warning("packet history: %s", e)
                 with self._lock:
+                    # closing a segment that failed to write; logged above
                     with contextlib.suppress(Exception):
                         self._seg["f"].close()
                     self._seg = None
@@ -25794,6 +25804,7 @@ class PacketRing:
         done = threading.Event()
         try:
             self.q.put(("wipe", done), timeout=timeout)
+        # a full queue: the wipe is done below, under the lock, instead
         except queue.Full:
             pass
         if not done.wait(timeout):
@@ -27925,16 +27936,16 @@ Download and continue ¦ Télécharger et continuer ¦ Descargar y continuar
 Start without live capture ¦ Démarrer sans capture en direct ¦ Empezar sin captura en directo
 Before anything is downloaded ¦ Avant tout téléchargement ¦ Antes de descargar nada
 MiniWireshark needs these to watch your network live. Nothing else is downloaded, and your own Python is not changed. ¦ MiniWireshark en a besoin pour observer votre réseau en direct. Rien d'autre n'est téléchargé, et votre propre Python n'est pas modifié. ¦ MiniWireshark los necesita para observar su red en directo. No se descarga nada más y su propio Python no se modifica.
-Answers first ¦ Les réponses d'abord ¦ Primero las respuestas
-The Dashboard answers three questions — is anything wrong, who is using the Internet, what is new — each saying what it could not see. Device cards tell a short story; the ? button (F1) explains what every mark means, right where it is. ¦ Le tableau de bord répond à trois questions — y a-t-il un problème, qui utilise Internet, quoi de neuf — en disant chaque fois ce qu'il n'a pas pu voir. Les fiches d'appareil racontent une courte histoire ; le bouton ? (F1) explique chaque marque à l'endroit même. ¦ El panel responde a tres preguntas —¿algo va mal?, ¿quién usa Internet?, ¿qué hay de nuevo?— y cada una dice lo que no pudo ver. Las fichas de dispositivo cuentan una breve historia; el botón ? (F1) explica cada marca justo donde está.
-Find anything, go back ¦ Tout trouver, revenir en arrière ¦ Encontrarlo todo, volver atrás
-Results as you type, Ctrl+K for every setting and Help topic, Back and Forward between views, tabs in four groups, and a Help with Show me. Every 5.0.2 action is still where you can reach it. ¦ Des résultats pendant la frappe, Ctrl+K pour chaque paramètre et chaque rubrique d'aide, Retour et Avance entre les vues, des onglets en quatre groupes et une aide avec « Montrer ». Chaque action de la 5.0.2 reste accessible. ¦ Resultados mientras escribe, Ctrl+K para cada ajuste y tema de ayuda, Atrás y Adelante entre vistas, pestañas en cuatro grupos y una ayuda con «Mostrar». Todas las acciones de la 5.0.2 siguen a su alcance.
-Correct it, compare it, look back ¦ Corriger, comparer, remonter le temps ¦ Corregir, comparar, mirar atrás
-Fix a website's category, tag a device's place and owner, undo any of it; pin two devices side by side; see the session as of any minute on the Timeline. ¦ Corrigez la catégorie d'un site, indiquez le lieu et le propriétaire d'un appareil, annulez n'importe laquelle de ces corrections ; épinglez deux appareils côte à côte ; voyez la session à n'importe quelle minute dans la Chronologie. ¦ Corrija la categoría de un sitio, indique el lugar y el propietario de un dispositivo, deshaga cualquiera de ellas; fije dos dispositivos uno al lado del otro; vea la sesión en cualquier minuto en la Cronología.
-Faster, steadier, easier to read ¦ Plus rapide, plus stable, plus lisible ¦ Más rápido, más estable, más legible
-Steadier on real PCs ¦ Plus solide sur les vrais PC ¦ Más estable en PC reales
-Capture starts without freezing the window, devices are told apart on PCs with VPN and virtual adapters, memory stays bounded while minimised, and closing is quick. Copies of different versions in one folder no longer get in each other's way. ¦ La capture démarre sans figer la fenêtre, les appareils sont bien distingués sur les PC avec VPN et cartes virtuelles, la mémoire reste limitée quand la fenêtre est réduite et la fermeture est rapide. Des copies de versions différentes dans un même dossier ne se gênent plus. ¦ La captura empieza sin congelar la ventana, los dispositivos se distinguen bien en PC con VPN y adaptadores virtuales, la memoria se mantiene limitada con la ventana minimizada y el cierre es rápido. Las copias de distintas versiones en una misma carpeta ya no se estorban.
-Shorter freezes when saving, loading and changing text size; sharp text on Windows at 125 % and more; an interface scale; Reduce motion; a visible keyboard focus everywhere. ¦ Des blocages plus courts à l'enregistrement, au chargement et au changement de taille du texte ; un texte net sous Windows à 125 % et plus ; une échelle de l'interface ; Réduire les animations ; un focus clavier visible partout. ¦ Bloqueos más cortos al guardar, cargar y cambiar el tamaño del texto; texto nítido en Windows al 125 % o más; una escala de la interfaz; Reducir el movimiento; un foco de teclado visible en todas partes.
+Safer by default ¦ Plus sûr par défaut ¦ Más seguro por defecto
+Linux and macOS ask for administrator rights only when capture starts. The data folder is closed to other users, Session only history is really cleared, and passwords never reach a file. ¦ Linux et macOS ne demandent les droits d'administrateur qu'au démarrage de la capture. Le dossier de données est fermé aux autres utilisateurs, l'historique « Session seulement » est vraiment effacé, et les mots de passe n'arrivent jamais dans un fichier. ¦ Linux y macOS piden derechos de administrador solo al empezar la captura. La carpeta de datos está cerrada a otros usuarios, el historial «Solo la sesión» se borra de verdad y las contraseñas nunca llegan a un archivo.
+Ready? and Story mode ¦ Prêt ? et le mode récit ¦ ¿Listo? y el modo relato
+The Welcome Center says what is ready, with a fix button for each problem. The Timeline tells what changed, day by day, in plain sentences. ¦ L'écran d'accueil dit ce qui est prêt, avec un bouton de réparation pour chaque problème. La Chronologie raconte ce qui a changé, jour après jour, en phrases simples. ¦ La pantalla de bienvenida dice qué está listo, con un botón para arreglar cada problema. La Cronología cuenta qué cambió, día a día, con frases sencillas.
+Unusual activity and more questions ¦ Activité inhabituelle et plus de questions ¦ Actividad inusual y más preguntas
+The Security tab shows each unusual thing with a worrying and an innocent reading side by side. Seven guided questions, including DNS, IPv6, Wi-Fi or Internet, and calls. ¦ L'onglet Sécurité montre chaque chose inhabituelle avec une lecture inquiétante et une lecture innocente côte à côte. Sept questions guidées, dont le DNS, l'IPv6, le Wi-Fi ou Internet, et les appels. ¦ La pestaña Seguridad muestra cada cosa inusual con una lectura preocupante y otra inocente, una al lado de la otra. Siete preguntas guiadas, entre ellas DNS, IPv6, Wi-Fi o Internet, y llamadas.
+Calls, check-up and notifications ¦ Appels, bilan et notifications ¦ Llamadas, revisión y notificaciones
+Call quality from packet headers only, a one-page Network check-up that hides personal details, and alerts while the window is minimised if you turn them on. ¦ La qualité des appels à partir des seuls en-têtes de paquets, un bilan du réseau d'une page qui masque les détails personnels, et des alertes quand la fenêtre est réduite si vous les activez. ¦ La calidad de las llamadas solo a partir de las cabeceras de los paquetes, una revisión de la red de una página que oculta los datos personales, y avisos con la ventana minimizada si los activa.
+Faster and steadier ¦ Plus rapide et plus stable ¦ Más rápido y más estable
+Packets are analysed about a fifth faster, memory stays flatter over long runs, and every tab fits small screens in all three languages. ¦ Les paquets sont analysés environ un cinquième plus vite, la mémoire reste plus stable sur de longues durées, et chaque onglet tient sur les petits écrans dans les trois langues. ¦ Los paquetes se analizan aproximadamente una quinta parte más rápido, la memoria se mantiene más estable en sesiones largas y cada pestaña cabe en pantallas pequeñas en los tres idiomas.
 Everything from 5.0 is still here ¦ Tout ce que contenait la 5.0 est toujours là ¦ Todo lo de la 5.0 sigue aquí
 The packet workspace, Full Power, Email Traffic, the Components Center and Safe Mode work as before. ¦ L'espace de travail des paquets, la pleine puissance, le trafic e-mail, le centre des composants et le mode sans échec fonctionnent comme avant. ¦ El espacio de trabajo de paquetes, la potencia máxima, el tráfico de correo, el centro de componentes y el modo seguro funcionan como antes.
 Check again ¦ Vérifier à nouveau ¦ Comprobar de nuevo
@@ -51647,6 +51658,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         if token != self._capture_token:
             # stopped, closed or restarted while the cards were tried
             if sniffer is not None:
+                # a stale start: the sniffer is dropped whatever stop says
                 with contextlib.suppress(Exception):
                     sniffer.stop()
             if on_done is not None:
@@ -55556,6 +55568,7 @@ proc ::mw_retheme {w map fgnew deffg} {
     def import_pcap_path(self, path):
         cap = int(self.config.get("capture.max_stored_events", 5000))
         big = False
+        # size unknown: import as a normal (not big) file
         with contextlib.suppress(Exception):
             big = bool(os.path.getsize(path) > cap * 40 and
                        self.capture_over(path, cap))
@@ -59310,6 +59323,7 @@ class DiagnosticsWindow:
             if s is None:
                 return f"Capture engine could not start: {err}"
             time.sleep(3)
+            # the test result is already known; stop errors don't change it
             with contextlib.suppress(Exception):
                 s.stop()
             return (f"Capture engine works: {len(box)} packets in 3 s on "
@@ -64043,6 +64057,7 @@ class _DeepWorkerProc:
         t.start()
         t.join(max(0.0, deadline - time.monotonic()))
         if t.is_alive():
+            # the worker may have exited already; the timeout is raised below
             with contextlib.suppress(Exception):
                 self.proc.kill()
             raise RuntimeError("deep worker did not answer in time")
@@ -64131,11 +64146,14 @@ class _DeepWorkerProc:
             self.ask_stop()
             left = 2.0 if deadline is None else \
                 max(0.0, deadline - time.monotonic())
+            # a worker that doesn't answer is killed just below
             with contextlib.suppress(Exception):
                 self.proc.wait(timeout=left)
         if self.proc.poll() is None:
+            # the worker may have exited between poll() and kill()
             with contextlib.suppress(Exception):
                 self.proc.kill()
+            # reaped later by the OS if it hasn't ended yet
             with contextlib.suppress(Exception):
                 self.proc.wait(timeout=0.5)
 
@@ -66547,7 +66565,7 @@ def run_self_tests(verbose=True, only=None):
         assert tk_version_note(8.6) == ""
         assert preflight_unattended()                 # a test run
         assert "Preparing the capture driver" in CAPTURE_ONLY_STEPS
-        assert SCRIPT_VERSION == "5.2.3"
+        assert SCRIPT_VERSION == "5.3.4"
 
     def t_session_roundtrip():
         clk = _FakeClock()
@@ -76579,6 +76597,280 @@ def t_no_silent_broad_except(ctx):
     assert "couldn't be checked" in tab.err_var.v, tab.err_var.v
 
 
+# capture, history, update and outbound code, by qualified function name
+SILENT_REASON_PATHS = re.compile(
+    r"captur|sniff|pcap|elevat|AnalysisWorker|PacketRing|_DeepWorker|"
+    r"histor|^Store\.|journal|self_update|rollback|outbound|download|"
+    r"fetch|ledger", re.I)
+
+
+def silent_without_reason(src, skip=None):
+    """5.3.4 (M18, plan section 1): silent handlers (an `except` whose body
+    is only `pass`, or `contextlib.suppress(Exception)`) on capture,
+    history, update and outbound paths that carry no written reason: a
+    `#` comment on the handler line, on its `pass`, or on the line just
+    above. `skip` (lo, hi) leaves out a line range (the test sections).
+    -> ["line N: kind in qualname"]"""
+    import ast
+    lines = src.splitlines()
+    tree = ast.parse(src)
+    parent = {}
+    for p in ast.walk(tree):
+        for c in ast.iter_child_nodes(p):
+            parent[c] = p
+
+    def qualname(node):
+        names = []
+        while node in parent:
+            node = parent[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef)):
+                names.append(node.name)
+        return ".".join(reversed(names))
+
+    def has_reason(*linenos):
+        for n in linenos:
+            text = lines[n - 1]
+            if "#" in text.split('"')[-1].split("'")[-1]:
+                return True
+        above = lines[linenos[0] - 2].strip() if linenos[0] > 1 else ""
+        return above.startswith("#")
+
+    bad = []
+    for node in ast.walk(tree):
+        if skip and skip[0] <= getattr(node, "lineno", 0) < skip[1]:
+            continue
+        if isinstance(node, ast.ExceptHandler) and \
+                all(isinstance(b, ast.Pass) for b in node.body):
+            kind, at = "except-pass", (node.lineno, node.body[0].lineno)
+        elif isinstance(node, ast.With) and any(
+                isinstance(it.context_expr, ast.Call) and
+                getattr(it.context_expr.func, "attr", "") == "suppress" and
+                any(getattr(a, "id", "") in ("Exception", "BaseException")
+                    for a in it.context_expr.args) for it in node.items):
+            kind, at = "suppress(Exception)", (node.lineno,)
+        else:
+            continue
+        name = qualname(node)
+        if SILENT_REASON_PATHS.search(name) and not has_reason(*at):
+            bad.append(f"line {at[0]}: {kind} in {name}")
+    return bad
+
+
+@self_test(needs_source=True)
+def t_m18_silent_handlers_have_a_reason(ctx):
+    """5.3.4 (M18 release gate, plan section 1): no silent `except ...:
+    pass` or `contextlib.suppress(Exception)` in capture, history, update
+    and outbound code without a written reason, and the check itself sees
+    one that has none."""
+    planted = ("import contextlib\n"
+               "def capture_stop(s):\n"
+               "    with contextlib.suppress(Exception):\n"
+               "        s.stop()\n"
+               "    try:\n"
+               "        s.close()\n"
+               "    except OSError:\n"
+               "        pass\n"
+               "def history_close(c):\n"
+               "    # closing a connection that already failed\n"
+               "    with contextlib.suppress(Exception):\n"
+               "        c.close()\n"
+               "    try:\n"
+               "        c.x()\n"
+               "    except OSError:     # gone already\n"
+               "        pass\n"
+               "def draw_label(w):\n"
+               "    with contextlib.suppress(Exception):\n"
+               "        w.pack()\n")
+    got = silent_without_reason(planted)
+    assert got == ["line 3: suppress(Exception) in capture_stop",
+                   "line 7: except-pass in capture_stop"], got
+    with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    lines = src.splitlines()
+    lo = next(i for i, ln in enumerate(lines, 1) if ln.startswith("#  20b."))
+    hi = next(i for i, ln in enumerate(lines, 1) if ln.startswith("#  21."))
+    bad = silent_without_reason(src, skip=(lo, hi))
+    assert not bad, f"{len(bad)} without a reason: " + "; ".join(bad)
+
+
+@self_test(needs_source=True)
+def t_m18_release_dry_run_writes_nothing(ctx):
+    """5.3.4 (M18, OS-08): in a checkout of the repository, the release
+    script's --dry-run prints the sha256 it would publish and writes no
+    file at all: none in the temporary folder (it used to leave a copy of
+    the whole program there) and none in the checkout. Skipped for a
+    downloaded copy (no .github folder) or without git."""
+    root = os.path.dirname(os.path.abspath(SCRIPT_PATH))
+    script = os.path.join(root, ".github", "scripts", "release_current.py")
+    git = shutil.which("git")
+    if not os.path.isfile(script) or not git:
+        return "skip"
+
+    def status():
+        r = subprocess.run([git, "-C", root, "status", "--porcelain"],
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout
+    rc, before = status()
+    if rc != 0:
+        return "skip"                       # not a git checkout
+    tmp = ctx.path(f"m18_release_tmp_{uuid.uuid4().hex[:6]}")
+    os.makedirs(tmp)
+    env = dict(os.environ, TMPDIR=tmp, TEMP=tmp, TMP=tmp)
+    r = subprocess.run([sys.executable, script, "--dry-run"], cwd=root,
+                       env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, (r.stdout + r.stderr)[-400:]
+    with open(os.path.join(root, "CHANGELOG.md"), encoding="utf-8") as f:
+        finished = f"## [{SCRIPT_VERSION}]" in f.read()
+    if finished:
+        with open(SCRIPT_PATH, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        assert f"sha256 {digest}," in r.stdout, r.stdout[-400:]
+        assert "dry run: would record" in r.stdout, r.stdout[-400:]
+    assert os.listdir(tmp) == [], os.listdir(tmp)
+    assert status() == (0, before), "the dry run changed the checkout"
+
+
+# ---- 5.3.4 M18: audit findings that had no test named after them ----------
+@self_test()
+def t_os09_toc_test_sees_unparsable_banner(ctx):
+    """5.3.4 (OS-09): a banner whose id the pattern can't read ("1a+.")
+    makes the table-of-contents check fail instead of being skipped."""
+    def src(banner_id):
+        return ('"""Doc.\n\n    1.    One\n    2.    Two\n"""\n'
+                "# ====\n#  1.  One\n# ====\n"
+                f"# ====\n#  {banner_id}.  Two\n# ====\n")
+    toc, banners = toc_and_banners(src("2"))
+    assert toc == banners == [("1", "One"), ("2", "Two")], (toc, banners)
+    toc, banners = toc_and_banners(src("1a+"))
+    assert toc != banners, banners
+    assert banners[1][0] == "?1a+", banners
+
+
+@self_test()
+def t_os02_elevated_files_handed_back(ctx):
+    """5.3.4 (OS-02): files an elevated run writes in the user's folders
+    go back to the user who started it; a run that is not elevated for
+    someone else changes no owner."""
+    saved = {k: os.environ.pop(k) for k in ("SUDO_UID", "SUDO_GID",
+                                            "PKEXEC_UID") if k in os.environ}
+    try:
+        assert _give_back_ids() is None      # nobody to hand files back to
+    finally:
+        os.environ.update(saved)
+    if IS_WINDOWS or os.geteuid() != 0:
+        return                         # only root can change an owner
+    d = ctx.path(f"os02_{uuid.uuid4().hex[:6]}")
+    os.makedirs(os.path.join(d, "sub"))
+    for p_ in (os.path.join(d, "a.json"), os.path.join(d, "sub", "b.db")):
+        with open(p_, "w", encoding="utf-8") as f:
+            f.write("{}")
+    real = globals()["_give_back_ids"]
+    globals()["_give_back_ids"] = lambda: (54321, 54321)
+    try:
+        give_back(os.path.join(d, "a.json"))
+        assert os.stat(os.path.join(d, "a.json")).st_uid == 54321
+        give_back_tree(d)
+        for p_ in (d, os.path.join(d, "sub"),
+                   os.path.join(d, "sub", "b.db")):
+            st = os.stat(p_)
+            assert (st.st_uid, st.st_gid) == (54321, 54321), p_
+    finally:
+        globals()["_give_back_ids"] = real
+        for dp, dn, fn in os.walk(d):
+            for n in [dp] + [os.path.join(dp, x) for x in dn + fn]:
+                with contextlib.suppress(OSError):
+                    os.chown(n, 0, 0)
+
+
+@self_test(needs_source=True)
+def t_lg05_pip_downloads_isolated(ctx):
+    """5.3.4 (LG-05): every pip run that can reach an index (install or
+    download without --no-index) runs with --isolated, so a pip.conf or
+    PIP_INDEX_URL can't send it somewhere else."""
+    import ast
+    with open(SCRIPT_PATH, "r", encoding="utf-8") as f:
+        src = f.read()
+    lines = src.splitlines()
+    lo = next(i for i, ln in enumerate(lines, 1) if ln.startswith("#  20b."))
+    seen, bad = 0, []
+    for node in ast.walk(ast.parse(src)):
+        if not isinstance(node, ast.List) or node.lineno >= lo:
+            continue
+        words = [e.value for e in node.elts
+                 if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        pip_run = bool({"install", "download"} & set(words)) and \
+            bool({"pip", "--target"} & set(words))
+        if not pip_run or "--no-index" in words:
+            continue
+        seen += 1
+        if "--isolated" not in words:
+            bad.append(f"line {node.lineno}: {words[:6]}")
+    assert seen >= 3, seen
+    assert not bad, bad
+
+
+@self_test()
+def t_lg06_kill_switch_never_opens_browser(ctx):
+    """5.3.4 (LG-06): with the kill switch on, the capture-driver step
+    downloads nothing and does not open the browser either; it says where
+    to get the driver instead."""
+    import webbrowser
+
+    class _State:
+        def recent_attempts(self, *_a):
+            return 0
+
+        def note_attempt(self, *_a):
+            pass
+
+    class _Loader:
+        def post_log(self, *_a):
+            pass
+    opened = []
+    old_open, old_killed = webbrowser.open, LEDGER.killed
+    webbrowser.open = lambda *a, **k: opened.append(a) or True
+    LEDGER.killed = True
+    try:
+        ok, msg = _install_npcap(_Loader(), _State())
+    finally:
+        webbrowser.open, LEDGER.killed = old_open, old_killed
+    assert ok is False and not opened, (ok, opened)
+    assert "not downloaded" in msg and "npcap.com" in msg, msg
+
+
+@self_test()
+def t_lg07_reverse_dns_own_subnet_only(ctx):
+    """5.3.4 (LG-07): device names are looked up only for addresses on
+    this computer's own networks: not another private network (a company
+    behind a VPN), not multicast, loopback or a broken address."""
+    nets = [ipaddress.ip_network("192.168.1.0/24"),
+            ipaddress.ip_network("fd00:1::/64")]
+    for ip, want in (("192.168.1.23", True), ("fd00:1::5", True),
+                     ("10.20.30.40", False), ("192.168.2.7", False),
+                     ("224.0.0.251", False), ("ff02::fb", False),
+                     ("127.0.0.1", False), ("0.0.0.0", False),
+                     ("8.8.8.8", False), ("not an ip", False)):
+        assert rdns_in_scope(ip, nets) is want, ip
+    assert rdns_in_scope("192.168.1.23", []) is False
+    assert rdns_in_scope("192.168.1.23", None) is False
+
+
+@self_test()
+def t_lg15_about_names_licence_and_trademark(ctx):
+    """5.3.4 (LG-15): Help -> About gives the version, the MIT licence and
+    the Wireshark trademark notice inside the program, in all three
+    languages."""
+    text = about_text()
+    assert text.splitlines()[0] == f"MiniWireshark {SCRIPT_VERSION}", text
+    for want in ("MIT License", "not affiliated", "registered trademark",
+                 "Wireshark Foundation", "SECURITY.md"):
+        assert want in text, want
+    for loc in ("fr", "es"):
+        assert translate_text("About MiniWireshark", loc) != \
+            "About MiniWireshark", loc
+
+
 # ---- 5.3.4 M7: Story mode (MC4), spike story (IP-022), CO-14 -----------------
 def _story_noon(days_back=0):
     """Noon, local time, `days_back` days ago (day grouping is local)."""
@@ -82288,6 +82580,9 @@ def run_gui_test(live=False):
 
     def s_demo():
         app.start_demo()
+        # 5.3.4 (ST-04): the status line says nothing is being captured
+        assert "Nothing is being captured" in app.status_var.get(), \
+            app.status_var.get()
         _gui_pump(root, 2.5)
         assert app.data_mode == "demo" and app.model.demo
         app.stop_demo()

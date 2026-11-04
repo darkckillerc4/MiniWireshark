@@ -19,7 +19,7 @@ In scope:
 - Anything that could send data off the computer without going through the outbound gate.
 - Leaks of credentials or message bodies into reports, sessions, logs, history or the clipboard.
 - Unsafe update or data-pack verification (Ed25519 signatures).
-- Privilege problems in the Windows elevation and Npcap install path.
+- Privilege problems in the Windows elevation and Npcap install path, the Linux and macOS capture-permission prompt, and the data folder's ownership and permission checks.
 
 Out of scope: monitoring a network you are not allowed to monitor. MiniWireshark is a defensive tool for your own networks.
 
