@@ -2954,8 +2954,8 @@ class LoaderWindow(tk.Frame):
         vs = ttk.Scrollbar(self.logf, orient="vertical",
                            command=self.log.yview)
         self.log.configure(yscrollcommand=vs.set)
-        self.log.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
+        self.log.pack(side="left", fill="both", expand=True)
         t = self.t or {}
         self.log.tag_configure("step", font=("TkFixedFont", 9, "bold"))
         self.log.tag_configure("ok", foreground=t.get("good_fg", "#0b6b3a"))
@@ -3309,8 +3309,17 @@ class LoaderWindow(tk.Frame):
                             f"Welcome to MiniWireshark "
                             f"{'.'.join(SCRIPT_VERSION.split('.')[:2])}!")
         self._clear_card()
-        top = tk.Frame(self.card, bg=self.bg)
-        top.pack(fill="both", expand=True)
+        # 5.3.4 (M17, S3): with the Ready? panel the Welcome Center needs
+        # more height than a 768-pixel screen has; What's new, the start-up
+        # checkbox and Repair… were pushed out of the window with no way
+        # to reach them. The checkbox row stays at the bottom and the rest
+        # scrolls when the window can't grow enough.
+        bottom = tk.Frame(self.card, bg=self.bg)
+        bottom.pack(side="bottom", fill="x", pady=(8, 0))
+        outer, top = make_scrollable(self.card, self.bg)
+        outer.canvas.configure(height=40)
+        outer.pack(fill="both", expand=True)
+        self._welcome_fit = (outer.canvas, top)
         if notice:
             self.notice_lbl = tk.Label(
                 top, text=notice, bg=self.card_bg, fg=self.warn,
@@ -3365,8 +3374,6 @@ class LoaderWindow(tk.Frame):
                      bg=self.card_bg, fg=self.fg, anchor="w",
                      justify="left", wraplength=640).pack(fill="x",
                                                           pady=1)
-        bottom = tk.Frame(top, bg=self.bg)
-        bottom.pack(fill="x", pady=(8, 0))
         if summary:
             tk.Label(bottom, text=summary, bg=self.bg, fg=self.muted,
                      anchor="w", justify="left", wraplength=640).pack(
@@ -3395,15 +3402,7 @@ class LoaderWindow(tk.Frame):
                                        lambda: self._choose("exit"))
         if first_tile is not None:
             first_tile.focus_set()
-        with contextlib.suppress(tk.TclError):      # room for everything
-            top_win = self.winfo_toplevel()
-            top_win.update_idletasks()
-            need = top_win.winfo_reqheight()
-            have = top_win.winfo_height()
-            limit = top_win.winfo_screenheight() - 80
-            if need > have:
-                top_win.geometry(f"{top_win.winfo_width()}x"
-                                 f"{min(need, limit)}")
+        self._fit_welcome()
         while self.choice is None:
             drain_deferred_tk()
             self._fill_ready_panel()
@@ -3423,6 +3422,28 @@ class LoaderWindow(tk.Frame):
 
     def _choose(self, key):
         self.choice = key
+
+    def _fit_welcome(self):
+        """Room for everything: grow the window (up to the screen, moved
+        up if it would run off the bottom) by what the Welcome Center's
+        scrolling part can't show. Run again when a Ready? line gets its
+        answer, which is often longer than "checking…" (5.3.4, M17)."""
+        canvas, inner = getattr(self, "_welcome_fit", (None, None))
+        if canvas is None:
+            return
+        with contextlib.suppress(tk.TclError):
+            win = self.winfo_toplevel()
+            win.update_idletasks()
+            extra = inner.winfo_reqheight() - canvas.winfo_height()
+            if extra <= 2:
+                return
+            sh = win.winfo_screenheight()
+            have = win.winfo_height()
+            want = min(have + extra, sh - 80)
+            if want <= have:
+                return
+            y = max(0, min(win.winfo_y(), sh - want - 60))
+            win.geometry(f"{win.winfo_width()}x{want}+{win.winfo_x()}+{y}")
 
     # ---- 5.3.4 (MC2): Ready? ------------------------------------------------
     def _build_ready_panel(self, parent):
@@ -3464,7 +3485,11 @@ class LoaderWindow(tk.Frame):
             return
         colors = {"ok": self.good, "warn": self.warn, "bad": self.bad,
                   "info": self.muted}
-        for key in [k for k in list(self.ready_results) if k in rows]:
+        done = [k for k in list(self.ready_results) if k in rows]
+        if done and not [k for k in rows if k not in done]:
+            # the last answer is in: room for the longer lines (M17)
+            self.after_idle(self._fit_welcome)
+        for key in done:
             state, text, fix = self.ready_results[key]
             mark, lbl, box, i = rows.pop(key)
             with contextlib.suppress(tk.TclError):
@@ -21256,6 +21281,12 @@ class NetworkModel:
         self.gw_arp_asks = OrderedDict()   # MAC → [first, last, count]
         self.gw_arp_replies = OrderedDict()   # to MAC → last reply ts
         self.obs_by_subject = {}
+        # 5.3.4 (M17, S7): "flow:<id>" subjects, oldest first. Every new
+        # connection added one (up to 60,000 of them, 48 observations
+        # each), long after the table had forgotten the connection: the
+        # soak's memory kept climbing for an hour and the cycle
+        # collector's full pass (the longest freeze) grew with it
+        self.obs_flow_keys = deque()
         self.obs_sink = False          # a history store wants observations
         self.obs_pending = []
         self.res_pending = []
@@ -21280,16 +21311,33 @@ class NetworkModel:
         for subj in (subject,) + tuple(also):
             dq = self.obs_by_subject.get(subj)
             if dq is None:
+                if subj.startswith("flow:"):
+                    self._forget_old_flow_subjects(subj)
                 if len(self.obs_by_subject) > 60000:
                     for k in list(self.obs_by_subject)[:6000]:
                         self.obs_by_subject.pop(k, None)
-                dq = self.obs_by_subject[subj] = deque(maxlen=48)
+                # 5.3.4 (M17, S7): a website's card shows 3 per device and
+                # a connection's 3; 48 of each for 5,000 websites held
+                # 240,000 observations and took hours to fill
+                dq = self.obs_by_subject[subj] = deque(
+                    maxlen=16 if subj.startswith("site:") else
+                    8 if subj.startswith("flow:") else 48)
             dq.append(o)
         if self.obs_sink:
             self.obs_pending.append(o)
             if len(self.obs_pending) > 200000:
                 del self.obs_pending[:50000]
         return o
+
+    def _forget_old_flow_subjects(self, subj):
+        """Keep the observations of as many connections as the connection
+        table itself keeps (active + closed), no more."""
+        keys = self.obs_flow_keys
+        keys.append(subj)
+        ft = self.flows
+        cap = ft.max_active + (ft.archive.maxlen or 0)
+        while len(keys) > cap:
+            self.obs_by_subject.pop(keys.popleft(), None)
 
     def observations_for(self, subject, kinds=None, limit=48):
         out = [o for o in self.obs_by_subject.get(subject, ())
@@ -30193,6 +30241,11 @@ def heading_font():
     if not spec:
         return tkfont.nametofont("TkHeadingFont"), "TkHeadingFont"
     f = _HEADING_FONT.get(spec)
+    if f is not None:
+        try:
+            f.cget("size")
+        except (tk.TclError, RuntimeError):
+            f = None              # made for a window that is gone (tests)
     if f is None:
         try:
             f = _HEADING_FONT[spec] = tkfont.Font(font=spec)
@@ -30397,6 +30450,112 @@ def fit_tree_headings(tree):
 def fit_all_headings(root):
     for tree in _walk_class(root, ttk.Treeview):
         fit_tree_headings(tree)
+
+
+def share_tree_width(tree):
+    """5.3.4 (M17, S3): a table made narrower (a window taken from full
+    screen down to 1024 wide, then a text size change) squeezed its
+    stretching columns to 30 pixels, "Device", "Made by", "Contacted
+    by" cut to a few letters, while the fixed columns kept all their
+    width. The fixed columns now give up width (down to their own
+    heading's) until every stretching column shows its heading; they
+    get it back as the table grows again. → True when widths changed."""
+    try:
+        avail = tree.winfo_width()
+        if avail < 100:
+            return False
+        cols = list(tree["columns"])
+        disp = tree["displaycolumns"]
+        if disp and disp[0] != "#all":
+            cols = [c for c in disp if c in cols]
+        if "tree" in str(tree.cget("show")):
+            cols = ["#0"] + cols
+        info = {}
+        for c in cols:
+            text = str(tree.heading(c, "text") or "")
+            info[c] = (int(tree.column(c, "width")),
+                       bool(int(tree.column(c, "stretch"))),
+                       heading_width(text) + 20 if text else 30)
+    except (tk.TclError, ValueError, TypeError, RuntimeError):
+        return False
+    stretch = [c for c in cols if info[c][1]]
+    fixed = [c for c in cols if not info[c][1]]
+    # a table that scrolls sideways never squeezes a stretching column
+    # below its heading (Tk took them to 30 pixels when the window was
+    # made narrow); what doesn't fit is reached with the scroll bar
+    with contextlib.suppress(tk.TclError, ValueError):
+        if str(tree.cget("xscrollcommand")):
+            for c in stretch:
+                if int(tree.column(c, "minwidth")) < info[c][2]:
+                    tree.column(c, minwidth=info[c][2])
+                    if info[c][0] < info[c][2]:
+                        tree.column(c, width=info[c][2])
+    w0 = getattr(tree, "_mw_w0", None)
+    if w0 is None:
+        w0 = tree._mw_w0 = {}
+    for c in list(w0):
+        if c not in info or info[c][1]:
+            del w0[c]
+    if not stretch or not fixed:
+        return False
+    base = {c: w0.get(c, info[c][0]) for c in fixed}
+    room = avail - sum(info[c][2] for c in stretch) - 4
+    new = dict(base)
+    if sum(base.values()) > room:
+        if not w0 and all(info[c][0] >= info[c][2] for c in stretch):
+            return False                       # nothing is cut
+        excess = {c: max(0, base[c] - info[c][2]) for c in fixed}
+        total = sum(excess.values())
+        if total <= 0:
+            return False
+        f = min(1.0, (sum(base.values()) - room) / total)
+        new = {c: base[c] - int(math.ceil(excess[c] * f)) for c in fixed}
+    changed = False
+    try:
+        for c in fixed:
+            if new[c] != info[c][0]:
+                if new[c] < base[c]:
+                    w0.setdefault(c, base[c])
+                else:
+                    w0.pop(c, None)
+                tree.column(c, width=new[c])
+                changed = True
+        left = avail - sum(new.values())
+        s_need = sum(info[c][2] for c in stretch)
+        for c in stretch:
+            want = max(info[c][2], left * info[c][2] // max(1, s_need))
+            if info[c][0] < info[c][2] or changed:
+                if want != info[c][0]:
+                    tree.column(c, width=want)
+                    changed = True
+    except (tk.TclError, ValueError):
+        return changed
+    return changed
+
+
+def install_tree_width_share(root):
+    """Every table, in every window: share_tree_width shortly after it
+    changes size (once per burst of <Configure> events)."""
+    jobs = {}
+
+    def later(tree):
+        jobs.pop(str(tree), None)
+        with contextlib.suppress(tk.TclError):
+            if tree.winfo_exists():
+                share_tree_width(tree)
+
+    def on_configure(e):
+        tree = e.widget
+        if not isinstance(tree, ttk.Treeview):
+            return
+        key = str(tree)
+        job = jobs.get(key)
+        with contextlib.suppress(tk.TclError):
+            if job is not None:
+                tree.after_cancel(job)
+            jobs[key] = tree.after(40, lambda: later(tree))
+    with contextlib.suppress(tk.TclError):
+        root.bind_class("Treeview", "<Configure>", on_configure, add="+")
 
 
 def dialog_contract(win):
@@ -30711,6 +30870,20 @@ def layout_audit(top, cells=False):
         except tk.TclError:
             continue
         stack.extend(kids)
+        # 5.3.4 (M17, S3): a packed widget the packer had no room left for
+        # is not drawn at all (Tk unmaps it), so the checks below never
+        # saw it: the Welcome Center's What's new and Repair… row, the
+        # scroll bars of text windows, the Sources tab's text
+        for c in kids:
+            try:
+                if c.winfo_manager() == "pack" and not c.winfo_ismapped():
+                    txt = ""
+                    with contextlib.suppress(tk.TclError):
+                        txt = str(c.cget("text"))
+                    out.append(("squeezed-out", str(c),
+                                txt[:40] or c.winfo_class()))
+            except tk.TclError:
+                continue
         try:
             if cls in _AUDIT_TEXT:
                 txt = str(w.cget("text"))
@@ -34476,8 +34649,8 @@ class DetailDialog:
                            highlightthickness=0)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set)
-        self.txt.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
+        self.txt.pack(side="left", fill="both", expand=True)
         self.txt.tag_configure("h", font=mw_font(11, "bold"),
                                spacing1=6, spacing3=3)
         self.txt.tag_configure("muted", foreground=t["muted_fg"])
@@ -35241,8 +35414,8 @@ class Inspector:
                            font=mw_font(10))
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set, state="disabled")
-        self.txt.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
+        self.txt.pack(side="left", fill="both", expand=True)
         self.legend = tk.Label(
             self.frame, text="◉ observed  ◈ reported  ◎ correlated  "
                              "◌ inferred  ? unknown", bg=WHITE,
@@ -36128,11 +36301,13 @@ class FeedTab(BaseTab):
         qe.bind("<KeyRelease>", lambda e: self._filter_soon())
         self.rows = deque(maxlen=500)
         self.hover = False
+        # 5.3.4 (M17, S3): wraps (it was cut off at 1024 wide in French
+        # and Spanish with extra large text)
         tk.Label(ctrl, text="   “Calm” groups busy moments so they're "
                             "easy to read — “Full speed” shows "
                             "every line as it happens.",
-                 bg=WHITE, fg="#666666", font=mw_font(9)).pack(
-            side="left", padx=(12, 0))
+                 bg=WHITE, fg="#666666", font=mw_font(9), justify="left",
+                 wraplength=560).pack(side="left", padx=(12, 0))
         self.hint_var = DisplayVar(value="")
         self.hint = tk.Label(self.frame, textvariable=self.hint_var,
                              bg=WHITE, fg="#666666", anchor="w",
@@ -37015,8 +37190,9 @@ class DevicesTab(BaseTab):
             side="right", padx=6)
         self.count_lbl = self.lbl(bar, "", muted=True)
         self.count_lbl.pack(side="right", padx=10)
+        # 5.3.4 (M17, S3): scrolls sideways, so no heading is ever cut
         wrap, self.tree = make_tree(self.frame, self.COLS,
-                                    selectmode="extended")
+                                    selectmode="extended", hscroll=True)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", lambda e: self._details())
         self.tree.bind("<Return>", lambda e: self._details())
@@ -37341,7 +37517,7 @@ class WebsitesTab(BaseTab):
         self.sort_box.bind("<<ComboboxSelected>>",
                            lambda e: (self.kit.clear_sort(), self.rebuild()))
         wrap, self.tree = make_tree(self.frame, self.COLS,
-                                    show="tree headings")
+                                    show="tree headings", hscroll=True)
         self.tree.heading("#0", text="Website (grouped by main domain)")
         self.tree.column("#0", width=280, stretch=True)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
@@ -38359,7 +38535,7 @@ class RemoteTab(BaseTab):
         tk.Label(self.frame, textvariable=self.status_var, bg=WHITE,
                  fg="#666666", justify="left", anchor="w", wraplength=1100,
                  font=mw_font(9)).pack(fill="x", padx=12)
-        wrap, self.tree = make_tree(self.frame, self.COLS)
+        wrap, self.tree = make_tree(self.frame, self.COLS, hscroll=True)
         wrap.pack(fill="both", expand=True, padx=6, pady=(4, 6))
         self.tree.bind("<Double-1>", self._details)
         self.iids = IidMap()
@@ -40357,8 +40533,8 @@ class SecurityTab(BaseTab):
                 e.width - 2 * 14 - 8), add="+")
         vs = ttk.Scrollbar(outer, orient="vertical", command=self.text.yview)
         self.text.configure(yscrollcommand=vs.set)
-        self.text.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
         self.text.tag_configure("h1", font=mw_font(12, "bold"),
                                 foreground="#2b3a56", spacing1=10,
                                 spacing3=4)
@@ -41956,8 +42132,8 @@ class PacketsTab(BaseTab):
         dvs = ttk.Scrollbar(tleft, orient="vertical",
                             command=self.dtree.yview)
         self.dtree.configure(yscrollcommand=dvs.set)
-        self.dtree.pack(side="left", fill="both", expand=True)
         dvs.pack(side="right", fill="y")
+        self.dtree.pack(side="left", fill="both", expand=True)
         bf, self.bytes_view = self._scrolled(dpane)
         self.bytes_view.configure(width=72)
         dpane.add(bf, weight=2)
@@ -43573,8 +43749,8 @@ class StreamsView(_SubView):
                            padx=6, pady=6, cursor="arrow")
         vs = ttk.Scrollbar(f, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set, state="disabled")
-        self.txt.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
+        self.txt.pack(side="left", fill="both", expand=True)
         self.result = None
         self.flow_id = None
         self.on_theme()
@@ -44440,25 +44616,39 @@ class SourcesTab(BaseTab):
             side="left")
         ttk.Button(bar, text="Remove", command=self._remove).pack(
             side="left", padx=6)
-        wrap, self.tree = make_tree(self.frame, [
+        # 5.3.4 (M17, S3): the table, the title and the text share the
+        # height in one grid. At 768 pixels with extra large text (the
+        # header and the toolbar take two lines each) the packer gave the
+        # 8-row table all the room and unmapped "Reported vs observed"
+        # and its text; packing them first unmapped the table instead.
+        # In a grid the table and the text rows give way by weight (both
+        # scroll) and the title row keeps its height, so all three stay
+        # on screen at any height.
+        body = tk.Frame(self.frame, bg=WHITE)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        body.rowconfigure(2, weight=1)
+        wrap, self.tree = make_tree(body, [
             ("source", "Source", 260, "w", True),
             ("kind", "Gives", 230, "w", False),
             ("level", "Evidence", 100, "w", False),
             ("state", "Status", 150, "w", False),
             ("last", "Last update", 100, "center", False),
             ("detail", "Details", 380, "w", True)])
-        self.tree.configure(height=8)
-        wrap.pack(fill="x", padx=6, pady=(0, 6))
+        self.tree.configure(height=2)
         self.tree.bind("<Double-1>", lambda e: self._edit())
-        self.lbl(self.frame, "Reported vs observed", muted=False,
-                 font=mw_font(11, "bold")).pack(anchor="w",
-                                                          padx=10)
-        self.recon = tk.Text(self.frame, height=10, wrap="word",
+        wrap.grid(row=0, column=0, sticky="nsew", padx=6, pady=(0, 6))
+        self.lbl(body, "Reported vs observed", muted=False,
+                 font=mw_font(11, "bold")).grid(row=1, column=0,
+                                                sticky="w", padx=10)
+        self.recon = tk.Text(body, height=2, wrap="word",
                              bg=self.t["text_bg"], fg=self.t["text_fg"],
                              relief="flat", padx=10, pady=8,
                              highlightthickness=0,
                              font=mw_font(10))
-        self.recon.pack(fill="both", expand=True, padx=6, pady=(2, 6))
+        self.recon.grid(row=2, column=0, sticky="nsew", padx=6,
+                        pady=(2, 6))
 
     def _sel(self):
         sel = self.tree.selection()
@@ -44951,8 +45141,8 @@ class HelpTab(BaseTab):
                              selectforeground="#ffffff")
         lvs = ttk.Scrollbar(lw, orient="vertical", command=self.lb.yview)
         self.lb.configure(yscrollcommand=lvs.set)
-        self.lb.pack(side="left", fill="both", expand=True)
         lvs.pack(side="right", fill="y")
+        self.lb.pack(side="left", fill="both", expand=True)
         self.lb.bind("<<ListboxSelect>>", self._picked)
         right = tk.Frame(body, bg=WHITE)
         right.pack(side="left", fill="both", expand=True, padx=(10, 0))
@@ -44961,8 +45151,8 @@ class HelpTab(BaseTab):
                       font=mw_font(10), highlightthickness=0)
         vs = ttk.Scrollbar(right, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vs.set)
-        txt.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
         txt.tag_configure("h", font=mw_font(12, "bold"),
                           foreground="#2b3a56", spacing1=8, spacing3=3)
         txt.tag_configure("h1", font=mw_font(14, "bold"),
@@ -46117,6 +46307,7 @@ class MiniWireshark:
         self.real_identity = (gateway_ip, set(my_ips), set(my_macs))
         self.default_iface_name = default_iface_name
         root.title("MiniWireshark")
+        install_tree_width_share(root)
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
         ww, wh = min(1440, sw - 40), min(900, sh - 80)
         # placed so it fits on the screen: the window used to keep the
@@ -46624,10 +46815,10 @@ class MiniWireshark:
         self.data_lbl = tk.Label(self.data_banner, anchor="w",
                                  justify="left", wraplength=1100,
                                  font=mw_font(10, "bold"))
-        self.data_lbl.pack(side="left")
         self.data_btn = ttk.Button(self.data_banner, text="Return to live "
                                    "capture", command=self._return_to_live)
-        self.data_btn.pack(side="right")
+        self.data_btn.pack(side="right")          # first: never squeezed
+        self.data_lbl.pack(side="left")
 
         # friendly (transient) status banner
         self.banner = tk.Frame(self.root, bg="#e8f0fe", padx=14, pady=8)
@@ -46638,11 +46829,13 @@ class MiniWireshark:
                  "watching. I'll explain everything in plain English.",
             bg="#e8f0fe", fg="#1a3a6b", anchor="w", justify="left",
             wraplength=1200, font=mw_font(11))
-        self.banner_lbl.pack(side="left", fill="x", expand=True)
         self.banner_close = tk.Label(self.banner, text="✕", bg="#e8f0fe",
                                      fg="#1a3a6b", cursor="hand2", padx=6,
                                      font=mw_font(11))
+        # 5.3.4 (M17, S3): the ✕ is packed first, so a long message wraps
+        # instead of squeezing it (cut to a sliver in French, large text)
         self.banner_close.pack(side="right")
+        self.banner_lbl.pack(side="left", fill="x", expand=True)
         self.banner_close.bind("<Button-1>", lambda e: self._hide_banner())
         Tooltip(self.banner_close, "Hide this message")
         self._banner_job = None
@@ -50792,6 +50985,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         for i in range(0, len(trees), 4):
             for tree in trees[i:i + 4]:
                 fit_tree_headings(tree)
+                share_tree_width(tree)        # 5.3.4 (M17)
             yield
 
     def _scale_explicit_fonts(self, widget, scale):
@@ -58684,8 +58878,8 @@ class DiagnosticsWindow:
                            padx=8, pady=6, highlightthickness=0)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set)
-        self.txt.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
+        self.txt.pack(side="left", fill="both", expand=True)
         self.win.bind("<Escape>", lambda e: self.win.destroy())
         app.refresh_env_report()
         self.refresh()
@@ -77572,7 +77766,7 @@ def gui_shots(out_dir, quick=False):
             audit = layout_audit(root, cells=True)
             found = [x for x in audit
                      if x[0] in ("canvas-text-overlap", "overlap", "cut-x",
-                                 "cut-y")]
+                                 "cut-y", "squeezed-out")]
             # 5.3.4 (ST-11): cut table cells and columns are counted and
             # listed (they were invisible to the audit before)
             cut = [x for x in audit if x[0] in ("cell-cut", "column-cut")]
@@ -79219,6 +79413,135 @@ def t_s15_unusual_folder_and_user_names(ctx):
     r = CheckupRedactor(users={"Zoë", "Müller"})
     out = r.text(f"Saved to {folder} by Zoë")
     assert "Zoë" not in out and "Müller" not in out, out
+
+
+@self_test()
+def t_m17_audit_sees_squeezed_out(ctx):
+    """5.3.4 (M17, S3): a packed widget the packer has no room left for
+    is not drawn at all; the layout audit lists it ("squeezed-out")
+    instead of passing the window. A widget taken out with pack_forget
+    is not listed."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        root.deiconify()
+        root.geometry("260x120")
+        # frames stand in for the message and its ✕ (no text is drawn:
+        # the Python 3.8 test build's Tk cannot draw label text)
+        row = tk.Frame(root)
+        row.pack(fill="x")
+        tk.Frame(row, width=400, height=20).pack(side="left", fill="x",
+                                                 expand=True)
+        x = tk.Frame(row, width=20, height=20)
+        x.pack(side="right")
+        gone = tk.Frame(row, width=20, height=20)
+        gone.pack(side="right")
+        gone.pack_forget()
+        root.update()
+        found = [(k, p) for k, p, _d in layout_audit(root)
+                 if k == "squeezed-out"]
+        assert ("squeezed-out", str(x)) in found, found
+        assert not any(p == str(gone) for _k, p in found), found
+        # packed first, the ✕ keeps its room (the fix used in the window)
+        x.pack_forget()
+        x.pack(side="right", before=row.pack_slaves()[0])
+        root.update()
+        assert x.winfo_ismapped()
+        assert not [k for k, _p, _d in layout_audit(root)
+                    if k == "squeezed-out"]
+    finally:
+        root.destroy()
+
+
+@self_test()
+def t_m17_scrollbars_packed_before_their_text(ctx):
+    """5.3.4 (M17, S3): a text or list packed (expanding) before its
+    scroll bar takes the whole width when it asks for more than there is
+    (large text, a narrow window), and the bar was not drawn at all.
+    No such pair is left in the program."""
+    with open(os.path.abspath(__file__), encoding="utf-8") as f:
+        src = f.read()
+    pat = re.compile(r'^( +)[\w.]+\.pack\(side="left", fill="both", '
+                     r'expand=True\)\n\1[\w.]+\.pack\(side="right", '
+                     r'fill="y"\)\n', re.M)
+    bad = [src.count("\n", 0, m.start()) + 1 for m in pat.finditer(src)]
+    assert not bad, f"text packed before its scroll bar at lines {bad}"
+
+
+@self_test()
+def t_m17_tree_width_share(ctx):
+    """5.3.4 (M17, S3): a table made narrow keeps every heading whole:
+    the fixed columns give up width (never below their own heading) to
+    the stretching ones, and get it back when the table is wide again."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        root.deiconify()
+        root.geometry("1200x240")
+        install_tree_width_share(root)
+        tree = ttk.Treeview(root, columns=("a", "who", "b", "c"),
+                            show="headings")
+        for c, text, w, st in (("a", "Made by", 300, False),
+                               ("who", "Contacted by", 200, True),
+                               ("b", "Provider (ASN)", 300, False),
+                               ("c", "Known name(s)", 300, False)):
+            tree.heading(c, text=text)
+            tree.column(c, width=w, stretch=st, minwidth=30)
+        tree.pack(fill="both", expand=True)
+        _gui_pump(root, 0.3)
+        assert not [k for k, _p, _d in layout_audit(root)
+                    if k == "heading-cut"]
+        root.geometry("640x240")
+        _gui_pump(root, 0.4)
+        cut = [d for k, _p, d in layout_audit(root) if k == "heading-cut"]
+        assert not cut, (cut, [tree.column(c, "width")
+                               for c in tree["columns"]])
+        assert int(tree.column("who", "width")) >= \
+            heading_width("Contacted by") + 20
+        assert sum(int(tree.column(c, "width"))
+                   for c in tree["columns"]) <= tree.winfo_width() + 4
+        root.geometry("1200x240")
+        _gui_pump(root, 0.4)
+        assert [int(tree.column(c, "width")) for c in ("a", "b", "c")] == \
+            [300, 300, 300], [tree.column(c, "width") for c in "abc"]
+        assert share_tree_width(tree) is False        # nothing to do
+        # a table that scrolls sideways, narrower than its headings: the
+        # stretching column keeps its heading's width (reached by
+        # scrolling) instead of being squeezed to 30 pixels
+        hs = ttk.Scrollbar(root, orient="horizontal", command=tree.xview)
+        tree.configure(xscrollcommand=hs.set)
+        root.geometry("420x240")
+        _gui_pump(root, 0.4)
+        assert int(tree.column("who", "width")) >= \
+            heading_width("Contacted by") + 20, tree.column("who", "width")
+    finally:
+        root.destroy()
+
+
+@self_test()
+def t_m17_flow_observations_bounded(ctx):
+    """5.3.4 (M17, S7 soak): the observations kept per connection go
+    with the connection: no more connections are remembered there than
+    the connection table keeps (it was up to 60,000, the soak's memory
+    climb). Devices and websites keep theirs; the newest connections
+    still answer."""
+    m = NetworkModel(ctx.cfg(), "192.168.1.1", {"192.168.1.10"}, set())
+    m.flows.resize(200, 100)
+    cap = m.flows.max_active + m.flows.archive.maxlen
+    for fid in range(1, 2001):
+        m.observe("flow_start", "aa:bb:cc:00:00:01", 1000.0 + fid,
+                  {"remote": "203.0.113.9"}, also=(f"flow:{fid}",))
+    flows = [k for k in m.obs_by_subject if k.startswith("flow:")]
+    assert len(flows) == cap, (len(flows), cap)
+    assert m.observations_for("flow:2000") and \
+        not m.observations_for("flow:1")
+    assert len(m.observations_for("aa:bb:cc:00:00:01")) == 48
+    for i in range(30):
+        m.observe("tls_sni", "aa:bb:cc:00:00:01", 5000.0 + i,
+                  {"domain": "example.com"}, also=("site:example.com",))
+    assert len(m.observations_for("site:example.com")) == 16
 
 
 # ============================================================================
@@ -83488,6 +83811,121 @@ def gt_534_words_and_polish(app, ctx):
         app._apply_theme(theme)
         TITLE_BAR["api"] = old_api
     assert not getattr(root, "_mw_dark_tb", False)
+
+
+@gui_test_step("5.3.4 M17: the layout crawler's finds — the Welcome Center "
+               "on a 768-pixel screen, the message line's ✕, Sources at "
+               "extra large text, tables made narrow")
+def gt_534_m17_layout(app, ctx):
+    root = app.root
+    # the Welcome Center with its Ready? panel in a window shorter than it
+    # needs and a screen that can't give more: nothing is pushed out, the
+    # start-up checkbox and Repair… stay, the rest scrolls
+    win = tk.Toplevel(root)
+    win.geometry("760x560+0+0")
+    lw = LoaderWindow(win, app.config)
+    lw.pack(fill="both", expand=True)
+    orig_sh = win.winfo_screenheight
+    win.winfo_screenheight = lambda: 640        # a 768-pixel laptop, less
+    got = {}
+
+    def look():
+        if lw.ready_rows and time.time() < t_end:
+            win.after(100, look)
+            return
+        _gui_pump(root, 0.3)
+        got["audit"] = [(k, d) for k, _p, d in layout_audit(win)
+                        if k in ("squeezed-out", "clipped-height", "cut-y")]
+        got["boxes"] = [str(b.cget("text")) for b in
+                        _walk_class(win, tk.Checkbutton) if b.winfo_ismapped()]
+        got["height"] = win.winfo_height()
+        canvas, inner = lw._welcome_fit
+        got["scrolls"] = inner.winfo_reqheight() > canvas.winfo_height()
+        lw._choose("exit")
+    t_end = time.time() + 20
+    win.after(200, look)
+    try:
+        assert lw.show_welcome("summary", "healthy", False) == "exit"
+    finally:
+        win.winfo_screenheight = orig_sh
+        win.destroy()
+    assert not got["audit"], got["audit"][:6]
+    assert "Show the Welcome Center at startup" in got["boxes"], got
+    assert got["height"] <= 560, got
+    assert got["scrolls"], got
+    # the message line: a long message wraps, the ✕ keeps its room
+    geo0 = root.geometry()
+    old = (app.config.get("general.language"),
+           app.config.get("appearance.text_size"))
+    try:
+        app.config.set("general.language", "Français")
+        app.config.set("appearance.text_size", "Extra large")
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.geometry("1024x768")
+        app._set_banner("Un message très long " * 12, "warn")
+        _gui_pump(root, 0.6)
+        assert app.banner_close.winfo_ismapped() and \
+            app.banner_close.winfo_width() >= \
+            app.banner_close.winfo_reqwidth() - 2
+        # the Feed's hint wraps instead of being cut
+        app._select_tab("feed")
+        _gui_pump(root, 0.4)
+        found = [x for x in layout_audit(app.tabs["feed"].frame)
+                 if x[0] in ("clipped-width", "squeezed-out")]
+        assert not found, found[:4]
+        # Sources: the table and "Reported vs observed" share the height
+        root.geometry("1024x768")
+        src = app._select_tab("sources")
+        _gui_pump(root, 0.6)
+        assert src.recon.winfo_ismapped(), "the reported/observed text " \
+            "was pushed out of the tab"
+        found = [x for x in layout_audit(src.frame)
+                 if x[0] in ("clipped-height", "squeezed-out")]
+        assert not found, found[:4]
+        # ...and with the tab only about 320 pixels high (what was left of
+        # 768 in the full GUI run, with a two-line strip above): the table,
+        # the title and the text are all still drawn
+        hgt = 768
+        while src.frame.winfo_height() > 330 and hgt > 480:
+            hgt -= 16
+            root.geometry(f"1024x{hgt}")
+            _gui_pump(root, 0.15)
+        _gui_pump(root, 0.3)
+        assert src.frame.winfo_height() <= 340, src.frame.winfo_height()
+        assert src.tree.winfo_ismapped() and src.recon.winfo_ismapped()
+        found = [x for x in layout_audit(src.frame)
+                 if x[0] in ("clipped-height", "squeezed-out")]
+        assert not found, (src.frame.winfo_height(), found[:4])
+        root.geometry("1024x768")
+        # tables made narrow after a text size change: headings whole (the
+        # crawler's sequence: small text full screen, normal text, then
+        # 1024 wide; the stretching columns were left at 30 pixels)
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        root.geometry("1920x1080")
+        for size in ("Small", "Normal"):
+            app.config.set("appearance.text_size", size)
+            app._apply_text_size(defer=False)
+            for name in ("remote", "devices", "websites"):
+                app._select_tab(name)
+                _gui_pump(root, 0.3)
+        root.geometry("1024x768")
+        _gui_pump(root, 0.6)
+        for name in ("remote", "devices", "websites"):
+            app._select_tab(name)
+            _gui_pump(root, 0.4)
+            cut = [d for k, _p, d in layout_audit(app.tabs[name].frame)
+                   if k == "heading-cut"]
+            assert not cut, (name, cut)
+    finally:
+        app._hide_banner()
+        app.config.set("general.language", old[0])
+        app.config.set("appearance.text_size", old[1])
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.geometry(geo0)
+        _gui_pump(root, 0.4)
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
