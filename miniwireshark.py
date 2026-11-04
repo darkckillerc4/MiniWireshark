@@ -3437,13 +3437,22 @@ class LoaderWindow(tk.Frame):
             extra = inner.winfo_reqheight() - canvas.winfo_height()
             if extra <= 2:
                 return
-            sh = win.winfo_screenheight()
-            have = win.winfo_height()
-            want = min(have + extra, sh - 80)
-            if want <= have:
+            # (review 6) where the window really is (wm geometry, not
+            # winfo_x/y, which on X11 and Windows are offsets that moved
+            # the window down by its title bar on every grow), and how
+            # tall its title bar is, inside the screen's work area
+            m = re.match(r"(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)",
+                         win.geometry())
+            if not m:
                 return
-            y = max(0, min(win.winfo_y(), sh - want - 60))
-            win.geometry(f"{win.winfo_width()}x{want}+{win.winfo_x()}+{y}")
+            w, have, x, y = (int(m.group(1)), int(m.group(2)),
+                             int(m.group(3).lstrip("+")),
+                             int(m.group(4).lstrip("+")))
+            deco = max(0, win.winfo_rooty() - y)
+            geo = welcome_fit_geometry(w, have, extra, x, y,
+                                       screen_work_area(win), deco)
+            if geo:
+                win.geometry(geo)
 
     # ---- 5.3.4 (MC2): Ready? ------------------------------------------------
     def _build_ready_panel(self, parent):
@@ -11193,17 +11202,47 @@ def awake_clock():
     return time.monotonic() if IS_WINDOWS else None
 
 
-def wake_check(d_wall, d_mono, d_awake, interval):
+_UNBIASED = []
+
+
+def steady_clock():
+    """-> (seconds on a steady clock, does it count sleep?). (review 6)
+    Windows' time.monotonic() keeps counting while the computer sleeps;
+    QueryUnbiasedInterruptTime does not, which makes Windows like Linux
+    and macOS: a sleep is the sleep-counting clock running ahead of this
+    one, so a slow interval (a long adapter reload) is never a sleep."""
+    if IS_WINDOWS:
+        if not _UNBIASED:
+            fn = None
+            with contextlib.suppress(Exception):
+                import ctypes
+                fn = ctypes.windll.kernel32.QueryUnbiasedInterruptTime
+            _UNBIASED.append(fn)
+        fn = _UNBIASED[0]
+        if fn is not None:
+            with contextlib.suppress(Exception):
+                import ctypes
+                v = ctypes.c_ulonglong()
+                if fn(ctypes.byref(v)):
+                    return v.value / 1e7, False
+        return time.monotonic(), True
+    return time.monotonic(), False
+
+
+def wake_check(d_wall, d_mono, d_awake, interval, mono_counts_sleep=False):
     """5.3.4 (S15): did the computer sleep during one watch interval, and
     did the wall clock step? -> (slept, clock step in seconds). The wall
     clock alone can't tell: a clock set ahead by a minute (by hand or by
     the time service) was taken for a sleep and restarted the capture.
     `d_awake` (time passed, sleep included; None when unknown) decides:
-    it is ahead of the steady clock after a sleep (Linux, macOS) or far
-    beyond the interval (Windows, whose steady clock counts sleep)."""
+    it is ahead of the steady clock `d_mono` after a sleep. Only when the
+    steady clock counts sleep too (Windows without
+    QueryUnbiasedInterruptTime) is an interval far beyond its length
+    taken for one."""
     if d_awake is None:                  # the 5.2.3 rule
         return ((d_wall - d_mono) > 20 or d_wall > interval + 60), 0.0
-    slept = (d_awake - d_mono) > 20 or d_awake > interval + 60
+    slept = (d_awake - d_mono) > 20 or (
+        mono_counts_sleep and d_awake > interval + 60)
     step = d_wall - d_awake
     return slept, (step if abs(step) > 20 else 0.0)
 
@@ -11219,7 +11258,7 @@ class NetworkWatcher(threading.Thread):
         self.interval = interval
         self.stop_flag = False
         self._wall = time.time()
-        self._mono = time.monotonic()
+        self._mono = steady_clock()[0]
         self._awake = awake_clock()
 
     def run(self):
@@ -11231,11 +11270,16 @@ class NetworkWatcher(threading.Thread):
                 slept += 0.5
             if self.stop_flag:
                 return
-            wall, mono, awake = time.time(), time.monotonic(), awake_clock()
+            (mono, counts), wall, awake = steady_clock(), time.time(), \
+                awake_clock()
             resumed, step = wake_check(
                 wall - self._wall, mono - self._mono,
                 None if awake is None or self._awake is None else
-                awake - self._awake, self.interval)
+                awake - self._awake, self.interval, counts)
+            if step:
+                # (review 6) the step is reported, in the log
+                LOG.warning("network watcher: the clock was changed by "
+                            "%+.0f s (not a sleep)", step)
             since = self._wall
             self._wall, self._mono, self._awake = wall, mono, awake
             snap = {"resumed": resumed, "time": wall, "since": since,
@@ -17550,8 +17594,9 @@ def _psutil():
 
 
 # TCP states of a connection its program has already closed (psutil names)
+# (review 6: and Windows' DELETE_TCB)
 TCP_ENDED_STATES = frozenset(("TIME_WAIT", "CLOSE", "CLOSING", "LAST_ACK",
-                              "FIN_WAIT1", "FIN_WAIT2"))
+                              "FIN_WAIT1", "FIN_WAIT2", "DELETE_TCB"))
 
 
 class ProcessMap:
@@ -17634,7 +17679,10 @@ class ProcessMap:
             # said "needs admin rights", and when a new connection reused
             # its port it took that connection's name away (the flaky
             # story_process_hit_rate test). It tells nothing: skipped.
-            if pid is None and status in TCP_ENDED_STATES:
+            # (review 6) Windows gives those rows process number 0 (the
+            # idle process owns them), not None: they were kept, shown as
+            # "needs admin rights", and won over the live row
+            if not pid and status in TCP_ENDED_STATES:
                 continue
             name = self._name(ps, pid) if pid else ""
             if pid is None:
@@ -17642,10 +17690,10 @@ class ProcessMap:
             ent = (pid, name)
             # a row with its program wins over one without
             old = by_local.get((proto, ip, port))
-            if old is None or (old[0] is None and pid is not None):
+            if old is None or (not old[0] and pid):
                 by_local[(proto, ip, port)] = ent
             old = by_port.get((proto, port))
-            if old is None or (old[0] is None and pid is not None):
+            if old is None or (not old[0] and pid):
                 by_port[(proto, port)] = ent
             ra = getattr(c, "raddr", None)
             if (proto == "TCP" and status == "LISTEN") or \
@@ -19126,9 +19174,14 @@ class ScanTracker:
     """Per-device sliding minute of connection attempts, to notice
     scanning-like behaviour (many distinct targets, few replies)."""
 
+    # (review 6, S7 soak) replies are kept as long as attempts matter
+    # (a minute) and a little more; they were kept until 5,000 a device
+    REPLY_KEEP = 120.0
+
     def __init__(self):
         self.attempts = defaultdict(deque)   # dev -> (ts, target, port)
-        self.replied = defaultdict(set)      # dev -> {(target, port)}
+        # dev -> OrderedDict((target, port) -> last reply time)
+        self.replied = {}
 
     def attempt(self, dev_key, ts, target, port):
         dq = self.attempts[dev_key]
@@ -19138,17 +19191,31 @@ class ScanTracker:
         if len(dq) > 3000:
             dq.popleft()
 
-    def reply(self, dev_key, target, port):
-        s = self.replied[dev_key]
-        s.add((target, port))
-        if len(s) > 5000:
-            s.clear()
+    def reply(self, dev_key, target, port, ts=None):
+        s = self.replied.get(dev_key)
+        if s is None:
+            s = self.replied[dev_key] = OrderedDict()
+        k = (target, port)
+        s[k] = time.time() if ts is None else ts
+        s.move_to_end(k)
+        while len(s) > 5000:
+            s.popitem(last=False)
+
+    def expire(self, now):
+        """Forget replies older than REPLY_KEEP, and devices left with
+        none and no attempts."""
+        for dev in list(self.replied):
+            s = self.replied[dev]
+            while s and now - next(iter(s.values())) > self.REPLY_KEEP:
+                s.popitem(last=False)
+            if not s and not self.attempts.get(dev):
+                del self.replied[dev]
 
     def evaluate(self, dev_key, port_threshold, host_threshold):
         dq = self.attempts.get(dev_key)
         if not dq:
             return None
-        rep = self.replied.get(dev_key, set())
+        rep = self.replied.get(dev_key) or {}
         per_host = defaultdict(set)
         per_port = defaultdict(set)
         for _ts, tgt, port in dq:
@@ -19328,7 +19395,10 @@ class LookupCorrelator:
     def __init__(self):
         self.by_dev_ip = {}       # (device, ip) -> deque[(ts, domain)]
         self.by_ip = {}           # ip -> deque[(ts, device, domain)]
-        self.order = deque()      # (ts, device, ip) for expiry
+        # (device, ip) -> its newest lookup time, oldest first, for
+        # expiry. (review 6) One entry per key: it was one per DNS answer
+        # for 30 minutes (41,000 in the soak at minute 20 for 10,000 keys)
+        self.order = OrderedDict()
         self.used = set()         # (device, domain) that led to a connect
 
     def note_resolution(self, device, domain, ip, ts):
@@ -19341,7 +19411,8 @@ class LookupCorrelator:
         if ipq is None:
             ipq = self.by_ip[ip] = deque(maxlen=16)
         ipq.append((ts, device, domain))
-        self.order.append((ts, device, ip))
+        self.order[k] = ts
+        self.order.move_to_end(k)
         self._expire(ts)
 
     def match(self, device, ip, ts):
@@ -19364,17 +19435,18 @@ class LookupCorrelator:
         return "", ""
 
     def _expire(self, now):
-        while self.order and now - self.order[0][0] > self.KEEP:
-            t, dev, ip = self.order.popleft()
+        order = self.order
+        while order:
+            (dev, ip), t = next(iter(order.items()))
+            if now - t <= self.KEEP and len(order) <= 200000:
+                break
+            order.popitem(last=False)
             dq = self.by_dev_ip.get((dev, ip))
             if dq and dq[-1][0] <= t:
                 self.by_dev_ip.pop((dev, ip), None)
             ipq = self.by_ip.get(ip)
             if ipq and ipq[-1][0] <= t:
                 self.by_ip.pop(ip, None)
-        if len(self.order) > 200000:
-            for _ in range(20000):
-                self.order.popleft()
         if len(self.used) > 100000:
             self.used.clear()
 
@@ -21202,6 +21274,27 @@ def calls_card_text(tracker, limit=3):
     return "\n".join(lines)
 
 
+def obs_evict_index(dq, site=False, weak=()):
+    """(review 6) Which observation a full subject gives up for a new one:
+    the oldest of its largest group. For a website the group is the
+    device (one device looking a name up again and again pushed out the
+    proof of the device that connected), weak kinds (lookups) first; for
+    a device it is the kind (48 new connections pushed out its DHCP
+    name). -> an index into dq."""
+    groups = {}
+    for i, o in enumerate(dq):
+        g = o[3] if site else o[2]
+        groups.setdefault(g, []).append(i)
+    if len(groups) <= 1 and not site:
+        return 0
+    idx = max(groups.values(), key=len)
+    if site:
+        for i in idx:
+            if dq[i][2] in weak:
+                return i
+    return idx[0]
+
+
 class NetworkModel:
     DISCOVERY_SECONDS = 8
 
@@ -21270,7 +21363,8 @@ class NetworkModel:
         # evidence (section 12b)
         self.correlator = LookupCorrelator()
         self.obs_seq = 0
-        self.obs_recent = deque(maxlen=20000)
+        # (review 6) the saved session keeps the last 3,000
+        self.obs_recent = deque(maxlen=4000)
         self.switch_ports = {}       # (proto, chassis) → what LLDP/CDP said
         self.reported = {}           # helper name → what it reported
         self.flow_starts = OrderedDict()   # (device, remote) → start times
@@ -21286,7 +21380,12 @@ class NetworkModel:
         # each), long after the table had forgotten the connection: the
         # soak's memory kept climbing for an hour and the cycle
         # collector's full pass (the longest freeze) grew with it
-        self.obs_flow_keys = deque()
+        self.obs_flow_keys = OrderedDict()
+        # (review 6, S7 soak) websites' observations, least recently
+        # added to first, and how many they hold: one budget for all of
+        # them (up to 20,000 websites x 16 filled for hours)
+        self.obs_site_keys = OrderedDict()
+        self.obs_site_held = 0
         self.obs_sink = False          # a history store wants observations
         self.obs_pending = []
         self.res_pending = []
@@ -21309,35 +21408,82 @@ class NetworkModel:
         o = (self.obs_seq, ts, kind, subject, data or {}, pkt)
         self.obs_recent.append(o)
         for subj in (subject,) + tuple(also):
-            dq = self.obs_by_subject.get(subj)
-            if dq is None:
-                if subj.startswith("flow:"):
-                    self._forget_old_flow_subjects(subj)
-                if len(self.obs_by_subject) > 60000:
-                    for k in list(self.obs_by_subject)[:6000]:
-                        self.obs_by_subject.pop(k, None)
-                # 5.3.4 (M17, S7): a website's card shows 3 per device and
-                # a connection's 3; 48 of each for 5,000 websites held
-                # 240,000 observations and took hours to fill
-                dq = self.obs_by_subject[subj] = deque(
-                    maxlen=16 if subj.startswith("site:") else
-                    8 if subj.startswith("flow:") else 48)
-            dq.append(o)
+            self._obs_add(subj, o)
         if self.obs_sink:
             self.obs_pending.append(o)
             if len(self.obs_pending) > 200000:
                 del self.obs_pending[:50000]
         return o
 
+    # (review 6) per-subject sizes, and what a full subject gives up
+    OBS_KEEP_SITE = 16
+    OBS_KEEP_FLOW = 4
+    OBS_KEEP_OTHER = 32
+    OBS_SITE_BUDGET = 20000
+    OBS_WEAK_KINDS = ("dns_query", "dns_answer")
+
+    def _obs_add(self, subj, o):
+        subjects = self.obs_by_subject
+        dq = subjects.get(subj)
+        site = subj.startswith("site:")
+        if dq is None:
+            if subj.startswith("flow:"):
+                self._forget_old_flow_subjects(subj)
+            if len(subjects) > 60000:
+                for k in list(subjects)[:6000]:
+                    self._obs_drop(k)
+            # 5.3.4 (M17, S7): a website's card shows 3 per device and
+            # a connection's 3; 48 of each for 5,000 websites held
+            # 240,000 observations and took hours to fill
+            dq = subjects[subj] = deque(
+                maxlen=self.OBS_KEEP_SITE if site else
+                self.OBS_KEEP_FLOW if subj.startswith("flow:") else
+                self.OBS_KEEP_OTHER)
+        if len(dq) >= dq.maxlen:
+            del dq[obs_evict_index(dq, site, self.OBS_WEAK_KINDS)]
+        elif site:
+            self.obs_site_held += 1
+        dq.append(o)
+        if site:
+            keys = self.obs_site_keys
+            keys[subj] = True
+            keys.move_to_end(subj)
+            while self.obs_site_held > self.OBS_SITE_BUDGET and \
+                    len(keys) > 1:
+                old = next(iter(keys))
+                if old == subj:
+                    break
+                self._obs_drop(old)
+
+    def _obs_drop(self, subj):
+        dq = self.obs_by_subject.pop(subj, None)
+        if subj.startswith("site:"):
+            self.obs_site_keys.pop(subj, None)
+            if dq:
+                self.obs_site_held -= len(dq)
+        elif subj.startswith("flow:"):
+            self.obs_flow_keys.pop(subj, None)
+
     def _forget_old_flow_subjects(self, subj):
         """Keep the observations of as many connections as the connection
-        table itself keeps (active + closed), no more."""
+        table itself keeps (active + closed), no more. (review 6) The
+        oldest first, but never one the table still holds (a long-lived
+        connection kept its row and lost its proof)."""
         keys = self.obs_flow_keys
-        keys.append(subj)
+        keys[subj] = True
         ft = self.flows
         cap = ft.max_active + (ft.archive.maxlen or 0)
+        spins = 0
         while len(keys) > cap:
-            self.obs_by_subject.pop(keys.popleft(), None)
+            old = next(iter(keys))
+            if spins < 64 and old != subj:
+                with contextlib.suppress(ValueError):
+                    if ft.by_id.get(int(old[5:])) is not None:
+                        keys.move_to_end(old)     # still in the table
+                        spins += 1
+                        continue
+            keys.pop(old, None)
+            self.obs_by_subject.pop(old, None)
 
     def observations_for(self, subject, kinds=None, limit=48):
         out = [o for o in self.obs_by_subject.get(subject, ())
@@ -22497,7 +22643,7 @@ class NetworkModel:
                 f.synack = True
                 if not out_dir and f.device_key:
                     self.scans.reply(f.device_key, f.remote_ip,
-                                     f.remote_port)
+                                     f.remote_port, ts)
                 # whoever sends the SYN-ACK is the server for this port
                 if sp in REMOTE_ACCESS_PORTS and src_dev is not None and \
                         src_dev.live:
@@ -23288,6 +23434,7 @@ class NetworkModel:
     def _check_scans(self, now):
         pt = int(self.config.get("alerts.scan_ports_threshold", 60))
         ht = int(self.config.get("alerts.scan_hosts_threshold", 40))
+        self.scans.expire(now)
         for key, dq in list(self.scans.attempts.items()):
             while dq and now - dq[0][0] > 60:
                 dq.popleft()
@@ -24199,6 +24346,7 @@ class Store:
         self.written = Counter()
         self.dropped_batches = 0
         self._stop = False
+        self.indexes_ok = False
         self._ready = threading.Event()
         self._idle = threading.Event()
         self._idle.set()
@@ -24334,12 +24482,20 @@ class Store:
         "CREATE INDEX IF NOT EXISTS events_session ON events(session)")
 
     def _late_indexes(self, con):
+        """-> True when every index is there. (review 6) Any failure is
+        logged, never ends the writer (a MemoryError left it dead with
+        history silently off), and the writer tries once more when idle."""
+        ok = True
         for sql in self.LATE_INDEXES:
             try:
                 con.execute(sql)
                 con.commit()
-            except sqlite3.Error as e:
+            except Exception as e:                   # noqa: BLE001
+                ok = False
                 LOG.warning("history index not made: %s", e)
+                with contextlib.suppress(Exception):
+                    con.rollback()
+        return ok
 
     def _backup_if_due(self, con):
         bak = self.path + ".bak"
@@ -24368,7 +24524,8 @@ class Store:
             return
         self._idle.clear()            # flush_now waits for the indexes
         self._ready.set()
-        self._late_indexes(con)
+        self.indexes_ok = self._late_indexes(con)
+        index_retry = not self.indexes_ok
         if self.q.empty():
             self._idle.set()
         self._backup_if_due(con)
@@ -24377,6 +24534,9 @@ class Store:
             try:
                 job = self.q.get(timeout=1.0)
             except queue.Empty:
+                if index_retry and not self._stop:
+                    index_retry = False         # (review 6) once more
+                    self.indexes_ok = self._late_indexes(con)
                 self._idle.set()
                 if self._stop:
                     break
@@ -24667,7 +24827,12 @@ class Store:
             finally:
                 con.close()
         except sqlite3.Error as e:
-            self.error = str(e)
+            # (review 6) "locked"/"busy" passes (the writer committing a
+            # large index); it is not a broken history
+            if _sqlite_busy(e):
+                LOG.info("history read waited too long: %s", e)
+            else:
+                self.error = str(e)
             return []
 
     def observations(self, subject, limit=200, since=0.0):
@@ -24915,11 +25080,31 @@ STORY_CATEGORY = {"presence": "Devices", "new_device": "Devices",
                   "spike": "Devices"}
 
 
-def sqlite_ro_uri(path):
+def sqlite_ro_uri(path, windows=None):
     """A read-only SQLite URI for a file path; every character of the path
-    quoted, so any folder name works."""
-    return "file:" + urllib.request.pathname2url(
-        os.path.abspath(path)) + "?mode=ro"
+    quoted, so any folder name works. (review 6) Built here, not with
+    pathname2url: from Python 3.13 that turns a network folder
+    (\\\\nas\\home) into file://nas/..., and SQLite refuses "nas" as the
+    URI's host; \\\\?\\UNC\\ paths lost their server. The URI always has an
+    empty host: file:///C:/..., file:////nas/home/..., file:///home/..."""
+    win = IS_WINDOWS if windows is None else windows
+    p = str(path)
+    if win:
+        if IS_WINDOWS:
+            p = os.path.abspath(p)
+        p = p.replace("/", "\\")
+        if p.upper().startswith("\\\\?\\UNC\\"):
+            p = "\\\\" + p[8:]
+        elif p.startswith("\\\\?\\"):
+            p = p[4:]
+        p = p.replace("\\", "/")
+        if re.match(r"^[A-Za-z]:", p):
+            p = "/" + p                  # /C:/Users/...
+    else:
+        p = os.path.abspath(p)           # may keep a leading "//"
+    if not p.startswith("/"):
+        p = "/" + p
+    return "file://" + urllib.parse.quote(p, safe="/:") + "?mode=ro"
 
 
 def story_day(ts):
@@ -30493,9 +30678,23 @@ def share_tree_width(tree):
     w0 = getattr(tree, "_mw_w0", None)
     if w0 is None:
         w0 = tree._mw_w0 = {}
+    mine = getattr(tree, "_mw_set", None)
+    if mine is None:
+        mine = tree._mw_set = {}
+    resized_by_hand = False
     for c in list(w0):
-        if c not in info or info[c][1]:
+        # (review 6) a width other than the one set here is the person's
+        # own: it stays, and becomes the column's width to give back
+        if c not in info or info[c][1] or (
+                c in mine and mine[c] != info[c][0]):
+            resized_by_hand = resized_by_hand or (
+                c in info and c in mine and mine[c] != info[c][0])
             del w0[c]
+            mine.pop(c, None)
+    same_size = getattr(tree, "_mw_avail", None) == avail
+    tree._mw_avail = avail
+    if resized_by_hand and same_size:
+        return False          # the table didn't change size: hands off
     if not stretch or not fixed:
         return False
     base = {c: w0.get(c, info[c][0]) for c in fixed}
@@ -30516,8 +30715,10 @@ def share_tree_width(tree):
             if new[c] != info[c][0]:
                 if new[c] < base[c]:
                     w0.setdefault(c, base[c])
+                    mine[c] = new[c]
                 else:
                     w0.pop(c, None)
+                    mine.pop(c, None)
                 tree.column(c, width=new[c])
                 changed = True
         left = avail - sum(new.values())
@@ -33717,9 +33918,13 @@ class TableKit:
         else:
             st["cols"] = list(self.user_cols)
         widths = {}
+        # (review 6) a column share_tree_width narrowed for a small window
+        # is saved at its own width, so it comes back at the next start
+        given = getattr(self.tree, "_mw_w0", None) or {}
         for c in ("#0",) + self.columns:
             with contextlib.suppress(tk.TclError, ValueError):
-                widths[c] = int(self.tree.column(c, "width"))
+                widths[c] = int(given.get(c) or
+                                self.tree.column(c, "width"))
         st["widths"], st["scale"] = widths, MW_FONT_SCALE[0]
         if self.sort_col:
             st["sort"] = [self.sort_col, self.sort_desc]
@@ -34658,6 +34863,7 @@ class DetailDialog:
                                spacing1=4, spacing3=8)
         self.txt.tag_configure("lk", foreground=t["accent"], underline=True)
         self._links = 0
+        self._tlinks = TextLinks(self.txt, "lk", cursor="")    # review 6
         self.txt.tag_bind("fold", "<Button-1>", lambda e: self.toggle_fold())
         self.txt.tag_bind("fold", "<Enter>",
                           lambda e: self.txt.configure(cursor="hand2"))
@@ -34693,9 +34899,7 @@ class DetailDialog:
         if kind and len(sections) > self.FOLD_KEEP + 1:
             keep = self.FOLD_KEEP
         self.folded = keep < len(sections) and self.app.fold_closed(kind)
-        for tag in self.txt.tag_names():
-            if tag.startswith("lk_"):
-                self.txt.tag_delete(tag)
+        self._tlinks.clear()
         for i, sec in enumerate(sections):
             heading, text = sec[0], sec[1]
             links = (getattr(self, "links", None) or {}).get(heading, ())
@@ -34743,16 +34947,11 @@ class DetailDialog:
         """(label, app method name, args): a link in the text."""
         label, meth, args = link
         self._links += 1
-        tag = f"lk_{self._links}"
-        self.txt.insert("end", translate_text(label), ("lk", tag))
         fn = getattr(self.app, meth, None)
-        if fn is not None:
-            self.txt.tag_bind(tag, "<Button-1>",
-                              lambda e, f=fn, a=tuple(args): f(*a))
-        self.txt.tag_bind(tag, "<Enter>",
-                          lambda e: self.txt.configure(cursor="hand2"))
-        self.txt.tag_bind(tag, "<Leave>",
-                          lambda e: self.txt.configure(cursor=""))
+        # (review 6) one binding for all links: see TextLinks
+        self.txt.insert("end", translate_text(label), self._tlinks.add(
+            (lambda f=fn, a=tuple(args): f(*a)) if fn is not None
+            else (lambda: None)))
 
     @staticmethod
     def section_text(text):
@@ -35383,6 +35582,51 @@ class BaseTab:
         return dev.key if dev else None
 
 
+class TextLinks:
+    """Clickable runs in a Text widget with one set of bindings per widget
+    (review 6). A tag_bind per run registered a Tcl command and kept its
+    Python function alive until the window closed (tag_delete frees
+    neither): the Inspector, refreshed about once a second, grew by 36
+    of them per refresh. Each run gets a name tag mapped to its function;
+    clear() forgets them all when the text is rewritten."""
+
+    def __init__(self, txt, tag="mw_link", seq="<Button-1>",
+                 cursor="arrow"):
+        self.txt, self.tag, self.fns = txt, tag, {}
+        self.n = 0
+        txt.tag_bind(tag, seq, self._fire)
+        if cursor is not None:
+            txt.tag_bind(tag, "<Enter>",
+                         lambda e: txt.configure(cursor="hand2"))
+            txt.tag_bind(tag, "<Leave>",
+                         lambda e: txt.configure(cursor=cursor))
+
+    def add(self, fn):
+        """-> the tags for one run: (shared tag, its own name tag)."""
+        self.n += 1
+        name = f"{self.tag}_{self.n}"
+        self.fns[name] = fn
+        return self.tag, name
+
+    def clear(self):
+        self.fns.clear()
+        with contextlib.suppress(tk.TclError):
+            for t in self.txt.tag_names():
+                if t.startswith(self.tag + "_"):
+                    self.txt.tag_delete(t)
+
+    def _fire(self, e):
+        try:
+            tags = self.txt.tag_names(f"@{e.x},{e.y}")
+        except tk.TclError:
+            return
+        for t in tags:
+            fn = self.fns.get(t)
+            if fn is not None:
+                fn()
+                return
+
+
 # ---- Inspector (docked evidence pane, F2) -------------------------------------
 class Inspector:
     """Shows the selected device / website / remote host / connection /
@@ -35425,6 +35669,7 @@ class Inspector:
         self.frame.bind("<Configure>", self._on_resize)
         self.current = None
         self._chip = 0
+        self._tlinks = TextLinks(self.txt, "c")
         self.on_theme()
         self._empty()
 
@@ -35461,9 +35706,7 @@ class Inspector:
         self.title_var.set(title)
         self.txt.configure(state="normal")
         self.txt.delete("1.0", "end")
-        for tag in self.txt.tag_names():
-            if tag.startswith("c_"):
-                self.txt.tag_delete(tag)
+        self._tlinks.clear()
 
     def _end(self):
         with contextlib.suppress(Exception):
@@ -35475,14 +35718,10 @@ class Inspector:
         self.txt.insert("end", translate_lines(text), tags)
 
     def _clickable(self, text, fn, base="link"):
+        # (review 6) one binding for every link: see TextLinks
         self._chip += 1
-        tag = f"c_{self._chip}"
-        self.txt.insert("end", translate_text(text), (base, tag))
-        self.txt.tag_bind(tag, "<Button-1>", lambda e: fn())
-        self.txt.tag_bind(tag, "<Enter>",
-                          lambda e: self.txt.configure(cursor="hand2"))
-        self.txt.tag_bind(tag, "<Leave>",
-                          lambda e: self.txt.configure(cursor="arrow"))
+        self.txt.insert("end", translate_text(text),
+                        (base,) + self._tlinks.add(fn))
 
     def _claim(self, label, value, level, why=""):
         # French puts a space before the colon
@@ -43751,6 +43990,7 @@ class StreamsView(_SubView):
         self.txt.configure(yscrollcommand=vs.set, state="disabled")
         vs.pack(side="right", fill="y")
         self.txt.pack(side="left", fill="both", expand=True)
+        self._tlinks = TextLinks(self.txt, "p", "<Double-1>", cursor=None)
         self.result = None
         self.flow_id = None
         self.on_theme()
@@ -43836,9 +44076,7 @@ class StreamsView(_SubView):
         txt = self.txt
         txt.configure(state="normal")
         txt.delete("1.0", "end")
-        for tag in txt.tag_names():
-            if tag.startswith("p_"):
-                txt.tag_delete(tag)
+        self._tlinks.clear()
         with contextlib.suppress(tk.TclError):
             self.raw_btn.pack_forget()
         if r is None or not r.chunks:
@@ -43860,9 +44098,9 @@ class StreamsView(_SubView):
             if kind == "gap":
                 txt.insert("end", body, ("gap",))
                 continue
-            ptag = f"p_{i}"
-            txt.tag_bind(ptag, "<Double-1>", lambda e, n=no: self.jump(n))
-            txt.insert("end", body, (f"d{kind}", ptag))
+            # (review 6) one binding for every segment: see TextLinks
+            txt.insert("end", body, (f"d{kind}",) + self._tlinks.add(
+                lambda n=no: self.jump(n)))
         txt.configure(state="disabled")
         c, s = r.client, r.server
         self.info.configure(text=(
@@ -45164,6 +45402,7 @@ class HelpTab(BaseTab):
         self.rows = []              # listbox row -> topic or None
         self.topic = None
         self._links = 0
+        self._tlinks = TextLinks(txt, "lk")                   # review 6
         self.refill()
         self.open_topic("Start here")
 
@@ -45234,23 +45473,16 @@ class HelpTab(BaseTab):
         txt = self.txt
         txt.config(state="normal")
         txt.delete("1.0", "end")
-        for tag in txt.tag_names():
-            if tag.startswith("lk_"):
-                txt.tag_delete(tag)
+        self._tlinks.clear()
         txt.insert("end", translate_text(tp["title"]) + "\n", ("h1",))
         txt.insert("end", translate_lines(help_body(tp, self.app)) + "\n")
         for label, tab, attr in tp["show"]:
             self._links += 1
-            tag = f"lk_{self._links}"
             word = "Take the tour" if tab == "tour" else "Show me"
             txt.insert("end", f"\n\u25B6 {translate_text(word)}: "
-                              f"{translate_text(label)}", ("show", tag))
-            txt.tag_bind(tag, "<Button-1>", lambda e, tb=tab, at=attr:
-                         self.app.show_me(tb, at))
-            txt.tag_bind(tag, "<Enter>",
-                         lambda e: txt.configure(cursor="hand2"))
-            txt.tag_bind(tag, "<Leave>",
-                         lambda e: txt.configure(cursor="arrow"))
+                              f"{translate_text(label)}", ("show",) +
+                       self._tlinks.add(lambda tb=tab, at=attr:
+                                        self.app.show_me(tb, at)))
         gloss_mark(txt, self.app, "2.0")
         txt.config(state="disabled")
         self._mark_current()
@@ -65721,9 +65953,22 @@ def self_test_wanted(only):
     or without the t_ prefix). -> a test-name predicate, None for all."""
     if not only:
         return None
-    names = {n.strip() for n in str(only).split(",") if n.strip()}
-    names |= {"t_" + n for n in names if not n.startswith("t_")}
-    return lambda fn_name: fn_name in names
+    # (review 6) also as the run prints them ("story process hit rate")
+    asked = [n.strip() for n in str(only).split(",") if n.strip()]
+    want = {}
+    for n in asked:
+        k = re.sub(r"[\s-]+", "_", n)
+        want[k if k.startswith("t_") else "t_" + k] = n
+    seen = set()
+
+    def wanted(fn_name):
+        if fn_name in want:
+            seen.add(fn_name)
+            return True
+        return False
+    wanted.unmatched = lambda: [n for k, n in want.items()
+                                if k not in seen]
+    return wanted
 
 
 def run_self_tests(verbose=True, only=None):
@@ -66553,7 +66798,8 @@ def run_self_tests(verbose=True, only=None):
                t_fingerprinting, t_interface_scoring, t_busy_workload):
         test(fn)
     ctx = TestContext(tmp, scapy_ok)
-    quick = "--quick" in sys.argv
+    # (review 6) a test asked for by name runs even with --quick
+    quick = "--quick" in sys.argv and wanted is None
     for fn, slow in SELF_TESTS:
         if slow and quick:
             continue
@@ -66563,9 +66809,10 @@ def run_self_tests(verbose=True, only=None):
         wrapped.__name__ = fn.__name__
         test(wrapped)
     shutil.rmtree(tmp, ignore_errors=True)
+    missing = wanted.unmatched() if wanted is not None else []
+    if missing and verbose:
+        print("No self-test is called " + ", ".join(missing) + ".")
     if wanted is not None and not results:
-        if verbose:
-            print(f"No self-test is called {only}.")
         return 2
     failed = [r for r in results if r[0] == "FAIL"]
     if verbose:
@@ -66573,7 +66820,7 @@ def run_self_tests(verbose=True, only=None):
               f" / {sum(1 for r in results if r[0] == 'SKIP')} skipped")
         for status, name, msg, _t in failed:
             print(f"\nFAILED: {name}\n{msg}")
-    return 1 if failed else 0
+    return 1 if failed else 2 if missing else 0
 
 
 # ---- registered tests (added milestone by milestone) -------------------------
@@ -71596,17 +71843,38 @@ def t_tcp_measurements(ctx):
 
 NET_SENDS = {"urlopen", "sendp", "sendto", "gethostbyaddr", "getaddrinfo",
              "create_connection", "sr1", "srp", "srp1", "sendall",
-             "HTTPConnection", "HTTPSConnection"}
+             "HTTPConnection", "HTTPSConnection",
+             # (review 6)
+             "connect_ex", "getnameinfo", "gethostbyname",
+             "gethostbyname_ex", "send", "sendmsg", "sr", "srloop",
+             "sendpfast", "open_connection"}
 # 5.3.4 (S16): programs that go on the network when this file starts them
 NET_TOOLS = {"curl", "wget", "ping", "ping6", "nslookup", "dig", "tracert",
              "traceroute", "tracepath", "pathping", "Invoke-WebRequest",
              "Invoke-RestMethod", "Test-NetConnection", "Resolve-DnsName",
              "Start-BitsTransfer", "bitsadmin", "winget", "ssh", "scp", "sftp",
-             "ftp", "tftp", "telnet", "nc", "ncat", "nmap", "arping"}
+             "ftp", "tftp", "telnet", "nc", "ncat", "nmap", "arping",
+             # (review 6)
+             "Test-Connection", "iwr", "irm", "nbtstat", "nmblookup",
+             "host", "drill", "mtr", "fping", "hping3", "arp-scan",
+             "smbclient", "avahi-resolve", "dns-sd"}
+# calls that take a command without starting it
+NOT_RUNNERS = {"join", "print", "repr", "str", "list", "tuple", "len",
+               "sorted", "format", "debug", "info", "warning", "error",
+               "exception", "append", "extend", "insert", "quote",
+               "list2cmdline", "cached_cmd", "post_log", "set"}
+# open a web address in the browser (a file path stays on this computer)
+URL_OPENERS = {"xdg-open", "open", "start", "explorer"}
 # calls that start another program (subprocess and this file's helpers)
 PROC_LAUNCHERS = {"run", "Popen", "call", "check_output", "check_call",
                   "system", "popen", "startfile", "_run", "_run_hidden",
-                  "_popen_hidden", "run_console", "execve", "execv"}
+                  "_popen_hidden", "run_console", "execve", "execv",
+                  # (review 6)
+                  "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv",
+                  "spawnve", "spawnvp", "spawnvpe", "posix_spawn",
+                  "posix_spawnp", "execl", "execle", "execlp", "execlpe",
+                  "execvp", "execvpe", "getoutput", "getstatusoutput",
+                  "create_subprocess_exec", "create_subprocess_shell"}
 
 
 def outbound_bypasses(tree):
@@ -71627,9 +71895,11 @@ def outbound_bypasses(tree):
     gated = {}
 
     def gate_line(fn):
-        """The first line of fn that calls the gate (0: none)."""
+        """The first line of fn that calls the gate (0: none). (review 6)
+        fn's own lines: a gate inside a function defined in fn may never
+        run."""
         if id(fn) not in gated:
-            gated[id(fn)] = min([n.lineno for n in ast.walk(fn) if isinstance(
+            gated[id(fn)] = min([n.lineno for n in own_nodes(fn) if isinstance(
                 n, ast.Call) and call_name(n) in ("outbound", "net_urlopen")],
                 default=0)
         return gated[id(fn)]
@@ -71647,13 +71917,22 @@ def outbound_bypasses(tree):
                                   ast.Lambda)):
                 todo.extend(ast.iter_child_nodes(n))
 
+    def target_key(t):
+        if isinstance(t, ast.Name):
+            return t.id
+        if isinstance(t, ast.Attribute) and isinstance(t.value, ast.Name) \
+                and t.value.id == "self":
+            return "self." + t.attr          # (review 6) self.cmd = [...]
+        return None
+
     def local_env(fn):
         env = {}
         for n in own_nodes(fn):
             if isinstance(n, ast.Assign):
                 for t in n.targets:
-                    if isinstance(t, ast.Name):
-                        env.setdefault(t.id, []).append(n.value)
+                    k = target_key(t)
+                    if k is not None:
+                        env.setdefault(k, []).append(n.value)
             elif isinstance(n, ast.AugAssign) and isinstance(n.target,
                                                              ast.Name):
                 env.setdefault(n.target.id, []).append(n.value)
@@ -71670,32 +71949,66 @@ def outbound_bypasses(tree):
             if isinstance(n, ast.Constant) and isinstance(n.value, str):
                 out.add(n.value)
                 out.update(n.value.split())
-            elif isinstance(n, ast.Name) and n.id in env and \
-                    n.id not in seen:
-                for v in env[n.id]:
-                    out |= words(v, env, seen + (n.id,))
+            elif isinstance(n, (ast.Name, ast.Attribute)):
+                k = target_key(n)
+                if k is not None and k in env and k not in seen:
+                    for v in env[k]:
+                        out |= words(v, env, seen + (k,))
             elif isinstance(n, ast.Call):
                 out |= builder_words(call_name(n))
         return out
 
-    def online(ws):
-        return bool(ws & NET_TOOLS) or ("pip" in ws and bool(
-            ws & {"install", "download"}) and "--no-index" not in ws)
+    tools = {t.lower() for t in NET_TOOLS}
 
-    funcs, todo = [], [tree]         # functions sit in statement lists
+    def online(ws):
+        # (review 6) "curl.exe", "/usr/bin/ping", "PING" are the tools too
+        names = {re.split(r"[\\/]", w)[-1].lower() for w in ws if w}
+        names |= {n[:-4] for n in names if n.endswith(".exe")}
+        if names & tools:
+            return True
+        if names & URL_OPENERS and any(
+                w.startswith(("http://", "https://")) for w in ws):
+            return True
+        return "pip" in names and bool(
+            names & {"install", "download"}) and "--no-index" not in ws
+
+    funcs, todo = [], [(tree, None)]  # functions sit in statement lists
+    owner_class = {}
     while todo:
-        n = todo.pop()
+        n, cls = todo.pop()
         for slot in ("body", "orelse", "finalbody", "handlers"):
             for c in getattr(n, slot, None) or ():
                 if isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     funcs.append(c)
-                if isinstance(c, ast.AST):
-                    todo.append(c)
-    envs = {}
+                    if cls is not None:
+                        owner_class[id(c)] = cls
+                    todo.append((c, None))
+                elif isinstance(c, ast.ClassDef):
+                    todo.append((c, c))
+                elif isinstance(c, ast.AST):
+                    todo.append((c, cls))
+    envs, class_envs = {}, {}
+
+    def class_env(cls):
+        """self.<name> assignments in every method of a class."""
+        if id(cls) not in class_envs:
+            env = {}
+            for m_ in cls.body:
+                if isinstance(m_, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for k, v in local_env(m_).items():
+                        if k.startswith("self."):
+                            env.setdefault(k, []).extend(v)
+            class_envs[id(cls)] = env
+        return class_envs[id(cls)]
 
     def env_of(fn):
         if id(fn) not in envs:
-            envs[id(fn)] = local_env(fn)
+            env = dict(local_env(fn))
+            cls = owner_class.get(id(fn))
+            if cls is not None:
+                for k, v in class_env(cls).items():
+                    env.setdefault(k, v)
+            envs[id(fn)] = env
         return envs[id(fn)]
     by_name = {}
     for fn in funcs:
@@ -71712,19 +72025,36 @@ def outbound_bypasses(tree):
                 for n in own_nodes(fn):
                     if isinstance(n, ast.Return) and n.value is not None:
                         ws |= words(n.value, env_of(fn))
-            builders[name] = ws if online(ws) else set()
+            # (review 6) part of a command counts too: [exe, "-m", "pip"]
+            # with "install" added by the caller
+            builders[name] = ws if online(ws) or "pip" in ws or \
+                ws & {"install", "download"} else set()
         return builders[name]
     bad = []
 
     def starts_online(call, fn):
-        if call_name(call) not in PROC_LAUNCHERS:
-            # any other call: a command list written in it (LG-04)
-            return any(online({e.value for e in lst.elts
-                               if isinstance(e, ast.Constant) and
-                               isinstance(e.value, str)})
-                       for a in call.args for lst in ast.walk(a)
-                       if isinstance(lst, ast.List))
         env = env_of(fn) if fn is not None else {}
+        if call_name(call) not in PROC_LAUNCHERS:
+            # any other call: a command list written in it (LG-04), or
+            # (review 6) a variable holding one, handed to a helper
+            if any(online({e.value for e in lst.elts
+                           if isinstance(e, ast.Constant) and
+                           isinstance(e.value, str)})
+                   for a in call.args for lst in ast.walk(a)
+                   if isinstance(lst, ast.List)):
+                return True
+            f = call.func
+            if call_name(call) in NOT_RUNNERS or isinstance(
+                    f, ast.Attribute) and isinstance(f.value, ast.Constant):
+                return False         # " ".join(cmd), print(cmd), ...
+            for a in call.args:
+                k = target_key(a)
+                if k is None or k not in env:
+                    continue
+                if any(isinstance(x, ast.List) for v in env[k]
+                       for x in ast.walk(v)) and online(words(a, env)):
+                    return True
+            return False
         ws = set()
         for a in list(call.args) + [k.value for k in call.keywords]:
             ws |= words(a, env)
@@ -71742,19 +72072,36 @@ def outbound_bypasses(tree):
                 is_send = name in NET_SENDS or (
                     name == "connect" and isinstance(f, ast.Attribute) and
                     not (isinstance(f.value, ast.Name) and
-                         f.value.id == "sqlite3")) or \
+                         f.value.id == "sqlite3")) or (
+                    # (review 6) the browser on a web address
+                    name in ("open", "open_new", "open_new_tab") and
+                    isinstance(f, ast.Attribute) and
+                    isinstance(f.value, ast.Name) and
+                    f.value.id == "webbrowser") or any(
+                    # (review 6) Thread(target=urlopen, ...)
+                    k.arg == "target" and isinstance(
+                        k.value, (ast.Name, ast.Attribute)) and
+                    (k.value.attr if isinstance(k.value, ast.Attribute)
+                     else k.value.id) in NET_SENDS
+                    for k in child.keywords) or \
                     starts_online(child, near)
                 if is_send:
                     owner = fn.name if fn is not None else "<module>"
                     # os_identity: connect() on a UDP socket sends nothing
                     exempt = owner in ("net_urlopen", "os_identity") or \
-                        top.startswith(("t_", "_gs_"))
+                        top.startswith(("t_", "_gs_", "test_"))
                     if not exempt and not (fn is not None and
                                            calls_outbound(fn)):
                         bad.append(f"{owner}:{child.lineno} {name}()")
                     elif not exempt and fn is near and \
                             child.lineno < gate_line(fn):
                         # 5.3.4 (S16): the gate first, then the send
+                        bad.append(f"{owner}:{child.lineno} {name}() "
+                                   "before outbound()")
+                    elif not exempt and near is not None and \
+                            near is not fn and \
+                            near.lineno < gate_line(fn):
+                        # (review 6) a helper defined before the gate
                         bad.append(f"{owner}:{child.lineno} {name}() "
                                    "before outbound()")
             visit(child, fn, top, near)
@@ -79287,7 +79634,7 @@ def t_s15_clock_steps_are_not_sleep(ctx):
     cases = (  # d_wall, d_mono, d_awake -> slept, step
         ((15, 15, 15), (False, 0.0)),              # a normal interval
         ((3615, 15, 3615), (True, 0.0)),           # Linux: slept an hour
-        ((3615, 3615, 3615), (True, 0.0)),         # Windows: slept an hour
+        ((3615, 15, 3615), (True, 0.0)),           # Windows (review 6)
         ((135, 15, 15), (False, 120.0)),           # clock set ahead
         ((-3585, 15, 15), (False, -3600.0)),       # clock set back
         ((3735, 15, 3615), (True, 120.0)),         # both
@@ -79295,6 +79642,10 @@ def t_s15_clock_steps_are_not_sleep(ctx):
     for (dw, dm, da), want in cases:
         got = wake_check(dw, dm, da, iv)
         assert got == want, ((dw, dm, da), got, want)
+    # Windows without QueryUnbiasedInterruptTime: its steady clock counts
+    # sleep, so the interval's length decides (review 6)
+    assert wake_check(3615, 3615, 3615, iv, mono_counts_sleep=True) == \
+        (True, 0.0)
     # without a sleep-counting clock: the 5.2.3 rule
     assert wake_check(3615, 15, None, iv)[0] and \
         not wake_check(15, 15, None, iv)[0]
@@ -79537,11 +79888,497 @@ def t_m17_flow_observations_bounded(ctx):
     assert len(flows) == cap, (len(flows), cap)
     assert m.observations_for("flow:2000") and \
         not m.observations_for("flow:1")
-    assert len(m.observations_for("aa:bb:cc:00:00:01")) == 48
+    assert len(m.observations_for("aa:bb:cc:00:00:01")) == \
+        NetworkModel.OBS_KEEP_OTHER          # review 6: 32 (was 48)
     for i in range(30):
         m.observe("tls_sni", "aa:bb:cc:00:00:01", 5000.0 + i,
                   {"domain": "example.com"}, also=("site:example.com",))
     assert len(m.observations_for("site:example.com")) == 16
+
+
+# ---- review 6 (M15 / M17 fixes) ---------------------------------------------
+@self_test()
+def t_r6_history_uri_network_folders(ctx):
+    """Review 6 (#1): the read-only history URI has an empty host for every
+    path. From Python 3.13 pathname2url made file://nas/... of a network
+    folder (SQLite: "invalid uri authority"), and \\\\?\\UNC\\ lost its
+    server; a POSIX path starting with // did the same."""
+    for path, want in (
+            (r"\\nas\home\Zoë #1\MiniWireshark\history.db",
+             "file:////nas/home/Zo%C3%AB%20%231/MiniWireshark/history.db"),
+            (r"\\?\UNC\nas\home\x\history.db",
+             "file:////nas/home/x/history.db"),
+            (r"\\?\C:\Users\x\history.db", "file:///C:/Users/x/history.db"),
+            (r"C:\Users\a?b 50%\history.db",
+             "file:///C:/Users/a%3Fb%2050%25/history.db")):
+        got = sqlite_ro_uri(path, windows=True)
+        assert got == want + "?mode=ro", (path, got)
+        assert not re.match(r"file://[^/]", got), got
+    for name in ("a b", "a#b", "a?b", "a%b", "a%20b", "Zoë"):
+        folder = ctx.path(os.path.join("r6uri", name))
+        os.makedirs(folder, exist_ok=True)
+        db = os.path.join(folder, "h.db")
+        con = sqlite3.connect(db)
+        con.execute("CREATE TABLE IF NOT EXISTS t(x)")
+        con.commit()
+        con.close()
+        uri = sqlite_ro_uri(db, windows=False)
+        ro = sqlite3.connect(uri, uri=True)
+        try:
+            ro.execute("SELECT * FROM t").fetchall()
+        finally:
+            ro.close()
+    if not IS_WINDOWS:
+        assert sqlite_ro_uri("//srv/x/h.db", windows=False).startswith(
+            "file:////srv/x/"), sqlite_ro_uri("//srv/x/h.db", windows=False)
+
+
+@self_test()
+def t_r6_text_links_one_binding(ctx):
+    """Review 6 (#2): clickable runs in a Text share one binding. Every
+    run's tag_bind registered a Tcl command (and kept its function) until
+    the window closed: the Inspector grew by 36 per refresh."""
+    # every place that drew links per refresh uses it
+    for fn in (Inspector._clickable, DetailDialog._link,
+               HelpTab.open_topic, StreamsView.render):
+        src = inspect.getsource(fn)
+        assert "tag_bind" not in src, fn.__qualname__
+    if sys.version_info < (3, 9):
+        return          # the test machine's 3.8 Tk aborts on any Text
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        root.deiconify()
+        txt = tk.Text(root, width=60, height=10)
+        txt.pack()
+        links = TextLinks(txt, "c")
+        hits = []
+        n0 = None
+        for rnd in range(30):
+            txt.delete("1.0", "end")
+            links.clear()
+            for i in range(12):
+                txt.insert("end", f"link {i} ",
+                           links.add(lambda i=i, r=rnd: hits.append((r, i))))
+            if n0 is None:
+                n0 = len(getattr(txt, "_tclCommands", None) or ())
+        n1 = len(getattr(txt, "_tclCommands", None) or ())
+        assert n1 == n0, (n0, n1)
+        assert len(links.fns) == 12, len(links.fns)
+        _gui_pump(root, 0.2)
+        x, y, _w, _h = txt.bbox(txt.search("link 3", "1.0"))
+
+        class E:
+            pass
+        e = E()
+        e.x, e.y = x + 2, y + 2
+        links._fire(e)
+        assert hits == [(29, 3)], hits
+    finally:
+        root.destroy()
+
+
+@self_test()
+def t_r6_memory_fills_to_a_size(ctx):
+    """Review 6 (#3, S7 soak): what still grew from minute 15 is held to a
+    size: websites' observations share one budget, the lookup correlator
+    keeps one entry per (device, address) instead of one per DNS answer
+    for 30 minutes, and the scan tracker forgets replies after two
+    minutes. Matching and scan detection still work."""
+    m = NetworkModel(ctx.cfg(), "192.168.1.1", {"192.168.1.10"}, set())
+    for s_ in range(1500):
+        for i in range(16):
+            m.observe("dns_query", "aa:bb:cc:00:00:%02x" % (s_ % 50),
+                      float(i), {"domain": f"s{s_}.example"},
+                      also=(f"site:s{s_}.example",))
+    held = sum(len(d) for k, d in m.obs_by_subject.items()
+               if k.startswith("site:"))
+    assert held <= NetworkModel.OBS_SITE_BUDGET, held
+    assert held == m.obs_site_held, (held, m.obs_site_held)
+    assert m.observations_for("site:s1499.example")      # newest kept
+    c = LookupCorrelator()
+    t = 0.0
+    for _round in range(60):
+        for dev in range(10):
+            for n in range(50):
+                c.note_resolution(f"dev{dev}", f"n{n}.example",
+                                  f"203.0.113.{n}", t)
+        t += 10.0
+    assert len(c.order) <= 500, len(c.order)
+    assert c.match("dev3", "203.0.113.7", t) == ("n7.example", "own-recent")
+    c.note_resolution("dev1", "late.example", "198.51.100.1", t + 4000)
+    assert c.match("dev3", "203.0.113.7", t + 4000) == ("", ""), \
+        "old lookups not forgotten"
+    assert len(c.order) == 1 and len(c.by_ip) == 1, (len(c.order), c.by_ip)
+    st = ScanTracker()
+    for i in range(3000):
+        st.reply("dev", f"10.0.{i // 250}.{i % 250}", 443, 100.0 + i * 0.01)
+    st.expire(100.0 + 30 + ScanTracker.REPLY_KEEP)
+    assert len(st.replied.get("dev", ())) == 0, len(st.replied.get("dev"))
+    assert "dev" not in st.replied
+    for i in range(70):
+        st.attempt("scanner", 1000.0 + i * 0.1, "192.168.1.50", 1000 + i)
+    st.reply("scanner", "192.168.1.50", 1003, 1001.0)
+    res = st.evaluate("scanner", 60, 40)
+    assert res and res[1] == 69, res
+
+
+@self_test()
+def t_r6_ended_connections_on_windows(ctx):
+    """Review 6 (#4): Windows reports what is left of a closed connection
+    (TIME_WAIT) with process number 0, not None, and has DELETE_TCB. They
+    were kept as "needs admin rights" and won over the live row."""
+    from collections import namedtuple
+    addr = namedtuple("addr", "ip port")
+    Conn = namedtuple("Conn", "fd family type laddr raddr status pid")
+
+    class FakePs:
+        class AccessDenied(Exception):
+            pass
+
+        def __init__(self, rows):
+            self.rows = rows
+
+        def net_connections(self, kind="inet"):
+            return list(self.rows)
+
+        class Process:
+            def __init__(self, pid):
+                self.pid = pid
+
+            def name(self):
+                return "chrome.exe"
+    lip = "192.168.1.20"
+    for status, pid in (("TIME_WAIT", 0), ("DELETE_TCB", None),
+                        ("TIME_WAIT", None)):
+        rows = [Conn(-1, 2, 1, addr(lip, 50000), addr("93.184.215.14", 443),
+                     status, pid),
+                Conn(-1, 2, 1, addr(lip, 50000), addr("142.250.1.1", 443),
+                     "ESTABLISHED", 4321)]
+        pm = ProcessMap()
+        g = globals()
+        real = g["_psutil"]
+        g["_psutil"] = lambda rows=rows: FakePs(rows)
+        try:
+            pm.read()
+        finally:
+            g["_psutil"] = real
+        assert pm.lookup("TCP", lip, 50000) == (4321, "chrome.exe"), \
+            (status, pid, pm.lookup("TCP", lip, 50000))
+        assert not pm.needs_admin, (status, pid)
+
+
+@self_test()
+def t_r6_tree_width_share_keeps_hand_widths(ctx):
+    """Review 6 (#5): a column the person widens while the table is narrow
+    keeps that width (it was set back on the next resize event); the
+    widths to give back are what a save writes."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        root.deiconify()
+        root.geometry("1400x240")
+        wrap, tree = make_tree(root, [
+            ("name", "Device", 200, "w", True),
+            ("ip", "Address", 160, "w", False),
+            ("vendor", "Made by", 220, "w", False),
+            ("seen", "Last seen", 180, "w", False),
+            ("note", "Contacted by", 200, "w", True)])
+        wrap.pack(fill="both", expand=True)
+        _gui_pump(root, 0.3)
+        share_tree_width(tree)
+        root.geometry("520x240")
+        _gui_pump(root, 0.3)
+        share_tree_width(tree)
+        assert int(tree.column("ip", "width")) < 160
+        assert tree._mw_w0.get("ip") == 160, tree._mw_w0
+        tree.column("ip", width=150)                  # by hand
+        share_tree_width(tree)
+        assert int(tree.column("ip", "width")) == 150, \
+            tree.column("ip", "width")
+        assert "ip" not in tree._mw_w0
+    finally:
+        root.destroy()
+
+
+@self_test()
+def t_r6_evidence_kept_fairly(ctx):
+    """Review 6 (#6): a full subject gives up the oldest observation of its
+    largest group: a website keeps the proof of the device that connected
+    while another one looks the name up again and again; a device keeps
+    its DHCP name after many new connections; a connection still in the
+    table keeps its proof however many shorter ones came after it."""
+    m = NetworkModel(ctx.cfg(), "192.168.1.1", {"192.168.1.10"}, set())
+    a, b = "aa:bb:cc:00:00:01", "aa:bb:cc:00:00:02"
+    m.observe("tls_sni", a, 1000.0, {"domain": "bank.example"},
+              also=("site:bank.example",))
+    for i in range(40):
+        m.observe("dns_query", b, 1001.0 + i, {"domain": "bank.example"},
+                  also=("site:bank.example",))
+    obs = m.observations_for("site:bank.example")
+    assert [o[2] for o in obs if o[3] == a] == ["tls_sni"], obs[:3]
+    assert len(obs) == NetworkModel.OBS_KEEP_SITE
+    m.observe("dhcp_ack", a, 2000.0, {"name": "Lisa-PC"})
+    for i in range(100):
+        m.observe("flow_start", a, 2001.0 + i, {"flow": 9000 + i})
+    assert m.observations_for(a, kinds=("dhcp_ack",))
+    ft = m.flows
+    ft.resize(200, 100)
+    key = ("TCP", "192.168.1.20", 50000, "93.184.215.14", 443)
+    long_f, _ = ft.lookup_or_create(key, "TCP", key[1], key[2], key[3],
+                                    key[4], 0.0)
+    m.observe("flow_start", a, 0.0, {"flow": long_f.fid},
+              also=(f"flow:{long_f.fid}",))
+    for i in range(400):
+        k = ("TCP", "192.168.1.20", 40000 + i, "203.0.113.9", 443)
+        f, _ = ft.lookup_or_create(k, "TCP", k[1], k[2], k[3], k[4], 1.0 + i)
+        ft.active.move_to_end(key)
+        m.observe("flow_start", b, 1.0 + i, {"flow": f.fid},
+                  also=(f"flow:{f.fid}",))
+    assert ft.get(long_f.fid) is not None
+    assert m.observations_for(f"flow:{long_f.fid}"), "long flow lost proof"
+    assert len(m.obs_flow_keys) <= ft.max_active + ft.archive.maxlen
+
+
+@self_test()
+def t_r6_outbound_check_sees_more(ctx):
+    """Review 6 (#7): the outbound static check also sees a command built
+    in two parts, a command handed to a helper in a variable, tools
+    written with a path or .exe, PowerShell's Test-Connection, nbtstat,
+    the browser on a web address, connect_ex/getnameinfo/gethostbyname,
+    os.spawn*, scapy send/sr, Thread(target=urlopen), self.cmd, a gate
+    only in a nested function, and a helper defined before the gate. A
+    file opened with xdg-open and " ".join(cmd) are not sends."""
+    import ast
+    import textwrap
+    bad = {
+        "partial": '''
+            def pip_base(exe):
+                return [exe, "-m", "pip"]
+            def get(exe):
+                subprocess.run(pip_base(exe) + ["install", "scapy"])
+        ''',
+        "helper": '''
+            def get(exe):
+                cmd = [exe, "-m", "pip", "install", "scapy"]
+                step("Packages", cmd, 900)
+        ''',
+        "exe": '''
+            def get(host):
+                subprocess.run(["curl.exe", "-s", host])
+        ''',
+        "path": '''
+            def get(host):
+                subprocess.run(["/usr/bin/ping", "-c", "1", host])
+        ''',
+        "ps": '''
+            def get(host):
+                subprocess.run(["powershell", "-Command",
+                                "Test-Connection " + host])
+        ''',
+        "nbtstat": '''
+            def get(host):
+                subprocess.run(["nbtstat", "-A", host])
+        ''',
+        "url": '''
+            def get():
+                subprocess.Popen(["xdg-open", "https://example.com"])
+        ''',
+        "browser": '''
+            def get():
+                webbrowser.open("https://example.com")
+        ''',
+        "apis": '''
+            def get(host):
+                s.connect_ex((host, 80))
+        ''',
+        "nameinfo": '''
+            def get(host):
+                socket.getnameinfo((host, 0), 0)
+        ''',
+        "spawn": '''
+            def get(host):
+                os.spawnlp(os.P_WAIT, "curl", "curl", host)
+        ''',
+        "scapy": '''
+            def get(host):
+                send(IP(dst=host) / ICMP())
+        ''',
+        "target": '''
+            def get(host):
+                threading.Thread(target=urllib.request.urlopen,
+                                 args=(host,)).start()
+        ''',
+        "self": '''
+            class A:
+                def __init__(self, exe):
+                    self.cmd = [exe, "-m", "pip", "install", "x"]
+                def go(self):
+                    subprocess.run(self.cmd)
+        ''',
+        "nested_gate": '''
+            def get(host):
+                def later():
+                    outbound("x", "tcp", host)
+                socket.create_connection((host, 443))
+        ''',
+        "helper_first": '''
+            def get(host):
+                def inner():
+                    socket.create_connection((host, 443))
+                inner()
+                outbound("x", "tcp", host)
+        '''}
+    for name, src in bad.items():
+        got = outbound_bypasses(ast.parse(textwrap.dedent(src)))
+        assert got, f"{name}: not seen"
+    ok = '''
+        def local(path, exe):
+            subprocess.Popen(["xdg-open", path])
+            cmd = [exe, "-m", "pip", "install", "x"]
+            LOG.info("running %s", " ".join(cmd))
+        def gated(host):
+            outbound("x", "tcp", host)
+            def inner():
+                socket.create_connection((host, 443))
+            inner()
+        '''
+    got = outbound_bypasses(ast.parse(textwrap.dedent(ok)))
+    assert got == [], got
+
+
+@self_test()
+def t_r6_slow_interval_is_not_sleep(ctx):
+    """Review 6 (#8): with a steady clock that stops in sleep (Windows'
+    QueryUnbiasedInterruptTime now, like Linux and macOS), a long interval
+    (a slow adapter reload) is not taken for a sleep; only when the
+    steady clock counts sleep too does the length decide. A clock step
+    is written to the log."""
+    iv = 15.0
+    assert wake_check(100, 100, 100, iv) == (False, 0.0)
+    assert wake_check(100, 100, 100, iv, mono_counts_sleep=True)[0]
+    assert wake_check(3615, 15, 3615, iv) == (True, 0.0)
+    secs, counts = steady_clock()
+    assert isinstance(secs, float) and secs > 0
+    assert counts is False or IS_WINDOWS
+    if awake_clock() is None:
+        return
+    lines = []
+
+    class H(logging.Handler):
+        def emit(self, rec):
+            lines.append(rec.getMessage())
+    h = H()
+    LOG.addHandler(h)
+    got = []
+    w = NetworkWatcher(got.append, interval=0.5)
+    w._wall -= 120
+    w.start()
+    try:
+        for _ in range(100):
+            if got:
+                break
+            time.sleep(0.05)
+    finally:
+        w.stop_flag = True
+        w.join(5)
+        LOG.removeHandler(h)
+    assert got and not got[0]["resumed"], got[:1]
+    assert any("clock was changed by +1" in x for x in lines), lines
+
+
+@self_test()
+def t_r6_welcome_fits_the_work_area(ctx):
+    """Review 6 (#9): the Welcome Center grows only inside the work area
+    with its title bar counted (on a 1366x768 screen with a 40-pixel
+    taskbar its bottom row ended under the taskbar)."""
+    work, deco = (0, 0, 1366, 728), 31
+    geo = welcome_fit_geometry(760, 560, 400, 303, 53, work, deco)
+    m = re.match(r"(\d+)x(\d+)\+(\d+)\+(\d+)", geo)
+    w, h, x, y = (int(v) for v in m.groups())
+    assert w == 760 and x == 303 and h > 560, geo
+    assert y >= work[1] and y + deco + h <= work[3], geo
+    assert welcome_fit_geometry(760, 689, 400, 0, 0, work, deco) == ""
+    # a taskbar on top: the window starts below it
+    geo = welcome_fit_geometry(760, 560, 400, 0, 0, (0, 48, 1366, 768), 31)
+    y = int(geo.rsplit("+", 1)[1])
+    assert y >= 48, geo
+
+
+@self_test()
+def t_r6_history_index_failures(ctx):
+    """Review 6 (#10): an index the writer can't build is tried once more
+    when idle, and no failure there ends the writer (a MemoryError left
+    history silently off). A read that meets a busy file is not recorded
+    as a broken history."""
+    class Proxy:
+        def __init__(self, con, fails):
+            self._con, self._fails = con, fails
+
+        def execute(self, sql, *a):
+            if sql.startswith("CREATE INDEX") and self._fails:
+                self._fails.pop()
+                raise MemoryError("simulated")
+            return self._con.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(self._con, name)
+
+    class Flaky(Store):
+        def _connect(self):
+            return Proxy(Store._connect(self), [1])
+
+    st = Flaky(ctx.path("r6idx.db"))
+    try:
+        assert st.write_events([{"when": time.time(), "kind": "x",
+                                 "text": "t"}]) and st.flush_now(10)
+        assert st._thread.is_alive()
+        t_end = time.time() + 10
+        while not st.indexes_ok and time.time() < t_end:
+            time.sleep(0.1)
+        assert st.indexes_ok
+        idx = {r[0] for r in st.query(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+        assert {"obs_session", "events_session"} <= idx, idx
+
+        def busy():
+            raise sqlite3.OperationalError("database is locked")
+        st._reader = busy
+        st.error = ""
+        assert st.query("SELECT 1") == [] and st.error == "", st.error
+    finally:
+        st.stop(wait=5)
+
+
+@self_test()
+def t_r6_self_test_names(ctx):
+    """Review 6 (#11): --self-test NAME takes the name as printed (spaces),
+    reports names that match nothing (exit 2) and runs a slow test that
+    was asked for by name even with --quick."""
+    w = self_test_wanted("story process hit rate, nosuch")
+    assert w("t_story_process_hit_rate") and not w("t_other")
+    assert w.unmatched() == ["nosuch"], w.unmatched()
+    ran = []
+
+    def t_r6_probe_slow(_ctx):
+        ran.append(1)
+    SELF_TESTS.append((t_r6_probe_slow, True))
+    argv = list(sys.argv)
+    try:
+        sys.argv.append("--quick")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = run_self_tests(verbose=True, only="r6 probe slow")
+        assert rc == 0 and ran == [1], (rc, ran, out.getvalue()[-300:])
+        with contextlib.redirect_stdout(out):
+            rc = run_self_tests(verbose=True,
+                                only="r6_probe_slow,no_such_test")
+        assert rc == 2 and "no_such_test" in out.getvalue(), rc
+    finally:
+        sys.argv[:] = argv
+        SELF_TESTS.remove((t_r6_probe_slow, True))
 
 
 # ============================================================================
@@ -83928,6 +84765,73 @@ def gt_534_m17_layout(app, ctx):
         _gui_pump(root, 0.4)
 
 
+@gui_test_step("review 6: the Inspector's refreshes keep no bindings; a "
+               "table narrowed for a small window saves its own widths")
+def gt_r6_inspector_and_saved_widths(app, ctx):
+    root = app.root
+    reg = app.model.registry
+    keys = [d.key for d in reg.by_key.values()]
+    assert keys, "no device to inspect"
+    key = max(reg.by_key.values(), key=lambda d: len(d.websites)).key
+    was = app.inspector_visible
+    app.inspect("device", key)
+    _gui_pump(root, 0.3)
+    txt = app.inspector.txt
+    n0 = len(getattr(txt, "_tclCommands", None) or ())
+    for _ in range(40):
+        app.inspector.refresh()
+    n1 = len(getattr(txt, "_tclCommands", None) or ())
+    assert n1 - n0 <= 2, f"the Inspector kept {n1 - n0} commands in 40 " \
+        "refreshes"
+    assert app.inspector._tlinks.fns, "no link in the device view"
+    if not was:
+        app.toggle_inspector(False, remember=False)
+    # widths: fixed columns given up for a narrow window are saved whole
+    geo0 = root.geometry()
+    name = None
+    for nm, tb in app.tabs.items():
+        kt, tr = getattr(tb, "kit", None), getattr(tb, "tree", None)
+        if kt is None or tr is None or str(tr.cget("xscrollcommand")):
+            continue
+        cols = [c for c in tr["columns"]]
+        if any(int(tr.column(c, "stretch")) for c in cols) and \
+                sum(int(tr.column(c, "width")) for c in cols
+                    if not int(tr.column(c, "stretch"))) > 500:
+            name = nm
+            break
+    assert name, "no table that shares its width"
+    tab = app._select_tab(name)
+    tree, kit = tab.tree, tab.kit
+    min0 = root.minsize()
+    try:
+        root.minsize(400, 300)
+        root.geometry("1920x1080")
+        _gui_pump(root, 0.6)
+        fixed = [c for c in tree["displaycolumns"]
+                 if c in tree["columns"] and
+                 not int(tree.column(c, "stretch"))]
+        full = {c: int(tree.column(c, "width")) for c in fixed}
+        root.geometry("560x700")
+        _gui_pump(root, 0.8)
+        share_tree_width(tree)
+        _gui_pump(root, 0.2)
+        shrunk = [c for c in fixed if int(tree.column(c, "width")) < full[c]]
+        assert shrunk, ("nothing was narrowed", name, tree.winfo_width(),
+                        {c: (int(tree.column(c, "width")),
+                             int(tree.column(c, "stretch")),
+                             tree.heading(c, "text"))
+                         for c in tree["displaycolumns"]})
+        kit.save()
+        saved = (app.config.get("appearance.tables") or {}).get(
+            kit.table_id, {}).get("widths", {})
+        assert all(int(saved.get(c, 0)) == full[c] for c in fixed), \
+            ({c: saved.get(c) for c in fixed}, full)
+    finally:
+        root.minsize(*min0)
+        root.geometry(geo0)
+        _gui_pump(root, 0.4)
+
+
 @gui_test_step("every action 5.0.2 could reach is still reachable")
 def gt_reachable(app, ctx):
     app.mode_ui_var.set("Advanced")
@@ -84719,6 +85623,36 @@ def _start_and_exit(root, app):
     except (KeyError, ValueError):
         secs = 1.0
     root.after(int(secs * 1000), done)
+
+
+def screen_work_area(win):
+    """(left, top, right, bottom) of the part of the screen windows may
+    use: on Windows without the taskbar (SPI_GETWORKAREA), elsewhere the
+    screen less a typical panel. (review 6)"""
+    sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+    if IS_WINDOWS:
+        with contextlib.suppress(Exception):
+            import ctypes
+            from ctypes import wintypes
+            r = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(
+                    0x30, 0, ctypes.byref(r), 0):
+                return r.left, r.top, r.right, r.bottom
+    return 0, 0, sw, sh - 40
+
+
+def welcome_fit_geometry(width, have, extra, x, y, work, deco):
+    """(review 6) The window grown by `extra` pixels of content, as far
+    as the work area allows with its title bar (`deco` pixels) counted,
+    moved up when its bottom would leave the work area. -> a geometry
+    string, or "" when it can't grow."""
+    top, bottom = work[1], work[3]
+    room = bottom - top - deco - 8
+    want = min(have + extra, room)
+    if want <= have:
+        return ""
+    y = max(top, min(y, bottom - want - deco - 8))
+    return f"{width}x{want}+{x}+{y}"
 
 
 def _center_window(win, w, h):
