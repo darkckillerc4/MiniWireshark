@@ -77253,10 +77253,14 @@ def t_m4_compiled_start_exclusions(ctx):
     plain = dict(IS_WINDOWS=True, FROZEN=False, TOOL_MODE=False,
                  _ELEV=False, SAFE_MODE=False, MW_STAGE="",
                  compiled_copy_path=lambda: fresh)
+    if not IS_WINDOWS:
+        # the copy's folder check is Windows' own (it refuses a POSIX
+        # folder once IS_WINDOWS is faked): on Linux and macOS the start
+        # rules are checked with the trust check standing in as passed
+        plain["compiled_copy_trusted"] = lambda path: path == fresh
     with _b9_patched(globals(), **plain):
-        if IS_WINDOWS:               # the copy's folder check is Windows'
-            assert compiled_start_wanted([], {})
-            assert compiled_start_wanted(["--demo"], {})
+        assert compiled_start_wanted([], {})
+        assert compiled_start_wanted(["--demo"], {})
         for name, value in (("IS_WINDOWS", False), ("FROZEN", True),
                             ("TOOL_MODE", True), ("_ELEV", True),
                             ("SAFE_MODE", True), ("MW_STAGE", "app")):
