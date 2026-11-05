@@ -8267,7 +8267,8 @@ def _mcast_or_bcast(ip):
     a = ip_obj(ip)
     if a is None:
         return False
-    return a.is_multicast or ip == "255.255.255.255" or a.is_unspecified
+    return a.is_multicast or str(a) == "255.255.255.255" or \
+        a.is_unspecified
 
 
 # 5.3.4 (M13): asked for every packet's destination
@@ -69369,9 +69370,8 @@ def t_ip004_route_pick_acts(ctx):
     nics = [card("A", "Realtek PCIe GbE Family Controller", g1),
             card("B", "Intel(R) Wi-Fi 6 AX201", g2)]
     vpn = [card("wg0", "WireGuard Tunnel", g1), nics[1]]
-    old_conf, old_flag = globals().get("conf"), FEATURES.get("route_pick")
-    try:
-        FEATURES["route_pick"] = True
+    with _b9_patched(globals(), conf=types.SimpleNamespace(ifaces={})), \
+            _b9_patched(FEATURES, route_pick=True):
         assert order(nics, "B", npf_device_name(g1))[0] == "A"
         assert order(nics, "B", npf_device_name(g1).lower())[0] == "A"
         assert order(nics, "B", "")[0] == "B"
@@ -69384,9 +69384,6 @@ def t_ip004_route_pick_acts(ctx):
         assert order(nics, "B", None)[0] == "B"
         assert order(nics, "B", npf_device_name(g1))[0] == "B"
         assert order(vpn, "wg0", npf_device_name(g1))[0] == "wg0"
-    finally:
-        globals()["conf"] = old_conf
-        FEATURES["route_pick"] = old_flag
 
 
 @self_test()
@@ -82076,6 +82073,19 @@ def t_534_sec_durable_writes_leave_no_temp(ctx):
     with open(pc, "rb") as f:
         assert struct.unpack("<I", f.read()[24:28])[0] == 5
 
+    def held(src, dst):
+        raise PermissionError(13, "held")
+    with _b9_patched(os, replace=held):
+        try:
+            write_raw_pcap(pc, [(b"\x01" * 60, 7.0, 1)] * 3)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("a failed pcap write was reported as done")
+    assert sorted(os.listdir(folder)) == ["a.txt", "b.pcap"]
+    with open(pc, "rb") as f:
+        assert struct.unpack("<I", f.read()[24:28])[0] == 5
+
 
 # ---- 5.3.4 review (B9): trust checks, capture rights and pure helpers -------
 _B9_MISSING = object()
@@ -82379,6 +82389,7 @@ def t_b9_is_multicast_or_broadcast(ctx):
         assert not is_multicast_or_broadcast(ip), ip
     assert is_multicast_or_broadcast(ipaddress.ip_address("224.0.0.1"))
     assert not is_multicast_or_broadcast(ipaddress.ip_address("10.0.0.1"))
+    assert is_multicast_or_broadcast(ipaddress.ip_address("255.255.255.255"))
 
 
 @self_test()
@@ -85421,16 +85432,16 @@ def run_gui_test(live=False):
 def write_raw_pcap(path, frames):
     """Write (raw, ts, linktype) frames to a classic pcap file (stdlib)."""
     lt = frames[0][2] if frames else 1
-    part = f"{path}.part"
-    with open(part, "wb") as f:
-        f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 262144, lt))
-        for raw, ts, _lt in frames:
-            sec = int(ts)
-            usec = int(round((ts - sec) * 1e6)) % 1000000
-            f.write(struct.pack("<IIII", sec & 0xffffffff, usec, len(raw),
-                                len(raw)))
-            f.write(raw)
-    os.replace(part, path)
+    out = bytearray(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 262144,
+                                lt))
+    for raw, ts, _lt in frames:
+        sec = int(ts)
+        usec = int(round((ts - sec) * 1e6)) % 1000000
+        out += struct.pack("<IIII", sec & 0xffffffff, usec, len(raw),
+                           len(raw))
+        out += raw
+    # review: a failed write leaves the old file and no partial one
+    atomic_write_bytes(path, bytes(out))
 
 
 def startup_sanity_checks():
