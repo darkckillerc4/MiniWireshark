@@ -79,3 +79,20 @@ jobs:
           MINIWIRESHARK_DATA: ${{ runner.temp }}\mw-gui-data
           MINIWIRESHARK_CONFIG: ${{ runner.temp }}\mw-gui-config.json
         run: python -X faulthandler miniwireshark.py --gui-test
+
+  # real macOS: the arp output, symlink and permission paths run there for
+  # real instead of mocked (court batch 3)
+  self-test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install capture library
+        run: python -m pip install "scapy>=2.5" psutil
+      - name: Self-test
+        env:
+          MINIWIRESHARK_DATA: ${{ runner.temp }}/mw-data
+          MINIWIRESHARK_CONFIG: ${{ runner.temp }}/mw-config.json
+        run: python miniwireshark.py --self-test
