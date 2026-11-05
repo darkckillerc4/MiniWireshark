@@ -38,6 +38,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 **Speed and memory**
 
+- **Faster start on Windows.** The window now starts from the saved compiled copy, as on Linux and macOS. On a Windows PC the first start went from about 14 to under 5 seconds, and the window's memory from about 440 to about 220 MB.
 - Packets are analysed about a fifth faster (69 instead of 87 microseconds each on the home test network).
 - When a live capture can't keep up, deep analysis pauses and packets are only counted, with a plain line saying so. It comes back after 5 calm seconds.
 - Memory stays flatter over long runs. In an 80-minute stress replay it grows 5.3 MB an hour after the first hour (it was 7.5), and no freeze is longer than half a second. Past 500 departed devices, the oldest unnamed ones leave memory.
@@ -58,7 +59,6 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 **Not in this release**
 
-- **Faster start on Windows** (starting from a saved compiled copy, as Linux and macOS do) was planned but not built: it first needs measurements on a real Windows PC. Windows starts as in 5.2.3.
 - Device fingerprints from DHCP request lists ship without built-in rows until real captures of your own devices are available.
 - The route-aware network-card pick on Windows only writes to the log for now.
 
@@ -149,7 +149,8 @@ Layout and loading bug campaign. A crawler opened every tab, view, dialog and se
 
 - The original "super noob-friendly" single-file packet sniffer. It handles elevation, dependency and driver installs, network-card choice, LAN discovery (ARP, mDNS, SSDP), self-healing capture and a paced plain-English feed.
 
-[Unreleased]: https://github.com/darkckillerc4/MiniWireshark/pull/1
+[5.3.4]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.3.4
+[5.2.3]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.2.3
 [5.1.2]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.1.2
 [5.0.2]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.0.2
 [5.0.1]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.0.1
