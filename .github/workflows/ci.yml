@@ -32,7 +32,7 @@ jobs:
 
   gui-test:
     # the real window, driven step by step under a virtual display
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -44,7 +44,9 @@ jobs:
         env:
           MINIWIRESHARK_DATA: ${{ runner.temp }}/mw-data
           MINIWIRESHARK_CONFIG: ${{ runner.temp }}/mw-config.json
-        run: xvfb-run -a -s "-screen 0 1920x1080x24" python miniwireshark.py --gui-test
+        run: |
+          sudo apt-get install -y xvfb > /dev/null
+          xvfb-run -a -s "-screen 0 1920x1080x24" python -X faulthandler miniwireshark.py --gui-test
 
   windows:
     # the Windows-only paths (compiled start and hand-off, notifier,
@@ -72,4 +74,4 @@ jobs:
         env:
           MINIWIRESHARK_DATA: ${{ runner.temp }}\mw-gui-data
           MINIWIRESHARK_CONFIG: ${{ runner.temp }}\mw-gui-config.json
-        run: python miniwireshark.py --gui-test
+        run: python -X faulthandler miniwireshark.py --gui-test
