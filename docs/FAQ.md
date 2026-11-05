@@ -19,11 +19,14 @@ No. It is MIT licensed.
 **Does it send my data anywhere?**
 No telemetry. Everything MiniWireshark itself sends (downloads, update checks, health checks, discovery probes, optional lookups) goes through one gate and is listed in the self-traffic ledger in **Settings → Privacy & Lookups**. The kill switch there blocks all of it.
 
+**Does it contact anything by itself?**
+Once a day it asks the official GitHub page for the latest version number: one request to `api.github.com`, with nothing about you. It only ever points you to <https://github.com/darkckillerc4/MiniWireshark/releases>, because other download sites may be fake. Turn it off in **Settings → Updates & Dependencies**; the kill switch and Safe Mode stop it too.
+
 **Does it store passwords it sees?**
-No. Mail logins, passwords and message bodies are dropped inside the parsers before anything is stored. A canary test checks reports, sessions, CSV files, logs, history and the clipboard for leaks.
+No. Mail logins, passwords and message bodies are dropped inside the parsers before anything is stored. A canary test checks reports, sessions, CSV files, logs, history and the clipboard for leaks. When a login is sent without encryption, the *Login sent without encryption* warning says who and where, never the password.
 
 **Can I share a report safely?**
-Turn on redaction when you export. Real names and addresses are replaced with documentation-range pseudonyms. Saved stream text is always redacted.
+Use **Export → Network check-up…**: names and addresses are hidden by default. For the full report, turn on redaction when you export: real names and addresses are replaced with documentation-range pseudonyms. Saved stream text is always redacted.
 
 ## It doesn't capture anything
 
@@ -31,10 +34,10 @@ Turn on redaction when you export. Real names and addresses are replaced with do
 Install [Npcap](https://npcap.com/). MiniWireshark offers to do it on the loading screen. Then restart MiniWireshark.
 
 **Linux: permission denied.**
-Run it with `sudo`, or give the capability to the Python you use, for example `sudo setcap cap_net_raw,cap_net_admin=eip "$(readlink -f "$(command -v python3)")"`. That applies to every script run with that Python.
+MiniWireshark asks for your password when you start watching. If you said no, choose **Start watching** again. To never be asked, give the capability to the Python you use, for example `sudo setcap cap_net_raw,cap_net_admin=eip "$(readlink -f "$(command -v python3)")"`. That applies to every script run with that Python.
 
 **macOS: no packets.**
-MiniWireshark needs read access to `/dev/bpf*`. Wireshark's *ChmodBPF* helper sets this up, or run it with `sudo`.
+MiniWireshark needs read access to `/dev/bpf*`. Wireshark's *ChmodBPF* helper sets this up; otherwise MiniWireshark asks for the administrator password when you start watching.
 
 **I only see my own computer's traffic.**
 That is normal on Wi-Fi and switched networks: each computer mostly sees its own traffic plus broadcasts. The **vantage meter** shows this. To see other devices' traffic you need a mirror (SPAN) port, a hub, monitor-mode Wi-Fi, or a connector such as Pi-hole or AdGuard Home for DNS.
@@ -48,13 +51,13 @@ Turn off **Settings → Capture → Choose the network card automatically** and 
 That is on purpose. Safe Mode turns off auto-capture, history, update checks and automatic downloads so you can reach the window. Open **Diagnostics** to see what failed, or run `python miniwireshark.py --boot-check`.
 
 **The first start is slow.**
-The first start installs packages and compiles the file. From 5.1.2 the compiled copy is cached, so later starts are faster.
+The first start installs packages and compiles the file. On Linux and macOS the compiled copy is cached, so later starts are faster. On Windows every start still compiles the file.
 
 **Something is broken and I don't know what.**
-Use **Settings → General → Repair MiniWireshark**. It checks components, reference lists, the history database, the settings file and the capture engine, then says what it fixed.
+Look at the **Ready?** list in the Welcome Center first: each problem has a fix button. Or use **Settings → General → Repair MiniWireshark**. It checks components, reference lists, the history database, the settings file and the capture engine, then says what it fixed.
 
 **The window is slow on a busy network.**
-Try **Settings → Performance**: lower the memory cap, or set **When it falls behind** to Strict. Full Power uses more processor cores for the deep pass.
+Try **Settings → Performance**: lower the memory cap, or set **When it falls behind** to Strict. Full Power uses more processor cores for the deep pass. When a live capture can't keep up, MiniWireshark pauses deep analysis by itself and says so; it comes back after a few calm seconds.
 
 ## Reporting a problem
 

@@ -1,8 +1,8 @@
 # Screenshots
 
-Every tab of MiniWireshark 5.1.2, taken in **Demo Mode**: the data is simulated and every name is a reserved `.example` name. Nothing was captured.
+Every tab of MiniWireshark, taken with 5.1.2 in **Demo Mode**: the data is simulated and every name is a reserved `.example` name. Nothing was captured.
 
-The pictures follow your GitHub theme: switch between light and dark to see both. All 28 files are in [`assets/screens/`](assets/screens/).
+The pictures follow your GitHub theme: switch between light and dark to see both. All 28 files are in [`assets/screens/`](assets/screens/). The screens added in 5.3.4 (Ready?, Story mode, Unusual activity, the Calls card and the Network check-up) are not pictured yet; `python miniwireshark.py --gui-shots DIR` takes fresh pictures of every tab.
 
 ## Dashboard
 

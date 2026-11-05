@@ -35,6 +35,9 @@ jobs:
       - name: Publish and record
         env:
           GH_TOKEN: ${{ github.token }}
+          # signs the release (miniwireshark.manifest.json) only when the
+          # owner has added this secret; without it nothing changes
+          MW_RELEASE_KEY: ${{ secrets.MW_RELEASE_KEY }}
         run: python3 .github/scripts/release_current.py ${{ inputs.dry_run && '--dry-run' || '' }}
       - name: Commit the version index
         if: ${{ !inputs.dry_run }}
@@ -43,4 +46,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898237+github-actions[bot]@users.noreply.github.com"
           git commit -am "Record release $(grep -oP '^SCRIPT_VERSION = "\K[^"]+' miniwireshark.py) in the version index"
+          git pull --rebase
           git push

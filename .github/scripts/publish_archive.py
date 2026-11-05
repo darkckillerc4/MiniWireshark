@@ -59,6 +59,10 @@ def main():
         target = subprocess.check_output(
             ["git", "rev-parse", e["target"] + "^{commit}"], cwd=ROOT,
             text=True).strip()
+        # 5.3.4 (OS-08): a missing notes file stops everything before
+        # anything is published, not halfway through
+        if not os.path.exists(os.path.join(NOTES, e["tag"] + ".md")):
+            sys.exit(f"{e['tag']}: no release notes in {NOTES}")
         staged.append((e, asset, target))
         print(f"verified {e['tag']:<14} {e['asset']:<30} {digest[:16]}")
     for e, asset, target in staged:

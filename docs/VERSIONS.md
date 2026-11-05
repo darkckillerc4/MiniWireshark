@@ -23,7 +23,7 @@ The checksums match the owner's offline archive (`All_MiniWireshark_Version`).
 
 ## How the releases are published
 
-All ten versions are published on the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases), each with its `.py` file and a `.sha256` file. 5.1.2 is marked *latest*; 4.0.0-dev and 5.1.2-rc.5 are pre-releases.
+Every version in the table is published on the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases), each with its `.py` file and a `.sha256` file. The row marked *latest* is the one GitHub shows as latest; rows marked *pre-release* never become latest.
 
 They were created by the **Publish archived releases** workflow, which only runs when started by hand:
 

@@ -22,12 +22,12 @@ Check it with `python --version` (Windows: `py --version`).
 3. Check the file. The two values must match:
 
    ```bash
-   sha256sum miniwireshark-5.1.2.py          # Linux
-   shasum -a 256 miniwireshark-5.1.2.py      # macOS
+   sha256sum miniwireshark-<version>.py          # Linux
+   shasum -a 256 miniwireshark-<version>.py      # macOS
    ```
 
    ```powershell
-   Get-FileHash -Algorithm SHA256 .\miniwireshark-5.1.2.py   # Windows
+   Get-FileHash -Algorithm SHA256 .\miniwireshark-<version>.py   # Windows
    ```
 
    Every version's checksum is also listed in the [version index](VERSIONS.md).
@@ -42,10 +42,10 @@ python miniwireshark.py            # Windows: py miniwireshark.py
 
 The loading screen then:
 
-1. Lists what it wants to download (capture library, optional extras) and lets you choose. It carries on by itself after a short countdown.
+1. Lists what it wants to download (capture library, optional extras) and waits for you to choose. Nothing is downloaded before you answer, and Demo Mode downloads nothing.
 2. Installs Python packages (scapy, and optionally psutil and cryptography) into **a private, per-Python folder**. Your system Python is never changed.
 3. On Windows, offers to install [Npcap](https://npcap.com/), the capture driver. With Npcap, capture works without administrator rights.
-4. Picks the best network card and opens the **Welcome Center**, where you choose between watching your network and the demo.
+4. Picks the best network card and opens the **Welcome Center**, where you choose between watching your network and the demo. Its **Ready?** list says whether the capture driver, capture permission, network card, data folder and history are ready, with a fix button for each problem. `--boot-check` prints the same list without opening the window.
 
 If the capture driver is missing or refused, MiniWireshark opens in **limited mode**. You can still open saved sessions, capture files and the demo.
 
@@ -55,7 +55,9 @@ If the capture driver is missing or refused, MiniWireshark opens in **limited mo
 |---|---|
 | Windows | Npcap. MiniWireshark offers to install it. |
 | Linux | root, or the `CAP_NET_RAW` capability on the Python you run it with |
-| macOS | read access to `/dev/bpf*` (for example with Wireshark's *ChmodBPF* helper) |
+| macOS | read access to `/dev/bpf*` (for example with Wireshark's *ChmodBPF* helper), or root |
+
+On Linux and macOS, MiniWireshark no longer restarts itself as root when it starts. When you start watching and the computer doesn't already allow capture, it asks for your password once. If you say no, it carries on without live capture. The demo, the help and capture files never ask. `--no-elevate` stops it from asking at all.
 
 ## Try it without capturing
 
@@ -72,6 +74,8 @@ The application stays one file. Everything it creates goes into one data folder:
 1. `miniwireshark_data/` next to the script, if that folder is writable (portable mode).
 2. Otherwise the per-user folder: `%LOCALAPPDATA%\MiniWireshark` (Windows), `~/Library/Application Support/MiniWireshark` (macOS), or `~/.local/share/miniwireshark` (Linux).
 
+On Linux and macOS the data folder is closed to other users (mode 0700). A folder that belongs to someone else, or that others can write to, is skipped. Files written while capture runs as root are handed back to you.
+
 Settings are saved in `miniwireshark_config.json`. Two environment variables move these files, which is useful for tests:
 
 ```bash
@@ -82,11 +86,17 @@ The data folder holds logs, saved sessions and the autosave, the optional histor
 
 ## Updating
 
-Download the new release and replace the file. Settings, history and sessions are kept, because they live in the data folder. MiniWireshark can also check for Ed25519-signed updates itself (**Settings → Updates & Dependencies**). If an update fails to start, the next start rolls it back.
+Download the new release and replace the file. Settings, history and sessions are kept, because they live in the data folder. Download it only from <https://github.com/darkckillerc4/MiniWireshark/releases>: other sites may offer fake copies. MiniWireshark checks that page for a new version once a day and tells you when one is out (**Settings → Updates & Dependencies**, where you can turn it off); it installs an update itself only when it is Ed25519-signed. If an update fails to start, the next start rolls it back.
 
 ## Uninstalling
 
-Delete `miniwireshark.py` and the data folder above. If you installed Npcap only for MiniWireshark, remove it from Windows' *Installed apps*.
+Delete `miniwireshark.py` and the data folder above. A few things live outside that folder, so delete them too:
+
+- `miniwireshark_config.json` (and `miniwireshark_config.json.bak`) next to `miniwireshark.py`, when that folder is writable.
+- scapy's own cache: `~/.cache/scapy` on Linux and macOS, `%LOCALAPPDATA%\scapy` on Windows.
+- Passwords you saved for a Pi-hole or AdGuard Home helper are in your system's keychain (Windows Credential Manager, macOS Keychain, or the Linux secret service), under "MiniWireshark". Remove them there, or remove each helper in MiniWireshark before you uninstall (removing a helper deletes its saved password).
+
+If you installed Npcap only for MiniWireshark, remove it from Windows' *Installed apps*.
 
 ## Command-line switches
 
@@ -97,9 +107,13 @@ Delete `miniwireshark.py` and the data folder above. If you installed Npcap only
 | `--boot-check` | Check this computer's setup and exit, without opening the window |
 | `--no-elevate` | Never ask for administrator rights |
 | `--yes` | Accept the download list without asking (unattended start) |
-| `--self-test` | Run the built-in test suite. No capture or admin rights needed |
+| `--self-test [NAME]` | Run the built-in test suite, or only the tests named (comma-separated). No capture or admin rights needed |
 | `--gui-test` | Drive the real window through every tab. Needs a display (`xvfb-run -a` on a headless Linux) |
 | `--bench-gui S1 S2` | Window-performance benchmark against fixed budgets |
 | `--release-gate` | All tests, the benchmark and pictures of every tab, written to one folder you can send back |
+| `--help` | List every switch and exit |
+| `--version` | Print the version and exit |
+
+An unknown switch, or a switch missing its value, ends with a one-line explanation before anything starts.
 
 Two failed starts in a row switch the next start to Safe Mode automatically.
