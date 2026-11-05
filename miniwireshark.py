@@ -81961,6 +81961,643 @@ def t_534_sec_durable_writes_leave_no_temp(ctx):
         assert struct.unpack("<I", f.read()[24:28])[0] == 5
 
 
+# ---- 5.3.4 review (B9): trust checks, capture rights and pure helpers -------
+_B9_MISSING = object()
+
+
+@contextlib.contextmanager
+def _b9_patched(where, **values):
+    """Test helper: set names on a module or object, or keys in a mapping
+    (globals(), os.environ; None removes the key), and put back what was
+    there afterwards (removing what wasn't)."""
+    mapping = hasattr(where, "__setitem__")
+    old = {k: where.get(k, _B9_MISSING) if mapping else
+           getattr(where, k, _B9_MISSING) for k in values}
+    try:
+        for k, v in values.items():
+            if not mapping:
+                setattr(where, k, v)
+            elif v is None:
+                where.pop(k, None)
+            else:
+                where[k] = v
+        yield
+    finally:
+        for k, v in old.items():
+            if v is not _B9_MISSING:
+                if mapping:
+                    where[k] = v
+                else:
+                    setattr(where, k, v)
+            elif mapping:
+                where.pop(k, None)
+            else:
+                with contextlib.suppress(AttributeError):
+                    delattr(where, k)
+
+
+@self_test()
+def t_b9_compiled_copy_trusted(ctx):
+    """B9: Windows keeps a compiled copy only under LOCALAPPDATA (not a
+    look-alike folder beside it, nothing when it is unset); root never
+    does; POSIX needs a private folder that exists."""
+    lad = ctx.path("lad")
+    with _b9_patched(globals(), IS_WINDOWS=True):
+        with _b9_patched(os.environ, LOCALAPPDATA=lad):
+            assert compiled_copy_trusted(os.path.join(lad, "b", "c.pyc"))
+            assert not compiled_copy_trusted(ctx.path("other.pyc"))
+            assert not compiled_copy_trusted(lad + "2" + os.sep + "c.pyc")
+        with _b9_patched(os.environ, LOCALAPPDATA=None):
+            assert not compiled_copy_trusted(os.path.join(lad, "c.pyc"))
+    with _b9_patched(globals(), IS_WINDOWS=False), \
+            _b9_patched(os, geteuid=lambda: 0):
+        assert not compiled_copy_trusted(os.path.join(lad, "c.pyc"))
+    if IS_WINDOWS or os.geteuid() == 0:
+        return
+    folder = ctx.path("b9cc")
+    assert not compiled_copy_trusted(os.path.join(folder, "c.pyc"))
+    os.makedirs(folder, mode=0o700)
+    os.chmod(folder, 0o700)
+    assert compiled_copy_trusted(os.path.join(folder, "c.pyc"))
+    os.chmod(folder, 0o770)
+    assert not compiled_copy_trusted(os.path.join(folder, "c.pyc"))
+
+
+@self_test()
+def t_b9_install_key_rejects_foreign(ctx):
+    """B9 (RT-01): install_key makes one 32-byte key and keeps returning
+    it; a key it can't trust is never returned (create=False says None,
+    create=True replaces it); a short key is replaced. POSIX: the new key
+    is 0600, and with an owner it can't trust it gives up (None)."""
+    folder = ctx.path("b9k")
+    os.makedirs(folder)
+    path = os.path.join(folder, "install.key")
+    planted = b"P" * 32
+
+    def put(data):
+        with open(path, "wb") as f:
+            f.write(data)
+
+    def read():
+        with open(path, "rb") as f:
+            return f.read()
+
+    def trusted(p):                  # stands for "private, a trusted owner"
+        return os.path.exists(p) and read() != planted
+    with _b9_patched(globals(), PATHS=types.SimpleNamespace(data=folder)):
+        with _b9_patched(globals(), private_file_ok=trusted):
+            assert install_key(create=False) is None
+            assert not os.path.exists(path)
+            k = install_key()
+            assert len(k) == 32 and install_key() == k == read()
+            assert install_key(create=False) == k
+            put(planted)
+            assert install_key(create=False) is None
+            k2 = install_key()
+            assert len(k2) == 32 and k2 not in (k, planted) and \
+                read() == k2
+            put(b"short")
+            assert install_key(create=False) is None
+            k3 = install_key()
+            assert len(k3) == 32 and read() == k3
+        if IS_WINDOWS:
+            return
+        assert install_key(create=False) == k3
+        os.chmod(path, 0o644)
+        assert install_key(create=False) is None
+        k4 = install_key()
+        assert k4 != k3 and stat.S_IMODE(os.stat(path).st_mode) == 0o600
+        put(planted)
+        with _b9_patched(globals(),
+                         trusted_uids=lambda: {os.geteuid() + 1}):
+            assert install_key() is None
+        assert not os.path.exists(path) or read() != planted
+
+
+@self_test()
+def t_b9_give_back_tree_mocked(ctx):
+    """B9 (OS-02): an elevated run hands back only root-owned entries of
+    the tree, without following links; a refused chown doesn't stop the
+    rest; with nobody to hand back to, nothing is changed."""
+    d = ctx.path("b9gb")
+    os.makedirs(os.path.join(d, "sub"))
+    for rel in ("a.json", os.path.join("sub", "b.db")):
+        with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
+            f.write("x")
+    root_owned = {d, os.path.join(d, "sub", "b.db")}
+    calls, done = [], []
+    real_lstat = os.lstat
+
+    def lstat(p):                    # the real entry, with a made-up owner
+        st = real_lstat(p)
+        return os.stat_result(tuple(st[:4]) + (
+            0 if p in root_owned else 1000,) + tuple(st[5:]))
+
+    def chown(p, uid, gid, follow_symlinks=True):
+        calls.append(p)
+        assert not follow_symlinks and (uid, gid) == (1000, 1001)
+        if p == d:
+            raise PermissionError(1, "refused")
+        done.append(p)
+    with _b9_patched(os, lstat=lstat, chown=chown):
+        with _b9_patched(globals(), _give_back_ids=lambda: None):
+            give_back_tree(d)
+            assert calls == []
+        with _b9_patched(globals(), _give_back_ids=lambda: (1000, 1001)):
+            give_back_tree(d)
+            give_back_tree(os.path.join(d, "missing"))
+    assert sorted(calls) == sorted(root_owned), calls
+    assert done == [os.path.join(d, "sub", "b.db")], done
+
+
+@self_test()
+def t_b9_has_capture_rights_mocked(ctx):
+    """B9 (LG-09): admin can capture; on Linux the CapEff cap_net_raw bit
+    (13) decides, and an odd or missing line or no /proc means no; macOS
+    follows whether /dev/bpf0 can be opened."""
+    def status(text):
+        def fake_open(path, *_a, **_k):
+            assert path == "/proc/self/status", path
+            if text is None:
+                raise OSError(2, "no /proc here")
+            return io.StringIO(text)
+        return fake_open
+
+    def rights(text):
+        with _b9_patched(globals(), open=status(text)):
+            return has_capture_rights()
+    with _b9_patched(globals(), is_admin=lambda: True):
+        assert has_capture_rights() is True
+    with _b9_patched(globals(), is_admin=lambda: False, IS_MAC=False):
+        assert rights("Name:\tpython3\nCapEff:\t0000000000002000\n") is True
+        assert rights("CapEff:\t0000003000003000\n") is True
+        assert rights("CapEff:\t0000000000001000\n") is False
+        assert rights("CapEff:\t0000000000000000\n") is False
+        assert rights("CapEff:\tzz\n") is False
+        assert rights("CapEff:\n") is False
+        assert rights("Name:\tpython3\n") is False
+        assert rights(None) is False
+    for ok in (True, False):
+        with _b9_patched(globals(), is_admin=lambda: False, IS_MAC=True), \
+                _b9_patched(os, access=lambda p, m: ok and
+                            p == "/dev/bpf0"):
+            assert has_capture_rights() is ok
+
+
+@self_test()
+def t_b9_l4_payload_no_ethernet_padding(ctx):
+    """B9 (S12): the UDP payload stops where the IP packet ends: Ethernet
+    padding is cut, zero bytes inside the packet are kept."""
+    if not ctx.scapy_ok:
+        return "skip"
+    for body in (b"hi", b"hi\x00\x00"):
+        built = Ether() / IP(dst="192.168.1.9") / UDP(sport=5, dport=6) / \
+            Raw(body)
+        parsed = Ether(bytes(built) + b"\x00" * 18)
+        assert len(bytes(parsed)) > len(bytes(built))
+        for pkt in (built, parsed):
+            assert _l4_payload(pkt, pkt[UDP]) == body, (body, pkt)
+
+
+@self_test()
+def t_b9_human_bytes(ctx):
+    """B9: sizes in B (whole), KB/MB/GB (one decimal), never past GB."""
+    assert _human_bytes(None) == _human_bytes(0) == "0 B"
+    assert _human_bytes(1023) == "1023 B" and _human_bytes(1024) == "1.0 KB"
+    assert _human_bytes(1536) == "1.5 KB"
+    assert _human_bytes(1048576) == "1.0 MB"
+    assert _human_bytes(5 * 2 ** 30) == "5.0 GB"
+    assert _human_bytes(3 * 2 ** 40) == "3072.0 GB"
+
+
+@self_test()
+def t_b9_human_rate(ctx):
+    """B9: rates in B/s (whole), KB/s, MB/s, GB/s (one decimal)."""
+    assert human_rate(None) == human_rate(0) == "0 B/s"
+    assert human_rate(1023) == "1023 B/s" and human_rate(1024) == "1.0 KB/s"
+    assert human_rate(2.5 * 2 ** 20) == "2.5 MB/s"
+    assert human_rate(2000 * 2 ** 30) == "2000.0 GB/s"
+
+
+@self_test()
+def t_b9_is_private_ip(ctx):
+    """B9: RFC 1918, link-local, loopback, multicast and IPv6 local
+    ranges are private; 172.32/16, public and documentation addresses
+    are not; anything that isn't an address string is not."""
+    for ip in ("192.168.1.1", "10.0.0.1", "172.16.0.1", "172.31.255.254",
+               "169.254.1.1", "127.0.0.1", "224.0.0.251", "fe80::1",
+               "fd00::1", "ff02::1", "::1"):
+        assert is_private_ip(ip), ip
+    for ip in ("172.32.0.1", "8.8.8.8", "2001:db8::1", "", None, "x", 3):
+        assert not is_private_ip(ip), ip
+
+
+@self_test()
+def t_b9_fmt_clock(ctx):
+    """B9: local time of day, with the date on request; no time is a
+    dash, an impossible one a question mark."""
+    t = time.mktime((2024, 3, 5, 14, 7, 9, 0, 0, -1))
+    assert fmt_clock(t) == "14:07:09"
+    assert fmt_clock(t, with_date=True) == "2024-03-05 14:07:09"
+    assert fmt_clock(0) == fmt_clock(None) == "—"
+    assert fmt_clock("x") == "?" and fmt_clock(-1e20) == "?"
+
+
+@self_test()
+def t_b9_is_vpn_iface(ctx):
+    """B9: tunnel names and VPN products are VPNs; a short word (tun, wg,
+    ppp, tap) only as a word of its own, so pppoe0, tape0, stun or
+    "Startup" are not."""
+    N = types.SimpleNamespace
+    for name, desc in (("tun0", ""), ("wg0", ""), ("utun3", ""),
+                       ("ppp0", ""), ("x", "WireGuard Tunnel"),
+                       ("x", "Tailscale"), ("x", "TAP-Windows Adapter V9")):
+        assert is_vpn_iface(N(name=name, description=desc)), (name, desc)
+    assert is_vpn_iface("tun0")
+    for name, desc in (("eth0", "Intel Ethernet"),
+                       ("Wi-Fi", "Intel Wi-Fi 6 AX201"), ("tape0", ""),
+                       ("pppoe0", ""), ("stun", ""),
+                       ("x", "Atheros Startup"), ("x", "Desktop adapter")):
+        assert not is_vpn_iface(N(name=name, description=desc)), (name,
+                                                                  desc)
+
+
+@self_test()
+def t_b9_is_virtual_iface(ctx):
+    """B9: VM, container, loopback, Bluetooth and WAN Miniport adapters are
+    virtual; a physical Ethernet or Wi-Fi card is not."""
+    N = types.SimpleNamespace
+    for name, desc in (("x", "VMware Virtual Ethernet Adapter for VMnet8"),
+                       ("vEthernet (WSL)", ""), ("docker0", ""),
+                       ("virbr0", ""), ("br-1a2b", ""),
+                       ("x", "Npcap Loopback Adapter"),
+                       ("x", "Bluetooth Device (Personal Area Network)"),
+                       ("x", "WAN Miniport (IP)")):
+        assert is_virtual_iface(N(name=name, description=desc)), name
+    for name, desc in (("Ethernet", "Intel(R) Ethernet I219-V"),
+                       ("Wi-Fi", "Killer Wi-Fi 6E"), ("en0", ""),
+                       ("eth0", "")):
+        assert not is_virtual_iface(N(name=name, description=desc)), name
+
+
+@self_test()
+def t_b9_iface_name_and_desc(ctx):
+    """B9: an adapter's name and description as text: a plain string is
+    its own name, a missing or None field is empty."""
+    N = types.SimpleNamespace
+    assert iface_name(N(name="eth0")) == "eth0" and iface_name("wg0") == "wg0"
+    assert iface_name(None) == "" and iface_name(N(name=None)) == ""
+    assert iface_desc(N(description="Intel")) == "Intel"
+    assert iface_desc("eth0") == "" and iface_desc(N(description=None)) == ""
+
+
+@self_test()
+def t_b9_is_multicast_or_broadcast(ctx):
+    """B9: multicast, the limited broadcast and the unspecified address
+    count; a subnet broadcast, a unicast or junk does not."""
+    for ip in ("224.0.0.251", "239.255.255.250", "255.255.255.255",
+               "0.0.0.0", "ff02::1", "::"):
+        assert is_multicast_or_broadcast(ip), ip
+    for ip in ("192.168.1.255", "192.168.1.5", "2001:db8::1", "junk", "",
+               None):
+        assert not is_multicast_or_broadcast(ip), ip
+    assert is_multicast_or_broadcast(ipaddress.ip_address("224.0.0.1"))
+    assert not is_multicast_or_broadcast(ipaddress.ip_address("10.0.0.1"))
+
+
+@self_test()
+def t_b9_sanitize_text_edges(ctx):
+    """B9: None is empty; tabs and line breaks become spaces; zero-width
+    characters, the BOM and C1 controls go; the cap is the caller's;
+    accented and CJK text is kept; non-strings become text."""
+    assert sanitize_text(None) == ""
+    assert sanitize_text("a\tb\r\nc") == "a b  c"
+    assert sanitize_text("ab​cd﻿") == "abcd"
+    assert sanitize_text("\x7f\x85z") == "z"
+    assert sanitize_text("x‮y", 10) == "xy"
+    assert sanitize_text("abcdef", 3) == "abc"
+    assert sanitize_text("café 中") == "café 中"
+    assert sanitize_text(42) == "42"
+
+
+@self_test()
+def t_b9_level_label(ctx):
+    """B9: an evidence level as glyph and word, or the glyph alone; an
+    unknown level reads "? Unknown"."""
+    assert level_label(LV_OBSERVED) == "◉ Observed"
+    assert level_label(LV_INFERRED) == "◌ Inferred"
+    assert level_label(LV_REPORTED, word=False) == "◈"
+    assert level_label("zzz") == "? Unknown"
+    assert level_label("zzz", False) == "?"
+
+
+@self_test()
+def t_b9_assoc_label(ctx):
+    """B9: how a device is tied to a website, as its level's glyph and a
+    short word; an unknown tie reads "? —"."""
+    assert assoc_label(AS_CONNECTED) == "◉ Connected"
+    assert assoc_label(AS_CONNECTED_AMBIG) == \
+        "◎ Connected (shared address)"
+    assert assoc_label(AS_INFERRED) == "◌ Possibly"
+    assert assoc_label("") == assoc_label("bogus") == "? —"
+
+
+@self_test()
+def t_b9_better_assoc(ctx):
+    """B9: the stronger of two ties wins in either order; a tie or two
+    unknown values keep the first."""
+    assert better_assoc(AS_CONNECTED, AS_INFERRED) == AS_CONNECTED
+    assert better_assoc(AS_INFERRED, AS_CONNECTED) == AS_CONNECTED
+    assert better_assoc(AS_LOOKUP_ONLY, AS_REPORTED) == AS_REPORTED
+    assert better_assoc(AS_CONNECTED_LOOKUP, AS_CONNECTED_AMBIG) == \
+        AS_CONNECTED_LOOKUP
+    assert better_assoc("bogus", "") == "bogus"
+    assert better_assoc("", "bogus") == ""
+
+
+@self_test()
+def t_b9_mail_line_label(ctx):
+    """B9: mail lines show reply codes and command names only; addresses,
+    subjects and text never appear."""
+    assert _mail_line_label(b"") == _mail_line_label(b"   ") == \
+        "(blank line)"
+    assert _mail_line_label(b"250-STARTTLS") == "reply 250- (text hidden)"
+    assert _mail_line_label(b"+OK 2 messages") == "reply +OK (text hidden)"
+    assert _mail_line_label(b"-ERR no") == "reply -ERR (text hidden)"
+    assert _mail_line_label(b"a1 OK LOGIN done") == "reply OK (text hidden)"
+    assert _mail_line_label(b"* 3 EXISTS") == \
+        "server status line (text hidden)"
+    for line, verb in ((b"MAIL FROM:<a@b.c>", "MAIL"),
+                       (b"mail from:<a@b>", "MAIL"),
+                       (b"RCPT TO:<x@y>", "RCPT"),
+                       (b"a2 FETCH 1 BODY[]", "FETCH")):
+        out = _mail_line_label(line)
+        assert out == f"command {verb} (details hidden)", (line, out)
+        assert "@" not in out
+    for line in (b"Subject: secret", b"Hello there friend", b"12345 abc"):
+        assert _mail_line_label(line) == \
+            "(content hidden: Email Traffic shows metadata only)", line
+
+
+@self_test()
+def t_b9_explain_choice_edges(ctx):
+    """B9: no card, no explanation; only bad reasons give the plain
+    fallback; good reasons keep their order."""
+    assert explain_choice(None) == "" and explain_reasons({}) == ""
+    bad = {"reasons": ["it has no IPv4 address", "it looks like a VPN/"
+                       "tunnel adapter", "it is disconnected"]}
+    assert explain_reasons(bad) == "it was the best of the available cards"
+    good = {"reasons": ["your router is on the same network",
+                        "it is disconnected",
+                        "it carries your default Internet route"]}
+    assert explain_choice(good) == ("Picked because your router is on the "
+                                    "same network, it carries your "
+                                    "default Internet route")
+
+
+@self_test()
+def t_b9_confidence_tier(ctx):
+    """B9: 60 and up High, 30 Medium, 10 Low, below that Unconfirmed."""
+    for score, tier in ((100, CONFIDENCE_HIGH), (60, CONFIDENCE_HIGH),
+                        (59.9, CONFIDENCE_MEDIUM), (30, CONFIDENCE_MEDIUM),
+                        (29, CONFIDENCE_LOW), (10, CONFIDENCE_LOW),
+                        (9, CONFIDENCE_UNCONFIRMED),
+                        (-5, CONFIDENCE_UNCONFIRMED)):
+        assert confidence_tier(score) == tier, (score, tier)
+
+
+@self_test()
+def t_b9_int_to_ip(ctx):
+    """B9: a 32-bit number as dotted IPv4, wrapped to 32 bits; a number
+    in a string works; junk is 0.0.0.0."""
+    assert _int_to_ip(0) == "0.0.0.0"
+    assert _int_to_ip(3232235777) == "192.168.1.1"
+    assert _int_to_ip(0xFFFFFFFF) == _int_to_ip(-1) == "255.255.255.255"
+    assert _int_to_ip(2 ** 32 + 1) == "0.0.0.1"
+    assert _int_to_ip("167772161") == "10.0.0.1"
+    assert _int_to_ip("x") == _int_to_ip(None) == "0.0.0.0"
+
+
+@self_test()
+def t_b9_local_subnet_for_routes(ctx):
+    """B9 (LG-08): only an on-link route of this card for this address
+    gives the subnet; a routed one, the default route, another card or
+    no address gives None (no guessed /24)."""
+    lan, mask = 0xC0A80100, 0xFFFFFF00
+    routes = [(0, 0, "192.168.1.1", "eth0", "192.168.1.5", 1),
+              (lan, mask, "192.168.1.1", "eth0", "192.168.1.5", 1),
+              (0x0A000000, 0xFF000000, "0.0.0.0", "eth0", "10.0.0.9", 1)]
+    want = ipaddress.ip_network("192.168.1.0/24")
+    with _b9_patched(globals(), conf=types.SimpleNamespace(
+            route=types.SimpleNamespace(routes=routes))):
+        assert local_subnet_for("eth0", "192.168.1.5") is None
+        routes.append((lan, mask, "0.0.0.0", "eth0", "192.168.1.5", 1))
+        assert local_subnet_for("eth0", "192.168.1.5") == want
+        assert local_subnet_for(types.SimpleNamespace(name="eth0"),
+                                "192.168.1.5") == want
+        assert local_subnet_for("", "192.168.1.5") == want
+        assert local_subnet_for("eth1", "192.168.1.5") is None
+        assert local_subnet_for("eth0", "") is None
+
+
+@self_test()
+def t_b9_private_file_ok(ctx):
+    """B9 (LG-10): a missing file is never trusted; on Windows an existing
+    one is; on POSIX only 0600 owned by a trusted user."""
+    p = ctx.path("b9pf.key")
+    assert not private_file_ok(p)
+    with open(p, "wb") as f:
+        f.write(b"k")
+    with _b9_patched(globals(), IS_WINDOWS=True):
+        assert private_file_ok(p)
+    if IS_WINDOWS:
+        return
+    os.chmod(p, 0o600)
+    assert private_file_ok(p)
+    os.chmod(p, 0o644)
+    assert not private_file_ok(p)
+    os.chmod(p, 0o600)
+    with _b9_patched(globals(), trusted_uids=lambda: {os.geteuid() + 1}):
+        assert not private_file_ok(p)
+
+
+@self_test()
+def t_b9_in_data_folder(ctx):
+    """B9: the data folder and what is under it count; a folder beside it
+    with the same start, a ".." escape, or no data folder does not."""
+    root = ctx.path("b9d")
+    os.makedirs(root)
+    with _b9_patched(globals(), PATHS=types.SimpleNamespace(data=root)):
+        assert in_data_folder(root)
+        assert in_data_folder(os.path.join(root, "site", "x.py"))
+        assert not in_data_folder(root + "2")
+        assert not in_data_folder(os.path.join(root, "..", "b9d2"))
+        assert not in_data_folder(os.path.join(root, "site", "..", ".."))
+    with _b9_patched(globals(), PATHS=types.SimpleNamespace()):
+        assert not in_data_folder(root)
+
+
+@self_test()
+def t_b9_trusted_uids(ctx):
+    """B9 (RT-01): None on Windows; normally only this user; an elevated
+    run adds the user who started it only when that user owns the
+    program file."""
+    with _b9_patched(globals(), IS_WINDOWS=True):
+        assert trusted_uids() is None
+    owner = os.stat(APP_PATH).st_uid
+    with _b9_patched(globals(), IS_WINDOWS=False), \
+            _b9_patched(os.environ, PKEXEC_UID=None, SUDO_UID=None):
+        with _b9_patched(os, geteuid=lambda: 1234):
+            assert trusted_uids() == {1234}
+        with _b9_patched(os, geteuid=lambda: 0):
+            assert trusted_uids() == {0}
+            with _b9_patched(os.environ, SUDO_UID=str(owner + 1)):
+                assert trusted_uids() == {0}
+            if owner:
+                with _b9_patched(os.environ, SUDO_UID=str(owner)):
+                    assert trusted_uids() == {0, owner}
+
+
+@self_test()
+def t_b9_invoking_uid(ctx):
+    """B9: the user behind pkexec, else sudo; a value that isn't a number
+    is skipped; neither set gives None."""
+    with _b9_patched(os.environ, PKEXEC_UID="1001", SUDO_UID="1002"):
+        assert _invoking_uid() == 1001
+    with _b9_patched(os.environ, PKEXEC_UID="x", SUDO_UID="1002"):
+        assert _invoking_uid() == 1002
+    with _b9_patched(os.environ, PKEXEC_UID=None, SUDO_UID="1002"):
+        assert _invoking_uid() == 1002
+    with _b9_patched(os.environ, PKEXEC_UID=None, SUDO_UID=None):
+        assert _invoking_uid() is None
+
+
+@self_test()
+def t_b9_give_back_ids(ctx):
+    """B9 (OS-02): files are handed back only by root, only to a trusted
+    invoking user, with SUDO_GID as the group; never on Windows."""
+    env = dict(PKEXEC_UID=None, SUDO_UID="1000", SUDO_GID="1001")
+    with _b9_patched(globals(), IS_WINDOWS=False,
+                     trusted_uids=lambda: {0, 1000}), \
+            _b9_patched(os.environ, **env):
+        with _b9_patched(os, geteuid=lambda: 0):
+            assert _give_back_ids() == (1000, 1001)
+            with _b9_patched(globals(), trusted_uids=lambda: {0}):
+                assert _give_back_ids() is None
+            with _b9_patched(os.environ, SUDO_UID=None):
+                assert _give_back_ids() is None
+        with _b9_patched(os, geteuid=lambda: 1000):
+            assert _give_back_ids() is None
+    with _b9_patched(globals(), IS_WINDOWS=True), \
+            _b9_patched(os.environ, **env):
+        assert _give_back_ids() is None
+
+
+@self_test()
+def t_b9_replace_retrying(ctx):
+    """B9 (B-10): a target held for a moment (PermissionError) is retried;
+    when it stays held the error is raised, the temporary file is removed
+    and the target is untouched."""
+    real = os.replace
+    tries = []
+
+    def held(n):
+        def fake(src, dst):
+            tries.append(dst)
+            if len(tries) <= n:
+                raise PermissionError(13, "held")
+            real(src, dst)
+        return fake
+    target = ctx.path("b9rr.json")
+    for name, text in ((target, "old"), (target + ".t1", "new")):
+        with open(name, "w", encoding="utf-8") as f:
+            f.write(text)
+    with _b9_patched(os, replace=held(2)):
+        _replace_retrying(target + ".t1", target)
+    assert len(tries) == 3 and not os.path.exists(target + ".t1")
+    with open(target + ".t2", "w", encoding="utf-8") as f:
+        f.write("newer")
+    tries.clear()
+    with _b9_patched(os, replace=held(99)):
+        try:
+            _replace_retrying(target + ".t2", target)
+        except PermissionError:
+            pass
+        else:
+            raise AssertionError("a held target was reported as written")
+    assert len(tries) == 4 and not os.path.exists(target + ".t2")
+    with open(target, encoding="utf-8") as f:
+        assert f.read() == "new"
+
+
+@self_test()
+def t_b9_iface_ipv4(ctx):
+    """B9: an adapter's own IPv4 address, else the one the system reports
+    for it; 0.0.0.0 or nothing is empty."""
+    N = types.SimpleNamespace
+    assert _iface_ipv4(N(ip="192.168.1.5")) == "192.168.1.5"
+    assert _iface_ipv4(N(ip="0.0.0.0")) == ""
+    with _b9_patched(globals(), get_if_addr=lambda i: "10.1.2.3"):
+        assert _iface_ipv4(N(ip="", name="eth0")) == "10.1.2.3"
+    with _b9_patched(globals(), get_if_addr=lambda i: "0.0.0.0"):
+        assert _iface_ipv4(N(name="eth0")) == ""
+    # False, not None: _b9_patched removes a key given None (no scapy)
+    with _b9_patched(globals(), get_if_addr=False):
+        assert _iface_ipv4(N(ip="", name="eth0")) == ""
+
+
+@self_test()
+def t_b9_iface_is_up(ctx):
+    """B9: psutil's answer first (by name or description); else the UP
+    flag off Windows; else unknown (None)."""
+    N = types.SimpleNamespace
+    up = N(name="eth0", description="", flags="UP|BROADCAST|RUNNING")
+    down = N(name="eth0", description="", flags="BROADCAST")
+
+    def broken():
+        raise OSError("no stats")
+    with _b9_patched(globals(), IS_WINDOWS=False):
+        with _b9_patched(OPTIONAL_MODULES, psutil=None):
+            assert _iface_is_up(up) is True
+            assert _iface_is_up(down) is False
+            assert _iface_is_up(N(name="eth0")) is None
+        ps = N(net_if_stats=lambda: {"eth0": N(isup=False)})
+        with _b9_patched(OPTIONAL_MODULES, psutil=ps):
+            assert _iface_is_up(up) is False
+        ps = N(net_if_stats=lambda: {"Intel": N(isup=True)})
+        with _b9_patched(OPTIONAL_MODULES, psutil=ps):
+            assert _iface_is_up(N(name="x", description="Intel",
+                                  flags="BROADCAST")) is True
+            assert _iface_is_up(down) is False
+        with _b9_patched(OPTIONAL_MODULES, psutil=N(net_if_stats=broken)):
+            assert _iface_is_up(up) is True
+    with _b9_patched(globals(), IS_WINDOWS=True), \
+            _b9_patched(OPTIONAL_MODULES, psutil=None):
+        assert _iface_is_up(up) is None
+
+
+@self_test()
+def t_b9_ip_obj(ctx):
+    """B9: an address string or number as an address object; junk, an
+    empty string or None is None."""
+    assert ip_obj("10.0.0.1") == ipaddress.ip_address("10.0.0.1")
+    assert ip_obj("::1").version == 6
+    assert ip_obj(3232235777) == ipaddress.ip_address("192.168.1.1")
+    for junk in ("x", "", "256.1.1.1", None):
+        assert ip_obj(junk) is None, junk
+
+
+@self_test()
+def t_b9_category_shown(ctx):
+    """B9: CDN and your own corrections always show; tracker categories
+    only with tracker classification on."""
+    on = {"websites.tracker_classification": True}
+    assert category_shown("CDN", "list", {})
+    assert category_shown("Tracking", CAT_YOURS, {})
+    assert not category_shown("Tracking", "list", {})
+    assert category_shown("Tracking", "list", on)
+
+
 @self_test()
 def t_r7_elevated_start_closes_and_is_marked(ctx):
     """Review 7 (#5, #6): when the elevated copy ran, this start's receipt
