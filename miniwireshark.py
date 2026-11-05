@@ -7590,7 +7590,7 @@ def _title_bar_api():
     return TITLE_BAR["api"]
 
 
-def dark_title_bar(win, dark):
+def dark_title_bar(win, dark, settle=True):
     """Ask Windows to draw `win`'s title bar dark (or light again). Only
     with the dark palette, behind FEATURES["dark_titlebar"]; a silent
     no-op elsewhere and on any error. -> True when Windows accepted it."""
@@ -7605,7 +7605,12 @@ def dark_title_bar(win, dark):
             return False
         dwm, user32, build = api
         _title_bar_types(dwm, user32)
-        win.update_idletasks()
+        # settle=False (a theme change, window already on screen): its
+        # frame exists, and update_idletasks would run all of the app's
+        # pending layout and redraw work here, inside the theme change
+        # (Windows run: 161 ms against 145)
+        if settle or not _is_mapped(win):
+            win.update_idletasks()
         hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
         attr = DWMWA_DARK if build >= 18985 else DWMWA_DARK_OLD
         value = ctypes.c_int(1 if dark else 0)
@@ -7639,14 +7644,56 @@ def set_dark_title_bars(root, dark):
         except Exception as e:                       # noqa: BLE001
             LOG.debug("title bar hook: %s", e)
     n = 0
-    stack = [root]
+    for w in _toplevel_windows(root):
+        n += bool(dark_title_bar(w, dark, settle=False))
+    return n
+
+
+def _is_mapped(win):
+    try:
+        return bool(win.winfo_ismapped())
+    except Exception:                                # noqa: BLE001
+        return False
+
+
+_TOPLEVELS_TCL = r"""
+proc ::mw_toplevels {w} {
+    set out {}
+    if {[winfo toplevel $w] eq $w} {lappend out $w}
+    foreach c [winfo children $w] {
+        set out [concat $out [::mw_toplevels $c]]
+    }
+    return $out
+}
+"""
+
+
+def _toplevel_windows(root):
+    """The main window and every dialog: one Tcl call (the Python walk
+    asked each of the ~700 widgets for its children, 5-10 ms of every
+    theme change)."""
+    try:
+        tkapp = root.tk
+        if not tkapp.call("info", "commands", "::mw_toplevels"):
+            tkapp.eval(_TOPLEVELS_TCL)
+        paths = tkapp.splitlist(tkapp.call("::mw_toplevels", root._w))
+        out = []
+        for p in paths:
+            with contextlib.suppress(KeyError, tk.TclError):
+                w = root.nametowidget(str(p))
+                if isinstance(w, (tk.Tk, tk.Toplevel)):
+                    out.append(w)
+        return out
+    except (tk.TclError, AttributeError):
+        pass
+    out, stack = [], [root]
     while stack:
         w = stack.pop()
         if isinstance(w, (tk.Tk, tk.Toplevel)):
-            n += bool(dark_title_bar(w, dark))
+            out.append(w)
         with contextlib.suppress(Exception):
             stack.extend(w.winfo_children())
-    return n
+    return out
 
 
 def _title_bar_on_map(event):
@@ -11976,6 +12023,7 @@ FEATURES = {
     "filter_english": True,  # a typed filter said in words (M16, IP-023)
     "route_pick": True,      # the card Windows' own route uses (IP-004)
     "compiled_start": True,  # Windows writes and starts from the copy (M4)
+    "theme_steps": True,     # hidden tabs recoloured just after (5.3.4)
 }
 
 
@@ -12188,6 +12236,8 @@ FEATURE_HELP = {
     "auto_update_check": "once a day, MiniWireshark asks the official GitHub "
                          "page for the latest version number (one request "
                          "to api.github.com, nothing about you)",
+    "theme_steps": "a theme change recolours the tabs you can't see one "
+                   "by one, just after the one you see",
 }
 
 
@@ -30622,6 +30672,33 @@ def _pad_pair(v):
     return (a[0], a[1]) if len(a) > 1 else (a[0], a[0])
 
 
+def bind_plain(widget, sequence, func, fields="", when=""):
+    """widget.bind(sequence, ..., add="+") without tkinter's event object.
+    tkinter's binding hands Tcl 19 %-fields and Python turns each into an
+    event attribute: about 40 us per event. A text-size change moves ~900
+    widgets, and every <Configure> ran that for each of its bindings (the
+    toplevel's own included, which Tk runs for every widget inside it).
+    Here Tcl passes only `fields` (e.g. "%W %w") to `func`, as strings, and
+    only when the Tcl expression `when` holds (e.g. {"%W" eq "."}).
+    -> the Tcl command name (deleted with the widget)."""
+    cmd = widget.register(func)
+    script = cmd + (" " + fields if fields else "")
+    if when:
+        script = "if {%s} {%s}" % (when, script)
+    widget.tk.call("bind", widget._w, sequence, "+" + script)
+    return cmd
+
+
+class _SizeEvent:
+    """The fields of a <Configure> event that bind_plain handlers use."""
+    __slots__ = ("widget", "width", "height")
+
+    def __init__(self, widget, width, height=0):
+        self.widget = widget
+        self.width = int(width)
+        self.height = int(height)
+
+
 class FlowLayout:
     """Lays out a frame's children left to right and wraps them onto more
     rows when the frame is narrower than they need. Children keep using
@@ -30654,7 +30731,7 @@ class FlowLayout:
     def _watch(self, w):
         if not getattr(w, "_mw_flow_watched", False):
             w._mw_flow_watched = True
-            w.bind("<Configure>", lambda e: self.schedule(), add="+")
+            bind_plain(w, "<Configure>", self.schedule)
 
     def _on_conf(self, e):
         if (e.width, e.height) != self._last:
@@ -31289,8 +31366,11 @@ def install_tree_width_share(root):
             if tree.winfo_exists():
                 share_tree_width(tree)
 
-    def on_configure(e):
-        tree = e.widget
+    def on_configure(path):
+        try:
+            tree = root.nametowidget(path)
+        except (KeyError, tk.TclError):
+            return
         if not isinstance(tree, ttk.Treeview):
             return
         key = str(tree)
@@ -31300,7 +31380,9 @@ def install_tree_width_share(root):
                 tree.after_cancel(job)
             jobs[key] = tree.after(40, lambda: later(tree))
     with contextlib.suppress(tk.TclError):
-        root.bind_class("Treeview", "<Configure>", on_configure, add="+")
+        # the path only (no tkinter event object, see bind_plain)
+        root.tk.call("bind", "Treeview", "<Configure>", "+%s %%W" %
+                     root._register(on_configure, None, 0))
 
 
 def dialog_contract(win):
@@ -31377,8 +31459,24 @@ def _autowrap_install(master):
         if key in _AUTOWRAP_INTERPS:
             return
         _AUTOWRAP_INTERPS.add(key)
+        root = master._root()
+
+        def plain(path, width):
+            try:
+                w = root.nametowidget(path)
+            except (KeyError, tk.TclError):
+                return
+            _autowrap(_SizeEvent(w, width))
+        # every label's <Configure> came to Python (300 per text-size
+        # change); Tcl now passes on only those that can re-wrap: wider
+        # than 30 pixels, with a wraplength (what _autowrap checks first)
+        cmd = master._register(plain, None, 0)
         for cls in ("Label", "TLabel"):
-            master.bind_class(cls, "<Configure>", _autowrap, add="+")
+            master.tk.call(
+                "bind", cls, "<Configure>",
+                "+if {%%w > 30 && ![catch {%%W cget -wraplength} ::mw_wl]"
+                " && [string is double -strict $::mw_wl] && $::mw_wl > 0}"
+                " {%s %%W %%w}" % cmd)
     except (tk.TclError, AttributeError):
         pass
 
@@ -32169,9 +32267,13 @@ class Tooltip:
         self._tip = tip
         # keep it on the screen (it opened past the right or bottom edge)
         try:
-            tip.update_idletasks()
+            # the label's own size is the window's (packed alone, no
+            # padding). tip.update_idletasks() ran ALL of the app's pending
+            # layout work at once, inside this callback: a tooltip that
+            # opened during a text-size change froze the window for all of
+            # it
             sw, sh = tip.winfo_screenwidth(), tip.winfo_screenheight()
-            tw, th = tip.winfo_reqwidth(), tip.winfo_reqheight()
+            tw, th = lbl.winfo_reqwidth(), lbl.winfo_reqheight()
             if x + tw > sw - 4:
                 x = max(0, sw - tw - 4)
             if y + th > sh - 4:
@@ -35323,22 +35425,26 @@ MW_FONT_SCALE = [1.0]
 
 
 def scale_mw_fonts(scale):
-    """Text size: every shared font follows at once."""
-    for _name in scale_mw_fonts_steps(scale):
-        pass
-
-
-def scale_mw_fonts_steps(scale):
-    """The same, one font per step: Tk re-lays out every widget using a
-    font when it changes (10-70 ms each at S1), so a caller can let the
-    window breathe between fonts."""
+    """Text size: every shared font follows at once. All in one callback:
+    Tk then re-lays the window out once for all of them (each font in a
+    callback of its own cost one walk over every widget per font)."""
     MW_FONT_SCALE[0] = scale
     for name, (size, _style) in list(MW_FONTS.items()):
-        with contextlib.suppress(tk.TclError, RuntimeError):
-            tkfont.nametofont(name).configure(
-                size=(-1 if size < 0 else 1) * max(
-                    6, int(round(abs(size) * scale))))
-        yield name
+        set_font_size(name, (-1 if size < 0 else 1) * max(
+            6, int(round(abs(size) * scale))))
+
+
+def set_font_size(name, size):
+    """Re-size a named font. Even an unchanged size is set again: that
+    re-lays the window out, as it always did when the same size is
+    applied again (a window made wider just before gets its panes laid
+    out again). -> True when the size changed."""
+    with contextlib.suppress(tk.TclError, RuntimeError):
+        f = tkfont.nametofont(name)
+        changed = str(f.cget("size")) != str(size)
+        f.configure(size=size)
+        return changed
+    return False
 
 
 def themed_menu(app):
@@ -46872,7 +46978,7 @@ class TabStrip:
         lbl.bind("<space>", lambda e, t=tid: self.select(t))
         lbl.bind("<Enter>", lambda e, t=tid: self._hover(t, True))
         lbl.bind("<Leave>", lambda e, t=tid: self._hover(t, False))
-        lbl.bind("<Configure>", lambda e: self.schedule(), add="+")
+        bind_plain(lbl, "<Configure>", self.schedule)
         self.tabs[tid] = (outer, bar, lbl)
         return self.tabs[tid]
 
@@ -47313,7 +47419,12 @@ class MiniWireshark:
         self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map,
                              add="+")
         self._compact = None
-        self.root.bind("<Configure>", self._on_root_configure, add="+")
+        # a toplevel's binding runs for every widget inside it: Tcl keeps
+        # the window's own events only (900 others per text-size change)
+        bind_plain(self.root, "<Configure>",
+                   lambda w, h: self._on_root_configure(
+                       _SizeEvent(self.root, w, h)),
+                   "%w %h", '"%%W" eq "%s"' % self.root._w)
         self._apply_shortcuts()
         self._startup_step("Starting the background helpers", 90)
         self.data.start()
@@ -47826,6 +47937,9 @@ class MiniWireshark:
         with contextlib.suppress(AttributeError):
             self.tabstrip.sync()
         cur = self.current_tab_name()
+        if getattr(self, "_theme_pending", None):
+            # a theme change is still recolouring the hidden tabs
+            self.finish_theme(self.tabs.get(cur))
         prev = getattr(self, "_shown_tab_name", None)
         if cur != prev:
             self._shown_tab_name = cur
@@ -51447,16 +51561,24 @@ class MiniWireshark:
         pal = palette_name(self.theme_name, self.high_contrast)
         self.theme = THEMES[pal]
         Tooltip.theme = self.theme
-        self._retheme_widget_tree(self.root, pal)
+        # (Windows run, 161 ms against 145) the tabs you can't see are
+        # recoloured just after, one per callback (they are 3/4 of the
+        # widgets); a tab shown before its turn is recoloured first
+        later = self._theme_steps_start()
+        self._retheme_widget_tree(self.root, pal,
+                                  skip=[t.frame for t in later])
         self._restyle_ttk(dark, self.high_contrast)
         set_dark_title_bars(self.root, dark)          # IP-003
         with contextlib.suppress(tk.TclError):
             self.root.configure(background=self.theme["window_bg"])
         for tab in self.tabs.values():
+            if tab in later:
+                continue
             with contextlib.suppress(tk.TclError):
                 tab.on_theme()
         for kit in getattr(self, "kits", ()):
-            kit.on_theme()
+            if getattr(kit, "tab", None) not in later:
+                kit.on_theme()
         if hasattr(self, "inspector"):
             self.inspector.on_theme()
             self.inspector.refresh()
@@ -51474,6 +51596,66 @@ class MiniWireshark:
         self.config.set("appearance.theme", self.theme_name)
         self.config.set("appearance.high_contrast", self.high_contrast)
         self.config.save()
+        if later:
+            self._theme_pending = [(t, pal) for t in later]
+            self._theme_job = self.root.after_idle(self._theme_kick)
+
+    def _theme_steps_start(self):
+        """Drop what an earlier theme change left to do (the walk maps any
+        palette to any palette, so this one covers it) -> the tabs to
+        recolour after this callback: the hidden ones, once the window is
+        on screen and the switch is on."""
+        job = getattr(self, "_theme_job", None)
+        if job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.root.after_cancel(job)
+        self._theme_job = None
+        self._theme_pending = []
+        if not FEATURES.get("theme_steps", True):
+            return []
+        try:
+            if not self.root.winfo_ismapped():
+                return []
+        except tk.TclError:
+            return []
+        return [t for t in getattr(self, "tabs", {}).values()
+                if not t.is_visible()]
+
+    def _theme_kick(self):
+        # after the visible part has been redrawn, not in the same breath
+        self._theme_job = self.root.after(1, self._theme_step)
+
+    def _theme_step(self):
+        self._theme_job = None
+        pend = getattr(self, "_theme_pending", None)
+        if not pend:
+            return
+        self._theme_one(*pend.pop(0))
+        if pend:
+            self._theme_job = self.root.after(1, self._theme_step)
+
+    def _theme_one(self, tab, pal):
+        self._retheme_widget_tree(tab.frame, pal)
+        with contextlib.suppress(tk.TclError):
+            tab.on_theme()
+        for kit in getattr(self, "kits", ()):
+            if getattr(kit, "tab", None) is tab:
+                kit.on_theme()
+
+    def finish_theme(self, tab=None):
+        """Recolour now what a theme change left for later: `tab` only,
+        or everything."""
+        pend = getattr(self, "_theme_pending", None) or []
+        for item in list(pend):
+            if tab is None or item[0] is tab:
+                pend.remove(item)
+                self._theme_one(*item)
+        if not pend:
+            job = getattr(self, "_theme_job", None)
+            if job is not None:
+                with contextlib.suppress(tk.TclError):
+                    self.root.after_cancel(job)
+            self._theme_job = None
 
 
     def _apply_style(self):
@@ -51566,6 +51748,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         }
     }
     foreach c [winfo children $w] {
+        if {[info exists ::mw_retheme_skip($c)]} continue
         ::mw_retheme $c $map $fgnew $deffg
     }
 }
@@ -51591,8 +51774,9 @@ proc ::mw_retheme {w map fgnew deffg} {
             MiniWireshark._retheme_maps[palette] = got
         return got
 
-    def _retheme_widget_tree(self, widget, palette):
-        """The whole tree in one Tcl call; the Python walk if that fails."""
+    def _retheme_widget_tree(self, widget, palette, skip=()):
+        """The whole tree in one Tcl call; the Python walk if that fails.
+        `skip`: widgets whose subtrees are left out (done later)."""
         tkapp = widget.tk
         try:
             if not getattr(self, "_retheme_tcl_ok", False):
@@ -51605,17 +51789,28 @@ proc ::mw_retheme {w map fgnew deffg} {
             deffg = []
             for k in _DEFAULT_FG_NAMES:
                 deffg += [k, 1]
-            tkapp.call("::mw_retheme", widget._w, tuple(flat),
-                       THEMES[palette]["text_fg"], tuple(deffg))
+            tkapp.call("array", "unset", "::mw_retheme_skip")
+            for w in skip:
+                tkapp.call("set", "::mw_retheme_skip(%s)" % w._w, 1)
+            try:
+                tkapp.call("::mw_retheme", widget._w, tuple(flat),
+                           THEMES[palette]["text_fg"], tuple(deffg))
+            finally:
+                tkapp.call("array", "unset", "::mw_retheme_skip")
             return
         except tk.TclError:
             self._retheme_tcl_ok = False
-        self._retheme_widget_tree_py(widget, palette)
+        if skip:
+            self._retheme_widget_tree_py(widget, palette, skip)
+        else:
+            self._retheme_widget_tree_py(widget, palette)
 
-    def _retheme_widget_tree_py(self, widget, palette):
+    def _retheme_widget_tree_py(self, widget, palette, skip=()):
         """Swap every known palette colour on `widget` and its descendants
         for the same colour in `palette`. Colours are mapped via their
         canonical light value, so any palette -> any palette is lossless."""
+        if skip and widget in skip:
+            return
         table = PALETTES[palette]
         try:
             keys = widget.keys()
@@ -51664,7 +51859,10 @@ proc ::mw_retheme {w map fgnew deffg} {
         except Exception:
             children = []
         for child in children:
-            self._retheme_widget_tree_py(child, palette)
+            if skip:
+                self._retheme_widget_tree_py(child, palette, skip)
+            else:
+                self._retheme_widget_tree_py(child, palette)
 
     def _restyle_ttk(self, dark, hc=False):
         style = ttk.Style()
@@ -51760,10 +51958,14 @@ proc ::mw_retheme {w map fgnew deffg} {
                   "Extra large": 1.3}
 
     def _apply_text_size(self, label=None, defer=True):
-        """Tk's own fonts change at once; MiniWireshark's shared fonts, the
-        few explicit fonts and the table headings follow in later short
-        callbacks, so Tk re-lays the window out in parts (all in one froze
-        it for 0.2-0.3 s at S1). defer=False does everything now."""
+        """Every named font (Tk's and MiniWireshark's shared ones) changes
+        at once; the few explicit fonts and the table headings follow in
+        later short callbacks. defer=False does everything now.
+        (Windows run, 356 ms against 105) one font per callback made Tk
+        visit every widget once per font: any change to a font in use
+        makes Tk call every widget of the window, whichever font it uses,
+        so 14 callbacks were 14 walks over ~700 widgets. Changed together,
+        Tk walks them once."""
         label = label or self.config.get("appearance.text_size", "Normal")
         scale = self.TEXT_SIZES.get(label, 1.0)
         Charts.forget_fonts()
@@ -51780,15 +51982,25 @@ proc ::mw_retheme {w map fgnew deffg} {
             if name not in base:
                 base[name] = f.cget("size")
             size = base[name]
-            f.configure(size=(-1 if size < 0 else 1) *
-                        max(6, int(round(abs(size) * scale))))
+            set_font_size(name, (-1 if size < 0 else 1) *
+                          max(6, int(round(abs(size) * scale))))
+        # in the same callback, so Tk folds every change into one walk
+        scale_mw_fonts(scale)
         try:
             # table text follows the text size too (it stayed at 10 pt)
             st = ttk.Style()
-            st.configure("Treeview", rowheight=int(24 * scale),
-                         font=("TkDefaultFont", int(round(10 * scale))))
-            st.configure("Treeview.Heading", font=(
-                "TkDefaultFont", int(round(10 * scale)), "bold"))
+            row = int(24 * scale)
+            body = ("TkDefaultFont", int(round(10 * scale)))
+            head = body + ("bold",)
+            # a style change, even to the same values, makes every ttk
+            # widget of the window rebuild its layout
+            if str(st.lookup("Treeview", "rowheight")) != str(row) or \
+                    str(st.lookup("Treeview", "font")) != \
+                    str(st.tk.call("list", *body)):
+                st.configure("Treeview", rowheight=row, font=body)
+            if str(st.lookup("Treeview.Heading", "font")) != \
+                    str(st.tk.call("list", *head)):
+                st.configure("Treeview.Heading", font=head)
         except tk.TclError:
             pass
         job = getattr(self, "_text_size_job", None)
@@ -51811,11 +52023,14 @@ proc ::mw_retheme {w map fgnew deffg} {
             except tk.TclError:
                 return
             self._text_size_job = self.root.after(1, step)
-        self._text_size_job = self.root.after(1, step)
+
+        def kick():
+            # after Tk's walk over the widgets (an idle task queued by the
+            # font changes above), never in the same breath as it
+            self._text_size_job = self.root.after(1, step)
+        self._text_size_job = self.root.after_idle(kick)
 
     def _text_size_steps(self, scale):
-        for _name in scale_mw_fonts_steps(scale):
-            yield
         with contextlib.suppress(KeyError, AttributeError, tk.TclError):
             self.tabs["packets"].fit_time_column()
         # rc.11: at Normal size with nothing scaled yet, every explicit font
@@ -51844,15 +52059,65 @@ proc ::mw_retheme {w map fgnew deffg} {
         for _ in self._scale_explicit_fonts_steps(widget, scale, every=0):
             pass
 
+    # (Windows run) the walk asked every widget for its options from
+    # Python, ~25 ms a text-size change for the ~10 widgets with an
+    # explicit font; Tcl now finds those in one call
+    _EXPLICIT_FONTS_TCL = r"""
+proc ::mw_explicit_fonts {top names} {
+    set out {}
+    set stack [list $top]
+    while {[llength $stack]} {
+        set w [lindex $stack end]
+        set stack [lreplace $stack end end]
+        if {![catch {$w cget -font} f] && $f ne "" &&
+                ![dict exists $names $f]} {
+            lappend out $w $f
+        }
+        foreach c [winfo children $w] {lappend stack $c}
+    }
+    return $out
+}
+"""
+
+    def _explicit_font_widgets(self, widget, names):
+        """The widgets under `widget` whose font is not a named font (the
+        ones a named-font change does not reach), or None if Tcl can't
+        say."""
+        tkapp = widget.tk
+        try:
+            if not getattr(self, "_explicit_tcl_ok", False):
+                tkapp.eval(self._EXPLICIT_FONTS_TCL)
+                self._explicit_tcl_ok = True
+            flat = []
+            for n in names:
+                flat += [n, 1]
+            got = tkapp.splitlist(tkapp.call(
+                "::mw_explicit_fonts", widget._w, tuple(flat)))
+        except tk.TclError:
+            self._explicit_tcl_ok = False
+            return None
+        out = []
+        for i in range(0, len(got) - 1, 2):
+            with contextlib.suppress(KeyError, tk.TclError):
+                out.append(widget.nametowidget(str(got[i])))
+        return out
+
     def _scale_explicit_fonts_steps(self, widget, scale, every=600):
         """The same, yielding after every `every` widgets (0: never).
         Widgets destroyed in between are skipped."""
-        stack, n = [widget], 0
         try:
             names = set(tkfont.names(self.root))
         except tk.TclError:
             names = set()
         memo = {}             # original font -> scaled font, this walk
+        found = self._explicit_font_widgets(widget, names)
+        if found is not None:
+            for n, w in enumerate(found, 1):
+                self._scale_one_font(w, scale, names, memo)
+                if every and n % every == 0:
+                    yield
+            return
+        stack, n = [widget], 0
         while stack:
             w = stack.pop()
             self._scale_one_font(w, scale, names, memo)
@@ -51892,7 +52157,11 @@ proc ::mw_retheme {w map fgnew deffg} {
                         parts = tuple(parts)
                         if memo is not None:
                             memo[raw] = parts
-                    widget.configure(font=parts)
+                    # already that font (the same size again): configuring
+                    # it would re-lay it out for nothing
+                    if str(widget.cget("font")) != str(
+                            widget.tk.call("list", *parts)):
+                        widget.configure(font=parts)
             except (tk.TclError, KeyError, TypeError):
                 pass
 
@@ -88189,6 +88458,155 @@ def gt_r6_inspector_and_saved_widths(app, ctx):
         root.minsize(*min0)
         root.geometry(geo0)
         _gui_pump(root, 0.4)
+
+
+def _heartbeat_measure(root, action, until, settle=0.4, timeout=10.0):
+    """Run `action` as a Tk callback and pump until `until()`, then for
+    `settle` s, with a 10 ms timer running: -> (longest gap between two
+    timer runs, total time the window was busy beyond the timer's 10 ms
+    and 2 ms of jitter), in ms. What --bench-gui calls a stall."""
+    ticks = [time.perf_counter()]
+    on = [True]
+
+    def beat():
+        ticks.append(time.perf_counter())
+        if on[0]:
+            root.after(10, beat)
+    _gui_pump(root, 0.05)
+    ticks[0] = time.perf_counter()
+    root.after(10, beat)
+    root.after(0, action)
+    _gui_pump(root, settle, until, timeout)
+    on[0] = False
+    gaps = [b - a for a, b in zip(ticks, ticks[1:])]
+    return (round(max(gaps or [0]) * 1000, 1),
+            round(sum(g - 0.012 for g in gaps if g > 0.012) * 1000, 1))
+
+
+@gui_test_step("Windows run: a text-size change re-lays the window out "
+               "once, quickly; a theme change recolours hidden tabs after")
+def gt_text_size_speed(app, ctx):
+    root = app.root
+    size0 = app.config.get("appearance.text_size", "Normal")
+    theme0, hc0 = app.theme_name, app.high_contrast
+    walks = []
+    cmd = root.register(lambda: walks.append(1))
+    # Tk sends <<TkWorldChanged>> to every widget each time it walks the
+    # window for a font change: counted on the main window only
+    root.tk.call("bind", root._w, "<<TkWorldChanged>>",
+                 '+if {"%%W" eq "%s"} {%s}' % (root._w, cmd))
+    probe = "Large" if size0 != "Large" else "Normal"
+    try:
+        app._select_tab("devices")
+        _gui_pump(root, 0.5)
+        # 1. one walk for all the named fonts (it was one per font: 13)
+        del walks[:]
+        app.config.set("appearance.text_size", probe)
+        before = int(tkfont.nametofont(mw_font(11, "bold")).cget("size"))
+        app._apply_text_size(probe)
+        now = int(tkfont.nametofont(mw_font(11, "bold")).cget("size"))
+        assert now != before, ("the shared fonts wait for later callbacks",
+                               before, now)
+        _gui_pump(root, 0.3, until=lambda: app._text_size_job is None,
+                  timeout=10)
+        _gui_pump(root, 0.3)
+        if walks:                   # Tk 8.6.10+ sends the event
+            assert len(walks) <= 2, f"{len(walks)} walks over the window " \
+                "for one text-size change"
+        # 2. the main window's <Configure> handler runs for the window
+        # only, not for each of the ~900 widgets that move inside it
+        script = str(root.tk.call("bind", root._w, "<Configure>"))
+        assert 'eq "."' in script, script
+        # 3. measured: in this window the old code was busy 340-460 ms a
+        # change (froze 60-75 ms at most): 10-14 font walks and ~1,800
+        # Python event handlers; now 60-100 ms (30-40). Best of three,
+        # each way
+        busy, stall = [], []
+        for _ in range(3):
+            for label in (size0, probe):
+                def act(label=label):
+                    app.config.set("appearance.text_size", label)
+                    app._apply_text_size(label)
+                gap, tot = _heartbeat_measure(
+                    root, act, lambda: app._text_size_job is None)
+                busy.append(tot)
+                stall.append(gap)
+        print(f"    text-size change: busy {busy} ms, longest freeze "
+              f"{stall} ms")
+        assert min(busy) <= 130, f"text-size change busy {min(busy)} ms " \
+            f"(runs {busy})"
+        assert min(stall) <= 105, f"text-size change froze {min(stall)} " \
+            f"ms (runs {stall})"
+    finally:
+        root.tk.call("bind", root._w, "<<TkWorldChanged>>", "")
+        app.config.set("appearance.text_size", size0)
+        app._apply_text_size(size0, defer=False)
+        _gui_pump(root, 0.3)
+    # 4. a theme change in steps ends exactly where the one-go change
+    # ends, for every palette, hidden tabs, tables and dialogs included
+    opts = ("background", "foreground", "activebackground",
+            "selectbackground", "insertbackground", "highlightbackground",
+            "fill", "troughcolor")
+
+    def snap():
+        d = {}
+        for w in _all_widgets(root):
+            for o in opts:
+                with contextlib.suppress(Exception):
+                    d[(str(w), o)] = str(w.cget(o)).lower()
+            if isinstance(w, tk.Text):
+                for tag in w.tag_names():
+                    for o in ("foreground", "background"):
+                        with contextlib.suppress(Exception):
+                            d[(str(w), tag, o)] = str(
+                                w.tag_cget(tag, o)).lower()
+        return d
+    on0 = FEATURES.get("theme_steps", True)
+    try:
+        for name, hc in (("Dark", False), ("Light", True), ("Dark", True),
+                         ("Light", False)):
+            FEATURES["theme_steps"] = False
+            app._apply_theme(name, hc)
+            _gui_pump(root, 0.3)
+            whole = snap()
+            app._apply_theme("Dark" if name == "Light" else "Light", not hc)
+            _gui_pump(root, 0.3)
+            FEATURES["theme_steps"] = True
+            app._apply_theme(name, hc)
+            assert app._theme_pending, "nothing left for later"
+            _gui_pump(root, 0.3, until=lambda: not app._theme_pending,
+                      timeout=10)
+            _gui_pump(root, 0.2)
+            stepped = snap()
+            # (widgets made in between, a new feed row, are not compared)
+            diff = [k for k in set(whole) & set(stepped)
+                    if whole[k] != stepped[k]]
+            assert not diff, (name, hc, len(diff), diff[:5])
+        # a tab shown before its turn is recoloured first
+        app._apply_theme("Dark", False)
+        _gui_pump(root, 0.3, until=lambda: not app._theme_pending)
+        app._select_tab("devices")
+        _gui_pump(root, 0.2)
+        app._apply_theme("Light", False)
+        pend = [t.name for t, _p in app._theme_pending]
+        assert "websites" in pend, pend
+        app._select_tab("websites")
+        _gui_pump(root, 0.01)
+        assert "websites" not in [t.name for t, _p in app._theme_pending]
+        _gui_pump(root, 0.3, until=lambda: not app._theme_pending)
+        busy, stall = [], []
+        for name in ("Dark", "Light", "Dark", "Light"):
+            gap, tot = _heartbeat_measure(
+                root, lambda name=name: app._apply_theme(name, False),
+                lambda: not app._theme_pending)
+            busy.append(tot)
+            stall.append(gap)
+        print(f"    theme change: busy {busy} ms, longest freeze {stall} ms")
+        assert min(stall) <= 145, f"theme change froze {min(stall)} ms"
+    finally:
+        FEATURES["theme_steps"] = on0
+        app._apply_theme(theme0, hc0)
+        _gui_pump(root, 0.3, until=lambda: not app._theme_pending)
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
