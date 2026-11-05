@@ -13051,9 +13051,15 @@ def probe_capture_sources(candidates, bpf, promisc, sink,
 
 
 # ---- capture files (stdlib reader for pcap and pcapng) ----------------------
-def iter_raw_capture(path):
+PCAP_ENDED_EARLY = "The file ended early, so not all of it could be read."
+PCAP_NO_PACKETS = "The file had no packets in it."
+
+
+def iter_raw_capture(path, notes=None):
     """Yield (raw_bytes, timestamp, linktype) from a .pcap or .pcapng
-    file without scapy. Raises ValueError for unknown formats."""
+    file without scapy. Raises ValueError for unknown formats. A classic
+    .pcap cut short or with a bad record length keeps what came before
+    and appends PCAP_ENDED_EARLY to `notes` (5.3.4 court WIN-03)."""
     with open(path, "rb") as f:
         head = f.read(4)
         if len(head) < 4:
@@ -13074,17 +13080,20 @@ def iter_raw_capture(path):
                                                            rest)
         lt &= 0x0FFFFFFF
         rec = struct.Struct(end + "IIII")
+        last_ts = 0.0
         while True:
             h = f.read(16)
-            if len(h) < 16:
+            data, incl = b"", 1
+            if len(h) == 16:
+                sec, frac, incl, _orig = rec.unpack(h)
+                data = f.read(incl) if incl <= 262144 * 4 else b""
+            if len(h) < 16 or len(data) < incl:
+                if h and notes is not None:
+                    notes.append(PCAP_ENDED_EARLY)
                 return
-            sec, frac, incl, _orig = rec.unpack(h)
-            if incl > 262144 * 4:
-                raise ValueError("corrupt record length")
-            data = f.read(incl)
-            if len(data) < incl:
-                return
-            yield data, sec + frac * scale, lt
+            # WIN-02: a corrupt time is clamped as in pcapng (QA-03)
+            last_ts = _sane_ts(sec + frac * scale, last_ts)
+            yield data, last_ts, lt
 
 
 def _iter_pcapng(f, first):
@@ -13181,11 +13190,12 @@ class RawPcapImporter(threading.Thread):
         self.on_done = on_done
         self.cancelled = False
         self.count = 0
+        self.notes = []
 
     def run(self):
         err = None
         try:
-            for raw, ts, lt in iter_raw_capture(self.path):
+            for raw, ts, lt in iter_raw_capture(self.path, self.notes):
                 if self.cancelled:
                     break
                 if not self.sink(raw, ts, lt, lambda: self.cancelled):
@@ -13203,7 +13213,8 @@ class RawPcapImporter(threading.Thread):
             err = (f"{type(e).__name__}. The file may be damaged, or it "
                    "isn't a pcap/pcapng capture.")
             LOG.exception("capture import failed")
-        self.on_done(self.count, err, self.cancelled)
+        self.on_done(self.count, err, self.cancelled,
+                     " ".join(self.notes))
 
 
 # ============================================================================
@@ -27364,6 +27375,8 @@ packet ¦ paquet ¦ paquete
 it was the best of the available cards ¦ c'était la meilleure des cartes disponibles ¦ era la mejor de las tarjetas disponibles
 it carries your default Internet route ¦ elle porte votre route Internet par défaut ¦ lleva su ruta a Internet predeterminada
 your router is on the same network ¦ votre box est sur le même réseau ¦ su router está en la misma red
+The file ended early, so not all of it could be read. ¦ Le fichier s'arrête trop tôt : il n'a pas pu être lu en entier. ¦ El archivo termina antes de tiempo: no se pudo leer entero.
+The file had no packets in it. ¦ Le fichier ne contenait aucun paquet. ¦ El archivo no contenía ningún paquete.
 Windows' own routing sends your Internet traffic through it ¦ le routage de Windows lui-même y fait passer votre trafic Internet ¦ el propio enrutamiento de Windows envía por ella su tráfico de Internet
 your Internet route goes through a VPN; the physical card shows the local network ¦ votre route Internet passe par un VPN ; la carte physique montre le réseau local ¦ su ruta a Internet pasa por una VPN; la tarjeta física muestra la red local
 Pick another card in the list, or click “Refresh”. ¦ Choisissez une autre carte dans la liste, ou cliquez sur « Actualiser ». ¦ Elija otra tarjeta de la lista o pulse «Actualizar».
@@ -29053,18 +29066,19 @@ I18N_PATTERNS = [
      r"un archivo.   [\1]"),
     (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets from (.+?)"
      r"( \(stopped early\))?\. Router identified from the capture "
-     r"\(likely\): (\S+)\. Nothing here is live\.",
+     r"\(likely\): (\S+)\. Nothing here is live\.( .+)?",
      r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Box "
-     r"identifiée dans la capture (probable) : \4. Rien n'est en direct.",
+     r"identifiée dans la capture (probable) : \4. Rien n'est en "
+     r"direct.{t5}",
      r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
      r"Router identificado en la captura (probable): \4. Nada es en "
-     r"directo."),
+     r"directo.{t5}"),
     (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets from (.+?)"
-     r"( \(stopped early\))?\.\s+Nothing here is live\.",
+     r"( \(stopped early\))?\.\s+Nothing here is live\.( .+)?",
      r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Rien "
-     r"n'est en direct.",
+     r"n'est en direct.{t4}",
      r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
-     r"Nada es en directo."),
+     r"Nada es en directo.{t4}"),
     (r"📂 Offline capture: (.+) — (\d+) packets \(not live\)",
      r"📂 Capture hors ligne : \1 — \2 paquets (pas en direct)",
      r"📂 Captura sin conexión: \1 — \2 paquetes (no en directo)"),
@@ -30668,11 +30682,14 @@ _ORIG_PACK = {}
 _ORIG_PLACE = None
 
 
-def _int(v):
+def _int(v, default=0):
+    """A Tk option or a setting as a whole number; `default` when it is
+    empty or not a number (5.3.4 court WIN-01: a bad setting stopped the
+    window from opening)."""
     try:
-        return int(float(str(v) or 0))
-    except (TypeError, ValueError):
-        return 0
+        return int(float(str(v)))
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def _flow_of(w, kw=None):
@@ -47044,8 +47061,8 @@ class MiniWireshark:
         self.demo = None
         self.dropped_capture = 0
         self.count = 0
-        self.max_rows = max(500, int(self.config.get(
-            "capture.max_stored_events", self.MAX_ROWS)))
+        self.max_rows = max(500, _int(self.config.get(
+            "capture.max_stored_events", self.MAX_ROWS), self.MAX_ROWS))
         self.all_rows = deque(maxlen=self.max_rows)
         self.pending_rows = deque()
         self.bookmarks = set()
@@ -55978,7 +55995,8 @@ proc ::mw_retheme {w map fgnew deffg} {
             return None
 
     def import_pcap_path(self, path):
-        cap = int(self.config.get("capture.max_stored_events", 5000))
+        cap = max(500, _int(self.config.get("capture.max_stored_events",
+                                            5000), 5000))
         big = False
         # size unknown: import as a normal (not big) file
         with contextlib.suppress(Exception):
@@ -56000,8 +56018,8 @@ proc ::mw_retheme {w map fgnew deffg} {
                              "  " + translate_text(
                                  "All packets are analysed; the Packets "
                                  "list keeps the last %d.") %
-                             int(self.config.get(
-                                 "capture.max_stored_events", 5000))
+                             max(500, _int(self.config.get(
+                                 "capture.max_stored_events", 5000), 5000))
                              if getattr(self, "_pcap_big", False) else ""),
                          kind="warn")
         LOG.info("importing pcap %s", path)
@@ -56022,17 +56040,18 @@ proc ::mw_retheme {w map fgnew deffg} {
                 latest["posted"] = True
                 self._async_results.put(show)
 
-        def done(n, err, cancelled):
+        def done(n, err, cancelled, note=""):
             self._async_results.put(lambda: self._pcap_done(n, err,
-                                                            cancelled))
+                                                            cancelled, note))
         self.importer = RawPcapImporter(path, self.lossless_sink(), progress,
                                         done)
         self.importer.start()
 
-    def _pcap_done(self, n, err, cancelled):
+    def _pcap_done(self, n, err, cancelled, note=""):
         if self.data_mode != "offline":
             return
         self.importer = None
+        self._pcap_note = note
         if err:
             self._set_banner(f"⚠️  Stopped reading the file: {err}",
                              kind="bad")
@@ -56075,11 +56094,15 @@ proc ::mw_retheme {w map fgnew deffg} {
 
     def _pcap_finished(self, n, cancelled):
         gw = self.model.gateway_ip
+        note = getattr(self, "_pcap_note", "")
+        if not n and not cancelled and not note:
+            note = PCAP_NO_PACKETS
         self._set_banner(
             f"\U0001F4C2  OFFLINE CAPTURE — finished reading {n} packets "
             f"from {self.data_label}{' (stopped early)' if cancelled else ''}"
             f". {('Router identified from the capture (likely): ' + gw + '.') if gw else ''}"
-            f" Nothing here is live.", kind="warn")
+            f" Nothing here is live.{(' ' + note) if note else ''}",
+            kind="warn")
         self.status_var.set(f"\U0001F4C2 Offline capture: {self.data_label} "
                             f"— {n} packets (not live)")
 
@@ -56881,8 +56904,8 @@ proc ::mw_retheme {w map fgnew deffg} {
             with contextlib.suppress(Exception):
                 self._restyle_mode_banner()
         setup_logging(cfg.get("diagnostics.verbose_logging", False))
-        new_max = max(500, int(cfg.get("capture.max_stored_events",
-                                       self.MAX_ROWS)))
+        new_max = max(500, _int(cfg.get("capture.max_stored_events",
+                                        self.MAX_ROWS), self.MAX_ROWS))
         if new_max != self.max_rows:
             self.max_rows = new_max
             self.all_rows = deque(self.all_rows, maxlen=new_max)
@@ -82610,6 +82633,90 @@ def t_b9_category_shown(ctx):
     assert category_shown("Tracking", CAT_YOURS, {})
     assert not category_shown("Tracking", "list", {})
     assert category_shown("Tracking", "list", on)
+
+
+@self_test()
+def t_534_court_bad_setting_numbers(ctx):
+    """5.3.4 court WIN-01: a packets-kept setting that is empty, not a
+    number, infinite or negative no longer stops the window from opening
+    or a capture file from being read: the default (or the 500 floor)
+    is used. Every read of the setting goes through _int."""
+    for bad in ("abc", "", None, float("inf"), float("nan"), [3]):
+        assert _int(bad, 5000) == 5000, bad
+    assert _int("2500", 5000) == 2500 and _int(2500.7, 5000) == 2500
+    assert max(500, _int(-5, 5000)) == 500
+    assert _int("") == 0 and _int("12") == 12          # Tk option values
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        src = f.read()
+    raw = re.findall(r"\bint\(\s*(?:self\.)?(?:config|cfg)\.get\(\s*"
+                     r"\"capture\.max_stored_events\"", src)
+    assert not raw, raw
+
+
+def _court_pcap(path, records, tail=b""):
+    with open(path, "wb") as f:
+        f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 262144, 1))
+        for sec, data in records:
+            f.write(struct.pack("<IIII", sec, 0, len(data), len(data)))
+            f.write(data)
+        f.write(tail)
+
+
+@self_test()
+def t_534_court_pcap_bad_time(ctx):
+    """5.3.4 court WIN-02: a classic .pcap packet time of 0xFFFFFFFF (year
+    2106) takes the previous packet's time, as pcapng does."""
+    p = ctx.path("court-ts.pcap")
+    frame = bytes(60)
+    _court_pcap(p, [(1700000000, frame), (0xFFFFFFFF, frame),
+                    (1700000002, frame)])
+    ts = [t for _r, t, _l in iter_raw_capture(p)]
+    assert ts == [1700000000.0, 1700000000.0, 1700000002.0], ts
+
+
+@self_test()
+def t_534_court_pcap_ended_early(ctx):
+    """5.3.4 court WIN-03: a classic .pcap cut short or with an impossible
+    record length keeps the packets before it, without an error, and the
+    finished banner says the file ended early (also in French); a file
+    with only its header says it had no packets."""
+    frame = bytes(60)
+    cut = struct.pack("<IIII", 1700000009, 0, 60, 60) + bytes(20)
+    huge = struct.pack("<IIII", 1700000009, 0, 2 ** 30, 2 ** 30)
+    for name, tail in (("cut", cut), ("huge", huge), ("half", cut[:9])):
+        p = ctx.path(f"court-{name}.pcap")
+        _court_pcap(p, [(1700000000, frame), (1700000001, frame)], tail)
+        notes = []
+        assert len(list(iter_raw_capture(p, notes))) == 2, name
+        assert notes == [PCAP_ENDED_EARLY], (name, notes)
+        done = []
+        imp = RawPcapImporter(p, lambda *a: True, lambda n: None,
+                              lambda *a: done.append(a))
+        imp.start()
+        imp.join(5)
+        assert done == [(2, None, False, PCAP_ENDED_EARLY)], done
+    empty = ctx.path("court-empty.pcap")
+    _court_pcap(empty, [])
+    notes = []
+    assert list(iter_raw_capture(empty, notes)) == [] and notes == []
+    shown = []
+
+    def finished(n, note):
+        app = types.SimpleNamespace(
+            model=types.SimpleNamespace(gateway_ip=""), data_label="x.pcap",
+            _pcap_note=note, status_var=types.SimpleNamespace(
+                set=lambda t: None),
+            _set_banner=lambda text, kind="info": shown.append(text))
+        MiniWireshark._pcap_finished(app, n, False)
+        return shown[-1]
+    assert finished(2, PCAP_ENDED_EARLY).endswith(
+        "Nothing here is live. " + PCAP_ENDED_EARLY)
+    assert finished(0, "").endswith(" " + PCAP_NO_PACKETS)
+    assert finished(2, "").endswith("Nothing here is live.")
+    fr = translate_text(finished(2, PCAP_ENDED_EARLY), "fr")
+    assert "lecture terminée" in fr and "trop tôt" in fr, fr
+    es = translate_text(finished(0, ""), "es")
+    assert "ningún paquete" in es, es
 
 
 @self_test()
