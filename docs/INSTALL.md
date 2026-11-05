@@ -86,7 +86,7 @@ The data folder holds logs, saved sessions and the autosave, the optional histor
 
 ## Updating
 
-Download the new release and replace the file. Settings, history and sessions are kept, because they live in the data folder. MiniWireshark can also check for Ed25519-signed updates itself (**Settings → Updates & Dependencies**). If an update fails to start, the next start rolls it back.
+Download the new release and replace the file. Settings, history and sessions are kept, because they live in the data folder. Download it only from <https://github.com/darkckillerc4/MiniWireshark/releases>: other sites may offer fake copies. MiniWireshark checks that page for a new version once a day and tells you when one is out (**Settings → Updates & Dependencies**, where you can turn it off); it installs an update itself only when it is Ed25519-signed. If an update fails to start, the next start rolls it back.
 
 ## Uninstalling
 

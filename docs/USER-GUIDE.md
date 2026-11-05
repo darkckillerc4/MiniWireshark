@@ -151,7 +151,7 @@ The Settings window is grouped by what you are trying to do. Each option has a o
 | Performance | Normal or Full Power, cores, memory cap, battery awareness |
 | Keyboard Shortcuts | Every shortcut |
 | Data & Export | Default folders, where your settings live |
-| Updates & Dependencies | Signed updates, the private Python, packages |
+| Updates & Dependencies | The daily check of the official GitHub page, signed updates, the private Python, packages |
 | Components | Optional parts and reference lists |
 | Diagnostics | Logs, debug bundle, self-test |
 

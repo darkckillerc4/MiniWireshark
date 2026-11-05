@@ -115,7 +115,7 @@ Thresholds that compare against "normal" wait for a baseline first, so a fresh s
 - Offers to install Npcap on Windows, picks the best network card, and restarts a capture that dies. When a live capture can't keep up, deep analysis pauses and packets are only counted, with a plain line saying so.
 - **Repair MiniWireshark:** one click fixes missing components, damaged lists or history, a broken settings file and a stuck capture.
 - **Boot receipts** and **Safe Mode** after two failed starts.
-- **Signed updates** and data packs (Ed25519), with rollback if an update fails to start.
+- **Signed updates** and data packs (Ed25519), with rollback if an update fails to start. A once-a-day check of the official GitHub page (one request to `api.github.com`, off in one click) says when a new version is out.
 
 ## Accessibility and languages
 

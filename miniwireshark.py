@@ -135,7 +135,7 @@ LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
 SCRIPT_VERSION = "5.3.4"
 SESSION_SCHEMA_VERSION = 3
-CONFIG_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 3
 
 ELEVATED_FLAG = "--miniwireshark-elevated"
 SELF_TEST_FLAG = "--self-test"
@@ -2667,6 +2667,146 @@ def net_urlopen(feature, req, timeout, detail=""):
     outbound(feature, parts.scheme or "http", parts.hostname or url,
              detail or (parts.path or "/")[:100])
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+# ---- 5.3.4: updates come only from the official GitHub page ------------------
+# Fake download sites copy the app. The update check asks one place by
+# default, the official GitHub releases, and follows no link from the
+# answer unless it is on GitHub itself. Another source still works when
+# you type one, but every update message then says it is not official.
+OFFICIAL_UPDATE_REPO = "darkckillerc4/MiniWireshark"
+OFFICIAL_UPDATE_PAGE = "github.com/" + OFFICIAL_UPDATE_REPO
+# GitHub's own rules: an owner is 1-39 letters, digits or single hyphens
+# (not first or last); a repository name is letters, digits, ".", "_" or
+# "-", and not "." or "..". No scheme, host, port, path or query fits.
+UPDATE_REPO_PATTERN = (r"^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}"
+                       r"/(?!\.\.?\Z)[A-Za-z0-9._-]{1,100}\Z")
+_UPDATE_REPO_RX = re.compile(UPDATE_REPO_PATTERN)
+# the only hosts an update link may point to (https only)
+UPDATE_HOSTS = frozenset({"github.com", "api.github.com",
+                          "objects.githubusercontent.com",
+                          "release-assets.githubusercontent.com"})
+UPDATE_CHECK_INTERVAL = 86400          # automatic checks: once a day at most
+_UPDATE_TAG_RX = re.compile(r"^v?\d{1,4}(?:\.\d{1,6}){1,3}\Z")
+
+
+def valid_update_repo(repo):
+    """True for a plain GitHub "owner/name" (nothing else is accepted)."""
+    return isinstance(repo, str) and bool(_UPDATE_REPO_RX.match(repo))
+
+
+def update_repo(cfg):
+    """The update source in use: what the user typed, or the official one
+    when the box is empty. "" when what was typed isn't owner/name."""
+    repo = str((cfg.get("updates.repo", "") if cfg is not None else "")
+               or "").strip()
+    if not repo:
+        return OFFICIAL_UPDATE_REPO
+    return repo if valid_update_repo(repo) else ""
+
+
+def is_official_repo(repo):
+    # GitHub names are not case-sensitive
+    return str(repo or "").strip().lower() == OFFICIAL_UPDATE_REPO.lower()
+
+
+def unofficial_source_note(repo):
+    """"" for the official source, else the plain warning every update
+    message carries."""
+    repo = str(repo or "").strip()
+    if not repo or is_official_repo(repo):
+        return ""
+    return (f"Unofficial update source: {repo}. Official releases come "
+            f"only from {OFFICIAL_UPDATE_PAGE}")
+
+
+def update_url_ok(url):
+    """An update link is followed only over https to GitHub's own hosts:
+    no other host, no port, no user name in it."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+        port = parts.port
+    except ValueError:
+        return False
+    return (parts.scheme == "https" and port in (None, 443) and
+            "@" not in parts.netloc and
+            (parts.hostname or "").lower() in UPDATE_HOSTS)
+
+
+def release_page_url(repo, tag):
+    """The release page, built here from the source and the tag; a link
+    in GitHub's answer is never shown."""
+    return (f"https://github.com/{repo}/releases/tag/"
+            f"{urllib.parse.quote(str(tag), safe='.-_')}")
+
+
+def parse_release_answer(data, repo):
+    """GitHub's "latest release" answer → {"tag", "version", "page",
+    "assets", "manifest", "ignored"}. Raises ValueError when the tag is not
+    a version. A link that isn't https on a GitHub host is left out (and
+    logged)."""
+    if not isinstance(data, dict):
+        raise ValueError("unexpected answer from GitHub")
+    tag = str(data.get("tag_name", "") or "")
+    if not _UPDATE_TAG_RX.match(tag):
+        raise ValueError("the latest release has no version number")
+    ignored = []
+    html = data.get("html_url", "")
+    if html and not update_url_ok(html):
+        ignored.append(str(html)[:200])
+    assets, manifest = [], ""
+    for a in data.get("assets", []) or []:
+        if not isinstance(a, dict):
+            continue
+        name = str(a.get("name", ""))
+        url = str(a.get("browser_download_url", "") or "")
+        if not (name.endswith(".py") or name == MANIFEST_NAME):
+            continue
+        if not update_url_ok(url):
+            ignored.append(url[:200])
+            continue
+        if name == MANIFEST_NAME:
+            manifest = manifest or url
+        else:
+            assets.append(url)
+    for u in ignored:
+        LOG.warning("update: ignored a link outside GitHub: %s", u)
+    return {"tag": tag, "version": tag.lstrip("v"),
+            "page": release_page_url(repo, tag), "assets": assets,
+            "manifest": manifest, "ignored": ignored}
+
+
+def update_check_due(cfg, now=None):
+    """At most one automatic check a day (a clock set back counts as
+    due, so a wrong date can't stop checks for good)."""
+    now = time.time() if now is None else now
+    try:
+        last = float(cfg.get("updates.last_check", 0) or 0)
+    except (TypeError, ValueError):
+        last = 0.0
+    return not (0 < last <= now and now - last < UPDATE_CHECK_INTERVAL)
+
+
+def auto_update_blocked(cfg, data_mode="live"):
+    """Why the automatic check must not run now ("" when it may). Every
+    gate counts: the switch, Safe Mode, the kill switch, a file, a saved
+    session or the demo (offline work), a bad source and the daily
+    limit."""
+    if not FEATURES.get("auto_update_check", True):
+        return "switched off (auto_update_check)"
+    if SAFE_MODE:
+        return "Safe Mode"
+    if not cfg.get("updates.check_automatically", True):
+        return "turned off in Settings"
+    if LEDGER.killed or cfg.get("privacy.kill_switch", False):
+        return "the kill switch is on"
+    if data_mode in ("offline", "session", "demo"):
+        return "working offline (" + data_mode + ")"
+    if not update_repo(cfg):
+        return "the update source isn't owner/name"
+    if not update_check_due(cfg):
+        return "already checked today"
+    return ""
 
 
 def _latest_npcap_version():
@@ -11686,6 +11826,7 @@ FEATURES = {
     "npcap_buffer": True,    # a bigger Npcap kernel buffer (M13, IP-024)
     "checkup_report": True,  # one-page Network check-up, redacted (M14)
     "dark_titlebar": True,   # Windows draws a dark title bar (M16, IP-003)
+    "auto_update_check": True,   # once a day, official GitHub page only
     "filter_english": True,  # a typed filter said in words (M16, IP-023)
 }
 
@@ -11888,6 +12029,9 @@ FEATURE_HELP = {
                      "bars of the window and its dialogs are dark too",
     "filter_english": "a typed field filter is said in plain words under "
                       "the filter box",
+    "auto_update_check": "once a day, MiniWireshark asks the official GitHub "
+                         "page for the latest version number (one request "
+                         "to api.github.com, nothing about you)",
 }
 
 
@@ -23732,8 +23876,10 @@ def _default_config():
         "export": {"default_dir": ""},
         "mode": {"active_scanning": True},
         "shortcuts": dict(DEFAULT_SHORTCUTS),
-        "updates": {"check_automatically": False, "repo": "",
-                    "allow_self_update": False},
+        "updates": {"check_automatically": True,
+                    "repo": OFFICIAL_UPDATE_REPO,
+                    "allow_self_update": False, "last_check": 0,
+                    "notice_pending": False},
         "connectors": {"list": [], "interval": 60},
         "privacy": {"geoip_enabled": False, "local_asn_db": False,
                     "auto_download_reference": True, "quic_names": True,
@@ -23760,6 +23906,25 @@ def migrate_config(data):
             perf["mode"] = "Low CPU" if perf.get("cpu_friendly_mode") \
                 else "Automatic"
         data["config_version"] = 2
+    if ver < 3:
+        # 5.3.4: updates come from the official GitHub page by default and
+        # are checked once a day. An empty source becomes the official one.
+        # Without a source the "check" box could not do anything (Settings
+        # greyed it out), so its stored False was never a working choice:
+        # it is turned on, and a one-time banner says so. A user who had
+        # set a source of their own and left checks off keeps them off.
+        up = data.get("updates")
+        if not isinstance(up, dict):
+            up = data["updates"] = {}
+        had_repo = bool(str(up.get("repo", "") or "").strip())
+        if not had_repo:
+            up["repo"] = OFFICIAL_UPDATE_REPO
+            if not up.get("check_automatically", False):
+                up["check_automatically"] = True
+                up["notice_pending"] = True
+        elif "check_automatically" not in up:
+            up["check_automatically"] = True
+        data["config_version"] = 3
     return data
 
 
@@ -26621,12 +26786,17 @@ File dialogs open here. Leave empty to use the system default. ¦ Les boîtes de
 Browse ¦ Parcourir ¦ Examinar
 Files ¦ Fichiers ¦ Archivos
 Open settings folder ¦ Ouvrir le dossier des paramètres ¦ Abrir la carpeta de ajustes
-Keep MiniWireshark and its helpers up to date — only when you ask. ¦ Gardez MiniWireshark et ses composants à jour — seulement quand vous le demandez. ¦ Mantenga MiniWireshark y sus componentes al día — solo cuando lo pida.
+Keep MiniWireshark up to date from its official GitHub page, and its helpers when you ask. ¦ Gardez MiniWireshark à jour depuis sa page GitHub officielle, et ses composants quand vous le demandez. ¦ Mantenga MiniWireshark al día desde su página oficial de GitHub, y sus componentes cuando lo pida.
 Update checks ¦ Recherche de mises à jour ¦ Comprobación de actualizaciones
 GitHub repository ¦ Dépôt GitHub ¦ Repositorio de GitHub
-Where new releases are published, as owner/name. Leave empty and MiniWireshark never checks. ¦ Où les nouvelles versions sont publiées, sous la forme propriétaire/nom. Laissez vide et MiniWireshark ne vérifie jamais. ¦ Dónde se publican las versiones nuevas, como propietario/nombre. Déjelo vacío y MiniWireshark nunca comprobará.
-Check when MiniWireshark opens ¦ Vérifier à l'ouverture de MiniWireshark ¦ Comprobar al abrir MiniWireshark
-Asks GitHub for the latest release number only. ¦ Demande seulement à GitHub le numéro de la dernière version. ¦ Solo pide a GitHub el número de la última versión.
+Where new releases are looked for, as owner/name. Leave it as it is: other download sites may be fake. ¦ Où chercher les nouvelles versions, sous la forme propriétaire/nom. Laissez-le tel quel : les autres sites de téléchargement peuvent être faux. ¦ Dónde se buscan las versiones nuevas, como propietario/nombre. Déjelo como está: otros sitios de descarga pueden ser falsos.
+Check for a new version once a day ¦ Chercher une nouvelle version une fois par jour ¦ Buscar una versión nueva una vez al día
+One request to api.github.com for the latest version number. Nothing about you is sent. ¦ Une seule demande à api.github.com pour le numéro de la dernière version. Rien sur vous n'est envoyé. ¦ Una sola petición a api.github.com para el número de la última versión. No se envía nada sobre usted.
+Use the official source ¦ Utiliser la source officielle ¦ Usar la fuente oficial
+Use only owner/name as on GitHub (letters, digits, - . _), not a web address. ¦ Indiquez seulement propriétaire/nom comme sur GitHub (lettres, chiffres, - . _), pas une adresse web. ¦ Indique solo propietario/nombre como en GitHub (letras, números, - . _), no una dirección web.
+This isn't a GitHub owner/name, so nothing would be checked. ¦ Ce n'est pas un propriétaire/nom GitHub : rien ne serait vérifié. ¦ Esto no es un propietario/nombre de GitHub, así que no se comprobaría nada.
+Official update source: github.com/darkckillerc4/MiniWireshark. Links in GitHub's answer are followed only to GitHub itself. ¦ Source de mises à jour officielle : github.com/darkckillerc4/MiniWireshark. Les liens de la réponse de GitHub ne sont suivis que vers GitHub lui-même. ¦ Fuente de actualizaciones oficial: github.com/darkckillerc4/MiniWireshark. Los enlaces de la respuesta de GitHub solo se siguen hacia el propio GitHub.
+Update check: once a day, one request to api.github.com for the latest version number. Nothing about you is sent. Turn it off in Updates & Dependencies. ¦ Recherche de mises à jour : une fois par jour, une seule demande à api.github.com pour le numéro de la dernière version. Rien sur vous n'est envoyé. Désactivez-la dans Mises à jour. ¦ Búsqueda de actualizaciones: una vez al día, una sola petición a api.github.com para el número de la última versión. No se envía nada sobre usted. Desactívela en Actualizaciones.
 Offer to install updates (keeps a backup) ¦ Proposer d'installer les mises à jour (garde une sauvegarde) ¦ Ofrecer instalar actualizaciones (guarda una copia)
 Downloads the new .py from the release, checks it, saves a backup of this version, then replaces it atomically. If the new version fails to start, the backup is restored automatically. ¦ Télécharge le nouveau .py de la version, le vérifie, sauvegarde cette version puis la remplace d'un coup. Si la nouvelle version ne démarre pas, la sauvegarde est restaurée automatiquement. ¦ Descarga el nuevo .py de la versión, lo comprueba, guarda una copia de esta versión y la sustituye de una vez. Si la nueva versión no arranca, la copia se restaura automáticamente.
 Check for updates now ¦ Rechercher des mises à jour ¦ Buscar actualizaciones ahora
@@ -26975,7 +27145,10 @@ No matches found. Tip: try device:, site:, ip:, port: or alert: ¦ Aucun résult
 No packets to save yet. ¦ Pas encore de paquets à enregistrer. ¦ Aún no hay paquetes que guardar.
 No settings match that search. ¦ Aucun paramètre ne correspond à cette recherche. ¦ Ningún ajuste coincide con esa búsqueda.
 No timed lookups yet ¦ Pas encore de recherche chronométrée ¦ Aún no hay búsquedas cronometradas
-No update source is configured. If you host this script's releases on GitHub, set “owner/repo” in Settings → Updates & Dependencies — MiniWireshark never guesses one. ¦ Aucune source de mises à jour n'est configurée. Si vous publiez ce script sur GitHub, indiquez « propriétaire/dépôt » dans Paramètres → Mises à jour — MiniWireshark n'en devine jamais. ¦ No hay ninguna fuente de actualizaciones configurada. Si publica este script en GitHub, indique «propietario/repositorio» en Ajustes → Actualizaciones — MiniWireshark nunca adivina una.
+MiniWireshark now checks the official GitHub page for a new version once a day. You can turn this off in Settings → Updates & Dependencies. ¦ MiniWireshark cherche maintenant une nouvelle version sur sa page GitHub officielle une fois par jour. Vous pouvez le désactiver dans Paramètres → Mises à jour. ¦ MiniWireshark ahora busca una versión nueva en su página oficial de GitHub una vez al día. Puede desactivarlo en Ajustes → Actualizaciones.
+The update source in Settings → Updates & Dependencies isn't a GitHub owner/name, so nothing was checked. Click “Use the official source” there to fix it. ¦ La source de mises à jour dans Paramètres → Mises à jour n'est pas un propriétaire/nom GitHub : rien n'a été vérifié. Cliquez sur « Utiliser la source officielle » pour la corriger. ¦ La fuente de actualizaciones en Ajustes → Actualizaciones no es un propietario/nombre de GitHub, así que no se comprobó nada. Pulse «Usar la fuente oficial» para corregirla.
+It says a newer version is out (%s). Check it yourself before you download anything: %s ¦ Elle annonce une version plus récente (%s). Vérifiez vous-même avant de télécharger quoi que ce soit : %s ¦ Dice que hay una versión más nueva (%s). Compruébelo usted antes de descargar nada: %s
+A newer version (%s) is on the official GitHub page: %s ¦ Une version plus récente (%s) est sur la page GitHub officielle : %s ¦ Hay una versión más nueva (%s) en la página oficial de GitHub: %s
 No website names were seen for this address. ¦ Aucun nom de site n'a été vu pour cette adresse. ¦ No se vio ningún nombre de sitio para esta dirección.
 Nothing to show yet — start watching and browse for a bit. ¦ Rien à afficher pour l'instant — commencez à observer et naviguez un peu. ¦ Aún no hay nada que mostrar — empiece a observar y navegue un poco.
 Nothing to undo — you haven't changed any device identities in this session. ¦ Rien à annuler — vous n'avez modifié aucune identité d'appareil dans cette session. ¦ Nada que deshacer — no ha cambiado ninguna identidad de dispositivo en esta sesión.
@@ -28656,6 +28829,13 @@ _i18n_load()
 
 # Dynamic strings: (English pattern, French, Spanish); groups are kept.
 I18N_PATTERNS = [
+    # ---- 5.3.4: an update source that isn't the official one
+    (r"Unofficial update source: (.+?)\. Official releases come only from "
+     r"github\.com/darkckillerc4/MiniWireshark(\.?)",
+     r"Source de mises à jour non officielle : \1. Les versions officielles "
+     r"viennent uniquement de github.com/darkckillerc4/MiniWireshark\2",
+     r"Fuente de actualizaciones no oficial: \1. Las versiones oficiales "
+     r"solo vienen de github.com/darkckillerc4/MiniWireshark\2"),
     # ---- V5.0.2: live status pieces
     (r"👀 Watching “(.+)”\.", r"👀 Observation de « \1 ».",
      r"👀 Observando «\1»."),
@@ -32253,6 +32433,11 @@ SETTINGS_PAGES = [
                       "health checks, name lookups, downloads or update "
                       "checks. Every send is listed in the ledger below."},
              {"type": "info", "text_fn": "ledger_status_text"},
+             {"type": "info", "text": "Update check: once a day, one request "
+                                      "to api.github.com for the latest "
+                                      "version number. Nothing about you is "
+                                      "sent. Turn it off in Updates & "
+                                      "Dependencies."},
              {"type": "action", "actions": [
                  ("Open the self-traffic ledger…", "open_ledger")]},
          ]},
@@ -32456,21 +32641,26 @@ SETTINGS_PAGES = [
          ]},
      ]},
     {"id": "updates", "icon": "⬆", "title": "Updates & Dependencies",
-     "blurb": "Keep MiniWireshark and its helpers up to date — only "
-              "when you ask.",
+     "blurb": "Keep MiniWireshark up to date from its official GitHub "
+              "page, and its helpers when you ask.",
      "sections": [
          {"title": "Update checks", "controls": [
              {"key": "updates.repo", "type": "text", "width": 26,
-              "pattern": r"^[\w.-]+/[\w.-]+$",
-              "pattern_msg": "Use the form owner/name, e.g. yourname/"
-                             "miniwireshark",
+              "pattern": UPDATE_REPO_PATTERN,
+              "pattern_msg": "Use only owner/name as on GitHub (letters, "
+                             "digits, - . _), not a web address.",
               "label": "GitHub repository",
-              "help": "Where new releases are published, as owner/name. "
-                      "Leave empty and MiniWireshark never checks."},
+              "help": "Where new releases are looked for, as owner/name. "
+                      "Leave it as it is: other download sites may be "
+                      "fake."},
+             {"type": "info", "text_fn": "update_source_text",
+              "live": "updates.repo"},
+             {"type": "action", "actions": [
+                 ("Use the official source", "official_update_source")]},
              {"key": "updates.check_automatically", "type": "bool",
-              "label": "Check when MiniWireshark opens",
-              "requires": "updates.repo",
-              "help": "Asks GitHub for the latest release number only."},
+              "label": "Check for a new version once a day",
+              "help": "One request to api.github.com for the latest "
+                      "version number. Nothing about you is sent."},
              {"key": "updates.allow_self_update", "type": "bool",
               "label": "Offer to install updates (keeps a backup)",
               "requires": "updates.repo",
@@ -32791,6 +32981,11 @@ class SettingsWindow:
             self._show_error(key)
             if self.controls[key]["type"] == "shortcut" and not msg:
                 self._shortcut_prev[key] = self.vars[key].get()
+            for live, fn, lbl in getattr(self, "_live_info", []):
+                if live == key:
+                    with contextlib.suppress(tk.TclError):
+                        lbl.configure(text=translate_lines(
+                            getattr(self, fn)()))
         self._refresh_deps()
         self._refresh_footer()
         self._update_conflicts()
@@ -33010,6 +33205,7 @@ class SettingsWindow:
         self._wrap = [(l, r) for l, r in self._wrap if l is self.blurb_lbl]
         self._deps = []
         self._err_labels = {}
+        self._live_info = []
 
     def show_page(self, page_id):
         self.page_id = page_id
@@ -33198,7 +33394,11 @@ class SettingsWindow:
 
         elif typ == "info":
             text = c.get("text") or getattr(self, c["text_fn"])()
-            self._help(row, translate_lines(text), reserve=40)
+            lbl = self._help(row, translate_lines(text), reserve=40)
+            if c.get("live"):
+                # redrawn as the setting it describes is typed
+                self.__dict__.setdefault("_live_info", []).append(
+                    (c["live"], c["text_fn"], lbl))
 
         elif typ == "cvd_preview":
             self._cvd_preview(row)
@@ -33389,7 +33589,9 @@ class SettingsWindow:
             on = bool(v.get()) if isinstance(v, tk.BooleanVar) else \
                 bool(str(v.get()).strip()) if v is not None else True
             if isinstance(v, tk.StringVar) and req == "updates.repo":
-                on = on and not self.errors.get(req)
+                # 5.3.4: empty means the official source, so only a
+                # source that isn't owner/name turns these off
+                on = not self.errors.get(req)
             for w in widgets:
                 try:
                     w.state(["!disabled"] if on else ["disabled"])
@@ -33452,6 +33654,28 @@ class SettingsWindow:
     def ledger_status_text(self):
         return self.app.ledger_status_text()
 
+    def update_source_text(self):
+        """Says whether the source in the box (as typed, before Apply) is
+        the official one."""
+        v = self.vars.get("updates.repo")
+        typed = str(v.get() if v is not None else
+                    self.cfg.get("updates.repo", "") or "").strip()
+        if typed and not valid_update_repo(typed):
+            return ("\u26a0 This isn't a GitHub owner/name, so nothing "
+                    "would be checked.")
+        note = unofficial_source_note(typed)
+        if note:
+            return "\u26a0 " + note + "."
+        return ("\u2714 Official update source: " + OFFICIAL_UPDATE_PAGE +
+                ". Links in GitHub's answer are followed only to GitHub "
+                "itself.")
+
+    def use_official_update_source(self):
+        v = self.vars.get("updates.repo")
+        if v is not None:
+            v.set(OFFICIAL_UPDATE_REPO)
+            self._on_change("updates.repo")
+
     def release_keys_text(self):
         if RELEASE_KEYS:
             return ("Updates and data packs are installed only when signed "
@@ -33481,6 +33705,8 @@ class SettingsWindow:
                                     parent=self.win)
         elif name == "check_updates":
             self.app._check_for_updates(manual=True)
+        elif name == "official_update_source":
+            self.use_official_update_source()
         elif name == "install_datapack":
             self.app.install_datapack(self.win)
         elif name == "geoip_test":
@@ -46876,10 +47102,9 @@ class MiniWireshark:
         else:
             self.status_var.set("Ready. Click “Start watching” when "
                                 "you'd like to begin.")
-        if self.config.get("updates.check_automatically", False) and \
-                self.config.get("updates.repo", "").strip():
-            self.root.after(4000, lambda: self._check_for_updates(
-                manual=False))
+        # 5.3.4: the official GitHub page is asked once a day, off the Tk
+        # thread, through the same gate as every other send
+        self.root.after(4000, self._auto_update_check)
         LOG.info("GUI started (version %s, %s)", SCRIPT_VERSION,
                  platform.platform())
 
@@ -57807,17 +58032,45 @@ proc ::mw_retheme {w map fgnew deffg} {
     # ======================================================================
     #  Updates (opt-in) and safe self-update
     # ======================================================================
+    def _auto_update_check(self):
+        """The automatic check: at most once a day, never while a gate
+        says no (see auto_update_blocked). Looks again every hour, so a
+        window left open for days still hears of a new version."""
+        with contextlib.suppress(tk.TclError):
+            self.root.after(3_600_000, self._auto_update_check)
+        if self.config.get("updates.notice_pending", False):
+            self.config.set("updates.notice_pending", False)
+            self.config.save()
+            self._set_banner("⬆️  " + translate_text(
+                "MiniWireshark now checks the official GitHub page for a "
+                "new version once a day. You can turn this off in "
+                "Settings → Updates & Dependencies."))
+        why = auto_update_blocked(self.config,
+                                  getattr(self, "data_mode", "live"))
+        if why:
+            LOG.info("automatic update check skipped: %s", why)
+            return False
+        return self._check_for_updates(manual=False)
+
     def _check_for_updates(self, manual=True):
-        repo = self.config.get("updates.repo", "").strip()
+        typed = str(self.config.get("updates.repo", "") or "").strip()
+        repo = update_repo(self.config)
         if not repo:
+            LOG.warning("update source %r is not owner/name; not checked",
+                        typed[:120])
             if manual:
                 messagebox.showinfo(
                     "Check for updates",
-                    "No update source is configured. If you host this "
-                    "script's releases on GitHub, set “owner/repo” "
-                    "in Settings → Updates & Dependencies — "
-                    "MiniWireshark never guesses one.", parent=self.root)
-            return
+                    translate_text(
+                        "The update source in Settings → Updates & "
+                        "Dependencies isn't a GitHub owner/name, so nothing "
+                        "was checked. Click “Use the official "
+                        "source” there to fix it."), parent=self.root)
+            return False
+        # the time of the attempt counts, so a failing network is asked at
+        # most once a day too
+        self.config.set("updates.last_check", time.time())
+        self.config.save()
 
         def worker():
             try:
@@ -57826,39 +58079,54 @@ proc ::mw_retheme {w map fgnew deffg} {
                     "User-Agent": APP_NAME,
                     "Accept": "application/vnd.github+json"})
                 with net_urlopen("update", req, 8, "latest release") as resp:
-                    data = json.loads(resp.read().decode("utf-8", "ignore"))
-                tag = str(data.get("tag_name", "")).lstrip("v")
-                assets = [a.get("browser_download_url", "")
-                          for a in data.get("assets", []) or []
-                          if str(a.get("name", "")).endswith(".py")]
-                self._update_manifest_url = next(
-                    (a.get("browser_download_url", "") for a in
-                     data.get("assets", []) or []
-                     if a.get("name") == MANIFEST_NAME), "")
+                    if not update_url_ok(resp.geturl()):
+                        raise ValueError("the answer came from outside "
+                                         "GitHub and was ignored")
+                    data = json.loads(resp.read(2_000_000).decode(
+                        "utf-8", "ignore"))
+                rel = parse_release_answer(data, repo)
+                self._update_manifest_url = rel["manifest"]
                 self._async_results.put(lambda: self._report_update_result(
-                    tag, data.get("html_url", ""), assets, None, manual))
+                    rel["tag"], rel["assets"], None, manual, repo))
             except (OSError, ValueError, urllib.error.URLError) as e:
                 msg = str(e)
                 self._async_results.put(lambda: self._report_update_result(
-                    None, "", [], msg, manual))
+                    None, [], msg, manual, repo))
         threading.Thread(target=worker, daemon=True, name="update-check"
                          ).start()
+        return True
 
-    def _report_update_result(self, tag, url, assets, err, manual):
+    def _report_update_result(self, tag, assets, err, manual,
+                              repo=OFFICIAL_UPDATE_REPO):
+        """`tag` is the release's tag as GitHub gave it (already checked
+        to be a version). The only link ever shown is built here."""
+        note = unofficial_source_note(repo)
+        note = translate_text(note) + "." if note else ""
         if err is not None:
             if manual:
                 self._set_banner(f"⚠️  Couldn't check for updates "
                                  f"({err}).", kind="warn")
             return
-        if tag and _version_tuple(tag) > _version_tuple(SCRIPT_VERSION):
-            self._set_banner(f"⬆️  A newer version ({tag}) is "
-                             f"available. Release notes: {url}", kind="warn")
+        version = str(tag or "").lstrip("v")
+        url = release_page_url(repo, tag) if tag else ""
+        if version and _version_tuple(version) > \
+                _version_tuple(SCRIPT_VERSION):
+            if note:
+                self._set_banner("⚠️  " + note + " " + translate_text(
+                    "It says a newer version is out (%s). Check it yourself "
+                    "before you download anything: %s") % (version, url),
+                    kind="warn")
+            else:
+                self._set_banner("⬆️  " + translate_text(
+                    "A newer version (%s) is on the official GitHub page: "
+                    "%s") % (version, url), kind="warn")
             if not RELEASE_KEYS or not getattr(
                     self, "_update_manifest_url", ""):
                 if manual:
                     messagebox.showinfo(
                         "Update available",
-                        f"MiniWireshark {tag} is available (you have "
+                        (note + "\n\n" if note else "") +
+                        f"MiniWireshark {version} is available (you have "
                         f"{SCRIPT_VERSION}).\n\nThis copy only installs "
                         f"releases signed with a trusted release key, and "
                         + ("none is configured" if not RELEASE_KEYS else
@@ -57869,12 +58137,13 @@ proc ::mw_retheme {w map fgnew deffg} {
             if self.config.get("updates.allow_self_update", False) and \
                     assets and messagebox.askyesno(
                         "Update available",
-                        f"MiniWireshark {tag} is available (you have "
+                        (note + "\n\n" if note else "") +
+                        f"MiniWireshark {version} is available (you have "
                         f"{SCRIPT_VERSION}).\n\nDownload and install it now? "
                         f"A backup of this version is kept and restored "
                         f"automatically if the new one fails to start.",
                         parent=self.root):
-                self._self_update(assets[0], tag)
+                self._self_update(assets[0], version)
         elif manual:
             self._set_banner(f"✅  You're on the latest version "
                              f"({SCRIPT_VERSION}).")
@@ -57882,16 +58151,23 @@ proc ::mw_retheme {w map fgnew deffg} {
     def _self_update(self, url, tag):
         murl = getattr(self, "_update_manifest_url", "")
 
+        def fetch(link, timeout, what, limit):
+            # checked before the send and again after any redirect
+            if not update_url_ok(link):
+                raise ValueError(f"the {what} link is not on GitHub")
+            req = urllib.request.Request(link, headers={
+                "User-Agent": APP_NAME})
+            with net_urlopen("update", req, timeout, what) as r:
+                if not update_url_ok(r.geturl()):
+                    raise ValueError(f"the {what} was sent from outside "
+                                     f"GitHub")
+                return r.read(limit)
+
         def work():
             try:
-                req = urllib.request.Request(murl, headers={
-                    "User-Agent": APP_NAME})
-                with net_urlopen("update", req, 30, "signed manifest") as r:
-                    manifest = json.loads(r.read(1_000_000).decode("utf-8"))
-                req = urllib.request.Request(url, headers={
-                    "User-Agent": APP_NAME})
-                with net_urlopen("update", req, 60, "new version") as r:
-                    data = r.read(20_000_000)
+                manifest = json.loads(fetch(murl, 30, "signed manifest",
+                                            1_000_000).decode("utf-8"))
+                data = fetch(url, 60, "new version", 20_000_000)
                 body = check_release(manifest, data)
                 msg = apply_self_update(data, body["version"])
             except (OSError, ValueError, urllib.error.URLError) as e:
@@ -73853,6 +74129,347 @@ def t_signed_updates_and_packs(ctx):
         .hexdigest()
 
 
+class _FakeUpdateAnswer:
+    """What urlopen returns, for the update tests (nothing is sent)."""
+
+    def __init__(self, body, final_url):
+        self.body, self.final_url = body, final_url
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self, n=-1):
+        return self.body
+
+    def geturl(self):
+        return self.final_url
+
+
+def _update_stub(ctx, extra=None, answer=None, final_url=None):
+    """An object with just what the update code uses, and a fake urlopen
+    that records every request instead of sending it. → (stub, sent,
+    restore)."""
+    cfg = ctx.cfg(extra)
+    banners, sent = [], []
+    stub = types.SimpleNamespace(
+        config=cfg, _async_results=queue.Queue(), data_mode="live",
+        root=types.SimpleNamespace(after=lambda *a, **k: None),
+        _set_banner=lambda text, kind="info", action=None:
+        banners.append(text))
+    stub.banners = banners
+    for name in ("_check_for_updates", "_report_update_result",
+                 "_auto_update_check", "_self_update"):
+        setattr(stub, name, types.MethodType(getattr(MiniWireshark, name),
+                                             stub))
+    stub.dialogs = []
+    orig = (urllib.request.urlopen, messagebox.showinfo, messagebox.askyesno)
+
+    def fake(req, timeout=None):
+        url = req.full_url if isinstance(req, urllib.request.Request) \
+            else str(req)
+        sent.append(url)
+        body = json.dumps(answer if answer is not None else
+                          {"tag_name": "v1.0.0", "assets": []}).encode()
+        return _FakeUpdateAnswer(body, final_url or url)
+    urllib.request.urlopen = fake
+    messagebox.showinfo = lambda *a, **k: stub.dialogs.append(a) or "ok"
+    messagebox.askyesno = lambda *a, **k: stub.dialogs.append(a) and False
+
+    def restore():
+        (urllib.request.urlopen, messagebox.showinfo,
+         messagebox.askyesno) = orig
+    return stub, sent, restore
+
+
+def _update_run(stub, manual=False):
+    """Run one check to the end (its thread, then its Tk-side result)."""
+    started = stub._check_for_updates(manual=manual)
+    for t in list(threading.enumerate()):
+        if t.name == "update-check":
+            t.join(5)
+    while True:
+        try:
+            stub._async_results.get_nowait()()
+        except queue.Empty:
+            break
+    return started
+
+
+@self_test()
+def t_update_source_default_and_migration(ctx):
+    """5.3.4: updates come from the official GitHub page and are checked
+    automatically by default; an old settings file with no source moves to
+    it, a source and choice of the user's own are kept."""
+    d = _default_config()["updates"]
+    assert d["repo"] == OFFICIAL_UPDATE_REPO == "darkckillerc4/MiniWireshark"
+    assert d["check_automatically"] is True, d
+    assert d["allow_self_update"] is False      # self-install stays opt-in
+    assert update_repo(ctx.cfg()) == OFFICIAL_UPDATE_REPO
+    assert update_repo(ctx.cfg({"updates.repo": ""})) == OFFICIAL_UPDATE_REPO
+
+    def load(updates, ver=2):
+        p = ctx.path(f"upd_{uuid.uuid4().hex}.json")
+        data = {"config_version": ver}
+        if updates is not None:
+            data["updates"] = updates
+        with open(p, "w") as f:
+            json.dump(data, f)
+        return AppConfig(path=p)
+    # 5.3.3 wrote every key: no source, checks off (the box was greyed out)
+    c = load({"check_automatically": False, "repo": "",
+              "allow_self_update": False})
+    assert c.get("updates.repo") == OFFICIAL_UPDATE_REPO
+    assert c.get("updates.check_automatically") is True
+    assert c.get("updates.notice_pending") is True   # told once, can undo
+    assert c.data["config_version"] == CONFIG_SCHEMA_VERSION
+    # no updates section at all
+    c = load(None)
+    assert c.get("updates.repo") == OFFICIAL_UPDATE_REPO
+    assert c.get("updates.check_automatically") is True
+    # the user's own source and their explicit "off" are kept
+    c = load({"check_automatically": False, "repo": "someone/fork"})
+    assert c.get("updates.repo") == "someone/fork"
+    assert c.get("updates.check_automatically") is False
+    assert not c.get("updates.notice_pending")
+    c = load({"repo": "someone/fork"})
+    assert c.get("updates.check_automatically") is True
+    # a file already on the new schema is not migrated again
+    c = load({"check_automatically": False, "repo": OFFICIAL_UPDATE_REPO},
+             ver=3)
+    assert c.get("updates.check_automatically") is False
+    # Safe Mode still turns the check off
+    assert SAFE_MODE_OVERRIDES["updates.check_automatically"] is False
+    assert "auto_update_check" in FEATURES and \
+        "auto_update_check" in FEATURE_HELP
+
+
+@self_test()
+def t_update_unofficial_source_warning(ctx):
+    """5.3.4: a source other than the official one works, but Settings and
+    every update message say plainly that it isn't official."""
+    assert unofficial_source_note(OFFICIAL_UPDATE_REPO) == ""
+    assert unofficial_source_note("DarkCkillerC4/miniwireshark") == ""
+    assert unofficial_source_note("") == ""
+    note = unofficial_source_note("someone/fork")
+    assert note == ("Unofficial update source: someone/fork. Official "
+                    "releases come only from github.com/darkckillerc4/"
+                    "MiniWireshark"), note
+    fr = translate_text(note + ".", "fr")
+    es = translate_text(note + ".", "es")
+    assert "non officielle" in fr and "someone/fork" in fr and \
+        fr.endswith("."), fr
+    assert "no oficial" in es and "someone/fork" in es, es
+    stub, sent, restore = _update_stub(ctx, {
+        "updates.repo": "someone/fork"}, answer={
+        "tag_name": "v99.0.0", "html_url": "https://fake-mirror.example/dl",
+        "assets": []})
+    try:
+        assert _update_run(stub, manual=True)
+    finally:
+        restore()
+    assert sent == ["https://api.github.com/repos/someone/fork/releases/"
+                    "latest"], sent
+    b = stub.banners[-1]
+    assert "Unofficial update source: someone/fork" in b, b
+    assert "github.com/darkckillerc4/MiniWireshark" in b, b
+    assert "official GitHub page" not in b, b
+    assert "https://github.com/someone/fork/releases/tag/v99.0.0" in b, b
+    assert "fake-mirror" not in b, b
+    # the official source says so, and points at its own page
+    stub, sent, restore = _update_stub(ctx, answer={"tag_name": "v99.0.0"})
+    try:
+        _update_run(stub, manual=True)
+    finally:
+        restore()
+    b = stub.banners[-1]
+    assert "official GitHub page" in b and "Unofficial" not in b, b
+    assert ("https://github.com/darkckillerc4/MiniWireshark/releases/tag/"
+            "v99.0.0") in b, b
+
+
+@self_test()
+def t_update_repo_format(ctx):
+    """5.3.4: the update source is GitHub's owner/name and nothing else:
+    no web address, no other host, no path, only GitHub's characters."""
+    good = ["darkckillerc4/MiniWireshark", "a/b", "a-b/c.d_e", "A1/x-y",
+            "a" * 39 + "/r", "o/" + "r" * 100, "o/.hidden", "o/a..b"]
+    bad = ["", "a", "/b", "a/", "a/b/c", "https://github.com/a/b",
+           "github.com/a/b", "evil.example/a", "a/b?x=1", "a/b#x",
+           "-a/b", "a-/b", "a--b/c", "a_b/c", "a.b/c", "a/..", "a/.",
+           "a /b", "a/b ", "a/b\n", "a\\b", "a@b/c", "a:443/b",
+           "a" * 40 + "/r", "o/" + "r" * 101, "été/x", "a/b%2f",
+           "a/b c", None, 42]
+    for r in good:
+        assert valid_update_repo(r), r
+    for r in bad:
+        assert not valid_update_repo(r), r
+    # the Settings box uses the same rule
+    ctl = next(c for p in SETTINGS_PAGES for s in p["sections"]
+               for c in s["controls"] if c.get("key") == "updates.repo")
+    assert ctl["pattern"] == UPDATE_REPO_PATTERN
+    assert re.match(ctl["pattern"], "https://evil.example/x") is None
+    assert re.match(ctl["pattern"], "a/b\n") is None
+    # a bad source is never asked, not even by hand
+    assert update_repo(ctx.cfg({"updates.repo": "evil.example/x/y"})) == ""
+    stub, sent, restore = _update_stub(ctx, {
+        "updates.repo": "https://evil.example/x"})
+    try:
+        assert not _update_run(stub, manual=True)
+        assert not stub._auto_update_check()
+    finally:
+        restore()
+    assert sent == [], sent
+
+
+@self_test()
+def t_update_links_github_only(ctx):
+    """5.3.4: a link from GitHub's answer is used only when it is https on
+    github.com, api.github.com or GitHub's download hosts; anything else
+    (a fake mirror in html_url or browser_download_url) is ignored and
+    logged. The page shown is built by the program from source and tag."""
+    for u in ("https://github.com/a/b/releases/download/v1/m.py",
+              "https://objects.githubusercontent.com/x",
+              "https://release-assets.githubusercontent.com/x",
+              "https://api.github.com/repos/a/b",
+              "https://GitHub.com:443/a"):
+        assert update_url_ok(u), u
+    for u in ("http://github.com/a", "https://github.com.evil.example/a",
+              "https://evil.example/github.com/a", "https://github.com:8443/a",
+              "https://user@github.com/a", "ftp://github.com/a",
+              "https://githubusercontent.com/a", "//github.com/a",
+              "https://[::1]/a", "javascript:alert(1)", "", None):
+        assert not update_url_ok(u), u
+    good = "https://github.com/darkckillerc4/MiniWireshark/releases/" \
+           "download/v6.0.0/"
+    rel = parse_release_answer({
+        "tag_name": "v6.0.0",
+        "html_url": "https://miniwireshark-download.example/v6",
+        "assets": [
+            {"name": "miniwireshark.py",
+             "browser_download_url": "https://fake-host.example/m.py"},
+            {"name": "miniwireshark.py",
+             "browser_download_url": good + "miniwireshark.py"},
+            {"name": MANIFEST_NAME,
+             "browser_download_url": "http://github.com/x/" + MANIFEST_NAME},
+            {"name": "notes.txt",
+             "browser_download_url": "https://fake-host.example/n"}]},
+        OFFICIAL_UPDATE_REPO)
+    assert rel["assets"] == [good + "miniwireshark.py"], rel
+    assert rel["manifest"] == "", rel
+    assert rel["page"] == ("https://github.com/darkckillerc4/MiniWireshark/"
+                           "releases/tag/v6.0.0"), rel
+    assert len(rel["ignored"]) == 3, rel["ignored"]
+    assert rel["version"] == "6.0.0"
+    for tag in ("latest", "v6", "6.0.0-evil", "../../x", "v6.0.0/../a", "",
+                "v6.0.0 ", None):
+        try:
+            parse_release_answer({"tag_name": tag}, OFFICIAL_UPDATE_REPO)
+            raise AssertionError(f"tag {tag!r} accepted")
+        except ValueError:
+            pass
+    # an answer that was redirected away from GitHub is not used at all
+    stub, sent, restore = _update_stub(
+        ctx, answer={"tag_name": "v99.0.0"},
+        final_url="https://fake-host.example/latest")
+    try:
+        _update_run(stub, manual=True)
+    finally:
+        restore()
+    assert len(sent) == 1 and "99.0.0" not in " ".join(stub.banners), \
+        stub.banners
+    # self-install refuses a download link off GitHub before sending
+    stub, sent, restore = _update_stub(ctx)
+    stub._update_manifest_url = "https://fake-host.example/" + MANIFEST_NAME
+    try:
+        stub._self_update(good + "miniwireshark.py", "6.0.0")
+        for t in list(threading.enumerate()):
+            if t.name == "self-update":
+                t.join(5)
+        stub._async_results.get(timeout=5)()
+    finally:
+        restore()
+    assert sent == [], sent
+    assert stub.dialogs and "nothing was changed" in stub.dialogs[-1][1], \
+        stub.dialogs
+
+
+@self_test()
+def t_update_check_once_a_day(ctx):
+    """5.3.4: the automatic check asks GitHub at most once a day (the time
+    is kept in the settings file); a clock set back still allows one."""
+    now = time.time()
+    cfg = ctx.cfg()
+    assert update_check_due(cfg, now)               # never checked
+    cfg.set("updates.last_check", now - 3600)
+    assert not update_check_due(cfg, now)
+    cfg.set("updates.last_check", now - UPDATE_CHECK_INTERVAL - 1)
+    assert update_check_due(cfg, now)
+    cfg.set("updates.last_check", now + 5 * 86400)   # clock went back
+    assert update_check_due(cfg, now)
+    cfg.set("updates.last_check", "garbage")
+    assert update_check_due(cfg, now)
+    stub, sent, restore = _update_stub(ctx)
+    try:
+        assert stub._auto_update_check()
+        for t in list(threading.enumerate()):
+            if t.name == "update-check":
+                t.join(5)
+        assert len(sent) == 1, sent
+        assert float(stub.config.get("updates.last_check")) >= now
+        # saved, so the next start knows too
+        with open(stub.config.path, encoding="utf-8") as f:
+            assert json.load(f)["updates"]["last_check"] >= now
+        assert not stub._auto_update_check()
+        assert not stub._auto_update_check()
+        assert len(sent) == 1, sent
+        # a check by hand is never held back by the daily limit
+        _update_run(stub, manual=True)
+        assert len(sent) == 2, sent
+    finally:
+        restore()
+
+
+@self_test()
+def t_update_check_kill_switch_offline(ctx):
+    """5.3.4: the automatic check never runs with the kill switch on, while
+    working offline (a file, a saved session, the demo), with its switch
+    off or when turned off in Settings; a check by hand still goes through
+    the outbound gate, which the kill switch closes."""
+    assert auto_update_blocked(ctx.cfg()) == ""
+    assert "kill switch" in auto_update_blocked(ctx.cfg(
+        {"privacy.kill_switch": True}))
+    for mode in ("offline", "session", "demo"):
+        assert "offline" in auto_update_blocked(ctx.cfg(), mode), mode
+    assert auto_update_blocked(ctx.cfg({
+        "updates.check_automatically": False}))
+    was_f = FEATURES["auto_update_check"]
+    FEATURES["auto_update_check"] = False
+    try:
+        assert "auto_update_check" in auto_update_blocked(ctx.cfg())
+    finally:
+        FEATURES["auto_update_check"] = was_f
+    was = LEDGER.killed
+    stub, sent, restore = _update_stub(ctx)
+    try:
+        LEDGER.killed = True
+        assert "kill switch" in auto_update_blocked(stub.config)
+        assert not stub._auto_update_check()
+        _update_run(stub, manual=True)            # by hand: the gate says no
+        LEDGER.killed = was
+        stub.data_mode = "offline"
+        assert not stub._auto_update_check()
+    finally:
+        LEDGER.killed = was
+        restore()
+    assert sent == [], sent
+    assert any("kill switch" in b for b in stub.banners), stub.banners
+    assert any(e["feature"] == "update" and not e["allowed"]
+               for e in LEDGER.snapshot("update"))
+
+
 @self_test(slow=False)
 def test_i18n_catalog(ctx):
     """Languages: the catalog parses cleanly and covers every fixed string
@@ -78126,6 +78743,9 @@ def _bench_child(sid, out_path, pcap):
                      ("general.show_welcome", False),
                      ("appearance.beginner_mode", False),
                      ("appearance.inspector", True),
+                     # 5.3.4: checks are on by default now; a measured run
+                     # must not reach the Internet
+                     ("updates.check_automatically", False),
                      ("general.language", spec["language"]),
                      ("appearance.text_size", spec["text_size"])):
         cfg.set(key, val)
@@ -83276,6 +83896,69 @@ def _gs_repair(app, ctx):
     app._settings_win.show_page("diagnostics")
     _gui_pump(root, 0.2)
     app._settings_win.win.destroy()
+
+
+@gui_test_step("Settings: the official update source row (5.3.4)")
+def _gs_official_update_source(app, ctx):
+    """The Updates page shows the official source, warns while another
+    one is typed, refuses a web address, and "Use the official source"
+    puts the official one back."""
+    root = app.root
+    win = app._open_settings("updates")
+    _gui_pump(root, 0.3)
+    try:
+        win.show_page("updates")
+        _gui_pump(root, 0.2)
+        var = win.vars["updates.repo"]
+        var.set("")                 # an empty box means the official source
+        _gui_pump(root, 0.1)
+        live = [lbl for k, _fn, lbl in win._live_info if k == "updates.repo"]
+        assert len(live) == 1, win._live_info
+
+        def shown():
+            # what the label shows is the row's text, in the current
+            # language; the English is checked for its meaning
+            text = win.update_source_text()
+            assert live[0].cget("text") == translate_lines(text), (
+                live[0].cget("text"), text)
+            return text
+        assert "Official update source: github.com/darkckillerc4/" \
+               "MiniWireshark" in shown(), shown()
+        buttons = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, ttk.Button):
+                    buttons.append(c)
+                walk(c)
+        walk(win.content)
+        want = translate_text("Use the official source")
+        btn = next((b for b in buttons if b.cget("text") == want), None)
+        assert btn is not None, [b.cget("text") for b in buttons]
+        var.set("someone/fork")
+        _gui_pump(root, 0.1)
+        text = shown()
+        assert "Unofficial update source: someone/fork" in text, text
+        assert "github.com/darkckillerc4/MiniWireshark" in text, text
+        assert "updates.repo" not in win.errors
+        var.set("https://evil.example/someone/fork")
+        _gui_pump(root, 0.1)
+        assert "updates.repo" in win.errors, win.errors
+        assert "isn't a GitHub owner/name" in shown()
+        assert not win.apply()                # refused, nothing saved
+        btn.invoke()
+        _gui_pump(root, 0.1)
+        assert var.get() == OFFICIAL_UPDATE_REPO, var.get()
+        assert "updates.repo" not in win.errors, win.errors
+        assert "Official update source" in shown()
+        # the once-a-day box is on by default and says what is sent
+        assert win.controls["updates.check_automatically"]["help"]. \
+            startswith("One request to api.github.com")
+        assert win._default_for("updates.check_automatically") is True
+    finally:
+        with contextlib.suppress(tk.TclError):
+            win.win.destroy()
+        _gui_pump(root, 0.1)
 
 
 def run_gui_test(live=False):

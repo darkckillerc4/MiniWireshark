@@ -19,6 +19,9 @@ No. It is MIT licensed.
 **Does it send my data anywhere?**
 No telemetry. Everything MiniWireshark itself sends (downloads, update checks, health checks, discovery probes, optional lookups) goes through one gate and is listed in the self-traffic ledger in **Settings → Privacy & Lookups**. The kill switch there blocks all of it.
 
+**Does it contact anything by itself?**
+Once a day it asks the official GitHub page for the latest version number: one request to `api.github.com`, with nothing about you. It only ever points you to <https://github.com/darkckillerc4/MiniWireshark/releases>, because other download sites may be fake. Turn it off in **Settings → Updates & Dependencies**; the kill switch and Safe Mode stop it too.
+
 **Does it store passwords it sees?**
 No. Mail logins, passwords and message bodies are dropped inside the parsers before anything is stored. A canary test checks reports, sessions, CSV files, logs, history and the clipboard for leaks. When a login is sent without encryption, the *Login sent without encryption* warning says who and where, never the password.
 

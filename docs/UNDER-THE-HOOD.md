@@ -57,11 +57,13 @@ A browser's first QUIC packet is encrypted with keys anyone can derive from the 
 
 An update is installed only when its manifest is signed by a release key, its SHA-256 and size match, and it is newer than the running version, so downgrades are refused. With no release key configured, updates are check-only. If an update fails to start, the next start rolls it back.
 
+**Where updates come from.** The source is the official GitHub repository, `darkckillerc4/MiniWireshark`, unless you type another `owner/name` (checked against GitHub's own naming rules: no web address, no other host). Once a day, off the window's thread, one request goes to `api.github.com` through `outbound()`; the time is kept in the settings file. Links in the answer count only when they are `https` on GitHub's hosts, the tag must be a version number, and the release page shown is built from the source and the tag, never taken from the answer. A source other than the official one is called *unofficial* in Settings and in every update message.
+
 Verification uses `cryptography` when present, and otherwise **a pure-Python Ed25519 (RFC 8032)**, checked against the RFC's own test vectors. The same signatures protect optional data packs.
 
 ## <img src="assets/icons/privacy.svg" width="28" alt=""> Privacy that is enforced, not promised
 
-- **One gate for everything it sends.** Downloads (including the private runtime's `pip` downloads), update checks, health checks, discovery probes, reverse lookups and the router check all pass through `outbound()`. Each send is written to a self-traffic ledger you can read, and the kill switch stops all of it.
+- **One gate for everything it sends.** Downloads (including the private runtime's `pip` downloads), the daily update check (one request to `api.github.com`), health checks, discovery probes, reverse lookups and the router check all pass through `outbound()`. Each send is written to a self-traffic ledger you can read, and the kill switch stops all of it.
 - **A test that reads the source.** A self-test parses the file and fails if any network send bypasses the gate, including subprocess launches, URL openers and sends hidden in helper functions or threads.
 - **A private data folder.** On Linux and macOS it is closed to other users (umask 077, mode 0700) and must belong to the user who started MiniWireshark. Capture asks for root only when it starts, and files written as root are handed back.
 - **Secrets dropped in the parser.** Mail logins, passwords and message bodies never reach storage. A **canary** secret is planted in test traffic in every place a password could appear, and the tests check reports, sessions, CSV files, logs, history and the clipboard for it. The *Login sent without encryption* warning has its own test that plants a password and searches every store for it.

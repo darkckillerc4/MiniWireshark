@@ -127,6 +127,7 @@ Without a capture driver, MiniWireshark still opens in limited mode, so you can 
 MiniWireshark is a **defensive** tool for networks you own or are allowed to monitor.
 
 - **No telemetry.** Everything MiniWireshark itself sends goes through one gate, `outbound()`, and is listed in a self-traffic ledger. A kill switch blocks all of it.
+- **Updates only from the official GitHub page.** Once a day MiniWireshark makes one request to `api.github.com` for the latest release of [darkckillerc4/MiniWireshark](https://github.com/darkckillerc4/MiniWireshark/releases). Nothing about you is sent, and it only ever points you to that GitHub page: other download sites may be fake. Turn it off in **Settings → Updates & Dependencies**.
 - **Secrets are dropped inside the parsers.** Mail logins, passwords and message bodies are never stored. A canary test checks reports, sessions, CSV files, logs, history and the clipboard for leaks.
 - **Your data folder is private.** It is closed to other users, and administrator rights are asked for only when capture starts (Linux and macOS).
 - **Redaction.** Reports and exports can replace real names and addresses with documentation-range pseudonyms.
