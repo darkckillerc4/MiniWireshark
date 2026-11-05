@@ -131,6 +131,11 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 _T_START = time.perf_counter()
+# M4/B18: a window start handed to the compiled copy counts from the start
+# of the process that handed it over (compiled_start_handoff)
+with contextlib.suppress(ValueError):
+    _T_START -= min(60.0, max(0.0, time.time() - float(
+        os.environ.pop("MW_T0", "") or "x")))
 LAUNCH_TIMES = {}
 APP_NAME = "MiniWireshark"
 SCRIPT_VERSION = "5.3.4"
@@ -1827,6 +1832,100 @@ def runtime_handoff(argv=None, environ=None, execute=True, suitable=None,
     return None
 
 
+COMPILED_CHILD_ENV = "MW_COMPILED_CHILD"
+
+
+def compiled_start_off(environ=None):
+    """compiled_start switched off before FEATURES exists (Safe Mode or
+    MW_FEATURES_OFF, as apply_feature_switches reads them later)."""
+    environ = os.environ if environ is None else environ
+    return SAFE_MODE or "compiled_start" in {
+        x.strip() for x in environ.get("MW_FEATURES_OFF", "").split(",")}
+
+
+def compiled_start_wanted(argv=None, environ=None):
+    """M4/B18: whether this start should hand its window to a process
+    loaded from the compiled copy. Windows window starts only (Linux and
+    macOS exec into the copy instead): never the tools (self-test, gate,
+    bench, worker, release), an elevated copy, Safe Mode, a frozen build,
+    a child of a hand-off, with compiled_start off (MW_FEATURES_OFF) or
+    without a fresh copy that passes the trust and HMAC checks."""
+    environ = os.environ if environ is None else environ
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not IS_WINDOWS or FROZEN or TOOL_MODE or _ELEV or \
+            SAFE_FLAG in argv or MW_STAGE == "app" or \
+            environ.get("MW_STAGE") == "app" or \
+            environ.get(COMPILED_CHILD_ENV) or \
+            environ.get("MINIWIRESHARK_NO_CACHED_START") or \
+            compiled_start_off(environ):
+        return False
+    try:
+        target = compiled_copy_path()
+        return compiled_copy_trusted(target) and \
+            _pyc_fresh(target, os.stat(SCRIPT_PATH))
+    except OSError:
+        return False
+
+
+def compiled_start_handoff(argv=None, environ=None, timeout=HANDSHAKE_TIMEOUT,
+                           popen=None):
+    """M4/B18: on Windows this process (which parsed the 4 MB file: some
+    250 MB Windows never gives back) starts the same program loaded from
+    the compiled copy and leaves once that one's window is up, as the
+    managed-Python hand-off does. When the child fails or is late, this
+    process carries on as before. -> "handed" (the caller exits), or
+    None."""
+    environ = os.environ if environ is None else environ
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not compiled_start_wanted(argv, environ):
+        return None
+    ready = os.path.join(BOOT_DIR, f"ready-{os.getpid()}-"
+                                   f"{uuid.uuid4().hex[:8]}")
+    env = cached_env(environ)
+    env[COMPILED_CHILD_ENV] = "1"
+    env["MW_READY_FILE"] = ready
+    env["MW_T0"] = repr(time.time() - (time.perf_counter() - _T_START))
+    try:
+        os.makedirs(BOOT_DIR, exist_ok=True)
+        proc = (popen or subprocess.Popen)(
+            cached_cmd(sys.executable, SCRIPT_PATH,
+                       argv + [READY_ARG + ready]), env=env, close_fds=True,
+            creationflags=0)         # its own console, if any, is this one
+    except OSError as e:
+        LOG.warning("compiled start: could not start it: %s", e)
+        return None
+    t0, rc = time.monotonic(), None
+    while not os.path.exists(ready) and rc is None and \
+            time.monotonic() - t0 < timeout:
+        time.sleep(0.05)
+        rc = proc.poll()
+    up = os.path.exists(ready)
+    if up or rc == 0:
+        # rc 0 before its window: it ended on its own (nothing to redo)
+        with contextlib.suppress(OSError):
+            os.remove(ready)
+        boot_step("hand-off", True, "the window runs from the compiled copy")
+        if BOOT is not None:
+            BOOT.mark(outcome="handed_off", reached_window=up)
+        return "handed"
+    result = "timeout" if rc is None else "exited"
+    if result == "timeout" and proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.terminate()
+        with contextlib.suppress(subprocess.SubprocessError, OSError):
+            proc.wait(5)
+        with contextlib.suppress(OSError):
+            proc.kill()
+    with contextlib.suppress(OSError):
+        os.remove(ready)
+    LOG.warning("compiled start: %s; starting here instead",
+                "no window in time" if result == "timeout" else
+                f"it stopped with code {rc}")
+    boot_step("hand-off", False, "the compiled copy did not start; "
+                                 "starting here")
+    return None
+
+
 def _handoff_failed(env, why, log_path):
     """Remember a failed hand-off so it is not retried automatically, and
     tell this start what happened."""
@@ -1979,6 +2078,15 @@ if __name__ == "__main__" and not TOOL_MODE and IS_WINDOWS and \
         BOOT.mark(outcome="fatal")
         boot_step("elevation", False, "administrator rights refused")
     sys.exit(1)
+
+# M4/B18: after the elevation step (an elevated start never hands off, and
+# a refused UAC prompt is never asked twice). The child's own children
+# (a restart, workers) start as usual: the marks are dropped here.
+if __name__ == "__main__" and not TOOL_MODE and not _ELEV:
+    if os.environ.pop(COMPILED_CHILD_ENV, None):
+        os.environ.pop("MW_READY_FILE", None)
+    elif compiled_start_handoff() == "handed":
+        sys.exit(0)
 
 
 # ---- Tk ---------------------------------------------------------------------
@@ -12075,7 +12183,8 @@ FEATURE_HELP = {
                   "card",
     "compiled_start": "on Windows the compiled copy of the program is "
                       "written by the program itself (a first start no "
-                      "longer compiles the file twice)",
+                      "longer compiles the file twice), and the window "
+                      "runs from it, which needs about half the memory",
     "auto_update_check": "once a day, MiniWireshark asks the official GitHub "
                          "page for the latest version number (one request "
                          "to api.github.com, nothing about you)",
@@ -77130,6 +77239,101 @@ def t_compiled_copy_start(ctx):
                                     target) is None
 
 
+@self_test(needs_source=True)
+def t_m4_compiled_start_exclusions(ctx):
+    """M4/B18: only a Windows window start with a fresh, trusted copy hands
+    off; never the tools, an elevated copy, Safe Mode, a frozen build, a
+    child of a hand-off or of the managed Python, with the copy turned off
+    (MW_FEATURES_OFF, MINIWIRESHARK_NO_CACHED_START) or a stale copy."""
+    fresh = ctx.path("m4-fresh.pyc")
+    if not compiled_copy_trusted(fresh):
+        return "skip"                 # root, or a shared folder
+    assert keep_compiled_copy(compile("x = 1\n", SCRIPT_PATH, "exec"),
+                              fresh) == fresh
+    plain = dict(IS_WINDOWS=True, FROZEN=False, TOOL_MODE=False,
+                 _ELEV=False, SAFE_MODE=False, MW_STAGE="",
+                 compiled_copy_path=lambda: fresh)
+    with _b9_patched(globals(), **plain):
+        if IS_WINDOWS:               # the copy's folder check is Windows'
+            assert compiled_start_wanted([], {})
+            assert compiled_start_wanted(["--demo"], {})
+        for name, value in (("IS_WINDOWS", False), ("FROZEN", True),
+                            ("TOOL_MODE", True), ("_ELEV", True),
+                            ("SAFE_MODE", True), ("MW_STAGE", "app")):
+            with _b9_patched(globals(), **{name: value}):
+                assert not compiled_start_wanted([], {}), name
+        for env in ({"MW_STAGE": "app"}, {COMPILED_CHILD_ENV: "1"},
+                    {"MINIWIRESHARK_NO_CACHED_START": "1"},
+                    {"MW_FEATURES_OFF": "dpi, compiled_start"}):
+            assert not compiled_start_wanted([], env), env
+        assert not compiled_start_wanted([SAFE_FLAG], {})
+        with _b9_patched(globals(), compiled_copy_path=lambda: ctx.path(
+                "m4-missing.pyc")):
+            assert not compiled_start_wanted([], {})
+    assert not compiled_start_off({}) or SAFE_MODE
+    assert compiled_start_off({"MW_FEATURES_OFF": "compiled_start"})
+    assert "compiled_start" in FEATURES and "compiled_start" in FEATURE_HELP
+
+
+@self_test()
+def t_m4_compiled_start_handoff_fallback(ctx):
+    """M4/B18 (the child is mocked): this process leaves only when the
+    child's window is up (or the child ended on its own with 0); a child
+    that fails, is late or can't start leaves this process to carry on,
+    and a late one is stopped. The child loads the compiled copy, knows
+    it is a hand-off child, and gets this start's time."""
+    runs = []
+
+    class Child:
+        def __init__(self, cmd, env=None, **kw):
+            self.cmd, self.env, self.kw = cmd, env, kw
+            self.rc, self.stopped = None, False
+            ready = env["MW_READY_FILE"]
+            mode = runs[-1]
+            if mode == "ready":
+                with open(ready, "w", encoding="utf-8") as f:
+                    f.write("READY 1\n")
+            elif mode in ("crash", "zero"):
+                self.rc = 3 if mode == "crash" else 0
+            runs[-1] = self
+
+        def poll(self):
+            return self.rc
+
+        def terminate(self):
+            self.stopped, self.rc = True, -15
+
+        def wait(self, timeout=None):
+            return self.rc
+
+        kill = terminate
+
+    def refuse(cmd, **kw):
+        raise OSError(2, "no python")
+
+    def run(mode, popen=Child):
+        runs.append(mode)
+        return compiled_start_handoff(["--demo"], {}, timeout=0.3,
+                                      popen=popen)
+    with _b9_patched(globals(), compiled_start_wanted=lambda a, e: True,
+                     BOOT_DIR=ctx.path("m4-boot")):
+        assert run("ready") == "handed"
+        child = runs[-1]
+        assert child.cmd[:3] == [sys.executable, "-c", CACHED_RUN]
+        assert child.cmd[4] == "--demo" and \
+            child.cmd[-1].startswith(READY_ARG)
+        assert child.env[COMPILED_CHILD_ENV] == "1" and \
+            child.env["MW_CACHED"] == "1" and child.env["MW_PYC"]
+        assert 0 <= time.time() - float(child.env["MW_T0"]) < 3600
+        assert not os.path.exists(child.env["MW_READY_FILE"])
+        assert run("zero") == "handed"
+        assert run("crash") is None and not runs[-1].stopped
+        assert run("late") is None and runs[-1].stopped
+        assert run("x", popen=refuse) is None
+    with _b9_patched(globals(), compiled_start_wanted=lambda a, e: False):
+        assert compiled_start_handoff([], {}, popen=refuse) is None
+
+
 @self_test()
 def t_release_gate_parts(ctx):
     """The release gate's pieces that need no window: the machine facts,
@@ -79350,11 +79554,16 @@ def bench_gui(argv):
         env = dict(os.environ)
         env["MINIWIRESHARK_DATA"] = tempfile.mkdtemp(prefix="mw_benchdata_")
         t0 = time.time()
+        cmd = self_cmd("--bench-gui", "--child", sid, "--out", part,
+                       "--pcap", captures[size])
+        # M4/B18: the window loads from the compiled copy, as a Windows
+        # start does with compiled_start on
+        if IS_WINDOWS and not FROZEN and _MAIN_CODE is not None and \
+                not compiled_start_off() and keep_compiled_copy(_MAIN_CODE):
+            cmd = cached_cmd(sys.executable, SCRIPT_PATH, cmd[2:])
+            env = cached_env(env)
         try:
-            rc = _run_hidden(self_cmd("--bench-gui",
-                                         "--child", sid, "--out", part,
-                                         "--pcap", captures[size]), env=env,
-                                timeout=3600).returncode
+            rc = _run_hidden(cmd, env=env, timeout=3600).returncode
         except subprocess.TimeoutExpired:
             rc = -1
         if rc != 0 or not os.path.exists(part):
