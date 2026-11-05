@@ -68,6 +68,27 @@ def release_exists(tag):
     return r.returncode == 0
 
 
+def released_asset(tag, version):
+    """(bytes, commit) of what release `tag` published: its .py asset and
+    the commit its tag points at. A rerun records these, never HEAD's file
+    and commit (HEAD may be later work under the same version)."""
+    name = f"miniwireshark-{version}.py"
+    work = tempfile.mkdtemp(prefix="mw-released-")
+    try:
+        subprocess.run(["gh", "release", "download", tag, "--pattern", name,
+                        "--dir", work], check=True)
+        with open(os.path.join(work, name), "rb") as f:
+            data = f.read()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    commit = subprocess.check_output(
+        ["gh", "api", "repos/{owner}/{repo}/commits/" + tag, "--jq", ".sha"],
+        text=True).strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        sys.exit(f"{tag}: the tag's commit could not be read ({commit!r})")
+    return data, commit
+
+
 def record(version, date, body, digest, lines, commit):
     """Update the manifest, version index and README for the new release."""
     tag = "v" + version
@@ -131,11 +152,16 @@ def main():
     # here); record() only adds what is missing
     released = not DRY and release_exists(tag)
     date, body = section
-    with open(path("miniwireshark.py"), "rb") as f:
-        data = f.read()
+    if released:
+        # (review 7) the index describes the published file: a later push
+        # under the same version must not record HEAD's digest and commit
+        data, commit = released_asset(tag, version)
+    else:
+        with open(path("miniwireshark.py"), "rb") as f:
+            data = f.read()
+        commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     digest = hashlib.sha256(data).hexdigest()
     lines = data.count(b"\n")
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 
     notes_file = path(".github", "release-notes", tag + ".md")
     own_notes = os.path.exists(notes_file)

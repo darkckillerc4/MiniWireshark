@@ -250,6 +250,18 @@ def private_dir_ok(path, fix=False):
     return not st.st_mode & 0o022
 
 
+def in_data_folder(path):
+    """True when `path` is the data folder or inside it: a folder this
+    program made, so private_dir_ok may close it (fix=True). A 5.2.3 run
+    under umask 002 made data/site and cache/bytecode 0775 (review 7)."""
+    try:
+        root = os.path.realpath(PATHS.data)
+        p = os.path.realpath(path)
+        return os.path.commonpath([root, p]) == root
+    except (NameError, AttributeError, ValueError, OSError):
+        return False
+
+
 def private_file_ok(path):
     """POSIX: a file of a trusted user that only its owner can read and
     write (a key). Windows: it exists."""
@@ -738,13 +750,28 @@ def _fatal_dialog(title, message):
             sys.stderr.write(f"\n*** {title} ***\n{message}\n")
 
 
-def _relaunch_elevated(more_args=()):
+def _elevated_exit(rc, before_exit=None):
+    """(review 7) The elevated copy ran: this start ends "elevated", not
+    "running" (two of those sent the next start into Safe Mode), after
+    `before_exit` (the main window's clean close) had its turn."""
+    if BOOT is not None:
+        BOOT.mark(outcome="elevated")
+    if before_exit is not None:
+        try:
+            before_exit()
+        except Exception:                            # noqa: BLE001
+            LOG.exception("closing before the elevated copy's exit")
+    sys.exit(rc)
+
+
+def _relaunch_elevated(more_args=(), before_exit=None):
     """Start this program again with administrator / root rights. Windows:
     True once the UAC prompt was accepted (the caller exits). Linux and
     macOS: waits for the elevated copy and exits with its code when it
     really started; returns False when every way was refused or missing,
     so the caller can carry on without capture (5.3.4, LG-09: before, a
-    refused password closed the program)."""
+    refused password closed the program). `before_exit` runs before that
+    exit (review 7: the main window closes cleanly first)."""
     extra = [a for a in sys.argv[1:] if a != ELEVATED_FLAG and not
              a.startswith((DATA_ARG, START_ARG, ELEV_FLAG_ARG))] + \
         list(_HANDOFF_ARGS) + ([SAFE_FLAG] if SAFE_MODE else []) + \
@@ -788,7 +815,7 @@ def _relaunch_elevated(more_args=()):
             started()
             return False
         if started():
-            sys.exit(rc)
+            _elevated_exit(rc, before_exit)
         return False
     env_pairs = [f"{v}={os.environ[v]}" for v in
                  ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
@@ -812,7 +839,7 @@ def _relaunch_elevated(more_args=()):
         except OSError:
             continue
         if started():
-            sys.exit(rc)
+            _elevated_exit(rc, before_exit)
         # the launcher ran: a refused or failed password ends here, never
         # a second or third password prompt (5.3.4, review)
         LOG.info("elevation with %s ended (%s) without starting", L[0], rc)
@@ -1280,7 +1307,7 @@ def compiled_copy_trusted(target=None):
     if os.geteuid() == 0:
         return False
     try:
-        return private_dir_ok(folder) and \
+        return private_dir_ok(folder, fix=in_data_folder(folder)) and \
             os.stat(folder).st_uid == os.geteuid()
     except OSError:
         return False
@@ -2271,8 +2298,11 @@ class PrivatePackages:
         # a module planted there used to shadow `cryptography`, the very
         # library that checks update signatures
         if os.path.isdir(self.root) and self.root not in sys.path:
+            parent = os.path.dirname(self.root)
+            # (review 7) data/site is ours: closed like the root, or a
+            # 0775 one from an older run kept scapy unused on every start
             if not private_dir_ok(self.root, fix=True) or \
-                    not private_dir_ok(os.path.dirname(self.root)):
+                    not private_dir_ok(parent, fix=in_data_folder(parent)):
                 LOG.warning("private packages folder %s is not private; "
                             "not used", self.root)
                 return False
@@ -2654,6 +2684,17 @@ def _latest_npcap_version():
     return NPCAP_FALLBACK_VERSION
 
 
+def windows_powershell(environ=None):
+    """Windows PowerShell 5.1 by its full path in the Windows folder (the
+    one with Get-AuthenticodeSignature built in), else "powershell"."""
+    environ = os.environ if environ is None else environ
+    root = environ.get("SystemRoot") or environ.get("SYSTEMROOT") or \
+        environ.get("windir") or ""
+    exe = os.path.join(root, "System32", "WindowsPowerShell", "v1.0",
+                       "powershell.exe") if root else ""
+    return exe if exe and os.path.isfile(exe) else "powershell"
+
+
 def _authenticode_info(path, run=None):
     """Ask Windows whether a downloaded installer carries a valid digital
     signature and who signed it. Returns (status, signer_subject); status
@@ -2665,11 +2706,18 @@ def _authenticode_info(path, run=None):
     ps = ("$s = Get-AuthenticodeSignature -LiteralPath $env:MW_SIGNED_FILE;"
           " Write-Output $s.Status; "
           "Write-Output $s.SignerCertificate.Subject")
+    # (Windows run) started from a PowerShell 7 prompt, the inherited
+    # PSModulePath points Windows PowerShell 5.1 at PowerShell 7's modules,
+    # Get-AuthenticodeSignature fails to load and nothing comes back: the
+    # check runs Windows PowerShell itself, without that variable
+    env = {k: v for k, v in os.environ.items()
+           if k.upper() != "PSMODULEPATH"}
+    env["MW_SIGNED_FILE"] = os.path.abspath(path)
     try:
         r = (run or subprocess.run)(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-            capture_output=True, text=True, timeout=60,
-            env=dict(os.environ, MW_SIGNED_FILE=os.path.abspath(path)),
+            [windows_powershell(), "-NoProfile", "-NonInteractive",
+             "-Command", ps],
+            capture_output=True, text=True, timeout=60, env=env,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         lines = [ln.strip() for ln in (r.stdout or "").splitlines()]
         lines += ["", ""]
@@ -22316,6 +22364,10 @@ class NetworkModel:
         flips = self.registry.arp_flip_count(ip)
         both = self.registry.arp_claimants(ip)
         reg = self.registry
+        # (review 7) two MACs at once only while they still alternate: an
+        # address handed from one device to the next (a new DHCP lease, a
+        # replaced device) changes owner once, and is not a fight
+        fighting = len(both) >= 2 and reg.arp_flip_count(ip, 120) >= 2
         if ip == self.gateway_ip and len(both) == 1 and \
                 both[0] in reg.gw_candidates and \
                 reg.router_answering(ts, but=both[0]):
@@ -22323,8 +22375,9 @@ class NetworkModel:
             # address while the router is still sending: that is the
             # attack even when the router itself has stopped answering ARP
             both = both + sorted(reg.gw_macs)[:1]
+            fighting = True
         if flips >= int(self.config.get("alerts.arp_flip_threshold", 4)) \
-                or len(both) >= 2:
+                or fighting:
             a = self._alert(self.alerts.arp_spoof(
                 ip, len(self.registry.ip_macs.get(ip, ())), flips,
                 ip == self.gateway_ip, together=len(both)))
@@ -24368,10 +24421,10 @@ class Store:
         if not os.path.exists(self.path):
             return
         bad = ""
+        con = None
         try:
             con = sqlite3.connect(self.path, timeout=10)
             row = con.execute("PRAGMA quick_check").fetchone()
-            con.close()
             if not row or row[0] != "ok":
                 bad = str(row[0] if row else "no answer")
         except sqlite3.OperationalError as e:
@@ -24384,11 +24437,21 @@ class Store:
             bad = str(e)
         except sqlite3.DatabaseError as e:
             bad = str(e)
+        finally:
+            # (Windows run) a check that raised left its connection open,
+            # so setting the file aside failed with WinError 32
+            if con is not None:
+                with contextlib.suppress(sqlite3.Error):
+                    con.close()
         if not bad:
             return
         aside = f"{self.path}.corrupt-{int(time.time())}"
-        with contextlib.suppress(OSError):
-            os.replace(self.path, aside)
+        try:
+            set_aside_retrying(self.path, aside)
+        except OSError as e:
+            LOG.warning("history: the damaged file couldn't be set aside "
+                        "(%s); left as it is", e)
+            return
         for suffix in ("-wal", "-shm"):
             with contextlib.suppress(OSError):
                 os.remove(self.path + suffix)
@@ -25089,6 +25152,21 @@ STORY_CATEGORY = {"presence": "Devices", "new_device": "Devices",
                   "spike": "Devices"}
 
 
+def set_aside_retrying(src, dst, tries=20, pause=0.1):
+    """os.replace that waits a moment for a file Windows still holds open
+    (an antivirus scan, a reader closing): PermissionError for about 2 s,
+    then the error. Unlike _replace_retrying (for a temporary file), the
+    file is never deleted when the move fails: it is the only copy."""
+    for i in range(tries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == tries - 1:
+                raise
+            time.sleep(pause)
+
+
 def sqlite_ro_uri(path, windows=None):
     """A read-only SQLite URI for a file path; every character of the path
     quoted, so any folder name works. (review 6) Built here, not with
@@ -25099,7 +25177,9 @@ def sqlite_ro_uri(path, windows=None):
     win = IS_WINDOWS if windows is None else windows
     p = str(path)
     if win:
-        if IS_WINDOWS:
+        if IS_WINDOWS and not os.path.isabs(p):
+            # an absolute path is used as written (drive, UNC, \\?\), the
+            # same text on every Python; only a relative one is resolved
             p = os.path.abspath(p)
         p = p.replace("/", "\\")
         if p.upper().startswith("\\\\?\\UNC\\"):
@@ -25635,6 +25715,10 @@ class PacketRing:
         self._seg = None
         self._stop = False
         self._lock = threading.Lock()
+        # (review 7) every packet put gets a number; a wipe drops what was
+        # queued before it instead of waiting for the writer to reach it
+        self._seq = itertools.count(1)
+        self._drop_upto = 0
         os.makedirs(folder, exist_ok=True)
         # segments of earlier runs still count toward the size cap
         old = []
@@ -25661,7 +25745,7 @@ class PacketRing:
 
     def put(self, no, raw, ts, lt):
         try:
-            self.q.put_nowait((no, raw, ts, lt))
+            self.q.put_nowait((no, raw, ts, lt, next(self._seq)))
             return True
         except queue.Full:
             self.dropped += 1
@@ -25743,7 +25827,9 @@ class PacketRing:
                 self._seg["f"].flush()
             item[1].set()
             return
-        no, raw, ts, lt = item
+        no, raw, ts, lt = item[:4]
+        if len(item) > 4 and item[4] <= self._drop_upto:
+            return                  # queued before a wipe: never written
         seg = self._seg
         if seg is None or seg["lt"] != lt or no != seg["last"] + 1 \
                 or seg["bytes"] > self.SEGMENT_BYTES:
@@ -25798,18 +25884,17 @@ class PacketRing:
         seg = self._seg
         return sum(e[4] for e in self.index) + (seg["bytes"] if seg else 0)
 
-    def wipe(self, timeout=5.0):
+    def wipe(self):
         """Delete every saved packet ("Delete ALL history", Session only;
-        review of LG-13/CO-10: the packet files outlived the database)."""
-        done = threading.Event()
-        try:
-            self.q.put(("wipe", done), timeout=timeout)
-        # a full queue: the wipe is done below, under the lock, instead
-        except queue.Full:
-            pass
-        if not done.wait(timeout):
-            with self._lock:
-                self._handle(("wipe", threading.Event()))
+        review of LG-13/CO-10: the packet files outlived the database).
+        (review 7) Done here at once, under the lock (the writer holds it
+        for one packet at a time), and the packets still queued are
+        dropped: it used to wait up to 10 s on the window's thread for
+        the writer, then wipe inline anyway."""
+        upto = next(self._seq)
+        with self._lock:
+            self._drop_upto = upto
+            self._handle(("wipe", threading.Event()))
 
     def stop(self, wait=3.0):
         self._stop = True
@@ -26503,6 +26588,7 @@ Saves compact summaries (devices, presence, daily traffic totals, alerts, domain
 Keep history for ¦ Conserver l'historique pendant ¦ Guardar historial durante
 Older summaries are deleted automatically. “Session only” keeps nothing after you close MiniWireshark. ¦ Les résumés plus anciens sont supprimés automatiquement. « Session seulement » ne garde rien après la fermeture de MiniWireshark. ¦ Los resúmenes más antiguos se borran automáticamente. «Solo la sesión» no guarda nada al cerrar MiniWireshark.
 Session only ¦ Session seulement ¦ Solo la sesión
+Raw packets are not saved on exit while history is set to “Session only”, which keeps nothing after you close. ¦ Les paquets bruts ne sont pas enregistrés à la fermeture tant que l'historique est sur « Session seulement », qui ne garde rien après la fermeture. ¦ Los paquetes en bruto no se guardan al cerrar mientras el historial esté en «Solo la sesión», que no guarda nada al cerrar.
 Custom ¦ Personnalisé ¦ Personalizado
 Custom retention ¦ Durée personnalisée ¦ Retención personalizada
 Used when “Keep history for” is Custom. ¦ Utilisé quand « Conserver l'historique pendant » est Personnalisé. ¦ Se usa cuando «Guardar historial durante» es Personalizado.
@@ -32485,6 +32571,10 @@ def settings_conflicts(values):
             values.get("history.retention") == "Session only":
         out.append("History is on but set to “Session only”, so "
                    "nothing will be kept after you close MiniWireshark.")
+    if values.get("history.save_raw_packets") and \
+            values.get("history.retention") == "Session only":
+        out.append("Raw packets are not saved on exit while history is set "
+                   "to “Session only”, which keeps nothing after you close.")
     return out
 
 
@@ -50925,8 +51015,13 @@ class MiniWireshark:
     # 5.1.2: the walk runs in Tcl, one call for the whole tree. The
     # Python walk below made ~5,000 Tk calls (keys, cget, configure per
     # widget) for a 700-widget window, about 70 ms of a theme change.
+    # (Windows run, theme change 161 ms against 145) "$w configure" listed
+    # all 30-80 options of every widget only to find the eight colour ones;
+    # which of them a class has is now looked up once per class and read
+    # with cget: about a third of the walk's time
     _RETHEME_TCL = r"""
-proc ::mw_retheme {w map fgnew deffg} {
+proc ::mw_retheme_opts {w cls} {
+    set opts {}
     if {[catch {$w configure} specs] == 0} {
         foreach spec $specs {
             if {[llength $spec] != 5} continue
@@ -50934,21 +51029,33 @@ proc ::mw_retheme {w map fgnew deffg} {
             switch -- $opt {
                 -background - -activebackground - -selectbackground -
                 -selectforeground - -activeforeground -
-                -highlightbackground {set isfg 0}
-                -foreground - -insertbackground {set isfg 1}
-                default continue
-            }
-            set cur [string tolower [lindex $spec 4]]
-            if {$isfg && [dict exists $deffg $cur]} {
-                catch {$w configure $opt $fgnew}
-                continue
-            }
-            if {[dict exists $map $cur]} {
-                catch {$w configure $opt [dict get $map $cur]}
+                -highlightbackground {lappend opts $opt 0}
+                -foreground - -insertbackground {lappend opts $opt 1}
             }
         }
     }
-    if {[catch {winfo class $w} cls] == 0 && $cls eq "Text"} {
+    set ::mw_retheme_class($cls) $opts
+    return $opts
+}
+proc ::mw_retheme {w map fgnew deffg} {
+    if {[catch {winfo class $w} cls]} {set cls ""}
+    if {[info exists ::mw_retheme_class($cls)]} {
+        set opts $::mw_retheme_class($cls)
+    } else {
+        set opts [::mw_retheme_opts $w $cls]
+    }
+    foreach {opt isfg} $opts {
+        if {[catch {$w cget $opt} cur]} continue
+        set cur [string tolower $cur]
+        if {$isfg && [dict exists $deffg $cur]} {
+            catch {$w configure $opt $fgnew}
+            continue
+        }
+        if {[dict exists $map $cur]} {
+            catch {$w configure $opt [dict get $map $cur]}
+        }
+    }
+    if {$cls eq "Text"} {
         foreach tag [$w tag names] {
             foreach opt {-foreground -background} {
                 if {[catch {$w tag cget $tag $opt} cur]} continue
@@ -51541,8 +51648,11 @@ proc ::mw_retheme {w map fgnew deffg} {
         os.environ.setdefault("MINIWIRESHARK_DATA", PATHS.data)
         self.root.withdraw()
         self.root.update_idletasks()
-        # exits this copy with the elevated one's code when it ran
-        _relaunch_elevated((START_ARG + "monitor",))
+        # exits this copy with the elevated one's code when it ran; (review
+        # 7) through the clean close first: the exit from this Tk callback
+        # skipped the history, the journal, the tray icon and the receipt
+        _relaunch_elevated((START_ARG + "monitor",),
+                           before_exit=self._on_close)
         self.root.deiconify()
         self._set_banner("The password wasn't given, so this window can't "
                          "watch live traffic. Demo Mode and capture files "
@@ -57836,6 +57946,24 @@ proc ::mw_retheme {w map fgnew deffg} {
         LOG.error("unhandled GUI exception:\n%s", text)
         CrashDialog.show(self, text)
 
+    def _save_raw_packets_on_exit(self):
+        """"Save raw packets on exit" writes a .pcap into the sessions
+        folder. (review 7) Never with "Session only", which promises that
+        nothing is kept after you close. -> the path written, or None."""
+        if not self.config.get("history.save_raw_packets", False) or \
+                not self.all_rows or \
+                self.data_mode not in ("live", "idle") or \
+                self._session_only_history():
+            return None
+        path = os.path.join(PATHS.sessions, time.strftime(
+            "packets-%Y%m%d-%H%M%S.pcap"))
+        try:
+            self.save_pcap_to(path, self.all_rows)
+        except (OSError, ValueError) as e:
+            LOG.warning("raw packets not saved on exit: %s", e)
+            return None
+        return path
+
     def _on_close(self):
         LOG.info("shutting down")
         if getattr(self, "notifier", None) is not None:
@@ -57865,12 +57993,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                 for f in list(self.model.flows.active.values()):
                     self.model.flows.closed_log.append(f)
                 self._pump_store(reschedule=False)
-            if self.config.get("history.save_raw_packets", False) and \
-                    self.all_rows and self.data_mode in ("live", "idle"):
-                path = os.path.join(PATHS.sessions, time.strftime(
-                    "packets-%Y%m%d-%H%M%S.pcap"))
-                with contextlib.suppress(OSError, ValueError):
-                    self.save_pcap_to(path, self.all_rows)
+            self._save_raw_packets_on_exit()
             if not self._session_only_history():
                 self.autosave("exit")
             else:
@@ -58075,6 +58198,7 @@ class Redactor:
         self.maps = {k: {} for k in ("ip4", "ip4pub", "ip6", "mac", "name",
                                      "net", "site")}
         self.names, self.networks = set(), set()
+        self._ip_outs = set()
         if model is not None:
             self.learn(model)
         for n in extra_names:
@@ -58121,15 +58245,22 @@ class Redactor:
                 return "::ffff:" + self.ip(str(v4))
             return self._pseudo("ip6", ip, lambda n: f"2001:db8::"
                                 f"{n:x}")
+        if ip in self._ip_outs:
+            # (review 7) a stand-in already: the IPv4 pass met the one the
+            # IPv6 pass wrote for ::ffff:192.168.1.5 and made it "public"
+            return ip
         if is_private_ip(ip) or ip.startswith(("169.254.", "100.")):
-            return self._pseudo("ip4", ip, lambda n: f"192.0.2.{n % 254 + 1}"
-                                if n < 254 else f"192.0.2.{n % 254 + 1}"
-                                f"#{n // 254}")
-        if ip in ("0.0.0.0", "255.255.255.255") or ip.startswith(
+            out = self._pseudo("ip4", ip, lambda n: f"192.0.2.{n % 254 + 1}"
+                               if n < 254 else f"192.0.2.{n % 254 + 1}"
+                               f"#{n // 254}")
+        elif ip in ("0.0.0.0", "255.255.255.255") or ip.startswith(
                 ("224.", "239.", "127.")):
             return ip                      # well-known, nothing personal
-        return self._pseudo("ip4pub", ip, lambda n: f"198.51.100."
-                            f"{n % 254 + 1}")
+        else:
+            out = self._pseudo("ip4pub", ip, lambda n: f"198.51.100."
+                               f"{n % 254 + 1}")
+        self._ip_outs.update((out, out.split("#")[0]))
+        return out
 
     def mac(self, mac):
         m = re.sub(r"[^0-9a-f]", "", mac.lower())
@@ -60020,10 +60151,19 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
         raise ValueError("the download doesn't look like MiniWireshark")
     compile(text, "miniwireshark_update.py", "exec")
     backup = f"{script_path}.v{SCRIPT_VERSION}.bak"
+    mode = stat.S_IMODE(os.stat(script_path).st_mode)
     shutil.copy2(script_path, backup)
+    if not IS_WINDOWS:
+        # (review 7) nobody else may write the backup: copy2 kept a 0664
+        # program's mode, and rollback_source_ok then refused the backup
+        os.chmod(backup, mode & ~0o022)
     tmp = script_path + ".new"
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         f.write(text)
+    if not IS_WINDOWS:
+        # the new program keeps the old one's mode (a umask of 077 made
+        # it 0600, unreadable for the other users of a shared install)
+        os.chmod(tmp, mode)
     os.replace(tmp, script_path)
     # 5.2.3 (B-31): the marker names the file it belongs to and what was
     # written, so another copy of MiniWireshark sharing this data folder
@@ -65989,10 +66129,41 @@ def self_test_wanted(only):
     return wanted
 
 
+@contextlib.contextmanager
+def self_test_log_aside(folder):
+    """(Windows run) the tests' log records go to a file of their own in
+    `folder` (deleted with it), not into the real log: Repair's self-test
+    wrote made-up adapters, "installed update 9.9.9" and "clock jumped
+    365 days" there, and a debug bundle then looked alarming. The real
+    log file is detached meanwhile and always put back."""
+    real = [h for h in LOG.handlers if isinstance(h, logging.FileHandler)]
+    for h in real:
+        LOG.removeHandler(h)
+    try:
+        side = logging.FileHandler(os.path.join(folder, "self-test.log"),
+                                   encoding="utf-8", delay=True)
+        side.setFormatter(logging.Formatter(
+            "%(asctime)s %(levelname)-7s [%(threadName)s] %(message)s"))
+    except OSError:
+        side = logging.NullHandler()
+    LOG.addHandler(side)
+    try:
+        yield side
+    finally:
+        LOG.removeHandler(side)
+        with contextlib.suppress(Exception):
+            side.close()
+        for h in real:
+            if h not in LOG.handlers:
+                LOG.addHandler(h)
+
+
 def run_self_tests(verbose=True, only=None):
     results = []
     wanted = self_test_wanted(only)
     tmp = tempfile.mkdtemp(prefix="mw_selftest_")
+    aside = contextlib.ExitStack()
+    aside.enter_context(self_test_log_aside(tmp))
 
     def cfg(extra=None):
         c = AppConfig(path=os.path.join(tmp, f"cfg_{uuid.uuid4().hex}.json"))
@@ -66804,35 +66975,42 @@ def run_self_tests(verbose=True, only=None):
             if r["name"] in ("lo", "lo0"):
                 assert r["score"] < 0
 
-    for fn in (t_config_migration, t_settings_schema_has_defaults,
-               t_theme_mappings, t_confidence_scoring, t_mac_randomization,
-               t_device_lifecycle, t_public_ip_never_a_device,
-               t_device_merge_rules, t_registrable_domain, t_dns_parsing,
-               t_explain_registry, t_m6_corrections,
-               t_m7_asof_and_builder, t_m9_bootstrap,
-               t_tls_sni_parser, t_flow_aggregation, t_alert_debounce,
-               t_session_roundtrip, t_display_filters, t_historical_buckets,
-               t_dns_tracker, t_baseline, t_data_loaders, t_history_store,
-               t_fingerprinting, t_interface_scoring, t_busy_workload):
-        test(fn)
-    ctx = TestContext(tmp, scapy_ok)
-    # (review 6) a test asked for by name runs even with --quick
-    quick = "--quick" in sys.argv and wanted is None
-    for fn, slow in SELF_TESTS:
-        if slow and quick:
-            continue
+    try:
+        for fn in (t_config_migration, t_settings_schema_has_defaults,
+                   t_theme_mappings, t_confidence_scoring,
+                   t_mac_randomization, t_device_lifecycle,
+                   t_public_ip_never_a_device, t_device_merge_rules,
+                   t_registrable_domain, t_dns_parsing, t_explain_registry,
+                   t_m6_corrections, t_m7_asof_and_builder, t_m9_bootstrap,
+                   t_tls_sni_parser, t_flow_aggregation, t_alert_debounce,
+                   t_session_roundtrip, t_display_filters,
+                   t_historical_buckets, t_dns_tracker, t_baseline,
+                   t_data_loaders, t_history_store, t_fingerprinting,
+                   t_interface_scoring, t_busy_workload):
+            test(fn)
+        ctx = TestContext(tmp, scapy_ok)
+        # (review 6) a test asked for by name runs even with --quick
+        quick = "--quick" in sys.argv and wanted is None
+        for fn, slow in SELF_TESTS:
+            if slow and quick:
+                continue
 
-        def wrapped(fn=fn):
-            return fn(ctx)
-        wrapped.__name__ = fn.__name__
-        test(wrapped)
+            def wrapped(fn=fn):
+                return fn(ctx)
+            wrapped.__name__ = fn.__name__
+            test(wrapped)
+    finally:
+        aside.close()
     shutil.rmtree(tmp, ignore_errors=True)
+    failed = [r for r in results if r[0] == "FAIL"]
+    if results:
+        LOG.info("self-test ran: %d passed, %d failed",
+                 len(results) - len(failed), len(failed))
     missing = wanted.unmatched() if wanted is not None else []
     if missing and verbose:
         print("No self-test is called " + ", ".join(missing) + ".")
     if wanted is not None and not results:
         return 2
-    failed = [r for r in results if r[0] == "FAIL"]
     if verbose:
         print(f"\n{len(results) - len(failed)} passed / {len(failed)} failed"
               f" / {sum(1 for r in results if r[0] == 'SKIP')} skipped")
@@ -73919,7 +74097,13 @@ def test_v5_handoff_policy_and_handshake(ctx):
             f.write("import sys; print('boom: no Tk here'); sys.exit(5)\n")
         launcher = ctx.path("fake_python")
         if IS_WINDOWS:
-            launcher = sys.executable
+            # (Windows run) never this Python itself: runtime_handoff
+            # rightly keeps the start in the Python it runs in, and the
+            # policy checks below then got None. A file of its own stands
+            # for the managed Python; nothing below runs it on Windows
+            launcher = ctx.path("fake_python.exe")
+            with open(launcher, "wb") as f:
+                f.write(b"MZ")
         else:
             with open(launcher, "w") as f:
                 f.write(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} "
@@ -73962,6 +74146,15 @@ def _fake_wheel(path, name, version, files):
                     f"Name: {name}\nVersion: {version}\n")
         zf.writestr(f"{name}-{version}.dist-info/RECORD", "")
     return path
+
+
+def _file_url_for_test(path):
+    """A file: URL for a local file, as the standard library builds it
+    (file:///C:/... on Windows). "file://" + pathname2url() is not one:
+    pathname2url already gives "///C:/..." for a drive, and from 3.14
+    it also changed for other paths (Windows run)."""
+    import pathlib
+    return pathlib.Path(os.path.abspath(path)).as_uri()
 
 
 @self_test(slow=False, needs_source=True)
@@ -74025,18 +74218,18 @@ def test_private_packages_folder(ctx):
     with open(srcf, "wb") as f:
         f.write(b"x" * 1000)
     try:
-        fetch_to_file("file://" + urllib.request.pathname2url(srcf),
+        fetch_to_file(_file_url_for_test(srcf),
                       ctx.path("dl/blob.bin"), "0" * 64, "packages")
         raise AssertionError("bad fingerprint accepted")
     except RuntimeError_ as e:
         assert e.kind == "fingerprint", e.kind
     assert not os.path.exists(ctx.path("dl/blob.bin"))
-    ok = fetch_to_file("file://" + urllib.request.pathname2url(srcf),
+    ok = fetch_to_file(_file_url_for_test(srcf),
                        ctx.path("dl/blob2.bin"), sha256_file(srcf),
                        "packages")
     assert os.path.getsize(ok) == 1000
     try:
-        fetch_to_file("file://" + urllib.request.pathname2url(srcf),
+        fetch_to_file(_file_url_for_test(srcf),
                       ctx.path("dl/blob3.bin"), None, "packages",
                       max_bytes=100)
         raise AssertionError("size cap ignored")
@@ -74215,8 +74408,7 @@ def test_components_manager_lifecycle(ctx):
     os.makedirs(src)
 
     def url(name):
-        return "file://" + urllib.request.pathname2url(
-            os.path.join(src, name))
+        return _file_url_for_test(os.path.join(src, name))
     with open(os.path.join(src, "feodo.txt"), "w") as f:
         f.write(FEODO_SAMPLE)
     feodo_r = dataclasses.replace(dm.resource("feodo"), url=url(
@@ -77681,7 +77873,10 @@ def t_story_bench(ctx):
     40 devices coming and going all day, first visits, warnings, address
     changes) plus this session's home network takes at most 150 ms."""
     ev = []
-    base = _story_noon(6) - 11 * 3600
+    # the seven days before today: a day ends ~11 h after its 01:00 start,
+    # so with today among them a run before noon left part of it in the
+    # future, outside the story (from_store 4,732 of 5,000)
+    base = _story_noon(7) - 11 * 3600
     for day in range(7):
         t0 = base + day * 86400
         for dev in range(40):
@@ -77858,8 +78053,47 @@ def bench_capture(devices, flows, sites):
     return b.frames
 
 
+class _ProcessMemoryCounters(ctypes.Structure):
+    """PROCESS_MEMORY_COUNTERS (psapi.h)."""
+    _fields_ = [("cb", ctypes.c_uint32), ("PageFaultCount", ctypes.c_uint32),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t)]
+
+
+def _windows_rss_mb(kernel32=None, psapi=None):
+    """(Windows run) the working set from GetProcessMemoryInfo, in MB; 0.0
+    when Windows doesn't answer. The DLLs can be handed in (tests)."""
+    try:
+        if kernel32 is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        if psapi is None:
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        cur = kernel32.GetCurrentProcess
+        cur.argtypes, cur.restype = [], ctypes.c_void_p
+        info = psapi.GetProcessMemoryInfo
+        info.argtypes = [ctypes.c_void_p,
+                         ctypes.POINTER(_ProcessMemoryCounters),
+                         ctypes.c_uint32]
+        info.restype = ctypes.c_int
+        pmc = _ProcessMemoryCounters()
+        pmc.cb = ctypes.sizeof(pmc)
+        if info(cur(), ctypes.byref(pmc), pmc.cb):
+            return pmc.WorkingSetSize / (1024 * 1024)
+    except (OSError, AttributeError, TypeError, ValueError) as e:
+        LOG.info("memory use unknown: %s", e)
+    return 0.0
+
+
 def _rss_mb():
     """Resident memory of this process in MB (0 when unknown)."""
+    if IS_WINDOWS:
+        return _windows_rss_mb()
     with contextlib.suppress(OSError, ValueError):
         with open("/proc/self/status", encoding="utf-8") as f:
             for line in f:
@@ -78155,9 +78389,20 @@ BENCH_SUMMARY_KEYS = (
 )
 
 
+def bench_value_ok(key, val, lim):
+    """A measured value within its limit. (Windows run) memory that reads
+    0 was not measured at all (no Windows code read it): that fails."""
+    if not isinstance(val, (int, float)):
+        return False
+    if key.startswith("rss") and not val > 0:
+        return False
+    return val <= lim
+
+
 def bench_check(results, table=None, label="limit"):
     """[(scenario, metric, value, limit, ok)] for every metric that has a
-    limit in `table` and was measured."""
+    limit in `table` and was measured. Memory that couldn't be measured
+    reads 0.0 (_rss_mb) and fails."""
     table = BENCH_LIMITS if table is None else table
     out = []
     for sid, res in results.items():
@@ -78165,7 +78410,7 @@ def bench_check(results, table=None, label="limit"):
             val = res.get(key)
             if val is None:
                 continue
-            out.append((sid, key, val, lim, val <= lim))
+            out.append((sid, key, val, lim, bench_value_ok(key, val, lim)))
     return out
 
 
@@ -78588,7 +78833,8 @@ def release_gate(argv):
                     per.setdefault((sid, key, lim), []).append(float(val))
         for (sid, key, lim), vals in per.items():
             med = statistics.median(vals)
-            lines.append(f"  [{'PASS' if med <= lim else 'FAIL'}] {sid} "
+            ok = bench_value_ok(key, med, lim)
+            lines.append(f"  [{'PASS' if ok else 'FAIL'}] {sid} "
                          f"{key}: {med:.1f} (<= {lim}) runs "
                          + ", ".join(f"{v:.0f}" for v in vals))
     lines += ["", "Send this whole folder back (zip it): the pictures are "
@@ -80206,7 +80452,13 @@ def t_r6_history_uri_network_folders(ctx):
         got = sqlite_ro_uri(path, windows=True)
         assert got == want + "?mode=ro", (path, got)
         assert not re.match(r"file://[^/]", got), got
-    for name in ("a b", "a#b", "a?b", "a%b", "a%20b", "Zoë"):
+    # real files, through this computer's own conversion (a drive letter
+    # on Windows). "?" can't be in a Windows file name, so it is tried
+    # only where it can exist; the Windows "?" case is the string above
+    names = ["a b", "a#b", "a%b", "a%20b", "Zoë", "a;b=c&d"]
+    if not IS_WINDOWS:
+        names.append("a?b")
+    for name in names:
         folder = ctx.path(os.path.join("r6uri", name))
         os.makedirs(folder, exist_ok=True)
         db = os.path.join(folder, "h.db")
@@ -80214,12 +80466,19 @@ def t_r6_history_uri_network_folders(ctx):
         con.execute("CREATE TABLE IF NOT EXISTS t(x)")
         con.commit()
         con.close()
-        uri = sqlite_ro_uri(db, windows=False)
-        ro = sqlite3.connect(uri, uri=True)
-        try:
-            ro.execute("SELECT * FROM t").fetchall()
-        finally:
-            ro.close()
+        forms = [db]
+        if IS_WINDOWS:
+            forms.append("\\\\?\\" + os.path.abspath(db))
+            with contextlib.suppress(ValueError):    # another drive
+                forms.append(os.path.relpath(db))
+        for form in forms:
+            uri = sqlite_ro_uri(form)
+            assert not re.match(r"file://[^/]", uri), uri
+            ro = sqlite3.connect(uri, uri=True)
+            try:
+                ro.execute("SELECT * FROM t").fetchall()
+            finally:
+                ro.close()
     if not IS_WINDOWS:
         assert sqlite_ro_uri("//srv/x/h.db", windows=False).startswith(
             "file:////srv/x/"), sqlite_ro_uri("//srv/x/h.db", windows=False)
@@ -80671,6 +80930,532 @@ def t_r6_self_test_names(ctx):
     finally:
         sys.argv[:] = argv
         SELF_TESTS.remove((t_r6_probe_slow, True))
+
+
+# ---- review 7 (whole PR) and the Windows 11 run ------------------------------
+@self_test()
+def t_r7_umask_folders_repaired(ctx):
+    """Review 7 (#1, #8): a data/site or cache/bytecode folder that an
+    older run made 0775 (umask 002) is closed to 0700 and used: the
+    private packages (scapy) and the compiled copy were ignored on every
+    start. A folder outside the data folder is never changed."""
+    if IS_WINDOWS:
+        return "skip"                    # no POSIX modes there
+    tag = uuid.uuid4().hex[:6]
+    before = list(sys.path)
+    inside = os.path.join(PATHS.data, f"r7-site-{tag}")
+    outside = ctx.path(f"r7-site-{tag}")
+    try:
+        for parent in (inside, outside):
+            os.makedirs(os.path.join(parent, "tag"))
+            os.chmod(parent, 0o775)
+        assert PrivatePackages(root=os.path.join(inside, "tag")).activate()
+        assert os.stat(inside).st_mode & 0o777 == 0o700
+        assert sys.path[-1] == os.path.join(inside, "tag")
+        assert PrivatePackages(root=os.path.join(outside, "tag")).activate() \
+            is False
+        assert os.stat(outside).st_mode & 0o777 == 0o775
+    finally:
+        sys.path[:] = before
+        shutil.rmtree(inside, ignore_errors=True)
+    if os.geteuid() == 0:
+        return                           # root never uses a compiled copy
+    bc = os.path.join(PATHS.cache, f"r7-bytecode-{tag}")
+    os.makedirs(bc)
+    os.chmod(bc, 0o775)
+    other = ctx.path(f"r7-bytecode-{tag}")
+    os.makedirs(other)
+    os.chmod(other, 0o775)
+    try:
+        assert compiled_copy_trusted(os.path.join(bc, "x.pyc"))
+        assert os.stat(bc).st_mode & 0o777 == 0o700
+        assert not compiled_copy_trusted(os.path.join(other, "x.pyc"))
+    finally:
+        shutil.rmtree(bc, ignore_errors=True)
+
+
+@self_test(needs_source=True)
+def t_r7_update_backup_and_program_modes(ctx):
+    """Review 7 (#2): the update's backup is never group-writable (a 0664
+    program made a 0664 backup, so the automatic rollback refused it and
+    deleted its marker), and the new program keeps the old one's mode (a
+    umask of 077 made it 0600)."""
+    if IS_WINDOWS:
+        return "skip"
+    with open(SCRIPT_PATH, "rb") as f:
+        src = f.read()
+    folder = ctx.path(f"r7-update-{uuid.uuid4().hex[:6]}")
+    os.makedirs(folder)
+    script = os.path.join(folder, "miniwireshark.py")
+    marker = os.path.join(folder, "update_pending.json")
+    with open(script, "wb") as f:
+        f.write(src)
+    os.chmod(script, 0o664)
+    apply_self_update(src, "9.9.9", script, marker)
+    backup = f"{script}.v{SCRIPT_VERSION}.bak"
+    assert not os.stat(backup).st_mode & 0o022, oct(os.stat(backup).st_mode)
+    assert os.stat(script).st_mode & 0o777 == 0o664
+    ok, why = rollback_source_ok(read_json(marker, {}), script)
+    assert ok, why
+    os.chmod(script, 0o644)
+    old = os.umask(0o077)
+    try:
+        apply_self_update(src, "9.9.9", script, marker)
+    finally:
+        os.umask(old)
+    assert os.stat(script).st_mode & 0o777 == 0o644, \
+        oct(os.stat(script).st_mode)
+
+
+@self_test(needs_source=True)
+def t_r7_release_rerun_records_the_released_file(ctx):
+    """Review 7 (#3): a rerun for a version already released records the
+    released file's sha256, line count and tag commit, never HEAD's (a
+    later push under the same version). Run in a throwaway repository
+    with a stand-in for gh; skipped without git or a POSIX shell."""
+    root = os.path.dirname(os.path.abspath(SCRIPT_PATH))
+    script = os.path.join(root, ".github", "scripts", "release_current.py")
+    git = shutil.which("git")
+    if IS_WINDOWS or not git or not os.path.isfile(script):
+        return "skip"
+    repo = ctx.path(f"r7-release-{uuid.uuid4().hex[:6]}")
+    for d in (".github/scripts", "docs", "bin"):
+        os.makedirs(os.path.join(repo, d))
+    shutil.copy(script, os.path.join(repo, ".github", "scripts"))
+    released = 'SCRIPT_VERSION = "9.9.9"\n# as released\n'
+    files = {
+        "miniwireshark.py": released + "# a later fix, same version\n",
+        "CHANGELOG.md": "# Changelog\n\n## [9.9.9] — 2026-11-01\n\nFixes.\n",
+        ".github/archive-releases.json":
+            '{\n  "repo": "x",\n  "releases": []\n}\n',
+        "docs/VERSIONS.md": "| Version | Release | Lines | sha256 | "
+                            "Commit |\n|---|---|---|---|---|\n",
+        "README.md": "# x\n"}
+    for rel, text in files.items():
+        with open(os.path.join(repo, rel), "w", encoding="utf-8",
+                  newline="\n") as f:
+            f.write(text)
+    asset = os.path.join(repo, "bin", "released.py")
+    with open(asset, "w", encoding="utf-8", newline="\n") as f:
+        f.write(released)
+    tag_sha = "ab" * 20
+    gh = os.path.join(repo, "bin", "gh")
+    with open(gh, "w", encoding="utf-8", newline="\n") as f:
+        f.write('#!/bin/sh\ncase "$1 $2" in\n'
+                '  "release view") exit 0 ;;\n'
+                '  "release download") cp "$MW_FAKE_ASSET" "$7/$5"; exit 0 ;;\n'
+                '  "release create") exit 9 ;;\n'
+                'esac\n'
+                'if [ "$1" = api ]; then echo "$MW_FAKE_SHA"; exit 0; fi\n'
+                'exit 1\n')
+    os.chmod(gh, 0o755)
+
+    def run(*cmd):
+        return subprocess.run(cmd, cwd=repo, capture_output=True, text=True,
+                              timeout=120, env=env)
+    env = dict(os.environ, MW_FAKE_ASSET=asset, MW_FAKE_SHA=tag_sha,
+               PATH=os.path.join(repo, "bin") + os.pathsep +
+               os.environ.get("PATH", ""), GIT_CONFIG_NOSYSTEM="1",
+               HOME=repo)
+    for cmd in ([git, "init", "-q"], [git, "add", "-A"],
+                [git, "-c", "user.name=t", "-c", "user.email=t@t",
+                 "commit", "-qm", "x"]):
+        r = run(*cmd)
+        if r.returncode != 0:
+            return "skip"
+    r = run(sys.executable, os.path.join(".github", "scripts",
+                                         "release_current.py"))
+    assert r.returncode == 0, (r.stdout + r.stderr)[-600:]
+    want = hashlib.sha256(released.encode()).hexdigest()
+    man = read_json(os.path.join(repo, ".github", "archive-releases.json"))
+    entry = man["releases"][0]
+    assert entry["sha256"] == want and entry["target"] == tag_sha[:7], entry
+    with open(os.path.join(repo, "docs", "VERSIONS.md"),
+              encoding="utf-8") as f:
+        versions = f.read()
+    assert f"`{want}`" in versions and "| 2 |" in versions, versions
+
+
+@self_test()
+def t_r7_arp_handover_is_not_spoofing(ctx):
+    """Review 7 (#4): an address that passes from one device to another
+    (each answering twice within 2 minutes, one change of owner) is not
+    ARP spoofing; two that keep alternating still are (DANGER)."""
+    S = ScenarioBuilder
+    IP = "192.168.1.77"
+    A, B = "02:77:00:00:00:0a", "02:77:00:00:00:0b"
+
+    def model():
+        gw, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        b = S()
+        b.home_network()
+        replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+        b.frames = []
+        return m, b
+
+    def arp(b, mac, dt):
+        b._emit(PK.Ether(src=mac, dst=S.PHONE[1]) /
+                PK.ARP(op=2, psrc=IP, hwsrc=mac, pdst=S.PHONE[0],
+                       hwdst=S.PHONE[1]), dt=dt)
+
+    def spoof(m):
+        return [a for a in m.alerts.alerts.values() if a.kind == "arp_spoof"]
+    m, b = model()
+    for mac in (A, A, A, B, B, B):
+        arp(b, mac, 5)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    assert not spoof(m), [str(a.__dict__)[:200] for a in spoof(m)]
+    m, b = model()
+    for i in range(12):
+        arp(b, (A, B)[i % 2], 4)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    assert spoof(m) and spoof(m)[0].severity == "DANGER"
+
+
+@self_test()
+def t_r7_elevated_start_closes_and_is_marked(ctx):
+    """Review 7 (#5, #6): when the elevated copy ran, this start's receipt
+    says "elevated", not "running" (two of those sent the next start into
+    Safe Mode), and Start watching closes the window cleanly (history,
+    journal, tray icon) before this copy exits."""
+    if IS_WINDOWS or IS_MAC:
+        return "skip"                    # the sudo and pkexec path
+    g = globals()
+    saved = {k: g[k] for k in ("BOOT", "SELF_TEST_MODE", "needs_elevation",
+                               "elevation_allowed")}
+    real_which, real_call = shutil.which, subprocess.call
+    real_ask = messagebox.askyesno
+
+    def accepted(cmd, *a, **kw):
+        flag = next(x for x in cmd if x.startswith(ELEV_FLAG_ARG))
+        with open(flag[len(ELEV_FLAG_ARG):], "w", encoding="utf-8") as f:
+            f.write("1")
+        return 3
+    order = []
+    try:
+        g["BOOT"] = BootReceipt(directory=ctx.path("r7boot"))
+        shutil.which = lambda n: "/usr/bin/" + n if n == "sudo" else None
+        subprocess.call = accepted
+        try:
+            _relaunch_elevated((START_ARG + "monitor",))
+            raise AssertionError("did not end after the elevated copy")
+        except SystemExit as e:
+            assert e.code == 3
+        assert g["BOOT"].data["outcome"] == "elevated", g["BOOT"].data
+        assert not BootReceipt.failed(read_json(g["BOOT"].path, {}))
+        # from the window: the clean close runs first, then the exit
+        g["BOOT"] = BootReceipt(directory=ctx.path("r7boot"))
+        g["SELF_TEST_MODE"] = False
+        g["needs_elevation"] = lambda: True
+        g["elevation_allowed"] = lambda: True
+        messagebox.askyesno = lambda *a, **k: True
+        root = types.SimpleNamespace(
+            withdraw=lambda: order.append("withdraw"),
+            update_idletasks=lambda: None,
+            deiconify=lambda: order.append("deiconify"))
+        win = types.SimpleNamespace(
+            root=root, _on_close=lambda: order.append(
+                "close:" + g["BOOT"].data["outcome"]),
+            _set_banner=lambda *a, **k: order.append("banner"))
+        try:
+            MiniWireshark._ask_capture_rights(win)
+            raise AssertionError("did not end after the elevated copy")
+        except SystemExit as e:
+            assert e.code == 3
+        assert order == ["withdraw", "close:elevated"], order
+    finally:
+        shutil.which, subprocess.call = real_which, real_call
+        messagebox.askyesno = real_ask
+        g.update(saved)
+
+
+@self_test()
+def t_r7_session_only_keeps_no_raw_packets(ctx):
+    """Review 7 (#7): with "Session only", "Save raw packets on exit"
+    writes no .pcap into the sessions folder (and Settings says why)."""
+    saved = []
+
+    def win(retention):
+        w = types.SimpleNamespace(
+            config=ctx.cfg({"history.save_raw_packets": True,
+                            "history.retention": retention}),
+            all_rows=[{"no": 1}], data_mode="live",
+            save_pcap_to=lambda path, rows: saved.append(path))
+        w._session_only_history = \
+            lambda: MiniWireshark._session_only_history(w)
+        return w
+    assert MiniWireshark._save_raw_packets_on_exit(win("Session only")) \
+        is None and saved == []
+    path = MiniWireshark._save_raw_packets_on_exit(win("30 days"))
+    assert path and saved == [path], saved
+    src = inspect.getsource(MiniWireshark._on_close)
+    assert "_save_raw_packets_on_exit()" in src and \
+        "save_raw_packets\"" not in src
+    notes = settings_conflicts({"history.save_raw_packets": True,
+                                "history.retention": "Session only"})
+    assert any("not saved on exit" in n for n in notes), notes
+
+
+@self_test()
+def t_r7_redactor_mapped_ipv4_one_stand_in(ctx):
+    """Review 7 (#9): ::ffff:192.168.1.5 becomes ::ffff: plus the same
+    stand-in as 192.168.1.5; the IPv4 pass no longer re-redacts that
+    stand-in as an Internet address (198.51.100.x)."""
+    r = Redactor()
+    out = r.text("peer ::ffff:192.168.1.5 then 192.168.1.5, "
+                 "::ffff:8.8.8.8 then 8.8.8.8")
+    words = out.replace(",", "").split()
+    v4, pub = words[3], words[6]
+    assert words[1] == "::ffff:" + v4 and v4.startswith("192.0.2."), out
+    assert words[4] == "::ffff:" + pub and pub.startswith("198.51.100."), \
+        out
+    assert set(r.maps["ip4pub"]) == {"8.8.8.8"}, r.maps
+    assert set(r.maps["ip4"]) == {"192.168.1.5"}, r.maps
+
+
+@self_test()
+def t_r7_packet_ring_wipe_never_waits(ctx):
+    """Review 7 (#10): "Delete ALL history" with a busy packet writer
+    returns at once (it waited up to 10 s on the window's thread), the
+    packets queued before it are never written, and the ones that come
+    after it are kept."""
+    folder = ctx.path(f"r7-ring-{uuid.uuid4().hex[:6]}")
+    pr = PacketRing(folder, 20, None, 1)
+    real = pr._handle
+    busy = threading.Event()
+    busy.set()
+
+    def slow(item):
+        if busy.is_set() and item[0] not in ("wipe", "flush", "epoch"):
+            time.sleep(0.01)
+        real(item)
+    pr._handle = slow
+    try:
+        for i in range(1, 301):
+            pr.put(i, b"\x00" * 60 + b"OLDPACKET", time.time(), 1)
+        t0 = time.perf_counter()
+        pr.wipe()
+        took = time.perf_counter() - t0
+        busy.clear()
+        for i in range(301, 311):
+            pr.put(i, b"\x00" * 60 + b"NEWPACKET", time.time(), 1)
+        assert pr.flush(30)
+    finally:
+        pr.stop()
+    assert took < 1.0, f"the wipe waited {took:.1f} s"
+    data = b""
+    for name in os.listdir(folder):
+        if name.startswith("seg-"):
+            with open(os.path.join(folder, name), "rb") as f:
+                data += f.read()
+    assert b"OLDPACKET" not in data and b"NEWPACKET" in data
+
+
+@self_test()
+def t_r7_damaged_history_set_aside_closed(ctx):
+    """Windows run (#11): a damaged history file is set aside with no
+    connection to it open (the check's own one stayed open when it
+    raised, so Windows refused the rename with WinError 32), and a rename
+    Windows refuses for a moment is tried again."""
+    path = ctx.path(f"r7-damaged-{uuid.uuid4().hex[:6]}.sqlite3")
+    with open(path, "wb") as f:
+        f.write(b"not a database at all " * 300)
+    opened = []
+
+    class Tracked(sqlite3.Connection):
+        def close(self):
+            with contextlib.suppress(ValueError):
+                opened.remove(self)
+            super().close()
+    real_connect, real_replace = sqlite3.connect, os.replace
+    seen = []
+
+    def connect(target, *a, **kw):
+        if str(target) == path:
+            con = real_connect(target, *a, factory=Tracked, **kw)
+            opened.append(con)
+            return con
+        return real_connect(target, *a, **kw)
+
+    def replace(src, dst, *a, **kw):
+        if src == path:
+            seen.append(len(opened))
+            if len(seen) < 3:
+                raise PermissionError(32, "in use by another process")
+        return real_replace(src, dst, *a, **kw)
+    probe = Store.__new__(Store)
+    probe.path, probe.recovered = path, ""
+    sqlite3.connect, os.replace = connect, replace
+    try:
+        probe._check_integrity()
+    finally:
+        sqlite3.connect, os.replace = real_connect, real_replace
+    assert seen == [0, 0, 0], seen
+    assert probe.recovered.startswith("The history file was damaged"), \
+        probe.recovered
+    assert not os.path.exists(path)
+    assert [n for n in os.listdir(ctx.tmp)
+            if n.startswith(os.path.basename(path) + ".corrupt-")]
+
+
+@self_test()
+def t_r7_npcap_check_ignores_powershell7(ctx):
+    """Windows run (#12): started from a PowerShell 7 prompt, the
+    signature check still runs Windows PowerShell with -NoProfile and
+    without the inherited PSModulePath (which broke
+    Get-AuthenticodeSignature: nothing came back, the install was
+    refused)."""
+    seen = {}
+
+    def fake(cmd, **kw):
+        seen["cmd"], seen["env"] = cmd, kw.get("env") or {}
+        return subprocess.CompletedProcess(cmd, 0, "Valid\nCN=x\n", "")
+    old = os.environ.get("PSModulePath")
+    os.environ["PSModulePath"] = os.pathsep.join(
+        ["C:\\Program Files\\PowerShell\\7\\Modules", "C:\\x"])
+    try:
+        assert _authenticode_info(ctx.path("npcap.exe"), run=fake)[0] == \
+            "Valid"
+    finally:
+        if old is None:
+            os.environ.pop("PSModulePath", None)
+        else:
+            os.environ["PSModulePath"] = old
+    assert not [k for k in seen["env"] if k.upper() == "PSMODULEPATH"]
+    assert "-NoProfile" in seen["cmd"] and seen["env"]["MW_SIGNED_FILE"]
+    assert seen["cmd"][0] == windows_powershell()
+    sysroot = ctx.path("r7-windir")
+    exe = os.path.join(sysroot, "System32", "WindowsPowerShell", "v1.0",
+                       "powershell.exe")
+    os.makedirs(os.path.dirname(exe), exist_ok=True)
+    with open(exe, "wb") as f:
+        f.write(b"MZ")
+    assert windows_powershell({"SystemRoot": sysroot}) == exe
+    assert windows_powershell({}) == "powershell"
+
+
+@self_test()
+def t_r7_memory_measured_on_windows(ctx):
+    """Windows run (#15): Windows' working set comes from
+    GetProcessMemoryInfo (it read 0, so the 365 MB gate passed without
+    measuring anything); memory that reads 0 fails the gate."""
+    calls = {}
+
+    def get_current_process():
+        return 1234
+
+    def get_process_memory_info(handle, ref, cb):
+        calls["args"] = (handle, cb)
+        ref._obj.WorkingSetSize = 123 * 1024 * 1024
+        return 1
+    k32 = types.SimpleNamespace(GetCurrentProcess=get_current_process)
+    psapi = types.SimpleNamespace(
+        GetProcessMemoryInfo=get_process_memory_info)
+    assert _windows_rss_mb(k32, psapi) == 123.0
+    assert calls["args"] == (1234, ctypes.sizeof(_ProcessMemoryCounters))
+    fn = psapi.GetProcessMemoryInfo
+    assert fn.restype is ctypes.c_int and len(fn.argtypes) == 3
+    assert k32.GetCurrentProcess.restype is ctypes.c_void_p
+    psapi.GetProcessMemoryInfo = lambda h, ref, cb: 0
+    assert _windows_rss_mb(k32, psapi) == 0.0
+    assert _rss_mb() > 0                      # this computer, for real
+    lim = BENCH_LIMITS["S1"]["rss_loaded_mb"]
+    rows = bench_check({"S1": {"rss_loaded_mb": 0.0}})
+    assert rows == [("S1", "rss_loaded_mb", 0.0, lim, False)], rows
+    assert bench_check({"S1": {"rss_loaded_mb": 120.0}})[0][4]
+    assert not bench_value_ok("rss_loaded_mb", 0, lim)
+    assert bench_value_ok("theme.stall_ms", 0, 145)
+
+
+@self_test()
+def t_r7_theme_walk_reads_options_once_per_class(ctx):
+    """Windows run (#17): the theme walk finds a class's colour options
+    once (it listed every option of every widget, the larger part of a
+    theme change) and still recolours exactly what the Python walk does."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        light, dark = next((k, v) for k, v in LIGHT_TO_DARK_HEX.items()
+                           if k != v)
+        # the test machine's 3.8 Tk aborts on a classic Label, Button or
+        # Text (see t_r6_text_links_one_binding): ttk labels there
+        classic = sys.version_info >= (3, 9)
+        kinds = ("Frame", "Label", "Button") if classic else \
+            ("Frame", "TLabel")
+        trees = []
+        for _ in range(2):
+            fr = tk.Frame(root, background=light)
+            for i in range(30):
+                if classic:
+                    (tk.Label if i % 3 else tk.Button)(
+                        fr, text=str(i), background=light,
+                        activebackground=light).pack()
+                else:
+                    ttk.Label(fr, text=str(i), background=light).pack()
+            trees.append(fr)
+        stub = types.SimpleNamespace(retheme_map=MiniWireshark.retheme_map,
+                                     _RETHEME_TCL=MiniWireshark._RETHEME_TCL)
+        stub._retheme_widget_tree_py = lambda w, p: \
+            MiniWireshark._retheme_widget_tree_py(stub, w, p)
+        MiniWireshark._retheme_widget_tree(stub, trees[0], "Dark")
+        assert stub._retheme_tcl_ok
+        MiniWireshark._retheme_widget_tree_py(stub, trees[1], "Dark")
+
+        def colours(fr):
+            return [(w.winfo_class(), str(w.cget(o)).lower())
+                    for w in [fr] + fr.winfo_children()
+                    for o in ("background", "activebackground",
+                              "foreground") if o in w.keys()]
+        got, want = colours(trees[0]), colours(trees[1])
+        assert got == want, [x for x in zip(got, want) if x[0] != x[1]][:4]
+        assert (kinds[1], dark.lower()) in got, got[:4]
+        for cls in kinds:
+            assert int(root.tk.call("info", "exists",
+                                    f"::mw_retheme_class({cls})")), cls
+    finally:
+        root.destroy()
+
+
+@self_test()
+def t_r7_self_test_keeps_the_real_log_clean(ctx):
+    """Windows run (#18): what the tests log (made-up adapters, "installed
+    update 9.9.9", a damaged history) never reaches the real log, even
+    when a test fails; the real log gets one line, "self-test ran: N
+    passed, M failed", and its handler is back afterwards."""
+    real_path = ctx.path(f"r7-real-{uuid.uuid4().hex[:6]}.log")
+    real = logging.FileHandler(real_path, encoding="utf-8")
+    real.setFormatter(logging.Formatter("%(message)s"))
+    level = LOG.level
+    LOG.setLevel(logging.INFO)
+    LOG.addHandler(real)
+
+    def t_r7_probe_log_ok(_ctx):
+        LOG.warning("installed update 9.9.9 (backup x)")
+
+    def t_r7_probe_log_bad(_ctx):
+        LOG.warning("history: The history file was damaged")
+        raise AssertionError("planted failure")
+    probes = [(t_r7_probe_log_ok, False), (t_r7_probe_log_bad, False)]
+    SELF_TESTS.extend(probes)
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = run_self_tests(verbose=True,
+                                only="r7_probe_log_ok,r7_probe_log_bad")
+        assert rc == 1, rc
+        assert real in LOG.handlers, "the real log was not put back"
+    finally:
+        for pr in probes:
+            SELF_TESTS.remove(pr)
+        LOG.removeHandler(real)
+        real.close()
+        LOG.setLevel(level)
+    with open(real_path, encoding="utf-8") as f:
+        lines = f.read().splitlines()
+    assert lines == ["self-test ran: 1 passed, 1 failed"], lines
 
 
 # ============================================================================
@@ -81368,20 +82153,33 @@ def _gs_map3(app, ctx):
     full = (time.perf_counter() - t0) * 1000
     nodes = {v[1] for v in tab.nodes.values() if v[0] == "device"}
     assert len(nodes) == 300, len(nodes)
-    times = []
+    times, ours = [], []
     for i in range(20):
         t0 = time.perf_counter()
         tab._fast_pan(5, 3)
+        t1 = time.perf_counter()
         root.update_idletasks()
         times.append((time.perf_counter() - t0) * 1000)
+        ours.append((t1 - t0) * 1000)
     t0 = time.perf_counter()
     tab._fast_zoom(1.1)
+    t1 = time.perf_counter()
     root.update_idletasks()
     zoom_ms = (time.perf_counter() - t0) * 1000
-    worst = sorted(times)[-2]
+    zoom_ours = (t1 - t0) * 1000
+    worst, worst_ours = sorted(times)[-2], sorted(ours)[-2]
     print(f"      (300 devices: full draw {full:.0f} ms, pan frame "
-          f"{worst:.1f} ms, zoom frame {zoom_ms:.1f} ms)")
-    assert worst <= 16 and zoom_ms <= 16, (worst, zoom_ms)
+          f"{worst:.1f} ms ({worst_ours:.1f} ms of it ours), zoom frame "
+          f"{zoom_ms:.1f} ms ({zoom_ours:.1f} ms ours))")
+    # what MiniWireshark does for a frame (one Tcl move or scale of what
+    # is drawn) fits one 60 Hz frame everywhere
+    assert worst_ours <= 16 and zoom_ours <= 16, (worst_ours, zoom_ours)
+    # the whole frame includes the system repainting 300 labelled nodes.
+    # (Windows run) GDI took 31 ms for that on Windows 11 while our part
+    # stayed one Tcl call: there, three 60 Hz frames (still a smooth
+    # 20+ updates a second); elsewhere one frame
+    budget = 50 if IS_WINDOWS else 16
+    assert worst <= budget and zoom_ms <= budget, (worst, zoom_ms, budget)
     _gui_pump(root, 0.3)                       # the debounced redraw
     # drag one device and it stays where it was put
     key = sorted(nodes)[0]
@@ -82254,8 +83052,21 @@ def _gs_v502_behaviour(app, ctx):
     app._select_tab("dash")
     _gui_pump(root, 0.2)
     first = app.nb.index("current")
-    app.search_entry.focus_set()
-    _gui_pump(root, 0.1)
+    # (Windows run) a key event goes to the window that has the focus; a
+    # test window behind another one has none, so focus_set alone left
+    # the key with nobody. Take the focus first, and check it was taken
+    root.deiconify()
+    with contextlib.suppress(tk.TclError):
+        root.attributes("-topmost", True)    # Windows: to the front
+    root.lift()
+    root.focus_force()
+    app.search_entry.focus_force()
+    _gui_pump(root, 0.3, lambda: root.focus_get() is app.search_entry,
+              timeout=3)
+    with contextlib.suppress(tk.TclError):
+        root.attributes("-topmost", False)
+    assert root.focus_get() is app.search_entry, \
+        f"the window could not take the focus ({root.focus_get()})"
     app.search_entry.event_generate("<Control-Tab>")
     _gui_pump(root, 0.2)
     assert app.nb.index("current") != first, "Ctrl+Tab did nothing"
