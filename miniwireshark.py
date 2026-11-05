@@ -15548,10 +15548,12 @@ def os_neighbor_mac(ip):
             r = run_console(cmd, timeout=5)
         except (OSError, subprocess.SubprocessError):
             continue
-        m = re.search(r"([0-9a-fA-F]{2}([:-])(?:[0-9a-fA-F]{2}\2){4}"
-                      r"[0-9a-fA-F]{2})", r.stdout or "")
+        # court MAC-01: macOS `arp -n` drops leading zeros (0:1a:2b:…)
+        m = re.search(r"(?<![0-9a-fA-F:-])([0-9a-fA-F]{1,2}([:-])"
+                      r"(?:[0-9a-fA-F]{1,2}\2){4}[0-9a-fA-F]{1,2})"
+                      r"(?![0-9a-fA-F:-])", r.stdout or "")
         if m:
-            mac = m.group(1).replace("-", ":").lower()
+            mac = _padded_mac(m.group(1))
             if is_unicast_mac(mac):
                 return mac
     return ""
@@ -18106,6 +18108,12 @@ def parse_arp_windows(text):
     return out
 
 
+def _padded_mac(raw):
+    """aa:b:… or aa-bb-… as aa:0b:…, lower case (BSD tools drop zeros)."""
+    return ":".join(p.zfill(2) for p in raw.replace("-", ":").split(
+        ":")).lower()
+
+
 def parse_arp_bsd(text):
     """`arp -an` (macOS / BSD) → [(ip, mac, iface)]."""
     out = []
@@ -18113,9 +18121,9 @@ def parse_arp_bsd(text):
         m = re.search(r"\((\d+\.\d+\.\d+\.\d+)\) at ([0-9a-fA-F:]+)"
                       r"(?: on (\S+))?", line)
         if m and "incomplete" not in line:
-            mac = ":".join(p.zfill(2) for p in m.group(2).split(":"))
+            mac = _padded_mac(m.group(2))
             if len(mac) == 17:
-                out.append((m.group(1), mac.lower(), m.group(3) or ""))
+                out.append((m.group(1), mac, m.group(3) or ""))
     return out
 
 
@@ -60556,20 +60564,25 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
         raise ValueError("the download doesn't look like MiniWireshark")
     compile(text, "miniwireshark_update.py", "exec")
     backup = f"{script_path}.v{SCRIPT_VERSION}.bak"
-    mode = stat.S_IMODE(os.stat(script_path).st_mode)
+    before = os.stat(script_path)
+    mode = stat.S_IMODE(before.st_mode)
     shutil.copy2(script_path, backup)
     if not IS_WINDOWS:
         # (review 7) nobody else may write the backup: copy2 kept a 0664
         # program's mode, and rollback_source_ok then refused the backup
         os.chmod(backup, mode & ~0o022)
-    tmp = script_path + ".new"
+    # court NIX-04: a program started through a symlink is replaced where
+    # it really is; the link (and the backup beside it) stay as they are
+    real = os.path.realpath(script_path)
+    tmp = real + ".new"
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         f.write(text)
     if not IS_WINDOWS:
         # the new program keeps the old one's mode (a umask of 077 made
         # it 0600, unreadable for the other users of a shared install)
         os.chmod(tmp, mode)
-    os.replace(tmp, script_path)
+    os.replace(tmp, real)
+    _give_update_back(before, (real, backup))
     # 5.2.3 (B-31): the marker names the file it belongs to and what was
     # written, so another copy of MiniWireshark sharing this data folder
     # (an archived version) never "rolls back" over itself
@@ -60585,6 +60598,21 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
             f"version. A backup of {SCRIPT_VERSION} is at:\n{backup}\nIf the "
             f"new version fails to start, the backup is restored "
             f"automatically.")
+
+
+def _give_update_back(before, paths):
+    """court MAC-02: an update run as root (sudo, pkexec) leaves the
+    program and its backup with the owner the program had before, not
+    root (the user could no longer change or update it). Never to root,
+    never on Windows; a refusal is logged, not fatal."""
+    if IS_WINDOWS or os.geteuid() != 0 or not before.st_uid:
+        return
+    for p in paths:
+        try:
+            os.chown(p, before.st_uid, before.st_gid, follow_symlinks=False)
+        except OSError as e:
+            LOG.warning("update: could not give %s back to its owner: %s",
+                        p, e)
 
 
 def _norm_path(p):
@@ -82668,7 +82696,7 @@ def t_b9_category_shown(ctx):
     assert category_shown("Tracking", "list", on)
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_534_court_bad_setting_numbers(ctx):
     """5.3.4 court WIN-01: a packets-kept setting that is empty, not a
     number, infinite or negative no longer stops the window from opening
@@ -82837,7 +82865,7 @@ def t_534_court_table_ctrl_c(ctx):
         root.destroy()
 
 
-@self_test()
+@self_test(needs_source=True)
 def t_534_court_repo_help_and_tk_hint(ctx):
     """5.3.4 court GUI-08 and MAC-05: the update-source help points at the
     "Use the official source" button in all three languages and keeps
@@ -82853,6 +82881,115 @@ def t_534_court_repo_help_and_tk_hint(ctx):
         src = f.read()
     tk_msg = src[src.index("needs Python's graphical toolkit"):][:400]
     assert "brew install python-tk" in tk_msg and "python.org" in tk_msg
+
+
+@self_test()
+def t_534_court_neighbor_mac_short_octets(ctx):
+    """5.3.4 court MAC-01 (simulated macOS): the OS neighbour cache entry
+    is read even when `arp -n` drops leading zeros, normalised like
+    parse_arp_bsd does; Linux and Windows lines still read as before."""
+    outs = {}
+
+    def fake(cmd, timeout=10):
+        return types.SimpleNamespace(stdout=outs.get(cmd[0], ""))
+    with _b9_patched(globals(), IS_WINDOWS=False, run_console=fake):
+        outs["arp"] = "? (192.168.1.1) at 0:1a:2b:3c:4d:5e on en0 ifscope " \
+                      "[ethernet]\n"
+        assert os_neighbor_mac("192.168.1.1") == "00:1a:2b:3c:4d:5e"
+        outs["arp"] = "? (192.168.1.1) at (incomplete) on en0\n"
+        assert os_neighbor_mac("192.168.1.1") == ""
+        outs["ip"] = "192.168.1.1 dev eth0 lladdr AA:BB:CC:DD:EE:01 " \
+                     "REACHABLE\n"
+        assert os_neighbor_mac("192.168.1.1") == "aa:bb:cc:dd:ee:01"
+    with _b9_patched(globals(), IS_WINDOWS=True, run_console=fake):
+        outs["arp"] = "Interface: 192.168.1.10 --- 0xb\n  192.168.1.1     " \
+                      "   00-1e-58-aa-00-01     dynamic\n"
+        assert os_neighbor_mac("192.168.1.1") == "00:1e:58:aa:00:01"
+    assert parse_arp_bsd("? (10.0.0.2) at 0:1a:2b:3c:4d:5e on en0") == \
+        [("10.0.0.2", "00:1a:2b:3c:4d:5e", "en0")]
+
+
+def _court_update_body():
+    return ("# MiniWireshark (test update)\ndef main():\n    return 0\n" +
+            "#" * 60000 + "\n").encode("utf-8")
+
+
+@self_test()
+def t_534_court_update_through_symlink(ctx):
+    """5.3.4 court NIX-04: a program started through a symlink is updated
+    where it really is, and the link survives (simulated where symlinks
+    need privileges: realpath is mocked)."""
+    folder = ctx.path(f"court-link-{uuid.uuid4().hex[:6]}")
+    os.makedirs(os.path.join(folder, "real"))
+    target = os.path.join(folder, "real", "miniwireshark.py")
+    link = os.path.join(folder, "mw")
+    with open(target, "w", encoding="utf-8") as f:
+        f.write("old\n")
+    real_link = True
+    try:
+        os.symlink(target, link)
+    except (OSError, NotImplementedError):
+        real_link = False
+        with open(link, "w", encoding="utf-8") as f:
+            f.write("stands for the link\n")
+    rp = os.path.realpath
+    fake_rp = (lambda p: target if _norm_path(p) == _norm_path(link)
+               else rp(p))
+    marker = os.path.join(folder, "update_pending.json")
+    with _b9_patched(os.path, realpath=rp if real_link else fake_rp):
+        apply_self_update(_court_update_body(), "9.9.9", link, marker)
+    with open(target, "rb") as f:
+        assert f.read() == _court_update_body()
+    if real_link:
+        assert os.path.islink(link) and rp(link) == rp(target)
+    else:
+        with open(link, encoding="utf-8") as f:
+            assert f.read() == "stands for the link\n"
+    backup = f"{link}.v{SCRIPT_VERSION}.bak"
+    assert os.path.exists(backup) and not os.path.exists(target + ".new")
+    assert read_json(marker, {}).get("backup") == backup
+
+
+@self_test()
+def t_534_court_update_as_root_gives_back(ctx):
+    """5.3.4 court MAC-02 (simulated sudo/pkexec): an update run as root
+    gives the program and its backup back to the owner the program had
+    (uid 1000), never to root; a refused chown is logged, not fatal;
+    nothing happens for a root-owned program, a normal user or on
+    Windows."""
+    calls = []
+
+    def chown(p, uid, gid, follow_symlinks=True):
+        calls.append((os.path.basename(p), uid, gid, follow_symlinks))
+        if p.endswith("refuse"):
+            raise PermissionError(1, "refused")
+    st = types.SimpleNamespace(st_uid=1000, st_gid=1001)
+    with _b9_patched(globals(), IS_WINDOWS=False), \
+            _b9_patched(os, chown=chown, geteuid=lambda: 0):
+        _give_update_back(st, ("/x/refuse", "/x/mw.py.bak"))
+        assert calls == [("refuse", 1000, 1001, False),
+                         ("mw.py.bak", 1000, 1001, False)], calls
+        calls.clear()
+        _give_update_back(types.SimpleNamespace(st_uid=0, st_gid=0),
+                          ("/x/mw.py",))
+        with _b9_patched(os, geteuid=lambda: 1000):
+            _give_update_back(st, ("/x/mw.py",))
+    with _b9_patched(globals(), IS_WINDOWS=True), \
+            _b9_patched(os, chown=chown, geteuid=lambda: 0):
+        _give_update_back(st, ("/x/mw.py",))
+    assert calls == [], calls
+    folder = ctx.path(f"court-root-{uuid.uuid4().hex[:6]}")
+    os.makedirs(folder)
+    script = os.path.join(folder, "miniwireshark.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("old\n")
+    seen = []
+    with _b9_patched(globals(), _give_update_back=lambda b, paths:
+                     seen.append((b.st_ino, paths))):
+        apply_self_update(_court_update_body(), "9.9.9", script,
+                          os.path.join(folder, "update_pending.json"))
+    assert len(seen) == 1 and seen[0][1] == (
+        os.path.realpath(script), f"{script}.v{SCRIPT_VERSION}.bak"), seen
 
 
 @self_test()
