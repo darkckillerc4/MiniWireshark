@@ -14510,6 +14510,17 @@ class DeviceRegistry:
         return sorted(m for m, t in (self.arp_seen.get(ip) or {}).items()
                       if sum(1 for x in t if now - x <= window) >= 2)
 
+    def arp_twin_ip(self, ip, macs, window=120):
+        """5.3.4 review: another address that all of `macs` answered for
+        in the last `window` seconds (ARP flux: one host with two network
+        cards answers for both its addresses from both), or None."""
+        now = self.now()
+        for ip2, seen in self.arp_seen.items():
+            if ip2 != ip and all(seen.get(m) and now - seen[m][-1] <= window
+                                 for m in macs):
+                return ip2
+        return None
+
     def note_dhcp_lease(self, ip, mac, hostname, lease_secs=None, when=None):
         when = when or self.now()
         dev = self.touch(ip, mac, "dhcp_lease",
@@ -17011,10 +17022,31 @@ class AlertEngine:
                                            prefixes[:4]],
             subject=f"rogue_ra:{mac}")
 
-    def arp_spoof(self, ip, n_macs, flips, is_gateway, together=0):
+    def arp_spoof(self, ip, n_macs, flips, is_gateway, together=0,
+                  twin=False):
+        # twin: False, or (mac_a, mac_b, other_ip) from Registry.arp_twin_ip
         if self._debounced(f"arpspoof:{ip}", 120):
             return None
         who = "Your router's address" if is_gateway else f"The address {ip}"
+        if twin:
+            # (5.3.4 review) ARP flux: demoted, not silenced, so a forged
+            # decoy reply for a second address cannot hide an attack
+            mac_a, mac_b, other = twin
+            return self._add(
+                "arp_spoof", "WARNING", f"ip:{ip}",
+                f"Two network cards of one device (MAC {mac_a} and MAC "
+                f"{mac_b}) are both answering for {ip}",
+                f"{ip} was claimed by {together or n_macs} different MAC "
+                f"addresses, which also both answer for {other}.",
+                "Two network cards of one device (MAC "
+                f"{mac_a} and MAC {mac_b}) are both answering for this "
+                f"address and for another address ({other}). This is known "
+                "as ARP flux, and is common on Linux machines with two "
+                "network connections.",
+                "This is usually harmless. But if you don't have a device "
+                "with two network connections, treat it as possible ARP "
+                "spoofing — one device impersonating another so "
+                "traffic passes through it.")
         return self._add(
             "arp_spoof", "DANGER", f"ip:{ip}",
             f"{who} keeps switching between devices",
@@ -22522,12 +22554,21 @@ class NetworkModel:
             fighting = True
         if flips >= int(self.config.get("alerts.arp_flip_threshold", 4)) \
                 or fighting:
+            # (5.3.4 review) ARP flux: the same two MACs, neither the
+            # router's, also both answering for another address lately
+            other = None
+            if ip != self.gateway_ip and len(both) == 2 and \
+                    not set(both) & (reg.gw_macs | reg.gw_candidates):
+                other = reg.arp_twin_ip(ip, both)
             a = self._alert(self.alerts.arp_spoof(
                 ip, len(self.registry.ip_macs.get(ip, ())), flips,
-                ip == self.gateway_ip, together=len(both)))
+                ip == self.gateway_ip, together=len(both),
+                twin=(both[0], both[1], other) if other else False))
             if a and not a.updated:
                 a.evidence = [f"{t:.0f}: {ip} claimed by {m}" for t, m in
                               list(self.registry.arp_claims.get(ip, ()))[-8:]]
+                if other:
+                    a.evidence.append(f"also both answering for {other}")
                 if ip == self.gateway_ip:
                     self.banner("\U0001F6A8  Your router's address keeps "
                                 "flipping between two devices — see the "
@@ -81733,6 +81774,63 @@ def t_r7_arp_handover_is_not_spoofing(ctx):
         arp(b, (A, B)[i % 2], 4)
     replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
     assert spoof(m) and spoof(m)[0].severity == "DANGER"
+
+
+@self_test()
+def t_534_arp_flux_two_nics_is_warning(ctx):
+    """5.3.4 review: one host with two network cards answering for both
+    its addresses from both (ARP flux) is a WARNING, not DANGER; an
+    attacker against the router stays DANGER, and a forged decoy reply
+    for a spare address only demotes the alert, never hides it."""
+    S = ScenarioBuilder
+    X, Y, Z = "192.168.1.77", "192.168.1.78", "192.168.1.79"
+    A, B = "02:77:00:00:00:0a", "02:77:00:00:00:0b"
+    M = "02:66:00:00:00:66"
+    V = S.TV
+
+    def model():
+        gw, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        b = S()
+        b.home_network()
+        replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+        b.frames = []
+        return m, b
+
+    def arp(b, mac, dt, psrc):
+        b._emit(PK.Ether(src=mac, dst=S.PHONE[1]) /
+                PK.ARP(op=2, psrc=psrc, hwsrc=mac, pdst=S.PHONE[0],
+                       hwdst=S.PHONE[1]), dt=dt)
+
+    def spoof(m, ip=None):
+        return [a for a in m.alerts.alerts.values() if a.kind == "arp_spoof"
+                and (ip is None or a.device_key == f"ip:{ip}")]
+    m, b = model()
+    for i in range(16):
+        arp(b, (A, B)[i // 2 % 2], 4, (X, Y)[i % 2])
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    got = spoof(m)
+    assert got and all(a.severity == "WARNING" for a in got), \
+        [(a.device_key, a.severity) for a in got]
+    m, b = model()
+    for i in range(12):
+        arp(b, (M, S.GW[1])[i % 2], 4, S.GW[0])
+        arp(b, (M, V[1])[i % 2], 0.5, V[0])
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    gw = spoof(m, S.GW[0])
+    assert gw and gw[0].severity == "DANGER", \
+        [(a.device_key, a.severity) for a in spoof(m)]
+    m, b = model()
+    arp(b, M, 4, Z)
+    arp(b, V[1], 4, Z)
+    for i in range(12):
+        arp(b, (M, V[1])[i % 2], 4, V[0])
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    got = spoof(m, V[0])
+    assert got and got[0].severity in ("WARNING", "DANGER"), \
+        [(a.device_key, a.severity) for a in spoof(m)]
 
 
 @self_test()
