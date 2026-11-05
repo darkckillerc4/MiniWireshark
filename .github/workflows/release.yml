@@ -35,6 +35,9 @@ jobs:
       - name: Publish and record
         env:
           GH_TOKEN: ${{ github.token }}
+          # signs the release (miniwireshark.manifest.json) only when the
+          # owner has added this secret; without it nothing changes
+          MW_RELEASE_KEY: ${{ secrets.MW_RELEASE_KEY }}
         run: python3 .github/scripts/release_current.py ${{ inputs.dry_run && '--dry-run' || '' }}
       - name: Commit the version index
         if: ${{ !inputs.dry_run }}

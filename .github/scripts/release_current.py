@@ -39,6 +39,24 @@ def read(*parts):
         return f.read()
 
 
+def sign_asset(asset, version, work):
+    """Sign the release with the MW_RELEASE_KEY secret (the JSON file that
+    --make-release-key writes) and return the signed manifest's path.
+    Only runs when the secret exists; the key file lives in the temporary
+    folder, which is removed when the release is done."""
+    key = os.path.join(work, "release.key")
+    fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(os.environ["MW_RELEASE_KEY"])
+    try:
+        subprocess.run([sys.executable, path("miniwireshark.py"),
+                        "--sign-release", asset, "--key", key,
+                        "--version", version], check=True)
+    finally:
+        os.remove(key)
+    return os.path.join(work, "miniwireshark.manifest.json")
+
+
 def write(text, *parts):
     with open(path(*parts), "w", encoding="utf-8", newline="\n") as f:
         f.write(text)
@@ -201,6 +219,8 @@ def main():
         if not own_notes:
             with open(notes_file, "w", encoding="utf-8") as f:
                 f.write(notes)
+        if not released and os.environ.get("MW_RELEASE_KEY"):
+            cmd[4:4] = [sign_asset(asset, version, work)]
         if released:
             print(f"{tag} is already released; checking the version index.")
         else:
