@@ -1448,6 +1448,9 @@ def start_from_compiled_copy(code, argv=None, environ=None, execute=True,
     return None
 
 
+# M4: the code this process runs, kept so Windows can write the compiled
+# copy itself (prepare_compiled_copy) instead of compiling the file again
+_MAIN_CODE = sys._getframe(0).f_code if __name__ == "__main__" else None
 if __name__ == "__main__" and not FROZEN:
     if os.environ.get("MW_CACHED"):
         # loaded from the copy: keep it fresh for the processes it starts,
@@ -3824,10 +3827,10 @@ def warm_up_before_window(loader, cfg):
         loader.post_progress(100)
         if box and store_calibration(cfg, box[0]):
             done["calibration_pps"] = round(box[0])
-    # Windows (and a start with the compiled copy turned off) never keeps
-    # the compiled copy itself: a short helper writes it now, so the first
-    # Full Power worker starts in 0.2 s, not 1 s. Waited for here (up to
-    # 20 s), so it does not compete with building the window
+    # Windows writes the compiled copy itself now (M4, compiled_start);
+    # when it can't (or a start with the copy turned off), a short helper
+    # writes it, so the first Full Power worker starts in 0.2 s, not 1 s.
+    # Waited for here (up to 20 s), so it does not compete with the window
     proc = prepare_compiled_copy(cfg=cfg)
     if proc is not None:
         loader.warm_step("Preparing the helper processes — once per "
@@ -3857,6 +3860,13 @@ def prepare_compiled_copy(popen=None, cfg=None):
         st = os.stat(SCRIPT_PATH)
         if not compiled_copy_trusted() or _pyc_fresh(compiled_copy_path(),
                                                      st):
+            return None
+        # M4: on Windows (no exec into the copy) this process writes it
+        # from the code it already runs, with the same key and checks; the
+        # helper compiled the 4 MB file again (10 s on a first start)
+        if IS_WINDOWS and not FROZEN and _MAIN_CODE is not None and \
+                FEATURES.get("compiled_start", True) and \
+                keep_compiled_copy(_MAIN_CODE):
             return None
         stamp = f"{int(st.st_mtime)}:{st.st_size}"
         if cfg is not None:
@@ -11857,6 +11867,7 @@ FEATURES = {
     "auto_update_check": True,   # once a day, official GitHub page only
     "filter_english": True,  # a typed filter said in words (M16, IP-023)
     "route_pick": True,      # the card Windows' own route uses (IP-004)
+    "compiled_start": True,  # Windows writes and starts from the copy (M4)
 }
 
 
@@ -12062,6 +12073,9 @@ FEATURE_HELP = {
                   "the Internet is picked first, and a VPN that carries "
                   "the Internet route is not picked over the physical "
                   "card",
+    "compiled_start": "on Windows the compiled copy of the program is "
+                      "written by the program itself (a first start no "
+                      "longer compiles the file twice)",
     "auto_update_check": "once a day, MiniWireshark asks the official GitHub "
                          "page for the latest version number (one request "
                          "to api.github.com, nothing about you)",
@@ -76701,9 +76715,12 @@ def t_warm_up_on_the_loading_screen(ctx):
         globals()["prepare_compiled_copy"] = real_prep
     assert not store_calibration(cfg, 0)
     # the compiled copy for helpers: written by a helper only when missing
+    # (M4: with compiled_start off; on, Windows writes it itself, below)
     started = []
     real_path = globals()["compiled_copy_path"]
+    real_cs = FEATURES["compiled_start"]
     try:
+        FEATURES["compiled_start"] = False
         globals()["compiled_copy_path"] = lambda: ctx.path("none.pyc")
         if not compiled_copy_trusted():
             # root (or a shared folder) never keeps one: no helper either
@@ -76730,10 +76747,31 @@ def t_warm_up_on_the_loading_screen(ctx):
         assert prepare_compiled_copy(popen=fake, cfg=c2) == "proc"
         assert prepare_compiled_copy(popen=fake, cfg=c2) is None
         assert len(started) == 2
+        # M4: Windows writes the copy in this process, from the code it
+        # runs (same key and freshness check), and starts no helper; if it
+        # can't, the helper still does
+        FEATURES["compiled_start"] = True
+        mine = ctx.path("m4-own.pyc")
+        globals()["compiled_copy_path"] = lambda: mine
+        code = compile("x = 1\n", SCRIPT_PATH, "exec")
+        if not IS_WINDOWS:           # Linux, macOS: exec, so the helper
+            with _b9_patched(globals(), _MAIN_CODE=code):
+                assert prepare_compiled_copy(popen=fake) == "proc"
+            raise _NoCopyHere
+        with _b9_patched(globals(), _MAIN_CODE=code):
+            assert prepare_compiled_copy(popen=fake) is None
+            assert len(started) == 2 and _pyc_fresh(mine,
+                                                    os.stat(SCRIPT_PATH))
+            globals()["compiled_copy_path"] = lambda: os.path.join(
+                ctx.path("m4-nowhere"), "x.pyc")
+            with _b9_patched(globals(), keep_compiled_copy=lambda c: None):
+                assert prepare_compiled_copy(popen=fake) == "proc"
+            assert len(started) == 3
     except _NoCopyHere:
         pass
     finally:
         globals()["compiled_copy_path"] = real_path
+        FEATURES["compiled_start"] = real_cs
     # the capture start: the first quiet wait ends it, not a 0.2 s sleep
     if not ctx.scapy_ok or conf is None:
         return
