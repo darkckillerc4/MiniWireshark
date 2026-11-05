@@ -24020,16 +24020,20 @@ def migrate_config(data):
     if ver < 3:
         # 5.3.4: updates come from the official GitHub page by default and
         # are checked once a day. An empty source becomes the official one.
-        # Checks are turned on, with a one-time banner, only when no choice
-        # was stored; a stored "off" stays off until the user says yes
-        # (court GUI-07), with or without a source of their own.
+        # Without a source the "check" box could not do anything (Settings
+        # greyed it out and 5.3.3 stored False for everyone), so that False
+        # was never a choice: the owner asked for automatic checks, so it
+        # is turned on and a one-time banner says how to turn it off. A
+        # user who had set a source of their own and left checks off keeps
+        # them off. (Court GUI-07 asked to keep the stored "off"; the
+        # owner's request for automatic updates decides.)
         up = data.get("updates")
         if not isinstance(up, dict):
             up = data["updates"] = {}
         had_repo = bool(str(up.get("repo", "") or "").strip())
         if not had_repo:
             up["repo"] = OFFICIAL_UPDATE_REPO
-            if "check_automatically" not in up:
+            if not up.get("check_automatically", False):
                 up["check_automatically"] = True
                 up["notice_pending"] = True
         elif "check_automatically" not in up:
@@ -74446,13 +74450,13 @@ def t_update_source_default_and_migration(ctx):
         with open(p, "w") as f:
             json.dump(data, f)
         return AppConfig(path=p)
-    # 5.3.3 wrote every key: no source, checks off. Court GUI-07: that
-    # stored "off" stays off (no consent to a daily check)
+    # 5.3.3 wrote every key: no source, checks off (the box was greyed
+    # out, so it was never a choice): on, and told once (can undo)
     c = load({"check_automatically": False, "repo": "",
               "allow_self_update": False})
     assert c.get("updates.repo") == OFFICIAL_UPDATE_REPO
-    assert c.get("updates.check_automatically") is False
-    assert not c.get("updates.notice_pending")
+    assert c.get("updates.check_automatically") is True
+    assert c.get("updates.notice_pending") is True
     assert c.data["config_version"] == CONFIG_SCHEMA_VERSION
     # no updates section at all: on, and told once (can undo)
     c = load(None)
