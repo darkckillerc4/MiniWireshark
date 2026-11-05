@@ -905,7 +905,7 @@ def mac_admin_cmd(argv):
     """The osascript command that runs argv as administrator. 5.3.4 (RT-07,
     OS-05): the shell command is passed as an argument to the script, not
     pasted into the AppleScript text, so a quote or apostrophe in the
-    program's path ("Krystel's Mac") neither breaks it nor runs as code."""
+    program's path ("Sam's Mac") neither breaks it nor runs as code."""
     return ["osascript", "-e", "on run argv",
             "-e", "do shell script (item 1 of argv) with administrator "
                   "privileges",
@@ -69651,7 +69651,7 @@ def t_m1b_npcap_signature_path(ctx):
         seen["cmd"], seen["env"] = cmd, kw.get("env") or {}
         return subprocess.CompletedProcess(
             cmd, 0, "Valid\nCN=Nmap Software LLC, O=Nmap Software LLC\n", "")
-    path = ctx.path("npcap 1.80 (Krystel's).exe")
+    path = ctx.path("npcap 1.80 (Sam's).exe")
     st, who = _authenticode_info(path, run=fake)
     assert (st, who) == ("Valid", "CN=Nmap Software LLC, O=Nmap Software LLC")
     assert seen["cmd"][-2] == "-Command" and path not in " ".join(
@@ -75823,7 +75823,7 @@ def test_teach_once_fingerprints(ctx):
     assert lt.match(b) is None
     assert LearnedTypes(path=ctx.path("learned.json")).items == []
     assert _name_pattern("ESP_6A1B2C") == "esp_*"
-    assert _name_pattern("Krystel's laptop") == ""
+    assert _name_pattern("Sam's laptop") == ""
     lt2 = LearnedTypes(path=ctx.path("learned2.json"))
     for i in range(LearnedTypes.MAX + 20):
         lt2.learn(DeviceRecord(key=f"k{i}", mac=f"00:1b:a9:00:{i // 256:02x}:"
@@ -77434,7 +77434,7 @@ def t_m1b_pin_and_applescript(ctx):
     finally:
         http.client.HTTPSConnection = real
     assert sent == [], sent
-    path = '/Users/k/Krystel\'s "Mac"/a" & (do shell script "x") & "'
+    path = '/Users/s/Sam\'s "Mac"/a" & (do shell script "x") & "'
     cmd = mac_admin_cmd(["/usr/bin/python3", path, "--x"])
     assert cmd[:7] == ["osascript", "-e", "on run argv", "-e",
                        "do shell script (item 1 of argv) with "
