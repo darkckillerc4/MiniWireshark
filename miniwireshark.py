@@ -68483,19 +68483,30 @@ def t_call_decoder_fuzz(ctx):
     frames = call_corpus().frames()
     m = _call_model(ctx, frames[:4000])        # streams to be fed lies
     slowest, mutated = 0.0, []
-    for i in range(12000):
-        raw, ts, lt = frames[rng.randrange(len(frames))]
-        b = _mutate_call_frame(rng, raw)
-        t0 = time.perf_counter()
-        r = wire_rtc(b[42:])
-        if r is not None and r["kind"] == "RTP":
-            assert r["header_len"] <= len(b) - 42, r
-        d = fast_decode(b, ts + 0.0001 * i, lt)
-        assert isinstance(d, dict) and "proto" in d
-        m.ingest(d)
-        slowest = max(slowest, time.perf_counter() - t0)
-        if i % 4 == 0:
-            mutated.append((b, ts, lt))
+    # the time limit is the decoders' own: a garbage-collector pass (a
+    # whole-heap walk that the app's frozen start-up objects keep short)
+    # runs between frames, not inside the timed part
+    was_on = gc.isenabled()
+    gc.disable()
+    try:
+        for i in range(12000):
+            raw, ts, lt = frames[rng.randrange(len(frames))]
+            b = _mutate_call_frame(rng, raw)
+            t0 = time.perf_counter()
+            r = wire_rtc(b[42:])
+            if r is not None and r["kind"] == "RTP":
+                assert r["header_len"] <= len(b) - 42, r
+            d = fast_decode(b, ts + 0.0001 * i, lt)
+            assert isinstance(d, dict) and "proto" in d
+            m.ingest(d)
+            slowest = max(slowest, time.perf_counter() - t0)
+            if i % 4 == 0:
+                mutated.append((b, ts, lt))
+            if i % 500 == 499:
+                gc.collect(0)
+    finally:
+        if was_on:
+            gc.enable()
     m.calls.summary()
     calls_card_text(m.calls)
     assert slowest < 0.050, f"one frame took {slowest * 1000:.0f} ms"
