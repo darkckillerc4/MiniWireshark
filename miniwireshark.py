@@ -481,18 +481,28 @@ def _tmp_name(path):
     return f"{path}.tmp{os.getpid()}-{threading.get_ident() % 100000}"
 
 
-def atomic_write_text(path, text, encoding="utf-8"):
+def _atomic_write(path, data, mode, encoding=None):
+    """(5.3.4 review) on disk before the rename, so a power cut cannot
+    leave an empty file; the temporary file never stays."""
     tmp = _tmp_name(path)
-    with open(tmp, "w", encoding=encoding) as f:
-        f.write(text)
+    try:
+        with open(tmp, mode, encoding=encoding) as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
     _replace_retrying(tmp, path)
+
+
+def atomic_write_text(path, text, encoding="utf-8"):
+    _atomic_write(path, text, "w", encoding=encoding)
 
 
 def atomic_write_bytes(path, data):
-    tmp = _tmp_name(path)
-    with open(tmp, "wb") as f:
-        f.write(data)
-    _replace_retrying(tmp, path)
+    _atomic_write(path, data, "wb")
 
 
 def session_is_gz(path):
@@ -9204,7 +9214,10 @@ def _decode_tcp_payload(d, load, reasm):
             head = load[:2048].decode("latin-1")
         except UnicodeError:
             head = ""
-        line = head.split("\r\n", 1)[0]
+        # (5.3.4 review) safe_text_line hides the query even when the
+        # request line is cut before " HTTP/x.y"
+        line = sanitize_text(safe_text_line(
+            load[:2048].split(b"\n", 1)[0].rstrip(b"\r")), 200)
         m = re.search(r"\r\nHost:\s*([^\r\n]+)", head, re.I)
         host = m.group(1).strip().lower()[:120] if m else ""
         if host and not re.match(r"^[a-z0-9._:\[\]-]+$", host):
@@ -9216,8 +9229,7 @@ def _decode_tcp_payload(d, load, reasm):
                 d["text"] = f"Proxy tunnel request: {line[:100]}"
                 d["encrypted"] = "unknown"
             else:
-                d["text"] = "Unsecured web request: " + \
-                    hide_credentials(line)[:110]
+                d["text"] = "Unsecured web request: " + line[:110]
                 if host:
                     d["text"] += f"  (Host: {host})"
                 d["encrypted"] = "no"
@@ -10980,7 +10992,6 @@ class NameCache:
     def __init__(self):
         self.ip_to_name = {}
         self.sources = {}
-        self.domain_to_ips = defaultdict(set)
         self.lock = threading.Lock()
         self.version = 0
 
@@ -10998,10 +11009,6 @@ class NameCache:
                 return False
             self.ip_to_name[ip] = name
             self.sources[ip] = source
-            ips = self.domain_to_ips[name.lower()]
-            ips.add(ip)
-            if len(ips) > 64:
-                ips.pop()
             if len(self.ip_to_name) > 50000:
                 for k in list(self.ip_to_name)[:5000]:
                     self.ip_to_name.pop(k, None)
@@ -24679,6 +24686,9 @@ class Store:
         with contextlib.suppress(sqlite3.Error):
             con.execute("PRAGMA journal_mode=WAL")
             con.execute("PRAGMA synchronous=NORMAL")
+            # (5.3.4 review) a forgotten device's rows don't stay in free
+            # pages of the file
+            con.execute("PRAGMA secure_delete=ON")
         con.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, "
                     "v TEXT)")
         row = con.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
@@ -60054,7 +60064,8 @@ class CrashDialog:
             return
         cls._open = True
         try:
-            path = app.autosave("crash")
+            path = None if app._session_only_history() else \
+                app.autosave("crash")
         except Exception:                            # noqa: BLE001
             LOG.exception("autosave after a crash")
             path = None
@@ -62301,6 +62312,19 @@ def _next_proto(d, proto, off, end):
 
 
 def _dissect_ethertype(d, et, off):
+    # (5.3.4 review) stacked VLAN tags in a loop, at most 8: a recursion
+    # per tag let a crafted frame raise RecursionError out of dissect()
+    for _tag in range(8):
+        if et not in (0x8100, 0x88A8):
+            break
+        d.begin("vlan", off, off + 4)
+        tci = d.u16(off)
+        d.add("vlan.priority", tci >> 13, off, 2)
+        d.add("vlan.id", tci & 0xFFF, off, 2)
+        inner = d.u16(off + 2)
+        d.add("vlan.etype", inner, off + 2, 2,
+              f"{_ETHERTYPES.get(inner, 'other')} (0x{inner:04x})")
+        et, off = inner, off + 4
     if et == 0x0800:
         _dissect_ipv4(d, off)
     elif et == 0x86DD:
@@ -62321,15 +62345,6 @@ def _dissect_ethertype(d, et, off):
               6)
         d.add("arp.dst.proto_ipv4", _socket.inet_ntoa(
             d.raw[off + 24:off + 28]), off + 24, 4)
-    elif et in (0x8100, 0x88A8):
-        d.begin("vlan", off, off + 4)
-        tci = d.u16(off)
-        d.add("vlan.priority", tci >> 13, off, 2)
-        d.add("vlan.id", tci & 0xFFF, off, 2)
-        inner = d.u16(off + 2)
-        d.add("vlan.etype", inner, off + 2, 2,
-              f"{_ETHERTYPES.get(inner, 'other')} (0x{inner:04x})")
-        _dissect_ethertype(d, inner, off + 4)
     elif off < len(d.raw):
         d.begin("data", off)
         d.add("data.len", len(d.raw) - off, off, len(d.raw) - off,
@@ -81834,6 +81849,52 @@ def t_534_arp_flux_two_nics_is_warning(ctx):
 
 
 @self_test()
+def t_534_sec_cut_http_line_hides_query(ctx):
+    """5.3.4 review: a request line cut before " HTTP/x.y" still has its
+    query hidden in the info text, and the unused domain map is gone."""
+    d = {"dns_names": [], "learns": [], "dst_ip": "", "seq": None}
+    _decode_tcp_payload(d, b"GET /search?q=private+medical+term&ref=" +
+                        b"A" * 1500, None)
+    assert d["text"].startswith("Unsecured web request: GET /search?") \
+        and "medical" not in d["text"], d["text"]
+    assert not hasattr(NameCache(), "domain_to_ips")
+
+
+@self_test()
+def t_534_sec_stacked_vlan_tags_do_not_raise(ctx):
+    """5.3.4 review: 1200 stacked VLAN tags no longer raise RecursionError
+    out of dissect(), which never raises."""
+    raw = b"\x00" * 12 + b"\x81\x00" + b"\x00\x01\x81\x00" * 1200 + \
+        b"\x00\x01\x08\x00"
+    out = dissect(raw)
+    assert out.nodes
+
+
+@self_test()
+def t_534_sec_durable_writes_leave_no_temp(ctx):
+    """5.3.4 review: a failed atomic write keeps the old file and leaves no
+    temporary file; a pcap with a time past 2106 is still written."""
+    folder = ctx.path("durable")
+    os.makedirs(folder)
+    p = os.path.join(folder, "a.txt")
+    atomic_write_text(p, "old")
+    try:
+        atomic_write_text(p, "\udc80")       # can't be encoded: fails
+    except UnicodeError:
+        pass
+    else:
+        raise AssertionError("the write should have failed")
+    with open(p, encoding="utf-8") as f:
+        assert f.read() == "old"
+    assert os.listdir(folder) == ["a.txt"], os.listdir(folder)
+    pc = os.path.join(folder, "b.pcap")
+    write_raw_pcap(pc, [(b"\x00" * 60, 2 ** 32 + 5.5, 1)])
+    assert sorted(os.listdir(folder)) == ["a.txt", "b.pcap"]
+    with open(pc, "rb") as f:
+        assert struct.unpack("<I", f.read()[24:28])[0] == 5
+
+
+@self_test()
 def t_r7_elevated_start_closes_and_is_marked(ctx):
     """Review 7 (#5, #6): when the elevated copy ran, this start's receipt
     says "elevated", not "running" (two of those sent the next start into
@@ -84218,13 +84279,16 @@ def run_gui_test(live=False):
 def write_raw_pcap(path, frames):
     """Write (raw, ts, linktype) frames to a classic pcap file (stdlib)."""
     lt = frames[0][2] if frames else 1
-    with open(path, "wb") as f:
+    part = f"{path}.part"
+    with open(part, "wb") as f:
         f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 262144, lt))
         for raw, ts, _lt in frames:
             sec = int(ts)
             usec = int(round((ts - sec) * 1e6)) % 1000000
-            f.write(struct.pack("<IIII", sec, usec, len(raw), len(raw)))
+            f.write(struct.pack("<IIII", sec & 0xffffffff, usec, len(raw),
+                                len(raw)))
             f.write(raw)
+    os.replace(part, path)
 
 
 def startup_sanity_checks():
