@@ -32,7 +32,11 @@ jobs:
 
   gui-test:
     # the real window, driven step by step under a virtual display
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
