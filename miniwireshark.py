@@ -1987,6 +1987,7 @@ except ImportError:                                  # pragma: no cover
     sys.stderr.write(
         "MiniWireshark needs Python's graphical toolkit (tkinter).\n"
         "  Windows/macOS: reinstall Python from python.org (tick 'tcl/tk').\n"
+        "  macOS Homebrew: brew install python-tk\n"
         "  Debian/Ubuntu: sudo apt install python3-tk\n"
         "  Fedora:        sudo dnf install python3-tkinter\n")
     if BOOT is not None:
@@ -23992,17 +23993,16 @@ def migrate_config(data):
     if ver < 3:
         # 5.3.4: updates come from the official GitHub page by default and
         # are checked once a day. An empty source becomes the official one.
-        # Without a source the "check" box could not do anything (Settings
-        # greyed it out), so its stored False was never a working choice:
-        # it is turned on, and a one-time banner says so. A user who had
-        # set a source of their own and left checks off keeps them off.
+        # Checks are turned on, with a one-time banner, only when no choice
+        # was stored; a stored "off" stays off until the user says yes
+        # (court GUI-07), with or without a source of their own.
         up = data.get("updates")
         if not isinstance(up, dict):
             up = data["updates"] = {}
         had_repo = bool(str(up.get("repo", "") or "").strip())
         if not had_repo:
             up["repo"] = OFFICIAL_UPDATE_REPO
-            if not up.get("check_automatically", False):
+            if "check_automatically" not in up:
                 up["check_automatically"] = True
                 up["notice_pending"] = True
         elif "check_automatically" not in up:
@@ -26875,7 +26875,7 @@ Open settings folder ¦ Ouvrir le dossier des paramètres ¦ Abrir la carpeta de
 Keep MiniWireshark up to date from its official GitHub page, and its helpers when you ask. ¦ Gardez MiniWireshark à jour depuis sa page GitHub officielle, et ses composants quand vous le demandez. ¦ Mantenga MiniWireshark al día desde su página oficial de GitHub, y sus componentes cuando lo pida.
 Update checks ¦ Recherche de mises à jour ¦ Comprobación de actualizaciones
 GitHub repository ¦ Dépôt GitHub ¦ Repositorio de GitHub
-Where new releases are looked for, as owner/name. Leave it as it is: other download sites may be fake. ¦ Où chercher les nouvelles versions, sous la forme propriétaire/nom. Laissez-le tel quel : les autres sites de téléchargement peuvent être faux. ¦ Dónde se buscan las versiones nuevas, como propietario/nombre. Déjelo como está: otros sitios de descarga pueden ser falsos.
+Where new releases are looked for, as owner/name. To go back to the official page, click “Use the official source” below. Other download sites may be fake. ¦ Où chercher les nouvelles versions, sous la forme propriétaire/nom. Pour revenir à la page officielle, cliquez sur « Utiliser la source officielle » ci-dessous. Les autres sites de téléchargement peuvent être faux. ¦ Dónde se buscan las versiones nuevas, como propietario/nombre. Para volver a la página oficial, pulse «Usar la fuente oficial» abajo. Otros sitios de descarga pueden ser falsos.
 Check for a new version once a day ¦ Chercher une nouvelle version une fois par jour ¦ Buscar una versión nueva una vez al día
 One request to api.github.com for the latest version number. Nothing about you is sent. ¦ Une seule demande à api.github.com pour le numéro de la dernière version. Rien sur vous n'est envoyé. ¦ Una sola petición a api.github.com para el número de la última versión. No se envía nada sobre usted.
 Use the official source ¦ Utiliser la source officielle ¦ Usar la fuente oficial
@@ -28787,6 +28787,25 @@ new websites ¦ nouveaux sites web ¦ sitios web nuevos
 device came back ¦ appareil revenu ¦ dispositivo que volvió
 devices came back ¦ appareils revenus ¦ dispositivos que volvieron
 device left ¦ appareil parti ¦ dispositivo que se fue
+device back ¦ appareil revenu ¦ dispositivo de vuelta
+device expired ¦ appareil expiré ¦ dispositivo caducado
+ip changed ¦ adresse IP changée ¦ dirección IP cambiada
+dhcp lease ¦ bail DHCP ¦ concesión DHCP
+hostname ¦ nom d'hôte ¦ nombre de equipo
+identity ¦ identité ¦ identidad
+identity merged ¦ identités fusionnées ¦ identidades fusionadas
+possible duplicate ¦ doublon possible ¦ posible duplicado
+service ¦ service ¦ servicio
+traffic spike ¦ pic de trafic ¦ pico de tráfico
+dns change ¦ changement DNS ¦ cambio de DNS
+capture ¦ capture ¦ captura
+interface ¦ interface ¦ interfaz
+internet ¦ Internet ¦ Internet
+vpn ¦ VPN ¦ VPN
+network ¦ réseau ¦ red
+wifi ¦ Wi-Fi ¦ Wi-Fi
+too busy ¦ trop occupé ¦ demasiado ocupado
+rogue router ¦ routeur suspect ¦ router sospechoso
 devices left ¦ appareils partis ¦ dispositivos que se fueron
 warning ¦ avertissement ¦ aviso
 warnings ¦ avertissements ¦ avisos
@@ -32745,8 +32764,9 @@ SETTINGS_PAGES = [
                              "digits, - . _), not a web address.",
               "label": "GitHub repository",
               "help": "Where new releases are looked for, as owner/name. "
-                      "Leave it as it is: other download sites may be "
-                      "fake."},
+                      "To go back to the official page, click “Use the "
+                      "official source” below. Other download sites may "
+                      "be fake."},
              {"type": "info", "text_fn": "update_source_text",
               "live": "updates.repo"},
              {"type": "action", "actions": [
@@ -34284,6 +34304,9 @@ class TableKit:
         tree.bind("<<TreeviewSelect>>", lambda e: self.update_explain(),
                   add="+")
         tree.bind("<ButtonRelease-1>", self._release, add="+")
+        # court NI-03: Ctrl+C copies the selected rows (this table only)
+        for seq in ("<Control-c>", "<Control-C>"):
+            tree.bind(seq, self.copy_selection, add="+")
         if self.relative:
             tree.bind("<Motion>", self._motion, add="+")
             tree.bind("<Leave>", lambda e: self._hide_tip(), add="+")
@@ -34982,10 +35005,13 @@ class TableKit:
             w.writerow(self.row_cells(iid))
         return buf.getvalue()
 
-    def copy_selection(self):
-        sel = list(self.tree.selection())
+    COPY_MAX = 1000          # rows one copy takes: 5000 froze the window
+
+    def copy_selection(self, _event=None):
+        sel = list(self.tree.selection())[:self.COPY_MAX]
         if sel:
             copy_to_clipboard(self.app, self.csv_text(sel))
+        return "break"
 
     def export(self, path=None, done=None):
         """This table as you see it (filter, sort, columns) to a CSV file.
@@ -37640,7 +37666,7 @@ class TimelineTab(BaseTab):
                 "", index, tags=(e["severity"],),
                 values=(f"{icon} {e['severity']}",
                         fmt_clock(e["when"], with_date=old),
-                        e["kind"], translate_event(
+                        translate_text(e["kind"]), translate_event(
                             timeline_text(self.model, e))))
             self.refs[iid] = e
         except tk.TclError:
@@ -58138,6 +58164,13 @@ proc ::mw_retheme {w map fgnew deffg} {
         window left open for days still hears of a new version."""
         with contextlib.suppress(tk.TclError):
             self.root.after(3_600_000, self._auto_update_check)
+        why = auto_update_blocked(self.config,
+                                  getattr(self, "data_mode", "live"))
+        if why:
+            LOG.info("automatic update check skipped: %s", why)
+            return False
+        # court GUI-06: told with the first check that really runs, not
+        # while Safe Mode, the kill switch or offline work blocks it
         if self.config.get("updates.notice_pending", False):
             self.config.set("updates.notice_pending", False)
             self.config.save()
@@ -58145,11 +58178,6 @@ proc ::mw_retheme {w map fgnew deffg} {
                 "MiniWireshark now checks the official GitHub page for a "
                 "new version once a day. You can turn this off in "
                 "Settings → Updates & Dependencies."))
-        why = auto_update_blocked(self.config,
-                                  getattr(self, "data_mode", "live"))
-        if why:
-            LOG.info("automatic update check skipped: %s", why)
-            return False
         return self._check_for_updates(manual=False)
 
     def _check_for_updates(self, manual=True):
@@ -74375,17 +74403,22 @@ def t_update_source_default_and_migration(ctx):
         with open(p, "w") as f:
             json.dump(data, f)
         return AppConfig(path=p)
-    # 5.3.3 wrote every key: no source, checks off (the box was greyed out)
+    # 5.3.3 wrote every key: no source, checks off. Court GUI-07: that
+    # stored "off" stays off (no consent to a daily check)
     c = load({"check_automatically": False, "repo": "",
               "allow_self_update": False})
     assert c.get("updates.repo") == OFFICIAL_UPDATE_REPO
-    assert c.get("updates.check_automatically") is True
-    assert c.get("updates.notice_pending") is True   # told once, can undo
+    assert c.get("updates.check_automatically") is False
+    assert not c.get("updates.notice_pending")
     assert c.data["config_version"] == CONFIG_SCHEMA_VERSION
-    # no updates section at all
+    # no updates section at all: on, and told once (can undo)
     c = load(None)
     assert c.get("updates.repo") == OFFICIAL_UPDATE_REPO
     assert c.get("updates.check_automatically") is True
+    assert c.get("updates.notice_pending") is True
+    c = load({"repo": ""})
+    assert c.get("updates.check_automatically") is True
+    assert c.get("updates.notice_pending") is True
     # the user's own source and their explicit "off" are kept
     c = load({"check_automatically": False, "repo": "someone/fork"})
     assert c.get("updates.repo") == "someone/fork"
@@ -82717,6 +82750,109 @@ def t_534_court_pcap_ended_early(ctx):
     assert "lecture terminée" in fr and "trop tôt" in fr, fr
     es = translate_text(finished(0, ""), "es")
     assert "ningún paquete" in es, es
+
+
+@self_test()
+def t_534_court_update_notice_waits(ctx):
+    """5.3.4 court GUI-06: the one-time "now checks once a day" notice
+    stays pending while Safe Mode, the kill switch or offline work blocks
+    the check, and is shown once with the first check that runs."""
+    notice = "now checks the official GitHub page"
+    stub, sent, restore = _update_stub(ctx, {"updates.notice_pending":
+                                             True})
+    try:
+        for why in ("safe", "kill", "offline"):
+            stub.data_mode = "offline" if why == "offline" else "live"
+            stub.config.set("privacy.kill_switch", why == "kill")
+            with _b9_patched(globals(), SAFE_MODE=why == "safe"):
+                assert stub._auto_update_check() is False, why
+            assert stub.config.get("updates.notice_pending") is True, why
+        assert not any(notice in b for b in stub.banners), stub.banners
+        stub.config.set("privacy.kill_switch", False)
+        stub.data_mode = "live"
+        assert stub._auto_update_check()
+        for t in list(threading.enumerate()):
+            if t.name == "update-check":
+                t.join(5)
+        assert not stub.config.get("updates.notice_pending")
+        assert stub._auto_update_check() is False     # checked today
+        assert sum(notice in b for b in stub.banners) == 1, stub.banners
+        assert len(sent) == 1, sent
+    finally:
+        restore()
+
+
+@self_test()
+def t_534_court_timeline_type_words(ctx):
+    """5.3.4 court GUI-01: the Timeline's Type column is in French and
+    Spanish for every kind of event; an unknown kind stays as it is."""
+    kinds = set(TIMELINE_CATEGORY) | {"too busy", "rogue router"}
+    for loc in ("fr", "es"):
+        missing = sorted(k for k in kinds if k not in I18N[loc])
+        assert not missing, (loc, missing)
+    rows = []
+    tab = types.SimpleNamespace(
+        app=types.SimpleNamespace(SEVERITY_ICON={}), model=None, refs={},
+        tree=types.SimpleNamespace(
+            insert=lambda parent, index, **kw: rows.append(kw["values"])
+            or "i%d" % len(rows)))
+    with _b9_patched(globals(), CURRENT_LOCALE="fr"):
+        for kind in ("dhcp lease", "alert", "new device", "made-up kind"):
+            TimelineTab._insert(tab, {"when": time.time(), "kind": kind,
+                                      "severity": "INFO", "text": "x"})
+    assert [r[2] for r in rows] == ["bail DHCP", "alerte",
+                                    "nouvel appareil", "made-up kind"], rows
+
+
+@self_test()
+def t_534_court_table_ctrl_c(ctx):
+    """5.3.4 court NI-03: Ctrl+C on a table copies its selected rows
+    (bound on that table, not on the whole window), through the usual
+    clipboard masking, at most 1000 rows at a time."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    got = []
+    try:
+        app = types.SimpleNamespace(config=ctx.cfg(), kits=[], root=root,
+                                    theme=THEMES["Light"])
+        wrap, tree = make_tree(root, [("name", "Name", 120, "w", True)])
+        kit = TableKit(types.SimpleNamespace(app=app, name="(t)",
+                                             is_visible=lambda: False),
+                       tree, wrap, "(t)", key_of=lambda i: i)
+        assert "copy_selection" in tree.bind("<Control-c>")
+        assert "copy_selection" in tree.bind("<Control-C>")
+        assert not root.bind_all("<Control-c>")
+        ids = [tree.insert("", "end", values=(f"row{i}",))
+               for i in range(5000)]
+        with _b9_patched(globals(), copy_to_clipboard=lambda a, text:
+                         got.append(text.splitlines())):
+            tree.selection_set(ids[:3])
+            assert kit.copy_selection() == "break"
+            tree.selection_set(ids)
+            kit.copy_selection()
+        assert got[0] == ["Name", "row0", "row1", "row2"], got[0]
+        assert len(got[1]) == 1 + TableKit.COPY_MAX, len(got[1])
+    finally:
+        root.destroy()
+
+
+@self_test()
+def t_534_court_repo_help_and_tk_hint(ctx):
+    """5.3.4 court GUI-08 and MAC-05: the update-source help points at the
+    "Use the official source" button in all three languages and keeps
+    the fake-site warning; the no-Tk message has the Homebrew hint."""
+    help_text = next(c["help"] for sec in SETTINGS_PAGES
+                     for g in sec["sections"] for c in g["controls"]
+                     if c.get("key") == "updates.repo")
+    assert "Use the official source" in help_text and "fake" in help_text
+    assert "Utiliser la source officielle" in translate_text(help_text,
+                                                              "fr")
+    assert "Usar la fuente oficial" in translate_text(help_text, "es")
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        src = f.read()
+    tk_msg = src[src.index("needs Python's graphical toolkit"):][:400]
+    assert "brew install python-tk" in tk_msg and "python.org" in tk_msg
 
 
 @self_test()
