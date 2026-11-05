@@ -8,7 +8,7 @@ Please **do not open a public issue** for a security problem. Use GitHub's priva
 
 Please include:
 
-- The MiniWireshark version (*Help → About*, or the first line of `--self-test`), your OS and your Python version.
+- The MiniWireshark version (*Help / About → About MiniWireshark*, or `python miniwireshark.py --version`), your OS and your Python version.
 - What happens and how to reproduce it.
 - Any data that could leak. **Do not attach real packet captures or logs that contain your network's addresses or credentials.** Use Demo Mode or the built-in redaction (shareable reports with pseudonyms) instead.
 

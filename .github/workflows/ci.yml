@@ -9,6 +9,16 @@ permissions:
   contents: read
 
 jobs:
+  privacy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: No personal data, captures or secrets in the repository
+        run: python .github/scripts/privacy_check.py
+
   self-test:
     runs-on: ubuntu-22.04   # still has Python 3.8 builds
     strategy:

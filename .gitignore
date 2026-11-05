@@ -225,3 +225,21 @@ miniwireshark_config.json*
 *.mwsession.json
 *.pcap
 *.pcapng
+
+# MiniWireshark user data: never commit (the repository is public)
+miniwireshark_data/
+miniwireshark_config.json
+miniwireshark_config.json.bak
+*.mwsession
+*.mwsession.json
+*.pcap
+*.pcapng
+networks.json
+listening.json
+.env
+*.pem
+*.key
+*.p12
+*.pfx
+# Local working folders
+scratch/

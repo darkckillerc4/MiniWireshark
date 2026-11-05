@@ -28,10 +28,13 @@ Under the beginner view is a real analysis workstation, with packet dissection, 
 
 - [Highlights](#highlights)
 - [Screenshots](#screenshots)
+- [Download](#download)
 - [Quick start](#quick-start)
 - [Documentation](#documentation)
 - [Requirements](#requirements)
 - [Privacy and safety](#privacy-and-safety)
+- [Your data and uninstalling](#your-data-and-uninstalling)
+- [Troubleshooting](#troubleshooting)
 - [Testing](#testing)
 - [Versions and downloads](#versions-and-downloads)
 - [Project layout](#project-layout)
@@ -70,6 +73,14 @@ All taken in Demo Mode, and they follow your GitHub theme. Every tab, in both th
 </tr>
 </table>
 
+## Download
+
+1. Open the [latest release](https://github.com/darkckillerc4/MiniWireshark/releases/latest) and download `miniwireshark-<version>.py` and its `.sha256` file.
+2. Check that the two match: `sha256sum` (Linux), `shasum -a 256` (macOS) or `Get-FileHash -Algorithm SHA256` (Windows PowerShell). Every checksum is also in the [version index](docs/VERSIONS.md).
+3. Run it with Python, as below. There is no installer.
+
+Download MiniWireshark only from this GitHub page. Copies on other sites may be fake, and MiniWireshark's own update check only ever points here. Step-by-step instructions for each system are in [Installation](docs/INSTALL.md).
+
 ## Quick start
 
 ```bash
@@ -90,12 +101,15 @@ Useful switches:
 |---|---|
 | `--demo` | Start in Demo Mode with simulated, clearly labelled data |
 | `--safe` | Safe Mode: conservative settings, no auto-capture |
+| `--no-elevate` | Never ask for administrator rights |
 | `--boot-check` | Check this computer's setup (the same Ready? list) without opening the window |
 | `--self-test [NAME]` | Run the built-in test suite, or only the named tests (no admin rights or capture needed) |
 | `--gui-test` | Drive the real window through every tab (needs a display) |
 | `--bench-gui S1 S2` | Window-performance benchmark against fixed budgets |
 | `--release-gate` | Everything above plus pictures of every tab, in one folder |
 | `--help`, `--version` | List every switch, or print the version |
+
+The full list, including the developer switches, is in [Installation](docs/INSTALL.md#command-line-switches).
 
 ## Documentation
 
@@ -135,6 +149,26 @@ MiniWireshark is a **defensive** tool for networks you own or are allowed to mon
 
 Found a security issue? See [SECURITY.md](SECURITY.md).
 
+## Your data and uninstalling
+
+Everything MiniWireshark creates goes into one data folder: `miniwireshark_data/` next to the script when that folder is writable, otherwise `%LOCALAPPDATA%\MiniWireshark` (Windows), `~/Library/Application Support/MiniWireshark` (macOS) or `~/.local/share/miniwireshark` (Linux). Settings are in `miniwireshark_config.json` next to the script.
+
+Those files describe your own network: device names, addresses and saved sessions. Don't attach them to a public issue. **Storage used…** in the command palette (`Ctrl+K`) shows what each part takes.
+
+To uninstall, delete `miniwireshark.py`, the data folder and `miniwireshark_config.json`. The few other places are listed in [Installation](docs/INSTALL.md#uninstalling).
+
+## Troubleshooting
+
+| What you see | What to try |
+|---|---|
+| No packets at all | On Windows, install [Npcap](https://npcap.com/) (MiniWireshark offers to). On Linux and macOS, accept the password prompt when capture starts. |
+| Only this computer's own traffic | That is normal on Wi-Fi and on most switches. The vantage meter in the bottom-right corner says what can and can't be seen from here. |
+| It opened in Safe Mode | Two failed starts in a row do that. Start it again normally, and use **Ready?** in the Welcome Center to see what failed. |
+| The wrong network card | Pick the right one in **Network card** at the top of the window, then press **Start watching**. |
+| It starts slowly the first time | The first start checks your setup and may install packages into its own folder. Later starts are faster. |
+
+More answers are in the [FAQ](docs/FAQ.md). To report a problem, open an [issue](https://github.com/darkckillerc4/MiniWireshark/issues/new/choose).
+
 ## Testing
 
 ```bash
@@ -163,7 +197,7 @@ Every release is a single `.py` file attached to its [GitHub release](https://gi
 ## Project layout
 
 ```
-miniwireshark.py        the application: one file on purpose, ~86k lines in banner-marked regions
+miniwireshark.py        the application: one file on purpose, ~89k lines in banner-marked regions
 legacy/                 versions 1.x and 2.0.0 (written before this repository's history began)
 docs/                   installation, user guide, features, architecture, FAQ, version index
 .github/                CI, issue and PR templates, release notes, archive-release workflow
@@ -175,7 +209,7 @@ The file's docstring lists every region in order (bootstrap, capture pipeline, p
 
 **5.3.4** is the current release. It is a medium release: the 5.2.3 security audit closed, a Ready? list, Story mode, Unusual activity, seven guided questions, call quality, notifications and a one-page check-up. See the [changelog](CHANGELOG.md).
 
-No later release is planned yet. Waiting for measurements on a real Windows PC: a faster start on Windows from a saved compiled copy, and a lower Windows memory limit. The single `.py` file stays until 6.0, which is not opened.
+No later release is planned yet. Waiting for measurements on a real Windows PC: a lower Windows memory limit. The single `.py` file stays until 6.0, which is not opened.
 
 ## Contributing
 

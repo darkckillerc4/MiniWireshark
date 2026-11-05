@@ -7,7 +7,7 @@ This guide walks through the MiniWireshark window. Everything here also works in
 Each start opens the Welcome Center, unless you turn it off in **Settings → General**. It has four choices:
 
 - **Start Monitoring** picks the best network card and begins watching.
-- **Demo Mode** shows simulated data. Nothing is captured or sent.
+- **Try Demo Mode** shows simulated data. Nothing is captured or sent.
 - **Quick Start Guide** gives a short tour.
 - **Diagnostics** checks the setup when something isn't working.
 
@@ -44,7 +44,7 @@ Select anything and press `F2` for the **inspector**, a side panel with the full
 
 Press `Ctrl+K` and type. The palette finds tabs, settings pages and actions, for example:
 
-- *Start watching*, *Stop watching*, *Demo mode*
+- *Start watching*, *Stop watching*, *Demo Mode*
 - *Open a capture file…*, *Save session…*, *Shareable report…*
 - *Why is my Internet slow?*, *What is using my bandwidth?* and the five other investigations
 - *What changed recently*, *Review new alerts*
