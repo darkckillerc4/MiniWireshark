@@ -168,6 +168,44 @@ def _run_hidden(cmd, **kw):
 def _popen_hidden(cmd, **kw):
     kw.setdefault("creationflags", NO_WINDOW)
     return subprocess.Popen(cmd, **kw)
+
+
+_ONE_JOB = {}                     # thread name -> the request waiting (or None)
+_ONE_JOB_LOCK = threading.Lock()
+
+
+def start_one(name, work, coalesce=False):
+    """5.3.4 soak: `work` on a daemon thread called `name`, at most one at
+    a time. A request while one runs is skipped, or with `coalesce` kept
+    (only the newest) and run right after it: a blocked call can no
+    longer pile up threads. -> True when a thread was started."""
+    with _ONE_JOB_LOCK:
+        if name in _ONE_JOB:
+            if coalesce:
+                _ONE_JOB[name] = work
+            return False
+        _ONE_JOB[name] = None
+
+    def run(job):
+        while job is not None:
+            try:
+                job()
+            except Exception:                        # noqa: BLE001
+                LOG.exception("background job %s", name)
+            with _ONE_JOB_LOCK:
+                job = _ONE_JOB.get(name)
+                if job is None:
+                    _ONE_JOB.pop(name, None)
+                else:
+                    _ONE_JOB[name] = None
+    try:
+        threading.Thread(target=run, args=(work,), daemon=True,
+                         name=name).start()
+    except RuntimeError:
+        with _ONE_JOB_LOCK:
+            _ONE_JOB.pop(name, None)
+        raise
+    return True
 IS_MAC = platform.system() == "Darwin"
 
 try:
@@ -32040,6 +32078,7 @@ class GeoIPService:
         self._consecutive_total_failures = 0
         self._paused_until = 0.0
         self._thread = None
+        self._start_lock = threading.Lock()
         self._stop = False
 
     # ---- public API ---------------------------------------------------
@@ -32097,10 +32136,12 @@ class GeoIPService:
 
     # ---- internals ------------------------------------------------------
     def _ensure_thread(self):
-        if self._thread is None or not self._thread.is_alive():
-            self._stop = False
-            self._thread = threading.Thread(target=self._run, daemon=True)
-            self._thread.start()
+        with self._start_lock:           # never two (soak)
+            if self._thread is None or not self._thread.is_alive():
+                self._stop = False
+                self._thread = threading.Thread(target=self._run,
+                                                daemon=True, name="geoip")
+                self._thread.start()
 
     def _fetch(self, url):
         req = urllib.request.Request(
@@ -34276,7 +34317,8 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
         canvas.configure(scrollregion=canvas.bbox("all"))
         if fit_width:
             want = inner.winfo_reqwidth()
-            if abs(int(canvas.cget("width")) - want) > 2:
+            # "10c" until a width is set: winfo_pixels reads any unit
+            if abs(canvas.winfo_pixels(canvas.cget("width")) - want) > 2:
                 canvas.configure(width=want)
         show_bar()
 
@@ -48678,8 +48720,7 @@ class MiniWireshark:
             ssid = current_ssid()
             self._async_results.put(lambda: self._on_network_known(
                 mac, subnet, ssid, attempt))
-        threading.Thread(target=work, daemon=True,
-                         name="network-id").start()
+        start_one("network-id", work)        # one at a time (soak)
 
     def _on_network_known(self, router_mac, subnet, ssid, attempt):
         if self.data_mode != "live":
@@ -52526,8 +52567,9 @@ proc ::mw_explicit_fonts {top names} {
             self._async_results.put(lambda: self._capture_probe_done(
                 token, res, candidates, bpf, promisc, auto, keep_data,
                 on_done))
-        threading.Thread(target=work, daemon=True,
-                         name="capture-start").start()
+        # one at a time; a newer start waits for a blocked one (soak), and
+        # the older one's result is dropped by the token check
+        start_one("capture-start", work, coalesce=True)
         return True
 
     def _capture_probe_done(self, token, res, candidates, bpf, promisc,
@@ -52812,8 +52854,7 @@ proc ::mw_explicit_fonts {top names} {
                 LOG.warning("adapter scoring failed: %s", e)
             self._async_results.put(lambda: self._heal_continue(
                 token, prev_name, route, scores))
-        threading.Thread(target=work, daemon=True,
-                         name="capture-heal").start()
+        start_one("capture-heal", work)      # one at a time (soak)
 
     def _heal_continue(self, token, prev_name, route, scores):
         if token != self._capture_token or self.sniffer is not None or \
@@ -53658,7 +53699,8 @@ proc ::mw_explicit_fonts {top names} {
                 finally:
                     c.close()
                 self._async_results.put(lambda: show(text, ok, kind_, sp))
-            threading.Thread(target=work, daemon=True).start()
+            threading.Thread(target=work, daemon=True,
+                             name="connector-test").start()
 
         def show(text, ok, kind_, sp):
             with contextlib.suppress(tk.TclError):
@@ -53690,7 +53732,8 @@ proc ::mw_explicit_fonts {top names} {
                         pin["value"] = fp
                         test()
                 self._async_results.put(ask)
-            threading.Thread(target=work, daemon=True).start()
+            threading.Thread(target=work, daemon=True,
+                             name="connector-cert").start()
         trust_btn.configure(command=trust)
 
         def save():
@@ -83569,6 +83612,106 @@ def t_534_c7_arp_memory_pruned(ctx):
     assert reg.ip_macs[old] == {"02:66:00:00:00:02"}
     assert sorted(reg.prune_arp(9000.0)) == sorted([recent, old])
     assert gw in reg.arp_claims and recent not in reg.arp_claims
+
+
+@self_test(needs_source=True)
+def t_534_soak_one_job_per_name(ctx):
+    """5.3.4 soak: while a job's thread is blocked, a second request starts
+    no second thread (skipped, or with coalesce run once afterwards, the
+    newest only); the network-id, capture-start and capture-heal sites
+    go through it."""
+    gate, ran = threading.Event(), []
+
+    def blocked():
+        ran.append("first")
+        gate.wait(5)
+
+    def named(n):
+        return [t for t in threading.enumerate() if t.name == n]
+    assert start_one("soak-test-skip", blocked)
+    assert not start_one("soak-test-skip", lambda: ran.append("skipped"))
+    assert len(named("soak-test-skip")) == 1
+    gate.set()
+    for t in named("soak-test-skip"):
+        t.join(5)
+    assert ran == ["first"] and "soak-test-skip" not in _ONE_JOB
+    gate.clear()
+    ran.clear()
+    assert start_one("soak-test-co", blocked, coalesce=True)
+    for i in range(3):
+        assert not start_one("soak-test-co", lambda i=i: ran.append(i),
+                             coalesce=True)
+    assert len(named("soak-test-co")) == 1
+    gate.set()
+    for t in named("soak-test-co"):
+        t.join(5)
+    assert ran == ["first", 2] and "soak-test-co" not in _ONE_JOB, ran
+    assert start_one("soak-test-err", lambda: 1 / 0)       # logged, freed
+    for t in named("soak-test-err"):
+        t.join(5)
+    assert "soak-test-err" not in _ONE_JOB
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        src = f.read()
+    for name, how in (("network-id", ""), ("capture-start", ", "
+                      "coalesce=True"), ("capture-heal", "")):
+        assert f'start_one("{name}", work{how})' in src, name
+        assert f'name="{name}"' not in src, name
+
+
+@self_test(needs_source=True)
+def t_534_soak_threads_named(ctx):
+    """5.3.4 soak: every thread the program starts has a name (the soak's
+    census counts them by name), and the GeoIP worker is never started
+    twice while it runs."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        src = f.read()
+    lines = src.splitlines()
+    tests = (next(i for i, ln in enumerate(lines) if ln.startswith(
+        "#  20b.  Self-tests")), next(i for i, ln in enumerate(lines)
+                                       if ln.startswith("#  21.  ")))
+    bad = []
+    for node in ast.walk(ast.parse(src)):
+        f = getattr(node, "func", None)
+        if isinstance(node, ast.Call) and isinstance(f, ast.Attribute) and \
+                f.attr == "Thread" and \
+                getattr(f.value, "id", "") == "threading" and \
+                not tests[0] < node.lineno - 1 < tests[1] and \
+                not any(k.arg == "name" for k in node.keywords):
+            bad.append(node.lineno)
+    assert not bad, bad
+    gate = threading.Event()
+    geo = GeoIPService(lambda *a: None)
+    geo._run = lambda: gate.wait(5)
+    try:
+        geo._ensure_thread()
+        first = geo._thread
+        geo._ensure_thread()
+        assert geo._thread is first and first.name == "geoip"
+        assert sum(t is first for t in threading.enumerate()) == 1
+    finally:
+        gate.set()
+        geo._thread.join(5)
+
+
+@self_test()
+def t_534_scrollable_fit_width_units(ctx):
+    """5.3.4: a fit-width scrolling frame with no width of its own (Tk
+    says "10c") resizes without an error on every start."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    errors = []
+    root.report_callback_exception = lambda *a: errors.append(a[1])
+    try:
+        outer, inner = make_scrollable(root, fit_width=True)
+        outer.pack(fill="both", expand=True)
+        tk.Label(inner, text="x" * 80).pack()
+        root.update()
+        root.update()
+        assert not errors, errors
+    finally:
+        root.destroy()
 
 
 @self_test()

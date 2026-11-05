@@ -132,6 +132,36 @@ def tasks():
         return -1
 
 
+def handles():
+    """Windows: this process's open handles; elsewhere its open files."""
+    if os.name != "nt":
+        return fds()
+    try:
+        import ctypes
+        n = ctypes.c_ulong()
+        k = ctypes.windll.kernel32
+        if k.GetProcessHandleCount(k.GetCurrentProcess(), ctypes.byref(n)):
+            return n.value
+    except (AttributeError, OSError):
+        pass
+    return -1
+
+
+def write_threads():
+    """SOAK_CENSUS, every sample: the live threads by name (numbers folded,
+    so "Thread-12 (work)" and "Thread-13 (work)" count together) and the
+    handle count, so a growing thread is named."""
+    import collections
+    import re
+    names = collections.Counter(re.sub(r"\d+", "#", t.name)
+                                for t in threading.enumerate())
+    line = (f"minute {state['minute']} handles={handles()} "
+            f"threads={sum(names.values())} " +
+            ", ".join(f"{n} x{c}" for n, c in sorted(names.items())))
+    with open(out_csv + ".threads.txt", "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+
+
 t0 = time.time()
 f = open(out_csv, "w", newline="", encoding="utf-8")
 w = csv.writer(f)
@@ -176,6 +206,11 @@ def sample():
                 for x in st:
                     fh.write(f"  {x}\n")
         tm_prev[0] = snap
+    if os.environ.get("SOAK_CENSUS"):
+        try:
+            write_threads()
+        except Exception as e:                     # noqa: BLE001
+            print("thread census failed", e, flush=True)
     if os.environ.get("SOAK_CENSUS") and state["minute"] % 5 == 0:
         try:
             write_census()
