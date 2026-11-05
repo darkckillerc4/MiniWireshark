@@ -77027,7 +77027,10 @@ def test_deep_worker_process_and_mode_switching(ctx):
         res[proc] = sorted(e.store.findings)
         e.stop()
     if len(res) == 2:
-        assert res[True] == res[False]
+        assert res[True] == res[False], (
+            "process only: %r; thread only: %r" % (
+                [f for f in res[True] if f not in res[False]][:5],
+                [f for f in res[False] if f not in res[True]][:5]))
 
     def summary(m):
         return (sorted((d.key, d.device_class, d.ip) for d in
