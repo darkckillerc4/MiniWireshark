@@ -46,9 +46,9 @@ def sign_asset(asset, version, work):
     folder, which is removed when the release is done."""
     key = os.path.join(work, "release.key")
     fd = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(os.environ["MW_RELEASE_KEY"])
     try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(os.environ["MW_RELEASE_KEY"])
         subprocess.run([sys.executable, path("miniwireshark.py"),
                         "--sign-release", asset, "--key", key,
                         "--version", version], check=True)
