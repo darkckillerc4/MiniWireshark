@@ -14244,7 +14244,7 @@ class DeviceRegistry:
         self.gw_heard = {}
         self.ra_routers = set()
         self.history = []
-        self.arp_claims = defaultdict(lambda: deque(maxlen=16))
+        self.arp_claims = defaultdict(lambda: deque(maxlen=8))
         self.arp_seen = defaultdict(dict)     # ip -> {mac: deque of times}
         self.labels = None            # KnownDevicesStore (aliases etc.)
         self.gaps = []                # (start, end) capture gaps
@@ -14581,7 +14581,7 @@ class DeviceRegistry:
             dev.lease_start = when
             dev.lease_expiry = when + lease_secs if lease_secs else 0.0
             _push_bounded(dev.dhcp_history,
-                          [ip, when, lease_secs or 0, hostname or ""], 20)
+                          [ip, when, lease_secs or 0, hostname or ""], 8)
             self.dhcp_leases[ip] = ((mac or "").lower(), hostname, when,
                                     dev.lease_expiry)
         return dev, reused
@@ -14766,7 +14766,24 @@ class DeviceRegistry:
                 if dev and dev.lease_ip == ip and \
                         dev.last_confirmed < lease[3]:
                     dev.lease_ip = ""
+        self.prune_arp(now)
         return newly_inactive, newly_expired
+
+    ARP_KEEP = 3600          # C7: seconds an unclaimed address is remembered
+
+    def prune_arp(self, now):
+        """C7: the ARP claims, claimants and MACs of an address nobody has
+        answered for in ARP_KEEP seconds are forgotten (they grew with
+        every address ever seen). The router's address is always kept:
+        its history is what tells a new router from an impersonator."""
+        old = [ip for ip, q in self.arp_claims.items()
+               if ip != self.gateway_ip and (not q or
+                                             now - q[-1][0] > self.ARP_KEEP)]
+        for ip in old:
+            self.arp_claims.pop(ip, None)
+            self.arp_seen.pop(ip, None)
+            self.ip_macs.pop(ip, None)
+        return old
 
     EXPIRED_KEEP = 500       # 5.3.4 (M13, CO-03)
 
@@ -15141,7 +15158,7 @@ class DeviceRegistry:
         keep.mac_history = sorted(keep.mac_history + other.mac_history,
                                   key=lambda h: h[1])[-10:]
         keep.dhcp_history = sorted(keep.dhcp_history + other.dhcp_history,
-                                   key=lambda h: h[1])[-20:]
+                                   key=lambda h: h[1])[-8:]
         keep.hostname_history = sorted(
             keep.hostname_history + other.hostname_history,
             key=lambda h: h[2])[-20:]
@@ -23127,7 +23144,8 @@ class NetworkModel:
             if q is None:
                 if len(self.flow_starts) >= 6000:
                     self.flow_starts.popitem(last=False)
-                q = self.flow_starts[fk] = deque(maxlen=64)
+                # C7: 24 is plenty for periodic_findings (needs 11)
+                q = self.flow_starts[fk] = deque(maxlen=24)
             q.append(ts)
             self.observe("flow_start", flow.device_key, ts,
                          {"remote": flow.remote_ip, "port": flow.remote_port,
@@ -82990,6 +83008,32 @@ def t_534_court_update_as_root_gives_back(ctx):
                           os.path.join(folder, "update_pending.json"))
     assert len(seen) == 1 and seen[0][1] == (
         os.path.realpath(script), f"{script}.v{SCRIPT_VERSION}.bak"), seen
+
+
+@self_test()
+def t_534_c7_arp_memory_pruned(ctx):
+    """5.3.4 review (C7): an address nobody answered ARP for in an hour
+    leaves arp_claims, arp_seen and ip_macs at the next lifecycle tick;
+    a recent one and the router's address stay; an address claimed
+    again starts afresh; only the last 8 claims are kept."""
+    clock = [0.0]
+    gw, old, recent = "192.168.1.1", "192.168.1.66", "192.168.1.77"
+    reg = DeviceRegistry(gw, set(), ctx.cfg(), now_fn=lambda: clock[0])
+    reg.note_arp_reply(gw, "00:1e:58:aa:00:01", 0.0)
+    reg.note_arp_reply(old, "02:66:00:00:00:01", 0.0)
+    for i in range(12):
+        reg.note_arp_reply(recent, "02:77:00:00:00:0%d" % (i % 2),
+                           3000.0 + i)
+    assert len(reg.arp_claims[recent]) == 8
+    clock[0] = 4000.0
+    reg.tick_lifecycle(4000.0)
+    for table in (reg.arp_claims, reg.arp_seen, reg.ip_macs):
+        assert old not in table and recent in table and gw in table
+    assert reg.prune_arp(3000.0 + 11 + reg.ARP_KEEP) == []     # not yet
+    reg.note_arp_reply(old, "02:66:00:00:00:02", 4001.0)
+    assert reg.ip_macs[old] == {"02:66:00:00:00:02"}
+    assert sorted(reg.prune_arp(9000.0)) == sorted([recent, old])
+    assert gw in reg.arp_claims and recent not in reg.arp_claims
 
 
 @self_test()
