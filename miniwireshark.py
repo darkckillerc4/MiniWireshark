@@ -11263,10 +11263,17 @@ def _iface_is_up(iface):
     return None
 
 
-def score_interfaces(default_iface_name="", gateway_ip=""):
+def score_interfaces(default_iface_name="", gateway_ip="", best=None):
     """Score every adapter so the automatic choice is explainable.
     Returns a list of dicts sorted best-first:
-    {iface, name, label, score, reasons, ip, vpn, virtual, up}."""
+    {iface, name, label, score, reasons, ip, vpn, virtual, up}.
+    `best` (IP-004): the Npcap name of the card Windows' own routing uses
+    (looked up when None); no card matching it leaves today's order."""
+    route_pick = bool(FEATURES.get("route_pick"))
+    if not route_pick:
+        best = ""
+    elif best is None:
+        best = windows_best_adapter() if IS_WINDOWS else ""
     out = []
     try:
         ifaces = list(conf.ifaces.values())
@@ -11284,6 +11291,12 @@ def score_interfaces(default_iface_name="", gateway_ip=""):
         if is_default:
             score += 50
             reasons.append("it carries your default Internet route")
+        is_best = bool(best) and str(getattr(iface, "network_name", "")
+                                     or "").upper() == best.upper()
+        if is_best and not vpn:
+            score += 60
+            reasons.append("Windows' own routing sends your Internet "
+                           "traffic through it")
         if ip and not ip.startswith("169.254.") and not ip.startswith("127."):
             score += 20
             reasons.append(f"it has a usable address ({ip})")
@@ -11304,7 +11317,13 @@ def score_interfaces(default_iface_name="", gateway_ip=""):
             score -= 100
             reasons.append("it is the loopback (internal) adapter")
         elif vpn:
-            if is_default:
+            if route_pick and (is_best or is_default):
+                # a full-tunnel VPN carries the default route, but the
+                # local network is only seen on the physical card
+                score -= 75
+                reasons.append("your Internet route goes through a VPN; "
+                               "the physical card shows the local network")
+            elif is_default:
                 reasons.append("it is a VPN/tunnel adapter (and your traffic "
                                "currently goes through it)")
             else:
@@ -11835,6 +11854,7 @@ FEATURES = {
     "dark_titlebar": True,   # Windows draws a dark title bar (M16, IP-003)
     "auto_update_check": True,   # once a day, official GitHub page only
     "filter_english": True,  # a typed filter said in words (M16, IP-023)
+    "route_pick": True,      # the card Windows' own route uses (IP-004)
 }
 
 
@@ -12036,6 +12056,10 @@ FEATURE_HELP = {
                      "bars of the window and its dialogs are dark too",
     "filter_english": "a typed field filter is said in plain words under "
                       "the filter box",
+    "route_pick": "the network card Windows' own routing uses to reach "
+                  "the Internet is picked first, and a VPN that carries "
+                  "the Internet route is not picked over the physical "
+                  "card",
     "auto_update_check": "once a day, MiniWireshark asks the official GitHub "
                          "page for the latest version number (one request "
                          "to api.github.com, nothing about you)",
@@ -27340,6 +27364,8 @@ packet ¦ paquet ¦ paquete
 it was the best of the available cards ¦ c'était la meilleure des cartes disponibles ¦ era la mejor de las tarjetas disponibles
 it carries your default Internet route ¦ elle porte votre route Internet par défaut ¦ lleva su ruta a Internet predeterminada
 your router is on the same network ¦ votre box est sur le même réseau ¦ su router está en la misma red
+Windows' own routing sends your Internet traffic through it ¦ le routage de Windows lui-même y fait passer votre trafic Internet ¦ el propio enrutamiento de Windows envía por ella su tráfico de Internet
+your Internet route goes through a VPN; the physical card shows the local network ¦ votre route Internet passe par un VPN ; la carte physique montre le réseau local ¦ su ruta a Internet pasa por una VPN; la tarjeta física muestra la red local
 Pick another card in the list, or click “Refresh”. ¦ Choisissez une autre carte dans la liste, ou cliquez sur « Actualiser ». ¦ Elija otra tarjeta de la lista o pulse «Actualizar».
 No address assignments seen yet (they happen when devices join). ¦ Aucune attribution d'adresse vue pour l'instant (elles ont lieu quand des appareils arrivent). ¦ Aún no se han visto asignaciones de direcciones (ocurren cuando se conectan dispositivos).
 Built-in packet capture is working. ¦ La capture de paquets intégrée fonctionne. ¦ La captura de paquetes integrada funciona.
@@ -69200,8 +69226,9 @@ def t_bf002_wifi_location_hidden(ctx):
 
 @self_test()
 def t_ip004_adapter_pick_log(ctx):
-    """5.3.4 (IP-004): the route-aware pick is only logged, never used;
-    off Windows or on any failure it is empty and changes nothing."""
+    """5.3.4 (IP-004): the route-aware pick is logged beside the card in
+    use; off Windows or on any failure it is empty and changes nothing
+    (t_ip004_route_pick_acts covers how it orders the cards)."""
     g = "{1A2B3C4D-0000-1111-2222-333344445555}"
     assert npf_device_name(g.lower()) == "\\Device\\NPF_" + g
     assert npf_device_name("bad") == "" and npf_device_name("") == ""
@@ -69212,6 +69239,46 @@ def t_ip004_adapter_pick_log(ctx):
     assert log_adapter_pick("x", "") == ""
     if not IS_WINDOWS:
         assert windows_best_adapter() == ""
+
+
+@self_test()
+def t_ip004_route_pick_acts(ctx):
+    """5.3.4 (IP-004): the card Windows' own route uses ranks first; no
+    match leaves the old order; a VPN carrying the Internet route loses
+    to the physical card; with route_pick off, the old order is kept."""
+    g1 = "{1A2B3C4D-0000-1111-2222-333344445555}"
+    g2 = "{9F8E7D6C-0000-1111-2222-333344445555}"
+
+    def card(name, desc, guid):
+        return types.SimpleNamespace(name=name, description=desc,
+                                     network_name=npf_device_name(guid),
+                                     ip="192.168.1.5")
+
+    def order(cards, default, best):
+        globals()["conf"] = types.SimpleNamespace(
+            ifaces={c.name: c for c in cards})
+        return [r["name"] for r in score_interfaces(default, "", best)]
+    nics = [card("A", "Realtek PCIe GbE Family Controller", g1),
+            card("B", "Intel(R) Wi-Fi 6 AX201", g2)]
+    vpn = [card("wg0", "WireGuard Tunnel", g1), nics[1]]
+    old_conf, old_flag = globals().get("conf"), FEATURES.get("route_pick")
+    try:
+        FEATURES["route_pick"] = True
+        assert order(nics, "B", npf_device_name(g1))[0] == "A"
+        assert order(nics, "B", npf_device_name(g1).lower())[0] == "A"
+        assert order(nics, "B", "")[0] == "B"
+        assert order(nics, "B", "\\Device\\NPF_{unknown}")[0] == "B"
+        recs = score_interfaces("B", "", npf_device_name(g1))
+        assert "Windows' own routing" in explain_reasons(recs[0]), recs[0]
+        assert order(vpn, "wg0", npf_device_name(g1))[0] == "B"
+        assert order(vpn, "wg0", "")[0] == "B"
+        FEATURES["route_pick"] = False
+        assert order(nics, "B", None)[0] == "B"
+        assert order(nics, "B", npf_device_name(g1))[0] == "B"
+        assert order(vpn, "wg0", npf_device_name(g1))[0] == "wg0"
+    finally:
+        globals()["conf"] = old_conf
+        FEATURES["route_pick"] = old_flag
 
 
 @self_test()
@@ -87087,11 +87154,12 @@ REACHABLE_502 = (
 #  21.  Application entry point
 # ============================================================================
 def windows_best_adapter(dest="1.1.1.1"):
-    """5.3.4 (IP-004, experiment): the adapter Windows' own routing would
+    """5.3.4 (IP-004): the adapter Windows' own routing would
     use to reach `dest` (GetBestInterfaceEx: a table look-up, no packet
-    is sent), as an Npcap device name `\\Device\\NPF_{GUID}`. Only logged
-    beside the pick in use until the logs show they agree; a full-tunnel
-    VPN returns the tunnel adapter. -> name, or "" on any failure."""
+    is sent), as an Npcap device name `\\Device\\NPF_{GUID}`. It ranks
+    first in score_interfaces (feature route_pick); a full-tunnel
+    VPN returns the tunnel adapter (score_interfaces then prefers the
+    physical card). -> name, or "" on any failure."""
     if not IS_WINDOWS:
         return ""
     try:
