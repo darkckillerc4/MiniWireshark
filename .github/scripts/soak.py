@@ -155,7 +155,10 @@ def write_threads():
     import re
     names = collections.Counter(re.sub(r"\d+", "#", t.name)
                                 for t in threading.enumerate())
+    # blocks: Python objects alive; if RSS climbs while this stays flat,
+    # the growth is native (Tk, Npcap, the C heap), not Python data
     line = (f"minute {state['minute']} handles={handles()} "
+            f"blocks={sys.getallocatedblocks()} "
             f"threads={sum(names.values())} " +
             ", ".join(f"{n} x{c}" for n, c in sorted(names.items())))
     with open(out_csv + ".threads.txt", "a", encoding="utf-8") as fh:
