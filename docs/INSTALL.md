@@ -107,10 +107,16 @@ If you installed Npcap only for MiniWireshark, remove it from Windows' *Installe
 | `--boot-check` | Check this computer's setup and exit, without opening the window |
 | `--no-elevate` | Never ask for administrator rights |
 | `--yes` | Accept the download list without asking (unattended start) |
+| `--no-runtime` | Use the Python you started it with, not MiniWireshark's private Python |
 | `--self-test [NAME]` | Run the built-in test suite, or only the tests named (comma-separated). No capture or admin rights needed |
 | `--gui-test` | Drive the real window through every tab. Needs a display (`xvfb-run -a` on a headless Linux) |
-| `--bench-gui S1 S2` | Window-performance benchmark against fixed budgets |
-| `--release-gate` | All tests, the benchmark and pictures of every tab, written to one folder you can send back |
+| `--bench` | Measure this computer's analysis speed |
+| `--quick` | With `--self-test`, `--gui-shots` or `--release-gate`: the shorter run |
+| `--bench-gui S1 S2` | Developer: window-performance benchmark against fixed budgets |
+| `--gui-shots DIR` | Developer: take a picture of every tab into `DIR` |
+| `--start-check` | Developer: time a full start |
+| `--release-check [FILE]` | Developer: check a release file |
+| `--release-gate` | Developer: all tests, the benchmark and pictures of every tab, written to one folder you can send back |
 | `--help` | List every switch and exit |
 | `--version` | Print the version and exit |
 

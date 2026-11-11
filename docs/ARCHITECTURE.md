@@ -1,6 +1,6 @@
 # Architecture
 
-MiniWireshark is about 86,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
+MiniWireshark is about 89,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
 
 ## The map of the file
 
@@ -55,7 +55,7 @@ python miniwireshark.py
 
 If a step that only capture needs fails, MiniWireshark continues in *limited mode* instead of stopping. You can still open files and the demo.
 
-From 5.1.2 the compiled code is cached per Python version in the data folder. Later processes of the same file (the private-Python hand-off and the Full Power workers) load that copy, which saves a few seconds and about 150 MB. From 5.3.4 the copy is signed with a per-install HMAC key and never used by a process running as root.
+From 5.1.2 the compiled code is cached per Python version in the data folder. Later processes of the same file (the private-Python hand-off, the Full Power workers and, from 5.3.4, the window itself on Windows) load that copy, which saves a few seconds and about 150 MB. From 5.3.4 the copy is signed with a per-install HMAC key and never used by a process running as root.
 
 ## How a packet becomes an answer
 

@@ -943,7 +943,7 @@ def mac_admin_cmd(argv):
     """The osascript command that runs argv as administrator. 5.3.4 (RT-07,
     OS-05): the shell command is passed as an argument to the script, not
     pasted into the AppleScript text, so a quote or apostrophe in the
-    program's path ("Krystel's Mac") neither breaks it nor runs as code."""
+    program's path ("Sam's Mac") neither breaks it nor runs as code."""
     return ["osascript", "-e", "on run argv",
             "-e", "do shell script (item 1 of argv) with administrator "
                   "privileges",
@@ -1186,8 +1186,9 @@ def cli_usage():
         elif flag == "--version":
             name = "-V, --version"
         lines.append(f"  {name:<24} {text}")
-    lines += ["", "With no options the window opens. Settings live in the "
-              "data folder (set MINIWIRESHARK_DATA to move it)."]
+    lines += ["", "With no options the window opens. Data goes in the data "
+              "folder and settings in miniwireshark_config.json (set "
+              "MINIWIRESHARK_DATA or MINIWIRESHARK_CONFIG to move them)."]
     return "\n".join(lines)
 
 
@@ -4747,7 +4748,9 @@ def runtime_error_text(exc, limit=160):
     kind = classify_runtime_error(exc)
     title = RUNTIME_ERRORS.get(kind, RUNTIME_ERRORS["other"])[0]
     detail = exc.detail if isinstance(exc, RuntimeError_) else str(exc)
-    detail = (detail or "").strip()[:limit]
+    detail = (detail or "").strip()
+    if len(detail) > limit:          # 5.3.4 QA: say that it was cut
+        detail = detail[:limit - 1].rstrip() + "…"
     return f"{title} ({detail})" if detail else title
 
 
@@ -8028,9 +8031,11 @@ def is_private_ip(ip):
 
 
 def _human_bytes(n):
+    # 5.3.4 QA: the unit is chosen after rounding, so 1,048,575 bytes is
+    # "1.0 MB", not "1024.0 KB".
     n = float(n or 0)
     for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
+        if round(n, 0 if unit == "B" else 1) < 1024 or unit == "GB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n:.1f} GB"
@@ -8390,7 +8395,7 @@ def human_rate(bps):
     """Bytes per second → friendly text."""
     bps = float(bps or 0)
     for unit in ("B/s", "KB/s", "MB/s", "GB/s"):
-        if bps < 1024 or unit == "GB/s":
+        if round(bps, 0 if unit == "B/s" else 1) < 1024 or unit == "GB/s":
             return f"{bps:.0f} {unit}" if unit == "B/s" else \
                 f"{bps:.1f} {unit}"
         bps /= 1024
@@ -21362,7 +21367,11 @@ def investigate_call(f):
         n = f.get("unmeasured") or 0
         if not f.get("measuring", True):
             reasons.append(_t("Call measuring is turned off."))
-        if n:
+        if n == 1:
+            reasons.append(_t("1 connection looked like a call, but the "
+                              "call app sent no connection check (STUN), "
+                              "so it can't be measured."))
+        elif n:
             reasons.append(_t("%d connections looked like a call, but the "
                               "call app sent no connection check (STUN), "
                               "so they can't be measured.", n))
@@ -21775,7 +21784,10 @@ def calls_card_text(tracker, limit=3):
     if not calls:
         lines.append(tr("No calls seen yet."))
     n = tracker.unmeasured() if tracker is not None else 0
-    if n:
+    if n == 1:
+        lines.append(tr("1 connection looked like a call but had no "
+                        "connection check, so it is not measured."))
+    elif n:
         lines.append(tr("%d connections looked like a call but had no "
                         "connection check, so they are not measured.") % n)
     lines.append(tr("Observed from packet headers only: no names, no "
@@ -26417,6 +26429,35 @@ def span_words(sec):
         f"{h:.1f} h"
 
 
+def conversation_rate_text(total_bytes, duration):
+    """Average rate of a conversation, or "—" when it lasted under a
+    second (5.3.4 QA: one 1,500-byte packet showed "1.4 MB/s")."""
+    try:
+        duration = float(duration or 0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration < 1:
+        return "—"
+    return f"{_human_bytes((total_bytes or 0) / duration)}/s"
+
+
+def usual_hours_text(on):
+    """The span of busy hours as "08:00–23:00" (5.3.4 QA). A span that
+    crosses midnight starts after the longest quiet stretch ("22:00–02:00",
+    not "00:00–00:00"), and every hour busy reads "00:00–24:00"."""
+    on = sorted({int(h) % 24 for h in on})
+    if not on:
+        return ""
+    if len(on) == 24:
+        return "00:00–24:00"
+    # The longest run of quiet hours, wrapping round midnight.
+    gaps = [((on[(i + 1) % len(on)] - h - 1) % 24, h)
+            for i, h in enumerate(on)]
+    _gap, last = max(gaps)
+    first = on[(on.index(last) + 1) % len(on)]
+    return f"{first:02d}:00–{(last + 1) % 24:02d}:00"
+
+
 def plural(n, one, many=None):
     """“1 packet”, “2 packets”, “1,234 packets” (5.3.4, ST-09: the Security
     page said “1 packets”)."""
@@ -28833,6 +28874,7 @@ Worst moment: %s lost around %s. ¦ Pire moment : %s perdus vers %s. ¦ Peor mom
 And 1 more call. ¦ Et 1 autre appel. ¦ Y 1 llamada más.
 And %d more calls. ¦ Et %d autres appels. ¦ Y %d llamadas más.
 No calls seen yet. ¦ Aucun appel vu pour l'instant. ¦ Todavía no se ha visto ninguna llamada.
+1 connection looked like a call but had no connection check, so it is not measured. ¦ 1 connexion ressemblait à un appel mais sans vérification de connexion : elle n'est pas mesurée. ¦ 1 conexión parecía una llamada pero no tenía comprobación de conexión, así que no se mide.
 %d connections looked like a call but had no connection check, so they are not measured. ¦ %d connexions ressemblaient à un appel mais sans vérification de connexion : elles ne sont pas mesurées. ¦ %d conexiones parecían una llamada pero no tenían comprobación de conexión, así que no se miden.
 Observed from packet headers only: no names, no sound or picture. Calls are measured after the call app checks its connection (STUN); some call apps can't be measured. ¦ Observé uniquement à partir des en-têtes des paquets : ni noms, ni son, ni image. Les appels sont mesurés après que l'application d'appel a vérifié sa connexion (STUN) ; certaines applications d'appel ne peuvent pas être mesurées. ¦ Observado solo a partir de las cabeceras de los paquetes: sin nombres, sin sonido ni imagen. Las llamadas se miden después de que la aplicación de llamadas compruebe su conexión (STUN); algunas aplicaciones de llamadas no se pueden medir.
 Login sent without encryption ¦ Connexion envoyée sans chiffrement ¦ Inicio de sesión enviado sin cifrar
@@ -28996,6 +29038,7 @@ Move closer to the router, or use 5 GHz or a cable for calls. ¦ Rapprochez-vous
 Only the packets this computer sent were seen, so loss on the way can't be counted here. ¦ Seuls les paquets envoyés par cet ordinateur ont été vus : la perte en route ne peut pas être comptée ici. ¦ Solo se vieron los paquetes que envió este equipo, así que la pérdida por el camino no se puede contar aquí.
 The call's packets arrived complete and on time, so the stutter isn't visible here: it may come from the other person's connection, the call app or the computer itself. ¦ Les paquets de l'appel sont arrivés complets et à l'heure : la saccade n'est pas visible ici. Elle peut venir de la connexion de votre correspondant, de l'application d'appel ou de l'ordinateur lui-même. ¦ Los paquetes de la llamada llegaron completos y a tiempo, así que el corte no se ve aquí: puede venir de la conexión de la otra persona, de la aplicación de llamadas o del propio equipo.
 Call measuring is turned off. ¦ La mesure des appels est désactivée. ¦ La medición de llamadas está desactivada.
+1 connection looked like a call, but the call app sent no connection check (STUN), so it can't be measured. ¦ 1 connexion ressemblait à un appel, mais l'application d'appel n'a envoyé aucune vérification de connexion (STUN) : elle ne peut pas être mesurée. ¦ 1 conexión parecía una llamada, pero la aplicación de llamadas no envió ninguna comprobación de conexión (STUN), así que no se puede medir.
 %d connections looked like a call, but the call app sent no connection check (STUN), so they can't be measured. ¦ %d connexions ressemblaient à un appel, mais l'application d'appel n'a envoyé aucune vérification de connexion (STUN) : elles ne peuvent pas être mesurées. ¦ %d conexiones parecían una llamada, pero la aplicación de llamadas no envió ninguna comprobación de conexión (STUN), así que no se pueden medir.
 A call on another device (a phone, a TV) isn't visible from this computer. ¦ Un appel sur un autre appareil (un téléphone, une télé) n'est pas visible depuis cet ordinateur. ¦ Una llamada en otro dispositivo (un teléfono, una tele) no se ve desde este equipo.
 No call was seen. Look again during a call. ¦ Aucun appel n'a été vu. Regardez de nouveau pendant un appel. ¦ No se vio ninguna llamada. Vuelva a mirar durante una llamada.
@@ -29325,7 +29368,7 @@ I18N_PATTERNS = [
      r"d'un fichier.   [\1]",
      r"📂  CAPTURA SIN CONEXIÓN — no es en directo. Está viendo paquetes de "
      r"un archivo.   [\1]"),
-    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets from (.+?)"
+    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets? from (.+?)"
      r"( \(stopped early\))?\. Router identified from the capture "
      r"\(likely\): (\S+)\. Nothing here is live\.( .+)?",
      r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Box "
@@ -29334,13 +29377,13 @@ I18N_PATTERNS = [
      r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
      r"Router identificado en la captura (probable): \4. Nada es en "
      r"directo.{t5}"),
-    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets from (.+?)"
+    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets? from (.+?)"
      r"( \(stopped early\))?\.\s+Nothing here is live\.( .+)?",
      r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Rien "
      r"n'est en direct.{t4}",
      r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
      r"Nada es en directo.{t4}"),
-    (r"📂 Offline capture: (.+) — (\d+) packets \(not live\)",
+    (r"📂 Offline capture: (.+) — (\d+) packets? \(not live\)",
      r"📂 Capture hors ligne : \1 — \2 paquets (pas en direct)",
      r"📂 Captura sin conexión: \1 — \2 paquetes (no en directo)"),
     (r"\(Not live\) (.+)", "(Pas en direct) {t1}", "(No en directo) {t1}"),
@@ -29574,7 +29617,7 @@ I18N_PATTERNS = [
      r"Búsqueda típica \1 ms, \2 fallidas"),
     (r"Typical lookup (\d+) ms", r"Recherche habituelle \1 ms",
      r"Búsqueda típica \1 ms"),
-    (r"Typical lookup (\d+) ms over (\d+) recent lookups; (\S+) failed\.",
+    (r"Typical lookup (\d+) ms over (\d+) recent lookups?; (\S+) failed\.",
      r"Recherche habituelle \1 ms sur \2 recherches récentes ; \3 en échec.",
      r"Búsqueda típica \1 ms en \2 búsquedas recientes; \3 fallidas."),
     (r"Connections take (\d+) ms to open",
@@ -34251,9 +34294,40 @@ _UNIT_MULT = {"B": 1, "KB": 1024, "MB": 1024 ** 2, "GB": 1024 ** 3,
               "B/s": 1, "KB/s": 1024, "MB/s": 1024 ** 2, "GB/s": 1024 ** 3}
 
 
+_DURATION_PART = re.compile(r"(\d+(?:\.\d+)?)\s*(d|h|m|s|ms)\b")
+_DURATION_CELL = re.compile(
+    r"^<?\s*\d+(?:\.\d+)?\s*(?:d|h|m|s|ms)"
+    r"(?:\s+\d+(?:\.\d+)?\s*(?:d|h|m|s|ms))*$")
+_DURATION_SECS = {"d": 86400, "h": 3600, "m": 60, "s": 1, "ms": 0.001}
+
+
+def _cell_number(s):
+    """5.3.4 QA: durations ("<1s", "1m 01s", "1d 1h", "120 ms"), clock
+    times ("9:59:59") and percentages ("12%") as numbers, so those
+    columns sort by value, not as text. None when the cell is none of
+    these."""
+    if _DURATION_CELL.match(s):
+        n = sum(float(a) * _DURATION_SECS[u]
+                for a, u in _DURATION_PART.findall(s))
+        return n - 0.5 if s.startswith("<") else n
+    m = re.match(r"^(\d+):([0-5]\d)(?::([0-5]\d))?$", s)
+    if m:
+        h, mi, se = m.group(1), m.group(2), m.group(3)
+        return (int(h) * 3600 + int(mi) * 60 + int(se)) if se else \
+            int(h) * 60 + int(mi)
+    m = re.match(r"^(-?\d+(?:\.\d+)?)\s*%$", s)
+    if m:
+        return float(m.group(1))
+    return None
+
+
 def sort_key(v):
-    """Numeric-aware sort for table cells ("1.2 MB", "350", "12:01:05")."""
+    """Numeric-aware sort for table cells ("1.2 MB", "350", "12:01:05",
+    "1m 01s", "120 ms", "12%")."""
     s = str(v).strip()
+    n = _cell_number(s)
+    if n is not None:
+        return (0, n, "")
     m = re.match(r"^[^\d\-]*(-?[\d,]*\.?\d+)\s*([KMG]?B(?:/s)?)?", s)
     if m and (m.group(2) or re.match(r"^-?[\d,]*\.?\d+$", s.replace(" ", ""))):
         try:
@@ -37797,12 +37871,13 @@ class TimelineTab(BaseTab):
             self.pause_chk.configure(state="disabled" if hist else "normal")
             if hist:
                 self.status_lbl.configure(
-                    text=f"{n} saved events" + (
+                    text=plural(n, "saved event") + (
                         f", back to {fmt_clock(self.oldest_ts, True)}"
                         if self.oldest_ts else "") +
                     ("" if not self.exhausted else " (all loaded)"))
             else:
-                self.status_lbl.configure(text=f"{n} events this session")
+                self.status_lbl.configure(
+                    text=plural(n, "event") + " this session")
 
     def on_theme(self):
         for sev, (fg, bg) in self.app._severity_colors().items():
@@ -38712,7 +38787,7 @@ class WebsitesTab(BaseTab):
         dev_key = self.device_key_from_choice(self.dev_var.get())
         recs = [w for w in self.model.websites.values()
                 if self._match(w, dev_key)]
-        self.count_lbl.configure(text=f"{len(recs)} sites")
+        self.count_lbl.configure(text=plural(len(recs), "site"))
         grouped = self.app.config.get("websites.group_subdomains", True)
         if grouped:
             groups = defaultdict(list)
@@ -39201,7 +39276,7 @@ class ConnectionsTab(BaseTab):
         n_open = sum(1 for f in flows if not f.closed)
         vals = [""] * len(self.COLS)
         idx = {c[0]: i for i, c in enumerate(self.COLS)}
-        vals[idx["to"]] = translate_text(f"{len(flows)} connections")
+        vals[idx["to"]] = translate_text(plural(len(flows), "connection"))
         vals[idx["up"]] = _human_bytes(up)
         vals[idx["down"]] = _human_bytes(down)
         vals[idx["status"]] = translate_text(f"{n_open} open")
@@ -45352,7 +45427,6 @@ class StatisticsView(_SubView):
         flows.sort(key=lambda f: -f.total_bytes)
         self._conv = {}
         for f in flows[:3000]:
-            dur = max(0.001, f.duration)
             iid = tree.insert("", "end", values=(
                 f"{f.local_ip}:{f.local_port}" if f.local_port else
                 f.local_ip,
@@ -45360,7 +45434,7 @@ class StatisticsView(_SubView):
                 if f.remote_port else (f.domain or f.remote_ip),
                 f.transport, f"{f.packets:,}", _human_bytes(f.bytes_out),
                 _human_bytes(f.bytes_in), human_duration(f.duration),
-                f"{_human_bytes(f.total_bytes / dur)}/s",
+                conversation_rate_text(f.total_bytes, f.duration),
                 "reset" if f.rst else "closed" if f.closed else "open"))
             self._conv[iid] = f.fid
         tree.bind("<Double-1>", lambda e: self._open_conv(tree))
@@ -49081,7 +49155,7 @@ class MiniWireshark:
             items.append((f"Settings: {page['title']}", "setting",
                           lambda p=page["id"]: self._open_settings(p)))
         acts = [("Start watching", self.start), ("Stop watching", self.stop),
-                ("Demo mode", self.start_demo),
+                ("Demo Mode", self.start_demo),
                 ("Open a capture file…", self.open_pcap),
                 ("Save session…", self._save_session),
                 ("Shareable report…", self.export_shareable),
@@ -49269,7 +49343,8 @@ class MiniWireshark:
             if not path:
                 return 0
         n = self.save_pcap_to(path, rows)
-        self._set_banner(f"\U0001F4BE  Saved {n} packets from before the "
+        self._set_banner(f"\U0001F4BE  Saved {plural(n, 'packet')} from "
+                         f"before the "
                          f"alert to {path}", kind="good")
         return n
 
@@ -54441,7 +54516,8 @@ proc ::mw_explicit_fonts {top names} {
                                       f"{med:.0f} ms).")
         elif med is not None:
             out["dns"] = ("Healthy", f"Typical lookup {med:.0f} ms over "
-                                     f"{n} recent lookups; "
+                                     f"{n} recent "
+                                     f"{'lookup' if n == 1 else 'lookups'}; "
                                      f"{rate:.0%} failed.")
         elif "dns_ms" in h and h.get("dns_ms"):
             out["dns"] = ("Healthy", f"Test lookup answered in "
@@ -55242,7 +55318,7 @@ proc ::mw_explicit_fonts {top names} {
         if n >= 30:
             top = max(b.hours) or 1
             on = [h for h in range(24) if b.hours[h] >= top * 0.2]
-            hours = f"{min(on):02d}:00–{(max(on) + 1) % 24:02d}:00"
+            hours = usual_hours_text(on)
             line = narrate("usual_hours", hours=C(hours, LV_CORRELATED),
                            basis=C("learned over %d active minutes" % n,
                                    LV_OBSERVED))
@@ -56590,13 +56666,15 @@ proc ::mw_explicit_fonts {top names} {
         if not n and not cancelled and not note:
             note = PCAP_NO_PACKETS
         self._set_banner(
-            f"\U0001F4C2  OFFLINE CAPTURE — finished reading {n} packets "
+            f"\U0001F4C2  OFFLINE CAPTURE — finished reading {n} "
+            f"{'packet' if n == 1 else 'packets'} "
             f"from {self.data_label}{' (stopped early)' if cancelled else ''}"
             f". {('Router identified from the capture (likely): ' + gw + '.') if gw else ''}"
             f" Nothing here is live.{(' ' + note) if note else ''}",
             kind="warn")
         self.status_var.set(f"\U0001F4C2 Offline capture: {self.data_label} "
-                            f"— {n} packets (not live)")
+                            f"— {n} {'packet' if n == 1 else 'packets'} "
+                            f"(not live)")
 
     def toggle_demo(self):
         if self.data_mode == "demo":
@@ -57007,7 +57085,8 @@ proc ::mw_explicit_fonts {top names} {
                 messagebox.showerror("Save error", str(e), parent=self.root)
         return self.jobs.submit(
             "pcap_save", "Saving the packets", run,
-            lambda n: self.status_var.set(f"Saved {n} packets to {path}"),
+            lambda n: self.status_var.set(
+                f"Saved {plural(n, 'packet')} to {path}"),
             bad)
 
     @staticmethod
@@ -69694,7 +69773,7 @@ def t_m1b_npcap_signature_path(ctx):
         seen["cmd"], seen["env"] = cmd, kw.get("env") or {}
         return subprocess.CompletedProcess(
             cmd, 0, "Valid\nCN=Nmap Software LLC, O=Nmap Software LLC\n", "")
-    path = ctx.path("npcap 1.80 (Krystel's).exe")
+    path = ctx.path("npcap 1.80 (Sam's).exe")
     st, who = _authenticode_info(path, run=fake)
     assert (st, who) == ("Valid", "CN=Nmap Software LLC, O=Nmap Software LLC")
     assert seen["cmd"][-2] == "-Command" and path not in " ".join(
@@ -75866,7 +75945,7 @@ def test_teach_once_fingerprints(ctx):
     assert lt.match(b) is None
     assert LearnedTypes(path=ctx.path("learned.json")).items == []
     assert _name_pattern("ESP_6A1B2C") == "esp_*"
-    assert _name_pattern("Krystel's laptop") == ""
+    assert _name_pattern("Sam's laptop") == ""
     lt2 = LearnedTypes(path=ctx.path("learned2.json"))
     for i in range(LearnedTypes.MAX + 20):
         lt2.learn(DeviceRecord(key=f"k{i}", mac=f"00:1b:a9:00:{i // 256:02x}:"
@@ -77477,7 +77556,7 @@ def t_m1b_pin_and_applescript(ctx):
     finally:
         http.client.HTTPSConnection = real
     assert sent == [], sent
-    path = '/Users/k/Krystel\'s "Mac"/a" & (do shell script "x") & "'
+    path = '/Users/s/Sam\'s "Mac"/a" & (do shell script "x") & "'
     cmd = mac_admin_cmd(["/usr/bin/python3", path, "--x"])
     assert cmd[:7] == ["osascript", "-e", "on run argv", "-e",
                        "do shell script (item 1 of argv) with "
@@ -78336,6 +78415,73 @@ def t_m18_release_dry_run_writes_nothing(ctx):
         assert "dry run: would record" in r.stdout, r.stdout[-400:]
     assert os.listdir(tmp) == [], os.listdir(tmp)
     assert status() == (0, before), "the dry run changed the checkout"
+
+
+# ---- 5.3.4 QA: small details found by the QA team ------------------------
+@self_test()
+def t_qa_small_text_details(ctx):
+    """5.3.4 QA: sizes change unit after rounding ("1.0 MB", not "1024.0
+    KB"); usual hours across midnight read "22:00–02:00", not
+    "00:00–00:00"; one call, packet, site or lookup is singular, in every
+    language; a zero-length conversation has no average rate; durations,
+    clock times and percentages sort by value; a cut error detail ends in
+    "…"; --boot-check doesn't say "Data folder: Data folder:"."""
+    assert _human_bytes(1048575) == "1.0 MB", _human_bytes(1048575)
+    assert _human_bytes(1073741800) == "1.0 GB"
+    assert _human_bytes(1023) == "1023 B" and _human_bytes(1024) == "1.0 KB"
+    assert human_rate(1048575) == "1.0 MB/s" and human_rate(5) == "5 B/s"
+    assert usual_hours_text([22, 23, 0, 1]) == "22:00–02:00"
+    assert usual_hours_text(range(8, 23)) == "08:00–23:00"
+    assert usual_hours_text(range(24)) == "00:00–24:00"
+    assert usual_hours_text([]) == ""
+    assert conversation_rate_text(1500, 0) == "—"
+    assert conversation_rate_text(2048, 2) == "1.0 KB/s"
+    cells = [human_duration(x) for x in (90000, 0.4, 61, 59, 3700, 5)]
+    assert sorted(cells, key=sort_key) == [
+        "<1s", "5s", "59s", "1m 01s", "1h 01m", "1d 1h"], cells
+    assert sorted(["1000 ms", "35 ms", "—", "120 ms"], key=sort_key) == [
+        "35 ms", "120 ms", "1000 ms", "—"]
+    assert sorted(["12:01:05", "9:59:59", "10:00:00"], key=sort_key) == [
+        "9:59:59", "10:00:00", "12:01:05"]
+    assert sorted(["12%", "5%", "100%"], key=sort_key) == ["5%", "12%",
+                                                          "100%"]
+    assert sorted(["2 KB", "1.5 MB", "300"], key=sort_key) == [
+        "300", "2 KB", "1.5 MB"], "sizes still sort as before"
+    text = runtime_error_text(RuntimeError("x" * 300))
+    assert text.endswith("…)") and len(text) < 220, text
+    assert boot_check_ready_line("Data folder", "Data folder: /d") == \
+        "Data folder: /d"
+    assert boot_check_ready_line("History", "No history yet.") == \
+        "History: No history yet."
+
+    class OneUnmeasured:
+        def summary(self):
+            return []
+
+        def unmeasured(self):
+            return 1
+    card = calls_card_text(OneUnmeasured())
+    assert "1 connection looked like a call" in card, card
+    assert "1 connections" not in card, card
+    for loc in ("fr", "es"):
+        one = translate_text("1 connection looked like a call but had no "
+                             "connection check, so it is not measured.",
+                             locale=loc)
+        assert one.startswith("1 con") and "looked like" not in one and \
+            "connexions" not in one and "conexiones" not in one, one
+        banner = translate_text(
+            "\U0001F4C2  OFFLINE CAPTURE — finished reading 1 packet from "
+            "x.pcap. Nothing here is live.", locale=loc)
+        assert "finished reading" not in banner, (loc, banner)
+        status = translate_text("\U0001F4C2 Offline capture: x.pcap — 1 "
+                                "packet (not live)", locale=loc)
+        assert "not live" not in status, (loc, status)
+        dns = translate_text("Typical lookup 20 ms over 1 recent lookup; "
+                             "0% failed.", locale=loc)
+        assert "Typical lookup" not in dns, (loc, dns)
+        demo = translate_text("Demo Mode", locale=loc)
+        assert demo != "Demo Mode", (loc, demo)
+    assert plural(1, "site") == "1 site" and plural(2, "event") == "2 events"
 
 
 # ---- 5.3.4 M18: audit findings that had no test named after them ----------
@@ -89806,6 +89952,14 @@ def ready_line(key, cfg=None):
         return "warn", f"Couldn't check ({type(e).__name__}).", ""
 
 
+def boot_check_ready_line(title, text):
+    """"Data folder: /path" for --boot-check, not "Data folder: Data
+    folder: /path" when the line already starts with its title (5.3.4 QA)."""
+    if text.lower().startswith(title.lower() + ":"):
+        return text
+    return f"{title}: {text}"
+
+
 def ready_report(cfg=None):
     """[(key, title, state, text, fix)] — what --boot-check prints and the
     Welcome Center shows."""
@@ -89854,11 +90008,14 @@ def boot_check(out=print):
     out("")
     out("Ready?")
     for _k, title, state, text, _fix in ready_report(AppConfig()):
-        out(f"  {READY_MARK[state]} {title}: {text}")
+        out(f"  {READY_MARK[state]} {boot_check_ready_line(title, text)}")
     out("")
     out("Recent starts:")
-    for r in BootReceipt.recent(n=5):
+    recent = BootReceipt.recent(n=5)
+    for r in recent:
         out("  " + BootReceipt.summary(r).replace("\n", "\n  "))
+    if not recent:
+        out("  (none yet)")
     out("")
     out("Startup tests:")
     tmp = tempfile.mkdtemp(prefix="mw_bootcheck_")

@@ -51,7 +51,7 @@ Turn off **Settings → Capture → Choose the network card automatically** and 
 That is on purpose. Safe Mode turns off auto-capture, history, update checks and automatic downloads so you can reach the window. Open **Diagnostics** to see what failed, or run `python miniwireshark.py --boot-check`.
 
 **The first start is slow.**
-The first start installs packages and compiles the file. On Linux and macOS the compiled copy is cached, so later starts are faster. On Windows every start still compiles the file.
+The first start installs packages and compiles the file. The compiled copy is then cached, so later starts are faster. From 5.3.4 this includes Windows, where the window itself starts from the cached copy.
 
 **Something is broken and I don't know what.**
 Look at the **Ready?** list in the Welcome Center first: each problem has a fix button. Or use **Settings → General → Repair MiniWireshark**. It checks components, reference lists, the history database, the settings file and the capture engine, then says what it fixed.
@@ -69,4 +69,4 @@ Open an [issue](https://github.com/darkckillerc4/MiniWireshark/issues/new/choose
 On the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases). Each release has the `.py` file and a `.sha256` file. The [version index](VERSIONS.md) lists every checksum.
 
 **Can two versions share a folder?**
-Yes, but each one keeps its data in `miniwireshark_data/` next to the script. To keep them fully apart, put each in its own folder. From 5.2.3, copies sharing a folder can no longer damage each other's files.
+Yes. Copies in the same folder share `miniwireshark_data/` next to the script. To keep them fully apart, put each in its own folder. From 5.2.3, copies sharing a folder can no longer damage each other's files.
