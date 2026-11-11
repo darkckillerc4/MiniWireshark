@@ -78405,6 +78405,36 @@ def t_release_gate_parts(ctx):
 
 
 @self_test()
+def t_534_known_limit_text_size(ctx):
+    """5.3.4 (the owner's decision): the Windows text-size change is a
+    KNOWN LIMIT. Its 105 ms target is not raised and a miss is still a
+    FAIL, labelled; the GUI test guards Windows at 600 / 150 ms and keeps
+    130 / 105 elsewhere."""
+    assert BENCH_LIMITS["S1"]["text_size.stall_ms"] == 105
+    assert TEXT_SIZE_TARGET_MS == (130, 105)
+    g = globals()
+    win0 = g["IS_WINDOWS"]
+    try:
+        for win in (True, False):
+            g["IS_WINDOWS"] = win
+            rows = bench_check({"S1": {"text_size.stall_ms": 116.0,
+                                       "theme.stall_ms": 999.0}})
+            assert ("S1", "text_size.stall_ms", 116.0, 105, False) in rows
+            known = bench_known_limit("S1", "text_size.stall_ms")
+            assert bool(known) is win, (win, known)
+            assert not bench_known_limit("S1", "theme.stall_ms")
+            if win:
+                assert known.startswith("KNOWN LIMIT"), known
+    finally:
+        g["IS_WINDOWS"] = win0
+    want = (600, 150) if IS_WINDOWS else (130, 105)
+    assert TEXT_SIZE_LIMITS_MS == want, TEXT_SIZE_LIMITS_MS
+    line = text_size_known_limit_line(399.4, 91.1)
+    assert line.startswith("KNOWN LIMIT: text-size change 399 ms on "
+                           "Windows, target 105 ms"), line
+
+
+@self_test()
 def test_deep_worker_process_and_mode_switching(ctx):
     """A real worker process gives the same findings as the thread; and
     switching Normal ↔ Full Power 50 times during a replay leaves the
@@ -80236,6 +80266,44 @@ BENCH_LIMITS = {
            "story.stall_ms": 150},
 }
 BENCH_LIMITS_PROVISIONAL = False
+
+# 5.3.4 (the owner's decision, CI round 6): a miss the owner accepted for
+# this release. It stays a FAIL against its target, which is not raised,
+# with this label next to it. (platform test, label)
+BENCH_KNOWN_LIMITS = {
+    ("S1", "text_size.stall_ms"): (
+        lambda: IS_WINDOWS,
+        "KNOWN LIMIT accepted by the owner for 5.3.4: a text-size change "
+        "on Windows (Tk re-measures and redraws every native window when "
+        "the shared fonts change; the font sharing redesign is planned)"),
+}
+
+# The GUI test's text-size limits, ms: (busy, longest freeze). The target
+# stays 130 / 105 (BENCH_LIMITS["S1"]["text_size.stall_ms"]). On Windows
+# the owner accepted the slower change for 5.3.4 (KNOWN LIMIT), and the
+# test there guards against it getting worse: measured on the windows-
+# latest runner in CI rounds 5-6, busy 396-446 ms and longest freeze
+# 87-117 ms per change (Tk's own work about 510 ms of the 570 ms inside
+# update(), Python callbacks 43-62 ms); limits about 1.4 x those: 600 and
+# 150.
+TEXT_SIZE_TARGET_MS = (130, 105)
+TEXT_SIZE_LIMITS_MS = (600, 150) if IS_WINDOWS else TEXT_SIZE_TARGET_MS
+
+
+def bench_known_limit(sid, key):
+    """The owner's KNOWN LIMIT label for a metric on this computer, or
+    ""."""
+    test, label = BENCH_KNOWN_LIMITS.get((sid, key), (None, ""))
+    return label if test is not None and test() else ""
+
+
+def text_size_known_limit_line(busy_ms, stall_ms):
+    """What the Windows GUI test prints about the accepted limit."""
+    return (f"KNOWN LIMIT: text-size change {busy_ms:.0f} ms on Windows, "
+            f"target {TEXT_SIZE_TARGET_MS[1]} ms (longest freeze "
+            f"{stall_ms:.0f} ms; busy target {TEXT_SIZE_TARGET_MS[0]} ms; "
+            f"accepted by the owner for 5.3.4, guarded at "
+            f"{TEXT_SIZE_LIMITS_MS[0]} / {TEXT_SIZE_LIMITS_MS[1]} ms)")
 BENCH_TARGETS = {
     "S1": {"import.stall_ms": 100, "import.p99_ms": 40,
            "session_load.stall_ms": 100, "session_save.stall_ms": 100,
@@ -80718,8 +80786,9 @@ def bench_gui(argv):
               + (" (provisional limits)" if flag == "--check" and
                  BENCH_LIMITS_PROVISIONAL else "") + ":")
         for sid, key, val, lim, ok in rows:
+            known = "" if ok else bench_known_limit(sid, key)
             print(f"  [{'PASS' if ok else 'FAIL'}] {sid} {key}: {val} "
-                  f"(<= {lim})")
+                  f"(<= {lim})" + (f"  {known}" if known else ""))
         if flag == "--check" and not all(r[4] for r in rows):
             rc = 1
     if any("error" in r for r in results.values()):
@@ -81060,9 +81129,11 @@ def release_gate(argv):
         for (sid, key, lim), vals in per.items():
             med = statistics.median(vals)
             ok = bench_value_ok(key, med, lim)
+            known = "" if ok else bench_known_limit(sid, key)
             lines.append(f"  [{'PASS' if ok else 'FAIL'}] {sid} "
                          f"{key}: {med:.1f} (<= {lim}) runs "
-                         + ", ".join(f"{v:.0f}" for v in vals))
+                         + ", ".join(f"{v:.0f}" for v in vals)
+                         + (f"  {known}" if known else ""))
     lines += ["", "Send this whole folder back (zip it): the pictures are "
                   "in shots/, every step's full output is next to this "
                   "file. It contains no captured traffic from your network: "
@@ -90429,10 +90500,13 @@ def gt_text_size_speed(app, ctx):
         if IS_WINDOWS or min(busy) > 130 or os.environ.get("MW_PROFILE"):
             now = app.config.get("appearance.text_size")
             print(_text_size_options(app, other[now], now))
-        assert min(busy) <= 130, f"text-size change busy {min(busy)} ms " \
-            f"(runs {busy})"
-        assert min(stall) <= 105, f"text-size change froze {min(stall)} " \
-            f"ms (runs {stall})"
+        busy_max, stall_max = TEXT_SIZE_LIMITS_MS
+        if IS_WINDOWS:
+            print(f"    {text_size_known_limit_line(min(busy), min(stall))}")
+        assert min(busy) <= busy_max, f"text-size change busy " \
+            f"{min(busy)} ms (runs {busy}; limit {busy_max})"
+        assert min(stall) <= stall_max, f"text-size change froze " \
+            f"{min(stall)} ms (runs {stall}; limit {stall_max})"
     finally:
         root.tk.call("bind", root._w, "<<TkWorldChanged>>", "")
         app.config.set("appearance.text_size", size0)

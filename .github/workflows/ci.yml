@@ -86,7 +86,12 @@ jobs:
           sudo apt-get install -y xvfb > /dev/null
           # gdb is only for the backtrace: an apt mirror outage (seen on
           # this runner) must not fail the GUI test itself
-          { sudo apt-get update -qq && sudo apt-get install -y gdb > /dev/null; } \
+          # and is bounded: in run 43050920456 a DNS outage held apt-get
+          # update for 7 min and the install until the job's 20-min limit
+          # cancelled the job before the test ran
+          { timeout 120 sudo apt-get update -qq -o Acquire::Retries=1 \
+              -o Acquire::http::Timeout=20 &&
+            timeout 180 sudo apt-get install -y gdb > /dev/null; } \
             || echo "::warning::gdb could not be installed; GUI test runs without it"
           python -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.TkVersion, tkinter.Tcl().eval('info patchlevel'))"
           ldd "$(python -c 'import _tkinter; print(_tkinter.__file__)')" | grep -Ei 'tk|tcl|xft|fontconfig|freetype|x11'

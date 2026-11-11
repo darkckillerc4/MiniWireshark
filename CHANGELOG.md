@@ -62,6 +62,10 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - On a small screen, an Inspector switched on in Settings now makes room for the tabs when the window opens narrow, not only when you make the window narrower.
 - A text-size change is quicker: the tables, the rows of buttons and the scrolling pages on tabs you can't see are fitted when you open their tab.
 
+**Known limits**
+
+- **Changing the text size on Windows is slow.** It takes about 0.4 seconds on the test machine, and the window doesn't answer for about a tenth of a second while it happens (the goal is 0.1 seconds; on Linux it is well under that). The reason: on Windows every part of the window is its own small system window, and when the shared fonts change, all of them (about 700) are measured and drawn again. Making this fast needs a change to how the window shares its fonts, planned for a later release.
+
 **Not in this release**
 
 - Device fingerprints from DHCP request lists ship without built-in rows until real captures of your own devices are available.
