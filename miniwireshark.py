@@ -31119,6 +31119,54 @@ class FlowLayout:
 
     def relayout(self):
         self._job = None
+        if not self._wait_shown():
+            self._layout()
+
+    def _wait_shown(self):
+        """5.3.4 CI (Windows, text size): the rows of a tab not shown are
+        laid out when the tab is shown. A text-size change re-laid out
+        75 rows, 55 of them on hidden tabs (Linux count). Only for a
+        notebook page of a window on screen: a window not shown yet, or
+        a frame merely unpacked, is laid out at once, as before, so its
+        size can be measured. -> True when the row waits."""
+        if not FEATURES.get("theme_steps", True):
+            return False
+        try:
+            f = self.f
+            top = f.winfo_toplevel() if f.winfo_exists() else None
+            if top is None or f.winfo_viewable() or \
+                    not top.winfo_ismapped():
+                return False
+            # the outermost frame not mapped (inside it, frames shown
+            # before stay mapped): a page the notebook hides?
+            page, w = None, f
+            while w is not None and w is not top:
+                if not w.winfo_ismapped():
+                    page = w
+                w = w.master
+            if page is None or not isinstance(page.master, ttk.Notebook):
+                return False
+            if not getattr(page, "_mw_flow_bound", False):
+                page._mw_flow_bound = True
+                page._mw_flow_wait = []
+                bind_plain(page, "<Map>",
+                           lambda p=page: FlowLayout.page_shown(p),
+                           when='"%%W" eq "%s"' % page._w)
+        except (tk.TclError, AttributeError):
+            return False
+        if self not in page._mw_flow_wait:
+            page._mw_flow_wait.append(self)
+        return True
+
+    @staticmethod
+    def page_shown(page):
+        """A notebook page is on screen: its waiting rows are laid out
+        now, before it is drawn."""
+        waiting, page._mw_flow_wait = page._mw_flow_wait, []
+        for fl in waiting:
+            fl.relayout()
+
+    def _layout(self):
         f = self.f
         try:
             if not f.winfo_exists():
@@ -34622,9 +34670,6 @@ def enable_sorting(tree, on_sort=None):
     return state
 
 
-FIT_ROUNDS = 6
-
-
 def make_scrollable(parent, bg="#ffffff", fit_width=False):
     """A frame that scrolls vertically (wheel, scrollbar). → (outer to
     pack, inner to fill). fit_width: as wide as its content."""
@@ -34648,16 +34693,10 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
         except tk.TclError:
             pass
 
-    # 5.3.4 CI (macOS): the self-test's update() of a fit-width frame
-    # never returned. Each resize handler counts its calls (the test
-    # reports them), and a fit that keeps changing the width it just set,
-    # more than FIT_ROUNDS times before Tk is idle, stops for that round
-    # instead of resizing for ever.
-    counts = {"inner": 0, "canvas": 0, "fits": 0, "held": 0}
-    rounds = {"n": 0, "job": None}
-
-    def round_over():
-        rounds["n"], rounds["job"] = 0, None
+    # each resize handler counts its calls: a test can tell when they have
+    # stopped (5.3.4 CI, macOS: Tk there always has an event waiting, so
+    # "until no event is left" never came)
+    counts = {"inner": 0, "canvas": 0, "fits": 0}
 
     def inner_conf(_e=None):
         counts["inner"] += 1
@@ -34666,14 +34705,8 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
             want = inner.winfo_reqwidth()
             # "10c" until a width is set: winfo_pixels reads any unit
             if abs(canvas.winfo_pixels(canvas.cget("width")) - want) > 2:
-                if rounds["n"] < FIT_ROUNDS:
-                    rounds["n"] += 1
-                    counts["fits"] += 1
-                    canvas.configure(width=want)
-                    if rounds["job"] is None:
-                        rounds["job"] = canvas.after(250, round_over)
-                else:
-                    counts["held"] += 1
+                counts["fits"] += 1
+                canvas.configure(width=want)
         show_bar()
 
     def canvas_conf(e):
@@ -68665,15 +68698,20 @@ def t_toc_matches_banners(ctx):
     assert len(ids) == len(set(ids)), "duplicate banner ids"
 
 
-def _gate_handoff_run(fair, seconds=1.5, slice_s=0.025):
+def _gate_handoff_run(fair, entries=80, slice_s=0.025, timeout=15.0):
     """A worker holding a GuiGate in 25 ms slices, a 'Tk' thread asking
-    for it every 10 ms. -> (sorted Tk waits in s, worker slices done)."""
+    for it every 10 ms, until the Tk side got in `entries` times (or
+    `timeout`). -> (sorted Tk waits in s, worker slices done, stats):
+    stats["overtakes"] counts the slices after which the worker took the
+    gate back while a Tk callback was still waiting for it, without the
+    50 ms wait for it having run out (stats["gave_up"])."""
     gate = GuiGate()
     saved = FEATURES.get("fair_gate", True)
     FEATURES["fair_gate"] = fair
     stop = threading.Event()
     slices = [0]
     waits = []
+    stats = {"overtakes": 0, "gave_up": 0, "seconds": 0.0}
 
     def worker():
         while not stop.is_set():
@@ -68683,7 +68721,12 @@ def _gate_handoff_run(fair, seconds=1.5, slice_s=0.025):
                     pass
                 seen = gate.tk_entries
             slices[0] += 1
-            gate.yield_to_tk(seen)
+            spent = gate.yield_to_tk(seen)
+            if gate.tk_waiting > 0 and gate.tk_entries == seen:
+                if fair and spent >= 0.049:
+                    stats["gave_up"] += 1        # its 50 ms ran out
+                else:
+                    stats["overtakes"] += 1
 
     def tk_side():
         while not stop.is_set():
@@ -68691,31 +68734,45 @@ def _gate_handoff_run(fair, seconds=1.5, slice_s=0.025):
             gate.enter_tk()
             waits.append(time.perf_counter() - t0)
             gate.release()
+            if len(waits) >= entries:
+                stop.set()
             time.sleep(0.010)
+    t0 = time.perf_counter()
     try:
         threads = [threading.Thread(target=worker, daemon=True),
                    threading.Thread(target=tk_side, daemon=True)]
         for th in threads:
             th.start()
-        time.sleep(seconds)
+        stop.wait(timeout)
         stop.set()
         for th in threads:
             th.join(2)
     finally:
         FEATURES["fair_gate"] = saved
-    return sorted(waits), slices[0]
+    stats["seconds"] = time.perf_counter() - t0
+    return sorted(waits), slices[0], stats
 
 
 @self_test()
 def t_gate_handoff(ctx):
-    """With fair handoff a Tk callback never waits much more than one
-    25 ms analysis slice for the GuiGate, and analysis keeps going."""
-    waits, slices = _gate_handoff_run(True)
-    assert len(waits) > 20, f"the Tk side got in only {len(waits)} times"
+    """With fair handoff the analysis thread, between its 25 ms slices,
+    lets a waiting Tk callback in before it takes the gate again (it
+    took it straight back: Python locks are not fair), so a callback
+    waits about one slice at most, and analysis keeps going.
+    5.3.4 CI (macOS): it counted the Tk side's turns in 1.5 s, which is
+    the runner's speed (19 there, 60 here); it now waits for 80 turns and
+    checks the hand-off itself."""
+    waits, slices, st = _gate_handoff_run(True)
+    info = (f"{len(waits)} Tk turns in {st['seconds']:.1f} s, "
+            f"{slices} slices, waits p50 "
+            f"{waits[len(waits) // 2] * 1000:.0f} ms, max "
+            f"{waits[-1] * 1000:.0f} ms, {st}") if waits else str(st)
+    assert len(waits) >= 80, f"the Tk side got in only: {info}"
+    assert st["overtakes"] == 0, f"the worker took the gate back over a " \
+        f"waiting Tk callback: {info}"
     p90 = waits[int(len(waits) * 0.9)]
-    assert p90 < 0.040 and waits[-1] < 0.120, (
-        f"Tk waited p90 {p90 * 1000:.0f} ms, max {waits[-1] * 1000:.0f} ms")
-    assert slices > 20, f"analysis only ran {slices} slices"
+    assert p90 < 0.040 and waits[-1] < 0.120, info
+    assert slices > 20, info
     saved = dict(FEATURES)
     assert apply_feature_switches(
         False, {"MW_FEATURES_OFF": "no_such_switch"}) == saved
@@ -81013,6 +81070,26 @@ def _tk_can_draw():
     return _TK_DRAWS[0]
 
 
+def _pump_until_still(root, state, slices=3, timeout=10.0):
+    """Run Tk's events in short slices until state() is the same after
+    `slices` slices in a row (True), or `timeout` passes (False). Not
+    "until the queue is empty": on macOS Tk always has an event waiting,
+    and update() there never returned (5.3.4 CI, 6 hours)."""
+    last, same = object(), 0
+    t_end = time.monotonic() + timeout
+    while time.monotonic() < t_end:
+        n = 0
+        while n < 500 and root.tk.dooneevent(tk._tkinter.DONT_WAIT):
+            n += 1
+        cur = state()
+        same = same + 1 if cur == last else 0
+        if same >= slices:
+            return True
+        last = cur
+        time.sleep(0.02)
+    return False
+
+
 def _m16_tk():
     """A hidden Tk root for a self-test, or None (no display, or a Tk
     that can't draw: skip)."""
@@ -84912,28 +84989,41 @@ def t_534_scrollable_fit_width_units(ctx):
         return "skip"
     errors = []
     root.report_callback_exception = lambda *a: errors.append(a[1])
+    # Tk's default width is "10c"; some builds give it back as "10c" (the
+    # bug: int("10c")), this one in pixels. Every build here answers with
+    # the width as it was set, so the check runs the same everywhere.
+    real_cget, real_conf = tk.Canvas.cget, tk.Canvas.configure
+    as_set = {}
+
+    def conf(self, cnf=None, **kw):
+        if "width" in kw:
+            as_set[str(self)] = str(kw["width"])
+        return real_conf(self, cnf, **kw)
+
+    def cget(self, key):
+        if key == "width" and str(self) in as_set:
+            return as_set[str(self)]
+        return real_cget(self, key)
     try:
+        tk.Canvas.cget, tk.Canvas.configure = cget, conf
         outer, inner = make_scrollable(root, fit_width=True)
+        outer.canvas.configure(width="10c")
         outer.pack(fill="both", expand=True)
         tk.Label(inner, text="x" * 80).pack()
-        # 5.3.4 CI (macOS): root.update() never returned here; a bounded
-        # pump says what kept Tk busy instead of hanging the run
-        for _ in range(2):
-            n = 0
-            while root.tk.dooneevent(tk._tkinter.DONT_WAIT):
-                n += 1
-                assert n < 20000, ("Tk never settled", outer.fit_counts)
-        assert not errors, errors
-        assert outer.fit_counts["held"] == 0, outer.fit_counts
-        # a fit undone again at once, round after round (what a resize
-        # ping-pong does): it stops after FIT_ROUNDS until Tk is idle
+        # 5.3.4 CI (macOS): root.update() never returned here, and a pump
+        # "until no event is left" never ended either (Tk on macOS always
+        # has one waiting; the handlers ran once). Pumped in slices until
+        # the handlers' counts stay the same for three slices.
+        settled = _pump_until_still(root, lambda: dict(outer.fit_counts))
         c = outer.fit_counts
-        fits0 = c["fits"]
-        for _ in range(FIT_ROUNDS + 4):
-            outer.canvas.configure(width=1)
-            inner.event_generate("<Configure>")
-        assert c["fits"] - fits0 <= FIT_ROUNDS and c["held"] >= 4, c
+        assert settled, ("the resize handlers kept running", c)
+        assert c["inner"] >= 1, c
+        assert not errors, errors
+        want = inner.winfo_reqwidth()
+        got = outer.canvas.winfo_pixels(outer.canvas.cget("width"))
+        assert abs(got - want) <= 2, (got, want)
     finally:
+        tk.Canvas.cget, tk.Canvas.configure = real_cget, real_conf
         root.destroy()
 
 
@@ -88820,14 +88910,23 @@ def reachable_actions(app):
                      "alerts", "packets"):
             tab = app.tabs[name]
             app._select_tab(name)
-            if name == "packets":
-                tab.show_subview("Packets")
+            # the table's own view: earlier steps leave Packets on
+            # Statistics and Connections on Mail (5.3.4 CI: the Mail view
+            # was still showing when the run was slow, so the Connections
+            # table had no row on screen to open a menu on)
+            if name in ("packets", "connections"):
+                tab.show_subview(name.capitalize())
             # the new tab fills 1 ms after it is shown (5.1.2)
             _gui_pump(app.root, 0.05, until=lambda: getattr(
                 app, "_tab_refresh_job", None) is None, timeout=5)
             _gui_pump(app.root, 0.3)
             tree = tab.tree
             kids = tree.get_children()
+            if kids:
+                # an earlier step may have scrolled the table (it was
+                # at 14 % in a slow run): the first row back on screen
+                tree.see(kids[0])
+                tree.update_idletasks()
             box = tree.bbox(kids[0]) if kids else None
             if not box:
                 out.add(f"rowmenu:{name}:(no rows to open a menu on)")
@@ -89171,8 +89270,11 @@ def gt_534_notify_minimised(app, ctx):
         stall = max(beat["gaps"] or [0]) * 1000
         assert calls and calls[0][0] == "add" and \
             calls[0][1] == "tray-notify", calls
+        gaps = [round(g * 1000) for g in beat["gaps"]]
         assert stall <= NOTIFY_STALL_BUDGET_MS * slack, \
-            f"the window stalled {stall:.0f} ms while the tray call ran"
+            f"the window stalled {stall:.0f} ms while the tray call ran " \
+            f"(beats, ms: {gaps}; the tray call took " \
+            f"{calls[0][3] * 1000:.0f} ms on {calls[0][1]})"
         assert len(beat["gaps"]) >= 15, len(beat["gaps"])   # kept beating
         if not IS_WINDOWS:
             assert calls[0][3] >= 0.29 and flashes[0][1] is True, calls
@@ -89972,6 +90074,60 @@ def _profile_text_size(app, label, top=20):
     return out.getvalue()
 
 
+def _main_thread_breakdown(app, action, until, settle=0.4):
+    """Where the main thread's time goes during `action` and its later
+    callbacks, measured on the main thread only (cProfile on 3.12+ also
+    counts other threads' waits, e.g. the ring worker's drain): the same
+    heartbeat as _heartbeat_measure, first with nothing to do (the floor
+    the measure itself shows on this machine), then with `action`; time
+    inside root.update(), split into the Python callbacks it ran (from
+    PerfProbe) and Tk's own work; main-thread CPU time. -> text"""
+    root = app.root
+    idle = _heartbeat_measure(root, lambda: None, lambda: True, settle)
+    spent = [0.0, 0]
+    orig_update = root.update
+
+    def timed_update():
+        t = time.perf_counter()
+        try:
+            return orig_update()
+        finally:
+            spent[0] += time.perf_counter() - t
+            spent[1] += 1
+    probe0 = PERF[0]
+    probe = PerfProbe()
+    probe.SLOW = 0.004
+    PERF[0] = probe
+    root.update = timed_update
+    try:
+        t0, c0 = time.perf_counter(), time.thread_time()
+        gap, tot = _heartbeat_measure(root, action, until, settle)
+        wall = time.perf_counter() - t0
+        cpu = time.thread_time() - c0
+    finally:
+        del root.update
+        PERF[0] = probe0
+    ms = lambda x: round(x * 1000, 1)       # noqa: E731
+    by = {}
+    for _w, _ph, name, wk, _wt in probe.slow:
+        n, t = by.get(name, (0, 0.0))
+        by[name] = (n + 1, t + wk)
+    top = sorted(by.items(), key=lambda kv: -kv[1][1])[:8]
+    lines = [f"    main thread, one change ({ms(wall)} ms wall, "
+             f"{settle * 1000:.0f} ms of it settling): busy {tot} ms, "
+             f"longest freeze {gap} ms; with nothing to do the same "
+             f"heartbeat shows busy {idle[1]} ms, longest gap {idle[0]} ms",
+             f"      inside update(): {ms(spent[0])} ms over {spent[1]} "
+             f"calls; Python callbacks {ms(probe.work)} ms over {probe.n} "
+             f"(longest {ms(probe.max_work[0])} ms, {probe.max_work[1]}); "
+             f"Tk's own work ~{ms(max(0.0, spent[0] - probe.work))} ms; "
+             f"main-thread CPU {ms(cpu)} ms",
+             "      callbacks over 4 ms: " + (", ".join(
+                 f"{name} {ms(t)} ms x{n}" for name, (n, t) in top)
+                 or "none")]
+    return "\n".join(lines)
+
+
 @gui_test_step("Windows run: a text-size change re-lays the window out "
                "once, quickly; a theme change recolours hidden tabs after")
 def gt_text_size_speed(app, ctx):
@@ -90006,6 +90162,57 @@ def gt_text_size_speed(app, ctx):
         # only, not for each of the ~900 widgets that move inside it
         script = str(root.tk.call("bind", root._w, "<Configure>"))
         assert 'eq "."' in script, script
+        # 2b. 5.3.4 CI: the rows of hidden tabs are laid out when their tab
+        # is shown (55 of 75 rows were re-laid out on hidden tabs), and
+        # then as they would have been
+        app._select_tab("devices")
+        _gui_pump(root, 0.3)
+        laid = []
+        real_layout = FlowLayout._layout
+
+        def counted(fl):
+            laid.append((fl, bool(fl.f.winfo_viewable())))
+            return real_layout(fl)
+        FlowLayout._layout = counted
+        try:
+            nxt = size0 if app.config.get("appearance.text_size") != \
+                size0 else probe
+            app.config.set("appearance.text_size", nxt)
+            app._apply_text_size(nxt)
+            _gui_pump(root, 0.3, until=lambda: app._text_size_job is None,
+                      timeout=10)
+            _gui_pump(root, 0.3)
+            pages = tuple(str(t.frame) + "." for t in app.tabs.values()
+                          if not t.is_visible())
+            shown = sum(1 for _f, v in laid if v)
+            hidden = [str(fl.f) for fl, v in laid
+                      if not v and str(fl.f).startswith(pages)]
+            assert shown and not hidden, (
+                f"{len(hidden)} rows of hidden tabs laid out "
+                f"({shown} on screen)", hidden[:5])
+            waiting = {n: t for n, t in app.tabs.items()
+                       if getattr(t.frame, "_mw_flow_wait", None)}
+            assert waiting, "no hidden tab has a row waiting"
+            name = sorted(waiting)[0]
+            rows = list(app.tabs[name].frame._mw_flow_wait)
+            del laid[:]
+            app._select_tab(name)
+            _gui_pump(root, 0.3)
+            assert not app.tabs[name].frame._mw_flow_wait
+            done = {id(fl) for fl, _v in laid}
+            assert all(id(fl) in done for fl in rows), (name, len(rows),
+                                                        len(done))
+        finally:
+            FlowLayout._layout = real_layout
+        for fl in rows:              # laid out as a fresh layout would
+            before = [(str(it["w"]), it["w"].place_info())
+                      for it in fl.items if it["shown"]]
+            fl._layout()
+            after = [(str(it["w"]), it["w"].place_info())
+                     for it in fl.items if it["shown"]]
+            assert before == after, (name, str(fl.f))
+        app._select_tab("devices")
+        _gui_pump(root, 0.3)
         # 3. measured: in this window the old code was busy 340-460 ms a
         # change (froze 60-75 ms at most): 10-14 font walks and ~1,800
         # Python event handlers; now 60-100 ms (30-40). Best of three,
@@ -90022,10 +90229,20 @@ def gt_text_size_speed(app, ctx):
                 stall.append(gap)
         print(f"    text-size change: busy {busy} ms, longest freeze "
               f"{stall} ms")
-        # 5.3.4 CI: where the time goes, from one more change under the
-        # profiler: always on Windows (busy 230-255 ms there, ~42 ms on
-        # Linux), elsewhere when over the limit or asked (MW_PROFILE=1)
+        # 5.3.4 CI: where the time goes: always on Windows (busy 330-372
+        # ms there in CI round 4, ~42 ms on Linux), elsewhere when over
+        # the limit or asked (MW_PROFILE=1). cProfile's view showed only
+        # ~35 ms of main-thread Python and Tk calls in a 142 ms change and
+        # 95 ms of the ring worker waiting, so the main thread is also
+        # measured on its own, with the heartbeat's own floor. The size
+        # in effect here is `probe` (the runs above end on it): round 4's
+        # profile was of a change to `probe` again, i.e. of no change
         if IS_WINDOWS or min(busy) > 130 or os.environ.get("MW_PROFILE"):
+            def act(label=size0):
+                app.config.set("appearance.text_size", label)
+                app._apply_text_size(label)
+            print(_main_thread_breakdown(
+                app, act, lambda: app._text_size_job is None))
             print(_profile_text_size(app, probe))
         # 5.3.4 CI: the tables of hidden tabs are fitted when shown
         pend = dict(getattr(app, "_fit_pending", None) or {})
