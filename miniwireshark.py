@@ -87557,6 +87557,8 @@ REACHABLE_ALTERNATES = {
 }
 # Old entry -> its new name, for actions a later milestone renames or moves.
 REACHABLE_RENAMES = {
+    # 5.3.4 QA: the palette uses the same "Demo Mode" name as the menu
+    "palette:action:Demo mode": "palette:action:Demo Mode",
     # M7: the inventory became the network sheet
     "menu:export:Device inventory (printable)…":
         "menu:export:Network sheet (printable)…",
