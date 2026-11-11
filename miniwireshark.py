@@ -86026,7 +86026,14 @@ def _gs_this_pc(app, ctx):
                    for f in mine}
     pm.listening = {("TCP", "0.0.0.0", 8000): (5151, "python.exe"),
                     ("TCP", "127.0.0.1", 5432): (99, "postgres.exe")}
-    assert app.attribute_processes() >= 1
+    # the waits above run window callbacks, so a network check can land
+    # there too and put this machine's real address back (CI 24.04 lost
+    # the scenario's addresses this way); set them again with no wait
+    # between that and the attribution
+    m.set_identity(my_ips=ident[1], local_nets=ident[3])
+    got = app.attribute_processes()
+    assert got >= 1, ("nothing attributed", sorted(m.my_ips),
+                      sum(1 for f in mine if f.process), len(mine))
     assert all(f.process == "firefox.exe (pid 4242)" for f in mine
                if f.local_port is not None)
     rep = dict(app.device_report(m.registry.by_key[m.my_device_key()]))
