@@ -2246,6 +2246,36 @@ except ImportError:                                  # pragma: no cover
     sys.exit(1)
 
 
+# 5.3.4 CI round 7 (Windows self-test, intermittent): the process aborted
+# with "Tcl_AsyncDelete: async handler deleted by the wrong thread". Tcl
+# must delete an interpreter on the thread that made it, and Python
+# deletes it wherever the last reference to it goes. A Font or Variable
+# of a closed window (kept in a cache such as MW_FONT_OBJ), a cycle the
+# collector frees while a worker thread runs, or a worker thread that
+# outlives the window could be that last reference. Every interpreter made
+# on the main thread is now also held here until the program ends, when
+# the main thread releases it. In the app that is the one main window (and
+# a fatal-error dialog); the self-test holds its test windows' ones.
+_TK_INTERPS = []
+
+
+def _keep_tk_interps():
+    orig = tk.Tk.__init__
+    if getattr(orig, "_mw_keeps", False):
+        return
+
+    @functools.wraps(orig)
+    def init(self, *a, **kw):
+        orig(self, *a, **kw)
+        if threading.current_thread() is threading.main_thread():
+            _TK_INTERPS.append(self.tk)
+    init._mw_keeps = True
+    tk.Tk.__init__ = init
+
+
+_keep_tk_interps()
+
+
 # ============================================================================
 #  1b.  Scapy symbols (filled in by load_scapy once the dependency is ready)
 # ============================================================================
@@ -18290,7 +18320,10 @@ class ProcessMap:
 
     def __init__(self, interval=2.0):
         self.interval = interval
-        self.by_local = {}        # (proto, ip, port) → (pid, name)
+        # (by_local: (proto, ip, port) → (pid, name), the same by the
+        # address's one form): one snapshot, swapped in one store, so a
+        # lookup on the window thread never mixes two reads of the table
+        self._tables = ({}, {})
         self.by_port = {}         # (proto, port) → (pid, name)
         self.listening = {}       # (proto, ip, port) → (pid, name)
         self.names = {}           # pid → name
@@ -18300,6 +18333,18 @@ class ProcessMap:
         self.error = ""
         self.available = _psutil() is not None
         self.seq = 0
+
+    @property
+    def by_local(self):
+        return self._tables[0]
+
+    @by_local.setter
+    def by_local(self, table):
+        """A table set by hand (tests) gets its other form too."""
+        by_addr = {}
+        for (proto, ip, port), ent in table.items():
+            by_addr.setdefault((proto, local_addr_key(ip), port), ent)
+        self._tables = (table, by_addr)
 
     def _name(self, ps, pid):
         if not pid:
@@ -18335,7 +18380,7 @@ class ProcessMap:
         if ps is None:
             return False
         conns, partial = self._connections(ps)
-        by_local, by_port, listening = {}, {}, {}
+        by_local, by_port, listening, by_addr = {}, {}, {}, {}
         unnamed = 0
         # 5.2.3 (B-18): Windows reuses process numbers quickly; a name is
         # kept only while its process number is still in the table, so a
@@ -18375,6 +18420,12 @@ class ProcessMap:
             old = by_local.get((proto, ip, port))
             if old is None or (not old[0] and pid):
                 by_local[(proto, ip, port)] = ent
+            # the same address written another way (an IPv4 address in
+            # IPv6 form, a scope suffix)
+            key = (proto, local_addr_key(ip), port)
+            old = by_addr.get(key)
+            if old is None or (not old[0] and pid):
+                by_addr[key] = ent
             old = by_port.get((proto, port))
             if old is None or (not old[0] and pid):
                 by_port[(proto, port)] = ent
@@ -18382,8 +18433,8 @@ class ProcessMap:
             if (proto == "TCP" and status == "LISTEN") or \
                     (proto == "UDP" and not ra):
                 listening[(proto, ip, port)] = ent
-        self.by_local, self.by_port, self.listening = by_local, by_port, \
-            listening
+        self._tables = (by_local, by_addr)
+        self.by_port, self.listening = by_port, listening
         self.needs_admin = partial or unnamed > 0
         self.at = time.time()
         self.seq += 1
@@ -18407,18 +18458,37 @@ class ProcessMap:
         return True
 
     def lookup(self, proto, ip, port):
-        """→ (pid, name) or None. Name "" = the OS didn't say (admin)."""
+        """→ (pid, name) or None. Name "" = the OS didn't say (admin).
+        By this exact local address and port (however the address is
+        written), else by a socket on every address with that port; never
+        by the port alone. 5.3.4 (round 7): after this computer's address
+        changed (Wi-Fi switch, VPN up), the port alone named whatever
+        program had that port number on the new address, so a connection
+        from the old address got another program's name; it is now left
+        unnamed."""
         if port is None:
             return None
-        ent = self.by_local.get((proto, ip, port))
+        by_local, by_addr = self._tables
+        ent = by_local.get((proto, ip, port))
+        if ent is None:
+            ent = by_addr.get((proto, local_addr_key(ip), port))
         if ent is None:
             for any_ip in ("0.0.0.0", "::", ""):
-                ent = self.by_local.get((proto, any_ip, port))
+                ent = by_local.get((proto, any_ip, port))
                 if ent is not None:
                     break
-        if ent is None:
-            ent = self.by_port.get((proto, port))
         return ent
+
+
+def local_addr_key(ip):
+    """One way to write a local address: an IPv4 address in IPv6 form
+    (::ffff:a.b.c.d, as dual-stack sockets report it) as IPv4, without a
+    scope suffix (%12), lower case."""
+    s = str(ip or "").split("%", 1)[0].lower()
+    if s.startswith("::ffff:") and "." in s:
+        return s[7:]
+    a = ip_obj(s) if ":" in s else None
+    return a.compressed if a is not None else s
 
 
 def program_label(ent):
@@ -80085,6 +80155,97 @@ def t_story_process_hit_rate(ctx):
     for f in m.flows.archive:
         assert f.process == "", f.process       # not "needs admin rights"
     assert not pm.needs_admin                   # TIME_WAIT has no program
+
+
+@self_test(needs_source=True)
+def t_r7_tk_freed_on_main_thread_only(ctx):
+    """5.3.4 CI round 7 (Windows self-test abort, "Tcl_AsyncDelete: async
+    handler deleted by the wrong thread"): when the last reference to a
+    closed window's Tk objects (a cached shared font, a Variable, a Font)
+    goes on a worker thread, or the collector frees them there, the
+    process lives on; Tcl's interpreter is let go on the main thread at
+    the end. In a child process: without the fix it aborts."""
+    if not _tk_can_draw():
+        return "skip"
+    code = r'''
+import gc, importlib.util, os, sys, threading
+sys.argv = ["x", "--bench"]
+spec = importlib.util.spec_from_file_location("mw", os.environ["MW_FILE"])
+mw = importlib.util.module_from_spec(spec)
+sys.modules["mw"] = mw
+spec.loader.exec_module(mw)
+tk, tkfont = mw.tk, mw.tkfont
+r = tk.Tk()
+r.withdraw()
+mw.mw_font(10)                         # the app's cache keeps its Font
+box = [tk.StringVar(r, "x"), tkfont.Font(root=r, size=9)]
+cyc = {"w": tk.Frame(r)}
+cyc["self"] = cyc                      # for the collector
+r.destroy()
+del r, cyc
+
+
+def work():
+    mw.MW_FONT_OBJ.clear()
+    box.clear()
+    gc.collect()                       # the collector, on this thread
+t = threading.Thread(target=work)
+t.start()
+t.join()
+print("OK", len(mw._TK_INTERPS), flush=True)
+'''
+    env = dict(os.environ, MW_FILE=os.path.abspath(__file__),
+               MINIWIRESHARK_DATA=ctx.path("tk-thread-data"))
+    r = subprocess.run([sys.executable, "-I", "-c", code], env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "OK 1" in r.stdout, (
+        r.returncode, r.stdout[-300:], r.stderr[-800:])
+
+
+@self_test()
+def t_r7_attribution_after_address_change(ctx):
+    """5.3.4 (round 7): this computer's address changes (Wi-Fi switch, VPN
+    up) between the connection table's read and the attribution. A
+    connection from the old address is left unnamed. It got the program
+    that had the same port number on the new address (by the port alone).
+    A socket on every address still names it; the same address written
+    as ::ffff:a.b.c.d does too; the new address is named after the
+    change."""
+    old_ip, new_ip = "192.168.1.20", "10.8.0.2"
+    m = NetworkModel(ctx.cfg(), *scenario_identity()[:3])
+    m.set_identity(my_ips={old_ip})
+    flows = {}
+    for i, (ip, port) in enumerate(((old_ip, 50000), (old_ip, 50001),
+                                    (old_ip, 50002), (new_ip, 50000))):
+        f = FlowRecord(i + 1, ("TCP", i), "TCP", ip, port, "93.184.215.14",
+                       443, m.now())
+        m.flows.active[f.key] = f
+        flows[(ip, port)] = f
+    rows = [_conn_row(50000, 77, ip=new_ip, rport=443),
+            _conn_row(50001, 88, "LISTEN", ip="0.0.0.0"),
+            _conn_row(50002, 99, ip="::ffff:" + old_ip, rport=443)]
+    names = {77: "vpnapp.exe", 88: "server.exe", 99: "dual.exe"}
+
+    def run():
+        pm = ProcessMap()
+        pm._name = lambda _ps, pid: names.get(pid, "")
+        assert pm.read()
+        return pm
+    pm = _with_conn_table(rows, run)
+    app = types.SimpleNamespace(procmap=pm, model=m)
+    MiniWireshark.attribute_processes(app)      # my_ips not updated yet
+    assert flows[(old_ip, 50000)].process == "", \
+        ("another program's name", flows[(old_ip, 50000)].process)
+    assert flows[(old_ip, 50001)].process == "server.exe (pid 88)"
+    assert flows[(old_ip, 50002)].process == "dual.exe (pid 99)"
+    assert flows[(new_ip, 50000)].process == ""      # not ours yet
+    m.set_identity(my_ips={new_ip})
+    MiniWireshark.attribute_processes(app)
+    assert flows[(new_ip, 50000)].process == "vpnapp.exe (pid 77)"
+    assert flows[(old_ip, 50000)].process == ""
+    assert local_addr_key("::FFFF:192.168.1.20") == "192.168.1.20"
+    assert local_addr_key("fe80::1%12") == "fe80::1"
+    assert local_addr_key("2001:DB8:0:0::1") == "2001:db8::1"
 
 
 @self_test()

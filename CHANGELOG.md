@@ -61,6 +61,8 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - A Windows console with an old code page no longer stops MiniWireshark with a text error; a character it can't show is printed as "?".
 - On a small screen, an Inspector switched on in Settings now makes room for the tabs when the window opens narrow, not only when you make the window narrower.
 - A text-size change is quicker: the tables, the rows of buttons and the scrolling pages on tabs you can't see are fitted when you open their tab.
+- When your computer's address changes (another Wi-Fi network, a VPN switched on), a connection from the old address is no longer named after a different program that happens to use the same port number now. It is left without a program name.
+- A rare crash ("Tcl_AsyncDelete: async handler deleted by the wrong thread") can no longer happen when the last piece of a closed window is let go by a background task.
 
 **Known limits**
 
