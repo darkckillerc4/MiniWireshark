@@ -1389,6 +1389,17 @@ def cached_cmd(python, script, args=()):
     return [python, "-c", CACHED_RUN, script] + list(args)
 
 
+def interpreter_flags():
+    """This interpreter's command-line options (-X faulthandler, -W, -O,
+    -I...), as a list to start the same program again with them."""
+    if FROZEN:
+        return []
+    try:
+        return list(subprocess._args_from_interpreter_flags())
+    except Exception:                                # noqa: BLE001
+        return []
+
+
 def cached_env(env):
     env = dict(env)
     if FROZEN:
@@ -1476,6 +1487,10 @@ def start_from_compiled_copy(code, argv=None, environ=None, execute=True,
     if not target:
         return None
     cmd = cached_cmd(sys.executable, SCRIPT_PATH, argv)
+    # (5.3.4 CI, Ubuntu 22.04) the interpreter's own options go along:
+    # "python -X faulthandler miniwireshark.py" replaced itself with a
+    # process without them, so a native crash printed no Python trace
+    cmd[1:1] = interpreter_flags()
     if not execute:
         return cmd
     env = dict(environ)
@@ -11345,6 +11360,16 @@ class LanScanner(threading.Thread):
         self.last_sweep = 0.0
         self.errors = 0
         self.last_error = ""
+        # our own MAC on the chosen interface, looked up once. Every
+        # frame names it as the source: left out, scapy fills it in from
+        # its default interface, which can be another adapter, or none
+        # at all on Windows without Npcap ("Interface ... not found")
+        self.my_mac = None
+
+    def _own_mac(self):
+        if not self.my_mac:
+            self.my_mac = _iface_mac(self.iface)
+        return self.my_mac
 
     def _note_error(self, e):
         self.errors += 1
@@ -11373,6 +11398,10 @@ class LanScanner(threading.Thread):
     def _sweep(self):
         if not self.allowed():
             return
+        if not self._own_mac():
+            self._note_error(LookupError(
+                f"no hardware address for {self.iface}"))
+            return
         self.sweeps += 1
         self.last_sweep = time.time()
         self._arp_sweep()
@@ -11391,7 +11420,9 @@ class LanScanner(threading.Thread):
         if not hosts:
             return
         try:
-            pkts = [Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=h) for h in hosts]
+            mac = self._own_mac()
+            pkts = [Ether(src=mac, dst="ff:ff:ff:ff:ff:ff") /
+                    ARP(hwsrc=mac, psrc=self.my_ip, pdst=h) for h in hosts]
             outbound("lan_scan", "arp", f"{len(hosts)} addresses in "
                      f"{self.subnet}", "who-has (one per address)",
                      count=len(pkts))
@@ -11403,7 +11434,7 @@ class LanScanner(threading.Thread):
         if not self.my_ip:
             return
         try:
-            pkt = (Ether(dst="01:00:5e:00:00:fb") /
+            pkt = (Ether(src=self._own_mac(), dst="01:00:5e:00:00:fb") /
                    IP(dst="224.0.0.251", src=self.my_ip) /
                    UDP(sport=5353, dport=5353) /
                    DNS(rd=0, qd=DNSQR(qname="_services._dns-sd._udp.local.",
@@ -11420,7 +11451,7 @@ class LanScanner(threading.Thread):
         try:
             msg = ("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\n"
                    'MAN: "ssdp:discover"\r\nMX: 2\r\nST: ssdp:all\r\n\r\n')
-            pkt = (Ether(dst="01:00:5e:7f:ff:fa") /
+            pkt = (Ether(src=self._own_mac(), dst="01:00:5e:7f:ff:fa") /
                    IP(dst="239.255.255.250", src=self.my_ip) /
                    UDP(sport=random.randint(20000, 60000), dport=1900) /
                    Raw(load=msg.encode()))
@@ -11441,6 +11472,27 @@ def _iface_ip(iface):
         return get_if_addr(getattr(iface, "name", iface))
     except Exception as e:                           # noqa: BLE001
         LOG.debug("interface address (%s): %s", iface, e)
+    return ""
+
+
+def _iface_mac(iface):
+    """Our hardware address on the chosen interface, or "" when it can't
+    be read (no capture driver, adapter gone)."""
+    try:
+        from scapy.all import get_if_hwaddr
+    except Exception as e:                           # noqa: BLE001
+        LOG.debug("interface hardware address: %s", e)
+        return ""
+    for name in (iface, getattr(iface, "name", None)):
+        if name is None:
+            continue
+        try:
+            mac = str(get_if_hwaddr(name) or "").lower()
+        except Exception as e:                       # noqa: BLE001
+            LOG.debug("interface hardware address (%s): %s", name, e)
+            continue
+        if mac and mac != "00:00:00:00:00:00":
+            return mac
     return ""
 
 
@@ -24884,6 +24936,22 @@ STORE_MIGRATIONS = {
 }
 
 
+def _zero_free_pages(con):
+    """Overwrite the file's free pages with zeros: a table of zero blobs
+    takes them over, then is dropped (secure_delete is ON)."""
+    try:
+        free = con.execute("PRAGMA freelist_count").fetchone()[0]
+        size = con.execute("PRAGMA page_size").fetchone()[0]
+        con.execute("CREATE TABLE IF NOT EXISTS _zero(b BLOB)")
+        con.executemany("INSERT INTO _zero VALUES(zeroblob(?))",
+                        [(size // 2,)] * (int(free) * 2 + 2))
+        con.commit()
+        con.execute("DROP TABLE _zero")
+        con.commit()
+    except sqlite3.Error as e:
+        LOG.warning("history free pages not overwritten: %s", e)
+
+
 class Store:
     """Durable, optional history in one SQLite file (WAL mode).
 
@@ -25360,19 +25428,36 @@ class Store:
                     con.execute(f"DELETE FROM {t} WHERE {col}=?",
                                 (device_key,))
             else:
-                for t in ("devices", "presence", "traffic", "alerts",
-                          "domains", "baselines", "observations",
-                          "resolutions", "flows", "site_ties", "events",
-                          "packet_segments"):
-                    con.execute(f"DELETE FROM {t}")
-                # (review) earlier sessions named the networks you joined
-                # and when; only this run's row stays, without its name
-                con.execute("DELETE FROM sessions WHERE id<>?",
-                            (self.session,))
-                con.execute("UPDATE sessions SET network='' WHERE id=?",
-                            (self.session,))
-                con.commit()
-                con.execute("VACUUM")
+                # 5.3.4 CI: secure_delete=ON wrote zeros over every freed
+                # page (the whole file once into the -wal, once more at the
+                # checkpoint) only for VACUUM to drop those pages from the
+                # file straight after: 2.7 s on a Windows runner for a
+                # 90-day file. FAST still clears the table pages it writes
+                # anyway and leaves the free pages to VACUUM; if VACUUM
+                # fails, the free pages are overwritten instead.
+                con.execute("PRAGMA secure_delete=FAST")
+                try:
+                    for t in ("devices", "presence", "traffic", "alerts",
+                              "domains", "baselines", "observations",
+                              "resolutions", "flows", "site_ties", "events",
+                              "packet_segments"):
+                        con.execute(f"DELETE FROM {t}")
+                    # (review) earlier sessions named the networks you
+                    # joined and when; only this run's row stays, unnamed
+                    con.execute("DELETE FROM sessions WHERE id<>?",
+                                (self.session,))
+                    con.execute("UPDATE sessions SET network='' WHERE id=?",
+                                (self.session,))
+                    con.commit()
+                finally:
+                    con.execute("PRAGMA secure_delete=ON")
+                try:
+                    con.execute("VACUUM")
+                except sqlite3.Error as e:
+                    LOG.warning("history VACUUM failed (%s): overwriting "
+                                "the free pages instead", e)
+                    _zero_free_pages(con)
+                    raise
                 # 5.3.4 (LG-13): "Delete ALL history" means the copies too:
                 # the -wal file, the nightly backup and the ones made
                 # before an upgrade or after damage
@@ -31313,6 +31398,37 @@ def text_width(font, text, keep=True):
         return font.measure(text)
 
 
+def _pack_pady(info):
+    """Total vertical padding from a pack_info() dict."""
+    v = info.get("pady", 0)
+    parts = [int(float(str(x))) for x in (
+        v if isinstance(v, (tuple, list)) else str(v).split())] or [0]
+    if len(parts) == 1:
+        return 2 * parts[0]
+    return sum(parts[:2])
+
+
+def pack_while_set(widget, var, allowed=None, **pack):
+    """Pack `widget` (with these pack options) only while `var` holds
+    some text, and allowed() says there is room for it: an empty or
+    secondary line takes no height from what it sits beside. -> the
+    function that decides again (for a <Configure> of the container)."""
+    def sync(*_a):
+        try:
+            show = bool(str(var.get()).strip()) and (
+                allowed is None or allowed())
+            if show:
+                if not widget.winfo_manager():
+                    widget.pack(**pack)
+            elif widget.winfo_manager():
+                widget.pack_forget()
+        except tk.TclError:
+            pass
+    var.trace_add("write", sync)
+    sync()
+    return sync
+
+
 def fit_heading(tree, col):
     try:
         text = str(tree.heading(col, "text") or "")
@@ -31403,7 +31519,17 @@ def share_tree_width(tree):
     room = avail - sum(info[c][2] for c in stretch) - 4
     new = dict(base)
     if sum(base.values()) > room:
-        if not w0 and all(info[c][0] >= info[c][2] for c in stretch):
+        # (5.3.4 CI, Windows) "nothing is cut" counted on Tk having
+        # already squeezed the stretching columns to the new width; when
+        # this ran first, the fixed columns kept their full width and the
+        # ones on the right were pushed past the edge of a table that
+        # can't scroll sideways (Tk then cut the stretching column too)
+        overflow = sum(info[c][0] for c in cols) > avail + 4
+        with contextlib.suppress(tk.TclError):
+            if str(tree.cget("xscrollcommand")):
+                overflow = False             # reached with the scroll bar
+        if not w0 and not overflow and all(
+                info[c][0] >= info[c][2] for c in stretch):
             return False                       # nothing is cut
         excess = {c: max(0, base[c] - info[c][2]) for c in fixed}
         total = sum(excess.values())
@@ -33454,20 +33580,25 @@ class SettingsWindow:
 
         # ---- sidebar
         f_base = tkfont.Font(root=self.win, font=self.F_BASE)
-        longest = max(text_width(f_base, translate_text(p["title"]))
+        scale = self.app.TEXT_SIZES.get(self.cfg.get(
+            "appearance.text_size", "Normal"), 1.0)
+        # (5.3.4 CI, Ubuntu 24.04) measured as the open page's row is
+        # drawn: bold, at the text size's own point size. The regular
+        # width times the scale was 6 pixels short of DejaVu Sans Bold
+        # ("Privacidad y búsquedas" cut at Large text)
+        f_sel = tkfont.Font(root=self.win, font=(
+            self.F_BASE[0], max(6, int(round(self.F_BASE[1] * scale))),
+            "bold"))
+        longest = max(text_width(f_sel, translate_text(p["title"]))
                       for p in SETTINGS_PAGES)
-        side_w = max(220, min(330, longest + 60))
+        side_w = max(220, min(380, longest + 84))
         side = tk.Frame(self.win, bg=t["side_bg"], width=side_w)
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
         # the page list must fit the window: tighter rows on short screens
         avail = int(self.win.winfo_screenheight()) - 100
         avail = min(avail, 720) - 190
-        scale = self.app.TEXT_SIZES.get(self.cfg.get(
-            "appearance.text_size", "Normal"), 1.0)
         line = int(f_base.metrics("linespace") * scale)
-        side_w = max(220, min(380, int(longest * scale) + 84))
-        side.configure(width=side_w)
         self._nav_pady = max(1, min(5, (avail // max(1, len(
             SETTINGS_PAGES)) - line) // 2))
         tk.Label(side, text="Settings", bg=t["side_bg"], fg=t["text_fg"],
@@ -36232,12 +36363,69 @@ class BaseTab:
                        wraplength=1000, justify="left",
                        font=mw_font(11))
         lbl.pack(anchor="w")
+        sub_lbl = None
         if sub:
-            tk.Label(top, text=sub, bg=WHITE, fg="#666666",
-                     wraplength=1000, justify="left",
-                     font=mw_font(9)).pack(anchor="w",
-                                                     pady=(2, 0))
+            sub_lbl = tk.Label(top, text=sub, bg=WHITE, fg="#666666",
+                               wraplength=1000, justify="left",
+                               font=mw_font(9))
+            sub_lbl.pack(anchor="w", pady=(2, 0))
+        # (the Connections tab builds its header in a sub-view's frame)
+        self._head = (self.frame, top, sub_lbl)
+        # the tab's size, or the header's own (a text size change)
+        for w in (self.frame, top):
+            w.bind("<Configure>", self._fit_header, add="+")
         return top
+
+    def _fit_header(self, _e=None):
+        """5.3.4 (CI, Ubuntu 24.04's DejaVu Sans): in a short tab (large
+        text, a 690 or 768 pixel window) the header and the tool bars
+        took every pixel and Tk unmapped what the tab is for (Timeline's
+        table, Sources' text). The explanation steps aside for it: first
+        its second line, then the whole header, while the tab can't give
+        the content about six lines; it comes back when there's room."""
+        head = getattr(self, "_head", None)
+        if head is None:
+            return
+        box, top, sub = head
+        try:
+            h = box.winfo_height()
+            if h <= 1:
+                return                          # not laid out yet
+            fixed = 0
+            for w in box.pack_slaves():
+                info = w.pack_info()
+                if w is top or str(info.get("expand")) in ("1", "true"):
+                    continue
+                fixed += w.winfo_reqheight() + _pack_pady(info)
+            line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+            room = h - fixed - 6 * line
+            full = 2 * int(top.cget("pady"))
+            for c in top.winfo_children():
+                if c.winfo_manager() == "pack":
+                    full += c.winfo_reqheight() + _pack_pady(c.pack_info())
+            if sub is not None and not sub.winfo_manager():
+                full += sub.winfo_reqheight() + 2
+            short = full - (sub.winfo_reqheight() + 2 if sub is not None
+                            else 0)
+            show_sub = sub is not None and room >= full
+            show_top = room >= short
+            if not show_top:
+                if top.winfo_manager():
+                    top.pack_forget()
+                return
+            if sub is not None:
+                if show_sub and not sub.winfo_manager():
+                    sub.pack(anchor="w", pady=(2, 0))
+                elif not show_sub and sub.winfo_manager():
+                    sub.pack_forget()
+            if not top.winfo_manager():
+                rest = box.pack_slaves()
+                if rest:
+                    top.pack(fill="x", before=rest[0])
+                else:
+                    top.pack(fill="x")
+        except (tk.TclError, ValueError):
+            return
 
     def toolbar(self):
         bar = tk.Frame(self.frame, bg=WHITE, padx=12)
@@ -43209,14 +43397,35 @@ class PacketsTab(BaseTab):
         nb.add(tf, text="Packet details")
         nb.add(df, text="Text dump")
         nb.add(hf, text="Hex dump")
-        tk.Label(bottom, textvariable=self.field_var, anchor="w", bg=WHITE,
-                 fg="#555555", font=mw_font(9)).pack(
-            side="bottom", fill="x", before=nb)
+        # (5.3.4 CI, Ubuntu 24.04 fonts) the two lines are packed only
+        # while they say something and the details keep about six lines:
+        # packed before the notebook, they took the whole pane in a short
+        # window (Spanish, large text, 1000×690) and Tk unmapped the
+        # notebook. They come back when the pane grows.
+        field_lbl = tk.Label(bottom, textvariable=self.field_var,
+                             anchor="w", bg=WHITE, fg="#555555",
+                             font=mw_font(9))
         self.explain_var = DisplayVar(value="")
-        tk.Label(bottom, textvariable=self.explain_var, anchor="w",
-                 bg=WHITE, fg="#2b3a56", justify="left", wraplength=1000,
-                 font=mw_font(10)).pack(side="top", fill="x",
-                                                  before=nb, padx=4)
+        explain_lbl = tk.Label(bottom, textvariable=self.explain_var,
+                               anchor="w", bg=WHITE, fg="#2b3a56",
+                               justify="left", wraplength=1000,
+                               font=mw_font(10))
+
+        def room():
+            h = bottom.winfo_height()
+            if h <= 1:
+                return True                     # not laid out yet
+            used = sum(w.winfo_reqheight() for w, v in (
+                (field_lbl, self.field_var),
+                (explain_lbl, self.explain_var)) if str(v.get()).strip())
+            line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+            return h - used >= 6 * line
+        syncs = (pack_while_set(field_lbl, self.field_var, room,
+                                side="bottom", fill="x", before=nb),
+                 pack_while_set(explain_lbl, self.explain_var, room,
+                                side="top", fill="x", before=nb, padx=4))
+        bottom.bind("<Configure>", lambda e: [f() for f in syncs],
+                    add="+")
         self.dtree.bind("<Button-3>", self._field_menu)
         self.dtree.bind("<Button-2>", self._field_menu)
         self.bytes_view.bind("<Button-1>", self._byte_click)
@@ -45684,12 +45893,16 @@ class SourcesTab(BaseTab):
         # and its text; packing them first unmapped the table instead.
         # In a grid the table and the text rows give way by weight (both
         # scroll) and the title row keeps its height, so all three stay
-        # on screen at any height.
+        # on screen at any height. (5.3.4 CI, Ubuntu 24.04's DejaVu Sans)
+        # Grid takes the same number of pixels from each weighted row, so
+        # the shorter text row reached zero first and was unmapped while
+        # the table still had 8 pixels: one uniform group keeps the two
+        # rows the same height, and they shrink together.
         body = tk.Frame(self.frame, bg=WHITE)
         body.pack(fill="both", expand=True)
         body.columnconfigure(0, weight=1)
-        body.rowconfigure(0, weight=1)
-        body.rowconfigure(2, weight=1)
+        body.rowconfigure(0, weight=1, uniform="sources")
+        body.rowconfigure(2, weight=1, uniform="sources")
         wrap, self.tree = make_tree(body, [
             ("source", "Source", 260, "w", True),
             ("kind", "Gives", 230, "w", False),
@@ -67132,6 +67345,14 @@ def self_test_log_aside(folder):
                 LOG.addHandler(h)
 
 
+def _test_eth(src="02:00:00:00:00:05", dst="02:00:00:00:00:01"):
+    """An Ethernet header for a test packet, with both addresses given.
+    Left out, scapy fills them in from the default interface: on Windows
+    without Npcap that raises "Interface ... not found", and a missing
+    dst can make scapy send an ARP request to look it up."""
+    return Ether(src=src, dst=dst)
+
+
 def run_self_tests(verbose=True, only=None):
     results = []
     wanted = self_test_wanted(only)
@@ -67403,13 +67624,15 @@ def run_self_tests(verbose=True, only=None):
     def t_dns_parsing():
         if need_scapy():
             return "skip"
-        q = Ether(bytes(Ether() / IP(src="192.168.1.5", dst="192.168.1.1") /
+        q = Ether(bytes(_test_eth() /
+                        IP(src="192.168.1.5", dst="192.168.1.1") /
                         UDP(sport=5000, dport=53) /
                         DNS(id=7, rd=1, qd=DNSQR(qname="www.example.com"))))
         d = decode_packet(q)
         assert d["proto"] == "DNS" and d["dns"]["qr"] == 0 and \
             d["dns"]["qname"] == "www.example.com"
-        r = Ether(bytes(Ether() / IP(src="192.168.1.1", dst="192.168.1.5") /
+        r = Ether(bytes(_test_eth() /
+                        IP(src="192.168.1.1", dst="192.168.1.5") /
                         UDP(sport=53, dport=5000) /
                         DNS(id=7, qr=1, qd=DNSQR(qname="www.example.com"),
                             an=[DNSRR(rrname="www.example.com",
@@ -67419,11 +67642,13 @@ def run_self_tests(verbose=True, only=None):
         d = decode_packet(r)
         assert d["dns"]["answers"] == ["93.184.215.14"], d["dns"]
         assert ("93.184.215.14", "www.example.com") in d["learns"]
-        nx = Ether(bytes(Ether() / IP() / UDP(sport=53, dport=5000) /
+        nx = Ether(bytes(_test_eth() /
+                         IP(src="192.168.1.1", dst="192.168.1.5") /
+                         UDP(sport=53, dport=5000) /
                          DNS(id=8, qr=1, rcode=3,
                              qd=DNSQR(qname="nope.example"))))
         assert "does not exist" in decode_packet(nx)["text"]
-        t = Ether(bytes(Ether() / IP(src="192.168.1.5", dst="9.9.9.9") /
+        t = Ether(bytes(_test_eth() / IP(src="192.168.1.5", dst="9.9.9.9") /
                         TCP(sport=5001, dport=53, flags="PA") /
                         Raw(b"\x00\x1d" + bytes(DNS(rd=1, qd=DNSQR(
                             qname="example.com"))))))
@@ -67461,7 +67686,7 @@ def run_self_tests(verbose=True, only=None):
         assert parse_tls_hello(ch[:60]) is not None   # truncated: no crash
         if need_scapy():
             return
-        base = Ether() / IP(src="192.168.1.5", dst="93.184.215.14")
+        base = _test_eth() / IP(src="192.168.1.5", dst="93.184.215.14")
         rs = TlsReassembler()
         p1 = Ether(bytes(base / TCP(sport=4000, dport=443, flags="PA",
                                     seq=10) / Raw(ch[:1000])))
@@ -77618,12 +77843,25 @@ def t_compiled_copy_start(ctx):
         assert r.returncode == 0, r.stderr[-400:]
         assert r.stdout, "the worker said nothing"
     env = {"PATH": os.environ.get("PATH", "")}
-    cmd = start_from_compiled_copy(code, ["--demo"], env, execute=False,
-                                   target=ctx.path("copy2.pyc"))
+    g, real_flags = globals(), interpreter_flags
+    try:
+        g["interpreter_flags"] = lambda: ["-X", "faulthandler"]
+        cmd = start_from_compiled_copy(code, ["--demo"], env,
+                                       execute=False,
+                                       target=ctx.path("copy2.pyc"))
+    finally:
+        g["interpreter_flags"] = real_flags
     if IS_WINDOWS:
         assert cmd is None
     else:
-        assert cmd == cached_cmd(sys.executable, SCRIPT_PATH, ["--demo"])
+        plain = cached_cmd(sys.executable, SCRIPT_PATH, ["--demo"])
+        assert cmd == plain[:1] + ["-X", "faulthandler"] + plain[1:], cmd
+    # (5.3.4 CI) the options a run was started with survive the exec
+    r = subprocess.run([sys.executable, "-X", "faulthandler", "-W",
+                        "error", "-c", "import subprocess; print("
+                        "subprocess._args_from_interpreter_flags())"],
+                       capture_output=True, text=True, timeout=60)
+    assert "'faulthandler'" in r.stdout and "-Werror" in r.stdout, r
     assert start_from_compiled_copy(code, ["--demo"], {"MW_CACHED": "1"},
                                     False, target) is None
     assert start_from_compiled_copy(code, [SAFE_FLAG], env, False,
@@ -80420,8 +80658,33 @@ def release_gate(argv):
 
 
 # ---- 5.3.4 M16: words and polish ---------------------------------------------
+_TK_DRAWS = []
+
+
+def _tk_can_draw():
+    """Whether this Python's Tk can draw a Label at all, asked once in a
+    child process: a test machine's Python 3.8 build aborts the whole
+    process on its first Label or Text (two copies of Xlib: "[xcb]
+    Unknown sequence number"), which ended the self-test run there."""
+    if not _TK_DRAWS:
+        code = ("import tkinter as t; r = t.Tk(); r.withdraw(); "
+                "t.Label(r, text='x').pack(); r.update(); r.destroy()")
+        try:
+            r = subprocess.run([sys.executable, "-c", code],
+                               capture_output=True, timeout=60,
+                               creationflags=getattr(
+                                   subprocess, "CREATE_NO_WINDOW", 0))
+            _TK_DRAWS.append(r.returncode == 0)
+        except (OSError, subprocess.SubprocessError):
+            _TK_DRAWS.append(False)
+    return _TK_DRAWS[0]
+
+
 def _m16_tk():
-    """A hidden Tk root for a self-test, or None (no display: skip)."""
+    """A hidden Tk root for a self-test, or None (no display, or a Tk
+    that can't draw: skip)."""
+    if not _tk_can_draw():
+        return None
     try:
         r = tk.Tk()
         r.withdraw()
@@ -81651,12 +81914,73 @@ def t_s14_long_history(ctx):
         assert took + took2 <= lim["checkup_render"] and len(html_) > 500
         t0 = time.perf_counter()
         st.clear()
+        # what the window waits for: Clear history only hands the job over
+        handed = (time.perf_counter() - t0) * 1000
+        assert handed <= 50, f"handing the clear over took {handed:.0f} ms"
         assert st.flush_now(30)
         took = (time.perf_counter() - t0) * 1000
         assert took <= 2000, f"clearing (VACUUM) took {took:.0f} ms"
         assert st.query("SELECT COUNT(*) FROM observations")[0][0] == 0
     finally:
         st.stop(5)
+
+
+@self_test()
+def t_534_ci_clear_all_writes_little(ctx):
+    """5.3.4 CI (Windows): "Delete ALL history" no longer writes zeros
+    over every freed page before VACUUM drops them (2.7 s on a Windows
+    runner); nothing of the old rows stays in the file or its -wal, and
+    if VACUUM fails the free pages are overwritten instead."""
+    mark = b"zz-old-host.example"
+    path = ctx.path("clear_io.sqlite3")
+    st = Store(path, session_id=1)
+    try:
+        now = time.time()
+        for i in range(30):
+            assert st.write_observations([
+                (1, now, "dns_answer", mark.decode() + str(k),
+                 {"pad": "x" * 200}, 1) for k in range(i * 500,
+                                                       i * 500 + 500)])
+        assert st.flush_now(30)
+        size = os.path.getsize(path) + (os.path.getsize(path + "-wal")
+                                        if os.path.exists(path + "-wal")
+                                        else 0)
+        assert size > 3 * 1024 * 1024, size
+        io_ = "/proc/self/io"
+
+        def wrote():
+            with open(io_, encoding="ascii") as f:
+                return int(next(ln for ln in f if ln.startswith(
+                    "wchar")).split()[1])
+        w0 = wrote() if os.path.exists(io_) else None
+        st.clear()
+        assert st.flush_now(30)
+        if w0 is not None:
+            # with every freed page zeroed: about twice the file size
+            assert wrote() - w0 < size // 2, (wrote() - w0, size)
+    finally:
+        st.stop(5)
+    for f in (path, path + "-wal"):
+        if os.path.exists(f):
+            with open(f, "rb") as fh:
+                assert mark not in fh.read(), f
+    con = sqlite3.connect(ctx.path("zero.sqlite3"))
+    try:
+        con.execute("PRAGMA secure_delete=FAST")    # as clear() deletes
+        con.execute("CREATE TABLE t(v TEXT)")
+        con.executemany("INSERT INTO t VALUES(?)",
+                        [(mark.decode() * 20,)] * 400)
+        con.commit()
+        con.execute("DELETE FROM t")
+        con.commit()
+        with open(ctx.path("zero.sqlite3"), "rb") as fh:
+            assert mark in fh.read()        # the free pages still hold it
+        con.execute("PRAGMA secure_delete=ON")
+        _zero_free_pages(con)
+    finally:
+        con.close()
+    with open(ctx.path("zero.sqlite3"), "rb") as fh:
+        assert mark not in fh.read()
 
 
 # ---- 5.3.4 M15 (S15): clocks and locales --------------------------------------
@@ -81965,6 +82289,32 @@ def t_m17_tree_width_share(ctx):
         assert [int(tree.column(c, "width")) for c in ("a", "b", "c")] == \
             [300, 300, 300], [tree.column(c, "width") for c in "abc"]
         assert share_tree_width(tree) is False        # nothing to do
+        # (5.3.4 CI, Windows) the share runs before Tk has squeezed the
+        # stretching column to the narrower table: it still makes room
+        t2 = ttk.Treeview(root, columns=("a", "who", "b", "c"),
+                          show="headings")
+        for c, text, w, st in (("a", "Made by", 300, False),
+                               ("who", "Contacted by", 200, True),
+                               ("b", "Provider (ASN)", 300, False),
+                               ("c", "Known name(s)", 300, False)):
+            t2.heading(c, text=text)
+            t2.column(c, width=w, stretch=st, minwidth=30)
+        tree.pack_forget()
+        t2.pack(fill="both", expand=True)
+        root.geometry("640x240")
+        _gui_pump(root, 0.4)
+        t2._mw_w0, t2._mw_set = {}, {}
+        for c, w in (("a", 300), ("who", 300), ("b", 300), ("c", 300)):
+            t2.column(c, width=w)
+        share_tree_width(t2)
+        _gui_pump(root, 0.2)
+        ws = [int(t2.column(c, "width")) for c in t2["columns"]]
+        assert sum(ws) <= t2.winfo_width() + 4 and ws[1] >= \
+            heading_width("Contacted by") + 20, (ws, t2.winfo_width())
+        t2.destroy()
+        tree.pack(fill="both", expand=True)
+        root.geometry("1200x240")
+        _gui_pump(root, 0.4)
         # a table that scrolls sideways, narrower than its headings: the
         # stretching column keeps its heading's width (reached by
         # scrolling) instead of being squeezed to 30 pixels
@@ -82990,12 +83340,132 @@ def t_b9_l4_payload_no_ethernet_padding(ctx):
     if not ctx.scapy_ok:
         return "skip"
     for body in (b"hi", b"hi\x00\x00"):
-        built = Ether() / IP(dst="192.168.1.9") / UDP(sport=5, dport=6) / \
+        built = _test_eth() / IP(src="192.168.1.5", dst="192.168.1.9") / \
+            UDP(sport=5, dport=6) / \
             Raw(body)
         parsed = Ether(bytes(built) + b"\x00" * 18)
         assert len(bytes(parsed)) > len(bytes(built))
         for pkt in (built, parsed):
             assert _l4_payload(pkt, pkt[UDP]) == body, (body, pkt)
+
+
+@self_test()
+def t_534_ci_short_tab_keeps_its_content(ctx):
+    """5.3.4 CI (Ubuntu 24.04 fonts): in a tab too short for everything,
+    the header's explanation steps aside (second line first) so the
+    tab's table stays drawn; it comes back, in its place, with room. An
+    empty status line takes no height (pack_while_set)."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        root.deiconify()
+        nb = ttk.Notebook(root)
+        nb.pack(fill="both", expand=True)
+
+        class Tab(BaseTab):
+            def build(self):
+                self.header("A long explanation " * 4, "A second line")
+                bar = self.toolbar()
+                tk.Label(bar, text="tools", height=3).pack()
+                self.body = tk.Frame(self.frame, height=200, width=300)
+                self.body.pack(fill="both", expand=True)
+        tab = Tab(types.SimpleNamespace(nb=nb))
+        nb.add(tab.frame, text="t")
+        top, sub = tab._head[1], tab._head[2]
+        line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        rows = []
+        for h in (900, 8 * line + 200, 6 * line + 120, 900):
+            root.geometry(f"600x{h}")
+            _gui_pump(root, 0.3)
+            rows.append((bool(top.winfo_ismapped()),
+                         bool(sub.winfo_ismapped()),
+                         tab.body.winfo_ismapped(),
+                         tab.body.winfo_height()))
+        assert rows[0][:3] == (True, True, True), rows
+        assert all(r[2] and r[3] >= 5 * line for r in rows), rows
+        assert not rows[2][0] and not rows[2][1], rows
+        assert rows[3][:2] == (True, True), rows
+        assert tab.frame.pack_slaves()[0] is top     # back in its place
+        var = tk.StringVar(master=root, value="")
+        lbl = tk.Label(tab.body, textvariable=var)
+        fits = [True]
+        sync = pack_while_set(lbl, var, lambda: fits[0], side="top")
+        assert not lbl.winfo_manager()
+        var.set("now it says something")
+        assert lbl.winfo_manager() == "pack"
+        fits[0] = False                      # no room left: it steps aside
+        sync()
+        assert not lbl.winfo_manager()
+        fits[0] = True
+        sync()
+        assert lbl.winfo_manager() == "pack"
+        var.set("")
+        assert not lbl.winfo_manager()
+    finally:
+        root.destroy()
+
+
+@self_test(needs_source=True)
+def t_534_ci_frames_name_both_addresses(ctx):
+    """5.3.4 CI (Windows): every Ethernet or ARP layer the file builds
+    (tests and app) names its addresses. Left out, scapy reads them from
+    the default interface, which fails on Windows without Npcap and can
+    send an ARP request. Building from bytes (decoding) is fine."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    need = {"Ether": ("src", "dst"), "ARP": ("hwsrc",)}
+    bad = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or node.args:
+            continue
+        fn = node.func
+        name = fn.id if isinstance(fn, ast.Name) else \
+            fn.attr if isinstance(fn, ast.Attribute) else ""
+        if name not in need:
+            continue
+        kws = {k.arg for k in node.keywords}
+        if None in kws:                            # **kwargs: can't tell
+            continue
+        missing = [k for k in need[name] if k not in kws]
+        if missing:
+            bad.append(f"line {node.lineno}: {name}() without "
+                       f"{', '.join(missing)}")
+    assert not bad, bad
+
+
+@self_test()
+def t_534_ci_lan_frames_name_their_source(ctx):
+    """5.3.4 CI: LAN discovery names our own MAC on the chosen interface
+    in every frame, and sends nothing when it can't read that address
+    (no capture driver) instead of letting scapy guess an interface."""
+    if not ctx.scapy_ok:
+        return "skip"
+    g = globals()
+    real = {k: g[k] for k in ("sendp", "_iface_mac")}
+    sent = []
+
+    def fake_send(p, **kw):
+        sent.extend(p if isinstance(p, list) else [p])
+    mac = "02:00:00:00:00:0a"
+    try:
+        g["sendp"] = fake_send
+        g["_iface_mac"] = lambda iface: ""
+        sc = LanScanner("eth9", "192.0.2.10")
+        sc.subnet = ipaddress.ip_network("192.0.2.8/30")
+        sc._sweep()
+        assert sent == [] and sc.sweeps == 0 and sc.errors == 1, sent
+        g["_iface_mac"] = lambda iface: mac
+        sc._sweep()
+    finally:
+        g.update(real)
+    assert sc.sweeps == 1 and len(sent) == 3, sent   # ARP .9, mDNS, SSDP
+    for p in sent:
+        assert Ether(bytes(p)).src == mac, p.summary()
+    arp = Ether(bytes(sent[0]))[ARP]
+    assert arp.hwsrc == mac and arp.psrc == "192.0.2.10" and \
+        arp.pdst == "192.0.2.9", arp.summary()
 
 
 @self_test()

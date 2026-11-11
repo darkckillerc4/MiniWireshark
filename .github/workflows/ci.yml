@@ -55,12 +55,41 @@ jobs:
       - name: Install capture library
         run: python -m pip install "scapy>=2.5" psutil
       - name: GUI test
+        if: matrix.os != 'ubuntu-22.04'
         env:
           MINIWIRESHARK_DATA: ${{ runner.temp }}/mw-data
           MINIWIRESHARK_CONFIG: ${{ runner.temp }}/mw-config.json
         run: |
           sudo apt-get install -y xvfb > /dev/null
           xvfb-run -a -s "-screen 0 1920x1080x24" python -X faulthandler miniwireshark.py --gui-test
+      - name: GUI test (under gdb, for the native backtrace of the crash)
+        # 22.04 only: the run died with "Segmentation fault" and no output.
+        # gdb follows the start's exec into the compiled copy; on a crash
+        # it prints every thread's native stack and the loaded libraries,
+        # then lets the signal through so faulthandler prints the Python
+        # stack too. The exit code is the test's (255 after a crash).
+        if: matrix.os == 'ubuntu-22.04'
+        env:
+          MINIWIRESHARK_DATA: ${{ runner.temp }}/mw-data
+          MINIWIRESHARK_CONFIG: ${{ runner.temp }}/mw-config.json
+          PYTHONUNBUFFERED: "1"
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y xvfb gdb > /dev/null
+          python -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.TkVersion, tkinter.Tcl().eval('info patchlevel'))"
+          ldd "$(python -c 'import _tkinter; print(_tkinter.__file__)')" | grep -Ei 'tk|tcl|xft|fontconfig|freetype|x11'
+          fc-match sans-serif; fc-list | wc -l
+          cat > "$RUNNER_TEMP/crash.gdb" <<'EOF'
+          set pagination off
+          handle SIGPIPE nostop noprint pass
+          run
+          if $_isvoid($_exitcode)
+            thread apply all bt 30
+            info sharedlibrary
+            continue
+          end
+          EOF
+          xvfb-run -a -s "-screen 0 1920x1080x24" gdb -q -batch -return-child-result \
+            -x "$RUNNER_TEMP/crash.gdb" --args python -X faulthandler miniwireshark.py --gui-test
 
   windows:
     # the Windows-only paths (compiled start and hand-off, notifier,
