@@ -26426,6 +26426,10 @@ class PacketRing:
         self._seg = None
         self._stop = False
         self._lock = threading.Lock()
+        # set while the window's thread wants the lock (a wipe): a plain
+        # Lock is not fair, so a busy writer taking it straight back
+        # after each packet could keep the window waiting for seconds
+        self._lock_wanted = threading.Event()
         # (review 7) every packet put gets a number; a wipe drops what was
         # queued before it instead of waiting for the writer to reach it
         self._seq = itertools.count(1)
@@ -26506,6 +26510,8 @@ class PacketRing:
                 continue
             if item is None:
                 break
+            while self._lock_wanted.is_set():
+                time.sleep(0.002)       # let the window's thread in first
             try:
                 with self._lock:
                     self._handle(item)
@@ -26603,9 +26609,13 @@ class PacketRing:
         dropped: it used to wait up to 10 s on the window's thread for
         the writer, then wipe inline anyway."""
         upto = next(self._seq)
-        with self._lock:
-            self._drop_upto = upto
-            self._handle(("wipe", threading.Event()))
+        self._drop_upto = upto          # the writer drops older ones now
+        self._lock_wanted.set()
+        try:
+            with self._lock:
+                self._handle(("wipe", threading.Event()))
+        finally:
+            self._lock_wanted.clear()
 
     def stop(self, wait=3.0):
         self._stop = True
@@ -85228,7 +85238,9 @@ def t_r7_packet_ring_wipe_never_waits(ctx):
         assert pr.flush(30)
     finally:
         pr.stop()
-    assert took < 1.0, f"the wipe waited {took:.1f} s"
+    # a fair hand-over takes a few ms; the unfair lock took 0.5 s median,
+    # up to 3 s, with this writer (CI 3.12 hit 1.8 s)
+    assert took < 0.2, f"the wipe waited {took:.2f} s"
     data = b""
     for name in os.listdir(folder):
         if name.startswith("seg-"):
