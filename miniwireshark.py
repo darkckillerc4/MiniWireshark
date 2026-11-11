@@ -3070,10 +3070,7 @@ def update_check_due(cfg, now=None):
     """At most one automatic check a day (a clock set back counts as
     due, so a wrong date can't stop checks for good)."""
     now = time.time() if now is None else now
-    try:
-        last = float(cfg.get("updates.last_check", 0) or 0)
-    except (TypeError, ValueError):
-        last = 0.0
+    last = _float(cfg.get("updates.last_check", 0))
     return not (0 < last <= now and now - last < UPDATE_CHECK_INTERVAL)
 
 
@@ -8496,7 +8493,12 @@ VIRTUAL_IFACE_WORDS = ("vmware", "virtualbox", "vbox", "hyper-v", "vethernet",
                        "npcap loopback", "loopback", "bluetooth", "wan miniport",
                        "isatap", "teredo", "6to4", "kernel debug", "pseudo",
                        "ifb", "dummy", "lxc", "lxd", "podman", "cni", "flannel",
-                       "kube", "wsl")
+                       "kube", "wsl") + (
+    # court MAC-03: macOS virtual cards (AWDL, low-latency WLAN, Apple's
+    # internal link, the hotspot, 6in4/6to4 tunnels, Internet Sharing's
+    # bridge, virtual machines), matched as whole names
+    "awdl", "llw", "anpi", "ap1", "gif", "stf", "bridge100", "vmenet")
+VIRTUAL_IFACE_TOKENS = VIRTUAL_IFACE_WORDS[-8:]
 VPN_IFACE_WORDS = ("tun", "tap", "wg", "wireguard", "vpn", "openvpn", "utun",
                    "ppp", "ipsec", "tailscale", "zerotier", "nordlynx",
                    "proton", "mullvad", "fortinet", "cisco anyconnect",
@@ -8718,7 +8720,9 @@ def is_vpn_iface(iface):
 
 def is_virtual_iface(iface):
     text = (iface_name(iface) + " " + iface_desc(iface)).lower()
-    return any(w in text for w in VIRTUAL_IFACE_WORDS)
+    return any(re.search(r"(^|[^a-z])" + re.escape(w) + r"\d*($|[^a-z])",
+                         text) if w in VIRTUAL_IFACE_TOKENS else w in text
+               for w in VIRTUAL_IFACE_WORDS)
 
 
 # 5.1.2: categories you corrected, by registrable domain (Settings keeps
@@ -13480,13 +13484,14 @@ def iter_raw_capture(path, notes=None):
     """Yield (raw_bytes, timestamp, linktype) from a .pcap or .pcapng
     file without scapy. Raises ValueError for unknown formats. A classic
     .pcap cut short or with a bad record length keeps what came before
-    and appends PCAP_ENDED_EARLY to `notes` (5.3.4 court WIN-03)."""
+    and appends PCAP_ENDED_EARLY to `notes` (5.3.4 court WIN-03); so
+    does a cut .pcapng."""
     with open(path, "rb") as f:
         head = f.read(4)
         if len(head) < 4:
             raise ValueError("file is empty")
         if head == b"\x0a\x0d\x0d\x0a":
-            yield from _iter_pcapng(f, head)
+            yield from _iter_pcapng(f, head, notes)
             return
         magic_le = struct.unpack("<I", head)[0]
         magics = {0xa1b2c3d4: ("<", 1e-6), 0xd4c3b2a1: (">", 1e-6),
@@ -13517,7 +13522,10 @@ def iter_raw_capture(path, notes=None):
             yield data, last_ts, lt
 
 
-def _iter_pcapng(f, first):
+def _iter_pcapng(f, first, notes=None):
+    def cut():
+        if notes is not None:
+            notes.append(PCAP_ENDED_EARLY)
     end = "<"
     ifaces = []                   # (linktype, ts_scale)
     last_ts = 0.0
@@ -13526,9 +13534,12 @@ def _iter_pcapng(f, first):
         if block_type is None:
             block_type = f.read(4)
             if len(block_type) < 4:
+                if block_type:
+                    cut()
                 return
         lenb = f.read(4)
         if len(lenb) < 4:
+            cut()
             return
         if block_type == b"\x0a\x0d\x0d\x0a":
             bom = f.read(4)
@@ -13545,6 +13556,9 @@ def _iter_pcapng(f, first):
             if blen < 28 or blen > 64 * 1024 * 1024 or blen % 4:
                 raise ValueError("corrupt pcapng section header")
             body = f.read(blen - 12)
+            if len(body) < blen - 12:
+                cut()
+                return
             ifaces = []
             block_type = None
             continue
@@ -13554,6 +13568,7 @@ def _iter_pcapng(f, first):
             raise ValueError("corrupt pcapng block")
         body = f.read(blen - 8)
         if len(body) < blen - 8:
+            cut()
             return
         body = body[:-4]
         block_type = None
@@ -15974,6 +15989,15 @@ def mac_ssid_hidden(name):
     return n in ("<redacted>", "redacted") or n.startswith("you are not")
 
 
+def neighbor_macs(text):
+    """Every MAC in neighbour-table text, as aa:bb:cc:dd:ee:ff."""
+    # court MAC-01: macOS `arp -n` drops leading zeros (0:1a:2b:…)
+    return [_padded_mac(m.group(1)) for m in re.finditer(
+        r"(?<![0-9a-fA-F:-])([0-9a-fA-F]{1,2}([:-])"
+        r"(?:[0-9a-fA-F]{1,2}\2){4}[0-9a-fA-F]{1,2})"
+        r"(?![0-9a-fA-F:-])", text or "")]
+
+
 def os_neighbor_mac(ip):
     """The OS's own ARP/neighbour cache entry for `ip` (no traffic sent)."""
     if not ip:
@@ -15985,14 +16009,9 @@ def os_neighbor_mac(ip):
             r = run_console(cmd, timeout=5)
         except (OSError, subprocess.SubprocessError):
             continue
-        # court MAC-01: macOS `arp -n` drops leading zeros (0:1a:2b:…)
-        m = re.search(r"(?<![0-9a-fA-F:-])([0-9a-fA-F]{1,2}([:-])"
-                      r"(?:[0-9a-fA-F]{1,2}\2){4}[0-9a-fA-F]{1,2})"
-                      r"(?![0-9a-fA-F:-])", r.stdout or "")
-        if m:
-            mac = _padded_mac(m.group(1))
-            if is_unicast_mac(mac):
-                return mac
+        macs = neighbor_macs(r.stdout)
+        if macs and is_unicast_mac(macs[0]):
+            return macs[0]
     return ""
 
 
@@ -19871,10 +19890,10 @@ class BaselineEngine:
         if len(snapshot) == 5:
             return self._check_v2(snapshot)
         vals, mean, std, n = snapshot
-        need = int(self.config.get("alerts.baseline_min_minutes", 15))
+        need = _int(self.config.get("alerts.baseline_min_minutes", 15), 15)
         if n < need:
             return []
-        mult = float(self.config.get("alerts.chatty_multiplier", 4))
+        mult = _float(self.config.get("alerts.chatty_multiplier", 4), 4)
         out = []
         for f, floor in self.FLOORS.items():
             v, m, s = vals.get(f, 0), mean.get(f, 0.0), std.get(f, 0.0)
@@ -19886,8 +19905,8 @@ class BaselineEngine:
         vals, mean, std, _n, info = snapshot
         if info["total"] < BASELINE_PRIOR_MINUTES:
             return []                  # a brand-new device settles first
-        need = int(self.config.get("alerts.baseline_min_minutes", 15))
-        mult = float(self.config.get("alerts.chatty_multiplier", 4))
+        need = _int(self.config.get("alerts.baseline_min_minutes", 15), 15)
+        mult = _float(self.config.get("alerts.chatty_multiplier", 4), 4)
         own = info["own"] >= need
         _pm, s_up, s_down, s_n = KIND_PRIORS.get(info["kind"],
                                                  KIND_PRIORS["unknown"])
@@ -19911,7 +19930,7 @@ class BaselineEngine:
     def state(self, key):
         """The learning state of one device, in words."""
         b = self.devices.get(key)
-        need = int(self.config.get("alerts.baseline_min_minutes", 15))
+        need = _int(self.config.get("alerts.baseline_min_minutes", 15), 15)
         return (b or DeviceBaseline()).state_text(need)
 
     def reset(self):
@@ -22964,9 +22983,10 @@ class NetworkModel:
                     dev.remote_ips.add(rip)
             if role == "sent":
                 if dev.live and dev.traffic_baseline_flag(
-                        ts, float(self.config.get("alerts.chatty_multiplier",
-                                                  4)),
-                        float(self.config.get("alerts.chatty_min_rate", 3))):
+                        ts, _float(self.config.get(
+                            "alerts.chatty_multiplier", 4), 4),
+                        _float(self.config.get("alerts.chatty_min_rate", 3),
+                               3)):
                     a = self._alert(self.alerts.chatty_device(dev))
                     if a and not a.updated:
                         self.push_timeline(
@@ -22975,16 +22995,16 @@ class NetworkModel:
                             ("device", dev.key), dev.key)
             if dev.reactivated_now:
                 dev.reactivated_now = False
-                window = float(self.config.get(
-                    "alerts.reconnect_window_minutes", 30)) * 60
+                window = _float(self.config.get(
+                    "alerts.reconnect_window_minutes", 30), 30) * 60
                 recent = [t for t in dev.reactivations if ts - t <= window]
                 if dev.live:
                     self.push_timeline("device back", "INFO",
                                        f"{dev.display_name()} came back "
                                        f"online", ("device", dev.key),
                                        dev.key)
-                if len(recent) >= int(self.config.get(
-                        "alerts.reconnect_count", 5)):
+                if len(recent) >= _int(self.config.get(
+                        "alerts.reconnect_count", 5), 5):
                     self._alert(self.alerts.reconnect_cycle(
                         dev, len(recent), window))
         return out[0], out[1]
@@ -23087,7 +23107,8 @@ class NetworkModel:
             # attack even when the router itself has stopped answering ARP
             both = both + sorted(reg.gw_macs)[:1]
             fighting = True
-        if flips >= int(self.config.get("alerts.arp_flip_threshold", 4)) \
+        if flips >= _int(self.config.get("alerts.arp_flip_threshold", 4),
+                         4) \
                 or fighting:
             # (5.3.4 review) ARP flux: the same two MACs, neither the
             # router's, also both answering for another address lately
@@ -23547,7 +23568,7 @@ class NetworkModel:
         dq.append((ts, f.remote_ip))
         while dq and ts - dq[0][0] > 600:
             dq.popleft()
-        thr = int(self.config.get("alerts.reset_threshold", 40))
+        thr = _int(self.config.get("alerts.reset_threshold", 40), 40)
         if len(dq) >= thr:
             dev = self.registry.by_key.get(f.device_key)
             if dev and dev.live:
@@ -24140,8 +24161,8 @@ class NetworkModel:
             if dev.state != STATE_ACTIVE or not dev.live:
                 continue
             if dev.confidence in (CONFIDENCE_LOW, CONFIDENCE_UNCONFIRMED) \
-                    and dev.packets >= int(self.config.get(
-                        "alerts.unknown_min_packets", 5)) and \
+                    and dev.packets >= _int(self.config.get(
+                        "alerts.unknown_min_packets", 5), 5) and \
                     not dev.expected:
                 self._alert(self.alerts.unknown_device(dev))
         yield "unknown devices"
@@ -24188,7 +24209,7 @@ class NetworkModel:
             servers = [ip for ip, *_ in self.dns.summary_rows()[:3]]
             self._alert(self.alerts.dns_failures(rate, n, servers))
         med, n = self.dns.median_latency(now)
-        slow = float(self.config.get("dns.slow_ms", 800))
+        slow = _float(self.config.get("dns.slow_ms", 800), 800)
         if med is not None and n >= 10 and med >= slow:
             rows = self.dns.summary_rows()
             self._alert(self.alerts.dns_slow(med, n, rows[0][0] if rows
@@ -24199,7 +24220,8 @@ class NetworkModel:
             self._alert(self.alerts.dns_multi(ext))
 
     def _check_broadcast(self, now):
-        thr = float(self.config.get("alerts.broadcast_pps_threshold", 400))
+        thr = _float(self.config.get("alerts.broadcast_pps_threshold",
+                                     400), 400)
         pps = self.metrics.series["bcast_packets"].total_window(
             1, 10, now, skip_current=True) / 10.0
         if pps >= thr:
@@ -24214,8 +24236,8 @@ class NetworkModel:
             self._alert(self.alerts.broadcast_storm(pps, who))
 
     def _check_scans(self, now):
-        pt = int(self.config.get("alerts.scan_ports_threshold", 60))
-        ht = int(self.config.get("alerts.scan_hosts_threshold", 40))
+        pt = _int(self.config.get("alerts.scan_ports_threshold", 60), 60)
+        ht = _int(self.config.get("alerts.scan_hosts_threshold", 40), 40)
         self.scans.expire(now)
         for key, dq in list(self.scans.attempts.items()):
             while dq and now - dq[0][0] > 60:
@@ -31356,6 +31378,16 @@ def _int(v, default=0):
         return int(float(str(v)))
     except (TypeError, ValueError, OverflowError):
         return default
+
+
+def _float(v, default=0.0):
+    """A setting as a finite number; `default` when it is empty, not a
+    number or infinite (5.3.4 court WIN-01, as _int)."""
+    try:
+        f = float(str(v))
+    except (TypeError, ValueError):
+        return default
+    return f if math.isfinite(f) else default
 
 
 def _flow_of(w, kw=None):
@@ -41607,7 +41639,7 @@ class HealthTab(BaseTab):
             fnt = Charts.font(c, ("TkDefaultFont", 7))
             widest = max(fnt.measure(x) for x in DNS_BUCKET_LABELS) + 6
             step = max(1, int(math.ceil(widest / max(1.0, bw))))
-            slow = float(self.app.config.get("dns.slow_ms", 800))
+            slow = _float(self.app.config.get("dns.slow_ms", 800), 800)
             for i, v in enumerate(counts):
                 x0 = 10 + i * bw + 3
                 x1 = 10 + (i + 1) * bw - 3
@@ -50171,8 +50203,8 @@ class MiniWireshark:
             pr.stop()
             self.packet_ring = None
         elif pr is not None:
-            pr.cap = max(20, int(self.config.get("history.packet_ring_mb",
-                                                 200))) * 1024 * 1024
+            pr.cap = max(20, _int(self.config.get("history.packet_ring_mb",
+                                                  200), 200)) * 1024 * 1024
             pr.store = self.history
 
     def _bind_inspector(self):
@@ -50219,8 +50251,8 @@ class MiniWireshark:
         mode, _why = self.effective_perf_mode()
         cfg = self.config
         self.deep.configure(
-            mode, cores=int(cfg.get("performance.full_power_cores", 2)),
-            ram_mb=int(cfg.get("performance.ram_cap_mb", 1536)),
+            mode, cores=_int(cfg.get("performance.full_power_cores", 2), 2),
+            ram_mb=_int(cfg.get("performance.ram_cap_mb", 1536), 1536),
             policy=cfg.get("performance.shedding", "Smart"),
             my_ips=self.model.my_ips,
             prefer_process=cfg.get("performance.deep_runner",
@@ -50381,7 +50413,7 @@ class MiniWireshark:
             problem = tr("the DNS server didn't answer the test lookup")
         med, _n = m.dns.median_latency(now)
         rate, nq = m.dns.failure_rate(now)
-        slow = float(self.config.get("dns.slow_ms", 800))
+        slow = _float(self.config.get("dns.slow_ms", 800), 800)
         if problem is None and nq >= 10 and rate >= 0.3:
             problem = tr("%d%% of recent website lookups failed") % \
                 round(rate * 100)
@@ -50679,11 +50711,7 @@ class MiniWireshark:
         since = now - STORY_DAYS * 86400 if store is not None else 0.0
         last = None
         if live:
-            try:
-                last = float(self.config.get("general.story_seen", 0.0)
-                             or 0.0)
-            except (TypeError, ValueError):
-                last = 0.0
+            last = _float(self.config.get("general.story_seen", 0.0))
         return since, now, store, last
 
     def request_story(self, force=False):
@@ -50710,10 +50738,7 @@ class MiniWireshark:
     def _story_done(self, story):
         """On the Tk thread: keep it, and redraw where it is shown."""
         self._story_at = time.monotonic()
-        try:
-            seen = float(self.config.get("general.story_seen", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            seen = 0.0
+        seen = _float(self.config.get("general.story_seen", 0.0))
         last = story.get("last_looked")
         if story.get("model_id") != id(self.model) or \
                 (last is not None and float(last) < seen):
@@ -54122,7 +54147,7 @@ proc ::mw_explicit_fonts {top names} {
                 return
             self.connectors = ConnectorManager(
                 specs, self.vault, self._connector_result,
-                float(self.config.get("connectors.interval", 60)))
+                _float(self.config.get("connectors.interval", 60), 60))
             self.connectors.start()
         else:
             self.connectors.update(specs)
@@ -54398,7 +54423,7 @@ proc ::mw_explicit_fonts {top names} {
             self.model, wifi=dict(wp.last) if wp is not None and wp.last
             else None, health=dict(self.model.health)
             if self.data_mode == "live" else {},
-            dns_slow_ms=float(self.config.get("dns.slow_ms", 800)),
+            dns_slow_ms=_float(self.config.get("dns.slow_ms", 800), 800),
             offline=self.data_mode in ("offline", "session"),
             namer=self.short_device_name, window=window,
             wifi_hidden=getattr(wp, "hidden", "") if wp is not None else "",
@@ -54430,8 +54455,8 @@ proc ::mw_explicit_fonts {top names} {
         wp = self._wifi_view()
         wifi = dict(wp.last) if wp is not None and wp.last else None
         if which == "dns":
-            return dns_facts(m, dns_slow_ms=float(
-                self.config.get("dns.slow_ms", 800)), offline=offline)
+            return dns_facts(m, dns_slow_ms=_float(
+                self.config.get("dns.slow_ms", 800), 800), offline=offline)
         if which == "ipv6":
             return ipv6_facts(m, offline=offline)
         if which == "connect":
@@ -54973,8 +54998,8 @@ proc ::mw_explicit_fonts {top names} {
         with self.gate:               # called from the prober thread
             self.model.note_probes(probes, time.time() + 20)
         return {"gateway": gw, "internet_target": target, "dns_server": dns,
-                "interval": int(self.config.get("health.interval_seconds",
-                                                30))}
+                "interval": _int(self.config.get("health.interval_seconds",
+                                                 30), 30)}
 
     def _on_health_result(self, res):
         m = self.model
@@ -55059,7 +55084,7 @@ proc ::mw_explicit_fonts {top names} {
                                           "yet.")
         med, n = m.dns.median_latency(now)
         rate, nq = m.dns.failure_rate(now)
-        slow = float(self.config.get("dns.slow_ms", 800))
+        slow = _float(self.config.get("dns.slow_ms", 800), 800)
         if "dns_ok" in h and not h["dns_ok"]:
             out["dns"] = ("Needs attention", f"The DNS server "
                                              f"{h.get('dns_server')} didn't "
@@ -59144,7 +59169,7 @@ proc ::mw_explicit_fonts {top names} {
             ret = self.config.get("history.retention", "30 days")
             days = HISTORY_RETENTION.get(ret)
             if days is None:
-                days = int(self.config.get("history.custom_days", 14))
+                days = _int(self.config.get("history.custom_days", 14), 14)
             if days:
                 history.prune(days)
 
@@ -75889,7 +75914,7 @@ def t_update_check_once_a_day(ctx):
             if t.name == "update-check":
                 t.join(5)
         assert len(sent) == 1, sent
-        assert float(stub.config.get("updates.last_check")) >= now
+        assert _float(stub.config.get("updates.last_check")) >= now
         # saved, so the next start knows too
         with open(stub.config.path, encoding="utf-8") as f:
             assert json.load(f)["updates"]["last_check"] >= now
@@ -84850,17 +84875,101 @@ def t_534_court_bad_setting_numbers(ctx):
     """5.3.4 court WIN-01: a packets-kept setting that is empty, not a
     number, infinite or negative no longer stops the window from opening
     or a capture file from being read: the default (or the 500 floor)
-    is used. Every read of the setting goes through _int."""
+    is used. Every number setting is read through _int or _float."""
     for bad in ("abc", "", None, float("inf"), float("nan"), [3]):
         assert _int(bad, 5000) == 5000, bad
     assert _int("2500", 5000) == 2500 and _int(2500.7, 5000) == 2500
     assert max(500, _int(-5, 5000)) == 500
     assert _int("") == 0 and _int("12") == 12          # Tk option values
+    for bad in ("abc", "", None, float("inf"), float("nan"), "-inf"):
+        assert _float(bad, 800) == 800, bad
+    assert _float("4.5", 4) == 4.5 and _float(3) == 3.0
     with open(SCRIPT_PATH, encoding="utf-8") as f:
         src = f.read()
-    raw = re.findall(r"\bint\(\s*(?:self\.)?(?:config|cfg)\.get\(\s*"
-                     r"\"capture\.max_stored_events\"", src)
+    raw = re.findall(r"\b(?:int|float)\(\s*(?:\w+\.)*(?:config|cfg)"
+                     r"\.get\(", src)
     assert not raw, raw
+
+
+@self_test()
+def t_534_court_real_neighbor_table(ctx):
+    """5.3.4 court batch 3 (real OS, no mocks): on macOS and Linux the
+    real neighbour table, read with os_neighbor_mac's commands and parser,
+    gives only aa:bb:cc:dd:ee:ff addresses (an empty table is fine), and
+    os_neighbor_mac answers one of its addresses the same way. Skipped
+    on Windows."""
+    if IS_WINDOWS:
+        return "skip"
+    for cmd in (["ip", "neigh", "show"], ["arp", "-an"]):
+        try:
+            out = run_console(cmd, timeout=5).stdout or ""
+        except (OSError, subprocess.SubprocessError):
+            continue
+        for mac in neighbor_macs(out):
+            assert re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac), \
+                (cmd, mac)
+        ips = re.findall(r"\b\d+\.\d+\.\d+\.\d+\b", out)
+        mac = os_neighbor_mac(ips[0]) if ips else ""
+        assert mac == "" or re.fullmatch(
+            r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac), mac
+        return None
+    return "skip"
+
+
+@self_test()
+def t_534_court_mac_virtual_cards(ctx):
+    """5.3.4 court MAC-03: macOS's virtual cards (awdl0, llw0, anpi0, ap1,
+    gif0, stf0, bridge100, vmenet0) are virtual by whole name only; with
+    a full-tunnel VPN on utun0 carrying the default route, en0 is picked
+    off Windows too, and only route_pick does that."""
+    N = types.SimpleNamespace
+    for name in ("awdl0", "llw0", "anpi0", "anpi1", "ap1", "gif0", "stf0",
+                 "bridge100", "vmenet0"):
+        assert is_virtual_iface(N(name=name, description="")), name
+    for name in ("en0", "en1", "gifted", "llwx", "capstf", "bridge0",
+                 "Wi-Fi"):
+        assert not is_virtual_iface(N(name=name, description="")), name
+    cards = [N(name="utun0", description="", ip="10.8.0.2"),
+             N(name="en0", description="", ip="192.168.1.5"),
+             N(name="awdl0", description="", ip="169.254.3.4")]
+
+    def order():
+        return [r["name"] for r in score_interfaces("utun0", "192.168.1.1")]
+    with _b9_patched(globals(), IS_WINDOWS=False,
+                     conf=N(ifaces={c.name: c for c in cards})), \
+            _b9_patched(OPTIONAL_MODULES, psutil=None), \
+            _b9_patched(FEATURES, route_pick=True):
+        assert order() == ["en0", "utun0", "awdl0"], order()
+        FEATURES["route_pick"] = False
+        assert order()[0] == "utun0", order()
+
+
+@self_test()
+def t_534_court_pcapng_ended_early(ctx):
+    """5.3.4 court WIN-03 for pcapng: a .pcapng cut inside a block, its
+    length or its type keeps the packets before it and says the file
+    ended early, as a classic .pcap does; a whole file says nothing."""
+    def blk(t, body):
+        n = 12 + len(body)
+        return struct.pack("<II", t, n) + body + struct.pack("<I", n)
+    shb = blk(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    idb = blk(1, struct.pack("<HHI", 1, 0, 65535))
+    epb = blk(6, struct.pack("<IIIII", 0, 0, 0, 60, 60) + bytes(60))
+    whole = shb + idb + epb + epb
+    p = ctx.path("court-cut.pcapng")
+    for tail, note in ((b"", []), (epb[:30], [PCAP_ENDED_EARLY]),
+                       (epb[:6], [PCAP_ENDED_EARLY]),
+                       (epb[:2], [PCAP_ENDED_EARLY])):
+        with open(p, "wb") as f:
+            f.write(whole + tail)
+        notes = []
+        assert len(list(iter_raw_capture(p, notes))) == 2, tail
+        assert notes == note, (len(tail), notes)
+    with open(p, "wb") as f:
+        f.write(shb[:20])
+    notes = []
+    assert list(iter_raw_capture(p, notes)) == [] and \
+        notes == [PCAP_ENDED_EARLY], notes
 
 
 def _court_pcap(path, records, tail=b""):
@@ -85066,8 +85175,9 @@ def _court_update_body():
 @self_test()
 def t_534_court_update_through_symlink(ctx):
     """5.3.4 court NIX-04: a program started through a symlink is updated
-    where it really is, and the link survives (simulated where symlinks
-    need privileges: realpath is mocked)."""
+    where it really is, and the link survives (a real symlink off
+    Windows; simulated where symlinks need privileges: realpath is
+    mocked)."""
     folder = ctx.path(f"court-link-{uuid.uuid4().hex[:6]}")
     os.makedirs(os.path.join(folder, "real"))
     target = os.path.join(folder, "real", "miniwireshark.py")
@@ -85078,6 +85188,8 @@ def t_534_court_update_through_symlink(ctx):
     try:
         os.symlink(target, link)
     except (OSError, NotImplementedError):
+        if not IS_WINDOWS:
+            raise
         real_link = False
         with open(link, "w", encoding="utf-8") as f:
             f.write("stands for the link\n")
@@ -89428,7 +89540,7 @@ def gt_534_story_mode(app, ctx):
             "1 change since you last looked."
         app._select_tab("dash")
         app._on_tab_changed()
-        assert float(app.config.get("general.story_seen")) == \
+        assert _float(app.config.get("general.story_seen")) == \
             fake["built"]
         assert fake["fresh"] == 0 and not any(
             it["fresh"] for _d, its in fake["days"] for it in its)
