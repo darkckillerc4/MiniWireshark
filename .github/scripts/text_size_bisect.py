@@ -25,6 +25,9 @@ def nums(text):
     return [float(x) for x in text.split(",") if x.strip()]
 
 
+GUARD = 0.85
+
+
 def main(commits):
     base = Path(os.environ.get("RUNNER_TEMP") or tempfile.mkdtemp())
     base = base / "text-size-bisect"
@@ -75,12 +78,32 @@ def main(commits):
             statistics.median(busy), min(busy), statistics.median(frz)))
     table = "\n".join(rows)
     print(table)
+    # regression guard (5.3.4): the head commit, last, must stay at most
+    # GUARD x the first (reference) commit's median busy on the same
+    # runner. Measured: 0.70 (3.14) and 0.75 (3.12) of f0c5932; undoing
+    # the round 4-5 savings would bring it back to about 1.0.
+    verdict = ""
+    ref = [b for bs, _f in runs[names[0]] for b in bs]
+    head = [b for bs, _f in runs[names[-1]] for b in bs]
+    failed = 0
+    if len(names) > 1:
+        if not ref or not head:
+            verdict = "FAIL: no numbers for %s or %s" % (names[0], names[-1])
+            failed = 1
+        else:
+            ratio = statistics.median(head) / statistics.median(ref)
+            failed = int(ratio > GUARD)
+            verdict = "%s: %s is %.2f x %s (limit %.2f)" % (
+                "FAIL" if failed else "PASS", names[-1], ratio, names[0],
+                GUARD)
+        print(verdict)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as f:
             f.write("### Text-size change, Python %s, Tk %s\n\n%s\n" % (
                 sys.version.split()[0], tk, table))
-    return 0
+            f.write("\n%s\n" % verdict)
+    return failed
 
 
 if __name__ == "__main__":
