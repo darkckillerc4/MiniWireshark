@@ -56,6 +56,11 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - Every tab, dialog and settings page fits from 1024×768 to 1920×1080 in all three languages, both themes and four text sizes (the layout check found 51 kinds of problem; now none).
 - Errors that used to vanish are logged or shown. The Dashboard and Health always agree. A device has one name everywhere.
 - History on a network folder opens. A program on this computer keeps its name when an old connection ends.
+- **Ubuntu 22.04:** the window no longer crashes while it opens. Ubuntu 22.04's font library crashes Tk when it draws a colour emoji; MiniWireshark now leaves colour fonts out there, so emoji show in plain form.
+- **Repair's quick self-test** takes about 20 seconds instead of up to 6 minutes. It used to run nearly the whole self-test (344 tests). It now runs 62: the core checks, plus the tests for each part Repair looks at (program components, data folder, history database, capture, settings file, update checks). It no longer checks the program's own code, layouts or translations, because Repair can't change those. `--self-test` still runs everything.
+- A Windows console with an old code page no longer stops MiniWireshark with a text error; a character it can't show is printed as "?".
+- On a small screen, an Inspector switched on in Settings now makes room for the tabs when the window opens narrow, not only when you make the window narrower.
+- A text-size change is quicker: the tables on tabs you can't see are fitted when you open their tab.
 
 **Not in this release**
 

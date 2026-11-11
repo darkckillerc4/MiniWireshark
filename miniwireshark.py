@@ -3273,6 +3273,11 @@ def _install_npcap(loader, state):
 # ============================================================================
 #  2b.  Loading window (first-run / every-run preparation)
 # ============================================================================
+def _suppress_tcl(fn, *args):
+    with contextlib.suppress(tk.TclError):
+        fn(*args)
+
+
 class LoaderWindow(tk.Frame):
     """Runtime Manager & Welcome Center.
 
@@ -3596,11 +3601,34 @@ class LoaderWindow(tk.Frame):
             kind, ("● Checking", "#c8d2e0", "#2b3a55"))
         self.health_lbl.configure(text=text, bg=bg, fg=fg)
 
+    def _bring_forward(self):
+        """5.3.4 (review): a question the start waits for is shown where
+        the person sees it: the window comes back from the taskbar, in
+        front of other windows, with the keyboard on it. (Windows can
+        start a second process's window behind the one in front, and the
+        start then waits on a card nobody sees.) -> True when it could"""
+        top = self.winfo_toplevel()
+        try:
+            if top.state() in ("iconic", "withdrawn"):
+                top.deiconify()
+            top.lift()
+            # in front for a moment: Windows otherwise only flashes the
+            # taskbar button of a window that wasn't the foreground one
+            top.attributes("-topmost", True)
+            top.after(600, lambda: _suppress_tcl(
+                top.attributes, "-topmost", False))
+            top.focus_force()
+            return True
+        except tk.TclError:
+            return False
+
     def _show_question(self, kind, kw, ev, box):
         def answer(value):
             box[0] = value
             self._clear_card()
             ev.set()
+        self._bring_forward()
+        self.status_var.set(translate_text("Waiting for your choice"))
         if kind == "consent":
             f = self._card_frame("Set up MiniWireshark's own Python? "
                                  "(recommended)", kw.get("text", ""))
@@ -31738,12 +31766,17 @@ def focus_ring(widget, color="#2b7de9", width=2):
 
 
 def _walk_class(root, cls):
+    """The widgets of class `cls` under `root` (root included). 5.3.4 CI:
+    from tkinter's own table of children, as winfo_children() builds it
+    (it skips the widgets Python didn't create), without asking Tk once
+    per widget: ~700 round trips per walk, 15 walks in a text-size
+    change."""
     stack = [root]
     while stack:
         w = stack.pop()
         try:
-            stack.extend(w.winfo_children())
-        except tk.TclError:
+            stack.extend(list(w.children.values()))
+        except (AttributeError, RuntimeError):
             continue
         if isinstance(w, cls):
             yield w
@@ -34589,6 +34622,9 @@ def enable_sorting(tree, on_sort=None):
     return state
 
 
+FIT_ROUNDS = 6
+
+
 def make_scrollable(parent, bg="#ffffff", fit_width=False):
     """A frame that scrolls vertically (wheel, scrollbar). → (outer to
     pack, inner to fill). fit_width: as wide as its content."""
@@ -34612,16 +34648,36 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
         except tk.TclError:
             pass
 
+    # 5.3.4 CI (macOS): the self-test's update() of a fit-width frame
+    # never returned. Each resize handler counts its calls (the test
+    # reports them), and a fit that keeps changing the width it just set,
+    # more than FIT_ROUNDS times before Tk is idle, stops for that round
+    # instead of resizing for ever.
+    counts = {"inner": 0, "canvas": 0, "fits": 0, "held": 0}
+    rounds = {"n": 0, "job": None}
+
+    def round_over():
+        rounds["n"], rounds["job"] = 0, None
+
     def inner_conf(_e=None):
+        counts["inner"] += 1
         canvas.configure(scrollregion=canvas.bbox("all"))
         if fit_width:
             want = inner.winfo_reqwidth()
             # "10c" until a width is set: winfo_pixels reads any unit
             if abs(canvas.winfo_pixels(canvas.cget("width")) - want) > 2:
-                canvas.configure(width=want)
+                if rounds["n"] < FIT_ROUNDS:
+                    rounds["n"] += 1
+                    counts["fits"] += 1
+                    canvas.configure(width=want)
+                    if rounds["job"] is None:
+                        rounds["job"] = canvas.after(250, round_over)
+                else:
+                    counts["held"] += 1
         show_bar()
 
     def canvas_conf(e):
+        counts["canvas"] += 1
         canvas.itemconfigure(win, width=e.width)
         show_bar()
     inner.bind("<Configure>", inner_conf)
@@ -34653,6 +34709,7 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
     outer.bind("<Enter>", bind)
     outer.bind("<Leave>", unbind)
     outer.canvas = canvas
+    outer.fit_counts = counts
     return outer, inner
 
 
@@ -48363,6 +48420,10 @@ class MiniWireshark:
         if getattr(self, "_theme_pending", None):
             # a theme change is still recolouring the hidden tabs
             self.finish_theme(self.tabs.get(cur))
+        if getattr(self, "_fit_pending", None) and self.tabs.get(cur):
+            # and a text-size change left its tables to fit when shown
+            self.root.after_idle(lambda t=self.tabs.get(cur):
+                                 self.finish_text_size(t))
         prev = getattr(self, "_shown_tab_name", None)
         if cur != prev:
             self._shown_tab_name = cur
@@ -49357,6 +49418,7 @@ class MiniWireshark:
         if remember:
             # the person's choice: no automatic showing or hiding after it
             self._insp_auto_hidden = False
+            self._insp_by_person = show
             self.config.set("appearance.inspector", show)
             self.config.save()
         if show:
@@ -49371,10 +49433,18 @@ class MiniWireshark:
         to the tabs and gives it back when it is wide again; the setting
         stays as the person left it."""
         lim = px(self.INSPECTOR_MIN_WINDOW)
+        if total < 300:
+            return                      # not laid out yet
         prev = getattr(self, "_body_w_prev", None)
         self._body_w_prev = total
-        if prev is None or total < 300:
-            return
+        if prev is None:
+            # 5.3.4 CI (1024x768 Windows runner): a window that opens
+            # narrow never crossed the line, so an Inspector switched on in
+            # Settings stayed squeezed on a small laptop. The first width
+            # counts as coming from wide, unless the person opened the
+            # Inspector in this narrow window themselves.
+            prev = lim if self.inspector_visible and not getattr(
+                self, "_insp_by_person", False) else total
         if self.inspector_visible and total < lim <= prev:
             self.toggle_inspector(False, remember=False)
             self._insp_auto_hidden = True
@@ -50892,13 +50962,14 @@ class MiniWireshark:
                         "Diagnostics.")
 
     def _repair_selftest(self, timeout=120):  # the 2 minutes below
-        """5.3.4 CI: the core tests only. It ran `--self-test --quick`, 344
-        of the 355 tests (the code checks included), which took 6 minutes
-        on a Windows runner (105 s on Linux) and kept Repair "Working…" for
-        all of it; the core takes seconds."""
+        """5.3.4 CI: the core tests and the tests of each part a person
+        repairs (REPAIR_AREAS). It ran `--self-test --quick`, 344 of the
+        355 tests (the code checks included), which took 6 minutes on a
+        Windows runner (105 s on Linux) and kept Repair "Working…" for all
+        of it; this set takes about 20 s there."""
         try:
             r = subprocess.run(self_cmd(SELF_TEST_FLAG,
-                                        ",".join(CORE_SELF_TESTS)),
+                                        ",".join(REPAIR_SELF_TESTS)),
                                capture_output=True, text=True,
                                encoding="utf-8", errors="replace",
                                env=dict(os.environ, PYTHONIOENCODING="utf-8"),
@@ -52444,6 +52515,7 @@ proc ::mw_retheme {w map fgnew deffg} {
         if not defer:
             for _ in steps:
                 pass
+            self.finish_text_size()
             return
 
         def step():
@@ -52476,13 +52548,43 @@ proc ::mw_retheme {w map fgnew deffg} {
         self._explicit_scale = scale
         yield
         # bigger text: table headings widen so they are not cut, a few
-        # tables per callback
-        trees = list(_walk_class(self.root, ttk.Treeview))
+        # tables per callback. 5.3.4 CI (Windows, busy 230-255 ms): the
+        # tables of the tabs not on screen are fitted when their tab is
+        # shown, as a theme change recolours them; each fit re-lays a
+        # table out, and most tables are on hidden tabs
+        trees = self._text_size_trees()
         for i in range(0, len(trees), 4):
             for tree in trees[i:i + 4]:
                 fit_tree_headings(tree)
                 share_tree_width(tree)        # 5.3.4 (M17)
             yield
+
+    def _text_size_trees(self):
+        """The tables to fit now (on screen, or not on a tab); the ones
+        on hidden tabs wait in _fit_pending for their tab."""
+        hidden = {}
+        if FEATURES.get("theme_steps", True):
+            with contextlib.suppress(tk.TclError, AttributeError):
+                if self.root.winfo_ismapped():
+                    hidden = {t.frame: t for t in self.tabs.values()
+                              if not t.is_visible()}
+        later = {}
+        for t in hidden.values():
+            later[t] = list(_walk_class(t.frame, ttk.Treeview))
+        waiting = {id(x) for v in later.values() for x in v}
+        self._fit_pending = {t: v for t, v in later.items() if v}
+        return [x for x in _walk_class(self.root, ttk.Treeview)
+                if id(x) not in waiting]
+
+    def finish_text_size(self, tab=None):
+        """Fit the tables a text-size change left for later: `tab`'s, or
+        all of them."""
+        pend = getattr(self, "_fit_pending", None) or {}
+        for t in ([tab] if tab is not None else list(pend)):
+            for tree in pend.pop(t, ()):
+                with contextlib.suppress(tk.TclError):
+                    fit_tree_headings(tree)
+                    share_tree_width(tree)
 
     def _scale_explicit_fonts(self, widget, scale):
         """Widgets built with an explicit ("TkDefaultFont", 11, "bold")
@@ -67403,15 +67505,19 @@ def self_test_wanted(only):
         return None
     # (review 6) also as the run prints them ("story process hit rate")
     asked = [n.strip() for n in str(only).split(",") if n.strip()]
+    # 5.3.4 (review): matched as the run prints a name (its function name
+    # less two letters), so the "test_…" tests ("st private packages
+    # folder") can be asked for too; they never matched before
     want = {}
     for n in asked:
         k = re.sub(r"[\s-]+", "_", n)
-        want[k if k.startswith("t_") else "t_" + k] = n
+        want[k[2:] if k.startswith(("t_", "test_")) else k] = n
     seen = set()
 
     def wanted(fn_name):
-        if fn_name in want:
-            seen.add(fn_name)
+        key = fn_name[2:]
+        if key in want:
+            seen.add(key)
             return True
         return False
     wanted.unmatched = lambda: [n for k, n in want.items()
@@ -67543,6 +67649,43 @@ CORE_SELF_TESTS = (
     "t_historical_buckets", "t_dns_tracker", "t_baseline", "t_data_loaders",
     "t_history_store", "t_fingerprinting", "t_interface_scoring",
     "t_busy_workload")
+
+# 5.3.4 (review): what Repair's "Quick self-test" checks: the core above
+# plus, for each thing a person repairs, the tests of that part. Measured
+# on the Windows runner (Python 3.12): the core 2.4 s, these 18 s (12 s of
+# it the private packages folder); `--self-test --quick` was 344 tests and
+# 6 minutes. Everything else (code checks, layouts, translations) checks
+# the program file, which Repair can't change.
+REPAIR_AREAS = (
+    ("program components and the Python they run on", (
+        "test_components_manager_lifecycle", "t_component_rows",
+        "t_runtime_state_and_handoff", "t_runtime_lock_and_platforms",
+        "t_b9_install_key_rejects_foreign", "t_b9_compiled_copy_trusted")),
+    ("the data folder", (
+        "t_m1a_data_trust", "t_b9_in_data_folder", "t_b9_private_file_ok",
+        "test_b10_atomic_write_retries_a_busy_target", "t_b9_trusted_uids")),
+    ("the history database", (
+        "t_store_roundtrip", "t_store_migrates_v1_file",
+        "t_store_recovers_from_corruption", "t_m1b_history_delete_all",
+        "t_m2_history_two_copies_and_clock",
+        "t_r7_damaged_history_set_aside_closed",
+        "t_r6_history_index_failures")),
+    ("capture and what it needs", (
+        "t_fast_decoder_matches_scapy", "t_capture_file_readers",
+        "t_npcap_signer_pin", "t_m1b_npcap_signature_path",
+        "t_b9_has_capture_rights_mocked", "test_capture_fault_classifier",
+        "t_os12_identity_without_scapy", "test_private_packages_folder")),
+    ("the settings file", (
+        "t_m2_settings_and_stores_survive_damage",
+        "t_534_court_bad_setting_numbers")),
+    ("updates and what they trust", (
+        "t_signed_updates_and_packs", "t_update_source_default_and_migration",
+        "t_update_unofficial_source_warning", "t_update_repo_format",
+        "t_update_links_github_only", "t_534_court_update_through_symlink",
+        "t_534_court_update_as_root_gives_back")),
+)
+REPAIR_SELF_TESTS = CORE_SELF_TESTS + tuple(
+    n for _area, names in REPAIR_AREAS for n in names)
 
 
 def run_self_tests(verbose=True, only=None):
@@ -83756,9 +83899,25 @@ def t_534_ci_repair_runs_the_core_tests(ctx):
     assert second == ("failed", "The self-test didn't finish within 2 "
                                 "minutes."), second
     cmd, kw = seen[0]
-    assert "--quick" not in cmd and cmd[-1] == ",".join(CORE_SELF_TESTS)
+    assert "--quick" not in cmd and cmd[-1] == ",".join(REPAIR_SELF_TESTS)
     assert kw["timeout"] == 120 and kw["errors"] == "replace", kw
     assert len(CORE_SELF_TESTS) == len(set(CORE_SELF_TESTS)) >= 20
+    # (review) each part a person repairs has its tests, and every name
+    # is a registered test (a renamed one would quietly drop out)
+    assert len(REPAIR_SELF_TESTS) == len(set(REPAIR_SELF_TESTS))
+    assert len(REPAIR_AREAS) == 6 and all(n for _a, n in REPAIR_AREAS)
+    known = set(CORE_SELF_TESTS) | {fn.__name__ for fn, _slow in SELF_TESTS}
+    assert not set(REPAIR_SELF_TESTS) - known, \
+        set(REPAIR_SELF_TESTS) - known
+    slow = {fn.__name__ for fn, sl in SELF_TESTS if sl}
+    assert not set(REPAIR_SELF_TESTS) & slow
+    # the "test_…" tests can be asked for, by function or printed name
+    for asked in ("test_private_packages_folder",
+                  "st private packages folder"):
+        w = self_test_wanted(asked)
+        assert w("test_private_packages_folder") and not w.unmatched(), asked
+    w = self_test_wanted("t_dns_parsing,baseline")
+    assert w("t_dns_parsing") and w("t_baseline") and not w("t_dns")
     with contextlib.redirect_stdout(io.StringIO()) as out:
         rc = run_self_tests(verbose=True, only="t_dns_parsing,t_baseline")
     assert rc == 0 and out.getvalue().count("[PASS]") == 2, out.getvalue()
@@ -83869,6 +84028,37 @@ def t_534_ci_test_timers_go_with_their_widget(ctx):
     assert aid in interp.splitlist(interp.call("after", "info"))
     root.destroy()
     assert aid not in interp.splitlist(interp.call("after", "info"))
+
+
+@self_test()
+def t_534_ci_inspector_lent_when_opening_narrow(ctx):
+    """5.3.4 CI (1024x768): an Inspector switched on in Settings is lent
+    to the tabs when the window opens narrower than the line, not only
+    when it is made narrower; one the person opened in a narrow window
+    stays; layout widths below 300 px don't count."""
+    def win(by_person=False):
+        w = types.SimpleNamespace(inspector_visible=True, calls=[],
+                                  _insp_by_person=by_person,
+                                  INSPECTOR_MIN_WINDOW=1180)
+
+        def toggle(show, remember=True):
+            w.calls.append((show, remember))
+            w.inspector_visible = show
+        w.toggle_inspector = toggle
+        return w
+    w = win()
+    MiniWireshark._inspector_fit(w, 1)            # before the layout
+    assert w.calls == [] and not hasattr(w, "_body_w_prev")
+    MiniWireshark._inspector_fit(w, px(1000))
+    assert w.calls == [(False, False)] and w._insp_auto_hidden, w.calls
+    MiniWireshark._inspector_fit(w, px(1400))     # wide again: back
+    assert w.calls[-1] == (True, False) and w.inspector_visible
+    w = win(by_person=True)
+    MiniWireshark._inspector_fit(w, px(1000))
+    assert w.calls == [], "the person's own choice was undone"
+    w = win()
+    MiniWireshark._inspector_fit(w, px(1300))     # wide: nothing to do
+    assert w.calls == []
 
 
 @self_test()
@@ -84726,9 +84916,23 @@ def t_534_scrollable_fit_width_units(ctx):
         outer, inner = make_scrollable(root, fit_width=True)
         outer.pack(fill="both", expand=True)
         tk.Label(inner, text="x" * 80).pack()
-        root.update()
-        root.update()
+        # 5.3.4 CI (macOS): root.update() never returned here; a bounded
+        # pump says what kept Tk busy instead of hanging the run
+        for _ in range(2):
+            n = 0
+            while root.tk.dooneevent(tk._tkinter.DONT_WAIT):
+                n += 1
+                assert n < 20000, ("Tk never settled", outer.fit_counts)
         assert not errors, errors
+        assert outer.fit_counts["held"] == 0, outer.fit_counts
+        # a fit undone again at once, round after round (what a resize
+        # ping-pong does): it stops after FIT_ROUNDS until Tk is idle
+        c = outer.fit_counts
+        fits0 = c["fits"]
+        for _ in range(FIT_ROUNDS + 4):
+            outer.canvas.configure(width=1)
+            inner.event_generate("<Configure>")
+        assert c["fits"] - fits0 <= FIT_ROUNDS and c["held"] >= 4, c
     finally:
         root.destroy()
 
@@ -86857,6 +87061,34 @@ def _gs_loader(app, ctx):
     lw.pump()
     assert lw.stage_state["Download"] in ("active", "done")
     assert "MB/s" in lw.speed_var.get() or lw.speed_var.get() == ""
+    # 5.3.4 (review): the download question the start waits for comes to
+    # the front, with the keyboard on its first button, even when the
+    # window was hidden or minimised; the status line says it waits
+    win.withdraw()          # (iconify needs a window manager to show)
+    _gui_pump(root, 0.2)
+    assert win.state() == "withdrawn"
+    got = []
+    item = {"name": "Capture driver (Npcap)", "version": "1", "size": "1 MB",
+            "host": "npcap.com", "check": "x", "where": "y", "note": ""}
+    th = threading.Thread(target=lambda: got.append(
+        lw.ask("preflight", items=[item])), daemon=True)
+    th.start()
+    t_end = time.time() + 5
+    while time.time() < t_end and getattr(lw, "preflight_card", None) is None:
+        lw.pump()
+        root.update()
+        time.sleep(0.02)
+    assert getattr(lw, "preflight_card", None) is not None, "no card"
+    _gui_pump(root, 0.2)
+    assert win.state() == "normal", win.state()
+    assert lw.status_var.get() == translate_text("Waiting for your choice")
+    go = [b for b in _walk_class(lw.preflight_card, ttk.Button)
+          if "Download" in str(b.cget("text"))]
+    assert go and str(win.focus_get()) == str(go[0]), win.focus_get()
+    [b for b in _walk_class(lw.preflight_card, ttk.Button)
+     if "without" in str(b.cget("text"))][0].invoke()
+    th.join(3)
+    assert got == ["without"], got
     win.after(300, lambda: lw._choose("demo"))
     choice = lw.show_welcome("summary", "healthy", True)
     assert choice == "demo", choice
@@ -87434,30 +87666,35 @@ def gt_m4_shell(app, ctx):
         app.select_group(i)
         _gui_pump(root, 0.1)
         assert app.current_tab_name() in TAB_GROUPS[i][1]
-    # no group split across rows at 1366 px, in all three languages
+    # no group split across rows at 1024 px (a small laptop, or a
+    # scaled display), at most two rows, in all three languages. 5.3.4
+    # (review): checked at 1024, the narrowest window the layout supports,
+    # in the window itself (it was 1366, and measured for a 1366-px window
+    # on the 1024-px Windows runner)
     old_geo = root.geometry()
     old_lang = app.config.get("general.language", "English")
+    max0 = root.maxsize()
     try:
+        # the window's frame must not push a 1024-px window past a
+        # 1024-px screen's limit (Tk holds windows to the screen)
+        root.maxsize(px(2000), px(1200))
         for lang in ("English", "Français", "Español"):
             app.config.set("general.language", lang)
             app._apply_runtime_settings()
-            root.geometry(px_geo("1366x768"))
+            # from wide to 1024, as a window is made narrower: below 1180
+            # an open Inspector lends its room to the tabs (on the
+            # runner it kept it, and the strip had 609 px of 1028)
+            root.geometry(px_geo("1400x700"))
+            _gui_pump(root, 0.4)
+            root.geometry(px_geo("1024x700"))
             _gui_pump(root, 0.6)
+            assert abs(root.winfo_width() - px(1024)) <= 2, \
+                (root.winfo_width(), root.winfo_screenwidth())
+            assert not app.inspector_visible, "the Inspector kept its room"
             ts = app.tabstrip
             ts.relayout()
-            # 5.3.4 CI: a screen narrower than 1366 px (the Windows
-            # runner's is 1024x768) holds the window to its width, and
-            # the strip was measured at that; measure the strip a
-            # 1366-px window has
-            want = int(px_geo("1366x768").split("x")[0])
-            short = max(0, want - root.winfo_width())
-            width = ts.frame.winfo_width() + short
-            if short and lang == "English":
-                print(f"      (the screen is {root.winfo_screenwidth()} px "
-                      f"wide, the window {root.winfo_width()} px: the "
-                      f"strip is measured at {width} px)")
-            caps = len(ts.group_rows(width, captions=True)) <= 2
-            rows = ts.group_rows(width, captions=caps)
+            width = ts.frame.winfo_width()
+            rows = ts.group_rows(width, captions=ts.show_captions)
             where = {}
             # (5.3.4 CI) the widths, to tell a narrow screen from wide text
             seen = (lang, f"strip {width} px, window {root.winfo_width()} "
@@ -87470,7 +87707,11 @@ def gt_m4_shell(app, ctx):
                     assert gi not in where, ("group split",) + seen
                     where[gi] = ri
             assert len(rows) <= 2, seen
+            if lang == "Français":
+                print(f"      (tab strip at 1024 px, French: {width} px, "
+                      f"{len(rows)} rows, captions {ts.show_captions})")
     finally:
+        root.maxsize(*max0)
         app.config.set("general.language", old_lang)
         app._apply_runtime_settings()
         root.geometry(old_geo)
@@ -88315,11 +88556,19 @@ def gt_rc2_polish(app, ctx):
     # a narrow window lends the Inspector's room to the tabs, and gives
     # it back; the setting is not touched
     geo0 = root.geometry()
+    max0 = root.maxsize()
     vis_before = app.inspector_visible
     try:
+        # 5.3.4 CI: the Windows runner's screen is 1024x768 and Tk holds a
+        # window to the screen (wm maxsize), so "1400 wide" stayed 1024
+        # and the window never crossed the line. Let it be wider than the
+        # screen, and check it really is.
+        root.maxsize(px(2000), px(1200))
         app.toggle_inspector(True)
         root.geometry(px_geo("1400x800"))
         _gui_pump(root, 0.5)
+        assert root.winfo_width() >= px(1400) - 2, \
+            (root.winfo_width(), root.winfo_screenwidth())
         assert app.inspector_visible
         root.geometry(px_geo("1000x700"))
         _gui_pump(root, 0.6)
@@ -88338,6 +88587,7 @@ def gt_rc2_polish(app, ctx):
         _gui_pump(root, 0.6)
         assert not app.inspector_visible
     finally:
+        root.maxsize(*max0)
         root.geometry(geo0)
         _gui_pump(root, 0.4)
         app.toggle_inspector(vis_before)
@@ -89693,6 +89943,35 @@ def _heartbeat_measure(root, action, until, settle=0.4, timeout=10.0):
             round(sum(g - 0.012 for g in gaps if g > 0.012) * 1000, 1))
 
 
+def _profile_text_size(app, label, top=20):
+    """One text-size change to `label` and everything it leaves for later
+    callbacks, under cProfile: the top functions by cumulative and by own
+    time (Tk's own work shows as _tkinter's "call" rows). -> text"""
+    import cProfile
+    import pstats
+    root = app.root
+    prof = cProfile.Profile()
+    t0 = time.perf_counter()
+    prof.enable()
+    try:
+        app.config.set("appearance.text_size", label)
+        app._apply_text_size(label)
+        _gui_pump(root, 0.02, lambda: app._text_size_job is None,
+                  timeout=10)
+    finally:
+        prof.disable()
+    wall = (time.perf_counter() - t0) * 1000
+    out = io.StringIO()
+    st = pstats.Stats(prof, stream=out)
+    st.strip_dirs()
+    out.write(f"    profile of one text-size change ({wall:.0f} ms with "
+              f"the profiler on), by cumulative time:\n")
+    st.sort_stats("cumulative").print_stats(top)
+    out.write("    by own time:\n")
+    st.sort_stats("tottime").print_stats(top)
+    return out.getvalue()
+
+
 @gui_test_step("Windows run: a text-size change re-lays the window out "
                "once, quickly; a theme change recolours hidden tabs after")
 def gt_text_size_speed(app, ctx):
@@ -89743,6 +90022,27 @@ def gt_text_size_speed(app, ctx):
                 stall.append(gap)
         print(f"    text-size change: busy {busy} ms, longest freeze "
               f"{stall} ms")
+        # 5.3.4 CI: where the time goes, from one more change under the
+        # profiler: always on Windows (busy 230-255 ms there, ~42 ms on
+        # Linux), elsewhere when over the limit or asked (MW_PROFILE=1)
+        if IS_WINDOWS or min(busy) > 130 or os.environ.get("MW_PROFILE"):
+            print(_profile_text_size(app, probe))
+        # 5.3.4 CI: the tables of hidden tabs are fitted when shown
+        pend = dict(getattr(app, "_fit_pending", None) or {})
+        assert pend and app.tabs["devices"] not in pend, list(pend)
+        tab = next(iter(pend))
+        name = next(n for n, t in app.tabs.items() if t is tab)
+        app._select_tab(name)
+        _gui_pump(root, 0.3)
+        assert tab not in app._fit_pending, name
+        for tree in pend[tab]:
+            for c in ("#0",) + tuple(tree["columns"]):
+                text = str(tree.heading(c, "text") or "")
+                if text:
+                    assert int(tree.column(c, "width")) >= \
+                        heading_width(text) + 20, (name, c, text)
+        app._select_tab("devices")
+        _gui_pump(root, 0.2)
         assert min(busy) <= 130, f"text-size change busy {min(busy)} ms " \
             f"(runs {busy})"
         assert min(stall) <= 105, f"text-size change froze {min(stall)} " \
