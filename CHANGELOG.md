@@ -47,6 +47,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 **Fixes**
 
+- The Security page no longer repeats its "What is this?" heading: each refresh left one more copy on the Unusual activity line (in every language the page had been shown in).
 - Damaged or hostile capture, session and settings files end with a message, never a crash or runaway memory. A session file that would unpack past 256 MB is refused.
 - Two copies in one folder: a busy database is no longer taken for a damaged one, session numbers never clash, and each crash journal belongs to one copy.
 - Windows 11 24H2 hiding Wi-Fi details while Location is off, and German Windows output, are read correctly. MiniWireshark never turns Location on.

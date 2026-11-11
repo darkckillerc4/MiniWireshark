@@ -42153,6 +42153,12 @@ class SecurityTab(BaseTab):
             return
         if str(u.frame) in [str(x) for x in t.window_names()]:
             t.delete("2.0", "end")
+            # deleting up to "end" also takes the newline after the
+            # section, so the page's first heading then went on the
+            # section's own line, which this delete keeps: one more
+            # "What is this?" on every refresh (5.3.4 user report)
+            if t.index("end-1c").split(".")[0] == "1":
+                t.insert("end", "\n")
             return
         t.delete("1.0", "end")
         t.window_create("1.0", window=u.frame)
@@ -88935,7 +88941,15 @@ def gt_rc2_polish(app, ctx):
         _gui_pump(root, 0.3)
         st = app.tabs["security"]
         st.refresh()
+        # every refresh writes the page once: the first heading is never
+        # left behind on the Unusual activity line (it piled up there,
+        # one copy per refresh and language)
+        for _ in range(3):
+            st.refresh()
         text = st.text.get("1.0", "end")
+        assert text.count("What is this?") == 1, text[:300]
+        assert st.text.get("1.0", "1.end").strip() == "", \
+            st.text.get("1.0", "1.end")[:200]
         assert st.folded_titles, text[:300]
         assert translate_text("Nothing to report") in text
         assert text.index(translate_text("Nothing to report")) > \
