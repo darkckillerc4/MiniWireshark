@@ -8204,6 +8204,10 @@ def _human_bytes(n):
     return f"{n:.1f} GB"
 
 
+# 5.3.4: carrier-grade NAT / Tailscale space (RFC 6598), never the Internet
+_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+
 @functools.lru_cache(maxsize=65536)
 def _is_public_cached(ip):
     try:
@@ -8212,7 +8216,7 @@ def _is_public_cached(ip):
         return False
     return not a.is_private and not a.is_multicast and not a.is_loopback \
         and not a.is_link_local and not a.is_reserved and \
-        not a.is_unspecified
+        not a.is_unspecified and a not in _CGNAT_NET
 
 
 def is_public_ip(ip):
@@ -13916,7 +13920,7 @@ class DeviceRecord:
                 return n
         if self.vendor:
             return f"{self.vendor} device"
-        return self.ip or self.mac or self.key
+        return anonymous_device_label(self) or self.ip or self.mac or self.key
 
     def all_names(self):
         return {n.lower() for n in (self.hostname, self.dhcp_hostname,
@@ -16210,6 +16214,33 @@ class RemoteHostRecord:
         if self.asn:
             return f"AS{self.asn} {self.org}".strip()
         return self.org
+
+
+def anonymous_device_label(dev):
+    """5.3.4: why a device has no name, instead of a bare address."""
+    if dev.link_local_only:
+        return "Device without a network address (self-assigned 169.254)"
+    if dev.randomized_mac:
+        return "Device using a private Wi-Fi address"
+    return ""
+
+
+def host_label(r, doh=False):
+    """5.3.4: what to call an Internet address — its name, a known service,
+    its provider, or why no name was seen (doh: encrypted DNS was seen)."""
+    n = r.domain or doh_ip_name(r.ip) or KNOWN_DNS.get(r.ip)
+    if n:
+        return n
+    if r.ports == {123}:
+        return "time server"
+    n = r.provider_text()
+    if n:
+        return n
+    if doh and "QUIC" in r.protocols:
+        return "Name hidden (encrypted DNS + QUIC)"
+    if doh and "TLS" in r.protocols:
+        return "Name hidden by ECH (encrypted hello)"
+    return "Contacted directly (no name looked up)"
 
 
 def remote_to_dict(rec):
@@ -23582,11 +23613,17 @@ class NetworkModel:
         if dns and dns.get("qr") == 1 and d["sport"] == 53:
             dkey = dst_dev.key if dst_dev is not None else ""
             qname = (dns.get("qname") or "").lower().strip(".")
-            for ip, name in d["learns"]:
+            # 5.3.4: the queried name last, so it stays the address's name
+            # over a CNAME-chain name; a chain-only CDN edge name
+            # (e6858.dscx.akamaiedge.net) is plumbing, not a website
+            for ip, name in sorted(d["learns"], key=lambda x: (
+                    x[1] or "").lower().strip(".") == qname):
                 if not (is_public_ip(ip) and name):
                     continue
-                rec = self.register_website(name, ip, dst_dev, "DNS", ts)
                 lname = name.lower().strip(".")
+                if lname != qname and domain_category(lname)[0] == "CDN":
+                    continue
+                rec = self.register_website(name, ip, dst_dev, "DNS", ts)
                 self.correlator.note_resolution(dkey, lname, ip, ts)
                 if self.obs_sink:
                     self.res_pending.append((ts, dkey, lname, ip))
@@ -23652,7 +23689,7 @@ class NetworkModel:
                          connection=False, encrypted=None, reported=False):
         ts = ts or self.now()
         key = domain.lower().strip(".")
-        if not key or "." not in key:
+        if not key or "." not in key or _looks_like_ip(key):
             return None
         rec = self.websites.get(key)
         if rec is None:
@@ -23743,9 +23780,11 @@ class NetworkModel:
         elif direction == "down":
             pub, rport, dev, out = d["src_ip"], d["sport"], dst_dev, False
         elif direction == "other":
-            if is_public_ip(d["dst_ip"]):
+            # 5.3.4: a public address of our own (IPv6 prefix) is never remote
+            if is_public_ip(d["dst_ip"]) and not self.is_local(d["dst_ip"]):
                 pub, rport, dev, out = d["dst_ip"], d["dport"], src_dev, True
-            elif is_public_ip(d["src_ip"]):
+            elif is_public_ip(d["src_ip"]) and \
+                    not self.is_local(d["src_ip"]):
                 pub, rport, dev, out = d["src_ip"], d["sport"], dst_dev, False
             else:
                 return
@@ -28478,6 +28517,13 @@ No connections in this view. Short ones are hidden in Beginner. ¦ Aucune connex
 Show short connections ¦ Afficher les connexions courtes ¦ Mostrar las conexiones cortas
 No connections yet. ¦ Aucune connexion pour l'instant. ¦ Aún no hay conexiones.
 (no name seen) ¦ (aucun nom vu) ¦ (no se vio ningún nombre)
+time server ¦ serveur de temps ¦ servidor de hora
+Name hidden (encrypted DNS + QUIC) ¦ Nom masqué (DNS chiffré + QUIC) ¦ Nombre oculto (DNS cifrado + QUIC)
+Name hidden by ECH (encrypted hello) ¦ Nom masqué par ECH (hello chiffré) ¦ Nombre oculto por ECH (hello cifrado)
+Contacted directly (no name looked up) ¦ Contacté directement (aucun nom recherché) ¦ Contactado directamente (no se buscó ningún nombre)
+Provider unknown: the offline provider database is off. Turn on “Offline country/provider database” in Settings → Privacy. ¦ Fournisseur inconnu : la base de fournisseurs hors ligne est désactivée. Activez « Base pays/fournisseur hors ligne » dans Paramètres → Confidentialité. ¦ Proveedor desconocido: la base de datos de proveedores sin conexión está desactivada. Active «Base de datos de país/proveedor sin conexión» en Ajustes → Privacidad.
+Device using a private Wi-Fi address ¦ Appareil avec une adresse Wi-Fi privée ¦ Dispositivo con una dirección Wi-Fi privada
+Device without a network address (self-assigned 169.254) ¦ Appareil sans adresse réseau (169.254 auto-attribuée) ¦ Dispositivo sin dirección de red (169.254 autoasignada)
 Internet host ¦ Hôte Internet ¦ Equipo de Internet
 No Internet hosts yet. They appear when a device talks to a public address. ¦ Aucun hôte Internet pour l'instant. Ils apparaissent quand un appareil communique avec une adresse publique. ¦ Aún no hay hosts de Internet. Aparecen cuando un dispositivo habla con una dirección pública.
 Search: ¦ Rechercher : ¦ Buscar:
@@ -30660,7 +30706,12 @@ def translate_cell(v):
                  "Idle", "Offline", "Expired", "Online", "Closing",
                  "Closed", "Open", "Encrypted", "Not encrypted", "INFO",
                  "WARNING", "DANGER", "New", "Acknowledged", "New (saved)",
-                 "Acknowledged (saved)"}
+                 "Acknowledged (saved)", "time server",
+                 "Name hidden (encrypted DNS + QUIC)",
+                 "Name hidden by ECH (encrypted hello)",
+                 "Contacted directly (no name looked up)",
+                 "Device using a private Wi-Fi address",
+                 "Device without a network address (self-assigned 169.254)"}
         words.update(FRIENDLY_PROTO.values())
         words.update(PORT_SERVICES.values())
         words.update(DEVICE_CLASSES)
@@ -39682,7 +39733,9 @@ class ConnectionsTab(BaseTab):
         return True
 
     def values(self, f):
-        to = f.domain or f.remote_ip
+        rh = None if f.domain else self.model.remote_hosts.get(f.remote_ip)
+        to = f.domain or (host_label(rh, bool(self.model.dns.encrypted_seen))
+                          if rh is not None else f.remote_ip)
         if f.domain and f.domain_conf and f.domain_conf != "Observed":
             to += "  (likely)"
         port = f.remote_port if f.transport in ("TCP", "UDP") else ""
@@ -40165,13 +40218,13 @@ class RemoteTab(BaseTab):
         app = self.app
         who = ", ".join(app.short_device_name(k)
                         for k in sorted(r.devices)[:3]) or "—"
-        names = r.domain or ""
+        names = host_label(r, bool(self.model.dns.encrypted_seen))
         if len(r.domains) > 1:
             names += f" +{len(r.domains) - 1}"
         if r.vpn_endpoint:
             names = f"(likely {r.vpn_endpoint} VPN server) " + names
         return (r.ip, r.location_text() or "—",
-                r.provider_text() or "—", names or "(no name seen)",
+                r.provider_text() or "—", names,
                 ", ".join(str(p) for p in sorted(r.ports)[:4]) or "—",
                 ", ".join(sorted(r.protocols)[:4]) or "—", who,
                 f"↑{_human_bytes(r.bytes_out)} "
@@ -55352,7 +55405,7 @@ proc ::mw_explicit_fonts {top names} {
         if dev.confidence == CONFIDENCE_UNCONFIRMED:
             return "Unconfirmed device"
         return dev.device_class if dev.device_class != "Unknown" else \
-            (dev.ip or dev.mac)
+            (anonymous_device_label(dev) or dev.ip or dev.mac)
 
     def short_device_name(self, key):
         dev = self.model.registry.by_key.get(key)
@@ -56499,14 +56552,18 @@ proc ::mw_explicit_fonts {top names} {
                          for k in sorted(r.devices)) or "—"
         loc = r.location_text() or ("not looked up (turn on a country lookup "
                                     "in Settings → Privacy)")
+        label = host_label(r, bool(self.model.dns.encrypted_seen))
+        if not r.provider_text() and not self.config.get(
+                "privacy.local_asn_db", False):
+            loc += ("\nProvider unknown: the offline provider database is "
+                    "off. Turn on “Offline country/provider database” in "
+                    "Settings → Privacy.")
         sections = [
             ("What is it?", f"{ip} is an address on the Internet — not a "
                             f"device on your network." +
              (f" It looks like a {r.vpn_endpoint} VPN server (most traffic "
               f"goes through it)." if r.vpn_endpoint else "")),
-            ("Known names", ", ".join(sorted(r.domains)) or
-             "No website name was seen for it (it may have been contacted "
-             "directly, or the lookup was encrypted)."),
+            ("Known names", ", ".join(sorted(r.domains)) or label),
             ("Location & provider", f"{loc}\n{r.provider_text() or ''}"
                                     f"{(' (via ' + r.geo_source + ')') if r.geo_source else ''}"),
             ("Activity", f"Sent to it: {_human_bytes(r.bytes_out)}    "
@@ -81491,6 +81548,141 @@ def t_s9_visible_literals_translated(ctx):
                     miss.append((node.lineno, loc, s))
     assert total > 400, total
     assert not miss, miss[:12]
+
+
+@self_test()
+def t_hosts_cname_cdn_edge_name(ctx):
+    """5.3.4 (hosts 1): www.apple.com → CNAME … → e6858.dscx.akamaiedge.net:
+    the address keeps the queried name and the edge name is no website."""
+    if not ctx.scapy_ok:
+        return "skip"
+    b = ScenarioBuilder()
+    b.home_network()
+    me, gw = b.ME, b.GW
+    rrs = [PK.DNSRR(rrname="www.apple.com", type="CNAME",
+                    rdata="www.apple.com.edgekey.net", ttl=60),
+           PK.DNSRR(rrname="www.apple.com.edgekey.net", type="CNAME",
+                    rdata="e6858.dscx.akamaiedge.net", ttl=60),
+           PK.DNSRR(rrname="e6858.dscx.akamaiedge.net", rdata="23.33.44.55",
+                    ttl=20)]
+    b._emit(PK.Ether(src=gw[1], dst=me[1]) / PK.IP(src=gw[0], dst=me[0]) /
+            PK.UDP(sport=53, dport=40999) /
+            PK.DNS(id=5, qr=1, qd=PK.DNSQR(qname="www.apple.com"), an=rrs))
+    b.tls(me, "", "23.33.44.55", sni=False, size=3000)
+    m = scenario_model(ctx.cfg(), b.frames)
+    assert m.remote_hosts["23.33.44.55"].domain == "www.apple.com", \
+        m.remote_hosts["23.33.44.55"].domains
+    assert "e6858.dscx.akamaiedge.net" not in m.websites
+    assert "www.apple.com" in m.websites
+
+
+@self_test()
+def t_hosts_label_fallbacks(ctx):
+    """5.3.4 (hosts 2): an Internet host with no name says what it is or
+    why no name was seen, in all three languages."""
+    def rh(ip, ports=(443,), protos=(), **kw):
+        r = RemoteHostRecord(ip=ip, **kw)
+        r.ports, r.protocols = set(ports), set(protos)
+        return r
+    assert host_label(rh("1.2.3.4", domain="a.example")) == "a.example"
+    assert "Quad9" in host_label(rh("9.9.9.9")), host_label(rh("9.9.9.9"))
+    assert host_label(rh("5.6.7.8", (123,))) == "time server"
+    assert host_label(rh("5.6.7.8", asn=15169, org="GOOGLE")) == \
+        "AS15169 GOOGLE"
+    quic, ech = rh("5.6.7.8", protos=("QUIC",)), rh("5.6.7.8",
+                                                     protos=("TCP", "TLS"))
+    assert host_label(quic, True) == "Name hidden (encrypted DNS + QUIC)"
+    assert host_label(ech, True) == "Name hidden by ECH (encrypted hello)"
+    assert host_label(ech) == host_label(quic) == \
+        "Contacted directly (no name looked up)"
+    for s in ("time server", host_label(quic, True), host_label(ech, True),
+              host_label(ech)):
+        for loc in ("fr", "es"):
+            assert translate_text(s, loc) != s, (loc, s)
+    m = scenario_model(ctx.cfg(), [])
+    m.remote_hosts[ech.ip] = ech
+    tab = types.SimpleNamespace(app=types.SimpleNamespace(
+        short_device_name=str), model=m)
+    assert RemoteTab.values(tab, ech)[3] == host_label(ech)
+
+
+@self_test()
+def t_hosts_provider_db_hint(ctx):
+    """5.3.4 (hosts 3): the offline provider database stays off by
+    default, and a host with no provider says how to turn it on."""
+    for on in (False, True):
+        cfg = ctx.cfg({"privacy.local_asn_db": True} if on else None)
+        assert cfg.get("privacy.local_asn_db", False) is on
+        m = scenario_model(cfg, [])
+        app = types.SimpleNamespace(model=m, config=cfg,
+                                    short_device_name=str)
+        text = "\n".join(b for _, b in MiniWireshark.remote_report(
+            app, RemoteHostRecord(ip="5.6.7.8")))
+        assert ("Offline country/provider database" in text) is not on, text
+
+
+@self_test()
+def t_hosts_anonymous_device_labels(ctx):
+    """5.3.4 (hosts 4): a nameless device with a private Wi-Fi address or
+    only a self-assigned 169.254 address is called that, not a bare IP."""
+    if not ctx.scapy_ok:
+        return "skip"
+    b = ScenarioBuilder()
+    b.home_network()
+    rnd = ("192.168.1.77", "a6:3b:12:9e:44:01", "")
+    b.arp_announce(rnd)
+    b.dhcp(rnd)
+    b._emit(PK.Ether(src="02:aa:bb:cc:dd:ee", dst="ff:ff:ff:ff:ff:ff") /
+            PK.IP(src="169.254.12.34", dst="169.254.255.255") /
+            PK.UDP(sport=138, dport=138) / PK.Raw(b"\x00" * 50))
+    m = scenario_model(ctx.cfg(), b.frames)
+    app = types.SimpleNamespace(model=m)
+    want = {"a6:3b:12:9e:44:01": "Device using a private Wi-Fi address",
+            "02:aa:bb:cc:dd:ee": "Device without a network address "
+                                 "(self-assigned 169.254)"}
+    for d in m.registry.by_key.values():
+        if d.mac in want:
+            assert MiniWireshark.device_label(app, d) == want[d.mac] == \
+                d.display_name(), (d.mac, d.display_name())
+            del want[d.mac]
+    assert not want, want
+    for s in ("Device using a private Wi-Fi address",
+              "Device without a network address (self-assigned 169.254)"):
+        for loc in ("fr", "es"):
+            assert translate_text(s, loc) != s, (loc, s)
+
+
+@self_test()
+def t_hosts_cgnat_not_public(ctx):
+    """5.3.4 (hosts 5): 100.64.0.0/10 (carrier NAT, Tailscale) is not an
+    Internet host."""
+    assert not is_public_ip("100.64.1.1")
+    assert not is_public_ip("100.127.255.254")
+    assert is_public_ip("100.63.255.255") and is_public_ip("100.128.0.1")
+
+
+@self_test()
+def t_hosts_own_public_v6_not_remote(ctx):
+    """5.3.4 (hosts 6): our own public IPv6 address talking to a private
+    one is not listed as an Internet host."""
+    if not ctx.scapy_ok:
+        return "skip"
+    fr = ScenarioBuilder().home_network() + \
+        ScenarioBuilder().protocol_tour()
+    m = scenario_model(ctx.cfg(), fr)
+    assert m.is_local("2a01:e0a:1f:2c0::10")
+    assert "2a01:e0a:1f:2c0::10" not in m.remote_hosts
+
+
+@self_test()
+def t_hosts_ip_is_not_a_website(ctx):
+    """5.3.4 (hosts 7): an address used as a name (http://93.1.2.3/) gets
+    no Websites row."""
+    m = scenario_model(ctx.cfg(), [])
+    for name in ("93.1.2.3", "2606:4700::1111"):
+        assert m.register_website(name, "93.1.2.3", None, "HTTP Host") \
+            is None and name not in m.websites
+    assert m.register_website("a.example", "93.1.2.3", None, "DNS")
 
 
 @self_test()
