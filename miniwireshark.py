@@ -34700,7 +34700,9 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
 
     def inner_conf(_e=None):
         counts["inner"] += 1
-        canvas.configure(scrollregion=canvas.bbox("all"))
+        box = canvas.bbox("all")
+        if box:                 # none while the frame is hidden
+            canvas.configure(scrollregion=box)
         if fit_width:
             want = inner.winfo_reqwidth()
             # "10c" until a width is set: winfo_pixels reads any unit
@@ -34715,6 +34717,23 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
         show_bar()
     inner.bind("<Configure>", inner_conf)
     canvas.bind("<Configure>", canvas_conf)
+
+    # 5.3.4 CI round 5 (Windows, text size): pack and grid unmap their
+    # widgets when the frame holding them is unmapped, a canvas does not
+    # unmap the frame it shows. So a hidden tab that scrolls kept all its
+    # widgets mapped (146 of the 579 on hidden tabs), and Tk laid them out
+    # and redrew them on every text-size change. The frame now goes and
+    # comes back with the canvas.
+    def canvas_unmapped():
+        with contextlib.suppress(tk.TclError):
+            canvas.itemconfigure(win, state="hidden")
+
+    def canvas_mapped():
+        with contextlib.suppress(tk.TclError):
+            canvas.itemconfigure(win, state="normal")
+            inner_conf()
+    bind_plain(canvas, "<Unmap>", canvas_unmapped)
+    bind_plain(canvas, "<Map>", canvas_mapped)
     seqs = ("<MouseWheel>", "<Button-4>", "<Button-5>")
 
     def wheel(e):
@@ -85028,6 +85047,58 @@ def t_534_scrollable_fit_width_units(ctx):
 
 
 @self_test()
+def t_534_scrollable_hidden_tab_unmapped(ctx):
+    """5.3.4 CI round 5: the widgets of a scrolling frame on a hidden tab
+    are unmapped with it, as pack and grid unmap theirs (a canvas kept
+    them mapped, so Tk laid them out and redrew them on every text-size
+    change), and come back, scrollable, when the tab is shown."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        root.deiconify()
+        root.geometry("300x200")
+        nb = ttk.Notebook(root)
+        nb.pack(fill="both", expand=True)
+        a, b = tk.Frame(nb), tk.Frame(nb)
+        nb.add(a, text="a")
+        nb.add(b, text="b")
+        outer, inner = make_scrollable(b)
+        outer.pack(fill="both", expand=True)
+        font = tkfont.Font(root, family="Helvetica", size=10)
+        rows = [tk.Label(inner, text=f"row {i}", font=font)
+                for i in range(40)]
+        for r in rows:
+            r.pack(anchor="w")
+        state = lambda: (rows[0].winfo_ismapped(),     # noqa: E731
+                         inner.winfo_ismapped(),
+                         str(outer.canvas.cget("scrollregion")))
+        nb.select(b)
+        assert _pump_until_still(root, state), state()
+        assert rows[0].winfo_viewable(), state()
+        region = str(outer.canvas.cget("scrollregion"))
+        assert region and int(float(region.split()[3])) > 200, region
+        nb.select(a)
+        assert _pump_until_still(root, state), state()
+        # a text-size change while the tab is hidden: the canvas mapped
+        # its frame again (unmapping it was not enough)
+        font.configure(size=14)
+        assert _pump_until_still(root, state), state()
+        assert not inner.winfo_ismapped() and \
+            not rows[0].winfo_ismapped(), ("still mapped on a hidden tab",
+                                           state())
+        nb.select(b)
+        assert _pump_until_still(root, state), state()
+        assert rows[0].winfo_viewable() and rows[-1].winfo_ismapped(), \
+            state()
+        now = str(outer.canvas.cget("scrollregion"))
+        assert int(float(now.split()[3])) > int(float(region.split()[3])), \
+            ("the scroll region kept the smaller text's height", region, now)
+    finally:
+        root.destroy()
+
+
+@self_test()
 def t_r7_elevated_start_closes_and_is_marked(ctx):
     """Review 7 (#5, #6): when the elevated copy ran, this start's receipt
     says "elevated", not "running" (two of those sent the next start into
@@ -90074,29 +90145,37 @@ def _profile_text_size(app, label, top=20):
     return out.getvalue()
 
 
-def _main_thread_breakdown(app, action, until, settle=0.4):
+def _main_thread_breakdown(app, action, until, settle=0.4, top=10):
     """Where the main thread's time goes during `action` and its later
     callbacks, measured on the main thread only (cProfile on 3.12+ also
     counts other threads' waits, e.g. the ring worker's drain): the same
     heartbeat as _heartbeat_measure, first with nothing to do (the floor
-    the measure itself shows on this machine), then with `action`; time
-    inside root.update(), split into the Python callbacks it ran (from
-    PerfProbe) and Tk's own work; main-thread CPU time. -> text"""
+    the measure itself shows on this machine), then with `action`. Each
+    root.update() of the pump is split into its idle part (Tk's geometry
+    managers and redrawing: update_idletasks first) and its events part
+    (timers, <Configure>, the system's paint and size messages), and each
+    part into the Python callbacks it ran (PerfProbe) and Tk's own work;
+    the `top` slowest of each, and main-thread CPU time. -> text"""
     root = app.root
     idle = _heartbeat_measure(root, lambda: None, lambda: True, settle)
-    spent = [0.0, 0]
+    calls = []                  # (idle s, idle py s, events s, events py s)
     orig_update = root.update
+    orig_idle = root.update_idletasks
+    probe = PerfProbe()
+    probe.SLOW = 0.0            # every callback by name
 
     def timed_update():
-        t = time.perf_counter()
+        t0, w0 = time.perf_counter(), probe.work
         try:
-            return orig_update()
+            orig_idle()
         finally:
-            spent[0] += time.perf_counter() - t
-            spent[1] += 1
+            t1, w1 = time.perf_counter(), probe.work
+            try:
+                orig_update()
+            finally:
+                calls.append((t1 - t0, w1 - w0, time.perf_counter() - t1,
+                              probe.work - w1))
     probe0 = PERF[0]
-    probe = PerfProbe()
-    probe.SLOW = 0.004
     PERF[0] = probe
     root.update = timed_update
     try:
@@ -90112,20 +90191,88 @@ def _main_thread_breakdown(app, action, until, settle=0.4):
     for _w, _ph, name, wk, _wt in probe.slow:
         n, t = by.get(name, (0, 0.0))
         by[name] = (n + 1, t + wk)
-    top = sorted(by.items(), key=lambda kv: -kv[1][1])[:8]
+    cb = sorted(by.items(), key=lambda kv: -kv[1][1])[:top]
+    i_all = sum(c[0] for c in calls)
+    i_py = sum(c[1] for c in calls)
+    e_all = sum(c[2] for c in calls)
+    e_py = sum(c[3] for c in calls)
+    slow = sorted(range(len(calls)), key=lambda i: -(calls[i][0] +
+                                                    calls[i][2]))[:top]
     lines = [f"    main thread, one change ({ms(wall)} ms wall, "
              f"{settle * 1000:.0f} ms of it settling): busy {tot} ms, "
              f"longest freeze {gap} ms; with nothing to do the same "
              f"heartbeat shows busy {idle[1]} ms, longest gap {idle[0]} ms",
-             f"      inside update(): {ms(spent[0])} ms over {spent[1]} "
-             f"calls; Python callbacks {ms(probe.work)} ms over {probe.n} "
-             f"(longest {ms(probe.max_work[0])} ms, {probe.max_work[1]}); "
-             f"Tk's own work ~{ms(max(0.0, spent[0] - probe.work))} ms; "
-             f"main-thread CPU {ms(cpu)} ms",
-             "      callbacks over 4 ms: " + (", ".join(
-                 f"{name} {ms(t)} ms x{n}" for name, (n, t) in top)
+             f"      inside update(): {ms(i_all + e_all)} ms over "
+             f"{len(calls)} calls; Python callbacks {ms(probe.work)} ms "
+             f"over {probe.n}; Tk's own work ~"
+             f"{ms(max(0.0, i_all + e_all - i_py - e_py))} ms (idle work "
+             f"waiting when update() began {ms(i_all - i_py)} ms; events and "
+             f"the work they set off {ms(e_all - e_py)} ms); main-thread "
+             f"CPU {ms(cpu)} ms",
+             "      slowest update() calls, in order of the pump (#: idle "
+             "Tk/Python + events Tk/Python ms): " + ", ".join(
+                 f"#{i + 1}: {ms(calls[i][0] - calls[i][1])}/"
+                 f"{ms(calls[i][1])} + {ms(calls[i][2] - calls[i][3])}/"
+                 f"{ms(calls[i][3])}" for i in sorted(slow)),
+             f"      top {top} Python callbacks by time: " + (", ".join(
+                 f"{name} {ms(t)} ms x{n}" for name, (n, t) in cb)
                  or "none")]
     return "\n".join(lines)
+
+
+def _text_size_options(app, label, other):
+    """5.3.4 CI round 5, for the owner's choice: what (a) hiding the
+    window during a text-size change, and (b) re-laying out only the tab
+    on screen, could buy. (a) is measured: one change to `label` with
+    the main window withdrawn, all its steps at once, shown again after;
+    then the same change back to `other` with the window on screen, the
+    same way, to compare like with like. (b) is estimated from the
+    widget counts: how many widgets are on the tab shown, on hidden
+    tabs, and elsewhere (Tk visits all of them). -> text"""
+    root = app.root
+    seen = set()
+    mapped = [0]                # on hidden tabs, still mapped (not shown)
+
+    def count(w, tally=False):
+        n, stack = 0, [w]
+        while stack:
+            x = stack.pop()
+            if id(x) in seen:
+                continue
+            seen.add(id(x))
+            n += 1
+            if tally:
+                with contextlib.suppress(tk.TclError):
+                    mapped[0] += bool(x.winfo_ismapped())
+            stack.extend(list(getattr(x, "children", {}).values()))
+        return n
+    cur = app.tabs.get(app.current_tab_name())
+    on_tab = count(cur.frame) if cur else 0
+    hidden = sum(count(t.frame, True) for t in app.tabs.values()
+                 if t is not cur)
+    rest = count(root)              # what is left: shell, Inspector, bars
+    total = on_tab + hidden + rest
+
+    def change(lab, hide):
+        def act():
+            if hide:
+                root.withdraw()
+            app.config.set("appearance.text_size", lab)
+            app._apply_text_size(lab, defer=False)
+            if hide:
+                root.update_idletasks()
+                root.deiconify()
+        return act
+    shown = _heartbeat_measure(root, change(label, True), lambda: True)
+    _gui_pump(root, 0.5)
+    on = _heartbeat_measure(root, change(other, False), lambda: True)
+    _gui_pump(root, 0.5)
+    return (f"    options: widgets {total} (tab on screen {on_tab}, hidden "
+            f"tabs {hidden}, {mapped[0]} of them still mapped, the rest "
+            f"{rest}); one change all at once with "
+            f"the window on screen: busy {on[1]} ms, longest freeze "
+            f"{on[0]} ms; (a) the same with the window hidden and shown "
+            f"again: busy {shown[1]} ms, longest freeze {shown[0]} ms")
 
 
 @gui_test_step("Windows run: a text-size change re-lays the window out "
@@ -90216,17 +90363,25 @@ def gt_text_size_speed(app, ctx):
         # 3. measured: in this window the old code was busy 340-460 ms a
         # change (froze 60-75 ms at most): 10-14 font walks and ~1,800
         # Python event handlers; now 60-100 ms (30-40). Best of three,
-        # each way
+        # each way, and each one a real change: 5.3.4 CI round 5, the
+        # first run was to the size already in effect (left so by 2b),
+        # 127-140 ms on Windows against ~400 for a real change, and
+        # min() took it
         busy, stall = [], []
-        for _ in range(3):
-            for label in (size0, probe):
-                def act(label=label):
-                    app.config.set("appearance.text_size", label)
-                    app._apply_text_size(label)
-                gap, tot = _heartbeat_measure(
-                    root, act, lambda: app._text_size_job is None)
-                busy.append(tot)
-                stall.append(gap)
+        other = {size0: probe, probe: size0}
+        label = other[app.config.get("appearance.text_size")]
+        for _ in range(6):
+            cur = app.config.get("appearance.text_size")
+            assert label != cur, ("not a change", label, cur)
+
+            def act(label=label):
+                app.config.set("appearance.text_size", label)
+                app._apply_text_size(label)
+            gap, tot = _heartbeat_measure(
+                root, act, lambda: app._text_size_job is None)
+            busy.append(tot)
+            stall.append(gap)
+            label = other[label]
         print(f"    text-size change: busy {busy} ms, longest freeze "
               f"{stall} ms")
         # 5.3.4 CI: where the time goes: always on Windows (busy 330-372
@@ -90234,16 +90389,15 @@ def gt_text_size_speed(app, ctx):
         # the limit or asked (MW_PROFILE=1). cProfile's view showed only
         # ~35 ms of main-thread Python and Tk calls in a 142 ms change and
         # 95 ms of the ring worker waiting, so the main thread is also
-        # measured on its own, with the heartbeat's own floor. The size
-        # in effect here is `probe` (the runs above end on it): round 4's
-        # profile was of a change to `probe` again, i.e. of no change
+        # measured on its own, with the heartbeat's own floor. Round 4's
+        # profile was of a change to the size in effect, i.e. of no change
         if IS_WINDOWS or min(busy) > 130 or os.environ.get("MW_PROFILE"):
-            def act(label=size0):
+            def act(label=label):
                 app.config.set("appearance.text_size", label)
                 app._apply_text_size(label)
             print(_main_thread_breakdown(
                 app, act, lambda: app._text_size_job is None))
-            print(_profile_text_size(app, probe))
+            print(_profile_text_size(app, other[label]))
         # 5.3.4 CI: the tables of hidden tabs are fitted when shown
         pend = dict(getattr(app, "_fit_pending", None) or {})
         assert pend and app.tabs["devices"] not in pend, list(pend)
@@ -90260,6 +90414,9 @@ def gt_text_size_speed(app, ctx):
                         heading_width(text) + 20, (name, c, text)
         app._select_tab("devices")
         _gui_pump(root, 0.2)
+        if IS_WINDOWS or min(busy) > 130 or os.environ.get("MW_PROFILE"):
+            now = app.config.get("appearance.text_size")
+            print(_text_size_options(app, other[now], now))
         assert min(busy) <= 130, f"text-size change busy {min(busy)} ms " \
             f"(runs {busy})"
         assert min(stall) <= 105, f"text-size change froze {min(stall)} " \

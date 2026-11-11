@@ -60,7 +60,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **Repair's quick self-test** takes about 20 seconds instead of up to 6 minutes. It used to run nearly the whole self-test (344 tests). It now runs 62: the core checks, plus the tests for each part Repair looks at (program components, data folder, history database, capture, settings file, update checks). It no longer checks the program's own code, layouts or translations, because Repair can't change those. `--self-test` still runs everything.
 - A Windows console with an old code page no longer stops MiniWireshark with a text error; a character it can't show is printed as "?".
 - On a small screen, an Inspector switched on in Settings now makes room for the tabs when the window opens narrow, not only when you make the window narrower.
-- A text-size change is quicker: the tables and the rows of buttons on tabs you can't see are fitted when you open their tab.
+- A text-size change is quicker: the tables, the rows of buttons and the scrolling pages on tabs you can't see are fitted when you open their tab.
 
 **Not in this release**
 
