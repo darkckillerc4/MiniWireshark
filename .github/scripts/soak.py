@@ -159,6 +159,8 @@ def write_threads():
     # the growth is native (Tk, Npcap, the C heap), not Python data
     line = (f"minute {state['minute']} handles={handles()} "
             f"blocks={sys.getallocatedblocks()} "
+            # Tk interpreters held until exit (5.3.4 round 7): must stay 1
+            f"tk_interps={len(getattr(mw, '_TK_INTERPS', ()))} "
             f"threads={sum(names.values())} " +
             ", ".join(f"{n} x{c}" for n, c in sorted(names.items())))
     with open(out_csv + ".threads.txt", "a", encoding="utf-8") as fh:
