@@ -158,6 +158,35 @@ IS_WINDOWS = platform.system() == "Windows"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)  # B-45
 
 
+def console_never_fails(streams=None):
+    """5.3.4 CI (Windows): print() of a character the console's code page
+    lacks (the GUI test's "\u2715" on cp1252, a French or Spanish word on
+    an old OEM page) raised UnicodeEncodeError and ended the run. Every
+    start (window, --self-test, --release-gate, --boot-check, any command
+    line output) now writes such a character as "?" on that console;
+    UTF-8 consoles are untouched. -> the names of the streams changed."""
+    changed = []
+    for name in streams or ("stdout", "stderr"):
+        st = getattr(sys, name, None)
+        enc = getattr(st, "encoding", None)
+        if not enc or not hasattr(st, "reconfigure"):
+            continue                    # pythonw (None), a test's StringIO
+        try:
+            "\u2715\u2014\u00e9\u2026".encode(enc)
+            continue                    # it can write anything we print
+        except (UnicodeEncodeError, LookupError):
+            pass
+        if getattr(st, "errors", "") in ("replace", "backslashreplace"):
+            continue
+        with contextlib.suppress(ValueError, OSError, AttributeError):
+            st.reconfigure(errors="replace")
+            changed.append(name)
+    return changed
+
+
+console_never_fails()
+
+
 def _run_hidden(cmd, **kw):
     """subprocess.run that never flashes a console window on Windows
     (5.3.4, C-03); the S8 self-test keeps every call on it or a helper."""
@@ -546,6 +575,61 @@ def atomic_write_text(path, text, encoding="utf-8"):
 
 def atomic_write_bytes(path, data):
     _atomic_write(path, data, "wb")
+
+
+XFT_COLOR_SAFE = 20305          # libXft 2.3.5 handles colour (emoji) fonts
+XFT_GUARD_ENV = "MW_FONTCONFIG_GUARD"
+
+
+def xft_version():
+    """libXft's version as one number (2.3.4 -> 20304), or None."""
+    try:
+        return int(ctypes.CDLL("libXft.so.2").XftGetVersion())
+    except (OSError, AttributeError, ValueError, TypeError):
+        return None
+
+
+def xft_color_font_guard(environ=None, version=None, folder=None):
+    """5.3.4 (CI, Ubuntu 22.04): Tk 8.6 with libXft before 2.3.5 crashes
+    (segmentation fault) once it has drawn an emoji from a colour font
+    such as Noto Color Emoji, installed on every Ubuntu 22.04 desktop,
+    at two text sizes: two Labels are enough, with no line of ours
+    involved. Every 22.04 user crashed while the window was being built.
+    For this process (and the ones it starts) fontconfig gets a setup
+    that includes the usual one and leaves colour fonts out; emoji then
+    come from a plain font or show as a box. -> the setup file, or None
+    when nothing needs doing."""
+    environ = os.environ if environ is None else environ
+    if IS_WINDOWS or IS_MAC:
+        return None
+    mine = environ.get(XFT_GUARD_ENV, "")
+    if mine and environ.get("FONTCONFIG_FILE") == mine:
+        return None                     # set up already (a parent did)
+    version = xft_version() if version is None else version
+    if version is None or version >= XFT_COLOR_SAFE:
+        return None
+    base = environ.get("FONTCONFIG_FILE") or "/etc/fonts/fonts.conf"
+    path = os.path.join(folder or PATHS.cache, "fonts-no-colour.conf")
+    text = ('<?xml version="1.0"?>\n'
+            '<!DOCTYPE fontconfig SYSTEM "urn:fontconfig:fonts.dtd">\n'
+            "<!-- MiniWireshark: libXft %d.%d.%d crashes Tk on colour "
+            "fonts -->\n<fontconfig>\n"
+            '  <include ignore_missing="yes">%s</include>\n'
+            "  <selectfont><rejectfont><pattern>"
+            '<patelt name="color"><bool>true</bool></patelt>'
+            "</pattern></rejectfont></selectfont>\n"
+            "</fontconfig>\n") % (version // 10000, version // 100 % 100,
+                                   version % 100, html.escape(base))
+    try:
+        atomic_write_text(path, text)
+    except OSError as e:
+        LOG.warning("colour fonts left on (libXft %s): %s", version, e)
+        return None
+    environ["FONTCONFIG_FILE"] = environ[XFT_GUARD_ENV] = path
+    return path
+
+
+xft_color_font_guard()          # before Tk loads fontconfig
 
 
 def session_is_gz(path):
@@ -4211,6 +4295,9 @@ def step_tkinter(l, state):
 
 # ---- the pre-flight card: what will be downloaded, before the first byte ------
 SKIP_DOWNLOADS = [False]
+# MW_START_AND_EXIT: the start test (the GUI test's warm start, the release
+# gate's start check) runs with nobody at the screen
+START_TEST = bool(os.environ.get("MW_START_AND_EXIT"))
 
 
 def preflight_items(state):
@@ -4267,9 +4354,15 @@ def step_preflight(l, state):
                    f"({it['size']}) from {it['host']}, {it['check']} → "
                    f"{it['where']}" + (f". {it['note']}" if it["note"]
                                        else ""), "detail")
-    if preflight_unattended():
+    if START_TEST:
+        # 5.3.4 CI (Windows, no Npcap): nobody answers in a start test; it
+        # waited for a click until the test gave up after 180 s. A start
+        # test never downloads or installs anything.
+        answer = "without"
+    elif preflight_unattended():
         return True, "Downloading what is missing (unattended start)."
-    answer = l.ask("preflight", items=items)
+    else:
+        answer = l.ask("preflight", items=items)
     if answer == "without":
         SKIP_DOWNLOADS[0] = True
         CAPTURE_LIMITED[0] = ("You chose to start without live capture; "
@@ -26666,6 +26759,7 @@ I18N_SEP = " \u00a6 "
 I18N_CATALOG = """\
 Getting everything ready — quick after the first time ¦ Préparation en cours — rapide après la première fois ¦ Preparando todo — rápido después de la primera vez
 Checking ¦ Vérification ¦ Comprobando
+The self-test didn't finish within 2 minutes. ¦ L'autotest ne s'est pas terminé en 2 minutes. ¦ La autoprueba no terminó en 2 minutos.
 Check ¦ Vérifier ¦ Comprobar
 Download ¦ Téléchargement ¦ Descarga
 Verify ¦ Contrôler ¦ Verificar
@@ -50639,6 +50733,7 @@ class MiniWireshark:
         def work():
             results = []
             for key, _title in REPAIR_STEPS:
+                self.repair_now = key          # the GUI test names it
                 show(key, "busy", "checking…")
                 try:
                     status, text = getattr(self, f"_repair_{key}")()
@@ -50796,12 +50891,20 @@ class MiniWireshark:
             if res else "The capture engine couldn't restart; see "
                         "Diagnostics.")
 
-    def _repair_selftest(self):
+    def _repair_selftest(self, timeout=120):  # the 2 minutes below
+        """5.3.4 CI: the core tests only. It ran `--self-test --quick`, 344
+        of the 355 tests (the code checks included), which took 6 minutes
+        on a Windows runner (105 s on Linux) and kept Repair "Working…" for
+        all of it; the core takes seconds."""
         try:
             r = subprocess.run(self_cmd(SELF_TEST_FLAG,
-                                        "--quick"), capture_output=True, text=True,
-                               timeout=600, creationflags=getattr(
-                                   subprocess, "CREATE_NO_WINDOW", 0))
+                                        ",".join(CORE_SELF_TESTS)),
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace",
+                               env=dict(os.environ, PYTHONIOENCODING="utf-8"),
+                               timeout=timeout, creationflags=NO_WINDOW)
+        except subprocess.TimeoutExpired:
+            return "failed", "The self-test didn't finish within 2 minutes."
         except (OSError, subprocess.SubprocessError) as e:
             return "failed", str(e)
         tail = (r.stdout or "").strip().splitlines()[-1:] or ["?"]
@@ -67353,7 +67456,101 @@ def _test_eth(src="02:00:00:00:00:05", dst="02:00:00:00:00:01"):
     return Ether(src=src, dst=dst)
 
 
+# 5.3.4 CI: the longest a single test may run before the run stops and
+# names it. Measured: the slowest self-test is 29.7 s (Windows runner,
+# Python 3.12, "release gate parts"), the slowest GUI step 138 s (Ubuntu
+# 22.04, Repair, before it ran only the core tests); a macOS self-test ran
+# for 6 hours without saying which test it was in.
+SELF_TEST_LIMIT_S = 300
+GUI_STEP_LIMIT_S = 600
+
+
+class StepWatchdog:
+    """Stop a test run whose step has run past `limit` seconds: print the
+    step's name and every thread's stack, then end the process with exit
+    code 3, so a hang fails in minutes, by name, instead of when CI gives
+    up on the whole job."""
+
+    def __init__(self, what, limit, out=None, stop=None):
+        self.what, self.limit = what, limit
+        self.out = out
+        self.stop = stop or (lambda: os._exit(3))
+        self.fired = threading.Event()
+        self._timer = None
+
+    def _fire(self):
+        self.fired.set()
+        out = self.out or sys.__stderr__ or sys.stderr
+        with contextlib.suppress(Exception):
+            out.write(f"\n[TIMEOUT] {self.what}: still running after "
+                      f"{self.limit:.0f} s; stopping the run. Every "
+                      f"thread's stack:\n")
+            out.flush()
+            try:
+                import faulthandler
+                faulthandler.dump_traceback(file=out, all_threads=True)
+            except (AttributeError, ValueError, OSError,
+                    io.UnsupportedOperation):    # no file number (a test)
+                for tid, frame in sys._current_frames().items():
+                    out.write(f"Thread {tid}:\n" +
+                              "".join(traceback.format_stack(frame)))
+            out.flush()
+        self.stop()
+
+    def __enter__(self):
+        self._timer = threading.Timer(self.limit, self._fire)
+        self._timer.daemon = True
+        self._timer.name = "step-watchdog"
+        self._timer.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._timer.cancel()
+        return False
+
+
+def finish_test_run(what, rc, limit=60):
+    """5.3.4 CI (macOS): the self-test printed nothing for 6 hours: its
+    lines sat in the pipe's buffer and the process never ended, so there
+    was no telling where it stood. The output is flushed, threads that
+    would keep the process alive are named, and if leaving takes more
+    than `limit` seconds the stacks are printed and the run ends with
+    exit code 3. -> rc"""
+    for st in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            st.flush()
+    left = sorted(t.name for t in threading.enumerate()
+                  if t is not threading.main_thread() and not t.daemon and
+                  t.is_alive())
+    if left:
+        with contextlib.suppress(Exception):
+            print(f"({what}: still running at the end: {', '.join(left)})",
+                  file=sys.stderr, flush=True)
+    StepWatchdog(f"{what}, leaving", limit).__enter__()
+    return rc
+
+
+# the built-in core of the self-test (defined inside run_self_tests), in
+# the order they run; Repair's "Quick self-test" runs just these
+CORE_SELF_TESTS = (
+    "t_config_migration", "t_settings_schema_has_defaults",
+    "t_theme_mappings", "t_confidence_scoring", "t_mac_randomization",
+    "t_device_lifecycle", "t_public_ip_never_a_device",
+    "t_device_merge_rules", "t_registrable_domain", "t_dns_parsing",
+    "t_explain_registry", "t_m6_corrections", "t_m7_asof_and_builder",
+    "t_m9_bootstrap", "t_tls_sni_parser", "t_flow_aggregation",
+    "t_alert_debounce", "t_session_roundtrip", "t_display_filters",
+    "t_historical_buckets", "t_dns_tracker", "t_baseline", "t_data_loaders",
+    "t_history_store", "t_fingerprinting", "t_interface_scoring",
+    "t_busy_workload")
+
+
 def run_self_tests(verbose=True, only=None):
+    # 5.3.4 CI (Windows): timers go with their widget here too, as in the
+    # window. A table's 60 ms timer outlived its test's Tk root (destroyed,
+    # its interpreter still alive), and the next test's update() ran it:
+    # 'invalid command name "…update_empty"'.
+    install_after_guard()
     results = []
     wanted = self_test_wanted(only)
     tmp = tempfile.mkdtemp(prefix="mw_selftest_")
@@ -67372,7 +67569,8 @@ def run_self_tests(verbose=True, only=None):
         name = fn.__name__[2:].replace("_", " ")
         t0 = time.perf_counter()
         try:
-            r = fn()
+            with StepWatchdog("self-test " + name, SELF_TEST_LIMIT_S):
+                r = fn()
             status = "SKIP" if r == "skip" else "PASS"
             msg = "" if status == "PASS" else "not available here"
         except Exception as e:                       # noqa: BLE001
@@ -67381,7 +67579,8 @@ def run_self_tests(verbose=True, only=None):
         results.append((status, name, msg, time.perf_counter() - t0))
         if verbose:
             print(f"  [{status}] {name} ({(time.perf_counter() - t0) * 1000:.0f}"
-                  f" ms){(' — ' + msg.splitlines()[0]) if msg else ''}")
+                  f" ms){(' — ' + msg.splitlines()[0]) if msg else ''}",
+                  flush=True)                 # 5.3.4 CI: seen as it runs
 
     scapy_ok = True
     try:
@@ -68174,19 +68373,10 @@ def run_self_tests(verbose=True, only=None):
             if r["name"] in ("lo", "lo0"):
                 assert r["score"] < 0
 
+    core = locals()
     try:
-        for fn in (t_config_migration, t_settings_schema_has_defaults,
-                   t_theme_mappings, t_confidence_scoring,
-                   t_mac_randomization, t_device_lifecycle,
-                   t_public_ip_never_a_device, t_device_merge_rules,
-                   t_registrable_domain, t_dns_parsing, t_explain_registry,
-                   t_m6_corrections, t_m7_asof_and_builder, t_m9_bootstrap,
-                   t_tls_sni_parser, t_flow_aggregation, t_alert_debounce,
-                   t_session_roundtrip, t_display_filters,
-                   t_historical_buckets, t_dns_tracker, t_baseline,
-                   t_data_loaders, t_history_store, t_fingerprinting,
-                   t_interface_scoring, t_busy_workload):
-            test(fn)
+        for name in CORE_SELF_TESTS:
+            test(core[name])
         ctx = TestContext(tmp, scapy_ok)
         # (review 6) a test asked for by name runs even with --quick
         quick = "--quick" in sys.argv and wanted is None
@@ -83469,6 +83659,219 @@ def t_534_ci_lan_frames_name_their_source(ctx):
 
 
 @self_test()
+def t_534_ci_old_xft_leaves_colour_fonts_out(ctx):
+    """5.3.4 CI (Ubuntu 22.04 segfault): with libXft before 2.3.5 the app
+    points fontconfig at a setup that includes the usual one and rejects
+    colour fonts, once (a restarted or child process keeps it); newer
+    libXft, Windows and macOS are left alone."""
+    folder = tempfile.mkdtemp(dir=ctx.tmp)
+    env = {"FONTCONFIG_FILE": "/etc/my <fonts>.conf"}
+    path = xft_color_font_guard(env, 20304, folder)
+    if IS_WINDOWS or IS_MAC:
+        assert path is None and len(env) == 1, env
+        return
+    assert path and env["FONTCONFIG_FILE"] == path == env[XFT_GUARD_ENV]
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    assert "<include ignore_missing=\"yes\">/etc/my &lt;fonts&gt;.conf" \
+        "</include>" in text, text
+    assert "<rejectfont><pattern><patelt name=\"color\"><bool>true" in text
+    assert "2.3.4" in text
+    import xml.dom.minidom
+    xml.dom.minidom.parseString(text)              # well formed
+    assert xft_color_font_guard(env, 20304, folder) is None   # no nesting
+    assert env["FONTCONFIG_FILE"] == path
+    env = {}
+    assert xft_color_font_guard(env, 20305, folder) is None and env == {}
+    assert xft_color_font_guard(env, 20304, folder) == path
+    assert "/etc/fonts/fonts.conf</include>" in open(path).read()
+    v = xft_version()
+    if v is not None and v < XFT_COLOR_SAFE:       # this process too
+        assert os.environ.get("FONTCONFIG_FILE") == \
+            os.environ.get(XFT_GUARD_ENV), v
+
+
+@self_test()
+def t_534_ci_console_never_fails(ctx):
+    """5.3.4 CI (Windows cp1252): a character the console can't show is
+    written as "?" instead of ending the run, on every start; a UTF-8
+    console keeps its characters."""
+    real = sys.stdout, sys.stderr
+    old = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    utf = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")
+    try:
+        sys.stdout, sys.stderr = old, utf
+        assert console_never_fails() == ["stdout"]
+        print("Clear \u2715 \u2014 caf\u00e9")
+        print("\u2715", file=sys.stderr)
+        assert console_never_fails() == []                 # once is enough
+        sys.stdout = None                                  # pythonw
+        assert console_never_fails() == []
+    finally:
+        sys.stdout, sys.stderr = real
+    old.flush()
+    utf.flush()
+    assert old.buffer.getvalue() == b"Clear ? \x97 caf\xe9" + \
+        os.linesep.encode(), old.buffer.getvalue()
+    assert utf.buffer.getvalue().startswith("\u2715".encode()), utf
+
+
+@self_test(needs_source=True, slow=True)
+def t_534_ci_console_never_fails_on_start(ctx):
+    """5.3.4 CI: the real starts print on an ASCII-only console without a
+    UnicodeEncodeError (--boot-check printed "\u00b7" and died)."""
+    env = dict(os.environ, PYTHONIOENCODING="ascii",
+               MINIWIRESHARK_DATA=ctx.path("data"),
+               MINIWIRESHARK_CONFIG=ctx.path("c.json"))
+    for argv in (["--boot-check"], ["--help"], ["--self-test",
+                                               "t_b9_human_bytes"]):
+        r = subprocess.run(cached_cmd(sys.executable, SCRIPT_PATH, argv),
+                           capture_output=True, env=env, timeout=300,
+                           creationflags=NO_WINDOW)
+        assert b"UnicodeEncodeError" not in r.stderr, (argv, r.stderr[-600:])
+        assert r.stdout, argv
+
+
+@self_test()
+def t_534_ci_repair_runs_the_core_tests(ctx):
+    """5.3.4 CI (Windows GUI test, 300 s): Repair's "Quick self-test" ran
+    `--self-test --quick` (344 tests, 6 minutes on a Windows runner); it
+    runs the core tests by name, with a 2-minute limit that it reports."""
+    seen = []
+
+    def fake_run(cmd, **kw):
+        seen.append((cmd, kw))
+        if len(seen) == 2:
+            raise subprocess.TimeoutExpired(cmd, kw["timeout"])
+        return types.SimpleNamespace(returncode=0,
+                                     stdout="\n27 passed / 0 failed\n")
+    real = subprocess.run
+    try:
+        subprocess.run = fake_run
+        first = MiniWireshark._repair_selftest(None)
+        second = MiniWireshark._repair_selftest(None)
+    finally:
+        subprocess.run = real
+    assert first == ("ok", "27 passed / 0 failed"), first
+    assert second == ("failed", "The self-test didn't finish within 2 "
+                                "minutes."), second
+    cmd, kw = seen[0]
+    assert "--quick" not in cmd and cmd[-1] == ",".join(CORE_SELF_TESTS)
+    assert kw["timeout"] == 120 and kw["errors"] == "replace", kw
+    assert len(CORE_SELF_TESTS) == len(set(CORE_SELF_TESTS)) >= 20
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        rc = run_self_tests(verbose=True, only="t_dns_parsing,t_baseline")
+    assert rc == 0 and out.getvalue().count("[PASS]") == 2, out.getvalue()
+
+
+@self_test()
+def t_534_ci_start_test_never_waits(ctx):
+    """5.3.4 CI (Windows GUI test, warm start, 180 s): a start test on a
+    computer without Npcap waited for an answer to "download the capture
+    driver?". It now starts without downloading, and doesn't stop at the
+    Welcome Center for the notice that leaves."""
+    g = globals()
+    real = {k: g[k] for k in ("preflight_items", "START_TEST",
+                              "preflight_unattended")}
+    item = {"name": "Capture driver (Npcap)", "version": "1", "size": "1 MB",
+            "host": "npcap.com", "check": "x", "where": "y", "note": ""}
+
+    class Nobody:
+        def post_log(self, *a):
+            pass
+
+        def post_health(self, *a):
+            pass
+
+        def ask(self, *a, **kw):
+            raise AssertionError("a start test asked a question")
+    old = SKIP_DOWNLOADS[0], CAPTURE_LIMITED[0]
+    try:
+        g["preflight_items"] = lambda state: [item]
+        g["preflight_unattended"] = lambda: False
+        g["START_TEST"] = True
+        ok, msg = step_preflight(Nobody(), None)
+        assert ok and SKIP_DOWNLOADS[0] and CAPTURE_LIMITED[0], msg
+        g["START_TEST"] = False
+        try:
+            step_preflight(Nobody(), None)
+            raise RuntimeError("a normal start didn't ask")
+        except AssertionError:
+            pass                        # a person is asked, as before
+    finally:
+        g.update(real)
+        SKIP_DOWNLOADS[0], CAPTURE_LIMITED[0] = old
+    quiet = AppConfig(path=ctx.path("w.json"))
+    quiet.set("general.show_welcome", False)
+    assert welcome_wanted(quiet, False, "note", start_test=False)
+    assert not welcome_wanted(quiet, False, "note", start_test=True)
+    assert welcome_wanted(quiet, True, "", start_test=True)
+    quiet.set("general.show_welcome", True)
+    assert welcome_wanted(quiet, False, "", start_test=True)
+
+
+@self_test()
+def t_534_ci_hung_step_names_itself(ctx):
+    """5.3.4 CI (macOS, 6 hours): a self-test or GUI step that runs past
+    its limit prints its name and the stacks and stops the run; one that
+    finishes in time leaves no trace."""
+    out = io.StringIO()
+    stopped = threading.Event()
+    with StepWatchdog("self-test quick one", 5, out, stopped.set) as w:
+        pass
+    time.sleep(0.05)
+    assert not w.fired.is_set() and out.getvalue() == ""
+    with StepWatchdog("self-test stuck one", 0.05, out, stopped.set) as w:
+        assert stopped.wait(10), "the watchdog never fired"
+    text = out.getvalue()
+    assert "[TIMEOUT] self-test stuck one: still running after 0 s" in \
+        text and "t_534_ci_hung_step_names_itself" in text, text
+    assert 60 <= SELF_TEST_LIMIT_S <= GUI_STEP_LIMIT_S
+    src = inspect.getsource(run_self_tests) + inspect.getsource(run_gui_test)
+    assert src.count("StepWatchdog(") == 2, "both runners use it"
+    # leaving: a thread that keeps the process alive is named, and the
+    # run ends after the limit with the stacks
+    hold = threading.Event()
+    t = threading.Thread(target=hold.wait, name="probe-holds-exit")
+    t.start()
+    err, real_err = io.StringIO(), sys.stderr
+    try:
+        sys.stderr = err
+        g = globals()
+        real_wd = g["StepWatchdog"]
+        armed = []
+        g["StepWatchdog"] = lambda what, limit: armed.append(
+            (what, limit)) or types.SimpleNamespace(__enter__=lambda: None)
+        try:
+            assert finish_test_run("self-test", 4, limit=7) == 4
+        finally:
+            g["StepWatchdog"] = real_wd
+    finally:
+        sys.stderr = real_err
+        hold.set()
+        t.join(5)
+    assert armed == [("self-test, leaving", 7)], armed
+    assert "still running at the end: probe-holds-exit" in err.getvalue()
+
+
+@self_test()
+def t_534_ci_test_timers_go_with_their_widget(ctx):
+    """5.3.4 CI (Windows): a timer set on a widget of a self-test's window
+    is cancelled with the window, so a later test's update() can't run a
+    callback whose command is gone."""
+    assert AFTER_GUARD["on"], "the self-test runs without the after guard"
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    interp = root.tk
+    w = tk.Frame(root)
+    aid = w.after(60_000, lambda: None)
+    assert aid in interp.splitlist(interp.call("after", "info"))
+    root.destroy()
+    assert aid not in interp.splitlist(interp.call("after", "info"))
+
+
+@self_test()
 def t_b9_human_bytes(ctx):
     """B9: sizes in B (whole), KB/MB/GB (one decimal), never past GB."""
     assert _human_bytes(None) == _human_bytes(0) == "0 B"
@@ -86464,9 +86867,12 @@ def _gs_loader(app, ctx):
 def _gs_repair(app, ctx):
     root = app.root
     w = app.repair_everything()
+    t0 = time.monotonic()
     ok = _gui_pump(root, 0.2, lambda: getattr(app, "last_repair", None)
-                   is not None, timeout=300)
-    assert ok, "repair did not finish"
+                   is not None, timeout=150)
+    assert ok, (f"repair did not finish in 150 s, still on the "
+                f"{getattr(app, 'repair_now', '?')!r} step")
+    print(f"      (repair took {time.monotonic() - t0:.1f} s)")
     res = {k: (st, msg) for k, st, msg in app.last_repair[1]}
     assert set(res) == {k for k, _t in REPAIR_STEPS}, res
     assert res["settings"][0] in ("ok", "fixed"), res
@@ -86580,13 +86986,19 @@ def run_gui_test(live=False):
     def step(name, fn):
         t0 = time.perf_counter()
         try:
-            fn()
+            with StepWatchdog("GUI test step " + name, GUI_STEP_LIMIT_S):
+                fn()
             results.append(("PASS", name, ""))
         except Exception as e:                       # noqa: BLE001
             results.append(("FAIL", name, f"{type(e).__name__}: {e}\n" +
                             traceback.format_exc(limit=6)))
+        # 5.3.4 CI: the reason on the step's own line, in case the run
+        # dies before the summary at the end (it did, on Windows)
+        why = results[-1][2].splitlines()[0][:300] if results[-1][2] \
+            else ""
         print(f"  [{results[-1][0]}] {name} "
-              f"({(time.perf_counter() - t0) * 1000:.0f} ms)", flush=True)
+              f"({(time.perf_counter() - t0) * 1000:.0f} ms)"
+              + (f" \u2014 {why}" if why else ""), flush=True)
 
     frames = ctx.frames()
     pcap = ctx.path("scenario.pcap")
@@ -87033,14 +87445,31 @@ def gt_m4_shell(app, ctx):
             _gui_pump(root, 0.6)
             ts = app.tabstrip
             ts.relayout()
-            rows = ts.group_rows(ts.frame.winfo_width(),
-                                 captions=ts.show_captions)
+            # 5.3.4 CI: a screen narrower than 1366 px (the Windows
+            # runner's is 1024x768) holds the window to its width, and
+            # the strip was measured at that; measure the strip a
+            # 1366-px window has
+            want = int(px_geo("1366x768").split("x")[0])
+            short = max(0, want - root.winfo_width())
+            width = ts.frame.winfo_width() + short
+            if short and lang == "English":
+                print(f"      (the screen is {root.winfo_screenwidth()} px "
+                      f"wide, the window {root.winfo_width()} px: the "
+                      f"strip is measured at {width} px)")
+            caps = len(ts.group_rows(width, captions=True)) <= 2
+            rows = ts.group_rows(width, captions=caps)
             where = {}
+            # (5.3.4 CI) the widths, to tell a narrow screen from wide text
+            seen = (lang, f"strip {width} px, window {root.winfo_width()} "
+                    f"of {root.winfo_screenwidth()} px", [
+                        [(gi, [(t, ts.tabs[t][0].winfo_reqwidth())
+                               for t in tids]) for gi, tids, _c in r]
+                        for r in rows])
             for ri, r in enumerate(rows):
                 for gi, _tids, _c in r:
-                    assert gi not in where, (lang, "group split", rows)
+                    assert gi not in where, ("group split",) + seen
                     where[gi] = ri
-            assert len(rows) <= 2, (lang, rows)
+            assert len(rows) <= 2, seen
     finally:
         app.config.set("general.language", old_lang)
         app._apply_runtime_settings()
@@ -87773,11 +88202,21 @@ def gt_rc2_polish(app, ctx):
                     d[(str(w), o)] = str(w.cget(o)).lower()
         return d
     theme0 = app.theme_name
+
+    def walked():
+        # 5.3.4 CI (Windows): the hidden tabs are recoloured one per
+        # callback after the change; 0.2 s covered them here (13 tabs,
+        # about 150 ms) but not on the Windows runner, and the snapshot
+        # caught tabs not yet recoloured. Wait for the last one.
+        assert _gui_pump(root, 0.05, lambda: not app._theme_pending,
+                         timeout=10), \
+            f"{len(app._theme_pending)} tabs still waiting for the theme"
+        _gui_pump(root, 0.1)
     # the Tcl walk gives what the Python walk gave, both ways
     try:
         for name in ("Dark", "Light"):
             app._apply_theme(name)
-            _gui_pump(root, 0.2)
+            walked()
             tcl = snap()
             other = "Light" if name == "Dark" else "Dark"
             app._apply_theme(other)
@@ -87788,7 +88227,7 @@ def gt_rc2_polish(app, ctx):
             finally:
                 del app._retheme_widget_tree
             assert app._retheme_widget_tree == real
-            _gui_pump(root, 0.2)
+            walked()
             py = snap()
             diff = [k for k in set(tcl) | set(py) if tcl.get(k) != py.get(k)]
             assert not diff, diff[:5]
@@ -88202,8 +88641,18 @@ def gt_rc11_warm_start(app, ctx):
     env.pop("MW_FEATURES_OFF", None)
     outs = []
     for _ in range(2):
-        r = _run_hidden(self_cmd(), env=env,
-                           capture_output=True, text=True, timeout=180)
+        try:
+            r = _run_hidden(self_cmd(), env=env, capture_output=True,
+                            text=True, encoding="utf-8", errors="replace",
+                            timeout=180)
+        except subprocess.TimeoutExpired:
+            log = os.path.join(d, "logs", "miniwireshark.log")
+            tail = ""
+            with contextlib.suppress(OSError), \
+                    open(log, encoding="utf-8", errors="replace") as fh:
+                tail = "".join(fh.readlines()[-8:])
+            raise AssertionError("the started copy was still running after "
+                                 "180 s; its log ends:\n" + tail)
         line = next((x for x in r.stdout.splitlines()
                      if x.startswith("START_OK")), "")
         assert line, (r.returncode, r.stdout[-600:], r.stderr[-1200:])
@@ -90040,8 +90489,7 @@ def main():
         action = "demo"
     elif START_MONITOR:
         action = "monitor"         # the elevated copy: straight to capture
-    elif cfg.get("general.show_welcome", True) or first_time or \
-            startup_notice():
+    elif welcome_wanted(cfg, first_time, startup_notice()):
         health = "healthy"
         if CAPTURE_LIMITED[0] or HANDOFF_NOTE[0] or SAFE_MODE:
             health = "degraded"
@@ -90225,6 +90673,16 @@ SAFE_MODE_OVERRIDES = {
     "privacy.auto_download_reference": False,
     "accessibility.ui_scale": "Automatic",
 }
+
+
+def welcome_wanted(cfg, first_time, notice, start_test=None):
+    """Does this start stop at the Welcome Center? When it is on, on a new
+    version, or with something unusual to say; never for a notice in a
+    start test (5.3.4 CI: on Windows without Npcap it said "start without
+    live capture" and waited for a click there instead)."""
+    start_test = START_TEST if start_test is None else start_test
+    return bool(cfg.get("general.show_welcome", True) or first_time or
+                (notice and not start_test))
 
 
 def startup_notice():
@@ -90519,10 +90977,12 @@ if __name__ == "__main__":
     if SELF_TEST_MODE:
         setup_logging()
         print(f"MiniWireshark {SCRIPT_VERSION} self-test")
-        sys.exit(run_self_tests(only=_arg(sys.argv, SELF_TEST_FLAG)))
+        sys.exit(finish_test_run("self-test", run_self_tests(
+            only=_arg(sys.argv, SELF_TEST_FLAG))))
     if GUI_TEST_MODE:
         print(f"MiniWireshark {SCRIPT_VERSION} GUI test")
-        sys.exit(run_gui_test(live="--live" in sys.argv))
+        sys.exit(finish_test_run("GUI test", run_gui_test(
+            live="--live" in sys.argv)))
     if BENCH_GUI_MODE:
         sys.exit(bench_gui(sys.argv[1:]))
     if "--gui-shots" in sys.argv:

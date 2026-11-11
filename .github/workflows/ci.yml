@@ -9,8 +9,13 @@ permissions:
   contents: read
 
 jobs:
+  # timeout-minutes: about three times the longest run measured (run
+  # 42978911434 and the two before it), so a hang fails in minutes, not
+  # after GitHub's 6 hours; inside, every test step stops itself after 5
+  # (self-test) or 10 (GUI step) minutes and names itself
   privacy:
     runs-on: ubuntu-latest
+    timeout-minutes: 5        # measured 0.1 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,6 +26,7 @@ jobs:
 
   self-test:
     runs-on: ubuntu-22.04   # still has Python 3.8 builds
+    timeout-minutes: 15       # measured 1.8-2.8 min
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +49,7 @@ jobs:
   gui-test:
     # the real window, driven step by step under a virtual display
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20       # measured 5.3-5.5 min (24.04)
     strategy:
       fail-fast: false
       matrix:
@@ -63,8 +70,10 @@ jobs:
           sudo apt-get install -y xvfb > /dev/null
           xvfb-run -a -s "-screen 0 1920x1080x24" python -X faulthandler miniwireshark.py --gui-test
       - name: GUI test (under gdb, for the native backtrace of the crash)
-        # 22.04 only: the run died with "Segmentation fault" and no output.
-        # gdb follows the start's exec into the compiled copy; on a crash
+        # 22.04 only: the run died with "Segmentation fault" and no output
+        # (libXft 2.3.4 drawing colour emoji; the app now leaves colour
+        # fonts out there, see xft_color_font_guard). Kept under gdb so a
+        # native crash still shows its stack. gdb follows the start's exec into the compiled copy; on a crash
         # it prints every thread's native stack and the loaded libraries,
         # then lets the signal through so faulthandler prints the Python
         # stack too. The exit code is the test's (255 after a crash).
@@ -95,6 +104,7 @@ jobs:
     # the Windows-only paths (compiled start and hand-off, notifier,
     # memory reading, PowerShell checks) run here between PC runs
     runs-on: windows-latest
+    timeout-minutes: 35       # measured 9.2 min (3.14) with a 3-minute wait in it
     strategy:
       fail-fast: false
       matrix:
@@ -123,6 +133,7 @@ jobs:
   # real instead of mocked (court batch 3)
   self-test-macos:
     runs-on: macos-latest
+    timeout-minutes: 30       # a run hung for 6 hours
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
