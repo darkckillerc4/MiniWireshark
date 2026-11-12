@@ -88,7 +88,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 - Device fingerprints from DHCP request lists ship without built-in rows until real captures of your own devices are available.
 
-Tested on Python 3.8, 3.12 and 3.13 (more than 350 self-tests) and with 59 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed.
+Tested on Python 3.8, 3.12 and 3.13 (more than 350 self-tests) and with 67 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed.
 
 ## [5.2.3] — 2026-10-24
 
