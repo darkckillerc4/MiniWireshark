@@ -26736,10 +26736,14 @@ class PacketRing:
         self._seg = None
         self._stop = False
         self._lock = threading.Lock()
-        # set while the window's thread wants the lock (a wipe): a plain
-        # Lock is not fair, so a busy writer taking it straight back
-        # after each packet could keep the window waiting for seconds
+        # set while the window's thread wants the lock (a wipe, or a
+        # packet opened from the history): a plain Lock is not fair, so a
+        # busy writer taking it straight back after each packet could keep
+        # the window waiting for seconds. Counted, so two callers at once
+        # never clear it under each other.
         self._lock_wanted = threading.Event()
+        self._wanting = 0
+        self._wanting_lock = threading.Lock()
         # (review 7) every packet put gets a number; a wipe drops what was
         # queued before it instead of waiting for the writer to reach it
         self._seq = itertools.count(1)
@@ -26882,9 +26886,28 @@ class PacketRing:
             return False
         return ev.wait(timeout)
 
+    @contextlib.contextmanager
+    def _first_turn(self):
+        """The lock, taken ahead of the writer: it steps back between two
+        packets while this is held or waited for."""
+        with self._wanting_lock:
+            self._wanting += 1
+            self._lock_wanted.set()
+        try:
+            with self._lock:
+                yield
+        finally:
+            with self._wanting_lock:
+                self._wanting -= 1
+                if not self._wanting:
+                    self._lock_wanted.clear()
+
     def find(self, no, epoch=None):
-        """(raw, ts, linktype) of packet `no` from disk, or None."""
-        with self._lock:
+        """(raw, ts, linktype) of packet `no` from disk, or None. Audit
+        2026-11-12 (#13): called on the window's thread (jump_to_packet),
+        so it takes the lock with the same fair hand-over as wipe(); it
+        waited 0.5–3 s behind a busy writer."""
+        with self._first_turn():
             epoch = self.epoch if epoch is None else epoch
             seg = self._seg
             candidates = [e[:] for e in reversed(self.index)
@@ -26920,12 +26943,8 @@ class PacketRing:
         the writer, then wipe inline anyway."""
         upto = next(self._seq)
         self._drop_upto = upto          # the writer drops older ones now
-        self._lock_wanted.set()
-        try:
-            with self._lock:
-                self._handle(("wipe", threading.Event()))
-        finally:
-            self._lock_wanted.clear()
+        with self._first_turn():
+            self._handle(("wipe", threading.Event()))
 
     def stop(self, wait=3.0):
         self._stop = True
@@ -86524,6 +86543,65 @@ def t_r7_packet_ring_wipe_never_waits(ctx):
             with open(os.path.join(folder, name), "rb") as f:
                 data += f.read()
     assert b"OLDPACKET" not in data and b"NEWPACKET" in data
+
+
+@self_test()
+def t_534_audit_packet_ring_find_never_waits(ctx):
+    """Audit 2026-11-12 (#13): opening a packet from the packet history
+    (jump_to_packet, on the window's thread) while a busy capture is
+    writing gets the same fair hand-over as the wipe. The writer took the
+    lock straight back after each packet, so find() waited 0.5–3 s."""
+    folder = ctx.path(f"audit-ring-{uuid.uuid4().hex[:6]}")
+    pr = PacketRing(folder, 20, None, 1)
+    real = pr._handle
+    busy = threading.Event()
+    me = threading.get_ident()
+    asked = []          # was the writer told to step back, at each ask?
+
+    class Watched:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            if threading.get_ident() == me:
+                asked.append(pr._lock_wanted.is_set())
+            return self.inner.__enter__()
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+    def slow(item):
+        if busy.is_set() and item[0] not in ("wipe", "flush", "epoch"):
+            time.sleep(0.01)
+        real(item)
+    pr._handle = slow
+    pr._lock = Watched(pr._lock)
+    try:
+        for i in range(1, 21):
+            pr.put(i, b"\x00" * 60 + b"PACKET%03d" % i, time.time(), 1)
+        assert pr.flush(30)
+        busy.set()
+        for i in range(21, 1021):
+            pr.put(i, b"\x00" * 60 + b"PACKET%03d" % i, time.time(), 1)
+        time.sleep(0.05)                    # the writer is in its stride
+        waits = []
+        for no in (5, 12, 18, 3, 9, 15, 20, 1) * 2:
+            t0 = time.perf_counter()
+            frame = pr.find(no)
+            waits.append(time.perf_counter() - t0)
+            assert frame is not None and \
+                frame[0].endswith(b"PACKET%03d" % no), (no, frame)
+        busy.clear()
+    finally:
+        pr.stop()
+    # every ask from this thread went ahead of the writer (whether the
+    # unfair lock happened to make one wait here is down to timing)
+    assert len(asked) == 16 and all(asked), asked
+    assert not pr._lock_wanted.is_set() and pr._wanting == 0
+    # a fair hand-over takes a few ms each; the unfair lock took 0.5 s
+    # and more for one of them
+    assert sum(waits) < 0.25, "find() waited " + ", ".join(
+        f"{w:.2f}" for w in waits) + " s"
 
 
 @self_test()
