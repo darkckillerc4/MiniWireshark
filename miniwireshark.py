@@ -3066,6 +3066,14 @@ OUTBOUND_FEATURES = {
     "packages": "Components and packages (downloads you approved)",
 }
 
+# 5.3.4 crowd test (#3): what the kill switch does, said once. The banner,
+# the Settings help, the ledger, Help and the Ready? list each said it in
+# their own words ("stops every optional request", "sends nothing at all",
+# "nothing leaves this computer" — other programs' traffic still does).
+KILL_SWITCH_EFFECT = ("MiniWireshark sends nothing: no discovery probes, "
+                      "health checks, name lookups, downloads or update "
+                      "checks. Watching continues.")
+
 
 class SelfTrafficLedger:
     def __init__(self, keep=3000):
@@ -13962,13 +13970,15 @@ def is_randomized_mac(mac):
         return False
 
 
+# lowest score for each word (the Devices key quotes these, #28)
+CONFIDENCE_STEPS = ((60, CONFIDENCE_HIGH), (30, CONFIDENCE_MEDIUM),
+                    (10, CONFIDENCE_LOW), (0, CONFIDENCE_UNCONFIRMED))
+
+
 def confidence_tier(score):
-    if score >= 60:
-        return CONFIDENCE_HIGH
-    if score >= 30:
-        return CONFIDENCE_MEDIUM
-    if score >= 10:
-        return CONFIDENCE_LOW
+    for low, word in CONFIDENCE_STEPS:
+        if score >= low:
+            return word
     return CONFIDENCE_UNCONFIRMED
 
 
@@ -18453,9 +18463,11 @@ def wifi_quality(rssi):
     if rssi >= -75:
         return "Degraded", "fair", ("Usable, but video calls and big "
                                     "downloads may stutter.")
-    return "Needs attention", "weak", ("Weak signal — the most likely cause "
-                                       "of slowness. Move closer to the "
-                                       "router or remove obstacles.")
+    # 5.3.4 crowd test (#8): a reading of the signal, not a verdict on
+    # what made anything slow (no speed was measured)
+    return "Needs attention", "weak", ("Weak signal — likely to make the "
+                                       "connection slower. Move closer to "
+                                       "the router or remove obstacles.")
 
 
 # 5.3.4 (BF-002): Windows 11 24H2 answers `netsh wlan show interfaces`
@@ -20329,6 +20341,25 @@ LEVEL_HELP = {
                 "mean it didn't happen."}
 
 
+def device_scales_key():
+    """5.3.4 crowd test (#28): the Devices table says how sure it is in
+    three ways — "Device evidence" (●●● High: is it a real device), the
+    "Evidence" glyphs (◉ ◎ ◌: how its presence, name and kind are known)
+    and "Likely"/"Possibly" before the kind — and defined none of them,
+    so "High" next to "Possibly NAS" read as a contradiction. One key,
+    built from the same tables the cells use."""
+    conf = " · ".join(
+        f"{CONFIDENCE_ICON[w]} {w}" + (f" (score {n}+)" if n else "")
+        for n, w in CONFIDENCE_STEPS)
+    lv = " · ".join(f"{LEVEL_GLYPH[x]} {LEVEL_WORD[x]}" for x in (
+        LV_OBSERVED, LV_REPORTED, LV_CORRELATED, LV_INFERRED, LV_UNKNOWN))
+    return (f"Device evidence: is it a real device? {conf}. Evidence: how "
+            f"three facts are known, in order: on your network · name · "
+            f"kind ({lv}). “Likely” or “Possibly” before a kind is how sure "
+            f"that guess is, so a device with High evidence can still be "
+            f"only “Possibly” a printer.")
+
+
 # ---- EXPLAIN (5.1.2 F7): one place for every "what does this mean" ------
 # (kind, key) -> (short, long). Used by tooltips, Explain inline, Help and
 # search. The self-test fails when an alert type, a device state, a
@@ -21798,9 +21829,11 @@ def investigate_wifi_internet(f):
                                          "router)"), 0.3, "Possible",
                           [line], fix=ifix))
         else:
+            # (#8) a quick handshake is no speed test: say what was timed
             H.append(_hyp("internet", _t("The Internet side (beyond your "
                                          "router)"), 0.05, "Unlikely", (),
-                          [line]))
+                          [line, _t("○ Only how quickly connections open "
+                                    "was timed, not download speed")]))
     reasons = []
     if not any(x["key"] == "home" for x in H):
         reasons.append(_t("No connections to your router or other home "
@@ -26242,6 +26275,7 @@ def digest_sort(out):
 STORY_DAYS = 7               # how far back the story goes with history on
 STORY_LIST_MAX = 3           # more new devices or websites a day: one line
 STORY_MAX_AGE = 60.0         # seconds before the Dashboard asks again
+STORY_MIN_AGE = 10.0         # new data: written again after this long
 STORY_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
                   "Saturday", "Sunday")
 STORY_CATEGORY = {"presence": "Devices", "new_device": "Devices",
@@ -26528,6 +26562,18 @@ def story_job_run(job, gate, model, store, since, until, last_looked,
     story["build_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     story["model_id"] = id(model)
     return story
+
+
+def story_data_sig(model):
+    """What the story is written from, in a few numbers: when one moves,
+    the story is out of date. 5.3.4 crowd test (#6): a story could be a
+    minute old, so it said "2 changes" while the Dashboard, worked out
+    from the same data a moment later, counted 5 new devices, and an
+    unrelated setting's Apply (which wrote it again) made it "6 changes"."""
+    tl = model.timeline
+    return (id(model), len(tl), tl[-1]["when"] if tl else 0.0,
+            len(model.registry.by_key), len(model.websites),
+            len(model.alerts.alerts))
 
 
 def story_card_text(story, data_mode="live"):
@@ -27329,7 +27375,6 @@ Compare sessions ¦ Comparer des sessions ¦ Comparar sesiones
 What changed since ¦ Ce qui a changé depuis ¦ Qué cambió desde
 Time ¦ Heure ¦ Hora
 What happened ¦ Ce qui s'est passé ¦ Qué pasó
-The devices on your local network. Confidence shows how much local evidence supports each one — an IP address alone is never enough to count as a device. ¦ Les appareils de votre réseau local. La confiance indique combien de preuves locales soutiennent chacun — une adresse IP seule ne suffit jamais à compter comme appareil. ¦ Los dispositivos de su red local. La confianza indica cuántas pruebas locales respaldan cada uno — una dirección IP sola nunca basta para contar como dispositivo.
 Double-click a device for details, or right-click for actions (rename, mark as yours, merge…). ¦ Double-cliquez sur un appareil pour les détails, ou clic droit pour les actions (renommer, marquer comme vôtre, fusionner…). ¦ Haga doble clic en un dispositivo para ver detalles, o clic derecho para acciones (renombrar, marcar como suyo, fusionar…).
 Show offline ¦ Afficher hors ligne ¦ Mostrar desconectados
 Show expired ¦ Afficher expirés ¦ Mostrar caducados
@@ -27722,7 +27767,6 @@ Un-mute all alerts ¦ Réactiver toutes les alertes ¦ Reactivar todas las alert
 Every feature that contacts an outside service is listed here, with exactly what it sends. Nothing is uploaded silently and there is no telemetry. ¦ Chaque fonction qui contacte un service extérieur est listée ici, avec exactement ce qu'elle envoie. Rien n'est envoyé en silence et il n'y a aucune télémétrie. ¦ Cada función que contacta con un servicio externo aparece aquí, con exactamente lo que envía. No se sube nada en silencio y no hay telemetría.
 What MiniWireshark itself sends ¦ Ce que MiniWireshark envoie lui-même ¦ Lo que envía el propio MiniWireshark
 Kill switch: stop everything MiniWireshark sends ¦ Arrêt d'urgence : stopper tout envoi de MiniWireshark ¦ Interruptor de corte: detener todo lo que envía MiniWireshark
-Watching keeps working, but nothing leaves this computer from MiniWireshark: no discovery probes, health checks, name lookups, downloads or update checks. Every send is listed in the ledger below. ¦ L'observation continue, mais rien ne quitte cet ordinateur de la part de MiniWireshark : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. Chaque envoi est listé dans le registre ci-dessous. ¦ La observación sigue funcionando, pero nada sale de este equipo por parte de MiniWireshark: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. Cada envío figura en el registro de abajo.
 Open the self-traffic ledger ¦ Ouvrir le registre des envois ¦ Abrir el registro de envíos propios
 Reference data (no personal data sent) ¦ Données de référence (aucune donnée personnelle envoyée) ¦ Datos de referencia (no se envían datos personales)
 Download public reference lists ¦ Télécharger les listes de référence publiques ¦ Descargar listas de referencia públicas
@@ -28010,7 +28054,6 @@ weak ¦ faible ¦ débil
 fair ¦ moyen ¦ aceptable
 good ¦ bon ¦ bueno
 excellent ¦ excellent ¦ excelente
-Weak signal — the most likely cause of slowness. Move closer to the router or remove obstacles. ¦ Signal faible — la cause la plus probable de lenteur. Rapprochez-vous de la box ou enlevez les obstacles. ¦ Señal débil — la causa más probable de la lentitud. Acérquese al router o quite obstáculos.
 Usable, but video calls and big downloads may stutter. ¦ Utilisable, mais les appels vidéo et gros téléchargements peuvent saccader. ¦ Utilizable, pero las videollamadas y descargas grandes pueden ir a saltos.
 Good signal. ¦ Bon signal. ¦ Buena señal.
 Strong signal. ¦ Signal fort. ¦ Señal fuerte.
@@ -28225,7 +28268,6 @@ Repairing dependencies in the background ¦ Réparation des dépendances en arri
 Switched to Quiet Mode — I stopped sending discovery probes and health checks. I'm still listening normally. ¦ Passé en mode discret — j'ai arrêté les sondes de découverte et les vérifications de santé. J'écoute toujours normalement. ¦ Cambiado a modo silencioso — dejé de enviar sondas de descubrimiento y comprobaciones de salud. Sigo escuchando con normalidad.
 History cleared. ¦ Historique effacé. ¦ Historial borrado.
 That device's history was deleted. ¦ L'historique de cet appareil a été supprimé. ¦ Se borró el historial de ese dispositivo.
-Kill switch on — MiniWireshark sends nothing (watching continues). ¦ Arrêt d'urgence activé — MiniWireshark n'envoie rien (l'observation continue). ¦ Interruptor de corte activado — MiniWireshark no envía nada (la observación continúa).
 Switched to Active Scanning — I'll periodically look for quiet devices on your own network again. ¦ Passé en analyse active — je chercherai de nouveau régulièrement les appareils discrets sur votre réseau. ¦ Cambiado a exploración activa — volveré a buscar periódicamente dispositivos silenciosos en su red.
 MiniWireshark hit an unexpected problem ¦ MiniWireshark a rencontré un problème inattendu ¦ MiniWireshark encontró un problema inesperado
 Getting started automatically — picking your best network card ¦ Démarrage automatique — choix de votre meilleure carte réseau ¦ Empezando automáticamente — eligiendo su mejor tarjeta de red
@@ -29815,6 +29857,38 @@ No devices seen yet. ¦ Aucun appareil vu pour l'instant. ¦ Aún no se ha visto
 What this computer could see ¦ Ce que cet ordinateur pouvait voir ¦ Lo que este equipo podía ver
 Couldn't answer this one here. ¦ Impossible de répondre à celle-ci d'ici. ¦ No se puede responder a esta desde aquí.
 Made on this computer by MiniWireshark %s. To keep a copy, print this page or save it as a PDF from the browser's Print dialog. ¦ Créé sur cet ordinateur par MiniWireshark %s. Pour en garder une copie, imprimez cette page ou enregistrez-la en PDF depuis la boîte d'impression du navigateur. ¦ Creado en este equipo por MiniWireshark %s. Para guardar una copia, imprima esta página o guárdela como PDF desde el cuadro de impresión del navegador.
+# 5.3.4 crowd test: the places where the app contradicted itself
+No unusual behaviour, but 1 open warning needs a look. ¦ Aucun comportement inhabituel, mais 1 avertissement ouvert mérite un coup d'œil. ¦ Ningún comportamiento inusual, pero 1 aviso abierto merece una revisión.
+They are in the Alerts tab. ¦ Ils sont dans l'onglet Alertes. ¦ Están en la pestaña Alertas.
+no unusual behaviour ¦ aucun comportement inhabituel ¦ ningún comportamiento inusual
+MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. ¦ MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. ¦ MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa.
+KILL SWITCH ON ¦ ARRÊT D'URGENCE ACTIVÉ ¦ INTERRUPTOR DE CORTE ACTIVADO
+Kill switch on ¦ Arrêt d'urgence activé ¦ Interruptor de corte activado
+MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. Each request it sent or blocked is listed in the self-traffic ledger (the button below). ¦ MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. Chaque requête envoyée ou bloquée figure dans le registre des envois (le bouton ci-dessous). ¦ MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa. Cada solicitud enviada o bloqueada figura en el registro de envíos (el botón de abajo).
+Settings → Privacy → Kill switch. MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. ¦ Paramètres → Confidentialité → Arrêt d'urgence. MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. ¦ Ajustes → Privacidad → Interruptor de corte. MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa.
+Nothing sent or blocked yet. ¦ Rien n'a encore été envoyé ni bloqué. ¦ Aún no se ha enviado ni bloqueado nada.
+Checks only run while watching live; this is demo data. ¦ Les vérifications ne tournent qu'en observation en direct ; ce sont des données de démo. ¦ Las comprobaciones solo se ejecutan observando en directo; estos son datos de demostración.
+Checks only run while watching live; this is saved data. ¦ Les vérifications ne tournent qu'en observation en direct ; ce sont des données enregistrées. ¦ Las comprobaciones solo se ejecutan observando en directo; estos son datos guardados.
+Checks only run while watching live. Press Start watching. ¦ Les vérifications ne tournent qu'en observation en direct. Appuyez sur Commencer à observer. ¦ Las comprobaciones solo se ejecutan observando en directo. Pulse Empezar a observar.
+The kill switch is on, so no checks are sent. ¦ L'arrêt d'urgence est activé : aucune vérification n'est envoyée. ¦ El interruptor de corte está activado, así que no se envía ninguna comprobación.
+Quiet Mode sends no test traffic. Switch to Active Scanning to run the checks. ¦ Le mode discret n'envoie aucun trafic de test. Passez au balayage actif pour lancer les vérifications. ¦ El modo silencioso no envía tráfico de prueba. Cambie al escaneo activo para ejecutar las comprobaciones.
+Still finding out which network this is; checks start once it is one you trust. ¦ Identification du réseau en cours ; les vérifications commencent dès que c'est un réseau de confiance. ¦ Todavía se está averiguando qué red es; las comprobaciones empiezan cuando sea una red de confianza.
+This network isn't marked as yours, so no test traffic is sent. Use “Trust this network” to allow the checks. ¦ Ce réseau n'est pas marqué comme le vôtre : aucun trafic de test n'est envoyé. Utilisez « Faire confiance à ce réseau » pour autoriser les vérifications. ¦ Esta red no está marcada como suya, así que no se envía tráfico de prueba. Use «Confiar en esta red» para permitir las comprobaciones.
+Active checks are switched off in Settings → Network Health. ¦ Les vérifications actives sont désactivées dans Paramètres → Santé du réseau. ¦ Las comprobaciones activas están desactivadas en Ajustes → Salud de la red.
+Check the router, DNS and the Internet now (a few tiny test connections). ¦ Vérifier maintenant le routeur, le DNS et Internet (quelques petites connexions de test). ¦ Comprobar ahora el router, el DNS e Internet (unas pocas conexiones de prueba diminutas).
+none: not capturing live ¦ aucune : pas de capture en direct ¦ ninguna: no se captura en directo
+not picked yet ¦ pas encore choisie ¦ aún no elegida
+not seen yet ¦ pas encore vu ¦ aún no visto
+none seen (no IPv6 router announcement) ¦ aucun vu (pas d'annonce de routeur IPv6) ¦ ninguno visto (sin anuncio de router IPv6)
+◐ Partly checked ¦ ◐ Vérifié en partie ¦ ◐ Comprobado en parte
+Partly checked ¦ Vérifié en partie ¦ Comprobado en parte
+router and Internet seen in traffic, not checked yet ¦ routeur et Internet vus dans le trafic, pas encore vérifiés ¦ router e Internet vistos en el tráfico, aún sin comprobar
+○ Only how quickly connections open was timed, not download speed ¦ ○ Seule la rapidité d'ouverture des connexions a été mesurée, pas la vitesse de téléchargement ¦ ○ Solo se midió lo rápido que se abren las conexiones, no la velocidad de descarga
+Weak signal — likely to make the connection slower. Move closer to the router or remove obstacles. ¦ Signal faible — risque de ralentir la connexion. Rapprochez-vous de la box ou enlevez les obstacles. ¦ Señal débil — probablemente haga la conexión más lenta. Acérquese al router o quite obstáculos.
+Time window ¦ Période ¦ Periodo
+%s of data so far ¦ %s de données pour l'instant ¦ %s de datos por ahora
+Device evidence: is it a real device? ●●● High (score 60+) · ●●○ Medium (score 30+) · ●○○ Low (score 10+) · ○○○ Unconfirmed. Evidence: how three facts are known, in order: on your network · name · kind (◉ Observed · ◈ Reported · ◎ Correlated · ◌ Inferred · ? Unknown). “Likely” or “Possibly” before a kind is how sure that guess is, so a device with High evidence can still be only “Possibly” a printer. ¦ Preuves de l'appareil : est-ce un vrai appareil ? ●●● Élevée (score 60+) · ●●○ Moyenne (score 30+) · ●○○ Faible (score 10+) · ○○○ Non confirmé. Preuves : comment trois faits sont connus, dans l'ordre : sur votre réseau · nom · type (◉ Observé · ◈ Signalé · ◎ Recoupé · ◌ Déduit · ? Inconnu). « Probable » ou « Peut-être » devant un type dit à quel point cette supposition est sûre : un appareil aux preuves élevées peut n'être que « Peut-être » une imprimante. ¦ Pruebas del dispositivo: ¿es un dispositivo real? ●●● Alta (puntuación 60+) · ●●○ Media (puntuación 30+) · ●○○ Baja (puntuación 10+) · ○○○ Sin confirmar. Pruebas: cómo se conocen tres datos, en orden: en su red · nombre · tipo (◉ Observado · ◈ Informado · ◎ Correlacionado · ◌ Deducido · ? Desconocido). «Probable» o «Posiblemente» delante de un tipo indica lo segura que es esa suposición, así que un dispositivo con pruebas altas puede ser solo «Posiblemente» una impresora.
+The devices on your local network. Device evidence shows how sure it is that each one is a real device — an IP address alone is never enough to count as a device. ¦ Les appareils de votre réseau local. Les preuves de l'appareil indiquent à quel point il est sûr que chacun est un vrai appareil — une adresse IP seule ne suffit jamais à compter comme appareil. ¦ Los dispositivos de su red local. Las pruebas del dispositivo indican lo seguro que es que cada uno sea un dispositivo real — una dirección IP sola nunca basta para contar como dispositivo.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -30883,6 +30957,27 @@ I18N_PATTERNS += [
      r"hasta ahora: \1 (solo las que pasaron por la tarjeta de red de "
      r"este ordenador)."),
 ]
+# 5.3.4 crowd test: the places where the app contradicted itself
+I18N_PATTERNS += [
+    (r"No unusual behaviour, but (\d+) open warnings need a look\.",
+     r"Aucun comportement inhabituel, mais \1 avertissements ouverts "
+     r"méritent un coup d'œil.",
+     r"Ningún comportamiento inusual, pero \1 avisos abiertos merecen una "
+     r"revisión."),
+    (r"No problems in what was checked\. Not checked yet: (.+)\.",
+     r"Aucun problème dans ce qui a été vérifié. Pas encore vérifié : "
+     r"{t1}.",
+     r"Ningún problema en lo que se comprobó. Aún sin comprobar: {t1}."),
+    (r"Worth a look: (.+?) — (.+) No slowness was measured, so it may not "
+     r"be slowing anything down\.",
+     "À regarder : {t1} — {t2} Aucune lenteur n'a été mesurée : ce n'est "
+     "peut-être la cause de rien.",
+     "Para revisar: {t1} — {t2} No se midió ninguna lentitud, así que "
+     "puede que no esté frenando nada."),
+    (r"(\d[\d,]*) shown · (\d[\d,]*) in memory · display paused",
+     r"\1 affichés · \2 en mémoire · affichage en pause",
+     r"\1 mostrados · \2 en memoria · vista en pausa"),
+]
 I18N_PATTERNS.sort(key=lambda x: 0 if x[0].startswith(
     ("Online now", r"Offline since (\d\d")) else 1)
 _I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
@@ -30923,7 +31018,12 @@ def _i18n_lookup(s, table, loc):
                     if tok in out:
                         sub = g or ""
                         if sub:
-                            sub = _i18n_lookup(sub, table, loc) or sub
+                            # a list ("Router reachable, Internet
+                            # reachable"): each name on its own
+                            sub = _i18n_lookup(sub, table, loc) or (
+                                ", ".join(_i18n_lookup(x, table, loc) or x
+                                          for x in sub.split(", "))
+                                if ", " in sub else sub)
                         out = out.replace(tok, sub)
             return pre + out + post
     # "Title — explanation": both halves known
@@ -33696,10 +33796,9 @@ SETTINGS_PAGES = [
          {"title": "What MiniWireshark itself sends", "controls": [
              {"key": "privacy.kill_switch", "type": "bool",
               "label": "Kill switch: stop everything MiniWireshark sends",
-              "help": "Watching keeps working, but nothing leaves this "
-                      "computer from MiniWireshark: no discovery probes, "
-                      "health checks, name lookups, downloads or update "
-                      "checks. Every send is listed in the ledger below."},
+              "help": KILL_SWITCH_EFFECT + " Each request it sent or "
+                      "blocked is listed in the self-traffic ledger (the "
+                      "button below)."},
              {"type": "info", "text_fn": "ledger_status_text"},
              {"type": "info", "text": "Update check: once a day, one request "
                                       "to api.github.com for the latest "
@@ -37873,6 +37972,14 @@ class DashboardTab(BaseTab):
     )
     RANGES = {"Last 5 minutes": (1, 300), "Last hour": (10, 360),
               "Last 24 hours": (60, 1440)}
+
+    def window_seconds(self):
+        """The time window picked at the top of the page, in seconds: the
+        charts and the “Who is using the Internet?” answer both use it
+        (5.3.4 crowd test #25: only the charts did, so the card kept
+        saying "in the last 10 min" whatever was picked)."""
+        res, n = self.RANGES.get(self.range_var.get(), (1, 300))
+        return res * n
     # Explain inline: one grey line under each card title
     CARD_EXPLAIN = {
         "internet": "Whether the Internet answers from here, measured "
@@ -37907,8 +38014,8 @@ class DashboardTab(BaseTab):
                           values=list(self.RANGES), width=14,
                           state="readonly")
         cb.pack(side="right")
-        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh(force=True))
-        tk.Label(head, text="Charts:", bg=WHITE, fg="#666666").pack(
+        cb.bind("<<ComboboxSelected>>", lambda e: self._window_changed())
+        tk.Label(head, text="Time window:", bg=WHITE, fg="#666666").pack(
             side="right", padx=6)
         tk.Label(outer, text="A quick overview — click any card to open "
                              "the full picture.", bg=WHITE,
@@ -38112,7 +38219,9 @@ class DashboardTab(BaseTab):
     def show_unusual_card(self):
         if self.unusual_card is None:
             return ""
-        text = unusual_card_text(len(unusual_findings(self.model.alerts)))
+        eng = self.model.alerts
+        text = unusual_card_text(len(unusual_findings(eng)),
+                                 len(other_open_alerts(eng)))
         with contextlib.suppress(tk.TclError):
             if self.unusual_lbl.cget("text") != translate_text(text):
                 self.unusual_lbl.configure(text=text)
@@ -38214,7 +38323,7 @@ class DashboardTab(BaseTab):
             return
         m, app = self.model, self.app
         if self.story_card is not None:
-            app.request_story()         # a job; at most once a minute
+            app.request_story()   # a job; when the data changed (10 s apart)
             self.show_story_card()
         self.show_unusual_card()
         now = m.now()
@@ -38260,6 +38369,11 @@ class DashboardTab(BaseTab):
             self.state_lbl.configure(bg=bg, fg=fg)
         self._draw_charts(now)
 
+    def _window_changed(self):
+        with contextlib.suppress(Exception):
+            self.app.dashboard_answers(force=True)
+        self.refresh(force=True)
+
     def _draw_charts(self, now):
         c, t, m = self.canvas, self.t, self.model
         try:
@@ -38272,6 +38386,11 @@ class DashboardTab(BaseTab):
         res, n = self.RANGES.get(self.range_var.get(), (1, 300))
         span = res * n
         xl = (f"-{human_duration(span)}", "now")
+        dur = m.metrics.duration(now) if m.metrics.first_ts else 0
+        if 0 < dur < span:
+            # (#25) a one-hour axis over 90 seconds of data says so
+            xl = (xl[0] + " · " + translate_text("%s of data so far") %
+                  human_duration(dur), "now")
         down = [v / res for _b, v in m.metrics.series["bytes_down"].series(
             res, n, now)]
         up = [v / res for _b, v in m.metrics.series["bytes_up"].series(
@@ -38861,9 +38980,17 @@ class TimelineTab(BaseTab):
         self._update_status()
         return len(rows)
 
+    def shown_event_count(self):
+        """The events listed now: one source for the counter under the
+        table. 5.3.4 crowd test (#5): the counter counted the table's rows
+        when it was last rebuilt (episode headings included) and was not
+        updated as events arrived, so it said "0 events this session"
+        over a list of events."""
+        return sum(1 for e in self.refs.values() if e is not None)
+
     def _update_status(self):
         hist = self.history_mode()
-        n = len(self.tree.get_children())
+        n = self.shown_event_count()
         if self.story_on():
             st = self.app.story
             with contextlib.suppress(tk.TclError):
@@ -39055,14 +39182,19 @@ class TimelineTab(BaseTab):
         if self.pause_var.get() or self.history_mode():
             return
         cutoff, dev_key, q = self._filters()
+        # (#5) a rebuild that ran before this batch arrived already listed
+        # it (it reads the model's timeline): those events are not added
+        # a second time
+        have = {id(v) for v in self.refs.values() if v is not None}
         for e in entries:
-            if self._matches(e, cutoff, dev_key, q):
+            if id(e) not in have and self._matches(e, cutoff, dev_key, q):
                 self._insert(e, index=0)
         kids = self.tree.get_children()
         if len(kids) > 1500:
             for old in kids[1500:]:
                 self.refs.pop(old, None)
             self.tree.delete(*kids[1500:])
+        self._update_status()
         self.kit.empty_soon()
 
     def _insert(self, e, index="end"):
@@ -39255,11 +39387,10 @@ class DevicesTab(BaseTab):
             ("tags", "Place / owner", 130, "w", True)]
 
     def build(self):
-        self.header("🏠  The devices on your local network. Confidence shows "
-                    "how much local evidence supports each one — an IP "
-                    "address alone is never enough to count as a device.",
-                    "Double-click a device for details, or right-click for "
-                    "actions (rename, mark as yours, merge…).")
+        self.header("🏠  The devices on your local network. Device evidence "
+                    "shows how sure it is that each one is a real device — "
+                    "an IP address alone is never enough to count as a "
+                    "device.", device_scales_key())
         bar = self.toolbar()
         self.show_inactive_var = tk.BooleanVar(
             value=self.app.config.get("devices.show_inactive", False))
@@ -39280,8 +39411,10 @@ class DevicesTab(BaseTab):
         fe.bind("<KeyRelease>", lambda e: self._filter_soon())
         ttk.Button(bar, text="Merge devices…",
                    command=self.merge_dialog).pack(side="right")
-        ttk.Button(bar, text="Details", command=self._details).pack(
-            side="right", padx=6)
+        det = ttk.Button(bar, text="Details", command=self._details)
+        det.pack(side="right", padx=6)
+        Tooltip(det, "Double-click a device for details, or right-click for "
+                     "actions (rename, mark as yours, merge…).")
         self.count_lbl = self.lbl(bar, "", muted=True)
         self.count_lbl.pack(side="right", padx=10)
         # 5.3.4 (M17, S3): scrolls sideways, so no heading is ever cut
@@ -39311,7 +39444,7 @@ class DevicesTab(BaseTab):
         if d is None:
             return ""
         tr_ = translate_text
-        return (f"{tr_(d.confidence)} {tr_('confidence')}: "
+        return (f"{tr_('Device evidence')} {tr_(d.confidence)}: "
                 f"{tr_(explain('confidence', d.confidence))}   ·   "
                 f"{tr_(explain('state', d.state, long=False))}: "
                 f"{tr_(explain('state', d.state))}")
@@ -41993,6 +42126,13 @@ def likely_culprit(results):
     return bad[0]
 
 
+# the checks the overall verdict needs before it says "Healthy" (#7), and
+# the measured symptoms that make a cause the "likely culprit" (#8)
+HEALTH_CORE_CHECKS = ("wifi", "gateway", "internet", "dns")
+HEALTH_SLOW_SIGNS = ("gateway", "internet", "dns", "loss", "latency",
+                     "retrans", "resets", "reconnects")
+
+
 class HealthTab(BaseTab):
     name, label_key = "health", "tab_health"
     CHECKS = (("overall", "Overall"), ("wifi", "Wi-Fi signal (this "
@@ -42022,6 +42162,9 @@ class HealthTab(BaseTab):
         self.run_btn = ttk.Button(head, text="Run checks now",
                                   command=self.app.run_health_checks)
         self.run_btn.pack(side="right")
+        self.run_tip = Tooltip(self.run_btn, "Check the router, DNS and the "
+                                             "Internet now (a few tiny test "
+                                             "connections).")
         ttk.Button(head, text="\U0001F50E Why is it slow?",
                    command=lambda: self.app.investigate("slow")).pack(
             side="right", padx=6)
@@ -42309,6 +42452,7 @@ class HealthTab(BaseTab):
                     "Needs attention": ("✖ Needs attention",
                                         "danger_fg"),
                     "Unknown": ("? Unknown", "muted_fg"),
+                    "Partly checked": ("◐ Partly checked", "muted_fg"),
                     "Info": ("ℹ Info", "info_fg")}
 
     def refresh(self):
@@ -42331,9 +42475,13 @@ class HealthTab(BaseTab):
         self.note_var.set(app.health_note())
         self.info_var.set(app.connection_info_text())
         self.show_calls()
-        allowed = app.health_checks_allowed()
+        why = app.health_checks_blocked()
         with contextlib.suppress(tk.TclError):
-            self.run_btn.state(["!disabled"] if allowed else ["disabled"])
+            self.run_btn.state(["disabled"] if why else ["!disabled"])
+        # (#17) a greyed button says why when pointed at
+        self.run_tip.set_text(translate_text(why) if why else translate_text(
+            "Check the router, DNS and the Internet now (a few tiny test "
+            "connections)."))
         sel = self.dns_tree.selection()
         keep = self.dns_tree.set(sel[0], "srv") if sel else None
         self.dns_tree.delete(*self.dns_tree.get_children())
@@ -42418,9 +42566,33 @@ def unusual_findings(engine, limit=None):
     return out
 
 
-def unusual_card_text(n):
-    """The Dashboard card's sentence."""
+def other_open_alerts(engine):
+    """The open WARNING and DANGER alerts that are not a statistical
+    judgment (an open remote-access service, a protocol without
+    encryption…), newest first. 5.3.4 crowd test (#4): the Dashboard
+    card, the Security section and the check-up each decided on their own
+    whether these count, and two said "Nothing unusual right now" over
+    open warnings in the Alerts tab. All three ask here now."""
+    out = []
+    for aid in list(engine.order):
+        a = engine.alerts.get(aid)
+        if a is None or a.acknowledged or a.kind in UNUSUAL_KINDS or \
+                a.severity not in ("WARNING", "DANGER"):
+            continue
+        out.append(a)
+    return out
+
+
+def unusual_card_text(n, others=0):
+    """The Dashboard card's sentence. `others`: open warnings that are
+    not about unusual behaviour; "Nothing unusual" is never said over
+    them."""
     if not n:
+        if others == 1:
+            return "No unusual behaviour, but 1 open warning needs a look."
+        if others:
+            return (f"No unusual behaviour, but {others} open warnings "
+                    f"need a look.")
         return "Nothing unusual right now."
     if n == 1:
         return "1 thing is unusual: see both readings."
@@ -42464,9 +42636,10 @@ class UnusualSection:
 
     def refresh(self, force=False):
         found = self.findings()
+        others = len(other_open_alerts(self.app.model.alerts))
         # 5.3.4: the language is part of it: "What we saw: …" is put
         # together already translated, so a switch must rebuild the cards
-        sig = (CURRENT_LOCALE, id(self.app.model), len(found),
+        sig = (CURRENT_LOCALE, id(self.app.model), len(found), others,
                tuple((f["id"], f["count"]) for f in found[:self.SHOW]))
         if sig == self._sig and not force:
             return found
@@ -42476,10 +42649,21 @@ class UnusualSection:
         self.cards, self._wrap = [], []
         with contextlib.suppress(tk.TclError):
             self.count_lbl.configure(text=(
+                "no unusual behaviour" if not found and others else
                 "nothing to look at" if not found else
                 "1 finding" if len(found) == 1 else
                 f"{len(found)} findings"))
-        if not found:
+        if not found and others:
+            # (#4) not "Nothing unusual" over open warnings
+            lbl = tk.Label(self.body, text=(
+                "⚠  " + translate_text(unusual_card_text(0, others)) +
+                " " + translate_text("They are in the Alerts tab.")),
+                bg=self.SECTION_BG, fg="#8a5a00", anchor="w",
+                justify="left", cursor="hand2")
+            lbl.pack(fill="x")
+            lbl.bind("<Button-1>", lambda e: self.app._select_tab("alerts"))
+            self._wrap.append((lbl, 1.0))
+        elif not found:
             lbl = tk.Label(self.body, text="✔  Nothing unusual right now. "
                                            "Each device is compared with "
                                            "what it usually does.",
@@ -44895,8 +45079,12 @@ class PacketsTab(BaseTab):
                                "and alerts, not packets — open a capture "
                                "file to see packets.")
             return
+        # 5.3.4 crowd test (#26): "in memory" is the number Statistics and
+        # the I/O graph count; while the display is paused it kept the
+        # number from the moment of the pause, so the tabs disagreed
         self.count_var.set(f"{len(self.matched)} shown · "
-                           f"{len(self.app.all_rows)} in memory")
+                           f"{len(self.app.all_rows)} in memory" +
+                           (" · display paused" if self.paused else ""))
 
     def add_rows(self, rows):
         if self.paused or not self.is_visible():
@@ -45147,6 +45335,8 @@ class PacketsTab(BaseTab):
         if self._dirty and not self.paused and self.is_visible():
             self._dirty = False
             self.rebuild()
+        elif self.is_visible():
+            self._count()          # paused: the list waits, the count not
 
     def rebuild(self):
         self._dirty = False
@@ -47009,9 +47199,7 @@ HELP_USING = (
      "what to attach when asking for help.",
      (("Diagnostics", "do", "open_diagnostics"),)),
     ("Kill switch",
-     "Settings → Privacy → Kill switch stops every optional network "
-     "request MiniWireshark makes (country lookup, downloads, update "
-     "checks). Watching continues, and nothing else changes.", ()),
+     "Settings → Privacy → Kill switch. " + KILL_SWITCH_EFFECT, ()),
 )
 
 # glossary notes: a word in a text -> its glossary topic (acronyms read
@@ -49616,9 +49804,7 @@ class MiniWireshark:
         cmd = self._toggle_active_scanning
         if LEDGER.killed:
             bg, fg = t["mode_quiet_bg"], t["mode_quiet_fg"]
-            text = ("\U0001F6D1 KILL SWITCH ON — MiniWireshark sends nothing "
-                    "at all (no probes, lookups, downloads or update "
-                    "checks). It only listens.")
+            text = "\U0001F6D1 KILL SWITCH ON — " + KILL_SWITCH_EFFECT
             btn_text = "Turn the kill switch off"
             cmd = self._kill_switch_off
         elif wanted and live and prof is None:
@@ -49688,9 +49874,7 @@ class MiniWireshark:
                         "Switch to Active Scanning",
                         self._toggle_active_scanning))
         if LEDGER.killed:
-            text = ("\U0001F6D1 KILL SWITCH ON — MiniWireshark sends nothing "
-                    "at all (no probes, lookups, downloads or update "
-                    "checks). It only listens.")
+            text = "\U0001F6D1 KILL SWITCH ON — " + KILL_SWITCH_EFFECT
             colors = ("mode_quiet_bg", "mode_quiet_fg")
         elif data:
             # 5.3.4 (ST-08): each piece in the current language (the
@@ -49852,10 +50036,32 @@ class MiniWireshark:
                        self.toggle_state_panel(False)).pack(side="right")
 
     def _kill_switch_off(self):
-        self.config.set("privacy.kill_switch", False)
+        self.set_kill_switch(False)
+
+    def set_kill_switch(self, on):
+        """The one way the kill switch is turned on or off outside the
+        Settings window's Apply. 5.3.4 crowd test (#3): the ledger's box
+        and the banner's button saved the setting, but an open Settings
+        window kept its old tick (and said "All changes saved"), and the
+        ledger's box kept its tick after the banner turned it off."""
+        on = bool(on)
+        self.config.set("privacy.kill_switch", on)
         self.config.save()
         self._apply_runtime_settings()
         self._restyle_mode_banner()
+        sw = self._settings_win
+        if sw is not None and sw.alive():
+            sw.sync_key("privacy.kill_switch", on)
+            if sw.page_id == "privacy" and not sw.dirty():
+                with contextlib.suppress(tk.TclError):
+                    sw.show_page("privacy")     # the ledger summary line
+        led = getattr(self, "_ledger_win", None)
+        var = getattr(led, "_mw_kill_var", None)
+        if var is not None:
+            with contextlib.suppress(tk.TclError):
+                if bool(var.get()) != on:
+                    var.set(on)
+        return on
 
     def _data_label_tag(self):
         lab = self.data_label
@@ -50945,7 +51151,8 @@ class MiniWireshark:
         c = m.alerts.counts()
         sig = (id(m), self.data_mode, c["DANGER"], c["WARNING"],
                len(m.health_history), self.active_mode(),
-               bool(m.metrics.first_ts), CURRENT_LOCALE)      # ST-08
+               bool(m.metrics.first_ts), CURRENT_LOCALE,      # ST-08
+               self.dashboard_window())                       # #25
         cache = getattr(self, "_answers", None)
         now = time.monotonic()
         if not force and cache is not None and cache["sig"] == sig and \
@@ -51032,7 +51239,11 @@ class MiniWireshark:
             LOG.debug("health verdict for the answer", exc_info=True)
             worst, why = "", ""
         if worst in ("Needs attention", "Degraded"):
-            return (tr("Possibly") + ": " + (tr(why) if why else tr(
+            # (#8) "Possibly: Likely culprit: …" hedged twice
+            lead = "" if why.startswith(("Likely culprit:",
+                                         "Worth a look:")) else \
+                tr("Possibly") + ": "
+            return (lead + (tr(why) if why else tr(
                 "the Health tab found something to look at")) +
                     ("" if (why or "").endswith(".") else "."), "warn",
                     lambda: self.goto("health"))
@@ -51061,11 +51272,21 @@ class MiniWireshark:
                     self.show_alert(a) if a else self.goto("alerts"))
         return (text, "good", lambda: self.goto("health"))
 
+    def dashboard_window(self):
+        """Seconds: the Dashboard's time window (#25), else 10 minutes."""
+        dash = getattr(self, "tabs", {}).get("dash")
+        try:
+            return dash.window_seconds() if dash is not None else \
+                self.USAGE_WINDOW
+        except (AttributeError, tk.TclError):
+            return self.USAGE_WINDOW
+
     def usage_by_device(self, window=None):
         """Bytes per device over the last `window` seconds of
-        connections, and the bytes tied to no device."""
+        connections (the Dashboard's window), and the bytes tied to no
+        device."""
         m = self.model
-        window = window or self.USAGE_WINDOW
+        window = window or self.dashboard_window()
         now = m.now()
         per, unatt = Counter(), 0
         for x in m.flows.all_flows():
@@ -51083,8 +51304,9 @@ class MiniWireshark:
         devices: it says it cannot see them."""
         tr = translate_text
         m = self.model
-        per, unatt = self.usage_by_device()
-        win = span_words(self.USAGE_WINDOW)
+        window = self.dashboard_window()
+        per, unatt = self.usage_by_device(window)
+        win = span_words(window)
         show = lambda: self.investigate("bandwidth")        # noqa: E731
         v = m.vantage.classify(offline=self.data_mode in ("offline",
                                                           "session"))
@@ -51324,15 +51546,20 @@ class MiniWireshark:
         if jobs is None or "story" in jobs.active:
             return None
         st = self.story
+        sig = story_data_sig(self.model)
+        age = time.monotonic() - self._story_at
         if not force and st is not None and \
                 st.get("model_id") == id(self.model) and \
-                time.monotonic() - self._story_at < STORY_MAX_AGE:
+                age < STORY_MAX_AGE and \
+                (st.get("data_sig") == sig or age < STORY_MIN_AGE):
             return None
         since, until, store, last = self.story_period()
         m, gate = self.model, self.gate
 
         def run(job):
-            return story_job_run(job, gate, m, store, since, until, last)
+            story = story_job_run(job, gate, m, store, since, until, last)
+            story["data_sig"] = sig
+            return story
         return jobs.submit("story", "Writing the story", run,
                            done=self._story_done, failed=self._story_failed)
 
@@ -55383,13 +55610,24 @@ proc ::mw_explicit_fonts {top names} {
         m, tr = self.model, translate_text
         now = m.now()
         parts = []
-        h = m.health if self.data_mode == "live" else {}
+        # (#7) the same facts as the Health tab's rows: its router and
+        # Internet rows read m.health in every mode, and say "seen" when
+        # only passive traffic showed them
+        h = m.health
         if h.get("time"):
             age = max(0, time.time() - h["time"])
             parts.append(tr("router and Internet checks") + " " +
                          span_words(age) + " " + tr("ago"))
         else:
-            parts.append(tr("no router or Internet check yet"))
+            res = {}
+            with contextlib.suppress(Exception):
+                res = self.health_summary()
+            if any((res.get(k) or ("",))[0] == "Info"
+                   for k in ("gateway", "internet")):
+                parts.append(tr("router and Internet seen in traffic, not "
+                                "checked yet"))
+            else:
+                parts.append(tr("no router or Internet check yet"))
         parts.append(tr("website lookups and connections over the last") +
                      " " + span_words(600))
         wp = self._wifi_view()
@@ -55659,8 +55897,36 @@ proc ::mw_explicit_fonts {top names} {
     #  Health
     # ======================================================================
     def health_checks_allowed(self):
-        return (self.data_mode == "live" and self.active_mode() and
-                self.config.get("health.active_checks", True))
+        return not self.health_checks_blocked()
+
+    def health_checks_blocked(self):
+        """Why the active checks can't run now ("" when they can): one
+        reason for the greyed "Run checks now" button, its tooltip, the
+        note under it and the banner (5.3.4 crowd test #17: the button
+        was greyed with no hint, and the note asked for a "Trust this
+        network" button the banner didn't show)."""
+        if self.data_mode in ("offline", "session", "demo"):
+            return ("Checks only run while watching live; this is demo "
+                    "data." if self.data_mode == "demo" else "Checks only "
+                    "run while watching live; this is saved data.")
+        if self.data_mode != "live":
+            return "Checks only run while watching live. Press Start watching."
+        if LEDGER.killed:
+            return "The kill switch is on, so no checks are sent."
+        if not self.config.get("mode.active_scanning", True):
+            return ("Quiet Mode sends no test traffic. Switch to Active "
+                    "Scanning to run the checks.")
+        if not self.active_mode():
+            if getattr(self, "network_profile", None) is None:
+                return ("Still finding out which network this is; checks "
+                        "start once it is one you trust.")
+            return ("This network isn't marked as yours, so no test "
+                    "traffic is sent. Use “Trust this network” to allow "
+                    "the checks.")
+        if not self.config.get("health.active_checks", True):
+            return ("Active checks are switched off in Settings → Network "
+                    "Health.")
+        return ""
 
     def _dns_target(self):
         for s in self.system_dns + sorted(self.model.dhcp_dns):
@@ -55698,16 +55964,21 @@ proc ::mw_explicit_fonts {top names} {
                             "Internet connection test failed")
 
     def run_health_checks(self):
-        if not self.health_checks_allowed():
-            self._set_banner("Health checks send a few tiny test connections, "
-                             "so they only run while watching live with "
-                             "Active Scanning on (not in Quiet Mode).",
-                             kind="warn")
+        why = self.health_checks_blocked()
+        if why:
+            self._set_banner(translate_text(why), kind="warn")
             return
         self.prober.run_now.set()
         self._set_banner("\U0001FA7A  Running health checks…")
 
     def health_note(self):
+        if self.data_mode == "live" and LEDGER.killed:
+            return self.health_checks_blocked()
+        if self.data_mode == "live" and \
+                self.config.get("mode.active_scanning", True) and \
+                getattr(self, "network_profile", None) is None and \
+                not self.active_mode():
+            return self.health_checks_blocked()
         if self.data_mode in ("offline", "session", "demo"):
             return ("Showing what can be worked out from the "
                     f"{'demo data' if self.data_mode == 'demo' else 'saved data'}"
@@ -55925,15 +56196,32 @@ proc ::mw_explicit_fonts {top names} {
             worst = "Unknown"
         names = {k: t for k, t in HealthTab.CHECKS}
         culprit = likely_culprit(out)
-        if worst == "Healthy":
+        # 5.3.4 crowd test (#7): "Healthy" only when the checks at the top
+        # have a result; "no conflicts seen" over three "? Unknown" rows
+        # is not a clean bill of health
+        unchecked = [names[k] for k in HEALTH_CORE_CHECKS
+                     if out[k][0] == "Unknown"]
+        if worst == "Healthy" and unchecked:
+            worst = "Partly checked"
+            text = ("No problems in what was checked. Not checked yet: " +
+                    ", ".join(unchecked) + ".")
+        elif worst == "Healthy":
             text = "Everything checked looks fine."
         elif worst == "Unknown":
             text = "Not enough information yet."
         else:
             parts = []
-            if culprit:
+            # (#8) a cause is only the "likely culprit" when a symptom was
+            # measured too; a weak signal alone is worth a look
+            signs = [k for k in HEALTH_SLOW_SIGNS if k != culprit and
+                     order.get(out[k][0], 0) >= 1]
+            if culprit and (culprit in HEALTH_SLOW_SIGNS or signs):
                 parts.append(f"Likely culprit: {names[culprit]} — "
                              f"{out[culprit][1]}")
+            elif culprit:
+                parts.append(f"Worth a look: {names[culprit]} — "
+                             f"{out[culprit][1]} No slowness was measured, "
+                             f"so it may not be slowing anything down.")
             others = [names[k] for k in bad if k != culprit and k in names]
             if others:
                 parts.append("Also look at: " + ", ".join(others) + ".")
@@ -55945,18 +56233,29 @@ proc ::mw_explicit_fonts {top names} {
     def connection_info_text(self):
         m = self.model
         rec = self._score_for(self.current_iface_label)
-        lines = ["Network card : " + (self.current_iface_label or "—"),
-                 "This computer: " + (", ".join(sorted(m.my_ips)) or "—"),
+        # 5.3.4 crowd test (#17): a value that isn't known says why,
+        # instead of a bare "—"
+        tr = translate_text
+        live = self.data_mode == "live"
+        no_card = tr("none: not capturing live") if not live else \
+            tr("not picked yet")
+        lines = ["Network card : " + (self.current_iface_label or no_card),
+                 "This computer: " + (", ".join(sorted(m.my_ips)) or
+                                      tr("not seen yet")),
                  "Subnet(s)    : " + (", ".join(str(n) for n in
-                                                m.local_nets[:3]) or "—"),
-                 "Router       : " + (m.gateway_ip or "—"),
+                                                m.local_nets[:3]) or
+                                      tr("not seen yet")),
+                 "Router       : " + (m.gateway_ip or tr("not seen yet")),
                  "DNS servers  : " + (", ".join(
                      (self.system_dns[:3] if self.data_mode == "live"
-                      else []) or sorted(m.dhcp_dns)[:3]) or "—"),
+                      else []) or sorted(m.dhcp_dns)[:3]) or
+                     tr("not seen yet")),
                  "IPv6 prefix  : " + (", ".join(str(p) for p in
-                                               m.v6_prefixes[:2]) or "—"),
+                                               m.v6_prefixes[:2]) or
+                                      tr("none seen (no IPv6 router "
+                                         "announcement)")),
                  "Why this card: " + (explain_reasons(rec) if rec
-                                      else "—")]
+                                      else no_card)]
         wp = self._wifi_view()
         w = wp.last if wp is not None else None
         if w:
@@ -58876,9 +59175,8 @@ proc ::mw_explicit_fonts {top names} {
         if LEDGER.killed and not was:
             with contextlib.suppress(Exception):
                 self._stop_lan_scanner()
-            self._set_banner("\U0001F6D1  Kill switch on — MiniWireshark "
-                             "sends nothing (watching continues).",
-                             kind="warn")
+            self._set_banner("\U0001F6D1  Kill switch on — " +
+                             KILL_SWITCH_EFFECT, kind="warn")
         if was != LEDGER.killed:
             with contextlib.suppress(Exception):
                 self._restyle_mode_banner()
@@ -59486,7 +59784,7 @@ proc ::mw_explicit_fonts {top names} {
         return n
 
     def ledger_status_text(self):
-        state = ("🛑 Kill switch ON — nothing is being sent." if
+        state = ("🛑 Kill switch on — " + KILL_SWITCH_EFFECT if
                  LEDGER.killed else "Sent since start, by feature:")
         return state + "\n" + "\n".join(LEDGER.summary_lines())
 
@@ -59513,13 +59811,12 @@ proc ::mw_explicit_fonts {top names} {
         kill_var = tk.BooleanVar(value=LEDGER.killed)
 
         def toggle():
-            self.config.set("privacy.kill_switch", kill_var.get())
-            self.config.save()
-            self._apply_runtime_settings()
+            self.set_kill_switch(kill_var.get())
             fill()
         ttk.Checkbutton(bar, text="Kill switch: stop everything MiniWireshark "
                                   "sends", variable=kill_var,
                         command=toggle).pack(side="left")
+        win._mw_kill_var = kill_var
         sum_var = DisplayVar()
         tk.Label(bar, textvariable=sum_var, bg=t["tab_bg"],
                  fg=t["muted_fg"]).pack(side="right")
@@ -59531,12 +59828,23 @@ proc ::mw_explicit_fonts {top names} {
             ("detail", "Details", 260, "w", True),
             ("status", "", 70, "center", False)])
         wrap.pack(fill="both", expand=True, padx=12, pady=8)
+        # (#3) an empty ledger says so instead of showing a blank table
+        empty_lbl = tk.Label(win, text="Nothing sent or blocked yet.",
+                             bg=t["tab_bg"], fg=t["muted_fg"])
+        win._mw_empty = empty_lbl
         shown = [0]
 
         def fill():
             if not win.winfo_exists():
                 return
+            if bool(kill_var.get()) != LEDGER.killed:
+                kill_var.set(LEDGER.killed)   # changed elsewhere (#3)
             rows = LEDGER.snapshot()
+            if rows and empty_lbl.winfo_manager():
+                empty_lbl.place_forget()
+            elif not rows and not empty_lbl.winfo_manager():
+                empty_lbl.place(in_=wrap, relx=0.5, rely=0.35,
+                                anchor="center")
             if len(rows) != shown[0] or not tree.get_children():
                 tree.delete(*tree.get_children())
                 for e in reversed(rows[-1000:]):
@@ -61358,12 +61666,10 @@ def checkup_facts(model, app=None, data_mode="live", namer=None,
     # MC6: unusual activity, then the other open warnings
     facts["unusual"] = unusual_findings(m.alerts, limit=5) if \
         FEATURES.get("unusual_section", True) else []
-    found = [m.alerts.alerts[a] for a in list(m.alerts.order)
-             if a in m.alerts.alerts]
+    others = other_open_alerts(m.alerts)
+    facts["other_open"] = len(others)
     facts["alerts"] = [(a.severity, translate_event(a.reason))
-                       for a in found if not a.acknowledged and
-                       a.severity in ("WARNING", "DANGER") and
-                       a.kind not in UNUSUAL_KINDS][:5]
+                       for a in others][:5]
     # MC7: the investigations, passively
     facts["investigations"] = checkup_investigations(m, app, offline)
     # MC3: the devices with their kinds
@@ -61484,7 +61790,7 @@ def checkup_html(facts, red=None):
     alerts = facts.get("alerts") or []
     parts.append(f"<section><h2>{e(tr('Unusual activity'))}</h2>" + (
         "".join(cards) if cards else
-        f"<p class='muted'>{e(tr('Nothing unusual right now.'))}</p>") + (
+        f"<p class='muted'>{e(tr(unusual_card_text(0, facts.get('other_open') or 0)))}</p>") + (
         f"<p><b>{e(tr('Other open alerts'))}</b></p><ul>" + "".join(
             f"<li><span class='badge sev-{e(sev)}'>{e(tr(sev))}</span> "
             f"{E(reason)}</li>" for sev, reason in alerts) + "</ul>"
@@ -94512,7 +94818,7 @@ def _ready_updates(cfg):
 
 def _ready_outbound(cfg):
     if cfg is not None and cfg.get("privacy.kill_switch", False):
-        return "ok", "Nothing leaves this PC: the kill switch is on.", ""
+        return "ok", "Kill switch on — " + KILL_SWITCH_EFFECT, ""
     sent = LEDGER.summary_lines()
     return ("info", "What MiniWireshark itself sends is listed in "
             "Privacy (Settings). So far: " + "; ".join(sent[:3]), "")
