@@ -24894,7 +24894,7 @@ DEFAULT_FILTER_PRESETS = {
 def _default_config():
     return {
         "config_version": CONFIG_SCHEMA_VERSION,
-        "general": {"auto_start_capture": True, "confirm_before_clear": False,
+        "general": {"auto_start_capture": True, "confirm_before_clear": True,
                     "beginner_explanations": True,
                     "explanation_verbosity": "Normal", "language": "English",
                     "upgraded_from_3": False, "show_welcome": True,
@@ -28394,6 +28394,10 @@ This alert isn't about one device; use “Mute this type” instead. ¦ Cette al
 This banner always tells the truth about whether MiniWireshark is sending discovery probes and health checks on your network or only listening. It can never be hidden — that's a transparency guarantee, not a setting. ¦ Ce bandeau dit toujours la vérité : MiniWireshark envoie-t-il des sondes de découverte et des vérifications de santé sur votre réseau, ou écoute-t-il seulement ? Il ne peut jamais être masqué — c'est une garantie de transparence, pas un réglage. ¦ Esta franja siempre dice la verdad sobre si MiniWireshark envía sondas de descubrimiento y comprobaciones de salud en su red o solo escucha. Nunca se puede ocultar — es una garantía de transparencia, no un ajuste.
 This check needs Active Mode on a network you've marked as yours, while watching live (and the kill switch off). ¦ Cette vérification nécessite le mode actif sur un réseau marqué comme vôtre, pendant l'observation en direct (et l'arrêt d'urgence désactivé). ¦ Esta comprobación necesita el modo activo en una red marcada como suya, observando en directo (y el interruptor de corte desactivado).
 This clears all packets, devices, websites, connections, alerts and the timeline from this session. Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. ¿Continuar?
+This clears all packets, devices, websites, connections, alerts and the timeline from this session. Watching carries on if it is running. You can undo it for 30 seconds.⏎⏎Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. L'observation continue si elle est en cours. Vous pouvez l'annuler pendant 30 secondes.⏎⏎Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. La observación continúa si está en marcha. Puede deshacerlo durante 30 segundos.⏎⏎¿Continuar?
+This clears all packets, devices, websites, connections, alerts and the timeline from this session. Watching carries on if it is running. This can't be undone.⏎⏎Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. L'observation continue si elle est en cours. Cette action est irréversible.⏎⏎Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. La observación continúa si está en marcha. No se puede deshacer.⏎⏎¿Continuar?
+This clears all packets, devices, websites, connections, alerts and the timeline from this session. Watching stops too (New session). You can undo it for 30 seconds.⏎⏎Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. L'observation s'arrête aussi (nouvelle session). Vous pouvez l'annuler pendant 30 secondes.⏎⏎Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. La observación también se detiene (nueva sesión). Puede deshacerlo durante 30 segundos.⏎⏎¿Continuar?
+This clears all packets, devices, websites, connections, alerts and the timeline from this session. Watching stops too (New session). This can't be undone.⏎⏎Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. L'observation s'arrête aussi (nouvelle session). Cette action est irréversible.⏎⏎Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. La observación también se detiene (nueva sesión). No se puede deshacer.⏎⏎¿Continuar?
 This preset uses an advanced expression; switch to Advanced view to see it. ¦ Ce préréglage utilise une expression avancée ; passez en vue avancée pour la voir. ¦ Este ajuste usa una expresión avanzada; cambie a la vista avanzada para verla.
 Trust / untrust ¦ Faire confiance / retirer ¦ Confiar / dejar de confiar
 Trust this certificate? ¦ Faire confiance à ce certificat ? ¦ ¿Confiar en este certificado?
@@ -58442,14 +58446,27 @@ proc ::mw_explicit_fonts {top names} {
     # ======================================================================
     #  Clearing / sessions / offline data / demo
     # ======================================================================
-    def clear(self):
-        if self.config.get("general.confirm_before_clear", False):
-            if not messagebox.askyesno(
-                    "Clear everything?",
-                    "This clears all packets, devices, websites, connections, "
-                    "alerts and the timeline from this session. Continue?",
-                    parent=self.root):
-                return
+    def _confirm_clear(self, stopping=False):
+        """5.3.4 crowd test #10: Clear (Ctrl+L) asks first unless "Ask
+        before clearing data" was turned off (it was off by default, so
+        one key press wiped the session), and says how it differs from
+        New session."""
+        if not self.config.get("general.confirm_before_clear", True):
+            return True
+        undo = self.data_mode not in ("offline", "session", "demo")
+        return messagebox.askyesno(
+            "Clear everything?",
+            "This clears all packets, devices, websites, connections, "
+            "alerts and the timeline from this session. "
+            + ("Watching stops too (New session)." if stopping else
+               "Watching carries on if it is running.")
+            + (" You can undo it for 30 seconds." if undo else
+               " This can't be undone.")
+            + "\n\nContinue?", parent=self.root)
+
+    def clear(self, confirmed=False):
+        if not confirmed and not self._confirm_clear():
+            return
         live = self.data_mode == "live"
         undo = None
         if self.data_mode in ("offline", "session", "demo"):
@@ -58522,8 +58539,10 @@ proc ::mw_explicit_fonts {top names} {
         return True
 
     def _new_session(self):
+        if not self._confirm_clear(stopping=True):
+            return
         self.stop()
-        self.clear()
+        self.clear(confirmed=True)
 
     def _return_to_live(self):
         if self.data_mode == "demo":
@@ -95524,6 +95543,37 @@ def gt_c9_start_without_engine(app, ctx):
     _gui_pump(root, 0.3)
     assert "Demo Mode" not in app.status_var.get(), app.status_var.get()
     _gt_back_to_scenario(app, ctx)
+
+
+@gui_test_step("5.3.4 crowd #10: Clear and New session ask first by default; "
+               "No keeps everything")
+def gt_c10_clear_asks(app, ctx):
+    root = app.root
+    assert config_defaults_flat()["general.confirm_before_clear"] is True
+    cfg = app.config
+    had = cfg.get("general.confirm_before_clear", None)
+    # a settings file that never changed this setting gets the default
+    with contextlib.suppress(KeyError, AttributeError, TypeError):
+        del cfg.data["general"]["confirm_before_clear"]
+    n, count = len(app.model.registry.by_key), app.model.count
+    assert n, "the scenario should have devices"
+    asked = []
+    real_ask = messagebox.askyesno
+    messagebox.askyesno = lambda *a, **k: asked.append(a) and False
+    try:
+        app.clear()
+        app._new_session()
+    finally:
+        messagebox.askyesno = real_ask
+        if had is not None:
+            cfg.set("general.confirm_before_clear", had)
+    _gui_pump(root, 0.2)
+    assert len(asked) == 2, asked
+    assert len(app.model.registry.by_key) == n and \
+        app.model.count == count, "No still cleared the session"
+    assert "Watching carries on" in asked[0][1], asked[0][1]
+    assert "Watching stops too" in asked[1][1], asked[1][1]
+    assert "can't be undone" in asked[0][1]       # offline: no Undo
 
 
 # ============================================================================

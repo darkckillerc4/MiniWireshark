@@ -87,6 +87,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - The Packets tab's "in memory" count stays current while the display is paused, so it matches Statistics and the I/O graph.
 - The Devices tab explains its three ways of saying how sure it is: "Device evidence" (is it a real device, with the score each level needs), the "Evidence" marks, and "Likely" or "Possibly" before a kind.
 - *Start watching* on a computer that can't capture no longer clears the demo or the opened file first: it keeps what is on screen and says why it can't watch, with a Repair button. After the demo ends, the status line no longer says Demo Mode.
+- *Clear and start fresh* (Ctrl+L) and *New session* now ask before they wipe the session ("Ask before clearing data" is on by default), say whether watching carries on, and whether Undo is possible. Saying No to New session no longer stops watching.
 
 **Known limits**
 
