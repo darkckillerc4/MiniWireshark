@@ -23171,7 +23171,8 @@ class NetworkModel:
         self.epoch_open(end, "resumed")
         return entry
 
-    def push_timeline(self, kind, severity, text, ref=None, device=""):
+    def push_timeline(self, kind, severity, text, ref=None, device="",
+                      named=None):
         entry = {"when": self.now(), "kind": kind, "severity": severity,
                  "text": text, "ref": ref, "device": device,
                  "live": not self.use_packet_clock}
@@ -23179,7 +23180,7 @@ class NetworkModel:
         # the device's current name instead of three names for one device
         dv = self.registry.by_key.get(device) if device else None
         if dv is not None:
-            nm = dv.display_name()
+            nm = named or dv.display_name()
             if nm and nm in text:
                 entry["name"] = nm
         self.timeline.append(entry)
@@ -23192,9 +23193,61 @@ class NetworkModel:
                 del self.tl_pending[:5000]
         return entry
 
+    def alert_device_name(self, dev):
+        """The name an alert sentence uses for `dev`: its display name,
+        but "This computer" when it has no name of its own (its maker or
+        address said nothing), "Your router" instead of an address."""
+        n = dev.display_name()
+        if dev.alias or dev.best_name():
+            return n
+        if dev.device_class == "This computer" or \
+                (dev.ip and dev.ip in self.my_ips):
+            return "This computer"
+        if dev.ip and dev.ip == self.gateway_ip and looks_like_address(n):
+            return "Your router"
+        return n
+
+    def refresh_alert_names(self, keys=None):
+        """5.3.4 crowd test #11: alert titles carry the device's name as
+        it is now. A renamed device kept its old name in the Alerts tab
+        (the Devices tab and the Timeline had the new one), and this
+        computer was named by its address. → the alerts changed."""
+        reg = self.registry
+        changed = []
+        for a in list(self.alerts.alerts.values()):
+            if keys is not None and a.device_key not in keys:
+                continue
+            old = a.refs.get("named")
+            if not old or old not in a.reason:
+                continue
+            dev = reg.by_key.get(reg.resolve(a.device_key))
+            if dev is None:
+                continue
+            new = self.alert_device_name(dev)
+            if not new or new == old or (looks_like_address(new) and
+                                         not looks_like_address(old)):
+                continue
+            a.reason = a.reason.replace(old, new, 1)
+            a.refs["named"] = new
+            changed.append(a)
+        for a in changed:
+            if a not in self.ev_alerts:
+                a.updated = True          # shown again, not announced again
+                self.ev_alerts.append(a)
+        return changed
+
     def _alert(self, a):
         if a is None:
             return None
+        if not a.updated and "named" not in a.refs:
+            dv = self.registry.by_key.get(a.device_key)
+            nm = dv.display_name() if dv is not None else ""
+            if nm and nm in a.reason:
+                a.refs["named"] = nm
+                new = self.alert_device_name(dv)
+                if new and new != nm:
+                    a.reason = a.reason.replace(nm, new, 1)
+                    a.refs["named"] = new
         self.ev_alerts.append(a)
         if not a.updated:
             self.metrics.add("alerts", self.now(), 1)
@@ -23667,10 +23720,15 @@ class NetworkModel:
                               info.get("lease_time") or 0,
                               "server": info.get("server_id") or
                               d["src_ip"], "hostname": host})
+                # crowd test #11: a device without a name is not named
+                # by the address it is being given
+                nm = dev.display_name()
+                if not nm or looks_like_address(nm):
+                    nm = "A device"
                 self.push_timeline("dhcp lease", "INFO",
-                                   f"{dev.display_name()} got address "
+                                   f"{nm} got address "
                                    f"{info['yiaddr']} from DHCP",
-                                   ("device", dev.key), dev.key)
+                                   ("device", dev.key), dev.key, named=nm)
 
     def _observe_nd(self, d, ts):
         nd = d["nd"]
@@ -24647,6 +24705,7 @@ class NetworkModel:
                         "alerts.unknown_min_packets", 5), 5) and \
                     not dev.expected:
                 self._alert(self.alerts.unknown_device(dev))
+        self.refresh_alert_names()
         yield "unknown devices"
         for keep, other in self.registry.auto_merge_pass():
             dev = self.registry.by_key.get(keep)
@@ -27513,6 +27572,7 @@ DNS HEALTH ¦ SANTÉ DNS ¦ SALUD DNS
 ALERTS ¦ ALERTES ¦ ALERTAS
 MOST ACTIVE DEVICE ¦ APPAREIL LE PLUS ACTIF ¦ DISPOSITIVO MÁS ACTIVO
 This computer ¦ Cet ordinateur ¦ Este equipo
+A device ¦ Un appareil ¦ Un dispositivo
 MOST CONTACTED WEBSITE ¦ SITE LE PLUS CONTACTÉ ¦ SITIO MÁS CONTACTADO
 CAPTURE DURATION ¦ DURÉE DE CAPTURE ¦ DURACIÓN DE LA CAPTURA
 Feed speed ¦ Vitesse du fil ¦ Velocidad del flujo
@@ -31070,8 +31130,8 @@ EVENT_PATTERNS = [
     (r"(.+) connected: reporting lookups for (\d+) device\(s\)",
      r"\1 connecté : signale les recherches de \2 appareil(s)",
      r"\1 conectado: informa de las búsquedas de \2 dispositivo(s)"),
-    (r"(.+) got address (\S+) from DHCP", r"\1 a obtenu l'adresse \2 par "
-     r"DHCP", r"\1 obtuvo la dirección \2 por DHCP"),
+    (r"(.+) got address (\S+) from DHCP", r"{t1} a obtenu l'adresse \2 par "
+     r"DHCP", r"{t1} obtuvo la dirección \2 por DHCP"),
     (r"(.+) joined your network", r"\1 a rejoint votre réseau",
      r"\1 se ha unido a su red"),
     (r"(.+) moved to history \(expired\)", r"\1 passé dans l'historique "
@@ -31108,8 +31168,8 @@ EVENT_PATTERNS = [
      r"identificativa"),
     (r"(.+) keeps switching between devices", r"\1 passe sans cesse d'un "
      r"appareil à l'autre", r"\1 cambia continuamente entre dispositivos"),
-    (r"(.+) offers remote access \((.+)\)", r"\1 propose un accès à "
-     r"distance (\2)", r"\1 ofrece acceso remoto (\2)"),
+    (r"(.+) offers remote access \((.+)\)", r"{t1} propose un accès à "
+     r"distance (\2)", r"{t1} ofrece acceso remoto (\2)"),
     (r"(.+) shows a scanning-like pattern", r"\1 présente un comportement "
      r"qui ressemble à un balayage", r"\1 muestra un patrón parecido a un "
      r"escaneo"),
@@ -31347,6 +31407,8 @@ def timeline_text(model, e):
     if dev is None:
         return text
     new = dev.display_name()
+    if looks_like_address(new) and not looks_like_address(old):
+        return text           # "A device got address …" stays readable
     return text.replace(old, new, 1) if new and new != old else text
 
 
@@ -50842,6 +50904,8 @@ class MiniWireshark:
 
     # ---- corrections (undoable) ---------------------------------------------------
     def _apply_correction_result(self, keys, banner=""):
+        if keys:
+            self.model.refresh_alert_names(set(keys))
         for k in keys:
             dev = self.model.registry.by_key.get(k)
             if dev is not None and dev.live:
@@ -58238,9 +58302,22 @@ proc ::mw_explicit_fonts {top names} {
         """A stored alert rule in words."""
         kind, _, subject = str(tag).partition("|")
         title = translate_text(ALERT_TYPES.get(kind, (kind,))[0])
-        dev = self.model.registry.by_key.get(subject)
+        reg = self.model.registry
+        dev = reg.by_key.get(subject)
+        detail = ""
+        if dev is None and "|" in subject:
+            # 5.3.4 crowd test #11: a subject is "device key|service" (or
+            # "|protocol|server"); the toast showed the raw key
+            # "02:00:5e:10:00:10|SSH" instead of the device's name
+            key, _, detail = subject.partition("|")
+            dev = reg.by_key.get(reg.resolve(key)) or reg.by_key.get(key)
+            if dev is None:
+                subject = key
+            detail = detail.replace("|", ", ")
         who = self.device_label(dev) if dev is not None else \
             (subject.replace("ip:", "") or "?")
+        if detail:
+            who = f"{who} ({detail})"
         if kind_of == "muted":
             return translate_text("No more “%s” alerts for %s") % (title,
                                                                    who)
@@ -95574,6 +95651,90 @@ def gt_c10_clear_asks(app, ctx):
     assert "Watching carries on" in asked[0][1], asked[0][1]
     assert "Watching stops too" in asked[1][1], asked[1][1]
     assert "can't be undone" in asked[0][1]       # offline: no Undo
+
+
+@self_test()
+def t_c11_alert_names_this_computer(ctx):
+    """5.3.4 crowd test #11: an alert about this computer, which has no
+    name of its own, says "This computer", not its address or maker; a
+    rename reaches the alert's title, and undoing it brings it back."""
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    ra = next(a for a in m.alerts.alerts.values()
+              if a.kind == "remote_access")
+    assert ra.reason == "This computer offers remote access (SSH)", \
+        ra.reason
+    a = next(a for a in m.alerts.alerts.values()
+             if a.reason == "Alex-iPhone joined your network")
+    m.correct_rename(a.device_key, "Kid Tablet")
+    assert m.refresh_alert_names({a.device_key}) == [a]
+    assert a.reason == "Kid Tablet joined your network", a.reason
+    m.correct_rename(a.device_key, "")
+    m.refresh_alert_names()
+    assert a.reason == "Alex-iPhone joined your network", a.reason
+    for e in m.timeline:
+        mm = re.match(r"(\S+) got address (\S+) from DHCP", e["text"])
+        assert not (mm and mm.group(1) == mm.group(2)), e["text"]
+    assert translate_event("This computer offers remote access (SSH)",
+                           ) == "This computer offers remote access (SSH)"
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        fr = translate_event("This computer offers remote access (SSH)")
+    finally:
+        set_locale(old)
+    assert fr.startswith("Cet ordinateur propose"), fr
+
+
+@gui_test_step("5.3.4 crowd #11: alerts use names — a rename reaches the "
+               "Alerts tab, rules in words, DHCP lines")
+def gt_c11_alert_names(app, ctx):
+    root = app.root
+    m = app.model
+    reg = m.registry
+    dev = next((d for d in reg.by_key.values()
+                if d.display_name() == "Alex-iPhone"), None)
+    assert dev is not None, "the scenario's Alex-iPhone is missing"
+    a = next(x for x in m.alerts.alerts.values()
+             if x.device_key == dev.key and x.kind == "new_device")
+    # a name learned after the alert reaches its title too
+    assert a.reason == "Alex-iPhone joined your network", a.reason
+    ra = next(x for x in m.alerts.alerts.values()
+              if x.kind == "remote_access")
+    tab = app.tabs["alerts"]
+    app._apply_correction_result(m.correct_rename(dev.key, "Kid Tablet"))
+    try:
+        _gui_pump(root, 0.6)
+        assert "Kid Tablet" in a.reason, a.reason
+        row = tab.tree.item(tab.iids[a.id], "values") if a.id in \
+            tab.iids else ()
+        assert row and any("Kid Tablet" in str(v) for v in row), row
+        # the stored rule names the device, never "key|service"
+        words = app.rule_text(f"{ra.kind}|{ra.subject}")
+        assert "|" not in words and ":" not in words.split("about")[-1], \
+            words
+        who = app.device_label(reg.by_key[reg.resolve(ra.device_key)])
+        assert who in words and "SSH" in words, (who, words)
+    finally:
+        app._apply_correction_result(m.correct_rename(dev.key, ""))
+        _gui_pump(root, 0.3)
+    assert "Alex-iPhone" in a.reason, a.reason
+    # a DHCP line never reads "192.168.1.50 got address 192.168.1.50"
+    for e in m.timeline:
+        mm = re.match(r"(\S+) got address (\S+) from DHCP", e["text"])
+        assert not (mm and mm.group(1) == mm.group(2)), e["text"]
+    nameless = DeviceRecord(key="02:00:00:00:00:99", ip="192.168.1.99",
+                            mac="02:00:00:00:00:99")
+    assert m.alert_device_name(nameless) == "192.168.1.99"
+    entry = {"text": "A device got address 192.168.1.99 from DHCP",
+             "name": "A device", "device": nameless.key}
+    reg.by_key[nameless.key] = nameless
+    try:
+        assert timeline_text(m, entry) == entry["text"]
+        nameless.alias = "Garden camera"
+        assert timeline_text(m, entry).startswith("Garden camera got"), \
+            timeline_text(m, entry)
+    finally:
+        reg.by_key.pop(nameless.key, None)
 
 
 # ============================================================================
