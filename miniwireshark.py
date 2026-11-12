@@ -18775,12 +18775,17 @@ class ProcessMap:
 def local_addr_key(ip):
     """One way to write a local address: an IPv4 address in IPv6 form
     (::ffff:a.b.c.d, as dual-stack sockets report it) as IPv4, without a
-    scope suffix (%12), lower case."""
+    scope suffix (%12), lower case. Audit 2026-11-12 (#16): however the
+    IPv6 form is written (::ffff:c0a8:114, the long form), not only with a
+    dotted quad."""
     s = str(ip or "").split("%", 1)[0].lower()
     if s.startswith("::ffff:") and "." in s:
         return s[7:]
     a = ip_obj(s) if ":" in s else None
-    return a.compressed if a is not None else s
+    if a is None:
+        return s
+    v4 = getattr(a, "ipv4_mapped", None)
+    return str(v4) if v4 is not None else a.compressed
 
 
 def program_label(ent):
@@ -55269,7 +55274,9 @@ proc ::mw_explicit_fonts {top names} {
         # short one closes before the process table is read again; the
         # release gate's GUI test lost them when that read was slow)
         # A closed one is named only by its exact address and port, never
-        # by the port alone (another program may have it by now).
+        # by the port alone (another program may have it by now); audit
+        # 2026-11-12 (#16): its address however it is written
+        # (::ffff:c0a8:114), as for an open one.
         active = list(m.flows.active.values())[-3000:]
         recent = list(m.flows.archive)[-500:]
         for i, f in enumerate(active + recent):
@@ -80824,6 +80831,49 @@ def t_r7_attribution_after_address_change(ctx):
     assert local_addr_key("::FFFF:192.168.1.20") == "192.168.1.20"
     assert local_addr_key("fe80::1%12") == "fe80::1"
     assert local_addr_key("2001:DB8:0:0::1") == "2001:db8::1"
+
+
+@self_test()
+def t_534_audit_attribution_every_mapped_form(ctx):
+    """Audit 2026-11-12 (#16): an IPv4 address in IPv6 form is one
+    address however it is written (::ffff:c0a8:114, the long form, upper
+    case), and a connection that has already closed is matched that way
+    too (it was matched only as written). A closed one is still never
+    named by the port alone."""
+    ip = "192.168.1.20"
+    for form in ("::ffff:c0a8:114", "::FFFF:C0A8:0114",
+                 "0:0:0:0:0:ffff:c0a8:114", "::ffff:192.168.1.20%3",
+                 "0000:0000:0000:0000:0000:ffff:192.168.1.20"):
+        assert local_addr_key(form) == ip, (form, local_addr_key(form))
+    assert local_addr_key("::c0a8:114") == "::c0a8:114"   # not mapped
+    assert local_addr_key("2001:db8::c0a8:114") == "2001:db8::c0a8:114"
+    m = NetworkModel(ctx.cfg(), *scenario_identity()[:3])
+    m.set_identity(my_ips={ip})
+    flows = {}
+    for i, port in enumerate((51000, 51001, 51002)):
+        f = FlowRecord(i + 1, ("TCP", i), "TCP", ip, port, "93.184.215.14",
+                       443, m.now())
+        flows[port] = f
+    m.flows.active[flows[51000].key] = flows[51000]
+    m.flows.archive.append(flows[51001])          # closed since the read
+    m.flows.archive.append(flows[51002])          # closed, port alone
+    rows = [_conn_row(51000, 70, ip="::ffff:c0a8:114", rport=443),
+            _conn_row(51001, 71, ip="::ffff:c0a8:114", rport=443),
+            _conn_row(51002, 72, "LISTEN", ip="0.0.0.0")]
+    names = {70: "live.exe", 71: "closed.exe", 72: "server.exe"}
+
+    def run():
+        pm = ProcessMap()
+        pm._name = lambda _ps, pid: names.get(pid, "")
+        assert pm.read()
+        return pm
+    pm = _with_conn_table(rows, run)
+    app = types.SimpleNamespace(procmap=pm, model=m)
+    MiniWireshark.attribute_processes(app)
+    assert flows[51000].process == "live.exe (pid 70)", flows[51000].process
+    assert flows[51001].process == "closed.exe (pid 71)", \
+        flows[51001].process
+    assert flows[51002].process == "", flows[51002].process
 
 
 # a helper that starts a grandchild holding its output and both wait 60 s;
