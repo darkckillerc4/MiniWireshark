@@ -86,6 +86,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - The Dashboard's time window (now called "Time window") sets the period of the "Who is using the Internet?" answer too, and a chart longer than the data says how much data there is.
 - The Packets tab's "in memory" count stays current while the display is paused, so it matches Statistics and the I/O graph.
 - The Devices tab explains its three ways of saying how sure it is: "Device evidence" (is it a real device, with the score each level needs), the "Evidence" marks, and "Likely" or "Possibly" before a kind.
+- *Start watching* on a computer that can't capture no longer clears the demo or the opened file first: it keeps what is on screen and says why it can't watch, with a Repair button. After the demo ends, the status line no longer says Demo Mode.
 
 **Known limits**
 

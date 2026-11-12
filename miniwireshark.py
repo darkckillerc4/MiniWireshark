@@ -28417,6 +28417,8 @@ Some settings need attention ¦ Certains paramètres demandent votre attention �
 Country lookup can't reach any service. ¦ La recherche de pays ne peut joindre aucun service. ¦ La búsqueda de país no puede contactar con ningún servicio.
 Marked as expected — I won't alert on this again. ¦ Marqué comme attendu — je ne signalerai plus cela. ¦ Marcado como esperado — no volveré a avisar de esto.
 The capture engine isn't available. ¦ Le moteur de capture n'est pas disponible. ¦ El motor de captura no está disponible.
+The capture engine isn't available, so MiniWireshark can't watch live traffic here. What's on screen was kept. Repair can install what is missing. ¦ Le moteur de capture n'est pas disponible, donc MiniWireshark ne peut pas observer le trafic en direct ici. Ce qui est affiché a été conservé. Réparer peut installer ce qui manque. ¦ El motor de captura no está disponible, así que MiniWireshark no puede observar el tráfico en directo aquí. Se ha conservado lo que hay en pantalla. Reparar puede instalar lo que falta.
+The capture engine isn't available, so MiniWireshark can't watch live traffic here. Repair can install what is missing. ¦ Le moteur de capture n'est pas disponible, donc MiniWireshark ne peut pas observer le trafic en direct ici. Réparer peut installer ce qui manque. ¦ El motor de captura no está disponible, así que MiniWireshark no puede observar el tráfico en directo aquí. Reparar puede instalar lo que falta.
 Testing country lookup ¦ Test de la recherche de pays ¦ Probando la búsqueda de país
 Welcome! I'll pick your network card and start watching. I'll explain everything in plain English. ¦ Bienvenue ! Je vais choisir votre carte réseau et commencer à observer. J'expliquerai tout simplement. ¦ ¡Bienvenido! Elegiré su tarjeta de red y empezaré a observar. Se lo explicaré todo con palabras sencillas.
 Copied to the clipboard. ¦ Copié dans le presse-papiers. ¦ Copiado al portapapeles.
@@ -54532,15 +54534,24 @@ proc ::mw_explicit_fonts {top names} {
     def start(self, auto=False):
         if self.sniffer is not None or self._capture_starting:
             return
-        if not auto and not self._confirm_leave_nonlive("Start watching"):
-            return
-        self._leave_nonlive()
+        # 5.3.4 crowd test #9: a start that can't happen says so before
+        # anything is cleared. It used to clear the demo (or the opened
+        # file) first, then stop with "The capture engine isn't
+        # available", leaving an empty window that watched nothing.
         if not HAVE_SCAPY:
-            self._set_banner("❌  The capture engine isn't available.",
-                             kind="bad")
+            kept = self.data_mode in ("offline", "session", "demo")
+            self._set_banner(
+                "❌  The capture engine isn't available, so MiniWireshark "
+                "can't watch live traffic here. "
+                + ("What's on screen was kept. " if kept else "")
+                + "Repair can install what is missing.", kind="bad",
+                action=("Repair", self.repair_everything))
+            return
+        if not auto and not self._confirm_leave_nonlive("Start watching"):
             return
         if self._ask_capture_rights(auto):
             return
+        self._leave_nonlive()
         label = self.iface_var.get()
         others = [l for l in self.iface_box["values"] if l != label]
         if self.config.get("capture.auto_select_interface", True):
@@ -54594,8 +54605,15 @@ proc ::mw_explicit_fonts {top names} {
                                   self.real_identity[2])
             self.replace_model(self._new_model())
             self._baselines_from_history()
+        was = self.data_mode
         self.data_mode = "idle"
         self.data_label = ""
+        if was in ("offline", "session", "demo"):
+            # crowd test #9: the status line no longer says "Demo Mode —
+            # nothing is being captured" (or names the file) once the
+            # demo or the file has gone
+            self.status_var.set("Ready. Click “Start watching” when "
+                                "you'd like to begin.")
         self._restyle_mode_banner()
 
     def _ensure_worker(self):
@@ -95463,6 +95481,49 @@ def gt_c534_palette_focus(app, ctx):
     app.search_entry.focus_force()
     _gui_pump(root, 0.2)
     assert int(card.cget("highlightthickness")) == 1
+
+
+# ============================================================================
+#  20d.  5.3.4 crowd test fixes (the ranked bug list): one test per fix
+# ============================================================================
+def _gt_back_to_scenario(app, ctx):
+    """Re-open the scenario capture for the steps that follow."""
+    frames = ctx.frames()
+    app.import_pcap_path(ctx.path("scenario.pcap"))
+    assert _gui_pump(app.root, 0.5, lambda: app.importer is None and
+                     app.data_mode == "offline" and
+                     app.model.count >= len(frames), timeout=60)
+    _gui_pump(app.root, 1.0)
+
+
+@gui_test_step("5.3.4 crowd #9: Start watching without a capture engine "
+               "keeps the demo; leaving the demo resets the status line")
+def gt_c9_start_without_engine(app, ctx):
+    root = app.root
+    app.start_demo()
+    assert _gui_pump(root, 0.5, lambda: app.model.registry.by_key,
+                     timeout=30)
+    _gui_pump(root, 1.0)
+    n = len(app.model.registry.by_key)
+    asked = []
+    real_ask, had = messagebox.askyesno, HAVE_SCAPY
+    messagebox.askyesno = lambda *a, **k: asked.append(a) or True
+    globals()["HAVE_SCAPY"] = False
+    try:
+        app.start()
+    finally:
+        messagebox.askyesno = real_ask
+        globals()["HAVE_SCAPY"] = had
+    banner = str(app.banner_lbl.cget("text"))
+    assert app.data_mode == "demo" and app.model.demo, app.data_mode
+    assert len(app.model.registry.by_key) >= n, "the demo data was cleared"
+    assert not asked, "asked to clear the demo for a start that can't happen"
+    assert "isn't available" in banner and "kept" in banner, banner
+    assert "Nothing is being captured" in app.status_var.get()
+    app.stop_demo()
+    _gui_pump(root, 0.3)
+    assert "Demo Mode" not in app.status_var.get(), app.status_var.get()
+    _gt_back_to_scenario(app, ctx)
 
 
 # ============================================================================
