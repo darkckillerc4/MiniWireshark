@@ -31017,9 +31017,41 @@ def untranslate_text(s):
 
 _I18N_KEYS = ("text", "label", "message", "detail", "title")
 _I18N_HOOKED = []
+_I18N_SRC_MAX = 64           # texts remembered per widget
 
 
-def _i18n_cnf(cnf):
+def _i18n_remember(w, shown, src):
+    """Remember on `w` the English source of a text it shows. A language
+    switch re-labels from it: the reverse catalog is many to one
+    ("Rechercher" is Find and Search, "Durée" Took and Duration), so
+    each switch to French or Spanish and back could change an English
+    label for good (Find -> Search, Kind: -> Type:)."""
+    if not isinstance(shown, str):
+        return
+    d = getattr(w, "_mw_i18n_src", None)
+    if d is None:
+        d = {}
+        try:
+            w._mw_i18n_src = d
+        except AttributeError:
+            return
+    d.pop(shown, None)
+    d[shown] = src
+    if len(d) > _I18N_SRC_MAX:
+        del d[next(iter(d))]
+
+
+def i18n_source(w, shown, prev):
+    """The English text behind `shown` on `w`, shown in language `prev`."""
+    if prev == "en" or not isinstance(shown, str):
+        return shown
+    d = getattr(w, "_mw_i18n_src", None)
+    if d and shown in d:
+        return d[shown]
+    return untranslate_text(shown)
+
+
+def _i18n_cnf(cnf, w=None):
     if not cnf:
         return cnf
     hit = [k for k in _I18N_KEYS if isinstance(cnf.get(k), str)]
@@ -31027,7 +31059,10 @@ def _i18n_cnf(cnf):
         return cnf
     cnf = dict(cnf)
     for k in hit:
-        cnf[k] = translate_text(cnf[k])
+        src = cnf[k]
+        cnf[k] = translate_text(src)
+        if w is not None:
+            _i18n_remember(w, cnf[k], src)
     return cnf
 
 
@@ -31055,7 +31090,7 @@ def install_i18n_hooks():
             except (TypeError, AttributeError):
                 return orig_options(self, cnf, kw)
             if isinstance(merged, dict):
-                return orig_options(self, _i18n_cnf(merged))
+                return orig_options(self, _i18n_cnf(merged, self))
         return orig_options(self, cnf, kw)
     tk.Misc._options = _options
 
@@ -31063,7 +31098,8 @@ def install_i18n_hooks():
 
     def wm_title(self, string=None):
         if string is not None and CURRENT_LOCALE != "en":
-            string = translate_text(string)
+            src, string = string, translate_text(string)
+            _i18n_remember(self, string, src)
         return orig_title(self, string)
     tk.Wm.wm_title = tk.Wm.title = wm_title
 
@@ -31074,6 +31110,7 @@ def install_i18n_hooks():
             if CURRENT_LOCALE != "en" and isinstance(kw.get("text"), str):
                 src = kw["text"]
                 kw["text"] = translate_text(src)
+                _i18n_remember(self, kw["text"], src)
                 if kw["text"] != src and name == "heading" and a:
                     out = orig(self, *a, **kw)
                     _i18n_fit_heading(self, a[0], kw["text"])
@@ -31155,10 +31192,15 @@ def install_i18n_hooks():
     _I18N_HOOKED.append(True)
 
 
-def i18n_retranslate(root):
+def i18n_retranslate(root, prev=None):
     """Re-label every open window after the language changes: each shown
-    text goes back to its English source and through the hook again."""
+    text goes back to its English source and through the hook again.
+    `prev`: the language the texts are shown in now ("en": they are the
+    English sources; None: not known)."""
     count = 0
+
+    def src_of(shown):
+        return i18n_source(w, shown, prev)
     stack = [root]
     while stack:
         w = stack.pop()
@@ -31168,18 +31210,18 @@ def i18n_retranslate(root):
             continue
         try:
             if isinstance(w, (tk.Tk, tk.Toplevel)):
-                w.title(untranslate_text(w.title()))
+                w.title(src_of(w.title()))
             if isinstance(w, tk.Menu):
                 end = w.index("end")
                 for i in range(0 if end is None else end + 1):
                     if w.type(i) in ("command", "cascade", "checkbutton",
                                      "radiobutton"):
                         lab = w.entrycget(i, "label")
-                        w.entryconfigure(i, label=untranslate_text(lab))
+                        w.entryconfigure(i, label=src_of(lab))
                 continue
             if isinstance(w, ttk.Notebook):
                 for t in w.tabs():
-                    w.tab(t, text=untranslate_text(w.tab(t, "text")))
+                    w.tab(t, text=src_of(w.tab(t, "text")))
             elif isinstance(w, ttk.Combobox) and \
                     getattr(w, "_mw_i18n", None):
                 info = w._mw_i18n
@@ -31188,18 +31230,18 @@ def i18n_retranslate(root):
                 info["shown"].set(translate_text(info["var"].get()))
             elif isinstance(w, ttk.Treeview):
                 for c in ("#0",) + tuple(w["columns"]):
-                    w.heading(c, text=untranslate_text(w.heading(c, "text")))
+                    w.heading(c, text=src_of(w.heading(c, "text")))
             elif isinstance(w, tk.Canvas):
                 for item in w.find_all():
                     if w.type(item) == "text":
-                        w.itemconfigure(item, text=untranslate_text(
+                        w.itemconfigure(item, text=src_of(
                             w.itemcget(item, "text")))
             keys = w.keys()
             if "text" in keys and "textvariable" in keys and \
                     not str(w.cget("textvariable")):
                 cur = w.cget("text")
                 if isinstance(cur, str) and cur:
-                    w.configure(text=untranslate_text(cur))
+                    w.configure(text=src_of(cur))
                     count += 1
         except (tk.TclError, TypeError, ValueError):
             continue
@@ -31249,8 +31291,10 @@ class DisplayVar(tk.StringVar):
         # 2 s, so an unchanged text is not written again
         if isinstance(value, str):
             # a text read back from the label and set again is a shown
-            # text: keep its English source
-            self._src = untranslate_text(value)
+            # text: keep its English source (an English text is its own:
+            # "VPN" is also the French for "VPNs")
+            self._src = untranslate_text(value) if CURRENT_LOCALE != "en" \
+                else value
         else:
             self._src = value
         shown = self.shown(value)
@@ -31290,6 +31334,26 @@ def _pad_pair(v):
     if not a:
         return 0, 0
     return (a[0], a[1]) if len(a) > 1 else (a[0], a[0])
+
+
+def set_command(widget, fn, **kw):
+    """widget.configure(command=fn, **kw) for a widget whose command
+    changes as it is restyled: tkinter registers a new Tcl command on each
+    configure and never frees the one it replaces, so a button set again
+    on every refresh (an empty table's, the state line's) kept one more
+    each time. The same function is not registered again."""
+    old = getattr(widget, "_mw_cmd", None)
+    if old is not None and old[0] == fn:
+        if kw:
+            widget.configure(**kw)
+        return
+    prev = old[1] if old is not None else str(widget.cget("command"))
+    widget.configure(command=fn, **kw)
+    widget._mw_cmd = (fn, str(widget.cget("command")))
+    if prev and prev != widget._mw_cmd[1] and \
+            prev in (getattr(widget, "_tclCommands", None) or ()):
+        with contextlib.suppress(tk.TclError, ValueError):
+            widget.deletecommand(prev)
 
 
 def bind_plain(widget, sequence, func, fields="", when=""):
@@ -34273,9 +34337,19 @@ class SettingsWindow:
                 pass
 
     def _bind_wheel(self, _e=None):
-        self.win.bind_all("<MouseWheel>", self._wheel)
-        self.win.bind_all("<Button-4>", self._wheel)
-        self.win.bind_all("<Button-5>", self._wheel)
+        # the command is registered once, as for scroll frames (5.2.3,
+        # B-28): bind_all(fn) on each <Enter> kept three more Tcl
+        # commands on the main window every time the pointer came in
+        script = getattr(self, "_wheel_script", None)
+        if script is None:
+            script = self._wheel_script = \
+                'if {"[%s %s]" == "break"} break\n' % (
+                    self.win._register(self._wheel, self.win._substitute,
+                                       True),
+                    self.win._subst_format_str)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            with contextlib.suppress(tk.TclError):
+                self.win.tk.call("bind", "all", seq, script)
 
     def _unbind_wheel(self, _e=None):
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
@@ -35778,7 +35852,7 @@ class TableKit:
             self.empty_lbl.configure(
                 text=text, wraplength=max(160, min(520, tw - 60)))
             if button and fn:
-                self.empty_btn.configure(text=button, command=fn)
+                set_command(self.empty_btn, fn, text=button)
                 if not self.empty_btn.winfo_manager():
                     self.empty_btn.pack(pady=(0, 10))
             elif self.empty_btn.winfo_manager():
@@ -36239,12 +36313,35 @@ def set_font_size(name, size):
     return False
 
 
+_POPUP_LAST = [None]
+
+
+def recycle_popup(menu):
+    """A menu made for one popup is destroyed when the next popup is made:
+    nothing else did, so every right-click (and every Export, Session or
+    Help menu) left one more Menu, its submenus and their commands under
+    the main window. Only one popup is ever up. The old one goes once the
+    current callback is over: a menu command may open the next menu."""
+    old, _POPUP_LAST[0] = _POPUP_LAST[0], menu
+    if old is None or old is menu:
+        return menu
+
+    def gone(old=old):
+        with contextlib.suppress(tk.TclError):
+            if old.winfo_exists():
+                old.destroy()
+    with contextlib.suppress(tk.TclError, RuntimeError):
+        menu._root().after_idle(gone)
+    return menu
+
+
 def themed_menu(app):
     t = app.theme
-    return tk.Menu(app.root, tearoff=0, bg=t["tab_bg"], fg=t["text_fg"],
-                   activebackground=t["accent"],
-                   activeforeground="#000000" if app.high_contrast and
-                   app.theme_name == "Dark" else "#ffffff")
+    return recycle_popup(tk.Menu(
+        app.root, tearoff=0, bg=t["tab_bg"], fg=t["text_fg"],
+        activebackground=t["accent"],
+        activeforeground="#000000" if app.high_contrast and
+        app.theme_name == "Dark" else "#ffffff"))
 
 
 def popup_menu(app, event, items):
@@ -36812,7 +36909,7 @@ class Charts:
             with contextlib.suppress(tk.TclError):
                 c.clipboard_clear()
                 c.clipboard_append(hide_credentials(cls.chart_text(c, csv_)))
-        m = tk.Menu(c, tearoff=0)
+        m = recycle_popup(tk.Menu(c, tearoff=0))
         m.add_command(label=translate_text("Copy chart data as text"),
                       command=lambda: copy(False))
         m.add_command(label=translate_text("Copy chart data as CSV"),
@@ -49211,7 +49308,7 @@ class MiniWireshark:
                     btn.pack_forget()
                 btn._mw_on = False
                 return
-            btn.configure(text=action[0], command=action[1])
+            set_command(btn, action[1], text=action[0])
             if not getattr(btn, "_mw_on", False) or \
                     not btn.winfo_manager():
                 btn.pack(side="right", padx=(8, 4), before=self.banner_lbl)
@@ -49309,7 +49406,7 @@ class MiniWireshark:
         text = "  ".join(translate_text(p) for p in text.split("  "))
         self.mode_banner.configure(bg=bg)
         self.mode_lbl.configure(bg=bg, fg=fg, text=text)
-        self.mode_toggle_btn.configure(text=btn_text, command=cmd)
+        set_command(self.mode_toggle_btn, cmd, text=btn_text)
         # Not live (a file, a saved session, the demo): nothing can be sent,
         # and the yellow banner says so in one line instead of a second
         # banner repeating "not capturing live" (two banners plus the
@@ -49418,7 +49515,7 @@ class MiniWireshark:
             self.mode_banner.configure(bg=bg)
             self.mode_lbl.configure(bg=bg, fg=fg, text=text,
                                     cursor="hand2")
-            self.mode_toggle_btn.configure(text=btn_text, command=cmd)
+            set_command(self.mode_toggle_btn, cmd, text=btn_text)
             self.mode_power_lbl.configure(text=power, bg=bg, fg=fg)
             if power and not self.mode_power_lbl.winfo_manager():
                 self.mode_power_lbl.pack(side="right", padx=(0, 10),
@@ -52438,7 +52535,7 @@ class MiniWireshark:
         shown = getattr(self, "_locale_shown", "en")
         if shown != CURRENT_LOCALE:
             self._locale_shown = CURRENT_LOCALE
-            i18n_retranslate(self.root)
+            i18n_retranslate(self.root, shown)
             # 5.3.4 (ST-08): status lines, card values and feed rows
             # keep their English source and are shown again
             DisplayVar.retranslate_all()
@@ -52455,6 +52552,12 @@ class MiniWireshark:
                     self.inspector.refresh()
                 else:
                     self.inspector._empty()
+            # open cards are written again only when their data changes:
+            # they kept the old language
+            for dlg in list(getattr(self, "_card_wins", None) or ()):
+                with contextlib.suppress(AttributeError, tk.TclError):
+                    if dlg.alive():
+                        dlg.set_sections(dlg.sections)
         try:
             self.hdr_title.configure(text=tr("app_title"))
             self.hdr_subtitle.configure(text=tr("app_subtitle"))
@@ -53140,7 +53243,12 @@ proc ::mw_explicit_fonts {top names} {
                 self.root.unbind_all(seq)
             except tk.TclError:
                 pass
-        self._bound_shortcuts = []
+        # and the commands those bindings called: unbind_all keeps them,
+        # 16 more on each settings apply or language change
+        for cmd in getattr(self, "_shortcut_cmds", []):
+            with contextlib.suppress(tk.TclError, ValueError):
+                self.root.deletecommand(cmd)
+        self._bound_shortcuts, self._shortcut_cmds = [], []
         actions = {
             "start": lambda e=None: self.start(),
             "stop": lambda e=None: self.stop(),
@@ -53166,8 +53274,9 @@ proc ::mw_explicit_fonts {top names} {
             if not fn or not seq:
                 continue
             try:
-                self.root.bind_all(seq, fn)
+                cmd = self.root.bind_all(seq, fn)
                 self._bound_shortcuts.append(seq)
+                self._shortcut_cmds.append(cmd)
             except tk.TclError:
                 pass
 
@@ -56521,13 +56630,24 @@ proc ::mw_explicit_fonts {top names} {
                         dlg.gone = True
                         text, other = self.gone_text(kind, key)
                         dlg.set_sections([("No longer listed", text)])
+                        # one button: an item that went, came back and
+                        # went again added a second one
+                        old_btn = getattr(dlg, "open_it_btn", None)
+                        if old_btn is not None:
+                            old_btn.destroy()
+                            dlg.open_it_btn = None
                         if other is not None:
-                            ttk.Button(dlg.btns, text="Open it",
-                                       command=lambda o=other:
-                                       self.open_card("device", o)).pack(
-                                side="left", padx=(0, 6))
+                            dlg.open_it_btn = ttk.Button(
+                                dlg.btns, text="Open it",
+                                command=lambda o=other:
+                                self.open_card("device", o))
+                            dlg.open_it_btn.pack(side="left", padx=(0, 6))
                     elif new != dlg.sections:
                         dlg.gone = False
+                        old_btn = getattr(dlg, "open_it_btn", None)
+                        if old_btn is not None:
+                            old_btn.destroy()
+                            dlg.open_it_btn = None
                         dlg.set_sections(new)
                 except tk.TclError:
                     pass
@@ -91758,6 +91878,274 @@ def gt_text_size_speed(app, ctx):
         FEATURES["theme_steps"] = on0
         app._apply_theme(theme0, hc0)
         _gui_pump(root, 0.3, until=lambda: not app._theme_pending)
+
+
+def pileup_snapshot(app, detail=None):
+    """What can pile up when a page is written again, per tab or window:
+    widgets, Text lines and characters, embedded windows and images, tag
+    bindings, Treeview and Listbox rows, menu entries, the Tcl commands
+    widgets keep (bindings, button commands), binding scripts and
+    variable traces. -> Counter {(owner, what): n}. `detail` (a dict)
+    gets each widget's own counts and shown texts, for a diff."""
+    root = app.root
+    owners = sorted(((str(t.frame) + ".", n) for n, t in app.tabs.items()),
+                    key=lambda p: -len(p[0]))
+    snap = Counter()
+    seen_vars = set()
+    # the packet list has one row per line that fits (its count follows
+    # the window's height) and rows for no more
+    virtual = str(getattr(app.tabs.get("packets"), "tree", ""))
+    # a timer waiting to run holds a command until it runs
+    timers = set()
+    with contextlib.suppress(tk.TclError):
+        for aid in root.tk.splitlist(root.tk.call("after", "info")):
+            with contextlib.suppress(tk.TclError):
+                script = root.tk.splitlist(
+                    root.tk.call("after", "info", aid))[0]
+                timers.update(str(script).split())
+
+    def owner_of(path):
+        for pre, n in owners:
+            if path.startswith(pre) or path + "." == pre:
+                return n
+        parts = path.split(".")
+        if len(parts) < 2 or not parts[1]:
+            return "."
+        top = "." + parts[1]
+        with contextlib.suppress(tk.TclError, KeyError):
+            # popups come and go under new names: counted together
+            if root.nametowidget(top).winfo_class() == "Menu":
+                return "(menus)"
+        return top
+    for w in _all_widgets(root):
+        path = str(w)
+        own = owner_of(path)
+        snap[(own, "widgets")] += 1
+        with contextlib.suppress(Exception):
+            cmds = [c for c in (getattr(w, "_tclCommands", None) or ())
+                    if c not in timers]
+            snap[(own, "commands")] += len(cmds)
+            if detail is not None:
+                detail[(path, "commands")] = sorted(
+                    re.sub(r"^\d+", "", c) for c in cmds)
+        with contextlib.suppress(Exception):
+            for seq in w.tk.splitlist(w.tk.call("bind", w._w)):
+                n = str(w.tk.call("bind", w._w, seq)).count("\n") + 1
+                snap[(own, "bindings")] += n
+                if detail is not None:
+                    detail[(path, "bind " + seq)] = n
+        with contextlib.suppress(Exception):
+            for opt in ("textvariable", "variable"):
+                if opt in w.keys():
+                    name = str(w.cget(opt))
+                    if name and name not in seen_vars:
+                        seen_vars.add(name)
+                        snap[(own, "traces")] += len(w.tk.splitlist(
+                            w.tk.call("trace", "info", "variable", name)))
+        if detail is not None:
+            with contextlib.suppress(Exception):
+                if isinstance(w, tk.Text):
+                    detail[(path, "content")] = w.get("1.0", "end-1c")
+                elif isinstance(w, tk.Menu):
+                    end = w.index("end")
+                    detail[(path, "labels")] = [
+                        str(w.entrycget(i, "label")) if w.type(i) not in
+                        ("separator", "tearoff") else "-"
+                        for i in range(0 if end is None else end + 1)]
+                elif isinstance(w, ttk.Treeview):
+                    detail[(path, "headings")] = [
+                        str(w.heading(c, "text")) for c in
+                        ("#0",) + tuple(w["columns"])]
+                elif isinstance(w, ttk.Notebook):
+                    detail[(path, "tabs")] = [str(w.tab(t, "text"))
+                                              for t in w.tabs()]
+                elif "text" in w.keys():
+                    detail[(path, "text")] = str(w.cget("text"))
+        with contextlib.suppress(Exception):
+            if isinstance(w, tk.Text):
+                snap[(own, "text lines")] += int(
+                    w.index("end-1c").split(".")[0])
+                snap[(own, "text chars")] += len(w.get("1.0", "end-1c"))
+                snap[(own, "embedded")] += len(w.window_names()) + \
+                    len(w.image_names())
+                n = 0
+                for tag in w.tag_names():
+                    n += len(w.tk.splitlist(w.tk.call(
+                        w._w, "tag", "bind", tag)))
+                snap[(own, "tag bindings")] += n
+            elif isinstance(w, ttk.Treeview) and path != virtual:
+                n, stack = 0, list(w.get_children(""))
+                while stack:
+                    iid = stack.pop()
+                    n += 1
+                    stack.extend(w.get_children(iid))
+                snap[(own, "rows")] += n
+            elif isinstance(w, tk.Listbox):
+                snap[(own, "rows")] += w.size()
+            elif isinstance(w, tk.Menu):
+                end = w.index("end")
+                snap[(own, "entries")] += 0 if end is None else end + 1
+    return snap
+
+
+_PILEUP_TEXTS = ("content", "text", "labels", "headings", "tabs")
+
+
+def pileup_drift(d0, d1):
+    """Shown texts that changed into another text with the same French or
+    Spanish translation: read back from a translation, not from their
+    English source (Find came back as Search, Kind: as Type:)."""
+    out = []
+
+    def same(a, b):
+        return a != b and any(translate_text(a, loc) ==
+                              translate_text(b, loc) for loc in ("fr", "es"))
+    for k in set(d0) & set(d1):
+        if k[1] not in _PILEUP_TEXTS or k[1] == "content":
+            continue
+        a, b = d0[k], d1[k]
+        if isinstance(a, list) and isinstance(b, list):
+            if len(a) == len(b):
+                out += [(k, x, y) for x, y in zip(a, b) if same(x, y)]
+        elif isinstance(a, str) and isinstance(b, str) and same(a, b):
+            out.append((k, a, b))
+    return sorted(out)
+
+
+def pileup_round(app, langs=("Français", "Español", "English"), pages=()):
+    """With no `langs`: every tab and sub-view shown and refreshed three
+    times. With `langs`: the language changed through them, each one
+    shown on every tab and sub-view, the Inspector, the open cards and the
+    Settings pages in `pages`."""
+    root = app.root
+
+    def visit():
+        for name, tab in app.tabs.items():
+            app._select_tab(name)
+            _gui_pump(root, 0.02)
+            views = list(getattr(tab, "_sub_frames", {}) or ())
+            first = getattr(tab, "subview", None)
+            for v in views or [None]:
+                if v is not None:
+                    tab.show_subview(v)
+                tab.refresh()
+                _gui_pump(root, 0.02)
+            if views and first:
+                tab.show_subview(first)
+        with contextlib.suppress(AttributeError, tk.TclError):
+            if app.inspector.current:
+                app.inspector.refresh()
+        sw = getattr(app, "_settings_win", None)
+        for page in pages:
+            with contextlib.suppress(AttributeError, tk.TclError):
+                sw.show_page(page)
+                _gui_pump(root, 0.02)
+        app._cards_tick()
+    if not langs:
+        for _ in range(3):
+            visit()
+    for lang in langs:
+        app.config.set("general.language", lang)
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.2)
+        visit()
+    _gui_pump(root, 0.3)
+
+
+@gui_test_step("nothing piles up: every tab, card, menu and Settings page "
+               "refreshed, languages, theme and text size changed")
+def gt_nothing_piles_up(app, ctx):
+    """5.3.4: the Security page's "What is this?" piled up, one more on
+    each refresh and in each language. Whatever a page writes again (rows,
+    lines, widgets, menu entries, bindings, button commands) must be back
+    to the same count after refreshes and language, theme and text-size
+    changes, and no English text may come back as another one."""
+    root = app.root
+    lang0 = app.config.get("general.language", "English")
+    size0 = app.config.get("appearance.text_size", "Normal")
+    theme0, hc0 = app.theme_name, app.high_contrast
+    other = "Large" if size0 != "Large" else "Normal"
+    m = app.model
+    orig_popup = tk.Menu.tk_popup
+    tk.Menu.tk_popup = lambda menu, *a, **k: None
+    pages = [p["id"] for p in SETTINGS_PAGES][:6]
+
+    def menus():
+        for opener in (app._open_help_menu, app._open_session_menu,
+                       app._open_export_menu):
+            opener()
+        ev = types.SimpleNamespace(x=4, y=4, x_root=0, y_root=0,
+                                   widget=root)
+        popup_menu(app, ev, [("One", lambda: None),
+                             ("More", [("Two", lambda: None)])])
+        _gui_pump(root, 0.05)
+
+    def everything(langs=("Français", "Español", "English")):
+        pileup_round(app, (), pages)
+        menus()
+        pileup_round(app, langs, pages)
+        for theme, hc in (("Dark", False), ("Light", True),
+                          (theme0, hc0)):
+            app._apply_theme(theme, hc)
+            _gui_pump(root, 0.3, until=lambda: not app._theme_pending,
+                      timeout=10)
+        for label in (other, size0):
+            app.config.set("appearance.text_size", label)
+            app._apply_text_size(label, defer=False)
+            _gui_pump(root, 0.2)
+        menus()
+        pileup_round(app, (), pages)
+    try:
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        devs = sorted(m.registry.by_key.values(),
+                      key=lambda d: -len(d.websites))
+        assert devs, "no device"
+        app.inspect("device", devs[0].key)
+        app.show_device(devs[-1].key)
+        for aid in list(m.alerts.order)[:1]:
+            app.show_alert(aid)
+        app._open_settings()
+        _gui_pump(root, 0.3)
+        # once first: what is made the first time (a hidden tab's wait
+        # for its layout after a text-size change) is not a pile-up
+        everything(("Français", "English"))
+        d0 = {}
+        before = pileup_snapshot(app, d0)
+        everything()
+        d1 = {}
+        after = pileup_snapshot(app, d1)
+        grew = sorted((k, before.get(k, 0), v) for k, v in after.items()
+                      if v > before.get(k, 0))
+        if grew or os.environ.get("MW_PILEUP_DEBUG"):
+            for k in sorted(set(d0) | set(d1)):
+                a, b = d0.get(k), d1.get(k)
+                if a == b or k[1] in _PILEUP_TEXTS:
+                    continue
+                if isinstance(a, list) or isinstance(b, list):
+                    ca, cb = Counter(a or []), Counter(b or [])
+                    print("    ", k, "+", sorted((cb - ca).elements())[:8],
+                          "-", sorted((ca - cb).elements())[:8])
+                else:
+                    print("    ", k, a, "->", b)
+        assert not grew, f"{len(grew)} counts grew: {grew[:12]}"
+        drift = pileup_drift(d0, d1)
+        assert not drift, f"{len(drift)} texts changed: {drift[:8]}"
+        # one popup menu is kept (and its submenus), whatever was opened
+        assert before[("(menus)", "widgets")] <= 3, \
+            before[("(menus)", "widgets")]
+    finally:
+        tk.Menu.tk_popup = orig_popup
+        app.config.set("general.language", lang0)
+        app.config.set("appearance.text_size", size0)
+        app._apply_runtime_settings()
+        app._apply_text_size(size0, defer=False)
+        with contextlib.suppress(AttributeError, tk.TclError):
+            app._settings_win.win.destroy()
+        for dlg in list(getattr(app, "_card_wins", None) or ()):
+            with contextlib.suppress(AttributeError, tk.TclError):
+                dlg.win.destroy()
+        _gui_pump(root, 0.3)
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")

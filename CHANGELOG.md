@@ -49,6 +49,8 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 - The Timeline's Time column makes room for Story mode ranges such as "22:52–23:07", which were cut off at larger text sizes.
 - The Security page no longer repeats its "What is this?" heading: each refresh left one more copy on the Unusual activity line (in every language the page had been shown in).
+- Switching to French or Spanish and back leaves every English label as it was. Some came back as another word with the same translation ("Find" as "Search", "Kind:" as "Type:", "Took" as "Duration"). Open device and alert cards change language too.
+- Nothing is kept from one right-click menu, refresh or language change to the next: each popup menu, each pointer movement over Settings, each settings change and each restyle of the state line or an empty table's button kept a little more memory until the window closed.
 - Damaged or hostile capture, session and settings files end with a message, never a crash or runaway memory. A session file that would unpack past 256 MB is refused.
 - Two copies in one folder: a busy database is no longer taken for a damaged one, session numbers never clash, and each crash journal belongs to one copy.
 - Windows 11 24H2 hiding Wi-Fi details while Location is off, and German Windows output, are read correctly. MiniWireshark never turns Location on.
