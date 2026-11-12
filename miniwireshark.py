@@ -80658,13 +80658,16 @@ def t_r8_pip_run_reaped_when_cancelled_or_late(ctx):
     made = []
     real = subprocess.Popen
 
+    cmd = [sys.executable, "-c",
+           "import time; print('x', flush=True); time.sleep(30)"]
+
     class Rec(real):
         def __init__(self, *a, **k):
             super().__init__(*a, **k)
-            made.append(self)
+            # only the pip runs: on Windows the tree kill starts taskkill
+            if list(a[0] if a else k.get("args", ())) == cmd:
+                made.append(self)
     mgr = RuntimeManager(root_dir=ctx.path("r8-runtime"))
-    cmd = [sys.executable, "-c",
-           "import time; print('x', flush=True); time.sleep(30)"]
     subprocess.Popen = Rec
     try:
         t0 = time.monotonic()
