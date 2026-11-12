@@ -3,3 +3,12 @@ contact_links:
   - name: Security problem
     url: https://github.com/darkckillerc4/MiniWireshark/security/advisories/new
     about: Report vulnerabilities privately, please.
+  - name: Is it safe? What does it send?
+    url: https://github.com/darkckillerc4/MiniWireshark/blob/main/docs/TRUST.md
+    about: How to check for yourself what MiniWireshark sends, keeps and asks for.
+  - name: Questions and ideas
+    url: https://github.com/darkckillerc4/MiniWireshark/discussions
+    about: Ask a question or share an idea in Discussions.
+  - name: Something doesn't work
+    url: https://github.com/darkckillerc4/MiniWireshark/blob/main/docs/FAQ.md
+    about: The FAQ answers the common capture and start-up problems first.

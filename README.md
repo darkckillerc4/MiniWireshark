@@ -60,7 +60,7 @@ The engineering underneath (a self-installing private Python runtime, a decoder 
 
 ## Screenshots
 
-All taken in Demo Mode, and they follow your GitHub theme. Every tab, in both themes, is in [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md).
+All taken with 5.3.4 in Demo Mode (simulated data, nothing captured), and they follow your GitHub theme. Every tab, in both themes, is in [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md).
 
 <table>
 <tr>
@@ -70,6 +70,10 @@ All taken in Demo Mode, and they follow your GitHub theme. Every tab, in both th
 <tr>
 <td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/dark-health.png"><img src="docs/assets/screens/light-health.png" alt="Health tab"></picture><p align="center"><b>Health</b>: Wi-Fi, router, DNS and Internet checks</p></td>
 <td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/dark-packets.png"><img src="docs/assets/screens/light-packets.png" alt="Packets tab"></picture><p align="center"><b>Packets</b>: dissection, streams and filters</p></td>
+</tr>
+<tr>
+<td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/dark-investigate.png"><img src="docs/assets/screens/light-investigate.png" alt="Why is my Internet slow? window"></picture><p align="center"><b>Guided questions</b>: evidence for and against, ranked (new in 5.3.4)</p></td>
+<td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/dark-story.png"><img src="docs/assets/screens/light-story.png" alt="Timeline in Story mode"></picture><p align="center"><b>Story mode</b>: what changed, in plain sentences (new in 5.3.4)</p></td>
 </tr>
 </table>
 
@@ -120,6 +124,7 @@ The full list, including the developer switches, is in [Installation](docs/INSTA
 | [Features](docs/FEATURES.md) | Everything MiniWireshark can do, including every alert it raises |
 | [Architecture](docs/ARCHITECTURE.md) | How the single file is organised and how a packet becomes an answer |
 | [FAQ and troubleshooting](docs/FAQ.md) | Capture problems, Safe Mode, privacy questions |
+| [Can I trust it?](docs/TRUST.md) | Check what it sends, keeps and asks for, how it is tested, and its honest limits |
 | [Screenshots](docs/SCREENSHOTS.md) | Every tab, in the light and the dark theme |
 | [Under the hood](docs/UNDER-THE-HOOD.md) | The runtime manager, fast decoder, signed updates, self-tests and the rest of the engineering |
 | [Logo and images](docs/BRANDING.md) | The logo, icons, Windows icon and social preview |
@@ -146,6 +151,8 @@ MiniWireshark is a **defensive** tool for networks you own or are allowed to mon
 - **Your data folder is private.** It is closed to other users, and administrator rights are asked for only when capture starts (Linux and macOS).
 - **Redaction.** Reports and exports can replace real names and addresses with documentation-range pseudonyms.
 - **Active scanning stays on your own subnet,** and Quiet Mode turns it off on networks you haven't trusted.
+
+Skeptical? Good. [Can I trust it?](docs/TRUST.md) shows how to check each of these claims yourself.
 
 Found a security issue? See [SECURITY.md](SECURITY.md).
 
