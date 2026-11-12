@@ -1,7 +1,13 @@
 """S7 soak harness (M17): stress profile S2 replayed live at 2x speed into
 the real window, looping, with wall-clock timestamps like a capture.
-Samples RSS, Python heap (allocated blocks + tracemalloc-free estimate),
-thread count, open fds and the longest Tk freeze every minute.
+Samples RSS, pymalloc blocks in use (with a rough size estimate), thread
+count, open fds and the longest Tk freeze every minute.
+
+A replay: the packets go straight into the analysis. No capture card is
+opened and Npcap is never loaded, so the live-capture paths (starting,
+stopping and healing a capture, the sniffer threads, the Npcap heal) are
+not exercised here; the GUI test's long-run step (gt_r8_long_run_fast_time)
+drives those with a fake sniffer.
 
 usage: soak.py REPO CSV MINUTES [--tabs]
 """
@@ -155,8 +161,11 @@ def write_threads():
     import re
     names = collections.Counter(re.sub(r"\d+", "#", t.name)
                                 for t in threading.enumerate())
-    # blocks: Python objects alive; if RSS climbs while this stays flat,
-    # the growth is native (Tk, Npcap, the C heap), not Python data
+    # blocks: sys.getallocatedblocks(), the memory blocks Python's small-
+    # object allocator (pymalloc) has handed out. Not a count of objects:
+    # an object may take several blocks or none (large ones come from the
+    # C heap). If RSS climbs while this stays flat, the growth is outside
+    # pymalloc (Tk, the C heap, large buffers), not small Python objects
     line = (f"minute {state['minute']} handles={handles()} "
             f"blocks={sys.getallocatedblocks()} "
             # Tk interpreters held until exit (5.3.4 round 7): must stay 1
@@ -191,7 +200,7 @@ def sample():
         flows = -1
     w.writerow([state["minute"], round(time.time() - t0, 1),
                 round(mw._rss_mb(), 1), blocks,
-                round(blocks * 64 / 1e6, 1),
+                round(blocks * 64 / 1e6, 1),         # rough: 64 bytes a block
                 len(gc.get_objects(2)) if state["minute"] % 5 == 0 else "",
                 threading.active_count(), tasks(), fds(),
                 m.count, sent[0], sent[1], app.ring.dropped,

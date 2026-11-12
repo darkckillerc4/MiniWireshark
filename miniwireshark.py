@@ -199,6 +199,81 @@ def _popen_hidden(cmd, **kw):
     return subprocess.Popen(cmd, **kw)
 
 
+def _kill_tree(p):
+    """Kill `p` and what it started: its own process group (POSIX, started
+    with start_new_session) or taskkill /T (Windows)."""
+    if p.poll() is not None:
+        return
+    try:
+        if IS_WINDOWS:
+            _run_hidden(["taskkill", "/T", "/F", "/PID", str(p.pid)],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, timeout=5)
+        elif os.getpgid(p.pid) == p.pid:       # its own group only
+            os.killpg(p.pid, 9)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    with contextlib.suppress(OSError):
+        p.kill()
+
+
+def run_bounded(cmd, timeout, input=None, text=False, env=None,
+                capture_output=True, **kw):
+    """5.3.4 (round 8): subprocess.run(capture_output=True) that returns
+    within `timeout` plus a few seconds and leaves nothing open. On a
+    timeout subprocess.run kills only the child and, on Windows, then
+    reads its pipes with no time limit: a grandchild that inherited them
+    (PowerShell's WMI host, a console helper) holds that read, and the
+    thread that asked, forever. Here the output goes to temporary files
+    (nothing to wait on), the whole tree is killed and reaped and the
+    files are closed. Raises TimeoutExpired like subprocess.run."""
+    kw.setdefault("creationflags", NO_WINDOW)
+    if not IS_WINDOWS:
+        kw.setdefault("start_new_session", True)
+    files = [tempfile.TemporaryFile(), tempfile.TemporaryFile()] \
+        if capture_output else [None, None]
+    p = None
+    try:
+        p = subprocess.Popen(
+            cmd, env=env, stdout=files[0], stderr=files[1],
+            stdin=subprocess.DEVNULL if input is None else subprocess.PIPE,
+            **kw)
+        if input is not None:
+            with contextlib.suppress(OSError):
+                p.stdin.write(input.encode() if isinstance(input, str)
+                              else input)
+            with contextlib.suppress(OSError):
+                p.stdin.close()
+        try:
+            p.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(p)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                p.wait(timeout=3)
+            raise subprocess.TimeoutExpired(cmd, timeout) from None
+        out = []
+        for f in files:
+            data = b""
+            if f is not None:
+                f.seek(0)
+                data = f.read()
+                if text:
+                    data = data.decode(locale.getpreferredencoding(False),
+                                       "replace").replace("\r\n", "\n")
+            out.append(data if f is not None else None)
+        return subprocess.CompletedProcess(cmd, p.returncode, out[0], out[1])
+    except BaseException:
+        if p is not None and p.poll() is None:
+            _kill_tree(p)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                p.wait(timeout=3)
+        raise
+    finally:
+        for f in files:
+            if f is not None:
+                f.close()
+
+
 _ONE_JOB = {}                     # thread name -> the request waiting (or None)
 _ONE_JOB_LOCK = threading.Lock()
 
@@ -1634,9 +1709,11 @@ def _pid_alive(pid):
             h = k.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFO
             if not h:
                 return False
-            code = ctypes.c_ulong()
-            ok = k.GetExitCodeProcess(h, ctypes.byref(code))
-            k.CloseHandle(h)
+            try:
+                code = ctypes.c_ulong()
+                ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+            finally:
+                k.CloseHandle(h)                     # round 8: always
             return bool(ok) and code.value == 259    # STILL_ACTIVE
         except (AttributeError, OSError):
             return False
@@ -3201,7 +3278,7 @@ def _authenticode_info(path, run=None):
            if k.upper() != "PSMODULEPATH"}
     env["MW_SIGNED_FILE"] = os.path.abspath(path)
     try:
-        r = (run or subprocess.run)(
+        r = (run or run_bounded)(
             [windows_powershell(), "-NoProfile", "-NonInteractive",
              "-Command", ps],
             capture_output=True, text=True, timeout=60, env=env,
@@ -5182,18 +5259,28 @@ class RuntimeManager:
                                                    "CREATE_NO_WINDOW", 0))
         out = []
         t_end = time.time() + timeout
-        while True:
-            if cancel():
-                p.kill()
-                raise RuntimeError_("cancelled")
-            try:
-                o, _ = p.communicate(timeout=0.5)
-                out.append(o or "")
-                break
-            except subprocess.TimeoutExpired:
-                if time.time() > t_end:
-                    p.kill()
-                    raise RuntimeError_("other", f"timed out: {cmd[1:3]}")
+        try:
+            while True:
+                if cancel():
+                    raise RuntimeError_("cancelled")
+                try:
+                    o, _ = p.communicate(timeout=0.5)
+                    out.append(o or "")
+                    break
+                except subprocess.TimeoutExpired:
+                    if time.time() > t_end:
+                        raise RuntimeError_("other",
+                                            f"timed out: {cmd[1:3]}")
+        finally:
+            # round 8: a cancel or a timeout kills, reaps and closes the
+            # pipe (before, the killed pip stayed a zombie with its pipe
+            # open)
+            if p.poll() is None:
+                _kill_tree(p)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    p.wait(timeout=5)
+            with contextlib.suppress(OSError):
+                p.stdout.close()
         text = "".join(out)
         for ln in text.splitlines()[-30:]:
             self._log("  " + ln)
@@ -11857,12 +11944,11 @@ def system_dns_servers():
     servers = []
     try:
         if IS_WINDOWS:
-            r = subprocess.run(
+            r = run_bounded(
                 [windows_powershell(), "-NoProfile", "-NonInteractive",
                  "-Command", "Get-DnsClientServerAddress -AddressFamily "
                  "IPv4 | Select-Object -ExpandProperty ServerAddresses"],
-                capture_output=True, text=True, timeout=20,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                20, text=True)
             servers = [ln.strip() for ln in r.stdout.splitlines()
                        if re.match(r"^\d+\.\d+\.\d+\.\d+$", ln.strip())]
         elif IS_MAC:
@@ -18080,10 +18166,7 @@ def run_console(cmd, timeout=10):
     """subprocess.run for a read-only console tool: no window flashes,
     output decoded with console_decode. A Windows tool runs from
     System32, never from the current folder (windows_system_tool)."""
-    r = subprocess.run(windows_system_tool(cmd), capture_output=True,
-                       timeout=timeout,
-                       creationflags=getattr(subprocess,
-                                             "CREATE_NO_WINDOW", 0))
+    r = run_bounded(windows_system_tool(cmd), timeout)   # round 8: never hangs
     r.stdout, r.stderr = console_decode(r.stdout), console_decode(r.stderr)
     return r
 
@@ -18724,9 +18807,8 @@ def read_arp_cache():
         if os.path.exists("/proc/net/arp"):
             with open("/proc/net/arp", encoding="utf-8") as f:
                 return parse_proc_arp(f.read())
-        r = subprocess.run(["arp", "-an"], capture_output=True, text=True,
-                           timeout=10)
-        return parse_arp_bsd(r.stdout)
+        return parse_arp_bsd(run_bounded(["arp", "-an"], 10,
+                                         text=True).stdout)
     except (OSError, subprocess.SubprocessError):
         return []
 
@@ -59488,8 +59570,9 @@ proc ::mw_explicit_fonts {top names} {
                 msg = str(e)
                 self._async_results.put(lambda: self._report_update_result(
                     None, [], msg, manual, repo))
-        threading.Thread(target=worker, daemon=True, name="update-check"
-                         ).start()
+        # round 8: one at a time; a click during a slow automatic check
+        # is kept and answered right after it
+        start_one("update-check", worker, coalesce=True)
         return True
 
     def _report_update_result(self, tag, assets, err, manual,
@@ -65895,9 +65978,9 @@ class _DeepWorkerProc:
         t.start()
         t.join(max(0.0, deadline - time.monotonic()))
         if t.is_alive():
-            # the worker may have exited already; the timeout is raised below
-            with contextlib.suppress(Exception):
-                self.proc.kill()
+            # the worker may have exited already; the timeout is raised
+            # below. Round 8: reaped and its pipes closed, not left open
+            self.stop(kill=True)
             raise RuntimeError("deep worker did not answer in time")
         hello = box[0] if box else None
         if not hello or hello[0] != "ready":
@@ -65994,6 +66077,15 @@ class _DeepWorkerProc:
             # reaped later by the OS if it hasn't ended yet
             with contextlib.suppress(Exception):
                 self.proc.wait(timeout=0.5)
+        if self.proc.poll() is not None:
+            # round 8: an ended worker's pipes are closed now (its reader
+            # and writer get end-of-file), not when the object is collected
+            for f in (self.proc.stdin, self.proc.stdout):
+                # a pipe its writer already broke may fail to flush; it is
+                # closed either way
+                with contextlib.suppress(OSError, ValueError):
+                    if f is not None:
+                        f.close()
 
     def ask_stop(self):
         if self.proc is not None and self.proc.poll() is None:
@@ -66063,6 +66155,12 @@ class DeepEngine:
                 self.backend == "process" and any(w.alive for w in
                                                   self.workers)):
             return
+        # round 8: workers that stopped answering are ended, reaped and
+        # closed before new ones start (a worker whose pipe broke but
+        # whose process kept running stayed behind for each restart)
+        for w in getattr(self, "workers", ()):
+            w.stop(kill=True)
+        self.workers = []
         n = max(1, min(self.cores, (os.cpu_count() or 1) - 1))
         if self.want_process and (os.cpu_count() or 1) > 1:
             try:
@@ -73977,6 +74075,7 @@ URL_OPENERS = {"xdg-open", "open", "start", "explorer"}
 PROC_LAUNCHERS = {"run", "Popen", "call", "check_output", "check_call",
                   "system", "popen", "startfile", "_run", "_run_hidden",
                   "_popen_hidden", "run_console", "execve", "execv",
+                  "run_bounded",
                   # (review 6)
                   "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv",
                   "spawnve", "spawnvp", "spawnvpe", "posix_spawn",
@@ -80471,6 +80570,201 @@ def t_r7_attribution_after_address_change(ctx):
     assert local_addr_key("2001:DB8:0:0::1") == "2001:db8::1"
 
 
+# a helper that starts a grandchild holding its output and both wait 60 s;
+# the last argument marks both processes (see _procs_with)
+_R8_HANG_TREE = (
+    "import subprocess, sys, time; "
+    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)',"
+    " sys.argv[1]]); print('started', flush=True); time.sleep(60)")
+
+
+def _procs_with(token):
+    """Live (not zombie) processes whose command line holds `token`
+    (Linux /proc; elsewhere [])."""
+    out = []
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return out
+    for pid in pids:
+        try:
+            with open(f"/proc/{pid}/cmdline", "rb") as f:
+                cl = f.read()
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                st = f.read()
+        except OSError:
+            continue
+        if token.encode() in cl and b") Z " not in st:
+            out.append(int(pid))
+    return out
+
+
+def _open_fds():
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return None
+
+
+@self_test(needs_source=True)
+def t_r8_bounded_run_ends_the_whole_tree(ctx):
+    """5.3.4 (round 8): run_console and the PowerShell calls go through
+    run_bounded. With a helper whose own child holds its output open and
+    never ends (a hung PowerShell/WMI call), the call comes back by its
+    time limit plus a few seconds, the helper AND its child are gone
+    and no file handle stays open. subprocess.run killed only the
+    helper (the child lived on) and, on Windows, then waited for the
+    output with no limit: the thread that asked hung for good. Output,
+    errors and text decoding still come back on a normal run."""
+    if not os.path.isdir("/proc/self/fd"):
+        return "skip"
+    token = f"mw-r8-tree-{os.getpid()}-{time.monotonic_ns()}"
+    fd0 = _open_fds()
+    for call in (lambda: run_bounded([sys.executable, "-c", _R8_HANG_TREE,
+                                      token], 1.0),
+                 lambda: run_console([sys.executable, "-c", _R8_HANG_TREE,
+                                      token], timeout=1.0)):
+        t0 = time.monotonic()
+        try:
+            call()
+            raise AssertionError("no timeout")
+        except subprocess.TimeoutExpired:
+            pass
+        took = time.monotonic() - t0
+        assert took < 1.0 + 4.0, took
+        t_end = time.monotonic() + 3.0
+        while _procs_with(token) and time.monotonic() < t_end:
+            time.sleep(0.05)
+        left = _procs_with(token)
+        for pid in left:                    # the test leaves nothing
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+        assert not left, f"{len(left)} helper process(es) outlived the call"
+        assert _open_fds() <= fd0, (fd0, _open_fds())
+    r = run_bounded([sys.executable, "-c", "import sys; print('été');"
+                     " sys.stderr.write('err'); sys.exit(3)"], 30, text=True,
+                    env=dict(os.environ, PYTHONIOENCODING=locale.
+                             getpreferredencoding(False)))
+    assert (r.returncode, r.stdout.strip(), r.stderr) == (3, "été",
+                                                          "err"), r
+    assert _open_fds() <= fd0, (fd0, _open_fds())
+
+
+@self_test(needs_source=True)
+def t_r8_pip_run_reaped_when_cancelled_or_late(ctx):
+    """5.3.4 (round 8): the component installer's pip run, cancelled or
+    past its time limit, is killed, waited for and its pipe closed.
+    Before, it was only killed: a zombie with an open pipe each time."""
+    made = []
+    real = subprocess.Popen
+
+    class Rec(real):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            made.append(self)
+    mgr = RuntimeManager(root_dir=ctx.path("r8-runtime"))
+    cmd = [sys.executable, "-c",
+           "import time; print('x', flush=True); time.sleep(30)"]
+    subprocess.Popen = Rec
+    try:
+        t0 = time.monotonic()
+        for kw in ({"cancel": lambda: time.monotonic() - t0 > 0.5},
+                   {"timeout": 0.5}):
+            try:
+                mgr._run(cmd, **kw)
+                raise AssertionError("not stopped")
+            except RuntimeError_:
+                pass
+    finally:
+        subprocess.Popen = real
+    assert len(made) == 2, made
+    for p in made:
+        # returncode is set only by a wait: never looked at = a zombie
+        assert p.returncode is not None, "the pip run was not waited for"
+        assert p.stdout.closed, "the pip run's pipe stayed open"
+
+
+@self_test(needs_source=True)
+def t_r8_deep_worker_reaped_and_closed(ctx):
+    """5.3.4 (round 8): a deep-analysis worker that never says hello is
+    ended, waited for and its pipes closed (before: killed, pipes left
+    open); a stopped worker's pipes are closed; and workers that stopped
+    answering are stopped before new ones start (before: a worker whose
+    pipe broke but whose process ran on stayed behind at each restart)."""
+    def child():
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+    w = _DeepWorkerProc(types.SimpleNamespace(), 0)
+    w.proc = child()
+    try:
+        w.handshake(set(), time.monotonic() + 0.3)
+        raise AssertionError("no timeout")
+    except RuntimeError as e:
+        assert "in time" in str(e), e
+    assert w.proc.returncode is not None, "not waited for"
+    assert w.proc.stdout.closed and w.proc.stdin.closed, "pipes left open"
+    w2 = _DeepWorkerProc(types.SimpleNamespace(), 1)
+    w2.proc = child()
+    w2.stop(kill=True)
+    assert w2.proc.stdout.closed and w2.proc.stdin.closed
+    stopped = []
+    old = types.SimpleNamespace(alive=False, ask_stop=lambda: None,
+                                stop=lambda kill=False, deadline=None:
+                                stopped.append(kill))
+    e = DeepEngine()
+    e.configure("Full Power", cores=1, policy="Off", prefer_process=False)
+    e.workers, e.backend = [old], "process"
+    try:
+        e._ensure_backend()
+        assert stopped == [True], f"old workers stopped: {stopped}"
+        assert e.workers == [] and e.backend == "thread", e.backend
+    finally:
+        e.stop()
+
+
+@self_test()
+def t_r8_update_check_one_at_a_time(ctx):
+    """5.3.4 (round 8): the update check runs one at a time. With the
+    answer hanging, 30 more checks start no more threads; a click made
+    meanwhile is answered once the hung one ends. Before, each check
+    started its own thread."""
+    stub, _sent, restore = _update_stub(ctx)
+    gate = threading.Event()
+    asked = []
+
+    def hang(req, timeout=None):
+        asked.append(1)
+        gate.wait(30)
+        raise OSError("offline")
+    urllib.request.urlopen = hang
+    # the check goes through the per-hop redirect opener (security review)
+    globals()["_redirect_opener"] = \
+        lambda allowed: types.SimpleNamespace(open=hang)
+    try:
+        for _ in range(30):
+            assert stub._check_for_updates(manual=False)
+        stub._check_for_updates(manual=True)
+        time.sleep(0.2)
+        n = sum(t.name == "update-check" for t in threading.enumerate())
+        assert n == 1, f"{n} update-check threads"
+    finally:
+        gate.set()
+        t_end = time.monotonic() + 10
+        while any(t.name == "update-check" for t in threading.enumerate()) \
+                and time.monotonic() < t_end:
+            time.sleep(0.02)
+        restore()
+    assert len(asked) == 2, asked              # the hung one, then the click
+    while True:
+        try:
+            stub._async_results.get_nowait()()
+        except queue.Empty:
+            break
+    assert stub.banners, "the click got no answer"
+
+
 @self_test()
 def t_s16_ended_connections_never_hide_programs(ctx):
     """5.3.4 (S16): in the connection table, what is left of a closed
@@ -86087,6 +86381,7 @@ def t_sec_windows_tools_from_system32(ctx):
         return subprocess.CompletedProcess(cmd, 0, b"", b"")
     g = globals()
     real_win, real_run = IS_WINDOWS, subprocess.run
+    real_bounded = g["run_bounded"]
     old = {k: os.environ.get(k) for k in ("SystemRoot", "SYSTEMROOT",
                                           "windir")}
     try:
@@ -86095,12 +86390,14 @@ def t_sec_windows_tools_from_system32(ctx):
         os.environ["SystemRoot"] = sysroot
         g["IS_WINDOWS"] = True
         subprocess.run = fake
+        g["run_bounded"] = lambda cmd, timeout, **kw: fake(cmd, **kw)
         run_console(["arp", "-a"])
         run_console(["netsh", "wlan", "show", "interfaces"])
         run_console(["route", "print", "-4", "0.0.0.0"])
         system_dns_servers()
     finally:
         subprocess.run = real_run
+        g["run_bounded"] = real_bounded
         g["IS_WINDOWS"] = real_win
         for k, v in old.items():
             if v is None:
@@ -91632,6 +91929,326 @@ REACHABLE_502 = (
     "tab:timeline",
     "tab:websites",
 )
+
+
+LONG_RUN_CYCLES = 500
+# the periodic jobs that run on a helper thread: at most one each
+LONG_RUN_JOBS = ("network-id", "capture-start", "capture-heal",
+                 "update-check", "process-map", "wifi-probe")
+
+
+def _tk_census(root):
+    """(widgets, pending after() timers, bindings) of a Tk window: every
+    widget under root, `after info`, and the bound sequences of each
+    widget, its class and "all"."""
+    tkc = root.tk
+    widgets, stack, classes = 0, [str(root)], set()
+    binds = 0
+    while stack:
+        w = stack.pop()
+        widgets += 1
+        binds += len(tkc.splitlist(tkc.call("bind", w)))
+        with contextlib.suppress(tk.TclError):
+            classes.add(tkc.call("winfo", "class", w))
+        stack.extend(tkc.splitlist(tkc.call("winfo", "children", w)))
+    for tag in classes | {"all"}:
+        binds += len(tkc.splitlist(tkc.call("bind", tag)))
+    return widgets, len(tkc.splitlist(tkc.call("after", "info"))), binds
+
+
+@gui_test_step("round 8: 500 rounds of the periodic jobs in fast time "
+               "(network check, capture start/stop/heal with a fake "
+               "sniffer, programs table, Wi-Fi, update check, screen "
+               "refresh), with hung, slow and failing helpers, leave no "
+               "thread, file handle or helper process behind")
+def gt_r8_long_run_fast_time(app, ctx):
+    """5.3.4 (round 8), the soak in fast time. For the first half every
+    helper hangs (a card that never opens, a router lookup, a network
+    reload, the update server, the connection table and the Wi-Fi query
+    never answer); then they are let go and alternate between failing,
+    slow and working (a fake scapy sniffer with its own thread, the real
+    start path with a sniffer that refuses, a router lookup whose helper
+    process and its child hang until killed). Measured: no job ever runs
+    twice at once (before 0015, each hung request kept its own thread:
+    hundreds); at the end Python and OS threads and open files are back
+    to where they were (+1), and no helper process is left."""
+    if not os.path.isdir("/proc/self/fd"):
+        return "skip"                   # the counts come from /proc
+    root, g = app.root, globals()
+    token = f"mw-r8-run-{os.getpid()}-{time.monotonic_ns()}"
+    gate = threading.Event()
+    state = {"phase": "hang", "i": 0, "lookups": 0, "real": 0,
+             "sniffers": 0}
+    errors = []
+
+    def helper(kind):
+        """Hung in the first half; then fails, is slow or works."""
+        if state["phase"] == "hang":
+            gate.wait(120)
+            raise OSError(f"fake {kind}: let go")
+        r = state["i"] % 3
+        if r == 0:
+            raise OSError(f"fake {kind} failure")
+        if r == 1:
+            time.sleep(0.004)
+
+    def drain():
+        drain_deferred_tk()
+        while True:
+            try:
+                fn = app._async_results.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                fn()
+            except Exception as e:                   # noqa: BLE001
+                errors.append(f"{type(e).__name__}: {e}")
+
+    class FakeAsyncSniffer:
+        """scapy's AsyncSniffer: a thread until stop(); may refuse."""
+        def __init__(self, **kw):
+            self.kw, self.exception, self.running = kw, None, False
+            self.thread, self._stop = None, threading.Event()
+
+        def start(self):
+            if state["i"] % 2:
+                raise OSError("fake: the card refused")
+            self.running = True
+            state["sniffers"] += 1
+            self.thread = threading.Thread(target=self._run, daemon=True,
+                                           name="fake-sniffer")
+            self.thread.start()
+
+        def _run(self):
+            while not self._stop.wait(0.005):
+                pass
+            self.running = False
+
+        def stop(self):
+            if self.thread is None:
+                raise RuntimeError("not running")
+            self._stop.set()
+            self.thread.join(2)
+
+    class StubRaw:
+        """The raw socket: never available here."""
+        def __init__(self, *a):
+            self.exception, self.stop_flag = None, False
+            self.started, self.first_cycle = threading.Event(), \
+                threading.Event()
+
+        def start(self):
+            self.exception = OSError("fake: no raw socket")
+            self.started.set()
+            self.first_cycle.set()
+
+        def is_alive(self):
+            return False
+
+    real_scs = start_capture_source
+
+    def fake_start_source(iface, bpf, promisc, sink):
+        helper("card")
+        if state["i"] % 25 == 2:
+            state["real"] += 1
+            return real_scs(iface, bpf, promisc, sink)   # the real path
+        if state["i"] % 3 == 2:
+            sn = FakeAsyncSniffer()
+            sn.start()
+            return SnifferCapture(sn), None
+        return None, OSError("fake: the card refused")
+
+    def fake_mac(ip):
+        helper("router lookup")
+        return "02:00:5e:00:00:01"
+
+    def fake_ssid():
+        # asked on every network check (the router's address may be
+        # known from its packets already)
+        helper("Wi-Fi name")
+        state["lookups"] += 1
+        if state["lookups"] % 10 == 1:
+            # a helper process whose own child holds its output, both
+            # hung: run_console must end both and come back
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                run_console([sys.executable, "-c", _R8_HANG_TREE, token],
+                            timeout=0.3)
+        return "R8 test network"
+
+    class Proxy:
+        def __init__(self, real, **over):
+            self._real = real
+            self.__dict__.update(over)
+
+        def __getattr__(self, k):
+            return getattr(self._real, k)
+    real_conf = g["conf"]
+    route0 = None
+    with contextlib.suppress(Exception):
+        route0 = real_conf.route.route("0.0.0.0")
+    scores0 = [dict(r) for r in app.iface_scores]
+
+    def fake_reload():
+        helper("card list")
+
+    def fake_scores(*a, **k):
+        return [dict(r) for r in scores0]
+
+    class SlowTable(_FakeConnTable):
+        def net_connections(self, kind="inet"):
+            helper("connection table")
+            return list(self.rows)
+
+    def fake_urlopen(*a, **k):
+        helper("update server")
+        raise OSError("fake: offline")
+
+    patched = {
+        "start_capture_source": fake_start_source,
+        "os_neighbor_mac": fake_mac,
+        "current_ssid": fake_ssid,
+        "conf": Proxy(real_conf,
+                      ifaces=Proxy(getattr(real_conf, "ifaces", None),
+                                   reload=fake_reload),
+                      route=Proxy(getattr(real_conf, "route", None),
+                                  resync=lambda: None,
+                                  route=lambda dst: route0)),
+        "score_interfaces": fake_scores,
+        "net_urlopen": fake_urlopen,
+        "RawCapture": StubRaw,
+        "AsyncSniffer": FakeAsyncSniffer,
+        "probe_l2_socket": lambda: {"snaplen": False, "promisc": False}}
+    saved = {k: g[k] for k in patched}
+    had_ps = "psutil" in OPTIONAL_MODULES
+    ps_was = OPTIONAL_MODULES.get("psutil")
+    keep = {k: getattr(app, k) for k in (
+        "data_mode", "procmap", "wifi", "network_fp", "network_profile",
+        "real_identity", "default_iface_name")}
+    app._stop_capture_only()
+    drain()
+    _gui_pump(root, 0.3)
+    gc.collect()
+    base = (threading.active_count(), len(os.listdir("/proc/self/task")),
+            len(os.listdir("/proc/self/fd")))
+    census0, blocks0 = _tk_census(root), sys.getallocatedblocks()
+    peak = Counter()
+    peak_total = 0
+    t_start = time.monotonic()
+    labels = list(app.iface_box["values"])[:2] or ["Default"]
+    try:
+        g.update(patched)
+        OPTIONAL_MODULES["psutil"] = SlowTable(
+            [_conn_row(50000 + i, 4000 + i) for i in range(20)])
+        app.active_mode = lambda: False        # never a LAN scan here
+        pm, wp = ProcessMap(), WifiProbe()
+        wp.read = lambda iface="", desc="": helper("Wi-Fi") or {"rssi": -50}
+        app.procmap, app.wifi = pm, wp
+        for i in range(LONG_RUN_CYCLES):
+            state["i"] = i
+            if i == LONG_RUN_CYCLES // 2:
+                # the hung half is over: every job held one thread at most
+                assert all(peak[j] <= 1 for j in LONG_RUN_JOBS), dict(peak)
+                state["phase"] = "run"
+                gate.set()
+            app.data_mode = "live"
+            app._restart_attempts = 0
+            if app._restart_job:
+                with contextlib.suppress(tk.TclError):
+                    root.after_cancel(app._restart_job)
+                app._restart_job = None
+            app._identify_network_async()
+            app._stop_capture_only()
+            app._start_capture(labels)
+            if state["phase"] == "run":
+                t_end = time.monotonic() + 2.0
+                while app._capture_starting and time.monotonic() < t_end:
+                    time.sleep(0.002)
+                    drain()
+            app._stop_capture_only()
+            app._heal_attempt()
+            pm.refresh(force=True)
+            wp.refresh(force=True)
+            app._check_for_updates(manual=False)
+            # the screen refresh (each part as its timer would call it)
+            app._tick_status_once()
+            app._tick_this_pc()
+            for part in (app._flush_events, app._flush_devices,
+                         app._flush_websites, app._flush_remotes,
+                         app._flush_flows, app._flush_geo):
+                part(app.model)
+            if i % 10 == 0:
+                for tab in app.tabs.values():
+                    if tab.is_visible():
+                        tab.refresh()
+            drain()
+            root.update()
+            names = Counter(t.name for t in threading.enumerate())
+            for j in LONG_RUN_JOBS + ("fake-sniffer",):
+                peak[j] = max(peak[j], names[j])
+            peak_total = max(peak_total, threading.active_count())
+        run_s = time.monotonic() - t_start
+        app._stop_capture_only()
+        app.data_mode = keep["data_mode"]
+        # everything still running ends within a few seconds
+        t_end = time.monotonic() + 20
+        while time.monotonic() < t_end:
+            drain()
+            root.update()
+            busy = [t.name for t in threading.enumerate()
+                    if t.name in LONG_RUN_JOBS + ("fake-sniffer",)]
+            if not busy and not _procs_with(token):
+                break
+            time.sleep(0.02)
+        drain()
+    finally:
+        gate.set()
+        g.update(saved)
+        if had_ps:
+            OPTIONAL_MODULES["psutil"] = ps_was
+        else:
+            OPTIONAL_MODULES.pop("psutil", None)
+        app.__dict__.pop("active_mode", None)
+        app._stop_capture_only()
+        for k, v in keep.items():
+            setattr(app, k, v)
+        if app._restart_job:
+            with contextlib.suppress(tk.TclError):
+                root.after_cancel(app._restart_job)
+            app._restart_job = None
+        with contextlib.suppress(tk.TclError):
+            app.start_btn.config(state="normal")
+            app.stop_btn.config(state="disabled")
+        left_procs = _procs_with(token)
+        for pid in left_procs:          # the test leaves nothing behind
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+    gc.collect()
+    _gui_pump(root, 0.3)
+    end = (threading.active_count(), len(os.listdir("/proc/self/task")),
+           len(os.listdir("/proc/self/fd")))
+    census1, blocks1 = _tk_census(root), sys.getallocatedblocks()
+    left = [t.name for t in threading.enumerate()
+            if t.name in LONG_RUN_JOBS + ("fake-sniffer",)]
+    print(f"  (round 8 long run: {LONG_RUN_CYCLES} rounds in {run_s:.1f} s; "
+          f"Python threads {base[0]}->{end[0]} (peak {peak_total}), OS "
+          f"threads {base[1]}->{end[1]}, open files {base[2]}->{end[2]}; "
+          f"most at once per job {dict(peak)}; network checks "
+          f"{state['lookups']}, sniffers started {state['sniffers']}, real "
+          f"start path {state['real']}; pymalloc blocks {blocks0}->{blocks1} "
+          f"({blocks1 - blocks0:+d}); Tk widgets/timers/bindings "
+          f"{census0}->{census1})")
+    assert not errors, errors[:5]
+    assert all(peak[j] <= 1 for j in LONG_RUN_JOBS), dict(peak)
+    assert peak["fake-sniffer"] <= 2, dict(peak)
+    # the jobs really ran, the real start path and fake sniffers too
+    assert state["lookups"] >= 50 and state["real"] >= 3 and \
+        state["sniffers"] >= 20, state
+    assert not left, f"still running: {left}"
+    assert not left_procs, \
+        f"{len(left_procs)} helper process(es) outlived their call"
+    assert end[0] <= base[0] + 1, ("Python threads", base[0], end[0])
+    assert end[1] <= base[1] + 1, ("OS threads", base[1], end[1])
+    assert end[2] <= base[2] + 1, ("open files", base[2], end[2])
 
 
 # ============================================================================
