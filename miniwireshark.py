@@ -29003,6 +29003,11 @@ Less detail ¦ Moins de détails ¦ Menos detalles
 More in Help ¦ Plus dans l'aide ¦ Más en la ayuda
 No topic matches. ¦ Aucune rubrique ne correspond. ¦ Ningún tema coincide.
 Show all results ¦ Afficher tous les résultats ¦ Mostrar todos los resultados
+1 result. Double-click or press Enter to open it. ¦ 1 résultat. Double-cliquez ou appuyez sur Entrée pour l'ouvrir. ¦ 1 resultado. Haga doble clic o pulse Intro para abrirlo.
+No matches. Try a tab, a setting, a device or an action. ¦ Aucun résultat. Essayez un onglet, un paramètre, un appareil ou une action. ¦ Sin resultados. Pruebe una pestaña, un ajuste, un dispositivo o una acción.
+No changes yet ¦ Aucune modification pour l'instant ¦ Aún no hay cambios
+Save changes? ¦ Enregistrer les modifications ? ¦ ¿Guardar los cambios?
+Save your changes before closing?⏎⏎Yes saves them. No closes without saving. Cancel keeps this window open. ¦ Enregistrer vos modifications avant de fermer ?⏎⏎Oui les enregistre. Non ferme sans enregistrer. Annuler garde cette fenêtre ouverte. ¦ ¿Guardar los cambios antes de cerrar?⏎⏎Sí los guarda. No cierra sin guardar. Cancelar deja esta ventana abierta.
 No matches. Tip: device:, site:, ip:, port: or alert: ¦ Aucun résultat. Astuce : device:, site:, ip:, port: ou alert: ¦ Sin resultados. Consejo: device:, site:, ip:, port: o alert:
 Rename a workspace ¦ Renommer un espace de travail ¦ Cambiar el nombre de un espacio de trabajo
 Which workspace? ¦ Quel espace de travail ? ¦ ¿Qué espacio de trabajo?
@@ -30854,6 +30859,13 @@ I18N_PATTERNS += [
      r"Pide al DHCP los mismos ajustes, en el mismo orden, que «\1», que "
      r"probablemente es: {t2}"),
     (r"Made by (.+)", r"Fabriqué par \1", r"Fabricado por \1"),
+    # crowd test 5.3.4 #2, #15: the search results window
+    (r"(\d+) results\. Double-click or press Enter to open one\.",
+     r"\1 résultats. Double-cliquez ou appuyez sur Entrée pour en ouvrir "
+     r"un.", r"\1 resultados. Haga doble clic o pulse Intro para abrir "
+     r"uno."),
+    (r"Search results for “(.+)”", r"Résultats de recherche pour « \1 »",
+     r"Resultados de la búsqueda de «\1»"),
     (r"It advertises the “(.+)” service", r"Il annonce le service « \1 »",
      r"Anuncia el servicio «\1»"),
     (r"Its UPnP announcement mentions “(.+)”", r"Son annonce UPnP "
@@ -34080,6 +34092,7 @@ class SettingsWindow:
         self.page_id = page if any(p["id"] == page for p in SETTINGS_PAGES) \
             else "general"
         self.searching = False
+        self.saved_once = False        # Apply or OK pressed in this window
         self.win = tk.Toplevel(app.root)
         self.win.title("Settings")
         sw_, sh_ = app.root.winfo_screenwidth(), app.root.winfo_screenheight()
@@ -34095,6 +34108,9 @@ class SettingsWindow:
         self.show_page(self.page_id)
         self.win.bind("<Escape>", lambda e: self.cancel())
         self.win.protocol("WM_DELETE_WINDOW", self.cancel)
+        # crowd test 5.3.4 #14: the keyboard comes here, so Escape closes
+        # the window (it went on to the main window, which kept it)
+        self.win.after(60, lambda: focus_toplevel(self.win))
         self._tick()
 
     # ---------------------------------------------------------------- state
@@ -34882,8 +34898,11 @@ class SettingsWindow:
                 self.dirty_lbl.configure(text="\u25cf Unsaved changes",
                                          fg=self.t["warn_fg"])
             else:
-                self.dirty_lbl.configure(text="All changes saved",
-                                         fg=self.t["muted_fg"])
+                # "All changes saved" only once something was saved here
+                # (crowd test 5.3.4 #14: it greeted a fresh window)
+                self.dirty_lbl.configure(
+                    text="All changes saved" if self.saved_once
+                    else "No changes yet", fg=self.t["muted_fg"])
             state = ["!disabled"] if (dirty and not bad) else ["disabled"]
             self.apply_btn.state(state)
             self.reset_btn.state(["disabled"] if self.searching
@@ -35076,6 +35095,7 @@ class SettingsWindow:
             v = self._value_of(key)
             self.vars[key].set(v if isinstance(v, bool) else str(v))
         self.baseline = self._snapshot()
+        self.saved_once = True
         after = (self.cfg.get("appearance.theme"),
                  self.cfg.get("appearance.high_contrast"),
                  self.cfg.get("appearance.text_size"))
@@ -35090,13 +35110,24 @@ class SettingsWindow:
     def ok(self):
         if self.apply():
             self.win.destroy()
+            return True
+        return False
 
     def cancel(self):
-        if self.dirty() and not messagebox.askyesno(
-                "Discard changes?", "You have unsaved changes. Close "
-                "without saving?", parent=self.win):
-            return
+        """Close; with unsaved changes, ask what to do with them. Yes
+        saves, No throws them away, Cancel stays (crowd test 5.3.4 #14:
+        "Close without saving?" made Yes the button that loses them)."""
+        if self.dirty():
+            ans = messagebox.askyesnocancel(
+                "Save changes?", "Save your changes before closing?\n\n"
+                "Yes saves them. No closes without saving. Cancel keeps "
+                "this window open.", parent=self.win)
+            if ans is None:
+                return False
+            if ans:
+                return self.ok()
         self.win.destroy()
+        return True
 
 
 
@@ -35443,7 +35474,45 @@ def debounce(widget, fn, ms=150):
             with contextlib.suppress(tk.TclError):
                 widget.after_cancel(job)
         state["job"] = widget.after(ms, fire)
+
+    def cancel():
+        job, state["job"] = state["job"], None
+        if job is not None:
+            with contextlib.suppress(tk.TclError):
+                widget.after_cancel(job)
+    call.cancel = cancel
     return call
+
+
+# 5.3.4 crowd test #2: hyphens, dashes, underscores and spaces don't count
+# in a search, so "wifi" finds "Wi-Fi" and "home nas" finds "home-nas"
+_SEARCH_FOLD = str.maketrans("", "", " -_‐‑‒–—")
+
+
+def search_fold(s):
+    """Lower case, without the characters a search skips."""
+    return (s or "").lower().translate(_SEARCH_FOLD)
+
+
+def search_hit(term, hay, fterm=None):
+    """`term` is in `hay` (both lower case), as typed or folded."""
+    if term in hay:
+        return True
+    fterm = search_fold(term) if fterm is None else fterm
+    return bool(fterm) and fterm in search_fold(hay)
+
+
+def focus_toplevel(win, widget=None):
+    """Give a new window the keyboard (Escape, arrows, Enter). Without
+    it the keys kept going to the main window, which still had the
+    focus (crowd test 5.3.4 #1, #14). Returns True when it took."""
+    try:
+        if not win.winfo_exists():
+            return False
+        (widget or win).focus_force()
+        return True
+    except tk.TclError:
+        return False
 
 
 class _Desc:
@@ -47791,9 +47860,31 @@ class SearchDrop:
         entry.bind("<KeyRelease>", self._key, add="+")
         entry.bind("<Down>", lambda e: self.move(1))
         entry.bind("<Up>", lambda e: self.move(-1))
-        entry.bind("<Escape>", lambda e: self.close())
+        entry.bind("<Escape>", lambda e: self.escape())
         entry.bind("<FocusOut>", lambda e: entry.after(250,
                                                         self._focus_gone))
+
+    def escape(self):
+        """Escape in the box: the list under it and the results window
+        both close (crowd test 5.3.4 #1)."""
+        self.cancel()
+        self.close()
+        with contextlib.suppress(AttributeError):
+            self.app.close_search_window()
+        return "break"
+
+    def cancel(self):
+        """A list still due from the last key is not drawn (Enter opened
+        the results window meanwhile)."""
+        with contextlib.suppress(AttributeError):
+            self._soon.cancel()
+
+    def owns(self, w):
+        """The click landed on the box or on the list under it."""
+        if w is self.entry:
+            return True
+        fr = self.frame
+        return fr is not None and str(w).startswith(str(fr))
 
     def _key(self, e):
         if e.keysym in ("Down", "Up", "Return", "KP_Enter", "Escape",
@@ -47810,17 +47901,8 @@ class SearchDrop:
 
     def results(self, q):
         """[(group, [(text, action)])] — the window's own search, then
-        Settings and Help."""
-        app = self.app
-        out = []
-        for group, items in app.search_results(q).items():
-            out.append((group, [(label, lambda r=ref: app.open_ref(r))
-                                for label, ref in items[:self.PER_GROUP]
-                                if ref]))
-        for group, items in app.search_extras(q).items():
-            if items:
-                out.append((group, items[:self.PER_GROUP]))
-        return [(g, it) for g, it in out if it]
+        Settings, Health and Help (the results window lists the same)."""
+        return self.app.search_groups(q, self.PER_GROUP)
 
     def update(self):
         q = self.app.global_search_var.get().strip()
@@ -47861,7 +47943,10 @@ class SearchDrop:
                                cursor="hand2")
                 lbl.pack(fill="x")
                 i = len(self.rows)
-                lbl.bind("<Button-1>", lambda e, a=action: self._run(a))
+                # "break": the click must not reach the window's own
+                # click-away handler, which would close what it opened
+                lbl.bind("<Button-1>",
+                         lambda e, a=action: self._run(a) or "break")
                 lbl.bind("<Enter>", lambda e, k=i: self._mark(k))
                 self.rows.append((lbl, action))
                 n += 1
@@ -47869,7 +47954,8 @@ class SearchDrop:
                         bg=t["card_bg"], fg=t["accent"], anchor="w",
                         padx=8, pady=3, cursor="hand2")
         more.pack(fill="x", pady=(4, 0))
-        more.bind("<Button-1>", lambda e: self._run(app._run_global_search))
+        more.bind("<Button-1>",
+                  lambda e: self._run(app._run_global_search) or "break")
         self.rows.append((more, app._run_global_search))
         try:
             x = self.entry.winfo_rootx() - root.winfo_rootx()
@@ -48519,6 +48605,8 @@ class MiniWireshark:
         self.apply_reduce_motion()
         self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map,
                              add="+")
+        for seq in ("<FocusIn>", "<FocusOut>"):
+            self.root.bind_class("Frame", seq, self._card_focus, add="+")
         self._compact = None
         # a toplevel's binding runs for every widget inside it: Tcl keeps
         # the window's own events only (900 others per text-size change)
@@ -48826,6 +48914,10 @@ class MiniWireshark:
         self.search_entry = se
         se.bind("<Return>", lambda e: self._search_enter())
         self.search_drop = SearchDrop(self, se)
+        # every widget of the main window carries its tag: a click
+        # anywhere else closes the search list and windows (crowd test
+        # 5.3.4 #1)
+        self.root.bind("<Button-1>", self._click_away, add="+")
         Tooltip(se, "Search devices, names, MACs, IPs, vendors, websites, "
                     "Internet hosts, countries, providers, alerts, timeline, "
                     "settings and help — or Ctrl+K for anything. Tokens: "
@@ -49259,6 +49351,35 @@ class MiniWireshark:
             fl = getattr(fr, "_mw_flow", None)
             if fl is not None:
                 fl.schedule()
+
+    def _card_focus(self, e):
+        """A card that takes the keyboard (Tab, Shift+Tab) draws a
+        2-pixel ring in the theme's focus colour, in place of 1 pixel of
+        its padding (crowd test 5.3.4 #21: the 1-pixel ring, black on
+        some cards, was hard to see)."""
+        w = e.widget
+        if isinstance(w, str):
+            return
+        try:
+            if str(w.cget("takefocus")) != "1":
+                return
+            base = getattr(w, "_mw_ring", None)
+            if base is None:
+                base = w._mw_ring = (int(w.cget("highlightthickness")),
+                                     int(str(w.cget("padx"))),
+                                     int(str(w.cget("pady"))))
+            th, padx, pady = base
+            if th < 1:
+                return
+            if e.type == tk.EventType.FocusIn:
+                w.configure(highlightthickness=th + 1,
+                            highlightcolor=self.theme.get("focus",
+                                                          "#2b7de9"),
+                            padx=max(0, padx - 1), pady=max(0, pady - 1))
+            else:
+                w.configure(highlightthickness=th, padx=padx, pady=pady)
+        except (tk.TclError, ValueError):
+            pass
 
     def _on_toplevel_map(self, e):
         w = e.widget
@@ -50136,9 +50257,9 @@ class MiniWireshark:
         """Everything Ctrl+K can reach: (label, category, action)."""
         items = []
         for name, tab in self.tabs.items():
-            label = translate_text(STRINGS.get(tab.label_key, name)) if \
-                tab.label_key else name
-            items.append((re.sub(r"^\W+\s*", "", label), "tab",
+            # crowd test 5.3.4 #21: the tab strip's own names ("Happening",
+            # not the inner "feed"; STRINGS is keyed by language first)
+            items.append((palette_tab_label(tab.label_key, name), "tab",
                           lambda n=name: self._select_tab(n)))
         for sv in PacketsTab.SUBVIEWS:
             items.append((f"Packets → {sv}", "view",
@@ -50149,8 +50270,12 @@ class MiniWireshark:
                       lambda: (self._select_tab("connections"),
                                self.tabs["connections"].show_subview(
                                    "Mail"))))
+        # one name for one thing: "Settings", "Settings › Alerts" and
+        # "Settings › Alerts › Slow DNS" ("Setting: Stop" came first for
+        # "sett", above the Settings pages)
+        items.append(("Settings", "setting", lambda: self._open_settings()))
         for page in SETTINGS_PAGES:
-            items.append((f"Settings: {page['title']}", "setting",
+            items.append((f"Settings › {page['title']}", "setting",
                           lambda p=page["id"]: self._open_settings(p)))
         acts = [("Start watching", self.start), ("Stop watching", self.stop),
                 ("Demo Mode", self.start_demo),
@@ -50219,7 +50344,8 @@ class MiniWireshark:
             for sec in page["sections"]:
                 for c in sec["controls"]:
                     if c.get("key") and c.get("label"):
-                        items.append((f"Setting: {c['label']}", "setting",
+                        items.append((f"Settings › {page['title']} › "
+                                      f"{c['label']}", "setting",
                                       lambda k=c["key"]:
                                       self.open_setting(k)))
         for title in getattr(self, "help_titles", lambda: [])():
@@ -50257,6 +50383,9 @@ class MiniWireshark:
         tab._load_preset()
 
     def open_palette(self, _e=None):
+        old = getattr(self, "_palette", None)
+        if old is not None:
+            old.close()
         self._palette = CommandPalette(self)
         return self._palette
 
@@ -52177,16 +52306,19 @@ class MiniWireshark:
         if not ql:
             return []
         scored = []
+        fq = search_fold(ql)      # "wifi" finds "Wi-Fi" (crowd test #2)
         for i, tp in enumerate(help_topics()):
             title = tp["title"].lower()
             shown = translate_text(tp["title"]).lower()
-            if title.startswith(ql) or shown.startswith(ql):
+            if title.startswith(ql) or shown.startswith(ql) or (
+                    fq and (search_fold(title).startswith(fq) or
+                            search_fold(shown).startswith(fq))):
                 sc = 10
-            elif ql in title or ql in shown:
+            elif search_hit(ql, title, fq) or search_hit(ql, shown, fq):
                 sc = 6
             elif ql in tp["terms"]:
                 sc = 4
-            elif ql in help_body(tp, self).lower():
+            elif search_hit(ql, help_body(tp, self).lower(), fq):
                 sc = 1
             else:
                 continue
@@ -52599,6 +52731,11 @@ class MiniWireshark:
         self.config.set("appearance.beginner_mode", self.beginner_mode)
         self.config.save()
         self._apply_ui_mode()
+        # an open Settings window shows it as saved, not as a change of
+        # its own (crowd test 5.3.4 #14), and its OK can't undo it
+        sw = getattr(self, "_settings_win", None)
+        if sw is not None and sw.alive():
+            sw.sync_key("appearance.beginner_mode", self.beginner_mode)
 
     def _apply_ui_mode(self):
         """Beginner hides the technical tabs and fields; Advanced shows
@@ -53072,6 +53209,12 @@ proc ::mw_retheme {w map fgnew deffg} {
         for w in ("TButton", "TCheckbutton", "TRadiobutton", "TEntry",
                   "TCombobox", "Treeview"):
             style.configure(w, focuscolor=focus)
+        # crowd test 5.3.4 #21: a drop-down list or a number box with the
+        # keyboard drew no ring at all (clam marks only an entry's
+        # focus), so Tab through Settings seemed to lose its place
+        for w in ("TEntry", "TCombobox", "TSpinbox"):
+            style.map(w, bordercolor=[("focus", focus)],
+                      lightcolor=[("focus", focus)])
         style.map("Treeview.Heading",
                   background=[("active", bg)], foreground=[("active", fg)])
         style.configure("TMenubutton", background=bg, foreground=fg)
@@ -58323,6 +58466,11 @@ proc ::mw_explicit_fonts {top names} {
                      re.I)
         token, term = (m.group(1).lower(), m.group(2).strip().lower()) if m \
             else (None, q.lower())
+        # 5.3.4 crowd test #2: "wifi" finds "Wi-Fi", "homenas" "home-nas"
+        fterm = search_fold(term)
+
+        def hit(hay):
+            return search_hit(term, hay, fterm)
         res = OrderedDict((k, []) for k in ("Devices", "Websites",
                                             "Internet hosts", "Connections",
                                             "Alerts", "Timeline"))
@@ -58331,8 +58479,8 @@ proc ::mw_explicit_fonts {top names} {
         if token is None:
             # 5.1.2: the words of each device and connection are joined
             # once (kept 3 s), not on every key
-            for key, (label, words) in cache["dev"].items():
-                if term in words:
+            for key, (label, words, folded) in cache["dev"].items():
+                if term in words or (fterm and fterm in folded):
                     res["Devices"].append((label, ("device", key)))
         if token in ("device", "ip", "mac"):
             for d in mod.registry.by_key.values():
@@ -58345,13 +58493,13 @@ proc ::mw_explicit_fonts {top names} {
                     [self.device_label(d), d.alias, d.ip, d.mac, d.vendor,
                      d.device_class, translate_text(d.device_class),
                      d.notes] + sorted(d.ipv6)
-                if any(term in (f or "").lower() for f in fields):
+                if any(hit((f or "").lower()) for f in fields):
                     res["Devices"].append(
                         (f"{self.device_label(d)}  ({d.ip or d.mac}) — "
                          f"{d.device_class}", ("device", d.key)))
         if token in (None, "site"):
             for w in mod.websites.values():
-                if term in w.domain:
+                if hit(w.domain):
                     res["Websites"].append((f"{w.domain}  ({w.requests} "
                                             f"hits)", ("website", w.domain)))
         if token in (None, "ip", "country", "site"):
@@ -58360,7 +58508,7 @@ proc ::mw_explicit_fonts {top names} {
                        f"{r.country_name}"}.get(token) or \
                     " ".join([r.ip, r.domain, " ".join(r.domains), r.country,
                               r.country_name, r.org, f"as{r.asn}"])
-                if term in hay.lower():
+                if hit(hay.lower()):
                     res["Internet hosts"].append(
                         (f"{r.ip}  {r.domain}  {r.location_text()}  "
                          f"{r.provider_text()}", ("remote", r.ip)))
@@ -58375,11 +58523,14 @@ proc ::mw_explicit_fonts {top names} {
                 else:
                     words = cache["flow"].get(f.fid)
                     if words is None:
-                        words = cache["flow"][f.fid] = " ".join(
+                        words = " ".join(
                             str(x) for x in (f.remote_ip, f.local_ip,
                                              f.domain, f.service,
                                              f.remote_port)).lower()
-                    ok = term in words
+                        words = cache["flow"][f.fid] = (words,
+                                                        search_fold(words))
+                    ok = term in words[0] or bool(fterm and
+                                                  fterm in words[1])
                 if ok:
                     res["Connections"].append(
                         (f"#{f.fid} {self.short_device_name(f.device_key)} "
@@ -58390,13 +58541,12 @@ proc ::mw_explicit_fonts {top names} {
         if token in (None, "alert"):
             for aid in mod.alerts.order:
                 a = mod.alerts.alerts.get(aid)
-                if a and (term in a.reason.lower() or
-                          term in a.kind.lower()):
+                if a and (hit(a.reason.lower()) or hit(a.kind.lower())):
                     res["Alerts"].append((f"[{a.severity}] {a.reason}",
                                           ("alert", a.id)))
         if token is None:
             for e in list(mod.timeline)[-3000:]:
-                if term in e["text"].lower():
+                if hit(e["text"].lower()):
                     res["Timeline"].append(
                         (f"{fmt_clock(e['when'])}  {e['text']}",
                          e.get("ref")))
@@ -58429,8 +58579,9 @@ proc ::mw_explicit_fonts {top names} {
                 translate_text(d.device_class), d.notes, d.place,
                 d.owner) if x)
             words += " " + " ".join(sorted(d.ipv6))
+            words = words.lower()
             dev[d.key] = (f"{label}  ({d.ip or d.mac}) — {d.device_class}",
-                          words.lower())
+                          words, search_fold(words))
         h = self._hay = {"model": self.model, "t": now, "dev": dev,
                          "flow": {}, "n": len(self.model.registry.by_key)}
         return h
@@ -58438,19 +58589,30 @@ proc ::mw_explicit_fonts {top names} {
     def search_extras(self, q):
         """Settings and Help that match `q` (for the result list)."""
         ql = q.strip().lower()
-        out = OrderedDict((("Settings", []), ("Help", [])))
+        out = OrderedDict((("Settings", []), ("Health", []), ("Help", [])))
         if len(ql) < 2:
             return out
+        fq = search_fold(ql)
         for page in SETTINGS_PAGES:
             for sec in page["sections"]:
                 for c in sec["controls"]:
                     lab = c.get("label") or ""
-                    if c.get("key") and (ql in lab.lower() or ql in
-                                         translate_text(lab).lower()):
+                    if c.get("key") and (
+                            search_hit(ql, lab.lower(), fq) or
+                            search_hit(ql, translate_text(lab).lower(),
+                                       fq)):
                         out["Settings"].append(
                             (f"{translate_text(page['title'])} › "
                              f"{translate_text(lab)}",
                              lambda k=c["key"]: self.open_setting(k)))
+        # 5.3.4 crowd test #2: the Health tab's checks ("Wi-Fi signal
+        # (this computer)" is on screen, so "wifi" must find it)
+        for _key, lab in HealthTab.CHECKS:
+            if search_hit(ql, lab.lower(), fq) or \
+                    search_hit(ql, translate_text(lab).lower(), fq):
+                out["Health"].append(
+                    (f"{translate_text('Health')} › {translate_text(lab)}",
+                     lambda: self._select_tab("health")))
         fn = getattr(self, "help_matches", None)
         if fn is not None:
             for title in fn(q)[:8]:
@@ -58465,42 +58627,147 @@ proc ::mw_explicit_fonts {top names} {
             win.find_setting(key)
         return win
 
+    def search_groups(self, q, per_group=None):
+        """[(group, [(text, action)])]: what the header search finds. The
+        list under the box (per_group of each) and the results window
+        are built from it, so the two never disagree (crowd test 5.3.4
+        #2: the window said "0 result(s)" over a list of Help topics)."""
+        out = []
+        for group, items in self.search_results(q).items():
+            acts = []
+            for label, ref in items:
+                if ref:
+                    acts.append((label, lambda r=ref: self.open_ref(r)))
+                elif group == "Timeline":
+                    acts.append((label,
+                                 lambda: self._select_tab("timeline")))
+            out.append((group, acts))
+        out += list(self.search_extras(q).items())
+        return [(g, it[:per_group] if per_group else it)
+                for g, it in out if it]
+
+    def search_window(self):
+        """The open search results window, or None."""
+        win = getattr(self, "_search_win", None)
+        try:
+            return win if win is not None and win.winfo_exists() else None
+        except tk.TclError:
+            return None
+
+    def close_search_window(self, refocus=False):
+        """Close the results window. refocus: back to the search box with
+        its text selected, so typing replaces it."""
+        win, self._search_win = self.search_window(), None
+        if win is None:
+            return False
+        with contextlib.suppress(tk.TclError):
+            win.destroy()
+        if refocus:
+            with contextlib.suppress(tk.TclError, AttributeError):
+                e = self.search_entry
+                e.focus_set()
+                e.select_range(0, "end")
+                e.icursor("end")
+        return True
+
+    def _click_away(self, e):
+        """A click elsewhere in the main window closes the list under the
+        search box, the search results window and the Ctrl+K box (crowd
+        test 5.3.4 #1 and #21: they stayed over the window and took its
+        clicks)."""
+        w = e.widget
+        if isinstance(w, str):
+            return
+        drop = getattr(self, "search_drop", None)
+        if drop is not None and drop.frame is not None and \
+                not drop.owns(w):
+            drop.close()
+        self.close_search_window()
+        pal = getattr(self, "_palette", None)
+        if pal is not None:
+            pal.close()
+
+    def _search_win_geometry(self, w, h):
+        """Under the search box, inside the screen (it opened at the top
+        left, over the tabs and the box itself)."""
+        e, root = self.search_entry, self.root
+        root.update_idletasks()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        right = e.winfo_rootx() + e.winfo_width()
+        x = max(0, min(right - w, sw - w - 8))
+        y = e.winfo_rooty() + e.winfo_height() + 6
+        h = max(200, min(h, sh - y - 48))
+        return f"{w}x{h}+{x}+{y}"
+
     def _run_global_search(self):
+        drop = getattr(self, "search_drop", None)
+        if drop is not None:
+            drop.cancel()
+            drop.close()
+        self.close_search_window()
         q = self.global_search_var.get().strip()
         if not q:
-            return
-        res = self.search_results(q)
+            return None
+        groups = self.search_groups(q)
+        total = sum(len(items) for _g, items in groups)
         t = self.theme
         win = tk.Toplevel(self.root)
+        self._search_win = win
         win.title(f"Search results for “{q}”")
-        win.geometry(px_geo("620x480"))
+        try:
+            w, h = (int(x) for x in px_geo("620x480").split("x"))
+        except ValueError:
+            w, h = 620, 480
+        win.geometry(self._search_win_geometry(w, h))
         win.configure(bg=t["tab_bg"])
         win.transient(self.root)
-        tk.Label(win, text=f"{sum(len(v) for v in res.values())} result(s). "
-                           f"Double-click to jump there.", bg=t["tab_bg"],
-                 fg=t["muted_fg"]).pack(anchor="w", padx=10, pady=(8, 0))
+        if total:
+            head = ("1 result. Double-click or press Enter to open it."
+                    if total == 1 else
+                    f"{total} results. Double-click or press Enter to "
+                    f"open one.")
+        else:
+            head = ("No matches found. Tip: try device:, site:, ip:, "
+                    "port: or alert:")
+        tk.Label(win, text=head, bg=t["tab_bg"], fg=t["muted_fg"],
+                 anchor="w", justify="left", wraplength=w - 40).pack(
+            fill="x", padx=10, pady=(8, 0))
         frame, tree = make_tree(win, [("what", "Result", 560, "w", True)],
                                 show="tree", sortable=False)
         frame.configure(bg=t["tab_bg"])
         frame.pack(fill="both", expand=True, padx=10, pady=10)
-        refs = {}
-        if not res:
-            tree.insert("", "end", text="No matches found. Tip: try device:, "
-                                        "site:, ip:, port: or alert:")
-        for group, items in res.items():
-            g = tree.insert("", "end", text=f"{group} ({len(items)})",
-                            open=True)
-            for label, ref in items:
+        acts = {}
+        first = None
+        for group, items in groups:
+            g = tree.insert("", "end", text=f"{translate_text(group)} "
+                                            f"({len(items)})", open=True)
+            for label, action in items:
                 iid = tree.insert(g, "end", text=label)
-                refs[iid] = ref
+                acts[iid] = action
+                first = first or iid
+        win._mw_results = (total, acts)
 
         def go(_e=None):
             sel = tree.selection()
-            if sel and refs.get(sel[0]):
-                self.open_ref(refs[sel[0]])
+            act = acts.get(sel[0]) if sel else None
+            if act is None:
+                return "break"
+            self.close_search_window()
+            with contextlib.suppress(tk.TclError):
+                act()
+            return "break"
         tree.bind("<Double-1>", go)
         tree.bind("<Return>", go)
-        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Escape>",
+                 lambda e: self.close_search_window(refocus=True) or "break")
+        if first:
+            tree.selection_set(first)
+            tree.focus(first)
+        # the keyboard goes to the results, so Escape and the arrows work
+        # without a click in the window first (crowd test 5.3.4 #1)
+        tree.focus_set()
+        win.after(60, lambda: focus_toplevel(win, tree))
+        return win
 
     # ======================================================================
     #  Settings glue
@@ -61543,6 +61810,12 @@ TASK_WORKSPACES = {
 }
 
 
+def palette_tab_label(label_key, name=""):
+    """A tab as the tab strip names it, without its icon ("Happening")."""
+    label = translate_text(tr(label_key)) if label_key else name
+    return re.sub(r"^\W+\s*", "", label) or name
+
+
 class CommandPalette:
     """Ctrl+K: type to reach any tab, view, setting, filter, device or
     action."""
@@ -61571,9 +61844,23 @@ class CommandPalette:
         e.bind("<Down>", lambda ev: self._move(1))
         e.bind("<Up>", lambda ev: self._move(-1))
         self.lb.bind("<Double-1>", self.run)
-        self.win.bind("<Escape>", lambda ev: self.win.destroy())
+        self.win.bind("<Escape>", lambda ev: self.close())
+        self.entry = e
         self.filter()
         e.focus_set()
+        self.win.after(60, lambda: focus_toplevel(self.win, e))
+
+    def alive(self):
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def close(self):
+        """Escape, or a click in the main window (crowd test 5.3.4 #21:
+        the box stayed over the Health tab until Escape)."""
+        with contextlib.suppress(tk.TclError):
+            self.win.destroy()
 
     def filter(self):
         q = self.q.get()
@@ -61594,6 +61881,12 @@ class CommandPalette:
                            + (f"    [{key}]" if key else ""))
         if self.shown:
             self.lb.selection_set(0)
+        else:
+            self.lb.insert("end", translate_text(
+                "No matches. Try a tab, a setting, a device or an action."))
+            with contextlib.suppress(tk.TclError):
+                self.lb.itemconfigure(0, foreground=self.app.theme[
+                    "muted_fg"])
 
     def _move(self, d):
         sel = self.lb.curselection()
@@ -61613,7 +61906,7 @@ class CommandPalette:
         if label in rec:
             rec.remove(label)
         rec.append(label)
-        self.win.destroy()
+        self.close()
         fn()
 
 
@@ -90593,6 +90886,21 @@ REACHABLE_RENAMES = {
     "menu:help:🛠 Repair MiniWireshark…":
         "menu:help:MiniWireshark health > 🛠 Repair MiniWireshark…",
 }
+# 5.3.4 crowd test #21: Ctrl+K names the tabs as the tab strip does (it
+# showed the inner names, "dash" and "feed") and writes every settings
+# entry the same way, "Settings › …"
+REACHABLE_RENAMES.update({
+    f"palette:tab:{name}": f"palette:tab:{label}" for name, label in (
+        ("dash", "Dashboard"), ("feed", "Happening"),
+        ("timeline", "Timeline"), ("devices", "Devices"), ("map", "Map"),
+        ("health", "Health"), ("alerts", "Alerts"),
+        ("websites", "Websites"), ("connections", "Connections"),
+        ("remote", "Internet hosts"), ("packets", "Packets"),
+        ("security", "Security"), ("sources", "Sources"),
+        ("help", "Help"))})
+REACHABLE_RENAMES.update({
+    f"palette:setting:Settings: {p['title']}":
+        f"palette:setting:Settings › {p['title']}" for p in SETTINGS_PAGES})
 # Menu entries that exist only in some states (a file open, an autosave
 # present); they are not part of the comparison.
 REACHABLE_CONDITIONAL = {
@@ -93138,6 +93446,234 @@ def gt_r8_long_run_fast_time(app, ctx):
     assert end[0] <= base[0] + 1, ("Python threads", base[0], end[0])
     assert end[1] <= base[1] + 1, ("OS threads", base[1], end[1])
     assert end[2] <= base[2] + 1, ("open files", base[2], end[2])
+
+
+def _gui_focus_main(app):
+    """The main window's search box takes the keyboard, as after a click
+    in it (the crowd tests below then check where a new window puts
+    it)."""
+    root = app.root
+    root.deiconify()
+    root.lift()
+    with contextlib.suppress(tk.TclError):
+        root.focus_force()
+        app.search_entry.focus_force()
+    _gui_pump(root, 0.3, lambda: root.focus_get() is app.search_entry,
+              timeout=3)
+    assert root.focus_get() is app.search_entry, \
+        f"the main window could not take the focus ({root.focus_get()})"
+
+
+def _gui_focus_in(root, win, timeout=3):
+    def inside():
+        f = root.focus_get()
+        try:
+            return f is not None and f.winfo_toplevel() is win
+        except (tk.TclError, KeyError):
+            return False
+    _gui_pump(root, 0.1, inside, timeout=timeout)
+    return root.focus_get() if inside() else None
+
+
+@gui_test_step("crowd 5.3.4 #1 #2: the search results window opens under "
+               "the box with the keyboard, counts what the list under the "
+               "box shows, finds Wi-Fi as wifi, and Escape or a click "
+               "away closes it")
+def gt_c534_search_window(app, ctx):
+    root, drop, e = app.root, app.search_drop, app.search_entry
+    _gui_focus_main(app)
+    try:
+        # #2: the window counts what it lists, the list's results among
+        # them ("0 result(s)" over Help topics that the list showed)
+        app.global_search_var.set("vpn")
+        drop.update()
+        _gui_pump(root, 0.2)
+        listed = [t for _g, it in drop.results("vpn") for t, _a in it]
+        assert listed, "nothing found for vpn"
+        win = app._run_global_search()
+        _gui_pump(root, 0.4)
+        total, acts = win._mw_results
+        assert total == len(acts) >= len(listed), (total, listed)
+        heads = [str(w.cget("text")) for w in win.winfo_children()
+                 if isinstance(w, tk.Label)]
+        assert heads and heads[0].startswith(f"{total} result"), heads
+        assert drop.frame is None, "the list stayed under the window"
+        # #1: under the search box, not at the top left over the tabs
+        assert win.winfo_rooty() >= e.winfo_rooty() + e.winfo_height(), \
+            (win.winfo_rooty(), e.winfo_rooty())
+        # #1: the keyboard is in the window, so Escape closes it and the
+        # box is back with its text selected (typing replaces it)
+        f = _gui_focus_in(root, win)
+        assert f is not None, f"the keyboard stayed in {root.focus_get()}"
+        f.event_generate("<Escape>")
+        _gui_pump(root, 0.2)
+        assert app.search_window() is None and not win.winfo_exists()
+        assert root.focus_get() is e and e.selection_present()
+        # #1: a click elsewhere in the main window closes it, and the
+        # list under the box
+        win = app._run_global_search()
+        _gui_pump(root, 0.3)
+        app.mode_lbl.event_generate("<Button-1>", x=2, y=2)
+        _gui_pump(root, 0.2)
+        assert app.search_window() is None, "a click away left it open"
+        _gui_focus_main(app)            # typing in the box again
+        app.global_search_var.set("192.168")
+        drop.update()
+        _gui_pump(root, 0.2)
+        assert drop.frame is not None
+        app.mode_lbl.event_generate("<Button-1>", x=2, y=2)
+        _gui_pump(root, 0.2)
+        assert drop.frame is None, "a click away left the list open"
+        # #2: hyphens and spaces don't count: "wifi" finds the Health
+        # tab's "Wi-Fi signal (this computer)" and the Wi-Fi help
+        health = dict(drop.results("wifi")).get("Health", [])
+        assert any("Wi-Fi signal" in t for t, _a in health), health
+        assert set(app.help_matches("wi-fi")) <= set(
+            app.help_matches("wifi")), app.help_matches("wifi")
+        d = next(iter(app.model.registry.by_key.values()))
+        alias0 = d.alias
+        try:
+            d.alias = "Kitchen-Speaker Two"
+            app._hay = None
+            got = dict(drop.results("kitchenspeaker")).get("Devices", [])
+            assert got, "a device name with a hyphen was not found"
+        finally:
+            d.alias = alias0
+            app._hay = None
+        # nothing found: the tip is a line of its own, not a cut-off row
+        app.global_search_var.set("zzqqxxyy")
+        win = app._run_global_search()
+        _gui_pump(root, 0.2)
+        assert win._mw_results[0] == 0
+        heads = [str(w.cget("text")) for w in win.winfo_children()
+                 if isinstance(w, tk.Label)]
+        assert heads and heads[0].startswith("No matches found") and \
+            "alert:" in heads[0], heads
+    finally:
+        app.close_search_window()
+        drop.close()
+        app.global_search_var.set("")
+
+
+@gui_test_step("crowd 5.3.4 #14: Settings takes the keyboard (Escape "
+               "closes it), says no change was made until one is saved, "
+               "asks Save / Don't save / Cancel, and follows the header's "
+               "Beginner | Advanced")
+def gt_c534_settings(app, ctx):
+    root = app.root
+    _gui_focus_main(app)
+    sw = app._open_settings("general")
+    f = _gui_focus_in(root, sw.win)
+    assert f is not None, f"the keyboard stayed in {root.focus_get()}"
+    assert sw.dirty_lbl.cget("text") == "No changes yet", \
+        sw.dirty_lbl.cget("text")
+    f.event_generate("<Escape>")
+    _gui_pump(root, 0.2)
+    assert not sw.alive(), "Escape did not close Settings"
+    key = "general.confirm_before_clear"
+    orig = bool(app.config.get(key, False))
+    old = messagebox.askyesnocancel
+    asked = []
+    try:
+        for ans in (None, False, True):
+            sw = app._open_settings("general")
+            _gui_pump(root, 0.3)
+            sw.vars[key].set(not orig)
+            assert "Unsaved changes" in sw.dirty_lbl.cget("text")
+            messagebox.askyesnocancel = \
+                lambda *a, _r=ans, **k: (asked.append(a), _r)[1]
+            sw.cancel()
+            _gui_pump(root, 0.2)
+            if ans is None:             # Cancel: the window stays
+                assert sw.alive() and sw.dirty()
+                sw.win.destroy()
+            elif ans is False:          # No: closed, nothing saved
+                assert not sw.alive()
+                assert bool(app.config.get(key)) == orig
+            else:                       # Yes: saved and closed
+                assert not sw.alive()
+                assert bool(app.config.get(key)) == (not orig)
+        assert len(asked) == 3, asked
+        # after Apply the footer says the changes are saved
+        sw = app._open_settings("general")
+        _gui_pump(root, 0.3)
+        sw.vars[key].set(orig)
+        assert sw.apply()
+        assert sw.dirty_lbl.cget("text") == "All changes saved"
+        # the header's Beginner | Advanced shows in Settings as saved
+        mode0 = app.mode_ui_var.get()
+        try:
+            app.mode_ui_var.set("Advanced" if mode0 == "Beginner"
+                                else "Beginner")
+            app._on_ui_mode_change()
+            _gui_pump(root, 0.2)
+            assert sw.vars["appearance.beginner_mode"].get() == \
+                app.beginner_mode and not sw.dirty()
+        finally:
+            app.mode_ui_var.set(mode0)
+            app._on_ui_mode_change()
+        sw.win.destroy()
+    finally:
+        messagebox.askyesnocancel = old
+        app.config.set(key, orig)
+        app.config.save()
+        sw = app._settings_win
+        if sw is not None and sw.alive():
+            sw.win.destroy()
+
+
+@gui_test_step("crowd 5.3.4 #21: Ctrl+K knows the tabs by their names, "
+               "names settings one way, says when nothing matches and "
+               "closes on a click away; drop-down lists, number boxes and "
+               "cards show the keyboard focus")
+def gt_c534_palette_focus(app, ctx):
+    root = app.root
+    p = app.open_palette()
+    try:
+        p.q.set("happening")
+        _gui_pump(root, 0.1)
+        assert p.shown and p.shown[0][1] == "Happening", p.shown[:3]
+        p.q.set("sett")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Settings", [x[1] for x in p.shown[:4]]
+        labels = [lb for lb, cat, _f in app.palette_items()
+                  if cat == "setting"]
+        assert labels and all(x == "Settings" or x.startswith(
+            "Settings › ") for x in labels), \
+            [x for x in labels if not x.startswith("Settings")][:4]
+        p.q.set("zzqqxxyy")
+        _gui_pump(root, 0.1)
+        assert not p.shown and p.lb.size() == 1 and \
+            "No matches" in p.lb.get(0), p.lb.get(0, "end")
+        p.run()                          # Enter on the hint does nothing
+        app.mode_lbl.event_generate("<Button-1>", x=2, y=2)
+        _gui_pump(root, 0.2)
+        assert not p.alive(), "a click away left Ctrl+K open"
+    finally:
+        p.close()
+    # Tab into a drop-down list or a number box draws a ring
+    st = ttk.Style()
+    ring = st.lookup("TCheckbutton", "focuscolor")
+    for cls in ("TCombobox", "TSpinbox", "TEntry"):
+        got = st.lookup(cls, "bordercolor", ["focus"])
+        assert got == ring, (cls, got, ring)
+    # a card with the keyboard draws a 2-pixel ring in the focus colour
+    app._select_tab("dash")
+    _gui_pump(root, 0.3)
+    cards = [c for c in app.tabs["dash"].card_frames if c.winfo_viewable()]
+    assert cards, "no card shown on the Dashboard"
+    card = cards[-1]
+    _gui_focus_main(app)
+    card.focus_force()
+    _gui_pump(root, 0.2, lambda: root.focus_get() is card, timeout=3)
+    assert root.focus_get() is card
+    assert int(card.cget("highlightthickness")) == 2, \
+        card.cget("highlightthickness")
+    assert str(card.cget("highlightcolor")).lower() == \
+        app.theme["focus"].lower()
+    app.search_entry.focus_force()
+    _gui_pump(root, 0.2)
+    assert int(card.cget("highlightthickness")) == 1
 
 
 # ============================================================================
