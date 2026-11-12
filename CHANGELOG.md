@@ -91,6 +91,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - Alerts now use a device's current name: a renamed device, or one whose name is learned later, is renamed in the Alerts tab too, and this computer is called "This computer" instead of its address or maker. A rule stored with *Expected* names the device and service instead of a raw key such as "02:00:5e:10:00:10|SSH". A device without a name no longer reads "192.168.50.40 got address 192.168.50.40 from DHCP".
 - Devices without a name of their own can be told apart in alerts and the Timeline: "Device using a private Wi-Fi address (192.168.1.77)" instead of the same words for each, translated inside French and Spanish sentences.
 - Packets tab: the packet details keep room for a few lines in a short window instead of shrinking to their heading; a filter that hides the packet shown in the details empties them; *Pause display* and a filter that matches nothing say so next to the count; the Expert view says why it is empty in Full Power; the Protocol hierarchy headings sit over their own numbers again (they were one column off).
+- Printing and saving: the preview of the Network sheet no longer shows its title twice and lists each device on its own lines instead of one run-together paragraph; the preview has a *Print…* button that opens the page in your web browser to print or save as PDF; the sheet and the inventory say when they are demo data; Save and Open dialogs start in your Documents folder instead of the folder MiniWireshark was started from.
 
 **Known limits**
 

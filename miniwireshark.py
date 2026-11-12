@@ -29396,6 +29396,10 @@ Review ¦ Passer en revue ¦ Revisar
 Display paused at %d shown · %d in memory (still capturing) ¦ Affichage suspendu à %d affichés · %d en mémoire (la capture continue) ¦ Vista en pausa con %d mostrados · %d en memoria (la captura continúa)
 0 shown · %d in memory — no packet in memory matches this filter ¦ 0 affiché · %d en mémoire — aucun paquet en mémoire ne correspond à ce filtre ¦ 0 mostrados · %d en memoria — ningún paquete en memoria coincide con este filtro
 No findings yet. Full Power checks packets as they arrive, so packets from before it was switched on are not checked. ¦ Aucune constatation pour l'instant. La pleine puissance vérifie les paquets à leur arrivée : ceux d'avant son activation ne sont pas vérifiés. ¦ Aún no hay hallazgos. La máxima potencia comprueba los paquetes a medida que llegan, así que los de antes de activarla no se comprueban.
+Print ¦ Imprimer ¦ Imprimir
+Demo Mode: this is made-up sample data, not your network. ¦ Mode démo : ce sont des données d'exemple inventées, pas votre réseau. ¦ Modo demo: son datos de ejemplo inventados, no su red.
+The page couldn't be opened in your web browser. Save it and open the file to print it. ¦ La page n'a pas pu être ouverte dans votre navigateur. Enregistrez-la et ouvrez le fichier pour l'imprimer. ¦ No se pudo abrir la página en su navegador. Guárdela y abra el archivo para imprimirla.
+Opened in your web browser: print it from there, or choose Save as PDF. ¦ Ouvert dans votre navigateur : imprimez-le depuis celui-ci ou choisissez Enregistrer en PDF. ¦ Abierto en su navegador: imprímalo desde allí o elija Guardar como PDF.
 Review %d new ¦ Revoir %d nouvelles ¦ Revisar %d nuevas
 Review alerts ¦ Passer en revue les alertes ¦ Revisar alertas
 Review new alerts ¦ Passer en revue les nouvelles alertes ¦ Revisar las alertas nuevas
@@ -34474,6 +34478,18 @@ def _pretty_seq(seq):
     parts = [p for p in (seq or "").strip("<>").split("-") if p != "Key"]
     return "+".join(names.get(p, p.upper() if len(p) == 1 else p)
                     for p in parts if p)
+
+
+def default_save_dir():
+    """Where Save and Open dialogs start when no export folder is set:
+    the user's Documents folder, else the home folder (crowd test #13:
+    the dialogs opened in the folder MiniWireshark was started from,
+    which was its source checkout). None when neither exists."""
+    home = os.path.expanduser("~")
+    for d in (os.path.join(home, "Documents"), home):
+        if d and d != "~" and os.path.isdir(d):
+            return d
+    return None
 
 
 def _open_path(path):
@@ -59114,7 +59130,7 @@ proc ::mw_explicit_fonts {top names} {
     # ======================================================================
     def _dialog_dir(self):
         d = (self.config.get("export.default_dir", "") or "").strip()
-        return d if d and os.path.isdir(d) else None
+        return d if d and os.path.isdir(d) else default_save_dir()
 
     def _popup_at_pointer(self, menu):
         try:
@@ -59249,8 +59265,13 @@ proc ::mw_explicit_fonts {top names} {
         rows = inventory_rows(self.model, self.device_label)
         net = self.network_name()
         sub = (f"{net} · " if net else "") + \
-            f"generated {fmt_clock(time.time(), True)}"
+            f"generated {fmt_clock(time.time(), True)}" + \
+            self._demo_note()
         return inventory_html(rows, "Device inventory", sub)
+
+    def _demo_note(self):
+        return " · DEMO DATA — NOT LIVE TRAFFIC" if \
+            self.data_mode == "demo" else ""
 
     def sheet_facts(self):
         """The network sheet's lines above the table: health, alerts,
@@ -59286,7 +59307,7 @@ proc ::mw_explicit_fonts {top names} {
         rows = inventory_rows(self.model, self.device_label)
         net = self.network_name()
         sub = (f"{net} · " if net else "") + \
-            f"{fmt_clock(time.time(), True)}"
+            f"{fmt_clock(time.time(), True)}" + self._demo_note()
         return inventory_html(rows, "Network sheet", sub,
                               facts=self.sheet_facts())
 
@@ -59378,6 +59399,13 @@ proc ::mw_explicit_fonts {top names} {
         info = tk.Label(win, text="", bg=t["tab_bg"], fg=t["muted_fg"],
                         anchor="w")
         info.pack(fill="x", padx=12)
+        if self.data_mode == "demo":
+            # crowd test #13: an export of the demo said nothing about it
+            tk.Label(win, text=translate_text(
+                "Demo Mode: this is made-up sample data, not your "
+                "network."), bg=t["tab_bg"], fg=t.get("warn_fg",
+                                                      t["text_fg"]),
+                anchor="w").pack(fill="x", padx=12)
         panes = tk.Frame(win, bg=t["tab_bg"])
         panes.pack(fill="both", expand=True, padx=12, pady=6)
         texts = []
@@ -59433,17 +59461,56 @@ proc ::mw_explicit_fonts {top names} {
                 return
             self._set_banner(f"\U0001F4C4  Saved: {path}", kind="good")
             win.destroy()
+
+        def print_it():
+            return self.print_html(state["out"], parent=win)
         btns = tk.Frame(win, bg=t["tab_bg"], padx=12, pady=8)
         btns.pack(fill="x")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(
             side="right")
         ttk.Button(btns, text="Save…", style="Accent.TButton",
                    command=save).pack(side="right", padx=6)
+        if os.path.splitext(filename)[1] in ("", ".html"):
+            ttk.Button(btns, text="Print…", command=print_it).pack(
+                side="right")
         render()
         win._mw_state, win._mw_opts, win._mw_on, win._mw_render = \
             state, opts, on, render
-        win._mw_save = save
+        win._mw_save, win._mw_print = save, print_it
         return win
+
+    def print_html(self, content, parent=None):
+        """5.3.4 crowd test #13: the page said "Print this page", but the
+        preview offered only Save. Print opens what will be saved in the
+        web browser, which prints it or saves it as PDF. The copy is kept
+        in the private data folder (one file, replaced each time), never
+        in a shared temporary folder. → its path, or None."""
+        folder = os.path.join(PATHS.data, "print")
+        path = os.path.join(folder, "print-preview.html")
+        page = content
+        if "</body>" in page:
+            page = page.replace("</body>", "<script>window.addEventListener("
+                                "'load',function(){window.print()})"
+                                "</script></body>", 1)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with contextlib.suppress(OSError):
+                os.chmod(folder, 0o700)
+            atomic_write_text(path, page)
+        except OSError as e:
+            messagebox.showerror("Print", str(e), parent=parent or self.root)
+            return None
+        if not _open_path(path):
+            messagebox.showerror(
+                "Print", translate_text("The page couldn't be opened in "
+                                        "your web browser. Save it and "
+                                        "open the file to print it."),
+                parent=parent or self.root)
+            return None
+        self._set_banner(translate_text(
+            "Opened in your web browser: print it from there, or choose "
+            "Save as PDF."), kind="good")
+        return path
 
     def _ask_save(self, ext, types, name):
         return filedialog.asksaveasfilename(
@@ -61858,9 +61925,55 @@ def inventory_html(rows, title="Device inventory", subtitle="", facts=None):
             f"</footer></body></html>")
 
 
+def _preview_cell(c):
+    c = re.sub(r"(?i)<br\s*/?>", " ", c)
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", "", c)).split())
+
+
+def _preview_table(m):
+    """One HTML table as text (crowd test #13): a table with a heading
+    row becomes one block per row ("Device: …" on its first line, then
+    "Kind: …, Address: …"), a two-column table "Label: value" lines. As
+    plain cells it ran together into one paragraph in the preview."""
+    rows = []
+    for tr in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", m.group(0)):
+        cells = re.findall(r"(?is)<(t[hd])[^>]*>(.*?)</t[hd]>", tr)
+        rows.append([(k.lower(), _preview_cell(v)) for k, v in cells])
+    rows = [r for r in rows if r]
+    if not rows:
+        return "\n"
+    out = []
+    if all(k == "th" for k, _v in rows[0]) and len(rows[0]) > 2:
+        names = [v for _k, v in rows[0]]
+        for r in rows[1:]:
+            vals = [v for _k, v in r]
+            pairs = [(names[i] if i < len(names) else "", v)
+                     for i, v in enumerate(vals) if v]
+            if not pairs:
+                continue
+            lead = next(((n, v) for n, v in pairs if n), pairs[0])
+            rest = [f"{n}: {v}" if n else v for n, v in pairs
+                    if (n, v) != lead]
+            out.append(f"{lead[0]}: {lead[1]}" if lead[0] else lead[1])
+            if rest:
+                out.append("    " + " · ".join(rest))
+            out.append("")
+    else:
+        for r in rows:
+            vals = [v for _k, v in r if v]
+            if len(r) == 2 and r[0][0] == "th":
+                out.append(f"{r[0][1]}: {r[1][1]}")
+            elif vals:
+                out.append(" · ".join(vals))
+    return "\n" + "\n".join(out).rstrip() + "\n\n"
+
+
 def html_to_preview_text(h):
     """A readable plain-text rendering of an HTML export (for previews)."""
-    h = re.sub(r"(?is)<(style|script)[^>]*>.*?</\1>", "", h)
+    # crowd test #13: the <title> (inside <head>) ran into the heading:
+    # "Network sheetNetwork sheet"
+    h = re.sub(r"(?is)<(style|script|title)[^>]*>.*?</\1>", "", h)
+    h = re.sub(r"(?is)<table[^>]*>.*?</table>", _preview_table, h)
     h = re.sub(r"(?i)<br\s*/?>|</(p|tr|h\d|li|section|div)>", "\n", h)
     h = re.sub(r"(?i)</t[dh]>", "  ", h)
     h = re.sub(r"<[^>]+>", "", h)
@@ -96008,6 +96121,69 @@ def gt_c12_packet_view(app, ctx):
         (vals, len(app.all_rows))
     assert tree.set(top, "pct") == "100.0", tree.set(top, "pct")
     pt.show_subview("Packets")
+
+
+@gui_test_step("5.3.4 crowd #13: the network sheet previews cleanly, has a "
+               "Print button, says demo, and saving starts outside the "
+               "program folder")
+def gt_c13_print_and_export(app, ctx):
+    root = app.root
+    sheet = app.sheet_document()
+    text = html_to_preview_text(sheet)
+    assert "Network sheetNetwork sheet" not in text, text[:80]
+    assert text.startswith("Network sheet\n"), text[:80]
+    lines = text.splitlines()
+    names = [ln for ln in lines if ln.startswith("Device: ")]
+    rows = inventory_rows(app.model, app.device_label)
+    assert len(names) == len(rows), (len(names), len(rows))
+    assert any(ln.startswith("Router: ") for ln in lines), lines[:12]
+    # Print: what will be saved opens in the browser, from the data folder
+    opened = []
+    real = _open_path
+    globals()["_open_path"] = lambda p: opened.append(p) or True
+    win = app.redaction_preview("Network sheet", sheet, "network-sheet.html",
+                                redact=False)
+    try:
+        _gui_pump(root, 0.2)
+        labels = []
+
+        def walk(w):
+            with contextlib.suppress(tk.TclError):
+                if isinstance(w, ttk.Button):
+                    labels.append(str(w.cget("text")))
+            for c in w.winfo_children():
+                walk(c)
+        walk(win)
+        assert any(lb.startswith(translate_text("Print")) for lb in labels), \
+            labels
+        path = win._mw_print()
+    finally:
+        globals()["_open_path"] = real
+        with contextlib.suppress(tk.TclError):
+            win.destroy()
+    assert path and opened == [path], (path, opened)
+    assert os.path.dirname(os.path.dirname(path)) == PATHS.data, path
+    with open(path, encoding="utf-8") as f:
+        page = f.read()
+    assert "window.print()" in page and "Network sheet" in page
+    # an export of the demo says so
+    was = app.data_mode
+    app.data_mode = "demo"
+    try:
+        assert "DEMO DATA" in app.sheet_document()
+        assert "DEMO DATA" in app.inventory_document()
+    finally:
+        app.data_mode = was
+    assert "DEMO DATA" not in app.sheet_document()
+    # Save dialogs start in Documents or the home folder
+    old = app.config.get("export.default_dir", "")
+    app.config.set("export.default_dir", "")
+    try:
+        d = app._dialog_dir()
+    finally:
+        app.config.set("export.default_dir", old)
+    home = os.path.expanduser("~")
+    assert d in (os.path.join(home, "Documents"), home), d
 
 
 # ============================================================================
