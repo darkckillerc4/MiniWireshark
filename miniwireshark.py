@@ -3068,8 +3068,8 @@ OUTBOUND_FEATURES = {
 
 # 5.3.4 crowd test (#3): what the kill switch does, said once. The banner,
 # the Settings help, the ledger, Help and the Ready? list each said it in
-# their own words ("stops every optional request", "sends nothing at all",
-# "nothing leaves this computer" — other programs' traffic still does).
+# their own words: only the optional requests, absolutely nothing, nothing
+# leaving this computer at all (other programs' traffic still does).
 KILL_SWITCH_EFFECT = ("MiniWireshark sends nothing: no discovery probes, "
                       "health checks, name lookups, downloads or update "
                       "checks. Watching continues.")
@@ -29866,6 +29866,8 @@ KILL SWITCH ON ¦ ARRÊT D'URGENCE ACTIVÉ ¦ INTERRUPTOR DE CORTE ACTIVADO
 Kill switch on ¦ Arrêt d'urgence activé ¦ Interruptor de corte activado
 MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. Each request it sent or blocked is listed in the self-traffic ledger (the button below). ¦ MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. Chaque requête envoyée ou bloquée figure dans le registre des envois (le bouton ci-dessous). ¦ MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa. Cada solicitud enviada o bloqueada figura en el registro de envíos (el botón de abajo).
 Settings → Privacy → Kill switch. MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. ¦ Paramètres → Confidentialité → Arrêt d'urgence. MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. ¦ Ajustes → Privacidad → Interruptor de corte. MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa.
+KILL SWITCH ON — MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. ¦ ARRÊT D'URGENCE ACTIVÉ — MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. ¦ INTERRUPTOR DE CORTE ACTIVADO — MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa.
+Kill switch on — MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. ¦ Arrêt d'urgence activé — MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. ¦ Interruptor de corte activado — MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa.
 Nothing sent or blocked yet. ¦ Rien n'a encore été envoyé ni bloqué. ¦ Aún no se ha enviado ni bloqueado nada.
 Checks only run while watching live; this is demo data. ¦ Les vérifications ne tournent qu'en observation en direct ; ce sont des données de démo. ¦ Las comprobaciones solo se ejecutan observando en directo; estos son datos de demostración.
 Checks only run while watching live; this is saved data. ¦ Les vérifications ne tournent qu'en observation en direct ; ce sont des données enregistrées. ¦ Las comprobaciones solo se ejecutan observando en directo; estos son datos guardados.
@@ -30957,8 +30959,9 @@ I18N_PATTERNS += [
      r"hasta ahora: \1 (solo las que pasaron por la tarjeta de red de "
      r"este ordenador)."),
 ]
-# 5.3.4 crowd test: the places where the app contradicted itself
-I18N_PATTERNS += [
+# 5.3.4 crowd test: the places where the app contradicted itself (in
+# front: the generic "(.+) — (.+)." would take them first)
+I18N_PATTERNS[:0] = [
     (r"No unusual behaviour, but (\d+) open warnings need a look\.",
      r"Aucun comportement inhabituel, mais \1 avertissements ouverts "
      r"méritent un coup d'œil.",
@@ -87783,6 +87786,118 @@ def t_r7_self_test_keeps_the_real_log_clean(ctx):
     assert lines == ["self-test ran: 1 passed, 1 failed, 1 skipped"], lines
 
 
+# ---- 5.3.4 crowd test: places where the app contradicted itself ------------
+def _ct_translated(texts):
+    miss = [(loc, t) for t in texts for loc in ("fr", "es")
+            if translate_text(t, loc) == t]
+    assert not miss, miss[:4]
+
+
+@self_test()
+def t_ct3_kill_switch_said_once(ctx):
+    """Crowd test #3: the banner, the Settings help, the ledger, Help and
+    the Ready? line say the same thing about the kill switch (one
+    sentence, KILL_SWITCH_EFFECT), in all three languages, and none of
+    the old claims ("nothing leaves this computer", "stops every
+    optional request", "the ledger below") is left."""
+    ctl = next(c for pg in SETTINGS_PAGES for sec in pg["sections"]
+               for c in sec["controls"] if c.get("key") ==
+               "privacy.kill_switch")
+    topic = next(t for t in HELP_USING if t[0] == "Kill switch")
+    st, ready, _fix = _ready_outbound(ctx.cfg({"privacy.kill_switch": True}))
+    texts = [ctl["help"], topic[1], ready]
+    for t in texts:
+        assert KILL_SWITCH_EFFECT in t, t
+        for old in ("nothing leaves this", "Nothing leaves this",
+                    "every optional", "ledger below", "sends nothing at all"):
+            assert old not in t, (old, t)
+    assert st == "ok"
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        src = f.read()
+    stop = src.index("#  20b.  Self-tests")
+    for old in ("sends nothing at all", "Nothing leaves this PC",
+                "stops every optional network", "listed in the ledger below",
+                "Kill switch ON — nothing is being sent"):
+        assert old not in src[:stop], old
+    _ct_translated(texts + ["\U0001F6D1 KILL SWITCH ON — " +
+                            KILL_SWITCH_EFFECT,
+                            "\U0001F6D1  Kill switch on — " +
+                            KILL_SWITCH_EFFECT,
+                            "Nothing sent or blocked yet."])
+
+
+@self_test()
+def t_ct4_nothing_unusual_never_over_open_warnings(ctx):
+    """Crowd test #4: with an open WARNING that is not about unusual
+    behaviour (FTP without encryption), the Dashboard card, the Security
+    section and the check-up don't say "Nothing unusual right now": they
+    all count it with other_open_alerts(). Acknowledged, it no longer
+    counts."""
+    clock = [1761600000.0]
+    e = AlertEngine(ctx.cfg({}), now_fn=lambda: clock[0])
+    a = e.cleartext("Brother HL-L2350DW", "aa:bb", "FTP", "203.0.113.5",
+                    True)
+    assert a is not None and a.severity == "WARNING"
+    assert unusual_findings(e) == []
+    others = other_open_alerts(e)
+    assert [x.id for x in others] == [a.id]
+    text = unusual_card_text(len(unusual_findings(e)), len(others))
+    assert "Nothing unusual" not in text and "1 open warning" in text, text
+    assert "2 open warnings" in unusual_card_text(0, 2)
+    _ct_translated([text, unusual_card_text(0, 2),
+                    "They are in the Alerts tab.", "no unusual behaviour"])
+    e.acknowledge(a.id)
+    assert other_open_alerts(e) == []
+    assert unusual_card_text(0, len(other_open_alerts(e))) == \
+        "Nothing unusual right now."
+
+
+@self_test()
+def t_ct8_wifi_signal_is_not_a_speed_test(ctx):
+    """Crowd test #8: a weak signal is described, not crowned "the most
+    likely cause of slowness"; a quick handshake to Internet sites says
+    it timed how fast connections open, not download speed."""
+    why = wifi_quality(-78)[2]
+    assert "most likely cause" not in why, why
+    hyps = investigate_wifi_internet({"lan_ms": 4.0, "lan_n": 5,
+                                      "lan_gw": True, "wan_ms": 34.0,
+                                      "wan_n": 9})
+    inet = next(h for h in hyps if h["key"] == "internet")
+    assert inet["status"] == "Unlikely", inet
+    assert any("not download speed" in x for x in inet["against"]), inet
+    _ct_translated([why, "○ Only how quickly connections open was timed, "
+                         "not download speed"])
+
+
+@self_test()
+def t_ct28_device_scales_have_one_key(ctx):
+    """Crowd test #28: the Devices table's three ways of saying how sure
+    it is ("Device evidence" dots, the "Evidence" glyphs, "Likely" and
+    "Possibly") have one key, built from the tables the cells use, with
+    the score each word needs; the Devices header shows it."""
+    key = device_scales_key()
+    for low, word in CONFIDENCE_STEPS:
+        assert f"{CONFIDENCE_ICON[word]} {word}" in key, word
+        assert confidence_tier(low) == word, (low, word)
+        if low:
+            assert f"score {low}+" in key and \
+                confidence_tier(low - 1) != word, low
+    for lv, glyph in LEVEL_GLYPH.items():
+        assert f"{glyph} {LEVEL_WORD[lv]}" in key, lv
+    for word in ("Device evidence", "Evidence", "“Likely”", "“Possibly”"):
+        assert word in key, word
+    assert {c[0]: c[1] for c in DevicesTab.COLS}["conf"] in key
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        src = f.read()
+    body = src[src.index("class DevicesTab(BaseTab):"):]
+    body = body[:body.index("    def explain_row")]
+    assert "device_scales_key()" in body, "the Devices header has no key"
+    _ct_translated([key, "The devices on your local network. Device "
+                    "evidence shows how sure it is that each one is a real "
+                    "device — an IP address alone is never enough to count "
+                    "as a device."])
+
+
 # ============================================================================
 #  20c.  GUI test — drives the real window under a (virtual) display
 #
@@ -88226,6 +88341,16 @@ def _gs_diag_depth(app, ctx):
     res = app.health_summary()
     assert res["wifi"][0] == "Needs attention", res["wifi"]
     assert app.health_culprit == "wifi"
+    # crowd test #8: a weak signal with no slowness measured is worth a
+    # look, not yet the culprit; with router checks that lost packets it
+    # is the likely culprit
+    assert res["overall"][1].startswith("Worth a look: Wi-Fi"), \
+        res["overall"]
+    for ok in (True, False, True):
+        m.health_history.append({"gateway_ok": ok, "gateway_ms": 4.0})
+    res = app.health_summary()
+    assert res["loss"][0] == "Needs attention", res["loss"]
+    assert app.health_culprit == "wifi"
     assert "Likely culprit: Wi-Fi" in res["overall"][1], res["overall"]
     assert res["switch"][0] == "Healthy" and "core-sw1" in res["switch"][1]
     # ST-07: the Dashboard's first answer agrees with the Health verdict
@@ -88250,6 +88375,7 @@ def _gs_diag_depth(app, ctx):
             win.destroy()
     app.wifi.last = None
     app.wifi.at = 0.0
+    m.health_history.clear()
     app.data_mode = "idle"
 
 
@@ -93210,6 +93336,278 @@ def gt_nothing_piles_up(app, ctx):
             with contextlib.suppress(AttributeError, tk.TclError):
                 dlg.win.destroy()
         _gui_pump(root, 0.3)
+
+
+@gui_test_step("crowd #3: the kill switch's boxes and banner agree")
+def _gs_ct3_kill_switch(app, ctx):
+    """Ticked in the ledger, the open Settings window shows it ticked (and
+    still "All changes saved"), the banner says the one sentence; turned
+    off from the banner, both boxes clear."""
+    root = app.root
+    was = app.config.get("privacy.kill_switch", False)
+    sw = app._open_settings("privacy")
+    _gui_pump(root, 0.2)
+    led = app.open_ledger()
+    _gui_pump(root, 0.2)
+
+    def boxes(w):
+        out = []
+        for c in w.winfo_children():
+            if isinstance(c, ttk.Checkbutton):
+                out.append(c)
+            out += boxes(c)
+        return out
+    try:
+        box = next(b for b in boxes(led) if "Kill switch" in
+                   str(b.cget("text")) or "urgence" in str(b.cget("text")))
+        box.invoke()                                 # tick it in the ledger
+        _gui_pump(root, 0.2)
+        assert LEDGER.killed
+        assert sw.vars["privacy.kill_switch"].get() is True, \
+            "Settings still shows the kill switch off"
+        assert not sw.dirty(), "Settings calls the synced tick unsaved"
+        text = str(app.mode_lbl.cget("text"))
+        assert "KILL SWITCH" in text and \
+            translate_text(KILL_SWITCH_EFFECT) in text, text
+        app._kill_switch_off()                       # the banner's button
+        _gui_pump(root, 1.3)                         # the ledger's tick
+        assert not LEDGER.killed
+        assert not root.getvar(str(box.cget("variable"))), \
+            "the ledger's box stayed ticked"
+        assert sw.vars["privacy.kill_switch"].get() is False
+        if not LEDGER.snapshot():
+            assert led._mw_empty.winfo_manager(), "a blank ledger"
+    finally:
+        app.set_kill_switch(was)
+        with contextlib.suppress(tk.TclError):
+            led.destroy()
+        with contextlib.suppress(tk.TclError):
+            sw.win.destroy()
+        _gui_pump(root, 0.1)
+
+
+@gui_test_step("crowd #4: no \"Nothing unusual\" over an open warning")
+def _gs_ct4_unusual(app, ctx):
+    root = app.root
+    eng = app.model.alerts
+    held = [a for a in eng.alerts.values() if not a.acknowledged]
+    for a in held:
+        a.acknowledged = True
+    a = eng.cleartext("Crowd printer", "ct:04", "FTP", "203.0.113.4", True)
+    try:
+        assert a is not None and a.severity == "WARNING"
+        dash = app._select_tab("dash")
+        _gui_pump(root, 0.2)
+        text = dash.show_unusual_card()
+        assert "Nothing unusual" not in text and "open warning" in text, \
+            text
+        sec = app._select_tab("security")
+        _gui_pump(root, 0.2)
+        sec.unusual.refresh(force=True)
+        shown = " ".join(str(w.cget("text")) for w in
+                         sec.unusual.body.winfo_children()
+                         if isinstance(w, tk.Label))
+        assert "Nothing unusual" not in shown and "open warning" in shown, \
+            shown
+    finally:
+        if a is not None:
+            eng.acknowledge(a.id)
+        for x in held:
+            x.acknowledged = False
+        with contextlib.suppress(Exception):
+            app.tabs["security"].unusual.refresh(force=True)
+
+
+@gui_test_step("crowd #5: the Timeline's counter counts the events listed")
+def _gs_ct5_timeline_count(app, ctx):
+    root = app.root
+    m = app.model
+    tl = app._select_tab("timeline")
+    tl.set_story(False)
+    tl.pause_var.set(False)
+    tl.rebuild()
+    _gui_pump(root, 0.2)
+    e1 = m.push_timeline("network", "INFO", "Crowd test five, first event")
+    tl.rebuild()                 # lists it from the model's timeline ...
+    app._flush_events(m)         # ... before the batch with it arrives
+    _gui_pump(root, 0.2)
+
+    def listed():
+        return [v for v in tl.refs.values() if v is not None]
+    texts = [str(tl.tree.set(i, "text")) for i in tl.tree.get_children()]
+    assert sum("Crowd test five, first" in t for t in texts) == 1, \
+        "the event is listed twice"
+    want = plural(len(listed()), "event") + " this session"
+    assert str(tl.status_lbl.cget("text")) == want, \
+        (tl.status_lbl.cget("text"), want)
+    m.push_timeline("network", "INFO", "Crowd test five, second event")
+    app._flush_events(m)         # arrives without a rebuild
+    _gui_pump(root, 0.2)
+    want = plural(len(listed()), "event") + " this session"
+    assert str(tl.status_lbl.cget("text")) == want, \
+        (tl.status_lbl.cget("text"), want)
+    assert e1 in listed()
+
+
+@gui_test_step("crowd #6: the story is written again when its data changed")
+def _gs_ct6_story_fresh(app, ctx):
+    root = app.root
+    m = app.model
+    _gui_pump(root, 0.05, lambda: "story" not in app.jobs.active,
+              timeout=30)
+    assert app.request_story(force=True) is not None
+    assert _gui_pump(root, 0.05, lambda: app.story is not None and
+                     "story" not in app.jobs.active, timeout=30)
+    c0 = app.story["count"]
+    assert app.request_story() is None, "nothing changed: no new story"
+    m.push_timeline("network", "WARNING", "Crowd test six: the router "
+                                          "restarted")
+    app._story_at = time.monotonic() - 15      # older than 10 s, not 60
+    job = app.request_story()
+    assert job is not None, "a story a few seconds old missed new data"
+    assert _gui_pump(root, 0.05, lambda: "story" not in app.jobs.active and
+                     app.story is not None and app.story["count"] > c0,
+                     timeout=30), (c0, app.story and app.story["count"])
+    dash = app.tabs["dash"]
+    assert dash.show_story_card() == story_card_text(app.story,
+                                                     app.data_mode)
+
+
+def _ct_health_model(app):
+    """An empty model with no checks: (old model, old data mode)."""
+    old = (app.model, app.data_mode)
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "offline"
+    return old
+
+
+def _ct_health_restore(app, old):
+    app.wifi.last = None
+    app.wifi.at = 0.0
+    app.replace_model(old[0])
+    app.data_mode = old[1]
+    _gui_pump(app.root, 0.2)
+
+
+@gui_test_step("crowd #7: Health says Healthy only when the top checks ran")
+def _gs_ct7_health_verdict(app, ctx):
+    old = _ct_health_model(app)
+    try:
+        res = app.health_summary()
+        assert all(res[k][0] == "Unknown" for k in ("gateway", "internet",
+                                                    "dns", "wifi")), res
+        st, text = res["overall"]
+        assert st != "Healthy", res["overall"]
+        assert "Not checked yet" in text and "Router reachable" in text, text
+        tab = app._select_tab("health")
+        tab.refresh()
+        _gui_pump(app.root, 0.1)
+        label = str(tab.rows["overall"][0].cget("text"))
+        assert "Healthy" not in label, label
+        # "Why is it slow?" and the rows say the same about the router
+        fresh = app.slow_freshness()
+        if res["gateway"][0] == "Info":
+            assert "not checked yet" in fresh, fresh
+    finally:
+        _ct_health_restore(app, old)
+
+
+@gui_test_step("crowd #8: a weak signal alone is not the likely culprit")
+def _gs_ct8_culprit(app, ctx):
+    old = _ct_health_model(app)
+    app.data_mode = "live"
+    try:
+        app.wifi.last = parse_netsh_wlan(NETSH_EN)       # -78 dBm
+        app.wifi.at = time.time() + 3600
+        res = app.health_summary()
+        assert res["wifi"][0] == "Needs attention", res["wifi"]
+        text = res["overall"][1]
+        assert "Likely culprit" not in text and "No slowness was " \
+            "measured" in text, text
+        ans, kind, _go = app.dashboard_answers(force=True)["wrong"]
+        assert kind == "warn" and "Possibly: Worth" not in ans and \
+            "Likely culprit" not in ans, ans
+    finally:
+        _ct_health_restore(app, old)
+
+
+@gui_test_step("crowd #17: Health says why instead of a dash or a grey button")
+def _gs_ct17_health_reasons(app, ctx):
+    old = _ct_health_model(app)
+    try:
+        tab = app._select_tab("health")
+        tab.refresh()
+        _gui_pump(app.root, 0.1)
+        assert tab.run_btn.instate(["disabled"])
+        why = app.health_checks_blocked()
+        assert why and "live" in why, why
+        assert tab.run_tip.text == translate_text(why), tab.run_tip.text
+        for line in app.connection_info_text().splitlines():
+            assert not line.rstrip().endswith(": —"), line
+        app.data_mode = "live"
+        LEDGER.killed = True
+        try:
+            assert "kill switch" in app.health_note(), app.health_note()
+        finally:
+            LEDGER.killed = False
+    finally:
+        _ct_health_restore(app, old)
+
+
+@gui_test_step("crowd #25: the Dashboard's time window is the cards' window")
+def _gs_ct25_window(app, ctx):
+    root = app.root
+    dash = app._select_tab("dash")
+    was = dash.range_var.get()
+    try:
+        for choice, secs in (("Last hour", 3600), ("Last 5 minutes", 300),
+                             ("Last 24 hours", 86400)):
+            dash.range_var.set(choice)
+            dash._window_changed()
+            _gui_pump(root, 0.1)
+            text = app.dashboard_answers()["usage"][0]
+            assert f" {span_words(secs)}" in text, (choice, text)
+    finally:
+        dash.range_var.set(was)
+        dash._window_changed()
+
+
+@gui_test_step("crowd #26: one packet count on Packets and Statistics")
+def _gs_ct26_packet_count(app, ctx):
+    root = app.root
+    tab = app._select_tab("packets")
+    tab.show_subview("Packets")
+    _gui_pump(root, 0.1)
+    rows = list(app.all_rows)[-20:]
+    if not rows:
+        return
+    if not tab.paused:
+        tab.toggle_pause()
+    added = 0
+    try:
+        for d in rows:                     # more arrive while paused
+            app.all_rows.append(dict(d))
+            added += 1
+        tab.refresh()
+        _gui_pump(root, 0.1)
+        n = len(app.all_rows)
+        assert f"{n} in memory" in tab.count_var.get(), \
+            (tab.count_var.get(), n)
+        tab.show_subview("Statistics")
+        tab.stats.kind_var.set("Protocol hierarchy")
+        tab.stats.refresh(force=True)
+        assert f"Out of {n:,} packets in memory" in \
+            str(tab.stats.note.cget("text")), tab.stats.note.cget("text")
+    finally:
+        for _ in range(added):
+            app.all_rows.pop()
+        tab.show_subview("Packets")
+        if tab.paused:
+            tab.toggle_pause()
+        _gui_pump(root, 0.1)
 
 
 @gui_test_step("every action 5.0.2 could reach is still reachable")
