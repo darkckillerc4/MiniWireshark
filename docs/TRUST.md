@@ -45,6 +45,7 @@ MiniWireshark mostly *listens*. It sends something in the following cases, each 
 | Country lookup | **Off** by default | An online lookup service, only if you turn it on |
 | Pi-hole / AdGuard Home | Only if you add one | The helper you added, on your network |
 | Router port-forwarding check | Only when you press the button | Your router |
+| Open a local service | Only when you open one from Websites → Local services | Your browser, at `127.0.0.1` (this computer) |
 
 How to check:
 

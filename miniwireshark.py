@@ -18970,7 +18970,7 @@ def local_services_state(pm):
 
 def local_service_cells(r):
     """One row's cells in the shown language: port, protocol, what it is,
-    program, where it listens, who can reach it."""
+    who can reach it, program, where it listens."""
     tt = translate_text
     shown = [tt("all addresses") if a in LOCAL_ANY_ADDRESS else a
              for a in r["addrs"]]
@@ -18980,8 +18980,8 @@ def local_service_cells(r):
     if prog in ("the operating system",
                 "unknown program (needs admin rights to name it)"):
         prog = tt(prog)
-    return (r["port"], r["proto"], tt(r["what"]), prog,
-            f"{where} ({', '.join(shown)})", tt(r["safety"]))
+    return (r["port"], r["proto"], tt(r["what"]), tt(r["safety"]), prog,
+            f"{where} ({', '.join(shown)})")
 
 
 class ListenWatch:
@@ -40963,12 +40963,12 @@ class LocalServicesView:
     127.0.0.1, through the outbound() gate. Reading the list sends
     nothing."""
 
-    COLS = [("port", "Port", 64, "e", False),
+    COLS = [("port", "Port", 60, "e", False),
             ("proto", "Protocol", 76, "w", False),
-            ("what", "What it probably is", 210, "w", True),
-            ("program", "Program", 170, "w", True),
-            ("listens", "Listens on", 200, "w", True),
-            ("safety", "Who can reach it", 250, "w", True)]
+            ("what", "What it probably is", 200, "w", True),
+            ("safety", "Who can reach it", 250, "w", True),
+            ("program", "Program", 160, "w", True),
+            ("listens", "Listens on", 200, "w", True)]
     POLL_MS = 150
     READ_TIMEOUT = 8.0           # s: give up waiting for one read
     AUTO_EVERY = 15.0            # s: read again while shown, not watching
@@ -40986,17 +40986,25 @@ class LocalServicesView:
         self._auto_at = 0.0
         top = tk.Frame(frame, bg=WHITE, padx=12, pady=8)
         top.pack(fill="x")
-        tk.Label(top, text="\U0001F5A5  Local services — programs on this "
+        self.head_lbl = tk.Label(top, text="\U0001F5A5  Local services — programs on this "
                  "computer that wait for connections. Most are normal: "
                  "development tools, printing, file sharing.",
                  bg=WHITE, fg="#333333", wraplength=1000, justify="left",
-                 font=mw_font(11)).pack(anchor="w")
-        tk.Label(top, text="“This computer only” can't be reached from "
-                 "other devices. “The whole network” can, unless a firewall "
-                 "blocks it. Double-click a web app to open it in your "
-                 "browser.", bg=WHITE, fg="#666666", wraplength=1000,
-                 justify="left", font=mw_font(9)).pack(anchor="w",
-                                                        pady=(2, 0))
+                 font=mw_font(11))
+        self.head_lbl.pack(anchor="w")
+        sub = tk.Label(top, text="“This computer only” can't be reached "
+                       "from other devices. “The whole network” can, "
+                       "unless a firewall blocks it. Double-click a web "
+                       "app to open it in your browser.", bg=WHITE,
+                       fg="#666666", wraplength=1000, justify="left",
+                       font=mw_font(9))
+        sub.pack(anchor="w", pady=(2, 0))
+        # in a short window (large text, 768 pixels) the explanation steps
+        # aside for the table, as in every tab (BaseTab._fit_header)
+        self._head = (frame, top, sub)
+        for w in (frame, top):
+            w.bind("<Configure>", lambda _e=None: BaseTab._fit_header(self),
+                   add="+")
         bar = tk.Frame(frame, bg=WHITE, padx=12)
         bar.pack(fill="x", pady=(0, 6))
         self.refresh_btn = ttk.Button(bar, text="Refresh",
@@ -82076,21 +82084,21 @@ def t_534_local_services_rows(ctx):
     assert st == "ok" and len(got) == 1          # partial: still shown
     # the cells, in all three languages
     cells = local_service_cells(vite)
-    assert cells == (5173, "TCP", LOCAL_DEV_WEB, "node (pid 4001)",
-                     "This computer only (127.0.0.1, ::1)", LOCAL_SAFE), \
-        cells
-    assert local_service_cells(dev)[4] == \
+    assert cells == (5173, "TCP", LOCAL_DEV_WEB, LOCAL_SAFE,
+                     "node (pid 4001)",
+                     "This computer only (127.0.0.1, ::1)"), cells
+    assert local_service_cells(dev)[5] == \
         "The whole network (all addresses)"
     try:
         for loc in ("fr", "es"):
             set_locale(loc)
             c = local_service_cells(dev)
             for en, shown in ((LOCAL_DEV_WEB, c[2]),
-                              (LOCAL_EXPOSED, c[5])):
+                              (LOCAL_EXPOSED, c[3])):
                 assert shown == I18N[loc][en] and shown != en, (loc, c)
-            assert c[4].startswith(I18N[loc]["The whole network"]) and \
-                I18N[loc]["all addresses"] in c[4], c
-            assert local_service_cells(unk)[3] == I18N[loc][
+            assert c[5].startswith(I18N[loc]["The whole network"]) and \
+                I18N[loc]["all addresses"] in c[5], c
+            assert local_service_cells(unk)[4] == I18N[loc][
                 "unknown program (needs admin rights to name it)"]
             for r in rows:
                 assert translate_text(r["what"]) != r["what"], (loc, r)
@@ -90188,6 +90196,7 @@ def _gs_v502_layout(app, ctx):
                 # listeners, so the rows don't depend on this computer)
                 if name == "websites":
                     tab = app.tabs[name]
+                    src0 = tab.local.source
                     tab.local.source = lambda: (
                         "ok", _local_fake_listeners())
                     try:
@@ -90199,7 +90208,7 @@ def _gs_v502_layout(app, ctx):
                                          f"local: {kind} {path[-60:]} "
                                          f"{detail}")
                     finally:
-                        tab.local.source = None
+                        tab.local.source = src0
                         tab.show_subview("Websites")
             # a dialog with many buttons and the settings window
             dev = next(iter(app.model.registry.by_key))
@@ -90611,6 +90620,13 @@ def run_gui_test(live=False):
     root = tk.Tk()
     gw, ips, macs, nets = scenario_identity()
     app = MiniWireshark(root, "", set(), set(), "", config=cfg)
+    if not live:
+        # 5.3.4: Websites → Local services shows a fixed set of listeners,
+        # so what the steps count and lay out doesn't depend on this
+        # computer (t_534_local_services_from_connection_table reads the
+        # table itself)
+        app.tabs["websites"].local.source = lambda: (
+            "ok", _local_fake_listeners())
 
     def step(name, fn):
         t0 = time.perf_counter()
@@ -93373,6 +93389,7 @@ def gt_534_local_services(app, ctx):
     tab = app._select_tab("websites")
     view = tab.local
     fake = {"state": "ok", "listening": _local_fake_listeners()}
+    src0 = view.source
     view.source = lambda: (fake["state"], dict(fake["listening"]))
 
     def widgets(w):
@@ -93412,14 +93429,14 @@ def gt_534_local_services(app, ctx):
         rows = cells()
         assert len(rows) == 10, rows
         by = {(r[1], r[0]): r for r in rows}
-        assert by[("TCP", "5173")][5] == "Only this computer can reach it"
-        assert by[("TCP", "8080")][5] == \
+        assert by[("TCP", "5173")][3] == "Only this computer can reach it"
+        assert by[("TCP", "8080")][3] == \
             "Other devices on your network can reach it"
-        assert by[("TCP", "8080")][4] == "The whole network (all addresses)"
+        assert by[("TCP", "8080")][5] == "The whole network (all addresses)"
         assert by[("TCP", "5173")][2] == "Web app in development"
         assert by[("TCP", "631")][2] == "Printing (IPP)"
         assert by[("TCP", "5432")][2] == "Database connection (PostgreSQL)"
-        assert "node (pid 4001)" == by[("TCP", "5173")][3]
+        assert "node (pid 4001)" == by[("TCP", "5173")][4]
         # refresh 3 times and EN → FR → ES → EN: the same rows, widgets
         # and table kits every time
         base = (len(rows), widgets(view.frame), len(app.kits),
@@ -93437,7 +93454,7 @@ def gt_534_local_services(app, ctx):
             got = cells()
             assert (len(got), widgets(view.frame), len(app.kits),
                     len(view.iid_row)) == base, (lang, len(got))
-            safe = {r[5] for r in got}
+            safe = {r[3] for r in got}
             want = {translate_text(LOCAL_SAFE, loc),
                     translate_text(LOCAL_EXPOSED, loc)}
             assert safe == want, (lang, safe)
@@ -93548,7 +93565,7 @@ def gt_534_local_services(app, ctx):
         assert not found, "\n".join(found[:10])
     finally:
         webbrowser.open, LEDGER.killed = old_open, old_killed
-        view.source = None
+        view.source = src0
         app.config.set("general.language", old[0])
         app.config.set("appearance.theme", old[1])
         app.config.set("appearance.text_size", old[2])
