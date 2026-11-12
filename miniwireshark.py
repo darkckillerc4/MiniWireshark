@@ -42152,7 +42152,12 @@ class SecurityTab(BaseTab):
             t.delete("1.0", "end")
             return
         if str(u.frame) in [str(x) for x in t.window_names()]:
-            t.delete("2.0", "end")
+            # 5.3.4 QA: everything after the section goes, wherever the
+            # first heading ended up; deleting from line 2 left that
+            # heading behind, so each refresh added one more "What is
+            # this?" to the same line.
+            t.delete(f"{t.index(str(u.frame))} + 1 chars", "end")
+            t.insert("end", "\n")
             return
         t.delete("1.0", "end")
         t.window_create("1.0", window=u.frame)
@@ -88935,7 +88940,10 @@ def gt_rc2_polish(app, ctx):
         _gui_pump(root, 0.3)
         st = app.tabs["security"]
         st.refresh()
+        st.refresh()
         text = st.text.get("1.0", "end")
+        # 5.3.4 QA: each refresh added one more "What is this?" heading
+        assert text.count("What is this?") == 1, text[:300]
         assert st.folded_titles, text[:300]
         assert translate_text("Nothing to report") in text
         assert text.index(translate_text("Nothing to report")) > \
