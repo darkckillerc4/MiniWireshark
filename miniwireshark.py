@@ -16476,6 +16476,48 @@ def anonymous_device_label(dev):
     return ""
 
 
+def sentence_device_name(dev):
+    """The name a sentence (alert, Timeline) uses for `dev`: its display
+    name, but a nameless device's label carries its address, so two
+    devices with private Wi-Fi addresses can be told apart in one list
+    (review of #11): "Device using a private Wi-Fi address
+    (192.168.1.77)", "Device without a network address (self-assigned
+    169.254.12.34)"."""
+    n = dev.display_name()
+    anon = anonymous_device_label(dev)
+    if not anon or n != anon:
+        return n
+    if dev.link_local_only:
+        ip = dev.ip if (dev.ip or "").startswith("169.254.") else ""
+        return (f"Device without a network address (self-assigned {ip})"
+                if ip else n)
+    mac = dev.mac or ""
+    tail = dev.ip or (f"…{mac[-5:]}" if len(mac) >= 5 else "")
+    return f"{n} ({tail})" if tail else n
+
+
+_ANON_LABEL_RX = re.compile(
+    r"Device using a private Wi-Fi address(?= \(|\b)|"
+    r"Device without a network address \(self-assigned ([0-9.]+)\)")
+
+
+def translate_anonymous_labels(text, loc):
+    """The nameless-device labels inside an already translated sentence
+    (they stayed English inside French and Spanish alerts)."""
+    if loc == "en" or "Device " not in text:
+        return text
+    wifi = translate_text("Device using a private Wi-Fi address", loc)
+
+    def one(mm):
+        if mm.group(1) is None:
+            return wifi
+        return {"fr": f"Appareil sans adresse réseau ({mm.group(1)} "
+                      f"auto-attribuée)",
+                "es": f"Dispositivo sin dirección de red ({mm.group(1)} "
+                      f"autoasignada)"}.get(loc, mm.group(0))
+    return _ANON_LABEL_RX.sub(one, text)
+
+
 def host_label(r, doh=False):
     """5.3.4: what to call an Internet address — its name, a known service,
     its provider, or why no name was seen (doh: encrypted DNS was seen)."""
@@ -23179,8 +23221,12 @@ class NetworkModel:
         # 5.3.4 (MC3): the name the sentence uses, so the Timeline can show
         # the device's current name instead of three names for one device
         dv = self.registry.by_key.get(device) if device else None
+        if dv is not None and not named:
+            nm, sn = dv.display_name(), sentence_device_name(dv)
+            if sn != nm and nm and nm in text:
+                text = entry["text"] = text.replace(nm, sn, 1)
         if dv is not None:
-            nm = named or dv.display_name()
+            nm = named or sentence_device_name(dv)
             if nm and nm in text:
                 entry["name"] = nm
         self.timeline.append(entry)
@@ -23197,7 +23243,7 @@ class NetworkModel:
         """The name an alert sentence uses for `dev`: its display name,
         but "This computer" when it has no name of its own (its maker or
         address said nothing), "Your router" instead of an address."""
-        n = dev.display_name()
+        n = sentence_device_name(dev)
         if dev.alias or dev.best_name():
             return n
         if dev.device_class == "This computer" or \
@@ -31185,6 +31231,13 @@ EVENT_PATTERNS = [
 ]
 I18N_PATTERNS += EVENT_PATTERNS
 I18N_PATTERNS += [
+    # review of #11: a nameless device's label with its address
+    (r"Device using a private Wi-Fi address \((\S+)\)",
+     r"Appareil avec une adresse Wi-Fi privée (\1)",
+     r"Dispositivo con una dirección Wi-Fi privada (\1)"),
+    (r"Device without a network address \(self-assigned ([0-9.]+)\)",
+     r"Appareil sans adresse réseau (\1 auto-attribuée)",
+     r"Dispositivo sin dirección de red (\1 autoasignada)"),
     (r"Its name \(“(.+)”\) looks like an? (.+)", r"Son nom (« \1 ») "
      r"ressemble à : {t2}", r"Su nombre («\1») parece de: {t2}"),
     # 5.3.4 (MC3)
@@ -31406,7 +31459,7 @@ def timeline_text(model, e):
     dev = reg.by_key.get(reg.resolve(key))
     if dev is None:
         return text
-    new = dev.display_name()
+    new = sentence_device_name(dev)
     if looks_like_address(new) and not looks_like_address(old):
         return text           # "A device got address …" stays readable
     return text.replace(old, new, 1) if new and new != old else text
@@ -31444,6 +31497,8 @@ def translate_event(text):
                     if tok in hit:
                         hit = hit.replace(tok, table.get(g or "", g or ""))
             break
+    if hit is not None:
+        hit = translate_anonymous_labels(hit, loc)
     out = pre + hit + post if hit is not None else text
     if len(_EVENT_CACHE) > 20000:
         _EVENT_CACHE.clear()
@@ -95735,6 +95790,60 @@ def gt_c11_alert_names(app, ctx):
             timeline_text(m, entry)
     finally:
         reg.by_key.pop(nameless.key, None)
+
+
+@self_test()
+def t_c11_nameless_devices_told_apart(ctx):
+    """Review of crowd test #11: two nameless devices with private Wi-Fi
+    addresses get distinct names in alerts and the Timeline (their
+    address follows the label), and the label is translated inside a
+    French or Spanish sentence."""
+    if not ctx.scapy_ok:
+        return "skip"
+    b = ScenarioBuilder()
+    b.home_network()
+    hosts = [("192.168.1.77", "a6:3b:12:9e:44:01", ""),
+             ("192.168.1.78", "a6:3b:12:9e:44:02", "")]
+    for h in hosts:
+        b.arp_announce(h)
+        b.dhcp(h)
+    m = scenario_model(ctx.cfg(), b.frames)
+    label = "Device using a private Wi-Fi address"
+    devs = [d for d in m.registry.by_key.values()
+            if d.mac in {h[1] for h in hosts}]
+    assert len(devs) == 2 and all(d.display_name() == label for d in devs)
+    names = {sentence_device_name(d) for d in devs}
+    assert names == {f"{label} (192.168.1.77)",
+                     f"{label} (192.168.1.78)"}, names
+    for d in devs:
+        reasons = [a.reason for a in m.alerts.alerts.values()
+                   if a.device_key == d.key]
+        lines = [timeline_text(m, e) for e in m.timeline
+                 if e.get("device") == d.key]
+        assert reasons and lines, (reasons, lines)
+        for t in reasons + lines:
+            assert t.startswith(f"{label} ({d.ip})"), t
+    a = next(a for a in m.alerts.alerts.values() if a.device_key ==
+             devs[0].key and a.kind == "new_device")
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        fr = translate_event(a.reason)
+        set_locale("es")
+        es = translate_event(a.reason)
+    finally:
+        set_locale(old)
+    assert fr == "Appareil avec une adresse Wi-Fi privée (192.168.1.77) " \
+        "a rejoint votre réseau", fr
+    assert es.startswith("Dispositivo con una dirección Wi-Fi privada "
+                         "(192.168.1.77)"), es
+    lone = DeviceRecord(key="02:aa:bb:cc:dd:ee", ip="169.254.12.34",
+                        mac="02:aa:bb:cc:dd:ee")
+    lone.link_local_only = True
+    assert sentence_device_name(lone) == "Device without a network " \
+        "address (self-assigned 169.254.12.34)", sentence_device_name(lone)
+    assert translate_text(sentence_device_name(lone), "fr") == \
+        "Appareil sans adresse réseau (169.254.12.34 auto-attribuée)"
 
 
 # ============================================================================
