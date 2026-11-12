@@ -72,7 +72,7 @@ You can always say no. It then opens in limited mode, where you can still use ca
 
 ## 5. Check how it is tested
 
-- **Self-test:** more than 360 tests built into the file (`--self-test`). They cover the decoders, the alert rules, the privacy canary, the outbound gate, corrupt files and clock jumps.
+- **Self-test:** more than 350 tests built into the file (`--self-test`). They cover the decoders, the alert rules, the privacy canary, the outbound gate, corrupt files and clock jumps.
 - **GUI test:** `--gui-test` drives the real window through every tab.
 - **CI:** every push and pull request runs the self-test on Python 3.8, 3.12 and 3.13, the GUI test on two Ubuntu versions, the self-test and GUI test on Windows, the self-test on macOS, and a [privacy check](../.github/scripts/privacy_check.py) that keeps captures, personal data and keys out of this public repository. Results are on the [Actions page](https://github.com/darkckillerc4/MiniWireshark/actions).
 - **Long runs:** a fast replay test tracks memory, threads and Tk interpreters over many simulated hours. 5.3.4 was not re-run for 8 hours on a real PC; the [changelog](../CHANGELOG.md) lists that under Known limits.

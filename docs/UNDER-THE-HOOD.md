@@ -81,7 +81,7 @@ Verification uses `cryptography` when present, and otherwise **a pure-Python Ed2
 
 ## <img src="assets/icons/tests.svg" width="28" alt=""> A window that tests and measures itself
 
-- **More than 260 self-tests** run without capture or admin rights, driven by **replay scenarios**: a scripted home network made of ordinary packets with `.example` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
+- **More than 350 self-tests** run without capture or admin rights, driven by **replay scenarios**: a scripted home network made of ordinary packets with `.example` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
 - **Fuzzers** throw malformed packets at the decoders, the call decoder and the model; a run of a million mutated frames with a fixed seed raises no error.
 - **A mutation check** flipped comparisons and constants in 30 key functions; every surviving change is killed by a test or listed as equivalent, with a reason.
 - **The GUI test** drives the real window through every tab (62 steps).

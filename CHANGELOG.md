@@ -4,7 +4,7 @@ All notable changes to MiniWireshark. Versions follow `MAJOR.MINOR.PATCH`; each 
 
 ## [5.3.4] — 2026-11-04
 
-A medium release that makes MiniWireshark safer, easier to start and easier to understand. Every finding of the 5.2.3 security audit is fixed in the code, new screens explain your network to a beginner, and the largest bug campaign so far ran before, during and after the new features.
+A medium release that makes MiniWireshark safer, easier to start and easier to understand. Every finding of the 5.2.3 security audit is fixed in the code (four of the fixes still need a check on real hardware: a Windows PC, a Mac and a real Wi-Fi roam), new screens explain your network to a beginner, and the largest bug campaign so far ran before, during and after the new features.
 
 **Security and privacy**
 
@@ -61,12 +61,16 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - Errors that used to vanish are logged or shown. The Dashboard and Health always agree. A device has one name everywhere.
 - History on a network folder opens. A program on this computer keeps its name when an old connection ends.
 - **Ubuntu 22.04:** the window no longer crashes while it opens. Ubuntu 22.04's font library crashes Tk when it draws a colour emoji; MiniWireshark now leaves colour fonts out there, so emoji show in plain form.
-- **Repair's quick self-test** takes about 20 seconds instead of up to 6 minutes. It used to run nearly the whole self-test (344 tests). It now runs 62: the core checks, plus the tests for each part Repair looks at (program components, data folder, history database, capture, settings file, update checks). It no longer checks the program's own code, layouts or translations, because Repair can't change those. `--self-test` still runs everything.
+- **Repair's quick self-test** takes about 20 seconds instead of up to 6 minutes. It used to run nearly the whole self-test (344 tests at the time). It now runs 62: the core checks, plus the tests for each part Repair looks at (program components, data folder, history database, capture, settings file, update checks). It no longer checks the program's own code, layouts or translations, because Repair can't change those. `--self-test` still runs everything.
 - A Windows console with an old code page no longer stops MiniWireshark with a text error; a character it can't show is printed as "?".
 - On a small screen, an Inspector switched on in Settings now makes room for the tabs when the window opens narrow, not only when you make the window narrower.
 - A text-size change is quicker: the tables, the rows of buttons and the scrolling pages on tabs you can't see are fitted when you open their tab.
 - When your computer's address changes (another Wi-Fi network, a VPN switched on), a connection from the old address is no longer named after a different program that happens to use the same port number now. It is left without a program name.
 - A rare crash ("Tcl_AsyncDelete: async handler deleted by the wrong thread") can no longer happen when the last piece of a closed window is let go by a background task.
+- After an update that didn't start is rolled back, the start carries on: the loading screen and the Welcome Center say what happened. A message box used to stop the start until you clicked OK.
+- Opening a packet from the packet history during a busy capture no longer freezes the window for up to 3 seconds.
+- **Ubuntu 22.04:** if MiniWireshark can't leave colour fonts out, the log now says so (it said nothing, and the window could crash). It also finds the font library's version from its file name when it can't ask the library.
+- A connection is named after its program even when the system writes this computer's address in another IPv6 form, such as `::ffff:c0a8:114`.
 
 **Known limits**
 
@@ -76,13 +80,15 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **Memory still grows over many hours.** In a 24-hour fast replay that kept meeting new websites, memory grew from about 80 to about 335 MB. Its lists of sites and names have a size limit but no age limit. A replay with only known sites grows about 5 MB an hour after the first hour.
 - **Not re-tested on a real PC for 5.3.4:** memory, threads and handles over an 8-hour capture on Windows, and the network-card pick with a real VPN switched on. These were checked only in replays and with simulated network cards.
 - **macOS and Linux** fixes were checked in the automated tests (CI) only, not on a real Mac or Linux desktop. The window test does not run on macOS or on Python 3.8.
+- **Two messages at start still wait for a click:** "Administrator required" on Windows when the administrator prompt is refused, and "Startup error" when the window can't open. Both end the program, so nothing else waits behind them. The operating system's own password or administrator prompt also waits for your answer.
+- **The text-size speed check on Windows is loose.** The GUI test now judges the middle of its six runs, not the quickest, but on Windows it allows 600 ms, about 1.45 times the slowest test machine's usual 414 ms, so a smaller slowdown there passes. A second check compares with an older, slower version on the same machine and fails above 0.80 of it (measured 0.65 to 0.73).
 - **The network-card pick on Windows** now prefers the card that Windows' own routing uses (it changes the order of the cards, it doesn't only log). It knows the common VPN cards by name, but may not know every VPN product's name.
 
 **Not in this release**
 
 - Device fingerprints from DHCP request lists ship without built-in rows until real captures of your own devices are available.
 
-Tested on Python 3.8, 3.12 and 3.13 (371 self-tests) and with 56 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed.
+Tested on Python 3.8, 3.12 and 3.13 (more than 350 self-tests) and with 59 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed.
 
 ## [5.2.3] — 2026-10-24
 
