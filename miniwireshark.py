@@ -3064,6 +3064,10 @@ OUTBOUND_FEATURES = {
     "connector": "Connected helpers (Pi-hole, AdGuard Home)",
     "release": "Release tooling (developers only)",
     "packages": "Components and packages (downloads you approved)",
+    # 5.3.4: a page of a service on this computer, opened in the browser
+    # from Websites → Local services (it goes to 127.0.0.1 only, but the
+    # page may load more, so it is recorded and the kill switch stops it)
+    "local_open": "Local services opened in your browser (this computer)",
 }
 
 # 5.3.4 crowd test (#3): what the kill switch does, said once. The banner,
@@ -18823,6 +18827,163 @@ def listening_key(proto, ip, port):
     return f"{proto}/{port}/{scope}"
 
 
+# ---- 5.3.4: Local services (Websites tab) ------------------------------------
+# The services listening on this computer, one row per program and port,
+# with a plain guess at what each one is and who can reach it. Built from
+# ProcessMap.listening (psutil, the same table the Security tab reads);
+# nothing is sent to list them.
+LOCAL_DEV_WEB = "Web app in development"
+# TCP ports where a program on a person's own computer is most often a web
+# app being built (React, Vite, Angular, Django, Flask, Rails, Jupyter...)
+LOCAL_DEV_PORTS = frozenset({3000, 3001, 3002, 4000, 4200, 5000, 5173, 5174,
+                             8000, 8080, 8081, 8888, 9000})
+# ...and a real web server
+LOCAL_WEB_SERVER = {80: "Web server", 8008: "Web server",
+                    443: "Secure web server", 8443: "Secure web server"}
+LOCAL_HTTPS_PORTS = frozenset({443, 8443})
+# a program's name says more than its port: (start of the name, what it
+# is, a web page?)
+LOCAL_PROGRAM_HINTS = (
+    ("postgres", "Database connection (PostgreSQL)", False),
+    ("mysqld", "Database connection (MySQL)", False),
+    ("mariadbd", "Database connection (MySQL)", False),
+    ("mongod", "Database connection (MongoDB)", False),
+    ("redis-server", "In-memory database (Redis)", False),
+    ("cupsd", "Printing (IPP)", False),
+    ("sshd", "Remote terminal (SSH)", False),
+    # macOS: the AirPlay receiver takes 5000 and 7000
+    ("controlcenter", "Streaming to a speaker/TV (AirPlay)", False),
+)
+LOCAL_SAFE = "Only this computer can reach it"
+LOCAL_EXPOSED = "Other devices on your network can reach it"
+LOCAL_UNKNOWN = "Not sure what this is"
+LOCAL_ANY_ADDRESS = ("0.0.0.0", "::", "", "*")
+
+
+def _local_is_loopback(ip):
+    s = local_addr_key(ip)
+    return s.startswith("127.") or s == "::1"
+
+
+def local_service_guess(proto, port, program=""):
+    """-> (what it probably is, in English; True when it is likely a web
+    page a browser can open). TCP only for web pages."""
+    name = re.sub(r" \(pid \d+\)$", "", str(program or "")).lower()
+    name = name[:-4] if name.endswith(".exe") else name
+    for start, what, web in LOCAL_PROGRAM_HINTS:
+        if name.startswith(start):
+            return what, web and proto == "TCP"
+    if proto == "TCP" and port in LOCAL_DEV_PORTS:
+        return LOCAL_DEV_WEB, True
+    if proto == "TCP" and port in LOCAL_WEB_SERVER:
+        return LOCAL_WEB_SERVER[port], True
+    what = PORT_SERVICES.get(port)
+    if what:
+        return what, False
+    return LOCAL_UNKNOWN, False
+
+
+def local_service_url(proto, port, addrs, web):
+    """The address to open in a browser: on this computer (127.0.0.1, or
+    ::1 for a service on IPv6 only), for a TCP service that is likely a
+    web page; None otherwise (also for one that listens only on another
+    address of this computer)."""
+    if not web or proto != "TCP" or not isinstance(port, int) or \
+            not 0 < port < 65536:
+        return None
+    keys = {local_addr_key(a) for a in addrs}
+    host = None
+    if "127.0.0.1" in keys or "0.0.0.0" in keys or "*" in keys:
+        host = "127.0.0.1"
+    else:
+        v4 = sorted(k for k in keys if k.startswith("127."))
+        if v4:
+            host = v4[0]
+        elif "::1" in keys or "::" in keys or "" in keys:
+            host = "[::1]"
+    if host is None:
+        return None
+    scheme = "https" if port in LOCAL_HTTPS_PORTS else "http"
+    return f"{scheme}://{host}:{port}/"
+
+
+def local_url_ok(url):
+    """True only for http(s) to this computer itself (what the Local
+    services view may open)."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+        port = parts.port
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    a = ip_obj(host)
+    return parts.scheme in ("http", "https") and port is not None and \
+        "@" not in parts.netloc and a is not None and a.is_loopback
+
+
+def local_service_rows(listening):
+    """ProcessMap.listening ({(proto, ip, port): (pid, name)}) -> the rows
+    of the Local services view: one per protocol, port and program, its
+    addresses merged. Each row: {"proto", "port", "program", "addrs",
+    "network" (reachable from other devices), "what", "web", "url",
+    "safety"}. High UDP ports (a client's, not a service) are left out.
+    Reachable from the network first, then by protocol and port."""
+    groups = {}
+    for (proto, ip, port), ent in (listening or {}).items():
+        if proto not in ("TCP", "UDP") or not isinstance(port, int):
+            continue
+        if proto == "UDP" and port >= LISTEN_EPHEMERAL:
+            continue
+        prog = program_label(ent)
+        groups.setdefault((proto, port, prog), set()).add(str(ip or ""))
+    rows = []
+    for (proto, port, prog), addrs in groups.items():
+        network = any(not _local_is_loopback(a) for a in addrs)
+        what, web = local_service_guess(proto, port, prog)
+        addrs = tuple(sorted(addrs, key=lambda a: (":" in a, a)))
+        rows.append({"proto": proto, "port": port, "program": prog,
+                     "addrs": addrs, "network": network, "what": what,
+                     "web": web,
+                     "url": local_service_url(proto, port, addrs, web),
+                     "safety": LOCAL_EXPOSED if network else LOCAL_SAFE})
+    rows.sort(key=lambda r: (not r["network"], r["proto"], r["port"],
+                             r["program"]))
+    return rows
+
+
+def local_services_state(pm):
+    """(state, listening) for the Local services view. state: "ok",
+    "unavailable" (no psutil), "unread" (not read yet) or "denied" (the
+    operating system wouldn't give the list without admin rights, or
+    reading it failed)."""
+    if pm is None or not getattr(pm, "available", False):
+        return "unavailable", {}
+    listening = dict(getattr(pm, "listening", None) or {})
+    if not listening and getattr(pm, "error", ""):
+        return "denied", {}
+    if not getattr(pm, "at", 0):
+        return "unread", {}
+    if not listening and getattr(pm, "needs_admin", False):
+        return "denied", {}
+    return "ok", listening
+
+
+def local_service_cells(r):
+    """One row's cells in the shown language: port, protocol, what it is,
+    program, where it listens, who can reach it."""
+    tt = translate_text
+    shown = [tt("all addresses") if a in LOCAL_ANY_ADDRESS else a
+             for a in r["addrs"]]
+    where = tt("The whole network" if r["network"] else
+               "This computer only")
+    prog = r["program"]
+    if prog in ("the operating system",
+                "unknown program (needs admin rights to name it)"):
+        prog = tt(prog)
+    return (r["port"], r["proto"], tt(r["what"]), prog,
+            f"{where} ({', '.join(shown)})", tt(r["safety"]))
+
+
 class ListenWatch:
     """Remembers which programs accept connections on this computer and
     reports new ones. The first look only learns (no alerts)."""
@@ -29891,6 +30052,43 @@ Time window ¦ Période ¦ Periodo
 %s of data so far ¦ %s de données pour l'instant ¦ %s de datos por ahora
 Device evidence: is it a real device? ●●● High (score 60+) · ●●○ Medium (score 30+) · ●○○ Low (score 10+) · ○○○ Unconfirmed. Evidence: how three facts are known, in order: on your network · name · kind (◉ Observed · ◈ Reported · ◎ Correlated · ◌ Inferred · ? Unknown). “Likely” or “Possibly” before a kind is how sure that guess is, so a device with High evidence can still be only “Possibly” a printer. ¦ Preuves de l'appareil : est-ce un vrai appareil ? ●●● Élevée (score 60+) · ●●○ Moyenne (score 30+) · ●○○ Faible (score 10+) · ○○○ Non confirmé. Preuves : comment trois faits sont connus, dans l'ordre : sur votre réseau · nom · type (◉ Observé · ◈ Signalé · ◎ Recoupé · ◌ Déduit · ? Inconnu). « Probable » ou « Peut-être » devant un type dit à quel point cette supposition est sûre : un appareil aux preuves élevées peut n'être que « Peut-être » une imprimante. ¦ Pruebas del dispositivo: ¿es un dispositivo real? ●●● Alta (puntuación 60+) · ●●○ Media (puntuación 30+) · ●○○ Baja (puntuación 10+) · ○○○ Sin confirmar. Pruebas: cómo se conocen tres datos, en orden: en su red · nombre · tipo (◉ Observado · ◈ Informado · ◎ Correlacionado · ◌ Deducido · ? Desconocido). «Probable» o «Posiblemente» delante de un tipo indica lo segura que es esa suposición, así que un dispositivo con pruebas altas puede ser solo «Posiblemente» una impresora.
 The devices on your local network. Device evidence shows how sure it is that each one is a real device — an IP address alone is never enough to count as a device. ¦ Les appareils de votre réseau local. Les preuves de l'appareil indiquent à quel point il est sûr que chacun est un vrai appareil — une adresse IP seule ne suffit jamais à compter comme appareil. ¦ Los dispositivos de su red local. Las pruebas del dispositivo indican lo seguro que es que cada uno sea un dispositivo real — una dirección IP sola nunca basta para contar como dispositivo.
+# 5.3.4: Websites → Local services
+Local services ¦ Services locaux ¦ Servicios locales
+Websites → Local services ¦ Sites web → Services locaux ¦ Sitios web → Servicios locales
+Local services — programs on this computer that wait for connections. Most are normal: development tools, printing, file sharing. ¦ Services locaux — les programmes de cet ordinateur qui attendent des connexions. La plupart sont normaux : outils de développement, impression, partage de fichiers. ¦ Servicios locales — los programas de este equipo que esperan conexiones. La mayoría son normales: herramientas de desarrollo, impresión, uso compartido de archivos.
+“This computer only” can't be reached from other devices. “The whole network” can, unless a firewall blocks it. Double-click a web app to open it in your browser. ¦ « Cet ordinateur seulement » est inaccessible depuis les autres appareils. « Tout le réseau » l'est, sauf si un pare-feu le bloque. Double-cliquez sur une application web pour l'ouvrir dans votre navigateur. ¦ «Solo este equipo» no es accesible desde otros dispositivos. «Toda la red» sí lo es, salvo que un cortafuegos lo bloquee. Haga doble clic en una aplicación web para abrirla en su navegador.
+Refresh ¦ Actualiser ¦ Actualizar
+Open in browser ¦ Ouvrir dans le navigateur ¦ Abrir en el navegador
+What it probably is ¦ Ce que c'est probablement ¦ Qué es probablemente
+Program ¦ Programme ¦ Programa
+Listens on ¦ À l'écoute sur ¦ Escucha en
+Who can reach it ¦ Qui peut le joindre ¦ Quién puede acceder
+Some programs couldn't be named or listed without administrator rights. ¦ Certains programmes n'ont pas pu être nommés ou listés sans les droits d'administrateur. ¦ Algunos programas no se pudieron nombrar ni listar sin derechos de administrador.
+%d reachable from the network ¦ %d joignable(s) depuis le réseau ¦ %d accesible(s) desde la red
+Reading the list of services on this computer… ¦ Lecture de la liste des services de cet ordinateur… ¦ Leyendo la lista de servicios de este equipo…
+The list of services needs the optional psutil component (Settings → Repair). ¦ La liste des services nécessite le composant facultatif psutil (Paramètres → Réparer). ¦ La lista de servicios necesita el componente opcional psutil (Ajustes → Reparar).
+This computer didn't let MiniWireshark read the list of services without administrator rights. ¦ Cet ordinateur n'a pas laissé MiniWireshark lire la liste des services sans les droits d'administrateur. ¦ Este equipo no dejó que MiniWireshark leyera la lista de servicios sin derechos de administrador.
+The list of services hasn't been read yet. ¦ La liste des services n'a pas encore été lue. ¦ La lista de servicios aún no se ha leído.
+No services are listening on this computer. ¦ Aucun service n'est à l'écoute sur cet ordinateur. ¦ No hay ningún servicio a la escucha en este equipo.
+This service doesn't look like a web page, so it isn't opened in the browser. ¦ Ce service ne ressemble pas à une page web, il n'est donc pas ouvert dans le navigateur. ¦ Este servicio no parece una página web, así que no se abre en el navegador.
+Not opened: the kill switch is on. ¦ Pas ouvert : l'arrêt d'urgence est activé. ¦ No se abrió: el interruptor de corte está activado.
+To open it yourself, type this address in your browser: ¦ Pour l'ouvrir vous-même, tapez cette adresse dans votre navigateur : ¦ Para abrirlo usted mismo, escriba esta dirección en su navegador:
+The browser couldn't be opened. ¦ Le navigateur n'a pas pu être ouvert. ¦ No se pudo abrir el navegador.
+Copy port ¦ Copier le port ¦ Copiar el puerto
+Copy address ¦ Copier l'adresse ¦ Copiar la dirección
+Web app in development ¦ Application web en développement ¦ Aplicación web en desarrollo
+Web server ¦ Serveur web ¦ Servidor web
+Secure web server ¦ Serveur web sécurisé ¦ Servidor web seguro
+Not sure what this is ¦ Pas sûr de ce que c'est ¦ No está claro qué es
+Only this computer can reach it ¦ Seul cet ordinateur peut le joindre ¦ Solo este equipo puede acceder
+Other devices on your network can reach it ¦ D'autres appareils de votre réseau peuvent le joindre ¦ Otros dispositivos de su red pueden acceder
+This computer only ¦ Cet ordinateur seulement ¦ Solo este equipo
+The whole network ¦ Tout le réseau ¦ Toda la red
+all addresses ¦ toutes les adresses ¦ todas las direcciones
+the operating system ¦ le système d'exploitation ¦ el sistema operativo
+unknown program (needs admin rights to name it) ¦ programme inconnu (il faut les droits d'administrateur pour le nommer) ¦ programa desconocido (hacen falta derechos de administrador para nombrarlo)
+Database connection (MongoDB) ¦ Connexion à une base de données (MongoDB) ¦ Conexión a base de datos (MongoDB)
+Local services opened in your browser (this computer) ¦ Services locaux ouverts dans votre navigateur (cet ordinateur) ¦ Servicios locales abiertos en su navegador (este equipo)
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -30035,6 +30233,9 @@ I18N_PATTERNS = [
     (r"(\d[\d,]*) devices?", r"\1 appareils", r"\1 dispositivos"),
     (r"(\d[\d,]*) websites?", r"\1 sites web", r"\1 sitios web"),
     (r"(\d[\d,]*) sites?", r"\1 sites", r"\1 sitios"),
+    # 5.3.4: Websites → Local services
+    (r"1 service", r"1 service", r"1 servicio"),
+    (r"(\d[\d,]*) services", r"\1 services", r"\1 servicios"),
     (r"(\d[\d,]*) hits?", r"\1 visites", r"\1 visitas"),
     (r"(\d[\d,]*) connections?", r"\1 connexions", r"\1 conexiones"),
     (r"(\d[\d,]*) alerts?", r"\1 alertes", r"\1 alertas"),
@@ -39707,8 +39908,32 @@ class WebsitesTab(BaseTab):
             ("ips", "Server IPs", 160, "w", False)]
     SORTS = ("Most contacted", "Most traffic", "Recently seen",
              "First seen")
+    SUBVIEWS = ("Websites", "Local services")
 
     def build(self):
+        # 5.3.4: a second sub-view, Local services: what listens on this
+        # computer (localhost), with the address to open web apps
+        outer = self.frame
+        views = self.make_subviews(list(self.SUBVIEWS),
+                                   on_switch=self._on_subview)
+        self.frame = views["Websites"]
+        try:
+            self._build_websites()
+        finally:
+            self.frame = outer
+        self.local = LocalServicesView(self, views["Local services"])
+
+    def _on_subview(self, name):
+        if name == "Local services":
+            self.local.shown()
+        elif self._dirty:
+            self.rebuild()
+
+    def _show_websites(self):
+        if getattr(self, "subview", "Websites") != "Websites":
+            self.show_subview("Websites")
+
+    def _build_websites(self):
         self.header("🌍  Websites and online services your devices looked up "
                     "or connected to.",
                     "For secure (https) sites MiniWireshark sees only the "
@@ -39872,6 +40097,7 @@ class WebsitesTab(BaseTab):
         self._job = self.frame.after(350, self.rebuild)
 
     def set_filter(self, text):
+        self._show_websites()
         self.q_var.set(text or "")
         self.rebuild()
 
@@ -40058,6 +40284,10 @@ class WebsitesTab(BaseTab):
                 self.kit.updated(iid, key, vals)
 
     def refresh(self):
+        if self.subview == "Local services":
+            if self.is_visible():
+                self.local.tick()
+            return
         if self._dirty and self.is_visible() and self._job is None:
             self._job = self.frame.after(10, self.rebuild)
 
@@ -40078,6 +40308,7 @@ class WebsitesTab(BaseTab):
         return self.kit._right_click(event)
 
     def select(self, dom):
+        self._show_websites()
         self.q_var.set("")
         if dom not in self.key_to_iid:
             self.rebuild()
@@ -40722,6 +40953,294 @@ class MailView:
             self.tree.delete(*self.tree.get_children())
         self.rows = {}
         self._version = -1
+
+
+class LocalServicesView:
+    """Websites → Local services (5.3.4): the services listening on this
+    computer (localhost), from the same connection table as the Security
+    tab (psutil). Each row says what the program probably is and whether
+    other devices can reach it; a web app opens in the browser at
+    127.0.0.1, through the outbound() gate. Reading the list sends
+    nothing."""
+
+    COLS = [("port", "Port", 64, "e", False),
+            ("proto", "Protocol", 76, "w", False),
+            ("what", "What it probably is", 210, "w", True),
+            ("program", "Program", 170, "w", True),
+            ("listens", "Listens on", 200, "w", True),
+            ("safety", "Who can reach it", 250, "w", True)]
+    POLL_MS = 150
+    READ_TIMEOUT = 8.0           # s: give up waiting for one read
+    AUTO_EVERY = 15.0            # s: read again while shown, not watching
+
+    def __init__(self, tab, frame):
+        self.tab, self.app, self.frame = tab, tab.app, frame
+        self.rows = []
+        self.iid_row = {}
+        self.source = None       # tests: () -> (state, listening)
+        self.state = "unread"
+        self._sig = None
+        self._seen_seq = None
+        self._poll_job = None
+        self._reading_until = 0.0
+        self._auto_at = 0.0
+        top = tk.Frame(frame, bg=WHITE, padx=12, pady=8)
+        top.pack(fill="x")
+        tk.Label(top, text="\U0001F5A5  Local services — programs on this "
+                 "computer that wait for connections. Most are normal: "
+                 "development tools, printing, file sharing.",
+                 bg=WHITE, fg="#333333", wraplength=1000, justify="left",
+                 font=mw_font(11)).pack(anchor="w")
+        tk.Label(top, text="“This computer only” can't be reached from "
+                 "other devices. “The whole network” can, unless a firewall "
+                 "blocks it. Double-click a web app to open it in your "
+                 "browser.", bg=WHITE, fg="#666666", wraplength=1000,
+                 justify="left", font=mw_font(9)).pack(anchor="w",
+                                                        pady=(2, 0))
+        bar = tk.Frame(frame, bg=WHITE, padx=12)
+        bar.pack(fill="x", pady=(0, 6))
+        self.refresh_btn = ttk.Button(bar, text="Refresh",
+                                      command=self.reload)
+        self.refresh_btn.pack(side="left")
+        self.open_btn = ttk.Button(bar, text="Open in browser",
+                                   command=self.open_selected,
+                                   state="disabled")
+        self.open_btn.pack(side="left", padx=(6, 0))
+        self.count_lbl = tk.Label(bar, text="", bg=WHITE, fg="#666666")
+        self.count_lbl.pack(side="right")
+        # shown only when some programs couldn't be named or listed
+        self.note_lbl = tk.Label(frame, text="", bg=WHITE, fg="#8a5a00",
+                                 wraplength=1000, justify="left",
+                                 anchor="w", padx=12, font=mw_font(9))
+        wrap, self.tree = make_tree(frame, self.COLS, hscroll=True)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.wrap = wrap
+        self.tree.bind("<Double-1>", self._double)
+        self.tree.bind("<Return>", self._double)
+        self.tree.bind("<<TreeviewSelect>>",
+                       lambda e: self._sync_buttons(), add="+")
+        self.kit = TableKit(
+            tab, self.tree, wrap, "local_services",
+            key_of=lambda iid: self._key(self.iid_row.get(iid)),
+            empty_state=self.empty_state,
+            sort_values={"port": lambda k: k[1] if k else None},
+            menu=self.menu_spec)
+
+    @staticmethod
+    def _key(r):
+        return (r["proto"], r["port"], r["program"]) if r else None
+
+    # ---- reading ----------------------------------------------------------
+    def snapshot(self):
+        if self.source is not None:
+            return self.source()
+        return local_services_state(self.app.procmap)
+
+    def reading(self):
+        return self.source is None and time.time() < self._reading_until \
+            and self.app.procmap.busy
+
+    def shown(self):
+        """The sub-view was opened: show what is known and read the list
+        again when it is old."""
+        pm = self.app.procmap
+        if self.source is None and pm.available and \
+                time.time() - pm.at > self.AUTO_EVERY:
+            self.reload()
+        else:
+            self.refresh(force=True)
+
+    def tick(self):
+        """While shown (the tab's refresh): new rows when the table was
+        read again; read it again now and then when not watching live
+        (live capture reads it every few seconds anyway)."""
+        pm = self.app.procmap
+        now = time.time()
+        if self.source is None and pm.available and \
+                self.app.data_mode != "live" and not pm.busy and \
+                self._poll_job is None and \
+                now - pm.at > self.AUTO_EVERY and \
+                now - self._auto_at > self.AUTO_EVERY:
+            self._auto_at = now        # a read that fails is not retried
+            self.reload()              # on every tick
+            return
+        if pm.seq != self._seen_seq and self._poll_job is None:
+            self.refresh()
+
+    def reload(self):
+        """Refresh: read the connection table again (in the background)
+        and show it when the read is done. One wait at a time."""
+        pm = self.app.procmap
+        if self.source is None and pm.available:
+            pm.refresh(force=True)
+            self._reading_until = time.time() + self.READ_TIMEOUT
+            self._cancel_poll()
+            self._poll_job = self.frame.after(self.POLL_MS, self._poll)
+        self.refresh(force=True)
+
+    def _cancel_poll(self):
+        if self._poll_job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.frame.after_cancel(self._poll_job)
+            self._poll_job = None
+
+    def _poll(self):
+        self._poll_job = None
+        if self.reading():
+            self._poll_job = self.frame.after(self.POLL_MS, self._poll)
+            return
+        self._reading_until = 0.0
+        self.refresh(force=True)
+
+    # ---- the table --------------------------------------------------------
+    def refresh(self, force=False):
+        state, listening = self.snapshot()
+        pm = self.app.procmap
+        self._seen_seq = pm.seq
+        rows = local_service_rows(listening) if state == "ok" else []
+        partial = state == "ok" and self.source is None and \
+            bool(pm.needs_admin)
+        sig = (CURRENT_LOCALE, state, self.reading(), partial,
+               tuple((self._key(r), r["addrs"]) for r in rows))
+        if sig == self._sig and not force:
+            return False
+        self._sig, self.state, self.rows = sig, state, rows
+        tree = self.tree
+        try:
+            sel = tree.selection()
+            want = self._key(self.iid_row.get(sel[0])) if sel else None
+            tree.delete(*tree.get_children())
+        except tk.TclError:
+            return False
+        self.iid_row.clear()
+        self.kit.clear()
+        pick = None
+        for r in rows:
+            key = self._key(r)
+            vals = self.kit.decorate(key, local_service_cells(r))
+            idx, slot = self.kit.insert_index("", key, vals)
+            iid = tree.insert("", idx, values=vals)
+            self.iid_row[iid] = r
+            self.kit.inserted("", iid, slot, key)
+            if key == want:
+                pick = iid
+        with contextlib.suppress(tk.TclError):
+            if pick is not None:
+                tree.selection_set(pick)
+                tree.see(pick)
+            n_net = sum(1 for r in rows if r["network"])
+            text = translate_text(plural(len(rows), "service")) \
+                if rows else ""
+            if n_net:
+                text += "  ·  " + translate_text(
+                    "%d reachable from the network") % n_net
+            self.count_lbl.configure(text=text)
+            if partial:
+                self.note_lbl.configure(text=(
+                    "Some programs couldn't be named or listed without "
+                    "administrator rights."))
+                if not self.note_lbl.winfo_manager():
+                    self.note_lbl.pack(fill="x", pady=(0, 4),
+                                       before=self.wrap)
+            elif self.note_lbl.winfo_manager():
+                self.note_lbl.pack_forget()
+        self._sync_buttons()
+        self.kit.empty_soon()
+        return True
+
+    def empty_state(self):
+        if self.reading():
+            return ("Reading the list of services on this computer…",
+                    None, None)
+        if self.state == "unavailable":
+            return ("The list of services needs the optional psutil "
+                    "component (Settings → Repair).", None, None)
+        if self.state == "denied":
+            return ("This computer didn't let MiniWireshark read the list "
+                    "of services without administrator rights.",
+                    "Refresh", self.reload)
+        if self.state == "unread":
+            return ("The list of services hasn't been read yet.",
+                    "Refresh", self.reload)
+        return ("No services are listening on this computer.", "Refresh",
+                self.reload)
+
+    def selected_row(self):
+        with contextlib.suppress(tk.TclError):
+            sel = self.tree.selection()
+            if sel:
+                return self.iid_row.get(sel[0])
+        return None
+
+    def _sync_buttons(self):
+        r = self.selected_row()
+        with contextlib.suppress(tk.TclError):
+            self.open_btn.configure(
+                state="normal" if r is not None and r["url"] else "disabled")
+
+    def menu_spec(self, key):
+        r = next((x for x in self.rows if self._key(x) == key), None)
+        if r is None:
+            return {}
+        app = self.app
+        spec = {"copy": [("Copy port", lambda: copy_to_clipboard(
+            app, str(r["port"])))]}
+        if r["url"]:
+            spec["open"] = lambda: self.open_service(r)
+            spec["copy"].append(("Copy address", lambda: copy_to_clipboard(
+                app, r["url"])))
+            spec["own"] = [("Open in browser",
+                            lambda: self.open_service(r))]
+        return spec
+
+    def _double(self, _e=None):
+        r = self.selected_row()
+        if r is not None:
+            self.open_service(r)
+        return "break"
+
+    def open_selected(self):
+        r = self.selected_row()
+        return self.open_service(r) if r is not None else False
+
+    def open_service(self, r):
+        """Open a web app of this computer in the browser: only a TCP
+        service that is likely a web page, only at 127.0.0.1 (or ::1), and
+        through the outbound() gate, so the ledger lists it and the kill
+        switch stops it. -> True when the browser was asked to open it."""
+        tt = translate_text
+        url = r.get("url") if r else None
+        if not url or not local_url_ok(url):
+            self.app._set_banner(tt(
+                "This service doesn't look like a web page, so it isn't "
+                "opened in the browser."), "info")
+            return False
+        parts = urllib.parse.urlsplit(url)
+        try:
+            outbound("local_open", "browser",
+                     f"{parts.hostname}:{parts.port}",
+                     "a service on this computer")
+        except OutboundBlocked:
+            self.app._set_banner(
+                tt("Not opened: the kill switch is on.") + " " +
+                tt("To open it yourself, type this address in your "
+                   "browser:") + " " + url, "warn")
+            return False
+        import webbrowser
+        try:
+            ok = bool(webbrowser.open(url))
+        except Exception as e:                       # noqa: BLE001
+            LOG.warning("couldn't open the browser on %s: %s", url, e)
+            ok = False
+        if not ok:
+            self.app._set_banner(
+                tt("The browser couldn't be opened.") + " " +
+                tt("To open it yourself, type this address in your "
+                   "browser:") + " " + url, "warn")
+        return ok
+
+    def on_locale(self):
+        self.refresh(force=True)
 
 
 # ---- Remote hosts (Advanced) -------------------------------------------------
@@ -50507,6 +51026,10 @@ class MiniWireshark:
         # "Settings › Alerts › Slow DNS" ("Setting: Stop" came first for
         # "sett", above the Settings pages)
         items.append(("Settings", "setting", lambda: self._open_settings()))
+        items.append(("Websites → Local services", "view",
+                      lambda: (self._select_tab("websites"),
+                               self.tabs["websites"].show_subview(
+                                   "Local services"))))
         for page in SETTINGS_PAGES:
             items.append((f"Settings › {page['title']}", "setting",
                           lambda p=page["id"]: self._open_settings(p)))
@@ -53036,6 +53559,8 @@ class MiniWireshark:
                 self.tabs["feed"].on_locale()
             with contextlib.suppress(AttributeError, KeyError, tk.TclError):
                 self.tabs["packets"]._validate_expr()       # IP-023
+            with contextlib.suppress(AttributeError, KeyError, tk.TclError):
+                self.tabs["websites"].local.on_locale()     # its cells
             with contextlib.suppress(AttributeError, KeyError, tk.TclError):
                 sec_u = self.tabs["security"].unusual
                 if sec_u is not None:
@@ -81443,6 +81968,220 @@ def t_story_process_hit_rate(ctx):
     for f in m.flows.archive:
         assert f.process == "", f.process       # not "needs admin rights"
     assert not pm.needs_admin                   # TIME_WAIT has no program
+
+
+def _local_fake_listeners():
+    """A fixed set of listening sockets (Websites → Local services)."""
+    return {("TCP", "127.0.0.1", 5173): (4001, "node"),
+            ("TCP", "::1", 5173): (4001, "node"),
+            ("TCP", "0.0.0.0", 8080): (4002, "python3"),
+            ("TCP", "127.0.0.1", 631): (88, "cupsd"),
+            ("TCP", "0.0.0.0", 5432): (99, "postgres"),
+            ("TCP", "::", 3000): (5, "node"),
+            ("TCP", "192.168.1.20", 8000): (6, "python.exe"),
+            ("UDP", "0.0.0.0", 5353): (7, "avahi-daemon"),
+            ("UDP", "0.0.0.0", 50123): (8, "chrome"),
+            ("TCP", "127.0.0.1", 44321): (None, ""),
+            ("TCP", "0.0.0.0", 5000): (9, "ControlCenter"),
+            ("TCP", "127.0.0.1", 443): (10, "nginx")}
+
+
+@self_test()
+def t_534_local_services_rows(ctx):
+    """5.3.4 (Local services): one row per protocol, port and program,
+    addresses merged; a plain guess at what it is (development web apps,
+    printing, PostgreSQL, the program's name before the port); who can
+    reach it; a browser address only for a TCP web app reachable at
+    127.0.0.1 or ::1; high UDP ports left out; reachable from the network
+    first."""
+    rows = local_service_rows(_local_fake_listeners())
+    by = {(r["proto"], r["port"]): r for r in rows}
+    assert len(rows) == 10 and len(by) == 10, [
+        (r["proto"], r["port"]) for r in rows]
+    assert ("UDP", 50123) not in by                # a client's socket
+    vite = by[("TCP", 5173)]
+    assert vite["addrs"] == ("127.0.0.1", "::1"), vite
+    assert not vite["network"] and vite["safety"] == LOCAL_SAFE
+    assert vite["what"] == LOCAL_DEV_WEB and vite["web"]
+    assert vite["url"] == "http://127.0.0.1:5173/", vite
+    assert vite["program"] == "node (pid 4001)"
+    dev = by[("TCP", 8080)]
+    assert dev["network"] and dev["safety"] == LOCAL_EXPOSED
+    assert dev["what"] == LOCAL_DEV_WEB and \
+        dev["url"] == "http://127.0.0.1:8080/", dev
+    assert by[("TCP", 3000)]["url"] == "http://[::1]:3000/"   # IPv6 only
+    assert by[("TCP", 3000)]["network"]
+    # a web app only on this computer's network address: not at 127.0.0.1
+    lan = by[("TCP", 8000)]
+    assert lan["web"] and lan["url"] is None and lan["network"]
+    cups = by[("TCP", 631)]
+    assert cups["what"] == "Printing (IPP)" and not cups["web"] and \
+        cups["url"] is None and not cups["network"]
+    assert by[("TCP", 5432)]["what"] == "Database connection (PostgreSQL)"
+    assert not by[("TCP", 5432)]["web"]
+    assert by[("UDP", 5353)]["what"] == "Local name lookup (mDNS)"
+    assert by[("UDP", 5353)]["url"] is None
+    unk = by[("TCP", 44321)]
+    assert unk["what"] == LOCAL_UNKNOWN and "needs admin" in unk["program"]
+    # macOS' AirPlay receiver on 5000 is not a web app
+    air = by[("TCP", 5000)]
+    assert "AirPlay" in air["what"] and air["url"] is None, air
+    assert by[("TCP", 443)]["url"] == "https://127.0.0.1:443/"
+    assert by[("TCP", 443)]["what"] == "Secure web server"
+    nets = [r["network"] for r in rows]
+    assert nets == sorted(nets, reverse=True), nets  # the network first
+    # the guesses alone
+    assert local_service_guess("TCP", 3000) == (LOCAL_DEV_WEB, True)
+    assert local_service_guess("UDP", 3000)[1] is False
+    assert local_service_guess("TCP", 5432) == (
+        "Database connection (PostgreSQL)", False)
+    assert local_service_guess("TCP", 631)[0] == "Printing (IPP)"
+    assert local_service_guess("TCP", 6379, "redis-server (pid 3)")[0] == \
+        "In-memory database (Redis)"
+    assert local_service_guess("TCP", 22, "sshd.exe")[0] == \
+        "Remote terminal (SSH)"
+    assert local_service_guess("TCP", 61000) == (LOCAL_UNKNOWN, False)
+    assert local_service_rows({}) == [] and local_service_rows(None) == []
+    # only this computer, only http(s), a port, no user name
+    for url, ok in (("http://127.0.0.1:5173/", True),
+                    ("http://[::1]:3000/", True),
+                    ("https://127.0.0.1:443/", True),
+                    ("http://127.0.0.1/", False),
+                    ("http://192.168.1.20:8000/", False),
+                    ("http://localhost:3000/", False),
+                    ("http://x@127.0.0.1:80/", False),
+                    ("file:///etc/passwd", False),
+                    ("javascript:alert(1)", False),
+                    ("http://127.0.0.1:99999/", False), ("", False)):
+        assert local_url_ok(url) is ok, url
+    for r in rows:
+        assert r["url"] is None or local_url_ok(r["url"]), r
+    # what the view shows when the list can't be read
+    ns = types.SimpleNamespace
+    assert local_services_state(None)[0] == "unavailable"
+    assert local_services_state(ns(available=False))[0] == "unavailable"
+    assert local_services_state(ns(available=True, listening={}, error="",
+                                   at=0, needs_admin=False))[0] == "unread"
+    assert local_services_state(ns(available=True, listening={},
+                                   error="access denied", at=0,
+                                   needs_admin=False))[0] == "denied"
+    assert local_services_state(ns(available=True, listening={}, error="",
+                                   at=5.0, needs_admin=True))[0] == "denied"
+    st, got = local_services_state(ns(available=True, error="", at=5.0,
+                                      needs_admin=False, listening={}))
+    assert st == "ok" and got == {}
+    st, got = local_services_state(ns(
+        available=True, error="", at=5.0, needs_admin=True,
+        listening={("TCP", "127.0.0.1", 3000): (1, "node")}))
+    assert st == "ok" and len(got) == 1          # partial: still shown
+    # the cells, in all three languages
+    cells = local_service_cells(vite)
+    assert cells == (5173, "TCP", LOCAL_DEV_WEB, "node (pid 4001)",
+                     "This computer only (127.0.0.1, ::1)", LOCAL_SAFE), \
+        cells
+    assert local_service_cells(dev)[4] == \
+        "The whole network (all addresses)"
+    try:
+        for loc in ("fr", "es"):
+            set_locale(loc)
+            c = local_service_cells(dev)
+            for en, shown in ((LOCAL_DEV_WEB, c[2]),
+                              (LOCAL_EXPOSED, c[5])):
+                assert shown == I18N[loc][en] and shown != en, (loc, c)
+            assert c[4].startswith(I18N[loc]["The whole network"]) and \
+                I18N[loc]["all addresses"] in c[4], c
+            assert local_service_cells(unk)[3] == I18N[loc][
+                "unknown program (needs admin rights to name it)"]
+            for r in rows:
+                assert translate_text(r["what"]) != r["what"], (loc, r)
+                assert translate_text(r["safety"]) != r["safety"]
+            assert translate_text("3 services") == \
+                ("3 services" if loc == "fr" else "3 servicios")
+            assert translate_text("1 service") == \
+                ("1 service" if loc == "fr" else "1 servicio")
+    finally:
+        set_locale("English")
+
+
+@self_test()
+def t_534_local_services_from_connection_table(ctx):
+    """5.3.4 (Local services): the rows come from the same connection
+    table as the Security tab (psutil, here a stand-in): listening TCP
+    sockets and UDP ones without a peer, never a connection."""
+    def row(ip, port, pid, status, raddr=(), kind=1):
+        return types.SimpleNamespace(laddr=(ip, port), raddr=raddr, pid=pid,
+                                     status=status, type=kind)
+    table = [row("127.0.0.1", 5173, 40, "LISTEN"),
+             row("0.0.0.0", 8080, 41, "LISTEN"),
+             row("127.0.0.1", 5173, 40, "ESTABLISHED", ("127.0.0.1", 50000)),
+             row("192.168.1.5", 50001, 42, "ESTABLISHED",
+                 ("93.184.215.14", 443)),
+             row("0.0.0.0", 5353, 43, "NONE", (), 2)]
+    pm = ProcessMap()
+    assert _with_conn_table(table, pm.read)
+    st, listening = local_services_state(pm)
+    assert st == "ok", st
+    rows = local_service_rows(listening)
+    got = [(r["proto"], r["port"], r["network"], r["program"]) for r in rows]
+    assert got == [("TCP", 8080, True, "app41.exe (pid 41)"),
+                   ("UDP", 5353, True, "app43.exe (pid 43)"),
+                   ("TCP", 5173, False, "app40.exe (pid 40)")], got
+    # the Security page's list and this one agree
+    sec = {(p, port, scope != "the network")
+           for p, port, scope, _prog in
+           MiniWireshark.listening_rows(types.SimpleNamespace(procmap=pm))}
+    assert sec == {(r["proto"], r["port"], not r["network"])
+                   for r in rows}, sec
+
+
+@self_test()
+def t_534_local_services_open_through_gate(ctx):
+    """5.3.4 (Local services): opening a web app goes through outbound()
+    (listed in the ledger as this computer, stopped by the kill switch,
+    which says what to type instead); a service that isn't a web page is
+    never opened."""
+    import webbrowser
+    rows = {(r["proto"], r["port"]): r
+            for r in local_service_rows(_local_fake_listeners())}
+    banners = []
+    view = types.SimpleNamespace(app=types.SimpleNamespace(
+        _set_banner=lambda text, kind="info": banners.append((kind, text))))
+    opened = []
+    old_open, old_killed = webbrowser.open, LEDGER.killed
+    webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+    n0 = len(LEDGER.snapshot("local_open"))
+    try:
+        LEDGER.killed = False
+        assert LocalServicesView.open_service(view, rows[("TCP", 5173)])
+        assert opened == ["http://127.0.0.1:5173/"], opened
+        ent = LEDGER.snapshot("local_open")
+        assert len(ent) == n0 + 1 and ent[-1]["allowed"] and \
+            ent[-1]["dest"] == "127.0.0.1:5173", ent[-1]
+        assert "local_open" in OUTBOUND_FEATURES
+        # not a web page / not on 127.0.0.1: nothing opened, nothing sent
+        for key in (("TCP", 631), ("UDP", 5353), ("TCP", 8000)):
+            assert not LocalServicesView.open_service(view, rows[key])
+        assert len(opened) == 1 and len(LEDGER.snapshot("local_open")) == \
+            n0 + 1
+        assert "doesn't look like a web page" in banners[-1][1], banners
+        # a forged row with another address is refused too
+        bad = dict(rows[("TCP", 5173)], url="http://93.184.215.14:80/")
+        assert not LocalServicesView.open_service(view, bad)
+        assert len(opened) == 1
+        # the kill switch
+        LEDGER.killed = True
+        blocked = LEDGER.blocked
+        assert not LocalServicesView.open_service(view, rows[("TCP", 8080)])
+        assert len(opened) == 1 and LEDGER.blocked == blocked + 1
+        assert banners[-1][0] == "warn" and "kill switch" in \
+            banners[-1][1] and "http://127.0.0.1:8080/" in banners[-1][1]
+        # a browser that can't be started: says what to type
+        LEDGER.killed = False
+        webbrowser.open = lambda url, *a, **k: False
+        assert not LocalServicesView.open_service(view, rows[("TCP", 3000)])
+        assert "http://[::1]:3000/" in banners[-1][1], banners[-1]
+    finally:
+        webbrowser.open, LEDGER.killed = old_open, old_killed
 
 
 @self_test(needs_source=True)
