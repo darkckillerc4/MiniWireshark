@@ -38539,9 +38539,24 @@ class TimelineTab(BaseTab):
                 shown += 1
         if not marked and shown:
             self._insert_story_mark()
+        self._fit_when(story=True)
         self._update_status()
         self.kit.empty_soon()
         return shown
+
+    def _fit_when(self, story):
+        """The Time column wide enough for what it shows at the current
+        text size: a story range "22:52–23:07" was cut to "22:52–22:!"
+        in the 80-pixel column. It only grows, so a width the user
+        dragged wider stays."""
+        try:
+            f = tkfont.Font(font=ttk.Style().lookup("Treeview", "font") or
+                            "TkDefaultFont")
+            need = text_width(f, "00:00–00:00" if story else "00:00:00") + 18
+            if int(self.tree.column("when", "width")) < need:
+                self.tree.column("when", width=need)
+        except (tk.TclError, AttributeError, ValueError):
+            pass
 
     def _insert_story_mark(self):
         with contextlib.suppress(tk.TclError):
@@ -89707,8 +89722,17 @@ def gt_534_story_mode(app, ctx):
     dg["new_devices"].append((now - 6000, "aa:tv", "Old-TV"))
     fake = story_build(dg, {}, last_looked=now - 4000, now=now)
     fake["model_id"] = id(m)
+    # narrower than a range at this text size (80 px cut "22:52–22:!" at a
+    # bigger one): showing the story must make room for it
+    tl.tree.column("when", width=40)
     tl.show_story(fake)
     rows = tl.tree.get_children()
+    _tf = tkfont.Font(font=ttk.Style().lookup("Treeview", "font") or
+                      "TkDefaultFont")
+    _whens = [tl.tree.set(i, "when") for i in rows]
+    assert any("–" in w for w in _whens), _whens
+    _cw = int(tl.tree.column("when", "width"))
+    assert all(text_width(_tf, w) + 8 <= _cw for w in _whens), (_cw, _whens)
     kinds = [("mark" if "story_mark" in tl.tree.item(i, "tags") else
               "head" if "episode" in tl.tree.item(i, "tags") else "item")
              for i in rows]
