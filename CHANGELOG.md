@@ -90,6 +90,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - *Clear and start fresh* (Ctrl+L) and *New session* now ask before they wipe the session ("Ask before clearing data" is on by default), say whether watching carries on, and whether Undo is possible. Saying No to New session no longer stops watching.
 - Alerts now use a device's current name: a renamed device, or one whose name is learned later, is renamed in the Alerts tab too, and this computer is called "This computer" instead of its address or maker. A rule stored with *Expected* names the device and service instead of a raw key such as "02:00:5e:10:00:10|SSH". A device without a name no longer reads "192.168.50.40 got address 192.168.50.40 from DHCP".
 - Devices without a name of their own can be told apart in alerts and the Timeline: "Device using a private Wi-Fi address (192.168.1.77)" instead of the same words for each, translated inside French and Spanish sentences.
+- Packets tab: the packet details keep room for a few lines in a short window instead of shrinking to their heading; a filter that hides the packet shown in the details empties them; *Pause display* and a filter that matches nothing say so next to the count; the Expert view says why it is empty in Full Power; the Protocol hierarchy headings sit over their own numbers again (they were one column off).
 
 **Known limits**
 

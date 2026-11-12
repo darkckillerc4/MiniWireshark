@@ -29393,6 +29393,9 @@ Place and owner ¦ Lieu et propriétaire ¦ Lugar y propietario
 Place and owner… ¦ Lieu et propriétaire… ¦ Lugar y propietario…
 Quiet Mode (or a network not marked as yours): ranked only on what was overheard; nothing was sent to check. ¦ Mode discret (ou réseau non marqué comme le vôtre) : classé uniquement d'après ce qui a été entendu ; rien n'a été envoyé pour vérifier. ¦ Modo silencioso (o una red no marcada como suya): ordenado solo con lo que se ha escuchado; no se envió nada para comprobar.
 Review ¦ Passer en revue ¦ Revisar
+Display paused at %d shown · %d in memory (still capturing) ¦ Affichage suspendu à %d affichés · %d en mémoire (la capture continue) ¦ Vista en pausa con %d mostrados · %d en memoria (la captura continúa)
+0 shown · %d in memory — no packet in memory matches this filter ¦ 0 affiché · %d en mémoire — aucun paquet en mémoire ne correspond à ce filtre ¦ 0 mostrados · %d en memoria — ningún paquete en memoria coincide con este filtro
+No findings yet. Full Power checks packets as they arrive, so packets from before it was switched on are not checked. ¦ Aucune constatation pour l'instant. La pleine puissance vérifie les paquets à leur arrivée : ceux d'avant son activation ne sont pas vérifiés. ¦ Aún no hay hallazgos. La máxima potencia comprueba los paquetes a medida que llegan, así que los de antes de activarla no se comprueban.
 Review %d new ¦ Revoir %d nouvelles ¦ Revisar %d nuevas
 Review alerts ¦ Passer en revue les alertes ¦ Revisar alertas
 Review new alerts ¦ Passer en revue les nouvelles alertes ¦ Revisar las alertas nuevas
@@ -45070,6 +45073,9 @@ class PacketsTab(BaseTab):
         self.tree.bind("<Configure>", lambda e: self.render(), add="+")
         bottom = tk.Frame(vert, bg=WHITE)
         vert.add(bottom, weight=2)
+        self.detail_bottom = bottom
+        vert.bind("<Configure>", lambda e: self._details_room_soon(),
+                  add="+")
         nb = ttk.Notebook(bottom)
         nb.pack(fill="both", expand=True)
         tf = tk.Frame(nb, bg=WHITE)
@@ -45178,6 +45184,45 @@ class PacketsTab(BaseTab):
             self.app.config.set("appearance.panes", panes)
             self.app.config.save()
 
+    def details_room(self):
+        """(pixels the details part needs, pixels the list needs): four
+        lines of packet details under the tab and column headings, and
+        three rows of packets."""
+        try:
+            line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        except tk.TclError:
+            line = 16
+        rowh = max(line + 4, self._row_height() or 0)
+        return 4 * rowh + 2 * line + 30, 3 * rowh + line + 8
+
+    def _details_room_soon(self):
+        if getattr(self, "_room_job", None):
+            return
+        with contextlib.suppress(tk.TclError):
+            self._room_job = self.frame.after_idle(self._keep_details_room)
+
+    def _keep_details_room(self):
+        """5.3.4 crowd test #12: the packet details collapsed to their
+        "Field / Value" heading in a short window (the list took nearly
+        all of the height, and a saved divider could leave less), so the
+        details had to be dug out with a thin divider. The divider now
+        leaves the details room whenever the window is tall
+        enough for both (four lines; three rows of packets stay)."""
+        self._room_job = None
+        vert = self.vert_pane
+        try:
+            total = vert.winfo_height()
+            if total <= 40:
+                return
+            need, keep = self.details_room()
+            pos = vert.sashpos(0)
+            if total - pos >= need:
+                return
+            vert.sashpos(0, max(keep, total - need) if total >= keep + 40
+                         else total // 2)
+        except tk.TclError:
+            pass
+
     def _pane_restore(self, pw, name):
         if getattr(pw, "_mw_restored", False):
             return
@@ -45195,6 +45240,8 @@ class PacketsTab(BaseTab):
                     pw._mw_restored = True
             except tk.TclError:
                 pass
+            if pw is getattr(self, "vert_pane", None):
+                self._keep_details_room()
         pw.after_idle(place)
 
     # ---- the plain-word filter builder (5.1.2 M7) ------------------------
@@ -45519,6 +45566,8 @@ class PacketsTab(BaseTab):
                                  else "⏸ Pause display")
         if not self.paused:
             self.rebuild()
+        else:
+            self._count()
 
     # ---- rows (virtual table: only the visible rows exist as Treeview
     #      items; the scrollbar, wheel and keys move a window over
@@ -45744,16 +45793,29 @@ class PacketsTab(BaseTab):
                                "and alerts, not packets — open a capture "
                                "file to see packets.")
             return
-        # 5.3.4 crowd test (#26): "in memory" is the number Statistics and
-        # the I/O graph count; while the display is paused it kept the
-        # number from the moment of the pause, so the tabs disagreed
-        self.count_var.set(f"{len(self.matched)} shown · "
-                           f"{len(self.app.all_rows)} in memory" +
-                           (" · display paused" if self.paused else ""))
+        # crowd tests #26 and #12: "in memory" is the number Statistics
+        # and the I/O graph count, and stays current while paused
+        n, total = len(self.matched), len(self.app.all_rows)
+        if self.paused:
+            # crowd test #12: "Resume display" showed while the count
+            # kept rising, which read as if Pause did nothing
+            self.count_var.set(translate_text(
+                "Display paused at %d shown · %d in memory (still "
+                "capturing)") % (n, total))
+        elif not n and total and self.filter.active():
+            # an expression that matches nothing used to say only "0
+            # shown", like a mistake nobody reported
+            self.count_var.set(translate_text(
+                "0 shown · %d in memory — no packet in memory matches this "
+                "filter") % total)
+        else:
+            self.count_var.set(f"{n} shown · {total} in memory")
 
     def add_rows(self, rows):
         if self.paused or not self.is_visible():
             self._dirty = True
+            if self.paused:
+                self._count()
             return
         self.ctx._alert_cache = None
         new = [d for d in rows if self._keep(d)]
@@ -46013,6 +46075,11 @@ class PacketsTab(BaseTab):
         self.matched = m
         if self.sort_col is not None:
             self._resort()
+        if self._detail_no is not None and \
+                self.index_of_no(self._detail_no) is None:
+            # crowd test #12: "stream:101 — 20 shown" kept showing the
+            # details of packet #33, which the filter had hidden
+            self.clear_details()
         n = self._nslots()
         if self.follow_var.get() and self.sort_col is None:
             self.top = max(0, len(m) - n)
@@ -46339,19 +46406,28 @@ class PacketsTab(BaseTab):
             app.bookmarks.add(d["no"])
         self.render()
 
+    def clear_details(self):
+        """Empty the details, the text and hex dumps (no packet shown)."""
+        self.sel_no, self._detail_no = None, None
+        self._dt_ranges, self._dt_keys = {}, {}
+        self._dis = None
+        with contextlib.suppress(tk.TclError):
+            self.dtree.delete(*self.dtree.get_children())
+            for w in (self.details, self.hexview, self.bytes_view):
+                w.config(state="normal")
+                w.delete("1.0", "end")
+                w.config(state="disabled")
+        self.explain_var.set("")
+        self.field_var.set("")
+
     def reset(self):
         self.tree.delete(*self.tree.get_children())
         self.matched, self.slots, self.slot_rows = [], [], {}
-        self.top, self.sel_no, self._detail_no = 0, None, None
+        self.top = 0
         with contextlib.suppress(tk.TclError):
             self.vbar.set(0.0, 1.0)
         self._count()
-        self.dtree.delete(*self.dtree.get_children())
-        for w in (self.details, self.hexview, self.bytes_view):
-            w.config(state="normal")
-            w.delete("1.0", "end")
-            w.config(state="disabled")
-        self.explain_var.set("")
+        self.clear_details()
         for v in (self.streams, self.exchanges, self.stats, self.expert):
             v.reset()
 
@@ -47105,9 +47181,11 @@ class ExpertView(_SubView):
 
     def refresh(self, force=False):
         store = self.app.deep.store
-        if store.version == self._version and not force:
+        mode = self.app.effective_perf_mode()[0]
+        if store.version == self._version and not force and \
+                mode == getattr(self, "_mode", None):
             return
-        self._version = store.version
+        self._version, self._mode = store.version, mode
         with store.lock:
             fs = list(store.findings)
         rank = self.rank()
@@ -47123,7 +47201,13 @@ class ExpertView(_SubView):
                     f"#{g['first']}" if g["first"] else "—",
                     f"#{g['last']}" if g["last"] else "—"))
                 self.groups[iid] = g
+            # crowd test #12: with Full Power on and nothing found yet,
+            # the empty table said nothing at all
             self.hint.configure(text=self.full_power_hint() or (
+                translate_text("No findings yet. Full Power checks packets "
+                               "as they arrive, so packets from before it "
+                               "was switched on are not checked.")
+                if not fs else
                 f"{len(fs):,} findings in {len(gs):,} groups · double-click "
                 f"to open the first packet"))
 
@@ -47250,9 +47334,14 @@ class StatisticsView(_SubView):
         for w in self.body.winfo_children():
             w.destroy()
         self.canvas = None
-        wrap, self.tree = make_tree(self.body, cols, hscroll=True,
-                                    show="tree headings" if cols and
-                                    cols[0][0] == "#0" else "headings")
+        tree_col = bool(cols) and cols[0][0] == "#0"
+        # crowd test #12: "#0" was also made a data column, so every
+        # heading of the Protocol hierarchy sat one column left of its
+        # numbers
+        wrap, self.tree = make_tree(self.body, cols[1:] if tree_col
+                                    else cols, hscroll=True,
+                                    show="tree headings" if tree_col
+                                    else "headings")
         wrap.pack(fill="both", expand=True)
         return self.tree
 
@@ -95842,6 +95931,83 @@ def t_c11_nameless_devices_told_apart(ctx):
         "address (self-assigned 169.254.12.34)", sentence_device_name(lone)
     assert translate_text(sentence_device_name(lone), "fr") == \
         "Appareil sans adresse réseau (169.254.12.34 auto-attribuée)"
+
+
+@gui_test_step("5.3.4 crowd #12: packet view — the details keep room, a "
+               "filter clears hidden details, pause and empty results "
+               "say so, Expert explains, hierarchy headings line up")
+def gt_c12_packet_view(app, ctx):
+    root = app.root
+    pt = app.tabs["packets"]
+    geo = root.geometry()
+    try:
+        root.geometry("1024x700")
+        app._select_tab("packets")
+        pt.show_subview("Packets")
+        _gui_pump(root, 1.2)
+        line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        dh, lh = pt.dtree.winfo_height(), pt.tree.winfo_height()
+        assert dh >= 4 * line, f"packet details {dh} px high (line {line})"
+        assert lh >= 4 * line, f"packet list {lh} px high"
+    finally:
+        root.geometry(geo)
+        _gui_pump(root, 0.5)
+    # a filter that hides the packet in the details empties them
+    pt.clear_filter()
+    _gui_pump(root, 0.3)
+    assert pt.matched, "no packets in the list"
+    first = pt.matched[0]["no"]
+    pt.select_no(first)
+    _gui_pump(root, 0.3)
+    assert pt._detail_no == first and pt.dtree.get_children()
+    pt.set_expression(f"frame.number > {first}")
+    _gui_pump(root, 0.3)
+    assert pt.index_of_no(first) is None
+    assert pt._detail_no is None and not pt.dtree.get_children(), \
+        "the details still show a packet the filter hides"
+    # an expression that matches nothing says so
+    pt.set_expression("frame.number > 999999999")
+    _gui_pump(root, 0.2)
+    assert "no packet" in pt.count_var.get(), pt.count_var.get()
+    pt.clear_filter()
+    _gui_pump(root, 0.2)
+    # Pause display: the count says the display is paused
+    pt.toggle_pause()
+    try:
+        pt.add_rows([])
+        assert "paused" in pt.count_var.get().lower(), pt.count_var.get()
+    finally:
+        pt.toggle_pause()
+    assert "paused" not in pt.count_var.get().lower()
+    # Expert in Full Power with nothing found: the reason is shown
+    store = app.deep.store
+    mode = app.config.get("performance.mode", "Automatic")
+    with store.lock:
+        saved = list(store.findings)
+        store.findings.clear()
+    try:
+        app.config.set("performance.mode", "Full Power")
+        pt.expert.refresh()
+        hint = str(pt.expert.hint.cget("text"))
+        assert "No findings yet" in hint, hint
+    finally:
+        app.config.set("performance.mode", mode)
+        with store.lock:
+            store.findings.extend(saved)
+        pt.expert.refresh(force=True)
+    # Protocol hierarchy: each heading over its own numbers
+    sv = pt.stats
+    sv.kind_var.set("Protocol hierarchy")
+    sv.refresh(force=True)
+    tree = sv.tree
+    assert "#0" not in tuple(tree["columns"]), tree["columns"]
+    top = tree.get_children()[0]
+    assert tree.item(top, "text") == "Frame"
+    vals = tree.item(top, "values")
+    assert tree.set(top, "pk") == vals[0] == f"{len(app.all_rows):,}", \
+        (vals, len(app.all_rows))
+    assert tree.set(top, "pct") == "100.0", tree.set(top, "pct")
+    pt.show_subview("Packets")
 
 
 # ============================================================================
