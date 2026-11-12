@@ -75,6 +75,16 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - Opening a packet from the packet history during a busy capture no longer freezes the window for up to 3 seconds.
 - **Ubuntu 22.04:** if MiniWireshark can't leave colour fonts out, the log now says so (it said nothing, and the window could crash). It also finds the font library's version from its file name when it can't ask the library.
 - A connection is named after its program even when the system writes this computer's address in another IPv6 form, such as `::ffff:c0a8:114`.
+- The kill switch is the same everywhere: ticking it in the self-traffic ledger ticks it in an open Settings window too (without "unsaved changes"), turning it off from the banner clears the ledger's box, and the banner, Settings, Help and Ready? all say the same sentence about what it stops. An empty ledger says "Nothing sent or blocked yet."
+- The Dashboard and the Security page no longer say "Nothing unusual right now" while the Alerts tab has open warnings; they say how many warnings need a look.
+- The Timeline's counter counts the events it lists (it could say "0 events this session" over a list of events), and an event no longer appears twice.
+- The Story is written again as soon as the data it tells has changed, so its count matches the Dashboard instead of lagging up to a minute behind.
+- The Health verdict says "Partly checked" and names what was not checked yet, instead of "Healthy" over rows that all say Unknown. "Why is it slow?" now agrees with the Health rows about the router and the Internet.
+- A weak Wi-Fi signal is called the "likely culprit" only when slowness was actually measured; otherwise it is "worth a look". *Is it my Wi-Fi or the Internet?* says it timed how fast connections open, not download speed.
+- Health says why instead of showing a bare "—" (network card, IPv6 prefix, why this card), and the greyed "Run checks now" button says why when you point at it.
+- The Dashboard's time window (now called "Time window") sets the period of the "Who is using the Internet?" answer too, and a chart longer than the data says how much data there is.
+- The Packets tab's "in memory" count stays current while the display is paused, so it matches Statistics and the I/O graph.
+- The Devices tab explains its three ways of saying how sure it is: "Device evidence" (is it a real device, with the score each level needs), the "Evidence" marks, and "Likely" or "Possibly" before a kind.
 
 **Known limits**
 

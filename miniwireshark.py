@@ -61793,7 +61793,9 @@ def checkup_html(facts, red=None):
     alerts = facts.get("alerts") or []
     parts.append(f"<section><h2>{e(tr('Unusual activity'))}</h2>" + (
         "".join(cards) if cards else
-        f"<p class='muted'>{e(tr(unusual_card_text(0, facts.get('other_open') or 0)))}</p>") + (
+        f"<p class='muted'>"
+        f"{e(tr(unusual_card_text(0, facts.get('other_open') or 0)))}</p>")
+        + (
         f"<p><b>{e(tr('Other open alerts'))}</b></p><ul>" + "".join(
             f"<li><span class='badge sev-{e(sev)}'>{e(tr(sev))}</span> "
             f"{E(reason)}</li>" for sev, reason in alerts) + "</ul>"
