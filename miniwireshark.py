@@ -1768,6 +1768,9 @@ if __name__ == "__main__" and not FROZEN:
 HANDSHAKE_TIMEOUT = 25.0          # seconds for the managed Python's window
 HANDSHAKE_ELEVATION_TIMEOUT = 180.0   # if it is waiting for a UAC click
 HANDOFF_NOTE = [""]               # why a hand-off failed (shown at startup)
+# audit 2026-11-12 (#12): a rolled-back update, said on the loading screen
+# and the Welcome Center instead of a message box that held the start
+ROLLBACK_NOTE = [""]
 
 # arguments that only carry the hand-off between two processes
 _HANDOFF_ARGS = [a for a in sys.argv[1:] if a.startswith(READY_ARG) or
@@ -90687,6 +90690,75 @@ def reachable_actions(app):
     return sorted(out - REACHABLE_CONDITIONAL)
 
 
+@gui_test_step("5.3.4 audit #12: a rolled-back update never holds the "
+               "start behind a message box")
+def gt_534_audit_rollback_start_never_waits(app, ctx):
+    """Audit 2026-11-12 (#12): the third failed start after an update
+    rolls it back, and says so on the loading screen and the Welcome
+    Center. It said so in a message box, and the start waited for a
+    click there. A real start of a copy of this program, with its own
+    pending-update marker and backup, must reach its window and close by
+    itself."""
+    if not HAS_SOURCE:
+        return "skip"
+    # the notice the Welcome Center shows, in this process
+    old = ROLLBACK_NOTE[0]
+    try:
+        ROLLBACK_NOTE[0] = "The update to 9.9.9 didn't start correctly."
+        notice = startup_notice()
+        assert "9.9.9" in notice and \
+            translate_text("Update rolled back") in notice, notice
+        quiet = types.SimpleNamespace(get=lambda _k, d=None: False)
+        assert welcome_wanted(quiet, False, notice, start_test=False)
+    finally:
+        ROLLBACK_NOTE[0] = old
+    d = ctx.path(f"rollback-{uuid.uuid4().hex[:6]}")
+    data, prog = os.path.join(d, "data"), os.path.join(d, "prog")
+    os.makedirs(data, exist_ok=True)
+    os.makedirs(prog, exist_ok=True)
+    script = os.path.join(prog, "miniwireshark.py")
+    shutil.copy2(SCRIPT_PATH, script)
+    backup = f"{script}.v5.2.3.bak"
+    shutil.copy2(SCRIPT_PATH, backup)
+    for f in (script, backup):
+        os.chmod(f, 0o644)
+    marker = os.path.join(data, "update_pending.json")
+    with open(marker, "w", encoding="utf-8") as fh:
+        json.dump({"script": script, "backup": backup, "from": "5.2.3",
+                   "version": SCRIPT_VERSION, "attempts": 2}, fh)
+    cfgp = os.path.join(d, "cfg.json")
+    with open(cfgp, "w", encoding="utf-8") as fh:
+        json.dump({"general": {"show_welcome": False,
+                               "welcome_version": SCRIPT_VERSION,
+                               "auto_start_capture": False}}, fh)
+    env = dict(os.environ, MINIWIRESHARK_DATA=data,
+               MINIWIRESHARK_CONFIG=cfgp, MW_START_AND_EXIT="0.5",
+               MINIWIRESHARK_NO_CACHED_START="1")
+    env.pop("MW_FEATURES_OFF", None)
+    log = os.path.join(data, "logs", "miniwireshark.log")
+    try:
+        r = _run_hidden([sys.executable, script], env=env,
+                        capture_output=True, text=True, encoding="utf-8",
+                        errors="replace", timeout=180)
+    except subprocess.TimeoutExpired:
+        tail = ""
+        with contextlib.suppress(OSError), \
+                open(log, encoding="utf-8", errors="replace") as fh:
+            tail = "".join(fh.readlines()[-8:])
+        raise AssertionError("the start with a rolled-back update was "
+                             "still waiting after 180 s; its log ends:\n" +
+                             tail)
+    line = next((x for x in r.stdout.splitlines()
+                 if x.startswith("START_OK")), "")
+    assert line and "mapped=True" in line, (r.returncode, r.stdout[-600:],
+                                            r.stderr[-1200:])
+    assert not os.path.exists(marker), "the update was not rolled back"
+    with open(log, encoding="utf-8", errors="replace") as fh:
+        text = fh.read()
+    assert "update rolled back: The update to " + SCRIPT_VERSION in text, \
+        text[-1500:]
+
+
 @gui_test_step("5.1.2 rc.11: warm start — the loading screen's checklist, "
                "and a real start built behind it")
 def gt_rc11_warm_start(app, ctx):
@@ -93342,11 +93414,16 @@ def main():
     root.minsize(640, 520)
     _center_window(root, 760, 680)
     base_ttk_style()
-    if rolled:
-        messagebox.showwarning("Update rolled back", rolled)
-
     loader = LoaderWindow(root, cfg)
     loader.pack(fill="both", expand=True)
+    if rolled:
+        # audit 2026-11-12 (#12): never a message box here, which held the
+        # start until it was clicked: the log, the loading screen and the
+        # Welcome Center's notice say it
+        ROLLBACK_NOTE[0] = rolled
+        LOG.warning("update rolled back: %s", rolled)
+        loader.post_log("⚠ " + translate_text("Update rolled back") +
+                        ": " + rolled, "warn")
     root.configure(background=loader.bg)
     root.update()
     boot_step("window", True, f"Tk {tk.TkVersion}")
@@ -93632,6 +93709,9 @@ def welcome_wanted(cfg, first_time, notice, start_test=None):
 def startup_notice():
     """Plain words for anything unusual about this start (or "")."""
     parts = []
+    if ROLLBACK_NOTE[0]:
+        parts.append("⚠ " + translate_text("Update rolled back") + " — " +
+                     ROLLBACK_NOTE[0])
     if SAFE_MODE:
         parts.append("🛟 " + translate_text("Safe Mode") + " — " +
                      translate_text(SAFE_REASON[0] or "") + " " +
