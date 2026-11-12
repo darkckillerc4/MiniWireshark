@@ -70,12 +70,16 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 - **Changing the text size on Windows is slow.** It takes about 0.4 seconds on the test machine, and the window doesn't answer for about a tenth of a second while it happens (the goal is 0.1 seconds; on Linux it is well under that). The reason: on Windows every part of the window is its own small system window, and when the shared fonts change, all of them (about 700) are measured and drawn again. Making this fast needs a change to how the window shares its fonts, planned for a later release.
 
+- **Memory still grows over many hours.** In a 24-hour fast replay that kept meeting new websites, memory grew from about 80 to about 335 MB. Its lists of sites and names have a size limit but no age limit. A replay with only known sites grows about 5 MB an hour after the first hour.
+- **Not re-tested on a real PC for 5.3.4:** memory, threads and handles over an 8-hour capture on Windows, and the network-card pick with a real VPN switched on. These were checked only in replays and with simulated network cards.
+- **macOS and Linux** fixes were checked in the automated tests (CI) only, not on a real Mac or Linux desktop. The window test does not run on macOS or on Python 3.8.
+- **The network-card pick on Windows** now prefers the card that Windows' own routing uses (it changes the order of the cards, it doesn't only log). It knows the common VPN cards by name, but may not know every VPN product's name.
+
 **Not in this release**
 
 - Device fingerprints from DHCP request lists ship without built-in rows until real captures of your own devices are available.
-- The route-aware network-card pick on Windows only writes to the log for now.
 
-Tested on Python 3.8 and 3.12: 272 self-tests and 62 GUI steps.
+Tested on Python 3.8, 3.12 and 3.13 (371 self-tests) and with 56 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed.
 
 ## [5.2.3] — 2026-10-24
 

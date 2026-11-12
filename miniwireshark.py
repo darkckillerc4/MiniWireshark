@@ -68770,17 +68770,19 @@ def run_self_tests(verbose=True, only=None):
         aside.close()
     shutil.rmtree(tmp, ignore_errors=True)
     failed = [r for r in results if r[0] == "FAIL"]
+    # a skip is not a pass: "361 passed" was 356 passes and 5 skips
+    skipped = sum(1 for r in results if r[0] == "SKIP")
+    passed = len(results) - len(failed) - skipped
     if results:
-        LOG.info("self-test ran: %d passed, %d failed",
-                 len(results) - len(failed), len(failed))
+        LOG.info("self-test ran: %d passed, %d failed, %d skipped",
+                 passed, len(failed), skipped)
     missing = wanted.unmatched() if wanted is not None else []
     if missing and verbose:
         print("No self-test is called " + ", ".join(missing) + ".")
     if wanted is not None and not results:
         return 2
     if verbose:
-        print(f"\n{len(results) - len(failed)} passed / {len(failed)} failed"
-              f" / {sum(1 for r in results if r[0] == 'SKIP')} skipped")
+        print(f"\n{passed} passed / {len(failed)} failed / {skipped} skipped")
         for status, name, msg, _t in failed:
             print(f"\nFAILED: {name}\n{msg}")
     return 1 if failed else 2 if missing else 0
@@ -85977,7 +85979,8 @@ def t_r7_self_test_keeps_the_real_log_clean(ctx):
     """Windows run (#18): what the tests log (made-up adapters, "installed
     update 9.9.9", a damaged history) never reaches the real log, even
     when a test fails; the real log gets one line, "self-test ran: N
-    passed, M failed", and its handler is back afterwards."""
+    passed, M failed, K skipped" (a skip is not a pass), and its handler
+    is back afterwards."""
     real_path = ctx.path(f"r7-real-{uuid.uuid4().hex[:6]}.log")
     real = logging.FileHandler(real_path, encoding="utf-8")
     real.setFormatter(logging.Formatter("%(message)s"))
@@ -85991,13 +85994,22 @@ def t_r7_self_test_keeps_the_real_log_clean(ctx):
     def t_r7_probe_log_bad(_ctx):
         LOG.warning("history: The history file was damaged")
         raise AssertionError("planted failure")
-    probes = [(t_r7_probe_log_ok, False), (t_r7_probe_log_bad, False)]
+
+    def t_r7_probe_log_skip(_ctx):
+        return "skip"
+    probes = [(t_r7_probe_log_ok, False), (t_r7_probe_log_bad, False),
+              (t_r7_probe_log_skip, False)]
     SELF_TESTS.extend(probes)
     try:
-        with contextlib.redirect_stdout(io.StringIO()):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
             rc = run_self_tests(verbose=True,
-                                only="r7_probe_log_ok,r7_probe_log_bad")
+                                only="r7_probe_log_ok,r7_probe_log_bad,"
+                                     "r7_probe_log_skip")
         assert rc == 1, rc
+        # a skip is not a pass (audit #17: "361 passed" held 5 skips)
+        assert "1 passed / 1 failed / 1 skipped" in out.getvalue(), \
+            out.getvalue()[-200:]
         assert real in LOG.handlers, "the real log was not put back"
     finally:
         for pr in probes:
@@ -86007,7 +86019,7 @@ def t_r7_self_test_keeps_the_real_log_clean(ctx):
         LOG.setLevel(level)
     with open(real_path, encoding="utf-8") as f:
         lines = f.read().splitlines()
-    assert lines == ["self-test ran: 1 passed, 1 failed"], lines
+    assert lines == ["self-test ran: 1 passed, 1 failed, 1 skipped"], lines
 
 
 # ============================================================================
