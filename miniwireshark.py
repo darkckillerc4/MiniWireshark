@@ -35502,6 +35502,27 @@ def search_hit(term, hay, fterm=None):
     return bool(fterm) and fterm in search_fold(hay)
 
 
+def draw_tick_box(img, n, field, edge, tick=None):
+    """An n×n checkbox in `img` (4 clear pixels on its right as the gap
+    before the text): a 1-pixel edge, and a tick ✓ when `tick` is a
+    colour."""
+    img.blank()
+    img.configure(width=n + 4, height=n)
+    img.put(edge, to=(0, 0, n, n))
+    img.put(field, to=(1, 1, n - 1, n - 1))
+    if not tick:
+        return
+    t = max(2, n // 6)
+    pts = ((0.20, 0.50), (0.40, 0.70), (0.80, 0.24))
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        steps = int(n * 2)
+        for i in range(steps + 1):
+            x = int(round((x0 + (x1 - x0) * i / steps) * n - t / 2))
+            y = int(round((y0 + (y1 - y0) * i / steps) * n - t / 2))
+            x, y = max(2, min(n - 2 - t, x)), max(2, min(n - 2 - t, y))
+            img.put(tick, to=(x, y, x + t, y + t))
+
+
 def focus_toplevel(win, widget=None):
     """Give a new window the keyboard (Escape, arrows, Enter). Without
     it the keys kept going to the main window, which still had the
@@ -53218,6 +53239,58 @@ proc ::mw_retheme {w map fgnew deffg} {
         style.map("Treeview.Heading",
                   background=[("active", bg)], foreground=[("active", fg)])
         style.configure("TMenubutton", background=bg, foreground=fg)
+        self._check_colours = (field, "#000000" if hc and not dark else (
+            "#ffffff" if hc else ("#8a93a3" if dark else "#6b7280")),
+            fg if hc else focus, "#7a808c" if dark else "#a0a4ab")
+        self._restyle_check()
+
+    CHECK_PX = 14             # the tick box at the Normal text size
+
+    def _restyle_check(self, scale=None):
+        """Every checkbox draws a tick when it is on. Tk's "clam" look
+        draws a cross, which read as "no" (crowd test 5.3.4 #14: "checked
+        boxes draw as X, unchecked as empty box"). Four images, redrawn
+        in place for the theme and the text size (no new Tk image or
+        element each time)."""
+        if scale is None:
+            scale = self.TEXT_SIZES.get(self.config.get(
+                "appearance.text_size", "Normal"), 1.0)
+        field, border, mark, off = getattr(
+            self, "_check_colours", ("#ffffff", "#6b7280", "#2b7de9",
+                                     "#a0a4ab"))
+        n = max(11, int(round(self.CHECK_PX * scale)))
+        sig = (n, field, border, mark, off)
+        if getattr(self, "_check_sig", None) == sig:
+            return                  # a redraw makes every checkbox redraw
+        try:
+            imgs = getattr(self, "_check_imgs", None)
+            if imgs is None:
+                imgs = {k: tk.PhotoImage(master=self.root, width=n + 4,
+                                         height=n)
+                        for k in ("off", "on", "off_d", "on_d")}
+                style = ttk.Style()
+                style.tk.call(
+                    "ttk::style", "element", "create",
+                    "Mw.Checkbutton.indicator", "image",
+                    (imgs["off"], "disabled selected", imgs["on_d"],
+                     "selected", imgs["on"], "disabled", imgs["off_d"]))
+                style.layout("TCheckbutton", [("Checkbutton.padding", {
+                    "sticky": "nswe", "children": [
+                        ("Mw.Checkbutton.indicator",
+                         {"side": "left", "sticky": ""}),
+                        ("Checkbutton.focus", {
+                            "side": "left", "sticky": "w", "children": [
+                                ("Checkbutton.label",
+                                 {"sticky": "nswe"})]})]})])
+                self._check_imgs = imgs
+            for key, (edge, tick) in (("off", (border, None)),
+                                      ("on", (border, mark)),
+                                      ("off_d", (off, None)),
+                                      ("on_d", (off, off))):
+                draw_tick_box(imgs[key], n, field, edge, tick)
+            self._check_sig = sig
+        except tk.TclError:
+            LOG.debug("checkbox tick", exc_info=True)
 
 
     TEXT_SIZES = {"Small": 0.9, "Normal": 1.0, "Large": 1.15,
@@ -53269,6 +53342,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                 st.configure("Treeview.Heading", font=head)
         except tk.TclError:
             pass
+        self._restyle_check(scale)           # the tick box grows too
         job = getattr(self, "_text_size_job", None)
         if job is not None:
             with contextlib.suppress(tk.TclError):
@@ -58736,6 +58810,10 @@ proc ::mw_explicit_fonts {top names} {
                                 show="tree", sortable=False)
         frame.configure(bg=t["tab_bg"])
         frame.pack(fill="both", expand=True, padx=10, pady=10)
+        # the results are in the tree column (#0), which kept Tk's 200
+        # pixels: "Health › Wi-Fi signal (thi" (crowd test 5.3.4 #2)
+        tree.configure(displaycolumns=())
+        tree.column("#0", width=w - 60, minwidth=200, stretch=True)
         acts = {}
         first = None
         for group, items in groups:
@@ -58745,7 +58823,7 @@ proc ::mw_explicit_fonts {top names} {
                 iid = tree.insert(g, "end", text=label)
                 acts[iid] = action
                 first = first or iid
-        win._mw_results = (total, acts)
+        win._mw_results, win._mw_tree = (total, acts), tree
 
         def go(_e=None):
             sel = tree.selection()
@@ -93502,6 +93580,8 @@ def gt_c534_search_window(app, ctx):
                  if isinstance(w, tk.Label)]
         assert heads and heads[0].startswith(f"{total} result"), heads
         assert drop.frame is None, "the list stayed under the window"
+        # #2: a result line is not cut at 200 pixels
+        assert int(win._mw_tree.column("#0", "width")) >= 400
         # #1: under the search box, not at the top left over the tabs
         assert win.winfo_rooty() >= e.winfo_rooty() + e.winfo_height(), \
             (win.winfo_rooty(), e.winfo_rooty())
@@ -93565,6 +93645,17 @@ def gt_c534_search_window(app, ctx):
                "Beginner | Advanced")
 def gt_c534_settings(app, ctx):
     root = app.root
+    # a ticked box shows a tick, not Tk's cross: the corners stay clear
+    lay = str(ttk.Style().layout("TCheckbutton"))
+    assert "Mw.Checkbutton.indicator" in lay, lay
+    on, off = app._check_imgs["on"], app._check_imgs["off"]
+    n = off.height()
+    field = off.get(n // 2, n // 2)
+    assert on.get(3, 3) == field and on.get(n - 4, n - 4) == field and \
+        on.get(3, n - 4) == field, "the ticked box draws a cross"
+    assert on.get(int(0.40 * n), int(0.70 * n)) != field, "no tick drawn"
+    assert all(off.get(x, y) == field for x in range(2, n - 2)
+               for y in range(2, n - 2)), "the empty box is not empty"
     _gui_focus_main(app)
     sw = app._open_settings("general")
     f = _gui_focus_in(root, sw.win)
