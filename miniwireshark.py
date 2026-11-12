@@ -38203,14 +38203,17 @@ class DashboardTab(BaseTab):
                          bg="#f6f7fa", fg="#2b3a56", font=mw_font(10, "bold"),
                          anchor="w")
         title.pack(side="left")
-        self.unusual_lbl = tk.Label(card, text="…", bg="#f6f7fa",
-                                    fg="#222222", font=mw_font(10),
-                                    anchor="w", justify="left")
-        self.unusual_lbl.pack(side="left", padx=(10, 0), fill="x",
-                              expand=True)
         more = tk.Label(card, text="See both readings ›", bg="#f6f7fa",
                         fg="#0b5394", anchor="e", cursor="hand2")
         more.pack(side="right")
+        # wraps (a longer sentence for open warnings, #4) and leaves the
+        # link its room
+        self.unusual_lbl = tk.Label(card, text="…", bg="#f6f7fa",
+                                    fg="#222222", font=mw_font(10),
+                                    anchor="w", justify="left",
+                                    wraplength=600)
+        self.unusual_lbl.pack(side="left", padx=(10, 0), fill="x",
+                              expand=True)
         for w in (card, title, self.unusual_lbl, more):
             w.bind("<Button-1>", lambda e: self.app.open_unusual())
         card.bind("<Return>", lambda e: self.app.open_unusual())
@@ -51154,8 +51157,8 @@ class MiniWireshark:
         c = m.alerts.counts()
         sig = (id(m), self.data_mode, c["DANGER"], c["WARNING"],
                len(m.health_history), self.active_mode(),
-               bool(m.metrics.first_ts), CURRENT_LOCALE,      # ST-08
-               self.dashboard_window())                       # #25
+               bool(m.metrics.first_ts), self.dashboard_window(),  # #25
+               CURRENT_LOCALE)                                # ST-08
         cache = getattr(self, "_answers", None)
         now = time.monotonic()
         if not force and cache is not None and cache["sig"] == sig and \
