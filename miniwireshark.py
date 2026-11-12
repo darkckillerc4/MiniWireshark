@@ -2949,14 +2949,41 @@ def outbound(feature, kind, dest, detail="", count=1):
     return True
 
 
-def net_urlopen(feature, req, timeout, detail=""):
-    """urllib.request.urlopen behind the outbound gate."""
+def net_urlopen(feature, req, timeout, detail="", allowed=None):
+    """urllib.request.urlopen behind the outbound gate. With `allowed` (a
+    test of a URL), every redirect is checked before it is followed."""
     url = req.full_url if isinstance(req, urllib.request.Request) \
         else str(req)
     parts = urllib.parse.urlsplit(url)
     outbound(feature, parts.scheme or "http", parts.hostname or url,
              detail or (parts.path or "/")[:100])
+    if allowed is not None:
+        opener = _redirect_opener(allowed)
+        return opener.open(req, timeout=timeout)
     return urllib.request.urlopen(req, timeout=timeout)
+
+
+class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
+    """(security review) A redirect is followed only to a URL `allowed`
+    accepts. urllib follows up to 10 redirects to any host, plain http
+    included: checking only where the answer finally came from let an
+    update request reach a host off the list (and unrecorded by the
+    outbound gate) on the way."""
+
+    def __init__(self, allowed):
+        self.allowed = allowed
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not self.allowed(newurl):
+            raise urllib.error.URLError(
+                "a redirect to %s was refused" % (
+                    urllib.parse.urlsplit(str(newurl)).hostname or "?"))
+        return super().redirect_request(req, fp, code, msg, headers,
+                                        newurl)
+
+
+def _redirect_opener(allowed):
+    return urllib.request.build_opener(_CheckedRedirects(allowed))
 
 
 # ---- 5.3.4: updates come only from the official GitHub page ------------------
@@ -3120,6 +3147,39 @@ def windows_powershell(environ=None):
     exe = os.path.join(root, "System32", "WindowsPowerShell", "v1.0",
                        "powershell.exe") if root else ""
     return exe if exe and os.path.isfile(exe) else "powershell"
+
+
+# Windows tools run by name. (security review) CreateProcess looks for a
+# bare name in the current folder before System32, so a planted
+# "arp.exe" or "netsh.exe" in the folder MiniWireshark was started from
+# (Downloads, a shared drive) ran instead of Windows' own tool.
+WINDOWS_SYSTEM_TOOLS = frozenset({"arp", "netsh", "route", "ipconfig",
+                                  "getmac", "powershell"})
+
+
+def windows_system_tool(cmd, environ=None, windows=None):
+    """`cmd` with a bare Windows tool name (arp, netsh, route, ...)
+    replaced by its full path in System32; anything else, or off
+    Windows, unchanged. -> a new list"""
+    cmd = list(cmd)
+    windows = IS_WINDOWS if windows is None else windows
+    if not windows or not cmd:
+        return cmd
+    name = str(cmd[0])
+    base = name.lower()[:-4] if name.lower().endswith(".exe") else \
+        name.lower()
+    if any(c in name for c in "\\/:") or base not in WINDOWS_SYSTEM_TOOLS:
+        return cmd
+    environ = os.environ if environ is None else environ
+    if base == "powershell":
+        cmd[0] = windows_powershell(environ)
+        return cmd
+    root = environ.get("SystemRoot") or environ.get("SYSTEMROOT") or \
+        environ.get("windir") or ""
+    exe = os.path.join(root, "System32", base + ".exe") if root else ""
+    if exe and os.path.isfile(exe):
+        cmd[0] = exe
+    return cmd
 
 
 def _authenticode_info(path, run=None):
@@ -11798,9 +11858,9 @@ def system_dns_servers():
     try:
         if IS_WINDOWS:
             r = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 "Get-DnsClientServerAddress -AddressFamily IPv4 | "
-                 "Select-Object -ExpandProperty ServerAddresses"],
+                [windows_powershell(), "-NoProfile", "-NonInteractive",
+                 "-Command", "Get-DnsClientServerAddress -AddressFamily "
+                 "IPv4 | Select-Object -ExpandProperty ServerAddresses"],
                 capture_output=True, text=True, timeout=20,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             servers = [ln.strip() for ln in r.stdout.splitlines()
@@ -18018,8 +18078,10 @@ def console_decode(data):
 
 def run_console(cmd, timeout=10):
     """subprocess.run for a read-only console tool: no window flashes,
-    output decoded with console_decode."""
-    r = subprocess.run(cmd, capture_output=True, timeout=timeout,
+    output decoded with console_decode. A Windows tool runs from
+    System32, never from the current folder (windows_system_tool)."""
+    r = subprocess.run(windows_system_tool(cmd), capture_output=True,
+                       timeout=timeout,
                        creationflags=getattr(subprocess,
                                              "CREATE_NO_WINDOW", 0))
     r.stdout, r.stderr = console_decode(r.stdout), console_decode(r.stderr)
@@ -25709,6 +25771,13 @@ class Store:
                     LOG.warning("history VACUUM failed (%s): overwriting "
                                 "the free pages instead", e)
                     _zero_free_pages(con)
+                    # (security review) the copies go even then: the
+                    # failure is only logged and the window has already
+                    # said "History cleared", so the nightly backup and
+                    # the -wal's older frames must not keep every row
+                    with contextlib.suppress(sqlite3.Error):
+                        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self.remove_copies()
                     raise
                 # 5.3.4 (LG-13): "Delete ALL history" means the copies too:
                 # the -wal file, the nightly backup and the ones made
@@ -59404,7 +59473,8 @@ proc ::mw_explicit_fonts {top names} {
                 req = urllib.request.Request(url, headers={
                     "User-Agent": APP_NAME,
                     "Accept": "application/vnd.github+json"})
-                with net_urlopen("update", req, 8, "latest release") as resp:
+                with net_urlopen("update", req, 8, "latest release",
+                                 allowed=update_url_ok) as resp:
                     if not update_url_ok(resp.geturl()):
                         raise ValueError("the answer came from outside "
                                          "GitHub and was ignored")
@@ -59483,7 +59553,8 @@ proc ::mw_explicit_fonts {top names} {
                 raise ValueError(f"the {what} link is not on GitHub")
             req = urllib.request.Request(link, headers={
                 "User-Agent": APP_NAME})
-            with net_urlopen("update", req, timeout, what) as r:
+            with net_urlopen("update", req, timeout, what,
+                             allowed=update_url_ok) as r:
                 if not update_url_ok(r.geturl()):
                     raise ValueError(f"the {what} was sent from outside "
                                      f"GitHub")
@@ -75740,12 +75811,20 @@ def _update_stub(ctx, extra=None, answer=None, final_url=None):
                           {"tag_name": "v1.0.0", "assets": []}).encode()
         return _FakeUpdateAnswer(body, final_url or url)
     urllib.request.urlopen = fake
+    real_opener = globals()["_redirect_opener"]
+    stub.openers = []
+
+    def fake_opener(allowed):
+        stub.openers.append(allowed)
+        return types.SimpleNamespace(open=fake)
+    globals()["_redirect_opener"] = fake_opener
     messagebox.showinfo = lambda *a, **k: stub.dialogs.append(a) or "ok"
     messagebox.askyesno = lambda *a, **k: stub.dialogs.append(a) and False
 
     def restore():
         (urllib.request.urlopen, messagebox.showinfo,
          messagebox.askyesno) = orig
+        globals()["_redirect_opener"] = real_opener
     return stub, sent, restore
 
 
@@ -75964,6 +76043,45 @@ def t_update_links_github_only(ctx):
     assert sent == [], sent
     assert stub.dialogs and "nothing was changed" in stub.dialogs[-1][1], \
         stub.dialogs
+
+
+@self_test()
+def t_sec_update_redirects_checked_each_hop(ctx):
+    """Security review (5.3.4): an update request follows a redirect only
+    to an https GitHub host. urllib followed any redirect (plain http,
+    any host) and only the final address was checked, so a hop off the
+    list was still sent to, and never recorded by the outbound gate."""
+    h = _CheckedRedirects(update_url_ok)
+    req = urllib.request.Request(
+        "https://github.com/a/b/releases/download/v6.0.0/m.py")
+    for bad in ("http://github.com/a/m.py", "https://evil.example/m.py",
+                "https://github.com.evil.example/m.py"):
+        try:
+            h.redirect_request(req, None, 302, "Found", {}, bad)
+            raise AssertionError(f"redirect to {bad} followed")
+        except urllib.error.URLError as e:
+            assert "refused" in str(e), e
+    ok = "https://release-assets.githubusercontent.com/x?sig=1"
+    nxt = h.redirect_request(req, None, 302, "Found", {}, ok)
+    assert nxt is not None and nxt.full_url == ok, nxt
+    # the check and the download both go through it
+    stub, sent, restore = _update_stub(ctx, answer={"tag_name": "v1.0.0"})
+    try:
+        _update_run(stub, manual=True)
+        stub._update_manifest_url = (
+            "https://github.com/a/b/releases/download/v6.0.0/" +
+            MANIFEST_NAME)
+        stub._self_update("https://github.com/a/b/releases/download/"
+                          "v6.0.0/m.py", "6.0.0")
+        for t in list(threading.enumerate()):
+            if t.name == "self-update":
+                t.join(5)
+        stub._async_results.get(timeout=5)()
+    finally:
+        restore()
+    assert len(sent) >= 2 and stub.openers and all(
+        a is update_url_ok for a in stub.openers), (sent, stub.openers)
+    assert len(stub.openers) == len(sent), (sent, stub.openers)
 
 
 @self_test()
@@ -82894,6 +83012,63 @@ def t_534_ci_clear_all_writes_little(ctx):
         assert mark not in fh.read()
 
 
+@self_test()
+def t_sec_clear_all_vacuum_fails_still_removes_copies(ctx):
+    """Security review (5.3.4): when VACUUM fails during "Delete ALL
+    history" (a full disk: it needs a second copy's room), the window has
+    already said "History cleared" and the error is only logged. The
+    nightly backup and the -wal's older frames must go anyway; they used
+    to stay with every row in them."""
+    mark = b"zz-sec-vacuum-host.example"
+    path = ctx.path("clear_fail.sqlite3")
+    st = Store(path, session_id=1)
+    jobs = []
+    try:
+        now = time.time()
+        assert st.write_observations([
+            (1, now, "dns_answer", mark.decode() + str(k), {"p": "x" * 200},
+             1) for k in range(400)])
+        assert st.flush_now(30)
+        st.submit = jobs.append
+        try:
+            st.clear()
+        finally:
+            del st.submit
+    finally:
+        st.stop(5)
+    assert len(jobs) == 1, jobs
+    with open(path + ".bak", "wb") as f:           # last night's backup
+        f.write(b"backup " + mark)
+
+    class VacuumFails:
+        def __init__(self, con):
+            self._con = con
+
+        def execute(self, sql, *a):
+            if sql.strip().upper() == "VACUUM":
+                raise sqlite3.OperationalError("database or disk is full")
+            return self._con.execute(sql, *a)
+
+        def __getattr__(self, name):
+            return getattr(self._con, name)
+    con = sqlite3.connect(path, timeout=15)
+    try:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA secure_delete=ON")
+        try:
+            jobs[0](VacuumFails(con))
+            raise AssertionError("the failed VACUUM was not reported")
+        except sqlite3.OperationalError as e:
+            assert "full" in str(e), e
+    finally:
+        con.close()
+    assert not os.path.exists(path + ".bak"), "the backup was kept"
+    for f in (path, path + "-wal"):
+        if os.path.exists(f):
+            with open(f, "rb") as fh:
+                assert mark not in fh.read(), f
+
+
 # ---- 5.3.4 M15 (S15): clocks and locales --------------------------------------
 NETSH_DE = """
 Es ist 1 Schnittstelle auf dem System vorhanden:
@@ -85889,6 +86064,64 @@ def t_r7_npcap_check_ignores_powershell7(ctx):
         f.write(b"MZ")
     assert windows_powershell({"SystemRoot": sysroot}) == exe
     assert windows_powershell({}) == "powershell"
+
+
+@self_test()
+def t_sec_windows_tools_from_system32(ctx):
+    """Security review (5.3.4): arp, netsh, route and PowerShell run by
+    their full path in System32. Run by bare name, Windows looked in the
+    current folder first, so an "arp.exe" planted in the folder the app
+    was started from (Downloads) ran instead."""
+    sysroot = ctx.path("sec-windir")
+    s32 = os.path.join(sysroot, "System32")
+    ps = os.path.join(s32, "WindowsPowerShell", "v1.0", "powershell.exe")
+    os.makedirs(os.path.dirname(ps), exist_ok=True)
+    for exe in (os.path.join(s32, "arp.exe"), os.path.join(s32, "netsh.exe"),
+                os.path.join(s32, "route.exe"), ps):
+        with open(exe, "wb") as f:
+            f.write(b"MZ")
+    seen = []
+
+    def fake(cmd, **kw):
+        seen.append(list(cmd))
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+    g = globals()
+    real_win, real_run = IS_WINDOWS, subprocess.run
+    old = {k: os.environ.get(k) for k in ("SystemRoot", "SYSTEMROOT",
+                                          "windir")}
+    try:
+        for k in old:
+            os.environ.pop(k, None)
+        os.environ["SystemRoot"] = sysroot
+        g["IS_WINDOWS"] = True
+        subprocess.run = fake
+        run_console(["arp", "-a"])
+        run_console(["netsh", "wlan", "show", "interfaces"])
+        run_console(["route", "print", "-4", "0.0.0.0"])
+        system_dns_servers()
+    finally:
+        subprocess.run = real_run
+        g["IS_WINDOWS"] = real_win
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    assert [c[0] for c in seen] == [
+        os.path.join(s32, "arp.exe"), os.path.join(s32, "netsh.exe"),
+        os.path.join(s32, "route.exe"), ps], seen
+    assert seen[0][1:] == ["-a"], seen
+    # off Windows, a path, or a tool not in the list: unchanged
+    assert windows_system_tool(["arp", "-n"], windows=False) == ["arp", "-n"]
+    env = {"SystemRoot": sysroot}
+    assert windows_system_tool(["ARP.EXE", "-a"], env, True)[0] == \
+        os.path.join(s32, "arp.exe")
+    assert windows_system_tool([r"C:\x\arp.exe"], env, True) == \
+        [r"C:\x\arp.exe"]
+    assert windows_system_tool(["python", "-V"], env, True) == \
+        ["python", "-V"]
+    # System32 without the tool: the name is left for Windows to find
+    assert windows_system_tool(["ipconfig"], env, True) == ["ipconfig"]
 
 
 @self_test()

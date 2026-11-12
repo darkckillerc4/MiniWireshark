@@ -27,6 +27,13 @@ concurrency:
 
 jobs:
   release:
+    # (security review) "Run workflow" can pick any branch: only main may
+    # publish, sign with MW_RELEASE_KEY and push the version index. The
+    # environment lets the owner keep MW_RELEASE_KEY as an environment
+    # secret with a deployment-branch rule of main only (Settings ->
+    # Environments -> release); until then the repository secret is used
+    environment: release
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
