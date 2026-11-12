@@ -95634,9 +95634,7 @@ def gt_c534_palette_focus(app, ctx):
     assert int(card.cget("highlightthickness")) == 1
 
 
-# ============================================================================
-#  20d.  5.3.4 crowd test fixes (the ranked bug list): one test per fix
-# ============================================================================
+# ---- 5.3.4 crowd test fixes (the ranked bug list): one test per fix ----
 def _gt_back_to_scenario(app, ctx):
     """Re-open the scenario capture for the steps that follow."""
     frames = ctx.frames()
