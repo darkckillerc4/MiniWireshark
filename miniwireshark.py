@@ -90184,6 +90184,23 @@ def _gs_v502_layout(app, ctx):
                 for kind, path, detail in layout_audit(root):
                     found.append(f"{lang}/{size}/{geo} {name}: {kind} "
                                  f"{path[-60:]} {detail}")
+                # 5.3.4: and Websites → Local services (with fake
+                # listeners, so the rows don't depend on this computer)
+                if name == "websites":
+                    tab = app.tabs[name]
+                    tab.local.source = lambda: (
+                        "ok", _local_fake_listeners())
+                    try:
+                        tab.show_subview("Local services")
+                        _gui_pump(root, 0.35)
+                        assert tab.local.tree.get_children()
+                        for kind, path, detail in layout_audit(root):
+                            found.append(f"{lang}/{size}/{geo} websites/"
+                                         f"local: {kind} {path[-60:]} "
+                                         f"{detail}")
+                    finally:
+                        tab.local.source = None
+                        tab.show_subview("Websites")
             # a dialog with many buttons and the settings window
             dev = next(iter(app.model.registry.by_key))
             app.show_device(dev)
@@ -93344,6 +93361,209 @@ def gt_534_m17_layout(app, ctx):
         app._apply_text_size(defer=False)
         root.geometry(geo0)
         _gui_pump(root, 0.4)
+
+
+@gui_test_step("5.3.4 Local services: Websites → Local services with fake "
+               "listeners — rows, safety notes, open only web apps through "
+               "the gate, empty and no-admin states, refresh and EN/FR/ES "
+               "without piling up, fits at 1024×768")
+def gt_534_local_services(app, ctx):
+    import webbrowser
+    root = app.root
+    tab = app._select_tab("websites")
+    view = tab.local
+    fake = {"state": "ok", "listening": _local_fake_listeners()}
+    view.source = lambda: (fake["state"], dict(fake["listening"]))
+
+    def widgets(w):
+        n = 1
+        for c in w.winfo_children():
+            n += widgets(c)
+        return n
+
+    def cells():
+        return [tuple(str(v) for v in view.tree.item(i, "values"))
+                for i in view.tree.get_children()]
+
+    def pick(port, proto="TCP"):
+        for iid, r in view.iid_row.items():
+            if r["port"] == port and r["proto"] == proto:
+                view.tree.selection_set(iid)
+                view.tree.focus(iid)
+                _gui_pump(root, 0.05)
+                return iid
+        raise AssertionError(f"no row for {proto} {port}")
+
+    old = (app.config.get("general.language"),
+           app.config.get("appearance.theme"),
+           app.config.get("appearance.text_size"), root.geometry())
+    old_open, old_killed = webbrowser.open, LEDGER.killed
+    opened = []
+    try:
+        # (reachable_actions visits other tabs: first)
+        assert "subview:websites/Local services" in reachable_actions(app)
+        assert any(x[0] == "Websites → Local services"
+                   for x in app.palette_items())
+        app._select_tab("websites")
+        tab.show_subview("Local services")
+        _gui_pump(root, 0.4)
+        assert tab.subview == "Local services"
+        assert view.tree.winfo_ismapped()
+        rows = cells()
+        assert len(rows) == 10, rows
+        by = {(r[1], r[0]): r for r in rows}
+        assert by[("TCP", "5173")][5] == "Only this computer can reach it"
+        assert by[("TCP", "8080")][5] == \
+            "Other devices on your network can reach it"
+        assert by[("TCP", "8080")][4] == "The whole network (all addresses)"
+        assert by[("TCP", "5173")][2] == "Web app in development"
+        assert by[("TCP", "631")][2] == "Printing (IPP)"
+        assert by[("TCP", "5432")][2] == "Database connection (PostgreSQL)"
+        assert "node (pid 4001)" == by[("TCP", "5173")][3]
+        # refresh 3 times and EN → FR → ES → EN: the same rows, widgets
+        # and table kits every time
+        base = (len(rows), widgets(view.frame), len(app.kits),
+                len(view.iid_row))
+        for _ in range(3):
+            view.refresh_btn.invoke()
+            _gui_pump(root, 0.2)
+            assert (len(cells()), widgets(view.frame), len(app.kits),
+                    len(view.iid_row)) == base
+        for lang, loc in (("Français", "fr"), ("Español", "es"),
+                          ("English", "en")):
+            app.config.set("general.language", lang)
+            app._apply_runtime_settings()
+            _gui_pump(root, 0.4)
+            got = cells()
+            assert (len(got), widgets(view.frame), len(app.kits),
+                    len(view.iid_row)) == base, (lang, len(got))
+            safe = {r[5] for r in got}
+            want = {translate_text(LOCAL_SAFE, loc),
+                    translate_text(LOCAL_EXPOSED, loc)}
+            assert safe == want, (lang, safe)
+            assert str(view.open_btn.cget("text")) == translate_text(
+                "Open in browser", loc)
+            assert str(view.tree.heading("safety", "text")).rstrip(
+                " ▲▼") == translate_text("Who can reach it", loc)
+        assert cells() == rows                 # English again, the same
+        # open: only a TCP web app, at 127.0.0.1, through the gate
+        webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+        LEDGER.killed = False
+        n0 = len(LEDGER.snapshot("local_open"))
+        pick(5173)
+        assert str(view.open_btn.cget("state")) == "normal"
+        view.open_btn.invoke()
+        assert opened == ["http://127.0.0.1:5173/"], opened
+        pick(8080)
+        assert view.tree.bind("<Double-1>")        # double-click opens
+        view._double()
+        assert opened[-1] == "http://127.0.0.1:8080/", opened
+        assert len(LEDGER.snapshot("local_open")) == n0 + len(opened)
+        for port, proto in ((631, "TCP"), (5432, "TCP"), (5353, "UDP")):
+            pick(port, proto)
+            assert str(view.open_btn.cget("state")) == "disabled", port
+            n = len(opened)
+            view._double()
+            assert len(opened) == n, (port, opened)
+        # the right-click menu offers it only on a web app
+        assert any(it and it[0] == "Open in browser" for it in
+                   view.kit.row_items(pick(3000)))
+        assert not any(it and it[0] == "Open in browser" for it in
+                       view.kit.row_items(pick(631)))
+        # the kill switch stops it and says what to type
+        LEDGER.killed = True
+        pick(5173)
+        n = len(opened)
+        view.open_btn.invoke()
+        assert len(opened) == n
+        assert "http://127.0.0.1:5173/" in str(app.banner_lbl.cget("text"))
+        LEDGER.killed = False
+        app._hide_banner()
+        # empty, then a computer that won't say without admin rights, then
+        # back: the same widgets
+        fake["state"], fake["listening"] = "ok", {}
+        view.reload()
+        _gui_pump(root, 0.3)
+        view.kit.update_empty()
+        assert not view.tree.get_children()
+        assert str(view.kit.empty_lbl.cget("text")) == \
+            "No services are listening on this computer."
+        assert view.kit.empty.winfo_manager() == "place"
+        assert str(view.open_btn.cget("state")) == "disabled"
+        assert str(view.count_lbl.cget("text")) == ""
+        fake["state"] = "denied"
+        view.reload()
+        _gui_pump(root, 0.3)
+        view.kit.update_empty()
+        assert "administrator rights" in str(view.kit.empty_lbl.cget(
+            "text"))
+        fake["state"] = "unavailable"
+        view.reload()
+        _gui_pump(root, 0.3)
+        view.kit.update_empty()
+        assert "psutil" in str(view.kit.empty_lbl.cget("text"))
+        app.config.set("general.language", "Español")
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.3)
+        view.kit.update_empty()
+        assert str(view.kit.empty_lbl.cget("text")) == translate_text(
+            "The list of services needs the optional psutil component "
+            "(Settings → Repair).", "es")
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        fake["state"], fake["listening"] = "ok", _local_fake_listeners()
+        view.reload()
+        _gui_pump(root, 0.3)
+        assert len(cells()) == len(rows)
+        assert not view.kit.empty.winfo_manager()
+        assert widgets(view.frame) == base[1]
+        # fits at 1024×768: every text size, both themes, the 3 languages
+        found = []
+        combos = [(size, theme) for size in MiniWireshark.TEXT_SIZES
+                  for theme in ("Light", "Dark")]
+        langs = ("English", "Français", "Español")
+        for i, (size, theme) in enumerate(combos):
+            lang = langs[i % 3]
+            app.config.set("general.language", lang)
+            app.config.set("appearance.theme", theme)
+            app.config.set("appearance.text_size", size)
+            app._apply_runtime_settings()
+            app._apply_text_size(defer=False)
+            root.geometry("1024x768")
+            _gui_pump(root, 0.5, until=lambda: not getattr(
+                app, "_theme_pending", False), timeout=10)
+            _gui_pump(root, 0.3)
+            assert view.tree.winfo_ismapped(), (lang, theme, size)
+            found += [f"{lang}/{theme}/{size}: {k} {p[-50:]} {d}"
+                      for k, p, d in layout_audit(view.frame)]
+            # the buttons are whole and inside the window
+            for b in (view.refresh_btn, view.open_btn):
+                assert b.winfo_ismapped() and b.winfo_width() >= \
+                    b.winfo_reqwidth() - 2, (lang, size, b.cget("text"))
+                assert b.winfo_rootx() + b.winfo_width() <= \
+                    root.winfo_rootx() + root.winfo_width(), (lang, size)
+            if theme == "Dark":
+                bg = str(view.frame.cget("bg")).lower()
+                assert bg != WHITE, (size, bg)
+        assert not found, "\n".join(found[:10])
+    finally:
+        webbrowser.open, LEDGER.killed = old_open, old_killed
+        view.source = None
+        app.config.set("general.language", old[0])
+        app.config.set("appearance.theme", old[1])
+        app.config.set("appearance.text_size", old[2])
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.geometry(old[3])
+        _gui_pump(root, 0.4, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        tab.show_subview("Websites")
+        app._hide_banner()
+    # back on Websites, a website search still works and the sub-view
+    # follows it
+    tab.show_subview("Local services")
+    tab.set_filter("")
+    assert tab.subview == "Websites"
 
 
 @gui_test_step("review 6: the Inspector's refreshes keep no bindings; a "
