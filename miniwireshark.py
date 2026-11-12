@@ -93456,6 +93456,10 @@ def _gui_focus_main(app):
     root.deiconify()
     root.lift()
     with contextlib.suppress(tk.TclError):
+        # the pointer over the main window: with no window manager (the
+        # crowd test's Xvfb) the keys go where the pointer is, unless a
+        # window takes them
+        app.search_entry.event_generate("<Motion>", warp=True, x=4, y=4)
         root.focus_force()
         app.search_entry.focus_force()
     _gui_pump(root, 0.3, lambda: root.focus_get() is app.search_entry,
