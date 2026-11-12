@@ -79077,6 +79077,28 @@ def t_534_known_limit_text_size(ctx):
 
 
 @self_test()
+def t_534_audit_text_size_judged_by_median(ctx):
+    """Audit 2026-11-12 (#18): the GUI test's text-size check judges the
+    median of its runs. It took the best of six, so one quick run let
+    five slow ones through."""
+    lim = (600, 150)
+    assert text_size_misses([380, 410, 395, 402, 390, 399],
+                            [88, 95, 90, 91, 87, 93], lim) == []
+    slow = text_size_misses([350, 900, 910, 880, 905, 890],
+                            [80, 90, 85, 88, 86, 89], lim)
+    assert len(slow) == 1 and "busy 895.0 ms" in slow[0], slow
+    froze = text_size_misses([380, 410, 395, 402, 390, 399],
+                             [60, 200, 210, 190, 205, 199], lim)
+    assert len(froze) == 1 and "froze 199.5 ms" in froze[0], froze
+    # one slow run among quick ones is noise, not a miss
+    assert text_size_misses([40, 45, 900, 42, 41, 44],
+                            [25, 26, 300, 24, 25, 27], (130, 105)) == []
+    # the limits in force by default
+    assert text_size_misses([10] * 6, [10] * 6) == []
+    assert text_size_misses([TEXT_SIZE_LIMITS_MS[0] + 1] * 6, [10] * 6)
+
+
+@self_test()
 def test_deep_worker_process_and_mode_switching(ctx):
     """A real worker process gives the same findings as the thread; and
     switching Normal ↔ Full Power 50 times during a replay leaves the
@@ -81282,6 +81304,24 @@ def bench_known_limit(sid, key):
     ""."""
     test, label = BENCH_KNOWN_LIMITS.get((sid, key), (None, ""))
     return label if test is not None and test() else ""
+
+
+def text_size_misses(busy, stall, limits=None):
+    """The GUI test's judgement of its text-size runs (ms each): the
+    median run against each limit, so one quick run among slow ones no
+    longer passes. Audit 2026-11-12 (#18): it took the best of the six.
+    Measured medians in CI (16 Windows jobs, 14 Ubuntu ones, Nov 11-12):
+    at most 414 / 96 ms on Windows (limits 600 / 150) and 46 / 28 ms on
+    Ubuntu (limits 130 / 105). -> the failure messages ([] = pass)."""
+    busy_max, stall_max = TEXT_SIZE_LIMITS_MS if limits is None else limits
+    out = []
+    for what, runs, limit in (("busy", busy, busy_max),
+                              ("froze", stall, stall_max)):
+        mid = statistics.median(runs)
+        if mid > limit:
+            out.append(f"text-size change {what} {mid:.1f} ms, the median "
+                       f"of {len(runs)} runs {runs}; limit {limit}")
+    return out
 
 
 def text_size_known_limit_line(busy_ms, stall_ms):
@@ -92057,13 +92097,11 @@ def gt_text_size_speed(app, ctx):
         if IS_WINDOWS or min(busy) > 130 or os.environ.get("MW_PROFILE"):
             now = app.config.get("appearance.text_size")
             print(_text_size_options(app, other[now], now))
-        busy_max, stall_max = TEXT_SIZE_LIMITS_MS
         if IS_WINDOWS:
-            print(f"    {text_size_known_limit_line(min(busy), min(stall))}")
-        assert min(busy) <= busy_max, f"text-size change busy " \
-            f"{min(busy)} ms (runs {busy}; limit {busy_max})"
-        assert min(stall) <= stall_max, f"text-size change froze " \
-            f"{min(stall)} ms (runs {stall}; limit {stall_max})"
+            print("    " + text_size_known_limit_line(
+                statistics.median(busy), statistics.median(stall)))
+        missed = text_size_misses(busy, stall)
+        assert not missed, "; ".join(missed)
     finally:
         root.tk.call("bind", root._w, "<<TkWorldChanged>>", "")
         app.config.set("appearance.text_size", size0)

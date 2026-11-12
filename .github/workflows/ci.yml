@@ -155,7 +155,7 @@ jobs:
   # against f0c5932 (before the round 4-5 savings) on the same runner,
   # interleaved, so runner speed cancels out (machines differ by up to
   # 40%, which no fixed limit in ms survives). Fails if this commit is
-  # over 0.85 x f0c5932's median; measured 0.70-0.75.
+  # over 0.80 x f0c5932's median; measured 0.65-0.75.
   text-size-bisect:
     runs-on: windows-latest
     timeout-minutes: 40       # 6 short GUI runs, about 2.5 min each
@@ -174,6 +174,8 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Install capture library
         run: python -m pip install "scapy>=2.5" psutil
+      - name: The guard's own check
+        run: python .github/scripts/text_size_bisect.py --self-check
       - name: Text-size change per commit, interleaved
         run: python .github/scripts/text_size_bisect.py f0c5932 ${{ github.sha }}
 
