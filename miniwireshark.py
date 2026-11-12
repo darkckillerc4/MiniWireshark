@@ -657,15 +657,45 @@ XFT_GUARD_ENV = "MW_FONTCONFIG_GUARD"
 XFT_GUARD_WAS = "MW_FONTCONFIG_WAS"   # FONTCONFIG_FILE before the guard
 
 
-def xft_version():
-    """libXft's version as one number (2.3.4 -> 20304), or None."""
-    try:
-        return int(ctypes.CDLL("libXft.so.2").XftGetVersion())
-    except (OSError, AttributeError, ValueError, TypeError):
-        return None
+XFT_LIB_DIRS = ("/usr/lib", "/usr/lib64", "/usr/local/lib", "/lib",
+                "/lib64")
 
 
-def xft_color_font_guard(environ=None, version=None, folder=None):
+def xft_version(lib_dirs=XFT_LIB_DIRS, ask=True):
+    """libXft's version as one number (2.3.4 -> 20304), or None. Asked of
+    the library itself; audit 2026-11-12 (#14): when that fails, read
+    from the library's file name (libXft.so.2.3.4) in the usual folders
+    and their per-architecture subfolders, so the guard below is not
+    turned off just because the library couldn't be asked."""
+    if ask:
+        try:
+            return int(ctypes.CDLL("libXft.so.2").XftGetVersion())
+        except (OSError, AttributeError, ValueError, TypeError):
+            pass
+    pat = re.compile(r"libXft\.so\.2\.(\d+)\.(\d+)$")
+    found = []
+    for base in lib_dirs:
+        try:
+            subs = [base] + [os.path.join(base, n) for n in os.listdir(base)
+                             if n.endswith("-linux-gnu")]
+        except OSError:
+            continue
+        for d in subs:
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            for n in names:
+                m = pat.match(n)
+                if m:
+                    found.append(20000 + int(m.group(1)) * 100 +
+                                 int(m.group(2)))
+    # several copies: the oldest decides (it may be the one Tk loads)
+    return min(found) if found else None
+
+
+def xft_color_font_guard(environ=None, version=None, folder=None,
+                         record=None):
     """5.3.4 (CI, Ubuntu 22.04): Tk 8.6 with libXft before 2.3.5 crashes
     (segmentation fault) once it has drawn an emoji from a colour font
     such as Noto Color Emoji, installed on every Ubuntu 22.04 desktop,
@@ -674,15 +704,27 @@ def xft_color_font_guard(environ=None, version=None, folder=None):
     For this process (and the ones it starts) fontconfig gets a setup
     that includes the usual one and leaves colour fonts out; emoji then
     come from a plain font or show as a box. -> the setup file, or None
-    when nothing needs doing."""
+    when nothing needs doing. Audit 2026-11-12 (#14): what it did and why
+    goes into `record` (the start's own call keeps it in XFT_GUARD, and
+    log_xft_guard() writes it to the log once the log is open), so a
+    guard that could not do its job is never silent."""
     environ = os.environ if environ is None else environ
+    record = {} if record is None else record
     if IS_WINDOWS or IS_MAC:
+        record.update(state="not needed", why="not X11")
         return None
     mine = environ.get(XFT_GUARD_ENV, "")
     if mine and environ.get("FONTCONFIG_FILE") == mine:
+        record.update(state="on", path=mine, why="set up by the parent")
         return None                     # set up already (a parent did)
     version = xft_version() if version is None else version
-    if version is None or version >= XFT_COLOR_SAFE:
+    record["version"] = version
+    if version is None:
+        # no libXft to be found: Tk can't be drawing with it
+        record.update(state="not needed", why="libXft not found")
+        return None
+    if version >= XFT_COLOR_SAFE:
+        record.update(state="not needed", why="libXft handles colour fonts")
         return None
     base = environ.get("FONTCONFIG_FILE") or "/etc/fonts/fonts.conf"
     path = os.path.join(folder or PATHS.cache, "fonts-no-colour.conf")
@@ -699,10 +741,12 @@ def xft_color_font_guard(environ=None, version=None, folder=None):
     try:
         atomic_write_text(path, text)
     except OSError as e:
+        record.update(state="FAILED", why=f"couldn't write {path}: {e}")
         LOG.warning("colour fonts left on (libXft %s): %s", version, e)
         return None
     environ[XFT_GUARD_WAS] = environ.get("FONTCONFIG_FILE", "")
     environ["FONTCONFIG_FILE"] = environ[XFT_GUARD_ENV] = path
+    record.update(state="on", path=path, why="colour fonts left out")
     return path
 
 
@@ -723,7 +767,32 @@ def env_for_outside(environ=None):
     return env
 
 
-xft_color_font_guard()          # before Tk loads fontconfig
+def log_xft_guard(record=None, log=None):
+    """Write what the start's libXft guard did to the log (it runs before
+    the log is open). A guard that failed is a warning: the window may
+    crash on the first colour emoji. -> the line written, or ""."""
+    record = XFT_GUARD if record is None else record
+    log = LOG if log is None else log
+    if not record.get("state") or record.get("why") == "not X11":
+        return ""
+    v = record.get("version")
+    ver = f"{v // 10000}.{v // 100 % 100}.{v % 100}" \
+        if isinstance(v, int) else "?"
+    line = (f"libXft guard {record['state']} (libXft {ver}): "
+            f"{record.get('why', '')}")
+    late = record.get("tk_loaded") and record["state"] == "on"
+    if late:
+        line += "; Tk was loaded before it ran, so it came too late"
+    if record["state"] == "FAILED" or late:
+        log.warning("%s", line)
+    else:
+        log.info("%s", line)
+    return line
+
+
+# before Tk loads fontconfig; the self-test checks that it ran, and ran first
+XFT_GUARD = {"tk_loaded": "tkinter" in sys.modules}
+xft_color_font_guard(record=XFT_GUARD)
 
 
 def session_is_gz(path):
@@ -85150,6 +85219,65 @@ def t_534_review_fontconfig_guard_stays_inside(ctx):
 
 
 @self_test()
+def t_534_audit_xft_guard_runs_first_and_is_logged(ctx):
+    """Audit 2026-11-12 (#14): the libXft guard ran in this very start,
+    before Tk was loaded, and kept what it did; a guard that can't do its
+    job (its setup file can't be written) is a warning in the log, not
+    silence; a libXft that can't be asked is found by its file name."""
+    assert XFT_GUARD.get("state"), f"the guard never ran: {XFT_GUARD}"
+    assert XFT_GUARD.get("tk_loaded") is False, XFT_GUARD
+    if not (IS_WINDOWS or IS_MAC):
+        if "version" in XFT_GUARD:          # (not set up by a parent)
+            v = XFT_GUARD["version"]
+            assert v == xft_version(), (v, xft_version())
+            if v is not None and v < XFT_COLOR_SAFE:
+                assert XFT_GUARD["state"] == "on", XFT_GUARD
+        if XFT_GUARD["state"] == "on":
+            assert os.environ.get("FONTCONFIG_FILE") == XFT_GUARD["path"]
+    # its setup file can't be written: recorded and logged as a warning
+    blocker = os.path.join(tempfile.mkdtemp(dir=ctx.tmp), "a-file")
+    with open(blocker, "w", encoding="utf-8") as f:
+        f.write("x")
+    rec, env = {}, {}
+    assert xft_color_font_guard(env, 20304, os.path.join(blocker, "sub"),
+                                rec) is None
+    seen = []
+
+    class Keep(logging.Handler):
+        def emit(self, r):
+            seen.append((r.levelno, r.getMessage()))
+    log = logging.getLogger(f"mw-test-xft-{uuid.uuid4().hex[:6]}")
+    log.propagate = False
+    log.setLevel(logging.DEBUG)
+    log.addHandler(Keep())
+    line = log_xft_guard(rec, log)
+    if IS_WINDOWS or IS_MAC:
+        assert rec["state"] == "not needed" and not line and not seen, rec
+    else:
+        assert rec["state"] == "FAILED" and "FONTCONFIG_FILE" not in env
+        assert "couldn't write" in rec["why"], rec
+        assert seen == [(logging.WARNING, line)], seen
+        assert "FAILED" in line and "2.3.4" in line, line
+        # a guard that worked is an info line, and a late one a warning
+        seen.clear()
+        log_xft_guard({"state": "on", "version": 20304,
+                       "why": "colour fonts left out"}, log)
+        log_xft_guard({"state": "on", "version": 20304, "tk_loaded": True,
+                       "why": "colour fonts left out"}, log)
+        assert [lv for lv, _m in seen] == [logging.INFO, logging.WARNING]
+        assert "too late" in seen[1][1], seen
+    # the version from the library's file name, the oldest copy deciding
+    lib = tempfile.mkdtemp(dir=ctx.tmp)
+    arch = os.path.join(lib, "x86_64-linux-gnu")
+    os.makedirs(arch)
+    for n in ("libXft.so.2", "libXft.so.2.3.4", "libXft.so.2.3.4.bak"):
+        open(os.path.join(arch, n), "w").close()
+    open(os.path.join(lib, "libXft.so.2.3.8"), "w").close()
+    assert xft_version((lib,), ask=False) == 20304
+    assert xft_version((os.path.join(lib, "missing"),), ask=False) is None
+
+
+@self_test()
 def t_534_ci_console_never_fails(ctx):
     """5.3.4 CI (Windows cp1252): a character the console can't show is
     written as "?" instead of ending the run, on every start; a UTF-8
@@ -93096,6 +93224,7 @@ def main():
              "stage=%s)", SCRIPT_VERSION, platform.python_version(),
              sys.executable, platform.platform(), is_admin(),
              MW_STAGE or "launcher")
+    log_xft_guard()
     _install_thread_excepthook()
     install_gui_gate()
     apply_feature_switches(SAFE_MODE)
