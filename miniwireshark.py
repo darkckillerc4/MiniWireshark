@@ -654,6 +654,7 @@ def atomic_write_bytes(path, data):
 
 XFT_COLOR_SAFE = 20305          # libXft 2.3.5 handles colour (emoji) fonts
 XFT_GUARD_ENV = "MW_FONTCONFIG_GUARD"
+XFT_GUARD_WAS = "MW_FONTCONFIG_WAS"   # FONTCONFIG_FILE before the guard
 
 
 def xft_version():
@@ -700,8 +701,26 @@ def xft_color_font_guard(environ=None, version=None, folder=None):
     except OSError as e:
         LOG.warning("colour fonts left on (libXft %s): %s", version, e)
         return None
+    environ[XFT_GUARD_WAS] = environ.get("FONTCONFIG_FILE", "")
     environ["FONTCONFIG_FILE"] = environ[XFT_GUARD_ENV] = path
     return path
+
+
+def env_for_outside(environ=None):
+    """The environment for a program started for the person (their file
+    manager, browser or text editor through xdg-open): without the
+    colour-font guard, which is for MiniWireshark's own processes. (5.3.4
+    review: a browser that xdg-open started inherited it, and showed no
+    colour emoji for as long as it ran.)"""
+    env = dict(os.environ if environ is None else environ)
+    mine = env.pop(XFT_GUARD_ENV, "")
+    was = env.pop(XFT_GUARD_WAS, "")
+    if mine and env.get("FONTCONFIG_FILE") == mine:
+        if was:
+            env["FONTCONFIG_FILE"] = was
+        else:
+            env.pop("FONTCONFIG_FILE", None)
+    return env
 
 
 xft_color_font_guard()          # before Tk loads fontconfig
@@ -18663,15 +18682,24 @@ class ProcessMap:
         unnamed."""
         if port is None:
             return None
-        by_local, by_addr = self._tables
-        ent = by_local.get((proto, ip, port))
-        if ent is None:
-            ent = by_addr.get((proto, local_addr_key(ip), port))
+        by_local = self._tables[0]
+        ent = self.lookup_exact(proto, ip, port)
         if ent is None:
             for any_ip in ("0.0.0.0", "::", ""):
                 ent = by_local.get((proto, any_ip, port))
                 if ent is not None:
                     break
+        return ent
+
+    def lookup_exact(self, proto, ip, port):
+        """-> (pid, name) or None: by this exact local address and port
+        only, however the address is written (a closed connection: never
+        by a socket on every address, another program may have the port
+        by now)."""
+        by_local, by_addr = self._tables
+        ent = by_local.get((proto, ip, port))
+        if ent is None:
+            ent = by_addr.get((proto, local_addr_key(ip), port))
         return ent
 
 
@@ -33854,7 +33882,7 @@ def _open_path(path):
         elif sys.platform == "darwin":
             subprocess.Popen(["open", path])
         else:
-            subprocess.Popen(["xdg-open", path])
+            subprocess.Popen(["xdg-open", path], env=env_for_outside())
         return True
     except Exception as e:                           # noqa: BLE001
         # several "Open folder" buttons ignore the answer: leave a trace
@@ -39900,8 +39928,13 @@ class ConnectionsTab(BaseTab):
 
     def values(self, f):
         rh = None if f.domain else self.model.remote_hosts.get(f.remote_ip)
-        to = f.domain or (host_label(rh, bool(self.model.dns.encrypted_seen))
-                          if rh is not None else f.remote_ip)
+        to = f.domain or f.remote_ip
+        if rh is not None:
+            # (review) the address stays next to what it is: in Beginner
+            # this column is the only one that shows it, and every host
+            # with no name read the same ("Contacted directly")
+            to = f"{f.remote_ip} — " + translate_text(host_label(
+                rh, bool(self.model.dns.encrypted_seen)))
         if f.domain and f.domain_conf and f.domain_conf != "Observed":
             to += "  (likely)"
         port = f.remote_port if f.transport in ("TCP", "UDP") else ""
@@ -55049,8 +55082,10 @@ proc ::mw_explicit_fonts {top names} {
             if i < len(active):
                 ent = pm.lookup(f.transport, f.local_ip, f.local_port)
             else:
-                ent = pm.by_local.get((f.transport, f.local_ip,
-                                       f.local_port))
+                # (review) by the address however it is written, as for
+                # an open one: a dual-stack socket says ::ffff:a.b.c.d
+                ent = pm.lookup_exact(f.transport, f.local_ip,
+                                      f.local_port)
             if ent is not None:
                 f.process = program_label(ent)
                 n += 1
@@ -80565,6 +80600,19 @@ def t_r7_attribution_after_address_change(ctx):
     MiniWireshark.attribute_processes(app)
     assert flows[(new_ip, 50000)].process == "vpnapp.exe (pid 77)"
     assert flows[(old_ip, 50000)].process == ""
+    # (review) a closed connection is named by its address however the
+    # table writes it, as an open one is; never by a socket on every
+    # address (another program may have that port by now)
+    for i, (port, pid) in enumerate(((50002, 99), (50001, 88))):
+        f = FlowRecord(10 + i, ("TCP", 10 + i), "TCP", old_ip, port,
+                       "93.184.215.14", 443, m.now())
+        m.flows.archive.append(f)
+        flows[("closed", port)] = f
+    m.set_identity(my_ips={old_ip, new_ip})
+    MiniWireshark.attribute_processes(app)
+    assert flows[("closed", 50002)].process == "dual.exe (pid 99)", \
+        flows[("closed", 50002)].process
+    assert flows[("closed", 50001)].process == ""
     assert local_addr_key("::FFFF:192.168.1.20") == "192.168.1.20"
     assert local_addr_key("fe80::1%12") == "fe80::1"
     assert local_addr_key("2001:DB8:0:0::1") == "2001:db8::1"
@@ -82036,6 +82084,34 @@ def t_hosts_label_fallbacks(ctx):
     tab = types.SimpleNamespace(app=types.SimpleNamespace(
         short_device_name=str), model=m)
     assert RemoteTab.values(tab, ech)[3] == host_label(ech)
+
+
+@self_test()
+def t_hosts_connections_keep_the_address(ctx):
+    """5.3.4 (review of hosts 2): in the Connections table a host with no
+    name shows what it is AND its address (Beginner hides the Remote
+    endpoint column, so the address was nowhere and rows to different
+    hosts read the same), in every language; a named one shows its
+    name."""
+    m = scenario_model(ctx.cfg(), [])
+    r = RemoteHostRecord(ip="5.6.7.8")
+    r.ports, r.protocols = {443}, {"TCP", "TLS"}
+    m.remote_hosts[r.ip] = r
+    tab = types.SimpleNamespace(app=types.SimpleNamespace(
+        short_device_name=str), model=m)
+    f = FlowRecord(1, ("TCP", 1), "TCP", "192.168.1.5", 50000, "5.6.7.8",
+                   443, m.now())
+    label = host_label(r)
+    try:
+        for loc in ("en", "fr", "es"):
+            set_locale(loc)
+            to = ConnectionsTab.values(tab, f)[1]
+            assert to.startswith("5.6.7.8") and \
+                to.endswith(translate_text(label)), (loc, to)
+    finally:
+        set_locale("en")
+    f.domain = "a.example"
+    assert ConnectionsTab.values(tab, f)[1] == "a.example"
 
 
 @self_test()
@@ -84882,6 +84958,56 @@ def t_534_ci_old_xft_leaves_colour_fonts_out(ctx):
     if v is not None and v < XFT_COLOR_SAFE:       # this process too
         assert os.environ.get("FONTCONFIG_FILE") == \
             os.environ.get(XFT_GUARD_ENV), v
+
+
+@self_test()
+def t_534_review_fontconfig_guard_stays_inside(ctx):
+    """5.3.4 (review): the colour-font guard is for MiniWireshark's own
+    processes. A program opened for the person (xdg-open: their browser,
+    file manager or editor) gets the fontconfig setup they had: their own
+    FONTCONFIG_FILE back, or none."""
+    folder = tempfile.mkdtemp(dir=ctx.tmp)
+    for before in ({"FONTCONFIG_FILE": "/etc/their.conf", "X": "1"},
+                   {"X": "1"}):
+        env = dict(before)
+        path = xft_color_font_guard(env, 20304, folder)
+        if IS_WINDOWS or IS_MAC:
+            assert path is None
+            continue
+        assert env["FONTCONFIG_FILE"] == path
+        assert env_for_outside(env) == before, env_for_outside(env)
+    # a FONTCONFIG_FILE of their own, with no guard, is left alone
+    theirs = {"FONTCONFIG_FILE": "/etc/their.conf"}
+    assert env_for_outside(theirs) == theirs
+    if IS_WINDOWS or IS_MAC:
+        return
+    seen = []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            seen.append((cmd, kw))
+    keys = ("FONTCONFIG_FILE", XFT_GUARD_ENV, XFT_GUARD_WAS)
+    saved = {k: os.environ.get(k) for k in keys}
+    real = subprocess.Popen
+    try:
+        for k in keys:
+            os.environ.pop(k, None)
+        os.environ["FONTCONFIG_FILE"] = "/etc/their.conf"
+        xft_color_font_guard(os.environ, 20304, folder)
+        subprocess.Popen = FakePopen
+        assert _open_path(ctx.path("a folder"))
+    finally:
+        subprocess.Popen = real
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    (cmd, kw), = seen
+    assert cmd[0] == "xdg-open", cmd
+    env = kw.get("env")
+    assert env is not None and env.get("FONTCONFIG_FILE") == \
+        "/etc/their.conf" and XFT_GUARD_ENV not in env, env
 
 
 @self_test()
