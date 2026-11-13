@@ -41387,9 +41387,15 @@ class MapTab(BaseTab):
         # the note goes in the legend line under the map (on the canvas
         # it landed on a node in French)
         with contextlib.suppress(tk.TclError, AttributeError):
-            self.legend_lbl.configure(text=translate_text(self.LEGEND) + (
+            src = self.LEGEND + ("  ·  ★ not shown: most devices are new "
+                                 "this hour" if hide else "")
+            shown = translate_text(self.LEGEND) + (
                 "  ·  " + translate_text("★ not shown: most devices are new "
-                                         "this hour") if hide else ""))
+                                         "this hour") if hide else "")
+            self.legend_lbl.configure(text=shown)
+            # given translated: remember the English, or a switch back to
+            # English left the legend in Spanish (Windows CI)
+            _i18n_remember(self.legend_lbl, shown, src)
         if not stars or hide:
             return
         for X, Y, R, key in stars:
