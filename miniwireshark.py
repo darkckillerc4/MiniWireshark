@@ -96174,9 +96174,17 @@ def gt_c12_packet_view(app, ctx):
         pt.show_subview("Packets")
         _gui_pump(root, 1.2)
         line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        vert = pt.vert_pane
+        total, pos = vert.winfo_height(), vert.sashpos(0)
+        need, keep = pt.details_room()
+        # the details get their room, or all but the list's three rows
+        # when the window is too short for both (earlier steps may have
+        # opened bars above the list)
+        assert total - pos >= min(need, total - keep) - 2, \
+            (total, pos, need, keep)
         dh, lh = pt.dtree.winfo_height(), pt.tree.winfo_height()
-        assert dh >= 4 * line, f"packet details {dh} px high (line {line})"
-        assert lh >= 4 * line, f"packet list {lh} px high"
+        assert dh >= 2 * line, f"packet details {dh} px high (line {line})"
+        assert lh >= 2 * line, f"packet list {lh} px high"
     finally:
         root.geometry(geo)
         _gui_pump(root, 0.5)
