@@ -29400,6 +29400,14 @@ Print ¦ Imprimer ¦ Imprimir
 Demo Mode: this is made-up sample data, not your network. ¦ Mode démo : ce sont des données d'exemple inventées, pas votre réseau. ¦ Modo demo: son datos de ejemplo inventados, no su red.
 The page couldn't be opened in your web browser. Save it and open the file to print it. ¦ La page n'a pas pu être ouverte dans votre navigateur. Enregistrez-la et ouvrez le fichier pour l'imprimer. ¦ No se pudo abrir la página en su navegador. Guárdela y abra el archivo para imprimirla.
 Opened in your web browser: print it from there, or choose Save as PDF. ¦ Ouvert dans votre navigateur : imprimez-le depuis celui-ci ou choisissez Enregistrer en PDF. ¦ Abierto en su navegador: imprímalo desde allí o elija Guardar como PDF.
+“%s” starts a fresh live session, so %s will be cleared from view. ¦ « %s » démarre une nouvelle session en direct : %s sera retiré(e) de l'affichage. ¦ «%s» inicia una nueva sesión en directo, así que %s se quitará de la vista.
+Save it first (Session ▾ Save session) if you want to keep it. Continue? ¦ Enregistrez d'abord (Session ▾ Enregistrer la session) si vous voulez le garder. Continuer ? ¦ Guárdelo antes (Sesión ▾ Guardar sesión) si quiere conservarlo. ¿Continuar?
+“%s” stops live capture and replaces what's on screen. Save the current session first if you want to keep it. Continue? ¦ « %s » arrête la capture en direct et remplace ce qui est affiché. Enregistrez d'abord la session en cours si vous voulez la garder. Continuer ? ¦ «%s» detiene la captura en directo y reemplaza lo que hay en pantalla. Guarde antes la sesión actual si quiere conservarla. ¿Continuar?
+the opened capture file ¦ le fichier de capture ouvert ¦ el archivo de captura abierto
+the loaded session ¦ la session chargée ¦ la sesión cargada
+the demo data ¦ les données de démo ¦ los datos de demostración
+The Quick Start Guide walks through five steps with Show me buttons. Demo Mode fills every tab with clearly labelled sample data, apart from your real session. ¦ Le guide de démarrage rapide parcourt cinq étapes avec des boutons « Montrer ». Le mode démo remplit chaque onglet de données d'exemple clairement signalées, à part de votre vraie session. ¦ La guía de inicio rápido recorre cinco pasos con botones «Mostrar». El modo demo llena cada pestaña con datos de ejemplo claramente marcados, aparte de su sesión real.
+Correlated — Two separate observations line up — for example a device looked a name up and connected to the answer a moment later. ¦ Corrélé — Deux observations distinctes concordent — par exemple un appareil a cherché un nom puis s'est connecté à la réponse un instant plus tard. ¦ Correlacionado — Dos observaciones distintas coinciden — por ejemplo, un dispositivo buscó un nombre y se conectó a la respuesta un momento después.
 Review %d new ¦ Revoir %d nouvelles ¦ Revisar %d nuevas
 Review alerts ¦ Passer en revue les alertes ¦ Revisar alertas
 Review new alerts ¦ Passer en revue les nouvelles alertes ¦ Revisar las alertas nuevas
@@ -30503,7 +30511,7 @@ I18N_PATTERNS = [
      "\\1 — {t2} (probable)."),
     (r"(.+) — Possibly (.+)\.", "\\1 — {t2} (possible).",
      "\\1 — {t2} (posible)."),
-    (r"(.+) — (.+)\.", "\\1 — {t2}.", "\\1 — {t2}."),
+    (r"(.+) — (.+)\.", "{t1} — {t2}.", "{t1} — {t2}."),
     (r"MAC: (\S+)  \(private / randomized address\)",
      r"MAC : \1  (adresse privée / aléatoire)",
      r"MAC: \1  (dirección privada / aleatoria)"),
@@ -31014,6 +31022,10 @@ _DHCP_WORDS = (r"(asking for an address|offering an address|accepting the "
                r"offer|declining|confirmed|refused|releasing|asking for "
                r"info)")
 EVENT_PATTERNS = [
+    # crowd test #15: a packet's service with its TCP flags
+    (r"(.+) \(((?:SYN|ACK|FIN|RST|PSH|URG|ECE|CWR)"
+     r"(?:,(?:SYN|ACK|FIN|RST|PSH|URG|ECE|CWR))*)\)", r"{t1} (\2)",
+     r"{t1} (\2)"),
     # 5.3.4 (M16, ST-05, ST-08): feed lines that stayed English
     (r"looked up ([\w.-]+)", r"a cherché \1", r"buscó \1"),
     (r"Looking up ([\w.-]+)", r"Recherche de \1", r"Buscando \1"),
@@ -31348,12 +31360,22 @@ def _i18n_lookup(s, table, loc):
                     if tok in out:
                         sub = g or ""
                         if sub:
-                            # a list ("Router reachable, Internet
-                            # reachable"): each name on its own
-                            sub = _i18n_lookup(sub, table, loc) or (
-                                ", ".join(_i18n_lookup(x, table, loc) or x
-                                          for x in sub.split(", "))
-                                if ", " in sub else sub)
+                            hit = _i18n_lookup(sub, table, loc)
+                            if hit is None and not sub.endswith("."):
+                                # crowd test #15: the catalog holds the
+                                # sentence with its full stop
+                                hit = _i18n_lookup(sub + ".", table, loc)
+                                if hit is not None and hit.endswith("."):
+                                    hit = hit[:-1]
+                                else:
+                                    hit = None
+                            if hit is None and ", " in sub:
+                                # a list ("Router reachable, Internet
+                                # reachable"): each name on its own
+                                hit = ", ".join(
+                                    _i18n_lookup(x, table, loc) or x
+                                    for x in sub.split(", "))
+                            sub = hit or sub
                         out = out.replace(tok, sub)
             return pre + out + post
     # "Title — explanation": both halves known
@@ -31503,6 +31525,14 @@ def translate_event(text):
                     tok = "{t%d}" % i
                     if tok in hit:
                         hit = hit.replace(tok, table.get(g or "", g or ""))
+            g1 = mm.group(1) if mm.groups() else ""
+            if g1 and g1.endswith(" device") and len(g1) > 7 and \
+                    g1 not in table and hit.startswith(g1):
+                # crowd test #15: a maker's device ("{vendor} device")
+                maker = g1[:-7]
+                hit = ({"fr": f"Appareil {maker}",
+                        "es": f"Dispositivo {maker}"}.get(loc, g1) +
+                       hit[len(g1):])
             break
     if hit is not None:
         hit = translate_anonymous_labels(hit, loc)
@@ -40284,7 +40314,7 @@ class WebsitesTab(BaseTab):
         return w.best_assoc
 
     def _values(self, w):
-        who = ", ".join(self.app.short_device_name(k)
+        who = ", ".join(translate_cell(self.app.short_device_name(k))
                         for k in sorted(w.devices)[:3]) or "—"
         if len(w.devices) > 3:
             who += f" +{len(w.devices) - 3}"
@@ -40386,7 +40416,7 @@ class WebsitesTab(BaseTab):
                                              else ("\U0001F512 Encrypted"
                                                    if enc else "Unknown"))
         cats = {w.category for w in members if w.category}
-        who = ", ".join(self.app.short_device_name(k)
+        who = ", ".join(translate_cell(self.app.short_device_name(k))
                         for k in sorted(devs)[:3]) or "—"
         b = sum(w.bytes for w in members)
         best = ""
@@ -41506,7 +41536,7 @@ class RemoteTab(BaseTab):
 
     def values(self, r):
         app = self.app
-        who = ", ".join(app.short_device_name(k)
+        who = ", ".join(translate_cell(app.short_device_name(k))
                         for k in sorted(r.devices)[:3]) or "—"
         names = host_label(r, bool(self.model.dns.encrypted_seen))
         if len(r.domains) > 1:
@@ -45626,7 +45656,8 @@ class PacketsTab(BaseTab):
                 self.time_text(d, prev),
                 app.disp_addr(d["src_ip"], d["src_mac"]),
                 app.disp_addr(d["dst_ip"], d["dst_mac"]), d["proto"],
-                d["length"], d.get("flow_id") or "", d["text"])
+                d["length"], d.get("flow_id") or "",
+                translate_event(d["text"]))      # crowd test #15
         if not self.custom:
             return base
         return base + tuple(self.field_text(d, f) for f in self.custom)
@@ -53806,6 +53837,15 @@ class MiniWireshark:
                 self.tabs["feed"].on_locale()
             with contextlib.suppress(AttributeError, KeyError, tk.TclError):
                 self.tabs["packets"]._validate_expr()       # IP-023
+            # crowd test #15: rows already in these tables stayed in the
+            # language they were added in ("family-nas joined your
+            # network", "High", "New" in the French Alertes)
+            for name in ("timeline", "alerts"):
+                with contextlib.suppress(AttributeError, KeyError,
+                                         tk.TclError):
+                    self.tabs[name].rebuild()
+            with contextlib.suppress(AttributeError, KeyError, tk.TclError):
+                self.tabs["packets"].render()
             with contextlib.suppress(AttributeError, KeyError, tk.TclError):
                 self.tabs["websites"].local.on_locale()     # its cells
             with contextlib.suppress(AttributeError, KeyError, tk.TclError):
@@ -54752,10 +54792,14 @@ proc ::mw_explicit_fonts {top names} {
             what = {"offline": "the opened capture file",
                     "session": "the loaded session",
                     "demo": "the demo data"}[self.data_mode]
+            # crowd test #15: built from translated pieces (the Spanish
+            # "Empezar a observar" question was entirely English)
+            tr = translate_text
             return messagebox.askyesno(
-                action, f"{action} starts a fresh live session, so {what} "
-                f"will be cleared from view.\n\nSave it first (Session ▾ "
-                f"Save session) if you want to keep it. Continue?",
+                action, tr("“%s” starts a fresh live session, so %s will be "
+                           "cleared from view.") % (tr(action), tr(what)) +
+                "\n\n" + tr("Save it first (Session ▾ Save session) if you "
+                             "want to keep it. Continue?"),
                 parent=self.root)
         return True
 
@@ -58930,9 +58974,10 @@ proc ::mw_explicit_fonts {top names} {
     def _confirm_leave_live(self, action):
         if self.data_mode == "live" and self.model.has_data():
             return messagebox.askyesno(
-                action, f"{action} stops live capture and replaces what's on "
-                f"screen. Save the current session first if you want to keep "
-                f"it. Continue?", parent=self.root)
+                action, translate_text(
+                    "“%s” stops live capture and replaces what's on screen. "
+                    "Save the current session first if you want to keep it. "
+                    "Continue?") % translate_text(action), parent=self.root)
         return self._confirm_leave_nonlive(action)
 
     def open_pcap(self):
@@ -96184,6 +96229,71 @@ def gt_c13_print_and_export(app, ctx):
         app.config.set("export.default_dir", old)
     home = os.path.expanduser("~")
     assert d in (os.path.join(home, "Documents"), home), d
+
+
+@gui_test_step("5.3.4 crowd #15: after a language change the Timeline, "
+               "Alerts, packet Info, Help and the Start watching question "
+               "are in French and Spanish")
+def gt_c15_language_leaks(app, ctx):
+    root = app.root
+    eng = re.compile(r"joined your network|got address|\bWARNING\b|"
+                     r"^(High|New|Medium)$|offers remote access|"
+                     r"Secure web browsing|Seen directly in a packet|"
+                     r"Quick Start Guide walks")
+    asked = []
+    real_ask = messagebox.askyesno
+    lang0 = app.config.get("general.language", "English")
+    try:
+        for lang, loc in (("Français", "fr"), ("Español", "es")):
+            app.config.set("general.language", lang)
+            app._apply_runtime_settings()
+            _gui_pump(root, 0.5)
+            for name in ("timeline", "alerts", "packets"):
+                tab = app._select_tab(name)
+                if name == "packets":
+                    tab.show_subview("Packets")
+                _gui_pump(root, 0.8)
+                left = [str(v) for iid in list(tab.tree.get_children())[:400]
+                        for v in tab.tree.item(iid, "values")
+                        if eng.search(str(v))]
+                assert not left, (lang, name, left[:5])
+            for topic in ("Start here", "Evidence marks"):
+                ht = app.open_help(topic)
+                _gui_pump(root, 0.3)
+                body = ht.txt.get("1.0", "end")
+                assert not eng.search(body), (lang, topic, body[:300])
+            # the Start watching question, built from translated pieces
+            messagebox.askyesno = lambda *a, **k: asked.append(
+                (loc, a, k)) and False
+            was = app.data_mode
+            app.data_mode = "demo"
+            try:
+                app._confirm_leave_nonlive("Start watching")
+            finally:
+                app.data_mode = was
+                messagebox.askyesno = real_ask
+            msg = asked[-1][1][1]
+            assert "starts a fresh live session" not in msg and \
+                "Continue?" not in msg, msg
+            assert translate_text("Start watching", loc) in msg, msg
+    finally:
+        messagebox.askyesno = real_ask
+        app.config.set("general.language", lang0)
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.3)
+    assert translate_event("D-Link Corporation device joined your network"
+                           ) == "D-Link Corporation device joined your " \
+        "network"
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        assert translate_event("D-Link Corporation device joined your "
+                               "network") == \
+            "Appareil D-Link Corporation a rejoint votre réseau"
+        assert translate_event("Secure web browsing (SYN,ACK)") == \
+            "Navigation web sécurisée (SYN,ACK)"
+    finally:
+        set_locale(old)
 
 
 # ============================================================================
