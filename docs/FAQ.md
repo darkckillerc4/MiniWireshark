@@ -17,7 +17,7 @@ No. It is MIT licensed.
 ## Privacy
 
 **Does it send my data anywhere?**
-No telemetry. Everything MiniWireshark itself sends (downloads, update checks, health checks, discovery probes, optional lookups) goes through one gate and is listed in the self-traffic ledger in **Settings → Privacy & Lookups**. The kill switch there blocks all of it.
+No telemetry. Everything MiniWireshark itself sends (downloads, update checks, health checks, discovery probes, optional lookups) goes through one gate and is listed in the self-traffic ledger. Open it from **Security → What MiniWireshark sent…** or **Settings → Privacy & Lookups**. The kill switch in either place blocks all of it.
 
 **Does it contact anything by itself?**
 Once a day it asks the official GitHub page for the latest version number: one request to `api.github.com`, with nothing about you. It only ever points you to <https://github.com/darkckillerc4/MiniWireshark/releases>, because other download sites may be fake. Turn it off in **Settings → Updates & Dependencies**; the kill switch and Safe Mode stop it too.
@@ -27,6 +27,34 @@ No. Mail logins, passwords and message bodies are dropped inside the parsers bef
 
 **Can I share a report safely?**
 Use **Export → Network check-up…**: names and addresses are hidden by default. For the full report, turn on redaction when you export: real names and addresses are replaced with documentation-range pseudonyms. Saved stream text is always redacted.
+
+## If you're skeptical
+
+Good. A program that watches your network should earn your trust. [Can I trust MiniWireshark?](TRUST.md) lists every claim with a way to check it. The short answers:
+
+**How do I try it without trusting it with my network?**
+Start it in Demo Mode (`python miniwireshark.py --demo`, or **Try Demo Mode** on the welcome screen). It shows simulated traffic with reserved `.example` names, captures nothing and sends nothing. You can also open a capture file you already have, which needs no capture rights at all.
+
+**Can I read the code before I run it?**
+Yes. It is one plain Python file with no compiled parts. The docstring at the top lists every region in order, and every network send goes through one function, `outbound()`. A self-test fails if any network call in the file skips it.
+
+**How do I know the file wasn't changed?**
+Download it only from the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases) and compare its SHA-256 with the `.sha256` file next to it. [TRUST.md](TRUST.md#1-check-the-download) has the command for each system.
+
+**Does it update itself behind my back?**
+No. It checks GitHub once a day for the latest version number and tells you. It installs an update only when the update is signed with a release key built into your copy; otherwise you download it yourself. Turn the check off in **Settings → Updates & Dependencies**. See [SECURITY.md](../SECURITY.md#where-updates-come-from).
+
+**Why does it download Python packages?**
+It needs Scapy to capture live traffic; other packages are optional. Downloads come only from `python.org` and the Python Package Index, go into its own data folder, and never change the Python you already have. Scapy's file is checked against a fingerprint built into MiniWireshark. Without it, MiniWireshark opens in limited mode, where Demo Mode and capture files still work.
+
+**Why does it ask for administrator rights or a password?**
+Reading raw packets needs them on every system, the same as Wireshark. On Windows, the Npcap driver handles this once it is installed. On Linux and macOS it asks only when you start watching, never just to open the window.
+
+**It was written with an AI assistant. Why should I trust that?**
+Trust the checks, not the author. Each change ships with self-tests (more than 350), runs on Windows, macOS and two Ubuntu versions in [CI](https://github.com/darkckillerc4/MiniWireshark/actions), and passes a privacy check before it can be merged. The maintainer reviews and signs off every release. The release notes list what was *not* tested, too.
+
+**Something here turned out to be false.**
+Please [open an issue](https://github.com/darkckillerc4/MiniWireshark/issues/new/choose), or use private reporting for a security problem (see [SECURITY.md](../SECURITY.md)).
 
 ## It doesn't capture anything
 

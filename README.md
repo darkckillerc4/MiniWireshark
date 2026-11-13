@@ -184,7 +184,7 @@ xvfb-run -a python miniwireshark.py --gui-test    # Linux without a display
 python miniwireshark.py --bench-gui S1 S2         # performance budgets
 ```
 
-Continuous integration runs a syntax check and the self-test on every push and pull request (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)).
+Continuous integration runs on every push and pull request (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)): the self-test on Python 3.8, 3.12 and 3.13, the GUI test on two Ubuntu versions and on Windows, the self-test on macOS, and a privacy check that keeps captures, personal data and keys out of this public repository.
 
 ## Versions and downloads
 
