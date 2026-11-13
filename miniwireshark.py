@@ -11674,9 +11674,14 @@ class NameCache:
     reverse DNS. `sources` remembers where each name came from so a guess
     from reverse DNS never outranks what a device announced itself."""
 
-    def __init__(self):
+    KEEP = 2 * 3600          # audit #4: a name not heard again for 2 h goes
+    MAX = 20000              # was 50,000
+
+    def __init__(self, clock=time.time):
         self.ip_to_name = {}
         self.sources = {}
+        self.seen = {}            # ip -> when its name was last learned
+        self.clock = clock
         self.lock = threading.Lock()
         self.version = 0
 
@@ -11687,6 +11692,8 @@ class NameCache:
         if not name:
             return False
         with self.lock:
+            if ip in self.ip_to_name:
+                self.seen[ip] = self.clock()
             if self.ip_to_name.get(ip) == name:
                 return False
             if self.sources.get(ip) in ("dhcp", "mdns", "nbns") and \
@@ -11694,18 +11701,35 @@ class NameCache:
                 return False
             self.ip_to_name[ip] = name
             self.sources[ip] = source
-            if len(self.ip_to_name) > 50000:
-                for k in list(self.ip_to_name)[:5000]:
+            self.seen[ip] = self.clock()
+            if len(self.ip_to_name) > self.MAX:
+                for k in list(self.ip_to_name)[:self.MAX // 10]:
                     self.ip_to_name.pop(k, None)
                     self.sources.pop(k, None)
+                    self.seen.pop(k, None)
             self.version += 1
             return True
 
     def forget(self, ip):
         with self.lock:
+            self.seen.pop(ip, None)
             if self.ip_to_name.pop(ip, None) is not None:
                 self.sources.pop(ip, None)
                 self.version += 1
+
+    def prune(self, now, keep=()):
+        """Audit #4: names not learned again for KEEP seconds go, apart
+        from the addresses in `keep`. -> the addresses dropped."""
+        with self.lock:
+            old = [ip for ip, t in self.seen.items()
+                   if now - t > self.KEEP and ip not in keep]
+            for ip in old:
+                self.ip_to_name.pop(ip, None)
+                self.sources.pop(ip, None)
+                del self.seen[ip]
+            if old:
+                self.version += 1
+        return old
 
     def get(self, ip):
         return self.ip_to_name.get(ip, "")
@@ -15045,7 +15069,7 @@ class DeviceRegistry:
         r = self._elig.get(ip)
         if r is None:
             r = self._eligible_uncached(ip)
-            if len(self._elig) > 50000:
+            if len(self._elig) > 10000:       # audit #4: was 50,000
                 self._elig.clear()
             self._elig[ip] = r
         return r
@@ -20742,7 +20766,6 @@ class LookupCorrelator:
         # expiry. (review 6) One entry per key: it was one per DNS answer
         # for 30 minutes (41,000 in the soak at minute 20 for 10,000 keys)
         self.order = OrderedDict()
-        self.used = set()         # (device, domain) that led to a connect
 
     def note_resolution(self, device, domain, ip, ts):
         k = (device, ip)
@@ -20765,10 +20788,8 @@ class LookupCorrelator:
         if dq:
             t, dom = dq[-1]
             if 0 <= ts - t <= self.STRONG_WINDOW:
-                self.used.add((device, dom))
                 return dom, "own-recent"
             if ts - t <= self.KEEP:
-                self.used.add((device, dom))
                 return dom, "own-old"
         ipq = self.by_ip.get(ip)
         if ipq:
@@ -20790,8 +20811,6 @@ class LookupCorrelator:
             ipq = self.by_ip.get(ip)
             if ipq and ipq[-1][0] <= t:
                 self.by_ip.pop(ip, None)
-        if len(self.used) > 100000:
-            self.used.clear()
 
 
 # ============================================================================
@@ -22662,7 +22681,7 @@ class NetworkModel:
         self.my_macs = {m.lower() for m in my_macs if m}
         self.local_nets = []
         self.v6_prefixes = []
-        self.cache = NameCache()
+        self.cache = NameCache(self.now)
         self.registry = DeviceRegistry(gateway_ip, self.my_ips, config,
                                        self.now)
         self.registry.my_macs = self.my_macs
@@ -24329,8 +24348,8 @@ class NetworkModel:
             names = self.ip_to_domains.get(ip)
             if names is None:
                 names = self.ip_to_domains[ip] = OrderedDict()
-                if len(self.ip_to_domains) > 60000:
-                    for k in list(self.ip_to_domains)[:6000]:
+                if len(self.ip_to_domains) > 20000:         # was 60,000
+                    for k in list(self.ip_to_domains)[:2000]:
                         self.ip_to_domains.pop(k, None)
             names.pop(key, None)
             names[key] = ts
@@ -24396,9 +24415,9 @@ class NetworkModel:
             self.remote_hosts[pub] = rec
             self._geo_fill(rec)
             self._reputation_fill(rec)
-            if len(self.remote_hosts) > 30000:
+            if len(self.remote_hosts) > self.REMOTE_MAX:
                 for old in sorted(self.remote_hosts.values(),
-                                  key=lambda r: r.last_seen)[:3000]:
+                                  key=lambda r: r.last_seen)[:800]:
                     self.remote_hosts.pop(old.ip, None)
         rec.last_seen = max(rec.last_seen, ts)
         rec.packets += 1
@@ -24789,6 +24808,7 @@ class NetworkModel:
         for f in self.flows.expire(now):
             pass
         self.dns.expire(now)
+        self.forget_aged(now)
         yield "expiry"
         self._check_dns(now)
         self._check_broadcast(now)
@@ -24840,6 +24860,44 @@ class NetworkModel:
             self.dirty_devices.add(key)
         self.registry.events = []
         self._announce_created()
+
+    REMOTE_KEEP = 6 * 3600   # audit #4: remote hosts and their names
+    REMOTE_MAX = 8000        # was 30,000, far above a home network's day
+
+    def forget_aged(self, now):
+        """Audit #4: remote hosts, address -> name lists and learned names
+        were capped by count only, so a day of new sites grew without a
+        plateau. Entries unseen for REMOTE_KEEP (names: NameCache.KEEP)
+        go, except addresses a kept connection, a known device or an
+        unacknowledged alert still refers to. -> how many went."""
+        if abs(now - getattr(self, "_aged_at", 0.0)) < 60:
+            return 0
+        self._aged_at = now
+        ips = []
+        for f in self.flows.all_flows():
+            ips += (f.remote_ip, f.local_ip)
+        for dev in self.registry.by_key.values():      # labelled ones too
+            ips += dev.ipv4s
+            ips += dev.ipv6
+            ips.append(dev.ip)
+        for a in self.alerts.alerts.values():
+            if not a.acknowledged:
+                ips.append(a.refs.get("remote", ""))
+                ips += str(a.subject or "").split("|")
+        keep = {ip for ip in ips if isinstance(ip, str)}   # a loaded session
+        cut = now - self.REMOTE_KEEP
+        old = [ip for ip, r in self.remote_hosts.items()
+               if r.last_seen < cut and ip not in keep]
+        for ip in old:
+            del self.remote_hosts[ip]
+            self.ev_geo.discard(ip)
+        self.dirty_remotes.update(old)             # the table drops the rows
+        doms = [ip for ip, names in self.ip_to_domains.items()
+                if ip not in keep and next(reversed(names.values()), 0) < cut]
+        for ip in doms:
+            del self.ip_to_domains[ip]
+        self.correlator._expire(now)     # without waiting for a new lookup
+        return len(old) + len(doms) + len(self.cache.prune(now, keep))
 
     def _check_dns(self, now):
         rate, n = self.dns.failure_rate(now)
@@ -88399,6 +88457,49 @@ def t_534_c7_arp_memory_pruned(ctx):
     assert reg.ip_macs[old] == {"02:66:00:00:00:02"}
     assert sorted(reg.prune_arp(9000.0)) == sorted([recent, old])
     assert gw in reg.arp_claims and recent not in reg.arp_claims
+
+
+@self_test()
+def t_534_aged_tables_forgotten(ctx):
+    """Audit #4: remote hosts, their names, learned names and lookups are
+    forgotten once unseen for their window on the packet clock; an
+    address a kept connection or an unacknowledged alert refers to
+    stays, and goes once the alert is acknowledged."""
+    m = scenario_model(ctx.cfg(), [])
+    t = m.offline_now = 2e9
+    old, conn, warn, new = ("203.0.113.%d" % i for i in (1, 2, 3, 4))
+
+    def add(ip, ts):
+        m.offline_now = ts
+        m.remote_hosts[ip] = RemoteHostRecord(ip=ip, first_seen=ts,
+                                              last_seen=ts)
+        m.ip_to_domains[ip] = OrderedDict([("x.example", ts)])
+        m.cache.learn(ip, "x.example")
+        m.correlator.note_resolution("", "x.example", ip, ts)
+    for ip in (old, conn, warn):
+        add(ip, t)
+    m.flows.lookup_or_create(("t",), "TCP", "192.168.1.10", 50000, conn,
+                             443, t)
+    m.alerts.alerts["t"] = a = Alert(
+        id="t", kind="reputation", severity="Medium", device_key="",
+        reason="", observed="", interpretation="", possible_explanations="",
+        refs={"remote": warn})
+    assert m.forget_aged(t + 3600) == 0 and len(m.correlator.by_ip) == 0
+    m.forget_aged(t + NameCache.KEEP + 60)                 # names: 2 h
+    assert m.cache.get(conn) and m.cache.get(warn) and not m.cache.get(old)
+    assert old in m.remote_hosts and old in m.ip_to_domains
+    add(new, t + m.REMOTE_KEEP - 60)
+    m.forget_aged(t + m.REMOTE_KEEP + 60)                  # remotes: 6 h
+    assert sorted(m.remote_hosts) == [conn, warn, new], sorted(m.remote_hosts)
+    assert sorted(m.ip_to_domains) == [conn, warn, new]
+    assert old in m.dirty_remotes                          # row removed
+    m.forget_aged(t + m.REMOTE_KEEP + 90)                  # once a minute
+    assert warn in m.remote_hosts
+    a.acknowledged = True
+    m.forget_aged(t + m.REMOTE_KEEP + 200)
+    assert warn not in m.remote_hosts and conn in m.remote_hosts
+    assert not m.cache.get(warn) and m.cache.get(conn)
+    assert set(m.cache.seen) == set(m.cache.ip_to_name)
 
 
 @self_test(needs_source=True)
