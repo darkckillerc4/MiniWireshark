@@ -94,6 +94,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - Printing and saving: the preview of the Network sheet no longer shows its title twice and lists each device on its own lines instead of one run-together paragraph; the preview has a *Print…* button that opens the page in your web browser to print or save as PDF; the sheet and the inventory say when they are demo data; Save and Open dialogs start in your Documents folder instead of the folder MiniWireshark was started from.
 - French and Spanish: after a language change, the rows already in the Timeline and the Alerts tab are shown in the new language; the packet list's Info column, the Start watching question, the Help's Start here and Evidence marks pages, a maker's device in a sentence ("Appareil D-Link …") and "This computer" under *Contacted by* are translated.
 - Help → Troubleshooting now says how to watch on Linux and macOS (your password when watching starts, or sudo; on Linux the one-time `setcap` capture right) and names the real menu path to Diagnostics, in all three languages. Diagnostics has a *Capture rights* line that says what is missing and what to do.
+- The I/O graph draws packets per second, traffic in bits per second and DNS latency as three charts, each with its unit on the axis. Packets per second no longer lie flat at 0 under the traffic line, and the DNS axis no longer shows "0" twice.
 
 **Known limits**
 

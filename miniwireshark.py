@@ -8831,6 +8831,31 @@ DHCPV6_MSG = {1: "looking for an IPv6 address (Solicit)",
               9: "declining an address", 11: "asking for network settings"}
 
 
+def axis_number(v):
+    """A chart axis number with as many decimals as small values need,
+    so neighbouring grid lines never read the same (crowd test #27: a
+    DNS axis from 0 to 0.5 ms read "0" twice)."""
+    v = float(v or 0)
+    if v == 0:
+        return "0"
+    a = abs(v)
+    if a < 1:
+        return f"{v:.2f}"
+    if a < 10:
+        return f"{v:.1f}"
+    return f"{v:,.0f}"
+
+
+def bit_rate(bps):
+    """Bits per second → "0 b/s", "800 b/s", "1.5 kb/s", "12 Mb/s"."""
+    v = float(bps or 0)
+    for unit in ("b/s", "kb/s", "Mb/s"):
+        if abs(v) < 1000:
+            return f"{axis_number(v)} {unit}"
+        v /= 1000
+    return f"{axis_number(v)} Gb/s"
+
+
 def human_rate(bps):
     """Bytes per second → friendly text."""
     bps = float(bps or 0)
@@ -29427,6 +29452,7 @@ the demo data ¦ les données de démo ¦ los datos de demostración
 The Quick Start Guide walks through five steps with Show me buttons. Demo Mode fills every tab with clearly labelled sample data, apart from your real session. ¦ Le guide de démarrage rapide parcourt cinq étapes avec des boutons « Montrer ». Le mode démo remplit chaque onglet de données d'exemple clairement signalées, à part de votre vraie session. ¦ La guía de inicio rápido recorre cinco pasos con botones «Mostrar». El modo demo llena cada pestaña con datos de ejemplo claramente marcados, aparte de su sesión real.
 Correlated — Two separate observations line up — for example a device looked a name up and connected to the answer a moment later. ¦ Corrélé — Deux observations distinctes concordent — par exemple un appareil a cherché un nom puis s'est connecté à la réponse un instant plus tard. ¦ Correlacionado — Dos observaciones distintas coinciden — por ejemplo, un dispositivo buscó un nombre y se conectó a la respuesta un momento después.
 Nothing appears: check the network card at the top, and that watching is started. On Windows, Npcap must be installed. On Linux and macOS, watching needs administrator (root) rights: MiniWireshark asks for your password when watching starts, or you can start it with sudo. To watch without a password on Linux, give Python the capture right once in a terminal: sudo setcap cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v python3)")" (it is then allowed for every program run with that Python). Help / About → MiniWireshark health → Diagnostics… checks all of this: its "Capture rights" line says what is missing. Repair fixes the program's own files; the debug bundle (masked by default) is what to attach when asking for help. ¦ Rien n'apparaît : vérifiez la carte réseau en haut, et que l'observation est lancée. Sous Windows, Npcap doit être installé. Sous Linux et macOS, l'observation demande les droits d'administrateur (root) : MiniWireshark demande votre mot de passe quand l'observation commence, ou vous pouvez le lancer avec sudo. Pour observer sans mot de passe sous Linux, donnez une fois le droit de capture à Python dans un terminal : sudo setcap cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v python3)")" (il vaut alors pour tout programme lancé avec ce Python). Aide / À propos → État de MiniWireshark → Diagnostic… vérifie tout cela : sa ligne « Droits de capture » dit ce qui manque. Réparer corrige les fichiers du programme ; le paquet de débogage (masqué par défaut) est ce qu'il faut joindre pour demander de l'aide. ¦ No aparece nada: compruebe la tarjeta de red de arriba y que la observación está iniciada. En Windows, Npcap debe estar instalado. En Linux y macOS, observar necesita derechos de administrador (root): MiniWireshark pide su contraseña al empezar a observar, o puede iniciarlo con sudo. Para observar sin contraseña en Linux, dé una vez a Python el derecho de captura en un terminal: sudo setcap cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v python3)")" (vale entonces para todo programa que use ese Python). Ayuda / Acerca de → Estado de MiniWireshark → Diagnóstico… lo comprueba todo: su línea «Derechos de captura» dice qué falta. Reparar arregla los archivos del programa; el paquete de depuración (enmascarado por defecto) es lo que hay que adjuntar al pedir ayuda.
+Traffic (bits per second) ¦ Trafic (bits par seconde) ¦ Tráfico (bits por segundo)
 Review %d new ¦ Revoir %d nouvelles ¦ Revisar %d nuevas
 Review alerts ¦ Passer en revue les alertes ¦ Revisar alertas
 Review new alerts ¦ Passer en revue les nouvelles alertes ¦ Revisar las alertas nuevas
@@ -47696,21 +47722,32 @@ class StatisticsView(_SubView):
         colors = [t["accent"], t["good_fg"], t["warn_fg"], t["muted_fg"]]
 
         def draw(_e=None):
+            # crowd test #27: packets/s and bits/s shared one axis with
+            # no unit (packets/s drew as a flat line at 0), and the DNS
+            # axis read "0" twice: one chart per unit, the unit on every
+            # axis label
             c.delete("all")
-            w, h = max(300, c.winfo_width()), max(200, c.winfo_height())
-            top = series[:3]
-            self._io_geom = Charts.line(c, 10, 6, w - 20, h * 0.62 - 10,
-                        [(lab, v, colors[i]) for i, (lab, v) in
-                         enumerate(top)], t, title="Traffic",
-                        fmt=lambda v: f"{v:,.0f}",
-                        xlabels=(fmt_clock(t0) if rows else "",
-                                 fmt_clock(rows[-1]["time"]) if rows
-                                 else ""))
-            Charts.line(c, 10, h * 0.62 + 4, w - 20, h * 0.38 - 10,
+            w, h = max(300, c.winfo_width()), max(240, c.winfo_height())
+            xl = (fmt_clock(t0) if rows else "",
+                  fmt_clock(rows[-1]["time"]) if rows else "")
+            ph = h / 3
+            self._io_geom = Charts.line(
+                c, 10, 6, w - 20, ph - 10,
+                [(series[0][0], series[0][1], colors[0])] if series else [],
+                t, title="Packets per second",
+                fmt=lambda v: axis_number(v) + " " +
+                translate_text("packets/s"), xlabels=xl)
+            Charts.line(c, 10, ph + 2, w - 20, ph - 10,
+                        [(lab, v, colors[i + 1]) for i, (lab, v) in
+                         enumerate(series[1:3])], t,
+                        title="Traffic (bits per second)", fmt=bit_rate,
+                        xlabels=xl)
+            Charts.line(c, 10, 2 * ph + 2, w - 20, ph - 10,
                         [(series[3][0], series[3][1], colors[3])]
                         if series else [], t, title="DNS latency (Full "
-                        "Power)", fmt=lambda v: f"{v:.0f}",
-                        empty="No DNS timings (turn on Full Power)")
+                        "Power)", fmt=lambda v: axis_number(v) + " ms",
+                        empty="No DNS timings (turn on Full Power)",
+                        xlabels=xl)
         c.bind("<Configure>", draw)
         c.bind("<Double-1>", lambda e: self._io_jump(e, first, step))
         self.after_draw = draw
@@ -96361,6 +96398,39 @@ def t_c19_linux_capture_help(ctx):
         if not IS_MAC:
             assert "setcap" in missing and \
                 os.path.realpath(sys.executable) in missing, missing
+
+
+@gui_test_step("5.3.4 crowd #27: the I/O graph draws one unit per chart, "
+               "with the unit on its axis")
+def gt_c27_io_graph_units(app, ctx):
+    root = app.root
+    pt = app._select_tab("packets")
+    pt.show_subview("Statistics")
+    sv = pt.stats
+    sv.kind_var.set("I/O graph")
+    sv.refresh(force=True)
+    _gui_pump(root, 0.5)
+    charts = Charts.chart_data(sv.canvas)
+    units = {}
+    for title, r in charts.items():
+        heads = [h for h in r["header"][1:]]
+        kinds = {"packets" if "packets" in h else "bits" if "bits" in h
+                 else "ms" if "ms" in h else h for h in heads}
+        assert len(kinds) == 1, (title, heads)
+        units[title] = kinds.pop()
+        labels = [r["fmt"](v) for v in (0, 0.125, 0.25, 0.5, 2500.0)]
+        assert len(set(labels)) == len(labels), (title, labels)
+    assert sorted(units.values()) == ["bits", "ms", "packets"], units
+    texts = [str(sv.canvas.itemcget(i, "text"))
+             for i in sv.canvas.find_all()
+             if sv.canvas.type(i) == "text"]
+    assert any(tx.endswith(" b/s") or tx.endswith(" kb/s") or
+               tx.endswith(" Mb/s") for tx in texts), texts
+    assert any(tx.endswith(" ms") for tx in texts), texts
+    assert any(tx.endswith("packets/s") and tx[0].isdigit()
+               for tx in texts), texts
+    assert bit_rate(1500) == "1.5 kb/s" and axis_number(0.25) == "0.25"
+    pt.show_subview("Packets")
 
 
 # ============================================================================
