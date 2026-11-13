@@ -2268,6 +2268,24 @@ def needs_elevation():
     return not has_capture_rights()
 
 
+def capture_rights_line():
+    """5.3.4 crowd test #19: the Diagnostics line that says whether this
+    window may watch live traffic, and the next step when it may not."""
+    if IS_WINDOWS:
+        return ("Npcap installed" if _npcap_present() else
+                "Npcap missing — install it from npcap.com")
+    if has_capture_rights():
+        return "yes" + (" (administrator)" if is_admin() else
+                        " (capture right given to this Python)")
+    if IS_MAC:
+        return ("no — MiniWireshark asks for your password when watching "
+                "starts; or start it with sudo")
+    return ("no — MiniWireshark asks for your password when watching "
+            "starts; or start it with sudo; or once: sudo setcap "
+            "cap_net_raw,cap_net_admin+eip " +
+            os.path.realpath(sys.executable))
+
+
 def has_capture_rights():
     """5.3.4 (LG-09): capture works without root when this Python has the
     raw-socket capability (Linux: `setcap cap_net_raw,cap_net_admin+eip`)
@@ -29408,6 +29426,7 @@ the loaded session ¦ la session chargée ¦ la sesión cargada
 the demo data ¦ les données de démo ¦ los datos de demostración
 The Quick Start Guide walks through five steps with Show me buttons. Demo Mode fills every tab with clearly labelled sample data, apart from your real session. ¦ Le guide de démarrage rapide parcourt cinq étapes avec des boutons « Montrer ». Le mode démo remplit chaque onglet de données d'exemple clairement signalées, à part de votre vraie session. ¦ La guía de inicio rápido recorre cinco pasos con botones «Mostrar». El modo demo llena cada pestaña con datos de ejemplo claramente marcados, aparte de su sesión real.
 Correlated — Two separate observations line up — for example a device looked a name up and connected to the answer a moment later. ¦ Corrélé — Deux observations distinctes concordent — par exemple un appareil a cherché un nom puis s'est connecté à la réponse un instant plus tard. ¦ Correlacionado — Dos observaciones distintas coinciden — por ejemplo, un dispositivo buscó un nombre y se conectó a la respuesta un momento después.
+Nothing appears: check the network card at the top, and that watching is started. On Windows, Npcap must be installed. On Linux and macOS, watching needs administrator (root) rights: MiniWireshark asks for your password when watching starts, or you can start it with sudo. To watch without a password on Linux, give Python the capture right once in a terminal: sudo setcap cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v python3)")" (it is then allowed for every program run with that Python). Help / About → MiniWireshark health → Diagnostics… checks all of this: its "Capture rights" line says what is missing. Repair fixes the program's own files; the debug bundle (masked by default) is what to attach when asking for help. ¦ Rien n'apparaît : vérifiez la carte réseau en haut, et que l'observation est lancée. Sous Windows, Npcap doit être installé. Sous Linux et macOS, l'observation demande les droits d'administrateur (root) : MiniWireshark demande votre mot de passe quand l'observation commence, ou vous pouvez le lancer avec sudo. Pour observer sans mot de passe sous Linux, donnez une fois le droit de capture à Python dans un terminal : sudo setcap cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v python3)")" (il vaut alors pour tout programme lancé avec ce Python). Aide / À propos → État de MiniWireshark → Diagnostic… vérifie tout cela : sa ligne « Droits de capture » dit ce qui manque. Réparer corrige les fichiers du programme ; le paquet de débogage (masqué par défaut) est ce qu'il faut joindre pour demander de l'aide. ¦ No aparece nada: compruebe la tarjeta de red de arriba y que la observación está iniciada. En Windows, Npcap debe estar instalado. En Linux y macOS, observar necesita derechos de administrador (root): MiniWireshark pide su contraseña al empezar a observar, o puede iniciarlo con sudo. Para observar sin contraseña en Linux, dé una vez a Python el derecho de captura en un terminal: sudo setcap cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v python3)")" (vale entonces para todo programa que use ese Python). Ayuda / Acerca de → Estado de MiniWireshark → Diagnóstico… lo comprueba todo: su línea «Derechos de captura» dice qué falta. Reparar arregla los archivos del programa; el paquete de depuración (enmascarado por defecto) es lo que hay que adjuntar al pedir ayuda.
 Review %d new ¦ Revoir %d nouvelles ¦ Revisar %d nuevas
 Review alerts ¦ Passer en revue les alertes ¦ Revisar alertas
 Review new alerts ¦ Passer en revue les nouvelles alertes ¦ Revisar las alertas nuevas
@@ -47874,6 +47893,24 @@ class SourcesTab(BaseTab):
             self.recon.configure(bg=self.t["text_bg"], fg=self.t["text_fg"])
 
 
+# crowd test #19: the Linux capture steps (sudo, or the capture right with
+# setcap) and the exact menu path to Diagnostics
+TROUBLESHOOTING_HELP = (
+    'Nothing appears: check the network card at the top, and that '
+    'watching is started. On Windows, Npcap must be installed. On Linux '
+    'and macOS, watching needs administrator (root) rights: '
+    'MiniWireshark asks for your password when watching starts, or you '
+    'can start it with sudo. To watch without a password on Linux, give '
+    'Python the capture right once in a terminal: sudo setcap '
+    'cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v '
+    'python3)")" (it is then allowed for every program run with that '
+    'Python). Help / About → MiniWireshark health → Diagnostics… checks '
+    'all of this: its "Capture rights" line says what is missing. '
+    "Repair fixes the program's own files; the debug bundle (masked by "
+    'default) is what to attach when asking for help.'
+)
+
+
 # ---- Help --------------------------------------------------------------------
 # ---- Help topics (5.1.2 F7) ----------------------------------------------------
 # Every topic: title, group, body (text, or a function of the app for the
@@ -47992,12 +48029,7 @@ HELP_USING = (
      "after a while; warnings stay until closed. The ✉ button in the "
      "status bar keeps the last 50.", (("Messages", "app", "msg_btn"),)),
     ("Troubleshooting",
-     "Nothing appears: check the network card at the top, and that "
-     "watching is started. On Windows, Npcap must be installed; on Linux "
-     "and macOS capturing needs permission. Help → MiniWireshark health → "
-     "Diagnostics checks all of this and says what to do; Repair fixes "
-     "the program's own files; the debug bundle (masked by default) is "
-     "what to attach when asking for help.",
+     TROUBLESHOOTING_HELP,
      (("Diagnostics", "do", "open_diagnostics"),)),
     ("Kill switch",
      "Settings → Privacy → Kill switch. " + KILL_SWITCH_EFFECT, ()),
@@ -62947,6 +62979,7 @@ class DiagnosticsWindow:
                                       if nt[1] else "—")(
                 process_hit_rate(m)),
             f"Capture backend     {backend}",
+            "Capture rights      " + capture_rights_line(),
             "Npcap/libpcap       " + ("Npcap present" if IS_WINDOWS and
                                        _npcap_present() else
                                        "Npcap MISSING" if IS_WINDOWS else
@@ -96294,6 +96327,40 @@ def gt_c15_language_leaks(app, ctx):
             "Navigation web sécurisée (SYN,ACK)"
     finally:
         set_locale(old)
+
+
+@self_test()
+def t_c19_linux_capture_help(ctx):
+    """5.3.4 crowd test #19: the Troubleshooting help gives the Linux
+    steps (password, sudo, the setcap capture right), names the menu path
+    to Diagnostics by its real labels, and is in French and Spanish;
+    Diagnostics has a "Capture rights" line with the next step."""
+    topic = next(t for t in help_topics() if t["title"] == "Troubleshooting")
+    body = topic["body"]
+    for word in ("sudo", "setcap cap_net_raw,cap_net_admin+eip",
+                 "Capture rights"):
+        assert word in body, word
+    path = [translate_text(x) for x in ("Help / About",
+                                        "MiniWireshark health")]
+    assert " → ".join(path) + " → Diagnostics…" in body, body
+    for loc in ("fr", "es"):
+        t = translate_lines(body, loc)
+        assert t != body and "setcap" in t, (loc, t[:80])
+        assert translate_text("MiniWireshark health", loc) in t, loc
+    line = capture_rights_line()
+    assert line, line
+    real = (globals()["has_capture_rights"], globals()["is_admin"])
+    try:
+        globals()["has_capture_rights"] = lambda: False
+        globals()["is_admin"] = lambda: False
+        missing = capture_rights_line()
+    finally:
+        globals()["has_capture_rights"], globals()["is_admin"] = real
+    if not IS_WINDOWS:
+        assert missing.startswith("no — ") and "sudo" in missing, missing
+        if not IS_MAC:
+            assert "setcap" in missing and \
+                os.path.realpath(sys.executable) in missing, missing
 
 
 # ============================================================================
