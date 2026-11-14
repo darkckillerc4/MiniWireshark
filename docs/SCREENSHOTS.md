@@ -1,8 +1,10 @@
 # Screenshots
 
-Every tab of MiniWireshark 5.1.2, taken in **Demo Mode**: the data is simulated and every name is a reserved `.example` name. Nothing was captured.
+Every tab of MiniWireshark **5.3.4**, plus the screens new in 5.3.4, taken in **Demo Mode** at 1440×900. The data is simulated and every name is a reserved `.example` name. Nothing was captured.
 
-The pictures follow your GitHub theme: switch between light and dark to see both. All 28 files are in [`assets/screens/`](assets/screens/).
+The pictures follow your GitHub theme: switch between light and dark to see both. All 34 files are in [`assets/screens/`](assets/screens/). To take your own, start `python miniwireshark.py --demo` and look around; `--gui-shots DIR` photographs every tab of a synthetic network for developers.
+
+**New in 5.3.4:** [Story mode](#story-mode) · [Unusual activity](#unusual-activity) · [Guided questions](#guided-questions)
 
 ## Dashboard
 
@@ -128,4 +130,33 @@ Built-in guides, a glossary and the Quick Start.
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/screens/dark-help.png">
   <img src="assets/screens/light-help.png" alt="Help tab, demo data" width="100%">
+</picture>
+
+## New in 5.3.4
+
+### Story mode
+
+The Timeline told as a story: what changed, day by day, in plain sentences, with repeats grouped together.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screens/dark-story.png">
+  <img src="assets/screens/light-story.png" alt="Timeline in Story mode, demo data" width="100%">
+</picture>
+
+### Unusual activity
+
+At the top of the Security tab. Each device is compared with what it usually does, and anything odd is shown with the worrying and the innocent reading side by side. Here, in the demo, nothing is unusual.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screens/dark-unusual.png">
+  <img src="assets/screens/light-unusual.png" alt="Security tab with the Unusual activity section, demo data" width="100%">
+</picture>
+
+### Guided questions
+
+Seven questions, such as *Why is my Internet slow?*, *Is it my Wi-Fi or the Internet?* and *Why does my call stutter?* Each explanation is ranked Likely, Possible or Unlikely, with the evidence for and against it. When it can't tell from this computer, it says so.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/screens/dark-investigate.png">
+  <img src="assets/screens/light-investigate.png" alt="Why is my Internet slow? investigation window, demo data" width="100%">
 </picture>

@@ -27,6 +27,13 @@ concurrency:
 
 jobs:
   release:
+    # (security review) "Run workflow" can pick any branch: only main may
+    # publish, sign with MW_RELEASE_KEY and push the version index. The
+    # environment lets the owner keep MW_RELEASE_KEY as an environment
+    # secret with a deployment-branch rule of main only (Settings ->
+    # Environments -> release); until then the repository secret is used
+    environment: release
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -35,6 +42,9 @@ jobs:
       - name: Publish and record
         env:
           GH_TOKEN: ${{ github.token }}
+          # signs the release (miniwireshark.manifest.json) only when the
+          # owner has added this secret; without it nothing changes
+          MW_RELEASE_KEY: ${{ secrets.MW_RELEASE_KEY }}
         run: python3 .github/scripts/release_current.py ${{ inputs.dry_run && '--dry-run' || '' }}
       - name: Commit the version index
         if: ${{ !inputs.dry_run }}
@@ -43,4 +53,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898237+github-actions[bot]@users.noreply.github.com"
           git commit -am "Record release $(grep -oP '^SCRIPT_VERSION = "\K[^"]+' miniwireshark.py) in the version index"
+          git pull --rebase
           git push

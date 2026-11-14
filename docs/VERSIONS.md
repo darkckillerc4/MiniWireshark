@@ -16,14 +16,14 @@ Every MiniWireshark release is a single Python file. The table lists each archiv
 | 2.0.0 | [v2.0.0](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v2.0.0) | 7,267 | `950c342063a9c79026836fade381cd4b9abadfaf62f182f51f5ac6872c2879e8` | [`legacy/`](../legacy/miniwireshark-2.0.0.py) |
 | 1.x | [v1.0.0](https://github.com/darkckillerc4/MiniWireshark/releases/tag/v1.0.0) | 2,726 | `01c01cf7d954f71e0e6e4cfeef4fd5cb47699e44226fbd0cfab289058116ebf0` | [`legacy/`](../legacy/miniwireshark-1.0.0.py) |
 
-The checksums match the owner's offline archive (`All_MiniWireshark_Version`).
+The checksums match the original release files.
 
 - Versions 1.x and 2.0.0 come from before this repository's history; their files are in [`legacy/`](../legacy/).
 - Every other version is taken straight from the listed commit.
 
 ## How the releases are published
 
-All ten versions are published on the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases), each with its `.py` file and a `.sha256` file. 5.1.2 is marked *latest*; 4.0.0-dev and 5.1.2-rc.5 are pre-releases.
+Every version in the table is published on the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases), each with its `.py` file and a `.sha256` file. The row marked *latest* is the one GitHub shows as latest; rows marked *pre-release* never become latest.
 
 They were created by the **Publish archived releases** workflow, which only runs when started by hand:
 

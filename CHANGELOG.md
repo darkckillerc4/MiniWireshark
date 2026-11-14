@@ -2,6 +2,118 @@
 
 All notable changes to MiniWireshark. Versions follow `MAJOR.MINOR.PATCH`; each release is one `.py` file attached to its [GitHub release](https://github.com/darkckillerc4/MiniWireshark/releases). Checksums are in [docs/VERSIONS.md](docs/VERSIONS.md).
 
+## [5.3.4] — 2026-11-04
+
+A medium release that makes MiniWireshark safer, easier to start and easier to understand. Every finding of the 5.2.3 security audit is fixed in the code (four of the fixes still need a check on real hardware: a Windows PC, a Mac and a real Wi-Fi roam), new screens explain your network to a beginner, and the largest bug campaign so far ran before, during and after the new features.
+
+**Security and privacy**
+
+- **Administrator rights only when needed.** On Linux and macOS, MiniWireshark no longer starts as administrator (root). It asks for your password when capture starts, not at all when the computer already allows capture, and carries on without capture if you say no. The demo and the help never ask.
+- **Your files stay yours.** The data folder is closed to other people on the computer, and a folder that belongs to someone else is not used. There is no shared temporary folder any more. Another user can no longer swap the saved copy that speeds up starting, the update rollback copy or the private packages to run their own code.
+- **A new install asks first.** It no longer trusts the first network it sees or starts Active Scanning by itself.
+- **History does what it says.** "Session only" history is really deleted when you close the window. "Delete ALL history" also removes the backups and the saved packet files.
+- **Passwords stay out of everything.** Logins, form contents and the private parts of web addresses are hidden in packet details, saved conversations, CSV files and anything you copy, whatever the port. A new warning, *Login sent without encryption*, says who signed in and where, never the password.
+- **A fake router is caught.** When a second device claims to be your router, a DANGER alert appears, even if the fake one answers much faster. An IPv6 announcement from another device that tries to take over your network is flagged.
+- **The kill switch stops everything.** Package downloads now go through the same gate, so the kill switch stops them too. Device names are looked up only on your own network. Demo Mode downloads nothing. The download list waits for your answer instead of counting down.
+- **Updates now come only from the official GitHub page, checked once a day; you can turn it off.** Fake download sites copy MiniWireshark, so the update check asks only [github.com/darkckillerc4/MiniWireshark](https://github.com/darkckillerc4/MiniWireshark/releases), follows no link off GitHub, and only ever shows that page. It sends one request to `api.github.com` and nothing about you. Another source still works if you type one, but it is called *unofficial* everywhere. Turn the check off in **Settings → Updates & Dependencies**; the kill switch, Safe Mode and working offline stop it too.
+- **Connected helpers:** a Pi-hole or AdGuard Home certificate is checked before the password is sent.
+- **Windows:** the Npcap installer is no longer refused by its own signature check. **macOS:** an apostrophe in a folder name can't break the administrator prompt, and Wi-Fi is found without Apple's removed `airport` tool.
+- **Help → About** shows the version, the MIT licence and the Wireshark trademark notice.
+
+**New features**
+
+- **Ready?** The Welcome Center shows one list: Python, capture driver, capture permission, network card, data folder, history, signed updates and what leaves this computer. Each line says whether it is ready, with a fix button where one exists. `--boot-check` prints the same list, so the two never disagree.
+- **Story mode.** The Timeline can tell what changed in plain sentences, day by day, newest first. Repeats are folded ("Phone left and came back 6 times"), and a line marks what is new since you last looked. A Dashboard card says how many changes are waiting. A traffic spike on this computer names the program: "At 14:02 chrome.exe on this computer sent 80.0 MB in one minute".
+- **Better device names.** Apple model codes become product names ("MacBook Pro"), and DHCP clues suggest when two entries are probably the same device. When the evidence disagrees, the device card says "But:". On a test set of 65 devices, 64 get the right kind.
+- **A baseline that knows day from night.** Each device has a day and a night profile, starts from what is normal for its kind, and is judged after 5 minutes instead of 15. What it learned more than 14 days ago is forgotten. The device card says what it has learned so far. A new alert, *New service used*, appears when a one-job device suddenly reaches a service it never used.
+- **Unusual activity** at the top of the Security tab: one card for each unusual thing, with *Could be a problem* and *Could be normal* side by side, what was seen and one next step. A Dashboard card opens it.
+- **Snooze an alert** for 1 hour, 1 day or until tomorrow, for one device or for all. A DANGER alert can be snoozed for a day at most, and the Alerts tab says how many alerts are held back.
+- **Seven guided questions instead of two.** New: *Is my DNS working?*, *Is IPv6 working?*, *Why can't this device connect?*, *Is it my Wi-Fi or the Internet?* and *Why does my call stutter?* Each lists the likely causes with the evidence for and against, never a verdict, and says "Can't tell from here" when it can't. They are in `Ctrl+K`, the Alerts tab and **Health → More questions…**
+- **Calls.** A Calls card under Health shows how many packets video and voice calls lose and how uneven they arrive, read from packet headers only, never the call itself. It says so when a call app can't be measured.
+- **Network check-up.** **Export → Network check-up…** writes one page in plain English: what is ready, what changed, unusual activity, the seven questions and your devices. Names and addresses are hidden unless you turn that off. Print it, or save it as PDF from the browser.
+- **Notifications while minimised** (off until you turn them on in **Settings → Alerts → Where alerts appear**). The window title counts new DANGER alerts, the taskbar button flashes on Windows, and an optional silent Windows notification appears at most once a minute. It names no device unless you ask, and never shows an address.
+- **Local services.** **Websites → Local services** lists the programs on this computer that wait for connections: the port, the program, what it probably is ("Web app in development" for 3000 or 5173, printing for 631, PostgreSQL for 5432) and who can reach it: *Only this computer can reach it* or *Other devices on your network can reach it*. Double-click a web app, or press **Open in browser**, to open it at 127.0.0.1. That is listed in the self-traffic ledger and the kill switch stops it. When the list can't be read without administrator rights, it says so.
+- **Your own blocklist.** Load a text file of addresses, ranges or website names from the Security tab (**Your own blocklist…**). It stays on your computer and is never downloaded. Private addresses and entries that are too wide are refused, with the reason.
+- **Command line.** `--help` and `--version` work. An unknown switch or a missing value ends with a one-line explanation. `--self-test NAME` runs one test. Starting without a screen no longer forces Safe Mode next time.
+- **Clearer words.** A filter you type is said in words under the box. The Beginner view says what happened ("asked the network which device has 192.168.1.1") instead of naming ARP, QUIC or MAC, and calls a MAC a hardware address. Grey text meets the WCAG AA contrast level, so it is easier to read. On Windows the title bar turns dark with the dark theme. Everything new is in French and Spanish.
+
+**Speed and memory**
+
+- **Faster start on Windows.** The window now starts from the saved compiled copy, as on Linux and macOS. On a Windows PC the first start went from about 14 to under 5 seconds, and the window's memory from about 440 to about 220 MB.
+- Packets are analysed about a fifth faster (69 instead of 87 microseconds each on the home test network).
+- When a live capture can't keep up, deep analysis pauses and packets are only counted, with a plain line saying so. It comes back after 5 calm seconds.
+- Memory stays flatter over long runs. In an 80-minute stress replay it grows 5.3 MB an hour after the first hour (it was 7.5), and no freeze is longer than half a second. Past 500 departed devices, the oldest unnamed ones leave memory.
+- On Windows the capture driver gets a bigger buffer, so short bursts lose fewer packets.
+- *Compare sessions* over 90 days of history takes about 60 ms instead of 4.9 seconds.
+
+**Fixes**
+
+- The Timeline's Time column makes room for Story mode ranges such as "22:52–23:07", which were cut off at larger text sizes.
+- The Security page no longer repeats its "What is this?" heading: each refresh left one more copy on the Unusual activity line (in every language the page had been shown in).
+- Switching to French or Spanish and back leaves every English label as it was. Some came back as another word with the same translation ("Find" as "Search", "Kind:" as "Type:", "Took" as "Duration"). Open device and alert cards change language too.
+- Nothing is kept from one right-click menu, refresh or language change to the next: each popup menu, each pointer movement over Settings, each settings change and each restyle of the state line or an empty table's button kept a little more memory until the window closed.
+- Damaged or hostile capture, session and settings files end with a message, never a crash or runaway memory. A session file that would unpack past 256 MB is refused.
+- Two copies in one folder: a busy database is no longer taken for a damaged one, session numbers never clash, and each crash journal belongs to one copy.
+- Windows 11 24H2 hiding Wi-Fi details while Location is off, and German Windows output, are read correctly. MiniWireshark never turns Location on.
+- Blocklists with ranges inside ranges, and IPv6 ranges, now match. *Why is my Internet slow?* no longer blames the network for packets the capture itself missed.
+- A sleep, a clock change or daylight-saving time no longer restarts the capture, silences alerts or empties the history. A "#" or accents in the data folder name are fine.
+- The two packet decoders now agree on unusual packets (296 disagreements fixed). A million damaged packets in a row raise no error.
+- Every tab, dialog and settings page fits from 1024×768 to 1920×1080 in all three languages, both themes and four text sizes (the layout check found 51 kinds of problem; now none).
+- Errors that used to vanish are logged or shown. The Dashboard and Health always agree. A device has one name everywhere.
+- History on a network folder opens. A program on this computer keeps its name when an old connection ends.
+- **Ubuntu 22.04:** the window no longer crashes while it opens. Ubuntu 22.04's font library crashes Tk when it draws a colour emoji; MiniWireshark now leaves colour fonts out there, so emoji show in plain form.
+- **Repair's quick self-test** takes about 20 seconds instead of up to 6 minutes. It used to run nearly the whole self-test (344 tests at the time). It now runs 62: the core checks, plus the tests for each part Repair looks at (program components, data folder, history database, capture, settings file, update checks). It no longer checks the program's own code, layouts or translations, because Repair can't change those. `--self-test` still runs everything.
+- A Windows console with an old code page no longer stops MiniWireshark with a text error; a character it can't show is printed as "?".
+- On a small screen, an Inspector switched on in Settings now makes room for the tabs when the window opens narrow, not only when you make the window narrower.
+- A text-size change is quicker: the tables, the rows of buttons and the scrolling pages on tabs you can't see are fitted when you open their tab.
+- When your computer's address changes (another Wi-Fi network, a VPN switched on), a connection from the old address is no longer named after a different program that happens to use the same port number now. It is left without a program name.
+- The search results window opens under the search box instead of over the tabs, takes the keyboard, and closes with Escape or a click elsewhere; the search box gets its text back selected, so typing replaces it.
+- Search counts what it lists (it said "0 result(s)" over a list of results), includes the Settings, Health and Help matches the list under the box shows, and ignores hyphens and spaces, so "wifi" finds "Wi-Fi signal (this computer)".
+- Settings takes the keyboard when it opens, so Escape closes it. The footer says "No changes yet" until you save something, and closing with unsaved changes asks "Save your changes before closing?", where Yes saves them. Changing Beginner or Advanced in the header no longer shows up in Settings as an unsaved change. A ticked checkbox shows a tick instead of a cross, which looked like "no".
+- Ctrl+K knows the tabs by their names ("happening" finds the Happening tab), names every settings entry "Settings › …" with Settings itself first, says when nothing matches, and closes on a click elsewhere. Drop-down lists, number boxes and Dashboard cards show a clear ring when they have the keyboard.
+- A rare crash ("Tcl_AsyncDelete: async handler deleted by the wrong thread") can no longer happen when the last piece of a closed window is let go by a background task.
+- After an update that didn't start is rolled back, the start carries on: the loading screen and the Welcome Center say what happened. A message box used to stop the start until you clicked OK.
+- Opening a packet from the packet history during a busy capture no longer freezes the window for up to 3 seconds.
+- **Ubuntu 22.04:** if MiniWireshark can't leave colour fonts out, the log now says so (it said nothing, and the window could crash). It also finds the font library's version from its file name when it can't ask the library.
+- A connection is named after its program even when the system writes this computer's address in another IPv6 form, such as `::ffff:c0a8:114`.
+- The kill switch is the same everywhere: ticking it in the self-traffic ledger ticks it in an open Settings window too (without "unsaved changes"), turning it off from the banner clears the ledger's box, and the banner, Settings, Help and Ready? all say the same sentence about what it stops. An empty ledger says "Nothing sent or blocked yet."
+- The Dashboard and the Security page no longer say "Nothing unusual right now" while the Alerts tab has open warnings; they say how many warnings need a look.
+- The Timeline's counter counts the events it lists (it could say "0 events this session" over a list of events), and an event no longer appears twice.
+- The Story is written again as soon as the data it tells has changed, so its count matches the Dashboard instead of lagging up to a minute behind.
+- The Health verdict says "Partly checked" and names what was not checked yet, instead of "Healthy" over rows that all say Unknown. "Why is it slow?" now agrees with the Health rows about the router and the Internet.
+- A weak Wi-Fi signal is called the "likely culprit" only when slowness was actually measured; otherwise it is "worth a look". *Is it my Wi-Fi or the Internet?* says it timed how fast connections open, not download speed.
+- Health says why instead of showing a bare "—" (network card, IPv6 prefix, why this card), and the greyed "Run checks now" button says why when you point at it.
+- The Dashboard's time window (now called "Time window") sets the period of the "Who is using the Internet?" answer too, and a chart longer than the data says how much data there is.
+- The Packets tab's "in memory" count stays current while the display is paused, so it matches Statistics and the I/O graph.
+- The Devices tab explains its three ways of saying how sure it is: "Device evidence" (is it a real device, with the score each level needs), the "Evidence" marks, and "Likely" or "Possibly" before a kind.
+- *Start watching* on a computer that can't capture no longer clears the demo or the opened file first: it keeps what is on screen and says why it can't watch, with a Repair button. After the demo ends, the status line no longer says Demo Mode.
+- *Clear and start fresh* (Ctrl+L) and *New session* now ask before they wipe the session ("Ask before clearing data" is on by default), say whether watching carries on, and whether Undo is possible. Saying No to New session no longer stops watching.
+- Alerts now use a device's current name: a renamed device, or one whose name is learned later, is renamed in the Alerts tab too, and this computer is called "This computer" instead of its address or maker. A rule stored with *Expected* names the device and service instead of a raw key such as "02:00:5e:10:00:10|SSH". A device without a name no longer reads "192.168.50.40 got address 192.168.50.40 from DHCP".
+- Devices without a name of their own can be told apart in alerts and the Timeline: "Device using a private Wi-Fi address (192.168.1.77)" instead of the same words for each, translated inside French and Spanish sentences.
+- Packets tab: the packet details keep room for a few lines in a short window instead of shrinking to their heading; a filter that hides the packet shown in the details empties them; *Pause display* and a filter that matches nothing say so next to the count; the Expert view says why it is empty in Full Power; the Protocol hierarchy headings sit over their own numbers again (they were one column off).
+- Printing and saving: the preview of the Network sheet no longer shows its title twice and lists each device on its own lines instead of one run-together paragraph; the preview has a *Print…* button that opens the page in your web browser to print or save as PDF; the sheet and the inventory say when they are demo data; Save and Open dialogs start in your Documents folder instead of the folder MiniWireshark was started from.
+- French and Spanish: after a language change, the rows already in the Timeline and the Alerts tab are shown in the new language; the packet list's Info column, the Start watching question, the Help's Start here and Evidence marks pages, a maker's device in a sentence ("Appareil D-Link …") and "This computer" under *Contacted by* are translated.
+- Help → Troubleshooting now says how to watch on Linux and macOS (your password when watching starts, or sudo; on Linux the one-time `setcap` capture right) and names the real menu path to Diagnostics, in all three languages. Diagnostics has a *Capture rights* line that says what is missing and what to do.
+- The I/O graph draws packets per second, traffic in bits per second and DNS latency as three charts, each with its unit on the axis. Packets per second no longer lie flat at 0 under the traffic line, and the DNS axis no longer shows "0" twice.
+
+**Known limits**
+
+- **Changing the text size on Windows is slow.** It takes about 0.4 seconds on the test machine, and the window doesn't answer for about a tenth of a second while it happens (the goal is 0.1 seconds; on Linux it is well under that). The reason: on Windows every part of the window is its own small system window, and when the shared fonts change, all of them (about 700) are measured and drawn again. Making this fast needs a change to how the window shares its fonts, planned for a later release.
+- **Not re-tested on a real PC for this release: long-run memory, thread and handle growth on Windows, and the network-card pick with a VPN connected.** The last real 8-hour run was on an older build. On that build memory grew by about 8–9 MB an hour, Python threads went from 13 to 19, system threads from 15 to 24 and handles from 318 to 507. Changes made since then are meant to stop this growth: each background job runs only one at a time, a helper program that hangs is ended together with anything it started, and finished helper programs are closed properly. These changes are checked by automated tests on Linux only, not on a Windows PC, so this is untested, not fixed. The evidence that does exist is the GUI test step "round 8: 500 rounds of the periodic jobs in fast time" (`gt_r8_long_run_fast_time`). It runs the network check, capture start, stop and restart, the programs table, the Wi-Fi check, the update check and the screen refresh 500 times, with helpers that hang, fail or are slow. It then checks that threads, open files and helper processes are back to where they started. It uses a fake capture in place of Npcap, and it does not show how memory behaves over hours. The soak script (`.github/scripts/soak.py`) replays saved packets and never opens Npcap, so it does not cover live capture either. Its "blocks" figure counts memory blocks handed out by Python's small-object allocator (pymalloc), not objects.
+
+- **Memory still grows over many hours.** In a 24-hour fast replay that kept meeting new websites, memory grew from about 80 to about 335 MB. Its lists of sites and names have a size limit but no age limit. A replay with only known sites grows about 5 MB an hour after the first hour.
+- **Not re-tested on a real PC for 5.3.4:** memory, threads and handles over an 8-hour capture on Windows, and the network-card pick with a real VPN switched on. These were checked only in replays and with simulated network cards.
+- **macOS and Linux** fixes were checked in the automated tests (CI) only, not on a real Mac or Linux desktop. The window test does not run on macOS or on Python 3.8.
+- **Two messages at start still wait for a click:** "Administrator required" on Windows when the administrator prompt is refused, and "Startup error" when the window can't open. Both end the program, so nothing else waits behind them. The operating system's own password or administrator prompt also waits for your answer.
+- **The text-size speed check on Windows is loose.** The GUI test now judges the middle of its six runs, not the quickest, but on Windows it allows 600 ms, about 1.45 times the slowest test machine's usual 414 ms, so a smaller slowdown there passes. A second check compares with an older, slower version on the same machine and fails above 0.80 of it (measured 0.65 to 0.73).
+- **The network-card pick on Windows** now prefers the card that Windows' own routing uses (it changes the order of the cards, it doesn't only log). It knows the common VPN cards by name, but may not know every VPN product's name.
+
+**Not in this release**
+
+- Device fingerprints from DHCP request lists ship without built-in rows until real captures of your own devices are available.
+
+Tested on Python 3.8, 3.12 and 3.13 (more than 350 self-tests) and with 67 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed.
+
 ## [5.2.3] — 2026-10-24
 
 A reliability release: capture starts without freezing, devices are identified correctly on PCs with VPN and virtual adapters, and copies of different versions can share a folder safely.
@@ -87,7 +199,8 @@ Layout and loading bug campaign. A crawler opened every tab, view, dialog and se
 
 - The original "super noob-friendly" single-file packet sniffer. It handles elevation, dependency and driver installs, network-card choice, LAN discovery (ARP, mDNS, SSDP), self-healing capture and a paced plain-English feed.
 
-[Unreleased]: https://github.com/darkckillerc4/MiniWireshark/pull/1
+[5.3.4]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.3.4
+[5.2.3]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.2.3
 [5.1.2]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.1.2
 [5.0.2]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.0.2
 [5.0.1]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.0.1

@@ -1,6 +1,6 @@
 # Contributing to MiniWireshark
 
-Thanks for helping. A few rules keep a 66,000-line single-file app healthy.
+Thanks for helping. A few rules keep an 89,000-line single-file app healthy.
 
 ## House rules
 

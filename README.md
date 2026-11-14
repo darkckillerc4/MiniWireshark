@@ -28,10 +28,13 @@ Under the beginner view is a real analysis workstation, with packet dissection, 
 
 - [Highlights](#highlights)
 - [Screenshots](#screenshots)
+- [Download](#download)
 - [Quick start](#quick-start)
 - [Documentation](#documentation)
 - [Requirements](#requirements)
 - [Privacy and safety](#privacy-and-safety)
+- [Your data and uninstalling](#your-data-and-uninstalling)
+- [Troubleshooting](#troubleshooting)
 - [Testing](#testing)
 - [Versions and downloads](#versions-and-downloads)
 - [Project layout](#project-layout)
@@ -43,21 +46,21 @@ Under the beginner view is a real analysis workstation, with packet dissection, 
 
 | | | |
 |---|---|---|
-| <img src="docs/assets/icons/investigate.svg" width="36" alt=""> | **Plain-English answers** | The dashboard answers three questions: "Is anything wrong?", "Who is using the Internet?" and "What is new?" Every card opens the evidence behind it. |
+| <img src="docs/assets/icons/investigate.svg" width="36" alt=""> | **Plain-English answers** | The dashboard answers three questions: "Is anything wrong?", "Who is using the Internet?" and "What is new?" Every card opens the evidence behind it. A **Ready?** list at start says what works and how to fix what doesn't, and **Story mode** tells what changed, day by day. |
 | <img src="docs/assets/icons/devices.svg" width="36" alt=""> | **Devices, websites and remote hosts kept apart** | A website is a name and never a device. A public address is a remote host and never a device. Each device carries confidence levels and the evidence for them. |
 | <img src="docs/assets/icons/map.svg" width="36" alt=""> | **Honest coverage** | A vantage meter, blind spots and a coverage report say what MiniWireshark *can't* see from where it sits. |
 | <img src="docs/assets/icons/packets.svg" width="36" alt=""> | **Deep analysis when you want it** | Full Power mode runs every dissector in worker processes and adds TCP reassembly, expert findings, protocol exchanges (DNS, DHCP, TLS, HTTP, SMB, SSH, MQTT, SIP and more), Follow stream, I/O graphs, conversations and a filter language. |
-| <img src="docs/assets/icons/health.svg" width="36" alt=""> | **Investigations** | "Why is my Internet slow?" checks Wi-Fi, the router, DNS, packet loss, heavy programs and VPNs, and says when it can't tell from here. |
-| <img src="docs/assets/icons/alerts.svg" width="36" alt=""> | **Security engine** | Alerts for ARP spoofing, rogue IPv6 router adverts, logins sent before encryption, new listening services, port scans and unusual traffic, with innocent explanations alongside. |
-| <img src="docs/assets/icons/history.svg" width="36" alt=""> | **History** | An optional SQLite history (WAL, migrations with backups), saved sessions, a crash-safe journal and a flight recorder. |
+| <img src="docs/assets/icons/health.svg" width="36" alt=""> | **Investigations** | Seven guided questions, from "Why is my Internet slow?" to "Is it my Wi-Fi or the Internet?" and "Why does my call stutter?". Each weighs the evidence for and against, and says when it can't tell from here. Call quality (loss and jitter) is read from packet headers only. |
+| <img src="docs/assets/icons/alerts.svg" width="36" alt=""> | **Security engine** | Alerts for a fake router, rogue IPv6 router adverts, logins sent without encryption, new services, port scans and unusual traffic. **Unusual activity** shows the worrying and the innocent reading side by side. A day-and-night baseline per device, alert snooze, your own blocklist, and opt-in notifications while minimised. |
+| <img src="docs/assets/icons/history.svg" width="36" alt=""> | **History and reports** | An optional SQLite history (WAL, migrations with backups), saved sessions, a crash-safe journal and a flight recorder. A one-page **Network check-up** a beginner can print or send, with names and addresses hidden by default. |
 | <img src="docs/assets/icons/accessibility.svg" width="36" alt=""> | **Accessible and multilingual** | English, French and Spanish. Light and dark themes, colour-blind palettes, adjustable text size, full keyboard control and a command palette (`Ctrl+K`). |
 | <img src="docs/assets/icons/self-maintaining.svg" width="36" alt=""> | **Self-maintaining** | Installs its own dependencies into a private folder and never into your system Python. Offers to install Npcap on Windows, picks the best network card, heals a capture that dies, and checks Ed25519-signed updates. |
 
-The engineering underneath (a self-installing private Python runtime, a decoder 15× faster than the obvious one, pure-Python AES and Ed25519 fallbacks, 131 self-tests) is described in [Under the hood](docs/UNDER-THE-HOOD.md).
+The engineering underneath (a self-installing private Python runtime, a decoder 15× faster than the obvious one, pure-Python AES and Ed25519 fallbacks, more than 350 self-tests) is described in [Under the hood](docs/UNDER-THE-HOOD.md).
 
 ## Screenshots
 
-All taken in Demo Mode, and they follow your GitHub theme. Every tab, in both themes, is in [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md).
+All taken with 5.3.4 in Demo Mode (simulated data, nothing captured), and they follow your GitHub theme. Every tab, in both themes, is in [docs/SCREENSHOTS.md](docs/SCREENSHOTS.md).
 
 <table>
 <tr>
@@ -68,7 +71,19 @@ All taken in Demo Mode, and they follow your GitHub theme. Every tab, in both th
 <td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/dark-health.png"><img src="docs/assets/screens/light-health.png" alt="Health tab"></picture><p align="center"><b>Health</b>: Wi-Fi, router, DNS and Internet checks</p></td>
 <td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/dark-packets.png"><img src="docs/assets/screens/light-packets.png" alt="Packets tab"></picture><p align="center"><b>Packets</b>: dissection, streams and filters</p></td>
 </tr>
+<tr>
+<td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/dark-investigate.png"><img src="docs/assets/screens/light-investigate.png" alt="Why is my Internet slow? window"></picture><p align="center"><b>Guided questions</b>: evidence for and against, ranked (new in 5.3.4)</p></td>
+<td width="50%"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/dark-story.png"><img src="docs/assets/screens/light-story.png" alt="Timeline in Story mode"></picture><p align="center"><b>Story mode</b>: what changed, in plain sentences (new in 5.3.4)</p></td>
+</tr>
 </table>
+
+## Download
+
+1. Open the [latest release](https://github.com/darkckillerc4/MiniWireshark/releases/latest) and download `miniwireshark-<version>.py` and its `.sha256` file.
+2. Check that the two match: `sha256sum` (Linux), `shasum -a 256` (macOS) or `Get-FileHash -Algorithm SHA256` (Windows PowerShell). Every checksum is also in the [version index](docs/VERSIONS.md).
+3. Run it with Python, as below. There is no installer.
+
+Download MiniWireshark only from this GitHub page. Copies on other sites may be fake, and MiniWireshark's own update check only ever points here. Step-by-step instructions for each system are in [Installation](docs/INSTALL.md).
 
 ## Quick start
 
@@ -90,11 +105,15 @@ Useful switches:
 |---|---|
 | `--demo` | Start in Demo Mode with simulated, clearly labelled data |
 | `--safe` | Safe Mode: conservative settings, no auto-capture |
-| `--boot-check` | Check this computer's setup without opening the window |
-| `--self-test` | Run the built-in test suite (no admin rights or capture needed) |
+| `--no-elevate` | Never ask for administrator rights |
+| `--boot-check` | Check this computer's setup (the same Ready? list) without opening the window |
+| `--self-test [NAME]` | Run the built-in test suite, or only the named tests (no admin rights or capture needed) |
 | `--gui-test` | Drive the real window through every tab (needs a display) |
 | `--bench-gui S1 S2` | Window-performance benchmark against fixed budgets |
 | `--release-gate` | Everything above plus pictures of every tab, in one folder |
+| `--help`, `--version` | List every switch, or print the version |
+
+The full list, including the developer switches, is in [Installation](docs/INSTALL.md#command-line-switches).
 
 ## Documentation
 
@@ -105,6 +124,7 @@ Useful switches:
 | [Features](docs/FEATURES.md) | Everything MiniWireshark can do, including every alert it raises |
 | [Architecture](docs/ARCHITECTURE.md) | How the single file is organised and how a packet becomes an answer |
 | [FAQ and troubleshooting](docs/FAQ.md) | Capture problems, Safe Mode, privacy questions |
+| [Can I trust it?](docs/TRUST.md) | Check what it sends, keeps and asks for, how it is tested, and its honest limits |
 | [Screenshots](docs/SCREENSHOTS.md) | Every tab, in the light and the dark theme |
 | [Under the hood](docs/UNDER-THE-HOOD.md) | The runtime manager, fast decoder, signed updates, self-tests and the rest of the engineering |
 | [Logo and images](docs/BRANDING.md) | The logo, icons, Windows icon and social preview |
@@ -115,8 +135,8 @@ Useful switches:
 - **Python 3.8 or newer** with Tk (included with the python.org and Microsoft Store installers on Windows and macOS; on Linux, `sudo apt install python3-tk`).
 - **Packet capture:**
   - **Windows:** [Npcap](https://npcap.com/). MiniWireshark offers to install it, and capture works without administrator rights once it is there.
-  - **Linux:** root or `CAP_NET_RAW`.
-  - **macOS:** access to `/dev/bpf*`.
+  - **Linux:** root or `CAP_NET_RAW`. MiniWireshark asks for the password only when capture starts, and not at all when the capability is set.
+  - **macOS:** access to `/dev/bpf*`, or the administrator password when capture starts.
 - **scapy** and optional extras (psutil, cryptography) are installed automatically into a private, per-Python folder.
 
 Without a capture driver, MiniWireshark still opens in limited mode, so you can explore saved sessions, capture files and the demo.
@@ -126,16 +146,40 @@ Without a capture driver, MiniWireshark still opens in limited mode, so you can 
 MiniWireshark is a **defensive** tool for networks you own or are allowed to monitor.
 
 - **No telemetry.** Everything MiniWireshark itself sends goes through one gate, `outbound()`, and is listed in a self-traffic ledger. A kill switch blocks all of it.
+- **Updates only from the official GitHub page.** Once a day MiniWireshark makes one request to `api.github.com` for the latest release of [darkckillerc4/MiniWireshark](https://github.com/darkckillerc4/MiniWireshark/releases). Nothing about you is sent, and it only ever points you to that GitHub page: other download sites may be fake. Turn it off in **Settings → Updates & Dependencies**.
 - **Secrets are dropped inside the parsers.** Mail logins, passwords and message bodies are never stored. A canary test checks reports, sessions, CSV files, logs, history and the clipboard for leaks.
-- **Redaction.** Reports and shared screenshots can replace real names and addresses with documentation-range pseudonyms.
+- **Your data folder is private.** It is closed to other users, and administrator rights are asked for only when capture starts (Linux and macOS).
+- **Redaction.** Reports and exports can replace real names and addresses with documentation-range pseudonyms.
 - **Active scanning stays on your own subnet,** and Quiet Mode turns it off on networks you haven't trusted.
 
+Skeptical? Good. [Can I trust it?](docs/TRUST.md) shows how to check each of these claims yourself.
+
 Found a security issue? See [SECURITY.md](SECURITY.md).
+
+## Your data and uninstalling
+
+Everything MiniWireshark creates goes into one data folder: `miniwireshark_data/` next to the script when that folder is writable, otherwise `%LOCALAPPDATA%\MiniWireshark` (Windows), `~/Library/Application Support/MiniWireshark` (macOS) or `~/.local/share/miniwireshark` (Linux). Settings are in `miniwireshark_config.json` next to the script.
+
+Those files describe your own network: device names, addresses and saved sessions. Don't attach them to a public issue. **Storage used…** in the command palette (`Ctrl+K`) shows what each part takes.
+
+To uninstall, delete `miniwireshark.py`, the data folder and `miniwireshark_config.json`. The few other places are listed in [Installation](docs/INSTALL.md#uninstalling).
+
+## Troubleshooting
+
+| What you see | What to try |
+|---|---|
+| No packets at all | On Windows, install [Npcap](https://npcap.com/) (MiniWireshark offers to). On Linux and macOS, accept the password prompt when capture starts. |
+| Only this computer's own traffic | That is normal on Wi-Fi and on most switches. The vantage meter in the bottom-right corner says what can and can't be seen from here. |
+| It opened in Safe Mode | Two failed starts in a row do that. Start it again normally, and use **Ready?** in the Welcome Center to see what failed. |
+| The wrong network card | Pick the right one in **Network card** at the top of the window, then press **Start watching**. |
+| It starts slowly the first time | The first start checks your setup and may install packages into its own folder. Later starts are faster. |
+
+More answers are in the [FAQ](docs/FAQ.md). To report a problem, open an [issue](https://github.com/darkckillerc4/MiniWireshark/issues/new/choose).
 
 ## Testing
 
 ```bash
-python miniwireshark.py --self-test               # ~35 s, 131+ tests
+python miniwireshark.py --self-test               # a few minutes, more than 350 tests
 xvfb-run -a python miniwireshark.py --gui-test    # Linux without a display
 python miniwireshark.py --bench-gui S1 S2         # performance budgets
 ```
@@ -160,7 +204,7 @@ Every release is a single `.py` file attached to its [GitHub release](https://gi
 ## Project layout
 
 ```
-miniwireshark.py        the application: one file on purpose, ~66k lines in banner-marked regions
+miniwireshark.py        the application: one file on purpose, ~94k lines in banner-marked regions
 legacy/                 versions 1.x and 2.0.0 (written before this repository's history began)
 docs/                   installation, user guide, features, architecture, FAQ, version index
 .github/                CI, issue and PR templates, release notes, archive-release workflow
@@ -170,13 +214,9 @@ The file's docstring lists every region in order (bootstrap, capture pipeline, p
 
 ## Roadmap
 
-**5.2.3** is in progress ([pull request #1](https://github.com/darkckillerc4/MiniWireshark/pull/1)). It is a reliability release:
+**5.3.4** is in testing and not released yet; the latest release is 5.2.3. It is a medium release: every finding of the 5.2.3 security audit fixed in the code (four of the fixes still need a check on real hardware), a Ready? list, Story mode, Unusual activity, seven guided questions, call quality, notifications and a one-page check-up. See the [changelog](CHANGELOG.md).
 
-- Capture starts and recovers without freezing the window.
-- Archived versions can share a folder safely.
-- Memory stays bounded while the window is minimised.
-- Devices are identified correctly on PCs with VPN and virtual adapters.
-- Windows fixes, and groundwork for a standalone `.exe`.
+No later release is planned yet. Waiting for measurements on a real Windows PC: a lower Windows memory limit. The single `.py` file stays until 6.0, which is not opened.
 
 ## Contributing
 
