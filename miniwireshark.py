@@ -41697,7 +41697,7 @@ class LocalServicesView:
                 "This service doesn't look like a web page, so it isn't "
                 "opened in the browser."), "info")
             return False
-        if self.demo():
+        if LocalServicesView.demo(self):
             # a made-up service: the same port on this computer is
             # something else, or nothing
             self.app._set_banner(tt(
