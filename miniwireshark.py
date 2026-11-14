@@ -100628,12 +100628,14 @@ def t_q35_update_failures_are_told_and_restore_is_whole(ctx):
         with open(src, "rb") as fi, open(dst, "wb") as fo:
             fo.write(fi.read()[:100])
         raise OSError("the disk went away")
-    shutil.copyfile = half
+    # both: on Windows copy2 copies with CopyFile2, never through copyfile
+    real2 = shutil.copy2
+    shutil.copyfile = shutil.copy2 = half
     try:
         msg = rollback_update_if_needed(force=True, script_path=cur,
                                         marker_path=marker)
     finally:
-        shutil.copyfile = real
+        shutil.copyfile, shutil.copy2 = real, real2
     assert "failed" in msg, msg
     assert open(cur, "rb").read() == new, "the program was left broken"
     assert not [n for n in os.listdir(d) if n.endswith(".rb")]
