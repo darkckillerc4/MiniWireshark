@@ -19127,6 +19127,17 @@ LOCAL_SAFE = "Only this computer can reach it"
 LOCAL_EXPOSED = "Other devices on your network can reach it"
 LOCAL_UNKNOWN = "Not sure what this is"
 LOCAL_ANY_ADDRESS = ("0.0.0.0", "::", "", "*")
+# Demo Mode shows these made-up services, never this computer's own
+# programs (audit 2026-11-14 #15: under "Everything shown is simulated" it
+# listed the real ones)
+DEMO_LOCAL_LISTENERS = {
+    ("TCP", "127.0.0.1", 5173): (2101, "node"),
+    ("TCP", "::1", 5173): (2101, "node"),
+    ("TCP", "0.0.0.0", 8000): (2102, "python3"),
+    ("TCP", "127.0.0.1", 631): (311, "cupsd"),
+    ("TCP", "127.0.0.1", 5432): (412, "postgres"),
+    ("UDP", "0.0.0.0", 5353): (205, "avahi-daemon"),
+    ("TCP", "0.0.0.0", 22): (98, "sshd")}
 
 
 def _local_is_loopback(ip):
@@ -30469,6 +30480,7 @@ This computer didn't let MiniWireshark read the list of services without adminis
 The list of services hasn't been read yet. ¦ La liste des services n'a pas encore été lue. ¦ La lista de servicios aún no se ha leído.
 No services are listening on this computer. ¦ Aucun service n'est à l'écoute sur cet ordinateur. ¦ No hay ningún servicio a la escucha en este equipo.
 This service doesn't look like a web page, so it isn't opened in the browser. ¦ Ce service ne ressemble pas à une page web, il n'est donc pas ouvert dans le navigateur. ¦ Este servicio no parece una página web, así que no se abre en el navegador.
+Demo Mode: this service is made up, so nothing is opened. ¦ Mode démo : ce service est inventé, rien n'est donc ouvert. ¦ Modo demo: este servicio es inventado, así que no se abre nada.
 Not opened: the kill switch is on. ¦ Pas ouvert : l'arrêt d'urgence est activé. ¦ No se abrió: el interruptor de corte está activado.
 To open it yourself, type this address in your browser: ¦ Pour l'ouvrir vous-même, tapez cette adresse dans votre navigateur : ¦ Para abrirlo usted mismo, escriba esta dirección en su navegador:
 The browser couldn't be opened. ¦ Le navigateur n'a pas pu être ouvert. ¦ No se pudo abrir el navegador.
@@ -41435,6 +41447,7 @@ class LocalServicesView:
         self.state = "unread"
         self._sig = None
         self._seen_seq = None
+        self._seen_demo = False
         self._poll_job = None
         self._reading_until = 0.0
         self._auto_at = 0.0
@@ -41493,20 +41506,25 @@ class LocalServicesView:
         return (r["proto"], r["port"], r["program"]) if r else None
 
     # ---- reading ----------------------------------------------------------
+    def demo(self):
+        return getattr(self.app, "data_mode", "") == "demo"
+
     def snapshot(self):
         if self.source is not None:
             return self.source()
+        if self.demo():
+            return "ok", dict(DEMO_LOCAL_LISTENERS)
         return local_services_state(self.app.procmap)
 
     def reading(self):
-        return self.source is None and time.time() < self._reading_until \
-            and self.app.procmap.busy
+        return self.source is None and not self.demo() and \
+            time.time() < self._reading_until and self.app.procmap.busy
 
     def shown(self):
         """The sub-view was opened: show what is known and read the list
         again when it is old."""
         pm = self.app.procmap
-        if self.source is None and pm.available and \
+        if self.source is None and not self.demo() and pm.available and \
                 time.time() - pm.at > self.AUTO_EVERY:
             self.reload()
         else:
@@ -41519,21 +41537,22 @@ class LocalServicesView:
         pm = self.app.procmap
         now = time.time()
         if self.source is None and pm.available and \
-                self.app.data_mode != "live" and not pm.busy and \
-                self._poll_job is None and \
+                self.app.data_mode not in ("live", "demo") and \
+                not pm.busy and self._poll_job is None and \
                 now - pm.at > self.AUTO_EVERY and \
                 now - self._auto_at > self.AUTO_EVERY:
             self._auto_at = now        # a read that fails is not retried
             self.reload()              # on every tick
             return
-        if pm.seq != self._seen_seq and self._poll_job is None:
+        if (pm.seq != self._seen_seq or self.demo() != self._seen_demo) \
+                and self._poll_job is None:
             self.refresh()
 
     def reload(self):
         """Refresh: read the connection table again (in the background)
         and show it when the read is done. One wait at a time."""
         pm = self.app.procmap
-        if self.source is None and pm.available:
+        if self.source is None and pm.available and not self.demo():
             pm.refresh(force=True)
             self._reading_until = time.time() + self.READ_TIMEOUT
             self._cancel_poll()
@@ -41559,10 +41578,11 @@ class LocalServicesView:
         state, listening = self.snapshot()
         pm = self.app.procmap
         self._seen_seq = pm.seq
+        self._seen_demo = demo = self.demo()
         rows = local_service_rows(listening) if state == "ok" else []
-        partial = state == "ok" and self.source is None and \
+        partial = state == "ok" and self.source is None and not demo and \
             bool(pm.needs_admin)
-        sig = (CURRENT_LOCALE, state, self.reading(), partial,
+        sig = (CURRENT_LOCALE, state, self.reading(), partial, demo,
                tuple((self._key(r), r["addrs"]) for r in rows))
         if sig == self._sig and not force:
             return False
@@ -41676,6 +41696,13 @@ class LocalServicesView:
             self.app._set_banner(tt(
                 "This service doesn't look like a web page, so it isn't "
                 "opened in the browser."), "info")
+            return False
+        if self.demo():
+            # a made-up service: the same port on this computer is
+            # something else, or nothing
+            self.app._set_banner(tt(
+                "Demo Mode: this service is made up, so nothing is "
+                "opened."), "info")
             return False
         parts = urllib.parse.urlsplit(url)
         try:
@@ -82941,6 +82968,58 @@ def t_534_local_services_open_through_gate(ctx):
         webbrowser.open, LEDGER.killed = old_open, old_killed
 
 
+@self_test()
+def t_a2_local_services_demo_is_made_up(ctx):
+    """Audit 2026-11-14 #15: in Demo Mode, Websites → Local services lists
+    made-up services, never this computer's own programs, never reads the
+    connection table, and opens nothing; outside Demo Mode it reads the
+    real table as before."""
+    real = {("TCP", "127.0.0.1", 47123): (777, "a2-real-program")}
+    reads = []
+    pm = types.SimpleNamespace(available=True, listening=dict(real),
+                               error="", at=time.time(), needs_admin=False,
+                               busy=False, seq=1,
+                               refresh=lambda force=False: reads.append(1))
+    banners, opened = [], []
+    app = types.SimpleNamespace(
+        procmap=pm, data_mode="demo",
+        _set_banner=lambda text, kind="info": banners.append(text))
+    view = types.SimpleNamespace(
+        app=app, source=None, _reading_until=0.0, _poll_job=None,
+        READ_TIMEOUT=LocalServicesView.READ_TIMEOUT, POLL_MS=150,
+        _poll=lambda: None,
+        frame=types.SimpleNamespace(after=lambda ms, fn: None))
+    view.demo = lambda: LocalServicesView.demo(view)
+    state, listening = LocalServicesView.snapshot(view)
+    assert state == "ok" and listening == DEMO_LOCAL_LISTENERS, listening
+    rows = local_service_rows(listening)
+    assert rows and not any("a2-real-program" in r["program"] or
+                            r["port"] == 47123 for r in rows), rows
+    assert not LocalServicesView.reading(view)
+    # Refresh in Demo Mode doesn't read the real table
+    view._cancel_poll = lambda: None
+    view.refresh = lambda force=False: None
+    LocalServicesView.reload(view)
+    assert reads == [], reads
+    import webbrowser
+    old_open = webbrowser.open
+    webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+    n0 = len(LEDGER.snapshot("local_open"))
+    try:
+        web = next(r for r in rows if r["url"])
+        assert not LocalServicesView.open_service(view, web)
+        assert opened == [] and "made up" in banners[-1], banners
+        assert len(LEDGER.snapshot("local_open")) == n0
+    finally:
+        webbrowser.open = old_open
+    for loc in ("fr", "es"):
+        assert translate_text(banners[-1], loc) != banners[-1]
+    # live (or an opened file): the real table, as before
+    app.data_mode = "live"
+    state, listening = LocalServicesView.snapshot(view)
+    assert state == "ok" and listening == real, listening
+
+
 @self_test(needs_source=True)
 def t_r7_tk_freed_on_main_thread_only(ctx):
     """5.3.4 CI round 7 (Windows self-test abort, "Tcl_AsyncDelete: async
@@ -94683,6 +94762,88 @@ def gt_534_local_services(app, ctx):
     tab.show_subview("Local services")
     tab.set_filter("")
     assert tab.subview == "Websites"
+
+
+@gui_test_step("audit2 Local services in Demo Mode: made-up services, the "
+               "real table never read, nothing opened, no light blocks in "
+               "Dark")
+def gt_a2_local_services_demo(app, ctx):
+    import webbrowser
+    root = app.root
+    pm = app.procmap
+    reads, opened = [], []
+    old_refresh, old_open = pm.refresh, webbrowser.open
+    old_theme = app.config.get("appearance.theme")
+    tab = app._select_tab("websites")
+    view = tab.local
+    src0 = view.source
+    view.source = None
+    want = sorted((r["proto"], r["port"], r["program"])
+                  for r in local_service_rows(DEMO_LOCAL_LISTENERS))
+    webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+    try:
+        # outside Demo Mode the real table is read (audit #19: the GUI
+        # test only ever showed made-up rows)
+        if pm.available and app.data_mode != "demo":
+            pm.refresh = lambda *a, **k: reads.append(1) or \
+                old_refresh(*a, **k)
+            tab.show_subview("Local services")
+            view.reload()
+            assert _gui_pump(root, 0.2, lambda: not view.reading(),
+                             timeout=15)
+            _gui_pump(root, 0.2)
+            assert reads, "Refresh didn't read the connection table"
+            state, listening = local_services_state(pm)
+            assert view.state == state, (view.state, state)
+            assert len(view.iid_row) == len(
+                local_service_rows(listening)), len(view.iid_row)
+            del reads[:]
+        pm.refresh = lambda *a, **k: reads.append(1)
+        app.start_demo()
+        assert _gui_pump(root, 0.3, lambda: app.data_mode == "demo",
+                         timeout=30)
+        app._select_tab("websites")
+        tab.show_subview("Local services")
+        _gui_pump(root, 0.4)
+        view.refresh_btn.invoke()
+        _gui_pump(root, 0.3)
+        for _ in range(3):
+            tab.refresh()
+            _gui_pump(root, 0.05)
+        got = sorted((r["proto"], r["port"], r["program"])
+                     for r in view.iid_row.values())
+        assert got == want, got
+        assert reads == [], "the real connection table was read"
+        iid = next(i for i, r in view.iid_row.items() if r["url"])
+        view.tree.selection_set(iid)
+        view.tree.focus(iid)
+        _gui_pump(root, 0.05)
+        view.open_btn.invoke()
+        view._double()
+        assert opened == [], opened
+        assert "made up" in str(app.banner_lbl.cget("text"))
+        app._hide_banner()
+        # #16: the header and the status strip follow the Dark theme
+        app.config.set("appearance.theme", "Dark")
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.5, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        _gui_pump(root, 0.2)
+        leaks = dark_theme_leaks(view.frame)
+        assert not leaks, leaks[:5]
+    finally:
+        pm.refresh, webbrowser.open = old_refresh, old_open
+        view.source = src0
+        app.config.set("appearance.theme", old_theme)
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.4, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        if app.data_mode == "demo":
+            app.stop_demo()
+            _gui_pump(root, 0.3)
+        tab.show_subview("Websites")
+        app._hide_banner()
+    _gt_back_to_scenario(app, ctx)
 
 
 @gui_test_step("review 6: the Inspector's refreshes keep no bindings; a "

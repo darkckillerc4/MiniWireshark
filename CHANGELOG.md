@@ -101,6 +101,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - A packet with many IPv6 extension headers, or with three or more VLAN tags, no longer slows the analysis: 180 extension headers took up to 0.2 seconds a packet, now well under a millisecond.
 - A UDP message whose length field claims more than the packet holds shows its real size ("Quick message (2 bytes)", not 65527 bytes). IPv6 carried inside IPv6 is called "IPv6-in-IPv6", not "IPv6-in-IPv4", and the packet details say "truncated" or "this isn't IPv4" instead of "malformed (packed IP wrong length for inet_ntoa)".
 - A packet that breaks the decoder is now written in the log, the first of each kind with its details, so it can be reported. It used to be counted silently.
+- In Demo Mode, **Websites → Local services** shows made-up services instead of the programs really running on this computer, and opens nothing in the browser. It used to list this computer's own programs under the "Everything shown is simulated" banner.
 
 **Known limits**
 
