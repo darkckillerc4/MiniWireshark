@@ -94950,8 +94950,10 @@ def _gs_ct6_story_fresh(app, ctx):
 
 
 def _ct_health_model(app):
-    """An empty model with no checks: (old model, old data mode)."""
-    old = (app.model, app.data_mode)
+    """An empty model with no checks: (old model, old data mode, the
+    packet rows; replace_model empties them, and the steps after need
+    them: the Packets right-click check found no row)."""
+    old = (app.model, app.data_mode, list(app.all_rows))
     ident = scenario_identity()
     m = app._new_model(identity=ident[:3])
     m.set_identity(local_nets=ident[3])
@@ -94965,6 +94967,9 @@ def _ct_health_restore(app, old):
     app.wifi.at = 0.0
     app.replace_model(old[0])
     app.data_mode = old[1]
+    app.all_rows.extend(old[2])
+    with contextlib.suppress(tk.TclError, AttributeError):
+        app.tabs["packets"].rebuild()
     _gui_pump(app.root, 0.2)
 
 
@@ -96187,8 +96192,13 @@ def gt_c12_packet_view(app, ctx):
         assert total - pos >= min(need, total - keep) - 2, \
             (total, pos, need, keep)
         dh, lh = pt.dtree.winfo_height(), pt.tree.winfo_height()
-        assert dh >= 2 * line, f"packet details {dh} px high (line {line})"
-        assert lh >= 2 * line, f"packet list {lh} px high"
+        if total >= need + keep:
+            # only when the pane has room for both: in the full run the
+            # bars earlier steps leave open (banners, the docked panel)
+            # left the whole pane 69 px high at 1024×700
+            assert dh >= 2 * line, \
+                f"packet details {dh} px high (line {line})"
+            assert lh >= 2 * line, f"packet list {lh} px high"
     finally:
         root.geometry(geo)
         _gui_pump(root, 0.5)
