@@ -62124,8 +62124,11 @@ proc ::mw_explicit_fonts {top names} {
             LOG.info("automatic update check skipped: %s", why)
             return False
         # court GUI-06: told with the first check that really runs, not
-        # while Safe Mode, the kill switch or offline work blocks it
-        if self.config.get("updates.notice_pending", False):
+        # while Safe Mode, the kill switch or offline work blocks it.
+        # Second audit (privacy #10): a new install is told too (the
+        # notice was only for upgrades): the first automatic check ever
+        if self.config.get("updates.notice_pending", False) or \
+                not _float(self.config.get("updates.last_check", 0)):
             self.config.set("updates.notice_pending", False)
             self.config.save()
             self._set_banner("⬆️  " + translate_text(
@@ -98150,6 +98153,34 @@ def t_a2_settings_file_follows_the_folder_rule(ctx):
             _b9_patched(os.environ, MINIWIRESHARK_CONFIG=None):
         c = AppConfig()
     assert c.path == os.path.join(PATHS.data, name), c.path
+
+
+@self_test()
+def t_a2_new_install_told_about_the_update_check(ctx):
+    """Second audit (privacy #10): a new install's first automatic update
+    check says that MiniWireshark checks GitHub once a day and how to
+    turn it off (the notice was only for upgrades); later checks don't
+    repeat it."""
+    notice = "now checks the official GitHub page"
+    stub, sent, restore = _update_stub(ctx)
+    try:
+        assert not stub.config.get("updates.notice_pending")
+        assert not _float(stub.config.get("updates.last_check", 0))
+        assert stub._auto_update_check()
+        for t in list(threading.enumerate()):
+            if t.name == "update-check":
+                t.join(5)
+        assert sum(notice in b for b in stub.banners) == 1, stub.banners
+        stub.config.set("updates.last_check",
+                        time.time() - UPDATE_CHECK_INTERVAL - 5)
+        assert stub._auto_update_check()
+        for t in list(threading.enumerate()):
+            if t.name == "update-check":
+                t.join(5)
+        assert sum(notice in b for b in stub.banners) == 1, stub.banners
+        assert len(sent) == 2, sent
+    finally:
+        restore()
 
 
 # ============================================================================
