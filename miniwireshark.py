@@ -45292,7 +45292,20 @@ class PacketsTab(BaseTab):
         except tk.TclError:
             line = 16
         rowh = max(line + 4, self._row_height() or 0)
-        return 4 * rowh + 2 * line + 30, 3 * rowh + line + 8
+        # the list's own part: its heading, three rows, and what sits
+        # around the table (the horizontal scroll bar, borders). Guessing
+        # the heading as one line and leaving the bar out kept one row
+        # on Windows, where both are taller.
+        head = self.head_h or line + 8
+        extra = 20
+        with contextlib.suppress(tk.TclError, AttributeError):
+            # the bar's asked-for height stays put while the panes move
+            bars = [w for w in self.tree.master.winfo_children()
+                    if isinstance(w, ttk.Scrollbar) and
+                    str(w.cget("orient")) == "horizontal"]
+            if bars:
+                extra = bars[0].winfo_reqheight() + 4
+        return 4 * rowh + 2 * line + 30, head + 3 * rowh + extra + 4
 
     def _details_room_soon(self):
         if getattr(self, "_room_job", None):
@@ -96235,6 +96248,9 @@ def gt_c12_packet_view(app, ctx):
         if total >= keep + 40:
             assert total - pos >= min(need, total - keep) - 2, \
                 (total, pos, need, keep)
+            # and the list above keeps three whole rows (on Windows the
+            # guessed room left one)
+            assert pt._nslots() >= 3, (total, pos, keep, pt._nslots())
         dh, lh = pt.dtree.winfo_height(), pt.tree.winfo_height()
         if total >= need + keep:
             # only when the pane has room for both: in the full run the
