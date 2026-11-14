@@ -96716,6 +96716,12 @@ def gt_534_notify_minimised(app, ctx):
     def shell(op, hwnd, head, body):
         t0 = time.perf_counter()
         if IS_WINDOWS:
+            # the real tray call is the Windows evidence, but a person may
+            # see it: never let a test toast look like a real attack
+            if head:
+                head = "[TEST] " + head
+            if body:
+                body = "MiniWireshark self-test, not your network. " + body
             ok = real_shell(op, hwnd, head, body)
         else:
             time.sleep(0.3)
