@@ -87747,8 +87747,11 @@ def t_s13_baseline_edges(ctx):
     a = 1.0 / (1 + BASELINE_PRIOR_WEIGHT)
     pr = b.prof[baseline_period(1000 * 60.0)]
     assert abs(pr["mean"]["packets"] - (pk - a * pk)) < 1e-9, pr["mean"]
-    while pr["var"]["packets"] >= 0.25:
+    for _i in range(10000):     # (35-checker review) bounded: a regression
+        if pr["var"]["packets"] < 0.25:      # fails here, never hangs
+            break
         b._finish_v2(zero)
+    assert pr["var"]["packets"] < 0.25, pr["var"]
     var = pr["var"]["packets"]
     s = b._finish_v2(zero)
     assert abs(s[2]["packets"] - math.sqrt(var)) < 1e-12 and \
