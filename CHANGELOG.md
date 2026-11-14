@@ -11,6 +11,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **Administrator rights only when needed.** On Linux and macOS, MiniWireshark no longer starts as administrator (root). It asks for your password when capture starts, not at all when the computer already allows capture, and carries on without capture if you say no. The demo and the help never ask.
 - **Your files stay yours.** The data folder is closed to other people on the computer, and a folder that belongs to someone else is not used. There is no shared temporary folder any more. Another user can no longer swap the saved copy that speeds up starting, the update rollback copy or the private packages to run their own code.
 - **The administrator copy runs nothing of yours.** On Linux and macOS, the copy that runs as root for capture starts Python isolated and runs programs only from the system's own folders. A Python file or program planted in your home folder, or in the folder you started MiniWireshark from, no longer runs as root.
+- **The browser never opens as administrator.** When capture runs with administrator (root) rights on Linux or macOS, a local service, a report or a folder now opens as you, not as root.
 - **A new install asks first.** It no longer trusts the first network it sees or starts Active Scanning by itself.
 - **History does what it says.** "Session only" history is really deleted when you close the window. "Delete ALL history" also removes the backups and the saved packet files.
 - **Passwords stay out of everything.** Logins, form contents and the private parts of web addresses are hidden in packet details, saved conversations, CSV files and anything you copy, whatever the port. A new warning, *Login sent without encryption*, says who signed in and where, never the password.
@@ -103,6 +104,8 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - A UDP message whose length field claims more than the packet holds shows its real size ("Quick message (2 bytes)", not 65527 bytes). IPv6 carried inside IPv6 is called "IPv6-in-IPv6", not "IPv6-in-IPv4", and the packet details say "truncated" or "this isn't IPv4" instead of "malformed (packed IP wrong length for inet_ntoa)".
 - A packet that breaks the decoder is now written in the log, the first of each kind with its details, so it can be reported. It used to be counted silently.
 - In Demo Mode, **Websites → Local services** shows made-up services instead of the programs really running on this computer, and opens nothing in the browser. It used to list this computer's own programs under the "Everything shown is simulated" banner.
+
+- `--self-test` passes on a fresh install, before the capture library (scapy) and the optional parts are installed. Three tests assumed they were already there and failed, although the program was fine.
 
 **Known limits**
 

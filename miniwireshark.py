@@ -34886,14 +34886,80 @@ def default_save_dir():
     return None
 
 
+def person_ids():
+    """(uid, gid, user name, home) of the person a root copy works for
+    (sudo, pkexec, the password prompt), or None when this copy is not
+    root on someone's behalf (Windows, a normal start, a root login)."""
+    if IS_WINDOWS or os.geteuid() != 0:
+        return None
+    uid = _invoking_uid()
+    if not uid:
+        return None
+    name, home, gid = "", "", -1
+    try:
+        import pwd
+        pw = pwd.getpwuid(uid)
+        name, home, gid = pw.pw_name, pw.pw_dir, pw.pw_gid
+    except (ImportError, KeyError):
+        pass
+    with contextlib.suppress(ValueError):
+        gid = int(os.environ.get("SUDO_GID", ""))
+    if gid < 0:
+        return None
+    return uid, gid, name, home
+
+
+def start_for_person(cmd, **kw):
+    """Second audit (security #4): start a program for the person (their
+    browser, file manager or editor) as that person, never as root. A
+    root copy started through sudo or pkexec used to open the browser as
+    root, so a page from any local server ran in a root browser.
+    -> the Popen."""
+    env = env_for_outside(kw.pop("env", None))
+    ids = person_ids()
+    if ids is None:
+        return subprocess.Popen(cmd, env=env, **kw)
+    uid, gid, name, home = ids
+    env.update({"HOME": home or env.get("HOME", "/"),
+                "USER": name or env.get("USER", ""),
+                "LOGNAME": name or env.get("LOGNAME", "")})
+    env.pop("SUDO_COMMAND", None)
+
+    def demote():
+        if name:
+            try:
+                os.initgroups(name, gid)
+            except OSError:
+                os.setgroups([gid])
+        else:
+            os.setgroups([gid])
+        os.setgid(gid)
+        os.setuid(uid)
+    return subprocess.Popen(cmd, env=env, preexec_fn=demote, **kw)
+
+
+def open_in_browser(url, feature, dest, detail=""):
+    """Open `url` in the person's browser, through the outbound() gate
+    (raises OutboundBlocked while the kill switch is on). A root copy
+    opens it as the person (start_for_person). -> True when asked."""
+    outbound(feature, "browser", dest, detail)
+    if person_ids() is not None:
+        start_for_person(["open" if IS_MAC else "xdg-open", url],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        return True
+    import webbrowser
+    return bool(webbrowser.open(url))
+
+
 def _open_path(path):
     try:
         if sys.platform.startswith("win"):
             os.startfile(path)  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
+            start_for_person(["open", path])
         else:
-            subprocess.Popen(["xdg-open", path], env=env_for_outside())
+            start_for_person(["xdg-open", path])
         return True
     except Exception as e:                           # noqa: BLE001
         # several "Open folder" buttons ignore the answer: leave a trace
@@ -41776,18 +41842,16 @@ class LocalServicesView:
             return False
         parts = urllib.parse.urlsplit(url)
         try:
-            outbound("local_open", "browser",
-                     f"{parts.hostname}:{parts.port}",
-                     "a service on this computer")
+            # second audit (security #4): as the person, never as root
+            ok = open_in_browser(url, "local_open",
+                                 f"{parts.hostname}:{parts.port}",
+                                 "a service on this computer")
         except OutboundBlocked:
             self.app._set_banner(
                 tt("Not opened: the kill switch is on.") + " " +
                 tt("To open it yourself, type this address in your "
                    "browser:") + " " + url, "warn")
             return False
-        import webbrowser
-        try:
-            ok = bool(webbrowser.open(url))
         except Exception as e:                       # noqa: BLE001
             LOG.warning("couldn't open the browser on %s: %s", url, e)
             ok = False
@@ -75923,7 +75987,12 @@ def t_environment_diagnose(ctx):
     assert names[:3] == ["Python", "Graphical toolkit (Tk)", "pip"], names
     assert set(RUNTIME_LOCK) <= set(names)
     sc = next(r for r in rep["rows"] if r[0] == "scapy")
-    assert sc[1] and sc[4] != "bad", sc        # the self-test needs scapy
+    if ctx.scapy_ok:
+        assert sc[1] and sc[4] != "bad", sc
+    else:
+        # second audit (install #29): a fresh install has no scapy yet,
+        # and the check must say so instead of the self-test failing
+        assert not sc[1] and sc[4] == "bad" and "Missing" in sc[3], sc
     assert "pip check" in rep["text"] or rep["pip_problems"]
     assert rep["info"]["python"] == platform.python_version()
     try:
@@ -82971,7 +83040,9 @@ def t_534_local_services_from_connection_table(ctx):
              row("192.168.1.5", 50001, 42, "ESTABLISHED",
                  ("93.184.215.14", 443)),
              row("0.0.0.0", 5353, 43, "NONE", (), 2)]
-    pm = ProcessMap()
+    # second audit (install #29): made with the stand-in too, so a fresh
+    # install without psutil checks the same rows
+    pm = _with_conn_table(table, ProcessMap)
     assert _with_conn_table(table, pm.read)
     st, listening = local_services_state(pm)
     assert st == "ok", st
@@ -87790,8 +87861,10 @@ def t_534_ci_repair_runs_the_core_tests(ctx):
         assert w("test_private_packages_folder") and not w.unmatched(), asked
     w = self_test_wanted("t_dns_parsing,baseline")
     assert w("t_dns_parsing") and w("t_baseline") and not w("t_dns")
+    # second audit (install #29): two tests that run without scapy (dns
+    # parsing was skipped on a fresh install, and this failed)
     with contextlib.redirect_stdout(io.StringIO()) as out:
-        rc = run_self_tests(verbose=True, only="t_dns_parsing,t_baseline")
+        rc = run_self_tests(verbose=True, only="t_b9_trusted_uids,t_baseline")
     assert rc == 0 and out.getvalue().count("[PASS]") == 2, out.getvalue()
 
 
@@ -97384,6 +97457,55 @@ def t_a2_cached_run_ignores_the_current_folder(ctx):
                     capture_output=True, env=env, timeout=60, cwd=folder)
     assert not os.path.exists(marker), r.stderr.decode()[-300:]
     assert r.stdout.decode().strip() == "source True", r
+
+
+@self_test()
+def t_a2_browser_opens_as_the_person(ctx):
+    """Second audit (security #4): a root copy started through sudo or
+    pkexec opens the browser, a local service and folders as the person
+    who started it, never as root; a normal start still uses the
+    browser module. Both go through the outbound() gate."""
+    if IS_WINDOWS:
+        return "skip"
+    import webbrowser
+    opened, started = [], []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            started.append((cmd, kw))
+    real = (subprocess.Popen, webbrowser.open, LEDGER.killed)
+    before = len(LEDGER.snapshot("local_open"))
+    try:
+        subprocess.Popen = FakePopen
+        webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+        LEDGER.killed = False
+        with _b9_patched(os.environ, SUDO_UID="65534", SUDO_GID="65534",
+                         PKEXEC_UID=None), \
+                _b9_patched(os, geteuid=lambda: 0):
+            assert person_ids()[:2] == (65534, 65534), person_ids()
+            assert open_in_browser("http://127.0.0.1:5173/", "local_open",
+                                   "127.0.0.1:5173", "test")
+            assert _open_path(ctx.path("a2_folder"))
+        assert not opened, opened
+        assert [c[0][0] for c in started] == [
+            "open" if IS_MAC else "xdg-open"] * 2, started
+        assert all(callable(kw.get("preexec_fn")) for _c, kw in started)
+        assert started[0][0][1] == "http://127.0.0.1:5173/"
+        started.clear()
+        with _b9_patched(os.environ, SUDO_UID=None, PKEXEC_UID=None):
+            assert open_in_browser("http://127.0.0.1:5173/", "local_open",
+                                   "127.0.0.1:5173", "test")
+        assert opened == ["http://127.0.0.1:5173/"] and not started
+    finally:
+        subprocess.Popen, webbrowser.open, LEDGER.killed = real
+    assert len(LEDGER.snapshot("local_open")) == before + 2
+    # really started as that person (only a root self-test can switch)
+    if os.geteuid() == 0 and not IS_MAC:
+        with _b9_patched(os.environ, SUDO_UID="65534", SUDO_GID="65534",
+                         PKEXEC_UID=None):
+            p = start_for_person(["id", "-u"], stdout=subprocess.PIPE)
+            out = p.communicate(timeout=30)[0].decode().strip()
+        assert out == "65534", out
 
 
 # ============================================================================
