@@ -8709,7 +8709,13 @@ def set_colorblind_mode(label_or_code):
 
 
 
-@functools.lru_cache(maxsize=65536)
+# 5.3.4 (memory audit): the address memos below held 65,536 addresses
+# each (about 10 MB apiece once full, filled by every new remote address
+# over a day); a busy network repeats a few hundred
+_ADDR_MEMO = 16384
+
+
+@functools.lru_cache(maxsize=_ADDR_MEMO)
 def _is_private_cached(ip):
     try:
         a = ipaddress.ip_address(ip)
@@ -8741,7 +8747,7 @@ def _human_bytes(n):
 _CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
 
 
-@functools.lru_cache(maxsize=65536)
+@functools.lru_cache(maxsize=_ADDR_MEMO)
 def _is_public_cached(ip):
     try:
         a = ipaddress.ip_address(ip)
@@ -9178,7 +9184,7 @@ def _is_unicast_mac_cached(mac):
     return mac.lower() not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
 
 
-@functools.lru_cache(maxsize=65536)
+@functools.lru_cache(maxsize=_ADDR_MEMO)
 def _ip_obj_cached(ip):
     try:
         return ipaddress.ip_address(ip)
@@ -12102,7 +12108,8 @@ class NameCache:
             self.sources[ip] = source
             self.seen[ip] = self.clock()
             if len(self.ip_to_name) > self.MAX:
-                for k in list(self.ip_to_name)[:self.MAX // 10]:
+                for k in list(itertools.islice(self.ip_to_name,
+                                               self.MAX // 10)):
                     self.ip_to_name.pop(k, None)
                     self.sources.pop(k, None)
                     self.seen.pop(k, None)
@@ -14553,6 +14560,17 @@ def _push_bounded(lst, item, limit):
         del lst[:-limit]
 
 
+def trim_counter(c, keep):
+    """5.3.4 (memory audit): a Counter keyed by something new every few
+    minutes (a website, an address) keeps its `keep // 2` largest counts
+    once it holds more than `keep` keys. In place, so every holder of
+    the Counter sees the trim."""
+    if len(c) > keep:
+        top = c.most_common(keep // 2)
+        c.clear()
+        c.update(dict(top))
+
+
 @_slotted
 @dataclass
 class DeviceRecord:
@@ -15436,7 +15454,7 @@ def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
     return best, word, reasons[:6]
 
 
-@functools.lru_cache(maxsize=65536)
+@functools.lru_cache(maxsize=_ADDR_MEMO)
 def _classify_address_cached(ip):
     return DeviceRegistry._classify_address_raw(ip)
 
@@ -15517,6 +15535,9 @@ class DeviceRegistry:
                     return "virtual-bridge"
         return None
 
+    # 5.3.4 (memory audit): was 50,000; every remote address fills it
+    ELIG_KEEP = 10000             # audit #4: was 50,000
+
     def eligible_ip(self, ip):
         """May this address be attached to a LOCAL device? (memoised; the
         memo resets whenever the local networks or IPv6 prefixes change)"""
@@ -15529,7 +15550,7 @@ class DeviceRegistry:
         r = self._elig.get(ip)
         if r is None:
             r = self._eligible_uncached(ip)
-            if len(self._elig) > 10000:       # audit #4: was 50,000
+            if len(self._elig) > self.ELIG_KEEP:   # audit #4: was 50,000
                 self._elig.clear()
             self._elig[ip] = r
         return r
@@ -15721,7 +15742,12 @@ class DeviceRegistry:
                 dev.hostname, dev.hostname_source = "", ""
         dev.ipv4s.add(ip)
         if len(dev.ipv4s) > 16:
-            dev.ipv4s = set(list(dev.ipv4s)[-16:]) | {ip}
+            # 5.3.4: the 16 used most recently (a set has no order, so the
+            # address in use could go); the current one always stays
+            seen = {h[0]: float(h[2] or h[1] or 0.0)
+                    for h in dev.ip_history}
+            dev.ipv4s = set(sorted(dev.ipv4s, key=lambda a: (
+                a == ip, seen.get(a, 0.0), a))[-16:])
         if dev.ip_history and dev.ip_history[-1][0] == ip:
             dev.ip_history[-1][2] = when
         else:
@@ -17305,8 +17331,14 @@ class FlowTable:
     def resize(self, max_active, archive_size):
         self.max_active = max(200, int(max_active))
         if self.archive.maxlen != archive_size:
-            self.archive = deque(self.archive, maxlen=max(100,
-                                                          int(archive_size)))
+            keep = max(100, int(archive_size))
+            old = list(self.archive)
+            self.archive = deque(old, maxlen=keep)
+            # 5.3.4 (memory audit): a smaller archive let its oldest
+            # connections go but they stayed findable by number for ever
+            for f in old[:max(0, len(old) - keep)]:
+                self.by_id.pop(f.fid, None)
+                self.dirty.add(f.fid)
 
     def get(self, fid):
         return self.by_id.get(fid)
@@ -17321,6 +17353,9 @@ class FlowTable:
         if len(self.archive) == self.archive.maxlen and self.archive:
             old = self.archive[0]
             self.by_id.pop(old.fid, None)
+            # 5.3.4 (memory audit): so the Connections table lets its row
+            # go too (it stayed until the table held 3,000)
+            self.dirty.add(old.fid)
         self.archive.append(f)
         self.closed_now.append(f)
         self.closed_log.append(f)
@@ -18304,7 +18339,7 @@ class AlertEngine:
         self.alerts[a.id] = a
         self.order.appendleft(a.id)
         self._open[(kind, subject)] = a.id
-        while len(self.order) > 500:
+        while len(self.order) > self.KEEP:
             old = self.alerts.pop(self.order.pop(), None)
             # 5.2.3 (B-27): forget it as "open" too (the map only grew)
             if old is not None and \
@@ -18313,6 +18348,7 @@ class AlertEngine:
         return a
 
     DEBOUNCE_KEEP = 20000
+    KEEP = 500                    # alerts (the oldest goes)
 
     def _debounced(self, key, seconds):
         now = self.now()
@@ -20591,9 +20627,23 @@ class DnsTracker:
         self.encrypted_seen = Counter()   # provider/method -> count
         self.dot_flows = 0
 
+    SERVERS_KEEP = 256            # 5.3.4 (memory audit)
+    DOMAINS_KEEP = 8000           # names asked (the most asked half stays)
+
+    def forget(self, dev_key):
+        """A device that left memory (CO-03) takes its servers along."""
+        self.device_servers.pop(dev_key, None)
+        self.device_last.pop(dev_key, None)
+
     def _srv(self, ip):
         s = self.servers.get(ip)
         if s is None:
+            if len(self.servers) >= self.SERVERS_KEEP:
+                # 5.3.4 (memory audit): every address asked on port 53
+                # stayed (a device trying many servers, or a scan); the
+                # one quiet the longest goes
+                old = min(self.servers, key=lambda k: self.servers[k]["last"])
+                del self.servers[old]
             s = self.servers[ip] = {"queries": 0, "responses": 0, "nx": 0,
                                     "servfail": 0, "timeouts": 0,
                                     "lat": deque(maxlen=60), "first": 0.0,
@@ -20612,8 +20662,9 @@ class DnsTracker:
         q = (info.get("qname") or "").lower()
         if q:
             self.domains[q] += 1
-            if len(self.domains) > 8000:
-                self.domains = Counter(dict(self.domains.most_common(4000)))
+            if len(self.domains) > self.DOMAINS_KEEP:
+                self.domains = Counter(dict(self.domains.most_common(
+                    self.DOMAINS_KEEP // 2)))
         key = (client_ip, server_ip, info.get("id"), q)
         self.pending[key] = (ts, dev_key)
         while len(self.pending) > 4096:
@@ -23510,7 +23561,7 @@ class NetworkModel:
         self._seen_roots = None          # registrable domains seen (B-24)
         self.remote_hosts = {}
         self.ip_to_domains = {}
-        self.timeline = deque(maxlen=3000)
+        self.timeline = deque(maxlen=self.TIMELINE_KEEP)
         self.count = 0
         self.dhcp_servers = defaultdict(int)
         self.dhcp_routers = Counter()
@@ -23519,7 +23570,7 @@ class NetworkModel:
         self.http_count = 0
         self.http_hosts = Counter()
         self.cleartext_seen = Counter()
-        self.bcast_talkers = deque(maxlen=5000)
+        self.bcast_talkers = deque(maxlen=self.BCAST_KEEP)
         self.gw_mac_traffic = Counter()
         self.vpn_bytes = Counter()
         self.vpn = {"iface": "", "endpoint": "", "kind": ""}
@@ -23548,7 +23599,7 @@ class NetworkModel:
         self.correlator = LookupCorrelator()
         self.obs_seq = 0
         # (review 6) the saved session keeps the last 3,000
-        self.obs_recent = deque(maxlen=4000)
+        self.obs_recent = deque(maxlen=self.OBS_RECENT_KEEP)
         self.switch_ports = {}       # (proto, chassis) → what LLDP/CDP said
         self.reported = {}           # helper name → what it reported
         self.flow_starts = OrderedDict()   # (device, remote) → start times
@@ -23559,7 +23610,8 @@ class NetworkModel:
         self.dhcp_offers = OrderedDict()  # (#37) server → router, DNS
         self._form_wait = OrderedDict()  # (#34) a form POST's body next
         self._dup_pending = OrderedDict()  # (#39) address → (ts, MAC)
-        self.rtt_samples = deque(maxlen=2000)  # (ts, rtt, remote, dev, fid)
+        # (ts, rtt, remote, dev, fid)
+        self.rtt_samples = deque(maxlen=self.RTT_KEEP)
         # 5.3.4 (MC7): passive evidence the investigations read, bounded
         self.lan_rtt_samples = deque(maxlen=500)   # (ts, rtt, remote ip)
         self.dhcp_chains = OrderedDict()   # client MAC → deque (ts, type)
@@ -23602,9 +23654,30 @@ class NetworkModel:
             self._obs_add(subj, o)
         if self.obs_sink:
             self.obs_pending.append(o)
-            if len(self.obs_pending) > 200000:
-                del self.obs_pending[:50000]
+            if len(self.obs_pending) > self.PENDING_KEEP:
+                del self.obs_pending[:self.PENDING_KEEP // 4]
         return o
+
+    # 5.3.4 (memory audit): what grows with time, not with devices, held
+    # to these sizes (see t_534_memory_flat_in_fast_time)
+    # WEBSITES_KEEP was 20,000: about 40 MB once full (about 2 KB a
+    # website), filled in a few days of ordinary browsing; the history
+    # keeps what is older. (Remote addresses: REMOTE_MAX, audit #4)
+    WEBSITES_KEEP = 10000         # websites (the oldest tenth goes)
+    IP_NAMES_KEEP = 20000         # address -> its names (audit #4)
+    ROOTS_KEEP = 60000            # registrable domains seen ("First visit")
+    OBS_SUBJECTS_KEEP = 60000     # subjects with observations
+    FLOW_STARTS_KEEP = 6000       # (device, remote) start times
+    TIMELINE_KEEP = 3000          # timeline lines in memory
+    RTT_KEEP = 2000               # round-trip times kept
+    BCAST_KEEP = 5000             # who sent the last broadcasts
+    OBS_RECENT_KEEP = 4000        # newest observations (sessions keep 3,000)
+    DEVICE_SITES_KEEP = 500       # websites listed on one device
+    DEVICE_REMOTES_KEEP = 500     # remote addresses listed on one device
+    HTTP_HOSTS_KEEP = 2000        # websites reached over plain HTTP
+    VPN_PEERS_KEEP = 1000         # addresses seen on a VPN port
+    DOH_CLIENTS_KEEP = 512        # addresses that used encrypted DNS
+    PENDING_KEEP = 200000         # waiting for the history store
 
     # (review 6) per-subject sizes, and what a full subject gives up
     OBS_KEEP_SITE = 16
@@ -23620,8 +23693,9 @@ class NetworkModel:
         if dq is None:
             if subj.startswith("flow:"):
                 self._forget_old_flow_subjects(subj)
-            if len(subjects) > 60000:
-                for k in list(subjects)[:6000]:
+            if len(subjects) > self.OBS_SUBJECTS_KEEP:
+                for k in list(itertools.islice(
+                        subjects, self.OBS_SUBJECTS_KEEP // 10)):
                     self._obs_drop(k)
             # 5.3.4 (M17, S7): a website's card shows 3 per device and
             # a connection's 3; 48 of each for 5,000 websites held
@@ -23675,6 +23749,13 @@ class NetworkModel:
                         continue
             keys.pop(old, None)
             self.obs_by_subject.pop(old, None)
+
+    def _note_doh(self, src_ip, hint):
+        if src_ip not in self.doh_seen and \
+                len(self.doh_seen) >= self.DOH_CLIENTS_KEEP:
+            # 5.3.4 (memory audit): the oldest address goes first
+            self.doh_seen.pop(next(iter(self.doh_seen)), None)
+        self.doh_seen[src_ip].add(hint)
 
     def observations_for(self, subject, kinds=None, limit=48):
         out = [o for o in self.obs_by_subject.get(subject, ())
@@ -23750,7 +23831,11 @@ class NetworkModel:
             t[2] = max(t[2], ts)
             t[3] += 1
         if self.obs_sink:
-            self.tie_pending.add((device, domain))
+            # 5.3.4 (memory audit): the store takes these every second;
+            # if it stops, the newest ties are not added (it was a set
+            # without end)
+            if len(self.tie_pending) < self.PENDING_KEEP:
+                self.tie_pending.add((device, domain))
         self.dirty_websites.add(domain)
 
     # ---- user corrections (undoable) ---------------------------------------
@@ -24383,7 +24468,7 @@ class NetworkModel:
             self._observe_dns(d, ts, src_dev, dst_dev)
         if d["doh_hint"] and self.config.get("dns.detect_encrypted_dns",
                                              True):
-            self.doh_seen[src_ip].add(d["doh_hint"])
+            self._note_doh(src_ip, d["doh_hint"])
             self.dns.encrypted_seen[d["doh_hint"]] += 1
 
         if self.registry.moved_ips:
@@ -24450,7 +24535,7 @@ class NetworkModel:
                 dev.type_hint = d["type_hint"]
             if internet:
                 rip = d["dst_ip"] if role == "sent" else d["src_ip"]
-                if rip and len(dev.remote_ips) < 500:
+                if rip and len(dev.remote_ips) < self.DEVICE_REMOTES_KEEP:
                     dev.remote_ips.add(rip)
             if role == "sent":
                 if dev.live and dev.traffic_baseline_flag(
@@ -25120,6 +25205,8 @@ class NetworkModel:
                 self.correlator.note_resolution(dkey, lname, ip, ts)
                 if self.obs_sink:
                     self.res_pending.append((ts, dkey, lname, ip))
+                    if len(self.res_pending) > self.PENDING_KEEP:
+                        del self.res_pending[:self.PENDING_KEEP // 4]
                 if rec is not None and dkey and lname == qname:
                     rec.lookups += 1
                     self.tie(dkey, lname, AS_LOOKUP_ONLY, ts)
@@ -25160,7 +25247,7 @@ class NetworkModel:
             fk = (flow.device_key, flow.remote_ip)
             q = self.flow_starts.get(fk)
             if q is None:
-                if len(self.flow_starts) >= 6000:
+                if len(self.flow_starts) >= self.FLOW_STARTS_KEEP:
                     old, _q = self.flow_starts.popitem(last=False)
                     self.flow_start_n.pop(old, None)
                 # C7: 24 is plenty for periodic_findings (needs 11)
@@ -25201,8 +25288,9 @@ class NetworkModel:
             new_root = reg not in roots
             if new_root:
                 roots[reg] = None
-                if len(roots) > 60000:
-                    for k in list(itertools.islice(roots, 6000)):
+                if len(roots) > self.ROOTS_KEEP:
+                    for k in list(itertools.islice(roots,
+                                                   self.ROOTS_KEEP // 10)):
                         del roots[k]
             rec = WebsiteRecord(domain=key, registrable=reg, first_seen=ts,
                                 last_seen=ts)
@@ -25210,9 +25298,10 @@ class NetworkModel:
             if category_shown(cat, src, self.config):
                 rec.category, rec.category_source = cat, src
             self.websites[key] = rec
-            if len(self.websites) > 20000:
+            if len(self.websites) > self.WEBSITES_KEEP:
                 for old in sorted(self.websites.values(),
-                                  key=lambda w: w.last_seen)[:2000]:
+                                  key=lambda w: w.last_seen)[
+                                      :self.WEBSITES_KEEP // 10]:
                     self.websites.pop(old.domain, None)
             if new_root and not self.in_discovery() and \
                     not self.use_packet_clock:
@@ -25227,14 +25316,17 @@ class NetworkModel:
                 rec.resolved_ips.add(ip)
             names = self.ip_to_domains.get(ip)
             if names is None:
-                names = self.ip_to_domains[ip] = OrderedDict()
-                if len(self.ip_to_domains) > 20000:         # was 60,000
-                    for k in list(self.ip_to_domains)[:2000]:
+                # 5.3.4 (memory audit): a plain dict keeps the order too,
+                # at about half an OrderedDict's size
+                names = self.ip_to_domains[ip] = {}
+                if len(self.ip_to_domains) > self.IP_NAMES_KEEP:
+                    for k in list(itertools.islice(
+                            self.ip_to_domains, self.IP_NAMES_KEEP // 10)):
                         self.ip_to_domains.pop(k, None)
             names.pop(key, None)
             names[key] = ts
             while len(names) > 8:
-                names.popitem(last=False)
+                del names[next(iter(names))]
             rh = self.remote_hosts.get(ip)
             if rh is not None:
                 if len(rh.domains) < 20:
@@ -25250,7 +25342,7 @@ class NetworkModel:
                 self._own_blocklist_name(dev, key)
             if len(rec.devices) < 200:
                 rec.devices.add(dev.key)
-            if len(dev.websites) < 500:
+            if len(dev.websites) < self.DEVICE_SITES_KEEP:
                 dev.websites.add(key)
         rec.requests += 1
         if connection:
@@ -25264,6 +25356,9 @@ class NetworkModel:
         if source == "HTTP Host":
             self.http_count += 1
             self.http_hosts[key] += 1
+            # 5.3.4 (memory audit): one key per website reached over
+            # plain HTTP, for ever; the Security page shows the top 6
+            trim_counter(self.http_hosts, self.HTTP_HOSTS_KEEP)
         doh = doh_name(key) if self.config.get(
             "dns.detect_encrypted_dns", True) else None
         if doh:
@@ -25297,7 +25392,8 @@ class NetworkModel:
             self._reputation_fill(rec)
             if len(self.remote_hosts) > self.REMOTE_MAX:
                 for old in sorted(self.remote_hosts.values(),
-                                  key=lambda r: r.last_seen)[:800]:
+                                  key=lambda r: r.last_seen)[
+                                      :self.REMOTE_MAX // 10]:
                     self.remote_hosts.pop(old.ip, None)
         rec.last_seen = max(rec.last_seen, ts)
         rec.packets += 1
@@ -25326,6 +25422,10 @@ class NetworkModel:
                 rec.domains.update(names)
         if rport in VPN_PORTS and d["transport"] == "UDP":
             self.vpn_bytes[pub] += d["length"]
+            # 5.3.4 (memory audit): one key per address on a VPN port
+            # (a VPN app that hops servers adds one each time); only
+            # the largest one is ever read
+            trim_counter(self.vpn_bytes, self.VPN_PEERS_KEEP)
         self.dirty_remotes.add(pub)
         if not rec.country:
             self.ev_geo.add(pub)
@@ -25833,6 +25933,7 @@ class NetworkModel:
             self.baselines.devices.pop(key, None)       # CO-03
             self.resets.pop(key, None)
             self.scans.forget(key)
+            self.dns.forget(key)             # 5.3.4 (memory audit)
             self.dirty_devices.discard(key)
             self._classify_dirty.discard(key)
         yield "lifecycle"
@@ -27568,7 +27669,10 @@ class Store:
             con.execute("DELETE FROM devices WHERE last_seen < ?", (cutoff,))
             for t, col in (("observations", "ts"), ("resolutions", "ts"),
                            ("flows", "end"), ("site_ties", "last"),
-                           ("events", "ts")):
+                           ("events", "ts"),
+                           # 5.3.4 (memory audit): one row per 8 MB packet
+                           # file, kept for ever after the file was gone
+                           ("packet_segments", "t1")):
                 con.execute(f"DELETE FROM {t} WHERE {col} < ?", (cutoff,))
             con.execute("DELETE FROM sessions WHERE ended IS NOT NULL AND "
                         "ended < ?", (cutoff,))
@@ -40648,6 +40752,7 @@ class DashboardTab(BaseTab):
 # ---- Happening (friendly feed) -------------------------------------------------
 class FeedTab(BaseTab):
     name, label_key = "feed", "tab_feed"
+    ROWS_KEEP = 500               # lines shown
 
     def build(self):
         self.speed = DEFAULT_FEED_SPEED
@@ -40851,8 +40956,11 @@ class FeedTab(BaseTab):
                     self.tree.yview_moveto(self.tree.index(anchor) /
                                            max(1, n))
             kids = self.tree.get_children()
-            if len(kids) > 500:
-                self.tree.delete(*kids[500:])
+            keep = self.ROWS_KEEP
+            if len(kids) > keep:
+                for old in kids[keep:]:
+                    self.kit.removed(old)    # 5.3.4 (memory audit)
+                self.tree.delete(*kids[keep:])
         return cfg["interval"]
 
     @staticmethod
@@ -40905,6 +41013,7 @@ TIMELINE_CATEGORY = {
 
 class TimelineTab(BaseTab):
     name, label_key = "timeline", "tab_timeline"
+    ROWS_KEEP = 1500              # lines shown
     VIEW_VARS = ("search_var", "type_var", "sev_var", "dev_var")
 
     def build(self):
@@ -41367,10 +41476,14 @@ class TimelineTab(BaseTab):
             if id(e) not in have and self._matches(e, cutoff, dev_key, q):
                 self._insert(e, index=0)
         kids = self.tree.get_children()
-        if len(kids) > 1500:
-            for old in kids[1500:]:
+        keep = self.ROWS_KEEP
+        if len(kids) > keep:
+            for old in kids[keep:]:
                 self.refs.pop(old, None)
-            self.tree.delete(*kids[1500:])
+                # 5.3.4 (memory audit): a sorted table kept each
+                # deleted row's sort entry
+                self.kit.removed(old)
+            self.tree.delete(*kids[keep:])
         self._update_status()
         self.kit.empty_soon()
 
@@ -41416,9 +41529,9 @@ class TimelineTab(BaseTab):
         rows = [e for e in self.model.timeline
                 if self._matches(e, cutoff, dev_key, q)]
         if self.episodes_var.get():
-            self._insert_episodes(rows[-1500:])
+            self._insert_episodes(rows[-self.ROWS_KEEP:])
         else:
-            for i, e in enumerate(reversed(rows[-1500:])):
+            for i, e in enumerate(reversed(rows[-self.ROWS_KEEP:])):
                 if i and i % 300 == 0:
                     yield
                     if self._fill_gen != my:
@@ -42607,7 +42720,10 @@ class ConnectionsTab(BaseTab):
                 f = self.model.flows.get(fid)
                 iid = self.iids.get(fid)
                 if f is None or iid is None:
-                    if f is not None and self._match(f, dev_key, q):
+                    # 5.3.4 (memory audit): a row of a connection the
+                    # model let go goes with the next regrouping
+                    if (f is None) != (iid is None) and (
+                            f is None or self._match(f, dev_key, q)):
                         self._group_dirty = True
                     continue
                 with contextlib.suppress(tk.TclError):
@@ -43373,6 +43489,25 @@ class RemoteTab(BaseTab):
                 continue
             tree_upsert(self.tree, self.iids, ip, self.values(r),
                         kit=self.kit)
+        self._trim_rows()
+
+    ROWS_KEEP = 5000              # as many as a rebuild shows
+
+    def _trim_rows(self):
+        """5.3.4 (memory audit): while the tab stayed open every new
+        address added a row, and an address the model had let go (past
+        its cap) kept its row: the table only grew. Past ROWS_KEEP the
+        rows of forgotten addresses go, then the smallest."""
+        if len(self.iids) <= self.ROWS_KEEP:
+            return
+        hosts = self.model.remote_hosts
+        gone = [ip for ip in self.iids if ip not in hosts]
+        extra = len(self.iids) - len(gone) - self.ROWS_KEEP
+        if extra > 0:
+            gone += sorted((ip for ip in self.iids if ip in hosts),
+                           key=lambda ip: hosts[ip].bytes_total)[:extra]
+        for ip in gone:
+            tree_remove(self.tree, self.iids, ip, kit=self.kit)
 
     def refresh(self):
         self.status_var.set(self.app._geoip_status_text())
@@ -43391,7 +43526,7 @@ class RemoteTab(BaseTab):
         self.kit.clear()
         recs = sorted(self.model.remote_hosts.values(),
                       key=lambda r: -r.bytes_total)
-        for i, r in enumerate(recs[:5000]):
+        for i, r in enumerate(recs[:self.ROWS_KEEP]):
             if i and i % 200 == 0:
                 yield
                 if self._fill_gen != my:
@@ -43637,6 +43772,13 @@ class AlertsTab(BaseTab):
         tags = ("ack",) if a.acknowledged else (a.severity,)
         tree_upsert(self.tree, self.iids, a.id, self.values(a), tags=tags,
                     index=0, kit=self.kit)
+        known = self.model.alerts.alerts
+        if len(self.iids) > len(known) + max(1, self.model.alerts.KEEP // 10):
+            # 5.3.4 (memory audit): the engine keeps its newest 500
+            # alerts; the rows of the ones it let go stayed. They go once
+            # there are 50 of them (a tenth of the cap)
+            for aid in [k for k in self.iids if k not in known]:
+                tree_remove(self.tree, self.iids, aid, kit=self.kit)
         self.review_soon()
 
     def review_soon(self):
@@ -52799,8 +52941,9 @@ class MiniWireshark:
             return
         if not router_mac and attempt < 6:
             # the router hasn't spoken yet; listen a little longer
-            self.root.after(10000, lambda: self._identify_network_async(
-                attempt + 1))
+            self._after_one("_network_check_job", 10000,
+                            lambda: self._identify_network_async(
+                                attempt + 1))
             return
         fp = network_fingerprint(router_mac or "unknown", subnet)
         self._roam_pending = False
@@ -56903,7 +57046,8 @@ proc ::mw_explicit_fonts {top names} {
         self.model.obs_sink = self._history_live()
         if self.network_fp:
             self.model.registry.network_id = self.network_fp
-        self.root.after(1500, self._identify_network_async)
+        self._after_one("_network_check_job", 1500,
+                        self._identify_network_async)
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self._start_lan_scanner()
@@ -57153,7 +57297,8 @@ proc ::mw_explicit_fonts {top names} {
                 self.model.push_timeline("capture", "INFO",
                                          f"Capture restarted on "
                                          f"“{self.current_iface_label}”")
-                self.root.after(120000, self._reset_restart_counter)
+                self._after_one("_restart_reset_job", 120000,
+                                self._reset_restart_counter)
             elif started and started[0] != self._capture_token:
                 # (35-checker review) Stop was pressed (or another start
                 # began) while the cards were tried: this attempt was
@@ -57169,8 +57314,24 @@ proc ::mw_explicit_fonts {top names} {
             done(False)
 
     def _reset_restart_counter(self):
+        self._restart_reset_job = None
         if self.sniffer is not None:
             self._restart_attempts = 0
+
+    def _after_one(self, attr, ms, fn):
+        """5.3.4 (memory audit, round 8): a timer of which only the
+        newest matters: the one still waiting is cancelled first. Each
+        capture start added a 120 s and a 1.5 s timer of its own, so a
+        capture restarted often (or the round 8 run) piled them up."""
+        old = getattr(self, attr, None)
+        if old:
+            with contextlib.suppress(tk.TclError, ValueError):
+                self.root.after_cancel(old)
+
+        def run():
+            setattr(self, attr, None)
+            fn()
+        setattr(self, attr, self.root.after(ms, run))
 
     def _on_network_snapshot(self, snap):
         self._last_snapshot = snap
@@ -57301,7 +57462,13 @@ proc ::mw_explicit_fonts {top names} {
         if getattr(self, "_rebuild_on_restore", False):
             self._rebuild_on_restore = False
             self._rebuild_tables_soon()
-        m = self.model
+        self._flush_ui_parts(self.model)
+        with contextlib.suppress(tk.TclError):
+            self.root.after(self._ms(700), self._flush_ui)
+
+    def _flush_ui_parts(self, m):
+        """One round of _flush_ui without the next one being scheduled
+        (the fast-time memory test calls it once a simulated minute)."""
         for part in (self._flush_events, self._flush_devices,
                      self._flush_websites, self._flush_remotes,
                      self._flush_flows, self._flush_geo):
@@ -57309,8 +57476,6 @@ proc ::mw_explicit_fonts {top names} {
                 part(m)
             except Exception:                        # noqa: BLE001
                 self._flush_failed(part.__name__)
-        with contextlib.suppress(tk.TclError):
-            self.root.after(self._ms(700), self._flush_ui)
 
     def _flush_failed(self, name):
         """Log (at most once a minute per part) and have the affected
@@ -57372,7 +57537,6 @@ proc ::mw_explicit_fonts {top names} {
             self.tabs["remote"].update_keys(keys)
 
     FLUSH_MAX = 250
-
     @classmethod
     def _take_dirty(cls, m, attr):
         """The changed rows for one table refresh, at most FLUSH_MAX; the
@@ -68675,6 +68839,12 @@ class MailTracker:
         rc.append(ts)
         while rc and ts - rc[0] > 60:
             rc.popleft()
+        if len(self.reconnects) > self.MAX:
+            # 5.3.4 (memory audit): one key per client and server, for
+            # ever; only the last minute is ever read
+            for k in [k for k, q in self.reconnects.items()
+                      if not q or ts - q[-1] > 60]:
+                del self.reconnects[k]
         if len(rc) == 10:
             self.finding(ts, "note", "Sequence",
                          f"{s.client} reconnected to the mail server "
@@ -69012,11 +69182,11 @@ class ProtocolTracker:
         self.dhcp = OrderedDict()  # xid -> state
         self.dhcp_servers = set()
         self._dhcp_warned = False
-        self.http = {}             # stream -> deque of pending requests
+        self.http = OrderedDict()  # stream -> deque of pending requests
         self.tls = OrderedDict()   # stream -> handshake state
         self.ntp = OrderedDict()   # (client, server, xmt) -> (ts, no)
         self.ssh = {}              # stream -> banners
-        self.mqtt = {}             # stream -> counters
+        self.mqtt = OrderedDict()  # stream -> counters
         self.counts = Counter()
         self.mail = MailTracker(self._emit_kw, self._finding)
         self.logins = OrderedDict()    # stream -> state (IP-013)
@@ -69030,6 +69200,12 @@ class ProtocolTracker:
     def closed(self, st, ts, how):
         """A TCP stream finished (FIN, RST, idle or memory)."""
         self.mail.closed(st, ts, how)
+        # 5.3.4 (memory audit): the stream's waiting requests and counts
+        # went on being kept, one entry per HTTP or MQTT connection
+        key = repr(st.key)
+        self.http.pop(key, None)
+        self.mqtt.pop(key, None)
+        self.ssh.pop(key, None)
 
     def take(self):
         out, self.out = self.out, []
@@ -69389,7 +69565,10 @@ class ProtocolTracker:
                                       m.direction == 0 else server[0],
                                       server[0] if m.direction == 0 else
                                       client[0], kind="rtsp")
-            q = self.http.setdefault(key, deque(maxlen=64))
+            q = self.http.get(key)
+            if q is None:
+                q = self.http[key] = deque(maxlen=64)
+                self._bound(self.http, self.MAX_PENDING)
             mm = re.match(r"^([A-Z]+) (\S+) HTTP/1\.\d", first)
             if m.direction == 0 and mm:
                 host = re.search(rb"\r\nhost:\s*([^\r\n]+)", data, re.I)
@@ -69459,7 +69638,10 @@ class ProtocolTracker:
             return None
         if m.kind == "mqtt" and data:
             t = data[0] >> 4
-            s = self.mqtt.setdefault(key, Counter())
+            s = self.mqtt.get(key)
+            if s is None:
+                s = self.mqtt[key] = Counter()
+                self._bound(self.mqtt, self.MAX_PENDING)
             s[_MQTT_TYPES.get(t, str(t))] += 1
             if t == 2 and len(data) >= 4:
                 rc = data[3]
@@ -71131,6 +71313,57 @@ class ScenarioBuilder:
             frames.append((tmpl[k % len(tmpl)], round(t, 6), 1))
         return frames
 
+
+def long_run_hosts(n=20):
+    """The steady devices of the long-run scenario: (ip, mac, name)."""
+    return [("192.168.1.%d" % (100 + i),
+             "02:00:5e:10:%02x:%02x" % (i // 256, i % 256), "") for i in
+            range(n)]
+
+
+def long_run_minute(minute, t0, hosts, names=2, seed=11, guests=False):
+    """5.3.4 (memory audit): one minute of a home network that runs for
+    days. The devices stay the same; what changes all the time is what
+    grows a memory: every device looks up `names` new websites a minute
+    (each on a new address, one in ten fails), opens a short connection
+    to each from a new port (one in ten ends with a reset), and every
+    fifth device fetches a page over plain HTTP. Every 10 minutes the
+    devices announce themselves and every 30 one device sweeps 70 ports
+    of another (an alert). With `guests`, once an hour a guest phone
+    arrives that never comes back (memory that grows with devices, not
+    with time). -> frames spread over the minute from t0."""
+    rng = random.Random(seed * 1000003 + minute)
+    sb = ScenarioBuilder(t0=t0, seed=minute)
+    sb.port = 20000 + (minute * 211) % 40000
+    sb.qid = (minute * 977) % 60000
+    L = sb.L
+    who = list(hosts)
+    if guests and minute % 60 == 30:
+        g = minute // 60
+        who.append(("192.168.1.%d" % (200 + g % 50),
+                    "da:%02x:%02x:00:00:01" % ((g >> 8) & 255, g & 255),
+                    ""))
+    for i, h in enumerate(who):
+        if minute % 10 == 0 or h not in hosts:
+            sb.arp_announce(h)
+        for j in range(names):
+            name = f"m{minute}-{i}-{j}.site{rng.randrange(10 ** 6)}.example"
+            rip = "34.%d.%d.%d" % (rng.randrange(1, 250), rng.randrange(256),
+                                   rng.randrange(1, 255))
+            sb.dns(h, name, rip, rcode=3 if rng.random() < 0.1 else 0)
+            sb.tls(h, name, rip, size=1500, rst=rng.random() < 0.1)
+        if i % 5 == 0:
+            sb.http(h, f"plain{minute % 500}.example.org",
+                    "34.117.%d.%d" % (minute % 250, i + 1))
+    if minute % 30 == 15 and len(hosts) > 1:
+        a, b = hosts[minute % len(hosts)], hosts[(minute + 1) % len(hosts)]
+        for k in range(70):
+            sb._emit(L.Ether(src=a[1], dst=b[1]) / L.IP(src=a[0], dst=b[0]) /
+                     L.TCP(sport=sb._next_port(), dport=1000 + k, flags="S"),
+                     dt=0.001)
+    n = max(1, len(sb.frames))
+    return [(raw, round(t0 + 59.0 * k / n, 6), lt)
+            for k, (raw, _ts, lt) in enumerate(sb.frames)]
 
 def scenario_identity():
     """(gateway, my_ips, my_macs, local_nets) of the scripted network."""
@@ -74553,9 +74786,15 @@ def t_store_roundtrip(ctx):
         raise AssertionError("write through query()")
     except ValueError:
         pass
+    assert st.write_segment(1, 9, 100.0, 101.0, "seg.pcap", 4096, 1)
+    now = time.time()
+    assert st.write_segment(10, 19, now, now, "seg2.pcap", 4096, 1)
+    assert st.flush_now(10)
     st.prune(1)          # everything above is from 1970: pruned
     assert st.flush_now(10)
     assert st.counts()["observations"] == 0
+    # 5.3.4 (memory audit): the rows of old packet files go too
+    assert st.query("SELECT first_no FROM packet_segments") == [(10,)]
     st.stop(5)
 
 
@@ -91258,6 +91497,388 @@ def t_534_aged_tables_forgotten(ctx):
     assert set(m.cache.seen) == set(m.cache.ip_to_name)
 
 
+@self_test()
+def t_534_memory_caps_hold(ctx):
+    """5.3.4 memory audit: each structure that had no bound now has one.
+    Websites reached over plain HTTP and addresses on a VPN port keep
+    their largest counts; addresses that used encrypted DNS, DNS servers
+    and what waits for the history store stop at their caps; a device
+    that leaves memory takes its DNS servers along; the lookup matcher
+    keeps no set of used pairs; a closed connection the archive lets go
+    is marked for the Connections table; the deep pass forgets a
+    stream's HTTP and MQTT state when the stream ends and holds at most
+    MAX_PENDING; the mail tracker forgets reconnect counts older than a
+    minute."""
+    m = NetworkModel(ctx.cfg(), "192.168.1.1", {"192.168.1.10"}, set())
+    m.HTTP_HOSTS_KEEP, m.VPN_PEERS_KEEP, m.DOH_CLIENTS_KEEP = 40, 20, 10
+    m.PENDING_KEEP = 100
+    for i in range(300):
+        m.register_website(f"h{i}.example", None, None, "HTTP Host",
+                           1000.0 + i)
+    for _ in range(9):
+        m.register_website("big.example", None, None, "HTTP Host", 2000.0)
+    assert len(m.http_hosts) <= 40 and m.http_hosts["big.example"] == 9, \
+        (len(m.http_hosts), m.http_hosts.most_common(1))
+    for i in range(200):
+        m.vpn_bytes["198.51.100.1"] += 10
+        m.vpn_bytes[f"203.0.113.{i}"] += 1
+        trim_counter(m.vpn_bytes, m.VPN_PEERS_KEEP)
+    assert len(m.vpn_bytes) <= 20 and \
+        m.vpn_bytes.most_common(1)[0][0] == "198.51.100.1"
+    for i in range(40):
+        m._note_doh(f"192.168.1.{100 + i}", "dns.google")
+        m._note_doh("192.168.1.100", "cloudflare-dns.com")
+    assert len(m.doh_seen) <= 10 and \
+        m.doh_seen["192.168.1.139"] == {"dns.google"}, dict(m.doh_seen)
+    m.obs_sink = True
+    for i in range(500):
+        m.observe("dns_query", "aa:bb:cc:00:00:01", float(i),
+                  {"domain": "x.example"})
+        m.tie("aa:bb:cc:00:00:01", "h1.example", AS_CONNECTED, float(i))
+        m.websites[f"t{i}.example"] = WebsiteRecord(
+            domain=f"t{i}.example", registrable=f"t{i}.example")
+        m.tie(f"dev{i}", f"t{i}.example", AS_CONNECTED, float(i))
+    assert len(m.obs_pending) <= 100 and len(m.tie_pending) <= 100, \
+        (len(m.obs_pending), len(m.tie_pending))
+    # DNS servers: the one quiet the longest goes; devices take theirs
+    dt = DnsTracker()
+    dt.SERVERS_KEEP = 8
+    for i in range(30):
+        dt.on_query(100.0 + i, "192.168.1.20", f"203.0.113.{i}",
+                    {"qname": "a.example", "id": i}, dev_key="dev1")
+    dt.on_query(500.0, "192.168.1.20", "203.0.113.29", {"qname": "b",
+                                                         "id": 99},
+                dev_key="dev1")
+    assert len(dt.servers) == 8 and "203.0.113.29" in dt.servers and \
+        "203.0.113.0" not in dt.servers, sorted(dt.servers)
+    assert "dev1" in dt.device_servers
+    dt.forget("dev1")
+    assert "dev1" not in dt.device_servers and "dev1" not in dt.device_last
+    assert not hasattr(LookupCorrelator(), "used")
+    # the Connections table hears of a closed connection that is let go
+    ft = FlowTable(200, 100)
+    for i in range(400):
+        k = ("TCP", "192.168.1.20", 40000 + i, "203.0.113.9", 443)
+        ft.lookup_or_create(k, "TCP", k[1], k[2], k[3], k[4], float(i))
+    ft.dirty.clear()
+    ft.expire(10 ** 6)
+    gone = [fid for fid in ft.dirty if ft.get(fid) is None]
+    assert gone and len(ft.by_id) <= 300, (len(gone), len(ft.by_id))
+    # a smaller archive lets go of the numbers of what it dropped
+    ft.dirty.clear()
+    ft.resize(200, 100)
+    assert len(ft.archive) == 100 and len(ft.by_id) == 100 + len(ft.active)
+    ft.resize(200, 150)
+    assert len(ft.by_id) == len(ft.archive) + len(ft.active)
+    # a device's 16 addresses are the ones it used last, not any 16
+    reg = DeviceRegistry("192.168.1.1", {"192.168.1.10"}, ctx.cfg())
+    dev = reg.touch("192.168.1.30", "02:aa:00:00:00:01", "arp_reply",
+                    "", 100.0)
+    for i in range(40):
+        reg._assign_ip(dev, "10.0.0.%d" % (i % 20 + 1), 200.0 + i)
+    assert len(dev.ipv4s) == 16 and dev.ip == "10.0.0.20", sorted(dev.ipv4s)
+    assert dev.ipv4s == {"10.0.0.%d" % n for n in range(5, 21)}, \
+        sorted(dev.ipv4s)
+    # the deep pass: HTTP streams that never end, then the end of capture
+    da = DeepAnalyzer(my_ips={ScenarioBuilder.ME[0]})
+    da.proto.MAX_PENDING = 16
+    sb = ScenarioBuilder()
+    for i in range(60):
+        sb.http(ScenarioBuilder.PHONE, f"s{i}.example", f"34.1.0.{i + 1}")
+    for no, (raw, ts, lt) in enumerate(sb.frames, 1):
+        da.process(no, ts, lt, raw)
+    assert 0 < len(da.proto.http) <= 16, len(da.proto.http)
+    da.flush(sb.t + 10, final=True)
+    assert not da.proto.http and not da.proto.mqtt, len(da.proto.http)
+    # the mail tracker: one key per client and mail server, for a minute
+    mt = MailTracker(lambda **k: None, lambda *a: None)
+    mt.MAX = 16
+    for i in range(200):
+        st = types.SimpleNamespace(
+            key=(("192.168.1.20", 40000 + i), (f"203.0.113.{i}", 25)),
+            a=("192.168.1.20", 40000 + i))
+        msg = types.SimpleNamespace(kind="line", data=b"220 mx ESMTP\r\n",
+                                    direction=1)
+        assert mt.session(st, 1000.0 + i * 10, msg) is not None
+        mt.closed(st, 1000.0 + i * 10, "closed")
+    assert len(mt.reconnects) <= 16 + 1, len(mt.reconnects)
+
+
+# ---- 5.3.4 memory audit: what grows with time is held to a size --------------
+#  The 8-hour Windows soak grew 8-9 MB an hour while the devices stayed the
+#  same. These tests run days of a network in fast time instead: the model
+#  clock is moved on by hand, every minute brings new websites, addresses,
+#  ports and connections, and what can grow with time (not with devices)
+#  must stay under its cap while memory stays flat.
+MEMORY_CAPS = (
+    (NetworkModel, "WEBSITES_KEEP"), (NetworkModel, "REMOTE_MAX"),
+    (NetworkModel, "IP_NAMES_KEEP"), (NetworkModel, "ROOTS_KEEP"),
+    (NetworkModel, "OBS_SUBJECTS_KEEP"), (NetworkModel, "OBS_SITE_BUDGET"),
+    (NetworkModel, "FLOW_STARTS_KEEP"), (NetworkModel, "HTTP_HOSTS_KEEP"),
+    (NetworkModel, "VPN_PEERS_KEEP"), (NetworkModel, "DOH_CLIENTS_KEEP"),
+    (NetworkModel, "PENDING_KEEP"), (NetworkModel, "TIMELINE_KEEP"),
+    (NetworkModel, "OBS_RECENT_KEEP"), (NetworkModel, "RTT_KEEP"),
+    (NetworkModel, "BCAST_KEEP"),
+    (NetworkModel, "DEVICE_SITES_KEEP"),
+    (NetworkModel, "DEVICE_REMOTES_KEEP"), (NameCache, "MAX"),
+    (AlertEngine, "DEBOUNCE_KEEP"),
+    (AlertEngine, "KEEP"),
+    (DnsTracker, "DOMAINS_KEEP"), (DnsTracker, "SERVERS_KEEP"),
+    (DeviceRegistry, "ELIG_KEEP"))
+MEMORY_TABLE_CAPS = ((FeedTab, "ROWS_KEEP"), (TimelineTab, "ROWS_KEEP"),
+                     (RemoteTab, "ROWS_KEEP"))
+
+
+# the address memos (functools.lru_cache), called by name at each use
+MEMORY_MEMOS = ("_is_private_cached", "_is_public_cached",
+                "_is_unicast_mac_cached", "_ip_obj_cached",
+                "_mcast_or_bcast_cached", "_classify_address_cached")
+
+
+@contextlib.contextmanager
+def scaled_memory_caps(div):
+    """Every cap in MEMORY_CAPS divided by `div` (at least 8) while the
+    block runs, so a run of a few fast-time hours fills them all; the code
+    that holds them is the same. Always put back."""
+    saved = [(cls, name, cls.__dict__[name])
+             for cls, name in MEMORY_CAPS + MEMORY_TABLE_CAPS]
+    g = globals()
+    memos = {name: g[name] for name in MEMORY_MEMOS}
+    plain = {"_ADDR_TEXT_MAX": g["_ADDR_TEXT_MAX"],
+             "METRIC_TIERS": g["METRIC_TIERS"]}
+    try:
+        for cls, name, v in saved:
+            setattr(cls, name, max(8, v // div))
+        for name, fn in memos.items():
+            g[name] = functools.lru_cache(maxsize=max(
+                8, fn.cache_info().maxsize // div))(fn.__wrapped__)
+        g["_ADDR_TEXT_MAX"] = max(8, plain["_ADDR_TEXT_MAX"] // div)
+        # a day of minutes becomes a shorter day; the 1-second tier keeps
+        # the minute that the checks read
+        g["METRIC_TIERS"] = tuple((res, max(60 if res == 1 else 12,
+                                            n // div))
+                                  for res, n in plain["METRIC_TIERS"])
+        yield
+    finally:
+        for cls, name, v in saved:
+            setattr(cls, name, v)
+        g.update(memos)
+        g.update(plain)
+
+
+def memory_census(m):
+    """What a long live run can fill, and the size each must stay under:
+    {name: (size, cap)}. Device tables are checked against the devices."""
+    ft, reg, c = m.flows, m.registry, m.correlator
+    flows_cap = ft.max_active + (ft.archive.maxlen or 0)
+    devs = len(reg.by_key)
+    return {
+        "websites": (len(m.websites), m.WEBSITES_KEEP),
+        "remote addresses": (len(m.remote_hosts), m.REMOTE_MAX),
+        "names per address": (len(m.ip_to_domains), m.IP_NAMES_KEEP),
+        "first-visit domains": (len(m._seen_roots or ()), m.ROOTS_KEEP),
+        "observed subjects": (len(m.obs_by_subject),
+                              m.OBS_SUBJECTS_KEEP + 1),
+        "website observations": (m.obs_site_held, m.OBS_SITE_BUDGET),
+        "connection subjects": (len(m.obs_flow_keys), flows_cap),
+        "connection start times": (len(m.flow_starts), m.FLOW_STARTS_KEEP),
+        "plain HTTP websites": (len(m.http_hosts), m.HTTP_HOSTS_KEEP),
+        "VPN addresses": (len(m.vpn_bytes), m.VPN_PEERS_KEEP),
+        "encrypted DNS users": (len(m.doh_seen), m.DOH_CLIENTS_KEEP),
+        "names learned": (len(m.cache.ip_to_name), m.cache.MAX),
+        # (30 minutes, and at most 200,000: the review thread's part)
+        "lookups": (len(c.order), 200000),
+        "lookups per address": (len(c.by_ip), 200000),
+        "lookups per device": (len(c.by_dev_ip), 200000),
+        "names asked": (len(m.dns.domains), m.dns.DOMAINS_KEEP),
+        "DNS servers": (len(m.dns.servers), m.dns.SERVERS_KEEP),
+        "DNS waiting": (len(m.dns.pending), 4096),
+        "alerts": (len(m.alerts.alerts), m.alerts.KEEP),
+        "alerts still open": (len(m.alerts._open), m.alerts.KEEP),
+        "alert repeats": (len(m.alerts._debounce),
+                          m.alerts.DEBOUNCE_KEEP + 1),
+        "timeline": (len(m.timeline), m.timeline.maxlen),
+        "recent observations": (len(m.obs_recent), m.obs_recent.maxlen),
+        "round-trip times": (len(m.rtt_samples), m.rtt_samples.maxlen),
+        "broadcast senders": (len(m.bcast_talkers), m.bcast_talkers.maxlen),
+        "observations for history": (len(m.obs_pending), m.PENDING_KEEP),
+        "lookups for history": (len(m.res_pending), m.PENDING_KEEP),
+        "website ties for history": (len(m.tie_pending), m.PENDING_KEEP),
+        "connections": (len(ft.active), ft.max_active),
+        "closed connections": (len(ft.archive), ft.archive.maxlen),
+        "connection numbers": (len(ft.by_id), flows_cap),
+        "baselines": (len(m.baselines.devices), devs),
+        "reset counts": (len(m.resets), devs),
+        "ARP claims": (len(reg.arp_claims), devs + 1),
+        "DNS servers per device": (len(m.dns.device_servers), devs),
+        "websites of a device": (max((len(d.websites) for d in
+                                      reg.by_key.values()), default=0),
+                                 m.DEVICE_SITES_KEEP),
+        "remote addresses of a device": (
+            max((len(d.remote_ips) for d in reg.by_key.values()),
+                default=0), m.DEVICE_REMOTES_KEEP),
+        "metric buckets": (max(sum(len(od) for od in ts.tiers.values())
+                               for ts in m.metrics.series.values()),
+                           sum(n for _r, n in METRIC_TIERS)),
+        "device-address memo": (len(reg._elig), reg.ELIG_KEEP + 1),
+        "address texts": (max(len(_IP4_TEXT), len(_MAC_TEXT)),
+                          _ADDR_TEXT_MAX),
+        **{"memo " + n: (globals()[n].cache_info().currsize,
+                         globals()[n].cache_info().maxsize)
+           for n in MEMORY_MEMOS},
+    }
+
+
+def memory_over_caps(m):
+    """{name: (size, cap)} of what is over its cap now (empty = all well)."""
+    return {k: v for k, v in memory_census(m).items() if v[0] > v[1]}
+
+
+def drain_like_the_window(m):
+    """What the window takes from the model every second or so (the
+    tables, the feed, the history store), here thrown away."""
+    m.ev_feed.clear()
+    m.ev_timeline.clear()
+    m.ev_alerts.clear()
+    m.ev_banner.clear()
+    m.ev_geo.clear()
+    for attr in ("dirty_devices", "dirty_websites", "dirty_remotes"):
+        getattr(m, attr).clear()
+    m.flows.dirty.clear()
+    m.flows.closed_now.clear()
+    m.flows.closed_log.clear()
+    m.registry.rekeyed, m.registry.removed = [], []
+    m.obs_pending, m.res_pending, m.tl_pending = [], [], []
+    m.tie_pending = set()
+
+
+def memory_fast_time(cfg, minutes=160, settle=0, measure=(100, 160),
+                     hosts=8, names=2, tick_every=20.0):
+    """Runs the long-run scenario through a live-like model (its own clock,
+    moved on by hand, starting at 22:00 so the run crosses midnight and
+    each hour). tracemalloc starts at `settle` and is read at the two
+    `measure` minutes (by then everything that churns has been replaced
+    once, so what was made before the start no longer counts). ->
+    (model, [(minute, what was over its cap)], the last census, growth
+    figures). The census is taken every minute and only what was over is
+    kept, so the run itself holds nothing more as it goes."""
+    import tracemalloc
+    day = time.localtime(SCENARIO_T0)
+    t0 = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 22, 0, 0, 0, 0,
+                      -1))
+    clock = [t0]
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(cfg, gw, ips, macs, now_fn=lambda: clock[0])
+    m.set_identity(local_nets=nets)
+    m.flows.resize(200, 100)
+    m.capture_started = t0 - 3600          # past discovery
+    m.obs_sink = True                      # the history path too
+    dec = fast_frame_decoder(m)
+    who = long_run_hosts(hosts)
+    over, last, snaps, traced, objs = [], {}, {}, {}, {}
+    no = 0
+    was = tracemalloc.is_tracing()
+    try:
+        for minute in range(minutes + 1):
+            start = t0 + 60.0 * minute
+            next_tick = start + tick_every
+            for raw, ts, lt in long_run_minute(minute, start, who, names):
+                clock[0] = ts
+                d = dec(raw, ts, lt)
+                if d is None:
+                    continue
+                no += 1
+                d["no"] = no
+                learn_names_from(m.cache, d)
+                m.ingest(d)
+                if ts >= next_tick:
+                    m.tick()
+                    drain_like_the_window(m)
+                    next_tick += tick_every
+            clock[0] = start + 60.0
+            m.tick()
+            drain_like_the_window(m)
+            last = memory_census(m)
+            bad = {k: v for k, v in last.items() if v[0] > v[1]}
+            if bad and len(over) < 20:
+                over.append((minute, bad))
+            if minute == settle and not was:
+                gc.collect()
+                tracemalloc.start(1)
+            if minute in measure:
+                last = None
+                gc.collect()
+                objs[minute] = len(gc.get_objects())
+                if tracemalloc.is_tracing():
+                    snaps[minute] = tracemalloc.take_snapshot()
+                    traced[minute] = tracemalloc.get_traced_memory()[0]
+    finally:
+        if not was and tracemalloc.is_tracing():
+            tracemalloc.stop()
+    a, b = measure
+    growth = {"packets": no, "devices": len(m.registry.by_key)}
+    if a in snaps and b in snaps:
+        diffs = [st for st in snaps[b].compare_to(snaps[a], "lineno")
+                 if st.size_diff > 0]
+        diffs.sort(key=lambda st: -st.size_diff)
+        growth["total"] = traced[b] - traced[a]
+        growth["held"] = (traced[a], traced[b])
+        growth["top"] = [(f"{os.path.basename(st.traceback[0].filename)}:"
+                          f"{st.traceback[0].lineno}", st.size_diff)
+                         for st in diffs[:8]]
+    if a in objs and b in objs:
+        growth["objects"] = (objs[a], objs[b])
+    return m, over, memory_census(m), growth
+
+
+# Measured (Linux, Python 3.12 and 3.8): about 3.8 MB held at minute 100;
+# from minute 100 to 160 +14 to +63 KB in all, at most 17 KB on one line
+# (the address-text memo, which empties itself when full), and from 9
+# objects fewer to 143 more (the night-upload minutes of the second
+# audit's check fill while the run crosses midnight, and are kept for a
+# fixed window). The limits are four to ten times that, and well under
+# what one leaked object per new website would add in that hour (960
+# websites: about 960 objects and 400 KB).
+MEMORY_FLAT_LIMIT = 256 * 1024
+MEMORY_FLAT_LINE = 64 * 1024
+MEMORY_FLAT_OBJECTS = 300
+
+
+@self_test(slow=True)
+def t_534_memory_flat_in_fast_time(ctx):
+    """5.3.4 memory audit: 160 fast-time minutes of a network whose
+    devices stay the same but which reaches new websites, addresses and
+    ports every minute (short connections, failed lookups, resets, a port
+    sweep every half hour; minute, hour and midnight rollovers). With
+    every cap divided by 80 so the run fills them all: nothing that grows
+    with time ever passes its cap, and from minute 100 to 160 the memory
+    still held grows by less than MEMORY_FLAT_LIMIT, no line by more than
+    MEMORY_FLAT_LINE, and the number of Python objects by less than
+    MEMORY_FLAT_OBJECTS."""
+    with scaled_memory_caps(80):
+        m, over, end, g = memory_fast_time(ctx.cfg())
+        assert not over, over[:3]
+        # the run filled what it should have: these were at their caps
+        # (a Counter is cut to half, the others lose a tenth)
+        for name in ("websites", "remote addresses", "names per address",
+                     "first-visit domains", "names learned",
+                     "plain HTTP websites", "closed connections",
+                     "timeline", "metric buckets", "memo _ip_obj_cached",
+                     "websites of a device"):
+            assert end[name][0] >= 0.5 * end[name][1], (name, end[name])
+        assert g["devices"] <= 8 + 2, g["devices"]     # and the router
+        assert len(m.alerts.alerts) > 0, "the port sweeps raised no alert"
+        assert "total" in g, "tracemalloc was already running"
+        o0, o1 = g["objects"]
+        print(f"      ({g['packets']} packets; held {g['held'][0] // 1024} "
+              f"KB at minute 100, {g['held'][1] // 1024} KB at 160, growth "
+              f"{g['total'] / 1024:+.0f} KB; objects {o0} -> {o1}; most: "
+              f"{g['top'][:3]})")
+        assert g["total"] < MEMORY_FLAT_LIMIT, g
+        assert not g["top"] or g["top"][0][1] < MEMORY_FLAT_LINE, g["top"]
+        assert o1 - o0 < MEMORY_FLAT_OBJECTS, (o0, o1)
+
+
 @self_test(needs_source=True)
 def t_534_soak_one_job_per_name(ctx):
     """5.3.4 soak: while a job's thread is blocked, a second request starts
@@ -98756,6 +99377,227 @@ def gt_r8_long_run_fast_time(app, ctx):
     assert end[0] <= base[0] + 1, ("Python threads", base[0], end[0])
     assert end[1] <= base[1] + 1, ("OS threads", base[1], end[1])
     assert end[2] <= base[2] + 1, ("open files", base[2], end[2])
+    # 5.3.4 memory audit: each capture start left a 120 s and a 1.5 s timer
+    # of its own (13 -> 27 here); one of each may wait now
+    assert census1[1] <= census0[1] + 2, ("Tk timers", census0, census1)
+    assert census1[0] == census0[0], ("Tk widgets", census0, census1)
+
+
+def tk_census(app):
+    """5.3.4 memory audit: what the window holds in Tk, counted. Widgets,
+    table rows, canvas items, text tags and marks, bindings, timers,
+    images, fonts, Tcl commands (each Python callback is one), Tcl
+    variables (each StringVar or IntVar is one) and their traces, and the
+    table kits' per-row records."""
+    root = app.root
+    out = Counter()
+    sl = root.tk.splitlist
+
+    def rows(tree, parent=""):
+        kids = tree.get_children(parent)
+        return len(kids) + sum(rows(tree, k) for k in kids)
+
+    def walk(w):
+        out["widgets"] += 1
+        try:
+            cls = w.winfo_class()
+            if cls == "Treeview":
+                out["table rows"] += rows(w)
+            elif cls == "Canvas":
+                out["canvas items"] += len(w.find_all())
+            elif cls == "Text":
+                out["text tags"] += len(w.tag_names())
+                out["text marks"] += len(w.mark_names())
+                out["text windows"] += len(w.window_names())
+            out["bindings"] += len(w.bind())
+        except tk.TclError:
+            pass
+        for ch in w.winfo_children():
+            walk(ch)
+    walk(root)
+    out["timers"] = len(sl(root.tk.call("after", "info")))
+    out["images"] = len(root.image_names())
+    out["fonts"] = len(tkfont.names(root))
+    out["Tcl commands"] = len(sl(root.tk.call("info", "commands")))
+    names = sl(root.tk.call("info", "globals"))
+    out["Tcl variables"] = len(names)
+    for n in names:
+        with contextlib.suppress(tk.TclError):
+            out["variable traces"] += len(sl(root.tk.call(
+                "trace", "info", "variable", n)))
+    out["global bindings"] = len(root.bind_all())
+    out["table kits"] = len(app.kits)
+    for kit in app.kits:
+        out["kit row records"] += len(kit._ent) + len(kit.dotted) + \
+            len(kit._rel_text)
+    for name, tab in app.tabs.items():
+        tree = getattr(tab, "tree", None)
+        if tree is not None:
+            with contextlib.suppress(tk.TclError):
+                out["rows " + name] = rows(tree)
+    return out
+
+
+# what must not move at all once the window has run for a while, and what
+# may move a little with what is on screen. Measured from minute 80 to
+# 240: widgets 743 -> 744 (the Security tab draws its finding cards
+# again when they change, one more or one fewer row), Tcl commands +3,
+# bindings +1, canvas items +2, timers and global bindings move by one or
+# two as jobs come and go. A leak of what one refresh makes would add
+# that much again every minute, 80 times over, so these margins still
+# catch it
+TK_FLAT_EXACT = ("images", "fonts", "Tcl variables", "variable traces",
+                 "table kits", "text windows")
+TK_FLAT_SLACK = {"widgets": 20, "Tcl commands": 30, "bindings": 30,
+                 "canvas items": 400, "text tags": 60, "text marks": 20,
+                 "timers": 3, "global bindings": 4}
+
+
+@gui_test_step("5.3.4 memory audit: the window stays flat in fast time "
+               "(tables, canvases, timers, bindings, variables)")
+def gt_534_memory_flat_window(app, ctx):
+    """Over three fast-time hours of the long-run scenario through the real
+    window: packets through the capture path, the model clock moved on by
+    hand, model upkeep, the tables' updates, a tab switch every minute and
+    the shown tab refreshed, the Inspector and a device card now and then.
+    With the caps divided by 80, and the Packets list kept to its
+    smallest (500 rows) so that the rows waiting for it while it is hidden
+    (up to twice that) do not swamp the measure. After 120 minutes of
+    warm-up the Tk counts stay where they were (TK_FLAT_EXACT exactly,
+    the rest within TK_FLAT_SLACK), every table stays under its cap, and
+    the window's Python memory still held grows less than
+    GUI_FLAT_LIMIT."""
+    import tracemalloc
+    root = app.root
+    hosts = long_run_hosts(8)
+    names = list(app.tabs)
+    censuses, model_over = {}, []
+    old_max = app.config.get("capture.max_stored_events", 5000)
+    app.config.set("capture.max_stored_events", 500)
+    app._apply_runtime_settings()
+    with scaled_memory_caps(80):
+        app.stop()
+        app._leave_nonlive()
+        ident = scenario_identity()
+        day = time.localtime(SCENARIO_T0)
+        t0 = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 23, 0, 0,
+                          0, 0, -1))
+        clock = [t0]
+        m = app._new_model(identity=ident[:3])
+        m.set_identity(local_nets=ident[3])
+        m._clock = lambda: clock[0]
+        m.flows.resize(200, 100)
+        app.replace_model(m)
+        app.data_mode = "live"
+        m.capture_started = t0 - 3600
+        sink = app.lossless_sink()
+        held = {}
+        try:
+            for minute in range(GUI_FLAT_MINUTES + 1):
+                start = t0 + 60.0 * minute
+                frames = long_run_minute(minute, start, hosts)
+                want = app.count + len(frames)
+                for raw, ts, lt in frames:
+                    clock[0] = ts
+                    sink(raw, ts, lt)
+                assert _gui_pump(root, 0.0, lambda: app.count >= want and
+                                 not len(app.ring) and not app.worker.busy,
+                                 timeout=60), (minute, app.count, want)
+                clock[0] = start + 60.0
+                done = []
+                app.tick_model_stepped(lambda: done.append(1))
+                assert _gui_pump(root, 0.0, lambda: done, timeout=30)
+                app._flush_ui_parts(app.model)
+                app._select_tab(names[minute % len(names)])
+                _gui_pump(root, 0.02)
+                for tab in app.tabs.values():
+                    if tab.is_visible():
+                        tab.refresh()
+                if minute % 10 == 5:
+                    key = next(iter(m.registry.by_key), None)
+                    if key:
+                        app.inspect("device", key)
+                        app.inspector.refresh()
+                        app.show_device(key)
+                        _gui_pump(root, 0.1)
+                        for w in root.winfo_children():
+                            if isinstance(w, tk.Toplevel) and \
+                                    w.winfo_exists() and \
+                                    w is not getattr(app, "_loader", None):
+                                with contextlib.suppress(tk.TclError):
+                                    if w.title() and w.winfo_viewable():
+                                        w.destroy()
+                _gui_pump(root, 0.03)
+                over = memory_over_caps(m)
+                if over:
+                    model_over.append((minute, over))
+                if minute == 0:
+                    gc.collect()
+                    tracemalloc.start(1)   # from the start (see the model test)
+                if minute in GUI_FLAT_AT:
+                    _gui_pump(root, 0.3)
+                    gc.collect()
+                    censuses[minute] = tk_census(app)
+                    if tracemalloc.is_tracing():
+                        held[minute] = tracemalloc.get_traced_memory()[0]
+            caps = {"rows feed": FeedTab.ROWS_KEEP,
+                    "rows timeline": TimelineTab.ROWS_KEEP,
+                    "rows remote": RemoteTab.ROWS_KEEP,
+                    "rows alerts": AlertEngine.KEEP + max(
+                        1, AlertEngine.KEEP // 10),
+                    "rows connections": m.flows.max_active +
+                    m.flows.archive.maxlen,
+                    # rows and their group rows
+                    "rows websites": 2 * NetworkModel.WEBSITES_KEEP,
+                    "rows devices": len(m.registry.by_key)}
+        finally:
+            if tracemalloc.is_tracing():
+                tracemalloc.stop()
+            app.data_mode = "idle"
+            app.config.set("capture.max_stored_events", old_max)
+            app._apply_runtime_settings()
+    base = censuses[GUI_FLAT_AT[0]]
+    later = [censuses[k] for k in GUI_FLAT_AT[1:]]
+    last = later[-1]
+    print(f"      (minute {GUI_FLAT_AT[0]}: {dict(base)})")
+    print(f"      (minute {GUI_FLAT_AT[-1]} vs {GUI_FLAT_AT[0]}: " +
+          ", ".join(f"{k} {base[k]}->{last[k]}" for k in sorted(base)
+                    if base[k] != last[k]) + "; Python held " +
+          ", ".join(f"{held[k] // 1024} KB at {k}" for k in GUI_FLAT_AT) +
+          ")")
+    assert not model_over, model_over[:3]
+    for k in TK_FLAT_EXACT:
+        assert all(c[k] == base[k] for c in later), \
+            (k, [c[k] for c in [base] + later])
+    for k, slack in TK_FLAT_SLACK.items():
+        assert all(c[k] <= base[k] + slack for c in later), \
+            (k, slack, [c[k] for c in [base] + later])
+    for c in [base] + later:
+        for k, cap in caps.items():
+            assert c[k] <= cap, (k, c[k], cap)
+        assert c["kit row records"] <= 3 * c["table rows"] + 50, \
+            (c["kit row records"], c["table rows"])
+    grew = max(held[k] for k in GUI_FLAT_AT[1:]) - held[GUI_FLAT_AT[0]]
+    assert grew < GUI_FLAT_LIMIT, (grew, held)
+    # back to the scenario capture for the steps that follow
+    frames = ctx.frames()
+    app.import_pcap_path(ctx.path("scenario.pcap"))
+    assert _gui_pump(root, 0.5, lambda: app.importer is None and
+                     app.data_mode == "offline" and
+                     app.model.count >= len(frames), timeout=60)
+    _gui_pump(root, 1.0)
+
+
+# 5.3.4: measured from minute 120 (when the Packets list and the rows
+# waiting for it have filled) on: the Python memory still held moved by at
+# most +620 KB and came back (6910, 7000, 7530, 7000 KB at minutes 120,
+# 160, 200 and 240). The rise from minute 80 to 120 (+1.1 MB) was those
+# rows filling up to their cap. 2 MB is about three times the measured
+# swing; one leaked decoded packet (about 850 bytes) for each packet
+# would go past it within a few minutes
+GUI_FLAT_LIMIT = 2 * 1024 * 1024
+GUI_FLAT_MINUTES = 200
+GUI_FLAT_AT = (120, 160, 200)    # the first is the base, after warm-up
 
 
 def _gui_focus_main(app):
