@@ -37,7 +37,7 @@ MiniWireshark mostly *listens*. It sends something in the following cases, each 
 | What | When | Where it goes |
 |---|---|---|
 | Update check | Once a day, unless you turn it off | `api.github.com`, for the latest release number only |
-| Reference lists | Only when you ask for them in the Components Center, or weekly if you choose *Weekly* there (the default is *Manual*) | `wireshark.org` (vendor names), `publicsuffix.org`, and each optional list you turn on there (`iana.org`, `iptoasn.com`, `raw.githubusercontent.com`, `feodotracker.abuse.ch`, `spamhaus.org`). Plain file downloads. |
+| Reference lists | Only when you ask: Get or Check now in the Components Center, Refresh now in Settings, or Updates set to *Weekly* (the default is *Manual*; with Weekly a missing list is fetched at start, and a list more than 30 days old again) | `wireshark.org` (vendor names), `publicsuffix.org`, and each optional list you turn on there (`iana.org`, `iptoasn.com`, `raw.githubusercontent.com`, `feodotracker.abuse.ch`, `spamhaus.org`). Plain file downloads. |
 | Private Python and packages | Only when you approve the download list | `python.org` and the Python Package Index (`pypi.org`, `files.pythonhosted.org`) |
 | Npcap (Windows) | Only when you choose to install it | `npcap.com` |
 | Health checks | Every 30 seconds while watching live, but only on a network you marked as yours, with Active Scanning on (never in Quiet Mode). Turn them off in **Settings → Network Health**. | Your router, your DNS server, and one test address: `1.1.1.1` port 443 (Cloudflare) unless you change it there |

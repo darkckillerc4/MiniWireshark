@@ -89,6 +89,7 @@ import gc
 import gzip
 import hashlib
 import html
+import http.client
 import importlib
 import inspect
 import itertools
@@ -1110,7 +1111,10 @@ def load_json_store(path, kind=dict):
     except ValueError:
         pass
     try:
-        atomic_write_bytes(f"{path}.damaged-{int(time.time())}", raw)
+        # (35-checker review) one copy of the same damage: a store that is
+        # never saved again was set aside once more on every start
+        if not damaged_copy_exists(path, raw):
+            atomic_write_bytes(f"{path}.damaged-{int(time.time())}", raw)
     except OSError:
         return None, "unreadable"
     bak = read_json(path + ".bak", None)
@@ -1119,6 +1123,26 @@ def load_json_store(path, kind=dict):
         return bak, "restored"
     LOG.warning("%s was damaged and set aside", path)
     return None, "damaged"
+
+
+def damaged_copy_exists(path, raw):
+    """True when a `.damaged-…` copy beside `path` already holds `raw`."""
+    folder = os.path.dirname(path) or "."
+    stem = os.path.basename(path) + ".damaged-"
+    try:
+        names = [n for n in os.listdir(folder) if n.startswith(stem)]
+    except OSError:
+        return False
+    for n in names:
+        try:
+            if os.path.getsize(os.path.join(folder, n)) != len(raw):
+                continue
+            with open(os.path.join(folder, n), "rb") as f:
+                if f.read() == raw:
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def store_problem_text(problem, what):
@@ -1135,17 +1159,15 @@ def store_problem_text(problem, what):
 def save_json_store(path, obj):
     """Write a store with a backup of the previous version and an fsync,
     so a power cut leaves the old or the new file, never half of one."""
+    text = json.dumps(obj, indent=2, default=str)
     if os.path.exists(path):
         with contextlib.suppress(OSError):
             if isinstance(read_json(path, None), (dict, list)):
-                shutil.copyfile(path, path + ".bak")
-    tmp = _tmp_name(path)
-    with _open_new_tmp(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(obj, indent=2, default=str))
-        f.flush()
-        with contextlib.suppress(OSError):
-            os.fsync(f.fileno())
-    _replace_retrying(tmp, path)
+                # (35-checker review) the backup too is all or nothing
+                with open(path, "rb") as f:
+                    atomic_write_bytes(path + ".bak", f.read())
+    # (35-checker review) a failed write leaves no *.tmp file behind
+    _atomic_write(path, text, "w", "utf-8")
 
 
 def is_admin():
@@ -1522,10 +1544,9 @@ CLI_FLAGS = {
                               "test (needs a display)."),
     "--live": ("", False, ""),
     "--bench": ("", False, "Measure this computer's analysis speed."),
-    # second audit (install #31): the scenarios it takes, as the docs say
-    "--bench-gui": ("S1 S2 …", True, "Developer: window benchmarks for "
-                                    "the scenarios named (or all); "
-                                    "--check compares with the budgets."),
+    "--bench-gui": ("S1 S2 S3 S4 | all", True,
+                    "Developer: window benchmarks (S1 when none is named; "
+                    "--check compares with the limits)."),
     "--check": ("", False, ""),
     "--targets": ("", False, ""),
     "--runs": ("N", False, ""),
@@ -1561,7 +1582,10 @@ def cli_usage():
             name = "-h, --help"
         elif flag == "--version":
             name = "-V, --version"
-        lines.append(f"  {name:<24} {text}")
+        if len(name) > 24:                # its text on the next line
+            lines += [f"  {name}", f"  {'':<24} {text}"]
+        else:
+            lines.append(f"  {name:<24} {text}")
     lines += ["", "With no options the window opens. Data goes in the data "
               "folder and settings in miniwireshark_config.json (set "
               "MINIWIRESHARK_DATA or MINIWIRESHARK_CONFIG to move them)."]
@@ -2899,7 +2923,9 @@ def fetch_to_file(url, dest, expected_sha=None, feature="packages",
                                  {"speed": speed, "eta": eta})
     except RuntimeError_:
         raise
-    except (OSError, urllib.error.URLError) as e:
+    except (OSError, urllib.error.URLError, http.client.HTTPException) as e:
+        # (35-checker review) a dropped transfer (IncompleteRead) is no
+        # OSError: it escaped raw, and the .part was never resumed
         raise RuntimeError_(classify_runtime_error(e), str(e))
     if expected_sha:
         actual = sha256_file(part)
@@ -5339,6 +5365,12 @@ class RuntimeError_(Exception):
 
 
 # Friendly error taxonomy (shown by the installer and the Repair report)
+# (35-checker review) the free space the private Python needs while it is
+# set up (the download, the unpacked copy and the previous one kept for a
+# rollback); the error, the description and the check said 250, 120 and 300
+RUNTIME_FREE_MB = 300
+RUNTIME_DISK_MB = 120            # what it takes once set up
+
 RUNTIME_ERRORS = {
     "refused": ("Not downloaded: the kill switch is on",
                 "Nothing left this computer. Turn the kill switch off "
@@ -5358,8 +5390,8 @@ RUNTIME_ERRORS = {
     "signature": ("The installer wasn't signed by the Python Software "
                   "Foundation", "It was deleted without being run."),
     "disk": ("Not enough free disk space",
-             "About 250 MB are needed in the data folder. Free some space "
-             "and try again."),
+             f"About {RUNTIME_FREE_MB} MB of free space is needed in the "
+             f"data folder. Free some space and try again."),
     "permission": ("No permission to write in the data folder",
                    "Run MiniWireshark from a folder you can write to, or "
                    "set MINIWIRESHARK_DATA to one."),
@@ -5408,11 +5440,14 @@ def classify_runtime_error(exc):
         return "permission"
     if "no space" in text or "disk full" in text or "errno 28" in text:
         return "disk"
+    # (35-checker review) a 407 only as the HTTP status: "wrote 407 bytes"
+    # or a path with 407 in it is no proxy
     if "certificate" in text or "ssl" in text or "proxy" in text or \
-            "407" in text:
+            "http error 407" in text:
         return "proxy"
     if isinstance(exc, (urllib.error.URLError, _socket.timeout,
-                        ConnectionError)) or "getaddrinfo" in text or \
+                        ConnectionError, http.client.HTTPException)) or \
+            "getaddrinfo" in text or \
             "timed out" in text or "name or service" in text:
         return "offline"
     return "other"
@@ -5448,7 +5483,7 @@ class RuntimeManager:
         return {"platform": plat, "source": src, "wheel_tag": tag,
                 "packages": pkgs, "skipped": skipped,
                 "python": RUNTIME_PYTHON, "dir": self.root,
-                "download_mb": 30, "disk_mb": 120,
+                "download_mb": 30, "disk_mb": RUNTIME_DISK_MB,
                 "use_pyorg": plat[0] == "windows" and not vcr,
                 "supported": bool(src) and bool(tag)}
 
@@ -5463,7 +5498,9 @@ class RuntimeManager:
                 f"{p['python']} so it runs the same on every computer.\n\n"
                 f"• Download: about {p['download_mb']} MB from GitHub "
                 f"(python-build-standalone) plus {names} from PyPI.\n"
-                f"• Disk: about {p['disk_mb']} MB, all inside\n  {p['dir']}\n"
+                f"• Disk: about {p['disk_mb']} MB once set up ("
+                f"{RUNTIME_FREE_MB} MB free while it installs), all "
+                f"inside\n  {p['dir']}\n"
                 f"• Every file is checked against a fingerprint built into "
                 f"MiniWireshark before it is used.\n"
                 f"• Your own Python, PATH and system settings are never "
@@ -5537,7 +5574,8 @@ class RuntimeManager:
                                      {"speed": speed, "eta": eta})
         except RuntimeError_:
             raise
-        except (OSError, urllib.error.URLError) as e:
+        except (OSError, urllib.error.URLError,
+                http.client.HTTPException) as e:
             raise RuntimeError_(classify_runtime_error(e), str(e))
         if expected_sha:
             if progress:
@@ -5643,7 +5681,7 @@ class RuntimeManager:
             raise RuntimeError_("unsupported", str(plan["platform"]))
         free = shutil.disk_usage(PATHS.data).free if hasattr(
             shutil, "disk_usage") else 1 << 40
-        if free < 300 * 1024 * 1024:
+        if free < RUNTIME_FREE_MB * 1024 * 1024:
             raise RuntimeError_("disk", f"{free // (1024 * 1024)} MB free")
         env_id = time.strftime("cp314-%Y%m%d-%H%M%S")
         env_dir = os.path.join(self.root, env_id)
@@ -7521,9 +7559,12 @@ class DataManager:
     def start(self, force=False, keys=None):
         """Load cached copies; download what you asked for (keys/force) or
         what is due under the Weekly policy — all in the background."""
-        if self._busy:
-            return False
-        self._busy = True
+        # (35-checker review) checked and set as one step: Repair's helper
+        # thread and the window could both start a download run
+        with self.lock:
+            if self._busy:
+                return False
+            self._busy = True
         weekly = self.policy() == "Weekly"
 
         def run():
@@ -7858,6 +7899,7 @@ def explain_port_text(port, transport="tcp"):
     e = explain_port(port, transport)
     if not e:
         return ""
+    port = e["port"]          # (35-checker review) "50000" compared as text
     lines = []
     if e["plain"]:
         lines.append(f"Port {port}: {e['plain']}.")
@@ -12359,11 +12401,18 @@ def _iface_is_up(iface):
             LOG.debug("interface state via psutil: %s", e)
     flags = getattr(iface, "flags", None)
     if flags is not None and not IS_WINDOWS:
-        txt = str(flags)
-        if "UP" in txt:
-            return True
-        return False
+        return iface_flags_up(flags)
     return None
+
+
+def iface_flags_up(flags):
+    """(35-checker review) whether an adapter's flags say it is up: a
+    number (IFF_UP is bit 0) as some scapy versions give it, or words
+    ("UP+BROADCAST+RUNNING"). A number used to read as "disconnected",
+    and "LOWER_UP" alone as up."""
+    if isinstance(flags, int) and not isinstance(flags, bool):
+        return bool(flags & 1)
+    return "UP" in re.split(r"[^A-Z_]+", str(flags).upper())
 
 
 def score_interfaces(default_iface_name="", gateway_ip="", best=None):
@@ -12410,9 +12459,12 @@ def score_interfaces(default_iface_name="", gateway_ip="", best=None):
             score -= 40
             reasons.append("it has no IPv4 address")
         if ip and gateway_ip:
-            with contextlib.suppress(ValueError):
-                if ipaddress.ip_address(gateway_ip) in \
-                        ipaddress.ip_network(f"{ip}/24", strict=False):
+            # (35-checker review, LG-08) the card's real subnet from the
+            # route table, never a /24 guess; unknown: no bonus
+            net = local_subnet_for(iface, ip)
+            with contextlib.suppress(ValueError, TypeError):
+                if net is not None and \
+                        ipaddress.ip_address(gateway_ip) in net:
                     score += 10
                     reasons.append("your router is on the same network")
         low = (name + " " + desc).lower()
@@ -12688,6 +12740,12 @@ class HealthProber(threading.Thread):
         try:
             s.sendto(build_dns_query(name, qid), (server, 53))
             while True:
+                # (35-checker review) one deadline for all the answers: a
+                # stream of other datagrams kept it waiting for ever
+                left = timeout - (time.perf_counter() - t0)
+                if left <= 0:
+                    return False, None, None
+                s.settimeout(left)
                 data, _ = s.recvfrom(2048)
                 if len(data) >= 4 and struct.unpack(">H", data[:2])[0] == qid:
                     rcode = data[3] & 0x0F
@@ -21841,10 +21899,14 @@ def periodic_findings(model, min_repeats=10, only=None):
         got = detect_periodic(starts, min_repeats)
         if not got:
             continue
-        period, n = got
-        # second audit (#35): every start, not only the 24 kept
+        period, _n = got
+        # (35-checker review) "(N times)" is how often it made contact
+        # (starts a second or more apart), not the regular gaps plus one;
+        # second audit (#35): every start counted, not only the 24 kept
+        ts = sorted(starts)
+        n = 1 + sum(1 for a, b in zip(ts, ts[1:]) if b - a >= 1.0)
         n = max(n, getattr(model, "flow_start_n", {}).get(
-            (dev_key, remote), 0) - 1)
+            (dev_key, remote), 0))
         names = model.ip_to_domains.get(remote)
         dest = next(reversed(names)) if names else remote
         dev = reg.by_key.get(reg.resolve(dev_key))
@@ -21854,8 +21916,8 @@ def periodic_findings(model, min_repeats=10, only=None):
                        destination=C(dest, LV_OBSERVED if not names else
                                      LV_CORRELATED),
                        period=C(human_period(period), LV_CORRELATED),
-                       repeats=C(n + 1, LV_OBSERVED))
-        out.append((dev_key, dest, period, n + 1, text))
+                       repeats=C(n, LV_OBSERVED))
+        out.append((dev_key, dest, period, n, text))
     out.sort(key=lambda r: -r[3])
     return out
 
@@ -22407,7 +22469,15 @@ def investigate_ipv6(f):
                        _t("◉ %d%% of Internet traffic went over IPv6",
                           round(100 * (f.get("v6_share") or 0)))]))
     span = f.get("span") or 0
-    if not f.get("ra") and not att:
+    # (35-checker review) IPv6 bytes over UDP/QUIC count too: a network
+    # used over IPv6 without a TCP handshake was "not offering IPv6"
+    share = f.get("v6_share") or 0
+    used = bool(att) or share > 0
+    if share > 0 and not att:
+        H.append(_hyp("working", _t("IPv6 is working"), 0.5, "Possible",
+                      [_t("◉ %d%% of Internet traffic went over IPv6",
+                          max(1, round(100 * share)))]))
+    if not f.get("ra") and not used:
         if span >= 600:
             H.append(_hyp("not_offered", _t("Your network doesn't offer "
                                             "IPv6 (common, and not a "
@@ -22417,12 +22487,12 @@ def investigate_ipv6(f):
                           fix=_t("Nothing to fix: everything works over "
                                  "IPv4. Your router or Internet provider "
                                  "may offer IPv6 as an option.")))
-    elif f.get("ra") and not att:
+    elif f.get("ra") and not used:
         H.append(_hyp("unused", _t("IPv6 is announced, but nothing used it "
                                    "yet"), 0.3, "Possible",
                       [_t("◉ The router announces IPv6")]))
     reasons = []
-    if not f.get("ra") and not att and span < 600:
+    if not f.get("ra") and not used and span < 600:
         reasons.append(_t(
             "This file has no IPv6 router announcement and no IPv6 "
             "connections, and it is too short to tell that IPv6 is off.")
@@ -22485,7 +22555,11 @@ def connect_facts(model, key, window=900, offline=False, namer=None):
     f["arp_asks"] = sum(1 for t in asks[3] if now - t <= window) \
         if asks else 0
     rep = m.gw_arp_replies.get(mac) if mac else None
-    f["gw_replied"] = bool(rep and asks and rep >= asks[0])
+    # (35-checker review) an answer to a question inside the window: one
+    # given before it (after the first question ever) said "answered"
+    # while the router ignored every question since
+    recent = [t for t in asks[3] if now - t <= window] if asks else []
+    f["gw_replied"] = bool(rep and recent and rep >= min(recent))
     f["router_heard"] = reg.router_answering(now)
     # the router's answers to a device go to that device alone: they are
     # visible here only if answers to other devices were seen too (a
@@ -22799,6 +22873,20 @@ def investigate_call(f):
             reasons.append(_t("Only the packets this computer sent were "
                               "seen, so loss on the way can't be counted "
                               "here."))
+        elif not bad and cd is not None and cd >= 0.01:
+            # (35-checker review) the capture's own drops: whether the
+            # call's packets arrived complete can't be said
+            reasons.append(_t(
+                "This capture itself missed packets, so it can't tell "
+                "whether the call's packets arrived complete. They "
+                "arrived on time; look again while the computer is less "
+                "busy."))
+        elif not bad and lp > 0:
+            reasons.append(_t(
+                "The call lost only %s of its packets and they arrived on "
+                "time, so the stutter isn't visible here: it may come from "
+                "the other person's connection, the call app or the "
+                "computer itself.", f"{lp:.1f}%"))
         elif not bad:
             reasons.append(_t(
                 "The call's packets arrived complete and on time, so the "
@@ -23210,19 +23298,22 @@ def calls_card_text(tracker, limit=3):
                "jitter %d ms (usually fine below %d)." if c["kind"] ==
                "video" else "Your voice call lost %s of packets between %s "
                "and %s; jitter %d ms (usually fine below %d).")
-        lines.append(tr(tpl) % (f"{c['loss_pct']:.1f}%",
-                                hm_clock(c["first"]), hm_clock(c["last"]),
-                                round(c["jitter_ms"]), CALL_JITTER_OK_MS))
+        # (35-checker review) through _t: a translation whose
+        # placeholders don't fit falls back to English instead of raising
+        lines.append(_t(tpl, f"{c['loss_pct']:.1f}%",
+                        hm_clock(c["first"]), hm_clock(c["last"]),
+                        round(c["jitter_ms"]), CALL_JITTER_OK_MS))
         w = c["worst"]
         if w and 100.0 * w[3] / w[2] >= max(CALL_LOSS_OK_PCT,
                                             1.5 * c["loss_pct"]):
-            lines.append("  " + tr("Worst moment: %s lost around %s.") % (
-                f"{100.0 * w[3] / w[2]:.1f}%", hm_clock(w[0])))
+            lines.append("  " + _t("Worst moment: %s lost around %s.",
+                                   f"{100.0 * w[3] / w[2]:.1f}%",
+                                   hm_clock(w[0])))
     more = len(calls) - limit
     if more == 1:
         lines.append(tr("And 1 more call."))
     elif more > 1:
-        lines.append(tr("And %d more calls.") % more)
+        lines.append(_t("And %d more calls.", more))
     if not calls:
         lines.append(tr("No calls seen yet."))
     n = tracker.unmeasured() if tracker is not None else 0
@@ -23230,8 +23321,8 @@ def calls_card_text(tracker, limit=3):
         lines.append(tr("1 connection looked like a call but had no "
                         "connection check, so it is not measured."))
     elif n:
-        lines.append(tr("%d connections looked like a call but had no "
-                        "connection check, so they are not measured.") % n)
+        lines.append(_t("%d connections looked like a call but had no "
+                        "connection check, so they are not measured.", n))
     lines.append(tr("Observed from packet headers only: no names, no "
                     "sound or picture. Calls are measured after the call "
                     "app checks its connection (STUN); some call apps "
@@ -24135,7 +24226,12 @@ class NetworkModel:
             text = (f"Plugged into {name}, port {port or '?'}"
                     + (f", VLAN {rec['vlan']}" if rec["vlan"] else "")
                     + f" (announced by the switch, {rec['proto']})")
-            if cur is not None:
+            if cur is not None and cur.get("port") == rec["port"]:
+                # (35-checker review) same port, another VLAN: not a move
+                text = (f"VLAN changed on {name}, port {port or '?'}: now "
+                        f"{rec['vlan'] or 'none'} (was "
+                        f"{cur.get('vlan') or 'none'})")
+            elif cur is not None:
                 text = (f"Moved to {name}, port {port or '?'} (was "
                         f"{cur.get('port_desc') or cur.get('port')})")
             self.push_timeline("network", "INFO" if cur is None else
@@ -27266,6 +27362,15 @@ class Store:
                         con.rollback()
                     LOG.warning("history write failed: %s", e)
                     break
+                except Exception as e:               # noqa: BLE001
+                    # (35-checker review) a bad value in one batch ended
+                    # the writer silently: history stopped, every later
+                    # batch queued, then dropped, and nothing said so
+                    self.error = f"{type(e).__name__}: {e}"
+                    with contextlib.suppress(sqlite3.Error):
+                        con.rollback()
+                    LOG.warning("history write failed: %s", self.error)
+                    break
             if self.q.empty():
                 self._idle.set()
         with contextlib.suppress(sqlite3.Error):
@@ -29343,7 +29448,6 @@ Kill switch: stop everything MiniWireshark sends ¦ Arrêt d'urgence : stopper t
 Open the self-traffic ledger ¦ Ouvrir le registre des envois ¦ Abrir el registro de envíos propios
 Reference data (no personal data sent) ¦ Données de référence (aucune donnée personnelle envoyée) ¦ Datos de referencia (no se envían datos personales)
 Download public reference lists ¦ Télécharger les listes de référence publiques ¦ Descargar listas de referencia públicas
-Fetches the hardware-vendor list (wireshark.org) and the Public Suffix List (publicsuffix.org) about once a month. These are ordinary file downloads: nothing about your network is sent. Built-in lists are used when this is off or offline. ¦ Récupère la liste des fabricants (wireshark.org) et la Public Suffix List (publicsuffix.org) environ une fois par mois. Ce sont de simples téléchargements : rien sur votre réseau n'est envoyé. Les listes intégrées servent quand c'est désactivé ou hors ligne. ¦ Obtiene la lista de fabricantes (wireshark.org) y la Public Suffix List (publicsuffix.org) más o menos una vez al mes. Son descargas normales: no se envía nada sobre su red. Se usan las listas integradas cuando está desactivado o sin conexión.
 Refresh now ¦ Actualiser maintenant ¦ Actualizar ahora
 What is read from packets ¦ Ce qui est lu dans les paquets ¦ Qué se lee de los paquetes
 Read site names from HTTP/3 (QUIC) first packets ¦ Lire les noms de sites dans les premiers paquets HTTP/3 (QUIC) ¦ Leer nombres de sitios de los primeros paquetes HTTP/3 (QUIC)
@@ -29881,7 +29985,7 @@ Components Center ¦ Centre des composants ¦ Centro de componentes
 Address on a public blocklist contacted ¦ Adresse d'une liste de blocage publique contactée ¦ Contacto con una dirección de una lista de bloqueo pública
 A device contacts an address on a public blocklist you turned on in the Components Center. ¦ Un appareil contacte une adresse figurant sur une liste de blocage publique activée dans le centre des composants. ¦ Un dispositivo contacta con una dirección de una lista de bloqueo pública que activó en el centro de componentes.
 Use the downloaded vendor and site lists ¦ Utiliser les listes de fabricants et de sites téléchargées ¦ Usar las listas de fabricantes y sitios descargadas
-Uses the hardware-vendor list and the Public Suffix List you got in the Components Center. They are only downloaded when you ask (or weekly, if you choose that there); nothing about your network is sent. Built-in lists are used when this is off or nothing was downloaded. ¦ Utilise la liste des fabricants et la Public Suffix List obtenues dans le centre des composants. Elles ne sont téléchargées que sur demande (ou chaque semaine si vous le choisissez) ; rien sur votre réseau n'est envoyé. Les listes intégrées servent quand c'est désactivé ou que rien n'a été téléchargé. ¦ Usa la lista de fabricantes y la Public Suffix List que obtuvo en el centro de componentes. Solo se descargan cuando lo pide (o cada semana, si lo elige allí); no se envía nada sobre su red. Se usan las listas integradas cuando está desactivado o no se descargó nada.
+Uses the hardware-vendor list and the Public Suffix List you got in the Components Center. Nothing is downloaded unless you ask: with Updates set to Manual there (the default), only when you press Get, Check now or Refresh now. With Weekly, a missing list is downloaded when MiniWireshark starts, and each list again once your copy is more than 30 days old. Nothing about your network is sent. Built-in lists are used when this is off or nothing was downloaded. ¦ Utilise la liste des fabricants et la Public Suffix List obtenues dans le centre des composants. Rien n'est téléchargé sans votre demande : avec Mises à jour sur Manuelles (par défaut), seulement quand vous cliquez sur Obtenir, Vérifier maintenant ou Actualiser maintenant. Avec Chaque semaine, une liste absente est téléchargée au démarrage de MiniWireshark, et chaque liste l'est de nouveau quand votre copie a plus de 30 jours. Rien sur votre réseau n'est envoyé. Les listes intégrées servent quand c'est désactivé ou que rien n'a été téléchargé. ¦ Usa la lista de fabricantes y la Public Suffix List que obtuvo en el centro de componentes. No se descarga nada salvo que lo pida: con Actualizaciones en Manuales (la opción por defecto), solo cuando pulsa Obtener, Comprobar ahora o Actualizar ahora. Con Semanales, una lista que falta se descarga al iniciar MiniWireshark, y cada lista de nuevo cuando su copia tiene más de 30 días. No se envía nada sobre su red. Se usan las listas integradas cuando está desactivado o no se descargó nada.
 Startup history ¦ Historique des démarrages ¦ Historial de inicios
 Set device type… ¦ Définir le type d'appareil… ¦ Definir el tipo de dispositivo…
 Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
@@ -30261,7 +30365,7 @@ Get / rebuild managed Python ¦ Obtenir / reconstruire le Python géré ¦ Obten
 Remove managed Python ¦ Supprimer le Python géré ¦ Eliminar el Python gestionado
 Start in the managed Python (used only after its window reports back; otherwise the Python you started with) ¦ Démarrer dans le Python géré (utilisé seulement si sa fenêtre confirme son ouverture ; sinon le Python avec lequel vous avez démarré) ¦ Iniciar en el Python gestionado (solo si su ventana confirma que se abrió; si no, el Python con el que lo inició)
 Repair / Update fixes the private packages folder (the capture engine is reinstalled from a fingerprinted file) and, if you have a managed Python, reinstalls its verified components and updates its pip. A newer Python is only installed when you ask. Nothing outside MiniWireshark's data folder is changed. ¦ Réparer / mettre à jour corrige le dossier des paquets privés (le moteur de capture est réinstallé depuis un fichier à empreinte vérifiée) et, si vous avez un Python géré, réinstalle ses composants vérifiés et met à jour son pip. Un Python plus récent n'est installé que sur demande. Rien n'est modifié hors du dossier de données de MiniWireshark. ¦ Reparar / actualizar arregla la carpeta de paquetes privados (el motor de captura se reinstala desde un archivo con huella verificada) y, si tiene un Python gestionado, reinstala sus componentes verificados y actualiza su pip. Un Python más reciente solo se instala si lo pide. No se cambia nada fuera de la carpeta de datos de MiniWireshark.
-Optional data, packages and helpers. MiniWireshark watches your network without any of them, and nothing downloads unless you ask. Every download is listed in the self-traffic ledger, and the kill switch blocks them all. ¦ Données, paquets et outils facultatifs. MiniWireshark surveille votre réseau sans aucun d'eux, et rien n'est téléchargé sans votre demande. Chaque téléchargement figure dans le registre des envois, et l'arrêt d'urgence les bloque tous. ¦ Datos, paquetes y herramientas opcionales. MiniWireshark vigila su red sin ninguno de ellos y no se descarga nada salvo que lo pida. Cada descarga figura en el registro de envíos y el interruptor de corte las bloquea todas.
+Optional data, packages and helpers. MiniWireshark watches your network without any of them, and nothing downloads unless you ask (Get, Check now, or Updates: Weekly). Every download is listed in the self-traffic ledger, and the kill switch blocks them all. ¦ Données, paquets et outils facultatifs. MiniWireshark surveille votre réseau sans aucun d'eux, et rien n'est téléchargé sans votre demande (Obtenir, Vérifier maintenant, ou Mises à jour : Chaque semaine). Chaque téléchargement figure dans le registre des envois, et l'arrêt d'urgence les bloque tous. ¦ Datos, paquetes y herramientas opcionales. MiniWireshark vigila su red sin ninguno de ellos y no se descarga nada salvo que lo pida (Obtener, Comprobar ahora, o Actualizaciones: Semanales). Cada descarga figura en el registro de envíos y el interruptor de corte las bloquea todas.
 Check now ¦ Vérifier maintenant ¦ Comprobar ahora
 Export offline pack ¦ Exporter un pack hors ligne ¦ Exportar paquete sin conexión
 Import offline pack ¦ Importer un pack hors ligne ¦ Importar paquete sin conexión
@@ -30442,8 +30546,8 @@ Nothing in this view yet. ¦ Rien dans cette vue pour l'instant. ¦ Aún no hay 
 Jump to now ¦ Revenir au présent ¦ Ir al momento actual
 Show only: ¦ Afficher seulement : ¦ Mostrar solo:
 INTERNET HOSTS — public Internet addresses your devices talked to. These are never devices on your network — they live somewhere out on the Internet. ¦ HÔTES INTERNET — adresses Internet publiques avec lesquelles vos appareils ont communiqué. Ce ne sont jamais des appareils de votre réseau — ils sont quelque part sur Internet. ¦ EQUIPOS DE INTERNET — direcciones públicas de Internet con las que hablaron sus dispositivos. Nunca son dispositivos de su red — están en algún lugar de Internet.
-Hides the technical Connections, Internet hosts and Packets tabs and the advanced filter fields. Nothing is removed — switch this off any time to see everything. ¦ Masque les onglets techniques Connexions, Hôtes Internet et Paquets ainsi que les filtres avancés. Rien n'est supprimé — désactivez à tout moment pour tout voir. ¦ Oculta las pestañas técnicas Conexiones, Equipos de Internet y Paquetes y los filtros avanzados. No se elimina nada — desactívelo cuando quiera para verlo todo.
-Beginner shows the essentials. Advanced adds the Connections, Internet hosts and Packets tabs, technical columns and filter expressions. Same data either way. ¦ Débutant montre l'essentiel. Avancé ajoute les onglets Connexions, Hôtes Internet et Paquets, les colonnes techniques et les expressions de filtre. Mêmes données dans les deux cas. ¦ Principiante muestra lo esencial. Avanzado añade las pestañas Conexiones, Equipos de Internet y Paquetes, columnas técnicas y expresiones de filtro. Los mismos datos en ambos casos.
+Hides the technical Connections, Internet hosts, Packets and Sources tabs and the advanced filter fields. Nothing is removed — switch this off any time to see everything. ¦ Masque les onglets techniques Connexions, Hôtes Internet, Paquets et Sources ainsi que les filtres avancés. Rien n'est supprimé — désactivez à tout moment pour tout voir. ¦ Oculta las pestañas técnicas Conexiones, Equipos de Internet, Paquetes y Fuentes y los filtros avanzados. No se elimina nada — desactívelo cuando quiera para verlo todo.
+Beginner shows the essentials. Advanced adds the Connections, Internet hosts, Packets and Sources tabs, technical columns and filter expressions. Same data either way. ¦ Débutant montre l'essentiel. Avancé ajoute les onglets Connexions, Hôtes Internet, Paquets et Sources, les colonnes techniques et les expressions de filtre. Mêmes données dans les deux cas. ¦ Principiante muestra lo esencial. Avanzado añade las pestañas Conexiones, Equipos de Internet, Paquetes y Fuentes, columnas técnicas y expresiones de filtro. Los mismos datos en ambos casos.
 Back (Alt+Left) ¦ Retour (Alt+Gauche) ¦ Atrás (Alt+Izquierda)
 Forward (Alt+Right) ¦ Suivant (Alt+Droite) ¦ Adelante (Alt+Derecha)
 Back to ¦ Revenir à ¦ Volver a
@@ -31319,6 +31423,8 @@ Packets arrive unevenly (jitter) ¦ Les paquets arrivent de façon irrégulière
 Move closer to the router, or use 5 GHz or a cable for calls. ¦ Rapprochez-vous du routeur, ou utilisez le 5 GHz ou un câble pour les appels. ¦ Acérquese al router, o use 5 GHz o un cable para las llamadas.
 Only the packets this computer sent were seen, so loss on the way can't be counted here. ¦ Seuls les paquets envoyés par cet ordinateur ont été vus : la perte en route ne peut pas être comptée ici. ¦ Solo se vieron los paquetes que envió este equipo, así que la pérdida por el camino no se puede contar aquí.
 The call's packets arrived complete and on time, so the stutter isn't visible here: it may come from the other person's connection, the call app or the computer itself. ¦ Les paquets de l'appel sont arrivés complets et à l'heure : la saccade n'est pas visible ici. Elle peut venir de la connexion de votre correspondant, de l'application d'appel ou de l'ordinateur lui-même. ¦ Los paquetes de la llamada llegaron completos y a tiempo, así que el corte no se ve aquí: puede venir de la conexión de la otra persona, de la aplicación de llamadas o del propio equipo.
+This capture itself missed packets, so it can't tell whether the call's packets arrived complete. They arrived on time; look again while the computer is less busy. ¦ Cette capture a elle-même manqué des paquets : impossible de dire si les paquets de l'appel sont arrivés complets. Ils sont arrivés à l'heure ; regardez de nouveau quand l'ordinateur est moins occupé. ¦ Esta captura perdió paquetes por sí misma, así que no puede saber si los paquetes de la llamada llegaron completos. Llegaron a tiempo; vuelva a mirar cuando el equipo esté menos ocupado.
+The call lost only %s of its packets and they arrived on time, so the stutter isn't visible here: it may come from the other person's connection, the call app or the computer itself. ¦ L'appel n'a perdu que %s de ses paquets et ils sont arrivés à l'heure : la saccade n'est pas visible ici. Elle peut venir de la connexion de votre correspondant, de l'application d'appel ou de l'ordinateur lui-même. ¦ La llamada solo perdió %s de sus paquetes y llegaron a tiempo, así que el corte no se ve aquí: puede venir de la conexión de la otra persona, de la aplicación de llamadas o del propio equipo.
 Call measuring is turned off. ¦ La mesure des appels est désactivée. ¦ La medición de llamadas está desactivada.
 1 connection looked like a call, but the call app sent no connection check (STUN), so it can't be measured. ¦ 1 connexion ressemblait à un appel, mais l'application d'appel n'a envoyé aucune vérification de connexion (STUN) : elle ne peut pas être mesurée. ¦ 1 conexión parecía una llamada, pero la aplicación de llamadas no envió ninguna comprobación de conexión (STUN), así que no se puede medir.
 %d connections looked like a call, but the call app sent no connection check (STUN), so they can't be measured. ¦ %d connexions ressemblaient à un appel, mais l'application d'appel n'a envoyé aucune vérification de connexion (STUN) : elles ne peuvent pas être mesurées. ¦ %d conexiones parecían una llamada, pero la aplicación de llamadas no envió ninguna comprobación de conexión (STUN), así que no se pueden medir.
@@ -35358,8 +35464,9 @@ SETTINGS_PAGES = [
          {"title": "Layout", "controls": [
              {"key": "appearance.beginner_mode", "type": "bool",
               "label": "Beginner view",
-              "help": "Hides the technical Connections, Internet hosts and "
-                      "Packets tabs and the advanced filter fields. Nothing "
+              "help": "Hides the technical Connections, Internet hosts, "
+                      "Packets and Sources tabs and the advanced filter "
+                      "fields. Nothing "
                       "is removed — switch this off any time to see "
                       "everything."},
          ]},
@@ -35790,11 +35897,15 @@ SETTINGS_PAGES = [
              {"key": "privacy.auto_download_reference", "type": "bool",
               "label": "Use the downloaded vendor and site lists",
               "help": "Uses the hardware-vendor list and the Public Suffix "
-                      "List you got in the Components Center. They are only "
-                      "downloaded when you ask (or weekly, if you choose "
-                      "that there); nothing about your network is sent. "
-                      "Built-in lists are used when this is off or nothing "
-                      "was downloaded."},
+                      "List you got in the Components Center. Nothing is "
+                      "downloaded unless you ask: with Updates set to "
+                      "Manual there (the default), only when you press "
+                      "Get, Check now or Refresh now. With Weekly, a "
+                      "missing list is downloaded when MiniWireshark "
+                      "starts, and each list again once your copy is more "
+                      "than 30 days old. Nothing about your network is "
+                      "sent. Built-in lists are used when this is off or "
+                      "nothing was downloaded."},
              {"type": "info", "text_fn": "data_status_text"},
              {"type": "action", "actions": [
                  ("Components Center…", "components_center"),
@@ -51657,7 +51768,8 @@ class MiniWireshark:
                                  command=self._on_ui_mode_change)
             rb.pack(side="left")
             Tooltip(rb, "Beginner shows the essentials. Advanced adds the "
-                        "Connections, Internet hosts and Packets tabs, "
+                        "Connections, Internet hosts, Packets and Sources "
+                        "tabs, "
                         "technical columns and filter expressions. Same "
                         "data either way.")
         tk.Label(search_grp, text="Search", bg="#2b3a55",
@@ -57034,16 +57146,25 @@ proc ::mw_explicit_fonts {top names} {
         if not cands:
             cands = list(self.iface_box["values"])[:1]
 
+        started = []
+
         def done(ok):
             if ok:
                 self.model.push_timeline("capture", "INFO",
                                          f"Capture restarted on "
                                          f"“{self.current_iface_label}”")
                 self.root.after(120000, self._reset_restart_counter)
+            elif started and started[0] != self._capture_token:
+                # (35-checker review) Stop was pressed (or another start
+                # began) while the cards were tried: this attempt was
+                # cancelled, it didn't fail. Healing it restarted the
+                # capture the person had just stopped.
+                return
             else:
                 self._handle_sniffer_died(RuntimeError("restart failed"))
         if cands:
             self._start_capture(cands[:4], keep_data=True, on_done=done)
+            started.append(self._capture_token)
         else:
             done(False)
 
@@ -60987,6 +61108,12 @@ proc ::mw_explicit_fonts {top names} {
         new = new or ask_text(self, "Rename a workspace", "New name:", old)
         if not new or new == old:
             return None
+        # (35-checker review) another workspace of that name was replaced
+        # without a word
+        if new in saved and not messagebox.askyesno(
+                "Rename a workspace", f"A workspace called “{new}” "
+                f"already exists. Replace it?", parent=self.root):
+            return None
         saved[new] = saved.pop(old)
         self.config.set("workspaces.saved", saved)
         self.config.save()
@@ -62250,7 +62377,8 @@ proc ::mw_explicit_fonts {top names} {
                  anchor="w").pack(fill="x", padx=14, pady=(12, 0))
         tk.Label(win, text="Optional data, packages and helpers. "
                            "MiniWireshark watches your network without any "
-                           "of them, and nothing downloads unless you ask. "
+                           "of them, and nothing downloads unless you ask "
+                           "(Get, Check now, or Updates: Weekly). "
                            "Every download is listed in the self-traffic "
                            "ledger, and the kill switch blocks them all.",
                  bg=t["tab_bg"], fg=t["muted_fg"], anchor="w",
@@ -63279,6 +63407,10 @@ proc ::mw_explicit_fonts {top names} {
                 msg = apply_self_update(data, body["version"])
             except (OSError, ValueError, urllib.error.URLError) as e:
                 msg = f"Update failed, nothing was changed: {e}"
+            except Exception as e:                   # noqa: BLE001
+                # (35-checker review) never a silent end of this thread
+                LOG.exception("update failed")
+                msg = f"Update failed: {type(e).__name__}: {e}"
             self._async_results.put(lambda: messagebox.showinfo(
                 "Update", msg, parent=self.root))
         threading.Thread(target=work, daemon=True, name="self-update").start()
@@ -65606,7 +65738,12 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
         raise ValueError(f"the download isn't a text file ({e})")
     if "MiniWireshark" not in text or "def main" not in text:
         raise ValueError("the download doesn't look like MiniWireshark")
-    compile(text, "miniwireshark_update.py", "exec")
+    try:
+        compile(text, "miniwireshark_update.py", "exec")
+    except (SyntaxError, ValueError) as e:
+        # (35-checker review) a SyntaxError escaped the update thread and
+        # the person was never told
+        raise ValueError(f"the download is not a working program ({e})")
     backup = f"{script_path}.v{SCRIPT_VERSION}.bak"
     before = os.stat(script_path)
     mode = stat.S_IMODE(before.st_mode)
@@ -65619,12 +65756,21 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
     # it really is; the link (and the backup beside it) stay as they are
     real = os.path.realpath(script_path)
     tmp = real + ".new"
-    with open(tmp, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
-    if not IS_WINDOWS:
-        # the new program keeps the old one's mode (a umask of 077 made
-        # it 0600, unreadable for the other users of a shared install)
-        os.chmod(tmp, mode)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            # (35-checker review) on disk before the rename: a power cut
+            # just after it could leave an empty program
+            f.flush()
+            os.fsync(f.fileno())
+        if not IS_WINDOWS:
+            # the new program keeps the old one's mode (a umask of 077 made
+            # it 0600, unreadable for the other users of a shared install)
+            os.chmod(tmp, mode)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
     os.replace(tmp, real)
     _give_update_back(before, (real, backup))
     # 5.2.3 (B-31): the marker names the file it belongs to and what was
@@ -65636,7 +65782,17 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
               "backup_sha256": sha256_file(backup),
               "time": time.time(), "attempts": 0}
     marker["mac"] = update_marker_mac(marker)
-    atomic_write_json(marker_path, marker)
+    try:
+        atomic_write_json(marker_path, marker)
+    except OSError as e:
+        # (35-checker review) the program is already replaced: this is no
+        # "nothing was changed" failure, only the automatic restore is off
+        LOG.warning("update marker not written: %s", e)
+        return (f"MiniWireshark {tag} was installed. Restart it to use the "
+                f"new version. A backup of {SCRIPT_VERSION} is at:\n"
+                f"{backup}\nThe automatic restore couldn't be set up ({e}): "
+                f"if the new version fails to start, copy the backup back "
+                f"by hand.")
     LOG.info("installed update %s (backup %s)", tag, backup)
     return (f"MiniWireshark {tag} was installed. Restart it to use the new "
             f"version. A backup of {SCRIPT_VERSION} is at:\n{backup}\nIf the "
@@ -65830,6 +65986,25 @@ def claim_interrupted_journal(path=None, now=None, keep=3):
     return dest
 
 
+def restore_program_copy(backup, script_path):
+    """(35-checker review) put the backup back in one rename: it is
+    copied beside the program and on disk first, so an interruption
+    leaves the old file or the new one, never half of one (a copy over
+    the program truncated it first, and this is the only restore path).
+    A program started through a symlink is restored where it really is."""
+    real = os.path.realpath(script_path)
+    tmp = real + ".rb"
+    try:
+        shutil.copy2(backup, tmp)
+        with open(tmp, "rb+") as f:
+            os.fsync(f.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+    os.replace(tmp, real)
+
+
 def rollback_update_if_needed(force=False, script_path=None,
                               marker_path=None):
     """Called at startup (and on a startup crash). Returns a message if a
@@ -65853,7 +66028,7 @@ def rollback_update_if_needed(force=False, script_path=None,
         return ""
     if backup and os.path.exists(backup):
         try:
-            shutil.copy2(backup, script_path)
+            restore_program_copy(backup, script_path)
             os.remove(marker_path)
             LOG.warning("rolled back update %s", marker.get("version"))
             return (f"The update to {marker.get('version')} didn't start "
@@ -71396,8 +71571,10 @@ def corpus_scores(model, labels):
         got[mac] = cls
         if cls != want:
             wrong.append((mac, want, cls, word))
-            if word == "Likely" and "Router" in (want, cls) or \
-                    "This computer" in (want, cls):
+            # (35-checker review) the parentheses: any wrong label on
+            # "This computer" counted as a wrong Likely
+            if word == "Likely" and ("Router" in (want, cls) or
+                                     "This computer" in (want, cls)):
                 bad.append((mac, want, cls))
     per = {}
     for kind in sorted(set(labels.values())):
@@ -71956,7 +72133,7 @@ def run_self_tests(verbose=True, only=None):
         reg.v6_prefixes = [ipaddress.ip_network("2a01:4f8:1::/64")]
         assert reg.eligible_ip("2a01:4f8:1::5")
         if not scapy_ok:
-            return
+            return "skip"   # (35-checker review) was counted as passed
         p = Ether(src="00:11:22:33:44:01", dst="00:00:00:00:00:20") / \
             IP(src="93.184.215.14", dst="192.168.1.20") / \
             TCP(sport=443, dport=5555, flags="A")
@@ -72134,7 +72311,7 @@ def run_self_tests(verbose=True, only=None):
         assert parse_tls_hello(b"\x17\x03\x03\x00\x05hello") is None
         assert parse_tls_hello(ch[:60]) is not None   # truncated: no crash
         if need_scapy():
-            return
+            return "skip"   # (35-checker review) was counted as passed
         base = _test_eth() / IP(src="192.168.1.5", dst="93.184.215.14")
         rs = TlsReassembler()
         p1 = Ether(bytes(base / TCP(sport=4000, dport=443, flags="PA",
@@ -72558,17 +72735,14 @@ def run_self_tests(verbose=True, only=None):
                                        time.time())],
                            "domains": [("example.com", 3, 100)],
                            "baselines": [("k1", {"n": 5})]})
-        for _ in range(50):
-            if hs.q.empty():
-                break
-            time.sleep(0.05)
-        time.sleep(0.3)
+        # (35-checker review) an empty queue is not a finished write
+        assert hs.flush_now(10)
         assert hs.known_device_rows()[0][0] == "k1"
             # a row from before 5.3.4 comes back with when it was last learned
         row = hs.load_baselines()["k1"]
         assert row["n"] == 5 and 0 < row["last"] <= time.time() + 1, row
         hs.clear("k1")
-        time.sleep(0.4)
+        assert hs.flush_now(10)
         assert hs.known_device_rows() == []
         hs.stop()
 
@@ -73200,7 +73374,7 @@ def t_sanitize_hostile_names(ctx):
     assert len(sanitize_text("x" * 999)) == 200
     assert sanitize_text(b"bytes\xff") .startswith("bytes")
     if not ctx.scapy_ok:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     sb = ScenarioBuilder()
     host = ("192.168.1.77", "00:11:22:33:44:77", "pc‮cod.exe\x07")
     sb.dhcp(host)
@@ -74319,7 +74493,11 @@ def t_pipeline_worker(ctx):
     for raw, ts, lt in frames[:40]:
         old_sink(raw, ts, lt)
     w2.start()
-    time.sleep(0.3)
+    # (35-checker review) until the worker has read all 40 (a fixed 0.3 s
+    # flaked under load), then the same check
+    t_end = time.time() + 10
+    while w2.stale < 40 and time.time() < t_end:
+        time.sleep(0.01)
     w2.stop_flag = True
     w2.join(2)
     assert h2.count == 0 and w2.stale == 40, (h2.count, w2.stale)
@@ -74401,7 +74579,9 @@ def t_m1b_history_delete_all(ctx):
             if f.startswith("h.sqlite3") and f not in (
                 "h.sqlite3", "h.sqlite3-wal", "h.sqlite3-shm")]
     assert left == [], left
-    with contextlib.suppress(OSError):
+    # (35-checker review) no -wal file holds nothing either; any other
+    # error is no longer hidden
+    if os.path.exists(path + "-wal"):
         assert os.path.getsize(path + "-wal") == 0
     with open(path, "rb") as f:
         assert b"secret-clinic" not in f.read()
@@ -74488,7 +74668,7 @@ def t_bf001_reputation_ranges(ctx):
         (int(ipaddress.ip_address("2001:db8::")),
          int(ipaddress.ip_address("2001:db8::ffff")), "six", 6)])
     assert rl.lookup("10.200.0.1") == "big"
-    assert rl.lookup("10.1.1.9") in ("big", "small")
+    assert rl.lookup("10.1.1.9") == "small"     # the nearer, smaller one
     assert rl.lookup("11.0.0.1") == "" and rl.lookup("9.255.255.255") == ""
     assert rl.lookup("2001:db8::5") == "six"
     assert rl.lookup("2001:db9::5") == "" and len(rl) == 3
@@ -75896,14 +76076,16 @@ def t_ip010_own_blocklist(ctx):
         assert a.severity == "WARNING" and "your own blocklist and a " \
             "public blocklist" in a.reason, a.reason
         # the switch off: the list is not used
+        was_on = FEATURES.get("own_blocklist", True)
         FEATURES["own_blocklist"] = False
         try:
             r = reputation_db()
             assert r is None or not r.lookup("45.9.20.1")
         finally:
-            FEATURES["own_blocklist"] = True
-        assert use_own_blocklist(None) is None and reputation_db() is None \
-            or not reputation_db().lookup("45.9.20.1")
+            FEATURES["own_blocklist"] = was_on   # (35-checker review)
+        assert use_own_blocklist(None) is None and (
+            reputation_db() is None or
+            not reputation_db().lookup("45.9.20.1"))
     finally:
         OWN_BLOCKLIST[0] = old
         _REP_GEN[0] += 1
@@ -77326,7 +77508,9 @@ def t_corrections_property(ctx):
             for dv in reg.by_key.values():
                 assert sum(st.get("bytes_up", 0) for st in
                            dv.iface_stats.values()) == dv.bytes_up
-            assert sum(owners.values()) == len(macs)
+            # (35-checker review) was sum(owners) == len(macs), true by
+            # construction: every owner is a live device instead
+            assert set(owners) <= set(reg.by_key), (trial, owners)
 
 
 @self_test()
@@ -77934,7 +78118,27 @@ def t_quic_rfc9001_vectors(ctx):
         bytes.fromhex("000102030405060708090a0b0c0d0e0f"),
         bytes.fromhex("00112233445566778899aabbccddeeff")).hex() == \
         "69c4e0d86a7b0430d8cdb78070b4c55a"
-    # GCM: NIST test case 4-style round trip and tamper detection
+    # GCM: the NIST GCM spec's test cases 1, 2 and 4 (with AAD), checked
+    # without `cryptography` too (35-checker review: only a round trip was
+    # checked, which a symmetric GHASH mistake passes)
+    z16, z12 = bytes(16), bytes(12)
+    assert _aes_gcm_py(z16, z12, b"", b"", decrypt=False).hex() == \
+        "58e2fccefa7e3061367f1d57a4e7455a"
+    assert _aes_gcm_py(z16, z12, z16, b"", decrypt=False).hex() == \
+        "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"
+    k4 = bytes.fromhex("feffe9928665731c6d6a8f9467308308")
+    iv4 = bytes.fromhex("cafebabefacedbaddecaf888")
+    p4 = bytes.fromhex(
+        "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+        "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")
+    a4 = bytes.fromhex("feedfacedeadbeeffeedfacedeadbeefabaddad2")
+    c4 = bytes.fromhex(
+        "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e"
+        "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091"
+        "5bc94fbc3221a5db94fae95ae7121a47")
+    assert _aes_gcm_py(k4, iv4, p4, a4, decrypt=False) == c4
+    assert _aes_gcm_py(k4, iv4, c4, a4) == p4
+    # round trip and tamper detection at other lengths
     key, nonce = bytes(range(16)), bytes(range(12))
     for n in (0, 15, 16, 33, 1000):
         data = bytes((i * 7) & 0xff for i in range(n))
@@ -79187,7 +79391,7 @@ def t_investigations_reach_planted_cause(ctx):
     assert bw["rows"][0].startswith("◉ TV used")
     # on a scripted replay: slow DNS answers are the planted cause
     if not ctx.scapy_ok:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     S = ScenarioBuilder
     fr = []
     t = ctx.frames()[-1][1] + 5
@@ -82579,7 +82783,7 @@ def t_warm_up_on_the_loading_screen(ctx):
         FEATURES["compiled_start"] = real_cs
     # the capture start: the first quiet wait ends it, not a 0.2 s sleep
     if not ctx.scapy_ok or conf is None:
-        return
+        return "skip"   # (35-checker review) was counted as passed
 
     class QuietSock:
         closed = False
@@ -82637,7 +82841,7 @@ def t_rt01_compiled_copy_forgery(ctx):
     folder others can write, a key others can read, and any copy at all
     when the start is root. A copy MiniWireshark made itself still loads."""
     if IS_WINDOWS:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     import hmac
     import importlib._bootstrap_external as be
     folder = ctx.path("rt01")
@@ -82684,7 +82888,7 @@ def t_m1a_data_trust(ctx):
     can write to is refused (OS-04, LG-10, RT-06); a rollback copies only
     the backup this install wrote, under an authentic marker (RT-02)."""
     if IS_WINDOWS:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     mine = ctx.path("m1a-mine")
     os.makedirs(mine, exist_ok=True)
     os.chmod(mine, 0o777)
@@ -82771,13 +82975,19 @@ def t_m1a_elevation(ctx):
     assert not wants_capture(None, ctx.cfg({"general.auto_start_capture":
                                             False}))
     if IS_WINDOWS or IS_MAC:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     assert isinstance(has_capture_rights(), bool)
     assert needs_elevation() is (not has_capture_rights())
     if os.geteuid() == 0:
         assert has_capture_rights()
     calls = []
     real_which, real_call = shutil.which, subprocess.call
+    # (35-checker review) the flag folders go in a temporary folder of the
+    # test's own: the system one may hold a real elevated copy's folder,
+    # and a failed assert left this test's folder there
+    real_tmp = tempfile.tempdir
+    tempfile.tempdir = ctx.path(f"elev-tmp-{uuid.uuid4().hex[:6]}")
+    os.makedirs(tempfile.tempdir)
 
     def refused(cmd, *a, **kw):
         calls.append(cmd)
@@ -82821,6 +83031,7 @@ def t_m1a_elevation(ctx):
         os.rmdir(d)
     finally:
         shutil.which, subprocess.call = real_which, real_call
+        tempfile.tempdir = real_tmp
 
 
 @self_test()
@@ -83882,7 +84093,7 @@ def t_os02_elevated_files_handed_back(ctx):
     finally:
         os.environ.update(saved)
     if IS_WINDOWS or os.geteuid() != 0:
-        return                         # only root can change an owner
+        return "skip"                  # only root can change an owner
     d = ctx.path(f"os02_{uuid.uuid4().hex[:6]}")
     os.makedirs(os.path.join(d, "sub"))
     for p_ in (os.path.join(d, "a.json"), os.path.join(d, "sub", "b.db")):
@@ -87077,7 +87288,7 @@ def t_ip003_dark_title_bar(ctx):
             assert dark_title_bar(Win(), True) is False
         root = _m16_tk()
         if root is None:
-            return None
+            return "skip"      # (35-checker review) was counted as passed
         try:
             TITLE_BAR["api"] = (dwm, User32(), 22631)
             calls.clear()
@@ -88125,7 +88336,7 @@ def t_s15_clock_steps_are_not_sleep(ctx):
     assert wake_check(3615, 15, None, iv)[0] and \
         not wake_check(15, 15, None, iv)[0]
     if awake_clock() is None:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     got = []
     w = NetworkWatcher(got.append, interval=0.5)
     w._wall -= 120                       # the clock went ahead 2 minutes
@@ -88149,8 +88360,9 @@ def t_s15_daylight_saving_days(ctx):
     back was two days back, or the same day); the day/night baseline
     follows the local hour through both changes."""
     if not hasattr(time, "tzset"):
-        return
+        return "skip"   # (35-checker review) was counted as passed
     old = os.environ.get("TZ")
+    ran = 0
     try:
         for tz, spring, autumn in (("Europe/Paris", (2026, 3, 29),
                                     (2026, 10, 25)),
@@ -88158,6 +88370,7 @@ def t_s15_daylight_saving_days(ctx):
                                     (2026, 11, 1))):
             if not os.path.exists(os.path.join("/usr/share/zoneinfo", tz)):
                 continue
+            ran += 1
             os.environ["TZ"] = tz
             time.tzset()
 
@@ -88188,6 +88401,8 @@ def t_s15_daylight_saving_days(ctx):
         else:
             os.environ["TZ"] = old
         time.tzset()
+    if not ran:                 # (35-checker review) no time zone files
+        return "skip"
 
 
 @self_test()
@@ -88458,7 +88673,7 @@ def t_r6_text_links_one_binding(ctx):
         src = inspect.getsource(fn)
         assert "tag_bind" not in src, fn.__qualname__
     if sys.version_info < (3, 9):
-        return          # the test machine's 3.8 Tk aborts on any Text
+        return "skip"   # the test machine's 3.8 Tk aborts on any Text
     root = _m16_tk()
     if root is None:
         return "skip"
@@ -88778,7 +88993,7 @@ def t_r6_slow_interval_is_not_sleep(ctx):
     assert isinstance(secs, float) and secs > 0
     assert counts is False or IS_WINDOWS
     if awake_clock() is None:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     lines = []
 
     class H(logging.Handler):
@@ -88905,6 +89120,19 @@ def t_r7_umask_folders_repaired(ctx):
     if IS_WINDOWS:
         return "skip"                    # no POSIX modes there
     tag = uuid.uuid4().hex[:6]
+    # (35-checker review) a data folder of the test's own: it wrote into
+    # the person's real data and cache folders
+    real_data, real_cache = PATHS.data, PATHS.cache
+    PATHS.data = ctx.path(f"r7-data-{tag}")
+    PATHS.cache = os.path.join(PATHS.data, "cache")
+    os.makedirs(PATHS.cache, mode=0o700)
+    try:
+        return _r7_umask_folders(ctx, tag)
+    finally:
+        PATHS.data, PATHS.cache = real_data, real_cache
+
+
+def _r7_umask_folders(ctx, tag):
     before = list(sys.path)
     inside = os.path.join(PATHS.data, f"r7-site-{tag}")
     outside = ctx.path(f"r7-site-{tag}")
@@ -89245,8 +89473,10 @@ def t_b9_compiled_copy_trusted(ctx):
     with _b9_patched(globals(), IS_WINDOWS=False), \
             _b9_patched(os, geteuid=lambda: 0):
         assert not compiled_copy_trusted(os.path.join(lad, "c.pyc"))
-    if IS_WINDOWS or os.geteuid() == 0:
-        return
+    if IS_WINDOWS:
+        return "skip"   # (35-checker review) was counted as passed
+    if os.geteuid() == 0:
+        return          # root never uses a compiled copy: checked above
     folder = ctx.path("b9cc")
     assert not compiled_copy_trusted(os.path.join(folder, "c.pyc"))
     os.makedirs(folder, mode=0o700)
@@ -89294,7 +89524,7 @@ def t_b9_install_key_rejects_foreign(ctx):
             k3 = install_key()
             assert len(k3) == 32 and read() == k3
         if IS_WINDOWS:
-            return
+            return "skip"   # (35-checker review) was counted as passed
         assert install_key(create=False) == k3
         os.chmod(path, 0o644)
         assert install_key(create=False) is None
@@ -89565,7 +89795,7 @@ def t_534_review_fontconfig_guard_stays_inside(ctx):
     theirs = {"FONTCONFIG_FILE": "/etc/their.conf"}
     assert env_for_outside(theirs) == theirs
     if IS_WINDOWS or IS_MAC:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     seen = []
 
     class FakePopen:
@@ -89808,8 +90038,11 @@ def t_534_ci_hung_step_names_itself(ctx):
     assert "[TIMEOUT] self-test stuck one: still running after 0 s" in \
         text and "t_534_ci_hung_step_names_itself" in text, text
     assert 60 <= SELF_TEST_LIMIT_S <= GUI_STEP_LIMIT_S
-    src = inspect.getsource(run_self_tests) + inspect.getsource(run_gui_test)
+    # (35-checker review) the GUI test's steps run in gui_test_record
+    src = inspect.getsource(run_self_tests) + \
+        inspect.getsource(gui_test_record)
     assert src.count("StepWatchdog(") == 2, "both runners use it"
+    assert "gui_test_record(" in inspect.getsource(run_gui_test)
     # leaving: a thread that keeps the process alive is named, and the
     # run ends after the limit with the stacks
     hold = threading.Event()
@@ -90136,7 +90369,7 @@ def t_b9_private_file_ok(ctx):
     with _b9_patched(globals(), IS_WINDOWS=True):
         assert private_file_ok(p)
     if IS_WINDOWS:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     os.chmod(p, 0o600)
     assert private_file_ok(p)
     os.chmod(p, 0o644)
@@ -91974,8 +92207,8 @@ def _gs_stress(app, ctx):
 
 @gui_test_step("live capture starts and stops (only with --live)")
 def _gs_live(app, ctx):
-    if "--live" not in sys.argv:
-        return
+    if not getattr(ctx, "live", False):
+        return "skip"
     app.start(auto=True)
     _gui_pump(app.root, 3.0)
     assert app.sniffer is not None, "capture did not start"
@@ -93801,6 +94034,21 @@ def _gs_official_update_source(app, ctx):
         _gui_pump(root, 0.1)
 
 
+def gui_test_record(results, name, fn):
+    """Run one GUI test step and add (status, name, message) to
+    `results`. (35-checker review) a step that returns "skip" (not
+    available here, or --live not given) is SKIP, as in the self-test: it
+    was counted as passed."""
+    try:
+        with StepWatchdog("GUI test step " + name, GUI_STEP_LIMIT_S):
+            r = fn()
+        results.append(("SKIP", name, "not available here") if r == "skip"
+                       else ("PASS", name, ""))
+    except Exception as e:                           # noqa: BLE001
+        results.append(("FAIL", name, f"{type(e).__name__}: {e}\n" +
+                        traceback.format_exc(limit=6)))
+
+
 def run_gui_test(live=False):
     """Returns 0 on success. Prints a step-by-step report."""
     global PATHS
@@ -93812,6 +94060,7 @@ def run_gui_test(live=False):
     _patch_dialogs_for_tests()
     results = []
     ctx = TestContext(tmp, True)
+    ctx.live = bool(live)        # (35-checker review) was read from argv
     cfg = ctx.cfg({"general.auto_start_capture": False,
                    "updates.check_automatically": False,
                    "privacy.auto_download_reference": False,
@@ -93831,13 +94080,7 @@ def run_gui_test(live=False):
 
     def step(name, fn):
         t0 = time.perf_counter()
-        try:
-            with StepWatchdog("GUI test step " + name, GUI_STEP_LIMIT_S):
-                fn()
-            results.append(("PASS", name, ""))
-        except Exception as e:                       # noqa: BLE001
-            results.append(("FAIL", name, f"{type(e).__name__}: {e}\n" +
-                            traceback.format_exc(limit=6)))
+        gui_test_record(results, name, fn)
         # 5.3.4 CI: the reason on the step's own line, in case the run
         # dies before the summary at the end (it did, on Windows)
         why = results[-1][2].splitlines()[0][:300] if results[-1][2] \
@@ -93960,10 +94203,11 @@ def run_gui_test(live=False):
         assert not bad, f"non-daemon threads left: {bad}"
     step("clean shutdown", s_close)
     failed = [r for r in results if r[0] == "FAIL"]
+    skipped = sum(1 for r in results if r[0] == "SKIP")
     print(f"  (timers cancelled with their widget: "
           f"{AFTER_GUARD['cancelled']})")
-    print(f"\nGUI test: {len(results) - len(failed)} passed / "
-          f"{len(failed)} failed")
+    print(f"\nGUI test: {len(results) - len(failed) - skipped} passed / "
+          f"{len(failed)} failed / {skipped} skipped")
     for _s, name, msg in failed:
         print(f"\nFAILED: {name}\n{msg}")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -97864,7 +98108,7 @@ def _gs_ct26_packet_count(app, ctx):
     _gui_pump(root, 0.1)
     rows = list(app.all_rows)[-20:]
     if not rows:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     if not tab.paused:
         tab.toggle_pause()
     added = 0
@@ -99834,6 +100078,599 @@ def t_a2_ready_list_agrees_with_the_boot_check(ctx):
     usage = cli_usage()
     assert "--bench-gui [S1 S2" in usage, usage
     assert cli_check(["--bench-gui", "S1", "S2", "--check"]) is None
+@self_test(needs_source=True)
+def t_q35_beginner_help_names_every_hidden_tab(ctx):
+    """35-checker pass: the Beginner view's help (Settings) and the
+    Beginner / Advanced tooltip name every tab Beginner hides, Sources
+    too, in all three languages."""
+    import ast
+    hidden = [STRINGS["en"][c.label_key].split(" ", 1)[1]
+              for c in BaseTab.__subclasses__() if c.advanced]
+    assert "Sources" in hidden and len(hidden) == 4, hidden
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    tips = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == \
+                "Tooltip" and len(node.args) > 1:
+            parts, n = [], node.args[1]
+            while isinstance(n, ast.BinOp):
+                parts.insert(0, n.right.value)
+                n = n.left
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                parts.insert(0, n.value)
+                text = "".join(parts)
+                if text.startswith("Beginner shows the essentials"):
+                    tips.append(text)
+    assert len(tips) == 1, tips
+    page = next(c for p in SETTINGS_PAGES for s in p["sections"]
+                for c in s["controls"]
+                if c.get("key") == "appearance.beginner_mode")
+    for text in (tips[0], page["help"]):
+        for tab in hidden:
+            assert tab in text, (tab, text)
+        for loc in ("fr", "es"):
+            tr = translate_text(text, loc)
+            assert tr != text, (loc, text)
+            for tab in hidden:
+                assert translate_text(tab, loc) in tr, (loc, tab, tr)
+
+
+@self_test()
+def t_q35_reference_data_help_says_what_the_code_does(ctx):
+    """35-checker pass: nothing is downloaded on its own under Manual (the
+    default); under Weekly a missing list is fetched and an old one again
+    after its refresh days; the setting's help says exactly that, and no
+    "about once a month" text is left in any language."""
+    help_ = next(c for p in SETTINGS_PAGES for s in p["sections"]
+                 for c in s["controls"]
+                 if c.get("key") == "privacy.auto_download_reference")["help"]
+    for key in ("oui", "psl"):
+        r = next(x for x in DATA_MANIFEST if x.key == key)
+        assert r.enable_key == "privacy.auto_download_reference"
+        assert f"{r.refresh_days} days" in help_, help_
+    assert "Manual" in help_ and "Weekly" in help_ and \
+        "unless you ask" in help_, help_
+    for loc in ("fr", "es"):
+        assert translate_text(help_, loc) != help_, loc
+    for loc, table in I18N.items():
+        for en, tr in table.items():
+            for t in (en, tr):
+                assert "once a month" not in t and \
+                    "une fois par mois" not in t and \
+                    "una vez al mes" not in t, (loc, en[:60])
+    assert config_defaults_flat().get("components.policy",
+                                      "Manual") == "Manual"
+    for policy, want in (("Manual", set()), ("Weekly", {"oui", "psl"})):
+        got = []
+        dm = DataManager(ctx.path(f"q35-ref-{policy}"), ctx.cfg(
+            {"privacy.auto_download_reference": True,
+             "components.policy": policy}))
+        os.makedirs(dm.cache_dir, exist_ok=True)
+        dm._download = lambda r, got=got: got.append(r.key) or False
+        assert dm.start()
+        t_end = time.time() + 20
+        while dm.busy() and time.time() < t_end:
+            time.sleep(0.02)
+        assert not dm.busy()
+        assert want <= set(got) and (want or not got), (policy, got)
+
+
+@self_test()
+def t_q35_bench_gui_help_shows_its_scenarios(ctx):
+    """35-checker pass: --help shows the --bench-gui scenarios, and they
+    are the real ones."""
+    rc, text = cli_check(["--help"])
+    assert rc == 0
+    line = next(ln for ln in text.splitlines()
+                if ln.strip().startswith("--bench-gui"))
+    want = "[" + " ".join(BENCH_SCENARIOS) + " | all]"
+    assert line.strip() == "--bench-gui " + want, line
+    assert cli_check(["--bench-gui", "S2", "S3", "--check"]) is None
+    assert cli_check(["--bench-gui"]) is None
+
+
+@self_test()
+def t_q35_dropped_download_is_a_runtime_error(ctx):
+    """35-checker pass: a transfer cut short (http.client.IncompleteRead,
+    no OSError) ends as a RuntimeError_ the window explains, and keeps
+    its .part; "407" in a message is a proxy only as the HTTP status; the
+    private Python's free-space need is one number everywhere."""
+    class Resp:
+        status = 200
+        headers = {"Content-Length": "100"}
+
+        def __init__(self):
+            self.n = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, _n):
+            self.n += 1
+            if self.n == 1:
+                return b"x" * 40
+            raise http.client.IncompleteRead(b"", 60)
+    real = globals()["net_urlopen"]
+    globals()["net_urlopen"] = lambda *a, **k: Resp()
+    try:
+        for get in (lambda d: fetch_to_file("https://example.com/f", d,
+                                            expected_sha="0" * 64),
+                    lambda d: RuntimeManager(root_dir=ctx.path("q35rt"))
+                    .download("https://example.com/f", d,
+                              expected_sha="0" * 64)):
+            dest = ctx.path(f"q35dl-{uuid.uuid4().hex[:6]}/file.bin")
+            try:
+                get(dest)
+                raise AssertionError("no error")
+            except RuntimeError_ as e:
+                assert e.kind == "offline", e.kind
+            assert os.path.getsize(dest + ".part") == 40
+    finally:
+        globals()["net_urlopen"] = real
+    assert classify_runtime_error(OSError("wrote 407 bytes")) != "proxy"
+    assert classify_runtime_error(OSError(
+        "/home/u/407/x: not found")) != "proxy"
+    assert classify_runtime_error(urllib.error.HTTPError(
+        "https://x/", 407, "Proxy Authentication Required", {}, None)) == \
+        "proxy"
+    assert f"{RUNTIME_FREE_MB} MB" in RUNTIME_ERRORS["disk"][1]
+    mgr = RuntimeManager(root_dir=ctx.path("q35rt2"))
+    if mgr.plan()["supported"]:
+        assert f"{RUNTIME_FREE_MB} MB free" in mgr.describe()
+        real_du = shutil.disk_usage
+        shutil.disk_usage = lambda p: types.SimpleNamespace(
+            free=RUNTIME_FREE_MB * 1024 * 1024 - 1, total=1, used=0)
+        try:
+            mgr.provision()
+            raise AssertionError("provisioned without the space")
+        except RuntimeError_ as e:
+            assert e.kind == "disk", e
+        finally:
+            shutil.disk_usage = real_du
+
+
+@self_test()
+def t_q35_json_store_leaves_no_temporary_files(ctx):
+    """35-checker pass: a store write that fails leaves no *.tmp file, and
+    the same damaged store is set aside once, not on every start."""
+    folder = ctx.path(f"q35store-{uuid.uuid4().hex[:6]}")
+    os.makedirs(folder)
+    path = os.path.join(folder, "labels.json")
+    save_json_store(path, {"a": 1})
+
+    class Bad:
+        def __str__(self):
+            raise RuntimeError("cannot be written")
+    try:
+        save_json_store(path, {"a": Bad()})
+        raise AssertionError("no error")
+    except RuntimeError:
+        pass
+    assert sorted(os.listdir(folder)) == ["labels.json"], os.listdir(folder)
+    assert read_json(path, None) == {"a": 1}
+    save_json_store(path, {"a": 2})
+    assert read_json(path + ".bak", None) == {"a": 1}
+    with open(path, "w") as f:
+        f.write("{broken")
+    os.remove(path + ".bak")
+    for i in range(3):
+        data, problem = load_json_store(path)
+        assert data is None and problem == "damaged", problem
+        for n in os.listdir(folder):     # as if set aside on another day
+            if ".damaged-" in n and len(n.rsplit("-", 1)[1]) > 3:
+                os.replace(os.path.join(folder, n), f"{path}.damaged-{i}")
+    damaged = [n for n in os.listdir(folder) if ".damaged-" in n]
+    assert len(damaged) == 1, damaged
+
+
+@self_test()
+def t_q35_port_text_takes_text_ports(ctx):
+    """35-checker pass: a port given as text is explained like a number
+    (it raised TypeError)."""
+    assert "ephemeral" in explain_port_text("50000")
+    assert explain_port_text("50000") == explain_port_text(50000)
+    assert explain_port_text("x") == ""
+
+
+@self_test()
+def t_q35_data_manager_starts_once(ctx):
+    """35-checker pass: two starts at the same moment (Repair's thread and
+    the window) give one download run, not two."""
+    hold = threading.Event()
+
+    class Slow(DataManager):
+        @property
+        def _busy(self):
+            v = self.__dict__.get("_q35_busy", False)
+            time.sleep(0.05)              # both read before either writes
+            return v
+
+        @_busy.setter
+        def _busy(self, v):
+            self.__dict__["_q35_busy"] = v
+    dm = Slow(ctx.path("q35-dm"), ctx.cfg({}))
+    dm.enabled = lambda r: hold.wait(10) and False
+    gate = threading.Barrier(2)
+    got = []
+
+    def go():
+        gate.wait()
+        got.append(dm.start())
+    ts = [threading.Thread(target=go) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(5)
+    hold.set()
+    assert sorted(got) == [False, True], got
+    t_end = time.time() + 10
+    while dm.busy() and time.time() < t_end:
+        time.sleep(0.02)
+
+
+@self_test()
+def t_q35_adapter_up_and_router_on_its_subnet(ctx):
+    """35-checker pass: adapter flags given as a number are read (they
+    made every adapter "disconnected"), and "your router is on the same
+    network" uses the card's real subnet from the route table, never a
+    /24 guess (LG-08)."""
+    assert iface_flags_up(0x1043) and not iface_flags_up(0x1002)
+    assert iface_flags_up("UP+BROADCAST+RUNNING")
+    assert not iface_flags_up("BROADCAST+LOWER_UP")
+    assert not iface_flags_up("")
+    ip_int = int(ipaddress.ip_address("10.0.0.0"))
+    mask = int(ipaddress.ip_address("255.255.255.240"))
+    card = types.SimpleNamespace(name="q35eth0", description="", ip="10.0.0.5",
+                                 flags="UP+BROADCAST", network_name="")
+    fake = types.SimpleNamespace(
+        ifaces={"q35eth0": card},
+        route=types.SimpleNamespace(routes=[
+            (ip_int, mask, "0.0.0.0", "q35eth0", "10.0.0.5", 1)]))
+    real = globals().get("conf")
+    globals()["conf"] = fake
+    try:
+        for gw, same in (("10.0.0.1", True), ("10.0.0.100", False)):
+            rec = score_interfaces("", gw, best="")
+            r = next(x for x in rec if x["name"] == "q35eth0")
+            said = "your router is on the same network" in r["reasons"]
+            assert said is same, (gw, r["reasons"])
+        fake.route.routes = []                  # subnet unknown: no guess
+        r = score_interfaces("", "10.0.0.1", best="")[0]
+        assert "your router is on the same network" not in r["reasons"]
+    finally:
+        globals()["conf"] = real
+
+
+@self_test()
+def t_q35_dns_check_has_one_deadline(ctx):
+    """35-checker pass: the health check's DNS lookup gives up at its
+    timeout even when other datagrams keep arriving (it waited for ever)."""
+    stop = threading.Event()
+
+    class Sock:
+        def __init__(self, *a):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def sendto(self, data, addr):
+            return len(data)
+
+        def recvfrom(self, n):
+            if stop.is_set():
+                raise OSError("test over")
+            time.sleep(0.02)
+            return b"\x00\x00\x81\x80" + bytes(8), ("192.0.2.53", 53)
+
+        def close(self):
+            pass
+    real = globals()["_socket"]
+    globals()["_socket"] = types.SimpleNamespace(
+        AF_INET=real.AF_INET, AF_INET6=real.AF_INET6,
+        SOCK_DGRAM=real.SOCK_DGRAM, socket=Sock, timeout=real.timeout)
+    out = []
+    try:
+        t = threading.Thread(target=lambda: out.append(
+            HealthProber._dns_rtt("192.0.2.53", timeout=0.3)), daemon=True)
+        t.start()
+        t.join(5)
+        assert not t.is_alive(), "the lookup never gave up"
+    finally:
+        stop.set()
+        globals()["_socket"] = real
+    assert out == [(False, None, None)], out
+
+
+@self_test()
+def t_q35_router_answer_must_be_recent(ctx):
+    """35-checker pass: "Why can't this device connect?" counts the
+    router's answer only when it came after a question inside the window:
+    an answer from long ago no longer hides a router that ignores every
+    question since."""
+    b = ScenarioBuilder()
+    b.arp_announce(b.ME)
+    L, nb, ip = b.L, MC7_NEWBIE, "192.168.1.77"
+
+    def ask():
+        b._emit(L.Ether(src=nb, dst="ff:ff:ff:ff:ff:ff") / L.ARP(
+            op=1, hwsrc=nb, psrc=ip, pdst=b.GW[0]), dt=1.0)
+    ask()
+    b._emit(L.Ether(src=b.GW[1], dst=nb) / L.ARP(
+        op=2, hwsrc=b.GW[1], psrc=b.GW[0], hwdst=nb, pdst=ip), dt=0.01)
+    b.t += 2000
+    for _i in range(3):
+        ask()
+    b.tls(b.ME, "www.example.com", "93.184.215.14", size=4000)
+    m = _call_model(ctx, b.frames)
+    assert m.gw_arp_replies.get(nb), dict(m.gw_arp_replies)
+    f = connect_facts(m, nb)
+    assert f["arp_asks"] == 3 and not f["gw_replied"], f
+    hyps = investigate_connect(f)
+    assert not any(h["key"] == "router_silent" and h["status"] ==
+                   "Unlikely" for h in hyps), hyps
+
+
+@self_test()
+def t_q35_call_never_overclaims_complete(ctx):
+    """35-checker pass: "arrived complete and on time" only when nothing
+    was lost and the capture itself dropped nothing."""
+    base = {"tuple": (), "first": 0.0, "last": 60.0, "kind": "voice",
+            "worst": None, "inbound": True}
+
+    def why(f):
+        return json.dumps(investigate_call(f), default=str)
+    full = "arrived complete and on time"
+    assert full in why({"calls": [dict(base, loss_pct=0.0, jitter_ms=2)]})
+    dropped = why({"calls": [dict(base, loss_pct=0.0, jitter_ms=2)],
+                   "capture_drop_pct": 0.05})
+    assert full not in dropped and "can't tell whether" in dropped, dropped
+    some = why({"calls": [dict(base, loss_pct=0.5, jitter_ms=2)]})
+    assert full not in some and "lost only 0.5%" in some, some
+
+
+@self_test()
+def t_q35_history_writer_survives_a_bad_batch(ctx):
+    """35-checker pass: a batch that fails with something other than a
+    database error is reported and the writer goes on (history stopped
+    silently)."""
+    st = Store(ctx.path(f"q35h-{uuid.uuid4().hex[:6]}.sqlite3"),
+               session_id=1)
+    ran = []
+    try:
+        def bad(con):
+            raise TypeError("a value the database can't take")
+        assert st.submit(bad)
+        assert st.submit(lambda con: ran.append(1))
+        assert st.flush_now(10), "the writer stopped"
+        assert ran == [1] and st._thread.is_alive()
+        assert "TypeError" in st.error, st.error
+    finally:
+        st.stop(5)
+
+
+@self_test()
+def t_q35_periodic_counts_contacts(ctx):
+    """35-checker pass: "about every 60 s (N times)" counts the contacts
+    seen, not the regular gaps plus one."""
+    starts = [1000.0 + i * 60 for i in range(13)]
+    starts += [starts[-1] + 500 * (k + 1) for k in range(3)]
+    m = types.SimpleNamespace(
+        flow_starts={("dev1", "52.1.2.3"): starts}, ip_to_domains={},
+        registry=types.SimpleNamespace(resolve=lambda k: k, by_key={}))
+    rows = periodic_findings(m)
+    assert rows and rows[0][3] == 16 and "(16 times)" in rows[0][4], rows
+
+
+@self_test()
+def t_q35_ipv6_over_udp_counts_as_used(ctx):
+    """35-checker pass: IPv6 traffic without a TCP handshake (QUIC) is
+    IPv6 in use: never "your network doesn't offer IPv6" or "nothing used
+    it yet"."""
+    for f in ({"v6_share": 0.3, "span": 1200},
+              {"v6_share": 0.3, "span": 1200, "ra": True},
+              {"v6_share": 0.3, "span": 60}):
+        keys = {h["key"] for h in investigate_ipv6(f)}
+        assert not keys & {"not_offered", "unused"}, (f, keys)
+        assert "working" in keys, (f, keys)
+    keys = {h["key"] for h in investigate_ipv6({"span": 1200})}
+    assert "not_offered" in keys, keys
+
+
+@self_test()
+def t_q35_vlan_change_is_not_a_move(ctx):
+    """35-checker pass: the same switch port on another VLAN is said as a
+    VLAN change, not "Moved to"."""
+    m = _call_model(ctx, [])
+    t = SCENARIO_T0
+    for i, raw in enumerate((_lldp_frame(vlan=20), _lldp_frame(vlan=30))):
+        d = _fast_decode(raw, t + 1 + i, 1, None)
+        d["no"] = 1 + i
+        m.ingest(d)
+    tl = [e["text"] for e in m.timeline if e["kind"] == "network"]
+    assert any(x.startswith("VLAN changed on core-sw1") and "now 30" in x
+               and "was 20" in x for x in tl), tl
+    assert not any(x.startswith("Moved to") for x in tl), tl
+
+
+@self_test()
+def t_q35_calls_card_survives_a_bad_translation(ctx):
+    """35-checker pass: a translation of the Calls card whose placeholders
+    don't fit falls back to English instead of raising."""
+    tpl = ("Your voice call lost %s of packets between %s and %s; "
+           "jitter %d ms (usually fine below %d).")
+    tracker = types.SimpleNamespace(unmeasured=lambda: 0, summary=lambda: [
+        {"kind": "voice", "loss_pct": 2.0, "first": SCENARIO_T0,
+         "last": SCENARIO_T0 + 60, "jitter_ms": 10.0, "worst": None}])
+    old = CURRENT_LOCALE
+    key = ("fr", tpl)
+    had = _I18N_CACHE.get(key)
+    try:
+        set_locale("fr")
+        _I18N_CACHE[key] = "Appel : %s perdu"
+        text = calls_card_text(tracker)
+        assert "Your voice call lost 2.0%" in text, text
+    finally:
+        set_locale(old)
+        if had is None:
+            _I18N_CACHE.pop(key, None)
+        else:
+            _I18N_CACHE[key] = had
+
+
+@self_test()
+def t_q35_stop_during_self_heal_is_final(ctx):
+    """35-checker pass (high): Stop pressed while a self-heal restart is
+    trying the cards ends it; the cancelled attempt is no failure to heal
+    again (the capture came back after the person stopped it). A restart
+    that really fails still heals."""
+    def fake():
+        app = types.SimpleNamespace()
+        app._capture_token = 5
+        app.sniffer = None
+        app._capture_starting = False
+        app.data_mode = "live"
+        app.iface_scores = [{"name": "eth0", "score": 50,
+                             "display": "Ethernet"}]
+        app.iface_box = {"values": ["Ethernet"]}
+        app._populate_ifaces = lambda scores=None: None
+        app.died = []
+        app._handle_sniffer_died = lambda e: app.died.append(e)
+        app.pending = []
+
+        def start(cands, keep_data=False, on_done=None):
+            app._capture_token += 1
+            app._capture_starting = True
+            app.pending.append(on_done)
+            return True
+        app._start_capture = start
+        return app
+    app = fake()
+    MiniWireshark._heal_continue(app, app._capture_token, "eth0", None, None)
+    assert len(app.pending) == 1
+    app._capture_token += 1            # Stop: cancels the start under way
+    app._capture_starting = False
+    app.data_mode = "idle"
+    app.pending[0](False)              # the stale start reports back
+    assert app.died == [], "a cancelled restart was healed again"
+    app = fake()
+    MiniWireshark._heal_continue(app, app._capture_token, "eth0", None, None)
+    app._capture_starting = False
+    app.pending[0](False)              # no stop: a real failure
+    assert len(app.died) == 1
+
+
+@self_test()
+def t_q35_rename_workspace_never_replaces_silently(ctx):
+    """35-checker pass: renaming a workspace to the name of another asks
+    first; "no" keeps both."""
+    cfg = ctx.cfg({"workspaces.saved": {"Home": {"tab": "devices"},
+                                        "Work": {"tab": "alerts"}}})
+    app = types.SimpleNamespace(config=cfg, root=None)
+    asked = []
+    real = messagebox.askyesno
+    try:
+        messagebox.askyesno = lambda *a, **k: asked.append(a) or False
+        assert MiniWireshark.rename_workspace(app, "Home", "Work") is None
+        assert asked, "it didn't ask"
+        saved = cfg.get("workspaces.saved")
+        assert saved["Home"] == {"tab": "devices"} and \
+            saved["Work"] == {"tab": "alerts"}, saved
+        messagebox.askyesno = lambda *a, **k: True
+        assert MiniWireshark.rename_workspace(app, "Home", "Work") == "Work"
+        assert cfg.get("workspaces.saved") == {"Work": {"tab": "devices"}}
+    finally:
+        messagebox.askyesno = real
+
+
+@self_test(needs_source=True)
+def t_q35_update_failures_are_told_and_restore_is_whole(ctx):
+    """35-checker pass: a download that doesn't compile is a ValueError
+    (the update thread died on SyntaxError, silently); a marker that can't
+    be written after the program was replaced says so instead of "nothing
+    was changed"; an interrupted rollback leaves the program whole (it
+    was copied over the program, truncating it first)."""
+    d = ctx.path(f"q35upd-{uuid.uuid4().hex[:6]}")
+    os.makedirs(d)
+    cur = os.path.join(d, "miniwireshark.py")
+    old = b"# MiniWireshark old\ndef main():\n    pass\n" + b"#" * 60000
+    with open(cur, "wb") as f:
+        f.write(old)
+    broken = b"# MiniWireshark\ndef main(:\n    pass\n" + b"#" * 60000
+    try:
+        apply_self_update(broken, "9.9.9", cur, os.path.join(d, "m.json"))
+        raise AssertionError("installed a broken program")
+    except ValueError as e:
+        assert "not a working program" in str(e), e
+    assert open(cur, "rb").read() == old
+    new = _court_update_body()
+    folder_marker = os.path.join(d, "marker-is-a-folder")
+    os.makedirs(folder_marker)
+    msg = apply_self_update(new, "9.9.9", cur, folder_marker)
+    assert "was installed" in msg and "couldn't be set up" in msg, msg
+    assert open(cur, "rb").read() == new
+    assert not [n for n in os.listdir(d) if n.endswith(".new")]
+    # a real marker, then a rollback whose copy breaks half way
+    with open(cur, "wb") as f:
+        f.write(old)
+    marker = os.path.join(d, "marker.json")
+    apply_self_update(new, "9.9.9", cur, marker)
+    real = shutil.copyfile
+
+    def half(src, dst, *a, **k):
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            fo.write(fi.read()[:100])
+        raise OSError("the disk went away")
+    shutil.copyfile = half
+    try:
+        msg = rollback_update_if_needed(force=True, script_path=cur,
+                                        marker_path=marker)
+    finally:
+        shutil.copyfile = real
+    assert "failed" in msg, msg
+    assert open(cur, "rb").read() == new, "the program was left broken"
+    assert not [n for n in os.listdir(d) if n.endswith(".rb")]
+
+
+@self_test(needs_source=True)
+def t_q35_ctrl_c_is_not_success(ctx):
+    """35-checker pass: Ctrl+C while MiniWireshark starts ends with exit
+    code 130, not 0."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    main_if = [n for n in tree.body if isinstance(n, ast.If) and
+               "__name__" in ast.dump(n.test)]
+    assert main_if
+    handlers = [h for n in ast.walk(main_if[-1]) if isinstance(n, ast.Try)
+                for h in n.handlers if h.type is not None and
+                getattr(h.type, "id", "") == "KeyboardInterrupt"]
+    assert handlers, "no Ctrl+C handler"
+    for h in handlers:
+        calls = [c for c in ast.walk(h) if isinstance(c, ast.Call) and
+                 isinstance(c.func, ast.Attribute) and c.func.attr == "exit"]
+        assert calls and isinstance(calls[0].args[0], ast.Constant) and \
+            calls[0].args[0].value == 130, ast.dump(h)
+
+
+@self_test()
+def t_q35_gui_test_counts_skips(ctx):
+    """35-checker pass: a GUI test step that returns "skip" is reported
+    as skipped (it counted as passed), and the --live step skips unless
+    the run was asked for --live."""
+    res = []
+    gui_test_record(res, "a", lambda: None)
+    gui_test_record(res, "b", lambda: "skip")
+
+    def boom():
+        raise ValueError("x")
+    gui_test_record(res, "c", boom)
+    assert [r[0] for r in res] == ["PASS", "SKIP", "FAIL"], res
+    assert _gs_live(None, types.SimpleNamespace(live=False)) == "skip"
 
 
 # ============================================================================
@@ -100748,7 +101585,8 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        pass
+        # (35-checker review) stopped with Ctrl+C: not a success (128+2)
+        sys.exit(130)
     except Exception as e:                           # noqa: BLE001
         LOG.exception("fatal error")
         boot_step("crash", False, error=e)

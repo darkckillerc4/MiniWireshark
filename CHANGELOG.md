@@ -134,6 +134,25 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - The Dashboard's ALERTS card names its counts ("Danger 0 · Warning 1 · Info 5") instead of three bare numbers behind symbols.
 - The Map legend says what the letter on a device means: how sure MiniWireshark is that it is a real device (H high, M medium, L low, ? unconfirmed).
 - French: a fact another system told MiniWireshark is called "Signalé" everywhere (it was "rapporté" in places), and a correlated one "Corrélé" (it was "Recoupé" in the evidence key).
+- Pressing Stop while MiniWireshark was restarting a capture that had stopped by itself no longer starts the capture again a few seconds later.
+- The help for the Beginner view now names all the tabs it hides: Connections, Internet hosts, Packets and Sources.
+- The help for the downloaded vendor and site lists says what really happens: nothing is downloaded unless you ask (Updates is Manual by default); with Weekly, a missing list is fetched at start and each list again once it is more than 30 days old. The Components Center says the same.
+- `--help` shows the scenarios `--bench-gui` takes (S1 S2 S3 S4, or all).
+- A download cut off part way (for the private Python or a package) now says "No Internet connection" and resumes next time, instead of failing with a raw error. A message that merely contains "407" (a size, a folder) is no longer taken for a proxy problem.
+- The private Python's disk space is one number everywhere: it needs about 300 MB free while it installs (the message said 250 MB, the description 120 MB).
+- A failed save of your labels, trusted networks or taught device types leaves no temporary file behind, and a damaged copy of one is set aside once, not again on every start.
+- History no longer stops in silence when one batch can't be written: the error is shown and the next batches are saved.
+- *Why can't this device connect?* only says "the router answered" when it answered one of the device's recent questions, not one from long before.
+- *Why does my call stutter?* no longer says the call's packets "arrived complete" when the capture itself missed packets or some were lost.
+- *Is IPv6 working?* counts IPv6 traffic that uses no TCP handshake (QUIC), so a network used over IPv6 is no longer called one that "doesn't offer IPv6".
+- "Contacts X about every 60 s (N times)" counts every contact seen.
+- A switch port that moves to another VLAN is reported as a VLAN change, not as "Moved to" the same port.
+- A French or Spanish text of the Calls card that doesn't fit its numbers falls back to English instead of breaking the card.
+- Renaming a workspace to the name of another one asks before replacing it.
+- An update whose download isn't a working program now says so (the update failed without a word). If the update was installed but its automatic restore couldn't be set up, the message says that instead of "nothing was changed". A restore of the previous version is copied in one step, so an interruption can't leave a broken program.
+- Stopping MiniWireshark with Ctrl+C while it starts ends with exit code 130 instead of 0.
+- The network check's DNS lookup gives up at its time limit even when other answers keep arriving.
+- The network-card pick reads a card's state when the capture library gives it as a number, and checks "your router is on the same network" against the card's real network instead of assuming a /24.
 
 **Known limits**
 
