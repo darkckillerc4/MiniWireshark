@@ -1,6 +1,6 @@
 # Logo and images
 
-Everything here is in [`assets/`](assets/), drawn as SVG in the app's own palette (navy `#0f1b2d` to `#1b3354`, accent `#7fbaff`, wave `#4ea1ff` to `#b48cff`). Use them freely when you write about MiniWireshark.
+Everything here is in [`assets/`](assets/), drawn as SVG in the app's own palette (the PNG and ICO files are exported from the SVGs) (navy `#0f1b2d` to `#1b3354`, accent `#7fbaff`, wave `#4ea1ff` to `#b48cff`). Use them freely when you write about MiniWireshark. They are released under the repository's MIT License (see [LICENSE](../LICENSE)).
 
 ## Logo
 
@@ -27,7 +27,7 @@ To use the social preview on GitHub: open the repository's **Settings → Genera
 
 ## Icons
 
-One icon for each area of the app, 48×48 SVG. They are used in the README and in [Under the hood](UNDER-THE-HOOD.md).
+One icon for each area of the app, 48×48 SVG. They are used in the README, in [Under the hood](UNDER-THE-HOOD.md) and in [Can I trust it?](TRUST.md).
 
 | | | | | | |
 |:-:|:-:|:-:|:-:|:-:|:-:|
@@ -37,7 +37,7 @@ One icon for each area of the app, 48×48 SVG. They are used in the README and i
 
 ## Screenshots
 
-28 pictures, every tab in the light and the dark theme, all from Demo Mode. See [Screenshots](SCREENSHOTS.md). To take them again after a change to the window, run the release gate, which photographs every tab:
+34 pictures, every tab in the light and the dark theme, all from Demo Mode. See [Screenshots](SCREENSHOTS.md). To take them again after a change to the window, run the release gate, which photographs every tab:
 
 ```bash
 xvfb-run -a python miniwireshark.py --release-gate

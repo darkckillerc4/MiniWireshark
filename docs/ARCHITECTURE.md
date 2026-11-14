@@ -1,6 +1,6 @@
 # Architecture
 
-MiniWireshark is about 89,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
+MiniWireshark is about 94,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
 
 ## The map of the file
 
@@ -45,7 +45,7 @@ python miniwireshark.py
    ├─ Loading window (2b, 2c): the bootstrap steps, in plain English.
    │     Missing packages go into a private per-Python folder, never the
    │     system Python. Required packages are checked against a pinned
-   │     SHA-256; optional ones come from PyPI through pip, unpinned.
+   │     SHA-256; optional ones come from PyPI through pip at exact pinned versions, with pip checking PyPI's own hashes.
    │
    ├─ Load scapy, find the gateway, this computer's addresses and the
    │     best network card. Warm up the first views.
@@ -64,7 +64,7 @@ From 5.1.2 the compiled code is cached per Python version in the data folder. La
      │  raw bytes, time, link type
      ▼
  capture thread (6b) ──▶ RawRing ──▶ AnalysisWorker ──▶ NetworkModel (13)
-   never parses           drops are     fast_decode (5b),     devices, websites,
+   never parses           drops are     fast_decode (5b/5c),     devices, websites,
                           counted here  holds GuiGate         remote hosts, flows,
                           by cause      ≤ ~25 ms at a time    metrics, alerts
                                                                  │
@@ -104,7 +104,7 @@ Observations are facts with a source, a time and, when they came from a packet, 
 
 ## Settings are one table
 
-Every option is declared exactly once in `SETTINGS_PAGES` (region 16), grouped by what a person is trying to do. The Settings window is generated from that table, and the self-tests prove that no option is orphaned or phantom.
+Every option is declared exactly once in `SETTINGS_PAGES` (region 16), grouped by what a person is trying to do. The Settings window is generated from that table, and a self-test checks that every option in the table has a default.
 
 ## Privacy is enforced in code
 
@@ -114,7 +114,7 @@ Every option is declared exactly once in `SETTINGS_PAGES` (region 16), grouped b
 
 ## Testing
 
-All test traffic comes from **replay scenarios** (20a): a scripted home network made of ordinary packets with reserved `.example` names. The same frames drive the self-tests, the fuzzer, the GUI test and the benchmarks.
+All test traffic comes from **replay scenarios** (20a): a scripted home network made of ordinary packets with reserved `example.com`, `.org` and `.net` names. The same frames drive the self-tests, the fuzzer, the GUI test and the benchmarks.
 
 | Command | What runs |
 |---|---|
@@ -123,4 +123,4 @@ All test traffic comes from **replay scenarios** (20a): a scripted home network 
 | `--bench-gui S1 S2` | Window-performance scenarios against fixed budgets (`BENCH_LIMITS`) |
 | `--release-gate` | All of the above plus pictures of every tab |
 
-CI runs a syntax check and the self-test on Python 3.8, 3.12 and 3.13 for every push and pull request ([`ci.yml`](../.github/workflows/ci.yml)).
+CI runs on every pull request and every push to `main` ([`ci.yml`](../.github/workflows/ci.yml)): the self-test on Python 3.8, 3.12 and 3.13, the GUI test on Linux and Windows, the self-test on macOS, a privacy check and a docs check.

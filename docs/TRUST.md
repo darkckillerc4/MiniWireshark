@@ -13,7 +13,7 @@ A network monitor sees everything your computer sends, so you should be skeptica
 | It has no telemetry. Everything it sends goes through one gate and is listed. | Open **Security → What MiniWireshark sent**. Turn on the **kill switch** and watch it block everything. |
 | It never phones home for updates from anywhere but GitHub. | Read [SECURITY.md](../SECURITY.md#where-updates-come-from). Search the file for `OFFICIAL_UPDATE_REPO`. |
 | Its claims are tested. | Run `python miniwireshark.py --self-test` on your own computer (a few minutes, no capture or admin rights needed). |
-| It says what it can't see. | The vantage meter in the bottom-right corner, and **Help → What this computer can see**. |
+| It says what it can't see. | The vantage meter in the bottom-right corner, and **Help → Help & glossary → What this computer can see**. |
 
 ## 1. Check the download
 
@@ -28,7 +28,7 @@ shasum -a 256 miniwireshark-<version>.py      # macOS
 Get-FileHash -Algorithm SHA256 .\miniwireshark-<version>.py   # Windows
 ```
 
-The value must match the `.sha256` file next to it on the release. Every release since 1.0 is listed with its checksum in [VERSIONS.md](VERSIONS.md). Each release is built by the public [release workflow](../.github/workflows/release.yml) from the commit it names. You can compare the file with `git show v<version>:miniwireshark.py`.
+The value must match the `.sha256` file next to it on the release. Every release since 1.0 is listed with its checksum in [VERSIONS.md](VERSIONS.md). Each release is published by the public [release workflow](../.github/workflows/release.yml) from the commit it names. You can compare the file with `git show v<version>:miniwireshark.py`.
 
 ## 2. Check what it sends
 
@@ -37,12 +37,13 @@ MiniWireshark mostly *listens*. It sends something in the following cases, each 
 | What | When | Where it goes |
 |---|---|---|
 | Update check | Once a day, unless you turn it off | `api.github.com`, for the latest release number only |
-| Reference lists | About once a month, unless you turn it off | `wireshark.org` (vendor names) and `publicsuffix.org`. Plain file downloads. |
-| Private Python and packages | Only when you approve the download list | `python.org` and the Python Package Index (`pypi.org`, `files.pythonhosted.org`) |
+| Reference lists | Only when you ask in the Components Center, or weekly if you set **Settings → Components → Updates** to Weekly | `wireshark.org` (vendor names) and `publicsuffix.org`. Optional lists you turn on add `www.iana.org` (port names), `raw.githubusercontent.com` (tracker and DNS-resolver lists), `iptoasn.com`, `feodotracker.abuse.ch` and `www.spamhaus.org`. Plain file downloads. |
+| Private Python and packages | Only when you approve the download list, and when you press the *Newer Python* check | `github.com` (a standalone Python build, pinned by SHA-256), `python.org` (the Windows fallback installer, checked for its signature) and the Python Package Index (`pypi.org`, `files.pythonhosted.org`) |
+| Self-update | Only if you turn on *Offer to install updates*, and only for a signed release | `github.com` release files |
 | Npcap (Windows) | Only when you choose to install it | `npcap.com` |
-| Health checks | When you open Health or run them | Your router, your DNS server, and a test address |
+| Health checks | When you run them, and about every 30 seconds in the background while Active Mode is on and the network is one you trust (turn Active Mode off to stop them) | Your router, your DNS server, and a test address |
 | Device discovery (Active Mode) | Only on your own subnet, and never on a network you haven't trusted | Devices on your local network |
-| Country lookup | **Off** by default | An online lookup service, only if you turn it on |
+| Country lookup | **Off** by default | One of four online lookup services (`ipwho.is`, `geojs.io`, `ipapi.co` or `ip-api.com`; the last one over plain HTTP), only if you turn it on |
 | Pi-hole / AdGuard Home | Only if you add one | The helper you added, on your network |
 | Router port-forwarding check | Only when you press the button | Your router |
 
@@ -50,22 +51,22 @@ How to check:
 
 - **Security → What MiniWireshark sent** lists every send, with its purpose and destination.
 - The **kill switch** (Settings → Privacy & Lookups) blocks all of it. A blocked send is listed as blocked.
-- **Safe Mode** (`--safe`) starts with no automatic capture, no history, no update checks and no downloads.
-- Watch it from outside with your firewall, or with Wireshark itself. Filter on the computer's address while MiniWireshark runs in Demo Mode, which sends nothing at all.
+- **Safe Mode** (`--safe`) starts with no automatic capture, no history, no update checks and no automatic downloads (a reference-list refresh you ask for, or have set to Weekly, is the one exception we know of).
+- Watch it from outside with your firewall, or with Wireshark itself. Filter on the computer's address while MiniWireshark runs in Demo Mode, which sends nothing with the default settings (if you set reference lists to refresh Weekly, that refresh can still run).
 - In the code, a self-test (`outbound_bypasses`) parses the file and fails if any network call skips the gate. That includes `pip` and other programs it starts.
 
 ## 3. Check what it keeps
 
 Everything it writes goes in one data folder (see [Installation](INSTALL.md#where-it-keeps-its-files)): logs, sessions, the optional history, and its private packages. History is **off** by default.
 
-- Passwords, mail logins and message bodies are dropped inside the decoders and never stored. A canary self-test plants fake secrets and checks every report, session, CSV, log, history row and clipboard copy for them.
+- Passwords, mail logins and message bodies are dropped inside the decoders and never stored. A canary test in the GUI test (`--gui-test`) plants fake secrets and checks every report, session, CSV, log, history row (when history is on) and clipboard copy for them.
 - On Linux and macOS the data folder is closed to other users.
-- **Storage used…** in the command palette (`Ctrl+K`) shows what each part takes. Deleting the folder removes everything.
+- **Storage used…** in the command palette (`Ctrl+K`) shows what each part takes. Deleting the folder removes everything, except passwords for connected helpers that you saved in the system keychain on macOS or Linux (see [Uninstalling](INSTALL.md#uninstalling)).
 - Shareable reports and the Network check-up can replace names and addresses with pseudonyms.
 
 ## 4. Check the permissions it asks for
 
-- **Windows:** packet capture needs the [Npcap](https://npcap.com/) driver. Once Npcap is installed, capture works without administrator rights.
+- **Windows:** packet capture needs the [Npcap](https://npcap.com/) driver. With Npcap in its default mode, capture works without administrator rights. If Npcap was installed in its admin-only mode, MiniWireshark asks for administrator rights.
 - **Linux and macOS:** capture needs root, `CAP_NET_RAW` or access to `/dev/bpf*`. From 5.3.4 MiniWireshark doesn't start as administrator. It asks for your password only when capture starts. Demo Mode, capture files and the help never ask.
 
 You can always say no. It then opens in limited mode, where you can still use capture files, saved sessions and the demo.
@@ -74,9 +75,9 @@ You can always say no. It then opens in limited mode, where you can still use ca
 
 - **Self-test:** more than 350 tests built into the file (`--self-test`). They cover the decoders, the alert rules, the privacy canary, the outbound gate, corrupt files and clock jumps.
 - **GUI test:** `--gui-test` drives the real window through every tab.
-- **CI:** every push and pull request runs the self-test on Python 3.8, 3.12 and 3.13, the GUI test on two Ubuntu versions, the self-test and GUI test on Windows, the self-test on macOS, and a [privacy check](../.github/scripts/privacy_check.py) that keeps captures, personal data and keys out of this public repository. Results are on the [Actions page](https://github.com/darkckillerc4/MiniWireshark/actions).
+- **CI:** every pull request, and every push to `main`, runs the self-test on Python 3.8, 3.12 and 3.13, the GUI test on two Ubuntu versions, the self-test and GUI test on Windows, the self-test on macOS, and a [privacy check](../.github/scripts/privacy_check.py) that keeps captures, personal data and keys out of this public repository. Results are on the [Actions page](https://github.com/darkckillerc4/MiniWireshark/actions).
 - **Long runs:** a fast replay test tracks memory, threads and Tk interpreters over many simulated hours. 5.3.4 was not re-run for 8 hours on a real PC; the [changelog](../CHANGELOG.md) lists that under Known limits.
-- **Screenshots** in these docs are taken from Demo Mode: simulated data with reserved `.example` names. Nothing in them is real traffic.
+- **Screenshots** in these docs are taken from Demo Mode: simulated data with reserved `example.com`, `.org` and `.net` names. Nothing in them is real traffic.
 
 ## 6. Honest limits
 

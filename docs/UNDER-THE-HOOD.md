@@ -11,7 +11,7 @@ People run MiniWireshark on whatever Python they have: an old 3.8, a Store build
 **Layer 2, the runtime itself:**
 
 - **Relocatable builds.** It uses [python-build-standalone](https://github.com/astral-sh/python-build-standalone) "install only, stripped" builds of CPython 3.14 for Windows (x86, x64, ARM64), macOS (Intel and Apple silicon) and Linux (x64, ARM64). They need no admin rights and include Tk.
-- **Every byte is pinned.** Each archive's SHA-256 is written into the source file. Wheels for the private runtime are hash-pinned too, and installed with `pip --require-hashes`.
+- **Every download is checked.** The runtime archives for the first Python are pinned by SHA-256 in the source file. A newer Python build takes its SHA-256 from GitHub's release record. The Windows fallback installer from python.org must carry a valid Python Software Foundation signature. Wheels for the private runtime are hash-pinned and installed with `pip --require-hashes`.
 - **Safe archive extraction.** Archives are extracted with path checks, so a crafted archive can't write outside its folder.
 - **Build next to, then switch.** A new environment is built beside the old one and tested before it is used. If the old one is still running, the switch happens on the next start.
 - **Repair without the network.** **Repair** reinstalls components from the cached downloads and re-tests them. If the interpreter itself is damaged, it rebuilds from the cached archive.
@@ -37,7 +37,7 @@ capture thread ──raw bytes──▶ RawRing ──▶ AnalysisWorker ──�
 
 The obvious way to decode packets in Python is to build a scapy object for each one. MiniWireshark's **fast wire decoder** (region 5b) reads the bytes directly with `struct`, for the frames that make up nearly all real traffic: Ethernet and VLAN, ARP, IPv4 and IPv6, TCP, UDP, ICMP and neighbour discovery, DNS, mDNS, LLMNR, DHCP, SSDP, NBNS, NTP, QUIC, TLS and HTTP.
 
-- It is roughly **15 to 20 times faster** than the scapy path. In 5.3.4 a profile-driven pass took it from about 96,000 to **178,000 frames per second**, and the whole analysis path from 87 to 69 microseconds per packet.
+- It is meant to be far faster than the scapy path (the code comment puts it at roughly 15 to 20 times). In 5.3.4 a profile-driven pass took the whole analysis path from 87 to 69 microseconds per packet (see the [changelog](../CHANGELOG.md)). Run `--bench-gui` to measure it on your own computer.
 - It produces **exactly the same result** as the scapy decoder. A differential self-test replays a scenario through both and compares them field by field, and a differential fuzzer compares them on unusual and damaged frames.
 - **Call headers only:** STUN, RTP and RTCP headers (never the media) feed a per-call tracker that computes loss and jitter as RFC 3550 does. A stream counts as a call only after a STUN exchange.
 - Anything it doesn't understand goes to scapy, so coverage never shrinks.
@@ -59,7 +59,7 @@ An update is installed only when its manifest is signed by a release key, its SH
 
 **Where updates come from.** The source is the official GitHub repository, `darkckillerc4/MiniWireshark`, unless you type another `owner/name` (checked against GitHub's own naming rules: no web address, no other host). Once a day, off the window's thread, one request goes to `api.github.com` through `outbound()`; the time is kept in the settings file. Links in the answer count only when they are `https` on GitHub's hosts, the tag must be a version number, and the release page shown is built from the source and the tag, never taken from the answer. A source other than the official one is called *unofficial* in Settings and in every update message.
 
-Verification uses `cryptography` when present, and otherwise **a pure-Python Ed25519 (RFC 8032)**, checked against the RFC's own test vectors. The same signatures protect optional data packs.
+Verification uses `cryptography` when present, and otherwise **a pure-Python Ed25519 (RFC 8032)**, checked against the RFC's own test vectors. Optional reference lists are checked with their own keys.
 
 ## <img src="assets/icons/privacy.svg" width="28" alt=""> Privacy that is enforced, not promised
 
@@ -81,19 +81,19 @@ Verification uses `cryptography` when present, and otherwise **a pure-Python Ed2
 
 ## <img src="assets/icons/tests.svg" width="28" alt=""> A window that tests and measures itself
 
-- **More than 350 self-tests** run without capture or admin rights, driven by **replay scenarios**: a scripted home network made of ordinary packets with `.example` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
-- **Fuzzers** throw malformed packets at the decoders, the call decoder and the model; a run of a million mutated frames with a fixed seed raises no error.
+- **More than 350 self-tests** run without capture or admin rights, driven by **replay scenarios**: a scripted home network made of ordinary packets with `example.com`, `.org` and `.net` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
+- **Fuzzers** throw malformed packets at the decoders, the call decoder and the model; a seeded run of thousands of mutated frames is part of the self-test, and a one-off run of a million frames raised no error (see the [changelog](../CHANGELOG.md)).
 - **A mutation check** flipped comparisons and constants in 30 key functions; every surviving change is killed by a test or listed as equivalent, with a reason.
-- **The GUI test** drives the real window through every tab (62 steps).
+- **The GUI test** drives the real window through every tab (67 steps).
 - **A layout crawler** opened every tab, view, dialog and settings page in three languages, two themes, four text sizes and screen sizes from 1024×768 to 1920×1080, and flagged overlaps and cut-off text.
-- **Performance budgets** (`BENCH_LIMITS`) are frozen, and `--bench-gui` fails when the window gets slower.
+- **Performance budgets** (`BENCH_LIMITS`) are frozen, and `--bench-gui --check` fails when the window gets slower.
 - **`--release-gate`** runs all of it and photographs every tab into one folder that can be sent back from another computer.
 - **The settings are one table.** Every option is declared once, the Settings window is generated from it, and the tests prove that nothing is orphaned or phantom.
 - **The table of contents is tested.** The file's docstring lists every region, and a self-test fails when it drifts from the banners.
 
 ## <img src="assets/icons/speed.svg" width="28" alt=""> Faster starts from a cached compiled copy
 
-Started as `python miniwireshark.py`, Python compiles the whole 89,000-line file first. That costs a few seconds and about 150 MB that the process keeps for its whole life. From 5.1.2, the compiled code is cached in the data folder, one file per Python version and checked against the script's time and size like any `.pyc`. Later processes load it, and the loading screen does the first-time work, so the window appears finished.
+Started as `python miniwireshark.py`, Python compiles the whole 94,000-line file first. That costs a few seconds and about 150 MB that the process keeps for its whole life. From 5.1.2, the compiled code is cached in the data folder, one file per Python version and checked against the script's time and size like any `.pyc`. Later processes load it, and the loading screen does the first-time work, so the window appears finished.
 
 From 5.3.4 the cached copy carries an HMAC made with a per-install key that only you can read, it is kept only in a folder that belongs to you and is closed to others, and a process running as root never writes or loads it. From 5.3.4 Windows uses it too: the copy is written in the same process, and the window starts from it. Measured on a Windows PC, the first start went from about 14 s to under 5 s and the window's memory from about 440 MB to about 220 MB.
 

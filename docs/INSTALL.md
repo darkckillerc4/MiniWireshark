@@ -32,7 +32,7 @@ Check it with `python --version` (Windows: `py --version`).
 
    Every version's checksum is also listed in the [version index](VERSIONS.md).
 
-You can rename the file to `miniwireshark.py`. Older versions are on the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases).
+Check the checksum first, then rename the file to `miniwireshark.py` if you like (the checksum is of the content, so it still matches). Older versions are on the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases).
 
 ## 3. Start it
 
@@ -65,24 +65,24 @@ On Linux and macOS, MiniWireshark no longer restarts itself as root when it star
 python miniwireshark.py --demo
 ```
 
-Demo Mode shows simulated, clearly labelled data with `.example` names. Nothing is captured or sent.
+Demo Mode shows simulated, clearly labelled data with `example.com`, `.org` and `.net` names. Nothing is captured or sent.
 
 ## Where it keeps its files
 
 The application stays one file. Everything it creates goes into one data folder:
 
 1. `miniwireshark_data/` next to the script, if that folder is writable (portable mode).
-2. Otherwise the per-user folder: `%LOCALAPPDATA%\MiniWireshark` (Windows), `~/Library/Application Support/MiniWireshark` (macOS), or `~/.local/share/miniwireshark` (Linux).
+2. Otherwise the per-user folder: `%LOCALAPPDATA%\MiniWireshark` (Windows), `~/Library/Application Support/MiniWireshark` (macOS), or `$XDG_DATA_HOME/miniwireshark` (Linux; by default `~/.local/share/miniwireshark`).
 
 On Linux and macOS the data folder is closed to other users (mode 0700). A folder that belongs to someone else, or that others can write to, is skipped. Files written while capture runs as root are handed back to you.
 
-Settings are saved in `miniwireshark_config.json`. Two environment variables move these files, which is useful for tests:
+Settings are saved in `miniwireshark_config.json` next to the script, or in the data folder when the script's folder is not writable. Two environment variables move these files, which is useful for tests:
 
 ```bash
 MINIWIRESHARK_DATA=/tmp/mw-data MINIWIRESHARK_CONFIG=/tmp/mw-config.json python miniwireshark.py
 ```
 
-The data folder holds logs, saved sessions and the autosave, the optional history database, the private packages and boot receipts. **Storage used…** in the command palette (`Ctrl+K`) shows how much each part uses.
+The data folder holds logs, saved sessions and the autosave, the optional history database, the private Python and packages, caches, boot receipts and a small `vault.json` for helper passwords. On Windows the passwords in it are encrypted for your account (DPAPI). On Linux without a secret service, and on macOS without the `security` tool, they are stored in it with only the file's permissions (mode 0600) to protect them, which is weaker. If neither folder above can be written, it falls back to a temporary folder. **Storage used…** in the command palette (`Ctrl+K`) shows how much each part uses.
 
 ## Updating
 
@@ -92,9 +92,10 @@ Download the new release and replace the file. Settings, history and sessions ar
 
 Delete `miniwireshark.py` and the data folder above. A few things live outside that folder, so delete them too:
 
-- `miniwireshark_config.json` (and `miniwireshark_config.json.bak`) next to `miniwireshark.py`, when that folder is writable.
-- scapy's own cache: `~/.cache/scapy` on Linux and macOS, `%LOCALAPPDATA%\scapy` on Windows.
-- Passwords you saved for a Pi-hole or AdGuard Home helper are in your system's keychain (Windows Credential Manager, macOS Keychain, or the Linux secret service), under "MiniWireshark". Remove them there, or remove each helper in MiniWireshark before you uninstall (removing a helper deletes its saved password).
+- `miniwireshark_config.json` (and `miniwireshark_config.json.bak`) next to `miniwireshark.py`, when that folder is writable. Otherwise they are in the data folder and go with it.
+- scapy's own cache: `~/.cache/scapy` on Linux and macOS, and `%USERPROFILE%\.cache\scapy` on Windows.
+- Update backups, named `miniwireshark.py.v<version>.bak`, next to the script.
+- Passwords you saved for a Pi-hole or AdGuard Home helper are in your system's keychain (macOS Keychain or the Linux secret service), under "MiniWireshark". On Windows they are in `vault.json` in the data folder, so deleting that folder removes them. Remove them there, or remove each helper in MiniWireshark before you uninstall (removing a helper deletes its saved password).
 
 If you installed Npcap only for MiniWireshark, remove it from Windows' *Installed apps*.
 
