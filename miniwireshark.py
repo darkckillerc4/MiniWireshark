@@ -96073,10 +96073,14 @@ def gt_c11_alert_names(app, ctx):
     tab = app.tabs["alerts"]
     app._apply_correction_result(m.correct_rename(dev.key, "Kid Tablet"))
     try:
-        _gui_pump(root, 0.6)
+        def row_now():
+            return tab.tree.item(tab.iids[a.id], "values") if a.id in \
+                tab.iids else ()
+        # the window shows model events on its own timer: wait for it
+        _gui_pump(root, 0.3, until=lambda: any(
+            "Kid Tablet" in str(v) for v in row_now()), timeout=10)
         assert "Kid Tablet" in a.reason, a.reason
-        row = tab.tree.item(tab.iids[a.id], "values") if a.id in \
-            tab.iids else ()
+        row = row_now()
         assert row and any("Kid Tablet" in str(v) for v in row), row
         # the stored rule names the device, never "key|service"
         words = app.rule_text(f"{ra.kind}|{ra.subject}")
