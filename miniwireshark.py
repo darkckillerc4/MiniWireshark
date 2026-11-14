@@ -21764,6 +21764,7 @@ class LookupCorrelator:
 
     STRONG_WINDOW = 10.0          # lookup → connection within 10 s
     KEEP = 1800.0                 # forget lookups after 30 minutes
+    MAX = 20000                   # audit #56: was 200,000 (177k in a loop)
 
     def __init__(self):
         self.by_dev_ip = {}       # (device, ip) -> deque[(ts, domain)]
@@ -21808,7 +21809,7 @@ class LookupCorrelator:
         order = self.order
         while order:
             (dev, ip), t = next(iter(order.items()))
-            if now - t <= self.KEEP and len(order) <= 200000:
+            if now - t <= self.KEEP and len(order) <= self.MAX:
                 break
             order.popitem(last=False)
             dq = self.by_dev_ip.get((dev, ip))
@@ -57895,14 +57896,37 @@ proc ::mw_explicit_fonts {top names} {
                 self.inspector.refresh()
 
     def _flush_websites(self, m):
-        if m.dirty_websites:
+        if self._dirty_overflow(m, "dirty_websites"):
+            tab = self.tabs["websites"]
+            tab._dirty = True
+            tab.refresh()
+        elif m.dirty_websites:
             keys = self._take_dirty(m, "dirty_websites")
             self.tabs["websites"].update_keys(keys)
 
     def _flush_remotes(self, m):
-        if m.dirty_remotes:
+        if self._dirty_overflow(m, "dirty_remotes"):
+            tab = self.tabs["remote"]
+            tab._pending = True
+            tab.refresh()
+        elif m.dirty_remotes:
             keys = self._take_dirty(m, "dirty_remotes")
             self.tabs["remote"].update_keys(keys)
+
+    def _dirty_overflow(self, m, attr):
+        """Audit #56: rows changing faster than FLUSH_MAX a tick grew the
+        set without bound (61k each in a looped replay). Past FLOW_BACKLOG
+        it is dropped for one table refill, at most every 5 s."""
+        now = time.monotonic()
+        last = getattr(self, "_overflow_at", None)
+        if last is None:
+            last = self._overflow_at = {}
+        if len(getattr(m, attr)) <= self.FLOW_BACKLOG or \
+                now - last.get(attr, -1e9) <= 5:
+            return False
+        last[attr] = now
+        setattr(m, attr, set())
+        return True
 
     FLUSH_MAX = 250
     @classmethod
@@ -92334,9 +92358,9 @@ def memory_census(m):
         "encrypted DNS users": (len(m.doh_seen), m.DOH_CLIENTS_KEEP),
         "names learned": (len(m.cache.ip_to_name), m.cache.MAX),
         # (30 minutes, and at most 200,000: the review thread's part)
-        "lookups": (len(c.order), 200000),
-        "lookups per address": (len(c.by_ip), 200000),
-        "lookups per device": (len(c.by_dev_ip), 200000),
+        "lookups": (len(c.order), c.MAX),
+        "lookups per address": (len(c.by_ip), c.MAX),
+        "lookups per device": (len(c.by_dev_ip), c.MAX),
         "names asked": (len(m.dns.domains), m.dns.DOMAINS_KEEP),
         "DNS servers": (len(m.dns.servers), m.dns.SERVERS_KEEP),
         "DNS waiting": (len(m.dns.pending), 4096),
@@ -92524,6 +92548,37 @@ def t_534_memory_flat_in_fast_time(ctx):
         assert g["total"] < MEMORY_FLAT_LIMIT, g
         assert not g["top"] or g["top"][0][1] < MEMORY_FLAT_LINE, g["top"]
         assert o1 - o0 < MEMORY_FLAT_OBJECTS, (o0, o1)
+
+
+@self_test()
+def t_534_loop_replay_bounded(ctx):
+    """Audit #56: a looped replay rewinds the clock, so the lookup
+    correlator never aged out and only its 200,000 cap held; changed-row
+    sets fed faster than a tick drains grew without bound. Now both
+    stop at a cap and a big backlog becomes one table refill."""
+    c = LookupCorrelator()
+    for loop in range(3):                          # same times each loop
+        for i in range(c.MAX):
+            c.note_resolution("d", "s.example", "10.%d.%d.%d" % (
+                loop, i // 250, i % 250), 1000.0 + i * 0.01)
+    assert len(c.order) <= c.MAX and len(c.by_dev_ip) <= c.MAX
+    assert len(c.by_ip) <= c.MAX
+    assert c.match("d", "10.2.79.249", 1200.0)[0] == "s.example"
+    m = scenario_model(ctx.cfg(), [])
+    got = []
+    tab = types.SimpleNamespace(_pending=False, refresh=lambda: None,
+                                update_keys=got.extend)
+    win = types.SimpleNamespace(FLOW_BACKLOG=100, FLUSH_MAX=250,
+                                tabs={"remote": tab})
+    win._dirty_overflow = lambda mm, a: MiniWireshark._dirty_overflow(
+        win, mm, a)
+    win._take_dirty = MiniWireshark._take_dirty
+    m.dirty_remotes = {str(i) for i in range(101)}
+    MiniWireshark._flush_remotes(win, m)
+    assert not m.dirty_remotes and tab._pending and not got
+    tab._pending, m.dirty_remotes = False, {str(i) for i in range(101)}
+    MiniWireshark._flush_remotes(win, m)            # not again within 5 s
+    assert len(got) == 101 and not tab._pending
 
 
 @self_test(needs_source=True)
