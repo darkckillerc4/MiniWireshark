@@ -205,7 +205,7 @@ Every release is a single `.py` file attached to its [GitHub release](https://gi
 
 ```
 miniwireshark.py        the application: one file on purpose, ~94k lines in banner-marked regions
-legacy/                 versions 1.x and 2.0.0 (written before this repository's history began)
+legacy/                 versions 1.x and 2.0.0 (written before this repository; imported later)
 docs/                   installation, user guide, features, architecture, FAQ, version index
 .github/                CI, issue and PR templates, release notes, archive-release workflow
 ```
