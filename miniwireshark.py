@@ -1522,7 +1522,10 @@ CLI_FLAGS = {
                               "test (needs a display)."),
     "--live": ("", False, ""),
     "--bench": ("", False, "Measure this computer's analysis speed."),
-    "--bench-gui": ("", False, "Developer: window benchmarks."),
+    # second audit (install #31): the scenarios it takes, as the docs say
+    "--bench-gui": ("S1 S2 …", True, "Developer: window benchmarks for "
+                                    "the scenarios named (or all); "
+                                    "--check compares with the budgets."),
     "--check": ("", False, ""),
     "--targets": ("", False, ""),
     "--runs": ("N", False, ""),
@@ -2547,17 +2550,59 @@ if __name__ == "__main__" and not TOOL_MODE and not _ELEV:
 
 
 # ---- Tk ---------------------------------------------------------------------
+# second audit (install #31): python.org's macOS installer has no "tcl/tk"
+# box (Tk is always in it); the Windows one calls it "tcl/tk and IDLE"
+TK_MISSING_HELP = (
+    "MiniWireshark needs Python's graphical toolkit (tkinter).\n"
+    "  Windows:       run the python.org installer again, choose Modify and "
+    "tick 'tcl/tk and IDLE'.\n"
+    "  macOS:         install Python from python.org (Tk is included), or "
+    "with Homebrew: brew install python-tk\n"
+    "  Debian/Ubuntu: sudo apt install python3-tk\n"
+    "  Fedora:        sudo dnf install python3-tkinter\n")
+
+
+def boot_check_without_tk(err, out=print):
+    """Second audit (install #30): `--boot-check` on a Python without
+    tkinter, the most common Linux problem. It printed only "needs
+    tkinter"; it now says what it can check without the window toolkit,
+    and the fix. -> exit code 1."""
+    out(f"MiniWireshark {SCRIPT_VERSION} boot check")
+    out(f"  Python      {platform.python_version()} ({sys.executable})")
+    out(f"  Window      FAILED: no graphical toolkit (tkinter): "
+        f"{type(err).__name__}: {err}")
+    for line in TK_MISSING_HELP.splitlines()[1:]:
+        out("    " + line.strip())
+    try:
+        import importlib.util as iu
+        scapy = iu.find_spec("scapy") is not None
+    except (ImportError, ValueError):
+        scapy = False
+    out(f"  scapy       {'installed' if scapy else 'not installed yet (the first start offers it)'}")
+    writable = _dir_writable(PATHS.data)
+    out(f"  Data folder {PATHS.data} "
+        f"({'writable' if writable else 'NOT writable'})")
+    out("")
+    out("Ready?")
+    out("  ✗ Python and window toolkit: this Python has no graphical "
+        "toolkit (tkinter), so the window can't open. Install it as shown "
+        "above.")
+    out("")
+    out("Result: problems found (see above)")
+    return 1
+
+
 try:
     import tkinter as tk
     import tkinter.font as tkfont
     from tkinter import filedialog, messagebox, ttk
-except ImportError:                                  # pragma: no cover
-    sys.stderr.write(
-        "MiniWireshark needs Python's graphical toolkit (tkinter).\n"
-        "  Windows/macOS: reinstall Python from python.org (tick 'tcl/tk').\n"
-        "  macOS Homebrew: brew install python-tk\n"
-        "  Debian/Ubuntu: sudo apt install python3-tk\n"
-        "  Fedora:        sudo dnf install python3-tkinter\n")
+except ImportError as _tk_error:                     # pragma: no cover
+    if BOOT_CHECK_MODE:
+        sys.exit(boot_check_without_tk(_tk_error))
+    sys.stderr.write(TK_MISSING_HELP)
+    if TOOL_MODE:
+        sys.stderr.write("`--boot-check` works without it and says what "
+                         "else is ready.\n")
     if BOOT is not None:
         # 5.3.4 (OS-06): a Python without Tk is not a crashed start, so it
         # never puts the next start (on a Python with Tk) into Safe Mode
@@ -98183,6 +98228,72 @@ def t_a2_new_install_told_about_the_update_check(ctx):
         restore()
 
 
+@self_test(needs_source=True)
+def t_a2_boot_check_without_tkinter(ctx):
+    """Second audit (install #30): on a Python without tkinter (the most
+    common Linux problem) --boot-check still reports: the window toolkit
+    as the problem with how to install it, the data folder, and a Ready?
+    line that agrees; other tool switches point to it."""
+    block = ctx.path("a2_no_tk")
+    os.makedirs(os.path.join(block, "tkinter"), exist_ok=True)
+    with open(os.path.join(block, "tkinter", "__init__.py"), "w",
+              encoding="utf-8") as f:
+        f.write("raise ImportError('No module named _tkinter (test)')\n")
+    data = ctx.path("a2_no_tk_data")
+    os.makedirs(data, mode=0o700, exist_ok=True)
+    env = dict(os.environ, PYTHONPATH=block, MINIWIRESHARK_DATA=data,
+               PYTHONIOENCODING="utf-8")
+    r = _run_hidden([sys.executable, SCRIPT_PATH, "--boot-check"], env=env,
+                    capture_output=True, timeout=120)
+    out = r.stdout.decode("utf-8", "replace")
+    assert r.returncode == 1, (r.returncode, out, r.stderr[-400:])
+    for want in ("boot check", "Window      FAILED: no graphical toolkit",
+                 "python3-tk", "brew install python-tk",
+                 "tcl/tk and IDLE", f"Data folder {data}",
+                 "✗ Python and window toolkit",
+                 "Result: problems found"):
+        assert want in out, (want, out)
+    assert "✓ Python" not in out
+    r = _run_hidden([sys.executable, SCRIPT_PATH, "--bench"], env=env,
+                    capture_output=True, timeout=120)
+    err = r.stderr.decode("utf-8", "replace")
+    assert r.returncode == 1 and "--boot-check" in err, err
+
+
+@self_test()
+def t_a2_ready_list_agrees_with_the_boot_check(ctx):
+    """Second audit (install #30, #31): when the window can't open,
+    --boot-check's Ready? list doesn't say "✓ Python and window toolkit"
+    under "Window FAILED"; with --no-elevate the capture-permission line
+    doesn't promise a password prompt; --help shows that --bench-gui
+    takes scenarios."""
+    lines = []
+    real_tk = tk.Tk
+
+    def no_display(*a, **k):
+        raise tk.TclError("no display name and no $DISPLAY environment "
+                          "variable")
+    try:
+        tk.Tk = no_display
+        rc = boot_check(out=lines.append)
+    finally:
+        tk.Tk = real_tk
+        WINDOW_PROBLEM[0] = ""
+    text = "\n".join(lines)
+    assert rc == 1 and "Window      FAILED" in text, text
+    py = next(ln for ln in lines if "Python and window toolkit" in ln)
+    assert py.strip().startswith(READY_MARK["bad"]) and \
+        "no display name" in py, py
+    if not IS_WINDOWS:
+        with _b9_patched(globals(), has_capture_rights=lambda: False), \
+                _b9_patched(os.environ, MINIWIRESHARK_NO_ELEVATE="1"):
+            state, said, _fix = _ready_permission(None)
+        assert "never asks" in said and "asks when" not in said, said
+    usage = cli_usage()
+    assert "--bench-gui [S1 S2" in usage, usage
+    assert cli_check(["--bench-gui", "S1", "S2", "--check"]) is None
+
+
 # ============================================================================
 #  21.  Application entry point
 # ============================================================================
@@ -98839,9 +98950,18 @@ BOOT_TESTS = ("test_boot_receipts_and_crash_loop",
 READY_MARK = {"ok": "✓", "warn": "!", "bad": "✗", "info": "·"}
 
 
+# second audit (install #30): set by --boot-check when the window can't open
+WINDOW_PROBLEM = [""]
+
+
 def _ready_python(cfg):
     ok, why = system_python_suitable()
     text = f"Python {platform.python_version()}, Tk {tk.TkVersion}"
+    if WINDOW_PROBLEM[0]:
+        # "Window FAILED" and "✓ Python and window toolkit" were printed
+        # in the same report
+        return ("bad", f"{text}, but the window can't open here: "
+                f"{WINDOW_PROBLEM[0]}", "")
     if ok:
         return "ok", text, ""
     return ("warn", f"{text} — {why}. A newer Python is at "
@@ -98865,6 +98985,12 @@ def _ready_driver(cfg):
 def _ready_permission(cfg):
     if has_capture_rights():
         return "ok", "Allowed to watch network traffic", ""
+    if not elevation_allowed():
+        # second audit (install #31): --no-elevate was ignored here
+        return ("warn", "Not allowed to watch traffic, and this start "
+                "never asks for administrator rights (--no-elevate or "
+                "MINIWIRESHARK_NO_ELEVATE). Capture files and Demo Mode "
+                "work.", "")
     return ("warn", "Needs permission to watch traffic; MiniWireshark asks "
             "when you start monitoring (Demo Mode and files don't need "
             "it).", "monitor")
@@ -98979,6 +99105,7 @@ def boot_check(out=print):
     out(f"  Python      {platform.python_version()} ({sys.executable})")
     suitable, why = system_python_suitable()
     out(f"  Suitable    {'yes' if suitable else 'no — ' + why}")
+    WINDOW_PROBLEM[0] = ""
     try:
         r = tk.Tk()
         r.withdraw()
@@ -98987,6 +99114,7 @@ def boot_check(out=print):
         out(f"  Window      ok (Tk {tk.TkVersion})")
     except Exception as e:                           # noqa: BLE001
         ok_all = False
+        WINDOW_PROBLEM[0] = f"{type(e).__name__}: {e}"
         out(f"  Window      FAILED: {type(e).__name__}: {e}")
     dep = next(d for d in DEPENDENCY_MANIFEST if d["required"])
     ready, info = _required_ready(dep)

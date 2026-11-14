@@ -117,6 +117,9 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - A settings file saved by Windows Notepad (with a byte-order mark) is read normally. It used to be taken for damaged, and all settings went back to the defaults.
 - Two copies of MiniWireshark that share a settings file keep each other's changes. The last one to save used to undo the other's without a word.
 
+- `--boot-check` works on a Python without the window toolkit (tkinter), the most common Linux problem: it says that is what's missing, how to install it, and whether the data folder is fine. It used to print only "needs tkinter". When the window can't open, its Ready? list no longer says "✓ Python and window toolkit" under "Window FAILED".
+- With `--no-elevate`, the Ready? list no longer says MiniWireshark will ask for your password when you start watching. `--help` shows that `--bench-gui` takes scenario names; the install guide lists `-h` and `-V`, Homebrew's `python-tk`, and the right box to tick in the Windows Python installer.
+
 **Known limits**
 
 - **Changing the text size on Windows is slow.** It takes about 0.4 seconds on the test machine, and the window doesn't answer for about a tenth of a second while it happens (the goal is 0.1 seconds; on Linux it is well under that). The reason: on Windows every part of the window is its own small system window, and when the shared fonts change, all of them (about 700) are measured and drawn again. Making this fast needs a change to how the window shares its fonts, planned for a later release.

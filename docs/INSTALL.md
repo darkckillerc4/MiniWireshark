@@ -9,7 +9,7 @@ You need **Python 3.8 or newer with Tk**.
 | System | How |
 |---|---|
 | Windows | Install from [python.org](https://www.python.org/downloads/) or the Microsoft Store. Tk is included. |
-| macOS | Install from [python.org](https://www.python.org/downloads/). Tk is included. |
+| macOS | Install from [python.org](https://www.python.org/downloads/). Tk is included. With Homebrew: `brew install python python-tk` (Homebrew's Python has no Tk without `python-tk`). |
 | Debian, Ubuntu | `sudo apt install python3 python3-tk` |
 | Fedora | `sudo dnf install python3 python3-tkinter` |
 
@@ -104,7 +104,7 @@ If you installed Npcap only for MiniWireshark, remove it from Windows' *Installe
 |---|---|
 | `--demo` | Start in Demo Mode |
 | `--safe` | Safe Mode: no auto-capture, no history, no update checks, no automatic downloads |
-| `--boot-check` | Check this computer's setup and exit, without opening the window |
+| `--boot-check` | Check this computer's setup and exit, without opening the window. It works on a Python without Tk too, and says how to install it |
 | `--no-elevate` | Never ask for administrator rights |
 | `--yes` | Accept the download list without asking (unattended start) |
 | `--no-runtime` | Use the Python you started it with, not MiniWireshark's private Python |
@@ -112,13 +112,13 @@ If you installed Npcap only for MiniWireshark, remove it from Windows' *Installe
 | `--gui-test` | Drive the real window through every tab. Needs a display (`xvfb-run -a` on a headless Linux) |
 | `--bench` | Measure this computer's analysis speed |
 | `--quick` | With `--self-test`, `--gui-shots` or `--release-gate`: the shorter run |
-| `--bench-gui S1 S2` | Developer: window-performance benchmark against fixed budgets |
+| `--bench-gui S1 S2` | Developer: window-performance benchmark for the scenarios named (or `all`); `--check` compares with the fixed budgets |
 | `--gui-shots DIR` | Developer: take a picture of every tab into `DIR` |
 | `--start-check` | Developer: time a full start |
 | `--release-check [FILE]` | Developer: check a release file |
 | `--release-gate` | Developer: all tests, the benchmark and pictures of every tab, written to one folder you can send back |
-| `--help` | List every switch and exit |
-| `--version` | Print the version and exit |
+| `-h`, `--help` | List every switch and exit |
+| `-V`, `--version` | Print the version and exit |
 
 An unknown switch, or a switch missing its value, ends with a one-line explanation before anything starts.
 
