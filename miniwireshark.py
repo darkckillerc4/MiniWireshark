@@ -732,12 +732,31 @@ def _tmp_name(path):
     return f"{path}.tmp{os.getpid()}-{threading.get_ident() % 100000}"
 
 
+def _open_new_tmp(tmp, mode, encoding=None):
+    """Second audit (security #5): the temporary file is always a new file
+    of our own. Its name can be guessed, so a file or link someone left
+    under it in a shared folder (an export to /tmp) is removed and never
+    followed: before, a link there made the write land in its target, and
+    the rename then put the link in place of the file."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | \
+        getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    for attempt in range(2):
+        try:
+            fd = os.open(tmp, flags, 0o666)
+            break
+        except FileExistsError:
+            if attempt:
+                raise
+            os.remove(tmp)            # a stale one, or someone else's link
+    return os.fdopen(fd, mode, encoding=encoding)
+
+
 def _atomic_write(path, data, mode, encoding=None):
     """(5.3.4 review) on disk before the rename, so a power cut cannot
     leave an empty file; the temporary file never stays."""
     tmp = _tmp_name(path)
     try:
-        with open(tmp, mode, encoding=encoding) as f:
+        with _open_new_tmp(tmp, mode, encoding=encoding) as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -37208,7 +37227,7 @@ class TableKit:
             copy_to_clipboard(self.app, self.cell_text(iid, col))
 
     def copy_row(self, iid):
-        copy_to_clipboard(self.app, "\t".join(self.row_cells(iid)))
+        copy_to_clipboard(self.app, safe_tsv_row(self.row_cells(iid)))
 
     def csv_text(self, iids):
         buf = io.StringIO()
@@ -37496,6 +37515,14 @@ class _SafeCsv:
 
 def safe_csv_writer(f):
     return _SafeCsv(f)
+
+
+def safe_tsv_row(cells):
+    """Second audit (security #5): a copied row is pasted into a
+    spreadsheet as cells, so its text cells get the same formula guard
+    as a CSV file (a device or site name from the network could start
+    with "=")."""
+    return "\t".join(str(_SafeCsv.cell(c)) for c in cells)
 
 
 def copy_to_clipboard(app, text):
@@ -37986,8 +38013,12 @@ class Charts:
                 [x if i == 0 or r["fmt"] is None or x == "" else
                  r["fmt"](x) for i, x in enumerate(row)]
                 for row in r["rows"]]
-            lines.append("\t".join(str(h) for h in head))
-            lines += ["\t".join(str(x) for x in row) for row in rows]
+            lines.append(safe_tsv_row(head))
+            # second audit (security #5): the names (first column) come
+            # from the network; numbers stay as they are
+            lines += ["\t".join([str(_SafeCsv.cell(str(row[0])))] +
+                                [str(x) for x in row[1:]])
+                      if row else "" for row in rows]
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
 
@@ -97506,6 +97537,51 @@ def t_a2_browser_opens_as_the_person(ctx):
             p = start_for_person(["id", "-u"], stdout=subprocess.PIPE)
             out = p.communicate(timeout=30)[0].decode().strip()
         assert out == "65534", out
+
+
+@self_test()
+def t_a2_temp_file_never_follows_a_link(ctx):
+    """Second audit (security #5): the temporary file of a save is a new
+    file of our own: a link planted under its predictable name (in a
+    shared folder) is neither written through nor renamed into place."""
+    if IS_WINDOWS:
+        return "skip"                  # links need extra rights there
+    folder = ctx.path("a2_shared")
+    os.makedirs(folder, exist_ok=True)
+    victim = ctx.path("a2_victim.txt")
+    with open(victim, "w", encoding="utf-8") as f:
+        f.write("keep")
+    target = os.path.join(folder, "export.json")
+    os.symlink(victim, _tmp_name(target))
+    atomic_write_text(target, "new")
+    with open(victim, encoding="utf-8") as f:
+        assert f.read() == "keep"
+    assert not os.path.islink(target)
+    with open(target, encoding="utf-8") as f:
+        assert f.read() == "new"
+    assert not os.path.lexists(_tmp_name(target))
+
+
+@self_test()
+def t_a2_copied_rows_cannot_start_a_formula(ctx):
+    """Second audit (security #5): a table row or chart data copied to
+    the clipboard gets the same formula guard as a CSV file."""
+    got = []
+    real = globals()["copy_to_clipboard"]
+    try:
+        globals()["copy_to_clipboard"] = lambda app, text: got.append(text)
+        TableKit.copy_row(types.SimpleNamespace(
+            app=None, row_cells=lambda iid: ["=HYPERLINK(\"x\")", "+1",
+                                             "router", "-cmd"]), "i1")
+    finally:
+        globals()["copy_to_clipboard"] = real
+    assert got == ["'=HYPERLINK(\"x\")\t'+1\trouter\t'-cmd"], got
+    canvas = types.SimpleNamespace(_mw_chart={"Sites": {
+        "anchor": None, "header": ["Site", "Bytes"], "note": "",
+        "texts": None, "fmt": None,
+        "rows": [["@SUM(1)", 5], ["example.com", -3]]}})
+    text = Charts.chart_text(canvas)
+    assert "'@SUM(1)\t5" in text and "example.com\t-3" in text, text
 
 
 # ============================================================================
