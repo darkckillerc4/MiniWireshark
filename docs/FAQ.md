@@ -45,7 +45,7 @@ Download it only from the [releases page](https://github.com/darkckillerc4/MiniW
 No. It checks GitHub once a day for the latest version number and tells you. It installs an update only when the update is signed with a release key built into your copy; otherwise you download it yourself. Turn the check off in **Settings → Updates & Dependencies**. See [SECURITY.md](../SECURITY.md#where-updates-come-from).
 
 **Why does it download Python packages?**
-It needs Scapy to capture live traffic; other packages are optional. Downloads come only from `python.org` and the Python Package Index, go into its own data folder, and never change the Python you already have. Scapy's file is checked against a fingerprint built into MiniWireshark. Without it, MiniWireshark opens in limited mode, where Demo Mode and capture files still work.
+It needs Scapy to capture live traffic; other packages are optional. Downloads come only from `github.com` (a standalone Python build), `python.org` and the Python Package Index, after you approve the list. They go into its own data folder and never change the Python you already have. The Python build and Scapy are checked against fingerprints built into MiniWireshark. Without it, MiniWireshark opens in limited mode, where Demo Mode and capture files still work.
 
 **Why does it ask for administrator rights or a password?**
 Reading raw packets needs them on every system, the same as Wireshark. On Windows, the Npcap driver handles this once it is installed. On Linux and macOS it asks only when you start watching, never just to open the window.

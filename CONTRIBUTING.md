@@ -41,4 +41,4 @@ Use the issue templates. A **debug bundle** from the Diagnostics window masks ad
 
 ## Releasing
 
-Releases are automatic. Set `SCRIPT_VERSION` in `miniwireshark.py`, change the changelog heading from `## [Unreleased] — x.y.z` to `## [x.y.z] — YYYY-MM-DD`, and merge to `main`. The **Release** workflow publishes the `.py` file and its `.sha256`, and records the version in the README and [docs/VERSIONS.md](docs/VERSIONS.md). Notes come from `.github/release-notes/vx.y.z.md` if you write one, otherwise from the changelog.
+Releases are automatic. While you work, collect changes under a `## [Unreleased] — x.y.z` heading at the top of `CHANGELOG.md`; the Release workflow skips a version whose heading still says Unreleased. To release, set `SCRIPT_VERSION` in `miniwireshark.py`, change the heading to `## [x.y.z] — YYYY-MM-DD`, and merge to `main`. The **Release** workflow publishes the `.py` file and its `.sha256`, and records the version in the README and [docs/VERSIONS.md](docs/VERSIONS.md). Notes come from `.github/release-notes/vx.y.z.md` if you write one, otherwise from the changelog.

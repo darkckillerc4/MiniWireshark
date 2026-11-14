@@ -13,7 +13,7 @@ A network monitor sees everything your computer sends, so you should be skeptica
 | It has no telemetry. Everything it sends goes through one gate and is listed. | Open **Security → What MiniWireshark sent**. Turn on the **kill switch** and watch it block everything. |
 | It never phones home for updates from anywhere but GitHub. | Read [SECURITY.md](../SECURITY.md#where-updates-come-from). Search the file for `OFFICIAL_UPDATE_REPO`. |
 | Its claims are tested. | Run `python miniwireshark.py --self-test` on your own computer (a few minutes, no capture or admin rights needed). |
-| It says what it can't see. | The vantage meter in the bottom-right corner, and **Help → What this computer can see**. |
+| It says what it can't see. | The vantage meter in the bottom-right corner, and **Help → Help & glossary → What this computer can see**. |
 
 ## 1. Check the download
 
@@ -37,8 +37,8 @@ MiniWireshark mostly *listens*. It sends something in the following cases, each 
 | What | When | Where it goes |
 |---|---|---|
 | Update check | Once a day, unless you turn it off | `api.github.com`, for the latest release number only |
-| Reference lists | About once a month, unless you turn it off | `wireshark.org` (vendor names) and `publicsuffix.org`. Plain file downloads. |
-| Private Python and packages | Only when you approve the download list | `python.org` and the Python Package Index (`pypi.org`, `files.pythonhosted.org`) |
+| Reference lists | Only when you ask in the Components Center, or weekly if you set **Settings → Components → Updates** to Weekly | `wireshark.org` (vendor names) and `publicsuffix.org`. Optional lists you turn on add `www.iana.org` (port names), `raw.githubusercontent.com` (tracker and DNS-resolver lists), `iptoasn.com`, `feodotracker.abuse.ch` and `www.spamhaus.org`. Plain file downloads. |
+| Private Python and packages | Only when you approve the download list | `github.com` (a standalone Python build, pinned by SHA-256), `python.org` (the Windows fallback installer, checked for its signature) and the Python Package Index (`pypi.org`, `files.pythonhosted.org`) |
 | Npcap (Windows) | Only when you choose to install it | `npcap.com` |
 | Health checks | When you open Health or run them | Your router, your DNS server, and a test address |
 | Device discovery (Active Mode) | Only on your own subnet, and never on a network you haven't trusted | Devices on your local network |
@@ -74,7 +74,7 @@ You can always say no. It then opens in limited mode, where you can still use ca
 
 - **Self-test:** more than 350 tests built into the file (`--self-test`). They cover the decoders, the alert rules, the privacy canary, the outbound gate, corrupt files and clock jumps.
 - **GUI test:** `--gui-test` drives the real window through every tab.
-- **CI:** every push and pull request runs the self-test on Python 3.8, 3.12 and 3.13, the GUI test on two Ubuntu versions, the self-test and GUI test on Windows, the self-test on macOS, and a [privacy check](../.github/scripts/privacy_check.py) that keeps captures, personal data and keys out of this public repository. Results are on the [Actions page](https://github.com/darkckillerc4/MiniWireshark/actions).
+- **CI:** every pull request, and every push to `main`, runs the self-test on Python 3.8, 3.12 and 3.13, the GUI test on two Ubuntu versions, the self-test and GUI test on Windows, the self-test on macOS, and a [privacy check](../.github/scripts/privacy_check.py) that keeps captures, personal data and keys out of this public repository. Results are on the [Actions page](https://github.com/darkckillerc4/MiniWireshark/actions).
 - **Long runs:** a fast replay test tracks memory, threads and Tk interpreters over many simulated hours. 5.3.4 was not re-run for 8 hours on a real PC; the [changelog](../CHANGELOG.md) lists that under Known limits.
 - **Screenshots** in these docs are taken from Demo Mode: simulated data with reserved `.example` names. Nothing in them is real traffic.
 

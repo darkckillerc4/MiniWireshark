@@ -6,7 +6,7 @@ The words MiniWireshark and these pages use, in plain English. Terms marked *(ap
 
 ## A to D
 
-**Active Mode** *(app)*: The setting that lets MiniWireshark send discovery probes (to find devices and their names) on a network you have marked as yours. Off, it only listens. Every probe is listed in **What MiniWireshark sent**.
+**Active Mode** *(app)*: Lets MiniWireshark send discovery probes (to find devices and their names), only on a network you have marked as yours. Its opposite, Quiet Mode, only listens. Every probe is listed in **What MiniWireshark sent**.
 
 **ARP (Address Resolution Protocol)**: How devices on the same network find each other's hardware address from an IP address. It has no protection, so a device can lie in it; see [Possible ARP spoofing](ALERTS.md#possible-arp-spoofing).
 
@@ -60,7 +60,7 @@ The words MiniWireshark and these pages use, in plain English. Terms marked *(ap
 
 **Pseudonyms** *(app)*: Replacement names and addresses from the documentation ranges, used in shareable reports so nothing real is shown.
 
-**Reference lists** *(app)*: Public lists MiniWireshark downloads about once a month: vendor names for MAC addresses (from Wireshark) and the public suffix list. They contain nothing about you.
+**Reference lists** *(app)*: Public lists MiniWireshark downloads when you ask in the Components Center (or weekly, if you choose that in **Settings → Components**): vendor names for MAC addresses (from Wireshark), the public suffix list, and optional extras. Built-in copies are used until then. Downloading them sends nothing about you.
 
 ## S to Z
 
