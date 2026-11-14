@@ -27856,6 +27856,34 @@ def story_day(ts):
         return "?"
 
 
+def alerts_card_text(counts):
+    """The Dashboard's ALERTS card: each count with its word (second
+    audit #54: "0 1 5" behind three symbols said nothing)."""
+    return (f"Danger {counts.get('DANGER', 0)} · "
+            f"Warning {counts.get('WARNING', 0)} · "
+            f"Info {counts.get('INFO', 0)}")
+
+
+def story_day_row(day, n, tr=None):
+    """A Story day heading for the Timeline's four columns (second
+    audit #53): the day and its count read as one heading in the wide
+    column ("Today · 2 changes"), not "2 changes" under Type and
+    "Today" under What happened."""
+    tr = tr or translate_text
+    count = tr("1 change") if n == 1 else tr("%d changes") % n
+    return ("", "", "", f"── {story_day_label(day)} · {count} ──")
+
+
+def story_item_row(it, icon, when, mark=""):
+    """A Story sentence for the Timeline's columns: the Type column
+    names what it is about (Devices, Websites, Alerts …), like the
+    other rows; the sentence already says how many times (second audit
+    #53: it showed "×5")."""
+    return (f"{icon} {it['severity']}", when,
+            translate_text(it.get("category") or ""),
+            mark + story_sentence(it))
+
+
 def story_day_label(day, now=None):
     """'Today', 'Yesterday' or 'Monday 2026-10-26', in the current
     language."""
@@ -29046,7 +29074,7 @@ Security check ¦ Contrôle de sécurité ¦ Revisión de seguridad
 Friendly explanations of what I've noticed. Unusual is not the same as dangerous. ¦ Explications simples de ce que j'ai remarqué. Inhabituel ne veut pas dire dangereux. ¦ Explicaciones sencillas de lo que he notado. Inusual no es lo mismo que peligroso.
 Check my router's port forwarding (UPnP) ¦ Vérifier les redirections de ports de ma box (UPnP) ¦ Comprobar la redirección de puertos de mi router (UPnP)
 What MiniWireshark sent ¦ Ce que MiniWireshark a envoyé ¦ Lo que envió MiniWireshark
-Sources — where MiniWireshark's information comes from. What this computer sees itself is “Observed”; what a connected helper tells it is “Reported”, shown beside it and never added to it. ¦ Sources — d'où viennent les informations de MiniWireshark. Ce que cet ordinateur voit lui-même est « Observé » ; ce qu'un assistant connecté lui dit est « Rapporté », affiché à côté et jamais additionné. ¦ Fuentes — de dónde viene la información de MiniWireshark. Lo que ve este equipo es «Observado»; lo que le dice un ayudante conectado es «Informado», mostrado al lado y nunca sumado.
+Sources — where MiniWireshark's information comes from. What this computer sees itself is “Observed”; what a connected helper tells it is “Reported”, shown beside it and never added to it. ¦ Sources — d'où viennent les informations de MiniWireshark. Ce que cet ordinateur voit lui-même est « Observé » ; ce qu'un assistant connecté lui dit est « Signalé », affiché à côté et jamais additionné. ¦ Fuentes — de dónde viene la información de MiniWireshark. Lo que ve este equipo es «Observado»; lo que le dice un ayudante conectado es «Informado», mostrado al lado y nunca sumado.
 Optional: connect your Pi-hole or AdGuard Home to see the lookups of devices this computer can't hear. Read-only — nothing is ever changed on them. ¦ Facultatif : connectez votre Pi-hole ou AdGuard Home pour voir les recherches des appareils que cet ordinateur n'entend pas. Lecture seule — rien n'y est jamais modifié. ¦ Opcional: conecte su Pi-hole o AdGuard Home para ver las búsquedas de los dispositivos que este equipo no oye. Solo lectura — nunca se cambia nada en ellos.
 Add Pi-hole ¦ Ajouter Pi-hole ¦ Añadir Pi-hole
 Add AdGuard Home ¦ Ajouter AdGuard Home ¦ Añadir AdGuard Home
@@ -29056,7 +29084,7 @@ Pause / resume ¦ Pause / reprise ¦ Pausar / reanudar
 Remove ¦ Supprimer ¦ Quitar
 Gives ¦ Fournit ¦ Aporta
 Last update ¦ Dernière mise à jour ¦ Última actualización
-Reported vs observed ¦ Rapporté ou observé ¦ Informado frente a observado
+Reported vs observed ¦ Signalé ou observé ¦ Informado frente a observado
 Show only ¦ Afficher seulement ¦ Mostrar solo
 All ¦ Tous ¦ Todos
 Website ¦ Site web ¦ Sitio web
@@ -29086,7 +29114,7 @@ Run self-test ¦ Lancer l'autotest ¦ Ejecutar autoprueba
 Open data folder ¦ Ouvrir le dossier des données ¦ Abrir la carpeta de datos
 Open logs ¦ Ouvrir les journaux ¦ Abrir registros
 Inspector ¦ Inspecteur ¦ Inspector
-observed  ◈ reported  ◎ correlated  ◌ inferred  ? unknown ¦ observé  ◈ rapporté  ◎ corrélé  ◌ déduit  ? inconnu ¦ observado  ◈ informado  ◎ correlacionado  ◌ deducido  ? desconocido
+observed  ◈ reported  ◎ correlated  ◌ inferred  ? unknown ¦ observé  ◈ signalé  ◎ corrélé  ◌ déduit  ? inconnu ¦ observado  ◈ informado  ◎ correlacionado  ◌ deducido  ? desconocido
 Ready. Click “Start watching” when you'd like to begin. ¦ Prêt. Cliquez sur « Commencer à observer » quand vous voulez. ¦ Listo. Haga clic en «Empezar a observar» cuando quiera.
 General ¦ Général ¦ General
 Appearance ¦ Apparence ¦ Apariencia
@@ -29538,7 +29566,7 @@ Warning ¦ Avertissement ¦ Aviso
 Click to open the details. ¦ Cliquez pour ouvrir les détails. ¦ Haga clic para abrir los detalles.
 INTERNET (outside your network) ¦ INTERNET (hors de votre réseau) ¦ INTERNET (fuera de su red)
 YOUR LOCAL NETWORK ¦ VOTRE RÉSEAU LOCAL ¦ SU RED LOCAL
-Letters = confidence (H M L ?) · hollow = offline · ─ seen (switch said so) · ┄ logical (inferred) · ★ new this hour · red ring = open alert · drag a device to place it ¦ Lettres = confiance (H M L ?) · creux = hors ligne · ─ vu (selon le commutateur) · ┄ logique (déduit) · ★ nouveau cette heure · anneau rouge = alerte ouverte · faites glisser un appareil pour le placer ¦ Letras = confianza (H M L ?) · hueco = desconectado · ─ visto (según el conmutador) · ┄ lógico (deducido) · ★ nuevo en esta hora · anillo rojo = alerta abierta · arrastre un dispositivo para colocarlo
+Letter on a device = how sure it is real: H high, M medium, L low, ? unconfirmed · hollow = offline · ─ seen (switch said so) · ┄ logical (inferred) · ★ new this hour · red ring = open alert · drag a device to place it ¦ Lettre sur un appareil = certitude qu'il est réel : H élevée, M moyenne, L faible, ? non confirmé · creux = hors ligne · ─ vu (selon le commutateur) · ┄ logique (déduit) · ★ nouveau cette heure · anneau rouge = alerte ouverte · faites glisser un appareil pour le placer ¦ Letra en un dispositivo = certeza de que es real: H alta, M media, L baja, ? sin confirmar · hueco = desconectado · ─ visto (según el conmutador) · ┄ lógico (deducido) · ★ nuevo en esta hora · anillo rojo = alerta abierta · arrastre un dispositivo para colocarlo
 Load 200 older ¦ Charger 200 plus anciens ¦ Cargar 200 anteriores
 Internet traffic ¦ Trafic Internet ¦ Tráfico de Internet
 No Internet traffic measured yet ¦ Aucun trafic Internet mesuré pour l'instant ¦ Aún no se ha medido tráfico de Internet
@@ -29625,7 +29653,7 @@ Any source ¦ Toute source ¦ Cualquier fuente
 Both ¦ Les deux ¦ Ambos
 Connected ¦ Connecté ¦ Conectado
 Connected (shared address) ¦ Connecté (adresse partagée) ¦ Conectado (dirección compartida)
-Looked up (reported) ¦ Recherché (rapporté) ¦ Buscado (informado)
+Looked up (reported) ¦ Recherché (signalé) ¦ Buscado (informado)
 Looked up only ¦ Recherché seulement ¦ Solo buscado
 Possibly ¦ Peut-être ¦ Posiblemente
 Encrypted ¦ Chiffré ¦ Cifrado
@@ -31466,7 +31494,7 @@ router and Internet seen in traffic, not checked yet ¦ routeur et Internet vus 
 Weak signal — likely to make the connection slower. Move closer to the router or remove obstacles. ¦ Signal faible — risque de ralentir la connexion. Rapprochez-vous de la box ou enlevez les obstacles. ¦ Señal débil — probablemente haga la conexión más lenta. Acérquese al router o quite obstáculos.
 Time window ¦ Période ¦ Periodo
 %s of data so far ¦ %s de données pour l'instant ¦ %s de datos por ahora
-Device evidence: is it a real device? ●●● High (score 60+) · ●●○ Medium (score 30+) · ●○○ Low (score 10+) · ○○○ Unconfirmed. Evidence: how three facts are known, in order: on your network · name · kind (◉ Observed · ◈ Reported · ◎ Correlated · ◌ Inferred · ? Unknown). “Likely” or “Possibly” before a kind is how sure that guess is, so a device with High evidence can still be only “Possibly” a printer. ¦ Preuves de l'appareil : est-ce un vrai appareil ? ●●● Élevée (score 60+) · ●●○ Moyenne (score 30+) · ●○○ Faible (score 10+) · ○○○ Non confirmé. Preuves : comment trois faits sont connus, dans l'ordre : sur votre réseau · nom · type (◉ Observé · ◈ Signalé · ◎ Recoupé · ◌ Déduit · ? Inconnu). « Probable » ou « Peut-être » devant un type dit à quel point cette supposition est sûre : un appareil aux preuves élevées peut n'être que « Peut-être » une imprimante. ¦ Pruebas del dispositivo: ¿es un dispositivo real? ●●● Alta (puntuación 60+) · ●●○ Media (puntuación 30+) · ●○○ Baja (puntuación 10+) · ○○○ Sin confirmar. Pruebas: cómo se conocen tres datos, en orden: en su red · nombre · tipo (◉ Observado · ◈ Informado · ◎ Correlacionado · ◌ Deducido · ? Desconocido). «Probable» o «Posiblemente» delante de un tipo indica lo segura que es esa suposición, así que un dispositivo con pruebas altas puede ser solo «Posiblemente» una impresora.
+Device evidence: is it a real device? ●●● High (score 60+) · ●●○ Medium (score 30+) · ●○○ Low (score 10+) · ○○○ Unconfirmed. Evidence: how three facts are known, in order: on your network · name · kind (◉ Observed · ◈ Reported · ◎ Correlated · ◌ Inferred · ? Unknown). “Likely” or “Possibly” before a kind is how sure that guess is, so a device with High evidence can still be only “Possibly” a printer. ¦ Preuves de l'appareil : est-ce un vrai appareil ? ●●● Élevée (score 60+) · ●●○ Moyenne (score 30+) · ●○○ Faible (score 10+) · ○○○ Non confirmé. Preuves : comment trois faits sont connus, dans l'ordre : sur votre réseau · nom · type (◉ Observé · ◈ Signalé · ◎ Corrélé · ◌ Déduit · ? Inconnu). « Probable » ou « Peut-être » devant un type dit à quel point cette supposition est sûre : un appareil aux preuves élevées peut n'être que « Peut-être » une imprimante. ¦ Pruebas del dispositivo: ¿es un dispositivo real? ●●● Alta (puntuación 60+) · ●●○ Media (puntuación 30+) · ●○○ Baja (puntuación 10+) · ○○○ Sin confirmar. Pruebas: cómo se conocen tres datos, en orden: en su red · nombre · tipo (◉ Observado · ◈ Informado · ◎ Correlacionado · ◌ Deducido · ? Desconocido). «Probable» o «Posiblemente» delante de un tipo indica lo segura que es esa suposición, así que un dispositivo con pruebas altas puede ser solo «Posiblemente» una impresora.
 The devices on your local network. Device evidence shows how sure it is that each one is a real device — an IP address alone is never enough to count as a device. ¦ Les appareils de votre réseau local. Les preuves de l'appareil indiquent à quel point il est sûr que chacun est un vrai appareil — une adresse IP seule ne suffit jamais à compter comme appareil. ¦ Los dispositivos de su red local. Las pruebas del dispositivo indican lo seguro que es que cada uno sea un dispositivo real — una dirección IP sola nunca basta para contar como dispositivo.
 # 5.3.4: Websites → Local services
 Local services ¦ Services locaux ¦ Servicios locales
@@ -32319,6 +32347,10 @@ I18N_PATTERNS += [
 ]
 # 5.3.4 (MC5): what the baseline learned, and its state
 I18N_PATTERNS += [
+    # second audit (#54): the Dashboard's ALERTS card
+    (r"Danger (\d+) · Warning (\d+) · Info (\d+)",
+     r"Danger \1 · Avertissement \2 · Info \3",
+     r"Peligro \1 · Aviso \2 · Info \3"),
     (r"Learning \((\d+) of (\d+) min\)",
      r"En apprentissage (\1 sur \2 min)", r"Aprendiendo (\1 de \2 min)"),
     (r"Knows this device \((\d+) days\)",
@@ -32983,6 +33015,11 @@ def translate_text(s, locale=None):
             _I18N_CACHE.clear()
         _I18N_CACHE[key] = out
         if out is not s:
+            # second audit (#51): a nameless device's label inside a
+            # translated sentence ("Avertissement : Device using a
+            # private Wi-Fi address propose …")
+            out = translate_anonymous_labels(out, loc)
+            _I18N_CACHE[key] = out
             if len(I18N_REVERSE) > 50000:
                 I18N_REVERSE.clear()
             I18N_REVERSE[out] = s
@@ -40371,8 +40408,7 @@ class DashboardTab(BaseTab):
         self.vars["up"].set(human_rate(up))
         self.vars["pps"].set(f"{m.metrics.current('packets', now):.0f}")
         c = m.alerts.counts()
-        self.vars["alerts"].set(f"‼ {c['DANGER']}  ⚠ {c['WARNING']}  "
-                                f"ℹ {c['INFO']}")
+        self.vars["alerts"].set(alerts_card_text(c))
         self.vars["capture"].set(app.capture_status_short())
         self.vars["internet"].set(app.internet_status_short())
         self.vars["dns"].set(app.dns_status_short())
@@ -41147,12 +41183,10 @@ class TimelineTab(BaseTab):
             items = [it for it in items if self._story_matches(it)]
             if not items:
                 continue
-            n = len(items)
             with contextlib.suppress(tk.TclError):
                 iid = self.tree.insert(
                     "", "end", tags=("episode",),
-                    values=("", "", tr("1 change") if n == 1 else
-                            tr("%d changes") % n, story_day_label(day)))
+                    values=story_day_row(day, len(items), tr))
                 self.refs[iid] = None
             for it in items:
                 if not marked and not it["fresh"]:
@@ -41198,9 +41232,7 @@ class TimelineTab(BaseTab):
         with contextlib.suppress(tk.TclError):
             iid = self.tree.insert(
                 "", "end", tags=(it["severity"],),
-                values=(f"{icon} {it['severity']}", when,
-                        f"×{it['count']}" if it["count"] > 1 else "",
-                        mark + story_sentence(it)))
+                values=story_item_row(it, icon, when, mark))
             self.refs[iid] = it
 
     def add(self, entries):
@@ -43611,7 +43643,8 @@ class AlertsTab(BaseTab):
 # ---- Network map v2 ----------------------------------------------------------
 class MapTab(BaseTab):
     name, label_key = "map", "tab_map"
-    LEGEND = ("Letters = confidence (H M L ?) · hollow = offline · ─ seen "
+    LEGEND = ("Letter on a device = how sure it is real: H high, M "
+              "medium, L low, ? unconfirmed · hollow = offline · ─ seen "
               "(switch said so) · ┄ logical (inferred) · ★ new this hour "
               "· red ring = open alert · drag a device to place it")
 
@@ -75710,6 +75743,69 @@ def t_a2_login_in_default_mode(ctx):
 
 
 @self_test()
+def t_a2_ui_words(ctx):
+    """Second audit (#51, #53, #54): a nameless device's label is
+    translated inside a French or Spanish sentence; a Story day heading
+    reads "Today · 2 changes" in the wide column and a Story row's Type
+    column names its category (not "×5"); the Spanish Story says "Aviso"
+    like the severity column; the ALERTS card names its counts; the Map
+    legend says what its letters mean; French calls a reported fact
+    "Signalé" and a correlated one "Corrélé" everywhere."""
+    anon = ("Device using a private Wi-Fi address (192.168.1.77) offers "
+            "remote access (SSH)")
+    for loc, word in (("fr", "Appareil avec une adresse Wi-Fi privée"),
+                      ("es", "Dispositivo con una dirección Wi-Fi privada")):
+        out = translate_text("Warning: " + anon, loc)
+        assert word in out and "Device " not in out, (loc, out)
+    old = CURRENT_LOCALE
+    try:
+        now = time.time()
+        today = story_day(now)
+        row = story_day_row(today, 2)
+        assert row[:3] == ("", "", "") and "Today" in row[3] and \
+            "2 changes" in row[3], row
+        it = {"severity": "WARNING", "category": "Devices", "count": 5,
+              "say": _story_say("%s changed its address %d times",
+                                ("Phone", 5)),
+              "text": "Phone changed its address 5 times"}
+        cells = story_item_row(it, "⚠", "10:00–10:20")
+        assert cells[2] == "Devices" and "×" not in "".join(cells), cells
+        assert alerts_card_text({"DANGER": 0, "WARNING": 1, "INFO": 5}) == \
+            "Danger 0 · Warning 1 · Info 5"
+        assert "Letters = confidence" not in MapTab.LEGEND and \
+            "H high" in MapTab.LEGEND, MapTab.LEGEND
+        set_locale("es")
+        row = story_day_row(today, 2)
+        assert "Hoy" in row[3] and "2 cambios" in row[3], row
+        assert story_item_row(it, "⚠", "")[2] == "Dispositivos"
+        st = {"say": _story_say("Warning: %s", (anon,), (0,))}
+        assert story_sentence(st).startswith("Aviso: Dispositivo"), \
+            story_sentence(st)
+        assert translate_text(alerts_card_text(
+            {"DANGER": 2, "WARNING": 1, "INFO": 5})) == \
+            "Peligro 2 · Aviso 1 · Info 5"
+        assert translate_text(MapTab.LEGEND).startswith("Letra en"), \
+            translate_text(MapTab.LEGEND)[:60]
+        set_locale("fr")
+        assert translate_text(alerts_card_text(
+            {"DANGER": 2, "WARNING": 1, "INFO": 5})) == \
+            "Danger 2 · Avertissement 1 · Info 5"
+        assert translate_text(MapTab.LEGEND).startswith("Lettre sur"), \
+            translate_text(MapTab.LEGEND)[:60]
+        for en in ("Looked up (reported)", "Reported vs observed",
+                   "observed  ◈ reported  ◎ correlated  ◌ inferred  "
+                   "? unknown"):
+            fr = translate_text(en)
+            assert "apporté" not in fr and "ignalé" in fr, fr
+        legend = [v for k, v in I18N["fr"].items()
+                  if k.startswith("Device evidence: is it a real device?")]
+        assert legend and all("Recoupé" not in v and "◎ Corrélé" in v
+                              for v in legend), legend
+    finally:
+        set_locale(old)
+
+
+@self_test()
 def t_ip010_own_blocklist(ctx):
     """5.3.4 (IP-010): your own blocklist file: addresses, ranges (IPv4 and
     IPv6) and names, comments and hosts-file lines; private and local
@@ -95573,8 +95669,12 @@ def gt_534_story_mode(app, ctx):
           f"by the job, drawn in {draw_ms:.1f} ms)")
     heads = [i for i in tl.tree.get_children()
              if "episode" in tl.tree.item(i, "tags")]
+    # second audit (#53): "Today · N changes" in the wide column
     assert [tl.tree.set(i, "text") for i in heads] == \
-        [story_day_label(d) for d, _its in st["days"]]
+        [story_day_row(d, len(_its))[3] for d, _its in st["days"]]
+    assert all(story_day_label(d) in tl.tree.set(i, "text") and
+               not tl.tree.set(i, "kind") for i, (d, _its) in
+               zip(heads, st["days"]))
     assert "Writing" not in str(tl.status_lbl.cget("text"))
     # a scripted live story: the line falls between new and seen
     now = _story_noon(0)
@@ -95605,7 +95705,10 @@ def gt_534_story_mode(app, ctx):
     first = tl.refs[rows[1]]
     assert tl.tree.set(rows[1], "text") == ROW_DOT + \
         "Phone left and came back 4 times"
-    assert tl.tree.set(rows[1], "kind") == "×8" and first["fresh"]
+    # second audit (#53): the Type column names the category; the
+    # sentence says how many times
+    assert tl.tree.set(rows[1], "kind") == "Devices" and first["fresh"] \
+        and first["count"] == 8
     tl.tree.selection_set(rows[1])
     tl._on_double()                    # no such device: the sentence
     _gui_pump(root, 0.1)
