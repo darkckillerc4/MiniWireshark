@@ -96,7 +96,7 @@ def check_target(src, target, line_no, is_image):
 
 def check_file(path):
     found = []
-    strict = not path.startswith("docs/plans/")
+    strict = True
     with open(path, "rb") as f:
         raw = f.read()
     if strict:

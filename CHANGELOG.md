@@ -2,7 +2,7 @@
 
 All notable changes to MiniWireshark. Versions follow `MAJOR.MINOR.PATCH`; each release is one `.py` file attached to its [GitHub release](https://github.com/darkckillerc4/MiniWireshark/releases). Checksums are in [docs/VERSIONS.md](docs/VERSIONS.md).
 
-## [5.3.4] — 2026-11-04
+## [5.3.4] — Unreleased
 
 A medium release that makes MiniWireshark safer, easier to start and easier to understand. Every finding of the 5.2.3 security audit is fixed in the code (four of the fixes still need a check on real hardware: a Windows PC, a Mac and a real Wi-Fi roam), new screens explain your network to a beginner, and the largest bug campaign so far ran before, during and after the new features.
 
@@ -175,7 +175,6 @@ Layout and loading bug campaign. A crawler opened every tab, view, dialog and se
 
 - The original "super noob-friendly" single-file packet sniffer. It handles elevation, dependency and driver installs, network-card choice, LAN discovery (ARP, mDNS, SSDP), self-healing capture and a paced plain-English feed.
 
-[5.3.4]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.3.4
 [5.2.3]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.2.3
 [5.1.2]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.1.2
 [5.0.2]: https://github.com/darkckillerc4/MiniWireshark/releases/tag/v5.0.2
