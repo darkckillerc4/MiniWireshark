@@ -1140,7 +1140,7 @@ def save_json_store(path, obj):
             if isinstance(read_json(path, None), (dict, list)):
                 shutil.copyfile(path, path + ".bak")
     tmp = _tmp_name(path)
-    with open(tmp, "w", encoding="utf-8") as f:
+    with _open_new_tmp(tmp, "w", encoding="utf-8") as f:
         f.write(json.dumps(obj, indent=2, default=str))
         f.flush()
         with contextlib.suppress(OSError):
@@ -3288,10 +3288,52 @@ def net_urlopen(feature, req, timeout, detail="", allowed=None):
     parts = urllib.parse.urlsplit(url)
     outbound(feature, parts.scheme or "http", parts.hostname or url,
              detail or (parts.path or "/")[:100])
-    if allowed is not None:
-        opener = _redirect_opener(allowed)
-        return opener.open(req, timeout=timeout)
-    return urllib.request.urlopen(req, timeout=timeout)
+    prev = getattr(_NET_FEATURE, "name", None)
+    _NET_FEATURE.name = feature        # what a redirect is recorded under
+    try:
+        if allowed is not None:
+            opener = _redirect_opener(allowed)
+            return opener.open(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout)
+    finally:
+        _NET_FEATURE.name = prev
+
+
+# Second audit (privacy #11): urllib follows up to 10 redirects to any
+# host. Only the update check checked them; every other download (the
+# reference lists, country lookups, packages) could be sent on to another
+# host, plain http included, and the ledger listed only the first one.
+# Each redirect now passes the outbound() gate itself (recorded, stopped by
+# the kill switch), and https is never redirected to plain http.
+_NET_FEATURE = threading.local()
+
+
+def gate_redirect(old_url, new_url, feature=None):
+    """Raise unless the redirect from old_url to new_url may be followed;
+    records it in the ledger under the feature of the request."""
+    feature = feature or getattr(_NET_FEATURE, "name", None)
+    old = urllib.parse.urlsplit(str(old_url))
+    new = urllib.parse.urlsplit(str(new_url))
+    if not feature:
+        raise urllib.error.URLError("a redirect outside the outbound gate "
+                                    "was refused")
+    if old.scheme == "https" and new.scheme != "https":
+        raise urllib.error.URLError(
+            "a redirect from https to %s was refused" % (new.scheme or "?"))
+    outbound(feature, new.scheme or "http", new.hostname or str(new_url),
+             f"redirected from {old.hostname or '?'}")
+
+
+class _GatedRedirects(urllib.request.HTTPRedirectHandler):
+    """Every redirect urlopen follows goes through gate_redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        gate_redirect(req.full_url, newurl)
+        return super().redirect_request(req, fp, code, msg, headers,
+                                        newurl)
+
+
+urllib.request.install_opener(urllib.request.build_opener(_GatedRedirects))
 
 
 class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
@@ -3309,6 +3351,9 @@ class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
             raise urllib.error.URLError(
                 "a redirect to %s was refused" % (
                     urllib.parse.urlsplit(str(newurl)).hostname or "?"))
+        # second audit (#11): recorded too (this opener is the update's)
+        gate_redirect(req.full_url, newurl,
+                      getattr(_NET_FEATURE, "name", None) or "update")
         return super().redirect_request(req, fp, code, msg, headers,
                                         newurl)
 
@@ -27453,6 +27498,27 @@ def remove_history_copies(path, live_too=False):
             os.remove(f)
 
 
+def history_record_files(paths=None):
+    """Second audit (privacy #7): the files besides the history database
+    that keep what was seen on the network: the autosave, the crash
+    journal and the ones set aside, a restored session, your device names
+    and notes, the remembered networks and the programs that waited for
+    connections, with their backups and damaged copies. -> existing paths."""
+    import glob
+    paths = paths or PATHS
+    bases = [paths.autosave, paths.journal,
+             os.path.join(paths.sessions, "restored.mwsession.json"),
+             paths.known_devices, paths.networks,
+             os.path.join(paths.data, "listening.json")]
+    out = set()
+    for b in bases:
+        out.add(b)
+        out.update(glob.glob(glob.escape(b) + ".*"))
+    out.update(glob.glob(os.path.join(glob.escape(paths.sessions),
+                                      "journal-interrupted-*")))
+    return sorted(p for p in out if os.path.isfile(p) or os.path.islink(p))
+
+
 def wipe_packet_files(folder):
     """Delete the saved packets (seg-*.pcap) in `folder`."""
     n = 0
@@ -28406,7 +28472,7 @@ A browser's first HTTP/3 packet names the site, protected only by keys anyone ca
 Country & provider lookup ¦ Recherche de pays et fournisseur ¦ Búsqueda de país y proveedor
 Offline country/provider database (recommended) ¦ Base pays/fournisseur hors ligne (recommandé) ¦ Base de datos de país/proveedor sin conexión (recomendado)
 Online country lookup (fallback) ¦ Recherche de pays en ligne (secours) ¦ Búsqueda de país en línea (alternativa)
-Sends each remote (Internet) IP address — never your own devices' addresses, MAC addresses, packet contents or website names — to a public geolocation service (ipwho.is, geojs.io, ipapi.co, ip-api.com) to find its country. ¦ Envoie chaque adresse IP distante (Internet) — jamais les adresses de vos appareils, les adresses MAC, le contenu des paquets ni les noms de sites — à un service public de géolocalisation (ipwho.is, geojs.io, ipapi.co, ip-api.com) pour trouver son pays. ¦ Envía cada dirección IP remota (de Internet) — nunca las de sus dispositivos, direcciones MAC, contenido de paquetes ni nombres de sitios — a un servicio público de geolocalización (ipwho.is, geojs.io, ipapi.co, ip-api.com) para saber su país.
+Sends each remote (Internet) IP address — never your own devices' addresses, MAC addresses, packet contents or website names — to a public geolocation service (ipwho.is, geojs.io, ipapi.co) to find its country. ¦ Envoie chaque adresse IP distante (Internet) — jamais les adresses de vos appareils, les adresses MAC, le contenu des paquets ni les noms de sites — à un service public de géolocalisation (ipwho.is, geojs.io, ipapi.co) pour trouver son pays. ¦ Envía cada dirección IP remota (de Internet) — nunca las de sus dispositivos, direcciones MAC, contenido de paquetes ni nombres de sitios — a un servicio público de geolocalización (ipwho.is, geojs.io, ipapi.co) para saber su país.
 Test lookup ¦ Tester la recherche ¦ Probar la búsqueda
 What MiniWireshark keeps ¦ Ce que MiniWireshark conserve ¦ Lo que guarda MiniWireshark
 Captured network information is processed on this computer and stays here unless you export it. Raw packets are never written to disk unless you export them or enable it under History. Settings live in a small file next to the program; names you give devices are kept in the data folder. ¦ Les informations réseau capturées sont traitées sur cet ordinateur et y restent sauf si vous les exportez. Les paquets bruts ne sont jamais écrits sur disque sauf si vous les exportez ou l'activez dans Historique. Les paramètres sont dans un petit fichier à côté du programme ; les noms donnés aux appareils sont dans le dossier des données. ¦ La información de red capturada se procesa en este equipo y se queda aquí salvo que la exporte. Los paquetes en bruto nunca se escriben en disco salvo que los exporte o lo active en Historial. Los ajustes están en un pequeño archivo junto al programa; los nombres que da a los dispositivos se guardan en la carpeta de datos.
@@ -28793,7 +28859,7 @@ Full report (HTML) ¦ Rapport complet (HTML) ¦ Informe completo (HTML)
 Health checks send a few tiny test connections, so they only run while watching live with Active Scanning on (not in Quiet Mode). ¦ Les vérifications de santé envoient quelques minuscules connexions de test : elles ne tournent que pendant l'observation en direct avec l'analyse active (pas en mode discret). ¦ Las comprobaciones de salud envían unas pocas conexiones de prueba diminutas, así que solo se ejecutan al observar en directo con la exploración activa (no en modo silencioso).
 Help & glossary ¦ Aide et glossaire ¦ Ayuda y glosario
 Hide the inspector (F2 shows it again) ¦ Masquer l'inspecteur (F2 le réaffiche) ¦ Ocultar el inspector (F2 lo vuelve a mostrar)
-History is off, but an old history file exists. Delete it? ¦ L'historique est désactivé, mais un ancien fichier d'historique existe. Le supprimer ? ¦ El historial está desactivado, pero existe un archivo de historial antiguo. ¿Borrarlo?
+History is off, but old history or saved sessions are still on this computer. Delete them? ¦ L'historique est désactivé, mais un ancien historique ou des sessions enregistrées sont encore sur cet ordinateur. Les supprimer ? ¦ El historial está desactivado, pero aún hay un historial antiguo o sesiones guardadas en este equipo. ¿Borrarlos?
 Load session error ¦ Erreur de chargement de session ¦ Error al cargar la sesión
 Load session ¦ Charger une session ¦ Cargar sesión
 Mask IP and hardware addresses (recommended) ¦ Masquer les adresses IP et matérielles (recommandé) ¦ Ocultar direcciones IP y físicas (recomendado)
@@ -28873,7 +28939,7 @@ Undo selected ¦ Annuler la sélection ¦ Deshacer lo seleccionado
 Update available ¦ Mise à jour disponible ¦ Actualización disponible
 Update rolled back ¦ Mise à jour annulée ¦ Actualización revertida
 What this computer can and can't see. Click for the full coverage report. ¦ Ce que cet ordinateur peut voir ou non. Cliquez pour le rapport de couverture complet. ¦ Lo que este equipo puede y no puede ver. Haga clic para el informe de cobertura completo.
-Yes = delete ALL stored history.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
+Yes = delete ALL stored history: the history, saved packets, the last autosave, crash copies, your device names and notes, remembered networks and the list of programs that wait for connections.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré : l'historique, les paquets enregistrés, la dernière sauvegarde automatique, les copies après plantage, les noms et notes de vos appareils, les réseaux mémorisés et la liste des programmes qui attendent des connexions.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado: el historial, los paquetes guardados, el último guardado automático, las copias tras un fallo, los nombres y notas de sus dispositivos, las redes recordadas y la lista de programas que esperan conexiones.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
 You have unsaved changes. Close without saving? ¦ Vous avez des modifications non enregistrées. Fermer sans enregistrer ? ¦ Tiene cambios sin guardar. ¿Cerrar sin guardar?
 Your device corrections (undo) ¦ Vos corrections d'appareils (annuler) ¦ Sus correcciones de dispositivos (deshacer)
 Your identity corrections ¦ Vos corrections d'identité ¦ Sus correcciones de identidad
@@ -33737,20 +33803,14 @@ def _geo_parse_ipapico(d):
     return d.get("country_code", ""), d.get("country_name", "")
 
 
-def _geo_parse_ipapi(d):
-    if d.get("status") != "success":
-        raise ValueError(d.get("message") or "lookup failed")
-    return d.get("countryCode", ""), d.get("country", "")
-
-
 GEOIP_PROVIDERS = [
     ("ipwho.is", "https://ipwho.is/{ip}?fields=success,message,country,"
                  "country_code", _geo_parse_ipwho),
     ("geojs.io", "https://get.geojs.io/v1/ip/country/{ip}.json",
      _geo_parse_geojs),
     ("ipapi.co", "https://ipapi.co/{ip}/json/", _geo_parse_ipapico),
-    ("ip-api.com", "http://ip-api.com/json/{ip}?fields=status,message,"
-                   "country,countryCode", _geo_parse_ipapi),
+    # second audit (privacy #11): ip-api.com's free service is plain http,
+    # which sent each address in clear text; it is no longer asked
 ]
 
 
@@ -34591,8 +34651,8 @@ SETTINGS_PAGES = [
               "help": "Sends each remote (Internet) IP address — never "
                       "your own devices' addresses, MAC addresses, packet "
                       "contents or website names — to a public "
-                      "geolocation service (ipwho.is, geojs.io, ipapi.co, "
-                      "ip-api.com) to find its country."},
+                      "geolocation service (ipwho.is, geojs.io, ipapi.co) "
+                      "to find its country."},
              {"type": "geo_status"},
              {"type": "action", "actions": [
                  ("Test lookup", "geoip_test"),
@@ -61567,21 +61627,28 @@ proc ::mw_explicit_fonts {top names} {
 
     def clear_history(self, parent=None):
         if self.history is None:
-            if os.path.exists(PATHS.history_db) and messagebox.askyesno(
-                    "Clear history", "History is off, but an old history "
-                    "file exists. Delete it?", parent=parent or self.root):
+            if (os.path.exists(PATHS.history_db) or
+                    history_record_files()) and messagebox.askyesno(
+                    "Clear history", "History is off, but old history or "
+                    "saved sessions are still on this computer. Delete "
+                    "them?", parent=parent or self.root):
                 remove_history_copies(PATHS.history_db, live_too=True)
                 self._wipe_packets()
+                self._forget_records()
             return
         choice = messagebox.askyesnocancel(
-            "Clear history", "Yes = delete ALL stored history.\nNo = delete "
-            "only the selected device's history (Devices tab).",
+            "Clear history", "Yes = delete ALL stored history: the "
+            "history, saved packets, the last autosave, crash copies, your "
+            "device names and notes, remembered networks and the list of "
+            "programs that wait for connections.\nNo = delete only the "
+            "selected device's history (Devices tab).",
             parent=parent or self.root)
         if choice is None:
             return
         if choice:
             self.history.clear()
             self._wipe_packets()
+            self._forget_records()
             self._set_banner("\U0001F5D1  History cleared.")
         else:
             keys = self.tabs["devices"].selected_keys()
@@ -61593,6 +61660,28 @@ proc ::mw_explicit_fonts {top names} {
             for k in keys:
                 self.history.clear(k)
             self._set_banner("\U0001F5D1  That device's history was deleted.")
+
+    def _forget_records(self):
+        """Second audit (privacy #7): "Delete ALL history" also deletes the
+        other records of what was seen: the autosave, the crash journals,
+        your device names and notes, the remembered networks and the
+        programs that waited for connections (history_record_files). Only
+        the history database and the saved packets went before."""
+        self.known.data = {}
+        self.networks.data = {"networks": {}}
+        self.network_profile = None
+        lw = getattr(self, "listen_watch", None)
+        if lw is not None:
+            lw.known, lw.learning = {}, True
+        self._journal_written = False
+        self._journal_count = -1
+        gone = 0
+        for path in history_record_files():
+            with contextlib.suppress(OSError):
+                os.remove(path)
+                gone += 1
+        LOG.info("delete all history: %d other files removed", gone)
+        return gone
 
     def reset_baselines(self, parent=None):
         if messagebox.askyesno("Reset learned baselines",
@@ -61608,6 +61697,20 @@ proc ::mw_explicit_fonts {top names} {
 
     def _session_only_history(self):
         return self.config.get("history.retention") == "Session only"
+
+    def _exit_autosave(self):
+        """On a clean exit. Second audit (privacy #8): the session is kept
+        (the "Open last autosave" copy) only while history is on and kept
+        for longer than the session. With history off (the default) it
+        used to be written on every exit, though TRUST.md says history is
+        off. -> the autosave's path or None."""
+        if self._session_only_history():
+            self._forget_session_history()
+            return None
+        if self.history is None:
+            LOG.info("history is off: the session is not kept on exit")
+            return None
+        return self.autosave("exit")
 
     def _forget_session_history(self):
         """5.3.4 (CO-10): "Session only keeps nothing after you close".
@@ -61801,9 +61904,12 @@ proc ::mw_explicit_fonts {top names} {
 
     def _geoip_retry(self):
         n = self.geoip.retry_failed()
-        for ip, rec in self.model.remote_hosts.items():
-            if not rec.country:
-                self.geoip.request(ip)
+        # second audit (privacy #11): only live addresses, as everywhere
+        # else (an opened capture file's addresses were sent)
+        if self.data_mode == "live":
+            for ip, rec in self.model.remote_hosts.items():
+                if not rec.country:
+                    self.geoip.request(ip)
         self._set_banner(f"\U0001F30D  Retrying country lookups ({n} that had "
                          f"failed).")
 
@@ -62092,10 +62198,7 @@ proc ::mw_explicit_fonts {top names} {
                     self.model.flows.closed_log.append(f)
                 self._pump_store(reschedule=False)
             self._save_raw_packets_on_exit()
-            if not self._session_only_history():
-                self.autosave("exit")
-            else:
-                self._forget_session_history()
+            self._exit_autosave()
             with contextlib.suppress(OSError):
                 # 5.3.4 (OS-07): only this copy's own journal; a second
                 # copy running in the same folder keeps its crash copy
@@ -97582,6 +97685,204 @@ def t_a2_copied_rows_cannot_start_a_formula(ctx):
         "rows": [["@SUM(1)", 5], ["example.com", -3]]}})
     text = Charts.chart_text(canvas)
     assert "'@SUM(1)\t5" in text and "example.com\t-3" in text, text
+
+
+@gui_test_step("second audit privacy #7: Delete ALL history also deletes the "
+               "autosave, crash journals, device names, networks and "
+               "listening programs")
+def gt_a2_delete_all_history_leaves_nothing(app, ctx):
+    root = app.root
+    planted = [PATHS.autosave, PATHS.journal, PATHS.journal + ".sha256",
+               os.path.join(PATHS.sessions, "journal-interrupted-20261114-"
+                            "101010-1.mwsession.json"),
+               PATHS.known_devices, PATHS.known_devices + ".bak",
+               PATHS.networks, os.path.join(PATHS.data, "listening.json")]
+    for p in planted:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"seen": "192.168.1.77 example.com"}')
+    keep = (app.known.data, app.networks.data, app.network_profile,
+            app.history)
+    asked = []
+    real = (messagebox.askyesno, messagebox.askyesnocancel)
+    messagebox.askyesno = lambda *a, **k: asked.append(a) or True
+    messagebox.askyesnocancel = lambda *a, **k: asked.append(a) or True
+    try:
+        app.history = None                       # history off (default)
+        app.clear_history()
+        _gui_pump(root, 0.1)
+        assert len(asked) == 1, asked
+        left = [p for p in planted if os.path.exists(p)]
+        assert not left, left
+        assert not history_record_files(), history_record_files()
+        assert app.known.data == {} and \
+            app.networks.data == {"networks": {}}
+        # history on: the Yes of "delete ALL" deletes them too
+        for p in planted:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("{}")
+        cleared = []
+        app.history = types.SimpleNamespace(
+            clear=lambda *a: cleared.append(a))
+        asked.clear()
+        app.clear_history()
+        assert cleared == [()] and len(asked) == 1, (cleared, asked)
+        assert "device names" in asked[0][1], asked[0][1]
+        left = [p for p in planted if os.path.exists(p)]
+        assert not left, left
+    finally:
+        messagebox.askyesno, messagebox.askyesnocancel = real
+        (app.known.data, app.networks.data, app.network_profile,
+         app.history) = keep
+
+
+@gui_test_step("second audit privacy #8: with history off, closing keeps no "
+               "autosave of the session")
+def gt_a2_history_off_keeps_no_autosave(app, ctx):
+    keep = (app.data_mode, app.history)
+    with contextlib.suppress(OSError):
+        os.remove(PATHS.autosave)
+    try:
+        assert app.model.has_data(), "the scenario should be loaded"
+        app.data_mode = "idle"                   # stopped watching live
+        app.history = None
+        assert app.config.get("history.retention") != "Session only"
+        assert app._exit_autosave() is None
+        assert not os.path.exists(PATHS.autosave), \
+            "history is off, but the session was kept"
+        # history on (30 days): the session is kept for "Open last autosave"
+        app.history = types.SimpleNamespace()
+        assert app._exit_autosave() == PATHS.autosave
+        assert os.path.exists(PATHS.autosave)
+    finally:
+        app.data_mode, app.history = keep
+        with contextlib.suppress(OSError):
+            os.remove(PATHS.autosave)
+
+
+@self_test()
+def t_a2_redirects_go_through_the_gate(ctx):
+    """Second audit (privacy #11): a redirect of any download is listed in
+    the ledger under the request's feature and stopped by the kill switch
+    (only the update check looked at redirects, and the ledger named only
+    the first host); https is never redirected to plain http."""
+    import http.server
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/a":
+                self.send_response(302)
+                self.send_header("Location", f"http://localhost:{port}/b")
+                self.end_headers()
+                return
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    killed = LEDGER.killed
+    try:
+        LEDGER.killed = False
+        n = len(LEDGER.snapshot("diagnostics"))
+        with net_urlopen("diagnostics", f"http://127.0.0.1:{port}/a",
+                         10) as r:
+            assert r.read() == b"ok"
+        new = LEDGER.snapshot("diagnostics")[n:]
+        assert [e["dest"] for e in new] == ["127.0.0.1", "localhost"], new
+        assert "redirected from 127.0.0.1" in new[1]["detail"], new
+        # the kill switch stops the hop (here: switched on in between)
+        real = globals()["outbound"]
+
+        def kill_after_first(*a, **k):
+            r_ = real(*a, **k)
+            LEDGER.killed = True
+            return r_
+        globals()["outbound"] = kill_after_first
+        try:
+            net_urlopen("diagnostics", f"http://127.0.0.1:{port}/a", 10)
+            raise AssertionError("the redirect was followed")
+        except OutboundBlocked:
+            pass
+        finally:
+            globals()["outbound"] = real
+    finally:
+        LEDGER.killed = killed
+        srv.shutdown()
+        srv.server_close()
+    try:
+        gate_redirect("https://a.example/x", "http://b.example/y",
+                      "reference")
+        raise AssertionError("https was redirected to http")
+    except urllib.error.URLError as e:
+        assert "https" in str(e), e
+
+
+@self_test()
+def t_a2_country_lookup_https_and_live_only(ctx):
+    """Second audit (privacy #11): every country-lookup service is asked
+    over https (ip-api.com's plain http sent addresses in clear text), and
+    "Retry" asks only for addresses seen live, never an opened file's."""
+    assert GEOIP_PROVIDERS and all(
+        url.startswith("https://") for _n, url, _p in GEOIP_PROVIDERS), \
+        GEOIP_PROVIDERS
+    asked = []
+    stub = types.SimpleNamespace(
+        geoip=types.SimpleNamespace(retry_failed=lambda: 1,
+                                    request=asked.append),
+        model=types.SimpleNamespace(remote_hosts={
+            "93.184.215.14": types.SimpleNamespace(country="")}),
+        data_mode="offline", _set_banner=lambda *a, **k: None)
+    MiniWireshark._geoip_retry(stub)
+    assert not asked, asked
+    stub.data_mode = "live"
+    MiniWireshark._geoip_retry(stub)
+    assert asked == ["93.184.215.14"], asked
+
+
+@self_test(needs_source=True)
+def t_a2_trust_page_matches_the_code(ctx):
+    """Second audit (privacy #8, #9, #11): docs/TRUST.md says what the
+    code does: health checks run on their own every interval on a
+    trusted network, to the default test address; reference lists come
+    only when asked (Manual) unless Weekly is chosen; country lookups name
+    the services in use; the history section says what is kept on exit."""
+    path = os.path.join(SCRIPT_DIR, "docs", "TRUST.md")
+    if not os.path.exists(path):
+        return "skip"                  # a release file without the docs
+    with open(path, encoding="utf-8") as f:
+        doc = f.read()
+
+    def row(name):
+        return next(ln for ln in doc.splitlines()
+                    if ln.startswith(f"| {name} |"))
+    flat = config_defaults_flat()
+    health = row("Health checks")
+    assert "When you open Health" not in health, health
+    assert f"Every {flat['health.interval_seconds']} seconds" in health, \
+        health
+    assert flat["health.internet_target"].rpartition(":")[0] in health
+    assert "network you marked as yours" in health, health
+    ref = row("Reference lists")
+    assert "once a month" not in ref and \
+        f"*{flat['components.policy']}*" in ref, ref
+    for res in DATA_MANIFEST:
+        host = urllib.parse.urlsplit(res.url).hostname
+        assert host.replace("www.", "") in ref, (host, ref)
+    geo = row("Country lookup")
+    for _n, url, _p in GEOIP_PROVIDERS:
+        assert urllib.parse.urlsplit(url).hostname in geo, (url, geo)
+    assert "live" in geo, geo
+    assert flat["history.enabled"] is False and \
+        "History is **off** by default" in doc
+    assert "no saved session" in doc and "Open last autosave" in doc
+    assert "Clear history" in doc and "remembered networks" in doc
 
 
 # ============================================================================

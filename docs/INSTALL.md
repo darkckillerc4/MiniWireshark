@@ -82,7 +82,7 @@ Settings are saved in `miniwireshark_config.json`. Two environment variables mov
 MINIWIRESHARK_DATA=/tmp/mw-data MINIWIRESHARK_CONFIG=/tmp/mw-config.json python miniwireshark.py
 ```
 
-The data folder holds logs, saved sessions and the autosave, the optional history database, the private packages and boot receipts. **Storage used…** in the command palette (`Ctrl+K`) shows how much each part uses.
+The data folder holds logs, saved sessions and the autosave (kept only while history is on), the optional history database, the private packages and boot receipts. **Storage used…** in the command palette (`Ctrl+K`) shows how much each part uses.
 
 ## Updating
 
