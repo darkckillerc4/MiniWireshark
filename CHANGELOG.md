@@ -137,6 +137,8 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **Some unusual packets are still slower to analyse:** traffic on port 53 that isn't DNS takes about 77 microseconds a packet instead of 3, and its row can read like a DNS answer. Tunnels (IP inside IP) are still handed to the slower decoder: up to about 3 ms for a full-size packet.
 - **Local services opens web apps with `http://`,** except on ports 443 and 8443; a development server on another port that only speaks HTTPS shows a browser error, and you need to type `https://` yourself. The release gate's screenshots don't include the Local services view.
 - **An upgrade from 5.3.3 or older turns the daily update check on, even if it was off.** 5.3.3 stored "off" for everyone, so a real choice can't be told from that. A one-time notice says how to turn it off again (Settings → Updates & Dependencies).
+- **On Windows, the saved compiled copy is trusted by its folder only.** It is used only from under your own LOCALAPPDATA folder and must carry this install's signature (HMAC), but the key file's owner and permissions are not checked there as they are on Linux and macOS.
+- **A rollback can bring back an older genuine version.** When an update fails to start three times, the version it replaced comes back, even if the update fixed a security problem in it. Download the newer version again from the releases page.
 
 **Not in this release**
 
