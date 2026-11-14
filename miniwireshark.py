@@ -23437,9 +23437,6 @@ class NetworkModel:
         self.health = {}
         self.health_history = deque(maxlen=120)
         self.capture_started = 0.0
-        # second audit (#40): an opened file's first seconds are its
-        # discovery time (its devices were there before it began)
-        self.discovery_from_first_packet = False
         self.epochs = []    # [start, end|None, why started, why ended]
         self.announce_new = True
         self.demo = False
@@ -24226,9 +24223,6 @@ class NetworkModel:
         ts = d["time"]
         if self.use_packet_clock and ts > self.offline_now:
             self.offline_now = ts
-        if self.discovery_from_first_packet:
-            self.discovery_from_first_packet = False
-            self.capture_started = ts
         self.count += 1
         self._pkt_no = d.get("no")
         self.vantage.note(d, self.my_macs, self.my_ips)
@@ -60744,7 +60738,6 @@ proc ::mw_explicit_fonts {top names} {
         m = self._new_model(offline=True, identity=("", set(), set()))
         m.announce_new = True
         m.capture_started = 0
-        m.discovery_from_first_packet = True     # second audit (#40)
         self.replace_model(m)
         self.data_mode = "offline"
         self.data_label = os.path.basename(path)
@@ -75598,8 +75591,7 @@ def t_a2_alert_text_translated(ctx):
     hold (what it means, innocent explanations, why it was flagged), and
     the "what we saw" sentences of the common alerts; the alert table's
     title too. A new device's alert no longer says "low-confidence"
-    under a High confidence. An opened file's devices that were there
-    from its start (the router too) don't each "join your network"."""
+    under a High confidence."""
     import ast
     with open(SCRIPT_PATH, encoding="utf-8") as f:
         tree = ast.parse(f.read())
@@ -75649,21 +75641,6 @@ def t_a2_alert_text_translated(ctx):
             [a.reason for a in made if translate_event(a.reason) == a.reason]
     finally:
         set_locale(old)
-    # an opened file: the devices there from its first seconds are no news
-    gw, ips, macs, nets = scenario_identity()
-    m = NetworkModel(ctx.cfg({}), "", set(), set())
-    m.use_packet_clock = True
-    m.capture_started = 0
-    m.discovery_from_first_packet = True
-    sb = ScenarioBuilder()
-    sb.home_network()
-    sb.t += 60
-    sb.arp_announce(("192.168.1.77", "3c:22:fb:77:00:77"))
-    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
-    joined = sorted(a.device_key for a in a2_kinds(m, "new_device"))
-    assert "3c:22:fb:77:00:77" in joined, joined
-    assert not {sb.GW[1], sb.ME[1], sb.PHONE[1], sb.TV[1]} & set(joined), \
-        joined
 
 
 @self_test()

@@ -129,7 +129,6 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - The Story no longer says the router "changed its address 24 times" when it simply answers for two addresses, back and forth.
 - French and Spanish: an alert's whole text is translated, not only its title: what was seen, what it usually means, the innocent explanations and why it was flagged.
 - A new device's alert no longer says "low-confidence" under a High confidence: it says how sure MiniWireshark is of what the device is.
-- Opening a capture file no longer says that every device in it, the router included, "joined your network"; only devices that appear after the file's first seconds do.
 
 **Known limits**
 
