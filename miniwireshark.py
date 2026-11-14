@@ -42717,9 +42717,10 @@ class HealthTab(BaseTab):
         self.fold_btn.pack(side="right")
         self._fold_sig = None
         self.note_var = DisplayVar()
-        tk.Label(outer, textvariable=self.note_var, bg=WHITE, fg="#666666",
-                 justify="left", anchor="w", wraplength=1100).pack(
-            fill="x", pady=(2, 8))
+        self.note_lbl = tk.Label(outer, textvariable=self.note_var, bg=WHITE,
+                                 fg="#666666", justify="left", anchor="w",
+                                 wraplength=1100)
+        self.note_lbl.pack(fill="x", pady=(2, 8))
         body = tk.Frame(outer, bg=WHITE)
         body.pack(fill="both", expand=True)
         # the right-hand panel keeps its width and scrolls on a short
@@ -43005,7 +43006,15 @@ class HealthTab(BaseTab):
             with contextlib.suppress(tk.TclError):
                 st.configure(text=label, fg=self.t[tok])
                 ex.configure(text=text)
-        self.note_var.set(app.health_note())
+        note = app.health_note()
+        if note != getattr(self, "_note_was", None):
+            self._note_was = note
+            self.note_var.set(note)
+            # a new text at the same width brings no <Configure>: wrap it
+            # now (a longer French note was cut at 1326 pixels)
+            with contextlib.suppress(tk.TclError):
+                self.note_lbl.update_idletasks()
+                _autowrap(_WrapEvent(self.note_lbl))
         self.info_var.set(app.connection_info_text())
         self.show_calls()
         why = app.health_checks_blocked()
