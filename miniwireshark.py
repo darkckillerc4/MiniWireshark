@@ -9786,7 +9786,8 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
         load = _l4_payload(pkt, u)
         if u.len and int(u.len) >= 8:
             load = load[:int(u.len) - 8]
-            d["payload_len"] = int(u.len) - 8
+            d["payload_len"] = _udp_payload_len(
+                int(u.len), _udp_ip_room(u), len(load))
         else:
             d["payload_len"] = len(load)
         dns_layer = pkt[DNS] if pkt.haslayer(DNS) else None
@@ -9904,6 +9905,40 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
     return d
 
 
+def _udp_payload_len(ulen, room, have):
+    """The size of a UDP message: its own length field, but never more
+    than the IP header says follows the UDP header (`room`, None when the
+    IP header doesn't say) or, when the IP header can't be trusted either,
+    than the bytes there are (`have`). Audit 2026-11-14 #48: a 10-byte
+    datagram claiming 65535 showed "Quick message (65527 bytes)" and fed
+    that size to the QUIC check. A capture cut short (a snap length) keeps
+    the size the headers agree on."""
+    n = ulen - 8
+    if room is not None and 8 <= room < ulen:
+        n = room - 8
+    elif room is not None and room < 8:
+        n = min(n, have)
+    return max(0, n)
+
+
+def _udp_ip_room(u):
+    """Bytes from the start of scapy UDP layer `u` to the end its IP
+    header claims, or None when it can't be told."""
+    skip, ly = 0, u.underlayer
+    while ly is not None and type(ly).__name__.startswith("IPv6ExtHdr"):
+        skip += 8 if type(ly).__name__ == "IPv6ExtHdrFragment" else \
+            (int(getattr(ly, "len", 0) or 0) + 1) * 8
+        ly = ly.underlayer
+    try:
+        if ly is not None and type(ly).__name__ == "IP" and ly.len:
+            return int(ly.len) - int(ly.ihl or 5) * 4 - skip
+        if ly is not None and type(ly).__name__ == "IPv6" and ly.plen:
+            return int(ly.plen) - skip
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def _ip_proto_name(ipl):
     """'ESP', 'GRE'… for the IP protocol (after any IPv6 extension
     headers), as the fast decoder names it; whatever scapy dissected the
@@ -9914,9 +9949,18 @@ def _ip_proto_name(ipl):
     if nh is None:
         nh = _ipv6_upper(ipl)[0]
     try:
-        return _IPPROTO_NAMES.get(int(nh))
+        return _ip_proto_label(int(nh), 4 if hasattr(ipl, "proto") else 6)
     except (TypeError, ValueError):
         return None
+
+
+def _ip_proto_label(proto, ipver):
+    """The name of IP protocol `proto` carried in IP version `ipver`:
+    a tunnel says what is inside what (audit 2026-11-14 #48: IPv6 inside
+    IPv6 was called "IPv6-in-IPv4")."""
+    if ipver == 6 and proto in (4, 41):
+        return "IPv4-in-IPv6" if proto == 4 else "IPv6-in-IPv6"
+    return _IPPROTO_NAMES.get(proto)
 
 
 def _ipv6_upper(ipl):
@@ -11114,6 +11158,7 @@ def fast_decode(raw, ts, lt=1, reasm=None, gateway_ip="", my_ips=()):
     try:
         d = decode_packet(pkt, gateway_ip, my_ips, reasm)
     except Exception as e:                           # noqa: BLE001
+        log_decode_error("packet decoder", e)
         d = _fast_new(raw, ts, lt)
         d["text"] = f"Undecodable frame ({type(e).__name__})"
         d["pkt"] = pkt
@@ -11122,6 +11167,26 @@ def fast_decode(raw, ts, lt=1, reasm=None, gateway_ip="", my_ips=()):
     d["raw"] = raw
     d["linktype"] = lt
     return d
+
+
+_DECODE_ERRORS_LOGGED = set()
+
+
+def log_decode_error(where, e):
+    """A packet that broke a decoder: the first of each kind (where and
+    exception type, at most 50 kinds) goes in the log as a WARNING with
+    its traceback, so a bug can be found from a debug bundle; the rest at
+    DEBUG, so a stream of damaged packets can't fill the log. Audit
+    2026-11-14 #49: they were logged only at DEBUG, or not at all."""
+    key = (where, type(e).__name__)
+    if key not in _DECODE_ERRORS_LOGGED and len(_DECODE_ERRORS_LOGGED) < 50:
+        _DECODE_ERRORS_LOGGED.add(key)
+        LOG.warning("%s failed on a packet: %s: %s (the first of its kind; "
+                    "later ones are only counted)", where, type(e).__name__,
+                    e, exc_info=(type(e), e, e.__traceback__))
+    else:
+        LOG.debug("%s failed on a packet: %s: %s", where,
+                  type(e).__name__, e)
 
 
 def _row_from_dissection(raw, ts, lt):
@@ -11165,13 +11230,14 @@ def _fast_decode(raw, ts, lt, reasm):
             d["multicast"] = True
         et = _U16.unpack_from(raw, 12)[0]
         off = 14
-        vlans = 0
-        while et in (0x8100, 0x88a8) and vlans < 2:   # (scapy: not 0x9100)
+        # every stacked tag, however many (audit 2026-11-14 #47: from the
+        # third on they went to scapy, a few ms each and, past about 370
+        # tags, a "Raw frame"); 4 bytes each, so the frame bounds it
+        while et in (0x8100, 0x88a8):                 # (scapy: not 0x9100)
             if n < off + 4:
                 raise NeedDeepParse("vlan")
             et = _U16.unpack_from(raw, off + 2)[0]
             off += 4
-            vlans += 1
         if et < 0x0600:
             if raw[14:22] == CDP_SNAP:
                 info = parse_cdp(raw[22:])
@@ -11272,7 +11338,8 @@ def _fast_ipv4(d, raw, off, reasm):
         raise NeedDeepParse("fragment")
     end = off + total if ihl <= total and off + total <= n else n
     l4 = off + ihl
-    return _fast_l4(d, raw, proto, l4, end, reasm, 4)
+    return _fast_l4(d, raw, proto, l4, end, reasm, 4,
+                    off + total if total else None)
 
 
 def _fast_ipv6(d, raw, off, reasm):
@@ -11290,23 +11357,27 @@ def _fast_ipv6(d, raw, off, reasm):
         d["multicast"] = True
     end = off + 40 + plen if off + 40 + plen <= n else n
     p = off + 40
-    hops = 0
-    while nh in (0, 43, 60) and hops < 6:
+    # every hop-by-hop, routing and destination-options header (audit
+    # 2026-11-14 #47: after 6 the frame went to scapy, 45-184 ms for 180
+    # of them in one 1504-byte frame); at least 8 bytes each, so the
+    # frame bounds the walk
+    while nh in (0, 43, 60):
         if p + 2 > end:
             raise NeedDeepParse("short extension header")
         nh, hl = raw[p], (raw[p + 1] + 1) * 8
         p += hl
-        hops += 1
     if nh == 44:
         raise NeedDeepParse("ipv6 fragment")
-    return _fast_l4(d, raw, nh, p, end, reasm, 6)
+    return _fast_l4(d, raw, nh, p, end, reasm, 6,
+                    off + 40 + plen if plen else None)
 
 
-def _fast_l4(d, raw, proto, p, end, reasm, ipver):
+def _fast_l4(d, raw, proto, p, end, reasm, ipver, ip_end=None):
     if proto == 6:
         return _fast_tcp(d, raw, p, end, reasm)
     if proto == 17:
-        return _fast_udp(d, raw, p, end, reasm)
+        return _fast_udp(d, raw, p, end, reasm,
+                         None if ip_end is None else ip_end - p)
     if proto == 1 and ipver == 4:
         # (scapy leaves a timestamp/address-mask message cut short as Raw)
         if end - p < 8 or \
@@ -11323,7 +11394,7 @@ def _fast_l4(d, raw, proto, p, end, reasm, ipver):
         d.update({"proto": "IGMP", "tag": "IGMP", "transport": "IGMP",
                   "text": "Joining/leaving a multicast group (IGMP)"})
         return _fast_done(d)
-    name = _IPPROTO_NAMES.get(proto)
+    name = _ip_proto_label(proto, ipver)
     if name is None or proto in (4, 41, 47):
         # tunnels: scapy decodes the inner packet
         raise NeedDeepParse(f"ip proto {proto}")
@@ -11456,7 +11527,7 @@ def _rtc_wanted(load):
         FEATURES.get("call_quality", True)
 
 
-def _fast_udp(d, raw, p, end, reasm=None):
+def _fast_udp(d, raw, p, end, reasm=None, room=None):
     if end - p < 8:
         raise NeedDeepParse("short udp")
     sport, dport, ulen = struct.unpack_from(">HHH", raw, p)
@@ -11466,7 +11537,7 @@ def _fast_udp(d, raw, p, end, reasm=None):
     if ulen < 8:
         raise NeedDeepParse("bad udp length")    # scapy's own reading
     load = bytes(raw[p + 8:end][:ulen - 8])
-    d["payload_len"] = ulen - 8
+    d["payload_len"] = _udp_payload_len(ulen, room, len(load))
     if (53 in ports or 5353 in ports or 5355 in ports) and len(load) >= 12:
         name = "mDNS" if 5353 in ports else "LLMNR" if 5355 in ports \
             else "DNS"
@@ -13582,7 +13653,7 @@ class AnalysisWorker(threading.Thread):
                 self.errors += 1
                 if self.errors <= 20:
                     self.last_error = f"{type(e).__name__}: {e}"
-                    LOG.debug("decode error: %s", self.last_error)
+                log_decode_error("packet analysis", e)
                 continue
             if d.get("pkt") is not None:
                 self.deep += 1
@@ -13842,6 +13913,12 @@ def probe_capture_sources(candidates, bpf, promisc, sink,
 # ---- capture files (stdlib reader for pcap and pcapng) ----------------------
 PCAP_ENDED_EARLY = "The file ended early, so not all of it could be read."
 PCAP_NO_PACKETS = "The file had no packets in it."
+PCAP_NO_IFACE = ("Some packets named a network card the file doesn't "
+                 "describe, so they were left out.")
+# the largest packet record read: as for a pcapng block (audit 2026-11-14
+# #42: a classic .pcap record over 1 MiB stopped the import with "the file
+# ended early", dropping every packet after it)
+PCAP_MAX_RECORD = 64 * 1024 * 1024
 
 
 def iter_raw_capture(path, notes=None):
@@ -13868,15 +13945,29 @@ def iter_raw_capture(path, notes=None):
             raise ValueError("truncated pcap header")
         _vmaj, _vmin, _tz, _sig, _snap, lt = struct.unpack(end + "HHiIII",
                                                            rest)
-        lt &= 0x0FFFFFFF
+        # the link type is the low 16 bits; the rest says whether frames
+        # carry their checksum (FCS) (audit 2026-11-14 #44: 0x0FFFFFFF
+        # kept the "FCS present" bit, so Ethernet went undecoded)
+        lt &= 0xFFFF
         rec = struct.Struct(end + "IIII")
         last_ts = 0.0
+        size = None
         while True:
             h = f.read(16)
             data, incl = b"", 1
             if len(h) == 16:
                 sec, frac, incl, _orig = rec.unpack(h)
-                data = f.read(incl) if incl <= 262144 * 4 else b""
+                if incl > PCAP_MAX_RECORD:
+                    if size is None:
+                        size = os.fstat(f.fileno()).st_size
+                    if size - f.tell() >= incl:
+                        # the bytes are there: a damaged record, not a
+                        # short file (as a pcapng block says)
+                        raise ValueError(
+                            f"a packet record claims {incl} bytes, more "
+                            "than any real packet")
+                else:
+                    data = f.read(incl)
             if len(h) < 16 or len(data) < incl:
                 if h and notes is not None:
                     notes.append(PCAP_ENDED_EARLY)
@@ -13890,6 +13981,11 @@ def _iter_pcapng(f, first, notes=None):
     def cut():
         if notes is not None:
             notes.append(PCAP_ENDED_EARLY)
+
+    def no_iface():
+        # audit 2026-11-14 #44: such a packet was decoded as Ethernet
+        if notes is not None and PCAP_NO_IFACE not in notes:
+            notes.append(PCAP_NO_IFACE)
     end = "<"
     ifaces = []                   # (linktype, ts_scale)
     last_ts = 0.0
@@ -13923,6 +14019,8 @@ def _iter_pcapng(f, first, notes=None):
             if len(body) < blen - 12:
                 cut()
                 return
+            if body[-4:] != lenb:
+                raise ValueError("corrupt pcapng section header")
             ifaces = []
             block_type = None
             continue
@@ -13934,6 +14032,9 @@ def _iter_pcapng(f, first, notes=None):
         if len(body) < blen - 8:
             cut()
             return
+        # audit 2026-11-14 #44: the length is written at both ends
+        if body[-4:] != lenb:
+            raise ValueError("corrupt pcapng block")
         body = body[:-4]
         block_type = None
         if btype == 1 and len(body) >= 8:              # interface description
@@ -13954,18 +14055,33 @@ def _iter_pcapng(f, first, notes=None):
         elif btype == 6 and len(body) >= 20:           # enhanced packet
             iid, hi, lo, cap, _orig = struct.unpack_from(end + "IIIII", body,
                                                          0)
-            lt, scale = ifaces[iid] if iid < len(ifaces) else (1, 1e-6)
+            # audit 2026-11-14 #44: more packet than the block holds would
+            # take its padding and options as packet bytes
+            if 20 + cap > len(body):
+                raise ValueError("corrupt pcapng packet block")
+            if iid >= len(ifaces):
+                no_iface()
+                continue
+            lt, scale = ifaces[iid]
             ts = _sane_ts(((hi << 32) | lo) * scale, last_ts)
             last_ts = ts
             yield bytes(body[20:20 + cap]), ts, lt
         elif btype == 3 and len(body) >= 4:            # simple packet
-            lt, _s = ifaces[0] if ifaces else (1, 1e-6)
+            if not ifaces:
+                no_iface()
+                continue
+            lt, _s = ifaces[0]
             orig = struct.unpack_from(end + "I", body, 0)[0]
             yield bytes(body[4:4 + orig]), last_ts, lt
         elif btype == 2 and len(body) >= 20:           # obsolete packet
             iid = struct.unpack_from(end + "H", body, 0)[0]
             hi, lo, cap = struct.unpack_from(end + "III", body, 4)
-            lt, scale = ifaces[iid] if iid < len(ifaces) else (1, 1e-6)
+            if 20 + cap > len(body):
+                raise ValueError("corrupt pcapng packet block")
+            if iid >= len(ifaces):
+                no_iface()
+                continue
+            lt, scale = ifaces[iid]
             ts = _sane_ts(((hi << 32) | lo) * scale, last_ts)
             last_ts = ts
             yield bytes(body[20:20 + cap]), ts, lt
@@ -28743,6 +28859,14 @@ it carries your default Internet route ¦ elle porte votre route Internet par d�
 your router is on the same network ¦ votre box est sur le même réseau ¦ su router está en la misma red
 The file ended early, so not all of it could be read. ¦ Le fichier s'arrête trop tôt : il n'a pas pu être lu en entier. ¦ El archivo termina antes de tiempo: no se pudo leer entero.
 The file had no packets in it. ¦ Le fichier ne contenait aucun paquet. ¦ El archivo no contenía ningún paquete.
+Some packets named a network card the file doesn't describe, so they were left out. ¦ Certains paquets citent une carte réseau que le fichier ne décrit pas : ils ont été laissés de côté. ¦ Algunos paquetes nombran una tarjeta de red que el archivo no describe, así que se dejaron fuera.
+(stopped early) ¦ (arrêtée avant la fin) ¦ (detenida antes del final)
+file is empty ¦ le fichier est vide ¦ el archivo está vacío
+not a pcap/pcapng file ¦ ce n'est pas un fichier pcap/pcapng ¦ no es un archivo pcap/pcapng
+truncated pcap header ¦ en-tête pcap coupé ¦ cabecera pcap cortada
+corrupt pcapng section header ¦ en-tête de section pcapng endommagé ¦ cabecera de sección pcapng dañada
+corrupt pcapng block ¦ bloc pcapng endommagé ¦ bloque pcapng dañado
+corrupt pcapng packet block ¦ bloc de paquet pcapng endommagé ¦ bloque de paquete pcapng dañado
 Windows' own routing sends your Internet traffic through it ¦ le routage de Windows lui-même y fait passer votre trafic Internet ¦ el propio enrutamiento de Windows envía por ella su tráfico de Internet
 your Internet route goes through a VPN; the physical card shows the local network ¦ votre route Internet passe par un VPN ; la carte physique montre le réseau local ¦ su ruta a Internet pasa por una VPN; la tarjeta física muestra la red local
 Pick another card in the list, or click “Refresh”. ¦ Choisissez une autre carte dans la liste, ou cliquez sur « Actualiser ». ¦ Elija otra tarjeta de la lista o pulse «Actualizar».
@@ -30554,24 +30678,35 @@ I18N_PATTERNS = [
      r"d'un fichier.   [\1]",
      r"📂  CAPTURA SIN CONEXIÓN — no es en directo. Está viendo paquetes de "
      r"un archivo.   [\1]"),
-    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets? from (.+?)"
+    # (audit 2026-11-14 #43: the count in its own singular or plural,
+    # and "(stopped early)" translated instead of dropped)
+    (r"📂  OFFLINE CAPTURE — finished reading (\d+ packets?) from (.+?)"
      r"( \(stopped early\))?\. Router identified from the capture "
      r"\(likely\): (\S+)\. Nothing here is live\.( .+)?",
-     r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Box "
+     r"📂  CAPTURE HORS LIGNE — lecture terminée : {t1} de \2{t3}. Box "
      r"identifiée dans la capture (probable) : \4. Rien n'est en "
      r"direct.{t5}",
-     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
+     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: {t1} de \2{t3}. "
      r"Router identificado en la captura (probable): \4. Nada es en "
      r"directo.{t5}"),
-    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets? from (.+?)"
+    (r"📂  OFFLINE CAPTURE — finished reading (\d+ packets?) from (.+?)"
      r"( \(stopped early\))?\.\s+Nothing here is live\.( .+)?",
-     r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Rien "
+     r"📂  CAPTURE HORS LIGNE — lecture terminée : {t1} de \2{t3}. Rien "
      r"n'est en direct.{t4}",
-     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
+     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: {t1} de \2{t3}. "
      r"Nada es en directo.{t4}"),
-    (r"📂 Offline capture: (.+) — (\d+) packets? \(not live\)",
-     r"📂 Capture hors ligne : \1 — \2 paquets (pas en direct)",
-     r"📂 Captura sin conexión: \1 — \2 paquetes (no en directo)"),
+    (r"📂 Offline capture: (.+) — (\d+ packets?) \(not live\)",
+     r"📂 Capture hors ligne : \1 — {t2} (pas en direct)",
+     r"📂 Captura sin conexión: \1 — {t2} (no en directo)"),
+    (r"Stopped reading the file: (.+?)\. The file may be damaged, or it "
+     r"isn't a pcap/pcapng capture\.",
+     r"Lecture du fichier arrêtée : {t1}. Le fichier est peut-être "
+     r"endommagé, ou ce n'est pas une capture pcap/pcapng.",
+     r"Se dejó de leer el archivo: {t1}. Puede que el archivo esté dañado "
+     r"o que no sea una captura pcap/pcapng."),
+    (r"a packet record claims (\d+) bytes, more than any real packet",
+     r"un paquet annonce \1 octets, plus que tout vrai paquet",
+     r"un paquete dice tener \1 bytes, más que cualquier paquete real"),
     (r"\(Not live\) (.+)", "(Pas en direct) {t1}", "(No en directo) {t1}"),
     (r"Imported capture\. Blind spots: (.+)\.  \(click for details\)",
      "Capture importée. Angles morts : {t1}.  (cliquez pour les détails)",
@@ -65746,7 +65881,9 @@ def _dissect_ipv4(d, off):
     tl = d.u16(off + 2)
     end = min(len(d.raw), off + tl) if tl >= hl else len(d.raw)
     d.node.length = end - off
-    d.add("ip.version", b0 >> 4, off, 1)
+    # audit 2026-11-14 #48: another version is said, not taken for IPv4
+    d.add("ip.version", b0 >> 4, off, 1,
+          warning="" if b0 >> 4 == 4 else "not 4: this isn't IPv4")
     d.add("ip.hdr_len", hl, off, 1, f"{hl} bytes",
           warning="" if hl >= 20 else "too short")
     d.add("ip.dsfield", d.u8(off + 1), off + 1, 1, f"0x{d.u8(off + 1):02x}")
@@ -65771,6 +65908,7 @@ def _dissect_ipv4(d, off):
     d.add("ip.checksum.status", "correct" if ok else "incorrect", off + 10, 2,
           warning="" if ok else "checksum does not match (normal for "
           "packets this computer sends when the card computes it)")
+    d.need(off + 12, 8)        # cut short: "truncated", not "malformed"
     d.add("ip.src", _socket.inet_ntoa(d.raw[off + 12:off + 16]), off + 12, 4)
     d.add("ip.dst", _socket.inet_ntoa(d.raw[off + 16:off + 20]), off + 16, 4)
     if hl > 20:
@@ -88252,6 +88390,253 @@ def t_534_court_pcap_ended_early(ctx):
     assert "lecture terminée" in fr and "trop tôt" in fr, fr
     es = translate_text(finished(0, ""), "es")
     assert "ningún paquete" in es, es
+
+
+@self_test()
+def t_a2_pcap_big_record_kept(ctx):
+    """Audit 2026-11-14 #42: a classic .pcap record over 1 MiB is read like
+    any other (the packets after it were dropped with a false "the file
+    ended early"); a record past the limit whose bytes are there is called
+    damaged, not short; one cut by the end of the file still ended early."""
+    frame = bytes(60)
+    big = bytes(14) + bytes(2 * 1024 * 1024)
+    p = ctx.path("a2-big.pcap")
+    _court_pcap(p, [(1700000000, frame), (1700000001, big),
+                    (1700000002, frame)])
+    notes = []
+    got = list(iter_raw_capture(p, notes))
+    assert [len(r) for r, _t, _l in got] == [60, len(big), 60], \
+        [len(r) for r, _t, _l in got]
+    assert notes == [], notes
+    done = []
+    imp = RawPcapImporter(p, lambda *a: True, lambda n: None,
+                          lambda *a: done.append(a))
+    imp.start()
+    imp.join(10)
+    assert done == [(3, None, False, "")], done
+    old = PCAP_MAX_RECORD
+    globals()["PCAP_MAX_RECORD"] = 1024
+    try:
+        notes = []
+        try:
+            list(iter_raw_capture(p, notes))
+            raise AssertionError("a damaged record was taken for the end")
+        except ValueError as e:
+            assert "claims" in str(e) and notes == [], (e, notes)
+        # the claim runs past the end of the file: it did end early
+        cut = ctx.path("a2-cut.pcap")
+        _court_pcap(cut, [(1700000000, frame)], struct.pack(
+            "<IIII", 1700000001, 0, 4096, 4096) + bytes(2000))
+        notes = []
+        assert len(list(iter_raw_capture(cut, notes))) == 1
+        assert notes == [PCAP_ENDED_EARLY], notes
+    finally:
+        globals()["PCAP_MAX_RECORD"] = old
+
+
+@self_test()
+def t_a2_capture_file_fields(ctx):
+    """Audit 2026-11-14 #44: the FCS bits of a .pcap link type are left
+    out (Ethernet stays Ethernet); a pcapng packet on an interface the
+    file never described is left out with a note, not read as Ethernet; a
+    packet longer than its block, or a block whose two lengths differ, is
+    damage."""
+    p = ctx.path("a2-fcs.pcap")
+    with open(p, "wb") as f:
+        f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 262144,
+                            0x04000001 | (4 << 28)))
+        f.write(struct.pack("<IIII", 1700000000, 0, 60, 60) + bytes(60))
+    got = list(iter_raw_capture(p))
+    assert [lt for _r, _t, lt in got] == [1], got
+
+    def blk(t, body, tail=None):
+        n = 12 + len(body)
+        return struct.pack("<II", t, n) + body + struct.pack(
+            "<I", n if tail is None else tail)
+    shb = blk(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    idb = blk(1, struct.pack("<HHI", 113, 0, 65535))     # Linux cooked
+
+    def epb(iid, cap=60, data=60):
+        return blk(6, struct.pack("<IIIII", iid, 0, 0, cap, cap) +
+                   bytes(data))
+    q = ctx.path("a2-iface.pcapng")
+    with open(q, "wb") as f:
+        f.write(shb + idb + epb(0) + epb(3) + epb(0))
+    notes = []
+    got = list(iter_raw_capture(q, notes))
+    assert [lt for _r, _t, lt in got] == [113, 113], got
+    assert notes == [PCAP_NO_IFACE], notes
+    for name, bad in (("cap", epb(0, cap=5000)),
+                      ("tail", blk(6, struct.pack("<IIIII", 0, 0, 0, 60, 60)
+                                   + bytes(60), tail=999))):
+        with open(q, "wb") as f:
+            f.write(shb + idb + epb(0) + bad)
+        out = []
+        try:
+            for x in iter_raw_capture(q):
+                out.append(x)
+            raise AssertionError(f"{name}: damage not seen")
+        except ValueError:
+            assert len(out) == 1, (name, len(out))
+
+
+@self_test()
+def t_a2_import_banner_translated(ctx):
+    """Audit 2026-11-14 #43: the import banners in French and Spanish keep
+    "(stopped early)", say "1 paquet"/"1 paquete", and the error banner is
+    translated too."""
+    s = ("📂  OFFLINE CAPTURE — finished reading 1 packet from x.pcap "
+         "(stopped early).  Nothing here is live.")
+    fr, es = translate_text(s, "fr"), translate_text(s, "es")
+    assert "1 paquet de x.pcap (arrêtée avant la fin)." in fr, fr
+    assert "1 paquete de x.pcap (detenida antes del final)." in es, es
+    s = s.replace("1 packet", "7 packets").replace(" (stopped early)", "")
+    assert "7 paquets de x.pcap. Rien" in translate_text(s, "fr")
+    st = "📂 Offline capture: x.pcap — 1 packet (not live)"
+    assert translate_text(st, "fr").endswith("1 paquet (pas en direct)")
+    assert translate_text(st, "es").endswith("1 paquete (no en directo)")
+    err = ("⚠️  Stopped reading the file: corrupt pcapng block. The file "
+           "may be damaged, or it isn't a pcap/pcapng capture.")
+    fr = translate_text(err, "fr")
+    assert fr.startswith("⚠️  Lecture du fichier arrêtée : bloc pcapng "
+                         "endommagé.") and "damaged" not in fr, fr
+    assert "dañado" in translate_text(err, "es")
+    assert translate_text(PCAP_NO_IFACE, "fr") != PCAP_NO_IFACE
+
+
+def _a2_destopts(n, l4, proto):
+    hdrs = b""
+    for i in range(n):
+        hdrs += bytes([60 if i < n - 1 else proto, 0]) + \
+            b"\x01\x04\x00\x00\x00\x00"
+    ip = struct.pack(">IHBB", 6 << 28, len(hdrs) + len(l4), 60, 64) + \
+        _socket.inet_pton(_socket.AF_INET6, "2001:db8::1") + \
+        _socket.inet_pton(_socket.AF_INET6, "2001:db8::2")
+    return bytes(6) + b"\x02\x00\x00\x00\x00\x01\x86\xdd" + ip + hdrs + l4
+
+
+@self_test()
+def t_a2_ipv6_many_extension_headers_fast(ctx):
+    """Audit 2026-11-14 #47: an IPv6 frame with 180 destination-options
+    headers (a normal 1514-byte frame) is read by the fast decoder, not
+    handed to scapy (45-184 ms each); so are 3 and more stacked VLAN tags;
+    where scapy reads them too, the two agree."""
+    syn = struct.pack(">HHIIBBHHH", 40000, 443, 1, 0, 0x50, 0x02, 64240,
+                      0, 0)
+    frames = [_a2_destopts(n, syn, 6) for n in (7, 180)]
+    assert len(frames[1]) == 1514, len(frames[1])
+    udp = struct.pack(">HHHH", 1, 9999, 8 + 20, 0) + bytes(20)
+    ip4 = struct.pack(">BBHHHBBH", 0x45, 0, 48, 0, 0, 64, 17, 0) + \
+        _socket.inet_aton("1.1.1.1") + _socket.inet_aton("2.2.2.2") + udp
+    for tags in (3, 40):
+        frames.append(bytes(6) + b"\x02\x00\x00\x00\x00\x01" + b"".join(
+            b"\x81\x00" + struct.pack(">H", i + 1) for i in range(tags)) +
+            b"\x08\x00" + ip4)
+    for raw in frames:
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
+        assert d["transport"] in ("TCP", "UDP"), d["text"]
+    worst = 0.0
+    for _ in range(5):
+        t0 = time.perf_counter()
+        d = fast_decode(frames[1], 1.0)
+        worst = max(worst, time.perf_counter() - t0)
+    assert d["text"] == "Secure web browsing (SYN)", d["text"]
+    assert worst < 0.005, f"{worst * 1000:.1f} ms for one frame"
+    if ctx.scapy_ok:
+        diffs = decoder_differences([(r, 1.0, 1) for r in frames[:3]])
+        assert not diffs, diffs[:3]
+
+
+@self_test()
+def t_a2_udp_length_never_past_the_ip_packet(ctx):
+    """Audit 2026-11-14 #48: a 2-byte UDP message whose length field says
+    65535 is "Quick message (2 bytes)" in both decoders (it said 65527),
+    while a capture cut short by a snap length keeps the size the IP and
+    UDP headers agree on."""
+    def frame(ulen, load, total=None):
+        u = struct.pack(">HHHH", 40000, 40001, ulen, 0) + load
+        tl = 20 + len(u) if total is None else total
+        ip = struct.pack(">BBHHHBBH", 0x45, 0, tl, 0, 0, 64, 17, 0) + \
+            _socket.inet_aton("10.0.0.1") + _socket.inet_aton("10.0.0.2")
+        return bytes(6) + b"\x02\x00\x00\x00\x00\x01\x08\x00" + ip + u
+    lie = frame(65535, b"ab")
+    d = fast_decode(lie, 1.0)
+    assert d["payload_len"] == 2 and d["text"] == \
+        "Quick message (2 bytes)", (d["payload_len"], d["text"])
+    snapped = frame(1408, bytes(60), total=1428)
+    assert fast_decode(snapped, 1.0)["payload_len"] == 1400
+    if ctx.scapy_ok:
+        for raw, want in ((lie, 2), (snapped, 1400)):
+            got = decode_packet(Ether(raw))["payload_len"]
+            assert got == want, (got, want)
+        assert not decoder_differences([(lie, 1.0, 1), (snapped, 1.0, 1)])
+
+
+@self_test()
+def t_a2_tunnel_names_and_ipv4_dissect(ctx):
+    """Audit 2026-11-14 #48: IPv6 inside IPv6 is "IPv6-in-IPv6" (it said
+    "IPv6-in-IPv4"); the packet details say a version-9 header isn't IPv4
+    and that a cut header is truncated, not "malformed (packed IP wrong
+    length for inet_ntoa)"."""
+    assert _ip_proto_label(41, 6) == "IPv6-in-IPv6"
+    assert _ip_proto_label(41, 4) == "IPv6-in-IPv4"
+    assert _ip_proto_label(4, 6) == "IPv4-in-IPv6"
+    assert _ip_proto_label(4, 4) == "IP-in-IP"
+    if ctx.scapy_ok:
+        inner = IPv6(src="fd00::1", dst="fd00::2", nh=59)
+        pkt = Ether(bytes(Ether(src="02:00:00:00:00:01",
+                                dst="02:00:00:00:00:02") /
+                          IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                          inner))
+        got = decode_packet(pkt)["proto"]
+        assert got == "IPv6-in-IPv6", got
+    raw = bytes(12) + b"\x08\x00" + b"\x91" + bytes(13)  # 4-byte header
+    dis = dissect(raw)
+    ip = next(n for n in dis.nodes if n.key == "ip")
+    assert "truncated" in ip.warning and "malformed" not in ip.warning, \
+        ip.warning
+    ver = next(f for f in ip.fields if f.key == "ip.version")
+    assert "isn't IPv4" in ver.warning, ver.warning
+
+
+@self_test()
+def t_a2_decode_errors_logged(ctx):
+    """Audit 2026-11-14 #49: a packet that breaks the decoder is logged as
+    a WARNING with its traceback the first time (each kind once), then
+    only at DEBUG; the row still says "Undecodable frame"."""
+    if not ctx.scapy_ok:
+        return "skip"
+    caught = []
+
+    class _Grab(logging.Handler):
+        def emit(self, record):
+            caught.append((record.levelno, record.getMessage(),
+                           record.exc_info is not None))
+    grab = _Grab(logging.DEBUG)
+    old_level, old_dp = LOG.level, globals()["decode_packet"]
+    seen = set(_DECODE_ERRORS_LOGGED)
+    _DECODE_ERRORS_LOGGED.clear()
+
+    def boom(*_a, **_k):
+        raise KeyError("a2-canary")
+    LOG.addHandler(grab)
+    LOG.setLevel(logging.DEBUG)
+    globals()["decode_packet"] = boom
+    try:
+        raw = bytes(12) + b"\x91\x00" + bytes(40)       # declined
+        for _ in range(3):
+            d = fast_decode(raw, 1.0)
+            assert d["text"] == "Undecodable frame (KeyError)", d["text"]
+    finally:
+        globals()["decode_packet"] = old_dp
+        LOG.removeHandler(grab)
+        LOG.setLevel(old_level)
+        _DECODE_ERRORS_LOGGED.clear()
+        _DECODE_ERRORS_LOGGED.update(seen)
+    mine = [c for c in caught if "a2-canary" in c[1]]
+    assert [c[0] for c in mine] == [logging.WARNING, logging.DEBUG,
+                                    logging.DEBUG], mine
+    assert mine[0][2], "the first one carries its traceback"
 
 
 @self_test()

@@ -95,6 +95,12 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - French and Spanish: after a language change, the rows already in the Timeline and the Alerts tab are shown in the new language; the packet list's Info column, the Start watching question, the Help's Start here and Evidence marks pages, a maker's device in a sentence ("Appareil D-Link …") and "This computer" under *Contacted by* are translated.
 - Help → Troubleshooting now says how to watch on Linux and macOS (your password when watching starts, or sudo; on Linux the one-time `setcap` capture right) and names the real menu path to Diagnostics, in all three languages. Diagnostics has a *Capture rights* line that says what is missing and what to do.
 - The I/O graph draws packets per second, traffic in bits per second and DNS latency as three charts, each with its unit on the axis. Packets per second no longer lie flat at 0 under the traffic line, and the DNS axis no longer shows "0" twice.
+- A .pcap file with a packet larger than 1 MB is read to the end. Reading used to stop at that packet with "The file ended early", and every packet after it was lost.
+- Capture files: a .pcap that records the Ethernet checksum is decoded as Ethernet again; a .pcapng packet for a network card the file doesn't describe is left out with a note instead of being read as Ethernet; a packet longer than its block, or a block whose two lengths disagree, is reported as damage.
+- In French and Spanish, the message at the end of an import keeps "(stopped early)", says "1 paquet" / "1 paquete" instead of "1 paquets" / "1 paquetes", and the "Stopped reading the file" message is translated.
+- A packet with many IPv6 extension headers, or with three or more VLAN tags, no longer slows the analysis: 180 extension headers took up to 0.2 seconds a packet, now well under a millisecond.
+- A UDP message whose length field claims more than the packet holds shows its real size ("Quick message (2 bytes)", not 65527 bytes). IPv6 carried inside IPv6 is called "IPv6-in-IPv6", not "IPv6-in-IPv4", and the packet details say "truncated" or "this isn't IPv4" instead of "malformed (packed IP wrong length for inet_ntoa)".
+- A packet that breaks the decoder is now written in the log, the first of each kind with its details, so it can be reported. It used to be counted silently.
 
 **Known limits**
 
