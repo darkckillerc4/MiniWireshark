@@ -76,7 +76,7 @@ The application stays one file. Everything it creates goes into one data folder:
 
 On Linux and macOS the data folder is closed to other users (mode 0700). A folder that belongs to someone else, or that others can write to, is skipped. Files written while capture runs as root are handed back to you.
 
-Settings are saved in `miniwireshark_config.json`. Two environment variables move these files, which is useful for tests:
+Settings are saved in `miniwireshark_config.json`: next to the script when that folder passes the same check (it is yours and nobody else can write to it), otherwise in the data folder. Two environment variables move these files, which is useful for tests:
 
 ```bash
 MINIWIRESHARK_DATA=/tmp/mw-data MINIWIRESHARK_CONFIG=/tmp/mw-config.json python miniwireshark.py
@@ -92,7 +92,7 @@ Download the new release and replace the file. Settings, history and sessions ar
 
 Delete `miniwireshark.py` and the data folder above. A few things live outside that folder, so delete them too:
 
-- `miniwireshark_config.json` (and `miniwireshark_config.json.bak`) next to `miniwireshark.py`, when that folder is writable.
+- `miniwireshark_config.json` (and `miniwireshark_config.json.bak`) next to `miniwireshark.py`, when that folder is yours and nobody else can write to it.
 - scapy's own cache: `~/.cache/scapy` on Linux and macOS, `%LOCALAPPDATA%\scapy` on Windows.
 - Passwords you saved for a Pi-hole or AdGuard Home helper are in your system's keychain (Windows Credential Manager, macOS Keychain, or the Linux secret service), under "MiniWireshark". Remove them there, or remove each helper in MiniWireshark before you uninstall (removing a helper deletes its saved password).
 

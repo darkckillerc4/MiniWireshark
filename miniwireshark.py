@@ -1104,7 +1104,7 @@ def load_json_store(path, kind=dict):
     if raw is None:
         return None, "unreadable"
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8-sig"))   # (second audit #24)
         if isinstance(data, kind):
             return data, ""
     except ValueError:
@@ -25523,6 +25523,99 @@ def migrate_config(data):
     return data
 
 
+def _json_copy(v):
+    return json.loads(json.dumps(v, default=str))
+
+
+def config_beside_app_ok(default_path):
+    """Second audit (install #28): the settings file next to the program is
+    used only where the data folder could be: a folder of a trusted user
+    (trusted_uids) that nobody else can write to, and a file nobody else
+    can change. Before, any writable folder would do, so another user
+    could plant settings in a shared folder next to the script."""
+    folder = os.path.dirname(os.path.abspath(default_path))
+    if not private_dir_ok(folder):
+        return False
+    if os.path.lexists(default_path):
+        if IS_WINDOWS:
+            return True
+        try:
+            st = os.lstat(default_path)
+        except OSError:
+            return False
+        return stat.S_ISREG(st.st_mode) and \
+            st.st_uid in trusted_uids() and not st.st_mode & 0o022
+    return _dir_writable(folder)
+
+
+# second audit (settings #21): values a choice also takes besides its
+# labels (a colour-blind code, any "N %" scale)
+CHOICE_ALSO_OK = {
+    "accessibility.colorblind": lambda v: v in ("", "deutan", "protan",
+                                                "tritan"),
+    "accessibility.ui_scale": lambda v: bool(re.match(r"^\d+\s*%$", v)),
+}
+
+
+def _type_fits(value, default):
+    if default is None:
+        return True
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float)) and \
+            not isinstance(value, bool) and math.isfinite(value)
+    return isinstance(value, type(default))
+
+
+def clean_config_values(data):
+    """Second audit (settings #21-#23): every setting this version knows
+    gets a value of its default's kind (a word, a number, on/off, a
+    list), a choice one of its choices, a number its range. Anything else
+    is set back to the default, so a hand-edited or damaged value can't
+    stop the start (`"theme": "Purple"` did, even in Safe Mode) or a
+    background task (`"idle_minutes": null`). -> the keys set back."""
+    fixed = []
+    defaults = _default_config()
+    for section, vals in defaults.items():
+        have = data.get(section)
+        if not isinstance(vals, dict) or not isinstance(have, dict):
+            continue
+        for k, dv in vals.items():
+            if k in have and not _type_fits(have[k], dv):
+                have[k] = dv
+                fixed.append(f"{section}.{k}")
+    for page in SETTINGS_PAGES:
+        for sec in page["sections"]:
+            for c in sec["controls"]:
+                key = c.get("key")
+                if not key:
+                    continue
+                section, _, k = key.partition(".")
+                have = data.get(section)
+                if not isinstance(have, dict) or k not in have:
+                    continue
+                v = have[k]
+                if c.get("type") == "choice" and \
+                        isinstance(c.get("choices"), (list, tuple)):
+                    also = CHOICE_ALSO_OK.get(key)
+                    if v not in c["choices"] and not (
+                            isinstance(v, str) and also and also(v)):
+                        have[k] = defaults[section][k]
+                        fixed.append(key)
+                elif c.get("type") == "int" and \
+                        isinstance(v, (int, float)) and \
+                        not isinstance(v, bool):
+                    lo, hi = c.get("min"), c.get("max")
+                    if lo is not None and v < lo:
+                        have[k] = lo
+                        fixed.append(key)
+                    elif hi is not None and v > hi:
+                        have[k] = hi
+                        fixed.append(key)
+    return fixed
+
+
 class AppConfig:
     """JSON-backed settings. Degrades to defaults on any read/parse problem
     rather than crashing (keeping a backup of the damaged file); migrates
@@ -25533,7 +25626,8 @@ class AppConfig:
         if path is None:
             path = os.environ.get("MINIWIRESHARK_CONFIG")
         if path is None:
-            if os.path.exists(default_path) or _dir_writable(SCRIPT_DIR):
+            # second audit (install #28): the data folder's rule applies
+            if config_beside_app_ok(default_path):
                 path = default_path
             else:
                 path = os.path.join(PATHS.data, "miniwireshark_config.json")
@@ -25543,7 +25637,43 @@ class AppConfig:
         # when it was read (before this start writes anything)
         self.from_version = ""
         self.read_only = False
+        self.repaired = []           # keys set back to their defaults
+        self._disk_sig = None        # what this copy last read or wrote
         self.data = self._load()
+        self._base = _json_copy(self.data)
+
+    def _parse(self, raw):
+        """The file's bytes -> (settings merged over the defaults and
+        cleaned, the version that last showed the Welcome Center, keys
+        set back to defaults). Raises ValueError for damaged JSON."""
+        # second audit (settings #24): Notepad's byte-order mark is fine
+        data = json.loads(raw.decode("utf-8-sig"))
+        if not isinstance(data, dict):
+            raise ValueError("config is not an object")
+        data = migrate_config(data)
+        gen = data.get("general")
+        from_version = str(gen.get("welcome_version") or "") \
+            if isinstance(gen, dict) else ""
+        merged = _default_config()
+        for section, vals in data.items():
+            if section in merged and isinstance(vals, dict) and \
+                    isinstance(merged[section], dict):
+                merged[section].update(vals)
+            elif section not in merged:
+                # 5.2.3 (B-32): a section this version doesn't know
+                # (written by a newer one) is kept as it is, so running
+                # an older copy no longer erases those settings
+                merged[section] = vals
+        try:
+            ver = int(data.get("config_version", 0) or 0)
+        except (TypeError, ValueError):
+            ver = 0
+        if ver > CONFIG_SCHEMA_VERSION:
+            LOG.info("settings were written by a newer MiniWireshark "
+                     "(schema %s); keeping what this version doesn't "
+                     "know", ver)
+        merged["config_version"] = max(ver, CONFIG_SCHEMA_VERSION)
+        return merged, from_version, clean_config_values(merged)
 
     def _load(self):
         defaults = _default_config()
@@ -25570,32 +25700,20 @@ class AppConfig:
                             "is.")
             return defaults
         try:
-            data = json.loads(raw.decode("utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("config is not an object")
-            data = migrate_config(data)
-            gen = data.get("general")
-            if isinstance(gen, dict):
-                self.from_version = str(gen.get("welcome_version") or "")
-            merged = _default_config()
-            for section, vals in data.items():
-                if section in merged and isinstance(vals, dict) and \
-                        isinstance(merged[section], dict):
-                    merged[section].update(vals)
-                elif section not in merged:
-                    # 5.2.3 (B-32): a section this version doesn't know
-                    # (written by a newer one) is kept as it is, so running
-                    # an older copy no longer erases those settings
-                    merged[section] = vals
-            try:
-                ver = int(data.get("config_version", 0) or 0)
-            except (TypeError, ValueError):
-                ver = 0
-            if ver > CONFIG_SCHEMA_VERSION:
-                LOG.info("settings were written by a newer MiniWireshark "
-                         "(schema %s); keeping what this version doesn't "
-                         "know", ver)
-            merged["config_version"] = max(ver, CONFIG_SCHEMA_VERSION)
+            merged, self.from_version, self.repaired = self._parse(raw)
+            self._disk_sig = hashlib.sha256(raw).hexdigest()
+            if self.repaired:
+                # second audit (settings #21-#23): a value this version
+                # can't use (a theme that doesn't exist, a list where a
+                # word belongs, an empty number) stopped every start, even
+                # in Safe Mode; it is set back to its default instead
+                LOG.warning("settings set back to their defaults: %s",
+                            ", ".join(self.repaired))
+                self.warning = (
+                    "Some settings had values this version can't use, so "
+                    "they are back to their defaults: " +
+                    ", ".join(self.repaired[:6]) +
+                    (" …" if len(self.repaired) > 6 else "") + ".")
             return merged
         except (OSError, ValueError) as e:
             LOG.warning("config unreadable (%s); using defaults", e)
@@ -25645,11 +25763,50 @@ class AppConfig:
                 if stale:
                     with contextlib.suppress(OSError):
                         shutil.copyfile(self.path, bak)
-            atomic_write_json(self.path, self.data)
+            self._merge_from_disk()
+            text = json.dumps(self.data, indent=2, default=str)
+            atomic_write_text(self.path, text)
+            self._disk_sig = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            self._base = _json_copy(self.data)
             return True
         except OSError:
             LOG.warning("could not save settings to %s", self.path)
             return False
+
+    def _merge_from_disk(self):
+        """Second audit (settings #25): another copy of MiniWireshark saved
+        the same file since this one read it. Only what this copy changed
+        is written over the file as it is now; before, the last save won
+        and the other copy's changes were lost without a word."""
+        base = getattr(self, "_base", None)
+        if base is None:
+            return False
+        try:
+            with open(self.path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return False
+        if hashlib.sha256(raw).hexdigest() == self._disk_sig:
+            return False
+        try:
+            other = self._parse(raw)[0]
+        except (ValueError, UnicodeDecodeError):
+            return False                 # damaged: this copy's settings win
+        for section, vals in self.data.items():
+            was = base.get(section)
+            if isinstance(vals, dict) and isinstance(was, dict) and \
+                    isinstance(other.get(section), dict):
+                for k, v in vals.items():
+                    if k not in was or was[k] != v:
+                        other[section][k] = _json_copy(v)
+                for k in was:
+                    if k not in vals:
+                        other[section].pop(k, None)
+            elif vals != was:
+                other[section] = _json_copy(vals)
+        LOG.info("settings: merged with changes another copy saved")
+        self.data = other
+        return True
 
     def reset(self, section=None):
         fresh = _default_config()
@@ -62198,7 +62355,10 @@ proc ::mw_explicit_fonts {top names} {
                     self.model.flows.closed_log.append(f)
                 self._pump_store(reschedule=False)
             self._save_raw_packets_on_exit()
-            self._exit_autosave()
+            if self._session_only_history():
+                self._forget_session_history()
+            else:
+                self._exit_autosave()
             with contextlib.suppress(OSError):
                 # 5.3.4 (OS-07): only this copy's own journal; a second
                 # copy running in the same folder keeps its crash copy
@@ -97883,6 +98043,113 @@ def t_a2_trust_page_matches_the_code(ctx):
         "History is **off** by default" in doc
     assert "no saved session" in doc and "Open last autosave" in doc
     assert "Clear history" in doc and "remembered networks" in doc
+
+
+@self_test()
+def t_a2_bad_setting_values_never_stop_the_start(ctx):
+    """Second audit (settings #21-#24): a theme that doesn't exist, a list
+    for the colour-blind mode, an empty number, on/off as a word and a
+    number out of range are each set back to the default (with a
+    warning) instead of stopping every start, even in Safe Mode; good
+    values next to them are kept; a byte-order mark (Notepad) is read,
+    not taken for damage."""
+    assert clean_config_values(_default_config()) == []
+    path = ctx.path("a2_bad.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"appearance": {"theme": "Purple", "text_size": "Large"},
+                   "accessibility": {"colorblind": ["Off"],
+                                     "ui_scale": "175 %"},
+                   "devices": {"idle_minutes": None,
+                               "inactive_minutes": -5},
+                   "general": {"tips": "yes"},
+                   "health": {"interval_seconds": float("nan")}}, f)
+    c = AppConfig(path=path)
+    assert c.get("appearance.theme") == "Light"
+    assert c.get("appearance.text_size") == "Large"
+    assert c.get("accessibility.colorblind") == "Off"
+    assert c.get("accessibility.ui_scale") == "175 %"
+    assert c.get("devices.idle_minutes") == 2
+    assert c.get("devices.inactive_minutes") == 1          # its minimum
+    assert c.get("general.tips") is True
+    assert c.get("health.interval_seconds") == 30
+    assert sorted(c.repaired) == sorted([
+        "appearance.theme", "accessibility.colorblind",
+        "devices.idle_minutes", "devices.inactive_minutes",
+        "general.tips", "health.interval_seconds"]), c.repaired
+    assert "appearance.theme" in c.warning, c.warning
+    # what the start does with them now works
+    resolve_theme(c.get("appearance.theme"))
+    assert THEMES[c.get("appearance.theme")]
+    set_colorblind_mode(c.get("accessibility.colorblind", "Off"))
+    assert c.get("devices.idle_minutes") * 60 == 120
+    set_colorblind_mode("Off")
+    # Safe Mode reads the same file the same way
+    with _b9_patched(c, overrides=dict(SAFE_MODE_OVERRIDES)):
+        assert c.get("appearance.theme") in THEMES
+    bom = ctx.path("a2_bom.json")
+    with open(bom, "wb") as f:
+        f.write(b"\xef\xbb\xbf" + json.dumps(
+            {"appearance": {"theme": "Dark"}}).encode())
+    b = AppConfig(path=bom)
+    assert b.get("appearance.theme") == "Dark" and not b.warning, b.warning
+    assert not os.path.exists(bom + ".damaged")
+
+
+@self_test()
+def t_a2_two_copies_keep_each_others_settings(ctx):
+    """Second audit (settings #25): two copies of MiniWireshark with the
+    same settings file each keep what the other changed; before, the
+    last save won and the other's change was lost."""
+    path = ctx.path("a2_shared_config.json")
+    AppConfig(path=path).save()
+    a, b = AppConfig(path=path), AppConfig(path=path)
+    a.set("appearance.theme", "Dark")
+    assert a.save()
+    b.set("general.tips", False)
+    b.get("alerts.muted_devices").append("02:00:5e:10:00:10")  # in place
+    assert b.save()
+    c = AppConfig(path=path)
+    assert c.get("appearance.theme") == "Dark", "the first copy's change "\
+        "was lost"
+    assert c.get("general.tips") is False
+    assert c.get("alerts.muted_devices") == ["02:00:5e:10:00:10"]
+    # the first copy saving again keeps the second one's changes too
+    a.set("appearance.text_size", "Large")
+    assert a.save()
+    d = AppConfig(path=path)
+    assert (d.get("appearance.theme"), d.get("general.tips"),
+            d.get("appearance.text_size")) == ("Dark", False, "Large")
+    assert a.get("general.tips") is False        # and it knows them now
+
+
+@self_test()
+def t_a2_settings_file_follows_the_folder_rule(ctx):
+    """Second audit (install #28): the settings file goes next to the
+    program only where the data folder could: not in a folder others can
+    write to, and not a file others can change (INSTALL.md says such
+    places are skipped). Then it goes in the data folder."""
+    if IS_WINDOWS:
+        return "skip"
+    shared = ctx.path("a2_shared_dir")
+    os.makedirs(shared, exist_ok=True)
+    os.chmod(shared, 0o777)
+    mine = ctx.path("a2_my_dir")
+    os.makedirs(mine, exist_ok=True)
+    os.chmod(mine, 0o755)
+    name = "miniwireshark_config.json"
+    assert not config_beside_app_ok(os.path.join(shared, name))
+    assert config_beside_app_ok(os.path.join(mine, name))
+    planted = os.path.join(mine, name)
+    with open(planted, "w", encoding="utf-8") as f:
+        f.write("{}")
+    os.chmod(planted, 0o666)
+    assert not config_beside_app_ok(planted)
+    os.chmod(planted, 0o600)
+    assert config_beside_app_ok(planted)
+    with _b9_patched(globals(), APP_HOME=shared, SCRIPT_DIR=shared), \
+            _b9_patched(os.environ, MINIWIRESHARK_CONFIG=None):
+        c = AppConfig()
+    assert c.path == os.path.join(PATHS.data, name), c.path
 
 
 # ============================================================================

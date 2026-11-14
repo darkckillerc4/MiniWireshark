@@ -13,6 +13,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **The administrator copy runs nothing of yours.** On Linux and macOS, the copy that runs as root for capture starts Python isolated and runs programs only from the system's own folders. A Python file or program planted in your home folder, or in the folder you started MiniWireshark from, no longer runs as root.
 - **The browser never opens as administrator.** When capture runs with administrator (root) rights on Linux or macOS, a local service, a report or a folder now opens as you, not as root.
 - **Saving into a shared folder is safe.** A save no longer follows a link that someone else left under its temporary name, so it can't overwrite another file. A table row or chart data copied to the clipboard can't start a spreadsheet formula, the same as a CSV file.
+- **The settings file follows the data folder's rule.** It is no longer read from or written to a folder next to the program that other people can write to, so they can't plant settings there; it goes in your data folder instead.
 - **A new install asks first.** It no longer trusts the first network it sees or starts Active Scanning by itself.
 - **History does what it says.** "Session only" history is really deleted when you close the window. "Delete ALL history" also removes the backups and the saved packet files.
 - **"Delete ALL history" deletes everything it names.** It now also deletes the last autosave, the crash copies, your device names and notes, the remembered networks and the list of programs that wait for connections, and its question lists them.
@@ -110,6 +111,10 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - In Demo Mode, **Websites → Local services** shows made-up services instead of the programs really running on this computer, and opens nothing in the browser. It used to list this computer's own programs under the "Everything shown is simulated" banner.
 
 - `--self-test` passes on a fresh install, before the capture library (scapy) and the optional parts are installed. Three tests assumed they were already there and failed, although the program was fine.
+
+- A settings value MiniWireshark can't use (a theme that doesn't exist, a list where a word belongs, an empty number, a number out of range) is set back to its default with a warning. It used to stop every start, even in Safe Mode, or make a background task fail over and over.
+- A settings file saved by Windows Notepad (with a byte-order mark) is read normally. It used to be taken for damaged, and all settings went back to the defaults.
+- Two copies of MiniWireshark that share a settings file keep each other's changes. The last one to save used to undo the other's without a word.
 
 **Known limits**
 
