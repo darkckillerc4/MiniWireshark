@@ -18,7 +18,14 @@ python -m py_compile miniwireshark.py
 python miniwireshark.py --self-test
 xvfb-run -a python miniwireshark.py --gui-test     # if you touched the window
 python -m pyflakes miniwireshark.py               # no new findings
+python .github/scripts/privacy_check.py           # nothing personal or secret
+python .github/scripts/docs_check.py              # links, headings, images
+python .github/scripts/reference_docs.py --check  # alert and field pages
 ```
+
+If you change an alert's text or a packet field, run `python .github/scripts/reference_docs.py` to rewrite [docs/ALERTS.md](docs/ALERTS.md) and [docs/FIELDS.md](docs/FIELDS.md). CI fails when they are out of date. The repository's `.editorconfig` keeps line endings and whitespace the way the docs check expects.
+
+The repository is public. Commit with your GitHub no-reply address (GitHub → Settings → Emails → *Keep my email addresses private*); CI checks the addresses on a pull request's commits.
 
 Use private data folders for test runs, so you never mix test data with your own:
 

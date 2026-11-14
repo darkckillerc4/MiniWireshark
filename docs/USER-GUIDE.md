@@ -83,7 +83,7 @@ dns.qry.name contains "example"
 tls && !(ip.dst == 10.0.0.1)
 ```
 
-Under the box, a field filter is said in plain words (`tcp.port == 443 and ip.addr == 10.0.0.5` becomes *TCP traffic on port 443 to or from 10.0.0.5*), and nothing is said when the meaning isn't certain. A filter that doesn't parse shows the reason and never affects capture. Right-click a value and choose **Copy as filter** or **Filter on this conversation** to build one without typing. Saved filters live under **filter presets**.
+Under the box, a field filter is said in plain words (`tcp.port == 443 and ip.addr == 10.0.0.5` becomes *TCP traffic on port 443 to or from 10.0.0.5*), and nothing is said when the meaning isn't certain. A filter that doesn't parse shows the reason and never affects capture. Right-click a value and choose **Copy as filter** or **Filter on this conversation** to build one without typing. Saved filters live under **filter presets**. Every field you can use is listed in [Packet filter fields](FIELDS.md).
 
 ## Investigations
 

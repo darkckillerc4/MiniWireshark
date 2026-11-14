@@ -25,7 +25,7 @@ What MiniWireshark 5.3.4 can do, grouped by the question it answers. For how to 
 
 ## Is anything wrong?
 
-The security and health engine raises these alerts. Each one says *why it was flagged*, *what innocent explanations exist* and *what to check*. Each kind can be turned off, and its threshold changed, in **Settings → Alerts**.
+The security and health engine raises these alerts. Each one says *why it was flagged*, *what innocent explanations exist* and *what to check*. The [Alerts reference](ALERTS.md) gives that text for every alert. Each kind can be turned off, and its threshold changed, in **Settings → Alerts**.
 
 | Alert | Severity |
 |---|---|
@@ -78,7 +78,7 @@ Thresholds that compare against "normal" wait for a baseline first, so a fresh s
 
 ## Deep analysis
 
-- **Packet workspace:** packet list, dissection tree with byte ranges, hex view, and a registry of 166 fields.
+- **Packet workspace:** packet list, dissection tree with byte ranges, hex view, and a registry of 166 fields (listed in [Packet filter fields](FIELDS.md)).
 - **Reassembly:** IP defragmentation and TCP stream reassembly.
 - **Full Power mode:** every dissector runs in worker processes, and adds protocol exchanges for DNS, DHCP, TLS, HTTP, RTSP, SSH, SMB, MQTT, NTP and SIP.
 - **Mail traffic:** SMTP, IMAP and POP3 analysis. Logins, passwords and message bodies are dropped inside the parser.

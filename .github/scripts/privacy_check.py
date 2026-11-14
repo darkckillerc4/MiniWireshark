@@ -15,7 +15,9 @@ should never be published:
   not publish the very words it protects. Add a word with:
       python .github/scripts/privacy_check.py --hash "word"
 
-Run it with no arguments from the repository root. It prints each
+Run it with no arguments from the repository root. With
+`--commits BASE..HEAD` it also checks the author and committer addresses of
+those commits: only GitHub and Anthropic no-reply addresses may appear. It prints each
 finding as path:line: reason and exits 1 when there is any.
 """
 import hashlib
@@ -35,6 +37,10 @@ BLOCKED_FILES = [
     (re.compile(r"\.log$", re.I), "a log file"),
     (re.compile(r"\.(pem|key|p12|pfx)$", re.I), "a key file"),
     (re.compile(r"(^|/)\.env$", re.I), "an environment file"),
+    (re.compile(r"\.(db|sqlite|sqlite3|db-wal|db-shm)$", re.I),
+     "a database (the history file or a copy)"),
+    (re.compile(r"\.jsonl$", re.I), "a JSON lines log"),
+    (re.compile(r"\.bak$", re.I), "a backup file"),
 ]
 
 SECRETS = [
@@ -66,7 +72,13 @@ BLOCKED_WORD_HASHES = {
     "be00770c04b59f94910de11bcfa0ecd800b4152870ded76be59f3ba12af4b38d",
 }
 
-WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}")
+# Unicode-aware, so an accented name is one word and its hash can match.
+WORD = re.compile(r"[^\W_][\w-]{2,}")
+
+# Commit author and committer addresses that are fine to publish.
+PUBLIC_COMMIT_EMAIL = re.compile(
+    r"(@users\.noreply\.github\.com|^noreply@github\.com|"
+    r"^noreply@anthropic\.com|^41898237\+github-actions\[bot\]@)$", re.I)
 
 # This file describes the patterns, so it is not scanned for them.
 SELF = ".github/scripts/privacy_check.py"
@@ -80,6 +92,30 @@ def tracked_files():
     out = subprocess.run(["git", "ls-files", "-z"], capture_output=True,
                          check=True).stdout
     return [p for p in out.decode("utf-8", "replace").split("\0") if p]
+
+
+def decode(raw):
+    """Text as str, or None for a binary file. UTF-16 files (Windows
+    exports, .reg files) start with a byte-order mark and are decoded."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", "replace")
+    if b"\0" in raw[:8192]:
+        return None
+    return raw.decode("utf-8", "replace")
+
+
+def commit_emails(rev_range):
+    """(commit, address) for every author or committer address in the
+    range that isn't a public no-reply address."""
+    out = subprocess.run(["git", "log", "--format=%h %ae %ce", rev_range],
+                         capture_output=True, text=True, check=True).stdout
+    found = []
+    for line in out.splitlines():
+        sha, *emails = line.split()
+        for e in set(emails):
+            if not PUBLIC_COMMIT_EMAIL.search(e):
+                found.append((sha, e))
+    return found
 
 
 def check_text(path, text):
@@ -104,6 +140,16 @@ def main(argv):
         print(word_hash(argv[2]))
         return 0
     findings = []
+    if len(argv) == 3 and argv[1] == "--commits":
+        # Only the commits being added (CI passes base..head), so commits
+        # published before this check existed don't fail every run.
+        for sha, email in commit_emails(argv[2]):
+            user, _, domain = email.partition("@")
+            masked = f"{user[:1]}***@{domain}"
+            findings.append((f"commit {sha}", 0,
+                             f"a non-public email address ({masked}) as "
+                             "author or committer. Use your GitHub "
+                             "no-reply address."))
     for path in tracked_files():
         for rx, why in BLOCKED_FILES:
             if rx.search(path):
@@ -115,9 +161,10 @@ def main(argv):
                 raw = f.read()
         except OSError:
             continue
-        if b"\0" in raw[:8192]:
+        text = decode(raw)
+        if text is None:
             continue  # binary file
-        findings += check_text(path, raw.decode("utf-8", "replace"))
+        findings += check_text(path, text)
     for path, n, why in findings:
         print(f"{path}:{n}: {why}")
     if findings:

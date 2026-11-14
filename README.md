@@ -123,6 +123,9 @@ The full list, including the developer switches, is in [Installation](docs/INSTA
 | [User guide](docs/USER-GUIDE.md) | The tabs, filters, command palette, shortcuts and settings |
 | [Features](docs/FEATURES.md) | Everything MiniWireshark can do, including every alert it raises |
 | [Architecture](docs/ARCHITECTURE.md) | How the single file is organised and how a packet becomes an answer |
+| [Alerts reference](docs/ALERTS.md) | Every alert: why it fires, what it usually means, what to check |
+| [Packet filter fields](docs/FIELDS.md) | Every protocol and field the field filter knows |
+| [Glossary](docs/GLOSSARY.md) | Network terms and MiniWireshark features in plain English |
 | [FAQ and troubleshooting](docs/FAQ.md) | Capture problems, Safe Mode, privacy questions |
 | [Can I trust it?](docs/TRUST.md) | Check what it sends, keeps and asks for, how it is tested, and its honest limits |
 | [Screenshots](docs/SCREENSHOTS.md) | Every tab, in the light and the dark theme |
