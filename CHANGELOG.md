@@ -119,6 +119,13 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 - `--boot-check` works on a Python without the window toolkit (tkinter), the most common Linux problem: it says that is what's missing, how to install it, and whether the data folder is fine. It used to print only "needs tkinter". When the window can't open, its Ready? list no longer says "✓ Python and window toolkit" under "Window FAILED".
 - With `--no-elevate`, the Ready? list no longer says MiniWireshark will ask for your password when you start watching. `--help` shows that `--bench-gui` takes scenario names; the install guide lists `-h` and `-V`, Homebrew's `python-tk`, and the right box to tick in the Windows Python installer.
+- A device that sends a lot to the Internet at night (say 30 MB at 3 am) now raises *Large upload at night* under Unusual activity, once: the next night the same amount is known. A backup to iCloud, Dropbox or OneDrive is said as a backup and doesn't count as unusual.
+- A password sent without encryption, in a web form, HTTP Basic or a web address, or with FTP, POP3 or IMAP, now raises *Login sent without encryption* in the normal mode too, not only in Full Power. The password itself is still never read into anything or kept.
+- A device that contacts the same server on a timer (30 times or more, nearly evenly spaced) now raises *Regular check-ins to one server*. The clock, a server several of your devices share and uneven contacts raise nothing. The device card counts every contact (it stopped at 24).
+- Many long, random-looking names looked up under one domain (a way to hide data in name lookups, "DNS tunnelling") now raise *Data hidden in name lookups*.
+- A second DHCP server that hands out a different router is now DANGER and says what it hands out, including when it names itself as the router and the DNS server. MiniWireshark keeps the real router as your gateway, even when the other server answers more often.
+- iCloud backups, Netflix, YouTube and other known backup and streaming services no longer show up as unusual uploads, downloads or a busy device; the Timeline still tells the spike.
+- During ARP spoofing, the attacker's claim on another device's address no longer adds a "Duplicate IP address … often harmless" warning, and the Story says "Danger" for a DANGER alert (and "Aviso" in Spanish, like the Severity column). A port scan says the most ports it tried in a minute instead of the first count seen, and the resets the scan gets back no longer raise *Repeated connection resets* about the scanner.
 
 **Known limits**
 

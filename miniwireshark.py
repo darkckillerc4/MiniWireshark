@@ -10150,7 +10150,78 @@ def _ipv6_upper(ipl):
     return nh, ly
 
 
+# ---- second audit 2026-11-14 (#34): a sign-in in one packet ------------------
+#  Only the field NAMES are matched; a match says "a password went by" and
+#  the bytes are dropped. Nothing of the value is ever copied anywhere.
+_LOGIN_FIELD = (rb"(?:password|passwd|passwort|kennwort|pass|pwd|pw|"
+                rb"user_?pass|login_?password|motdepasse|mot_de_passe|"
+                rb"contrase(?:%c3%b1|\xc3\xb1|n)a|senha)")
+_LOGIN_FORM_RX = re.compile(rb"(?:^|[&\s])" + _LOGIN_FIELD + rb"=[^&\s]",
+                            re.I)
+_LOGIN_JSON_RX = re.compile(rb"\"" + _LOGIN_FIELD + rb"\"\s*:\s*\"[^\"]",
+                            re.I)
+_LOGIN_PART_RX = re.compile(rb"name=\"" + _LOGIN_FIELD + rb"\"", re.I)
+_LOGIN_QUERY_RX = re.compile(rb"^[A-Z]+ [^ ?]*\?(?:[^ ]*&)?" + _LOGIN_FIELD +
+                             rb"=[^& ]", re.I)
+_LOGIN_BASIC_RX = re.compile(rb"\n[ \t]*(?:proxy-)?authorization[ \t]*:"
+                             rb"[ \t]*basic[ \t]+\S", re.I)
+_LOGIN_FORM_TYPES = (b"x-www-form-urlencoded", b"multipart/form-data",
+                     b"application/json")
+
+
+def http_form_login(body):
+    """"a password field in a web form" when a request body carries a
+    password field with a value, else ""."""
+    body = body[:4096]
+    if _LOGIN_FORM_RX.search(body) or _LOGIN_JSON_RX.search(body) or \
+            _LOGIN_PART_RX.search(body):
+        return "a password field in a web form"
+    return ""
+
+
+def _login_in_packet(d, load):
+    """Mark a decoded packet that carries a sign-in: d["login"] says how
+    (never what), d["login_proto"] which protocol; d["form_post"] a web
+    form whose body comes in the next packet."""
+    if load[:5] == b"HTTP/":
+        return
+    if load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE", b"OPTI",
+                    b"PATC"):
+        head = load[:4096]
+        how = ""
+        if _LOGIN_BASIC_RX.search(head):
+            how = "HTTP Basic sign-in"
+        elif _LOGIN_QUERY_RX.match(head.split(b"\n", 1)[0]):
+            how = "a password in the web address"
+        elif head[:4] in (b"POST", b"PUT ", b"PATC"):
+            cut = head.find(b"\r\n\r\n")
+            cut, skip = (cut, 4) if cut >= 0 else (head.find(b"\n\n"), 2)
+            if cut < 0:
+                return
+            body = head[cut + skip:]
+            how = http_form_login(body)
+            if not how and not body.strip() and any(
+                    t in head[:cut].lower() for t in _LOGIN_FORM_TYPES):
+                d["form_post"] = True
+        if how:
+            d["login"], d["login_proto"] = how, "HTTP"
+        return
+    dport = d.get("dport")
+    if dport in (21, 110) and load[:5].upper() == b"PASS " and \
+            len(load.strip()) > 5:
+        d["login"] = "USER and PASS commands"
+        d["login_proto"] = "FTP" if dport == 21 else "POP3"
+    elif dport == 143 and re.match(rb"[^ ]+ LOGIN [^ ]+ [^ \r\n]", load[:512],
+                                   re.I):
+        d["login"], d["login_proto"] = "LOGIN command", "IMAP"
+
+
 def _decode_tcp_payload(d, load, reasm):
+    if FEATURES.get("login_warning", True) and (
+            load[:5] in (b"PASS ", b"pass ") or load[:4] in (
+                b"GET ", b"POST", b"PUT ", b"PATC") or (
+                d.get("dport") == 143 and b" LOGIN " in load[:256].upper())):
+        _login_in_packet(d, load)
     # plain HTTP?
     if load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
                     b"OPTI", b"PATC", b"CONN") or load[:5] == b"HTTP/":
@@ -17436,6 +17507,10 @@ ALERT_TYPES = {
     "reputation":       ("Address on a public blocklist contacted",
                          "WARNING"),
     "cleartext_login":  ("Login sent without encryption", "WARNING"),
+    # second audit 2026-11-14 (#33, #35, #36)
+    "night_upload":     ("Large upload at night", "WARNING"),
+    "beacon":           ("Regular check-ins to one server", "WARNING"),
+    "dns_tunnel":       ("Data hidden in name lookups", "WARNING"),
 }
 
 # default confidence + "why was this flagged" for each kind
@@ -17455,6 +17530,13 @@ ALERT_META = {
     "cleartext_login": ("High", "A sign-in was recognised in a "
                                 "reassembled, unencrypted connection "
                                 "(Full Power)."),
+    "night_upload": ("Medium", "A device sent a lot to the Internet at "
+                               "night, more than it ever did at night "
+                               "before."),
+    "beacon": ("Medium", "A device opened new connections to the same "
+                         "server many times, at nearly even intervals."),
+    "dns_tunnel": ("Medium", "Many long, random-looking names were looked "
+                             "up under one domain in a few minutes."),
     "chatty_device": ("Medium", "Traffic this minute is far above this "
                                 "device's own recent average."),
     "unknown_device": ("Medium", "The device stayed hard to identify after "
@@ -17668,6 +17750,21 @@ ALERT_CHECKLIST.setdefault("cleartext_login", [
     "Use a password there that you don't use anywhere else, and change it "
     "if this login crossed the Internet."])
 
+ALERT_CHECKLIST.update({
+    "night_upload": ["Was the device backing up, syncing photos or "
+                     "uploading a video overnight? Then this is expected.",
+                     "If it should be idle at night, look at which program "
+                     "sent the data, and run a malware scan on it."],
+    "beacon": ["Do you know the server? A weather, news or smart-home app "
+               "checking in is normal.",
+               "If the device should be idle and you don't know the server, "
+               "look at which program makes the connections."],
+    "dns_tunnel": ["Is antivirus, a VPN or a remote-access tool installed on "
+                   "the device? Some use name lookups like this on purpose.",
+                   "If not, disconnect the device from the network and run a "
+                   "malware scan on it."],
+})
+
 ALERT_CHECKLIST.setdefault("reputation", [
     "Look at which device contacted it and whether that was expected (an "
     "app, an update, a link someone opened).",
@@ -17727,6 +17824,12 @@ ALERT_MEANS = {
     "cleartext_login": "Usually an older router, camera, printer or "
                        "storage box on your own network that only offers "
                        "a plain sign-in page.",
+    "night_upload": "Usually a backup or a photo sync that runs while the "
+                    "device charges at night.",
+    "beacon": "Usually an app or a gadget that checks in with its server "
+              "on a timer (weather, smart home, mail, updates).",
+    "dns_tunnel": "Sometimes antivirus or a VPN that uses name lookups on "
+                  "purpose; otherwise a way to sneak data past a firewall.",
 }
 
 
@@ -18222,7 +18325,42 @@ class AlertEngine:
             "reconnecting and briefly overlapping the old lease. Worth a "
             "look if it keeps happening.")
 
-    def dhcp_anomaly(self, servers):
+    def dhcp_anomaly(self, servers, rogue=None):
+        """More than one DHCP server. `rogue`: (server, router, dns,
+        trusted server, trusted router) when one hands out a different
+        router (second audit #37): DANGER, and it says what it hands out."""
+        if rogue:
+            if self._debounced("dhcp_anomaly:rogue", 300):
+                return None
+            srv, router, dns, good, good_router = rogue
+            selfish = [w for w, on in (("router", router == srv),
+                                        ("DNS server", srv in dns)) if on]
+            tail = (" It names itself as the " + " and the ".join(selfish)
+                    + ".") if selfish else ""
+            return self._add(
+                "dhcp_anomaly", "DANGER", "",
+                (f"A second device hands out addresses and names itself as "
+                 f"your router: {srv}" if router == srv else
+                 f"A second device hands out addresses and a different "
+                 f"router: {srv}"),
+                f"{len(servers)} different DHCP servers seen: "
+                f"{', '.join(sorted(servers))}. {srv} gives devices {router} "
+                f"as their router and {', '.join(dns) or 'no DNS server'} "
+                f"for name lookups. The usual one, {good}, gives "
+                f"{good_router} as the router.{tail}",
+                "Devices that take an address from it send their Internet "
+                "traffic and name lookups through that device, which can "
+                "read or redirect them.",
+                "A second router or a travel router plugged in by mistake "
+                "does the same. If you don't recognise that device, unplug "
+                "it and reconnect your devices.",
+                confidence="High",
+                why="A second DHCP server named a different router than "
+                    "the usual one.",
+                evidence=[f"DHCP server: {srv}", f"Router it gives: {router}",
+                          f"Usual router: {good_router}"] +
+                ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
+                refs={"remote": srv})
         if self._debounced("dhcp_anomaly", 300):
             return None
         return self._add(
@@ -18511,14 +18649,14 @@ class AlertEngine:
             subject=f"{dev_key}|{proto}")
 
     def cleartext_login(self, dev_name, dev_key, proto, server, port,
-                        is_public, how=""):
+                        is_public, how="", why=None, source=""):
         """5.3.4 (IP-013): a sign-in travelled as plain text (seen in Full
         Power, where connections are reassembled). Nothing of the login
         itself is passed in or kept: only who, to where and how. Repeats
         are folded into one open alert; snooze and "mute for this device"
         quiet a router or camera that is always signed into this way."""
         if not FEATURES.get("login_warning", True) or self._debounced(
-                f"clogin:{dev_key}:{proto}:{server}", 3600):
+                f"clogin{source}:{dev_key}:{proto}:{server}", 3600):
             return None
         where = "on the Internet" if is_public else "on your network"
         return self._add(
@@ -18532,8 +18670,8 @@ class AlertEngine:
             "offer a plain sign-in page. It matters more when the server "
             "is on the Internet.",
             confidence="High",
-            why="A sign-in was recognised in a reassembled, unencrypted "
-                "connection (Full Power).",
+            why=why or "A sign-in was recognised in a reassembled, "
+                       "unencrypted connection (Full Power).",
             evidence=[f"Server {where}: {server} (port {port})"] +
             ([f"Kind of login: {how}"] if how else []),
             refs={"remote": server}, subject=f"{dev_key}|{proto}|{server}")
@@ -18665,6 +18803,18 @@ class AlertEngine:
 
     def scan_pattern(self, dev, what, n):
         if self._debounced(f"scan:{dev.key}", 3600):
+            # second audit (#39): the alert said the first count it saw
+            # ("154 different ports") while the scan went on to 1,024;
+            # the open alert now keeps the most seen in a minute
+            a = self.alerts.get(self._open.get(("scan_pattern", dev.key),
+                                               ""))
+            if a is not None and not a.acknowledged and \
+                    n > a.refs.get("most", 0):
+                a.refs["most"] = n
+                a.observed = (f"Within a minute it tried {n} {what}, most "
+                              f"without an answer.")
+                a.updated = True
+                return a
             return None
         return self._add(
             "scan_pattern", "WARNING", dev.key,
@@ -18675,7 +18825,86 @@ class AlertEngine:
             "discovery) on purpose. Otherwise, check what software the "
             "device runs.",
             confidence="Medium", why="Many distinct connection attempts "
-                                     "with few successful replies.")
+                                     "with few successful replies.",
+            refs={"most": n})
+
+    # ---- second audit 2026-11-14 (#33, #35, #36) ---------------------------
+    def night_upload(self, dev, total, minutes, dest, service="", start=0.0):
+        """A device sent a lot to the Internet at night, more than twice
+        what it ever sent in a night hour before. A known backup service
+        (iCloud, Dropbox…) is said, and only an INFO: kept out of Unusual
+        activity, since phones and computers back up at night."""
+        if self._debounced(f"nightup:{dev.key}", 6 * 3600):
+            return None
+        size = _human_bytes(total)
+        if service:
+            return self._add(
+                "night_upload", "INFO", dev.key,
+                f"{dev.display_name()} backed up at night ({service})",
+                f"At night it sent {size} to {dest} in {minutes} minutes. "
+                f"That is {service}, a backup service.",
+                "This looks like a backup.",
+                "Phones and computers back up while they charge at night.",
+                confidence="Medium",
+                why="Most of the data went to a known backup service.",
+                evidence=[f"Sent: {size}", f"To: {dest}"],
+                refs={"explained": service, "start": start})
+        return self._add(
+            "night_upload", "WARNING", dev.key,
+            f"{dev.display_name()} sent {size} to the Internet at night",
+            f"At night it sent {size} to {dest} in {minutes} minutes. It "
+            f"has never sent this much in a night hour before.",
+            "Data left this device while it is usually idle.",
+            "Backups, photo syncs and system updates run at night too. It "
+            "matters if nothing on the device should be sending files.",
+            confidence="Medium",
+            why="Compared with what this device sent at night before.",
+            evidence=[f"Sent: {size}", f"To: {dest}"],
+            refs={"start": start})
+
+    def beacon(self, dev, dest, remote, period, n, named):
+        """A device opened a new connection to one server many times, at
+        nearly even intervals (see beacon_period)."""
+        if self._debounced(f"beacon:{dev.key}:{remote}", 86400):
+            return None
+        every = human_period(period)
+        return self._add(
+            "beacon", "WARNING", dev.key,
+            f"{dev.display_name()} contacts {dest} every {every}",
+            f"It opened a new connection to {dest} {n} times, about once "
+            f"every {every}.",
+            "Contacts on a timer are how many apps check for news, and how "
+            "some malware asks for orders.",
+            "Weather and news widgets, smart-home gadgets, mail and update "
+            "checks do this. It matters if you don't know the server and "
+            "the device should be idle.",
+            confidence="Medium" if not named else "Low",
+            why="At least 30 new connections to the same server, nearly "
+                "evenly spaced.",
+            evidence=[f"Server: {dest}", f"Contacts: {n}",
+                      f"Every: {every}"],
+            refs={"remote": remote}, subject=f"beacon|{dev.key}|{remote}")
+
+    def dns_tunnel(self, dev, parent, n, minutes, txt_share, sample):
+        """Many long, random-looking names looked up under one domain in a
+        few minutes (see DnsTunnelWatch)."""
+        if self._debounced(f"dnstun:{dev.key}:{parent}", 6 * 3600):
+            return None
+        return self._add(
+            "dns_tunnel", "WARNING", dev.key,
+            f"{dev.display_name()} may be hiding data in name lookups",
+            f"In {minutes} minutes it looked up {n} different long, "
+            f"random-looking names under {parent}, such as {sample}.",
+            "Long random names under one domain can carry data out past "
+            "a firewall (DNS tunnelling).",
+            "Some antivirus and security programs check files this way, "
+            "and a few VPN and remote-access tools use it on purpose.",
+            confidence="High" if txt_share >= 0.5 else "Medium",
+            why="Many long, random-looking names were looked up under one "
+                "domain in a few minutes.",
+            evidence=[f"Domain: {parent}", f"Different names: {n}"] +
+            (["Most were text (TXT) lookups"] if txt_share >= 0.5 else []),
+            subject=f"dnstun|{dev.key}|{parent}")
 
 
 # ============================================================================
@@ -20546,6 +20775,11 @@ class DeviceBaseline:
         self.first = 0.0            # first and last learned minute
         self.last = 0.0
         self.svc_at = 0             # self.n when a new service last appeared
+        # second audit (#33): the most it sent in a night hour so far
+        self.night_up_max = 0
+        self.cur_up_by = {}         # this minute: bytes per remote, up
+        self.cur_down_by = {}       # … and down (#38)
+        self.last_top = ("", "")    # the busiest remote of the last minute
 
     def _profile(self, period):
         """The day or night profile, started from the kind's prior."""
@@ -20579,6 +20813,8 @@ class DeviceBaseline:
         self.cur_min = minute
         self.cur = {f: 0 for f in self.FEATURES}
         self.cur_dests = set()
+        self.cur_up_by = {}
+        self.cur_down_by = {}
 
     def observe(self, ts, nbytes, direction, remote_ip="", is_dns=False,
                 proto="", service_port=None, new_conn=False):
@@ -20590,11 +20826,14 @@ class DeviceBaseline:
             finished = self.finish()
             self._reset_cur(minute)
         c = self.cur
+        by = self.cur_up_by if direction == "sent" else self.cur_down_by
         if direction == "sent":
             c["packets"] += 1
             c["bytes_up"] += nbytes
         else:
             c["bytes_down"] += nbytes
+        if remote_ip and (remote_ip in by or len(by) < 64):
+            by[remote_ip] = by.get(remote_ip, 0) + nbytes
         if remote_ip and len(self.cur_dests) < 5000:
             self.cur_dests.add(remote_ip)
         if is_dns:
@@ -20619,6 +20858,8 @@ class DeviceBaseline:
             return None
         vals = dict(self.cur)
         vals["destinations"] = len(self.cur_dests)
+        self.last_top = tuple(max(by, key=by.get) if by else ""
+                              for by in (self.cur_up_by, self.cur_down_by))
         snapshot = (vals, dict(self.mean),
                     {f: math.sqrt(max(0.0, self.var[f]))
                      for f in self.FEATURES}, self.n)
@@ -20674,7 +20915,7 @@ class DeviceBaseline:
             # and ignores the rest)
             d.update({"v": BASELINE_VERSION, "kind": self.kind,
                       "first": self.first, "last": self.last,
-                      "svc_at": self.svc_at,
+                      "svc_at": self.svc_at, "nup": self.night_up_max,
                       "profiles": {k: {"n": p["n"], "mean": dict(p["mean"]),
                                        "var": dict(p["var"])}
                                    for k, p in self.prof.items()}})
@@ -20688,6 +20929,7 @@ class DeviceBaseline:
         self.first = max(0.0, _finite(d.get("first")))
         self.last = max(self.first, _finite(d.get("last")))
         self.svc_at = min(self.n, max(0, int(_finite(d.get("svc_at")))))
+        self.night_up_max = max(0, int(min(_finite(d.get("nup")), 1e15)))
         profs = d.get("profiles")
         if isinstance(profs, dict):
             for period in ("day", "night"):
@@ -21593,6 +21835,9 @@ def periodic_findings(model, min_repeats=10, only=None):
         if not got:
             continue
         period, n = got
+        # second audit (#35): every start, not only the 24 kept
+        n = max(n, getattr(model, "flow_start_n", {}).get(
+            (dev_key, remote), 0) - 1)
         names = model.ip_to_domains.get(remote)
         dest = next(reversed(names)) if names else remote
         dev = reg.by_key.get(reg.resolve(dev_key))
@@ -22987,6 +23232,134 @@ def calls_card_text(tracker, limit=3):
     return "\n".join(lines)
 
 
+# ---- second audit 2026-11-14: detections (#33, #35, #36, #38) ---------------
+# Services that move a lot of data on purpose. A night upload to a backup
+# service is said as a backup; a spike to a backup (up) or a streaming
+# service (down) is told on the Timeline, not raised as unusual. Matched
+# on the end of the name the address was looked up as.
+KNOWN_BULK_SERVICES = (
+    ("icloud.com", "iCloud", "backup"),
+    ("icloud-content.com", "iCloud", "backup"),
+    ("apple-cloudkit.com", "iCloud", "backup"),
+    ("dropbox.com", "Dropbox", "backup"),
+    ("dropboxapi.com", "Dropbox", "backup"),
+    ("onedrive.live.com", "OneDrive", "backup"),
+    ("storage.live.com", "OneDrive", "backup"),
+    ("1drv.com", "OneDrive", "backup"),
+    ("photos.googleapis.com", "Google Photos", "backup"),
+    ("drive.google.com", "Google Drive", "backup"),
+    ("backblazeb2.com", "Backblaze", "backup"),
+    ("backblaze.com", "Backblaze", "backup"),
+    ("idrive.com", "IDrive", "backup"),
+    ("nflxvideo.net", "Netflix", "stream"),
+    ("netflix.com", "Netflix", "stream"),
+    ("googlevideo.com", "YouTube", "stream"),
+    ("youtube.com", "YouTube", "stream"),
+    ("ttvnw.net", "Twitch", "stream"),
+    ("dssott.com", "Disney+", "stream"),
+    ("aiv-cdn.net", "Prime Video", "stream"),
+    ("scdn.co", "Spotify", "stream"),
+)
+NIGHT_UPLOAD_BYTES = 20 * 1024 * 1024   # sent in one night hour
+NIGHT_UPLOAD_WINDOW = 3600.0
+BEACON_MIN_CONTACTS = 30
+BEACON_SKIP_PORTS = frozenset((0, 53, 123, 853, 3478, 5349, 19302))
+DNS_TUNNEL_NAMES = 50          # long random names under one domain …
+DNS_TUNNEL_WINDOW = 600.0      # … within this many seconds
+DNS_TUNNEL_LABEL = 30          # a label this long, random-looking
+# security services that look up file hashes as names on purpose
+DNS_TUNNEL_SKIP = ("sophosxl.net", "mcafee.com", "trendmicro.com", "e5.sk")
+
+
+def known_bulk_service(names, kind=None):
+    """(label, kind) of the first name that belongs to a known backup or
+    streaming service, or None. `names`: one name or several."""
+    if isinstance(names, str):
+        names = (names,)
+    for n in names or ():
+        h = str(n or "").lower().strip(".")
+        for suf, label, k in KNOWN_BULK_SERVICES:
+            if (h == suf or h.endswith("." + suf)) and kind in (None, k):
+                return label, k
+    return None
+
+
+def beacon_period(starts, min_gaps=20, spread=0.2, share=0.8):
+    """Connection start times → the period in seconds when they are
+    nearly even (at least `share` of the last gaps within `spread` of
+    their median, the median between 20 s and an hour), else None. Much
+    stricter than detect_periodic: this one raises an alert."""
+    ts = sorted(starts)
+    gaps = [b - a for a, b in zip(ts, ts[1:])]
+    if len(gaps) < min_gaps:
+        return None
+    med = statistics.median(gaps)
+    if not 20.0 <= med <= 3600.0:
+        return None
+    close = sum(1 for g in gaps if abs(g - med) <= spread * med)
+    return med if close >= share * len(gaps) else None
+
+
+def random_label(label):
+    """True for a long label that looks like encoded data: letters and
+    digits mixed, many different characters, no long words."""
+    lab = (label or "").lower()
+    if len(lab) < DNS_TUNNEL_LABEL or not re.fullmatch(r"[a-z0-9_-]+", lab):
+        return False
+    digits = sum(c.isdigit() for c in lab)
+    if digits == 0 or digits == len(lab):
+        return False
+    cnt = Counter(lab)
+    ent = -sum(v / len(lab) * math.log2(v / len(lab)) for v in cnt.values())
+    return ent >= 3.5
+
+
+class DnsTunnelWatch:
+    """Per device and domain: the long random names looked up in the last
+    DNS_TUNNEL_WINDOW seconds. Bounded: 400 device+domain pairs, 200
+    names each."""
+
+    KEEP = 400
+
+    def __init__(self):
+        self.groups = OrderedDict()
+
+    def note(self, dev_key, qname, qtype, ts):
+        """→ (parent, distinct names, minutes, TXT share, sample) when the
+        pair crosses DNS_TUNNEL_NAMES, else None."""
+        q = (qname or "").lower().strip(".")
+        labels = q.split(".")
+        if len(labels) < 3 or not any(random_label(x)
+                                      for x in labels[:-2]):
+            return None
+        parent = registrable_domain(q)
+        if not parent or any(parent == s or parent.endswith("." + s)
+                             for s in DNS_TUNNEL_SKIP):
+            return None
+        key = (dev_key, parent)
+        g = self.groups.get(key)
+        if g is None or ts - g["first"] > DNS_TUNNEL_WINDOW:
+            g = {"first": ts, "names": set(), "n": 0, "txt": 0,
+                 "sample": q}
+            self.groups[key] = g
+            while len(self.groups) > self.KEEP:
+                self.groups.popitem(last=False)
+        self.groups.move_to_end(key)
+        g["n"] += 1
+        if qtype in (16, 10):                # TXT, NULL
+            g["txt"] += 1
+        if len(g["names"]) < 200:
+            g["names"].add(q)
+        n = len(g["names"])
+        if n < DNS_TUNNEL_NAMES:
+            return None
+        minutes = max(1, int(round((ts - g["first"]) / 60.0)))
+        sample = g["sample"]
+        if len(sample) > 48:
+            sample = sample[:24] + "…" + sample[-20:]
+        return parent, n, minutes, g["txt"] / max(1, g["n"]), sample
+
+
 def obs_evict_index(dq, site=False, weak=()):
     """(review 6) Which observation a full subject gives up for a new one:
     the oldest of its largest group. For a website the group is the
@@ -23081,6 +23454,13 @@ class NetworkModel:
         self.switch_ports = {}       # (proto, chassis) → what LLDP/CDP said
         self.reported = {}           # helper name → what it reported
         self.flow_starts = OrderedDict()   # (device, remote) → start times
+        # second audit (#35): how many starts in all (the deque keeps 24)
+        self.flow_start_n = {}
+        self.night_up = {}               # (#33) device → this night hour
+        self.dns_tunnels = DnsTunnelWatch()      # (#36)
+        self.dhcp_offers = OrderedDict()  # (#37) server → router, DNS
+        self._form_wait = OrderedDict()  # (#34) a form POST's body next
+        self._dup_pending = OrderedDict()  # (#39) address → (ts, MAC)
         self.rtt_samples = deque(maxlen=2000)  # (ts, rtt, remote, dev, fid)
         # 5.3.4 (MC7): passive evidence the investigations read, bounded
         self.lan_rtt_samples = deque(maxlen=500)   # (ts, rtt, remote ip)
@@ -23911,6 +24291,9 @@ class NetworkModel:
         self._observe_remote(d, ts, direction, src_dev, dst_dev, new_flow)
         if d["cleartext"]:
             self._observe_cleartext(d, src_dev, dst_dev, direction)
+        if d.get("login") or d.get("form_post") or (
+                self._form_wait and d.get("payload_len")):
+            self._observe_login(d)
         self._baseline_observe(d, ts, src_dev, dst_dev, direction, flow,
                                new_flow)
         self._announce_created()
@@ -23971,7 +24354,10 @@ class NetworkModel:
                         ts, _float(self.config.get(
                             "alerts.chatty_multiplier", 4), 4),
                         _float(self.config.get("alerts.chatty_min_rate", 3),
-                               3)):
+                               3)) and not (
+                        # second audit (#38): a film or a backup
+                        self._bulk_service(dev, False) or
+                        self._bulk_service(dev, True)):
                     a = self._alert(self.alerts.chatty_device(dev))
                     if a and not a.updated:
                         self.push_timeline(
@@ -24126,8 +24512,36 @@ class NetworkModel:
                             "replacement, but worth a look otherwise — "
                             "see Alerts.", "warn")
         else:
-            self._alert(self.alerts.duplicate_ip(
-                ip, len(self.registry.ip_macs.get(ip, ()))))
+            # second audit (#39): told at the next upkeep, once it is clear
+            # whether ARP spoofing (raised a few flips later) covers it
+            self._bounded_put(self._dup_pending, ip, (ts, mac), 256)
+
+    def _check_duplicates(self, now):
+        for ip, (ts, mac) in list(self._dup_pending.items()):
+            if 0 <= now - ts < 30:
+                continue
+            del self._dup_pending[ip]
+            if not self._part_of_spoof(ip, mac):
+                self._alert(self.alerts.duplicate_ip(
+                    ip, len(self.registry.ip_macs.get(ip, ()))))
+
+    def _part_of_spoof(self, ip, mac):
+        """Second audit (#39): a second claim on an address that an open
+        ARP spoofing alert already covers (this address, or the device that
+        also claims your router's address). A "Duplicate IP address …
+        often harmless" warning next to the DANGER said the opposite."""
+        eng = self.alerts
+
+        def open_spoof(addr):
+            a = eng.alerts.get(eng._open.get(("arp_spoof", f"ip:{addr}"),
+                                             ""))
+            return a is not None and not a.acknowledged
+        if open_spoof(ip):
+            return True
+        gw = self.gateway_ip
+        return bool(gw and open_spoof(gw) and mac and
+                    mac in self.registry.ip_macs.get(gw, ()) and
+                    mac not in self.registry.gw_macs)
 
     def _observe_dhcp(self, d, ts):
         info = d["dhcp"]
@@ -24142,11 +24556,20 @@ class NetworkModel:
             self._bounded_put(self.dhcp_chains, cm, ch)
         if mt in (2, 5) and d["src_ip"]:
             server = info.get("server_id") or d["src_ip"]
+            # second audit (#37): what each server tells devices to use
+            off = self.dhcp_offers.get(server)
+            if off is None and len(self.dhcp_offers) < 16:
+                off = self.dhcp_offers[server] = {"router": "", "dns": []}
+            if off is not None:
+                if info.get("router"):
+                    off["router"] = str(info["router"])
+                if info.get("dns_servers"):
+                    off["dns"] = [str(x) for x in info["dns_servers"][:4]]
             if mt in (2, 5):
                 self.dhcp_servers[server] += 1
                 if len(self.dhcp_servers) > 1:
                     self._alert(self.alerts.dhcp_anomaly(
-                        set(self.dhcp_servers)))
+                        set(self.dhcp_servers), self.dhcp_rogue()))
             if info.get("router"):
                 self.dhcp_routers[info["router"]] += 1
             for s in info.get("dns_servers") or []:
@@ -24345,6 +24768,14 @@ class NetworkModel:
                               d["dst_ip"]})
             change = self.dns.on_query(ts, d["src_ip"], d["dst_ip"], info,
                                        key)
+            # second audit (#36): data hidden in name lookups; the router
+            # forwards everyone's lookups, so it is not judged
+            if key and src_dev.live and info.get("qname") and \
+                    d["src_ip"] != self.gateway_ip:
+                hit = self.dns_tunnels.note(key, info["qname"],
+                                            info.get("qtype"), ts)
+                if hit:
+                    self._alert(self.alerts.dns_tunnel(src_dev, *hit))
             if change and src_dev and src_dev.live:
                 self.push_timeline("dns change", "WARNING",
                                    f"{src_dev.display_name()} now uses DNS "
@@ -24561,7 +24992,7 @@ class NetworkModel:
         thr = _int(self.config.get("alerts.reset_threshold", 40), 40)
         if len(dq) >= thr:
             dev = self.registry.by_key.get(f.device_key)
-            if dev and dev.live:
+            if dev and dev.live and not self._scanning(dev.key):
                 top = Counter(r for _t, r in dq).most_common(1)
                 self._alert(self.alerts.tcp_resets(
                     dev, len(dq), 600, top[0][0] if top else ""))
@@ -24627,10 +25058,14 @@ class NetworkModel:
             q = self.flow_starts.get(fk)
             if q is None:
                 if len(self.flow_starts) >= 6000:
-                    self.flow_starts.popitem(last=False)
+                    old, _q = self.flow_starts.popitem(last=False)
+                    self.flow_start_n.pop(old, None)
                 # C7: 24 is plenty for periodic_findings (needs 11)
                 q = self.flow_starts[fk] = deque(maxlen=24)
             q.append(ts)
+            n = self.flow_start_n[fk] = self.flow_start_n.get(fk, 0) + 1
+            if n >= BEACON_MIN_CONTACTS and n % 5 == 0:
+                self._check_beacon(fk, q, n, flow)
             self.observe("flow_start", flow.device_key, ts,
                          {"remote": flow.remote_ip, "port": flow.remote_port,
                           "proto": flow.transport, "flow": flow.fid,
@@ -24890,10 +25325,39 @@ class NetworkModel:
                 if len(b.countries) < 80:
                     b.countries.add(code)
 
-    def deep_login(self, t):
+    def _observe_login(self, d):
+        """Second audit (#34): a sign-in seen in one packet, in every mode
+        (Full Power reassembles more, but a web form's password, HTTP
+        Basic, a password in a web address and FTP/POP3/IMAP sign-ins on
+        their usual ports fit in one packet). A form whose body comes in
+        the next packet is looked at then. Only who, where and how are
+        kept; the packet's bytes are read here and dropped."""
+        key4 = (d["src_ip"], d["sport"], d["dst_ip"], d["dport"])
+        how, proto = d.get("login") or "", d.get("login_proto") or "HTTP"
+        if d.get("form_post") and not how:
+            self._bounded_put(self._form_wait, key4, d["time"], 256)
+            return None
+        if not how:
+            if key4 not in self._form_wait:
+                return None
+            del self._form_wait[key4]
+            n = d.get("payload_len") or 0
+            raw = d.get("raw") or b""
+            if not raw and d.get("pkt") is not None:
+                with contextlib.suppress(Exception):
+                    raw = bytes(d["pkt"])          # scapy's decoder
+            how = http_form_login(bytes(raw[-n:][:4096]) if n else b"")
+            if not how:
+                return None
+        return self.deep_login({"client": d["src_ip"],
+                                "server": d["dst_ip"], "port": d["dport"],
+                                "proto": proto, "how": how}, packet=True)
+
+    def deep_login(self, t, packet=False):
         """5.3.4 (IP-013): a login the deep pass saw sent without
         encryption (a transaction dict: client, server, port, proto, how;
-        never the user name or password). → the alert or None."""
+        never the user name or password). → the alert or None.
+        `packet`: seen in one packet (second audit #34), not reassembled."""
         if not FEATURES.get("login_warning", True):
             return None
         client = str(t.get("client") or "")
@@ -24912,7 +25376,9 @@ class NetworkModel:
         return self._alert(self.alerts.cleartext_login(
             name, key, sanitize_text(str(t.get("proto") or "?"), 12),
             server, port, is_public_ip(server),
-            how=sanitize_text(str(t.get("how") or ""), 60)))
+            how=sanitize_text(str(t.get("how") or ""), 60),
+            why="A sign-in was recognised in an unencrypted packet."
+            if packet else None, source=":pkt" if packet else ""))
 
     def _observe_cleartext(self, d, src_dev, dst_dev, direction):
         proto = d["cleartext"]
@@ -24960,9 +25426,129 @@ class NetworkModel:
                              new_conn=bool(new_flow and flow and
                                            flow.device_key == dev.key))
             self._baseline_check(dev, snap)
+            if role == "sent" and direction == "up":
+                self._night_upload(dev, b, ts, d["length"], remote)
+
+    # ---- second audit 2026-11-14 (#33, #35) ----------------------------------
+    def _is_night(self, ts):
+        """baseline_period(ts) == "night", worked out once a minute."""
+        minute = int(ts // 60)
+        c = getattr(self, "_night_cache", None)
+        if c is None or c[0] != minute:
+            c = self._night_cache = (minute,
+                                     baseline_period(ts) == "night")
+        return c[1]
+
+    def _night_upload(self, dev, b, ts, nbytes, remote):
+        """(#33) What a device sends to the Internet in a rolling hour at
+        night (23:00-07:00 local time). Raised once a night when it passes
+        NIGHT_UPLOAD_BYTES and more than twice the most it sent in a night
+        hour before (DeviceBaseline.night_up_max, kept with the baseline):
+        a NAS that backs up every night is told once, not every night. A
+        backup service is said, as an INFO."""
+        if not self._is_night(ts) or dev.ip == self.gateway_ip:
+            return None
+        night = story_day(ts - 12 * 3600)        # the evening it began
+        ep = self.night_up.get(dev.key)
+        if ep is None or ep["night"] != night:
+            ep = {"night": night, "mins": deque(), "total": 0,
+                  "to": Counter(), "prev": b.night_up_max, "told": False}
+            self.night_up[dev.key] = ep
+            if len(self.night_up) > 2000:
+                for k in list(self.night_up)[:200]:
+                    del self.night_up[k]
+        minute = int(ts // 60)
+        mins = ep["mins"]
+        if mins and mins[-1][0] == minute:
+            mins[-1][1] += nbytes
+        else:
+            mins.append([minute, nbytes])
+        ep["total"] += nbytes
+        while mins and minute - mins[0][0] >= NIGHT_UPLOAD_WINDOW // 60:
+            ep["total"] -= mins.popleft()[1]
+        if remote and (remote in ep["to"] or len(ep["to"]) < 64):
+            ep["to"][remote] += nbytes
+        total = ep["total"]
+        if total > b.night_up_max:
+            b.night_up_max = total
+        if ep["told"] or total < NIGHT_UPLOAD_BYTES or \
+                total <= 2 * ep["prev"]:
+            return None
+        ep["told"] = True
+        sent = sum(ep["to"].values()) or 1
+        backup = 0
+        service = ""
+        for ip, n in ep["to"].most_common():
+            hit = known_bulk_service(self.ip_to_domains.get(ip) or (),
+                                     "backup")
+            if hit:
+                backup += n
+                service = service or hit[0]
+        top = ep["to"].most_common(1)
+        top_ip = top[0][0] if top else ""
+        names = self.ip_to_domains.get(top_ip)
+        dest = next(reversed(names)) if names else (top_ip or "?")
+        if len(ep["to"]) > 1:
+            dest += f" and {len(ep['to']) - 1} other servers" \
+                if len(ep["to"]) > 2 else " and 1 other server"
+        minutes = mins[-1][0] - mins[0][0] + 1
+        return self._alert(self.alerts.night_upload(
+            dev, total, minutes, dest,
+            service if backup >= 0.7 * sent else "",
+            start=mins[0][0] * 60.0))
+
+    def _check_beacon(self, fk, starts, n, flow):
+        """(#35) A device that opens a new connection to one server on a
+        timer. Few false alarms: 30 contacts or more, nearly even gaps
+        (beacon_period), not name lookups, the clock, call set-up or a
+        ping, not the router, and a server no other device of yours uses
+        (a gadget maker's cloud is shared by its gadgets)."""
+        dev_key, remote = fk
+        if flow is None or flow.transport not in ("TCP", "UDP") or \
+                flow.remote_port in BEACON_SKIP_PORTS:
+            return None
+        reg = self.registry
+        dev = reg.by_key.get(dev_key) or reg.by_key.get(reg.resolve(dev_key))
+        if dev is None or not dev.live or dev.ip == self.gateway_ip:
+            return None
+        rec = self.remote_hosts.get(remote)
+        if rec is not None and len(rec.devices) > 1:
+            return None
+        period = beacon_period(starts)
+        if period is None:
+            return None
+        names = self.ip_to_domains.get(remote)
+        dest = next(reversed(names)) if names else remote
+        return self._alert(self.alerts.beacon(dev, dest, remote, period, n,
+                                              bool(names)))
+
+    def _bulk_service(self, dev, upload):
+        """Second audit (#38): the known backup (upload) or streaming
+        (download) service the device's busiest remote of its last minute
+        belongs to, or ""."""
+        b = self.baselines.devices.get(dev.key)
+        if b is None:
+            return ""
+        by = b.cur_up_by if upload else b.cur_down_by
+        for ip in (b.last_top[0 if upload else 1],
+                   max(by, key=by.get) if by else ""):
+            hit = known_bulk_service(self.ip_to_domains.get(ip) or (),
+                                     "backup" if upload else "stream") \
+                if ip else None
+            if hit:
+                return hit[0]
+        return ""
 
     def _baseline_check(self, dev, snap):
         for feat, v, m in self.baselines.check(snap):
+            if feat in ("bytes_up", "bytes_down") and \
+                    self._bulk_service(dev, feat == "bytes_up"):
+                # second audit (#38): an iCloud backup or a Netflix film
+                # is told on the Timeline, not raised as unusual
+                if not self.alerts._debounced(
+                        f"bulk:{feat}:{dev.key}", 1800):
+                    self._spike_story(dev, None, feat == "bytes_up", v)
+                continue
             a = self._alert(self.alerts.baseline_anomaly(
                 dev, feat, v, m, self.baselines.last_note))
             if a is not None and not a.updated and \
@@ -25011,7 +25597,7 @@ class NetworkModel:
         on this computer sent 80.0 MB in one minute"."""
         start = (int(self.now() // 60) - 1) * 60.0
         prog = self.spike_program(dev, upload, start)
-        if prog is not None:
+        if prog is not None and a is not None:
             a.refs["program"] = prog or "?"
         text = spike_sentence(hm_clock(start), dev.display_name(), upload,
                               _human_bytes(value), prog is not None,
@@ -25155,6 +25741,7 @@ class NetworkModel:
         self._check_dns(now)
         self._check_broadcast(now)
         self._check_scans(now)
+        self._check_duplicates(now)
         yield "checks"
         for dev in list(self.registry.by_key.values()):
             if dev.state != STATE_ACTIVE or not dev.live:
@@ -25272,6 +25859,24 @@ class NetworkModel:
                     self.device_for(top[0][0])
                 who = dev.display_name() if dev else top[0][0]
             self._alert(self.alerts.broadcast_storm(pps, who))
+
+    def _scanning(self, key):
+        """Second audit (#39): the device is scanning (an open alert, or
+        its last minute looks like one). The resets a scan gets back are
+        the scan's own, not "a service refusing connections"."""
+        eng = self.alerts
+        a = eng.alerts.get(eng._open.get(("scan_pattern", key), ""))
+        if a is not None and not a.acknowledged:
+            return True
+        if len(self.scans.attempts.get(key) or ()) < 20:
+            return False
+        # a third of the scan thresholds: the resets (40 by default) come
+        # in before the scan alert's 60 ports
+        return self.scans.evaluate(
+            key, max(10, _int(self.config.get(
+                "alerts.scan_ports_threshold", 60), 60) // 3),
+            max(10, _int(self.config.get(
+                "alerts.scan_hosts_threshold", 40), 40) // 3)) is not None
 
     def _check_scans(self, now):
         pt = _int(self.config.get("alerts.scan_ports_threshold", 60), 60)
@@ -25400,9 +26005,43 @@ class NetworkModel:
                                    f"which looks like a {kind or 'VPN'} "
                                    f"server", ("remote", ip))
 
+    def dhcp_trusted(self):
+        """Second audit (#37): (server, router) of the DHCP server this
+        network trusts: the one that names the router this computer uses
+        (live), else the first one seen. A rogue server arrives later and
+        often answers more, so the count can't decide."""
+        offers = [(s, o) for s, o in self.dhcp_offers.items()
+                  if o.get("router")]
+        if not offers:
+            return None
+        if self.gateway_ip and not self.use_packet_clock:
+            for s, o in offers:
+                if o["router"] == self.gateway_ip:
+                    return s, o["router"]
+        return offers[0][0], offers[0][1]["router"]
+
+    def dhcp_rogue(self):
+        """Second audit (#37): (server, router, DNS servers, trusted server,
+        trusted router) of a second DHCP server that hands out a different
+        router than the trusted one, else None."""
+        trusted = self.dhcp_trusted()
+        if trusted is None:
+            return None
+        for s, o in self.dhcp_offers.items():
+            if s != trusted[0] and o.get("router") and \
+                    o["router"] != trusted[1]:
+                return s, o["router"], list(o.get("dns") or []), \
+                    trusted[0], trusted[1]
+        return None
+
     def infer_gateway(self):
         """For imported captures: work out which address is the router,
-        from DHCP 'router' options or from where Internet traffic flows."""
+        from DHCP 'router' options or from where Internet traffic flows.
+        Second audit (#37): when DHCP servers disagree about the router,
+        the trusted server's router, never the busiest offer (a rogue
+        server answering every request named itself the gateway)."""
+        if self.dhcp_rogue() is not None:
+            return self.dhcp_trusted()[1]
         if self.dhcp_routers:
             return self.dhcp_routers.most_common(1)[0][0]
         if self.gw_mac_traffic:
@@ -25493,6 +26132,7 @@ def _default_config():
                    "new_country": True, "broadcast_storm": True,
                    "scan_pattern": True, "reputation": True,
                    "cleartext_login": True, "own_blocklist_path": "",
+                   "night_upload": True, "beacon": True, "dns_tunnel": True,
                    "chatty_multiplier": 4, "chatty_min_rate": 3,
                    "unknown_min_packets": 5, "reconnect_count": 5,
                    "reconnect_window_minutes": 30, "arp_flip_threshold": 4,
@@ -27387,8 +28027,10 @@ def story_build(dg, names=None, last_looked=None, now=None):
         elif group == "alert":
             sev = "DANGER" if any(f[1] == "DANGER" for f in facts) \
                 else "WARNING"
-            say = _story_say("Warning: %s", (subject,), (0,)) if n == 1 \
-                else _story_say("Warning (%d times): %s", (n, subject),
+            # second audit (#39): a DANGER is said as one, not "Warning"
+            word = "Danger" if sev == "DANGER" else "Warning"
+            say = _story_say(word + ": %s", (subject,), (0,)) if n == 1 \
+                else _story_say(word + " (%d times): %s", (n, subject),
                                 (1,))
             item(facts, group, say, None, "", sev)
         elif group == "spike":
@@ -30446,8 +31088,10 @@ First visit to %s ¦ Première visite sur %s ¦ Primera visita a %s
 %s changed its address %d times ¦ %s a changé d'adresse %d fois ¦ %s cambió de dirección %d veces
 %s changed DNS server %d times ¦ %s a changé de serveur DNS %d fois ¦ %s cambió de servidor DNS %d veces
 %s (%d times) ¦ %s (%d fois) ¦ %s (%d veces)
-Warning: %s ¦ Avertissement : %s ¦ Advertencia: %s
-Warning (%d times): %s ¦ Avertissement (%d fois) : %s ¦ Advertencia (%d veces): %s
+Warning: %s ¦ Avertissement : %s ¦ Aviso: %s
+Warning (%d times): %s ¦ Avertissement (%d fois) : %s ¦ Aviso (%d veces): %s
+Danger: %s ¦ Danger : %s ¦ Peligro: %s
+Danger (%d times): %s ¦ Danger (%d fois) : %s ¦ Peligro (%d veces): %s
 What changed: the story ¦ Ce qui a changé : le récit ¦ Qué cambió: el relato
 Read the story ¦ Lire le récit ¦ Leer el relato
 The changes of the last days in plain sentences, with what is new since you last looked. ¦ Les changements des derniers jours en phrases simples, avec ce qui est nouveau depuis votre dernier coup d'œil. ¦ Los cambios de los últimos días con frases sencillas, con lo nuevo desde la última vez que miró.
@@ -30482,7 +31126,6 @@ No calls seen yet. ¦ Aucun appel vu pour l'instant. ¦ Todavía no se ha visto 
 %d connections looked like a call but had no connection check, so they are not measured. ¦ %d connexions ressemblaient à un appel mais sans vérification de connexion : elles ne sont pas mesurées. ¦ %d conexiones parecían una llamada pero no tenían comprobación de conexión, así que no se miden.
 Observed from packet headers only: no names, no sound or picture. Calls are measured after the call app checks its connection (STUN); some call apps can't be measured. ¦ Observé uniquement à partir des en-têtes des paquets : ni noms, ni son, ni image. Les appels sont mesurés après que l'application d'appel a vérifié sa connexion (STUN) ; certaines applications d'appel ne peuvent pas être mesurées. ¦ Observado solo a partir de las cabeceras de los paquetes: sin nombres, sin sonido ni imagen. Las llamadas se miden después de que la aplicación de llamadas compruebe su conexión (STUN); algunas aplicaciones de llamadas no se pueden medir.
 Login sent without encryption ¦ Connexion envoyée sans chiffrement ¦ Inicio de sesión enviado sin cifrar
-A password is sent without encryption (seen in Full Power; the password itself is never kept). ¦ Un mot de passe est envoyé sans chiffrement (vu en pleine puissance ; le mot de passe lui-même n'est jamais conservé). ¦ Se envía una contraseña sin cifrar (visto en máxima potencia; la contraseña en sí nunca se guarda).
 If it is your own router, camera or storage box, look in its settings for a secure (HTTPS) way to sign in. ¦ S'il s'agit de votre propre routeur, caméra ou boîtier de stockage, cherchez dans ses réglages une connexion sécurisée (HTTPS). ¦ Si es su propio router, cámara o equipo de almacenamiento, busque en sus ajustes una forma segura (HTTPS) de iniciar sesión.
 Use a password there that you don't use anywhere else, and change it if this login crossed the Internet. ¦ Utilisez-y un mot de passe que vous n'utilisez nulle part ailleurs, et changez-le si cette connexion a traversé Internet. ¦ Use allí una contraseña que no use en ningún otro sitio, y cámbiela si este inicio de sesión cruzó Internet.
 Usually an older router, camera, printer or storage box on your own network that only offers a plain sign-in page. ¦ D'habitude un ancien routeur, une caméra, une imprimante ou un boîtier de stockage de votre réseau qui ne propose qu'une page de connexion non chiffrée. ¦ Normalmente un router, una cámara, una impresora o un equipo de almacenamiento antiguo de su red que solo ofrece una página de inicio de sesión sin cifrar.
@@ -30856,6 +31499,52 @@ the operating system ¦ le système d'exploitation ¦ el sistema operativo
 unknown program (needs admin rights to name it) ¦ programme inconnu (il faut les droits d'administrateur pour le nommer) ¦ programa desconocido (hacen falta derechos de administrador para nombrarlo)
 Database connection (MongoDB) ¦ Connexion à une base de données (MongoDB) ¦ Conexión a base de datos (MongoDB)
 Local services opened in your browser (this computer) ¦ Services locaux ouverts dans votre navigateur (cet ordinateur) ¦ Servicios locales abiertos en su navegador (este equipo)
+Large upload at night ¦ Gros envoi pendant la nuit ¦ Gran subida durante la noche
+Regular check-ins to one server ¦ Contacts réguliers avec un même serveur ¦ Contactos regulares con un mismo servidor
+Data hidden in name lookups ¦ Données cachées dans des recherches de noms ¦ Datos ocultos en búsquedas de nombres
+A device sent a lot to the Internet at night, more than it ever did at night before. ¦ Un appareil a envoyé beaucoup vers Internet pendant la nuit, plus qu'il ne l'avait jamais fait la nuit. ¦ Un dispositivo envió mucho a Internet durante la noche, más de lo que nunca había enviado de noche.
+A device opened new connections to the same server many times, at nearly even intervals. ¦ Un appareil a ouvert de nombreuses fois de nouvelles connexions vers le même serveur, à intervalles presque réguliers. ¦ Un dispositivo abrió muchas veces conexiones nuevas con el mismo servidor, a intervalos casi regulares.
+Many long, random-looking names were looked up under one domain in a few minutes. ¦ De nombreux noms longs, qui semblent aléatoires, ont été recherchés sous un même domaine en quelques minutes. ¦ Se buscaron muchos nombres largos y de aspecto aleatorio bajo un mismo dominio en pocos minutos.
+Was the device backing up, syncing photos or uploading a video overnight? Then this is expected. ¦ L'appareil faisait-il une sauvegarde, une synchronisation de photos ou l'envoi d'une vidéo cette nuit ? Alors c'est normal. ¦ ¿El dispositivo hacía una copia de seguridad, sincronizaba fotos o subía un vídeo esta noche? Entonces es lo esperado.
+If it should be idle at night, look at which program sent the data, and run a malware scan on it. ¦ S'il devrait être inactif la nuit, regardez quel programme a envoyé les données et lancez une analyse antivirus sur l'appareil. ¦ Si debería estar inactivo de noche, mire qué programa envió los datos y analice el dispositivo en busca de malware.
+Do you know the server? A weather, news or smart-home app checking in is normal. ¦ Connaissez-vous le serveur ? Une application de météo, d'actualités ou de maison connectée qui se signale, c'est normal. ¦ ¿Conoce el servidor? Que una aplicación del tiempo, de noticias o de hogar inteligente se conecte es normal.
+If the device should be idle and you don't know the server, look at which program makes the connections. ¦ Si l'appareil devrait être inactif et que vous ne connaissez pas le serveur, regardez quel programme ouvre ces connexions. ¦ Si el dispositivo debería estar inactivo y no conoce el servidor, mire qué programa abre esas conexiones.
+Is antivirus, a VPN or a remote-access tool installed on the device? Some use name lookups like this on purpose. ¦ Un antivirus, un VPN ou un outil d'accès à distance est-il installé sur l'appareil ? Certains utilisent volontairement des recherches de noms de ce genre. ¦ ¿Hay un antivirus, una VPN o una herramienta de acceso remoto en el dispositivo? Algunos usan búsquedas de nombres así a propósito.
+If not, disconnect the device from the network and run a malware scan on it. ¦ Sinon, déconnectez l'appareil du réseau et lancez une analyse antivirus. ¦ Si no, desconecte el dispositivo de la red y analícelo en busca de malware.
+Usually a backup or a photo sync that runs while the device charges at night. ¦ D'habitude une sauvegarde ou une synchronisation de photos qui tourne pendant que l'appareil charge la nuit. ¦ Normalmente una copia de seguridad o una sincronización de fotos que se hace mientras el dispositivo se carga de noche.
+Usually an app or a gadget that checks in with its server on a timer (weather, smart home, mail, updates). ¦ D'habitude une application ou un objet connecté qui se signale à son serveur à intervalles fixes (météo, maison connectée, courrier, mises à jour). ¦ Normalmente una aplicación o un aparato que se conecta con su servidor cada cierto tiempo (tiempo, hogar inteligente, correo, actualizaciones).
+Sometimes antivirus or a VPN that uses name lookups on purpose; otherwise a way to sneak data past a firewall. ¦ Parfois un antivirus ou un VPN qui utilise volontairement des recherches de noms ; sinon, un moyen de faire passer des données en douce à travers un pare-feu. ¦ A veces un antivirus o una VPN que usa búsquedas de nombres a propósito; si no, una forma de sacar datos a escondidas a través de un cortafuegos.
+Something on this device may be sending your files out while nobody uses it. ¦ Quelque chose sur cet appareil envoie peut-être vos fichiers à l'extérieur pendant que personne ne l'utilise. ¦ Puede que algo en este dispositivo esté enviando sus archivos fuera mientras nadie lo usa.
+A program on this device may be checking in with someone else's server for orders. ¦ Un programme de cet appareil demande peut-être des ordres au serveur de quelqu'un d'autre. ¦ Puede que un programa de este dispositivo esté pidiendo órdenes al servidor de otra persona.
+Check whether the device was backing up then; if not, look at which program sent the data. ¦ Vérifiez si l'appareil faisait une sauvegarde à ce moment-là ; sinon, regardez quel programme a envoyé les données. ¦ Compruebe si el dispositivo hacía una copia de seguridad en ese momento; si no, mire qué programa envió los datos.
+Look up the server; if you don't know it, see which program on the device makes the connections. ¦ Renseignez-vous sur le serveur ; si vous ne le connaissez pas, regardez quel programme de l'appareil ouvre ces connexions. ¦ Busque información sobre el servidor; si no lo conoce, mire qué programa del dispositivo abre esas conexiones.
+A password is sent without encryption (the password itself is never kept). ¦ Un mot de passe est envoyé sans chiffrement (le mot de passe lui-même n'est jamais conservé). ¦ Se envía una contraseña sin cifrar (la contraseña en sí nunca se guarda).
+A device sends much more to the Internet at night than it ever did before. ¦ Un appareil envoie la nuit beaucoup plus vers Internet qu'il ne l'a jamais fait. ¦ Un dispositivo envía de noche mucho más a Internet de lo que nunca había enviado.
+A device contacts the same server again and again on a timer. ¦ Un appareil contacte le même serveur encore et encore, à intervalles fixes. ¦ Un dispositivo contacta con el mismo servidor una y otra vez, cada cierto tiempo.
+A device looks up many long, random-looking names under one domain. ¦ Un appareil recherche de nombreux noms longs, qui semblent aléatoires, sous un même domaine. ¦ Un dispositivo busca muchos nombres largos y de aspecto aleatorio bajo un mismo dominio.
+This looks like a backup. ¦ Cela ressemble à une sauvegarde. ¦ Parece una copia de seguridad.
+Phones and computers back up while they charge at night. ¦ Les téléphones et les ordinateurs font leurs sauvegardes pendant qu'ils chargent la nuit. ¦ Los teléfonos y los ordenadores hacen sus copias de seguridad mientras se cargan de noche.
+Most of the data went to a known backup service. ¦ La plupart des données sont allées vers un service de sauvegarde connu. ¦ La mayoría de los datos fueron a un servicio de copias de seguridad conocido.
+Data left this device while it is usually idle. ¦ Des données ont quitté cet appareil à un moment où il est d'habitude inactif. ¦ Salieron datos de este dispositivo cuando normalmente está inactivo.
+Backups, photo syncs and system updates run at night too. It matters if nothing on the device should be sending files. ¦ Les sauvegardes, synchronisations de photos et mises à jour système tournent aussi la nuit. C'est important si rien sur l'appareil ne devrait envoyer de fichiers. ¦ Las copias de seguridad, las sincronizaciones de fotos y las actualizaciones del sistema también se hacen de noche. Importa si nada en el dispositivo debería estar enviando archivos.
+Compared with what this device sent at night before. ¦ Comparé à ce que cet appareil envoyait la nuit auparavant. ¦ Comparado con lo que este dispositivo enviaba de noche antes.
+Contacts on a timer are how many apps check for news, and how some malware asks for orders. ¦ Des contacts à intervalles fixes, c'est ainsi que beaucoup d'applications cherchent des nouvelles, et ainsi que certains logiciels malveillants demandent des ordres. ¦ Los contactos cada cierto tiempo son la forma en que muchas aplicaciones buscan novedades, y en que algún malware pide órdenes.
+Weather and news widgets, smart-home gadgets, mail and update checks do this. It matters if you don't know the server and the device should be idle. ¦ Les widgets de météo et d'actualités, les objets connectés, la vérification du courrier et des mises à jour font cela. C'est important si vous ne connaissez pas le serveur et que l'appareil devrait être inactif. ¦ Los widgets del tiempo y de noticias, los aparatos de hogar inteligente y las comprobaciones de correo y actualizaciones lo hacen. Importa si no conoce el servidor y el dispositivo debería estar inactivo.
+At least 30 new connections to the same server, nearly evenly spaced. ¦ Au moins 30 nouvelles connexions vers le même serveur, presque régulièrement espacées. ¦ Al menos 30 conexiones nuevas con el mismo servidor, espaciadas de forma casi regular.
+Long random names under one domain can carry data out past a firewall (DNS tunnelling). ¦ Des noms longs et aléatoires sous un même domaine peuvent faire sortir des données à travers un pare-feu (tunnel DNS). ¦ Los nombres largos y aleatorios bajo un mismo dominio pueden sacar datos a través de un cortafuegos (túnel DNS).
+Some antivirus and security programs check files this way, and a few VPN and remote-access tools use it on purpose. ¦ Certains antivirus et programmes de sécurité vérifient des fichiers de cette façon, et quelques VPN et outils d'accès à distance l'utilisent volontairement. ¦ Algunos antivirus y programas de seguridad comprueban archivos así, y unas pocas VPN y herramientas de acceso remoto lo usan a propósito.
+Most were text (TXT) lookups ¦ La plupart étaient des recherches de texte (TXT) ¦ La mayoría eran búsquedas de texto (TXT)
+Devices that take an address from it send their Internet traffic and name lookups through that device, which can read or redirect them. ¦ Les appareils qui en reçoivent une adresse font passer leur trafic Internet et leurs recherches de noms par cet appareil, qui peut les lire ou les rediriger. ¦ Los dispositivos que reciben una dirección de él envían su tráfico de Internet y sus búsquedas de nombres a través de ese dispositivo, que puede leerlos o redirigirlos.
+A second router or a travel router plugged in by mistake does the same. If you don't recognise that device, unplug it and reconnect your devices. ¦ Un second routeur ou un routeur de voyage branché par erreur fait la même chose. Si vous ne reconnaissez pas cet appareil, débranchez-le et reconnectez vos appareils. ¦ Un segundo router o un router de viaje conectado por error hace lo mismo. Si no reconoce ese dispositivo, desconéctelo y vuelva a conectar sus dispositivos.
+A second DHCP server named a different router than the usual one. ¦ Un second serveur DHCP a indiqué un autre routeur que l'habituel. ¦ Un segundo servidor DHCP indicó un router distinto del habitual.
+It names itself as the router. ¦ Il se désigne lui-même comme routeur. ¦ Se indica a sí mismo como router.
+It names itself as the DNS server. ¦ Il se désigne lui-même comme serveur DNS. ¦ Se indica a sí mismo como servidor DNS.
+It names itself as the router and the DNS server. ¦ Il se désigne lui-même comme routeur et comme serveur DNS. ¦ Se indica a sí mismo como router y como servidor DNS.
+no DNS server ¦ aucun serveur DNS ¦ ningún servidor DNS
+A sign-in was recognised in an unencrypted packet. ¦ Une connexion a été reconnue dans un paquet non chiffré. ¦ Se reconoció un inicio de sesión en un paquete sin cifrar.
+a password field in a web form ¦ un champ de mot de passe dans un formulaire web ¦ un campo de contraseña en un formulario web
+a password in the web address ¦ un mot de passe dans l'adresse web ¦ una contraseña en la dirección web
+LOGIN command ¦ commande LOGIN ¦ comando LOGIN
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -31900,6 +32589,81 @@ EVENT_PATTERNS = [
     (r"(\S+) is at (\S+)", r"\1 est à \2", r"\1 está en \2"),
 ]
 I18N_PATTERNS += EVENT_PATTERNS
+# second audit 2026-11-14 (#33-#37, #40): the new alerts' sentences
+EVENT_PATTERNS += [
+    (r"(.+) backed up at night \((.+)\)",
+     r"\1 a fait une sauvegarde pendant la nuit (\2)",
+     r"\1 hizo una copia de seguridad durante la noche (\2)"),
+    (r"(.+) sent (\d[\d.,]* [KMGT]?B) to the Internet at night",
+     r"\1 a envoyé \2 vers Internet pendant la nuit",
+     r"\1 envió \2 a Internet durante la noche"),
+    (r"(.+) contacts (\S+) every (\d+ (?:s|min|h)|[\d.]+ h)",
+     r"\1 contacte \2 toutes les \3", r"\1 contacta con \2 cada \3"),
+    (r"(.+) may be hiding data in name lookups",
+     r"\1 cache peut-être des données dans des recherches de noms",
+     r"\1 quizá oculta datos en búsquedas de nombres"),
+    (r"A second device hands out addresses and names itself as your "
+     r"router: (\S+)",
+     r"Un second appareil distribue des adresses et se désigne comme "
+     r"votre routeur : \1",
+     r"Un segundo dispositivo reparte direcciones y se indica como su "
+     r"router: \1"),
+    (r"A second device hands out addresses and a different router: (\S+)",
+     r"Un second appareil distribue des adresses et un autre routeur : \1",
+     r"Un segundo dispositivo reparte direcciones y otro router: \1"),
+]
+I18N_PATTERNS += EVENT_PATTERNS[-6:]
+I18N_PATTERNS += [
+    (r"(.+) and (\d+) other servers", r"\1 et \2 autres serveurs",
+     r"\1 y otros \2 servidores"),
+    (r"(.+) and 1 other server", r"\1 et 1 autre serveur",
+     r"\1 y otro servidor"),
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"That is (.+), a backup service\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. C'est \\4, "
+     "un service de sauvegarde.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Es \\4, un "
+     "servicio de copias de seguridad."),
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"It has never sent this much in a night hour before\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. Il n'avait "
+     "jamais envoyé autant en une heure de nuit.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Nunca había "
+     "enviado tanto en una hora de noche."),
+    (r"Sent: (.+)", r"Envoyé : \1", r"Enviado: \1"),
+    (r"To: (.+)", "Vers : {t1}", "A: {t1}"),
+    (r"It opened a new connection to (\S+) (\d+) times, about once every "
+     r"(.+)\.", r"Il a ouvert une nouvelle connexion vers \1 \2 fois, à peu "
+     r"près une fois toutes les \3.", r"Abrió una conexión nueva con \1 \2 "
+     r"veces, más o menos una vez cada \3."),
+    (r"Server: (.+)", r"Serveur : \1", r"Servidor: \1"),
+    (r"Contacts: (\d+)", r"Contacts : \1", r"Contactos: \1"),
+    (r"Every: (.+)", r"Intervalle : \1", r"Intervalo: \1"),
+    (r"In (\d+) minutes it looked up (\d+) different long, random-looking "
+     r"names under (\S+), such as (.+)\.",
+     r"En \1 minutes, il a recherché \2 noms différents, longs et qui "
+     r"semblent aléatoires, sous \3, par exemple \4.",
+     r"En \1 minutos buscó \2 nombres distintos, largos y de aspecto "
+     r"aleatorio, bajo \3, por ejemplo \4."),
+    (r"Domain: (.+)", r"Domaine : \1", r"Dominio: \1"),
+    (r"Different names: (\d+)", r"Noms différents : \1",
+     r"Nombres distintos: \1"),
+    (r"(\d+) different DHCP servers seen: (.+?)\. (\S+) gives devices (\S+) "
+     r"as their router and (.+?) for name lookups\. The usual one, (\S+), "
+     r"gives (\S+) as the router\.((?: .+)?)",
+     "\\1 serveurs DHCP différents vus : \\2. \\3 donne aux appareils \\4 "
+     "comme routeur et {t5} pour les recherches de noms. L'habituel, \\6, "
+     "donne \\7 comme routeur.{t8}",
+     "Se vieron \\1 servidores DHCP distintos: \\2. \\3 da a los "
+     "dispositivos \\4 como router y {t5} para las búsquedas de nombres. "
+     "El habitual, \\6, da \\7 como router.{t8}"),
+    (r"DHCP server: (.+)", r"Serveur DHCP : \1", r"Servidor DHCP: \1"),
+    (r"Router it gives: (.+)", r"Routeur qu'il donne : \1",
+     r"Router que da: \1"),
+    (r"Usual router: (.+)", r"Routeur habituel : \1",
+     r"Router habitual: \1"),
+    (r"DNS it gives: (.+)", r"DNS qu'il donne : \1", r"DNS que da: \1"),
+]
 I18N_PATTERNS += [
     # review of #11: a nameless device's label with its address
     (r"Device using a private Wi-Fi address \((\S+)\)",
@@ -34694,9 +35458,16 @@ SETTINGS_PAGES = [
                                            "a public blocklist you turned "
                                            "on in the Components Center."),
               _alert_control("cleartext_login", "A password is sent without "
-                                                "encryption (seen in Full "
-                                                "Power; the password itself "
-                                                "is never kept)."),
+                                                "encryption (the password "
+                                                "itself is never kept)."),
+              _alert_control("night_upload", "A device sends much more to "
+                                             "the Internet at night than "
+                                             "it ever did before."),
+              _alert_control("beacon", "A device contacts the same server "
+                                       "again and again on a timer."),
+              _alert_control("dns_tunnel", "A device looks up many long, "
+                                           "random-looking names under one "
+                                           "domain."),
           ]},
          {"title": "Sensitivity", "controls": [
              {"key": "alerts.chatty_multiplier", "type": "int", "min": 2,
@@ -43958,7 +44729,7 @@ class HealthTab(BaseTab):
 #  the innocent one side by side, what was seen, and one next step.
 UNUSUAL_KINDS = ("upload_spike", "download_spike", "many_destinations",
                  "many_connections", "chatty_device", "unusual_service",
-                 "new_country")
+                 "new_country", "night_upload", "beacon")
 UNUSUAL_PROBLEM = {
     "upload_spike": "A program you don't know may be sending data out "
                     "from this device.",
@@ -43974,6 +44745,10 @@ UNUSUAL_PROBLEM = {
                        "software was changed without you.",
     "new_country": "The device may be talking to a server it has no "
                    "reason to use.",
+    "night_upload": "Something on this device may be sending your files "
+                    "out while nobody uses it.",
+    "beacon": "A program on this device may be checking in with someone "
+              "else's server for orders.",
 }
 UNUSUAL_STEP = {
     "upload_spike": "Check what the device was doing at that time (backup, "
@@ -43990,6 +44765,10 @@ UNUSUAL_STEP = {
                        "if nothing changed.",
     "new_country": "Open the device and look at the remote hosts it "
                    "contacted.",
+    "night_upload": "Check whether the device was backing up then; if not, "
+                    "look at which program sent the data.",
+    "beacon": "Look up the server; if you don't know it, see which program "
+              "on the device makes the connections.",
 }
 
 
@@ -43999,8 +44778,9 @@ def unusual_findings(engine, limit=None):
     out = []
     for aid in list(engine.order):
         a = engine.alerts.get(aid)
-        if a is None or a.acknowledged or a.kind not in UNUSUAL_KINDS:
-            continue
+        if a is None or a.acknowledged or a.kind not in UNUSUAL_KINDS or \
+                a.refs.get("explained"):
+            continue          # second audit (#38): a backup said as one
         out.append({
             "id": a.id, "kind": a.kind, "severity": a.severity,
             "title": a.reason, "saw": a.observed,
@@ -74268,6 +75048,427 @@ def t_ip013_secret_hidden_on_odd_ports(ctx):
         "GET /a?(query hidden)"
     assert _deep_preview("line", b"Proxy-Authorization: Basic x\r\n") == \
         "Proxy-Authorization: (hidden)"
+
+
+# ---- second audit 2026-11-14: detections (#33-#38) ----------------------------
+def a2_local_ts(day, hour, minute=0):
+    """A packet time at this local hour on 2026-11-<day>."""
+    return time.mktime((2026, 11, day, hour, minute, 0, 0, 0, -1))
+
+
+def a2_model(ctx, frames, decoder=None):
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, frames, decoder=decoder or fast_frame_decoder(m),
+                  tick_every=2000)
+    return m
+
+
+def a2_upload_frames(sb, host, rip, total, minutes, size=8000):
+    """`total` bytes from `host` to `rip` spread over `minutes` (one
+    frame copied: the model counts bytes, not sequence numbers)."""
+    raw = bytes(PK.Ether(src=host[1], dst=sb.GW[1]) /
+                PK.IP(src=host[0], dst=rip) /
+                PK.TCP(sport=45555, dport=443, flags="PA", seq=1) /
+                PK.Raw(bytes(size)))
+    n = total // len(raw) + 1
+    step = minutes * 60.0 / n
+    for _ in range(n):
+        sb.t += step
+        sb.frames.append((raw, round(sb.t, 6), 1))
+
+
+def a2_kinds(m, kind):
+    return [a for a in m.alerts.alerts.values() if a.kind == kind]
+
+
+@self_test()
+def t_a2_night_upload(ctx):
+    """Second audit (#33): 30 MB sent to the Internet at 3 am raises "Large
+    upload at night" (WARNING, under Unusual activity, in the Story); the
+    same upload by day, and the same upload the next night (now known),
+    raise nothing; an iCloud backup at night is said as one (INFO, kept
+    out of Unusual activity); the sentences are in French and Spanish."""
+    rip, cloud = "93.184.215.99", "17.248.1.10"
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.dns(sb.PHONE, "upload.example.net", rip)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, sb.PHONE, rip, 30 * 1024 * 1024, 12)
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "night_upload")
+    assert len(got) == 1 and got[0].severity == "WARNING", got
+    a = got[0]
+    assert a.device_key == m.device_for(sb.PHONE[0]).key, a.device_key
+    assert "upload.example.net" in a.observed and "MB" in a.reason, a
+    assert [f["kind"] for f in unusual_findings(m.alerts)] == \
+        ["night_upload"], unusual_findings(m.alerts)
+    dg = digest_new(0, time.time() + 86400)
+    for _ in digest_memory_steps(m, dg):
+        pass
+    assert any("at night" in r for _t, _s, r in dg["alerts"]), dg["alerts"]
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why,
+                     UNUSUAL_PROBLEM["night_upload"],
+                     UNUSUAL_STEP["night_upload"],
+                     ALERT_MEANS["night_upload"],
+                     ALERT_TYPES["night_upload"][0]) + tuple(
+                         ALERT_CHECKLIST["night_upload"]):
+            assert translate_text(text, loc) != text, (loc, text)
+        assert translate_event(a.reason) == a.reason    # English now
+    # the next night, the same upload is what this phone does: quiet
+    sb2 = ScenarioBuilder(t0=a2_local_ts(11, 3))
+    a2_upload_frames(sb2, sb.PHONE, rip, 30 * 1024 * 1024, 12)
+    replay_frames(m, sb2.frames, decoder=fast_frame_decoder(m),
+                  tick_every=2000)
+    assert len(a2_kinds(m, "night_upload")) == 1, a2_kinds(m, "night_upload")
+    # by day: no night alert
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 14))
+    sb.home_network()
+    sb.dns(sb.PHONE, "upload.example.net", rip)
+    a2_upload_frames(sb, sb.PHONE, rip, 30 * 1024 * 1024, 12)
+    assert not a2_kinds(a2_model(ctx, sb.frames), "night_upload")
+    # an iCloud backup at night: said as one, not unusual
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.dns(sb.PHONE, "p42-content.icloud-content.com", cloud)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, sb.PHONE, cloud, 30 * 1024 * 1024, 12)
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "night_upload")
+    assert len(got) == 1 and got[0].severity == "INFO" and \
+        "iCloud" in got[0].reason, got
+    assert not unusual_findings(m.alerts), unusual_findings(m.alerts)
+    for loc in ("fr", "es"):
+        assert translate_text(got[0].observed, loc) != got[0].observed
+
+
+@self_test()
+def t_a2_known_services_not_unusual(ctx):
+    """Second audit (#38): a spike to a backup service (up) or a streaming
+    service (down) is told on the Timeline, not raised as an Unusual
+    activity warning; the same spike to an unknown server still is."""
+    gw, ips, macs, nets = scenario_identity()
+    clock = [SCENARIO_T0]
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs, now_fn=lambda: clock[0])
+    m.set_identity(local_nets=nets)
+    dev = m.registry.touch("192.168.1.23", "da:a1:19:23:45:67", "arp_reply",
+                           "x", clock[0])
+    m.ip_to_domains["17.248.1.10"] = OrderedDict(
+        [("p42-content.icloud-content.com", 1)])
+    m.ip_to_domains["45.57.1.2"] = OrderedDict(
+        [("ipv4-c001.1.oca.nflxvideo.net", 1)])
+    b = m.baselines.get(dev.key)
+    m.baselines.check = lambda snap: snap
+    b.last_top = ("17.248.1.10", "45.57.1.2")
+    m._baseline_check(dev, [("bytes_up", 3e7, 1e5),
+                            ("bytes_down", 9e8, 1e6)])
+    assert not a2_kinds(m, "upload_spike") and \
+        not a2_kinds(m, "download_spike"), list(m.alerts.alerts.values())
+    assert sum(e["kind"] == "traffic spike" for e in m.timeline) == 2
+    b.last_top = ("93.184.215.99", "93.184.215.98")
+    m._baseline_check(dev, [("bytes_up", 3e7, 1e5)])
+    assert len(a2_kinds(m, "upload_spike")) == 1
+    assert known_bulk_service("rr3.sn-a5m.googlevideo.com") == \
+        ("YouTube", "stream")
+    assert known_bulk_service("notgooglevideo.com") is None
+
+
+def a2_syn(sb, host, rip, dport=443, proto="TCP"):
+    sp = sb._next_port()
+    out = PK.Ether(src=host[1], dst=sb.GW[1]) / PK.IP(src=host[0], dst=rip)
+    if proto == "TCP":
+        sb._emit(out / PK.TCP(sport=sp, dport=dport, flags="S", seq=1), 0)
+    else:
+        sb._emit(out / PK.UDP(sport=sp, dport=dport) / PK.Raw(bytes(48)), 0)
+
+
+@self_test()
+def t_a2_beacon(ctx):
+    """Second audit (#35): a device that contacts one server every 60 s
+    (120 times) raises "Regular check-ins to one server" (WARNING, under
+    Unusual activity), and its card counts all 120 contacts, not the 24
+    kept; the clock (NTP every 64 s), uneven contacts and a server two of
+    your devices use raise nothing."""
+    rng = random.Random(3)
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+    t = sb.t
+    for i in range(120):
+        sb.t = t + 60 * i + rng.uniform(-1.5, 1.5)
+        a2_syn(sb, sb.PHONE, "185.199.110.77")
+        sb.t += 0.5
+        a2_syn(sb, sb.TV, "93.184.215.50", 123, "UDP")          # NTP
+        sb.t += 0.5
+        a2_syn(sb, sb.NAS, "93.184.215.51")          # shared cloud …
+        a2_syn(sb, sb.PRINTER, "93.184.215.51")      # … of two devices
+    sb.t = t
+    for _ in range(120):                              # uneven
+        sb.t += rng.choice((5, 30, 90, 200, 600))
+        a2_syn(sb, sb.PLUG, "93.184.215.52")
+    sb.frames.sort(key=lambda f: f[1])
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "beacon")
+    assert len(got) == 1 and got[0].severity == "WARNING", \
+        [(a.reason, a.device_key) for a in got]
+    a = got[0]
+    phone = m.device_for(sb.PHONE[0])
+    assert a.device_key == phone.key and "185.199.110.77" in a.reason and \
+        "every 60 s" in a.reason, a.reason
+    assert "beacon" in [f["kind"] for f in unusual_findings(m.alerts)]
+    per = periodic_findings(m, only=phone.key)
+    assert per and per[0][3] == 120, per
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why,
+                     UNUSUAL_PROBLEM["beacon"], UNUSUAL_STEP["beacon"],
+                     ALERT_MEANS["beacon"], ALERT_TYPES["beacon"][0]) + \
+                tuple(ALERT_CHECKLIST["beacon"]):
+            assert translate_text(text, loc) != text, (loc, text)
+    assert beacon_period([60.0 * i for i in range(25)]) == 60.0
+    assert beacon_period([60.0 * i + (i % 2) * 25 for i in range(25)]) \
+        is None
+
+
+@self_test()
+def t_a2_dns_tunnel(ctx):
+    """Second audit (#36): 400 TXT lookups with 56-character random labels
+    under one domain raise "Data hidden in name lookups"; lookups of
+    ordinary names, long readable names, an antivirus service's hash
+    lookups and the router forwarding lookups raise nothing."""
+    rng = random.Random(9)
+    abc = "abcdefghijklmnopqrstuvwxyz234567"
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+
+    def ask(host, name, qtype=1, dst=None):
+        sp = sb._next_port()
+        sb._emit(PK.Ether(src=host[1], dst=sb.GW[1]) /
+                 PK.IP(src=host[0], dst=dst or sb.GW[0]) /
+                 PK.UDP(sport=sp, dport=53) /
+                 PK.DNS(id=sp & 0xFFFF, rd=1,
+                        qd=PK.DNSQR(qname=name, qtype=qtype)), 0.5)
+    for i in range(400):
+        label = "".join(rng.choice(abc) for _ in range(56))
+        ask(sb.LAPTOP, f"{label}.t.tunnel-example.net", 16)
+        ask(sb.PHONE, f"www{i}.shop-example.com")
+        ask(sb.PHONE, "a-very-long-but-readable-subdomain-name-here."
+                      f"cdn{i}.example.org")
+        h = "".join(rng.choice("0123456789abcdef") for _ in range(40))
+        ask(sb.TV, f"{h}.files.sophosxl.net", 16)
+        ask((sb.GW[0], sb.GW[1]), f"{label}x.t.other-example.net", 16,
+            "9.9.9.9")
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "dns_tunnel")
+    assert len(got) == 1, [(a.reason, a.device_key) for a in got]
+    a = got[0]
+    assert a.device_key == m.device_for(sb.LAPTOP[0]).key and \
+        "tunnel-example.net" in a.observed and a.confidence == "High", a
+    assert a in other_open_alerts(m.alerts)          # check-up, Security
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why,
+                     ALERT_MEANS["dns_tunnel"],
+                     ALERT_TYPES["dns_tunnel"][0]) + tuple(
+                         ALERT_CHECKLIST["dns_tunnel"]) + tuple(a.evidence):
+            assert translate_text(text, loc) != text, (loc, text)
+    assert random_label("mzxw6ytboi2gk3tfnz2xgzlsmvzgk4tbmvzwi2lomfzw63th")
+    assert not random_label("a-very-long-but-readable-subdomain-name-here")
+    assert not random_label("0123456789012345678901234567890123")
+
+
+def a2_dhcp_ack(sb, server, mac, client, router, dns):
+    chaddr = bytes.fromhex(client[1].replace(":", "")) + b"\x00" * 10
+    sb._emit(PK.Ether(src=mac, dst=client[1]) /
+             PK.IP(src=server, dst=client[0]) / PK.UDP(sport=67, dport=68) /
+             PK.BOOTP(op=2, yiaddr=client[0], chaddr=chaddr) /
+             PK.DHCP(options=[("message-type", "ack"), ("server_id", server),
+                              ("lease_time", 3600), ("router", router),
+                              ("name_server", dns), "end"]))
+
+
+@self_test()
+def t_a2_rogue_dhcp(ctx):
+    """Second audit (#37): a second DHCP server that gives out itself as the
+    router and DNS server is DANGER and says so; the gateway stays the
+    real router even though the rogue answers more often; a second server
+    that gives the same router (a mesh node) stays a WARNING."""
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+    for _ in range(12):
+        a2_dhcp_ack(sb, rogue, rmac, sb.PHONE, rogue, rogue)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    assert m.dhcp_routers.most_common(1)[0][0] == rogue     # it answers more
+    assert m.infer_gateway() == gw, m.infer_gateway()
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert len(got) == 1 and got[0].severity == "DANGER", \
+        [(a.severity, a.reason) for a in got]
+    a = got[0]
+    assert "names itself as your router" in a.reason and \
+        "It names itself as the router and the DNS server." in a.observed, a
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why) + tuple(a.evidence):
+            assert translate_text(text, loc) != text, (loc, text)
+    # a mesh node handing out the same router: a warning, as before
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+    a2_dhcp_ack(sb, "192.168.1.2", "02:66:66:00:00:02", sb.PHONE, sb.GW[0],
+                sb.GW[0])
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert len(got) == 1 and got[0].severity == "WARNING", got
+    assert m.infer_gateway() == sb.GW[0]
+
+
+@self_test()
+def t_a2_spoof_and_scan_words(ctx):
+    """Second audit (#39): during ARP spoofing of the router (DANGER), the
+    attacker's claim on a phone's address adds no "Duplicate IP address
+    … often harmless" warning, and the Story says "Danger:" (in Spanish
+    "Peligro:", and a warning "Aviso:" like its Severity column); a port
+    scan of 1,024 ports says 1,024, and the resets the scan gets back
+    raise no "Repeated connection resets" about the scanner."""
+    S = ScenarioBuilder
+    ATT = ("192.168.1.66", "02:66:66:66:66:66")
+
+    def arp(b, ip, mac, to, dt):
+        b._emit(PK.Ether(src=mac, dst=to[1]) /
+                PK.ARP(op=2, psrc=ip, hwsrc=mac, pdst=to[0], hwdst=to[1]),
+                dt=dt)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    b = S()
+    b.home_network()
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    b.frames = []
+    arp(b, ATT[0], ATT[1], S.GW, 1)
+    for sec in range(300):
+        arp(b, S.GW[0], ATT[1], S.PHONE, 1.0)
+        arp(b, S.PHONE[0], ATT[1], S.GW, 0.01)
+        if sec % 30 == 0:
+            arp(b, S.GW[0], S.GW[1], S.PHONE, 0.01)
+            arp(b, S.PHONE[0], S.PHONE[1], S.GW, 0.01)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m), tick_every=20)
+    kinds = Counter((a.kind, a.severity) for a in m.alerts.alerts.values())
+    assert kinds[("arp_spoof", "DANGER")] >= 1, kinds
+    # (192.168.1.50 is claimed by two devices of the home network itself)
+    assert not [a for a in a2_kinds(m, "duplicate_ip")
+                if S.PHONE[0] in a.reason], kinds
+    dg = digest_new(0, time.time() + 86400)
+    for _ in digest_memory_steps(m, dg):
+        pass
+    story = story_build(dg)
+    danger = [it for _d, items in story["days"] for it in items
+              if it["kind"] == "alert" and it["severity"] == "DANGER"]
+    assert danger and all(it["text"].startswith("Danger") for it in danger)
+    old = CURRENT_LOCALE
+    try:
+        set_locale("es")
+        assert story_sentence(danger[0]).startswith("Peligro"), \
+            story_sentence(danger[0])
+        warn = {"say": _story_say("Warning: %s", ("x",), ())}
+        assert story_sentence(warn).startswith(translate_text("Warning"))
+    finally:
+        set_locale(old)
+    # a port scan of a printer: 1,024 closed ports in 50 seconds
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    b = S()
+    b.home_network()
+    pr = S.PRINTER
+    for port in range(1, 1025):
+        sp = 50000 + port % 7
+        b._emit(PK.Ether(src=S.ME[1], dst=pr[1]) /
+                PK.IP(src=S.ME[0], dst=pr[0]) /
+                PK.TCP(sport=sp, dport=port, flags="S", seq=1), 0.024)
+        b._emit(PK.Ether(src=pr[1], dst=S.ME[1]) /
+                PK.IP(src=pr[0], dst=S.ME[0]) /
+                PK.TCP(sport=port, dport=sp, flags="RA", seq=0, ack=2),
+                0.0005)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m), tick_every=200)
+    scans = a2_kinds(m, "scan_pattern")
+    assert len(scans) == 1 and "1024 different ports" in scans[0].observed, \
+        [a.observed for a in scans]
+    assert not a2_kinds(m, "tcp_resets"), \
+        [a.reason for a in a2_kinds(m, "tcp_resets")]
+
+
+@self_test()
+def t_a2_login_in_default_mode(ctx):
+    """Second audit (#34): without Full Power, a password POSTed over plain
+    HTTP (in the request's packet, or in the packet after its headers, or
+    as JSON), HTTP Basic and FTP PASS each raise "Login sent without
+    encryption", from either decoder; a login page without a password, an
+    empty password field and a field that only starts with "pass" raise
+    nothing; the password is in no alert, timeline line or decoded
+    packet."""
+    c = IP013_CANARY.encode()
+    sb = ScenarioBuilder()
+    sb.home_network()
+    me, gw = sb.ME, sb.GW[1]
+    head = (b"POST /login HTTP/1.1\r\nHost: shop.example\r\nContent-Type: "
+            b"application/x-www-form-urlencoded\r\n")
+    sb._tcp_talk(me, "93.184.215.61", gw, 46001, 80, [
+        (0, head + b"Content-Length: 30\r\n\r\nuser=alex&password=" + c),
+        (1, b"HTTP/1.1 302 Found\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.62", gw, 46002, 80, [
+        (0, head + b"Content-Length: 30\r\n\r\n"),
+        (0, b"user=alex&pwd=" + c), (1, b"HTTP/1.1 302 Found\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.63", gw, 46003, 8080, [
+        (0, b"POST /api/session HTTP/1.1\r\nHost: cam.example\r\nContent-"
+            b"Type: application/json\r\n\r\n{\"user\":\"alex\",\"password\":"
+            b"\"" + c + b"\"}"), (1, b"HTTP/1.1 200 OK\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.64", gw, 46004, 21, [
+        (1, b"220 hi\r\n"), (0, b"USER alex\r\n"), (1, b"331 pw\r\n"),
+        (0, b"PASS " + c + b"\r\n"), (1, b"230 ok\r\n")])
+    # nothing to say: no password, an empty one, "passage", a GET page
+    sb._tcp_talk(me, "93.184.215.65", gw, 46005, 80, [
+        (0, head + b"\r\nuser=alex&remember=1"),
+        (0, head + b"\r\nuser=alex&password=&x=1"),
+        (0, head + b"\r\npassage=north&compass=" + c),
+        (0, b"GET /login HTTP/1.1\r\nHost: shop.example\r\n\r\n"),
+        (1, b"HTTP/1.1 200 OK\r\n\r\npassword=" + c)])
+    decoders = [fast_frame_decoder]
+    if ctx.scapy_ok:
+        decoders.append(default_frame_decoder)
+    for mk in decoders:
+        gwip, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg({}), gwip, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        replay_frames(m, sb.frames, decoder=mk(m))
+        got = a2_kinds(m, "cleartext_login")
+        where = sorted(a.refs.get("remote") for a in got)
+        assert where == ["93.184.215.61", "93.184.215.62", "93.184.215.63",
+                         "93.184.215.64"], (mk.__name__, where)
+        assert all(a.severity == "WARNING" and "unencrypted packet" in a.why
+                   for a in got), got
+        blob = json.dumps([alert_to_dict(a) for a in m.alerts.alerts
+                           .values()]) + repr(list(m.timeline)) + \
+            repr(m.ev_feed)
+        for form in ip013_secret_forms():
+            assert form not in blob, "the password leaked into an alert"
+    for raw, ts, lt in sb.frames:
+        d = fast_decode(raw, ts, lt)
+        text = repr({k: v for k, v in d.items()
+                     if k not in ("raw", "pkt", "payload")})
+        assert IP013_CANARY not in text, text[:200]
+    for loc in ("fr", "es"):
+        for text in ("a password field in a web form",
+                     "A sign-in was recognised in an unencrypted packet."):
+            assert translate_text(text, loc) != text, (loc, text)
 
 
 @self_test()
