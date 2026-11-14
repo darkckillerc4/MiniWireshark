@@ -377,6 +377,66 @@ def self_cmd(*args):
     return [sys.executable, SCRIPT_PATH] + list(args)
 
 
+def elevated_cmd(*args):
+    """self_cmd() for the copy that runs as administrator (root). Second
+    audit (security #1): Python starts isolated (-I), so the root copy
+    loads no .pth file or module from the user's own site-packages, no
+    PYTHONPATH and nothing from the current folder: the user's own
+    processes can write there, and it ran as uid 0."""
+    if FROZEN:
+        return self_cmd(*args)
+    return [sys.executable, "-I", SCRIPT_PATH] + list(args)
+
+
+ROOT_PATH_FALLBACK = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin",
+                      "/usr/bin", "/sbin", "/bin")
+
+
+def root_safe_path(path_value):
+    """Second audit (security #1): the PATH a root copy may run programs
+    from. Only folders root owns that nobody else can write to are kept
+    (the order stays): a netstat, lsof or xdg-open in the user's ~/bin
+    used to run as root. Falls back to the usual system folders."""
+    out = []
+    for d in str(path_value or "").split(os.pathsep):
+        if not d or not os.path.isabs(d) or d in out:
+            continue
+        try:
+            st = os.stat(d)
+        except OSError:
+            continue
+        if os.path.isdir(d) and st.st_uid == 0 and not st.st_mode & 0o022:
+            out.append(d)
+    if not out:
+        out = [d for d in ROOT_PATH_FALLBACK if os.path.isdir(d)] or \
+            list(ROOT_PATH_FALLBACK)
+    return os.pathsep.join(out)
+
+
+ROOT_DROPPED_ENV = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+                    "PYTHONUSERBASE", "PYTHONINSPECT", "PYTHONEXECUTABLE",
+                    "PYTHONBREAKPOINT", "PYTHONPYCACHEPREFIX")
+
+
+def harden_root_env(environ, euid=None, invoked=None):
+    """Second audit (security #1): a copy started as root for the user
+    (sudo, pkexec, the password prompt) keeps the user's HOME for the
+    data folder, but runs programs only from root's own folders, and the
+    Python processes it starts (workers, pip) load nothing of the
+    user's. -> True when it changed `environ`."""
+    if IS_WINDOWS:
+        return False
+    euid = os.geteuid() if euid is None else euid
+    invoked = (_invoking_uid() is not None) if invoked is None else invoked
+    if euid != 0 or not invoked:
+        return False
+    environ["PATH"] = root_safe_path(environ.get("PATH", ""))
+    for v in ROOT_DROPPED_ENV:
+        environ.pop(v, None)
+    environ["PYTHONNOUSERSITE"] = "1"
+    return True
+
+
 if FROZEN and "--mw-worker" not in sys.argv:
     # a windowed exe has no console: writes to None would raise
     for _name in ("stdout", "stderr"):
@@ -1132,7 +1192,7 @@ def _relaunch_elevated(more_args=(), before_exit=None):
         except OSError:
             return False
         extra += [DATA_ARG + PATHS.data, ELEV_FLAG_ARG + flag]
-    argv = self_cmd(ELEVATED_FLAG, *extra)
+    argv = elevated_cmd(ELEVATED_FLAG, *extra)
 
     def started():
         ok = os.path.exists(flag)
@@ -1161,12 +1221,15 @@ def _relaunch_elevated(more_args=(), before_exit=None):
         if started():
             _elevated_exit(rc, before_exit)
         return False
+    # second audit (security #1): root gets a PATH of root's own folders,
+    # never the user's (a program in ~/bin ran as root)
     env_pairs = [f"{v}={os.environ[v]}" for v in
                  ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
-                  "XDG_RUNTIME_DIR", "HOME", "USER", "LANG", "PATH",
+                  "XDG_RUNTIME_DIR", "HOME", "USER", "LANG",
                   "MINIWIRESHARK_DATA", "MINIWIRESHARK_CONFIG", "MW_STAGE",
                   "MINIWIRESHARK_NO_RUNTIME", "MW_READY_FILE")
-                 if v in os.environ]
+                 if v in os.environ] + \
+        ["PATH=" + root_safe_path(os.environ.get("PATH", ""))]
     launchers = []
     if shutil.which("pkexec"):
         launchers.append(["pkexec", "env"] + env_pairs)
@@ -1572,11 +1635,17 @@ if __name__ == "__main__":
 # write (POSIX: owned by this user, not group/other-writable; Windows:
 # only under the per-user LOCALAPPDATA), never by root. Anything else is
 # compiled from the file as usual.
+# Second audit (security #2): `python -c` puts the current folder first on
+# sys.path, and hmac and hashlib were imported from there before any check
+# (a hmac.py in the folder MiniWireshark was started from ran, as root under
+# sudo). The current folder is dropped before anything is imported.
 PYC_MAC_LEN = 32
 CACHED_RUN = "\n".join((
-    "import sys,os,types,marshal,hmac,hashlib,importlib.util as U",
+    "import sys;sys.path[:]=[x for x in sys.path if x]",
+    "import os,types,marshal,hmac,hashlib,importlib.util as U",
     "p=os.path.abspath(sys.argv[1]);sys.argv=sys.argv[1:]",
-    "sys.path[0]=os.path.dirname(p);c=None;q=os.environ.get('MW_PYC','')",
+    "sys.path.insert(0,os.path.dirname(p));c=None;"
+    "q=os.environ.get('MW_PYC','')",
     "try:",
     " s=os.stat(p);e=os.environ;k=e.get('MW_KEY','')",
     " if os.name=='nt':",
@@ -2399,6 +2468,7 @@ if ELEVATED_FLAG in sys.argv:
     _ELEV = True
 else:
     _ELEV = False
+harden_root_env(os.environ)
 mark_elevated_start()
 START_MONITOR = START_ARG + "monitor" in sys.argv
 if START_MONITOR:
@@ -97230,6 +97300,90 @@ def gt_c27_io_graph_units(app, ctx):
                for tx in texts), texts
     assert bit_rate(1500) == "1.5 kb/s" and axis_number(0.25) == "0.25"
     pt.show_subview("Packets")
+
+
+# ---- second audit (2026-11-14): security, privacy, settings, install -------
+@self_test(needs_source=True)
+def t_a2_elevated_copy_isolated(ctx):
+    """Second audit (security #1): the copy started as root runs Python
+    with -I, so a .pth file in the user's own site-packages (or
+    PYTHONPATH) runs nothing as root, and gets a PATH of root's own
+    folders only. The root copy drops the user's Python variables for
+    the processes it starts."""
+    if IS_WINDOWS or IS_MAC:
+        return "skip"
+    calls = []
+    real_which, real_call = shutil.which, subprocess.call
+    bad = ctx.path("a2_userbin")
+    os.makedirs(bad, exist_ok=True)
+    os.chmod(bad, 0o777)               # anyone can plant a program here
+    try:
+        shutil.which = lambda n: "/usr/bin/" + n if n == "pkexec" else None
+        subprocess.call = lambda cmd, *a, **k: calls.append(cmd) or 126
+        with _b9_patched(os.environ, PATH=bad + os.pathsep + "/usr/bin"):
+            assert _relaunch_elevated((START_ARG + "monitor",)) is False
+    finally:
+        shutil.which, subprocess.call = real_which, real_call
+    cmd = calls[0]
+    py = cmd.index(sys.executable)
+    assert cmd[py + 1] == "-I" and cmd[py + 2] == SCRIPT_PATH, cmd
+    paths = [c for c in cmd[:py] if c.startswith("PATH=")]
+    assert len(paths) == 1 and bad not in paths[0] and \
+        "/usr/bin" in paths[0], paths
+    # the -I start really ignores a planted .pth file
+    base = ctx.path("a2_userbase")
+    site_dir = os.path.join(base, "lib", f"python{sys.version_info[0]}."
+                            f"{sys.version_info[1]}", "site-packages")
+    os.makedirs(site_dir, exist_ok=True)
+    marker = ctx.path("a2_pth_ran")
+    with open(os.path.join(site_dir, "evil.pth"), "w",
+              encoding="utf-8") as f:
+        f.write(f"import os; open({marker!r}, 'w').write('ran')\n")
+    script = ctx.path("a2_noop.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("print('ok')\n")
+    env = dict(os.environ, PYTHONUSERBASE=base)
+    env.pop("PYTHONNOUSERSITE", None)
+    r = _run_hidden(cmd[py:py + 2] + [script], env=env,
+                    capture_output=True, timeout=60)
+    assert r.stdout.decode().strip() == "ok", r
+    assert not os.path.exists(marker), "a .pth file ran in the root copy"
+    # the root copy itself: root's folders only, no user Python variables
+    environ = {"PATH": bad + os.pathsep + "/usr/bin",
+               "PYTHONPATH": bad, "PYTHONUSERBASE": base, "HOME": "/h"}
+    assert harden_root_env(environ, euid=0, invoked=True)
+    assert bad not in environ["PATH"] and "PYTHONPATH" not in environ and \
+        "PYTHONUSERBASE" not in environ and environ["HOME"] == "/h" and \
+        environ["PYTHONNOUSERSITE"] == "1", environ
+    same = {"PATH": bad}
+    assert not harden_root_env(same, euid=0, invoked=False) and \
+        same == {"PATH": bad}
+    assert not harden_root_env(same, euid=1000, invoked=True)
+
+
+@self_test(needs_source=True)
+def t_a2_cached_run_ignores_the_current_folder(ctx):
+    """Second audit (security #2): CACHED_RUN imports nothing from the
+    folder it was started in (a hmac.py there ran, as root under sudo,
+    before any check)."""
+    folder = ctx.path("a2_cwd")
+    os.makedirs(folder, exist_ok=True)
+    marker = ctx.path("a2_hmac_ran")
+    for mod in ("hmac", "hashlib", "types", "marshal"):
+        with open(os.path.join(folder, mod + ".py"), "w",
+                  encoding="utf-8") as f:
+            f.write(f"open({marker!r}, 'w').write('ran')\n"
+                    f"raise SystemExit('planted {mod} ran')\n")
+    script = ctx.path("a2_src.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("import sys\nprint('source', sys.path[0] == "
+                f"{os.path.dirname(script)!r})\n")
+    env = dict(os.environ, MW_PYC=os.path.join(folder, "none.pyc"),
+               MW_KEY=os.path.join(folder, "none.key"))
+    r = _run_hidden([sys.executable, "-c", CACHED_RUN, script],
+                    capture_output=True, env=env, timeout=60, cwd=folder)
+    assert not os.path.exists(marker), r.stderr.decode()[-300:]
+    assert r.stdout.decode().strip() == "source True", r
 
 
 # ============================================================================
