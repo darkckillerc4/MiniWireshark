@@ -3290,6 +3290,8 @@ OUTBOUND_FEATURES = {
     # from Websites → Local services (it goes to 127.0.0.1 only, but the
     # page may load more, so it is recorded and the kill switch stops it)
     "local_open": "Local services opened in your browser (this computer)",
+    # ...and one "GET /" to each of them, to see if it is a web page
+    "local_probe": "Local services checked for a web page (this computer)",
 }
 
 # 5.3.4 crowd test (#3): what the kill switch does, said once. The banner,
@@ -3601,7 +3603,8 @@ def windows_powershell(environ=None):
 # "arp.exe" or "netsh.exe" in the folder MiniWireshark was started from
 # (Downloads, a shared drive) ran instead of Windows' own tool.
 WINDOWS_SYSTEM_TOOLS = frozenset({"arp", "netsh", "route", "ipconfig",
-                                  "getmac", "powershell"})
+                                  "getmac", "powershell", "netstat",
+                                  "tasklist"})
 
 
 def windows_system_tool(cmd, environ=None, windows=None):
@@ -19605,6 +19608,170 @@ def listening_key(proto, ip, port):
     return f"{proto}/{port}/{scope}"
 
 
+# ---- 5.3.4: listening TCP sockets without psutil -----------------------------
+def _split_host_port(s):
+    """"0.0.0.0:80", "[::1]:3000", "*:8080" -> (ip, port) or None."""
+    host, _sep, port = str(s).rpartition(":")
+    if not port.isdigit() or not host:
+        return None
+    return host.strip("[]"), int(port)
+
+
+def parse_netstat_listening(text):
+    """Windows `netstat -ano` -> [(ip, port, pid)] of listening TCP
+    sockets: those with no peer (0.0.0.0:0, [::]:0), as the state word
+    is in the system's language."""
+    out = []
+    for line in (text or "").splitlines():
+        p = line.split()
+        if len(p) < 5 or p[0].upper() != "TCP" or \
+                p[2] not in ("0.0.0.0:0", "[::]:0") or not p[-1].isdigit():
+            continue
+        hp = _split_host_port(p[1])
+        if hp:
+            out.append((hp[0].split("%")[0], hp[1], int(p[-1])))
+    return out
+
+
+def parse_tasklist_csv(text):
+    """Windows `tasklist /FO CSV /NH` -> {pid: program}."""
+    out = {}
+    for row in csv.reader(io.StringIO(text or "")):
+        if len(row) >= 2 and row[1].isdigit():
+            out[int(row[1])] = row[0]
+    return out
+
+
+def parse_proc_net_tcp(text):
+    """Linux /proc/net/tcp or tcp6 -> [(ip, port, socket inode)] in LISTEN
+    (state 0A). shortcut: words read little-endian (x86, ARM); a
+    big-endian Linux would need the byte order checked."""
+    out = []
+    for line in (text or "").splitlines()[1:]:
+        p = line.split()
+        if len(p) < 10 or p[3] != "0A" or ":" not in p[1]:
+            continue
+        hexip, hexport = p[1].split(":")
+        try:
+            raw = b"".join(bytes.fromhex(hexip[i:i + 8])[::-1]
+                           for i in range(0, len(hexip), 8))
+            a = ipaddress.ip_address(raw)
+            a = getattr(a, "ipv4_mapped", None) or a
+            out.append((str(a), int(hexport, 16),
+                        int(p[9]) if p[9].isdigit() else None))
+        except ValueError:
+            continue
+    return out
+
+
+def proc_socket_pids(inodes, root="/proc", limit=20000):
+    """Linux: {socket inode: pid} from the /proc/<pid>/fd links (only this
+    user's own processes can be read; root sees all). Reads at most
+    `limit` links."""
+    want = {"socket:[%d]" % i: i for i in inodes if i}
+    out, n = {}, 0
+    if not want:
+        return out
+    with contextlib.suppress(OSError):
+        for pid in os.listdir(root):
+            if not pid.isdigit():
+                continue
+            fd_dir = os.path.join(root, pid, "fd")
+            with contextlib.suppress(OSError):
+                for fd in os.listdir(fd_dir):
+                    n += 1
+                    if n > limit:
+                        return out
+                    with contextlib.suppress(OSError):
+                        i = want.get(os.readlink(os.path.join(fd_dir, fd)))
+                        if i is not None:
+                            out[i] = int(pid)
+    return out
+
+
+def proc_comm(pid, root="/proc"):
+    """Linux: the program name of process `pid`, or ""."""
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        with open(os.path.join(root, str(int(pid)), "comm"),
+                  encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    return ""
+
+
+def parse_lsof_listening(text):
+    """`lsof -nP -iTCP -sTCP:LISTEN` -> [(ip, port, pid, program)]."""
+    out = []
+    for line in (text or "").splitlines()[1:]:
+        p = line.split()
+        if len(p) < 9 or not p[1].isdigit():
+            continue
+        name = p[-2] if p[-1] == "(LISTEN)" else p[-1]
+        hp = _split_host_port(name)
+        if not hp:
+            continue
+        ip = hp[0]
+        if ip == "*":
+            ip = "::" if p[4] == "IPv6" else "0.0.0.0"
+        out.append((ip, hp[1], int(p[1]),
+                    p[0].replace("\\x20", " ")))
+    return out
+
+
+def os_listening():
+    """This computer's listening TCP sockets without psutil ->
+    {("TCP", ip, port): (pid, program)}: netstat + tasklist (Windows),
+    /proc (Linux; lsof for what that can't name) or lsof (macOS). pid
+    None: not named (another user's, needs admin). Reads only."""
+    lsof = ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"]
+    rows = []
+    if IS_WINDOWS:
+        socks = parse_netstat_listening(run_console(["netstat", "-ano"],
+                                                    10).stdout)
+        names = {}
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            if socks:
+                names = parse_tasklist_csv(run_console(
+                    ["tasklist", "/FO", "CSV", "/NH"], 10).stdout)
+        rows = [(ip, port, pid, names.get(pid, ""))
+                for ip, port, pid in socks]
+    elif os.path.exists("/proc/net/tcp"):
+        socks = []
+        for name in ("tcp", "tcp6"):
+            with contextlib.suppress(OSError):
+                with open("/proc/net/" + name, encoding="ascii",
+                          errors="replace") as f:
+                    socks += parse_proc_net_tcp(f.read())
+        pids = proc_socket_pids({i for _ip, _p, i in socks})
+        rows = [(ip, port, pids.get(i), proc_comm(pids[i]) if i in pids
+                 else "") for ip, port, i in socks]
+        if any(r[2] is None for r in rows) and shutil.which("lsof"):
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                by = {r[:2]: r[2:] for r in parse_lsof_listening(
+                    run_console(lsof, 10).stdout)}
+                rows = [r if r[2] else r[:2] + by.get(r[:2], (None, ""))
+                        for r in rows]
+    elif shutil.which("lsof"):
+        rows = parse_lsof_listening(run_console(lsof, 10).stdout)
+    return {("TCP", ip, port): (pid, name) for ip, port, pid, name in rows}
+
+
+class OsListenMap(ProcessMap):
+    """Local services without psutil: ProcessMap's listening table, read
+    with the operating system's own tools (os_listening). TCP only."""
+
+    def __init__(self):
+        super().__init__()
+        self.available = True
+
+    def read(self):
+        self.listening = os_listening()
+        self.needs_admin = any(pid is None
+                               for pid, _n in self.listening.values())
+        self.at = time.time()
+        self.seq += 1
+        return True
+
+
 # ---- 5.3.4: Local services (Websites tab) ------------------------------------
 # The services listening on this computer, one row per program and port,
 # with a plain guess at what each one is and who can reach it. Built from
@@ -19672,33 +19839,59 @@ def local_service_guess(proto, port, program=""):
     return LOCAL_UNKNOWN, False
 
 
-def local_service_url(proto, port, addrs, web):
-    """The address to open in a browser: on this computer (127.0.0.1, or
-    ::1 for a service on IPv6 only), for a TCP service that is likely a
-    web page; None otherwise (also for one that listens only on another
-    address of this computer)."""
+def local_own_addresses(app=None):
+    """This computer's own addresses: the ones the app knows (my_ips) and
+    the ones it would route out with, found without sending anything (a
+    UDP socket connected to a TEST-NET address and never used)."""
+    ips = set(getattr(getattr(app, "model", None), "my_ips", None) or ())
+    for fam, far in ((_socket.AF_INET, "192.0.2.1"),
+                     (_socket.AF_INET6, "2001:db8::1")):
+        with contextlib.suppress(OSError):
+            with _socket.socket(fam, _socket.SOCK_DGRAM) as sk:
+                sk.connect((far, 9))
+                ips.add(sk.getsockname()[0])
+    return {local_addr_key(i) for i in ips} - {"", "0.0.0.0", "::"}
+
+
+def local_service_host(addrs, own=()):
+    """The address of this computer a service is asked and opened at:
+    127.0.0.1 (or ::1 for one on IPv6 only), else one of its own
+    addresses in `own` it is bound to (a LAN address); None otherwise."""
+    keys = {local_addr_key(a) for a in addrs}
+    if keys & {"127.0.0.1", "0.0.0.0", "*"}:
+        return "127.0.0.1"
+    v4 = sorted(k for k in keys if k.startswith("127."))
+    if v4:
+        return v4[0]
+    if keys & {"::1", "::", ""}:
+        return "::1"
+    mine = {local_addr_key(o) for o in own} - {"", "0.0.0.0", "::"}
+    # an IPv6 link-local address needs its %scope, which isn't kept
+    lan = sorted(k for k in keys & mine if not k.startswith("fe80"))
+    return lan[0] if lan else None
+
+
+def local_service_url(proto, port, addrs, web, own=(), https=None):
+    """The address to open in a browser: on this computer (127.0.0.1, ::1
+    for a service on IPv6 only, or the own address in `own` a service is
+    bound to), for a TCP service that is likely a web page; None
+    otherwise. https: what the probe found; None (not asked) falls back
+    to LOCAL_HTTPS_PORTS."""
     if not web or proto != "TCP" or not isinstance(port, int) or \
             not 0 < port < 65536:
         return None
-    keys = {local_addr_key(a) for a in addrs}
-    host = None
-    if "127.0.0.1" in keys or "0.0.0.0" in keys or "*" in keys:
-        host = "127.0.0.1"
-    else:
-        v4 = sorted(k for k in keys if k.startswith("127."))
-        if v4:
-            host = v4[0]
-        elif "::1" in keys or "::" in keys or "" in keys:
-            host = "[::1]"
+    host = local_service_host(addrs, own)
     if host is None:
         return None
-    scheme = "https" if port in LOCAL_HTTPS_PORTS else "http"
-    return f"{scheme}://{host}:{port}/"
+    if https is None:
+        https = port in LOCAL_HTTPS_PORTS
+    host = f"[{host}]" if ":" in host else host
+    return f"{'https' if https else 'http'}://{host}:{port}/"
 
 
-def local_url_ok(url):
-    """True only for http(s) to this computer itself (what the Local
-    services view may open)."""
+def local_url_ok(url, own=()):
+    """True only for http(s) to this computer itself: loopback, or one of
+    its own addresses in `own` (what the Local services view may open)."""
     try:
         parts = urllib.parse.urlsplit(str(url or ""))
         port = parts.port
@@ -19706,17 +19899,104 @@ def local_url_ok(url):
         return False
     host = (parts.hostname or "").lower()
     a = ip_obj(host)
+    if a is None or a.is_unspecified:
+        return False
     return parts.scheme in ("http", "https") and port is not None and \
-        "@" not in parts.netloc and a is not None and a.is_loopback
+        "@" not in parts.netloc and (a.is_loopback or local_addr_key(
+            host) in {local_addr_key(o) for o in own})
 
 
-def local_service_rows(listening):
+# not asked "GET /": known to speak something else (Redis logs it as an
+# attack, raw printing on 9100 could print the request), databases,
+# SMB/NetBIOS; and every port the table or the program's name says isn't
+# a web page (local_service_rows)
+LOCAL_PROBE_SKIP = frozenset({137, 138, 139, 445, 1433, 3306, 5432, 6379,
+                              9100, 11211, 27017})
+
+
+def probe_local_http(host, port, own=(), timeout=1.0):
+    """One "GET /" to a port of THIS computer (loopback, or one of its own
+    addresses in `own`; never another host, and no redirect is
+    followed): plain HTTP, then TLS without checking the certificate when
+    the answer looks like TLS. Each try: `timeout` s to connect, then
+    `timeout` s to read at most 64 KB; each is listed in the ledger and
+    stopped by the kill switch (OutboundBlocked).
+    -> {"web", "https", "status", "title"}"""
+    a = ip_obj(host)
+    if a is None or a.is_unspecified or not (a.is_loopback or local_addr_key(
+            host) in {local_addr_key(o) for o in own}):
+        raise ValueError("only this computer is asked")
+    port = int(port)
+    if not 0 < port < 65536:
+        raise ValueError("not a port")
+    where = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    req = (f"GET / HTTP/1.0\r\nHost: {where}\r\nUser-Agent: MiniWireshark"
+           f"\r\nAccept: text/html\r\nConnection: close\r\n\r\n").encode()
+
+    def ask(tls):
+        """-> (bytes read, the server closed by itself)"""
+        outbound("local_probe", "https" if tls else "http", where,
+                 "GET / (this computer only)")
+        data, closed, accepted = b"", False, False
+        try:
+            with _socket.create_connection((host, port), timeout) as raw:
+                accepted, sk = True, raw
+                if tls:
+                    import ssl
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE   # it is this computer
+                    sk = ctx.wrap_socket(raw)
+                with sk:
+                    sk.sendall(req)
+                    end = time.monotonic() + timeout
+                    while len(data) < 65536:
+                        left = end - time.monotonic()
+                        if left <= 0:
+                            break
+                        sk.settimeout(left)
+                        chunk = sk.recv(65536 - len(data))
+                        if not chunk:
+                            closed = True
+                            break
+                        data += chunk
+        except _socket.timeout:
+            pass                       # a mute server: not closed
+        except OSError:                # reset: closed (refused: not)
+            closed = closed or (accepted and not data)
+        return data, closed
+    status = re.compile(rb"HTTP/\d\.\d (\d{3})")
+    data, closed = ask(False)
+    https = False
+    m = status.match(data)
+    # TLS: a TLS record back, a close without a word (OpenSSL), or "400:
+    # plain HTTP sent to an HTTPS port" (nginx)
+    if data[:2] in (b"\x15\x03", b"\x16\x03") or (closed and not data) or \
+            (m and m.group(1) == b"400" and b"https" in data.lower()):
+        tdata, _c = ask(True)
+        tm = status.match(tdata)
+        if tm:
+            data, m, https = tdata, tm, True
+    if not m:
+        return {"web": False, "https": False, "status": 0, "title": ""}
+    t = re.search(rb"<title[^>]*>(.*?)</title", data, re.I | re.S)
+    title = sanitize_text(" ".join(html.unescape(t.group(1).decode(
+        "utf-8", "replace")).split()), 120) if t else ""
+    return {"web": True, "https": https, "status": int(m.group(1)),
+            "title": title}
+
+
+def local_service_rows(listening, own=(), probes=None):
     """ProcessMap.listening ({(proto, ip, port): (pid, name)}) -> the rows
     of the Local services view: one per protocol, port and program, its
     addresses merged. Each row: {"proto", "port", "program", "addrs",
     "network" (reachable from other devices), "what", "web", "url",
-    "safety"}. High UDP ports (a client's, not a service) are left out.
-    Reachable from the network first, then by protocol and port."""
+    "safety", "probe" (the key to ask it "GET /" by: (port, program,
+    host), None when it isn't asked), "https", "title"}. `own`: this
+    computer's addresses; `probes`: {probe key: probe_local_http answer},
+    which wins over the guess. High UDP ports (a client's, not a service)
+    are left out. Reachable from the network first, then by protocol and
+    port."""
     groups = {}
     for (proto, ip, port), ent in (listening or {}).items():
         if proto not in ("TCP", "UDP") or not isinstance(port, int):
@@ -19730,11 +20010,23 @@ def local_service_rows(listening):
         network = any(not _local_is_loopback(a) for a in addrs)
         what, web = local_service_guess(proto, port, prog)
         addrs = tuple(sorted(addrs, key=lambda a: (":" in a, a)))
+        host = local_service_host(addrs, own)
+        key = (port, prog, host) if proto == "TCP" and host and \
+            port not in LOCAL_PROBE_SKIP and \
+            (web or what == LOCAL_UNKNOWN) else None
+        got = (probes or {}).get(key) if key else None
+        https, title = None, ""
+        if got:
+            web, https, title = got["web"], got["https"], got["title"]
+            if web and what == LOCAL_UNKNOWN:
+                what = LOCAL_WEB_SERVER[80]
         rows.append({"proto": proto, "port": port, "program": prog,
                      "addrs": addrs, "network": network, "what": what,
                      "web": web,
-                     "url": local_service_url(proto, port, addrs, web),
-                     "safety": LOCAL_EXPOSED if network else LOCAL_SAFE})
+                     "url": local_service_url(proto, port, addrs, web,
+                                              own, https),
+                     "safety": LOCAL_EXPOSED if network else LOCAL_SAFE,
+                     "probe": key, "https": https, "title": title})
     rows.sort(key=lambda r: (not r["network"], r["proto"], r["port"],
                              r["program"]))
     return rows
@@ -19769,7 +20061,10 @@ def local_service_cells(r):
     if prog in ("the operating system",
                 "unknown program (needs admin rights to name it)"):
         prog = tt(prog)
-    return (r["port"], r["proto"], tt(r["what"]), tt(r["safety"]), prog,
+    what = tt(r["what"])
+    if r.get("title"):                 # the page's own title, when asked
+        what += " — " + r["title"]
+    return (r["port"], r["proto"], what, tt(r["safety"]), prog,
             f"{where} ({', '.join(shown)})")
 
 
@@ -43071,6 +43366,12 @@ class LocalServicesView:
         self._poll_job = None
         self._reading_until = 0.0
         self._auto_at = 0.0
+        self._os_pm = None       # without psutil: OsListenMap
+        # (port, program, host) -> probe_local_http's answer, or None
+        # (being asked, or couldn't be): each port is asked once, again
+        # only on Refresh
+        self.probes = {}
+        self._probe_seq = self._probe_seen = 0
         top = tk.Frame(frame, bg=WHITE, padx=12, pady=8)
         top.pack(fill="x")
         self.head_lbl = tk.Label(top, text="\U0001F5A5  Local services — programs on this "
@@ -43094,8 +43395,8 @@ class LocalServicesView:
                    add="+")
         bar = tk.Frame(frame, bg=WHITE, padx=12)
         bar.pack(fill="x", pady=(0, 6))
-        self.refresh_btn = ttk.Button(bar, text="Refresh",
-                                      command=self.reload)
+        self.refresh_btn = ttk.Button(
+            bar, text="Refresh", command=lambda: self.reload(reprobe=True))
         self.refresh_btn.pack(side="left")
         self.open_btn = ttk.Button(bar, text="Open in browser",
                                    command=self.open_selected,
@@ -43129,21 +43430,31 @@ class LocalServicesView:
     def demo(self):
         return getattr(self.app, "data_mode", "") == "demo"
 
+    def _pm(self):
+        """psutil's connection table, or without psutil the operating
+        system's own tools (OsListenMap)."""
+        pm = self.app.procmap
+        if pm.available:
+            return pm
+        if self._os_pm is None:
+            self._os_pm = OsListenMap()
+        return self._os_pm
+
     def snapshot(self):
         if self.source is not None:
             return self.source()
         if self.demo():
             return "ok", dict(DEMO_LOCAL_LISTENERS)
-        return local_services_state(self.app.procmap)
+        return local_services_state(self._pm())
 
     def reading(self):
         return self.source is None and not self.demo() and \
-            time.time() < self._reading_until and self.app.procmap.busy
+            time.time() < self._reading_until and self._pm().busy
 
     def shown(self):
         """The sub-view was opened: show what is known and read the list
         again when it is old."""
-        pm = self.app.procmap
+        pm = self._pm()
         if self.source is None and not self.demo() and pm.available and \
                 time.time() - pm.at > self.AUTO_EVERY:
             self.reload()
@@ -43154,24 +43465,30 @@ class LocalServicesView:
         """While shown (the tab's refresh): new rows when the table was
         read again; read it again now and then when not watching live
         (live capture reads it every few seconds anyway)."""
-        pm = self.app.procmap
+        pm = self._pm()
         now = time.time()
         if self.source is None and pm.available and \
-                self.app.data_mode not in ("live", "demo") and \
+                (self.app.data_mode != "live" or
+                 pm is not self.app.procmap) and \
+                self.app.data_mode != "demo" and \
                 not pm.busy and self._poll_job is None and \
                 now - pm.at > self.AUTO_EVERY and \
                 now - self._auto_at > self.AUTO_EVERY:
             self._auto_at = now        # a read that fails is not retried
             self.reload()              # on every tick
             return
-        if (pm.seq != self._seen_seq or self.demo() != self._seen_demo) \
-                and self._poll_job is None:
+        if (pm.seq != self._seen_seq or self.demo() != self._seen_demo or
+                self._probe_seq != self._probe_seen) and \
+                self._poll_job is None:
             self.refresh()
 
-    def reload(self):
+    def reload(self, reprobe=False):
         """Refresh: read the connection table again (in the background)
-        and show it when the read is done. One wait at a time."""
-        pm = self.app.procmap
+        and show it when the read is done. One wait at a time. `reprobe`
+        (the Refresh button): ask every web port again."""
+        if reprobe:
+            self.probes = {}
+        pm = self._pm()
         if self.source is None and pm.available and not self.demo():
             pm.refresh(force=True)
             self._reading_until = time.time() + self.READ_TIMEOUT
@@ -43196,14 +43513,19 @@ class LocalServicesView:
     # ---- the table --------------------------------------------------------
     def refresh(self, force=False):
         state, listening = self.snapshot()
-        pm = self.app.procmap
-        self._seen_seq = pm.seq
+        pm = self._pm()
+        self._seen_seq, self._probe_seen = pm.seq, self._probe_seq
         self._seen_demo = demo = self.demo()
-        rows = local_service_rows(listening) if state == "ok" else []
+        # Demo Mode's made-up services are never this computer's
+        own = () if demo else local_own_addresses(self.app)
+        rows = local_service_rows(listening, own, self.probes) \
+            if state == "ok" else []
+        self._start_probes(rows, own)
         partial = state == "ok" and self.source is None and not demo and \
             bool(pm.needs_admin)
         sig = (CURRENT_LOCALE, state, self.reading(), partial, demo,
-               tuple((self._key(r), r["addrs"]) for r in rows))
+               tuple((self._key(r), r["addrs"], r["url"], r["title"])
+                     for r in rows))
         if sig == self._sig and not force:
             return False
         self._sig, self.state, self.rows = sig, state, rows
@@ -43249,6 +43571,40 @@ class LocalServicesView:
         self._sync_buttons()
         self.kit.empty_soon()
         return True
+
+    def _start_probes(self, rows, own):
+        """Ask the ports not asked yet "GET /" in the background (at most 8
+        at a time); the table shows the answers when they are in. Not
+        for fixture rows, nor in Demo Mode (it sends nothing)."""
+        if self.source is not None or \
+                getattr(self.app, "data_mode", "") == "demo":
+            return False
+        todo = [r["probe"] for r in rows
+                if r["probe"] and r["probe"] not in self.probes]
+        if not todo:
+            return False
+        probes = self.probes          # Refresh starts a new one
+
+        def one(k):
+            port, _prog, host = k
+            try:
+                probes[k] = probe_local_http(host, port, own)
+            except (OSError, ValueError):            # the kill switch too
+                pass
+
+        def work():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(
+                    8, thread_name_prefix="local-probe") as ex:
+                list(ex.map(one, todo))
+            self._probe_seq += 1
+        for k in todo:
+            probes[k] = None
+        if start_one("local-probe", work):
+            return True
+        for k in todo:                # one is running: asked after it
+            probes.pop(k, None)
+        return False
 
     def empty_state(self):
         if self.reading():
@@ -43307,12 +43663,13 @@ class LocalServicesView:
 
     def open_service(self, r):
         """Open a web app of this computer in the browser: only a TCP
-        service that is likely a web page, only at 127.0.0.1 (or ::1), and
+        service that is likely a web page, only at 127.0.0.1 (or ::1, or
+        an own address of this computer it alone is bound to), and
         through the outbound() gate, so the ledger lists it and the kill
         switch stops it. -> True when the browser was asked to open it."""
         tt = translate_text
         url = r.get("url") if r else None
-        if not url or not local_url_ok(url):
+        if not url or not local_url_ok(url, local_own_addresses(self.app)):
             self.app._set_banner(tt(
                 "This service doesn't look like a web page, so it isn't "
                 "opened in the browser."), "info")
@@ -79006,8 +79363,10 @@ def outbound_bypasses(tree):
                     starts_online(child, near)
                 if is_send:
                     owner = fn.name if fn is not None else "<module>"
-                    # os_identity: connect() on a UDP socket sends nothing
-                    exempt = owner in ("net_urlopen", "os_identity") or \
+                    # os_identity, local_own_addresses: connect() on a UDP
+                    # socket sends nothing
+                    exempt = owner in ("net_urlopen", "os_identity",
+                                       "local_own_addresses") or \
                         top.startswith(("t_", "_gs_", "test_"))
                     if not exempt and not (fn is not None and
                                            calls_outbound(fn)):
@@ -85456,6 +85815,7 @@ def t_a2_local_services_demo_is_made_up(ctx):
         app=app, source=None, _reading_until=0.0, _poll_job=None,
         READ_TIMEOUT=LocalServicesView.READ_TIMEOUT, POLL_MS=150,
         _poll=lambda: None,
+        _pm=lambda: pm,
         frame=types.SimpleNamespace(after=lambda ms, fn: None))
     view.demo = lambda: LocalServicesView.demo(view)
     state, listening = LocalServicesView.snapshot(view)
@@ -85486,6 +85846,282 @@ def t_a2_local_services_demo_is_made_up(ctx):
     app.data_mode = "live"
     state, listening = LocalServicesView.snapshot(view)
     assert state == "ok" and listening == real, listening
+
+
+@self_test()
+def t_534_local_program_names_without_psutil(ctx):
+    """Local services without psutil: netstat (in any language: a socket
+    with no peer) plus tasklist's CSV on Windows; on Linux the listening
+    socket's inode leads to its process through /proc/<pid>/fd (bounded)
+    and /proc/<pid>/comm names it; lsof (macOS, and Linux sockets /proc
+    can't name)."""
+    net = ("\r\nConnexions actives\r\n\r\n  Proto  Adresse locale   Adresse "
+           "distante  État\r\n"
+           "  TCP    0.0.0.0:135      0.0.0.0:0   ÉCOUTE   1012\r\n"
+           "  TCP    127.0.0.1:5173   0.0.0.0:0   ÉCOUTE   4242\r\n"
+           "  TCP    [::1]:3000       [::]:0      ÉCOUTE   77\r\n"
+           "  TCP    192.168.1.5:50000 93.184.215.14:443 ÉTABLIE 4242\r\n"
+           "  UDP    0.0.0.0:5353     *:*                  900\r\n")
+    assert parse_netstat_listening(net) == [
+        ("0.0.0.0", 135, 1012), ("127.0.0.1", 5173, 4242),
+        ("::1", 3000, 77)], parse_netstat_listening(net)
+    assert parse_tasklist_csv(
+        '"System Idle Process","0","Services","0","8 K"\r\n'
+        '"node.exe","4242","Console","1","51,200 K"\r\n'
+        '"bad","x"\r\n') == {0: "System Idle Process", 4242: "node.exe"}
+    assert parse_tasklist_csv("") == {}
+    tcp = ("  sl  local_address rem_address   st tx_queue rx_queue tr "
+           "tm->when retrnsmt   uid  timeout inode\n"
+           "   0: 0100007F:1F40 00000000:0000 0A 00000000:00000000 "
+           "00:00000000 00000000  1000        0 31337 1 0 100 0 0 10 0\n"
+           "   1: 0100007F:9C40 0100007F:1F40 01 00000000:00000000 "
+           "00:00000000 00000000  1000        0 31338 1 0 100 0 0 10 0\n")
+    assert parse_proc_net_tcp(tcp) == [("127.0.0.1", 8000, 31337)]
+    root = tempfile.mkdtemp(prefix="mw-proc-")
+    try:
+        for pid, comm in (("77", "python3\n"), ("88", "sshd\n")):
+            os.makedirs(os.path.join(root, pid, "fd"))
+            with open(os.path.join(root, pid, "comm"), "w") as f:
+                f.write(comm)
+        links = {os.path.join(root, "77", "fd", "3"): "socket:[31337]",
+                 os.path.join(root, "77", "fd", "4"): "/dev/null",
+                 os.path.join(root, "88", "fd", "3"): "socket:[5]"}
+        real = os.listdir
+
+        def listdir(d):
+            return [os.path.basename(k) for k in links
+                    if os.path.dirname(k) == d] if d.endswith("fd") \
+                else real(d)
+        with _b9_patched(os, listdir=listdir, readlink=links.__getitem__):
+            assert proc_socket_pids({31337}, root) == {31337: 77}
+            assert len(proc_socket_pids({31337, 5}, root, limit=1)) <= 1
+        assert proc_socket_pids(set(), root) == {}
+        assert proc_comm(77, root) == "python3" and proc_comm(9, root) == ""
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    lsof = ("COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n"
+            "node     4242 me   23u  IPv4 0x1      0t0  TCP 127.0.0.1:5173 "
+            "(LISTEN)\n"
+            "Python\\x20 77 me    4u  IPv6 0x2      0t0  TCP *:8000 "
+            "(LISTEN)\n"
+            "rapportd  500 me    5u  IPv6 0x3      0t0  TCP [::1]:49152 "
+            "(LISTEN)\n")
+    assert parse_lsof_listening(lsof) == [
+        ("127.0.0.1", 5173, 4242, "node"), ("::", 8000, 77, "Python "),
+        ("::1", 49152, 500, "rapportd")], parse_lsof_listening(lsof)
+    # the table the view reads without psutil
+    fake = {("TCP", "127.0.0.1", 5173): (4242, "node.exe"),
+            ("TCP", "0.0.0.0", 8000): (None, "")}
+    with _b9_patched(globals(), os_listening=lambda: dict(fake)):
+        pm = OsListenMap()
+        assert pm.available and local_services_state(pm)[0] == "unread"
+        assert pm.read() and pm.needs_admin
+        st, got = local_services_state(pm)
+    assert st == "ok" and got == fake, (st, got)
+    names = [r["program"] for r in local_service_rows(got)]
+    assert "node.exe (pid 4242)" in names, names
+    assert "netstat" in WINDOWS_SYSTEM_TOOLS and \
+        "tasklist" in WINDOWS_SYSTEM_TOOLS
+
+
+@self_test()
+def t_534_local_http_probe(ctx):
+    """Local services: a real web server on 127.0.0.1 is found with its
+    page title (plain HTTP); a port that answers "GET /" with a TLS
+    record is asked again over TLS and, when that handshake fails, is
+    not a web page; an https answer gives an https address; a closed
+    port is asked once and not over TLS; each try is in the ledger and
+    the kill switch stops it. (No certificate here: the TLS decision
+    alone is tested.)"""
+    import http.server
+
+    class Page(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"<html><title>My dev\n &amp; app</title>")
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Page)
+    threading.Thread(target=srv.serve_forever, daemon=True,
+                     name="t-local-http").start()
+    closed = _socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    free = closed.getsockname()[1]
+    closed.close()
+    killed = LEDGER.killed
+    try:
+        LEDGER.killed = False
+        n0 = len(LEDGER.snapshot("local_probe"))
+        got = probe_local_http("127.0.0.1", srv.server_address[1],
+                               timeout=2.0)
+        assert got == {"web": True, "https": False, "status": 200,
+                       "title": "My dev & app"}, got
+        assert probe_local_http("127.0.0.1", free, timeout=0.5)["web"] is \
+            False
+        ent = LEDGER.snapshot("local_probe")
+        assert len(ent) == n0 + 2 and ent[-1]["kind"] == "http" and \
+            ent[-1]["dest"] == f"127.0.0.1:{free}", ent[-2:]
+        LEDGER.killed = True
+        try:
+            probe_local_http("127.0.0.1", srv.server_address[1])
+            raise AssertionError("sent with the kill switch on")
+        except OutboundBlocked:
+            pass
+    finally:
+        LEDGER.killed = killed
+        srv.shutdown()
+        srv.server_close()
+    # a TLS server's answer to plain HTTP: an alert record, then close
+    lsk = _socket.socket()
+    lsk.bind(("127.0.0.1", 0))
+    lsk.listen(4)
+    lsk.settimeout(10)
+    hits = []
+
+    def serve():
+        for _ in range(2):
+            try:
+                c, _a = lsk.accept()
+            except OSError:
+                return
+            with c:
+                c.settimeout(3)
+                with contextlib.suppress(OSError):
+                    hits.append(c.recv(5))
+                    c.sendall(b"\x15\x03\x03\x00\x02\x02\x28")
+    th = threading.Thread(target=serve, daemon=True, name="t-local-tls")
+    th.start()
+    port = lsk.getsockname()[1]
+    try:
+        got = probe_local_http("127.0.0.1", port, timeout=2.0)
+        th.join(5)
+    finally:
+        lsk.close()
+    assert got == {"web": False, "https": False, "status": 0,
+                   "title": ""}, got
+    assert len(hits) == 2 and hits[0].startswith(b"GET") and \
+        hits[1][:1] == b"\x16", hits            # then a TLS ClientHello
+    assert [e["kind"] for e in LEDGER.snapshot("local_probe")[-2:]] == \
+        ["http", "https"]
+    listening = {("TCP", "127.0.0.1", port): (5, "dev")}
+    key = local_service_rows(listening)[0]["probe"]
+    tls = {"web": True, "https": True, "status": 200, "title": "My app"}
+    row = local_service_rows(listening, (), {key: tls})[0]
+    assert row["url"] == f"https://127.0.0.1:{port}/" and \
+        row["what"] == "Web server" and row["title"] == "My app"
+    assert local_service_cells(row)[2] == "Web server — My app"
+
+
+@self_test()
+def t_534_local_probe_skip_and_once(ctx):
+    """Local services: ports known not to be web pages (Redis 6379, raw
+    printing 9100, databases, SMB/NetBIOS, what the service table or the
+    program's name marks as something else) are never asked; a port is
+    asked once when it appears, the automatic re-read reuses the answer,
+    Refresh asks again; a restarted program is asked again; Demo Mode
+    asks nothing; the answer's scheme wins over the port's."""
+    for port in (6379, 9100, 3306, 5432, 27017, 1433, 11211, 139, 445):
+        assert port in LOCAL_PROBE_SKIP, port
+    listening = {("TCP", "127.0.0.1", p): (p, "x") for p in
+                 (6379, 9100, 3306, 5432, 27017, 1433, 11211, 139, 445,
+                  22, 631, 5173, 8443, 61000)}
+    listening[("TCP", "127.0.0.1", 7777)] = (1, "redis-server")
+    listening[("UDP", "0.0.0.0", 5353)] = (2, "avahi")
+    rows = local_service_rows(listening)
+    asked = sorted(r["port"] for r in rows if r["probe"])
+    assert asked == [5173, 8443, 61000], asked
+    by = {r["port"]: r for r in rows}
+    assert by[8443]["url"] == "https://127.0.0.1:8443/"   # not asked yet
+    k = by[8443]["probe"]
+    plain = {"web": True, "https": False, "status": 200, "title": ""}
+    r = local_service_rows(listening, (), {k: plain})
+    assert {x["port"]: x for x in r}[8443]["url"] == \
+        "http://127.0.0.1:8443/"
+    nope = dict(plain, web=False)
+    r = local_service_rows(listening, (), {by[5173]["probe"]: nope})
+    assert {x["port"]: x for x in r}[5173]["url"] is None
+    seen = []
+
+    def probe(host, port, own=(), timeout=1.0):
+        seen.append((host, port))
+        return dict(plain, title="App %d" % port)
+
+    def view(mode="offline"):
+        return types.SimpleNamespace(
+            source=None, probes={}, _probe_seq=0,
+            app=types.SimpleNamespace(data_mode=mode),
+            _pm=lambda: types.SimpleNamespace(available=False),
+            refresh=lambda force=False: None)
+
+    def run(v, rows):
+        started = LocalServicesView._start_probes(v, rows, ())
+        for t in [t for t in threading.enumerate()
+                  if t.name == "local-probe"]:
+            t.join(10)
+        return started
+    with _b9_patched(globals(), probe_local_http=probe):
+        v = view()
+        assert run(v, rows) and sorted(seen) == [
+            ("127.0.0.1", 5173), ("127.0.0.1", 8443),
+            ("127.0.0.1", 61000)], seen
+        assert v._probe_seq == 1 and v.probes[by[5173]["probe"]][
+            "title"] == "App 5173"
+        assert not run(v, local_service_rows(listening, (), v.probes))
+        assert len(seen) == 3                       # the re-read: no
+        moved = dict(listening)
+        moved[("TCP", "127.0.0.1", 5173)] = (99, "x")      # restarted
+        assert run(v, local_service_rows(moved, (), v.probes))
+        assert len(seen) == 4 and seen[-1] == ("127.0.0.1", 5173)
+        LocalServicesView.reload(v, reprobe=True)   # the Refresh button
+        assert v.probes == {} and run(v, rows) and len(seen) == 7
+        demo = view("demo")
+        assert not run(demo, rows) and len(seen) == 7 and demo.probes == {}
+        fixture = view()
+        fixture.source = lambda: ("ok", listening)
+        assert not run(fixture, rows) and len(seen) == 7
+
+
+@self_test()
+def t_534_local_lan_bound(ctx):
+    """Local services: a service bound only to an address of this computer
+    (a LAN address) is asked and opened there; an address that isn't this
+    computer's is never asked nor opened."""
+    own = {"192.168.1.20", "fe80::5"}
+    listening = {("TCP", "192.168.1.20", 8000): (6, "python.exe"),
+                 ("TCP", "10.9.9.9", 8001): (7, "python.exe"),
+                 ("TCP", "fe80::5", 8002): (8, "python.exe")}
+    by = {r["port"]: r for r in local_service_rows(listening, own)}
+    assert by[8000]["url"] == "http://192.168.1.20:8000/" and \
+        by[8000]["probe"] == (8000, "python.exe (pid 6)", "192.168.1.20")
+    for port in (8001, 8002):           # not this computer's / no scope
+        assert by[port]["url"] is None and by[port]["probe"] is None
+    assert all(r["url"] is None for r in local_service_rows(listening))
+    for url, ok in (("http://192.168.1.20:8000/", True),
+                    ("https://192.168.1.20:8443/", True),
+                    ("http://192.168.1.21:8000/", False),
+                    ("http://0.0.0.0:8000/", False),
+                    ("http://127.0.0.1:8000/", True)):
+        assert local_url_ok(url, own) is ok, url
+    assert not local_url_ok("http://192.168.1.20:8000/")
+    tried = []
+
+    def connect(addr, timeout=None, *a):
+        tried.append(addr)
+        raise ConnectionRefusedError("test")
+    with _b9_patched(_socket, create_connection=connect):
+        assert probe_local_http("192.168.1.20", 8000, own)["web"] is False
+        for host in ("10.9.9.9", "0.0.0.0", "::", "example.com"):
+            try:
+                probe_local_http(host, 8000, own)
+                raise AssertionError(f"{host} was asked")
+            except ValueError:
+                pass
+    assert tried == [("192.168.1.20", 8000)], tried     # refused: no TLS
+    app = types.SimpleNamespace(model=types.SimpleNamespace(
+        my_ips={"192.168.1.20"}))
+    assert "192.168.1.20" in local_own_addresses(app)
 
 
 @self_test(needs_source=True)
