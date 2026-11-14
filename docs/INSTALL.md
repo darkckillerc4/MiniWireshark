@@ -65,7 +65,7 @@ On Linux and macOS, MiniWireshark no longer restarts itself as root when it star
 python miniwireshark.py --demo
 ```
 
-Demo Mode shows simulated, clearly labelled data with `.example` names. Nothing is captured or sent.
+Demo Mode shows simulated, clearly labelled data with `example.com`, `.org` and `.net` names. Nothing is captured or sent.
 
 ## Where it keeps its files
 
@@ -82,7 +82,7 @@ Settings are saved in `miniwireshark_config.json` next to the script, or in the 
 MINIWIRESHARK_DATA=/tmp/mw-data MINIWIRESHARK_CONFIG=/tmp/mw-config.json python miniwireshark.py
 ```
 
-The data folder holds logs, saved sessions and the autosave, the optional history database, the private packages and boot receipts. **Storage used…** in the command palette (`Ctrl+K`) shows how much each part uses.
+The data folder holds logs, saved sessions and the autosave, the optional history database, the private Python and packages, caches, boot receipts and a small `vault.json` for helper passwords. On Windows the passwords in it are encrypted for your account (DPAPI). On Linux without a secret service, and on macOS without the `security` tool, they are stored in it with only the file's permissions (mode 0600) to protect them, which is weaker. If neither folder above can be written, it falls back to a temporary folder. **Storage used…** in the command palette (`Ctrl+K`) shows how much each part uses.
 
 ## Updating
 
@@ -93,8 +93,9 @@ Download the new release and replace the file. Settings, history and sessions ar
 Delete `miniwireshark.py` and the data folder above. A few things live outside that folder, so delete them too:
 
 - `miniwireshark_config.json` (and `miniwireshark_config.json.bak`) next to `miniwireshark.py`, when that folder is writable. Otherwise they are in the data folder and go with it.
-- scapy's own cache: `~/.cache/scapy` on Linux and macOS, `%LOCALAPPDATA%\scapy` on Windows.
-- Passwords you saved for a Pi-hole or AdGuard Home helper are in your system's keychain (Windows Credential Manager, macOS Keychain, or the Linux secret service), under "MiniWireshark". Remove them there, or remove each helper in MiniWireshark before you uninstall (removing a helper deletes its saved password).
+- scapy's own cache: `~/.cache/scapy` on Linux and macOS, and `%USERPROFILE%\.cache\scapy` on Windows.
+- Update backups, named `miniwireshark.py.v<version>.bak`, next to the script.
+- Passwords you saved for a Pi-hole or AdGuard Home helper are in your system's keychain (macOS Keychain or the Linux secret service), under "MiniWireshark". On Windows they are in `vault.json` in the data folder, so deleting that folder removes them. Remove them there, or remove each helper in MiniWireshark before you uninstall (removing a helper deletes its saved password).
 
 If you installed Npcap only for MiniWireshark, remove it from Windows' *Installed apps*.
 

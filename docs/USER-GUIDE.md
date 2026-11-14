@@ -13,7 +13,7 @@ Each start opens the Welcome Center, unless you turn it off in **Settings → Ge
 
 A coloured health line says whether MiniWireshark is ready, or running degraded (no capture driver, Safe Mode, or the private Python could not start).
 
-Below it, the **Ready?** list checks Python, the capture driver, capture permission, the network card, the data folder, history, signed updates and what leaves this computer. Each line shows *checking…* until it answers, then says whether it is ready, with a fix button where one exists. `--boot-check` prints the same list.
+Below it, the **Ready?** list checks Python, the capture driver, capture permission, the network card, the data folder, history, signed updates and what leaves this PC. Each line shows *checking…* until it answers, then says whether it is ready, with a fix button where one exists. `--boot-check` prints the same list.
 
 ## The tabs
 
@@ -53,7 +53,7 @@ Press `Ctrl+K` and type. The palette finds tabs, settings pages and actions, for
 
 ## Filtering
 
-Each table has a search box. Simple words search everywhere. Friendly tokens narrow it down:
+Each table has a search box, and plain words search it. In the **Packets** tab, friendly tokens narrow the packet list down:
 
 | Token | Example | Matches |
 |---|---|---|
@@ -62,10 +62,10 @@ Each table has a search box. Simple words search everywhere. Friendly tokens nar
 | `port:` `sport:` `dport:` | `port:443` | A port |
 | `site:` `host:` `domain:` | `site:example.com` | A website name |
 | `device:` | `device:@mine-phone` | A device, by name or alias |
-| `dir:` | `dir:out` | Direction |
-| `mac:` | `mac:aa:bb:cc` | A hardware address |
+| `dir:` | `dir:up` | Direction: `up`, `down`, `lan`, `bcast` or `other` |
+| `mac:` | `mac:aa:bb:cc:dd:ee:ff` | A hardware address (the whole address) |
 | `stream:` | `stream:12` | One reassembled stream |
-| `sev:` | `sev:warning` | Severity (packets with expert findings) |
+| `sev:` | `sev:warning` | Packets whose device or address has an unacknowledged alert of that level or higher (`info`, `warning`, `danger`) |
 | `len>N` `len<N` | `len>1000` | Packet size |
 | `marked` | `marked` | Packets you marked |
 
@@ -91,7 +91,7 @@ Each investigation lists the likely causes on a board, with the evidence for and
 
 | Question | What it looks at |
 |---|---|
-| **Why is my Internet slow?** | The Wi-Fi signal, the router, DNS, packet loss, heavy programs and VPNs |
+| **Why is my Internet slow?** | The Wi-Fi signal, the router, delay beyond the router, DNS, packet loss, heavy programs, another device using the connection and VPNs |
 | **What is using my bandwidth?** | Devices and, on this computer, programs |
 | **Is my DNS working?** | Failed and slow lookups, a change of DNS server, encrypted DNS |
 | **Is IPv6 working?** | The router's announcement, the share of IPv6 traffic, IPv6 connections left unanswered while IPv4 works |
@@ -104,9 +104,9 @@ Each investigation lists the likely causes on a board, with the evidence for and
 | Action | What you get |
 |---|---|
 | **Save session** | Everything collected so far, in a `.mwsession.json` file you can reopen later |
-| Autosave and journal | Kept automatically. After a crash, the File menu offers **Restore the interrupted session** and **Open last autosave**. |
+| Autosave and journal | Kept automatically. After a crash, the **Session ▾** menu offers **Restore the interrupted session** and **Open last autosave**. |
 | **Open a capture file** | Reads `.pcap` and `.pcapng`, including files from Wireshark or tcpdump |
-| **Export** (`Ctrl+E`) | The current table as CSV. Formula injection is blocked. |
+| **Export** (`Ctrl+E`) | Opens the export menu: reports, CSV of packets, devices or connections, JSON and `.pcap`. Every CSV blocks formula injection. |
 | **Shareable report** | One self-contained HTML file with charts, with optional redaction of names and addresses |
 | **Network check-up** | One page in plain English (what is ready, what changed, unusual activity, the seven questions, your devices). Names and addresses are hidden unless you turn that off |
 | **Follow stream → Save** | A conversation as text, always redacted |
@@ -117,7 +117,7 @@ Each investigation lists the likely causes on a board, with the evidence for and
 |---|---|
 | `Ctrl+R` | Start watching |
 | `Ctrl+.` | Stop watching |
-| `Ctrl+L` | Clear collected data (asks first) |
+| `Ctrl+L` | Clear collected data. You can undo it for 30 seconds; it asks first only if **Settings → General → Ask before clearing data** is on |
 | `Ctrl+E` | Export |
 | `Ctrl+F` | Find |
 | `Ctrl+Z` | Undo |
@@ -133,13 +133,13 @@ Every shortcut can be changed in **Settings → Keyboard Shortcuts**.
 
 ## Settings
 
-The Settings window is grouped by what you are trying to do. Each option has a one-line explanation under it.
+The Settings window is grouped by what you are trying to do. Each option has a short explanation under it.
 
 | Page | Covers |
 |---|---|
 | General | Startup, explanations, language, and **Repair MiniWireshark** (one click fixes the usual problems) |
-| Appearance | Theme, beginner view, high contrast, text size, reduced motion |
-| Accessibility | Colour-blind palettes, interface scale |
+| Appearance | Theme and beginner view |
+| Accessibility | Colour-blind palettes, high contrast, text size, interface scale, reduced motion |
 | Capture | Network card choice, promiscuous mode, how much to keep |
 | Devices & Identity | When a device counts as idle, inactive or gone; merging duplicates |
 | Websites & DNS | Grouping subdomains, tracker marks, encrypted DNS, slow-DNS threshold |
@@ -148,7 +148,7 @@ The Settings window is grouped by what you are trying to do. Each option has a o
 | Alerts | Each alert kind on or off, and its thresholds. **Where alerts appear**: the live feed, and the opt-in notifications while the window is minimised (title count, taskbar flash, Windows notification) |
 | Privacy & Lookups | Kill switch, reference downloads, QUIC names, network owner and country lookups, the self-traffic ledger |
 | History | The history database, how long to keep it, the packet ring |
-| Performance | Normal or Full Power, cores, memory cap, battery awareness |
+| Performance | Automatic, Normal, Low CPU or Full Power, cores, the memory limit, battery awareness |
 | Keyboard Shortcuts | Every shortcut |
 | Data & Export | Default folders, where your settings live |
 | Updates & Dependencies | The daily check of the official GitHub page, signed updates, the private Python, packages |

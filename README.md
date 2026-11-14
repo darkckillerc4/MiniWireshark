@@ -19,7 +19,7 @@ Under the beginner view is a real analysis workstation, with packet dissection, 
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screens/dark-dash.png">
     <img src="docs/assets/screens/light-dash.png" alt="MiniWireshark dashboard showing demo data" width="92%">
   </picture>
-  <br><sub>The dashboard showing the built-in <b>demo data</b> (simulated, <code>.example</code> names). Nothing is captured in Demo Mode.</sub>
+  <br><sub>The dashboard showing the built-in <b>demo data</b> (simulated, <code>example.com</code> names). Nothing is captured in Demo Mode.</sub>
 </p>
 
 ---
@@ -137,7 +137,7 @@ The full list, including the developer switches, is in [Installation](docs/INSTA
 
 - **Python 3.8 or newer** with Tk (included with the python.org and Microsoft Store installers on Windows and macOS; on Linux, `sudo apt install python3-tk`).
 - **Packet capture:**
-  - **Windows:** [Npcap](https://npcap.com/). MiniWireshark offers to install it, and capture works without administrator rights once it is there.
+  - **Windows:** [Npcap](https://npcap.com/). MiniWireshark offers to install it. With Npcap in its default mode, capture works without administrator rights.
   - **Linux:** root or `CAP_NET_RAW`. MiniWireshark asks for the password only when capture starts, and not at all when the capability is set.
   - **macOS:** access to `/dev/bpf*`, or the administrator password when capture starts.
 - **scapy** and optional extras (psutil, cryptography) are installed automatically into a private, per-Python folder.
@@ -161,7 +161,7 @@ Found a security issue? See [SECURITY.md](SECURITY.md).
 
 ## Your data and uninstalling
 
-Everything MiniWireshark creates goes into one data folder: `miniwireshark_data/` next to the script when that folder is writable, otherwise `%LOCALAPPDATA%\MiniWireshark` (Windows), `~/Library/Application Support/MiniWireshark` (macOS) or `~/.local/share/miniwireshark` (Linux). Settings are in `miniwireshark_config.json` next to the script.
+Everything MiniWireshark creates goes into one data folder: `miniwireshark_data/` next to the script when that folder is writable, otherwise `%LOCALAPPDATA%\MiniWireshark` (Windows), `~/Library/Application Support/MiniWireshark` (macOS) or `$XDG_DATA_HOME/miniwireshark` (Linux, by default `~/.local/share/miniwireshark`). Settings are in `miniwireshark_config.json` next to the script.
 
 Those files describe your own network: device names, addresses and saved sessions. Don't attach them to a public issue. **Storage used…** in the command palette (`Ctrl+K`) shows what each part takes.
 
@@ -187,7 +187,7 @@ xvfb-run -a python miniwireshark.py --gui-test    # Linux without a display
 python miniwireshark.py --bench-gui S1 S2         # performance budgets
 ```
 
-Continuous integration runs on every pull request and every push to `main` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)): the self-test on Python 3.8, 3.12 and 3.13, the GUI test on two Ubuntu versions and on Windows, the self-test on macOS, a privacy check that keeps captures, personal data and keys out of this public repository, and a docs check for broken links.
+Continuous integration runs on every pull request and every push to `main` (see [`.github/workflows/ci.yml`](.github/workflows/ci.yml)): the self-test on Python 3.8, 3.12 and 3.13 (Ubuntu), the self-test and the GUI test on Windows (Python 3.12 and 3.14), the GUI test on two Ubuntu versions, the self-test on macOS, a privacy check that keeps captures, personal data and keys out of this public repository, and a docs check for broken links.
 
 ## Versions and downloads
 
@@ -208,7 +208,7 @@ Every release is a single `.py` file attached to its [GitHub release](https://gi
 
 ```
 miniwireshark.py        the application: one file on purpose, ~94k lines in banner-marked regions
-legacy/                 versions 1.x and 2.0.0 (written before this repository's history began)
+legacy/                 versions 1.x and 2.0.0 (written before this repository was created, and imported here)
 docs/                   installation, user guide, features, architecture, FAQ, version index
 .github/                CI, issue and PR templates, release notes, archive-release workflow
 ```

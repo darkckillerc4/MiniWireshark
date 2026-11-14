@@ -1,6 +1,6 @@
 # Contributing to MiniWireshark
 
-Thanks for helping. A few rules keep an 89,000-line single-file app healthy.
+Thanks for helping. A few rules keep a 94,000-line single-file app healthy.
 
 ## House rules
 
@@ -9,7 +9,7 @@ Thanks for helping. A few rules keep an 89,000-line single-file app healthy.
 3. **Every fix comes with a regression test** in the self-test (region 20b) or the GUI test (region 20c).
 4. **Privacy defaults never get weaker.** Everything that sends traffic goes through `outbound()`. Secrets are dropped inside parsers.
 5. **The window must not freeze.** Slow work belongs on a worker thread or in a background job. The benchmark budgets (`--bench-gui`) must still pass.
-6. **Python 3.8+** must keep working (`vermin` reports 3.7 as the syntax floor).
+6. **Python 3.8+** must keep working (the self-test parses the file for Python 3.7 and 3.8 syntax).
 
 ## Before opening a pull request
 
@@ -17,7 +17,7 @@ Thanks for helping. A few rules keep an 89,000-line single-file app healthy.
 python -m py_compile miniwireshark.py
 python miniwireshark.py --self-test
 xvfb-run -a python miniwireshark.py --gui-test     # if you touched the window
-python -m pyflakes miniwireshark.py               # no new findings
+python -m pip install pyflakes && python -m pyflakes miniwireshark.py   # no findings
 python .github/scripts/privacy_check.py           # nothing personal or secret
 python .github/scripts/docs_check.py              # links, headings, images
 python .github/scripts/reference_docs.py --check  # alert and field pages

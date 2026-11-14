@@ -6,7 +6,7 @@ The words MiniWireshark and these pages use, in plain English. Terms marked *(ap
 
 ## A to D
 
-**Active Mode** *(app)*: Lets MiniWireshark send discovery probes (to find devices and their names), only on a network you have marked as yours. Its opposite, Quiet Mode, only listens. Every probe is listed in **What MiniWireshark sent**.
+**Active Mode** *(app)*: Also called Active Scanning in the window. It lets MiniWireshark send discovery probes (to find devices and their names), only on a network you have marked as yours. Its opposite, Quiet Mode, only listens. Every probe is listed in **What MiniWireshark sent**.
 
 **ARP (Address Resolution Protocol)**: How devices on the same network find each other's hardware address from an IP address. It has no protection, so a device can lie in it; see [Possible ARP spoofing](ALERTS.md#possible-arp-spoofing).
 
@@ -24,7 +24,7 @@ The words MiniWireshark and these pages use, in plain English. Terms marked *(ap
 
 **DNS (Domain Name System)**: The Internet's phone book: it turns a name like `example.com` into an address. MiniWireshark uses DNS answers to tell you which websites a device uses.
 
-**Demo Mode** *(app)*: Simulated traffic with reserved `.example` names, so you can try every tab. It captures nothing and sends nothing. Start it with `--demo` or **Try Demo Mode**.
+**Demo Mode** *(app)*: Simulated traffic with reserved `example.com`, `.org` and `.net` names, so you can try every tab. It captures nothing and sends nothing. Start it with `--demo` or **Try Demo Mode**.
 
 ## E to L
 
@@ -42,7 +42,7 @@ The words MiniWireshark and these pages use, in plain English. Terms marked *(ap
 
 **Kill switch** *(app)*: Blocks everything MiniWireshark itself would send: update checks, downloads, health checks and probes. Find it in **What MiniWireshark sent** or **Settings → Privacy & Lookups**.
 
-**Limited mode** *(app)*: How MiniWireshark opens when it can't capture, for example without the capture driver or the permission. Capture files, saved sessions and Demo Mode still work.
+**Limited mode** *(app)*: How MiniWireshark runs when it can't capture, for example without the capture engine, the capture driver or the permission. Capture files, saved sessions and Demo Mode still work.
 
 ## M to R
 
@@ -64,9 +64,9 @@ The words MiniWireshark and these pages use, in plain English. Terms marked *(ap
 
 ## S to Z
 
-**Safe Mode** *(app)*: A start with no automatic capture, no history, no update checks and no downloads. Start it with `--safe`; MiniWireshark also uses it after two crashes in a row.
+**Safe Mode** *(app)*: A start with no automatic capture, no history, no update checks and no downloads. Start it with `--safe`; MiniWireshark also uses it after two starts in a row that never reached the window.
 
-**Self-traffic ledger (What MiniWireshark sent)** *(app)*: The list of every send MiniWireshark itself made, with its purpose and destination. Open it from the Security tab.
+**Self-traffic ledger (What MiniWireshark sent)** *(app)*: The window titled "What MiniWireshark itself sent": the list of every send MiniWireshark itself made, with its purpose and destination. Open it from the Security tab.
 
 **Session** *(app)*: A saved snapshot of what MiniWireshark has seen, which you can open again later. Sessions stay on your computer.
 
@@ -74,7 +74,7 @@ The words MiniWireshark and these pages use, in plain English. Terms marked *(ap
 
 **TCP and UDP**: The two main ways to carry data. TCP checks that everything arrives, in order (websites, mail). UDP just sends (DNS, calls, games).
 
-**Vantage meter** *(app)*: The gauge in the bottom-right corner that says how much of other devices' traffic this computer can actually see. On ordinary Wi-Fi it is mostly its own.
+**Vantage meter** *(app)*: The status line at the bottom right that says how much of other devices' traffic this computer can actually see. On ordinary Wi-Fi it is mostly its own.
 
 **VPN**: A tunnel that encrypts your traffic to a server elsewhere. While it is on, MiniWireshark sees the tunnel, not the sites inside it.
 
