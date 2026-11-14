@@ -275,41 +275,77 @@ def run_bounded(cmd, timeout, input=None, text=False, env=None,
 
 
 _ONE_JOB = {}                     # thread name -> the request waiting (or None)
+_ONE_JOB_RUN = {}                 # name -> (thread, deadline) of the job running
+_ONE_JOB_LOST = {}                # name -> the thread last abandoned there
 _ONE_JOB_LOCK = threading.Lock()
+# audit #5: seconds a job may run before the next request abandons it
+ONE_JOB_LIMIT = {"network-id": 60.0, "capture-start": 30.0,
+                 "capture-heal": 30.0}
+ONE_JOB_LIMIT_DEFAULT = 60.0
 
 
 def start_one(name, work, coalesce=False):
     """5.3.4 soak: `work` on a daemon thread called `name`, at most one at
     a time. A request while one runs is skipped, or with `coalesce` kept
     (only the newest) and run right after it: a blocked call can no
-    longer pile up threads. -> True when a thread was started."""
+    longer pile up threads. Audit #5: a job past its ONE_JOB_LIMIT no
+    longer blocks the name; the next request renames its thread
+    "<name>-abandoned", leaves it to finish alone and starts afresh (one
+    abandoned thread per name at most). -> True when a thread started."""
     with _ONE_JOB_LOCK:
         if name in _ONE_JOB:
-            if coalesce:
-                _ONE_JOB[name] = work
-            return False
+            th, until = _ONE_JOB_RUN.get(name, (None, 0.0))
+            lost = _ONE_JOB_LOST.get(name)
+            if th is None or time.monotonic() < until or \
+                    (lost is not None and lost.is_alive()):
+                if coalesce:
+                    _ONE_JOB[name] = work
+                return False
+            th.name = name + "-abandoned"
+            _ONE_JOB_LOST[name] = th
+            del _ONE_JOB_RUN[name]       # its end now leaves the name alone
+            LOG.warning("background job %s ran over %.0f s: abandoned",
+                        name, ONE_JOB_LIMIT.get(name, ONE_JOB_LIMIT_DEFAULT))
         _ONE_JOB[name] = None
 
+    def mine(me):
+        return _ONE_JOB_RUN.get(name, (None,))[0] is me
+
     def run(job):
+        me = threading.current_thread()
+        with _ONE_JOB_LOCK:
+            _ONE_JOB_RUN[name] = (me, time.monotonic() + ONE_JOB_LIMIT.get(
+                name, ONE_JOB_LIMIT_DEFAULT))
         try:
             while job is not None:
+                with _ONE_JOB_LOCK:
+                    if not mine(me):
+                        return                     # abandoned meanwhile
+                    _ONE_JOB_RUN[name] = (me, time.monotonic() +
+                                          ONE_JOB_LIMIT.get(
+                                              name, ONE_JOB_LIMIT_DEFAULT))
                 try:
                     job()
                 except Exception:                    # noqa: BLE001
                     LOG.exception("background job %s", name)
                 with _ONE_JOB_LOCK:
+                    if not mine(me):
+                        return                     # abandoned meanwhile
                     job = _ONE_JOB.get(name)
                     if job is None:
                         _ONE_JOB.pop(name, None)
+                        _ONE_JOB_RUN.pop(name, None)
                     else:
                         _ONE_JOB[name] = None
         finally:
             # a BaseException (SystemExit in a job) ends the thread: the
             # name is free again, or every later request was skipped for
-            # the rest of the session
-            if job is not None:
-                with _ONE_JOB_LOCK:
+            # the rest of the session. An abandoned thread leaves the name
+            # to the one that took it over.
+            with _ONE_JOB_LOCK:
+                if mine(me):
                     _ONE_JOB.pop(name, None)
+                    _ONE_JOB_RUN.pop(name, None)
     try:
         threading.Thread(target=run, args=(work,), daemon=True,
                          name=name).start()
@@ -88544,6 +88580,40 @@ def t_534_soak_one_job_per_name(ctx):
                       "coalesce=True"), ("capture-heal", "")):
         assert f'start_one("{name}", work{how})' in src, name
         assert f'name="{name}"' not in src, name
+
+
+@self_test()
+def t_534_hung_job_abandoned(ctx):
+    """Audit #5: a job blocked past its limit is abandoned by the next
+    request (thread renamed "-abandoned", warned once), the new request
+    runs, and while that thread still hangs no second one is abandoned."""
+    name, gate, ran = "soak-test-hang", threading.Event(), []
+    ONE_JOB_LIMIT[name] = 0.2
+
+    def named(n):
+        return [t for t in threading.enumerate() if t.name == n]
+    try:
+        assert start_one(name, lambda: gate.wait(10))
+        assert not start_one(name, lambda: ran.append(1))     # in time
+        time.sleep(0.3)
+        assert start_one(name, lambda: (ran.append(2), gate.wait(10)))
+        assert len(named(name + "-abandoned")) == 1
+        time.sleep(0.3)                    # the new one is late too, but
+        assert not start_one(name, lambda: ran.append(3))   # one at most
+        assert len(named(name + "-abandoned")) == 1 and ran == [2]
+        gate.set()
+        for t in named(name) + named(name + "-abandoned"):
+            t.join(5)
+        assert name not in _ONE_JOB and name not in _ONE_JOB_RUN
+        assert start_one(name, lambda: ran.append(4))
+        for t in named(name):
+            t.join(5)
+        assert ran == [2, 4] and name not in _ONE_JOB, ran
+    finally:
+        gate.set()
+        ONE_JOB_LIMIT.pop(name, None)
+        _ONE_JOB_LOST.pop(name, None)
+
 
 
 @self_test(needs_source=True)
