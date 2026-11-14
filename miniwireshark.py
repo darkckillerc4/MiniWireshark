@@ -291,17 +291,25 @@ def start_one(name, work, coalesce=False):
         _ONE_JOB[name] = None
 
     def run(job):
-        while job is not None:
-            try:
-                job()
-            except Exception:                        # noqa: BLE001
-                LOG.exception("background job %s", name)
-            with _ONE_JOB_LOCK:
-                job = _ONE_JOB.get(name)
-                if job is None:
+        try:
+            while job is not None:
+                try:
+                    job()
+                except Exception:                    # noqa: BLE001
+                    LOG.exception("background job %s", name)
+                with _ONE_JOB_LOCK:
+                    job = _ONE_JOB.get(name)
+                    if job is None:
+                        _ONE_JOB.pop(name, None)
+                    else:
+                        _ONE_JOB[name] = None
+        finally:
+            # a BaseException (SystemExit in a job) ends the thread: the
+            # name is free again, or every later request was skipped for
+            # the rest of the session
+            if job is not None:
+                with _ONE_JOB_LOCK:
                     _ONE_JOB.pop(name, None)
-                else:
-                    _ONE_JOB[name] = None
     try:
         threading.Thread(target=run, args=(work,), daemon=True,
                          name=name).start()
@@ -88983,6 +88991,35 @@ def t_r7_theme_walk_reads_options_once_per_class(ctx):
                                     f"::mw_retheme_class({cls})")), cls
     finally:
         root.destroy()
+
+
+@self_test()
+def t_start_one_frees_its_name_after_base_exception(ctx):
+    """A job that ends its thread with a BaseException (SystemExit) frees
+    its name: before, it stayed in _ONE_JOB and every later request of
+    that name was skipped for the whole session (second audit)."""
+    name = f"t-one-{uuid.uuid4().hex[:6]}"
+    done = threading.Event()
+
+    def bad():
+        try:
+            raise SystemExit("planted")
+        finally:
+            done.set()
+    hook = threading.excepthook
+    threading.excepthook = lambda a: None           # the planted exit
+    try:
+        assert start_one(name, bad)
+        assert done.wait(5)
+        t_end = time.monotonic() + 5
+        while name in _ONE_JOB and time.monotonic() < t_end:
+            time.sleep(0.01)
+    finally:
+        threading.excepthook = hook
+    assert name not in _ONE_JOB, "the name stayed taken"
+    ran = threading.Event()
+    assert start_one(name, ran.set), "a later request was skipped"
+    assert ran.wait(5)
 
 
 @self_test()
