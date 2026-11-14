@@ -126,6 +126,10 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - A second DHCP server that hands out a different router is now DANGER and says what it hands out, including when it names itself as the router and the DNS server. MiniWireshark keeps the real router as your gateway, even when the other server answers more often.
 - iCloud backups, Netflix, YouTube and other known backup and streaming services no longer show up as unusual uploads, downloads or a busy device; the Timeline still tells the spike.
 - During ARP spoofing, the attacker's claim on another device's address no longer adds a "Duplicate IP address … often harmless" warning, and the Story says "Danger" for a DANGER alert (and "Aviso" in Spanish, like the Severity column). A port scan says the most ports it tried in a minute instead of the first count seen, and the resets the scan gets back no longer raise *Repeated connection resets* about the scanner.
+- The Story no longer says the router "changed its address 24 times" when it simply answers for two addresses, back and forth.
+- French and Spanish: an alert's whole text is translated, not only its title: what was seen, what it usually means, the innocent explanations and why it was flagged.
+- A new device's alert no longer says "low-confidence" under a High confidence: it says how sure MiniWireshark is of what the device is.
+- Opening a capture file no longer says that every device in it, the router included, "joined your network"; only devices that appear after the file's first seconds do.
 
 **Known limits**
 

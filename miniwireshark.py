@@ -15650,7 +15650,11 @@ class DeviceRegistry:
         if dev.ip != ip:
             old = dev.ip
             dev.ip = ip
-            if old and when - dev.first_seen > 30 and dev.live:
+            # second audit (#38): a device that holds two addresses (a
+            # router with an alias) going back and forth between them is
+            # no change; it made "the router changed its address 24 times"
+            if old and when - dev.first_seen > 30 and dev.live and \
+                    ip not in dev.ipv4s:
                 self.events.append(
                     ("ip changed", "INFO",
                      f"{dev.display_name()} changed address {old} → {ip}",
@@ -18289,12 +18293,15 @@ class AlertEngine:
     def new_device(self, dev):
         if dev.expected:
             return None
+        # second audit (#40): "High" confidence (a new device did appear)
+        # next to "low-confidence identity evidence" read as a
+        # contradiction; what it is and how sure that is are told apart
         return self._add(
             "new_device", "INFO", dev.key,
             f"{dev.display_name()} joined your network",
-            f"A device with {dev.confidence.lower()}-confidence identity "
-            f"evidence ({', '.join(dev.evidence_summary()) or 'minimal'}) "
-            f"appeared.",
+            f"A device appeared that wasn't here before. How sure "
+            f"MiniWireshark is of what it is: {dev.confidence} ("
+            f"{', '.join(dev.evidence_summary()) or 'little evidence'}).",
             "This is a new local device on your network.",
             "Normal if you just added a device (phone, guest, smart-home "
             "gadget). Worth checking if you don't recognize it.")
@@ -23430,6 +23437,9 @@ class NetworkModel:
         self.health = {}
         self.health_history = deque(maxlen=120)
         self.capture_started = 0.0
+        # second audit (#40): an opened file's first seconds are its
+        # discovery time (its devices were there before it began)
+        self.discovery_from_first_packet = False
         self.epochs = []    # [start, end|None, why started, why ended]
         self.announce_new = True
         self.demo = False
@@ -24216,6 +24226,9 @@ class NetworkModel:
         ts = d["time"]
         if self.use_packet_clock and ts > self.offline_now:
             self.offline_now = ts
+        if self.discovery_from_first_packet:
+            self.discovery_from_first_packet = False
+            self.capture_started = ts
         self.count += 1
         self._pkt_no = d.get("no")
         self.vantage.note(d, self.my_macs, self.my_ips)
@@ -31545,6 +31558,73 @@ A sign-in was recognised in an unencrypted packet. ¦ Une connexion a été reco
 a password field in a web form ¦ un champ de mot de passe dans un formulaire web ¦ un campo de contraseña en un formulario web
 a password in the web address ¦ un mot de passe dans l'adresse web ¦ una contraseña en la dirección web
 LOGIN command ¦ commande LOGIN ¦ comando LOGIN
+This is the first time it has been busy at night, so it was compared with what is usual for its kind. ¦ C'est la première fois qu'il est actif la nuit : il a donc été comparé à ce qui est habituel pour ce type d'appareil. ¦ Es la primera vez que está activo de noche, así que se comparó con lo habitual para su tipo de dispositivo.
+This is the first time it has been busy during the day, so it was compared with what is usual for its kind. ¦ C'est la première fois qu'il est actif en journée : il a donc été comparé à ce qui est habituel pour ce type d'appareil. ¦ Es la primera vez que está activo de día, así que se comparó con lo habitual para su tipo de dispositivo.
+first time active at night ¦ première activité de nuit ¦ primera actividad de noche
+first time active during the day ¦ première activité de jour ¦ primera actividad de día
+This device's traffic this minute is well above its own recent average. ¦ Le trafic de cet appareil cette minute est bien au-dessus de sa moyenne récente. ¦ El tráfico de este dispositivo en este minuto está muy por encima de su media reciente.
+A destination country this device hadn't used this session. ¦ Un pays de destination que cet appareil n'avait pas utilisé pendant cette session. ¦ Un país de destino que este dispositivo no había usado en esta sesión.
+A device normally answers for its address consistently. Rapid flip-flopping is the signature of ARP spoofing — one device impersonating another so traffic passes through it. It can also happen if two devices were accidentally given the same fixed IP. If this is your router's address, treat it seriously: disconnect and check the router's device list. ¦ Un appareil répond normalement toujours de la même façon pour son adresse. Des allers-retours rapides sont la signature de l'usurpation ARP : un appareil se fait passer pour un autre afin que le trafic passe par lui. Cela peut aussi arriver si deux appareils ont reçu par erreur la même adresse IP fixe. S'il s'agit de l'adresse de votre routeur, prenez-le au sérieux : déconnectez-vous et vérifiez la liste des appareils du routeur. ¦ Un dispositivo normalmente responde siempre igual por su dirección. Los cambios rápidos de un lado a otro son la señal de la suplantación ARP: un dispositivo se hace pasar por otro para que el tráfico pase por él. También puede pasar si a dos dispositivos se les dio por error la misma IP fija. Si es la dirección de su router, tómeselo en serio: desconéctese y revise la lista de dispositivos del router.
+A known device advertised a service it hadn't advertised before. ¦ Un appareil connu a annoncé un service qu'il n'annonçait pas avant. ¦ Un dispositivo conocido anunció un servicio que antes no anunciaba.
+A remote-access service was advertised or accepted connections. ¦ Un service d'accès à distance a été annoncé ou a accepté des connexions. ¦ Un servicio de acceso remoto se anunció o aceptó conexiones.
+Anyone on the same network path could read this traffic. ¦ Toute personne sur le même chemin réseau pourrait lire ce trafic. ¦ Cualquiera en el mismo camino de red podría leer este tráfico.
+Broadcast rate stayed above the threshold. ¦ Le débit de diffusion est resté au-dessus du seuil. ¦ La tasa de difusión se mantuvo por encima del umbral.
+Can be a misbehaving gadget, a network loop (a cable plugged into two switch ports), or heavy discovery traffic. ¦ Peut venir d'un objet connecté défaillant, d'une boucle réseau (un câble branché sur deux ports d'un switch) ou d'un trafic de découverte important. ¦ Puede ser un aparato que falla, un bucle de red (un cable conectado a dos puertos de un switch) o mucho tráfico de descubrimiento.
+Common and harmless when a VPN connects, a browser enables secure DNS, or you change settings. Worth checking if you didn't change anything, because DNS decides which servers your device talks to. ¦ Courant et sans danger quand un VPN se connecte, qu'un navigateur active le DNS sécurisé ou que vous changez des réglages. À vérifier si vous n'avez rien changé, car le DNS décide à quels serveurs votre appareil parle. ¦ Habitual e inofensivo cuando se conecta una VPN, un navegador activa el DNS seguro o usted cambia ajustes. Conviene comprobarlo si no cambió nada, porque el DNS decide con qué servidores habla su dispositivo.
+Common for devices that stay quiet or use a randomized MAC. Confidence usually improves the longer it's on the network. ¦ Courant pour les appareils silencieux ou qui utilisent une adresse MAC aléatoire. La certitude augmente en général avec le temps passé sur le réseau. ¦ Habitual en dispositivos que hablan poco o usan una MAC aleatoria. La certeza suele mejorar cuanto más tiempo está en la red.
+Common for old devices, local printers and some smart-home gear. It's worth avoiding for anything with a password. ¦ Courant pour les anciens appareils, les imprimantes locales et certains objets connectés. À éviter pour tout ce qui demande un mot de passe. ¦ Habitual en dispositivos antiguos, impresoras locales y algunos aparatos de hogar inteligente. Conviene evitarlo para todo lo que lleve contraseña.
+Compared with this device's own learned baseline (not with other devices). ¦ Comparé à ce que cet appareil fait d'habitude (pas aux autres appareils). ¦ Comparado con lo que este dispositivo hace normalmente (no con otros dispositivos).
+Connections are being refused or cut off. ¦ Des connexions sont refusées ou coupées. ¦ Se están rechazando o cortando conexiones.
+Could be a second router plugged in by mistake, or — less commonly — a rogue DHCP server. If you don't recognize one of these addresses, unplug that device and check your network. ¦ Peut-être un second routeur branché par erreur ou, plus rarement, un serveur DHCP malveillant. Si vous ne reconnaissez pas l'une de ces adresses, débranchez cet appareil et vérifiez votre réseau. ¦ Puede ser un segundo router conectado por error o, con menos frecuencia, un servidor DHCP malicioso. Si no reconoce alguna de estas direcciones, desconecte ese dispositivo y revise su red.
+Devices on your network don't all use the same DNS service. ¦ Les appareils de votre réseau n'utilisent pas tous le même service DNS. ¦ Los dispositivos de su red no usan todos el mismo servicio DNS.
+Devices that accept this announcement may send IPv6 traffic through that device. ¦ Les appareils qui acceptent cette annonce peuvent faire passer leur trafic IPv6 par cet appareil. ¦ Los dispositivos que aceptan este anuncio pueden enviar su tráfico IPv6 a través de ese dispositivo.
+Expected if you run a scanner (or IT tools, printers/NAS discovery) on purpose. Otherwise, check what software the device runs. ¦ Normal si vous lancez volontairement un scanner (ou des outils informatiques, la découverte d'imprimantes ou de NAS). Sinon, vérifiez quels logiciels tournent sur l'appareil. ¦ Es lo esperado si ejecuta un escáner a propósito (o herramientas informáticas, el descubrimiento de impresoras o NAS). Si no, compruebe qué programas ejecuta el dispositivo.
+Fine if you set it up (e.g. SSH on a Raspberry Pi, Remote Desktop on your PC). Make sure it's intended and protected by a strong password. ¦ Pas de souci si vous l'avez mis en place (par ex. SSH sur un Raspberry Pi, le Bureau à distance sur votre PC). Vérifiez que c'est voulu et protégé par un mot de passe solide. ¦ No pasa nada si lo configuró usted (p. ej. SSH en una Raspberry Pi, Escritorio remoto en su PC). Asegúrese de que es intencionado y está protegido con una contraseña fuerte.
+If it persists, restart the router and this computer's Wi-Fi; if it comes back, look for an unknown device on the network. It can also happen right after a router is replaced. ¦ Si cela persiste, redémarrez le routeur et le Wi-Fi de cet ordinateur ; si cela revient, cherchez un appareil inconnu sur le réseau. Cela peut aussi arriver juste après le remplacement d'un routeur. ¦ Si persiste, reinicie el router y el Wi-Fi de este equipo; si vuelve, busque un dispositivo desconocido en la red. También puede pasar justo después de cambiar el router.
+Its behavior changed compared to its own baseline this session. ¦ Son comportement a changé par rapport à son habitude pendant cette session. ¦ Su comportamiento cambió respecto a lo habitual en esta sesión.
+Lists can be out of date, and one address can host many unrelated sites. Check which program on that device made the connection; if you don't recognise it, run a malware scan on that device. ¦ Les listes peuvent être périmées, et une adresse peut héberger de nombreux sites sans lien. Vérifiez quel programme de cet appareil a ouvert la connexion ; si vous ne le reconnaissez pas, lancez une analyse antivirus sur cet appareil. ¦ Las listas pueden estar desfasadas y una dirección puede alojar muchos sitios sin relación. Compruebe qué programa de ese dispositivo abrió la conexión; si no lo reconoce, analice ese dispositivo en busca de malware.
+Many distinct connection attempts with few successful replies. ¦ De nombreuses tentatives de connexion différentes, avec peu de réponses. ¦ Muchos intentos de conexión distintos con pocas respuestas.
+Median DNS latency exceeded the slow-DNS threshold. ¦ Le temps de réponse DNS médian a dépassé le seuil de DNS lent. ¦ La latencia DNS mediana superó el umbral de DNS lento.
+Mesh Wi-Fi nodes, a second router, a phone hotspot or a virtual-machine host can do this legitimately. ¦ Des bornes Wi-Fi maillées, un second routeur, un partage de connexion d'un téléphone ou un hôte de machines virtuelles peuvent le faire légitimement. ¦ Los nodos de Wi-Fi en malla, un segundo router, el punto de acceso de un teléfono o un anfitrión de máquinas virtuales pueden hacerlo legítimamente.
+MiniWireshark can't confidently say what this device is. ¦ MiniWireshark ne peut pas dire avec certitude ce qu'est cet appareil. ¦ MiniWireshark no puede decir con seguridad qué es este dispositivo.
+More than three DNS servers were contacted. ¦ Plus de trois serveurs DNS ont été contactés. ¦ Se contactó con más de tres servidores DNS.
+New country after the baseline period. ¦ Nouveau pays après la période d'apprentissage. ¦ País nuevo después del periodo de aprendizaje.
+Normal after enabling sharing, casting or a new app. Worth a look only if you didn't change anything. ¦ Normal après avoir activé un partage, la diffusion ou une nouvelle application. À regarder seulement si vous n'avez rien changé. ¦ Normal después de activar el uso compartido, la transmisión o una aplicación nueva. Solo merece una revisión si no cambió nada.
+Normal if you just added a device (phone, guest, smart-home gadget). Worth checking if you don't recognize it. ¦ Normal si vous venez d'ajouter un appareil (téléphone, invité, objet connecté). À vérifier si vous ne le reconnaissez pas. ¦ Normal si acaba de añadir un dispositivo (teléfono, invitado, aparato de hogar inteligente). Conviene comprobarlo si no lo reconoce.
+Normal with VPNs, browsers that use their own secure DNS, or gadgets with hard-coded DNS. Public DNS services are not harmful in themselves. ¦ Normal avec les VPN, les navigateurs qui utilisent leur propre DNS sécurisé ou les objets au DNS imposé. Les services DNS publics ne sont pas dangereux en soi. ¦ Normal con VPN, navegadores que usan su propio DNS seguro o aparatos con un DNS fijo. Los servicios DNS públicos no son dañinos en sí mismos.
+Normally only your router does this. ¦ Normalement, seul votre routeur fait cela. ¦ Normalmente solo su router hace esto.
+Often a service that's down, a firewall/ad-blocker refusing connections, or a flaky connection. Rarely a security issue. ¦ Souvent un service en panne, un pare-feu ou un bloqueur de publicité qui refuse des connexions, ou une connexion instable. Rarement un problème de sécurité. ¦ A menudo un servicio caído, un cortafuegos o bloqueador de anuncios que rechaza conexiones, o una conexión inestable. Rara vez un problema de seguridad.
+Often a temporary problem at your Internet provider or router, or an ad-blocker deliberately refusing some names. ¦ Souvent un problème passager chez votre fournisseur d'accès ou sur votre routeur, ou un bloqueur de publicité qui refuse volontairement certains noms. ¦ A menudo un problema pasajero de su proveedor de Internet o del router, o un bloqueador de anuncios que rechaza algunos nombres a propósito.
+Often harmless — Wi-Fi privacy MAC rotation or a device reconnecting and briefly overlapping the old lease. Worth a look if it keeps happening. ¦ Souvent sans danger : changement d'adresse MAC privée Wi-Fi, ou un appareil qui se reconnecte et chevauche brièvement l'ancien bail. À regarder si cela se répète. ¦ A menudo inofensivo: cambio de la MAC privada de Wi-Fi o un dispositivo que se reconecta y se solapa un momento con la concesión anterior. Conviene revisarlo si se repite.
+Often normal (a game, a file-sharing app, a developer tool). If you don't recognise the program, close it or check it with your antivirus. ¦ Souvent normal (un jeu, une application de partage de fichiers, un outil de développement). Si vous ne reconnaissez pas le programme, fermez-le ou vérifiez-le avec votre antivirus. ¦ A menudo normal (un juego, una aplicación para compartir archivos, una herramienta de desarrollo). Si no reconoce el programa, ciérrelo o compruébelo con su antivirus.
+Often normal right after a router reboot or firmware update. It is also the classic sign of ARP spoofing — a device pretending to be your router. If you didn't just restart your router, investigate. ¦ Souvent normal juste après un redémarrage ou une mise à jour du routeur. C'est aussi le signe classique de l'usurpation ARP : un appareil qui se fait passer pour votre routeur. Si vous n'avez pas redémarré votre routeur, cherchez la cause. ¦ A menudo normal justo después de reiniciar o actualizar el router. También es la señal clásica de la suplantación ARP: un dispositivo que se hace pasar por su router. Si no acaba de reiniciar el router, investigue.
+Often normal — a big download, a video call, a software update. Worth a glance if you don't expect that device to be busy right now. ¦ Souvent normal : un gros téléchargement, un appel vidéo, une mise à jour. À regarder si vous ne vous attendez pas à ce que cet appareil soit occupé en ce moment. ¦ A menudo normal: una descarga grande, una videollamada, una actualización. Merece un vistazo si no espera que ese dispositivo esté ocupado ahora.
+Pages may feel slow to start loading. ¦ Les pages peuvent sembler lentes à commencer à charger. ¦ Las páginas pueden tardar en empezar a cargarse.
+The address-to-hardware mapping this computer uses differs from the one seen in replies on the wire. ¦ La correspondance adresse–matériel qu'utilise cet ordinateur diffère de celle vue dans les réponses sur le réseau. ¦ La correspondencia dirección–hardware que usa este equipo difiere de la vista en las respuestas en la red.
+The device claiming to be your router is not consistent. ¦ L'appareil qui se présente comme votre routeur n'est pas toujours le même. ¦ El dispositivo que dice ser su router no es siempre el mismo.
+The local network is being flooded with 'to everyone' messages. ¦ Le réseau local est inondé de messages « à tout le monde ». ¦ La red local se está inundando de mensajes «para todos».
+The operating system lists it as listening; it wasn't there before. ¦ Le système d'exploitation l'indique en attente de connexions ; il n'y était pas avant. ¦ El sistema operativo lo muestra esperando conexiones; antes no estaba.
+The protocol was recognised from the traffic itself. ¦ Le protocole a été reconnu à partir du trafic lui-même. ¦ El protocolo se reconoció a partir del propio tráfico.
+The reset count crossed the threshold for this window. ¦ Le nombre de réinitialisations a dépassé le seuil pour cette période. ¦ El número de restablecimientos superó el umbral para este periodo.
+The service that turns website names into addresses changed for this device. ¦ Le service qui transforme les noms de sites en adresses a changé pour cet appareil. ¦ El servicio que convierte los nombres de sitios en direcciones cambió para este dispositivo.
+The share of failed lookups is well above normal. ¦ La part de recherches échouées est bien au-dessus de la normale. ¦ La proporción de búsquedas fallidas está muy por encima de lo normal.
+This behavior is unusual compared with this device's recent activity. ¦ Ce comportement est inhabituel par rapport à l'activité récente de cet appareil. ¦ Este comportamiento es inusual comparado con la actividad reciente de este dispositivo.
+This device can probably be controlled over the network. ¦ Cet appareil peut probablement être contrôlé par le réseau. ¦ Este dispositivo probablemente se puede controlar a través de la red.
+This device consistently used one DNS server, then moved to another. ¦ Cet appareil utilisait toujours un serveur DNS, puis est passé à un autre. ¦ Este dispositivo usaba siempre un servidor DNS y luego pasó a otro.
+This device is repeatedly reconnecting. ¦ Cet appareil se reconnecte sans cesse. ¦ Este dispositivo se reconecta una y otra vez.
+This device now offers something new on your network. ¦ Cet appareil propose maintenant quelque chose de nouveau sur votre réseau. ¦ Este dispositivo ofrece ahora algo nuevo en su red.
+This is a new local device on your network. ¦ C'est un nouvel appareil local sur votre réseau. ¦ Es un dispositivo local nuevo en su red.
+This is usually harmless. But if you don't have a device with two network connections, treat it as possible ARP spoofing — one device impersonating another so traffic passes through it. ¦ C'est en général sans danger. Mais si vous n'avez pas d'appareil avec deux connexions réseau, considérez cela comme une possible usurpation ARP : un appareil qui se fait passer pour un autre afin que le trafic passe par lui. ¦ Normalmente es inofensivo. Pero si no tiene un dispositivo con dos conexiones de red, trátelo como una posible suplantación ARP: un dispositivo que se hace pasar por otro para que el tráfico pase por él.
+This looks like what network-scanning tools do. ¦ Cela ressemble à ce que font les outils de balayage réseau. ¦ Se parece a lo que hacen las herramientas de escaneo de red.
+Two devices are repeatedly fighting over the same network address. ¦ Deux appareils se disputent sans cesse la même adresse réseau. ¦ Dos dispositivos se disputan una y otra vez la misma dirección de red.
+Two devices currently disagree about who owns this address. ¦ Deux appareils ne sont pas d'accord en ce moment sur le propriétaire de cette adresse. ¦ Dos dispositivos no se ponen de acuerdo ahora mismo sobre quién tiene esta dirección.
+Updates, backups, video calls, game downloads and cloud sync all cause bursts like this. It only matters if the device shouldn't be doing anything right now. ¦ Les mises à jour, sauvegardes, appels vidéo, téléchargements de jeux et synchronisations dans le cloud provoquent tous ce genre de pics. Ce n'est important que si l'appareil ne devrait rien faire en ce moment. ¦ Las actualizaciones, copias de seguridad, videollamadas, descargas de juegos y sincronizaciones en la nube causan picos así. Solo importa si el dispositivo no debería estar haciendo nada ahora.
+Usually Wi-Fi interference, a weak signal, or a device with power-saving/roaming quirks — rarely an attack. ¦ D'habitude des interférences Wi-Fi, un signal faible ou un appareil aux réglages d'économie d'énergie ou d'itinérance capricieux ; rarement une attaque. ¦ Normalmente interferencias de Wi-Fi, una señal débil o un dispositivo con ajustes de ahorro de energía o itinerancia peculiares; rara vez un ataque.
+Usually your provider's DNS being slow or a congested connection; it isn't a security problem. ¦ D'habitude le DNS de votre fournisseur qui est lent ou une connexion encombrée ; ce n'est pas un problème de sécurité. ¦ Normalmente el DNS de su proveedor va lento o la conexión está saturada; no es un problema de seguridad.
+Very often normal: cloud and content services are spread across many countries. Location databases can also be wrong. ¦ Très souvent normal : les services cloud et de contenu sont répartis dans de nombreux pays. Les bases de localisation peuvent aussi se tromper. ¦ Muy a menudo normal: los servicios en la nube y de contenidos están repartidos por muchos países. Las bases de datos de ubicación también pueden equivocarse.
+Website names aren't being resolved reliably right now. ¦ Les noms de sites ne sont pas traduits en adresses de façon fiable en ce moment. ¦ Los nombres de los sitios no se están resolviendo de forma fiable ahora mismo.
+little evidence ¦ peu d'indices ¦ pocos indicios
+A device appeared that I haven't seen in this session. ¦ Un appareil que je n'avais pas vu pendant cette session est apparu. ¦ Apareció un dispositivo que no había visto en esta sesión.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -32611,9 +32691,96 @@ EVENT_PATTERNS += [
     (r"A second device hands out addresses and a different router: (\S+)",
      r"Un second appareil distribue des adresses et un autre routeur : \1",
      r"Un segundo dispositivo reparte direcciones y otro router: \1"),
+    (r"(.+): unusual upload spike", r"\1 : pic d'envoi inhabituel",
+     r"\1: pico de subida inusual"),
+    (r"(.+): unusual download spike", r"\1 : pic de téléchargement "
+     r"inhabituel", r"\1: pico de descarga inusual"),
+    (r"(.+): unusually many destinations", r"\1 : nombre inhabituel de "
+     r"destinations", r"\1: número inusual de destinos"),
+    (r"(.+): unusually many new connections", r"\1 : nombre inhabituel de "
+     r"nouvelles connexions", r"\1: número inusual de conexiones nuevas"),
 ]
-I18N_PATTERNS += EVENT_PATTERNS[-6:]
+I18N_PATTERNS += EVENT_PATTERNS[-10:]
 I18N_PATTERNS += [
+    (r"A device appeared that wasn't here before\. How sure MiniWireshark "
+     r"is of what it is: (\w+) \((.+)\)\.",
+     "Un appareil est apparu qui n'était pas là avant. Ce que "
+     "MiniWireshark sait de ce qu'il est : {t1} ({t2}).",
+     "Apareció un dispositivo que antes no estaba. Lo seguro que está "
+     "MiniWireshark de qué es: {t1} ({t2})."),
+    # (#40) the existing alerts' "what we saw" sentences
+    (r"In one minute it uploaded (.+); its usual minute is about (.+)\."
+     r"((?: .+)?)",
+     "En une minute, il a envoyé \\1 ; d'habitude environ \\2 par "
+     "minute.{t3}",
+     "En un minuto subió \\1; lo habitual es unos \\2 por minuto.{t3}"),
+    (r"In one minute it downloaded (.+); its usual minute is about (.+)\."
+     r"((?: .+)?)",
+     "En une minute, il a téléchargé \\1 ; d'habitude environ \\2 par "
+     "minute.{t3}",
+     "En un minuto descargó \\1; lo habitual es unos \\2 por minuto.{t3}"),
+    (r"In one minute it contacted (\d+) different Internet hosts; its usual "
+     r"minute is about (\d+)\.((?: .+)?)",
+     "En une minute, il a contacté \\1 hôtes Internet différents ; "
+     "d'habitude environ \\2.{t3}",
+     "En un minuto contactó con \\1 hosts de Internet distintos; lo "
+     "habitual es unos \\2.{t3}"),
+    (r"In one minute it opened (\d+) new connections; its usual minute is "
+     r"about (\d+)\.((?: .+)?)",
+     "En une minute, il a ouvert \\1 nouvelles connexions ; d'habitude "
+     "environ \\2.{t3}",
+     "En un minuto abrió \\1 conexiones nuevas; lo habitual es unas "
+     "\\2.{t3}"),
+    (r"This minute: (.+)", r"Cette minute : \1", r"Este minuto: \1"),
+    (r"Usual: (.+)", "D'habitude : {t1}", "Lo habitual: {t1}"),
+    (r"Why now: (.+)", "Pourquoi maintenant : {t1}", "Por qué ahora: {t1}"),
+    (r"(\d+) different MAC addresses have claimed (\S+)\.",
+     r"\1 adresses MAC différentes ont revendiqué \2.",
+     r"\1 direcciones MAC distintas han reclamado \2."),
+    (r"Your gateway \((\S+)\) has answered ARP from (\d+) different MAC "
+     r"addresses in this session\.",
+     r"Votre passerelle (\1) a répondu en ARP depuis \2 adresses MAC "
+     r"différentes pendant cette session.",
+     r"Su puerta de enlace (\1) ha respondido por ARP desde \2 direcciones "
+     r"MAC distintas en esta sesión."),
+    (r"(\S+) was claimed by (\d+) different MAC addresses and flipped back "
+     r"and forth (\d+) times within a minute\.",
+     r"\1 a été revendiquée par \2 adresses MAC différentes et a changé "
+     r"\3 fois de main en une minute.",
+     r"\1 fue reclamada por \2 direcciones MAC distintas y cambió de "
+     r"manos \3 veces en un minuto."),
+    (r"(\S+) was claimed by (\d+) different MAC addresses answering at the "
+     r"same time \(each more than once within 2 minutes\)\.",
+     r"\1 a été revendiquée par \2 adresses MAC différentes qui répondaient "
+     r"en même temps (chacune plus d'une fois en 2 minutes).",
+     r"\1 fue reclamada por \2 direcciones MAC distintas que respondían a "
+     r"la vez (cada una más de una vez en 2 minutos)."),
+    (r"(\d+) connections were abruptly reset in the last (\d+) minutes "
+     r"\(most often with (.+)\)\.",
+     r"\1 connexions ont été brusquement réinitialisées ces \2 dernières "
+     r"minutes (le plus souvent avec \3).",
+     r"\1 conexiones se restablecieron de golpe en los últimos \2 minutos "
+     r"(sobre todo con \3)."),
+    (r"(\d+) connections were abruptly reset in the last (\d+) minutes\.",
+     r"\1 connexions ont été brusquement réinitialisées ces \2 dernières "
+     r"minutes.",
+     r"\1 conexiones se restablecieron de golpe en los últimos \2 "
+     r"minutos."),
+    (r"Within a minute it tried (\d+) different ports on (\S+), most "
+     r"without an answer\.",
+     r"En une minute, il a essayé \1 ports différents sur \2, la plupart "
+     r"sans réponse.",
+     r"En un minuto probó \1 puertos distintos en \2, la mayoría sin "
+     r"respuesta."),
+    (r"Within a minute it tried (\d+) different hosts on port (\d+), most "
+     r"without an answer\.",
+     r"En une minute, il a essayé \1 hôtes différents sur le port \2, la "
+     r"plupart sans réponse.",
+     r"En un minuto probó \1 hosts distintos en el puerto \2, la mayoría "
+     r"sin respuesta."),
+    (r"(\d+) different DHCP servers seen: ([0-9a-fA-F.:, ]+)\.",
+     r"\1 serveurs DHCP différents vus : \2.",
+     r"Se vieron \1 servidores DHCP distintos: \2."),
     (r"(.+) and (\d+) other servers", r"\1 et \2 autres serveurs",
      r"\1 y otros \2 servidores"),
     (r"(.+) and 1 other server", r"\1 et 1 autre serveur",
@@ -60577,6 +60744,7 @@ proc ::mw_explicit_fonts {top names} {
         m = self._new_model(offline=True, identity=("", set(), set()))
         m.announce_new = True
         m.capture_started = 0
+        m.discovery_from_first_packet = True     # second audit (#40)
         self.replace_model(m)
         self.data_mode = "offline"
         self.data_label = os.path.basename(path)
@@ -75177,6 +75345,24 @@ def t_a2_known_services_not_unusual(ctx):
     assert known_bulk_service("notgooglevideo.com") is None
 
 
+@self_test()
+def t_a2_two_addresses_no_story(ctx):
+    """Second audit (#38): a router that answers for two addresses, back
+    and forth, changed its address once, not 24 times; a phone that moves
+    to a new address still changes it each time."""
+    reg = DeviceRegistry("192.168.1.1", set(), ctx.cfg({}),
+                         now_fn=lambda: 1000.0)
+    for i in range(24):
+        reg.touch("192.168.1.1" if i % 2 else "192.168.0.1",
+                  "00:1e:58:aa:00:01", "arp_reply", "x", 1000.0 + 60 * i)
+        reg.touch(f"192.168.1.{100 + i}", "da:a1:19:23:45:67", "arp_reply",
+                  "x", 1000.0 + 60 * i)
+    ev = Counter(key for kind, _s, _t, key in reg.events
+                 if kind == "ip changed")
+    assert ev["00:1e:58:aa:00:01"] == 1 and \
+        ev["da:a1:19:23:45:67"] == 23, ev
+
+
 def a2_syn(sb, host, rip, dport=443, proto="TCP"):
     sp = sb._next_port()
     out = PK.Ether(src=host[1], dst=sb.GW[1]) / PK.IP(src=host[0], dst=rip)
@@ -75403,6 +75589,81 @@ def t_a2_spoof_and_scan_words(ctx):
         [a.observed for a in scans]
     assert not a2_kinds(m, "tcp_resets"), \
         [a.reason for a in a2_kinds(m, "tcp_resets")]
+
+
+@self_test(needs_source=True)
+def t_a2_alert_text_translated(ctx):
+    """Second audit (#40): in French and Spanish an alert's whole text is
+    translated, not only its title: every fixed sentence an alert can
+    hold (what it means, innocent explanations, why it was flagged), and
+    the "what we saw" sentences of the common alerts; the alert table's
+    title too. A new device's alert no longer says "low-confidence"
+    under a High confidence. An opened file's devices that were there
+    from its start (the router too) don't each "join your network"."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    fixed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "AlertEngine":
+            for c in ast.walk(node):
+                if isinstance(c, ast.Call) and \
+                        getattr(c.func, "attr", "") == "_add":
+                    for a in list(c.args[4:7]) + [
+                            k.value for k in c.keywords if k.arg == "why"]:
+                        if isinstance(a, ast.Constant) and \
+                                isinstance(a.value, str):
+                            fixed.add(a.value)
+    assert len(fixed) > 50, len(fixed)
+    miss = [(loc, s) for s in sorted(fixed) for loc in ("fr", "es")
+            if translate_text(s, loc) == s]
+    assert not miss, miss[:6]
+    clock = [SCENARIO_T0]
+    e = AlertEngine(ctx.cfg({}), now_fn=lambda: clock[0])
+    reg = DeviceRegistry("192.168.1.1", set(), ctx.cfg({}),
+                         now_fn=lambda: clock[0])
+    dev = reg.touch("192.168.1.60", "24:0a:c4:60:00:60", "arp_reply", "x",
+                    clock[0])
+    made = [e.new_device(dev),
+            e.baseline_anomaly(dev, "bytes_up", 5e6, 2e4,
+                               note="first time active at night"),
+            e.baseline_anomaly(dev, "new_conns", 300, 4),
+            e.duplicate_ip("192.168.1.60", 2),
+            e.gateway_change("192.168.1.1", 2),
+            e.arp_spoof("192.168.1.1", 2, 5, True),
+            e.dhcp_anomaly({"192.168.1.1", "192.168.1.2"}),
+            e.tcp_resets(dev, 45, 600, "93.184.215.14"),
+            e.scan_pattern(dev, "different ports on 192.168.1.50", 90)]
+    assert all(made), made
+    nd = made[0]
+    assert nd.confidence == "High" and "-confidence" not in nd.observed, \
+        nd.observed
+    for a in made:
+        for loc in ("fr", "es"):
+            for text in [a.reason, a.observed] + list(a.evidence):
+                assert translate_text(text, loc) != text, (loc, text)
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        assert all(translate_event(a.reason) != a.reason for a in made), \
+            [a.reason for a in made if translate_event(a.reason) == a.reason]
+    finally:
+        set_locale(old)
+    # an opened file: the devices there from its first seconds are no news
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", set(), set())
+    m.use_packet_clock = True
+    m.capture_started = 0
+    m.discovery_from_first_packet = True
+    sb = ScenarioBuilder()
+    sb.home_network()
+    sb.t += 60
+    sb.arp_announce(("192.168.1.77", "3c:22:fb:77:00:77"))
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    joined = sorted(a.device_key for a in a2_kinds(m, "new_device"))
+    assert "3c:22:fb:77:00:77" in joined, joined
+    assert not {sb.GW[1], sb.ME[1], sb.PHONE[1], sb.TV[1]} & set(joined), \
+        joined
 
 
 @self_test()
