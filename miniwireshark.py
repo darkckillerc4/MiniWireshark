@@ -45315,10 +45315,11 @@ class PacketsTab(BaseTab):
                 return
             need, keep = self.details_room()
             pos = vert.sashpos(0)
-            if total - pos >= need:
+            if total - pos >= need or total < keep + 40:
+                # too short for three rows and the details: the packet
+                # list comes first (halving it left one row on Windows)
                 return
-            vert.sashpos(0, max(keep, total - need) if total >= keep + 40
-                         else total // 2)
+            vert.sashpos(0, max(keep, total - need))
         except tk.TclError:
             pass
 
@@ -95019,7 +95020,12 @@ def _gs_ct7_health_verdict(app, ctx):
                                                     "dns", "wifi")), res
         st, text = res["overall"]
         assert st != "Healthy", res["overall"]
-        assert "Not checked yet" in text and "Router reachable" in text, text
+        # a real problem of this computer comes first (Windows CI has no
+        # Npcap: "Worth a look: Capture driver"); otherwise the verdict
+        # says what was not checked yet
+        if not text.startswith(translate_text("Worth a look")):
+            assert "Not checked yet" in text and "Router reachable" in text, \
+                text
         tab = app._select_tab("health")
         tab.refresh()
         _gui_pump(app.root, 0.1)
@@ -96226,8 +96232,9 @@ def gt_c12_packet_view(app, ctx):
         # the details get their room, or all but the list's three rows
         # when the window is too short for both (earlier steps may have
         # opened bars above the list)
-        assert total - pos >= min(need, total - keep) - 2, \
-            (total, pos, need, keep)
+        if total >= keep + 40:
+            assert total - pos >= min(need, total - keep) - 2, \
+                (total, pos, need, keep)
         dh, lh = pt.dtree.winfo_height(), pt.tree.winfo_height()
         if total >= need + keep:
             # only when the pane has room for both: in the full run the
