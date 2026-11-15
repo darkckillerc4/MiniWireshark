@@ -19914,6 +19914,19 @@ LOCAL_PROBE_SKIP = frozenset({137, 138, 139, 445, 1433, 3306, 5432, 6379,
                               9100, 11211, 27017})
 
 
+def local_page_title(data):
+    """The page's <title>, found in one pass (second audit #3: a lazy
+    regex over 64 KB of "<title>" took about 2 s of CPU per answer)."""
+    lo = data.lower()
+    i = lo.find(b"<title")
+    j = lo.find(b">", i) if i >= 0 else -1
+    k = lo.find(b"</title", j) if j >= 0 else -1
+    if k < 0:
+        return ""
+    return sanitize_text(" ".join(html.unescape(data[j + 1:k][:4096].decode(
+        "utf-8", "replace")).split()), 120)
+
+
 def probe_local_http(host, port, own=(), timeout=1.0):
     """One "GET /" to a port of THIS computer (loopback, or one of its own
     addresses in `own`; never another host, and no redirect is
@@ -19979,9 +19992,7 @@ def probe_local_http(host, port, own=(), timeout=1.0):
             data, m, https = tdata, tm, True
     if not m:
         return {"web": False, "https": False, "status": 0, "title": ""}
-    t = re.search(rb"<title[^>]*>(.*?)</title", data, re.I | re.S)
-    title = sanitize_text(" ".join(html.unescape(t.group(1).decode(
-        "utf-8", "replace")).split()), 120) if t else ""
+    title = local_page_title(data)
     return {"web": True, "https": https, "status": int(m.group(1)),
             "title": title}
 
@@ -92591,6 +92602,21 @@ def t_534_hung_job_abandoned(ctx):
         ONE_JOB_LIMIT.pop(name, None)
         _ONE_JOB_LOST.pop(name, None)
 
+
+
+@self_test()
+def t_a2_local_page_title_one_pass(ctx):
+    """Second audit #3: the Local services probe reads a page's title in
+    one pass; 64 KB of "<title>" with no end tag takes milliseconds, not
+    seconds."""
+    assert local_page_title(b"HTTP/1.0 200 OK\r\n\r\n<html><TITLE id=x>"
+                            b" My  &amp; app </title>") == "My & app"
+    assert local_page_title(b"<title>no end") == ""
+    assert local_page_title(b"no title at all") == ""
+    t0 = time.perf_counter()
+    assert local_page_title(b"<title>" * 9362) == ""
+    took = time.perf_counter() - t0
+    assert took < 0.1, f"{took:.3f} s"
 
 
 @self_test(needs_source=True)
