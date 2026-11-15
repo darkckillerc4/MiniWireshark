@@ -89,6 +89,7 @@ import gc
 import gzip
 import hashlib
 import html
+import http.client
 import importlib
 import inspect
 import itertools
@@ -275,33 +276,77 @@ def run_bounded(cmd, timeout, input=None, text=False, env=None,
 
 
 _ONE_JOB = {}                     # thread name -> the request waiting (or None)
+_ONE_JOB_RUN = {}                 # name -> (thread, deadline) of the job running
+_ONE_JOB_LOST = {}                # name -> the thread last abandoned there
 _ONE_JOB_LOCK = threading.Lock()
+# audit #5: seconds a job may run before the next request abandons it
+ONE_JOB_LIMIT = {"network-id": 60.0, "capture-start": 30.0,
+                 "capture-heal": 30.0}
+ONE_JOB_LIMIT_DEFAULT = 60.0
 
 
 def start_one(name, work, coalesce=False):
     """5.3.4 soak: `work` on a daemon thread called `name`, at most one at
     a time. A request while one runs is skipped, or with `coalesce` kept
     (only the newest) and run right after it: a blocked call can no
-    longer pile up threads. -> True when a thread was started."""
+    longer pile up threads. Audit #5: a job past its ONE_JOB_LIMIT no
+    longer blocks the name; the next request renames its thread
+    "<name>-abandoned", leaves it to finish alone and starts afresh (one
+    abandoned thread per name at most). -> True when a thread started."""
     with _ONE_JOB_LOCK:
         if name in _ONE_JOB:
-            if coalesce:
-                _ONE_JOB[name] = work
-            return False
+            th, until = _ONE_JOB_RUN.get(name, (None, 0.0))
+            lost = _ONE_JOB_LOST.get(name)
+            if th is None or time.monotonic() < until or \
+                    (lost is not None and lost.is_alive()):
+                if coalesce:
+                    _ONE_JOB[name] = work
+                return False
+            th.name = name + "-abandoned"
+            _ONE_JOB_LOST[name] = th
+            del _ONE_JOB_RUN[name]       # its end now leaves the name alone
+            LOG.warning("background job %s ran over %.0f s: abandoned",
+                        name, ONE_JOB_LIMIT.get(name, ONE_JOB_LIMIT_DEFAULT))
         _ONE_JOB[name] = None
 
+    def mine(me):
+        return _ONE_JOB_RUN.get(name, (None,))[0] is me
+
     def run(job):
-        while job is not None:
-            try:
-                job()
-            except Exception:                        # noqa: BLE001
-                LOG.exception("background job %s", name)
+        me = threading.current_thread()
+        with _ONE_JOB_LOCK:
+            _ONE_JOB_RUN[name] = (me, time.monotonic() + ONE_JOB_LIMIT.get(
+                name, ONE_JOB_LIMIT_DEFAULT))
+        try:
+            while job is not None:
+                with _ONE_JOB_LOCK:
+                    if not mine(me):
+                        return                     # abandoned meanwhile
+                    _ONE_JOB_RUN[name] = (me, time.monotonic() +
+                                          ONE_JOB_LIMIT.get(
+                                              name, ONE_JOB_LIMIT_DEFAULT))
+                try:
+                    job()
+                except Exception:                    # noqa: BLE001
+                    LOG.exception("background job %s", name)
+                with _ONE_JOB_LOCK:
+                    if not mine(me):
+                        return                     # abandoned meanwhile
+                    job = _ONE_JOB.get(name)
+                    if job is None:
+                        _ONE_JOB.pop(name, None)
+                        _ONE_JOB_RUN.pop(name, None)
+                    else:
+                        _ONE_JOB[name] = None
+        finally:
+            # a BaseException (SystemExit in a job) ends the thread: the
+            # name is free again, or every later request was skipped for
+            # the rest of the session. An abandoned thread leaves the name
+            # to the one that took it over.
             with _ONE_JOB_LOCK:
-                job = _ONE_JOB.get(name)
-                if job is None:
+                if mine(me):
                     _ONE_JOB.pop(name, None)
-                else:
-                    _ONE_JOB[name] = None
+                    _ONE_JOB_RUN.pop(name, None)
     try:
         threading.Thread(target=run, args=(work,), daemon=True,
                          name=name).start()
@@ -331,6 +376,66 @@ def self_cmd(*args):
     if FROZEN:
         return [sys.executable] + list(args)
     return [sys.executable, SCRIPT_PATH] + list(args)
+
+
+def elevated_cmd(*args):
+    """self_cmd() for the copy that runs as administrator (root). Second
+    audit (security #1): Python starts isolated (-I), so the root copy
+    loads no .pth file or module from the user's own site-packages, no
+    PYTHONPATH and nothing from the current folder: the user's own
+    processes can write there, and it ran as uid 0."""
+    if FROZEN:
+        return self_cmd(*args)
+    return [sys.executable, "-I", SCRIPT_PATH] + list(args)
+
+
+ROOT_PATH_FALLBACK = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin",
+                      "/usr/bin", "/sbin", "/bin")
+
+
+def root_safe_path(path_value):
+    """Second audit (security #1): the PATH a root copy may run programs
+    from. Only folders root owns that nobody else can write to are kept
+    (the order stays): a netstat, lsof or xdg-open in the user's ~/bin
+    used to run as root. Falls back to the usual system folders."""
+    out = []
+    for d in str(path_value or "").split(os.pathsep):
+        if not d or not os.path.isabs(d) or d in out:
+            continue
+        try:
+            st = os.stat(d)
+        except OSError:
+            continue
+        if os.path.isdir(d) and st.st_uid == 0 and not st.st_mode & 0o022:
+            out.append(d)
+    if not out:
+        out = [d for d in ROOT_PATH_FALLBACK if os.path.isdir(d)] or \
+            list(ROOT_PATH_FALLBACK)
+    return os.pathsep.join(out)
+
+
+ROOT_DROPPED_ENV = ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP",
+                    "PYTHONUSERBASE", "PYTHONINSPECT", "PYTHONEXECUTABLE",
+                    "PYTHONBREAKPOINT", "PYTHONPYCACHEPREFIX")
+
+
+def harden_root_env(environ, euid=None, invoked=None):
+    """Second audit (security #1): a copy started as root for the user
+    (sudo, pkexec, the password prompt) keeps the user's HOME for the
+    data folder, but runs programs only from root's own folders, and the
+    Python processes it starts (workers, pip) load nothing of the
+    user's. -> True when it changed `environ`."""
+    if IS_WINDOWS:
+        return False
+    euid = os.geteuid() if euid is None else euid
+    invoked = (_invoking_uid() is not None) if invoked is None else invoked
+    if euid != 0 or not invoked:
+        return False
+    environ["PATH"] = root_safe_path(environ.get("PATH", ""))
+    for v in ROOT_DROPPED_ENV:
+        environ.pop(v, None)
+    environ["PYTHONNOUSERSITE"] = "1"
+    return True
 
 
 if FROZEN and "--mw-worker" not in sys.argv:
@@ -628,12 +733,31 @@ def _tmp_name(path):
     return f"{path}.tmp{os.getpid()}-{threading.get_ident() % 100000}"
 
 
+def _open_new_tmp(tmp, mode, encoding=None):
+    """Second audit (security #5): the temporary file is always a new file
+    of our own. Its name can be guessed, so a file or link someone left
+    under it in a shared folder (an export to /tmp) is removed and never
+    followed: before, a link there made the write land in its target, and
+    the rename then put the link in place of the file."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | \
+        getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    for attempt in range(2):
+        try:
+            fd = os.open(tmp, flags, 0o666)
+            break
+        except FileExistsError:
+            if attempt:
+                raise
+            os.remove(tmp)            # a stale one, or someone else's link
+    return os.fdopen(fd, mode, encoding=encoding)
+
+
 def _atomic_write(path, data, mode, encoding=None):
     """(5.3.4 review) on disk before the rename, so a power cut cannot
     leave an empty file; the temporary file never stays."""
     tmp = _tmp_name(path)
     try:
-        with open(tmp, mode, encoding=encoding) as f:
+        with _open_new_tmp(tmp, mode, encoding=encoding) as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -981,13 +1105,16 @@ def load_json_store(path, kind=dict):
     if raw is None:
         return None, "unreadable"
     try:
-        data = json.loads(raw.decode("utf-8"))
+        data = json.loads(raw.decode("utf-8-sig"))   # (second audit #24)
         if isinstance(data, kind):
             return data, ""
     except ValueError:
         pass
     try:
-        atomic_write_bytes(f"{path}.damaged-{int(time.time())}", raw)
+        # (35-checker review) one copy of the same damage: a store that is
+        # never saved again was set aside once more on every start
+        if not damaged_copy_exists(path, raw):
+            atomic_write_bytes(f"{path}.damaged-{int(time.time())}", raw)
     except OSError:
         return None, "unreadable"
     bak = read_json(path + ".bak", None)
@@ -996,6 +1123,26 @@ def load_json_store(path, kind=dict):
         return bak, "restored"
     LOG.warning("%s was damaged and set aside", path)
     return None, "damaged"
+
+
+def damaged_copy_exists(path, raw):
+    """True when a `.damaged-…` copy beside `path` already holds `raw`."""
+    folder = os.path.dirname(path) or "."
+    stem = os.path.basename(path) + ".damaged-"
+    try:
+        names = [n for n in os.listdir(folder) if n.startswith(stem)]
+    except OSError:
+        return False
+    for n in names:
+        try:
+            if os.path.getsize(os.path.join(folder, n)) != len(raw):
+                continue
+            with open(os.path.join(folder, n), "rb") as f:
+                if f.read() == raw:
+                    return True
+        except OSError:
+            continue
+    return False
 
 
 def store_problem_text(problem, what):
@@ -1012,17 +1159,15 @@ def store_problem_text(problem, what):
 def save_json_store(path, obj):
     """Write a store with a backup of the previous version and an fsync,
     so a power cut leaves the old or the new file, never half of one."""
+    text = json.dumps(obj, indent=2, default=str)
     if os.path.exists(path):
         with contextlib.suppress(OSError):
             if isinstance(read_json(path, None), (dict, list)):
-                shutil.copyfile(path, path + ".bak")
-    tmp = _tmp_name(path)
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(obj, indent=2, default=str))
-        f.flush()
-        with contextlib.suppress(OSError):
-            os.fsync(f.fileno())
-    _replace_retrying(tmp, path)
+                # (35-checker review) the backup too is all or nothing
+                with open(path, "rb") as f:
+                    atomic_write_bytes(path + ".bak", f.read())
+    # (35-checker review) a failed write leaves no *.tmp file behind
+    _atomic_write(path, text, "w", "utf-8")
 
 
 def is_admin():
@@ -1088,7 +1233,7 @@ def _relaunch_elevated(more_args=(), before_exit=None):
         except OSError:
             return False
         extra += [DATA_ARG + PATHS.data, ELEV_FLAG_ARG + flag]
-    argv = self_cmd(ELEVATED_FLAG, *extra)
+    argv = elevated_cmd(ELEVATED_FLAG, *extra)
 
     def started():
         ok = os.path.exists(flag)
@@ -1117,12 +1262,15 @@ def _relaunch_elevated(more_args=(), before_exit=None):
         if started():
             _elevated_exit(rc, before_exit)
         return False
+    # second audit (security #1): root gets a PATH of root's own folders,
+    # never the user's (a program in ~/bin ran as root)
     env_pairs = [f"{v}={os.environ[v]}" for v in
                  ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
-                  "XDG_RUNTIME_DIR", "HOME", "USER", "LANG", "PATH",
+                  "XDG_RUNTIME_DIR", "HOME", "USER", "LANG",
                   "MINIWIRESHARK_DATA", "MINIWIRESHARK_CONFIG", "MW_STAGE",
                   "MINIWIRESHARK_NO_RUNTIME", "MW_READY_FILE")
-                 if v in os.environ]
+                 if v in os.environ] + \
+        ["PATH=" + root_safe_path(os.environ.get("PATH", ""))]
     launchers = []
     if shutil.which("pkexec"):
         launchers.append(["pkexec", "env"] + env_pairs)
@@ -1396,7 +1544,9 @@ CLI_FLAGS = {
                               "test (needs a display)."),
     "--live": ("", False, ""),
     "--bench": ("", False, "Measure this computer's analysis speed."),
-    "--bench-gui": ("", False, "Developer: window benchmarks."),
+    "--bench-gui": ("S1 S2 S3 S4 | all", True,
+                    "Developer: window benchmarks (S1 when none is named; "
+                    "--check compares with the limits)."),
     "--check": ("", False, ""),
     "--targets": ("", False, ""),
     "--runs": ("N", False, ""),
@@ -1432,7 +1582,10 @@ def cli_usage():
             name = "-h, --help"
         elif flag == "--version":
             name = "-V, --version"
-        lines.append(f"  {name:<24} {text}")
+        if len(name) > 24:                # its text on the next line
+            lines += [f"  {name}", f"  {'':<24} {text}"]
+        else:
+            lines.append(f"  {name:<24} {text}")
     lines += ["", "With no options the window opens. Data goes in the data "
               "folder and settings in miniwireshark_config.json (set "
               "MINIWIRESHARK_DATA or MINIWIRESHARK_CONFIG to move them)."]
@@ -1528,11 +1681,17 @@ if __name__ == "__main__":
 # write (POSIX: owned by this user, not group/other-writable; Windows:
 # only under the per-user LOCALAPPDATA), never by root. Anything else is
 # compiled from the file as usual.
+# Second audit (security #2): `python -c` puts the current folder first on
+# sys.path, and hmac and hashlib were imported from there before any check
+# (a hmac.py in the folder MiniWireshark was started from ran, as root under
+# sudo). The current folder is dropped before anything is imported.
 PYC_MAC_LEN = 32
 CACHED_RUN = "\n".join((
-    "import sys,os,types,marshal,hmac,hashlib,importlib.util as U",
+    "import sys;sys.path[:]=[x for x in sys.path if x]",
+    "import os,types,marshal,hmac,hashlib,importlib.util as U",
     "p=os.path.abspath(sys.argv[1]);sys.argv=sys.argv[1:]",
-    "sys.path[0]=os.path.dirname(p);c=None;q=os.environ.get('MW_PYC','')",
+    "sys.path.insert(0,os.path.dirname(p));c=None;"
+    "q=os.environ.get('MW_PYC','')",
     "try:",
     " s=os.stat(p);e=os.environ;k=e.get('MW_KEY','')",
     " if os.name=='nt':",
@@ -2268,6 +2427,24 @@ def needs_elevation():
     return not has_capture_rights()
 
 
+def capture_rights_line():
+    """5.3.4 crowd test #19: the Diagnostics line that says whether this
+    window may watch live traffic, and the next step when it may not."""
+    if IS_WINDOWS:
+        return ("Npcap installed" if _npcap_present() else
+                "Npcap missing — install it from npcap.com")
+    if has_capture_rights():
+        return "yes" + (" (administrator)" if is_admin() else
+                        " (capture right given to this Python)")
+    if IS_MAC:
+        return ("no — MiniWireshark asks for your password when watching "
+                "starts; or start it with sudo")
+    return ("no — MiniWireshark asks for your password when watching "
+            "starts; or start it with sudo; or once: sudo setcap "
+            "cap_net_raw,cap_net_admin+eip " +
+            os.path.realpath(sys.executable))
+
+
 def has_capture_rights():
     """5.3.4 (LG-09): capture works without root when this Python has the
     raw-socket capability (Linux: `setcap cap_net_raw,cap_net_admin+eip`)
@@ -2337,6 +2514,7 @@ if ELEVATED_FLAG in sys.argv:
     _ELEV = True
 else:
     _ELEV = False
+harden_root_env(os.environ)
 mark_elevated_start()
 START_MONITOR = START_ARG + "monitor" in sys.argv
 if START_MONITOR:
@@ -2396,17 +2574,59 @@ if __name__ == "__main__" and not TOOL_MODE and not _ELEV:
 
 
 # ---- Tk ---------------------------------------------------------------------
+# second audit (install #31): python.org's macOS installer has no "tcl/tk"
+# box (Tk is always in it); the Windows one calls it "tcl/tk and IDLE"
+TK_MISSING_HELP = (
+    "MiniWireshark needs Python's graphical toolkit (tkinter).\n"
+    "  Windows:       run the python.org installer again, choose Modify and "
+    "tick 'tcl/tk and IDLE'.\n"
+    "  macOS:         install Python from python.org (Tk is included), or "
+    "with Homebrew: brew install python-tk\n"
+    "  Debian/Ubuntu: sudo apt install python3-tk\n"
+    "  Fedora:        sudo dnf install python3-tkinter\n")
+
+
+def boot_check_without_tk(err, out=print):
+    """Second audit (install #30): `--boot-check` on a Python without
+    tkinter, the most common Linux problem. It printed only "needs
+    tkinter"; it now says what it can check without the window toolkit,
+    and the fix. -> exit code 1."""
+    out(f"MiniWireshark {SCRIPT_VERSION} boot check")
+    out(f"  Python      {platform.python_version()} ({sys.executable})")
+    out(f"  Window      FAILED: no graphical toolkit (tkinter): "
+        f"{type(err).__name__}: {err}")
+    for line in TK_MISSING_HELP.splitlines()[1:]:
+        out("    " + line.strip())
+    try:
+        import importlib.util as iu
+        scapy = iu.find_spec("scapy") is not None
+    except (ImportError, ValueError):
+        scapy = False
+    out(f"  scapy       {'installed' if scapy else 'not installed yet (the first start offers it)'}")
+    writable = _dir_writable(PATHS.data)
+    out(f"  Data folder {PATHS.data} "
+        f"({'writable' if writable else 'NOT writable'})")
+    out("")
+    out("Ready?")
+    out("  ✗ Python and window toolkit: this Python has no graphical "
+        "toolkit (tkinter), so the window can't open. Install it as shown "
+        "above.")
+    out("")
+    out("Result: problems found (see above)")
+    return 1
+
+
 try:
     import tkinter as tk
     import tkinter.font as tkfont
     from tkinter import filedialog, messagebox, ttk
-except ImportError:                                  # pragma: no cover
-    sys.stderr.write(
-        "MiniWireshark needs Python's graphical toolkit (tkinter).\n"
-        "  Windows/macOS: reinstall Python from python.org (tick 'tcl/tk').\n"
-        "  macOS Homebrew: brew install python-tk\n"
-        "  Debian/Ubuntu: sudo apt install python3-tk\n"
-        "  Fedora:        sudo dnf install python3-tkinter\n")
+except ImportError as _tk_error:                     # pragma: no cover
+    if BOOT_CHECK_MODE:
+        sys.exit(boot_check_without_tk(_tk_error))
+    sys.stderr.write(TK_MISSING_HELP)
+    if TOOL_MODE:
+        sys.stderr.write("`--boot-check` works without it and says what "
+                         "else is ready.\n")
     if BOOT is not None:
         # 5.3.4 (OS-06): a Python without Tk is not a crashed start, so it
         # never puts the next start (on a Python with Tk) into Safe Mode
@@ -2703,7 +2923,9 @@ def fetch_to_file(url, dest, expected_sha=None, feature="packages",
                                  {"speed": speed, "eta": eta})
     except RuntimeError_:
         raise
-    except (OSError, urllib.error.URLError) as e:
+    except (OSError, urllib.error.URLError, http.client.HTTPException) as e:
+        # (35-checker review) a dropped transfer (IncompleteRead) is no
+        # OSError: it escaped raw, and the .part was never resumed
         raise RuntimeError_(classify_runtime_error(e), str(e))
     if expected_sha:
         actual = sha256_file(part)
@@ -3064,7 +3286,21 @@ OUTBOUND_FEATURES = {
     "connector": "Connected helpers (Pi-hole, AdGuard Home)",
     "release": "Release tooling (developers only)",
     "packages": "Components and packages (downloads you approved)",
+    # 5.3.4: a page of a service on this computer, opened in the browser
+    # from Websites → Local services (it goes to 127.0.0.1 only, but the
+    # page may load more, so it is recorded and the kill switch stops it)
+    "local_open": "Local services opened in your browser (this computer)",
+    # ...and one "GET /" to each of them, to see if it is a web page
+    "local_probe": "Local services checked for a web page (this computer)",
 }
+
+# 5.3.4 crowd test (#3): what the kill switch does, said once. The banner,
+# the Settings help, the ledger, Help and the Ready? list each said it in
+# their own words: only the optional requests, absolutely nothing, nothing
+# leaving this computer at all (other programs' traffic still does).
+KILL_SWITCH_EFFECT = ("MiniWireshark sends nothing: no discovery probes, "
+                      "health checks, name lookups, downloads or update "
+                      "checks. Watching continues.")
 
 
 class SelfTrafficLedger:
@@ -3125,10 +3361,52 @@ def net_urlopen(feature, req, timeout, detail="", allowed=None):
     parts = urllib.parse.urlsplit(url)
     outbound(feature, parts.scheme or "http", parts.hostname or url,
              detail or (parts.path or "/")[:100])
-    if allowed is not None:
-        opener = _redirect_opener(allowed)
-        return opener.open(req, timeout=timeout)
-    return urllib.request.urlopen(req, timeout=timeout)
+    prev = getattr(_NET_FEATURE, "name", None)
+    _NET_FEATURE.name = feature        # what a redirect is recorded under
+    try:
+        if allowed is not None:
+            opener = _redirect_opener(allowed)
+            return opener.open(req, timeout=timeout)
+        return urllib.request.urlopen(req, timeout=timeout)
+    finally:
+        _NET_FEATURE.name = prev
+
+
+# Second audit (privacy #11): urllib follows up to 10 redirects to any
+# host. Only the update check checked them; every other download (the
+# reference lists, country lookups, packages) could be sent on to another
+# host, plain http included, and the ledger listed only the first one.
+# Each redirect now passes the outbound() gate itself (recorded, stopped by
+# the kill switch), and https is never redirected to plain http.
+_NET_FEATURE = threading.local()
+
+
+def gate_redirect(old_url, new_url, feature=None):
+    """Raise unless the redirect from old_url to new_url may be followed;
+    records it in the ledger under the feature of the request."""
+    feature = feature or getattr(_NET_FEATURE, "name", None)
+    old = urllib.parse.urlsplit(str(old_url))
+    new = urllib.parse.urlsplit(str(new_url))
+    if not feature:
+        raise urllib.error.URLError("a redirect outside the outbound gate "
+                                    "was refused")
+    if old.scheme == "https" and new.scheme != "https":
+        raise urllib.error.URLError(
+            "a redirect from https to %s was refused" % (new.scheme or "?"))
+    outbound(feature, new.scheme or "http", new.hostname or str(new_url),
+             f"redirected from {old.hostname or '?'}")
+
+
+class _GatedRedirects(urllib.request.HTTPRedirectHandler):
+    """Every redirect urlopen follows goes through gate_redirect."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        gate_redirect(req.full_url, newurl)
+        return super().redirect_request(req, fp, code, msg, headers,
+                                        newurl)
+
+
+urllib.request.install_opener(urllib.request.build_opener(_GatedRedirects))
 
 
 class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
@@ -3146,6 +3424,9 @@ class _CheckedRedirects(urllib.request.HTTPRedirectHandler):
             raise urllib.error.URLError(
                 "a redirect to %s was refused" % (
                     urllib.parse.urlsplit(str(newurl)).hostname or "?"))
+        # second audit (#11): recorded too (this opener is the update's)
+        gate_redirect(req.full_url, newurl,
+                      getattr(_NET_FEATURE, "name", None) or "update")
         return super().redirect_request(req, fp, code, msg, headers,
                                         newurl)
 
@@ -3322,7 +3603,8 @@ def windows_powershell(environ=None):
 # "arp.exe" or "netsh.exe" in the folder MiniWireshark was started from
 # (Downloads, a shared drive) ran instead of Windows' own tool.
 WINDOWS_SYSTEM_TOOLS = frozenset({"arp", "netsh", "route", "ipconfig",
-                                  "getmac", "powershell"})
+                                  "getmac", "powershell", "netstat",
+                                  "tasklist"})
 
 
 def windows_system_tool(cmd, environ=None, windows=None):
@@ -5086,6 +5368,12 @@ class RuntimeError_(Exception):
 
 
 # Friendly error taxonomy (shown by the installer and the Repair report)
+# (35-checker review) the free space the private Python needs while it is
+# set up (the download, the unpacked copy and the previous one kept for a
+# rollback); the error, the description and the check said 250, 120 and 300
+RUNTIME_FREE_MB = 300
+RUNTIME_DISK_MB = 120            # what it takes once set up
+
 RUNTIME_ERRORS = {
     "refused": ("Not downloaded: the kill switch is on",
                 "Nothing left this computer. Turn the kill switch off "
@@ -5105,8 +5393,8 @@ RUNTIME_ERRORS = {
     "signature": ("The installer wasn't signed by the Python Software "
                   "Foundation", "It was deleted without being run."),
     "disk": ("Not enough free disk space",
-             "About 250 MB are needed in the data folder. Free some space "
-             "and try again."),
+             f"About {RUNTIME_FREE_MB} MB of free space is needed in the "
+             f"data folder. Free some space and try again."),
     "permission": ("No permission to write in the data folder",
                    "Run MiniWireshark from a folder you can write to, or "
                    "set MINIWIRESHARK_DATA to one."),
@@ -5155,11 +5443,14 @@ def classify_runtime_error(exc):
         return "permission"
     if "no space" in text or "disk full" in text or "errno 28" in text:
         return "disk"
+    # (35-checker review) a 407 only as the HTTP status: "wrote 407 bytes"
+    # or a path with 407 in it is no proxy
     if "certificate" in text or "ssl" in text or "proxy" in text or \
-            "407" in text:
+            "http error 407" in text:
         return "proxy"
     if isinstance(exc, (urllib.error.URLError, _socket.timeout,
-                        ConnectionError)) or "getaddrinfo" in text or \
+                        ConnectionError, http.client.HTTPException)) or \
+            "getaddrinfo" in text or \
             "timed out" in text or "name or service" in text:
         return "offline"
     return "other"
@@ -5195,7 +5486,7 @@ class RuntimeManager:
         return {"platform": plat, "source": src, "wheel_tag": tag,
                 "packages": pkgs, "skipped": skipped,
                 "python": RUNTIME_PYTHON, "dir": self.root,
-                "download_mb": 30, "disk_mb": 120,
+                "download_mb": 30, "disk_mb": RUNTIME_DISK_MB,
                 "use_pyorg": plat[0] == "windows" and not vcr,
                 "supported": bool(src) and bool(tag)}
 
@@ -5210,7 +5501,9 @@ class RuntimeManager:
                 f"{p['python']} so it runs the same on every computer.\n\n"
                 f"• Download: about {p['download_mb']} MB from GitHub "
                 f"(python-build-standalone) plus {names} from PyPI.\n"
-                f"• Disk: about {p['disk_mb']} MB, all inside\n  {p['dir']}\n"
+                f"• Disk: about {p['disk_mb']} MB once set up ("
+                f"{RUNTIME_FREE_MB} MB free while it installs), all "
+                f"inside\n  {p['dir']}\n"
                 f"• Every file is checked against a fingerprint built into "
                 f"MiniWireshark before it is used.\n"
                 f"• Your own Python, PATH and system settings are never "
@@ -5284,7 +5577,8 @@ class RuntimeManager:
                                      {"speed": speed, "eta": eta})
         except RuntimeError_:
             raise
-        except (OSError, urllib.error.URLError) as e:
+        except (OSError, urllib.error.URLError,
+                http.client.HTTPException) as e:
             raise RuntimeError_(classify_runtime_error(e), str(e))
         if expected_sha:
             if progress:
@@ -5390,7 +5684,7 @@ class RuntimeManager:
             raise RuntimeError_("unsupported", str(plan["platform"]))
         free = shutil.disk_usage(PATHS.data).free if hasattr(
             shutil, "disk_usage") else 1 << 40
-        if free < 300 * 1024 * 1024:
+        if free < RUNTIME_FREE_MB * 1024 * 1024:
             raise RuntimeError_("disk", f"{free // (1024 * 1024)} MB free")
         env_id = time.strftime("cp314-%Y%m%d-%H%M%S")
         env_dir = os.path.join(self.root, env_id)
@@ -7268,9 +7562,12 @@ class DataManager:
     def start(self, force=False, keys=None):
         """Load cached copies; download what you asked for (keys/force) or
         what is due under the Weekly policy — all in the background."""
-        if self._busy:
-            return False
-        self._busy = True
+        # (35-checker review) checked and set as one step: Repair's helper
+        # thread and the window could both start a download run
+        with self.lock:
+            if self._busy:
+                return False
+            self._busy = True
         weekly = self.policy() == "Weekly"
 
         def run():
@@ -7605,6 +7902,7 @@ def explain_port_text(port, transport="tcp"):
     e = explain_port(port, transport)
     if not e:
         return ""
+    port = e["port"]          # (35-checker review) "50000" compared as text
     lines = []
     if e["plain"]:
         lines.append(f"Port {port}: {e['plain']}.")
@@ -8414,7 +8712,13 @@ def set_colorblind_mode(label_or_code):
 
 
 
-@functools.lru_cache(maxsize=65536)
+# 5.3.4 (memory audit): the address memos below held 65,536 addresses
+# each (about 10 MB apiece once full, filled by every new remote address
+# over a day); a busy network repeats a few hundred
+_ADDR_MEMO = 16384
+
+
+@functools.lru_cache(maxsize=_ADDR_MEMO)
 def _is_private_cached(ip):
     try:
         a = ipaddress.ip_address(ip)
@@ -8446,7 +8750,7 @@ def _human_bytes(n):
 _CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
 
 
-@functools.lru_cache(maxsize=65536)
+@functools.lru_cache(maxsize=_ADDR_MEMO)
 def _is_public_cached(ip):
     try:
         a = ipaddress.ip_address(ip)
@@ -8801,6 +9105,31 @@ DHCPV6_MSG = {1: "looking for an IPv6 address (Solicit)",
               9: "declining an address", 11: "asking for network settings"}
 
 
+def axis_number(v):
+    """A chart axis number with as many decimals as small values need,
+    so neighbouring grid lines never read the same (crowd test #27: a
+    DNS axis from 0 to 0.5 ms read "0" twice)."""
+    v = float(v or 0)
+    if v == 0:
+        return "0"
+    a = abs(v)
+    if a < 1:
+        return f"{v:.2f}"
+    if a < 10:
+        return f"{v:.1f}"
+    return f"{v:,.0f}"
+
+
+def bit_rate(bps):
+    """Bits per second → "0 b/s", "800 b/s", "1.5 kb/s", "12 Mb/s"."""
+    v = float(bps or 0)
+    for unit in ("b/s", "kb/s", "Mb/s"):
+        if abs(v) < 1000:
+            return f"{axis_number(v)} {unit}"
+        v /= 1000
+    return f"{axis_number(v)} Gb/s"
+
+
 def human_rate(bps):
     """Bytes per second → friendly text."""
     bps = float(bps or 0)
@@ -8858,7 +9187,7 @@ def _is_unicast_mac_cached(mac):
     return mac.lower() not in ("00:00:00:00:00:00", "ff:ff:ff:ff:ff:ff")
 
 
-@functools.lru_cache(maxsize=65536)
+@functools.lru_cache(maxsize=_ADDR_MEMO)
 def _ip_obj_cached(ip):
     try:
         return ipaddress.ip_address(ip)
@@ -9687,7 +10016,8 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
         load = _l4_payload(pkt, u)
         if u.len and int(u.len) >= 8:
             load = load[:int(u.len) - 8]
-            d["payload_len"] = int(u.len) - 8
+            d["payload_len"] = _udp_payload_len(
+                int(u.len), _udp_ip_room(u), len(load))
         else:
             d["payload_len"] = len(load)
         dns_layer = pkt[DNS] if pkt.haslayer(DNS) else None
@@ -9805,6 +10135,40 @@ def decode_packet(pkt, gateway_ip="", my_ips=(), reasm=None):
     return d
 
 
+def _udp_payload_len(ulen, room, have):
+    """The size of a UDP message: its own length field, but never more
+    than the IP header says follows the UDP header (`room`, None when the
+    IP header doesn't say) or, when the IP header can't be trusted either,
+    than the bytes there are (`have`). Audit 2026-11-14 #48: a 10-byte
+    datagram claiming 65535 showed "Quick message (65527 bytes)" and fed
+    that size to the QUIC check. A capture cut short (a snap length) keeps
+    the size the headers agree on."""
+    n = ulen - 8
+    if room is not None and 8 <= room < ulen:
+        n = room - 8
+    elif room is not None and room < 8:
+        n = min(n, have)
+    return max(0, n)
+
+
+def _udp_ip_room(u):
+    """Bytes from the start of scapy UDP layer `u` to the end its IP
+    header claims, or None when it can't be told."""
+    skip, ly = 0, u.underlayer
+    while ly is not None and type(ly).__name__.startswith("IPv6ExtHdr"):
+        skip += 8 if type(ly).__name__ == "IPv6ExtHdrFragment" else \
+            (int(getattr(ly, "len", 0) or 0) + 1) * 8
+        ly = ly.underlayer
+    try:
+        if ly is not None and type(ly).__name__ == "IP" and ly.len:
+            return int(ly.len) - int(ly.ihl or 5) * 4 - skip
+        if ly is not None and type(ly).__name__ == "IPv6" and ly.plen:
+            return int(ly.plen) - skip
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
 def _ip_proto_name(ipl):
     """'ESP', 'GRE'… for the IP protocol (after any IPv6 extension
     headers), as the fast decoder names it; whatever scapy dissected the
@@ -9815,9 +10179,18 @@ def _ip_proto_name(ipl):
     if nh is None:
         nh = _ipv6_upper(ipl)[0]
     try:
-        return _IPPROTO_NAMES.get(int(nh))
+        return _ip_proto_label(int(nh), 4 if hasattr(ipl, "proto") else 6)
     except (TypeError, ValueError):
         return None
+
+
+def _ip_proto_label(proto, ipver):
+    """The name of IP protocol `proto` carried in IP version `ipver`:
+    a tunnel says what is inside what (audit 2026-11-14 #48: IPv6 inside
+    IPv6 was called "IPv6-in-IPv4")."""
+    if ipver == 6 and proto in (4, 41):
+        return "IPv4-in-IPv6" if proto == 4 else "IPv6-in-IPv6"
+    return _IPPROTO_NAMES.get(proto)
 
 
 def _ipv6_upper(ipl):
@@ -9828,7 +10201,78 @@ def _ipv6_upper(ipl):
     return nh, ly
 
 
+# ---- second audit 2026-11-14 (#34): a sign-in in one packet ------------------
+#  Only the field NAMES are matched; a match says "a password went by" and
+#  the bytes are dropped. Nothing of the value is ever copied anywhere.
+_LOGIN_FIELD = (rb"(?:password|passwd|passwort|kennwort|pass|pwd|pw|"
+                rb"user_?pass|login_?password|motdepasse|mot_de_passe|"
+                rb"contrase(?:%c3%b1|\xc3\xb1|n)a|senha)")
+_LOGIN_FORM_RX = re.compile(rb"(?:^|[&\s])" + _LOGIN_FIELD + rb"=[^&\s]",
+                            re.I)
+_LOGIN_JSON_RX = re.compile(rb"\"" + _LOGIN_FIELD + rb"\"\s*:\s*\"[^\"]",
+                            re.I)
+_LOGIN_PART_RX = re.compile(rb"name=\"" + _LOGIN_FIELD + rb"\"", re.I)
+_LOGIN_QUERY_RX = re.compile(rb"^[A-Z]+ [^ ?]*\?(?:[^ ]*&)?" + _LOGIN_FIELD +
+                             rb"=[^& ]", re.I)
+_LOGIN_BASIC_RX = re.compile(rb"\n[ \t]*(?:proxy-)?authorization[ \t]*:"
+                             rb"[ \t]*basic[ \t]+\S", re.I)
+_LOGIN_FORM_TYPES = (b"x-www-form-urlencoded", b"multipart/form-data",
+                     b"application/json")
+
+
+def http_form_login(body):
+    """"a password field in a web form" when a request body carries a
+    password field with a value, else ""."""
+    body = body[:4096]
+    if _LOGIN_FORM_RX.search(body) or _LOGIN_JSON_RX.search(body) or \
+            _LOGIN_PART_RX.search(body):
+        return "a password field in a web form"
+    return ""
+
+
+def _login_in_packet(d, load):
+    """Mark a decoded packet that carries a sign-in: d["login"] says how
+    (never what), d["login_proto"] which protocol; d["form_post"] a web
+    form whose body comes in the next packet."""
+    if load[:5] == b"HTTP/":
+        return
+    if load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE", b"OPTI",
+                    b"PATC"):
+        head = load[:4096]
+        how = ""
+        if _LOGIN_BASIC_RX.search(head):
+            how = "HTTP Basic sign-in"
+        elif _LOGIN_QUERY_RX.match(head.split(b"\n", 1)[0]):
+            how = "a password in the web address"
+        elif head[:4] in (b"POST", b"PUT ", b"PATC"):
+            cut = head.find(b"\r\n\r\n")
+            cut, skip = (cut, 4) if cut >= 0 else (head.find(b"\n\n"), 2)
+            if cut < 0:
+                return
+            body = head[cut + skip:]
+            how = http_form_login(body)
+            if not how and not body.strip() and any(
+                    t in head[:cut].lower() for t in _LOGIN_FORM_TYPES):
+                d["form_post"] = True
+        if how:
+            d["login"], d["login_proto"] = how, "HTTP"
+        return
+    dport = d.get("dport")
+    if dport in (21, 110) and load[:5].upper() == b"PASS " and \
+            len(load.strip()) > 5:
+        d["login"] = "USER and PASS commands"
+        d["login_proto"] = "FTP" if dport == 21 else "POP3"
+    elif dport == 143 and re.match(rb"[^ ]+ LOGIN [^ ]+ [^ \r\n]", load[:512],
+                                   re.I):
+        d["login"], d["login_proto"] = "LOGIN command", "IMAP"
+
+
 def _decode_tcp_payload(d, load, reasm):
+    if FEATURES.get("login_warning", True) and (
+            load[:5] in (b"PASS ", b"pass ") or load[:4] in (
+                b"GET ", b"POST", b"PUT ", b"PATC") or (
+                d.get("dport") == 143 and b" LOGIN " in load[:256].upper())):
+        _login_in_packet(d, load)
     # plain HTTP?
     if load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
                     b"OPTI", b"PATC", b"CONN") or load[:5] == b"HTTP/":
@@ -11015,6 +11459,7 @@ def fast_decode(raw, ts, lt=1, reasm=None, gateway_ip="", my_ips=()):
     try:
         d = decode_packet(pkt, gateway_ip, my_ips, reasm)
     except Exception as e:                           # noqa: BLE001
+        log_decode_error("packet decoder", e)
         d = _fast_new(raw, ts, lt)
         d["text"] = f"Undecodable frame ({type(e).__name__})"
         d["pkt"] = pkt
@@ -11023,6 +11468,26 @@ def fast_decode(raw, ts, lt=1, reasm=None, gateway_ip="", my_ips=()):
     d["raw"] = raw
     d["linktype"] = lt
     return d
+
+
+_DECODE_ERRORS_LOGGED = set()
+
+
+def log_decode_error(where, e):
+    """A packet that broke a decoder: the first of each kind (where and
+    exception type, at most 50 kinds) goes in the log as a WARNING with
+    its traceback, so a bug can be found from a debug bundle; the rest at
+    DEBUG, so a stream of damaged packets can't fill the log. Audit
+    2026-11-14 #49: they were logged only at DEBUG, or not at all."""
+    key = (where, type(e).__name__)
+    if key not in _DECODE_ERRORS_LOGGED and len(_DECODE_ERRORS_LOGGED) < 50:
+        _DECODE_ERRORS_LOGGED.add(key)
+        LOG.warning("%s failed on a packet: %s: %s (the first of its kind; "
+                    "later ones are only counted)", where, type(e).__name__,
+                    e, exc_info=(type(e), e, e.__traceback__))
+    else:
+        LOG.debug("%s failed on a packet: %s: %s", where,
+                  type(e).__name__, e)
 
 
 def _row_from_dissection(raw, ts, lt):
@@ -11066,13 +11531,14 @@ def _fast_decode(raw, ts, lt, reasm):
             d["multicast"] = True
         et = _U16.unpack_from(raw, 12)[0]
         off = 14
-        vlans = 0
-        while et in (0x8100, 0x88a8) and vlans < 2:   # (scapy: not 0x9100)
+        # every stacked tag, however many (audit 2026-11-14 #47: from the
+        # third on they went to scapy, a few ms each and, past about 370
+        # tags, a "Raw frame"); 4 bytes each, so the frame bounds it
+        while et in (0x8100, 0x88a8):                 # (scapy: not 0x9100)
             if n < off + 4:
                 raise NeedDeepParse("vlan")
             et = _U16.unpack_from(raw, off + 2)[0]
             off += 4
-            vlans += 1
         if et < 0x0600:
             if raw[14:22] == CDP_SNAP:
                 info = parse_cdp(raw[22:])
@@ -11173,7 +11639,8 @@ def _fast_ipv4(d, raw, off, reasm):
         raise NeedDeepParse("fragment")
     end = off + total if ihl <= total and off + total <= n else n
     l4 = off + ihl
-    return _fast_l4(d, raw, proto, l4, end, reasm, 4)
+    return _fast_l4(d, raw, proto, l4, end, reasm, 4,
+                    off + total if total else None)
 
 
 def _fast_ipv6(d, raw, off, reasm):
@@ -11191,23 +11658,27 @@ def _fast_ipv6(d, raw, off, reasm):
         d["multicast"] = True
     end = off + 40 + plen if off + 40 + plen <= n else n
     p = off + 40
-    hops = 0
-    while nh in (0, 43, 60) and hops < 6:
+    # every hop-by-hop, routing and destination-options header (audit
+    # 2026-11-14 #47: after 6 the frame went to scapy, 45-184 ms for 180
+    # of them in one 1504-byte frame); at least 8 bytes each, so the
+    # frame bounds the walk
+    while nh in (0, 43, 60):
         if p + 2 > end:
             raise NeedDeepParse("short extension header")
         nh, hl = raw[p], (raw[p + 1] + 1) * 8
         p += hl
-        hops += 1
     if nh == 44:
         raise NeedDeepParse("ipv6 fragment")
-    return _fast_l4(d, raw, nh, p, end, reasm, 6)
+    return _fast_l4(d, raw, nh, p, end, reasm, 6,
+                    off + 40 + plen if plen else None)
 
 
-def _fast_l4(d, raw, proto, p, end, reasm, ipver):
+def _fast_l4(d, raw, proto, p, end, reasm, ipver, ip_end=None):
     if proto == 6:
         return _fast_tcp(d, raw, p, end, reasm)
     if proto == 17:
-        return _fast_udp(d, raw, p, end, reasm)
+        return _fast_udp(d, raw, p, end, reasm,
+                         None if ip_end is None else ip_end - p)
     if proto == 1 and ipver == 4:
         # (scapy leaves a timestamp/address-mask message cut short as Raw)
         if end - p < 8 or \
@@ -11224,7 +11695,7 @@ def _fast_l4(d, raw, proto, p, end, reasm, ipver):
         d.update({"proto": "IGMP", "tag": "IGMP", "transport": "IGMP",
                   "text": "Joining/leaving a multicast group (IGMP)"})
         return _fast_done(d)
-    name = _IPPROTO_NAMES.get(proto)
+    name = _ip_proto_label(proto, ipver)
     if name is None or proto in (4, 41, 47):
         # tunnels: scapy decodes the inner packet
         raise NeedDeepParse(f"ip proto {proto}")
@@ -11357,7 +11828,7 @@ def _rtc_wanted(load):
         FEATURES.get("call_quality", True)
 
 
-def _fast_udp(d, raw, p, end, reasm=None):
+def _fast_udp(d, raw, p, end, reasm=None, room=None):
     if end - p < 8:
         raise NeedDeepParse("short udp")
     sport, dport, ulen = struct.unpack_from(">HHH", raw, p)
@@ -11367,7 +11838,7 @@ def _fast_udp(d, raw, p, end, reasm=None):
     if ulen < 8:
         raise NeedDeepParse("bad udp length")    # scapy's own reading
     load = bytes(raw[p + 8:end][:ulen - 8])
-    d["payload_len"] = ulen - 8
+    d["payload_len"] = _udp_payload_len(ulen, room, len(load))
     if (53 in ports or 5353 in ports or 5355 in ports) and len(load) >= 12:
         name = "mDNS" if 5353 in ports else "LLMNR" if 5355 in ports \
             else "DNS"
@@ -11611,9 +12082,14 @@ class NameCache:
     reverse DNS. `sources` remembers where each name came from so a guess
     from reverse DNS never outranks what a device announced itself."""
 
-    def __init__(self):
+    KEEP = 2 * 3600          # audit #4: a name not heard again for 2 h goes
+    MAX = 20000              # was 50,000
+
+    def __init__(self, clock=time.time):
         self.ip_to_name = {}
         self.sources = {}
+        self.seen = {}            # ip -> when its name was last learned
+        self.clock = clock
         self.lock = threading.Lock()
         self.version = 0
 
@@ -11624,6 +12100,8 @@ class NameCache:
         if not name:
             return False
         with self.lock:
+            if ip in self.ip_to_name:
+                self.seen[ip] = self.clock()
             if self.ip_to_name.get(ip) == name:
                 return False
             if self.sources.get(ip) in ("dhcp", "mdns", "nbns") and \
@@ -11631,18 +12109,36 @@ class NameCache:
                 return False
             self.ip_to_name[ip] = name
             self.sources[ip] = source
-            if len(self.ip_to_name) > 50000:
-                for k in list(self.ip_to_name)[:5000]:
+            self.seen[ip] = self.clock()
+            if len(self.ip_to_name) > self.MAX:
+                for k in list(itertools.islice(self.ip_to_name,
+                                               self.MAX // 10)):
                     self.ip_to_name.pop(k, None)
                     self.sources.pop(k, None)
+                    self.seen.pop(k, None)
             self.version += 1
             return True
 
     def forget(self, ip):
         with self.lock:
+            self.seen.pop(ip, None)
             if self.ip_to_name.pop(ip, None) is not None:
                 self.sources.pop(ip, None)
                 self.version += 1
+
+    def prune(self, now, keep=()):
+        """Audit #4: names not learned again for KEEP seconds go, apart
+        from the addresses in `keep`. -> the addresses dropped."""
+        with self.lock:
+            old = [ip for ip, t in self.seen.items()
+                   if now - t > self.KEEP and ip not in keep]
+            for ip in old:
+                self.ip_to_name.pop(ip, None)
+                self.sources.pop(ip, None)
+                del self.seen[ip]
+            if old:
+                self.version += 1
+        return old
 
     def get(self, ip):
         return self.ip_to_name.get(ip, "")
@@ -11915,11 +12411,18 @@ def _iface_is_up(iface):
             LOG.debug("interface state via psutil: %s", e)
     flags = getattr(iface, "flags", None)
     if flags is not None and not IS_WINDOWS:
-        txt = str(flags)
-        if "UP" in txt:
-            return True
-        return False
+        return iface_flags_up(flags)
     return None
+
+
+def iface_flags_up(flags):
+    """(35-checker review) whether an adapter's flags say it is up: a
+    number (IFF_UP is bit 0) as some scapy versions give it, or words
+    ("UP+BROADCAST+RUNNING"). A number used to read as "disconnected",
+    and "LOWER_UP" alone as up."""
+    if isinstance(flags, int) and not isinstance(flags, bool):
+        return bool(flags & 1)
+    return "UP" in re.split(r"[^A-Z_]+", str(flags).upper())
 
 
 def score_interfaces(default_iface_name="", gateway_ip="", best=None):
@@ -11966,9 +12469,12 @@ def score_interfaces(default_iface_name="", gateway_ip="", best=None):
             score -= 40
             reasons.append("it has no IPv4 address")
         if ip and gateway_ip:
-            with contextlib.suppress(ValueError):
-                if ipaddress.ip_address(gateway_ip) in \
-                        ipaddress.ip_network(f"{ip}/24", strict=False):
+            # (35-checker review, LG-08) the card's real subnet from the
+            # route table, never a /24 guess; unknown: no bonus
+            net = local_subnet_for(iface, ip)
+            with contextlib.suppress(ValueError, TypeError):
+                if net is not None and \
+                        ipaddress.ip_address(gateway_ip) in net:
                     score += 10
                     reasons.append("your router is on the same network")
         low = (name + " " + desc).lower()
@@ -12244,6 +12750,12 @@ class HealthProber(threading.Thread):
         try:
             s.sendto(build_dns_query(name, qid), (server, 53))
             while True:
+                # (35-checker review) one deadline for all the answers: a
+                # stream of other datagrams kept it waiting for ever
+                left = timeout - (time.perf_counter() - t0)
+                if left <= 0:
+                    return False, None, None
+                s.settimeout(left)
                 data, _ = s.recvfrom(2048)
                 if len(data) >= 4 and struct.unpack(">H", data[:2])[0] == qid:
                     rcode = data[3] & 0x0F
@@ -13459,7 +13971,7 @@ class AnalysisWorker(threading.Thread):
                 self.errors += 1
                 if self.errors <= 20:
                     self.last_error = f"{type(e).__name__}: {e}"
-                    LOG.debug("decode error: %s", self.last_error)
+                log_decode_error("packet analysis", e)
                 continue
             if d.get("pkt") is not None:
                 self.deep += 1
@@ -13719,6 +14231,12 @@ def probe_capture_sources(candidates, bpf, promisc, sink,
 # ---- capture files (stdlib reader for pcap and pcapng) ----------------------
 PCAP_ENDED_EARLY = "The file ended early, so not all of it could be read."
 PCAP_NO_PACKETS = "The file had no packets in it."
+PCAP_NO_IFACE = ("Some packets named a network card the file doesn't "
+                 "describe, so they were left out.")
+# the largest packet record read: as for a pcapng block (audit 2026-11-14
+# #42: a classic .pcap record over 1 MiB stopped the import with "the file
+# ended early", dropping every packet after it)
+PCAP_MAX_RECORD = 64 * 1024 * 1024
 
 
 def iter_raw_capture(path, notes=None):
@@ -13745,15 +14263,29 @@ def iter_raw_capture(path, notes=None):
             raise ValueError("truncated pcap header")
         _vmaj, _vmin, _tz, _sig, _snap, lt = struct.unpack(end + "HHiIII",
                                                            rest)
-        lt &= 0x0FFFFFFF
+        # the link type is the low 16 bits; the rest says whether frames
+        # carry their checksum (FCS) (audit 2026-11-14 #44: 0x0FFFFFFF
+        # kept the "FCS present" bit, so Ethernet went undecoded)
+        lt &= 0xFFFF
         rec = struct.Struct(end + "IIII")
         last_ts = 0.0
+        size = None
         while True:
             h = f.read(16)
             data, incl = b"", 1
             if len(h) == 16:
                 sec, frac, incl, _orig = rec.unpack(h)
-                data = f.read(incl) if incl <= 262144 * 4 else b""
+                if incl > PCAP_MAX_RECORD:
+                    if size is None:
+                        size = os.fstat(f.fileno()).st_size
+                    if size - f.tell() >= incl:
+                        # the bytes are there: a damaged record, not a
+                        # short file (as a pcapng block says)
+                        raise ValueError(
+                            f"a packet record claims {incl} bytes, more "
+                            "than any real packet")
+                else:
+                    data = f.read(incl)
             if len(h) < 16 or len(data) < incl:
                 if h and notes is not None:
                     notes.append(PCAP_ENDED_EARLY)
@@ -13767,6 +14299,11 @@ def _iter_pcapng(f, first, notes=None):
     def cut():
         if notes is not None:
             notes.append(PCAP_ENDED_EARLY)
+
+    def no_iface():
+        # audit 2026-11-14 #44: such a packet was decoded as Ethernet
+        if notes is not None and PCAP_NO_IFACE not in notes:
+            notes.append(PCAP_NO_IFACE)
     end = "<"
     ifaces = []                   # (linktype, ts_scale)
     last_ts = 0.0
@@ -13800,6 +14337,8 @@ def _iter_pcapng(f, first, notes=None):
             if len(body) < blen - 12:
                 cut()
                 return
+            if body[-4:] != lenb:
+                raise ValueError("corrupt pcapng section header")
             ifaces = []
             block_type = None
             continue
@@ -13811,6 +14350,9 @@ def _iter_pcapng(f, first, notes=None):
         if len(body) < blen - 8:
             cut()
             return
+        # audit 2026-11-14 #44: the length is written at both ends
+        if body[-4:] != lenb:
+            raise ValueError("corrupt pcapng block")
         body = body[:-4]
         block_type = None
         if btype == 1 and len(body) >= 8:              # interface description
@@ -13831,18 +14373,33 @@ def _iter_pcapng(f, first, notes=None):
         elif btype == 6 and len(body) >= 20:           # enhanced packet
             iid, hi, lo, cap, _orig = struct.unpack_from(end + "IIIII", body,
                                                          0)
-            lt, scale = ifaces[iid] if iid < len(ifaces) else (1, 1e-6)
+            # audit 2026-11-14 #44: more packet than the block holds would
+            # take its padding and options as packet bytes
+            if 20 + cap > len(body):
+                raise ValueError("corrupt pcapng packet block")
+            if iid >= len(ifaces):
+                no_iface()
+                continue
+            lt, scale = ifaces[iid]
             ts = _sane_ts(((hi << 32) | lo) * scale, last_ts)
             last_ts = ts
             yield bytes(body[20:20 + cap]), ts, lt
         elif btype == 3 and len(body) >= 4:            # simple packet
-            lt, _s = ifaces[0] if ifaces else (1, 1e-6)
+            if not ifaces:
+                no_iface()
+                continue
+            lt, _s = ifaces[0]
             orig = struct.unpack_from(end + "I", body, 0)[0]
             yield bytes(body[4:4 + orig]), last_ts, lt
         elif btype == 2 and len(body) >= 20:           # obsolete packet
             iid = struct.unpack_from(end + "H", body, 0)[0]
             hi, lo, cap = struct.unpack_from(end + "III", body, 4)
-            lt, scale = ifaces[iid] if iid < len(ifaces) else (1, 1e-6)
+            if 20 + cap > len(body):
+                raise ValueError("corrupt pcapng packet block")
+            if iid >= len(ifaces):
+                no_iface()
+                continue
+            lt, scale = ifaces[iid]
             ts = _sane_ts(((hi << 32) | lo) * scale, last_ts)
             last_ts = ts
             yield bytes(body[20:20 + cap]), ts, lt
@@ -13962,13 +14519,15 @@ def is_randomized_mac(mac):
         return False
 
 
+# lowest score for each word (the Devices key quotes these, #28)
+CONFIDENCE_STEPS = ((60, CONFIDENCE_HIGH), (30, CONFIDENCE_MEDIUM),
+                    (10, CONFIDENCE_LOW), (0, CONFIDENCE_UNCONFIRMED))
+
+
 def confidence_tier(score):
-    if score >= 60:
-        return CONFIDENCE_HIGH
-    if score >= 30:
-        return CONFIDENCE_MEDIUM
-    if score >= 10:
-        return CONFIDENCE_LOW
+    for low, word in CONFIDENCE_STEPS:
+        if score >= low:
+            return word
     return CONFIDENCE_UNCONFIRMED
 
 
@@ -14002,6 +14561,17 @@ def _push_bounded(lst, item, limit):
     lst.append(item)
     if len(lst) > limit:
         del lst[:-limit]
+
+
+def trim_counter(c, keep):
+    """5.3.4 (memory audit): a Counter keyed by something new every few
+    minutes (a website, an address) keeps its `keep // 2` largest counts
+    once it holds more than `keep` keys. In place, so every holder of
+    the Counter sees the trim."""
+    if len(c) > keep:
+        top = c.most_common(keep // 2)
+        c.clear()
+        c.update(dict(top))
 
 
 @_slotted
@@ -14887,7 +15457,7 @@ def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
     return best, word, reasons[:6]
 
 
-@functools.lru_cache(maxsize=65536)
+@functools.lru_cache(maxsize=_ADDR_MEMO)
 def _classify_address_cached(ip):
     return DeviceRegistry._classify_address_raw(ip)
 
@@ -14968,6 +15538,9 @@ class DeviceRegistry:
                     return "virtual-bridge"
         return None
 
+    # 5.3.4 (memory audit): was 50,000; every remote address fills it
+    ELIG_KEEP = 10000             # audit #4: was 50,000
+
     def eligible_ip(self, ip):
         """May this address be attached to a LOCAL device? (memoised; the
         memo resets whenever the local networks or IPv6 prefixes change)"""
@@ -14980,7 +15553,7 @@ class DeviceRegistry:
         r = self._elig.get(ip)
         if r is None:
             r = self._eligible_uncached(ip)
-            if len(self._elig) > 50000:
+            if len(self._elig) > self.ELIG_KEEP:   # audit #4: was 50,000
                 self._elig.clear()
             self._elig[ip] = r
         return r
@@ -15159,7 +15732,11 @@ class DeviceRegistry:
         if dev.ip != ip:
             old = dev.ip
             dev.ip = ip
-            if old and when - dev.first_seen > 30 and dev.live:
+            # second audit (#38): a device that holds two addresses (a
+            # router with an alias) going back and forth between them is
+            # no change; it made "the router changed its address 24 times"
+            if old and when - dev.first_seen > 30 and dev.live and \
+                    ip not in dev.ipv4s:
                 self.events.append(
                     ("ip changed", "INFO",
                      f"{dev.display_name()} changed address {old} → {ip}",
@@ -15168,7 +15745,12 @@ class DeviceRegistry:
                 dev.hostname, dev.hostname_source = "", ""
         dev.ipv4s.add(ip)
         if len(dev.ipv4s) > 16:
-            dev.ipv4s = set(list(dev.ipv4s)[-16:]) | {ip}
+            # 5.3.4: the 16 used most recently (a set has no order, so the
+            # address in use could go); the current one always stays
+            seen = {h[0]: float(h[2] or h[1] or 0.0)
+                    for h in dev.ip_history}
+            dev.ipv4s = set(sorted(dev.ipv4s, key=lambda a: (
+                a == ip, seen.get(a, 0.0), a))[-16:])
         if dev.ip_history and dev.ip_history[-1][0] == ip:
             dev.ip_history[-1][2] = when
         else:
@@ -16462,6 +17044,48 @@ def anonymous_device_label(dev):
     return ""
 
 
+def sentence_device_name(dev):
+    """The name a sentence (alert, Timeline) uses for `dev`: its display
+    name, but a nameless device's label carries its address, so two
+    devices with private Wi-Fi addresses can be told apart in one list
+    (review of #11): "Device using a private Wi-Fi address
+    (192.168.1.77)", "Device without a network address (self-assigned
+    169.254.12.34)"."""
+    n = dev.display_name()
+    anon = anonymous_device_label(dev)
+    if not anon or n != anon:
+        return n
+    if dev.link_local_only:
+        ip = dev.ip if (dev.ip or "").startswith("169.254.") else ""
+        return (f"Device without a network address (self-assigned {ip})"
+                if ip else n)
+    mac = dev.mac or ""
+    tail = dev.ip or (f"…{mac[-5:]}" if len(mac) >= 5 else "")
+    return f"{n} ({tail})" if tail else n
+
+
+_ANON_LABEL_RX = re.compile(
+    r"Device using a private Wi-Fi address(?= \(|\b)|"
+    r"Device without a network address \(self-assigned ([0-9.]+)\)")
+
+
+def translate_anonymous_labels(text, loc):
+    """The nameless-device labels inside an already translated sentence
+    (they stayed English inside French and Spanish alerts)."""
+    if loc == "en" or "Device " not in text:
+        return text
+    wifi = translate_text("Device using a private Wi-Fi address", loc)
+
+    def one(mm):
+        if mm.group(1) is None:
+            return wifi
+        return {"fr": f"Appareil sans adresse réseau ({mm.group(1)} "
+                      f"auto-attribuée)",
+                "es": f"Dispositivo sin dirección de red ({mm.group(1)} "
+                      f"autoasignada)"}.get(loc, mm.group(0))
+    return _ANON_LABEL_RX.sub(one, text)
+
+
 def host_label(r, doh=False):
     """5.3.4: what to call an Internet address — its name, a known service,
     its provider, or why no name was seen (doh: encrypted DNS was seen)."""
@@ -16710,8 +17334,14 @@ class FlowTable:
     def resize(self, max_active, archive_size):
         self.max_active = max(200, int(max_active))
         if self.archive.maxlen != archive_size:
-            self.archive = deque(self.archive, maxlen=max(100,
-                                                          int(archive_size)))
+            keep = max(100, int(archive_size))
+            old = list(self.archive)
+            self.archive = deque(old, maxlen=keep)
+            # 5.3.4 (memory audit): a smaller archive let its oldest
+            # connections go but they stayed findable by number for ever
+            for f in old[:max(0, len(old) - keep)]:
+                self.by_id.pop(f.fid, None)
+                self.dirty.add(f.fid)
 
     def get(self, fid):
         return self.by_id.get(fid)
@@ -16726,6 +17356,9 @@ class FlowTable:
         if len(self.archive) == self.archive.maxlen and self.archive:
             old = self.archive[0]
             self.by_id.pop(old.fid, None)
+            # 5.3.4 (memory audit): so the Connections table lets its row
+            # go too (it stayed until the table held 3,000)
+            self.dirty.add(old.fid)
         self.archive.append(f)
         self.closed_now.append(f)
         self.closed_log.append(f)
@@ -16974,6 +17607,10 @@ ALERT_TYPES = {
     "reputation":       ("Address on a public blocklist contacted",
                          "WARNING"),
     "cleartext_login":  ("Login sent without encryption", "WARNING"),
+    # second audit 2026-11-14 (#33, #35, #36)
+    "night_upload":     ("Large upload at night", "WARNING"),
+    "beacon":           ("Regular check-ins to one server", "WARNING"),
+    "dns_tunnel":       ("Data hidden in name lookups", "WARNING"),
 }
 
 # default confidence + "why was this flagged" for each kind
@@ -16993,6 +17630,13 @@ ALERT_META = {
     "cleartext_login": ("High", "A sign-in was recognised in a "
                                 "reassembled, unencrypted connection "
                                 "(Full Power)."),
+    "night_upload": ("Medium", "A device sent a lot to the Internet at "
+                               "night, more than it ever did at night "
+                               "before."),
+    "beacon": ("Medium", "A device opened new connections to the same "
+                         "server many times, at nearly even intervals."),
+    "dns_tunnel": ("Medium", "Many long, random-looking names were looked "
+                             "up under one domain in a few minutes."),
     "chatty_device": ("Medium", "Traffic this minute is far above this "
                                 "device's own recent average."),
     "unknown_device": ("Medium", "The device stayed hard to identify after "
@@ -17206,6 +17850,21 @@ ALERT_CHECKLIST.setdefault("cleartext_login", [
     "Use a password there that you don't use anywhere else, and change it "
     "if this login crossed the Internet."])
 
+ALERT_CHECKLIST.update({
+    "night_upload": ["Was the device backing up, syncing photos or "
+                     "uploading a video overnight? Then this is expected.",
+                     "If it should be idle at night, look at which program "
+                     "sent the data, and run a malware scan on it."],
+    "beacon": ["Do you know the server? A weather, news or smart-home app "
+               "checking in is normal.",
+               "If the device should be idle and you don't know the server, "
+               "look at which program makes the connections."],
+    "dns_tunnel": ["Is antivirus, a VPN or a remote-access tool installed on "
+                   "the device? Some use name lookups like this on purpose.",
+                   "If not, disconnect the device from the network and run a "
+                   "malware scan on it."],
+})
+
 ALERT_CHECKLIST.setdefault("reputation", [
     "Look at which device contacted it and whether that was expected (an "
     "app, an update, a link someone opened).",
@@ -17265,6 +17924,12 @@ ALERT_MEANS = {
     "cleartext_login": "Usually an older router, camera, printer or "
                        "storage box on your own network that only offers "
                        "a plain sign-in page.",
+    "night_upload": "Usually a backup or a photo sync that runs while the "
+                    "device charges at night.",
+    "beacon": "Usually an app or a gadget that checks in with its server "
+              "on a timer (weather, smart home, mail, updates).",
+    "dns_tunnel": "Sometimes antivirus or a VPN that uses name lookups on "
+                  "purpose; otherwise a way to sneak data past a firewall.",
 }
 
 
@@ -17677,7 +18342,7 @@ class AlertEngine:
         self.alerts[a.id] = a
         self.order.appendleft(a.id)
         self._open[(kind, subject)] = a.id
-        while len(self.order) > 500:
+        while len(self.order) > self.KEEP:
             old = self.alerts.pop(self.order.pop(), None)
             # 5.2.3 (B-27): forget it as "open" too (the map only grew)
             if old is not None and \
@@ -17686,6 +18351,7 @@ class AlertEngine:
         return a
 
     DEBOUNCE_KEEP = 20000
+    KEEP = 500                    # alerts (the oldest goes)
 
     def _debounced(self, key, seconds):
         now = self.now()
@@ -17724,12 +18390,15 @@ class AlertEngine:
     def new_device(self, dev):
         if dev.expected:
             return None
+        # second audit (#40): "High" confidence (a new device did appear)
+        # next to "low-confidence identity evidence" read as a
+        # contradiction; what it is and how sure that is are told apart
         return self._add(
             "new_device", "INFO", dev.key,
             f"{dev.display_name()} joined your network",
-            f"A device with {dev.confidence.lower()}-confidence identity "
-            f"evidence ({', '.join(dev.evidence_summary()) or 'minimal'}) "
-            f"appeared.",
+            f"A device appeared that wasn't here before. How sure "
+            f"MiniWireshark is of what it is: {dev.confidence} ("
+            f"{', '.join(dev.evidence_summary()) or 'little evidence'}).",
             "This is a new local device on your network.",
             "Normal if you just added a device (phone, guest, smart-home "
             "gadget). Worth checking if you don't recognize it.")
@@ -17760,7 +18429,42 @@ class AlertEngine:
             "reconnecting and briefly overlapping the old lease. Worth a "
             "look if it keeps happening.")
 
-    def dhcp_anomaly(self, servers):
+    def dhcp_anomaly(self, servers, rogue=None):
+        """More than one DHCP server. `rogue`: (server, router, dns,
+        trusted server, trusted router) when one hands out a different
+        router (second audit #37): DANGER, and it says what it hands out."""
+        if rogue:
+            if self._debounced("dhcp_anomaly:rogue", 300):
+                return None
+            srv, router, dns, good, good_router = rogue
+            selfish = [w for w, on in (("router", router == srv),
+                                        ("DNS server", srv in dns)) if on]
+            tail = (" It names itself as the " + " and the ".join(selfish)
+                    + ".") if selfish else ""
+            return self._add(
+                "dhcp_anomaly", "DANGER", "",
+                (f"A second device hands out addresses and names itself as "
+                 f"your router: {srv}" if router == srv else
+                 f"A second device hands out addresses and a different "
+                 f"router: {srv}"),
+                f"{len(servers)} different DHCP servers seen: "
+                f"{', '.join(sorted(servers))}. {srv} gives devices {router} "
+                f"as their router and {', '.join(dns) or 'no DNS server'} "
+                f"for name lookups. The usual one, {good}, gives "
+                f"{good_router} as the router.{tail}",
+                "Devices that take an address from it send their Internet "
+                "traffic and name lookups through that device, which can "
+                "read or redirect them.",
+                "A second router or a travel router plugged in by mistake "
+                "does the same. If you don't recognise that device, unplug "
+                "it and reconnect your devices.",
+                confidence="High",
+                why="A second DHCP server named a different router than "
+                    "the usual one.",
+                evidence=[f"DHCP server: {srv}", f"Router it gives: {router}",
+                          f"Usual router: {good_router}"] +
+                ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
+                refs={"remote": srv})
         if self._debounced("dhcp_anomaly", 300):
             return None
         return self._add(
@@ -18049,14 +18753,14 @@ class AlertEngine:
             subject=f"{dev_key}|{proto}")
 
     def cleartext_login(self, dev_name, dev_key, proto, server, port,
-                        is_public, how=""):
+                        is_public, how="", why=None, source=""):
         """5.3.4 (IP-013): a sign-in travelled as plain text (seen in Full
         Power, where connections are reassembled). Nothing of the login
         itself is passed in or kept: only who, to where and how. Repeats
         are folded into one open alert; snooze and "mute for this device"
         quiet a router or camera that is always signed into this way."""
         if not FEATURES.get("login_warning", True) or self._debounced(
-                f"clogin:{dev_key}:{proto}:{server}", 3600):
+                f"clogin{source}:{dev_key}:{proto}:{server}", 3600):
             return None
         where = "on the Internet" if is_public else "on your network"
         return self._add(
@@ -18070,8 +18774,8 @@ class AlertEngine:
             "offer a plain sign-in page. It matters more when the server "
             "is on the Internet.",
             confidence="High",
-            why="A sign-in was recognised in a reassembled, unencrypted "
-                "connection (Full Power).",
+            why=why or "A sign-in was recognised in a reassembled, "
+                       "unencrypted connection (Full Power).",
             evidence=[f"Server {where}: {server} (port {port})"] +
             ([f"Kind of login: {how}"] if how else []),
             refs={"remote": server}, subject=f"{dev_key}|{proto}|{server}")
@@ -18203,6 +18907,18 @@ class AlertEngine:
 
     def scan_pattern(self, dev, what, n):
         if self._debounced(f"scan:{dev.key}", 3600):
+            # second audit (#39): the alert said the first count it saw
+            # ("154 different ports") while the scan went on to 1,024;
+            # the open alert now keeps the most seen in a minute
+            a = self.alerts.get(self._open.get(("scan_pattern", dev.key),
+                                               ""))
+            if a is not None and not a.acknowledged and \
+                    n > a.refs.get("most", 0):
+                a.refs["most"] = n
+                a.observed = (f"Within a minute it tried {n} {what}, most "
+                              f"without an answer.")
+                a.updated = True
+                return a
             return None
         return self._add(
             "scan_pattern", "WARNING", dev.key,
@@ -18213,7 +18929,86 @@ class AlertEngine:
             "discovery) on purpose. Otherwise, check what software the "
             "device runs.",
             confidence="Medium", why="Many distinct connection attempts "
-                                     "with few successful replies.")
+                                     "with few successful replies.",
+            refs={"most": n})
+
+    # ---- second audit 2026-11-14 (#33, #35, #36) ---------------------------
+    def night_upload(self, dev, total, minutes, dest, service="", start=0.0):
+        """A device sent a lot to the Internet at night, more than twice
+        what it ever sent in a night hour before. A known backup service
+        (iCloud, Dropbox…) is said, and only an INFO: kept out of Unusual
+        activity, since phones and computers back up at night."""
+        if self._debounced(f"nightup:{dev.key}", 6 * 3600):
+            return None
+        size = _human_bytes(total)
+        if service:
+            return self._add(
+                "night_upload", "INFO", dev.key,
+                f"{dev.display_name()} backed up at night ({service})",
+                f"At night it sent {size} to {dest} in {minutes} minutes. "
+                f"That is {service}, a backup service.",
+                "This looks like a backup.",
+                "Phones and computers back up while they charge at night.",
+                confidence="Medium",
+                why="Most of the data went to a known backup service.",
+                evidence=[f"Sent: {size}", f"To: {dest}"],
+                refs={"explained": service, "start": start})
+        return self._add(
+            "night_upload", "WARNING", dev.key,
+            f"{dev.display_name()} sent {size} to the Internet at night",
+            f"At night it sent {size} to {dest} in {minutes} minutes. It "
+            f"has never sent this much in a night hour before.",
+            "Data left this device while it is usually idle.",
+            "Backups, photo syncs and system updates run at night too. It "
+            "matters if nothing on the device should be sending files.",
+            confidence="Medium",
+            why="Compared with what this device sent at night before.",
+            evidence=[f"Sent: {size}", f"To: {dest}"],
+            refs={"start": start})
+
+    def beacon(self, dev, dest, remote, period, n, named):
+        """A device opened a new connection to one server many times, at
+        nearly even intervals (see beacon_period)."""
+        if self._debounced(f"beacon:{dev.key}:{remote}", 86400):
+            return None
+        every = human_period(period)
+        return self._add(
+            "beacon", "WARNING", dev.key,
+            f"{dev.display_name()} contacts {dest} every {every}",
+            f"It opened a new connection to {dest} {n} times, about once "
+            f"every {every}.",
+            "Contacts on a timer are how many apps check for news, and how "
+            "some malware asks for orders.",
+            "Weather and news widgets, smart-home gadgets, mail and update "
+            "checks do this. It matters if you don't know the server and "
+            "the device should be idle.",
+            confidence="Medium" if not named else "Low",
+            why="At least 30 new connections to the same server, nearly "
+                "evenly spaced.",
+            evidence=[f"Server: {dest}", f"Contacts: {n}",
+                      f"Every: {every}"],
+            refs={"remote": remote}, subject=f"beacon|{dev.key}|{remote}")
+
+    def dns_tunnel(self, dev, parent, n, minutes, txt_share, sample):
+        """Many long, random-looking names looked up under one domain in a
+        few minutes (see DnsTunnelWatch)."""
+        if self._debounced(f"dnstun:{dev.key}:{parent}", 6 * 3600):
+            return None
+        return self._add(
+            "dns_tunnel", "WARNING", dev.key,
+            f"{dev.display_name()} may be hiding data in name lookups",
+            f"In {minutes} minutes it looked up {n} different long, "
+            f"random-looking names under {parent}, such as {sample}.",
+            "Long random names under one domain can carry data out past "
+            "a firewall (DNS tunnelling).",
+            "Some antivirus and security programs check files this way, "
+            "and a few VPN and remote-access tools use it on purpose.",
+            confidence="High" if txt_share >= 0.5 else "Medium",
+            why="Many long, random-looking names were looked up under one "
+                "domain in a few minutes.",
+            evidence=[f"Domain: {parent}", f"Different names: {n}"] +
+            (["Most were text (TXT) lookups"] if txt_share >= 0.5 else []),
+            subject=f"dnstun|{dev.key}|{parent}")
 
 
 # ============================================================================
@@ -18453,9 +19248,11 @@ def wifi_quality(rssi):
     if rssi >= -75:
         return "Degraded", "fair", ("Usable, but video calls and big "
                                     "downloads may stutter.")
-    return "Needs attention", "weak", ("Weak signal — the most likely cause "
-                                       "of slowness. Move closer to the "
-                                       "router or remove obstacles.")
+    # 5.3.4 crowd test (#8): a reading of the signal, not a verdict on
+    # what made anything slow (no speed was measured)
+    return "Needs attention", "weak", ("Weak signal — likely to make the "
+                                       "connection slower. Move closer to "
+                                       "the router or remove obstacles.")
 
 
 # 5.3.4 (BF-002): Windows 11 24H2 answers `netsh wlan show interfaces`
@@ -18809,6 +19606,477 @@ def listening_key(proto, ip, port):
     scope = "this computer only" if ip in ("127.0.0.1", "::1") or \
         str(ip).startswith("127.") else "the network"
     return f"{proto}/{port}/{scope}"
+
+
+# ---- 5.3.4: listening TCP sockets without psutil -----------------------------
+def _split_host_port(s):
+    """"0.0.0.0:80", "[::1]:3000", "*:8080" -> (ip, port) or None."""
+    host, _sep, port = str(s).rpartition(":")
+    if not port.isdigit() or not host:
+        return None
+    return host.strip("[]"), int(port)
+
+
+def parse_netstat_listening(text):
+    """Windows `netstat -ano` -> [(ip, port, pid)] of listening TCP
+    sockets: those with no peer (0.0.0.0:0, [::]:0), as the state word
+    is in the system's language."""
+    out = []
+    for line in (text or "").splitlines():
+        p = line.split()
+        if len(p) < 5 or p[0].upper() != "TCP" or \
+                p[2] not in ("0.0.0.0:0", "[::]:0") or not p[-1].isdigit():
+            continue
+        hp = _split_host_port(p[1])
+        if hp:
+            out.append((hp[0].split("%")[0], hp[1], int(p[-1])))
+    return out
+
+
+def parse_tasklist_csv(text):
+    """Windows `tasklist /FO CSV /NH` -> {pid: program}."""
+    out = {}
+    for row in csv.reader(io.StringIO(text or "")):
+        if len(row) >= 2 and row[1].isdigit():
+            out[int(row[1])] = row[0]
+    return out
+
+
+def parse_proc_net_tcp(text):
+    """Linux /proc/net/tcp or tcp6 -> [(ip, port, socket inode)] in LISTEN
+    (state 0A). shortcut: words read little-endian (x86, ARM); a
+    big-endian Linux would need the byte order checked."""
+    out = []
+    for line in (text or "").splitlines()[1:]:
+        p = line.split()
+        if len(p) < 10 or p[3] != "0A" or ":" not in p[1]:
+            continue
+        hexip, hexport = p[1].split(":")
+        try:
+            raw = b"".join(bytes.fromhex(hexip[i:i + 8])[::-1]
+                           for i in range(0, len(hexip), 8))
+            a = ipaddress.ip_address(raw)
+            a = getattr(a, "ipv4_mapped", None) or a
+            out.append((str(a), int(hexport, 16),
+                        int(p[9]) if p[9].isdigit() else None))
+        except ValueError:
+            continue
+    return out
+
+
+def proc_socket_pids(inodes, root="/proc", limit=20000):
+    """Linux: {socket inode: pid} from the /proc/<pid>/fd links (only this
+    user's own processes can be read; root sees all). Reads at most
+    `limit` links."""
+    want = {"socket:[%d]" % i: i for i in inodes if i}
+    out, n = {}, 0
+    if not want:
+        return out
+    with contextlib.suppress(OSError):
+        for pid in os.listdir(root):
+            if not pid.isdigit():
+                continue
+            fd_dir = os.path.join(root, pid, "fd")
+            with contextlib.suppress(OSError):
+                for fd in os.listdir(fd_dir):
+                    n += 1
+                    if n > limit:
+                        return out
+                    with contextlib.suppress(OSError):
+                        i = want.get(os.readlink(os.path.join(fd_dir, fd)))
+                        if i is not None:
+                            out[i] = int(pid)
+    return out
+
+
+def proc_comm(pid, root="/proc"):
+    """Linux: the program name of process `pid`, or ""."""
+    with contextlib.suppress(OSError, ValueError, TypeError):
+        with open(os.path.join(root, str(int(pid)), "comm"),
+                  encoding="utf-8", errors="replace") as f:
+            return f.read().strip()
+    return ""
+
+
+def parse_lsof_listening(text):
+    """`lsof -nP -iTCP -sTCP:LISTEN` -> [(ip, port, pid, program)]."""
+    out = []
+    for line in (text or "").splitlines()[1:]:
+        p = line.split()
+        if len(p) < 9 or not p[1].isdigit():
+            continue
+        name = p[-2] if p[-1] == "(LISTEN)" else p[-1]
+        hp = _split_host_port(name)
+        if not hp:
+            continue
+        ip = hp[0]
+        if ip == "*":
+            ip = "::" if p[4] == "IPv6" else "0.0.0.0"
+        out.append((ip, hp[1], int(p[1]),
+                    p[0].replace("\\x20", " ")))
+    return out
+
+
+def os_listening():
+    """This computer's listening TCP sockets without psutil ->
+    {("TCP", ip, port): (pid, program)}: netstat + tasklist (Windows),
+    /proc (Linux; lsof for what that can't name) or lsof (macOS). pid
+    None: not named (another user's, needs admin). Reads only."""
+    lsof = ["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"]
+    rows = []
+    if IS_WINDOWS:
+        socks = parse_netstat_listening(run_console(["netstat", "-ano"],
+                                                    10).stdout)
+        names = {}
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            if socks:
+                names = parse_tasklist_csv(run_console(
+                    ["tasklist", "/FO", "CSV", "/NH"], 10).stdout)
+        rows = [(ip, port, pid, names.get(pid, ""))
+                for ip, port, pid in socks]
+    elif os.path.exists("/proc/net/tcp"):
+        socks = []
+        for name in ("tcp", "tcp6"):
+            with contextlib.suppress(OSError):
+                with open("/proc/net/" + name, encoding="ascii",
+                          errors="replace") as f:
+                    socks += parse_proc_net_tcp(f.read())
+        pids = proc_socket_pids({i for _ip, _p, i in socks})
+        rows = [(ip, port, pids.get(i), proc_comm(pids[i]) if i in pids
+                 else "") for ip, port, i in socks]
+        if any(r[2] is None for r in rows) and shutil.which("lsof"):
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                by = {r[:2]: r[2:] for r in parse_lsof_listening(
+                    run_console(lsof, 10).stdout)}
+                rows = [r if r[2] else r[:2] + by.get(r[:2], (None, ""))
+                        for r in rows]
+    elif shutil.which("lsof"):
+        rows = parse_lsof_listening(run_console(lsof, 10).stdout)
+    return {("TCP", ip, port): (pid, name) for ip, port, pid, name in rows}
+
+
+class OsListenMap(ProcessMap):
+    """Local services without psutil: ProcessMap's listening table, read
+    with the operating system's own tools (os_listening). TCP only."""
+
+    def __init__(self):
+        super().__init__()
+        self.available = True
+
+    def read(self):
+        self.listening = os_listening()
+        self.needs_admin = any(pid is None
+                               for pid, _n in self.listening.values())
+        self.at = time.time()
+        self.seq += 1
+        return True
+
+
+# ---- 5.3.4: Local services (Websites tab) ------------------------------------
+# The services listening on this computer, one row per program and port,
+# with a plain guess at what each one is and who can reach it. Built from
+# ProcessMap.listening (psutil, the same table the Security tab reads);
+# nothing is sent to list them.
+LOCAL_DEV_WEB = "Web app in development"
+# TCP ports where a program on a person's own computer is most often a web
+# app being built (React, Vite, Angular, Django, Flask, Rails, Jupyter...)
+LOCAL_DEV_PORTS = frozenset({3000, 3001, 3002, 4000, 4200, 5000, 5173, 5174,
+                             8000, 8080, 8081, 8888, 9000})
+# ...and a real web server
+LOCAL_WEB_SERVER = {80: "Web server", 8008: "Web server",
+                    443: "Secure web server", 8443: "Secure web server"}
+LOCAL_HTTPS_PORTS = frozenset({443, 8443})
+# a program's name says more than its port: (start of the name, what it
+# is, a web page?)
+LOCAL_PROGRAM_HINTS = (
+    ("postgres", "Database connection (PostgreSQL)", False),
+    ("mysqld", "Database connection (MySQL)", False),
+    ("mariadbd", "Database connection (MySQL)", False),
+    ("mongod", "Database connection (MongoDB)", False),
+    ("redis-server", "In-memory database (Redis)", False),
+    ("cupsd", "Printing (IPP)", False),
+    ("sshd", "Remote terminal (SSH)", False),
+    # macOS: the AirPlay receiver takes 5000 and 7000
+    ("controlcenter", "Streaming to a speaker/TV (AirPlay)", False),
+)
+LOCAL_SAFE = "Only this computer can reach it"
+LOCAL_EXPOSED = "Other devices on your network can reach it"
+LOCAL_UNKNOWN = "Not sure what this is"
+LOCAL_ANY_ADDRESS = ("0.0.0.0", "::", "", "*")
+# Demo Mode shows these made-up services, never this computer's own
+# programs (audit 2026-11-14 #15: under "Everything shown is simulated" it
+# listed the real ones)
+DEMO_LOCAL_LISTENERS = {
+    ("TCP", "127.0.0.1", 5173): (2101, "node"),
+    ("TCP", "::1", 5173): (2101, "node"),
+    ("TCP", "0.0.0.0", 8000): (2102, "python3"),
+    ("TCP", "127.0.0.1", 631): (311, "cupsd"),
+    ("TCP", "127.0.0.1", 5432): (412, "postgres"),
+    ("UDP", "0.0.0.0", 5353): (205, "avahi-daemon"),
+    ("TCP", "0.0.0.0", 22): (98, "sshd")}
+
+
+def _local_is_loopback(ip):
+    s = local_addr_key(ip)
+    return s.startswith("127.") or s == "::1"
+
+
+def local_service_guess(proto, port, program=""):
+    """-> (what it probably is, in English; True when it is likely a web
+    page a browser can open). TCP only for web pages."""
+    name = re.sub(r" \(pid \d+\)$", "", str(program or "")).lower()
+    name = name[:-4] if name.endswith(".exe") else name
+    for start, what, web in LOCAL_PROGRAM_HINTS:
+        if name.startswith(start):
+            return what, web and proto == "TCP"
+    if proto == "TCP" and port in LOCAL_DEV_PORTS:
+        return LOCAL_DEV_WEB, True
+    if proto == "TCP" and port in LOCAL_WEB_SERVER:
+        return LOCAL_WEB_SERVER[port], True
+    what = PORT_SERVICES.get(port)
+    if what:
+        return what, False
+    return LOCAL_UNKNOWN, False
+
+
+def local_own_addresses(app=None):
+    """This computer's own addresses: the ones the app knows (my_ips) and
+    the ones it would route out with, found without sending anything (a
+    UDP socket connected to a TEST-NET address and never used)."""
+    ips = set(getattr(getattr(app, "model", None), "my_ips", None) or ())
+    for fam, far in ((_socket.AF_INET, "192.0.2.1"),
+                     (_socket.AF_INET6, "2001:db8::1")):
+        with contextlib.suppress(OSError):
+            with _socket.socket(fam, _socket.SOCK_DGRAM) as sk:
+                sk.connect((far, 9))
+                ips.add(sk.getsockname()[0])
+    return {local_addr_key(i) for i in ips} - {"", "0.0.0.0", "::"}
+
+
+def local_service_host(addrs, own=()):
+    """The address of this computer a service is asked and opened at:
+    127.0.0.1 (or ::1 for one on IPv6 only), else one of its own
+    addresses in `own` it is bound to (a LAN address); None otherwise."""
+    keys = {local_addr_key(a) for a in addrs}
+    if keys & {"127.0.0.1", "0.0.0.0", "*"}:
+        return "127.0.0.1"
+    v4 = sorted(k for k in keys if k.startswith("127."))
+    if v4:
+        return v4[0]
+    if keys & {"::1", "::", ""}:
+        return "::1"
+    mine = {local_addr_key(o) for o in own} - {"", "0.0.0.0", "::"}
+    # an IPv6 link-local address needs its %scope, which isn't kept
+    lan = sorted(k for k in keys & mine if not k.startswith("fe80"))
+    return lan[0] if lan else None
+
+
+def local_service_url(proto, port, addrs, web, own=(), https=None):
+    """The address to open in a browser: on this computer (127.0.0.1, ::1
+    for a service on IPv6 only, or the own address in `own` a service is
+    bound to), for a TCP service that is likely a web page; None
+    otherwise. https: what the probe found; None (not asked) falls back
+    to LOCAL_HTTPS_PORTS."""
+    if not web or proto != "TCP" or not isinstance(port, int) or \
+            not 0 < port < 65536:
+        return None
+    host = local_service_host(addrs, own)
+    if host is None:
+        return None
+    if https is None:
+        https = port in LOCAL_HTTPS_PORTS
+    host = f"[{host}]" if ":" in host else host
+    return f"{'https' if https else 'http'}://{host}:{port}/"
+
+
+def local_url_ok(url, own=()):
+    """True only for http(s) to this computer itself: loopback, or one of
+    its own addresses in `own` (what the Local services view may open)."""
+    try:
+        parts = urllib.parse.urlsplit(str(url or ""))
+        port = parts.port
+    except ValueError:
+        return False
+    host = (parts.hostname or "").lower()
+    a = ip_obj(host)
+    if a is None or a.is_unspecified:
+        return False
+    return parts.scheme in ("http", "https") and port is not None and \
+        "@" not in parts.netloc and (a.is_loopback or local_addr_key(
+            host) in {local_addr_key(o) for o in own})
+
+
+# not asked "GET /": known to speak something else (Redis logs it as an
+# attack, raw printing on 9100 could print the request), databases,
+# SMB/NetBIOS; and every port the table or the program's name says isn't
+# a web page (local_service_rows)
+LOCAL_PROBE_SKIP = frozenset({137, 138, 139, 445, 1433, 3306, 5432, 6379,
+                              9100, 11211, 27017})
+
+
+def local_page_title(data):
+    """The page's <title>, found in one pass (second audit #3: a lazy
+    regex over 64 KB of "<title>" took about 2 s of CPU per answer)."""
+    lo = data.lower()
+    i = lo.find(b"<title")
+    j = lo.find(b">", i) if i >= 0 else -1
+    k = lo.find(b"</title", j) if j >= 0 else -1
+    if k < 0:
+        return ""
+    return sanitize_text(" ".join(html.unescape(data[j + 1:k][:4096].decode(
+        "utf-8", "replace")).split()), 120)
+
+
+def probe_local_http(host, port, own=(), timeout=1.0):
+    """One "GET /" to a port of THIS computer (loopback, or one of its own
+    addresses in `own`; never another host, and no redirect is
+    followed): plain HTTP, then TLS without checking the certificate when
+    the answer looks like TLS. Each try: `timeout` s to connect, then
+    `timeout` s to read at most 64 KB; each is listed in the ledger and
+    stopped by the kill switch (OutboundBlocked).
+    -> {"web", "https", "status", "title"}"""
+    a = ip_obj(host)
+    if a is None or a.is_unspecified or not (a.is_loopback or local_addr_key(
+            host) in {local_addr_key(o) for o in own}):
+        raise ValueError("only this computer is asked")
+    port = int(port)
+    if not 0 < port < 65536:
+        raise ValueError("not a port")
+    where = f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+    req = (f"GET / HTTP/1.0\r\nHost: {where}\r\nUser-Agent: MiniWireshark"
+           f"\r\nAccept: text/html\r\nConnection: close\r\n\r\n").encode()
+
+    def ask(tls):
+        """-> (bytes read, the server closed by itself)"""
+        outbound("local_probe", "https" if tls else "http", where,
+                 "GET / (this computer only)")
+        data, closed, accepted = b"", False, False
+        try:
+            with _socket.create_connection((host, port), timeout) as raw:
+                accepted, sk = True, raw
+                if tls:
+                    import ssl
+                    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                    ctx.check_hostname = False
+                    ctx.verify_mode = ssl.CERT_NONE   # it is this computer
+                    sk = ctx.wrap_socket(raw)
+                with sk:
+                    sk.sendall(req)
+                    end = time.monotonic() + timeout
+                    while len(data) < 65536:
+                        left = end - time.monotonic()
+                        if left <= 0:
+                            break
+                        sk.settimeout(left)
+                        chunk = sk.recv(65536 - len(data))
+                        if not chunk:
+                            closed = True
+                            break
+                        data += chunk
+        except _socket.timeout:
+            pass                       # a mute server: not closed
+        except OSError:                # reset: closed (refused: not)
+            closed = closed or (accepted and not data)
+        return data, closed
+    status = re.compile(rb"HTTP/\d\.\d (\d{3})")
+    data, closed = ask(False)
+    https = False
+    m = status.match(data)
+    # TLS: a TLS record back, a close without a word (OpenSSL), or "400:
+    # plain HTTP sent to an HTTPS port" (nginx)
+    if data[:2] in (b"\x15\x03", b"\x16\x03") or (closed and not data) or \
+            (m and m.group(1) == b"400" and b"https" in data.lower()):
+        tdata, _c = ask(True)
+        tm = status.match(tdata)
+        if tm:
+            data, m, https = tdata, tm, True
+    if not m:
+        return {"web": False, "https": False, "status": 0, "title": ""}
+    title = local_page_title(data)
+    return {"web": True, "https": https, "status": int(m.group(1)),
+            "title": title}
+
+
+def local_service_rows(listening, own=(), probes=None):
+    """ProcessMap.listening ({(proto, ip, port): (pid, name)}) -> the rows
+    of the Local services view: one per protocol, port and program, its
+    addresses merged. Each row: {"proto", "port", "program", "addrs",
+    "network" (reachable from other devices), "what", "web", "url",
+    "safety", "probe" (the key to ask it "GET /" by: (port, program,
+    host), None when it isn't asked), "https", "title"}. `own`: this
+    computer's addresses; `probes`: {probe key: probe_local_http answer},
+    which wins over the guess. High UDP ports (a client's, not a service)
+    are left out. Reachable from the network first, then by protocol and
+    port."""
+    groups = {}
+    for (proto, ip, port), ent in (listening or {}).items():
+        if proto not in ("TCP", "UDP") or not isinstance(port, int):
+            continue
+        if proto == "UDP" and port >= LISTEN_EPHEMERAL:
+            continue
+        prog = program_label(ent)
+        groups.setdefault((proto, port, prog), set()).add(str(ip or ""))
+    rows = []
+    for (proto, port, prog), addrs in groups.items():
+        network = any(not _local_is_loopback(a) for a in addrs)
+        what, web = local_service_guess(proto, port, prog)
+        addrs = tuple(sorted(addrs, key=lambda a: (":" in a, a)))
+        host = local_service_host(addrs, own)
+        key = (port, prog, host) if proto == "TCP" and host and \
+            port not in LOCAL_PROBE_SKIP and \
+            (web or what == LOCAL_UNKNOWN) else None
+        got = (probes or {}).get(key) if key else None
+        https, title = None, ""
+        if got:
+            web, https, title = got["web"], got["https"], got["title"]
+            if web and what == LOCAL_UNKNOWN:
+                what = LOCAL_WEB_SERVER[80]
+        rows.append({"proto": proto, "port": port, "program": prog,
+                     "addrs": addrs, "network": network, "what": what,
+                     "web": web,
+                     "url": local_service_url(proto, port, addrs, web,
+                                              own, https),
+                     "safety": LOCAL_EXPOSED if network else LOCAL_SAFE,
+                     "probe": key, "https": https, "title": title})
+    rows.sort(key=lambda r: (not r["network"], r["proto"], r["port"],
+                             r["program"]))
+    return rows
+
+
+def local_services_state(pm):
+    """(state, listening) for the Local services view. state: "ok",
+    "unavailable" (no psutil), "unread" (not read yet) or "denied" (the
+    operating system wouldn't give the list without admin rights, or
+    reading it failed)."""
+    if pm is None or not getattr(pm, "available", False):
+        return "unavailable", {}
+    listening = dict(getattr(pm, "listening", None) or {})
+    if not listening and getattr(pm, "error", ""):
+        return "denied", {}
+    if not getattr(pm, "at", 0):
+        return "unread", {}
+    if not listening and getattr(pm, "needs_admin", False):
+        return "denied", {}
+    return "ok", listening
+
+
+def local_service_cells(r):
+    """One row's cells in the shown language: port, protocol, what it is,
+    who can reach it, program, where it listens."""
+    tt = translate_text
+    shown = [tt("all addresses") if a in LOCAL_ANY_ADDRESS else a
+             for a in r["addrs"]]
+    where = tt("The whole network" if r["network"] else
+               "This computer only")
+    prog = r["program"]
+    if prog in ("the operating system",
+                "unknown program (needs admin rights to name it)"):
+        prog = tt(prog)
+    what = tt(r["what"])
+    if r.get("title"):                 # the page's own title, when asked
+        what += " — " + r["title"]
+    return (r["port"], r["proto"], what, tt(r["safety"]), prog,
+            f"{where} ({', '.join(shown)})")
 
 
 class ListenWatch:
@@ -19665,9 +20933,23 @@ class DnsTracker:
         self.encrypted_seen = Counter()   # provider/method -> count
         self.dot_flows = 0
 
+    SERVERS_KEEP = 256            # 5.3.4 (memory audit)
+    DOMAINS_KEEP = 8000           # names asked (the most asked half stays)
+
+    def forget(self, dev_key):
+        """A device that left memory (CO-03) takes its servers along."""
+        self.device_servers.pop(dev_key, None)
+        self.device_last.pop(dev_key, None)
+
     def _srv(self, ip):
         s = self.servers.get(ip)
         if s is None:
+            if len(self.servers) >= self.SERVERS_KEEP:
+                # 5.3.4 (memory audit): every address asked on port 53
+                # stayed (a device trying many servers, or a scan); the
+                # one quiet the longest goes
+                old = min(self.servers, key=lambda k: self.servers[k]["last"])
+                del self.servers[old]
             s = self.servers[ip] = {"queries": 0, "responses": 0, "nx": 0,
                                     "servfail": 0, "timeouts": 0,
                                     "lat": deque(maxlen=60), "first": 0.0,
@@ -19686,8 +20968,9 @@ class DnsTracker:
         q = (info.get("qname") or "").lower()
         if q:
             self.domains[q] += 1
-            if len(self.domains) > 8000:
-                self.domains = Counter(dict(self.domains.most_common(4000)))
+            if len(self.domains) > self.DOMAINS_KEEP:
+                self.domains = Counter(dict(self.domains.most_common(
+                    self.DOMAINS_KEEP // 2)))
         key = (client_ip, server_ip, info.get("id"), q)
         self.pending[key] = (ts, dev_key)
         while len(self.pending) > 4096:
@@ -19914,6 +21197,11 @@ class DeviceBaseline:
         self.first = 0.0            # first and last learned minute
         self.last = 0.0
         self.svc_at = 0             # self.n when a new service last appeared
+        # second audit (#33): the most it sent in a night hour so far
+        self.night_up_max = 0
+        self.cur_up_by = {}         # this minute: bytes per remote, up
+        self.cur_down_by = {}       # … and down (#38)
+        self.last_top = ("", "")    # the busiest remote of the last minute
 
     def _profile(self, period):
         """The day or night profile, started from the kind's prior."""
@@ -19947,6 +21235,8 @@ class DeviceBaseline:
         self.cur_min = minute
         self.cur = {f: 0 for f in self.FEATURES}
         self.cur_dests = set()
+        self.cur_up_by = {}
+        self.cur_down_by = {}
 
     def observe(self, ts, nbytes, direction, remote_ip="", is_dns=False,
                 proto="", service_port=None, new_conn=False):
@@ -19958,11 +21248,14 @@ class DeviceBaseline:
             finished = self.finish()
             self._reset_cur(minute)
         c = self.cur
+        by = self.cur_up_by if direction == "sent" else self.cur_down_by
         if direction == "sent":
             c["packets"] += 1
             c["bytes_up"] += nbytes
         else:
             c["bytes_down"] += nbytes
+        if remote_ip and (remote_ip in by or len(by) < 64):
+            by[remote_ip] = by.get(remote_ip, 0) + nbytes
         if remote_ip and len(self.cur_dests) < 5000:
             self.cur_dests.add(remote_ip)
         if is_dns:
@@ -19987,6 +21280,8 @@ class DeviceBaseline:
             return None
         vals = dict(self.cur)
         vals["destinations"] = len(self.cur_dests)
+        self.last_top = tuple(max(by, key=by.get) if by else ""
+                              for by in (self.cur_up_by, self.cur_down_by))
         snapshot = (vals, dict(self.mean),
                     {f: math.sqrt(max(0.0, self.var[f]))
                      for f in self.FEATURES}, self.n)
@@ -20042,7 +21337,7 @@ class DeviceBaseline:
             # and ignores the rest)
             d.update({"v": BASELINE_VERSION, "kind": self.kind,
                       "first": self.first, "last": self.last,
-                      "svc_at": self.svc_at,
+                      "svc_at": self.svc_at, "nup": self.night_up_max,
                       "profiles": {k: {"n": p["n"], "mean": dict(p["mean"]),
                                        "var": dict(p["var"])}
                                    for k, p in self.prof.items()}})
@@ -20056,6 +21351,7 @@ class DeviceBaseline:
         self.first = max(0.0, _finite(d.get("first")))
         self.last = max(self.first, _finite(d.get("last")))
         self.svc_at = min(self.n, max(0, int(_finite(d.get("svc_at")))))
+        self.night_up_max = max(0, int(min(_finite(d.get("nup")), 1e15)))
         profs = d.get("profiles")
         if isinstance(profs, dict):
             for period in ("day", "night"):
@@ -20329,6 +21625,25 @@ LEVEL_HELP = {
                 "mean it didn't happen."}
 
 
+def device_scales_key():
+    """5.3.4 crowd test (#28): the Devices table says how sure it is in
+    three ways — "Device evidence" (●●● High: is it a real device), the
+    "Evidence" glyphs (◉ ◎ ◌: how its presence, name and kind are known)
+    and "Likely"/"Possibly" before the kind — and defined none of them,
+    so "High" next to "Possibly NAS" read as a contradiction. One key,
+    built from the same tables the cells use."""
+    conf = " · ".join(
+        f"{CONFIDENCE_ICON[w]} {w}" + (f" (score {n}+)" if n else "")
+        for n, w in CONFIDENCE_STEPS)
+    lv = " · ".join(f"{LEVEL_GLYPH[x]} {LEVEL_WORD[x]}" for x in (
+        LV_OBSERVED, LV_REPORTED, LV_CORRELATED, LV_INFERRED, LV_UNKNOWN))
+    return (f"Device evidence: is it a real device? {conf}. Evidence: how "
+            f"three facts are known, in order: on your network · name · "
+            f"kind ({lv}). “Likely” or “Possibly” before a kind is how sure "
+            f"that guess is, so a device with High evidence can still be "
+            f"only “Possibly” a printer.")
+
+
 # ---- EXPLAIN (5.1.2 F7): one place for every "what does this mean" ------
 # (kind, key) -> (short, long). Used by tooltips, Explain inline, Help and
 # search. The self-test fails when an alert type, a device state, a
@@ -20457,7 +21772,6 @@ class LookupCorrelator:
         # expiry. (review 6) One entry per key: it was one per DNS answer
         # for 30 minutes (41,000 in the soak at minute 20 for 10,000 keys)
         self.order = OrderedDict()
-        self.used = set()         # (device, domain) that led to a connect
 
     def note_resolution(self, device, domain, ip, ts):
         k = (device, ip)
@@ -20480,10 +21794,8 @@ class LookupCorrelator:
         if dq:
             t, dom = dq[-1]
             if 0 <= ts - t <= self.STRONG_WINDOW:
-                self.used.add((device, dom))
                 return dom, "own-recent"
             if ts - t <= self.KEEP:
-                self.used.add((device, dom))
                 return dom, "own-old"
         ipq = self.by_ip.get(ip)
         if ipq:
@@ -20505,8 +21817,6 @@ class LookupCorrelator:
             ipq = self.by_ip.get(ip)
             if ipq and ipq[-1][0] <= t:
                 self.by_ip.pop(ip, None)
-        if len(self.used) > 100000:
-            self.used.clear()
 
 
 # ============================================================================
@@ -20946,7 +22256,14 @@ def periodic_findings(model, min_repeats=10, only=None):
         got = detect_periodic(starts, min_repeats)
         if not got:
             continue
-        period, n = got
+        period, _n = got
+        # (35-checker review) "(N times)" is how often it made contact
+        # (starts a second or more apart), not the regular gaps plus one;
+        # second audit (#35): every start counted, not only the 24 kept
+        ts = sorted(starts)
+        n = 1 + sum(1 for a, b in zip(ts, ts[1:]) if b - a >= 1.0)
+        n = max(n, getattr(model, "flow_start_n", {}).get(
+            (dev_key, remote), 0))
         names = model.ip_to_domains.get(remote)
         dest = next(reversed(names)) if names else remote
         dev = reg.by_key.get(reg.resolve(dev_key))
@@ -20956,8 +22273,8 @@ def periodic_findings(model, min_repeats=10, only=None):
                        destination=C(dest, LV_OBSERVED if not names else
                                      LV_CORRELATED),
                        period=C(human_period(period), LV_CORRELATED),
-                       repeats=C(n + 1, LV_OBSERVED))
-        out.append((dev_key, dest, period, n + 1, text))
+                       repeats=C(n, LV_OBSERVED))
+        out.append((dev_key, dest, period, n, text))
     out.sort(key=lambda r: -r[3])
     return out
 
@@ -21509,7 +22826,15 @@ def investigate_ipv6(f):
                        _t("◉ %d%% of Internet traffic went over IPv6",
                           round(100 * (f.get("v6_share") or 0)))]))
     span = f.get("span") or 0
-    if not f.get("ra") and not att:
+    # (35-checker review) IPv6 bytes over UDP/QUIC count too: a network
+    # used over IPv6 without a TCP handshake was "not offering IPv6"
+    share = f.get("v6_share") or 0
+    used = bool(att) or share > 0
+    if share > 0 and not att:
+        H.append(_hyp("working", _t("IPv6 is working"), 0.5, "Possible",
+                      [_t("◉ %d%% of Internet traffic went over IPv6",
+                          max(1, round(100 * share)))]))
+    if not f.get("ra") and not used:
         if span >= 600:
             H.append(_hyp("not_offered", _t("Your network doesn't offer "
                                             "IPv6 (common, and not a "
@@ -21519,12 +22844,12 @@ def investigate_ipv6(f):
                           fix=_t("Nothing to fix: everything works over "
                                  "IPv4. Your router or Internet provider "
                                  "may offer IPv6 as an option.")))
-    elif f.get("ra") and not att:
+    elif f.get("ra") and not used:
         H.append(_hyp("unused", _t("IPv6 is announced, but nothing used it "
                                    "yet"), 0.3, "Possible",
                       [_t("◉ The router announces IPv6")]))
     reasons = []
-    if not f.get("ra") and not att and span < 600:
+    if not f.get("ra") and not used and span < 600:
         reasons.append(_t(
             "This file has no IPv6 router announcement and no IPv6 "
             "connections, and it is too short to tell that IPv6 is off.")
@@ -21587,7 +22912,11 @@ def connect_facts(model, key, window=900, offline=False, namer=None):
     f["arp_asks"] = sum(1 for t in asks[3] if now - t <= window) \
         if asks else 0
     rep = m.gw_arp_replies.get(mac) if mac else None
-    f["gw_replied"] = bool(rep and asks and rep >= asks[0])
+    # (35-checker review) an answer to a question inside the window: one
+    # given before it (after the first question ever) said "answered"
+    # while the router ignored every question since
+    recent = [t for t in asks[3] if now - t <= window] if asks else []
+    f["gw_replied"] = bool(rep and recent and rep >= min(recent))
     f["router_heard"] = reg.router_answering(now)
     # the router's answers to a device go to that device alone: they are
     # visible here only if answers to other devices were seen too (a
@@ -21798,9 +23127,11 @@ def investigate_wifi_internet(f):
                                          "router)"), 0.3, "Possible",
                           [line], fix=ifix))
         else:
+            # (#8) a quick handshake is no speed test: say what was timed
             H.append(_hyp("internet", _t("The Internet side (beyond your "
                                          "router)"), 0.05, "Unlikely", (),
-                          [line]))
+                          [line, _t("○ Only how quickly connections open "
+                                    "was timed, not download speed")]))
     reasons = []
     if not any(x["key"] == "home" for x in H):
         reasons.append(_t("No connections to your router or other home "
@@ -21899,6 +23230,20 @@ def investigate_call(f):
             reasons.append(_t("Only the packets this computer sent were "
                               "seen, so loss on the way can't be counted "
                               "here."))
+        elif not bad and cd is not None and cd >= 0.01:
+            # (35-checker review) the capture's own drops: whether the
+            # call's packets arrived complete can't be said
+            reasons.append(_t(
+                "This capture itself missed packets, so it can't tell "
+                "whether the call's packets arrived complete. They "
+                "arrived on time; look again while the computer is less "
+                "busy."))
+        elif not bad and lp > 0:
+            reasons.append(_t(
+                "The call lost only %s of its packets and they arrived on "
+                "time, so the stutter isn't visible here: it may come from "
+                "the other person's connection, the call app or the "
+                "computer itself.", f"{lp:.1f}%"))
         elif not bad:
             reasons.append(_t(
                 "The call's packets arrived complete and on time, so the "
@@ -22310,19 +23655,22 @@ def calls_card_text(tracker, limit=3):
                "jitter %d ms (usually fine below %d)." if c["kind"] ==
                "video" else "Your voice call lost %s of packets between %s "
                "and %s; jitter %d ms (usually fine below %d).")
-        lines.append(tr(tpl) % (f"{c['loss_pct']:.1f}%",
-                                hm_clock(c["first"]), hm_clock(c["last"]),
-                                round(c["jitter_ms"]), CALL_JITTER_OK_MS))
+        # (35-checker review) through _t: a translation whose
+        # placeholders don't fit falls back to English instead of raising
+        lines.append(_t(tpl, f"{c['loss_pct']:.1f}%",
+                        hm_clock(c["first"]), hm_clock(c["last"]),
+                        round(c["jitter_ms"]), CALL_JITTER_OK_MS))
         w = c["worst"]
         if w and 100.0 * w[3] / w[2] >= max(CALL_LOSS_OK_PCT,
                                             1.5 * c["loss_pct"]):
-            lines.append("  " + tr("Worst moment: %s lost around %s.") % (
-                f"{100.0 * w[3] / w[2]:.1f}%", hm_clock(w[0])))
+            lines.append("  " + _t("Worst moment: %s lost around %s.",
+                                   f"{100.0 * w[3] / w[2]:.1f}%",
+                                   hm_clock(w[0])))
     more = len(calls) - limit
     if more == 1:
         lines.append(tr("And 1 more call."))
     elif more > 1:
-        lines.append(tr("And %d more calls.") % more)
+        lines.append(_t("And %d more calls.", more))
     if not calls:
         lines.append(tr("No calls seen yet."))
     n = tracker.unmeasured() if tracker is not None else 0
@@ -22330,13 +23678,141 @@ def calls_card_text(tracker, limit=3):
         lines.append(tr("1 connection looked like a call but had no "
                         "connection check, so it is not measured."))
     elif n:
-        lines.append(tr("%d connections looked like a call but had no "
-                        "connection check, so they are not measured.") % n)
+        lines.append(_t("%d connections looked like a call but had no "
+                        "connection check, so they are not measured.", n))
     lines.append(tr("Observed from packet headers only: no names, no "
                     "sound or picture. Calls are measured after the call "
                     "app checks its connection (STUN); some call apps "
                     "can't be measured."))
     return "\n".join(lines)
+
+
+# ---- second audit 2026-11-14: detections (#33, #35, #36, #38) ---------------
+# Services that move a lot of data on purpose. A night upload to a backup
+# service is said as a backup; a spike to a backup (up) or a streaming
+# service (down) is told on the Timeline, not raised as unusual. Matched
+# on the end of the name the address was looked up as.
+KNOWN_BULK_SERVICES = (
+    ("icloud.com", "iCloud", "backup"),
+    ("icloud-content.com", "iCloud", "backup"),
+    ("apple-cloudkit.com", "iCloud", "backup"),
+    ("dropbox.com", "Dropbox", "backup"),
+    ("dropboxapi.com", "Dropbox", "backup"),
+    ("onedrive.live.com", "OneDrive", "backup"),
+    ("storage.live.com", "OneDrive", "backup"),
+    ("1drv.com", "OneDrive", "backup"),
+    ("photos.googleapis.com", "Google Photos", "backup"),
+    ("drive.google.com", "Google Drive", "backup"),
+    ("backblazeb2.com", "Backblaze", "backup"),
+    ("backblaze.com", "Backblaze", "backup"),
+    ("idrive.com", "IDrive", "backup"),
+    ("nflxvideo.net", "Netflix", "stream"),
+    ("netflix.com", "Netflix", "stream"),
+    ("googlevideo.com", "YouTube", "stream"),
+    ("youtube.com", "YouTube", "stream"),
+    ("ttvnw.net", "Twitch", "stream"),
+    ("dssott.com", "Disney+", "stream"),
+    ("aiv-cdn.net", "Prime Video", "stream"),
+    ("scdn.co", "Spotify", "stream"),
+)
+NIGHT_UPLOAD_BYTES = 20 * 1024 * 1024   # sent in one night hour
+NIGHT_UPLOAD_WINDOW = 3600.0
+BEACON_MIN_CONTACTS = 30
+BEACON_SKIP_PORTS = frozenset((0, 53, 123, 853, 3478, 5349, 19302))
+DNS_TUNNEL_NAMES = 50          # long random names under one domain …
+DNS_TUNNEL_WINDOW = 600.0      # … within this many seconds
+DNS_TUNNEL_LABEL = 30          # a label this long, random-looking
+# security services that look up file hashes as names on purpose
+DNS_TUNNEL_SKIP = ("sophosxl.net", "mcafee.com", "trendmicro.com", "e5.sk")
+
+
+def known_bulk_service(names, kind=None):
+    """(label, kind) of the first name that belongs to a known backup or
+    streaming service, or None. `names`: one name or several."""
+    if isinstance(names, str):
+        names = (names,)
+    for n in names or ():
+        h = str(n or "").lower().strip(".")
+        for suf, label, k in KNOWN_BULK_SERVICES:
+            if (h == suf or h.endswith("." + suf)) and kind in (None, k):
+                return label, k
+    return None
+
+
+def beacon_period(starts, min_gaps=20, spread=0.2, share=0.8):
+    """Connection start times → the period in seconds when they are
+    nearly even (at least `share` of the last gaps within `spread` of
+    their median, the median between 20 s and an hour), else None. Much
+    stricter than detect_periodic: this one raises an alert."""
+    ts = sorted(starts)
+    gaps = [b - a for a, b in zip(ts, ts[1:])]
+    if len(gaps) < min_gaps:
+        return None
+    med = statistics.median(gaps)
+    if not 20.0 <= med <= 3600.0:
+        return None
+    close = sum(1 for g in gaps if abs(g - med) <= spread * med)
+    return med if close >= share * len(gaps) else None
+
+
+def random_label(label):
+    """True for a long label that looks like encoded data: letters and
+    digits mixed, many different characters, no long words."""
+    lab = (label or "").lower()
+    if len(lab) < DNS_TUNNEL_LABEL or not re.fullmatch(r"[a-z0-9_-]+", lab):
+        return False
+    digits = sum(c.isdigit() for c in lab)
+    if digits == 0 or digits == len(lab):
+        return False
+    cnt = Counter(lab)
+    ent = -sum(v / len(lab) * math.log2(v / len(lab)) for v in cnt.values())
+    return ent >= 3.5
+
+
+class DnsTunnelWatch:
+    """Per device and domain: the long random names looked up in the last
+    DNS_TUNNEL_WINDOW seconds. Bounded: 400 device+domain pairs, 200
+    names each."""
+
+    KEEP = 400
+
+    def __init__(self):
+        self.groups = OrderedDict()
+
+    def note(self, dev_key, qname, qtype, ts):
+        """→ (parent, distinct names, minutes, TXT share, sample) when the
+        pair crosses DNS_TUNNEL_NAMES, else None."""
+        q = (qname or "").lower().strip(".")
+        labels = q.split(".")
+        if len(labels) < 3 or not any(random_label(x)
+                                      for x in labels[:-2]):
+            return None
+        parent = registrable_domain(q)
+        if not parent or any(parent == s or parent.endswith("." + s)
+                             for s in DNS_TUNNEL_SKIP):
+            return None
+        key = (dev_key, parent)
+        g = self.groups.get(key)
+        if g is None or ts - g["first"] > DNS_TUNNEL_WINDOW:
+            g = {"first": ts, "names": set(), "n": 0, "txt": 0,
+                 "sample": q}
+            self.groups[key] = g
+            while len(self.groups) > self.KEEP:
+                self.groups.popitem(last=False)
+        self.groups.move_to_end(key)
+        g["n"] += 1
+        if qtype in (16, 10):                # TXT, NULL
+            g["txt"] += 1
+        if len(g["names"]) < 200:
+            g["names"].add(q)
+        n = len(g["names"])
+        if n < DNS_TUNNEL_NAMES:
+            return None
+        minutes = max(1, int(round((ts - g["first"]) / 60.0)))
+        sample = g["sample"]
+        if len(sample) > 48:
+            sample = sample[:24] + "…" + sample[-20:]
+        return parent, n, minutes, g["txt"] / max(1, g["n"]), sample
 
 
 def obs_evict_index(dq, site=False, weak=()):
@@ -22375,7 +23851,7 @@ class NetworkModel:
         self.my_macs = {m.lower() for m in my_macs if m}
         self.local_nets = []
         self.v6_prefixes = []
-        self.cache = NameCache()
+        self.cache = NameCache(self.now)
         self.registry = DeviceRegistry(gateway_ip, self.my_ips, config,
                                        self.now)
         self.registry.my_macs = self.my_macs
@@ -22391,7 +23867,7 @@ class NetworkModel:
         self._seen_roots = None          # registrable domains seen (B-24)
         self.remote_hosts = {}
         self.ip_to_domains = {}
-        self.timeline = deque(maxlen=3000)
+        self.timeline = deque(maxlen=self.TIMELINE_KEEP)
         self.count = 0
         self.dhcp_servers = defaultdict(int)
         self.dhcp_routers = Counter()
@@ -22400,7 +23876,7 @@ class NetworkModel:
         self.http_count = 0
         self.http_hosts = Counter()
         self.cleartext_seen = Counter()
-        self.bcast_talkers = deque(maxlen=5000)
+        self.bcast_talkers = deque(maxlen=self.BCAST_KEEP)
         self.gw_mac_traffic = Counter()
         self.vpn_bytes = Counter()
         self.vpn = {"iface": "", "endpoint": "", "kind": ""}
@@ -22429,11 +23905,19 @@ class NetworkModel:
         self.correlator = LookupCorrelator()
         self.obs_seq = 0
         # (review 6) the saved session keeps the last 3,000
-        self.obs_recent = deque(maxlen=4000)
+        self.obs_recent = deque(maxlen=self.OBS_RECENT_KEEP)
         self.switch_ports = {}       # (proto, chassis) → what LLDP/CDP said
         self.reported = {}           # helper name → what it reported
         self.flow_starts = OrderedDict()   # (device, remote) → start times
-        self.rtt_samples = deque(maxlen=2000)  # (ts, rtt, remote, dev, fid)
+        # second audit (#35): how many starts in all (the deque keeps 24)
+        self.flow_start_n = {}
+        self.night_up = {}               # (#33) device → this night hour
+        self.dns_tunnels = DnsTunnelWatch()      # (#36)
+        self.dhcp_offers = OrderedDict()  # (#37) server → router, DNS
+        self._form_wait = OrderedDict()  # (#34) a form POST's body next
+        self._dup_pending = OrderedDict()  # (#39) address → (ts, MAC)
+        # (ts, rtt, remote, dev, fid)
+        self.rtt_samples = deque(maxlen=self.RTT_KEEP)
         # 5.3.4 (MC7): passive evidence the investigations read, bounded
         self.lan_rtt_samples = deque(maxlen=500)   # (ts, rtt, remote ip)
         self.dhcp_chains = OrderedDict()   # client MAC → deque (ts, type)
@@ -22476,9 +23960,30 @@ class NetworkModel:
             self._obs_add(subj, o)
         if self.obs_sink:
             self.obs_pending.append(o)
-            if len(self.obs_pending) > 200000:
-                del self.obs_pending[:50000]
+            if len(self.obs_pending) > self.PENDING_KEEP:
+                del self.obs_pending[:self.PENDING_KEEP // 4]
         return o
+
+    # 5.3.4 (memory audit): what grows with time, not with devices, held
+    # to these sizes (see t_534_memory_flat_in_fast_time)
+    # WEBSITES_KEEP was 20,000: about 40 MB once full (about 2 KB a
+    # website), filled in a few days of ordinary browsing; the history
+    # keeps what is older. (Remote addresses: REMOTE_MAX, audit #4)
+    WEBSITES_KEEP = 10000         # websites (the oldest tenth goes)
+    IP_NAMES_KEEP = 20000         # address -> its names (audit #4)
+    ROOTS_KEEP = 60000            # registrable domains seen ("First visit")
+    OBS_SUBJECTS_KEEP = 60000     # subjects with observations
+    FLOW_STARTS_KEEP = 6000       # (device, remote) start times
+    TIMELINE_KEEP = 3000          # timeline lines in memory
+    RTT_KEEP = 2000               # round-trip times kept
+    BCAST_KEEP = 5000             # who sent the last broadcasts
+    OBS_RECENT_KEEP = 4000        # newest observations (sessions keep 3,000)
+    DEVICE_SITES_KEEP = 500       # websites listed on one device
+    DEVICE_REMOTES_KEEP = 500     # remote addresses listed on one device
+    HTTP_HOSTS_KEEP = 2000        # websites reached over plain HTTP
+    VPN_PEERS_KEEP = 1000         # addresses seen on a VPN port
+    DOH_CLIENTS_KEEP = 512        # addresses that used encrypted DNS
+    PENDING_KEEP = 200000         # waiting for the history store
 
     # (review 6) per-subject sizes, and what a full subject gives up
     OBS_KEEP_SITE = 16
@@ -22494,8 +23999,9 @@ class NetworkModel:
         if dq is None:
             if subj.startswith("flow:"):
                 self._forget_old_flow_subjects(subj)
-            if len(subjects) > 60000:
-                for k in list(subjects)[:6000]:
+            if len(subjects) > self.OBS_SUBJECTS_KEEP:
+                for k in list(itertools.islice(
+                        subjects, self.OBS_SUBJECTS_KEEP // 10)):
                     self._obs_drop(k)
             # 5.3.4 (M17, S7): a website's card shows 3 per device and
             # a connection's 3; 48 of each for 5,000 websites held
@@ -22549,6 +24055,13 @@ class NetworkModel:
                         continue
             keys.pop(old, None)
             self.obs_by_subject.pop(old, None)
+
+    def _note_doh(self, src_ip, hint):
+        if src_ip not in self.doh_seen and \
+                len(self.doh_seen) >= self.DOH_CLIENTS_KEEP:
+            # 5.3.4 (memory audit): the oldest address goes first
+            self.doh_seen.pop(next(iter(self.doh_seen)), None)
+        self.doh_seen[src_ip].add(hint)
 
     def observations_for(self, subject, kinds=None, limit=48):
         out = [o for o in self.obs_by_subject.get(subject, ())
@@ -22624,7 +24137,11 @@ class NetworkModel:
             t[2] = max(t[2], ts)
             t[3] += 1
         if self.obs_sink:
-            self.tie_pending.add((device, domain))
+            # 5.3.4 (memory audit): the store takes these every second;
+            # if it stops, the newest ties are not added (it was a set
+            # without end)
+            if len(self.tie_pending) < self.PENDING_KEEP:
+                self.tie_pending.add((device, domain))
         self.dirty_websites.add(domain)
 
     # ---- user corrections (undoable) ---------------------------------------
@@ -22977,15 +24494,20 @@ class NetworkModel:
         self.epoch_open(end, "resumed")
         return entry
 
-    def push_timeline(self, kind, severity, text, ref=None, device=""):
+    def push_timeline(self, kind, severity, text, ref=None, device="",
+                      named=None):
         entry = {"when": self.now(), "kind": kind, "severity": severity,
                  "text": text, "ref": ref, "device": device,
                  "live": not self.use_packet_clock}
         # 5.3.4 (MC3): the name the sentence uses, so the Timeline can show
         # the device's current name instead of three names for one device
         dv = self.registry.by_key.get(device) if device else None
+        if dv is not None and not named:
+            nm, sn = dv.display_name(), sentence_device_name(dv)
+            if sn != nm and nm and nm in text:
+                text = entry["text"] = text.replace(nm, sn, 1)
         if dv is not None:
-            nm = dv.display_name()
+            nm = named or sentence_device_name(dv)
             if nm and nm in text:
                 entry["name"] = nm
         self.timeline.append(entry)
@@ -22998,9 +24520,61 @@ class NetworkModel:
                 del self.tl_pending[:5000]
         return entry
 
+    def alert_device_name(self, dev):
+        """The name an alert sentence uses for `dev`: its display name,
+        but "This computer" when it has no name of its own (its maker or
+        address said nothing), "Your router" instead of an address."""
+        n = sentence_device_name(dev)
+        if dev.alias or dev.best_name():
+            return n
+        if dev.device_class == "This computer" or \
+                (dev.ip and dev.ip in self.my_ips):
+            return "This computer"
+        if dev.ip and dev.ip == self.gateway_ip and looks_like_address(n):
+            return "Your router"
+        return n
+
+    def refresh_alert_names(self, keys=None):
+        """5.3.4 crowd test #11: alert titles carry the device's name as
+        it is now. A renamed device kept its old name in the Alerts tab
+        (the Devices tab and the Timeline had the new one), and this
+        computer was named by its address. → the alerts changed."""
+        reg = self.registry
+        changed = []
+        for a in list(self.alerts.alerts.values()):
+            if keys is not None and a.device_key not in keys:
+                continue
+            old = a.refs.get("named")
+            if not old or old not in a.reason:
+                continue
+            dev = reg.by_key.get(reg.resolve(a.device_key))
+            if dev is None:
+                continue
+            new = self.alert_device_name(dev)
+            if not new or new == old or (looks_like_address(new) and
+                                         not looks_like_address(old)):
+                continue
+            a.reason = a.reason.replace(old, new, 1)
+            a.refs["named"] = new
+            changed.append(a)
+        for a in changed:
+            if a not in self.ev_alerts:
+                a.updated = True          # shown again, not announced again
+                self.ev_alerts.append(a)
+        return changed
+
     def _alert(self, a):
         if a is None:
             return None
+        if not a.updated and "named" not in a.refs:
+            dv = self.registry.by_key.get(a.device_key)
+            nm = dv.display_name() if dv is not None else ""
+            if nm and nm in a.reason:
+                a.refs["named"] = nm
+                new = self.alert_device_name(dv)
+                if new and new != nm:
+                    a.reason = a.reason.replace(nm, new, 1)
+                    a.refs["named"] = new
         self.ev_alerts.append(a)
         if not a.updated:
             self.metrics.add("alerts", self.now(), 1)
@@ -23043,7 +24617,12 @@ class NetworkModel:
             text = (f"Plugged into {name}, port {port or '?'}"
                     + (f", VLAN {rec['vlan']}" if rec["vlan"] else "")
                     + f" (announced by the switch, {rec['proto']})")
-            if cur is not None:
+            if cur is not None and cur.get("port") == rec["port"]:
+                # (35-checker review) same port, another VLAN: not a move
+                text = (f"VLAN changed on {name}, port {port or '?'}: now "
+                        f"{rec['vlan'] or 'none'} (was "
+                        f"{cur.get('vlan') or 'none'})")
+            elif cur is not None:
                 text = (f"Moved to {name}, port {port or '?'} (was "
                         f"{cur.get('port_desc') or cur.get('port')})")
             self.push_timeline("network", "INFO" if cur is None else
@@ -23195,7 +24774,7 @@ class NetworkModel:
             self._observe_dns(d, ts, src_dev, dst_dev)
         if d["doh_hint"] and self.config.get("dns.detect_encrypted_dns",
                                              True):
-            self.doh_seen[src_ip].add(d["doh_hint"])
+            self._note_doh(src_ip, d["doh_hint"])
             self.dns.encrypted_seen[d["doh_hint"]] += 1
 
         if self.registry.moved_ips:
@@ -23206,6 +24785,9 @@ class NetworkModel:
         self._observe_remote(d, ts, direction, src_dev, dst_dev, new_flow)
         if d["cleartext"]:
             self._observe_cleartext(d, src_dev, dst_dev, direction)
+        if d.get("login") or d.get("form_post") or (
+                self._form_wait and d.get("payload_len")):
+            self._observe_login(d)
         self._baseline_observe(d, ts, src_dev, dst_dev, direction, flow,
                                new_flow)
         self._announce_created()
@@ -23259,14 +24841,17 @@ class NetworkModel:
                 dev.type_hint = d["type_hint"]
             if internet:
                 rip = d["dst_ip"] if role == "sent" else d["src_ip"]
-                if rip and len(dev.remote_ips) < 500:
+                if rip and len(dev.remote_ips) < self.DEVICE_REMOTES_KEEP:
                     dev.remote_ips.add(rip)
             if role == "sent":
                 if dev.live and dev.traffic_baseline_flag(
                         ts, _float(self.config.get(
                             "alerts.chatty_multiplier", 4), 4),
                         _float(self.config.get("alerts.chatty_min_rate", 3),
-                               3)):
+                               3)) and not (
+                        # second audit (#38): a film or a backup
+                        self._bulk_service(dev, False) or
+                        self._bulk_service(dev, True)):
                     a = self._alert(self.alerts.chatty_device(dev))
                     if a and not a.updated:
                         self.push_timeline(
@@ -23421,8 +25006,36 @@ class NetworkModel:
                             "replacement, but worth a look otherwise — "
                             "see Alerts.", "warn")
         else:
-            self._alert(self.alerts.duplicate_ip(
-                ip, len(self.registry.ip_macs.get(ip, ()))))
+            # second audit (#39): told at the next upkeep, once it is clear
+            # whether ARP spoofing (raised a few flips later) covers it
+            self._bounded_put(self._dup_pending, ip, (ts, mac), 256)
+
+    def _check_duplicates(self, now):
+        for ip, (ts, mac) in list(self._dup_pending.items()):
+            if 0 <= now - ts < 30:
+                continue
+            del self._dup_pending[ip]
+            if not self._part_of_spoof(ip, mac):
+                self._alert(self.alerts.duplicate_ip(
+                    ip, len(self.registry.ip_macs.get(ip, ()))))
+
+    def _part_of_spoof(self, ip, mac):
+        """Second audit (#39): a second claim on an address that an open
+        ARP spoofing alert already covers (this address, or the device that
+        also claims your router's address). A "Duplicate IP address …
+        often harmless" warning next to the DANGER said the opposite."""
+        eng = self.alerts
+
+        def open_spoof(addr):
+            a = eng.alerts.get(eng._open.get(("arp_spoof", f"ip:{addr}"),
+                                             ""))
+            return a is not None and not a.acknowledged
+        if open_spoof(ip):
+            return True
+        gw = self.gateway_ip
+        return bool(gw and open_spoof(gw) and mac and
+                    mac in self.registry.ip_macs.get(gw, ()) and
+                    mac not in self.registry.gw_macs)
 
     def _observe_dhcp(self, d, ts):
         info = d["dhcp"]
@@ -23437,11 +25050,20 @@ class NetworkModel:
             self._bounded_put(self.dhcp_chains, cm, ch)
         if mt in (2, 5) and d["src_ip"]:
             server = info.get("server_id") or d["src_ip"]
+            # second audit (#37): what each server tells devices to use
+            off = self.dhcp_offers.get(server)
+            if off is None and len(self.dhcp_offers) < 16:
+                off = self.dhcp_offers[server] = {"router": "", "dns": []}
+            if off is not None:
+                if info.get("router"):
+                    off["router"] = str(info["router"])
+                if info.get("dns_servers"):
+                    off["dns"] = [str(x) for x in info["dns_servers"][:4]]
             if mt in (2, 5):
                 self.dhcp_servers[server] += 1
                 if len(self.dhcp_servers) > 1:
                     self._alert(self.alerts.dhcp_anomaly(
-                        set(self.dhcp_servers)))
+                        set(self.dhcp_servers), self.dhcp_rogue()))
             if info.get("router"):
                 self.dhcp_routers[info["router"]] += 1
             for s in info.get("dns_servers") or []:
@@ -23473,10 +25095,15 @@ class NetworkModel:
                               info.get("lease_time") or 0,
                               "server": info.get("server_id") or
                               d["src_ip"], "hostname": host})
+                # crowd test #11: a device without a name is not named
+                # by the address it is being given
+                nm = dev.display_name()
+                if not nm or looks_like_address(nm):
+                    nm = "A device"
                 self.push_timeline("dhcp lease", "INFO",
-                                   f"{dev.display_name()} got address "
+                                   f"{nm} got address "
                                    f"{info['yiaddr']} from DHCP",
-                                   ("device", dev.key), dev.key)
+                                   ("device", dev.key), dev.key, named=nm)
 
     def _observe_nd(self, d, ts):
         nd = d["nd"]
@@ -23635,6 +25262,14 @@ class NetworkModel:
                               d["dst_ip"]})
             change = self.dns.on_query(ts, d["src_ip"], d["dst_ip"], info,
                                        key)
+            # second audit (#36): data hidden in name lookups; the router
+            # forwards everyone's lookups, so it is not judged
+            if key and src_dev.live and info.get("qname") and \
+                    d["src_ip"] != self.gateway_ip:
+                hit = self.dns_tunnels.note(key, info["qname"],
+                                            info.get("qtype"), ts)
+                if hit:
+                    self._alert(self.alerts.dns_tunnel(src_dev, *hit))
             if change and src_dev and src_dev.live:
                 self.push_timeline("dns change", "WARNING",
                                    f"{src_dev.display_name()} now uses DNS "
@@ -23851,7 +25486,7 @@ class NetworkModel:
         thr = _int(self.config.get("alerts.reset_threshold", 40), 40)
         if len(dq) >= thr:
             dev = self.registry.by_key.get(f.device_key)
-            if dev and dev.live:
+            if dev and dev.live and not self._scanning(dev.key):
                 top = Counter(r for _t, r in dq).most_common(1)
                 self._alert(self.alerts.tcp_resets(
                     dev, len(dq), 600, top[0][0] if top else ""))
@@ -23876,6 +25511,8 @@ class NetworkModel:
                 self.correlator.note_resolution(dkey, lname, ip, ts)
                 if self.obs_sink:
                     self.res_pending.append((ts, dkey, lname, ip))
+                    if len(self.res_pending) > self.PENDING_KEEP:
+                        del self.res_pending[:self.PENDING_KEEP // 4]
                 if rec is not None and dkey and lname == qname:
                     rec.lookups += 1
                     self.tie(dkey, lname, AS_LOOKUP_ONLY, ts)
@@ -23916,11 +25553,15 @@ class NetworkModel:
             fk = (flow.device_key, flow.remote_ip)
             q = self.flow_starts.get(fk)
             if q is None:
-                if len(self.flow_starts) >= 6000:
-                    self.flow_starts.popitem(last=False)
+                if len(self.flow_starts) >= self.FLOW_STARTS_KEEP:
+                    old, _q = self.flow_starts.popitem(last=False)
+                    self.flow_start_n.pop(old, None)
                 # C7: 24 is plenty for periodic_findings (needs 11)
                 q = self.flow_starts[fk] = deque(maxlen=24)
             q.append(ts)
+            n = self.flow_start_n[fk] = self.flow_start_n.get(fk, 0) + 1
+            if n >= BEACON_MIN_CONTACTS and n % 5 == 0:
+                self._check_beacon(fk, q, n, flow)
             self.observe("flow_start", flow.device_key, ts,
                          {"remote": flow.remote_ip, "port": flow.remote_port,
                           "proto": flow.transport, "flow": flow.fid,
@@ -23953,8 +25594,9 @@ class NetworkModel:
             new_root = reg not in roots
             if new_root:
                 roots[reg] = None
-                if len(roots) > 60000:
-                    for k in list(itertools.islice(roots, 6000)):
+                if len(roots) > self.ROOTS_KEEP:
+                    for k in list(itertools.islice(roots,
+                                                   self.ROOTS_KEEP // 10)):
                         del roots[k]
             rec = WebsiteRecord(domain=key, registrable=reg, first_seen=ts,
                                 last_seen=ts)
@@ -23962,9 +25604,10 @@ class NetworkModel:
             if category_shown(cat, src, self.config):
                 rec.category, rec.category_source = cat, src
             self.websites[key] = rec
-            if len(self.websites) > 20000:
+            if len(self.websites) > self.WEBSITES_KEEP:
                 for old in sorted(self.websites.values(),
-                                  key=lambda w: w.last_seen)[:2000]:
+                                  key=lambda w: w.last_seen)[
+                                      :self.WEBSITES_KEEP // 10]:
                     self.websites.pop(old.domain, None)
             if new_root and not self.in_discovery() and \
                     not self.use_packet_clock:
@@ -23979,14 +25622,17 @@ class NetworkModel:
                 rec.resolved_ips.add(ip)
             names = self.ip_to_domains.get(ip)
             if names is None:
-                names = self.ip_to_domains[ip] = OrderedDict()
-                if len(self.ip_to_domains) > 60000:
-                    for k in list(self.ip_to_domains)[:6000]:
+                # 5.3.4 (memory audit): a plain dict keeps the order too,
+                # at about half an OrderedDict's size
+                names = self.ip_to_domains[ip] = {}
+                if len(self.ip_to_domains) > self.IP_NAMES_KEEP:
+                    for k in list(itertools.islice(
+                            self.ip_to_domains, self.IP_NAMES_KEEP // 10)):
                         self.ip_to_domains.pop(k, None)
             names.pop(key, None)
             names[key] = ts
             while len(names) > 8:
-                names.popitem(last=False)
+                del names[next(iter(names))]
             rh = self.remote_hosts.get(ip)
             if rh is not None:
                 if len(rh.domains) < 20:
@@ -24002,7 +25648,7 @@ class NetworkModel:
                 self._own_blocklist_name(dev, key)
             if len(rec.devices) < 200:
                 rec.devices.add(dev.key)
-            if len(dev.websites) < 500:
+            if len(dev.websites) < self.DEVICE_SITES_KEEP:
                 dev.websites.add(key)
         rec.requests += 1
         if connection:
@@ -24016,6 +25662,9 @@ class NetworkModel:
         if source == "HTTP Host":
             self.http_count += 1
             self.http_hosts[key] += 1
+            # 5.3.4 (memory audit): one key per website reached over
+            # plain HTTP, for ever; the Security page shows the top 6
+            trim_counter(self.http_hosts, self.HTTP_HOSTS_KEEP)
         doh = doh_name(key) if self.config.get(
             "dns.detect_encrypted_dns", True) else None
         if doh:
@@ -24047,9 +25696,10 @@ class NetworkModel:
             self.remote_hosts[pub] = rec
             self._geo_fill(rec)
             self._reputation_fill(rec)
-            if len(self.remote_hosts) > 30000:
+            if len(self.remote_hosts) > self.REMOTE_MAX:
                 for old in sorted(self.remote_hosts.values(),
-                                  key=lambda r: r.last_seen)[:3000]:
+                                  key=lambda r: r.last_seen)[
+                                      :self.REMOTE_MAX // 10]:
                     self.remote_hosts.pop(old.ip, None)
         rec.last_seen = max(rec.last_seen, ts)
         rec.packets += 1
@@ -24078,6 +25728,10 @@ class NetworkModel:
                 rec.domains.update(names)
         if rport in VPN_PORTS and d["transport"] == "UDP":
             self.vpn_bytes[pub] += d["length"]
+            # 5.3.4 (memory audit): one key per address on a VPN port
+            # (a VPN app that hops servers adds one each time); only
+            # the largest one is ever read
+            trim_counter(self.vpn_bytes, self.VPN_PEERS_KEEP)
         self.dirty_remotes.add(pub)
         if not rec.country:
             self.ev_geo.add(pub)
@@ -24180,10 +25834,39 @@ class NetworkModel:
                 if len(b.countries) < 80:
                     b.countries.add(code)
 
-    def deep_login(self, t):
+    def _observe_login(self, d):
+        """Second audit (#34): a sign-in seen in one packet, in every mode
+        (Full Power reassembles more, but a web form's password, HTTP
+        Basic, a password in a web address and FTP/POP3/IMAP sign-ins on
+        their usual ports fit in one packet). A form whose body comes in
+        the next packet is looked at then. Only who, where and how are
+        kept; the packet's bytes are read here and dropped."""
+        key4 = (d["src_ip"], d["sport"], d["dst_ip"], d["dport"])
+        how, proto = d.get("login") or "", d.get("login_proto") or "HTTP"
+        if d.get("form_post") and not how:
+            self._bounded_put(self._form_wait, key4, d["time"], 256)
+            return None
+        if not how:
+            if key4 not in self._form_wait:
+                return None
+            del self._form_wait[key4]
+            n = d.get("payload_len") or 0
+            raw = d.get("raw") or b""
+            if not raw and d.get("pkt") is not None:
+                with contextlib.suppress(Exception):
+                    raw = bytes(d["pkt"])          # scapy's decoder
+            how = http_form_login(bytes(raw[-n:][:4096]) if n else b"")
+            if not how:
+                return None
+        return self.deep_login({"client": d["src_ip"],
+                                "server": d["dst_ip"], "port": d["dport"],
+                                "proto": proto, "how": how}, packet=True)
+
+    def deep_login(self, t, packet=False):
         """5.3.4 (IP-013): a login the deep pass saw sent without
         encryption (a transaction dict: client, server, port, proto, how;
-        never the user name or password). → the alert or None."""
+        never the user name or password). → the alert or None.
+        `packet`: seen in one packet (second audit #34), not reassembled."""
         if not FEATURES.get("login_warning", True):
             return None
         client = str(t.get("client") or "")
@@ -24202,7 +25885,9 @@ class NetworkModel:
         return self._alert(self.alerts.cleartext_login(
             name, key, sanitize_text(str(t.get("proto") or "?"), 12),
             server, port, is_public_ip(server),
-            how=sanitize_text(str(t.get("how") or ""), 60)))
+            how=sanitize_text(str(t.get("how") or ""), 60),
+            why="A sign-in was recognised in an unencrypted packet."
+            if packet else None, source=":pkt" if packet else ""))
 
     def _observe_cleartext(self, d, src_dev, dst_dev, direction):
         proto = d["cleartext"]
@@ -24250,9 +25935,129 @@ class NetworkModel:
                              new_conn=bool(new_flow and flow and
                                            flow.device_key == dev.key))
             self._baseline_check(dev, snap)
+            if role == "sent" and direction == "up":
+                self._night_upload(dev, b, ts, d["length"], remote)
+
+    # ---- second audit 2026-11-14 (#33, #35) ----------------------------------
+    def _is_night(self, ts):
+        """baseline_period(ts) == "night", worked out once a minute."""
+        minute = int(ts // 60)
+        c = getattr(self, "_night_cache", None)
+        if c is None or c[0] != minute:
+            c = self._night_cache = (minute,
+                                     baseline_period(ts) == "night")
+        return c[1]
+
+    def _night_upload(self, dev, b, ts, nbytes, remote):
+        """(#33) What a device sends to the Internet in a rolling hour at
+        night (23:00-07:00 local time). Raised once a night when it passes
+        NIGHT_UPLOAD_BYTES and more than twice the most it sent in a night
+        hour before (DeviceBaseline.night_up_max, kept with the baseline):
+        a NAS that backs up every night is told once, not every night. A
+        backup service is said, as an INFO."""
+        if not self._is_night(ts) or dev.ip == self.gateway_ip:
+            return None
+        night = story_day(ts - 12 * 3600)        # the evening it began
+        ep = self.night_up.get(dev.key)
+        if ep is None or ep["night"] != night:
+            ep = {"night": night, "mins": deque(), "total": 0,
+                  "to": Counter(), "prev": b.night_up_max, "told": False}
+            self.night_up[dev.key] = ep
+            if len(self.night_up) > 2000:
+                for k in list(self.night_up)[:200]:
+                    del self.night_up[k]
+        minute = int(ts // 60)
+        mins = ep["mins"]
+        if mins and mins[-1][0] == minute:
+            mins[-1][1] += nbytes
+        else:
+            mins.append([minute, nbytes])
+        ep["total"] += nbytes
+        while mins and minute - mins[0][0] >= NIGHT_UPLOAD_WINDOW // 60:
+            ep["total"] -= mins.popleft()[1]
+        if remote and (remote in ep["to"] or len(ep["to"]) < 64):
+            ep["to"][remote] += nbytes
+        total = ep["total"]
+        if total > b.night_up_max:
+            b.night_up_max = total
+        if ep["told"] or total < NIGHT_UPLOAD_BYTES or \
+                total <= 2 * ep["prev"]:
+            return None
+        ep["told"] = True
+        sent = sum(ep["to"].values()) or 1
+        backup = 0
+        service = ""
+        for ip, n in ep["to"].most_common():
+            hit = known_bulk_service(self.ip_to_domains.get(ip) or (),
+                                     "backup")
+            if hit:
+                backup += n
+                service = service or hit[0]
+        top = ep["to"].most_common(1)
+        top_ip = top[0][0] if top else ""
+        names = self.ip_to_domains.get(top_ip)
+        dest = next(reversed(names)) if names else (top_ip or "?")
+        if len(ep["to"]) > 1:
+            dest += f" and {len(ep['to']) - 1} other servers" \
+                if len(ep["to"]) > 2 else " and 1 other server"
+        minutes = mins[-1][0] - mins[0][0] + 1
+        return self._alert(self.alerts.night_upload(
+            dev, total, minutes, dest,
+            service if backup >= 0.7 * sent else "",
+            start=mins[0][0] * 60.0))
+
+    def _check_beacon(self, fk, starts, n, flow):
+        """(#35) A device that opens a new connection to one server on a
+        timer. Few false alarms: 30 contacts or more, nearly even gaps
+        (beacon_period), not name lookups, the clock, call set-up or a
+        ping, not the router, and a server no other device of yours uses
+        (a gadget maker's cloud is shared by its gadgets)."""
+        dev_key, remote = fk
+        if flow is None or flow.transport not in ("TCP", "UDP") or \
+                flow.remote_port in BEACON_SKIP_PORTS:
+            return None
+        reg = self.registry
+        dev = reg.by_key.get(dev_key) or reg.by_key.get(reg.resolve(dev_key))
+        if dev is None or not dev.live or dev.ip == self.gateway_ip:
+            return None
+        rec = self.remote_hosts.get(remote)
+        if rec is not None and len(rec.devices) > 1:
+            return None
+        period = beacon_period(starts)
+        if period is None:
+            return None
+        names = self.ip_to_domains.get(remote)
+        dest = next(reversed(names)) if names else remote
+        return self._alert(self.alerts.beacon(dev, dest, remote, period, n,
+                                              bool(names)))
+
+    def _bulk_service(self, dev, upload):
+        """Second audit (#38): the known backup (upload) or streaming
+        (download) service the device's busiest remote of its last minute
+        belongs to, or ""."""
+        b = self.baselines.devices.get(dev.key)
+        if b is None:
+            return ""
+        by = b.cur_up_by if upload else b.cur_down_by
+        for ip in (b.last_top[0 if upload else 1],
+                   max(by, key=by.get) if by else ""):
+            hit = known_bulk_service(self.ip_to_domains.get(ip) or (),
+                                     "backup" if upload else "stream") \
+                if ip else None
+            if hit:
+                return hit[0]
+        return ""
 
     def _baseline_check(self, dev, snap):
         for feat, v, m in self.baselines.check(snap):
+            if feat in ("bytes_up", "bytes_down") and \
+                    self._bulk_service(dev, feat == "bytes_up"):
+                # second audit (#38): an iCloud backup or a Netflix film
+                # is told on the Timeline, not raised as unusual
+                if not self.alerts._debounced(
+                        f"bulk:{feat}:{dev.key}", 1800):
+                    self._spike_story(dev, None, feat == "bytes_up", v)
+                continue
             a = self._alert(self.alerts.baseline_anomaly(
                 dev, feat, v, m, self.baselines.last_note))
             if a is not None and not a.updated and \
@@ -24301,7 +26106,7 @@ class NetworkModel:
         on this computer sent 80.0 MB in one minute"."""
         start = (int(self.now() // 60) - 1) * 60.0
         prog = self.spike_program(dev, upload, start)
-        if prog is not None:
+        if prog is not None and a is not None:
             a.refs["program"] = prog or "?"
         text = spike_sentence(hm_clock(start), dev.display_name(), upload,
                               _human_bytes(value), prog is not None,
@@ -24434,16 +26239,19 @@ class NetworkModel:
             self.baselines.devices.pop(key, None)       # CO-03
             self.resets.pop(key, None)
             self.scans.forget(key)
+            self.dns.forget(key)             # 5.3.4 (memory audit)
             self.dirty_devices.discard(key)
             self._classify_dirty.discard(key)
         yield "lifecycle"
         for f in self.flows.expire(now):
             pass
         self.dns.expire(now)
+        self.forget_aged(now)
         yield "expiry"
         self._check_dns(now)
         self._check_broadcast(now)
         self._check_scans(now)
+        self._check_duplicates(now)
         yield "checks"
         for dev in list(self.registry.by_key.values()):
             if dev.state != STATE_ACTIVE or not dev.live:
@@ -24453,6 +26261,7 @@ class NetworkModel:
                         "alerts.unknown_min_packets", 5), 5) and \
                     not dev.expected:
                 self._alert(self.alerts.unknown_device(dev))
+        self.refresh_alert_names()
         yield "unknown devices"
         for keep, other in self.registry.auto_merge_pass():
             dev = self.registry.by_key.get(keep)
@@ -24491,6 +26300,44 @@ class NetworkModel:
         self.registry.events = []
         self._announce_created()
 
+    REMOTE_KEEP = 6 * 3600   # audit #4: remote hosts and their names
+    REMOTE_MAX = 8000        # was 30,000, far above a home network's day
+
+    def forget_aged(self, now):
+        """Audit #4: remote hosts, address -> name lists and learned names
+        were capped by count only, so a day of new sites grew without a
+        plateau. Entries unseen for REMOTE_KEEP (names: NameCache.KEEP)
+        go, except addresses a kept connection, a known device or an
+        unacknowledged alert still refers to. -> how many went."""
+        if abs(now - getattr(self, "_aged_at", 0.0)) < 60:
+            return 0
+        self._aged_at = now
+        ips = []
+        for f in self.flows.all_flows():
+            ips += (f.remote_ip, f.local_ip)
+        for dev in self.registry.by_key.values():      # labelled ones too
+            ips += dev.ipv4s
+            ips += dev.ipv6
+            ips.append(dev.ip)
+        for a in self.alerts.alerts.values():
+            if not a.acknowledged:
+                ips.append(a.refs.get("remote", ""))
+                ips += str(a.subject or "").split("|")
+        keep = {ip for ip in ips if isinstance(ip, str)}   # a loaded session
+        cut = now - self.REMOTE_KEEP
+        old = [ip for ip, r in self.remote_hosts.items()
+               if r.last_seen < cut and ip not in keep]
+        for ip in old:
+            del self.remote_hosts[ip]
+            self.ev_geo.discard(ip)
+        self.dirty_remotes.update(old)             # the table drops the rows
+        doms = [ip for ip, names in self.ip_to_domains.items()
+                if ip not in keep and next(reversed(names.values()), 0) < cut]
+        for ip in doms:
+            del self.ip_to_domains[ip]
+        self.correlator._expire(now)     # without waiting for a new lookup
+        return len(old) + len(doms) + len(self.cache.prune(now, keep))
+
     def _check_dns(self, now):
         rate, n = self.dns.failure_rate(now)
         if n >= 20 and rate >= 0.3:
@@ -24522,6 +26369,24 @@ class NetworkModel:
                     self.device_for(top[0][0])
                 who = dev.display_name() if dev else top[0][0]
             self._alert(self.alerts.broadcast_storm(pps, who))
+
+    def _scanning(self, key):
+        """Second audit (#39): the device is scanning (an open alert, or
+        its last minute looks like one). The resets a scan gets back are
+        the scan's own, not "a service refusing connections"."""
+        eng = self.alerts
+        a = eng.alerts.get(eng._open.get(("scan_pattern", key), ""))
+        if a is not None and not a.acknowledged:
+            return True
+        if len(self.scans.attempts.get(key) or ()) < 20:
+            return False
+        # a third of the scan thresholds: the resets (40 by default) come
+        # in before the scan alert's 60 ports
+        return self.scans.evaluate(
+            key, max(10, _int(self.config.get(
+                "alerts.scan_ports_threshold", 60), 60) // 3),
+            max(10, _int(self.config.get(
+                "alerts.scan_hosts_threshold", 40), 40) // 3)) is not None
 
     def _check_scans(self, now):
         pt = _int(self.config.get("alerts.scan_ports_threshold", 60), 60)
@@ -24650,9 +26515,43 @@ class NetworkModel:
                                    f"which looks like a {kind or 'VPN'} "
                                    f"server", ("remote", ip))
 
+    def dhcp_trusted(self):
+        """Second audit (#37): (server, router) of the DHCP server this
+        network trusts: the one that names the router this computer uses
+        (live), else the first one seen. A rogue server arrives later and
+        often answers more, so the count can't decide."""
+        offers = [(s, o) for s, o in self.dhcp_offers.items()
+                  if o.get("router")]
+        if not offers:
+            return None
+        if self.gateway_ip and not self.use_packet_clock:
+            for s, o in offers:
+                if o["router"] == self.gateway_ip:
+                    return s, o["router"]
+        return offers[0][0], offers[0][1]["router"]
+
+    def dhcp_rogue(self):
+        """Second audit (#37): (server, router, DNS servers, trusted server,
+        trusted router) of a second DHCP server that hands out a different
+        router than the trusted one, else None."""
+        trusted = self.dhcp_trusted()
+        if trusted is None:
+            return None
+        for s, o in self.dhcp_offers.items():
+            if s != trusted[0] and o.get("router") and \
+                    o["router"] != trusted[1]:
+                return s, o["router"], list(o.get("dns") or []), \
+                    trusted[0], trusted[1]
+        return None
+
     def infer_gateway(self):
         """For imported captures: work out which address is the router,
-        from DHCP 'router' options or from where Internet traffic flows."""
+        from DHCP 'router' options or from where Internet traffic flows.
+        Second audit (#37): when DHCP servers disagree about the router,
+        the trusted server's router, never the busiest offer (a rogue
+        server answering every request named itself the gateway)."""
+        if self.dhcp_rogue() is not None:
+            return self.dhcp_trusted()[1]
         if self.dhcp_routers:
             return self.dhcp_routers.most_common(1)[0][0]
         if self.gw_mac_traffic:
@@ -24700,7 +26599,7 @@ DEFAULT_FILTER_PRESETS = {
 def _default_config():
     return {
         "config_version": CONFIG_SCHEMA_VERSION,
-        "general": {"auto_start_capture": True, "confirm_before_clear": False,
+        "general": {"auto_start_capture": True, "confirm_before_clear": True,
                     "beginner_explanations": True,
                     "explanation_verbosity": "Normal", "language": "English",
                     "upgraded_from_3": False, "show_welcome": True,
@@ -24743,6 +26642,7 @@ def _default_config():
                    "new_country": True, "broadcast_storm": True,
                    "scan_pattern": True, "reputation": True,
                    "cleartext_login": True, "own_blocklist_path": "",
+                   "night_upload": True, "beacon": True, "dns_tunnel": True,
                    "chatty_multiplier": 4, "chatty_min_rate": 3,
                    "unknown_min_packets": 5, "reconnect_count": 5,
                    "reconnect_window_minutes": 30, "arp_flip_threshold": 4,
@@ -24818,6 +26718,99 @@ def migrate_config(data):
     return data
 
 
+def _json_copy(v):
+    return json.loads(json.dumps(v, default=str))
+
+
+def config_beside_app_ok(default_path):
+    """Second audit (install #28): the settings file next to the program is
+    used only where the data folder could be: a folder of a trusted user
+    (trusted_uids) that nobody else can write to, and a file nobody else
+    can change. Before, any writable folder would do, so another user
+    could plant settings in a shared folder next to the script."""
+    folder = os.path.dirname(os.path.abspath(default_path))
+    if not private_dir_ok(folder):
+        return False
+    if os.path.lexists(default_path):
+        if IS_WINDOWS:
+            return True
+        try:
+            st = os.lstat(default_path)
+        except OSError:
+            return False
+        return stat.S_ISREG(st.st_mode) and \
+            st.st_uid in trusted_uids() and not st.st_mode & 0o022
+    return _dir_writable(folder)
+
+
+# second audit (settings #21): values a choice also takes besides its
+# labels (a colour-blind code, any "N %" scale)
+CHOICE_ALSO_OK = {
+    "accessibility.colorblind": lambda v: v in ("", "deutan", "protan",
+                                                "tritan"),
+    "accessibility.ui_scale": lambda v: bool(re.match(r"^\d+\s*%$", v)),
+}
+
+
+def _type_fits(value, default):
+    if default is None:
+        return True
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float)) and \
+            not isinstance(value, bool) and math.isfinite(value)
+    return isinstance(value, type(default))
+
+
+def clean_config_values(data):
+    """Second audit (settings #21-#23): every setting this version knows
+    gets a value of its default's kind (a word, a number, on/off, a
+    list), a choice one of its choices, a number its range. Anything else
+    is set back to the default, so a hand-edited or damaged value can't
+    stop the start (`"theme": "Purple"` did, even in Safe Mode) or a
+    background task (`"idle_minutes": null`). -> the keys set back."""
+    fixed = []
+    defaults = _default_config()
+    for section, vals in defaults.items():
+        have = data.get(section)
+        if not isinstance(vals, dict) or not isinstance(have, dict):
+            continue
+        for k, dv in vals.items():
+            if k in have and not _type_fits(have[k], dv):
+                have[k] = dv
+                fixed.append(f"{section}.{k}")
+    for page in SETTINGS_PAGES:
+        for sec in page["sections"]:
+            for c in sec["controls"]:
+                key = c.get("key")
+                if not key:
+                    continue
+                section, _, k = key.partition(".")
+                have = data.get(section)
+                if not isinstance(have, dict) or k not in have:
+                    continue
+                v = have[k]
+                if c.get("type") == "choice" and \
+                        isinstance(c.get("choices"), (list, tuple)):
+                    also = CHOICE_ALSO_OK.get(key)
+                    if v not in c["choices"] and not (
+                            isinstance(v, str) and also and also(v)):
+                        have[k] = defaults[section][k]
+                        fixed.append(key)
+                elif c.get("type") == "int" and \
+                        isinstance(v, (int, float)) and \
+                        not isinstance(v, bool):
+                    lo, hi = c.get("min"), c.get("max")
+                    if lo is not None and v < lo:
+                        have[k] = lo
+                        fixed.append(key)
+                    elif hi is not None and v > hi:
+                        have[k] = hi
+                        fixed.append(key)
+    return fixed
+
+
 class AppConfig:
     """JSON-backed settings. Degrades to defaults on any read/parse problem
     rather than crashing (keeping a backup of the damaged file); migrates
@@ -24828,7 +26821,8 @@ class AppConfig:
         if path is None:
             path = os.environ.get("MINIWIRESHARK_CONFIG")
         if path is None:
-            if os.path.exists(default_path) or _dir_writable(SCRIPT_DIR):
+            # second audit (install #28): the data folder's rule applies
+            if config_beside_app_ok(default_path):
                 path = default_path
             else:
                 path = os.path.join(PATHS.data, "miniwireshark_config.json")
@@ -24838,7 +26832,43 @@ class AppConfig:
         # when it was read (before this start writes anything)
         self.from_version = ""
         self.read_only = False
+        self.repaired = []           # keys set back to their defaults
+        self._disk_sig = None        # what this copy last read or wrote
         self.data = self._load()
+        self._base = _json_copy(self.data)
+
+    def _parse(self, raw):
+        """The file's bytes -> (settings merged over the defaults and
+        cleaned, the version that last showed the Welcome Center, keys
+        set back to defaults). Raises ValueError for damaged JSON."""
+        # second audit (settings #24): Notepad's byte-order mark is fine
+        data = json.loads(raw.decode("utf-8-sig"))
+        if not isinstance(data, dict):
+            raise ValueError("config is not an object")
+        data = migrate_config(data)
+        gen = data.get("general")
+        from_version = str(gen.get("welcome_version") or "") \
+            if isinstance(gen, dict) else ""
+        merged = _default_config()
+        for section, vals in data.items():
+            if section in merged and isinstance(vals, dict) and \
+                    isinstance(merged[section], dict):
+                merged[section].update(vals)
+            elif section not in merged:
+                # 5.2.3 (B-32): a section this version doesn't know
+                # (written by a newer one) is kept as it is, so running
+                # an older copy no longer erases those settings
+                merged[section] = vals
+        try:
+            ver = int(data.get("config_version", 0) or 0)
+        except (TypeError, ValueError):
+            ver = 0
+        if ver > CONFIG_SCHEMA_VERSION:
+            LOG.info("settings were written by a newer MiniWireshark "
+                     "(schema %s); keeping what this version doesn't "
+                     "know", ver)
+        merged["config_version"] = max(ver, CONFIG_SCHEMA_VERSION)
+        return merged, from_version, clean_config_values(merged)
 
     def _load(self):
         defaults = _default_config()
@@ -24865,32 +26895,20 @@ class AppConfig:
                             "is.")
             return defaults
         try:
-            data = json.loads(raw.decode("utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("config is not an object")
-            data = migrate_config(data)
-            gen = data.get("general")
-            if isinstance(gen, dict):
-                self.from_version = str(gen.get("welcome_version") or "")
-            merged = _default_config()
-            for section, vals in data.items():
-                if section in merged and isinstance(vals, dict) and \
-                        isinstance(merged[section], dict):
-                    merged[section].update(vals)
-                elif section not in merged:
-                    # 5.2.3 (B-32): a section this version doesn't know
-                    # (written by a newer one) is kept as it is, so running
-                    # an older copy no longer erases those settings
-                    merged[section] = vals
-            try:
-                ver = int(data.get("config_version", 0) or 0)
-            except (TypeError, ValueError):
-                ver = 0
-            if ver > CONFIG_SCHEMA_VERSION:
-                LOG.info("settings were written by a newer MiniWireshark "
-                         "(schema %s); keeping what this version doesn't "
-                         "know", ver)
-            merged["config_version"] = max(ver, CONFIG_SCHEMA_VERSION)
+            merged, self.from_version, self.repaired = self._parse(raw)
+            self._disk_sig = hashlib.sha256(raw).hexdigest()
+            if self.repaired:
+                # second audit (settings #21-#23): a value this version
+                # can't use (a theme that doesn't exist, a list where a
+                # word belongs, an empty number) stopped every start, even
+                # in Safe Mode; it is set back to its default instead
+                LOG.warning("settings set back to their defaults: %s",
+                            ", ".join(self.repaired))
+                self.warning = (
+                    "Some settings had values this version can't use, so "
+                    "they are back to their defaults: " +
+                    ", ".join(self.repaired[:6]) +
+                    (" …" if len(self.repaired) > 6 else "") + ".")
             return merged
         except (OSError, ValueError) as e:
             LOG.warning("config unreadable (%s); using defaults", e)
@@ -24940,11 +26958,50 @@ class AppConfig:
                 if stale:
                     with contextlib.suppress(OSError):
                         shutil.copyfile(self.path, bak)
-            atomic_write_json(self.path, self.data)
+            self._merge_from_disk()
+            text = json.dumps(self.data, indent=2, default=str)
+            atomic_write_text(self.path, text)
+            self._disk_sig = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            self._base = _json_copy(self.data)
             return True
         except OSError:
             LOG.warning("could not save settings to %s", self.path)
             return False
+
+    def _merge_from_disk(self):
+        """Second audit (settings #25): another copy of MiniWireshark saved
+        the same file since this one read it. Only what this copy changed
+        is written over the file as it is now; before, the last save won
+        and the other copy's changes were lost without a word."""
+        base = getattr(self, "_base", None)
+        if base is None:
+            return False
+        try:
+            with open(self.path, "rb") as f:
+                raw = f.read()
+        except OSError:
+            return False
+        if hashlib.sha256(raw).hexdigest() == self._disk_sig:
+            return False
+        try:
+            other = self._parse(raw)[0]
+        except (ValueError, UnicodeDecodeError):
+            return False                 # damaged: this copy's settings win
+        for section, vals in self.data.items():
+            was = base.get(section)
+            if isinstance(vals, dict) and isinstance(was, dict) and \
+                    isinstance(other.get(section), dict):
+                for k, v in vals.items():
+                    if k not in was or was[k] != v:
+                        other[section][k] = _json_copy(v)
+                for k in was:
+                    if k not in vals:
+                        other[section].pop(k, None)
+            elif vals != was:
+                other[section] = _json_copy(vals)
+        LOG.info("settings: merged with changes another copy saved")
+        self.data = other
+        return True
 
     def reset(self, section=None):
         fresh = _default_config()
@@ -25712,6 +27769,15 @@ class Store:
                         con.rollback()
                     LOG.warning("history write failed: %s", e)
                     break
+                except Exception as e:               # noqa: BLE001
+                    # (35-checker review) a bad value in one batch ended
+                    # the writer silently: history stopped, every later
+                    # batch queued, then dropped, and nothing said so
+                    self.error = f"{type(e).__name__}: {e}"
+                    with contextlib.suppress(sqlite3.Error):
+                        con.rollback()
+                    LOG.warning("history write failed: %s", self.error)
+                    break
             if self.q.empty():
                 self._idle.set()
         with contextlib.suppress(sqlite3.Error):
@@ -25909,7 +27975,10 @@ class Store:
             con.execute("DELETE FROM devices WHERE last_seen < ?", (cutoff,))
             for t, col in (("observations", "ts"), ("resolutions", "ts"),
                            ("flows", "end"), ("site_ties", "last"),
-                           ("events", "ts")):
+                           ("events", "ts"),
+                           # 5.3.4 (memory audit): one row per 8 MB packet
+                           # file, kept for ever after the file was gone
+                           ("packet_segments", "t1")):
                 con.execute(f"DELETE FROM {t} WHERE {col} < ?", (cutoff,))
             con.execute("DELETE FROM sessions WHERE ended IS NOT NULL AND "
                         "ended < ?", (cutoff,))
@@ -26242,6 +28311,7 @@ def digest_sort(out):
 STORY_DAYS = 7               # how far back the story goes with history on
 STORY_LIST_MAX = 3           # more new devices or websites a day: one line
 STORY_MAX_AGE = 60.0         # seconds before the Dashboard asks again
+STORY_MIN_AGE = 10.0         # new data: written again after this long
 STORY_WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
                   "Saturday", "Sunday")
 STORY_CATEGORY = {"presence": "Devices", "new_device": "Devices",
@@ -26299,6 +28369,34 @@ def story_day(ts):
         return time.strftime("%Y-%m-%d", time.localtime(ts))
     except (ValueError, OverflowError, OSError, TypeError):
         return "?"
+
+
+def alerts_card_text(counts):
+    """The Dashboard's ALERTS card: each count with its word (second
+    audit #54: "0 1 5" behind three symbols said nothing)."""
+    return (f"Danger {counts.get('DANGER', 0)} · "
+            f"Warning {counts.get('WARNING', 0)} · "
+            f"Info {counts.get('INFO', 0)}")
+
+
+def story_day_row(day, n, tr=None):
+    """A Story day heading for the Timeline's four columns (second
+    audit #53): the day and its count read as one heading in the wide
+    column ("Today · 2 changes"), not "2 changes" under Type and
+    "Today" under What happened."""
+    tr = tr or translate_text
+    count = tr("1 change") if n == 1 else tr("%d changes") % n
+    return ("", "", "", f"── {story_day_label(day)} · {count} ──")
+
+
+def story_item_row(it, icon, when, mark=""):
+    """A Story sentence for the Timeline's columns: the Type column
+    names what it is about (Devices, Websites, Alerts …), like the
+    other rows; the sentence already says how many times (second audit
+    #53: it showed "×5")."""
+    return (f"{icon} {it['severity']}", when,
+            translate_text(it.get("category") or ""),
+            mark + story_sentence(it))
 
 
 def story_day_label(day, now=None):
@@ -26479,8 +28577,10 @@ def story_build(dg, names=None, last_looked=None, now=None):
         elif group == "alert":
             sev = "DANGER" if any(f[1] == "DANGER" for f in facts) \
                 else "WARNING"
-            say = _story_say("Warning: %s", (subject,), (0,)) if n == 1 \
-                else _story_say("Warning (%d times): %s", (n, subject),
+            # second audit (#39): a DANGER is said as one, not "Warning"
+            word = "Danger" if sev == "DANGER" else "Warning"
+            say = _story_say(word + ": %s", (subject,), (0,)) if n == 1 \
+                else _story_say(word + " (%d times): %s", (n, subject),
                                 (1,))
             item(facts, group, say, None, "", sev)
         elif group == "spike":
@@ -26528,6 +28628,18 @@ def story_job_run(job, gate, model, store, since, until, last_looked,
     story["build_ms"] = round((time.perf_counter() - t0) * 1000, 1)
     story["model_id"] = id(model)
     return story
+
+
+def story_data_sig(model):
+    """What the story is written from, in a few numbers: when one moves,
+    the story is out of date. 5.3.4 crowd test (#6): a story could be a
+    minute old, so it said "2 changes" while the Dashboard, worked out
+    from the same data a moment later, counted 5 new devices, and an
+    unrelated setting's Apply (which wrote it again) made it "6 changes"."""
+    tl = model.timeline
+    return (id(model), len(tl), tl[-1]["when"] if tl else 0.0,
+            len(model.registry.by_key), len(model.websites),
+            len(model.alerts.alerts))
 
 
 def story_card_text(story, data_mode="live"):
@@ -26778,6 +28890,27 @@ def remove_history_copies(path, live_too=False):
     for f in files:
         with contextlib.suppress(OSError):
             os.remove(f)
+
+
+def history_record_files(paths=None):
+    """Second audit (privacy #7): the files besides the history database
+    that keep what was seen on the network: the autosave, the crash
+    journal and the ones set aside, a restored session, your device names
+    and notes, the remembered networks and the programs that waited for
+    connections, with their backups and damaged copies. -> existing paths."""
+    import glob
+    paths = paths or PATHS
+    bases = [paths.autosave, paths.journal,
+             os.path.join(paths.sessions, "restored.mwsession.json"),
+             paths.known_devices, paths.networks,
+             os.path.join(paths.data, "listening.json")]
+    out = set()
+    for b in bases:
+        out.add(b)
+        out.update(glob.glob(glob.escape(b) + ".*"))
+    out.update(glob.glob(os.path.join(glob.escape(paths.sessions),
+                                      "journal-interrupted-*")))
+    return sorted(p for p in out if os.path.isfile(p) or os.path.islink(p))
 
 
 def wipe_packet_files(folder):
@@ -27306,6 +29439,7 @@ DNS HEALTH ¦ SANTÉ DNS ¦ SALUD DNS
 ALERTS ¦ ALERTES ¦ ALERTAS
 MOST ACTIVE DEVICE ¦ APPAREIL LE PLUS ACTIF ¦ DISPOSITIVO MÁS ACTIVO
 This computer ¦ Cet ordinateur ¦ Este equipo
+A device ¦ Un appareil ¦ Un dispositivo
 MOST CONTACTED WEBSITE ¦ SITE LE PLUS CONTACTÉ ¦ SITIO MÁS CONTACTADO
 CAPTURE DURATION ¦ DURÉE DE CAPTURE ¦ DURACIÓN DE LA CAPTURA
 Feed speed ¦ Vitesse du fil ¦ Velocidad del flujo
@@ -27329,7 +29463,6 @@ Compare sessions ¦ Comparer des sessions ¦ Comparar sesiones
 What changed since ¦ Ce qui a changé depuis ¦ Qué cambió desde
 Time ¦ Heure ¦ Hora
 What happened ¦ Ce qui s'est passé ¦ Qué pasó
-The devices on your local network. Confidence shows how much local evidence supports each one — an IP address alone is never enough to count as a device. ¦ Les appareils de votre réseau local. La confiance indique combien de preuves locales soutiennent chacun — une adresse IP seule ne suffit jamais à compter comme appareil. ¦ Los dispositivos de su red local. La confianza indica cuántas pruebas locales respaldan cada uno — una dirección IP sola nunca basta para contar como dispositivo.
 Double-click a device for details, or right-click for actions (rename, mark as yours, merge…). ¦ Double-cliquez sur un appareil pour les détails, ou clic droit pour les actions (renommer, marquer comme vôtre, fusionner…). ¦ Haga doble clic en un dispositivo para ver detalles, o clic derecho para acciones (renombrar, marcar como suyo, fusionar…).
 Show offline ¦ Afficher hors ligne ¦ Mostrar desconectados
 Show expired ¦ Afficher expirés ¦ Mostrar caducados
@@ -27456,7 +29589,7 @@ Security check ¦ Contrôle de sécurité ¦ Revisión de seguridad
 Friendly explanations of what I've noticed. Unusual is not the same as dangerous. ¦ Explications simples de ce que j'ai remarqué. Inhabituel ne veut pas dire dangereux. ¦ Explicaciones sencillas de lo que he notado. Inusual no es lo mismo que peligroso.
 Check my router's port forwarding (UPnP) ¦ Vérifier les redirections de ports de ma box (UPnP) ¦ Comprobar la redirección de puertos de mi router (UPnP)
 What MiniWireshark sent ¦ Ce que MiniWireshark a envoyé ¦ Lo que envió MiniWireshark
-Sources — where MiniWireshark's information comes from. What this computer sees itself is “Observed”; what a connected helper tells it is “Reported”, shown beside it and never added to it. ¦ Sources — d'où viennent les informations de MiniWireshark. Ce que cet ordinateur voit lui-même est « Observé » ; ce qu'un assistant connecté lui dit est « Rapporté », affiché à côté et jamais additionné. ¦ Fuentes — de dónde viene la información de MiniWireshark. Lo que ve este equipo es «Observado»; lo que le dice un ayudante conectado es «Informado», mostrado al lado y nunca sumado.
+Sources — where MiniWireshark's information comes from. What this computer sees itself is “Observed”; what a connected helper tells it is “Reported”, shown beside it and never added to it. ¦ Sources — d'où viennent les informations de MiniWireshark. Ce que cet ordinateur voit lui-même est « Observé » ; ce qu'un assistant connecté lui dit est « Signalé », affiché à côté et jamais additionné. ¦ Fuentes — de dónde viene la información de MiniWireshark. Lo que ve este equipo es «Observado»; lo que le dice un ayudante conectado es «Informado», mostrado al lado y nunca sumado.
 Optional: connect your Pi-hole or AdGuard Home to see the lookups of devices this computer can't hear. Read-only — nothing is ever changed on them. ¦ Facultatif : connectez votre Pi-hole ou AdGuard Home pour voir les recherches des appareils que cet ordinateur n'entend pas. Lecture seule — rien n'y est jamais modifié. ¦ Opcional: conecte su Pi-hole o AdGuard Home para ver las búsquedas de los dispositivos que este equipo no oye. Solo lectura — nunca se cambia nada en ellos.
 Add Pi-hole ¦ Ajouter Pi-hole ¦ Añadir Pi-hole
 Add AdGuard Home ¦ Ajouter AdGuard Home ¦ Añadir AdGuard Home
@@ -27466,7 +29599,7 @@ Pause / resume ¦ Pause / reprise ¦ Pausar / reanudar
 Remove ¦ Supprimer ¦ Quitar
 Gives ¦ Fournit ¦ Aporta
 Last update ¦ Dernière mise à jour ¦ Última actualización
-Reported vs observed ¦ Rapporté ou observé ¦ Informado frente a observado
+Reported vs observed ¦ Signalé ou observé ¦ Informado frente a observado
 Show only ¦ Afficher seulement ¦ Mostrar solo
 All ¦ Tous ¦ Todos
 Website ¦ Site web ¦ Sitio web
@@ -27496,7 +29629,7 @@ Run self-test ¦ Lancer l'autotest ¦ Ejecutar autoprueba
 Open data folder ¦ Ouvrir le dossier des données ¦ Abrir la carpeta de datos
 Open logs ¦ Ouvrir les journaux ¦ Abrir registros
 Inspector ¦ Inspecteur ¦ Inspector
-observed  ◈ reported  ◎ correlated  ◌ inferred  ? unknown ¦ observé  ◈ rapporté  ◎ corrélé  ◌ déduit  ? inconnu ¦ observado  ◈ informado  ◎ correlacionado  ◌ deducido  ? desconocido
+observed  ◈ reported  ◎ correlated  ◌ inferred  ? unknown ¦ observé  ◈ signalé  ◎ corrélé  ◌ déduit  ? inconnu ¦ observado  ◈ informado  ◎ correlacionado  ◌ deducido  ? desconocido
 Ready. Click “Start watching” when you'd like to begin. ¦ Prêt. Cliquez sur « Commencer à observer » quand vous voulez. ¦ Listo. Haga clic en «Empezar a observar» cuando quiera.
 General ¦ Général ¦ General
 Appearance ¦ Apparence ¦ Apariencia
@@ -27722,11 +29855,9 @@ Un-mute all alerts ¦ Réactiver toutes les alertes ¦ Reactivar todas las alert
 Every feature that contacts an outside service is listed here, with exactly what it sends. Nothing is uploaded silently and there is no telemetry. ¦ Chaque fonction qui contacte un service extérieur est listée ici, avec exactement ce qu'elle envoie. Rien n'est envoyé en silence et il n'y a aucune télémétrie. ¦ Cada función que contacta con un servicio externo aparece aquí, con exactamente lo que envía. No se sube nada en silencio y no hay telemetría.
 What MiniWireshark itself sends ¦ Ce que MiniWireshark envoie lui-même ¦ Lo que envía el propio MiniWireshark
 Kill switch: stop everything MiniWireshark sends ¦ Arrêt d'urgence : stopper tout envoi de MiniWireshark ¦ Interruptor de corte: detener todo lo que envía MiniWireshark
-Watching keeps working, but nothing leaves this computer from MiniWireshark: no discovery probes, health checks, name lookups, downloads or update checks. Every send is listed in the ledger below. ¦ L'observation continue, mais rien ne quitte cet ordinateur de la part de MiniWireshark : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. Chaque envoi est listé dans le registre ci-dessous. ¦ La observación sigue funcionando, pero nada sale de este equipo por parte de MiniWireshark: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. Cada envío figura en el registro de abajo.
 Open the self-traffic ledger ¦ Ouvrir le registre des envois ¦ Abrir el registro de envíos propios
 Reference data (no personal data sent) ¦ Données de référence (aucune donnée personnelle envoyée) ¦ Datos de referencia (no se envían datos personales)
 Download public reference lists ¦ Télécharger les listes de référence publiques ¦ Descargar listas de referencia públicas
-Fetches the hardware-vendor list (wireshark.org) and the Public Suffix List (publicsuffix.org) about once a month. These are ordinary file downloads: nothing about your network is sent. Built-in lists are used when this is off or offline. ¦ Récupère la liste des fabricants (wireshark.org) et la Public Suffix List (publicsuffix.org) environ une fois par mois. Ce sont de simples téléchargements : rien sur votre réseau n'est envoyé. Les listes intégrées servent quand c'est désactivé ou hors ligne. ¦ Obtiene la lista de fabricantes (wireshark.org) y la Public Suffix List (publicsuffix.org) más o menos una vez al mes. Son descargas normales: no se envía nada sobre su red. Se usan las listas integradas cuando está desactivado o sin conexión.
 Refresh now ¦ Actualiser maintenant ¦ Actualizar ahora
 What is read from packets ¦ Ce qui est lu dans les paquets ¦ Qué se lee de los paquetes
 Read site names from HTTP/3 (QUIC) first packets ¦ Lire les noms de sites dans les premiers paquets HTTP/3 (QUIC) ¦ Leer nombres de sitios de los primeros paquetes HTTP/3 (QUIC)
@@ -27734,7 +29865,7 @@ A browser's first HTTP/3 packet names the site, protected only by keys anyone ca
 Country & provider lookup ¦ Recherche de pays et fournisseur ¦ Búsqueda de país y proveedor
 Offline country/provider database (recommended) ¦ Base pays/fournisseur hors ligne (recommandé) ¦ Base de datos de país/proveedor sin conexión (recomendado)
 Online country lookup (fallback) ¦ Recherche de pays en ligne (secours) ¦ Búsqueda de país en línea (alternativa)
-Sends each remote (Internet) IP address — never your own devices' addresses, MAC addresses, packet contents or website names — to a public geolocation service (ipwho.is, geojs.io, ipapi.co, ip-api.com) to find its country. ¦ Envoie chaque adresse IP distante (Internet) — jamais les adresses de vos appareils, les adresses MAC, le contenu des paquets ni les noms de sites — à un service public de géolocalisation (ipwho.is, geojs.io, ipapi.co, ip-api.com) pour trouver son pays. ¦ Envía cada dirección IP remota (de Internet) — nunca las de sus dispositivos, direcciones MAC, contenido de paquetes ni nombres de sitios — a un servicio público de geolocalización (ipwho.is, geojs.io, ipapi.co, ip-api.com) para saber su país.
+Sends each remote (Internet) IP address — never your own devices' addresses, MAC addresses, packet contents or website names — to a public geolocation service (ipwho.is, geojs.io, ipapi.co) to find its country. ¦ Envoie chaque adresse IP distante (Internet) — jamais les adresses de vos appareils, les adresses MAC, le contenu des paquets ni les noms de sites — à un service public de géolocalisation (ipwho.is, geojs.io, ipapi.co) pour trouver son pays. ¦ Envía cada dirección IP remota (de Internet) — nunca las de sus dispositivos, direcciones MAC, contenido de paquetes ni nombres de sitios — a un servicio público de geolocalización (ipwho.is, geojs.io, ipapi.co) para saber su país.
 Test lookup ¦ Tester la recherche ¦ Probar la búsqueda
 What MiniWireshark keeps ¦ Ce que MiniWireshark conserve ¦ Lo que guarda MiniWireshark
 Captured network information is processed on this computer and stays here unless you export it. Raw packets are never written to disk unless you export them or enable it under History. Settings live in a small file next to the program; names you give devices are kept in the data folder. ¦ Les informations réseau capturées sont traitées sur cet ordinateur et y restent sauf si vous les exportez. Les paquets bruts ne sont jamais écrits sur disque sauf si vous les exportez ou l'activez dans Historique. Les paramètres sont dans un petit fichier à côté du programme ; les noms donnés aux appareils sont dans le dossier des données. ¦ La información de red capturada se procesa en este equipo y se queda aquí salvo que la exporte. Los paquetes en bruto nunca se escriben en disco salvo que los exporte o lo active en Historial. Los ajustes están en un pequeño archivo junto al programa; los nombres que da a los dispositivos se guardan en la carpeta de datos.
@@ -27949,7 +30080,7 @@ Warning ¦ Avertissement ¦ Aviso
 Click to open the details. ¦ Cliquez pour ouvrir les détails. ¦ Haga clic para abrir los detalles.
 INTERNET (outside your network) ¦ INTERNET (hors de votre réseau) ¦ INTERNET (fuera de su red)
 YOUR LOCAL NETWORK ¦ VOTRE RÉSEAU LOCAL ¦ SU RED LOCAL
-Letters = confidence (H M L ?) · hollow = offline · ─ seen (switch said so) · ┄ logical (inferred) · ★ new this hour · red ring = open alert · drag a device to place it ¦ Lettres = confiance (H M L ?) · creux = hors ligne · ─ vu (selon le commutateur) · ┄ logique (déduit) · ★ nouveau cette heure · anneau rouge = alerte ouverte · faites glisser un appareil pour le placer ¦ Letras = confianza (H M L ?) · hueco = desconectado · ─ visto (según el conmutador) · ┄ lógico (deducido) · ★ nuevo en esta hora · anillo rojo = alerta abierta · arrastre un dispositivo para colocarlo
+Letter on a device = how sure it is real: H high, M medium, L low, ? unconfirmed · hollow = offline · ─ seen (switch said so) · ┄ logical (inferred) · ★ new this hour · red ring = open alert · drag a device to place it ¦ Lettre sur un appareil = certitude qu'il est réel : H élevée, M moyenne, L faible, ? non confirmé · creux = hors ligne · ─ vu (selon le commutateur) · ┄ logique (déduit) · ★ nouveau cette heure · anneau rouge = alerte ouverte · faites glisser un appareil pour le placer ¦ Letra en un dispositivo = certeza de que es real: H alta, M media, L baja, ? sin confirmar · hueco = desconectado · ─ visto (según el conmutador) · ┄ lógico (deducido) · ★ nuevo en esta hora · anillo rojo = alerta abierta · arrastre un dispositivo para colocarlo
 Load 200 older ¦ Charger 200 plus anciens ¦ Cargar 200 anteriores
 Internet traffic ¦ Trafic Internet ¦ Tráfico de Internet
 No Internet traffic measured yet ¦ Aucun trafic Internet mesuré pour l'instant ¦ Aún no se ha medido tráfico de Internet
@@ -28010,7 +30141,6 @@ weak ¦ faible ¦ débil
 fair ¦ moyen ¦ aceptable
 good ¦ bon ¦ bueno
 excellent ¦ excellent ¦ excelente
-Weak signal — the most likely cause of slowness. Move closer to the router or remove obstacles. ¦ Signal faible — la cause la plus probable de lenteur. Rapprochez-vous de la box ou enlevez les obstacles. ¦ Señal débil — la causa más probable de la lentitud. Acérquese al router o quite obstáculos.
 Usable, but video calls and big downloads may stutter. ¦ Utilisable, mais les appels vidéo et gros téléchargements peuvent saccader. ¦ Utilizable, pero las videollamadas y descargas grandes pueden ir a saltos.
 Good signal. ¦ Bon signal. ¦ Buena señal.
 Strong signal. ¦ Signal fort. ¦ Señal fuerte.
@@ -28037,7 +30167,7 @@ Any source ¦ Toute source ¦ Cualquier fuente
 Both ¦ Les deux ¦ Ambos
 Connected ¦ Connecté ¦ Conectado
 Connected (shared address) ¦ Connecté (adresse partagée) ¦ Conectado (dirección compartida)
-Looked up (reported) ¦ Recherché (rapporté) ¦ Buscado (informado)
+Looked up (reported) ¦ Recherché (signalé) ¦ Buscado (informado)
 Looked up only ¦ Recherché seulement ¦ Solo buscado
 Possibly ¦ Peut-être ¦ Posiblemente
 Encrypted ¦ Chiffré ¦ Cifrado
@@ -28122,7 +30252,7 @@ Full report (HTML) ¦ Rapport complet (HTML) ¦ Informe completo (HTML)
 Health checks send a few tiny test connections, so they only run while watching live with Active Scanning on (not in Quiet Mode). ¦ Les vérifications de santé envoient quelques minuscules connexions de test : elles ne tournent que pendant l'observation en direct avec l'analyse active (pas en mode discret). ¦ Las comprobaciones de salud envían unas pocas conexiones de prueba diminutas, así que solo se ejecutan al observar en directo con la exploración activa (no en modo silencioso).
 Help & glossary ¦ Aide et glossaire ¦ Ayuda y glosario
 Hide the inspector (F2 shows it again) ¦ Masquer l'inspecteur (F2 le réaffiche) ¦ Ocultar el inspector (F2 lo vuelve a mostrar)
-History is off, but an old history file exists. Delete it? ¦ L'historique est désactivé, mais un ancien fichier d'historique existe. Le supprimer ? ¦ El historial está desactivado, pero existe un archivo de historial antiguo. ¿Borrarlo?
+History is off, but old history or saved sessions are still on this computer. Delete them? ¦ L'historique est désactivé, mais un ancien historique ou des sessions enregistrées sont encore sur cet ordinateur. Les supprimer ? ¦ El historial está desactivado, pero aún hay un historial antiguo o sesiones guardadas en este equipo. ¿Borrarlos?
 Load session error ¦ Erreur de chargement de session ¦ Error al cargar la sesión
 Load session ¦ Charger une session ¦ Cargar sesión
 Mask IP and hardware addresses (recommended) ¦ Masquer les adresses IP et matérielles (recommandé) ¦ Ocultar direcciones IP y físicas (recomendado)
@@ -28190,6 +30320,10 @@ This alert isn't about one device; use “Mute this type” instead. ¦ Cette al
 This banner always tells the truth about whether MiniWireshark is sending discovery probes and health checks on your network or only listening. It can never be hidden — that's a transparency guarantee, not a setting. ¦ Ce bandeau dit toujours la vérité : MiniWireshark envoie-t-il des sondes de découverte et des vérifications de santé sur votre réseau, ou écoute-t-il seulement ? Il ne peut jamais être masqué — c'est une garantie de transparence, pas un réglage. ¦ Esta franja siempre dice la verdad sobre si MiniWireshark envía sondas de descubrimiento y comprobaciones de salud en su red o solo escucha. Nunca se puede ocultar — es una garantía de transparencia, no un ajuste.
 This check needs Active Mode on a network you've marked as yours, while watching live (and the kill switch off). ¦ Cette vérification nécessite le mode actif sur un réseau marqué comme vôtre, pendant l'observation en direct (et l'arrêt d'urgence désactivé). ¦ Esta comprobación necesita el modo activo en una red marcada como suya, observando en directo (y el interruptor de corte desactivado).
 This clears all packets, devices, websites, connections, alerts and the timeline from this session. Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. ¿Continuar?
+This clears all packets, devices, websites, connections, alerts and the timeline from this session. Watching carries on if it is running. You can undo it for 30 seconds.⏎⏎Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. L'observation continue si elle est en cours. Vous pouvez l'annuler pendant 30 secondes.⏎⏎Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. La observación continúa si está en marcha. Puede deshacerlo durante 30 segundos.⏎⏎¿Continuar?
+This clears all packets, devices, websites, connections, alerts and the timeline from this session. Watching carries on if it is running. This can't be undone.⏎⏎Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. L'observation continue si elle est en cours. Cette action est irréversible.⏎⏎Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. La observación continúa si está en marcha. No se puede deshacer.⏎⏎¿Continuar?
+This clears all packets, devices, websites, connections, alerts and the timeline from this session. Watching stops too (New session). You can undo it for 30 seconds.⏎⏎Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. L'observation s'arrête aussi (nouvelle session). Vous pouvez l'annuler pendant 30 secondes.⏎⏎Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. La observación también se detiene (nueva sesión). Puede deshacerlo durante 30 segundos.⏎⏎¿Continuar?
+This clears all packets, devices, websites, connections, alerts and the timeline from this session. Watching stops too (New session). This can't be undone.⏎⏎Continue? ¦ Cela efface tous les paquets, appareils, sites, connexions, alertes et la chronologie de cette session. L'observation s'arrête aussi (nouvelle session). Cette action est irréversible.⏎⏎Continuer ? ¦ Esto borra todos los paquetes, dispositivos, sitios, conexiones, alertas y la cronología de esta sesión. La observación también se detiene (nueva sesión). No se puede deshacer.⏎⏎¿Continuar?
 This preset uses an advanced expression; switch to Advanced view to see it. ¦ Ce préréglage utilise une expression avancée ; passez en vue avancée pour la voir. ¦ Este ajuste usa una expresión avanzada; cambie a la vista avanzada para verla.
 Trust / untrust ¦ Faire confiance / retirer ¦ Confiar / dejar de confiar
 Trust this certificate? ¦ Faire confiance à ce certificat ? ¦ ¿Confiar en este certificado?
@@ -28198,7 +30332,7 @@ Undo selected ¦ Annuler la sélection ¦ Deshacer lo seleccionado
 Update available ¦ Mise à jour disponible ¦ Actualización disponible
 Update rolled back ¦ Mise à jour annulée ¦ Actualización revertida
 What this computer can and can't see. Click for the full coverage report. ¦ Ce que cet ordinateur peut voir ou non. Cliquez pour le rapport de couverture complet. ¦ Lo que este equipo puede y no puede ver. Haga clic para el informe de cobertura completo.
-Yes = delete ALL stored history.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
+Yes = delete ALL stored history: the history, saved packets, the last autosave, crash copies, your device names and notes, remembered networks and the list of programs that wait for connections.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré : l'historique, les paquets enregistrés, la dernière sauvegarde automatique, les copies après plantage, les noms et notes de vos appareils, les réseaux mémorisés et la liste des programmes qui attendent des connexions.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado: el historial, los paquetes guardados, el último guardado automático, las copias tras un fallo, los nombres y notas de sus dispositivos, las redes recordadas y la lista de programas que esperan conexiones.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
 You have unsaved changes. Close without saving? ¦ Vous avez des modifications non enregistrées. Fermer sans enregistrer ? ¦ Tiene cambios sin guardar. ¿Cerrar sin guardar?
 Your device corrections (undo) ¦ Vos corrections d'appareils (annuler) ¦ Sus correcciones de dispositivos (deshacer)
 Your identity corrections ¦ Vos corrections d'identité ¦ Sus correcciones de identidad
@@ -28213,6 +30347,8 @@ Some settings need attention ¦ Certains paramètres demandent votre attention �
 Country lookup can't reach any service. ¦ La recherche de pays ne peut joindre aucun service. ¦ La búsqueda de país no puede contactar con ningún servicio.
 Marked as expected — I won't alert on this again. ¦ Marqué comme attendu — je ne signalerai plus cela. ¦ Marcado como esperado — no volveré a avisar de esto.
 The capture engine isn't available. ¦ Le moteur de capture n'est pas disponible. ¦ El motor de captura no está disponible.
+The capture engine isn't available, so MiniWireshark can't watch live traffic here. What's on screen was kept. Repair can install what is missing. ¦ Le moteur de capture n'est pas disponible, donc MiniWireshark ne peut pas observer le trafic en direct ici. Ce qui est affiché a été conservé. Réparer peut installer ce qui manque. ¦ El motor de captura no está disponible, así que MiniWireshark no puede observar el tráfico en directo aquí. Se ha conservado lo que hay en pantalla. Reparar puede instalar lo que falta.
+The capture engine isn't available, so MiniWireshark can't watch live traffic here. Repair can install what is missing. ¦ Le moteur de capture n'est pas disponible, donc MiniWireshark ne peut pas observer le trafic en direct ici. Réparer peut installer ce qui manque. ¦ El motor de captura no está disponible, así que MiniWireshark no puede observar el tráfico en directo aquí. Reparar puede instalar lo que falta.
 Testing country lookup ¦ Test de la recherche de pays ¦ Probando la búsqueda de país
 Welcome! I'll pick your network card and start watching. I'll explain everything in plain English. ¦ Bienvenue ! Je vais choisir votre carte réseau et commencer à observer. J'expliquerai tout simplement. ¦ ¡Bienvenido! Elegiré su tarjeta de red y empezaré a observar. Se lo explicaré todo con palabras sencillas.
 Copied to the clipboard. ¦ Copié dans le presse-papiers. ¦ Copiado al portapapeles.
@@ -28225,7 +30361,6 @@ Repairing dependencies in the background ¦ Réparation des dépendances en arri
 Switched to Quiet Mode — I stopped sending discovery probes and health checks. I'm still listening normally. ¦ Passé en mode discret — j'ai arrêté les sondes de découverte et les vérifications de santé. J'écoute toujours normalement. ¦ Cambiado a modo silencioso — dejé de enviar sondas de descubrimiento y comprobaciones de salud. Sigo escuchando con normalidad.
 History cleared. ¦ Historique effacé. ¦ Historial borrado.
 That device's history was deleted. ¦ L'historique de cet appareil a été supprimé. ¦ Se borró el historial de ese dispositivo.
-Kill switch on — MiniWireshark sends nothing (watching continues). ¦ Arrêt d'urgence activé — MiniWireshark n'envoie rien (l'observation continue). ¦ Interruptor de corte activado — MiniWireshark no envía nada (la observación continúa).
 Switched to Active Scanning — I'll periodically look for quiet devices on your own network again. ¦ Passé en analyse active — je chercherai de nouveau régulièrement les appareils discrets sur votre réseau. ¦ Cambiado a exploración activa — volveré a buscar periódicamente dispositivos silenciosos en su red.
 MiniWireshark hit an unexpected problem ¦ MiniWireshark a rencontré un problème inattendu ¦ MiniWireshark encontró un problema inesperado
 Getting started automatically — picking your best network card ¦ Démarrage automatique — choix de votre meilleure carte réseau ¦ Empezando automáticamente — eligiendo su mejor tarjeta de red
@@ -28260,7 +30395,7 @@ Components Center ¦ Centre des composants ¦ Centro de componentes
 Address on a public blocklist contacted ¦ Adresse d'une liste de blocage publique contactée ¦ Contacto con una dirección de una lista de bloqueo pública
 A device contacts an address on a public blocklist you turned on in the Components Center. ¦ Un appareil contacte une adresse figurant sur une liste de blocage publique activée dans le centre des composants. ¦ Un dispositivo contacta con una dirección de una lista de bloqueo pública que activó en el centro de componentes.
 Use the downloaded vendor and site lists ¦ Utiliser les listes de fabricants et de sites téléchargées ¦ Usar las listas de fabricantes y sitios descargadas
-Uses the hardware-vendor list and the Public Suffix List you got in the Components Center. They are only downloaded when you ask (or weekly, if you choose that there); nothing about your network is sent. Built-in lists are used when this is off or nothing was downloaded. ¦ Utilise la liste des fabricants et la Public Suffix List obtenues dans le centre des composants. Elles ne sont téléchargées que sur demande (ou chaque semaine si vous le choisissez) ; rien sur votre réseau n'est envoyé. Les listes intégrées servent quand c'est désactivé ou que rien n'a été téléchargé. ¦ Usa la lista de fabricantes y la Public Suffix List que obtuvo en el centro de componentes. Solo se descargan cuando lo pide (o cada semana, si lo elige allí); no se envía nada sobre su red. Se usan las listas integradas cuando está desactivado o no se descargó nada.
+Uses the hardware-vendor list and the Public Suffix List you got in the Components Center. Nothing is downloaded unless you ask: with Updates set to Manual there (the default), only when you press Get, Check now or Refresh now. With Weekly, a missing list is downloaded when MiniWireshark starts, and each list again once your copy is more than 30 days old. Nothing about your network is sent. Built-in lists are used when this is off or nothing was downloaded. ¦ Utilise la liste des fabricants et la Public Suffix List obtenues dans le centre des composants. Rien n'est téléchargé sans votre demande : avec Mises à jour sur Manuelles (par défaut), seulement quand vous cliquez sur Obtenir, Vérifier maintenant ou Actualiser maintenant. Avec Chaque semaine, une liste absente est téléchargée au démarrage de MiniWireshark, et chaque liste l'est de nouveau quand votre copie a plus de 30 jours. Rien sur votre réseau n'est envoyé. Les listes intégrées servent quand c'est désactivé ou que rien n'a été téléchargé. ¦ Usa la lista de fabricantes y la Public Suffix List que obtuvo en el centro de componentes. No se descarga nada salvo que lo pida: con Actualizaciones en Manuales (la opción por defecto), solo cuando pulsa Obtener, Comprobar ahora o Actualizar ahora. Con Semanales, una lista que falta se descarga al iniciar MiniWireshark, y cada lista de nuevo cuando su copia tiene más de 30 días. No se envía nada sobre su red. Se usan las listas integradas cuando está desactivado o no se descargó nada.
 Startup history ¦ Historique des démarrages ¦ Historial de inicios
 Set device type… ¦ Définir le type d'appareil… ¦ Definir el tipo de dispositivo…
 Set device type ¦ Définir le type d'appareil ¦ Definir el tipo de dispositivo
@@ -28283,6 +30418,14 @@ it carries your default Internet route ¦ elle porte votre route Internet par d�
 your router is on the same network ¦ votre box est sur le même réseau ¦ su router está en la misma red
 The file ended early, so not all of it could be read. ¦ Le fichier s'arrête trop tôt : il n'a pas pu être lu en entier. ¦ El archivo termina antes de tiempo: no se pudo leer entero.
 The file had no packets in it. ¦ Le fichier ne contenait aucun paquet. ¦ El archivo no contenía ningún paquete.
+Some packets named a network card the file doesn't describe, so they were left out. ¦ Certains paquets citent une carte réseau que le fichier ne décrit pas : ils ont été laissés de côté. ¦ Algunos paquetes nombran una tarjeta de red que el archivo no describe, así que se dejaron fuera.
+(stopped early) ¦ (arrêtée avant la fin) ¦ (detenida antes del final)
+file is empty ¦ le fichier est vide ¦ el archivo está vacío
+not a pcap/pcapng file ¦ ce n'est pas un fichier pcap/pcapng ¦ no es un archivo pcap/pcapng
+truncated pcap header ¦ en-tête pcap coupé ¦ cabecera pcap cortada
+corrupt pcapng section header ¦ en-tête de section pcapng endommagé ¦ cabecera de sección pcapng dañada
+corrupt pcapng block ¦ bloc pcapng endommagé ¦ bloque pcapng dañado
+corrupt pcapng packet block ¦ bloc de paquet pcapng endommagé ¦ bloque de paquete pcapng dañado
 Windows' own routing sends your Internet traffic through it ¦ le routage de Windows lui-même y fait passer votre trafic Internet ¦ el propio enrutamiento de Windows envía por ella su tráfico de Internet
 your Internet route goes through a VPN; the physical card shows the local network ¦ votre route Internet passe par un VPN ; la carte physique montre le réseau local ¦ su ruta a Internet pasa por una VPN; la tarjeta física muestra la red local
 Pick another card in the list, or click “Refresh”. ¦ Choisissez une autre carte dans la liste, ou cliquez sur « Actualiser ». ¦ Elija otra tarjeta de la lista o pulse «Actualizar».
@@ -28632,7 +30775,7 @@ Get / rebuild managed Python ¦ Obtenir / reconstruire le Python géré ¦ Obten
 Remove managed Python ¦ Supprimer le Python géré ¦ Eliminar el Python gestionado
 Start in the managed Python (used only after its window reports back; otherwise the Python you started with) ¦ Démarrer dans le Python géré (utilisé seulement si sa fenêtre confirme son ouverture ; sinon le Python avec lequel vous avez démarré) ¦ Iniciar en el Python gestionado (solo si su ventana confirma que se abrió; si no, el Python con el que lo inició)
 Repair / Update fixes the private packages folder (the capture engine is reinstalled from a fingerprinted file) and, if you have a managed Python, reinstalls its verified components and updates its pip. A newer Python is only installed when you ask. Nothing outside MiniWireshark's data folder is changed. ¦ Réparer / mettre à jour corrige le dossier des paquets privés (le moteur de capture est réinstallé depuis un fichier à empreinte vérifiée) et, si vous avez un Python géré, réinstalle ses composants vérifiés et met à jour son pip. Un Python plus récent n'est installé que sur demande. Rien n'est modifié hors du dossier de données de MiniWireshark. ¦ Reparar / actualizar arregla la carpeta de paquetes privados (el motor de captura se reinstala desde un archivo con huella verificada) y, si tiene un Python gestionado, reinstala sus componentes verificados y actualiza su pip. Un Python más reciente solo se instala si lo pide. No se cambia nada fuera de la carpeta de datos de MiniWireshark.
-Optional data, packages and helpers. MiniWireshark watches your network without any of them, and nothing downloads unless you ask. Every download is listed in the self-traffic ledger, and the kill switch blocks them all. ¦ Données, paquets et outils facultatifs. MiniWireshark surveille votre réseau sans aucun d'eux, et rien n'est téléchargé sans votre demande. Chaque téléchargement figure dans le registre des envois, et l'arrêt d'urgence les bloque tous. ¦ Datos, paquetes y herramientas opcionales. MiniWireshark vigila su red sin ninguno de ellos y no se descarga nada salvo que lo pida. Cada descarga figura en el registro de envíos y el interruptor de corte las bloquea todas.
+Optional data, packages and helpers. MiniWireshark watches your network without any of them, and nothing downloads unless you ask (Get, Check now, or Updates: Weekly). Every download is listed in the self-traffic ledger, and the kill switch blocks them all. ¦ Données, paquets et outils facultatifs. MiniWireshark surveille votre réseau sans aucun d'eux, et rien n'est téléchargé sans votre demande (Obtenir, Vérifier maintenant, ou Mises à jour : Chaque semaine). Chaque téléchargement figure dans le registre des envois, et l'arrêt d'urgence les bloque tous. ¦ Datos, paquetes y herramientas opcionales. MiniWireshark vigila su red sin ninguno de ellos y no se descarga nada salvo que lo pida (Obtener, Comprobar ahora, o Actualizaciones: Semanales). Cada descarga figura en el registro de envíos y el interruptor de corte las bloquea todas.
 Check now ¦ Vérifier maintenant ¦ Comprobar ahora
 Export offline pack ¦ Exporter un pack hors ligne ¦ Exportar paquete sin conexión
 Import offline pack ¦ Importer un pack hors ligne ¦ Importar paquete sin conexión
@@ -28813,8 +30956,8 @@ Nothing in this view yet. ¦ Rien dans cette vue pour l'instant. ¦ Aún no hay 
 Jump to now ¦ Revenir au présent ¦ Ir al momento actual
 Show only: ¦ Afficher seulement : ¦ Mostrar solo:
 INTERNET HOSTS — public Internet addresses your devices talked to. These are never devices on your network — they live somewhere out on the Internet. ¦ HÔTES INTERNET — adresses Internet publiques avec lesquelles vos appareils ont communiqué. Ce ne sont jamais des appareils de votre réseau — ils sont quelque part sur Internet. ¦ EQUIPOS DE INTERNET — direcciones públicas de Internet con las que hablaron sus dispositivos. Nunca son dispositivos de su red — están en algún lugar de Internet.
-Hides the technical Connections, Internet hosts and Packets tabs and the advanced filter fields. Nothing is removed — switch this off any time to see everything. ¦ Masque les onglets techniques Connexions, Hôtes Internet et Paquets ainsi que les filtres avancés. Rien n'est supprimé — désactivez à tout moment pour tout voir. ¦ Oculta las pestañas técnicas Conexiones, Equipos de Internet y Paquetes y los filtros avanzados. No se elimina nada — desactívelo cuando quiera para verlo todo.
-Beginner shows the essentials. Advanced adds the Connections, Internet hosts and Packets tabs, technical columns and filter expressions. Same data either way. ¦ Débutant montre l'essentiel. Avancé ajoute les onglets Connexions, Hôtes Internet et Paquets, les colonnes techniques et les expressions de filtre. Mêmes données dans les deux cas. ¦ Principiante muestra lo esencial. Avanzado añade las pestañas Conexiones, Equipos de Internet y Paquetes, columnas técnicas y expresiones de filtro. Los mismos datos en ambos casos.
+Hides the technical Connections, Internet hosts, Packets and Sources tabs and the advanced filter fields. Nothing is removed — switch this off any time to see everything. ¦ Masque les onglets techniques Connexions, Hôtes Internet, Paquets et Sources ainsi que les filtres avancés. Rien n'est supprimé — désactivez à tout moment pour tout voir. ¦ Oculta las pestañas técnicas Conexiones, Equipos de Internet, Paquetes y Fuentes y los filtros avanzados. No se elimina nada — desactívelo cuando quiera para verlo todo.
+Beginner shows the essentials. Advanced adds the Connections, Internet hosts, Packets and Sources tabs, technical columns and filter expressions. Same data either way. ¦ Débutant montre l'essentiel. Avancé ajoute les onglets Connexions, Hôtes Internet, Paquets et Sources, les colonnes techniques et les expressions de filtre. Mêmes données dans les deux cas. ¦ Principiante muestra lo esencial. Avanzado añade las pestañas Conexiones, Equipos de Internet, Paquetes y Fuentes, columnas técnicas y expresiones de filtro. Los mismos datos en ambos casos.
 Back (Alt+Left) ¦ Retour (Alt+Gauche) ¦ Atrás (Alt+Izquierda)
 Forward (Alt+Right) ¦ Suivant (Alt+Droite) ¦ Adelante (Alt+Derecha)
 Back to ¦ Revenir à ¦ Volver a
@@ -29003,6 +31146,11 @@ Less detail ¦ Moins de détails ¦ Menos detalles
 More in Help ¦ Plus dans l'aide ¦ Más en la ayuda
 No topic matches. ¦ Aucune rubrique ne correspond. ¦ Ningún tema coincide.
 Show all results ¦ Afficher tous les résultats ¦ Mostrar todos los resultados
+1 result. Double-click or press Enter to open it. ¦ 1 résultat. Double-cliquez ou appuyez sur Entrée pour l'ouvrir. ¦ 1 resultado. Haga doble clic o pulse Intro para abrirlo.
+No matches. Try a tab, a setting, a device or an action. ¦ Aucun résultat. Essayez un onglet, un paramètre, un appareil ou une action. ¦ Sin resultados. Pruebe una pestaña, un ajuste, un dispositivo o una acción.
+No changes yet ¦ Aucune modification pour l'instant ¦ Aún no hay cambios
+Save changes? ¦ Enregistrer les modifications ? ¦ ¿Guardar los cambios?
+Save your changes before closing?⏎⏎Yes saves them. No closes without saving. Cancel keeps this window open. ¦ Enregistrer vos modifications avant de fermer ?⏎⏎Oui les enregistre. Non ferme sans enregistrer. Annuler garde cette fenêtre ouverte. ¦ ¿Guardar los cambios antes de cerrar?⏎⏎Sí los guarda. No cierra sin guardar. Cancelar deja esta ventana abierta.
 No matches. Tip: device:, site:, ip:, port: or alert: ¦ Aucun résultat. Astuce : device:, site:, ip:, port: ou alert: ¦ Sin resultados. Consejo: device:, site:, ip:, port: o alert:
 Rename a workspace ¦ Renommer un espace de travail ¦ Cambiar el nombre de un espacio de trabajo
 Which workspace? ¦ Quel espace de travail ? ¦ ¿Qué espacio de trabajo?
@@ -29073,6 +31221,23 @@ Place and owner ¦ Lieu et propriétaire ¦ Lugar y propietario
 Place and owner… ¦ Lieu et propriétaire… ¦ Lugar y propietario…
 Quiet Mode (or a network not marked as yours): ranked only on what was overheard; nothing was sent to check. ¦ Mode discret (ou réseau non marqué comme le vôtre) : classé uniquement d'après ce qui a été entendu ; rien n'a été envoyé pour vérifier. ¦ Modo silencioso (o una red no marcada como suya): ordenado solo con lo que se ha escuchado; no se envió nada para comprobar.
 Review ¦ Passer en revue ¦ Revisar
+Display paused at %d shown · %d in memory (still capturing) ¦ Affichage suspendu à %d affichés · %d en mémoire (la capture continue) ¦ Vista en pausa con %d mostrados · %d en memoria (la captura continúa)
+0 shown · %d in memory — no packet in memory matches this filter ¦ 0 affiché · %d en mémoire — aucun paquet en mémoire ne correspond à ce filtre ¦ 0 mostrados · %d en memoria — ningún paquete en memoria coincide con este filtro
+No findings yet. Full Power checks packets as they arrive, so packets from before it was switched on are not checked. ¦ Aucune constatation pour l'instant. La pleine puissance vérifie les paquets à leur arrivée : ceux d'avant son activation ne sont pas vérifiés. ¦ Aún no hay hallazgos. La máxima potencia comprueba los paquetes a medida que llegan, así que los de antes de activarla no se comprueban.
+Print ¦ Imprimer ¦ Imprimir
+Demo Mode: this is made-up sample data, not your network. ¦ Mode démo : ce sont des données d'exemple inventées, pas votre réseau. ¦ Modo demo: son datos de ejemplo inventados, no su red.
+The page couldn't be opened in your web browser. Save it and open the file to print it. ¦ La page n'a pas pu être ouverte dans votre navigateur. Enregistrez-la et ouvrez le fichier pour l'imprimer. ¦ No se pudo abrir la página en su navegador. Guárdela y abra el archivo para imprimirla.
+Opened in your web browser: print it from there, or choose Save as PDF. ¦ Ouvert dans votre navigateur : imprimez-le depuis celui-ci ou choisissez Enregistrer en PDF. ¦ Abierto en su navegador: imprímalo desde allí o elija Guardar como PDF.
+“%s” starts a fresh live session, so %s will be cleared from view. ¦ « %s » démarre une nouvelle session en direct : %s sera retiré(e) de l'affichage. ¦ «%s» inicia una nueva sesión en directo, así que %s se quitará de la vista.
+Save it first (Session ▾ Save session) if you want to keep it. Continue? ¦ Enregistrez d'abord (Session ▾ Enregistrer la session) si vous voulez le garder. Continuer ? ¦ Guárdelo antes (Sesión ▾ Guardar sesión) si quiere conservarlo. ¿Continuar?
+“%s” stops live capture and replaces what's on screen. Save the current session first if you want to keep it. Continue? ¦ « %s » arrête la capture en direct et remplace ce qui est affiché. Enregistrez d'abord la session en cours si vous voulez la garder. Continuer ? ¦ «%s» detiene la captura en directo y reemplaza lo que hay en pantalla. Guarde antes la sesión actual si quiere conservarla. ¿Continuar?
+the opened capture file ¦ le fichier de capture ouvert ¦ el archivo de captura abierto
+the loaded session ¦ la session chargée ¦ la sesión cargada
+the demo data ¦ les données de démo ¦ los datos de demostración
+The Quick Start Guide walks through five steps with Show me buttons. Demo Mode fills every tab with clearly labelled sample data, apart from your real session. ¦ Le guide de démarrage rapide parcourt cinq étapes avec des boutons « Montrer ». Le mode démo remplit chaque onglet de données d'exemple clairement signalées, à part de votre vraie session. ¦ La guía de inicio rápido recorre cinco pasos con botones «Mostrar». El modo demo llena cada pestaña con datos de ejemplo claramente marcados, aparte de su sesión real.
+Correlated — Two separate observations line up — for example a device looked a name up and connected to the answer a moment later. ¦ Corrélé — Deux observations distinctes concordent — par exemple un appareil a cherché un nom puis s'est connecté à la réponse un instant plus tard. ¦ Correlacionado — Dos observaciones distintas coinciden — por ejemplo, un dispositivo buscó un nombre y se conectó a la respuesta un momento después.
+Nothing appears: check the network card at the top, and that watching is started. On Windows, Npcap must be installed. On Linux and macOS, watching needs administrator (root) rights: MiniWireshark asks for your password when watching starts, or you can start it with sudo. To watch without a password on Linux, give Python the capture right once in a terminal: sudo setcap cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v python3)")" (it is then allowed for every program run with that Python). Help / About → MiniWireshark health → Diagnostics… checks all of this: its "Capture rights" line says what is missing. Repair fixes the program's own files; the debug bundle (masked by default) is what to attach when asking for help. ¦ Rien n'apparaît : vérifiez la carte réseau en haut, et que l'observation est lancée. Sous Windows, Npcap doit être installé. Sous Linux et macOS, l'observation demande les droits d'administrateur (root) : MiniWireshark demande votre mot de passe quand l'observation commence, ou vous pouvez le lancer avec sudo. Pour observer sans mot de passe sous Linux, donnez une fois le droit de capture à Python dans un terminal : sudo setcap cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v python3)")" (il vaut alors pour tout programme lancé avec ce Python). Aide / À propos → État de MiniWireshark → Diagnostic… vérifie tout cela : sa ligne « Droits de capture » dit ce qui manque. Réparer corrige les fichiers du programme ; le paquet de débogage (masqué par défaut) est ce qu'il faut joindre pour demander de l'aide. ¦ No aparece nada: compruebe la tarjeta de red de arriba y que la observación está iniciada. En Windows, Npcap debe estar instalado. En Linux y macOS, observar necesita derechos de administrador (root): MiniWireshark pide su contraseña al empezar a observar, o puede iniciarlo con sudo. Para observar sin contraseña en Linux, dé una vez a Python el derecho de captura en un terminal: sudo setcap cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v python3)")" (vale entonces para todo programa que use ese Python). Ayuda / Acerca de → Estado de MiniWireshark → Diagnóstico… lo comprueba todo: su línea «Derechos de captura» dice qué falta. Reparar arregla los archivos del programa; el paquete de depuración (enmascarado por defecto) es lo que hay que adjuntar al pedir ayuda.
+Traffic (bits per second) ¦ Trafic (bits par seconde) ¦ Tráfico (bits por segundo)
 Review %d new ¦ Revoir %d nouvelles ¦ Revisar %d nuevas
 Review alerts ¦ Passer en revue les alertes ¦ Revisar alertas
 Review new alerts ¦ Passer en revue les nouvelles alertes ¦ Revisar las alertas nuevas
@@ -29472,8 +31637,10 @@ First visit to %s ¦ Première visite sur %s ¦ Primera visita a %s
 %s changed its address %d times ¦ %s a changé d'adresse %d fois ¦ %s cambió de dirección %d veces
 %s changed DNS server %d times ¦ %s a changé de serveur DNS %d fois ¦ %s cambió de servidor DNS %d veces
 %s (%d times) ¦ %s (%d fois) ¦ %s (%d veces)
-Warning: %s ¦ Avertissement : %s ¦ Advertencia: %s
-Warning (%d times): %s ¦ Avertissement (%d fois) : %s ¦ Advertencia (%d veces): %s
+Warning: %s ¦ Avertissement : %s ¦ Aviso: %s
+Warning (%d times): %s ¦ Avertissement (%d fois) : %s ¦ Aviso (%d veces): %s
+Danger: %s ¦ Danger : %s ¦ Peligro: %s
+Danger (%d times): %s ¦ Danger (%d fois) : %s ¦ Peligro (%d veces): %s
 What changed: the story ¦ Ce qui a changé : le récit ¦ Qué cambió: el relato
 Read the story ¦ Lire le récit ¦ Leer el relato
 The changes of the last days in plain sentences, with what is new since you last looked. ¦ Les changements des derniers jours en phrases simples, avec ce qui est nouveau depuis votre dernier coup d'œil. ¦ Los cambios de los últimos días con frases sencillas, con lo nuevo desde la última vez que miró.
@@ -29508,7 +31675,6 @@ No calls seen yet. ¦ Aucun appel vu pour l'instant. ¦ Todavía no se ha visto 
 %d connections looked like a call but had no connection check, so they are not measured. ¦ %d connexions ressemblaient à un appel mais sans vérification de connexion : elles ne sont pas mesurées. ¦ %d conexiones parecían una llamada pero no tenían comprobación de conexión, así que no se miden.
 Observed from packet headers only: no names, no sound or picture. Calls are measured after the call app checks its connection (STUN); some call apps can't be measured. ¦ Observé uniquement à partir des en-têtes des paquets : ni noms, ni son, ni image. Les appels sont mesurés après que l'application d'appel a vérifié sa connexion (STUN) ; certaines applications d'appel ne peuvent pas être mesurées. ¦ Observado solo a partir de las cabeceras de los paquetes: sin nombres, sin sonido ni imagen. Las llamadas se miden después de que la aplicación de llamadas compruebe su conexión (STUN); algunas aplicaciones de llamadas no se pueden medir.
 Login sent without encryption ¦ Connexion envoyée sans chiffrement ¦ Inicio de sesión enviado sin cifrar
-A password is sent without encryption (seen in Full Power; the password itself is never kept). ¦ Un mot de passe est envoyé sans chiffrement (vu en pleine puissance ; le mot de passe lui-même n'est jamais conservé). ¦ Se envía una contraseña sin cifrar (visto en máxima potencia; la contraseña en sí nunca se guarda).
 If it is your own router, camera or storage box, look in its settings for a secure (HTTPS) way to sign in. ¦ S'il s'agit de votre propre routeur, caméra ou boîtier de stockage, cherchez dans ses réglages une connexion sécurisée (HTTPS). ¦ Si es su propio router, cámara o equipo de almacenamiento, busque en sus ajustes una forma segura (HTTPS) de iniciar sesión.
 Use a password there that you don't use anywhere else, and change it if this login crossed the Internet. ¦ Utilisez-y un mot de passe que vous n'utilisez nulle part ailleurs, et changez-le si cette connexion a traversé Internet. ¦ Use allí una contraseña que no use en ningún otro sitio, y cámbiela si este inicio de sesión cruzó Internet.
 Usually an older router, camera, printer or storage box on your own network that only offers a plain sign-in page. ¦ D'habitude un ancien routeur, une caméra, une imprimante ou un boîtier de stockage de votre réseau qui ne propose qu'une page de connexion non chiffrée. ¦ Normalmente un router, una cámara, una impresora o un equipo de almacenamiento antiguo de su red que solo ofrece una página de inicio de sesión sin cifrar.
@@ -29667,6 +31833,8 @@ Packets arrive unevenly (jitter) ¦ Les paquets arrivent de façon irrégulière
 Move closer to the router, or use 5 GHz or a cable for calls. ¦ Rapprochez-vous du routeur, ou utilisez le 5 GHz ou un câble pour les appels. ¦ Acérquese al router, o use 5 GHz o un cable para las llamadas.
 Only the packets this computer sent were seen, so loss on the way can't be counted here. ¦ Seuls les paquets envoyés par cet ordinateur ont été vus : la perte en route ne peut pas être comptée ici. ¦ Solo se vieron los paquetes que envió este equipo, así que la pérdida por el camino no se puede contar aquí.
 The call's packets arrived complete and on time, so the stutter isn't visible here: it may come from the other person's connection, the call app or the computer itself. ¦ Les paquets de l'appel sont arrivés complets et à l'heure : la saccade n'est pas visible ici. Elle peut venir de la connexion de votre correspondant, de l'application d'appel ou de l'ordinateur lui-même. ¦ Los paquetes de la llamada llegaron completos y a tiempo, así que el corte no se ve aquí: puede venir de la conexión de la otra persona, de la aplicación de llamadas o del propio equipo.
+This capture itself missed packets, so it can't tell whether the call's packets arrived complete. They arrived on time; look again while the computer is less busy. ¦ Cette capture a elle-même manqué des paquets : impossible de dire si les paquets de l'appel sont arrivés complets. Ils sont arrivés à l'heure ; regardez de nouveau quand l'ordinateur est moins occupé. ¦ Esta captura perdió paquetes por sí misma, así que no puede saber si los paquetes de la llamada llegaron completos. Llegaron a tiempo; vuelva a mirar cuando el equipo esté menos ocupado.
+The call lost only %s of its packets and they arrived on time, so the stutter isn't visible here: it may come from the other person's connection, the call app or the computer itself. ¦ L'appel n'a perdu que %s de ses paquets et ils sont arrivés à l'heure : la saccade n'est pas visible ici. Elle peut venir de la connexion de votre correspondant, de l'application d'appel ou de l'ordinateur lui-même. ¦ La llamada solo perdió %s de sus paquetes y llegaron a tiempo, así que el corte no se ve aquí: puede venir de la conexión de la otra persona, de la aplicación de llamadas o del propio equipo.
 Call measuring is turned off. ¦ La mesure des appels est désactivée. ¦ La medición de llamadas está desactivada.
 1 connection looked like a call, but the call app sent no connection check (STUN), so it can't be measured. ¦ 1 connexion ressemblait à un appel, mais l'application d'appel n'a envoyé aucune vérification de connexion (STUN) : elle ne peut pas être mesurée. ¦ 1 conexión parecía una llamada, pero la aplicación de llamadas no envió ninguna comprobación de conexión (STUN), así que no se puede medir.
 %d connections looked like a call, but the call app sent no connection check (STUN), so they can't be measured. ¦ %d connexions ressemblaient à un appel, mais l'application d'appel n'a envoyé aucune vérification de connexion (STUN) : elles ne peuvent pas être mesurées. ¦ %d conexiones parecían una llamada, pero la aplicación de llamadas no envió ninguna comprobación de conexión (STUN), así que no se pueden medir.
@@ -29810,6 +31978,191 @@ No devices seen yet. ¦ Aucun appareil vu pour l'instant. ¦ Aún no se ha visto
 What this computer could see ¦ Ce que cet ordinateur pouvait voir ¦ Lo que este equipo podía ver
 Couldn't answer this one here. ¦ Impossible de répondre à celle-ci d'ici. ¦ No se puede responder a esta desde aquí.
 Made on this computer by MiniWireshark %s. To keep a copy, print this page or save it as a PDF from the browser's Print dialog. ¦ Créé sur cet ordinateur par MiniWireshark %s. Pour en garder une copie, imprimez cette page ou enregistrez-la en PDF depuis la boîte d'impression du navigateur. ¦ Creado en este equipo por MiniWireshark %s. Para guardar una copia, imprima esta página o guárdela como PDF desde el cuadro de impresión del navegador.
+# 5.3.4 crowd test: the places where the app contradicted itself
+No unusual behaviour, but 1 open warning needs a look. ¦ Aucun comportement inhabituel, mais 1 avertissement ouvert mérite un coup d'œil. ¦ Ningún comportamiento inusual, pero 1 aviso abierto merece una revisión.
+They are in the Alerts tab. ¦ Ils sont dans l'onglet Alertes. ¦ Están en la pestaña Alertas.
+no unusual behaviour ¦ aucun comportement inhabituel ¦ ningún comportamiento inusual
+MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. ¦ MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. ¦ MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa.
+KILL SWITCH ON ¦ ARRÊT D'URGENCE ACTIVÉ ¦ INTERRUPTOR DE CORTE ACTIVADO
+Kill switch on ¦ Arrêt d'urgence activé ¦ Interruptor de corte activado
+MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. Each request it sent or blocked is listed in the self-traffic ledger (the button below). ¦ MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. Chaque requête envoyée ou bloquée figure dans le registre des envois (le bouton ci-dessous). ¦ MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa. Cada solicitud enviada o bloqueada figura en el registro de envíos (el botón de abajo).
+Settings → Privacy → Kill switch. MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. ¦ Paramètres → Confidentialité → Arrêt d'urgence. MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. ¦ Ajustes → Privacidad → Interruptor de corte. MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa.
+KILL SWITCH ON — MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. ¦ ARRÊT D'URGENCE ACTIVÉ — MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. ¦ INTERRUPTOR DE CORTE ACTIVADO — MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa.
+Kill switch on — MiniWireshark sends nothing: no discovery probes, health checks, name lookups, downloads or update checks. Watching continues. ¦ Arrêt d'urgence activé — MiniWireshark n'envoie rien : ni sondes de découverte, ni vérifications de santé, ni recherches de noms, ni téléchargements, ni recherche de mises à jour. L'observation continue. ¦ Interruptor de corte activado — MiniWireshark no envía nada: ni sondas de descubrimiento, ni comprobaciones de salud, ni búsquedas de nombres, ni descargas, ni comprobación de actualizaciones. La observación continúa.
+Nothing sent or blocked yet. ¦ Rien n'a encore été envoyé ni bloqué. ¦ Aún no se ha enviado ni bloqueado nada.
+Checks only run while watching live; this is demo data. ¦ Les vérifications ne tournent qu'en observation en direct ; ce sont des données de démo. ¦ Las comprobaciones solo se ejecutan observando en directo; estos son datos de demostración.
+Checks only run while watching live; this is saved data. ¦ Les vérifications ne tournent qu'en observation en direct ; ce sont des données enregistrées. ¦ Las comprobaciones solo se ejecutan observando en directo; estos son datos guardados.
+Checks only run while watching live. Press Start watching. ¦ Les vérifications ne tournent qu'en observation en direct. Appuyez sur Commencer à observer. ¦ Las comprobaciones solo se ejecutan observando en directo. Pulse Empezar a observar.
+The kill switch is on, so no checks are sent. ¦ L'arrêt d'urgence est activé : aucune vérification n'est envoyée. ¦ El interruptor de corte está activado, así que no se envía ninguna comprobación.
+Quiet Mode sends no test traffic. Switch to Active Scanning to run the checks. ¦ Le mode discret n'envoie aucun trafic de test. Passez au balayage actif pour lancer les vérifications. ¦ El modo silencioso no envía tráfico de prueba. Cambie al escaneo activo para ejecutar las comprobaciones.
+Still finding out which network this is; checks start once it is one you trust. ¦ Identification du réseau en cours ; les vérifications commencent dès que c'est un réseau de confiance. ¦ Todavía se está averiguando qué red es; las comprobaciones empiezan cuando sea una red de confianza.
+This network isn't marked as yours, so no test traffic is sent. Use “Trust this network” to allow the checks. ¦ Ce réseau n'est pas marqué comme le vôtre : aucun trafic de test n'est envoyé. Utilisez « Faire confiance à ce réseau » pour autoriser les vérifications. ¦ Esta red no está marcada como suya, así que no se envía tráfico de prueba. Use «Confiar en esta red» para permitir las comprobaciones.
+Active checks are switched off in Settings → Network Health. ¦ Les vérifications actives sont désactivées dans Paramètres → Santé du réseau. ¦ Las comprobaciones activas están desactivadas en Ajustes → Salud de la red.
+Check the router, DNS and the Internet now (a few tiny test connections). ¦ Vérifier maintenant le routeur, le DNS et Internet (quelques petites connexions de test). ¦ Comprobar ahora el router, el DNS e Internet (unas pocas conexiones de prueba diminutas).
+none: not capturing live ¦ aucune : pas de capture en direct ¦ ninguna: no se captura en directo
+not picked yet ¦ pas encore choisie ¦ aún no elegida
+not seen yet ¦ pas encore vu ¦ aún no visto
+none seen (no IPv6 router announcement) ¦ aucun vu (pas d'annonce de routeur IPv6) ¦ ninguno visto (sin anuncio de router IPv6)
+◐ Partly checked ¦ ◐ Vérifié en partie ¦ ◐ Comprobado en parte
+Partly checked ¦ Vérifié en partie ¦ Comprobado en parte
+router and Internet seen in traffic, not checked yet ¦ routeur et Internet vus dans le trafic, pas encore vérifiés ¦ router e Internet vistos en el tráfico, aún sin comprobar
+○ Only how quickly connections open was timed, not download speed ¦ ○ Seule la rapidité d'ouverture des connexions a été mesurée, pas la vitesse de téléchargement ¦ ○ Solo se midió lo rápido que se abren las conexiones, no la velocidad de descarga
+Weak signal — likely to make the connection slower. Move closer to the router or remove obstacles. ¦ Signal faible — risque de ralentir la connexion. Rapprochez-vous de la box ou enlevez les obstacles. ¦ Señal débil — probablemente haga la conexión más lenta. Acérquese al router o quite obstáculos.
+Time window ¦ Période ¦ Periodo
+%s of data so far ¦ %s de données pour l'instant ¦ %s de datos por ahora
+Device evidence: is it a real device? ●●● High (score 60+) · ●●○ Medium (score 30+) · ●○○ Low (score 10+) · ○○○ Unconfirmed. Evidence: how three facts are known, in order: on your network · name · kind (◉ Observed · ◈ Reported · ◎ Correlated · ◌ Inferred · ? Unknown). “Likely” or “Possibly” before a kind is how sure that guess is, so a device with High evidence can still be only “Possibly” a printer. ¦ Preuves de l'appareil : est-ce un vrai appareil ? ●●● Élevée (score 60+) · ●●○ Moyenne (score 30+) · ●○○ Faible (score 10+) · ○○○ Non confirmé. Preuves : comment trois faits sont connus, dans l'ordre : sur votre réseau · nom · type (◉ Observé · ◈ Signalé · ◎ Corrélé · ◌ Déduit · ? Inconnu). « Probable » ou « Peut-être » devant un type dit à quel point cette supposition est sûre : un appareil aux preuves élevées peut n'être que « Peut-être » une imprimante. ¦ Pruebas del dispositivo: ¿es un dispositivo real? ●●● Alta (puntuación 60+) · ●●○ Media (puntuación 30+) · ●○○ Baja (puntuación 10+) · ○○○ Sin confirmar. Pruebas: cómo se conocen tres datos, en orden: en su red · nombre · tipo (◉ Observado · ◈ Informado · ◎ Correlacionado · ◌ Deducido · ? Desconocido). «Probable» o «Posiblemente» delante de un tipo indica lo segura que es esa suposición, así que un dispositivo con pruebas altas puede ser solo «Posiblemente» una impresora.
+The devices on your local network. Device evidence shows how sure it is that each one is a real device — an IP address alone is never enough to count as a device. ¦ Les appareils de votre réseau local. Les preuves de l'appareil indiquent à quel point il est sûr que chacun est un vrai appareil — une adresse IP seule ne suffit jamais à compter comme appareil. ¦ Los dispositivos de su red local. Las pruebas del dispositivo indican lo seguro que es que cada uno sea un dispositivo real — una dirección IP sola nunca basta para contar como dispositivo.
+# 5.3.4: Websites → Local services
+Local services ¦ Services locaux ¦ Servicios locales
+Websites → Local services ¦ Sites web → Services locaux ¦ Sitios web → Servicios locales
+Local services — programs on this computer that wait for connections. Most are normal: development tools, printing, file sharing. ¦ Services locaux — les programmes de cet ordinateur qui attendent des connexions. La plupart sont normaux : outils de développement, impression, partage de fichiers. ¦ Servicios locales — los programas de este equipo que esperan conexiones. La mayoría son normales: herramientas de desarrollo, impresión, uso compartido de archivos.
+“This computer only” can't be reached from other devices. “The whole network” can, unless a firewall blocks it. Double-click a web app to open it in your browser. ¦ « Cet ordinateur seulement » est inaccessible depuis les autres appareils. « Tout le réseau » l'est, sauf si un pare-feu le bloque. Double-cliquez sur une application web pour l'ouvrir dans votre navigateur. ¦ «Solo este equipo» no es accesible desde otros dispositivos. «Toda la red» sí lo es, salvo que un cortafuegos lo bloquee. Haga doble clic en una aplicación web para abrirla en su navegador.
+Refresh ¦ Actualiser ¦ Actualizar
+Open in browser ¦ Ouvrir dans le navigateur ¦ Abrir en el navegador
+What it probably is ¦ Ce que c'est probablement ¦ Qué es probablemente
+Program ¦ Programme ¦ Programa
+Listens on ¦ À l'écoute sur ¦ Escucha en
+Who can reach it ¦ Qui peut le joindre ¦ Quién puede acceder
+Some programs couldn't be named or listed without administrator rights. ¦ Certains programmes n'ont pas pu être nommés ou listés sans les droits d'administrateur. ¦ Algunos programas no se pudieron nombrar ni listar sin derechos de administrador.
+%d reachable from the network ¦ %d joignable(s) depuis le réseau ¦ %d accesible(s) desde la red
+Reading the list of services on this computer… ¦ Lecture de la liste des services de cet ordinateur… ¦ Leyendo la lista de servicios de este equipo…
+The list of services needs the optional psutil component (Settings → Repair). ¦ La liste des services nécessite le composant facultatif psutil (Paramètres → Réparer). ¦ La lista de servicios necesita el componente opcional psutil (Ajustes → Reparar).
+This computer didn't let MiniWireshark read the list of services without administrator rights. ¦ Cet ordinateur n'a pas laissé MiniWireshark lire la liste des services sans les droits d'administrateur. ¦ Este equipo no dejó que MiniWireshark leyera la lista de servicios sin derechos de administrador.
+The list of services hasn't been read yet. ¦ La liste des services n'a pas encore été lue. ¦ La lista de servicios aún no se ha leído.
+No services are listening on this computer. ¦ Aucun service n'est à l'écoute sur cet ordinateur. ¦ No hay ningún servicio a la escucha en este equipo.
+This service doesn't look like a web page, so it isn't opened in the browser. ¦ Ce service ne ressemble pas à une page web, il n'est donc pas ouvert dans le navigateur. ¦ Este servicio no parece una página web, así que no se abre en el navegador.
+Demo Mode: this service is made up, so nothing is opened. ¦ Mode démo : ce service est inventé, rien n'est donc ouvert. ¦ Modo demo: este servicio es inventado, así que no se abre nada.
+Not opened: the kill switch is on. ¦ Pas ouvert : l'arrêt d'urgence est activé. ¦ No se abrió: el interruptor de corte está activado.
+To open it yourself, type this address in your browser: ¦ Pour l'ouvrir vous-même, tapez cette adresse dans votre navigateur : ¦ Para abrirlo usted mismo, escriba esta dirección en su navegador:
+The browser couldn't be opened. ¦ Le navigateur n'a pas pu être ouvert. ¦ No se pudo abrir el navegador.
+Copy port ¦ Copier le port ¦ Copiar el puerto
+Copy address ¦ Copier l'adresse ¦ Copiar la dirección
+Web app in development ¦ Application web en développement ¦ Aplicación web en desarrollo
+Web server ¦ Serveur web ¦ Servidor web
+Secure web server ¦ Serveur web sécurisé ¦ Servidor web seguro
+Not sure what this is ¦ Pas sûr de ce que c'est ¦ No está claro qué es
+Only this computer can reach it ¦ Seul cet ordinateur peut le joindre ¦ Solo este equipo puede acceder
+Other devices on your network can reach it ¦ D'autres appareils de votre réseau peuvent le joindre ¦ Otros dispositivos de su red pueden acceder
+This computer only ¦ Cet ordinateur seulement ¦ Solo este equipo
+The whole network ¦ Tout le réseau ¦ Toda la red
+all addresses ¦ toutes les adresses ¦ todas las direcciones
+the operating system ¦ le système d'exploitation ¦ el sistema operativo
+unknown program (needs admin rights to name it) ¦ programme inconnu (il faut les droits d'administrateur pour le nommer) ¦ programa desconocido (hacen falta derechos de administrador para nombrarlo)
+Database connection (MongoDB) ¦ Connexion à une base de données (MongoDB) ¦ Conexión a base de datos (MongoDB)
+Local services opened in your browser (this computer) ¦ Services locaux ouverts dans votre navigateur (cet ordinateur) ¦ Servicios locales abiertos en su navegador (este equipo)
+Large upload at night ¦ Gros envoi pendant la nuit ¦ Gran subida durante la noche
+Regular check-ins to one server ¦ Contacts réguliers avec un même serveur ¦ Contactos regulares con un mismo servidor
+Data hidden in name lookups ¦ Données cachées dans des recherches de noms ¦ Datos ocultos en búsquedas de nombres
+A device sent a lot to the Internet at night, more than it ever did at night before. ¦ Un appareil a envoyé beaucoup vers Internet pendant la nuit, plus qu'il ne l'avait jamais fait la nuit. ¦ Un dispositivo envió mucho a Internet durante la noche, más de lo que nunca había enviado de noche.
+A device opened new connections to the same server many times, at nearly even intervals. ¦ Un appareil a ouvert de nombreuses fois de nouvelles connexions vers le même serveur, à intervalles presque réguliers. ¦ Un dispositivo abrió muchas veces conexiones nuevas con el mismo servidor, a intervalos casi regulares.
+Many long, random-looking names were looked up under one domain in a few minutes. ¦ De nombreux noms longs, qui semblent aléatoires, ont été recherchés sous un même domaine en quelques minutes. ¦ Se buscaron muchos nombres largos y de aspecto aleatorio bajo un mismo dominio en pocos minutos.
+Was the device backing up, syncing photos or uploading a video overnight? Then this is expected. ¦ L'appareil faisait-il une sauvegarde, une synchronisation de photos ou l'envoi d'une vidéo cette nuit ? Alors c'est normal. ¦ ¿El dispositivo hacía una copia de seguridad, sincronizaba fotos o subía un vídeo esta noche? Entonces es lo esperado.
+If it should be idle at night, look at which program sent the data, and run a malware scan on it. ¦ S'il devrait être inactif la nuit, regardez quel programme a envoyé les données et lancez une analyse antivirus sur l'appareil. ¦ Si debería estar inactivo de noche, mire qué programa envió los datos y analice el dispositivo en busca de malware.
+Do you know the server? A weather, news or smart-home app checking in is normal. ¦ Connaissez-vous le serveur ? Une application de météo, d'actualités ou de maison connectée qui se signale, c'est normal. ¦ ¿Conoce el servidor? Que una aplicación del tiempo, de noticias o de hogar inteligente se conecte es normal.
+If the device should be idle and you don't know the server, look at which program makes the connections. ¦ Si l'appareil devrait être inactif et que vous ne connaissez pas le serveur, regardez quel programme ouvre ces connexions. ¦ Si el dispositivo debería estar inactivo y no conoce el servidor, mire qué programa abre esas conexiones.
+Is antivirus, a VPN or a remote-access tool installed on the device? Some use name lookups like this on purpose. ¦ Un antivirus, un VPN ou un outil d'accès à distance est-il installé sur l'appareil ? Certains utilisent volontairement des recherches de noms de ce genre. ¦ ¿Hay un antivirus, una VPN o una herramienta de acceso remoto en el dispositivo? Algunos usan búsquedas de nombres así a propósito.
+If not, disconnect the device from the network and run a malware scan on it. ¦ Sinon, déconnectez l'appareil du réseau et lancez une analyse antivirus. ¦ Si no, desconecte el dispositivo de la red y analícelo en busca de malware.
+Usually a backup or a photo sync that runs while the device charges at night. ¦ D'habitude une sauvegarde ou une synchronisation de photos qui tourne pendant que l'appareil charge la nuit. ¦ Normalmente una copia de seguridad o una sincronización de fotos que se hace mientras el dispositivo se carga de noche.
+Usually an app or a gadget that checks in with its server on a timer (weather, smart home, mail, updates). ¦ D'habitude une application ou un objet connecté qui se signale à son serveur à intervalles fixes (météo, maison connectée, courrier, mises à jour). ¦ Normalmente una aplicación o un aparato que se conecta con su servidor cada cierto tiempo (tiempo, hogar inteligente, correo, actualizaciones).
+Sometimes antivirus or a VPN that uses name lookups on purpose; otherwise a way to sneak data past a firewall. ¦ Parfois un antivirus ou un VPN qui utilise volontairement des recherches de noms ; sinon, un moyen de faire passer des données en douce à travers un pare-feu. ¦ A veces un antivirus o una VPN que usa búsquedas de nombres a propósito; si no, una forma de sacar datos a escondidas a través de un cortafuegos.
+Something on this device may be sending your files out while nobody uses it. ¦ Quelque chose sur cet appareil envoie peut-être vos fichiers à l'extérieur pendant que personne ne l'utilise. ¦ Puede que algo en este dispositivo esté enviando sus archivos fuera mientras nadie lo usa.
+A program on this device may be checking in with someone else's server for orders. ¦ Un programme de cet appareil demande peut-être des ordres au serveur de quelqu'un d'autre. ¦ Puede que un programa de este dispositivo esté pidiendo órdenes al servidor de otra persona.
+Check whether the device was backing up then; if not, look at which program sent the data. ¦ Vérifiez si l'appareil faisait une sauvegarde à ce moment-là ; sinon, regardez quel programme a envoyé les données. ¦ Compruebe si el dispositivo hacía una copia de seguridad en ese momento; si no, mire qué programa envió los datos.
+Look up the server; if you don't know it, see which program on the device makes the connections. ¦ Renseignez-vous sur le serveur ; si vous ne le connaissez pas, regardez quel programme de l'appareil ouvre ces connexions. ¦ Busque información sobre el servidor; si no lo conoce, mire qué programa del dispositivo abre esas conexiones.
+A password is sent without encryption (the password itself is never kept). ¦ Un mot de passe est envoyé sans chiffrement (le mot de passe lui-même n'est jamais conservé). ¦ Se envía una contraseña sin cifrar (la contraseña en sí nunca se guarda).
+A device sends much more to the Internet at night than it ever did before. ¦ Un appareil envoie la nuit beaucoup plus vers Internet qu'il ne l'a jamais fait. ¦ Un dispositivo envía de noche mucho más a Internet de lo que nunca había enviado.
+A device contacts the same server again and again on a timer. ¦ Un appareil contacte le même serveur encore et encore, à intervalles fixes. ¦ Un dispositivo contacta con el mismo servidor una y otra vez, cada cierto tiempo.
+A device looks up many long, random-looking names under one domain. ¦ Un appareil recherche de nombreux noms longs, qui semblent aléatoires, sous un même domaine. ¦ Un dispositivo busca muchos nombres largos y de aspecto aleatorio bajo un mismo dominio.
+This looks like a backup. ¦ Cela ressemble à une sauvegarde. ¦ Parece una copia de seguridad.
+Phones and computers back up while they charge at night. ¦ Les téléphones et les ordinateurs font leurs sauvegardes pendant qu'ils chargent la nuit. ¦ Los teléfonos y los ordenadores hacen sus copias de seguridad mientras se cargan de noche.
+Most of the data went to a known backup service. ¦ La plupart des données sont allées vers un service de sauvegarde connu. ¦ La mayoría de los datos fueron a un servicio de copias de seguridad conocido.
+Data left this device while it is usually idle. ¦ Des données ont quitté cet appareil à un moment où il est d'habitude inactif. ¦ Salieron datos de este dispositivo cuando normalmente está inactivo.
+Backups, photo syncs and system updates run at night too. It matters if nothing on the device should be sending files. ¦ Les sauvegardes, synchronisations de photos et mises à jour système tournent aussi la nuit. C'est important si rien sur l'appareil ne devrait envoyer de fichiers. ¦ Las copias de seguridad, las sincronizaciones de fotos y las actualizaciones del sistema también se hacen de noche. Importa si nada en el dispositivo debería estar enviando archivos.
+Compared with what this device sent at night before. ¦ Comparé à ce que cet appareil envoyait la nuit auparavant. ¦ Comparado con lo que este dispositivo enviaba de noche antes.
+Contacts on a timer are how many apps check for news, and how some malware asks for orders. ¦ Des contacts à intervalles fixes, c'est ainsi que beaucoup d'applications cherchent des nouvelles, et ainsi que certains logiciels malveillants demandent des ordres. ¦ Los contactos cada cierto tiempo son la forma en que muchas aplicaciones buscan novedades, y en que algún malware pide órdenes.
+Weather and news widgets, smart-home gadgets, mail and update checks do this. It matters if you don't know the server and the device should be idle. ¦ Les widgets de météo et d'actualités, les objets connectés, la vérification du courrier et des mises à jour font cela. C'est important si vous ne connaissez pas le serveur et que l'appareil devrait être inactif. ¦ Los widgets del tiempo y de noticias, los aparatos de hogar inteligente y las comprobaciones de correo y actualizaciones lo hacen. Importa si no conoce el servidor y el dispositivo debería estar inactivo.
+At least 30 new connections to the same server, nearly evenly spaced. ¦ Au moins 30 nouvelles connexions vers le même serveur, presque régulièrement espacées. ¦ Al menos 30 conexiones nuevas con el mismo servidor, espaciadas de forma casi regular.
+Long random names under one domain can carry data out past a firewall (DNS tunnelling). ¦ Des noms longs et aléatoires sous un même domaine peuvent faire sortir des données à travers un pare-feu (tunnel DNS). ¦ Los nombres largos y aleatorios bajo un mismo dominio pueden sacar datos a través de un cortafuegos (túnel DNS).
+Some antivirus and security programs check files this way, and a few VPN and remote-access tools use it on purpose. ¦ Certains antivirus et programmes de sécurité vérifient des fichiers de cette façon, et quelques VPN et outils d'accès à distance l'utilisent volontairement. ¦ Algunos antivirus y programas de seguridad comprueban archivos así, y unas pocas VPN y herramientas de acceso remoto lo usan a propósito.
+Most were text (TXT) lookups ¦ La plupart étaient des recherches de texte (TXT) ¦ La mayoría eran búsquedas de texto (TXT)
+Devices that take an address from it send their Internet traffic and name lookups through that device, which can read or redirect them. ¦ Les appareils qui en reçoivent une adresse font passer leur trafic Internet et leurs recherches de noms par cet appareil, qui peut les lire ou les rediriger. ¦ Los dispositivos que reciben una dirección de él envían su tráfico de Internet y sus búsquedas de nombres a través de ese dispositivo, que puede leerlos o redirigirlos.
+A second router or a travel router plugged in by mistake does the same. If you don't recognise that device, unplug it and reconnect your devices. ¦ Un second routeur ou un routeur de voyage branché par erreur fait la même chose. Si vous ne reconnaissez pas cet appareil, débranchez-le et reconnectez vos appareils. ¦ Un segundo router o un router de viaje conectado por error hace lo mismo. Si no reconoce ese dispositivo, desconéctelo y vuelva a conectar sus dispositivos.
+A second DHCP server named a different router than the usual one. ¦ Un second serveur DHCP a indiqué un autre routeur que l'habituel. ¦ Un segundo servidor DHCP indicó un router distinto del habitual.
+It names itself as the router. ¦ Il se désigne lui-même comme routeur. ¦ Se indica a sí mismo como router.
+It names itself as the DNS server. ¦ Il se désigne lui-même comme serveur DNS. ¦ Se indica a sí mismo como servidor DNS.
+It names itself as the router and the DNS server. ¦ Il se désigne lui-même comme routeur et comme serveur DNS. ¦ Se indica a sí mismo como router y como servidor DNS.
+no DNS server ¦ aucun serveur DNS ¦ ningún servidor DNS
+A sign-in was recognised in an unencrypted packet. ¦ Une connexion a été reconnue dans un paquet non chiffré. ¦ Se reconoció un inicio de sesión en un paquete sin cifrar.
+a password field in a web form ¦ un champ de mot de passe dans un formulaire web ¦ un campo de contraseña en un formulario web
+a password in the web address ¦ un mot de passe dans l'adresse web ¦ una contraseña en la dirección web
+LOGIN command ¦ commande LOGIN ¦ comando LOGIN
+This is the first time it has been busy at night, so it was compared with what is usual for its kind. ¦ C'est la première fois qu'il est actif la nuit : il a donc été comparé à ce qui est habituel pour ce type d'appareil. ¦ Es la primera vez que está activo de noche, así que se comparó con lo habitual para su tipo de dispositivo.
+This is the first time it has been busy during the day, so it was compared with what is usual for its kind. ¦ C'est la première fois qu'il est actif en journée : il a donc été comparé à ce qui est habituel pour ce type d'appareil. ¦ Es la primera vez que está activo de día, así que se comparó con lo habitual para su tipo de dispositivo.
+first time active at night ¦ première activité de nuit ¦ primera actividad de noche
+first time active during the day ¦ première activité de jour ¦ primera actividad de día
+This device's traffic this minute is well above its own recent average. ¦ Le trafic de cet appareil cette minute est bien au-dessus de sa moyenne récente. ¦ El tráfico de este dispositivo en este minuto está muy por encima de su media reciente.
+A destination country this device hadn't used this session. ¦ Un pays de destination que cet appareil n'avait pas utilisé pendant cette session. ¦ Un país de destino que este dispositivo no había usado en esta sesión.
+A device normally answers for its address consistently. Rapid flip-flopping is the signature of ARP spoofing — one device impersonating another so traffic passes through it. It can also happen if two devices were accidentally given the same fixed IP. If this is your router's address, treat it seriously: disconnect and check the router's device list. ¦ Un appareil répond normalement toujours de la même façon pour son adresse. Des allers-retours rapides sont la signature de l'usurpation ARP : un appareil se fait passer pour un autre afin que le trafic passe par lui. Cela peut aussi arriver si deux appareils ont reçu par erreur la même adresse IP fixe. S'il s'agit de l'adresse de votre routeur, prenez-le au sérieux : déconnectez-vous et vérifiez la liste des appareils du routeur. ¦ Un dispositivo normalmente responde siempre igual por su dirección. Los cambios rápidos de un lado a otro son la señal de la suplantación ARP: un dispositivo se hace pasar por otro para que el tráfico pase por él. También puede pasar si a dos dispositivos se les dio por error la misma IP fija. Si es la dirección de su router, tómeselo en serio: desconéctese y revise la lista de dispositivos del router.
+A known device advertised a service it hadn't advertised before. ¦ Un appareil connu a annoncé un service qu'il n'annonçait pas avant. ¦ Un dispositivo conocido anunció un servicio que antes no anunciaba.
+A remote-access service was advertised or accepted connections. ¦ Un service d'accès à distance a été annoncé ou a accepté des connexions. ¦ Un servicio de acceso remoto se anunció o aceptó conexiones.
+Anyone on the same network path could read this traffic. ¦ Toute personne sur le même chemin réseau pourrait lire ce trafic. ¦ Cualquiera en el mismo camino de red podría leer este tráfico.
+Broadcast rate stayed above the threshold. ¦ Le débit de diffusion est resté au-dessus du seuil. ¦ La tasa de difusión se mantuvo por encima del umbral.
+Can be a misbehaving gadget, a network loop (a cable plugged into two switch ports), or heavy discovery traffic. ¦ Peut venir d'un objet connecté défaillant, d'une boucle réseau (un câble branché sur deux ports d'un switch) ou d'un trafic de découverte important. ¦ Puede ser un aparato que falla, un bucle de red (un cable conectado a dos puertos de un switch) o mucho tráfico de descubrimiento.
+Common and harmless when a VPN connects, a browser enables secure DNS, or you change settings. Worth checking if you didn't change anything, because DNS decides which servers your device talks to. ¦ Courant et sans danger quand un VPN se connecte, qu'un navigateur active le DNS sécurisé ou que vous changez des réglages. À vérifier si vous n'avez rien changé, car le DNS décide à quels serveurs votre appareil parle. ¦ Habitual e inofensivo cuando se conecta una VPN, un navegador activa el DNS seguro o usted cambia ajustes. Conviene comprobarlo si no cambió nada, porque el DNS decide con qué servidores habla su dispositivo.
+Common for devices that stay quiet or use a randomized MAC. Confidence usually improves the longer it's on the network. ¦ Courant pour les appareils silencieux ou qui utilisent une adresse MAC aléatoire. La certitude augmente en général avec le temps passé sur le réseau. ¦ Habitual en dispositivos que hablan poco o usan una MAC aleatoria. La certeza suele mejorar cuanto más tiempo está en la red.
+Common for old devices, local printers and some smart-home gear. It's worth avoiding for anything with a password. ¦ Courant pour les anciens appareils, les imprimantes locales et certains objets connectés. À éviter pour tout ce qui demande un mot de passe. ¦ Habitual en dispositivos antiguos, impresoras locales y algunos aparatos de hogar inteligente. Conviene evitarlo para todo lo que lleve contraseña.
+Compared with this device's own learned baseline (not with other devices). ¦ Comparé à ce que cet appareil fait d'habitude (pas aux autres appareils). ¦ Comparado con lo que este dispositivo hace normalmente (no con otros dispositivos).
+Connections are being refused or cut off. ¦ Des connexions sont refusées ou coupées. ¦ Se están rechazando o cortando conexiones.
+Could be a second router plugged in by mistake, or — less commonly — a rogue DHCP server. If you don't recognize one of these addresses, unplug that device and check your network. ¦ Peut-être un second routeur branché par erreur ou, plus rarement, un serveur DHCP malveillant. Si vous ne reconnaissez pas l'une de ces adresses, débranchez cet appareil et vérifiez votre réseau. ¦ Puede ser un segundo router conectado por error o, con menos frecuencia, un servidor DHCP malicioso. Si no reconoce alguna de estas direcciones, desconecte ese dispositivo y revise su red.
+Devices on your network don't all use the same DNS service. ¦ Les appareils de votre réseau n'utilisent pas tous le même service DNS. ¦ Los dispositivos de su red no usan todos el mismo servicio DNS.
+Devices that accept this announcement may send IPv6 traffic through that device. ¦ Les appareils qui acceptent cette annonce peuvent faire passer leur trafic IPv6 par cet appareil. ¦ Los dispositivos que aceptan este anuncio pueden enviar su tráfico IPv6 a través de ese dispositivo.
+Expected if you run a scanner (or IT tools, printers/NAS discovery) on purpose. Otherwise, check what software the device runs. ¦ Normal si vous lancez volontairement un scanner (ou des outils informatiques, la découverte d'imprimantes ou de NAS). Sinon, vérifiez quels logiciels tournent sur l'appareil. ¦ Es lo esperado si ejecuta un escáner a propósito (o herramientas informáticas, el descubrimiento de impresoras o NAS). Si no, compruebe qué programas ejecuta el dispositivo.
+Fine if you set it up (e.g. SSH on a Raspberry Pi, Remote Desktop on your PC). Make sure it's intended and protected by a strong password. ¦ Pas de souci si vous l'avez mis en place (par ex. SSH sur un Raspberry Pi, le Bureau à distance sur votre PC). Vérifiez que c'est voulu et protégé par un mot de passe solide. ¦ No pasa nada si lo configuró usted (p. ej. SSH en una Raspberry Pi, Escritorio remoto en su PC). Asegúrese de que es intencionado y está protegido con una contraseña fuerte.
+If it persists, restart the router and this computer's Wi-Fi; if it comes back, look for an unknown device on the network. It can also happen right after a router is replaced. ¦ Si cela persiste, redémarrez le routeur et le Wi-Fi de cet ordinateur ; si cela revient, cherchez un appareil inconnu sur le réseau. Cela peut aussi arriver juste après le remplacement d'un routeur. ¦ Si persiste, reinicie el router y el Wi-Fi de este equipo; si vuelve, busque un dispositivo desconocido en la red. También puede pasar justo después de cambiar el router.
+Its behavior changed compared to its own baseline this session. ¦ Son comportement a changé par rapport à son habitude pendant cette session. ¦ Su comportamiento cambió respecto a lo habitual en esta sesión.
+Lists can be out of date, and one address can host many unrelated sites. Check which program on that device made the connection; if you don't recognise it, run a malware scan on that device. ¦ Les listes peuvent être périmées, et une adresse peut héberger de nombreux sites sans lien. Vérifiez quel programme de cet appareil a ouvert la connexion ; si vous ne le reconnaissez pas, lancez une analyse antivirus sur cet appareil. ¦ Las listas pueden estar desfasadas y una dirección puede alojar muchos sitios sin relación. Compruebe qué programa de ese dispositivo abrió la conexión; si no lo reconoce, analice ese dispositivo en busca de malware.
+Many distinct connection attempts with few successful replies. ¦ De nombreuses tentatives de connexion différentes, avec peu de réponses. ¦ Muchos intentos de conexión distintos con pocas respuestas.
+Median DNS latency exceeded the slow-DNS threshold. ¦ Le temps de réponse DNS médian a dépassé le seuil de DNS lent. ¦ La latencia DNS mediana superó el umbral de DNS lento.
+Mesh Wi-Fi nodes, a second router, a phone hotspot or a virtual-machine host can do this legitimately. ¦ Des bornes Wi-Fi maillées, un second routeur, un partage de connexion d'un téléphone ou un hôte de machines virtuelles peuvent le faire légitimement. ¦ Los nodos de Wi-Fi en malla, un segundo router, el punto de acceso de un teléfono o un anfitrión de máquinas virtuales pueden hacerlo legítimamente.
+MiniWireshark can't confidently say what this device is. ¦ MiniWireshark ne peut pas dire avec certitude ce qu'est cet appareil. ¦ MiniWireshark no puede decir con seguridad qué es este dispositivo.
+More than three DNS servers were contacted. ¦ Plus de trois serveurs DNS ont été contactés. ¦ Se contactó con más de tres servidores DNS.
+New country after the baseline period. ¦ Nouveau pays après la période d'apprentissage. ¦ País nuevo después del periodo de aprendizaje.
+Normal after enabling sharing, casting or a new app. Worth a look only if you didn't change anything. ¦ Normal après avoir activé un partage, la diffusion ou une nouvelle application. À regarder seulement si vous n'avez rien changé. ¦ Normal después de activar el uso compartido, la transmisión o una aplicación nueva. Solo merece una revisión si no cambió nada.
+Normal if you just added a device (phone, guest, smart-home gadget). Worth checking if you don't recognize it. ¦ Normal si vous venez d'ajouter un appareil (téléphone, invité, objet connecté). À vérifier si vous ne le reconnaissez pas. ¦ Normal si acaba de añadir un dispositivo (teléfono, invitado, aparato de hogar inteligente). Conviene comprobarlo si no lo reconoce.
+Normal with VPNs, browsers that use their own secure DNS, or gadgets with hard-coded DNS. Public DNS services are not harmful in themselves. ¦ Normal avec les VPN, les navigateurs qui utilisent leur propre DNS sécurisé ou les objets au DNS imposé. Les services DNS publics ne sont pas dangereux en soi. ¦ Normal con VPN, navegadores que usan su propio DNS seguro o aparatos con un DNS fijo. Los servicios DNS públicos no son dañinos en sí mismos.
+Normally only your router does this. ¦ Normalement, seul votre routeur fait cela. ¦ Normalmente solo su router hace esto.
+Often a service that's down, a firewall/ad-blocker refusing connections, or a flaky connection. Rarely a security issue. ¦ Souvent un service en panne, un pare-feu ou un bloqueur de publicité qui refuse des connexions, ou une connexion instable. Rarement un problème de sécurité. ¦ A menudo un servicio caído, un cortafuegos o bloqueador de anuncios que rechaza conexiones, o una conexión inestable. Rara vez un problema de seguridad.
+Often a temporary problem at your Internet provider or router, or an ad-blocker deliberately refusing some names. ¦ Souvent un problème passager chez votre fournisseur d'accès ou sur votre routeur, ou un bloqueur de publicité qui refuse volontairement certains noms. ¦ A menudo un problema pasajero de su proveedor de Internet o del router, o un bloqueador de anuncios que rechaza algunos nombres a propósito.
+Often harmless — Wi-Fi privacy MAC rotation or a device reconnecting and briefly overlapping the old lease. Worth a look if it keeps happening. ¦ Souvent sans danger : changement d'adresse MAC privée Wi-Fi, ou un appareil qui se reconnecte et chevauche brièvement l'ancien bail. À regarder si cela se répète. ¦ A menudo inofensivo: cambio de la MAC privada de Wi-Fi o un dispositivo que se reconecta y se solapa un momento con la concesión anterior. Conviene revisarlo si se repite.
+Often normal (a game, a file-sharing app, a developer tool). If you don't recognise the program, close it or check it with your antivirus. ¦ Souvent normal (un jeu, une application de partage de fichiers, un outil de développement). Si vous ne reconnaissez pas le programme, fermez-le ou vérifiez-le avec votre antivirus. ¦ A menudo normal (un juego, una aplicación para compartir archivos, una herramienta de desarrollo). Si no reconoce el programa, ciérrelo o compruébelo con su antivirus.
+Often normal right after a router reboot or firmware update. It is also the classic sign of ARP spoofing — a device pretending to be your router. If you didn't just restart your router, investigate. ¦ Souvent normal juste après un redémarrage ou une mise à jour du routeur. C'est aussi le signe classique de l'usurpation ARP : un appareil qui se fait passer pour votre routeur. Si vous n'avez pas redémarré votre routeur, cherchez la cause. ¦ A menudo normal justo después de reiniciar o actualizar el router. También es la señal clásica de la suplantación ARP: un dispositivo que se hace pasar por su router. Si no acaba de reiniciar el router, investigue.
+Often normal — a big download, a video call, a software update. Worth a glance if you don't expect that device to be busy right now. ¦ Souvent normal : un gros téléchargement, un appel vidéo, une mise à jour. À regarder si vous ne vous attendez pas à ce que cet appareil soit occupé en ce moment. ¦ A menudo normal: una descarga grande, una videollamada, una actualización. Merece un vistazo si no espera que ese dispositivo esté ocupado ahora.
+Pages may feel slow to start loading. ¦ Les pages peuvent sembler lentes à commencer à charger. ¦ Las páginas pueden tardar en empezar a cargarse.
+The address-to-hardware mapping this computer uses differs from the one seen in replies on the wire. ¦ La correspondance adresse–matériel qu'utilise cet ordinateur diffère de celle vue dans les réponses sur le réseau. ¦ La correspondencia dirección–hardware que usa este equipo difiere de la vista en las respuestas en la red.
+The device claiming to be your router is not consistent. ¦ L'appareil qui se présente comme votre routeur n'est pas toujours le même. ¦ El dispositivo que dice ser su router no es siempre el mismo.
+The local network is being flooded with 'to everyone' messages. ¦ Le réseau local est inondé de messages « à tout le monde ». ¦ La red local se está inundando de mensajes «para todos».
+The operating system lists it as listening; it wasn't there before. ¦ Le système d'exploitation l'indique en attente de connexions ; il n'y était pas avant. ¦ El sistema operativo lo muestra esperando conexiones; antes no estaba.
+The protocol was recognised from the traffic itself. ¦ Le protocole a été reconnu à partir du trafic lui-même. ¦ El protocolo se reconoció a partir del propio tráfico.
+The reset count crossed the threshold for this window. ¦ Le nombre de réinitialisations a dépassé le seuil pour cette période. ¦ El número de restablecimientos superó el umbral para este periodo.
+The service that turns website names into addresses changed for this device. ¦ Le service qui transforme les noms de sites en adresses a changé pour cet appareil. ¦ El servicio que convierte los nombres de sitios en direcciones cambió para este dispositivo.
+The share of failed lookups is well above normal. ¦ La part de recherches échouées est bien au-dessus de la normale. ¦ La proporción de búsquedas fallidas está muy por encima de lo normal.
+This behavior is unusual compared with this device's recent activity. ¦ Ce comportement est inhabituel par rapport à l'activité récente de cet appareil. ¦ Este comportamiento es inusual comparado con la actividad reciente de este dispositivo.
+This device can probably be controlled over the network. ¦ Cet appareil peut probablement être contrôlé par le réseau. ¦ Este dispositivo probablemente se puede controlar a través de la red.
+This device consistently used one DNS server, then moved to another. ¦ Cet appareil utilisait toujours un serveur DNS, puis est passé à un autre. ¦ Este dispositivo usaba siempre un servidor DNS y luego pasó a otro.
+This device is repeatedly reconnecting. ¦ Cet appareil se reconnecte sans cesse. ¦ Este dispositivo se reconecta una y otra vez.
+This device now offers something new on your network. ¦ Cet appareil propose maintenant quelque chose de nouveau sur votre réseau. ¦ Este dispositivo ofrece ahora algo nuevo en su red.
+This is a new local device on your network. ¦ C'est un nouvel appareil local sur votre réseau. ¦ Es un dispositivo local nuevo en su red.
+This is usually harmless. But if you don't have a device with two network connections, treat it as possible ARP spoofing — one device impersonating another so traffic passes through it. ¦ C'est en général sans danger. Mais si vous n'avez pas d'appareil avec deux connexions réseau, considérez cela comme une possible usurpation ARP : un appareil qui se fait passer pour un autre afin que le trafic passe par lui. ¦ Normalmente es inofensivo. Pero si no tiene un dispositivo con dos conexiones de red, trátelo como una posible suplantación ARP: un dispositivo que se hace pasar por otro para que el tráfico pase por él.
+This looks like what network-scanning tools do. ¦ Cela ressemble à ce que font les outils de balayage réseau. ¦ Se parece a lo que hacen las herramientas de escaneo de red.
+Two devices are repeatedly fighting over the same network address. ¦ Deux appareils se disputent sans cesse la même adresse réseau. ¦ Dos dispositivos se disputan una y otra vez la misma dirección de red.
+Two devices currently disagree about who owns this address. ¦ Deux appareils ne sont pas d'accord en ce moment sur le propriétaire de cette adresse. ¦ Dos dispositivos no se ponen de acuerdo ahora mismo sobre quién tiene esta dirección.
+Updates, backups, video calls, game downloads and cloud sync all cause bursts like this. It only matters if the device shouldn't be doing anything right now. ¦ Les mises à jour, sauvegardes, appels vidéo, téléchargements de jeux et synchronisations dans le cloud provoquent tous ce genre de pics. Ce n'est important que si l'appareil ne devrait rien faire en ce moment. ¦ Las actualizaciones, copias de seguridad, videollamadas, descargas de juegos y sincronizaciones en la nube causan picos así. Solo importa si el dispositivo no debería estar haciendo nada ahora.
+Usually Wi-Fi interference, a weak signal, or a device with power-saving/roaming quirks — rarely an attack. ¦ D'habitude des interférences Wi-Fi, un signal faible ou un appareil aux réglages d'économie d'énergie ou d'itinérance capricieux ; rarement une attaque. ¦ Normalmente interferencias de Wi-Fi, una señal débil o un dispositivo con ajustes de ahorro de energía o itinerancia peculiares; rara vez un ataque.
+Usually your provider's DNS being slow or a congested connection; it isn't a security problem. ¦ D'habitude le DNS de votre fournisseur qui est lent ou une connexion encombrée ; ce n'est pas un problème de sécurité. ¦ Normalmente el DNS de su proveedor va lento o la conexión está saturada; no es un problema de seguridad.
+Very often normal: cloud and content services are spread across many countries. Location databases can also be wrong. ¦ Très souvent normal : les services cloud et de contenu sont répartis dans de nombreux pays. Les bases de localisation peuvent aussi se tromper. ¦ Muy a menudo normal: los servicios en la nube y de contenidos están repartidos por muchos países. Las bases de datos de ubicación también pueden equivocarse.
+Website names aren't being resolved reliably right now. ¦ Les noms de sites ne sont pas traduits en adresses de façon fiable en ce moment. ¦ Los nombres de los sitios no se están resolviendo de forma fiable ahora mismo.
+little evidence ¦ peu d'indices ¦ pocos indicios
+A device appeared that I haven't seen in this session. ¦ Un appareil que je n'avais pas vu pendant cette session est apparu. ¦ Apareció un dispositivo que no había visto en esta sesión.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -29954,6 +32307,9 @@ I18N_PATTERNS = [
     (r"(\d[\d,]*) devices?", r"\1 appareils", r"\1 dispositivos"),
     (r"(\d[\d,]*) websites?", r"\1 sites web", r"\1 sitios web"),
     (r"(\d[\d,]*) sites?", r"\1 sites", r"\1 sitios"),
+    # 5.3.4: Websites → Local services
+    (r"1 service", r"1 service", r"1 servicio"),
+    (r"(\d[\d,]*) services", r"\1 services", r"\1 servicios"),
     (r"(\d[\d,]*) hits?", r"\1 visites", r"\1 visitas"),
     (r"(\d[\d,]*) connections?", r"\1 connexions", r"\1 conexiones"),
     (r"(\d[\d,]*) alerts?", r"\1 alertes", r"\1 alertas"),
@@ -29998,24 +32354,35 @@ I18N_PATTERNS = [
      r"d'un fichier.   [\1]",
      r"📂  CAPTURA SIN CONEXIÓN — no es en directo. Está viendo paquetes de "
      r"un archivo.   [\1]"),
-    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets? from (.+?)"
+    # (audit 2026-11-14 #43: the count in its own singular or plural,
+    # and "(stopped early)" translated instead of dropped)
+    (r"📂  OFFLINE CAPTURE — finished reading (\d+ packets?) from (.+?)"
      r"( \(stopped early\))?\. Router identified from the capture "
      r"\(likely\): (\S+)\. Nothing here is live\.( .+)?",
-     r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Box "
+     r"📂  CAPTURE HORS LIGNE — lecture terminée : {t1} de \2{t3}. Box "
      r"identifiée dans la capture (probable) : \4. Rien n'est en "
      r"direct.{t5}",
-     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
+     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: {t1} de \2{t3}. "
      r"Router identificado en la captura (probable): \4. Nada es en "
      r"directo.{t5}"),
-    (r"📂  OFFLINE CAPTURE — finished reading (\d+) packets? from (.+?)"
+    (r"📂  OFFLINE CAPTURE — finished reading (\d+ packets?) from (.+?)"
      r"( \(stopped early\))?\.\s+Nothing here is live\.( .+)?",
-     r"📂  CAPTURE HORS LIGNE — lecture terminée : \1 paquets de \2. Rien "
+     r"📂  CAPTURE HORS LIGNE — lecture terminée : {t1} de \2{t3}. Rien "
      r"n'est en direct.{t4}",
-     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: \1 paquetes de \2. "
+     r"📂  CAPTURA SIN CONEXIÓN — lectura terminada: {t1} de \2{t3}. "
      r"Nada es en directo.{t4}"),
-    (r"📂 Offline capture: (.+) — (\d+) packets? \(not live\)",
-     r"📂 Capture hors ligne : \1 — \2 paquets (pas en direct)",
-     r"📂 Captura sin conexión: \1 — \2 paquetes (no en directo)"),
+    (r"📂 Offline capture: (.+) — (\d+ packets?) \(not live\)",
+     r"📂 Capture hors ligne : \1 — {t2} (pas en direct)",
+     r"📂 Captura sin conexión: \1 — {t2} (no en directo)"),
+    (r"Stopped reading the file: (.+?)\. The file may be damaged, or it "
+     r"isn't a pcap/pcapng capture\.",
+     r"Lecture du fichier arrêtée : {t1}. Le fichier est peut-être "
+     r"endommagé, ou ce n'est pas une capture pcap/pcapng.",
+     r"Se dejó de leer el archivo: {t1}. Puede que el archivo esté dañado "
+     r"o que no sea una captura pcap/pcapng."),
+    (r"a packet record claims (\d+) bytes, more than any real packet",
+     r"un paquet annonce \1 octets, plus que tout vrai paquet",
+     r"un paquete dice tener \1 bytes, más que cualquier paquete real"),
     (r"\(Not live\) (.+)", "(Pas en direct) {t1}", "(No en directo) {t1}"),
     (r"Imported capture\. Blind spots: (.+)\.  \(click for details\)",
      "Capture importée. Angles morts : {t1}.  (cliquez pour les détails)",
@@ -30102,7 +32469,7 @@ I18N_PATTERNS = [
      "\\1 — {t2} (probable)."),
     (r"(.+) — Possibly (.+)\.", "\\1 — {t2} (possible).",
      "\\1 — {t2} (posible)."),
-    (r"(.+) — (.+)\.", "\\1 — {t2}.", "\\1 — {t2}."),
+    (r"(.+) — (.+)\.", "{t1} — {t2}.", "{t1} — {t2}."),
     (r"MAC: (\S+)  \(private / randomized address\)",
      r"MAC : \1  (adresse privée / aléatoire)",
      r"MAC: \1  (dirección privada / aleatoria)"),
@@ -30496,6 +32863,10 @@ I18N_PATTERNS += [
 ]
 # 5.3.4 (MC5): what the baseline learned, and its state
 I18N_PATTERNS += [
+    # second audit (#54): the Dashboard's ALERTS card
+    (r"Danger (\d+) · Warning (\d+) · Info (\d+)",
+     r"Danger \1 · Avertissement \2 · Info \3",
+     r"Peligro \1 · Aviso \2 · Info \3"),
     (r"Learning \((\d+) of (\d+) min\)",
      r"En apprentissage (\1 sur \2 min)", r"Aprendiendo (\1 de \2 min)"),
     (r"Knows this device \((\d+) days\)",
@@ -30613,6 +32984,10 @@ _DHCP_WORDS = (r"(asking for an address|offering an address|accepting the "
                r"offer|declining|confirmed|refused|releasing|asking for "
                r"info)")
 EVENT_PATTERNS = [
+    # crowd test #15: a packet's service with its TCP flags
+    (r"(.+) \(((?:SYN|ACK|FIN|RST|PSH|URG|ECE|CWR)"
+     r"(?:,(?:SYN|ACK|FIN|RST|PSH|URG|ECE|CWR))*)\)", r"{t1} (\2)",
+     r"{t1} (\2)"),
     # 5.3.4 (M16, ST-05, ST-08): feed lines that stayed English
     (r"looked up ([\w.-]+)", r"a cherché \1", r"buscó \1"),
     (r"Looking up ([\w.-]+)", r"Recherche de \1", r"Buscando \1"),
@@ -30782,8 +33157,8 @@ EVENT_PATTERNS = [
     (r"(.+) connected: reporting lookups for (\d+) device\(s\)",
      r"\1 connecté : signale les recherches de \2 appareil(s)",
      r"\1 conectado: informa de las búsquedas de \2 dispositivo(s)"),
-    (r"(.+) got address (\S+) from DHCP", r"\1 a obtenu l'adresse \2 par "
-     r"DHCP", r"\1 obtuvo la dirección \2 por DHCP"),
+    (r"(.+) got address (\S+) from DHCP", r"{t1} a obtenu l'adresse \2 par "
+     r"DHCP", r"{t1} obtuvo la dirección \2 por DHCP"),
     (r"(.+) joined your network", r"\1 a rejoint votre réseau",
      r"\1 se ha unido a su red"),
     (r"(.+) moved to history \(expired\)", r"\1 passé dans l'historique "
@@ -30820,8 +33195,8 @@ EVENT_PATTERNS = [
      r"identificativa"),
     (r"(.+) keeps switching between devices", r"\1 passe sans cesse d'un "
      r"appareil à l'autre", r"\1 cambia continuamente entre dispositivos"),
-    (r"(.+) offers remote access \((.+)\)", r"\1 propose un accès à "
-     r"distance (\2)", r"\1 ofrece acceso remoto (\2)"),
+    (r"(.+) offers remote access \((.+)\)", r"{t1} propose un accès à "
+     r"distance (\2)", r"{t1} ofrece acceso remoto (\2)"),
     (r"(.+) shows a scanning-like pattern", r"\1 présente un comportement "
      r"qui ressemble à un balayage", r"\1 muestra un patrón parecido a un "
      r"escaneo"),
@@ -30836,7 +33211,176 @@ EVENT_PATTERNS = [
     (r"(\S+) is at (\S+)", r"\1 est à \2", r"\1 está en \2"),
 ]
 I18N_PATTERNS += EVENT_PATTERNS
+# second audit 2026-11-14 (#33-#37, #40): the new alerts' sentences
+EVENT_PATTERNS += [
+    (r"(.+) backed up at night \((.+)\)",
+     r"\1 a fait une sauvegarde pendant la nuit (\2)",
+     r"\1 hizo una copia de seguridad durante la noche (\2)"),
+    (r"(.+) sent (\d[\d.,]* [KMGT]?B) to the Internet at night",
+     r"\1 a envoyé \2 vers Internet pendant la nuit",
+     r"\1 envió \2 a Internet durante la noche"),
+    (r"(.+) contacts (\S+) every (\d+ (?:s|min|h)|[\d.]+ h)",
+     r"\1 contacte \2 toutes les \3", r"\1 contacta con \2 cada \3"),
+    (r"(.+) may be hiding data in name lookups",
+     r"\1 cache peut-être des données dans des recherches de noms",
+     r"\1 quizá oculta datos en búsquedas de nombres"),
+    (r"A second device hands out addresses and names itself as your "
+     r"router: (\S+)",
+     r"Un second appareil distribue des adresses et se désigne comme "
+     r"votre routeur : \1",
+     r"Un segundo dispositivo reparte direcciones y se indica como su "
+     r"router: \1"),
+    (r"A second device hands out addresses and a different router: (\S+)",
+     r"Un second appareil distribue des adresses et un autre routeur : \1",
+     r"Un segundo dispositivo reparte direcciones y otro router: \1"),
+    (r"(.+): unusual upload spike", r"\1 : pic d'envoi inhabituel",
+     r"\1: pico de subida inusual"),
+    (r"(.+): unusual download spike", r"\1 : pic de téléchargement "
+     r"inhabituel", r"\1: pico de descarga inusual"),
+    (r"(.+): unusually many destinations", r"\1 : nombre inhabituel de "
+     r"destinations", r"\1: número inusual de destinos"),
+    (r"(.+): unusually many new connections", r"\1 : nombre inhabituel de "
+     r"nouvelles connexions", r"\1: número inusual de conexiones nuevas"),
+]
+I18N_PATTERNS += EVENT_PATTERNS[-10:]
 I18N_PATTERNS += [
+    (r"A device appeared that wasn't here before\. How sure MiniWireshark "
+     r"is of what it is: (\w+) \((.+)\)\.",
+     "Un appareil est apparu qui n'était pas là avant. Ce que "
+     "MiniWireshark sait de ce qu'il est : {t1} ({t2}).",
+     "Apareció un dispositivo que antes no estaba. Lo seguro que está "
+     "MiniWireshark de qué es: {t1} ({t2})."),
+    # (#40) the existing alerts' "what we saw" sentences
+    (r"In one minute it uploaded (.+); its usual minute is about (.+)\."
+     r"((?: .+)?)",
+     "En une minute, il a envoyé \\1 ; d'habitude environ \\2 par "
+     "minute.{t3}",
+     "En un minuto subió \\1; lo habitual es unos \\2 por minuto.{t3}"),
+    (r"In one minute it downloaded (.+); its usual minute is about (.+)\."
+     r"((?: .+)?)",
+     "En une minute, il a téléchargé \\1 ; d'habitude environ \\2 par "
+     "minute.{t3}",
+     "En un minuto descargó \\1; lo habitual es unos \\2 por minuto.{t3}"),
+    (r"In one minute it contacted (\d+) different Internet hosts; its usual "
+     r"minute is about (\d+)\.((?: .+)?)",
+     "En une minute, il a contacté \\1 hôtes Internet différents ; "
+     "d'habitude environ \\2.{t3}",
+     "En un minuto contactó con \\1 hosts de Internet distintos; lo "
+     "habitual es unos \\2.{t3}"),
+    (r"In one minute it opened (\d+) new connections; its usual minute is "
+     r"about (\d+)\.((?: .+)?)",
+     "En une minute, il a ouvert \\1 nouvelles connexions ; d'habitude "
+     "environ \\2.{t3}",
+     "En un minuto abrió \\1 conexiones nuevas; lo habitual es unas "
+     "\\2.{t3}"),
+    (r"This minute: (.+)", r"Cette minute : \1", r"Este minuto: \1"),
+    (r"Usual: (.+)", "D'habitude : {t1}", "Lo habitual: {t1}"),
+    (r"Why now: (.+)", "Pourquoi maintenant : {t1}", "Por qué ahora: {t1}"),
+    (r"(\d+) different MAC addresses have claimed (\S+)\.",
+     r"\1 adresses MAC différentes ont revendiqué \2.",
+     r"\1 direcciones MAC distintas han reclamado \2."),
+    (r"Your gateway \((\S+)\) has answered ARP from (\d+) different MAC "
+     r"addresses in this session\.",
+     r"Votre passerelle (\1) a répondu en ARP depuis \2 adresses MAC "
+     r"différentes pendant cette session.",
+     r"Su puerta de enlace (\1) ha respondido por ARP desde \2 direcciones "
+     r"MAC distintas en esta sesión."),
+    (r"(\S+) was claimed by (\d+) different MAC addresses and flipped back "
+     r"and forth (\d+) times within a minute\.",
+     r"\1 a été revendiquée par \2 adresses MAC différentes et a changé "
+     r"\3 fois de main en une minute.",
+     r"\1 fue reclamada por \2 direcciones MAC distintas y cambió de "
+     r"manos \3 veces en un minuto."),
+    (r"(\S+) was claimed by (\d+) different MAC addresses answering at the "
+     r"same time \(each more than once within 2 minutes\)\.",
+     r"\1 a été revendiquée par \2 adresses MAC différentes qui répondaient "
+     r"en même temps (chacune plus d'une fois en 2 minutes).",
+     r"\1 fue reclamada por \2 direcciones MAC distintas que respondían a "
+     r"la vez (cada una más de una vez en 2 minutos)."),
+    (r"(\d+) connections were abruptly reset in the last (\d+) minutes "
+     r"\(most often with (.+)\)\.",
+     r"\1 connexions ont été brusquement réinitialisées ces \2 dernières "
+     r"minutes (le plus souvent avec \3).",
+     r"\1 conexiones se restablecieron de golpe en los últimos \2 minutos "
+     r"(sobre todo con \3)."),
+    (r"(\d+) connections were abruptly reset in the last (\d+) minutes\.",
+     r"\1 connexions ont été brusquement réinitialisées ces \2 dernières "
+     r"minutes.",
+     r"\1 conexiones se restablecieron de golpe en los últimos \2 "
+     r"minutos."),
+    (r"Within a minute it tried (\d+) different ports on (\S+), most "
+     r"without an answer\.",
+     r"En une minute, il a essayé \1 ports différents sur \2, la plupart "
+     r"sans réponse.",
+     r"En un minuto probó \1 puertos distintos en \2, la mayoría sin "
+     r"respuesta."),
+    (r"Within a minute it tried (\d+) different hosts on port (\d+), most "
+     r"without an answer\.",
+     r"En une minute, il a essayé \1 hôtes différents sur le port \2, la "
+     r"plupart sans réponse.",
+     r"En un minuto probó \1 hosts distintos en el puerto \2, la mayoría "
+     r"sin respuesta."),
+    (r"(\d+) different DHCP servers seen: ([0-9a-fA-F.:, ]+)\.",
+     r"\1 serveurs DHCP différents vus : \2.",
+     r"Se vieron \1 servidores DHCP distintos: \2."),
+    (r"(.+) and (\d+) other servers", r"\1 et \2 autres serveurs",
+     r"\1 y otros \2 servidores"),
+    (r"(.+) and 1 other server", r"\1 et 1 autre serveur",
+     r"\1 y otro servidor"),
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"That is (.+), a backup service\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. C'est \\4, "
+     "un service de sauvegarde.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Es \\4, un "
+     "servicio de copias de seguridad."),
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"It has never sent this much in a night hour before\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. Il n'avait "
+     "jamais envoyé autant en une heure de nuit.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Nunca había "
+     "enviado tanto en una hora de noche."),
+    (r"Sent: (.+)", r"Envoyé : \1", r"Enviado: \1"),
+    (r"To: (.+)", "Vers : {t1}", "A: {t1}"),
+    (r"It opened a new connection to (\S+) (\d+) times, about once every "
+     r"(.+)\.", r"Il a ouvert une nouvelle connexion vers \1 \2 fois, à peu "
+     r"près une fois toutes les \3.", r"Abrió una conexión nueva con \1 \2 "
+     r"veces, más o menos una vez cada \3."),
+    (r"Server: (.+)", r"Serveur : \1", r"Servidor: \1"),
+    (r"Contacts: (\d+)", r"Contacts : \1", r"Contactos: \1"),
+    (r"Every: (.+)", r"Intervalle : \1", r"Intervalo: \1"),
+    (r"In (\d+) minutes it looked up (\d+) different long, random-looking "
+     r"names under (\S+), such as (.+)\.",
+     r"En \1 minutes, il a recherché \2 noms différents, longs et qui "
+     r"semblent aléatoires, sous \3, par exemple \4.",
+     r"En \1 minutos buscó \2 nombres distintos, largos y de aspecto "
+     r"aleatorio, bajo \3, por ejemplo \4."),
+    (r"Domain: (.+)", r"Domaine : \1", r"Dominio: \1"),
+    (r"Different names: (\d+)", r"Noms différents : \1",
+     r"Nombres distintos: \1"),
+    (r"(\d+) different DHCP servers seen: (.+?)\. (\S+) gives devices (\S+) "
+     r"as their router and (.+?) for name lookups\. The usual one, (\S+), "
+     r"gives (\S+) as the router\.((?: .+)?)",
+     "\\1 serveurs DHCP différents vus : \\2. \\3 donne aux appareils \\4 "
+     "comme routeur et {t5} pour les recherches de noms. L'habituel, \\6, "
+     "donne \\7 comme routeur.{t8}",
+     "Se vieron \\1 servidores DHCP distintos: \\2. \\3 da a los "
+     "dispositivos \\4 como router y {t5} para las búsquedas de nombres. "
+     "El habitual, \\6, da \\7 como router.{t8}"),
+    (r"DHCP server: (.+)", r"Serveur DHCP : \1", r"Servidor DHCP: \1"),
+    (r"Router it gives: (.+)", r"Routeur qu'il donne : \1",
+     r"Router que da: \1"),
+    (r"Usual router: (.+)", r"Routeur habituel : \1",
+     r"Router habitual: \1"),
+    (r"DNS it gives: (.+)", r"DNS qu'il donne : \1", r"DNS que da: \1"),
+]
+I18N_PATTERNS += [
+    # review of #11: a nameless device's label with its address
+    (r"Device using a private Wi-Fi address \((\S+)\)",
+     r"Appareil avec une adresse Wi-Fi privée (\1)",
+     r"Dispositivo con una dirección Wi-Fi privada (\1)"),
+    (r"Device without a network address \(self-assigned ([0-9.]+)\)",
+     r"Appareil sans adresse réseau (\1 auto-attribuée)",
+     r"Dispositivo sin dirección de red (\1 autoasignada)"),
     (r"Its name \(“(.+)”\) looks like an? (.+)", r"Son nom (« \1 ») "
      r"ressemble à : {t2}", r"Su nombre («\1») parece de: {t2}"),
     # 5.3.4 (MC3)
@@ -30854,6 +33398,13 @@ I18N_PATTERNS += [
      r"Pide al DHCP los mismos ajustes, en el mismo orden, que «\1», que "
      r"probablemente es: {t2}"),
     (r"Made by (.+)", r"Fabriqué par \1", r"Fabricado por \1"),
+    # crowd test 5.3.4 #2, #15: the search results window
+    (r"(\d+) results\. Double-click or press Enter to open one\.",
+     r"\1 résultats. Double-cliquez ou appuyez sur Entrée pour en ouvrir "
+     r"un.", r"\1 resultados. Haga doble clic o pulse Intro para abrir "
+     r"uno."),
+    (r"Search results for “(.+)”", r"Résultats de recherche pour « \1 »",
+     r"Resultados de la búsqueda de «\1»"),
     (r"It advertises the “(.+)” service", r"Il annonce le service « \1 »",
      r"Anuncia el servicio «\1»"),
     (r"Its UPnP announcement mentions “(.+)”", r"Son annonce UPnP "
@@ -30870,6 +33421,28 @@ I18N_PATTERNS += [
      r"ordinateur).", r"Ningún asistente conectado. Búsquedas observadas "
      r"hasta ahora: \1 (solo las que pasaron por la tarjeta de red de "
      r"este ordenador)."),
+]
+# 5.3.4 crowd test: the places where the app contradicted itself (in
+# front: the generic "(.+) — (.+)." would take them first)
+I18N_PATTERNS[:0] = [
+    (r"No unusual behaviour, but (\d+) open warnings need a look\.",
+     r"Aucun comportement inhabituel, mais \1 avertissements ouverts "
+     r"méritent un coup d'œil.",
+     r"Ningún comportamiento inusual, pero \1 avisos abiertos merecen una "
+     r"revisión."),
+    (r"No problems in what was checked\. Not checked yet: (.+)\.",
+     r"Aucun problème dans ce qui a été vérifié. Pas encore vérifié : "
+     r"{t1}.",
+     r"Ningún problema en lo que se comprobó. Aún sin comprobar: {t1}."),
+    (r"Worth a look: (.+?) — (.+) No slowness was measured, so it may not "
+     r"be slowing anything down\.",
+     "À regarder : {t1} — {t2} Aucune lenteur n'a été mesurée : ce n'est "
+     "peut-être la cause de rien.",
+     "Para revisar: {t1} — {t2} No se midió ninguna lentitud, así que "
+     "puede que no esté frenando nada."),
+    (r"(\d[\d,]*) shown · (\d[\d,]*) in memory · display paused",
+     r"\1 affichés · \2 en mémoire · affichage en pause",
+     r"\1 mostrados · \2 en memoria · vista en pausa"),
 ]
 I18N_PATTERNS.sort(key=lambda x: 0 if x[0].startswith(
     ("Online now", r"Offline since (\d\d")) else 1)
@@ -30911,7 +33484,22 @@ def _i18n_lookup(s, table, loc):
                     if tok in out:
                         sub = g or ""
                         if sub:
-                            sub = _i18n_lookup(sub, table, loc) or sub
+                            hit = _i18n_lookup(sub, table, loc)
+                            if hit is None and not sub.endswith("."):
+                                # crowd test #15: the catalog holds the
+                                # sentence with its full stop
+                                hit = _i18n_lookup(sub + ".", table, loc)
+                                if hit is not None and hit.endswith("."):
+                                    hit = hit[:-1]
+                                else:
+                                    hit = None
+                            if hit is None and ", " in sub:
+                                # a list ("Router reachable, Internet
+                                # reachable"): each name on its own
+                                hit = ", ".join(
+                                    _i18n_lookup(x, table, loc) or x
+                                    for x in sub.split(", "))
+                            sub = hit or sub
                         out = out.replace(tok, sub)
             return pre + out + post
     # "Title — explanation": both halves known
@@ -30943,6 +33531,11 @@ def translate_text(s, locale=None):
             _I18N_CACHE.clear()
         _I18N_CACHE[key] = out
         if out is not s:
+            # second audit (#51): a nameless device's label inside a
+            # translated sentence ("Avertissement : Device using a
+            # private Wi-Fi address propose …")
+            out = translate_anonymous_labels(out, loc)
+            _I18N_CACHE[key] = out
             if len(I18N_REVERSE) > 50000:
                 I18N_REVERSE.clear()
             I18N_REVERSE[out] = s
@@ -31024,7 +33617,9 @@ def timeline_text(model, e):
     dev = reg.by_key.get(reg.resolve(key))
     if dev is None:
         return text
-    new = dev.display_name()
+    new = sentence_device_name(dev)
+    if looks_like_address(new) and not looks_like_address(old):
+        return text           # "A device got address …" stays readable
     return text.replace(old, new, 1) if new and new != old else text
 
 
@@ -31059,7 +33654,17 @@ def translate_event(text):
                     tok = "{t%d}" % i
                     if tok in hit:
                         hit = hit.replace(tok, table.get(g or "", g or ""))
+            g1 = mm.group(1) if mm.groups() else ""
+            if g1 and g1.endswith(" device") and len(g1) > 7 and \
+                    g1 not in table and hit.startswith(g1):
+                # crowd test #15: a maker's device ("{vendor} device")
+                maker = g1[:-7]
+                hit = ({"fr": f"Appareil {maker}",
+                        "es": f"Dispositivo {maker}"}.get(loc, g1) +
+                       hit[len(g1):])
             break
+    if hit is not None:
+        hit = translate_anonymous_labels(hit, loc)
     out = pre + hit + post if hit is not None else text
     if len(_EVENT_CACHE) > 20000:
         _EVENT_CACHE.clear()
@@ -32878,20 +35483,14 @@ def _geo_parse_ipapico(d):
     return d.get("country_code", ""), d.get("country_name", "")
 
 
-def _geo_parse_ipapi(d):
-    if d.get("status") != "success":
-        raise ValueError(d.get("message") or "lookup failed")
-    return d.get("countryCode", ""), d.get("country", "")
-
-
 GEOIP_PROVIDERS = [
     ("ipwho.is", "https://ipwho.is/{ip}?fields=success,message,country,"
                  "country_code", _geo_parse_ipwho),
     ("geojs.io", "https://get.geojs.io/v1/ip/country/{ip}.json",
      _geo_parse_geojs),
     ("ipapi.co", "https://ipapi.co/{ip}/json/", _geo_parse_ipapico),
-    ("ip-api.com", "http://ip-api.com/json/{ip}?fields=status,message,"
-                   "country,countryCode", _geo_parse_ipapi),
+    # second audit (privacy #11): ip-api.com's free service is plain http,
+    # which sent each address in clear text; it is no longer asked
 ]
 
 
@@ -33275,8 +35874,9 @@ SETTINGS_PAGES = [
          {"title": "Layout", "controls": [
              {"key": "appearance.beginner_mode", "type": "bool",
               "label": "Beginner view",
-              "help": "Hides the technical Connections, Internet hosts and "
-                      "Packets tabs and the advanced filter fields. Nothing "
+              "help": "Hides the technical Connections, Internet hosts, "
+                      "Packets and Sources tabs and the advanced filter "
+                      "fields. Nothing "
                       "is removed — switch this off any time to see "
                       "everything."},
          ]},
@@ -33573,9 +36173,16 @@ SETTINGS_PAGES = [
                                            "a public blocklist you turned "
                                            "on in the Components Center."),
               _alert_control("cleartext_login", "A password is sent without "
-                                                "encryption (seen in Full "
-                                                "Power; the password itself "
-                                                "is never kept)."),
+                                                "encryption (the password "
+                                                "itself is never kept)."),
+              _alert_control("night_upload", "A device sends much more to "
+                                             "the Internet at night than "
+                                             "it ever did before."),
+              _alert_control("beacon", "A device contacts the same server "
+                                       "again and again on a timer."),
+              _alert_control("dns_tunnel", "A device looks up many long, "
+                                           "random-looking names under one "
+                                           "domain."),
           ]},
          {"title": "Sensitivity", "controls": [
              {"key": "alerts.chatty_multiplier", "type": "int", "min": 2,
@@ -33684,10 +36291,9 @@ SETTINGS_PAGES = [
          {"title": "What MiniWireshark itself sends", "controls": [
              {"key": "privacy.kill_switch", "type": "bool",
               "label": "Kill switch: stop everything MiniWireshark sends",
-              "help": "Watching keeps working, but nothing leaves this "
-                      "computer from MiniWireshark: no discovery probes, "
-                      "health checks, name lookups, downloads or update "
-                      "checks. Every send is listed in the ledger below."},
+              "help": KILL_SWITCH_EFFECT + " Each request it sent or "
+                      "blocked is listed in the self-traffic ledger (the "
+                      "button below)."},
              {"type": "info", "text_fn": "ledger_status_text"},
              {"type": "info", "text": "Update check: once a day, one request "
                                       "to api.github.com for the latest "
@@ -33701,11 +36307,15 @@ SETTINGS_PAGES = [
              {"key": "privacy.auto_download_reference", "type": "bool",
               "label": "Use the downloaded vendor and site lists",
               "help": "Uses the hardware-vendor list and the Public Suffix "
-                      "List you got in the Components Center. They are only "
-                      "downloaded when you ask (or weekly, if you choose "
-                      "that there); nothing about your network is sent. "
-                      "Built-in lists are used when this is off or nothing "
-                      "was downloaded."},
+                      "List you got in the Components Center. Nothing is "
+                      "downloaded unless you ask: with Updates set to "
+                      "Manual there (the default), only when you press "
+                      "Get, Check now or Refresh now. With Weekly, a "
+                      "missing list is downloaded when MiniWireshark "
+                      "starts, and each list again once your copy is more "
+                      "than 30 days old. Nothing about your network is "
+                      "sent. Built-in lists are used when this is off or "
+                      "nothing was downloaded."},
              {"type": "info", "text_fn": "data_status_text"},
              {"type": "action", "actions": [
                  ("Components Center…", "components_center"),
@@ -33733,8 +36343,8 @@ SETTINGS_PAGES = [
               "help": "Sends each remote (Internet) IP address — never "
                       "your own devices' addresses, MAC addresses, packet "
                       "contents or website names — to a public "
-                      "geolocation service (ipwho.is, geojs.io, ipapi.co, "
-                      "ip-api.com) to find its country."},
+                      "geolocation service (ipwho.is, geojs.io, ipapi.co) "
+                      "to find its country."},
              {"type": "geo_status"},
              {"type": "action", "actions": [
                  ("Test lookup", "geoip_test"),
@@ -34035,14 +36645,92 @@ def _pretty_seq(seq):
                     for p in parts if p)
 
 
+def default_save_dir():
+    """Where Save and Open dialogs start when no export folder is set:
+    the user's Documents folder, else the home folder (crowd test #13:
+    the dialogs opened in the folder MiniWireshark was started from,
+    which was its source checkout). None when neither exists."""
+    home = os.path.expanduser("~")
+    for d in (os.path.join(home, "Documents"), home):
+        if d and d != "~" and os.path.isdir(d):
+            return d
+    return None
+
+
+def person_ids():
+    """(uid, gid, user name, home) of the person a root copy works for
+    (sudo, pkexec, the password prompt), or None when this copy is not
+    root on someone's behalf (Windows, a normal start, a root login)."""
+    if IS_WINDOWS or os.geteuid() != 0:
+        return None
+    uid = _invoking_uid()
+    if not uid:
+        return None
+    name, home, gid = "", "", -1
+    try:
+        import pwd
+        pw = pwd.getpwuid(uid)
+        name, home, gid = pw.pw_name, pw.pw_dir, pw.pw_gid
+    except (ImportError, KeyError):
+        pass
+    with contextlib.suppress(ValueError):
+        gid = int(os.environ.get("SUDO_GID", ""))
+    if gid < 0:
+        return None
+    return uid, gid, name, home
+
+
+def start_for_person(cmd, **kw):
+    """Second audit (security #4): start a program for the person (their
+    browser, file manager or editor) as that person, never as root. A
+    root copy started through sudo or pkexec used to open the browser as
+    root, so a page from any local server ran in a root browser.
+    -> the Popen."""
+    env = env_for_outside(kw.pop("env", None))
+    ids = person_ids()
+    if ids is None:
+        return subprocess.Popen(cmd, env=env, **kw)
+    uid, gid, name, home = ids
+    env.update({"HOME": home or env.get("HOME", "/"),
+                "USER": name or env.get("USER", ""),
+                "LOGNAME": name or env.get("LOGNAME", "")})
+    env.pop("SUDO_COMMAND", None)
+
+    def demote():
+        if name:
+            try:
+                os.initgroups(name, gid)
+            except OSError:
+                os.setgroups([gid])
+        else:
+            os.setgroups([gid])
+        os.setgid(gid)
+        os.setuid(uid)
+    return subprocess.Popen(cmd, env=env, preexec_fn=demote, **kw)
+
+
+def open_in_browser(url, feature, dest, detail=""):
+    """Open `url` in the person's browser, through the outbound() gate
+    (raises OutboundBlocked while the kill switch is on). A root copy
+    opens it as the person (start_for_person). -> True when asked."""
+    outbound(feature, "browser", dest, detail)
+    if person_ids() is not None:
+        start_for_person(["open" if IS_MAC else "xdg-open", url],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        return True
+    import webbrowser
+    return bool(webbrowser.open(url))
+
+
 def _open_path(path):
     try:
         if sys.platform.startswith("win"):
             os.startfile(path)  # type: ignore[attr-defined]
         elif sys.platform == "darwin":
-            subprocess.Popen(["open", path])
+            start_for_person(["open", path])
         else:
-            subprocess.Popen(["xdg-open", path], env=env_for_outside())
+            start_for_person(["xdg-open", path])
         return True
     except Exception as e:                           # noqa: BLE001
         # several "Open folder" buttons ignore the answer: leave a trace
@@ -34080,6 +36768,7 @@ class SettingsWindow:
         self.page_id = page if any(p["id"] == page for p in SETTINGS_PAGES) \
             else "general"
         self.searching = False
+        self.saved_once = False        # Apply or OK pressed in this window
         self.win = tk.Toplevel(app.root)
         self.win.title("Settings")
         sw_, sh_ = app.root.winfo_screenwidth(), app.root.winfo_screenheight()
@@ -34095,6 +36784,9 @@ class SettingsWindow:
         self.show_page(self.page_id)
         self.win.bind("<Escape>", lambda e: self.cancel())
         self.win.protocol("WM_DELETE_WINDOW", self.cancel)
+        # crowd test 5.3.4 #14: the keyboard comes here, so Escape closes
+        # the window (it went on to the main window, which kept it)
+        self.win.after(60, lambda: focus_toplevel(self.win))
         self._tick()
 
     # ---------------------------------------------------------------- state
@@ -34882,8 +37574,11 @@ class SettingsWindow:
                 self.dirty_lbl.configure(text="\u25cf Unsaved changes",
                                          fg=self.t["warn_fg"])
             else:
-                self.dirty_lbl.configure(text="All changes saved",
-                                         fg=self.t["muted_fg"])
+                # "All changes saved" only once something was saved here
+                # (crowd test 5.3.4 #14: it greeted a fresh window)
+                self.dirty_lbl.configure(
+                    text="All changes saved" if self.saved_once
+                    else "No changes yet", fg=self.t["muted_fg"])
             state = ["!disabled"] if (dirty and not bad) else ["disabled"]
             self.apply_btn.state(state)
             self.reset_btn.state(["disabled"] if self.searching
@@ -35076,6 +37771,7 @@ class SettingsWindow:
             v = self._value_of(key)
             self.vars[key].set(v if isinstance(v, bool) else str(v))
         self.baseline = self._snapshot()
+        self.saved_once = True
         after = (self.cfg.get("appearance.theme"),
                  self.cfg.get("appearance.high_contrast"),
                  self.cfg.get("appearance.text_size"))
@@ -35090,13 +37786,24 @@ class SettingsWindow:
     def ok(self):
         if self.apply():
             self.win.destroy()
+            return True
+        return False
 
     def cancel(self):
-        if self.dirty() and not messagebox.askyesno(
-                "Discard changes?", "You have unsaved changes. Close "
-                "without saving?", parent=self.win):
-            return
+        """Close; with unsaved changes, ask what to do with them. Yes
+        saves, No throws them away, Cancel stays (crowd test 5.3.4 #14:
+        "Close without saving?" made Yes the button that loses them)."""
+        if self.dirty():
+            ans = messagebox.askyesnocancel(
+                "Save changes?", "Save your changes before closing?\n\n"
+                "Yes saves them. No closes without saving. Cancel keeps "
+                "this window open.", parent=self.win)
+            if ans is None:
+                return False
+            if ans:
+                return self.ok()
         self.win.destroy()
+        return True
 
 
 
@@ -35443,7 +38150,66 @@ def debounce(widget, fn, ms=150):
             with contextlib.suppress(tk.TclError):
                 widget.after_cancel(job)
         state["job"] = widget.after(ms, fire)
+
+    def cancel():
+        job, state["job"] = state["job"], None
+        if job is not None:
+            with contextlib.suppress(tk.TclError):
+                widget.after_cancel(job)
+    call.cancel = cancel
     return call
+
+
+# 5.3.4 crowd test #2: hyphens, dashes, underscores and spaces don't count
+# in a search, so "wifi" finds "Wi-Fi" and "home nas" finds "home-nas"
+_SEARCH_FOLD = str.maketrans("", "", " -_‐‑‒–—")
+
+
+def search_fold(s):
+    """Lower case, without the characters a search skips."""
+    return (s or "").lower().translate(_SEARCH_FOLD)
+
+
+def search_hit(term, hay, fterm=None):
+    """`term` is in `hay` (both lower case), as typed or folded."""
+    if term in hay:
+        return True
+    fterm = search_fold(term) if fterm is None else fterm
+    return bool(fterm) and fterm in search_fold(hay)
+
+
+def draw_tick_box(img, n, field, edge, tick=None):
+    """An n×n checkbox in `img` (4 clear pixels on its right as the gap
+    before the text): a 1-pixel edge, and a tick ✓ when `tick` is a
+    colour."""
+    img.blank()
+    img.configure(width=n + 4, height=n)
+    img.put(edge, to=(0, 0, n, n))
+    img.put(field, to=(1, 1, n - 1, n - 1))
+    if not tick:
+        return
+    t = max(2, n // 6)
+    pts = ((0.20, 0.50), (0.40, 0.70), (0.80, 0.24))
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+        steps = int(n * 2)
+        for i in range(steps + 1):
+            x = int(round((x0 + (x1 - x0) * i / steps) * n - t / 2))
+            y = int(round((y0 + (y1 - y0) * i / steps) * n - t / 2))
+            x, y = max(2, min(n - 2 - t, x)), max(2, min(n - 2 - t, y))
+            img.put(tick, to=(x, y, x + t, y + t))
+
+
+def focus_toplevel(win, widget=None):
+    """Give a new window the keyboard (Escape, arrows, Enter). Without
+    it the keys kept going to the main window, which still had the
+    focus (crowd test 5.3.4 #1, #14). Returns True when it took."""
+    try:
+        if not win.winfo_exists():
+            return False
+        (widget or win).focus_force()
+        return True
+    except tk.TclError:
+        return False
 
 
 class _Desc:
@@ -36213,7 +38979,7 @@ class TableKit:
             copy_to_clipboard(self.app, self.cell_text(iid, col))
 
     def copy_row(self, iid):
-        copy_to_clipboard(self.app, "\t".join(self.row_cells(iid)))
+        copy_to_clipboard(self.app, safe_tsv_row(self.row_cells(iid)))
 
     def csv_text(self, iids):
         buf = io.StringIO()
@@ -36501,6 +39267,14 @@ class _SafeCsv:
 
 def safe_csv_writer(f):
     return _SafeCsv(f)
+
+
+def safe_tsv_row(cells):
+    """Second audit (security #5): a copied row is pasted into a
+    spreadsheet as cells, so its text cells get the same formula guard
+    as a CSV file (a device or site name from the network could start
+    with "=")."""
+    return "\t".join(str(_SafeCsv.cell(c)) for c in cells)
 
 
 def copy_to_clipboard(app, text):
@@ -36991,8 +39765,12 @@ class Charts:
                 [x if i == 0 or r["fmt"] is None or x == "" else
                  r["fmt"](x) for i, x in enumerate(row)]
                 for row in r["rows"]]
-            lines.append("\t".join(str(h) for h in head))
-            lines += ["\t".join(str(x) for x in row) for row in rows]
+            lines.append(safe_tsv_row(head))
+            # second audit (security #5): the names (first column) come
+            # from the network; numbers stay as they are
+            lines += ["\t".join([str(_SafeCsv.cell(str(row[0])))] +
+                                [str(x) for x in row[1:]])
+                      if row else "" for row in rows]
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
 
@@ -37783,6 +40561,14 @@ class DashboardTab(BaseTab):
     )
     RANGES = {"Last 5 minutes": (1, 300), "Last hour": (10, 360),
               "Last 24 hours": (60, 1440)}
+
+    def window_seconds(self):
+        """The time window picked at the top of the page, in seconds: the
+        charts and the “Who is using the Internet?” answer both use it
+        (5.3.4 crowd test #25: only the charts did, so the card kept
+        saying "in the last 10 min" whatever was picked)."""
+        res, n = self.RANGES.get(self.range_var.get(), (1, 300))
+        return res * n
     # Explain inline: one grey line under each card title
     CARD_EXPLAIN = {
         "internet": "Whether the Internet answers from here, measured "
@@ -37817,8 +40603,8 @@ class DashboardTab(BaseTab):
                           values=list(self.RANGES), width=14,
                           state="readonly")
         cb.pack(side="right")
-        cb.bind("<<ComboboxSelected>>", lambda e: self.refresh(force=True))
-        tk.Label(head, text="Charts:", bg=WHITE, fg="#666666").pack(
+        cb.bind("<<ComboboxSelected>>", lambda e: self._window_changed())
+        tk.Label(head, text="Time window:", bg=WHITE, fg="#666666").pack(
             side="right", padx=6)
         tk.Label(outer, text="A quick overview — click any card to open "
                              "the full picture.", bg=WHITE,
@@ -38003,14 +40789,17 @@ class DashboardTab(BaseTab):
                          bg="#f6f7fa", fg="#2b3a56", font=mw_font(10, "bold"),
                          anchor="w")
         title.pack(side="left")
-        self.unusual_lbl = tk.Label(card, text="…", bg="#f6f7fa",
-                                    fg="#222222", font=mw_font(10),
-                                    anchor="w", justify="left")
-        self.unusual_lbl.pack(side="left", padx=(10, 0), fill="x",
-                              expand=True)
         more = tk.Label(card, text="See both readings ›", bg="#f6f7fa",
                         fg="#0b5394", anchor="e", cursor="hand2")
         more.pack(side="right")
+        # wraps (a longer sentence for open warnings, #4) and leaves the
+        # link its room
+        self.unusual_lbl = tk.Label(card, text="…", bg="#f6f7fa",
+                                    fg="#222222", font=mw_font(10),
+                                    anchor="w", justify="left",
+                                    wraplength=600)
+        self.unusual_lbl.pack(side="left", padx=(10, 0), fill="x",
+                              expand=True)
         for w in (card, title, self.unusual_lbl, more):
             w.bind("<Button-1>", lambda e: self.app.open_unusual())
         card.bind("<Return>", lambda e: self.app.open_unusual())
@@ -38022,7 +40811,9 @@ class DashboardTab(BaseTab):
     def show_unusual_card(self):
         if self.unusual_card is None:
             return ""
-        text = unusual_card_text(len(unusual_findings(self.model.alerts)))
+        eng = self.model.alerts
+        text = unusual_card_text(len(unusual_findings(eng)),
+                                 len(other_open_alerts(eng)))
         with contextlib.suppress(tk.TclError):
             if self.unusual_lbl.cget("text") != translate_text(text):
                 self.unusual_lbl.configure(text=text)
@@ -38124,7 +40915,7 @@ class DashboardTab(BaseTab):
             return
         m, app = self.model, self.app
         if self.story_card is not None:
-            app.request_story()         # a job; at most once a minute
+            app.request_story()   # a job; when the data changed (10 s apart)
             self.show_story_card()
         self.show_unusual_card()
         now = m.now()
@@ -38138,8 +40929,7 @@ class DashboardTab(BaseTab):
         self.vars["up"].set(human_rate(up))
         self.vars["pps"].set(f"{m.metrics.current('packets', now):.0f}")
         c = m.alerts.counts()
-        self.vars["alerts"].set(f"‼ {c['DANGER']}  ⚠ {c['WARNING']}  "
-                                f"ℹ {c['INFO']}")
+        self.vars["alerts"].set(alerts_card_text(c))
         self.vars["capture"].set(app.capture_status_short())
         self.vars["internet"].set(app.internet_status_short())
         self.vars["dns"].set(app.dns_status_short())
@@ -38170,6 +40960,11 @@ class DashboardTab(BaseTab):
             self.state_lbl.configure(bg=bg, fg=fg)
         self._draw_charts(now)
 
+    def _window_changed(self):
+        with contextlib.suppress(Exception):
+            self.app.dashboard_answers(force=True)
+        self.refresh(force=True)
+
     def _draw_charts(self, now):
         c, t, m = self.canvas, self.t, self.model
         try:
@@ -38182,6 +40977,11 @@ class DashboardTab(BaseTab):
         res, n = self.RANGES.get(self.range_var.get(), (1, 300))
         span = res * n
         xl = (f"-{human_duration(span)}", "now")
+        dur = m.metrics.duration(now) if m.metrics.first_ts else 0
+        if 0 < dur < span:
+            # (#25) a one-hour axis over 90 seconds of data says so
+            xl = (xl[0] + " · " + translate_text("%s of data so far") %
+                  human_duration(dur), "now")
         down = [v / res for _b, v in m.metrics.series["bytes_down"].series(
             res, n, now)]
         up = [v / res for _b, v in m.metrics.series["bytes_up"].series(
@@ -38258,6 +41058,7 @@ class DashboardTab(BaseTab):
 # ---- Happening (friendly feed) -------------------------------------------------
 class FeedTab(BaseTab):
     name, label_key = "feed", "tab_feed"
+    ROWS_KEEP = 500               # lines shown
 
     def build(self):
         self.speed = DEFAULT_FEED_SPEED
@@ -38461,8 +41262,11 @@ class FeedTab(BaseTab):
                     self.tree.yview_moveto(self.tree.index(anchor) /
                                            max(1, n))
             kids = self.tree.get_children()
-            if len(kids) > 500:
-                self.tree.delete(*kids[500:])
+            keep = self.ROWS_KEEP
+            if len(kids) > keep:
+                for old in kids[keep:]:
+                    self.kit.removed(old)    # 5.3.4 (memory audit)
+                self.tree.delete(*kids[keep:])
         return cfg["interval"]
 
     @staticmethod
@@ -38515,6 +41319,7 @@ TIMELINE_CATEGORY = {
 
 class TimelineTab(BaseTab):
     name, label_key = "timeline", "tab_timeline"
+    ROWS_KEEP = 1500              # lines shown
     VIEW_VARS = ("search_var", "type_var", "sev_var", "dev_var")
 
     def build(self):
@@ -38771,9 +41576,17 @@ class TimelineTab(BaseTab):
         self._update_status()
         return len(rows)
 
+    def shown_event_count(self):
+        """The events listed now: one source for the counter under the
+        table. 5.3.4 crowd test (#5): the counter counted the table's rows
+        when it was last rebuilt (episode headings included) and was not
+        updated as events arrived, so it said "0 events this session"
+        over a list of events."""
+        return sum(1 for e in self.refs.values() if e is not None)
+
     def _update_status(self):
         hist = self.history_mode()
-        n = len(self.tree.get_children())
+        n = self.shown_event_count()
         if self.story_on():
             st = self.app.story
             with contextlib.suppress(tk.TclError):
@@ -38896,12 +41709,10 @@ class TimelineTab(BaseTab):
             items = [it for it in items if self._story_matches(it)]
             if not items:
                 continue
-            n = len(items)
             with contextlib.suppress(tk.TclError):
                 iid = self.tree.insert(
                     "", "end", tags=("episode",),
-                    values=("", "", tr("1 change") if n == 1 else
-                            tr("%d changes") % n, story_day_label(day)))
+                    values=story_day_row(day, len(items), tr))
                 self.refs[iid] = None
             for it in items:
                 if not marked and not it["fresh"]:
@@ -38947,9 +41758,7 @@ class TimelineTab(BaseTab):
         with contextlib.suppress(tk.TclError):
             iid = self.tree.insert(
                 "", "end", tags=(it["severity"],),
-                values=(f"{icon} {it['severity']}", when,
-                        f"×{it['count']}" if it["count"] > 1 else "",
-                        mark + story_sentence(it)))
+                values=story_item_row(it, icon, when, mark))
             self.refs[iid] = it
 
     def add(self, entries):
@@ -38965,14 +41774,23 @@ class TimelineTab(BaseTab):
         if self.pause_var.get() or self.history_mode():
             return
         cutoff, dev_key, q = self._filters()
+        # (#5) a rebuild that ran before this batch arrived already listed
+        # it (it reads the model's timeline): those events are not added
+        # a second time
+        have = {id(v) for v in self.refs.values() if v is not None}
         for e in entries:
-            if self._matches(e, cutoff, dev_key, q):
+            if id(e) not in have and self._matches(e, cutoff, dev_key, q):
                 self._insert(e, index=0)
         kids = self.tree.get_children()
-        if len(kids) > 1500:
-            for old in kids[1500:]:
+        keep = self.ROWS_KEEP
+        if len(kids) > keep:
+            for old in kids[keep:]:
                 self.refs.pop(old, None)
-            self.tree.delete(*kids[1500:])
+                # 5.3.4 (memory audit): a sorted table kept each
+                # deleted row's sort entry
+                self.kit.removed(old)
+            self.tree.delete(*kids[keep:])
+        self._update_status()
         self.kit.empty_soon()
 
     def _insert(self, e, index="end"):
@@ -39017,9 +41835,9 @@ class TimelineTab(BaseTab):
         rows = [e for e in self.model.timeline
                 if self._matches(e, cutoff, dev_key, q)]
         if self.episodes_var.get():
-            self._insert_episodes(rows[-1500:])
+            self._insert_episodes(rows[-self.ROWS_KEEP:])
         else:
-            for i, e in enumerate(reversed(rows[-1500:])):
+            for i, e in enumerate(reversed(rows[-self.ROWS_KEEP:])):
                 if i and i % 300 == 0:
                     yield
                     if self._fill_gen != my:
@@ -39165,11 +41983,10 @@ class DevicesTab(BaseTab):
             ("tags", "Place / owner", 130, "w", True)]
 
     def build(self):
-        self.header("🏠  The devices on your local network. Confidence shows "
-                    "how much local evidence supports each one — an IP "
-                    "address alone is never enough to count as a device.",
-                    "Double-click a device for details, or right-click for "
-                    "actions (rename, mark as yours, merge…).")
+        self.header("🏠  The devices on your local network. Device evidence "
+                    "shows how sure it is that each one is a real device — "
+                    "an IP address alone is never enough to count as a "
+                    "device.", device_scales_key())
         bar = self.toolbar()
         self.show_inactive_var = tk.BooleanVar(
             value=self.app.config.get("devices.show_inactive", False))
@@ -39190,8 +42007,10 @@ class DevicesTab(BaseTab):
         fe.bind("<KeyRelease>", lambda e: self._filter_soon())
         ttk.Button(bar, text="Merge devices…",
                    command=self.merge_dialog).pack(side="right")
-        ttk.Button(bar, text="Details", command=self._details).pack(
-            side="right", padx=6)
+        det = ttk.Button(bar, text="Details", command=self._details)
+        det.pack(side="right", padx=6)
+        Tooltip(det, "Double-click a device for details, or right-click for "
+                     "actions (rename, mark as yours, merge…).")
         self.count_lbl = self.lbl(bar, "", muted=True)
         self.count_lbl.pack(side="right", padx=10)
         # 5.3.4 (M17, S3): scrolls sideways, so no heading is ever cut
@@ -39221,7 +42040,7 @@ class DevicesTab(BaseTab):
         if d is None:
             return ""
         tr_ = translate_text
-        return (f"{tr_(d.confidence)} {tr_('confidence')}: "
+        return (f"{tr_('Device evidence')} {tr_(d.confidence)}: "
                 f"{tr_(explain('confidence', d.confidence))}   ·   "
                 f"{tr_(explain('state', d.state, long=False))}: "
                 f"{tr_(explain('state', d.state))}")
@@ -39478,8 +42297,32 @@ class WebsitesTab(BaseTab):
             ("ips", "Server IPs", 160, "w", False)]
     SORTS = ("Most contacted", "Most traffic", "Recently seen",
              "First seen")
+    SUBVIEWS = ("Websites", "Local services")
 
     def build(self):
+        # 5.3.4: a second sub-view, Local services: what listens on this
+        # computer (localhost), with the address to open web apps
+        outer = self.frame
+        views = self.make_subviews(list(self.SUBVIEWS),
+                                   on_switch=self._on_subview)
+        self.frame = views["Websites"]
+        try:
+            self._build_websites()
+        finally:
+            self.frame = outer
+        self.local = LocalServicesView(self, views["Local services"])
+
+    def _on_subview(self, name):
+        if name == "Local services":
+            self.local.shown()
+        elif self._dirty:
+            self.rebuild()
+
+    def _show_websites(self):
+        if getattr(self, "subview", "Websites") != "Websites":
+            self.show_subview("Websites")
+
+    def _build_websites(self):
         self.header("🌍  Websites and online services your devices looked up "
                     "or connected to.",
                     "For secure (https) sites MiniWireshark sees only the "
@@ -39643,6 +42486,7 @@ class WebsitesTab(BaseTab):
         self._job = self.frame.after(350, self.rebuild)
 
     def set_filter(self, text):
+        self._show_websites()
         self.q_var.set(text or "")
         self.rebuild()
 
@@ -39687,7 +42531,7 @@ class WebsitesTab(BaseTab):
         return w.best_assoc
 
     def _values(self, w):
-        who = ", ".join(self.app.short_device_name(k)
+        who = ", ".join(translate_cell(self.app.short_device_name(k))
                         for k in sorted(w.devices)[:3]) or "—"
         if len(w.devices) > 3:
             who += f" +{len(w.devices) - 3}"
@@ -39789,7 +42633,7 @@ class WebsitesTab(BaseTab):
                                              else ("\U0001F512 Encrypted"
                                                    if enc else "Unknown"))
         cats = {w.category for w in members if w.category}
-        who = ", ".join(self.app.short_device_name(k)
+        who = ", ".join(translate_cell(self.app.short_device_name(k))
                         for k in sorted(devs)[:3]) or "—"
         b = sum(w.bytes for w in members)
         best = ""
@@ -39829,6 +42673,10 @@ class WebsitesTab(BaseTab):
                 self.kit.updated(iid, key, vals)
 
     def refresh(self):
+        if self.subview == "Local services":
+            if self.is_visible():
+                self.local.tick()
+            return
         if self._dirty and self.is_visible() and self._job is None:
             self._job = self.frame.after(10, self.rebuild)
 
@@ -39849,6 +42697,7 @@ class WebsitesTab(BaseTab):
         return self.kit._right_click(event)
 
     def select(self, dom):
+        self._show_websites()
         self.q_var.set("")
         if dom not in self.key_to_iid:
             self.rebuild()
@@ -40177,7 +43026,10 @@ class ConnectionsTab(BaseTab):
                 f = self.model.flows.get(fid)
                 iid = self.iids.get(fid)
                 if f is None or iid is None:
-                    if f is not None and self._match(f, dev_key, q):
+                    # 5.3.4 (memory audit): a row of a connection the
+                    # model let go goes with the next regrouping
+                    if (f is None) != (iid is None) and (
+                            f is None or self._match(f, dev_key, q)):
                         self._group_dirty = True
                     continue
                 with contextlib.suppress(tk.TclError):
@@ -40495,6 +43347,377 @@ class MailView:
         self._version = -1
 
 
+class LocalServicesView:
+    """Websites → Local services (5.3.4): the services listening on this
+    computer (localhost), from the same connection table as the Security
+    tab (psutil). Each row says what the program probably is and whether
+    other devices can reach it; a web app opens in the browser at
+    127.0.0.1, through the outbound() gate. Reading the list sends
+    nothing."""
+
+    COLS = [("port", "Port", 60, "e", False),
+            ("proto", "Protocol", 76, "w", False),
+            ("what", "What it probably is", 200, "w", True),
+            ("safety", "Who can reach it", 250, "w", True),
+            ("program", "Program", 160, "w", True),
+            ("listens", "Listens on", 200, "w", True)]
+    POLL_MS = 150
+    READ_TIMEOUT = 8.0           # s: give up waiting for one read
+    AUTO_EVERY = 15.0            # s: read again while shown, not watching
+
+    def __init__(self, tab, frame):
+        self.tab, self.app, self.frame = tab, tab.app, frame
+        self.rows = []
+        self.iid_row = {}
+        self.source = None       # tests: () -> (state, listening)
+        self.state = "unread"
+        self._sig = None
+        self._seen_seq = None
+        self._seen_demo = False
+        self._poll_job = None
+        self._reading_until = 0.0
+        self._auto_at = 0.0
+        self._os_pm = None       # without psutil: OsListenMap
+        # (port, program, host) -> probe_local_http's answer, or None
+        # (being asked, or couldn't be): each port is asked once, again
+        # only on Refresh
+        self.probes = {}
+        self._probe_seq = self._probe_seen = 0
+        top = tk.Frame(frame, bg=WHITE, padx=12, pady=8)
+        top.pack(fill="x")
+        self.head_lbl = tk.Label(top, text="\U0001F5A5  Local services — programs on this "
+                 "computer that wait for connections. Most are normal: "
+                 "development tools, printing, file sharing.",
+                 bg=WHITE, fg="#333333", wraplength=1000, justify="left",
+                 font=mw_font(11))
+        self.head_lbl.pack(anchor="w")
+        sub = tk.Label(top, text="“This computer only” can't be reached "
+                       "from other devices. “The whole network” can, "
+                       "unless a firewall blocks it. Double-click a web "
+                       "app to open it in your browser.", bg=WHITE,
+                       fg="#666666", wraplength=1000, justify="left",
+                       font=mw_font(9))
+        sub.pack(anchor="w", pady=(2, 0))
+        # in a short window (large text, 768 pixels) the explanation steps
+        # aside for the table, as in every tab (BaseTab._fit_header)
+        self._head = (frame, top, sub)
+        for w in (frame, top):
+            w.bind("<Configure>", lambda _e=None: BaseTab._fit_header(self),
+                   add="+")
+        bar = tk.Frame(frame, bg=WHITE, padx=12)
+        bar.pack(fill="x", pady=(0, 6))
+        self.refresh_btn = ttk.Button(
+            bar, text="Refresh", command=lambda: self.reload(reprobe=True))
+        self.refresh_btn.pack(side="left")
+        self.open_btn = ttk.Button(bar, text="Open in browser",
+                                   command=self.open_selected,
+                                   state="disabled")
+        self.open_btn.pack(side="left", padx=(6, 0))
+        self.count_lbl = tk.Label(bar, text="", bg=WHITE, fg="#666666")
+        self.count_lbl.pack(side="right")
+        # shown only when some programs couldn't be named or listed
+        self.note_lbl = tk.Label(frame, text="", bg=WHITE, fg="#8a5a00",
+                                 wraplength=1000, justify="left",
+                                 anchor="w", padx=12, font=mw_font(9))
+        wrap, self.tree = make_tree(frame, self.COLS, hscroll=True)
+        wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.wrap = wrap
+        self.tree.bind("<Double-1>", self._double)
+        self.tree.bind("<Return>", self._double)
+        self.tree.bind("<<TreeviewSelect>>",
+                       lambda e: self._sync_buttons(), add="+")
+        self.kit = TableKit(
+            tab, self.tree, wrap, "local_services",
+            key_of=lambda iid: self._key(self.iid_row.get(iid)),
+            empty_state=self.empty_state,
+            sort_values={"port": lambda k: k[1] if k else None},
+            menu=self.menu_spec)
+
+    @staticmethod
+    def _key(r):
+        return (r["proto"], r["port"], r["program"]) if r else None
+
+    # ---- reading ----------------------------------------------------------
+    def demo(self):
+        return getattr(self.app, "data_mode", "") == "demo"
+
+    def _pm(self):
+        """psutil's connection table, or without psutil the operating
+        system's own tools (OsListenMap)."""
+        pm = self.app.procmap
+        if pm.available:
+            return pm
+        if self._os_pm is None:
+            self._os_pm = OsListenMap()
+        return self._os_pm
+
+    def snapshot(self):
+        if self.source is not None:
+            return self.source()
+        if self.demo():
+            return "ok", dict(DEMO_LOCAL_LISTENERS)
+        return local_services_state(self._pm())
+
+    def reading(self):
+        return self.source is None and not self.demo() and \
+            time.time() < self._reading_until and self._pm().busy
+
+    def shown(self):
+        """The sub-view was opened: show what is known and read the list
+        again when it is old."""
+        pm = self._pm()
+        if self.source is None and not self.demo() and pm.available and \
+                time.time() - pm.at > self.AUTO_EVERY:
+            self.reload()
+        else:
+            self.refresh(force=True)
+
+    def tick(self):
+        """While shown (the tab's refresh): new rows when the table was
+        read again; read it again now and then when not watching live
+        (live capture reads it every few seconds anyway)."""
+        pm = self._pm()
+        now = time.time()
+        if self.source is None and pm.available and \
+                (self.app.data_mode != "live" or
+                 pm is not self.app.procmap) and \
+                self.app.data_mode != "demo" and \
+                not pm.busy and self._poll_job is None and \
+                now - pm.at > self.AUTO_EVERY and \
+                now - self._auto_at > self.AUTO_EVERY:
+            self._auto_at = now        # a read that fails is not retried
+            self.reload()              # on every tick
+            return
+        if (pm.seq != self._seen_seq or self.demo() != self._seen_demo or
+                self._probe_seq != self._probe_seen) and \
+                self._poll_job is None:
+            self.refresh()
+
+    def reload(self, reprobe=False):
+        """Refresh: read the connection table again (in the background)
+        and show it when the read is done. One wait at a time. `reprobe`
+        (the Refresh button): ask every web port again."""
+        if reprobe:
+            self.probes = {}
+        pm = self._pm()
+        if self.source is None and pm.available and not self.demo():
+            pm.refresh(force=True)
+            self._reading_until = time.time() + self.READ_TIMEOUT
+            self._cancel_poll()
+            self._poll_job = self.frame.after(self.POLL_MS, self._poll)
+        self.refresh(force=True)
+
+    def _cancel_poll(self):
+        if self._poll_job is not None:
+            with contextlib.suppress(tk.TclError):
+                self.frame.after_cancel(self._poll_job)
+            self._poll_job = None
+
+    def _poll(self):
+        self._poll_job = None
+        if self.reading():
+            self._poll_job = self.frame.after(self.POLL_MS, self._poll)
+            return
+        self._reading_until = 0.0
+        self.refresh(force=True)
+
+    # ---- the table --------------------------------------------------------
+    def refresh(self, force=False):
+        state, listening = self.snapshot()
+        pm = self._pm()
+        self._seen_seq, self._probe_seen = pm.seq, self._probe_seq
+        self._seen_demo = demo = self.demo()
+        # Demo Mode's made-up services are never this computer's
+        own = () if demo else local_own_addresses(self.app)
+        rows = local_service_rows(listening, own, self.probes) \
+            if state == "ok" else []
+        self._start_probes(rows, own)
+        partial = state == "ok" and self.source is None and not demo and \
+            bool(pm.needs_admin)
+        sig = (CURRENT_LOCALE, state, self.reading(), partial, demo,
+               tuple((self._key(r), r["addrs"], r["url"], r["title"])
+                     for r in rows))
+        if sig == self._sig and not force:
+            return False
+        self._sig, self.state, self.rows = sig, state, rows
+        tree = self.tree
+        try:
+            sel = tree.selection()
+            want = self._key(self.iid_row.get(sel[0])) if sel else None
+            tree.delete(*tree.get_children())
+        except tk.TclError:
+            return False
+        self.iid_row.clear()
+        self.kit.clear()
+        pick = None
+        for r in rows:
+            key = self._key(r)
+            vals = self.kit.decorate(key, local_service_cells(r))
+            idx, slot = self.kit.insert_index("", key, vals)
+            iid = tree.insert("", idx, values=vals)
+            self.iid_row[iid] = r
+            self.kit.inserted("", iid, slot, key)
+            if key == want:
+                pick = iid
+        with contextlib.suppress(tk.TclError):
+            if pick is not None:
+                tree.selection_set(pick)
+                tree.see(pick)
+            n_net = sum(1 for r in rows if r["network"])
+            text = translate_text(plural(len(rows), "service")) \
+                if rows else ""
+            if n_net:
+                text += "  ·  " + translate_text(
+                    "%d reachable from the network") % n_net
+            self.count_lbl.configure(text=text)
+            if partial:
+                self.note_lbl.configure(text=(
+                    "Some programs couldn't be named or listed without "
+                    "administrator rights."))
+                if not self.note_lbl.winfo_manager():
+                    self.note_lbl.pack(fill="x", pady=(0, 4),
+                                       before=self.wrap)
+            elif self.note_lbl.winfo_manager():
+                self.note_lbl.pack_forget()
+        self._sync_buttons()
+        self.kit.empty_soon()
+        return True
+
+    def _start_probes(self, rows, own):
+        """Ask the ports not asked yet "GET /" in the background (at most 8
+        at a time); the table shows the answers when they are in. Not
+        for fixture rows, nor in Demo Mode (it sends nothing)."""
+        if self.source is not None or \
+                getattr(self.app, "data_mode", "") == "demo":
+            return False
+        todo = [r["probe"] for r in rows
+                if r["probe"] and r["probe"] not in self.probes]
+        if not todo:
+            return False
+        probes = self.probes          # Refresh starts a new one
+
+        def one(k):
+            port, _prog, host = k
+            try:
+                probes[k] = probe_local_http(host, port, own)
+            except (OSError, ValueError):            # the kill switch too
+                pass
+
+        def work():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(
+                    8, thread_name_prefix="local-probe") as ex:
+                list(ex.map(one, todo))
+            self._probe_seq += 1
+        for k in todo:
+            probes[k] = None
+        if start_one("local-probe", work):
+            return True
+        for k in todo:                # one is running: asked after it
+            probes.pop(k, None)
+        return False
+
+    def empty_state(self):
+        if self.reading():
+            return ("Reading the list of services on this computer…",
+                    None, None)
+        if self.state == "unavailable":
+            return ("The list of services needs the optional psutil "
+                    "component (Settings → Repair).", None, None)
+        if self.state == "denied":
+            return ("This computer didn't let MiniWireshark read the list "
+                    "of services without administrator rights.",
+                    "Refresh", self.reload)
+        if self.state == "unread":
+            return ("The list of services hasn't been read yet.",
+                    "Refresh", self.reload)
+        return ("No services are listening on this computer.", "Refresh",
+                self.reload)
+
+    def selected_row(self):
+        with contextlib.suppress(tk.TclError):
+            sel = self.tree.selection()
+            if sel:
+                return self.iid_row.get(sel[0])
+        return None
+
+    def _sync_buttons(self):
+        r = self.selected_row()
+        with contextlib.suppress(tk.TclError):
+            self.open_btn.configure(
+                state="normal" if r is not None and r["url"] else "disabled")
+
+    def menu_spec(self, key):
+        r = next((x for x in self.rows if self._key(x) == key), None)
+        if r is None:
+            return {}
+        app = self.app
+        spec = {"copy": [("Copy port", lambda: copy_to_clipboard(
+            app, str(r["port"])))]}
+        if r["url"]:
+            spec["open"] = lambda: self.open_service(r)
+            spec["copy"].append(("Copy address", lambda: copy_to_clipboard(
+                app, r["url"])))
+            spec["own"] = [("Open in browser",
+                            lambda: self.open_service(r))]
+        return spec
+
+    def _double(self, _e=None):
+        r = self.selected_row()
+        if r is not None:
+            self.open_service(r)
+        return "break"
+
+    def open_selected(self):
+        r = self.selected_row()
+        return self.open_service(r) if r is not None else False
+
+    def open_service(self, r):
+        """Open a web app of this computer in the browser: only a TCP
+        service that is likely a web page, only at 127.0.0.1 (or ::1, or
+        an own address of this computer it alone is bound to), and
+        through the outbound() gate, so the ledger lists it and the kill
+        switch stops it. -> True when the browser was asked to open it."""
+        tt = translate_text
+        url = r.get("url") if r else None
+        if not url or not local_url_ok(url, local_own_addresses(self.app)):
+            self.app._set_banner(tt(
+                "This service doesn't look like a web page, so it isn't "
+                "opened in the browser."), "info")
+            return False
+        if LocalServicesView.demo(self):
+            # a made-up service: the same port on this computer is
+            # something else, or nothing
+            self.app._set_banner(tt(
+                "Demo Mode: this service is made up, so nothing is "
+                "opened."), "info")
+            return False
+        parts = urllib.parse.urlsplit(url)
+        try:
+            # second audit (security #4): as the person, never as root
+            ok = open_in_browser(url, "local_open",
+                                 f"{parts.hostname}:{parts.port}",
+                                 "a service on this computer")
+        except OutboundBlocked:
+            self.app._set_banner(
+                tt("Not opened: the kill switch is on.") + " " +
+                tt("To open it yourself, type this address in your "
+                   "browser:") + " " + url, "warn")
+            return False
+        except Exception as e:                       # noqa: BLE001
+            LOG.warning("couldn't open the browser on %s: %s", url, e)
+            ok = False
+        if not ok:
+            self.app._set_banner(
+                tt("The browser couldn't be opened.") + " " +
+                tt("To open it yourself, type this address in your "
+                   "browser:") + " " + url, "warn")
+        return ok
+
+    def on_locale(self):
+        self.refresh(force=True)
+
+
 # ---- Remote hosts (Advanced) -------------------------------------------------
 class RemoteTab(BaseTab):
     name, label_key, advanced = "remote", "tab_remote", True
@@ -40608,7 +43831,7 @@ class RemoteTab(BaseTab):
 
     def values(self, r):
         app = self.app
-        who = ", ".join(app.short_device_name(k)
+        who = ", ".join(translate_cell(app.short_device_name(k))
                         for k in sorted(r.devices)[:3]) or "—"
         names = host_label(r, bool(self.model.dns.encrypted_seen))
         if len(r.domains) > 1:
@@ -40634,6 +43857,25 @@ class RemoteTab(BaseTab):
                 continue
             tree_upsert(self.tree, self.iids, ip, self.values(r),
                         kit=self.kit)
+        self._trim_rows()
+
+    ROWS_KEEP = 5000              # as many as a rebuild shows
+
+    def _trim_rows(self):
+        """5.3.4 (memory audit): while the tab stayed open every new
+        address added a row, and an address the model had let go (past
+        its cap) kept its row: the table only grew. Past ROWS_KEEP the
+        rows of forgotten addresses go, then the smallest."""
+        if len(self.iids) <= self.ROWS_KEEP:
+            return
+        hosts = self.model.remote_hosts
+        gone = [ip for ip in self.iids if ip not in hosts]
+        extra = len(self.iids) - len(gone) - self.ROWS_KEEP
+        if extra > 0:
+            gone += sorted((ip for ip in self.iids if ip in hosts),
+                           key=lambda ip: hosts[ip].bytes_total)[:extra]
+        for ip in gone:
+            tree_remove(self.tree, self.iids, ip, kit=self.kit)
 
     def refresh(self):
         self.status_var.set(self.app._geoip_status_text())
@@ -40652,7 +43894,7 @@ class RemoteTab(BaseTab):
         self.kit.clear()
         recs = sorted(self.model.remote_hosts.values(),
                       key=lambda r: -r.bytes_total)
-        for i, r in enumerate(recs[:5000]):
+        for i, r in enumerate(recs[:self.ROWS_KEEP]):
             if i and i % 200 == 0:
                 yield
                 if self._fill_gen != my:
@@ -40898,6 +44140,13 @@ class AlertsTab(BaseTab):
         tags = ("ack",) if a.acknowledged else (a.severity,)
         tree_upsert(self.tree, self.iids, a.id, self.values(a), tags=tags,
                     index=0, kit=self.kit)
+        known = self.model.alerts.alerts
+        if len(self.iids) > len(known) + max(1, self.model.alerts.KEEP // 10):
+            # 5.3.4 (memory audit): the engine keeps its newest 500
+            # alerts; the rows of the ones it let go stayed. They go once
+            # there are 50 of them (a tenth of the cap)
+            for aid in [k for k in self.iids if k not in known]:
+                tree_remove(self.tree, self.iids, aid, kit=self.kit)
         self.review_soon()
 
     def review_soon(self):
@@ -41015,7 +44264,8 @@ class AlertsTab(BaseTab):
 # ---- Network map v2 ----------------------------------------------------------
 class MapTab(BaseTab):
     name, label_key = "map", "tab_map"
-    LEGEND = ("Letters = confidence (H M L ?) · hollow = offline · ─ seen "
+    LEGEND = ("Letter on a device = how sure it is real: H high, M "
+              "medium, L low, ? unconfirmed · hollow = offline · ─ seen "
               "(switch said so) · ┄ logical (inferred) · ★ new this hour "
               "· red ring = open alert · drag a device to place it")
 
@@ -41387,9 +44637,15 @@ class MapTab(BaseTab):
         # the note goes in the legend line under the map (on the canvas
         # it landed on a node in French)
         with contextlib.suppress(tk.TclError, AttributeError):
-            self.legend_lbl.configure(text=translate_text(self.LEGEND) + (
+            src = self.LEGEND + ("  ·  ★ not shown: most devices are new "
+                                 "this hour" if hide else "")
+            shown = translate_text(self.LEGEND) + (
                 "  ·  " + translate_text("★ not shown: most devices are new "
-                                         "this hour") if hide else ""))
+                                         "this hour") if hide else "")
+            self.legend_lbl.configure(text=shown)
+            # given translated: remember the English, or a switch back to
+            # English left the legend in Spanish (Windows CI)
+            _i18n_remember(self.legend_lbl, shown, src)
         if not stars or hide:
             return
         for X, Y, R, key in stars:
@@ -41897,6 +45153,13 @@ def likely_culprit(results):
     return bad[0]
 
 
+# the checks the overall verdict needs before it says "Healthy" (#7), and
+# the measured symptoms that make a cause the "likely culprit" (#8)
+HEALTH_CORE_CHECKS = ("wifi", "gateway", "internet", "dns")
+HEALTH_SLOW_SIGNS = ("gateway", "internet", "dns", "loss", "latency",
+                     "retrans", "resets", "reconnects")
+
+
 class HealthTab(BaseTab):
     name, label_key = "health", "tab_health"
     CHECKS = (("overall", "Overall"), ("wifi", "Wi-Fi signal (this "
@@ -41926,6 +45189,9 @@ class HealthTab(BaseTab):
         self.run_btn = ttk.Button(head, text="Run checks now",
                                   command=self.app.run_health_checks)
         self.run_btn.pack(side="right")
+        self.run_tip = Tooltip(self.run_btn, "Check the router, DNS and the "
+                                             "Internet now (a few tiny test "
+                                             "connections).")
         ttk.Button(head, text="\U0001F50E Why is it slow?",
                    command=lambda: self.app.investigate("slow")).pack(
             side="right", padx=6)
@@ -41945,9 +45211,10 @@ class HealthTab(BaseTab):
         self.fold_btn.pack(side="right")
         self._fold_sig = None
         self.note_var = DisplayVar()
-        tk.Label(outer, textvariable=self.note_var, bg=WHITE, fg="#666666",
-                 justify="left", anchor="w", wraplength=1100).pack(
-            fill="x", pady=(2, 8))
+        self.note_lbl = tk.Label(outer, textvariable=self.note_var, bg=WHITE,
+                                 fg="#666666", justify="left", anchor="w",
+                                 wraplength=1100)
+        self.note_lbl.pack(fill="x", pady=(2, 8))
         body = tk.Frame(outer, bg=WHITE)
         body.pack(fill="both", expand=True)
         # the right-hand panel keeps its width and scrolls on a short
@@ -42213,6 +45480,7 @@ class HealthTab(BaseTab):
                     "Needs attention": ("✖ Needs attention",
                                         "danger_fg"),
                     "Unknown": ("? Unknown", "muted_fg"),
+                    "Partly checked": ("◐ Partly checked", "muted_fg"),
                     "Info": ("ℹ Info", "info_fg")}
 
     def refresh(self):
@@ -42232,12 +45500,24 @@ class HealthTab(BaseTab):
             with contextlib.suppress(tk.TclError):
                 st.configure(text=label, fg=self.t[tok])
                 ex.configure(text=text)
-        self.note_var.set(app.health_note())
+        note = app.health_note()
+        if note != getattr(self, "_note_was", None):
+            self._note_was = note
+            self.note_var.set(note)
+            # a new text at the same width brings no <Configure>: wrap it
+            # now (a longer French note was cut at 1326 pixels)
+            with contextlib.suppress(tk.TclError):
+                self.note_lbl.update_idletasks()
+                _autowrap(_WrapEvent(self.note_lbl))
         self.info_var.set(app.connection_info_text())
         self.show_calls()
-        allowed = app.health_checks_allowed()
+        why = app.health_checks_blocked()
         with contextlib.suppress(tk.TclError):
-            self.run_btn.state(["!disabled"] if allowed else ["disabled"])
+            self.run_btn.state(["disabled"] if why else ["!disabled"])
+        # (#17) a greyed button says why when pointed at
+        self.run_tip.set_text(translate_text(why) if why else translate_text(
+            "Check the router, DNS and the Internet now (a few tiny test "
+            "connections)."))
         sel = self.dns_tree.selection()
         keep = self.dns_tree.set(sel[0], "srv") if sel else None
         self.dns_tree.delete(*self.dns_tree.get_children())
@@ -42264,7 +45544,7 @@ class HealthTab(BaseTab):
 #  the innocent one side by side, what was seen, and one next step.
 UNUSUAL_KINDS = ("upload_spike", "download_spike", "many_destinations",
                  "many_connections", "chatty_device", "unusual_service",
-                 "new_country")
+                 "new_country", "night_upload", "beacon")
 UNUSUAL_PROBLEM = {
     "upload_spike": "A program you don't know may be sending data out "
                     "from this device.",
@@ -42280,6 +45560,10 @@ UNUSUAL_PROBLEM = {
                        "software was changed without you.",
     "new_country": "The device may be talking to a server it has no "
                    "reason to use.",
+    "night_upload": "Something on this device may be sending your files "
+                    "out while nobody uses it.",
+    "beacon": "A program on this device may be checking in with someone "
+              "else's server for orders.",
 }
 UNUSUAL_STEP = {
     "upload_spike": "Check what the device was doing at that time (backup, "
@@ -42296,6 +45580,10 @@ UNUSUAL_STEP = {
                        "if nothing changed.",
     "new_country": "Open the device and look at the remote hosts it "
                    "contacted.",
+    "night_upload": "Check whether the device was backing up then; if not, "
+                    "look at which program sent the data.",
+    "beacon": "Look up the server; if you don't know it, see which program "
+              "on the device makes the connections.",
 }
 
 
@@ -42305,8 +45593,9 @@ def unusual_findings(engine, limit=None):
     out = []
     for aid in list(engine.order):
         a = engine.alerts.get(aid)
-        if a is None or a.acknowledged or a.kind not in UNUSUAL_KINDS:
-            continue
+        if a is None or a.acknowledged or a.kind not in UNUSUAL_KINDS or \
+                a.refs.get("explained"):
+            continue          # second audit (#38): a backup said as one
         out.append({
             "id": a.id, "kind": a.kind, "severity": a.severity,
             "title": a.reason, "saw": a.observed,
@@ -42322,9 +45611,33 @@ def unusual_findings(engine, limit=None):
     return out
 
 
-def unusual_card_text(n):
-    """The Dashboard card's sentence."""
+def other_open_alerts(engine):
+    """The open WARNING and DANGER alerts that are not a statistical
+    judgment (an open remote-access service, a protocol without
+    encryption…), newest first. 5.3.4 crowd test (#4): the Dashboard
+    card, the Security section and the check-up each decided on their own
+    whether these count, and two said "Nothing unusual right now" over
+    open warnings in the Alerts tab. All three ask here now."""
+    out = []
+    for aid in list(engine.order):
+        a = engine.alerts.get(aid)
+        if a is None or a.acknowledged or a.kind in UNUSUAL_KINDS or \
+                a.severity not in ("WARNING", "DANGER"):
+            continue
+        out.append(a)
+    return out
+
+
+def unusual_card_text(n, others=0):
+    """The Dashboard card's sentence. `others`: open warnings that are
+    not about unusual behaviour; "Nothing unusual" is never said over
+    them."""
     if not n:
+        if others == 1:
+            return "No unusual behaviour, but 1 open warning needs a look."
+        if others:
+            return (f"No unusual behaviour, but {others} open warnings "
+                    f"need a look.")
         return "Nothing unusual right now."
     if n == 1:
         return "1 thing is unusual: see both readings."
@@ -42368,9 +45681,10 @@ class UnusualSection:
 
     def refresh(self, force=False):
         found = self.findings()
+        others = len(other_open_alerts(self.app.model.alerts))
         # 5.3.4: the language is part of it: "What we saw: …" is put
         # together already translated, so a switch must rebuild the cards
-        sig = (CURRENT_LOCALE, id(self.app.model), len(found),
+        sig = (CURRENT_LOCALE, id(self.app.model), len(found), others,
                tuple((f["id"], f["count"]) for f in found[:self.SHOW]))
         if sig == self._sig and not force:
             return found
@@ -42380,10 +45694,21 @@ class UnusualSection:
         self.cards, self._wrap = [], []
         with contextlib.suppress(tk.TclError):
             self.count_lbl.configure(text=(
+                "no unusual behaviour" if not found and others else
                 "nothing to look at" if not found else
                 "1 finding" if len(found) == 1 else
                 f"{len(found)} findings"))
-        if not found:
+        if not found and others:
+            # (#4) not "Nothing unusual" over open warnings
+            lbl = tk.Label(self.body, text=(
+                "⚠  " + translate_text(unusual_card_text(0, others)) +
+                " " + translate_text("They are in the Alerts tab.")),
+                bg=self.SECTION_BG, fg="#8a5a00", anchor="w",
+                justify="left", cursor="hand2")
+            lbl.pack(fill="x")
+            lbl.bind("<Button-1>", lambda e: self.app._select_tab("alerts"))
+            self._wrap.append((lbl, 1.0))
+        elif not found:
             lbl = tk.Label(self.body, text="✔  Nothing unusual right now. "
                                            "Each device is compared with "
                                            "what it usually does.",
@@ -44125,6 +47450,9 @@ class PacketsTab(BaseTab):
         self.tree.bind("<Configure>", lambda e: self.render(), add="+")
         bottom = tk.Frame(vert, bg=WHITE)
         vert.add(bottom, weight=2)
+        self.detail_bottom = bottom
+        vert.bind("<Configure>", lambda e: self._details_room_soon(),
+                  add="+")
         nb = ttk.Notebook(bottom)
         nb.pack(fill="both", expand=True)
         tf = tk.Frame(nb, bg=WHITE)
@@ -44233,6 +47561,59 @@ class PacketsTab(BaseTab):
             self.app.config.set("appearance.panes", panes)
             self.app.config.save()
 
+    def details_room(self):
+        """(pixels the details part needs, pixels the list needs): four
+        lines of packet details under the tab and column headings, and
+        three rows of packets."""
+        try:
+            line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        except tk.TclError:
+            line = 16
+        rowh = max(line + 4, self._row_height() or 0)
+        # the list's own part: its heading, three rows, and what sits
+        # around the table (the horizontal scroll bar, borders). Guessing
+        # the heading as one line and leaving the bar out kept one row
+        # on Windows, where both are taller.
+        head = self.head_h or line + 8
+        extra = 20
+        with contextlib.suppress(tk.TclError, AttributeError):
+            # the bar's asked-for height stays put while the panes move
+            bars = [w for w in self.tree.master.winfo_children()
+                    if isinstance(w, ttk.Scrollbar) and
+                    str(w.cget("orient")) == "horizontal"]
+            if bars:
+                extra = bars[0].winfo_reqheight() + 4
+        return 4 * rowh + 2 * line + 30, head + 3 * rowh + extra + 4
+
+    def _details_room_soon(self):
+        if getattr(self, "_room_job", None):
+            return
+        with contextlib.suppress(tk.TclError):
+            self._room_job = self.frame.after_idle(self._keep_details_room)
+
+    def _keep_details_room(self):
+        """5.3.4 crowd test #12: the packet details collapsed to their
+        "Field / Value" heading in a short window (the list took nearly
+        all of the height, and a saved divider could leave less), so the
+        details had to be dug out with a thin divider. The divider now
+        leaves the details room whenever the window is tall
+        enough for both (four lines; three rows of packets stay)."""
+        self._room_job = None
+        vert = self.vert_pane
+        try:
+            total = vert.winfo_height()
+            if total <= 40:
+                return
+            need, keep = self.details_room()
+            pos = vert.sashpos(0)
+            if total - pos >= need or total < keep + 40:
+                # too short for three rows and the details: the packet
+                # list comes first (halving it left one row on Windows)
+                return
+            vert.sashpos(0, max(keep, total - need))
+        except tk.TclError:
+            pass
+
     def _pane_restore(self, pw, name):
         if getattr(pw, "_mw_restored", False):
             return
@@ -44250,6 +47631,8 @@ class PacketsTab(BaseTab):
                     pw._mw_restored = True
             except tk.TclError:
                 pass
+            if pw is getattr(self, "vert_pane", None):
+                self._keep_details_room()
         pw.after_idle(place)
 
     # ---- the plain-word filter builder (5.1.2 M7) ------------------------
@@ -44574,6 +47957,8 @@ class PacketsTab(BaseTab):
                                  else "⏸ Pause display")
         if not self.paused:
             self.rebuild()
+        else:
+            self._count()
 
     # ---- rows (virtual table: only the visible rows exist as Treeview
     #      items; the scrollbar, wheel and keys move a window over
@@ -44616,7 +48001,8 @@ class PacketsTab(BaseTab):
                 self.time_text(d, prev),
                 app.disp_addr(d["src_ip"], d["src_mac"]),
                 app.disp_addr(d["dst_ip"], d["dst_mac"]), d["proto"],
-                d["length"], d.get("flow_id") or "", d["text"])
+                d["length"], d.get("flow_id") or "",
+                translate_event(d["text"]))      # crowd test #15
         if not self.custom:
             return base
         return base + tuple(self.field_text(d, f) for f in self.custom)
@@ -44799,12 +48185,29 @@ class PacketsTab(BaseTab):
                                "and alerts, not packets — open a capture "
                                "file to see packets.")
             return
-        self.count_var.set(f"{len(self.matched)} shown · "
-                           f"{len(self.app.all_rows)} in memory")
+        # crowd tests #26 and #12: "in memory" is the number Statistics
+        # and the I/O graph count, and stays current while paused
+        n, total = len(self.matched), len(self.app.all_rows)
+        if self.paused:
+            # crowd test #12: "Resume display" showed while the count
+            # kept rising, which read as if Pause did nothing
+            self.count_var.set(translate_text(
+                "Display paused at %d shown · %d in memory (still "
+                "capturing)") % (n, total))
+        elif not n and total and self.filter.active():
+            # an expression that matches nothing used to say only "0
+            # shown", like a mistake nobody reported
+            self.count_var.set(translate_text(
+                "0 shown · %d in memory — no packet in memory matches this "
+                "filter") % total)
+        else:
+            self.count_var.set(f"{n} shown · {total} in memory")
 
     def add_rows(self, rows):
         if self.paused or not self.is_visible():
             self._dirty = True
+            if self.paused:
+                self._count()
             return
         self.ctx._alert_cache = None
         new = [d for d in rows if self._keep(d)]
@@ -45051,6 +48454,8 @@ class PacketsTab(BaseTab):
         if self._dirty and not self.paused and self.is_visible():
             self._dirty = False
             self.rebuild()
+        elif self.is_visible():
+            self._count()          # paused: the list waits, the count not
 
     def rebuild(self):
         self._dirty = False
@@ -45062,6 +48467,11 @@ class PacketsTab(BaseTab):
         self.matched = m
         if self.sort_col is not None:
             self._resort()
+        if self._detail_no is not None and \
+                self.index_of_no(self._detail_no) is None:
+            # crowd test #12: "stream:101 — 20 shown" kept showing the
+            # details of packet #33, which the filter had hidden
+            self.clear_details()
         n = self._nslots()
         if self.follow_var.get() and self.sort_col is None:
             self.top = max(0, len(m) - n)
@@ -45388,19 +48798,28 @@ class PacketsTab(BaseTab):
             app.bookmarks.add(d["no"])
         self.render()
 
+    def clear_details(self):
+        """Empty the details, the text and hex dumps (no packet shown)."""
+        self.sel_no, self._detail_no = None, None
+        self._dt_ranges, self._dt_keys = {}, {}
+        self._dis = None
+        with contextlib.suppress(tk.TclError):
+            self.dtree.delete(*self.dtree.get_children())
+            for w in (self.details, self.hexview, self.bytes_view):
+                w.config(state="normal")
+                w.delete("1.0", "end")
+                w.config(state="disabled")
+        self.explain_var.set("")
+        self.field_var.set("")
+
     def reset(self):
         self.tree.delete(*self.tree.get_children())
         self.matched, self.slots, self.slot_rows = [], [], {}
-        self.top, self.sel_no, self._detail_no = 0, None, None
+        self.top = 0
         with contextlib.suppress(tk.TclError):
             self.vbar.set(0.0, 1.0)
         self._count()
-        self.dtree.delete(*self.dtree.get_children())
-        for w in (self.details, self.hexview, self.bytes_view):
-            w.config(state="normal")
-            w.delete("1.0", "end")
-            w.config(state="disabled")
-        self.explain_var.set("")
+        self.clear_details()
         for v in (self.streams, self.exchanges, self.stats, self.expert):
             v.reset()
 
@@ -46154,9 +49573,11 @@ class ExpertView(_SubView):
 
     def refresh(self, force=False):
         store = self.app.deep.store
-        if store.version == self._version and not force:
+        mode = self.app.effective_perf_mode()[0]
+        if store.version == self._version and not force and \
+                mode == getattr(self, "_mode", None):
             return
-        self._version = store.version
+        self._version, self._mode = store.version, mode
         with store.lock:
             fs = list(store.findings)
         rank = self.rank()
@@ -46172,7 +49593,13 @@ class ExpertView(_SubView):
                     f"#{g['first']}" if g["first"] else "—",
                     f"#{g['last']}" if g["last"] else "—"))
                 self.groups[iid] = g
+            # crowd test #12: with Full Power on and nothing found yet,
+            # the empty table said nothing at all
             self.hint.configure(text=self.full_power_hint() or (
+                translate_text("No findings yet. Full Power checks packets "
+                               "as they arrive, so packets from before it "
+                               "was switched on are not checked.")
+                if not fs else
                 f"{len(fs):,} findings in {len(gs):,} groups · double-click "
                 f"to open the first packet"))
 
@@ -46299,9 +49726,14 @@ class StatisticsView(_SubView):
         for w in self.body.winfo_children():
             w.destroy()
         self.canvas = None
-        wrap, self.tree = make_tree(self.body, cols, hscroll=True,
-                                    show="tree headings" if cols and
-                                    cols[0][0] == "#0" else "headings")
+        tree_col = bool(cols) and cols[0][0] == "#0"
+        # crowd test #12: "#0" was also made a data column, so every
+        # heading of the Protocol hierarchy sat one column left of its
+        # numbers
+        wrap, self.tree = make_tree(self.body, cols[1:] if tree_col
+                                    else cols, hscroll=True,
+                                    show="tree headings" if tree_col
+                                    else "headings")
         wrap.pack(fill="both", expand=True)
         return self.tree
 
@@ -46590,21 +50022,32 @@ class StatisticsView(_SubView):
         colors = [t["accent"], t["good_fg"], t["warn_fg"], t["muted_fg"]]
 
         def draw(_e=None):
+            # crowd test #27: packets/s and bits/s shared one axis with
+            # no unit (packets/s drew as a flat line at 0), and the DNS
+            # axis read "0" twice: one chart per unit, the unit on every
+            # axis label
             c.delete("all")
-            w, h = max(300, c.winfo_width()), max(200, c.winfo_height())
-            top = series[:3]
-            self._io_geom = Charts.line(c, 10, 6, w - 20, h * 0.62 - 10,
-                        [(lab, v, colors[i]) for i, (lab, v) in
-                         enumerate(top)], t, title="Traffic",
-                        fmt=lambda v: f"{v:,.0f}",
-                        xlabels=(fmt_clock(t0) if rows else "",
-                                 fmt_clock(rows[-1]["time"]) if rows
-                                 else ""))
-            Charts.line(c, 10, h * 0.62 + 4, w - 20, h * 0.38 - 10,
+            w, h = max(300, c.winfo_width()), max(240, c.winfo_height())
+            xl = (fmt_clock(t0) if rows else "",
+                  fmt_clock(rows[-1]["time"]) if rows else "")
+            ph = h / 3
+            self._io_geom = Charts.line(
+                c, 10, 6, w - 20, ph - 10,
+                [(series[0][0], series[0][1], colors[0])] if series else [],
+                t, title="Packets per second",
+                fmt=lambda v: axis_number(v) + " " +
+                translate_text("packets/s"), xlabels=xl)
+            Charts.line(c, 10, ph + 2, w - 20, ph - 10,
+                        [(lab, v, colors[i + 1]) for i, (lab, v) in
+                         enumerate(series[1:3])], t,
+                        title="Traffic (bits per second)", fmt=bit_rate,
+                        xlabels=xl)
+            Charts.line(c, 10, 2 * ph + 2, w - 20, ph - 10,
                         [(series[3][0], series[3][1], colors[3])]
                         if series else [], t, title="DNS latency (Full "
-                        "Power)", fmt=lambda v: f"{v:.0f}",
-                        empty="No DNS timings (turn on Full Power)")
+                        "Power)", fmt=lambda v: axis_number(v) + " ms",
+                        empty="No DNS timings (turn on Full Power)",
+                        xlabels=xl)
         c.bind("<Configure>", draw)
         c.bind("<Double-1>", lambda e: self._io_jump(e, first, step))
         self.after_draw = draw
@@ -46787,6 +50230,24 @@ class SourcesTab(BaseTab):
             self.recon.configure(bg=self.t["text_bg"], fg=self.t["text_fg"])
 
 
+# crowd test #19: the Linux capture steps (sudo, or the capture right with
+# setcap) and the exact menu path to Diagnostics
+TROUBLESHOOTING_HELP = (
+    'Nothing appears: check the network card at the top, and that '
+    'watching is started. On Windows, Npcap must be installed. On Linux '
+    'and macOS, watching needs administrator (root) rights: '
+    'MiniWireshark asks for your password when watching starts, or you '
+    'can start it with sudo. To watch without a password on Linux, give '
+    'Python the capture right once in a terminal: sudo setcap '
+    'cap_net_raw,cap_net_admin+eip "$(readlink -f "$(command -v '
+    'python3)")" (it is then allowed for every program run with that '
+    'Python). Help / About → MiniWireshark health → Diagnostics… checks '
+    'all of this: its "Capture rights" line says what is missing. '
+    "Repair fixes the program's own files; the debug bundle (masked by "
+    'default) is what to attach when asking for help.'
+)
+
+
 # ---- Help --------------------------------------------------------------------
 # ---- Help topics (5.1.2 F7) ----------------------------------------------------
 # Every topic: title, group, body (text, or a function of the app for the
@@ -46905,17 +50366,10 @@ HELP_USING = (
      "after a while; warnings stay until closed. The ✉ button in the "
      "status bar keeps the last 50.", (("Messages", "app", "msg_btn"),)),
     ("Troubleshooting",
-     "Nothing appears: check the network card at the top, and that "
-     "watching is started. On Windows, Npcap must be installed; on Linux "
-     "and macOS capturing needs permission. Help → MiniWireshark health → "
-     "Diagnostics checks all of this and says what to do; Repair fixes "
-     "the program's own files; the debug bundle (masked by default) is "
-     "what to attach when asking for help.",
+     TROUBLESHOOTING_HELP,
      (("Diagnostics", "do", "open_diagnostics"),)),
     ("Kill switch",
-     "Settings → Privacy → Kill switch stops every optional network "
-     "request MiniWireshark makes (country lookup, downloads, update "
-     "checks). Watching continues, and nothing else changes.", ()),
+     "Settings → Privacy → Kill switch. " + KILL_SWITCH_EFFECT, ()),
 )
 
 # glossary notes: a word in a text -> its glossary topic (acronyms read
@@ -47785,9 +51239,31 @@ class SearchDrop:
         entry.bind("<KeyRelease>", self._key, add="+")
         entry.bind("<Down>", lambda e: self.move(1))
         entry.bind("<Up>", lambda e: self.move(-1))
-        entry.bind("<Escape>", lambda e: self.close())
+        entry.bind("<Escape>", lambda e: self.escape())
         entry.bind("<FocusOut>", lambda e: entry.after(250,
                                                         self._focus_gone))
+
+    def escape(self):
+        """Escape in the box: the list under it and the results window
+        both close (crowd test 5.3.4 #1)."""
+        self.cancel()
+        self.close()
+        with contextlib.suppress(AttributeError):
+            self.app.close_search_window()
+        return "break"
+
+    def cancel(self):
+        """A list still due from the last key is not drawn (Enter opened
+        the results window meanwhile)."""
+        with contextlib.suppress(AttributeError):
+            self._soon.cancel()
+
+    def owns(self, w):
+        """The click landed on the box or on the list under it."""
+        if w is self.entry:
+            return True
+        fr = self.frame
+        return fr is not None and str(w).startswith(str(fr))
 
     def _key(self, e):
         if e.keysym in ("Down", "Up", "Return", "KP_Enter", "Escape",
@@ -47804,17 +51280,8 @@ class SearchDrop:
 
     def results(self, q):
         """[(group, [(text, action)])] — the window's own search, then
-        Settings and Help."""
-        app = self.app
-        out = []
-        for group, items in app.search_results(q).items():
-            out.append((group, [(label, lambda r=ref: app.open_ref(r))
-                                for label, ref in items[:self.PER_GROUP]
-                                if ref]))
-        for group, items in app.search_extras(q).items():
-            if items:
-                out.append((group, items[:self.PER_GROUP]))
-        return [(g, it) for g, it in out if it]
+        Settings, Health and Help (the results window lists the same)."""
+        return self.app.search_groups(q, self.PER_GROUP)
 
     def update(self):
         q = self.app.global_search_var.get().strip()
@@ -47855,7 +51322,10 @@ class SearchDrop:
                                cursor="hand2")
                 lbl.pack(fill="x")
                 i = len(self.rows)
-                lbl.bind("<Button-1>", lambda e, a=action: self._run(a))
+                # "break": the click must not reach the window's own
+                # click-away handler, which would close what it opened
+                lbl.bind("<Button-1>",
+                         lambda e, a=action: self._run(a) or "break")
                 lbl.bind("<Enter>", lambda e, k=i: self._mark(k))
                 self.rows.append((lbl, action))
                 n += 1
@@ -47863,7 +51333,8 @@ class SearchDrop:
                         bg=t["card_bg"], fg=t["accent"], anchor="w",
                         padx=8, pady=3, cursor="hand2")
         more.pack(fill="x", pady=(4, 0))
-        more.bind("<Button-1>", lambda e: self._run(app._run_global_search))
+        more.bind("<Button-1>",
+                  lambda e: self._run(app._run_global_search) or "break")
         self.rows.append((more, app._run_global_search))
         try:
             x = self.entry.winfo_rootx() - root.winfo_rootx()
@@ -48513,6 +51984,8 @@ class MiniWireshark:
         self.apply_reduce_motion()
         self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map,
                              add="+")
+        for seq in ("<FocusIn>", "<FocusOut>"):
+            self.root.bind_class("Frame", seq, self._card_focus, add="+")
         self._compact = None
         # a toplevel's binding runs for every widget inside it: Tcl keeps
         # the window's own events only (900 others per text-size change)
@@ -48805,7 +52278,8 @@ class MiniWireshark:
                                  command=self._on_ui_mode_change)
             rb.pack(side="left")
             Tooltip(rb, "Beginner shows the essentials. Advanced adds the "
-                        "Connections, Internet hosts and Packets tabs, "
+                        "Connections, Internet hosts, Packets and Sources "
+                        "tabs, "
                         "technical columns and filter expressions. Same "
                         "data either way.")
         tk.Label(search_grp, text="Search", bg="#2b3a55",
@@ -48820,6 +52294,10 @@ class MiniWireshark:
         self.search_entry = se
         se.bind("<Return>", lambda e: self._search_enter())
         self.search_drop = SearchDrop(self, se)
+        # every widget of the main window carries its tag: a click
+        # anywhere else closes the search list and windows (crowd test
+        # 5.3.4 #1)
+        self.root.bind("<Button-1>", self._click_away, add="+")
         Tooltip(se, "Search devices, names, MACs, IPs, vendors, websites, "
                     "Internet hosts, countries, providers, alerts, timeline, "
                     "settings and help — or Ctrl+K for anything. Tokens: "
@@ -49254,6 +52732,35 @@ class MiniWireshark:
             if fl is not None:
                 fl.schedule()
 
+    def _card_focus(self, e):
+        """A card that takes the keyboard (Tab, Shift+Tab) draws a
+        2-pixel ring in the theme's focus colour, in place of 1 pixel of
+        its padding (crowd test 5.3.4 #21: the 1-pixel ring, black on
+        some cards, was hard to see)."""
+        w = e.widget
+        if isinstance(w, str):
+            return
+        try:
+            if str(w.cget("takefocus")) != "1":
+                return
+            base = getattr(w, "_mw_ring", None)
+            if base is None:
+                base = w._mw_ring = (int(w.cget("highlightthickness")),
+                                     int(str(w.cget("padx"))),
+                                     int(str(w.cget("pady"))))
+            th, padx, pady = base
+            if th < 1:
+                return
+            if e.type == tk.EventType.FocusIn:
+                w.configure(highlightthickness=th + 1,
+                            highlightcolor=self.theme.get("focus",
+                                                          "#2b7de9"),
+                            padx=max(0, padx - 1), pady=max(0, pady - 1))
+            else:
+                w.configure(highlightthickness=th, padx=padx, pady=pady)
+        except (tk.TclError, ValueError):
+            pass
+
     def _on_toplevel_map(self, e):
         w = e.widget
         if isinstance(w, tk.Toplevel) and not getattr(w, "_mw_flowed",
@@ -49468,9 +52975,7 @@ class MiniWireshark:
         cmd = self._toggle_active_scanning
         if LEDGER.killed:
             bg, fg = t["mode_quiet_bg"], t["mode_quiet_fg"]
-            text = ("\U0001F6D1 KILL SWITCH ON — MiniWireshark sends nothing "
-                    "at all (no probes, lookups, downloads or update "
-                    "checks). It only listens.")
+            text = "\U0001F6D1 KILL SWITCH ON — " + KILL_SWITCH_EFFECT
             btn_text = "Turn the kill switch off"
             cmd = self._kill_switch_off
         elif wanted and live and prof is None:
@@ -49540,9 +53045,7 @@ class MiniWireshark:
                         "Switch to Active Scanning",
                         self._toggle_active_scanning))
         if LEDGER.killed:
-            text = ("\U0001F6D1 KILL SWITCH ON — MiniWireshark sends nothing "
-                    "at all (no probes, lookups, downloads or update "
-                    "checks). It only listens.")
+            text = "\U0001F6D1 KILL SWITCH ON — " + KILL_SWITCH_EFFECT
             colors = ("mode_quiet_bg", "mode_quiet_fg")
         elif data:
             # 5.3.4 (ST-08): each piece in the current language (the
@@ -49704,10 +53207,32 @@ class MiniWireshark:
                        self.toggle_state_panel(False)).pack(side="right")
 
     def _kill_switch_off(self):
-        self.config.set("privacy.kill_switch", False)
+        self.set_kill_switch(False)
+
+    def set_kill_switch(self, on):
+        """The one way the kill switch is turned on or off outside the
+        Settings window's Apply. 5.3.4 crowd test (#3): the ledger's box
+        and the banner's button saved the setting, but an open Settings
+        window kept its old tick (and said "All changes saved"), and the
+        ledger's box kept its tick after the banner turned it off."""
+        on = bool(on)
+        self.config.set("privacy.kill_switch", on)
         self.config.save()
         self._apply_runtime_settings()
         self._restyle_mode_banner()
+        sw = self._settings_win
+        if sw is not None and sw.alive():
+            sw.sync_key("privacy.kill_switch", on)
+            if sw.page_id == "privacy" and not sw.dirty():
+                with contextlib.suppress(tk.TclError):
+                    sw.show_page("privacy")     # the ledger summary line
+        led = getattr(self, "_ledger_win", None)
+        var = getattr(led, "_mw_kill_var", None)
+        if var is not None:
+            with contextlib.suppress(tk.TclError):
+                if bool(var.get()) != on:
+                    var.set(on)
+        return on
 
     def _data_label_tag(self):
         lab = self.data_label
@@ -49784,8 +53309,9 @@ class MiniWireshark:
             return
         if not router_mac and attempt < 6:
             # the router hasn't spoken yet; listen a little longer
-            self.root.after(10000, lambda: self._identify_network_async(
-                attempt + 1))
+            self._after_one("_network_check_job", 10000,
+                            lambda: self._identify_network_async(
+                                attempt + 1))
             return
         fp = network_fingerprint(router_mac or "unknown", subnet)
         self._roam_pending = False
@@ -49940,6 +53466,8 @@ class MiniWireshark:
 
     # ---- corrections (undoable) ---------------------------------------------------
     def _apply_correction_result(self, keys, banner=""):
+        if keys:
+            self.model.refresh_alert_names(set(keys))
         for k in keys:
             dev = self.model.registry.by_key.get(k)
             if dev is not None and dev.live:
@@ -50130,9 +53658,9 @@ class MiniWireshark:
         """Everything Ctrl+K can reach: (label, category, action)."""
         items = []
         for name, tab in self.tabs.items():
-            label = translate_text(STRINGS.get(tab.label_key, name)) if \
-                tab.label_key else name
-            items.append((re.sub(r"^\W+\s*", "", label), "tab",
+            # crowd test 5.3.4 #21: the tab strip's own names ("Happening",
+            # not the inner "feed"; STRINGS is keyed by language first)
+            items.append((palette_tab_label(tab.label_key, name), "tab",
                           lambda n=name: self._select_tab(n)))
         for sv in PacketsTab.SUBVIEWS:
             items.append((f"Packets → {sv}", "view",
@@ -50143,8 +53671,16 @@ class MiniWireshark:
                       lambda: (self._select_tab("connections"),
                                self.tabs["connections"].show_subview(
                                    "Mail"))))
+        # one name for one thing: "Settings", "Settings › Alerts" and
+        # "Settings › Alerts › Slow DNS" ("Setting: Stop" came first for
+        # "sett", above the Settings pages)
+        items.append(("Settings", "setting", lambda: self._open_settings()))
+        items.append(("Websites → Local services", "view",
+                      lambda: (self._select_tab("websites"),
+                               self.tabs["websites"].show_subview(
+                                   "Local services"))))
         for page in SETTINGS_PAGES:
-            items.append((f"Settings: {page['title']}", "setting",
+            items.append((f"Settings › {page['title']}", "setting",
                           lambda p=page["id"]: self._open_settings(p)))
         acts = [("Start watching", self.start), ("Stop watching", self.stop),
                 ("Demo Mode", self.start_demo),
@@ -50213,7 +53749,8 @@ class MiniWireshark:
             for sec in page["sections"]:
                 for c in sec["controls"]:
                     if c.get("key") and c.get("label"):
-                        items.append((f"Setting: {c['label']}", "setting",
+                        items.append((f"Settings › {page['title']} › "
+                                      f"{c['label']}", "setting",
                                       lambda k=c["key"]:
                                       self.open_setting(k)))
         for title in getattr(self, "help_titles", lambda: [])():
@@ -50251,6 +53788,9 @@ class MiniWireshark:
         tab._load_preset()
 
     def open_palette(self, _e=None):
+        old = getattr(self, "_palette", None)
+        if old is not None:
+            old.close()
         self._palette = CommandPalette(self)
         return self._palette
 
@@ -50789,7 +54329,8 @@ class MiniWireshark:
         c = m.alerts.counts()
         sig = (id(m), self.data_mode, c["DANGER"], c["WARNING"],
                len(m.health_history), self.active_mode(),
-               bool(m.metrics.first_ts), CURRENT_LOCALE)      # ST-08
+               bool(m.metrics.first_ts), self.dashboard_window(),  # #25
+               CURRENT_LOCALE)                                # ST-08
         cache = getattr(self, "_answers", None)
         now = time.monotonic()
         if not force and cache is not None and cache["sig"] == sig and \
@@ -50876,7 +54417,11 @@ class MiniWireshark:
             LOG.debug("health verdict for the answer", exc_info=True)
             worst, why = "", ""
         if worst in ("Needs attention", "Degraded"):
-            return (tr("Possibly") + ": " + (tr(why) if why else tr(
+            # (#8) "Possibly: Likely culprit: …" hedged twice
+            lead = "" if why.startswith(("Likely culprit:",
+                                         "Worth a look:")) else \
+                tr("Possibly") + ": "
+            return (lead + (tr(why) if why else tr(
                 "the Health tab found something to look at")) +
                     ("" if (why or "").endswith(".") else "."), "warn",
                     lambda: self.goto("health"))
@@ -50905,11 +54450,21 @@ class MiniWireshark:
                     self.show_alert(a) if a else self.goto("alerts"))
         return (text, "good", lambda: self.goto("health"))
 
+    def dashboard_window(self):
+        """Seconds: the Dashboard's time window (#25), else 10 minutes."""
+        dash = getattr(self, "tabs", {}).get("dash")
+        try:
+            return dash.window_seconds() if dash is not None else \
+                self.USAGE_WINDOW
+        except (AttributeError, tk.TclError):
+            return self.USAGE_WINDOW
+
     def usage_by_device(self, window=None):
         """Bytes per device over the last `window` seconds of
-        connections, and the bytes tied to no device."""
+        connections (the Dashboard's window), and the bytes tied to no
+        device."""
         m = self.model
-        window = window or self.USAGE_WINDOW
+        window = window or self.dashboard_window()
         now = m.now()
         per, unatt = Counter(), 0
         for x in m.flows.all_flows():
@@ -50927,8 +54482,9 @@ class MiniWireshark:
         devices: it says it cannot see them."""
         tr = translate_text
         m = self.model
-        per, unatt = self.usage_by_device()
-        win = span_words(self.USAGE_WINDOW)
+        window = self.dashboard_window()
+        per, unatt = self.usage_by_device(window)
+        win = span_words(window)
         show = lambda: self.investigate("bandwidth")        # noqa: E731
         v = m.vantage.classify(offline=self.data_mode in ("offline",
                                                           "session"))
@@ -51168,15 +54724,20 @@ class MiniWireshark:
         if jobs is None or "story" in jobs.active:
             return None
         st = self.story
+        sig = story_data_sig(self.model)
+        age = time.monotonic() - self._story_at
         if not force and st is not None and \
                 st.get("model_id") == id(self.model) and \
-                time.monotonic() - self._story_at < STORY_MAX_AGE:
+                age < STORY_MAX_AGE and \
+                (st.get("data_sig") == sig or age < STORY_MIN_AGE):
             return None
         since, until, store, last = self.story_period()
         m, gate = self.model, self.gate
 
         def run(job):
-            return story_job_run(job, gate, m, store, since, until, last)
+            story = story_job_run(job, gate, m, store, since, until, last)
+            story["data_sig"] = sig
+            return story
         return jobs.submit("story", "Writing the story", run,
                            done=self._story_done, failed=self._story_failed)
 
@@ -52171,16 +55732,19 @@ class MiniWireshark:
         if not ql:
             return []
         scored = []
+        fq = search_fold(ql)      # "wifi" finds "Wi-Fi" (crowd test #2)
         for i, tp in enumerate(help_topics()):
             title = tp["title"].lower()
             shown = translate_text(tp["title"]).lower()
-            if title.startswith(ql) or shown.startswith(ql):
+            if title.startswith(ql) or shown.startswith(ql) or (
+                    fq and (search_fold(title).startswith(fq) or
+                            search_fold(shown).startswith(fq))):
                 sc = 10
-            elif ql in title or ql in shown:
+            elif search_hit(ql, title, fq) or search_hit(ql, shown, fq):
                 sc = 6
             elif ql in tp["terms"]:
                 sc = 4
-            elif ql in help_body(tp, self).lower():
+            elif search_hit(ql, help_body(tp, self).lower(), fq):
                 sc = 1
             else:
                 continue
@@ -52593,6 +56157,11 @@ class MiniWireshark:
         self.config.set("appearance.beginner_mode", self.beginner_mode)
         self.config.save()
         self._apply_ui_mode()
+        # an open Settings window shows it as saved, not as a change of
+        # its own (crowd test 5.3.4 #14), and its OK can't undo it
+        sw = getattr(self, "_settings_win", None)
+        if sw is not None and sw.alive():
+            sw.sync_key("appearance.beginner_mode", self.beginner_mode)
 
     def _apply_ui_mode(self):
         """Beginner hides the technical tabs and fields; Advanced shows
@@ -52639,6 +56208,17 @@ class MiniWireshark:
                 self.tabs["feed"].on_locale()
             with contextlib.suppress(AttributeError, KeyError, tk.TclError):
                 self.tabs["packets"]._validate_expr()       # IP-023
+            # crowd test #15: rows already in these tables stayed in the
+            # language they were added in ("family-nas joined your
+            # network", "High", "New" in the French Alertes)
+            for name in ("timeline", "alerts"):
+                with contextlib.suppress(AttributeError, KeyError,
+                                         tk.TclError):
+                    self.tabs[name].rebuild()
+            with contextlib.suppress(AttributeError, KeyError, tk.TclError):
+                self.tabs["packets"].render()
+            with contextlib.suppress(AttributeError, KeyError, tk.TclError):
+                self.tabs["websites"].local.on_locale()     # its cells
             with contextlib.suppress(AttributeError, KeyError, tk.TclError):
                 sec_u = self.tabs["security"].unusual
                 if sec_u is not None:
@@ -53066,9 +56646,67 @@ proc ::mw_retheme {w map fgnew deffg} {
         for w in ("TButton", "TCheckbutton", "TRadiobutton", "TEntry",
                   "TCombobox", "Treeview"):
             style.configure(w, focuscolor=focus)
+        # crowd test 5.3.4 #21: a drop-down list or a number box with the
+        # keyboard drew no ring at all (clam marks only an entry's
+        # focus), so Tab through Settings seemed to lose its place
+        for w in ("TEntry", "TCombobox", "TSpinbox"):
+            style.map(w, bordercolor=[("focus", focus)],
+                      lightcolor=[("focus", focus)])
         style.map("Treeview.Heading",
                   background=[("active", bg)], foreground=[("active", fg)])
         style.configure("TMenubutton", background=bg, foreground=fg)
+        self._check_colours = (field, "#000000" if hc and not dark else (
+            "#ffffff" if hc else ("#8a93a3" if dark else "#6b7280")),
+            fg if hc else focus, "#7a808c" if dark else "#a0a4ab")
+        self._restyle_check()
+
+    CHECK_PX = 14             # the tick box at the Normal text size
+
+    def _restyle_check(self, scale=None):
+        """Every checkbox draws a tick when it is on. Tk's "clam" look
+        draws a cross, which read as "no" (crowd test 5.3.4 #14: "checked
+        boxes draw as X, unchecked as empty box"). Four images, redrawn
+        in place for the theme and the text size (no new Tk image or
+        element each time)."""
+        if scale is None:
+            scale = self.TEXT_SIZES.get(self.config.get(
+                "appearance.text_size", "Normal"), 1.0)
+        field, border, mark, off = getattr(
+            self, "_check_colours", ("#ffffff", "#6b7280", "#2b7de9",
+                                     "#a0a4ab"))
+        n = max(11, int(round(self.CHECK_PX * scale)))
+        sig = (n, field, border, mark, off)
+        if getattr(self, "_check_sig", None) == sig:
+            return                  # a redraw makes every checkbox redraw
+        try:
+            imgs = getattr(self, "_check_imgs", None)
+            if imgs is None:
+                imgs = {k: tk.PhotoImage(master=self.root, width=n + 4,
+                                         height=n)
+                        for k in ("off", "on", "off_d", "on_d")}
+                style = ttk.Style()
+                style.tk.call(
+                    "ttk::style", "element", "create",
+                    "Mw.Checkbutton.indicator", "image",
+                    (imgs["off"], "disabled selected", imgs["on_d"],
+                     "selected", imgs["on"], "disabled", imgs["off_d"]))
+                style.layout("TCheckbutton", [("Checkbutton.padding", {
+                    "sticky": "nswe", "children": [
+                        ("Mw.Checkbutton.indicator",
+                         {"side": "left", "sticky": ""}),
+                        ("Checkbutton.focus", {
+                            "side": "left", "sticky": "w", "children": [
+                                ("Checkbutton.label",
+                                 {"sticky": "nswe"})]})]})])
+                self._check_imgs = imgs
+            for key, (edge, tick) in (("off", (border, None)),
+                                      ("on", (border, mark)),
+                                      ("off_d", (off, None)),
+                                      ("on_d", (off, off))):
+                draw_tick_box(imgs[key], n, field, edge, tick)
+            self._check_sig = sig
+        except tk.TclError:
+            LOG.debug("checkbox tick", exc_info=True)
 
 
     TEXT_SIZES = {"Small": 0.9, "Normal": 1.0, "Large": 1.15,
@@ -53120,6 +56758,7 @@ proc ::mw_retheme {w map fgnew deffg} {
                 st.configure("Treeview.Heading", font=head)
         except tk.TclError:
             pass
+        self._restyle_check(scale)           # the tick box grows too
         job = getattr(self, "_text_size_job", None)
         if job is not None:
             with contextlib.suppress(tk.TclError):
@@ -53524,25 +57163,38 @@ proc ::mw_explicit_fonts {top names} {
             what = {"offline": "the opened capture file",
                     "session": "the loaded session",
                     "demo": "the demo data"}[self.data_mode]
+            # crowd test #15: built from translated pieces (the Spanish
+            # "Empezar a observar" question was entirely English)
+            tr = translate_text
             return messagebox.askyesno(
-                action, f"{action} starts a fresh live session, so {what} "
-                f"will be cleared from view.\n\nSave it first (Session ▾ "
-                f"Save session) if you want to keep it. Continue?",
+                action, tr("“%s” starts a fresh live session, so %s will be "
+                           "cleared from view.") % (tr(action), tr(what)) +
+                "\n\n" + tr("Save it first (Session ▾ Save session) if you "
+                             "want to keep it. Continue?"),
                 parent=self.root)
         return True
 
     def start(self, auto=False):
         if self.sniffer is not None or self._capture_starting:
             return
-        if not auto and not self._confirm_leave_nonlive("Start watching"):
-            return
-        self._leave_nonlive()
+        # 5.3.4 crowd test #9: a start that can't happen says so before
+        # anything is cleared. It used to clear the demo (or the opened
+        # file) first, then stop with "The capture engine isn't
+        # available", leaving an empty window that watched nothing.
         if not HAVE_SCAPY:
-            self._set_banner("❌  The capture engine isn't available.",
-                             kind="bad")
+            kept = self.data_mode in ("offline", "session", "demo")
+            self._set_banner(
+                "❌  The capture engine isn't available, so MiniWireshark "
+                "can't watch live traffic here. "
+                + ("What's on screen was kept. " if kept else "")
+                + "Repair can install what is missing.", kind="bad",
+                action=("Repair", self.repair_everything))
+            return
+        if not auto and not self._confirm_leave_nonlive("Start watching"):
             return
         if self._ask_capture_rights(auto):
             return
+        self._leave_nonlive()
         label = self.iface_var.get()
         others = [l for l in self.iface_box["values"] if l != label]
         if self.config.get("capture.auto_select_interface", True):
@@ -53596,8 +57248,15 @@ proc ::mw_explicit_fonts {top names} {
                                   self.real_identity[2])
             self.replace_model(self._new_model())
             self._baselines_from_history()
+        was = self.data_mode
         self.data_mode = "idle"
         self.data_label = ""
+        if was in ("offline", "session", "demo"):
+            # crowd test #9: the status line no longer says "Demo Mode —
+            # nothing is being captured" (or names the file) once the
+            # demo or the file has gone
+            self.status_var.set("Ready. Click “Start watching” when "
+                                "you'd like to begin.")
         self._restyle_mode_banner()
 
     def _ensure_worker(self):
@@ -53755,7 +57414,8 @@ proc ::mw_explicit_fonts {top names} {
         self.model.obs_sink = self._history_live()
         if self.network_fp:
             self.model.registry.network_id = self.network_fp
-        self.root.after(1500, self._identify_network_async)
+        self._after_one("_network_check_job", 1500,
+                        self._identify_network_async)
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
         self._start_lan_scanner()
@@ -53998,22 +57658,48 @@ proc ::mw_explicit_fonts {top names} {
         if not cands:
             cands = list(self.iface_box["values"])[:1]
 
+        started = []
+
         def done(ok):
             if ok:
                 self.model.push_timeline("capture", "INFO",
                                          f"Capture restarted on "
                                          f"“{self.current_iface_label}”")
-                self.root.after(120000, self._reset_restart_counter)
+                self._after_one("_restart_reset_job", 120000,
+                                self._reset_restart_counter)
+            elif started and started[0] != self._capture_token:
+                # (35-checker review) Stop was pressed (or another start
+                # began) while the cards were tried: this attempt was
+                # cancelled, it didn't fail. Healing it restarted the
+                # capture the person had just stopped.
+                return
             else:
                 self._handle_sniffer_died(RuntimeError("restart failed"))
         if cands:
             self._start_capture(cands[:4], keep_data=True, on_done=done)
+            started.append(self._capture_token)
         else:
             done(False)
 
     def _reset_restart_counter(self):
+        self._restart_reset_job = None
         if self.sniffer is not None:
             self._restart_attempts = 0
+
+    def _after_one(self, attr, ms, fn):
+        """5.3.4 (memory audit, round 8): a timer of which only the
+        newest matters: the one still waiting is cancelled first. Each
+        capture start added a 120 s and a 1.5 s timer of its own, so a
+        capture restarted often (or the round 8 run) piled them up."""
+        old = getattr(self, attr, None)
+        if old:
+            with contextlib.suppress(tk.TclError, ValueError):
+                self.root.after_cancel(old)
+
+        def run():
+            setattr(self, attr, None)
+            fn()
+        setattr(self, attr, self.root.after(ms, run))
 
     def _on_network_snapshot(self, snap):
         self._last_snapshot = snap
@@ -54144,7 +57830,13 @@ proc ::mw_explicit_fonts {top names} {
         if getattr(self, "_rebuild_on_restore", False):
             self._rebuild_on_restore = False
             self._rebuild_tables_soon()
-        m = self.model
+        self._flush_ui_parts(self.model)
+        with contextlib.suppress(tk.TclError):
+            self.root.after(self._ms(700), self._flush_ui)
+
+    def _flush_ui_parts(self, m):
+        """One round of _flush_ui without the next one being scheduled
+        (the fast-time memory test calls it once a simulated minute)."""
         for part in (self._flush_events, self._flush_devices,
                      self._flush_websites, self._flush_remotes,
                      self._flush_flows, self._flush_geo):
@@ -54152,8 +57844,6 @@ proc ::mw_explicit_fonts {top names} {
                 part(m)
             except Exception:                        # noqa: BLE001
                 self._flush_failed(part.__name__)
-        with contextlib.suppress(tk.TclError):
-            self.root.after(self._ms(700), self._flush_ui)
 
     def _flush_failed(self, name):
         """Log (at most once a minute per part) and have the affected
@@ -54215,7 +57905,6 @@ proc ::mw_explicit_fonts {top names} {
             self.tabs["remote"].update_keys(keys)
 
     FLUSH_MAX = 250
-
     @classmethod
     def _take_dirty(cls, m, attr):
         """The changed rows for one table refresh, at most FLUSH_MAX; the
@@ -55160,13 +58849,24 @@ proc ::mw_explicit_fonts {top names} {
         m, tr = self.model, translate_text
         now = m.now()
         parts = []
-        h = m.health if self.data_mode == "live" else {}
+        # (#7) the same facts as the Health tab's rows: its router and
+        # Internet rows read m.health in every mode, and say "seen" when
+        # only passive traffic showed them
+        h = m.health
         if h.get("time"):
             age = max(0, time.time() - h["time"])
             parts.append(tr("router and Internet checks") + " " +
                          span_words(age) + " " + tr("ago"))
         else:
-            parts.append(tr("no router or Internet check yet"))
+            res = {}
+            with contextlib.suppress(Exception):
+                res = self.health_summary()
+            if any((res.get(k) or ("",))[0] == "Info"
+                   for k in ("gateway", "internet")):
+                parts.append(tr("router and Internet seen in traffic, not "
+                                "checked yet"))
+            else:
+                parts.append(tr("no router or Internet check yet"))
         parts.append(tr("website lookups and connections over the last") +
                      " " + span_words(600))
         wp = self._wifi_view()
@@ -55436,8 +59136,36 @@ proc ::mw_explicit_fonts {top names} {
     #  Health
     # ======================================================================
     def health_checks_allowed(self):
-        return (self.data_mode == "live" and self.active_mode() and
-                self.config.get("health.active_checks", True))
+        return not self.health_checks_blocked()
+
+    def health_checks_blocked(self):
+        """Why the active checks can't run now ("" when they can): one
+        reason for the greyed "Run checks now" button, its tooltip, the
+        note under it and the banner (5.3.4 crowd test #17: the button
+        was greyed with no hint, and the note asked for a "Trust this
+        network" button the banner didn't show)."""
+        if self.data_mode in ("offline", "session", "demo"):
+            return ("Checks only run while watching live; this is demo "
+                    "data." if self.data_mode == "demo" else "Checks only "
+                    "run while watching live; this is saved data.")
+        if self.data_mode != "live":
+            return "Checks only run while watching live. Press Start watching."
+        if LEDGER.killed:
+            return "The kill switch is on, so no checks are sent."
+        if not self.config.get("mode.active_scanning", True):
+            return ("Quiet Mode sends no test traffic. Switch to Active "
+                    "Scanning to run the checks.")
+        if not self.active_mode():
+            if getattr(self, "network_profile", None) is None:
+                return ("Still finding out which network this is; checks "
+                        "start once it is one you trust.")
+            return ("This network isn't marked as yours, so no test "
+                    "traffic is sent. Use “Trust this network” to allow "
+                    "the checks.")
+        if not self.config.get("health.active_checks", True):
+            return ("Active checks are switched off in Settings → Network "
+                    "Health.")
+        return ""
 
     def _dns_target(self):
         for s in self.system_dns + sorted(self.model.dhcp_dns):
@@ -55475,16 +59203,21 @@ proc ::mw_explicit_fonts {top names} {
                             "Internet connection test failed")
 
     def run_health_checks(self):
-        if not self.health_checks_allowed():
-            self._set_banner("Health checks send a few tiny test connections, "
-                             "so they only run while watching live with "
-                             "Active Scanning on (not in Quiet Mode).",
-                             kind="warn")
+        why = self.health_checks_blocked()
+        if why:
+            self._set_banner(translate_text(why), kind="warn")
             return
         self.prober.run_now.set()
         self._set_banner("\U0001FA7A  Running health checks…")
 
     def health_note(self):
+        if self.data_mode == "live" and LEDGER.killed:
+            return self.health_checks_blocked()
+        if self.data_mode == "live" and \
+                self.config.get("mode.active_scanning", True) and \
+                getattr(self, "network_profile", None) is None and \
+                not self.active_mode():
+            return self.health_checks_blocked()
         if self.data_mode in ("offline", "session", "demo"):
             return ("Showing what can be worked out from the "
                     f"{'demo data' if self.data_mode == 'demo' else 'saved data'}"
@@ -55702,15 +59435,32 @@ proc ::mw_explicit_fonts {top names} {
             worst = "Unknown"
         names = {k: t for k, t in HealthTab.CHECKS}
         culprit = likely_culprit(out)
-        if worst == "Healthy":
+        # 5.3.4 crowd test (#7): "Healthy" only when the checks at the top
+        # have a result; "no conflicts seen" over three "? Unknown" rows
+        # is not a clean bill of health
+        unchecked = [names[k] for k in HEALTH_CORE_CHECKS
+                     if out[k][0] == "Unknown"]
+        if worst == "Healthy" and unchecked:
+            worst = "Partly checked"
+            text = ("No problems in what was checked. Not checked yet: " +
+                    ", ".join(unchecked) + ".")
+        elif worst == "Healthy":
             text = "Everything checked looks fine."
         elif worst == "Unknown":
             text = "Not enough information yet."
         else:
             parts = []
-            if culprit:
+            # (#8) a cause is only the "likely culprit" when a symptom was
+            # measured too; a weak signal alone is worth a look
+            signs = [k for k in HEALTH_SLOW_SIGNS if k != culprit and
+                     order.get(out[k][0], 0) >= 1]
+            if culprit and (culprit in HEALTH_SLOW_SIGNS or signs):
                 parts.append(f"Likely culprit: {names[culprit]} — "
                              f"{out[culprit][1]}")
+            elif culprit:
+                parts.append(f"Worth a look: {names[culprit]} — "
+                             f"{out[culprit][1]} No slowness was measured, "
+                             f"so it may not be slowing anything down.")
             others = [names[k] for k in bad if k != culprit and k in names]
             if others:
                 parts.append("Also look at: " + ", ".join(others) + ".")
@@ -55722,18 +59472,29 @@ proc ::mw_explicit_fonts {top names} {
     def connection_info_text(self):
         m = self.model
         rec = self._score_for(self.current_iface_label)
-        lines = ["Network card : " + (self.current_iface_label or "—"),
-                 "This computer: " + (", ".join(sorted(m.my_ips)) or "—"),
+        # 5.3.4 crowd test (#17): a value that isn't known says why,
+        # instead of a bare "—"
+        tr = translate_text
+        live = self.data_mode == "live"
+        no_card = tr("none: not capturing live") if not live else \
+            tr("not picked yet")
+        lines = ["Network card : " + (self.current_iface_label or no_card),
+                 "This computer: " + (", ".join(sorted(m.my_ips)) or
+                                      tr("not seen yet")),
                  "Subnet(s)    : " + (", ".join(str(n) for n in
-                                                m.local_nets[:3]) or "—"),
-                 "Router       : " + (m.gateway_ip or "—"),
+                                                m.local_nets[:3]) or
+                                      tr("not seen yet")),
+                 "Router       : " + (m.gateway_ip or tr("not seen yet")),
                  "DNS servers  : " + (", ".join(
                      (self.system_dns[:3] if self.data_mode == "live"
-                      else []) or sorted(m.dhcp_dns)[:3]) or "—"),
+                      else []) or sorted(m.dhcp_dns)[:3]) or
+                     tr("not seen yet")),
                  "IPv6 prefix  : " + (", ".join(str(p) for p in
-                                               m.v6_prefixes[:2]) or "—"),
+                                               m.v6_prefixes[:2]) or
+                                      tr("none seen (no IPv6 router "
+                                         "announcement)")),
                  "Why this card: " + (explain_reasons(rec) if rec
-                                      else "—")]
+                                      else no_card)]
         wp = self._wifi_view()
         w = wp.last if wp is not None else None
         if w:
@@ -57146,9 +60907,22 @@ proc ::mw_explicit_fonts {top names} {
         """A stored alert rule in words."""
         kind, _, subject = str(tag).partition("|")
         title = translate_text(ALERT_TYPES.get(kind, (kind,))[0])
-        dev = self.model.registry.by_key.get(subject)
+        reg = self.model.registry
+        dev = reg.by_key.get(subject)
+        detail = ""
+        if dev is None and "|" in subject:
+            # 5.3.4 crowd test #11: a subject is "device key|service" (or
+            # "|protocol|server"); the toast showed the raw key
+            # "02:00:5e:10:00:10|SSH" instead of the device's name
+            key, _, detail = subject.partition("|")
+            dev = reg.by_key.get(reg.resolve(key)) or reg.by_key.get(key)
+            if dev is None:
+                subject = key
+            detail = detail.replace("|", ", ")
         who = self.device_label(dev) if dev is not None else \
             (subject.replace("ip:", "") or "?")
+        if detail:
+            who = f"{who} ({detail})"
         if kind_of == "muted":
             return translate_text("No more “%s” alerts for %s") % (title,
                                                                    who)
@@ -57354,14 +61128,27 @@ proc ::mw_explicit_fonts {top names} {
     # ======================================================================
     #  Clearing / sessions / offline data / demo
     # ======================================================================
-    def clear(self):
-        if self.config.get("general.confirm_before_clear", False):
-            if not messagebox.askyesno(
-                    "Clear everything?",
-                    "This clears all packets, devices, websites, connections, "
-                    "alerts and the timeline from this session. Continue?",
-                    parent=self.root):
-                return
+    def _confirm_clear(self, stopping=False):
+        """5.3.4 crowd test #10: Clear (Ctrl+L) asks first unless "Ask
+        before clearing data" was turned off (it was off by default, so
+        one key press wiped the session), and says how it differs from
+        New session."""
+        if not self.config.get("general.confirm_before_clear", True):
+            return True
+        undo = self.data_mode not in ("offline", "session", "demo")
+        return messagebox.askyesno(
+            "Clear everything?",
+            "This clears all packets, devices, websites, connections, "
+            "alerts and the timeline from this session. "
+            + ("Watching stops too (New session)." if stopping else
+               "Watching carries on if it is running.")
+            + (" You can undo it for 30 seconds." if undo else
+               " This can't be undone.")
+            + "\n\nContinue?", parent=self.root)
+
+    def clear(self, confirmed=False):
+        if not confirmed and not self._confirm_clear():
+            return
         live = self.data_mode == "live"
         undo = None
         if self.data_mode in ("offline", "session", "demo"):
@@ -57434,8 +61221,10 @@ proc ::mw_explicit_fonts {top names} {
         return True
 
     def _new_session(self):
+        if not self._confirm_clear(stopping=True):
+            return
         self.stop()
-        self.clear()
+        self.clear(confirmed=True)
 
     def _return_to_live(self):
         if self.data_mode == "demo":
@@ -57586,9 +61375,10 @@ proc ::mw_explicit_fonts {top names} {
     def _confirm_leave_live(self, action):
         if self.data_mode == "live" and self.model.has_data():
             return messagebox.askyesno(
-                action, f"{action} stops live capture and replaces what's on "
-                f"screen. Save the current session first if you want to keep "
-                f"it. Continue?", parent=self.root)
+                action, translate_text(
+                    "“%s” stops live capture and replaces what's on screen. "
+                    "Save the current session first if you want to keep it. "
+                    "Continue?") % translate_text(action), parent=self.root)
         return self._confirm_leave_nonlive(action)
 
     def open_pcap(self):
@@ -57786,7 +61576,7 @@ proc ::mw_explicit_fonts {top names} {
     # ======================================================================
     def _dialog_dir(self):
         d = (self.config.get("export.default_dir", "") or "").strip()
-        return d if d and os.path.isdir(d) else None
+        return d if d and os.path.isdir(d) else default_save_dir()
 
     def _popup_at_pointer(self, menu):
         try:
@@ -57849,6 +61639,12 @@ proc ::mw_explicit_fonts {top names} {
             return None
         new = new or ask_text(self, "Rename a workspace", "New name:", old)
         if not new or new == old:
+            return None
+        # (35-checker review) another workspace of that name was replaced
+        # without a word
+        if new in saved and not messagebox.askyesno(
+                "Rename a workspace", f"A workspace called “{new}” "
+                f"already exists. Replace it?", parent=self.root):
             return None
         saved[new] = saved.pop(old)
         self.config.set("workspaces.saved", saved)
@@ -57921,8 +61717,13 @@ proc ::mw_explicit_fonts {top names} {
         rows = inventory_rows(self.model, self.device_label)
         net = self.network_name()
         sub = (f"{net} · " if net else "") + \
-            f"generated {fmt_clock(time.time(), True)}"
+            f"generated {fmt_clock(time.time(), True)}" + \
+            self._demo_note()
         return inventory_html(rows, "Device inventory", sub)
+
+    def _demo_note(self):
+        return " · DEMO DATA — NOT LIVE TRAFFIC" if \
+            self.data_mode == "demo" else ""
 
     def sheet_facts(self):
         """The network sheet's lines above the table: health, alerts,
@@ -57958,7 +61759,7 @@ proc ::mw_explicit_fonts {top names} {
         rows = inventory_rows(self.model, self.device_label)
         net = self.network_name()
         sub = (f"{net} · " if net else "") + \
-            f"{fmt_clock(time.time(), True)}"
+            f"{fmt_clock(time.time(), True)}" + self._demo_note()
         return inventory_html(rows, "Network sheet", sub,
                               facts=self.sheet_facts())
 
@@ -58050,6 +61851,13 @@ proc ::mw_explicit_fonts {top names} {
         info = tk.Label(win, text="", bg=t["tab_bg"], fg=t["muted_fg"],
                         anchor="w")
         info.pack(fill="x", padx=12)
+        if self.data_mode == "demo":
+            # crowd test #13: an export of the demo said nothing about it
+            tk.Label(win, text=translate_text(
+                "Demo Mode: this is made-up sample data, not your "
+                "network."), bg=t["tab_bg"], fg=t.get("warn_fg",
+                                                      t["text_fg"]),
+                anchor="w").pack(fill="x", padx=12)
         panes = tk.Frame(win, bg=t["tab_bg"])
         panes.pack(fill="both", expand=True, padx=12, pady=6)
         texts = []
@@ -58105,17 +61913,56 @@ proc ::mw_explicit_fonts {top names} {
                 return
             self._set_banner(f"\U0001F4C4  Saved: {path}", kind="good")
             win.destroy()
+
+        def print_it():
+            return self.print_html(state["out"], parent=win)
         btns = tk.Frame(win, bg=t["tab_bg"], padx=12, pady=8)
         btns.pack(fill="x")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(
             side="right")
         ttk.Button(btns, text="Save…", style="Accent.TButton",
                    command=save).pack(side="right", padx=6)
+        if os.path.splitext(filename)[1] in ("", ".html"):
+            ttk.Button(btns, text="Print…", command=print_it).pack(
+                side="right")
         render()
         win._mw_state, win._mw_opts, win._mw_on, win._mw_render = \
             state, opts, on, render
-        win._mw_save = save
+        win._mw_save, win._mw_print = save, print_it
         return win
+
+    def print_html(self, content, parent=None):
+        """5.3.4 crowd test #13: the page said "Print this page", but the
+        preview offered only Save. Print opens what will be saved in the
+        web browser, which prints it or saves it as PDF. The copy is kept
+        in the private data folder (one file, replaced each time), never
+        in a shared temporary folder. → its path, or None."""
+        folder = os.path.join(PATHS.data, "print")
+        path = os.path.join(folder, "print-preview.html")
+        page = content
+        if "</body>" in page:
+            page = page.replace("</body>", "<script>window.addEventListener("
+                                "'load',function(){window.print()})"
+                                "</script></body>", 1)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            with contextlib.suppress(OSError):
+                os.chmod(folder, 0o700)
+            atomic_write_text(path, page)
+        except OSError as e:
+            messagebox.showerror("Print", str(e), parent=parent or self.root)
+            return None
+        if not _open_path(path):
+            messagebox.showerror(
+                "Print", translate_text("The page couldn't be opened in "
+                                        "your web browser. Save it and "
+                                        "open the file to print it."),
+                parent=parent or self.root)
+            return None
+        self._set_banner(translate_text(
+            "Opened in your web browser: print it from there, or choose "
+            "Save as PDF."), kind="good")
+        return path
 
     def _ask_save(self, ext, types, name):
         return filedialog.asksaveasfilename(
@@ -58317,6 +62164,11 @@ proc ::mw_explicit_fonts {top names} {
                      re.I)
         token, term = (m.group(1).lower(), m.group(2).strip().lower()) if m \
             else (None, q.lower())
+        # 5.3.4 crowd test #2: "wifi" finds "Wi-Fi", "homenas" "home-nas"
+        fterm = search_fold(term)
+
+        def hit(hay):
+            return search_hit(term, hay, fterm)
         res = OrderedDict((k, []) for k in ("Devices", "Websites",
                                             "Internet hosts", "Connections",
                                             "Alerts", "Timeline"))
@@ -58325,8 +62177,8 @@ proc ::mw_explicit_fonts {top names} {
         if token is None:
             # 5.1.2: the words of each device and connection are joined
             # once (kept 3 s), not on every key
-            for key, (label, words) in cache["dev"].items():
-                if term in words:
+            for key, (label, words, folded) in cache["dev"].items():
+                if term in words or (fterm and fterm in folded):
                     res["Devices"].append((label, ("device", key)))
         if token in ("device", "ip", "mac"):
             for d in mod.registry.by_key.values():
@@ -58339,13 +62191,13 @@ proc ::mw_explicit_fonts {top names} {
                     [self.device_label(d), d.alias, d.ip, d.mac, d.vendor,
                      d.device_class, translate_text(d.device_class),
                      d.notes] + sorted(d.ipv6)
-                if any(term in (f or "").lower() for f in fields):
+                if any(hit((f or "").lower()) for f in fields):
                     res["Devices"].append(
                         (f"{self.device_label(d)}  ({d.ip or d.mac}) — "
                          f"{d.device_class}", ("device", d.key)))
         if token in (None, "site"):
             for w in mod.websites.values():
-                if term in w.domain:
+                if hit(w.domain):
                     res["Websites"].append((f"{w.domain}  ({w.requests} "
                                             f"hits)", ("website", w.domain)))
         if token in (None, "ip", "country", "site"):
@@ -58354,7 +62206,7 @@ proc ::mw_explicit_fonts {top names} {
                        f"{r.country_name}"}.get(token) or \
                     " ".join([r.ip, r.domain, " ".join(r.domains), r.country,
                               r.country_name, r.org, f"as{r.asn}"])
-                if term in hay.lower():
+                if hit(hay.lower()):
                     res["Internet hosts"].append(
                         (f"{r.ip}  {r.domain}  {r.location_text()}  "
                          f"{r.provider_text()}", ("remote", r.ip)))
@@ -58369,11 +62221,14 @@ proc ::mw_explicit_fonts {top names} {
                 else:
                     words = cache["flow"].get(f.fid)
                     if words is None:
-                        words = cache["flow"][f.fid] = " ".join(
+                        words = " ".join(
                             str(x) for x in (f.remote_ip, f.local_ip,
                                              f.domain, f.service,
                                              f.remote_port)).lower()
-                    ok = term in words
+                        words = cache["flow"][f.fid] = (words,
+                                                        search_fold(words))
+                    ok = term in words[0] or bool(fterm and
+                                                  fterm in words[1])
                 if ok:
                     res["Connections"].append(
                         (f"#{f.fid} {self.short_device_name(f.device_key)} "
@@ -58384,13 +62239,12 @@ proc ::mw_explicit_fonts {top names} {
         if token in (None, "alert"):
             for aid in mod.alerts.order:
                 a = mod.alerts.alerts.get(aid)
-                if a and (term in a.reason.lower() or
-                          term in a.kind.lower()):
+                if a and (hit(a.reason.lower()) or hit(a.kind.lower())):
                     res["Alerts"].append((f"[{a.severity}] {a.reason}",
                                           ("alert", a.id)))
         if token is None:
             for e in list(mod.timeline)[-3000:]:
-                if term in e["text"].lower():
+                if hit(e["text"].lower()):
                     res["Timeline"].append(
                         (f"{fmt_clock(e['when'])}  {e['text']}",
                          e.get("ref")))
@@ -58423,8 +62277,9 @@ proc ::mw_explicit_fonts {top names} {
                 translate_text(d.device_class), d.notes, d.place,
                 d.owner) if x)
             words += " " + " ".join(sorted(d.ipv6))
+            words = words.lower()
             dev[d.key] = (f"{label}  ({d.ip or d.mac}) — {d.device_class}",
-                          words.lower())
+                          words, search_fold(words))
         h = self._hay = {"model": self.model, "t": now, "dev": dev,
                          "flow": {}, "n": len(self.model.registry.by_key)}
         return h
@@ -58432,19 +62287,30 @@ proc ::mw_explicit_fonts {top names} {
     def search_extras(self, q):
         """Settings and Help that match `q` (for the result list)."""
         ql = q.strip().lower()
-        out = OrderedDict((("Settings", []), ("Help", [])))
+        out = OrderedDict((("Settings", []), ("Health", []), ("Help", [])))
         if len(ql) < 2:
             return out
+        fq = search_fold(ql)
         for page in SETTINGS_PAGES:
             for sec in page["sections"]:
                 for c in sec["controls"]:
                     lab = c.get("label") or ""
-                    if c.get("key") and (ql in lab.lower() or ql in
-                                         translate_text(lab).lower()):
+                    if c.get("key") and (
+                            search_hit(ql, lab.lower(), fq) or
+                            search_hit(ql, translate_text(lab).lower(),
+                                       fq)):
                         out["Settings"].append(
                             (f"{translate_text(page['title'])} › "
                              f"{translate_text(lab)}",
                              lambda k=c["key"]: self.open_setting(k)))
+        # 5.3.4 crowd test #2: the Health tab's checks ("Wi-Fi signal
+        # (this computer)" is on screen, so "wifi" must find it)
+        for _key, lab in HealthTab.CHECKS:
+            if search_hit(ql, lab.lower(), fq) or \
+                    search_hit(ql, translate_text(lab).lower(), fq):
+                out["Health"].append(
+                    (f"{translate_text('Health')} › {translate_text(lab)}",
+                     lambda: self._select_tab("health")))
         fn = getattr(self, "help_matches", None)
         if fn is not None:
             for title in fn(q)[:8]:
@@ -58459,42 +62325,151 @@ proc ::mw_explicit_fonts {top names} {
             win.find_setting(key)
         return win
 
+    def search_groups(self, q, per_group=None):
+        """[(group, [(text, action)])]: what the header search finds. The
+        list under the box (per_group of each) and the results window
+        are built from it, so the two never disagree (crowd test 5.3.4
+        #2: the window said "0 result(s)" over a list of Help topics)."""
+        out = []
+        for group, items in self.search_results(q).items():
+            acts = []
+            for label, ref in items:
+                if ref:
+                    acts.append((label, lambda r=ref: self.open_ref(r)))
+                elif group == "Timeline":
+                    acts.append((label,
+                                 lambda: self._select_tab("timeline")))
+            out.append((group, acts))
+        out += list(self.search_extras(q).items())
+        return [(g, it[:per_group] if per_group else it)
+                for g, it in out if it]
+
+    def search_window(self):
+        """The open search results window, or None."""
+        win = getattr(self, "_search_win", None)
+        try:
+            return win if win is not None and win.winfo_exists() else None
+        except tk.TclError:
+            return None
+
+    def close_search_window(self, refocus=False):
+        """Close the results window. refocus: back to the search box with
+        its text selected, so typing replaces it."""
+        win, self._search_win = self.search_window(), None
+        if win is None:
+            return False
+        with contextlib.suppress(tk.TclError):
+            win.destroy()
+        if refocus:
+            with contextlib.suppress(tk.TclError, AttributeError):
+                e = self.search_entry
+                e.focus_set()
+                e.select_range(0, "end")
+                e.icursor("end")
+        return True
+
+    def _click_away(self, e):
+        """A click elsewhere in the main window closes the list under the
+        search box, the search results window and the Ctrl+K box (crowd
+        test 5.3.4 #1 and #21: they stayed over the window and took its
+        clicks)."""
+        w = e.widget
+        if isinstance(w, str):
+            return
+        drop = getattr(self, "search_drop", None)
+        if drop is not None and drop.frame is not None and \
+                not drop.owns(w):
+            drop.close()
+        self.close_search_window()
+        pal = getattr(self, "_palette", None)
+        if pal is not None:
+            pal.close()
+
+    def _search_win_geometry(self, w, h):
+        """Under the search box, inside the screen (it opened at the top
+        left, over the tabs and the box itself)."""
+        e, root = self.search_entry, self.root
+        root.update_idletasks()
+        sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+        right = e.winfo_rootx() + e.winfo_width()
+        x = max(0, min(right - w, sw - w - 8))
+        y = e.winfo_rooty() + e.winfo_height() + 6
+        h = max(200, min(h, sh - y - 48))
+        return f"{w}x{h}+{x}+{y}"
+
     def _run_global_search(self):
+        drop = getattr(self, "search_drop", None)
+        if drop is not None:
+            drop.cancel()
+            drop.close()
+        self.close_search_window()
         q = self.global_search_var.get().strip()
         if not q:
-            return
-        res = self.search_results(q)
+            return None
+        groups = self.search_groups(q)
+        total = sum(len(items) for _g, items in groups)
         t = self.theme
         win = tk.Toplevel(self.root)
+        self._search_win = win
         win.title(f"Search results for “{q}”")
-        win.geometry(px_geo("620x480"))
+        try:
+            w, h = (int(x) for x in px_geo("620x480").split("x"))
+        except ValueError:
+            w, h = 620, 480
+        win.geometry(self._search_win_geometry(w, h))
         win.configure(bg=t["tab_bg"])
         win.transient(self.root)
-        tk.Label(win, text=f"{sum(len(v) for v in res.values())} result(s). "
-                           f"Double-click to jump there.", bg=t["tab_bg"],
-                 fg=t["muted_fg"]).pack(anchor="w", padx=10, pady=(8, 0))
+        if total:
+            head = ("1 result. Double-click or press Enter to open it."
+                    if total == 1 else
+                    f"{total} results. Double-click or press Enter to "
+                    f"open one.")
+        else:
+            head = ("No matches found. Tip: try device:, site:, ip:, "
+                    "port: or alert:")
+        tk.Label(win, text=head, bg=t["tab_bg"], fg=t["muted_fg"],
+                 anchor="w", justify="left", wraplength=w - 40).pack(
+            fill="x", padx=10, pady=(8, 0))
         frame, tree = make_tree(win, [("what", "Result", 560, "w", True)],
                                 show="tree", sortable=False)
         frame.configure(bg=t["tab_bg"])
         frame.pack(fill="both", expand=True, padx=10, pady=10)
-        refs = {}
-        if not res:
-            tree.insert("", "end", text="No matches found. Tip: try device:, "
-                                        "site:, ip:, port: or alert:")
-        for group, items in res.items():
-            g = tree.insert("", "end", text=f"{group} ({len(items)})",
-                            open=True)
-            for label, ref in items:
+        # the results are in the tree column (#0), which kept Tk's 200
+        # pixels: "Health › Wi-Fi signal (thi" (crowd test 5.3.4 #2)
+        tree.configure(displaycolumns=())
+        tree.column("#0", width=w - 60, minwidth=200, stretch=True)
+        acts = {}
+        first = None
+        for group, items in groups:
+            g = tree.insert("", "end", text=f"{translate_text(group)} "
+                                            f"({len(items)})", open=True)
+            for label, action in items:
                 iid = tree.insert(g, "end", text=label)
-                refs[iid] = ref
+                acts[iid] = action
+                first = first or iid
+        win._mw_results, win._mw_tree = (total, acts), tree
 
         def go(_e=None):
             sel = tree.selection()
-            if sel and refs.get(sel[0]):
-                self.open_ref(refs[sel[0]])
+            act = acts.get(sel[0]) if sel else None
+            if act is None:
+                return "break"
+            self.close_search_window()
+            with contextlib.suppress(tk.TclError):
+                act()
+            return "break"
         tree.bind("<Double-1>", go)
         tree.bind("<Return>", go)
-        win.bind("<Escape>", lambda e: win.destroy())
+        win.bind("<Escape>",
+                 lambda e: self.close_search_window(refocus=True) or "break")
+        if first:
+            tree.selection_set(first)
+            tree.focus(first)
+        # the keyboard goes to the results, so Escape and the arrows work
+        # without a click in the window first (crowd test 5.3.4 #1)
+        tree.focus_set()
+        win.after(60, lambda: focus_toplevel(win, tree))
+        return win
 
     # ======================================================================
     #  Settings glue
@@ -58525,9 +62500,8 @@ proc ::mw_explicit_fonts {top names} {
         if LEDGER.killed and not was:
             with contextlib.suppress(Exception):
                 self._stop_lan_scanner()
-            self._set_banner("\U0001F6D1  Kill switch on — MiniWireshark "
-                             "sends nothing (watching continues).",
-                             kind="warn")
+            self._set_banner("\U0001F6D1  Kill switch on — " +
+                             KILL_SWITCH_EFFECT, kind="warn")
         if was != LEDGER.killed:
             with contextlib.suppress(Exception):
                 self._restyle_mode_banner()
@@ -58935,7 +62909,8 @@ proc ::mw_explicit_fonts {top names} {
                  anchor="w").pack(fill="x", padx=14, pady=(12, 0))
         tk.Label(win, text="Optional data, packages and helpers. "
                            "MiniWireshark watches your network without any "
-                           "of them, and nothing downloads unless you ask. "
+                           "of them, and nothing downloads unless you ask "
+                           "(Get, Check now, or Updates: Weekly). "
                            "Every download is listed in the self-traffic "
                            "ledger, and the kill switch blocks them all.",
                  bg=t["tab_bg"], fg=t["muted_fg"], anchor="w",
@@ -59135,7 +63110,7 @@ proc ::mw_explicit_fonts {top names} {
         return n
 
     def ledger_status_text(self):
-        state = ("🛑 Kill switch ON — nothing is being sent." if
+        state = ("🛑 Kill switch on — " + KILL_SWITCH_EFFECT if
                  LEDGER.killed else "Sent since start, by feature:")
         return state + "\n" + "\n".join(LEDGER.summary_lines())
 
@@ -59162,13 +63137,12 @@ proc ::mw_explicit_fonts {top names} {
         kill_var = tk.BooleanVar(value=LEDGER.killed)
 
         def toggle():
-            self.config.set("privacy.kill_switch", kill_var.get())
-            self.config.save()
-            self._apply_runtime_settings()
+            self.set_kill_switch(kill_var.get())
             fill()
         ttk.Checkbutton(bar, text="Kill switch: stop everything MiniWireshark "
                                   "sends", variable=kill_var,
                         command=toggle).pack(side="left")
+        win._mw_kill_var = kill_var
         sum_var = DisplayVar()
         tk.Label(bar, textvariable=sum_var, bg=t["tab_bg"],
                  fg=t["muted_fg"]).pack(side="right")
@@ -59180,12 +63154,23 @@ proc ::mw_explicit_fonts {top names} {
             ("detail", "Details", 260, "w", True),
             ("status", "", 70, "center", False)])
         wrap.pack(fill="both", expand=True, padx=12, pady=8)
+        # (#3) an empty ledger says so instead of showing a blank table
+        empty_lbl = tk.Label(win, text="Nothing sent or blocked yet.",
+                             bg=t["tab_bg"], fg=t["muted_fg"])
+        win._mw_empty = empty_lbl
         shown = [0]
 
         def fill():
             if not win.winfo_exists():
                 return
+            if bool(kill_var.get()) != LEDGER.killed:
+                kill_var.set(LEDGER.killed)   # changed elsewhere (#3)
             rows = LEDGER.snapshot()
+            if rows and empty_lbl.winfo_manager():
+                empty_lbl.place_forget()
+            elif not rows and not empty_lbl.winfo_manager():
+                empty_lbl.place(in_=wrap, relx=0.5, rely=0.35,
+                                anchor="center")
             if len(rows) != shown[0] or not tree.get_children():
                 tree.delete(*tree.get_children())
                 for e in reversed(rows[-1000:]):
@@ -59478,21 +63463,28 @@ proc ::mw_explicit_fonts {top names} {
 
     def clear_history(self, parent=None):
         if self.history is None:
-            if os.path.exists(PATHS.history_db) and messagebox.askyesno(
-                    "Clear history", "History is off, but an old history "
-                    "file exists. Delete it?", parent=parent or self.root):
+            if (os.path.exists(PATHS.history_db) or
+                    history_record_files()) and messagebox.askyesno(
+                    "Clear history", "History is off, but old history or "
+                    "saved sessions are still on this computer. Delete "
+                    "them?", parent=parent or self.root):
                 remove_history_copies(PATHS.history_db, live_too=True)
                 self._wipe_packets()
+                self._forget_records()
             return
         choice = messagebox.askyesnocancel(
-            "Clear history", "Yes = delete ALL stored history.\nNo = delete "
-            "only the selected device's history (Devices tab).",
+            "Clear history", "Yes = delete ALL stored history: the "
+            "history, saved packets, the last autosave, crash copies, your "
+            "device names and notes, remembered networks and the list of "
+            "programs that wait for connections.\nNo = delete only the "
+            "selected device's history (Devices tab).",
             parent=parent or self.root)
         if choice is None:
             return
         if choice:
             self.history.clear()
             self._wipe_packets()
+            self._forget_records()
             self._set_banner("\U0001F5D1  History cleared.")
         else:
             keys = self.tabs["devices"].selected_keys()
@@ -59504,6 +63496,28 @@ proc ::mw_explicit_fonts {top names} {
             for k in keys:
                 self.history.clear(k)
             self._set_banner("\U0001F5D1  That device's history was deleted.")
+
+    def _forget_records(self):
+        """Second audit (privacy #7): "Delete ALL history" also deletes the
+        other records of what was seen: the autosave, the crash journals,
+        your device names and notes, the remembered networks and the
+        programs that waited for connections (history_record_files). Only
+        the history database and the saved packets went before."""
+        self.known.data = {}
+        self.networks.data = {"networks": {}}
+        self.network_profile = None
+        lw = getattr(self, "listen_watch", None)
+        if lw is not None:
+            lw.known, lw.learning = {}, True
+        self._journal_written = False
+        self._journal_count = -1
+        gone = 0
+        for path in history_record_files():
+            with contextlib.suppress(OSError):
+                os.remove(path)
+                gone += 1
+        LOG.info("delete all history: %d other files removed", gone)
+        return gone
 
     def reset_baselines(self, parent=None):
         if messagebox.askyesno("Reset learned baselines",
@@ -59519,6 +63533,20 @@ proc ::mw_explicit_fonts {top names} {
 
     def _session_only_history(self):
         return self.config.get("history.retention") == "Session only"
+
+    def _exit_autosave(self):
+        """On a clean exit. Second audit (privacy #8): the session is kept
+        (the "Open last autosave" copy) only while history is on and kept
+        for longer than the session. With history off (the default) it
+        used to be written on every exit, though TRUST.md says history is
+        off. -> the autosave's path or None."""
+        if self._session_only_history():
+            self._forget_session_history()
+            return None
+        if self.history is None:
+            LOG.info("history is off: the session is not kept on exit")
+            return None
+        return self.autosave("exit")
 
     def _forget_session_history(self):
         """5.3.4 (CO-10): "Session only keeps nothing after you close".
@@ -59712,9 +63740,12 @@ proc ::mw_explicit_fonts {top names} {
 
     def _geoip_retry(self):
         n = self.geoip.retry_failed()
-        for ip, rec in self.model.remote_hosts.items():
-            if not rec.country:
-                self.geoip.request(ip)
+        # second audit (privacy #11): only live addresses, as everywhere
+        # else (an opened capture file's addresses were sent)
+        if self.data_mode == "live":
+            for ip, rec in self.model.remote_hosts.items():
+                if not rec.country:
+                    self.geoip.request(ip)
         self._set_banner(f"\U0001F30D  Retrying country lookups ({n} that had "
                          f"failed).")
 
@@ -59772,8 +63803,11 @@ proc ::mw_explicit_fonts {top names} {
             LOG.info("automatic update check skipped: %s", why)
             return False
         # court GUI-06: told with the first check that really runs, not
-        # while Safe Mode, the kill switch or offline work blocks it
-        if self.config.get("updates.notice_pending", False):
+        # while Safe Mode, the kill switch or offline work blocks it.
+        # Second audit (privacy #10): a new install is told too (the
+        # notice was only for upgrades): the first automatic check ever
+        if self.config.get("updates.notice_pending", False) or \
+                not _float(self.config.get("updates.last_check", 0)):
             self.config.set("updates.notice_pending", False)
             self.config.save()
             self._set_banner("⬆️  " + translate_text(
@@ -59905,6 +63939,10 @@ proc ::mw_explicit_fonts {top names} {
                 msg = apply_self_update(data, body["version"])
             except (OSError, ValueError, urllib.error.URLError) as e:
                 msg = f"Update failed, nothing was changed: {e}"
+            except Exception as e:                   # noqa: BLE001
+                # (35-checker review) never a silent end of this thread
+                LOG.exception("update failed")
+                msg = f"Update failed: {type(e).__name__}: {e}"
             self._async_results.put(lambda: messagebox.showinfo(
                 "Update", msg, parent=self.root))
         threading.Thread(target=work, daemon=True, name="self-update").start()
@@ -60003,10 +64041,10 @@ proc ::mw_explicit_fonts {top names} {
                     self.model.flows.closed_log.append(f)
                 self._pump_store(reschedule=False)
             self._save_raw_packets_on_exit()
-            if not self._session_only_history():
-                self.autosave("exit")
-            else:
+            if self._session_only_history():
                 self._forget_session_history()
+            else:
+                self._exit_autosave()
             with contextlib.suppress(OSError):
                 # 5.3.4 (OS-07): only this copy's own journal; a second
                 # copy running in the same folder keeps its crash copy
@@ -60393,9 +64431,55 @@ def inventory_html(rows, title="Device inventory", subtitle="", facts=None):
             f"</footer></body></html>")
 
 
+def _preview_cell(c):
+    c = re.sub(r"(?i)<br\s*/?>", " ", c)
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", "", c)).split())
+
+
+def _preview_table(m):
+    """One HTML table as text (crowd test #13): a table with a heading
+    row becomes one block per row ("Device: …" on its first line, then
+    "Kind: …, Address: …"), a two-column table "Label: value" lines. As
+    plain cells it ran together into one paragraph in the preview."""
+    rows = []
+    for tr in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", m.group(0)):
+        cells = re.findall(r"(?is)<(t[hd])[^>]*>(.*?)</t[hd]>", tr)
+        rows.append([(k.lower(), _preview_cell(v)) for k, v in cells])
+    rows = [r for r in rows if r]
+    if not rows:
+        return "\n"
+    out = []
+    if all(k == "th" for k, _v in rows[0]) and len(rows[0]) > 2:
+        names = [v for _k, v in rows[0]]
+        for r in rows[1:]:
+            vals = [v for _k, v in r]
+            pairs = [(names[i] if i < len(names) else "", v)
+                     for i, v in enumerate(vals) if v]
+            if not pairs:
+                continue
+            lead = next(((n, v) for n, v in pairs if n), pairs[0])
+            rest = [f"{n}: {v}" if n else v for n, v in pairs
+                    if (n, v) != lead]
+            out.append(f"{lead[0]}: {lead[1]}" if lead[0] else lead[1])
+            if rest:
+                out.append("    " + " · ".join(rest))
+            out.append("")
+    else:
+        for r in rows:
+            vals = [v for _k, v in r if v]
+            if len(r) == 2 and r[0][0] == "th":
+                out.append(f"{r[0][1]}: {r[1][1]}")
+            elif vals:
+                out.append(" · ".join(vals))
+    return "\n" + "\n".join(out).rstrip() + "\n\n"
+
+
 def html_to_preview_text(h):
     """A readable plain-text rendering of an HTML export (for previews)."""
-    h = re.sub(r"(?is)<(style|script)[^>]*>.*?</\1>", "", h)
+    # crowd test #13: the <title> (inside <head>) ran into the heading:
+    # "Network sheetNetwork sheet"
+    h = re.sub(r"(?is)<(style|script|title)[^>]*>.*?</\1>", "", h)
+    h = re.sub(r"(?is)<table[^>]*>.*?</table>", _preview_table, h)
     h = re.sub(r"(?i)<br\s*/?>|</(p|tr|h\d|li|section|div)>", "\n", h)
     h = re.sub(r"(?i)</t[dh]>", "  ", h)
     h = re.sub(r"<[^>]+>", "", h)
@@ -61007,12 +65091,10 @@ def checkup_facts(model, app=None, data_mode="live", namer=None,
     # MC6: unusual activity, then the other open warnings
     facts["unusual"] = unusual_findings(m.alerts, limit=5) if \
         FEATURES.get("unusual_section", True) else []
-    found = [m.alerts.alerts[a] for a in list(m.alerts.order)
-             if a in m.alerts.alerts]
+    others = other_open_alerts(m.alerts)
+    facts["other_open"] = len(others)
     facts["alerts"] = [(a.severity, translate_event(a.reason))
-                       for a in found if not a.acknowledged and
-                       a.severity in ("WARNING", "DANGER") and
-                       a.kind not in UNUSUAL_KINDS][:5]
+                       for a in others][:5]
     # MC7: the investigations, passively
     facts["investigations"] = checkup_investigations(m, app, offline)
     # MC3: the devices with their kinds
@@ -61133,7 +65215,9 @@ def checkup_html(facts, red=None):
     alerts = facts.get("alerts") or []
     parts.append(f"<section><h2>{e(tr('Unusual activity'))}</h2>" + (
         "".join(cards) if cards else
-        f"<p class='muted'>{e(tr('Nothing unusual right now.'))}</p>") + (
+        f"<p class='muted'>"
+        f"{e(tr(unusual_card_text(0, facts.get('other_open') or 0)))}</p>")
+        + (
         f"<p><b>{e(tr('Other open alerts'))}</b></p><ul>" + "".join(
             f"<li><span class='badge sev-{e(sev)}'>{e(tr(sev))}</span> "
             f"{E(reason)}</li>" for sev, reason in alerts) + "</ul>"
@@ -61324,6 +65408,7 @@ class DiagnosticsWindow:
                                       if nt[1] else "—")(
                 process_hit_rate(m)),
             f"Capture backend     {backend}",
+            "Capture rights      " + capture_rights_line(),
             "Npcap/libpcap       " + ("Npcap present" if IS_WINDOWS and
                                        _npcap_present() else
                                        "Npcap MISSING" if IS_WINDOWS else
@@ -61537,6 +65622,12 @@ TASK_WORKSPACES = {
 }
 
 
+def palette_tab_label(label_key, name=""):
+    """A tab as the tab strip names it, without its icon ("Happening")."""
+    label = translate_text(tr(label_key)) if label_key else name
+    return re.sub(r"^\W+\s*", "", label) or name
+
+
 class CommandPalette:
     """Ctrl+K: type to reach any tab, view, setting, filter, device or
     action."""
@@ -61565,9 +65656,23 @@ class CommandPalette:
         e.bind("<Down>", lambda ev: self._move(1))
         e.bind("<Up>", lambda ev: self._move(-1))
         self.lb.bind("<Double-1>", self.run)
-        self.win.bind("<Escape>", lambda ev: self.win.destroy())
+        self.win.bind("<Escape>", lambda ev: self.close())
+        self.entry = e
         self.filter()
         e.focus_set()
+        self.win.after(60, lambda: focus_toplevel(self.win, e))
+
+    def alive(self):
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def close(self):
+        """Escape, or a click in the main window (crowd test 5.3.4 #21:
+        the box stayed over the Health tab until Escape)."""
+        with contextlib.suppress(tk.TclError):
+            self.win.destroy()
 
     def filter(self):
         q = self.q.get()
@@ -61588,6 +65693,12 @@ class CommandPalette:
                            + (f"    [{key}]" if key else ""))
         if self.shown:
             self.lb.selection_set(0)
+        else:
+            self.lb.insert("end", translate_text(
+                "No matches. Try a tab, a setting, a device or an action."))
+            with contextlib.suppress(tk.TclError):
+                self.lb.itemconfigure(0, foreground=self.app.theme[
+                    "muted_fg"])
 
     def _move(self, d):
         sel = self.lb.curselection()
@@ -61607,7 +65718,7 @@ class CommandPalette:
         if label in rec:
             rec.remove(label)
         rec.append(label)
-        self.win.destroy()
+        self.close()
         fn()
 
 
@@ -62159,7 +66270,12 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
         raise ValueError(f"the download isn't a text file ({e})")
     if "MiniWireshark" not in text or "def main" not in text:
         raise ValueError("the download doesn't look like MiniWireshark")
-    compile(text, "miniwireshark_update.py", "exec")
+    try:
+        compile(text, "miniwireshark_update.py", "exec")
+    except (SyntaxError, ValueError) as e:
+        # (35-checker review) a SyntaxError escaped the update thread and
+        # the person was never told
+        raise ValueError(f"the download is not a working program ({e})")
     backup = f"{script_path}.v{SCRIPT_VERSION}.bak"
     before = os.stat(script_path)
     mode = stat.S_IMODE(before.st_mode)
@@ -62172,12 +66288,21 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
     # it really is; the link (and the backup beside it) stay as they are
     real = os.path.realpath(script_path)
     tmp = real + ".new"
-    with open(tmp, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
-    if not IS_WINDOWS:
-        # the new program keeps the old one's mode (a umask of 077 made
-        # it 0600, unreadable for the other users of a shared install)
-        os.chmod(tmp, mode)
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+            # (35-checker review) on disk before the rename: a power cut
+            # just after it could leave an empty program
+            f.flush()
+            os.fsync(f.fileno())
+        if not IS_WINDOWS:
+            # the new program keeps the old one's mode (a umask of 077 made
+            # it 0600, unreadable for the other users of a shared install)
+            os.chmod(tmp, mode)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
     os.replace(tmp, real)
     _give_update_back(before, (real, backup))
     # 5.2.3 (B-31): the marker names the file it belongs to and what was
@@ -62189,7 +66314,17 @@ def apply_self_update(data, tag, script_path=None, marker_path=None):
               "backup_sha256": sha256_file(backup),
               "time": time.time(), "attempts": 0}
     marker["mac"] = update_marker_mac(marker)
-    atomic_write_json(marker_path, marker)
+    try:
+        atomic_write_json(marker_path, marker)
+    except OSError as e:
+        # (35-checker review) the program is already replaced: this is no
+        # "nothing was changed" failure, only the automatic restore is off
+        LOG.warning("update marker not written: %s", e)
+        return (f"MiniWireshark {tag} was installed. Restart it to use the "
+                f"new version. A backup of {SCRIPT_VERSION} is at:\n"
+                f"{backup}\nThe automatic restore couldn't be set up ({e}): "
+                f"if the new version fails to start, copy the backup back "
+                f"by hand.")
     LOG.info("installed update %s (backup %s)", tag, backup)
     return (f"MiniWireshark {tag} was installed. Restart it to use the new "
             f"version. A backup of {SCRIPT_VERSION} is at:\n{backup}\nIf the "
@@ -62383,6 +66518,25 @@ def claim_interrupted_journal(path=None, now=None, keep=3):
     return dest
 
 
+def restore_program_copy(backup, script_path):
+    """(35-checker review) put the backup back in one rename: it is
+    copied beside the program and on disk first, so an interruption
+    leaves the old file or the new one, never half of one (a copy over
+    the program truncated it first, and this is the only restore path).
+    A program started through a symlink is restored where it really is."""
+    real = os.path.realpath(script_path)
+    tmp = real + ".rb"
+    try:
+        shutil.copy2(backup, tmp)
+        with open(tmp, "rb+") as f:
+            os.fsync(f.fileno())
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.remove(tmp)
+        raise
+    os.replace(tmp, real)
+
+
 def rollback_update_if_needed(force=False, script_path=None,
                               marker_path=None):
     """Called at startup (and on a startup crash). Returns a message if a
@@ -62406,7 +66560,7 @@ def rollback_update_if_needed(force=False, script_path=None,
         return ""
     if backup and os.path.exists(backup):
         try:
-            shutil.copy2(backup, script_path)
+            restore_program_copy(backup, script_path)
             os.remove(marker_path)
             LOG.warning("rolled back update %s", marker.get("version"))
             return (f"The update to {marker.get('version')} didn't start "
@@ -63911,7 +68065,9 @@ def _dissect_ipv4(d, off):
     tl = d.u16(off + 2)
     end = min(len(d.raw), off + tl) if tl >= hl else len(d.raw)
     d.node.length = end - off
-    d.add("ip.version", b0 >> 4, off, 1)
+    # audit 2026-11-14 #48: another version is said, not taken for IPv4
+    d.add("ip.version", b0 >> 4, off, 1,
+          warning="" if b0 >> 4 == 4 else "not 4: this isn't IPv4")
     d.add("ip.hdr_len", hl, off, 1, f"{hl} bytes",
           warning="" if hl >= 20 else "too short")
     d.add("ip.dsfield", d.u8(off + 1), off + 1, 1, f"0x{d.u8(off + 1):02x}")
@@ -63936,6 +68092,7 @@ def _dissect_ipv4(d, off):
     d.add("ip.checksum.status", "correct" if ok else "incorrect", off + 10, 2,
           warning="" if ok else "checksum does not match (normal for "
           "packets this computer sends when the card computes it)")
+    d.need(off + 12, 8)        # cut short: "truncated", not "malformed"
     d.add("ip.src", _socket.inet_ntoa(d.raw[off + 12:off + 16]), off + 12, 4)
     d.add("ip.dst", _socket.inet_ntoa(d.raw[off + 16:off + 20]), off + 16, 4)
     if hl > 20:
@@ -65050,6 +69207,12 @@ class MailTracker:
         rc.append(ts)
         while rc and ts - rc[0] > 60:
             rc.popleft()
+        if len(self.reconnects) > self.MAX:
+            # 5.3.4 (memory audit): one key per client and server, for
+            # ever; only the last minute is ever read
+            for k in [k for k, q in self.reconnects.items()
+                      if not q or ts - q[-1] > 60]:
+                del self.reconnects[k]
         if len(rc) == 10:
             self.finding(ts, "note", "Sequence",
                          f"{s.client} reconnected to the mail server "
@@ -65387,11 +69550,11 @@ class ProtocolTracker:
         self.dhcp = OrderedDict()  # xid -> state
         self.dhcp_servers = set()
         self._dhcp_warned = False
-        self.http = {}             # stream -> deque of pending requests
+        self.http = OrderedDict()  # stream -> deque of pending requests
         self.tls = OrderedDict()   # stream -> handshake state
         self.ntp = OrderedDict()   # (client, server, xmt) -> (ts, no)
         self.ssh = {}              # stream -> banners
-        self.mqtt = {}             # stream -> counters
+        self.mqtt = OrderedDict()  # stream -> counters
         self.counts = Counter()
         self.mail = MailTracker(self._emit_kw, self._finding)
         self.logins = OrderedDict()    # stream -> state (IP-013)
@@ -65405,6 +69568,12 @@ class ProtocolTracker:
     def closed(self, st, ts, how):
         """A TCP stream finished (FIN, RST, idle or memory)."""
         self.mail.closed(st, ts, how)
+        # 5.3.4 (memory audit): the stream's waiting requests and counts
+        # went on being kept, one entry per HTTP or MQTT connection
+        key = repr(st.key)
+        self.http.pop(key, None)
+        self.mqtt.pop(key, None)
+        self.ssh.pop(key, None)
 
     def take(self):
         out, self.out = self.out, []
@@ -65764,7 +69933,10 @@ class ProtocolTracker:
                                       m.direction == 0 else server[0],
                                       server[0] if m.direction == 0 else
                                       client[0], kind="rtsp")
-            q = self.http.setdefault(key, deque(maxlen=64))
+            q = self.http.get(key)
+            if q is None:
+                q = self.http[key] = deque(maxlen=64)
+                self._bound(self.http, self.MAX_PENDING)
             mm = re.match(r"^([A-Z]+) (\S+) HTTP/1\.\d", first)
             if m.direction == 0 and mm:
                 host = re.search(rb"\r\nhost:\s*([^\r\n]+)", data, re.I)
@@ -65834,7 +70006,10 @@ class ProtocolTracker:
             return None
         if m.kind == "mqtt" and data:
             t = data[0] >> 4
-            s = self.mqtt.setdefault(key, Counter())
+            s = self.mqtt.get(key)
+            if s is None:
+                s = self.mqtt[key] = Counter()
+                self._bound(self.mqtt, self.MAX_PENDING)
             s[_MQTT_TYPES.get(t, str(t))] += 1
             if t == 2 and len(data) >= 4:
                 rc = data[3]
@@ -67507,6 +71682,57 @@ class ScenarioBuilder:
         return frames
 
 
+def long_run_hosts(n=20):
+    """The steady devices of the long-run scenario: (ip, mac, name)."""
+    return [("192.168.1.%d" % (100 + i),
+             "02:00:5e:10:%02x:%02x" % (i // 256, i % 256), "") for i in
+            range(n)]
+
+
+def long_run_minute(minute, t0, hosts, names=2, seed=11, guests=False):
+    """5.3.4 (memory audit): one minute of a home network that runs for
+    days. The devices stay the same; what changes all the time is what
+    grows a memory: every device looks up `names` new websites a minute
+    (each on a new address, one in ten fails), opens a short connection
+    to each from a new port (one in ten ends with a reset), and every
+    fifth device fetches a page over plain HTTP. Every 10 minutes the
+    devices announce themselves and every 30 one device sweeps 70 ports
+    of another (an alert). With `guests`, once an hour a guest phone
+    arrives that never comes back (memory that grows with devices, not
+    with time). -> frames spread over the minute from t0."""
+    rng = random.Random(seed * 1000003 + minute)
+    sb = ScenarioBuilder(t0=t0, seed=minute)
+    sb.port = 20000 + (minute * 211) % 40000
+    sb.qid = (minute * 977) % 60000
+    L = sb.L
+    who = list(hosts)
+    if guests and minute % 60 == 30:
+        g = minute // 60
+        who.append(("192.168.1.%d" % (200 + g % 50),
+                    "da:%02x:%02x:00:00:01" % ((g >> 8) & 255, g & 255),
+                    ""))
+    for i, h in enumerate(who):
+        if minute % 10 == 0 or h not in hosts:
+            sb.arp_announce(h)
+        for j in range(names):
+            name = f"m{minute}-{i}-{j}.site{rng.randrange(10 ** 6)}.example"
+            rip = "34.%d.%d.%d" % (rng.randrange(1, 250), rng.randrange(256),
+                                   rng.randrange(1, 255))
+            sb.dns(h, name, rip, rcode=3 if rng.random() < 0.1 else 0)
+            sb.tls(h, name, rip, size=1500, rst=rng.random() < 0.1)
+        if i % 5 == 0:
+            sb.http(h, f"plain{minute % 500}.example.org",
+                    "34.117.%d.%d" % (minute % 250, i + 1))
+    if minute % 30 == 15 and len(hosts) > 1:
+        a, b = hosts[minute % len(hosts)], hosts[(minute + 1) % len(hosts)]
+        for k in range(70):
+            sb._emit(L.Ether(src=a[1], dst=b[1]) / L.IP(src=a[0], dst=b[0]) /
+                     L.TCP(sport=sb._next_port(), dport=1000 + k, flags="S"),
+                     dt=0.001)
+    n = max(1, len(sb.frames))
+    return [(raw, round(t0 + 59.0 * k / n, 6), lt)
+            for k, (raw, _ts, lt) in enumerate(sb.frames)]
+
 def scenario_identity():
     """(gateway, my_ips, my_macs, local_nets) of the scripted network."""
     return (ScenarioBuilder.GW[0], {ScenarioBuilder.ME[0]},
@@ -67946,8 +72172,10 @@ def corpus_scores(model, labels):
         got[mac] = cls
         if cls != want:
             wrong.append((mac, want, cls, word))
-            if word == "Likely" and "Router" in (want, cls) or \
-                    "This computer" in (want, cls):
+            # (35-checker review) the parentheses: any wrong label on
+            # "This computer" counted as a wrong Likely
+            if word == "Likely" and ("Router" in (want, cls) or
+                                     "This computer" in (want, cls)):
                 bad.append((mac, want, cls))
     per = {}
     for kind in sorted(set(labels.values())):
@@ -68506,7 +72734,7 @@ def run_self_tests(verbose=True, only=None):
         reg.v6_prefixes = [ipaddress.ip_network("2a01:4f8:1::/64")]
         assert reg.eligible_ip("2a01:4f8:1::5")
         if not scapy_ok:
-            return
+            return "skip"   # (35-checker review) was counted as passed
         p = Ether(src="00:11:22:33:44:01", dst="00:00:00:00:00:20") / \
             IP(src="93.184.215.14", dst="192.168.1.20") / \
             TCP(sport=443, dport=5555, flags="A")
@@ -68684,7 +72912,7 @@ def run_self_tests(verbose=True, only=None):
         assert parse_tls_hello(b"\x17\x03\x03\x00\x05hello") is None
         assert parse_tls_hello(ch[:60]) is not None   # truncated: no crash
         if need_scapy():
-            return
+            return "skip"   # (35-checker review) was counted as passed
         base = _test_eth() / IP(src="192.168.1.5", dst="93.184.215.14")
         rs = TlsReassembler()
         p1 = Ether(bytes(base / TCP(sport=4000, dport=443, flags="PA",
@@ -69108,17 +73336,14 @@ def run_self_tests(verbose=True, only=None):
                                        time.time())],
                            "domains": [("example.com", 3, 100)],
                            "baselines": [("k1", {"n": 5})]})
-        for _ in range(50):
-            if hs.q.empty():
-                break
-            time.sleep(0.05)
-        time.sleep(0.3)
+        # (35-checker review) an empty queue is not a finished write
+        assert hs.flush_now(10)
         assert hs.known_device_rows()[0][0] == "k1"
             # a row from before 5.3.4 comes back with when it was last learned
         row = hs.load_baselines()["k1"]
         assert row["n"] == 5 and 0 < row["last"] <= time.time() + 1, row
         hs.clear("k1")
-        time.sleep(0.4)
+        assert hs.flush_now(10)
         assert hs.known_device_rows() == []
         hs.stop()
 
@@ -69750,7 +73975,7 @@ def t_sanitize_hostile_names(ctx):
     assert len(sanitize_text("x" * 999)) == 200
     assert sanitize_text(b"bytes\xff") .startswith("bytes")
     if not ctx.scapy_ok:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     sb = ScenarioBuilder()
     host = ("192.168.1.77", "00:11:22:33:44:77", "pc‮cod.exe\x07")
     sb.dhcp(host)
@@ -70869,7 +75094,11 @@ def t_pipeline_worker(ctx):
     for raw, ts, lt in frames[:40]:
         old_sink(raw, ts, lt)
     w2.start()
-    time.sleep(0.3)
+    # (35-checker review) until the worker has read all 40 (a fixed 0.3 s
+    # flaked under load), then the same check
+    t_end = time.time() + 10
+    while w2.stale < 40 and time.time() < t_end:
+        time.sleep(0.01)
     w2.stop_flag = True
     w2.join(2)
     assert h2.count == 0 and w2.stale == 40, (h2.count, w2.stale)
@@ -70925,9 +75154,15 @@ def t_store_roundtrip(ctx):
         raise AssertionError("write through query()")
     except ValueError:
         pass
+    assert st.write_segment(1, 9, 100.0, 101.0, "seg.pcap", 4096, 1)
+    now = time.time()
+    assert st.write_segment(10, 19, now, now, "seg2.pcap", 4096, 1)
+    assert st.flush_now(10)
     st.prune(1)          # everything above is from 1970: pruned
     assert st.flush_now(10)
     assert st.counts()["observations"] == 0
+    # 5.3.4 (memory audit): the rows of old packet files go too
+    assert st.query("SELECT first_no FROM packet_segments") == [(10,)]
     st.stop(5)
 
 
@@ -70951,7 +75186,9 @@ def t_m1b_history_delete_all(ctx):
             if f.startswith("h.sqlite3") and f not in (
                 "h.sqlite3", "h.sqlite3-wal", "h.sqlite3-shm")]
     assert left == [], left
-    with contextlib.suppress(OSError):
+    # (35-checker review) no -wal file holds nothing either; any other
+    # error is no longer hidden
+    if os.path.exists(path + "-wal"):
         assert os.path.getsize(path + "-wal") == 0
     with open(path, "rb") as f:
         assert b"secret-clinic" not in f.read()
@@ -71038,7 +75275,7 @@ def t_bf001_reputation_ranges(ctx):
         (int(ipaddress.ip_address("2001:db8::")),
          int(ipaddress.ip_address("2001:db8::ffff")), "six", 6)])
     assert rl.lookup("10.200.0.1") == "big"
-    assert rl.lookup("10.1.1.9") in ("big", "small")
+    assert rl.lookup("10.1.1.9") == "small"     # the nearer, smaller one
     assert rl.lookup("11.0.0.1") == "" and rl.lookup("9.255.255.255") == ""
     assert rl.lookup("2001:db8::5") == "six"
     assert rl.lookup("2001:db9::5") == "" and len(rl) == 3
@@ -71794,6 +76031,567 @@ def t_ip013_secret_hidden_on_odd_ports(ctx):
         "Proxy-Authorization: (hidden)"
 
 
+# ---- second audit 2026-11-14: detections (#33-#38) ----------------------------
+def a2_local_ts(day, hour, minute=0):
+    """A packet time at this local hour on 2026-11-<day>."""
+    return time.mktime((2026, 11, day, hour, minute, 0, 0, 0, -1))
+
+
+def a2_model(ctx, frames, decoder=None):
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, frames, decoder=decoder or fast_frame_decoder(m),
+                  tick_every=2000)
+    return m
+
+
+def a2_upload_frames(sb, host, rip, total, minutes, size=8000):
+    """`total` bytes from `host` to `rip` spread over `minutes` (one
+    frame copied: the model counts bytes, not sequence numbers)."""
+    raw = bytes(PK.Ether(src=host[1], dst=sb.GW[1]) /
+                PK.IP(src=host[0], dst=rip) /
+                PK.TCP(sport=45555, dport=443, flags="PA", seq=1) /
+                PK.Raw(bytes(size)))
+    n = total // len(raw) + 1
+    step = minutes * 60.0 / n
+    for _ in range(n):
+        sb.t += step
+        sb.frames.append((raw, round(sb.t, 6), 1))
+
+
+def a2_kinds(m, kind):
+    return [a for a in m.alerts.alerts.values() if a.kind == kind]
+
+
+@self_test()
+def t_a2_night_upload(ctx):
+    """Second audit (#33): 30 MB sent to the Internet at 3 am raises "Large
+    upload at night" (WARNING, under Unusual activity, in the Story); the
+    same upload by day, and the same upload the next night (now known),
+    raise nothing; an iCloud backup at night is said as one (INFO, kept
+    out of Unusual activity); the sentences are in French and Spanish."""
+    rip, cloud = "93.184.215.99", "17.248.1.10"
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.dns(sb.PHONE, "upload.example.net", rip)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, sb.PHONE, rip, 30 * 1024 * 1024, 12)
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "night_upload")
+    assert len(got) == 1 and got[0].severity == "WARNING", got
+    a = got[0]
+    assert a.device_key == m.device_for(sb.PHONE[0]).key, a.device_key
+    assert "upload.example.net" in a.observed and "MB" in a.reason, a
+    assert [f["kind"] for f in unusual_findings(m.alerts)] == \
+        ["night_upload"], unusual_findings(m.alerts)
+    dg = digest_new(0, time.time() + 86400)
+    for _ in digest_memory_steps(m, dg):
+        pass
+    assert any("at night" in r for _t, _s, r in dg["alerts"]), dg["alerts"]
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why,
+                     UNUSUAL_PROBLEM["night_upload"],
+                     UNUSUAL_STEP["night_upload"],
+                     ALERT_MEANS["night_upload"],
+                     ALERT_TYPES["night_upload"][0]) + tuple(
+                         ALERT_CHECKLIST["night_upload"]):
+            assert translate_text(text, loc) != text, (loc, text)
+        assert translate_event(a.reason) == a.reason    # English now
+    # the next night, the same upload is what this phone does: quiet
+    sb2 = ScenarioBuilder(t0=a2_local_ts(11, 3))
+    a2_upload_frames(sb2, sb.PHONE, rip, 30 * 1024 * 1024, 12)
+    replay_frames(m, sb2.frames, decoder=fast_frame_decoder(m),
+                  tick_every=2000)
+    assert len(a2_kinds(m, "night_upload")) == 1, a2_kinds(m, "night_upload")
+    # by day: no night alert
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 14))
+    sb.home_network()
+    sb.dns(sb.PHONE, "upload.example.net", rip)
+    a2_upload_frames(sb, sb.PHONE, rip, 30 * 1024 * 1024, 12)
+    assert not a2_kinds(a2_model(ctx, sb.frames), "night_upload")
+    # an iCloud backup at night: said as one, not unusual
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.dns(sb.PHONE, "p42-content.icloud-content.com", cloud)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, sb.PHONE, cloud, 30 * 1024 * 1024, 12)
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "night_upload")
+    assert len(got) == 1 and got[0].severity == "INFO" and \
+        "iCloud" in got[0].reason, got
+    assert not unusual_findings(m.alerts), unusual_findings(m.alerts)
+    for loc in ("fr", "es"):
+        assert translate_text(got[0].observed, loc) != got[0].observed
+
+
+@self_test()
+def t_a2_known_services_not_unusual(ctx):
+    """Second audit (#38): a spike to a backup service (up) or a streaming
+    service (down) is told on the Timeline, not raised as an Unusual
+    activity warning; the same spike to an unknown server still is."""
+    gw, ips, macs, nets = scenario_identity()
+    clock = [SCENARIO_T0]
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs, now_fn=lambda: clock[0])
+    m.set_identity(local_nets=nets)
+    dev = m.registry.touch("192.168.1.23", "da:a1:19:23:45:67", "arp_reply",
+                           "x", clock[0])
+    m.ip_to_domains["17.248.1.10"] = OrderedDict(
+        [("p42-content.icloud-content.com", 1)])
+    m.ip_to_domains["45.57.1.2"] = OrderedDict(
+        [("ipv4-c001.1.oca.nflxvideo.net", 1)])
+    b = m.baselines.get(dev.key)
+    m.baselines.check = lambda snap: snap
+    b.last_top = ("17.248.1.10", "45.57.1.2")
+    m._baseline_check(dev, [("bytes_up", 3e7, 1e5),
+                            ("bytes_down", 9e8, 1e6)])
+    assert not a2_kinds(m, "upload_spike") and \
+        not a2_kinds(m, "download_spike"), list(m.alerts.alerts.values())
+    assert sum(e["kind"] == "traffic spike" for e in m.timeline) == 2
+    b.last_top = ("93.184.215.99", "93.184.215.98")
+    m._baseline_check(dev, [("bytes_up", 3e7, 1e5)])
+    assert len(a2_kinds(m, "upload_spike")) == 1
+    assert known_bulk_service("rr3.sn-a5m.googlevideo.com") == \
+        ("YouTube", "stream")
+    assert known_bulk_service("notgooglevideo.com") is None
+
+
+@self_test()
+def t_a2_two_addresses_no_story(ctx):
+    """Second audit (#38): a router that answers for two addresses, back
+    and forth, changed its address once, not 24 times; a phone that moves
+    to a new address still changes it each time."""
+    reg = DeviceRegistry("192.168.1.1", set(), ctx.cfg({}),
+                         now_fn=lambda: 1000.0)
+    for i in range(24):
+        reg.touch("192.168.1.1" if i % 2 else "192.168.0.1",
+                  "00:1e:58:aa:00:01", "arp_reply", "x", 1000.0 + 60 * i)
+        reg.touch(f"192.168.1.{100 + i}", "da:a1:19:23:45:67", "arp_reply",
+                  "x", 1000.0 + 60 * i)
+    ev = Counter(key for kind, _s, _t, key in reg.events
+                 if kind == "ip changed")
+    assert ev["00:1e:58:aa:00:01"] == 1 and \
+        ev["da:a1:19:23:45:67"] == 23, ev
+
+
+def a2_syn(sb, host, rip, dport=443, proto="TCP"):
+    sp = sb._next_port()
+    out = PK.Ether(src=host[1], dst=sb.GW[1]) / PK.IP(src=host[0], dst=rip)
+    if proto == "TCP":
+        sb._emit(out / PK.TCP(sport=sp, dport=dport, flags="S", seq=1), 0)
+    else:
+        sb._emit(out / PK.UDP(sport=sp, dport=dport) / PK.Raw(bytes(48)), 0)
+
+
+@self_test()
+def t_a2_beacon(ctx):
+    """Second audit (#35): a device that contacts one server every 60 s
+    (120 times) raises "Regular check-ins to one server" (WARNING, under
+    Unusual activity), and its card counts all 120 contacts, not the 24
+    kept; the clock (NTP every 64 s), uneven contacts and a server two of
+    your devices use raise nothing."""
+    rng = random.Random(3)
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+    t = sb.t
+    for i in range(120):
+        sb.t = t + 60 * i + rng.uniform(-1.5, 1.5)
+        a2_syn(sb, sb.PHONE, "185.199.110.77")
+        sb.t += 0.5
+        a2_syn(sb, sb.TV, "93.184.215.50", 123, "UDP")          # NTP
+        sb.t += 0.5
+        a2_syn(sb, sb.NAS, "93.184.215.51")          # shared cloud …
+        a2_syn(sb, sb.PRINTER, "93.184.215.51")      # … of two devices
+    sb.t = t
+    for _ in range(120):                              # uneven
+        sb.t += rng.choice((5, 30, 90, 200, 600))
+        a2_syn(sb, sb.PLUG, "93.184.215.52")
+    sb.frames.sort(key=lambda f: f[1])
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "beacon")
+    assert len(got) == 1 and got[0].severity == "WARNING", \
+        [(a.reason, a.device_key) for a in got]
+    a = got[0]
+    phone = m.device_for(sb.PHONE[0])
+    assert a.device_key == phone.key and "185.199.110.77" in a.reason and \
+        "every 60 s" in a.reason, a.reason
+    assert "beacon" in [f["kind"] for f in unusual_findings(m.alerts)]
+    per = periodic_findings(m, only=phone.key)
+    assert per and per[0][3] == 120, per
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why,
+                     UNUSUAL_PROBLEM["beacon"], UNUSUAL_STEP["beacon"],
+                     ALERT_MEANS["beacon"], ALERT_TYPES["beacon"][0]) + \
+                tuple(ALERT_CHECKLIST["beacon"]):
+            assert translate_text(text, loc) != text, (loc, text)
+    assert beacon_period([60.0 * i for i in range(25)]) == 60.0
+    assert beacon_period([60.0 * i + (i % 2) * 25 for i in range(25)]) \
+        is None
+
+
+@self_test()
+def t_a2_dns_tunnel(ctx):
+    """Second audit (#36): 400 TXT lookups with 56-character random labels
+    under one domain raise "Data hidden in name lookups"; lookups of
+    ordinary names, long readable names, an antivirus service's hash
+    lookups and the router forwarding lookups raise nothing."""
+    rng = random.Random(9)
+    abc = "abcdefghijklmnopqrstuvwxyz234567"
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+
+    def ask(host, name, qtype=1, dst=None):
+        sp = sb._next_port()
+        sb._emit(PK.Ether(src=host[1], dst=sb.GW[1]) /
+                 PK.IP(src=host[0], dst=dst or sb.GW[0]) /
+                 PK.UDP(sport=sp, dport=53) /
+                 PK.DNS(id=sp & 0xFFFF, rd=1,
+                        qd=PK.DNSQR(qname=name, qtype=qtype)), 0.5)
+    for i in range(400):
+        label = "".join(rng.choice(abc) for _ in range(56))
+        ask(sb.LAPTOP, f"{label}.t.tunnel-example.net", 16)
+        ask(sb.PHONE, f"www{i}.shop-example.com")
+        ask(sb.PHONE, "a-very-long-but-readable-subdomain-name-here."
+                      f"cdn{i}.example.org")
+        h = "".join(rng.choice("0123456789abcdef") for _ in range(40))
+        ask(sb.TV, f"{h}.files.sophosxl.net", 16)
+        ask((sb.GW[0], sb.GW[1]), f"{label}x.t.other-example.net", 16,
+            "9.9.9.9")
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "dns_tunnel")
+    assert len(got) == 1, [(a.reason, a.device_key) for a in got]
+    a = got[0]
+    assert a.device_key == m.device_for(sb.LAPTOP[0]).key and \
+        "tunnel-example.net" in a.observed and a.confidence == "High", a
+    assert a in other_open_alerts(m.alerts)          # check-up, Security
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why,
+                     ALERT_MEANS["dns_tunnel"],
+                     ALERT_TYPES["dns_tunnel"][0]) + tuple(
+                         ALERT_CHECKLIST["dns_tunnel"]) + tuple(a.evidence):
+            assert translate_text(text, loc) != text, (loc, text)
+    assert random_label("mzxw6ytboi2gk3tfnz2xgzlsmvzgk4tbmvzwi2lomfzw63th")
+    assert not random_label("a-very-long-but-readable-subdomain-name-here")
+    assert not random_label("0123456789012345678901234567890123")
+
+
+def a2_dhcp_ack(sb, server, mac, client, router, dns):
+    chaddr = bytes.fromhex(client[1].replace(":", "")) + b"\x00" * 10
+    sb._emit(PK.Ether(src=mac, dst=client[1]) /
+             PK.IP(src=server, dst=client[0]) / PK.UDP(sport=67, dport=68) /
+             PK.BOOTP(op=2, yiaddr=client[0], chaddr=chaddr) /
+             PK.DHCP(options=[("message-type", "ack"), ("server_id", server),
+                              ("lease_time", 3600), ("router", router),
+                              ("name_server", dns), "end"]))
+
+
+@self_test()
+def t_a2_rogue_dhcp(ctx):
+    """Second audit (#37): a second DHCP server that gives out itself as the
+    router and DNS server is DANGER and says so; the gateway stays the
+    real router even though the rogue answers more often; a second server
+    that gives the same router (a mesh node) stays a WARNING."""
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+    for _ in range(12):
+        a2_dhcp_ack(sb, rogue, rmac, sb.PHONE, rogue, rogue)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    assert m.dhcp_routers.most_common(1)[0][0] == rogue     # it answers more
+    assert m.infer_gateway() == gw, m.infer_gateway()
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert len(got) == 1 and got[0].severity == "DANGER", \
+        [(a.severity, a.reason) for a in got]
+    a = got[0]
+    assert "names itself as your router" in a.reason and \
+        "It names itself as the router and the DNS server." in a.observed, a
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why) + tuple(a.evidence):
+            assert translate_text(text, loc) != text, (loc, text)
+    # a mesh node handing out the same router: a warning, as before
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+    a2_dhcp_ack(sb, "192.168.1.2", "02:66:66:00:00:02", sb.PHONE, sb.GW[0],
+                sb.GW[0])
+    m = a2_model(ctx, sb.frames)
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert len(got) == 1 and got[0].severity == "WARNING", got
+    assert m.infer_gateway() == sb.GW[0]
+
+
+@self_test()
+def t_a2_spoof_and_scan_words(ctx):
+    """Second audit (#39): during ARP spoofing of the router (DANGER), the
+    attacker's claim on a phone's address adds no "Duplicate IP address
+    … often harmless" warning, and the Story says "Danger:" (in Spanish
+    "Peligro:", and a warning "Aviso:" like its Severity column); a port
+    scan of 1,024 ports says 1,024, and the resets the scan gets back
+    raise no "Repeated connection resets" about the scanner."""
+    S = ScenarioBuilder
+    ATT = ("192.168.1.66", "02:66:66:66:66:66")
+
+    def arp(b, ip, mac, to, dt):
+        b._emit(PK.Ether(src=mac, dst=to[1]) /
+                PK.ARP(op=2, psrc=ip, hwsrc=mac, pdst=to[0], hwdst=to[1]),
+                dt=dt)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    b = S()
+    b.home_network()
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m))
+    b.frames = []
+    arp(b, ATT[0], ATT[1], S.GW, 1)
+    for sec in range(300):
+        arp(b, S.GW[0], ATT[1], S.PHONE, 1.0)
+        arp(b, S.PHONE[0], ATT[1], S.GW, 0.01)
+        if sec % 30 == 0:
+            arp(b, S.GW[0], S.GW[1], S.PHONE, 0.01)
+            arp(b, S.PHONE[0], S.PHONE[1], S.GW, 0.01)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m), tick_every=20)
+    kinds = Counter((a.kind, a.severity) for a in m.alerts.alerts.values())
+    assert kinds[("arp_spoof", "DANGER")] >= 1, kinds
+    # (192.168.1.50 is claimed by two devices of the home network itself)
+    assert not [a for a in a2_kinds(m, "duplicate_ip")
+                if S.PHONE[0] in a.reason], kinds
+    dg = digest_new(0, time.time() + 86400)
+    for _ in digest_memory_steps(m, dg):
+        pass
+    story = story_build(dg)
+    danger = [it for _d, items in story["days"] for it in items
+              if it["kind"] == "alert" and it["severity"] == "DANGER"]
+    assert danger and all(it["text"].startswith("Danger") for it in danger)
+    old = CURRENT_LOCALE
+    try:
+        set_locale("es")
+        assert story_sentence(danger[0]).startswith("Peligro"), \
+            story_sentence(danger[0])
+        warn = {"say": _story_say("Warning: %s", ("x",), ())}
+        assert story_sentence(warn).startswith(translate_text("Warning"))
+    finally:
+        set_locale(old)
+    # a port scan of a printer: 1,024 closed ports in 50 seconds
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    b = S()
+    b.home_network()
+    pr = S.PRINTER
+    for port in range(1, 1025):
+        sp = 50000 + port % 7
+        b._emit(PK.Ether(src=S.ME[1], dst=pr[1]) /
+                PK.IP(src=S.ME[0], dst=pr[0]) /
+                PK.TCP(sport=sp, dport=port, flags="S", seq=1), 0.024)
+        b._emit(PK.Ether(src=pr[1], dst=S.ME[1]) /
+                PK.IP(src=pr[0], dst=S.ME[0]) /
+                PK.TCP(sport=port, dport=sp, flags="RA", seq=0, ack=2),
+                0.0005)
+    replay_frames(m, b.frames, decoder=fast_frame_decoder(m), tick_every=200)
+    scans = a2_kinds(m, "scan_pattern")
+    assert len(scans) == 1 and "1024 different ports" in scans[0].observed, \
+        [a.observed for a in scans]
+    assert not a2_kinds(m, "tcp_resets"), \
+        [a.reason for a in a2_kinds(m, "tcp_resets")]
+
+
+@self_test(needs_source=True)
+def t_a2_alert_text_translated(ctx):
+    """Second audit (#40): in French and Spanish an alert's whole text is
+    translated, not only its title: every fixed sentence an alert can
+    hold (what it means, innocent explanations, why it was flagged), and
+    the "what we saw" sentences of the common alerts; the alert table's
+    title too. A new device's alert no longer says "low-confidence"
+    under a High confidence."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    fixed = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "AlertEngine":
+            for c in ast.walk(node):
+                if isinstance(c, ast.Call) and \
+                        getattr(c.func, "attr", "") == "_add":
+                    for a in list(c.args[4:7]) + [
+                            k.value for k in c.keywords if k.arg == "why"]:
+                        if isinstance(a, ast.Constant) and \
+                                isinstance(a.value, str):
+                            fixed.add(a.value)
+    assert len(fixed) > 50, len(fixed)
+    miss = [(loc, s) for s in sorted(fixed) for loc in ("fr", "es")
+            if translate_text(s, loc) == s]
+    assert not miss, miss[:6]
+    clock = [SCENARIO_T0]
+    e = AlertEngine(ctx.cfg({}), now_fn=lambda: clock[0])
+    reg = DeviceRegistry("192.168.1.1", set(), ctx.cfg({}),
+                         now_fn=lambda: clock[0])
+    dev = reg.touch("192.168.1.60", "24:0a:c4:60:00:60", "arp_reply", "x",
+                    clock[0])
+    made = [e.new_device(dev),
+            e.baseline_anomaly(dev, "bytes_up", 5e6, 2e4,
+                               note="first time active at night"),
+            e.baseline_anomaly(dev, "new_conns", 300, 4),
+            e.duplicate_ip("192.168.1.60", 2),
+            e.gateway_change("192.168.1.1", 2),
+            e.arp_spoof("192.168.1.1", 2, 5, True),
+            e.dhcp_anomaly({"192.168.1.1", "192.168.1.2"}),
+            e.tcp_resets(dev, 45, 600, "93.184.215.14"),
+            e.scan_pattern(dev, "different ports on 192.168.1.50", 90)]
+    assert all(made), made
+    nd = made[0]
+    assert nd.confidence == "High" and "-confidence" not in nd.observed, \
+        nd.observed
+    for a in made:
+        for loc in ("fr", "es"):
+            for text in [a.reason, a.observed] + list(a.evidence):
+                assert translate_text(text, loc) != text, (loc, text)
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        assert all(translate_event(a.reason) != a.reason for a in made), \
+            [a.reason for a in made if translate_event(a.reason) == a.reason]
+    finally:
+        set_locale(old)
+
+
+@self_test()
+def t_a2_login_in_default_mode(ctx):
+    """Second audit (#34): without Full Power, a password POSTed over plain
+    HTTP (in the request's packet, or in the packet after its headers, or
+    as JSON), HTTP Basic and FTP PASS each raise "Login sent without
+    encryption", from either decoder; a login page without a password, an
+    empty password field and a field that only starts with "pass" raise
+    nothing; the password is in no alert, timeline line or decoded
+    packet."""
+    c = IP013_CANARY.encode()
+    sb = ScenarioBuilder()
+    sb.home_network()
+    me, gw = sb.ME, sb.GW[1]
+    head = (b"POST /login HTTP/1.1\r\nHost: shop.example\r\nContent-Type: "
+            b"application/x-www-form-urlencoded\r\n")
+    sb._tcp_talk(me, "93.184.215.61", gw, 46001, 80, [
+        (0, head + b"Content-Length: 30\r\n\r\nuser=alex&password=" + c),
+        (1, b"HTTP/1.1 302 Found\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.62", gw, 46002, 80, [
+        (0, head + b"Content-Length: 30\r\n\r\n"),
+        (0, b"user=alex&pwd=" + c), (1, b"HTTP/1.1 302 Found\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.63", gw, 46003, 8080, [
+        (0, b"POST /api/session HTTP/1.1\r\nHost: cam.example\r\nContent-"
+            b"Type: application/json\r\n\r\n{\"user\":\"alex\",\"password\":"
+            b"\"" + c + b"\"}"), (1, b"HTTP/1.1 200 OK\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.64", gw, 46004, 21, [
+        (1, b"220 hi\r\n"), (0, b"USER alex\r\n"), (1, b"331 pw\r\n"),
+        (0, b"PASS " + c + b"\r\n"), (1, b"230 ok\r\n")])
+    # nothing to say: no password, an empty one, "passage", a GET page
+    sb._tcp_talk(me, "93.184.215.65", gw, 46005, 80, [
+        (0, head + b"\r\nuser=alex&remember=1"),
+        (0, head + b"\r\nuser=alex&password=&x=1"),
+        (0, head + b"\r\npassage=north&compass=" + c),
+        (0, b"GET /login HTTP/1.1\r\nHost: shop.example\r\n\r\n"),
+        (1, b"HTTP/1.1 200 OK\r\n\r\npassword=" + c)])
+    decoders = [fast_frame_decoder]
+    if ctx.scapy_ok:
+        decoders.append(default_frame_decoder)
+    for mk in decoders:
+        gwip, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg({}), gwip, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        replay_frames(m, sb.frames, decoder=mk(m))
+        got = a2_kinds(m, "cleartext_login")
+        where = sorted(a.refs.get("remote") for a in got)
+        assert where == ["93.184.215.61", "93.184.215.62", "93.184.215.63",
+                         "93.184.215.64"], (mk.__name__, where)
+        assert all(a.severity == "WARNING" and "unencrypted packet" in a.why
+                   for a in got), got
+        blob = json.dumps([alert_to_dict(a) for a in m.alerts.alerts
+                           .values()]) + repr(list(m.timeline)) + \
+            repr(m.ev_feed)
+        for form in ip013_secret_forms():
+            assert form not in blob, "the password leaked into an alert"
+    for raw, ts, lt in sb.frames:
+        d = fast_decode(raw, ts, lt)
+        text = repr({k: v for k, v in d.items()
+                     if k not in ("raw", "pkt", "payload")})
+        assert IP013_CANARY not in text, text[:200]
+    for loc in ("fr", "es"):
+        for text in ("a password field in a web form",
+                     "A sign-in was recognised in an unencrypted packet."):
+            assert translate_text(text, loc) != text, (loc, text)
+
+
+@self_test()
+def t_a2_ui_words(ctx):
+    """Second audit (#51, #53, #54): a nameless device's label is
+    translated inside a French or Spanish sentence; a Story day heading
+    reads "Today · 2 changes" in the wide column and a Story row's Type
+    column names its category (not "×5"); the Spanish Story says "Aviso"
+    like the severity column; the ALERTS card names its counts; the Map
+    legend says what its letters mean; French calls a reported fact
+    "Signalé" and a correlated one "Corrélé" everywhere."""
+    anon = ("Device using a private Wi-Fi address (192.168.1.77) offers "
+            "remote access (SSH)")
+    for loc, word in (("fr", "Appareil avec une adresse Wi-Fi privée"),
+                      ("es", "Dispositivo con una dirección Wi-Fi privada")):
+        out = translate_text("Warning: " + anon, loc)
+        assert word in out and "Device " not in out, (loc, out)
+    old = CURRENT_LOCALE
+    try:
+        now = time.time()
+        today = story_day(now)
+        row = story_day_row(today, 2)
+        assert row[:3] == ("", "", "") and "Today" in row[3] and \
+            "2 changes" in row[3], row
+        it = {"severity": "WARNING", "category": "Devices", "count": 5,
+              "say": _story_say("%s changed its address %d times",
+                                ("Phone", 5)),
+              "text": "Phone changed its address 5 times"}
+        cells = story_item_row(it, "⚠", "10:00–10:20")
+        assert cells[2] == "Devices" and "×" not in "".join(cells), cells
+        assert alerts_card_text({"DANGER": 0, "WARNING": 1, "INFO": 5}) == \
+            "Danger 0 · Warning 1 · Info 5"
+        assert "Letters = confidence" not in MapTab.LEGEND and \
+            "H high" in MapTab.LEGEND, MapTab.LEGEND
+        set_locale("es")
+        row = story_day_row(today, 2)
+        assert "Hoy" in row[3] and "2 cambios" in row[3], row
+        assert story_item_row(it, "⚠", "")[2] == "Dispositivos"
+        st = {"say": _story_say("Warning: %s", (anon,), (0,))}
+        assert story_sentence(st).startswith("Aviso: Dispositivo"), \
+            story_sentence(st)
+        assert translate_text(alerts_card_text(
+            {"DANGER": 2, "WARNING": 1, "INFO": 5})) == \
+            "Peligro 2 · Aviso 1 · Info 5"
+        assert translate_text(MapTab.LEGEND).startswith("Letra en"), \
+            translate_text(MapTab.LEGEND)[:60]
+        set_locale("fr")
+        assert translate_text(alerts_card_text(
+            {"DANGER": 2, "WARNING": 1, "INFO": 5})) == \
+            "Danger 2 · Avertissement 1 · Info 5"
+        assert translate_text(MapTab.LEGEND).startswith("Lettre sur"), \
+            translate_text(MapTab.LEGEND)[:60]
+        for en in ("Looked up (reported)", "Reported vs observed",
+                   "observed  ◈ reported  ◎ correlated  ◌ inferred  "
+                   "? unknown"):
+            fr = translate_text(en)
+            assert "apporté" not in fr and "ignalé" in fr, fr
+        legend = [v for k, v in I18N["fr"].items()
+                  if k.startswith("Device evidence: is it a real device?")]
+        assert legend and all("Recoupé" not in v and "◎ Corrélé" in v
+                              for v in legend), legend
+    finally:
+        set_locale(old)
+
+
 @self_test()
 def t_ip010_own_blocklist(ctx):
     """5.3.4 (IP-010): your own blocklist file: addresses, ranges (IPv4 and
@@ -71885,14 +76683,16 @@ def t_ip010_own_blocklist(ctx):
         assert a.severity == "WARNING" and "your own blocklist and a " \
             "public blocklist" in a.reason, a.reason
         # the switch off: the list is not used
+        was_on = FEATURES.get("own_blocklist", True)
         FEATURES["own_blocklist"] = False
         try:
             r = reputation_db()
             assert r is None or not r.lookup("45.9.20.1")
         finally:
-            FEATURES["own_blocklist"] = True
-        assert use_own_blocklist(None) is None and reputation_db() is None \
-            or not reputation_db().lookup("45.9.20.1")
+            FEATURES["own_blocklist"] = was_on   # (35-checker review)
+        assert use_own_blocklist(None) is None and (
+            reputation_db() is None or
+            not reputation_db().lookup("45.9.20.1"))
     finally:
         OWN_BLOCKLIST[0] = old
         _REP_GEN[0] += 1
@@ -73315,7 +78115,9 @@ def t_corrections_property(ctx):
             for dv in reg.by_key.values():
                 assert sum(st.get("bytes_up", 0) for st in
                            dv.iface_stats.values()) == dv.bytes_up
-            assert sum(owners.values()) == len(macs)
+            # (35-checker review) was sum(owners) == len(macs), true by
+            # construction: every owner is a live device instead
+            assert set(owners) <= set(reg.by_key), (trial, owners)
 
 
 @self_test()
@@ -73853,7 +78655,12 @@ def t_environment_diagnose(ctx):
     assert names[:3] == ["Python", "Graphical toolkit (Tk)", "pip"], names
     assert set(RUNTIME_LOCK) <= set(names)
     sc = next(r for r in rep["rows"] if r[0] == "scapy")
-    assert sc[1] and sc[4] != "bad", sc        # the self-test needs scapy
+    if ctx.scapy_ok:
+        assert sc[1] and sc[4] != "bad", sc
+    else:
+        # second audit (install #29): a fresh install has no scapy yet,
+        # and the check must say so instead of the self-test failing
+        assert not sc[1] and sc[4] == "bad" and "Missing" in sc[3], sc
     assert "pip check" in rep["text"] or rep["pip_problems"]
     assert rep["info"]["python"] == platform.python_version()
     try:
@@ -73918,7 +78725,27 @@ def t_quic_rfc9001_vectors(ctx):
         bytes.fromhex("000102030405060708090a0b0c0d0e0f"),
         bytes.fromhex("00112233445566778899aabbccddeeff")).hex() == \
         "69c4e0d86a7b0430d8cdb78070b4c55a"
-    # GCM: NIST test case 4-style round trip and tamper detection
+    # GCM: the NIST GCM spec's test cases 1, 2 and 4 (with AAD), checked
+    # without `cryptography` too (35-checker review: only a round trip was
+    # checked, which a symmetric GHASH mistake passes)
+    z16, z12 = bytes(16), bytes(12)
+    assert _aes_gcm_py(z16, z12, b"", b"", decrypt=False).hex() == \
+        "58e2fccefa7e3061367f1d57a4e7455a"
+    assert _aes_gcm_py(z16, z12, z16, b"", decrypt=False).hex() == \
+        "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"
+    k4 = bytes.fromhex("feffe9928665731c6d6a8f9467308308")
+    iv4 = bytes.fromhex("cafebabefacedbaddecaf888")
+    p4 = bytes.fromhex(
+        "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72"
+        "1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")
+    a4 = bytes.fromhex("feedfacedeadbeeffeedfacedeadbeefabaddad2")
+    c4 = bytes.fromhex(
+        "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e"
+        "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091"
+        "5bc94fbc3221a5db94fae95ae7121a47")
+    assert _aes_gcm_py(k4, iv4, p4, a4, decrypt=False) == c4
+    assert _aes_gcm_py(k4, iv4, c4, a4) == p4
+    # round trip and tamper detection at other lengths
     key, nonce = bytes(range(16)), bytes(range(12))
     for n in (0, 15, 16, 33, 1000):
         data = bytes((i * 7) & 0xff for i in range(n))
@@ -74547,8 +79374,10 @@ def outbound_bypasses(tree):
                     starts_online(child, near)
                 if is_send:
                     owner = fn.name if fn is not None else "<module>"
-                    # os_identity: connect() on a UDP socket sends nothing
-                    exempt = owner in ("net_urlopen", "os_identity") or \
+                    # os_identity, local_own_addresses: connect() on a UDP
+                    # socket sends nothing
+                    exempt = owner in ("net_urlopen", "os_identity",
+                                       "local_own_addresses") or \
                         top.startswith(("t_", "_gs_", "test_"))
                     if not exempt and not (fn is not None and
                                            calls_outbound(fn)):
@@ -75171,7 +80000,7 @@ def t_investigations_reach_planted_cause(ctx):
     assert bw["rows"][0].startswith("◉ TV used")
     # on a scripted replay: slow DNS answers are the planted cause
     if not ctx.scapy_ok:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     S = ScenarioBuilder
     fr = []
     t = ctx.frames()[-1][1] + 5
@@ -78563,7 +83392,7 @@ def t_warm_up_on_the_loading_screen(ctx):
         FEATURES["compiled_start"] = real_cs
     # the capture start: the first quiet wait ends it, not a 0.2 s sleep
     if not ctx.scapy_ok or conf is None:
-        return
+        return "skip"   # (35-checker review) was counted as passed
 
     class QuietSock:
         closed = False
@@ -78621,7 +83450,7 @@ def t_rt01_compiled_copy_forgery(ctx):
     folder others can write, a key others can read, and any copy at all
     when the start is root. A copy MiniWireshark made itself still loads."""
     if IS_WINDOWS:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     import hmac
     import importlib._bootstrap_external as be
     folder = ctx.path("rt01")
@@ -78668,7 +83497,7 @@ def t_m1a_data_trust(ctx):
     can write to is refused (OS-04, LG-10, RT-06); a rollback copies only
     the backup this install wrote, under an authentic marker (RT-02)."""
     if IS_WINDOWS:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     mine = ctx.path("m1a-mine")
     os.makedirs(mine, exist_ok=True)
     os.chmod(mine, 0o777)
@@ -78755,13 +83584,19 @@ def t_m1a_elevation(ctx):
     assert not wants_capture(None, ctx.cfg({"general.auto_start_capture":
                                             False}))
     if IS_WINDOWS or IS_MAC:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     assert isinstance(has_capture_rights(), bool)
     assert needs_elevation() is (not has_capture_rights())
     if os.geteuid() == 0:
         assert has_capture_rights()
     calls = []
     real_which, real_call = shutil.which, subprocess.call
+    # (35-checker review) the flag folders go in a temporary folder of the
+    # test's own: the system one may hold a real elevated copy's folder,
+    # and a failed assert left this test's folder there
+    real_tmp = tempfile.tempdir
+    tempfile.tempdir = ctx.path(f"elev-tmp-{uuid.uuid4().hex[:6]}")
+    os.makedirs(tempfile.tempdir)
 
     def refused(cmd, *a, **kw):
         calls.append(cmd)
@@ -78805,6 +83640,7 @@ def t_m1a_elevation(ctx):
         os.rmdir(d)
     finally:
         shutil.which, subprocess.call = real_which, real_call
+        tempfile.tempdir = real_tmp
 
 
 @self_test()
@@ -79866,7 +84702,7 @@ def t_os02_elevated_files_handed_back(ctx):
     finally:
         os.environ.update(saved)
     if IS_WINDOWS or os.geteuid() != 0:
-        return                         # only root can change an owner
+        return "skip"                  # only root can change an owner
     d = ctx.path(f"os02_{uuid.uuid4().hex[:6]}")
     os.makedirs(os.path.join(d, "sub"))
     for p_ in (os.path.join(d, "a.json"), os.path.join(d, "sub", "b.db")):
@@ -80752,6 +85588,551 @@ def t_story_process_hit_rate(ctx):
     for f in m.flows.archive:
         assert f.process == "", f.process       # not "needs admin rights"
     assert not pm.needs_admin                   # TIME_WAIT has no program
+
+
+def _local_fake_listeners():
+    """A fixed set of listening sockets (Websites → Local services)."""
+    return {("TCP", "127.0.0.1", 5173): (4001, "node"),
+            ("TCP", "::1", 5173): (4001, "node"),
+            ("TCP", "0.0.0.0", 8080): (4002, "python3"),
+            ("TCP", "127.0.0.1", 631): (88, "cupsd"),
+            ("TCP", "0.0.0.0", 5432): (99, "postgres"),
+            ("TCP", "::", 3000): (5, "node"),
+            ("TCP", "192.168.1.20", 8000): (6, "python.exe"),
+            ("UDP", "0.0.0.0", 5353): (7, "avahi-daemon"),
+            ("UDP", "0.0.0.0", 50123): (8, "chrome"),
+            ("TCP", "127.0.0.1", 44321): (None, ""),
+            ("TCP", "0.0.0.0", 5000): (9, "ControlCenter"),
+            ("TCP", "127.0.0.1", 443): (10, "nginx")}
+
+
+@self_test()
+def t_534_local_services_rows(ctx):
+    """5.3.4 (Local services): one row per protocol, port and program,
+    addresses merged; a plain guess at what it is (development web apps,
+    printing, PostgreSQL, the program's name before the port); who can
+    reach it; a browser address only for a TCP web app reachable at
+    127.0.0.1 or ::1; high UDP ports left out; reachable from the network
+    first."""
+    rows = local_service_rows(_local_fake_listeners())
+    by = {(r["proto"], r["port"]): r for r in rows}
+    assert len(rows) == 10 and len(by) == 10, [
+        (r["proto"], r["port"]) for r in rows]
+    assert ("UDP", 50123) not in by                # a client's socket
+    vite = by[("TCP", 5173)]
+    assert vite["addrs"] == ("127.0.0.1", "::1"), vite
+    assert not vite["network"] and vite["safety"] == LOCAL_SAFE
+    assert vite["what"] == LOCAL_DEV_WEB and vite["web"]
+    assert vite["url"] == "http://127.0.0.1:5173/", vite
+    assert vite["program"] == "node (pid 4001)"
+    dev = by[("TCP", 8080)]
+    assert dev["network"] and dev["safety"] == LOCAL_EXPOSED
+    assert dev["what"] == LOCAL_DEV_WEB and \
+        dev["url"] == "http://127.0.0.1:8080/", dev
+    assert by[("TCP", 3000)]["url"] == "http://[::1]:3000/"   # IPv6 only
+    assert by[("TCP", 3000)]["network"]
+    # a web app only on this computer's network address: not at 127.0.0.1
+    lan = by[("TCP", 8000)]
+    assert lan["web"] and lan["url"] is None and lan["network"]
+    cups = by[("TCP", 631)]
+    assert cups["what"] == "Printing (IPP)" and not cups["web"] and \
+        cups["url"] is None and not cups["network"]
+    assert by[("TCP", 5432)]["what"] == "Database connection (PostgreSQL)"
+    assert not by[("TCP", 5432)]["web"]
+    assert by[("UDP", 5353)]["what"] == "Local name lookup (mDNS)"
+    assert by[("UDP", 5353)]["url"] is None
+    unk = by[("TCP", 44321)]
+    assert unk["what"] == LOCAL_UNKNOWN and "needs admin" in unk["program"]
+    # macOS' AirPlay receiver on 5000 is not a web app
+    air = by[("TCP", 5000)]
+    assert "AirPlay" in air["what"] and air["url"] is None, air
+    assert by[("TCP", 443)]["url"] == "https://127.0.0.1:443/"
+    assert by[("TCP", 443)]["what"] == "Secure web server"
+    nets = [r["network"] for r in rows]
+    assert nets == sorted(nets, reverse=True), nets  # the network first
+    # the guesses alone
+    assert local_service_guess("TCP", 3000) == (LOCAL_DEV_WEB, True)
+    assert local_service_guess("UDP", 3000)[1] is False
+    assert local_service_guess("TCP", 5432) == (
+        "Database connection (PostgreSQL)", False)
+    assert local_service_guess("TCP", 631)[0] == "Printing (IPP)"
+    assert local_service_guess("TCP", 6379, "redis-server (pid 3)")[0] == \
+        "In-memory database (Redis)"
+    assert local_service_guess("TCP", 22, "sshd.exe")[0] == \
+        "Remote terminal (SSH)"
+    assert local_service_guess("TCP", 61000) == (LOCAL_UNKNOWN, False)
+    assert local_service_rows({}) == [] and local_service_rows(None) == []
+    # only this computer, only http(s), a port, no user name
+    for url, ok in (("http://127.0.0.1:5173/", True),
+                    ("http://[::1]:3000/", True),
+                    ("https://127.0.0.1:443/", True),
+                    ("http://127.0.0.1/", False),
+                    ("http://192.168.1.20:8000/", False),
+                    ("http://localhost:3000/", False),
+                    ("http://x@127.0.0.1:80/", False),
+                    ("file:///etc/passwd", False),
+                    ("javascript:alert(1)", False),
+                    ("http://127.0.0.1:99999/", False), ("", False)):
+        assert local_url_ok(url) is ok, url
+    for r in rows:
+        assert r["url"] is None or local_url_ok(r["url"]), r
+    # what the view shows when the list can't be read
+    ns = types.SimpleNamespace
+    assert local_services_state(None)[0] == "unavailable"
+    assert local_services_state(ns(available=False))[0] == "unavailable"
+    assert local_services_state(ns(available=True, listening={}, error="",
+                                   at=0, needs_admin=False))[0] == "unread"
+    assert local_services_state(ns(available=True, listening={},
+                                   error="access denied", at=0,
+                                   needs_admin=False))[0] == "denied"
+    assert local_services_state(ns(available=True, listening={}, error="",
+                                   at=5.0, needs_admin=True))[0] == "denied"
+    st, got = local_services_state(ns(available=True, error="", at=5.0,
+                                      needs_admin=False, listening={}))
+    assert st == "ok" and got == {}
+    st, got = local_services_state(ns(
+        available=True, error="", at=5.0, needs_admin=True,
+        listening={("TCP", "127.0.0.1", 3000): (1, "node")}))
+    assert st == "ok" and len(got) == 1          # partial: still shown
+    # the cells, in all three languages
+    cells = local_service_cells(vite)
+    assert cells == (5173, "TCP", LOCAL_DEV_WEB, LOCAL_SAFE,
+                     "node (pid 4001)",
+                     "This computer only (127.0.0.1, ::1)"), cells
+    assert local_service_cells(dev)[5] == \
+        "The whole network (all addresses)"
+    try:
+        for loc in ("fr", "es"):
+            set_locale(loc)
+            c = local_service_cells(dev)
+            for en, shown in ((LOCAL_DEV_WEB, c[2]),
+                              (LOCAL_EXPOSED, c[3])):
+                assert shown == I18N[loc][en] and shown != en, (loc, c)
+            assert c[5].startswith(I18N[loc]["The whole network"]) and \
+                I18N[loc]["all addresses"] in c[5], c
+            assert local_service_cells(unk)[4] == I18N[loc][
+                "unknown program (needs admin rights to name it)"]
+            for r in rows:
+                assert translate_text(r["what"]) != r["what"], (loc, r)
+                assert translate_text(r["safety"]) != r["safety"]
+            assert translate_text("3 services") == \
+                ("3 services" if loc == "fr" else "3 servicios")
+            assert translate_text("1 service") == \
+                ("1 service" if loc == "fr" else "1 servicio")
+    finally:
+        set_locale("English")
+
+
+@self_test()
+def t_534_local_services_from_connection_table(ctx):
+    """5.3.4 (Local services): the rows come from the same connection
+    table as the Security tab (psutil, here a stand-in): listening TCP
+    sockets and UDP ones without a peer, never a connection."""
+    def row(ip, port, pid, status, raddr=(), kind=1):
+        return types.SimpleNamespace(laddr=(ip, port), raddr=raddr, pid=pid,
+                                     status=status, type=kind)
+    table = [row("127.0.0.1", 5173, 40, "LISTEN"),
+             row("0.0.0.0", 8080, 41, "LISTEN"),
+             row("127.0.0.1", 5173, 40, "ESTABLISHED", ("127.0.0.1", 50000)),
+             row("192.168.1.5", 50001, 42, "ESTABLISHED",
+                 ("93.184.215.14", 443)),
+             row("0.0.0.0", 5353, 43, "NONE", (), 2)]
+    # second audit (install #29): made with the stand-in too, so a fresh
+    # install without psutil checks the same rows
+    pm = _with_conn_table(table, ProcessMap)
+    assert _with_conn_table(table, pm.read)
+    st, listening = local_services_state(pm)
+    assert st == "ok", st
+    rows = local_service_rows(listening)
+    got = [(r["proto"], r["port"], r["network"], r["program"]) for r in rows]
+    assert got == [("TCP", 8080, True, "app41.exe (pid 41)"),
+                   ("UDP", 5353, True, "app43.exe (pid 43)"),
+                   ("TCP", 5173, False, "app40.exe (pid 40)")], got
+    # the Security page's list and this one agree
+    sec = {(p, port, scope != "the network")
+           for p, port, scope, _prog in
+           MiniWireshark.listening_rows(types.SimpleNamespace(procmap=pm))}
+    assert sec == {(r["proto"], r["port"], not r["network"])
+                   for r in rows}, sec
+
+
+@self_test()
+def t_534_local_services_open_through_gate(ctx):
+    """5.3.4 (Local services): opening a web app goes through outbound()
+    (listed in the ledger as this computer, stopped by the kill switch,
+    which says what to type instead); a service that isn't a web page is
+    never opened."""
+    import webbrowser
+    rows = {(r["proto"], r["port"]): r
+            for r in local_service_rows(_local_fake_listeners())}
+    banners = []
+    view = types.SimpleNamespace(app=types.SimpleNamespace(
+        _set_banner=lambda text, kind="info": banners.append((kind, text))))
+    opened = []
+    old_open, old_killed = webbrowser.open, LEDGER.killed
+    webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+    n0 = len(LEDGER.snapshot("local_open"))
+    try:
+        LEDGER.killed = False
+        assert LocalServicesView.open_service(view, rows[("TCP", 5173)])
+        assert opened == ["http://127.0.0.1:5173/"], opened
+        ent = LEDGER.snapshot("local_open")
+        assert len(ent) == n0 + 1 and ent[-1]["allowed"] and \
+            ent[-1]["dest"] == "127.0.0.1:5173", ent[-1]
+        assert "local_open" in OUTBOUND_FEATURES
+        # not a web page / not on 127.0.0.1: nothing opened, nothing sent
+        for key in (("TCP", 631), ("UDP", 5353), ("TCP", 8000)):
+            assert not LocalServicesView.open_service(view, rows[key])
+        assert len(opened) == 1 and len(LEDGER.snapshot("local_open")) == \
+            n0 + 1
+        assert "doesn't look like a web page" in banners[-1][1], banners
+        # a forged row with another address is refused too
+        bad = dict(rows[("TCP", 5173)], url="http://93.184.215.14:80/")
+        assert not LocalServicesView.open_service(view, bad)
+        assert len(opened) == 1
+        # the kill switch
+        LEDGER.killed = True
+        blocked = LEDGER.blocked
+        assert not LocalServicesView.open_service(view, rows[("TCP", 8080)])
+        assert len(opened) == 1 and LEDGER.blocked == blocked + 1
+        assert banners[-1][0] == "warn" and "kill switch" in \
+            banners[-1][1] and "http://127.0.0.1:8080/" in banners[-1][1]
+        # a browser that can't be started: says what to type
+        LEDGER.killed = False
+        webbrowser.open = lambda url, *a, **k: False
+        assert not LocalServicesView.open_service(view, rows[("TCP", 3000)])
+        assert "http://[::1]:3000/" in banners[-1][1], banners[-1]
+    finally:
+        webbrowser.open, LEDGER.killed = old_open, old_killed
+
+
+@self_test()
+def t_a2_local_services_demo_is_made_up(ctx):
+    """Audit 2026-11-14 #15: in Demo Mode, Websites → Local services lists
+    made-up services, never this computer's own programs, never reads the
+    connection table, and opens nothing; outside Demo Mode it reads the
+    real table as before."""
+    real = {("TCP", "127.0.0.1", 47123): (777, "a2-real-program")}
+    reads = []
+    pm = types.SimpleNamespace(available=True, listening=dict(real),
+                               error="", at=time.time(), needs_admin=False,
+                               busy=False, seq=1,
+                               refresh=lambda force=False: reads.append(1))
+    banners, opened = [], []
+    app = types.SimpleNamespace(
+        procmap=pm, data_mode="demo",
+        _set_banner=lambda text, kind="info": banners.append(text))
+    view = types.SimpleNamespace(
+        app=app, source=None, _reading_until=0.0, _poll_job=None,
+        READ_TIMEOUT=LocalServicesView.READ_TIMEOUT, POLL_MS=150,
+        _poll=lambda: None,
+        _pm=lambda: pm,
+        frame=types.SimpleNamespace(after=lambda ms, fn: None))
+    view.demo = lambda: LocalServicesView.demo(view)
+    state, listening = LocalServicesView.snapshot(view)
+    assert state == "ok" and listening == DEMO_LOCAL_LISTENERS, listening
+    rows = local_service_rows(listening)
+    assert rows and not any("a2-real-program" in r["program"] or
+                            r["port"] == 47123 for r in rows), rows
+    assert not LocalServicesView.reading(view)
+    # Refresh in Demo Mode doesn't read the real table
+    view._cancel_poll = lambda: None
+    view.refresh = lambda force=False: None
+    LocalServicesView.reload(view)
+    assert reads == [], reads
+    import webbrowser
+    old_open = webbrowser.open
+    webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+    n0 = len(LEDGER.snapshot("local_open"))
+    try:
+        web = next(r for r in rows if r["url"])
+        assert not LocalServicesView.open_service(view, web)
+        assert opened == [] and "made up" in banners[-1], banners
+        assert len(LEDGER.snapshot("local_open")) == n0
+    finally:
+        webbrowser.open = old_open
+    for loc in ("fr", "es"):
+        assert translate_text(banners[-1], loc) != banners[-1]
+    # live (or an opened file): the real table, as before
+    app.data_mode = "live"
+    state, listening = LocalServicesView.snapshot(view)
+    assert state == "ok" and listening == real, listening
+
+
+@self_test()
+def t_534_local_program_names_without_psutil(ctx):
+    """Local services without psutil: netstat (in any language: a socket
+    with no peer) plus tasklist's CSV on Windows; on Linux the listening
+    socket's inode leads to its process through /proc/<pid>/fd (bounded)
+    and /proc/<pid>/comm names it; lsof (macOS, and Linux sockets /proc
+    can't name)."""
+    net = ("\r\nConnexions actives\r\n\r\n  Proto  Adresse locale   Adresse "
+           "distante  État\r\n"
+           "  TCP    0.0.0.0:135      0.0.0.0:0   ÉCOUTE   1012\r\n"
+           "  TCP    127.0.0.1:5173   0.0.0.0:0   ÉCOUTE   4242\r\n"
+           "  TCP    [::1]:3000       [::]:0      ÉCOUTE   77\r\n"
+           "  TCP    192.168.1.5:50000 93.184.215.14:443 ÉTABLIE 4242\r\n"
+           "  UDP    0.0.0.0:5353     *:*                  900\r\n")
+    assert parse_netstat_listening(net) == [
+        ("0.0.0.0", 135, 1012), ("127.0.0.1", 5173, 4242),
+        ("::1", 3000, 77)], parse_netstat_listening(net)
+    assert parse_tasklist_csv(
+        '"System Idle Process","0","Services","0","8 K"\r\n'
+        '"node.exe","4242","Console","1","51,200 K"\r\n'
+        '"bad","x"\r\n') == {0: "System Idle Process", 4242: "node.exe"}
+    assert parse_tasklist_csv("") == {}
+    tcp = ("  sl  local_address rem_address   st tx_queue rx_queue tr "
+           "tm->when retrnsmt   uid  timeout inode\n"
+           "   0: 0100007F:1F40 00000000:0000 0A 00000000:00000000 "
+           "00:00000000 00000000  1000        0 31337 1 0 100 0 0 10 0\n"
+           "   1: 0100007F:9C40 0100007F:1F40 01 00000000:00000000 "
+           "00:00000000 00000000  1000        0 31338 1 0 100 0 0 10 0\n")
+    assert parse_proc_net_tcp(tcp) == [("127.0.0.1", 8000, 31337)]
+    root = tempfile.mkdtemp(prefix="mw-proc-")
+    try:
+        for pid, comm in (("77", "python3\n"), ("88", "sshd\n")):
+            os.makedirs(os.path.join(root, pid, "fd"))
+            with open(os.path.join(root, pid, "comm"), "w") as f:
+                f.write(comm)
+        links = {os.path.join(root, "77", "fd", "3"): "socket:[31337]",
+                 os.path.join(root, "77", "fd", "4"): "/dev/null",
+                 os.path.join(root, "88", "fd", "3"): "socket:[5]"}
+        real = os.listdir
+
+        def listdir(d):
+            return [os.path.basename(k) for k in links
+                    if os.path.dirname(k) == d] if d.endswith("fd") \
+                else real(d)
+        with _b9_patched(os, listdir=listdir, readlink=links.__getitem__):
+            assert proc_socket_pids({31337}, root) == {31337: 77}
+            assert len(proc_socket_pids({31337, 5}, root, limit=1)) <= 1
+        assert proc_socket_pids(set(), root) == {}
+        assert proc_comm(77, root) == "python3" and proc_comm(9, root) == ""
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    lsof = ("COMMAND   PID USER   FD   TYPE DEVICE SIZE/OFF NODE NAME\n"
+            "node     4242 me   23u  IPv4 0x1      0t0  TCP 127.0.0.1:5173 "
+            "(LISTEN)\n"
+            "Python\\x20 77 me    4u  IPv6 0x2      0t0  TCP *:8000 "
+            "(LISTEN)\n"
+            "rapportd  500 me    5u  IPv6 0x3      0t0  TCP [::1]:49152 "
+            "(LISTEN)\n")
+    assert parse_lsof_listening(lsof) == [
+        ("127.0.0.1", 5173, 4242, "node"), ("::", 8000, 77, "Python "),
+        ("::1", 49152, 500, "rapportd")], parse_lsof_listening(lsof)
+    # the table the view reads without psutil
+    fake = {("TCP", "127.0.0.1", 5173): (4242, "node.exe"),
+            ("TCP", "0.0.0.0", 8000): (None, "")}
+    with _b9_patched(globals(), os_listening=lambda: dict(fake)):
+        pm = OsListenMap()
+        assert pm.available and local_services_state(pm)[0] == "unread"
+        assert pm.read() and pm.needs_admin
+        st, got = local_services_state(pm)
+    assert st == "ok" and got == fake, (st, got)
+    names = [r["program"] for r in local_service_rows(got)]
+    assert "node.exe (pid 4242)" in names, names
+    assert "netstat" in WINDOWS_SYSTEM_TOOLS and \
+        "tasklist" in WINDOWS_SYSTEM_TOOLS
+
+
+@self_test()
+def t_534_local_http_probe(ctx):
+    """Local services: a real web server on 127.0.0.1 is found with its
+    page title (plain HTTP); a port that answers "GET /" with a TLS
+    record is asked again over TLS and, when that handshake fails, is
+    not a web page; an https answer gives an https address; a closed
+    port is asked once and not over TLS; each try is in the ledger and
+    the kill switch stops it. (No certificate here: the TLS decision
+    alone is tested.)"""
+    import http.server
+
+    class Page(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"<html><title>My dev\n &amp; app</title>")
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), Page)
+    threading.Thread(target=srv.serve_forever, daemon=True,
+                     name="t-local-http").start()
+    closed = _socket.socket()
+    closed.bind(("127.0.0.1", 0))
+    free = closed.getsockname()[1]
+    closed.close()
+    killed = LEDGER.killed
+    try:
+        LEDGER.killed = False
+        n0 = len(LEDGER.snapshot("local_probe"))
+        got = probe_local_http("127.0.0.1", srv.server_address[1],
+                               timeout=2.0)
+        assert got == {"web": True, "https": False, "status": 200,
+                       "title": "My dev & app"}, got
+        assert probe_local_http("127.0.0.1", free, timeout=0.5)["web"] is \
+            False
+        ent = LEDGER.snapshot("local_probe")
+        assert len(ent) == n0 + 2 and ent[-1]["kind"] == "http" and \
+            ent[-1]["dest"] == f"127.0.0.1:{free}", ent[-2:]
+        LEDGER.killed = True
+        try:
+            probe_local_http("127.0.0.1", srv.server_address[1])
+            raise AssertionError("sent with the kill switch on")
+        except OutboundBlocked:
+            pass
+    finally:
+        LEDGER.killed = killed
+        srv.shutdown()
+        srv.server_close()
+    # a TLS server's answer to plain HTTP: an alert record, then close
+    lsk = _socket.socket()
+    lsk.bind(("127.0.0.1", 0))
+    lsk.listen(4)
+    lsk.settimeout(10)
+    hits = []
+
+    def serve():
+        for _ in range(2):
+            try:
+                c, _a = lsk.accept()
+            except OSError:
+                return
+            with c:
+                c.settimeout(3)
+                with contextlib.suppress(OSError):
+                    hits.append(c.recv(5))
+                    c.sendall(b"\x15\x03\x03\x00\x02\x02\x28")
+    th = threading.Thread(target=serve, daemon=True, name="t-local-tls")
+    th.start()
+    port = lsk.getsockname()[1]
+    try:
+        got = probe_local_http("127.0.0.1", port, timeout=2.0)
+        th.join(5)
+    finally:
+        lsk.close()
+    assert got == {"web": False, "https": False, "status": 0,
+                   "title": ""}, got
+    assert len(hits) == 2 and hits[0].startswith(b"GET") and \
+        hits[1][:1] == b"\x16", hits            # then a TLS ClientHello
+    assert [e["kind"] for e in LEDGER.snapshot("local_probe")[-2:]] == \
+        ["http", "https"]
+    listening = {("TCP", "127.0.0.1", port): (5, "dev")}
+    key = local_service_rows(listening)[0]["probe"]
+    tls = {"web": True, "https": True, "status": 200, "title": "My app"}
+    row = local_service_rows(listening, (), {key: tls})[0]
+    assert row["url"] == f"https://127.0.0.1:{port}/" and \
+        row["what"] == "Web server" and row["title"] == "My app"
+    assert local_service_cells(row)[2] == "Web server — My app"
+
+
+@self_test()
+def t_534_local_probe_skip_and_once(ctx):
+    """Local services: ports known not to be web pages (Redis 6379, raw
+    printing 9100, databases, SMB/NetBIOS, what the service table or the
+    program's name marks as something else) are never asked; a port is
+    asked once when it appears, the automatic re-read reuses the answer,
+    Refresh asks again; a restarted program is asked again; Demo Mode
+    asks nothing; the answer's scheme wins over the port's."""
+    for port in (6379, 9100, 3306, 5432, 27017, 1433, 11211, 139, 445):
+        assert port in LOCAL_PROBE_SKIP, port
+    listening = {("TCP", "127.0.0.1", p): (p, "x") for p in
+                 (6379, 9100, 3306, 5432, 27017, 1433, 11211, 139, 445,
+                  22, 631, 5173, 8443, 61000)}
+    listening[("TCP", "127.0.0.1", 7777)] = (1, "redis-server")
+    listening[("UDP", "0.0.0.0", 5353)] = (2, "avahi")
+    rows = local_service_rows(listening)
+    asked = sorted(r["port"] for r in rows if r["probe"])
+    assert asked == [5173, 8443, 61000], asked
+    by = {r["port"]: r for r in rows}
+    assert by[8443]["url"] == "https://127.0.0.1:8443/"   # not asked yet
+    k = by[8443]["probe"]
+    plain = {"web": True, "https": False, "status": 200, "title": ""}
+    r = local_service_rows(listening, (), {k: plain})
+    assert {x["port"]: x for x in r}[8443]["url"] == \
+        "http://127.0.0.1:8443/"
+    nope = dict(plain, web=False)
+    r = local_service_rows(listening, (), {by[5173]["probe"]: nope})
+    assert {x["port"]: x for x in r}[5173]["url"] is None
+    seen = []
+
+    def probe(host, port, own=(), timeout=1.0):
+        seen.append((host, port))
+        return dict(plain, title="App %d" % port)
+
+    def view(mode="offline"):
+        return types.SimpleNamespace(
+            source=None, probes={}, _probe_seq=0,
+            app=types.SimpleNamespace(data_mode=mode),
+            _pm=lambda: types.SimpleNamespace(available=False),
+            refresh=lambda force=False: None)
+
+    def run(v, rows):
+        started = LocalServicesView._start_probes(v, rows, ())
+        for t in [t for t in threading.enumerate()
+                  if t.name == "local-probe"]:
+            t.join(10)
+        return started
+    with _b9_patched(globals(), probe_local_http=probe):
+        v = view()
+        assert run(v, rows) and sorted(seen) == [
+            ("127.0.0.1", 5173), ("127.0.0.1", 8443),
+            ("127.0.0.1", 61000)], seen
+        assert v._probe_seq == 1 and v.probes[by[5173]["probe"]][
+            "title"] == "App 5173"
+        assert not run(v, local_service_rows(listening, (), v.probes))
+        assert len(seen) == 3                       # the re-read: no
+        moved = dict(listening)
+        moved[("TCP", "127.0.0.1", 5173)] = (99, "x")      # restarted
+        assert run(v, local_service_rows(moved, (), v.probes))
+        assert len(seen) == 4 and seen[-1] == ("127.0.0.1", 5173)
+        LocalServicesView.reload(v, reprobe=True)   # the Refresh button
+        assert v.probes == {} and run(v, rows) and len(seen) == 7
+        demo = view("demo")
+        assert not run(demo, rows) and len(seen) == 7 and demo.probes == {}
+        fixture = view()
+        fixture.source = lambda: ("ok", listening)
+        assert not run(fixture, rows) and len(seen) == 7
+
+
+@self_test()
+def t_534_local_lan_bound(ctx):
+    """Local services: a service bound only to an address of this computer
+    (a LAN address) is asked and opened there; an address that isn't this
+    computer's is never asked nor opened."""
+    own = {"192.168.1.20", "fe80::5"}
+    listening = {("TCP", "192.168.1.20", 8000): (6, "python.exe"),
+                 ("TCP", "10.9.9.9", 8001): (7, "python.exe"),
+                 ("TCP", "fe80::5", 8002): (8, "python.exe")}
+    by = {r["port"]: r for r in local_service_rows(listening, own)}
+    assert by[8000]["url"] == "http://192.168.1.20:8000/" and \
+        by[8000]["probe"] == (8000, "python.exe (pid 6)", "192.168.1.20")
+    for port in (8001, 8002):           # not this computer's / no scope
+        assert by[port]["url"] is None and by[port]["probe"] is None
+    assert all(r["url"] is None for r in local_service_rows(listening))
+    for url, ok in (("http://192.168.1.20:8000/", True),
+                    ("https://192.168.1.20:8443/", True),
+                    ("http://192.168.1.21:8000/", False),
+                    ("http://0.0.0.0:8000/", False),
+                    ("http://127.0.0.1:8000/", True)):
+        assert local_url_ok(url, own) is ok, url
+    assert not local_url_ok("http://192.168.1.20:8000/")
+    tried = []
+
+    def connect(addr, timeout=None, *a):
+        tried.append(addr)
+        raise ConnectionRefusedError("test")
+    with _b9_patched(_socket, create_connection=connect):
+        assert probe_local_http("192.168.1.20", 8000, own)["web"] is False
+        for host in ("10.9.9.9", "0.0.0.0", "::", "example.com"):
+            try:
+                probe_local_http(host, 8000, own)
+                raise AssertionError(f"{host} was asked")
+            except ValueError:
+                pass
+    assert tried == [("192.168.1.20", 8000)], tried     # refused: no TLS
+    app = types.SimpleNamespace(model=types.SimpleNamespace(
+        my_ips={"192.168.1.20"}))
+    assert "192.168.1.20" in local_own_addresses(app)
 
 
 @self_test(needs_source=True)
@@ -82793,7 +88174,7 @@ def t_ip003_dark_title_bar(ctx):
             assert dark_title_bar(Win(), True) is False
         root = _m16_tk()
         if root is None:
-            return None
+            return "skip"      # (35-checker review) was counted as passed
         try:
             TITLE_BAR["api"] = (dwm, User32(), 22631)
             calls.clear()
@@ -83252,8 +88633,11 @@ def t_s13_baseline_edges(ctx):
     a = 1.0 / (1 + BASELINE_PRIOR_WEIGHT)
     pr = b.prof[baseline_period(1000 * 60.0)]
     assert abs(pr["mean"]["packets"] - (pk - a * pk)) < 1e-9, pr["mean"]
-    while pr["var"]["packets"] >= 0.25:
+    for _i in range(10000):     # (35-checker review) bounded: a regression
+        if pr["var"]["packets"] < 0.25:      # fails here, never hangs
+            break
         b._finish_v2(zero)
+    assert pr["var"]["packets"] < 0.25, pr["var"]
     var = pr["var"]["packets"]
     s = b._finish_v2(zero)
     assert abs(s[2]["packets"] - math.sqrt(var)) < 1e-12 and \
@@ -83841,7 +89225,7 @@ def t_s15_clock_steps_are_not_sleep(ctx):
     assert wake_check(3615, 15, None, iv)[0] and \
         not wake_check(15, 15, None, iv)[0]
     if awake_clock() is None:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     got = []
     w = NetworkWatcher(got.append, interval=0.5)
     w._wall -= 120                       # the clock went ahead 2 minutes
@@ -83865,8 +89249,9 @@ def t_s15_daylight_saving_days(ctx):
     back was two days back, or the same day); the day/night baseline
     follows the local hour through both changes."""
     if not hasattr(time, "tzset"):
-        return
+        return "skip"   # (35-checker review) was counted as passed
     old = os.environ.get("TZ")
+    ran = 0
     try:
         for tz, spring, autumn in (("Europe/Paris", (2026, 3, 29),
                                     (2026, 10, 25)),
@@ -83874,6 +89259,7 @@ def t_s15_daylight_saving_days(ctx):
                                     (2026, 11, 1))):
             if not os.path.exists(os.path.join("/usr/share/zoneinfo", tz)):
                 continue
+            ran += 1
             os.environ["TZ"] = tz
             time.tzset()
 
@@ -83904,6 +89290,8 @@ def t_s15_daylight_saving_days(ctx):
         else:
             os.environ["TZ"] = old
         time.tzset()
+    if not ran:                 # (35-checker review) no time zone files
+        return "skip"
 
 
 @self_test()
@@ -84174,7 +89562,7 @@ def t_r6_text_links_one_binding(ctx):
         src = inspect.getsource(fn)
         assert "tag_bind" not in src, fn.__qualname__
     if sys.version_info < (3, 9):
-        return          # the test machine's 3.8 Tk aborts on any Text
+        return "skip"   # the test machine's 3.8 Tk aborts on any Text
     root = _m16_tk()
     if root is None:
         return "skip"
@@ -84494,7 +89882,7 @@ def t_r6_slow_interval_is_not_sleep(ctx):
     assert isinstance(secs, float) and secs > 0
     assert counts is False or IS_WINDOWS
     if awake_clock() is None:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     lines = []
 
     class H(logging.Handler):
@@ -84621,6 +90009,19 @@ def t_r7_umask_folders_repaired(ctx):
     if IS_WINDOWS:
         return "skip"                    # no POSIX modes there
     tag = uuid.uuid4().hex[:6]
+    # (35-checker review) a data folder of the test's own: it wrote into
+    # the person's real data and cache folders
+    real_data, real_cache = PATHS.data, PATHS.cache
+    PATHS.data = ctx.path(f"r7-data-{tag}")
+    PATHS.cache = os.path.join(PATHS.data, "cache")
+    os.makedirs(PATHS.cache, mode=0o700)
+    try:
+        return _r7_umask_folders(ctx, tag)
+    finally:
+        PATHS.data, PATHS.cache = real_data, real_cache
+
+
+def _r7_umask_folders(ctx, tag):
     before = list(sys.path)
     inside = os.path.join(PATHS.data, f"r7-site-{tag}")
     outside = ctx.path(f"r7-site-{tag}")
@@ -84961,8 +90362,10 @@ def t_b9_compiled_copy_trusted(ctx):
     with _b9_patched(globals(), IS_WINDOWS=False), \
             _b9_patched(os, geteuid=lambda: 0):
         assert not compiled_copy_trusted(os.path.join(lad, "c.pyc"))
-    if IS_WINDOWS or os.geteuid() == 0:
-        return
+    if IS_WINDOWS:
+        return "skip"   # (35-checker review) was counted as passed
+    if os.geteuid() == 0:
+        return          # root never uses a compiled copy: checked above
     folder = ctx.path("b9cc")
     assert not compiled_copy_trusted(os.path.join(folder, "c.pyc"))
     os.makedirs(folder, mode=0o700)
@@ -85010,7 +90413,7 @@ def t_b9_install_key_rejects_foreign(ctx):
             k3 = install_key()
             assert len(k3) == 32 and read() == k3
         if IS_WINDOWS:
-            return
+            return "skip"   # (35-checker review) was counted as passed
         assert install_key(create=False) == k3
         os.chmod(path, 0o644)
         assert install_key(create=False) is None
@@ -85281,7 +90684,7 @@ def t_534_review_fontconfig_guard_stays_inside(ctx):
     theirs = {"FONTCONFIG_FILE": "/etc/their.conf"}
     assert env_for_outside(theirs) == theirs
     if IS_WINDOWS or IS_MAC:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     seen = []
 
     class FakePopen:
@@ -85454,8 +90857,10 @@ def t_534_ci_repair_runs_the_core_tests(ctx):
         assert w("test_private_packages_folder") and not w.unmatched(), asked
     w = self_test_wanted("t_dns_parsing,baseline")
     assert w("t_dns_parsing") and w("t_baseline") and not w("t_dns")
+    # second audit (install #29): two tests that run without scapy (dns
+    # parsing was skipped on a fresh install, and this failed)
     with contextlib.redirect_stdout(io.StringIO()) as out:
-        rc = run_self_tests(verbose=True, only="t_dns_parsing,t_baseline")
+        rc = run_self_tests(verbose=True, only="t_b9_trusted_uids,t_baseline")
     assert rc == 0 and out.getvalue().count("[PASS]") == 2, out.getvalue()
 
 
@@ -85522,8 +90927,11 @@ def t_534_ci_hung_step_names_itself(ctx):
     assert "[TIMEOUT] self-test stuck one: still running after 0 s" in \
         text and "t_534_ci_hung_step_names_itself" in text, text
     assert 60 <= SELF_TEST_LIMIT_S <= GUI_STEP_LIMIT_S
-    src = inspect.getsource(run_self_tests) + inspect.getsource(run_gui_test)
+    # (35-checker review) the GUI test's steps run in gui_test_record
+    src = inspect.getsource(run_self_tests) + \
+        inspect.getsource(gui_test_record)
     assert src.count("StepWatchdog(") == 2, "both runners use it"
+    assert "gui_test_record(" in inspect.getsource(run_gui_test)
     # leaving: a thread that keeps the process alive is named, and the
     # run ends after the limit with the stacks
     hold = threading.Event()
@@ -85850,7 +91258,7 @@ def t_b9_private_file_ok(ctx):
     with _b9_patched(globals(), IS_WINDOWS=True):
         assert private_file_ok(p)
     if IS_WINDOWS:
-        return
+        return "skip"   # (35-checker review) was counted as passed
     os.chmod(p, 0o600)
     assert private_file_ok(p)
     os.chmod(p, 0o644)
@@ -86206,6 +91614,253 @@ def t_534_court_pcap_ended_early(ctx):
 
 
 @self_test()
+def t_a2_pcap_big_record_kept(ctx):
+    """Audit 2026-11-14 #42: a classic .pcap record over 1 MiB is read like
+    any other (the packets after it were dropped with a false "the file
+    ended early"); a record past the limit whose bytes are there is called
+    damaged, not short; one cut by the end of the file still ended early."""
+    frame = bytes(60)
+    big = bytes(14) + bytes(2 * 1024 * 1024)
+    p = ctx.path("a2-big.pcap")
+    _court_pcap(p, [(1700000000, frame), (1700000001, big),
+                    (1700000002, frame)])
+    notes = []
+    got = list(iter_raw_capture(p, notes))
+    assert [len(r) for r, _t, _l in got] == [60, len(big), 60], \
+        [len(r) for r, _t, _l in got]
+    assert notes == [], notes
+    done = []
+    imp = RawPcapImporter(p, lambda *a: True, lambda n: None,
+                          lambda *a: done.append(a))
+    imp.start()
+    imp.join(10)
+    assert done == [(3, None, False, "")], done
+    old = PCAP_MAX_RECORD
+    globals()["PCAP_MAX_RECORD"] = 1024
+    try:
+        notes = []
+        try:
+            list(iter_raw_capture(p, notes))
+            raise AssertionError("a damaged record was taken for the end")
+        except ValueError as e:
+            assert "claims" in str(e) and notes == [], (e, notes)
+        # the claim runs past the end of the file: it did end early
+        cut = ctx.path("a2-cut.pcap")
+        _court_pcap(cut, [(1700000000, frame)], struct.pack(
+            "<IIII", 1700000001, 0, 4096, 4096) + bytes(2000))
+        notes = []
+        assert len(list(iter_raw_capture(cut, notes))) == 1
+        assert notes == [PCAP_ENDED_EARLY], notes
+    finally:
+        globals()["PCAP_MAX_RECORD"] = old
+
+
+@self_test()
+def t_a2_capture_file_fields(ctx):
+    """Audit 2026-11-14 #44: the FCS bits of a .pcap link type are left
+    out (Ethernet stays Ethernet); a pcapng packet on an interface the
+    file never described is left out with a note, not read as Ethernet; a
+    packet longer than its block, or a block whose two lengths differ, is
+    damage."""
+    p = ctx.path("a2-fcs.pcap")
+    with open(p, "wb") as f:
+        f.write(struct.pack("<IHHiIII", 0xa1b2c3d4, 2, 4, 0, 0, 262144,
+                            0x04000001 | (4 << 28)))
+        f.write(struct.pack("<IIII", 1700000000, 0, 60, 60) + bytes(60))
+    got = list(iter_raw_capture(p))
+    assert [lt for _r, _t, lt in got] == [1], got
+
+    def blk(t, body, tail=None):
+        n = 12 + len(body)
+        return struct.pack("<II", t, n) + body + struct.pack(
+            "<I", n if tail is None else tail)
+    shb = blk(0x0A0D0D0A, struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1))
+    idb = blk(1, struct.pack("<HHI", 113, 0, 65535))     # Linux cooked
+
+    def epb(iid, cap=60, data=60):
+        return blk(6, struct.pack("<IIIII", iid, 0, 0, cap, cap) +
+                   bytes(data))
+    q = ctx.path("a2-iface.pcapng")
+    with open(q, "wb") as f:
+        f.write(shb + idb + epb(0) + epb(3) + epb(0))
+    notes = []
+    got = list(iter_raw_capture(q, notes))
+    assert [lt for _r, _t, lt in got] == [113, 113], got
+    assert notes == [PCAP_NO_IFACE], notes
+    for name, bad in (("cap", epb(0, cap=5000)),
+                      ("tail", blk(6, struct.pack("<IIIII", 0, 0, 0, 60, 60)
+                                   + bytes(60), tail=999))):
+        with open(q, "wb") as f:
+            f.write(shb + idb + epb(0) + bad)
+        out = []
+        try:
+            for x in iter_raw_capture(q):
+                out.append(x)
+            raise AssertionError(f"{name}: damage not seen")
+        except ValueError:
+            assert len(out) == 1, (name, len(out))
+
+
+@self_test()
+def t_a2_import_banner_translated(ctx):
+    """Audit 2026-11-14 #43: the import banners in French and Spanish keep
+    "(stopped early)", say "1 paquet"/"1 paquete", and the error banner is
+    translated too."""
+    s = ("📂  OFFLINE CAPTURE — finished reading 1 packet from x.pcap "
+         "(stopped early).  Nothing here is live.")
+    fr, es = translate_text(s, "fr"), translate_text(s, "es")
+    assert "1 paquet de x.pcap (arrêtée avant la fin)." in fr, fr
+    assert "1 paquete de x.pcap (detenida antes del final)." in es, es
+    s = s.replace("1 packet", "7 packets").replace(" (stopped early)", "")
+    assert "7 paquets de x.pcap. Rien" in translate_text(s, "fr")
+    st = "📂 Offline capture: x.pcap — 1 packet (not live)"
+    assert translate_text(st, "fr").endswith("1 paquet (pas en direct)")
+    assert translate_text(st, "es").endswith("1 paquete (no en directo)")
+    err = ("⚠️  Stopped reading the file: corrupt pcapng block. The file "
+           "may be damaged, or it isn't a pcap/pcapng capture.")
+    fr = translate_text(err, "fr")
+    assert fr.startswith("⚠️  Lecture du fichier arrêtée : bloc pcapng "
+                         "endommagé.") and "damaged" not in fr, fr
+    assert "dañado" in translate_text(err, "es")
+    assert translate_text(PCAP_NO_IFACE, "fr") != PCAP_NO_IFACE
+
+
+def _a2_destopts(n, l4, proto):
+    hdrs = b""
+    for i in range(n):
+        hdrs += bytes([60 if i < n - 1 else proto, 0]) + \
+            b"\x01\x04\x00\x00\x00\x00"
+    ip = struct.pack(">IHBB", 6 << 28, len(hdrs) + len(l4), 60, 64) + \
+        _socket.inet_pton(_socket.AF_INET6, "2001:db8::1") + \
+        _socket.inet_pton(_socket.AF_INET6, "2001:db8::2")
+    return bytes(6) + b"\x02\x00\x00\x00\x00\x01\x86\xdd" + ip + hdrs + l4
+
+
+@self_test()
+def t_a2_ipv6_many_extension_headers_fast(ctx):
+    """Audit 2026-11-14 #47: an IPv6 frame with 180 destination-options
+    headers (a normal 1514-byte frame) is read by the fast decoder, not
+    handed to scapy (45-184 ms each); so are 3 and more stacked VLAN tags;
+    where scapy reads them too, the two agree."""
+    syn = struct.pack(">HHIIBBHHH", 40000, 443, 1, 0, 0x50, 0x02, 64240,
+                      0, 0)
+    frames = [_a2_destopts(n, syn, 6) for n in (7, 180)]
+    assert len(frames[1]) == 1514, len(frames[1])
+    udp = struct.pack(">HHHH", 1, 9999, 8 + 20, 0) + bytes(20)
+    ip4 = struct.pack(">BBHHHBBH", 0x45, 0, 48, 0, 0, 64, 17, 0) + \
+        _socket.inet_aton("1.1.1.1") + _socket.inet_aton("2.2.2.2") + udp
+    for tags in (3, 40):
+        frames.append(bytes(6) + b"\x02\x00\x00\x00\x00\x01" + b"".join(
+            b"\x81\x00" + struct.pack(">H", i + 1) for i in range(tags)) +
+            b"\x08\x00" + ip4)
+    for raw in frames:
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
+        assert d["transport"] in ("TCP", "UDP"), d["text"]
+    worst = 0.0
+    for _ in range(5):
+        t0 = time.perf_counter()
+        d = fast_decode(frames[1], 1.0)
+        worst = max(worst, time.perf_counter() - t0)
+    assert d["text"] == "Secure web browsing (SYN)", d["text"]
+    assert worst < 0.005, f"{worst * 1000:.1f} ms for one frame"
+    if ctx.scapy_ok:
+        diffs = decoder_differences([(r, 1.0, 1) for r in frames[:3]])
+        assert not diffs, diffs[:3]
+
+
+@self_test()
+def t_a2_udp_length_never_past_the_ip_packet(ctx):
+    """Audit 2026-11-14 #48: a 2-byte UDP message whose length field says
+    65535 is "Quick message (2 bytes)" in both decoders (it said 65527),
+    while a capture cut short by a snap length keeps the size the IP and
+    UDP headers agree on."""
+    def frame(ulen, load, total=None):
+        u = struct.pack(">HHHH", 40000, 40001, ulen, 0) + load
+        tl = 20 + len(u) if total is None else total
+        ip = struct.pack(">BBHHHBBH", 0x45, 0, tl, 0, 0, 64, 17, 0) + \
+            _socket.inet_aton("10.0.0.1") + _socket.inet_aton("10.0.0.2")
+        return bytes(6) + b"\x02\x00\x00\x00\x00\x01\x08\x00" + ip + u
+    lie = frame(65535, b"ab")
+    d = fast_decode(lie, 1.0)
+    assert d["payload_len"] == 2 and d["text"] == \
+        "Quick message (2 bytes)", (d["payload_len"], d["text"])
+    snapped = frame(1408, bytes(60), total=1428)
+    assert fast_decode(snapped, 1.0)["payload_len"] == 1400
+    if ctx.scapy_ok:
+        for raw, want in ((lie, 2), (snapped, 1400)):
+            got = decode_packet(Ether(raw))["payload_len"]
+            assert got == want, (got, want)
+        assert not decoder_differences([(lie, 1.0, 1), (snapped, 1.0, 1)])
+
+
+@self_test()
+def t_a2_tunnel_names_and_ipv4_dissect(ctx):
+    """Audit 2026-11-14 #48: IPv6 inside IPv6 is "IPv6-in-IPv6" (it said
+    "IPv6-in-IPv4"); the packet details say a version-9 header isn't IPv4
+    and that a cut header is truncated, not "malformed (packed IP wrong
+    length for inet_ntoa)"."""
+    assert _ip_proto_label(41, 6) == "IPv6-in-IPv6"
+    assert _ip_proto_label(41, 4) == "IPv6-in-IPv4"
+    assert _ip_proto_label(4, 6) == "IPv4-in-IPv6"
+    assert _ip_proto_label(4, 4) == "IP-in-IP"
+    if ctx.scapy_ok:
+        inner = IPv6(src="fd00::1", dst="fd00::2", nh=59)
+        pkt = Ether(bytes(Ether(src="02:00:00:00:00:01",
+                                dst="02:00:00:00:00:02") /
+                          IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                          inner))
+        got = decode_packet(pkt)["proto"]
+        assert got == "IPv6-in-IPv6", got
+    raw = bytes(12) + b"\x08\x00" + b"\x91" + bytes(13)  # 4-byte header
+    dis = dissect(raw)
+    ip = next(n for n in dis.nodes if n.key == "ip")
+    assert "truncated" in ip.warning and "malformed" not in ip.warning, \
+        ip.warning
+    ver = next(f for f in ip.fields if f.key == "ip.version")
+    assert "isn't IPv4" in ver.warning, ver.warning
+
+
+@self_test()
+def t_a2_decode_errors_logged(ctx):
+    """Audit 2026-11-14 #49: a packet that breaks the decoder is logged as
+    a WARNING with its traceback the first time (each kind once), then
+    only at DEBUG; the row still says "Undecodable frame"."""
+    if not ctx.scapy_ok:
+        return "skip"
+    caught = []
+
+    class _Grab(logging.Handler):
+        def emit(self, record):
+            caught.append((record.levelno, record.getMessage(),
+                           record.exc_info is not None))
+    grab = _Grab(logging.DEBUG)
+    old_level, old_dp = LOG.level, globals()["decode_packet"]
+    seen = set(_DECODE_ERRORS_LOGGED)
+    _DECODE_ERRORS_LOGGED.clear()
+
+    def boom(*_a, **_k):
+        raise KeyError("a2-canary")
+    LOG.addHandler(grab)
+    LOG.setLevel(logging.DEBUG)
+    globals()["decode_packet"] = boom
+    try:
+        raw = bytes(12) + b"\x91\x00" + bytes(40)       # declined
+        for _ in range(3):
+            d = fast_decode(raw, 1.0)
+            assert d["text"] == "Undecodable frame (KeyError)", d["text"]
+    finally:
+        globals()["decode_packet"] = old_dp
+        LOG.removeHandler(grab)
+        LOG.setLevel(old_level)
+        _DECODE_ERRORS_LOGGED.clear()
+        _DECODE_ERRORS_LOGGED.update(seen)
+    mine = [c for c in caught if "a2-canary" in c[1]]
+    assert [c[0] for c in mine] == [logging.WARNING, logging.DEBUG,
+                                    logging.DEBUG], mine
+    assert mine[0][2], "the first one carries its traceback"
+
+
+@self_test()
 def t_534_court_update_notice_waits(ctx):
     """5.3.4 court GUI-06: the one-time "now checks once a day" notice
     stays pending while Safe Mode, the kill switch or offline work blocks
@@ -86446,6 +92101,431 @@ def t_534_c7_arp_memory_pruned(ctx):
     assert gw in reg.arp_claims and recent not in reg.arp_claims
 
 
+@self_test()
+def t_534_aged_tables_forgotten(ctx):
+    """Audit #4: remote hosts, their names, learned names and lookups are
+    forgotten once unseen for their window on the packet clock; an
+    address a kept connection or an unacknowledged alert refers to
+    stays, and goes once the alert is acknowledged."""
+    m = scenario_model(ctx.cfg(), [])
+    t = m.offline_now = 2e9
+    old, conn, warn, new = ("203.0.113.%d" % i for i in (1, 2, 3, 4))
+
+    def add(ip, ts):
+        m.offline_now = ts
+        m.remote_hosts[ip] = RemoteHostRecord(ip=ip, first_seen=ts,
+                                              last_seen=ts)
+        m.ip_to_domains[ip] = OrderedDict([("x.example", ts)])
+        m.cache.learn(ip, "x.example")
+        m.correlator.note_resolution("", "x.example", ip, ts)
+    for ip in (old, conn, warn):
+        add(ip, t)
+    m.flows.lookup_or_create(("t",), "TCP", "192.168.1.10", 50000, conn,
+                             443, t)
+    m.alerts.alerts["t"] = a = Alert(
+        id="t", kind="reputation", severity="Medium", device_key="",
+        reason="", observed="", interpretation="", possible_explanations="",
+        refs={"remote": warn})
+    assert m.forget_aged(t + 3600) == 0 and len(m.correlator.by_ip) == 0
+    m.forget_aged(t + NameCache.KEEP + 60)                 # names: 2 h
+    assert m.cache.get(conn) and m.cache.get(warn) and not m.cache.get(old)
+    assert old in m.remote_hosts and old in m.ip_to_domains
+    add(new, t + m.REMOTE_KEEP - 60)
+    m.forget_aged(t + m.REMOTE_KEEP + 60)                  # remotes: 6 h
+    assert sorted(m.remote_hosts) == [conn, warn, new], sorted(m.remote_hosts)
+    assert sorted(m.ip_to_domains) == [conn, warn, new]
+    assert old in m.dirty_remotes                          # row removed
+    m.forget_aged(t + m.REMOTE_KEEP + 90)                  # once a minute
+    assert warn in m.remote_hosts
+    a.acknowledged = True
+    m.forget_aged(t + m.REMOTE_KEEP + 200)
+    assert warn not in m.remote_hosts and conn in m.remote_hosts
+    assert not m.cache.get(warn) and m.cache.get(conn)
+    assert set(m.cache.seen) == set(m.cache.ip_to_name)
+
+
+@self_test()
+def t_534_memory_caps_hold(ctx):
+    """5.3.4 memory audit: each structure that had no bound now has one.
+    Websites reached over plain HTTP and addresses on a VPN port keep
+    their largest counts; addresses that used encrypted DNS, DNS servers
+    and what waits for the history store stop at their caps; a device
+    that leaves memory takes its DNS servers along; the lookup matcher
+    keeps no set of used pairs; a closed connection the archive lets go
+    is marked for the Connections table; the deep pass forgets a
+    stream's HTTP and MQTT state when the stream ends and holds at most
+    MAX_PENDING; the mail tracker forgets reconnect counts older than a
+    minute."""
+    m = NetworkModel(ctx.cfg(), "192.168.1.1", {"192.168.1.10"}, set())
+    m.HTTP_HOSTS_KEEP, m.VPN_PEERS_KEEP, m.DOH_CLIENTS_KEEP = 40, 20, 10
+    m.PENDING_KEEP = 100
+    for i in range(300):
+        m.register_website(f"h{i}.example", None, None, "HTTP Host",
+                           1000.0 + i)
+    for _ in range(9):
+        m.register_website("big.example", None, None, "HTTP Host", 2000.0)
+    assert len(m.http_hosts) <= 40 and m.http_hosts["big.example"] == 9, \
+        (len(m.http_hosts), m.http_hosts.most_common(1))
+    for i in range(200):
+        m.vpn_bytes["198.51.100.1"] += 10
+        m.vpn_bytes[f"203.0.113.{i}"] += 1
+        trim_counter(m.vpn_bytes, m.VPN_PEERS_KEEP)
+    assert len(m.vpn_bytes) <= 20 and \
+        m.vpn_bytes.most_common(1)[0][0] == "198.51.100.1"
+    for i in range(40):
+        m._note_doh(f"192.168.1.{100 + i}", "dns.google")
+        m._note_doh("192.168.1.100", "cloudflare-dns.com")
+    assert len(m.doh_seen) <= 10 and \
+        m.doh_seen["192.168.1.139"] == {"dns.google"}, dict(m.doh_seen)
+    m.obs_sink = True
+    for i in range(500):
+        m.observe("dns_query", "aa:bb:cc:00:00:01", float(i),
+                  {"domain": "x.example"})
+        m.tie("aa:bb:cc:00:00:01", "h1.example", AS_CONNECTED, float(i))
+        m.websites[f"t{i}.example"] = WebsiteRecord(
+            domain=f"t{i}.example", registrable=f"t{i}.example")
+        m.tie(f"dev{i}", f"t{i}.example", AS_CONNECTED, float(i))
+    assert len(m.obs_pending) <= 100 and len(m.tie_pending) <= 100, \
+        (len(m.obs_pending), len(m.tie_pending))
+    # DNS servers: the one quiet the longest goes; devices take theirs
+    dt = DnsTracker()
+    dt.SERVERS_KEEP = 8
+    for i in range(30):
+        dt.on_query(100.0 + i, "192.168.1.20", f"203.0.113.{i}",
+                    {"qname": "a.example", "id": i}, dev_key="dev1")
+    dt.on_query(500.0, "192.168.1.20", "203.0.113.29", {"qname": "b",
+                                                         "id": 99},
+                dev_key="dev1")
+    assert len(dt.servers) == 8 and "203.0.113.29" in dt.servers and \
+        "203.0.113.0" not in dt.servers, sorted(dt.servers)
+    assert "dev1" in dt.device_servers
+    dt.forget("dev1")
+    assert "dev1" not in dt.device_servers and "dev1" not in dt.device_last
+    assert not hasattr(LookupCorrelator(), "used")
+    # the Connections table hears of a closed connection that is let go
+    ft = FlowTable(200, 100)
+    for i in range(400):
+        k = ("TCP", "192.168.1.20", 40000 + i, "203.0.113.9", 443)
+        ft.lookup_or_create(k, "TCP", k[1], k[2], k[3], k[4], float(i))
+    ft.dirty.clear()
+    ft.expire(10 ** 6)
+    gone = [fid for fid in ft.dirty if ft.get(fid) is None]
+    assert gone and len(ft.by_id) <= 300, (len(gone), len(ft.by_id))
+    # a smaller archive lets go of the numbers of what it dropped
+    ft.dirty.clear()
+    ft.resize(200, 100)
+    assert len(ft.archive) == 100 and len(ft.by_id) == 100 + len(ft.active)
+    ft.resize(200, 150)
+    assert len(ft.by_id) == len(ft.archive) + len(ft.active)
+    # a device's 16 addresses are the ones it used last, not any 16
+    reg = DeviceRegistry("192.168.1.1", {"192.168.1.10"}, ctx.cfg())
+    dev = reg.touch("192.168.1.30", "02:aa:00:00:00:01", "arp_reply",
+                    "", 100.0)
+    for i in range(40):
+        reg._assign_ip(dev, "10.0.0.%d" % (i % 20 + 1), 200.0 + i)
+    assert len(dev.ipv4s) == 16 and dev.ip == "10.0.0.20", sorted(dev.ipv4s)
+    assert dev.ipv4s == {"10.0.0.%d" % n for n in range(5, 21)}, \
+        sorted(dev.ipv4s)
+    # the deep pass: HTTP streams that never end, then the end of capture
+    da = DeepAnalyzer(my_ips={ScenarioBuilder.ME[0]})
+    da.proto.MAX_PENDING = 16
+    sb = ScenarioBuilder()
+    for i in range(60):
+        sb.http(ScenarioBuilder.PHONE, f"s{i}.example", f"34.1.0.{i + 1}")
+    for no, (raw, ts, lt) in enumerate(sb.frames, 1):
+        da.process(no, ts, lt, raw)
+    assert 0 < len(da.proto.http) <= 16, len(da.proto.http)
+    da.flush(sb.t + 10, final=True)
+    assert not da.proto.http and not da.proto.mqtt, len(da.proto.http)
+    # the mail tracker: one key per client and mail server, for a minute
+    mt = MailTracker(lambda **k: None, lambda *a: None)
+    mt.MAX = 16
+    for i in range(200):
+        st = types.SimpleNamespace(
+            key=(("192.168.1.20", 40000 + i), (f"203.0.113.{i}", 25)),
+            a=("192.168.1.20", 40000 + i))
+        msg = types.SimpleNamespace(kind="line", data=b"220 mx ESMTP\r\n",
+                                    direction=1)
+        assert mt.session(st, 1000.0 + i * 10, msg) is not None
+        mt.closed(st, 1000.0 + i * 10, "closed")
+    assert len(mt.reconnects) <= 16 + 1, len(mt.reconnects)
+
+
+# ---- 5.3.4 memory audit: what grows with time is held to a size --------------
+#  The 8-hour Windows soak grew 8-9 MB an hour while the devices stayed the
+#  same. These tests run days of a network in fast time instead: the model
+#  clock is moved on by hand, every minute brings new websites, addresses,
+#  ports and connections, and what can grow with time (not with devices)
+#  must stay under its cap while memory stays flat.
+MEMORY_CAPS = (
+    (NetworkModel, "WEBSITES_KEEP"), (NetworkModel, "REMOTE_MAX"),
+    (NetworkModel, "IP_NAMES_KEEP"), (NetworkModel, "ROOTS_KEEP"),
+    (NetworkModel, "OBS_SUBJECTS_KEEP"), (NetworkModel, "OBS_SITE_BUDGET"),
+    (NetworkModel, "FLOW_STARTS_KEEP"), (NetworkModel, "HTTP_HOSTS_KEEP"),
+    (NetworkModel, "VPN_PEERS_KEEP"), (NetworkModel, "DOH_CLIENTS_KEEP"),
+    (NetworkModel, "PENDING_KEEP"), (NetworkModel, "TIMELINE_KEEP"),
+    (NetworkModel, "OBS_RECENT_KEEP"), (NetworkModel, "RTT_KEEP"),
+    (NetworkModel, "BCAST_KEEP"),
+    (NetworkModel, "DEVICE_SITES_KEEP"),
+    (NetworkModel, "DEVICE_REMOTES_KEEP"), (NameCache, "MAX"),
+    (AlertEngine, "DEBOUNCE_KEEP"),
+    (AlertEngine, "KEEP"),
+    (DnsTracker, "DOMAINS_KEEP"), (DnsTracker, "SERVERS_KEEP"),
+    (DeviceRegistry, "ELIG_KEEP"))
+MEMORY_TABLE_CAPS = ((FeedTab, "ROWS_KEEP"), (TimelineTab, "ROWS_KEEP"),
+                     (RemoteTab, "ROWS_KEEP"))
+
+
+# the address memos (functools.lru_cache), called by name at each use
+MEMORY_MEMOS = ("_is_private_cached", "_is_public_cached",
+                "_is_unicast_mac_cached", "_ip_obj_cached",
+                "_mcast_or_bcast_cached", "_classify_address_cached")
+
+
+@contextlib.contextmanager
+def scaled_memory_caps(div):
+    """Every cap in MEMORY_CAPS divided by `div` (at least 8) while the
+    block runs, so a run of a few fast-time hours fills them all; the code
+    that holds them is the same. Always put back."""
+    saved = [(cls, name, cls.__dict__[name])
+             for cls, name in MEMORY_CAPS + MEMORY_TABLE_CAPS]
+    g = globals()
+    memos = {name: g[name] for name in MEMORY_MEMOS}
+    plain = {"_ADDR_TEXT_MAX": g["_ADDR_TEXT_MAX"],
+             "METRIC_TIERS": g["METRIC_TIERS"]}
+    try:
+        for cls, name, v in saved:
+            setattr(cls, name, max(8, v // div))
+        for name, fn in memos.items():
+            g[name] = functools.lru_cache(maxsize=max(
+                8, fn.cache_info().maxsize // div))(fn.__wrapped__)
+        g["_ADDR_TEXT_MAX"] = max(8, plain["_ADDR_TEXT_MAX"] // div)
+        # a day of minutes becomes a shorter day; the 1-second tier keeps
+        # the minute that the checks read
+        g["METRIC_TIERS"] = tuple((res, max(60 if res == 1 else 12,
+                                            n // div))
+                                  for res, n in plain["METRIC_TIERS"])
+        yield
+    finally:
+        for cls, name, v in saved:
+            setattr(cls, name, v)
+        g.update(memos)
+        g.update(plain)
+
+
+def memory_census(m):
+    """What a long live run can fill, and the size each must stay under:
+    {name: (size, cap)}. Device tables are checked against the devices."""
+    ft, reg, c = m.flows, m.registry, m.correlator
+    flows_cap = ft.max_active + (ft.archive.maxlen or 0)
+    devs = len(reg.by_key)
+    return {
+        "websites": (len(m.websites), m.WEBSITES_KEEP),
+        "remote addresses": (len(m.remote_hosts), m.REMOTE_MAX),
+        "names per address": (len(m.ip_to_domains), m.IP_NAMES_KEEP),
+        "first-visit domains": (len(m._seen_roots or ()), m.ROOTS_KEEP),
+        "observed subjects": (len(m.obs_by_subject),
+                              m.OBS_SUBJECTS_KEEP + 1),
+        "website observations": (m.obs_site_held, m.OBS_SITE_BUDGET),
+        "connection subjects": (len(m.obs_flow_keys), flows_cap),
+        "connection start times": (len(m.flow_starts), m.FLOW_STARTS_KEEP),
+        "plain HTTP websites": (len(m.http_hosts), m.HTTP_HOSTS_KEEP),
+        "VPN addresses": (len(m.vpn_bytes), m.VPN_PEERS_KEEP),
+        "encrypted DNS users": (len(m.doh_seen), m.DOH_CLIENTS_KEEP),
+        "names learned": (len(m.cache.ip_to_name), m.cache.MAX),
+        # (30 minutes, and at most 200,000: the review thread's part)
+        "lookups": (len(c.order), 200000),
+        "lookups per address": (len(c.by_ip), 200000),
+        "lookups per device": (len(c.by_dev_ip), 200000),
+        "names asked": (len(m.dns.domains), m.dns.DOMAINS_KEEP),
+        "DNS servers": (len(m.dns.servers), m.dns.SERVERS_KEEP),
+        "DNS waiting": (len(m.dns.pending), 4096),
+        "alerts": (len(m.alerts.alerts), m.alerts.KEEP),
+        "alerts still open": (len(m.alerts._open), m.alerts.KEEP),
+        "alert repeats": (len(m.alerts._debounce),
+                          m.alerts.DEBOUNCE_KEEP + 1),
+        "timeline": (len(m.timeline), m.timeline.maxlen),
+        "recent observations": (len(m.obs_recent), m.obs_recent.maxlen),
+        "round-trip times": (len(m.rtt_samples), m.rtt_samples.maxlen),
+        "broadcast senders": (len(m.bcast_talkers), m.bcast_talkers.maxlen),
+        "observations for history": (len(m.obs_pending), m.PENDING_KEEP),
+        "lookups for history": (len(m.res_pending), m.PENDING_KEEP),
+        "website ties for history": (len(m.tie_pending), m.PENDING_KEEP),
+        "connections": (len(ft.active), ft.max_active),
+        "closed connections": (len(ft.archive), ft.archive.maxlen),
+        "connection numbers": (len(ft.by_id), flows_cap),
+        "baselines": (len(m.baselines.devices), devs),
+        "reset counts": (len(m.resets), devs),
+        "ARP claims": (len(reg.arp_claims), devs + 1),
+        "DNS servers per device": (len(m.dns.device_servers), devs),
+        "websites of a device": (max((len(d.websites) for d in
+                                      reg.by_key.values()), default=0),
+                                 m.DEVICE_SITES_KEEP),
+        "remote addresses of a device": (
+            max((len(d.remote_ips) for d in reg.by_key.values()),
+                default=0), m.DEVICE_REMOTES_KEEP),
+        "metric buckets": (max(sum(len(od) for od in ts.tiers.values())
+                               for ts in m.metrics.series.values()),
+                           sum(n for _r, n in METRIC_TIERS)),
+        "device-address memo": (len(reg._elig), reg.ELIG_KEEP + 1),
+        "address texts": (max(len(_IP4_TEXT), len(_MAC_TEXT)),
+                          _ADDR_TEXT_MAX),
+        **{"memo " + n: (globals()[n].cache_info().currsize,
+                         globals()[n].cache_info().maxsize)
+           for n in MEMORY_MEMOS},
+    }
+
+
+def memory_over_caps(m):
+    """{name: (size, cap)} of what is over its cap now (empty = all well)."""
+    return {k: v for k, v in memory_census(m).items() if v[0] > v[1]}
+
+
+def drain_like_the_window(m):
+    """What the window takes from the model every second or so (the
+    tables, the feed, the history store), here thrown away."""
+    m.ev_feed.clear()
+    m.ev_timeline.clear()
+    m.ev_alerts.clear()
+    m.ev_banner.clear()
+    m.ev_geo.clear()
+    for attr in ("dirty_devices", "dirty_websites", "dirty_remotes"):
+        getattr(m, attr).clear()
+    m.flows.dirty.clear()
+    m.flows.closed_now.clear()
+    m.flows.closed_log.clear()
+    m.registry.rekeyed, m.registry.removed = [], []
+    m.obs_pending, m.res_pending, m.tl_pending = [], [], []
+    m.tie_pending = set()
+
+
+def memory_fast_time(cfg, minutes=160, settle=0, measure=(100, 160),
+                     hosts=8, names=2, tick_every=20.0):
+    """Runs the long-run scenario through a live-like model (its own clock,
+    moved on by hand, starting at 22:00 so the run crosses midnight and
+    each hour). tracemalloc starts at `settle` and is read at the two
+    `measure` minutes (by then everything that churns has been replaced
+    once, so what was made before the start no longer counts). ->
+    (model, [(minute, what was over its cap)], the last census, growth
+    figures). The census is taken every minute and only what was over is
+    kept, so the run itself holds nothing more as it goes."""
+    import tracemalloc
+    day = time.localtime(SCENARIO_T0)
+    t0 = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 22, 0, 0, 0, 0,
+                      -1))
+    clock = [t0]
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(cfg, gw, ips, macs, now_fn=lambda: clock[0])
+    m.set_identity(local_nets=nets)
+    m.flows.resize(200, 100)
+    m.capture_started = t0 - 3600          # past discovery
+    m.obs_sink = True                      # the history path too
+    dec = fast_frame_decoder(m)
+    who = long_run_hosts(hosts)
+    over, last, snaps, traced, objs = [], {}, {}, {}, {}
+    no = 0
+    was = tracemalloc.is_tracing()
+    try:
+        for minute in range(minutes + 1):
+            start = t0 + 60.0 * minute
+            next_tick = start + tick_every
+            for raw, ts, lt in long_run_minute(minute, start, who, names):
+                clock[0] = ts
+                d = dec(raw, ts, lt)
+                if d is None:
+                    continue
+                no += 1
+                d["no"] = no
+                learn_names_from(m.cache, d)
+                m.ingest(d)
+                if ts >= next_tick:
+                    m.tick()
+                    drain_like_the_window(m)
+                    next_tick += tick_every
+            clock[0] = start + 60.0
+            m.tick()
+            drain_like_the_window(m)
+            last = memory_census(m)
+            bad = {k: v for k, v in last.items() if v[0] > v[1]}
+            if bad and len(over) < 20:
+                over.append((minute, bad))
+            if minute == settle and not was:
+                gc.collect()
+                tracemalloc.start(1)
+            if minute in measure:
+                last = None
+                gc.collect()
+                objs[minute] = len(gc.get_objects())
+                if tracemalloc.is_tracing():
+                    snaps[minute] = tracemalloc.take_snapshot()
+                    traced[minute] = tracemalloc.get_traced_memory()[0]
+    finally:
+        if not was and tracemalloc.is_tracing():
+            tracemalloc.stop()
+    a, b = measure
+    growth = {"packets": no, "devices": len(m.registry.by_key)}
+    if a in snaps and b in snaps:
+        diffs = [st for st in snaps[b].compare_to(snaps[a], "lineno")
+                 if st.size_diff > 0]
+        diffs.sort(key=lambda st: -st.size_diff)
+        growth["total"] = traced[b] - traced[a]
+        growth["held"] = (traced[a], traced[b])
+        growth["top"] = [(f"{os.path.basename(st.traceback[0].filename)}:"
+                          f"{st.traceback[0].lineno}", st.size_diff)
+                         for st in diffs[:8]]
+    if a in objs and b in objs:
+        growth["objects"] = (objs[a], objs[b])
+    return m, over, memory_census(m), growth
+
+
+# Measured (Linux, Python 3.12 and 3.8): about 3.8 MB held at minute 100;
+# from minute 100 to 160 +14 to +63 KB in all, at most 17 KB on one line
+# (the address-text memo, which empties itself when full), and from 9
+# objects fewer to 143 more (the night-upload minutes of the second
+# audit's check fill while the run crosses midnight, and are kept for a
+# fixed window). The limits are four to ten times that, and well under
+# what one leaked object per new website would add in that hour (960
+# websites: about 960 objects and 400 KB).
+MEMORY_FLAT_LIMIT = 256 * 1024
+MEMORY_FLAT_LINE = 64 * 1024
+MEMORY_FLAT_OBJECTS = 300
+
+
+@self_test(slow=True)
+def t_534_memory_flat_in_fast_time(ctx):
+    """5.3.4 memory audit: 160 fast-time minutes of a network whose
+    devices stay the same but which reaches new websites, addresses and
+    ports every minute (short connections, failed lookups, resets, a port
+    sweep every half hour; minute, hour and midnight rollovers). With
+    every cap divided by 80 so the run fills them all: nothing that grows
+    with time ever passes its cap, and from minute 100 to 160 the memory
+    still held grows by less than MEMORY_FLAT_LIMIT, no line by more than
+    MEMORY_FLAT_LINE, and the number of Python objects by less than
+    MEMORY_FLAT_OBJECTS."""
+    with scaled_memory_caps(80):
+        m, over, end, g = memory_fast_time(ctx.cfg())
+        assert not over, over[:3]
+        # the run filled what it should have: these were at their caps
+        # (a Counter is cut to half, the others lose a tenth)
+        for name in ("websites", "remote addresses", "names per address",
+                     "first-visit domains", "names learned",
+                     "plain HTTP websites", "closed connections",
+                     "timeline", "metric buckets", "memo _ip_obj_cached",
+                     "websites of a device"):
+            assert end[name][0] >= 0.5 * end[name][1], (name, end[name])
+        assert g["devices"] <= 8 + 2, g["devices"]     # and the router
+        assert len(m.alerts.alerts) > 0, "the port sweeps raised no alert"
+        assert "total" in g, "tracemalloc was already running"
+        o0, o1 = g["objects"]
+        print(f"      ({g['packets']} packets; held {g['held'][0] // 1024} "
+              f"KB at minute 100, {g['held'][1] // 1024} KB at 160, growth "
+              f"{g['total'] / 1024:+.0f} KB; objects {o0} -> {o1}; most: "
+              f"{g['top'][:3]})")
+        assert g["total"] < MEMORY_FLAT_LIMIT, g
+        assert not g["top"] or g["top"][0][1] < MEMORY_FLAT_LINE, g["top"]
+        assert o1 - o0 < MEMORY_FLAT_OBJECTS, (o0, o1)
+
+
 @self_test(needs_source=True)
 def t_534_soak_one_job_per_name(ctx):
     """5.3.4 soak: while a job's thread is blocked, a second request starts
@@ -86488,6 +92568,55 @@ def t_534_soak_one_job_per_name(ctx):
                       "coalesce=True"), ("capture-heal", "")):
         assert f'start_one("{name}", work{how})' in src, name
         assert f'name="{name}"' not in src, name
+
+
+@self_test()
+def t_534_hung_job_abandoned(ctx):
+    """Audit #5: a job blocked past its limit is abandoned by the next
+    request (thread renamed "-abandoned", warned once), the new request
+    runs, and while that thread still hangs no second one is abandoned."""
+    name, gate, ran = "soak-test-hang", threading.Event(), []
+    ONE_JOB_LIMIT[name] = 0.2
+
+    def named(n):
+        return [t for t in threading.enumerate() if t.name == n]
+    try:
+        assert start_one(name, lambda: gate.wait(10))
+        assert not start_one(name, lambda: ran.append(1))     # in time
+        time.sleep(0.3)
+        assert start_one(name, lambda: (ran.append(2), gate.wait(10)))
+        assert len(named(name + "-abandoned")) == 1
+        time.sleep(0.3)                    # the new one is late too, but
+        assert not start_one(name, lambda: ran.append(3))   # one at most
+        assert len(named(name + "-abandoned")) == 1 and ran == [2]
+        gate.set()
+        for t in named(name) + named(name + "-abandoned"):
+            t.join(5)
+        assert name not in _ONE_JOB and name not in _ONE_JOB_RUN
+        assert start_one(name, lambda: ran.append(4))
+        for t in named(name):
+            t.join(5)
+        assert ran == [2, 4] and name not in _ONE_JOB, ran
+    finally:
+        gate.set()
+        ONE_JOB_LIMIT.pop(name, None)
+        _ONE_JOB_LOST.pop(name, None)
+
+
+
+@self_test()
+def t_a2_local_page_title_one_pass(ctx):
+    """Second audit #3: the Local services probe reads a page's title in
+    one pass; 64 KB of "<title>" with no end tag takes milliseconds, not
+    seconds."""
+    assert local_page_title(b"HTTP/1.0 200 OK\r\n\r\n<html><TITLE id=x>"
+                            b" My  &amp; app </title>") == "My & app"
+    assert local_page_title(b"<title>no end") == ""
+    assert local_page_title(b"no title at all") == ""
+    t0 = time.perf_counter()
+    assert local_page_title(b"<title>" * 9362) == ""
+    took = time.perf_counter() - t0
+    assert took < 0.1, f"{took:.3f} s"
 
 
 @self_test(needs_source=True)
@@ -87053,6 +93182,35 @@ def t_r7_theme_walk_reads_options_once_per_class(ctx):
 
 
 @self_test()
+def t_start_one_frees_its_name_after_base_exception(ctx):
+    """A job that ends its thread with a BaseException (SystemExit) frees
+    its name: before, it stayed in _ONE_JOB and every later request of
+    that name was skipped for the whole session (second audit)."""
+    name = f"t-one-{uuid.uuid4().hex[:6]}"
+    done = threading.Event()
+
+    def bad():
+        try:
+            raise SystemExit("planted")
+        finally:
+            done.set()
+    hook = threading.excepthook
+    threading.excepthook = lambda a: None           # the planted exit
+    try:
+        assert start_one(name, bad)
+        assert done.wait(5)
+        t_end = time.monotonic() + 5
+        while name in _ONE_JOB and time.monotonic() < t_end:
+            time.sleep(0.01)
+    finally:
+        threading.excepthook = hook
+    assert name not in _ONE_JOB, "the name stayed taken"
+    ran = threading.Event()
+    assert start_one(name, ran.set), "a later request was skipped"
+    assert ran.wait(5)
+
+
+@self_test()
 def t_r7_self_test_keeps_the_real_log_clean(ctx):
     """Windows run (#18): what the tests log (made-up adapters, "installed
     update 9.9.9", a damaged history) never reaches the real log, even
@@ -87098,6 +93256,118 @@ def t_r7_self_test_keeps_the_real_log_clean(ctx):
     with open(real_path, encoding="utf-8") as f:
         lines = f.read().splitlines()
     assert lines == ["self-test ran: 1 passed, 1 failed, 1 skipped"], lines
+
+
+# ---- 5.3.4 crowd test: places where the app contradicted itself ------------
+def _ct_translated(texts):
+    miss = [(loc, t) for t in texts for loc in ("fr", "es")
+            if translate_text(t, loc) == t]
+    assert not miss, miss[:4]
+
+
+@self_test()
+def t_ct3_kill_switch_said_once(ctx):
+    """Crowd test #3: the banner, the Settings help, the ledger, Help and
+    the Ready? line say the same thing about the kill switch (one
+    sentence, KILL_SWITCH_EFFECT), in all three languages, and none of
+    the old claims ("nothing leaves this computer", "stops every
+    optional request", "the ledger below") is left."""
+    ctl = next(c for pg in SETTINGS_PAGES for sec in pg["sections"]
+               for c in sec["controls"] if c.get("key") ==
+               "privacy.kill_switch")
+    topic = next(t for t in HELP_USING if t[0] == "Kill switch")
+    st, ready, _fix = _ready_outbound(ctx.cfg({"privacy.kill_switch": True}))
+    texts = [ctl["help"], topic[1], ready]
+    for t in texts:
+        assert KILL_SWITCH_EFFECT in t, t
+        for old in ("nothing leaves this", "Nothing leaves this",
+                    "every optional", "ledger below", "sends nothing at all"):
+            assert old not in t, (old, t)
+    assert st == "ok"
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        src = f.read()
+    stop = src.index("#  20b.  Self-tests")
+    for old in ("sends nothing at all", "Nothing leaves this PC",
+                "stops every optional network", "listed in the ledger below",
+                "Kill switch ON — nothing is being sent"):
+        assert old not in src[:stop], old
+    _ct_translated(texts + ["\U0001F6D1 KILL SWITCH ON — " +
+                            KILL_SWITCH_EFFECT,
+                            "\U0001F6D1  Kill switch on — " +
+                            KILL_SWITCH_EFFECT,
+                            "Nothing sent or blocked yet."])
+
+
+@self_test()
+def t_ct4_nothing_unusual_never_over_open_warnings(ctx):
+    """Crowd test #4: with an open WARNING that is not about unusual
+    behaviour (FTP without encryption), the Dashboard card, the Security
+    section and the check-up don't say "Nothing unusual right now": they
+    all count it with other_open_alerts(). Acknowledged, it no longer
+    counts."""
+    clock = [1761600000.0]
+    e = AlertEngine(ctx.cfg({}), now_fn=lambda: clock[0])
+    a = e.cleartext("Brother HL-L2350DW", "aa:bb", "FTP", "203.0.113.5",
+                    True)
+    assert a is not None and a.severity == "WARNING"
+    assert unusual_findings(e) == []
+    others = other_open_alerts(e)
+    assert [x.id for x in others] == [a.id]
+    text = unusual_card_text(len(unusual_findings(e)), len(others))
+    assert "Nothing unusual" not in text and "1 open warning" in text, text
+    assert "2 open warnings" in unusual_card_text(0, 2)
+    _ct_translated([text, unusual_card_text(0, 2),
+                    "They are in the Alerts tab.", "no unusual behaviour"])
+    e.acknowledge(a.id)
+    assert other_open_alerts(e) == []
+    assert unusual_card_text(0, len(other_open_alerts(e))) == \
+        "Nothing unusual right now."
+
+
+@self_test()
+def t_ct8_wifi_signal_is_not_a_speed_test(ctx):
+    """Crowd test #8: a weak signal is described, not crowned "the most
+    likely cause of slowness"; a quick handshake to Internet sites says
+    it timed how fast connections open, not download speed."""
+    why = wifi_quality(-78)[2]
+    assert "most likely cause" not in why, why
+    hyps = investigate_wifi_internet({"lan_ms": 4.0, "lan_n": 5,
+                                      "lan_gw": True, "wan_ms": 34.0,
+                                      "wan_n": 9})
+    inet = next(h for h in hyps if h["key"] == "internet")
+    assert inet["status"] == "Unlikely", inet
+    assert any("not download speed" in x for x in inet["against"]), inet
+    _ct_translated([why, "○ Only how quickly connections open was timed, "
+                         "not download speed"])
+
+
+@self_test()
+def t_ct28_device_scales_have_one_key(ctx):
+    """Crowd test #28: the Devices table's three ways of saying how sure
+    it is ("Device evidence" dots, the "Evidence" glyphs, "Likely" and
+    "Possibly") have one key, built from the tables the cells use, with
+    the score each word needs; the Devices header shows it."""
+    key = device_scales_key()
+    for low, word in CONFIDENCE_STEPS:
+        assert f"{CONFIDENCE_ICON[word]} {word}" in key, word
+        assert confidence_tier(low) == word, (low, word)
+        if low:
+            assert f"score {low}+" in key and \
+                confidence_tier(low - 1) != word, low
+    for lv, glyph in LEVEL_GLYPH.items():
+        assert f"{glyph} {LEVEL_WORD[lv]}" in key, lv
+    for word in ("Device evidence", "Evidence", "“Likely”", "“Possibly”"):
+        assert word in key, word
+    assert {c[0]: c[1] for c in DevicesTab.COLS}["conf"] in key
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        src = f.read()
+    body = src[src.index("class DevicesTab(BaseTab):"):]
+    body = body[:body.index("    def explain_row")]
+    assert "device_scales_key()" in body, "the Devices header has no key"
+    _ct_translated([key, "The devices on your local network. Device "
+                    "evidence shows how sure it is that each one is a real "
+                    "device — an IP address alone is never enough to count "
+                    "as a device."])
 
 
 # ============================================================================
@@ -87223,8 +93493,8 @@ def _gs_stress(app, ctx):
 
 @gui_test_step("live capture starts and stops (only with --live)")
 def _gs_live(app, ctx):
-    if "--live" not in sys.argv:
-        return
+    if not getattr(ctx, "live", False):
+        return "skip"
     app.start(auto=True)
     _gui_pump(app.root, 3.0)
     assert app.sniffer is not None, "capture did not start"
@@ -87543,6 +93813,16 @@ def _gs_diag_depth(app, ctx):
     res = app.health_summary()
     assert res["wifi"][0] == "Needs attention", res["wifi"]
     assert app.health_culprit == "wifi"
+    # crowd test #8: a weak signal with no slowness measured is worth a
+    # look, not yet the culprit; with router checks that lost packets it
+    # is the likely culprit
+    assert res["overall"][1].startswith("Worth a look: Wi-Fi"), \
+        res["overall"]
+    for ok in (True, False, True):
+        m.health_history.append({"gateway_ok": ok, "gateway_ms": 4.0})
+    res = app.health_summary()
+    assert res["loss"][0] == "Needs attention", res["loss"]
+    assert app.health_culprit == "wifi"
     assert "Likely culprit: Wi-Fi" in res["overall"][1], res["overall"]
     assert res["switch"][0] == "Healthy" and "core-sw1" in res["switch"][1]
     # ST-07: the Dashboard's first answer agrees with the Health verdict
@@ -87567,6 +93847,7 @@ def _gs_diag_depth(app, ctx):
             win.destroy()
     app.wifi.last = None
     app.wifi.at = 0.0
+    m.health_history.clear()
     app.data_mode = "idle"
 
 
@@ -88631,6 +94912,24 @@ def _gs_v502_layout(app, ctx):
                 for kind, path, detail in layout_audit(root):
                     found.append(f"{lang}/{size}/{geo} {name}: {kind} "
                                  f"{path[-60:]} {detail}")
+                # 5.3.4: and Websites → Local services (with fake
+                # listeners, so the rows don't depend on this computer)
+                if name == "websites":
+                    tab = app.tabs[name]
+                    src0 = tab.local.source
+                    tab.local.source = lambda: (
+                        "ok", _local_fake_listeners())
+                    try:
+                        tab.show_subview("Local services")
+                        _gui_pump(root, 0.35)
+                        assert tab.local.tree.get_children()
+                        for kind, path, detail in layout_audit(root):
+                            found.append(f"{lang}/{size}/{geo} websites/"
+                                         f"local: {kind} {path[-60:]} "
+                                         f"{detail}")
+                    finally:
+                        tab.local.source = src0
+                        tab.show_subview("Websites")
             # a dialog with many buttons and the settings window
             dev = next(iter(app.model.registry.by_key))
             app.show_device(dev)
@@ -89021,6 +95320,21 @@ def _gs_official_update_source(app, ctx):
         _gui_pump(root, 0.1)
 
 
+def gui_test_record(results, name, fn):
+    """Run one GUI test step and add (status, name, message) to
+    `results`. (35-checker review) a step that returns "skip" (not
+    available here, or --live not given) is SKIP, as in the self-test: it
+    was counted as passed."""
+    try:
+        with StepWatchdog("GUI test step " + name, GUI_STEP_LIMIT_S):
+            r = fn()
+        results.append(("SKIP", name, "not available here") if r == "skip"
+                       else ("PASS", name, ""))
+    except Exception as e:                           # noqa: BLE001
+        results.append(("FAIL", name, f"{type(e).__name__}: {e}\n" +
+                        traceback.format_exc(limit=6)))
+
+
 def run_gui_test(live=False):
     """Returns 0 on success. Prints a step-by-step report."""
     global PATHS
@@ -89032,6 +95346,7 @@ def run_gui_test(live=False):
     _patch_dialogs_for_tests()
     results = []
     ctx = TestContext(tmp, True)
+    ctx.live = bool(live)        # (35-checker review) was read from argv
     cfg = ctx.cfg({"general.auto_start_capture": False,
                    "updates.check_automatically": False,
                    "privacy.auto_download_reference": False,
@@ -89041,16 +95356,17 @@ def run_gui_test(live=False):
     root = tk.Tk()
     gw, ips, macs, nets = scenario_identity()
     app = MiniWireshark(root, "", set(), set(), "", config=cfg)
+    if not live:
+        # 5.3.4: Websites → Local services shows a fixed set of listeners,
+        # so what the steps count and lay out doesn't depend on this
+        # computer (t_534_local_services_from_connection_table reads the
+        # table itself)
+        app.tabs["websites"].local.source = lambda: (
+            "ok", _local_fake_listeners())
 
     def step(name, fn):
         t0 = time.perf_counter()
-        try:
-            with StepWatchdog("GUI test step " + name, GUI_STEP_LIMIT_S):
-                fn()
-            results.append(("PASS", name, ""))
-        except Exception as e:                       # noqa: BLE001
-            results.append(("FAIL", name, f"{type(e).__name__}: {e}\n" +
-                            traceback.format_exc(limit=6)))
+        gui_test_record(results, name, fn)
         # 5.3.4 CI: the reason on the step's own line, in case the run
         # dies before the summary at the end (it did, on Windows)
         why = results[-1][2].splitlines()[0][:300] if results[-1][2] \
@@ -89173,10 +95489,11 @@ def run_gui_test(live=False):
         assert not bad, f"non-daemon threads left: {bad}"
     step("clean shutdown", s_close)
     failed = [r for r in results if r[0] == "FAIL"]
+    skipped = sum(1 for r in results if r[0] == "SKIP")
     print(f"  (timers cancelled with their widget: "
           f"{AFTER_GUARD['cancelled']})")
-    print(f"\nGUI test: {len(results) - len(failed)} passed / "
-          f"{len(failed)} failed")
+    print(f"\nGUI test: {len(results) - len(failed) - skipped} passed / "
+          f"{len(failed)} failed / {skipped} skipped")
     for _s, name, msg in failed:
         print(f"\nFAILED: {name}\n{msg}")
     shutil.rmtree(tmp, ignore_errors=True)
@@ -90587,6 +96904,21 @@ REACHABLE_RENAMES = {
     "menu:help:🛠 Repair MiniWireshark…":
         "menu:help:MiniWireshark health > 🛠 Repair MiniWireshark…",
 }
+# 5.3.4 crowd test #21: Ctrl+K names the tabs as the tab strip does (it
+# showed the inner names, "dash" and "feed") and writes every settings
+# entry the same way, "Settings › …"
+REACHABLE_RENAMES.update({
+    f"palette:tab:{name}": f"palette:tab:{label}" for name, label in (
+        ("dash", "Dashboard"), ("feed", "Happening"),
+        ("timeline", "Timeline"), ("devices", "Devices"), ("map", "Map"),
+        ("health", "Health"), ("alerts", "Alerts"),
+        ("websites", "Websites"), ("connections", "Connections"),
+        ("remote", "Internet hosts"), ("packets", "Packets"),
+        ("security", "Security"), ("sources", "Sources"),
+        ("help", "Help"))})
+REACHABLE_RENAMES.update({
+    f"palette:setting:Settings: {p['title']}":
+        f"palette:setting:Settings › {p['title']}" for p in SETTINGS_PAGES})
 # Menu entries that exist only in some states (a file open, an autosave
 # present); they are not part of the comparison.
 REACHABLE_CONDITIONAL = {
@@ -90867,8 +97199,12 @@ def gt_534_story_mode(app, ctx):
           f"by the job, drawn in {draw_ms:.1f} ms)")
     heads = [i for i in tl.tree.get_children()
              if "episode" in tl.tree.item(i, "tags")]
+    # second audit (#53): "Today · N changes" in the wide column
     assert [tl.tree.set(i, "text") for i in heads] == \
-        [story_day_label(d) for d, _its in st["days"]]
+        [story_day_row(d, len(_its))[3] for d, _its in st["days"]]
+    assert all(story_day_label(d) in tl.tree.set(i, "text") and
+               not tl.tree.set(i, "kind") for i, (d, _its) in
+               zip(heads, st["days"]))
     assert "Writing" not in str(tl.status_lbl.cget("text"))
     # a scripted live story: the line falls between new and seen
     now = _story_noon(0)
@@ -90899,7 +97235,10 @@ def gt_534_story_mode(app, ctx):
     first = tl.refs[rows[1]]
     assert tl.tree.set(rows[1], "text") == ROW_DOT + \
         "Phone left and came back 4 times"
-    assert tl.tree.set(rows[1], "kind") == "×8" and first["fresh"]
+    # second audit (#53): the Type column names the category; the
+    # sentence says how many times
+    assert tl.tree.set(rows[1], "kind") == "Devices" and first["fresh"] \
+        and first["count"] == 8
     tl.tree.selection_set(rows[1])
     tl._on_double()                    # no such device: the sentence
     _gui_pump(root, 0.1)
@@ -91039,6 +97378,12 @@ def gt_534_notify_minimised(app, ctx):
     def shell(op, hwnd, head, body):
         t0 = time.perf_counter()
         if IS_WINDOWS:
+            # the real tray call is the Windows evidence, but a person may
+            # see it: never let a test toast look like a real attack
+            if head:
+                head = "[TEST] " + head
+            if body:
+                body = "MiniWireshark self-test, not your network. " + body
             ok = real_shell(op, hwnd, head, body)
         else:
             time.sleep(0.3)
@@ -91778,6 +98123,292 @@ def gt_534_m17_layout(app, ctx):
         _gui_pump(root, 0.4)
 
 
+@gui_test_step("5.3.4 Local services: Websites → Local services with fake "
+               "listeners — rows, safety notes, open only web apps through "
+               "the gate, empty and no-admin states, refresh and EN/FR/ES "
+               "without piling up, fits at 1024×768")
+def gt_534_local_services(app, ctx):
+    import webbrowser
+    root = app.root
+    tab = app._select_tab("websites")
+    view = tab.local
+    fake = {"state": "ok", "listening": _local_fake_listeners()}
+    src0 = view.source
+    view.source = lambda: (fake["state"], dict(fake["listening"]))
+
+    def widgets(w):
+        n = 1
+        for c in w.winfo_children():
+            n += widgets(c)
+        return n
+
+    def cells():
+        return [tuple(str(v) for v in view.tree.item(i, "values"))
+                for i in view.tree.get_children()]
+
+    def pick(port, proto="TCP"):
+        for iid, r in view.iid_row.items():
+            if r["port"] == port and r["proto"] == proto:
+                view.tree.selection_set(iid)
+                view.tree.focus(iid)
+                _gui_pump(root, 0.05)
+                return iid
+        raise AssertionError(f"no row for {proto} {port}")
+
+    old = (app.config.get("general.language"),
+           app.config.get("appearance.theme"),
+           app.config.get("appearance.text_size"), root.geometry())
+    old_open, old_killed = webbrowser.open, LEDGER.killed
+    opened = []
+    try:
+        # (reachable_actions visits other tabs: first)
+        assert "subview:websites/Local services" in reachable_actions(app)
+        assert any(x[0] == "Websites → Local services"
+                   for x in app.palette_items())
+        app._select_tab("websites")
+        tab.show_subview("Local services")
+        _gui_pump(root, 0.4)
+        assert tab.subview == "Local services"
+        assert view.tree.winfo_ismapped()
+        rows = cells()
+        assert len(rows) == 10, rows
+        by = {(r[1], r[0]): r for r in rows}
+        assert by[("TCP", "5173")][3] == "Only this computer can reach it"
+        assert by[("TCP", "8080")][3] == \
+            "Other devices on your network can reach it"
+        assert by[("TCP", "8080")][5] == "The whole network (all addresses)"
+        assert by[("TCP", "5173")][2] == "Web app in development"
+        assert by[("TCP", "631")][2] == "Printing (IPP)"
+        assert by[("TCP", "5432")][2] == "Database connection (PostgreSQL)"
+        assert "node (pid 4001)" == by[("TCP", "5173")][4]
+        # refresh 3 times and EN → FR → ES → EN: the same rows, widgets
+        # and table kits every time
+        base = (len(rows), widgets(view.frame), len(app.kits),
+                len(view.iid_row))
+        for _ in range(3):
+            view.refresh_btn.invoke()
+            _gui_pump(root, 0.2)
+            assert (len(cells()), widgets(view.frame), len(app.kits),
+                    len(view.iid_row)) == base
+        for lang, loc in (("Français", "fr"), ("Español", "es"),
+                          ("English", "en")):
+            app.config.set("general.language", lang)
+            app._apply_runtime_settings()
+            _gui_pump(root, 0.4)
+            got = cells()
+            assert (len(got), widgets(view.frame), len(app.kits),
+                    len(view.iid_row)) == base, (lang, len(got))
+            safe = {r[3] for r in got}
+            want = {translate_text(LOCAL_SAFE, loc),
+                    translate_text(LOCAL_EXPOSED, loc)}
+            assert safe == want, (lang, safe)
+            assert str(view.open_btn.cget("text")) == translate_text(
+                "Open in browser", loc)
+            assert str(view.tree.heading("safety", "text")).rstrip(
+                " ▲▼") == translate_text("Who can reach it", loc)
+        assert cells() == rows                 # English again, the same
+        # open: only a TCP web app, at 127.0.0.1, through the gate
+        webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+        LEDGER.killed = False
+        n0 = len(LEDGER.snapshot("local_open"))
+        pick(5173)
+        assert str(view.open_btn.cget("state")) == "normal"
+        view.open_btn.invoke()
+        assert opened == ["http://127.0.0.1:5173/"], opened
+        pick(8080)
+        assert view.tree.bind("<Double-1>")        # double-click opens
+        view._double()
+        assert opened[-1] == "http://127.0.0.1:8080/", opened
+        assert len(LEDGER.snapshot("local_open")) == n0 + len(opened)
+        for port, proto in ((631, "TCP"), (5432, "TCP"), (5353, "UDP")):
+            pick(port, proto)
+            assert str(view.open_btn.cget("state")) == "disabled", port
+            n = len(opened)
+            view._double()
+            assert len(opened) == n, (port, opened)
+        # the right-click menu offers it only on a web app
+        assert any(it and it[0] == "Open in browser" for it in
+                   view.kit.row_items(pick(3000)))
+        assert not any(it and it[0] == "Open in browser" for it in
+                       view.kit.row_items(pick(631)))
+        # the kill switch stops it and says what to type
+        LEDGER.killed = True
+        pick(5173)
+        n = len(opened)
+        view.open_btn.invoke()
+        assert len(opened) == n
+        assert "http://127.0.0.1:5173/" in str(app.banner_lbl.cget("text"))
+        LEDGER.killed = False
+        app._hide_banner()
+        # empty, then a computer that won't say without admin rights, then
+        # back: the same widgets
+        fake["state"], fake["listening"] = "ok", {}
+        view.reload()
+        _gui_pump(root, 0.3)
+        view.kit.update_empty()
+        assert not view.tree.get_children()
+        assert str(view.kit.empty_lbl.cget("text")) == \
+            "No services are listening on this computer."
+        assert view.kit.empty.winfo_manager() == "place"
+        assert str(view.open_btn.cget("state")) == "disabled"
+        assert str(view.count_lbl.cget("text")) == ""
+        fake["state"] = "denied"
+        view.reload()
+        _gui_pump(root, 0.3)
+        view.kit.update_empty()
+        assert "administrator rights" in str(view.kit.empty_lbl.cget(
+            "text"))
+        fake["state"] = "unavailable"
+        view.reload()
+        _gui_pump(root, 0.3)
+        view.kit.update_empty()
+        assert "psutil" in str(view.kit.empty_lbl.cget("text"))
+        app.config.set("general.language", "Español")
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.3)
+        view.kit.update_empty()
+        assert str(view.kit.empty_lbl.cget("text")) == translate_text(
+            "The list of services needs the optional psutil component "
+            "(Settings → Repair).", "es")
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        fake["state"], fake["listening"] = "ok", _local_fake_listeners()
+        view.reload()
+        _gui_pump(root, 0.3)
+        assert len(cells()) == len(rows)
+        assert not view.kit.empty.winfo_manager()
+        assert widgets(view.frame) == base[1]
+        # fits at 1024×768: every text size, both themes, the 3 languages
+        found = []
+        combos = [(size, theme) for size in MiniWireshark.TEXT_SIZES
+                  for theme in ("Light", "Dark")]
+        langs = ("English", "Français", "Español")
+        for i, (size, theme) in enumerate(combos):
+            lang = langs[i % 3]
+            app.config.set("general.language", lang)
+            app.config.set("appearance.theme", theme)
+            app.config.set("appearance.text_size", size)
+            app._apply_runtime_settings()
+            app._apply_text_size(defer=False)
+            root.geometry("1024x768")
+            _gui_pump(root, 0.5, until=lambda: not getattr(
+                app, "_theme_pending", False), timeout=10)
+            _gui_pump(root, 0.3)
+            assert view.tree.winfo_ismapped(), (lang, theme, size)
+            found += [f"{lang}/{theme}/{size}: {k} {p[-50:]} {d}"
+                      for k, p, d in layout_audit(view.frame)]
+            # the buttons are whole and inside the window
+            for b in (view.refresh_btn, view.open_btn):
+                assert b.winfo_ismapped() and b.winfo_width() >= \
+                    b.winfo_reqwidth() - 2, (lang, size, b.cget("text"))
+                assert b.winfo_rootx() + b.winfo_width() <= \
+                    root.winfo_rootx() + root.winfo_width(), (lang, size)
+            if theme == "Dark":
+                bg = str(view.frame.cget("bg")).lower()
+                assert bg != WHITE, (size, bg)
+        assert not found, "\n".join(found[:10])
+    finally:
+        webbrowser.open, LEDGER.killed = old_open, old_killed
+        view.source = src0
+        app.config.set("general.language", old[0])
+        app.config.set("appearance.theme", old[1])
+        app.config.set("appearance.text_size", old[2])
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.geometry(old[3])
+        _gui_pump(root, 0.4, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        tab.show_subview("Websites")
+        app._hide_banner()
+    # back on Websites, a website search still works and the sub-view
+    # follows it
+    tab.show_subview("Local services")
+    tab.set_filter("")
+    assert tab.subview == "Websites"
+
+
+@gui_test_step("audit2 Local services in Demo Mode: made-up services, the "
+               "real table never read, nothing opened, no light blocks in "
+               "Dark")
+def gt_a2_local_services_demo(app, ctx):
+    import webbrowser
+    root = app.root
+    pm = app.procmap
+    reads, opened = [], []
+    old_refresh, old_open = pm.refresh, webbrowser.open
+    old_theme = app.config.get("appearance.theme")
+    tab = app._select_tab("websites")
+    view = tab.local
+    src0 = view.source
+    view.source = None
+    want = sorted((r["proto"], r["port"], r["program"])
+                  for r in local_service_rows(DEMO_LOCAL_LISTENERS))
+    webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+    try:
+        # outside Demo Mode the real table is read (audit #19: the GUI
+        # test only ever showed made-up rows)
+        if pm.available and app.data_mode != "demo":
+            pm.refresh = lambda *a, **k: reads.append(1) or \
+                old_refresh(*a, **k)
+            tab.show_subview("Local services")
+            view.reload()
+            assert _gui_pump(root, 0.2, lambda: not view.reading(),
+                             timeout=15)
+            _gui_pump(root, 0.2)
+            assert reads, "Refresh didn't read the connection table"
+            state, listening = local_services_state(pm)
+            assert view.state == state, (view.state, state)
+            assert len(view.iid_row) == len(
+                local_service_rows(listening)), len(view.iid_row)
+            del reads[:]
+        pm.refresh = lambda *a, **k: reads.append(1)
+        app.start_demo()
+        assert _gui_pump(root, 0.3, lambda: app.data_mode == "demo",
+                         timeout=30)
+        app._select_tab("websites")
+        tab.show_subview("Local services")
+        _gui_pump(root, 0.4)
+        view.refresh_btn.invoke()
+        _gui_pump(root, 0.3)
+        for _ in range(3):
+            tab.refresh()
+            _gui_pump(root, 0.05)
+        got = sorted((r["proto"], r["port"], r["program"])
+                     for r in view.iid_row.values())
+        assert got == want, got
+        assert reads == [], "the real connection table was read"
+        iid = next(i for i, r in view.iid_row.items() if r["url"])
+        view.tree.selection_set(iid)
+        view.tree.focus(iid)
+        _gui_pump(root, 0.05)
+        view.open_btn.invoke()
+        view._double()
+        assert opened == [], opened
+        assert "made up" in str(app.banner_lbl.cget("text"))
+        app._hide_banner()
+        # #16: the header and the status strip follow the Dark theme
+        app.config.set("appearance.theme", "Dark")
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.5, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        _gui_pump(root, 0.2)
+        leaks = dark_theme_leaks(view.frame)
+        assert not leaks, leaks[:5]
+    finally:
+        pm.refresh, webbrowser.open = old_refresh, old_open
+        view.source = src0
+        app.config.set("appearance.theme", old_theme)
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.4, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        if app.data_mode == "demo":
+            app.stop_demo()
+            _gui_pump(root, 0.3)
+        tab.show_subview("Websites")
+        app._hide_banner()
+    _gt_back_to_scenario(app, ctx)
+
+
 @gui_test_step("review 6: the Inspector's refreshes keep no bindings; a "
                "table narrowed for a small window saves its own widths")
 def gt_r6_inspector_and_saved_widths(app, ctx):
@@ -92514,6 +99145,288 @@ def gt_nothing_piles_up(app, ctx):
         _gui_pump(root, 0.3)
 
 
+@gui_test_step("crowd #3: the kill switch's boxes and banner agree")
+def _gs_ct3_kill_switch(app, ctx):
+    """Ticked in the ledger, the open Settings window shows it ticked (and
+    still "All changes saved"), the banner says the one sentence; turned
+    off from the banner, both boxes clear."""
+    root = app.root
+    was = app.config.get("privacy.kill_switch", False)
+    sw = app._open_settings("privacy")
+    _gui_pump(root, 0.2)
+    led = app.open_ledger()
+    _gui_pump(root, 0.2)
+
+    def boxes(w):
+        out = []
+        for c in w.winfo_children():
+            if isinstance(c, ttk.Checkbutton):
+                out.append(c)
+            out += boxes(c)
+        return out
+    try:
+        box = next(b for b in boxes(led) if "Kill switch" in
+                   str(b.cget("text")) or "urgence" in str(b.cget("text")))
+        box.invoke()                                 # tick it in the ledger
+        _gui_pump(root, 0.2)
+        assert LEDGER.killed
+        assert sw.vars["privacy.kill_switch"].get() is True, \
+            "Settings still shows the kill switch off"
+        assert not sw.dirty(), "Settings calls the synced tick unsaved"
+        text = str(app.mode_lbl.cget("text"))
+        assert "KILL SWITCH" in text and \
+            translate_text(KILL_SWITCH_EFFECT) in text, text
+        app._kill_switch_off()                       # the banner's button
+        _gui_pump(root, 1.3)                         # the ledger's tick
+        assert not LEDGER.killed
+        assert not root.getvar(str(box.cget("variable"))), \
+            "the ledger's box stayed ticked"
+        assert sw.vars["privacy.kill_switch"].get() is False
+        if not LEDGER.snapshot():
+            assert led._mw_empty.winfo_manager(), "a blank ledger"
+    finally:
+        app.set_kill_switch(was)
+        with contextlib.suppress(tk.TclError):
+            led.destroy()
+        with contextlib.suppress(tk.TclError):
+            sw.win.destroy()
+        _gui_pump(root, 0.1)
+
+
+@gui_test_step("crowd #4: no \"Nothing unusual\" over an open warning")
+def _gs_ct4_unusual(app, ctx):
+    root = app.root
+    eng = app.model.alerts
+    held = [a for a in eng.alerts.values() if not a.acknowledged]
+    for a in held:
+        a.acknowledged = True
+    a = eng.cleartext("Crowd printer", "ct:04", "FTP", "203.0.113.4", True)
+    try:
+        assert a is not None and a.severity == "WARNING"
+        dash = app._select_tab("dash")
+        _gui_pump(root, 0.2)
+        text = dash.show_unusual_card()
+        assert "Nothing unusual" not in text and "open warning" in text, \
+            text
+        sec = app._select_tab("security")
+        _gui_pump(root, 0.2)
+        sec.unusual.refresh(force=True)
+        shown = " ".join(str(w.cget("text")) for w in
+                         sec.unusual.body.winfo_children()
+                         if isinstance(w, tk.Label))
+        assert "Nothing unusual" not in shown and "open warning" in shown, \
+            shown
+    finally:
+        if a is not None:
+            eng.acknowledge(a.id)
+        for x in held:
+            x.acknowledged = False
+        with contextlib.suppress(Exception):
+            app.tabs["security"].unusual.refresh(force=True)
+
+
+@gui_test_step("crowd #5: the Timeline's counter counts the events listed")
+def _gs_ct5_timeline_count(app, ctx):
+    root = app.root
+    m = app.model
+    tl = app._select_tab("timeline")
+    tl.set_story(False)
+    tl.pause_var.set(False)
+    tl.rebuild()
+    _gui_pump(root, 0.2)
+    e1 = m.push_timeline("network", "INFO", "Crowd test five, first event")
+    tl.rebuild()                 # lists it from the model's timeline ...
+    app._flush_events(m)         # ... before the batch with it arrives
+    _gui_pump(root, 0.2)
+
+    def listed():
+        return [v for v in tl.refs.values() if v is not None]
+    texts = [str(tl.tree.set(i, "text")) for i in tl.tree.get_children()]
+    assert sum("Crowd test five, first" in t for t in texts) == 1, \
+        "the event is listed twice"
+    want = plural(len(listed()), "event") + " this session"
+    assert str(tl.status_lbl.cget("text")) == want, \
+        (tl.status_lbl.cget("text"), want)
+    m.push_timeline("network", "INFO", "Crowd test five, second event")
+    app._flush_events(m)         # arrives without a rebuild
+    _gui_pump(root, 0.2)
+    want = plural(len(listed()), "event") + " this session"
+    assert str(tl.status_lbl.cget("text")) == want, \
+        (tl.status_lbl.cget("text"), want)
+    assert e1 in listed()
+
+
+@gui_test_step("crowd #6: the story is written again when its data changed")
+def _gs_ct6_story_fresh(app, ctx):
+    root = app.root
+    m = app.model
+    _gui_pump(root, 0.05, lambda: "story" not in app.jobs.active,
+              timeout=30)
+    assert app.request_story(force=True) is not None
+    assert _gui_pump(root, 0.05, lambda: app.story is not None and
+                     "story" not in app.jobs.active, timeout=30)
+    c0 = app.story["count"]
+    assert app.request_story() is None, "nothing changed: no new story"
+    m.push_timeline("network", "WARNING", "Crowd test six: the router "
+                                          "restarted")
+    app._story_at = time.monotonic() - 15      # older than 10 s, not 60
+    job = app.request_story()
+    assert job is not None, "a story a few seconds old missed new data"
+    assert _gui_pump(root, 0.05, lambda: "story" not in app.jobs.active and
+                     app.story is not None and app.story["count"] > c0,
+                     timeout=30), (c0, app.story and app.story["count"])
+    dash = app.tabs["dash"]
+    assert dash.show_story_card() == story_card_text(app.story,
+                                                     app.data_mode)
+
+
+def _ct_health_model(app):
+    """An empty model with no checks: (old model, old data mode, the
+    packet rows; replace_model empties them, and the steps after need
+    them: the Packets right-click check found no row)."""
+    old = (app.model, app.data_mode, list(app.all_rows))
+    ident = scenario_identity()
+    m = app._new_model(identity=ident[:3])
+    m.set_identity(local_nets=ident[3])
+    app.replace_model(m)
+    app.data_mode = "offline"
+    return old
+
+
+def _ct_health_restore(app, old):
+    app.wifi.last = None
+    app.wifi.at = 0.0
+    app.replace_model(old[0])
+    app.data_mode = old[1]
+    app.all_rows.extend(old[2])
+    with contextlib.suppress(tk.TclError, AttributeError):
+        app.tabs["packets"].rebuild()
+    _gui_pump(app.root, 0.2)
+
+
+@gui_test_step("crowd #7: Health says Healthy only when the top checks ran")
+def _gs_ct7_health_verdict(app, ctx):
+    old = _ct_health_model(app)
+    try:
+        res = app.health_summary()
+        assert all(res[k][0] == "Unknown" for k in ("gateway", "internet",
+                                                    "dns", "wifi")), res
+        st, text = res["overall"]
+        assert st != "Healthy", res["overall"]
+        # a real problem of this computer comes first (Windows CI has no
+        # Npcap: "Worth a look: Capture driver"); otherwise the verdict
+        # says what was not checked yet
+        if not text.startswith(translate_text("Worth a look")):
+            assert "Not checked yet" in text and "Router reachable" in text, \
+                text
+        tab = app._select_tab("health")
+        tab.refresh()
+        _gui_pump(app.root, 0.1)
+        label = str(tab.rows["overall"][0].cget("text"))
+        assert "Healthy" not in label, label
+        # "Why is it slow?" and the rows say the same about the router
+        fresh = app.slow_freshness()
+        if res["gateway"][0] == "Info":
+            assert "not checked yet" in fresh, fresh
+    finally:
+        _ct_health_restore(app, old)
+
+
+@gui_test_step("crowd #8: a weak signal alone is not the likely culprit")
+def _gs_ct8_culprit(app, ctx):
+    old = _ct_health_model(app)
+    app.data_mode = "live"
+    try:
+        app.wifi.last = parse_netsh_wlan(NETSH_EN)       # -78 dBm
+        app.wifi.at = time.time() + 3600
+        res = app.health_summary()
+        assert res["wifi"][0] == "Needs attention", res["wifi"]
+        text = res["overall"][1]
+        assert "Likely culprit" not in text and "No slowness was " \
+            "measured" in text, text
+        ans, kind, _go = app.dashboard_answers(force=True)["wrong"]
+        assert kind == "warn" and "Possibly: Worth" not in ans and \
+            "Likely culprit" not in ans, ans
+    finally:
+        _ct_health_restore(app, old)
+
+
+@gui_test_step("crowd #17: Health says why instead of a dash or a grey button")
+def _gs_ct17_health_reasons(app, ctx):
+    old = _ct_health_model(app)
+    try:
+        tab = app._select_tab("health")
+        tab.refresh()
+        _gui_pump(app.root, 0.1)
+        assert tab.run_btn.instate(["disabled"])
+        why = app.health_checks_blocked()
+        assert why and "live" in why, why
+        assert tab.run_tip.text == translate_text(why), tab.run_tip.text
+        for line in app.connection_info_text().splitlines():
+            assert not line.rstrip().endswith(": —"), line
+        app.data_mode = "live"
+        LEDGER.killed = True
+        try:
+            assert "kill switch" in app.health_note(), app.health_note()
+        finally:
+            LEDGER.killed = False
+    finally:
+        _ct_health_restore(app, old)
+
+
+@gui_test_step("crowd #25: the Dashboard's time window is the cards' window")
+def _gs_ct25_window(app, ctx):
+    root = app.root
+    dash = app._select_tab("dash")
+    was = dash.range_var.get()
+    try:
+        for choice, secs in (("Last hour", 3600), ("Last 5 minutes", 300),
+                             ("Last 24 hours", 86400)):
+            dash.range_var.set(choice)
+            dash._window_changed()
+            _gui_pump(root, 0.1)
+            text = app.dashboard_answers()["usage"][0]
+            assert f" {span_words(secs)}" in text, (choice, text)
+    finally:
+        dash.range_var.set(was)
+        dash._window_changed()
+
+
+@gui_test_step("crowd #26: one packet count on Packets and Statistics")
+def _gs_ct26_packet_count(app, ctx):
+    root = app.root
+    tab = app._select_tab("packets")
+    tab.show_subview("Packets")
+    _gui_pump(root, 0.1)
+    rows = list(app.all_rows)[-20:]
+    if not rows:
+        return "skip"   # (35-checker review) was counted as passed
+    if not tab.paused:
+        tab.toggle_pause()
+    added = 0
+    try:
+        for d in rows:                     # more arrive while paused
+            app.all_rows.append(dict(d))
+            added += 1
+        tab.refresh()
+        _gui_pump(root, 0.1)
+        n = len(app.all_rows)
+        assert f"{n} in memory" in tab.count_var.get(), \
+            (tab.count_var.get(), n)
+        tab.show_subview("Statistics")
+        tab.stats.kind_var.set("Protocol hierarchy")
+        tab.stats.refresh(force=True)
+        assert f"Out of {n:,} packets in memory" in \
+            str(tab.stats.note.cget("text")), tab.stats.note.cget("text")
+    finally:
+        for _ in range(added):
+            app.all_rows.pop()
+        tab.show_subview("Packets")
+        if tab.paused:
+            tab.toggle_pause()
+        _gui_pump(root, 0.1)
+
+
 @gui_test_step("every action 5.0.2 could reach is still reachable")
 def gt_reachable(app, ctx):
     app.mode_ui_var.set("Advanced")
@@ -93132,6 +100045,2147 @@ def gt_r8_long_run_fast_time(app, ctx):
     assert end[0] <= base[0] + 1, ("Python threads", base[0], end[0])
     assert end[1] <= base[1] + 1, ("OS threads", base[1], end[1])
     assert end[2] <= base[2] + 1, ("open files", base[2], end[2])
+    # 5.3.4 memory audit: each capture start left a 120 s and a 1.5 s timer
+    # of its own (13 -> 27 here); one of each may wait now
+    assert census1[1] <= census0[1] + 2, ("Tk timers", census0, census1)
+    assert census1[0] == census0[0], ("Tk widgets", census0, census1)
+
+
+def tk_census(app):
+    """5.3.4 memory audit: what the window holds in Tk, counted. Widgets,
+    table rows, canvas items, text tags and marks, bindings, timers,
+    images, fonts, Tcl commands (each Python callback is one), Tcl
+    variables (each StringVar or IntVar is one) and their traces, and the
+    table kits' per-row records."""
+    root = app.root
+    out = Counter()
+    sl = root.tk.splitlist
+
+    def rows(tree, parent=""):
+        kids = tree.get_children(parent)
+        return len(kids) + sum(rows(tree, k) for k in kids)
+
+    def walk(w):
+        out["widgets"] += 1
+        try:
+            cls = w.winfo_class()
+            if cls == "Treeview":
+                out["table rows"] += rows(w)
+            elif cls == "Canvas":
+                out["canvas items"] += len(w.find_all())
+            elif cls == "Text":
+                out["text tags"] += len(w.tag_names())
+                out["text marks"] += len(w.mark_names())
+                out["text windows"] += len(w.window_names())
+            out["bindings"] += len(w.bind())
+        except tk.TclError:
+            pass
+        for ch in w.winfo_children():
+            walk(ch)
+    walk(root)
+    out["timers"] = len(sl(root.tk.call("after", "info")))
+    out["images"] = len(root.image_names())
+    out["fonts"] = len(tkfont.names(root))
+    out["Tcl commands"] = len(sl(root.tk.call("info", "commands")))
+    names = sl(root.tk.call("info", "globals"))
+    out["Tcl variables"] = len(names)
+    for n in names:
+        with contextlib.suppress(tk.TclError):
+            out["variable traces"] += len(sl(root.tk.call(
+                "trace", "info", "variable", n)))
+    out["global bindings"] = len(root.bind_all())
+    out["table kits"] = len(app.kits)
+    for kit in app.kits:
+        out["kit row records"] += len(kit._ent) + len(kit.dotted) + \
+            len(kit._rel_text)
+    for name, tab in app.tabs.items():
+        tree = getattr(tab, "tree", None)
+        if tree is not None:
+            with contextlib.suppress(tk.TclError):
+                out["rows " + name] = rows(tree)
+    return out
+
+
+# what must not move at all once the window has run for a while, and what
+# may move a little with what is on screen. Measured from minute 80 to
+# 240: widgets 743 -> 744 (the Security tab draws its finding cards
+# again when they change, one more or one fewer row), Tcl commands +3,
+# bindings +1, canvas items +2, timers and global bindings move by one or
+# two as jobs come and go. A leak of what one refresh makes would add
+# that much again every minute, 80 times over, so these margins still
+# catch it
+TK_FLAT_EXACT = ("images", "fonts", "Tcl variables", "variable traces",
+                 "table kits", "text windows")
+TK_FLAT_SLACK = {"widgets": 20, "Tcl commands": 30, "bindings": 30,
+                 "canvas items": 400, "text tags": 60, "text marks": 20,
+                 "timers": 3, "global bindings": 4}
+
+
+@gui_test_step("5.3.4 memory audit: the window stays flat in fast time "
+               "(tables, canvases, timers, bindings, variables)")
+def gt_534_memory_flat_window(app, ctx):
+    """Over three fast-time hours of the long-run scenario through the real
+    window: packets through the capture path, the model clock moved on by
+    hand, model upkeep, the tables' updates, a tab switch every minute and
+    the shown tab refreshed, the Inspector and a device card now and then.
+    With the caps divided by 80, and the Packets list kept to its
+    smallest (500 rows) so that the rows waiting for it while it is hidden
+    (up to twice that) do not swamp the measure. After 120 minutes of
+    warm-up the Tk counts stay where they were (TK_FLAT_EXACT exactly,
+    the rest within TK_FLAT_SLACK), every table stays under its cap, and
+    the window's Python memory still held grows less than
+    GUI_FLAT_LIMIT."""
+    import tracemalloc
+    root = app.root
+    hosts = long_run_hosts(8)
+    names = list(app.tabs)
+    censuses, model_over = {}, []
+    old_max = app.config.get("capture.max_stored_events", 5000)
+    app.config.set("capture.max_stored_events", 500)
+    app._apply_runtime_settings()
+    with scaled_memory_caps(80):
+        app.stop()
+        app._leave_nonlive()
+        ident = scenario_identity()
+        day = time.localtime(SCENARIO_T0)
+        t0 = time.mktime((day.tm_year, day.tm_mon, day.tm_mday, 23, 0, 0,
+                          0, 0, -1))
+        clock = [t0]
+        m = app._new_model(identity=ident[:3])
+        m.set_identity(local_nets=ident[3])
+        m._clock = lambda: clock[0]
+        m.flows.resize(200, 100)
+        app.replace_model(m)
+        app.data_mode = "live"
+        m.capture_started = t0 - 3600
+        sink = app.lossless_sink()
+        held = {}
+        try:
+            for minute in range(GUI_FLAT_MINUTES + 1):
+                start = t0 + 60.0 * minute
+                frames = long_run_minute(minute, start, hosts)
+                want = app.count + len(frames)
+                for raw, ts, lt in frames:
+                    clock[0] = ts
+                    sink(raw, ts, lt)
+                assert _gui_pump(root, 0.0, lambda: app.count >= want and
+                                 not len(app.ring) and not app.worker.busy,
+                                 timeout=60), (minute, app.count, want)
+                clock[0] = start + 60.0
+                done = []
+                app.tick_model_stepped(lambda: done.append(1))
+                assert _gui_pump(root, 0.0, lambda: done, timeout=30)
+                app._flush_ui_parts(app.model)
+                app._select_tab(names[minute % len(names)])
+                _gui_pump(root, 0.02)
+                for tab in app.tabs.values():
+                    if tab.is_visible():
+                        tab.refresh()
+                if minute % 10 == 5:
+                    key = next(iter(m.registry.by_key), None)
+                    if key:
+                        app.inspect("device", key)
+                        app.inspector.refresh()
+                        app.show_device(key)
+                        _gui_pump(root, 0.1)
+                        for w in root.winfo_children():
+                            if isinstance(w, tk.Toplevel) and \
+                                    w.winfo_exists() and \
+                                    w is not getattr(app, "_loader", None):
+                                with contextlib.suppress(tk.TclError):
+                                    if w.title() and w.winfo_viewable():
+                                        w.destroy()
+                _gui_pump(root, 0.03)
+                over = memory_over_caps(m)
+                if over:
+                    model_over.append((minute, over))
+                if minute == 0:
+                    gc.collect()
+                    tracemalloc.start(1)   # from the start (see the model test)
+                if minute in GUI_FLAT_AT:
+                    _gui_pump(root, 0.3)
+                    gc.collect()
+                    censuses[minute] = tk_census(app)
+                    if tracemalloc.is_tracing():
+                        held[minute] = tracemalloc.get_traced_memory()[0]
+            caps = {"rows feed": FeedTab.ROWS_KEEP,
+                    "rows timeline": TimelineTab.ROWS_KEEP,
+                    "rows remote": RemoteTab.ROWS_KEEP,
+                    "rows alerts": AlertEngine.KEEP + max(
+                        1, AlertEngine.KEEP // 10),
+                    "rows connections": m.flows.max_active +
+                    m.flows.archive.maxlen,
+                    # rows and their group rows
+                    "rows websites": 2 * NetworkModel.WEBSITES_KEEP,
+                    "rows devices": len(m.registry.by_key)}
+        finally:
+            if tracemalloc.is_tracing():
+                tracemalloc.stop()
+            app.data_mode = "idle"
+            app.config.set("capture.max_stored_events", old_max)
+            app._apply_runtime_settings()
+    base = censuses[GUI_FLAT_AT[0]]
+    later = [censuses[k] for k in GUI_FLAT_AT[1:]]
+    last = later[-1]
+    print(f"      (minute {GUI_FLAT_AT[0]}: {dict(base)})")
+    print(f"      (minute {GUI_FLAT_AT[-1]} vs {GUI_FLAT_AT[0]}: " +
+          ", ".join(f"{k} {base[k]}->{last[k]}" for k in sorted(base)
+                    if base[k] != last[k]) + "; Python held " +
+          ", ".join(f"{held[k] // 1024} KB at {k}" for k in GUI_FLAT_AT) +
+          ")")
+    assert not model_over, model_over[:3]
+    for k in TK_FLAT_EXACT:
+        assert all(c[k] == base[k] for c in later), \
+            (k, [c[k] for c in [base] + later])
+    for k, slack in TK_FLAT_SLACK.items():
+        assert all(c[k] <= base[k] + slack for c in later), \
+            (k, slack, [c[k] for c in [base] + later])
+    for c in [base] + later:
+        for k, cap in caps.items():
+            assert c[k] <= cap, (k, c[k], cap)
+        assert c["kit row records"] <= 3 * c["table rows"] + 50, \
+            (c["kit row records"], c["table rows"])
+    grew = max(held[k] for k in GUI_FLAT_AT[1:]) - held[GUI_FLAT_AT[0]]
+    assert grew < GUI_FLAT_LIMIT, (grew, held)
+    # back to the scenario capture for the steps that follow
+    frames = ctx.frames()
+    app.import_pcap_path(ctx.path("scenario.pcap"))
+    assert _gui_pump(root, 0.5, lambda: app.importer is None and
+                     app.data_mode == "offline" and
+                     app.model.count >= len(frames), timeout=60)
+    _gui_pump(root, 1.0)
+
+
+# 5.3.4: measured from minute 120 (when the Packets list and the rows
+# waiting for it have filled) on: the Python memory still held moved by at
+# most +620 KB and came back (6910, 7000, 7530, 7000 KB at minutes 120,
+# 160, 200 and 240). The rise from minute 80 to 120 (+1.1 MB) was those
+# rows filling up to their cap. 2 MB is about three times the measured
+# swing; one leaked decoded packet (about 850 bytes) for each packet
+# would go past it within a few minutes
+GUI_FLAT_LIMIT = 2 * 1024 * 1024
+GUI_FLAT_MINUTES = 200
+GUI_FLAT_AT = (120, 160, 200)    # the first is the base, after warm-up
+
+
+def _gui_focus_main(app):
+    """The main window's search box takes the keyboard, as after a click
+    in it (the crowd tests below then check where a new window puts
+    it)."""
+    root = app.root
+    root.deiconify()
+    root.lift()
+    with contextlib.suppress(tk.TclError):
+        # the pointer over the main window: with no window manager (the
+        # crowd test's Xvfb) the keys go where the pointer is, unless a
+        # window takes them
+        app.search_entry.event_generate("<Motion>", warp=True, x=4, y=4)
+        root.focus_force()
+        app.search_entry.focus_force()
+    _gui_pump(root, 0.3, lambda: root.focus_get() is app.search_entry,
+              timeout=3)
+    assert root.focus_get() is app.search_entry, \
+        f"the main window could not take the focus ({root.focus_get()})"
+
+
+def _gui_focus_in(root, win, timeout=3):
+    def inside():
+        f = root.focus_get()
+        try:
+            return f is not None and f.winfo_toplevel() is win
+        except (tk.TclError, KeyError):
+            return False
+    _gui_pump(root, 0.1, inside, timeout=timeout)
+    return root.focus_get() if inside() else None
+
+
+@gui_test_step("crowd 5.3.4 #1 #2: the search results window opens under "
+               "the box with the keyboard, counts what the list under the "
+               "box shows, finds Wi-Fi as wifi, and Escape or a click "
+               "away closes it")
+def gt_c534_search_window(app, ctx):
+    root, drop, e = app.root, app.search_drop, app.search_entry
+    _gui_focus_main(app)
+    try:
+        # #2: the window counts what it lists, the list's results among
+        # them ("0 result(s)" over Help topics that the list showed)
+        app.global_search_var.set("vpn")
+        drop.update()
+        _gui_pump(root, 0.2)
+        listed = [t for _g, it in drop.results("vpn") for t, _a in it]
+        assert listed, "nothing found for vpn"
+        win = app._run_global_search()
+        _gui_pump(root, 0.4)
+        total, acts = win._mw_results
+        assert total == len(acts) >= len(listed), (total, listed)
+        heads = [str(w.cget("text")) for w in win.winfo_children()
+                 if isinstance(w, tk.Label)]
+        assert heads and heads[0].startswith(f"{total} result"), heads
+        assert drop.frame is None, "the list stayed under the window"
+        # #2: a result line is not cut at 200 pixels
+        assert int(win._mw_tree.column("#0", "width")) >= 400
+        # #1: under the search box, not at the top left over the tabs
+        assert win.winfo_rooty() >= e.winfo_rooty() + e.winfo_height(), \
+            (win.winfo_rooty(), e.winfo_rooty())
+        # #1: the keyboard is in the window, so Escape closes it and the
+        # box is back with its text selected (typing replaces it)
+        f = _gui_focus_in(root, win)
+        assert f is not None, f"the keyboard stayed in {root.focus_get()}"
+        f.event_generate("<Escape>")
+        _gui_pump(root, 0.2)
+        assert app.search_window() is None and not win.winfo_exists()
+        assert root.focus_get() is e and e.selection_present()
+        # #1: a click elsewhere in the main window closes it, and the
+        # list under the box
+        win = app._run_global_search()
+        _gui_pump(root, 0.3)
+        app.mode_lbl.event_generate("<Button-1>", x=2, y=2)
+        _gui_pump(root, 0.2)
+        assert app.search_window() is None, "a click away left it open"
+        _gui_focus_main(app)            # typing in the box again
+        app.global_search_var.set("192.168")
+        drop.update()
+        _gui_pump(root, 0.2)
+        assert drop.frame is not None
+        app.mode_lbl.event_generate("<Button-1>", x=2, y=2)
+        _gui_pump(root, 0.2)
+        assert drop.frame is None, "a click away left the list open"
+        # #2: hyphens and spaces don't count: "wifi" finds the Health
+        # tab's "Wi-Fi signal (this computer)" and the Wi-Fi help
+        health = dict(drop.results("wifi")).get("Health", [])
+        assert any("Wi-Fi signal" in t for t, _a in health), health
+        assert set(app.help_matches("wi-fi")) <= set(
+            app.help_matches("wifi")), app.help_matches("wifi")
+        d = next(iter(app.model.registry.by_key.values()))
+        alias0 = d.alias
+        try:
+            d.alias = "Kitchen-Speaker Two"
+            app._hay = None
+            got = dict(drop.results("kitchenspeaker")).get("Devices", [])
+            assert got, "a device name with a hyphen was not found"
+        finally:
+            d.alias = alias0
+            app._hay = None
+        # nothing found: the tip is a line of its own, not a cut-off row
+        app.global_search_var.set("zzqqxxyy")
+        win = app._run_global_search()
+        _gui_pump(root, 0.2)
+        assert win._mw_results[0] == 0
+        heads = [str(w.cget("text")) for w in win.winfo_children()
+                 if isinstance(w, tk.Label)]
+        assert heads and heads[0].startswith("No matches found") and \
+            "alert:" in heads[0], heads
+    finally:
+        app.close_search_window()
+        drop.close()
+        app.global_search_var.set("")
+
+
+@gui_test_step("crowd 5.3.4 #14: Settings takes the keyboard (Escape "
+               "closes it), says no change was made until one is saved, "
+               "asks Save / Don't save / Cancel, and follows the header's "
+               "Beginner | Advanced")
+def gt_c534_settings(app, ctx):
+    root = app.root
+    # a ticked box shows a tick, not Tk's cross: the corners stay clear
+    lay = str(ttk.Style().layout("TCheckbutton"))
+    assert "Mw.Checkbutton.indicator" in lay, lay
+    on, off = app._check_imgs["on"], app._check_imgs["off"]
+    n = off.height()
+    field = off.get(n // 2, n // 2)
+    assert on.get(3, 3) == field and on.get(n - 4, n - 4) == field and \
+        on.get(3, n - 4) == field, "the ticked box draws a cross"
+    assert on.get(int(0.40 * n), int(0.70 * n)) != field, "no tick drawn"
+    assert all(off.get(x, y) == field for x in range(2, n - 2)
+               for y in range(2, n - 2)), "the empty box is not empty"
+    _gui_focus_main(app)
+    sw = app._open_settings("general")
+    f = _gui_focus_in(root, sw.win)
+    assert f is not None, f"the keyboard stayed in {root.focus_get()}"
+    assert sw.dirty_lbl.cget("text") == "No changes yet", \
+        sw.dirty_lbl.cget("text")
+    f.event_generate("<Escape>")
+    _gui_pump(root, 0.2)
+    assert not sw.alive(), "Escape did not close Settings"
+    key = "general.confirm_before_clear"
+    orig = bool(app.config.get(key, False))
+    old = messagebox.askyesnocancel
+    asked = []
+    try:
+        for ans in (None, False, True):
+            sw = app._open_settings("general")
+            _gui_pump(root, 0.3)
+            sw.vars[key].set(not orig)
+            assert "Unsaved changes" in sw.dirty_lbl.cget("text")
+            messagebox.askyesnocancel = \
+                lambda *a, _r=ans, **k: (asked.append(a), _r)[1]
+            sw.cancel()
+            _gui_pump(root, 0.2)
+            if ans is None:             # Cancel: the window stays
+                assert sw.alive() and sw.dirty()
+                sw.win.destroy()
+            elif ans is False:          # No: closed, nothing saved
+                assert not sw.alive()
+                assert bool(app.config.get(key)) == orig
+            else:                       # Yes: saved and closed
+                assert not sw.alive()
+                assert bool(app.config.get(key)) == (not orig)
+        assert len(asked) == 3, asked
+        # after Apply the footer says the changes are saved
+        sw = app._open_settings("general")
+        _gui_pump(root, 0.3)
+        sw.vars[key].set(orig)
+        assert sw.apply()
+        assert sw.dirty_lbl.cget("text") == "All changes saved"
+        # the header's Beginner | Advanced shows in Settings as saved
+        mode0 = app.mode_ui_var.get()
+        try:
+            app.mode_ui_var.set("Advanced" if mode0 == "Beginner"
+                                else "Beginner")
+            app._on_ui_mode_change()
+            _gui_pump(root, 0.2)
+            assert sw.vars["appearance.beginner_mode"].get() == \
+                app.beginner_mode and not sw.dirty()
+        finally:
+            app.mode_ui_var.set(mode0)
+            app._on_ui_mode_change()
+        sw.win.destroy()
+    finally:
+        messagebox.askyesnocancel = old
+        app.config.set(key, orig)
+        app.config.save()
+        sw = app._settings_win
+        if sw is not None and sw.alive():
+            sw.win.destroy()
+
+
+@gui_test_step("crowd 5.3.4 #21: Ctrl+K knows the tabs by their names, "
+               "names settings one way, says when nothing matches and "
+               "closes on a click away; drop-down lists, number boxes and "
+               "cards show the keyboard focus")
+def gt_c534_palette_focus(app, ctx):
+    root = app.root
+    p = app.open_palette()
+    try:
+        p.q.set("happening")
+        _gui_pump(root, 0.1)
+        assert p.shown and p.shown[0][1] == "Happening", p.shown[:3]
+        p.q.set("sett")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Settings", [x[1] for x in p.shown[:4]]
+        labels = [lb for lb, cat, _f in app.palette_items()
+                  if cat == "setting"]
+        assert labels and all(x == "Settings" or x.startswith(
+            "Settings › ") for x in labels), \
+            [x for x in labels if not x.startswith("Settings")][:4]
+        p.q.set("zzqqxxyy")
+        _gui_pump(root, 0.1)
+        assert not p.shown and p.lb.size() == 1 and \
+            "No matches" in p.lb.get(0), p.lb.get(0, "end")
+        p.run()                          # Enter on the hint does nothing
+        app.mode_lbl.event_generate("<Button-1>", x=2, y=2)
+        _gui_pump(root, 0.2)
+        assert not p.alive(), "a click away left Ctrl+K open"
+    finally:
+        p.close()
+    # Tab into a drop-down list or a number box draws a ring
+    st = ttk.Style()
+    ring = st.lookup("TCheckbutton", "focuscolor")
+    for cls in ("TCombobox", "TSpinbox", "TEntry"):
+        got = st.lookup(cls, "bordercolor", ["focus"])
+        assert got == ring, (cls, got, ring)
+    # a card with the keyboard draws a 2-pixel ring in the focus colour
+    app._select_tab("dash")
+    _gui_pump(root, 0.3)
+    cards = [c for c in app.tabs["dash"].card_frames if c.winfo_viewable()]
+    assert cards, "no card shown on the Dashboard"
+    card = cards[-1]
+    _gui_focus_main(app)
+    card.focus_force()
+    _gui_pump(root, 0.2, lambda: root.focus_get() is card, timeout=3)
+    assert root.focus_get() is card
+    assert int(card.cget("highlightthickness")) == 2, \
+        card.cget("highlightthickness")
+    assert str(card.cget("highlightcolor")).lower() == \
+        app.theme["focus"].lower()
+    app.search_entry.focus_force()
+    _gui_pump(root, 0.2)
+    assert int(card.cget("highlightthickness")) == 1
+
+
+# ---- 5.3.4 crowd test fixes (the ranked bug list): one test per fix ----
+def _gt_back_to_scenario(app, ctx):
+    """Re-open the scenario capture for the steps that follow."""
+    frames = ctx.frames()
+    app.import_pcap_path(ctx.path("scenario.pcap"))
+    assert _gui_pump(app.root, 0.5, lambda: app.importer is None and
+                     app.data_mode == "offline" and
+                     app.model.count >= len(frames), timeout=60)
+    _gui_pump(app.root, 1.0)
+
+
+@gui_test_step("5.3.4 crowd #9: Start watching without a capture engine "
+               "keeps the demo; leaving the demo resets the status line")
+def gt_c9_start_without_engine(app, ctx):
+    root = app.root
+    app.start_demo()
+    assert _gui_pump(root, 0.5, lambda: app.model.registry.by_key,
+                     timeout=30)
+    _gui_pump(root, 1.0)
+    n = len(app.model.registry.by_key)
+    asked = []
+    real_ask, had = messagebox.askyesno, HAVE_SCAPY
+    messagebox.askyesno = lambda *a, **k: asked.append(a) or True
+    globals()["HAVE_SCAPY"] = False
+    try:
+        app.start()
+    finally:
+        messagebox.askyesno = real_ask
+        globals()["HAVE_SCAPY"] = had
+    banner = str(app.banner_lbl.cget("text"))
+    assert app.data_mode == "demo" and app.model.demo, app.data_mode
+    assert len(app.model.registry.by_key) >= n, "the demo data was cleared"
+    assert not asked, "asked to clear the demo for a start that can't happen"
+    assert "isn't available" in banner and "kept" in banner, banner
+    assert "Nothing is being captured" in app.status_var.get()
+    app.stop_demo()
+    _gui_pump(root, 0.3)
+    assert "Demo Mode" not in app.status_var.get(), app.status_var.get()
+    _gt_back_to_scenario(app, ctx)
+
+
+@gui_test_step("5.3.4 crowd #10: Clear and New session ask first by default; "
+               "No keeps everything")
+def gt_c10_clear_asks(app, ctx):
+    root = app.root
+    assert config_defaults_flat()["general.confirm_before_clear"] is True
+    cfg = app.config
+    had = cfg.get("general.confirm_before_clear", None)
+    # a settings file that never changed this setting gets the default
+    with contextlib.suppress(KeyError, AttributeError, TypeError):
+        del cfg.data["general"]["confirm_before_clear"]
+    n, count = len(app.model.registry.by_key), app.model.count
+    assert n, "the scenario should have devices"
+    asked = []
+    real_ask = messagebox.askyesno
+    messagebox.askyesno = lambda *a, **k: asked.append(a) and False
+    try:
+        app.clear()
+        app._new_session()
+    finally:
+        messagebox.askyesno = real_ask
+        if had is not None:
+            cfg.set("general.confirm_before_clear", had)
+    _gui_pump(root, 0.2)
+    assert len(asked) == 2, asked
+    assert len(app.model.registry.by_key) == n and \
+        app.model.count == count, "No still cleared the session"
+    assert "Watching carries on" in asked[0][1], asked[0][1]
+    assert "Watching stops too" in asked[1][1], asked[1][1]
+    assert "can't be undone" in asked[0][1]       # offline: no Undo
+
+
+@self_test()
+def t_c11_alert_names_this_computer(ctx):
+    """5.3.4 crowd test #11: an alert about this computer, which has no
+    name of its own, says "This computer", not its address or maker; a
+    rename reaches the alert's title, and undoing it brings it back."""
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    ra = next(a for a in m.alerts.alerts.values()
+              if a.kind == "remote_access")
+    assert ra.reason == "This computer offers remote access (SSH)", \
+        ra.reason
+    a = next(a for a in m.alerts.alerts.values()
+             if a.reason == "Alex-iPhone joined your network")
+    m.correct_rename(a.device_key, "Kid Tablet")
+    assert m.refresh_alert_names({a.device_key}) == [a]
+    assert a.reason == "Kid Tablet joined your network", a.reason
+    m.correct_rename(a.device_key, "")
+    m.refresh_alert_names()
+    assert a.reason == "Alex-iPhone joined your network", a.reason
+    for e in m.timeline:
+        mm = re.match(r"(\S+) got address (\S+) from DHCP", e["text"])
+        assert not (mm and mm.group(1) == mm.group(2)), e["text"]
+    assert translate_event("This computer offers remote access (SSH)",
+                           ) == "This computer offers remote access (SSH)"
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        fr = translate_event("This computer offers remote access (SSH)")
+    finally:
+        set_locale(old)
+    assert fr.startswith("Cet ordinateur propose"), fr
+
+
+@gui_test_step("5.3.4 crowd #11: alerts use names — a rename reaches the "
+               "Alerts tab, rules in words, DHCP lines")
+def gt_c11_alert_names(app, ctx):
+    root = app.root
+    m = app.model
+    reg = m.registry
+    dev = next((d for d in reg.by_key.values()
+                if d.display_name() == "Alex-iPhone"), None)
+    assert dev is not None, "the scenario's Alex-iPhone is missing"
+    a = next(x for x in m.alerts.alerts.values()
+             if x.device_key == dev.key and x.kind == "new_device")
+    # a name learned after the alert reaches its title too
+    assert a.reason == "Alex-iPhone joined your network", a.reason
+    ra = next(x for x in m.alerts.alerts.values()
+              if x.kind == "remote_access")
+    tab = app.tabs["alerts"]
+    app._apply_correction_result(m.correct_rename(dev.key, "Kid Tablet"))
+    try:
+        def row_now():
+            return tab.tree.item(tab.iids[a.id], "values") if a.id in \
+                tab.iids else ()
+        # the window shows model events on its own timer: wait for it
+        _gui_pump(root, 0.3, until=lambda: any(
+            "Kid Tablet" in str(v) for v in row_now()), timeout=10)
+        assert "Kid Tablet" in a.reason, a.reason
+        row = row_now()
+        assert row and any("Kid Tablet" in str(v) for v in row), row
+        # the stored rule names the device, never "key|service"
+        words = app.rule_text(f"{ra.kind}|{ra.subject}")
+        assert "|" not in words and ":" not in words.split("about")[-1], \
+            words
+        who = app.device_label(reg.by_key[reg.resolve(ra.device_key)])
+        assert who in words and "SSH" in words, (who, words)
+    finally:
+        app._apply_correction_result(m.correct_rename(dev.key, ""))
+        _gui_pump(root, 0.3)
+    assert "Alex-iPhone" in a.reason, a.reason
+    # a DHCP line never reads "192.168.1.50 got address 192.168.1.50"
+    for e in m.timeline:
+        mm = re.match(r"(\S+) got address (\S+) from DHCP", e["text"])
+        assert not (mm and mm.group(1) == mm.group(2)), e["text"]
+    nameless = DeviceRecord(key="02:00:00:00:00:99", ip="192.168.1.99",
+                            mac="02:00:00:00:00:99")
+    assert m.alert_device_name(nameless) == "192.168.1.99"
+    entry = {"text": "A device got address 192.168.1.99 from DHCP",
+             "name": "A device", "device": nameless.key}
+    reg.by_key[nameless.key] = nameless
+    try:
+        assert timeline_text(m, entry) == entry["text"]
+        nameless.alias = "Garden camera"
+        assert timeline_text(m, entry).startswith("Garden camera got"), \
+            timeline_text(m, entry)
+    finally:
+        reg.by_key.pop(nameless.key, None)
+
+
+@self_test()
+def t_c11_nameless_devices_told_apart(ctx):
+    """Review of crowd test #11: two nameless devices with private Wi-Fi
+    addresses get distinct names in alerts and the Timeline (their
+    address follows the label), and the label is translated inside a
+    French or Spanish sentence."""
+    if not ctx.scapy_ok:
+        return "skip"
+    b = ScenarioBuilder()
+    b.home_network()
+    hosts = [("192.168.1.77", "a6:3b:12:9e:44:01", ""),
+             ("192.168.1.78", "a6:3b:12:9e:44:02", "")]
+    for h in hosts:
+        b.arp_announce(h)
+        b.dhcp(h)
+    m = scenario_model(ctx.cfg(), b.frames)
+    label = "Device using a private Wi-Fi address"
+    devs = [d for d in m.registry.by_key.values()
+            if d.mac in {h[1] for h in hosts}]
+    assert len(devs) == 2 and all(d.display_name() == label for d in devs)
+    names = {sentence_device_name(d) for d in devs}
+    assert names == {f"{label} (192.168.1.77)",
+                     f"{label} (192.168.1.78)"}, names
+    for d in devs:
+        reasons = [a.reason for a in m.alerts.alerts.values()
+                   if a.device_key == d.key]
+        lines = [timeline_text(m, e) for e in m.timeline
+                 if e.get("device") == d.key]
+        assert reasons and lines, (reasons, lines)
+        for t in reasons + lines:
+            assert t.startswith(f"{label} ({d.ip})"), t
+    a = next(a for a in m.alerts.alerts.values() if a.device_key ==
+             devs[0].key and a.kind == "new_device")
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        fr = translate_event(a.reason)
+        set_locale("es")
+        es = translate_event(a.reason)
+    finally:
+        set_locale(old)
+    assert fr == "Appareil avec une adresse Wi-Fi privée (192.168.1.77) " \
+        "a rejoint votre réseau", fr
+    assert es.startswith("Dispositivo con una dirección Wi-Fi privada "
+                         "(192.168.1.77)"), es
+    lone = DeviceRecord(key="02:aa:bb:cc:dd:ee", ip="169.254.12.34",
+                        mac="02:aa:bb:cc:dd:ee")
+    lone.link_local_only = True
+    assert sentence_device_name(lone) == "Device without a network " \
+        "address (self-assigned 169.254.12.34)", sentence_device_name(lone)
+    assert translate_text(sentence_device_name(lone), "fr") == \
+        "Appareil sans adresse réseau (169.254.12.34 auto-attribuée)"
+
+
+@gui_test_step("5.3.4 crowd #12: packet view — the details keep room, a "
+               "filter clears hidden details, pause and empty results "
+               "say so, Expert explains, hierarchy headings line up")
+def gt_c12_packet_view(app, ctx):
+    root = app.root
+    pt = app.tabs["packets"]
+    geo = root.geometry()
+    try:
+        root.geometry("1024x700")
+        app._select_tab("packets")
+        pt.show_subview("Packets")
+        _gui_pump(root, 1.2)
+        line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+        vert = pt.vert_pane
+        total, pos = vert.winfo_height(), vert.sashpos(0)
+        need, keep = pt.details_room()
+        # the details get their room, or all but the list's three rows
+        # when the window is too short for both (earlier steps may have
+        # opened bars above the list)
+        if total >= keep + 40:
+            assert total - pos >= min(need, total - keep) - 2, \
+                (total, pos, need, keep)
+            # and the list above keeps three whole rows (on Windows the
+            # guessed room left one)
+            assert pt._nslots() >= 3, (total, pos, keep, pt._nslots())
+        dh, lh = pt.dtree.winfo_height(), pt.tree.winfo_height()
+        if total >= need + keep:
+            # only when the pane has room for both: in the full run the
+            # bars earlier steps leave open (banners, the docked panel)
+            # left the whole pane 69 px high at 1024×700
+            assert dh >= 2 * line, \
+                f"packet details {dh} px high (line {line})"
+            assert lh >= 2 * line, f"packet list {lh} px high"
+    finally:
+        root.geometry(geo)
+        _gui_pump(root, 0.5)
+    # a filter that hides the packet in the details empties them
+    pt.clear_filter()
+    _gui_pump(root, 0.3)
+    assert pt.matched, "no packets in the list"
+    first = pt.matched[0]["no"]
+    pt.select_no(first)
+    _gui_pump(root, 0.3)
+    assert pt._detail_no == first and pt.dtree.get_children()
+    pt.set_expression(f"frame.number > {first}")
+    _gui_pump(root, 0.3)
+    assert pt.index_of_no(first) is None
+    assert pt._detail_no is None and not pt.dtree.get_children(), \
+        "the details still show a packet the filter hides"
+    # an expression that matches nothing says so
+    pt.set_expression("frame.number > 999999999")
+    _gui_pump(root, 0.2)
+    assert "no packet" in pt.count_var.get(), pt.count_var.get()
+    pt.clear_filter()
+    _gui_pump(root, 0.2)
+    # Pause display: the count says the display is paused
+    pt.toggle_pause()
+    try:
+        pt.add_rows([])
+        assert "paused" in pt.count_var.get().lower(), pt.count_var.get()
+    finally:
+        pt.toggle_pause()
+    assert "paused" not in pt.count_var.get().lower()
+    # Expert in Full Power with nothing found: the reason is shown
+    store = app.deep.store
+    mode = app.config.get("performance.mode", "Automatic")
+    with store.lock:
+        saved = list(store.findings)
+        store.findings.clear()
+    try:
+        app.config.set("performance.mode", "Full Power")
+        pt.expert.refresh()
+        hint = str(pt.expert.hint.cget("text"))
+        assert "No findings yet" in hint, hint
+    finally:
+        app.config.set("performance.mode", mode)
+        with store.lock:
+            store.findings.extend(saved)
+        pt.expert.refresh(force=True)
+    # Protocol hierarchy: each heading over its own numbers
+    sv = pt.stats
+    sv.kind_var.set("Protocol hierarchy")
+    sv.refresh(force=True)
+    tree = sv.tree
+    assert "#0" not in tuple(tree["columns"]), tree["columns"]
+    top = tree.get_children()[0]
+    assert tree.item(top, "text") == "Frame"
+    vals = tree.item(top, "values")
+    assert tree.set(top, "pk") == vals[0] == f"{len(app.all_rows):,}", \
+        (vals, len(app.all_rows))
+    assert tree.set(top, "pct") == "100.0", tree.set(top, "pct")
+    pt.show_subview("Packets")
+
+
+@gui_test_step("5.3.4 crowd #13: the network sheet previews cleanly, has a "
+               "Print button, says demo, and saving starts outside the "
+               "program folder")
+def gt_c13_print_and_export(app, ctx):
+    root = app.root
+    sheet = app.sheet_document()
+    text = html_to_preview_text(sheet)
+    assert "Network sheetNetwork sheet" not in text, text[:80]
+    assert text.startswith("Network sheet\n"), text[:80]
+    lines = text.splitlines()
+    names = [ln for ln in lines if ln.startswith("Device: ")]
+    rows = inventory_rows(app.model, app.device_label)
+    assert len(names) == len(rows), (len(names), len(rows))
+    assert any(ln.startswith("Router: ") for ln in lines), lines[:12]
+    # Print: what will be saved opens in the browser, from the data folder
+    opened = []
+    real = _open_path
+    globals()["_open_path"] = lambda p: opened.append(p) or True
+    win = app.redaction_preview("Network sheet", sheet, "network-sheet.html",
+                                redact=False)
+    try:
+        _gui_pump(root, 0.2)
+        labels = []
+
+        def walk(w):
+            with contextlib.suppress(tk.TclError):
+                if isinstance(w, ttk.Button):
+                    labels.append(str(w.cget("text")))
+            for c in w.winfo_children():
+                walk(c)
+        walk(win)
+        assert any(lb.startswith(translate_text("Print")) for lb in labels), \
+            labels
+        path = win._mw_print()
+    finally:
+        globals()["_open_path"] = real
+        with contextlib.suppress(tk.TclError):
+            win.destroy()
+    assert path and opened == [path], (path, opened)
+    assert os.path.dirname(os.path.dirname(path)) == PATHS.data, path
+    with open(path, encoding="utf-8") as f:
+        page = f.read()
+    assert "window.print()" in page and "Network sheet" in page
+    # an export of the demo says so
+    was = app.data_mode
+    app.data_mode = "demo"
+    try:
+        assert "DEMO DATA" in app.sheet_document()
+        assert "DEMO DATA" in app.inventory_document()
+    finally:
+        app.data_mode = was
+    assert "DEMO DATA" not in app.sheet_document()
+    # Save dialogs start in Documents or the home folder
+    old = app.config.get("export.default_dir", "")
+    app.config.set("export.default_dir", "")
+    try:
+        d = app._dialog_dir()
+    finally:
+        app.config.set("export.default_dir", old)
+    home = os.path.expanduser("~")
+    assert d in (os.path.join(home, "Documents"), home), d
+
+
+@gui_test_step("5.3.4 crowd #15: after a language change the Timeline, "
+               "Alerts, packet Info, Help and the Start watching question "
+               "are in French and Spanish")
+def gt_c15_language_leaks(app, ctx):
+    root = app.root
+    eng = re.compile(r"joined your network|got address|\bWARNING\b|"
+                     r"^(High|New|Medium)$|offers remote access|"
+                     r"Secure web browsing|Seen directly in a packet|"
+                     r"Quick Start Guide walks")
+    asked = []
+    real_ask = messagebox.askyesno
+    lang0 = app.config.get("general.language", "English")
+    try:
+        for lang, loc in (("Français", "fr"), ("Español", "es")):
+            app.config.set("general.language", lang)
+            app._apply_runtime_settings()
+            _gui_pump(root, 0.5)
+            for name in ("timeline", "alerts", "packets"):
+                tab = app._select_tab(name)
+                if name == "packets":
+                    tab.show_subview("Packets")
+                _gui_pump(root, 0.8)
+                left = [str(v) for iid in list(tab.tree.get_children())[:400]
+                        for v in tab.tree.item(iid, "values")
+                        if eng.search(str(v))]
+                assert not left, (lang, name, left[:5])
+            for topic in ("Start here", "Evidence marks"):
+                ht = app.open_help(topic)
+                _gui_pump(root, 0.3)
+                body = ht.txt.get("1.0", "end")
+                assert not eng.search(body), (lang, topic, body[:300])
+            # the Start watching question, built from translated pieces
+            messagebox.askyesno = lambda *a, **k: asked.append(
+                (loc, a, k)) and False
+            was = app.data_mode
+            app.data_mode = "demo"
+            try:
+                app._confirm_leave_nonlive("Start watching")
+            finally:
+                app.data_mode = was
+                messagebox.askyesno = real_ask
+            msg = asked[-1][1][1]
+            assert "starts a fresh live session" not in msg and \
+                "Continue?" not in msg, msg
+            assert translate_text("Start watching", loc) in msg, msg
+    finally:
+        messagebox.askyesno = real_ask
+        app.config.set("general.language", lang0)
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.3)
+    assert translate_event("D-Link Corporation device joined your network"
+                           ) == "D-Link Corporation device joined your " \
+        "network"
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        assert translate_event("D-Link Corporation device joined your "
+                               "network") == \
+            "Appareil D-Link Corporation a rejoint votre réseau"
+        assert translate_event("Secure web browsing (SYN,ACK)") == \
+            "Navigation web sécurisée (SYN,ACK)"
+    finally:
+        set_locale(old)
+
+
+@self_test()
+def t_c19_linux_capture_help(ctx):
+    """5.3.4 crowd test #19: the Troubleshooting help gives the Linux
+    steps (password, sudo, the setcap capture right), names the menu path
+    to Diagnostics by its real labels, and is in French and Spanish;
+    Diagnostics has a "Capture rights" line with the next step."""
+    topic = next(t for t in help_topics() if t["title"] == "Troubleshooting")
+    body = topic["body"]
+    for word in ("sudo", "setcap cap_net_raw,cap_net_admin+eip",
+                 "Capture rights"):
+        assert word in body, word
+    path = [translate_text(x) for x in ("Help / About",
+                                        "MiniWireshark health")]
+    assert " → ".join(path) + " → Diagnostics…" in body, body
+    for loc in ("fr", "es"):
+        t = translate_lines(body, loc)
+        assert t != body and "setcap" in t, (loc, t[:80])
+        assert translate_text("MiniWireshark health", loc) in t, loc
+    line = capture_rights_line()
+    assert line, line
+    real = (globals()["has_capture_rights"], globals()["is_admin"])
+    try:
+        globals()["has_capture_rights"] = lambda: False
+        globals()["is_admin"] = lambda: False
+        missing = capture_rights_line()
+    finally:
+        globals()["has_capture_rights"], globals()["is_admin"] = real
+    if not IS_WINDOWS:
+        assert missing.startswith("no — ") and "sudo" in missing, missing
+        if not IS_MAC:
+            assert "setcap" in missing and \
+                os.path.realpath(sys.executable) in missing, missing
+
+
+@gui_test_step("5.3.4 crowd #27: the I/O graph draws one unit per chart, "
+               "with the unit on its axis")
+def gt_c27_io_graph_units(app, ctx):
+    root = app.root
+    pt = app._select_tab("packets")
+    pt.show_subview("Statistics")
+    sv = pt.stats
+    sv.kind_var.set("I/O graph")
+    sv.refresh(force=True)
+    _gui_pump(root, 0.5)
+    charts = Charts.chart_data(sv.canvas)
+    units = {}
+    for title, r in charts.items():
+        heads = [h for h in r["header"][1:]]
+        kinds = {"packets" if "packets" in h else "bits" if "bits" in h
+                 else "ms" if "ms" in h else h for h in heads}
+        assert len(kinds) == 1, (title, heads)
+        units[title] = kinds.pop()
+        labels = [r["fmt"](v) for v in (0, 0.125, 0.25, 0.5, 2500.0)]
+        assert len(set(labels)) == len(labels), (title, labels)
+    assert sorted(units.values()) == ["bits", "ms", "packets"], units
+    texts = [str(sv.canvas.itemcget(i, "text"))
+             for i in sv.canvas.find_all()
+             if sv.canvas.type(i) == "text"]
+    assert any(tx.endswith(" b/s") or tx.endswith(" kb/s") or
+               tx.endswith(" Mb/s") for tx in texts), texts
+    assert any(tx.endswith(" ms") for tx in texts), texts
+    assert any(tx.endswith("packets/s") and tx[0].isdigit()
+               for tx in texts), texts
+    assert bit_rate(1500) == "1.5 kb/s" and axis_number(0.25) == "0.25"
+    pt.show_subview("Packets")
+
+
+# ---- second audit (2026-11-14): security, privacy, settings, install -------
+@self_test(needs_source=True)
+def t_a2_elevated_copy_isolated(ctx):
+    """Second audit (security #1): the copy started as root runs Python
+    with -I, so a .pth file in the user's own site-packages (or
+    PYTHONPATH) runs nothing as root, and gets a PATH of root's own
+    folders only. The root copy drops the user's Python variables for
+    the processes it starts."""
+    if IS_WINDOWS or IS_MAC:
+        return "skip"
+    calls = []
+    real_which, real_call = shutil.which, subprocess.call
+    bad = ctx.path("a2_userbin")
+    os.makedirs(bad, exist_ok=True)
+    os.chmod(bad, 0o777)               # anyone can plant a program here
+    try:
+        shutil.which = lambda n: "/usr/bin/" + n if n == "pkexec" else None
+        subprocess.call = lambda cmd, *a, **k: calls.append(cmd) or 126
+        with _b9_patched(os.environ, PATH=bad + os.pathsep + "/usr/bin"):
+            assert _relaunch_elevated((START_ARG + "monitor",)) is False
+    finally:
+        shutil.which, subprocess.call = real_which, real_call
+    cmd = calls[0]
+    py = cmd.index(sys.executable)
+    assert cmd[py + 1] == "-I" and cmd[py + 2] == SCRIPT_PATH, cmd
+    paths = [c for c in cmd[:py] if c.startswith("PATH=")]
+    assert len(paths) == 1 and bad not in paths[0] and \
+        "/usr/bin" in paths[0], paths
+    # the -I start really ignores a planted .pth file
+    base = ctx.path("a2_userbase")
+    site_dir = os.path.join(base, "lib", f"python{sys.version_info[0]}."
+                            f"{sys.version_info[1]}", "site-packages")
+    os.makedirs(site_dir, exist_ok=True)
+    marker = ctx.path("a2_pth_ran")
+    with open(os.path.join(site_dir, "evil.pth"), "w",
+              encoding="utf-8") as f:
+        f.write(f"import os; open({marker!r}, 'w').write('ran')\n")
+    script = ctx.path("a2_noop.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("print('ok')\n")
+    env = dict(os.environ, PYTHONUSERBASE=base)
+    env.pop("PYTHONNOUSERSITE", None)
+    r = _run_hidden(cmd[py:py + 2] + [script], env=env,
+                    capture_output=True, timeout=60)
+    assert r.stdout.decode().strip() == "ok", r
+    assert not os.path.exists(marker), "a .pth file ran in the root copy"
+    # the root copy itself: root's folders only, no user Python variables
+    environ = {"PATH": bad + os.pathsep + "/usr/bin",
+               "PYTHONPATH": bad, "PYTHONUSERBASE": base, "HOME": "/h"}
+    assert harden_root_env(environ, euid=0, invoked=True)
+    assert bad not in environ["PATH"] and "PYTHONPATH" not in environ and \
+        "PYTHONUSERBASE" not in environ and environ["HOME"] == "/h" and \
+        environ["PYTHONNOUSERSITE"] == "1", environ
+    same = {"PATH": bad}
+    assert not harden_root_env(same, euid=0, invoked=False) and \
+        same == {"PATH": bad}
+    assert not harden_root_env(same, euid=1000, invoked=True)
+
+
+@self_test(needs_source=True)
+def t_a2_cached_run_ignores_the_current_folder(ctx):
+    """Second audit (security #2): CACHED_RUN imports nothing from the
+    folder it was started in (a hmac.py there ran, as root under sudo,
+    before any check)."""
+    folder = ctx.path("a2_cwd")
+    os.makedirs(folder, exist_ok=True)
+    marker = ctx.path("a2_hmac_ran")
+    for mod in ("hmac", "hashlib", "types", "marshal"):
+        with open(os.path.join(folder, mod + ".py"), "w",
+                  encoding="utf-8") as f:
+            f.write(f"open({marker!r}, 'w').write('ran')\n"
+                    f"raise SystemExit('planted {mod} ran')\n")
+    script = ctx.path("a2_src.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("import sys\nprint('source', sys.path[0] == "
+                f"{os.path.dirname(script)!r})\n")
+    env = dict(os.environ, MW_PYC=os.path.join(folder, "none.pyc"),
+               MW_KEY=os.path.join(folder, "none.key"))
+    r = _run_hidden([sys.executable, "-c", CACHED_RUN, script],
+                    capture_output=True, env=env, timeout=60, cwd=folder)
+    assert not os.path.exists(marker), r.stderr.decode()[-300:]
+    assert r.stdout.decode().strip() == "source True", r
+
+
+@self_test()
+def t_a2_browser_opens_as_the_person(ctx):
+    """Second audit (security #4): a root copy started through sudo or
+    pkexec opens the browser, a local service and folders as the person
+    who started it, never as root; a normal start still uses the
+    browser module. Both go through the outbound() gate."""
+    if IS_WINDOWS:
+        return "skip"
+    import webbrowser
+    opened, started = [], []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            started.append((cmd, kw))
+    real = (subprocess.Popen, webbrowser.open, LEDGER.killed)
+    before = len(LEDGER.snapshot("local_open"))
+    try:
+        subprocess.Popen = FakePopen
+        webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+        LEDGER.killed = False
+        with _b9_patched(os.environ, SUDO_UID="65534", SUDO_GID="65534",
+                         PKEXEC_UID=None), \
+                _b9_patched(os, geteuid=lambda: 0):
+            assert person_ids()[:2] == (65534, 65534), person_ids()
+            assert open_in_browser("http://127.0.0.1:5173/", "local_open",
+                                   "127.0.0.1:5173", "test")
+            assert _open_path(ctx.path("a2_folder"))
+        assert not opened, opened
+        assert [c[0][0] for c in started] == [
+            "open" if IS_MAC else "xdg-open"] * 2, started
+        assert all(callable(kw.get("preexec_fn")) for _c, kw in started)
+        assert started[0][0][1] == "http://127.0.0.1:5173/"
+        started.clear()
+        with _b9_patched(os.environ, SUDO_UID=None, PKEXEC_UID=None):
+            assert open_in_browser("http://127.0.0.1:5173/", "local_open",
+                                   "127.0.0.1:5173", "test")
+        assert opened == ["http://127.0.0.1:5173/"] and not started
+    finally:
+        subprocess.Popen, webbrowser.open, LEDGER.killed = real
+    assert len(LEDGER.snapshot("local_open")) == before + 2
+    # really started as that person (only a root self-test can switch)
+    if os.geteuid() == 0 and not IS_MAC:
+        with _b9_patched(os.environ, SUDO_UID="65534", SUDO_GID="65534",
+                         PKEXEC_UID=None):
+            p = start_for_person(["id", "-u"], stdout=subprocess.PIPE)
+            out = p.communicate(timeout=30)[0].decode().strip()
+        assert out == "65534", out
+
+
+@self_test()
+def t_a2_temp_file_never_follows_a_link(ctx):
+    """Second audit (security #5): the temporary file of a save is a new
+    file of our own: a link planted under its predictable name (in a
+    shared folder) is neither written through nor renamed into place."""
+    if IS_WINDOWS:
+        return "skip"                  # links need extra rights there
+    folder = ctx.path("a2_shared")
+    os.makedirs(folder, exist_ok=True)
+    victim = ctx.path("a2_victim.txt")
+    with open(victim, "w", encoding="utf-8") as f:
+        f.write("keep")
+    target = os.path.join(folder, "export.json")
+    os.symlink(victim, _tmp_name(target))
+    atomic_write_text(target, "new")
+    with open(victim, encoding="utf-8") as f:
+        assert f.read() == "keep"
+    assert not os.path.islink(target)
+    with open(target, encoding="utf-8") as f:
+        assert f.read() == "new"
+    assert not os.path.lexists(_tmp_name(target))
+
+
+@self_test()
+def t_a2_copied_rows_cannot_start_a_formula(ctx):
+    """Second audit (security #5): a table row or chart data copied to
+    the clipboard gets the same formula guard as a CSV file."""
+    got = []
+    real = globals()["copy_to_clipboard"]
+    try:
+        globals()["copy_to_clipboard"] = lambda app, text: got.append(text)
+        TableKit.copy_row(types.SimpleNamespace(
+            app=None, row_cells=lambda iid: ["=HYPERLINK(\"x\")", "+1",
+                                             "router", "-cmd"]), "i1")
+    finally:
+        globals()["copy_to_clipboard"] = real
+    assert got == ["'=HYPERLINK(\"x\")\t'+1\trouter\t'-cmd"], got
+    canvas = types.SimpleNamespace(_mw_chart={"Sites": {
+        "anchor": None, "header": ["Site", "Bytes"], "note": "",
+        "texts": None, "fmt": None,
+        "rows": [["@SUM(1)", 5], ["example.com", -3]]}})
+    text = Charts.chart_text(canvas)
+    assert "'@SUM(1)\t5" in text and "example.com\t-3" in text, text
+
+
+@gui_test_step("second audit privacy #7: Delete ALL history also deletes the "
+               "autosave, crash journals, device names, networks and "
+               "listening programs")
+def gt_a2_delete_all_history_leaves_nothing(app, ctx):
+    root = app.root
+    planted = [PATHS.autosave, PATHS.journal, PATHS.journal + ".sha256",
+               os.path.join(PATHS.sessions, "journal-interrupted-20261114-"
+                            "101010-1.mwsession.json"),
+               PATHS.known_devices, PATHS.known_devices + ".bak",
+               PATHS.networks, os.path.join(PATHS.data, "listening.json")]
+    for p in planted:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"seen": "192.168.1.77 example.com"}')
+    keep = (app.known.data, app.networks.data, app.network_profile,
+            app.history)
+    asked = []
+    real = (messagebox.askyesno, messagebox.askyesnocancel)
+    messagebox.askyesno = lambda *a, **k: asked.append(a) or True
+    messagebox.askyesnocancel = lambda *a, **k: asked.append(a) or True
+    try:
+        app.history = None                       # history off (default)
+        app.clear_history()
+        _gui_pump(root, 0.1)
+        assert len(asked) == 1, asked
+        left = [p for p in planted if os.path.exists(p)]
+        assert not left, left
+        assert not history_record_files(), history_record_files()
+        assert app.known.data == {} and \
+            app.networks.data == {"networks": {}}
+        # history on: the Yes of "delete ALL" deletes them too
+        for p in planted:
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("{}")
+        cleared = []
+        app.history = types.SimpleNamespace(
+            clear=lambda *a: cleared.append(a))
+        asked.clear()
+        app.clear_history()
+        assert cleared == [()] and len(asked) == 1, (cleared, asked)
+        assert "device names" in asked[0][1], asked[0][1]
+        left = [p for p in planted if os.path.exists(p)]
+        assert not left, left
+    finally:
+        messagebox.askyesno, messagebox.askyesnocancel = real
+        (app.known.data, app.networks.data, app.network_profile,
+         app.history) = keep
+
+
+@gui_test_step("second audit privacy #8: with history off, closing keeps no "
+               "autosave of the session")
+def gt_a2_history_off_keeps_no_autosave(app, ctx):
+    keep = (app.data_mode, app.history)
+    with contextlib.suppress(OSError):
+        os.remove(PATHS.autosave)
+    try:
+        assert app.model.has_data(), "the scenario should be loaded"
+        app.data_mode = "idle"                   # stopped watching live
+        app.history = None
+        assert app.config.get("history.retention") != "Session only"
+        assert app._exit_autosave() is None
+        assert not os.path.exists(PATHS.autosave), \
+            "history is off, but the session was kept"
+        # history on (30 days): the session is kept for "Open last autosave"
+        app.history = types.SimpleNamespace()
+        assert app._exit_autosave() == PATHS.autosave
+        assert os.path.exists(PATHS.autosave)
+    finally:
+        app.data_mode, app.history = keep
+        with contextlib.suppress(OSError):
+            os.remove(PATHS.autosave)
+
+
+@self_test()
+def t_a2_redirects_go_through_the_gate(ctx):
+    """Second audit (privacy #11): a redirect of any download is listed in
+    the ledger under the request's feature and stopped by the kill switch
+    (only the update check looked at redirects, and the ledger named only
+    the first host); https is never redirected to plain http."""
+    import http.server
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/a":
+                self.send_response(302)
+                self.send_header("Location", f"http://localhost:{port}/b")
+                self.end_headers()
+                return
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    killed = LEDGER.killed
+    try:
+        LEDGER.killed = False
+        n = len(LEDGER.snapshot("diagnostics"))
+        with net_urlopen("diagnostics", f"http://127.0.0.1:{port}/a",
+                         10) as r:
+            assert r.read() == b"ok"
+        new = LEDGER.snapshot("diagnostics")[n:]
+        assert [e["dest"] for e in new] == ["127.0.0.1", "localhost"], new
+        assert "redirected from 127.0.0.1" in new[1]["detail"], new
+        # the kill switch stops the hop (here: switched on in between)
+        real = globals()["outbound"]
+
+        def kill_after_first(*a, **k):
+            r_ = real(*a, **k)
+            LEDGER.killed = True
+            return r_
+        globals()["outbound"] = kill_after_first
+        try:
+            net_urlopen("diagnostics", f"http://127.0.0.1:{port}/a", 10)
+            raise AssertionError("the redirect was followed")
+        except OutboundBlocked:
+            pass
+        finally:
+            globals()["outbound"] = real
+    finally:
+        LEDGER.killed = killed
+        srv.shutdown()
+        srv.server_close()
+    try:
+        gate_redirect("https://a.example/x", "http://b.example/y",
+                      "reference")
+        raise AssertionError("https was redirected to http")
+    except urllib.error.URLError as e:
+        assert "https" in str(e), e
+
+
+@self_test()
+def t_a2_country_lookup_https_and_live_only(ctx):
+    """Second audit (privacy #11): every country-lookup service is asked
+    over https (ip-api.com's plain http sent addresses in clear text), and
+    "Retry" asks only for addresses seen live, never an opened file's."""
+    assert GEOIP_PROVIDERS and all(
+        url.startswith("https://") for _n, url, _p in GEOIP_PROVIDERS), \
+        GEOIP_PROVIDERS
+    asked = []
+    stub = types.SimpleNamespace(
+        geoip=types.SimpleNamespace(retry_failed=lambda: 1,
+                                    request=asked.append),
+        model=types.SimpleNamespace(remote_hosts={
+            "93.184.215.14": types.SimpleNamespace(country="")}),
+        data_mode="offline", _set_banner=lambda *a, **k: None)
+    MiniWireshark._geoip_retry(stub)
+    assert not asked, asked
+    stub.data_mode = "live"
+    MiniWireshark._geoip_retry(stub)
+    assert asked == ["93.184.215.14"], asked
+
+
+@self_test(needs_source=True)
+def t_a2_trust_page_matches_the_code(ctx):
+    """Second audit (privacy #8, #9, #11): docs/TRUST.md says what the
+    code does: health checks run on their own every interval on a
+    trusted network, to the default test address; reference lists come
+    only when asked (Manual) unless Weekly is chosen; country lookups name
+    the services in use; the history section says what is kept on exit."""
+    path = os.path.join(SCRIPT_DIR, "docs", "TRUST.md")
+    if not os.path.exists(path):
+        return "skip"                  # a release file without the docs
+    with open(path, encoding="utf-8") as f:
+        doc = f.read()
+
+    def row(name):
+        return next(ln for ln in doc.splitlines()
+                    if ln.startswith(f"| {name} |"))
+    flat = config_defaults_flat()
+    health = row("Health checks")
+    assert "When you open Health" not in health, health
+    assert f"Every {flat['health.interval_seconds']} seconds" in health, \
+        health
+    assert flat["health.internet_target"].rpartition(":")[0] in health
+    assert "network you marked as yours" in health, health
+    ref = row("Reference lists")
+    assert "once a month" not in ref and \
+        f"*{flat['components.policy']}*" in ref, ref
+    for res in DATA_MANIFEST:
+        host = urllib.parse.urlsplit(res.url).hostname
+        assert host.replace("www.", "") in ref, (host, ref)
+    geo = row("Country lookup")
+    for _n, url, _p in GEOIP_PROVIDERS:
+        assert urllib.parse.urlsplit(url).hostname in geo, (url, geo)
+    assert "live" in geo, geo
+    assert flat["history.enabled"] is False and \
+        "History is **off** by default" in doc
+    assert "no saved session" in doc and "Open last autosave" in doc
+    assert "Clear history" in doc and "remembered networks" in doc
+
+
+@self_test()
+def t_a2_bad_setting_values_never_stop_the_start(ctx):
+    """Second audit (settings #21-#24): a theme that doesn't exist, a list
+    for the colour-blind mode, an empty number, on/off as a word and a
+    number out of range are each set back to the default (with a
+    warning) instead of stopping every start, even in Safe Mode; good
+    values next to them are kept; a byte-order mark (Notepad) is read,
+    not taken for damage."""
+    assert clean_config_values(_default_config()) == []
+    path = ctx.path("a2_bad.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"appearance": {"theme": "Purple", "text_size": "Large"},
+                   "accessibility": {"colorblind": ["Off"],
+                                     "ui_scale": "175 %"},
+                   "devices": {"idle_minutes": None,
+                               "inactive_minutes": -5},
+                   "general": {"tips": "yes"},
+                   "health": {"interval_seconds": float("nan")}}, f)
+    c = AppConfig(path=path)
+    assert c.get("appearance.theme") == "Light"
+    assert c.get("appearance.text_size") == "Large"
+    assert c.get("accessibility.colorblind") == "Off"
+    assert c.get("accessibility.ui_scale") == "175 %"
+    assert c.get("devices.idle_minutes") == 2
+    assert c.get("devices.inactive_minutes") == 1          # its minimum
+    assert c.get("general.tips") is True
+    assert c.get("health.interval_seconds") == 30
+    assert sorted(c.repaired) == sorted([
+        "appearance.theme", "accessibility.colorblind",
+        "devices.idle_minutes", "devices.inactive_minutes",
+        "general.tips", "health.interval_seconds"]), c.repaired
+    assert "appearance.theme" in c.warning, c.warning
+    # what the start does with them now works
+    resolve_theme(c.get("appearance.theme"))
+    assert THEMES[c.get("appearance.theme")]
+    set_colorblind_mode(c.get("accessibility.colorblind", "Off"))
+    assert c.get("devices.idle_minutes") * 60 == 120
+    set_colorblind_mode("Off")
+    # Safe Mode reads the same file the same way
+    with _b9_patched(c, overrides=dict(SAFE_MODE_OVERRIDES)):
+        assert c.get("appearance.theme") in THEMES
+    bom = ctx.path("a2_bom.json")
+    with open(bom, "wb") as f:
+        f.write(b"\xef\xbb\xbf" + json.dumps(
+            {"appearance": {"theme": "Dark"}}).encode())
+    b = AppConfig(path=bom)
+    assert b.get("appearance.theme") == "Dark" and not b.warning, b.warning
+    assert not os.path.exists(bom + ".damaged")
+
+
+@self_test()
+def t_a2_two_copies_keep_each_others_settings(ctx):
+    """Second audit (settings #25): two copies of MiniWireshark with the
+    same settings file each keep what the other changed; before, the
+    last save won and the other's change was lost."""
+    path = ctx.path("a2_shared_config.json")
+    AppConfig(path=path).save()
+    a, b = AppConfig(path=path), AppConfig(path=path)
+    a.set("appearance.theme", "Dark")
+    assert a.save()
+    b.set("general.tips", False)
+    b.get("alerts.muted_devices").append("02:00:5e:10:00:10")  # in place
+    assert b.save()
+    c = AppConfig(path=path)
+    assert c.get("appearance.theme") == "Dark", "the first copy's change "\
+        "was lost"
+    assert c.get("general.tips") is False
+    assert c.get("alerts.muted_devices") == ["02:00:5e:10:00:10"]
+    # the first copy saving again keeps the second one's changes too
+    a.set("appearance.text_size", "Large")
+    assert a.save()
+    d = AppConfig(path=path)
+    assert (d.get("appearance.theme"), d.get("general.tips"),
+            d.get("appearance.text_size")) == ("Dark", False, "Large")
+    assert a.get("general.tips") is False        # and it knows them now
+
+
+@self_test()
+def t_a2_settings_file_follows_the_folder_rule(ctx):
+    """Second audit (install #28): the settings file goes next to the
+    program only where the data folder could: not in a folder others can
+    write to, and not a file others can change (INSTALL.md says such
+    places are skipped). Then it goes in the data folder."""
+    if IS_WINDOWS:
+        return "skip"
+    shared = ctx.path("a2_shared_dir")
+    os.makedirs(shared, exist_ok=True)
+    os.chmod(shared, 0o777)
+    mine = ctx.path("a2_my_dir")
+    os.makedirs(mine, exist_ok=True)
+    os.chmod(mine, 0o755)
+    name = "miniwireshark_config.json"
+    assert not config_beside_app_ok(os.path.join(shared, name))
+    assert config_beside_app_ok(os.path.join(mine, name))
+    planted = os.path.join(mine, name)
+    with open(planted, "w", encoding="utf-8") as f:
+        f.write("{}")
+    os.chmod(planted, 0o666)
+    assert not config_beside_app_ok(planted)
+    os.chmod(planted, 0o600)
+    assert config_beside_app_ok(planted)
+    with _b9_patched(globals(), APP_HOME=shared, SCRIPT_DIR=shared), \
+            _b9_patched(os.environ, MINIWIRESHARK_CONFIG=None):
+        c = AppConfig()
+    assert c.path == os.path.join(PATHS.data, name), c.path
+
+
+@self_test()
+def t_a2_new_install_told_about_the_update_check(ctx):
+    """Second audit (privacy #10): a new install's first automatic update
+    check says that MiniWireshark checks GitHub once a day and how to
+    turn it off (the notice was only for upgrades); later checks don't
+    repeat it."""
+    notice = "now checks the official GitHub page"
+    stub, sent, restore = _update_stub(ctx)
+    try:
+        assert not stub.config.get("updates.notice_pending")
+        assert not _float(stub.config.get("updates.last_check", 0))
+        assert stub._auto_update_check()
+        for t in list(threading.enumerate()):
+            if t.name == "update-check":
+                t.join(5)
+        assert sum(notice in b for b in stub.banners) == 1, stub.banners
+        stub.config.set("updates.last_check",
+                        time.time() - UPDATE_CHECK_INTERVAL - 5)
+        assert stub._auto_update_check()
+        for t in list(threading.enumerate()):
+            if t.name == "update-check":
+                t.join(5)
+        assert sum(notice in b for b in stub.banners) == 1, stub.banners
+        assert len(sent) == 2, sent
+    finally:
+        restore()
+
+
+@self_test(needs_source=True)
+def t_a2_boot_check_without_tkinter(ctx):
+    """Second audit (install #30): on a Python without tkinter (the most
+    common Linux problem) --boot-check still reports: the window toolkit
+    as the problem with how to install it, the data folder, and a Ready?
+    line that agrees; other tool switches point to it."""
+    block = ctx.path("a2_no_tk")
+    os.makedirs(os.path.join(block, "tkinter"), exist_ok=True)
+    with open(os.path.join(block, "tkinter", "__init__.py"), "w",
+              encoding="utf-8") as f:
+        f.write("raise ImportError('No module named _tkinter (test)')\n")
+    data = ctx.path("a2_no_tk_data")
+    os.makedirs(data, mode=0o700, exist_ok=True)
+    env = dict(os.environ, PYTHONPATH=block, MINIWIRESHARK_DATA=data,
+               PYTHONIOENCODING="utf-8")
+    r = _run_hidden([sys.executable, SCRIPT_PATH, "--boot-check"], env=env,
+                    capture_output=True, timeout=120)
+    out = r.stdout.decode("utf-8", "replace")
+    assert r.returncode == 1, (r.returncode, out, r.stderr[-400:])
+    for want in ("boot check", "Window      FAILED: no graphical toolkit",
+                 "python3-tk", "brew install python-tk",
+                 "tcl/tk and IDLE", f"Data folder {data}",
+                 "✗ Python and window toolkit",
+                 "Result: problems found"):
+        assert want in out, (want, out)
+    assert "✓ Python" not in out
+    r = _run_hidden([sys.executable, SCRIPT_PATH, "--bench"], env=env,
+                    capture_output=True, timeout=120)
+    err = r.stderr.decode("utf-8", "replace")
+    assert r.returncode == 1 and "--boot-check" in err, err
+
+
+@self_test()
+def t_a2_ready_list_agrees_with_the_boot_check(ctx):
+    """Second audit (install #30, #31): when the window can't open,
+    --boot-check's Ready? list doesn't say "✓ Python and window toolkit"
+    under "Window FAILED"; with --no-elevate the capture-permission line
+    doesn't promise a password prompt; --help shows that --bench-gui
+    takes scenarios."""
+    lines = []
+    real_tk = tk.Tk
+
+    def no_display(*a, **k):
+        raise tk.TclError("no display name and no $DISPLAY environment "
+                          "variable")
+    try:
+        tk.Tk = no_display
+        rc = boot_check(out=lines.append)
+    finally:
+        tk.Tk = real_tk
+        WINDOW_PROBLEM[0] = ""
+    text = "\n".join(lines)
+    assert rc == 1 and "Window      FAILED" in text, text
+    py = next(ln for ln in lines if "Python and window toolkit" in ln)
+    assert py.strip().startswith(READY_MARK["bad"]) and \
+        "no display name" in py, py
+    if not IS_WINDOWS:
+        with _b9_patched(globals(), has_capture_rights=lambda: False), \
+                _b9_patched(os.environ, MINIWIRESHARK_NO_ELEVATE="1"):
+            state, said, _fix = _ready_permission(None)
+        assert "never asks" in said and "asks when" not in said, said
+    usage = cli_usage()
+    assert "--bench-gui [S1 S2" in usage, usage
+    assert cli_check(["--bench-gui", "S1", "S2", "--check"]) is None
+@self_test(needs_source=True)
+def t_q35_beginner_help_names_every_hidden_tab(ctx):
+    """35-checker pass: the Beginner view's help (Settings) and the
+    Beginner / Advanced tooltip name every tab Beginner hides, Sources
+    too, in all three languages."""
+    import ast
+    hidden = [STRINGS["en"][c.label_key].split(" ", 1)[1]
+              for c in BaseTab.__subclasses__() if c.advanced]
+    assert "Sources" in hidden and len(hidden) == 4, hidden
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    tips = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and getattr(node.func, "id", "") == \
+                "Tooltip" and len(node.args) > 1:
+            parts, n = [], node.args[1]
+            while isinstance(n, ast.BinOp):
+                parts.insert(0, n.right.value)
+                n = n.left
+            if isinstance(n, ast.Constant) and isinstance(n.value, str):
+                parts.insert(0, n.value)
+                text = "".join(parts)
+                if text.startswith("Beginner shows the essentials"):
+                    tips.append(text)
+    assert len(tips) == 1, tips
+    page = next(c for p in SETTINGS_PAGES for s in p["sections"]
+                for c in s["controls"]
+                if c.get("key") == "appearance.beginner_mode")
+    for text in (tips[0], page["help"]):
+        for tab in hidden:
+            assert tab in text, (tab, text)
+        for loc in ("fr", "es"):
+            tr = translate_text(text, loc)
+            assert tr != text, (loc, text)
+            for tab in hidden:
+                assert translate_text(tab, loc) in tr, (loc, tab, tr)
+
+
+@self_test()
+def t_q35_reference_data_help_says_what_the_code_does(ctx):
+    """35-checker pass: nothing is downloaded on its own under Manual (the
+    default); under Weekly a missing list is fetched and an old one again
+    after its refresh days; the setting's help says exactly that, and no
+    "about once a month" text is left in any language."""
+    help_ = next(c for p in SETTINGS_PAGES for s in p["sections"]
+                 for c in s["controls"]
+                 if c.get("key") == "privacy.auto_download_reference")["help"]
+    for key in ("oui", "psl"):
+        r = next(x for x in DATA_MANIFEST if x.key == key)
+        assert r.enable_key == "privacy.auto_download_reference"
+        assert f"{r.refresh_days} days" in help_, help_
+    assert "Manual" in help_ and "Weekly" in help_ and \
+        "unless you ask" in help_, help_
+    for loc in ("fr", "es"):
+        assert translate_text(help_, loc) != help_, loc
+    for loc, table in I18N.items():
+        for en, tr in table.items():
+            for t in (en, tr):
+                assert "once a month" not in t and \
+                    "une fois par mois" not in t and \
+                    "una vez al mes" not in t, (loc, en[:60])
+    assert config_defaults_flat().get("components.policy",
+                                      "Manual") == "Manual"
+    for policy, want in (("Manual", set()), ("Weekly", {"oui", "psl"})):
+        got = []
+        dm = DataManager(ctx.path(f"q35-ref-{policy}"), ctx.cfg(
+            {"privacy.auto_download_reference": True,
+             "components.policy": policy}))
+        os.makedirs(dm.cache_dir, exist_ok=True)
+        dm._download = lambda r, got=got: got.append(r.key) or False
+        assert dm.start()
+        t_end = time.time() + 20
+        while dm.busy() and time.time() < t_end:
+            time.sleep(0.02)
+        assert not dm.busy()
+        assert want <= set(got) and (want or not got), (policy, got)
+
+
+@self_test()
+def t_q35_bench_gui_help_shows_its_scenarios(ctx):
+    """35-checker pass: --help shows the --bench-gui scenarios, and they
+    are the real ones."""
+    rc, text = cli_check(["--help"])
+    assert rc == 0
+    line = next(ln for ln in text.splitlines()
+                if ln.strip().startswith("--bench-gui"))
+    want = "[" + " ".join(BENCH_SCENARIOS) + " | all]"
+    assert line.strip() == "--bench-gui " + want, line
+    assert cli_check(["--bench-gui", "S2", "S3", "--check"]) is None
+    assert cli_check(["--bench-gui"]) is None
+
+
+@self_test()
+def t_q35_dropped_download_is_a_runtime_error(ctx):
+    """35-checker pass: a transfer cut short (http.client.IncompleteRead,
+    no OSError) ends as a RuntimeError_ the window explains, and keeps
+    its .part; "407" in a message is a proxy only as the HTTP status; the
+    private Python's free-space need is one number everywhere."""
+    class Resp:
+        status = 200
+        headers = {"Content-Length": "100"}
+
+        def __init__(self):
+            self.n = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self, _n):
+            self.n += 1
+            if self.n == 1:
+                return b"x" * 40
+            raise http.client.IncompleteRead(b"", 60)
+    real = globals()["net_urlopen"]
+    globals()["net_urlopen"] = lambda *a, **k: Resp()
+    try:
+        for get in (lambda d: fetch_to_file("https://example.com/f", d,
+                                            expected_sha="0" * 64),
+                    lambda d: RuntimeManager(root_dir=ctx.path("q35rt"))
+                    .download("https://example.com/f", d,
+                              expected_sha="0" * 64)):
+            dest = ctx.path(f"q35dl-{uuid.uuid4().hex[:6]}/file.bin")
+            try:
+                get(dest)
+                raise AssertionError("no error")
+            except RuntimeError_ as e:
+                assert e.kind == "offline", e.kind
+            assert os.path.getsize(dest + ".part") == 40
+    finally:
+        globals()["net_urlopen"] = real
+    assert classify_runtime_error(OSError("wrote 407 bytes")) != "proxy"
+    assert classify_runtime_error(OSError(
+        "/home/u/407/x: not found")) != "proxy"
+    assert classify_runtime_error(urllib.error.HTTPError(
+        "https://x/", 407, "Proxy Authentication Required", {}, None)) == \
+        "proxy"
+    assert f"{RUNTIME_FREE_MB} MB" in RUNTIME_ERRORS["disk"][1]
+    mgr = RuntimeManager(root_dir=ctx.path("q35rt2"))
+    if mgr.plan()["supported"]:
+        assert f"{RUNTIME_FREE_MB} MB free" in mgr.describe()
+        real_du = shutil.disk_usage
+        shutil.disk_usage = lambda p: types.SimpleNamespace(
+            free=RUNTIME_FREE_MB * 1024 * 1024 - 1, total=1, used=0)
+        try:
+            mgr.provision()
+            raise AssertionError("provisioned without the space")
+        except RuntimeError_ as e:
+            assert e.kind == "disk", e
+        finally:
+            shutil.disk_usage = real_du
+
+
+@self_test()
+def t_q35_json_store_leaves_no_temporary_files(ctx):
+    """35-checker pass: a store write that fails leaves no *.tmp file, and
+    the same damaged store is set aside once, not on every start."""
+    folder = ctx.path(f"q35store-{uuid.uuid4().hex[:6]}")
+    os.makedirs(folder)
+    path = os.path.join(folder, "labels.json")
+    save_json_store(path, {"a": 1})
+
+    class Bad:
+        def __str__(self):
+            raise RuntimeError("cannot be written")
+    try:
+        save_json_store(path, {"a": Bad()})
+        raise AssertionError("no error")
+    except RuntimeError:
+        pass
+    assert sorted(os.listdir(folder)) == ["labels.json"], os.listdir(folder)
+    assert read_json(path, None) == {"a": 1}
+    save_json_store(path, {"a": 2})
+    assert read_json(path + ".bak", None) == {"a": 1}
+    with open(path, "w") as f:
+        f.write("{broken")
+    os.remove(path + ".bak")
+    for i in range(3):
+        data, problem = load_json_store(path)
+        assert data is None and problem == "damaged", problem
+        for n in os.listdir(folder):     # as if set aside on another day
+            if ".damaged-" in n and len(n.rsplit("-", 1)[1]) > 3:
+                os.replace(os.path.join(folder, n), f"{path}.damaged-{i}")
+    damaged = [n for n in os.listdir(folder) if ".damaged-" in n]
+    assert len(damaged) == 1, damaged
+
+
+@self_test()
+def t_q35_port_text_takes_text_ports(ctx):
+    """35-checker pass: a port given as text is explained like a number
+    (it raised TypeError)."""
+    assert "ephemeral" in explain_port_text("50000")
+    assert explain_port_text("50000") == explain_port_text(50000)
+    assert explain_port_text("x") == ""
+
+
+@self_test()
+def t_q35_data_manager_starts_once(ctx):
+    """35-checker pass: two starts at the same moment (Repair's thread and
+    the window) give one download run, not two."""
+    hold = threading.Event()
+
+    class Slow(DataManager):
+        @property
+        def _busy(self):
+            v = self.__dict__.get("_q35_busy", False)
+            time.sleep(0.05)              # both read before either writes
+            return v
+
+        @_busy.setter
+        def _busy(self, v):
+            self.__dict__["_q35_busy"] = v
+    dm = Slow(ctx.path("q35-dm"), ctx.cfg({}))
+    dm.enabled = lambda r: hold.wait(10) and False
+    gate = threading.Barrier(2)
+    got = []
+
+    def go():
+        gate.wait()
+        got.append(dm.start())
+    ts = [threading.Thread(target=go) for _ in range(2)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join(5)
+    hold.set()
+    assert sorted(got) == [False, True], got
+    t_end = time.time() + 10
+    while dm.busy() and time.time() < t_end:
+        time.sleep(0.02)
+
+
+@self_test()
+def t_q35_adapter_up_and_router_on_its_subnet(ctx):
+    """35-checker pass: adapter flags given as a number are read (they
+    made every adapter "disconnected"), and "your router is on the same
+    network" uses the card's real subnet from the route table, never a
+    /24 guess (LG-08)."""
+    assert iface_flags_up(0x1043) and not iface_flags_up(0x1002)
+    assert iface_flags_up("UP+BROADCAST+RUNNING")
+    assert not iface_flags_up("BROADCAST+LOWER_UP")
+    assert not iface_flags_up("")
+    ip_int = int(ipaddress.ip_address("10.0.0.0"))
+    mask = int(ipaddress.ip_address("255.255.255.240"))
+    card = types.SimpleNamespace(name="q35eth0", description="", ip="10.0.0.5",
+                                 flags="UP+BROADCAST", network_name="")
+    fake = types.SimpleNamespace(
+        ifaces={"q35eth0": card},
+        route=types.SimpleNamespace(routes=[
+            (ip_int, mask, "0.0.0.0", "q35eth0", "10.0.0.5", 1)]))
+    real = globals().get("conf")
+    globals()["conf"] = fake
+    try:
+        for gw, same in (("10.0.0.1", True), ("10.0.0.100", False)):
+            rec = score_interfaces("", gw, best="")
+            r = next(x for x in rec if x["name"] == "q35eth0")
+            said = "your router is on the same network" in r["reasons"]
+            assert said is same, (gw, r["reasons"])
+        fake.route.routes = []                  # subnet unknown: no guess
+        r = score_interfaces("", "10.0.0.1", best="")[0]
+        assert "your router is on the same network" not in r["reasons"]
+    finally:
+        globals()["conf"] = real
+
+
+@self_test()
+def t_q35_dns_check_has_one_deadline(ctx):
+    """35-checker pass: the health check's DNS lookup gives up at its
+    timeout even when other datagrams keep arriving (it waited for ever)."""
+    stop = threading.Event()
+
+    class Sock:
+        def __init__(self, *a):
+            pass
+
+        def settimeout(self, t):
+            pass
+
+        def sendto(self, data, addr):
+            return len(data)
+
+        def recvfrom(self, n):
+            if stop.is_set():
+                raise OSError("test over")
+            time.sleep(0.02)
+            return b"\x00\x00\x81\x80" + bytes(8), ("192.0.2.53", 53)
+
+        def close(self):
+            pass
+    real = globals()["_socket"]
+    globals()["_socket"] = types.SimpleNamespace(
+        AF_INET=real.AF_INET, AF_INET6=real.AF_INET6,
+        SOCK_DGRAM=real.SOCK_DGRAM, socket=Sock, timeout=real.timeout)
+    out = []
+    try:
+        t = threading.Thread(target=lambda: out.append(
+            HealthProber._dns_rtt("192.0.2.53", timeout=0.3)), daemon=True)
+        t.start()
+        t.join(5)
+        assert not t.is_alive(), "the lookup never gave up"
+    finally:
+        stop.set()
+        globals()["_socket"] = real
+    assert out == [(False, None, None)], out
+
+
+@self_test()
+def t_q35_router_answer_must_be_recent(ctx):
+    """35-checker pass: "Why can't this device connect?" counts the
+    router's answer only when it came after a question inside the window:
+    an answer from long ago no longer hides a router that ignores every
+    question since."""
+    b = ScenarioBuilder()
+    b.arp_announce(b.ME)
+    L, nb, ip = b.L, MC7_NEWBIE, "192.168.1.77"
+
+    def ask():
+        b._emit(L.Ether(src=nb, dst="ff:ff:ff:ff:ff:ff") / L.ARP(
+            op=1, hwsrc=nb, psrc=ip, pdst=b.GW[0]), dt=1.0)
+    ask()
+    b._emit(L.Ether(src=b.GW[1], dst=nb) / L.ARP(
+        op=2, hwsrc=b.GW[1], psrc=b.GW[0], hwdst=nb, pdst=ip), dt=0.01)
+    b.t += 2000
+    for _i in range(3):
+        ask()
+    b.tls(b.ME, "www.example.com", "93.184.215.14", size=4000)
+    m = _call_model(ctx, b.frames)
+    assert m.gw_arp_replies.get(nb), dict(m.gw_arp_replies)
+    f = connect_facts(m, nb)
+    assert f["arp_asks"] == 3 and not f["gw_replied"], f
+    hyps = investigate_connect(f)
+    assert not any(h["key"] == "router_silent" and h["status"] ==
+                   "Unlikely" for h in hyps), hyps
+
+
+@self_test()
+def t_q35_call_never_overclaims_complete(ctx):
+    """35-checker pass: "arrived complete and on time" only when nothing
+    was lost and the capture itself dropped nothing."""
+    base = {"tuple": (), "first": 0.0, "last": 60.0, "kind": "voice",
+            "worst": None, "inbound": True}
+
+    def why(f):
+        return json.dumps(investigate_call(f), default=str)
+    full = "arrived complete and on time"
+    assert full in why({"calls": [dict(base, loss_pct=0.0, jitter_ms=2)]})
+    dropped = why({"calls": [dict(base, loss_pct=0.0, jitter_ms=2)],
+                   "capture_drop_pct": 0.05})
+    assert full not in dropped and "can't tell whether" in dropped, dropped
+    some = why({"calls": [dict(base, loss_pct=0.5, jitter_ms=2)]})
+    assert full not in some and "lost only 0.5%" in some, some
+
+
+@self_test()
+def t_q35_history_writer_survives_a_bad_batch(ctx):
+    """35-checker pass: a batch that fails with something other than a
+    database error is reported and the writer goes on (history stopped
+    silently)."""
+    st = Store(ctx.path(f"q35h-{uuid.uuid4().hex[:6]}.sqlite3"),
+               session_id=1)
+    ran = []
+    try:
+        def bad(con):
+            raise TypeError("a value the database can't take")
+        assert st.submit(bad)
+        assert st.submit(lambda con: ran.append(1))
+        assert st.flush_now(10), "the writer stopped"
+        assert ran == [1] and st._thread.is_alive()
+        assert "TypeError" in st.error, st.error
+    finally:
+        st.stop(5)
+
+
+@self_test()
+def t_q35_periodic_counts_contacts(ctx):
+    """35-checker pass: "about every 60 s (N times)" counts the contacts
+    seen, not the regular gaps plus one."""
+    starts = [1000.0 + i * 60 for i in range(13)]
+    starts += [starts[-1] + 500 * (k + 1) for k in range(3)]
+    m = types.SimpleNamespace(
+        flow_starts={("dev1", "52.1.2.3"): starts}, ip_to_domains={},
+        registry=types.SimpleNamespace(resolve=lambda k: k, by_key={}))
+    rows = periodic_findings(m)
+    assert rows and rows[0][3] == 16 and "(16 times)" in rows[0][4], rows
+
+
+@self_test()
+def t_q35_ipv6_over_udp_counts_as_used(ctx):
+    """35-checker pass: IPv6 traffic without a TCP handshake (QUIC) is
+    IPv6 in use: never "your network doesn't offer IPv6" or "nothing used
+    it yet"."""
+    for f in ({"v6_share": 0.3, "span": 1200},
+              {"v6_share": 0.3, "span": 1200, "ra": True},
+              {"v6_share": 0.3, "span": 60}):
+        keys = {h["key"] for h in investigate_ipv6(f)}
+        assert not keys & {"not_offered", "unused"}, (f, keys)
+        assert "working" in keys, (f, keys)
+    keys = {h["key"] for h in investigate_ipv6({"span": 1200})}
+    assert "not_offered" in keys, keys
+
+
+@self_test()
+def t_q35_vlan_change_is_not_a_move(ctx):
+    """35-checker pass: the same switch port on another VLAN is said as a
+    VLAN change, not "Moved to"."""
+    m = _call_model(ctx, [])
+    t = SCENARIO_T0
+    for i, raw in enumerate((_lldp_frame(vlan=20), _lldp_frame(vlan=30))):
+        d = _fast_decode(raw, t + 1 + i, 1, None)
+        d["no"] = 1 + i
+        m.ingest(d)
+    tl = [e["text"] for e in m.timeline if e["kind"] == "network"]
+    assert any(x.startswith("VLAN changed on core-sw1") and "now 30" in x
+               and "was 20" in x for x in tl), tl
+    assert not any(x.startswith("Moved to") for x in tl), tl
+
+
+@self_test()
+def t_q35_calls_card_survives_a_bad_translation(ctx):
+    """35-checker pass: a translation of the Calls card whose placeholders
+    don't fit falls back to English instead of raising."""
+    tpl = ("Your voice call lost %s of packets between %s and %s; "
+           "jitter %d ms (usually fine below %d).")
+    tracker = types.SimpleNamespace(unmeasured=lambda: 0, summary=lambda: [
+        {"kind": "voice", "loss_pct": 2.0, "first": SCENARIO_T0,
+         "last": SCENARIO_T0 + 60, "jitter_ms": 10.0, "worst": None}])
+    old = CURRENT_LOCALE
+    key = ("fr", tpl)
+    had = _I18N_CACHE.get(key)
+    try:
+        set_locale("fr")
+        _I18N_CACHE[key] = "Appel : %s perdu"
+        text = calls_card_text(tracker)
+        assert "Your voice call lost 2.0%" in text, text
+    finally:
+        set_locale(old)
+        if had is None:
+            _I18N_CACHE.pop(key, None)
+        else:
+            _I18N_CACHE[key] = had
+
+
+@self_test()
+def t_q35_stop_during_self_heal_is_final(ctx):
+    """35-checker pass (high): Stop pressed while a self-heal restart is
+    trying the cards ends it; the cancelled attempt is no failure to heal
+    again (the capture came back after the person stopped it). A restart
+    that really fails still heals."""
+    def fake():
+        app = types.SimpleNamespace()
+        app._capture_token = 5
+        app.sniffer = None
+        app._capture_starting = False
+        app.data_mode = "live"
+        app.iface_scores = [{"name": "eth0", "score": 50,
+                             "display": "Ethernet"}]
+        app.iface_box = {"values": ["Ethernet"]}
+        app._populate_ifaces = lambda scores=None: None
+        app.died = []
+        app._handle_sniffer_died = lambda e: app.died.append(e)
+        app.pending = []
+
+        def start(cands, keep_data=False, on_done=None):
+            app._capture_token += 1
+            app._capture_starting = True
+            app.pending.append(on_done)
+            return True
+        app._start_capture = start
+        return app
+    app = fake()
+    MiniWireshark._heal_continue(app, app._capture_token, "eth0", None, None)
+    assert len(app.pending) == 1
+    app._capture_token += 1            # Stop: cancels the start under way
+    app._capture_starting = False
+    app.data_mode = "idle"
+    app.pending[0](False)              # the stale start reports back
+    assert app.died == [], "a cancelled restart was healed again"
+    app = fake()
+    MiniWireshark._heal_continue(app, app._capture_token, "eth0", None, None)
+    app._capture_starting = False
+    app.pending[0](False)              # no stop: a real failure
+    assert len(app.died) == 1
+
+
+@self_test()
+def t_q35_rename_workspace_never_replaces_silently(ctx):
+    """35-checker pass: renaming a workspace to the name of another asks
+    first; "no" keeps both."""
+    cfg = ctx.cfg({"workspaces.saved": {"Home": {"tab": "devices"},
+                                        "Work": {"tab": "alerts"}}})
+    app = types.SimpleNamespace(config=cfg, root=None)
+    asked = []
+    real = messagebox.askyesno
+    try:
+        messagebox.askyesno = lambda *a, **k: asked.append(a) or False
+        assert MiniWireshark.rename_workspace(app, "Home", "Work") is None
+        assert asked, "it didn't ask"
+        saved = cfg.get("workspaces.saved")
+        assert saved["Home"] == {"tab": "devices"} and \
+            saved["Work"] == {"tab": "alerts"}, saved
+        messagebox.askyesno = lambda *a, **k: True
+        assert MiniWireshark.rename_workspace(app, "Home", "Work") == "Work"
+        assert cfg.get("workspaces.saved") == {"Work": {"tab": "devices"}}
+    finally:
+        messagebox.askyesno = real
+
+
+@self_test(needs_source=True)
+def t_q35_update_failures_are_told_and_restore_is_whole(ctx):
+    """35-checker pass: a download that doesn't compile is a ValueError
+    (the update thread died on SyntaxError, silently); a marker that can't
+    be written after the program was replaced says so instead of "nothing
+    was changed"; an interrupted rollback leaves the program whole (it
+    was copied over the program, truncating it first)."""
+    d = ctx.path(f"q35upd-{uuid.uuid4().hex[:6]}")
+    os.makedirs(d)
+    cur = os.path.join(d, "miniwireshark.py")
+    old = b"# MiniWireshark old\ndef main():\n    pass\n" + b"#" * 60000
+    with open(cur, "wb") as f:
+        f.write(old)
+    broken = b"# MiniWireshark\ndef main(:\n    pass\n" + b"#" * 60000
+    try:
+        apply_self_update(broken, "9.9.9", cur, os.path.join(d, "m.json"))
+        raise AssertionError("installed a broken program")
+    except ValueError as e:
+        assert "not a working program" in str(e), e
+    assert open(cur, "rb").read() == old
+    new = _court_update_body()
+    folder_marker = os.path.join(d, "marker-is-a-folder")
+    os.makedirs(folder_marker)
+    msg = apply_self_update(new, "9.9.9", cur, folder_marker)
+    assert "was installed" in msg and "couldn't be set up" in msg, msg
+    assert open(cur, "rb").read() == new
+    assert not [n for n in os.listdir(d) if n.endswith(".new")]
+    # a real marker, then a rollback whose copy breaks half way
+    with open(cur, "wb") as f:
+        f.write(old)
+    marker = os.path.join(d, "marker.json")
+    apply_self_update(new, "9.9.9", cur, marker)
+    real = shutil.copyfile
+
+    def half(src, dst, *a, **k):
+        with open(src, "rb") as fi, open(dst, "wb") as fo:
+            fo.write(fi.read()[:100])
+        raise OSError("the disk went away")
+    # both: on Windows copy2 copies with CopyFile2, never through copyfile
+    real2 = shutil.copy2
+    shutil.copyfile = shutil.copy2 = half
+    try:
+        msg = rollback_update_if_needed(force=True, script_path=cur,
+                                        marker_path=marker)
+    finally:
+        shutil.copyfile, shutil.copy2 = real, real2
+    assert "failed" in msg, msg
+    assert open(cur, "rb").read() == new, "the program was left broken"
+    assert not [n for n in os.listdir(d) if n.endswith(".rb")]
+
+
+@self_test(needs_source=True)
+def t_q35_ctrl_c_is_not_success(ctx):
+    """35-checker pass: Ctrl+C while MiniWireshark starts ends with exit
+    code 130, not 0."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    main_if = [n for n in tree.body if isinstance(n, ast.If) and
+               "__name__" in ast.dump(n.test)]
+    assert main_if
+    handlers = [h for n in ast.walk(main_if[-1]) if isinstance(n, ast.Try)
+                for h in n.handlers if h.type is not None and
+                getattr(h.type, "id", "") == "KeyboardInterrupt"]
+    assert handlers, "no Ctrl+C handler"
+    for h in handlers:
+        calls = [c for c in ast.walk(h) if isinstance(c, ast.Call) and
+                 isinstance(c.func, ast.Attribute) and c.func.attr == "exit"]
+        assert calls and isinstance(calls[0].args[0], ast.Constant) and \
+            calls[0].args[0].value == 130, ast.dump(h)
+
+
+@self_test()
+def t_q35_gui_test_counts_skips(ctx):
+    """35-checker pass: a GUI test step that returns "skip" is reported
+    as skipped (it counted as passed), and the --live step skips unless
+    the run was asked for --live."""
+    res = []
+    gui_test_record(res, "a", lambda: None)
+    gui_test_record(res, "b", lambda: "skip")
+
+    def boom():
+        raise ValueError("x")
+    gui_test_record(res, "c", boom)
+    assert [r[0] for r in res] == ["PASS", "SKIP", "FAIL"], res
+    assert _gs_live(None, types.SimpleNamespace(live=False)) == "skip"
 
 
 # ============================================================================
@@ -93790,9 +102844,18 @@ BOOT_TESTS = ("test_boot_receipts_and_crash_loop",
 READY_MARK = {"ok": "✓", "warn": "!", "bad": "✗", "info": "·"}
 
 
+# second audit (install #30): set by --boot-check when the window can't open
+WINDOW_PROBLEM = [""]
+
+
 def _ready_python(cfg):
     ok, why = system_python_suitable()
     text = f"Python {platform.python_version()}, Tk {tk.TkVersion}"
+    if WINDOW_PROBLEM[0]:
+        # "Window FAILED" and "✓ Python and window toolkit" were printed
+        # in the same report
+        return ("bad", f"{text}, but the window can't open here: "
+                f"{WINDOW_PROBLEM[0]}", "")
     if ok:
         return "ok", text, ""
     return ("warn", f"{text} — {why}. A newer Python is at "
@@ -93816,6 +102879,12 @@ def _ready_driver(cfg):
 def _ready_permission(cfg):
     if has_capture_rights():
         return "ok", "Allowed to watch network traffic", ""
+    if not elevation_allowed():
+        # second audit (install #31): --no-elevate was ignored here
+        return ("warn", "Not allowed to watch traffic, and this start "
+                "never asks for administrator rights (--no-elevate or "
+                "MINIWIRESHARK_NO_ELEVATE). Capture files and Demo Mode "
+                "work.", "")
     return ("warn", "Needs permission to watch traffic; MiniWireshark asks "
             "when you start monitoring (Demo Mode and files don't need "
             "it).", "monitor")
@@ -93875,7 +102944,7 @@ def _ready_updates(cfg):
 
 def _ready_outbound(cfg):
     if cfg is not None and cfg.get("privacy.kill_switch", False):
-        return "ok", "Nothing leaves this PC: the kill switch is on.", ""
+        return "ok", "Kill switch on — " + KILL_SWITCH_EFFECT, ""
     sent = LEDGER.summary_lines()
     return ("info", "What MiniWireshark itself sends is listed in "
             "Privacy (Settings). So far: " + "; ".join(sent[:3]), "")
@@ -93930,6 +102999,7 @@ def boot_check(out=print):
     out(f"  Python      {platform.python_version()} ({sys.executable})")
     suitable, why = system_python_suitable()
     out(f"  Suitable    {'yes' if suitable else 'no — ' + why}")
+    WINDOW_PROBLEM[0] = ""
     try:
         r = tk.Tk()
         r.withdraw()
@@ -93938,6 +103008,7 @@ def boot_check(out=print):
         out(f"  Window      ok (Tk {tk.TkVersion})")
     except Exception as e:                           # noqa: BLE001
         ok_all = False
+        WINDOW_PROBLEM[0] = f"{type(e).__name__}: {e}"
         out(f"  Window      FAILED: {type(e).__name__}: {e}")
     dep = next(d for d in DEPENDENCY_MANIFEST if d["required"])
     ready, info = _required_ready(dep)
@@ -94029,7 +103100,8 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        pass
+        # (35-checker review) stopped with Ctrl+C: not a success (128+2)
+        sys.exit(130)
     except Exception as e:                           # noqa: BLE001
         LOG.exception("fatal error")
         boot_step("crash", False, error=e)

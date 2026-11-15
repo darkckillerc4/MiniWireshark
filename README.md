@@ -111,7 +111,7 @@ Useful switches:
 | `--gui-test` | Drive the real window through every tab (needs a display) |
 | `--bench-gui S1 S2` | Window-performance benchmark against fixed budgets |
 | `--release-gate` | Everything above plus pictures of every tab, in one folder |
-| `--help`, `--version` | List every switch, or print the version |
+| `-h`, `--help`, `-V`, `--version` | List every switch, or print the version |
 
 The full list, including the developer switches, is in [Installation](docs/INSTALL.md#command-line-switches).
 
@@ -208,7 +208,7 @@ Every release is a single `.py` file attached to its [GitHub release](https://gi
 
 ```
 miniwireshark.py        the application: one file on purpose, ~94k lines in banner-marked regions
-legacy/                 versions 1.x and 2.0.0 (written before this repository was created, and imported here)
+legacy/                 versions 1.x and 2.0.0 (written before this repository; imported later)
 docs/                   installation, user guide, features, architecture, FAQ, version index
 .github/                CI, issue and PR templates, release notes, archive-release workflow
 ```

@@ -28,7 +28,7 @@ The tabs are in four groups. `Ctrl+1` to `Ctrl+4` jump to a group, `Ctrl+Tab` mo
 | | Map | A picture of your network: router, devices and the Internet |
 | | Health | Wi-Fi, router, DNS, packet loss and Internet checks. The **Calls** card shows the loss and jitter of video and voice calls. **More questions…** opens the guided investigations |
 | | Alerts | Security and health findings, each with *why*, *innocent explanations* and *what to do*. Acknowledge, mute or **snooze** them (1 hour, 1 day or until tomorrow) |
-| **Internet** | Websites | The names your devices reach, grouped by site, with trackers marked |
+| **Internet** | Websites | The names your devices reach, grouped by site, with trackers marked. **Local services** lists the programs on this computer that wait for connections, what each one probably is and whether other devices can reach it; double-click a web app to open it in your browser |
 | | Connections ¹ | Every flow: who, where, how much, how long |
 | | Internet hosts ¹ | Public addresses contacted, with country and network owner when lookups are on |
 | **Tools and help** | Packets ¹ | The packet workspace: list, dissection tree, hex view, streams, statistics, expert findings |

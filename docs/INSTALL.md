@@ -9,7 +9,7 @@ You need **Python 3.8 or newer with Tk**.
 | System | How |
 |---|---|
 | Windows | Install from [python.org](https://www.python.org/downloads/) or the Microsoft Store. Tk is included. |
-| macOS | Install from [python.org](https://www.python.org/downloads/). Tk is included. |
+| macOS | Install from [python.org](https://www.python.org/downloads/). Tk is included. With Homebrew: `brew install python python-tk` (Homebrew's Python has no Tk without `python-tk`). |
 | Debian, Ubuntu | `sudo apt install python3 python3-tk` |
 | Fedora | `sudo dnf install python3 python3-tkinter` |
 
@@ -76,13 +76,13 @@ The application stays one file. Everything it creates goes into one data folder:
 
 On Linux and macOS the data folder is closed to other users (mode 0700). A folder that belongs to someone else, or that others can write to, is skipped. Files written while capture runs as root are handed back to you.
 
-Settings are saved in `miniwireshark_config.json` next to the script, or in the data folder when the script's folder is not writable. Two environment variables move these files, which is useful for tests:
+Settings are saved in `miniwireshark_config.json`: next to the script when that folder passes the same check (it is yours and nobody else can write to it), otherwise in the data folder. Two environment variables move these files, which is useful for tests:
 
 ```bash
 MINIWIRESHARK_DATA=/tmp/mw-data MINIWIRESHARK_CONFIG=/tmp/mw-config.json python miniwireshark.py
 ```
 
-The data folder holds logs, saved sessions and the autosave, the optional history database, the private Python and packages, caches, boot receipts and a small `vault.json` for helper passwords. On Windows the passwords in it are encrypted for your account (DPAPI). On Linux without a secret service, and on macOS without the `security` tool, they are stored in it with only the file's permissions (mode 0600) to protect them, which is weaker. If neither folder above can be written, it falls back to a temporary folder. **Storage used…** in the command palette (`Ctrl+K`) shows how much each part uses.
+The data folder holds logs, saved sessions and the autosave (kept only while history is on), the optional history database, the private Python and packages, caches, boot receipts and a small `vault.json` for helper passwords. On Windows the passwords in it are encrypted for your account (DPAPI). On Linux without a secret service, and on macOS without the `security` tool, they are stored in it with only the file's permissions (mode 0600) to protect them, which is weaker. **Storage used…** in the command palette (`Ctrl+K`) shows how much each part uses.
 
 ## Updating
 
@@ -92,8 +92,8 @@ Download the new release and replace the file. Settings, history and sessions ar
 
 Delete `miniwireshark.py` and the data folder above. A few things live outside that folder, so delete them too:
 
-- `miniwireshark_config.json` (and `miniwireshark_config.json.bak`) next to `miniwireshark.py`, when that folder is writable. Otherwise they are in the data folder and go with it.
-- scapy's own cache: `~/.cache/scapy` on Linux and macOS, and `%USERPROFILE%\.cache\scapy` on Windows.
+- `miniwireshark_config.json` (and `miniwireshark_config.json.bak`) next to `miniwireshark.py`, when that folder is yours and nobody else can write to it.
+- scapy's own cache: `~/.cache/scapy` on Linux and macOS, `%USERPROFILE%\.cache\scapy` on Windows.
 - Update backups, named `miniwireshark.py.v<version>.bak`, next to the script.
 - Passwords you saved for a Pi-hole or AdGuard Home helper are in your system's keychain (macOS Keychain or the Linux secret service), under "MiniWireshark". On Windows they are in `vault.json` in the data folder, so deleting that folder removes them. Remove them there, or remove each helper in MiniWireshark before you uninstall (removing a helper deletes its saved password).
 
@@ -105,7 +105,7 @@ If you installed Npcap only for MiniWireshark, remove it from Windows' *Installe
 |---|---|
 | `--demo` | Start in Demo Mode |
 | `--safe` | Safe Mode: no auto-capture, no history, no update checks, no automatic downloads |
-| `--boot-check` | Check this computer's setup and exit, without opening the window |
+| `--boot-check` | Check this computer's setup and exit, without opening the window. It works on a Python without Tk too, and says how to install it |
 | `--no-elevate` | Never ask for administrator rights |
 | `--yes` | Accept the download list without asking (unattended start) |
 | `--no-runtime` | Use the Python you started it with, not MiniWireshark's private Python |
@@ -113,13 +113,13 @@ If you installed Npcap only for MiniWireshark, remove it from Windows' *Installe
 | `--gui-test` | Drive the real window through every tab. Needs a display (`xvfb-run -a` on a headless Linux) |
 | `--bench` | Measure this computer's analysis speed |
 | `--quick` | With `--self-test`, `--gui-shots` or `--release-gate`: the shorter run |
-| `--bench-gui S1 S2` | Developer: window-performance benchmark against fixed budgets |
+| `--bench-gui S1 S2` | Developer: window-performance benchmark for the scenarios named (or `all`); `--check` compares with the fixed budgets |
 | `--gui-shots DIR` | Developer: take a picture of every tab into `DIR` |
 | `--start-check` | Developer: time a full start |
 | `--release-check [FILE]` | Developer: check a release file |
 | `--release-gate` | Developer: all tests, the benchmark and pictures of every tab, written to one folder you can send back |
-| `--help` | List every switch and exit |
-| `--version` | Print the version and exit |
+| `-h`, `--help` | List every switch and exit |
+| `-V`, `--version` | Print the version and exit |
 
 An unknown switch, or a switch missing its value, ends with a one-line explanation before anything starts.
 

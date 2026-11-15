@@ -18,7 +18,7 @@ Every MiniWireshark release is a single Python file. The table lists each archiv
 
 The checksums match the original release files.
 
-- Versions 1.x and 2.0.0 come from before this repository's history; their files are in [`legacy/`](../legacy/).
+- Versions 1.x and 2.0.0 were written before this repository and imported into it later; their files are in [`legacy/`](../legacy/).
 - Every other version is taken straight from the listed commit.
 
 ## How the releases are published

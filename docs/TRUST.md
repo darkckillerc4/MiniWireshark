@@ -37,15 +37,16 @@ MiniWireshark mostly *listens*. It sends something in the following cases, each 
 | What | When | Where it goes |
 |---|---|---|
 | Update check | Once a day, unless you turn it off | `api.github.com`, for the latest release number only |
-| Reference lists | Only when you ask in the Components Center, or weekly if you set **Settings → Components → Updates** to Weekly | `wireshark.org` (vendor names) and `publicsuffix.org`. Optional lists you turn on add `www.iana.org` (port names), `raw.githubusercontent.com` (tracker and DNS-resolver lists), `iptoasn.com`, `feodotracker.abuse.ch` and `www.spamhaus.org`. Plain file downloads. |
+| Reference lists | Only when you ask: Get or Check now in the Components Center, Refresh now in Settings, or Updates set to *Weekly* (the default is *Manual*; with Weekly a missing list is fetched at start, and a list more than 30 days old again) | `wireshark.org` (vendor names), `publicsuffix.org`, and each optional list you turn on there (`iana.org`, `iptoasn.com`, `raw.githubusercontent.com`, `feodotracker.abuse.ch`, `spamhaus.org`). Plain file downloads. |
 | Private Python and packages | Only when you approve the download list, and when you press the *Newer Python* check | `github.com` (a standalone Python build, pinned by SHA-256), `python.org` (the Windows fallback installer, checked for its signature) and the Python Package Index (`pypi.org`, `files.pythonhosted.org`) |
 | Self-update | Only if you turn on *Offer to install updates*, and only for a signed release | `github.com` release files |
 | Npcap (Windows) | Only when you choose to install it | `npcap.com` |
-| Health checks | When you run them, and about every 30 seconds in the background while Active Mode is on and the network is one you trust (turn Active Mode off to stop them) | Your router, your DNS server, and a test address |
+| Health checks | Every 30 seconds while watching live, but only on a network you marked as yours, with Active Scanning on (never in Quiet Mode). Turn them off in **Settings → Network Health**. | Your router, your DNS server, and one test address: `1.1.1.1` port 443 (Cloudflare) unless you change it there |
 | Device discovery (Active Mode) | Only on your own subnet, and never on a network you haven't trusted | Devices on your local network |
-| Country lookup | **Off** by default | One of four online lookup services (`ipwho.is`, `geojs.io`, `ipapi.co` or `ip-api.com`; the last one over plain HTTP), only if you turn it on |
+| Country lookup | **Off** by default; only for addresses seen while watching live | An online lookup service over HTTPS (`ipwho.is`, `get.geojs.io` or `ipapi.co`), only if you turn it on |
 | Pi-hole / AdGuard Home | Only if you add one | The helper you added, on your network |
 | Router port-forwarding check | Only when you press the button | Your router |
+| Open a local service | Only when you open one from Websites → Local services | Your browser, at `127.0.0.1` (this computer) |
 
 How to check:
 
@@ -59,7 +60,11 @@ How to check:
 
 Everything it writes goes in one data folder (see [Installation](INSTALL.md#where-it-keeps-its-files)): logs, sessions, the optional history, and its private packages. History is **off** by default.
 
-- Passwords, mail logins and message bodies are dropped inside the decoders and never stored. A canary test in the GUI test (`--gui-test`) plants fake secrets and checks every report, session, CSV, log, history row (when history is on) and clipboard copy for them.
+- With history off, no record of what you watched is kept after you close the window: no history and no saved session. While you watch, a crash-safe copy of the session is kept and is deleted when you close. Only after a crash does it stay, so the next start can offer it back.
+- With history on, the last session is also saved when you close (**Open last autosave**), unless history is set to *Session only*.
+- Your device names and notes, the networks you marked as yours and the list of programs on this computer that wait for connections are kept either way.
+- **Clear history** in **Settings → History**, answered with *Yes* (delete ALL), deletes all of it: the history, saved packets, the autosave, crash copies, your device names and notes, the remembered networks and the list of programs that wait for connections.
+- Passwords, mail logins and message bodies are dropped inside the decoders and never stored. A canary self-test plants fake secrets and checks every report, session, CSV, log, history row and clipboard copy for them.
 - On Linux and macOS the data folder is closed to other users.
 - **Storage used…** in the command palette (`Ctrl+K`) shows what each part takes. Deleting the folder removes everything, except passwords for connected helpers that you saved in the system keychain on macOS or Linux (see [Uninstalling](INSTALL.md#uninstalling)).
 - Shareable reports and the Network check-up can replace names and addresses with pseudonyms.

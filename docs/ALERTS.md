@@ -6,22 +6,25 @@ Every alert MiniWireshark can raise, in the words the app uses. An alert means *
 
 Each alert in the app also shows what was seen, the evidence behind it and a confidence. You can turn each kind off or change its threshold in **Settings → Alerts**, and snooze it from the alert itself. Alerts that compare against "normal" wait until the device has a baseline. See [Features](FEATURES.md#is-anything-wrong) for how that works.
 
-There are 27 kinds:
+There are 30 kinds:
 
 | Alert | Severity |
 |---|---|
 | [Possible ARP spoofing](#possible-arp-spoofing) | Danger |
 | [Address on a public blocklist contacted](#address-on-a-public-blocklist-contacted) | Warning |
+| [Data hidden in name lookups](#data-hidden-in-name-lookups) | Warning |
 | [DHCP anomaly](#dhcp-anomaly) | Warning |
 | [DNS server changed](#dns-server-changed) | Warning |
 | [Duplicate IP address](#duplicate-ip-address) | Warning |
 | [Excessive broadcast traffic](#excessive-broadcast-traffic) | Warning |
 | [Gateway identity changed](#gateway-identity-changed) | Warning |
+| [Large upload at night](#large-upload-at-night) | Warning |
 | [Login sent without encryption](#login-sent-without-encryption) | Warning |
 | [Many DNS failures](#many-dns-failures) | Warning |
 | [New service used](#new-service-used) | Warning |
 | [Possible scanning pattern](#possible-scanning-pattern) | Warning |
 | [Rapid reconnect/disconnect](#rapid-reconnectdisconnect) | Warning |
+| [Regular check-ins to one server](#regular-check-ins-to-one-server) | Warning |
 | [Remote-access service seen](#remote-access-service-seen) | Warning |
 | [Repeated connection resets](#repeated-connection-resets) | Warning |
 | [Slow DNS](#slow-dns) | Warning |
@@ -64,6 +67,19 @@ There are 27 kinds:
 
 1. Look at which device contacted it and whether that was expected (an app, an update, a link someone opened).
 2. A list entry is a reason to look, not proof: shared servers and old entries are common.
+
+## Data hidden in name lookups
+
+**Severity:** Warning · **Usual confidence:** Medium
+
+**Why it is flagged:** Many long, random-looking names were looked up under one domain in a few minutes.
+
+**What it usually means:** Sometimes antivirus or a VPN that uses name lookups on purpose; otherwise a way to sneak data past a firewall.
+
+**What to check:**
+
+1. Is antivirus, a VPN or a remote-access tool installed on the device? Some use name lookups like this on purpose.
+2. If not, disconnect the device from the network and run a malware scan on it.
 
 ## DHCP anomaly
 
@@ -126,6 +142,19 @@ There are 27 kinds:
 1. Did you just restart, update or replace the router? If yes, this is expected.
 2. If not, check the router's admin page and its connected devices before trusting this network.
 
+## Large upload at night
+
+**Severity:** Warning · **Usual confidence:** Medium
+
+**Why it is flagged:** A device sent a lot to the Internet at night, more than it ever did at night before.
+
+**What it usually means:** Usually a backup or a photo sync that runs while the device charges at night.
+
+**What to check:**
+
+1. Was the device backing up, syncing photos or uploading a video overnight? Then this is expected.
+2. If it should be idle at night, look at which program sent the data, and run a malware scan on it.
+
 ## Login sent without encryption
 
 **Severity:** Warning · **Usual confidence:** High
@@ -184,6 +213,19 @@ There are 27 kinds:
 
 1. Check the device's Wi-Fi signal and its distance from the router.
 2. Look for power-saving or roaming settings on the device.
+
+## Regular check-ins to one server
+
+**Severity:** Warning · **Usual confidence:** Medium
+
+**Why it is flagged:** A device opened new connections to the same server many times, at nearly even intervals.
+
+**What it usually means:** Usually an app or a gadget that checks in with its server on a timer (weather, smart home, mail, updates).
+
+**What to check:**
+
+1. Do you know the server? A weather, news or smart-home app checking in is normal.
+2. If the device should be idle and you don't know the server, look at which program makes the connections.
 
 ## Remote-access service seen
 

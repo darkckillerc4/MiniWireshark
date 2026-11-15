@@ -22,6 +22,7 @@ A hub with four devices, and the traffic wave from the banner.
 |---|---|
 | [`banner.svg`](assets/banner.svg) | The top of the README |
 | [`social-preview.png`](assets/social-preview.png) | The card shown when the repository link is shared (1280×640) |
+| [`social-preview.svg`](assets/social-preview.svg) | The editable source of that card (export it to PNG at 1280×640) |
 
 To use the social preview on GitHub: open the repository's **Settings → General → Social preview → Edit → Upload an image** and choose `docs/assets/social-preview.png`. GitHub only accepts this upload from the website.
 
