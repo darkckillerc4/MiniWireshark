@@ -26555,10 +26555,12 @@ class NetworkModel:
             return self.dhcp_trusted()[1]
         if self.dhcp_routers:
             return self.dhcp_routers.most_common(1)[0][0]
-        if self.gw_mac_traffic:
-            mac = self.gw_mac_traffic.most_common(1)[0][0]
+        # 50-crowd D1: a broadcast or multicast address was named the
+        # router ("Router identified from the capture (likely):
+        # 192.168.1.255"); the busiest MAC with a usable address wins
+        for mac, _n in self.gw_mac_traffic.most_common(8):
             dev = self.registry.by_key.get(mac)
-            if dev is not None and dev.ip:
+            if dev is not None and dev.ip and usable_router_ip(dev.ip):
                 return dev.ip
         return ""
 
@@ -26574,6 +26576,60 @@ class NetworkModel:
 # ============================================================================
 #  14.  Persistence — configuration, sessions, known devices, history
 # ============================================================================
+def usable_router_ip(ip):
+    """False for addresses no router has: broadcast (x.x.x.255,
+    255.255.255.255), network (x.x.x.0), multicast, unspecified."""
+    try:
+        a = ipaddress.ip_address(str(ip).split("%")[0])
+    except ValueError:
+        return False
+    if a.is_multicast or a.is_unspecified or a.is_loopback:
+        return False
+    if a.version == 4 and a.packed[3] in (0, 255):
+        return False
+    return True
+
+
+def shortcut_from_key(keysym, state, platform=None):
+    """The Tk binding for a key pressed in the shortcut recorder.
+    -> "cancel" for Escape, None for a modifier on its own, "bare" for a
+    plain letter, digit or symbol (it would fire while you type: Windows
+    doesn't report the Windows key as a modifier, so Win+F arrived as a
+    bare "f"), else "<Control-Shift-k>" style text. On macOS the Command
+    key is state 0x8 and Option 0x10; on X11 0x8 is Alt and 0x40 Super;
+    on Windows Alt is 0x20000 and 0x8 is Num Lock."""
+    platform = platform or sys.platform
+    if keysym == "Escape":
+        return "cancel"
+    if keysym.split("_")[0] in ("Control", "Shift", "Alt", "Meta", "Super",
+                                "Hyper", "Win", "Caps", "Num", "Mode",
+                                "ISO", "Option", "Command"):
+        return None
+    mods = []
+    if state & 0x4:
+        mods.append("Control")
+    if platform == "darwin":
+        if state & 0x8:
+            mods.append("Command")
+        if state & 0x10:
+            mods.append("Option")
+    elif platform == "win32":
+        if state & 0x20000:          # 0x8 is Num Lock on Windows, not Alt
+            mods.append("Alt")
+    else:
+        if state & 0x8:
+            mods.append("Alt")
+        if state & 0x40:
+            mods.append("Mod4")
+    if state & 0x1:
+        mods.insert(1 if mods[:1] == ["Control"] else 0, "Shift")
+    typing = len(keysym) == 1 or keysym in ("space", "minus", "plus",
+                                            "comma", "period", "slash")
+    if typing and not [m for m in mods if m != "Shift"]:
+        return "bare"
+    return "<" + "-".join(mods + [keysym]) + ">"
+
+
 DEFAULT_SHORTCUTS = {
     "start": "<Control-r>", "stop": "<Control-period>",
     "clear": "<Control-l>", "export": "<Control-e>", "find": "<Control-f>",
@@ -30232,6 +30288,10 @@ Data folder ¦ Dossier des données ¦ Carpeta de datos
 Data pack ¦ Pack de données ¦ Paquete de datos
 Debug bundle ¦ Paquet de débogage ¦ Paquete de depuración
 Demo Mode ¦ Mode démo ¦ Modo demo
+Demo Mode ended — all demo data was discarded. Nothing is being captured: click “Start watching” when you'd like to watch your real network. ¦ Mode démo terminé : toutes les données de démo ont été supprimées. Rien n'est capturé : cliquez sur « Commencer à observer » quand vous voulez observer votre vrai réseau. ¦ Modo demo terminado: se descartaron todos los datos de demostración. No se captura nada: haga clic en «Empezar a observar» cuando quiera observar su red real.
+Add Ctrl or Alt to that key: a letter, digit or symbol on its own would fire while you type. ¦ Ajoutez Ctrl ou Alt à cette touche : une lettre, un chiffre ou un symbole seul se déclencherait pendant la saisie. ¦ Añada Ctrl o Alt a esa tecla: una letra, cifra o símbolo solo se activaría mientras escribe.
+Demo Mode sends nothing, but this button goes online to download or check something. Go online anyway? ¦ Le mode démo n'envoie rien, mais ce bouton se connecte à Internet pour télécharger ou vérifier quelque chose. Se connecter quand même ? ¦ El modo demo no envía nada, pero este botón se conecta a Internet para descargar o comprobar algo. ¿Conectarse de todos modos?
+Active Scanning starts only on a network you trust. ¦ L'analyse active ne démarre que sur un réseau auquel vous faites confiance. ¦ La exploración activa solo empieza en una red de confianza.
 Demo Mode ended — all demo data was discarded. ¦ Mode démo terminé — toutes les données de démo ont été supprimées. ¦ Modo demo terminado — se descartaron todos los datos de demostración.
 Demo Mode stops live capture and shows simulated data instead. Your live data on screen will be cleared (save it first if you want it). Continue? ¦ Le mode démo arrête la capture en direct et affiche des données simulées. Vos données réelles à l'écran seront effacées (enregistrez-les d'abord si vous voulez les garder). Continuer ? ¦ El modo demo detiene la captura en directo y muestra datos simulados. Sus datos reales en pantalla se borrarán (guárdelos antes si los quiere). ¿Continuar?
 Device inventory (printable) ¦ Inventaire des appareils (imprimable) ¦ Inventario de dispositivos (para imprimir)
@@ -31019,7 +31079,7 @@ Something looks wrong ¦ Quelque chose semble anormal ¦ Algo parece ir mal
 See inside a connection ¦ Voir l'intérieur d'une connexion ¦ Ver el interior de una conexión
 Dashboard tab ¦ Onglet Tableau de bord ¦ Pestaña Panel
 The tabs ¦ Les onglets ¦ Las pestañas
-Live feed tab ¦ Onglet En direct ¦ Pestaña En directo
+Happening tab ¦ Onglet En direct ¦ Pestaña En directo
 Timeline tab ¦ Onglet Chronologie ¦ Pestaña Cronología
 Devices tab ¦ Onglet Appareils ¦ Pestaña Dispositivos
 Websites tab ¦ Onglet Sites web ¦ Pestaña Sitios web
@@ -31229,6 +31289,7 @@ Print ¦ Imprimer ¦ Imprimir
 Demo Mode: this is made-up sample data, not your network. ¦ Mode démo : ce sont des données d'exemple inventées, pas votre réseau. ¦ Modo demo: son datos de ejemplo inventados, no su red.
 The page couldn't be opened in your web browser. Save it and open the file to print it. ¦ La page n'a pas pu être ouverte dans votre navigateur. Enregistrez-la et ouvrez le fichier pour l'imprimer. ¦ No se pudo abrir la página en su navegador. Guárdela y abra el archivo para imprimirla.
 Opened in your web browser: print it from there, or choose Save as PDF. ¦ Ouvert dans votre navigateur : imprimez-le depuis celui-ci ou choisissez Enregistrer en PDF. ¦ Abierto en su navegador: imprímalo desde allí o elija Guardar como PDF.
+“%s” replaces %s in the view. Nothing is captured live. ¦ « %s » remplace %s dans l'affichage. Rien n'est capturé en direct. ¦ «%s» reemplaza %s en la vista. No se captura nada en directo.
 “%s” starts a fresh live session, so %s will be cleared from view. ¦ « %s » démarre une nouvelle session en direct : %s sera retiré(e) de l'affichage. ¦ «%s» inicia una nueva sesión en directo, así que %s se quitará de la vista.
 Save it first (Session ▾ Save session) if you want to keep it. Continue? ¦ Enregistrez d'abord (Session ▾ Enregistrer la session) si vous voulez le garder. Continuer ? ¦ Guárdelo antes (Sesión ▾ Guardar sesión) si quiere conservarlo. ¿Continuar?
 “%s” stops live capture and replaces what's on screen. Save the current session first if you want to keep it. Continue? ¦ « %s » arrête la capture en direct et remplace ce qui est affiché. Enregistrez d'abord la session en cours si vous voulez la garder. Continuer ? ¦ «%s» detiene la captura en directo y reemplaza lo que hay en pantalla. Guarde antes la sesión actual si quiere conservarla. ¿Continuar?
@@ -37665,7 +37726,21 @@ class SettingsWindow:
     def runtime_status_text(self):
         return self.app.runtime_status_text()
 
+    # 50-crowd E2: in Demo Mode the banner says "Nothing is being sent",
+    # but these buttons go online. They now ask first there.
+    ONLINE_ACTIONS = ("check_updates", "refresh_data", "install_datapack",
+                      "geoip_test", "geoip_retry", "repair_deps",
+                      "repair_all")
+
     def _act(self, name):
+        if name in self.ONLINE_ACTIONS and \
+                getattr(self.app, "data_mode", "") == "demo" and \
+                not messagebox.askyesno(
+                    translate_text("Demo Mode"), translate_text(
+                        "Demo Mode sends nothing, but this button goes "
+                        "online to download or check something. Go "
+                        "online anyway?"), parent=self.win):
+            return
         if name == "open_config_folder":
             folder = os.path.dirname(self.cfg.path)
             if not _open_path(folder):
@@ -49765,10 +49840,12 @@ class StatisticsView(_SubView):
             path.append("Ethernet" if d.get("linktype", 1) == 1 else
                         f"Link type {d.get('linktype')}")
             v = d.get("ipver")
-            if v:
-                path.append("IPv4" if v == 4 else "IPv6")
-            elif d.get("tag") == "ARP" or d.get("proto") == "ARP":
+            # 50-crowd D2: ARP is its own network layer; ARP rows carry
+            # ipver 4, so they were counted (and drawn) under IPv4
+            if d.get("tag") == "ARP" or d.get("proto") == "ARP":
                 path.append("ARP")
+            elif v:
+                path.append("IPv4" if v == 4 else "IPv6")
             tr = d.get("transport")
             if tr:
                 path.append(tr)
@@ -50281,7 +50358,7 @@ HELP_TAB_TEXT = (
      "Internet? What is new? The “From here” line under them says what "
      "this computer can and can't see. The cards below show what's "
      "happening right now; click any card to open the tab behind it."),
-    ("Live feed tab", "feed", "tree",
+    ("Happening tab", "feed", "tree",
      "Everything as it happens, newest first, in plain words. Moving the "
      "pointer over the list pauses it so a line doesn't run away while "
      "you read it; move away (or press Jump to now) to resume."),
@@ -52991,7 +53068,11 @@ class MiniWireshark:
                     f"listening and sends nothing.")
             btn_text = "Trust this network"
             cmd = self.trust_network
-        elif wanted:
+        elif wanted and prof is not None and prof.get("trusted"):
+            # 50-crowd A3/A4/B: only a network you trusted shows ACTIVE
+            # SCANNING. After Stop on a network not yet identified (or
+            # not trusted) it said ACTIVE SCANNING although nothing would
+            # ever be probed there.
             bg, fg = t["mode_active_bg"], t["mode_active_fg"]
             text = tr("mode_active") + (f"  Network: {name}." if name
                                         else "")
@@ -53002,7 +53083,14 @@ class MiniWireshark:
         else:
             bg, fg = t["mode_quiet_bg"], t["mode_quiet_fg"]
             text = tr("mode_quiet") + (f"  Network: {name}." if name else "")
-            btn_text = "Switch to Active Scanning"
+            if wanted:
+                text += ("  Active Scanning starts only on a network you "
+                         "trust.")
+            if not live:
+                text += ("  (Nothing is being sent right now: not capturing "
+                         "live.)")
+            btn_text = ("Switch to Quiet Mode" if wanted else
+                        "Switch to Active Scanning")
         # the pieces are joined with two spaces; each has its own
         # translation (the joined sentence had none)
         text = "  ".join(translate_text(p) for p in text.split("  "))
@@ -53065,7 +53153,11 @@ class MiniWireshark:
                     f"haven't marked as yours, so MiniWireshark is only "
                     f"listening and sends nothing.")
             colors = ("mode_quiet_bg", "mode_quiet_fg")
-        elif wanted:
+        elif wanted and prof is not None and prof.get("trusted"):
+            # 50-crowd A3/A4/B: only a network you trusted shows ACTIVE
+            # SCANNING. After Stop on a network not yet identified (or
+            # not trusted) it said ACTIVE SCANNING although nothing would
+            # ever be probed there.
             text = tr("mode_active") + (f"  Network: {name}." if name
                                         else "")
             if not live:
@@ -53074,6 +53166,12 @@ class MiniWireshark:
             colors = ("mode_active_bg", "mode_active_fg")
         else:
             text = tr("mode_quiet") + (f"  Network: {name}." if name else "")
+            if wanted:
+                text += ("  Active Scanning starts only on a network you "
+                         "trust.")
+            if not live:
+                text += ("  (Nothing is being sent right now: not capturing "
+                         "live.)")
             colors = ("mode_quiet_bg", "mode_quiet_fg")
         if getattr(self, "_overload_shown", False):
             # 5.3.4 (M13, IP-025): an honest line while only counting
@@ -57035,20 +57133,23 @@ proc ::mw_explicit_fonts {top names} {
             fill="both", expand=True)
         win.configure(bg=self.theme["tab_bg"])
 
+        hint = tk.Label(win, text="", bg=self.theme["tab_bg"],
+                        fg=self.theme["text_fg"], wraplength=px(300))
+        hint.pack(fill="x")
+
         def on_key(event):
-            if event.keysym == "Escape":
+            seq = shortcut_from_key(event.keysym, event.state)
+            if seq == "cancel":
                 win.destroy(); return
-            if event.keysym in ("Control_L", "Control_R", "Shift_L",
-                               "Shift_R", "Alt_L", "Alt_R"):
+            if seq is None:                  # a modifier on its own
                 return
-            mods = []
-            if event.state & 0x4:
-                mods.append("Control")
-            if event.state & 0x1:
-                mods.append("Shift")
-            if event.state & 0x20000 or event.state & 0x0008:
-                mods.append("Alt")
-            seq = "<" + "-".join(mods + [event.keysym]) + ">"
+            if seq == "bare":
+                # 50-crowd A2: Win+F (or Cmd+F) was saved as a bare "f",
+                # and typing an f then jumped to search
+                hint.configure(text=translate_text(
+                    "Add Ctrl or Alt to that key: a letter, digit or "
+                    "symbol on its own would fire while you type."))
+                return
             display_var.set(seq)
             win.destroy()
         win.bind("<KeyPress>", on_key)
@@ -57159,7 +57260,7 @@ proc ::mw_explicit_fonts {top names} {
                          "best network card ...")
         self.start(auto=True)
 
-    def _confirm_leave_nonlive(self, action):
+    def _confirm_leave_nonlive(self, action, live=True):
         if self.data_mode in ("offline", "session", "demo"):
             what = {"offline": "the opened capture file",
                     "session": "the loaded session",
@@ -57167,9 +57268,15 @@ proc ::mw_explicit_fonts {top names} {
             # crowd test #15: built from translated pieces (the Spanish
             # "Empezar a observar" question was entirely English)
             tr = translate_text
+            # 50-crowd D1/C/E3: opening a file or a session is not live,
+            # so the question no longer says it "starts a fresh live
+            # session"
+            first = (tr("“%s” starts a fresh live session, so %s will be "
+                        "cleared from view.") if live else
+                     tr("“%s” replaces %s in the view. Nothing is captured "
+                        "live.")) % (tr(action), tr(what))
             return messagebox.askyesno(
-                action, tr("“%s” starts a fresh live session, so %s will be "
-                           "cleared from view.") % (tr(action), tr(what)) +
+                action, first +
                 "\n\n" + tr("Save it first (Session ▾ Save session) if you "
                              "want to keep it. Continue?"),
                 parent=self.root)
@@ -61403,7 +61510,7 @@ proc ::mw_explicit_fonts {top names} {
                     "“%s” stops live capture and replaces what's on screen. "
                     "Save the current session first if you want to keep it. "
                     "Continue?") % translate_text(action), parent=self.root)
-        return self._confirm_leave_nonlive(action)
+        return self._confirm_leave_nonlive(action, live=False)
 
     def open_pcap(self):
         path = filedialog.askopenfilename(
@@ -61590,10 +61697,14 @@ proc ::mw_explicit_fonts {top names} {
             self.demo.stop()
             self.demo = None
         self._leave_nonlive()
-        self._set_banner("Demo Mode ended — all demo data was discarded.")
+        # 50-crowd A3/A4/B/D1: leaving the demo used to start a real,
+        # promiscuous capture at once (auto_start_capture), with no
+        # question. Watching your real network is now always your click.
+        self._set_banner("Demo Mode ended — all demo data was discarded. "
+                         "Nothing is being captured: click “Start "
+                         "watching” when you'd like to watch your real "
+                         "network.")
         LOG.info("demo mode stopped")
-        if self.config.get("general.auto_start_capture", True):
-            self.start(auto=True)
 
     # ======================================================================
     #  Menus, export and reports
@@ -101249,6 +101360,50 @@ def t_a2_copied_rows_cannot_start_a_formula(ctx):
     assert "'@SUM(1)\t5" in text and "example.com\t-3" in text, text
 
 
+@gui_test_step("50-crowd: leaving the demo starts no capture; ACTIVE "
+               "SCANNING only on a trusted network; opening a file is not "
+               "called a live session")
+def gt_c50_demo_exit_and_mode_line(app, ctx):
+    root = app.root
+    started = []
+    real_start, real_ask = app.start, messagebox.askyesno
+    keep = (app.data_mode, getattr(app, "network_profile", None),
+            app.config.get("mode.active_scanning", True))
+    try:
+        app.start = lambda auto=False: started.append(auto)
+        app.start_demo()
+        _gui_pump(root, 1.0)
+        assert app.data_mode == "demo"
+        app.stop_demo()
+        _gui_pump(root, 0.3)
+        assert not started, "leaving the demo started a capture"
+        assert app.data_mode == "idle", app.data_mode
+        assert "Start watching" in str(app.banner_lbl.cget("text"))
+        app.config.set("mode.active_scanning", True)
+        app.network_profile = None
+        text = app.state_line_parts()[0]
+        assert "ACTIVE SCANNING" not in text, text
+        assert "only on a network you trust" in text, text
+        app.network_profile = {"name": "Home", "trusted": True}
+        assert "ACTIVE SCANNING" in app.state_line_parts()[0]
+        app.network_profile = {"name": "Cafe", "trusted": False}
+        assert "ACTIVE SCANNING" not in app.state_line_parts()[0]
+        asked = []
+        messagebox.askyesno = lambda *a, **k: asked.append(a) and False
+        app.data_mode = "offline"
+        app._confirm_leave_live("Opening a capture file")
+        assert "replaces" in asked[-1][1] and \
+            "live session" not in asked[-1][1], asked[-1]
+        app._confirm_leave_nonlive("Start watching")
+        assert "fresh live session" in asked[-1][1], asked[-1]
+    finally:
+        app.start, messagebox.askyesno = real_start, real_ask
+        app.data_mode, app.network_profile = keep[0], keep[1]
+        app.config.set("mode.active_scanning", keep[2])
+        app._restyle_mode_banner()
+    _gt_back_to_scenario(app, ctx)
+
+
 @gui_test_step("second audit privacy #7: Delete ALL history also deletes the "
                "autosave, crash journals, device names, networks and "
                "listening programs")
@@ -101320,6 +101475,54 @@ def gt_a2_history_off_keeps_no_autosave(app, ctx):
         app.data_mode, app.history = keep
         with contextlib.suppress(OSError):
             os.remove(PATHS.autosave)
+
+
+@self_test()
+def t_c50_shortcut_recorder_router_and_hierarchy(ctx):
+    """50-crowd: the shortcut recorder never saves a bare letter (Win+F
+    arrived as "f" on Windows), knows Command on macOS and Num Lock on
+    Windows; a broadcast address is never named the router; ARP is its
+    own layer in the Protocol hierarchy; the new texts are translated."""
+    f = shortcut_from_key
+    assert f("Escape", 0) == "cancel"
+    for k in ("Control_L", "Super_L", "Win_L", "Meta_R", "Alt_R"):
+        assert f(k, 0x4) is None, k
+    assert f("f", 0, "win32") == "bare"
+    assert f("f", 0x8, "win32") == "bare"            # Num Lock on
+    assert f("F", 0x1, "win32") == "bare"            # Shift only
+    assert f("f", 0x4, "win32") == "<Control-f>"
+    assert f("K", 0x5, "win32") == "<Control-Shift-K>"
+    assert f("f", 0x20000, "win32") == "<Alt-f>"
+    assert f("f", 0x8, "darwin") == "<Command-f>"
+    assert f("f", 0x8, "linux") == "<Alt-f>"
+    assert f("f", 0x40, "linux") == "<Mod4-f>"
+    assert f("F5", 0, "win32") == "<F5>"             # function keys alone
+    assert not usable_router_ip("192.168.1.255")
+    assert not usable_router_ip("255.255.255.255")
+    assert not usable_router_ip("224.0.0.251")
+    assert not usable_router_ip("not an ip")
+    assert usable_router_ip("192.168.1.1") and usable_router_ip("fe80::1")
+    m = NetworkModel(ctx.cfg())
+    bc, gw = "aa:aa:aa:aa:aa:01", "aa:aa:aa:aa:aa:02"
+    m.registry.by_key[bc] = types.SimpleNamespace(ip="192.168.1.255")
+    m.registry.by_key[gw] = types.SimpleNamespace(ip="192.168.1.1")
+    m.gw_mac_traffic[bc] += 50
+    m.gw_mac_traffic[gw] += 10
+    assert m.infer_gateway() == "192.168.1.1", m.infer_gateway()
+    rows = [{"ipver": 4, "tag": "ARP", "proto": "ARP", "length": 42},
+            {"ipver": 4, "transport": "UDP", "proto": "DNS", "length": 80}]
+    h = StatisticsView.hierarchy(rows)
+    assert h[("Frame", "Ethernet", "ARP")] == [1, 42], dict(h)
+    assert h[("Frame", "Ethernet", "IPv4")] == [1, 80], dict(h)
+    for text in ("Add Ctrl or Alt to that key: a letter, digit or symbol "
+                 "on its own would fire while you type.",
+                 "Active Scanning starts only on a network you trust.",
+                 "Demo Mode sends nothing, but this button goes online to "
+                 "download or check something. Go online anyway?",
+                 "“%s” replaces %s in the view. Nothing is captured live.",
+                 "Happening tab"):
+        for loc in ("fr", "es"):
+            assert translate_text(text, loc) != text, (loc, text)
 
 
 @self_test()

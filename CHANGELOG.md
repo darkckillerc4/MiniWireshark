@@ -27,6 +27,8 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **Connected helpers:** a Pi-hole or AdGuard Home certificate is checked before the password is sent.
 - **Windows:** the Npcap installer is no longer refused by its own signature check. **macOS:** an apostrophe in a folder name can't break the administrator prompt, and Wi-Fi is found without Apple's removed `airport` tool.
 - **Help → About** shows the version, the MIT licence and the Wireshark trademark notice.
+- **Leaving the demo never starts watching.** "Exit demo" used to start a real capture on your network card at once, with no question. Now it ends the demo and waits for you to click *Start watching*. The top line says *ACTIVE SCANNING* only on a network you marked as yours (after Stop it could say so on a network that was never checked). In Demo Mode, the Settings buttons that go online (update check, reference lists, data pack, country lookups, repair) ask first.
+- **50-tester crowd fixes.** A recorded shortcut can't be a bare letter any more (Win+F was saved as "f", so typing an f jumped to search), Command is understood on macOS and Num Lock is no longer read as Alt on Windows. Opening a file no longer says it "starts a fresh live session". A broadcast address is never named the router. ARP has its own line in the Protocol hierarchy instead of counting under IPv4. Help calls the Happening tab by its name.
 
 **New features**
 
