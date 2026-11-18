@@ -11757,12 +11757,15 @@ def _fast_tcp(d, raw, p, end, reasm):
         d["encrypted"] = "likely"
     load = raw[p + dataofs:end]
     # scapy takes DNS over TCP only when the length prefix fits the segment
+    dns = None
     if 53 in (sport, dport) and len(load) > 2 and \
             14 <= _U16.unpack_from(load, 0)[0] <= len(load):
         try:
-            text, learns, hint, info = wire_dns(load[2:], "DNS")
+            dns = wire_dns(load[2:], "DNS")
         except ValueError:
-            raise NeedDeepParse("odd dns/tcp")
+            dns = None                  # not DNS: a plain TCP row, no scapy
+    if dns is not None:
+        text, learns, hint, info = dns
         info["transport"] = "TCP"
         d.update({"proto": "DNS", "tag": "DNS", "text": text + " (TCP)",
                   "dns": info, "app_conf": "Observed"})
@@ -11855,13 +11858,18 @@ def _fast_udp(d, raw, p, end, reasm=None, room=None):
         raise NeedDeepParse("bad udp length")    # scapy's own reading
     load = bytes(raw[p + 8:end][:ulen - 8])
     d["payload_len"] = _udp_payload_len(ulen, room, len(load))
+    dns = None
     if (53 in ports or 5353 in ports or 5355 in ports) and len(load) >= 12:
         name = "mDNS" if 5353 in ports else "LLMNR" if 5355 in ports \
             else "DNS"
         try:
-            text, learns, hint, info = wire_dns(load, name)
+            dns = wire_dns(load, name)
         except ValueError:
-            raise NeedDeepParse("odd dns")
+            # third audit #1: not DNS, so a plain row by its port below,
+            # not scapy (6-17 ms a packet re-reading the junk as DNS)
+            dns = None
+    if dns is not None:
+        text, learns, hint, info = dns
         if dport == 53:
             d["plain_dns"] = True
         info["transport"] = "UDP"
@@ -92278,6 +92286,51 @@ def t_a2_udp_length_never_past_the_ip_packet(ctx):
             got = decode_packet(Ether(raw))["payload_len"]
             assert got == want, (got, want)
         assert not decoder_differences([(lie, 1.0, 1), (snapped, 1.0, 1)])
+
+
+def _a3_udp4(load, sport, dport, proto=17):
+    tl = 20 + (8 if proto == 17 else 0) + len(load)
+    hdr = struct.pack(">HHHH", sport, dport, 8 + len(load), 0) \
+        if proto == 17 else b""
+    return bytes(6) + b"\x02\x00\x00\x00\x00\x01\x08\x00" + \
+        struct.pack(">BBHHHBBH", 0x45, 0, tl, 0, 0, 64, proto, 0) + \
+        _socket.inet_aton("10.0.0.1") + _socket.inet_aton("10.0.0.2") + \
+        hdr + load
+
+
+@self_test()
+def t_a3_junk_dns_fails_fast(ctx):
+    """Third audit #1: what isn't DNS on ports 53, 5353 and 5355 (UDP or
+    TCP) is a plain row by its port from the fast decoder, not a scapy
+    re-read (6-17 ms a packet); real DNS still decodes."""
+    hdr = struct.pack(">HHHHHH", 1, 0x0100, 5, 0, 0, 0)    # 5 questions
+    chain = b"".join(b"\x01a" + struct.pack(">H", 0xC000 | (16 + 4 * i))
+                     for i in range(30)) + b"\x00"
+    hops = struct.pack(">HHHHHH", 1, 0x8180, 0, 200, 0, 0) + chain
+    hops += (b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 0)) * 110
+    tcp = struct.pack(">HHIIBBHHH", 5000, 53, 1, 0, 0x50, 0x18, 64240,
+                      0, 0) + struct.pack(">H", 1400) + b"\xff" * 1400
+    junk = [_a3_udp4(b"\xff" * 1400, 5000, p) for p in (53, 5353, 5355)] + \
+        [_a3_udp4(hdr, 5000, 53),                  # questions cut off
+         _a3_udp4(hdr[:4] + b"\x00\x01" + hdr[6:] + b"\xc0\x0c", 5000,
+                  53),                             # a name pointing at itself
+         _a3_udp4(hops, 53, 5000), _a3_udp4(tcp, 0, 0, proto=6)]
+    for raw in junk:
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())    # not declined
+        assert d["proto"] in ("UDP", "TCP") and d["dns"] is None and \
+            d["mdns"] is None, (d["proto"], d["text"])
+    assert _fast_decode(junk[0], 1.0, 1, None)["text"] == \
+        "Website lookup (DNS) (1400 bytes)"
+    q = _a3_udp4(struct.pack(">HHHHHH", 1, 0x0100, 1, 0, 0, 0) +
+                 b"\x07example\x03com\x00\x00\x01\x00\x01", 5000, 53)
+    assert fast_decode(q, 1.0)["text"] == "Looking up example.com"
+    t0, n = time.perf_counter(), 50
+    for _ in range(n):
+        for raw in junk:
+            fast_decode(raw, 1.0)
+    each = (time.perf_counter() - t0) / (n * len(junk))
+    # about 5-90 µs here; scapy took 1.5-6 ms
+    assert each < 0.0005, f"{each * 1e6:.0f} µs a junk packet"
 
 
 @self_test()
