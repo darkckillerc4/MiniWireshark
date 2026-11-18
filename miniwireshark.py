@@ -24508,11 +24508,15 @@ class NetworkModel:
         # the device's current name instead of three names for one device
         dv = self.registry.by_key.get(device) if device else None
         if dv is not None and not named:
-            nm, sn = dv.display_name(), sentence_device_name(dv)
+            # third audit (UI): this computer and the router without a
+            # name of their own are "This computer" and "Your router", as
+            # in the alerts (they were "Device using a private Wi-Fi
+            # address (…)" next to "family-nas joined your network")
+            nm, sn = dv.display_name(), self.alert_device_name(dv)
             if sn != nm and nm and nm in text:
                 text = entry["text"] = text.replace(nm, sn, 1)
         if dv is not None:
-            nm = named or sentence_device_name(dv)
+            nm = named or self.alert_device_name(dv)
             if nm and nm in text:
                 entry["name"] = nm
         self.timeline.append(entry)
@@ -24535,7 +24539,10 @@ class NetworkModel:
         if dev.device_class == "This computer" or \
                 (dev.ip and dev.ip in self.my_ips):
             return "This computer"
-        if dev.ip and dev.ip == self.gateway_ip and looks_like_address(n):
+        # third audit (UI): a router with a private Wi-Fi address was
+        # "Device using a private Wi-Fi address (192.168.50.1)" in the
+        # Timeline; without a name of its own it is "Your router"
+        if dev.ip and dev.ip == self.gateway_ip:
             return "Your router"
         return n
 
@@ -33738,7 +33745,10 @@ def timeline_text(model, e):
     dev = reg.by_key.get(reg.resolve(key))
     if dev is None:
         return text
-    new = sentence_device_name(dev)
+    # third audit (UI): "This computer" / "Your router" when they have no
+    # name of their own, as the alerts say
+    namer = getattr(model, "alert_device_name", None)
+    new = namer(dev) if namer is not None else sentence_device_name(dev)
     if looks_like_address(new) and not looks_like_address(old):
         return text           # "A device got address …" stays readable
     return text.replace(old, new, 1) if new and new != old else text
@@ -33783,6 +33793,11 @@ def translate_event(text):
                 hit = ({"fr": f"Appareil {maker}",
                         "es": f"Dispositivo {maker}"}.get(loc, g1) +
                        hit[len(g1):])
+            elif g1 in ("This computer", "Your router") and \
+                    hit.startswith(g1):
+                # third audit (UI): the names the Timeline now gives this
+                # computer and the router stayed English in a sentence
+                hit = table.get(g1, g1) + hit[len(g1):]
             break
     if hit is not None:
         hit = translate_anonymous_labels(hit, loc)
@@ -101000,6 +101015,61 @@ def t_c11_nameless_devices_told_apart(ctx):
         "address (self-assigned 169.254.12.34)", sentence_device_name(lone)
     assert translate_text(sentence_device_name(lone), "fr") == \
         "Appareil sans adresse réseau (169.254.12.34 auto-attribuée)"
+
+
+@self_test()
+def t_a3_timeline_names_own_devices(ctx):
+    """Third audit (UI): this computer and the router, when they have no
+    name of their own (a private Wi-Fi address), are "This computer" and
+    "Your router" in the Timeline, as in the alerts; they were "Device
+    using a private Wi-Fi address (192.168.50.10) joined your network"
+    next to "family-nas joined your network". French and Spanish say the
+    names in their own words."""
+    m = NetworkModel(ctx.cfg(), "192.168.50.1", ["192.168.50.10"],
+                     ["a6:3b:12:9e:44:10"])
+    m.set_identity(local_nets=[ipaddress.ip_network("192.168.50.0/24")])
+    reg = m.registry
+    label = "Device using a private Wi-Fi address"
+    me = DeviceRecord(key="a6:3b:12:9e:44:10", ip="192.168.50.10",
+                      mac="a6:3b:12:9e:44:10")
+    gw = DeviceRecord(key="a6:3b:12:9e:44:01", ip="192.168.50.1",
+                      mac="a6:3b:12:9e:44:01")
+    other = DeviceRecord(key="a6:3b:12:9e:44:77", ip="192.168.50.77",
+                         mac="a6:3b:12:9e:44:77")
+    for d in (me, gw, other):
+        d.randomized_mac = True
+        reg.by_key[d.key] = d
+    assert all(d.display_name() == label for d in (me, gw, other)), \
+        [d.display_name() for d in (me, gw, other)]
+    want = {me.key: "This computer joined your network",
+            gw.key: "Your router joined your network",
+            other.key: f"{label} (192.168.50.77) joined your network"}
+    for d in (me, gw, other):
+        e = m.push_timeline("new device", "INFO",
+                            f"{d.display_name()} joined your network",
+                            ("device", d.key), d.key)
+        assert e["text"] == want[d.key], e["text"]
+        assert timeline_text(m, e) == want[d.key], timeline_text(m, e)
+    # an entry stored before (an older history) is shown with the name too
+    old = {"text": f"{label} (192.168.50.10) joined your network",
+           "name": f"{label} (192.168.50.10)", "device": me.key}
+    assert timeline_text(m, old) == want[me.key], timeline_text(m, old)
+    # a name of its own still wins
+    me.alias = "Study PC"
+    assert timeline_text(m, old) == "Study PC joined your network"
+    me.alias = ""
+    was = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        fr = [translate_event(want[k]) for k in (me.key, gw.key)]
+        set_locale("es")
+        es = [translate_event(want[k]) for k in (me.key, gw.key)]
+    finally:
+        set_locale(was)
+    assert fr == ["Cet ordinateur a rejoint votre réseau",
+                  "Votre box a rejoint votre réseau"], fr
+    assert es == ["Este equipo se ha unido a su red",
+                  "Su router se ha unido a su red"], es
 
 
 @gui_test_step("5.3.4 crowd #12: packet view — the details keep room, a "

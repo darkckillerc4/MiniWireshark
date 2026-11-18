@@ -153,6 +153,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - Timeline Story mode: each day's heading reads "Today · 2 changes" in the *What happened* column, and the *Type* column says what a line is about (Devices, Websites, Alerts …) instead of "×5"; the sentence already says how many times.
 - The Dashboard's ALERTS card names its counts ("Danger 0 · Warning 1 · Info 5") instead of three bare numbers behind symbols.
 - The Map legend says what the letter on a device means: how sure MiniWireshark is that it is a real device (H high, M medium, L low, ? unconfirmed).
+- The Timeline calls this computer and the router "This computer" and "Your router" when they have no name of their own, as the alerts do. They were "Device using a private Wi-Fi address (192.168.50.10) joined your network".
 - French: a fact another system told MiniWireshark is called "Signalé" everywhere (it was "rapporté" in places), and a correlated one "Corrélé" (it was "Recoupé" in the evidence key).
 - Pressing Stop while MiniWireshark was restarting a capture that had stopped by itself no longer starts the capture again a few seconds later.
 - The help for the Beginner view now names all the tabs it hides: Connections, Internet hosts, Packets and Sources.
