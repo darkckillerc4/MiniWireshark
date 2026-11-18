@@ -92879,12 +92879,16 @@ def t_534_loop_replay_bounded(ctx):
     sets fed faster than a tick drains grew without bound. Now both
     stop at a cap and a big backlog becomes one table refill."""
     c = LookupCorrelator()
+    # third audit: the loops were c.MAX long, so the old 200,000 cap
+    # passed too. Fixed numbers now: 25,000 new names a loop must stop
+    # at 20,000
     for loop in range(3):                          # same times each loop
-        for i in range(c.MAX):
+        for i in range(25000):
             c.note_resolution("d", "s.example", "10.%d.%d.%d" % (
                 loop, i // 250, i % 250), 1000.0 + i * 0.01)
-    assert len(c.order) <= c.MAX and len(c.by_dev_ip) <= c.MAX
-    assert len(c.by_ip) <= c.MAX
+    assert len(c.order) <= 20000 and len(c.by_dev_ip) <= 20000, \
+        len(c.order)
+    assert len(c.by_ip) <= 20000, len(c.by_ip)
     assert c.match("d", "10.2.79.249", 1200.0)[0] == "s.example"
     m = scenario_model(ctx.cfg(), [])
     got = []
