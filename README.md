@@ -158,11 +158,11 @@ Found a security issue? See [SECURITY.md](SECURITY.md).
 
 ## Your data and uninstalling
 
-Everything MiniWireshark creates goes into one data folder: `miniwireshark_data/` next to the script when that folder is writable, otherwise `%LOCALAPPDATA%\MiniWireshark` (Windows), `~/Library/Application Support/MiniWireshark` (macOS) or `~/.local/share/miniwireshark` (Linux). Settings are in `miniwireshark_config.json` next to the script.
+Everything MiniWireshark creates goes into one data folder: `miniwireshark_data/` next to the script when that folder is writable, otherwise `%LOCALAPPDATA%\MiniWireshark` (Windows), `~/Library/Application Support/MiniWireshark` (macOS) or `~/.local/share/miniwireshark` (Linux). Settings are in `miniwireshark_config.json`: next to the script when that folder is yours and nobody else can write to it, otherwise in the data folder.
 
 Those files describe your own network: device names, addresses and saved sessions. Don't attach them to a public issue. **Storage used…** in the command palette (`Ctrl+K`) shows what each part takes.
 
-To uninstall, delete `miniwireshark.py`, the data folder and `miniwireshark_config.json`. The few other places are listed in [Installation](docs/INSTALL.md#uninstalling).
+To uninstall, delete `miniwireshark.py`, the data folder and `miniwireshark_config.json` if it is next to the script. The few other places are listed in [Installation](docs/INSTALL.md#uninstalling).
 
 ## Troubleshooting
 
