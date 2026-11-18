@@ -63874,6 +63874,16 @@ proc ::mw_explicit_fonts {top names} {
         lw = getattr(self, "listen_watch", None)
         if lw is not None:
             lw.known, lw.learning = {}, True
+        # third audit #1: the crash journal was rewritten from the model
+        # still in memory within 30 s; start afresh like New session, no Undo
+        job = getattr(getattr(self, "jobs", None), "active", {}).get(
+            "journal")
+        if job is not None:
+            job.cancelled = True
+        self.clear(confirmed=True)
+        self.model.baselines.reset()     # may be read before the delete ran
+        self._keep_undo(None)
+        self._banner_action(None)
         self._journal_written = False
         self._journal_count = -1
         gone = 0
@@ -102298,17 +102308,40 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
             f.write('{"seen": "192.168.1.77 example.com"}')
     keep = (app.known.data, app.networks.data, app.network_profile,
             app.history)
+    # third audit #1: the model stays whole for the steps after this one
+    was = (app.model, list(app.all_rows), app.count, set(app.bookmarks),
+           app.data_mode, app.data_label)
+    site = sorted(app.model.websites)[0]
+    ip = sorted(d.ip for d in app.model.registry.by_key.values()
+                if d.ip and d.ip != app.model.gateway_ip)[0]
     asked = []
     real = (messagebox.askyesno, messagebox.askyesnocancel)
     messagebox.askyesno = lambda *a, **k: asked.append(a) or True
     messagebox.askyesnocancel = lambda *a, **k: asked.append(a) or True
     try:
+        app.data_mode = "live"
+        app.write_journal()
+        with open(PATHS.journal, encoding="utf-8") as f:
+            assert site in f.read()
         app.history = None                       # history off (default)
         app.clear_history()
         _gui_pump(root, 0.1)
         assert len(asked) == 1, asked
         left = [p for p in planted if os.path.exists(p)]
         assert not left, left
+        # third audit #1: the next journal tick writes nothing old
+        assert not app.model.has_data() and app._clear_undo is None
+        app.data_mode = "live"
+        app._journal_tick()
+        _gui_pump(root, 1.0, until=lambda: not app.jobs.active)
+        scratch = os.path.dirname(ctx.path("x"))    # the test's own pcap
+        for top, _dirs, names in os.walk(PATHS.data):
+            for n in names if not top.startswith(scratch) else ():
+                with contextlib.suppress(OSError), \
+                        open(os.path.join(top, n), "rb") as f:
+                    blob = f.read()
+                    assert site.encode() not in blob and \
+                        ip.encode() not in blob, (n, site, ip)
         assert not history_record_files(), history_record_files()
         assert app.known.data == {} and \
             app.networks.data == {"networks": {}}
@@ -102318,7 +102351,7 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
                 f.write("{}")
         cleared = []
         app.history = types.SimpleNamespace(
-            clear=lambda *a: cleared.append(a))
+            clear=lambda *a: cleared.append(a), load_baselines=dict)
         asked.clear()
         app.clear_history()
         assert cleared == [()] and len(asked) == 1, (cleared, asked)
@@ -102329,6 +102362,13 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
         messagebox.askyesno, messagebox.askyesnocancel = real
         (app.known.data, app.networks.data, app.network_profile,
          app.history) = keep
+        app.replace_model(was[0])
+        app.all_rows.extend(was[1])
+        app.count = was[2]
+        app.bookmarks.update(was[3])
+        app.data_mode, app.data_label = was[4], was[5]
+        with contextlib.suppress(tk.TclError, KeyError, AttributeError):
+            app.tabs["packets"].rebuild()
 
 
 @gui_test_step("second audit privacy #8: with history off, closing keeps no "
