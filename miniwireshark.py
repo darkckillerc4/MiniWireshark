@@ -26756,6 +26756,33 @@ def config_beside_app_ok(default_path):
     return _dir_writable(folder)
 
 
+def config_beside_app_note(default_path, used_path):
+    """Third audit (install #28): a settings file next to the program
+    that the rule above turned down (most often a folder of your own that
+    your group may write to, as umask 002 makes them) was passed over
+    without a word, so an upgrade seemed to lose the settings. It stays
+    unused: a group can have other members, and the file decides where
+    updates come from. -> a plain-words note the first time (while the
+    data folder has no settings file yet), else "". Always logged."""
+    if os.path.abspath(default_path) == os.path.abspath(used_path) or \
+            not os.path.lexists(default_path):
+        return ""
+    folder = os.path.dirname(os.path.abspath(default_path))
+    LOG.warning("settings next to the program not used (others could "
+                "change %s); using %s", default_path, used_path)
+    if os.path.lexists(used_path):
+        return ""
+    how = "" if IS_WINDOWS else (
+        f" If no one else is in your user group, close the folder to "
+        f"others with chmod go-w \"{folder}\" \"{default_path}\" and "
+        f"start MiniWireshark again to use your old settings.")
+    return ("Your old settings file next to MiniWireshark was not used, "
+            "because other people on this computer could change it or "
+            f"its folder ({folder}). This run starts with the default "
+            f"settings, kept from now on in {os.path.dirname(used_path)}."
+            + how)
+
+
 # second audit (settings #21): values a choice also takes besides its
 # labels (a colour-blind code, any "N %" scale)
 CHOICE_ALSO_OK = {
@@ -26833,12 +26860,14 @@ class AppConfig:
         default_path = os.path.join(APP_HOME, "miniwireshark_config.json")
         if path is None:
             path = os.environ.get("MINIWIRESHARK_CONFIG")
+        beside_note = ""
         if path is None:
             # second audit (install #28): the data folder's rule applies
             if config_beside_app_ok(default_path):
                 path = default_path
             else:
                 path = os.path.join(PATHS.data, "miniwireshark_config.json")
+                beside_note = config_beside_app_note(default_path, path)
         self.path = path
         self.warning = ""
         # the version that last showed the Welcome Center, as the file said
@@ -26848,6 +26877,8 @@ class AppConfig:
         self.repaired = []           # keys set back to their defaults
         self._disk_sig = None        # what this copy last read or wrote
         self.data = self._load()
+        if beside_note and not self.warning:
+            self.warning = beside_note
         self._base = _json_copy(self.data)
 
     def _parse(self, raw):
@@ -101818,6 +101849,41 @@ def t_a3_settings_of_any_shape_load(ctx):
                 CONFIG_SCHEMA_VERSION
 
 
+@self_test()
+def t_a3_settings_left_beside_the_program_are_named(ctx):
+    """Third audit (install #28): a settings file next to the program in
+    a folder of your own that your group may write to (umask 002) is not
+    used, as before, but it is no longer passed over without a word: the
+    first start says why and how to close the folder, once."""
+    if IS_WINDOWS:
+        return "skip"
+    prog = ctx.path("a3_group_dir")
+    os.makedirs(prog, exist_ok=True)
+    os.chmod(prog, 0o775)
+    data = ctx.path("a3_group_data")
+    os.makedirs(data, exist_ok=True)
+    os.chmod(data, 0o700)
+    name = "miniwireshark_config.json"
+    old = os.path.join(prog, name)
+    with open(old, "w", encoding="utf-8") as f:
+        json.dump({"appearance": {"theme": "Dark"}}, f)
+    os.chmod(old, 0o644)
+    assert not config_beside_app_ok(old)
+    with _b9_patched(globals(), APP_HOME=prog, SCRIPT_DIR=prog), \
+            _b9_patched(PATHS, data=data), \
+            _b9_patched(os.environ, MINIWIRESHARK_CONFIG=None):
+        c = AppConfig()
+        assert c.path == os.path.join(data, name), c.path
+        assert c.get("appearance.theme") == "Light"
+        assert "was not used" in c.warning and "chmod go-w" in c.warning \
+            and prog in c.warning, c.warning
+        assert c.save()
+        assert not AppConfig().warning               # said once
+        os.chmod(prog, 0o755)                        # closed: used again
+        c = AppConfig()
+        assert c.path == old and c.get("appearance.theme") == "Dark"
+        assert not c.warning
+    assert not config_beside_app_note(old, old)
 
 
 @self_test()
