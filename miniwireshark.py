@@ -10158,13 +10158,12 @@ def _udp_payload_len(ulen, room, have):
     than the bytes there are (`have`). Audit 2026-11-14 #48: a 10-byte
     datagram claiming 65535 showed "Quick message (65527 bytes)" and fed
     that size to the QUIC check. A capture cut short (a snap length) keeps
-    the size the headers agree on."""
-    n = ulen - 8
-    if room is not None and 8 <= room < ulen:
-        n = room - 8
-    elif room is not None and room < 8:
-        n = min(n, have)
-    return max(0, n)
+    the size the headers agree on. Third audit #3: only when they agree
+    exactly; otherwise never more than the bytes there are (an IP length
+    of 0 or 65535 on a 12-byte datagram said 65527 or 65507 bytes)."""
+    if room == ulen:
+        return max(0, ulen - 8)
+    return max(0, min(ulen - 8, have))
 
 
 def _udp_ip_room(u):
@@ -92391,6 +92390,37 @@ def t_a3_ipv6_fragment_and_cut_chain_fast(ctx):
     if ctx.scapy_ok:
         diffs = decoder_differences([(r, 1.0, 1) for r, _t in cases])
         assert not diffs, diffs[:3]
+
+
+@self_test()
+def t_a3_udp_length_checked_against_ip_and_bytes(ctx):
+    """Third audit #3: a UDP size is never more than the bytes captured
+    unless the IP and UDP lengths agree (a snap length), and Ethernet
+    padding is cut at the smaller of the two lengths."""
+    def frame(load, ulen, total, pad=b""):
+        return bytes(6) + b"\x02\x00\x00\x00\x00\x01\x08\x00" + \
+            struct.pack(">BBHHHBBH", 0x45, 0, total, 0, 0, 64, 17, 0) + \
+            _socket.inet_aton("10.0.0.1") + _socket.inet_aton("10.0.0.2") + \
+            struct.pack(">HHHH", 40000, 443, ulen, 0) + load + pad
+    cases = [(frame(bytes(4), 65535, 0), 4),            # IP length 0
+             (frame(bytes(4), 65535, 65535), 4),        # both lie, apart
+             (frame(bytes(4), 12, 65535), 4),           # IP lies
+             (frame(bytes(4), 65535, 32), 4),           # UDP lies
+             (frame(bytes(10), 12, 38, pad=bytes(8)), 4),   # UDP is shorter
+             (frame(bytes(4), 12, 32, pad=bytes(18)), 4),   # padding
+             (frame(bytes(60), 1408, 1428), 1400)]      # snap length
+    for raw, want in cases:
+        d = fast_decode(raw, 1.0)
+        assert d["payload_len"] == want, (d["payload_len"], want)
+    assert _udp_payload_len(12, None, 4) == 4
+    assert _udp_payload_len(65535, None, 4) == 4
+    assert _udp_payload_len(1408, 1408, 60) == 1400
+    short = frame(bytes(4), 5, 32)              # length under 8: scapy's
+    assert fast_decode(short, 1.0)["payload_len"] <= 4
+    if ctx.scapy_ok:
+        for raw, want in cases:
+            got = decode_packet(Ether(raw))["payload_len"]
+            assert got == want, (got, want)
 
 
 @self_test()

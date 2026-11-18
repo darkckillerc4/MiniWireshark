@@ -186,6 +186,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - Stopping MiniWireshark with Ctrl+C while it starts ends with exit code 130 instead of 0.
 - The network check's DNS lookup gives up at its time limit even when other answers keep arriving.
 - The network-card pick reads a card's state when the capture library gives it as a number, and checks "your router is on the same network" against the card's real network instead of assuming a /24.
+- **A UDP message's size is checked against the bytes there are.** With an IP length of 0, or IP and UDP lengths that both claim far more than the packet holds, a 12-byte message showed as 65,527 or 65,507 bytes and fed that size to the QUIC check. It now shows the bytes captured. A capture cut short by a snap length still shows the full size when the IP and UDP lengths agree.
 
 **Known limits**
 
