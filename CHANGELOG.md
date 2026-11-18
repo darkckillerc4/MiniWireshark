@@ -64,6 +64,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
   - Old history now also removes its records of saved packet files. Before, these records stayed after the files were deleted.
 
   This was measured in a 30-hour fast replay of the analysis, with 20 devices that meet 40 new websites a minute. From hour 6 to hour 30, memory grew by 6 MB, and not at all after hour 24. Before these changes it grew by 33 MB and was still growing at hour 30.
+- **Saving the session holds less memory.** The session file, and the crash copy written every 30 seconds while capturing, are written piece by piece. Before, the whole session (24 MB with 10,000 websites) was first built in memory two or three times over, every 30 seconds, and memory crept up with each copy.
 - **The window keeps fewer rows.** The Remote hosts table keeps at most 5,000 rows. The Alerts tab drops the rows of alerts that the alert list has already let go. The Timeline and the live feed let go of what they kept for rows they had already removed. The Connections table drops rows for connections that have already been forgotten.
 - **Background timers no longer pile up.** The network check and the restart counter now keep one timer each. In the 500-round test, the window's timers grew from 13 to 27; now they stay at 13 to 15.
 - **Two new tests: "memory stays flat in fast time".** One runs the analysis, the other runs the whole window through hours of made-up traffic, with the size limits made 80 times smaller so that they fill up:

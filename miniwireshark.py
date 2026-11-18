@@ -754,11 +754,16 @@ def _open_new_tmp(tmp, mode, encoding=None):
 
 def _atomic_write(path, data, mode, encoding=None):
     """(5.3.4 review) on disk before the rename, so a power cut cannot
-    leave an empty file; the temporary file never stays."""
+    leave an empty file; the temporary file never stays. (third audit)
+    `data` can also be a function that writes to the open file itself,
+    in pieces, so a large file is never held in memory whole."""
     tmp = _tmp_name(path)
     try:
         with _open_new_tmp(tmp, mode, encoding=encoding) as f:
-            f.write(data)
+            if callable(data):
+                data(f)
+            else:
+                f.write(data)
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
@@ -51020,21 +51025,30 @@ class Job:
         if self.cancelled:
             raise JobCancelled()
 
-    def pieces_under_gate(self, gate, pieces, total=None):
+    def pieces_under_gate(self, gate, pieces, total=None, each=None):
         """Take items from the iterator `pieces`, each one while holding
-        the gate, giving the window its turn between them. -> list."""
+        the gate, giving the window its turn between them. -> list.
+        (third audit) With `each`, every item is handed to it (outside
+        the gate) and not kept: the list comes back empty."""
         out = []
+        n = 0
         it = iter(pieces)
         while True:
             with gate:
                 try:
-                    out.append(next(it))
+                    piece = next(it)
                 except StopIteration:
                     break
                 seen = gate.tk_entries
+            n += 1
+            if each is None:
+                out.append(piece)
+            else:
+                each(piece)
+            piece = None
             gate.yield_to_tk(seen)
             if total:
-                self.progress(min(0.95, len(out) / total))
+                self.progress(min(0.95, n / total))
             elif self.cancelled:
                 raise JobCancelled()
         return out
@@ -54258,8 +54272,12 @@ class MiniWireshark:
 
         def run(job):
             body(job)
+            h = hashlib.sha256()
             with open(part, "rb") as f:
-                digest = hashlib.sha256(f.read()).hexdigest()
+                # third audit: 1 MB at a time, not the whole file at once
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+            digest = h.hexdigest()
             os.replace(part, path)
             atomic_write_json(path + ".sha256", {
                 "journal": 2, "saved_at": time.time(), "sha256": digest,
@@ -61542,15 +61560,23 @@ proc ::mw_explicit_fonts {top names} {
                 // 300 + 14)
 
         def run(job):
-            parts = job.pieces_under_gate(
-                gate, SessionCodec.iter_json(model, meta), total=n)
-            text = "".join(parts)
+            # third audit (memory): the pieces go to the file as they are
+            # made. Joined first, the whole session (24 MB with 10,000
+            # websites) was held two or three times over, every 30 s for
+            # the crash copy, and memory crept up with each copy
+            def pieces(write):
+                job.pieces_under_gate(
+                    gate, SessionCodec.iter_json(model, meta), total=n,
+                    each=write)
             if str(path).lower().endswith(".gz"):
                 # 5.1.2: opt-in, several times smaller
-                atomic_write_bytes(path, gzip.compress(text.encode("utf-8"),
-                                                       compresslevel=6))
+                def write_gz(f):
+                    with gzip.GzipFile(fileobj=f, mode="wb",
+                                       compresslevel=6) as z:
+                        pieces(lambda p: z.write(p.encode("utf-8")))
+                atomic_write_bytes(path, write_gz)
             else:
-                atomic_write_text(path, text)
+                atomic_write_text(path, lambda f: pieces(f.write))
             return path
         return run
 
@@ -93010,6 +93036,51 @@ def t_534_lan_tallies_capped(ctx):
     win = types.SimpleNamespace(MINIMIZED_KEEP=50, _rebuild_on_restore=False)
     MiniWireshark._trim_queues_minimized(win, m)
     assert not reg.rekeyed and win._rebuild_on_restore
+
+
+@self_test()
+def t_534_session_saved_in_pieces(ctx):
+    """Third audit (memory): saving the session, and the crash copy made
+    every 30 s while live, joined the whole session into one text first
+    (24 MB with 10,000 websites, held two or three times over), and
+    memory crept up with each copy. The pieces now go to the file as
+    they are made: the most held at once is a small part of the file,
+    and the file (plain or .gz) reads back as the same session."""
+    import tracemalloc
+    if tracemalloc.is_tracing():
+        return "skip"
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    for i in range(8000):
+        m.register_website("s%d.piece%d.example.com" % (i, i % 50),
+                           "34.%d.%d.%d" % (i // 62500, i // 250 % 250,
+                                            1 + i % 250), None, "DNS")
+    app = types.SimpleNamespace(
+        model=m, gate=GuiGate(),
+        session_meta=lambda: {"data_source": "live", "interface": "eth0"})
+    got = {}
+    for name in ("s.mwsession.json", "s.mwsession.json.gz"):
+        path = ctx.path(name)
+        run = MiniWireshark.session_text_job(app, path)
+        tracemalloc.start()
+        try:
+            assert run(Job("t", "", None)) == path
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        size = os.path.getsize(path)
+        got[name] = read_session_payload(path)
+        if not name.endswith(".gz"):
+            assert size > 1_000_000, size
+            plain = size
+        # joined, the text alone was the size of the file (twice, with
+        # the list of pieces); now a few pieces at most
+        assert peak < plain / 2, (name, peak, plain)
+        assert not [n for n in os.listdir(ctx.tmp) if ".tmp" in n]
+    a, b = got["s.mwsession.json"], got["s.mwsession.json.gz"]
+    assert len(a["websites"]) == len(m.websites) >= 8000
+    a.pop("exported_at", None)
+    b.pop("exported_at", None)
+    assert a == b
 
 
 @self_test(needs_source=True)
