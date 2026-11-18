@@ -4121,7 +4121,7 @@ class LoaderWindow(tk.Frame):
                         "skip": ("–", self.muted)}.get(state,
                                                        ("○", self.muted))
         lb.configure(text=f"{glyph} {name}", fg=color,
-                     font=("TkDefaultFont", 9,
+                     font=default_font(9,
                            "bold" if state == "active" else "normal"))
 
     def _set_health(self, kind):
@@ -4719,8 +4719,8 @@ def warm_heading_widths(root, current_scale=1.0, budget_s=3.0):
         if abs(scale - current_scale) < 1e-6:
             continue
         with contextlib.suppress(tk.TclError):
-            fonts.append(tkfont.Font(root=root, font=(
-                "TkDefaultFont", int(round(10 * scale)), "bold")))
+            fonts.append(tkfont.Font(root=root, font=default_font(
+                int(round(10 * scale)), "bold")))
     if CURRENT_LOCALE != "en":      # _i18n_fit_heading's named font
         with contextlib.suppress(tk.TclError, KeyError):
             a = tkfont.nametofont("TkHeadingFont").actual()
@@ -36894,6 +36894,10 @@ class SettingsWindow:
     F_TITLE = ("TkDefaultFont", 15, "bold")
 
     def __init__(self, app, page="general"):
+        # third audit: the same sizes in TkDefaultFont's real family (see
+        # default_font); the class keeps the tuples as the reference
+        for attr in ("F_BASE", "F_HELP", "F_SECTION", "F_TITLE"):
+            setattr(self, attr, default_font(*getattr(self, attr)[1:]))
         self.app = app
         self.cfg = app.config
         self.defaults = _default_config()
@@ -37599,7 +37603,7 @@ class SettingsWindow:
                     cv.create_rectangle(x, 8, x + 22, 30, fill=col,
                                         outline="")
                     cv.create_text(x + 30, 19, text=label, anchor="w",
-                                   fill=col, font=("TkDefaultFont", 10,
+                                   fill=col, font=default_font(10,
                                                    "bold"))
                     x += 150
                 x = 8
@@ -39296,6 +39300,16 @@ def mw_font(size, *style):
 MW_FONT_SCALE = [1.0]
 
 
+def default_font(size, *style):
+    """Third audit: a font tuple of TkDefaultFont's family at a fixed
+    size, for the canvases, table tags, the table style and Settings,
+    which carried their own ("TkDefaultFont", n) tuples. Tk reads that as
+    an unknown family: right with Xft, the bitmap "fixed" font at one size
+    on a Tk without Xft. Unlike mw_font it does not follow the text size
+    (the callers size it themselves, or stay as they were)."""
+    return (_mw_family(), size) + tuple(style)
+
+
 def _mw_family():
     """The family mw_font builds on. In a font tuple Tk reads
     "TkDefaultFont" as a family name, not the named font. On X11 with
@@ -39806,7 +39820,7 @@ class Charts:
         labels and the title are measured so that none of them overlap
         (V5.0.2: they did with long labels, translations or a short
         chart)."""
-        small, bold = ("TkDefaultFont", 8), ("TkDefaultFont", 10, "bold")
+        small, bold = default_font(8), default_font(10, "bold")
         fs, fb = cls.font(c, small), cls.font(c, bold)
         title = translate_text(title)
         tw = fb.measure(title) if title else 0
@@ -39869,7 +39883,7 @@ class Charts:
                       fill=t["muted_fg"], text=x1, font=small)
         if vmax <= 0:
             c.create_text(left + pw / 2, top + ph / 2, text=empty,
-                          fill=t["muted_fg"], font=("TkDefaultFont", 9))
+                          fill=t["muted_fg"], font=default_font(9))
         for i, (label, vals, color) in enumerate(series):
             if not vals:
                 continue
@@ -39960,8 +39974,8 @@ class Charts:
         """items: list of (label, value, value_text, click_key). Labels
         and values are cut to their column, so a long device name or a
         value never runs into the chart beside it."""
-        bold, norm, small = (("TkDefaultFont", 10, "bold"),
-                             ("TkDefaultFont", 9), ("TkDefaultFont", 8))
+        bold, norm, small = (default_font(10, "bold"),
+                             default_font(9), default_font(8))
         tid = c.create_text(x, y, anchor="nw", text=cls.elide(
             c, translate_text(title), bold, w), fill=t["text_fg"],
             font=bold)
@@ -41661,7 +41675,7 @@ class TimelineTab(BaseTab):
                 c.create_line(x, 0, x, h, fill=t["warn_fg"], width=2)
                 c.create_text(min(w - 30, x + 4), 2, anchor="nw",
                               text=hm_clock(asof), fill=t["warn_fg"],
-                              font=("TkDefaultFont", 8, "bold"))
+                              font=default_font(8, "bold"))
 
     def _strip_click(self, e):
         with contextlib.suppress(tk.TclError):
@@ -41787,11 +41801,11 @@ class TimelineTab(BaseTab):
                 self.tree.tag_configure(sev, foreground=fg,
                                         background=bg or "")
         with contextlib.suppress(tk.TclError):
-            self.tree.tag_configure("episode", font=("TkDefaultFont", 10,
+            self.tree.tag_configure("episode", font=default_font(10,
                                                      "bold"),
                                     background=self.t["card_bg"])
             self.tree.tag_configure("story_mark", foreground=self.t[
-                "warn_fg"], font=("TkDefaultFont", 9, "bold"))
+                "warn_fg"], font=default_font(9, "bold"))
 
     def _schedule_rebuild(self):
         if self._rebuild_job:
@@ -44692,7 +44706,7 @@ class MapTab(BaseTab):
         txt = self.c.create_text(e.x + 14, e.y + 12, anchor="nw",
                                  text=f"{node[2]}\n{node[3]}",
                                  fill=t["tooltip_fg"],
-                                 font=("TkDefaultFont", 9))
+                                 font=default_font(9))
         bb = self.c.bbox(txt)
         if bb:
             rect = self.c.create_rectangle(bb[0] - 5, bb[1] - 4, bb[2] + 5,
@@ -44799,12 +44813,12 @@ class MapTab(BaseTab):
             lid = self.c.create_text(X, Y, text=letter,
                                      fill=t["tab_bg"] if not hollow
                                      else fill, tags=tag,
-                                     font=("TkDefaultFont", 8, "bold"))
+                                     font=default_font(8, "bold"))
             self.nodes[lid] = (kind, key, label, info)
         if show_label:
             tid = self.c.create_text(X, Y + R + 8, text=label[:22],
                                      fill=t["text_fg"], tags=tag,
-                                     font=("TkDefaultFont", 8,
+                                     font=default_font(8,
                                            "bold" if sel else "normal"))
             self.nodes[tid] = (kind, key, label, info)
             self._place_label(tid, X, Y, R, label, sel)
@@ -44838,7 +44852,7 @@ class MapTab(BaseTab):
             k = R * 0.7
             sid = c.create_text(X + k, Y - k, text="★", anchor="sw",
                                 fill=t["warn_fg"], tags=(f"n:{key}", "ov"),
-                                font=("TkDefaultFont", 10))
+                                font=default_font(10))
             for x, y, anchor in ((X + k, Y - k, "sw"), (X - k, Y - k, "se"),
                                  (X + k, Y + k, "nw"), (X - k, Y + k, "ne")):
                 c.coords(sid, x, y)
@@ -45029,7 +45043,7 @@ class MapTab(BaseTab):
             tt = self.c.create_text(X0, Y0 - R0 - 12,
                                     text="YOUR LOCAL NETWORK",
                                     fill=t["muted_fg"], tags=("deco",),
-                                    font=("TkDefaultFont", 9,
+                                    font=default_font(9,
                                           "bold"))
             if self.c.bbox(tt):
                 self._label_boxes = [self.c.bbox(tt)]
@@ -45130,7 +45144,7 @@ class MapTab(BaseTab):
             it = self.c.create_text(X, self.P(0, ty)[1],
                                     text="INTERNET (outside your network)",
                                     fill=t["muted_fg"], tags=("deco",),
-                                    font=("TkDefaultFont", 9,
+                                    font=default_font(9,
                                           "bold"))
             if self.c.bbox(it):
                 self._label_boxes = getattr(self, "_label_boxes", []) + [
@@ -45262,7 +45276,7 @@ class MapTab(BaseTab):
         for label, x in zip(("Devices", "Websites", "Remote hosts"), cols):
             X, Y = self.P(x, 16)
             self.c.create_text(X, Y, text=label, fill=t["muted_fg"],
-                               font=("TkDefaultFont", 9, "bold"))
+                               font=default_font(9, "bold"))
 
         def positions(items, keyfn):
             n = max(len(items), 1)
@@ -45534,7 +45548,7 @@ class HealthTab(BaseTab):
             bw = (w - 20) / n
             base = h - 22
             # labels that would touch: show every second (or third) one
-            fnt = Charts.font(c, ("TkDefaultFont", 7))
+            fnt = Charts.font(c, default_font(7))
             widest = max(fnt.measure(x) for x in DNS_BUCKET_LABELS) + 6
             step = max(1, int(math.ceil(widest / max(1.0, bw))))
             slow = _float(self.app.config.get("dns.slow_ms", 800), 800)
@@ -45550,14 +45564,14 @@ class HealthTab(BaseTab):
                                        outline="")
                     c.create_text((x0 + x1) / 2, base - bh - 7,
                                   text=f"{v / total:.0%}", fill=t["text_fg"],
-                                  font=("TkDefaultFont", 7))
+                                  font=default_font(7))
                 if i % step == 0:
                     c.create_text((x0 + x1) / 2, base + 9,
                                   text=DNS_BUCKET_LABELS[i],
                                   fill=t["muted_fg"],
-                                  font=("TkDefaultFont", 7))
+                                  font=default_font(7))
             c.create_text(w - 4, 2, text="ms", anchor="ne",
-                          fill=t["muted_fg"], font=("TkDefaultFont", 7))
+                          fill=t["muted_fg"], font=default_font(7))
             Charts.record(c, (c.find_all() or (None,))[0],
                           self.hist_title.cget("text"),
                           ["ms", "Lookups"],
@@ -45607,7 +45621,7 @@ class HealthTab(BaseTab):
                 c.create_text(w // 2, h // 2, text=translate_text(empty) + (
                     "\n" + translate_text("%d without an answer") % lost
                     if lost else ""), fill=t["muted_fg"], width=w - 24,
-                    justify="center", font=("TkDefaultFont", 9))
+                    justify="center", font=default_font(9))
                 return
             Charts.line(c, 4, 2, w - 8, h - 4,
                         [("Router", gw, t["chart_a"]),
@@ -52423,7 +52437,7 @@ class MiniWireshark:
         header.pack(fill="x")
         self.header_frame = header
         self.hdr_title = tk.Label(header, text=tr("app_title"), fg="white",
-                                  bg="#2b3a55", font=("TkDefaultFont", 16,
+                                  bg="#2b3a55", font=default_font(16,
                                                       "bold"))
         self.hdr_title.pack(side="left")
         self.hdr_subtitle = tk.Label(header, text=tr("app_subtitle"),
@@ -56935,7 +56949,7 @@ proc ::mw_retheme {w map fgnew deffg} {
             # table text follows the text size too (it stayed at 10 pt)
             st = ttk.Style()
             row = int(24 * scale)
-            body = ("TkDefaultFont", int(round(10 * scale)))
+            body = default_font(int(round(10 * scale)))
             head = body + ("bold",)
             # a style change, even to the same values, makes every ttk
             # widget of the window rebuild its layout
@@ -60832,9 +60846,9 @@ proc ::mw_explicit_fonts {top names} {
             cv.create_rectangle(x0, 8, max(x0 + 2, x1), 22,
                                 fill=t["conf_high"], outline="")
         cv.create_text(0, 30, anchor="w", text=fmt_clock(start),
-                       fill=t["muted_fg"], font=("TkDefaultFont", 7))
+                       fill=t["muted_fg"], font=default_font(7))
         cv.create_text(w, 30, anchor="e", text="now (green = online)",
-                       fill=t["muted_fg"], font=("TkDefaultFont", 7))
+                       fill=t["muted_fg"], font=default_font(7))
 
     # ======================================================================
     #  Website / remote / flow / alert reports
@@ -65866,7 +65880,7 @@ class CommandPalette:
         self.win.configure(bg=t["tab_bg"])
         self.win.transient(app.root)
         self.q = tk.StringVar()
-        e = ttk.Entry(self.win, textvariable=self.q, font=("TkDefaultFont",
+        e = ttk.Entry(self.win, textvariable=self.q, font=default_font(
                                                            12))
         e.pack(fill="x", padx=12, pady=(12, 6))
         self.lb = tk.Listbox(self.win, bg=t["text_bg"], fg=t["text_fg"],
@@ -90868,6 +90882,40 @@ def t_534_bench_gui_without_scapy_says_how(ctx):
 
 
 @self_test(needs_source=True)
+def t_a3_no_raw_default_font_tuples(ctx):
+    """Third audit: the program's own code builds no ("TkDefaultFont", n)
+    font tuple. Tk reads it as an unknown family name: the bitmap "fixed"
+    font at one size on a Tk without Xft (canvases, table tags, the table
+    style, Settings). default_font names TkDefaultFont's real family.
+    Tests may still build the tuple; SettingsWindow keeps its class-level
+    tuples as the reference and uses default_font per window."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    found = []
+
+    def visit(node, owner, in_class):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(ch, ch.name if owner is None else owner, False)
+            elif isinstance(ch, ast.ClassDef):
+                visit(ch, owner, True)
+            else:
+                if isinstance(ch, ast.Tuple) and len(ch.elts) >= 2 and \
+                        isinstance(ch.elts[0], ast.Constant) and \
+                        ch.elts[0].value == "TkDefaultFont" and not (
+                            isinstance(ch.elts[1], ast.Constant) and
+                            isinstance(ch.elts[1].value, str)):
+                    test = owner is not None and re.match(
+                        r"_?(t|gt|gs)_", owner)
+                    if not test and not (in_class and owner is None):
+                        found.append((ch.lineno, owner))
+                visit(ch, owner, in_class and owner is None)
+    visit(tree, None, False)
+    assert not found, found[:10]
+
+
+@self_test(needs_source=True)
 def t_534_ci_frames_name_both_addresses(ctx):
     """5.3.4 CI (Windows): every Ethernet or ARP layer the file builds
     (tests and app) names its addresses. Left out, scapy reads them from
@@ -101234,6 +101282,44 @@ def gt_a3_map_lines_under_names(app, ctx):
         tab.redraw(force=True)
 
 
+@gui_test_step("third audit: canvases, tables and Settings use "
+               "TkDefaultFont's real family, not the name as a family")
+def gt_a3_real_default_family(app, ctx):
+    """See t_a3_no_raw_default_font_tuples: what the window really uses."""
+    root = app.root
+    if str(root.tk.call("tk", "windowingsystem")) != "x11":
+        return "skip"
+    fam = tkfont.nametofont("TkDefaultFont").actual("family")
+    specs = {"table style": ttk.Style().lookup("Treeview", "font"),
+             "main button": ttk.Style().lookup("Accent.TButton", "font")}
+    tab = app._select_tab("map")
+    was = tab.mode_var.get()
+    tab.mode_var.set("Topology")
+    tab.redraw(force=True)
+    _gui_pump(root, 0.3)
+    texts = [i for i in tab.c.find_all() if tab.c.type(i) == "text"]
+    assert texts, "the map drew no text"
+    specs["map text"] = tab.c.itemcget(texts[0], "font")
+    tab.mode_var.set(was)
+    app._open_settings()
+    _gui_pump(root, 0.3)
+    sw = app._settings_win
+    try:
+        specs["Settings"] = sw.F_BASE
+    finally:
+        sw.win.destroy()
+    named = set(tkfont.names(root))
+    for what, spec in specs.items():
+        assert spec, (what, spec)
+        if isinstance(spec, str) and spec in named:
+            continue                     # a named font: Tk resolves it
+        first = spec[0] if isinstance(spec, tuple) else \
+            root.tk.splitlist(spec)[0]
+        assert first != "TkDefaultFont", (what, spec)
+        got = str(root.tk.call("font", "actual", spec, "-family"))
+        assert got == fam, (what, spec, got, fam)
+
+
 @gui_test_step("5.3.4 crowd #12: packet view — the details keep room, a "
                "filter clears hidden details, pause and empty results "
                "say so, Expert explains, hierarchy headings line up")
@@ -103470,7 +103556,7 @@ def base_ttk_style():
         s.theme_use("clam")
     s.configure("TButton", padding=(10, 6))
     s.configure("Accent.TButton", padding=(14, 8),
-                font=("TkDefaultFont", 11, "bold"), foreground="#ffffff",
+                font=default_font(11, "bold"), foreground="#ffffff",
                 background=ACCENT_BUTTON_BG)
     s.map("Accent.TButton", background=[("active", ACCENT_BUTTON_ACTIVE),
                                         ("disabled", "#9bb8e8")])

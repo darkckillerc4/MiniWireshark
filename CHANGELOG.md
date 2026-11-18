@@ -128,6 +128,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - In Demo Mode, **Websites → Local services** shows made-up services instead of the programs really running on this computer, and opens nothing in the browser. It used to list this computer's own programs under the "Everything shown is simulated" banner.
 
 - `--self-test` passes on a fresh install, before the capture library (scapy) and the optional parts are installed. Three tests assumed they were already there and failed, although the program was fine. It also passes on a Python whose Tk has no Xft, such as the ones uv installs: there the shared fonts fell back to the one-size "fixed" font, so headers ignored the text size, and one layout test failed.
+- On a Python whose Tk has no Xft (such as the ones uv installs), the Map, the charts, the table rows and headings, the main button and the Settings window also use the normal sans-serif font. They named the default font in a way such a Tk doesn't understand, so it showed a small bitmap font at one size.
 - `--bench-gui` on a Python without scapy says how to install it instead of ending in a raw error.
 
 - A settings value MiniWireshark can't use (a theme that doesn't exist, a list where a word belongs, an empty number, a number out of range) is set back to its default with a warning. It used to stop every start, even in Safe Mode, or make a background task fail over and over.
