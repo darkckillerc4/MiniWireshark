@@ -12,7 +12,7 @@ A network monitor sees everything your computer sends, so you should be skeptica
 | The file you downloaded is the published one. | Compare its SHA-256 with the `.sha256` file on the release and with the [version index](VERSIONS.md). |
 | It has no telemetry. Everything it sends goes through one gate and is listed. | Open **Security → What MiniWireshark sent**. Turn on the **kill switch** and watch it block everything. |
 | It never phones home for updates from anywhere but GitHub. | Read [SECURITY.md](../SECURITY.md#where-updates-come-from). Search the file for `OFFICIAL_UPDATE_REPO`. |
-| Its claims are tested. | Run `python miniwireshark.py --self-test` on your own computer (a few minutes, no capture or admin rights needed). |
+| Its claims are tested. | Run `python miniwireshark.py --self-test` on your own computer (5 to 10 minutes, no capture or admin rights needed). |
 | It says what it can't see. | The vantage meter in the bottom-right corner, and **Help → What this computer can see**. |
 
 ## 1. Check the download
@@ -36,7 +36,7 @@ MiniWireshark mostly *listens*. It sends something in the following cases, each 
 
 | What | When | Where it goes |
 |---|---|---|
-| Update check | Once a day, unless you turn it off | `api.github.com`, for the latest release number only |
+| Update check | Once a day, unless you turn it off. The first check runs about 4 seconds after the main window first opens, before you have done anything. It is skipped in Safe Mode, in Demo Mode, while a capture file or saved session is open, and with the kill switch on. | `api.github.com`, for the latest release number only |
 | Reference lists | Only when you ask: Get or Check now in the Components Center, Refresh now in Settings, or Updates set to *Weekly* (the default is *Manual*; with Weekly a missing list is fetched at start, and a list more than 30 days old again) | `wireshark.org` (vendor names), `publicsuffix.org`, and each optional list you turn on there (`iana.org`, `iptoasn.com`, `raw.githubusercontent.com`, `feodotracker.abuse.ch`, `spamhaus.org`). Plain file downloads. |
 | Private Python and packages | Only when you approve the download list | `python.org` and the Python Package Index (`pypi.org`, `files.pythonhosted.org`) |
 | Npcap (Windows) | Only when you choose to install it | `npcap.com` |
@@ -77,8 +77,8 @@ You can always say no. It then opens in limited mode, where you can still use ca
 
 ## 5. Check how it is tested
 
-- **Self-test:** more than 350 tests built into the file (`--self-test`). They cover the decoders, the alert rules, the privacy canary, the outbound gate, corrupt files and clock jumps.
-- **GUI test:** `--gui-test` drives the real window through every tab.
+- **Self-test:** 460 tests built into the file (`--self-test`). They cover the decoders, the alert rules, the privacy canary, the outbound gate, corrupt files and clock jumps. Without scapy and psutil, 40 of them are skipped; the [README](../README.md#testing) lists what each setup gives.
+- **GUI test:** `--gui-test` drives the real window through every tab, in 91 steps (the live-capture step runs only with `--live`).
 - **CI:** every push and pull request runs the self-test on Python 3.8, 3.12 and 3.13, the GUI test on two Ubuntu versions, the self-test and GUI test on Windows, the self-test on macOS, and a [privacy check](../.github/scripts/privacy_check.py) that keeps captures, personal data and keys out of this public repository. Results are on the [Actions page](https://github.com/darkckillerc4/MiniWireshark/actions).
 - **Long runs:** a fast replay test tracks memory, threads and Tk interpreters over many simulated hours. 5.3.4 was not re-run for 8 hours on a real PC; the [changelog](../CHANGELOG.md) lists that under Known limits.
 - **Screenshots** in these docs are taken from Demo Mode: simulated data with reserved `.example` names. Nothing in them is real traffic.

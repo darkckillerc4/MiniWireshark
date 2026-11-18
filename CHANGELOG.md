@@ -10,8 +10,8 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 - **Administrator rights only when needed.** On Linux and macOS, MiniWireshark no longer starts as administrator (root). It asks for your password when capture starts, not at all when the computer already allows capture, and carries on without capture if you say no. The demo and the help never ask.
 - **Your files stay yours.** The data folder is closed to other people on the computer, and a folder that belongs to someone else is not used. There is no shared temporary folder any more. Another user can no longer swap the saved copy that speeds up starting, the update rollback copy or the private packages to run their own code.
-- **The administrator copy runs nothing of yours.** On Linux and macOS, the copy that runs as root for capture starts Python isolated and runs programs only from the system's own folders. A Python file or program planted in your home folder, or in the folder you started MiniWireshark from, no longer runs as root.
-- **The browser never opens as administrator.** When capture runs with administrator (root) rights on Linux or macOS, a local service, a report or a folder now opens as you, not as root.
+- **The administrator copy runs nothing of yours.** On Linux and macOS, the copy that runs as root for capture starts Python isolated and runs programs only from the system's own folders. A Python file or program planted in your home folder, or in the folder you started MiniWireshark from, no longer runs as root. This holds when MiniWireshark asks for the password itself, or you start it with sudo or pkexec; a copy started as root another way (a root login, gksudo) keeps that environment.
+- **The browser never opens as administrator.** When capture runs with administrator (root) rights on Linux or macOS, a local service, a report or a folder now opens as you, not as root (when MiniWireshark asked for the password itself, or was started with sudo or pkexec; started as root another way, it can't tell who you are, and these open as root).
 - **Saving into a shared folder is safe.** A save no longer follows a link that someone else left under its temporary name, so it can't overwrite another file. A table row or chart data copied to the clipboard can't start a spreadsheet formula, the same as a CSV file.
 - **The settings file follows the data folder's rule.** It is no longer read from or written to a folder next to the program that other people can write to, so they can't plant settings there; it goes in your data folder instead.
 - **A new install asks first.** It no longer trusts the first network it sees or starts Active Scanning by itself.
@@ -127,7 +127,8 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - A packet that breaks the decoder is now written in the log, the first of each kind with its details, so it can be reported. It used to be counted silently.
 - In Demo Mode, **Websites → Local services** shows made-up services instead of the programs really running on this computer, and opens nothing in the browser. It used to list this computer's own programs under the "Everything shown is simulated" banner.
 
-- `--self-test` passes on a fresh install, before the capture library (scapy) and the optional parts are installed. Three tests assumed they were already there and failed, although the program was fine.
+- `--self-test` passes on a fresh install, before the capture library (scapy) and the optional parts are installed. Three tests assumed they were already there and failed, although the program was fine. It also passes on a Python whose Tk has no Xft, such as the ones uv installs: there the shared fonts fell back to the one-size "fixed" font, so headers ignored the text size, and one layout test failed.
+- `--bench-gui` on a Python without scapy says how to install it instead of ending in a raw error.
 
 - A settings value MiniWireshark can't use (a theme that doesn't exist, a list where a word belongs, an empty number, a number out of range) is set back to its default with a warning. It used to stop every start, even in Safe Mode, or make a background task fail over and over.
 - A settings file saved by Windows Notepad (with a byte-order mark) is read normally. It used to be taken for damaged, and all settings went back to the defaults.
@@ -203,7 +204,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 - Device fingerprints from DHCP request lists ship without built-in rows until real captures of your own devices are available.
 
-Tested on Python 3.8, 3.12 and 3.13, and 3.12 and 3.14 on Windows (more than 450 self-tests), and with 91 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed.
+Tested on Python 3.8, 3.12 and 3.13, and 3.12 and 3.14 on Windows (460 self-tests), and with 91 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed. On Linux with Python 3.12, scapy and psutil we measured 457 passed, 0 failed, 3 skipped (run as root, no `ip` or `arp`, not a git checkout); without scapy and psutil, 40 more tests are skipped (417 / 0 / 43). The [README](README.md#testing) lists every setup we measured.
 
 ## [5.2.3] — 2026-10-24
 
