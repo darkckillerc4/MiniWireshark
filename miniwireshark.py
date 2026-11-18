@@ -26684,12 +26684,24 @@ def _default_config():
     }
 
 
-def migrate_config(data):
+def migrate_config(data, fixed=None):
     """Bring an older settings file up to the current schema without
-    losing anything the user chose."""
-    ver = int(data.get("config_version", 1) or 1)
+    losing anything the user chose. Third audit (settings #21): a schema
+    number that isn't a number (a list, 1e999) or a "performance" that
+    isn't a section stopped every start, even with --safe; they are set
+    back (named in `fixed`) and the rest of the file is kept."""
+    fixed = [] if fixed is None else fixed
+    try:
+        ver = int(data.get("config_version", 1) or 1)
+    except (TypeError, ValueError, OverflowError):
+        ver = 1                  # unknown: the steps below are safe to redo
+        fixed.append("config_version")
     if ver < 2:
-        perf = data.setdefault("performance", {})
+        perf = data.get("performance")
+        if not isinstance(perf, dict):
+            if "performance" in data:
+                fixed.append("performance")
+            perf = data["performance"] = {}
         if "mode" not in perf:
             perf["mode"] = "Low CPU" if perf.get("cpu_friendly_mode") \
                 else "Automatic"
@@ -26846,7 +26858,8 @@ class AppConfig:
         data = json.loads(raw.decode("utf-8-sig"))
         if not isinstance(data, dict):
             raise ValueError("config is not an object")
-        data = migrate_config(data)
+        mig_fixed = []
+        data = migrate_config(data, mig_fixed)
         gen = data.get("general")
         from_version = str(gen.get("welcome_version") or "") \
             if isinstance(gen, dict) else ""
@@ -26862,14 +26875,14 @@ class AppConfig:
                 merged[section] = vals
         try:
             ver = int(data.get("config_version", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             ver = 0
         if ver > CONFIG_SCHEMA_VERSION:
             LOG.info("settings were written by a newer MiniWireshark "
                      "(schema %s); keeping what this version doesn't "
                      "know", ver)
         merged["config_version"] = max(ver, CONFIG_SCHEMA_VERSION)
-        return merged, from_version, clean_config_values(merged)
+        return merged, from_version, mig_fixed + clean_config_values(merged)
 
     def _load(self):
         defaults = _default_config()
@@ -26911,18 +26924,19 @@ class AppConfig:
                     ", ".join(self.repaired[:6]) +
                     (" …" if len(self.repaired) > 6 else "") + ".")
             return merged
-        except (OSError, ValueError) as e:
-            LOG.warning("config unreadable (%s); using defaults", e)
-            try:
-                with open(self.path + ".damaged", "wb") as f:
-                    f.write(raw)
-                kept = True
-            except OSError:
-                kept = False
+        except Exception as e:                       # noqa: BLE001
+            # third audit (settings #21): any file this version can't
+            # read (too deeply nested, a value of a shape nobody checked)
+            # is set aside like a damaged one; before, only ValueError
+            # was, so such a file stopped every start, even with --safe
+            LOG.warning("config unreadable (%s: %s); using defaults",
+                        type(e).__name__, str(e)[:200])
+            kept = self._set_aside(raw)
             if kept:
-                self.warning = ("Your settings file looked damaged, so I "
-                                "reset it to defaults (a copy was kept as "
-                                "“.damaged”).")
+                self.warning = (
+                    "Your settings file was damaged, so MiniWireshark "
+                    "started with the default settings (a copy was kept "
+                    f"as “{os.path.basename(kept)}” in the same folder).")
             else:
                 # no copy, so the file must not be written over
                 self.read_only = True
@@ -26930,6 +26944,34 @@ class AppConfig:
                                 "copy could be made, so this run uses the "
                                 "defaults and leaves the file as it is.")
             return defaults
+
+    def _set_aside(self, raw):
+        """Keep the damaged file's bytes as `<name>.damaged` (or
+        `.damaged-<time>` when an older, different copy already has that
+        name) and take the file itself out of the way, so the next start
+        is a clean one and the person is told once. -> the copy's path,
+        or "" when no copy could be made (then the file stays as it is)."""
+        dest = self.path + ".damaged"
+        try:
+            with open(dest, "rb") as f:
+                same = f.read() == raw
+            if not same:
+                dest = f"{self.path}.damaged-{int(time.time())}"
+        except OSError:
+            same = False                       # no older copy: use the name
+        try:
+            if not same:
+                atomic_write_bytes(dest, raw)
+        except OSError as e:
+            LOG.warning("the damaged settings file couldn't be copied: %s",
+                        e)
+            return ""
+        try:
+            os.remove(self.path)
+        except OSError as e:
+            # the copy is kept, so the next save may write over it
+            LOG.info("the damaged settings file stays in place: %s", e)
+        return dest
 
     def get(self, dotted, default=None):
         ov = getattr(self, "overrides", None)
@@ -26986,8 +27028,9 @@ class AppConfig:
             return False
         try:
             other = self._parse(raw)[0]
-        except (ValueError, UnicodeDecodeError):
-            return False                 # damaged: this copy's settings win
+        except Exception:                            # noqa: BLE001
+            # damaged (third audit: of any shape): this copy's settings win
+            return False
         for section, vals in self.data.items():
             was = base.get(section)
             if isinstance(vals, dict) and isinstance(was, dict) and \
@@ -101652,6 +101695,129 @@ def t_a2_settings_file_follows_the_folder_rule(ctx):
             _b9_patched(os.environ, MINIWIRESHARK_CONFIG=None):
         c = AppConfig()
     assert c.path == os.path.join(PATHS.data, name), c.path
+
+
+A3_BAD_SETTINGS = {
+    "version-list": b'{"config_version": [1], '
+                    b'"appearance": {"theme": "Dark"}}',
+    "version-inf": b'{"config_version": 1e999, '
+                   b'"appearance": {"theme": "Dark"}}',
+    "perf-number": b'{"config_version": 1, "performance": 5, '
+                   b'"appearance": {"theme": "Dark"}}',
+    "deep-list": b"[" * 100000 + b"]" * 100000,
+    "deep-object": b'{"a": ' * 100000 + b"1" + b"}" * 100000,
+}
+
+
+def _a3_real_start(ctx, tag, raw, safe=False, timeout=150):
+    """Start this program for real (--demo, the start test's exit after
+    the window) with `raw` as its settings file. -> (stdout, log, the
+    settings file's path)."""
+    d = ctx.path(f"a3-start-{tag}-{int(safe)}")
+    os.makedirs(os.path.join(d, "data"), exist_ok=True)
+    cfgp = os.path.join(d, "cfg.json")
+    with open(cfgp, "wb") as f:
+        f.write(raw)
+    env = dict(os.environ, MINIWIRESHARK_DATA=os.path.join(d, "data"),
+               MINIWIRESHARK_CONFIG=cfgp, MW_START_AND_EXIT="0.5",
+               MINIWIRESHARK_NO_CACHED_START="1")
+    for k in ("MW_FEATURES_OFF", "MW_READY_FILE"):
+        env.pop(k, None)
+    argv = self_cmd("--demo", *([SAFE_FLAG] if safe else []))
+    try:
+        r = _run_hidden(argv, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=timeout)
+        out = r.stdout or f"exit code {r.returncode}: {r.stderr[-300:]}"
+    except subprocess.TimeoutExpired:
+        out = f"still waiting after {timeout} s"
+    log = ""
+    with contextlib.suppress(OSError), open(
+            os.path.join(d, "data", "logs", "miniwireshark.log"),
+            encoding="utf-8", errors="replace") as fh:
+        log = fh.read()
+    return out, log, cfgp
+
+
+A3_GOOD_SETTINGS = b'{"general": {"show_welcome": false}}'
+
+
+@self_test(slow=True, needs_source=True)
+def t_a3_bad_settings_file_never_stops_the_start(ctx):
+    """Third audit (settings #21): the real program starts, with and
+    without --safe, whatever shape the settings file has: a schema number
+    that is a list or 1e999, "performance" as a number, JSON nested 100000
+    deep. Before, each stopped every start at "fatal error", Safe Mode
+    too, and the file stayed for the next start to fail again. Skipped
+    only where a start with good settings can't open the window either
+    (the lab's Python 3.8 Tk aborts in xcb)."""
+    runs = {}
+    cases = dict(A3_BAD_SETTINGS, control=A3_GOOD_SETTINGS)
+
+    def start(name, safe):
+        runs[(name, safe)] = _a3_real_start(ctx, name, cases[name], safe)
+    threads = [threading.Thread(target=start, args=(n, s), daemon=True)
+               for n in cases for s in (False, True)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(200)
+    assert len(runs) == 2 * len(cases), sorted(runs)
+    if not all("START_OK" in runs[("control", s)][0] for s in (False, True)):
+        return "skip"                # no real window on this machine
+    for (name, safe), (out, log, cfgp) in sorted(runs.items()):
+        tail = "\n".join(log.splitlines()[-6:])
+        assert "START_OK" in out and "mapped=True" in out, \
+            (name, safe, out[-300:], tail)
+        assert "fatal error" not in log, (name, safe, tail)
+        # the closed window saved settings this version can read
+        c = AppConfig(path=cfgp)
+        assert not c.warning, (name, safe, c.warning)
+        if name.startswith("deep"):
+            with open(cfgp + ".damaged", "rb") as f:
+                assert f.read() == A3_BAD_SETTINGS[name], name
+        elif name != "control":
+            assert c.get("appearance.theme") == "Dark", (name, safe)
+
+
+@self_test()
+def t_a3_settings_of_any_shape_load(ctx):
+    """Third audit (settings #21): a bad schema number or performance
+    section is set back and the rest is kept; a file nobody can read is
+    set aside once (copy kept, the file out of the way) so the next start
+    is quiet, and a later, different damage keeps the earlier copy."""
+    for name, raw in A3_BAD_SETTINGS.items():
+        p = ctx.path(f"a3-shape-{name}.json")
+        with open(p, "wb") as f:
+            f.write(raw)
+        c = AppConfig(path=p)
+        assert c.warning, name
+        assert isinstance(c.get("performance.mode"), str), name
+        assert c.data["config_version"] == CONFIG_SCHEMA_VERSION, name
+        if name.startswith("deep"):
+            assert "default settings" in c.warning and \
+                "copy was kept" in c.warning, c.warning
+            assert not os.path.exists(p), name       # set aside
+            with open(p + ".damaged", "rb") as f:
+                assert f.read() == raw
+            again = AppConfig(path=p)
+            assert not again.warning, again.warning  # told once
+            # the same damage again: the earlier, different copy stays
+            with open(p, "wb") as f:
+                f.write(raw[:-1])
+            AppConfig(path=p)
+            with open(p + ".damaged", "rb") as f:
+                assert f.read() == raw
+            assert [n for n in os.listdir(ctx.tmp)
+                    if n.startswith(os.path.basename(p) + ".damaged-")]
+        else:
+            assert c.get("appearance.theme") == "Dark", (name, c.warning)
+            want = "performance" if name == "perf-number" else \
+                "config_version"
+            assert want in c.repaired, c.repaired
+            assert c.save() and read_json(p)["config_version"] == \
+                CONFIG_SCHEMA_VERSION
+
+
 
 
 @self_test()
