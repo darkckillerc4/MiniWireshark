@@ -6027,12 +6027,23 @@ class RuntimeManager:
         except (OSError, ValueError):
             return False
 
-    def _env_for(self, exe):
+    def _env_for(self, exe, flags=None):
+        """Environment for the component probe and `pip check`. When the
+        probe looks at the Python running now, it must see the same
+        packages: started with -I or -s, this Python ignores the person's
+        own site-packages, so the probe must too (third audit: the check
+        said "scapy OK" while the running copy could not import it)."""
         env = dict(os.environ)
         env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-        if self._is_private(exe):
+        flags = flags or sys.flags
+        try:
+            same = os.path.realpath(exe) == os.path.realpath(sys.executable)
+        except (OSError, ValueError, TypeError):
+            same = False
+        if self._is_private(exe) or (same and flags.ignore_environment):
             for k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
                 env.pop(k, None)
+        if self._is_private(exe) or (same and flags.no_user_site):
             env["PYTHONNOUSERSITE"] = "1"
         return env
 
@@ -78968,6 +78979,43 @@ def t_environment_diagnose(ctx):
     except RuntimeError_:
         pass
     return rep["worst"]
+
+
+@self_test()
+def t_a3_component_probe_sees_what_this_python_sees(ctx):
+    """Third audit: run with -I, the component check started its probe
+    without -I, so it found scapy in the person's own site-packages and
+    said "OK" while this copy could not import it."""
+    import types
+    mgr = RuntimeManager(root_dir=ctx.path("rtprobe"))
+    iso = types.SimpleNamespace(ignore_environment=1, no_user_site=1)
+    plain = types.SimpleNamespace(ignore_environment=0, no_user_site=0)
+    keep = {k: os.environ.get(k) for k in ("PYTHONPATH", "PYTHONNOUSERSITE")}
+    os.environ["PYTHONPATH"] = ctx.path("elsewhere")
+    os.environ.pop("PYTHONNOUSERSITE", None)
+    try:
+        e = mgr._env_for(sys.executable, flags=iso)
+        assert e.get("PYTHONNOUSERSITE") == "1", "user site must be off"
+        assert "PYTHONPATH" not in e, "-I ignores PYTHONPATH"
+        e = mgr._env_for(sys.executable, flags=plain)
+        assert "PYTHONNOUSERSITE" not in e and "PYTHONPATH" in e, \
+            "a plain start must keep the person's own setup"
+        other = ctx.path("other-python")
+        e = mgr._env_for(other, flags=iso)
+        assert "PYTHONNOUSERSITE" not in e and "PYTHONPATH" in e, \
+            "another Python is probed as it is"
+    finally:
+        for k, v in keep.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    # the real check, on the Python running now, agrees with the import
+    import importlib.util
+    pk = (mgr.components(sys.executable).get("packages") or {}).get("psutil")
+    if isinstance(pk, dict):
+        here = importlib.util.find_spec("psutil") is not None
+        assert bool(pk.get("version")) == here, (pk, here)
 
 
 @self_test()
