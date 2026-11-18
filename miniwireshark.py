@@ -93975,7 +93975,14 @@ def _gs_this_pc(app, ctx):
     assert len(m.alerts.alerts) == n0 + 1
     assert any(a.kind == "arp_cache_mismatch" and a.severity == "DANGER"
                for a in m.alerts.alerts.values())
-    assert ("192.168.1.201", "02:11:22:33:44:55") in app.arp_cache_only()
+    # (third audit: this failed once on CI in a full run and never alone;
+    # say which condition dropped the address if it happens again)
+    reg = m.registry
+    assert ("192.168.1.201", "02:11:22:33:44:55") in app.arp_cache_only(), (
+        app.arp_cache_only(), app.arp_cache,
+        "192.168.1.201" in reg.ip_to_key, "02:11:22:33:44:55" in reg.by_key,
+        reg.eligible_ip("192.168.1.201"), [str(n) for n in m.local_nets],
+        getattr(m.local_nets, "own", None))
     # security tab with listeners and a UPnP result
     app.upnp_result = {"upnp": True, "at": time.time(), "mappings": [
         {"Protocol": "TCP", "ExternalPort": "3389",
