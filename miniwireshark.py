@@ -87169,6 +87169,15 @@ def bench_gui(argv):
         print("--bench-gui opens the real window and needs a display. On a "
               "server, run it inside xvfb-run.")
         return 2
+    try:
+        load_scapy()            # it builds the test captures with scapy
+    except ImportError as e:
+        # third audit: this ended in a raw ModuleNotFoundError traceback
+        print(f"--bench-gui builds its test captures with scapy, and this "
+              f"Python can't load it ({type(e).__name__}: {e}). Install "
+              f"it with:\n  \"{sys.executable}\" -m pip install scapy\n"
+              f"or start MiniWireshark once: the first start offers it.")
+        return 2
     wanted = [a.upper() for a in argv if a.upper() in BENCH_SCENARIOS]
     if "all" in argv:
         wanted = list(BENCH_SCENARIOS)
@@ -90657,6 +90666,24 @@ def t_534_ci_shared_fonts_keep_the_default_family(ctx):
             assert big.actual("weight") == "bold", big.actual()
     finally:
         root.destroy()
+
+
+@self_test()
+def t_534_bench_gui_without_scapy_says_how(ctx):
+    """5.3.4 (third audit): --bench-gui on a Python without scapy says
+    how to install it and stops with exit code 2, instead of a raw
+    ModuleNotFoundError traceback."""
+    def no_scapy():
+        raise ModuleNotFoundError("No module named 'scapy'")
+    buf = io.StringIO()
+    with _b9_patched(globals(), load_scapy=no_scapy), \
+            _b9_patched(os.environ, DISPLAY=":0"), \
+            contextlib.redirect_stdout(buf):
+        rc = bench_gui(["S1", "S2", "--check"])
+    text = buf.getvalue()
+    assert rc == 2, (rc, text)
+    assert "-m pip install scapy" in text and "first start" in text, text
+    assert "S1 " not in text, text          # stopped before any scenario
 
 
 @self_test(needs_source=True)
