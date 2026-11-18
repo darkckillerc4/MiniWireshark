@@ -72,6 +72,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
   - **The window test** runs 200 minutes, switching tabs and refreshing as it goes. After minute 120, its memory grew by 164 KB (the limit is 2 MB). The window's widgets, timers, bindings and table rows stayed where they were.
 - On Windows the capture driver gets a bigger buffer, so short bursts lose fewer packets.
 - **Junk on the DNS ports is quick.** Traffic on ports 53, 5353 and 5355 (UDP or TCP) that isn't DNS was read again by the slower decoder: 1.5 to 7 ms a packet here, up to 286 ms in the third audit. It now takes about 5 microseconds and shows as a plain row by its port, such as "Website lookup (DNS) (1400 bytes)".
+- **IPv6 fragments and cut-short IPv6 headers are quick.** A fragment header, or a chain of IPv6 extension headers cut short, sent the packet to the slower decoder: 0.2 to 0.6 ms a packet here, up to 112 ms in the third audit. Both now take about 3 to 5 microseconds. Each new IPv6 address also costs less: 4 instead of 12 microseconds a packet.
 - *Compare sessions* over 90 days of history takes about 60 ms instead of 4.9 seconds.
 
 **Fixes**

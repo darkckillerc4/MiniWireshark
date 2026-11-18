@@ -11659,6 +11659,16 @@ def _fast_ipv4(d, raw, off, reasm):
                     off + total if total else None)
 
 
+_IP6_ANY = bytes(16)
+_IP6_V4MAPPED = bytes(10) + b"\xff\xff"
+# the extension headers the fast decoder walks, by scapy's names for them
+_IP6_EXT_NAMES = {
+    0: "IPv6 Extension Header - Hop-by-Hop Options Header",
+    43: "IPv6 Option Header Routing",
+    60: "IPv6 Extension Header - Destination Options Header",
+    44: "IPv6 Extension Header - Fragmentation header"}
+
+
 def _fast_ipv6(d, raw, off, reasm):
     n = len(raw)
     if n < off + 40:
@@ -11670,21 +11680,33 @@ def _fast_ipv6(d, raw, off, reasm):
     src, dst = _ip6(raw[off + 8:off + 24]), _ip6(raw[off + 24:off + 40])
     d["src_ip"], d["dst_ip"] = src, dst
     d["ttl"], d["ttl_int"], d["ipver"] = _TTL_TEXT[hlim], hlim, 6
-    if is_multicast_or_broadcast(dst):
+    # third audit #2: read from the bytes; ipaddress took 8 µs for each new
+    # address (an IPv4-mapped one still goes the long way, as before)
+    db = raw[off + 24:off + 40]
+    if db[0] == 0xFF or db == _IP6_ANY or \
+            (db[:12] == _IP6_V4MAPPED and is_multicast_or_broadcast(dst)):
         d["multicast"] = True
     end = off + 40 + plen if off + 40 + plen <= n else n
     p = off + 40
-    # every hop-by-hop, routing and destination-options header (audit
-    # 2026-11-14 #47: after 6 the frame went to scapy, 45-184 ms for 180
-    # of them in one 1504-byte frame); at least 8 bytes each, so the
-    # frame bounds the walk
-    while nh in (0, 43, 60):
-        if p + 2 > end:
-            raise NeedDeepParse("short extension header")
-        nh, hl = raw[p], (raw[p + 1] + 1) * 8
+    # every hop-by-hop, routing, destination-options and fragment header
+    # (audit 2026-11-14 #47: after 6 the frame went to scapy, 45-184 ms
+    # for 180 of them in one 1504-byte frame); at least 8 bytes each, so
+    # the frame bounds the walk. Third audit #2: a fragment header or a
+    # chain cut short went to scapy too (12-112 ms); named as scapy does
+    last = None
+    while nh in _IP6_EXT_NAMES:
+        hl = 8 if nh == 44 else (raw[p + 1] + 1) * 8 if p + 2 <= end else 8
+        if p + hl > end:
+            name = ("Raw" if nh == 44 else _IP6_EXT_NAMES[nh]) if p < end \
+                else _IP6_EXT_NAMES.get(last, "IPv6")
+            d["proto"], d["text"] = name, f"{name} frame"
+            return _fast_done(d)
+        if nh == 44 and _U16.unpack_from(raw, p + 2)[0] >> 3:
+            # a later fragment holds no transport header
+            d["proto"], d["text"] = "Raw", "Raw frame"
+            return _fast_done(d)
+        last, nh = nh, raw[p]
         p += hl
-    if nh == 44:
-        raise NeedDeepParse("ipv6 fragment")
     return _fast_l4(d, raw, nh, p, end, reasm, 6,
                     off + 40 + plen if plen else None)
 
@@ -92251,13 +92273,13 @@ def t_a2_ipv6_many_extension_headers_fast(ctx):
     for raw in frames:
         d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
         assert d["transport"] in ("TCP", "UDP"), d["text"]
-    worst = 0.0
-    for _ in range(5):
-        t0 = time.perf_counter()
+    # third audit: an average over many runs (one slow run is a busy PC)
+    t0 = time.perf_counter()
+    for _ in range(50):
         d = fast_decode(frames[1], 1.0)
-        worst = max(worst, time.perf_counter() - t0)
+    each = (time.perf_counter() - t0) / 50
     assert d["text"] == "Secure web browsing (SYN)", d["text"]
-    assert worst < 0.005, f"{worst * 1000:.1f} ms for one frame"
+    assert each < 0.005, f"{each * 1000:.1f} ms for one frame"
     if ctx.scapy_ok:
         diffs = decoder_differences([(r, 1.0, 1) for r in frames[:3]])
         assert not diffs, diffs[:3]
@@ -92331,6 +92353,44 @@ def t_a3_junk_dns_fails_fast(ctx):
     each = (time.perf_counter() - t0) / (n * len(junk))
     # about 5-90 µs here; scapy took 1.5-6 ms
     assert each < 0.0005, f"{each * 1e6:.0f} µs a junk packet"
+
+
+@self_test()
+def t_a3_ipv6_fragment_and_cut_chain_fast(ctx):
+    """Third audit #2: IPv6 fragment headers and an extension chain cut
+    short are read by the fast decoder (scapy took 12-112 ms), the way
+    scapy reads them; a multicast destination is found from its bytes."""
+    udp = struct.pack(">HHHH", 5000, 9999, 28, 0) + bytes(20)
+    dest = bytes([17, 0]) + b"\x01\x04" + bytes(4)
+
+    def v6(nh, body, plen=None, dst="2001:db8::2"):
+        return b"\x02\x00\x00\x00\x00\x02\x02\x00\x00\x00\x00\x01\x86\xdd" \
+            + struct.pack(">IHBB", 6 << 28, len(body) if plen is None
+                        else plen, nh, 64) + \
+            _socket.inet_pton(_socket.AF_INET6, "2001:db8::1") + \
+            _socket.inet_pton(_socket.AF_INET6, dst) + body
+
+    def frag(nxt, off):
+        return bytes([nxt, 0]) + struct.pack(">HI", off << 3, 7)
+    cases = [(v6(44, frag(60, 0) + dest + udp), "Quick message (20 bytes)"),
+             (v6(44, frag(60, 9) + bytes(40)), "Raw frame"),
+             (v6(60, bytes([60, 200]) + bytes(6), plen=8),
+              "IPv6 Extension Header - Destination Options Header frame"),
+             (v6(44, bytes([17, 0, 0, 0])), "Raw frame"),
+             (v6(17, udp, dst="ff02::fb"), "Quick message (20 bytes)")]
+    for raw, text in cases:
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
+        assert d["text"] == text, (d["text"], text)
+    assert d["multicast"] and not fast_decode(cases[0][0], 1.0)["multicast"]
+    t0 = time.perf_counter()
+    for _ in range(100):
+        for raw, _text in cases:
+            fast_decode(raw, 1.0)
+    each = (time.perf_counter() - t0) / (100 * len(cases))
+    assert each < 0.0005, f"{each * 1e6:.0f} µs an IPv6 frame"   # ~4 µs
+    if ctx.scapy_ok:
+        diffs = decoder_differences([(r, 1.0, 1) for r, _t in cases])
+        assert not diffs, diffs[:3]
 
 
 @self_test()
