@@ -89835,8 +89835,14 @@ def t_m17_tree_width_share(ctx):
         tree.configure(xscrollcommand=hs.set)
         root.geometry("420x240")
         _gui_pump(root, 0.4)
-        assert int(tree.column("who", "width")) >= \
-            heading_width("Contacted by") + 20, tree.column("who", "width")
+        # (third audit, CI windows 3.12: still 30 after 0.4 s on a busy
+        # runner; the share runs 40 ms after the table's last resize, so
+        # give the resize time to land, then check the same thing)
+        need = heading_width("Contacted by") + 20
+        _gui_pump(root, until=lambda: int(tree.column("who", "width"))
+                  >= need, timeout=5)
+        assert int(tree.column("who", "width")) >= need, (
+            tree.column("who", "width"), need, tree.winfo_width())
     finally:
         root.destroy()
 
