@@ -14567,9 +14567,14 @@ def trim_counter(c, keep):
     """5.3.4 (memory audit): a Counter keyed by something new every few
     minutes (a website, an address) keeps its `keep // 2` largest counts
     once it holds more than `keep` keys. In place, so every holder of
-    the Counter sees the trim."""
+    the Counter sees the trim. (third audit) A plain dict of counts, such
+    as a defaultdict(int), is trimmed the same way."""
     if len(c) > keep:
-        top = c.most_common(keep // 2)
+        if isinstance(c, Counter):
+            top = c.most_common(keep // 2)
+        else:
+            top = sorted(c.items(), key=lambda kv: kv[1],
+                         reverse=True)[:keep // 2]
         c.clear()
         c.update(dict(top))
 
@@ -15468,6 +15473,11 @@ class DeviceRegistry:
     decides whether something earns a spot in the Devices tab — nothing
     else may fabricate a device from a bare IP sighting."""
 
+    # third audit: the window empties `rekeyed` and `removed` on every
+    # update. With no window (or none emptying them) they kept every
+    # change; past this the oldest half goes
+    CHANGES_KEEP = 4000
+
     def __init__(self, gateway_ip, my_ips, config, now_fn=None):
         self.gateway_ip = gateway_ip
         self.my_ips = set(my_ips)
@@ -15522,6 +15532,12 @@ class DeviceRegistry:
         if not ip:
             return None
         return _classify_address_cached(ip)
+
+    def _cap_changes(self, lst):
+        """Keep the newest CHANGES_KEEP // 2 of a change list nobody is
+        emptying (in place: the window may hold the same list)."""
+        if len(lst) > self.CHANGES_KEEP:
+            del lst[:-(self.CHANGES_KEEP // 2)]
 
     @staticmethod
     def _classify_address_raw(ip):
@@ -15654,6 +15670,7 @@ class DeviceRegistry:
                 dev = self.by_key.pop(prior_key)
                 dev.key = key
                 self.rekeyed.append((prior_key, key))
+                self._cap_changes(self.rekeyed)
         if dev is None:
             dev = DeviceRecord(key=key, first_seen=when, last_seen=when,
                                last_confirmed=when)
@@ -16075,6 +16092,7 @@ class DeviceRegistry:
                     self.ip_to_key.pop(ip, None)
             self.pruned[dev.key] = dev.last_confirmed
             self.removed.append(dev.key)
+            self._cap_changes(self.removed)
             gone.append(dev.key)
         if gone:
             # 5.3.4 review: names merged into a dropped device no longer
@@ -16435,6 +16453,7 @@ class DeviceRegistry:
         if not other.mac:
             self.bindings.rename_owner(other.key, keep.key)
         self.removed.append(other_key)
+        self._cap_changes(self.removed)
         name = (keep.dhcp_hostname or keep.mdns_name or keep.hostname
                 or keep.display_name())
         keep.merged_from.append(other.key)
@@ -23982,6 +24001,9 @@ class NetworkModel:
     TIMELINE_KEEP = 3000          # timeline lines in memory
     RTT_KEEP = 2000               # round-trip times kept
     BCAST_KEEP = 5000             # who sent the last broadcasts
+    # third audit: DHCP servers and routers offered, router MACs, switches
+    # heard. A real network has a handful; past this the least used go
+    LAN_TALLY_KEEP = 64
     OBS_RECENT_KEEP = 4000        # newest observations (sessions keep 3,000)
     DEVICE_SITES_KEEP = 500       # websites listed on one device
     DEVICE_REMOTES_KEEP = 500     # remote addresses listed on one device
@@ -24622,6 +24644,14 @@ class NetworkModel:
                     "count": (cur["count"] + 1) if cur else 1,
                     "pkt": d.get("no")})
         self.switch_ports[key] = rec
+        if len(self.switch_ports) > self.LAN_TALLY_KEEP:
+            # third audit: made-up switch names made one entry each; the
+            # ones heard from longest ago go
+            for k in sorted(self.switch_ports, key=lambda k:
+                            self.switch_ports[k]["last"])[
+                                :len(self.switch_ports) -
+                                self.LAN_TALLY_KEEP // 2]:
+                del self.switch_ports[k]
         if cur is None or cur.get("port") != rec["port"] or \
                 cur.get("vlan") != rec["vlan"]:
             name = rec["system"] or rec["chassis"]
@@ -24748,8 +24778,10 @@ class NetworkModel:
             self.bcast_talkers.append((ts, d["src_mac"] or src_ip))
         elif direction == "up" and d["dst_mac"]:
             self.gw_mac_traffic[d["dst_mac"]] += nbytes
+            trim_counter(self.gw_mac_traffic, self.LAN_TALLY_KEEP)
         elif direction == "down" and d["src_mac"]:
             self.gw_mac_traffic[d["src_mac"]] += nbytes
+            trim_counter(self.gw_mac_traffic, self.LAN_TALLY_KEEP)
 
         src_dev, dst_dev = self._observe_devices(d, src_local, dst_local,
                                                  direction, ts)
@@ -25073,11 +25105,15 @@ class NetworkModel:
                     off["dns"] = [str(x) for x in info["dns_servers"][:4]]
             if mt in (2, 5):
                 self.dhcp_servers[server] += 1
+                # third audit: a flood of offers with made-up server ids
+                # made one entry each. The busiest servers stay
+                trim_counter(self.dhcp_servers, self.LAN_TALLY_KEEP)
                 if len(self.dhcp_servers) > 1:
                     self._alert(self.alerts.dhcp_anomaly(
                         set(self.dhcp_servers), self.dhcp_rogue()))
             if info.get("router"):
                 self.dhcp_routers[info["router"]] += 1
+                trim_counter(self.dhcp_routers, self.LAN_TALLY_KEEP)
             for s in info.get("dns_servers") or []:
                 if len(self.dhcp_dns) < 8:
                     self.dhcp_dns.add(s)
@@ -58194,6 +58230,10 @@ proc ::mw_explicit_fonts {top names} {
         gone = m.registry.removed            # 5.3.4 review: dropped keys
         if len(gone) > keep:
             del gone[:]
+            self._rebuild_on_restore = True
+        moved = m.registry.rekeyed           # third audit: the same
+        if len(moved) > keep:
+            del moved[:]
             self._rebuild_on_restore = True
 
     def _flush_flows(self, m):
@@ -92905,6 +92945,63 @@ def t_534_loop_replay_bounded(ctx):
     tab._pending, m.dirty_remotes = False, {str(i) for i in range(101)}
     MiniWireshark._flush_remotes(win, m)            # not again within 5 s
     assert len(got) == 101 and not tab._pending
+
+
+@self_test()
+def t_534_lan_tallies_capped(ctx):
+    """Third audit (memory): the DHCP servers and routers offered, the
+    MACs that internet traffic goes through, the switches heard (LLDP)
+    and the device list's change lists had no limit, so made-up ones
+    grew them for ever. Each now stops at its cap, the busiest stay (the
+    real router is still the gateway) and a minimised window lets go of
+    rekeys it has not drawn."""
+    cap = NetworkModel.LAN_TALLY_KEEP
+    assert cap <= 64
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+    for i in range(300):
+        srv = "10.66.%d.%d" % (i // 250, 1 + i % 250)
+        mac = "02:66:00:00:%02x:%02x" % (i >> 8, i & 255)
+        a2_dhcp_ack(sb, srv, mac, sb.PHONE, srv, srv)
+        sb._emit(PK.Ether(src=sb.PHONE[1], dst=mac) /
+                 PK.IP(src=sb.PHONE[0], dst="8.8.%d.%d" % (i // 250,
+                                                         1 + i % 250)) /
+                 PK.TCP(sport=40000 + i, dport=443, flags="S"))
+        sb._emit(_lldp_frame(system="sw-%d" % i, port="p%d" % i,
+                             chassis=struct.pack(">IH", 0x021b5400, i)))
+    for _ in range(3):              # the real router carries the traffic
+        sb.dhcp(sb.PHONE)
+        sb.tls(sb.PHONE, "www.example.com", "93.184.215.14")
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    for name in ("dhcp_servers", "dhcp_routers", "gw_mac_traffic",
+                 "switch_ports"):
+        n = len(getattr(m, name))
+        assert 0 < n <= cap, (name, n)
+    assert sb.GW[0] in m.dhcp_servers and sb.GW[0] in m.dhcp_routers
+    assert sb.GW[1] in m.gw_mac_traffic
+    assert m.infer_gateway() == gw, m.infer_gateway()
+    assert any(r["system"] == "sw-299" for r in m.switch_ports.values())
+    assert a2_kinds(m, "dhcp_anomaly")              # still noticed
+    # the device list's change lists, with no window emptying them
+    m.set_identity(local_nets=[ipaddress.ip_network("192.168.0.0/16")])
+    reg = m.registry
+    reg.rekeyed, reg.removed = [], []
+    keep = reg.CHANGES_KEEP
+    for i in range(keep + 500):
+        ip = "192.168.%d.%d" % (10 + i // 250, 1 + i % 250)
+        reg.touch(ip, None, "arp_reply", "test", SCENARIO_T0 + 9000)
+        reg.touch(ip, "02:55:%02x:%02x:00:01" % (i >> 8, i & 255),
+                  "arp_reply", "test", SCENARIO_T0 + 9000)
+    assert 0 < len(reg.rekeyed) <= keep, len(reg.rekeyed)
+    assert reg.rekeyed[-1][1] == "02:55:%02x:%02x:00:01" % (
+        (keep + 499) >> 8, (keep + 499) & 255), reg.rekeyed[-1]
+    win = types.SimpleNamespace(MINIMIZED_KEEP=50, _rebuild_on_restore=False)
+    MiniWireshark._trim_queues_minimized(win, m)
+    assert not reg.rekeyed and win._rebuild_on_restore
 
 
 @self_test(needs_source=True)
