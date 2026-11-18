@@ -20807,7 +20807,9 @@ class ConnectorManager:
     def __init__(self, specs, vault, deliver, interval=60.0):
         self.vault = vault
         self.deliver = deliver
-        self.interval = interval
+        # third audit (settings #23): 0 asked without a pause, 1e308
+        # stopped the thread (a newer version's file isn't clamped)
+        self.interval = min(max(_float(interval, 60.0), 10.0), 3600.0)
         self.status = {}
         self.conns = {}
         self.cursor = {}
@@ -20819,6 +20821,8 @@ class ConnectorManager:
     def update(self, specs):
         live = {}
         for sp in specs or []:
+            if not isinstance(sp, dict):
+                continue           # (third audit #23) a settings file's junk
             cls = CONNECTOR_KINDS.get(sp.get("kind"))
             if cls is None or not sp.get("id"):
                 continue
@@ -26792,6 +26796,44 @@ CHOICE_ALSO_OK = {
 }
 
 
+# third audit (settings #23): what the lists and tables hold. A start with
+# `"filters.recent": [1]` or `"connectors.list": [1]` stopped at "startup
+# error"; items of another kind are dropped when the file is read
+CONFIG_LIST_ITEMS = {"filters.recent": str, "connectors.list": dict,
+                     "general.tours_done": str,
+                     "alerts.muted_devices": str, "alerts.expected": str}
+CONFIG_TABLE_VALUES = {"filters.presets": dict, "workspaces.saved": dict}
+# numbers with no Settings control, so no range there: `"interval": 0`
+# asked a connected helper without a pause, 1e308 stopped its thread
+CONFIG_RANGES = {"connectors.interval": (10, 3600)}
+
+
+def _clean_config_contents(data, fixed):
+    for key, kind in list(CONFIG_LIST_ITEMS.items()) + \
+            list(CONFIG_TABLE_VALUES.items()):
+        section, _, k = key.partition(".")
+        have = data.get(section)
+        v = have.get(k) if isinstance(have, dict) else None
+        if isinstance(v, list):
+            keep = [x for x in v if isinstance(x, kind)]
+            if len(keep) != len(v):
+                have[k] = keep
+                fixed.append(key)
+        elif isinstance(v, dict) and key in CONFIG_TABLE_VALUES:
+            keep = {n: x for n, x in v.items() if isinstance(x, kind)}
+            if len(keep) != len(v):
+                have[k] = keep
+                fixed.append(key)
+    for key, (lo, hi) in CONFIG_RANGES.items():
+        section, _, k = key.partition(".")
+        have = data.get(section)
+        v = have.get(k) if isinstance(have, dict) else None
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and \
+                not lo <= v <= hi:
+            have[k] = min(max(v, lo), hi)
+            fixed.append(key)
+
+
 def _type_fits(value, default):
     if default is None:
         return True
@@ -26848,6 +26890,10 @@ def clean_config_values(data):
                     elif hi is not None and v > hi:
                         have[k] = hi
                         fixed.append(key)
+    if _float(data.get("config_version", 0)) <= CONFIG_SCHEMA_VERSION:
+        # (B-32) a newer version's lists may hold what this one doesn't
+        # know: kept as they are, and the code that reads them copes
+        _clean_config_contents(data, fixed)
     return fixed
 
 
@@ -47968,7 +48014,7 @@ class PacketsTab(BaseTab):
         presets = self.app.config.get("filters.presets", {}) or {}
         recent = self.app.config.get("filters.recent", []) or []
         self.preset_box.configure(values=sorted(presets) + [
-            self.RECENT + r for r in recent[:8]])
+            self.RECENT + r for r in recent[:8] if isinstance(r, str)])
 
     def _remember_expr(self, expr):
         expr = (expr or "").strip()
@@ -101847,6 +101893,78 @@ def t_a3_settings_of_any_shape_load(ctx):
             assert want in c.repaired, c.repaired
             assert c.save() and read_json(p)["config_version"] == \
                 CONFIG_SCHEMA_VERSION
+
+
+@self_test()
+def t_a3_settings_items_of_the_wrong_kind_are_dropped(ctx):
+    """Third audit (settings #23): list and table items of the wrong kind
+    are dropped (`"filters.recent": [1]` and `"connectors.list": [1]`
+    stopped the start at "startup error"); the connected helpers'
+    interval stays between 10 s and an hour (0 asked without a pause,
+    1e308 stopped their thread)."""
+    p = ctx.path("a3-items.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"filters": {"recent": ["dns", 1, None, {}],
+                               "presets": {"Mine": {"proto": "DNS"},
+                                           "Bad": 5}},
+                   "connectors": {"list": [1, "x", {"id": "c1"}],
+                                  "interval": 0},
+                   "alerts": {"muted_devices": ["a|b", 2],
+                              "expected": [[]]},
+                   "general": {"tours_done": [None, "basics"]},
+                   "workspaces": {"saved": {"W": {"tab": "health"},
+                                            "X": "y"}}}, f)
+    c = AppConfig(path=p)
+    assert c.get("filters.recent") == ["dns"]
+    assert list(c.get("filters.presets")) == ["Mine"]
+    assert c.get("connectors.list") == [{"id": "c1"}]
+    assert c.get("connectors.interval") == 10
+    assert c.get("alerts.muted_devices") == ["a|b"]
+    assert c.get("alerts.expected") == []
+    assert c.get("general.tours_done") == ["basics"]
+    assert list(c.get("workspaces.saved")) == ["W"]
+    assert "filters.recent" in c.repaired and \
+        "connectors.interval" in c.repaired, c.repaired
+    c.set("connectors.interval", 1e308)
+    clean_config_values(c.data)
+    assert c.get("connectors.interval") == 3600
+    # (B-32) a newer version's file keeps its lists as they are
+    p = ctx.path("a3-items-newer.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"config_version": 99, "filters": {"recent": [1]},
+                   "connectors": {"list": [1]}}, f)
+    c = AppConfig(path=p)
+    assert c.get("filters.recent") == [1] and \
+        c.get("connectors.list") == [1], c.repaired
+    m = ConnectorManager([1, "x", {"id": "c1", "kind": "nope"}], None,
+                         lambda *a: None)
+    assert m.conns == {}
+    assert ConnectorManager([], None, None, 0).interval == 10
+    assert ConnectorManager([], None, None, 1e308).interval == 3600
+
+
+@self_test(slow=True, needs_source=True)
+def t_a3_newer_settings_lists_never_stop_the_start(ctx):
+    """Third audit (settings #23): a settings file from a newer version
+    keeps its lists as they are (B-32), so the code that reads them must
+    cope: recent filters and connected helpers that aren't what this
+    version expects, and a helper interval of 0, no longer stop the real
+    start at "startup error". Skipped only where a start with good
+    settings can't open the window either."""
+    if "START_OK" not in _a3_real_start(ctx, "newer-control",
+                                        A3_GOOD_SETTINGS)[0]:
+        return "skip"                # no real window on this machine
+    raw = json.dumps({"config_version": 99,
+                      "general": {"show_welcome": False,
+                                  "auto_start_capture": False},
+                      "filters": {"recent": [1, {"x": 2}]},
+                      "connectors": {"list": [1], "interval": 0}}).encode()
+    out, log, cfgp = _a3_real_start(ctx, "newer", raw, timeout=180)
+    assert "START_OK" in out and "mapped=True" in out, \
+        (out[-300:], log[-1500:])
+    assert "startup error" not in log and "Traceback" not in log, \
+        log[-1500:]
+    assert read_json(cfgp)["filters"]["recent"] == [1, {"x": 2}]
 
 
 @self_test()
