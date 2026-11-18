@@ -58155,12 +58155,15 @@ proc ::mw_explicit_fonts {top names} {
     def _dirty_overflow(self, m, attr):
         """Audit #56: rows changing faster than FLUSH_MAX a tick grew the
         set without bound (61k each in a looped replay). Past FLOW_BACKLOG
-        it is dropped for one table refill, at most every 5 s."""
+        it is dropped for one table refill, at most every 5 s. (third
+        audit) Past 4 x FLOW_BACKLOG it is dropped at once, so a burst
+        can't grow it in those 5 s."""
         now = time.monotonic()
         last = getattr(self, "_overflow_at", None)
         if last is None:
             last = self._overflow_at = {}
-        if len(getattr(m, attr)) <= self.FLOW_BACKLOG or \
+        n = len(getattr(m, attr))
+        if n <= self.FLOW_BACKLOG or n <= 4 * self.FLOW_BACKLOG and \
                 now - last.get(attr, -1e9) <= 5:
             return False
         last[attr] = now
@@ -92945,6 +92948,11 @@ def t_534_loop_replay_bounded(ctx):
     tab._pending, m.dirty_remotes = False, {str(i) for i in range(101)}
     MiniWireshark._flush_remotes(win, m)            # not again within 5 s
     assert len(got) == 101 and not tab._pending
+    # third audit: within those 5 s a burst past 4 x the backlog is still
+    # dropped, so the set has a hard cap
+    m.dirty_remotes = {str(i) for i in range(401)}
+    MiniWireshark._flush_remotes(win, m)
+    assert not m.dirty_remotes and tab._pending, len(m.dirty_remotes)
 
 
 @self_test()
