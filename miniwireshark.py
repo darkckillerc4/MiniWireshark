@@ -10281,7 +10281,7 @@ def _login_in_packet(d, load):
                 return
             body = head[cut + skip:]
             how = http_form_login(body)
-            if not how and not body.strip() and any(
+            if not how and any(
                     t in head[:cut].lower() for t in _LOGIN_FORM_TYPES):
                 d["form_post"] = True
         if how:
@@ -25955,23 +25955,37 @@ class NetworkModel:
         Basic, a password in a web address and FTP/POP3/IMAP sign-ins on
         their usual ports fit in one packet). A form whose body comes in
         the next packet is looked at then. Only who, where and how are
-        kept; the packet's bytes are read here and dropped."""
+        kept; the packet's bytes are read here and dropped.
+        Third audit: a form body split over several packets is put back
+        together (in order, up to the 4096 bytes http_form_login reads;
+        a new request ends it) until a password field shows, so
+        "pass" + "word=..." in two packets is seen too."""
         key4 = (d["src_ip"], d["sport"], d["dst_ip"], d["dport"])
         how, proto = d.get("login") or "", d.get("login_proto") or "HTTP"
-        if d.get("form_post") and not how:
-            self._bounded_put(self._form_wait, key4, d["time"], 256)
-            return None
         if not how:
-            if key4 not in self._form_wait:
+            post = d.get("form_post")
+            if not post and key4 not in self._form_wait:
                 return None
-            del self._form_wait[key4]
+            buf = b"" if post else self._form_wait.pop(key4)[1]
             n = d.get("payload_len") or 0
             raw = d.get("raw") or b""
             if not raw and d.get("pkt") is not None:
                 with contextlib.suppress(Exception):
                     raw = bytes(d["pkt"])          # scapy's decoder
-            how = http_form_login(bytes(raw[-n:][:4096]) if n else b"")
+            load = bytes(raw[-n:][:4096]) if n else b""
+            if post:                               # the body after headers
+                cut = load.find(b"\r\n\r\n")
+                load = load[cut + 4:] if cut >= 0 else \
+                    load[load.find(b"\n\n") + 2:]
+            elif load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
+                              b"OPTI", b"PATC"):
+                return None                        # the next request
+            buf = (buf + load)[:4096]
+            how = http_form_login(buf)
             if not how:
+                if len(buf) < 4096:
+                    self._bounded_put(self._form_wait, key4,
+                                      (d["time"], buf), 256)
                 return None
         return self.deep_login({"client": d["src_ip"],
                                 "server": d["dst_ip"], "port": d["dport"],
@@ -76928,6 +76942,17 @@ def t_a2_login_in_default_mode(ctx):
         (0, head + b"\r\npassage=north&compass=" + c),
         (0, b"GET /login HTTP/1.1\r\nHost: shop.example\r\n\r\n"),
         (1, b"HTTP/1.1 200 OK\r\n\r\npassword=" + c)])
+    # third audit: the body split over packets, inside the field name
+    sb._tcp_talk(me, "93.184.215.66", gw, 46006, 80, [
+        (0, head + b"\r\nuser=alex&pass"), (0, b"word=" + c),
+        (1, b"HTTP/1.1 302 Found\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.67", gw, 46007, 80, [
+        (0, head + b"\r\n"), (0, b"user=alex&p"), (0, b"wd=" + c),
+        (1, b"HTTP/1.1 302 Found\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.68", gw, 46008, 80, [   # no password
+        (0, head + b"\r\nuser=alex&rem"), (0, b"ember=1"),
+        (0, b"GET /pass HTTP/1.1\r\nHost: x\r\n\r\n"),
+        (1, b"HTTP/1.1 302 Found\r\n\r\n")])
     decoders = [fast_frame_decoder]
     if ctx.scapy_ok:
         decoders.append(default_frame_decoder)
@@ -76940,7 +76965,8 @@ def t_a2_login_in_default_mode(ctx):
         got = a2_kinds(m, "cleartext_login")
         where = sorted(a.refs.get("remote") for a in got)
         assert where == ["93.184.215.61", "93.184.215.62", "93.184.215.63",
-                         "93.184.215.64"], (mk.__name__, where)
+                         "93.184.215.64", "93.184.215.66",
+                         "93.184.215.67"], (mk.__name__, where)
         assert all(a.severity == "WARNING" and "unencrypted packet" in a.why
                    for a in got), got
         blob = json.dumps([alert_to_dict(a) for a in m.alerts.alerts
