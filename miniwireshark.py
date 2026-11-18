@@ -39232,7 +39232,8 @@ class TableKit:
 
     def copy_cell(self, iid, col):
         if col:
-            copy_to_clipboard(self.app, self.cell_text(iid, col))
+            copy_to_clipboard(self.app, safe_tsv_row([self.cell_text(
+                iid, col)]))
 
     def copy_row(self, iid):
         copy_to_clipboard(self.app, safe_tsv_row(self.row_cells(iid)))
@@ -102386,6 +102387,15 @@ def t_a2_copied_rows_cannot_start_a_formula(ctx):
     finally:
         globals()["copy_to_clipboard"] = real
     assert got == ["'=HYPERLINK(\"x\")\t'+1\trouter\t'-cmd"], got
+    # third audit: a single copied cell gets the same guard
+    try:
+        globals()["copy_to_clipboard"] = lambda app, text: got.append(text)
+        for cell in ("@SUM(1)", "\tx", "router"):
+            TableKit.copy_cell(types.SimpleNamespace(
+                app=None, cell_text=lambda iid, col, c=cell: c), "i1", "#1")
+    finally:
+        globals()["copy_to_clipboard"] = real
+    assert got[1:] == ["'@SUM(1)", "'\tx", "router"], got
     canvas = types.SimpleNamespace(_mw_chart={"Sites": {
         "anchor": None, "header": ["Site", "Bytes"], "note": "",
         "texts": None, "fmt": None,
