@@ -39137,7 +39137,7 @@ def mw_font(size, *style):
         return name
     except (tk.TclError, RuntimeError):
         pass
-    actual = tkfont.Font(font=("TkDefaultFont", size) + tuple(style)).actual()
+    actual = tkfont.Font(font=(_mw_family(), size) + tuple(style)).actual()
     scale = MW_FONT_SCALE[0]
     # keep the Font object: when it is garbage-collected, Tk deletes the
     # named font
@@ -39151,6 +39151,25 @@ def mw_font(size, *style):
 
 
 MW_FONT_SCALE = [1.0]
+
+
+def _mw_family():
+    """The family mw_font builds on. In a font tuple Tk reads
+    "TkDefaultFont" as a family name, not the named font. On X11 with
+    Xft, fontconfig maps that unknown name to the default sans, which is
+    TkDefaultFont's own family. A Tk without Xft (the Pythons uv
+    installs, python-build-standalone) falls back to the bitmap "fixed"
+    font at one size instead: every header was then 9 pt "fixed" and
+    the text size did nothing (third audit). On X11 we name
+    TkDefaultFont's real family; Windows and macOS keep the tuple."""
+    try:
+        if str(tk._default_root.tk.call("tk", "windowingsystem")) == "x11":
+            fam = tkfont.nametofont("TkDefaultFont").actual("family")
+            if fam:
+                return fam
+    except (tk.TclError, RuntimeError, AttributeError):
+        pass
+    return "TkDefaultFont"
 
 
 def scale_mw_fonts(scale):
@@ -90570,18 +90589,33 @@ def t_534_ci_short_tab_keeps_its_content(ctx):
         nb.add(tab.frame, text="t")
         top, sub = tab._head[1], tab._head[2]
         line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
-        rows = []
-        for h in (900, 8 * line + 200, 6 * line + 120, 900):
+
+        def row(h):
             root.geometry(f"600x{h}")
             _gui_pump(root, 0.3)
-            rows.append((bool(top.winfo_ismapped()),
-                         bool(sub.winfo_ismapped()),
-                         tab.body.winfo_ismapped(),
-                         tab.body.winfo_height()))
+            return (bool(top.winfo_ismapped()), bool(sub.winfo_ismapped()),
+                    tab.body.winfo_ismapped(), tab.body.winfo_height())
+        rows = [row(900)]
+        # the short heights come from what this Tk draws (third audit: a
+        # fixed "6 lines + 120" still left room for the first line with
+        # the fonts of a Tk without Xft): tab bar, tool bar, the header
+        # with both lines and its second line, measured at full height
+        over = root.winfo_height() - tab.frame.winfo_height()
+        bars = tab.body.winfo_y() - (top.winfo_y() + top.winfo_height())
+        both = top.winfo_height()
+        second = sub.winfo_height() + 2
+        content = over + bars + 6 * line
+        assert over > 0 and bars > 0 and second > 2, (over, bars, second)
+        for h in (8 * line + 200, 6 * line + 120,
+                  content + both - second // 2,         # no room for line 2
+                  content + (both - second) // 2,       # nor for line 1
+                  900):
+            rows.append(row(h))
         assert rows[0][:3] == (True, True, True), rows
         assert all(r[2] and r[3] >= 5 * line for r in rows), rows
-        assert not rows[2][0] and not rows[2][1], rows
-        assert rows[3][:2] == (True, True), rows
+        assert rows[3][:2] == (True, False), rows    # second line first
+        assert rows[4][:2] == (False, False), rows   # then the whole header
+        assert rows[5][:2] == (True, True), rows
         assert tab.frame.pack_slaves()[0] is top     # back in its place
         var = tk.StringVar(master=root, value="")
         lbl = tk.Label(tab.body, textvariable=var)
@@ -90598,6 +90632,29 @@ def t_534_ci_short_tab_keeps_its_content(ctx):
         assert lbl.winfo_manager() == "pack"
         var.set("")
         assert not lbl.winfo_manager()
+    finally:
+        root.destroy()
+
+
+@self_test()
+def t_534_ci_shared_fonts_keep_the_default_family(ctx):
+    """5.3.4 (third audit): on X11 the shared fonts use TkDefaultFont's
+    family and grow with their size. A Tk without Xft (uv's Pythons)
+    read the old ("TkDefaultFont", n) as an unknown family and gave the
+    bitmap "fixed" font at one size, whatever the text size."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        small = tkfont.nametofont(mw_font(9))
+        big = tkfont.nametofont(mw_font(20, "bold"))
+        assert big.metrics("linespace") > small.metrics("linespace"), (
+            small.actual(), big.actual())
+        if str(root.tk.call("tk", "windowingsystem")) == "x11":
+            fam = tkfont.nametofont("TkDefaultFont").actual("family")
+            assert small.actual("family") == fam, (small.actual(), fam)
+            assert big.actual("family") == fam, (big.actual(), fam)
+            assert big.actual("weight") == "bold", big.actual()
     finally:
         root.destroy()
 
