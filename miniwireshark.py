@@ -96458,7 +96458,16 @@ def gt_m4_shell(app, ctx):
             _gui_pump(root, 0.6)
             assert abs(root.winfo_width() - px(1024)) <= 2, \
                 (root.winfo_width(), root.winfo_screenwidth())
-            assert not app.inspector_visible, "the Inspector kept its room"
+            # (third audit, CI windows 3.14: after a language change the
+            # window is busy for a while, and the resize check runs 120 ms
+            # after the last resize; let it land before checking)
+            _gui_pump(root, until=lambda: not app.inspector_visible,
+                      timeout=5)
+            assert not app.inspector_visible, ("the Inspector kept its "
+                                               "room", lang,
+                                               app.body.winfo_width(),
+                                               getattr(app, "_body_w_prev",
+                                                       None))
             ts = app.tabstrip
             ts.relayout()
             width = ts.frame.winfo_width()
