@@ -32466,6 +32466,11 @@ I18N_PATTERNS = [
     (r"(-?\d+) dBm \((\w+)\), link (.+?), channel (.+?)\. (.+)",
      r"\1 dBm ({t2}), lien \3, canal \4. {t5}",
      r"\1 dBm ({t2}), enlace \3, canal \4. {t5}"),
+    # third audit (UI): the pieces of Health's "Your connection" Wi-Fi
+    # line, translated one by one (the line stayed English)
+    (r"(-?\d+) dBm \((\w+)\)", r"\1 dBm ({t2})", r"\1 dBm ({t2})"),
+    (r"link (\d+ Mbit/s)", r"lien \1", r"enlace \1"),
+    (r"channel (\d+(?: \([\d.]+ GHz\))?)", r"canal \1", r"canal \1"),
     (r"Router answered in (\d+) ms", r"La box a répondu en \1 ms",
      r"El router respondió en \1 ms"),
     # ---- V5 M11: reports, workspace, statistics and the explain line
@@ -33710,6 +33715,9 @@ def translate_cell(v):
                  "Device without a network address (self-assigned 169.254)"}
         words.update(FRIENDLY_PROTO.values())
         words.update(PORT_SERVICES.values())
+        # third audit (UI): the Websites "How we know" cell ("◉ Connected"
+        # stayed English in French and Spanish)
+        words.update(ASSOC_SHORT.values())
         words.update(DEVICE_CLASSES)
         for c in DEVICE_CLASSES:
             words.update((f"Likely {c}", f"Possibly {c}"))
@@ -54690,16 +54698,20 @@ class MiniWireshark:
         if self.data_mode in ("offline", "session"):
             head = tr("In this file, last hour")
         show = lambda: self.open_changes("Last hour")       # noqa: E731
+        # third audit (UI): "Depuis 23:13 : …" in French
+        colon = " : " if CURRENT_LOCALE == "fr" else ": "
         if not parts:
-            return head + ": " + tr("nothing new.") , "muted", show
-        return head + ": " + ", ".join(parts) + ".", "", show
+            return head + colon + tr("nothing new."), "muted", show
+        return head + colon + ", ".join(parts) + ".", "", show
 
     def honesty_line(self):
         v = self.model.vantage.classify(
             offline=self.data_mode in ("offline", "session"))
         spots = blind_spots(self.model, self.data_mode, self.active_mode())
         tr = translate_text
-        return (tr("From here") + ": " + tr(VANTAGE_TEXT[v][0]) +
+        # third audit (UI): French puts a space before the colon ("D'ici:")
+        colon = " : " if CURRENT_LOCALE == "fr" else ": "
+        return (tr("From here") + colon + tr(VANTAGE_TEXT[v][0]) +
                 (" · " + (tr("1 blind spot") if len(spots) == 1 else
                           tr("%d blind spots") % len(spots))
                  if spots else " · " + tr("no known blind spots")) +
@@ -59676,11 +59688,18 @@ proc ::mw_explicit_fonts {top names} {
         wp = self._wifi_view()
         w = wp.last if wp is not None else None
         if w:
-            lines.append("Wi-Fi        : " + (w.get("ssid") or "?")
+            ssid = w.get("ssid") or "?"
+            if self.data_mode == "demo" and ssid.endswith(" (simulated)"):
+                # the demo's own made-up network name, not a real one
+                ssid = ssid[:-len(" (simulated)")] + " (" + \
+                    tr("simulated") + ")"
+            lines.append("Wi-Fi        : " + ssid
                          + (f" via {w['bssid']}" if w.get("bssid") else ""))
             summ = wp.summary()
             if summ:
-                lines.append("               " + summ[3])
+                # third audit (UI): each piece in your language
+                lines.append("               " + ", ".join(
+                    tr(p) for p in summ[3].split(", ")))
         sw = self.model.switch_summary()
         if sw:
             lines.append("Switch port  : " + (sw["system"] or sw["chassis"])
@@ -101070,6 +101089,38 @@ def t_a3_timeline_names_own_devices(ctx):
                   "Votre box a rejoint votre réseau"], fr
     assert es == ["Este equipo se ha unido a su red",
                   "Su router se ha unido a su red"], es
+
+
+@self_test()
+def t_a3_fr_es_leaks(ctx):
+    """Third audit (UI): words that stayed English in French and Spanish:
+    the Websites "How we know" cell ("◉ Connected"), the pieces of
+    Health's Wi-Fi line ("-78 dBm (weak), link 65 Mbit/s, channel 11
+    (2.4 GHz)"). (The GUI step "third audit UI: Demo Mode …" checks the
+    French colon and the Health line in the window.)"""
+    was = CURRENT_LOCALE
+    line = "-78 dBm (weak), link 65 Mbit/s, channel 11 (2.4 GHz), 802.11n"
+    try:
+        for loc, cell, wifi in (
+                ("fr", "◉ Connecté",
+                 "-78 dBm (faible), lien 65 Mbit/s, canal 11 (2.4 GHz), "
+                 "802.11n"),
+                ("es", "◉ Conectado",
+                 "-78 dBm (débil), enlace 65 Mbit/s, canal 11 (2.4 GHz), "
+                 "802.11n")):
+            set_locale(loc)
+            _CELL_CACHE.clear()
+            got = translate_cell(assoc_label(AS_CONNECTED))
+            assert got == cell, (loc, got)
+            for a in (AS_CONNECTED_AMBIG, AS_REPORTED, AS_LOOKUP_ONLY,
+                      AS_INFERRED):
+                en = assoc_label(a)
+                assert translate_cell(en) != en, (loc, en)
+            got = ", ".join(translate_text(p) for p in line.split(", "))
+            assert got == wifi, (loc, got)
+    finally:
+        set_locale(was)
+        _CELL_CACHE.clear()
 
 
 @gui_test_step("5.3.4 crowd #12: packet view — the details keep room, a "
