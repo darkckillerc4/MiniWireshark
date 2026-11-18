@@ -1811,10 +1811,25 @@ def interpreter_flags():
         return []
 
 
+def drop_relative_pythonpath(env):
+    """Third audit: an empty or relative PYTHONPATH entry ('', '.', 'lib')
+    is the current folder, which CACHED_RUN keeps off sys.path; Python
+    makes it absolute before CACHED_RUN runs, so it goes from `env`."""
+    keep = [d for d in env.get("PYTHONPATH", "").split(os.pathsep)
+            if os.path.isabs(d) and (not IS_WINDOWS or
+                                     os.path.splitdrive(d)[0])]
+    if keep:
+        env["PYTHONPATH"] = os.pathsep.join(keep)
+    else:
+        env.pop("PYTHONPATH", None)
+    return env
+
+
 def cached_env(env):
     env = dict(env)
     if FROZEN:
         return env
+    drop_relative_pythonpath(env)
     env.setdefault("MW_PYC", compiled_copy_path())
     env.setdefault("MW_KEY", install_key_path())
     env["MW_CACHED"] = "1"
@@ -1904,7 +1919,7 @@ def start_from_compiled_copy(code, argv=None, environ=None, execute=True,
     cmd[1:1] = interpreter_flags()
     if not execute:
         return cmd
-    env = dict(environ)
+    env = drop_relative_pythonpath(dict(environ))
     env["MW_CACHED"] = "1"
     env["MW_PYC"] = target
     env["MW_KEY"] = install_key_path()
@@ -102221,6 +102236,34 @@ def t_a2_cached_run_ignores_the_current_folder(ctx):
                     capture_output=True, env=env, timeout=60, cwd=folder)
     assert not os.path.exists(marker), r.stderr.decode()[-300:]
     assert r.stdout.decode().strip() == "source True", r
+
+
+@self_test(needs_source=True)
+def t_a3_cached_run_ignores_relative_pythonpath(ctx):
+    """Third audit: a relative PYTHONPATH entry ('.', 'sub', '') points
+    into the current folder too; a cached-run child imports nothing from
+    it, and an absolute entry stays."""
+    folder = ctx.path("a3_cwd")
+    os.makedirs(os.path.join(folder, "sub"), exist_ok=True)
+    marker = ctx.path("a3_hmac_ran")
+    for sub in ("", "sub"):
+        with open(os.path.join(folder, sub, "hmac.py"), "w",
+                  encoding="utf-8") as f:
+            f.write(f"open({marker!r}, 'w').write('ran')\n")
+    script = ctx.path("a3_src.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("print('ok')\n")
+    keep = os.path.abspath(ctx.path("a3_abs"))
+    env = cached_env(dict(os.environ, PYTHONPATH=os.pathsep.join(
+        (".", "sub", "", keep))))
+    assert env["PYTHONPATH"] == keep, env["PYTHONPATH"]
+    assert "PYTHONPATH" not in cached_env({"PYTHONPATH": "." + os.pathsep})
+    env.update(MW_PYC=os.path.join(folder, "none.pyc"),
+               MW_KEY=os.path.join(folder, "none.key"))
+    r = _run_hidden(cached_cmd(sys.executable, script), capture_output=True,
+                    env=env, timeout=60, cwd=folder)
+    assert not os.path.exists(marker), r.stderr.decode()[-300:]
+    assert r.stdout.decode().strip() == "ok", r
 
 
 @self_test()
