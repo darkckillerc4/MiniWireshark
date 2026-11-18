@@ -68,6 +68,8 @@ def changelog_section(changelog, version):
                   r"(.*?)(?=^## \[|\Z)", changelog, re.M | re.S)
     if not m:
         return None
+    if "unreleased" in m.group(0).split("\n", 1)[0].lower():
+        return None  # not finished: never publish on a push
     return m.group(1) or datetime.date.today().isoformat(), m.group(2).strip()
 
 

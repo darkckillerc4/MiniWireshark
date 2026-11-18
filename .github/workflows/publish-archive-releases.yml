@@ -20,6 +20,7 @@ jobs:
     # (security review) releases are published from main only
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:

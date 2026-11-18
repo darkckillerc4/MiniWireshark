@@ -1,6 +1,6 @@
 # Screenshots
 
-Every tab of MiniWireshark **5.3.4**, plus the screens new in 5.3.4, taken in **Demo Mode** at 1440×900. The data is simulated and every name is a reserved `.example` name. Nothing was captured.
+Every tab of MiniWireshark **5.3.4**, plus the screens new in 5.3.4, taken in **Demo Mode** at 1440×900. The data is simulated and every website is a reserved `example.com`, `.org` or `.net` name. Nothing was captured.
 
 The pictures follow your GitHub theme: switch between light and dark to see both. All 34 files are in [`assets/screens/`](assets/screens/). To take your own, start `python miniwireshark.py --demo` and look around; `--gui-shots DIR` photographs every tab of a synthetic network for developers.
 

@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # timeout-minutes: about three times the longest run measured (run
   # 42978911434 and the two before it), so a hang fails in minutes, not
@@ -18,11 +22,33 @@ jobs:
     timeout-minutes: 5        # measured 0.1 min
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # the commit check reads the PR's commits
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: No personal data, captures or secrets in the repository
         run: python .github/scripts/privacy_check.py
+      - name: No personal email addresses on the pull request's commits
+        if: github.event_name == 'pull_request'
+        run: >-
+          python .github/scripts/privacy_check.py --commits
+          "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}"
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Links, headings, images and whitespace in the Markdown pages
+        run: python .github/scripts/docs_check.py
+      - name: The alert and filter-field pages match the app
+        run: python .github/scripts/reference_docs.py --check
+      - name: The helper scripts compile
+        run: python -m py_compile .github/scripts/*.py
 
   self-test:
     runs-on: ubuntu-22.04   # still has Python 3.8 builds

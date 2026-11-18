@@ -11,13 +11,13 @@ What MiniWireshark 5.3.4 can do, grouped by the question it answers. For how to 
 - **Device discovery** on your own subnet only, from ARP, mDNS, SSDP, DHCP and ordinary traffic. Active probes never leave your subnet, and Quiet Mode turns them off on networks you haven't trusted.
 - **Device identity:** type (phone, TV, printer, console, speaker, router …), maker from the hardware address, names announced by the device, and a confidence level with the evidence behind it. Every rule is one row of a signature table. Apple model codes are read as product names ("MacBook Pro"), and a "But:" line shows evidence that disagrees. Accuracy is measured on a synthetic test set of 65 devices (64 right).
 - **Identity over time:** a device keeps its identity when its address changes, private (randomised) hardware addresses are recognised, DHCP clues suggest when two entries are probably the same device, duplicates can be merged (and split again), and corrections you make are remembered.
-- **Several networks:** home, office and other networks you join are kept apart.
+- **Several networks:** each network you join is kept apart, with its own devices and baseline.
 - **Map** of the router, devices and the Internet.
 
 ## Who is using the Internet, and for what?
 
 - **Websites** from DNS, TLS SNI, HTTP Host and QUIC Initial packets, grouped by site, with known trackers marked.
-- **Remote hosts:** public addresses, with network owner and country when you turn those lookups on.
+- **Remote hosts:** public addresses, with the network owner (from an optional data pack) and the country (when you turn that lookup on).
 - **Connections:** every flow, with bytes, packets, duration and the device on each end.
 - **This computer:** which program owns each connection.
 - **Encrypted DNS** (DoH, DoT) is detected and named, so missing lookups aren't mistaken for silence.
@@ -25,18 +25,18 @@ What MiniWireshark 5.3.4 can do, grouped by the question it answers. For how to 
 
 ## Is anything wrong?
 
-The security and health engine raises these alerts. Each one says *why it was flagged*, *what innocent explanations exist* and *what to check*. Each kind can be turned off, and its threshold changed, in **Settings → Alerts**.
+The security and health engine raises these alerts. Each one says *why it was flagged*, *what innocent explanations exist* and *what to check*. The [Alerts reference](ALERTS.md) gives that text for every alert. Each kind can be turned off, and its threshold changed, in **Settings → Alerts**.
 
 | Alert | Severity |
 |---|---|
-| Possible ARP spoofing (including a second device claiming to be the router) | Danger |
+| Possible ARP spoofing (including a second device claiming to be the router; a device with two network cards only raises a Warning) | Danger |
 | Gateway identity changed | Warning |
 | DHCP anomaly | Warning |
 | Duplicate IP address | Warning |
 | Unexpected IPv6 router announcement | Warning |
 | Possible scanning pattern | Warning |
 | Remote-access service seen | Warning |
-| Address on a public blocklist, or on your own blocklist, contacted | Warning |
+| Address on a public blocklist, or on your own blocklist, contacted | Warning, or Danger when two public lists agree |
 | Login sent without encryption (Full Power; the password is never kept) | Warning, or Info inside your network |
 | New service used (a device reaches a service it never used) | Warning |
 | Unknown / unconfirmed device | Warning |
@@ -57,12 +57,12 @@ The security and health engine raises these alerts. Each one says *why it was fl
 | Several DNS servers in use | Info |
 | Unusual download spike | Info |
 
-Thresholds that compare against "normal" wait for a baseline first, so a fresh start doesn't flood you with alerts. The baseline keeps a day and a night profile for each device and starts from what is normal for its kind, so a device is judged after 5 minutes instead of 15. What it learned more than 14 days ago is forgotten, and the device card says what it has learned.
+Thresholds that compare against "normal" wait for a baseline first, so a fresh start doesn't flood you with alerts. The baseline keeps a day and a night profile for each device and starts from what is normal for its kind, so a device is judged after about 5 minutes instead of waiting for its own history (15 minutes by default, which you can change). What it learned more than 14 days ago is forgotten, and the device card says what it has learned.
 
-- **Unusual activity** at the top of the Security tab: one card per unusual finding, with *Could be a problem* and *Could be normal* side by side, what was seen, the evidence and one next step. A Dashboard card opens it.
+- **Unusual activity** at the top of the Security tab: one card per unusual finding (the top two, with a count of the rest), with *Could be a problem* and *Could be normal* side by side, what was seen, the evidence and one next step. A Dashboard card opens it.
 - **Snooze** an alert type for 1 hour, 1 day or until tomorrow, for one device or for all. A DANGER snooze lasts a day at most, and the Alerts tab counts what mute and snooze hold back.
 - **Your own blocklist:** a text file of addresses, CIDR ranges, IPv6 ranges, domain names or hosts-file lines, read only when you pick or reload it. Private, special-use and too-wide entries are refused with a reason.
-- **Notifications while minimised** (off by default): a count in the window title, a flashing taskbar button on Windows (the Dock on macOS) and an optional silent Windows notification, at most one a minute.
+- **Notifications while minimised** (off by default; only Danger alerts count unless you also choose Warning): a count in the window title, a flashing taskbar button on Windows (the Dock on macOS) and an optional silent Windows notification, at most one a minute.
 
 ## Why is it slow?
 
@@ -78,9 +78,9 @@ Thresholds that compare against "normal" wait for a baseline first, so a fresh s
 
 ## Deep analysis
 
-- **Packet workspace:** packet list, dissection tree with byte ranges, hex view, and a registry of 166 fields.
+- **Packet workspace:** packet list, dissection tree with byte ranges, hex view, and a registry of 166 fields (listed in [Packet filter fields](FIELDS.md)).
 - **Reassembly:** IP defragmentation and TCP stream reassembly.
-- **Full Power mode:** every dissector runs in worker processes, and adds protocol exchanges for DNS, DHCP, TLS, HTTP, RTSP, SSH, SMB, MQTT, NTP and SIP.
+- **Full Power mode:** the dissectors run in worker processes (or in a thread when processes can't start or aren't faster), and adds protocol exchanges for DNS, DHCP, TLS, HTTP, RTSP, SSH, SMB, MQTT, NTP and SIP.
 - **Mail traffic:** SMTP, IMAP and POP3 analysis. Logins, passwords and message bodies are dropped inside the parser.
 - **Follow stream**, with previous/next, direction and redacted save.
 - **Statistics:** conversations, protocol hierarchy, I/O graphs and expert findings with "show these packets".
@@ -106,11 +106,11 @@ Thresholds that compare against "normal" wait for a baseline first, so a fresh s
 - No telemetry. Every send goes through `outbound()` and is listed in the self-traffic ledger.
 - A **kill switch** blocks everything MiniWireshark itself would send, including package downloads.
 - A **privacy posture** report lists what is on and what it sends.
-- Redaction replaces real names and addresses with documentation-range pseudonyms in reports and exports.
+- Redaction replaces addresses with documentation-range pseudonyms and names with stand-ins such as "Device C" in reports and exports.
 
 ## Looking after itself
 
-- Installs its own packages into a private folder, never the system Python. The packages it needs to start, and the private runtime's packages, are checked against pinned SHA-256 fingerprints. Optional components (psutil, cryptography) come from PyPI over verified HTTPS through pip, without a pin.
+- Installs its own packages into a private folder, never the system Python. The packages it needs to start, and the private runtime's packages, are checked against pinned SHA-256 fingerprints. Optional components (psutil, cryptography) come from PyPI over verified HTTPS through pip, at exact versions, with pip checking PyPI's own hashes; MiniWireshark keeps no SHA-256 pin for them.
 - Optional private Python runtime, so it works even when your Python is unusual.
 - Offers to install Npcap on Windows, picks the best network card, and restarts a capture that dies. When a live capture can't keep up, deep analysis pauses and packets are only counted, with a plain line saying so.
 - **Repair MiniWireshark:** one click fixes missing components, damaged lists or history, a broken settings file and a stuck capture.
