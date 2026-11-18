@@ -95408,6 +95408,14 @@ def _gs_v501(app, ctx):
         assert text.startswith("packet,time,severity,group,finding")
         assert text.count("\n") >= len(kids) + 1
         tab.clear_filter()
+        # back from the Expert list, the list's height and the details
+        # pane's sash settle a moment later (<Configure> renders again);
+        # on a slow Windows runner the first render can still see the
+        # old, one-row height
+        _gui_pump(root, until=lambda: len(tab.slots) >= 2, timeout=5)
+        assert len(tab.slots) >= 2, (
+            "the packet list keeps one row", len(tab.matched),
+            tab.tree.winfo_height(), tab._row_height(), tab.head_h)
         # time display formats
         tab.time_var.set("Seconds since start")
         tab._time_format()
