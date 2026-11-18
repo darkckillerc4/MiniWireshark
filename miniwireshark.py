@@ -94509,8 +94509,13 @@ def _gs_this_pc(app, ctx):
     assert len(m.alerts.alerts) == n0 + 1
     assert any(a.kind == "arp_cache_mismatch" and a.severity == "DANGER"
                for a in m.alerts.alerts.values())
-    # (third audit: this failed once on CI in a full run and never alone;
-    # say which condition dropped the address if it happens again)
+    # (third audit: this failed on CI in full runs and never alone. The
+    # diagnosis printed on bd545db showed why: the waits above let the
+    # live network check put the runner's real networks (10.1.0.0/20,
+    # 172.17.0.0/16) back as the local networks, so 192.168.1.201 was
+    # off the LAN. Set the scenario's identity again with no wait between
+    # that and the check, as the program-attribution part above does.)
+    m.set_identity(my_ips=ident[1], local_nets=ident[3])
     reg = m.registry
     assert ("192.168.1.201", "02:11:22:33:44:55") in app.arp_cache_only(), (
         app.arp_cache_only(), app.arp_cache,
