@@ -23823,11 +23823,14 @@ def known_bulk_service(names, kind=None):
     return None
 
 
-def beacon_period(starts, min_gaps=20, spread=0.2, share=0.8):
+def beacon_period(starts, min_gaps=20, spread=0.2, share=0.8, cv=0.3):
     """Connection start times → the period in seconds when they are
     nearly even (at least `share` of the last gaps within `spread` of
     their median, the median between 20 s and an hour), else None. Much
-    stricter than detect_periodic: this one raises an alert."""
+    stricter than detect_periodic: this one raises an alert. Third
+    audit: a timer jittered on purpose (about ±50 %) still counts when
+    the gaps' coefficient of variation is at most `cv` (random contacts
+    are near 1)."""
     ts = sorted(starts)
     gaps = [b - a for a, b in zip(ts, ts[1:])]
     if len(gaps) < min_gaps:
@@ -23836,7 +23839,10 @@ def beacon_period(starts, min_gaps=20, spread=0.2, share=0.8):
     if not 20.0 <= med <= 3600.0:
         return None
     close = sum(1 for g in gaps if abs(g - med) <= spread * med)
-    return med if close >= share * len(gaps) else None
+    if close >= share * len(gaps) or \
+            statistics.pstdev(gaps) <= cv * statistics.mean(gaps):
+        return med
+    return None
 
 
 def random_label(label):
@@ -76628,6 +76634,14 @@ def t_a2_beacon(ctx):
     assert beacon_period([60.0 * i for i in range(25)]) == 60.0
     assert beacon_period([60.0 * i + (i % 2) * 25 for i in range(25)]) \
         is None
+    # third audit: ±40 % jitter on a 60 s timer still counts; random
+    # (exponential) gaps with the same mean don't
+    jit = list(itertools.accumulate(60 * rng.uniform(0.6, 1.4)
+                                    for _ in range(25)))
+    assert 40 < (beacon_period(jit) or 0) < 80, jit
+    rnd = list(itertools.accumulate(rng.expovariate(1 / 60.0)
+                                    for _ in range(25)))
+    assert beacon_period(rnd) is None, rnd
 
 
 @self_test()
