@@ -61749,9 +61749,13 @@ proc ::mw_explicit_fonts {top names} {
         self.demo = DemoGenerator(self.lossless_sink())
         self.demo.start()
         self._restyle_mode_banner()
-        self._set_banner("\U0001F3AE  DEMO DATA — NOT LIVE TRAFFIC. Explore "
-                         "the tabs; nothing here is real and nothing mixes "
-                         "with your real session.", kind="warn")
+        # third audit (UI): the state line above already says "DEMO DATA —
+        # NOT LIVE TRAFFIC"; a second banner said it again under it on
+        # every tab and took about 45 pixels of a small screen. Any older
+        # message (Welcome, Stopped) goes too: it was about the session
+        # the demo just replaced.
+        self._banner_action(None)
+        self._hide_banner()
         # ST-04: the "I'll pick a network card" line is not true here
         self.status_var.set("Demo Mode — showing made-up traffic. Nothing "
                             "is being captured.")
@@ -101121,6 +101125,50 @@ def t_a3_fr_es_leaks(ctx):
     finally:
         set_locale(was)
         _CELL_CACHE.clear()
+
+
+@gui_test_step("third audit UI: Demo Mode says DEMO DATA once; French "
+               "Dashboard and Health lines")
+def gt_a3_demo_once_and_french(app, ctx):
+    root = app.root
+    app._set_banner("An older message from before the demo.")
+    app.start_demo()
+    try:
+        _gui_pump(root, 0.5)
+
+        def demo_lines():
+            out = []
+            for frame, lbl in ((app.mode_banner, app.mode_lbl),
+                               (app.data_banner, app.data_lbl),
+                               (app.banner, app.banner_lbl)):
+                if frame.winfo_manager() and \
+                        "DEMO DATA" in str(lbl.cget("text")):
+                    out.append(str(lbl.cget("text")))
+            return out
+        lines = demo_lines()
+        assert len(lines) == 1, lines
+        assert not app.banner.winfo_manager(), app.banner_lbl.cget("text")
+        app.config.set("general.language", "Français")
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.5)
+        h = app.honesty_line()
+        assert h.startswith("D'ici : "), h
+        new = app.answer_new()[0]
+        assert re.match(r"(Depuis \d\d:\d\d|[^:]+) : ", new), new
+        info = app.connection_info_text()
+        wifi = [x.strip() for x in info.splitlines()
+                if "dBm" in x or x.startswith("Wi-Fi")]
+        assert wifi and "(simulé)" in wifi[0] and "simulated" not in info, \
+            wifi
+        assert any("lien" in x and "canal" in x and "weak" not in x and
+                   "channel" not in x for x in wifi), wifi
+    finally:
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.3)
+        app.stop_demo()
+        _gui_pump(root, 0.3)
+        _gt_back_to_scenario(app, ctx)
 
 
 @gui_test_step("5.3.4 crowd #12: packet view — the details keep room, a "
