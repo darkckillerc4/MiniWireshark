@@ -44746,9 +44746,32 @@ class MapTab(BaseTab):
             self.after_draw_declutter()
         else:
             self._connections(w, h)
+        self._label_backgrounds()
+        c.tag_lower("lblbg")
         c.tag_lower("edge")
         if self.list_wrap.winfo_ismapped():
             self.fill_list()
+
+    def _label_backgrounds(self):
+        """Third audit (UI): the dotted lines to the Internet column were
+        drawn through the names ("news.example.org"). Each name that shows
+        gets a patch of the map's own colour under it, above the lines, so
+        a line stops at the name instead of crossing it."""
+        c = self.c
+        bg = self.t["tab_bg"]
+        for tid, *_rest in getattr(self, "_label_ids", ()):
+            with contextlib.suppress(tk.TclError):
+                if str(c.itemcget(tid, "state")) == "hidden":
+                    continue
+                b = c.bbox(tid)
+                if not b:
+                    continue
+                tags = tuple(x for x in c.gettags(tid)
+                             if x.startswith("n:")) + ("lblbg",)
+                rid = c.create_rectangle(b[0] - 1, b[1], b[2] + 1, b[3],
+                                         fill=bg, outline="", tags=tags)
+                if tid in self.nodes:
+                    self.nodes[rid] = self.nodes[tid]
 
     def _conf_color(self, conf):
         t = self.t
@@ -101169,6 +101192,46 @@ def gt_a3_demo_once_and_french(app, ctx):
         app.stop_demo()
         _gui_pump(root, 0.3)
         _gt_back_to_scenario(app, ctx)
+
+
+@gui_test_step("third audit UI: Map lines stop at the names they cross")
+def gt_a3_map_lines_under_names(app, ctx):
+    root = app.root
+    tab = app._select_tab("map")
+    was = tab.mode_var.get()
+    try:
+        for mode in ("Topology", "Connections"):
+            tab.mode_var.set(mode)
+            tab.redraw(force=True)
+            _gui_pump(root, 0.3)
+            c = tab.c
+            order = {i: n for n, i in enumerate(c.find_all())}
+            labels = [t[0] for t in tab._label_ids
+                      if str(c.itemcget(t[0], "state")) != "hidden"]
+            assert labels, (mode, "no names drawn")
+            patches = [i for i in c.find_withtag("lblbg")]
+            crossed = 0
+            for tid in labels:
+                b = c.bbox(tid)
+                under = [p for p in patches if order[p] < order[tid] and
+                         c.coords(p)[0] <= b[0] + 1 and
+                         c.coords(p)[1] <= b[1] + 1 and
+                         c.coords(p)[2] >= b[2] - 1 and
+                         c.coords(p)[3] >= b[3] - 1]
+                assert under, (mode, c.itemcget(tid, "text"),
+                               "has no patch under it")
+                assert c.itemcget(under[0], "fill") == tab.t["tab_bg"]
+                edges = [i for i in c.find_overlapping(*b)
+                         if "edge" in c.gettags(i)]
+                crossed += bool(edges)
+                for e in edges:
+                    assert order[e] < order[under[0]], \
+                        (mode, c.itemcget(tid, "text"), "line over name")
+            LOG.debug("map %s: %d of %d names crossed by a line", mode,
+                      crossed, len(labels))
+    finally:
+        tab.mode_var.set(was)
+        tab.redraw(force=True)
 
 
 @gui_test_step("5.3.4 crowd #12: packet view — the details keep room, a "

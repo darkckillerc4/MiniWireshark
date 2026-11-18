@@ -154,6 +154,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - The Dashboard's ALERTS card names its counts ("Danger 0 · Warning 1 · Info 5") instead of three bare numbers behind symbols.
 - The Map legend says what the letter on a device means: how sure MiniWireshark is that it is a real device (H high, M medium, L low, ? unconfirmed).
 - Demo Mode says "DEMO DATA — NOT LIVE TRAFFIC" once, in the line under the header. A second banner repeated it on every tab and took a line of a small screen.
+- The Map's lines stop at the names of the devices and websites they pass, instead of being drawn through them ("news.example.org").
 - The Timeline calls this computer and the router "This computer" and "Your router" when they have no name of their own, as the alerts do. They were "Device using a private Wi-Fi address (192.168.50.10) joined your network".
 - French and Spanish: the Websites *How we know* column ("Connected"), the Wi-Fi line under Health → *Your connection* and the demo's network name are translated, and French puts a space before the colon in "D'ici :" and "Depuis 23:13 :".
 - French: a fact another system told MiniWireshark is called "Signalé" everywhere (it was "rapporté" in places), and a correlated one "Corrélé" (it was "Recoupé" in the evidence key).
