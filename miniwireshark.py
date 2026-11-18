@@ -33182,9 +33182,9 @@ EVENT_PATTERNS = [
      r"Conexión segura con \1 (HTTP/3 — el nombre se leyó del primer "
      r"paquete de la conexión)"),
     (r"(\S+) is at (\S+) \(Windows name\)", r"\1 est à \2 (nom Windows)",
-     r"\1 está en \2 (nombre de Windows)"),
+     r"\1 corresponde a \2 (nombre de Windows)"),
     (r"(\S+) is at (\S+) \(IPv6\)", r"\1 est à \2 (IPv6)",
-     r"\1 está en \2 (IPv6)"),
+     r"\1 corresponde a \2 (IPv6)"),
     (r"Router announcement \(IPv6\) — network (.+)", r"Annonce du routeur "
      r"(IPv6) — réseau \1", r"Anuncio del router (IPv6) — red \1"),
     (r"Announced itself: (.+)", r"S'est annoncé : \1", r"Se anunció: \1"),
@@ -33393,7 +33393,7 @@ EVENT_PATTERNS = [
      r"\1 marcado como {t2}"),
     (r"(\S+) announced itself \(gratuitous ARP\)", r"\1 s'est annoncé (ARP "
      r"gratuit)", r"\1 se anunció (ARP gratuito)"),
-    (r"(\S+) is at (\S+)", r"\1 est à \2", r"\1 está en \2"),
+    (r"(\S+) is at (\S+)", r"\1 est à \2", r"\1 corresponde a \2"),
 ]
 I18N_PATTERNS += EVENT_PATTERNS
 # second audit 2026-11-14 (#33-#37, #40): the new alerts' sentences
@@ -33640,6 +33640,14 @@ I18N_REVERSE = {}          # shown translation -> English source
 _I18N_CACHE = {}
 
 
+def _i18n_post(post, loc):
+    """The label's trailing part in `loc`: French puts a space before the
+    colon ("Gravité :", third audit), the others keep it as it is."""
+    if loc == "fr" and post.startswith(":"):
+        return " " + post
+    return post
+
+
 def _i18n_lookup(s, table, loc):
     hit = table.get(s)
     if hit is not None:
@@ -33647,10 +33655,10 @@ def _i18n_lookup(s, table, loc):
     tries = [("", s, "")]
     m = _I18N_CORE.match(s)
     if m and m.group(2) and (m.group(1) or m.group(3)):
-        tries.append((m.group(1), m.group(2), m.group(3)))
+        tries.append((m.group(1), m.group(2), _i18n_post(m.group(3), loc)))
         hit = table.get(m.group(2))
         if hit is not None:
-            return m.group(1) + hit + m.group(3)
+            return m.group(1) + hit + _i18n_post(m.group(3), loc)
     for pre, core, post in tries:
         for rx, fr, es in _I18N_PATTERNS_RX:
             mm = rx.match(core)
@@ -51494,6 +51502,7 @@ class SearchDrop:
     def __init__(self, app, entry):
         self.app, self.entry = app, entry
         self.frame = None
+        self.q = None               # the text the list was made for
         self.rows = []              # (label widget, action)
         self.sel = -1
         self._soon = debounce(entry, self.update, 150)
@@ -51506,11 +51515,18 @@ class SearchDrop:
 
     def escape(self):
         """Escape in the box: the list under it and the results window
-        both close (crowd test 5.3.4 #1)."""
+        both close (crowd test 5.3.4 #1). With nothing open, Escape
+        empties the box (third audit: the query stayed for good)."""
+        had = self.frame is not None
+        with contextlib.suppress(AttributeError):
+            had = had or self.app.search_window() is not None
         self.cancel()
         self.close()
         with contextlib.suppress(AttributeError):
             self.app.close_search_window()
+        if not had:
+            with contextlib.suppress(AttributeError, tk.TclError):
+                self.app.global_search_var.set("")
         return "break"
 
     def cancel(self):
@@ -51563,6 +51579,7 @@ class SearchDrop:
         fr = tk.Frame(root, bg=t["card_bg"], highlightthickness=1,
                       highlightbackground=t["border"], padx=2, pady=2)
         self.frame, self.rows, self.sel = fr, [], -1
+        self.q = q
         n = 0
         if not groups:
             tk.Label(fr, text=translate_text("No matches. Tip: device:, "
@@ -51629,6 +51646,15 @@ class SearchDrop:
     def open_selected(self):
         if self.frame is None:
             return False
+        # third audit: typed fast, Enter came before the list caught up
+        # and opened a row of the previous text. A list that isn't for
+        # what the box says now is not used: Enter searches the box.
+        with contextlib.suppress(AttributeError, tk.TclError):
+            if getattr(self, "q", None) != \
+                    self.app.global_search_var.get().strip():
+                self.cancel()
+                self.close()
+                return False
         if 0 <= self.sel < len(self.rows):
             self._run(self.rows[self.sel][1])
             return True
@@ -101014,6 +101040,56 @@ def gt_c534_search_window(app, ctx):
         app.global_search_var.set("")
 
 
+@gui_test_step("third audit: Escape twice empties the search box; Enter "
+               "searches what the box says, not a list left from before")
+def gt_a3_search_escape_and_enter(app, ctx):
+    root, drop, e = app.root, app.search_drop, app.search_entry
+    _gui_focus_main(app)
+    try:
+        app.global_search_var.set("vpn")
+        drop.update()
+        _gui_pump(root, 0.2)
+        assert drop.frame is not None, "no list for vpn"
+        e.focus_force()
+        _gui_pump(root, 0.1)
+        e.event_generate("<Escape>")
+        _gui_pump(root, 0.1)
+        assert drop.frame is None, "Escape left the list open"
+        assert app.global_search_var.get() == "vpn", \
+            "the first Escape only closes the list"
+        e.event_generate("<Escape>")
+        _gui_pump(root, 0.1)
+        assert app.global_search_var.get() == "", \
+            "Escape with nothing open keeps the text"
+        # typed faster than the list: the list still shows "vpn"
+        app.global_search_var.set("vpn")
+        drop.update()
+        _gui_pump(root, 0.1)
+        rows_vpn = drop.shown()
+        app.global_search_var.set("192.168")
+        drop.cancel()                   # Enter before the list redraws
+        assert drop.frame is not None and drop.shown() == rows_vpn
+        app._search_enter()
+        _gui_pump(root, 0.3)
+        win = app.search_window()
+        assert win is not None, "Enter ran a row of the old list"
+        assert "192.168" in win.title(), win.title()
+        app.close_search_window()
+        # the list for what the box says: Enter still opens its first row
+        app.global_search_var.set("192.168")
+        drop.update()
+        _gui_pump(root, 0.1)
+        assert drop.frame is not None
+        assert drop.open_selected() is True
+        _gui_pump(root, 0.2)
+        assert drop.frame is None
+    finally:
+        app.close_search_window()
+        drop.close()
+        app.global_search_var.set("")
+        _gui_pump(root, 0.1)
+
+
 @gui_test_step("crowd 5.3.4 #14: Settings takes the keyboard (Escape "
                "closes it), says no change was made until one is saved, "
                "asks Save / Don't save / Cancel, and follows the header's "
@@ -101413,6 +101489,33 @@ def t_a3_timeline_names_own_devices(ctx):
                   "Votre box a rejoint votre réseau"], fr
     assert es == ["Este equipo se ha unido a su red",
                   "Su router se ha unido a su red"], es
+
+
+@self_test()
+def t_a3_fr_label_colon_and_es_is_at(ctx):
+    """Third audit leftovers: a label translated on its words got its
+    colon back without French's space ("Gravité:"), and the Spanish
+    packet line "X is at <MAC>" read "X está en <MAC>" (is located in)."""
+    for en, fr in (("Severity:", "Gravité :"), ("Evidence:", "Preuve :"),
+                   ("Severity: ", "Gravité : ")):
+        assert translate_text(en, "fr") == fr, (en, translate_text(en, "fr"))
+    assert translate_text("Severity:", "es") == "Gravedad:", \
+        translate_text("Severity:", "es")
+    # the search box's own syntax stays as typed
+    assert "device:" in translate_text(
+        "No matches found. Tip: try device:, site:, ip:, port: or alert:",
+        "fr")
+    mac = "02:11:22:33:44:55"
+    for en, es in ((f"192.168.50.60 is at {mac}",
+                    f"192.168.50.60 corresponde a {mac}"),
+                   (f"fe80::1 is at {mac} (IPv6)",
+                    f"fe80::1 corresponde a {mac} (IPv6)"),
+                   ("LAPTOP is at 192.168.50.7 (Windows name)",
+                    "LAPTOP corresponde a 192.168.50.7 (nombre de Windows)")):
+        got = translate_text(en, "es")
+        assert got == es, (en, got)
+    assert translate_text(f"192.168.50.60 is at {mac}", "fr") == \
+        f"192.168.50.60 est à {mac}"
 
 
 @self_test()

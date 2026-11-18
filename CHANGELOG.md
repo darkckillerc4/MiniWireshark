@@ -162,6 +162,8 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - The Map's lines stop at the names of the devices and websites they pass, instead of being drawn through them ("news.example.org").
 - The Timeline calls this computer and the router "This computer" and "Your router" when they have no name of their own, as the alerts do. They were "Device using a private Wi-Fi address (192.168.50.10) joined your network".
 - French and Spanish: the Websites *How we know* column ("Connected"), the Wi-Fi line under Health → *Your connection* and the demo's network name are translated, and French puts a space before the colon in "D'ici :" and "Depuis 23:13 :".
+- French filter labels get their space before the colon too ("Gravité :", "Preuve :"), and the Spanish packet line "X is at <MAC>" says "X corresponde a <MAC>" instead of "está en" (is located in).
+- Search box: Escape with nothing open empties the box (the first Escape still only closes the list), and Enter typed before the list catches up searches what the box says instead of opening a row of the previous text.
 - French: a fact another system told MiniWireshark is called "Signalé" everywhere (it was "rapporté" in places), and a correlated one "Corrélé" (it was "Recoupé" in the evidence key).
 - Pressing Stop while MiniWireshark was restarting a capture that had stopped by itself no longer starts the capture again a few seconds later.
 - The help for the Beginner view now names all the tabs it hides: Connections, Internet hosts, Packets and Sources.
@@ -219,7 +221,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 - Device fingerprints from DHCP request lists ship without built-in rows until real captures of your own devices are available.
 
-Tested on Python 3.8, 3.12 and 3.13, and 3.12 and 3.14 on Windows (471 self-tests), and with 94 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed. On Linux with Python 3.12, scapy and psutil we measured 468 passed, 0 failed, 3 skipped (run as root, no `ip` or `arp`, not a git checkout); without scapy and psutil, 40 more tests are skipped (428 / 0 / 43). The [README](README.md#testing) lists every setup we measured.
+Tested on Python 3.8, 3.12 and 3.13, and 3.12 and 3.14 on Windows (472 self-tests), and with 95 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed. On Linux with Python 3.12, scapy and psutil we measured 469 passed, 0 failed, 3 skipped (run as root, no `ip` or `arp`, not a git checkout); without scapy and psutil, 40 more tests are skipped (429 / 0 / 43). The [README](README.md#testing) lists every setup we measured.
 
 ## [5.2.3] — 2026-10-24
 
