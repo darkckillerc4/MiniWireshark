@@ -45,7 +45,8 @@ MiniWireshark mostly *listens*. It sends something in the following cases, each 
 | Country lookup | **Off** by default; only for addresses seen while watching live | An online lookup service over HTTPS (`ipwho.is`, `get.geojs.io` or `ipapi.co`), only if you turn it on |
 | Pi-hole / AdGuard Home | Only if you add one | The helper you added, on your network |
 | Router port-forwarding check | Only when you press the button | Your router |
-| Open a local service | Only when you open one from Websites → Local services | Your browser, at `127.0.0.1` (this computer) |
+| Open a local service | Only when you open one from Websites → Local services. When MiniWireshark runs as administrator with no user to open it as (a root login, or an elevated copy on Windows), it doesn't open the browser and shows the address to type instead. | Your browser, at `127.0.0.1` (this computer) |
+| Local services web-page check | **Off** by default. Only after you tick *Check which ones are web pages* in Websites → Local services (setting `local_services.probe`): when the list is read, and again on **Refresh**. Never in Demo Mode. | Only this computer: one `GET /` (plain HTTP, then HTTPS without checking the certificate if the answer looks like TLS; 1 second, at most 64 KB read, no redirect followed) to each port that may be a web page, at `127.0.0.1` or this computer's own address. Never sent to databases, Redis, raw printing (9100), file sharing (SMB/NetBIOS), mail, DNS, SSH, LDAP, mDNS or SSDP ports. Each scan is one ledger line with its count. |
 
 How to check:
 

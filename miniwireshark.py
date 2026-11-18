@@ -13087,6 +13087,9 @@ FEATURES = {
     "route_pick": True,      # the card Windows' own route uses (IP-004)
     "compiled_start": True,  # Windows writes and starts from the copy (M4)
     "theme_steps": True,     # hidden tabs recoloured just after (5.3.4)
+    # Local services may ask this computer's ports "GET /", only once the
+    # person turns it on there (local_services.probe; third audit #1)
+    "local_probe": True,
 }
 
 
@@ -13301,6 +13304,9 @@ FEATURE_HELP = {
                          "to api.github.com, nothing about you)",
     "theme_steps": "a theme change recolours the tabs you can't see one "
                    "by one, just after the one you see",
+    "local_probe": "Local services can ask this computer's possible web "
+                   "pages for their title, once you tick “Check which "
+                   "ones are web pages” (off by default)",
 }
 
 
@@ -19855,7 +19861,9 @@ class OsListenMap(ProcessMap):
 # The services listening on this computer, one row per program and port,
 # with a plain guess at what each one is and who can reach it. Built from
 # ProcessMap.listening (psutil, the same table the Security tab reads);
-# nothing is sent to list them.
+# nothing is sent to list them. Only when the person turns on "Check which
+# ones are web pages" is each likely web port asked "GET /" (this
+# computer only; third audit #1).
 LOCAL_DEV_WEB = "Web app in development"
 # TCP ports where a program on a person's own computer is most often a web
 # app being built (React, Vite, Angular, Django, Flask, Rails, Jupyter...)
@@ -19990,29 +19998,55 @@ def local_url_ok(url, own=()):
 # SMB/NetBIOS; and every port the table or the program's name says isn't
 # a web page (local_service_rows)
 LOCAL_PROBE_SKIP = frozenset({137, 138, 139, 445, 1433, 3306, 5432, 6379,
-                              9100, 11211, 27017})
+                              9100, 11211, 27017,
+                              # third audit #2: well-known non-web ports
+                              22, 25, 53, 110, 143, 389, 465, 587, 993, 995,
+                              1900, 5353})
 
 
 def local_page_title(data):
     """The page's <title>, found in one pass (second audit #3: a lazy
-    regex over 64 KB of "<title>" took about 2 s of CPU per answer)."""
+    regex over 64 KB of "<title>" took about 2 s of CPU per answer).
+    Third audit: only the <title> element itself (not <titlebar>, not an
+    <svg>'s <title>), decoded by the charset the header or a <meta> names
+    (else UTF-8, else Windows-1252)."""
     lo = data.lower()
-    i = lo.find(b"<title")
-    j = lo.find(b">", i) if i >= 0 else -1
+    pos, svg = 0, lo.find(b"<svg")
+    while True:
+        i = lo.find(b"<title", pos)
+        if i < 0:
+            return ""
+        if 0 <= svg < i:               # skip the whole <svg>...</svg>
+            end = lo.find(b"</svg", svg)
+            if end < 0:
+                return ""
+            pos, svg = end + 5, lo.find(b"<svg", end + 5)
+            continue
+        if lo[i + 6:i + 7] in (b">", b" ", b"\t", b"\r", b"\n", b"/"):
+            break
+        pos = i + 6                    # <titlebar> and the like
+    j = lo.find(b">", i)
     k = lo.find(b"</title", j) if j >= 0 else -1
     if k < 0:
         return ""
-    return sanitize_text(" ".join(html.unescape(data[j + 1:k][:4096].decode(
-        "utf-8", "replace")).split()), 120)
+    raw = data[j + 1:k][:4096]
+    m = re.search(rb"charset\s*=\s*[\"']?([a-z0-9_.:-]{1,40})", lo)
+    try:
+        text = raw.decode(m.group(1).decode() if m else "utf-8")
+    except (LookupError, UnicodeDecodeError):
+        text = raw.decode("cp1252", "replace")
+    return sanitize_text(" ".join(html.unescape(text).split()), 120)
 
 
-def probe_local_http(host, port, own=(), timeout=1.0):
+def probe_local_http(host, port, own=(), timeout=1.0, record=True):
     """One "GET /" to a port of THIS computer (loopback, or one of its own
     addresses in `own`; never another host, and no redirect is
     followed): plain HTTP, then TLS without checking the certificate when
     the answer looks like TLS. Each try: `timeout` s to connect, then
     `timeout` s to read at most 64 KB; each is listed in the ledger and
-    stopped by the kill switch (OutboundBlocked).
+    stopped by the kill switch (OutboundBlocked). `record=False`: the
+    caller listed the whole scan in the ledger once (third audit); the
+    kill switch still stops each try.
     -> {"web", "https", "status", "title"}"""
     a = ip_obj(host)
     if a is None or a.is_unspecified or not (a.is_loopback or local_addr_key(
@@ -20027,8 +20061,11 @@ def probe_local_http(host, port, own=(), timeout=1.0):
 
     def ask(tls):
         """-> (bytes read, the server closed by itself)"""
-        outbound("local_probe", "https" if tls else "http", where,
-                 "GET / (this computer only)")
+        if record:
+            outbound("local_probe", "https" if tls else "http", where,
+                     "GET / (this computer only)")
+        elif LEDGER.killed:
+            raise OutboundBlocked("Not sent — the kill switch is on")
         data, closed, accepted = b"", False, False
         try:
             with _socket.create_connection((host, port), timeout) as raw:
@@ -26812,6 +26849,8 @@ def _default_config():
         "filters": {"presets": json.loads(json.dumps(DEFAULT_FILTER_PRESETS)),
                     "recent": []},
         "diagnostics": {"verbose_logging": False},
+        # third audit #1: asking local ports "GET /" is opt-in
+        "local_services": {"probe": False},
     }
 
 
@@ -32298,6 +32337,10 @@ the operating system ¦ le système d'exploitation ¦ el sistema operativo
 unknown program (needs admin rights to name it) ¦ programme inconnu (il faut les droits d'administrateur pour le nommer) ¦ programa desconocido (hacen falta derechos de administrador para nombrarlo)
 Database connection (MongoDB) ¦ Connexion à une base de données (MongoDB) ¦ Conexión a base de datos (MongoDB)
 Local services opened in your browser (this computer) ¦ Services locaux ouverts dans votre navigateur (cet ordinateur) ¦ Servicios locales abiertos en su navegador (este equipo)
+Local services checked for a web page (this computer) ¦ Services locaux vérifiés pour savoir s'ils sont une page web (cet ordinateur) ¦ Servicios locales comprobados para saber si son una página web (este equipo)
+Check which ones are web pages ¦ Vérifier lesquels sont des pages web ¦ Comprobar cuáles son páginas web
+Off by default. When on, MiniWireshark asks each service that may be a web page for its home page (one “GET /”), only on this computer, to show its title. Listed in “What MiniWireshark sent”; the kill switch stops it. ¦ Désactivé par défaut. Une fois activé, MiniWireshark demande sa page d'accueil (un seul « GET / ») à chaque service qui pourrait être une page web, uniquement sur cet ordinateur, pour afficher son titre. Listé dans « Ce que MiniWireshark a envoyé » ; l'arrêt d'urgence l'arrête. ¦ Desactivado por defecto. Al activarlo, MiniWireshark pide su página de inicio (un solo «GET /») a cada servicio que podría ser una página web, solo en este equipo, para mostrar su título. Aparece en «Lo que envió MiniWireshark»; el interruptor de corte lo detiene.
+MiniWireshark is running as administrator, so it doesn't open this page: your browser would run as administrator too. ¦ MiniWireshark fonctionne en administrateur, il n'ouvre donc pas cette page : votre navigateur fonctionnerait lui aussi en administrateur. ¦ MiniWireshark se ejecuta como administrador, así que no abre esta página: su navegador también se ejecutaría como administrador.
 Large upload at night ¦ Gros envoi pendant la nuit ¦ Gran subida durante la noche
 Regular check-ins to one server ¦ Contacts réguliers avec un même serveur ¦ Contactos regulares con un mismo servidor
 Data hidden in name lookups ¦ Données cachées dans des recherches de noms ¦ Datos ocultos en búsquedas de nombres
@@ -43657,7 +43700,8 @@ class LocalServicesView:
     tab (psutil). Each row says what the program probably is and whether
     other devices can reach it; a web app opens in the browser at
     127.0.0.1, through the outbound() gate. Reading the list sends
-    nothing."""
+    nothing; "Check which ones are web pages" (off by default, third
+    audit #1) asks the likely web ports "GET /", on this computer only."""
 
     COLS = [("port", "Port", 60, "e", False),
             ("proto", "Protocol", 76, "w", False),
@@ -43717,6 +43761,18 @@ class LocalServicesView:
                                    command=self.open_selected,
                                    state="disabled")
         self.open_btn.pack(side="left", padx=(6, 0))
+        self.probe_var = tk.BooleanVar(value=bool(self.app.config.get(
+            "local_services.probe", False)))
+        if FEATURES.get("local_probe", True):
+            cb = ttk.Checkbutton(bar, text="Check which ones are web pages",
+                                 variable=self.probe_var,
+                                 command=self._set_probe)
+            cb.pack(side="left", padx=(12, 0))
+            Tooltip(cb, "Off by default. When on, MiniWireshark asks each "
+                        "service that may be a web page for its home page "
+                        "(one “GET /”), only on this computer, to show its "
+                        "title. Listed in “What MiniWireshark sent”; the "
+                        "kill switch stops it.")
         self.count_lbl = tk.Label(bar, text="", bg=WHITE, fg="#666666")
         self.count_lbl.pack(side="right")
         # shown only when some programs couldn't be named or listed
@@ -43890,20 +43946,32 @@ class LocalServicesView:
     def _start_probes(self, rows, own):
         """Ask the ports not asked yet "GET /" in the background (at most 8
         at a time); the table shows the answers when they are in. Not
-        for fixture rows, nor in Demo Mode (it sends nothing)."""
+        for fixture rows, nor in Demo Mode (it sends nothing), and only
+        when the person turned it on (local_services.probe, third audit
+        #1). The ledger lists each scan once, with its count."""
         if self.source is not None or \
-                getattr(self.app, "data_mode", "") == "demo":
+                getattr(self.app, "data_mode", "") == "demo" or \
+                not FEATURES.get("local_probe", True) or \
+                not self.app.config.get("local_services.probe", False):
             return False
         todo = [r["probe"] for r in rows
                 if r["probe"] and r["probe"] not in self.probes]
         if not todo:
+            return False
+        try:
+            outbound("local_probe", "http", "this computer",
+                     "GET / to %d port(s) of this computer" % len(todo),
+                     count=len(todo))
+        except OutboundBlocked:
+            for k in todo:            # not again until Refresh
+                self.probes[k] = None
             return False
         probes = self.probes          # Refresh starts a new one
 
         def one(k):
             port, _prog, host = k
             try:
-                probes[k] = probe_local_http(host, port, own)
+                probes[k] = probe_local_http(host, port, own, record=False)
             except (OSError, ValueError):            # the kill switch too
                 pass
 
@@ -43920,6 +43988,16 @@ class LocalServicesView:
         for k in todo:                # one is running: asked after it
             probes.pop(k, None)
         return False
+
+    def _set_probe(self):
+        """The "Check which ones are web pages" switch: saved; on asks
+        now, off forgets the answers (the port-based guess again)."""
+        on = bool(self.probe_var.get())
+        self.app.config.set("local_services.probe", on)
+        self.app.config.save()
+        if not on:
+            self.probes = {}
+        self.refresh(force=True)
 
     def empty_state(self):
         if self.reading():
@@ -43995,6 +44073,16 @@ class LocalServicesView:
             self.app._set_banner(tt(
                 "Demo Mode: this service is made up, so nothing is "
                 "opened."), "info")
+            return False
+        if is_admin() and person_ids() is None:
+            # third audit #3: administrator with nobody to open it as (a
+            # root login, an elevated Windows copy): never a root browser
+            self.app._set_banner(
+                tt("MiniWireshark is running as administrator, so it "
+                   "doesn't open this page: your browser would run as "
+                   "administrator too.") + " " +
+                tt("To open it yourself, type this address in your "
+                   "browser:") + " " + url, "warn")
             return False
         parts = urllib.parse.urlsplit(url)
         try:
@@ -86254,7 +86342,9 @@ def t_534_local_services_open_through_gate(ctx):
     """5.3.4 (Local services): opening a web app goes through outbound()
     (listed in the ledger as this computer, stopped by the kill switch,
     which says what to type instead); a service that isn't a web page is
-    never opened."""
+    never opened. Third audit #3: an administrator copy with nobody to
+    open it as (root login, elevated Windows) refuses and says what to
+    type; a root copy started through sudo opens it as the person."""
     import webbrowser
     rows = {(r["proto"], r["port"]): r
             for r in local_service_rows(_local_fake_listeners())}
@@ -86265,8 +86355,26 @@ def t_534_local_services_open_through_gate(ctx):
     old_open, old_killed = webbrowser.open, LEDGER.killed
     webbrowser.open = lambda url, *a, **k: opened.append(url) or True
     n0 = len(LEDGER.snapshot("local_open"))
+    stack = contextlib.ExitStack()
     try:
         LEDGER.killed = False
+        with _b9_patched(globals(), is_admin=lambda: True,
+                         person_ids=lambda: None):
+            assert not LocalServicesView.open_service(
+                view, rows[("TCP", 5173)])
+        assert not opened and len(LEDGER.snapshot("local_open")) == n0
+        assert banners[-1][0] == "warn" and "administrator" in \
+            banners[-1][1] and "http://127.0.0.1:5173/" in banners[-1][1]
+        started = []
+        with _b9_patched(globals(), is_admin=lambda: True,
+                         person_ids=lambda: (1000, 1000, "me", "/home/me"),
+                         start_for_person=lambda cmd, **kw:
+                         started.append(cmd)):
+            assert LocalServicesView.open_service(view, rows[("TCP", 5173)])
+        assert not opened and started and \
+            started[0][-1] == "http://127.0.0.1:5173/", started
+        n0 += 1
+        stack.enter_context(_b9_patched(globals(), is_admin=lambda: False))
         assert LocalServicesView.open_service(view, rows[("TCP", 5173)])
         assert opened == ["http://127.0.0.1:5173/"], opened
         ent = LEDGER.snapshot("local_open")
@@ -86296,6 +86404,7 @@ def t_534_local_services_open_through_gate(ctx):
         assert not LocalServicesView.open_service(view, rows[("TCP", 3000)])
         assert "http://[::1]:3000/" in banners[-1][1], banners[-1]
     finally:
+        stack.close()
         webbrowser.open, LEDGER.killed = old_open, old_killed
 
 
@@ -86519,15 +86628,52 @@ def t_534_local_http_probe(ctx):
 
 
 @self_test()
+def t_a3_local_page_title(ctx):
+    """Third audit: the page title is the <title> element itself, not a
+    <titlebar> or an <svg>'s <title>, decoded by the charset the header
+    or a <meta> names (a Latin-1 page shows its accents); a probe that
+    isn't recorded on its own is still stopped by the kill switch."""
+    t = local_page_title
+    assert t(b"HTTP/1.0 200 OK\r\n\r\n<html><titlebar>x</titlebar>"
+             b"<svg><title>icon</title></svg><title lang=en>Real"
+             b"</title>") == "Real"
+    assert t(b"<svg><title>only icon</title></svg>") == ""
+    assert t(b"<svg><title>open svg") == ""
+    assert t(b"HTTP/1.0 200 OK\r\nContent-Type: text/html; "
+             b"charset=ISO-8859-1\r\n\r\n<title>Caf\xe9 cr\xe8me</title>"
+             ) == "Café crème"
+    assert t(b'<meta charset="windows-1252"><title>\xc9t\xe9</title>') == \
+        "Été"
+    assert t("<title>Página</title>".encode()) == "Página"
+    assert t(b"<title>no charset \xe9</title>") == "no charset é"
+    assert t(b"charset=nope-xyz <title>Caf\xe9</title>") == "Café"
+    assert t(b"<TITLE>Upper</TITLE>") == "Upper"
+    with _b9_patched(LEDGER, killed=True):
+        try:
+            probe_local_http("127.0.0.1", 9, record=False)
+            raise AssertionError("sent with the kill switch on")
+        except OutboundBlocked:
+            pass
+
+
+@self_test()
 def t_534_local_probe_skip_and_once(ctx):
     """Local services: ports known not to be web pages (Redis 6379, raw
     printing 9100, databases, SMB/NetBIOS, what the service table or the
     program's name marks as something else) are never asked; a port is
     asked once when it appears, the automatic re-read reuses the answer,
     Refresh asks again; a restarted program is asked again; Demo Mode
-    asks nothing; the answer's scheme wins over the port's."""
-    for port in (6379, 9100, 3306, 5432, 27017, 1433, 11211, 139, 445):
+    asks nothing; the answer's scheme wins over the port's. Third audit:
+    nothing is asked until local_services.probe is on (#1); the
+    well-known non-web ports are never asked, whatever the program is
+    called (#2); one ledger entry per scan, with its count."""
+    never = (6379, 9100, 3306, 5432, 27017, 1433, 11211, 137, 138, 139,
+             445, 22, 25, 53, 110, 143, 389, 465, 587, 993, 995, 5353, 1900)
+    for port in never:
         assert port in LOCAL_PROBE_SKIP, port
+    # the real path: an unknown program on each of them is not asked
+    odd = {("TCP", "127.0.0.1", p): (p, "mystery") for p in never}
+    assert not [r["port"] for r in local_service_rows(odd) if r["probe"]]
     listening = {("TCP", "127.0.0.1", p): (p, "x") for p in
                  (6379, 9100, 3306, 5432, 27017, 1433, 11211, 139, 445,
                   22, 631, 5173, 8443, 61000)}
@@ -86548,14 +86694,19 @@ def t_534_local_probe_skip_and_once(ctx):
     assert {x["port"]: x for x in r}[5173]["url"] is None
     seen = []
 
-    def probe(host, port, own=(), timeout=1.0):
+    def probe(host, port, own=(), timeout=1.0, record=True):
+        assert record is False          # the scan was listed once
         seen.append((host, port))
         return dict(plain, title="App %d" % port)
 
-    def view(mode="offline"):
+    def view(mode="offline", on=True):
         return types.SimpleNamespace(
             source=None, probes={}, _probe_seq=0,
-            app=types.SimpleNamespace(data_mode=mode),
+            app=types.SimpleNamespace(data_mode=mode, config=types.
+                                      SimpleNamespace(get=lambda k, d=None:
+                                                      on if k ==
+                                                      "local_services.probe"
+                                                      else d)),
             _pm=lambda: types.SimpleNamespace(available=False),
             refresh=lambda force=False: None)
 
@@ -86565,13 +86716,19 @@ def t_534_local_probe_skip_and_once(ctx):
                   if t.name == "local-probe"]:
             t.join(10)
         return started
-    with _b9_patched(globals(), probe_local_http=probe):
+    with _b9_patched(globals(), probe_local_http=probe), \
+            _b9_patched(LEDGER, killed=False):
+        off = view(on=False)                        # the default: off
+        assert not run(off, rows) and not seen and off.probes == {}
+        n0 = len(LEDGER.snapshot("local_probe"))
         v = view()
         assert run(v, rows) and sorted(seen) == [
             ("127.0.0.1", 5173), ("127.0.0.1", 8443),
             ("127.0.0.1", 61000)], seen
         assert v._probe_seq == 1 and v.probes[by[5173]["probe"]][
             "title"] == "App 5173"
+        ent = LEDGER.snapshot("local_probe")
+        assert len(ent) == n0 + 1 and ent[-1].get("count", 1) == 3, ent[-1:]
         assert not run(v, local_service_rows(listening, (), v.probes))
         assert len(seen) == 3                       # the re-read: no
         moved = dict(listening)
@@ -86585,6 +86742,10 @@ def t_534_local_probe_skip_and_once(ctx):
         fixture = view()
         fixture.source = lambda: ("ok", listening)
         assert not run(fixture, rows) and len(seen) == 7
+        LEDGER.killed = True                        # the kill switch
+        k = view()
+        assert not run(k, rows) and len(seen) == 7 and \
+            all(x is None for x in k.probes.values())
 
 
 @self_test()
@@ -87714,8 +87875,10 @@ def bench_gui(argv):
 # the window is photographed tab by tab, and one folder comes back with a
 # summary. Nothing is sent anywhere; nothing is installed.
 GATE_SHOT_TABS = ("dash", "feed", "timeline", "devices", "map", "health",
-                  "alerts", "websites", "connections", "remote", "packets",
-                  "security", "sources", "help")
+                  "alerts", "websites", "local_services", "connections",
+                  "remote", "packets", "security", "sources", "help")
+# a picture of a tab's sub-view: (tab, sub-view) (third audit)
+GATE_SHOT_SUBVIEWS = {"local_services": ("websites", "Local services")}
 
 
 def grab_window(root, path):
@@ -87849,9 +88012,12 @@ def gui_shots(out_dir, quick=False):
                      (f", {scale}" if scale else "") + ", window " +
                      f"{root.winfo_width()}x{root.winfo_height()}")
         for name in (GATE_SHOT_TABS if not quick else GATE_SHOT_TABS[:4]):
-            if name not in app.tabs:
+            tab_name, sub = GATE_SHOT_SUBVIEWS.get(name, (name, None))
+            if tab_name not in app.tabs:
                 continue
-            app._select_tab(name)
+            app._select_tab(tab_name)
+            if sub:
+                app.tabs[tab_name].show_subview(sub)
             _gui_pump(root, 0.8)
             park_pointer(root)
             _gui_pump(root, 0.2)
@@ -87869,6 +88035,9 @@ def gui_shots(out_dir, quick=False):
             problems += len(found)
             path = os.path.join(out_dir, f"{tag}-{name}.png")
             ok, how = grab_window(root, path)
+            if sub:
+                app.tabs[tab_name].show_subview(
+                    app.tabs[tab_name].SUBVIEWS[0])
             shots += ok
             tool = tool or (how if ok else "")
             lines.append(f"  {name:12s} " + (
@@ -99063,6 +99232,9 @@ def gt_534_local_services(app, ctx):
         _gui_pump(root, 0.4)
         assert tab.subview == "Local services"
         assert view.tree.winfo_ismapped()
+        # third audit #1: asking ports "GET /" is off until switched on
+        assert view.probe_var.get() is False and \
+            not app.config.get("local_services.probe", True)
         rows = cells()
         assert len(rows) == 10, rows
         by = {(r[1], r[0]): r for r in rows}
