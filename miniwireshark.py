@@ -733,7 +733,7 @@ def _tmp_name(path):
     return f"{path}.tmp{os.getpid()}-{threading.get_ident() % 100000}"
 
 
-def _open_new_tmp(tmp, mode, encoding=None):
+def _open_new_tmp(tmp, mode, encoding=None, newline=None):
     """Second audit (security #5): the temporary file is always a new file
     of our own. Its name can be guessed, so a file or link someone left
     under it in a shared folder (an export to /tmp) is removed and never
@@ -749,7 +749,7 @@ def _open_new_tmp(tmp, mode, encoding=None):
             if attempt:
                 raise
             os.remove(tmp)            # a stale one, or someone else's link
-    return os.fdopen(fd, mode, encoding=encoding)
+    return os.fdopen(fd, mode, encoding=encoding, newline=newline)
 
 
 def _atomic_write(path, data, mode, encoding=None):
@@ -39266,10 +39266,8 @@ class TableKit:
             w = safe_csv_writer(buf)
             for r in rows:
                 w.writerow(r)
-            tmp = path + ".part"
-            with open(tmp, "w", encoding="utf-8", newline="") as f:
-                f.write(buf.getvalue())
-            os.replace(tmp, path)
+            # third audit #2: never through a link planted at path.part
+            atomic_write_bytes(path, buf.getvalue().encode("utf-8"))
             return len(rows) - 1
 
         def ok(n):
@@ -62411,22 +62409,25 @@ proc ::mw_explicit_fonts {top names} {
         rows are plain dicts kept for the window); formatting and writing
         them — seconds on a OneDrive or network folder — happen in a
         background job. The file appears whole (written as .part, then
-        renamed)."""
+        renamed). Third audit #2: the temporary file is a new one of our
+        own, as in atomic_write_*: a link planted under its name is never
+        followed."""
+        tmp = _tmp_name(path)
+
         def run(job):
-            tmp = path + ".part"
-            with open(tmp, "w", newline="", encoding="utf-8") as f:
+            with _open_new_tmp(tmp, "w", encoding="utf-8", newline="") as f:
                 w = safe_csv_writer(f)
                 w.writerow(header)
                 for i, r in enumerate(rows):
                     w.writerow(r)
                     if i % 2000 == 1999:
                         job.progress(min(0.95, i / max(1, total)))
-            os.replace(tmp, path)
+            _replace_retrying(tmp, path)
             return path
 
         def failed(e):
             with contextlib.suppress(OSError):
-                os.remove(path + ".part")
+                os.remove(tmp)
             if not isinstance(e, JobCancelled):
                 messagebox.showerror("Export error", str(e),
                                      parent=self.root)
@@ -102268,6 +102269,40 @@ def t_a2_temp_file_never_follows_a_link(ctx):
     with open(target, encoding="utf-8") as f:
         assert f.read() == "new"
     assert not os.path.lexists(_tmp_name(target))
+
+
+@self_test()
+def t_a3_csv_export_never_follows_a_link(ctx):
+    """Third audit #2: both CSV exports (the window's and a table's) used
+    a plain open() on path.part, so a link planted there was written
+    through. Now they write a new file of their own, as atomic_write_*."""
+    if IS_WINDOWS:
+        return "skip"                  # links need extra rights there
+    folder = ctx.path("a3_shared")
+    os.makedirs(folder, exist_ok=True)
+    victim = ctx.path("a3_victim.txt")
+    with open(victim, "w", encoding="utf-8") as f:
+        f.write("keep")
+    jobs = types.SimpleNamespace(submit=lambda kind, title, run, ok, bad:
+                                 ok(run(Job(kind, title, None))))
+    status = types.SimpleNamespace(set=lambda *_a: None)
+    win = types.SimpleNamespace(jobs=jobs, status_var=status, root=None)
+    kit = types.SimpleNamespace(app=win)
+    for name, write in (
+            ("window.csv", lambda p: MiniWireshark._write_csv_job(
+                win, p, ["a"], [["1"]], 1, "done")),
+            ("table.csv", lambda p: TableKit._export_write(
+                kit, p, [["a"], ["1"]], None))):
+        target = os.path.join(folder, name)
+        for planted in (target + ".part", _tmp_name(target)):
+            os.symlink(victim, planted)
+        write(target)
+        with open(victim, encoding="utf-8") as f:
+            assert f.read() == "keep", name
+        assert not os.path.islink(target)
+        with open(target, "rb") as f:
+            assert f.read() == b"a\r\n1\r\n", name
+        assert not os.path.lexists(_tmp_name(target))
 
 
 @self_test()
