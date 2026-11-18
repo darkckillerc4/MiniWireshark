@@ -23916,6 +23916,7 @@ class NetworkModel:
         self._flow_marks = {}     # fid -> (out, in) when this minute began
         self.offline_now = 0.0
         self.gateway_ip = gateway_ip
+        self.gateway_guessed = False   # True: gateway_ip is infer_gateway's
         self.my_ips = set(my_ips)
         self.my_macs = {m.lower() for m in my_macs if m}
         self.local_nets = []
@@ -26611,13 +26612,16 @@ class NetworkModel:
     def dhcp_trusted(self):
         """Second audit (#37): (server, router) of the DHCP server this
         network trusts: the one that names the router this computer uses
-        (live), else the first one seen. A rogue server arrives later and
-        often answers more, so the count can't decide."""
+        (its default route), else the first one seen. A rogue server often
+        answers more, so the count can't decide. Third audit #3: the
+        default route decides even when the rogue was heard first (and with
+        the packet clock); only a gateway guessed from a file's DHCP isn't
+        ground truth."""
         offers = [(s, o) for s, o in self.dhcp_offers.items()
                   if o.get("router")]
         if not offers:
             return None
-        if self.gateway_ip and not self.use_packet_clock:
+        if self.gateway_ip and not self.gateway_guessed:
             for s, o in offers:
                 if o["router"] == self.gateway_ip:
                     return s, o["router"]
@@ -58422,6 +58426,7 @@ proc ::mw_explicit_fonts {top names} {
                     gw = self.model.infer_gateway()
                     if gw and gw != self.model.gateway_ip:
                         self.model.set_identity(gateway_ip=gw)
+                        self.model.gateway_guessed = True
                 self._update_perf()
                 self._sync_overload_line()
                 cv = self.model.cache.version
@@ -61832,6 +61837,7 @@ proc ::mw_explicit_fonts {top names} {
         gw = self.model.infer_gateway()
         if gw:
             self.model.set_identity(gateway_ip=gw)
+            self.model.gateway_guessed = True
         self.root.after(1500, self._pcap_finalize, n, cancelled)
 
     def _pcap_finalize(self, n, cancelled):
@@ -76702,6 +76708,24 @@ def t_a2_rogue_dhcp(ctx):
     got = a2_kinds(m, "dhcp_anomaly")
     assert len(got) == 1 and got[0].severity == "WARNING", got
     assert m.infer_gateway() == sb.GW[0]
+
+
+@self_test()
+def t_a3_rogue_dhcp_seen_first(ctx):
+    """Third audit #3: a rogue DHCP server heard before the real router no
+    longer makes the real router the suspect: the router this computer
+    uses (its default route) decides, not which offer came first."""
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    a2_dhcp_ack(sb, rogue, rmac, sb.PHONE, rogue, rogue)
+    sb.home_network()
+    m = a2_model(ctx, sb.frames)
+    assert m.dhcp_trusted() == (sb.GW[0], sb.GW[0]), m.dhcp_trusted()
+    assert m.dhcp_rogue()[:2] == (rogue, rogue), m.dhcp_rogue()
+    for _ in range(2):              # the answer doesn't move once used
+        assert m.infer_gateway() == sb.GW[0], m.infer_gateway()
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert got and got[-1].severity == "DANGER", got
 
 
 @self_test()
