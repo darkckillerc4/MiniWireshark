@@ -11655,7 +11655,12 @@ def _fast_ipv4(d, raw, off, reasm):
         raise NeedDeepParse("short ipv4")
     vihl = raw[off]
     ihl = (vihl & 0x0F) * 4
-    if vihl >> 4 != 4 or ihl < 20 or n < off + ihl:
+    if ihl < 20:
+        # round 4: a header shorter than its 20 fixed bytes can't be read;
+        # scapy took 2.5-6 ms a packet to say "Raw frame" too
+        d["proto"], d["text"] = "Raw", "Raw frame"
+        return _fast_done(d)
+    if vihl >> 4 != 4 or n < off + ihl:
         raise NeedDeepParse("bad ipv4 header")
     total = _U16.unpack_from(raw, off + 2)[0]
     frag = _U16.unpack_from(raw, off + 6)[0]
@@ -11700,7 +11705,12 @@ def _fast_ipv6(d, raw, off, reasm):
     if db[0] == 0xFF or db == _IP6_ANY or \
             (db[:12] == _IP6_V4MAPPED and is_multicast_or_broadcast(dst)):
         d["multicast"] = True
-    end = off + 40 + plen if off + 40 + plen <= n else n
+    # a payload length of 0 before hop-by-hop options, TCP or UDP is a
+    # jumbogram or a send the network card cuts up later (large send
+    # offload): its size is the bytes captured (round 4: it went to scapy,
+    # which called it "Padding frame")
+    end = n if not plen and nh in (0, 6, 17) else \
+        off + 40 + plen if off + 40 + plen <= n else n
     p = off + 40
     # every hop-by-hop, routing, destination-options and fragment header
     # (audit 2026-11-14 #47: after 6 the frame went to scapy, 45-184 ms
@@ -11748,6 +11758,12 @@ def _fast_l4(d, raw, proto, p, end, reasm, ipver, ip_end=None):
                   "text": "Joining/leaving a multicast group (IGMP)"})
         return _fast_done(d)
     name = _ip_proto_label(proto, ipver)
+    if name is None and p < end and not (proto == 135 and ipver == 6):
+        # round 4: a protocol scapy has no decoder for either (it has one
+        # for IPv6 mobility); it took 0.1-4.5 ms a packet (IP options,
+        # padded IPv6 headers) to say so
+        d["proto"], d["text"] = "Raw", "Raw frame"
+        return _fast_done(d)
     if name is None or proto in (4, 41, 47):
         # tunnels: scapy decodes the inner packet
         raise NeedDeepParse(f"ip proto {proto}")
@@ -93287,6 +93303,88 @@ def t_a3_udp_length_checked_against_ip_and_bytes(ctx):
         for raw, want in cases:
             got = decode_packet(Ether(raw))["payload_len"]
             assert got == want, (got, want)
+
+
+def _r4_eth(et, body):
+    return b"\x02\x00\x00\x00\x00\x02\x02\x00\x00\x00\x00\x01" + \
+        struct.pack(">H", et) + body
+
+
+def _r4_v4(proto, load, total=None, vihl=0x45):
+    return _r4_eth(0x0800, struct.pack(
+        ">BBHHHBBH", vihl, 0, 20 + len(load) if total is None else total,
+        0, 0, 64, proto, 0) + _socket.inet_aton("10.0.0.1") +
+        _socket.inet_aton("10.0.0.2") + load)
+
+
+def _r4_v6(nh, body, plen=None):
+    return _r4_eth(0x86DD, struct.pack(
+        ">IHBB", 6 << 28, len(body) if plen is None else plen, nh, 64) +
+        _socket.inet_pton(_socket.AF_INET6, "2001:db8::1") +
+        _socket.inet_pton(_socket.AF_INET6, "2001:db8::2") + body)
+
+
+@self_test()
+def t_r4_damaged_ip_and_unknown_protocols_fast(ctx):
+    """Round 4: an IPv4 header shorter than 20 bytes, and an IP protocol
+    scapy has no decoder for, are a "Raw frame" from the fast decoder, as
+    scapy says, without asking scapy (2.5-6 ms and 0.1-4.5 ms a packet);
+    tunnels and IPv6 mobility still go to scapy."""
+    junk = bytes(range(256)) * 6
+    short = [_r4_eth(0x0800, bytes([v << 4 | ihl]) + junk[:1400])
+             for v in (4, 0, 8) for ihl in range(5)]
+    pad1 = bytes([142, 16]) + bytes(16 * 8 + 6)     # 134 one-byte pads
+    weird = [_r4_v4(82, bytes(40 + 1000), vihl=0x4F),     # 40 B of options
+             _r4_v6(0, pad1 + bytes(64)), _r4_v6(60, pad1 + bytes(64)),
+             _r4_v6(59, bytes(8))]
+    for raw in short + weird:
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
+        assert (d["proto"], d["text"]) == ("Raw", "Raw frame"), d["text"]
+    assert _fast_decode(short[0], 1.0, 1, None)["src_ip"] == ""
+    assert fast_decode(weird[1], 1.0)["src_ip"] == "2001:db8::1"
+    every = [_r4_v4(pr, bytes(40)) for pr in range(256)] + \
+        [_r4_v6(nh, bytes(40)) for nh in range(256)]
+    for raw in (every[4], every[41], every[47], every[256 + 4],
+                every[256 + 41], every[256 + 47], every[256 + 135]):
+        try:
+            _fast_decode(raw, 1.0, 1, TlsReassembler())
+            raise AssertionError("a tunnel not handed to scapy")
+        except NeedDeepParse:
+            pass
+    t0 = time.perf_counter()
+    for _ in range(20):
+        for raw in short + weird:
+            fast_decode(raw, 1.0)
+    each = (time.perf_counter() - t0) / (20 * len(short + weird))
+    assert each < 0.0005, f"{each * 1e6:.0f} µs a packet"     # ~5 µs
+    if ctx.scapy_ok:
+        # what scapy says for each of them, protocol by protocol (not for
+        # the short headers: scapy reads their addresses or not depending
+        # on the bytes after them, and says "Raw frame" either way)
+        diffs = decoder_differences([(r, 1.0, 1) for r in weird + every + [
+            _r4_v4(82, b""), _r4_v6(59, b""), _r4_v6(59, b"", plen=0)]])
+        assert not diffs, diffs[:3]
+        for raw in short:
+            assert decode_packet(Ether(raw))["text"] == "Raw frame"
+
+
+@self_test()
+def t_r4_ipv6_payload_length_zero_uses_bytes(ctx):
+    """Round 4: an IPv6 payload length of 0 (a jumbogram, or a large send
+    the network card cuts up later) is read from the bytes captured, as an
+    IPv4 total length of 0 already was; it went to scapy, which said
+    "Padding frame"."""
+    udp = struct.pack(">HHHH", 40000, 9999, 65535, 0) + bytes(4)
+    tcp = struct.pack(">HHIIBBHHH", 40000, 443, 1, 0, 0x50, 0x18, 64240,
+                      0, 0) + bytes(1400)
+    for raw, text, size in (
+            (_r4_v6(17, udp, plen=0), "Quick message (4 bytes)", 4),
+            (_r4_v6(6, tcp, plen=0), None, 1400),
+            (_r4_v4(6, tcp, total=0), None, 1400)):
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
+        assert d["payload_len"] == size, (d["payload_len"], size)
+        assert text is None or d["text"] == text, d["text"]
+        assert d["transport"] in ("TCP", "UDP"), d["text"]
 
 
 @self_test()
