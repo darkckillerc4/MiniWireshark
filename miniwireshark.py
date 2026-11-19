@@ -103677,9 +103677,17 @@ def t_a2_browser_opens_as_the_person(ctx):
         assert all(callable(kw.get("preexec_fn")) for _c, kw in started)
         assert started[0][0][1] == "http://127.0.0.1:5173/"
         started.clear()
-        with _b9_patched(os.environ, SUDO_UID=None, PKEXEC_UID=None):
-            assert open_in_browser("http://127.0.0.1:5173/", "local_open",
-                                   "127.0.0.1:5173", "test")
+        # no person known at all: no SUDO_UID and no login id (a self-test
+        # run with sudo on a desktop has a login id of its own)
+        login_uid = globals()["_login_uid"]
+        globals()["_login_uid"] = lambda: None
+        try:
+            with _b9_patched(os.environ, SUDO_UID=None, PKEXEC_UID=None):
+                assert open_in_browser("http://127.0.0.1:5173/",
+                                       "local_open", "127.0.0.1:5173",
+                                       "test")
+        finally:
+            globals()["_login_uid"] = login_uid
         assert opened == ["http://127.0.0.1:5173/"] and not started
     finally:
         subprocess.Popen, webbrowser.open, LEDGER.killed = real
