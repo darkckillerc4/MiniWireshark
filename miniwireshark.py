@@ -19885,7 +19885,166 @@ LOCAL_PROGRAM_HINTS = (
     ("sshd", "Remote terminal (SSH)", False),
     # macOS: the AirPlay receiver takes 5000 and 7000
     ("controlcenter", "Streaming to a speaker/TV (AirPlay)", False),
+    # third audit (owner): more programs by name, so fewer rows say
+    # "unknown" (longer names first where one starts another)
+    ("sqlservr", "Database connection (SQL Server)", False),
+    ("memcached", "Cache server (memcached)", False),
+    ("httpd", "Web server (Apache)", True),
+    ("apache", "Web server (Apache)", True),
+    ("lighttpd", "Web server (lighttpd)", True),
+    ("caddy", "Web server (Caddy)", True),
+    ("jupyter", "Notebook server (Jupyter)", True),
+    ("ollama", "AI model server (Ollama)", False),
+    ("com.docker", "Containers (Docker)", False),
+    ("dockerd", "Containers (Docker)", False),
+    ("docker", "Containers (Docker)", False),
+    ("smbd", "Windows file sharing (SMB)", False),
+    ("nmbd", "Local name lookup (NetBIOS)", False),
+    ("cups-browsed", "Printer discovery", False),
+    ("spoolsv", "Printing (Windows)", False),
+    ("avahi-daemon", "Local name lookup (mDNS)", False),
+    ("mdnsresponder", "Local name lookup (mDNS)", False),
+    ("dnsmasq", "Website lookup (DNS)", False),
+    ("systemd-resolve", "Website lookup (DNS)", False),
+    ("chronyd", "Checking the time (NTP)", False),
+    ("ntpd", "Checking the time (NTP)", False),
+    ("rpcbind", "Network service directory (RPC)", False),
+    ("rapportd", "Nearby Apple devices (Continuity)", False),
+    ("sharingd", "AirDrop and sharing", False),
+    ("kdeconnect", "Phone link (KDE Connect)", False),
+    ("teamviewer", "Remote support (TeamViewer)", False),
+    ("anydesk", "Remote support (AnyDesk)", False),
+    ("x11vnc", "Remote screen sharing (VNC)", False),
+    ("vino", "Remote screen sharing (VNC)", False),
+    ("spotify", "Music app (Spotify)", False),
+    ("steam", "Game launcher (Steam)", False),
+    ("discord", "Chat app (Discord)", False),
+    ("dropbox", "File sync (Dropbox)", False),
+    ("onedrive", "File sync (OneDrive)", False),
+    ("zoom", "Video calls (Zoom)", False),
+    ("svchost", "Windows background service", False),
+    ("lsass", "Windows sign-in (Kerberos)", False),
+    ("wininit", "Windows background service", False),
+    ("launchd", "System service (macOS)", False),
+    ("systemd", "System service (systemd)", False),
 )
+# names that only count whole (a prefix would catch other programs):
+# Windows' own "System" process (pid 4: file sharing, discovery) and its
+# service manager
+LOCAL_PROGRAM_EXACT = {"system": "Part of Windows itself",
+                       "services": "Windows background service"}
+# third audit (owner: "organized, not just all put there"): each service
+# goes under one heading, found from what it is. (word in what it is,
+# heading key, a plain line saying what it does); the first match wins.
+LOCAL_KINDS = (
+    ("web", "Websites and web apps"),
+    ("db", "Databases and data stores"),
+    ("share", "File sharing, printing and streaming"),
+    ("remote", "Remote access to this computer"),
+    ("dev", "Developer tools"),
+    ("apps", "Apps"),
+    ("system", "System and network services"),
+    ("unknown", "Not sure what these are"),
+)
+LOCAL_WEB_ABOUT = "A web server: it sends web pages to a browser."
+LOCAL_KIND_RULES = (
+    # before "web": a website *lookup* is not a web page
+    ("website lookup", "system",
+     "Looks up website names (DNS) for this computer or your network."),
+    ("encrypted dns", "system",
+     "Looks up website names (DNS) for this computer or your network."),
+    ("windows remote management", "system", "Part of Windows."),
+    ("web app in development", "web",
+     "A website or app being built on this computer. Open it in your "
+     "browser to see it."),
+    ("notebook server", "web",
+     "Notebooks you open in your browser (code, notes and charts)."),
+    ("web admin", "web",
+     "A settings page for a program, opened in a browser."),
+    ("web", "web", LOCAL_WEB_ABOUT),
+    ("database", "db",
+     "A database: programs keep and read their data here."),
+    ("cache server", "db",
+     "A fast store that apps use to keep data close at hand."),
+    ("printer discovery", "share",
+     "Finds printers on your network so you can print to them."),
+    ("printing", "share",
+     "Printing: pages go through it on their way to a printer."),
+    ("file sharing", "share",
+     "Shares files and folders with other computers."),
+    ("file transfer", "share",
+     "Sends and receives files (an FTP-style file server)."),
+    ("remote file access", "share",
+     "Lets other computers open files stored here."),
+    ("file sync", "share",
+     "Keeps your files in step with other computers or the cloud."),
+    ("airdrop", "share",
+     "Sends files to nearby Apple devices (AirDrop)."),
+    ("airplay", "share",
+     "Lets phones and computers play sound or video through this "
+     "computer."),
+    ("media server", "share",
+     "Shares your films, music and photos with other devices."),
+    ("stream", "share", "Streams video or sound to other devices."),
+    ("casting", "share", "Lets this computer cast to a TV."),
+    ("remote terminal", "remote",
+     "Lets someone sign in to this computer and type commands. Normal "
+     "if you set it up; worth a look if you didn't."),
+    ("remote desktop", "remote",
+     "Lets someone see and control this computer's screen. Normal if "
+     "you set it up; worth a look if you didn't."),
+    ("screen sharing", "remote",
+     "Lets someone see and control this computer's screen. Normal if "
+     "you set it up; worth a look if you didn't."),
+    ("remote support", "remote",
+     "A remote-help tool: someone you give the code to can use this "
+     "computer."),
+    ("remote management", "remote",
+     "Lets an administrator manage this computer from elsewhere."),
+    ("containers", "dev",
+     "Runs programs in containers for software development."),
+    ("ai model server", "dev",
+     "Runs AI models on this computer for apps that ask it."),
+    ("message queue", "dev", "Passes messages between programs."),
+    ("proxy server", "dev",
+     "Relays connections for other programs (a proxy)."),
+    ("music app", "apps", "Part of an app installed on this computer."),
+    ("game", "apps", "Part of a game or game launcher."),
+    ("gaming", "apps", "Part of a game or game launcher."),
+    ("chat", "apps", "Part of a chat or calling app."),
+    ("video calls", "apps", "Part of a chat or calling app."),
+    ("calling", "apps", "Part of a chat or calling app."),
+    ("call relay", "apps", "Part of a chat or calling app."),
+    ("remote play", "apps", "Part of a game or game launcher."),
+    ("playstation", "apps", "Part of a game or game launcher."),
+    ("phone link", "apps", "Connects this computer with your phone."),
+    ("push notifications", "apps",
+     "Brings notifications to apps on this computer."),
+    ("iphone/ipad sync", "apps", "Syncs an iPhone or iPad."),
+    ("smart home", "apps", "Talks to smart home devices."),
+    ("name lookup", "system",
+     "Lets devices on your network find each other by name."),
+    ("device discovery", "system",
+     "Lets devices on your network find each other (TVs, printers, "
+     "speakers)."),
+    ("nearby apple devices", "system",
+     "Lets your Apple devices work together (Handoff, copy and paste)."),
+    ("ip address", "system", "Hands out network addresses (DHCP)."),
+    ("checking the time", "system", "Keeps this computer's clock right."),
+    ("vpn", "system", "A VPN: connects this computer to another network."),
+    ("windows", "system", "Part of Windows."),
+    ("system service", "system", "Part of the operating system."),
+    ("rpc", "system", "Part of the operating system."),
+    ("kerberos", "system", "Part of the operating system."),
+    ("log messages", "system", "Collects the system's log messages."),
+    ("network monitoring", "system",
+     "Answers network monitoring tools (SNMP)."),
+    ("directory lookup", "system",
+     "A company directory (users and computers)."),
+    ("email", "apps", "An email server or email app."),
+)
+LOCAL_UNKNOWN_ABOUT = ("MiniWireshark doesn't recognise it: look up the "
+                       "program's name.")
 LOCAL_SAFE = "Only this computer can reach it"
 LOCAL_EXPOSED = "Other devices on your network can reach it"
 LOCAL_UNKNOWN = "Not sure what this is"
@@ -19903,6 +20062,21 @@ DEMO_LOCAL_LISTENERS = {
     ("TCP", "0.0.0.0", 22): (98, "sshd")}
 
 
+def local_service_kind(what, web=False):
+    """(heading key of LOCAL_KINDS, a plain English line saying what the
+    service does) for what local_service_guess said it is."""
+    if what == LOCAL_UNKNOWN:
+        return ("web", LOCAL_WEB_ABOUT) if web else \
+            ("unknown", LOCAL_UNKNOWN_ABOUT)
+    low = str(what or "").lower()
+    for word, kind, about in LOCAL_KIND_RULES:
+        if word in low:
+            return kind, about
+    if web:
+        return "web", LOCAL_WEB_ABOUT
+    return "unknown", LOCAL_UNKNOWN_ABOUT
+
+
 def _local_is_loopback(ip):
     s = local_addr_key(ip)
     return s.startswith("127.") or s == "::1"
@@ -19913,6 +20087,8 @@ def local_service_guess(proto, port, program=""):
     page a browser can open). TCP only for web pages."""
     name = re.sub(r" \(pid \d+\)$", "", str(program or "")).lower()
     name = name[:-4] if name.endswith(".exe") else name
+    if name in LOCAL_PROGRAM_EXACT:
+        return LOCAL_PROGRAM_EXACT[name], False
     for start, what, web in LOCAL_PROGRAM_HINTS:
         if name.startswith(start):
             return what, web and proto == "TCP"
@@ -20147,9 +20323,10 @@ def local_service_rows(listening, own=(), probes=None):
             web, https, title = got["web"], got["https"], got["title"]
             if web and what == LOCAL_UNKNOWN:
                 what = LOCAL_WEB_SERVER[80]
+        kind, about = local_service_kind(what, web)
         rows.append({"proto": proto, "port": port, "program": prog,
                      "addrs": addrs, "network": network, "what": what,
-                     "web": web,
+                     "kind": kind, "about": about, "web": web,
                      "url": local_service_url(proto, port, addrs, web,
                                               own, https),
                      "safety": LOCAL_EXPOSED if network else LOCAL_SAFE,
@@ -20188,11 +20365,24 @@ def local_service_cells(r):
     if prog in ("the operating system",
                 "unknown program (needs admin rights to name it)"):
         prog = tt(prog)
-    what = tt(r["what"])
+    if r["what"] == LOCAL_UNKNOWN and isinstance(r["port"], int):
+        # third audit (owner): a clear name, not "Not sure what this is"
+        what = tt("Unknown service on port %d") % r["port"]
+    else:
+        what = tt(r["what"])
     if r.get("title"):                 # the page's own title, when asked
         what += " — " + r["title"]
     return (r["port"], r["proto"], what, tt(r["safety"]), prog,
             f"{where} ({', '.join(shown)})")
+
+
+def local_service_view_cells(r):
+    """(the name shown in the first column, the other columns) of one row
+    of the Local services view, in the shown language: what it does, run
+    by, who can reach it, port, protocol, where it listens."""
+    port, proto, what, safety, prog, listens = local_service_cells(r)
+    about = r.get("about") or local_service_kind(r["what"], r["web"])[1]
+    return what, (translate_text(about), prog, safety, port, proto, listens)
 
 
 class ListenWatch:
@@ -32328,6 +32518,137 @@ Web app in development ¦ Application web en développement ¦ Aplicación web e
 Web server ¦ Serveur web ¦ Servidor web
 Secure web server ¦ Serveur web sécurisé ¦ Servidor web seguro
 Not sure what this is ¦ Pas sûr de ce que c'est ¦ No está claro qué es
+# third audit (owner): Local services by kind, each with a plain line
+Android push notifications ¦ Notifications Android ¦ Notificaciones de Android
+Apple file sharing (AFP) ¦ Partage de fichiers Apple (AFP) ¦ Archivos compartidos de Apple (AFP)
+Apple push notifications ¦ Notifications Apple ¦ Notificaciones de Apple
+Casting control (Chromecast) ¦ Contrôle de la diffusion (Chromecast) ¦ Control de la transmisión (Chromecast)
+Chat messaging (XMPP) ¦ Messagerie instantanée (XMPP) ¦ Mensajería instantánea (XMPP)
+Company directory lookup (LDAP, secure) ¦ Annuaire d'entreprise (LDAP, sécurisé) ¦ Directorio de empresa (LDAP, seguro)
+Database connection (Oracle) ¦ Connexion à une base de données (Oracle) ¦ Conexión a base de datos (Oracle)
+Device discovery (WS-Discovery) ¦ Découverte d'appareils (WS-Discovery) ¦ Detección de dispositivos (WS-Discovery)
+Encrypted DNS (DNS-over-TLS) ¦ DNS chiffré (DNS-over-TLS) ¦ DNS cifrado (DNS-over-TLS)
+File sharing (BitTorrent) ¦ Partage de fichiers (BitTorrent) ¦ Archivos compartidos (BitTorrent)
+File sync (rsync) ¦ Synchronisation de fichiers (rsync) ¦ Sincronización de archivos (rsync)
+File transfer (FTPS) ¦ Transfert de fichiers (FTPS) ¦ Transferencia de archivos (FTPS)
+Getting an IP address (DHCP) ¦ Obtention d'une adresse IP (DHCP) ¦ Obtención de una dirección IP (DHCP)
+Live video streaming (RTMP) ¦ Diffusion vidéo en direct (RTMP) ¦ Transmisión de vídeo en directo (RTMP)
+Local name lookup (LLMNR) ¦ Recherche de nom locale (LLMNR) ¦ Búsqueda de nombre local (LLMNR)
+Message queue (AMQP) ¦ File de messages (AMQP) ¦ Cola de mensajes (AMQP)
+Online gaming ¦ Jeu en ligne ¦ Juego en línea
+Online gaming (Minecraft) ¦ Jeu en ligne (Minecraft) ¦ Juego en línea (Minecraft)
+Online gaming (Steam) ¦ Jeu en ligne (Steam) ¦ Juego en línea (Steam)
+Online gaming (Xbox Live) ¦ Jeu en ligne (Xbox Live) ¦ Juego en línea (Xbox Live)
+PlayStation network ¦ Réseau PlayStation ¦ Red de PlayStation
+Proxy server (HTTP) ¦ Serveur proxy (HTTP) ¦ Servidor proxy (HTTP)
+Proxy server (SOCKS) ¦ Serveur proxy (SOCKS) ¦ Servidor proxy (SOCKS)
+Remote management (WinRM) ¦ Gestion à distance (WinRM) ¦ Gestión remota (WinRM)
+Remote management (WinRM, secure) ¦ Gestion à distance (WinRM, sécurisé) ¦ Gestión remota (WinRM, segura)
+Remote play (PlayStation) ¦ Jeu à distance (PlayStation) ¦ Juego remoto (PlayStation)
+Remote screen sharing (Apple Remote Desktop) ¦ Partage d'écran à distance (Apple Remote Desktop) ¦ Pantalla compartida remota (Apple Remote Desktop)
+Search database (Elasticsearch) ¦ Base de recherche (Elasticsearch) ¦ Base de datos de búsqueda (Elasticsearch)
+Smart home messaging (CoAP) ¦ Messagerie de la maison connectée (CoAP) ¦ Mensajería del hogar inteligente (CoAP)
+Steam in-home streaming ¦ Diffusion de jeux à domicile (Steam) ¦ Transmisión de juegos en casa (Steam)
+VPN mesh (Tailscale) ¦ Réseau VPN maillé (Tailscale) ¦ Red VPN en malla (Tailscale)
+VPN mesh (ZeroTier) ¦ Réseau VPN maillé (ZeroTier) ¦ Red VPN en malla (ZeroTier)
+VPN tunnel (IPsec NAT-T) ¦ Tunnel VPN (IPsec NAT-T) ¦ Túnel VPN (IPsec NAT-T)
+VPN tunnel (IPsec) ¦ Tunnel VPN (IPsec) ¦ Túnel VPN (IPsec)
+VPN tunnel (L2TP) ¦ Tunnel VPN (L2TP) ¦ Túnel VPN (L2TP)
+VPN tunnel (OpenVPN) ¦ Tunnel VPN (OpenVPN) ¦ Túnel VPN (OpenVPN)
+VPN tunnel (PPTP, outdated) ¦ Tunnel VPN (PPTP, dépassé) ¦ Túnel VPN (PPTP, obsoleto)
+VPN tunnel (WireGuard) ¦ Tunnel VPN (WireGuard) ¦ Túnel VPN (WireGuard)
+Video/voice call relay (Google STUN) ¦ Relais d'appels audio/vidéo (Google STUN) ¦ Relé de llamadas de voz/vídeo (Google STUN)
+Video/voice call relay (STUN/TURN) ¦ Relais d'appels audio/vidéo (STUN/TURN) ¦ Relé de llamadas de voz/vídeo (STUN/TURN)
+Web admin (alternate port) ¦ Administration web (autre port) ¦ Administración web (puerto alternativo)
+Web service (alternate port) ¦ Service web (autre port) ¦ Servicio web (puerto alternativo)
+Windows Update sharing ¦ Partage des mises à jour Windows ¦ Uso compartido de Windows Update
+Windows remote management (RPC) ¦ Gestion à distance de Windows (RPC) ¦ Administración remota de Windows (RPC)
+iPhone/iPad sync ¦ Synchronisation iPhone/iPad ¦ Sincronización de iPhone/iPad
+Websites and web apps ¦ Sites et applications web ¦ Sitios y aplicaciones web
+Databases and data stores ¦ Bases de données et stockage ¦ Bases de datos y almacenamiento
+File sharing, printing and streaming ¦ Partage de fichiers, impression et diffusion ¦ Archivos compartidos, impresión y transmisión
+Remote access to this computer ¦ Accès à distance à cet ordinateur ¦ Acceso remoto a este equipo
+Developer tools ¦ Outils de développement ¦ Herramientas de desarrollo
+Apps ¦ Applications ¦ Aplicaciones
+System and network services ¦ Services du système et du réseau ¦ Servicios del sistema y de la red
+Not sure what these are ¦ Pas sûr de ce que c'est ¦ No está claro qué son
+Looks up website names (DNS) for this computer or your network. ¦ Recherche les noms des sites (DNS) pour cet ordinateur ou votre réseau. ¦ Busca los nombres de los sitios (DNS) para este equipo o su red.
+Part of Windows. ¦ Fait partie de Windows. ¦ Forma parte de Windows.
+A website or app being built on this computer. Open it in your browser to see it. ¦ Un site ou une application en cours de création sur cet ordinateur. Ouvrez-le dans votre navigateur pour le voir. ¦ Un sitio o una aplicación que se está creando en este equipo. Ábralo en su navegador para verlo.
+Notebooks you open in your browser (code, notes and charts). ¦ Des carnets que vous ouvrez dans votre navigateur (code, notes et graphiques). ¦ Cuadernos que abre en su navegador (código, notas y gráficos).
+A settings page for a program, opened in a browser. ¦ La page de réglages d'un programme, ouverte dans un navigateur. ¦ La página de ajustes de un programa, abierta en un navegador.
+A web server: it sends web pages to a browser. ¦ Un serveur web : il envoie des pages web à un navigateur. ¦ Un servidor web: envía páginas web a un navegador.
+A database: programs keep and read their data here. ¦ Une base de données : des programmes y gardent et y lisent leurs données. ¦ Una base de datos: los programas guardan y leen aquí sus datos.
+A fast store that apps use to keep data close at hand. ¦ Un stockage rapide où les applications gardent des données à portée de main. ¦ Un almacenamiento rápido donde las aplicaciones guardan datos a mano.
+Finds printers on your network so you can print to them. ¦ Trouve les imprimantes de votre réseau pour que vous puissiez y imprimer. ¦ Encuentra las impresoras de su red para que pueda imprimir en ellas.
+Printing: pages go through it on their way to a printer. ¦ Impression : les pages passent par lui avant d'arriver à une imprimante. ¦ Impresión: las páginas pasan por aquí camino de una impresora.
+Shares files and folders with other computers. ¦ Partage des fichiers et des dossiers avec d'autres ordinateurs. ¦ Comparte archivos y carpetas con otros equipos.
+Sends and receives files (an FTP-style file server). ¦ Envoie et reçoit des fichiers (un serveur de fichiers de type FTP). ¦ Envía y recibe archivos (un servidor de archivos tipo FTP).
+Lets other computers open files stored here. ¦ Permet à d'autres ordinateurs d'ouvrir les fichiers stockés ici. ¦ Permite que otros equipos abran los archivos guardados aquí.
+Keeps your files in step with other computers or the cloud. ¦ Garde vos fichiers à jour avec d'autres ordinateurs ou le cloud. ¦ Mantiene sus archivos al día con otros equipos o la nube.
+Sends files to nearby Apple devices (AirDrop). ¦ Envoie des fichiers aux appareils Apple à proximité (AirDrop). ¦ Envía archivos a dispositivos Apple cercanos (AirDrop).
+Lets phones and computers play sound or video through this computer. ¦ Permet aux téléphones et ordinateurs de lire du son ou de la vidéo sur cet ordinateur. ¦ Permite que teléfonos y equipos reproduzcan sonido o vídeo en este equipo.
+Shares your films, music and photos with other devices. ¦ Partage vos films, musiques et photos avec d'autres appareils. ¦ Comparte sus películas, música y fotos con otros dispositivos.
+Streams video or sound to other devices. ¦ Diffuse de la vidéo ou du son vers d'autres appareils. ¦ Transmite vídeo o sonido a otros dispositivos.
+Lets this computer cast to a TV. ¦ Permet à cet ordinateur de diffuser sur une télé. ¦ Permite que este equipo transmita a una tele.
+Lets someone sign in to this computer and type commands. Normal if you set it up; worth a look if you didn't. ¦ Permet à quelqu'un de se connecter à cet ordinateur et de taper des commandes. Normal si vous l'avez installé ; à vérifier sinon. ¦ Permite que alguien inicie sesión en este equipo y escriba órdenes. Normal si usted lo configuró; conviene revisarlo si no.
+Lets someone see and control this computer's screen. Normal if you set it up; worth a look if you didn't. ¦ Permet à quelqu'un de voir et de contrôler l'écran de cet ordinateur. Normal si vous l'avez installé ; à vérifier sinon. ¦ Permite que alguien vea y controle la pantalla de este equipo. Normal si usted lo configuró; conviene revisarlo si no.
+A remote-help tool: someone you give the code to can use this computer. ¦ Un outil d'aide à distance : la personne à qui vous donnez le code peut utiliser cet ordinateur. ¦ Una herramienta de ayuda remota: quien reciba el código puede usar este equipo.
+Lets an administrator manage this computer from elsewhere. ¦ Permet à un administrateur de gérer cet ordinateur à distance. ¦ Permite que un administrador gestione este equipo a distancia.
+Runs programs in containers for software development. ¦ Fait tourner des programmes dans des conteneurs pour le développement. ¦ Ejecuta programas en contenedores para el desarrollo de software.
+Runs AI models on this computer for apps that ask it. ¦ Fait tourner des modèles d'IA sur cet ordinateur pour les applications qui le demandent. ¦ Ejecuta modelos de IA en este equipo para las aplicaciones que lo piden.
+Passes messages between programs. ¦ Transmet des messages entre programmes. ¦ Pasa mensajes entre programas.
+Relays connections for other programs (a proxy). ¦ Relaie les connexions d'autres programmes (un proxy). ¦ Retransmite las conexiones de otros programas (un proxy).
+Part of an app installed on this computer. ¦ Fait partie d'une application installée sur cet ordinateur. ¦ Forma parte de una aplicación instalada en este equipo.
+Part of a game or game launcher. ¦ Fait partie d'un jeu ou d'un lanceur de jeux. ¦ Forma parte de un juego o de un lanzador de juegos.
+Part of a chat or calling app. ¦ Fait partie d'une application de messagerie ou d'appels. ¦ Forma parte de una aplicación de chat o de llamadas.
+Connects this computer with your phone. ¦ Relie cet ordinateur à votre téléphone. ¦ Conecta este equipo con su teléfono.
+Brings notifications to apps on this computer. ¦ Apporte les notifications aux applications de cet ordinateur. ¦ Lleva las notificaciones a las aplicaciones de este equipo.
+Syncs an iPhone or iPad. ¦ Synchronise un iPhone ou un iPad. ¦ Sincroniza un iPhone o un iPad.
+Talks to smart home devices. ¦ Communique avec les appareils de la maison connectée. ¦ Se comunica con los dispositivos del hogar inteligente.
+Lets devices on your network find each other by name. ¦ Permet aux appareils de votre réseau de se trouver par leur nom. ¦ Permite que los dispositivos de su red se encuentren por su nombre.
+Lets devices on your network find each other (TVs, printers, speakers). ¦ Permet aux appareils de votre réseau de se trouver (télés, imprimantes, enceintes). ¦ Permite que los dispositivos de su red se encuentren (teles, impresoras, altavoces).
+Lets your Apple devices work together (Handoff, copy and paste). ¦ Permet à vos appareils Apple de travailler ensemble (Handoff, copier-coller). ¦ Permite que sus dispositivos Apple trabajen juntos (Handoff, copiar y pegar).
+Hands out network addresses (DHCP). ¦ Distribue les adresses réseau (DHCP). ¦ Reparte las direcciones de red (DHCP).
+Keeps this computer's clock right. ¦ Garde l'horloge de cet ordinateur à l'heure. ¦ Mantiene en hora el reloj de este equipo.
+A VPN: connects this computer to another network. ¦ Un VPN : relie cet ordinateur à un autre réseau. ¦ Una VPN: conecta este equipo con otra red.
+Part of the operating system. ¦ Fait partie du système d'exploitation. ¦ Forma parte del sistema operativo.
+Collects the system's log messages. ¦ Recueille les messages du journal du système. ¦ Recoge los mensajes del registro del sistema.
+Answers network monitoring tools (SNMP). ¦ Répond aux outils de surveillance du réseau (SNMP). ¦ Responde a las herramientas de supervisión de red (SNMP).
+A company directory (users and computers). ¦ Un annuaire d'entreprise (utilisateurs et ordinateurs). ¦ Un directorio de empresa (usuarios y equipos).
+An email server or email app. ¦ Un serveur ou une application de messagerie. ¦ Un servidor o una aplicación de correo.
+MiniWireshark doesn't recognise it: look up the program's name. ¦ MiniWireshark ne le reconnaît pas : cherchez le nom du programme. ¦ MiniWireshark no lo reconoce: busque el nombre del programa.
+Select a service to read what it does and who runs it. ¦ Sélectionnez un service pour lire ce qu'il fait et qui le lance. ¦ Seleccione un servicio para leer qué hace y quién lo ejecuta.
+Cache server (memcached) ¦ Serveur de cache (memcached) ¦ Servidor de caché (memcached)
+Web server (Apache) ¦ Serveur web (Apache) ¦ Servidor web (Apache)
+Web server (lighttpd) ¦ Serveur web (lighttpd) ¦ Servidor web (lighttpd)
+Web server (Caddy) ¦ Serveur web (Caddy) ¦ Servidor web (Caddy)
+Notebook server (Jupyter) ¦ Serveur de carnets (Jupyter) ¦ Servidor de cuadernos (Jupyter)
+AI model server (Ollama) ¦ Serveur de modèles d'IA (Ollama) ¦ Servidor de modelos de IA (Ollama)
+Containers (Docker) ¦ Conteneurs (Docker) ¦ Contenedores (Docker)
+Printer discovery ¦ Recherche d'imprimantes ¦ Búsqueda de impresoras
+Printing (Windows) ¦ Impression (Windows) ¦ Impresión (Windows)
+Website lookup (DNS) ¦ Recherche de sites (DNS) ¦ Búsqueda de sitios (DNS)
+Network service directory (RPC) ¦ Annuaire des services réseau (RPC) ¦ Directorio de servicios de red (RPC)
+Nearby Apple devices (Continuity) ¦ Appareils Apple à proximité (Continuité) ¦ Dispositivos Apple cercanos (Continuidad)
+AirDrop and sharing ¦ AirDrop et partage ¦ AirDrop y compartir
+Phone link (KDE Connect) ¦ Lien avec le téléphone (KDE Connect) ¦ Enlace con el teléfono (KDE Connect)
+Remote support (TeamViewer) ¦ Assistance à distance (TeamViewer) ¦ Asistencia remota (TeamViewer)
+Remote support (AnyDesk) ¦ Assistance à distance (AnyDesk) ¦ Asistencia remota (AnyDesk)
+Music app (Spotify) ¦ Application de musique (Spotify) ¦ Aplicación de música (Spotify)
+Game launcher (Steam) ¦ Lanceur de jeux (Steam) ¦ Lanzador de juegos (Steam)
+Chat app (Discord) ¦ Application de discussion (Discord) ¦ Aplicación de chat (Discord)
+File sync (Dropbox) ¦ Synchronisation de fichiers (Dropbox) ¦ Sincronización de archivos (Dropbox)
+File sync (OneDrive) ¦ Synchronisation de fichiers (OneDrive) ¦ Sincronización de archivos (OneDrive)
+Video calls (Zoom) ¦ Appels vidéo (Zoom) ¦ Videollamadas (Zoom)
+Windows background service ¦ Service Windows en arrière-plan ¦ Servicio de Windows en segundo plano
+Windows sign-in (Kerberos) ¦ Connexion Windows (Kerberos) ¦ Inicio de sesión de Windows (Kerberos)
+System service (macOS) ¦ Service du système (macOS) ¦ Servicio del sistema (macOS)
+System service (systemd) ¦ Service du système (systemd) ¦ Servicio del sistema (systemd)
+Part of Windows itself ¦ Fait partie de Windows lui-même ¦ Forma parte del propio Windows
+Unknown service on port %d ¦ Service inconnu sur le port %d ¦ Servicio desconocido en el puerto %d
+Run by ¦ Lancé par ¦ Ejecutado por
+Service ¦ Service ¦ Servicio
 Only this computer can reach it ¦ Seul cet ordinateur peut le joindre ¦ Solo este equipo puede acceder
 Other devices on your network can reach it ¦ D'autres appareils de votre réseau peuvent le joindre ¦ Otros dispositivos de su red pueden acceder
 This computer only ¦ Cet ordinateur seulement ¦ Solo este equipo
@@ -43703,12 +44024,15 @@ class LocalServicesView:
     nothing; "Check which ones are web pages" (off by default, third
     audit #1) asks the likely web ports "GET /", on this computer only."""
 
-    COLS = [("port", "Port", 60, "e", False),
-            ("proto", "Protocol", 76, "w", False),
-            ("what", "What it probably is", 200, "w", True),
-            ("safety", "Who can reach it", 250, "w", True),
-            ("program", "Program", 160, "w", True),
-            ("listens", "Listens on", 200, "w", True)]
+    # third audit (owner): grouped by kind, the name in the tree column,
+    # then a plain line saying what it does and the program behind it
+    COLS = [("about", "What it does", 300, "w", True),
+            ("program", "Run by", 150, "w", True),
+            ("safety", "Who can reach it", 220, "w", True),
+            ("port", "Port", 60, "e", False),
+            ("proto", "Protocol", 70, "w", False),
+            ("listens", "Listens on", 170, "w", True)]
+    NAME_COL = ("Service", 250)
     POLL_MS = 150
     READ_TIMEOUT = 8.0           # s: give up waiting for one read
     AUTO_EVERY = 15.0            # s: read again while shown, not watching
@@ -43779,18 +44103,33 @@ class LocalServicesView:
         self.note_lbl = tk.Label(frame, text="", bg=WHITE, fg="#8a5a00",
                                  wraplength=1000, justify="left",
                                  anchor="w", padx=12, font=mw_font(9))
-        wrap, self.tree = make_tree(frame, self.COLS, hscroll=True)
+        wrap, self.tree = make_tree(frame, self.COLS, hscroll=True,
+                                    show="tree headings")
+        self.tree.heading("#0", text=self.NAME_COL[0], anchor="w")
+        self.tree.column("#0", width=self.NAME_COL[1], minwidth=120,
+                         stretch=True)
+        self.tree.tag_configure("kind", font=mw_font(10, "bold"))
+        # the selected service in full sentences: a table cell is cut at
+        # its column's width, this line wraps
+        self.detail_lbl = tk.Label(
+            frame, text="Select a service to read what it does and who "
+            "runs it.", bg=WHITE, fg="#333333", wraplength=1000,
+            justify="left", anchor="w", padx=12, font=mw_font(9))
+        self.detail_lbl.pack(side="bottom", fill="x", pady=(0, 6))
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.wrap = wrap
+        self.iid_group = {}          # heading row -> ("kind", key)
         self.tree.bind("<Double-1>", self._double)
         self.tree.bind("<Return>", self._double)
         self.tree.bind("<<TreeviewSelect>>",
                        lambda e: self._sync_buttons(), add="+")
         self.kit = TableKit(
             tab, self.tree, wrap, "local_services",
-            key_of=lambda iid: self._key(self.iid_row.get(iid)),
+            key_of=lambda iid: self._key(self.iid_row.get(iid)) or
+            self.iid_group.get(iid),
             empty_state=self.empty_state,
-            sort_values={"port": lambda k: k[1] if k else None},
+            sort_values={"port": lambda k: k[1] if k and
+                         isinstance(k[1], int) else None},
             menu=self.menu_spec)
 
     @staticmethod
@@ -43908,17 +44247,35 @@ class LocalServicesView:
         except tk.TclError:
             return False
         self.iid_row.clear()
+        self.iid_group.clear()
         self.kit.clear()
         pick = None
+        # third audit (owner): under one heading per kind, in a fixed
+        # order, each heading with its count; empty headings are left out
+        by_kind = {}
         for r in rows:
-            key = self._key(r)
-            vals = self.kit.decorate(key, local_service_cells(r))
-            idx, slot = self.kit.insert_index("", key, vals)
-            iid = tree.insert("", idx, values=vals)
-            self.iid_row[iid] = r
-            self.kit.inserted("", iid, slot, key)
-            if key == want:
-                pick = iid
+            by_kind.setdefault(r.get("kind") or "unknown", []).append(r)
+        for kind, heading in LOCAL_KINDS:
+            members = by_kind.get(kind)
+            if not members:
+                continue
+            gkey = ("kind", kind)
+            text = f"{translate_text(heading)} ({len(members)})"
+            giid = tree.insert("", "end", text=text, values=(),
+                               open=True, tags=("kind",))
+            self.iid_group[giid] = gkey
+            for r in members:
+                key = self._key(r)
+                name, cells = local_service_view_cells(r)
+                vals = self.kit.decorate(key, cells)
+                name = self.kit.decorate_text(key, name)
+                idx, slot = self.kit.insert_index(giid, key, vals,
+                                                  text=name)
+                iid = tree.insert(giid, idx, text=name, values=vals)
+                self.iid_row[iid] = r
+                self.kit.inserted(giid, iid, slot, key)
+                if key == want:
+                    pick = iid
         with contextlib.suppress(tk.TclError):
             if pick is not None:
                 tree.selection_set(pick)
@@ -44028,6 +44385,19 @@ class LocalServicesView:
         with contextlib.suppress(tk.TclError):
             self.open_btn.configure(
                 state="normal" if r is not None and r["url"] else "disabled")
+            self.detail_lbl.configure(text=self.detail_text(r))
+
+    @staticmethod
+    def detail_text(r):
+        """The selected service in words (third audit): its name, what it
+        does, the program running it and who can reach it."""
+        tt = translate_text
+        if r is None:
+            return tt("Select a service to read what it does and who runs "
+                      "it.")
+        name, (about, prog, safety, _p, _pr, _l) = \
+            local_service_view_cells(r)
+        return f"{name}: {about}  {tt('Run by')}: {prog}.  {safety}."
 
     def menu_spec(self, key):
         r = next((x for x in self.rows if self._key(x) == key), None)
@@ -44046,8 +44416,9 @@ class LocalServicesView:
 
     def _double(self, _e=None):
         r = self.selected_row()
-        if r is not None:
-            self.open_service(r)
+        if r is None:
+            return None              # a heading: opens or closes as usual
+        self.open_service(r)
         return "break"
 
     def open_selected(self):
@@ -86305,6 +86676,63 @@ def t_534_local_services_rows(ctx):
 
 
 @self_test()
+def t_a3_local_services_by_kind(ctx):
+    """Third audit (owner: "organized, not just all put there"): every
+    service goes under one heading with a plain line saying what it does,
+    the program's name counts before the port, and one MiniWireshark
+    doesn't know is "Unknown service on port X", in all three languages."""
+    rows = local_service_rows(_local_fake_listeners())
+    by = {(r["proto"], r["port"]): r for r in rows}
+    kinds = {k for k, _h in LOCAL_KINDS}
+    for r in rows:
+        assert r["kind"] in kinds and r["about"], r
+    assert by[("TCP", 5173)]["kind"] == "web"
+    assert by[("TCP", 5432)]["kind"] == "db"
+    assert by[("TCP", 631)]["kind"] == "share"
+    assert by[("UDP", 5353)]["kind"] == "system"
+    assert by[("TCP", 5000)]["kind"] == "share"            # AirPlay
+    unk = by[("TCP", 44321)]
+    assert unk["kind"] == "unknown" and unk["about"] == LOCAL_UNKNOWN_ABOUT
+    assert local_service_cells(unk)[2] == "Unknown service on port 44321"
+    name, cells = local_service_view_cells(by[("TCP", 5432)])
+    assert name == "Database connection (PostgreSQL)", name
+    assert cells[0] == "A database: programs keep and read their data " \
+        "here." and cells[1] == "postgres (pid 99)", cells
+    # a website *lookup* is not a web page; Windows' RPC is Windows
+    assert local_service_kind("Website lookup (DNS)")[0] == "system"
+    assert local_service_kind("Windows remote management (RPC)")[0] == \
+        "system"
+    assert local_service_kind("Remote desktop (RDP)")[0] == "remote"
+    # every service name the program knows lands under a real heading
+    whats = set(PORT_SERVICES.values()) | {w for _s, w, _b in
+                                           LOCAL_PROGRAM_HINTS} | \
+        set(LOCAL_PROGRAM_EXACT.values()) | set(LOCAL_WEB_SERVER.values()) \
+        | {LOCAL_DEV_WEB}
+    lost = sorted(w for w in whats if local_service_kind(w)[0] == "unknown")
+    assert not lost, lost
+    # the program's name says more than the port; whole names only where
+    # a prefix would catch other programs
+    assert local_service_guess("TCP", 445, "smbd")[0] == \
+        "Windows file sharing (SMB)"
+    assert local_service_guess("TCP", 11434, "ollama")[0] == \
+        "AI model server (Ollama)"
+    assert local_service_guess("TCP", 445, "System")[0] == \
+        "Part of Windows itself"
+    assert local_service_guess("TCP", 61000, "systemuiserver")[0] == \
+        LOCAL_UNKNOWN
+    # French and Spanish: every heading, line and name shown
+    shown = {h for _k, h in LOCAL_KINDS} | {a for _w, _k, a in
+                                            LOCAL_KIND_RULES} | \
+        {LOCAL_UNKNOWN_ABOUT, "Unknown service on port %d", "Run by",
+         "Service", "What it does"} | whats
+    for loc in ("fr", "es"):
+        missing = sorted(x for x in shown if x not in I18N[loc])
+        assert not missing, (loc, missing[:8])
+        assert translate_text("Unknown service on port %d", loc) % 7 != \
+            "Unknown service on port 7"
+
+
+@self_test()
 def t_534_local_services_from_connection_table(ctx):
     """5.3.4 (Local services): the rows come from the same connection
     table as the Security tab (psutil, here a stand-in): listening TCP
@@ -99205,8 +99633,23 @@ def gt_534_local_services(app, ctx):
         return n
 
     def cells():
-        return [tuple(str(v) for v in view.tree.item(i, "values"))
-                for i in view.tree.get_children()]
+        """Every service row, as (port, protocol, name, who can reach it,
+        run by, listens on, what it does) — the rows sit under one
+        heading per kind (third audit)."""
+        out = []
+        for g in view.tree.get_children():
+            assert g in view.iid_group, ("a service outside a heading", g)
+            for i in view.tree.get_children(g):
+                about, prog, safety, port, proto, listens = (
+                    str(v) for v in view.tree.item(i, "values"))
+                name = str(view.tree.item(i, "text")).lstrip(ROW_DOT + " ")
+                out.append((port, proto, name, safety, prog, listens,
+                            about))
+        return out
+
+    def headings():
+        return [str(view.tree.item(g, "text"))
+                for g in view.tree.get_children()]
 
     def pick(port, proto="TCP"):
         for iid, r in view.iid_row.items():
@@ -99221,6 +99664,7 @@ def gt_534_local_services(app, ctx):
            app.config.get("appearance.theme"),
            app.config.get("appearance.text_size"), root.geometry())
     old_open, old_killed = webbrowser.open, LEDGER.killed
+    admin0, ids0 = is_admin, person_ids
     opened = []
     try:
         # (reachable_actions visits other tabs: first)
@@ -99246,6 +99690,19 @@ def gt_534_local_services(app, ctx):
         assert by[("TCP", "631")][2] == "Printing (IPP)"
         assert by[("TCP", "5432")][2] == "Database connection (PostgreSQL)"
         assert "node (pid 4001)" == by[("TCP", "5173")][4]
+        # third audit (owner): one heading per kind, in a fixed order, with
+        # its count; a plain line for each; a clear name when unknown
+        assert headings() == [
+            "Websites and web apps (5)", "Databases and data stores (1)",
+            "File sharing, printing and streaming (2)",
+            "System and network services (1)",
+            "Not sure what these are (1)"], headings()
+        assert by[("TCP", "5432")][6] == \
+            "A database: programs keep and read their data here."
+        assert by[("TCP", "5173")][6].startswith("A website or app being "
+                                                 "built on this computer")
+        assert by[("TCP", "44321")][2] == "Unknown service on port 44321"
+        assert "doesn't recognise it" in by[("TCP", "44321")][6]
         # refresh 3 times and EN → FR → ES → EN: the same rows, widgets
         # and table kits every time
         base = (len(rows), widgets(view.frame), len(app.kits),
@@ -99275,6 +99732,19 @@ def gt_534_local_services(app, ctx):
         # open: only a TCP web app, at 127.0.0.1, through the gate
         webbrowser.open = lambda url, *a, **k: opened.append(url) or True
         LEDGER.killed = False
+        # third audit #3: a copy running as administrator with nobody to
+        # open it as (a root login) never opens a root browser, and says
+        # what to type; the rest is the person's own copy, so it runs the
+        # same as root in a test container as on a person's computer
+        G = globals()
+        G["is_admin"], G["person_ids"] = (lambda: True), (lambda: None)
+        pick(5173)
+        view.open_btn.invoke()
+        assert opened == [], opened
+        assert "administrator" in str(app.banner_lbl.cget("text")) and \
+            "http://127.0.0.1:5173/" in str(app.banner_lbl.cget("text"))
+        app._hide_banner()
+        G["is_admin"] = lambda: False
         n0 = len(LEDGER.snapshot("local_open"))
         pick(5173)
         assert str(view.open_btn.cget("state")) == "normal"
@@ -99374,6 +99844,7 @@ def gt_534_local_services(app, ctx):
         assert not found, "\n".join(found[:10])
     finally:
         webbrowser.open, LEDGER.killed = old_open, old_killed
+        globals()["is_admin"], globals()["person_ids"] = admin0, ids0
         view.source = src0
         app.config.set("general.language", old[0])
         app.config.set("appearance.theme", old[1])
