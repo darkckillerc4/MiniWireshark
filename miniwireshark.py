@@ -31087,6 +31087,16 @@ Clear the sort ¦ Annuler le tri ¦ Quitar el orden
 Export this table… ¦ Exporter ce tableau… ¦ Exportar esta tabla…
 Export this table ¦ Exporter ce tableau ¦ Exportar esta tabla
 Exporting the table ¦ Exportation du tableau ¦ Exportando la tabla
+Sort column: {col} — Shift+Enter sorts, Alt+Down opens the column menu ¦ Colonne de tri : {col} — Maj+Entrée trie, Alt+Bas ouvre le menu des colonnes ¦ Columna de orden: {col} — Mayús+Intro ordena, Alt+Abajo abre el menú de columnas
+Sorted by {col} ¦ Trié par {col} ¦ Ordenado por {col}
+This table can't be sorted. ¦ Ce tableau ne peut pas être trié. ¦ Esta tabla no se puede ordenar.
+Sort by ¦ Trier par ¦ Ordenar por
+Sort and columns ¦ Tri et colonnes ¦ Orden y columnas
+A row's menu, from the keyboard ¦ Menu d'une ligne, au clavier ¦ Menú de una fila, con el teclado
+A column's menu (sort, columns, export) ¦ Menu d'une colonne (tri, colonnes, export) ¦ Menú de una columna (orden, columnas, exportar)
+Sort by a column ¦ Trier par une colonne ¦ Ordenar por una columna
+Select every row ¦ Sélectionner toutes les lignes ¦ Seleccionar todas las filas
+Scroll a read-only text ¦ Faire défiler un texte en lecture seule ¦ Desplazar un texto de solo lectura
 (icon) ¦ (icône) ¦ (icono)
 Copy cell ¦ Copier la cellule ¦ Copiar la celda
 Copy row ¦ Copier la ligne ¦ Copiar la fila
@@ -35124,6 +35134,358 @@ def focus_ring(widget, color="#2b7de9", width=2):
     off()
 
 
+# ---- keyboard routes for text panes, canvases and tables (slice B) ----------
+_MOD_KEYS = 0x1 | 0x4 | 0x8 | 0x20000       # Shift, Control, Alt (Mod1, Win)
+
+
+def plain_key(e):
+    """True for a key pressed alone: Shift, Control and Alt are not held
+    (a plain <Up> binding also matches Shift+Up, which Tk's own
+    bindings use to extend a selection)."""
+    st = getattr(e, "state", 0)
+    return not (isinstance(st, int) and st & _MOD_KEYS)
+
+
+def make_readonly_focusable(txt, color="#2b7de9"):
+    """A read-only (disabled) Text takes part in Tab, shows where the
+    keyboard focus is, scrolls with the keys and still copies. Tk skips a
+    disabled Text when Tab walks the window, so Inspector, Help, the
+    packet details and every report were out of reach of a keyboard-only
+    user. A click focuses it too, so the keys work right after it."""
+    with contextlib.suppress(tk.TclError):
+        txt.configure(takefocus=1)
+    focus_ring(txt, color)
+
+    def top(_e=None):
+        txt.yview_moveto(0)
+        txt.xview_moveto(0)
+
+    def bottom(_e=None):
+        txt.yview_moveto(1)
+
+    def alone(fn):
+        def run(e):
+            if not plain_key(e):
+                return None
+            fn()
+            return "break"
+        return run
+    plain = {"Up": lambda: txt.yview_scroll(-1, "units"),
+             "Down": lambda: txt.yview_scroll(1, "units"),
+             "Prior": lambda: txt.yview_scroll(-1, "pages"),
+             "Next": lambda: txt.yview_scroll(1, "pages"),
+             "Left": lambda: txt.xview_scroll(-1, "units"),
+             "Right": lambda: txt.xview_scroll(1, "units"),
+             "Home": top, "End": bottom}
+    for key, fn in plain.items():
+        txt.bind(f"<Key-{key}>", alone(fn), add="+")
+    for seq, fn in (("<Control-Home>", top), ("<Control-End>", bottom)):
+        txt.bind(seq, lambda e, f=fn: (f(), "break")[1], add="+")
+
+    def select_all(_e=None):
+        with contextlib.suppress(tk.TclError):
+            txt.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def copy(_e=None):
+        with contextlib.suppress(tk.TclError):
+            text = txt.get("sel.first", "sel.last")
+            if text:
+                txt.clipboard_clear()
+                txt.clipboard_append(text)
+        return "break"
+    for seq in ("<Control-a>", "<Control-A>"):
+        txt.bind(seq, select_all, add="+")
+    for seq in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+        txt.bind(seq, copy, add="+")
+    txt.bind("<Button-1>", lambda e: txt.focus_set(), add="+")
+    return txt
+
+
+def canvas_focus_ring(c, color="#2b7de9", width=2):
+    """Tab reaches a canvas and a ring shows it has the focus. The ring is
+    four thin frames laid over the edges while it is focused, so the
+    canvas keeps its size and its coordinates (the Map hit-tests with the
+    pointer's own coordinates)."""
+    with contextlib.suppress(tk.TclError):
+        c.configure(takefocus=1)
+    edges = []
+
+    def on(_e=None):
+        if edges:
+            return
+        with contextlib.suppress(tk.TclError):
+            for kw in ({"relx": 0, "rely": 0, "relwidth": 1,
+                        "height": width},
+                       {"relx": 0, "rely": 1, "anchor": "sw",
+                        "relwidth": 1, "height": width},
+                       {"relx": 0, "rely": 0, "relheight": 1,
+                        "width": width},
+                       {"relx": 1, "rely": 0, "anchor": "ne",
+                        "relheight": 1, "width": width}):
+                f = tk.Frame(c, bg=color, bd=0, highlightthickness=0)
+                f.place(**kw)
+                edges.append(f)
+
+    def off(_e=None):
+        for f in edges:
+            with contextlib.suppress(tk.TclError):
+                f.destroy()
+        del edges[:]
+    c.bind("<FocusIn>", on, add="+")
+    c.bind("<FocusOut>", off, add="+")
+    c.bind("<Destroy>", off, add="+")
+
+
+def key_menu_event(widget, iid=None, x=None, y=None):
+    """What a right-click handler needs, for a key press: the position of
+    the row (or of the widget's top-left corner) in the widget's own
+    and in screen coordinates."""
+    if iid is not None and isinstance(widget, ttk.Treeview):
+        with contextlib.suppress(tk.TclError):
+            widget.see(iid)
+            widget.update_idletasks()
+            box = widget.bbox(iid)
+            if box:
+                x = box[0] + min(40, max(4, box[2] // 4)) if x is None \
+                    else x
+                y = box[1] + box[3] // 2
+    x = 4 if x is None else x
+    y = 4 if y is None else y
+    try:
+        rx, ry = widget.winfo_rootx(), widget.winfo_rooty()
+    except tk.TclError:
+        rx = ry = 0
+    return types.SimpleNamespace(x=x, y=y, x_root=rx + x, y_root=ry + y + 6,
+                                 widget=widget, keysym="Menu", state=0)
+
+
+def tree_cursor_row(tree):
+    """The row the keyboard is on: the focus row, else the selected one."""
+    with contextlib.suppress(tk.TclError):
+        f = tree.focus()
+        if f and tree.exists(f):
+            return f
+        sel = tree.selection()
+        if sel:
+            return sel[0]
+    return None
+
+
+def bind_context_keys(widget, handler, pos=None):
+    """The Menu key and Shift+F10 open what a right-click opens. Tk binds
+    <<ContextMenu>> to the mouse only. handler(event) is the right-click
+    handler; the event is placed on the focused row (pos(widget) may
+    give another event)."""
+    def go(_e):
+        ev = pos(widget) if pos else key_menu_event(
+            widget, tree_cursor_row(widget) if isinstance(
+                widget, ttk.Treeview) else None)
+        if ev is not None:
+            handler(ev)
+        return "break"
+    for seq in ("<Key-Menu>", "<Shift-F10>"):
+        widget.bind(seq, go, add="+")
+
+
+def bind_open(widget, handler):
+    """Enter (and the keypad's Enter) open the selected row, with the same
+    handler a double-click runs. A table with the keyboard on a row that
+    isn't selected yet opens that row."""
+    def run(e):
+        if not plain_key(e):
+            return None
+        if isinstance(widget, ttk.Treeview):
+            with contextlib.suppress(tk.TclError):
+                row = tree_cursor_row(widget)
+                if row and not widget.selection():
+                    widget.selection_set(row)
+        return handler(e)
+    for seq in ("<Return>", "<KP_Enter>"):
+        widget.bind(seq, run)
+
+
+def _tree_is_open(tree, iid):
+    with contextlib.suppress(tk.TclError):
+        return str(tree.item(iid, "open")).lower() in ("1", "true", "yes")
+    return False
+
+
+def tree_edge_row(tree, last=False):
+    """The first or the last row you can see (children of closed rows
+    don't count)."""
+    kids = tree.get_children("")
+    if not kids:
+        return None
+    if not last:
+        return kids[0]
+    row = kids[-1]
+    while _tree_is_open(tree, row):
+        sub = tree.get_children(row)
+        if not sub:
+            break
+        row = sub[-1]
+    return row
+
+
+def tree_visible_rows(tree):
+    out, stack = [], [iter(tree.get_children(""))]
+    while stack:
+        for iid in stack[-1]:
+            out.append(iid)
+            if _tree_is_open(tree, iid):
+                sub = tree.get_children(iid)
+                if sub:
+                    stack.append(iter(sub))
+                    break
+        else:
+            stack.pop()
+    return out
+
+
+def tree_nav_keys(tree):
+    """Home / End (and Ctrl+Home / Ctrl+End) go to the first / last row,
+    Shift+Home / Shift+End extend the selection to it, Ctrl+A selects every
+    row where the table allows more than one. Only 1 of 11 tables had
+    these."""
+    def mode():
+        with contextlib.suppress(tk.TclError):
+            return str(tree.cget("selectmode"))
+        return "none"
+
+    def go(last, extend=False, need_plain=False):
+        def run(e):
+            if need_plain and not plain_key(e):
+                return None
+            iid = tree_edge_row(tree, last)
+            if iid is None or mode() == "none":
+                return "break"
+            with contextlib.suppress(tk.TclError):
+                if extend and mode() == "extended":
+                    rows = tree_visible_rows(tree)
+                    here = tree_cursor_row(tree)
+                    a = rows.index(here) if here in rows else (
+                        len(rows) - 1 if last else 0)
+                    b = rows.index(iid)
+                    tree.selection_set(rows[min(a, b):max(a, b) + 1])
+                else:
+                    tree.selection_set(iid)
+                    tree.focus(iid)
+                tree.see(iid)
+            return "break"
+        return run
+    tree.bind("<Home>", go(False, need_plain=True))
+    tree.bind("<End>", go(True, need_plain=True))
+    tree.bind("<Control-Home>", go(False))
+    tree.bind("<Control-End>", go(True))
+    tree.bind("<Shift-Home>", go(False, extend=True))
+    tree.bind("<Shift-End>", go(True, extend=True))
+
+    def select_all(_e):
+        if mode() != "extended":
+            return None
+        with contextlib.suppress(tk.TclError):
+            tree.selection_set(tree_visible_rows(tree))
+        return "break"
+    for seq in ("<Control-a>", "<Control-A>"):
+        tree.bind(seq, select_all)
+
+
+HEADING_STATUS = [None]          # the status bar's .set (the App fills it)
+
+
+class HeadingKeys:
+    """Sort and column menu from the keyboard (the mouse needs a click or
+    a right-click on a heading). Shift+Left / Shift+Right move a cursor
+    along the headings (the status bar names the column), Shift+Enter or
+    Shift+Space sorts by it, Alt+Down or Ctrl+Shift+C opens the column
+    menu at it."""
+
+    def __init__(self, tree, cols, sort, menu=None, title=None,
+                 can_sort=None):
+        self.tree, self.cols, self.sort, self.menu = tree, cols, sort, menu
+        self.title = title or (lambda c: str(tree.heading(c, "text")).rstrip(
+            " ▲▼"))
+        self.can_sort = can_sort
+        self.col = None
+        tree.bind("<Shift-Left>", lambda e: self.move(-1))
+        tree.bind("<Shift-Right>", lambda e: self.move(1))
+        for seq in ("<Shift-Return>", "<Shift-KP_Enter>", "<Shift-space>"):
+            tree.bind(seq, self.sort_now)
+        if menu is not None:
+            for seq in ("<Alt-Down>", "<Control-Shift-C>",
+                        "<Control-Shift-c>"):
+                tree.bind(seq, self.open_menu)
+
+    def say(self, text):
+        sink = HEADING_STATUS[0]
+        if sink is not None:
+            with contextlib.suppress(tk.TclError, RuntimeError):
+                sink(text)
+
+    def _cols(self):
+        try:
+            return list(self.cols())
+        except tk.TclError:
+            return []
+
+    def current(self):
+        cols = self._cols()
+        if self.col not in cols:
+            self.col = cols[0] if cols else None
+        return self.col
+
+    def name(self, col):
+        with contextlib.suppress(tk.TclError):
+            return self.title(col) or translate_text("(icon)")
+        return str(col)
+
+    def move(self, d):
+        cols = self._cols()
+        if not cols:
+            return "break"
+        i = cols.index(self.col) + d if self.col in cols else (
+            0 if d > 0 else len(cols) - 1)
+        self.col = cols[max(0, min(i, len(cols) - 1))]
+        self.say(translate_text(
+            "Sort column: {col} — Shift+Enter sorts, Alt+Down opens the "
+            "column menu").replace("{col}", self.name(self.col)))
+        return "break"
+
+    def sort_now(self, _e=None):
+        col = self.current()
+        if col is None:
+            return "break"
+        if self.can_sort is not None and not self.can_sort():
+            self.say(translate_text("This table can't be sorted."))
+            return "break"
+        self.sort(col)
+        self.say(translate_text("Sorted by {col}").replace(
+            "{col}", self.name(col)))
+        return "break"
+
+    def pos(self):
+        """A stand-in right-click on the cursor column's heading."""
+        x = 0
+        with contextlib.suppress(tk.TclError, ValueError, IndexError):
+            cur = self.current()
+            shown = list(self.tree.cget("displaycolumns"))
+            if not shown or shown[0] == "#all":
+                shown = list(self.tree["columns"])
+            order = (["#0"] if "tree" in str(self.tree.cget("show")) else []
+                     ) + shown
+            total = sum(int(self.tree.column(c, "width")) for c in order)
+            for c in order[:order.index(cur)]:
+                x += int(self.tree.column(c, "width"))
+            x -= int(self.tree.xview()[0] * total)
+        return key_menu_event(self.tree, None, x=max(4, x + 6), y=4)
+
+    def open_menu(self, _e=None):
+        self.current()
+        self.menu(self.pos())
+        return "break"
+
+
 def _walk_class(root, cls):
     """The widgets of class `cls` under `root` (root included). 5.3.4 CI:
     from tkinter's own table of children, as winfo_children() builds it
@@ -38094,6 +38456,7 @@ def enable_sorting(tree, on_sort=None):
 
     for c in tree["columns"]:
         tree.heading(c, command=lambda cc=c: do_sort(cc))
+    state["do"] = do_sort
     return state
 
 
@@ -38192,6 +38555,14 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
     return outer, inner
 
 
+def tree_shown_columns(tree):
+    """The column ids a table shows, left to right (no tree column)."""
+    shown = list(tree.cget("displaycolumns"))
+    if not shown or shown[0] == "#all":
+        shown = list(tree["columns"])
+    return shown
+
+
 def make_tree(parent, columns, bg="#ffffff", show="headings",
               selectmode="browse", hscroll=False, sortable=True):
     """columns: list of (id, title, width, anchor, stretch)."""
@@ -38213,8 +38584,10 @@ def make_tree(parent, columns, bg="#ffffff", show="headings",
         hs.grid(row=1, column=0, sticky="ew")
     frame.rowconfigure(0, weight=1)
     frame.columnconfigure(0, weight=1)
+    tree_nav_keys(tree)
     if sortable:
-        enable_sorting(tree)
+        st = enable_sorting(tree)
+        HeadingKeys(tree, lambda: tree_shown_columns(tree), st["do"])
     return frame, tree
 
 
@@ -38505,6 +38878,14 @@ class TableKit:
         for c in ("#0",) + self.columns:
             with contextlib.suppress(tk.TclError):
                 tree.heading(c, command=lambda cc=c: self.sort_by(cc))
+        # the keyboard: Home / End / Ctrl+A, the row menu (Menu key,
+        # Shift+F10), and the heading's sort and column menu
+        tree_nav_keys(tree)
+        self.heading_keys = HeadingKeys(
+            tree, self.visible_cols, self.sort_by,
+            menu=self._heading_menu_at, can_sort=lambda: self.sortable)
+        for seq in ("<Key-Menu>", "<Shift-F10>"):
+            tree.bind(seq, self.key_menu)
         self.load()
         app.kits.append(self)
         self.empty_soon()
@@ -39275,6 +39656,59 @@ class TableKit:
             popup_menu(self.app, e, items)
         return "break"
 
+    def _heading_menu_at(self, ev):
+        popup_menu(self.app, ev, self.header_items())
+
+    def _cursor_row(self):
+        return tree_cursor_row(self.tree)
+
+    def bind_open(self, handler=None):
+        """Enter opens the selected row, with the handler the double-click
+        runs (handler(event)). With none: the row's Open action, else its
+        filter (the Happening feed's only one)."""
+        bind_open(self.tree, handler or self._open_row)
+
+    def _open_row(self, _e=None):
+        sel = self.tree.selection()
+        key = self.key_of(sel[0]) if sel else None
+        if key is None or not self.menu:
+            return None
+        spec = self.menu(key) or {}
+        fn = spec.get("open") or spec.get("filter")
+        if fn:
+            fn()
+        return None
+
+    def sort_items(self):
+        """Sort by ▸ each shown column (a tick on the one in use)."""
+        if not self.sortable:
+            return []
+        out = []
+        for c in self.visible_cols():
+            title = str(self.tree.heading(c, "text")).rstrip(" ▲▼") or \
+                translate_text("(icon)")
+            out.append((title, lambda cc=c: self.sort_by(cc), True,
+                        c == self.sort_col))
+        return [("Sort by", out)] if out else []
+
+    def key_menu(self, _e=None):
+        """Menu key / Shift+F10: the row menu at the row the keyboard is
+        on (the heading's menu when there is no row), with Sort and
+        columns at its end."""
+        iid = self._cursor_row()
+        ev = key_menu_event(self.tree, iid)
+        tail = self.sort_items() + self.header_items()
+        if iid is None:
+            popup_menu(self.app, ev, tail)
+            return "break"
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        col = self.heading_keys.col
+        items = list(self.row_items(iid, col)) or []
+        popup_menu(self.app, ev, items + [None, ("Sort and columns", tail)])
+        return "break"
+
     def header_items(self):
         shown = set(self.shown_cols())
         cols = []
@@ -39555,6 +39989,7 @@ class DetailDialog:
                            font=mw_font(10),
                            insertbackground=t["text_fg"],
                            highlightthickness=0)
+        make_readonly_focusable(self.txt)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set)
         vs.pack(side="right", fill="y")
@@ -39966,6 +40401,11 @@ class Charts:
         if recs is None:
             recs = c._mw_chart = OrderedDict()
             c.bind("<Button-3>", lambda e: cls.chart_menu(c, e), add="+")
+            # the keyboard reaches the chart's data too
+            canvas_focus_ring(c)
+            bind_context_keys(c, lambda e: cls.chart_menu(c, e),
+                              pos=lambda w: key_menu_event(w, None, x=12,
+                                                           y=12))
         recs[title or f"chart {len(recs) + 1}"] = {
             "anchor": anchor, "header": header, "rows": rows,
             "fmt": fmt, "texts": texts, "note": note}
@@ -40420,6 +40860,7 @@ class Inspector:
                            relief="flat", highlightthickness=0, padx=4,
                            pady=4, cursor="arrow", width=40,
                            font=mw_font(10))
+        make_readonly_focusable(self.txt)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set, state="disabled")
         vs.pack(side="right", fill="y")
@@ -41355,6 +41796,7 @@ class FeedTab(BaseTab):
         self.kit = TableKit(self, self.tree, wrap, "feed",
                             key_of=lambda iid: iid, menu=self.menu_spec,
                             sortable=False)
+        self.kit.bind_open()          # no double-click here: Enter filters
         self.restyle()
         self.refresh()
 
@@ -41663,6 +42105,7 @@ class TimelineTab(BaseTab):
                             else None,
                             empty_state=self.empty_state,
                             menu=self.menu_spec, sortable=False)
+        self.kit.bind_open(self._on_double)
         self.pending = []
         self._rebuild_job = None
         self.on_theme()
@@ -42620,6 +43063,7 @@ class WebsitesTab(BaseTab):
             relative={"last": self._site_last}, dot_col="#0",
             menu=self.menu_spec, all_keys=self._all_keys,
             explain=self.explain_row)
+        self.kit.bind_open(self._details)
         self._job = None
         self._dirty = False
         self.count_lbl = self.lbl(bar, "", muted=True)
@@ -43059,6 +43503,7 @@ class ConnectionsTab(BaseTab):
                          "packets": lambda k: flow(k, "packets"),
                          "id": lambda k: k if isinstance(k, int) else None},
             menu=self.menu_spec)
+        self.kit.bind_open(self._details)
         self._apply_grouping()
         self.apply_mode()
 
@@ -43450,6 +43895,7 @@ class MailView:
         wrap, self.tree = make_tree(frame, self.COLS, hscroll=True)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", self._details)
+        bind_open(self.tree, self._details)
         self.bar = bar
 
     def _full_power(self):
@@ -44024,6 +44470,7 @@ class RemoteTab(BaseTab):
                 "first": lambda k: host(k, lambda r: r.first_seen)},
             relative={"last": lambda k: host(k, lambda r: r.last_seen)},
             menu=self.menu_spec)
+        self.kit.bind_open(self._details)
 
     def _host(self, ip, fn):
         r = self.model.remote_hosts.get(ip)
@@ -44606,6 +45053,10 @@ class MapTab(BaseTab):
         self.c.bind("<Motion>", self._hover)
         self.c.bind("<Button-3>", self._context)
         self.c.bind("<Button-2>", self._context)
+        # the keyboard: Tab reaches the map (with a ring), Menu key and
+        # Shift+F10 open the selected node's menu
+        canvas_focus_ring(self.c)
+        bind_context_keys(self.c, self._context, pos=self._key_pos)
         self.c.bind("<MouseWheel>", lambda e: self.zoom(1.1 if e.delta > 0
                                                         else 0.9))
         self.c.bind("<Button-4>", lambda e: self.zoom(1.1))
@@ -44717,6 +45168,18 @@ class MapTab(BaseTab):
             dev = app.model.device_for(app.model.gateway_ip)
             if dev:
                 app.show_device(dev.key)
+
+    def _key_pos(self, c):
+        """Where the selected node (the first one with none) is drawn."""
+        item = next((i for i, n in self.nodes.items()
+                     if self.selected == (n[0], n[1])), None)
+        if item is None:
+            item = next(iter(self.nodes), None)
+        bb = c.bbox(item) if item is not None else None
+        if not bb:
+            return None
+        return key_menu_event(c, None, x=int((bb[0] + bb[2]) / 2),
+                              y=int((bb[1] + bb[3]) / 2))
 
     def _context(self, e):
         node = self._node_at(e.x, e.y)
@@ -46120,6 +46583,7 @@ class SecurityTab(BaseTab):
                             relief="flat", padx=14, pady=12,
                             font=mw_font(11), state="disabled",
                             highlightthickness=0)
+        make_readonly_focusable(self.text)
         # 5.3.4 (M9, MC6): unusual activity in one place, at the top of the
         # page (inside the text, so it scrolls with it on a short screen)
         self.unusual = None
@@ -47702,10 +48166,20 @@ class PacketsTab(BaseTab):
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._context)
         self.tree.bind("<Button-2>", self._context)
+        # the keyboard: the row menu (Menu key, Shift+F10), the headings'
+        # sort cursor and column menu, Enter goes to the details
+        bind_context_keys(self.tree, self._context, pos=lambda w:
+                          key_menu_event(w, (w.selection() or
+                                             (tree_cursor_row(w),))[0]))
+        self.heading_keys = HeadingKeys(
+            self.tree, lambda: tree_shown_columns(self.tree),
+            self._sort_by, menu=self._heading_menu)
+        bind_open(self.tree, lambda e: self._focus_details())
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.tree.bind(seq, self._wheel)
         for seq in ("<Up>", "<Down>", "<Prior>", "<Next>", "<Home>",
-                    "<End>"):
+                    "<End>", "<Control-Home>", "<Control-End>",
+                    "<Shift-Home>", "<Shift-End>"):
             self.tree.bind(seq, self._key)
         self.tree.bind("<Configure>", lambda e: self.render(), add="+")
         bottom = tk.Frame(vert, bg=WHITE)
@@ -47782,6 +48256,8 @@ class PacketsTab(BaseTab):
                     add="+")
         self.dtree.bind("<Button-3>", self._field_menu)
         self.dtree.bind("<Button-2>", self._field_menu)
+        tree_nav_keys(self.dtree)
+        bind_context_keys(self.dtree, self._field_menu)
         self.bytes_view.bind("<Button-1>", self._byte_click)
         self.matched = []        # filtered rows, in view order
         self.top = 0             # index of the first visible row
@@ -47948,11 +48424,24 @@ class PacketsTab(BaseTab):
             pass
         return show
 
+    def _focus_details(self):
+        """Enter on a packet: the keyboard goes to its fields."""
+        with contextlib.suppress(tk.TclError):
+            if not self.dtree.get_children(""):
+                return
+            row = tree_cursor_row(self.dtree) or \
+                self.dtree.get_children("")[0]
+            self.dtree.focus_set()
+            self.dtree.focus(row)
+            self.dtree.selection_set(row)
+            self.dtree.see(row)
+
     def _scrolled(self, parent):
         f = tk.Frame(parent, bg=WHITE)
         txt = tk.Text(f, wrap="none", font=self.app.mono, state="disabled",
                       fg="#222222", bg=WHITE, relief="flat", padx=6, pady=6,
                       highlightthickness=0, height=8)
+        make_readonly_focusable(txt)
         vs = ttk.Scrollbar(f, orient="vertical", command=txt.yview)
         hs = ttk.Scrollbar(f, orient="horizontal", command=txt.xview)
         txt.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
@@ -49464,6 +49953,7 @@ class StreamsView(_SubView):
         self.txt = tk.Text(f, wrap="char", font=self.app.mono, bg=WHITE,
                            fg="#222222", relief="flat", highlightthickness=0,
                            padx=6, pady=6, cursor="arrow")
+        make_readonly_focusable(self.txt)
         vs = ttk.Scrollbar(f, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set, state="disabled")
         vs.pack(side="right", fill="y")
@@ -49673,6 +50163,7 @@ class ExchangesView(_SubView):
         wrap, self.tree = make_tree(self.frame, self.COLS, hscroll=True)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", self._open)
+        bind_open(self.tree, self._open)
         self.rows = {}
 
     def refresh(self, force=False):
@@ -49801,8 +50292,10 @@ class ExpertView(_SubView):
         wrap.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._select)
         self.tree.bind("<Double-1>", self._open)
+        bind_open(self.tree, self._open)
         self.tree.bind("<Button-3>", self._menu)
         self.tree.bind("<Button-2>", self._menu)
+        bind_context_keys(self.tree, self._menu)
         self.detail = tk.Label(pw, text="", bg=WHITE, fg="#333333",
                                justify="left", anchor="nw", wraplength=900,
                                padx=8, pady=6)
@@ -50061,6 +50554,7 @@ class StatisticsView(_SubView):
                                               _human_bytes(by),
                                               f"{100 * by / max(1, tot[1]):.1f}"))
         tree.bind("<Double-1>", lambda e: self._filter_proto(tree))
+        bind_open(tree, lambda e: self._filter_proto(tree))
         self.note.configure(text=f"Out of {tot[0]:,} packets in memory "
                                  f"({_human_bytes(tot[1])}). Double-click a "
                                  f"protocol to filter the packet list.")
@@ -50107,6 +50601,8 @@ class StatisticsView(_SubView):
         tree.bind("<Double-1>", lambda e: self._open_conv(tree))
         tree.bind("<Button-3>", lambda e: self._conv_menu(tree, e))
         tree.bind("<Button-2>", lambda e: self._conv_menu(tree, e))
+        bind_open(tree, lambda e: self._open_conv(tree))
+        bind_context_keys(tree, lambda e: self._conv_menu(tree, e))
         self.note.configure(text=f"{len(flows):,} conversations among the "
                                  f"{len(rows):,} packets in memory. "
                                  f"Double-click one to follow it.")
@@ -50178,6 +50674,8 @@ class StatisticsView(_SubView):
         tree.bind("<Double-1>", lambda e: self._open_ep(tree))
         tree.bind("<Button-3>", lambda e: self._ep_menu(tree, e))
         tree.bind("<Button-2>", lambda e: self._ep_menu(tree, e))
+        bind_open(tree, lambda e: self._open_ep(tree))
+        bind_context_keys(tree, lambda e: self._ep_menu(tree, e))
         self.note.configure(text=f"{len(st):,} addresses in {len(rows):,} "
                                  f"packets in memory. A remote host is "
                                  f"never counted as a device on your "
@@ -50381,6 +50879,7 @@ class SourcesTab(BaseTab):
             ("detail", "Details", 380, "w", True)])
         self.tree.configure(height=2)
         self.tree.bind("<Double-1>", lambda e: self._edit())
+        bind_open(self.tree, lambda e: self._edit())
         wrap.grid(row=0, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self.lbl(body, "Reported vs observed", muted=False,
                  font=mw_font(11, "bold")).grid(row=1, column=0,
@@ -50390,6 +50889,7 @@ class SourcesTab(BaseTab):
                              relief="flat", padx=10, pady=8,
                              highlightthickness=0,
                              font=mw_font(10))
+        make_readonly_focusable(self.recon)
         self.recon.grid(row=2, column=0, sticky="nsew", padx=6,
                         pady=(2, 6))
 
@@ -50761,6 +51261,13 @@ KEYMAP_FIXED = (
     ("Close a window or a list", "Escape"),
     ("Move the Timeline time", "Left / Right (Shift: ten minutes)"),
     ("Complete a field name in a filter", "Tab"),
+    ("A row's menu, from the keyboard", "Menu key / Shift+F10"),
+    ("A column's menu (sort, columns, export)",
+     "Alt+Down (or Ctrl+Shift+C)"),
+    ("Sort by a column", "Shift+Left / Shift+Right, then Shift+Enter"),
+    ("Select every row", "Ctrl+A"),
+    ("Scroll a read-only text", "Up / Down / Page Up / Page Down / Home / "
+                               "End"),
 )
 
 
@@ -50903,6 +51410,7 @@ class HelpTab(BaseTab):
         txt = tk.Text(right, wrap="word", bg="#fbfbfb", fg="#222222",
                       relief="flat", padx=14, pady=12, cursor="arrow",
                       font=mw_font(10), highlightthickness=0)
+        make_readonly_focusable(txt)
         vs = ttk.Scrollbar(right, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vs.set)
         vs.pack(side="right", fill="y")
@@ -52756,6 +53264,7 @@ class MiniWireshark:
         self.status_var = DisplayVar(
             value="Getting ready — I'll pick a network card and start "
                   "watching automatically.")
+        HEADING_STATUS[0] = self.status_var.set
         status = tk.Frame(self.root, bg="#e3e6eb")
         status.pack(side="bottom", fill="x", before=self.body)
         status._mw_noflow = True
@@ -55855,6 +56364,7 @@ class MiniWireshark:
                                                       pady=(10, 4))
         txt = tk.Text(win, wrap="none", bg=t["tab_bg"], fg=t["text_fg"],
                       font=self.mono, relief="flat", padx=8, pady=6)
+        make_readonly_focusable(txt)
         txt.pack(fill="both", expand=True, padx=12)
         text = self.boot_history_text()
         txt.insert("1.0", text)
@@ -55918,6 +56428,7 @@ class MiniWireshark:
             fill="x", padx=12, pady=(10, 4))
         txt = tk.Text(win, wrap="none", bg=t["tab_bg"], fg=t["text_fg"],
                       font=("TkFixedFont", 8))
+        make_readonly_focusable(txt)
         txt.pack(fill="both", expand=True, padx=12)
 
         def fill():
@@ -62208,6 +62719,7 @@ proc ::mw_explicit_fonts {top names} {
             tx = tk.Text(col, wrap="word", bg=t["text_bg"], fg=t["text_fg"],
                          relief="flat", font=mw_font(9),
                          highlightthickness=0)
+            make_readonly_focusable(tx)
             tx.pack(fill="both", expand=True)
             texts.append(tx)
         panes.rowconfigure(0, weight=1)
@@ -63311,6 +63823,7 @@ proc ::mw_explicit_fonts {top names} {
         txt = tk.Text(right, wrap="word", bg=t["card_bg"], fg=t["text_fg"],
                       relief="flat", height=18, padx=10, pady=4,
                       highlightthickness=0)
+        make_readonly_focusable(txt)
         txt.pack(fill="both", expand=True)
         txt.tag_configure("k", font=mw_font(9, "bold"),
                           foreground=t["muted_fg"])
@@ -63656,6 +64169,7 @@ proc ::mw_explicit_fonts {top names} {
         text = tk.Text(win, height=12, wrap="word", relief="flat",
                        bg=t["text_bg"], fg=t["text_fg"],
                        font=mw_font(10), highlightthickness=0)
+        make_readonly_focusable(text)
         text.pack(fill="both", expand=True, padx=12, pady=8)
 
         def fill(msg=""):
@@ -65681,6 +66195,7 @@ class DiagnosticsWindow:
         self.txt = tk.Text(body, wrap="none", bg=t["text_bg"],
                            fg=t["text_fg"], font=app.mono, relief="flat",
                            padx=8, pady=6, highlightthickness=0)
+        make_readonly_focusable(self.txt)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set)
         vs.pack(side="right", fill="y")
@@ -66215,6 +66730,7 @@ class CrashDialog:
                  justify="left").pack(anchor="w", padx=14)
         txt = tk.Text(win, height=12, bg=t["text_bg"], fg=t["text_fg"],
                       font=app.mono, relief="flat", highlightthickness=0)
+        make_readonly_focusable(txt)
         txt.insert("1.0", text[-4000:])
         txt.config(state="disabled")
         txt.pack(fill="both", expand=True, padx=14, pady=8)
@@ -96430,6 +96946,400 @@ def gt_m3_table_kit(app, ctx):
     assert not ft.buffer
 
 
+def _tab_chain(app):
+    """Every widget Tab reaches from the header search box."""
+    seen, w = set(), app.search_entry
+    for _ in range(4000):
+        w = w.tk_focusNext()
+        if w is None or w in seen:
+            break
+        seen.add(w)
+    return seen
+
+
+@contextlib.contextmanager
+def _popups():
+    """The menus a key press opens, captured (never shown)."""
+    shown, orig = [], tk.Menu.tk_popup
+    tk.Menu.tk_popup = lambda menu, *a, **k: shown.append(menu)
+    try:
+        yield shown
+    finally:
+        tk.Menu.tk_popup = orig
+
+
+@gui_test_step("keyboard B: read-only text panes are in the Tab chain, "
+               "scroll and copy by key")
+def gt_kbd_text_panes(app, ctx):
+    root = app.root
+    app.toggle_inspector(True)
+    ptab = app._select_tab("packets")
+    ptab.show_subview("Packets")
+    row = next((d for d in app.all_rows if d.get("raw")), None)
+    assert row is not None and ptab.select_no(row["no"])
+    _gui_pump(root, 0.4)
+    nb = ptab.details.master.master
+    panes = {"inspector": app.inspector.txt, "bytes": ptab.bytes_view}
+    for i, page in enumerate(nb.tabs()):
+        nb.select(page)
+        _gui_pump(root, 0.2)
+        chain = _tab_chain(app)
+        for name, w in dict(panes, text=ptab.details,
+                            hex=ptab.hexview).items():
+            if w.winfo_viewable():
+                assert w in chain, f"{name} is not in the Tab chain"
+                assert str(w.cget("takefocus")) == "1"
+    nb.select(nb.tabs()[0])
+    _gui_pump(root, 0.2)
+    # Help body and the Inspector, on their own
+    app._select_tab("help")
+    _gui_pump(root, 0.3)
+    ht = app.tabs["help"].txt
+    assert ht.winfo_viewable() and ht in _tab_chain(app)
+    # scrolling, select all and copy, on a pane long enough to scroll
+    top = tk.Toplevel(root)
+    try:
+        txt = tk.Text(top, height=6, width=30, state="normal")
+        txt.insert("1.0", "\n".join(f"line {i}" for i in range(300)))
+        txt.configure(state="disabled")
+        make_readonly_focusable(txt)
+        entry = ttk.Entry(top)
+        entry.pack()
+        txt.pack(fill="both", expand=True)
+        _gui_pump(root, 0.2)
+        txt.focus_force()
+        _gui_pump(root, 0.2)
+        assert int(txt.cget("highlightthickness")) == 2
+        txt.event_generate("<Next>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[0] > 0, txt.yview()
+        y = txt.yview()[0]
+        txt.event_generate("<Down>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[0] > y
+        txt.event_generate("<End>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[1] == 1.0, txt.yview()
+        txt.event_generate("<Prior>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[1] < 1.0
+        txt.event_generate("<Home>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[0] == 0.0
+        txt.event_generate("<Control-End>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[1] == 1.0
+        txt.event_generate("<Control-Home>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[0] == 0.0
+        txt.event_generate("<Control-a>")
+        _gui_pump(root, 0.05)
+        assert txt.tag_ranges("sel"), "Ctrl+A selected nothing"
+        root.clipboard_clear()
+        txt.event_generate("<Control-c>")
+        _gui_pump(root, 0.1)
+        assert "line 299" in root.clipboard_get()
+        assert str(txt.cget("state")) == "disabled"
+        entry.focus_force()
+        _gui_pump(root, 0.1)
+        assert int(txt.cget("highlightthickness")) == 0
+    finally:
+        top.destroy()
+
+
+@gui_test_step("keyboard B: Enter, Home/End/Ctrl+A, the row menu, sort and "
+               "column menu on the tables")
+def gt_kbd_tables(app, ctx):
+    root = app.root
+    app.mode_ui_var.set("Advanced")
+    app._on_ui_mode_change()
+    rows_seen = 0
+    with _popups() as shown:
+        for name in ("devices", "websites", "connections", "remote",
+                     "alerts", "timeline", "feed"):
+            tab = app._select_tab(name)
+            if name in ("connections",):
+                tab.show_subview("Connections")
+            _gui_pump(root, 0.3)
+            tree, kit = tab.tree, tab.kit
+            tree.focus_force()
+            _gui_pump(root, 0.1)
+            kids = tree.get_children("")
+            if kids:
+                rows_seen += 1
+                tree.selection_set(kids[0])
+                tree.focus(kids[0])
+            # Menu key and Shift+F10 open the row menu, with Sort and columns
+            for seq in ("<Shift-F10>", "<Key-Menu>"):
+                del shown[:]
+                tree.event_generate(seq)
+                _gui_pump(root, 0.05)
+                assert shown, f"{name}: {seq} opened no menu"
+                labels = _menu_labels(shown[-1])
+                assert any(x.startswith("Sort and columns") for x in labels), \
+                    (name, labels)
+                if kit.sortable:
+                    assert "Sort and columns > Sort by" in labels, labels
+                assert "Sort and columns > Columns" in labels, labels
+            # Home / End / Ctrl+Home / Ctrl+End
+            if len(kids) >= 2:
+                tree.event_generate("<End>")
+                _gui_pump(root, 0.05)
+                last = tree_visible_rows(tree)[-1]
+                assert tree.selection() == (last,) and tree.focus() == last, \
+                    (name, tree.selection(), last)
+                tree.event_generate("<Home>")
+                _gui_pump(root, 0.05)
+                assert tree.selection() == (kids[0],), (name,
+                                                        tree.selection())
+                tree.event_generate("<Control-End>")
+                _gui_pump(root, 0.05)
+                assert tree.selection() == (last,)
+                tree.event_generate("<Control-Home>")
+                _gui_pump(root, 0.05)
+                assert tree.selection() == (kids[0],)
+                # Ctrl+A: every row where the table allows several
+                tree.event_generate("<Control-a>")
+                _gui_pump(root, 0.05)
+                if str(tree.cget("selectmode")) == "extended":
+                    assert len(tree.selection()) == len(
+                        tree_visible_rows(tree)), name
+                else:
+                    assert tree.selection() == (kids[0],), name
+            # the sort cursor and the column menu
+            if kit.sortable and kids:
+                kit.clear_sort()
+                cols = kit.visible_cols()
+                tree.event_generate("<Shift-Right>")
+                tree.event_generate("<Shift-Right>")
+                _gui_pump(root, 0.05)
+                want = cols[1]
+                assert kit.heading_keys.col == want, (name, cols)
+                assert kit.titles.get(want, want) and \
+                    tree.heading(want, "text").rstrip(" ▲▼") in \
+                    app.status_var.get(), app.status_var.get()
+                assert kit.sort_col is None
+                tree.event_generate("<Shift-Return>")
+                _gui_pump(root, 0.1)
+                assert kit.sort_col == want and not kit.sort_desc, \
+                    (name, kit.sort_col)
+                tree.event_generate("<Shift-space>")
+                _gui_pump(root, 0.1)
+                assert kit.sort_desc, "a second sort did not reverse"
+                tree.event_generate("<Shift-Left>")
+                assert kit.heading_keys.col == cols[0]
+                kit.clear_sort()
+            elif not kit.sortable:
+                tree.event_generate("<Shift-Return>")
+                assert kit.sort_col is None
+            for seq in ("<Alt-Down>", "<Control-Shift-C>"):
+                del shown[:]
+                tree.event_generate(seq)
+                _gui_pump(root, 0.05)
+                assert shown, f"{name}: {seq} opened no column menu"
+                labels = _menu_labels(shown[-1])
+                assert "Columns" in labels and \
+                    "Export this table…" in labels, (name, labels)
+    assert rows_seen >= 4, rows_seen
+
+
+@gui_test_step("keyboard B: Enter opens the selected row like a "
+               "double-click")
+def gt_kbd_enter_opens(app, ctx):
+    root = app.root
+    calls = []
+    saved = {}
+
+    def spy(owner, attr):
+        saved[(id(owner), attr)] = (owner, attr, getattr(owner, attr))
+        setattr(owner, attr, lambda *a, **k: calls.append((attr, a)))
+
+    def both(tab, tree):
+        """Return, then the double-click handler: the same call."""
+        del calls[:]
+        tree.event_generate("<Return>")
+        _gui_pump(root, 0.1)
+        by_key = list(calls)
+        del calls[:]
+        tree.event_generate("<KP_Enter>")
+        _gui_pump(root, 0.1)
+        assert calls == by_key, (calls, by_key)
+        return by_key
+    try:
+        for owner, attr in ((app, "show_website"), (app, "show_flow"),
+                            (app, "show_remote"), (app, "connector_dialog"),
+                            (app, "open_ref")):
+            spy(owner, attr)
+        # Websites, Connections, Remote: Enter = what the double-click runs
+        for name, attr in (("websites", "show_website"),
+                           ("connections", "show_flow"),
+                           ("remote", "show_remote")):
+            tab = app._select_tab(name)
+            if name == "connections":
+                tab.show_subview("Connections")
+            _gui_pump(root, 0.3)
+            tree = tab.tree
+            tree.focus_force()
+            opened = None
+            for iid in tree_visible_rows(tree):
+                tree.selection_set(iid)
+                tree.focus(iid)
+                del calls[:]
+                tab._details()
+                if calls:
+                    opened = list(calls)
+                    break
+            assert opened, f"{name}: no row that opens"
+            assert opened[0][0] == attr
+            assert both(tab, tree) == opened, name
+            # nothing selected, the keyboard on a row: that row opens
+            tree.selection_set(())
+            del calls[:]
+            tree.event_generate("<Return>")
+            _gui_pump(root, 0.1)
+            assert calls == opened, (name, calls)
+        # Timeline: the story line it opens
+        tl = app._select_tab("timeline")
+        _gui_pump(root, 0.3)
+        opened_ev = []
+        tl._open_event = lambda e: opened_ev.append(e)
+        kids = tl.tree.get_children("")
+        if kids:
+            tl.tree.focus_force()
+            tl.tree.selection_set(kids[0])
+            tl.tree.event_generate("<Return>")
+            _gui_pump(root, 0.1)
+            assert len(opened_ev) == 1 and opened_ev[0] is tl.refs[kids[0]]
+        del tl._open_event
+        # Feed: its one action, "show only this", on Enter
+        fd = app._select_tab("feed")
+        _gui_pump(root, 0.2)
+        iid = fd.tree.insert("", "end", values=("Kbd-Test-Device", "did a "
+                                                "thing", "now"))
+        fd.tree.focus_force()
+        fd.tree.selection_set(iid)
+        fd.tree.event_generate("<Return>")
+        _gui_pump(root, 0.1)
+        assert fd.q_var.get() == "Kbd-Test-Device", fd.q_var.get()
+        fd.q_var.set("")
+        fd.refilter()
+        # Sources: Enter edits the selected connector
+        st = app._select_tab("sources")
+        _gui_pump(root, 0.2)
+        iid = st.tree.insert("", "end", iid="c:kbd-test",
+                             values=("",) * len(st.tree["columns"]))
+        try:
+            st.tree.focus_force()
+            st.tree.selection_set(iid)
+            del calls[:]
+            st.tree.event_generate("<Return>")
+            _gui_pump(root, 0.1)
+            assert calls and calls[0][0] == "connector_dialog", calls
+        finally:
+            st.tree.delete(iid)
+        # Packets: Enter moves the keyboard to the packet's fields
+        pt = app._select_tab("packets")
+        pt.show_subview("Packets")
+        row = next(d for d in app.all_rows if d.get("raw"))
+        assert pt.select_no(row["no"])
+        _gui_pump(root, 0.4)
+        pt.tree.focus_force()
+        pt.tree.event_generate("<Return>")
+        _gui_pump(root, 0.2)
+        assert root.focus_get() is pt.dtree, root.focus_get()
+    finally:
+        for owner, attr, orig in saved.values():
+            setattr(owner, attr, orig)
+
+
+@gui_test_step("keyboard B: the Menu key and Shift+F10 on the packet "
+               "list, its fields, the Map and the charts")
+def gt_kbd_context_keys(app, ctx):
+    root = app.root
+    with _popups() as shown:
+        pt = app._select_tab("packets")
+        pt.show_subview("Packets")
+        row = next(d for d in app.all_rows if d.get("raw"))
+        assert pt.select_no(row["no"])
+        _gui_pump(root, 0.4)
+        pt.tree.focus_force()
+        _gui_pump(root, 0.1)
+        for seq in ("<Shift-F10>", "<Key-Menu>"):
+            del shown[:]
+            pt.tree.event_generate(seq)
+            _gui_pump(root, 0.05)
+            assert shown, f"packet list: {seq} opened no menu"
+            assert "Follow stream" in _menu_labels(shown[-1])
+        # a heading menu and a sort by the keyboard
+        del shown[:]
+        pt.tree.event_generate("<Alt-Down>")
+        _gui_pump(root, 0.05)
+        assert shown and "Columns" in _menu_labels(shown[-1]), shown
+        pt.tree.event_generate("<Shift-Right>")
+        pt.tree.event_generate("<Shift-Right>")
+        pt.tree.event_generate("<Shift-Return>")
+        _gui_pump(root, 0.2)
+        assert pt.sort_col == pt.heading_keys.col != None, pt.sort_col
+        pt._sort_by("no")
+        if pt.sort_col:
+            pt._sort_by("no")
+        # End goes to the last packet
+        pt.tree.event_generate("<End>")
+        _gui_pump(root, 0.2)
+        assert pt.sel_no == pt.matched[-1]["no"]
+        pt.tree.event_generate("<Home>")
+        _gui_pump(root, 0.2)
+        assert pt.sel_no == pt.matched[0]["no"]
+        # the details tree: field menu on the focused field
+        assert pt.select_no(row["no"])
+        _gui_pump(root, 0.4)
+        kids = pt.dtree.get_children("")
+        assert kids
+        pt.dtree.focus_force()
+        pt.dtree.selection_set(kids[0])
+        pt.dtree.focus(kids[0])
+        _gui_pump(root, 0.1)
+        for seq in ("<Shift-F10>", "<Key-Menu>"):
+            del shown[:]
+            pt.dtree.event_generate(seq)
+            _gui_pump(root, 0.05)
+            assert shown, f"field tree: {seq} opened no menu"
+        pt.dtree.event_generate("<End>")
+        _gui_pump(root, 0.05)
+        assert pt.dtree.focus() == tree_edge_row(pt.dtree, True)
+        # the Map
+        mp = app._select_tab("map")
+        mp.redraw(force=True)
+        _gui_pump(root, 0.4)
+        assert str(mp.c.cget("takefocus")) == "1"
+        if mp.nodes:
+            mp.c.focus_force()
+            _gui_pump(root, 0.1)
+            for seq in ("<Shift-F10>", "<Key-Menu>"):
+                del shown[:]
+                mp.c.event_generate(seq)
+                _gui_pump(root, 0.05)
+                assert shown, f"map: {seq} opened no menu"
+            assert any(isinstance(f, tk.Frame) for f in mp.c.winfo_children())
+        # the charts on Health
+        hl = app._select_tab("health")
+        _gui_pump(root, 0.5)
+        charts = [w for w in _all_widgets(hl.frame)
+                  if isinstance(w, tk.Canvas) and w.winfo_viewable() and
+                  Charts.chart_data(w)]
+        for c in charts[:3]:
+            assert str(c.cget("takefocus")) == "1"
+            c.focus_force()
+            _gui_pump(root, 0.1)
+            for seq in ("<Shift-F10>", "<Key-Menu>"):
+                del shown[:]
+                c.event_generate(seq)
+                _gui_pump(root, 0.05)
+                assert shown, f"chart: {seq} opened no menu"
+                assert "Copy chart data as text" in _menu_labels(shown[-1])
+        assert charts, "no chart with data on Health"
+
+
 @gui_test_step("5.1.2 M4: back/forward, tab groups, state line, cards, "
                "Clear with undo")
 def gt_m4_shell(app, ctx):
@@ -97054,7 +97964,9 @@ def keyboard_walk(app):
                     continue
                 if isinstance(x, ttk.Widget) and x.instate(["disabled"]):
                     continue
-                if not isinstance(x, ttk.Widget) and \
+                # a read-only Text must be reachable too (it scrolls and
+                # copies by key): only the other controls are exempt
+                if not isinstance(x, (ttk.Widget, tk.Text)) and \
                         str(x.cget("state")) == "disabled":
                     continue
             except tk.TclError:
