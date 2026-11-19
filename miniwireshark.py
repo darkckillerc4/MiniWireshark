@@ -118,6 +118,7 @@ import sys
 import tempfile
 import threading
 import types
+import unicodedata
 import zlib
 import time
 import traceback
@@ -26744,6 +26745,8 @@ def _default_config():
         "filters": {"presets": json.loads(json.dumps(DEFAULT_FILTER_PRESETS)),
                     "recent": []},
         "diagnostics": {"verbose_logging": False},
+        # Ctrl+K: the entries you ran last, newest first (labels, at most 20)
+        "palette": {"recent": []},
     }
 
 
@@ -32343,6 +32346,26 @@ Very often normal: cloud and content services are spread across many countries. 
 Website names aren't being resolved reliably right now. ¦ Les noms de sites ne sont pas traduits en adresses de façon fiable en ce moment. ¦ Los nombres de los sitios no se están resolviendo de forma fiable ahora mismo.
 little evidence ¦ peu d'indices ¦ pocos indicios
 A device appeared that I haven't seen in this session. ¦ Un appareil que je n'avais pas vu pendant cette session est apparu. ¦ Apareció un dispositivo que no había visto en esta sesión.
+tab ¦ onglet ¦ pestaña
+view ¦ vue ¦ vista
+action ¦ action ¦ acción
+workspace ¦ espace de travail ¦ espacio de trabajo
+your workspace ¦ votre espace de travail ¦ su espacio de trabajo
+recent filter ¦ filtre récent ¦ filtro reciente
+device ¦ appareil ¦ dispositivo
+host ¦ hôte ¦ host
+search ¦ recherche ¦ búsqueda
+Commands ¦ Commandes ¦ Comandos
+Tabs ¦ Onglets ¦ Pestañas
+Filters ¦ Filtres ¦ Filtros
+Recent ¦ Récents ¦ Recientes
+Suggested ¦ Suggestions ¦ Sugerencias
+Filter packets: ¦ Filtrer les paquets : ¦ Filtrar paquetes:
+Show device ¦ Afficher l'appareil ¦ Mostrar el dispositivo
+Search everything for ¦ Tout rechercher pour ¦ Buscar en todo
+{n} of {m} – keep typing ¦ {n} sur {m} – continuez à taper ¦ {n} de {m} – siga escribiendo
+Type a packet number, for example :123 ¦ Saisissez un numéro de paquet, par exemple :123 ¦ Escriba un número de paquete, por ejemplo :123
+Type to search. Start with > commands, @ devices, # packet number, / filter, ? help. Tab changes the group. ¦ Tapez pour chercher. Commencez par > commandes, @ appareils, # numéro de paquet, / filtre, ? aide. Tab change de groupe. ¦ Escriba para buscar. Empiece con > comandos, @ dispositivos, # número de paquete, / filtro, ? ayuda. Tab cambia de grupo.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -54022,6 +54045,12 @@ class MiniWireshark:
         for w in sites:
             items.append((f"Website: {w.domain}", "website",
                           lambda d=w.domain: self.show_website(d)))
+        # "@" reaches the Internet hosts too
+        for rec in sorted(self.model.remote_hosts.values(),
+                          key=lambda r: -(r.bytes_total or 0))[:200]:
+            items.append((f"Host: {rec.ip}" + (
+                f" ({rec.domain})" if rec.domain else ""), "host",
+                lambda i=rec.ip: self.show_remote(i)))
         n = 0
         for aid in self.model.alerts.order:
             a = self.model.alerts.alerts.get(aid)
@@ -54064,9 +54093,91 @@ class MiniWireshark:
             DEFAULT_SHORTCUTS.get(name, "")
         return _pretty_seq(seq) if seq else ""
 
-    def palette_key(self, label):
+    def palette_key(self, label, cat=""):
+        """The key shown beside a Ctrl+K row: an action's own shortcut, or
+        the Ctrl+1..4 that opens a tab's group."""
         name = self.PALETTE_KEYS.get(label)
+        if name is None and cat == "tab":
+            for tname, tab in self.tabs.items():
+                if palette_tab_label(tab.label_key, tname) == label:
+                    return self.shortcut_text(f"group{tab_group_of(tname) + 1}")
         return self.shortcut_text(name) if name else ""
+
+    def palette_dynamic(self, q, chip="all"):
+        """Rows Ctrl+K makes from what was typed, [(label, cat, action)]:
+        "Go to packet N", "Show device …", "Filter packets: …" and, last
+        (cat "search"), a search of everything. Only existing methods run:
+        go_to_packet, show_device, apply_filter and the header search."""
+        q = (q or "").strip()
+        if not q:
+            return []
+        key, _cats, rest, _cut = palette_scope(q, chip)
+        text = rest.strip()
+        rows = []
+        if key in ("all", "packet"):
+            n = palette_packet_number(text)
+            if n is not None:
+                rows.append((f"Go to packet {n}", "packet",
+                             lambda n=n: self.go_to_packet(n)))
+        if key in ("all", "filters", "devices"):
+            expr, addr = None, palette_address(text)
+            if addr:
+                expr = f"{addr[0]}:{addr[1]}"
+                dev = self.model.device_for(
+                    addr[1] if addr[0] == "ip" else None,
+                    addr[1] if addr[0] == "mac" else None)
+                if dev is not None:
+                    rows.append((f"Show device {self.device_label(dev)}",
+                                 "device",
+                                 lambda k=dev.key: self.show_device(k)))
+            elif key == "filters":
+                expr = palette_filter_expr(text) or text
+            else:
+                expr = palette_filter_expr(text) or palette_filter_expr(q)
+            if expr:
+                rows.append((f"Filter packets: {expr}", "filter",
+                             lambda e=expr: self.apply_filter(e)))
+        if key == "all":
+            rows.append((f"Search everything for \u201c{q}\u201d", "search",
+                         lambda s=q: self._palette_search(s)))
+        return rows
+
+    def _palette_search(self, q):
+        """The header search, with `q` in it (what is searched stays on this
+        computer)."""
+        drop = getattr(self, "search_drop", None)
+        if drop is not None:
+            drop.cancel()
+            drop.close()
+        self.global_search_var.set(q)
+        return self._search_enter()
+
+    def _focus_main(self):
+        """After a Ctrl+K choice: the keyboard goes to the shown tab's
+        table, else its filter box, else the tab strip. (It stayed on the
+        table of the tab that was left, now hidden.) A window the choice
+        opened keeps it."""
+        def go():
+            root = self.root
+            try:
+                root.update_idletasks()
+                w = root.focus_get()
+                if w is not None and w.winfo_toplevel() is not root:
+                    return
+                tab = self.tabs.get(self.current_tab_name())
+                if w is not None and tab is not None and w.winfo_viewable():
+                    top = str(tab.frame)
+                    if str(w) == top or str(w).startswith(top + "."):
+                        return
+                for cand in (getattr(tab, "tree", None),
+                             getattr(tab, "filter_entry", None), self.nb):
+                    if cand is not None and cand.winfo_viewable():
+                        cand.focus_set()
+                        return
+            except (tk.TclError, KeyError, AttributeError):
+                pass
+        with contextlib.suppress(tk.TclError):
+            self.root.after_idle(go)
 
     def _apply_preset(self, name):
         tab = self._select_tab("packets")
@@ -57270,6 +57381,15 @@ proc ::mw_explicit_fonts {top names} {
         for cmd in getattr(self, "_shortcut_cmds", []):
             with contextlib.suppress(tk.TclError, ValueError):
                 self.root.deletecommand(cmd)
+        # the text-field classes' own binding of the palette key (Ctrl+K cuts
+        # to the end of the line there): put back before the keys are set
+        for cls, seq, script in getattr(self, "_class_shortcuts", []):
+            with contextlib.suppress(tk.TclError):
+                if script:
+                    self.root.bind_class(cls, seq, script)
+                else:
+                    self.root.unbind_class(cls, seq)
+        self._class_shortcuts = []
         self._bound_shortcuts, self._shortcut_cmds = [], []
         actions = {
             "start": lambda e=None: self.start(),
@@ -57279,7 +57399,7 @@ proc ::mw_explicit_fonts {top names} {
             "find": self._focus_search,
             "undo": self._undo_shortcut,
             "inspector": lambda e=None: self.toggle_inspector(),
-            "palette": lambda e=None: self.open_palette(),
+            "palette": self._palette_shortcut,
             "goto_packet": lambda e=None: self.go_to_packet(),
             "back": lambda e=None: self._nav_key(self.router.back),
             "explain": lambda e=None: (self.set_explain(), "break")[1],
@@ -57299,8 +57419,29 @@ proc ::mw_explicit_fonts {top names} {
                 cmd = self.root.bind_all(seq, fn)
                 self._bound_shortcuts.append(seq)
                 self._shortcut_cmds.append(cmd)
+                if name == "palette":
+                    self._bind_palette_in_fields(seq, fn)
             except tk.TclError:
                 pass
+
+    def _palette_shortcut(self, event=None):
+        """Ctrl+K. In a text field it opens the palette and nothing else
+        (the field's own Ctrl+K deleted the text after the cursor)."""
+        self.open_palette()
+        return "break"
+
+    def _bind_palette_in_fields(self, seq, fn):
+        """Tk runs a text field's own binding of Ctrl+K (delete to the end
+        of the line) before the application-wide one, so "break" there is
+        too late: the key is bound on the field classes themselves, and
+        the previous binding is kept to put back when it is changed."""
+        for cls in ("TEntry", "Entry", "TCombobox", "TSpinbox", "Spinbox",
+                    "Text"):
+            with contextlib.suppress(tk.TclError):
+                script = self.root.bind_class(cls, seq)
+                cmd = self.root.bind_class(cls, seq, fn)
+                self._class_shortcuts.append((cls, seq, script))
+                self._shortcut_cmds.append(cmd)
 
     def _undo_shortcut(self, event=None):
         # in text fields Ctrl+Z belongs to the field
@@ -65958,6 +66099,293 @@ TASK_WORKSPACES = {
 }
 
 
+# ---- Ctrl+K: ranked matching, scopes and rows made from what is typed -------
+@functools.lru_cache(maxsize=16384)
+def palette_fold(s):
+    """Lower case without accents, one character out for each one in (so a
+    position in the folded text is a position in the shown text):
+    "Paramètres" -> "parametres"."""
+    out = []
+    for c in s:
+        d = unicodedata.normalize("NFD", c)
+        out.append((d[:1] or c).lower()[:1] or c)
+    return "".join(out)
+
+
+_PAL_WORD = re.compile(r"[^\W_]+")
+_PAL_SKIP = frozenset(" -_‐‑‒–—")   # as search_fold
+
+
+@functools.lru_cache(maxsize=16384)
+def _pal_compact(f):
+    """The folded text without the characters a search skips ("wifi" is in
+    "wi-fi"), and where each kept character was."""
+    keep = tuple(i for i, c in enumerate(f) if c not in _PAL_SKIP)
+    return "".join(f[i] for i in keep), keep
+
+
+def _pal_subseq(tok, f):
+    """Positions of `tok`'s letters in order in `f`, the first at the start
+    of a word; [] when they are not all there."""
+    start = 0
+    while True:
+        i = f.find(tok[0], start)
+        if i < 0:
+            return []
+        if i == 0 or not f[i - 1].isalnum():
+            break
+        start = i + 1
+    pos = [i]
+    for ch in tok[1:]:
+        i = f.find(ch, i + 1)
+        if i < 0:
+            return []
+        pos.append(i)
+    return pos
+
+
+# what kind of thing comes first when words match equally well
+PALETTE_PRIOR = {"tab": 40, "workspace": 32, "your workspace": 32,
+                 "action": 30, "view": 25, "filter": 15, "recent filter": 12,
+                 "alert": 10, "setting": 10, "device": 8, "website": 8,
+                 "host": 6, "recent": 5, "help": 0}
+
+
+def palette_rank(tokens, label, cat, extra="", catx=""):
+    """How well `label` (kind `cat`) answers the words in `tokens` (folded,
+    see palette_fold), or None when one of them is nowhere in it. Each word
+    must hit: at the start of a word of the label 100, inside it 60, in the
+    kind's name 30, as letters in order 10 (words of 3 letters or more).
+    `extra` is the label in the language shown, `catx` the kind's name in
+    it. The whole label typed +500, starting with what was typed +200,
+    then the kind (tabs before settings), a shorter label first."""
+    prior = PALETTE_PRIOR.get(cat, 0)
+    short = min(len(label), 120) * 0.05
+    if not tokens:
+        return prior - short
+    fl = palette_fold(label)
+    fx = palette_fold(extra) if extra and extra != label else ""
+    words = _PAL_WORD.findall(fl)
+    cl = _pal_compact(fl)[0]
+    cx = ""
+    if fx:
+        words += _PAL_WORD.findall(fx)
+        cx = _pal_compact(fx)[0]
+    cwords = _PAL_WORD.findall(palette_fold(cat))
+    if catx:
+        cwords += _PAL_WORD.findall(palette_fold(catx))
+    total = 0
+    for tok in tokens:
+        if any(w.startswith(tok) for w in words):
+            total += 100
+        elif tok in cl or (cx and tok in cx):
+            total += 60
+        elif any(w.startswith(tok) for w in cwords):
+            total += 30
+        elif len(tok) >= 3 and (_pal_subseq(tok, fl) or
+                                (fx and _pal_subseq(tok, fx))):
+            total += 10
+        else:
+            return None
+    q = "".join(tokens)
+    for c in (cl, cx):
+        if c and c == q:
+            total += 500
+            break
+    for c in (cl, cx):
+        if c and c.startswith(q):
+            total += 200
+            break
+    return total + prior - short
+
+
+def palette_recent_bonus(i):
+    """Used lately: from +60 for the last one down to +5."""
+    return max(5, 60 - 3 * i)
+
+
+def palette_hits(tokens, text):
+    """The positions in `text` that the words in `tokens` matched (for the
+    bold letters of a row)."""
+    f = palette_fold(text)
+    hits = set()
+    for tok in tokens:
+        m = next((w for w in _PAL_WORD.finditer(f)
+                  if w.group().startswith(tok)), None)
+        if m is not None:
+            hits.update(range(m.start(), m.start() + len(tok)))
+            continue
+        c, keep = _pal_compact(f)
+        j = c.find(tok)
+        if j >= 0:
+            hits.update(keep[j:j + len(tok)])
+        elif len(tok) >= 3:
+            hits.update(_pal_subseq(tok, f))
+    return hits
+
+
+# the group buttons under the box: key, name; and the kinds each one shows
+PALETTE_CHIPS = (("all", "All"), ("commands", "Commands"), ("tabs", "Tabs"),
+                 ("settings", "Settings"), ("devices", "Devices"),
+                 ("help", "Help"), ("filters", "Filters"))
+PALETTE_SCOPE_CATS = {
+    "all": None,
+    "commands": {"action", "view", "tab", "workspace", "your workspace"},
+    "tabs": {"tab"}, "settings": {"setting"},
+    "devices": {"device", "website", "host"}, "help": {"help"},
+    "filters": {"filter", "recent filter"},
+    "packet": set(),                  # only the rows made from the number
+    "actions": {"action"}, "views": {"view"},
+    "workspaces": {"workspace", "your workspace"}, "alerts": {"alert"},
+    "websites": {"website"}, "hosts": {"host"},
+    "recents": {"recent", "recent filter"},
+}
+# a first character that picks the group, as in Slack or VS Code
+PALETTE_PREFIXES = {">": "commands", "@": "devices", "/": "filters",
+                    "?": "help", "#": "packet", ":": "packet"}
+# "help: dns": a kind's name and a colon
+PALETTE_NAMES = {"help": "help", "tab": "tabs", "tabs": "tabs",
+                 "setting": "settings", "settings": "settings",
+                 "action": "actions", "actions": "actions",
+                 "view": "views", "views": "views",
+                 "command": "commands", "commands": "commands",
+                 "workspace": "workspaces", "workspaces": "workspaces",
+                 "device": "devices", "devices": "devices",
+                 "website": "websites", "websites": "websites",
+                 "host": "hosts", "hosts": "hosts",
+                 "alert": "alerts", "alerts": "alerts",
+                 "filter": "filters", "filters": "filters",
+                 "recent": "recents"}
+_PAL_NAME_RE = re.compile(r"^([^\W\d_]+)\s*:\s*(.*)$", re.S)
+
+
+def palette_scope(q, chip="all"):
+    """What a query asks for: (key, kinds shown or None for all, the words
+    to look for, how many characters of `q` the scope's own prefix takes).
+    A prefix wins over the chip: ">" commands, "@" devices, websites and
+    hosts, "#" or ":" a packet number, "/" a filter, "?" help, or a kind's
+    name and a colon ("help: dns", in the language shown too)."""
+    s = q.lstrip()
+    lead = len(q) - len(s)
+    if s and s[0] in PALETTE_PREFIXES:
+        key = PALETTE_PREFIXES[s[0]]
+        return key, PALETTE_SCOPE_CATS[key], s[1:], lead + 1
+    m = _PAL_NAME_RE.match(s)
+    if m:
+        name = palette_fold(m.group(1))
+        key = PALETTE_NAMES.get(name)
+        if key is None and CURRENT_LOCALE != "en":
+            for en, k in PALETTE_NAMES.items():
+                if palette_fold(translate_text(en)) == name:
+                    key = k
+                    break
+        if key is not None:
+            return key, PALETTE_SCOPE_CATS[key], m.group(2), \
+                len(q) - len(m.group(2))
+    if chip not in PALETTE_SCOPE_CATS:
+        chip = "all"
+    return chip, PALETTE_SCOPE_CATS[chip], q, 0
+
+
+_PAL_PACKET_RE = re.compile(
+    r"^(?:(?:go\s*to|goto|jump\s*to|open|show)\s+)?"
+    r"(?:packet|pkt|frame|paquet|paquete)\s*(?:no\.?|number|num|#|:)?\s*"
+    r"(\d{1,9})$", re.I)
+_PAL_NUMBER_RE = re.compile(r"^[#:]?\s*(\d{1,9})$")
+PAL_FIELD_RE = re.compile(
+    r"(?<![\w.])(" + "|".join(sorted(DisplayFilter.FIELDS)) + r")\s*:\s*",
+    re.I)
+_PAL_MAC_RE = re.compile(r"^(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$")
+
+
+def palette_packet_number(text):
+    """"go to packet 123", "packet 123", "#123", ":123" or "123" -> 123."""
+    t = (text or "").strip()
+    m = _PAL_PACKET_RE.match(t) or _PAL_NUMBER_RE.match(t)
+    return int(m.group(1)) if m else None
+
+
+def palette_filter_expr(text):
+    """A filter written in the box ("ip:1.2.3.4", "port: 443 or
+    proto:dns") -> the expression, else None."""
+    t = (text or "").strip()
+    if not PAL_FIELD_RE.search(t):
+        return None
+    expr = PAL_FIELD_RE.sub(lambda m: m.group(1).lower() + ":", t).strip()
+    return None if expr.endswith(":") else expr
+
+
+def palette_address(text):
+    """A bare IP or MAC address -> ("ip" | "mac", address), else None."""
+    t = (text or "").strip()
+    if _PAL_MAC_RE.match(t):
+        return "mac", t.lower().replace("-", ":")
+    if ":" in t or "." in t:
+        try:
+            return "ip", str(ipaddress.ip_address(t))
+        except ValueError:
+            return None
+    return None
+
+
+class _PaletteLines:
+    """The rows of the Ctrl+K list with the calls of a Listbox (size, get,
+    curselection, selection_set, selection_clear, see, delete, insert), so
+    the code and the tests written for the Listbox still work. A "line" is
+    a row, a section title or a note."""
+
+    def __init__(self, pal):
+        self.pal = pal
+
+    def size(self):
+        return len(self.pal._entries)
+
+    def _text(self, n):
+        kind, v = self.pal._entries[n]
+        if kind != "row":
+            return v
+        r = self.pal.shown[v]
+        return f"{r[4]}    — {r[5]}" + (f"    [{r[6]}]" if r[6] else "")
+
+    def get(self, first, last=None):
+        if last is None:
+            return self._text(int(first))
+        end = len(self.pal._entries) - 1 if last == "end" else int(last)
+        return tuple(self._text(i) for i in range(int(first), end + 1))
+
+    def curselection(self):
+        p = self.pal
+        if 0 <= p._sel < len(p.shown):
+            return (p._line_of(p._sel),)
+        return ()
+
+    def selection_set(self, first, last=None):
+        for i, (kind, v) in enumerate(self.pal._entries):
+            if kind == "row" and i == int(first):
+                self.pal._select(v)
+                return
+
+    def selection_clear(self, first=None, last=None):
+        self.pal._sel = -1
+        self.pal._paint_sel()
+
+    def see(self, i):
+        with contextlib.suppress(tk.TclError):
+            self.pal.txt.see(f"{int(i) + 1}.0")
+
+    def delete(self, first, last=None):
+        p = self.pal
+        a = int(first)
+        b = len(p._entries) - 1 if last == "end" else int(
+            a if last is None else last)
+        del p._entries[a:b + 1]
+        p._draw()
+
+    def insert(self, index, text):
+        self.pal._entries.append(("note", str(text)))
+        self.pal._draw()
+
+
 def palette_tab_label(label_key, name=""):
     """A tab as the tab strip names it, without its icon ("Happening")."""
     label = translate_text(tr(label_key)) if label_key else name
@@ -65966,37 +66394,117 @@ def palette_tab_label(label_key, name=""):
 
 class CommandPalette:
     """Ctrl+K: type to reach any tab, view, setting, filter, device or
-    action."""
+    action. Words rank the rows (palette_rank); a first character or the
+    group buttons narrow them; numbers, addresses and filters become rows
+    of their own (app.palette_dynamic)."""
+
+    CAP = 100
+    # what Ctrl+K offers before anything is typed, after the recent ones
+    SUGGESTED = ("Settings", "Go to packet…", "Open a capture file…",
+                 "Save session…")
 
     def __init__(self, app):
         self.app = app
         t = app.theme
         self.items = app.palette_items()
+        self._recent = [x for x in (app.config.get("palette.recent", [])
+                                    or []) if isinstance(x, str)][:20]
+        self.chip = "all"
+        self.shown = []           # (-score, label, kind, action, + the list's)
+        self._entries = []        # a line each: ("row", n) | ("head"|"note", text)
+        self._lines = {}
+        self._sel = -1
         self.win = tk.Toplevel(app.root)
         self.win.title("Go to…")
-        self.win.geometry(px_geo("620x420"))
         self.win.configure(bg=t["tab_bg"])
         self.win.transient(app.root)
+        self._place()
         self.q = tk.StringVar()
-        e = ttk.Entry(self.win, textvariable=self.q, font=default_font(
-                                                           12))
+        e = ttk.Entry(self.win, textvariable=self.q, font=default_font(12))
         e.pack(fill="x", padx=12, pady=(12, 6))
-        self.lb = tk.Listbox(self.win, bg=t["text_bg"], fg=t["text_fg"],
-                             selectbackground=t["accent"],
-                             activestyle="none", highlightthickness=0,
-                             font=mw_font(11))
-        self.lb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.shown = []
+        # the groups: clicked, or Tab / Shift+Tab in the box; never focused
+        self._selfg = "#ffffff" if wcag_contrast(t["accent"], "#ffffff") >= \
+            wcag_contrast(t["accent"], "#000000") else "#000000"
+        chips = tk.Frame(self.win, bg=t["tab_bg"])
+        chips.pack(fill="x", padx=12, pady=(0, 6))
+        self.chips = {}
+        for key, name in PALETTE_CHIPS:
+            lbl = tk.Label(chips, text=name, padx=8, pady=1,
+                           font=mw_font(9), cursor="hand2", takefocus=0)
+            lbl.pack(side="left", padx=(0, 4))
+            lbl.bind("<Button-1>", lambda ev, k=key: self._pick_chip(k))
+            self.chips[key] = lbl
+        tk.Label(self.win, text=translate_text(
+            "Type to search. Start with > commands, @ devices, # packet "
+            "number, / filter, ? help. Tab changes the group."),
+            bg=t["tab_bg"], fg=t["muted_fg"], font=mw_font(8), anchor="w",
+            justify="left", wraplength=580, takefocus=0).pack(
+            side="bottom", fill="x", padx=12, pady=(0, 8))
+        body = tk.Frame(self.win, bg=t["tab_bg"])
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        sb = ttk.Scrollbar(body, orient="vertical", takefocus=0)
+        sb.pack(side="right", fill="y")
+        self.txt = tx = tk.Text(
+            body, bg=t["text_bg"], fg=t["text_fg"], font=mw_font(11),
+            wrap="none", width=10, height=5, highlightthickness=0,
+            borderwidth=0, padx=6, pady=2, cursor="arrow", takefocus=0,
+            exportselection=0, insertwidth=0, spacing1=2, spacing3=2,
+            state="disabled", yscrollcommand=sb.set)
+        sb.configure(command=tx.yview)
+        tx.pack(side="left", fill="both", expand=True)
+        self.lb = _PaletteLines(self)
+        tx.tag_configure("cat", foreground=t["muted_fg"], font=mw_font(9))
+        tx.tag_configure("key", foreground=t["muted_fg"], font=mw_font(9))
+        tx.tag_configure("head", foreground=t["muted_fg"],
+                         font=mw_font(8, "bold"), spacing1=8)
+        tx.tag_configure("note", foreground=t["muted_fg"],
+                         font=mw_font(10, "italic"))
+        tx.tag_configure("hit", font=mw_font(11, "bold"),
+                         foreground=t.get("focus", t["accent"]))
+        tx.tag_configure("selrow", background=t["accent"],
+                         foreground=self._selfg)
+        tx.tag_raise("selrow")
+        tx.bind("<Configure>", self._tabstop)
+        tx.bind("<Button-1>", self._click)
+        tx.bind("<Double-Button-1>", lambda ev: self._click(ev, True))
+        for seq in ("<B1-Motion>", "<Triple-Button-1>", "<Shift-Button-1>",
+                    "<Control-Button-1>", "<ButtonRelease-1>"):
+            tx.bind(seq, lambda ev: "break")
         self.q.trace_add("write", lambda *a: self.filter())
         e.bind("<Return>", self.run)
-        e.bind("<Down>", lambda ev: self._move(1))
-        e.bind("<Up>", lambda ev: self._move(-1))
-        self.lb.bind("<Double-1>", self.run)
+        e.bind("<KP_Enter>", self.run)
+        e.bind("<Shift-Return>", lambda ev: self.run(keep=True))
+        for seq, d in (("<Down>", 1), ("<Up>", -1), ("<Control-n>", 1),
+                       ("<Control-p>", -1), ("<Control-j>", 1),
+                       ("<Next>", 10), ("<Prior>", -10)):
+            e.bind(seq, lambda ev, d=d: self._move(d))
+        e.bind("<Control-Home>", lambda ev: self._select(0))
+        e.bind("<Control-End>", lambda ev: self._select(len(self.shown) - 1))
+        e.bind("<Tab>", lambda ev: self._cycle(1))
+        e.bind("<Shift-Tab>", lambda ev: self._cycle(-1))
+        e.bind("<ISO_Left_Tab>", lambda ev: self._cycle(-1))
         self.win.bind("<Escape>", lambda ev: self.close())
         self.entry = e
         self.filter()
         e.focus_set()
         self.win.after(60, lambda: focus_toplevel(self.win, e))
+
+    def _place(self):
+        """620 x 420 over the middle of the main window."""
+        root = self.app.root
+        w, h = (int(x) for x in px_geo("620x420").split("x"))
+        try:
+            root.update_idletasks()
+            if root.winfo_width() < 200:
+                self.win.geometry(f"{w}x{h}")
+                return
+            x = root.winfo_rootx() + (root.winfo_width() - w) // 2
+            y = root.winfo_rooty() + (root.winfo_height() - h) // 2
+            x = max(0, min(x, root.winfo_screenwidth() - w))
+            y = max(0, min(y, root.winfo_screenheight() - h - 40))
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+        except tk.TclError:
+            self.win.geometry(f"{w}x{h}")
 
     def alive(self):
         try:
@@ -66010,52 +66518,238 @@ class CommandPalette:
         with contextlib.suppress(tk.TclError):
             self.win.destroy()
 
-    def filter(self):
-        q = self.q.get()
-        recent = list(getattr(self.app, "_palette_recent", ()))
-        scored = []
-        for label, cat, fn in self.items:
-            s = fuzzy_score(q, f"{label} {cat}")
-            if s is not None:
-                if label in recent:          # used lately: a small boost
-                    s += 3 + recent.index(label) * 0.1
-                scored.append((-s, label, cat, fn))
-        scored.sort(key=lambda x: x[0])
-        self.shown = scored[:60]
-        self.lb.delete(0, "end")
-        for _s, label, cat, _fn in self.shown:
-            key = self.app.palette_key(label)
-            self.lb.insert("end", f"{label}    — {translate_text(cat)}"
-                           + (f"    [{key}]" if key else ""))
-        if self.shown:
-            self.lb.selection_set(0)
-        else:
-            self.lb.insert("end", translate_text(
-                "No matches. Try a tab, a setting, a device or an action."))
-            with contextlib.suppress(tk.TclError):
-                self.lb.itemconfigure(0, foreground=self.app.theme[
-                    "muted_fg"])
+    # ---- groups ------------------------------------------------------------
+    def _active_chip(self):
+        key = palette_scope(self.q.get(), self.chip)[0]
+        return key if key in dict(PALETTE_CHIPS) else "all"
 
-    def _move(self, d):
-        sel = self.lb.curselection()
-        i = max(0, min(len(self.shown) - 1, (sel[0] if sel else 0) + d))
-        self.lb.selection_clear(0, "end")
-        self.lb.selection_set(i)
-        self.lb.see(i)
+    def _paint_chips(self):
+        t, active = self.app.theme, self._active_chip()
+        for key, lbl in self.chips.items():
+            on = key == active
+            with contextlib.suppress(tk.TclError):
+                lbl.configure(bg=t["accent"] if on else t["card_bg"],
+                              fg=self._selfg if on else t["text_fg"])
+
+    def _pick_chip(self, key):
+        """A group chosen: its prefix leaves the text, and the group stays
+        until another one is chosen."""
+        q = self.q.get()
+        cut = palette_scope(q, "all")[3]
+        self.chip = key
+        with contextlib.suppress(tk.TclError):
+            self.entry.focus_set()
+        if cut:
+            self.q.set(q[cut:])           # runs filter()
+        else:
+            self.filter()
         return "break"
 
-    def run(self, _e=None):
-        sel = self.lb.curselection()
-        if not sel or sel[0] >= len(self.shown):
-            return
-        label, fn = self.shown[sel[0]][1], self.shown[sel[0]][3]
-        rec = self.app.__dict__.setdefault("_palette_recent", deque(
-            maxlen=20))
-        if label in rec:
-            rec.remove(label)
-        rec.append(label)
+    def _cycle(self, d):
+        keys = [k for k, _n in PALETTE_CHIPS]
+        cur = self._active_chip()
+        return self._pick_chip(keys[(keys.index(cur) + d) % len(keys)])
+
+    # ---- the list ----------------------------------------------------------
+    def _row(self, neg, label, cat, fn, tokens=(), dyn=False):
+        """A `shown` entry: (-score, label, kind, action) and, after them,
+        what the list draws: label and kind as shown, key, matched letters,
+        and whether the row was made from the typed text."""
+        if dyn:
+            disp, cdisp = self._dyn_text(label), translate_text(cat)
+            key, hits = "", set()
+        else:
+            disp = translate_text(label) if CURRENT_LOCALE != "en" else label
+            cdisp = translate_text(cat)
+            key = self.app.palette_key(label, cat)
+            hits = palette_hits(tokens, disp) if tokens else set()
+        return (neg, label, cat, fn, disp, cdisp, key, hits, dyn)
+
+    @staticmethod
+    def _dyn_text(label):
+        for pre in ("Go to packet", "Filter packets:", "Show device",
+                    "Search everything for"):
+            if label.startswith(pre + " "):
+                return translate_text(pre) + label[len(pre):]
+        return label
+
+    def filter(self):
+        app = self.app
+        q = self.q.get()
+        key, cats, rest, _cut = palette_scope(q, self.chip)
+        self._paint_chips()
+        if not q.strip() and self.chip == "all":
+            return self._show_sections()
+        tokens = palette_fold(rest).split()
+        loc = CURRENT_LOCALE != "en"
+        order = {lab: i for i, lab in enumerate(self._recent)}
+        scored = []
+        for n, (label, cat, fn) in enumerate(self.items):
+            if cats is not None and cat not in cats:
+                continue
+            tl = translate_text(label) if loc else ""
+            tc = translate_text(cat) if loc else ""
+            s = palette_rank(tokens, label, cat, tl, tc)
+            if s is None:
+                continue
+            if label in order:
+                s += palette_recent_bonus(order[label])
+            scored.append((-s, n, label, cat, fn))
+        scored.sort(key=lambda x: x[:2])
+        total = len(scored)
+        dyn = app.palette_dynamic(q, self.chip) if q.strip() else []
+        shown = []
+        for i, (label, cat, fn) in enumerate(
+                d for d in dyn if d[1] != "search"):
+            shown.append(self._row(-10000.0 + i, label, cat, fn, dyn=True))
+        for neg, _n, label, cat, fn in scored[:self.CAP]:
+            shown.append(self._row(neg, label, cat, fn, tokens))
+        entries = [("row", i) for i in range(len(shown))]
+        if total > self.CAP:
+            entries.append(("note", translate_text(
+                "{n} of {m} – keep typing").format(n=self.CAP, m=total)))
+        if not shown:
+            entries.append(("note", translate_text(
+                "Type a packet number, for example :123" if key == "packet"
+                else "No matches. Try a tab, a setting, a device or an "
+                     "action.")))
+        for label, cat, fn in (d for d in dyn if d[1] == "search"):
+            shown.append(self._row(-1e-3, label, cat, fn, dyn=True))
+            entries.append(("row", len(shown) - 1))
+        self.shown, self._entries = shown, entries
+        self._sel = 0 if shown else -1
+        self._draw()
+
+    def _show_sections(self):
+        """Nothing typed: what you ran lately, then a few places to start."""
+        by_label = {}
+        for it in self.items:
+            by_label.setdefault(it[0], it)
+        rec = [by_label[x] for x in self._recent if x in by_label][:10]
+        used = {x[0] for x in rec}
+        sug = [it for it in self.items if it[1] == "tab"] + [
+            by_label[x] for x in self.SUGGESTED if x in by_label]
+        sug = [it for it in sug if it[0] not in used]
+        shown, entries = [], []
+        for title, group in (("Recent", rec), ("Suggested", sug)):
+            if not group:
+                continue
+            entries.append(("head", translate_text(title).upper()))
+            for label, cat, fn in group:
+                shown.append(self._row(0.0, label, cat, fn))
+                entries.append(("row", len(shown) - 1))
+        self.shown, self._entries = shown, entries
+        self._sel = 0 if shown else -1
+        self._draw()
+
+    def _line_of(self, i):
+        return self._lines.get(i, i)
+
+    def _draw(self):
+        tx = self.txt
+        tx.configure(state="normal")
+        tx.delete("1.0", "end")
+        self._lines = {}
+        for n, (kind, v) in enumerate(self._entries):
+            if n:
+                tx.insert("end", "\n")
+            if kind != "row":
+                tx.insert("end", v, kind)
+                continue
+            self._lines[v] = n
+            r = self.shown[v]
+            start = tx.index("end-1c")
+            tx.insert("end", r[4])
+            a = b = None
+            for h in sorted(r[7]) + [None]:
+                if h is not None and h == b:
+                    b = h + 1
+                    continue
+                if a is not None:
+                    tx.tag_add("hit", f"{start}+{a}c", f"{start}+{b}c")
+                a, b = (h, h + 1) if h is not None else (None, None)
+            tx.insert("end", "   " + r[5], "cat")
+            if r[6]:
+                tx.insert("end", "\t" + r[6], "key")
+        tx.configure(state="disabled")
+        self._tabstop()
+        self._paint_sel()
+        with contextlib.suppress(tk.TclError):
+            tx.yview_moveto(0)
+
+    def _tabstop(self, _e=None):
+        """The key of a row, right-aligned at the edge of the list."""
+        with contextlib.suppress(tk.TclError):
+            self.txt.configure(tabs=(max(100, self.txt.winfo_width() - 16),
+                                     "right"))
+
+    def _paint_sel(self):
+        tx = self.txt
+        with contextlib.suppress(tk.TclError):
+            tx.tag_remove("selrow", "1.0", "end")
+            if 0 <= self._sel < len(self.shown):
+                ln = self._lines.get(self._sel)
+                if ln is not None:
+                    tx.tag_add("selrow", f"{ln + 1}.0",
+                               f"{ln + 1}.0 lineend+1c")
+
+    def _select(self, i, see=True):
+        if not self.shown:
+            return "break"
+        self._sel = max(0, min(len(self.shown) - 1, i))
+        self._paint_sel()
+        if see:
+            with contextlib.suppress(tk.TclError):
+                if self._sel == 0:
+                    self.txt.see("1.0")
+                self.txt.see(f"{self._line_of(self._sel) + 1}.0")
+        return "break"
+
+    def _move(self, d):
+        return self._select((self._sel if self._sel >= 0 else 0) + d)
+
+    def _click(self, e, run=False):
+        """A click on a row selects it (twice runs it); the keyboard stays
+        in the box."""
+        with contextlib.suppress(tk.TclError, ValueError):
+            n = int(self.txt.index(f"@{e.x},{e.y}").split(".")[0]) - 1
+            if 0 <= n < len(self._entries) and \
+                    self._entries[n][0] == "row":
+                self._select(self._entries[n][1], see=False)
+                if run:
+                    self.run()
+        with contextlib.suppress(tk.TclError):
+            self.entry.focus_set()
+        return "break"
+
+    # ---- running ------------------------------------------------------------
+    def _remember(self, label):
+        self._recent = ([label] + [x for x in self._recent
+                                   if x != label])[:20]
+        cfg = self.app.config
+        cfg.set("palette.recent", list(self._recent))
+        cfg.save()
+
+    def run(self, _e=None, keep=False):
+        """Enter runs the row; Shift+Enter runs it and keeps the box open."""
+        if not 0 <= self._sel < len(self.shown):
+            return "break"
+        row = self.shown[self._sel]
+        label, fn = row[1], row[3]
+        if not row[8]:
+            self._remember(label)
+        if keep:
+            self.entry.after_idle(lambda: focus_toplevel(self.win,
+                                                         self.entry))
+            fn()
+            return "break"
+        app = self.app
         self.close()
-        fn()
+        try:
+            fn()
+        finally:
+            app._focus_main()
+        return "break"
 
 
 STORAGE_CATEGORIES = (
@@ -84625,6 +85319,93 @@ def test_palette_matcher_resolvers_posture(ctx):
     assert calibrate(0.2) > 100
 
 @self_test(slow=False)
+def test_palette_rank_scopes_dynamic(ctx):
+    """Ctrl+K: words rank the rows (start of a word, inside, kind, letters
+    in order; every word must hit; accents don't matter), a first
+    character or "help:" picks a group, and numbers, addresses and filters
+    typed in the box are told apart."""
+    items = [("Happening", "tab"), ("Dashboard", "tab"),
+             ("Settings", "setting"), ("Settings › Alerts", "setting"),
+             ("Settings › Alerts › Mail alerts", "setting"),
+             ("Connections", "tab"), ("Connections → Mail", "view"),
+             ("Help: How the Happening feed works", "help"),
+             ("Packets → Statistics", "view"), ("Wi-Fi signal", "view"),
+             ("Device: Mail server", "device"), ("Start watching", "action")]
+
+    def ranked(q, **kw):
+        toks = palette_fold(q).split()
+        got = [(palette_rank(toks, lab, cat, *kw.get(lab, ())), lab)
+               for lab, cat in items]
+        return [lab for sc, lab in sorted(
+            (g for g in got if g[0] is not None), key=lambda g: -g[0])]
+    assert ranked("happening")[0] == "Happening"
+    assert ranked("sett")[0] == "Settings"
+    assert ranked("conn mail")[0] == "Connections → Mail"
+    assert ranked("mail")[0] == "Connections → Mail"
+    assert ranked("pkst") == ["Packets → Statistics"]      # letters in order
+    assert ranked("wifi") == ["Wi-Fi signal"]              # skipped hyphen
+    assert ranked("zzqqxxyy") == []
+    assert ranked("mail dashboard") == []                  # every word hits
+    assert ranked("watch")[0] == "Start watching"
+    # a kind's name counts, less than the label's own words
+    assert palette_rank(["help"], "Dns", "help") == 30 - 0.15
+    assert palette_rank(["help"], "Help me", "help") > 100
+    assert palette_rank([], "Dns", "tab") == 40 - 0.15
+    # accents: "parametres" finds the French "Paramètres"
+    assert palette_fold("Paramètres") == "parametres"
+    assert palette_rank(["parametres"], "Settings", "setting",
+                        "Paramètres", "paramètre") > 700
+    assert palette_rank(["parametres"], "Settings", "setting") is None
+    # used lately: +60 down to +5
+    assert palette_recent_bonus(0) == 60 and palette_recent_bonus(40) == 5
+    assert palette_recent_bonus(1) < palette_recent_bonus(0)
+    # the letters a row shows in bold
+    assert palette_hits(["conn", "mail"], "Connections → Mail") == \
+        {0, 1, 2, 3, 14, 15, 16, 17}
+    assert palette_hits(["wifi"], "Wi-Fi signal") == {0, 1, 3, 4}
+    # groups
+    assert palette_scope(">sett")[:3] == (
+        "commands", PALETTE_SCOPE_CATS["commands"], "sett")
+    assert palette_scope("@dev")[0] == "devices"
+    assert palette_scope("?dns")[0] == "help"
+    assert palette_scope("/ip:1.1.1.1")[0] == "filters"
+    assert palette_scope("#12")[0] == "packet"
+    assert palette_scope(":12")[0] == "packet"
+    assert palette_scope("help: dns")[0] == "help" and \
+        palette_scope("help: dns")[2] == "dns"
+    assert palette_scope("settings: net")[0] == "settings"
+    assert palette_scope("net", "tabs")[:1] == ("tabs",)
+    assert palette_scope(">net", "tabs")[0] == "commands"   # prefix wins
+    assert palette_scope("ip:1.2.3.4")[0] == "all"          # not a kind
+    assert palette_scope("  >x")[3] == 3
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        assert palette_scope("aide: dns")[0] == "help"
+    finally:
+        set_locale(old)
+    # numbers, filters and addresses
+    for t in ("go to packet 123", "Go to packet 123", "packet 123", "#123",
+              ":123", "123", "pkt 123"):
+        assert palette_packet_number(t) == 123, t
+    for t in ("go to packet", "12 apples", "1.2.3.4", "", "ip:12"):
+        assert palette_packet_number(t) is None, t
+    assert palette_filter_expr("ip:1.2.3.4") == "ip:1.2.3.4"
+    assert palette_filter_expr("port: 443 or PROTO:dns") == \
+        "port:443 or proto:dns"
+    assert palette_filter_expr("device: tv") == "device:tv"
+    assert palette_filter_expr("sev:warning") == "sev:warning"
+    assert palette_filter_expr("hello") is None
+    assert palette_filter_expr("ip:") is None
+    assert palette_filter_expr("zip:1") is None             # not the field
+    assert palette_address("192.168.1.20") == ("ip", "192.168.1.20")
+    assert palette_address("AA-BB-CC-DD-EE-FF") == ("mac",
+                                                    "aa:bb:cc:dd:ee:ff")
+    assert palette_address("fe80::1") == ("ip", "fe80::1")
+    assert palette_address("123") is None and palette_address("a.b") is None
+
+
+@self_test(slow=False)
 def test_v501_fixes_and_filters(ctx):
     """5.0.1: sub-second durations, conversation / address / expert
     filters, frame.time_relative (was always empty), time formats, CSV
@@ -101189,6 +101970,12 @@ def gt_c534_palette_focus(app, ctx):
             [x for x in labels if not x.startswith("Settings")][:4]
         p.q.set("zzqqxxyy")
         _gui_pump(root, 0.1)
+        # nothing matches: the hint, and the one row that searches
+        # everything (the rows of a group have no such row)
+        assert [r[2] for r in p.shown] == ["search"] and \
+            "No matches" in p.lb.get(0), p.lb.get(0, "end")
+        p.q.set(">zzqqxxyy")
+        _gui_pump(root, 0.1)
         assert not p.shown and p.lb.size() == 1 and \
             "No matches" in p.lb.get(0), p.lb.get(0, "end")
         p.run()                          # Enter on the hint does nothing
@@ -101220,6 +102007,292 @@ def gt_c534_palette_focus(app, ctx):
     app.search_entry.focus_force()
     _gui_pump(root, 0.2)
     assert int(card.cget("highlightthickness")) == 1
+
+
+def _gui_key(app, widget, seq):
+    """Press `seq` in `widget` as the keyboard would (the widget has the
+    focus first)."""
+    widget.focus_force()
+    _gui_pump(app.root, 0.05, lambda: app.root.focus_get() is widget,
+              timeout=2)
+    widget.event_generate(seq)
+    _gui_pump(app.root, 0.1)
+
+
+@gui_test_step("Ctrl+K: go to a packet, run a filter, groups with > @ ? and "
+               "Tab, keys of the list, the number of rows, highlighting")
+def gt_kbd_palette_rows(app, ctx):
+    root = app.root
+    _gui_focus_main(app)
+    assert app.all_rows, "no packets"
+    no = app.all_rows[min(5, len(app.all_rows) - 1)]["no"]
+    p = app.open_palette()
+    try:
+        _gui_pump(root, 0.2)
+        # in the middle of the main window
+        cx = p.win.winfo_rootx() + p.win.winfo_width() / 2
+        mx = root.winfo_rootx() + root.winfo_width() / 2
+        assert abs(cx - mx) < 40, (cx, mx)
+        e = p.entry
+        # "go to packet N": first row, Enter opens it in the Packets tab
+        p.q.set(f"go to packet {no}")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == f"Go to packet {no}" and \
+            p.shown[0][2] == "packet", p.shown[:2]
+        assert p.shown[-1][2] == "search" and \
+            p.shown[-1][1] == f"Search everything for \u201cgo to packet "\
+            f"{no}\u201d", p.shown[-1][1]
+        app._select_tab("dash")
+        _gui_key(app, e, "<Return>")
+        assert not p.alive() and app.current_tab_name() == "packets", \
+            app.current_tab_name()
+        for q in (f"#{no}", f":{no}", str(no)):
+            p = app.open_palette()
+            p.q.set(q)
+            _gui_pump(root, 0.1)
+            assert p.shown[0][1] == f"Go to packet {no}", (q, p.shown[:2])
+            p.close()
+        # a filter typed in the box: first row, Enter applies it
+        p = app.open_palette()
+        p.q.set("ip:1.2.3.4")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Filter packets: ip:1.2.3.4" and \
+            p.shown[0][2] == "filter", p.shown[:2]
+        app._select_tab("dash")
+        _gui_key(app, p.entry, "<Return>")
+        assert app.current_tab_name() == "packets" and \
+            app.tabs["packets"].expr_var.get() == "ip:1.2.3.4", \
+            app.tabs["packets"].expr_var.get()
+        app.tabs["packets"].set_expression("")
+        for q, first in (("/port:443", "Filter packets: port:443"),
+                         ("filter: proto:dns", "Filter packets: proto:dns"),
+                         ("sev:warning", "Filter packets: sev:warning")):
+            p = app.open_palette()
+            p.q.set(q)
+            _gui_pump(root, 0.1)
+            assert p.shown[0][1] == first, (q, p.shown[:2])
+            p.close()
+        # a device's address: the device, then the filter
+        dev = next(iter(app.model.registry.by_key.values()))
+        p = app.open_palette()
+        p.q.set(dev.ip)
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1].startswith("Show device ") and \
+            p.shown[1][1] == f"Filter packets: ip:{dev.ip}", \
+            [x[1] for x in p.shown[:3]]
+        p.close()
+        # groups: only commands after ">", only devices (and sites, hosts)
+        # after "@", only Help after "?"; none has the search row
+        p = app.open_palette()
+        commands = PALETTE_SCOPE_CATS["commands"]
+        p.q.set(">")
+        _gui_pump(root, 0.1)
+        assert len(p.shown) > 10 and all(r[2] in commands for r in p.shown), \
+            sorted({r[2] for r in p.shown})
+        p.q.set(">go")
+        _gui_pump(root, 0.1)
+        assert p.shown and all(r[2] in commands for r in p.shown)
+        p.q.set("@dev")
+        _gui_pump(root, 0.1)
+        assert p.shown and all(r[2] in ("device", "website", "host")
+                               for r in p.shown), \
+            sorted({r[2] for r in p.shown})
+        p.q.set("?")
+        _gui_pump(root, 0.1)
+        assert p.shown and all(r[2] == "help" for r in p.shown)
+        p.q.set("help: dns")
+        _gui_pump(root, 0.1)
+        assert p.shown and all(r[2] == "help" for r in p.shown)
+        # Tab goes through the groups (the box keeps the keyboard), Shift+Tab
+        # back; a click on one picks it; none is a Tab stop
+        p.q.set("")
+        _gui_pump(root, 0.1)
+        assert p.chip == "all" and list(p.chips) == [
+            k for k, _n in PALETTE_CHIPS]
+        assert all(str(c.cget("takefocus")) == "0" for c in p.chips.values())
+        _gui_key(app, p.entry, "<Tab>")
+        assert p.chip == "commands" and root.focus_get() is p.entry
+        assert p.shown and all(r[2] in commands for r in p.shown)
+        _gui_key(app, p.entry, "<Tab>")
+        assert p.chip == "tabs" and all(r[2] == "tab" for r in p.shown)
+        _gui_key(app, p.entry, "<Shift-Tab>")
+        assert p.chip == "commands"
+        for _ in range(6):
+            _gui_key(app, p.entry, "<Tab>")
+        assert p.chip == "all", p.chip
+        p.q.set(">net")
+        _gui_pump(root, 0.1)
+        _gui_key(app, p.entry, "<Tab>")           # ">" gives way to Tabs
+        assert p.q.get() == "net" and p.chip == "tabs", (p.q.get(), p.chip)
+        p.chips["settings"].event_generate("<Button-1>")
+        _gui_pump(root, 0.1)
+        assert p.chip == "settings" and root.focus_get() is p.entry
+        assert all(r[2] == "setting" for r in p.shown)
+        p.q.set("")
+        p.chips["all"].event_generate("<Button-1>")
+        _gui_pump(root, 0.1)
+        # the keys of the list: PageDown by 10, Ctrl+N / Ctrl+P, the ends
+        p.q.set(">")
+        _gui_pump(root, 0.1)
+        assert p._sel == 0 and len(p.shown) > 25
+        _gui_key(app, p.entry, "<Control-n>")
+        assert p._sel == 1
+        _gui_key(app, p.entry, "<Control-p>")
+        assert p._sel == 0
+        _gui_key(app, p.entry, "<Down>")
+        _gui_key(app, p.entry, "<Control-j>")
+        assert p._sel == 2
+        _gui_key(app, p.entry, "<Up>")
+        _gui_key(app, p.entry, "<Up>")
+        _gui_key(app, p.entry, "<Next>")
+        assert p._sel == 10 and p.lb.curselection() == (10,), p._sel
+        assert p.txt.bbox("11.0") is not None, "row 10 not in view"
+        _gui_key(app, p.entry, "<Next>")
+        _gui_key(app, p.entry, "<Next>")
+        assert p._sel == 30 or p._sel == len(p.shown) - 1, p._sel
+        assert p.txt.bbox(f"{p._sel + 1}.0") is not None, "row not in view"
+        _gui_key(app, p.entry, "<Prior>")
+        assert p._sel == max(0, min(30, len(p.shown) - 1) - 10)
+        _gui_key(app, p.entry, "<Control-End>")
+        assert p._sel == len(p.shown) - 1
+        assert p.txt.bbox(f"{p._sel + 1}.0") is not None
+        _gui_key(app, p.entry, "<Control-Home>")
+        assert p._sel == 0
+        # Home and End stay in the box
+        p.q.set(">abc")
+        p.entry.icursor(2)
+        _gui_key(app, p.entry, "<End>")
+        assert p.entry.index("insert") == 4 and p._sel in (-1, 0)
+        _gui_key(app, p.entry, "<Home>")
+        assert p.entry.index("insert") == 0
+        # only the 100 best are listed, and the list says so
+        p.q.set("a")
+        _gui_pump(root, 0.1)
+        rows = [r for r in p.shown if not r[8]]
+        assert len(rows) == p.CAP, len(rows)
+        notes = [x for x in p.lb.get(0, "end") if "keep typing" in x]
+        assert len(notes) == 1 and notes[0].startswith(f"{p.CAP} of "), notes
+        # a click on a row selects it and the box keeps the keyboard
+        bb = p.txt.bbox("3.0")
+        assert bb is not None
+        p.txt.event_generate("<Button-1>", x=bb[0] + 8, y=bb[1] + bb[3] // 2)
+        _gui_pump(root, 0.1)
+        assert p._sel == 2 and root.focus_get() is p.entry, \
+            (p._sel, root.focus_get())
+        # matched letters in bold
+        p.q.set("conn mail")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Connections → Mail"
+        rng = p.txt.tag_ranges("hit")
+        assert rng and p.txt.get(rng[0], rng[1]) == "Conn", \
+            [str(r) for r in rng]
+        assert p.txt.get(rng[2], rng[3]) == "Mail"
+        # a tab row shows the key of its group
+        p.q.set("happening")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Happening" and p.shown[0][6] == "Ctrl+1", \
+            p.shown[0][:3] + p.shown[0][4:7]
+        assert "[Ctrl+1]" in p.lb.get(0)
+        # Shift+Enter runs a row and keeps the box open
+        p.q.set("explain inline")
+        _gui_pump(root, 0.1)
+        was = app.explain_on()
+        _gui_key(app, p.entry, "<Shift-Return>")
+        try:
+            assert p.alive() and app.explain_on() != was
+        finally:
+            app.set_explain(was)
+        assert app.explain_on() == was
+    finally:
+        p.close()
+        app.tabs["packets"].set_expression("")
+
+
+@gui_test_step("Ctrl+K: the keyboard lands in the tab that was opened; the "
+               "key works in the search box; recent rows are kept; French")
+def gt_kbd_palette_focus_recent(app, ctx):
+    root = app.root
+    _gui_focus_main(app)
+    # after running "Alerts" the focus is on something shown in that tab
+    app._select_tab("dash")
+    _gui_pump(root, 0.2)
+    _gui_focus_main(app)
+    p = app.open_palette()
+    p.q.set("alerts")
+    _gui_pump(root, 0.1)
+    assert p.shown[0][2] == "tab" and p.shown[0][4] == "Alerts", \
+        p.shown[0][:3]
+    p.run()
+    _gui_pump(root, 0.4)
+    assert app.current_tab_name() == "alerts"
+    w = root.focus_get()
+    top = str(app.tabs["alerts"].frame)
+    assert w is not None and w.winfo_viewable() and \
+        str(w).startswith(top + "."), (w, top)
+    # Ctrl+K in the header search box opens the palette and keeps the text
+    _gui_focus_main(app)
+    app.global_search_var.set("hello world")
+    app.search_entry.icursor(5)
+    _gui_key(app, app.search_entry, "<Control-k>")
+    assert app.global_search_var.get() == "hello world", \
+        app.global_search_var.get()
+    p = app._palette
+    assert p.alive()
+    p.close()
+    app.global_search_var.set("")
+    # the choices are kept, newest first, 20 at most, across restarts
+    label = "Explain inline (on / off)"
+    was = app.explain_on()
+    p = app.open_palette()
+    p.q.set("explain inline")
+    _gui_pump(root, 0.1)
+    assert p.shown[0][1] == label, p.shown[:2]
+    p.run()
+    _gui_pump(root, 0.2)
+    app.set_explain(was)
+    assert app.config.get("palette.recent")[0] == label
+    saved = json.load(open(app.config.path, encoding="utf-8"))
+    assert saved["palette"]["recent"][0] == label, saved.get("palette")
+    p = app.open_palette()
+    _gui_pump(root, 0.1)
+    assert p.lb.get(0) == "RECENT" and p.shown[0][1] == label, \
+        (p.lb.get(0), p.shown[0][:3])
+    heads = [x for x in p.lb.get(0, "end") if x.isupper()]
+    assert heads == ["RECENT", "SUGGESTED"], heads
+    assert any(r[2] == "tab" and r[6] for r in p.shown)
+    for i in range(25):
+        p._remember(f"Test row {i}")
+    assert len(app.config.get("palette.recent")) == 20
+    assert app.config.get("palette.recent")[0] == "Test row 24"
+    p.close()
+    # a used row goes up when the same words match several
+    app.config.set("palette.recent", [label])
+    p = app.open_palette()
+    p.q.set("inl")
+    _gui_pump(root, 0.1)
+    assert p.shown[0][1] == label
+    p.close()
+    app.config.set("palette.recent", [])
+    app.config.save()
+    # French: the kinds are translated, "parametres" finds "Paramètres"
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        p = app.open_palette()
+        p.q.set("parametres")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Settings" and \
+            p.shown[0][4] == "Paramètres" and p.shown[0][5] == "paramètre", \
+            p.shown[0][:6]
+        p.q.set("onglet")
+        _gui_pump(root, 0.1)
+        assert p.shown and p.shown[0][5] == "onglet", p.shown[0][4:6]
+        p.q.set("")
+        _gui_pump(root, 0.1)
+        assert p.lb.get(0) == "SUGGESTIONS", p.lb.get(0)
+        p.close()
+    finally:
+        set_locale(old)
 
 
 # ---- 5.3.4 crowd test fixes (the ranked bug list): one test per fix ----
