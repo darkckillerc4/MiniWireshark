@@ -104114,7 +104114,8 @@ def t_kbd_shortcut_names_have_controls_actions_and_no_clash(ctx):
     the program itself keeps (the older ones keep theirs)."""
     import inspect
     src = inspect.getsource(MiniWireshark._apply_shortcuts)
-    actions = set(re.findall(r'^\s+"(\w+)": lambda', src, re.M))
+    block = src[src.index("actions = {"):src.index("shortcuts = dict(")]
+    actions = set(re.findall(r'^\s+"(\w+)": ', block, re.M))
     ctl = {k.split(".", 1)[1] for k in settings_schema_keys()
            if k.startswith("shortcuts.")}
     for name in DEFAULT_SHORTCUTS:
