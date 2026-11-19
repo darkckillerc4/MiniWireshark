@@ -32778,6 +32778,8 @@ Usually your provider's DNS being slow or a congested connection; it isn't a sec
 Very often normal: cloud and content services are spread across many countries. Location databases can also be wrong. ¦ Très souvent normal : les services cloud et de contenu sont répartis dans de nombreux pays. Les bases de localisation peuvent aussi se tromper. ¦ Muy a menudo normal: los servicios en la nube y de contenidos están repartidos por muchos países. Las bases de datos de ubicación también pueden equivocarse.
 Website names aren't being resolved reliably right now. ¦ Les noms de sites ne sont pas traduits en adresses de façon fiable en ce moment. ¦ Los nombres de los sitios no se están resolviendo de forma fiable ahora mismo.
 little evidence ¦ peu d'indices ¦ pocos indicios
+The interrupted session can't be restored: its crash copy is incomplete or damaged. It was left in the sessions folder. ¦ La session interrompue ne peut pas être restaurée : sa copie après plantage est incomplète ou abîmée. Elle a été laissée dans le dossier des sessions. ¦ La sesión interrumpida no se puede restaurar: su copia tras un fallo está incompleta o dañada. Se ha dejado en la carpeta de sesiones.
+The interrupted session can't be restored: its crash copy couldn't be read or copied. ¦ La session interrompue ne peut pas être restaurée : sa copie après plantage n'a pas pu être lue ni copiée. ¦ La sesión interrumpida no se puede restaurar: su copia tras un fallo no se pudo leer ni copiar.
 A device appeared that I haven't seen in this session. ¦ Un appareil que je n'avais pas vu pendant cette session est apparu. ¦ Apareció un dispositivo que no había visto en esta sesión.
 """
 
@@ -52714,6 +52716,9 @@ class MiniWireshark:
                                                False))
         self._async_results = queue.Queue()
         self.jobs = JobRunner(self)
+        # round 4: a crash copy or history save under way puts nothing on
+        # disk once "Delete ALL history" has taken this
+        self._forget_lock = threading.Lock()
 
         # ---- capture pipeline state (see section 6b)
         install_gui_gate()
@@ -52825,6 +52830,9 @@ class MiniWireshark:
         self.root.after(700, self._flush_ui)
         self.root.after(1000, self._tick_status)
         self.root.after(2000, self._refresh_insights)
+        # round 4: what an interrupted write left (harmless in any mode:
+        # only our own names, 6 hours old, whose writer is gone)
+        sweep_stale_temp_files()
         self._journal_found = "" if TOOL_MODE else \
             claim_interrupted_journal()
         if self._journal_found and not TOOL_MODE:
@@ -54839,16 +54847,12 @@ class MiniWireshark:
 
         def run(job):
             body(job)
-            h = hashlib.sha256()
-            with open(part, "rb") as f:
-                # third audit: 1 MB at a time, not the whole file at once
-                for block in iter(lambda: f.read(1 << 20), b""):
-                    h.update(block)
-            digest = h.hexdigest()
-            os.replace(part, path)
-            atomic_write_json(path + ".sha256", {
-                "journal": 2, "saved_at": time.time(), "sha256": digest,
-                "pid": os.getpid()})
+            # round 4: in place with its fingerprint whatever moment a
+            # crash comes, and never after Delete ALL history
+            if not publish_crash_copy(part, path,
+                                      cancelled=lambda: job.cancelled,
+                                      lock=self._forget_lock):
+                raise JobCancelled()
             return path
 
         def ok(_p):
@@ -54866,26 +54870,22 @@ class MiniWireshark:
         journal v1 (5.0.x) is one JSON object holding both."""
         path = path or getattr(self, "_journal_found", "") or PATHS.journal
         tmp = os.path.join(PATHS.sessions, "restored.mwsession.json")
+        # round 4: refused with a plain sentence, never a bare KeyError
         try:
-            side = read_json(path + ".sha256")
-            if isinstance(side, dict) and side.get("journal") == 2:
-                with open(path, "rb") as f:
-                    raw = f.read()
-                if hashlib.sha256(raw).hexdigest() != side.get("sha256"):
-                    raise ValueError("the journal is damaged")
-                with open(tmp + ".part", "wb") as f:
-                    f.write(raw)
-                os.replace(tmp + ".part", tmp)
-            else:
-                with open(path, encoding="utf-8") as f:
-                    j = json.load(f)
-                body = json.dumps(j["session"], default=str, sort_keys=True)
-                if hashlib.sha256(body.encode()).hexdigest() != j["sha256"]:
-                    raise ValueError("the journal is damaged")
-                atomic_write_json(tmp, j["session"], compact=True)
-        except (OSError, ValueError, KeyError, TypeError) as e:
-            messagebox.showerror("Restore", f"The interrupted session could "
-                                 f"not be read: {e}", parent=self.root)
+            raw, verified = read_crash_copy(path)
+            if not verified:
+                LOG.warning("crash copy without a matching fingerprint; "
+                            "it is whole and is restored")
+            atomic_write_bytes(tmp, raw)
+            problem = ""
+        except CrashCopyUnreadable as e:
+            problem = str(e)
+        except Exception:                            # noqa: BLE001
+            LOG.exception("restore the interrupted session")
+            problem = CRASH_COPY_UNREADABLE
+        if problem:
+            messagebox.showerror("Restore", translate_text(problem),
+                                 parent=self.root)
             return False
         self._load_session(tmp)
         for p_ in (path, path + ".sha256"):
@@ -64353,6 +64353,7 @@ proc ::mw_explicit_fonts {top names} {
         if choice is None:
             return
         if choice:
+            self._stop_record_jobs()     # before the history is emptied
             self.history.clear()
             self._wipe_packets()
             self._forget_records()
@@ -64382,10 +64383,7 @@ proc ::mw_explicit_fonts {top names} {
             lw.known, lw.learning = {}, True
         # third audit #1: the crash journal was rewritten from the model
         # still in memory within 30 s; start afresh like New session, no Undo
-        job = getattr(getattr(self, "jobs", None), "active", {}).get(
-            "journal")
-        if job is not None:
-            job.cancelled = True
+        self._stop_record_jobs()
         self.clear(confirmed=True)
         self.model.baselines.reset()     # may be read before the delete ran
         self._keep_undo(None)
@@ -64399,6 +64397,20 @@ proc ::mw_explicit_fonts {top names} {
                 gone += 1
         LOG.info("delete all history: %d other files removed", gone)
         return gone
+
+    def _stop_record_jobs(self):
+        """Round 4: the crash copy and history save under way are
+        cancelled while holding _forget_lock, which both take to check it
+        and write: one that had read the session before "Delete ALL
+        history" finishes first (and its files are deleted after) or
+        writes nothing. Before, a copy past its reading still put the
+        deleted session back on disk."""
+        active = getattr(getattr(self, "jobs", None), "active", {})
+        with self._forget_lock:
+            for kind in ("journal", "history"):
+                job = active.get(kind)
+                if job is not None:
+                    job.cancelled = True
 
     def reset_baselines(self, parent=None):
         if messagebox.askyesno("Reset learned baselines",
@@ -64563,11 +64575,20 @@ proc ::mw_explicit_fonts {top names} {
                 return None
 
             def run(job):
-                store(job.pieces_under_gate(self.gate,
-                                            self._history_pieces()))
+                pieces = job.pieces_under_gate(self.gate,
+                                               self._history_pieces())
+                # round 4: not after "Delete ALL history" (see
+                # _stop_record_jobs)
+                self._store_history_snapshot(lambda: store(pieces), job)
             return self.jobs.submit("history", "Saving history", run)
         store(self._history_pieces())
         return None
+
+    def _store_history_snapshot(self, write, job):
+        with self._forget_lock:
+            if job.cancelled:
+                raise JobCancelled()
+            write()
 
     # ======================================================================
     #  Country lookup glue (opt-in)
@@ -67338,6 +67359,141 @@ def journal_owner(path):
         return int(side.get("pid") or 0) if isinstance(side, dict) else 0
     except (TypeError, ValueError):
         return 0
+
+
+CRASH_COPY_DAMAGED = ("The interrupted session can't be restored: its crash "
+                      "copy is incomplete or damaged. It was left in the "
+                      "sessions folder.")
+CRASH_COPY_UNREADABLE = ("The interrupted session can't be restored: its "
+                         "crash copy couldn't be read or copied.")
+
+
+class CrashCopyUnreadable(ValueError):
+    """A crash copy that can't be restored; str() is a plain sentence."""
+
+
+def read_crash_copy(path, limit=SESSION_MAX_CHARS):
+    """Round 4: the crash copy (journal) at `path` as the bytes of a
+    session file. -> (data, verified): verified is False when its
+    fingerprint was missing or didn't match but the file holds a whole
+    session (it is only ever put in place whole). Raises
+    CrashCopyUnreadable with a plain message, never anything else: a
+    copy whose fingerprint was not written yet failed with the bare
+    KeyError 'sha256'."""
+    side = read_json(path + ".sha256")
+    side = side if isinstance(side, dict) else {}
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(limit + 1)
+    except OSError as e:
+        raise CrashCopyUnreadable(CRASH_COPY_UNREADABLE) from e
+    if len(raw) > limit:
+        raise CrashCopyUnreadable(CRASH_COPY_DAMAGED)
+    if side.get("journal") == 2:
+        good = [side.get("sha256")] + list(side.get("previous") or [])[:4]
+        if hashlib.sha256(raw).hexdigest() in good:
+            return raw, True
+    try:
+        j = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError) as e:
+        raise CrashCopyUnreadable(CRASH_COPY_DAMAGED) from e
+    if not isinstance(j, dict):
+        raise CrashCopyUnreadable(CRASH_COPY_DAMAGED)
+    if "schema_version" in j and isinstance(j.get("session"), dict):
+        return raw, False                        # journal v2, whole
+    if isinstance(j.get("session"), dict) and "sha256" in j:
+        # journal v1 (5.0.x): one object holding the session and its
+        # fingerprint
+        body = json.dumps(j["session"], default=str, sort_keys=True)
+        if hashlib.sha256(body.encode()).hexdigest() != j["sha256"]:
+            raise CrashCopyUnreadable(CRASH_COPY_DAMAGED)
+        return json.dumps(j["session"], separators=(",", ":"),
+                          default=str).encode("utf-8"), True
+    raise CrashCopyUnreadable(CRASH_COPY_DAMAGED)
+
+
+def publish_crash_copy(part, path, cancelled=None, lock=None):
+    """Round 4: put the finished crash copy `part` in place at `path`
+    with its fingerprint (path.sha256), so that a crash at any moment
+    leaves a pair that restores. The fingerprint names the new copy and
+    still accepts the one in place before the rename; it is written once
+    more without the old one after. Before, a kill between the rename and
+    the fingerprint (4 of 25 in round 4) left a copy that Restore turned
+    down. `cancelled()` true (Delete ALL history ran meanwhile): nothing
+    is put in place; it is asked holding `lock`, which Delete ALL takes
+    too. -> True when published."""
+    h = hashlib.sha256()
+    with open(part, "rb") as f:
+        # third audit: 1 MB at a time, not the whole file at once
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    old = read_json(path + ".sha256")
+    keep = []
+    if isinstance(old, dict) and os.path.exists(path):
+        keep = [d for d in [old.get("sha256")] + list(
+            old.get("previous") or [])[:3] if isinstance(d, str)]
+    side = {"journal": 2, "saved_at": time.time(), "sha256": h.hexdigest(),
+            "pid": os.getpid()}
+    with (lock if lock is not None else contextlib.nullcontext()):
+        if cancelled is not None and cancelled():
+            with contextlib.suppress(OSError):
+                os.remove(part)
+            return False
+        atomic_write_json(path + ".sha256", dict(side, previous=keep))
+        _replace_retrying(part, path)
+        atomic_write_json(path + ".sha256", side)
+    return True
+
+
+STALE_TMP_AGE = 6 * 3600
+# what MiniWireshark itself leaves when a write is cut short: the
+# temporary file of an atomic write (_tmp_name), the crash copy's part
+# and a restored session's part (5.3.4 and earlier)
+_STALE_TMP_RE = re.compile(r"\.tmp(\d+)-\d+$|"
+                           r"^journal\.mwsession\.json\.(\d+)\.part$|"
+                           r"^restored\.mwsession\.json\.part$")
+STALE_TMP_FOLDERS = ("", "sessions", "cache", "logs")
+
+
+def sweep_stale_temp_files(folder=None, now=None, age=STALE_TMP_AGE):
+    """Round 4: temporary files that an interrupted write left in the data
+    folder (18 MB of session data after 25 kills) were never removed.
+    Only the names MiniWireshark makes, only in its own data folder and
+    its sessions, cache and logs folders, only regular files untouched
+    for `age` seconds whose writer isn't running; a link is never
+    followed or removed. -> the removed paths."""
+    folder = folder or PATHS.data
+    now = time.time() if now is None else now
+    gone = []
+    for sub in STALE_TMP_FOLDERS:
+        d = os.path.join(folder, sub) if sub else folder
+        try:
+            if not stat.S_ISDIR(os.lstat(d).st_mode):
+                continue                         # a link: not followed
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for e in entries:
+            m = _STALE_TMP_RE.search(e.name)
+            if not m:
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or now - st.st_mtime < age:
+                continue
+            pid = m.group(1) or m.group(2)
+            if pid and int(pid) != os.getpid() and _pid_alive(pid):
+                continue
+            with contextlib.suppress(OSError):
+                os.remove(e.path)
+                gone.append(e.path)
+    if gone:
+        LOG.info("removed %d temporary files left by an interrupted write",
+                 len(gone))
+    return gone
 
 
 def claim_interrupted_journal(path=None, now=None, keep=3):
@@ -96856,6 +97012,13 @@ def run_gui_test(live=False):
                    "history.enabled": True,
                    "history.retention": "7 days"})
     cfg.save()
+    # round 4: what an interrupted write left, swept when the window starts
+    # (a name "Delete ALL history" doesn't remove, so only the sweep can)
+    ctx.stale_tmp = os.path.join(PATHS.data,
+                                 "bootstrap_state.json.tmp99999999-1")
+    with open(ctx.stale_tmp, "w", encoding="utf-8") as f:
+        f.write("{}")
+    os.utime(ctx.stale_tmp, (time.time() - 7 * 3600,) * 2)
     root = tk.Tk()
     gw, ips, macs, nets = scenario_identity()
     app = MiniWireshark(root, "", set(), set(), "", config=cfg)
@@ -103043,6 +103206,179 @@ def t_a2_temp_file_never_follows_a_link(ctx):
         assert f.read() == "new"
     assert not os.path.lexists(_tmp_name(target))
 
+@self_test()
+def t_r4_crash_copy_restores_or_is_refused_plainly(ctx):
+    """Round 4: a crash copy (journal) cut at any byte, or a kill at any
+    moment of putting it in place, either restores or is refused with a
+    plain sentence (CrashCopyUnreadable). 4 of 25 kills between the
+    rename and the fingerprint left a whole copy that Restore turned down
+    with the bare KeyError 'sha256'."""
+    d = ctx.path(f"r4_journal_{uuid.uuid4().hex[:6]}")
+    os.makedirs(d)
+    jp = os.path.join(d, "journal.mwsession.json")
+
+    def body(tag):
+        return json.dumps({"schema_version": SESSION_SCHEMA_VERSION,
+                           "session": {"started": 1.0, "tag": tag},
+                           "devices": []}, separators=(",", ":"))
+
+    def put(text, **kw):
+        part = jp + ".1.part"
+        with open(part, "w", encoding="utf-8") as f:
+            f.write(text)
+        return publish_crash_copy(part, jp, **kw)
+
+    class Killed(BaseException):
+        pass
+    real = (atomic_write_json, _replace_retrying)
+    # a kill before, between and after each write and rename (the two
+    # fingerprints are renamed into place too)
+    for kill_at in range(6):
+        for n_ in os.listdir(d):
+            os.remove(os.path.join(d, n_))
+        assert put(body("old"))
+        steps = []
+
+        def step(fn):
+            def wrapped(*a, **k):
+                if len(steps) == kill_at:
+                    raise Killed()
+                steps.append(fn.__name__)
+                return fn(*a, **k)
+            return wrapped
+        globals()["atomic_write_json"] = step(real[0])
+        globals()["_replace_retrying"] = step(real[1])
+        try:
+            put(body("new"))
+        except Killed:
+            pass
+        finally:
+            globals()["atomic_write_json"], globals()["_replace_retrying"] \
+                = real
+        raw, verified = read_crash_copy(jp)
+        assert raw.decode() in (body("old"), body("new")), (kill_at, raw)
+        assert verified, f"killed after {steps}: the fingerprint doesn't " \
+            f"match the copy in place"
+        if kill_at >= 3:                  # past the copy's own rename
+            assert raw.decode() == body("new"), kill_at
+    # cut at any byte: refused plainly, with or without its fingerprint
+    whole = body("cut").encode()
+    put(whole.decode())
+    side = read_json(jp + ".sha256")
+    for with_side in (True, False):
+        for n in range(len(whole)):
+            with open(jp, "wb") as f:
+                f.write(whole[:n])
+            if with_side:
+                atomic_write_json(jp + ".sha256", side)
+            else:
+                with contextlib.suppress(OSError):
+                    os.remove(jp + ".sha256")
+            try:
+                read_crash_copy(jp)
+            except CrashCopyUnreadable as e:
+                assert str(e) == CRASH_COPY_DAMAGED, (n, e)
+            else:
+                raise AssertionError(f"a copy cut at byte {n} was taken")
+    # a whole copy whose fingerprint is old, missing or itself cut short
+    side_text = json.dumps(side)
+    for n in range(len(side_text) + 1):
+        with open(jp, "wb") as f:
+            f.write(whole)
+        with open(jp + ".sha256", "w", encoding="utf-8") as f:
+            f.write(side_text[:n].replace(side.get("sha256"), "0" * 64))
+        raw, _v = read_crash_copy(jp)
+        assert raw == whole, n
+    os.remove(jp + ".sha256")
+    assert read_crash_copy(jp) == (whole, False)
+    # junk, another kind of JSON, a missing file: plain refusals
+    for junk in (b"\xff\xfe", b"[1, 2]", b'{"a": 1}', b"[" * 100000,
+                 b'{"session": {}, "sha256": "x"}'):
+        with open(jp, "wb") as f:
+            f.write(junk)
+        try:
+            read_crash_copy(jp)
+        except CrashCopyUnreadable:
+            pass
+        else:
+            raise AssertionError(junk[:20])
+    os.remove(jp)
+    try:
+        read_crash_copy(jp)
+    except CrashCopyUnreadable as e:
+        assert str(e) == CRASH_COPY_UNREADABLE
+    else:
+        raise AssertionError("a missing copy was taken")
+    # a 5.0.x journal (v1) still restores
+    sess = {"schema_version": 1, "devices": [], "session": {}}
+    with open(jp, "w", encoding="utf-8") as f:
+        json.dump({"session": sess, "sha256": hashlib.sha256(json.dumps(
+            sess, default=str, sort_keys=True).encode()).hexdigest()}, f)
+    raw, verified = read_crash_copy(jp)
+    assert verified and json.loads(raw) == sess
+    # Delete ALL history ran meanwhile: nothing is put in place
+    os.remove(jp)
+    assert put(body("late"), cancelled=lambda: True,
+               lock=threading.Lock()) is False
+    assert os.listdir(d) == [], os.listdir(d)
+    for t in (CRASH_COPY_DAMAGED, CRASH_COPY_UNREADABLE):
+        for loc in ("fr", "es"):
+            assert translate_text(t, loc) != t, (loc, t)
+
+
+@self_test()
+def t_r4_stale_temp_files_swept(ctx):
+    """Round 4: temporary files left by an interrupted write (18 MB of
+    session data after 25 kills) are removed at start: only the names
+    MiniWireshark makes, only in its own data folder and its sessions,
+    cache and logs folders, only when untouched for 6 hours and their
+    writer isn't running, never through or of a link."""
+    d = ctx.path(f"r4_sweep_{uuid.uuid4().hex[:6]}")
+    outside = ctx.path(f"r4_outside_{uuid.uuid4().hex[:6]}")
+    for sub in ("sessions", "logs", "packets"):
+        os.makedirs(os.path.join(d, sub))
+    os.makedirs(outside)
+    old = time.time() - 7 * 3600
+    gone_pid = 99999999                   # above any pid_max
+    stale = [os.path.join(d, "sessions", f"journal.mwsession.json."
+                          f"{gone_pid}.part.tmp{gone_pid}-12345"),
+             os.path.join(d, "sessions", f"journal.mwsession.json."
+                          f"{gone_pid}.part"),
+             os.path.join(d, "sessions", f"journal.mwsession.json.sha256"
+                          f".tmp{gone_pid}-7"),
+             os.path.join(d, "sessions", "restored.mwsession.json.part"),
+             os.path.join(d, f"config.json.tmp{gone_pid}-1"),
+             os.path.join(d, "logs", f"x.json.tmp{gone_pid}-2")]
+    kept = [os.path.join(d, "sessions", f"autosave.mwsession.json.tmp"
+                         f"{gone_pid}-3"),               # too recent
+            os.path.join(d, f"networks.json.tmp{os.getppid()}-4"),  # alive
+            os.path.join(d, "sessions", "my notes.tmp"),
+            os.path.join(d, "geo.mmdb.part"),        # a download resumes
+            os.path.join(d, "packets", f"seg-1.pcap.tmp{gone_pid}-5"),
+            os.path.join(d, "sessions", "journal.mwsession.json"),
+            os.path.join(outside, f"a.json.tmp{gone_pid}-6")]
+    for p_ in stale + kept:
+        with open(p_, "w", encoding="utf-8") as f:
+            f.write("{}")
+        if p_ != kept[0]:
+            os.utime(p_, (old, old))
+    links = []
+    if hasattr(os, "symlink") and not IS_WINDOWS:
+        victim = os.path.join(outside, "victim.json")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write("keep")
+        os.utime(victim, (old, old))
+        links = [os.path.join(d, f"link.json.tmp{gone_pid}-8")]
+        os.symlink(victim, links[0])
+        os.symlink(outside, os.path.join(d, "cache"))  # a linked folder
+        kept.append(victim)
+    gone = sweep_stale_temp_files(d)
+    assert sorted(gone) == sorted(stale), (gone, stale)
+    left = [p_ for p_ in kept + links if not os.path.lexists(p_)]
+    assert not left, left
+    assert not any(os.path.exists(p_) for p_ in stale)
+    assert sweep_stale_temp_files(os.path.join(d, "no-such")) == []
+
 
 @self_test()
 def t_a3_csv_export_never_follows_a_link(ctx):
@@ -103218,6 +103554,172 @@ def gt_a2_history_off_keeps_no_autosave(app, ctx):
         app.data_mode, app.history = keep
         with contextlib.suppress(OSError):
             os.remove(PATHS.autosave)
+
+
+def _r4_put_session_back(app, was):
+    app.replace_model(was[0])
+    app.all_rows.clear()
+    app.all_rows.extend(was[1])
+    app.count = was[2]
+    app.bookmarks.update(was[3])
+    app.data_mode, app.data_label = was[4], was[5]
+    with contextlib.suppress(tk.TclError, KeyError, AttributeError):
+        app.tabs["packets"].rebuild()
+
+
+@gui_test_step("round 4: a crash copy cut short is refused with a plain "
+               "sentence, a whole one without its fingerprint restores, "
+               "and what an interrupted write left is swept at start")
+def gt_r4_crash_copy_restore(app, ctx):
+    root = app.root
+    assert ctx.stale_tmp and not os.path.exists(ctx.stale_tmp), \
+        "a stale temporary file was not swept at start"
+    was = (app.model, list(app.all_rows), app.count, set(app.bookmarks),
+           app.data_mode, app.data_label)
+    shown = []
+    real = messagebox.showerror
+    messagebox.showerror = lambda *a, **k: shown.append(a)
+    try:
+        jp = app.write_journal(ctx.path("r4j.mwsession.json"))
+        with open(jp, "rb") as f:
+            raw = f.read()
+        n_dev = len(app.model.registry.by_key)
+        with open(jp, "wb") as f:
+            f.write(raw[:len(raw) // 2])
+        assert app.restore_journal(jp) is False
+        assert [a[1] for a in shown] == [translate_text(
+            CRASH_COPY_DAMAGED)], shown
+        assert os.path.exists(jp), "a refused copy is kept"
+        # killed between the rename and the fingerprint (round 4, 4/25)
+        with open(jp, "wb") as f:
+            f.write(raw)
+        os.remove(jp + ".sha256")
+        shown.clear()
+        assert app.restore_journal(jp), shown
+        _gui_pump(root, 0.3, until=lambda: not app.jobs.busy(), timeout=30)
+        _gui_pump(root, 0.3)
+        assert not shown, shown
+        assert app.data_mode == "session"
+        assert len(app.model.registry.by_key) == n_dev
+        assert not os.path.exists(jp)
+    finally:
+        messagebox.showerror = real
+        _r4_put_session_back(app, was)
+
+
+@gui_test_step("round 4: Delete ALL history in a live session leaves "
+               "nothing: not from a crash copy or history save under way, "
+               "the next crash copy or a clean exit")
+def gt_r4_delete_all_live_session(app, ctx):
+    root = app.root
+    was = (app.model, list(app.all_rows), app.count, set(app.bookmarks),
+           app.data_mode, app.data_label)
+    keep = (app.known.data, app.networks.data, app.network_profile,
+            app.history)
+    site = sorted(app.model.websites)[0]
+    ip = sorted(d.ip for d in app.model.registry.by_key.values()
+                if d.ip and d.ip != app.model.gateway_ip)[0]
+    own = not isinstance(app.history, Store)
+    st = Store(PATHS.history_db, app.session_id, {"source": "live"}) \
+        if own else app.history
+
+    def records():
+        """What the window keeps on disk of what it saw (the test's own
+        files, a saved session or capture, are left out)."""
+        out = []
+        for top, _dirs, names in os.walk(PATHS.data):
+            for n in names:
+                rel = os.path.relpath(os.path.join(top, n), PATHS.data)
+                if rel.startswith(("sessions", "packets", "history.",
+                                   "known_devices", "networks",
+                                   "listening")):
+                    out.append(os.path.join(top, n))
+        return out
+
+    def holding():
+        hits = []
+        for p_ in records():
+            with contextlib.suppress(OSError), open(p_, "rb") as f:
+                blob = f.read()
+            if site.encode() in blob or ip.encode() in blob:
+                hits.append(os.path.relpath(p_, PATHS.data))
+        return hits
+    real = (messagebox.askyesnocancel, globals()["publish_crash_copy"])
+    go, held = threading.Event(), []
+
+    def slow_publish(part, *a, **k):
+        held.append("journal")
+        with open(part, "rb") as f:
+            data = f.read()
+        go.wait(30)
+        # on Windows the copy, still open for its fingerprint, can't be
+        # deleted by Delete ALL: keep it as it would be there
+        if not os.path.exists(part):
+            with open(part, "wb") as f:
+                f.write(data)
+        return real[1](part, *a, **k)
+
+    def slow_snapshot(write, job):
+        held.append("history")
+        go.wait(30)
+        return MiniWireshark._store_history_snapshot(app, write, job)
+    app.procmap.refresh = lambda *a, **k: None   # see privacy #7
+    app._proc_seen = app.procmap.seq
+    messagebox.askyesnocancel = lambda *a, **k: True
+    try:
+        app.history = st
+        app.data_mode = "live"
+        app._write_history()
+        assert st.flush_now(30)
+        assert holding(), "the history should hold the session first"
+        for kind in ("history", "journal"):
+            # a save that has read the session when Delete ALL runs
+            go.clear()
+            held.clear()
+            if kind == "history":
+                app._store_history_snapshot = slow_snapshot
+                app._write_history(background=True)
+            else:
+                globals()["publish_crash_copy"] = slow_publish
+                app.write_journal(background=True)
+            _gui_pump(root, 0.05, until=lambda: held, timeout=30)
+            assert held == [kind], held
+            app.clear_history()
+            go.set()
+            _gui_pump(root, 0.2, until=lambda: not app.jobs.active,
+                      timeout=30)
+            assert st.flush_now(30)
+            assert not holding(), (kind, holding())
+            globals()["publish_crash_copy"] = real[1]
+            with contextlib.suppress(AttributeError):
+                del app._store_history_snapshot
+            if kind == "history":
+                _r4_put_session_back(app, was)
+                app.data_mode = "live"
+        # the next crash copy, then what a clean exit writes (_on_close)
+        app.data_mode = "live"
+        app._journal_tick()
+        _gui_pump(root, 0.3, until=lambda: not app.jobs.active, timeout=30)
+        app._write_history()
+        app._pump_store(reschedule=False)
+        app._exit_autosave()
+        assert st.flush_now(30)
+        assert not holding(), holding()
+        assert not os.path.exists(PATHS.journal)
+    finally:
+        go.set()
+        messagebox.askyesnocancel = real[0]
+        globals()["publish_crash_copy"] = real[1]
+        for attr in ("_store_history_snapshot",):
+            with contextlib.suppress(AttributeError):
+                delattr(app, attr)
+        with contextlib.suppress(AttributeError):
+            del app.procmap.refresh
+        if own:
+            st.stop(5)
+        (app.known.data, app.networks.data, app.network_profile,
+         app.history) = keep
+        _r4_put_session_back(app, was)
 
 
 @self_test()
