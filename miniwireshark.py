@@ -20194,6 +20194,42 @@ LOCAL_PROBE_SKIP = frozenset({137, 138, 139, 445, 1433, 3306, 5432, 6379,
                               # third audit #2: well-known non-web ports
                               22, 25, 53, 110, 143, 389, 465, 587, 993, 995,
                               1900, 5353})
+# fourth audit: a second copy of one of them takes the next ports (a second
+# Redis on 6380, raw printing on 9101 and 9102, PostgreSQL on 5433, Redis
+# Sentinel and cluster ports), so these whole ranges are never asked...
+LOCAL_PROBE_SKIP_RANGES = ((3306, 3309), (5432, 5439), (6379, 6389),
+                           (9100, 9109), (11211, 11212), (16379, 16389),
+                           (26379, 26389), (27017, 27019), (33060, 33062))
+# ...nor a program whose name (a word of it) starts with one of these
+LOCAL_PROBE_NOT_WEB = ("redis", "valkey", "keydb", "memcache", "mongo",
+                       "mysql", "mariadb", "postgres", "sqlservr", "cups",
+                       "lpd", "p910nd", "jetdirect", "smbd", "nmbd",
+                       "samba", "sshd")
+
+
+def local_probe_wanted(proto, port, program, what, web):
+    """May the Local services check ask this service "GET /"? TCP only;
+    never a port in LOCAL_PROBE_SKIP or LOCAL_PROBE_SKIP_RANGES, nor a
+    program LOCAL_PROBE_NOT_WEB names; then only what the guess says is
+    a web page, or a service nothing is known about. Fourth audit: by the
+    program's name too, not the port alone, so nothing the view files
+    under databases, printing and sharing, remote access or the system
+    (local_service_kind) is asked."""
+    if proto != "TCP" or not isinstance(port, int) or \
+            port in LOCAL_PROBE_SKIP or \
+            any(a <= port <= b for a, b in LOCAL_PROBE_SKIP_RANGES):
+        return False
+    name = re.sub(r" \(pid \d+\)$", "", str(program or "")).lower()
+    if any(w.startswith(LOCAL_PROBE_NOT_WEB)
+           for w in re.split(r"[^a-z0-9]+", name)):
+        return False
+    return bool(web) or what == LOCAL_UNKNOWN
+
+
+# the tags local_page_title steps through (a name must end there: not
+# <titlebar>, not <header>)
+_TITLE_TAGS = re.compile(rb"<!--|<(/?)(svg|title|head|script|style)"
+                         rb"(?=[\s/>])")
 
 
 def local_page_title(data):
@@ -20201,27 +20237,54 @@ def local_page_title(data):
     regex over 64 KB of "<title>" took about 2 s of CPU per answer).
     Third audit: only the <title> element itself (not <titlebar>, not an
     <svg>'s <title>), decoded by the charset the header or a <meta> names
-    (else UTF-8, else Windows-1252)."""
+    (else UTF-8, else Windows-1252). Fourth audit: the one inside <head>
+    wins, else the first one outside every <svg> (nested or written
+    <svg/>); comments, scripts, styles and an empty <title/> are passed
+    over."""
     lo = data.lower()
-    pos, svg = 0, lo.find(b"<svg")
+    pos, depth, in_head, first = 0, 0, False, None
     while True:
-        i = lo.find(b"<title", pos)
-        if i < 0:
-            return ""
-        if 0 <= svg < i:               # skip the whole <svg>...</svg>
-            end = lo.find(b"</svg", svg)
-            if end < 0:
-                return ""
-            pos, svg = end + 5, lo.find(b"<svg", end + 5)
-            continue
-        if lo[i + 6:i + 7] in (b">", b" ", b"\t", b"\r", b"\n", b"/"):
+        m = _TITLE_TAGS.search(lo, pos)
+        if m is None:
             break
-        pos = i + 6                    # <titlebar> and the like
-    j = lo.find(b">", i)
-    k = lo.find(b"</title", j) if j >= 0 else -1
-    if k < 0:
+        if m.group(0) == b"<!--":
+            end = lo.find(b"-->", m.end())
+            if end < 0:
+                break
+            pos = end + 3
+            continue
+        close, tag = m.group(1), m.group(2)
+        gt = lo.find(b">", m.end())
+        if gt < 0:
+            break
+        pos = gt + 1
+        alone = lo[gt - 1:gt] == b"/"          # <svg/>, <title/>
+        if tag in (b"script", b"style"):
+            if not close and not alone:
+                end = lo.find(b"</" + tag, pos)
+                if end < 0:
+                    break
+                pos = end
+        elif tag == b"svg":
+            if close:
+                depth = max(0, depth - 1)
+            elif not alone:
+                depth += 1
+        elif tag == b"head":
+            in_head = not close and not alone
+        elif not close and not alone and not depth:
+            k = lo.find(b"</title", pos)
+            if k < 0:
+                break
+            if in_head:
+                first = (pos, k)
+                break
+            if first is None:
+                first = (pos, k)
+            pos = k
+    if first is None:
         return ""
-    raw = data[j + 1:k][:4096]
+    raw = data[first[0]:first[1]][:4096]
     m = re.search(rb"charset\s*=\s*[\"']?([a-z0-9_.:-]{1,40})", lo)
     try:
         text = raw.decode(m.group(1).decode() if m else "utf-8")
@@ -20237,8 +20300,9 @@ def probe_local_http(host, port, own=(), timeout=1.0, record=True):
     the answer looks like TLS. Each try: `timeout` s to connect, then
     `timeout` s to read at most 64 KB; each is listed in the ledger and
     stopped by the kill switch (OutboundBlocked). `record=False`: the
-    caller listed the whole scan in the ledger once (third audit); the
-    kill switch still stops each try.
+    caller listed the plain tries of the whole scan in the ledger once
+    (third audit); a try over TLS is still listed on its own (fourth
+    audit), and the kill switch still stops each try.
     -> {"web", "https", "status", "title"}"""
     a = ip_obj(host)
     if a is None or a.is_unspecified or not (a.is_loopback or local_addr_key(
@@ -20253,7 +20317,10 @@ def probe_local_http(host, port, own=(), timeout=1.0, record=True):
 
     def ask(tls):
         """-> (bytes read, the server closed by itself)"""
-        if record:
+        # record=False: the scan's line counts the plain tries only, so a
+        # try again over TLS gets its own line (fourth audit: the ledger
+        # left it out)
+        if record or tls:
             outbound("local_probe", "https" if tls else "http", where,
                      "GET / (this computer only)")
         elif LEDGER.killed:
@@ -20330,9 +20397,8 @@ def local_service_rows(listening, own=(), probes=None):
         what, web = local_service_guess(proto, port, prog)
         addrs = tuple(sorted(addrs, key=lambda a: (":" in a, a)))
         host = local_service_host(addrs, own)
-        key = (port, prog, host) if proto == "TCP" and host and \
-            port not in LOCAL_PROBE_SKIP and \
-            (web or what == LOCAL_UNKNOWN) else None
+        key = (port, prog, host) if host and local_probe_wanted(
+            proto, port, prog, what, web) else None
         got = (probes or {}).get(key) if key else None
         https, title = None, ""
         if got:
@@ -26198,7 +26264,9 @@ class NetworkModel:
         Basic, a password in a web address and FTP/POP3/IMAP sign-ins on
         their usual ports fit in one packet). A form whose body comes in
         the next packet is looked at then. Only who, where and how are
-        kept; the packet's bytes are read here and dropped.
+        kept in the alert; the packet's bytes are read here and dropped,
+        except the waiting form body below (memory only, at most 4096
+        bytes and 30 s each, 256 forms; CHANGELOG Known limits).
         Third audit: a form body split over several packets is put back
         together (in order, up to the 4096 bytes http_form_login reads;
         a new request ends it) until a password field shows, so
@@ -39969,6 +40037,11 @@ def safe_tsv_row(cells):
 
 def copy_to_clipboard(app, text):
     text = hide_credentials(scrub_secrets(text))
+    # fourth audit: one value copied on its own (a domain, a device's
+    # name, a packet's summary or field) is pasted into a spreadsheet as
+    # a cell too, so a single line gets the formula guard of a copied row
+    if "\n" not in text and "\r" not in text:
+        text = safe_tsv_row(text.split("\t"))
     try:
         app.root.clipboard_clear()
         app.root.clipboard_append(text)
@@ -44327,7 +44400,8 @@ class LocalServicesView:
         at a time); the table shows the answers when they are in. Not
         for fixture rows, nor in Demo Mode (it sends nothing), and only
         when the person turned it on (local_services.probe, third audit
-        #1). The ledger lists each scan once, with its count."""
+        #1). The ledger lists each scan once, with the number of ports
+        asked; a port asked again over HTTPS has its own line."""
         if self.source is not None or \
                 getattr(self.app, "data_mode", "") == "demo" or \
                 not FEATURES.get("local_probe", True) or \
@@ -87368,6 +87442,132 @@ def t_534_local_probe_skip_and_once(ctx):
         k = view()
         assert not run(k, rows) and len(seen) == 7 and \
             all(x is None for x in k.probes.values())
+
+
+@self_test()
+def t_a4_local_probe_skips_by_program(ctx):
+    """Fourth audit: the web-page check skipped by port only, so a raw
+    printer on 9101 and a second Redis on 6380 still got a "GET /" and a
+    TLS hello. Now the neighbouring ports of a database, Redis or raw
+    printing are skipped too, and so is a program whose name says it is
+    one, wherever it listens; nothing the view files under databases,
+    sharing, remote access or the system is asked."""
+    never = {9101: "python3", 9102: "nc", 6380: "python3", 5433: "x",
+             3307: "x", 27018: "x", 16379: "x", 26379: "redis-sentinel",
+             8080: "valkey-server", 3000: "keydb-server",
+             7000: "/opt/bin/my-cupsd", 8001: "mongos", 8002: "p910nd",
+             8003: "MySQLWorkbench.exe", 8004: "postgresql-14"}
+    asked = {5173: "node", 61000: "x", 8081: "helpdesk", 8000: "python3"}
+    listening = {("TCP", "127.0.0.1", p): (i, prog) for i, (p, prog) in
+                 enumerate(sorted({**never, **asked}.items()))}
+    rows = local_service_rows(listening)
+    got = sorted(r["port"] for r in rows if r["probe"])
+    assert got == sorted(asked), got
+    for r in rows:
+        if r["probe"]:
+            assert r["kind"] in ("web", "unknown"), r
+        elif r["kind"] in ("db", "share", "remote", "system"):
+            assert not local_probe_wanted("TCP", r["port"], r["program"],
+                                          r["what"], r["web"]), r
+    assert not local_probe_wanted("UDP", 5173, "node", LOCAL_DEV_WEB, True)
+
+
+@self_test()
+def t_a4_local_page_title_own_title(ctx):
+    """Fourth audit: the page's own title is the one inside <head>, else
+    the first one outside every <svg> (nested, or written <svg/>); a
+    comment, a script, an empty <title/> and a <titlebar> are passed
+    over; still one quick pass over 64 KB of junk."""
+    t = local_page_title
+    for page in (b"<svg><svg></svg><title>icon</title></svg>"
+                 b"<title>Real</title>",
+                 b"<svg/><title>Real</title>",
+                 b"<svg viewBox='0 0 1 1'/><title>Real</title>",
+                 b"<body><title>early</title><head><title>Real</title>",
+                 b"<html><head><title>Real</title></head><body><svg>"
+                 b"<title>i</title></svg>",
+                 b"<!-- <title>old</title> --><title>Real</title>",
+                 b"<script>t='<title>x</title>'</script><title>Real</title>",
+                 b"<title/><p>body</p><title>Real</title>",
+                 b"<titlebar>x</titlebar><title-bar>y</title-bar>"
+                 b"<header>z</header><title>Real</title>",
+                 b"<SVG><TITLE>i</TITLE></SVG><HEAD><TITLE>Real</TITLE>"):
+        assert t(page) == "Real", (page, t(page))
+    assert t(b"<svg><title>icon</title>") == ""        # never closed
+    assert t(b"<!-- <title>x</title>") == ""
+    for junk in (b"<svg " * 13000, b"<svg>" * 13000, b"<!--" * 16000,
+                 b"<title/>" * 8000, b"<head>" * 10000):
+        t0 = time.perf_counter()
+        assert t(junk + b"<title>x") == ""
+        took = time.perf_counter() - t0
+        assert took < 0.2, (junk[:6], f"{took:.3f} s")
+
+
+@self_test()
+def t_a4_local_probe_tls_try_listed(ctx):
+    """Fourth audit: the scan's one ledger line counts the plain "GET /"
+    tries only; a port asked again over TLS had no line at all. It now
+    gets its own, and the kill switch stops it."""
+    lsk = _socket.socket()
+    lsk.bind(("127.0.0.1", 0))
+    lsk.listen(4)
+    lsk.settimeout(10)
+    hits = []
+
+    def serve(n):
+        for _ in range(n):
+            try:
+                c, _a = lsk.accept()
+            except OSError:
+                return
+            with c:
+                c.settimeout(3)
+                with contextlib.suppress(OSError):
+                    hits.append(c.recv(5))
+                    c.sendall(b"\x15\x03\x03\x00\x02\x02\x28")
+    port = lsk.getsockname()[1]
+    try:
+        with _b9_patched(LEDGER, killed=False):
+            th = threading.Thread(target=serve, args=(2,), daemon=True,
+                                  name="t-a4-tls")
+            th.start()
+            n0 = len(LEDGER.snapshot("local_probe"))
+            got = probe_local_http("127.0.0.1", port, timeout=2.0,
+                                   record=False)
+            th.join(5)
+            new = LEDGER.snapshot("local_probe")[n0:]
+        assert got["web"] is False and len(hits) == 2, (got, hits)
+        assert [(e["kind"], e["dest"], e["allowed"]) for e in new] == [
+            ("https", f"127.0.0.1:{port}", True)], new
+    finally:
+        lsk.close()
+
+
+@self_test()
+def t_a4_single_copy_cannot_start_a_formula(ctx):
+    """Fourth audit: "Copy domain", "Copy name", "Copy summary" and the
+    other single copies went to the clipboard unguarded, so a name from
+    the network such as =HYPERLINK(...) became a formula when pasted
+    into a spreadsheet. A single line now gets the copied row's guard;
+    a guarded row or cell is not guarded twice, and a report of several
+    lines is left as it is."""
+    board = []
+    root = types.SimpleNamespace(clipboard_clear=board.clear,
+                                 clipboard_append=board.append,
+                                 update_idletasks=lambda: None)
+    app = types.SimpleNamespace(root=root, _set_banner=lambda *_a: None)
+    for text, want in (('=HYPERLINK("http://x","y")',
+                        '\'=HYPERLINK("http://x","y")'),
+                       ("@SUM(1+1)", "'@SUM(1+1)"),
+                       ("+cmd|x", "'+cmd|x"),
+                       ("router\t=1", "router\t'=1"),
+                       ("example.com", "example.com"),
+                       (safe_tsv_row(["=a", "b"]), "'=a\tb"),
+                       (safe_tsv_row(["\tx"]), "'\tx"),
+                       ("Report\n======\n=not a cell",
+                        "Report\n======\n=not a cell")):
+        assert copy_to_clipboard(app, text) is True
+        assert board == [want], (text, board)
 
 
 @self_test()
