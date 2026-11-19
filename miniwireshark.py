@@ -98408,7 +98408,7 @@ def reachable_actions(app):
         for sv in getattr(tab, "_sub_frames", None) or {}:
             out.add(f"subview:{name}/{sv}")
     data_made = {"device", "your workspace", "recent filter", "website",
-                 "alert", "recent"}
+                 "alert", "recent", "host"}
     for label, cat, _fn in app.palette_items():
         if cat not in data_made:
             out.add(f"palette:{cat}:{label}")
@@ -102023,6 +102023,8 @@ def _gui_key(app, widget, seq):
                "Tab, keys of the list, the number of rows, highlighting")
 def gt_kbd_palette_rows(app, ctx):
     root = app.root
+    if not app.all_rows:             # the steps before replaced the data
+        _gt_back_to_scenario(app, ctx)
     _gui_focus_main(app)
     assert app.all_rows, "no packets"
     no = app.all_rows[min(5, len(app.all_rows) - 1)]["no"]
