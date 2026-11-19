@@ -103135,6 +103135,12 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
     real = (messagebox.askyesno, messagebox.askyesnocancel)
     messagebox.askyesno = lambda *a, **k: asked.append(a) or True
     messagebox.askyesnocancel = lambda *a, **k: asked.append(a) or True
+    # The step pretends to watch live, so the once-a-second tick would read
+    # the runner's own listening programs and learn them afresh (a new
+    # listening.json, nothing old in it). Hold the programs table still so
+    # the step sees only what Delete ALL leaves behind.
+    app.procmap.refresh = lambda *a, **k: None
+    app._proc_seen = app.procmap.seq
     try:
         app.data_mode = "live"
         app.write_journal()
@@ -103177,6 +103183,8 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
         assert not left, left
     finally:
         messagebox.askyesno, messagebox.askyesnocancel = real
+        with contextlib.suppress(AttributeError):
+            del app.procmap.refresh
         (app.known.data, app.networks.data, app.network_profile,
          app.history) = keep
         app.replace_model(was[0])
