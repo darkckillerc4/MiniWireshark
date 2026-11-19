@@ -40454,7 +40454,38 @@ class Charts:
         if f is None:
             f = cls._FONTS[spec] = cls._Measured(
                 tkfont.Font(root=c, font=spec))
+            cls._hold(c, f.font, spec)
         return f
+
+    @staticmethod
+    def _hold(c, *fonts):
+        """Round 4: keeps a chart font loaded in Tk. Tk unloads a font
+        that no widget uses as soon as a measure is done. On a Tk without
+        Xft (the Pythons uv installs) the next measure of a text with a
+        sign outside Latin-1 ("–", "…") then searches every font of the X
+        server for it again: ~11 ms a measure, so the Health tab's
+        histogram took ~95 ms to redraw after each text-size change
+        (busy 157-276 ms against 130). A hidden canvas holds one empty
+        item per font; Tk then keeps the font and what it found."""
+        with contextlib.suppress(tk.TclError, AttributeError):
+            root = c._root()
+            keep = getattr(root, "_mw_font_keep", None)
+            if keep is None or not keep.winfo_exists():
+                keep = root._mw_font_keep = tk.Canvas(
+                    root, width=1, height=1, highlightthickness=0)
+                keep._mw_light_ok = True      # never shown
+            for font in fonts:
+                keep.create_text(0, 0, text="", font=font)
+
+    @classmethod
+    def held_fonts(cls, root):
+        """The fonts the hidden canvas keeps loaded (tests)."""
+        keep = getattr(root, "_mw_font_keep", None)
+        out = set()
+        with contextlib.suppress(tk.TclError, AttributeError):
+            for item in keep.find_all():
+                out.add(str(keep.itemcget(item, "font")))
+        return out
 
     @classmethod
     def forget_fonts(cls):
@@ -97753,9 +97784,17 @@ def gt_m2_background(app, ctx):
     # shared fonts look exactly like the tuples they replaced
     app._apply_text_size("Normal")
     _gui_pump(root, 0.1, until=lambda: app._text_size_job is None, timeout=5)
+    # (round 4) the look the old ("TkDefaultFont", size) tuples had where
+    # Tk read them as TkDefaultFont: its family at that size and style. A
+    # Tk without Xft (uv's Pythons) reads that tuple as an unknown family
+    # and draws the bitmap "fixed" font at one size, the third-audit bug
+    # mw_font fixes on X11; there the tuple is not the look to match
+    fam = "TkDefaultFont"
+    if str(root.tk.call("tk", "windowingsystem")) == "x11":
+        fam = tkfont.nametofont("TkDefaultFont").actual("family")
     for name, (size, style) in MW_FONTS.items():
         a = tkfont.nametofont(name).actual()
-        b = tkfont.Font(font=("TkDefaultFont", size) + style).actual()
+        b = tkfont.Font(font=(fam, size) + style).actual()
         assert a == b, (name, a, b)
     assert len(MW_FONTS) >= 8, sorted(MW_FONTS)
     app._apply_text_size("Large")
@@ -100886,6 +100925,32 @@ def _text_size_options(app, label, other):
             f"the window on screen: busy {on[1]} ms, longest freeze "
             f"{on[0]} ms; (a) the same with the window hidden and shown "
             f"again: busy {shown[1]} ms, longest freeze {shown[0]} ms")
+
+
+@gui_test_step("round 4: chart fonts stay loaded, so measuring a dash is "
+               "quick on a Tk without Xft")
+def gt_r4_chart_fonts_held(app, ctx):
+    root = app.root
+    ht = app.tabs["health"]
+    # the Health histogram after a text-size change: its widths measured
+    # anew (Charts.forget_fonts), with "10–25" style labels
+    Charts.forget_fonts()
+    ht._draw_hist()
+    held = Charts.held_fonts(root)
+    assert Charts._FONTS, "no chart font made"
+    for spec, f in list(Charts._FONTS.items()):
+        assert str(f.font) in held, ("not kept loaded", spec, str(f.font))
+        # without the hold, a Tk without Xft spent ~11 ms on each of these
+        # (it unloaded the font after each measure and searched every
+        # X font for the dash again); with Xft, Windows or macOS ~0.1 ms
+        f.font.measure("10–25 …")
+        took = []
+        for i in range(3):
+            t0 = time.perf_counter()
+            f.font.measure("%d–%d …" % (i, i + 7))
+            took.append((time.perf_counter() - t0) * 1000)
+        assert min(took) < 3, (spec, [round(x, 2) for x in took])
+    _gui_pump(root, 0.1)
 
 
 @gui_test_step("Windows run: a text-size change re-lays the window out "
