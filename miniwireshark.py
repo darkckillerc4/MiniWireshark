@@ -9342,6 +9342,12 @@ def category_shown(cat, src, cfg):
         cfg.get("websites.tracker_classification", False))
 
 
+def is_cdn_name(host):
+    """A name of a content delivery network on the built-in list."""
+    h = (host or "").lower().strip(".")
+    return any(h == suf or h.endswith("." + suf) for suf in CDN_SUFFIXES)
+
+
 def domain_category(host):
     """Optional classification: Advertising / Analytics / Social /
     Tracking / Content from the tracker list, CDN from the built-in list,
@@ -18575,35 +18581,10 @@ class AlertEngine:
         if rogue:
             if self._debounced("dhcp_anomaly:rogue", 300):
                 return None
-            srv, router, dns, good, good_router = rogue
-            selfish = [w for w, on in (("router", router == srv),
-                                        ("DNS server", srv in dns)) if on]
-            tail = (" It names itself as the " + " and the ".join(selfish)
-                    + ".") if selfish else ""
-            return self._add(
-                "dhcp_anomaly", "DANGER", "",
-                (f"A second device hands out addresses and names itself as "
-                 f"your router: {srv}" if router == srv else
-                 f"A second device hands out addresses and a different "
-                 f"router: {srv}"),
-                f"{len(servers)} different DHCP servers seen: "
-                f"{', '.join(sorted(servers))}. {srv} gives devices {router} "
-                f"as their router and {', '.join(dns) or 'no DNS server'} "
-                f"for name lookups. The usual one, {good}, gives "
-                f"{good_router} as the router.{tail}",
-                "Devices that take an address from it send their Internet "
-                "traffic and name lookups through that device, which can "
-                "read or redirect them.",
-                "A second router or a travel router plugged in by mistake "
-                "does the same. If you don't recognise that device, unplug "
-                "it and reconnect your devices.",
-                confidence="High",
-                why="A second DHCP server named a different router than "
-                    "the usual one.",
-                evidence=[f"DHCP server: {srv}", f"Router it gives: {router}",
-                          f"Usual router: {good_router}"] +
-                ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
-                refs={"remote": srv})
+            f = self._rogue_fields(servers, rogue)
+            return self._add("dhcp_anomaly", "DANGER", "", f[0], f[1], f[2],
+                             f[3], confidence="High", why=f[4],
+                             evidence=f[5], refs=f[6])
         if self._debounced("dhcp_anomaly", 300):
             return None
         return self._add(
@@ -18616,6 +18597,92 @@ class AlertEngine:
             "less commonly \u2014 a rogue DHCP server. If you don't "
             "recognize one of these addresses, unplug that device and "
             "check your network.")
+
+    @staticmethod
+    def _rogue_fields(servers, rogue):
+        """(reason, observed, interpretation, explanations, why, evidence,
+        refs) of a second DHCP server handing out a different router."""
+        srv, router, dns, good, good_router = rogue
+        selfish = [w for w, on in (("router", router == srv),
+                                    ("DNS server", srv in dns)) if on]
+        tail = (" It names itself as the " + " and the ".join(selfish)
+                + ".") if selfish else ""
+        return (
+            (f"A second device hands out addresses and names itself as "
+             f"your router: {srv}" if router == srv else
+             f"A second device hands out addresses and a different "
+             f"router: {srv}"),
+            f"{len(servers)} different DHCP servers seen: "
+            f"{', '.join(sorted(servers))}. {srv} gives devices {router} "
+            f"as their router and {', '.join(dns) or 'no DNS server'} "
+            f"for name lookups. The usual one, {good}, gives "
+            f"{good_router} as the router.{tail}",
+            "Devices that take an address from it send their Internet "
+            "traffic and name lookups through that device, which can "
+            "read or redirect them.",
+            "A second router or a travel router plugged in by mistake "
+            "does the same. If you don't recognise that device, unplug "
+            "it and reconnect your devices.",
+            "A second DHCP server named a different router than the usual "
+            "one.",
+            [f"DHCP server: {srv}", f"Router it gives: {router}",
+             f"Usual router: {good_router}"] +
+            ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
+            {"remote": srv})
+
+    def dhcp_impostor(self, imp):
+        """Fourth audit: DHCP answers that carry one server address (your
+        router's, usually) come from two MACs that hand out different
+        settings: a rogue DHCP server using your router's address raised
+        nothing. `imp`: NetworkModel.dhcp_impostor()."""
+        if self._debounced(f"dhcp_impostor:{imp['server']}", 300):
+            return None
+        f = self._impostor_fields(imp)
+        return self._add("dhcp_anomaly", "DANGER", "", f[0], f[1], f[2],
+                         f[3], confidence="High" if imp["sure"] else
+                         "Medium", why=f[4], evidence=f[5], refs=f[6],
+                         subject=f"dhcp_impostor|{imp['server']}")
+
+    @staticmethod
+    def _impostor_fields(imp):
+        srv, real, fake = imp["server"], imp["real"], imp["fake"]
+        router, dns = imp["router"] or "none", imp["dns"]
+        good_router, good_dns = imp["real_router"] or "none", imp["real_dns"]
+        sure = imp["sure"]
+        return (
+            (f"A device answers DHCP in your router's name: MAC {fake}"
+             if sure else f"Two devices answer DHCP as {srv} and hand out "
+                          f"different settings"),
+            f"Answers as DHCP server {srv} came from MAC {real} and from "
+            f"MAC {fake}. MAC {fake} gives {router} as the router and "
+            f"{', '.join(dns) or 'no DNS server'} for name lookups; MAC "
+            f"{real} gives {good_router} and "
+            f"{', '.join(good_dns) or 'no DNS server'}." +
+            (f" MAC {real} is your router's." if sure else ""),
+            "Devices that take an address from it send their Internet "
+            "traffic and name lookups through that device, which can "
+            "read or redirect them." if sure else
+            "One of them may be a device pretending to be your router's "
+            "DHCP server.",
+            "A second router or a travel router plugged in by mistake "
+            "does the same. If you don't recognise that device, unplug "
+            "it and reconnect your devices.",
+            "Two devices answered DHCP with the same server address and "
+            "gave different settings.",
+            [f"DHCP server: {srv}", f"Second MAC: {fake}",
+             f"Router it gives: {router}", f"Usual router: {good_router}"] +
+            ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
+            {"mac": fake, "sure": sure})
+
+    def rewrite(self, a, fields):
+        """Put new words in an open alert (what it says changed once more
+        was known: which DHCP server is the rogue, at the end of a file)."""
+        (a.reason, a.observed, a.interpretation, a.possible_explanations,
+         a.why, ev, refs) = fields
+        a.evidence = list(ev)[:20]
+        a.refs.update(refs)
+        a.updated = True
+        return a
 
     def rogue_ra(self, mac, who, prefixes, routers):
         if self._debounced(f"rogue_ra:{mac}", 600):
@@ -19105,12 +19172,41 @@ class AlertEngine:
             evidence=[f"Sent: {size}", f"To: {dest}"],
             refs={"start": start})
 
-    def beacon(self, dev, dest, remote, period, n, named):
+    def beacon(self, dev, dest, remote, period, n, named, quiet=""):
         """A device opened a new connection to one server many times, at
-        nearly even intervals (see beacon_period)."""
+        nearly even intervals (see beacon_period). quiet: "gadget" (a
+        smart-home gadget, TV or speaker checking in with a server it
+        looked up by name; fourth audit: a smart plug's heartbeat was a
+        WARNING) or "cdn" (a content delivery network's host, looked up
+        by name; fifth audit: a TV polling one every 60 s ± 40 %): an
+        INFO, kept out of Unusual activity."""
         if self._debounced(f"beacon:{dev.key}:{remote}", 86400):
             return None
         every = human_period(period)
+        if quiet:
+            gadget = quiet == "gadget"
+            return self._add(
+                "beacon", "INFO", dev.key,
+                f"{dev.display_name()} contacts {dest} every {every}",
+                f"It opened a new connection to {dest} {n} times, about "
+                f"once every {every}.",
+                "Smart-home gadgets, TVs and speakers check in with their "
+                "maker's server on a timer." if gadget else
+                "A content delivery network's server holds files for many "
+                "websites and apps; apps and TVs fetch from it on a timer.",
+                "This is what these gadgets usually do. It matters if you "
+                "don't know the server." if gadget else
+                "News, pictures and updates are fetched like this. It "
+                "matters if the device should be idle.",
+                confidence="Low",
+                why="A gadget contacted a server it looked up by name, at "
+                    "nearly even intervals." if gadget else
+                    "A content delivery network's server, looked up by "
+                    "name, was contacted at nearly even intervals.",
+                evidence=[f"Server: {dest}", f"Contacts: {n}",
+                          f"Every: {every}"],
+                refs={"remote": remote, "explained": quiet},
+                subject=f"beacon|{dev.key}|{remote}")
         return self._add(
             "beacon", "WARNING", dev.key,
             f"{dev.display_name()} contacts {dest} every {every}",
@@ -24150,11 +24246,21 @@ NIGHT_UPLOAD_BYTES = 20 * 1024 * 1024   # sent in one night hour
 NIGHT_UPLOAD_WINDOW = 3600.0
 BEACON_MIN_CONTACTS = 30
 BEACON_SKIP_PORTS = frozenset((0, 53, 123, 853, 3478, 5349, 19302))
+# fourth audit: gadgets whose whole job is to check in with their maker's
+# cloud on a timer (a smart plug every 60 s): an INFO when the server's
+# name came from a DNS answer, kept out of Unusual activity
+BEACON_GADGETS = frozenset(("Smart-home/IoT", "Smart TV", "Streaming device",
+                            "Speaker"))
 DNS_TUNNEL_NAMES = 50          # long random names under one domain …
 DNS_TUNNEL_WINDOW = 600.0      # … within this many seconds
 DNS_TUNNEL_LABEL = 30          # a label this long, random-looking
 # security services that look up file hashes as names on purpose
 DNS_TUNNEL_SKIP = ("sophosxl.net", "mcafee.com", "trendmicro.com", "e5.sk")
+# fourth audit: cloud names made of long random labels whose answers come
+# from the cloud's own name servers, so a lookup carries nothing out
+# (AWS load balancers: k8s-default-web-0a1b2c3d4e-1234567890.us-east-1.
+# elb.amazonaws.com)
+DNS_TUNNEL_SKIP_NAMES = (".elb.amazonaws.com", ".elb.amazonaws.com.cn")
 
 
 def known_bulk_service(names, kind=None):
@@ -24220,6 +24326,8 @@ class DnsTunnelWatch:
         """→ (parent, distinct names, minutes, TXT share, sample) when the
         pair crosses DNS_TUNNEL_NAMES, else None."""
         q = (qname or "").lower().strip(".")
+        if q.endswith(DNS_TUNNEL_SKIP_NAMES):
+            return None
         labels = q.split(".")
         if len(labels) < 3 or not any(random_label(x)
                                       for x in labels[:-2]):
@@ -24352,6 +24460,15 @@ class NetworkModel:
         self.night_up = {}               # (#33) device → this night hour
         self.dns_tunnels = DnsTunnelWatch()      # (#36)
         self.dhcp_offers = OrderedDict()  # (#37) server → router, DNS
+        # fourth audit: what each (server address, MAC) hands out, and the
+        # server addresses answered from two MACs with different settings
+        # (a rogue server using your router's address)
+        self.dhcp_mac_offers = OrderedDict()
+        self.dhcp_twins = {}
+        # fourth audit: names an address got only from a connection (TLS
+        # SNI, HTTP Host), never from a DNS answer: anyone can write
+        # "icloud-content.com" there
+        self.ip_unconfirmed = {}
         self._form_wait = OrderedDict()  # (#34) a form POST's body next
         self._dup_pending = OrderedDict()  # (#39) address → (ts, MAC)
         # (ts, rtt, remote, dev, fid)
@@ -25444,8 +25561,11 @@ class NetworkModel:
                 ip == self.gateway_ip, together=len(both),
                 twin=(both[0], both[1], other) if other else False))
             if a and not a.updated:
-                a.evidence = [f"{t:.0f}: {ip} claimed by {m}" for t, m in
-                              list(self.registry.arp_claims.get(ip, ()))[-8:]]
+                # fourth audit (#40): the time of day, not a raw epoch
+                # ("1763420000: …"), so the line reads in every language
+                a.evidence = [f"{fmt_clock(t)}: {ip} claimed by {m}"
+                              for t, m in list(
+                                  self.registry.arp_claims.get(ip, ()))[-8:]]
                 if other:
                     a.evidence.append(f"also both answering for {other}")
                 if ip == self.gateway_ip:
@@ -25517,6 +25637,7 @@ class NetworkModel:
                     off["router"] = str(info["router"])
                 if info.get("dns_servers"):
                     off["dns"] = [str(x) for x in info["dns_servers"][:4]]
+            imp = self._note_dhcp_mac(server, d["src_mac"], info)
             if mt in (2, 5):
                 self.dhcp_servers[server] += 1
                 # third audit: a flood of offers with made-up server ids
@@ -25525,6 +25646,8 @@ class NetworkModel:
                 if len(self.dhcp_servers) > 1:
                     self._alert(self.alerts.dhcp_anomaly(
                         set(self.dhcp_servers), self.dhcp_rogue()))
+                if imp is not None:
+                    self._alert(self.alerts.dhcp_impostor(imp))
             if info.get("router"):
                 self.dhcp_routers[info["router"]] += 1
                 trim_counter(self.dhcp_routers, self.LAN_TALLY_KEEP)
@@ -26091,6 +26214,19 @@ class NetworkModel:
                     for k in list(itertools.islice(
                             self.ip_to_domains, self.IP_NAMES_KEEP // 10)):
                         self.ip_to_domains.pop(k, None)
+                        self.ip_unconfirmed.pop(k, None)
+            un = self.ip_unconfirmed.get(ip)
+            if source == "DNS":
+                if un is not None:
+                    un.discard(key)
+                    if not un:
+                        del self.ip_unconfirmed[ip]
+            elif connection and key not in names:
+                if un is None and len(self.ip_unconfirmed) < \
+                        self.IP_NAMES_KEEP:
+                    un = self.ip_unconfirmed[ip] = set()
+                if un is not None and len(un) < 8:
+                    un.add(key)
             names.pop(key, None)
             names[key] = ts
             while len(names) > 8:
@@ -26480,8 +26616,7 @@ class NetworkModel:
         backup = 0
         service = ""
         for ip, n in ep["to"].most_common():
-            hit = known_bulk_service(self.ip_to_domains.get(ip) or (),
-                                     "backup")
+            hit = known_bulk_service(self.dns_names(ip), "backup")
             if hit:
                 backup += n
                 service = service or hit[0]
@@ -26520,8 +26655,27 @@ class NetworkModel:
             return None
         names = self.ip_to_domains.get(remote)
         dest = next(reversed(names)) if names else remote
-        return self._alert(self.alerts.beacon(dev, dest, remote, period, n,
-                                              bool(names)))
+        # fourth audit: names from a DNS answer only (a TLS hello can
+        # claim any name)
+        dns = self.dns_names(remote)
+        quiet = ""
+        if any(is_cdn_name(x) for x in dns):
+            # fifth audit: a TV polling a CDN host every 60 s ± 40 % was a
+            # WARNING under Unusual activity; a CDN host serves everyone
+            quiet = "cdn"
+        elif dns and (dev.user_class or dev.device_class) in BEACON_GADGETS:
+            quiet = "gadget"
+        return self._alert(self.alerts.beacon(
+            dev, dest, remote, period, n, bool(names), quiet=quiet))
+
+    def dns_names(self, ip):
+        """The names `ip` was given by a DNS answer (or by a source that
+        is not a connection's own claim). Fourth audit: a server of
+        anyone's can put "p42-content.icloud-content.com" in its TLS hello;
+        such a name alone no longer makes a night upload a backup."""
+        names = self.ip_to_domains.get(ip) or ()
+        un = self.ip_unconfirmed.get(ip)
+        return [n for n in names if not un or n not in un]
 
     def _bulk_service(self, dev, upload):
         """Second audit (#38): the known backup (upload) or streaming
@@ -26533,7 +26687,7 @@ class NetworkModel:
         by = b.cur_up_by if upload else b.cur_down_by
         for ip in (b.last_top[0 if upload else 1],
                    max(by, key=by.get) if by else ""):
-            hit = known_bulk_service(self.ip_to_domains.get(ip) or (),
+            hit = known_bulk_service(self.dns_names(ip),
                                      "backup" if upload else "stream") \
                 if ip else None
             if hit:
@@ -26827,6 +26981,7 @@ class NetworkModel:
                 if ip not in keep and next(reversed(names.values()), 0) < cut]
         for ip in doms:
             del self.ip_to_domains[ip]
+            self.ip_unconfirmed.pop(ip, None)
         self.correlator._expire(now)     # without waiting for a new lookup
         return len(old) + len(doms) + len(self.cache.prune(now, keep))
 
@@ -27023,7 +27178,112 @@ class NetworkModel:
             for s, o in offers:
                 if o["router"] == self.gateway_ip:
                     return s, o["router"]
+        # fifth audit: a capture file has no default route; the router
+        # the Internet traffic really goes through decides (the rogue
+        # heard first was trusted, and the real router accused)
+        best = None
+        for s, o in offers:
+            key = self.registry.ip_to_key.get(o["router"])
+            dev = self.registry.by_key.get(key) if key else None
+            n = self.gw_mac_traffic.get((dev.mac or "").lower(), 0) \
+                if dev is not None else 0
+            if n and (best is None or n > best[0]):
+                best = (n, s, o["router"])
+        if best is not None:
+            return best[1], best[2]
         return offers[0][0], offers[0][1]["router"]
+
+    def _note_dhcp_mac(self, server, mac, info):
+        """Fourth audit: what each MAC answering as DHCP server `server`
+        hands out. Two MACs that hand out different routers or DNS servers
+        under one server address (a rogue server using your router's
+        address; two relays of one real server give the same settings)
+        make a pair: then the real one's settings are the server's.
+        → dhcp_impostor() for this server, or None."""
+        mac = (mac or "").lower()
+        if not mac:
+            return None
+        mo = self.dhcp_mac_offers.get((server, mac))
+        if mo is None:
+            if len(self.dhcp_mac_offers) >= 32:
+                return None
+            mo = self.dhcp_mac_offers[(server, mac)] = {"router": "",
+                                                       "dns": []}
+        if info.get("router"):
+            mo["router"] = str(info["router"])
+        if info.get("dns_servers"):
+            mo["dns"] = [str(x) for x in info["dns_servers"][:4]]
+        if server not in self.dhcp_twins:
+            for (s, m), o in self.dhcp_mac_offers.items():
+                if s == server and m != mac and \
+                        (o["router"], o["dns"]) != (mo["router"],
+                                                     mo["dns"]):
+                    self.dhcp_twins[server] = [m, mac]
+                    break
+            else:
+                return None
+        elif mac not in self.dhcp_twins[server] and \
+                len(self.dhcp_twins[server]) < 4:
+            self.dhcp_twins[server].append(mac)
+        imp = self.dhcp_impostor(server)
+        if imp is not None and server in self.dhcp_offers:
+            self.dhcp_offers[server] = {"router": imp["real_router"],
+                                        "dns": list(imp["real_dns"])}
+        return imp
+
+    def dhcp_impostor(self, server=None):
+        """Fourth audit: a DHCP server address answered from two MACs with
+        different settings → {server, real, fake, sure, router, dns,
+        real_router, real_dns}, else None. The real one is the MAC your
+        router has (its ARP answers for the gateway address) or the one
+        the Internet traffic goes through; `sure` is False when neither
+        tells them apart (then the first one heard counts as real)."""
+        reg = self.registry
+        for s, macs in self.dhcp_twins.items():
+            if server is not None and s != server:
+                continue
+
+            def score(m):
+                return (m in reg.gw_macs, self.gw_mac_traffic.get(m, 0))
+            ranked = sorted(macs, key=score, reverse=True)
+            real = ranked[0]
+            ro = self.dhcp_mac_offers.get((s, real)) or {}
+            for fake in ranked[1:]:
+                fo = self.dhcp_mac_offers.get((s, fake)) or {}
+                if (fo.get("router"), fo.get("dns")) != \
+                        (ro.get("router"), ro.get("dns")):
+                    return {"server": s, "real": real, "fake": fake,
+                            "sure": score(real) > score(fake),
+                            "router": fo.get("router", ""),
+                            "dns": list(fo.get("dns") or []),
+                            "real_router": ro.get("router", ""),
+                            "real_dns": list(ro.get("dns") or [])}
+        return None
+
+    def refresh_dhcp_alerts(self):
+        """Fourth/fifth audit: in a capture file the DHCP answers come
+        before the traffic that shows which router is real, so the alert
+        could accuse the real router (and a rogue using its address could
+        not be told apart). Once more is known (infer_gateway, at the end
+        of a file), an open alert is said again with the right roles."""
+        eng = self.alerts
+        rogue = self.dhcp_rogue()
+        a = eng.alerts.get(eng._open.get(("dhcp_anomaly", ""), ""))
+        if a is not None and rogue is not None and not a.acknowledged and \
+                a.severity == "DANGER" and a.refs.get("remote") != rogue[0]:
+            eng.rewrite(a, eng._rogue_fields(set(self.dhcp_servers), rogue))
+        for s in list(self.dhcp_twins):
+            imp = self.dhcp_impostor(s)
+            a = eng.alerts.get(eng._open.get(
+                ("dhcp_anomaly", f"dhcp_impostor|{s}"), ""))
+            if imp is None or a is None or a.acknowledged:
+                continue
+            if (a.refs.get("mac"), a.refs.get("sure")) != \
+                    (imp["fake"], imp["sure"]):
+                eng.rewrite(a, eng._impostor_fields(imp))
+            if s in self.dhcp_offers:
+                self.dhcp_offers[s] = {"router": imp["real_router"],
+                                       "dns": list(imp["real_dns"])}
 
     def dhcp_rogue(self):
         """Second audit (#37): (server, router, DNS servers, trusted server,
@@ -27044,9 +27304,16 @@ class NetworkModel:
         from DHCP 'router' options or from where Internet traffic flows.
         Second audit (#37): when DHCP servers disagree about the router,
         the trusted server's router, never the busiest offer (a rogue
-        server answering every request named itself the gateway)."""
+        server answering every request named itself the gateway).
+        Fourth audit: an open DHCP alert is said again with what is known
+        now (refresh_dhcp_alerts), and a rogue answering with your
+        router's address never makes its router the gateway."""
+        self.refresh_dhcp_alerts()
         if self.dhcp_rogue() is not None:
             return self.dhcp_trusted()[1]
+        imp = self.dhcp_impostor()
+        if imp is not None and imp["real_router"]:
+            return imp["real_router"]
         if self.dhcp_routers:
             return self.dhcp_routers.most_common(1)[0][0]
         if self.gw_mac_traffic:
@@ -32913,6 +33180,109 @@ little evidence ¦ peu d'indices ¦ pocos indicios
 The interrupted session can't be restored: its crash copy is incomplete or damaged. It was left in the sessions folder. ¦ La session interrompue ne peut pas être restaurée : sa copie après plantage est incomplète ou abîmée. Elle a été laissée dans le dossier des sessions. ¦ La sesión interrumpida no se puede restaurar: su copia tras un fallo está incompleta o dañada. Se ha dejado en la carpeta de sesiones.
 The interrupted session can't be restored: its crash copy couldn't be read or copied. ¦ La session interrompue ne peut pas être restaurée : sa copie après plantage n'a pas pu être lue ni copiée. ¦ La sesión interrumpida no se puede restaurar: su copia tras un fallo no se pudo leer ni copiar.
 A device appeared that I haven't seen in this session. ¦ Un appareil que je n'avais pas vu pendant cette session est apparu. ¦ Apareció un dispositivo que no había visto en esta sesión.
+# fourth audit (#40): the fixed sentences of the alerts that stayed English
+Open your router's connected-devices list and look for this device. ¦ Ouvrez la liste des appareils connectés de votre box et cherchez cet appareil. ¦ Abra la lista de dispositivos conectados de su router y busque este dispositivo.
+If it isn't yours or a guest's, change your Wi-Fi password and re-check. ¦ S'il n'est ni à vous ni à un invité, changez votre mot de passe Wi-Fi et vérifiez à nouveau. ¦ Si no es suyo ni de un invitado, cambie la contraseña de su Wi-Fi y vuelva a comprobarlo.
+Disconnect from this network on any device you're unsure about. ¦ Déconnectez de ce réseau tout appareil dont vous n'êtes pas sûr. ¦ Desconecte de esta red cualquier dispositivo del que no esté seguro.
+Open your router's admin page from a device you trust and check its connected devices. ¦ Ouvrez la page d'administration de votre box depuis un appareil de confiance et vérifiez ses appareils connectés. ¦ Abra la página de administración de su router desde un dispositivo de confianza y revise sus dispositivos conectados.
+Restart the router; if this returns immediately, look for a device that shouldn't be there. ¦ Redémarrez la box ; si cela revient aussitôt, cherchez un appareil qui ne devrait pas être là. ¦ Reinicie el router; si vuelve a pasar enseguida, busque un dispositivo que no debería estar ahí.
+Did you just restart, update or replace the router? If yes, this is expected. ¦ Venez-vous de redémarrer, mettre à jour ou remplacer la box ? Si oui, c'est normal. ¦ ¿Acaba de reiniciar, actualizar o sustituir el router? Si es así, es lo esperado.
+If not, check the router's admin page and its connected devices before trusting this network. ¦ Sinon, vérifiez la page d'administration de la box et ses appareils connectés avant de faire confiance à ce réseau. ¦ Si no, revise la página de administración del router y sus dispositivos conectados antes de confiar en esta red.
+Normal if you have a second router, a mesh system or a device sharing its connection (phone hotspot, VM host). ¦ Normal si vous avez un second routeur, un système maillé ou un appareil qui partage sa connexion (point d'accès d'un téléphone, hôte de machines virtuelles). ¦ Normal si tiene un segundo router, un sistema en malla o un dispositivo que comparte su conexión (punto de acceso de un teléfono, anfitrión de máquinas virtuales).
+Otherwise find that device: a rogue router announcement can redirect IPv6 traffic through it. ¦ Sinon, trouvez cet appareil : une fausse annonce de routeur peut faire passer le trafic IPv6 par lui. ¦ Si no, busque ese dispositivo: un anuncio de router falso puede desviar el tráfico IPv6 a través de él.
+Check whether a second router or access point was plugged in recently. ¦ Vérifiez si un second routeur ou point d'accès a été branché récemment. ¦ Compruebe si se ha conectado hace poco un segundo router o punto de acceso.
+Unplug anything you don't recognize and see whether the second DHCP server disappears. ¦ Débranchez ce que vous ne reconnaissez pas et regardez si le second serveur DHCP disparaît. ¦ Desconecte lo que no reconozca y compruebe si desaparece el segundo servidor DHCP.
+Is the device downloading an update, streaming or on a video call? ¦ L'appareil télécharge-t-il une mise à jour, diffuse-t-il une vidéo ou est-il en appel vidéo ? ¦ ¿El dispositivo está descargando una actualización, reproduciendo contenido o en una videollamada?
+If it should be idle, restart it or look at what it is running. ¦ S'il devrait être inactif, redémarrez-le ou regardez ce qu'il exécute. ¦ Si debería estar inactivo, reinícielo o mire qué está ejecutando.
+Give it time — confidence rises as more evidence arrives. ¦ Laissez-lui du temps : la confiance augmente à mesure que les indices arrivent. ¦ Dele tiempo: la confianza aumenta a medida que llegan más indicios.
+Compare its MAC address with the labels on your devices or your router's list. ¦ Comparez son adresse MAC avec les étiquettes de vos appareils ou la liste de votre box. ¦ Compare su dirección MAC con las etiquetas de sus dispositivos o la lista de su router.
+Check the device's Wi-Fi signal and its distance from the router. ¦ Vérifiez le signal Wi-Fi de l'appareil et sa distance à la box. ¦ Compruebe la señal Wi-Fi del dispositivo y su distancia al router.
+Look for power-saving or roaming settings on the device. ¦ Cherchez des réglages d'économie d'énergie ou d'itinérance sur l'appareil. ¦ Busque ajustes de ahorro de energía o de itinerancia en el dispositivo.
+Check for two devices set to the same fixed IP. ¦ Cherchez deux appareils réglés sur la même adresse IP fixe. ¦ Busque dos dispositivos configurados con la misma IP fija.
+Renew the lease (reconnect the device) and see if it stops. ¦ Renouvelez le bail (reconnectez l'appareil) et regardez si cela cesse. ¦ Renueve la concesión (vuelva a conectar el dispositivo) y compruebe si se detiene.
+Did you (or an app/VPN) just change DNS settings? Then this is expected. ¦ Vous (ou une application, un VPN) venez de changer les réglages DNS ? Alors c'est normal. ¦ ¿Usted (o una aplicación o VPN) acaba de cambiar los ajustes DNS? Entonces es lo esperado.
+Otherwise, check the DNS settings in your router and on the device. ¦ Sinon, vérifiez les réglages DNS de votre box et de l'appareil. ¦ Si no, revise los ajustes DNS de su router y del dispositivo.
+Check whether websites load normally right now. ¦ Vérifiez si les sites se chargent normalement en ce moment. ¦ Compruebe si los sitios web cargan con normalidad ahora mismo.
+If not, restart the router; if it persists, try a different DNS server or contact your provider. ¦ Sinon, redémarrez la box ; si cela persiste, essayez un autre serveur DNS ou contactez votre fournisseur. ¦ Si no, reinicie el router; si persiste, pruebe otro servidor DNS o contacte con su proveedor.
+Run the Health tab's checks to compare router and Internet response times. ¦ Lancez les vérifications de l'onglet Santé pour comparer les temps de réponse de la box et d'Internet. ¦ Ejecute las comprobaciones de la pestaña Salud para comparar los tiempos de respuesta del router y de Internet.
+Slow DNS is often your provider's — a different DNS server can help. ¦ Un DNS lent est souvent celui de votre fournisseur : un autre serveur DNS peut aider. ¦ Un DNS lento suele ser el de su proveedor: otro servidor DNS puede ayudar.
+Usually harmless: VPNs, browsers with secure DNS, and some apps use their own DNS servers. ¦ En général sans danger : les VPN, les navigateurs avec DNS sécurisé et certaines applications utilisent leurs propres serveurs DNS. ¦ Normalmente inofensivo: las VPN, los navegadores con DNS seguro y algunas aplicaciones usan sus propios servidores DNS.
+Is the device updating, syncing a cloud folder, or running a peer-to-peer app? ¦ L'appareil se met-il à jour, synchronise-t-il un dossier cloud ou exécute-t-il une application pair-à-pair ? ¦ ¿El dispositivo se está actualizando, sincronizando una carpeta en la nube o ejecutando una aplicación P2P?
+If it should be idle, look at what it is running. ¦ S'il devrait être inactif, regardez ce qu'il exécute. ¦ Si debería estar inactivo, mire qué está ejecutando.
+Browsers, games and updates open many connections; check what the device is doing. ¦ Les navigateurs, jeux et mises à jour ouvrent beaucoup de connexions ; regardez ce que fait l'appareil. ¦ Los navegadores, los juegos y las actualizaciones abren muchas conexiones; mire qué está haciendo el dispositivo.
+Restart the device if it should be idle. ¦ Redémarrez l'appareil s'il devrait être inactif. ¦ Reinicie el dispositivo si debería estar inactivo.
+Is the device backing up photos, uploading video, or on a video call? ¦ L'appareil sauvegarde-t-il des photos, envoie-t-il une vidéo ou est-il en appel vidéo ? ¦ ¿El dispositivo está haciendo copia de fotos, subiendo vídeo o en una videollamada?
+If not, check what it is running — large unexpected uploads are worth understanding. ¦ Sinon, regardez ce qu'il exécute : un gros envoi inattendu mérite d'être compris. ¦ Si no, mire qué está ejecutando: merece la pena entender una subida grande e inesperada.
+A website or service may be refusing connections. ¦ Un site ou un service refuse peut-être les connexions. ¦ Puede que un sitio web o un servicio esté rechazando conexiones.
+Firewalls and ad-blockers also cause resets; check if something isn't working. ¦ Les pare-feu et bloqueurs de publicité provoquent aussi des réinitialisations ; vérifiez si quelque chose ne fonctionne pas. ¦ Los cortafuegos y los bloqueadores de anuncios también causan restablecimientos; compruebe si algo no funciona.
+Did you just install or enable something on that device (e.g. file sharing, casting)? ¦ Venez-vous d'installer ou d'activer quelque chose sur cet appareil (par exemple partage de fichiers, diffusion) ? ¦ ¿Acaba de instalar o activar algo en ese dispositivo (por ejemplo, compartir archivos o enviar contenido)?
+Avoid entering passwords on services that are not encrypted. ¦ Évitez de saisir des mots de passe sur des services non chiffrés. ¦ Evite escribir contraseñas en servicios sin cifrar.
+Check whether the device/app offers a secure (TLS) option. ¦ Vérifiez si l'appareil ou l'application propose une option sécurisée (TLS). ¦ Compruebe si el dispositivo o la aplicación ofrece una opción segura (TLS).
+Make sure remote access on that device is something you set up on purpose. ¦ Vérifiez que l'accès à distance sur cet appareil est bien quelque chose que vous avez configuré volontairement. ¦ Asegúrese de que el acceso remoto en ese dispositivo es algo que configuró a propósito.
+Use strong passwords and turn the service off if you don't need it. ¦ Utilisez des mots de passe solides et désactivez le service si vous n'en avez pas besoin. ¦ Use contraseñas seguras y desactive el servicio si no lo necesita.
+Usually normal: content networks and cloud services live in many countries. ¦ En général normal : les réseaux de contenu et les services cloud sont présents dans de nombreux pays. ¦ Normalmente es normal: las redes de contenidos y los servicios en la nube están en muchos países.
+Only worth a look if the device should rarely use the Internet. ¦ À regarder seulement si l'appareil ne devrait que rarement utiliser Internet. ¦ Solo merece una revisión si el dispositivo debería usar Internet muy poco.
+A misbehaving device or a network loop can flood the network. ¦ Un appareil défaillant ou une boucle réseau peut inonder le réseau. ¦ Un dispositivo que funciona mal o un bucle de red puede inundar la red.
+Unplug recently added network cables/switches and see if it stops. ¦ Débranchez les câbles réseau ou commutateurs ajoutés récemment et regardez si cela cesse. ¦ Desconecte los cables de red o conmutadores añadidos hace poco y compruebe si se detiene.
+If you ran a network scanner yourself, this is expected. ¦ Si vous avez lancé vous-même un scanner réseau, c'est normal. ¦ Si usted mismo ejecutó un escáner de red, es lo esperado.
+Otherwise, find that device and check what software it is running. ¦ Sinon, trouvez cet appareil et regardez quels logiciels il exécute. ¦ Si no, busque ese dispositivo y mire qué programas ejecuta.
+Look at which device contacted it and whether that was expected (an app, an update, a link someone opened). ¦ Regardez quel appareil l'a contacté et si c'était attendu (une application, une mise à jour, un lien que quelqu'un a ouvert). ¦ Mire qué dispositivo lo contactó y si era lo esperado (una aplicación, una actualización, un enlace que alguien abrió).
+A list entry is a reason to look, not proof: shared servers and old entries are common. ¦ Une entrée dans une liste est une raison de regarder, pas une preuve : les serveurs partagés et les entrées anciennes sont courants. ¦ Una entrada en una lista es un motivo para mirar, no una prueba: los servidores compartidos y las entradas antiguas son habituales.
+Your router's hardware (MAC) address changed during this session. ¦ L'adresse matérielle (MAC) de votre box a changé pendant cette session. ¦ La dirección de hardware (MAC) de su router cambió durante esta sesión.
+The address is on a public list of malicious servers you turned on in the Components Center. ¦ L'adresse figure sur une liste publique de serveurs malveillants que vous avez activée dans le Centre des composants. ¦ La dirección está en una lista pública de servidores maliciosos que activó en el Centro de componentes.
+Two different hardware addresses claimed the same IP address. ¦ Deux adresses matérielles différentes ont revendiqué la même adresse IP. ¦ Dos direcciones de hardware distintas reclamaron la misma dirección IP.
+More than one device answered DHCP requests. ¦ Plus d'un appareil a répondu aux demandes DHCP. ¦ Más de un dispositivo respondió a las solicitudes DHCP.
+A device other than your router announced itself as an IPv6 router. ¦ Un appareil autre que votre box s'est annoncé comme routeur IPv6. ¦ Un dispositivo distinto de su router se anunció como router IPv6.
+The same address was claimed by different hardware back and forth within a minute. ¦ La même adresse a été revendiquée tour à tour par des matériels différents en moins d'une minute. ¦ La misma dirección fue reclamada alternativamente por hardware distinto en menos de un minuto.
+Traffic this minute is far above this device's own recent average. ¦ Le trafic de cette minute est bien au-dessus de la moyenne récente de cet appareil. ¦ El tráfico de este minuto está muy por encima de la media reciente de este dispositivo.
+The device stayed hard to identify after sending a number of packets. ¦ L'appareil est resté difficile à identifier après avoir envoyé un certain nombre de paquets. ¦ El dispositivo siguió siendo difícil de identificar después de enviar varios paquetes.
+The device went offline and came back many times in a short window. ¦ L'appareil s'est déconnecté puis est revenu de nombreuses fois en peu de temps. ¦ El dispositivo se desconectó y volvió muchas veces en poco tiempo.
+Your router's address keeps switching between devices ¦ L'adresse de votre box passe sans cesse d'un appareil à l'autre ¦ La dirección de su router cambia continuamente entre dispositivos
+Only minimal evidence is available for this device. ¦ Il n'y a que très peu d'indices pour cet appareil. ¦ Solo hay muy pocos indicios para este dispositivo.
+A new service on this computer can be reached by others ¦ Un nouveau service de cet ordinateur est joignable par d'autres ¦ Otros pueden acceder a un nuevo servicio de este equipo
+A new local-only service on this computer. ¦ Un nouveau service de cet ordinateur, joignable seulement en local. ¦ Un nuevo servicio de este equipo, accesible solo en local.
+Another device may be pretending to be your router (ARP spoofing), which lets it see your traffic. ¦ Un autre appareil se fait peut-être passer pour votre box (usurpation ARP), ce qui lui permet de voir votre trafic. ¦ Puede que otro dispositivo se haga pasar por su router (suplantación ARP), lo que le permite ver su tráfico.
+Another device may be pretending to be this address. ¦ Un autre appareil se fait peut-être passer pour cette adresse. ¦ Puede que otro dispositivo se haga pasar por esta dirección.
+your router ¦ votre box ¦ su router
+various servers ¦ divers serveurs ¦ varios servidores
+the Internet ¦ Internet ¦ Internet
+the network ¦ le réseau ¦ la red
+unknown ¦ inconnu ¦ desconocido
+none ¦ aucun ¦ ninguno
+MAC seen locally ¦ MAC vue sur le réseau local ¦ MAC vista en la red local
+ARP reply ¦ réponse ARP ¦ respuesta ARP
+IPv6 Neighbor Discovery ¦ découverte des voisins IPv6 ¦ descubrimiento de vecinos IPv6
+DHCP lease ¦ bail DHCP ¦ concesión DHCP
+DHCP request ¦ demande DHCP ¦ solicitud DHCP
+mDNS advertisement ¦ annonce mDNS ¦ anuncio mDNS
+SSDP advertisement ¦ annonce SSDP ¦ anuncio SSDP
+Windows name (NetBIOS) ¦ nom Windows (NetBIOS) ¦ nombre de Windows (NetBIOS)
+Local traffic ¦ trafic local ¦ tráfico local
+Vendor (OUI) match ¦ fabricant reconnu (OUI) ¦ fabricante reconocido (OUI)
+Reverse DNS ¦ DNS inverse ¦ DNS inverso
+Can receive AirPlay audio/video from Apple devices. ¦ Peut recevoir l'audio et la vidéo AirPlay des appareils Apple. ¦ Puede recibir audio y vídeo AirPlay de dispositivos Apple.
+Can receive streamed audio (AirPlay-compatible speaker). ¦ Peut recevoir de l'audio diffusé (enceinte compatible AirPlay). ¦ Puede recibir audio transmitido (altavoz compatible con AirPlay).
+Can receive casted audio/video (Chromecast-compatible). ¦ Peut recevoir de l'audio et de la vidéo diffusés (compatible Chromecast). ¦ Puede recibir audio y vídeo enviados (compatible con Chromecast).
+Can be used as a Spotify Connect speaker. ¦ Peut servir d'enceinte Spotify Connect. ¦ Puede usarse como altavoz de Spotify Connect.
+This looks like a Sonos speaker. ¦ Cela ressemble à une enceinte Sonos. ¦ Parece un altavoz Sonos.
+This is a network printer. ¦ C'est une imprimante réseau. ¦ Es una impresora de red.
+Supports Apple HomeKit smart-home control. ¦ Prend en charge la maison connectée Apple HomeKit. ¦ Admite el control de hogar inteligente Apple HomeKit.
+Supports the Matter smart-home standard. ¦ Prend en charge la norme de maison connectée Matter. ¦ Admite el estándar de hogar inteligente Matter.
+Can be controlled remotely over SSH — make sure that's expected. ¦ Peut être contrôlé à distance par SSH : vérifiez que c'est voulu. ¦ Se puede controlar a distancia por SSH: compruebe que es lo esperado.
+Shares files over the network (Windows/SMB file sharing). ¦ Partage des fichiers sur le réseau (partage de fichiers Windows/SMB). ¦ Comparte archivos en la red (uso compartido de archivos de Windows/SMB).
+Shares files over the network (Apple file sharing). ¦ Partage des fichiers sur le réseau (partage de fichiers Apple). ¦ Comparte archivos en la red (uso compartido de archivos de Apple).
+A computer sharing its presence on the network. ¦ Un ordinateur qui signale sa présence sur le réseau. ¦ Un ordenador que anuncia su presencia en la red.
+Supports NVIDIA GameStream. ¦ Prend en charge NVIDIA GameStream. ¦ Admite NVIDIA GameStream.
+This looks like an Xbox console. ¦ Cela ressemble à une console Xbox. ¦ Parece una consola Xbox.
+This looks like a PlayStation console. ¦ Cela ressemble à une console PlayStation. ¦ Parece una consola PlayStation.
+One of them may be a device pretending to be your router's DHCP server. ¦ L'un d'eux est peut-être un appareil qui se fait passer pour le serveur DHCP de votre box. ¦ Puede que uno de ellos sea un dispositivo que se hace pasar por el servidor DHCP de su router.
+Two devices answered DHCP with the same server address and gave different settings. ¦ Deux appareils ont répondu au DHCP avec la même adresse de serveur et ont donné des réglages différents. ¦ Dos dispositivos respondieron al DHCP con la misma dirección de servidor y dieron ajustes distintos.
+Smart-home gadgets, TVs and speakers check in with their maker's server on a timer. ¦ Les objets connectés, téléviseurs et enceintes contactent le serveur de leur fabricant à intervalles réguliers. ¦ Los dispositivos de hogar inteligente, televisores y altavoces contactan con el servidor de su fabricante a intervalos regulares.
+This is what these gadgets usually do. It matters if you don't know the server. ¦ C'est ce que font d'habitude ces appareils. C'est important si vous ne connaissez pas le serveur. ¦ Es lo que suelen hacer estos dispositivos. Importa si no conoce el servidor.
+A content delivery network's server holds files for many websites and apps; apps and TVs fetch from it on a timer. ¦ Le serveur d'un réseau de diffusion de contenu (CDN) stocke des fichiers pour de nombreux sites et applications ; applications et téléviseurs y puisent à intervalles réguliers. ¦ El servidor de una red de distribución de contenidos (CDN) guarda archivos de muchos sitios y aplicaciones; las aplicaciones y los televisores los descargan a intervalos regulares.
+News, pictures and updates are fetched like this. It matters if the device should be idle. ¦ Les actualités, images et mises à jour sont récupérées ainsi. C'est important si l'appareil devrait être inactif. ¦ Las noticias, imágenes y actualizaciones se descargan así. Importa si el dispositivo debería estar inactivo.
+A content delivery network's server, looked up by name, was contacted at nearly even intervals. ¦ Le serveur d'un réseau de diffusion de contenu, dont le nom a été cherché, a été contacté à intervalles presque réguliers. ¦ Se contactó con el servidor de una red de distribución de contenidos, cuyo nombre se buscó, a intervalos casi regulares.
+A gadget contacted a server it looked up by name, at nearly even intervals. ¦ Un objet connecté a contacté un serveur dont il avait cherché le nom, à intervalles presque réguliers. ¦ Un dispositivo conectado contactó con un servidor cuyo nombre había buscado, a intervalos casi regulares.
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -34199,6 +34569,179 @@ I18N_PATTERNS[:0] = [
      r"\1 affichés · \2 en mémoire · affichage en pause",
      r"\1 mostrados · \2 en memoria · vista en pausa"),
 ]
+# fourth audit (#40): alert sentences built from changing parts that
+# stayed English in French and Spanish. In front: the general "(.+) keeps
+# switching between devices" left "The address 192.168.1.5" in English.
+_A4_EVENT = [
+    (r"The address (\S+) keeps switching between devices",
+     r"L'adresse \1 passe sans cesse d'un appareil à l'autre",
+     r"La dirección \1 cambia continuamente entre dispositivos"),
+    (r"Two network cards of one device \(MAC (\S+) and MAC (\S+)\) are both "
+     r"answering for (\S+)",
+     r"Deux cartes réseau d'un même appareil (MAC \1 et MAC \2) répondent "
+     r"toutes les deux pour \3",
+     r"Dos tarjetas de red de un mismo dispositivo (MAC \1 y MAC \2) "
+     r"responden ambas por \3"),
+    (r"This computer's ARP cache disagrees about your router",
+     r"Le cache ARP de cet ordinateur contredit le réseau pour votre box",
+     r"La caché ARP de este equipo contradice a la red sobre su router"),
+    (r"This computer's ARP cache disagrees about (\S+)",
+     r"Le cache ARP de cet ordinateur contredit le réseau pour \1",
+     r"La caché ARP de este equipo contradice a la red sobre \1"),
+    (r"A device answers DHCP in your router's name: MAC (\S+)",
+     r"Un appareil répond au DHCP au nom de votre box : MAC \1",
+     r"Un dispositivo responde al DHCP en nombre de su router: MAC \1"),
+    (r"Two devices answer DHCP as (\S+) and hand out different settings",
+     r"Deux appareils répondent au DHCP en tant que \1 et donnent des "
+     r"réglages différents",
+     r"Dos dispositivos responden al DHCP como \1 y dan ajustes distintos"),
+]
+_A4_TEXT = [
+    (r"Two network cards of one device \(MAC (\S+) and MAC (\S+)\) are both "
+     r"answering for this address and for another address \((\S+)\)\. This "
+     r"is known as ARP flux, and is common on Linux machines with two "
+     r"network connections\.",
+     r"Deux cartes réseau d'un même appareil (MAC \1 et MAC \2) répondent "
+     r"toutes les deux pour cette adresse et pour une autre adresse (\3). "
+     r"On appelle cela « ARP flux » ; c'est courant sur les machines Linux "
+     r"avec deux connexions réseau.",
+     r"Dos tarjetas de red de un mismo dispositivo (MAC \1 y MAC \2) "
+     r"responden ambas por esta dirección y por otra dirección (\3). Esto "
+     r"se llama «ARP flux» y es habitual en equipos Linux con dos "
+     r"conexiones de red."),
+    (r"(\S+) was claimed by (\d+) different MAC addresses, which also both "
+     r"answer for (\S+)\.",
+     r"\1 a été revendiquée par \2 adresses MAC différentes, qui répondent "
+     r"aussi toutes les deux pour \3.",
+     r"\1 fue reclamada por \2 direcciones MAC distintas, que también "
+     r"responden ambas por \3."),
+    (r"([\d:]+): (\S+) claimed by (\S+)", r"\1 : \2 revendiquée par \3",
+     r"\1: \2 reclamada por \3"),
+    (r"also both answering for (\S+)",
+     r"les deux répondent aussi pour \1", r"ambas responden también por \1"),
+    (r"An IPv6 Router Advertisement came from (\S+) for (.+?)\. Routers "
+     r"announcing on this network: (.+)\.",
+     r"Une annonce de routeur IPv6 est venue de \1 pour \2. Routeurs qui "
+     r"s'annoncent sur ce réseau : \3.",
+     r"Llegó un anuncio de router IPv6 de \1 para \2. Routers que se "
+     r"anuncian en esta red: \3."),
+    (r"An IPv6 Router Advertisement came from (\S+)\. Routers announcing "
+     r"on this network: (.+)\.",
+     r"Une annonce de routeur IPv6 est venue de \1. Routeurs qui "
+     r"s'annoncent sur ce réseau : \2.",
+     r"Llegó un anuncio de router IPv6 de \1. Routers que se anuncian en "
+     r"esta red: \2."),
+    (r"RA from (\S+)", r"Annonce de routeur venue de \1",
+     r"Anuncio de router de \1"),
+    (r"prefix (\S+)", r"préfixe \1", r"prefijo \1"),
+    (r"Only (.+) evidence is available for this device\.",
+     "Seuls ces indices sont disponibles pour cet appareil : {t1}.",
+     "Solo hay estos indicios para este dispositivo: {t1}."),
+    (r"(\d+) reconnects in the last (\d+) minutes\.",
+     r"\1 reconnexions ces \2 dernières minutes.",
+     r"\1 reconexiones en los últimos \2 minutos."),
+    (r"It had been using (\S+) for its lookups and is now using (\S+)\.",
+     r"Il utilisait \1 pour ses recherches de noms et utilise maintenant "
+     r"\2.",
+     r"Usaba \1 para sus búsquedas de nombres y ahora usa \2."),
+    (r"Previous server: (.+)", r"Serveur précédent : \1",
+     r"Servidor anterior: \1"),
+    (r"New server: (.+)", r"Nouveau serveur : \1", r"Servidor nuevo: \1"),
+    (r"(\d+)% of the last (\d+) DNS lookups failed or got no answer "
+     r"\(servers: (.+)\)\.",
+     "\\1 % des \\2 dernières recherches DNS ont échoué ou sont restées "
+     "sans réponse (serveurs : {t3}).",
+     "El \\1 % de las últimas \\2 búsquedas DNS fallaron o no tuvieron "
+     "respuesta (servidores: {t3})."),
+    (r"The typical DNS answer took (\d+) ms over the last (\d+) lookups "
+     r"\((.+)\)\.",
+     "La réponse DNS typique a pris \\1 ms sur les \\2 dernières "
+     "recherches ({t3}).",
+     "La respuesta DNS típica tardó \\1 ms en las últimas \\2 búsquedas "
+     "({t3})."),
+    (r"Lookups went to: (.+)\.", r"Recherches envoyées à : \1.",
+     r"Las búsquedas fueron a: \1."),
+    (r"It opened a connection to (.+?) on port (\d+) \((.+)\), which it "
+     r"had never used before\.",
+     "Il a ouvert une connexion vers {t1} sur le port \\2 ({t3}), qu'il "
+     "n'avait jamais utilisé.",
+     "Abrió una conexión con {t1} en el puerto \\2 ({t3}), que nunca "
+     "había usado."),
+    (r"It opened a connection to (.+?) on port (\d+), which it had never "
+     r"used before\.",
+     "Il a ouvert une connexion vers {t1} sur le port \\2, qu'il n'avait "
+     "jamais utilisé.",
+     "Abrió una conexión con {t1} en el puerto \\2, que nunca había "
+     "usado."),
+    (r"New: port (\d+) \((.+)\)", "Nouveau : port \\1 ({t2})",
+     "Nuevo: puerto \\1 ({t2})"),
+    (r"New: port (\d+)", r"Nouveau : port \1", r"Nuevo: puerto \1"),
+    (r"A device I already knew began announcing a new network service: "
+     r"(.+?)\. (.+)",
+     "Un appareil que je connaissais déjà a commencé à annoncer un "
+     "nouveau service réseau : \\1. {t2}",
+     "Un dispositivo que ya conocía empezó a anunciar un nuevo servicio "
+     "de red: \\1. {t2}"),
+    (r"A device I already knew began announcing a new network service: "
+     r"(.+)\.",
+     r"Un appareil que je connaissais déjà a commencé à annoncer un "
+     r"nouveau service réseau : \1.",
+     r"Un dispositivo que ya conocía empezó a anunciar un nuevo servicio "
+     r"de red: \1."),
+    (r"Unencrypted (\S+) traffic with (.+) was observed\.",
+     r"Du trafic \1 non chiffré avec \2 a été observé.",
+     r"Se observó tráfico \1 sin cifrar con \2."),
+    (r"It accepted an? (.+) connection \(port (\d+)\) from (\S+)\.",
+     "Il a accepté une connexion {t1} (port \\2) depuis \\3.",
+     "Aceptó una conexión {t1} (puerto \\2) desde \\3."),
+    (r"It advertises the remote-access service “(.+)” over (.+)\.",
+     r"Il annonce le service d'accès à distance « \1 » via \2.",
+     r"Anuncia el servicio de acceso remoto «\1» mediante \2."),
+    (r"Your router forwards Internet port (\d+) to it \(UPnP\)\.",
+     r"Votre box lui redirige le port Internet \1 (UPnP).",
+     r"Su router le reenvía el puerto de Internet \1 (UPnP)."),
+    (r"It is reachable from (.+)\. Seen in this computer's own connection "
+     r"table\.",
+     "Il est joignable depuis {t1}. Vu dans la table des connexions de "
+     "cet ordinateur.",
+     "Es accesible desde {t1}. Visto en la tabla de conexiones de este "
+     "equipo."),
+    (r"This computer has (\S+) → (\S+), but on the network (\S+) answers "
+     r"from (.+)\.",
+     r"Cet ordinateur associe \1 → \2, mais sur le réseau \3 répond "
+     r"depuis \4.",
+     r"Este equipo tiene \1 → \2, pero en la red \3 responde desde \4."),
+    (r"It connected to (\S+), located in (.+) \(per the lookup database\), "
+     r"after its usual destinations were learned\.",
+     r"Il s'est connecté à \1 (pays : \2, d'après la base de "
+     r"localisation), après l'apprentissage de ses destinations "
+     r"habituelles.",
+     r"Se conectó a \1 (país: \2, según la base de datos de ubicación), "
+     r"después de aprender sus destinos habituales."),
+    (r"About (\d+) broadcast/multicast packets per second, mostly from "
+     r"(.+)\.",
+     r"Environ \1 paquets de diffusion (broadcast/multicast) par seconde, "
+     r"surtout de \2.",
+     r"Unos \1 paquetes de difusión (broadcast/multicast) por segundo, "
+     r"sobre todo de \2."),
+    (r"Answers as DHCP server (\S+) came from MAC (\S+) and from MAC "
+     r"(\S+)\. MAC \3 gives (\S+) as the router and (.+?) for name "
+     r"lookups; MAC \2 gives (\S+) and (.+?)\.((?: .+)?)",
+     "Des réponses en tant que serveur DHCP \\1 sont venues de la MAC \\2 "
+     "et de la MAC \\3. La MAC \\3 donne {t4} comme routeur et {t5} pour "
+     "les recherches de noms ; la MAC \\2 donne {t6} et {t7}.{t8}",
+     "Llegaron respuestas como servidor DHCP \\1 de la MAC \\2 y de la "
+     "MAC \\3. La MAC \\3 da {t4} como router y {t5} para las búsquedas "
+     "de nombres; la MAC \\2 da {t6} y {t7}.{t8}"),
+    (r"MAC (\S+) is your router's\.", r"La MAC \1 est celle de votre box.",
+     r"La MAC \1 es la de su router."),
+    (r"Second MAC: (\S+)", r"Seconde MAC : \1", r"Segunda MAC: \1"),
+    (r"About (\d+) broadcast/multicast packets per second\.",
+     r"Environ \1 paquets de diffusion (broadcast/multicast) par seconde.",
+     r"Unos \1 paquetes de difusión (broadcast/multicast) por segundo."),
+]
+EVENT_PATTERNS[:0] = _A4_EVENT
+I18N_PATTERNS[:0] = _A4_EVENT + _A4_TEXT
 I18N_PATTERNS.sort(key=lambda x: 0 if x[0].startswith(
     ("Online now", r"Offline since (\d\d")) else 1)
 _I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
@@ -45053,7 +45596,6 @@ class AlertsTab(BaseTab):
         return [translate_text(f"{icons.get(sev, '')} {sev}", loc)
                 for loc in I18N_LOCALES
                 for sev in ("INFO", "WARNING", "DANGER")]
-
 
     def explain_row(self, aid):
         a = self.model.alerts.alerts.get(aid)
@@ -77650,6 +78192,297 @@ def t_a3_rogue_dhcp_seen_first(ctx):
         assert m.infer_gateway() == sb.GW[0], m.infer_gateway()
     got = a2_kinds(m, "dhcp_anomaly")
     assert got and got[-1].severity == "DANGER", got
+
+
+# ---- fourth and fifth audits: alerts ------------------------------------------
+def a4_dhcp_reply(sb, src, mac, server_id, client, router, dns):
+    """A DHCP ACK from `src`/`mac` that gives `server_id` as the server."""
+    chaddr = bytes.fromhex(client[1].replace(":", "")) + b"\x00" * 10
+    sb._emit(PK.Ether(src=mac, dst=client[1]) /
+             PK.IP(src=src, dst=client[0]) / PK.UDP(sport=67, dport=68) /
+             PK.BOOTP(op=2, yiaddr=client[0], chaddr=chaddr) /
+             PK.DHCP(options=[("message-type", "ack"),
+                              ("server_id", server_id),
+                              ("lease_time", 3600), ("router", router),
+                              ("name_server", dns), "end"]))
+
+
+@self_test()
+def t_a4_rogue_dhcp_on_router_ip(ctx):
+    """Fourth audit: a rogue DHCP server that answers with your router's
+    address as the server (its own MAC, from the router's address or from
+    its own) raised nothing, and its router became the gateway of a file.
+    It is now DANGER and names the MAC; the gateway stays the real router.
+    Two relays of one server that give the same settings raise nothing."""
+    S = ScenarioBuilder
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    for src in (S.GW[0], rogue):                      # r4, r4b
+        sb = S(t0=SCENARIO_T0)
+        sb.home_network()
+        for _ in range(6):
+            a4_dhcp_reply(sb, src, rmac, S.GW[0], S.PHONE, rogue, rogue)
+        sb.tls(S.PHONE, "www.example.com", "93.184.215.14")
+        m = a2_model(ctx, sb.frames)                  # live: router known
+        got = a2_kinds(m, "dhcp_anomaly")
+        assert len(got) == 1 and got[0].severity == "DANGER", \
+            (src, [(a.severity, a.reason) for a in got])
+        a = got[0]
+        assert a.reason == f"A device answers DHCP in your router's " \
+                           f"name: MAC {rmac}", a.reason
+        assert f"MAC {S.GW[1]} is your router's." in a.observed, a.observed
+        assert m.infer_gateway() == S.GW[0], m.infer_gateway()
+        assert m.dhcp_trusted() == (S.GW[0], S.GW[0]), m.dhcp_trusted()
+        for loc in ("fr", "es"):
+            for text in (a.reason, a.observed, a.interpretation,
+                         a.possible_explanations, a.why) + tuple(
+                             a.evidence[:2]):
+                assert translate_text(text, loc) != text, (loc, text)
+    # a capture file: no gateway known; the rogue is heard first and names
+    # itself as the router; the Internet traffic goes through the router
+    sb = S(t0=SCENARIO_T0)
+    a4_dhcp_reply(sb, S.GW[0], rmac, S.GW[0], S.PHONE, rogue, rogue)
+    sb.home_network()
+    for _ in range(3):
+        sb.tls(S.PHONE, "www.example.com", "93.184.215.14")
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    assert m.infer_gateway() == S.GW[0], m.infer_gateway()
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert len(got) == 1 and got[0].severity == "DANGER", got
+    assert rmac in got[0].reason and got[0].refs.get("sure"), \
+        (got[0].reason, got[0].refs)
+    # two relays of one server, same settings: nothing
+    sb = S(t0=SCENARIO_T0)
+    sb.home_network()
+    for _ in range(3):
+        a4_dhcp_reply(sb, "192.168.1.2", "02:77:00:00:00:02", S.GW[0],
+                      S.PHONE, S.GW[0], S.GW[0])
+    m = a2_model(ctx, sb.frames)
+    assert not a2_kinds(m, "dhcp_anomaly"), a2_kinds(m, "dhcp_anomaly")
+    assert m.dhcp_impostor() is None
+
+
+@self_test()
+def t_a5_rogue_dhcp_first_in_file(ctx):
+    """Fifth audit: in a capture FILE (no default route), a rogue DHCP
+    server heard before the real router still became the gateway, and
+    the alert accused the real router ("The usual one, 192.168.1.99").
+    The router the Internet traffic goes through decides now, and the
+    open alert is said again with the right roles."""
+    S = ScenarioBuilder
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = S(t0=SCENARIO_T0)
+    a2_dhcp_ack(sb, rogue, rmac, S.PHONE, rogue, rogue)
+    sb.home_network()
+    for _ in range(20):
+        sb.tls(S.PHONE, "www.example.com", "93.184.215.14", size=3000)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    assert m.infer_gateway() == S.GW[0], m.infer_gateway()
+    assert m.dhcp_trusted() == (S.GW[0], S.GW[0]), m.dhcp_trusted()
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert got and got[-1].severity == "DANGER", got
+    a = got[-1]
+    assert a.reason.endswith(rogue) and \
+        f"The usual one, {S.GW[0]}, gives {S.GW[0]}" in a.observed and \
+        a.refs.get("remote") == rogue, (a.reason, a.observed)
+
+
+@self_test()
+def t_a4_backup_name_from_dns_only(ctx):
+    """Fourth audit: a server that puts "p42-content.icloud-content.com"
+    in its TLS hello (the name never came from a DNS answer) made a 30 MB
+    upload at 3 am an iCloud backup (INFO, not Unusual). It is a "Large
+    upload at night" warning now; the same name from a DNS answer is
+    still said as a backup."""
+    rip = "45.9.40.77"
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.tls(sb.PHONE, "p42-content.icloud-content.com", rip, size=3000)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, sb.PHONE, rip, 30 * 1024 * 1024, 12)
+    m = a2_model(ctx, sb.frames)
+    assert "p42-content.icloud-content.com" in m.ip_to_domains.get(rip, ())
+    got = a2_kinds(m, "night_upload")
+    assert len(got) == 1 and got[0].severity == "WARNING" and \
+        not got[0].refs.get("explained"), \
+        [(a.severity, a.reason) for a in got]
+    assert "night_upload" in [f["kind"] for f in unusual_findings(m.alerts)]
+    # a DNS answer for the name makes it the server's name
+    m.register_website("p42-content.icloud-content.com", rip, None, "DNS")
+    assert m.dns_names(rip) == ["p42-content.icloud-content.com"]
+
+
+@self_test()
+def t_a4_check_ins_gadgets_and_cdn(ctx):
+    """Fourth/fifth audit: a smart plug that checks in with the server it
+    looked up every 60 s, and a TV polling a CDN host every 60 s ± 40 %,
+    were WARNINGs under Unusual activity: they are INFOs now, out of
+    Unusual activity. The same jittered timer to a server that is not a
+    CDN, and a gadget's timer to an address it never looked up, still
+    warn."""
+    rng = random.Random(11)
+    S = ScenarioBuilder
+    sb = S(t0=SCENARIO_T0)
+    sb.home_network()
+    plug_srv, cdn_srv, c2, bare = ("52.28.10.1", "23.50.1.9",
+                                    "185.199.110.77", "185.199.110.78")
+    sb.dns(S.PLUG, "devs.plugcloud-example.com", plug_srv)
+    sb.dns(S.TV, "tv-assets.akamaized.net", cdn_srv)
+    sb.dns(S.PHONE, "updates.example-app.net", c2)
+    t = sb.t
+    for i in range(120):
+        sb.t = t + 60 * i + rng.uniform(-1, 1)
+        a2_syn(sb, S.PLUG, plug_srv)
+        sb.t = t + 60 * i + 7 + rng.uniform(-1, 1)
+        a2_syn(sb, S.NAS, bare)
+    for host, srv in ((S.TV, cdn_srv), (S.PHONE, c2)):
+        sb.t = t
+        for _ in range(120):
+            sb.t += 60 * rng.uniform(0.6, 1.4)
+            a2_syn(sb, host, srv)
+    sb.frames.sort(key=lambda f: f[1])
+    m = a2_model(ctx, sb.frames)
+    plug, tv = m.device_for(S.PLUG[0]), m.device_for(S.TV[0])
+    phone, nas = m.device_for(S.PHONE[0]), m.device_for(S.NAS[0])
+    assert plug.device_class in BEACON_GADGETS and \
+        tv.device_class in BEACON_GADGETS, (plug.device_class,
+                                            tv.device_class)
+    by = {a.device_key: a for a in a2_kinds(m, "beacon")}
+    assert by.get(plug.key) is not None and \
+        by[plug.key].severity == "INFO", by.get(plug.key)
+    assert by.get(tv.key) is not None and by[tv.key].severity == "INFO" \
+        and by[tv.key].refs.get("explained") == "cdn", by.get(tv.key)
+    assert by.get(phone.key) is not None and \
+        by[phone.key].severity == "WARNING", by.get(phone.key)
+    nas.device_class = "Smart-home/IoT"        # a gadget, no name looked up
+    assert by.get(nas.key) is not None and \
+        by[nas.key].severity == "WARNING", by.get(nas.key)
+    un = {f["device"] for f in unusual_findings(m.alerts)
+          if f["kind"] == "beacon"}
+    assert phone.key in un and plug.key not in un and tv.key not in un, un
+    for a in (by[plug.key], by[tv.key]):
+        for loc in ("fr", "es"):
+            for text in (a.reason, a.observed, a.interpretation,
+                         a.possible_explanations, a.why):
+                assert translate_text(text, loc) != text, (loc, text)
+
+
+@self_test()
+def t_a4_load_balancer_names_not_tunnel(ctx):
+    """Fourth audit: many different AWS load-balancer names
+    (….elb.amazonaws.com, long random labels) raised "Data hidden in name
+    lookups"; their answers come from AWS's own name servers, so nothing
+    can be carried out. A tunnel domain is still caught."""
+    rng = random.Random(5)
+    abc = "abcdefghijklmnopqrstuvwxyz0123456789"
+    w = DnsTunnelWatch()
+    hits = []
+    for i in range(80):
+        lab = "".join(rng.choice(abc) for _ in range(32))
+        hits.append(w.note("dev", f"k8s-default-{lab}-{1000000 + i}."
+                           f"us-east-1.elb.amazonaws.com", 1, 100.0 + i))
+        hits.append(w.note("dev", f"{lab}.t.tunnel-example.net", 16,
+                           100.0 + i))
+    found = [h for h in hits if h]
+    assert found and all(h[0] == "tunnel-example.net" for h in found), \
+        {h[0] for h in found}
+
+
+@self_test()
+def t_a4_alert_sentences_fr_es(ctx):
+    """Fourth audit (#40): alert sentences that stayed English in French
+    and Spanish (ARP spoofing, DHCP, duplicate address, FTP/POP3/IMAP/
+    TELNET without encryption, "why it was flagged", "What to check" …)
+    are translated, and the ARP spoofing evidence says the time of day,
+    not a raw epoch."""
+    E = AlertEngine(ctx.cfg({}))
+    dev = DeviceRecord(key="aa:bb:cc:dd:ee:01", ip="192.168.1.20",
+                       mac="aa:bb:cc:dd:ee:01")
+    dev.alias = "Kitchen tablet"
+    k = dev.key
+    made = [
+        E.gateway_change("192.168.1.1", 2), E.duplicate_ip("192.168.1.30", 2),
+        E.dhcp_anomaly({"192.168.1.1", "192.168.1.99"}),
+        E.rogue_ra("aa:bb:cc:00:00:01", "Kitchen tablet", ["2001:db8::/64"],
+                   ["aa:bb:cc:00:00:01"]),
+        E.arp_spoof("192.168.1.1", 2, 6, True),
+        E.arp_spoof("192.168.1.31", 2, 1, False, together=2),
+        E.arp_spoof("192.168.1.32", 2, 1, False, together=2, twin=(
+            "aa:00:00:00:00:01", "aa:00:00:00:00:02", "192.168.1.33")),
+        E.chatty_device(dev), E.unknown_device(dev),
+        E.reconnect_cycle(dev, 5, 600),
+        E.dns_server_change("Kitchen tablet", k, "192.168.1.1", "8.8.8.8"),
+        E.dns_failures(0.4, 50, []), E.dns_slow(400, 50, ""),
+        E.dns_multi({"1.1.1.1", "8.8.8.8", "9.9.9.9", "192.168.1.1"}),
+        E.unusual_service(dev, 22, "203.0.113.5", [443]),
+        E.new_service(dev, "_airplay._tcp"),
+        E.remote_access("Kitchen tablet", k, "SSH", "It accepted a Remote "
+                        "terminal (SSH) connection (port 22) from "
+                        "192.168.1.5."),
+        E.remote_access("Kitchen tablet", k + "2", "_ssh._tcp", "It "
+                        "advertises the remote-access service “_ssh._tcp” "
+                        "over mDNS."),
+        E.remote_access("Kitchen tablet", k + "3", "VNC", "Your router "
+                        "forwards Internet port 5900 to it (UPnP)."),
+        E.new_listener(k, "python3", "TCP", 8000, "the network"),
+        E.arp_cache_mismatch("192.168.1.1", "aa:00:00:00:00:01",
+                             {"aa:00:00:00:00:02"}, True),
+        E.arp_cache_mismatch("192.168.1.7", "aa:00:00:00:00:01",
+                             {"aa:00:00:00:00:02"}, False),
+        E.new_country(dev, "France", "203.0.113.5"),
+        E.broadcast_storm(500, "Kitchen tablet"),
+    ] + [E.cleartext("Kitchen tablet", k + p, p, "203.0.113.5", True)
+         for p in ("FTP", "POP3", "IMAP", "TELNET")]
+    E._debounce.clear()
+    made.append(E.broadcast_storm(9, ""))
+    assert all(made), [i for i, a in enumerate(made) if a is None]
+    texts = [(a.kind, x) for a in made for x in
+             [a.reason, a.observed, a.interpretation,
+              a.possible_explanations, a.why] + list(a.evidence) if x]
+    texts += [(kd, why) for kd, (_c, why) in ALERT_META.items()]
+    # the fixed text of every alert: its type, what it usually means and
+    # what to check (most "What to check" steps were English)
+    texts += [(kd, t[0]) for kd, t in ALERT_TYPES.items()]
+    texts += [(kd, x) for kd, x in ALERT_MEANS.items()]
+    texts += [(kd, x) for kd, xs in ALERT_CHECKLIST.items() for x in xs]
+    texts += [("arp_spoof", "03:12:40: 192.168.1.1 claimed by "
+                            "aa:00:00:00:00:01"),
+              ("arp_spoof", "also both answering for 192.168.1.33")]
+    english = re.compile(r"\b(?:the|was|has|address|answering|keeps|"
+                         r"switching|traffic|observed|with|from)\b")
+    was = CURRENT_LOCALE
+    try:
+        for loc in ("fr", "es"):
+            set_locale(loc)
+            for kind, x in texts:
+                got = translate_text(x, loc)
+                ev = translate_event(x)
+                assert got != x or ev != x, (loc, kind, x)
+                best = got if got != x else ev
+                left = english.findall(re.sub(r"Kitchen tablet", "", best))
+                assert not left, (loc, kind, best)
+    finally:
+        set_locale(was)
+    # the evidence of an ARP fight carries the time of day
+    gw, ips, macs, nets = scenario_identity()
+    clock = [SCENARIO_T0]
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs, now_fn=lambda: clock[0])
+    m.set_identity(local_nets=nets)
+    for i in range(12):
+        clock[0] = SCENARIO_T0 + i
+        m._observe_arp(gw, ("00:1e:58:aa:00:01", "02:66:66:66:66:66")[i % 2],
+                       clock[0])
+    sp = a2_kinds(m, "arp_spoof")
+    assert sp and sp[0].evidence, sp
+    assert all(re.match(r"\d\d:\d\d:\d\d: ", e)
+               for e in sp[0].evidence if "claimed by" in e), sp[0].evidence
 
 
 @self_test()
