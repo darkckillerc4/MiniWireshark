@@ -98638,14 +98638,21 @@ def gt_kbd_tables(app, ctx):
                     (name, tree.selection(), last)
                 tree.event_generate("<Home>")
                 _gui_pump(root, 0.05)
-                assert tree.selection() == (kids[0],), (name,
+                # (a live table may re-sort between two keys: compare with
+                # the rows as they are now, not with the first look)
+                rows = tree_visible_rows(tree)
+                assert tree.selection() == (rows[0],), (name,
                                                         tree.selection())
                 tree.event_generate("<Control-End>")
                 _gui_pump(root, 0.05)
-                assert tree.selection() == (last,)
+                rows = tree_visible_rows(tree)
+                assert tree.selection() == (rows[-1],), (name,
+                                                         tree.selection())
                 tree.event_generate("<Control-Home>")
                 _gui_pump(root, 0.05)
-                assert tree.selection() == (kids[0],)
+                rows = tree_visible_rows(tree)
+                assert tree.selection() == (rows[0],), (name,
+                                                        tree.selection())
                 # Ctrl+A: every row where the table allows several
                 tree.event_generate("<Control-a>")
                 _gui_pump(root, 0.05)
