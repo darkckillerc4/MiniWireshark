@@ -24572,6 +24572,9 @@ class NetworkModel:
     OBS_RECENT_KEEP = 4000        # newest observations (sessions keep 3,000)
     DEVICE_SITES_KEEP = 500       # websites listed on one device
     DEVICE_REMOTES_KEEP = 500     # remote addresses listed on one device
+    # round 5 (memory): and in all, over every device (_cap_device_lists)
+    DEVICE_SITES_TOTAL = 100000
+    DEVICE_REMOTES_TOTAL = 100000
     HTTP_HOSTS_KEEP = 2000        # websites reached over plain HTTP
     VPN_PEERS_KEEP = 1000         # addresses seen on a VPN port
     DOH_CLIENTS_KEEP = 512        # addresses that used encrypted DNS
@@ -26927,6 +26930,7 @@ class NetworkModel:
             pass
         self.dns.expire(now)
         self.forget_aged(now)
+        self._cap_device_lists()
         yield "expiry"
         self._check_dns(now)
         self._check_broadcast(now)
@@ -26979,6 +26983,36 @@ class NetworkModel:
             self.dirty_devices.add(key)
         self.registry.events = []
         self._announce_created()
+
+    def _cap_device_lists(self):
+        """Round 5 (memory): each device lists at most DEVICE_SITES_KEEP
+        websites and DEVICE_REMOTES_KEEP remote addresses, but nothing held
+        the sum: 1,000 devices meeting new websites filled 500 of each a
+        device (a million texts, about 125 MB), and the harsh looped replay
+        grew in a straight line until they had. Past DEVICE_SITES_TOTAL (or
+        DEVICE_REMOTES_TOTAL) in all, the devices seen longest ago let go of
+        that list first, your labelled ones last, until a tenth is free.
+        -> the keys of the devices whose list was emptied."""
+        devs = self.registry.by_key.values()
+        gone = []
+        for attr, cap in (("websites", self.DEVICE_SITES_TOTAL),
+                          ("remote_ips", self.DEVICE_REMOTES_TOTAL)):
+            total = sum(len(getattr(d, attr)) for d in devs)
+            if total <= cap:
+                continue
+            goal = cap - cap // 10
+            labelled = self.registry.labelled
+            for d in sorted(devs, key=lambda d: (labelled(d), d.last_seen)):
+                lst = getattr(d, attr)
+                if not lst:
+                    continue
+                total -= len(lst)
+                lst.clear()
+                self.dirty_devices.add(d.key)
+                gone.append(d.key)
+                if total <= goal:
+                    break
+        return gone
 
     REMOTE_KEEP = 6 * 3600   # audit #4: remote hosts and their names
     REMOTE_MAX = 8000        # was 30,000, far above a home network's day
@@ -97459,6 +97493,8 @@ MEMORY_CAPS = (
     (NetworkModel, "BCAST_KEEP"),
     (NetworkModel, "DEVICE_SITES_KEEP"),
     (NetworkModel, "DEVICE_REMOTES_KEEP"), (NameCache, "MAX"),
+    (NetworkModel, "DEVICE_SITES_TOTAL"),
+    (NetworkModel, "DEVICE_REMOTES_TOTAL"),
     (AlertEngine, "DEBOUNCE_KEEP"),
     (AlertEngine, "KEEP"),
     (DnsTracker, "DOMAINS_KEEP"), (DnsTracker, "SERVERS_KEEP"),
@@ -97555,6 +97591,13 @@ def memory_census(m):
         "remote addresses of a device": (
             max((len(d.remote_ips) for d in reg.by_key.values()),
                 default=0), m.DEVICE_REMOTES_KEEP),
+        # round 5: and of all devices together
+        "websites of all devices": (sum(len(d.websites) for d in
+                                        reg.by_key.values()),
+                                    m.DEVICE_SITES_TOTAL),
+        "remote addresses of all devices": (
+            sum(len(d.remote_ips) for d in reg.by_key.values()),
+            m.DEVICE_REMOTES_TOTAL),
         "metric buckets": (max(sum(len(od) for od in ts.tiers.values())
                                for ts in m.metrics.series.values()),
                            sum(n for _r, n in METRIC_TIERS)),
@@ -97812,6 +97855,65 @@ def t_534_lan_tallies_capped(ctx):
     win = types.SimpleNamespace(MINIMIZED_KEEP=50, _rebuild_on_restore=False)
     MiniWireshark._trim_queues_minimized(win, m)
     assert not reg.rekeyed and win._rebuild_on_restore
+
+@self_test()
+def t_r5_device_lists_capped_in_all(ctx):
+    """Round 5 (memory): each device lists at most 500 websites and 500
+    remote addresses, but the sum over all devices had no cap, so in the
+    harsh looped replay (1,000 devices, new websites every loop) memory
+    grew in a straight line. Flooded through the capture path, the lists
+    of all devices together stay under their totals; past them the
+    devices seen longest ago let go first and your labelled ones last."""
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    cap = m.DEVICE_SITES_TOTAL = m.DEVICE_REMOTES_TOTAL = 400
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    hosts = [("192.168.1.%d" % (100 + i), "02:00:5e:20:00:%02x" % i, "")
+             for i in range(30)]
+    for h in hosts:
+        sb.arp_announce(h)
+    for j in range(40):
+        for i, h in enumerate(hosts):
+            k = j * 30 + i
+            name = "r5-%d.flood%d.example" % (k, k % 9)
+            rip = "34.%d.%d.%d" % (1 + k // 62500, k // 250 % 250,
+                                   1 + k % 250)
+            sb.dns(h, name, rip)
+            sb.tls(h, name, rip, size=200)
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    devs = [m.registry.by_key[h[1]] for h in hosts]
+    for attr in ("websites", "remote_ips"):
+        total = sum(len(getattr(d, attr)) for d in devs)
+        assert 0 < total <= cap, (attr, total)
+        # the device heard last still has its newest website
+        assert len(getattr(devs[-1], attr)) > 0, attr
+    assert "r5-1199.flood2.example" in devs[-1].websites
+    over = memory_over_caps(m)
+    assert "websites of all devices" not in over, over
+    assert "remote addresses of all devices" not in over, over
+    # which devices let go: the oldest unlabelled ones first
+    m.DEVICE_SITES_TOTAL = 900
+    reg = m.registry
+    t = SCENARIO_T0 + 5000
+    for key in list(reg.by_key):
+        reg.by_key[key].websites.clear()
+    four = []
+    for i, age in enumerate((0, 10, 20, -50)):
+        mac = "02:00:5e:21:00:%02x" % i
+        dev = DeviceRecord(key=mac, mac=mac, first_seen=t + age,
+                           last_seen=t + age, last_confirmed=t + age)
+        dev.websites.update("s%d-%d.example" % (i, n) for n in range(300))
+        reg.by_key[mac] = dev
+        four.append(dev)
+    four[3].alias = "Grandma's tablet"       # the oldest, but named
+    m.dirty_devices.clear()
+    gone = m._cap_device_lists()
+    assert gone == [four[0].key, four[1].key], gone
+    assert [len(d.websites) for d in four] == [0, 0, 300, 300]
+    assert set(gone) <= m.dirty_devices          # the table is redrawn
+    assert m._cap_device_lists() == []           # under the total now
 
 
 @self_test()
