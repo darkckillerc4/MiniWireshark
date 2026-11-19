@@ -34334,6 +34334,7 @@ def translate_cell(v):
     if not _CELL_WORDS:
         words = {"High", "Medium", "Low", "Unconfirmed", "Unknown",
                  "Private address", "Your router / gateway", "Active",
+                 "Your router",
                  "Idle", "Offline", "Expired", "Online", "Closing",
                  "Closed", "Open", "Encrypted", "Not encrypted", "INFO",
                  "WARNING", "DANGER", "New", "Acknowledged", "New (saved)",
@@ -35480,12 +35481,46 @@ def pack_while_set(widget, var, allowed=None, **pack):
     return sync
 
 
+def tree_cell_font():
+    """The font a table's cells are drawn in (the Treeview style's)."""
+    try:
+        spec = ttk.Style().lookup("Treeview", "font") or "TkDefaultFont"
+        if spec == "TkDefaultFont":
+            return tkfont.nametofont(spec)
+        return tkfont.Font(font=spec)
+    except (tk.TclError, RuntimeError):
+        return tkfont.nametofont("TkDefaultFont")
+
+
+def cell_texts_width(tree, col):
+    """The width the fixed texts set with fit_cell_texts need in `col`
+    (0 when none were set), measured in the cells' font as it is now."""
+    texts = (getattr(tree, "_mw_cell_texts", None) or {}).get(col)
+    if not texts:
+        return 0
+    font = tree_cell_font()
+    return max(text_width(font, t) for t in texts) + 16
+
+
+def fit_cell_texts(tree, col, texts):
+    """Fourth audit (UI): a column whose cells are a few fixed words (the
+    Alerts *Severity*: "⚠ AVERTISSEMENT" was cut to "AVERTISSEM") is
+    made wide enough for the longest of them, measured, and widened again
+    for a bigger text size (fit_heading)."""
+    store = getattr(tree, "_mw_cell_texts", None)
+    if store is None:
+        store = tree._mw_cell_texts = {}
+    store[col] = [t for t in texts if t]
+    fit_heading(tree, col)
+
+
 def fit_heading(tree, col):
     try:
         text = str(tree.heading(col, "text") or "")
-        if not text:
+        need = max(heading_width(text) + 20 if text else 0,
+                   cell_texts_width(tree, col))
+        if not need:
             return
-        need = heading_width(text) + 20
         if int(tree.column(col, "width")) < need:
             tree.column(col, width=need, minwidth=min(need, 60))
     except (tk.TclError, ValueError, TypeError, RuntimeError):
@@ -45006,7 +45041,19 @@ class AlertsTab(BaseTab):
             dot_col="reason", menu=self.menu_spec,
             all_keys=lambda: list(self.model.alerts.alerts),
             explain=self.explain_row)
+        # fourth audit (UI): French "⚠ AVERTISSEMENT" was cut to
+        # "AVERTISSEM"; the column fits the longest severity of every
+        # language, so a language change needs no new width
+        fit_cell_texts(self.tree, "sev", self.severity_texts())
         self.on_theme()
+
+    def severity_texts(self):
+        """Every Severity cell this table can show, in every language."""
+        icons = self.app.SEVERITY_ICON
+        return [translate_text(f"{icons.get(sev, '')} {sev}", loc)
+                for loc in I18N_LOCALES
+                for sev in ("INFO", "WARNING", "DANGER")]
+
 
     def explain_row(self, aid):
         a = self.model.alerts.alerts.get(aid)
@@ -45087,14 +45134,26 @@ class AlertsTab(BaseTab):
         if q:
             dev = self.model.registry.by_key.get(a.device_key)
             hay = " ".join([a.reason, a.kind, a.device_key,
-                            dev.display_name() if dev else ""]).lower()
+                            dev.display_name() if dev else "",
+                            self.related_name(dev) if dev else ""]).lower()
             if q not in hay:
                 return False
         return True
 
+    def related_name(self, dev):
+        """The *Related to* cell: the device's name, but "This computer"
+        and "Your router" for those two when they have no name of their
+        own, as the alert titles and the Timeline say (fourth audit: the
+        cell said "Device using a private Wi-Fi address" next to the
+        title "This computer offers remote access")."""
+        n = dev.display_name()
+        namer = getattr(self.model, "alert_device_name", None)
+        own = namer(dev) if namer is not None else n
+        return own if own in ("This computer", "Your router") else n
+
     def values(self, a):
         dev = self.model.registry.by_key.get(a.device_key)
-        who = dev.display_name() if dev else (a.device_key.replace(
+        who = self.related_name(dev) if dev else (a.device_key.replace(
             "ip:", "") or "—")
         icon = self.app.SEVERITY_ICON.get(a.severity, "")
         status = "Acknowledged" if a.acknowledged else "New"
@@ -77594,6 +77653,93 @@ def t_a3_rogue_dhcp_seen_first(ctx):
 
 
 @self_test()
+def t_a4_related_to_own_devices(ctx):
+    """Fourth audit (UI): the Alerts tab's *Related to* cell said "Device
+    using a private Wi-Fi address" for this computer (next to an alert
+    titled "This computer offers remote access") and for the router; it
+    says "This computer" and "Your router" now, as the Timeline does, in
+    French and Spanish too."""
+    m = NetworkModel(ctx.cfg({}), "192.168.50.1", ["192.168.50.10"],
+                     ["a6:3b:12:9e:44:10"])
+    m.set_identity(local_nets=[ipaddress.ip_network("192.168.50.0/24")])
+    reg = m.registry
+    me = DeviceRecord(key="a6:3b:12:9e:44:10", ip="192.168.50.10",
+                      mac="a6:3b:12:9e:44:10")
+    gw = DeviceRecord(key="a6:3b:12:9e:44:01", ip="192.168.50.1",
+                      mac="a6:3b:12:9e:44:01")
+    other = DeviceRecord(key="a6:3b:12:9e:44:77", ip="192.168.50.77",
+                         mac="a6:3b:12:9e:44:77")
+    for d in (me, gw, other):
+        d.randomized_mac = True
+        reg.by_key[d.key] = d
+    fake = types.SimpleNamespace(model=m, app=types.SimpleNamespace(
+        SEVERITY_ICON={}))
+    fake.related_name = lambda dev: AlertsTab.related_name(fake, dev)
+    label = "Device using a private Wi-Fi address"
+    want = {me.key: "This computer", gw.key: "Your router",
+            other.key: label}
+    for d in (me, gw, other):
+        a = m.alerts.remote_access(m.alert_device_name(d), d.key, "SSH",
+                                   "It accepted a Remote terminal (SSH) "
+                                   "connection (port 22) from 192.168.50.5.")
+        assert AlertsTab.values(fake, a)[3] == want[d.key], \
+            (d.ip, AlertsTab.values(fake, a)[3])
+    me.alias = "Study PC"
+    a = m.alerts.alerts[m.alerts._open[("remote_access", f"{me.key}|SSH")]]
+    assert AlertsTab.values(fake, a)[3] == "Study PC"
+    was = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        fr = [translate_cell(x) for x in ("This computer", "Your router")]
+        set_locale("es")
+        es = [translate_cell(x) for x in ("This computer", "Your router")]
+    finally:
+        set_locale(was)
+    assert fr == ["Cet ordinateur", "Votre box"], fr
+    assert es == ["Este equipo", "Su router"], es
+
+
+@self_test()
+def t_a4_cell_texts_keep_their_width(ctx):
+    """Fourth audit (UI): a column fitted to its cells' words keeps room
+    for the longest one at a bigger text size."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        root.deiconify()
+        root.geometry("900x200")
+        wrap, tree = make_tree(root, [
+            ("sev", "Severity", 60, "w", False),
+            ("what", "What happened", 400, "w", True),
+            ("who", "Related to", 200, "w", False)])
+        wrap.pack(fill="both", expand=True)
+        texts = ["⚠ AVERTISSEMENT", "‼ PELIGRO"]
+        fit_cell_texts(tree, "sev", texts)
+        font = tree_cell_font()
+
+        def fits():
+            return all(font.measure(t) + 12 <= int(tree.column("sev",
+                                                               "width"))
+                       for t in texts)
+        assert fits(), tree.column("sev", "width")
+        base = tkfont.nametofont("TkDefaultFont")
+        was = base.cget("size")
+        try:
+            base.configure(size=int(abs(was) * 1.6) * (1 if was > 0
+                                                         else -1))
+            _gui_pump(root, 0.2)
+            fit_tree_headings(tree)          # what a text size change does
+            font = tree_cell_font()
+            assert fits(), (tree.column("sev", "width"),
+                            font.measure(texts[0]))
+        finally:
+            base.configure(size=was)
+    finally:
+        root.destroy()
+
+
+@self_test()
 def t_a2_spoof_and_scan_words(ctx):
     """Second audit (#39): during ARP spoofing of the router (DANGER), the
     attacker's claim on a phone's address adds no "Duplicate IP address
@@ -103228,6 +103374,42 @@ def gt_a3_demo_once_and_french(app, ctx):
         app.stop_demo()
         _gui_pump(root, 0.3)
         _gt_back_to_scenario(app, ctx)
+
+
+@gui_test_step("fourth audit UI: the Alerts Severity column fits "
+               "AVERTISSEMENT in French, at every text size")
+def gt_a4_alert_severity_fits(app, ctx):
+    root = app.root
+    tab = app._select_tab("alerts")
+    tree = tab.tree
+    texts = tab.severity_texts()
+    assert any("AVERTISSEMENT" in t for t in texts) and \
+        any("PELIGRO" in t for t in texts), texts
+    try:
+        for lang in ("Français", "Español", "English"):
+            app.config.set("general.language", lang)
+            app._apply_runtime_settings()
+            for size in ("Normal", "Extra large"):
+                app.config.set("appearance.text_size", size)
+                app._apply_text_size(defer=False)
+                _gui_pump(root, 0.3)
+                app.finish_text_size()
+                tab.rebuild()
+                _gui_pump(root, 0.3)
+                font = tree_cell_font()
+                width = int(tree.column("sev", "width"))
+                cut = [t for t in texts if font.measure(t) + 12 > width]
+                assert not cut, (lang, size, width, cut)
+                shown = [str(tree.item(i, "values")[0])
+                         for i in tree.get_children()[:40]]
+                cut = [t for t in shown if font.measure(t) + 12 > width]
+                assert not cut, (lang, size, width, cut)
+    finally:
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        app.config.set("appearance.text_size", "Normal")
+        app._apply_text_size(defer=False)
+        _gui_pump(root, 0.3)
 
 
 @gui_test_step("third audit UI: Map lines stop at the names they cross")

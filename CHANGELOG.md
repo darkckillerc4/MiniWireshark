@@ -200,6 +200,8 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **A local page's title is its own.** The title inside the page's head is used, else the first one outside every picture (SVG), so a nested or self-closing SVG, a comment, a script or an empty title no longer gives the wrong title.
 - **A web form's other fields are not kept while a split password is awaited.** To catch a password split over packets, only the few bytes that may still become a password field's name (for example "&pass") wait for the next packet, at most 30 seconds; names, e-mail addresses and other values of the form are no longer held in memory.
 - **A single value you copy can't start a spreadsheet formula.** Copy domain, Copy name, Copy summary, Copy value and the other one-line copies now get the same guard as a copied row or CSV file. Text of several lines (a report) is copied as it is.
+- The Alerts tab's *Related to* column says "This computer" and "Your router" for those two when they have no name of their own, as the alert titles and the Timeline do. It said "Device using a private Wi-Fi address" next to an alert titled "This computer offers remote access".
+- The Alerts *Severity* column is measured to fit the longest severity word of every language at the current text size: French "AVERTISSEMENT" was cut to "AVERTISSEM".
 
 **Known limits**
 
