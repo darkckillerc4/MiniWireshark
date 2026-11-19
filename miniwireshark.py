@@ -10260,6 +10260,44 @@ def http_form_login(body):
     return ""
 
 
+# the field names _LOGIN_FIELD matches, spelled out (a self-test checks
+# that each one is matched)
+_LOGIN_FIELD_NAMES = (b"password", b"passwd", b"passwort", b"kennwort",
+                      b"pass", b"pwd", b"pw", b"userpass", b"user_pass",
+                      b"loginpassword", b"login_password", b"motdepasse",
+                      b"mot_de_passe", b"contrase%c3%b1a",
+                      b"contrase\xc3\xb1a", b"contrasena", b"senha")
+# what starts a password field: a form's (after & or a space), a
+# multipart part's name and a JSON key
+_LOGIN_MARKS = tuple(b + f + b"=" for f in _LOGIN_FIELD_NAMES
+                     for b in (b"&", b" ", b"\t", b"\r", b"\n", b"\x0b",
+                               b"\x0c")) + \
+    tuple(b'name="' + f + b'"' for f in _LOGIN_FIELD_NAMES)
+_LOGIN_FIRST_MARKS = tuple(f + b"=" for f in _LOGIN_FIELD_NAMES)
+_LOGIN_JSON_KEYS = tuple(b'"' + f + b'"' for f in _LOGIN_FIELD_NAMES)
+_LOGIN_JSON_REST = re.compile(rb'\s*(?::\s*"?)?')
+
+
+def login_form_tail(buf, whole=False):
+    """Fifth audit: the end of a form body worth keeping while its next
+    packet is awaited: only bytes that can still grow into the start of
+    a password field ("&pass", 'name="pass', '"password": "'), never a
+    value or another field. `whole`: buf starts at the body's start (a
+    field may start there without "&"). -> bytes, at most 64."""
+    lo = buf.lower()
+    for s in range(max(0, len(lo) - 64), len(lo)):
+        c = lo[s:]
+        if any(m.startswith(c) for m in _LOGIN_MARKS) or \
+                (whole and s == 0 and
+                 any(m.startswith(c) for m in _LOGIN_FIRST_MARKS)) or \
+                any(k.startswith(c) or (c.startswith(k) and
+                                        _LOGIN_JSON_REST.fullmatch(
+                                            c, len(k)))
+                    for k in _LOGIN_JSON_KEYS):
+            return buf[s:]
+    return b""
+
+
 def _login_in_packet(d, load):
     """Mark a decoded packet that carries a sign-in: d["login"] says how
     (never what), d["login_proto"] which protocol; d["form_post"] a web
@@ -26264,13 +26302,15 @@ class NetworkModel:
         Basic, a password in a web address and FTP/POP3/IMAP sign-ins on
         their usual ports fit in one packet). A form whose body comes in
         the next packet is looked at then. Only who, where and how are
-        kept in the alert; the packet's bytes are read here and dropped,
-        except the waiting form body below (memory only, at most 4096
-        bytes and 30 s each, 256 forms; CHANGELOG Known limits).
+        kept in the alert; the packet's bytes are read here and dropped.
         Third audit: a form body split over several packets is put back
         together (in order, up to the 4096 bytes http_form_login reads;
         a new request ends it) until a password field shows, so
-        "pass" + "word=..." in two packets is seen too."""
+        "pass" + "word=..." in two packets is seen too. Fifth audit: what
+        waits for the next packet (30 s at most, 256 forms) is only the
+        end that may still become a password field's start
+        (login_form_tail: "&pass"), never a value, plus how many bytes of
+        the body were read."""
         key4 = (d["src_ip"], d["sport"], d["dst_ip"], d["dport"])
         how, proto = d.get("login") or "", d.get("login_proto") or "HTTP"
         fw = self._form_wait   # OrderedDict, oldest first: forget after 30 s
@@ -26280,8 +26320,9 @@ class NetworkModel:
             post = d.get("form_post")
             if not post and key4 not in fw:
                 return None
-            old = fw.pop(key4, (0, b""))[1]   # a new POST drops the old body
-            buf = b"" if post else old
+            # a new POST drops the old body
+            _t, tail, seen = fw.pop(key4, (0, b"", 0))
+            tail, seen = (b"", 0) if post else (tail, seen)
             n = d.get("payload_len") or 0
             raw = d.get("raw") or b""
             if not raw and d.get("pkt") is not None:
@@ -26295,12 +26336,19 @@ class NetworkModel:
             elif load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
                               b"OPTI", b"PATC"):
                 return None                        # the next request
-            buf = (buf + load)[:4096]
-            how = http_form_login(buf)
+            load = load[:max(0, 4096 - seen)]  # the body's first 4096 bytes
+            whole = len(tail) == seen          # tail is the body so far
+            buf = tail + load
+            # not at the body's start: a field can't start at byte 0 (the
+            # byte before it was a value's), so "^" must not match there
+            how = http_form_login(buf if whole else b"\0" + buf)
             if not how:
-                if len(buf) < 4096:
-                    self._bounded_put(self._form_wait, key4,
-                                      (d["time"], buf), 256)
+                seen += len(load)
+                if seen < 4096:
+                    # fifth audit: only what may still become a password
+                    # field's start is kept, never the body itself
+                    self._bounded_put(self._form_wait, key4, (
+                        d["time"], login_form_tail(buf, whole), seen), 256)
                 return None
         return self.deep_login({"client": d["src_ip"],
                                 "server": d["dst_ip"], "port": d["dport"],
@@ -37406,6 +37454,39 @@ def person_ids():
     return uid, gid, name, home
 
 
+def _login_uid():
+    """The user whose login session started this process (Linux:
+    /proc/self/loginuid, kept through su and gksu), or None when it is
+    unset (4294967295), root's own (0) or can't be read."""
+    try:
+        with open("/proc/self/loginuid", encoding="ascii") as f:
+            uid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return uid if 0 < uid < 4294967295 else None
+
+
+def opener_ids():
+    """(uid, gid, user name, home) of the person a browser or file
+    manager is opened as: person_ids(), else, for a root copy that sudo
+    or pkexec didn't start (su, gksu, a root login), the user of the
+    login session it was started from (fifth audit), when that isn't
+    root. None: open as this process (not root, or a real root login)."""
+    ids = person_ids()
+    if ids is not None or IS_WINDOWS or os.geteuid() != 0 or \
+            _invoking_uid() is not None:
+        return ids
+    uid = _login_uid()
+    if uid is None:
+        return None
+    try:
+        import pwd
+        pw = pwd.getpwuid(uid)
+    except (ImportError, KeyError):
+        return None
+    return uid, pw.pw_gid, pw.pw_name, pw.pw_dir
+
+
 def start_for_person(cmd, **kw):
     """Second audit (security #4): start a program for the person (their
     browser, file manager or editor) as that person, never as root. A
@@ -37413,7 +37494,7 @@ def start_for_person(cmd, **kw):
     root, so a page from any local server ran in a root browser.
     -> the Popen."""
     env = env_for_outside(kw.pop("env", None))
-    ids = person_ids()
+    ids = opener_ids()
     if ids is None:
         return subprocess.Popen(cmd, env=env, **kw)
     uid, gid, name, home = ids
@@ -37440,7 +37521,7 @@ def open_in_browser(url, feature, dest, detail=""):
     (raises OutboundBlocked while the kill switch is on). A root copy
     opens it as the person (start_for_person). -> True when asked."""
     outbound(feature, "browser", dest, detail)
-    if person_ids() is not None:
+    if opener_ids() is not None:
         start_for_person(["open" if IS_MAC else "xdg-open", url],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
@@ -44541,7 +44622,7 @@ class LocalServicesView:
                 "Demo Mode: this service is made up, so nothing is "
                 "opened."), "info")
             return False
-        if is_admin() and person_ids() is None:
+        if is_admin() and opener_ids() is None:
             # third audit #3: administrator with nobody to open it as (a
             # root login, an elevated Windows copy): never a root browser
             self.app._set_banner(
@@ -77693,12 +77774,16 @@ def t_a2_login_in_default_mode(ctx):
                 "dport": k4[3], "form_post": post, "payload_len": len(raw),
                 "raw": raw, "time": t}
     m._observe_login(form(100.0, b"user=alex&pass", True))
-    assert m._form_wait[k4][1] == b"user=alex&pass", m._form_wait
+    # fifth audit: only the start of the password field waits, never the
+    # rest of the body (no "user", no "alex")
+    assert m._form_wait[k4][1] == b"&pass", m._form_wait
     assert m._observe_login(form(131.0, b"word=" + c, False)) is None
     assert k4 not in m._form_wait, m._form_wait
     m._observe_login(form(200.0, b"user=alex&pass", True))
     m._observe_login(form(201.0, b"user=bob&rem", True))
-    assert m._form_wait[k4][1] == b"user=bob&rem", m._form_wait
+    # the new POST replaced the old body: its own end, which can't become
+    # a password field, so nothing of it is kept
+    assert m._form_wait[k4][1:] == (b"", 12), m._form_wait
     m._observe_login(form(202.0, b"user=alex&password=" + c, True))
     assert k4 not in m._form_wait, m._form_wait
     for raw, ts, lt in sb.frames:
@@ -87470,6 +87555,132 @@ def t_a4_local_probe_skips_by_program(ctx):
             assert not local_probe_wanted("TCP", r["port"], r["program"],
                                           r["what"], r["web"]), r
     assert not local_probe_wanted("UDP", 5173, "node", LOCAL_DEV_WEB, True)
+
+
+@self_test()
+def t_a5_browser_as_login_person(ctx):
+    """Fifth audit: a root copy started without sudo or pkexec (su, gksu)
+    opened the browser and the file manager as root. They now open as
+    the user of the login session it was started from
+    (/proc/self/loginuid); with none (a real root login, or unset) as
+    before. Its data folder and whose files it trusts don't change."""
+    if IS_WINDOWS:
+        return "skip"
+    import pwd
+    import webbrowser
+    try:
+        nobody = pwd.getpwuid(65534)
+    except KeyError:
+        return "skip"
+    reads = iter(["1000\n", "0\n", "4294967295\n", "x\n"])
+
+    def fake_open(path, *a, **k):
+        assert path == "/proc/self/loginuid", path
+        return io.StringIO(next(reads))
+    with _b9_patched(globals(), open=fake_open):
+        assert [_login_uid() for _ in range(4)] == [1000, None, None, None]
+    opened, started = [], []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            started.append((cmd, kw))
+    real = (subprocess.Popen, webbrowser.open, LEDGER.killed)
+    trusted = trusted_uids()
+    try:
+        subprocess.Popen = FakePopen
+        webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+        LEDGER.killed = False
+        with _b9_patched(os.environ, SUDO_UID=None, PKEXEC_UID=None), \
+                _b9_patched(os, geteuid=lambda: 0):
+            with _b9_patched(globals(), _login_uid=lambda: 65534):
+                assert person_ids() is None       # unchanged elsewhere
+                assert opener_ids() == (65534, nobody.pw_gid,
+                                        nobody.pw_name, nobody.pw_dir)
+                assert open_in_browser("http://127.0.0.1:5173/",
+                                       "local_open", "127.0.0.1:5173", "t")
+                assert _open_path(ctx.path("a5_folder"))
+            assert not opened, opened
+            assert len(started) == 2 and all(
+                callable(kw.get("preexec_fn")) and
+                kw["env"].get("HOME") == nobody.pw_dir
+                for _c, kw in started), started
+            started.clear()
+            with _b9_patched(globals(), _login_uid=lambda: None):
+                assert opener_ids() is None       # a real root login
+                assert open_in_browser("http://127.0.0.1:5173/",
+                                       "local_open", "127.0.0.1:5173", "t")
+            assert opened == ["http://127.0.0.1:5173/"] and not started
+            # sudo said who: that person, not the login session's
+            with _b9_patched(os.environ, SUDO_UID="65534",
+                             SUDO_GID="65534"), \
+                    _b9_patched(globals(), _login_uid=lambda: 1000):
+                assert opener_ids()[0] == 65534
+    finally:
+        subprocess.Popen, webbrowser.open, LEDGER.killed = real
+    assert trusted_uids() == trusted
+
+
+@self_test()
+def t_a5_split_form_keeps_no_values(ctx):
+    """Fifth audit: while a form's next packet was awaited, up to 4 KB of
+    any form body (names, e-mail addresses, messages) stayed in memory.
+    Now only the end that may still become a password field's start
+    waits ("&pass", 'name="pa', '"password": '); a split password is
+    still found across two or three packets, in a form, a multipart
+    part or JSON, and a field that only looks like one after a value is
+    not."""
+    for f in _LOGIN_FIELD_NAMES:                     # spelled out right
+        assert _LOGIN_FORM_RX.search(b"&" + f + b"=x"), f
+    gwip, ips, macs, _nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gwip, ips, macs)
+    c = IP013_CANARY.encode()
+    heads = {"form": b"application/x-www-form-urlencoded",
+             "part": b"multipart/form-data; boundary=zz",
+             "json": b"application/json"}
+    port = [47000]
+
+    def talk(kind, parts):
+        """-> (the alert or None, every buffer that waited)"""
+        port[0] += 1
+        # a new server each time (one alert for each client and server)
+        k4 = ("192.168.1.10", port[0], "93.184.215.%d" % (port[0] - 46900),
+              80)
+        head = (b"POST /in HTTP/1.1\r\nHost: x\r\nContent-Type: " +
+                heads[kind] + b"\r\n\r\n")
+        waited, got = [], None
+        for i, body in enumerate(parts):
+            raw = (head if i == 0 else b"") + body
+            got = m._observe_login({
+                "src_ip": k4[0], "sport": k4[1], "dst_ip": k4[2],
+                "dport": k4[3], "form_post": i == 0,
+                "payload_len": len(raw), "raw": raw, "time": 10.0 + i})
+            if k4 in m._form_wait:
+                waited.append(m._form_wait[k4][1])
+        return got, waited
+    secret = (b"alex", b"bob@example.com", b"hello there", c)
+    for kind, parts, found in (
+            ("form", [b"user=alex&pass", b"word=" + c], True),
+            ("form", [b"user=alex&pa", b"ss", b"word=" + c], True),
+            ("form", [b"user=alex&password", b"=", c], True),
+            ("form", [b"pass", b"word=" + c], True),     # the body's start
+            ("form", [b"mail=bob@example.com&msg=hello there&n",
+                      b"ote=1&pwd=" + c], True),
+            ("form", [b"msg=hello there", b"password=" + c], False),
+            ("form", [b"mail=bob@example.com&msg=hello there"], False),
+            ("part", [b'--zz\r\nContent-Disposition: form-data; name="u"'
+                      b'\r\n\r\nalex\r\n--zz\r\nContent-Disposition: '
+                      b'form-data; name="pass', b'word"\r\n\r\n' + c],
+             True),
+            ("json", [b'{"user": "alex", "password"', b': "' + c + b'"}'],
+             True),
+            ("json", [b'{"user": "alex", "password": "', c + b'"}'], True),
+            ("json", [b'{"msg": "hello there", "pass', b'": "' + c + b'"}'],
+             True)):
+        got, waited = talk(kind, parts)
+        assert (got is not None) == found, (parts, got)
+        for buf in waited:
+            assert len(buf) <= 24 and not any(
+                x in buf for x in secret), (parts, waited)
 
 
 @self_test()
