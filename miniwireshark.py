@@ -97855,6 +97855,31 @@ def t_534_lan_tallies_capped(ctx):
     win = types.SimpleNamespace(MINIMIZED_KEEP=50, _rebuild_on_restore=False)
     MiniWireshark._trim_queues_minimized(win, m)
     assert not reg.rekeyed and win._rebuild_on_restore
+    # round 5 (memory): the list of removed keys has the same cap, both
+    # where expired devices leave memory and where two devices merge
+    reg.removed = []
+    t = SCENARIO_T0 + 9500
+    old = []
+    for i in range(keep + 500):
+        mac = "da:5e:%02x:%02x:00:01" % (i >> 8, i & 255)
+        reg.by_key[mac] = DeviceRecord(
+            key=mac, mac=mac, state=STATE_EXPIRED, first_seen=t + i,
+            last_seen=t + i, last_confirmed=t + i)
+        old.append(mac)
+    assert len(reg.prune_expired(keep=0)) == keep + 500
+    assert 0 < len(reg.removed) <= keep, len(reg.removed)
+    assert reg.removed[-1] == old[-1], reg.removed[-1]   # newest kept
+    reg.removed = []
+    for i in range(keep + 500):
+        a, b = ("02:5f:%02x:%02x:00:%02x" % (i >> 8, i & 255, j)
+                for j in (1, 2))
+        for k in (a, b):
+            reg.by_key[k] = DeviceRecord(key=k, mac=k, first_seen=t,
+                                         last_seen=t, last_confirmed=t)
+        assert reg.merge(a, b) is not None
+    assert 0 < len(reg.removed) <= keep, len(reg.removed)
+    assert reg.removed[-1] == b, reg.removed[-1]
+
 
 @self_test()
 def t_r5_device_lists_capped_in_all(ctx):

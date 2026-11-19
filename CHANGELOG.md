@@ -55,7 +55,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **Memory levels off within a day.** Every list that could grow with time was checked:
   - Lists that had no limit now have one. They are web hosts, VPN servers, encrypted-DNS users, DNS servers, half-finished web and chat requests, and mail reconnects.
   - What the DNS tracker knew about a device now leaves with the device.
-  - The DHCP servers and routers offered, the router addresses that internet traffic goes through and the switches heard keep at most 64 each (the busiest or most recently heard stay). A device sending made-up ones could grow them without end. The lists of devices that changed their name in the list now have a limit too when the window is minimised or absent.
+  - The DHCP servers and routers offered, the router addresses that internet traffic goes through and the switches heard keep at most 64 each (the busiest or most recently heard stay). A device sending made-up ones could grow them without end. The lists of devices that changed their name in the list, or left it, now have a limit too when the window is minimised or absent (a test now floods both).
   - The lists of website and remote-host rows waiting to be redrawn are emptied at once past 16,000 (a burst could grow them for up to 5 seconds before).
   - The list of websites keeps at most 10,000 (it was 20,000).
   - The websites and remote addresses listed on each device (up to 500 of each) now also have a limit for all devices together: 100,000 of each. With 1,000 devices meeting new websites they filled to about 125 MB, and the harsh looped replay grew in a straight line until they had. Past the limit, the devices seen longest ago let go of these lists first, and devices you named last.
