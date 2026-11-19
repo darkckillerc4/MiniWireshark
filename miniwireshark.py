@@ -26647,7 +26647,74 @@ DEFAULT_SHORTCUTS = {
     "back": "<Alt-Left>", "forward": "<Alt-Right>", "explain": "<F1>",
     "group1": "<Control-Key-1>", "group2": "<Control-Key-2>",
     "group3": "<Control-Key-3>", "group4": "<Control-Key-4>",
+    # keyboard-only use: move between the window's regions (F6 is the
+    # Windows and Linux convention), jump to the table, the shortcut
+    # sheet, Beginner / Advanced, refresh, and the divider between the
+    # tabs and the Inspector. None is used by Tk's Entry / Text / Treeview.
+    "regions": "<F6>", "regions_back": "<Shift-F6>", "focus_table": "<F7>",
+    "shortcut_sheet": "<Shift-F1>", "mode_toggle": "<F8>",
+    "refresh": "<F5>", "pane_narrower": "<Control-Shift-Left>",
+    "pane_wider": "<Control-Shift-Right>",
 }
+
+# Keys the text boxes keep for themselves (Tk's Entry / Text bindings, and
+# the editing keys people expect there). The Settings window refuses to
+# give one of them to an action, and the self-test checks the defaults.
+# The older defaults (Ctrl+E, Ctrl+F, Ctrl+K, Ctrl+Z ...) were chosen
+# before this list; they stay, and each of them lets the box keep the key.
+RESERVED_EDIT_KEYS = tuple(
+    f"<Control-Key-{c}>" for c in "abdefhknptwyxcvzoi") + (
+    "<Control-Key-slash>", "<Control-Key-backslash>")
+RESERVED_PLAIN_KEYS = (
+    "<Tab>", "<Shift-Tab>", "<Control-Tab>", "<Control-Shift-Tab>",
+    "<Up>", "<Down>", "<Left>", "<Right>", "<Prior>", "<Next>", "<Home>",
+    "<End>", "<Return>", "<space>", "<Escape>", "<BackSpace>", "<Delete>",
+    "<Menu>", "<F10>", "<Shift-F10>", "<Shift-Left>", "<Shift-Right>",
+    "<Control-Left>", "<Control-Right>", "<Control-Home>", "<Control-End>",
+    "<Control-Shift-Home>", "<Control-Shift-End>")
+
+
+def _norm_seq(seq):
+    """"<Control-Key-1>" == "<Control-1>"; modifiers in one fixed order,
+    letters lower case, so two spellings of one key compare equal."""
+    parts = [p for p in (seq or "").strip().strip("<>").split("-") if p]
+    parts = [p for p in parts if p != "Key"]
+    if not parts:
+        return ""
+    key, mods = parts[-1], parts[:-1]
+    order = ("Control", "Alt", "Shift")
+    mods = [m for m in order if m in mods] + [m for m in mods
+                                              if m not in order]
+    if len(key) == 1 and key.isalpha() and "Shift" not in mods:
+        key = key.lower()
+    return "<" + "-".join(mods + [key]) + ">"
+
+
+def shortcut_reserved(name, seq):
+    """Why `seq` may not be given to the action `name`: a sentence, or ""
+    when it is free. The action's own default is always allowed."""
+    n = _norm_seq(seq)
+    if not n or n == _norm_seq(DEFAULT_SHORTCUTS.get(name, "")):
+        return ""
+    for r in RESERVED_EDIT_KEYS:
+        if n == _norm_seq(r):
+            return "Text boxes use that key (editing)."
+    for tok, label in fixed_key_tokens().items():
+        if n == tok:
+            return f"Already used by \u201c{label}\u201d."
+    for r in RESERVED_PLAIN_KEYS:
+        if n == _norm_seq(r):
+            return "That key is used to move around the window."
+    parts = n.strip("<>").split("-")
+    if "Control" in parts and "Alt" in parts:
+        return "Ctrl+Alt is used for typing letters on some keyboards."
+    if "Alt" in parts and len(parts[-1]) == 1:
+        return "Alt and a letter open the window's menus."
+    if not set(parts[:-1]) & {"Control", "Alt", "Meta"} and \
+            (len(parts[-1]) == 1 or parts[-1] in (
+                "slash", "period", "comma", "minus", "plus", "equal")):
+        return "A plain letter key types text."
+    return ""
 
 DEFAULT_FILTER_PRESETS = {
     "My phone": {"expr": "device:@mine-phone"},
@@ -32366,6 +32433,30 @@ Search everything for ¦ Tout rechercher pour ¦ Buscar en todo
 {n} of {m} – keep typing ¦ {n} sur {m} – continuez à taper ¦ {n} de {m} – siga escribiendo
 Type a packet number, for example :123 ¦ Saisissez un numéro de paquet, par exemple :123 ¦ Escriba un número de paquete, por ejemplo :123
 Type to search. Start with > commands, @ devices, # packet number, / filter, ? help. Tab changes the group. ¦ Tapez pour chercher. Commencez par > commandes, @ appareils, # numéro de paquet, / filtre, ? aide. Tab change de groupe. ¦ Escriba para buscar. Empiece con > comandos, @ dispositivos, # número de paquete, / filtro, ? ayuda. Tab cambia de grupo.
+# ---- keyboard-only navigation (F6 / F7 / F8, tab strip, dividers)
+Next part of the window ¦ Partie suivante de la fenêtre ¦ Siguiente parte de la ventana
+Previous part of the window ¦ Partie précédente de la fenêtre ¦ Parte anterior de la ventana
+Go to the table ¦ Aller au tableau ¦ Ir a la tabla
+Show the keyboard shortcuts ¦ Afficher les raccourcis clavier ¦ Mostrar los atajos de teclado
+Beginner / Advanced view ¦ Vue Débutant / Avancé ¦ Vista Principiante / Avanzada
+Refresh this tab ¦ Actualiser cet onglet ¦ Actualizar esta pestaña
+Move the divider left ¦ Déplacer la séparation vers la gauche ¦ Mover el divisor a la izquierda
+Move the divider right ¦ Déplacer la séparation vers la droite ¦ Mover el divisor a la derecha
+Text boxes use that key (editing). ¦ Les champs de texte utilisent cette touche (édition). ¦ Los cuadros de texto usan esa tecla (edición).
+That key is used to move around the window. ¦ Cette touche sert à se déplacer dans la fenêtre. ¦ Esa tecla sirve para moverse por la ventana.
+Ctrl+Alt is used for typing letters on some keyboards. ¦ Ctrl+Alt sert à saisir des lettres sur certains claviers. ¦ Ctrl+Alt sirve para escribir letras en algunos teclados.
+Alt and a letter open the window's menus. ¦ Alt et une lettre ouvrent les menus de la fenêtre. ¦ Alt y una letra abren los menús de la ventana.
+A plain letter key types text. ¦ Une simple touche de lettre saisit du texte. ¦ Una simple tecla de letra escribe texto.
+Move the Packets list divider ¦ Déplacer la séparation de la liste des paquets ¦ Mover el divisor de la lista de paquetes
+Move along the tabs ¦ Se déplacer entre les onglets ¦ Moverse entre las pestañas
+Move between the sub-views ¦ Passer d'une sous-vue à l'autre ¦ Moverse entre las subvistas
+Move between the Dashboard cards ¦ Passer d'une carte du Tableau de bord à l'autre ¦ Moverse entre las tarjetas del Panel
+Now in the Advanced view (%s goes back to Beginner). ¦ Vue Avancé activée (%s revient à Débutant). ¦ Vista Avanzada activada (%s vuelve a Principiante).
+Now in the Beginner view (%s shows Advanced again). ¦ Vue Débutant activée (%s réaffiche Avancé). ¦ Vista Principiante activada (%s vuelve a mostrar Avanzada).
+Refreshed this tab. ¦ Onglet actualisé. ¦ Pestaña actualizada.
+%s: divider at %d%%. ¦ %s : séparation à %d %%. ¦ %s: divisor al %d %%.
+Packet list ¦ Liste des paquets ¦ Lista de paquetes
+There is no divider to move: show the Inspector (F2) first. ¦ Aucune séparation à déplacer : affichez d'abord l'inspecteur (F2). ¦ No hay divisor que mover: muestre antes el inspector (F2).
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -35147,6 +35238,89 @@ def focus_ring(widget, color="#2b7de9", width=2):
     off()
 
 
+def _modified(event):
+    """True when Shift, Ctrl or Alt is down: a plain-arrow binding stands
+    aside, so Alt+Left (Back), Ctrl+Shift+Left (divider) and the rest
+    still reach their own bindings. (A "<Left>" binding also matches
+    Alt+Left, and a "break" stops the "all" bindings after it.)"""
+    try:
+        return bool(int(event.state) & (0x1 | 0x4 | 0x8 | 0x20000))
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+class RovingGroup:
+    """A row of buttons that is one Tab stop: Tab lands on the one used
+    last (Start at first), Left / Right / Home / End walk the row. A
+    member that is disabled or hidden is passed over. Nothing moves for
+    the mouse. The Tab stop is decided when Tab is pressed (a takefocus
+    command), so a button that is enabled later joins at once."""
+
+    def __init__(self, root, widgets, default=None):
+        self.widgets = list(widgets)
+        self.current = default or self.widgets[0]
+        cmd = root.register(self._takefocus)
+        for w in self.widgets:
+            w.configure(takefocus=cmd)
+            for seq, how in (("<Left>", -1), ("<Right>", 1),
+                             ("<Home>", "first"), ("<End>", "last")):
+                w.bind(seq, lambda e, h=how, w=w: None if _modified(e)
+                       else self.move(w, h))
+            w.bind("<FocusIn>", lambda e, w=w: self._note(w), add="+")
+        groups = root.__dict__.setdefault("_roving_groups", [])
+        groups.append(self)
+
+    def usable(self, w):
+        try:
+            if not w.winfo_viewable():
+                return False
+            if isinstance(w, ttk.Widget):
+                return not w.instate(["disabled"])
+            return str(w.cget("state")) != "disabled"
+        except tk.TclError:
+            return False
+
+    def _note(self, w):
+        self.current = w
+
+    def stop(self):
+        """The member Tab lands on, or None when none can be used."""
+        if self.usable(self.current):
+            return self.current
+        return next((w for w in self.widgets if self.usable(w)), None)
+
+    def _takefocus(self, path):
+        st = self.stop()
+        return 1 if st is not None and str(st) == str(path) else 0
+
+    def move(self, frm, how):
+        ok = [w for w in self.widgets if self.usable(w) or w is frm]
+        if frm not in ok:
+            return "break"
+        i = ok.index(frm)
+        j = 0 if how == "first" else len(ok) - 1 if how == "last" \
+            else (i + how) % len(ok)
+        with contextlib.suppress(tk.TclError):
+            ok[j].focus_set()
+        return "break"
+
+
+def make_label_button(widget, fn, color="#2b7de9"):
+    """A clickable tk.Label that the keyboard can use: a Tab stop with the
+    focus ring, run by Return, Enter and Space. The mouse binding stays
+    the caller's own."""
+    with contextlib.suppress(tk.TclError):
+        widget.configure(takefocus=1)
+    focus_ring(widget, color)
+
+    def run(_e=None):
+        fn()
+        return "break"
+    for seq in ("<Return>", "<KP_Enter>", "<space>"):
+        widget.bind(seq, run)
+    return widget
+
+
 def _walk_class(root, cls):
     """The widgets of class `cls` under `root` (root included). 5.3.4 CI:
     from tkinter's own table of children, as winfo_children() builds it
@@ -36715,6 +36889,22 @@ SETTINGS_PAGES = [
               "label": "Internet tabs"},
              {"key": "shortcuts.group4", "type": "shortcut",
               "label": "Tools and help tabs"},
+             {"key": "shortcuts.regions", "type": "shortcut",
+              "label": "Next part of the window"},
+             {"key": "shortcuts.regions_back", "type": "shortcut",
+              "label": "Previous part of the window"},
+             {"key": "shortcuts.focus_table", "type": "shortcut",
+              "label": "Go to the table"},
+             {"key": "shortcuts.shortcut_sheet", "type": "shortcut",
+              "label": "Show the keyboard shortcuts"},
+             {"key": "shortcuts.mode_toggle", "type": "shortcut",
+              "label": "Beginner / Advanced view"},
+             {"key": "shortcuts.refresh", "type": "shortcut",
+              "label": "Refresh this tab"},
+             {"key": "shortcuts.pane_narrower", "type": "shortcut",
+              "label": "Move the divider left"},
+             {"key": "shortcuts.pane_wider", "type": "shortcut",
+              "label": "Move the divider right"},
          ]},
      ]},
     {"id": "data", "icon": "\U0001F4BE", "title": "Data & Export",
@@ -37099,9 +37289,12 @@ class SettingsWindow:
             seq = str(v.get()).strip()
             for other, ov in self.vars.items():
                 if other != key and self.controls[other]["type"] == "shortcut" \
-                        and str(ov.get()).strip() == seq and seq:
+                        and seq and _norm_seq(str(ov.get())) == _norm_seq(
+                            seq):
                     return (f"Already used by "
                             f"\u201c{self.controls[other]['label']}\u201d.")
+            # the keys the program or a text box keeps for itself
+            return shortcut_reserved(key.split(".", 1)[1], seq)
         return ""
 
     def _validate_all(self):
@@ -40330,6 +40523,15 @@ class BaseTab:
                            self.show_subview(n))
             b.pack(side="left", padx=(0, 4))
             self._sub_btns[n] = b
+            # one Tab stop for the row (the shown one, set in
+            # _style_subviews); arrows move along it
+            for seq, how in (("<Left>", -1), ("<Right>", 1),
+                             ("<Home>", "first"), ("<End>", "last")):
+                b.bind(seq, lambda e, h=how: None if _modified(e)
+                       else self._subview_move(h))
+            for seq in ("<Return>", "<KP_Enter>", "<Down>"):
+                b.bind(seq, lambda e: None if _modified(e)
+                       else self._subview_enter())
         self.subview = names[0]
         self._sub_frames[names[0]].pack(fill="both", expand=True)
         self._style_subviews()
@@ -40339,7 +40541,40 @@ class BaseTab:
         for n, b in getattr(self, "_sub_btns", {}).items():
             with contextlib.suppress(tk.TclError):
                 b.configure(style="Sub.Accent.TButton" if n == self.subview
-                            else "Sub.TButton")
+                            else "Sub.TButton",
+                            takefocus=1 if n == self.subview else 0)
+
+    def _subview_move(self, how):
+        """Left / Right / Home / End on a sub-view button: show the
+        neighbour sub-view and keep the focus on its button."""
+        names = list(getattr(self, "_sub_btns", {}))
+        if not names:
+            return "break"
+        i = names.index(self.subview) if self.subview in names else 0
+        j = 0 if how == "first" else len(names) - 1 if how == "last" \
+            else (i + how) % len(names)
+        self.show_subview(names[j])
+        with contextlib.suppress(tk.TclError):
+            self._sub_btns[names[j]].focus_set()
+        return "break"
+
+    def _subview_enter(self):
+        """Enter / Down on a sub-view button: into the sub-view's content
+        (the first control after the row, inside the shown sub-view)."""
+        btn = self._sub_btns.get(self.subview)
+        frame = self._sub_frames.get(self.subview)
+        if btn is None or frame is None:
+            return "break"
+        with contextlib.suppress(tk.TclError):
+            w, prefix = btn, str(frame) + "."
+            for _ in range(80):
+                w = w.tk_focusNext()
+                if w is None or w is btn:
+                    break
+                if str(w).startswith(prefix) and w.winfo_viewable():
+                    w.focus_set()
+                    break
+        return "break"
 
     def show_subview(self, name):
         if name not in getattr(self, "_sub_frames", {}):
@@ -40436,6 +40671,8 @@ class Inspector:
                          cursor="hand2")
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: app.toggle_inspector(False))
+        make_label_button(close, lambda: app.toggle_inspector(False))
+        self.close_btn = close
         Tooltip(close, "Hide the inspector (F2 shows it again)")
         body = tk.Frame(self.frame, bg=WHITE)
         body.pack(fill="both", expand=True, padx=(8, 4))
@@ -40910,7 +41147,8 @@ class DashboardTab(BaseTab):
             self.big_vars[key] = v
             for w in (card, tl, vl):
                 w.bind("<Button-1>", lambda e, c=cmd: c())
-            card.bind("<Return>", lambda e, c=cmd: c())
+            card.configure(highlightcolor="#2b7de9")
+            self._card_keys(card, cmd)
             self.big.columnconfigure(i, weight=1, uniform="big")
         grid = tk.Frame(outer, bg=WHITE)
         grid.pack(fill="x")
@@ -40942,7 +41180,7 @@ class DashboardTab(BaseTab):
             self.vars[key] = v
             for w in (card, tl, vl):
                 w.bind("<Button-1>", lambda e, tg=target: self.app.goto(tg))
-            card.bind("<Return>", lambda e, tg=target: self.app.goto(tg))
+            self._card_keys(card, lambda tg=target: self.app.goto(tg))
             Tooltip(card, "Click to open the details.")
         for c in range(6):
             grid.columnconfigure(c, weight=1, uniform="card")
@@ -40962,6 +41200,53 @@ class DashboardTab(BaseTab):
                ("new", "What is new?"))
     ANSWER_FG = {"good": "#0b6b3a", "warn": "#8a5a00", "bad": "#8a1a08",
                  "muted": "#666666", "": "#222222"}
+
+    def _card_keys(self, card, fn):
+        """Return and Space open a card; the arrow keys move to the
+        neighbouring card, row by row as the cards are laid out (the grid
+        goes from six columns to three on a narrow window)."""
+        cards = self.__dict__.setdefault("_kb_cards", [])
+        cards.append(card)
+
+        def go(_e=None):
+            fn()
+            return "break"
+        for seq in ("<Return>", "<KP_Enter>", "<space>"):
+            card.bind(seq, go)
+        for seq, d in (("<Left>", (-1, 0)), ("<Right>", (1, 0)),
+                       ("<Up>", (0, -1)), ("<Down>", (0, 1))):
+            card.bind(seq, lambda e, d=d, c=card: None if _modified(e)
+                      else self._card_move(c, d))
+
+    def _card_move(self, card, d):
+        """The card to the left / right in the same row, or the nearest
+        one in the row above / below; stays put at an edge."""
+        try:
+            cx = card.winfo_rootx() + card.winfo_width() / 2
+            cy = card.winfo_rooty() + card.winfo_height() / 2
+            half = max(4, card.winfo_height() / 2)
+            best, key = None, None
+            for c in self._kb_cards:
+                if c is card or not c.winfo_viewable():
+                    continue
+                x = c.winfo_rootx() + c.winfo_width() / 2
+                y = c.winfo_rooty() + c.winfo_height() / 2
+                same_row = abs(y - cy) < half
+                if d[0]:
+                    if not same_row or (x - cx) * d[0] <= 0:
+                        continue
+                    k = abs(x - cx)
+                else:
+                    if same_row or (y - cy) * d[1] <= 0:
+                        continue
+                    k = (abs(y - cy), abs(x - cx))
+                if key is None or k < key:
+                    best, key = c, k
+            if best is not None:
+                best.focus_set()
+        except tk.TclError:
+            pass
+        return "break"
 
     def _build_answers(self, outer):
         box = tk.Frame(outer, bg=WHITE)
@@ -40988,7 +41273,7 @@ class DashboardTab(BaseTab):
             more.pack(anchor="w")
             for w in (card, q, a, more):
                 w.bind("<Button-1>", lambda e, k=key: self._answer_show(k))
-            card.bind("<Return>", lambda e, k=key: self._answer_show(k))
+            self._card_keys(card, lambda k=key: self._answer_show(k))
             card.bind("<Configure>", lambda e, lb=a: self._fit_answer(
                 lb, e.width), add="+")
             self.answer_lbls[key] = a
@@ -40999,6 +41284,7 @@ class DashboardTab(BaseTab):
         self.honest_lbl.pack(fill="x", padx=4, pady=(2, 8))
         self.honest_lbl.bind("<Button-1>",
                              lambda e: self.app.open_coverage())
+        make_label_button(self.honest_lbl, self.app.open_coverage)
         Tooltip(self.honest_lbl, "What this computer can and can't see "
                                  "from where it is — click for details.")
 
@@ -41027,7 +41313,7 @@ class DashboardTab(BaseTab):
         more.pack(side="right")
         for w in (card, title, self.story_lbl, more):
             w.bind("<Button-1>", lambda e: self.app.open_story())
-        card.bind("<Return>", lambda e: self.app.open_story())
+        self._card_keys(card, self.app.open_story)
         Tooltip(card, "The changes of the last days in plain sentences, "
                       "with what is new since you last looked.")
         self.story_card = card
@@ -41062,7 +41348,7 @@ class DashboardTab(BaseTab):
                               expand=True)
         for w in (card, title, self.unusual_lbl, more):
             w.bind("<Button-1>", lambda e: self.app.open_unusual())
-        card.bind("<Return>", lambda e: self.app.open_unusual())
+        self._card_keys(card, self.app.open_unusual)
         Tooltip(card, "Things a device did that differ from what it "
                       "usually does, each with the worrying and the "
                       "innocent reading.")
@@ -50784,7 +51070,33 @@ KEYMAP_FIXED = (
     ("Close a window or a list", "Escape"),
     ("Move the Timeline time", "Left / Right (Shift: ten minutes)"),
     ("Complete a field name in a filter", "Tab"),
+    ("Move the Packets list divider", "Ctrl+Shift+Up / Ctrl+Shift+Down"),
+    ("Move along the tabs", "Left / Right / Home / End (on a tab)"),
+    ("Move between the sub-views", "Left / Right / Home / End "
+                                   "(on a sub-view)"),
+    ("Move between the Dashboard cards", "Arrow keys; Enter or Space "
+                                        "opens one"),
 )
+
+_FIXED_KEY_WORDS = {"Ctrl": "Control", "Page Up": "Prior",
+                    "Page Down": "Next", "Esc": "Escape", "Enter": "Return",
+                    "Space": "space", "Menu key": "Menu"}
+
+
+def fixed_key_tokens():
+    """{normalised Tk sequence: what KEYMAP_FIXED calls it}: the keys the
+    program itself keeps, read from the keyboard map's own rows so a new
+    row is protected without a second list."""
+    out = {}
+    for name, keys in KEYMAP_FIXED:
+        keys = re.sub(r"\s*\([^)]*\)", "", keys)
+        for tok in keys.split(" / "):
+            parts = [p.strip() for p in tok.replace(";", " / ").split("+")]
+            parts = [_FIXED_KEY_WORDS.get(p, p) for p in parts if p]
+            if not parts or " " in parts[-1] or "-" in parts[-1]:
+                continue
+            out.setdefault(_norm_seq("<" + "-".join(parts) + ">"), name)
+    return out
 
 
 def help_body(topic, app):
@@ -51844,14 +52156,20 @@ class TabStrip:
                          cursor="hand2")
         bar = tk.Frame(outer, height=3, bg=side, bd=0)
         bar.pack(fill="x")
+        # one Tab stop for the whole strip (the shown tab's label, set in
+        # sync()); Left / Right / Home / End move along the tabs
         lbl = tk.Label(outer, bg=side, fg=fg, padx=7, pady=3,
-                       font=mw_font(10, "bold"), takefocus=1)
+                       font=mw_font(10, "bold"), takefocus=0)
         focus_ring(lbl)             # 5.1.2: the focus can be seen
         lbl.pack(fill="both", expand=True)
         for w in (outer, bar, lbl):
             w.bind("<Button-1>", lambda e, t=tid: self.select(t))
         lbl.bind("<Return>", lambda e, t=tid: self.select(t))
         lbl.bind("<space>", lambda e, t=tid: self.select(t))
+        for seq, how in (("<Left>", -1), ("<Right>", 1), ("<Home>", "first"),
+                         ("<End>", "last")):
+            lbl.bind(seq, lambda e, h=how: None if _modified(e)
+                     else self.move(h))
         lbl.bind("<Enter>", lambda e, t=tid: self._hover(t, True))
         lbl.bind("<Leave>", lambda e, t=tid: self._hover(t, False))
         bind_plain(lbl, "<Configure>", self.schedule)
@@ -51862,6 +52180,37 @@ class TabStrip:
         with contextlib.suppress(tk.TclError):
             self.app.nb.select(tid)
             self.app.nb.focus_set()     # arrows and Ctrl+Tab keep working
+
+    def move(self, how):
+        """Left / Right / Home / End on a tab label (and Home / End on the
+        notebook): select the neighbour tab and keep the focus on the
+        strip, on the label of the tab now shown."""
+        if not self.order:
+            return "break"
+        cur = self._selected()
+        i = self.order.index(cur) if cur in self.order else 0
+        if how == "first":
+            j = 0
+        elif how == "last":
+            j = len(self.order) - 1
+        else:
+            j = (i + how) % len(self.order)
+        tid = self.order[j]
+        with contextlib.suppress(tk.TclError):
+            self.app.nb.select(tid)
+            self.tabs[tid][2].focus_set()
+        return "break"
+
+    def selected_label(self):
+        """The shown tab's label (the strip's one Tab stop), or None."""
+        cur = self._selected()
+        entry = self.tabs.get(cur)
+        if entry is None:
+            return None
+        try:
+            return entry[2] if entry[2].winfo_viewable() else None
+        except tk.TclError:
+            return None
 
     def cycle(self, step):
         """Ctrl+Tab / Ctrl+Shift+Tab from anywhere in the main window
@@ -51914,7 +52263,8 @@ class TabStrip:
                     lbl.configure(text=text)
                 outer.configure(bg=border)
                 bar.configure(bg=acc if on else side)
-                lbl.configure(bg=sel_bg if on else side, fg=fg)
+                lbl.configure(bg=sel_bg if on else side, fg=fg,
+                              takefocus=1 if on else 0)
             except tk.TclError:
                 pass
         self.order = ids
@@ -52671,11 +53021,12 @@ class MiniWireshark:
         self.toolbar_frame = bar
         rgrp = ttk.Frame(bar)          # these three wrap together
         rgrp.pack(side="right")
-        ttk.Button(rgrp, text="Session ▾", width=-8,
-                   command=self._open_session_menu).pack(side="right")
-        ttk.Button(rgrp, text="Export ▾", width=-8,
-                   command=self._open_export_menu).pack(side="right",
-                                                        padx=(0, 6))
+        self.session_btn = ttk.Button(rgrp, text="Session ▾", width=-8,
+                                      command=self._open_session_menu)
+        self.session_btn.pack(side="right")
+        self.export_btn = ttk.Button(rgrp, text="Export ▾", width=-8,
+                                     command=self._open_export_menu)
+        self.export_btn.pack(side="right", padx=(0, 6))
         self.clear_btn = ttk.Button(rgrp, text=tr("btn_clear"), width=-8,
                                     command=self.clear)
         if not FEATURES.get("state_line", True):
@@ -52688,8 +53039,9 @@ class MiniWireshark:
         self.iface_box.pack(side="left", padx=(6, 2))
         self.iface_tip = Tooltip(self.iface_box, "")
         self.iface_box.bind("<<ComboboxSelected>>", self._on_iface_picked)
-        ttk.Button(bar, text="↻", width=3, command=self.refresh_adapters
-                   ).pack(side="left", padx=(0, 12))
+        self.adapters_btn = ttk.Button(bar, text="↻", width=3,
+                                       command=self.refresh_adapters)
+        self.adapters_btn.pack(side="left", padx=(0, 12))
         self.cap_filter_lbl = ttk.Label(bar, text="Capture filter:")
         self.cap_filter_lbl.pack(side="left")
         self.filter_var = tk.StringVar()
@@ -52707,6 +53059,12 @@ class MiniWireshark:
         self.stop_btn = ttk.Button(bar, text=tr("btn_stop"), command=self.stop,
                                    state="disabled")
         self.stop_btn.pack(side="left", padx=6)
+        # the tool bar's buttons are one Tab stop (a row you walk with
+        # Left / Right / Home / End), so the tab strip is not nine presses
+        # away; in the order they are drawn
+        self.toolbar_group = RovingGroup(self.root, [
+            self.adapters_btn, self.start_btn, self.stop_btn,
+            self.export_btn, self.session_btn], default=self.start_btn)
 
         self.body = ttk.PanedWindow(self.root, orient="horizontal")
         self.body.pack(fill="both", expand=True, padx=12, pady=(6, 4))
@@ -52737,6 +53095,13 @@ class MiniWireshark:
         self.nb = ttk.Notebook(left, style="Main.TNotebook")
         self.nb.pack(fill="both", expand=True)
         self.nb.enable_traversal()
+        # the strip above is the one Tab stop for switching tabs; the
+        # notebook keeps the arrow keys (class binding) and gets Home / End
+        self.nb.configure(takefocus=0)
+        self.nb.bind("<Home>", lambda e: None if _modified(e)
+                     else self.tabstrip.move("first"))
+        self.nb.bind("<End>", lambda e: None if _modified(e)
+                     else self.tabstrip.move("last"))
         self.tabs = OrderedDict()
         classes = {c.name: c for c in (
             DashboardTab, FeedTab, TimelineTab, DevicesTab, WebsitesTab,
@@ -52763,6 +53128,13 @@ class MiniWireshark:
                           ("<Control-ISO_Left_Tab>", -1)):
             with contextlib.suppress(tk.TclError):
                 self.root.bind(seq, lambda e, s=step: self.tabstrip.cycle(s))
+        # the Packets list | details divider (the Left / Right pair is a
+        # setting, see _apply_shortcuts)
+        for seq, step in (("<Control-Shift-Up>", -1),
+                          ("<Control-Shift-Down>", 1)):
+            with contextlib.suppress(tk.TclError):
+                self.root.bind_all(
+                    seq, lambda e, s=step: self._resize_pane_v(s, e))
         self.inspector = Inspector(self, self.body)
         self.inspector_visible = False
         self.body.bind("<Configure>", self._body_resized, add="+")
@@ -52780,6 +53152,7 @@ class MiniWireshark:
             value="Getting ready — I'll pick a network card and start "
                   "watching automatically.")
         status = tk.Frame(self.root, bg="#e3e6eb")
+        self.status_frame = status
         status.pack(side="bottom", fill="x", before=self.body)
         status._mw_noflow = True
         self.footer_var = DisplayVar(value="")
@@ -52794,6 +53167,7 @@ class MiniWireshark:
                                 fg="#1a3a6b", bg="#e3e6eb", padx=8, pady=4,
                                 cursor="hand2")
         self.job_lbl.bind("<Button-1>", lambda e: self.jobs.cancel_all())
+        make_label_button(self.job_lbl, lambda: self.jobs.cancel_all())
         Tooltip(self.job_lbl, "Work running in the background. Click to "
                               "cancel it.")
         # 5.1.2: messages history; the status text opens Diagnostics
@@ -52801,6 +53175,7 @@ class MiniWireshark:
                                 bg="#e3e6eb", padx=8, pady=4, cursor="hand2")
         self.msg_btn.pack(side="left")
         self.msg_btn.bind("<Button-1>", lambda e: self.open_messages())
+        make_label_button(self.msg_btn, lambda: self.open_messages())
         Tooltip(self.msg_btn, "The last 50 messages")
         self._sync_messages_btn()
         self.status_lbl = tk.Label(
@@ -52809,9 +53184,11 @@ class MiniWireshark:
             padx=10, pady=4, cursor="hand2")
         self.status_lbl.pack(side="left", fill="x", expand=True)
         self.status_lbl.bind("<Button-1>", lambda e: self.open_diagnostics())
+        make_label_button(self.status_lbl, lambda: self.open_diagnostics())
         Tooltip(self.status_lbl, "What the capture is doing. Click for "
                                  "Diagnostics.")
         foot.bind("<Button-1>", lambda e: self.open_coverage())
+        make_label_button(foot, lambda: self.open_coverage())
         Tooltip(foot, "What this computer can and can't see. Click for "
                       "the full coverage report.")
         self._restyle_mode_banner()
@@ -57351,6 +57728,259 @@ proc ::mw_explicit_fonts {top names} {
                 pass
 
 
+    # ---- keyboard-only: the window's regions, F7, F8, F5, dividers --------
+    def _in_main(self, event):
+        """False for a key pressed in another window (Settings, a dialog):
+        these shortcuts are for the main window; bind_all reaches all."""
+        w = getattr(event, "widget", None)
+        try:
+            return w is None or isinstance(w, str) or \
+                w.winfo_toplevel() is self.root
+        except (tk.TclError, AttributeError, KeyError):
+            return True
+
+    def _under(self, widget, ancestor):
+        """True when `widget` is `ancestor` or inside it."""
+        try:
+            p, a = str(widget), str(ancestor)
+        except (tk.TclError, AttributeError):
+            return False
+        return bool(a) and (p == a or p.startswith(a + "."))
+
+    def _first_stop_in(self, frame, start=None):
+        """The first widget inside `frame` that Tab reaches (after
+        `start`, else the shown tab's label)."""
+        w = start or self.tabstrip.selected_label() or self.search_entry
+        first = w
+        prefix = str(frame) + "."
+        for _ in range(600):
+            try:
+                w = w.tk_focusNext()
+            except tk.TclError:
+                return None
+            if w is None or w is first:
+                return None
+            try:
+                if str(w).startswith(prefix) and w.winfo_viewable():
+                    return w
+            except tk.TclError:
+                continue
+        return None
+
+    def _table_target(self, tab=None):
+        """The shown tab's table: its tree when that is on screen, else
+        the first table under it, else the first control Tab reaches."""
+        tab = tab or self.tabs.get(self.current_tab_name())
+        if tab is None:
+            return None
+        try:
+            t = getattr(tab, "tree", None)
+            if t is not None and t.winfo_viewable():
+                return t
+            for t in _walk_class(tab.frame, ttk.Treeview):
+                if t.winfo_viewable():
+                    return t
+        except (tk.TclError, AttributeError):
+            pass
+        return self._first_stop_in(tab.frame)
+
+    def _focus_table(self, event=None):
+        """F7: the shown tab's table, with its first row selected when
+        nothing is."""
+        if event is not None and not self._in_main(event):
+            return None
+        w = self._table_target()
+        if w is None:
+            return "break"
+        try:
+            if isinstance(w, ttk.Treeview):
+                kids = w.get_children()
+                if kids and not w.selection():
+                    w.selection_set(kids[0])
+                    w.focus(kids[0])
+                    w.see(kids[0])
+                elif w.selection():
+                    w.see(w.selection()[0])
+            w.focus_set()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _regions(self):
+        """[(name, widget)] of the parts F6 visits, top to bottom: the
+        search box, the tab strip, the shown tab's filter box (when it
+        has one on screen), its table, the Inspector (when shown) and the
+        status line."""
+        out = [("search", self.search_entry)]
+        lbl = self.tabstrip.selected_label()
+        if lbl is not None:
+            out.append(("tabs", lbl))
+        tab = self.tabs.get(self.current_tab_name())
+        fe = getattr(tab, "filter_entry", None)
+        try:
+            if fe is not None and fe.winfo_viewable():
+                out.append(("filter", fe))
+        except tk.TclError:
+            pass
+        tbl = self._table_target(tab)
+        if tbl is not None and tbl is not fe:
+            out.append(("table", tbl))
+        if self.inspector_visible:
+            tgt = getattr(self.inspector, "txt", None) or \
+                getattr(self.inspector, "close_btn", None)
+            if tgt is not None:
+                out.append(("inspector", tgt))
+        out.append(("status", self.status_lbl))
+        return out
+
+    def _region_of(self, widget):
+        """The name of the region the focus is in ("" when none of the
+        F6 parts: the toolbar and banners count as the search box's)."""
+        if widget is None:
+            return ""
+        tab = self.tabs.get(self.current_tab_name())
+        fe = getattr(tab, "filter_entry", None)
+        if self.inspector_visible and self._under(
+                widget, self.inspector.frame):
+            return "inspector"
+        if self._under(widget, getattr(self, "status_frame", None)):
+            return "status"
+        if self._under(widget, self.tabstrip.frame) or self._under(
+                widget, self.nav_frame):
+            return "tabs"
+        if fe is not None and (widget is fe or (
+                tab is not None and str(fe.winfo_parent()) != str(tab.frame)
+                and self._under(widget, str(fe.winfo_parent())))):
+            return "filter"
+        if tab is not None and self._under(widget, tab.frame):
+            return "table"
+        if self._under(widget, self.nb):
+            return "table"
+        if self._under(widget, self.body):
+            return ""
+        return "search"
+
+    def _cycle_regions(self, step, event=None):
+        """F6 / Shift+F6: the next / previous part of the window, wrapping.
+        A part that is not on screen (no filter box, no Inspector) is
+        skipped."""
+        if event is not None and not self._in_main(event):
+            return None
+        regions = self._regions()
+        names = [n for n, _w in regions]
+        try:
+            cur = self._region_of(self.root.focus_get())
+        except (KeyError, tk.TclError):
+            cur = ""
+        if cur in names:
+            i = (names.index(cur) + step) % len(names)
+        else:
+            i = 0 if step > 0 else len(names) - 1
+        for k in range(len(names)):
+            _n, w = regions[(i + k * step) % len(names)]
+            try:
+                w.focus_set()
+                self._region_now = _n
+                break
+            except tk.TclError:
+                continue
+        return "break"
+
+    def _toggle_mode_key(self, event=None):
+        """F8: Beginner <-> Advanced."""
+        if event is not None and not self._in_main(event):
+            return None
+        now = "Beginner" if self.beginner_mode else "Advanced"
+        to = "Advanced" if now == "Beginner" else "Beginner"
+        self.mode_ui_var.set(to)
+        self._on_ui_mode_change()
+        self._set_banner("\U0001F441  " + translate_text(
+            "Now in the Advanced view (%s goes back to Beginner)."
+            if to == "Advanced" else
+            "Now in the Beginner view (%s shows Advanced again).")
+            % (self.shortcut_text("mode_toggle") or "F8"))
+        return "break"
+
+    def _refresh_key(self, event=None):
+        """F5: draw the shown tab again from the data."""
+        if event is not None and not self._in_main(event):
+            return None
+        self._refresh_shown_tab()
+        self._set_banner("\U0001F504  Refreshed this tab.")
+        return "break"
+
+    def _sheet_key(self, event=None):
+        """Shift+F1: the keyboard map (Help > Keyboard map)."""
+        if event is not None and not self._in_main(event):
+            return None
+        self.open_help("Keyboard map")
+        return "break"
+
+    PANE_STEP = 40
+
+    def _resize_pane(self, step, event=None):
+        """Ctrl+Shift+Left / Right: move a divider from the keyboard (the
+        mouse can, a ttk.PanedWindow's keys cannot). The Packets
+        fields | bytes divider when the focus is there, else the one
+        beside the Inspector."""
+        if event is not None:
+            if not self._in_main(event):
+                return None
+            if isinstance(getattr(event, "widget", None),
+                          (tk.Entry, ttk.Entry, tk.Text)):
+                return None       # Ctrl+Shift+arrows select words there
+        pane, what, total = self.body, "Inspector", None
+        foc = None
+        with contextlib.suppress(KeyError, tk.TclError):
+            foc = self.root.focus_get()
+        pk = self.tabs.get("packets")
+        dp = getattr(pk, "detail_pane", None)
+        if dp is not None and foc is not None and self._under(foc, dp) \
+                and dp.winfo_viewable():
+            pane, what = dp, "Packet details"
+        elif not self.inspector_visible:
+            self._set_banner("\u2194  There is no divider to move: show the "
+                             "Inspector (F2) first.")
+            return "break"
+        return self._move_sash(pane, step * px(self.PANE_STEP), what)
+
+    def _resize_pane_v(self, step, event=None):
+        """Ctrl+Shift+Up / Down: the Packets list | details divider."""
+        if event is not None:
+            if not self._in_main(event):
+                return None
+            if isinstance(getattr(event, "widget", None),
+                          (tk.Entry, ttk.Entry, tk.Text)):
+                return None
+        pk = self.tabs.get("packets")
+        vert = getattr(pk, "vert_pane", None)
+        if vert is None or not pk.is_visible() or not vert.winfo_viewable():
+            return "break"
+        return self._move_sash(vert, step * px(self.PANE_STEP),
+                               "Packet list")
+
+    def _move_sash(self, pane, delta, what):
+        try:
+            vertical = str(pane.cget("orient")) == "vertical"
+            total = pane.winfo_height() if vertical else pane.winfo_width()
+            pos = pane.sashpos(0)
+            new = max(px(80), min(total - px(80), pos + int(delta)))
+            pane.sashpos(0, new)
+            pos = pane.sashpos(0)
+        except tk.TclError:
+            return "break"
+        pk = self.tabs.get("packets")
+        for pw, name in ((getattr(pk, "vert_pane", None), "packets.list"),
+                         (getattr(pk, "detail_pane", None),
+                          "packets.detail")):
+            if pw is pane:
+                with contextlib.suppress(tk.TclError, AttributeError):
+                    pk._pane_moved(pw, name)
+        self._set_banner("\u2194  " + translate_text("%s: divider at %d%%.")
+                         % (translate_text(what),
+                            round(100 * pos / max(1, total))))
+        return "break"
+
     def _focus_search(self, _event=None):
         """Ctrl+F: the shown tab's own filter box when it has one (5.1.2),
         else the header search."""
@@ -57408,6 +58038,14 @@ proc ::mw_explicit_fonts {top names} {
             "group2": lambda e=None: self.select_group(1),
             "group3": lambda e=None: self.select_group(2),
             "group4": lambda e=None: self.select_group(3),
+            "regions": lambda e=None: self._cycle_regions(1, e),
+            "regions_back": lambda e=None: self._cycle_regions(-1, e),
+            "focus_table": lambda e=None: self._focus_table(e),
+            "shortcut_sheet": lambda e=None: self._sheet_key(e),
+            "mode_toggle": lambda e=None: self._toggle_mode_key(e),
+            "refresh": lambda e=None: self._refresh_key(e),
+            "pane_narrower": lambda e=None: self._resize_pane(-1, e),
+            "pane_wider": lambda e=None: self._resize_pane(1, e),
         }
         shortcuts = dict(DEFAULT_SHORTCUTS)
         shortcuts.update(self.config.data.get("shortcuts") or {})
@@ -97815,6 +98453,8 @@ def keyboard_walk(app):
     by Tab from the header search box."""
     root = app.root
     out = {}
+    first_tab = next((n for n, t in app.tabs.items()
+                      if not (app.beginner_mode and t.advanced)), None)
     for name, tab in app.tabs.items():
         if app.beginner_mode and tab.advanced:
             continue
@@ -97840,15 +98480,109 @@ def keyboard_walk(app):
                     continue
             except tk.TclError:
                 continue
-            if x not in seen:
+            if x not in seen and not _roving_member_reached(app, x, seen):
                 miss.append(str(x))
-        for _o, _b, lbl in app.tabstrip.tabs.values():
-            with contextlib.suppress(tk.TclError):
-                if lbl.winfo_viewable() and lbl not in seen:
-                    miss.append(str(lbl))
+        # the strip is one Tab stop (the shown tab's label); the others are
+        # reached with Left / Right / Home / End, checked by arrow_walk()
+        stop = app.tabstrip.selected_label()
+        if stop is not None and stop not in seen:
+            miss.append(str(stop))
+        miss += arrow_walk(app, strip=name == first_tab)
         if miss:
             out[name] = miss
     return out
+
+
+def _roving_member_reached(app, x, seen):
+    """True when `x` is one of a row's buttons whose row's Tab stop was
+    reached (the arrow keys take it from there: see arrow_walk)."""
+    for g in getattr(app.root, "_roving_groups", ()):
+        if x in g.widgets:
+            return g.stop() in seen
+    for tab in app.tabs.values():
+        btns = getattr(tab, "_sub_btns", None)
+        if btns and x in btns.values():
+            return btns.get(getattr(tab, "subview", None)) in seen
+    return False
+
+
+def arrow_walk(app, strip=True):
+    """[what Left / Right can't reach] for the rows that are one Tab stop:
+    every enabled button of the tool bar, every visible tab label (when
+    `strip`), every sub-view of the shown tab. Each is walked with the
+    real key events."""
+    root, miss = app.root, []
+
+    def key(w, seq):
+        with contextlib.suppress(tk.TclError):
+            w.focus_force()
+            root.update()
+            w.event_generate(seq)
+            root.update()
+    for g in getattr(root, "_roving_groups", ()):
+        usable = [w for w in g.widgets if g.usable(w)]
+        if len(usable) < 2:
+            continue
+        key(usable[0], "<Home>")
+        seen = []
+        for _ in range(len(usable) + 1):
+            w = root.focus_get()
+            if w in usable and w not in seen:
+                seen.append(w)
+            key(w if w is not None else usable[0], "<Right>")
+        miss += [f"{w} (arrows)" for w in usable if w not in seen]
+    # the tabs: Right from the first one visits every visible label
+    order = list(app.tabstrip.order) if strip else []
+    cur = app.nb.select()
+    try:
+        if order:
+            app.tabstrip.move("first")
+            shown = [app.tabstrip._selected()]
+            for _ in range(len(order)):
+                key(root.focus_get() or app.tabstrip.tabs[order[0]][2],
+                    "<Right>")
+                shown.append(app.tabstrip._selected())
+            miss += [f"{t} (tab arrows)" for t in order if t not in shown]
+    finally:
+        with contextlib.suppress(tk.TclError):
+            app.nb.select(cur)
+    tab = app.tabs.get(app.current_tab_name())
+    names = list(getattr(tab, "_sub_btns", {}) or {})
+    if len(names) > 1:
+        keep = tab.subview
+        try:
+            tab.show_subview(names[0])
+            shown = [tab.subview]
+            for _ in range(len(names)):
+                key(tab._sub_btns[tab.subview], "<Right>")
+                shown.append(tab.subview)
+            miss += [f"{tab.name}/{n} (sub-view arrows)" for n in names
+                     if n not in shown]
+        finally:
+            tab.show_subview(keep)
+    return miss
+
+
+def tab_presses_to_content(app, name=None):
+    """How many Tab presses take the focus from the header search box to
+    the first control inside the shown tab (the tab `name` is shown
+    first); None when Tab never gets there."""
+    if name:
+        app._select_tab(name)
+        _gui_pump(app.root, 0.3)
+    frame = app.tabs[app.current_tab_name()].frame
+    prefix = str(frame) + "."
+    w = app.search_entry
+    for n in range(1, 400):
+        w = w.tk_focusNext()
+        if w is None or w is app.search_entry:
+            return None
+        try:
+            if str(w).startswith(prefix) and w.winfo_viewable():
+                return n
+        except tk.TclError:
+            continue
+    return None
 
 
 @gui_test_step("5.1.2 M8: keyboard walk, focus rings, dialog contract, "
@@ -104436,6 +105170,457 @@ def t_q35_gui_test_counts_skips(ctx):
     gui_test_record(res, "c", boom)
     assert [r[0] for r in res] == ["PASS", "SKIP", "FAIL"], res
     assert _gs_live(None, types.SimpleNamespace(live=False)) == "skip"
+
+
+# ---- keyboard-only navigation, slice C (focus regions, tab strip, keys) ----
+NEW_KEYBOARD_SHORTCUTS = ("regions", "regions_back", "focus_table",
+                          "shortcut_sheet", "mode_toggle", "refresh",
+                          "pane_narrower", "pane_wider")
+# the defaults older than the reserved list: they keep their keys
+OLDER_SHORTCUTS = ("start", "stop", "clear", "export", "find", "undo",
+                   "inspector", "palette", "goto_packet", "back", "forward",
+                   "explain", "group1", "group2", "group3", "group4")
+
+
+@self_test(needs_source=True)
+def t_kbd_shortcut_names_have_controls_actions_and_no_clash(ctx):
+    """Every default shortcut has a Settings control and an action; no two
+    defaults are the same key; the new ones avoid every key a text box or
+    the program itself keeps (the older ones keep theirs)."""
+    import inspect
+    src = inspect.getsource(MiniWireshark._apply_shortcuts)
+    block = src[src.index("actions = {"):src.index("shortcuts = dict(")]
+    actions = set(re.findall(r'^\s+"(\w+)": ', block, re.M))
+    ctl = {k.split(".", 1)[1] for k in settings_schema_keys()
+           if k.startswith("shortcuts.")}
+    for name in DEFAULT_SHORTCUTS:
+        assert name in actions, f"shortcut {name}: no action"
+        assert name in ctl, f"shortcut {name}: no Settings control"
+    assert set(NEW_KEYBOARD_SHORTCUTS) <= set(DEFAULT_SHORTCUTS)
+    assert set(DEFAULT_SHORTCUTS) == set(NEW_KEYBOARD_SHORTCUTS) | \
+        set(OLDER_SHORTCUTS), "a new shortcut: add it to this test"
+    norm = {}
+    for name, seq in DEFAULT_SHORTCUTS.items():
+        n = _norm_seq(seq)
+        assert n and n not in norm, (name, seq, norm.get(n))
+        norm[n] = name
+    taken = {_norm_seq(x) for x in RESERVED_EDIT_KEYS + RESERVED_PLAIN_KEYS}
+    taken |= set(fixed_key_tokens())
+    for name in NEW_KEYBOARD_SHORTCUTS:
+        n = _norm_seq(DEFAULT_SHORTCUTS[name])
+        assert n not in taken, (name, n)
+        # not a plain letter, not Ctrl+Alt
+        assert "Alt" not in n or "Control" not in n, (name, n)
+    # the checker: its own default passes, a taken key is refused
+    assert shortcut_reserved("regions", "<F6>") == ""
+    assert _norm_seq("<Control-Key-1>") == _norm_seq("<Control-1>")
+    for bad in ("<Control-Key-w>", "<Tab>", "<Shift-Tab>", "<Control-Tab>",
+                "<Control-Alt-x>", "<Alt-a>", "<a>", "<Return>",
+                "<Control-slash>", "<Escape>"):
+        assert shortcut_reserved("regions", bad), bad
+    for good in ("<F9>", "<Control-Shift-F6>", "<F12>"):
+        assert shortcut_reserved("regions", good) == "", good
+    # the strings are in French and Spanish
+    labels = [c["label"] for pg in SETTINGS_PAGES for sec in pg["sections"]
+              for c in sec["controls"] if c.get("type") == "shortcut"]
+    assert len(labels) == len(DEFAULT_SHORTCUTS)
+    for text in labels + [n for n, _k in KEYMAP_FIXED] + [
+            "Text boxes use that key (editing).",
+            "That key is used to move around the window.",
+            "Refreshed this tab."]:
+        for loc in ("fr", "es"):
+            assert text in I18N[loc], (loc, text)
+
+
+@self_test()
+def t_kbd_roving_group_is_one_tab_stop(ctx):
+    """RovingGroup: one member is the Tab stop; a disabled one is passed
+    over; arrows walk the row. (A bare Tk window: no application.)"""
+    root = tk.Tk()
+    try:
+        root.withdraw()
+        fr = ttk.Frame(root)
+        fr.pack()
+        bs = [ttk.Button(fr, text=str(i)) for i in range(4)]
+        for b in bs:
+            b.pack(side="left")
+        root.deiconify()
+        root.update()
+        g = RovingGroup(root, bs, default=bs[1])
+        assert g.stop() is bs[1]
+        stops = [b for b in bs if g._takefocus(str(b))]
+        assert stops == [bs[1]], stops
+        bs[1].state(["disabled"])
+        assert g.stop() is bs[0]
+        bs[1].state(["!disabled"])
+        assert g.move(bs[1], 1) == "break"
+        g._note(bs[2])
+        assert g.stop() is bs[2]
+    finally:
+        root.destroy()
+
+
+def _kbd_press(root, widget, seq, pump=0.08):
+    """Focus `widget` (when given) and send it a key."""
+    if widget is not None:
+        with contextlib.suppress(tk.TclError):
+            widget.focus_force()
+        _gui_pump(root, 0.04)
+    w = root.focus_get() or widget or root
+    w.event_generate(seq)
+    _gui_pump(root, pump)
+
+
+@gui_test_step("kbd C1: F6 / Shift+F6 visit search, tabs, filter, table, "
+               "Inspector, status, and wrap")
+def gt_kbd_f6_regions(app, ctx):
+    root = app.root
+    keep = (app.inspector_visible, app.current_tab_name())
+    try:
+        for tabname, insp in (("devices", True), ("dash", False),
+                              ("alerts", True)):
+            app._select_tab(tabname)
+            _gui_pump(root, 0.5)
+            app.toggle_inspector(insp, remember=False)
+            _gui_pump(root, 0.4)
+            tab = app.tabs[tabname]
+            fe = getattr(tab, "filter_entry", None)
+            has_fe = fe is not None and fe.winfo_viewable()
+            want = ["search", "tabs"] + (["filter"] if has_fe else []) + \
+                ["table"] + (["inspector"] if insp else []) + ["status"]
+            regions = app._regions()
+            assert [n for n, _w in regions] == want, (tabname, regions)
+            widgets = dict(regions)
+            assert widgets["tabs"] is app.tabstrip.selected_label()
+            assert widgets["status"] is app.status_lbl
+            if has_fe:
+                assert widgets["filter"] is fe
+            assert widgets["table"] is app._table_target(tab)
+            _kbd_press(root, app.search_entry, "<F6>")     # search -> next
+            order = [app._region_of(root.focus_get())]
+            for _ in range(len(want) - 1):
+                _kbd_press(root, None, "<F6>")
+                order.append(app._region_of(root.focus_get()))
+            # the last press wrapped from the status line to the search box
+            assert order == want[1:] + ["search"], (tabname, order, want)
+            assert root.focus_get() is app.search_entry
+            # backwards from the search box: the status line, then up
+            _kbd_press(root, app.search_entry, "<Shift-F6>")
+            assert root.focus_get() is app.status_lbl, root.focus_get()
+            back = ["status"]
+            for _ in range(len(want) - 1):
+                _kbd_press(root, None, "<Shift-F6>")
+                back.append(app._region_of(root.focus_get()))
+            assert back == list(reversed(want)), (tabname, back, want)
+    finally:
+        app.toggle_inspector(keep[0], remember=False)
+        app._select_tab(keep[1] or "dash")
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C2: Tab from the search box reaches a tab's content in "
+               "at most 8 presses, every tab, both views")
+def gt_kbd_tab_presses(app, ctx):
+    root = app.root
+    mode = app.mode_ui_var.get()
+    worst = {}
+    try:
+        for view in ("Beginner", "Advanced"):
+            app.mode_ui_var.set(view)
+            app._on_ui_mode_change()
+            _gui_pump(root, 0.4)
+            for name, tab in app.tabs.items():
+                if app.beginner_mode and tab.advanced:
+                    continue
+                n = tab_presses_to_content(app, name)
+                worst[(view, name)] = n
+                assert n is not None and n <= 8, (view, name, n)
+        # only the shown tab's label is a Tab stop
+        stops = [str(l.cget("takefocus")) for _o, _b, l in
+                 app.tabstrip.tabs.values() if l.winfo_viewable()]
+        assert stops.count("1") == 1, stops
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        _gui_pump(root, 0.3)
+    return None
+
+
+@gui_test_step("kbd C3: Left / Right / Home / End on a tab label (and "
+               "Home / End on the notebook) switch tabs, focus stays on "
+               "the strip")
+def gt_kbd_tab_strip_arrows(app, ctx):
+    root = app.root
+    strip = app.tabstrip
+    app._select_tab("devices")
+    _gui_pump(root, 0.5)
+    order = list(strip.order)
+    assert len(order) >= 6, order
+    start = strip._selected()
+    i = order.index(start)
+    _kbd_press(root, strip.selected_label(), "<Right>")
+    assert strip._selected() == order[(i + 1) % len(order)], strip._selected()
+    assert root.focus_get() is strip.tabs[strip._selected()][2]
+    _kbd_press(root, None, "<Left>")
+    assert strip._selected() == start
+    assert root.focus_get() is strip.tabs[start][2]
+    _kbd_press(root, None, "<End>")
+    assert strip._selected() == order[-1]
+    assert root.focus_get() is strip.tabs[order[-1]][2]
+    _kbd_press(root, None, "<Right>")                 # wraps to the first
+    assert strip._selected() == order[0]
+    _kbd_press(root, None, "<Left>")                  # and back to the last
+    assert strip._selected() == order[-1]
+    _kbd_press(root, None, "<Home>")
+    assert strip._selected() == order[0]
+    # Alt+Left is Back, not "previous tab": the strip leaves it alone
+    went = []
+    app.router.back = lambda: went.append(1)
+    try:
+        cur = strip._selected()
+        _kbd_press(root, strip.tabs[cur][2], "<Alt-Left>")
+        assert went == [1] and strip._selected() == cur, (went,
+                                                          strip._selected())
+    finally:
+        del app.router.back
+    # the notebook itself (after a click on a tab): Home / End
+    _kbd_press(root, app.nb, "<End>")
+    assert strip._selected() == order[-1]
+    assert root.focus_get() is strip.tabs[order[-1]][2]
+    _gui_pump(root, 0.3)
+    stops = [str(l.cget("takefocus")) for _o, _b, l in
+             strip.tabs.values() if l.winfo_viewable()]
+    assert stops.count("1") == 1, stops
+    app._select_tab("dash")
+    _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C4: sub-view buttons: arrows switch, one Tab stop, "
+               "Enter / Down go into the content")
+def gt_kbd_subview_arrows(app, ctx):
+    root = app.root
+    mode = app.mode_ui_var.get()
+    tab = app._select_tab("packets")          # Advanced: shown for it
+    try:
+        _gui_pump(root, 0.5)
+        names = list(tab._sub_btns)
+        assert len(names) >= 3, names
+        tab.show_subview(names[0])
+        _gui_pump(root, 0.2)
+        stops = [n for n, b in tab._sub_btns.items()
+                 if str(b.cget("takefocus")) == "1"]
+        assert stops == [names[0]], stops
+        _kbd_press(root, tab._sub_btns[names[0]], "<Right>")
+        assert tab.subview == names[1], tab.subview
+        assert root.focus_get() is tab._sub_btns[names[1]]
+        assert [n for n, b in tab._sub_btns.items()
+                if str(b.cget("takefocus")) == "1"] == [names[1]]
+        _kbd_press(root, None, "<End>")
+        assert tab.subview == names[-1]
+        _kbd_press(root, None, "<Right>")                 # wraps
+        assert tab.subview == names[0]
+        _kbd_press(root, None, "<Left>")
+        assert tab.subview == names[-1]
+        _kbd_press(root, None, "<Home>")
+        assert tab.subview == names[0]
+        # into the content
+        for seq in ("<Down>", "<Return>"):
+            _kbd_press(root, tab._sub_btns[tab.subview], seq)
+            f = root.focus_get()
+            prefix = str(tab._sub_frames[tab.subview]) + "."
+            assert f is not None and str(f).startswith(prefix), (seq, f)
+        # the mouse way still works
+        tab._sub_btns[names[2]].invoke()
+        assert tab.subview == names[2]
+        tab.show_subview("Packets")
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C5: Dashboard cards: Space and Return open, arrows "
+               "move in grid order")
+def gt_kbd_dashboard_cards(app, ctx):
+    root = app.root
+    dt = app._select_tab("dash")
+    _gui_pump(root, 0.6)
+    calls = []
+    app.goto = lambda tg, arg=None: calls.append(tg)
+    try:
+        cards = dt.card_frames
+        cols = dt._card_cols
+        assert len(cards) == len(dt.CARDS) and cols >= 3 and \
+            len(cards) > cols
+        for seq in ("<space>", "<Return>"):
+            del calls[:]
+            _kbd_press(root, cards[0], seq)
+            assert calls == [dt.CARDS[0][2]], (seq, calls)
+        _kbd_press(root, cards[0], "<Right>")
+        assert root.focus_get() is cards[1]
+        _kbd_press(root, None, "<Left>")
+        assert root.focus_get() is cards[0]
+        _kbd_press(root, None, "<Left>")              # an edge: stays
+        assert root.focus_get() is cards[0]
+        _kbd_press(root, None, "<Down>")
+        assert root.focus_get() is cards[cols], (cols, root.focus_get())
+        _kbd_press(root, None, "<Up>")
+        assert root.focus_get() is cards[0]
+        # every card kind answers Space (answers, story, unusual, big)
+        for c in dt._kb_cards:
+            assert c.bind("<space>") and c.bind("<Right>"), c
+        assert len(dt._kb_cards) >= len(cards)
+    finally:
+        del app.goto
+
+
+@gui_test_step("kbd C6: status line, footer, messages, job and Inspector "
+               "close are keyboard-operable with a focus ring")
+def gt_kbd_status_widgets(app, ctx):
+    root = app.root
+    seen = []
+    app.open_diagnostics = lambda: seen.append("diag")
+    app.open_coverage = lambda: seen.append("coverage")
+    keep = app.inspector_visible
+    try:
+        app.toggle_inspector(True, remember=False)
+        _gui_pump(root, 0.4)
+        for w in (app.status_lbl, app.footer_lbl, app.msg_btn, app.job_lbl,
+                  app.inspector.close_btn):
+            assert str(w.cget("takefocus")) == "1", w
+            assert w.bind("<Return>") and w.bind("<space>"), w
+        for w, want in ((app.status_lbl, "diag"),
+                        (app.footer_lbl, "coverage")):
+            for seq in ("<Return>", "<space>"):
+                del seen[:]
+                _kbd_press(root, w, seq)
+                assert seen == [want], (w, seq, seen)
+            assert int(w.cget("highlightthickness")) == 2, \
+                "no focus ring on " + str(w)
+        app.search_entry.focus_force()
+        _gui_pump(root, 0.1)
+        assert int(app.status_lbl.cget("highlightthickness")) == 0
+        # the close mark: Space hides the Inspector, F2 shows it again
+        _kbd_press(root, app.inspector.close_btn, "<space>")
+        assert not app.inspector_visible
+    finally:
+        for n in ("open_diagnostics", "open_coverage"):
+            app.__dict__.pop(n, None)
+        app.toggle_inspector(keep, remember=False)
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C7: F7 table, F8 view, F5 refresh, Shift+F1 sheet, "
+               "Ctrl+Shift+arrows dividers")
+def gt_kbd_f_keys_and_dividers(app, ctx):
+    root = app.root
+    mode = app.mode_ui_var.get()
+    keep = app.inspector_visible
+    try:
+        # F7: the shown table, first row selected when none was
+        tab = app._select_tab("devices")
+        _gui_pump(root, 0.6)
+        kids = tab.tree.get_children()
+        assert kids, "the scenario should have devices"
+        tab.tree.selection_set(())
+        _kbd_press(root, app.search_entry, "<F7>")
+        assert root.focus_get() is tab.tree, root.focus_get()
+        assert tab.tree.selection(), "no row selected by F7"
+        # F8: Beginner <-> Advanced, twice
+        was = app.beginner_mode
+        _kbd_press(root, tab.tree, "<F8>")
+        assert app.beginner_mode == (not was)
+        assert app.mode_ui_var.get() == ("Beginner" if app.beginner_mode
+                                         else "Advanced")
+        _kbd_press(root, None, "<F8>")
+        assert app.beginner_mode == was
+        # F5: refreshes the shown tab
+        calls = []
+        app._refresh_shown_tab = lambda: calls.append(1)
+        try:
+            _kbd_press(root, tab.tree, "<F5>")
+        finally:
+            del app._refresh_shown_tab
+        assert calls == [1], calls
+        # Shift+F1: Help at the keyboard map, every binding listed
+        _kbd_press(root, tab.tree, "<Shift-F1>")
+        assert app.current_tab_name() == "help"
+        ht = app.tabs["help"]
+        _gui_pump(root, 0.4)
+        text = ht.txt.get("1.0", "end")
+        assert "Keyboard map" in text.splitlines()[0], text[:80]
+        for name in DEFAULT_SHORTCUTS:
+            assert _pretty_seq(DEFAULT_SHORTCUTS[name]) in text, name
+        for label, keys in KEYMAP_FIXED:
+            assert label in text and keys in text, label
+        # dividers: Ctrl+Shift+Left / Right (the Inspector's), with the
+        # focus on a tab label (in a text box these keys select words)
+        app._select_tab("devices")
+        app.toggle_inspector(True, remember=False)
+        _gui_pump(root, 0.6)
+        body = app.body
+        p0 = body.sashpos(0)
+        lbl = app.tabstrip.selected_label()
+        _kbd_press(root, lbl, "<Control-Shift-Left>")
+        p1 = body.sashpos(0)
+        assert p1 < p0, (p0, p1)
+        _kbd_press(root, lbl, "<Control-Shift-Right>")
+        assert body.sashpos(0) > p1
+        _kbd_press(root, app.search_entry, "<Control-Shift-Left>")
+        assert body.sashpos(0) > p1, "moved while typing in a text box"
+        # the Packets list | details divider
+        pt = app._select_tab("packets")
+        _gui_pump(root, 0.6)
+        v0 = pt.vert_pane.sashpos(0)
+        _kbd_press(root, app.tabstrip.selected_label(),
+                   "<Control-Shift-Down>")
+        v1 = pt.vert_pane.sashpos(0)
+        assert v1 > v0, (v0, v1)
+        _kbd_press(root, None, "<Control-Shift-Up>")
+        assert pt.vert_pane.sashpos(0) < v1
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        app.toggle_inspector(keep, remember=False)
+        app._select_tab("dash")
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C8: a new shortcut can be changed in Settings and the "
+               "old key stops working; taken keys are refused")
+def gt_kbd_remap_in_settings(app, ctx):
+    root = app.root
+    win = app._open_settings("shortcuts")
+    try:
+        _gui_pump(root, 0.5)
+        var = win.vars["shortcuts.regions"]
+        # refused: a text box's key, a fixed key, another action's key
+        for bad, why in (("<Control-Key-w>", "Text boxes"),
+                         ("<Tab>", "Already used by"),
+                         ("<Control-Tab>", "Already used by"),
+                         ("<F7>", "Already used by"),
+                         ("<Control-Alt-q>", "Ctrl+Alt")):
+            var.set(bad)
+            msg = win._validate("shortcuts.regions")
+            assert why in msg, (bad, msg)
+        var.set("<F9>")
+        assert win._validate("shortcuts.regions") == ""
+        assert win.apply(), win.errors
+        assert app.config.get("shortcuts.regions") == "<F9>"
+        root.update()
+        _kbd_press(root, app.search_entry, "<F9>")
+        assert root.focus_get() is app.tabstrip.selected_label(), \
+            root.focus_get()
+        _kbd_press(root, app.search_entry, "<F6>")        # no longer bound
+        assert root.focus_get() is app.search_entry, root.focus_get()
+    finally:
+        win.vars["shortcuts.regions"].set(DEFAULT_SHORTCUTS["regions"])
+        win.apply()
+        win.win.destroy()
+        _gui_pump(root, 0.3)
+    _kbd_press(root, app.search_entry, "<F6>")
+    assert root.focus_get() is app.tabstrip.selected_label()
+    app.search_entry.focus_force()
 
 
 # ============================================================================
