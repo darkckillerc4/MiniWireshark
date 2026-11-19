@@ -18441,9 +18441,12 @@ class AlertEngine:
         out = 0.0
         for tag in (f"{kind}|*", f"{kind}|{device_key}" if device_key
                     else None):
-            with contextlib.suppress(TypeError, ValueError):
-                if tag:
-                    out = max(out, float(sn.get(tag) or 0))
+            # fifth audit (settings): only a time a snooze can end at
+            # counts; `1e999` (or a time years away) snoozed for ever and a
+            # 400-digit number stopped the alerts (OverflowError)
+            v = sn.get(tag) if tag else None
+            if snooze_end_ok(v):
+                out = max(out, float(v))
         return out
 
     def _add(self, kind, severity, device_key, reason, observed, interp, poss,
@@ -21320,6 +21323,37 @@ class AdGuardConnector(Connector):
 
 
 CONNECTOR_KINDS = {"pihole": PiHoleConnector, "adguard": AdGuardConnector}
+# fifth audit (settings): what a helper's entry in the settings holds. An
+# entry was only checked to be a table, so `"id": [1]` or `"kind": {}`
+# stopped the helpers' start (TypeError: unhashable) and two entries with
+# the same id stopped the Sources tab (a duplicate row id)
+CONNECTOR_SPEC_KEYS = {"id": str, "kind": str, "name": str, "url": str,
+                       "username": str, "pin": str, "verify": bool,
+                       "enabled": bool}
+
+
+def connector_spec_clean(sp):
+    """One helper's settings with each known key of its kind: a key of
+    another kind is taken out (so its default applies), keys this version
+    doesn't know are kept. -> the entry, or None when it can't be one (not
+    a table, or no id to know it by)."""
+    if not isinstance(sp, dict):
+        return None
+    out = {k: v for k, v in sp.items() if k not in CONNECTOR_SPEC_KEYS or
+           isinstance(v, CONNECTOR_SPEC_KEYS[k])}
+    return out if out.get("id") else None
+
+
+def connector_specs(specs):
+    """The usable helper entries of a settings list, cleaned as above, the
+    first of each id only. Anything that isn't a list gives []."""
+    out, seen = [], set()
+    for sp in specs if isinstance(specs, list) else []:
+        sp = connector_spec_clean(sp)
+        if sp is not None and sp["id"] not in seen:
+            seen.add(sp["id"])
+            out.append(sp)
+    return out
 
 
 class ConnectorManager:
@@ -21342,9 +21376,8 @@ class ConnectorManager:
 
     def update(self, specs):
         live = {}
-        for sp in specs or []:
-            if not isinstance(sp, dict):
-                continue           # (third audit #23) a settings file's junk
+        # (third audit #23, fifth audit) a settings file's junk is skipped
+        for sp in connector_specs(specs):
             cls = CONNECTOR_KINDS.get(sp.get("kind"))
             if cls is None or not sp.get("id"):
                 continue
@@ -27455,7 +27488,13 @@ def migrate_config(data, fixed=None):
     back (named in `fixed`) and the rest of the file is kept."""
     fixed = [] if fixed is None else fixed
     try:
-        ver = int(data.get("config_version", 1) or 1)
+        ver = data.get("config_version", 1)
+        # fifth audit (settings): `{}`, `null`, `""` or `false` became 1
+        # without a word (and the next save kept a .bak); like a list
+        # they are not a number, so they are named as set back too
+        if isinstance(ver, bool) or not isinstance(ver, (int, float)):
+            raise TypeError("config_version is not a number")
+        ver = int(ver or 1)
     except (TypeError, ValueError, OverflowError):
         ver = 1                  # unknown: the steps below are safe to redo
         fixed.append("config_version")
@@ -27561,10 +27600,38 @@ CHOICE_ALSO_OK = {
 CONFIG_LIST_ITEMS = {"filters.recent": str, "connectors.list": dict,
                      "general.tours_done": str,
                      "alerts.muted_devices": str, "alerts.expected": str}
-CONFIG_TABLE_VALUES = {"filters.presets": dict, "workspaces.saved": dict}
+# a snooze lasts a day at most ("Until tomorrow" under two); an end later
+# than this is a hand edit or a clock that was wrong when it was set
+SNOOZE_LONGEST = 3 * 86400
+
+
+def snooze_end_ok(v, now=None):
+    """A snooze's end as the settings file holds it: a plain number (not
+    on/off), finite, after 1970 and at most SNOOZE_LONGEST from now."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        v = float(v)
+    except OverflowError:
+        return False
+    now = time.time() if now is None else now
+    return math.isfinite(v) and 0 < v <= now + SNOOZE_LONGEST
+
+
+# fifth audit (settings): a snooze's end time is checked too (a word, NaN,
+# 1e999, a list or a time years away was kept, and the alerts read it)
+CONFIG_TABLE_VALUES = {"filters.presets": dict, "workspaces.saved": dict,
+                       "alerts.snoozed": snooze_end_ok}
+# lists whose items are also mended one by one (fifth audit: a helper's
+# `"id": [1]` stopped the helpers' start)
+CONFIG_LIST_REPAIR = {"connectors.list": connector_specs}
 # numbers with no Settings control, so no range there: `"interval": 0`
 # asked a connected helper without a pause, 1e308 stopped its thread
 CONFIG_RANGES = {"connectors.interval": (10, 3600)}
+
+
+def _item_fits(x, kind):
+    return isinstance(x, kind) if isinstance(kind, type) else kind(x)
 
 
 def _clean_config_contents(data, fixed):
@@ -27574,12 +27641,14 @@ def _clean_config_contents(data, fixed):
         have = data.get(section)
         v = have.get(k) if isinstance(have, dict) else None
         if isinstance(v, list):
-            keep = [x for x in v if isinstance(x, kind)]
-            if len(keep) != len(v):
+            keep = [x for x in v if _item_fits(x, kind)]
+            if key in CONFIG_LIST_REPAIR:
+                keep = CONFIG_LIST_REPAIR[key](keep)
+            if keep != v:
                 have[k] = keep
                 fixed.append(key)
         elif isinstance(v, dict) and key in CONFIG_TABLE_VALUES:
-            keep = {n: x for n, x in v.items() if isinstance(x, kind)}
+            keep = {n: x for n, x in v.items() if _item_fits(x, kind)}
             if len(keep) != len(v):
                 have[k] = keep
                 fixed.append(key)
@@ -51806,7 +51875,7 @@ class SourcesTab(BaseTab):
             "Needs live capture" + ("" if pm.available else
                                     " and the optional psutil component"))))
         st_all = app.connectors.status if app.connectors else {}
-        for sp in app.config.get("connectors.list", []) or []:
+        for sp in connector_specs(app.config.get("connectors.list", [])):
             st = st_all.get(sp["id"], {})
             state = st.get("state", "waiting")
             label = {"ok": "✔ Connected", "auth": "✖ Wrong password",
@@ -59979,10 +60048,10 @@ proc ::mw_explicit_fonts {top names} {
                 self.tabs["sources"].refresh()
 
     def connector_set(self, cid, toggle_enabled=False, **changes):
-        specs = [dict(x) for x in self.config.get("connectors.list", [])
-                 or []]
+        specs = [dict(x) if isinstance(x, dict) else x
+                 for x in self.config.get("connectors.list", []) or []]
         for sp in specs:
-            if sp["id"] == cid:
+            if isinstance(sp, dict) and sp.get("id") == cid:
                 if toggle_enabled:
                     sp["enabled"] = not sp.get("enabled", True)
                 sp.update(changes)
@@ -59994,7 +60063,7 @@ proc ::mw_explicit_fonts {top names} {
 
     def connector_remove(self, cid):
         specs = [x for x in self.config.get("connectors.list", []) or []
-                 if x.get("id") != cid]
+                 if not (isinstance(x, dict) and x.get("id") == cid)]
         self.config.set("connectors.list", specs)
         self.config.save()
         self.vault.delete(cid)
@@ -60004,11 +60073,12 @@ proc ::mw_explicit_fonts {top names} {
 
     def connector_save(self, spec, password=None):
         """Add or update a helper; the password goes to the vault."""
-        specs = [dict(x) for x in self.config.get("connectors.list", [])
-                 or []]
+        specs = [dict(x) if isinstance(x, dict) else x
+                 for x in self.config.get("connectors.list", []) or []]
         if not spec.get("id"):
             spec["id"] = "c-" + uuid.uuid4().hex[:10]
-        specs = [x for x in specs if x.get("id") != spec["id"]] + [spec]
+        specs = [x for x in specs if not (
+            isinstance(x, dict) and x.get("id") == spec["id"])] + [spec]
         self.config.set("connectors.list", specs)
         self.config.save()
         cid = spec["id"]
@@ -60066,8 +60136,8 @@ proc ::mw_explicit_fonts {top names} {
         t = self.theme
         spec = {}
         if cid:
-            spec = next((dict(x) for x in self.config.get(
-                "connectors.list", []) or [] if x["id"] == cid), {})
+            spec = next((x for x in connector_specs(self.config.get(
+                "connectors.list", [])) if x["id"] == cid), {})
             kind = spec.get("kind", kind)
         cls = CONNECTOR_KINDS.get(kind or "pihole")
         win = tk.Toplevel(self.root)
@@ -62750,7 +62820,7 @@ proc ::mw_explicit_fonts {top names} {
             f"{a.kind}|{a.device_key}"
         sn = dict(self.config.get("alerts.snoozed", {}) or {})
         sn = {k: v for k, v in sn.items()
-              if isinstance(v, (int, float)) and v > now}
+              if snooze_end_ok(v, now) and v > now}
         sn[tag] = now + max(60.0, float(seconds))
         self.config.set("alerts.snoozed", dict(list(sn.items())[-200:]))
         self.config.save()
@@ -76408,15 +76478,51 @@ def _mutate_call_frame(rng, raw):
     return bytes(b)
 
 
+def _cpu_clock():
+    """This thread's CPU time clock, or None where there is none."""
+    clock = getattr(time, "thread_time", None)
+    try:
+        clock()
+        return clock
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def call_frame_limit_check(cpu_slowest, waited, retime, limit=0.050,
+                           tries=5):
+    """Fifth audit: "one frame took 98 ms" failed `call decoder fuzz` once
+    on a busy machine. The 50 ms limit stays; what is measured changed.
+    `cpu_slowest` is the most CPU time one frame used (None without a CPU
+    clock): over the limit fails. `waited` holds the frames whose wall
+    time was over it; each is timed again (`retime(frame)` -> seconds)
+    and fails only when it is slow every one of `tries` times, so a frame
+    the machine set aside for a while (preemption, another program) no
+    longer fails while one that is slow every time still does.
+    -> "" when all is well, else what was slow."""
+    if cpu_slowest is not None and cpu_slowest >= limit:
+        return f"one frame took {cpu_slowest * 1000:.0f} ms of CPU time"
+    for frame in waited:
+        best = min(retime(frame) for _ in range(tries))
+        if best >= limit:
+            return (f"one frame took {best * 1000:.0f} ms each of "
+                    f"{tries} times")
+    return ""
+
+
 @self_test(slow=True)
 def t_call_decoder_fuzz(ctx):
     """5.3.4 (MC8, S4 and S12 for the new decoder): mutated call frames
     never make wire_rtc, either decoder or the call tracker raise, none
-    takes over 50 ms, and both decoders agree on every field."""
+    takes over 50 ms, and both decoders agree on every field. Fifth
+    audit: the 50 ms is this thread's CPU time, and a frame over 50 ms of
+    wall time is timed again and fails only when slow every time, so a
+    busy machine no longer fails it ("one frame took 98 ms")."""
     rng = random.Random(1010)
     frames = call_corpus().frames()
     m = _call_model(ctx, frames[:4000])        # streams to be fed lies
-    slowest, mutated = 0.0, []
+    cpu = _cpu_clock()
+    limit = 0.050
+    cpu_slowest, waited, mutated = 0.0, [], []
     # the time limit is the decoders' own: a garbage-collector pass (a
     # whole-heap walk that the app's frozen start-up objects keep short)
     # runs between frames, not inside the timed part
@@ -76427,13 +76533,17 @@ def t_call_decoder_fuzz(ctx):
             raw, ts, lt = frames[rng.randrange(len(frames))]
             b = _mutate_call_frame(rng, raw)
             t0 = time.perf_counter()
+            c0 = cpu() if cpu else 0.0
             r = wire_rtc(b[42:])
             if r is not None and r["kind"] == "RTP":
                 assert r["header_len"] <= len(b) - 42, r
             d = fast_decode(b, ts + 0.0001 * i, lt)
             assert isinstance(d, dict) and "proto" in d
             m.ingest(d)
-            slowest = max(slowest, time.perf_counter() - t0)
+            if cpu:
+                cpu_slowest = max(cpu_slowest, cpu() - c0)
+            if time.perf_counter() - t0 >= limit:
+                waited.append((b, ts + 0.0001 * i, lt))
             if i % 4 == 0:
                 mutated.append((b, ts, lt))
             if i % 500 == 499:
@@ -76443,7 +76553,22 @@ def t_call_decoder_fuzz(ctx):
             gc.enable()
     m.calls.summary()
     calls_card_text(m.calls)
-    assert slowest < 0.050, f"one frame took {slowest * 1000:.0f} ms"
+
+    def retime(frame):
+        b, ts, lt = frame
+        t0 = time.perf_counter()
+        wire_rtc(b[42:])
+        fast_decode(b, ts, lt)
+        return time.perf_counter() - t0
+    was_on = gc.isenabled()
+    gc.disable()
+    try:
+        slow = call_frame_limit_check(cpu_slowest if cpu else None,
+                                      waited, retime, limit)
+    finally:
+        if was_on:
+            gc.enable()
+    assert not slow, slow
     if ctx.scapy_ok:
         diffs = decoder_differences(mutated)
         assert not diffs, f"{len(diffs)} differences, e.g. " + \
@@ -105745,6 +105870,181 @@ def t_a3_settings_items_of_the_wrong_kind_are_dropped(ctx):
     assert m.conns == {}
     assert ConnectorManager([], None, None, 0).interval == 10
     assert ConnectorManager([], None, None, 1e308).interval == 3600
+
+
+def _r5_load(ctx, name, text):
+    p = ctx.path(f"r5-{name}.json")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+    return p, AppConfig(path=p)
+
+
+R5_SNOOZE_JUNK = ('"str|*": "123", "nan|*": NaN, "inf|*": 1e999, '
+                  '"neg|*": -5, "zero|*": 0, "huge|*": 1' + "0" * 400 +
+                  ', "far|*": %d, "bool|*": true, "null|*": null, '
+                  '"nest|*": {"a": [1, {"b": null}]}, "list|*": [%d]')
+
+
+@self_test()
+def t_r5_snoozes_of_any_shape_are_dropped_at_load(ctx):
+    """Fifth audit (settings): a snooze end in the settings file that
+    isn't a time a snooze can end at (a word, NaN, 1e999, a negative or
+    400-digit number, a time ten years away, on/off, a list or a table) is
+    dropped when the file is read and named in the warning; real snoozes,
+    over or not, are kept. The alerts read what is left, and also a newer
+    version's file (not cleaned, B-32), without ever stopping: before,
+    1e999 snoozed an alert type for ever and the 400-digit number stopped
+    every alert (OverflowError)."""
+    now = time.time()
+    far = int(now + 10 * 365 * 86400)
+    junk = R5_SNOOZE_JUNK % (far, int(now + 3600))
+    text = ('{"alerts": {"snoozed": {"ok|*": %r, "ok|aa:bb": %r, '
+            '"past|*": %r, %s}}}' % (now + 3600, now + 86400 * 1.9,
+                                     now - 100, junk))
+    _, c = _r5_load(ctx, "snoozes", text)
+    sn = c.get("alerts.snoozed")
+    assert sorted(sn) == ["ok|*", "ok|aa:bb", "past|*"], sorted(sn)
+    assert "alerts.snoozed" in c.repaired and c.warning, c.repaired
+    kinds = ["ok", "past", "str", "nan", "inf", "neg", "zero", "huge",
+             "far", "bool", "null", "nest", "list", "none"]
+    eng = AlertEngine(c)
+    for kind in kinds:
+        until = eng.snoozed_until(kind, "aa:bb")
+        assert until == 0.0 or kind == "ok" or kind == "past", (kind, until)
+        eng.is_muted(kind, "aa:bb", "aa:bb")
+    assert eng.is_muted("ok", "", "") and not eng.is_muted("past", "", "")
+    assert not eng.is_muted("inf", "", "") and not eng.is_muted("far", "", "")
+    # a newer version's file keeps the table as it is: read it raw
+    p, c = _r5_load(ctx, "snoozes-newer", '{"config_version": 99, '
+                    '"alerts": {"snoozed": {%s}}}' % junk)
+    assert "huge|*" in c.get("alerts.snoozed")
+    eng = AlertEngine(c)
+    for kind in kinds:
+        assert eng.snoozed_until(kind, "aa:bb") == 0.0, kind
+        assert not eng.is_muted(kind, "aa:bb", "aa:bb"), kind
+        assert eng._add(kind, "WARNING", "aa:bb", "r", "o", "i", "p")
+    a = eng._add("arp_spoof", "DANGER", "aa:bb", "r", "o", "i", "p")
+    app = types.SimpleNamespace(config=c, _set_banner=lambda *x, **k: 0)
+    c.save = lambda: True
+    MiniWireshark.alert_snooze(app, a, 3600)
+    assert sorted(c.get("alerts.snoozed")) == ["arp_spoof|aa:bb"]
+    assert eng.snoozed_until("arp_spoof", "aa:bb") > time.time()
+
+
+@self_test()
+def t_r5_connector_entries_are_mended_at_load(ctx):
+    """Fifth audit (settings): each connected helper in the settings
+    file is a table with an id; a known key of the wrong kind is taken
+    out (its default applies), an entry with no usable id or a second one
+    with the same id is dropped. The helpers and their buttons cope with a
+    newer version's raw list too: before, `"id": [1]` or `"kind": {}`
+    stopped the helpers' start (unhashable) and a "url" that isn't text
+    stopped it at .rstrip."""
+    entries = ('[{"id": "c1", "kind": "pihole", "url": "http://pi.hole", '
+               '"verify": "yes", "enabled": 1, "name": 5, "pin": null, '
+               '"username": [], "zzz": {"a": [1]}}, '
+               '{"id": [1], "kind": "pihole"}, {"id": "c2", "kind": {}}, '
+               '{"id": "c1", "kind": "adguard"}, {"id": ""}, '
+               '{"kind": "pihole"}, {"id": "c3", "kind": "adguard", '
+               '"url": 7}, [], 3, null]')
+    _, c = _r5_load(ctx, "conns", '{"connectors": {"list": %s}}' % entries)
+    got = c.get("connectors.list")
+    assert got == [{"id": "c1", "kind": "pihole", "url": "http://pi.hole",
+                    "zzz": {"a": [1]}}, {"id": "c2"},
+                   {"id": "c3", "kind": "adguard"}], got
+    assert "connectors.list" in c.repaired and c.warning, c.repaired
+    m = ConnectorManager(got, None, lambda *a: None)
+    assert sorted(m.conns) == ["c1", "c3"], m.conns
+    assert m.conns["c1"].verify and m.conns["c3"].url == ""
+    m.stop()
+    # a clean list is left alone and not named
+    _, c = _r5_load(ctx, "conns-ok", json.dumps({"connectors": {"list": [
+        {"id": "c1", "kind": "pihole", "url": "http://pi.hole",
+         "verify": True, "enabled": False}]}}))
+    assert not c.repaired and len(c.get("connectors.list")) == 1
+    # a newer version's file (B-32) keeps its list: everything copes
+    _, c = _r5_load(ctx, "conns-newer", '{"config_version": 99, '
+                    '"connectors": {"list": %s}}' % entries)
+    raw = c.get("connectors.list")
+    assert len(raw) == 10, raw
+    m = ConnectorManager(raw, None, lambda *a: None)
+    assert sorted(m.conns) == ["c1", "c3"], m.conns
+    m.update(raw)
+    m.stop()
+    c.save = lambda: True
+    app = types.SimpleNamespace(
+        config=c, vault=types.SimpleNamespace(delete=lambda cid: None),
+        _start_connectors=lambda: None, tabs={})
+    MiniWireshark.connector_set(app, "c1", toggle_enabled=True)
+    assert c.get("connectors.list")[0]["enabled"] is False
+    MiniWireshark.connector_save(app, {"id": "c2", "kind": "pihole"})
+    MiniWireshark.connector_remove(app, "c1")
+    left = c.get("connectors.list")
+    assert len(left) == 8 and left[-1] == {"id": "c2", "kind": "pihole"}
+    assert 3 in left and None in left         # kept for the newer version
+
+
+@self_test()
+def t_r5_settings_version_of_any_kind_is_named(ctx):
+    """Fifth audit (settings): a schema number that is not a number
+    (`{}`, null, "", false, "3") takes the path `[1]`, 1e999 and NaN take:
+    set back, named in the start's warning, the rest kept, and no .bak of
+    the bad file. Before, `{}` and the others became 1 without a word and
+    the first save kept a .bak. A missing number (a version-1 file) and a
+    real number stay quiet."""
+    for name, ver in (("obj", "{}"), ("null", "null"), ("empty", '""'),
+                      ("false", "false"), ("word", '"3"'),
+                      ("list", "[1]"), ("nan", "NaN"), ("inf", "1e999")):
+        p, c = _r5_load(ctx, f"ver-{name}", '{"config_version": %s, '
+                        '"appearance": {"theme": "Dark"}}' % ver)
+        assert "config_version" in c.repaired, (name, c.repaired)
+        assert "config_version" in c.warning, (name, c.warning)
+        assert c.get("appearance.theme") == "Dark", name
+        assert c.data["config_version"] == CONFIG_SCHEMA_VERSION, name
+        assert c.save() and not os.path.exists(p + ".bak"), name
+        assert read_json(p)["config_version"] == CONFIG_SCHEMA_VERSION
+        again = AppConfig(path=p)
+        assert not again.warning and not again.repaired, name
+    for name, text in (("missing", '{"appearance": {"theme": "Dark"}}'),
+                       ("two", '{"config_version": 2}'),
+                       ("now", '{"config_version": %d}' %
+                        CONFIG_SCHEMA_VERSION)):
+        p, c = _r5_load(ctx, f"ver-{name}", text)
+        assert not c.repaired and not c.warning, (name, c.repaired)
+
+
+@self_test()
+def t_r5_call_frame_limit_survives_a_busy_machine(ctx):
+    """Fifth audit: `call decoder fuzz` failed once on a busy machine
+    ("one frame took 98 ms", limit 50). The limit stays. A frame that
+    waited (the machine was busy once) passes; one that is slow every
+    time it is timed, or that used 50 ms of CPU time, still fails."""
+    calls = {"n": 0}
+
+    def once_slow(frame):            # set aside once, then quick
+        calls["n"] += 1
+        return 0.150 if calls["n"] == 1 else 0.001
+    assert call_frame_limit_check(0.002, [b"f"], once_slow) == ""
+    assert "every" not in call_frame_limit_check(
+        0.002, [b"f"], lambda f: 0.001)
+    slow = call_frame_limit_check(0.002, [b"f"], lambda f: 0.150)
+    assert "150 ms each of 5 times" in slow, slow
+    slow = call_frame_limit_check(0.150, [], lambda f: 0.0)
+    assert "150 ms of CPU time" in slow, slow
+    assert call_frame_limit_check(None, [b"f"], once_slow) == ""
+    # the CPU clock sees work, not waiting
+    cpu = _cpu_clock()
+    if cpu is None:
+        return "skip"
+    c0 = cpu()
+    time.sleep(0.15)
+    waited = cpu() - c0
+    c0 = cpu()
+    end = time.perf_counter() + 0.15
+    while time.perf_counter() < end:
+        pass
+    worked = cpu() - c0
+    assert waited < 0.05 <= worked, (waited, worked)
 
 
 @self_test(slow=True, needs_source=True)
