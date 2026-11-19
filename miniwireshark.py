@@ -99023,6 +99023,12 @@ def gt_m4_shell(app, ctx):
             # runner it kept it, and the strip had 609 px of 1028)
             root.geometry(px_geo("1400x700"))
             _gui_pump(root, 0.4)
+            # (CI windows 3.14: busy after the language change, the resize
+            # check ran only after the next resize, so it never saw the
+            # window wide and the Inspector had no line to cross; wait for
+            # the wide width to land first)
+            _gui_pump(root, until=lambda: (getattr(app, "_body_w_prev", 0)
+                                           or 0) >= px(1180), timeout=5)
             root.geometry(px_geo("1024x700"))
             _gui_pump(root, 0.6)
             assert abs(root.winfo_width() - px(1024)) <= 2, \
