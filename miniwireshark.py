@@ -32461,6 +32461,7 @@ Move the Packets list divider ¦ Déplacer la séparation de la liste des paquet
 Move along the tabs ¦ Se déplacer entre les onglets ¦ Moverse entre las pestañas
 Move between the sub-views ¦ Passer d'une sous-vue à l'autre ¦ Moverse entre las subvistas
 Move between the Dashboard cards ¦ Passer d'une carte du Tableau de bord à l'autre ¦ Moverse entre las tarjetas del Panel
+Move along the toolbar ¦ Se déplacer dans la barre d'outils ¦ Moverse por la barra de herramientas
 Now in the Advanced view (%s goes back to Beginner). ¦ Vue Avancé activée (%s revient à Débutant). ¦ Vista Avanzada activada (%s vuelve a Principiante).
 Now in the Beginner view (%s shows Advanced again). ¦ Vue Débutant activée (%s réaffiche Avancé). ¦ Vista Principiante activada (%s vuelve a mostrar Avanzada).
 Refreshed this tab. ¦ Onglet actualisé. ¦ Pestaña actualizada.
@@ -35248,15 +35249,87 @@ def focus_ring(widget, color="#2b7de9", width=2):
     off()
 
 
-def _modified(event):
+def key_mod_masks(platform=None):
+    """(Shift, Control, Alt) bit masks of a Tk key event's `state`, for
+    this platform. Tk numbers the bits differently: on Windows 0x8 is
+    NumLock (on by default) and Alt is 0x20000; on X11 Alt is Mod1 (0x8)
+    (0x20000 in a Tk that gives Alt its own bit, as the self-made events
+    of a test do; Mod2, 0x10, is NumLock there and never counts); on macOS Command is Mod1 (0x8) and Option is Mod2 (0x10), and both
+    count as "Alt" here (Command keys belong to the menus)."""
+    p = platform or sys.platform
+    if p == "win32":
+        return 0x1, 0x4, 0x20000
+    if p == "darwin":
+        return 0x1, 0x4, 0x8 | 0x10
+    return 0x1, 0x4, 0x8 | 0x20000
+
+
+def _modified(event, platform=None):
     """True when Shift, Ctrl or Alt is down: a plain-arrow binding stands
     aside, so Alt+Left (Back), Ctrl+Shift+Left (divider) and the rest
     still reach their own bindings. (A "<Left>" binding also matches
-    Alt+Left, and a "break" stops the "all" bindings after it.)"""
+    Alt+Left and Shift+Left, and a "break" stops the "all" bindings after
+    it.) The one test every keyboard route uses; NumLock and CapsLock
+    never count (they are other bits on every platform)."""
     try:
-        return bool(int(event.state) & (0x1 | 0x4 | 0x8 | 0x20000))
-    except (TypeError, ValueError, AttributeError):
+        st = int(getattr(event, "state", 0))
+    except (TypeError, ValueError):
         return False
+    return bool(st & sum(key_mod_masks(platform)))
+
+
+def key_held(event, *names, platform=None):
+    """True when every named modifier ("shift", "control", "alt") is down
+    in the key event, on this platform's bits."""
+    shift, ctrl, alt = key_mod_masks(platform)
+    bits = {"shift": shift, "control": ctrl, "alt": alt}
+    try:
+        st = int(getattr(event, "state", 0))
+    except (TypeError, ValueError):
+        return False
+    return all(st & bits[n] for n in names)
+
+
+def _selects_words(w):
+    """True for a box the user types into (Ctrl+Shift+arrows select words
+    there). A read-only Text (the Inspector, the details) is not one."""
+    if isinstance(w, (tk.Entry, ttk.Entry)):
+        return True
+    if isinstance(w, tk.Text):
+        with contextlib.suppress(tk.TclError):
+            return str(w.cget("state")) == "normal"
+    return False
+
+
+def shortcut_default_losers(shortcuts):
+    """The actions that keep their own DEFAULT key while another action
+    was given that same key: a key saved by an older version (Start on
+    F5) that a newer default (Refresh on F5) now shares. The customised
+    action keeps the key; the default one waits (bound per action, the
+    later would silently win)."""
+    norm = {n: _norm_seq(q) for n, q in shortcuts.items()
+            if q and isinstance(q, str)}
+    custom = {n for n, q in norm.items()
+              if q != _norm_seq(DEFAULT_SHORTCUTS.get(n, ""))}
+    return {n for n, q in norm.items()
+            if n not in custom and any(
+                o != n and norm[o] == q for o in custom)}
+
+
+def _shortcut_sequence(state, keysym, platform=None):
+    """The Tk sequence for a key pressed in the shortcut box, "<Control-
+    Shift-F6>", with this platform's own modifier bits (NumLock is not
+    Alt on Windows)."""
+    shift, ctrl, alt = key_mod_masks(platform)
+    state = int(state)
+    mods = []
+    if state & ctrl:
+        mods.append("Control")
+    if state & shift:
+        mods.append("Shift")
+    if state & alt:
+        mods.append("Alt")
+    return "<" + "-".join(mods + [keysym]) + ">"
 
 
 class RovingGroup:
@@ -35331,16 +35404,6 @@ def make_label_button(widget, fn, color="#2b7de9"):
     return widget
 
 # ---- keyboard routes for text panes, canvases and tables (slice B) ----------
-_MOD_KEYS = 0x1 | 0x4 | 0x8 | 0x20000       # Shift, Control, Alt (Mod1, Win)
-
-
-def plain_key(e):
-    """True for a key pressed alone: Shift, Control and Alt are not held
-    (a plain <Up> binding also matches Shift+Up, which Tk's own
-    bindings use to extend a selection)."""
-    st = getattr(e, "state", 0)
-    return not (isinstance(st, int) and st & _MOD_KEYS)
-
 
 def make_readonly_focusable(txt, color="#2b7de9"):
     """A read-only (disabled) Text takes part in Tab, shows where the
@@ -35361,7 +35424,7 @@ def make_readonly_focusable(txt, color="#2b7de9"):
 
     def alone(fn):
         def run(e):
-            if not plain_key(e):
+            if _modified(e):
                 return None
             fn()
             return "break"
@@ -35480,8 +35543,10 @@ def bind_context_keys(widget, handler, pos=None):
         if ev is not None:
             handler(ev)
         return "break"
-    for seq in ("<Key-Menu>", "<Shift-F10>"):
-        widget.bind(seq, go, add="+")
+    for seq in ("<Key-Menu>", "<Key-App>", "<Shift-F10>"):
+        # (<Key-App> is the Windows keysym of the Menu key; X11 has none)
+        with contextlib.suppress(tk.TclError):
+            widget.bind(seq, go, add="+")
 
 
 def bind_open(widget, handler):
@@ -35489,7 +35554,7 @@ def bind_open(widget, handler):
     handler a double-click runs. A table with the keyboard on a row that
     isn't selected yet opens that row."""
     def run(e):
-        if not plain_key(e):
+        if _modified(e):
             return None
         if isinstance(widget, ttk.Treeview):
             with contextlib.suppress(tk.TclError):
@@ -35551,7 +35616,7 @@ def tree_nav_keys(tree):
 
     def go(last, extend=False, need_plain=False):
         def run(e):
-            if need_plain and not plain_key(e):
+            if need_plain and _modified(e):
                 return None
             iid = tree_edge_row(tree, last)
             if iid is None or mode() == "none":
@@ -35604,8 +35669,10 @@ class HeadingKeys:
             " ▲▼"))
         self.can_sort = can_sort
         self.col = None
-        tree.bind("<Shift-Left>", lambda e: self.move(-1))
-        tree.bind("<Shift-Right>", lambda e: self.move(1))
+        # Ctrl+Shift+Left / Right are the window's divider keys: a Tk
+        # "<Shift-Left>" also matches them, so they pass through
+        tree.bind("<Shift-Left>", lambda e: self.move(-1, e))
+        tree.bind("<Shift-Right>", lambda e: self.move(1, e))
         for seq in ("<Shift-Return>", "<Shift-KP_Enter>", "<Shift-space>"):
             tree.bind(seq, self.sort_now)
         if menu is not None:
@@ -35636,7 +35703,9 @@ class HeadingKeys:
             return self.title(col) or translate_text("(icon)")
         return str(col)
 
-    def move(self, d):
+    def move(self, d, event=None):
+        if event is not None and key_held(event, "control"):
+            return None
         cols = self._cols()
         if not cols:
             return "break"
@@ -37543,6 +37612,7 @@ class SettingsWindow:
                     if c.get("key"):
                         self.controls[c["key"]] = c
         self.errors = {}
+        self.warnings = {}        # older saved keys that now clash (no block)
         self._wrap = []
         self._deps = []
         self._nav = {}
@@ -37562,6 +37632,9 @@ class SettingsWindow:
         self.win.transient(app.root)
         self._create_vars()
         self.baseline = self._snapshot()
+        for key, c in self.controls.items():
+            if c["type"] == "shortcut":
+                self._validate(key)       # fills the warnings
         self._build_chrome()
         self.show_page(self.page_id)
         self.win.bind("<Escape>", lambda e: self.cancel())
@@ -37648,18 +37721,32 @@ class SettingsWindow:
                 return "That folder doesn't exist."
         elif c["type"] == "shortcut":
             seq = str(v.get()).strip()
+            msg = ""
             for other, ov in self.vars.items():
                 if other != key and self.controls[other]["type"] == "shortcut" \
                         and seq and _norm_seq(str(ov.get())) == _norm_seq(
                             seq):
-                    return (f"Already used by "
-                            f"\u201c{self.controls[other]['label']}\u201d.")
-            # the keys the program or a text box keeps for itself
-            return shortcut_reserved(key.split(".", 1)[1], seq)
+                    msg = (f"Already used by "
+                           f"\u201c{self.controls[other]['label']}\u201d.")
+                    break
+            if not msg:
+                # the keys the program or a text box keeps for itself
+                msg = shortcut_reserved(key.split(".", 1)[1], seq)
+            # a key saved by an older version that a newer default or
+            # reserved key now collides with, and that was not changed in
+            # this window: a warning (the other action keeps its key), not
+            # an error that blocks Apply for the whole window
+            if msg and str(v.get()) == getattr(self, "baseline", {}).get(
+                    key, None):
+                self.warnings[key] = msg
+                return ""
+            self.warnings.pop(key, None)
+            return msg
         return ""
 
     def _validate_all(self):
         self.errors = {}
+        self.warnings = {}
         for key in self.controls:
             msg = self._validate(key)
             if msg:
@@ -38324,8 +38411,10 @@ class SettingsWindow:
             return
         try:
             msg = self.errors.get(key, "")
-            if msg:
-                lbl.configure(text="\u26a0 " + msg)
+            note = self.warnings.get(key, "")
+            if msg or note:
+                lbl.configure(text=("\u26a0 " + msg) if msg else
+                              "\u2139 " + note)
                 lbl.pack(fill="x")
             else:
                 lbl.pack_forget()
@@ -38533,6 +38622,7 @@ class SettingsWindow:
             self.vars[key].set(bool(d) if c["type"] == "bool"
                                else ("" if d is None else str(d)))
         self.errors = {}
+        self.warnings = {}
         self.baseline = self._snapshot()
         self._build_chrome()
         self.show_page(self.page_id)
@@ -39099,8 +39189,9 @@ class TableKit:
         self.heading_keys = HeadingKeys(
             tree, self.visible_cols, self.sort_by,
             menu=self._heading_menu_at, can_sort=lambda: self.sortable)
-        for seq in ("<Key-Menu>", "<Shift-F10>"):
-            tree.bind(seq, self.key_menu)
+        for seq in ("<Key-Menu>", "<Key-App>", "<Shift-F10>"):
+            with contextlib.suppress(tk.TclError):
+                tree.bind(seq, self.key_menu)
         self.load()
         app.kits.append(self)
         self.empty_soon()
@@ -49428,6 +49519,9 @@ class PacketsTab(BaseTab):
         return "break"
 
     def _key(self, e):
+        # Ctrl+Shift+Up / Down move the window's list | details divider
+        if e.keysym in ("Up", "Down") and key_held(e, "control", "shift"):
+            return None
         m = self.matched
         if not m:
             return "break"
@@ -51582,6 +51676,8 @@ KEYMAP_FIXED = (
     ("Select every row", "Ctrl+A"),
     ("Scroll a read-only text", "Up / Down / Page Up / Page Down / Home / "
                                "End"),
+    ("Move along the toolbar", "Left / Right / Home / End (on a toolbar "
+                               "button)"),
 )
 
 _FIXED_KEY_WORDS = {"Ctrl": "Control", "Page Up": "Prior",
@@ -58436,8 +58532,7 @@ proc ::mw_explicit_fonts {top names} {
         if event is not None:
             if not self._in_main(event):
                 return None
-            if isinstance(getattr(event, "widget", None),
-                          (tk.Entry, ttk.Entry, tk.Text)):
+            if _selects_words(getattr(event, "widget", None)):
                 return None       # Ctrl+Shift+arrows select words there
         pane, what, total = self.body, "Inspector", None
         foc = None
@@ -58459,8 +58554,7 @@ proc ::mw_explicit_fonts {top names} {
         if event is not None:
             if not self._in_main(event):
                 return None
-            if isinstance(getattr(event, "widget", None),
-                          (tk.Entry, ttk.Entry, tk.Text)):
+            if _selects_words(getattr(event, "widget", None)):
                 return None
         pk = self.tabs.get("packets")
         vert = getattr(pk, "vert_pane", None)
@@ -58559,9 +58653,10 @@ proc ::mw_explicit_fonts {top names} {
         }
         shortcuts = dict(DEFAULT_SHORTCUTS)
         shortcuts.update(self.config.data.get("shortcuts") or {})
+        skip = shortcut_default_losers(shortcuts)
         for name, seq in shortcuts.items():
             fn = actions.get(name)
-            if not fn or not seq:
+            if not fn or not seq or name in skip:
                 continue
             try:
                 cmd = self.root.bind_all(seq, fn)
@@ -58574,7 +58669,12 @@ proc ::mw_explicit_fonts {top names} {
 
     def _palette_shortcut(self, event=None):
         """Ctrl+K. In a text field it opens the palette and nothing else
-        (the field's own Ctrl+K deleted the text after the cursor)."""
+        (the field's own Ctrl+K deleted the text after the cursor). Only in
+        the main window: in the palette's own box (it would rebuild and
+        lose the query) and in the text boxes of other windows the key is
+        left alone."""
+        if event is not None and not self._in_main(event):
+            return None
         self.open_palette()
         return "break"
 
@@ -58616,14 +58716,7 @@ proc ::mw_explicit_fonts {top names} {
             if event.keysym in ("Control_L", "Control_R", "Shift_L",
                                "Shift_R", "Alt_L", "Alt_R"):
                 return
-            mods = []
-            if event.state & 0x4:
-                mods.append("Control")
-            if event.state & 0x1:
-                mods.append("Shift")
-            if event.state & 0x20000 or event.state & 0x0008:
-                mods.append("Alt")
-            seq = "<" + "-".join(mods + [event.keysym]) + ">"
+            seq = _shortcut_sequence(event.state, event.keysym)
             display_var.set(seq)
             win.destroy()
         win.bind("<KeyPress>", on_key)
@@ -67562,6 +67655,8 @@ class CommandPalette:
         self._recent = [x for x in (app.config.get("palette.recent", [])
                                     or []) if isinstance(x, str)][:20]
         self.chip = "all"
+        # label -> kind, for what may be written to the configuration
+        self._kind_of = {it[0]: it[1] for it in self.items}
         self.shown = []           # (-score, label, kind, action, + the list's)
         self._entries = []        # a line each: ("row", n) | ("head"|"note", text)
         self._lines = {}
@@ -67875,11 +67970,21 @@ class CommandPalette:
         return "break"
 
     # ---- running ------------------------------------------------------------
-    def _remember(self, label):
+    # what is written to the configuration file: where to go and what to
+    # do, never names from the network (devices, websites, hosts, alerts,
+    # recent cards, filters typed). All of them stay in memory.
+    SAVED_KINDS = frozenset({"tab", "action", "view", "setting", "help",
+                             "workspace", "your workspace", "filter"})
+
+    def _remember(self, label, cat=None):
         self._recent = ([label] + [x for x in self._recent
                                    if x != label])[:20]
+        if cat is not None:
+            self._kind_of[label] = cat
         cfg = self.app.config
-        cfg.set("palette.recent", list(self._recent))
+        cfg.set("palette.recent", [x for x in self._recent
+                                   if self._kind_of.get(x) in
+                                   self.SAVED_KINDS])
         cfg.save()
 
     def run(self, _e=None, keep=False):
@@ -67889,7 +67994,7 @@ class CommandPalette:
         row = self.shown[self._sel]
         label, fn = row[1], row[3]
         if not row[8]:
-            self._remember(label)
+            self._remember(label, row[2])
         if keep:
             self.entry.after_idle(lambda: focus_toplevel(self.win,
                                                          self.entry))
@@ -103935,7 +104040,7 @@ def gt_kbd_palette_focus_recent(app, ctx):
     assert heads == ["RECENT", "SUGGESTED"], heads
     assert any(r[2] == "tab" and r[6] for r in p.shown)
     for i in range(25):
-        p._remember(f"Test row {i}")
+        p._remember(f"Test row {i}", "action")
     assert len(app.config.get("palette.recent")) == 20
     assert app.config.get("palette.recent")[0] == "Test row 24"
     p.close()
@@ -106198,6 +106303,61 @@ def t_kbd_roving_group_is_one_tab_stop(ctx):
         root.destroy()
 
 
+class _KbdEvent:
+    def __init__(self, state, keysym=""):
+        self.state, self.keysym = state, keysym
+
+
+@self_test()
+def t_kbd_modifier_bits_follow_the_platform(ctx):
+    """Tk numbers the modifier bits per platform: on Windows 0x8 is
+    NumLock (on by default), Alt is 0x20000, so a plain key must stay
+    plain with NumLock on; on X11 0x8 is Alt; on macOS Command / Option
+    are 0x8 / 0x10. One helper answers for every keyboard route."""
+    ev = _KbdEvent
+    # Windows: NumLock (0x8) and CapsLock (0x2) are not modifiers
+    assert not _modified(ev(0x8), "win32")
+    assert not _modified(ev(0x8 | 0x2), "win32")
+    assert not _modified(ev(0), "win32")
+    for st in (0x1, 0x4, 0x20000, 0x8 | 0x20000, 0x8 | 0x4):
+        assert _modified(ev(st), "win32"), hex(st)
+    # X11: 0x8 is Alt (Mod1); 0x10 (NumLock) and 0x2 are not
+    assert _modified(ev(0x8), "linux") and _modified(ev(0x20000), "linux")
+    assert not _modified(ev(0x10), "linux") and not _modified(ev(0x2), "linux")
+    # macOS: Command 0x8, Option 0x10
+    assert _modified(ev(0x8), "darwin") and _modified(ev(0x10), "darwin")
+    assert not _modified(ev(0x2), "darwin")
+    # an event without a usable state is "plain", never an error
+    assert not _modified(ev(None), "win32") and not _modified(object())
+    assert key_held(ev(0x4 | 0x1), "control", "shift", platform="win32")
+    assert not key_held(ev(0x4 | 0x8), "control", "shift", platform="win32")
+    assert key_held(ev(0x4 | 0x1 | 0x8), "control", "shift", platform="linux")
+    # the shortcut box reads the same bits (NumLock is not Alt on Windows)
+    assert _shortcut_sequence(0x4 | 0x1 | 0x8, "F6", "win32") == \
+        "<Control-Shift-F6>"
+    assert _shortcut_sequence(0x20000, "Left", "win32") == "<Alt-Left>"
+    assert _shortcut_sequence(0x4 | 0x8, "k", "linux") == "<Control-Alt-k>"
+    assert _shortcut_sequence(0x10, "x", "darwin") == "<Alt-x>"
+    assert _shortcut_sequence(0, "F2", "linux") == "<F2>"
+
+
+@self_test()
+def t_kbd_saved_key_equal_to_a_new_default(ctx):
+    """Start remapped to F5 (now Refresh's default): Start keeps F5, the
+    default action waits; with no clash nothing is skipped."""
+    d = dict(DEFAULT_SHORTCUTS)
+    assert shortcut_default_losers(d) == set()
+    d["start"] = "<F5>"
+    assert shortcut_default_losers(d) == {"refresh"}
+    d["start"] = "<Key-F5>"
+    assert shortcut_default_losers(d) == {"refresh"}
+    d["start"] = DEFAULT_SHORTCUTS["start"]
+    d["stop"] = "<F8>"          # another new default, another action
+    assert shortcut_default_losers(d) == {"mode_toggle"}
+    d["clear"] = ""
+    assert "clear" not in shortcut_default_losers(d)
+
+
 def _kbd_press(root, widget, seq, pump=0.08):
     """Focus `widget` (when given) and send it a key."""
     if widget is not None:
@@ -106559,6 +106719,177 @@ def gt_kbd_remap_in_settings(app, ctx):
     _kbd_press(root, app.search_entry, "<F6>")
     assert root.focus_get() is app.tabstrip.selected_label()
     app.search_entry.focus_force()
+
+
+@gui_test_step("kbd fix: the divider keys work with a table or a read-only "
+               "pane focused; Ctrl+K stays out of the palette's box and of "
+               "other windows' text boxes; the Apps key opens a row menu")
+def gt_kbd_fix_dividers_and_palette_key(app, ctx):
+    root = app.root
+    keep = (app.inspector_visible, app.current_tab_name())
+    try:
+        # Ctrl+Shift+Left / Right with a table focused (Shift+Left is the
+        # heading cursor's key; both were swallowed there)
+        app._select_tab("devices")
+        app.toggle_inspector(True, remember=False)
+        _gui_pump(root, 0.6)
+        tab = app.tabs["devices"]
+        table = app._table_target(tab)
+        body = app.body
+        p0 = body.sashpos(0)
+        _kbd_press(root, table, "<Control-Shift-Left>")
+        p1 = body.sashpos(0)
+        assert p1 < p0, ("table focused", p0, p1)
+        _kbd_press(root, table, "<Control-Shift-Right>")
+        assert body.sashpos(0) > p1
+        # the heading cursor still moves on Shift+Left (no Control)
+        hk = getattr(getattr(tab, "kit", None), "heading_keys", None)
+        if hk is not None:
+            hk.col = None
+            _kbd_press(root, table, "<Shift-Right>")
+            assert hk.col is not None
+        # Packets: Ctrl+Shift+Up / Down with the list focused move the
+        # divider and leave the selection where it was
+        pt = app._select_tab("packets")
+        _gui_pump(root, 0.6)
+        v0, sel = pt.vert_pane.sashpos(0), pt.sel_no
+        _kbd_press(root, pt.tree, "<Control-Shift-Down>")
+        v1 = pt.vert_pane.sashpos(0)
+        assert v1 > v0, ("packet list focused", v0, v1)
+        _kbd_press(root, pt.tree, "<Control-Shift-Up>")
+        assert pt.vert_pane.sashpos(0) < v1 and pt.sel_no == sel
+        # a read-only Text (the Inspector) is not a text box for these keys
+        ro = app.inspector.txt
+        assert str(ro.cget("state")) == "disabled"
+        app._select_tab("devices")
+        _gui_pump(root, 0.5)
+        q0 = body.sashpos(0)
+        _kbd_press(root, ro, "<Control-Shift-Left>")
+        assert body.sashpos(0) < q0, "no move from the read-only Inspector"
+        pt = app._select_tab("packets")
+        _gui_pump(root, 0.5)
+        ro = next((t for t in _walk_class(pt.detail_bottom, tk.Text)
+                   if t.winfo_viewable() and str(t.cget("state")) ==
+                   "disabled"), None)
+        w0 = pt.vert_pane.sashpos(0)
+        if ro is not None:
+            _kbd_press(root, ro, "<Control-Shift-Down>")
+            assert pt.vert_pane.sashpos(0) > w0, "read-only details pane"
+        # while typing in an editable box the keys stay the box's
+        eq = body.sashpos(0)
+        _kbd_press(root, app.search_entry, "<Control-Shift-Left>")
+        assert body.sashpos(0) == eq
+        # Ctrl+K in the palette's own box keeps the query
+        _gui_focus_main(app)
+        pal = app.open_palette()
+        pal.q.set("alerts")
+        _gui_pump(root, 0.1)
+        _kbd_press(root, pal.entry, "<Control-k>")
+        assert app._palette is pal and pal.alive() and pal.q.get() == \
+            "alerts", (app._palette is pal, pal.q.get())
+        pal.close()
+        # ... and in a text box of another window it does nothing
+        top = tk.Toplevel(root)
+        try:
+            box = tk.Text(top, width=20, height=3)
+            box.pack()
+            box.insert("1.0", "keep me")
+            box.mark_set("insert", "1.2")
+            _gui_pump(root, 0.1)
+            _kbd_press(root, box, "<Control-k>")
+            assert not (getattr(app, "_palette", None) is not None and
+                        app._palette.alive()), "palette opened from a dialog"
+        finally:
+            top.destroy()
+        # the Apps key (a keysym Windows has; X11 has none)
+        probe = tk.Frame(root)
+        try:
+            try:
+                probe.bind("<Key-App>", lambda e: None)
+                has_app = True
+            except tk.TclError:
+                has_app = False
+        finally:
+            probe.destroy()
+        if has_app:
+            assert pt.tree.bind("<Key-App>"), "the Apps key opens no menu"
+    finally:
+        app.toggle_inspector(keep[0], remember=False)
+        app._select_tab(keep[1])
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd fix: a saved key that equals a new default is a warning, "
+               "not an error; the customised action keeps the key")
+def gt_kbd_fix_saved_key_collides_with_new_default(app, ctx):
+    root = app.root
+    saved = app.config.get("shortcuts.start")
+    started, refreshed = [], []
+    orig_start = app.start
+    try:
+        app.config.set("shortcuts.start", "<F5>")
+        app.start = lambda *a, **k: started.append(1)
+        app._refresh_shown_tab = lambda: refreshed.append(1)
+        app._apply_shortcuts()
+        _kbd_press(root, app.tabstrip.selected_label(), "<F5>")
+        assert started == [1] and refreshed == [], (started, refreshed)
+        # Settings opens; Apply is not blocked by the legacy value
+        win = app._open_settings("shortcuts")
+        try:
+            _gui_pump(root, 0.5)
+            assert win._validate_all() == {}, win.errors
+            assert "shortcuts.start" in win.warnings or \
+                "shortcuts.refresh" in win.warnings, win.warnings
+            # a key typed now is still refused (reserved, or taken)
+            win.vars["shortcuts.stop"].set("<Control-Key-w>")
+            assert "Text boxes" in win._validate("shortcuts.stop")
+            win.vars["shortcuts.stop"].set(DEFAULT_SHORTCUTS["stop"])
+            win.vars["shortcuts.stop"].set("<F5>")
+            assert win._validate("shortcuts.stop"), "a new clash passed"
+            win.vars["shortcuts.stop"].set(DEFAULT_SHORTCUTS["stop"])
+            assert win._validate_all() == {}, win.errors
+        finally:
+            win.win.destroy()
+    finally:
+        app.start = orig_start
+        with contextlib.suppress(AttributeError):
+            del app._refresh_shown_tab
+        app.config.set("shortcuts.start", saved if saved is not None
+                       else DEFAULT_SHORTCUTS["start"])
+        app.config.save()
+        app._apply_shortcuts()
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd fix: the palette's Recent list is kept for tabs and "
+               "actions only; names from the network stay in memory")
+def gt_kbd_fix_palette_recent_privacy(app, ctx):
+    root = app.root
+    keep = list(app.config.get("palette.recent", []) or [])
+    try:
+        app.config.set("palette.recent", [])
+        p = app.open_palette()
+        for label, cat in (("Settings", "setting"), ("Device: laptop", "device"),
+                           ("Website: example.org", "website"),
+                           ("Host: 203.0.113.9", "host"),
+                           ("Alert: Something", "alert"),
+                           ("Recent: a card", "recent"),
+                           ("Filter: ip:10.0.0.1", "recent filter"),
+                           ("Start watching", "action")):
+            p._remember(label, cat)
+        mem = list(p._recent)
+        assert "Device: laptop" in mem and "Website: example.org" in mem
+        saved = json.load(open(app.config.path, encoding="utf-8"))
+        assert saved["palette"]["recent"] == ["Start watching", "Settings"], \
+            saved["palette"]
+        raw = open(app.config.path, encoding="utf-8").read()
+        for bad in ("laptop", "example.org", "203.0.113.9", "10.0.0.1"):
+            assert bad not in raw, bad
+        p.close()
+    finally:
+        app.config.set("palette.recent", keep)
+        app.config.save()
+
 
 
 # ============================================================================
