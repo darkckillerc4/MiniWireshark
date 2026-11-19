@@ -109926,6 +109926,18 @@ def t_kbd_saved_key_equal_to_a_new_default(ctx):
     assert "clear" not in shortcut_default_losers(d)
 
 
+def _kbd_mid_sash(pane):
+    """Put a divider half way before a keyboard move is measured: a step
+    run after a smaller window found the Packets divider already at its
+    limit (80 px above the bottom), so a move down had no room."""
+    with contextlib.suppress(tk.TclError):
+        pane.update_idletasks()
+        size = pane.winfo_height() if str(pane.cget("orient")) == \
+            "vertical" else pane.winfo_width()
+        pane.sashpos(0, size // 2)
+        pane.update_idletasks()
+
+
 def _kbd_press(root, widget, seq, pump=0.08):
     """Focus `widget` (when given) and send it a key."""
     if widget is not None:
@@ -110237,6 +110249,7 @@ def gt_kbd_f_keys_and_dividers(app, ctx):
         # the Packets list | details divider
         pt = app._select_tab("packets")
         _gui_pump(root, 0.6)
+        _kbd_mid_sash(pt.vert_pane)
         v0 = pt.vert_pane.sashpos(0)
         _kbd_press(root, app.tabstrip.selected_label(),
                    "<Control-Shift-Down>")
@@ -110320,6 +110333,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         # divider and leave the selection where it was
         pt = app._select_tab("packets")
         _gui_pump(root, 0.6)
+        _kbd_mid_sash(pt.vert_pane)
         v0, sel = pt.vert_pane.sashpos(0), pt.sel_no
         _kbd_press(root, pt.tree, "<Control-Shift-Down>")
         v1 = pt.vert_pane.sashpos(0)
@@ -110339,6 +110353,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         ro = next((t for t in _walk_class(pt.detail_bottom, tk.Text)
                    if t.winfo_viewable() and str(t.cget("state")) ==
                    "disabled"), None)
+        _kbd_mid_sash(pt.vert_pane)
         w0 = pt.vert_pane.sashpos(0)
         if ro is not None:
             _kbd_press(root, ro, "<Control-Shift-Down>")
