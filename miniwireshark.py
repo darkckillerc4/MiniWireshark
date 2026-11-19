@@ -96968,6 +96968,29 @@ def _popups():
         tk.Menu.tk_popup = orig
 
 
+def _kbd_packet_row(app, ctx):
+    """A packet with its bytes to select. Earlier steps may leave the
+    window on a loaded session with no packets (the scripted capture is
+    fed again then, as the inspector step does)."""
+    root = app.root
+    pick = lambda: next((d for d in app.all_rows if d.get("raw")), None)
+    if pick() is None:
+        ident = scenario_identity()
+        m = app._new_model(identity=ident[:3])
+        m.set_identity(local_nets=ident[3])
+        app.replace_model(m)
+        app.data_mode = "live"
+        sink = app.lossless_sink()
+        for raw, _ts, lt in ctx.frames():
+            sink(raw, time.time(), lt)
+        _gui_pump(root, 0.3, lambda: not len(app.ring) and
+                  not app.worker.busy, timeout=30)
+        _gui_pump(root, 0.5)
+    row = pick()
+    assert row is not None, (len(app.all_rows), app.data_mode)
+    return row
+
+
 @gui_test_step("keyboard B: read-only text panes are in the Tab chain, "
                "scroll and copy by key")
 def gt_kbd_text_panes(app, ctx):
@@ -96975,8 +96998,8 @@ def gt_kbd_text_panes(app, ctx):
     app.toggle_inspector(True)
     ptab = app._select_tab("packets")
     ptab.show_subview("Packets")
-    row = next((d for d in app.all_rows if d.get("raw")), None)
-    assert row is not None and ptab.select_no(row["no"])
+    row = _kbd_packet_row(app, ctx)
+    assert ptab.select_no(row["no"]), (row["no"], app.data_mode)
     _gui_pump(root, 0.4)
     nb = ptab.details.master.master
     panes = {"inspector": app.inspector.txt, "bytes": ptab.bytes_view}
@@ -97051,6 +97074,7 @@ def gt_kbd_text_panes(app, ctx):
                "column menu on the tables")
 def gt_kbd_tables(app, ctx):
     root = app.root
+    _kbd_packet_row(app, ctx)
     app.mode_ui_var.set("Advanced")
     app._on_ui_mode_change()
     rows_seen = 0
@@ -97076,11 +97100,12 @@ def gt_kbd_tables(app, ctx):
                 _gui_pump(root, 0.05)
                 assert shown, f"{name}: {seq} opened no menu"
                 labels = _menu_labels(shown[-1])
-                assert any(x.startswith("Sort and columns") for x in labels), \
-                    (name, labels)
+                pre = "Sort and columns > " if kids else ""   # no row: bare
+                if kids:
+                    assert "Sort and columns" in labels, (name, labels)
                 if kit.sortable:
-                    assert "Sort and columns > Sort by" in labels, labels
-                assert "Sort and columns > Columns" in labels, labels
+                    assert pre + "Sort by" in labels, (name, labels)
+                assert pre + "Columns" in labels, (name, labels)
             # Home / End / Ctrl+Home / Ctrl+End
             if len(kids) >= 2:
                 tree.event_generate("<End>")
@@ -97147,6 +97172,7 @@ def gt_kbd_tables(app, ctx):
                "double-click")
 def gt_kbd_enter_opens(app, ctx):
     root = app.root
+    _kbd_packet_row(app, ctx)
     calls = []
     saved = {}
 
@@ -97226,10 +97252,11 @@ def gt_kbd_enter_opens(app, ctx):
         # Sources: Enter edits the selected connector
         st = app._select_tab("sources")
         _gui_pump(root, 0.2)
+        st.tree.focus_force()
+        _gui_pump(root, 0.1)
         iid = st.tree.insert("", "end", iid="c:kbd-test",
                              values=("",) * len(st.tree["columns"]))
         try:
-            st.tree.focus_force()
             st.tree.selection_set(iid)
             del calls[:]
             st.tree.event_generate("<Return>")
@@ -97240,7 +97267,7 @@ def gt_kbd_enter_opens(app, ctx):
         # Packets: Enter moves the keyboard to the packet's fields
         pt = app._select_tab("packets")
         pt.show_subview("Packets")
-        row = next(d for d in app.all_rows if d.get("raw"))
+        row = _kbd_packet_row(app, ctx)
         assert pt.select_no(row["no"])
         _gui_pump(root, 0.4)
         pt.tree.focus_force()
@@ -97259,7 +97286,7 @@ def gt_kbd_context_keys(app, ctx):
     with _popups() as shown:
         pt = app._select_tab("packets")
         pt.show_subview("Packets")
-        row = next(d for d in app.all_rows if d.get("raw"))
+        row = _kbd_packet_row(app, ctx)
         assert pt.select_no(row["no"])
         _gui_pump(root, 0.4)
         pt.tree.focus_force()
