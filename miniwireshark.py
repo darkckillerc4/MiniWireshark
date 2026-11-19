@@ -36060,10 +36060,22 @@ def fit_cell_texts(tree, col, texts):
 def fit_heading(tree, col):
     try:
         text = str(tree.heading(col, "text") or "")
-        need = max(heading_width(text) + 20 if text else 0,
-                   cell_texts_width(tree, col))
+        head = heading_width(text) + 20 if text else 0
+        need = max(head, cell_texts_width(tree, col))
         if not need:
             return
+        # a column share_tree_width narrowed for a small window keeps its
+        # heading here: the room its words need is the width it gets back
+        # (and the one saved for it) when the window is wide again. Taking
+        # it back now made the narrowing look like the person's own
+        # resize, so the column's own width was lost.
+        w0 = getattr(tree, "_mw_w0", None)
+        if w0 and col in w0:
+            if int(w0[col]) < need:
+                w0[col] = need
+            need = head
+            if not need:
+                return
         if int(tree.column(col, "width")) < need:
             tree.column(col, width=need, minwidth=min(need, 60))
     except (tk.TclError, ValueError, TypeError, RuntimeError):
@@ -104224,6 +104236,13 @@ def gt_a4_alert_severity_fits(app, ctx):
     texts = tab.severity_texts()
     assert any("AVERTISSEMENT" in t for t in texts) and \
         any("PELIGRO" in t for t in texts), texts
+    # a window with room for the table: in a narrow one the fixed columns
+    # give up width first so every heading shows ("5.0.2 layout" and
+    # "review 6"), and the Severity words get their room back after
+    geo0, max0 = root.geometry(), root.maxsize()
+    root.maxsize(px(2000), px(1200))      # a 1024-px runner's screen too
+    root.geometry(px_geo("1600x900"))
+    _gui_pump(root, 0.4)
     try:
         for lang in ("Français", "Español", "English"):
             app.config.set("general.language", lang)
@@ -104248,6 +104267,8 @@ def gt_a4_alert_severity_fits(app, ctx):
         app._apply_runtime_settings()
         app.config.set("appearance.text_size", "Normal")
         app._apply_text_size(defer=False)
+        root.maxsize(*max0)
+        root.geometry(geo0)
         _gui_pump(root, 0.3)
 
 
