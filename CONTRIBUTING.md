@@ -1,6 +1,6 @@
 # Contributing to MiniWireshark
 
-Thanks for helping. A few rules keep a 66,000-line single-file app healthy.
+Thanks for helping. A few rules keep an 89,000-line single-file app healthy.
 
 ## House rules
 
@@ -31,6 +31,8 @@ Never commit captures, sessions, logs or `miniwireshark_config.json`. They can c
 ## Reporting bugs
 
 Use the issue templates. A **debug bundle** from the Diagnostics window masks addresses and secrets and is the most useful thing you can attach.
+
+Developer tools that CI does not run live in `.github/scripts/` too: `coverage_regions.py` reports how much of each class and function of `miniwireshark.py` the self-test runs, worst first (Python 3.12 or newer: `python .github/scripts/coverage_regions.py`).
 
 ## Releasing
 

@@ -9,8 +9,24 @@ permissions:
   contents: read
 
 jobs:
+  # timeout-minutes: about three times the longest run measured (run
+  # 42978911434 and the two before it), so a hang fails in minutes, not
+  # after GitHub's 6 hours; inside, every test step stops itself after 5
+  # (self-test) or 10 (GUI step) minutes and names itself
+  privacy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5        # measured 0.1 min
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: No personal data, captures or secrets in the repository
+        run: python .github/scripts/privacy_check.py
+
   self-test:
     runs-on: ubuntu-22.04   # still has Python 3.8 builds
+    timeout-minutes: 15       # measured 1.8-2.8 min
     strategy:
       fail-fast: false
       matrix:
@@ -29,3 +45,154 @@ jobs:
           MINIWIRESHARK_DATA: ${{ runner.temp }}/mw-data
           MINIWIRESHARK_CONFIG: ${{ runner.temp }}/mw-config.json
         run: xvfb-run -a python miniwireshark.py --self-test
+
+  gui-test:
+    # the real window, driven step by step under a virtual display
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25       # measured 5.3-5.5 min (24.04); 22.04 may run twice (gdb)
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install capture library
+        run: python -m pip install "scapy>=2.5" psutil
+      - name: GUI test
+        if: matrix.os != 'ubuntu-22.04'
+        env:
+          MINIWIRESHARK_DATA: ${{ runner.temp }}/mw-data
+          MINIWIRESHARK_CONFIG: ${{ runner.temp }}/mw-config.json
+        run: |
+          sudo apt-get install -y xvfb > /dev/null
+          xvfb-run -a -s "-screen 0 1920x1080x24" python -X faulthandler miniwireshark.py --gui-test
+      - name: GUI test (22.04; again under gdb only after a native crash)
+        # 22.04 only: the run died with "Segmentation fault" and no output
+        # (libXft 2.3.4 drawing colour emoji; the app now leaves colour
+        # fonts out there, see xft_color_font_guard). The plain run is the
+        # test: gdb changes the timing and can hide races. Only when it
+        # dies from a signal (exit code 128 or more) or faulthandler says
+        # "Fatal Python error" does it run once more under gdb, for every
+        # thread's native stack and the loaded libraries. The step ends
+        # with the plain run's exit code either way.
+        if: matrix.os == 'ubuntu-22.04'
+        env:
+          MINIWIRESHARK_DATA: ${{ runner.temp }}/mw-data
+          MINIWIRESHARK_CONFIG: ${{ runner.temp }}/mw-config.json
+          PYTHONUNBUFFERED: "1"
+        run: |
+          sudo apt-get install -y xvfb > /dev/null
+          python -c "import sys, tkinter; print(sys.version); print('Tk', tkinter.TkVersion, tkinter.Tcl().eval('info patchlevel'))"
+          ldd "$(python -c 'import _tkinter; print(_tkinter.__file__)')" | grep -Ei 'tk|tcl|xft|fontconfig|freetype|x11'
+          fc-match sans-serif; fc-list | wc -l
+          set +e
+          xvfb-run -a -s "-screen 0 1920x1080x24" python -X faulthandler miniwireshark.py --gui-test 2>&1 | tee "$RUNNER_TEMP/gui-test.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "GUI test exit code: $rc"
+          if [ "$rc" -ge 128 ] || grep -q "Fatal Python error" "$RUNNER_TEMP/gui-test.log"; then
+            echo "::warning::the GUI test died from a signal ($rc): once more under gdb for the native stack"
+            # gdb is only for the backtrace, and bounded: in run 43050920456
+            # a DNS outage held apt-get update for 7 min and the install
+            # until the job's limit cancelled the job
+            { timeout 120 sudo apt-get update -qq -o Acquire::Retries=1 \
+                -o Acquire::http::Timeout=20 &&
+              timeout 180 sudo apt-get install -y gdb > /dev/null; } \
+              || echo "::warning::gdb could not be installed"
+            if command -v gdb > /dev/null; then
+              cat > "$RUNNER_TEMP/crash.gdb" <<'EOF'
+          set pagination off
+          handle SIGPIPE nostop noprint pass
+          run
+          if $_isvoid($_exitcode)
+            thread apply all bt 30
+            info sharedlibrary
+            continue
+          end
+          EOF
+              MINIWIRESHARK_DATA="$RUNNER_TEMP/mw-data-gdb" \
+              MINIWIRESHARK_CONFIG="$RUNNER_TEMP/mw-config-gdb.json" \
+                timeout 600 xvfb-run -a -s "-screen 0 1920x1080x24" gdb -q -batch \
+                -return-child-result -x "$RUNNER_TEMP/crash.gdb" \
+                --args python -X faulthandler miniwireshark.py --gui-test || true
+            fi
+          fi
+          exit "$rc"
+
+  windows:
+    # the Windows-only paths (compiled start and hand-off, notifier,
+    # memory reading, PowerShell checks) run here between PC runs
+    runs-on: windows-latest
+    timeout-minutes: 35       # measured 9.2 min (3.14) with a 3-minute wait in it
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
+    steps:
+      - name: Keep the file's own line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install capture library
+        run: python -m pip install "scapy>=2.5" psutil
+      - name: Self-test
+        env:
+          MINIWIRESHARK_DATA: ${{ runner.temp }}\mw-data
+          MINIWIRESHARK_CONFIG: ${{ runner.temp }}\mw-config.json
+        run: python miniwireshark.py --self-test
+      - name: GUI test
+        env:
+          MINIWIRESHARK_DATA: ${{ runner.temp }}\mw-gui-data
+          MINIWIRESHARK_CONFIG: ${{ runner.temp }}\mw-gui-config.json
+        run: python -X faulthandler miniwireshark.py --gui-test
+
+  # Windows text-size regression guard (5.3.4): the change measured
+  # against f0c5932 (before the round 4-5 savings) on the same runner,
+  # interleaved, so runner speed cancels out (machines differ by up to
+  # 40%, which no fixed limit in ms survives). Fails if this commit is
+  # over 0.80 x f0c5932's median; measured 0.65-0.75.
+  text-size-bisect:
+    runs-on: windows-latest
+    timeout-minutes: 40       # 6 short GUI runs, about 2.5 min each
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.14"]
+    steps:
+      - name: Keep the file's own line endings
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install capture library
+        run: python -m pip install "scapy>=2.5" psutil
+      - name: The guard's own check
+        run: python .github/scripts/text_size_bisect.py --self-check
+      - name: Text-size change per commit, interleaved
+        run: python .github/scripts/text_size_bisect.py f0c5932 ${{ github.sha }}
+
+  # real macOS: the arp output, symlink and permission paths run there for
+  # real instead of mocked (court batch 3)
+  self-test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 30       # a run hung for 6 hours
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install capture library
+        run: python -m pip install "scapy>=2.5" psutil
+      - name: Self-test
+        env:
+          MINIWIRESHARK_DATA: ${{ runner.temp }}/mw-data
+          MINIWIRESHARK_CONFIG: ${{ runner.temp }}/mw-config.json
+        run: python miniwireshark.py --self-test
