@@ -26189,11 +26189,15 @@ class NetworkModel:
         "pass" + "word=..." in two packets is seen too."""
         key4 = (d["src_ip"], d["sport"], d["dst_ip"], d["dport"])
         how, proto = d.get("login") or "", d.get("login_proto") or "HTTP"
+        fw = self._form_wait   # OrderedDict, oldest first: forget after 30 s
+        while fw and d["time"] - next(iter(fw.values()))[0] > 30:
+            fw.popitem(last=False)
         if not how:
             post = d.get("form_post")
-            if not post and key4 not in self._form_wait:
+            if not post and key4 not in fw:
                 return None
-            buf = b"" if post else self._form_wait.pop(key4)[1]
+            old = fw.pop(key4, (0, b""))[1]   # a new POST drops the old body
+            buf = b"" if post else old
             n = d.get("payload_len") or 0
             raw = d.get("raw") or b""
             if not raw and d.get("pkt") is not None:
@@ -77433,6 +77437,24 @@ def t_a2_login_in_default_mode(ctx):
             repr(m.ev_feed)
         for form in ip013_secret_forms():
             assert form not in blob, "the password leaked into an alert"
+    # an unfinished split form is forgotten after 30 s (packet clock); a
+    # new POST on the same connection replaces the old body
+    k4 = ("192.168.1.10", 46009, "93.184.215.69", 80)
+
+    def form(t, body, post):
+        raw = (head + b"\r\n" if post else b"") + body
+        return {"src_ip": k4[0], "sport": k4[1], "dst_ip": k4[2],
+                "dport": k4[3], "form_post": post, "payload_len": len(raw),
+                "raw": raw, "time": t}
+    m._observe_login(form(100.0, b"user=alex&pass", True))
+    assert m._form_wait[k4][1] == b"user=alex&pass", m._form_wait
+    assert m._observe_login(form(131.0, b"word=" + c, False)) is None
+    assert k4 not in m._form_wait, m._form_wait
+    m._observe_login(form(200.0, b"user=alex&pass", True))
+    m._observe_login(form(201.0, b"user=bob&rem", True))
+    assert m._form_wait[k4][1] == b"user=bob&rem", m._form_wait
+    m._observe_login(form(202.0, b"user=alex&password=" + c, True))
+    assert k4 not in m._form_wait, m._form_wait
     for raw, ts, lt in sb.frames:
         d = fast_decode(raw, ts, lt)
         text = repr({k: v for k, v in d.items()
