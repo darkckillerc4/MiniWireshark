@@ -1,6 +1,6 @@
 # Architecture
 
-MiniWireshark is about 89,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
+MiniWireshark is about 105,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
 
 ## The map of the file
 
