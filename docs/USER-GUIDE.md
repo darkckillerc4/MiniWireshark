@@ -51,6 +51,8 @@ Press `Ctrl+K` and type. The palette finds tabs, settings pages and actions, for
 - *Network check-up…*, *Diagnostics*, *Components Center*, *Storage used…*, *Privacy posture…*
 - *Go to packet…*
 
+It understands more than names. Type `:123` (or *go to packet 123*) to jump to a packet, `ip:192.168.1.5` or `/ port:443` to filter packets, `>` for commands only, `@` for devices and websites, `?` for help topics. `Tab` changes the group (All, Commands, Tabs, Settings, Devices, Help, Filters), `Up` / `Down` / `Ctrl+N` / `Ctrl+P` / `Page Up` / `Page Down` move, `Enter` runs and `Shift+Enter` runs and keeps it open. With nothing typed it shows what you used lately and a few suggestions. Matches are highlighted, accents don't matter, and each row shows its shortcut.
+
 ## Filtering
 
 Each table has a search box. Simple words search everywhere. Friendly tokens narrow it down:
@@ -128,8 +130,20 @@ Each investigation lists the likely causes on a board, with the evidence for and
 | `Alt+Left` / `Alt+Right` | Back / forward |
 | `F1` | Explain this |
 | `F2` | Show or hide the inspector |
+| `F5` | Refresh this tab |
+| `F6` / `Shift+F6` | Next / previous part of the window (search, tabs, filter, table, inspector, status) |
+| `F7` | Go to the table |
+| `F8` | Beginner / Advanced view |
+| `Shift+F1` | Keyboard shortcuts |
+| `Ctrl+Shift+Left` / `Right` (and `Up` / `Down`) | Move a divider |
+| `Menu` key or `Shift+F10` | The selected row's menu |
+| `Alt+Down` | A column's menu (sort, columns, export) |
+| `Shift+Left` / `Shift+Right`, then `Shift+Enter` | Pick a column and sort by it |
+| `Enter` | Open the selected row |
+| `Home` / `End` / `Ctrl+A` | First row / last row / all rows in a table |
+| `Left` / `Right` / `Home` / `End` | Move along the tabs and sub-views (when one has the focus) |
 
-Every shortcut can be changed in **Settings → Keyboard Shortcuts**.
+Every shortcut can be changed in **Settings → Keyboard Shortcuts**. MiniWireshark can be used without a mouse: from the search box, `Tab` reaches the first control of a tab in about six presses (only the shown tab and the active sub-view are stops; use the arrow keys to move along them), and the Inspector, Help and details text panes can be focused and scrolled with the keys.
 
 ## Settings
 
