@@ -139,6 +139,15 @@ def record(version, date, body, digest, lines, commit):
         versions = re.sub(r"(^\|---[^\n]*\n)", lambda m: m.group(1) + row, versions, count=1, flags=re.M)
         write(versions, "docs", "VERSIONS.md")
 
+    # a version's heading has no date until it is released (a date set
+    # by hand went stale while the version waited); the release adds it
+    log = read("CHANGELOG.md")
+    dated = re.sub(r"^(## \[" + re.escape(version) + r"\])[ \t]*$",
+                   lambda m: f"{m.group(1)} — {date}", log, count=1,
+                   flags=re.M)
+    if dated != log:
+        write(dated, "CHANGELOG.md")
+
     if pre:
         return
     readme = read("README.md")

@@ -2,7 +2,7 @@
 
 All notable changes to MiniWireshark. Versions follow `MAJOR.MINOR.PATCH`; each release is one `.py` file attached to its [GitHub release](https://github.com/darkckillerc4/MiniWireshark/releases). Checksums are in [docs/VERSIONS.md](docs/VERSIONS.md).
 
-## [5.3.4] — 2026-11-04
+## [5.3.4]
 
 A medium release that makes MiniWireshark safer, easier to start and easier to understand. Every finding of the 5.2.3 security audit is fixed in the code (four of the fixes still need a check on real hardware: a Windows PC, a Mac and a real Wi-Fi roam), new screens explain your network to a beginner, and the largest bug campaign so far ran before, during and after the new features.
 
@@ -205,6 +205,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - An IPv6 packet with a payload length of 0 (a jumbogram, or a large send that the network card cuts up later) is read from the bytes captured, as IPv4 already was. It showed as "Padding frame".
 - **The Local services web-page check skips more than port numbers.** A second Redis (6380), raw printing on 9101 or 9102, a second database and Redis's Sentinel and cluster ports are no longer asked, and neither is a program whose name says it is a database, Redis, printing, file sharing or SSH, on any port.
 - The release gate's screenshots now include the Local services view.
+- **The changelog's date for a version is the day it is released.** A version's heading has no date while it waits (5.3.4's said 4 November for weeks); the release adds the date it is published.
 - **The self-traffic ledger lists every Local services try.** The scan's one line counts the ports asked; a port asked again over HTTPS now has a line of its own (it had none). The trust page says so, and that the check is off until you turn it on.
 - **A local page's title is its own.** The title inside the page's head is used, else the first one outside every picture (SVG), so a nested or self-closing SVG, a comment, a script or an empty title no longer gives the wrong title.
 - **A web form's other fields are not kept while a split password is awaited.** To catch a password split over packets, only the few bytes that may still become a password field's name (for example "&pass") wait for the next packet, at most 30 seconds; names, e-mail addresses and other values of the form are no longer held in memory.

@@ -95426,6 +95426,21 @@ def t_r7_release_rerun_records_the_released_file(ctx):
               encoding="utf-8") as f:
         versions = f.read()
     assert f"`{want}`" in versions and "| 2 |" in versions, versions
+    # round 6: a heading without a date (not released yet) gets the
+    # release's date, once; a dated heading is left as it is
+    log_path = os.path.join(repo, "CHANGELOG.md")
+    with open(log_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# Changelog\n\n## [9.9.9]\n\nFixes.\n\n"
+                "## [9.9.8] — 2026-10-01\n\nOlder.\n")
+    day0 = datetime.now().date().isoformat()
+    r = run(sys.executable, os.path.join(".github", "scripts",
+                                         "release_current.py"))
+    assert r.returncode == 0, (r.stdout + r.stderr)[-600:]
+    with open(log_path, encoding="utf-8") as f:
+        log = f.read()
+    days = {day0, datetime.now().date().isoformat()}    # midnight
+    assert any(f"## [9.9.9] — {d}\n\nFixes." in log for d in days), log
+    assert "## [9.9.8] — 2026-10-01\n" in log, log
 
 
 @self_test()
@@ -101942,7 +101957,9 @@ def gt_kbd_enter_opens(app, ctx):
             _gui_pump(root, 0.1)
             assert calls and calls[0][0] == "connector_dialog", calls
         finally:
-            st.tree.delete(iid)
+            # the Sources table's own refresh may have rebuilt it already
+            if st.tree.exists(iid):
+                st.tree.delete(iid)
         # Packets: Enter moves the keyboard to the packet's fields
         pt = app._select_tab("packets")
         pt.show_subview("Packets")
@@ -110505,7 +110522,9 @@ def _kbd_room(root, pane, need=None):
     with contextlib.suppress(tk.TclError):
         for _i in range(4):
             root.update_idletasks()
-            have = pane.winfo_height()
+            # an unmapped pane (pack gave it no room: the rows above it
+            # took the whole height) keeps its last, stale height
+            have = pane.winfo_height() if pane.winfo_ismapped() else 0
             if have >= need:
                 break
             if "root" not in _KBD_GEO:
