@@ -104551,9 +104551,12 @@ def gt_r6_inspector_and_saved_widths(app, ctx):
     assert name, "no table that shares its width"
     tab = app._select_tab(name)
     tree, kit = tab.tree, tab.kit
-    min0 = root.minsize()
+    min0, max0 = root.minsize(), root.maxsize()
     try:
         root.minsize(400, 300)
+        # (a 1024x768 screen) Tk holds a window to the screen unless its
+        # maximum size allows more: "full" has to be the full width
+        root.maxsize(4000, 3000)
         root.geometry("1920x1080")
         _gui_pump(root, 0.6)
         fixed = [c for c in tree["displaycolumns"]
@@ -104577,6 +104580,7 @@ def gt_r6_inspector_and_saved_widths(app, ctx):
             ({c: saved.get(c) for c in fixed}, full)
     finally:
         root.minsize(*min0)
+        root.maxsize(*max0)
         root.geometry(geo0)
         _gui_pump(root, 0.4)
 
@@ -110313,6 +110317,7 @@ def gt_kbd_f_keys_and_dividers(app, ctx):
         assert body.sashpos(0) > p1, "moved while typing in a text box"
         # the Packets list | details divider
         pt = app._select_tab("packets")
+        pt.show_subview("Packets")      # an earlier step may leave another
         _gui_pump(root, 0.6)
         _kbd_mid_sash(root, pt.vert_pane)
         v0 = pt.vert_pane.sashpos(0)
@@ -110398,6 +110403,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         # Packets: Ctrl+Shift+Up / Down with the list focused move the
         # divider and leave the selection where it was
         pt = app._select_tab("packets")
+        pt.show_subview("Packets")      # an earlier step may leave another
         _gui_pump(root, 0.6)
         _kbd_mid_sash(root, pt.vert_pane)
         v0, sel = pt.vert_pane.sashpos(0), pt.sel_no
