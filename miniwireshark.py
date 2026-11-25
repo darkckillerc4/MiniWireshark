@@ -36435,6 +36435,56 @@ class FlowLayout:
             page._mw_flow_wait.append(self)
         return True
 
+    def _break(self, items, W):
+        """The rows `items` take in W pixels: lists of [it, x, width]."""
+        lefts = [it for it in items if it["side"] != "right"]
+        rights = [it for it in items if it["side"] == "right"]
+        rows = [[]]          # each: list of (it, x, w)
+        x = xmin = 0         # xmin: a stretching label may shrink
+        for unit in self._units(lefts):
+            umin = sum(min(self._wid(it), 260) if it["expand"]
+                       else self._wid(it) for it in unit)
+            if xmin > 0 and xmin + umin > W:
+                rows.append([])
+                x = xmin = 0
+            for it in unit:
+                wd = self._wid(it)
+                rows[-1].append([it, x, wd])
+                x += wd
+            xmin += umin
+        # right-hand items, the first packed is the right-most
+        left_end = xmin
+        xr = W
+        for it in rights:
+            wd = self._wid(it)
+            if xr - wd < left_end and (xr < W or left_end > 0):
+                rows.append([])
+                left_end, xr = 0, W
+            xr -= wd
+            rows[-1].append([it, xr, wd])
+        return rows
+
+    def measure(self, hide=(), show=()):
+        """The height the row takes at its width with the widgets in
+        `hide` left out and those in `show` put back (nothing moves)."""
+        f = self.f
+        items = [it for it in self.items if (it["shown"] or it["w"] in show)
+                 and it["w"] not in hide and it["w"].winfo_exists()]
+        pl, pt, pr, pb = self._inner()
+        W = f.winfo_width() - pl - pr
+        if f.winfo_width() <= 1:
+            W = sum(self._wid(it) for it in items)
+        return sum(max(r[0]["w"].winfo_reqheight() + sum(r[0]["pady"])
+                       for r in row)
+                   for row in self._break(items, W) if row) + pt + pb
+
+    def show(self, w):
+        """Put back a widget hide() took out, where it was."""
+        it = self.find(w)
+        if it is not None and not it["shown"]:
+            it["shown"] = True
+            self.schedule()
+
     @staticmethod
     def page_shown(page):
         """A notebook page is on screen: its waiting rows are laid out
@@ -36455,31 +36505,7 @@ class FlowLayout:
             W = f.winfo_width() - pl - pr
             if f.winfo_width() <= 1:
                 W = natural
-            lefts = [it for it in items if it["side"] != "right"]
-            rights = [it for it in items if it["side"] == "right"]
-            rows = [[]]          # each: list of (it, x, w)
-            x = xmin = 0         # xmin: a stretching label may shrink
-            for unit in self._units(lefts):
-                umin = sum(min(self._wid(it), 260) if it["expand"]
-                           else self._wid(it) for it in unit)
-                if xmin > 0 and xmin + umin > W:
-                    rows.append([])
-                    x = xmin = 0
-                for it in unit:
-                    wd = self._wid(it)
-                    rows[-1].append([it, x, wd])
-                    x += wd
-                xmin += umin
-            # right-hand items, the first packed is the right-most
-            left_end = xmin
-            xr = W
-            for it in rights:
-                wd = self._wid(it)
-                if xr - wd < left_end and (xr < W or left_end > 0):
-                    rows.append([])
-                    left_end, xr = 0, W
-                xr -= wd
-                rows[-1].append([it, xr, wd])
+            rows = self._break(items, W)
             # an expanding item takes what is left of its row; anything
             # wider than the frame is clamped to it
             for row in rows:
@@ -51123,7 +51149,8 @@ class PacketsTab(BaseTab):
         self.quick_btn = ttk.Button(self.adv_row, text="Quick filters ▾",
                                     command=self.toggle_quick_filters)
         self.quick_btn.pack(side="left", padx=(0, 8))
-        self.lbl(self.adv_row, "Expression:").pack(side="left")
+        self.expr_lbl = self.lbl(self.adv_row, "Expression:")
+        self.expr_lbl.pack(side="left")
         self.expr_var = tk.StringVar()
         ee = ttk.Entry(self.adv_row, textvariable=self.expr_var, width=46)
         self.filter_entry = ee
@@ -51138,17 +51165,19 @@ class PacketsTab(BaseTab):
                     "Field expressions:  ip.src == 192.168.1.5    "
                     "tcp.port == 443    dns.qry.name contains \"example\"    "
                     "smtp    expert.severity >= warning    frame.len > 1000")
-        ttk.Button(self.adv_row, text="Fields…",
-                   command=self.open_fields).pack(side="left", padx=(0, 4))
-        ttk.Button(self.adv_row, text="Build…",
-                   command=self.toggle_builder).pack(side="left",
-                                                     padx=(0, 4))
+        self.fields_btn = ttk.Button(self.adv_row, text="Fields…",
+                                     command=self.open_fields)
+        self.fields_btn.pack(side="left", padx=(0, 4))
+        self.build_btn = ttk.Button(self.adv_row, text="Build…",
+                                    command=self.toggle_builder)
+        self.build_btn.pack(side="left", padx=(0, 4))
         self.builder = None
         self.suggest = FieldSuggest(self, ee)
         ttk.Button(self.adv_row, text="Apply",
                    command=self.apply).pack(side="left")
-        ttk.Button(self.adv_row, text="Clear filter",
-                   command=self.clear_filter).pack(side="left", padx=4)
+        self.clear_btn = ttk.Button(self.adv_row, text="Clear filter",
+                                    command=self.clear_filter)
+        self.clear_btn.pack(side="left", padx=4)
         self.preset_var = tk.StringVar(value=translate_text("Presets…"))
         self.preset_box = ttk.Combobox(self.adv_row, width=18,
                                        textvariable=self.preset_var,
@@ -51160,6 +51189,7 @@ class PacketsTab(BaseTab):
         pm = ttk.Button(self.adv_row, text="⋯", width=3)
         pm.configure(command=lambda b=pm: self._preset_menu(b))
         pm.pack(side="left")
+        self.preset_more = pm
         Tooltip(pm, "Save this filter as a preset, or delete the chosen "
                     "preset")
         self.err_var = DisplayVar()
@@ -51181,21 +51211,24 @@ class PacketsTab(BaseTab):
         self.pause_btn.pack(side="left")
         self.follow_var = tk.BooleanVar(
             value=app.config.get("capture.follow_newest", True))
-        ttk.Checkbutton(stat, text="Follow newest packet",
-                        variable=self.follow_var).pack(side="left",
-                                                       padx=(8, 0))
-        self.lbl(stat, "Time:").pack(side="left", padx=(12, 2))
+        self.follow_chk = ttk.Checkbutton(stat, text="Follow newest packet",
+                                          variable=self.follow_var)
+        self.follow_chk.pack(side="left", padx=(8, 0))
+        self.time_lbl = self.lbl(stat, "Time:")
+        self.time_lbl.pack(side="left", padx=(12, 2))
         self.time_var = tk.StringVar(value=app.config.get(
             "capture.time_format", "Time of day"))
         tb = ttk.Combobox(stat, textvariable=self.time_var, width=17,
                           state="readonly", values=list(TIME_FORMATS))
         tb.pack(side="left")
+        self.time_box = tb
         tb.bind("<<ComboboxSelected>>", lambda e: self._time_format())
         self.xcolor_var = tk.BooleanVar(value=app.config.get(
             "capture.color_expert", True))
-        ttk.Checkbutton(stat, text="Colour expert findings",
-                        variable=self.xcolor_var,
-                        command=self._xcolor).pack(side="left", padx=(8, 0))
+        self.xcolor_chk = ttk.Checkbutton(stat, text="Colour expert findings",
+                                          variable=self.xcolor_var,
+                                          command=self._xcolor)
+        self.xcolor_chk.pack(side="left", padx=(8, 0))
         self.ind_var = DisplayVar(value="Display filter: showing "
                                           "everything")
         tk.Label(stat, textvariable=self.ind_var, bg=WHITE, fg="#0b5394",
@@ -51203,9 +51236,22 @@ class PacketsTab(BaseTab):
         self.count_var = DisplayVar()
         tk.Label(stat, textvariable=self.count_var, bg=WHITE, fg="#666666"
                  ).pack(side="right")
-        vert = ttk.PanedWindow(self.frame, orient="vertical")
-        vert.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        # 5.3.4 (CI, a 1024x768 screen): the list and the details are
+        # packed first, from the bottom, asking for PANE_MIN pixels: they
+        # keep that room in a short window, and the rows above give way
+        # (_fit_rows; Tk squeezed the last rows packed, which was the list,
+        # to about 10 pixels or nothing). With room to spare it is laid
+        # out as before: the rows keep their height, the list takes the rest
+        vert = ttk.PanedWindow(self.frame, orient="vertical",
+                               height=px(self.PANE_MIN))
+        vert.pack(side="bottom", fill="both", expand=True, padx=10,
+                  pady=(4, 8), before=pills)
         self.vert_pane = vert
+        self._rows_level, self._rows_hidden = 0, set()
+        self._rows_job = None
+        for w in (self.frame, vert, pills, row, self.adv_row, self.err_lbl,
+                  self.means_lbl, stat):
+            bind_plain(w, "<Configure>", self._fit_rows_soon)
         lf = tk.Frame(vert, bg=WHITE)
         vert.add(lf, weight=3)
         wrap, self.tree = make_tree(
@@ -51393,6 +51439,71 @@ class PacketsTab(BaseTab):
                 extra = bars[0].winfo_reqheight() + 4
         return 4 * rowh + 2 * line + 30, head + 3 * rowh + extra + 4
 
+    PANE_MIN = 200       # the packet list and details, at the least
+
+    def _fit_rows_soon(self):
+        if getattr(self, "_rows_job", None) is None:
+            with contextlib.suppress(tk.TclError):
+                self._rows_job = self.vert_pane.after_idle(self._fit_rows)
+
+    def _fit_rows(self):
+        """5.3.4 (CI, a 1024x768 screen, the Inspector open): the filter
+        row and the row under it wrapped to seven lines and left the list
+        and the details about 10 pixels. When the list and the details
+        would have less than PANE_MIN pixels, the rows above give way:
+        first the filter row's Fields / Build / presets and the display
+        choices beside Pause (follow, time, colours) step aside, then the
+        rest of the Pause row, then the "Expression:" caption (the box
+        keeps its examples tip) and, while the quick filters are folded,
+        their button, then Clear filter (an emptied box and Enter clear
+        it too). They come back when there's room."""
+        self._rows_job = None
+        vert = self.vert_pane
+        view = vert.master
+        try:
+            height = view.winfo_height()
+            if height <= 1:
+                return                          # not laid out yet
+            back = self._rows_hidden
+            fl_stat = getattr(self.stat_row, "_mw_flow", None)
+            steps = [(self.fields_btn, self.build_btn, self.preset_box,
+                      self.preset_more, self.follow_chk, self.time_lbl,
+                      self.time_box, self.xcolor_chk),
+                     tuple(it["w"] for it in fl_stat.items) if fl_stat
+                     else (),
+                     (self.expr_lbl,) + (() if self.pills_frame.
+                                         winfo_manager() else
+                                         (self.quick_btn,)),
+                     (self.clear_btn,)]
+            hides = [sum(steps[:k], ()) for k in range(len(steps) + 1)]
+
+            def rows(level):
+                total = 0
+                for w in view.pack_slaves():
+                    if w is vert:
+                        continue
+                    fl = getattr(w, "_mw_flow", None)
+                    h = fl.measure(hide=hides[level], show=back) if fl \
+                        else w.winfo_reqheight()
+                    total += h + _pack_pady(w.pack_info())
+                return total
+            need = px(self.PANE_MIN) + _pack_pady(vert.pack_info())
+            level = next((lv for lv in range(len(steps))
+                          if height - rows(lv) >= need), len(steps))
+            self._rows_level = level
+            # (a row Tk lays out as a plain row yet can't give way)
+            want = {w for w in hides[level]
+                    if getattr(w.master, "_mw_flow", None) is not None}
+            if want == back:
+                return
+            for w in want - back:
+                w.master._mw_flow.hide(w)
+            for w in back - want:
+                w.master._mw_flow.show(w)
+            self._rows_hidden = want
+        except (tk.TclError, AttributeError, ValueError, TypeError):
+            pass
+
     def _details_room_soon(self):
         if getattr(self, "_room_job", None):
             return
@@ -51457,6 +51568,7 @@ class PacketsTab(BaseTab):
             return None
         if b is None and show is not False:
             self.builder = FilterBuilder(self)
+        self._fit_rows_soon()
         return self.builder
 
     def _show_err(self):
@@ -56712,6 +56824,8 @@ class MiniWireshark:
             fl = getattr(fr, "_mw_flow", None)
             if fl is not None:
                 fl.schedule()
+        if getattr(self, "state_panel", None) is not None:
+            self._attach_state_panel()
 
     def _card_focus(self, e):
         """A card that takes the keyboard (Tab, Shift+Tab) draws a
@@ -57129,12 +57243,34 @@ class MiniWireshark:
         self.state_panel = tk.Frame(self.root, bg=t["card_bg"], padx=16,
                                     pady=8, highlightthickness=1,
                                     highlightbackground=t["border"])
-        self.state_panel.pack(fill="x", after=self.mode_banner)
+        self._attach_state_panel()
         self.state_panel.bind("<Escape>", lambda e: self.toggle_state_panel(
             False))
         self._fill_state_panel()
         with contextlib.suppress(tk.TclError):
             self.state_panel.focus_set()
+
+    def _attach_state_panel(self):
+        """5.3.4 (CI, a 1024x768 screen): the details under the state line
+        pushed the tabs down by 140 pixels, and with the message line the
+        Packets list and its details were left none. In a short window
+        (compact mode) they open over the top of the window, under the
+        line, until closed (Close, Escape, or the line again); in a tall
+        one they sit under the line as before."""
+        panel = self.state_panel
+        if panel is None:
+            return
+        with contextlib.suppress(tk.TclError):
+            if self._compact:
+                if panel.winfo_manager() == "pack":
+                    panel.pack_forget()
+                panel.place(in_=self.mode_banner, x=0, y=0, rely=1.0,
+                            relwidth=1.0, bordermode="outside")
+                panel.lift()
+            else:
+                if panel.winfo_manager() == "place":
+                    panel.place_forget()
+                panel.pack(fill="x", after=self.mode_banner)
 
     def state_panel_lines(self):
         """The details under the state line, already in your language."""
@@ -102931,9 +103067,6 @@ def gui_test_record(results, name, fn):
     except Exception as e:                           # noqa: BLE001
         results.append(("FAIL", name, f"{type(e).__name__}: {e}\n" +
                         traceback.format_exc(limit=6)))
-    finally:
-        with contextlib.suppress(Exception):
-            _kbd_restore_geo()        # a window made taller for the step
 
 
 def run_gui_test(live=False):
@@ -112658,43 +112791,29 @@ def _kbd_menu_key():
     return "<Key-App>" if win else "<Key-Menu>"
 
 
-_KBD_GEO = {}
-
-
 def _kbd_room(root, pane, need=None):
     """(CI windows, a 768-pixel screen) with the GUI test's banners and
     filter rows the Packets list and details got about 10 pixels, so
     neither the divider keys nor the packet's fields could be reached.
-    Make the window taller for the step (Tk allows a window taller than
-    the screen once its maximum size allows it); gui_test_record puts it
-    back after the step."""
+    The window was made taller for the step; the window itself now keeps
+    them the room (PacketsTab._fit_rows, App._attach_state_panel), and
+    this checks that it does."""
     need = need or px(200)
-    with contextlib.suppress(tk.TclError):
-        for _i in range(4):
-            root.update_idletasks()
+
+    def have():
+        try:
             # an unmapped pane (pack gave it no room: the rows above it
             # took the whole height) keeps its last, stale height
-            have = pane.winfo_height() if pane.winfo_ismapped() else 0
-            if have >= need:
-                break
-            if "root" not in _KBD_GEO:
-                _KBD_GEO.update(root=root, geo=root.geometry(),
-                                max=root.maxsize())
-            root.maxsize(px(4000), px(3000))
-            root.geometry("%dx%d" % (root.winfo_width(),
-                                     root.winfo_height() + need - have + 40))
-            _gui_pump(root, 0.4)
-
-
-def _kbd_restore_geo():
-    if not _KBD_GEO:
-        return
-    was = dict(_KBD_GEO)
-    _KBD_GEO.clear()
-    with contextlib.suppress(tk.TclError):
-        was["root"].maxsize(*was["max"])
-        was["root"].geometry(was["geo"])
-        _gui_pump(was["root"], 0.3)
+            return pane.winfo_height() if pane.winfo_ismapped() else 0
+        except tk.TclError:
+            return 0
+    _gui_pump(root, 0.1, lambda: have() >= need, timeout=3)
+    got = have()
+    assert got >= need, (
+        f"the Packets list and details have {got} of the {need} pixels "
+        f"they need (shown: {bool(pane.winfo_ismapped())}; window "
+        f"{root.winfo_width()}x{root.winfo_height()} on a "
+        f"{root.winfo_screenwidth()}x{root.winfo_screenheight()} screen)")
 
 
 def _kbd_mid_sash(root, pane):
@@ -112960,6 +113079,99 @@ def gt_kbd_status_widgets(app, ctx):
             app.__dict__.pop(n, None)
         app.toggle_inspector(keep, remember=False)
         _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd room: Packets at 1024x768 keeps the list and details "
+               "200 pixels under the state panel, the message line, a typed "
+               "filter's line and an open Inspector; the rows come back in "
+               "a tall window")
+def gt_kbd_packets_room_768(app, ctx):
+    """5.3.4 CI (the Windows runner's 1024x768 screen): with the details
+    under the state line, the message line and the Inspector open (the
+    divider steps put it at half the window) the filter rows wrapped and
+    the Packets list and details had about 10 pixels, or none."""
+    root = app.root
+    pt = app.tabs["packets"]
+    vert = pt.vert_pane
+    keep = (root.geometry(), root.maxsize(), app.inspector_visible,
+            app.current_tab_name())
+    need = px(200)
+
+    def room():
+        _gui_pump(root, 0.5)
+        _gui_pump(root, 0.1, lambda: vert.winfo_ismapped() and
+                  vert.winfo_height() >= need, timeout=3)
+        return (vert.winfo_ismapped(), vert.winfo_height())
+
+    def fields_btn():
+        return next(w for w in pt.adv_row.winfo_children()
+                    if w.winfo_class() == "TButton" and
+                    str(w.cget("text")) == translate_text("Fields…"))
+    try:
+        # Tk holds a window to the screen unless its maximum size allows
+        # more (a 1024x768 screen, and a window placed at +20+30)
+        root.maxsize(px(4000), px(3000))
+        app._select_tab("packets")
+        pt.show_subview("Packets")
+        app.toggle_state_panel(True)
+        app._set_banner("A message with an action stays up", "warn",
+                        action=("Undo", lambda: None))
+        pt.expr_var.set("tcp.port == 443")
+        pt._validate_expr()                  # its "= ..." line under it
+        for geo in ("1024x768", "1009x738"):
+            root.geometry(geo)
+            _gui_pump(root, 0.6)
+            # below 1180 pixels the Inspector steps aside by itself; the
+            # divider steps open it again and put it half way
+            for half in (False, True):
+                app.toggle_inspector(True, remember=False)
+                _gui_pump(root, 0.4)
+                if half:
+                    app.body.sashpos(0, app.body.winfo_width() // 2)
+                else:
+                    app._inspector_width()
+                shown, h = room()
+                where = (geo, "Inspector at half" if half else "Inspector",
+                         f"window {root.winfo_width()}x"
+                         f"{root.winfo_height()}", f"tab "
+                         f"{vert.master.winfo_width()}x"
+                         f"{vert.master.winfo_height()}")
+                assert shown and h >= need, \
+                    ("the Packets list and details", h, "of", need,
+                     "shown" if shown else "not shown") + where
+                assert pt.expr_entry.winfo_ismapped(), \
+                    ("no filter box",) + where
+                assert app.state_panel is not None, where
+        # a tall window: the rows come back, the details sit under the line
+        app.toggle_state_panel(False)
+        app._banner_action(None)
+        app._hide_banner()
+        pt.expr_var.set("")
+        pt._validate_expr()
+        root.geometry(px_geo("1400x900"))
+        app.toggle_inspector(False, remember=False)
+        _gui_pump(root, 0.8)
+        _gui_pump(root, 0.1, lambda: fields_btn().winfo_ismapped(),
+                  timeout=3)
+        assert fields_btn().winfo_ismapped(), "Fields… stayed hidden"
+        assert pt.time_var.get() and any(
+            w.winfo_ismapped() for w in pt.stat_row.winfo_children()
+            if w.winfo_class() == "TCombobox"), "the Time choice stayed hidden"
+        app.toggle_state_panel(True)
+        _gui_pump(root, 0.3)
+        assert app.state_panel.winfo_manager() == "pack", \
+            app.state_panel.winfo_manager()
+    finally:
+        app.toggle_state_panel(False)
+        app._banner_action(None)
+        app._hide_banner()
+        pt.expr_var.set("")
+        pt._validate_expr()
+        root.geometry(keep[0])
+        root.maxsize(*keep[1])
+        app.toggle_inspector(keep[2], remember=False)
+        app._select_tab(keep[3])
+        _gui_pump(root, 0.4)
 
 
 @gui_test_step("kbd C7: F7 table, F8 view, F5 refresh, Shift+F1 sheet, "
