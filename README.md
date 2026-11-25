@@ -56,7 +56,7 @@ Under the beginner view is a real analysis workstation, with packet dissection, 
 | <img src="docs/assets/icons/accessibility.svg" width="36" alt=""> | **Accessible and multilingual** | English, French and Spanish. Light and dark themes, colour-blind palettes, adjustable text size, full keyboard control and a command palette (`Ctrl+K`). |
 | <img src="docs/assets/icons/self-maintaining.svg" width="36" alt=""> | **Self-maintaining** | Installs its own dependencies into a private folder and never into your system Python. Offers to install Npcap on Windows, picks the best network card, heals a capture that dies, and checks Ed25519-signed updates. |
 
-The engineering underneath (a self-installing private Python runtime, a decoder 15× faster than the obvious one, pure-Python AES and Ed25519 fallbacks, 519 self-tests) is described in [Under the hood](docs/UNDER-THE-HOOD.md).
+The engineering underneath (a self-installing private Python runtime, a decoder 15× faster than the obvious one, pure-Python AES and Ed25519 fallbacks, 520 self-tests) is described in [Under the hood](docs/UNDER-THE-HOOD.md).
 
 ## Screenshots
 
@@ -179,7 +179,7 @@ More answers are in the [FAQ](docs/FAQ.md). To report a problem, open an [issue]
 ## Testing
 
 ```bash
-python miniwireshark.py --self-test               # 519 tests, about 5 to 10 minutes
+python miniwireshark.py --self-test               # 520 tests, about 5 to 10 minutes
 xvfb-run -a python miniwireshark.py --gui-test    # Linux without a display
 python miniwireshark.py --bench-gui S1 S2         # performance budgets
 ```
@@ -188,10 +188,10 @@ What to expect from `--self-test` on 5.3.4, measured on Linux under `xvfb-run`. 
 
 | Python | scapy and psutil | Passed / failed / skipped |
 |---|---|---|
-| 3.12 | installed | 517 / 0 / 2 |
-| 3.12 | not installed (a fresh install, before the first start) | 477 / 0 / 42 |
-| 3.8 | installed | 498 / 0 / 21 |
-| 3.8 | not installed | 458 / 0 / 61 |
+| 3.12 | installed | 518 / 0 / 2 |
+| 3.12 | not installed (a fresh install, before the first start) | 478 / 0 / 42 |
+| 3.8 | installed | 499 / 0 / 21 |
+| 3.8 | not installed | 459 / 0 / 61 |
 
 - The 2 skips in every row come from our test machine, not the program: one test is skipped when it runs as root, and one when the computer has neither `ip` nor `arp`. Run as a normal user on a computer with `ip`, both run too. Three more are skipped outside a git checkout (a downloaded copy): they check the repository's own files.
 - Without scapy and psutil, 40 more tests are skipped: they decode packets with scapy or read programs with psutil.
@@ -218,7 +218,7 @@ Every release is a single `.py` file attached to its [GitHub release](https://gi
 ## Project layout
 
 ```
-miniwireshark.py        the application: one file on purpose, about 114,000 lines in banner-marked regions
+miniwireshark.py        the application: one file on purpose, about 115,000 lines in banner-marked regions
 legacy/                 versions 1.x and 2.0.0 (written before this repository; imported later)
 docs/                   installation, user guide, features, architecture, FAQ, version index
 .github/                CI, issue and PR templates, release notes, archive-release workflow
