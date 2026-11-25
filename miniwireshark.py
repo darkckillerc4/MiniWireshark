@@ -101762,7 +101762,7 @@ def gt_kbd_tables(app, ctx):
                 tree.selection_set(kids[0])
                 tree.focus(kids[0])
             # Menu key and Shift+F10 open the row menu, with Sort and columns
-            for seq in ("<Shift-F10>", "<Key-Menu>"):
+            for seq in ("<Shift-F10>", _kbd_menu_key()):
                 del shown[:]
                 tree.event_generate(seq)
                 _gui_pump(root, 0.05)
@@ -101970,7 +101970,7 @@ def gt_kbd_context_keys(app, ctx):
         _gui_pump(root, 0.4)
         pt.tree.focus_force()
         _gui_pump(root, 0.1)
-        for seq in ("<Shift-F10>", "<Key-Menu>"):
+        for seq in ("<Shift-F10>", _kbd_menu_key()):
             del shown[:]
             pt.tree.event_generate(seq)
             _gui_pump(root, 0.05)
@@ -102005,7 +102005,7 @@ def gt_kbd_context_keys(app, ctx):
         pt.dtree.selection_set(kids[0])
         pt.dtree.focus(kids[0])
         _gui_pump(root, 0.1)
-        for seq in ("<Shift-F10>", "<Key-Menu>"):
+        for seq in ("<Shift-F10>", _kbd_menu_key()):
             del shown[:]
             pt.dtree.event_generate(seq)
             _gui_pump(root, 0.05)
@@ -102021,7 +102021,7 @@ def gt_kbd_context_keys(app, ctx):
         if mp.nodes:
             mp.c.focus_force()
             _gui_pump(root, 0.1)
-            for seq in ("<Shift-F10>", "<Key-Menu>"):
+            for seq in ("<Shift-F10>", _kbd_menu_key()):
                 del shown[:]
                 mp.c.event_generate(seq)
                 _gui_pump(root, 0.05)
@@ -102037,7 +102037,7 @@ def gt_kbd_context_keys(app, ctx):
             assert str(c.cget("takefocus")) == "1"
             c.focus_force()
             _gui_pump(root, 0.1)
-            for seq in ("<Shift-F10>", "<Key-Menu>"):
+            for seq in ("<Shift-F10>", _kbd_menu_key()):
                 del shown[:]
                 c.event_generate(seq)
                 _gui_pump(root, 0.05)
@@ -110479,6 +110479,16 @@ def t_kbd_saved_key_equal_to_a_new_default(ctx):
     assert shortcut_default_losers(d) == {"mode_toggle"}
     d["clear"] = ""
     assert "clear" not in shortcut_default_losers(d)
+
+
+def _kbd_menu_key():
+    """The Menu (Apps) key as this Tk names it: <Key-App> on Windows,
+    <Key-Menu> on X11 (CI windows: a generated <Key-Menu> reached no
+    binding there)."""
+    root = tk._default_root
+    win = root is not None and root.tk.call("tk", "windowingsystem") == \
+        "win32"
+    return "<Key-App>" if win else "<Key-Menu>"
 
 
 _KBD_GEO = {}
