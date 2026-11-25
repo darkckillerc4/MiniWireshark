@@ -107549,6 +107549,10 @@ def gt_r8_long_run_fast_time(app, ctx):
     gc.collect()
     base = (threading.active_count(), len(os.listdir("/proc/self/task")),
             len(os.listdir("/proc/self/fd")))
+    # a tooltip open under the pointer (2 widgets) is not the jobs' own
+    with contextlib.suppress(tk.TclError, AttributeError):
+        if Tooltip._active is not None:
+            Tooltip._active._hide()
     census0, blocks0 = _tk_census(root), sys.getallocatedblocks()
     peak = Counter()
     peak_total = 0
@@ -107645,6 +107649,9 @@ def gt_r8_long_run_fast_time(app, ctx):
     _gui_pump(root, 0.3)
     end = (threading.active_count(), len(os.listdir("/proc/self/task")),
            len(os.listdir("/proc/self/fd")))
+    with contextlib.suppress(tk.TclError, AttributeError):
+        if Tooltip._active is not None:
+            Tooltip._active._hide()
     census1, blocks1 = _tk_census(root), sys.getallocatedblocks()
     left = [t.name for t in threading.enumerate()
             if t.name in LONG_RUN_JOBS + ("fake-sniffer",)]
