@@ -42279,40 +42279,42 @@ def _clip_box_editable(tkapp, w):
 
 def install_clipboard_guard(widget):
     """Seventh audit (security): no copy can skip the guard. Tk's own
-    "clipboard append" (Ctrl+C in any text, a table, a button of this
-    program) goes through clipboard_safe_text first; text copied from a
-    box the person types into is left as it is. Once per Tk. -> True
-    when the guard is in place."""
-    tkapp = getattr(widget, "tk", None)
-    if tkapp is None:
-        return False
+    copy (Ctrl+C or Copy in any text, entry or list box of this program)
+    is read back right after it and put on the clipboard guarded
+    (clipboard_safe_text); text copied from a box the person types into
+    is left as it is. Once per Tk. -> True when the guard is in place.
+    (Windows CI: wrapping Tk's own "clipboard" command instead made Tk
+    end the process with an access violation on its next use.)"""
     try:
-        if tkapp.call("info", "commands", "::mw_tk_clipboard"):
-            return True
-
-        def guard(w, data):
-            # _clip_box_editable answers False on any Tk error: guarded
-            if _clip_box_editable(tkapp, w):
-                return data
-            return clipboard_safe_text(str(data))
-        tkapp.createcommand("::mw_clip_guard", guard)
-        tkapp.eval(r"""
-rename ::clipboard ::mw_tk_clipboard
-proc ::clipboard {args} {
-    if {[lindex $args 0] eq "append" && [llength $args] >= 2} {
-        set w .
-        set i [lsearch -exact [lrange $args 0 end-1] -displayof]
-        if {$i >= 0} {set w [lindex $args [expr {$i + 1}]]}
-        set args [lreplace $args end end \
-            [::mw_clip_guard $w [lindex $args end]]]
-    }
-    return [uplevel 1 [linsert $args 0 ::mw_tk_clipboard]]
-}
-""")
+        root = widget._root()
+    except (AttributeError, tk.TclError):
+        return False
+    if getattr(root, "_mw_clip_guard", False):
         return True
+    tkapp = root.tk
+
+    def after_copy(e):
+        w = getattr(e, "widget", None)
+        if _clip_box_editable(tkapp, str(w) if w is not None else "."):
+            return None
+        try:
+            data = str(root.clipboard_get())
+        except tk.TclError:
+            return None                 # nothing, or not text
+        safe = clipboard_safe_text(data)
+        if safe != data:
+            with contextlib.suppress(tk.TclError):
+                root.clipboard_clear()
+                root.clipboard_append(safe)
+        return None
+    try:
+        # the "all" tag: after the widget's own Copy binding has run
+        root.bind_all("<<Copy>>", after_copy, add="+")
     except tk.TclError:
         LOG.warning("the clipboard guard could not be put in place")
         return False
+    root._mw_clip_guard = True
+    return True
 
 
 def put_on_clipboard(widget, text):
@@ -92672,14 +92674,13 @@ assert mw.install_clipboard_guard(r) and mw.install_clipboard_guard(r)
 print("GUARD", flush=True)
 got = []
 board_now = lambda: (got.append(r.clipboard_get()), got[-1])[1]
-r.clipboard_clear()
-r.clipboard_append("=1+1\nDevice\n=cmd|x")       # tkinter's own
-assert board_now() == "'=1+1\nDevice\n'=cmd|x", got
+# (this file's own writes all go through put_on_clipboard or
+# copy_to_clipboard: no_copy_skips_the_guard reads the source for that)
 txt = tk.Text(r)
 txt.insert("1.0", "Name\n=HYPERLINK(\"http://x\")\n")
 txt.configure(state="disabled")
 txt.tag_add("sel", "1.0", "end-1c")
-r.tk.call("tk_textCopy", txt._w)                 # Tk's Ctrl+C
+txt.event_generate("<<Copy>>")                   # Tk's own Ctrl+C
 assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
 mw.make_readonly_focusable(txt)
 txt.event_generate("<Control-c>")
@@ -103251,7 +103252,10 @@ def gt_kbd_text_panes(app, ctx):
     root = app.root
     # seventh audit (security): the window puts the clipboard guard in
     # place as it opens, for Tk's own Ctrl+C too
-    assert root.tk.call("info", "commands", "::mw_tk_clipboard")
+    assert getattr(root, "_mw_clip_guard", False)
+    assert any("<<Copy>>" in str(b) for b in
+               root.tk.splitlist(root.tk.call("bind", "all"))), \
+        "no guard on Tk's own Copy"
     app.toggle_inspector(True)
     ptab = app._select_tab("packets")
     ptab.show_subview("Packets")
