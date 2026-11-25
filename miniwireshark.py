@@ -111469,6 +111469,8 @@ def t_kbd_shortcut_names_have_controls_actions_and_no_clash(ctx):
 def t_kbd_roving_group_is_one_tab_stop(ctx):
     """RovingGroup: one member is the Tab stop; a disabled one is passed
     over; arrows walk the row. (A bare Tk window: no application.)"""
+    if not _tk_can_draw():
+        return "skip"           # the test machine's Python 3.8 Tk
     root = tk.Tk()
     try:
         root.withdraw()

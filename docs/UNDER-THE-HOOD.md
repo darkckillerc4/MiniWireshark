@@ -81,10 +81,10 @@ Verification uses `cryptography` when present, and otherwise **a pure-Python Ed2
 
 ## <img src="assets/icons/tests.svg" width="28" alt=""> A window that tests and measures itself
 
-- **480 self-tests** run without capture or admin rights (40 of them need scapy or psutil and are skipped without them), driven by **replay scenarios**: a scripted home network made of ordinary packets with `.example` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
+- **513 self-tests** run without capture or admin rights (40 of them need scapy or psutil and are skipped without them), driven by **replay scenarios**: a scripted home network made of ordinary packets with `.example` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
 - **Fuzzers** throw malformed packets at the decoders, the call decoder and the model; a run of a million mutated frames with a fixed seed raises no error.
 - **A mutation check** flipped comparisons and constants in 30 key functions; every surviving change is killed by a test or listed as equivalent, with a reason.
-- **The GUI test** drives the real window through every tab (95 steps; one of them, live capture, runs only with `--live`).
+- **The GUI test** drives the real window through every tab (123 steps; one of them, live capture, runs only with `--live`).
 - **A layout crawler** opened every tab, view, dialog and settings page in three languages, two themes, four text sizes and screen sizes from 1024×768 to 1920×1080, and flagged overlaps and cut-off text.
 - **Performance budgets** (`BENCH_LIMITS`) are frozen, and `--bench-gui` fails when the window gets slower.
 - **`--release-gate`** runs all of it and photographs every tab into one folder that can be sent back from another computer.
