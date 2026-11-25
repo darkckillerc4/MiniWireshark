@@ -4032,8 +4032,7 @@ class LoaderWindow(tk.Frame):
     def _copy_details(self):
         try:
             text = self.log.get("1.0", "end")
-            self.clipboard_clear()
-            self.clipboard_append(mask_sensitive(text))
+            put_on_clipboard(self, mask_sensitive(text))
             self.post_footer("Details copied (addresses masked).")
         except tk.TclError:
             pass
@@ -28543,6 +28542,94 @@ def config_defaults_flat():
     return out
 
 
+def _rule_names_one(tag):
+    """An alert rule "kind|subject" made for one device, address or name,
+    not a whole alert type ("kind|*")."""
+    return str(tag).partition("|")[2].strip() not in ("", "*")
+
+
+def forget_seen_in_settings(data):
+    """Seventh audit (privacy): "Delete ALL history" left the settings
+    that name what was seen: the recent filters (ip.addr==192.168.1.77,
+    dns.qry.name==www.example.com), the alerts marked expected, muted or
+    snoozed for one device or address, the devices' places on the Map,
+    the website categories you chose and the row a saved workspace
+    selects. They are emptied in `data` (a settings dict, changed in
+    place); what you named yourself (filter presets, workspaces and their
+    filters, connectors) and the rules for a whole alert type are kept.
+    -> the dotted names that were changed."""
+    changed = []
+
+    def section(name):
+        sec = data.get(name) if isinstance(data, dict) else None
+        return sec if isinstance(sec, dict) else None
+
+    def empty(name, key, blank):
+        sec = section(name)
+        if sec is not None and sec.get(key):
+            sec[key] = blank
+            changed.append(f"{name}.{key}")
+
+    empty("filters", "recent", [])
+    empty("map", "positions", {})
+    empty("websites", "category_overrides", {})
+    alerts = section("alerts")
+    if alerts is not None:
+        for key in ("expected", "muted_devices"):
+            val = alerts.get(key)
+            keep = [t for t in val if not _rule_names_one(t)] \
+                if isinstance(val, list) else []
+            if val and keep != val:
+                alerts[key] = keep
+                changed.append(f"alerts.{key}")
+        val = alerts.get("snoozed")
+        keep = {k: v for k, v in val.items() if not _rule_names_one(k)} \
+            if isinstance(val, dict) else {}
+        if val and keep != val:
+            alerts["snoozed"] = keep
+            changed.append("alerts.snoozed")
+    ws = section("workspaces")
+    saved = ws.get("saved") if ws is not None else None
+    for one in (saved.values() if isinstance(saved, dict) else ()):
+        view = one.get("view") if isinstance(one, dict) else None
+        if isinstance(view, dict) and view.get("sel") is not None:
+            view["sel"] = None
+            if "workspaces.saved" not in changed:
+                changed.append("workspaces.saved")
+    return changed
+
+
+def forget_seen_settings(cfg):
+    """Seventh audit (privacy): forget_seen_in_settings on the settings
+    in use, saved at once (so closing the window writes them as they are
+    now), and on the day-old backup copy next to the file (one that can't
+    be read is deleted). -> the dotted names that were changed."""
+    changed = forget_seen_in_settings(cfg.data)
+    CATEGORY_OVERRIDES.clear()
+    if getattr(cfg, "read_only", False):
+        LOG.info("delete all history: the settings file is kept as it was")
+        return changed
+    if changed:
+        cfg.save()
+    bak = cfg.path + ".bak"
+    try:
+        if os.path.islink(bak) or not os.path.isfile(bak):
+            data = None
+        else:
+            with open(bak, "rb") as f:
+                data = json.loads(f.read().decode("utf-8-sig"))
+        if os.path.lexists(bak) and not isinstance(data, dict):
+            os.remove(bak)
+        elif data is not None and forget_seen_in_settings(data):
+            atomic_write_text(bak, json.dumps(data, indent=2, default=str))
+    except (OSError, ValueError):
+        with contextlib.suppress(OSError):
+            os.remove(bak)
+    LOG.info("delete all history: settings emptied: %s",
+             ", ".join(changed) or "none")
+    return changed
+
+
 # ---- V5: teach-once device fingerprints ---------------------------------------
 def _name_pattern(name):
     """'ESP_6A1B2C' → 'esp_*', 'BRW008077500050' → 'brw*'; '' when the
@@ -31782,7 +31869,7 @@ Full report (HTML) ¦ Rapport complet (HTML) ¦ Informe completo (HTML)
 Health checks send a few tiny test connections, so they only run while watching live with Active Scanning on (not in Quiet Mode). ¦ Les vérifications de santé envoient quelques minuscules connexions de test : elles ne tournent que pendant l'observation en direct avec l'analyse active (pas en mode discret). ¦ Las comprobaciones de salud envían unas pocas conexiones de prueba diminutas, así que solo se ejecutan al observar en directo con la exploración activa (no en modo silencioso).
 Help & glossary ¦ Aide et glossaire ¦ Ayuda y glosario
 Hide the inspector (F2 shows it again) ¦ Masquer l'inspecteur (F2 le réaffiche) ¦ Ocultar el inspector (F2 lo vuelve a mostrar)
-History is off, but old history or saved sessions are still on this computer. Delete them? ¦ L'historique est désactivé, mais un ancien historique ou des sessions enregistrées sont encore sur cet ordinateur. Les supprimer ? ¦ El historial está desactivado, pero aún hay un historial antiguo o sesiones guardadas en este equipo. ¿Borrarlos?
+History is off, but old history, saved sessions or recent filters are still on this computer. Delete them? ¦ L'historique est désactivé, mais un ancien historique, des sessions enregistrées ou des filtres récents sont encore sur cet ordinateur. Les supprimer ? ¦ El historial está desactivado, pero aún hay un historial antiguo, sesiones guardadas o filtros recientes en este equipo. ¿Borrarlos?
 Load session error ¦ Erreur de chargement de session ¦ Error al cargar la sesión
 Load session ¦ Charger une session ¦ Cargar sesión
 Mask IP and hardware addresses (recommended) ¦ Masquer les adresses IP et matérielles (recommandé) ¦ Ocultar direcciones IP y físicas (recomendado)
@@ -31862,7 +31949,7 @@ Undo selected ¦ Annuler la sélection ¦ Deshacer lo seleccionado
 Update available ¦ Mise à jour disponible ¦ Actualización disponible
 Update rolled back ¦ Mise à jour annulée ¦ Actualización revertida
 What this computer can and can't see. Click for the full coverage report. ¦ Ce que cet ordinateur peut voir ou non. Cliquez pour le rapport de couverture complet. ¦ Lo que este equipo puede y no puede ver. Haga clic para el informe de cobertura completo.
-Yes = delete ALL stored history: the history, saved packets, the last autosave, crash copies, your device names and notes, remembered networks and the list of programs that wait for connections.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré : l'historique, les paquets enregistrés, la dernière sauvegarde automatique, les copies après plantage, les noms et notes de vos appareils, les réseaux mémorisés et la liste des programmes qui attendent des connexions.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado: el historial, los paquetes guardados, el último guardado automático, las copias tras un fallo, los nombres y notas de sus dispositivos, las redes recordadas y la lista de programas que esperan conexiones.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
+Yes = delete ALL stored history: the history, saved packets, the last autosave, crash copies, your device names and notes, remembered networks, the list of programs that wait for connections, recent filters, places on the Map, the website categories you chose and alert rules for one device or address.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré : l'historique, les paquets enregistrés, la dernière sauvegarde automatique, les copies après plantage, les noms et notes de vos appareils, les réseaux mémorisés, la liste des programmes qui attendent des connexions, les filtres récents, les emplacements sur la Carte, les catégories de sites que vous avez choisies et les règles d'alerte pour un seul appareil ou une seule adresse.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado: el historial, los paquetes guardados, el último guardado automático, las copias tras un fallo, los nombres y notas de sus dispositivos, las redes recordadas, la lista de programas que esperan conexiones, los filtros recientes, los lugares en el Mapa, las categorías de sitios que eligió y las reglas de alerta para un solo dispositivo o dirección.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
 You have unsaved changes. Close without saving? ¦ Vous avez des modifications non enregistrées. Fermer sans enregistrer ? ¦ Tiene cambios sin guardar. ¿Cerrar sin guardar?
 Your device corrections (undo) ¦ Vos corrections d'appareils (annuler) ¦ Sus correcciones de dispositivos (deshacer)
 Your identity corrections ¦ Vos corrections d'identité ¦ Sus correcciones de identidad
@@ -37315,8 +37402,7 @@ def make_readonly_focusable(txt, color="#2b7de9"):
         with contextlib.suppress(tk.TclError):
             text = txt.get("sel.first", "sel.last")
             if text:
-                txt.clipboard_clear()
-                txt.clipboard_append(text)
+                put_on_clipboard(txt, text)
         return "break"
     for seq in ("<Control-a>", "<Control-A>"):
         txt.bind(seq, select_all, add="+")
@@ -42152,6 +42238,90 @@ def safe_tsv_row(cells):
     return "\t".join(str(_SafeCsv.cell(c)) for c in cells)
 
 
+_CLIP_LINE_BREAK = re.compile(r"(\r\n|\r|\n)")
+_CLIP_RULE_LINE = re.compile(r"=+|-+")
+
+
+def clipboard_safe_text(text):
+    """Seventh audit (security): text of several lines went to the
+    clipboard as it was, so "=1+1\\nsecond line" or "Device\\n=cmd|x"
+    became a formula when pasted into a spreadsheet (each line is a row
+    there, each tab a cell). Every cell of every line now gets the guard
+    of a CSV cell: one that starts with = + - or @ gets a ' in front.
+    The rest is left as it is, so a report stays readable; a line made
+    only of = or - (a heading's underline) can't run anything and is
+    kept. A guarded text is not guarded twice."""
+    if not isinstance(text, str) or not text:
+        return text
+    parts = _CLIP_LINE_BREAK.split(text)
+    for i in range(0, len(parts), 2):
+        if parts[i] and not _CLIP_RULE_LINE.fullmatch(parts[i]):
+            parts[i] = "\t".join("'" + c if c.startswith(_SafeCsv.BAD)
+                                  else c for c in parts[i].split("\t"))
+    return "".join(parts)
+
+
+def _clip_box_editable(tkapp, w):
+    """True for a text box the person can type into (a search box, a
+    name being edited): what they copy from it is copied as it is."""
+    try:
+        cls = str(tkapp.call("winfo", "class", w))
+        if cls in ("Entry", "Spinbox"):
+            return str(tkapp.call(w, "cget", "-state")) == "normal"
+        if cls in ("TEntry", "TCombobox", "TSpinbox"):
+            return bool(tkapp.getboolean(tkapp.call(
+                w, "instate", "!disabled !readonly")))
+    except (tk.TclError, TypeError, ValueError):
+        pass
+    return False
+
+
+def install_clipboard_guard(widget):
+    """Seventh audit (security): no copy can skip the guard. Tk's own
+    "clipboard append" (Ctrl+C in any text, a table, a button of this
+    program) goes through clipboard_safe_text first; text copied from a
+    box the person types into is left as it is. Once per Tk. -> True
+    when the guard is in place."""
+    tkapp = getattr(widget, "tk", None)
+    if tkapp is None:
+        return False
+    try:
+        if tkapp.call("info", "commands", "::mw_tk_clipboard"):
+            return True
+
+        def guard(w, data):
+            # _clip_box_editable answers False on any Tk error: guarded
+            if _clip_box_editable(tkapp, w):
+                return data
+            return clipboard_safe_text(str(data))
+        tkapp.createcommand("::mw_clip_guard", guard)
+        tkapp.eval(r"""
+rename ::clipboard ::mw_tk_clipboard
+proc ::clipboard {args} {
+    if {[lindex $args 0] eq "append" && [llength $args] >= 2} {
+        set w .
+        set i [lsearch -exact [lrange $args 0 end-1] -displayof]
+        if {$i >= 0} {set w [lindex $args [expr {$i + 1}]]}
+        set args [lreplace $args end end \
+            [::mw_clip_guard $w [lindex $args end]]]
+    }
+    return [uplevel 1 [linsert $args 0 ::mw_tk_clipboard]]
+}
+""")
+        return True
+    except tk.TclError:
+        LOG.warning("the clipboard guard could not be put in place")
+        return False
+
+
+def put_on_clipboard(widget, text):
+    """Every copy of this program: the text on the clipboard, guarded
+    (clipboard_safe_text). Raises tk.TclError like clipboard_append."""
+    install_clipboard_guard(widget)
+    widget.clipboard_clear()
+    widget.clipboard_append(clipboard_safe_text(text))
+
+
 def copy_to_clipboard(app, text):
     text = hide_credentials(scrub_secrets(text))
     # fourth audit: one value copied on its own (a domain, a device's
@@ -42159,7 +42329,10 @@ def copy_to_clipboard(app, text):
     # a cell too, so a single line gets the formula guard of a copied row
     if "\n" not in text and "\r" not in text:
         text = safe_tsv_row(text.split("\t"))
+    else:
+        text = clipboard_safe_text(text)   # seventh audit: every line
     try:
+        install_clipboard_guard(app.root)
         app.root.clipboard_clear()
         app.root.clipboard_append(text)
         app.root.update_idletasks()
@@ -42698,8 +42871,8 @@ class Charts:
 
         def copy(csv_):
             with contextlib.suppress(tk.TclError):
-                c.clipboard_clear()
-                c.clipboard_append(hide_credentials(cls.chart_text(c, csv_)))
+                put_on_clipboard(c, hide_credentials(cls.chart_text(c,
+                                                                  csv_)))
         m = recycle_popup(tk.Menu(c, tearoff=0))
         m.add_command(label=translate_text("Copy chart data as text"),
                       command=lambda: copy(False))
@@ -55442,6 +55615,7 @@ class MiniWireshark:
                  progress=None):
         global DATA
         self.root = root
+        install_clipboard_guard(root)     # seventh audit: every copy
         # rc.11: (text, percent) for the loading screen the window is built
         # behind; None when built directly (tests, the benchmark)
         self._progress = progress
@@ -59327,8 +59501,7 @@ class MiniWireshark:
         bar.pack(fill="x", padx=12, pady=8)
 
         def copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(mask_sensitive(text))
+            put_on_clipboard(self.root, mask_sensitive(text))
             self._set_banner("📋  Copied to the clipboard.")
         ttk.Button(bar, text="Copy", command=copy).pack(side="left")
         ttk.Button(bar, text="Open folder", command=lambda: _open_path(
@@ -67599,11 +67772,14 @@ proc ::mw_explicit_fonts {top names} {
 
     def clear_history(self, parent=None):
         if self.history is None:
+            # seventh audit (privacy): the recent filters count too
             if (os.path.exists(PATHS.history_db) or
-                    history_record_files()) and messagebox.askyesno(
-                    "Clear history", "History is off, but old history or "
-                    "saved sessions are still on this computer. Delete "
-                    "them?", parent=parent or self.root):
+                    history_record_files() or forget_seen_in_settings(
+                        _json_copy(self.config.data))) and \
+                    messagebox.askyesno(
+                    "Clear history", "History is off, but old history, "
+                    "saved sessions or recent filters are still on this "
+                    "computer. Delete them?", parent=parent or self.root):
                 remove_history_copies(PATHS.history_db, live_too=True)
                 self._wipe_packets()
                 self._forget_records()
@@ -67611,8 +67787,10 @@ proc ::mw_explicit_fonts {top names} {
         choice = messagebox.askyesnocancel(
             "Clear history", "Yes = delete ALL stored history: the "
             "history, saved packets, the last autosave, crash copies, your "
-            "device names and notes, remembered networks and the list of "
-            "programs that wait for connections.\nNo = delete only the "
+            "device names and notes, remembered networks, the list of "
+            "programs that wait for connections, recent filters, places on "
+            "the Map, the website categories you chose and alert rules for "
+            "one device or address.\nNo = delete only the "
             "selected device's history (Devices tab).",
             parent=parent or self.root)
         if choice is None:
@@ -67655,6 +67833,12 @@ proc ::mw_explicit_fonts {top names} {
         self._banner_action(None)
         self._journal_written = False
         self._journal_count = -1
+        # seventh audit (privacy): the recent filters and the other
+        # settings that name what was seen, saved now so closing the
+        # window can't write them back
+        self._forgotten_settings = forget_seen_settings(self.config)
+        with contextlib.suppress(Exception):
+            self.tabs["packets"].refresh_presets()
         gone = 0
         for path in history_record_files():
             with contextlib.suppress(OSError):
@@ -92396,8 +92580,9 @@ def t_a4_single_copy_cannot_start_a_formula(ctx):
     other single copies went to the clipboard unguarded, so a name from
     the network such as =HYPERLINK(...) became a formula when pasted
     into a spreadsheet. A single line now gets the copied row's guard;
-    a guarded row or cell is not guarded twice, and a report of several
-    lines is left as it is."""
+    a guarded row or cell is not guarded twice. (Seventh audit: a report
+    of several lines was left as it is; now each of its lines is
+    guarded, a heading's underline of = kept.)"""
     board = []
     root = types.SimpleNamespace(clipboard_clear=board.clear,
                                  clipboard_append=board.append,
@@ -92412,9 +92597,176 @@ def t_a4_single_copy_cannot_start_a_formula(ctx):
                        (safe_tsv_row(["=a", "b"]), "'=a\tb"),
                        (safe_tsv_row(["\tx"]), "'\tx"),
                        ("Report\n======\n=not a cell",
-                        "Report\n======\n=not a cell")):
+                        "Report\n======\n'=not a cell")):
         assert copy_to_clipboard(app, text) is True
         assert board == [want], (text, board)
+
+
+@self_test()
+def t_r7_every_copied_line_guarded(ctx):
+    """Seventh audit (security): a copy of several lines reached the
+    clipboard unguarded ("=1+1\\nsecond line", "Device\\n=cmd|x"). Every
+    line, and every cell of a line, now gets the guard; ordinary lines
+    and a heading's underline stay as they are. With Tk, the copies that
+    don't go through copy_to_clipboard are guarded too: Ctrl+C in a
+    read-only text, a read-only box and the other buttons of this
+    program; what you copy from a box you type into is left alone."""
+    board = []
+    root = types.SimpleNamespace(clipboard_clear=board.clear,
+                                 clipboard_append=board.append,
+                                 update_idletasks=lambda: None)
+    app = types.SimpleNamespace(root=root, _set_banner=lambda *_a: None)
+    cases = (("=1+1\nsecond line", "'=1+1\nsecond line"),
+             ("Device\n=cmd|x", "Device\n'=cmd|x"),
+             ("a\r\n+b\r-c\n@d\tx\t=y\n", "a\r\n'+b\r'-c\n'@d\tx\t'=y\n"),
+             ("Title\n=====\n\nbody -1\n  -indented\n----",
+              "Title\n=====\n\nbody -1\n  -indented\n----"),
+             ("line one\nline two", "line one\nline two"))
+    for text, want in cases:
+        assert clipboard_safe_text(text) == want, (text,
+                                                    clipboard_safe_text(text))
+        assert clipboard_safe_text(want) == want, want    # not twice
+        assert copy_to_clipboard(app, text) is True
+        assert board == [want], (text, board)
+    r = _m16_tk()
+    if r is None:
+        return None
+    try:
+        assert install_clipboard_guard(r) and install_clipboard_guard(r)
+        got = []
+
+        def board_now():
+            got.append(r.clipboard_get())
+            return got[-1]
+        r.clipboard_clear()
+        r.clipboard_append("=1+1\nDevice\n=cmd|x")       # tkinter's own
+        assert board_now() == "'=1+1\nDevice\n'=cmd|x", got
+        txt = tk.Text(r)
+        txt.insert("1.0", "Name\n=HYPERLINK(\"http://x\")\n")
+        txt.configure(state="disabled")
+        txt.tag_add("sel", "1.0", "end-1c")
+        r.tk.call("tk_textCopy", txt._w)                 # Tk's Ctrl+C
+        assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+        make_readonly_focusable(txt)
+        txt.event_generate("<Control-c>")
+        assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+        ro = ttk.Entry(r)
+        ro.insert(0, "@SUM(1)")
+        ro.state(["readonly"])
+        ro.selection_range(0, "end")
+        ro.event_generate("<<Copy>>")
+        assert board_now() == "'@SUM(1)", got
+        box = ttk.Entry(r)                   # a search box you type in
+        box.insert(0, "-dns")
+        box.selection_range(0, "end")
+        box.event_generate("<<Copy>>")
+        assert board_now() == "-dns", got
+        put_on_clipboard(r, "x\n+y")
+        assert board_now() == "x\n'+y", got
+    finally:
+        with contextlib.suppress(tk.TclError):
+            r.destroy()
+
+
+@self_test(needs_source=True)
+def t_r7_no_copy_skips_the_guard(ctx):
+    """Seventh audit (security): every clipboard write of this file is
+    put_on_clipboard or copy_to_clipboard, both guarded (tests exempt).
+    Before, four buttons and Ctrl+C in a report wrote to the clipboard
+    themselves."""
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    bad, top = [], ""
+    for no, line in enumerate(lines, 1):
+        m = re.match(r"(?:def|class) (\w+)", line)
+        if m:
+            top = m.group(1)
+        if top.startswith(("t_", "gt_", "_gs_")) or top in (
+                "put_on_clipboard", "copy_to_clipboard",
+                "install_clipboard_guard") or line.lstrip().startswith("#"):
+            continue
+        if re.search(r"\.clipboard_(append|clear)\(|[\"'\[{ ]clipboard\s+"
+                     r"append\b", line):
+            bad.append(f"{top}:{no}")
+    assert not bad, "clipboard writes without the guard: " + ", ".join(bad)
+
+
+@self_test()
+def t_r7_delete_all_forgets_seen_settings(ctx):
+    """Seventh audit (privacy): after "Delete ALL history" and closing,
+    the settings file still held the recent filters
+    (ip.addr==192.168.1.77, dns.qry.name==www.example.com). They go, with
+    the other settings that name a device, address or website: alerts
+    marked expected, muted or snoozed for one device, Map places, website
+    categories you chose and a workspace's selected row; the day-old
+    backup copy is cleaned too. Your own presets, workspaces, settings
+    and the rules for a whole alert type are kept."""
+    needles = (b"192.168.1.77", b"example.com", b"aa:bb:cc:dd:ee:77")
+    cfg = ctx.cfg()
+    cfg.save()
+    soon = time.time() + 3600
+    cfg.set("filters.recent", ["ip.addr==192.168.1.77",
+                               "dns.qry.name==www.example.com"])
+    cfg.set("alerts.muted_devices", ["new_device|aa:bb:cc:dd:ee:77"])
+    cfg.set("alerts.expected", ["gateway_change|192.168.1.77",
+                                "dns_slow|*"])
+    cfg.set("alerts.snoozed", {"arp_spoof|aa:bb:cc:dd:ee:77": soon,
+                               "beacon|*": soon})
+    cfg.set("map.positions", {"net1": {"aa:bb:cc:dd:ee:77": [0.1, 0.2]}})
+    cfg.set("websites.category_overrides", {"example.com": "Social"})
+    presets = dict(cfg.get("filters.presets"))
+    presets["Mine"] = {"expr": "proto:dns"}
+    cfg.set("filters.presets", presets)
+    cfg.set("workspaces.saved", {"W": {"tab": "devices", "view": {
+        "sel": "aa:bb:cc:dd:ee:77", "sort": ["name", False]}}})
+    cfg.set("appearance.theme", "Dark")
+    cfg.save()
+    shutil.copyfile(cfg.path, cfg.path + ".bak")   # yesterday's copy
+    was_cats = dict(CATEGORY_OVERRIDES)
+    CATEGORY_OVERRIDES["example.com"] = "Social"
+    stub = types.SimpleNamespace(
+        config=cfg, known=types.SimpleNamespace(data={"k": 1}),
+        networks=types.SimpleNamespace(data={}), network_profile=None,
+        listen_watch=None, _stop_record_jobs=lambda: None,
+        clear=lambda confirmed=False: None, tabs={},
+        model=types.SimpleNamespace(baselines=types.SimpleNamespace(
+            reset=lambda: None)),
+        _keep_undo=lambda _u: None, _banner_action=lambda _a: None)
+    g = globals()
+    real = g["history_record_files"]
+    g["history_record_files"] = lambda paths=None: []   # not the test's
+    try:
+        assert forget_seen_in_settings(_json_copy(cfg.data))
+        MiniWireshark._forget_records(stub)
+        assert "example.com" not in CATEGORY_OVERRIDES
+    finally:
+        g["history_record_files"] = real
+        CATEGORY_OVERRIDES.clear()
+        CATEGORY_OVERRIDES.update(was_cats)
+    assert sorted(stub._forgotten_settings) == [
+        "alerts.expected", "alerts.muted_devices", "alerts.snoozed",
+        "filters.recent", "map.positions", "websites.category_overrides",
+        "workspaces.saved"], stub._forgotten_settings
+    cfg.save()                                    # closing the window
+    for p in (cfg.path, cfg.path + ".bak"):
+        with open(p, "rb") as f:
+            blob = f.read()
+        assert not [n for n in needles if n in blob], (p, blob[:400])
+    again = AppConfig(path=cfg.path)
+    assert again.get("filters.recent") == [] and \
+        again.get("appearance.theme") == "Dark" and \
+        again.get("filters.presets")["Mine"] == {"expr": "proto:dns"}
+    assert again.get("alerts.expected") == ["dns_slow|*"] and \
+        list(again.get("alerts.snoozed")) == ["beacon|*"]
+    w = again.get("workspaces.saved")["W"]
+    assert w["tab"] == "devices" and w["view"]["sel"] is None and \
+        w["view"]["sort"] == ["name", False], w
+    assert forget_seen_in_settings(_json_copy(again.data)) == []
+    # a backup that can't be read is deleted, not left behind
+    with open(cfg.path + ".bak", "w", encoding="utf-8") as f:
+        f.write('{"filters": {"recent": ["ip.addr==192.168.1.77"]')
+    assert forget_seen_settings(again) == []
+    assert not os.path.lexists(cfg.path + ".bak")
 
 
 @self_test()
@@ -102857,6 +103209,9 @@ def _kbd_packet_row(app, ctx):
                "scroll and copy by key")
 def gt_kbd_text_panes(app, ctx):
     root = app.root
+    # seventh audit (security): the window puts the clipboard guard in
+    # place as it opens, for Tk's own Ctrl+C too
+    assert root.tk.call("info", "commands", "::mw_tk_clipboard")
     app.toggle_inspector(True)
     ptab = app._select_tab("packets")
     ptab.show_subview("Packets")
@@ -102885,7 +103240,8 @@ def gt_kbd_text_panes(app, ctx):
     top = tk.Toplevel(root)
     try:
         txt = tk.Text(top, height=6, width=30, state="normal")
-        txt.insert("1.0", "\n".join(f"line {i}" for i in range(300)))
+        txt.insert("1.0", "\n".join(f"line {i}" for i in range(300)) +
+                   "\n=cmd|x")
         txt.configure(state="disabled")
         make_readonly_focusable(txt)
         entry = ttk.Entry(top)
@@ -102924,6 +103280,10 @@ def gt_kbd_text_panes(app, ctx):
         txt.event_generate("<Control-c>")
         _gui_pump(root, 0.1)
         assert "line 299" in root.clipboard_get()
+        # seventh audit (security): a line of the copy that could start
+        # a formula is guarded and the others are left as they are
+        assert root.clipboard_get().endswith("\nline 299\n'=cmd|x"), \
+            root.clipboard_get()[-40:]
         assert str(txt.cget("state")) == "disabled"
         entry.focus_force()
         _gui_pump(root, 0.1)
@@ -110160,7 +110520,15 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
     # the step sees only what Delete ALL leaves behind.
     app.procmap.refresh = lambda *a, **k: None
     app._proc_seen = app.procmap.seq
+    # seventh audit (privacy): the recent filters in the settings file
+    seen_keys = ("filters.recent", "alerts.muted_devices")
+    seen_was = {k: app.config.get(k) for k in seen_keys}
     try:
+        app.config.set("filters.recent", [f"ip.addr=={ip}",
+                                          f"dns.qry.name=={site}"])
+        app.config.set("alerts.muted_devices", [f"new_device|{ip}"])
+        app.config.save()
+        app.tabs["packets"].refresh_presets()
         app.data_mode = "live"
         app.write_journal()
         with open(PATHS.journal, encoding="utf-8") as f:
@@ -110171,6 +110539,15 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
         assert len(asked) == 1, asked
         left = [p for p in planted if os.path.exists(p)]
         assert not left, left
+        app._remember_window()                   # what closing saves
+        for p in (app.config.path, app.config.path + ".bak"):
+            with contextlib.suppress(FileNotFoundError), \
+                    open(p, "rb") as f:
+                blob = f.read()
+                assert site.encode() not in blob and \
+                    ip.encode() not in blob, (p, site, ip)
+        assert not [v for v in app.tabs["packets"].preset_box.cget(
+            "values") if ip in str(v) or site in str(v)]
         # third audit #1: the next journal tick writes nothing old
         assert not app.model.has_data() and app._clear_undo is None
         app.data_mode = "live"
@@ -110204,6 +110581,8 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
         messagebox.askyesno, messagebox.askyesnocancel = real
         with contextlib.suppress(AttributeError):
             del app.procmap.refresh
+        for k, v in seen_was.items():
+            app.config.set(k, v)
         (app.known.data, app.networks.data, app.network_profile,
          app.history) = keep
         app.replace_model(was[0])

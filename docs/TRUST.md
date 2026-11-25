@@ -63,7 +63,7 @@ Everything it writes goes in one data folder (see [Installation](INSTALL.md#wher
 - With history off, no record of what you watched is kept after you close the window: no history and no saved session. While you watch, a crash-safe copy of the session is kept and is deleted when you close. Only after a crash does it stay, so the next start can offer it back.
 - With history on, the last session is also saved when you close (**Open last autosave**), unless history is set to *Session only*.
 - Your device names and notes, the networks you marked as yours and the list of programs on this computer that wait for connections are kept either way.
-- **Clear history** in **Settings → History**, answered with *Yes* (delete ALL), deletes all of it: the history, saved packets, the autosave, crash copies, your device names and notes, the remembered networks and the list of programs that wait for connections.
+- **Clear history** in **Settings → History**, answered with *Yes* (delete ALL), deletes all of it: the history, saved packets, the autosave, crash copies, your device names and notes, the remembered networks, the list of programs that wait for connections, and the settings that name what was seen (recent filters, places on the Map, website categories you chose, alert rules for one device or address).
 - Passwords, mail logins and message bodies are dropped inside the decoders and never stored. A canary self-test plants fake secrets and checks every report, session, CSV, log, history row and clipboard copy for them.
 - On Linux and macOS the data folder is closed to other users.
 - **Storage used…** in the command palette (`Ctrl+K`) shows what each part takes. Deleting the folder removes everything.
