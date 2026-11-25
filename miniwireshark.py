@@ -113122,7 +113122,11 @@ def gt_a6_tab_stops_usable(app, ctx):
             for key, card in zip(("wrong", "usage"), cards):
                 dash.answer_show[key] = lambda k=key: shown.append(k)
                 card.focus_force()
-                _gui_pump(root, 0.05)
+                # (CI) Tk gives a key to the window with the focus: wait
+                # until the card has it
+                _gui_pump(root, 0.05, until=lambda c=card:
+                          root.focus_get() is c, timeout=3)
+                assert root.focus_get() is card, (key, root.focus_get())
                 card.event_generate("<Return>")
                 _gui_pump(root, 0.05)
         finally:
