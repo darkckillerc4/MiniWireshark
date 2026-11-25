@@ -113362,21 +113362,27 @@ def gt_a6_tab_stops_usable(app, ctx):
         shown = []
         show0 = dict(dash.answer_show)
         try:
-            for key, card in zip(("wrong", "usage"), cards):
+            for i, (key, card) in enumerate(zip(("wrong", "usage"),
+                                                cards)):
                 dash.answer_show[key] = lambda k=key: shown.append(k)
                 card.focus_force()
                 # (CI) Tk gives a key to the window with the focus: wait
                 # until the card has it
                 _gui_pump(root, 0.05, until=lambda c=card:
                           root.focus_get() is c, timeout=3)
-                if root.focus_get() is not card and root.focus_get():
+                if root.focus_get() is not card and i:
                     # (Windows CI) a card further down the Dashboard did
                     # not take the focus that way: Tab there, as a person
-                    # would, from the card before it
-                    root.focus_get().event_generate("<Tab>")
+                    # would, from the card before it (round 8, Ubuntu CI:
+                    # from whatever had the focus, Tab went elsewhere)
+                    cards[i - 1].focus_force()
+                    _gui_pump(root, 0.05, until=lambda c=cards[i - 1]:
+                              root.focus_get() is c, timeout=3)
+                    cards[i - 1].event_generate("<Tab>")
                     _gui_pump(root, 0.05, until=lambda c=card:
                               root.focus_get() is c, timeout=3)
-                assert root.focus_get() is card, (key, root.focus_get())
+                assert root.focus_get() is card, (
+                    key, root.focus_get(), card.winfo_viewable())
                 card.event_generate("<Return>")
                 _gui_pump(root, 0.05)
         finally:
