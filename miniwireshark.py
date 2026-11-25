@@ -15529,11 +15529,15 @@ def dhcp_peers(devices):
 
 
 def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
-                    ra_routers=(), gw_macs=(), peers=None):
+                    ra_routers=(), gw_macs=(), peers=None, dhcp_unsure=()):
     """Best guess at what a device is, with the reasons. Never certain:
     returns (class, confidence_word, reasons) where confidence_word is
     'Likely', 'Possibly' or ''. `peers` (from dhcp_peers) lets a device
-    that asks DHCP exactly like a known one share its kind (Possibly)."""
+    that asks DHCP exactly like a known one share its kind (Possibly).
+    `dhcp_unsure`: addresses of DHCP servers that name themselves as the
+    router while another one does too and nothing showed which is real
+    (NetworkModel.dhcp_unsure_routers): each is Possibly a router, never
+    your router."""
     if dev.ip and dev.ip in my_ips or (dev.mac and dev.mac in my_macs):
         return "This computer", "", ["This is the computer running "
                                      "MiniWireshark"]
@@ -15552,6 +15556,12 @@ def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
         add("Router", 80, "It answered for your router's address")
     if dev.mac and dev.mac in ra_routers:
         add("Router", 70, "It announces itself as an IPv6 router")
+    if dev.ip and dev.ip in dhcp_unsure and dev.ip != gateway_ip:
+        # seventh audit: a file with two DHCP servers and nothing else
+        # left the real router with no label at all
+        add("Router", 40, "It hands out addresses (DHCP) and names itself "
+                          "as the router, but so does another device, so "
+                          "it is not confirmed as your router")
     if dev.is_virtual:
         add("Container/virtual interface", 80,
             "Its address is in a typical container/virtual-network range")
@@ -19250,7 +19260,10 @@ class AlertEngine:
         audit: so is a known call service (`kind` "call": Zoom, Teams…) or
         video site ("video": YouTube, Vimeo) that the server's name came
         from, and an upload by a device you marked as a NAS ("nas", no
-        service: its offsite backup)."""
+        service: its offsite backup). Seventh audit: a call or video
+        upload also needs the address in the provider's own ranges
+        (provider_owns_ip); "nas_guess" (a device only guessed to be a
+        NAS) is still a warning that says how to mark it."""
         if self._debounced(f"nightup:{dev.key}", 6 * 3600):
             return None
         size = _human_bytes(total)
@@ -19273,9 +19286,11 @@ class AlertEngine:
                 "charge at night.",
                 confidence="Medium",
                 why="Most of the data went to a known call service, looked "
-                    "up by name." if call else
+                    "up by name, at an address the service publishes as "
+                    "its own." if call else
                     "Most of the data went to a known video site, looked "
-                    "up by name.",
+                    "up by name, at an address the site publishes as its "
+                    "own.",
                 evidence=[f"Sent: {size}", f"To: {dest}"],
                 refs={"explained": service, "start": start})
         if not service and kind == "nas":
@@ -19309,6 +19324,14 @@ class AlertEngine:
             f"At night it sent {size} to {dest} in {minutes} minutes. It "
             f"has never sent this much in a night hour before.",
             "Data left this device while it is usually idle.",
+            # seventh audit: a device only guessed to be a NAS still warns
+            # on its first offsite backup; it is told how to stop that
+            "It looks like a NAS, and a NAS often copies its backup to a "
+            "cloud service at night. If this is your NAS and you set that "
+            "up, right-click it in Devices, choose Set device type… and "
+            "pick NAS: a later night backup is then only an INFO, out of "
+            "Unusual activity."
+            if kind == "nas_guess" else
             "Backups, photo syncs and system updates run at night too. It "
             "matters if nothing on the device should be sending files.",
             confidence="Medium",
@@ -24433,6 +24456,97 @@ KNOWN_BULK_SERVICES = (
 # the kinds a night upload may be said as (kind=None in known_bulk_service
 # still finds a stream first: youtube.com is in both)
 NIGHT_UPLOAD_KINDS = ("backup", "call", "video")
+# Seventh audit: a forged DNS answer naming zoom.us made a 30 MB upload at
+# night to an attacker's address an INFO, kept out of Unusual activity. A
+# call or video upload is said as one only when the address is also in
+# the provider's own address ranges below. Where they come from (each
+# provider's published list, as it stood in November 2026; MiniWireshark
+# never downloads them):
+#   Zoom: "Zoom network firewall or proxy server settings" (Zoom support;
+#     assets.zoom.us/docs/ipranges/Zoom.txt), the ranges Zoom owns only,
+#     not its rented cloud space (AWS, Oracle)
+#   Microsoft Teams, Skype: "Microsoft 365 URLs and IP address ranges"
+#     (endpoints.office.com), the Teams media and signalling rows
+#   Webex: "Network Requirements for Webex Services" (help.webex.com),
+#     the Cisco-owned subnets, not the Azure or AWS ones
+#   Google Meet, YouTube: Google's own ranges (www.gstatic.com/ipranges/
+#     goog.json), only the ones Google's own services answer on, never
+#     Google Cloud's (cloud.json), which anyone can rent
+#   WhatsApp: Meta's network (AS32934) as Meta registers it in the routing
+#     registries (whois -h whois.radb.net -- '-i origin AS32934'), which
+#     Meta's developer pages point to
+#   Discord and Vimeo publish no list of their own (they run on shared
+#     clouds anyone can rent), so a night upload to them warns as it did
+#     before 5.3.4.
+# A provider's new range missing here makes a real call warn again (the
+# old behaviour); it never hides an upload.
+NIGHT_PROVIDER_NETS = {
+    "Zoom": (
+        "8.5.128.0/23", "69.174.57.0/24", "69.174.108.0/22",
+        "103.122.166.0/23", "134.224.0.0/16", "144.195.0.0/16",
+        "147.124.96.0/19", "149.137.0.0/17", "156.45.0.0/17",
+        "159.124.0.0/16", "162.12.232.0/22", "162.255.36.0/22",
+        "170.114.0.0/16", "173.231.80.0/20", "192.204.12.0/22",
+        "198.251.128.0/17", "204.80.104.0/21", "204.141.28.0/22",
+        "206.247.0.0/16", "207.226.132.0/24", "209.9.211.0/24",
+        "209.9.215.0/24", "213.19.144.0/24", "213.244.140.0/24",
+        "2620:123:2000::/40"),
+    "Microsoft Teams": (
+        "13.107.64.0/18", "52.112.0.0/14", "52.122.0.0/15",
+        "2603:1027::/48", "2603:1037::/48", "2603:1047::/48",
+        "2603:1057::/48", "2603:1063::/38", "2620:1ec:6::/48",
+        "2620:1ec:40::/42"),
+    "Webex": (
+        "23.89.0.0/16", "62.109.192.0/18", "64.68.96.0/19",
+        "66.114.160.0/20", "66.163.32.0/19", "69.26.160.0/19",
+        "114.29.192.0/19", "144.196.0.0/16", "150.253.128.0/17",
+        "163.129.0.0/16", "170.72.0.0/16", "170.133.128.0/18",
+        "173.39.224.0/19", "173.243.0.0/20", "207.182.160.0/19",
+        "209.197.192.0/19", "210.4.192.0/20", "216.151.128.0/19"),
+    "Google": (
+        "64.233.160.0/19", "66.102.0.0/20", "66.249.64.0/19",
+        "72.14.192.0/18", "74.125.0.0/16", "108.177.0.0/17",
+        "142.250.0.0/15", "172.217.0.0/16", "172.253.0.0/16",
+        "173.194.0.0/16", "192.178.0.0/15", "208.65.152.0/22",
+        "208.117.224.0/19", "209.85.128.0/17", "216.58.192.0/19",
+        "216.239.32.0/19", "2001:4860::/32", "2404:6800::/32",
+        "2607:f8b0::/32", "2800:3f0::/32", "2a00:1450::/32",
+        "2c0f:fb50::/32"),
+    "WhatsApp": (
+        "31.13.24.0/21", "31.13.64.0/18", "45.64.40.0/22",
+        "57.144.0.0/14", "66.220.144.0/20", "69.63.176.0/20",
+        "69.171.224.0/19", "74.119.76.0/22", "102.132.96.0/20",
+        "103.4.96.0/22", "129.134.0.0/16", "157.240.0.0/16",
+        "163.70.128.0/17", "173.252.64.0/18", "179.60.192.0/22",
+        "185.60.216.0/22", "185.89.216.0/22", "204.15.20.0/22",
+        "2a03:2880::/29"),
+}
+NIGHT_PROVIDER_OF = {"Zoom": "Zoom", "Microsoft Teams": "Microsoft Teams",
+                     "Skype": "Microsoft Teams", "Webex": "Webex",
+                     "Google Meet": "Google", "YouTube": "Google",
+                     "WhatsApp": "WhatsApp"}
+_NIGHT_NETS = {}
+
+
+def provider_owns_ip(label, ip):
+    """Seventh audit: True when `ip` is in the published address ranges of
+    the call service or video site `label` (NIGHT_PROVIDER_NETS). False
+    for any other address, a bad one, or a service with no published list
+    (Discord, Vimeo)."""
+    nets = _NIGHT_NETS.get(label)
+    if nets is None:
+        nets = _NIGHT_NETS[label] = tuple(
+            ipaddress.ip_network(n) for n in NIGHT_PROVIDER_NETS.get(
+                NIGHT_PROVIDER_OF.get(label, ""), ()))
+    if not nets:
+        return False
+    try:
+        addr = ipaddress.ip_address(str(ip or "").split("%", 1)[0])
+    except ValueError:
+        return False
+    if getattr(addr, "ipv4_mapped", None):
+        addr = addr.ipv4_mapped
+    return any(addr.version == n.version and addr in n for n in nets)
 NIGHT_UPLOAD_BYTES = 20 * 1024 * 1024   # sent in one night hour
 NIGHT_UPLOAD_WINDOW = 3600.0
 BEACON_MIN_CONTACTS = 30
@@ -25845,6 +25959,11 @@ class NetworkModel:
                 if len(self.dhcp_servers) > 1:
                     self._alert(self.alerts.dhcp_anomaly(
                         set(self.dhcp_servers), self.dhcp_rogue()))
+                    # seventh audit: their kinds depend on each other now
+                    for s in self.dhcp_servers:
+                        k = self.registry.ip_to_key.get(s)
+                        if k:
+                            self._classify_dirty.add(k)
                 if imp is not None:
                     self._alert(self.alerts.dhcp_impostor(imp))
             if info.get("router"):
@@ -26424,12 +26543,20 @@ class NetworkModel:
                 if un is None and len(self.ip_unconfirmed) < \
                         self.IP_NAMES_KEEP:
                     un = self.ip_unconfirmed[ip] = set()
-                if un is not None and len(un) < 8:
+                if un is not None:
                     un.add(key)
             names.pop(key, None)
             names[key] = ts
             while len(names) > 8:
                 del names[next(iter(names))]
+            if un:
+                # seventh audit: `un` stopped at 8 names, so a ninth name
+                # from TLS hellos (p42-content.icloud-content.com after
+                # eight others) counted as one from a DNS answer. It holds
+                # only the address's names now, at most 8
+                un.intersection_update(names)
+                if not un:
+                    self.ip_unconfirmed.pop(ip, None)
             rh = self.remote_hosts.get(ip)
             if rh is not None:
                 if len(rh.domains) < 20:
@@ -26907,6 +27034,12 @@ class NetworkModel:
             hit = None
             for k in NIGHT_UPLOAD_KINDS:
                 hit = known_bulk_service(names, k)
+                # seventh audit: a forged DNS answer can give any address
+                # Zoom's name; a call or video upload also needs the
+                # address in the provider's own ranges
+                if hit and k in ("call", "video") and \
+                        not provider_owns_ip(hit[0], ip):
+                    hit = None
                 if hit:
                     break
             if hit:
@@ -26927,6 +27060,10 @@ class NetworkModel:
             # a device YOU marked as a NAS (a guessed kind can be wrong)
             if dev.user_class == "NAS":
                 skind = "nas"
+            elif not dev.user_class and dev.device_class == "NAS":
+                # seventh audit: still a warning (the guess rests on what
+                # the device says of itself), but it says how to mark it
+                skind = "nas_guess"
         return self._alert(self.alerts.night_upload(
             dev, total, minutes, dest, service, start=mins[0][0] * 60.0,
             kind=skind))
@@ -27465,13 +27602,15 @@ class NetworkModel:
         # known kind on this network (option 55, used at last)
         peers = dhcp_peers(self.registry.by_key.values()) \
             if keys and FEATURES.get("signatures_v2", True) else None
+        unsure = self.dhcp_unsure_routers() if keys else ()
         for key in keys:
             dev = self.registry.by_key.get(key)
             if dev is None:
                 continue
             cls, word, reasons = classify_device(
                 dev, self.gateway_ip, self.my_ips, self.my_macs,
-                self.registry.ra_routers, self.registry.gw_macs, peers)
+                self.registry.ra_routers, self.registry.gw_macs, peers,
+                unsure)
             if dev.user_class:
                 auto = f"{word} {cls}".strip()
                 reasons = ["You set this type"] + (
@@ -27668,6 +27807,19 @@ class NetworkModel:
                 return s, o["router"], list(o.get("dns") or []), \
                     trusted[0], trusted[1], trusted[2]
         return None
+
+    def dhcp_unsure_routers(self):
+        """Seventh audit: the DHCP servers that name themselves as the
+        router while two servers hand out different routers and nothing
+        shows which one is real (the case where neither becomes the
+        gateway). Each is labelled Possibly a router, not confirmed as
+        yours, so a file with only DHCP in it keeps the router's label
+        without picking one. Empty otherwise."""
+        rogue = self.dhcp_rogue()
+        if rogue is None or rogue[5]:
+            return frozenset()
+        return frozenset(s for s, o in self.dhcp_offers.items()
+                         if o.get("router") == s)
 
     def drop_unsure_gateway(self):
         """Sixth audit: reading a file, a router guessed earlier (the rogue
@@ -33797,13 +33949,15 @@ This looks like a video or voice call. ¦ Cela ressemble à un appel vidéo ou v
 This looks like a video upload. ¦ Cela ressemble à l'envoi d'une vidéo. ¦ Parece la subida de un vídeo.
 A call sends your picture and sound for as long as it lasts. ¦ Un appel envoie votre image et votre son pendant toute sa durée. ¦ Una llamada envía su imagen y su sonido mientras dura.
 Phones and computers often upload videos while they charge at night. ¦ Les téléphones et les ordinateurs envoient souvent des vidéos pendant qu'ils chargent la nuit. ¦ Los teléfonos y los ordenadores suelen subir vídeos mientras se cargan de noche.
-Most of the data went to a known call service, looked up by name. ¦ La plupart des données sont allées vers un service d'appels connu, dont le nom a été cherché. ¦ La mayoría de los datos fueron a un servicio de llamadas conocido, cuyo nombre se buscó.
-Most of the data went to a known video site, looked up by name. ¦ La plupart des données sont allées vers un site de vidéos connu, dont le nom a été cherché. ¦ La mayoría de los datos fueron a un sitio de vídeos conocido, cuyo nombre se buscó.
+Most of the data went to a known call service, looked up by name, at an address the service publishes as its own. ¦ La plupart des données sont allées vers un service d'appels connu, dont le nom a été cherché, à une adresse que ce service déclare comme la sienne. ¦ La mayoría de los datos fueron a un servicio de llamadas conocido, cuyo nombre se buscó, en una dirección que el servicio publica como suya.
+Most of the data went to a known video site, looked up by name, at an address the site publishes as its own. ¦ La plupart des données sont allées vers un site de vidéos connu, dont le nom a été cherché, à une adresse que ce site déclare comme la sienne. ¦ La mayoría de los datos fueron a un sitio de vídeos conocido, cuyo nombre se buscó, en una dirección que el sitio publica como suya.
 This looks like a NAS copying its backup to the Internet. ¦ Cela ressemble à un NAS qui copie sa sauvegarde sur Internet. ¦ Parece un NAS que copia su copia de seguridad en Internet.
 A NAS often copies its backup to a cloud service at night. It matters if you never set that up. ¦ Un NAS copie souvent sa sauvegarde vers un service en ligne la nuit. C'est important si vous ne l'avez jamais configuré. ¦ Un NAS suele copiar su copia de seguridad a un servicio en la nube de noche. Importa si nunca lo configuró.
 You marked this device as a NAS. ¦ Vous avez indiqué que cet appareil est un NAS. ¦ Usted indicó que este dispositivo es un NAS.
 One of them may be a device pretending to be your router: devices that take an address from it send their Internet traffic and name lookups through it. ¦ L'un d'eux est peut-être un appareil qui se fait passer pour votre box : les appareils qui en reçoivent une adresse font passer par lui leur trafic Internet et leurs recherches de noms. ¦ Puede que uno de ellos sea un dispositivo que se hace pasar por su router: los dispositivos que reciben una dirección de él envían a través de él su tráfico de Internet y sus búsquedas de nombres.
 Two DHCP servers named different routers, and nothing showed which one is real. ¦ Deux serveurs DHCP ont indiqué des routeurs différents, et rien n'a montré lequel est le vrai. ¦ Dos servidores DHCP indicaron routers distintos y nada mostró cuál es el verdadero.
+It hands out addresses (DHCP) and names itself as the router, but so does another device, so it is not confirmed as your router ¦ Il distribue des adresses (DHCP) et se désigne comme routeur, mais un autre appareil le fait aussi, donc il n'est pas confirmé comme votre box ¦ Reparte direcciones (DHCP) y se indica a sí mismo como router, pero otro dispositivo también lo hace, así que no está confirmado como su router
+It looks like a NAS, and a NAS often copies its backup to a cloud service at night. If this is your NAS and you set that up, right-click it in Devices, choose Set device type… and pick NAS: a later night backup is then only an INFO, out of Unusual activity. ¦ Il ressemble à un NAS, et un NAS copie souvent sa sauvegarde vers un service en ligne la nuit. Si c'est votre NAS et que vous l'avez configuré, faites un clic droit dessus dans Appareils, choisissez Définir le type d'appareil… et prenez NAS : une sauvegarde de nuit suivante ne sera alors qu'une INFO, en dehors d'« Activité inhabituelle ». ¦ Parece un NAS, y un NAS suele copiar su copia de seguridad en un servicio en línea de noche. Si es su NAS y usted lo configuró, haga clic derecho sobre él en Dispositivos, elija Definir el tipo de dispositivo… y escoja NAS: una copia de seguridad de noche posterior será entonces solo una INFO, fuera de «Actividad inusual».
 tab ¦ onglet ¦ pestaña
 view ¦ vue ¦ vista
 action ¦ action ¦ acción
@@ -81301,13 +81455,16 @@ def t_a6_night_upload_call_video_nas(ctx):
     that only claims Zoom's name in its TLS hello, mostly to an unknown
     server, and from a device only guessed to be a NAS."""
     S = ScenarioBuilder
-    cases = (("zoomsjc144-195.sjc.zoom.us", S.PHONE, "", "Zoom",
-              "was on a call at night (Zoom)"),
-             ("upload.youtube.com", S.PHONE, "", "YouTube",
+    # seventh audit: each server's address is in its provider's own
+    # ranges (YouTube's was a Zoom address, 144.195.1.2)
+    cases = (("zoomsjc144-195.sjc.zoom.us", "144.195.1.2", S.PHONE, "",
+              "Zoom", "was on a call at night (Zoom)"),
+             ("upload.youtube.com", "142.250.1.2", S.PHONE, "", "YouTube",
               "uploaded a video at night (YouTube)"),
-             ("", S.NAS, "NAS", "nas", "(you marked it as a NAS)"))
-    for name, host, mark, explained, words in cases:
-        m = a6_night_model(ctx, name, "144.195.1.2", host, mark)
+             ("", "144.195.1.2", S.NAS, "NAS", "nas",
+              "(you marked it as a NAS)"))
+    for name, rip, host, mark, explained, words in cases:
+        m = a6_night_model(ctx, name, rip, host, mark)
         got = a2_kinds(m, "night_upload")
         assert len(got) == 1 and got[0].severity == "INFO" and \
             got[0].refs.get("explained") == explained and \
@@ -81481,6 +81638,198 @@ def t_a6_rogue_dhcp_first_only_dhcp(ctx):
     assert a.reason.endswith(rogue) and \
         f"The usual one, {S.GW[0]}" in a.observed and \
         a.refs.get("sure") is True, (a.reason, a.observed)
+
+
+@self_test()
+def t_a7_night_upload_forged_dns_answer(ctx):
+    """Seventh audit: a forged DNS answer that gave an attacker's address
+    the name zoom.us made a 30 MB upload there at 3 am "was on a call at
+    night (Zoom)", an INFO out of Unusual activity. A call or video upload
+    now also needs the address in the provider's own published ranges, and
+    the name from a DNS answer for that address; else it warns as before.
+    A ninth name from TLS hellos no longer counts as one from DNS."""
+    S = ScenarioBuilder
+    bad = "45.9.40.77"
+    real = (("zoom.us", "170.114.52.2", "Zoom"),
+            ("zoomsjc144-195.sjc.zoom.us", "144.195.1.2", "Zoom"),
+            ("teams.microsoft.com", "52.113.194.132", "Microsoft Teams"),
+            ("akamai.webex.com", "170.72.10.20", "Webex"),
+            ("meet.google.com", "74.125.250.10", "Google Meet"),
+            ("upload.youtube.com", "142.250.1.2", "YouTube"),
+            ("media-cdg2-1.cdn.whatsapp.net", "157.240.1.60", "WhatsApp"))
+    for name, rip, label in real:
+        m = a6_night_model(ctx, name, rip, S.PHONE)
+        got = a2_kinds(m, "night_upload")
+        assert len(got) == 1 and got[0].severity == "INFO" and \
+            got[0].refs.get("explained") == label, \
+            (name, [(a.severity, a.reason) for a in got])
+        assert not unusual_findings(m.alerts), name
+    a = got[0]
+    for loc in ("fr", "es"):
+        assert translate_text(a.why, loc) != a.why, (loc, a.why)
+    warn = [a6_night_model(ctx, name, bad, S.PHONE)
+            for name, _rip, _l in real]
+    # the provider's name for an address of another provider's
+    warn.append(a6_night_model(ctx, "upload.youtube.com", "144.195.1.2",
+                               S.PHONE))
+    # no published list of their own: as before 5.3.4
+    warn += [a6_night_model(ctx, "gateway.discord.media", "66.22.200.5",
+                            S.PHONE),
+             a6_night_model(ctx, "vimeo.com", "34.120.202.204", S.PHONE)]
+    # a Zoom address that no DNS answer gave the name (the answer named
+    # another one)
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.dns(S.PHONE, "zoom.us", "170.114.52.2")
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, S.PHONE, "170.114.9.9", 30 * 1024 * 1024, 12)
+    warn.append(a2_model(ctx, sb.frames))
+    # eight other names in TLS hellos, then a backup service's
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 40))
+    sb.home_network()
+    for i in range(8):
+        sb.tls(S.PHONE, f"www.site{i}.example", bad, size=3000)
+    sb.tls(S.PHONE, "p42-content.icloud-content.com", bad, size=3000)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, S.PHONE, bad, 30 * 1024 * 1024, 12)
+    tm = a2_model(ctx, sb.frames)
+    assert "p42-content.icloud-content.com" in tm.ip_to_domains.get(bad, ()) \
+        and not known_bulk_service(tm.dns_names(bad)), \
+        (list(tm.ip_to_domains.get(bad, ())), tm.dns_names(bad))
+    warn.append(tm)
+    for i, m in enumerate(warn):
+        got = a2_kinds(m, "night_upload")
+        assert len(got) == 1 and got[0].severity == "WARNING" and \
+            not got[0].refs.get("explained"), \
+            (i, [(a.severity, a.reason) for a in got])
+        assert "night_upload" in [f["kind"] for f in
+                                  unusual_findings(m.alerts)], i
+    assert provider_owns_ip("Zoom", "2620:123:2000::1") and \
+        provider_owns_ip("YouTube", "::ffff:142.250.1.2") and \
+        provider_owns_ip("Skype", "52.112.0.1")
+    for label, ip in (("Zoom", "170.115.0.1"), ("Zoom", "not an address"),
+                      ("Zoom", ""), ("Discord", "66.22.200.5"),
+                      ("Vimeo", "34.120.202.204"), ("iCloud", "17.1.1.1"),
+                      ("Google Meet", "34.120.202.204")):
+        assert not provider_owns_ip(label, ip), (label, ip)
+    for _suf, label, kind in KNOWN_BULK_SERVICES:
+        if kind in ("call", "video") and label not in ("Discord", "Vimeo"):
+            assert NIGHT_PROVIDER_NETS.get(NIGHT_PROVIDER_OF.get(label)), \
+                label
+
+
+def a7_dhcp_only_model(ctx, rogue_first):
+    """A capture file with only DHCP answers in it: the router (S.GW) and
+    a second server (192.168.1.99) that names itself as the router."""
+    S = ScenarioBuilder
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = S(t0=SCENARIO_T0)
+    if rogue_first:
+        a2_dhcp_ack(sb, rogue, rmac, S.PHONE, rogue, rogue)
+    sb.dhcp(S.PHONE)
+    sb.dhcp(S.TV)
+    if not rogue_first:
+        a2_dhcp_ack(sb, rogue, rmac, S.TV, rogue, rogue)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    dec = fast_frame_decoder(m)
+    replay_frames(m, sb.frames, decoder=dec)
+    gw = m.infer_gateway()
+    if gw:
+        m.set_identity(gateway_ip=gw)
+        m.gateway_guessed = True
+    else:
+        m.drop_unsure_gateway()
+    m._classify_dirty |= set(m.registry.by_key)
+    m._classify()
+    return m, rogue, dec
+
+
+@self_test()
+def t_a7_dhcp_only_two_servers_keep_labels(ctx):
+    """Seventh audit: a capture file with two DHCP servers that name
+    different routers and no routed traffic left the gateway empty (sixth
+    audit), and the router lost its router label too. Each server that
+    names itself as the router is now Possibly a router, "not confirmed as
+    your router", whichever was heard first; neither is the gateway or
+    "Your router", and the alert still accuses neither. Once Internet
+    traffic shows the real router, it is your router again and the other
+    one loses the label."""
+    S = ScenarioBuilder
+    lab = "not confirmed as your router"
+    for rogue_first in (True, False):
+        m, rogue, dec = a7_dhcp_only_model(ctx, rogue_first)
+        assert m.gateway_ip == "" and \
+            m.dhcp_unsure_routers() == {rogue, S.GW[0]}, \
+            (rogue_first, m.gateway_ip, m.dhcp_unsure_routers())
+        for ip in (S.GW[0], rogue):
+            d = m.device_for(ip)
+            assert d is not None and d.device_class == "Router" and \
+                d.class_confidence == "Possibly" and \
+                any(lab in r for r in d.class_reasons) and \
+                m.alert_device_name(d) != "Your router" and \
+                "Your router" not in m.friendly_who(ip, d.mac), \
+                (rogue_first, ip, d and (d.device_class,
+                                         d.class_confidence,
+                                         d.class_reasons))
+            for loc in ("fr", "es"):
+                for r in d.class_reasons:
+                    assert translate_text(r, loc) != r, (loc, r)
+        a = a2_kinds(m, "dhcp_anomaly")[-1]
+        assert a.severity == "DANGER" and a.refs.get("sure") is False \
+            and "The usual one" not in a.observed, (a.reason, a.observed)
+        # Internet traffic through the real router decides
+        sb2 = S(t0=SCENARIO_T0 + 60)
+        sb2.home_network()
+        for _ in range(20):
+            sb2.tls(S.PHONE, "www.example.com", "93.184.215.14", size=3000)
+        replay_frames(m, sb2.frames, decoder=dec)
+        gw = m.infer_gateway()
+        assert gw == S.GW[0], gw
+        m.set_identity(gateway_ip=gw)
+        m._classify_dirty |= set(m.registry.by_key)
+        m._classify()
+        assert not m.dhcp_unsure_routers()
+        g, r = m.device_for(S.GW[0]), m.device_for(rogue)
+        assert g.device_class == "Router" and \
+            g.class_confidence == "Likely" and \
+            not any(lab in x for x in g.class_reasons) and \
+            m.friendly_who(S.GW[0], g.mac).endswith("Your router"), \
+            (g.device_class, g.class_reasons)
+        assert not any(lab in x for x in r.class_reasons), r.class_reasons
+    # one DHCP server: the gateway as before, no "not confirmed"
+    sb = S(t0=SCENARIO_T0)
+    sb.dhcp(S.PHONE)
+    m = a2_model(ctx, sb.frames)
+    assert m.infer_gateway() == S.GW[0] and not m.dhcp_unsure_routers()
+
+
+@self_test()
+def t_a7_night_upload_guessed_nas_says_how_to_mark(ctx):
+    """Seventh audit: a NAS you haven't marked as one still warns on its
+    first offsite backup at night (its kind is only guessed, from what it
+    says of itself), and the warning now says how to mark it so a later
+    one is only an INFO. Other devices' warnings don't say it."""
+    S = ScenarioBuilder
+    m = a6_night_model(ctx, "", "85.10.1.2", S.NAS)
+    assert m.device_for(S.NAS[0]).device_class == "NAS"
+    got = a2_kinds(m, "night_upload")
+    assert len(got) == 1 and got[0].severity == "WARNING" and \
+        "night_upload" in [f["kind"] for f in unusual_findings(m.alerts)]
+    a = got[0]
+    assert "Set device type" in a.possible_explanations and \
+        "pick NAS" in a.possible_explanations, a.possible_explanations
+    for loc in ("fr", "es"):
+        t = translate_text(a.possible_explanations, loc)
+        assert t != a.possible_explanations and "NAS" in t, (loc, t)
+    m = a6_night_model(ctx, "", "85.10.1.2", S.PHONE)
+    got = a2_kinds(m, "night_upload")
+    assert got and "Set device type" not in got[0].possible_explanations
+    m = a6_night_model(ctx, "", "85.10.1.2", S.NAS, mark="NAS")
+    got = a2_kinds(m, "night_upload")
+    assert got and got[0].severity == "INFO"
 
 
 @self_test()
