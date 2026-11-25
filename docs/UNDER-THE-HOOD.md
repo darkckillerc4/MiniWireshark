@@ -81,10 +81,10 @@ Verification uses `cryptography` when present, and otherwise **a pure-Python Ed2
 
 ## <img src="assets/icons/tests.svg" width="28" alt=""> A window that tests and measures itself
 
-- **More than 400 self-tests** run without capture or admin rights, driven by **replay scenarios**: a scripted home network made of ordinary packets with `example.com`, `.org` and `.net` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
-- **Fuzzers** throw malformed packets at the decoders, the call decoder and the model; a seeded run of thousands of mutated frames is part of the self-test, and a one-off run of a million frames raised no error (see the [changelog](../CHANGELOG.md)).
+- **480 self-tests** run without capture or admin rights (40 of them need scapy or psutil and are skipped without them), driven by **replay scenarios**: a scripted home network made of ordinary packets with `example.com`, `.org` and `.net` names. The same frames drive the fuzzers, the GUI test and the benchmarks.
+- **Fuzzers** throw malformed packets at the decoders, the call decoder and the model; a run of a million mutated frames with a fixed seed raises no error.
 - **A mutation check** flipped comparisons and constants in 30 key functions; every surviving change is killed by a test or listed as equivalent, with a reason.
-- **The GUI test** drives the real window through every tab (more than 80 steps).
+- **The GUI test** drives the real window through every tab (95 steps; one of them, live capture, runs only with `--live`).
 - **A layout crawler** opened every tab, view, dialog and settings page in three languages, two themes, four text sizes and screen sizes from 1024×768 to 1920×1080, and flagged overlaps and cut-off text.
 - **Performance budgets** (`BENCH_LIMITS`) are frozen, and `--bench-gui --check` fails when the window gets slower.
 - **`--release-gate`** runs all of it and photographs every tab into one folder that can be sent back from another computer.
@@ -93,7 +93,7 @@ Verification uses `cryptography` when present, and otherwise **a pure-Python Ed2
 
 ## <img src="assets/icons/speed.svg" width="28" alt=""> Faster starts from a cached compiled copy
 
-Started as `python miniwireshark.py`, Python compiles the whole 103,000-line file first. That costs a few seconds and about 150 MB that the process keeps for its whole life. From 5.1.2, the compiled code is cached in the data folder, one file per Python version and checked against the script's time and size like any `.pyc`. Later processes load it, and the loading screen does the first-time work, so the window appears finished.
+Started as `python miniwireshark.py`, Python compiles the whole file (more than 100,000 lines) first. That costs a few seconds and about 150 MB that the process keeps for its whole life. From 5.1.2, the compiled code is cached in the data folder, one file per Python version and checked against the script's time and size like any `.pyc`. Later processes load it, and the loading screen does the first-time work, so the window appears finished.
 
 From 5.3.4 the cached copy carries an HMAC made with a per-install key that only you can read, it is kept only in a folder that belongs to you and is closed to others, and a process running as root never writes or loads it. From 5.3.4 Windows uses it too: the copy is written in the same process, and the window starts from it. Measured on a Windows PC, the first start went from about 14 s to under 5 s and the window's memory from about 440 MB to about 220 MB.
 

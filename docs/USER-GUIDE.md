@@ -28,7 +28,7 @@ The tabs are in four groups. `Ctrl+1` to `Ctrl+4` jump to a group, `Ctrl+Tab` mo
 | | Map | A picture of your network: router, devices and the Internet |
 | | Health | Wi-Fi, router, DNS, packet loss and Internet checks. The **Calls** card shows the loss and jitter of video and voice calls. **More questions…** opens the guided investigations |
 | | Alerts | Security and health findings, each with *why*, *innocent explanations* and *what to do*. Acknowledge, mute or **snooze** them (1 hour, 1 day or until tomorrow) |
-| **Internet** | Websites | The names your devices reach, grouped by site, with trackers marked. **Local services** lists the programs on this computer that wait for connections, what each one probably is and whether other devices can reach it; double-click a web app to open it in your browser |
+| **Internet** | Websites | The names your devices reach, grouped by site, with trackers marked. **Local services** lists the programs on this computer that wait for connections, what each one probably is and whether other devices can reach it (the check for which ones are web pages is optional and **off** by default, setting `local_services.probe`); double-click a web app to open it in your browser |
 | | Connections ¹ | Every flow: who, where, how much, how long |
 | | Internet hosts ¹ | Public addresses contacted, with country and network owner when lookups are on |
 | **Tools and help** | Packets ¹ | The packet workspace: list, dissection tree, hex view, streams, statistics, expert findings |
@@ -50,6 +50,8 @@ Press `Ctrl+K` and type. The palette finds tabs, settings pages and actions, for
 - *What changed recently*, *Review new alerts*
 - *Network check-up…*, *Diagnostics*, *Components Center*, *Storage used…*, *Privacy posture…*
 - *Go to packet…*
+
+It understands more than names. Type `:123` (or *go to packet 123*) to jump to a packet, `ip:192.168.1.5` or `/ port:443` to filter packets, `>` for commands only, `@` for devices and websites, `?` for help topics. `Tab` changes the group (All, Commands, Tabs, Settings, Devices, Help, Filters), `Up` / `Down` / `Ctrl+N` / `Ctrl+P` / `Page Up` / `Page Down` move, `Enter` runs and `Shift+Enter` runs and keeps it open. With nothing typed it shows what you used lately and a few suggestions. Matches are highlighted, accents don't matter, and each row shows its shortcut.
 
 ## Filtering
 
@@ -128,8 +130,20 @@ Each investigation lists the likely causes on a board, with the evidence for and
 | `Alt+Left` / `Alt+Right` | Back / forward |
 | `F1` | Explain this |
 | `F2` | Show or hide the inspector |
+| `F5` | Refresh this tab |
+| `F6` / `Shift+F6` | Next / previous part of the window (search, tabs, filter, table, inspector, status) |
+| `F7` | Go to the table |
+| `F8` | Beginner / Advanced view |
+| `Shift+F1` | Keyboard shortcuts |
+| `Ctrl+Shift+Left` / `Right` (and `Up` / `Down`) | Move a divider |
+| `Menu` key or `Shift+F10` | The selected row's menu |
+| `Alt+Down` | A column's menu (sort, columns, export) |
+| `Shift+Left` / `Shift+Right`, then `Shift+Enter` | Pick a column and sort by it |
+| `Enter` | Open the selected row |
+| `Home` / `End` / `Ctrl+A` | First row / last row / all rows in a table |
+| `Left` / `Right` / `Home` / `End` | Move along the tabs and sub-views (when one has the focus) |
 
-Every shortcut can be changed in **Settings → Keyboard Shortcuts**.
+Every shortcut can be changed in **Settings → Keyboard Shortcuts**. MiniWireshark can be used without a mouse: from the search box, `Tab` reaches the first control of a tab in about six presses (only the shown tab and the active sub-view are stops; use the arrow keys to move along them), and the Inspector, Help and details text panes can be focused and scrolled with the keys.
 
 ## Settings
 

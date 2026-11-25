@@ -118,6 +118,7 @@ import sys
 import tempfile
 import threading
 import types
+import unicodedata
 import zlib
 import time
 import traceback
@@ -733,7 +734,7 @@ def _tmp_name(path):
     return f"{path}.tmp{os.getpid()}-{threading.get_ident() % 100000}"
 
 
-def _open_new_tmp(tmp, mode, encoding=None):
+def _open_new_tmp(tmp, mode, encoding=None, newline=None):
     """Second audit (security #5): the temporary file is always a new file
     of our own. Its name can be guessed, so a file or link someone left
     under it in a shared folder (an export to /tmp) is removed and never
@@ -749,16 +750,21 @@ def _open_new_tmp(tmp, mode, encoding=None):
             if attempt:
                 raise
             os.remove(tmp)            # a stale one, or someone else's link
-    return os.fdopen(fd, mode, encoding=encoding)
+    return os.fdopen(fd, mode, encoding=encoding, newline=newline)
 
 
 def _atomic_write(path, data, mode, encoding=None):
     """(5.3.4 review) on disk before the rename, so a power cut cannot
-    leave an empty file; the temporary file never stays."""
+    leave an empty file; the temporary file never stays. (third audit)
+    `data` can also be a function that writes to the open file itself,
+    in pieces, so a large file is never held in memory whole."""
     tmp = _tmp_name(path)
     try:
         with _open_new_tmp(tmp, mode, encoding=encoding) as f:
-            f.write(data)
+            if callable(data):
+                data(f)
+            else:
+                f.write(data)
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
@@ -1806,10 +1812,25 @@ def interpreter_flags():
         return []
 
 
+def drop_relative_pythonpath(env):
+    """Third audit: an empty or relative PYTHONPATH entry ('', '.', 'lib')
+    is the current folder, which CACHED_RUN keeps off sys.path; Python
+    makes it absolute before CACHED_RUN runs, so it goes from `env`."""
+    keep = [d for d in env.get("PYTHONPATH", "").split(os.pathsep)
+            if os.path.isabs(d) and (not IS_WINDOWS or
+                                     os.path.splitdrive(d)[0])]
+    if keep:
+        env["PYTHONPATH"] = os.pathsep.join(keep)
+    else:
+        env.pop("PYTHONPATH", None)
+    return env
+
+
 def cached_env(env):
     env = dict(env)
     if FROZEN:
         return env
+    drop_relative_pythonpath(env)
     env.setdefault("MW_PYC", compiled_copy_path())
     env.setdefault("MW_KEY", install_key_path())
     env["MW_CACHED"] = "1"
@@ -1899,7 +1920,7 @@ def start_from_compiled_copy(code, argv=None, environ=None, execute=True,
     cmd[1:1] = interpreter_flags()
     if not execute:
         return cmd
-    env = dict(environ)
+    env = drop_relative_pythonpath(dict(environ))
     env["MW_CACHED"] = "1"
     env["MW_PYC"] = target
     env["MW_KEY"] = install_key_path()
@@ -4121,7 +4142,7 @@ class LoaderWindow(tk.Frame):
                         "skip": ("–", self.muted)}.get(state,
                                                        ("○", self.muted))
         lb.configure(text=f"{glyph} {name}", fg=color,
-                     font=("TkDefaultFont", 9,
+                     font=default_font(9,
                            "bold" if state == "active" else "normal"))
 
     def _set_health(self, kind):
@@ -4719,8 +4740,8 @@ def warm_heading_widths(root, current_scale=1.0, budget_s=3.0):
         if abs(scale - current_scale) < 1e-6:
             continue
         with contextlib.suppress(tk.TclError):
-            fonts.append(tkfont.Font(root=root, font=(
-                "TkDefaultFont", int(round(10 * scale)), "bold")))
+            fonts.append(tkfont.Font(root=root, font=default_font(
+                int(round(10 * scale)), "bold")))
     if CURRENT_LOCALE != "en":      # _i18n_fit_heading's named font
         with contextlib.suppress(tk.TclError, KeyError):
             a = tkfont.nametofont("TkHeadingFont").actual()
@@ -6022,12 +6043,23 @@ class RuntimeManager:
         except (OSError, ValueError):
             return False
 
-    def _env_for(self, exe):
+    def _env_for(self, exe, flags=None):
+        """Environment for the component probe and `pip check`. When the
+        probe looks at the Python running now, it must see the same
+        packages: started with -I or -s, this Python ignores the person's
+        own site-packages, so the probe must too (third audit: the check
+        said "scapy OK" while the running copy could not import it)."""
         env = dict(os.environ)
         env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
-        if self._is_private(exe):
+        flags = flags or sys.flags
+        try:
+            same = os.path.realpath(exe) == os.path.realpath(sys.executable)
+        except (OSError, ValueError, TypeError):
+            same = False
+        if self._is_private(exe) or (same and flags.ignore_environment):
             for k in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP"):
                 env.pop(k, None)
+        if self._is_private(exe) or (same and flags.no_user_site):
             env["PYTHONNOUSERSITE"] = "1"
         return env
 
@@ -9311,6 +9343,12 @@ def category_shown(cat, src, cfg):
         cfg.get("websites.tracker_classification", False))
 
 
+def is_cdn_name(host):
+    """A name of a content delivery network on the built-in list."""
+    h = (host or "").lower().strip(".")
+    return any(h == suf or h.endswith("." + suf) for suf in CDN_SUFFIXES)
+
+
 def domain_category(host):
     """Optional classification: Advertising / Analytics / Social /
     Tracking / Content from the tracker list, CDN from the built-in list,
@@ -10142,13 +10180,12 @@ def _udp_payload_len(ulen, room, have):
     than the bytes there are (`have`). Audit 2026-11-14 #48: a 10-byte
     datagram claiming 65535 showed "Quick message (65527 bytes)" and fed
     that size to the QUIC check. A capture cut short (a snap length) keeps
-    the size the headers agree on."""
-    n = ulen - 8
-    if room is not None and 8 <= room < ulen:
-        n = room - 8
-    elif room is not None and room < 8:
-        n = min(n, have)
-    return max(0, n)
+    the size the headers agree on. Third audit #3: only when they agree
+    exactly; otherwise never more than the bytes there are (an IP length
+    of 0 or 65535 on a 12-byte datagram said 65527 or 65507 bytes)."""
+    if room == ulen:
+        return max(0, ulen - 8)
+    return max(0, min(ulen - 8, have))
 
 
 def _udp_ip_room(u):
@@ -10230,6 +10267,44 @@ def http_form_login(body):
     return ""
 
 
+# the field names _LOGIN_FIELD matches, spelled out (a self-test checks
+# that each one is matched)
+_LOGIN_FIELD_NAMES = (b"password", b"passwd", b"passwort", b"kennwort",
+                      b"pass", b"pwd", b"pw", b"userpass", b"user_pass",
+                      b"loginpassword", b"login_password", b"motdepasse",
+                      b"mot_de_passe", b"contrase%c3%b1a",
+                      b"contrase\xc3\xb1a", b"contrasena", b"senha")
+# what starts a password field: a form's (after & or a space), a
+# multipart part's name and a JSON key
+_LOGIN_MARKS = tuple(b + f + b"=" for f in _LOGIN_FIELD_NAMES
+                     for b in (b"&", b" ", b"\t", b"\r", b"\n", b"\x0b",
+                               b"\x0c")) + \
+    tuple(b'name="' + f + b'"' for f in _LOGIN_FIELD_NAMES)
+_LOGIN_FIRST_MARKS = tuple(f + b"=" for f in _LOGIN_FIELD_NAMES)
+_LOGIN_JSON_KEYS = tuple(b'"' + f + b'"' for f in _LOGIN_FIELD_NAMES)
+_LOGIN_JSON_REST = re.compile(rb'\s*(?::\s*"?)?')
+
+
+def login_form_tail(buf, whole=False):
+    """Fifth audit: the end of a form body worth keeping while its next
+    packet is awaited: only bytes that can still grow into the start of
+    a password field ("&pass", 'name="pass', '"password": "'), never a
+    value or another field. `whole`: buf starts at the body's start (a
+    field may start there without "&"). -> bytes, at most 64."""
+    lo = buf.lower()
+    for s in range(max(0, len(lo) - 64), len(lo)):
+        c = lo[s:]
+        if any(m.startswith(c) for m in _LOGIN_MARKS) or \
+                (whole and s == 0 and
+                 any(m.startswith(c) for m in _LOGIN_FIRST_MARKS)) or \
+                any(k.startswith(c) or (c.startswith(k) and
+                                        _LOGIN_JSON_REST.fullmatch(
+                                            c, len(k)))
+                    for k in _LOGIN_JSON_KEYS):
+            return buf[s:]
+    return b""
+
+
 def _login_in_packet(d, load):
     """Mark a decoded packet that carries a sign-in: d["login"] says how
     (never what), d["login_proto"] which protocol; d["form_post"] a web
@@ -10251,7 +10326,7 @@ def _login_in_packet(d, load):
                 return
             body = head[cut + skip:]
             how = http_form_login(body)
-            if not how and not body.strip() and any(
+            if not how and any(
                     t in head[:cut].lower() for t in _LOGIN_FORM_TYPES):
                 d["form_post"] = True
         if how:
@@ -11625,7 +11700,12 @@ def _fast_ipv4(d, raw, off, reasm):
         raise NeedDeepParse("short ipv4")
     vihl = raw[off]
     ihl = (vihl & 0x0F) * 4
-    if vihl >> 4 != 4 or ihl < 20 or n < off + ihl:
+    if ihl < 20:
+        # round 4: a header shorter than its 20 fixed bytes can't be read;
+        # scapy took 2.5-6 ms a packet to say "Raw frame" too
+        d["proto"], d["text"] = "Raw", "Raw frame"
+        return _fast_done(d)
+    if vihl >> 4 != 4 or n < off + ihl:
         raise NeedDeepParse("bad ipv4 header")
     total = _U16.unpack_from(raw, off + 2)[0]
     frag = _U16.unpack_from(raw, off + 6)[0]
@@ -11643,6 +11723,16 @@ def _fast_ipv4(d, raw, off, reasm):
                     off + total if total else None)
 
 
+_IP6_ANY = bytes(16)
+_IP6_V4MAPPED = bytes(10) + b"\xff\xff"
+# the extension headers the fast decoder walks, by scapy's names for them
+_IP6_EXT_NAMES = {
+    0: "IPv6 Extension Header - Hop-by-Hop Options Header",
+    43: "IPv6 Option Header Routing",
+    60: "IPv6 Extension Header - Destination Options Header",
+    44: "IPv6 Extension Header - Fragmentation header"}
+
+
 def _fast_ipv6(d, raw, off, reasm):
     n = len(raw)
     if n < off + 40:
@@ -11654,21 +11744,38 @@ def _fast_ipv6(d, raw, off, reasm):
     src, dst = _ip6(raw[off + 8:off + 24]), _ip6(raw[off + 24:off + 40])
     d["src_ip"], d["dst_ip"] = src, dst
     d["ttl"], d["ttl_int"], d["ipver"] = _TTL_TEXT[hlim], hlim, 6
-    if is_multicast_or_broadcast(dst):
+    # third audit #2: read from the bytes; ipaddress took 8 µs for each new
+    # address (an IPv4-mapped one still goes the long way, as before)
+    db = raw[off + 24:off + 40]
+    if db[0] == 0xFF or db == _IP6_ANY or \
+            (db[:12] == _IP6_V4MAPPED and is_multicast_or_broadcast(dst)):
         d["multicast"] = True
-    end = off + 40 + plen if off + 40 + plen <= n else n
+    # a payload length of 0 before hop-by-hop options, TCP or UDP is a
+    # jumbogram or a send the network card cuts up later (large send
+    # offload): its size is the bytes captured (round 4: it went to scapy,
+    # which called it "Padding frame")
+    end = n if not plen and nh in (0, 6, 17) else \
+        off + 40 + plen if off + 40 + plen <= n else n
     p = off + 40
-    # every hop-by-hop, routing and destination-options header (audit
-    # 2026-11-14 #47: after 6 the frame went to scapy, 45-184 ms for 180
-    # of them in one 1504-byte frame); at least 8 bytes each, so the
-    # frame bounds the walk
-    while nh in (0, 43, 60):
-        if p + 2 > end:
-            raise NeedDeepParse("short extension header")
-        nh, hl = raw[p], (raw[p + 1] + 1) * 8
+    # every hop-by-hop, routing, destination-options and fragment header
+    # (audit 2026-11-14 #47: after 6 the frame went to scapy, 45-184 ms
+    # for 180 of them in one 1504-byte frame); at least 8 bytes each, so
+    # the frame bounds the walk. Third audit #2: a fragment header or a
+    # chain cut short went to scapy too (12-112 ms); named as scapy does
+    last = None
+    while nh in _IP6_EXT_NAMES:
+        hl = 8 if nh == 44 else (raw[p + 1] + 1) * 8 if p + 2 <= end else 8
+        if p + hl > end:
+            name = ("Raw" if nh == 44 else _IP6_EXT_NAMES[nh]) if p < end \
+                else _IP6_EXT_NAMES.get(last, "IPv6")
+            d["proto"], d["text"] = name, f"{name} frame"
+            return _fast_done(d)
+        if nh == 44 and _U16.unpack_from(raw, p + 2)[0] >> 3:
+            # a later fragment holds no transport header
+            d["proto"], d["text"] = "Raw", "Raw frame"
+            return _fast_done(d)
+        last, nh = nh, raw[p]
         p += hl
-    if nh == 44:
-        raise NeedDeepParse("ipv6 fragment")
     return _fast_l4(d, raw, nh, p, end, reasm, 6,
                     off + 40 + plen if plen else None)
 
@@ -11696,6 +11803,12 @@ def _fast_l4(d, raw, proto, p, end, reasm, ipver, ip_end=None):
                   "text": "Joining/leaving a multicast group (IGMP)"})
         return _fast_done(d)
     name = _ip_proto_label(proto, ipver)
+    if name is None and p < end and not (proto == 135 and ipver == 6):
+        # round 4: a protocol scapy has no decoder for either (it has one
+        # for IPv6 mobility); it took 0.1-4.5 ms a packet (IP options,
+        # padded IPv6 headers) to say so
+        d["proto"], d["text"] = "Raw", "Raw frame"
+        return _fast_done(d)
     if name is None or proto in (4, 41, 47):
         # tunnels: scapy decodes the inner packet
         raise NeedDeepParse(f"ip proto {proto}")
@@ -11741,12 +11854,15 @@ def _fast_tcp(d, raw, p, end, reasm):
         d["encrypted"] = "likely"
     load = raw[p + dataofs:end]
     # scapy takes DNS over TCP only when the length prefix fits the segment
+    dns = None
     if 53 in (sport, dport) and len(load) > 2 and \
             14 <= _U16.unpack_from(load, 0)[0] <= len(load):
         try:
-            text, learns, hint, info = wire_dns(load[2:], "DNS")
+            dns = wire_dns(load[2:], "DNS")
         except ValueError:
-            raise NeedDeepParse("odd dns/tcp")
+            dns = None                  # not DNS: a plain TCP row, no scapy
+    if dns is not None:
+        text, learns, hint, info = dns
         info["transport"] = "TCP"
         d.update({"proto": "DNS", "tag": "DNS", "text": text + " (TCP)",
                   "dns": info, "app_conf": "Observed"})
@@ -11839,13 +11955,18 @@ def _fast_udp(d, raw, p, end, reasm=None, room=None):
         raise NeedDeepParse("bad udp length")    # scapy's own reading
     load = bytes(raw[p + 8:end][:ulen - 8])
     d["payload_len"] = _udp_payload_len(ulen, room, len(load))
+    dns = None
     if (53 in ports or 5353 in ports or 5355 in ports) and len(load) >= 12:
         name = "mDNS" if 5353 in ports else "LLMNR" if 5355 in ports \
             else "DNS"
         try:
-            text, learns, hint, info = wire_dns(load, name)
+            dns = wire_dns(load, name)
         except ValueError:
-            raise NeedDeepParse("odd dns")
+            # third audit #1: not DNS, so a plain row by its port below,
+            # not scapy (6-17 ms a packet re-reading the junk as DNS)
+            dns = None
+    if dns is not None:
+        text, learns, hint, info = dns
         if dport == 53:
             d["plain_dns"] = True
         info["transport"] = "UDP"
@@ -13027,6 +13148,9 @@ FEATURES = {
     "route_pick": True,      # the card Windows' own route uses (IP-004)
     "compiled_start": True,  # Windows writes and starts from the copy (M4)
     "theme_steps": True,     # hidden tabs recoloured just after (5.3.4)
+    # Local services may ask this computer's ports "GET /", only once the
+    # person turns it on there (local_services.probe; third audit #1)
+    "local_probe": True,
 }
 
 
@@ -13241,6 +13365,9 @@ FEATURE_HELP = {
                          "to api.github.com, nothing about you)",
     "theme_steps": "a theme change recolours the tabs you can't see one "
                    "by one, just after the one you see",
+    "local_probe": "Local services can ask this computer's possible web "
+                   "pages for their title, once you tick “Check which "
+                   "ones are web pages” (off by default)",
 }
 
 
@@ -14567,9 +14694,14 @@ def trim_counter(c, keep):
     """5.3.4 (memory audit): a Counter keyed by something new every few
     minutes (a website, an address) keeps its `keep // 2` largest counts
     once it holds more than `keep` keys. In place, so every holder of
-    the Counter sees the trim."""
+    the Counter sees the trim. (third audit) A plain dict of counts, such
+    as a defaultdict(int), is trimmed the same way."""
     if len(c) > keep:
-        top = c.most_common(keep // 2)
+        if isinstance(c, Counter):
+            top = c.most_common(keep // 2)
+        else:
+            top = sorted(c.items(), key=lambda kv: kv[1],
+                         reverse=True)[:keep // 2]
         c.clear()
         c.update(dict(top))
 
@@ -15468,6 +15600,11 @@ class DeviceRegistry:
     decides whether something earns a spot in the Devices tab — nothing
     else may fabricate a device from a bare IP sighting."""
 
+    # third audit: the window empties `rekeyed` and `removed` on every
+    # update. With no window (or none emptying them) they kept every
+    # change; past this the oldest half goes
+    CHANGES_KEEP = 4000
+
     def __init__(self, gateway_ip, my_ips, config, now_fn=None):
         self.gateway_ip = gateway_ip
         self.my_ips = set(my_ips)
@@ -15522,6 +15659,12 @@ class DeviceRegistry:
         if not ip:
             return None
         return _classify_address_cached(ip)
+
+    def _cap_changes(self, lst):
+        """Keep the newest CHANGES_KEEP // 2 of a change list nobody is
+        emptying (in place: the window may hold the same list)."""
+        if len(lst) > self.CHANGES_KEEP:
+            del lst[:-(self.CHANGES_KEEP // 2)]
 
     @staticmethod
     def _classify_address_raw(ip):
@@ -15654,6 +15797,7 @@ class DeviceRegistry:
                 dev = self.by_key.pop(prior_key)
                 dev.key = key
                 self.rekeyed.append((prior_key, key))
+                self._cap_changes(self.rekeyed)
         if dev is None:
             dev = DeviceRecord(key=key, first_seen=when, last_seen=when,
                                last_confirmed=when)
@@ -16075,6 +16219,7 @@ class DeviceRegistry:
                     self.ip_to_key.pop(ip, None)
             self.pruned[dev.key] = dev.last_confirmed
             self.removed.append(dev.key)
+            self._cap_changes(self.removed)
             gone.append(dev.key)
         if gone:
             # 5.3.4 review: names merged into a dropped device no longer
@@ -16435,6 +16580,7 @@ class DeviceRegistry:
         if not other.mac:
             self.bindings.rename_owner(other.key, keep.key)
         self.removed.append(other_key)
+        self._cap_changes(self.removed)
         name = (keep.dhcp_hostname or keep.mdns_name or keep.hostname
                 or keep.display_name())
         keep.merged_from.append(other.key)
@@ -18296,9 +18442,12 @@ class AlertEngine:
         out = 0.0
         for tag in (f"{kind}|*", f"{kind}|{device_key}" if device_key
                     else None):
-            with contextlib.suppress(TypeError, ValueError):
-                if tag:
-                    out = max(out, float(sn.get(tag) or 0))
+            # fifth audit (settings): only a time a snooze can end at
+            # counts; `1e999` (or a time years away) snoozed for ever and a
+            # 400-digit number stopped the alerts (OverflowError)
+            v = sn.get(tag) if tag else None
+            if snooze_end_ok(v):
+                out = max(out, float(v))
         return out
 
     def _add(self, kind, severity, device_key, reason, observed, interp, poss,
@@ -18436,35 +18585,10 @@ class AlertEngine:
         if rogue:
             if self._debounced("dhcp_anomaly:rogue", 300):
                 return None
-            srv, router, dns, good, good_router = rogue
-            selfish = [w for w, on in (("router", router == srv),
-                                        ("DNS server", srv in dns)) if on]
-            tail = (" It names itself as the " + " and the ".join(selfish)
-                    + ".") if selfish else ""
-            return self._add(
-                "dhcp_anomaly", "DANGER", "",
-                (f"A second device hands out addresses and names itself as "
-                 f"your router: {srv}" if router == srv else
-                 f"A second device hands out addresses and a different "
-                 f"router: {srv}"),
-                f"{len(servers)} different DHCP servers seen: "
-                f"{', '.join(sorted(servers))}. {srv} gives devices {router} "
-                f"as their router and {', '.join(dns) or 'no DNS server'} "
-                f"for name lookups. The usual one, {good}, gives "
-                f"{good_router} as the router.{tail}",
-                "Devices that take an address from it send their Internet "
-                "traffic and name lookups through that device, which can "
-                "read or redirect them.",
-                "A second router or a travel router plugged in by mistake "
-                "does the same. If you don't recognise that device, unplug "
-                "it and reconnect your devices.",
-                confidence="High",
-                why="A second DHCP server named a different router than "
-                    "the usual one.",
-                evidence=[f"DHCP server: {srv}", f"Router it gives: {router}",
-                          f"Usual router: {good_router}"] +
-                ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
-                refs={"remote": srv})
+            f = self._rogue_fields(servers, rogue)
+            return self._add("dhcp_anomaly", "DANGER", "", f[0], f[1], f[2],
+                             f[3], confidence="High", why=f[4],
+                             evidence=f[5], refs=f[6])
         if self._debounced("dhcp_anomaly", 300):
             return None
         return self._add(
@@ -18477,6 +18601,92 @@ class AlertEngine:
             "less commonly \u2014 a rogue DHCP server. If you don't "
             "recognize one of these addresses, unplug that device and "
             "check your network.")
+
+    @staticmethod
+    def _rogue_fields(servers, rogue):
+        """(reason, observed, interpretation, explanations, why, evidence,
+        refs) of a second DHCP server handing out a different router."""
+        srv, router, dns, good, good_router = rogue
+        selfish = [w for w, on in (("router", router == srv),
+                                    ("DNS server", srv in dns)) if on]
+        tail = (" It names itself as the " + " and the ".join(selfish)
+                + ".") if selfish else ""
+        return (
+            (f"A second device hands out addresses and names itself as "
+             f"your router: {srv}" if router == srv else
+             f"A second device hands out addresses and a different "
+             f"router: {srv}"),
+            f"{len(servers)} different DHCP servers seen: "
+            f"{', '.join(sorted(servers))}. {srv} gives devices {router} "
+            f"as their router and {', '.join(dns) or 'no DNS server'} "
+            f"for name lookups. The usual one, {good}, gives "
+            f"{good_router} as the router.{tail}",
+            "Devices that take an address from it send their Internet "
+            "traffic and name lookups through that device, which can "
+            "read or redirect them.",
+            "A second router or a travel router plugged in by mistake "
+            "does the same. If you don't recognise that device, unplug "
+            "it and reconnect your devices.",
+            "A second DHCP server named a different router than the usual "
+            "one.",
+            [f"DHCP server: {srv}", f"Router it gives: {router}",
+             f"Usual router: {good_router}"] +
+            ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
+            {"remote": srv})
+
+    def dhcp_impostor(self, imp):
+        """Fourth audit: DHCP answers that carry one server address (your
+        router's, usually) come from two MACs that hand out different
+        settings: a rogue DHCP server using your router's address raised
+        nothing. `imp`: NetworkModel.dhcp_impostor()."""
+        if self._debounced(f"dhcp_impostor:{imp['server']}", 300):
+            return None
+        f = self._impostor_fields(imp)
+        return self._add("dhcp_anomaly", "DANGER", "", f[0], f[1], f[2],
+                         f[3], confidence="High" if imp["sure"] else
+                         "Medium", why=f[4], evidence=f[5], refs=f[6],
+                         subject=f"dhcp_impostor|{imp['server']}")
+
+    @staticmethod
+    def _impostor_fields(imp):
+        srv, real, fake = imp["server"], imp["real"], imp["fake"]
+        router, dns = imp["router"] or "none", imp["dns"]
+        good_router, good_dns = imp["real_router"] or "none", imp["real_dns"]
+        sure = imp["sure"]
+        return (
+            (f"A device answers DHCP in your router's name: MAC {fake}"
+             if sure else f"Two devices answer DHCP as {srv} and hand out "
+                          f"different settings"),
+            f"Answers as DHCP server {srv} came from MAC {real} and from "
+            f"MAC {fake}. MAC {fake} gives {router} as the router and "
+            f"{', '.join(dns) or 'no DNS server'} for name lookups; MAC "
+            f"{real} gives {good_router} and "
+            f"{', '.join(good_dns) or 'no DNS server'}." +
+            (f" MAC {real} is your router's." if sure else ""),
+            "Devices that take an address from it send their Internet "
+            "traffic and name lookups through that device, which can "
+            "read or redirect them." if sure else
+            "One of them may be a device pretending to be your router's "
+            "DHCP server.",
+            "A second router or a travel router plugged in by mistake "
+            "does the same. If you don't recognise that device, unplug "
+            "it and reconnect your devices.",
+            "Two devices answered DHCP with the same server address and "
+            "gave different settings.",
+            [f"DHCP server: {srv}", f"Second MAC: {fake}",
+             f"Router it gives: {router}", f"Usual router: {good_router}"] +
+            ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
+            {"mac": fake, "sure": sure})
+
+    def rewrite(self, a, fields):
+        """Put new words in an open alert (what it says changed once more
+        was known: which DHCP server is the rogue, at the end of a file)."""
+        (a.reason, a.observed, a.interpretation, a.possible_explanations,
+         a.why, ev, refs) = fields
+        a.evidence = list(ev)[:20]
+        a.refs.update(refs)
+        a.updated = True
+        return a
 
     def rogue_ra(self, mac, who, prefixes, routers):
         if self._debounced(f"rogue_ra:{mac}", 600):
@@ -18966,12 +19176,41 @@ class AlertEngine:
             evidence=[f"Sent: {size}", f"To: {dest}"],
             refs={"start": start})
 
-    def beacon(self, dev, dest, remote, period, n, named):
+    def beacon(self, dev, dest, remote, period, n, named, quiet=""):
         """A device opened a new connection to one server many times, at
-        nearly even intervals (see beacon_period)."""
+        nearly even intervals (see beacon_period). quiet: "gadget" (a
+        smart-home gadget, TV or speaker checking in with a server it
+        looked up by name; fourth audit: a smart plug's heartbeat was a
+        WARNING) or "cdn" (a content delivery network's host, looked up
+        by name; fifth audit: a TV polling one every 60 s ± 40 %): an
+        INFO, kept out of Unusual activity."""
         if self._debounced(f"beacon:{dev.key}:{remote}", 86400):
             return None
         every = human_period(period)
+        if quiet:
+            gadget = quiet == "gadget"
+            return self._add(
+                "beacon", "INFO", dev.key,
+                f"{dev.display_name()} contacts {dest} every {every}",
+                f"It opened a new connection to {dest} {n} times, about "
+                f"once every {every}.",
+                "Smart-home gadgets, TVs and speakers check in with their "
+                "maker's server on a timer." if gadget else
+                "A content delivery network's server holds files for many "
+                "websites and apps; apps and TVs fetch from it on a timer.",
+                "This is what these gadgets usually do. It matters if you "
+                "don't know the server." if gadget else
+                "News, pictures and updates are fetched like this. It "
+                "matters if the device should be idle.",
+                confidence="Low",
+                why="A gadget contacted a server it looked up by name, at "
+                    "nearly even intervals." if gadget else
+                    "A content delivery network's server, looked up by "
+                    "name, was contacted at nearly even intervals.",
+                evidence=[f"Server: {dest}", f"Contacts: {n}",
+                          f"Every: {every}"],
+                refs={"remote": remote, "explained": quiet},
+                subject=f"beacon|{dev.key}|{remote}")
         return self._add(
             "beacon", "WARNING", dev.key,
             f"{dev.display_name()} contacts {dest} every {every}",
@@ -19776,7 +20015,9 @@ class OsListenMap(ProcessMap):
 # The services listening on this computer, one row per program and port,
 # with a plain guess at what each one is and who can reach it. Built from
 # ProcessMap.listening (psutil, the same table the Security tab reads);
-# nothing is sent to list them.
+# nothing is sent to list them. Only when the person turns on "Check which
+# ones are web pages" is each likely web port asked "GET /" (this
+# computer only; third audit #1).
 LOCAL_DEV_WEB = "Web app in development"
 # TCP ports where a program on a person's own computer is most often a web
 # app being built (React, Vite, Angular, Django, Flask, Rails, Jupyter...)
@@ -19798,7 +20039,166 @@ LOCAL_PROGRAM_HINTS = (
     ("sshd", "Remote terminal (SSH)", False),
     # macOS: the AirPlay receiver takes 5000 and 7000
     ("controlcenter", "Streaming to a speaker/TV (AirPlay)", False),
+    # third audit (owner): more programs by name, so fewer rows say
+    # "unknown" (longer names first where one starts another)
+    ("sqlservr", "Database connection (SQL Server)", False),
+    ("memcached", "Cache server (memcached)", False),
+    ("httpd", "Web server (Apache)", True),
+    ("apache", "Web server (Apache)", True),
+    ("lighttpd", "Web server (lighttpd)", True),
+    ("caddy", "Web server (Caddy)", True),
+    ("jupyter", "Notebook server (Jupyter)", True),
+    ("ollama", "AI model server (Ollama)", False),
+    ("com.docker", "Containers (Docker)", False),
+    ("dockerd", "Containers (Docker)", False),
+    ("docker", "Containers (Docker)", False),
+    ("smbd", "Windows file sharing (SMB)", False),
+    ("nmbd", "Local name lookup (NetBIOS)", False),
+    ("cups-browsed", "Printer discovery", False),
+    ("spoolsv", "Printing (Windows)", False),
+    ("avahi-daemon", "Local name lookup (mDNS)", False),
+    ("mdnsresponder", "Local name lookup (mDNS)", False),
+    ("dnsmasq", "Website lookup (DNS)", False),
+    ("systemd-resolve", "Website lookup (DNS)", False),
+    ("chronyd", "Checking the time (NTP)", False),
+    ("ntpd", "Checking the time (NTP)", False),
+    ("rpcbind", "Network service directory (RPC)", False),
+    ("rapportd", "Nearby Apple devices (Continuity)", False),
+    ("sharingd", "AirDrop and sharing", False),
+    ("kdeconnect", "Phone link (KDE Connect)", False),
+    ("teamviewer", "Remote support (TeamViewer)", False),
+    ("anydesk", "Remote support (AnyDesk)", False),
+    ("x11vnc", "Remote screen sharing (VNC)", False),
+    ("vino", "Remote screen sharing (VNC)", False),
+    ("spotify", "Music app (Spotify)", False),
+    ("steam", "Game launcher (Steam)", False),
+    ("discord", "Chat app (Discord)", False),
+    ("dropbox", "File sync (Dropbox)", False),
+    ("onedrive", "File sync (OneDrive)", False),
+    ("zoom", "Video calls (Zoom)", False),
+    ("svchost", "Windows background service", False),
+    ("lsass", "Windows sign-in (Kerberos)", False),
+    ("wininit", "Windows background service", False),
+    ("launchd", "System service (macOS)", False),
+    ("systemd", "System service (systemd)", False),
 )
+# names that only count whole (a prefix would catch other programs):
+# Windows' own "System" process (pid 4: file sharing, discovery) and its
+# service manager
+LOCAL_PROGRAM_EXACT = {"system": "Part of Windows itself",
+                       "services": "Windows background service"}
+# third audit (owner: "organized, not just all put there"): each service
+# goes under one heading, found from what it is. (word in what it is,
+# heading key, a plain line saying what it does); the first match wins.
+LOCAL_KINDS = (
+    ("web", "Websites and web apps"),
+    ("db", "Databases and data stores"),
+    ("share", "File sharing, printing and streaming"),
+    ("remote", "Remote access to this computer"),
+    ("dev", "Developer tools"),
+    ("apps", "Apps"),
+    ("system", "System and network services"),
+    ("unknown", "Not sure what these are"),
+)
+LOCAL_WEB_ABOUT = "A web server: it sends web pages to a browser."
+LOCAL_KIND_RULES = (
+    # before "web": a website *lookup* is not a web page
+    ("website lookup", "system",
+     "Looks up website names (DNS) for this computer or your network."),
+    ("encrypted dns", "system",
+     "Looks up website names (DNS) for this computer or your network."),
+    ("windows remote management", "system", "Part of Windows."),
+    ("web app in development", "web",
+     "A website or app being built on this computer. Open it in your "
+     "browser to see it."),
+    ("notebook server", "web",
+     "Notebooks you open in your browser (code, notes and charts)."),
+    ("web admin", "web",
+     "A settings page for a program, opened in a browser."),
+    ("web", "web", LOCAL_WEB_ABOUT),
+    ("database", "db",
+     "A database: programs keep and read their data here."),
+    ("cache server", "db",
+     "A fast store that apps use to keep data close at hand."),
+    ("printer discovery", "share",
+     "Finds printers on your network so you can print to them."),
+    ("printing", "share",
+     "Printing: pages go through it on their way to a printer."),
+    ("file sharing", "share",
+     "Shares files and folders with other computers."),
+    ("file transfer", "share",
+     "Sends and receives files (an FTP-style file server)."),
+    ("remote file access", "share",
+     "Lets other computers open files stored here."),
+    ("file sync", "share",
+     "Keeps your files in step with other computers or the cloud."),
+    ("airdrop", "share",
+     "Sends files to nearby Apple devices (AirDrop)."),
+    ("airplay", "share",
+     "Lets phones and computers play sound or video through this "
+     "computer."),
+    ("media server", "share",
+     "Shares your films, music and photos with other devices."),
+    ("stream", "share", "Streams video or sound to other devices."),
+    ("casting", "share", "Lets this computer cast to a TV."),
+    ("remote terminal", "remote",
+     "Lets someone sign in to this computer and type commands. Normal "
+     "if you set it up; worth a look if you didn't."),
+    ("remote desktop", "remote",
+     "Lets someone see and control this computer's screen. Normal if "
+     "you set it up; worth a look if you didn't."),
+    ("screen sharing", "remote",
+     "Lets someone see and control this computer's screen. Normal if "
+     "you set it up; worth a look if you didn't."),
+    ("remote support", "remote",
+     "A remote-help tool: someone you give the code to can use this "
+     "computer."),
+    ("remote management", "remote",
+     "Lets an administrator manage this computer from elsewhere."),
+    ("containers", "dev",
+     "Runs programs in containers for software development."),
+    ("ai model server", "dev",
+     "Runs AI models on this computer for apps that ask it."),
+    ("message queue", "dev", "Passes messages between programs."),
+    ("proxy server", "dev",
+     "Relays connections for other programs (a proxy)."),
+    ("music app", "apps", "Part of an app installed on this computer."),
+    ("game", "apps", "Part of a game or game launcher."),
+    ("gaming", "apps", "Part of a game or game launcher."),
+    ("chat", "apps", "Part of a chat or calling app."),
+    ("video calls", "apps", "Part of a chat or calling app."),
+    ("calling", "apps", "Part of a chat or calling app."),
+    ("call relay", "apps", "Part of a chat or calling app."),
+    ("remote play", "apps", "Part of a game or game launcher."),
+    ("playstation", "apps", "Part of a game or game launcher."),
+    ("phone link", "apps", "Connects this computer with your phone."),
+    ("push notifications", "apps",
+     "Brings notifications to apps on this computer."),
+    ("iphone/ipad sync", "apps", "Syncs an iPhone or iPad."),
+    ("smart home", "apps", "Talks to smart home devices."),
+    ("name lookup", "system",
+     "Lets devices on your network find each other by name."),
+    ("device discovery", "system",
+     "Lets devices on your network find each other (TVs, printers, "
+     "speakers)."),
+    ("nearby apple devices", "system",
+     "Lets your Apple devices work together (Handoff, copy and paste)."),
+    ("ip address", "system", "Hands out network addresses (DHCP)."),
+    ("checking the time", "system", "Keeps this computer's clock right."),
+    ("vpn", "system", "A VPN: connects this computer to another network."),
+    ("windows", "system", "Part of Windows."),
+    ("system service", "system", "Part of the operating system."),
+    ("rpc", "system", "Part of the operating system."),
+    ("kerberos", "system", "Part of the operating system."),
+    ("log messages", "system", "Collects the system's log messages."),
+    ("network monitoring", "system",
+     "Answers network monitoring tools (SNMP)."),
+    ("directory lookup", "system",
+     "A company directory (users and computers)."),
+    ("email", "apps", "An email server or email app."),
+)
+LOCAL_UNKNOWN_ABOUT = ("MiniWireshark doesn't recognise it: look up the "
+                       "program's name.")
 LOCAL_SAFE = "Only this computer can reach it"
 LOCAL_EXPOSED = "Other devices on your network can reach it"
 LOCAL_UNKNOWN = "Not sure what this is"
@@ -19816,6 +20216,21 @@ DEMO_LOCAL_LISTENERS = {
     ("TCP", "0.0.0.0", 22): (98, "sshd")}
 
 
+def local_service_kind(what, web=False):
+    """(heading key of LOCAL_KINDS, a plain English line saying what the
+    service does) for what local_service_guess said it is."""
+    if what == LOCAL_UNKNOWN:
+        return ("web", LOCAL_WEB_ABOUT) if web else \
+            ("unknown", LOCAL_UNKNOWN_ABOUT)
+    low = str(what or "").lower()
+    for word, kind, about in LOCAL_KIND_RULES:
+        if word in low:
+            return kind, about
+    if web:
+        return "web", LOCAL_WEB_ABOUT
+    return "unknown", LOCAL_UNKNOWN_ABOUT
+
+
 def _local_is_loopback(ip):
     s = local_addr_key(ip)
     return s.startswith("127.") or s == "::1"
@@ -19826,6 +20241,8 @@ def local_service_guess(proto, port, program=""):
     page a browser can open). TCP only for web pages."""
     name = re.sub(r" \(pid \d+\)$", "", str(program or "")).lower()
     name = name[:-4] if name.endswith(".exe") else name
+    if name in LOCAL_PROGRAM_EXACT:
+        return LOCAL_PROGRAM_EXACT[name], False
     for start, what, web in LOCAL_PROGRAM_HINTS:
         if name.startswith(start):
             return what, web and proto == "TCP"
@@ -19911,29 +20328,119 @@ def local_url_ok(url, own=()):
 # SMB/NetBIOS; and every port the table or the program's name says isn't
 # a web page (local_service_rows)
 LOCAL_PROBE_SKIP = frozenset({137, 138, 139, 445, 1433, 3306, 5432, 6379,
-                              9100, 11211, 27017})
+                              9100, 11211, 27017,
+                              # third audit #2: well-known non-web ports
+                              22, 25, 53, 110, 143, 389, 465, 587, 993, 995,
+                              1900, 5353})
+# fourth audit: a second copy of one of them takes the next ports (a second
+# Redis on 6380, raw printing on 9101 and 9102, PostgreSQL on 5433, Redis
+# Sentinel and cluster ports), so these whole ranges are never asked...
+LOCAL_PROBE_SKIP_RANGES = ((3306, 3309), (5432, 5439), (6379, 6389),
+                           (9100, 9109), (11211, 11212), (16379, 16389),
+                           (26379, 26389), (27017, 27019), (33060, 33062))
+# ...nor a program whose name (a word of it) starts with one of these
+LOCAL_PROBE_NOT_WEB = ("redis", "valkey", "keydb", "memcache", "mongo",
+                       "mysql", "mariadb", "postgres", "sqlservr", "cups",
+                       "lpd", "p910nd", "jetdirect", "smbd", "nmbd",
+                       "samba", "sshd")
+
+
+def local_probe_wanted(proto, port, program, what, web):
+    """May the Local services check ask this service "GET /"? TCP only;
+    never a port in LOCAL_PROBE_SKIP or LOCAL_PROBE_SKIP_RANGES, nor a
+    program LOCAL_PROBE_NOT_WEB names; then only what the guess says is
+    a web page, or a service nothing is known about. Fourth audit: by the
+    program's name too, not the port alone, so nothing the view files
+    under databases, printing and sharing, remote access or the system
+    (local_service_kind) is asked."""
+    if proto != "TCP" or not isinstance(port, int) or \
+            port in LOCAL_PROBE_SKIP or \
+            any(a <= port <= b for a, b in LOCAL_PROBE_SKIP_RANGES):
+        return False
+    name = re.sub(r" \(pid \d+\)$", "", str(program or "")).lower()
+    if any(w.startswith(LOCAL_PROBE_NOT_WEB)
+           for w in re.split(r"[^a-z0-9]+", name)):
+        return False
+    return bool(web) or what == LOCAL_UNKNOWN
+
+
+# the tags local_page_title steps through (a name must end there: not
+# <titlebar>, not <header>)
+_TITLE_TAGS = re.compile(rb"<!--|<(/?)(svg|title|head|script|style)"
+                         rb"(?=[\s/>])")
 
 
 def local_page_title(data):
     """The page's <title>, found in one pass (second audit #3: a lazy
-    regex over 64 KB of "<title>" took about 2 s of CPU per answer)."""
+    regex over 64 KB of "<title>" took about 2 s of CPU per answer).
+    Third audit: only the <title> element itself (not <titlebar>, not an
+    <svg>'s <title>), decoded by the charset the header or a <meta> names
+    (else UTF-8, else Windows-1252). Fourth audit: the one inside <head>
+    wins, else the first one outside every <svg> (nested or written
+    <svg/>); comments, scripts, styles and an empty <title/> are passed
+    over."""
     lo = data.lower()
-    i = lo.find(b"<title")
-    j = lo.find(b">", i) if i >= 0 else -1
-    k = lo.find(b"</title", j) if j >= 0 else -1
-    if k < 0:
+    pos, depth, in_head, first = 0, 0, False, None
+    while True:
+        m = _TITLE_TAGS.search(lo, pos)
+        if m is None:
+            break
+        if m.group(0) == b"<!--":
+            end = lo.find(b"-->", m.end())
+            if end < 0:
+                break
+            pos = end + 3
+            continue
+        close, tag = m.group(1), m.group(2)
+        gt = lo.find(b">", m.end())
+        if gt < 0:
+            break
+        pos = gt + 1
+        alone = lo[gt - 1:gt] == b"/"          # <svg/>, <title/>
+        if tag in (b"script", b"style"):
+            if not close and not alone:
+                end = lo.find(b"</" + tag, pos)
+                if end < 0:
+                    break
+                pos = end
+        elif tag == b"svg":
+            if close:
+                depth = max(0, depth - 1)
+            elif not alone:
+                depth += 1
+        elif tag == b"head":
+            in_head = not close and not alone
+        elif not close and not alone and not depth:
+            k = lo.find(b"</title", pos)
+            if k < 0:
+                break
+            if in_head:
+                first = (pos, k)
+                break
+            if first is None:
+                first = (pos, k)
+            pos = k
+    if first is None:
         return ""
-    return sanitize_text(" ".join(html.unescape(data[j + 1:k][:4096].decode(
-        "utf-8", "replace")).split()), 120)
+    raw = data[first[0]:first[1]][:4096]
+    m = re.search(rb"charset\s*=\s*[\"']?([a-z0-9_.:-]{1,40})", lo)
+    try:
+        text = raw.decode(m.group(1).decode() if m else "utf-8")
+    except (LookupError, UnicodeDecodeError):
+        text = raw.decode("cp1252", "replace")
+    return sanitize_text(" ".join(html.unescape(text).split()), 120)
 
 
-def probe_local_http(host, port, own=(), timeout=1.0):
+def probe_local_http(host, port, own=(), timeout=1.0, record=True):
     """One "GET /" to a port of THIS computer (loopback, or one of its own
     addresses in `own`; never another host, and no redirect is
     followed): plain HTTP, then TLS without checking the certificate when
     the answer looks like TLS. Each try: `timeout` s to connect, then
     `timeout` s to read at most 64 KB; each is listed in the ledger and
-    stopped by the kill switch (OutboundBlocked).
+    stopped by the kill switch (OutboundBlocked). `record=False`: the
+    caller listed the plain tries of the whole scan in the ledger once
+    (third audit); a try over TLS is still listed on its own (fourth
+    audit), and the kill switch still stops each try.
     -> {"web", "https", "status", "title"}"""
     a = ip_obj(host)
     if a is None or a.is_unspecified or not (a.is_loopback or local_addr_key(
@@ -19948,8 +20455,14 @@ def probe_local_http(host, port, own=(), timeout=1.0):
 
     def ask(tls):
         """-> (bytes read, the server closed by itself)"""
-        outbound("local_probe", "https" if tls else "http", where,
-                 "GET / (this computer only)")
+        # record=False: the scan's line counts the plain tries only, so a
+        # try again over TLS gets its own line (fourth audit: the ledger
+        # left it out)
+        if record or tls:
+            outbound("local_probe", "https" if tls else "http", where,
+                     "GET / (this computer only)")
+        elif LEDGER.killed:
+            raise OutboundBlocked("Not sent — the kill switch is on")
         data, closed, accepted = b"", False, False
         try:
             with _socket.create_connection((host, port), timeout) as raw:
@@ -20022,18 +20535,18 @@ def local_service_rows(listening, own=(), probes=None):
         what, web = local_service_guess(proto, port, prog)
         addrs = tuple(sorted(addrs, key=lambda a: (":" in a, a)))
         host = local_service_host(addrs, own)
-        key = (port, prog, host) if proto == "TCP" and host and \
-            port not in LOCAL_PROBE_SKIP and \
-            (web or what == LOCAL_UNKNOWN) else None
+        key = (port, prog, host) if host and local_probe_wanted(
+            proto, port, prog, what, web) else None
         got = (probes or {}).get(key) if key else None
         https, title = None, ""
         if got:
             web, https, title = got["web"], got["https"], got["title"]
             if web and what == LOCAL_UNKNOWN:
                 what = LOCAL_WEB_SERVER[80]
+        kind, about = local_service_kind(what, web)
         rows.append({"proto": proto, "port": port, "program": prog,
                      "addrs": addrs, "network": network, "what": what,
-                     "web": web,
+                     "kind": kind, "about": about, "web": web,
                      "url": local_service_url(proto, port, addrs, web,
                                               own, https),
                      "safety": LOCAL_EXPOSED if network else LOCAL_SAFE,
@@ -20072,11 +20585,24 @@ def local_service_cells(r):
     if prog in ("the operating system",
                 "unknown program (needs admin rights to name it)"):
         prog = tt(prog)
-    what = tt(r["what"])
+    if r["what"] == LOCAL_UNKNOWN and isinstance(r["port"], int):
+        # third audit (owner): a clear name, not "Not sure what this is"
+        what = tt("Unknown service on port %d") % r["port"]
+    else:
+        what = tt(r["what"])
     if r.get("title"):                 # the page's own title, when asked
         what += " — " + r["title"]
     return (r["port"], r["proto"], what, tt(r["safety"]), prog,
             f"{where} ({', '.join(shown)})")
+
+
+def local_service_view_cells(r):
+    """(the name shown in the first column, the other columns) of one row
+    of the Local services view, in the shown language: what it does, run
+    by, who can reach it, port, protocol, where it listens."""
+    port, proto, what, safety, prog, listens = local_service_cells(r)
+    about = r.get("about") or local_service_kind(r["what"], r["web"])[1]
+    return what, (translate_text(about), prog, safety, port, proto, listens)
 
 
 class ListenWatch:
@@ -20798,6 +21324,37 @@ class AdGuardConnector(Connector):
 
 
 CONNECTOR_KINDS = {"pihole": PiHoleConnector, "adguard": AdGuardConnector}
+# fifth audit (settings): what a helper's entry in the settings holds. An
+# entry was only checked to be a table, so `"id": [1]` or `"kind": {}`
+# stopped the helpers' start (TypeError: unhashable) and two entries with
+# the same id stopped the Sources tab (a duplicate row id)
+CONNECTOR_SPEC_KEYS = {"id": str, "kind": str, "name": str, "url": str,
+                       "username": str, "pin": str, "verify": bool,
+                       "enabled": bool}
+
+
+def connector_spec_clean(sp):
+    """One helper's settings with each known key of its kind: a key of
+    another kind is taken out (so its default applies), keys this version
+    doesn't know are kept. -> the entry, or None when it can't be one (not
+    a table, or no id to know it by)."""
+    if not isinstance(sp, dict):
+        return None
+    out = {k: v for k, v in sp.items() if k not in CONNECTOR_SPEC_KEYS or
+           isinstance(v, CONNECTOR_SPEC_KEYS[k])}
+    return out if out.get("id") else None
+
+
+def connector_specs(specs):
+    """The usable helper entries of a settings list, cleaned as above, the
+    first of each id only. Anything that isn't a list gives []."""
+    out, seen = [], set()
+    for sp in specs if isinstance(specs, list) else []:
+        sp = connector_spec_clean(sp)
+        if sp is not None and sp["id"] not in seen:
+            seen.add(sp["id"])
+            out.append(sp)
+    return out
 
 
 class ConnectorManager:
@@ -20807,7 +21364,9 @@ class ConnectorManager:
     def __init__(self, specs, vault, deliver, interval=60.0):
         self.vault = vault
         self.deliver = deliver
-        self.interval = interval
+        # third audit (settings #23): 0 asked without a pause, 1e308
+        # stopped the thread (a newer version's file isn't clamped)
+        self.interval = min(max(_float(interval, 60.0), 10.0), 3600.0)
         self.status = {}
         self.conns = {}
         self.cursor = {}
@@ -20818,7 +21377,8 @@ class ConnectorManager:
 
     def update(self, specs):
         live = {}
-        for sp in specs or []:
+        # (third audit #23, fifth audit) a settings file's junk is skipped
+        for sp in connector_specs(specs):
             cls = CONNECTOR_KINDS.get(sp.get("kind"))
             if cls is None or not sp.get("id"):
                 continue
@@ -21764,6 +22324,7 @@ class LookupCorrelator:
 
     STRONG_WINDOW = 10.0          # lookup → connection within 10 s
     KEEP = 1800.0                 # forget lookups after 30 minutes
+    MAX = 20000                   # audit #56: was 200,000 (177k in a loop)
 
     def __init__(self):
         self.by_dev_ip = {}       # (device, ip) -> deque[(ts, domain)]
@@ -21808,7 +22369,7 @@ class LookupCorrelator:
         order = self.order
         while order:
             (dev, ip), t = next(iter(order.items()))
-            if now - t <= self.KEEP and len(order) <= 200000:
+            if now - t <= self.KEEP and len(order) <= self.MAX:
                 break
             order.popitem(last=False)
             dq = self.by_dev_ip.get((dev, ip))
@@ -23719,11 +24280,21 @@ NIGHT_UPLOAD_BYTES = 20 * 1024 * 1024   # sent in one night hour
 NIGHT_UPLOAD_WINDOW = 3600.0
 BEACON_MIN_CONTACTS = 30
 BEACON_SKIP_PORTS = frozenset((0, 53, 123, 853, 3478, 5349, 19302))
+# fourth audit: gadgets whose whole job is to check in with their maker's
+# cloud on a timer (a smart plug every 60 s): an INFO when the server's
+# name came from a DNS answer, kept out of Unusual activity
+BEACON_GADGETS = frozenset(("Smart-home/IoT", "Smart TV", "Streaming device",
+                            "Speaker"))
 DNS_TUNNEL_NAMES = 50          # long random names under one domain …
 DNS_TUNNEL_WINDOW = 600.0      # … within this many seconds
 DNS_TUNNEL_LABEL = 30          # a label this long, random-looking
 # security services that look up file hashes as names on purpose
 DNS_TUNNEL_SKIP = ("sophosxl.net", "mcafee.com", "trendmicro.com", "e5.sk")
+# fourth audit: cloud names made of long random labels whose answers come
+# from the cloud's own name servers, so a lookup carries nothing out
+# (AWS load balancers: k8s-default-web-0a1b2c3d4e-1234567890.us-east-1.
+# elb.amazonaws.com)
+DNS_TUNNEL_SKIP_NAMES = (".elb.amazonaws.com", ".elb.amazonaws.com.cn")
 
 
 def known_bulk_service(names, kind=None):
@@ -23739,11 +24310,14 @@ def known_bulk_service(names, kind=None):
     return None
 
 
-def beacon_period(starts, min_gaps=20, spread=0.2, share=0.8):
+def beacon_period(starts, min_gaps=20, spread=0.2, share=0.8, cv=0.3):
     """Connection start times → the period in seconds when they are
     nearly even (at least `share` of the last gaps within `spread` of
     their median, the median between 20 s and an hour), else None. Much
-    stricter than detect_periodic: this one raises an alert."""
+    stricter than detect_periodic: this one raises an alert. Third
+    audit: a timer jittered on purpose (about ±50 %) still counts when
+    the gaps' coefficient of variation is at most `cv` (random contacts
+    are near 1)."""
     ts = sorted(starts)
     gaps = [b - a for a, b in zip(ts, ts[1:])]
     if len(gaps) < min_gaps:
@@ -23752,7 +24326,10 @@ def beacon_period(starts, min_gaps=20, spread=0.2, share=0.8):
     if not 20.0 <= med <= 3600.0:
         return None
     close = sum(1 for g in gaps if abs(g - med) <= spread * med)
-    return med if close >= share * len(gaps) else None
+    if close >= share * len(gaps) or \
+            statistics.pstdev(gaps) <= cv * statistics.mean(gaps):
+        return med
+    return None
 
 
 def random_label(label):
@@ -23783,6 +24360,8 @@ class DnsTunnelWatch:
         """→ (parent, distinct names, minutes, TXT share, sample) when the
         pair crosses DNS_TUNNEL_NAMES, else None."""
         q = (qname or "").lower().strip(".")
+        if q.endswith(DNS_TUNNEL_SKIP_NAMES):
+            return None
         labels = q.split(".")
         if len(labels) < 3 or not any(random_label(x)
                                       for x in labels[:-2]):
@@ -23847,6 +24426,7 @@ class NetworkModel:
         self._flow_marks = {}     # fid -> (out, in) when this minute began
         self.offline_now = 0.0
         self.gateway_ip = gateway_ip
+        self.gateway_guessed = False   # True: gateway_ip is infer_gateway's
         self.my_ips = set(my_ips)
         self.my_macs = {m.lower() for m in my_macs if m}
         self.local_nets = []
@@ -23914,6 +24494,15 @@ class NetworkModel:
         self.night_up = {}               # (#33) device → this night hour
         self.dns_tunnels = DnsTunnelWatch()      # (#36)
         self.dhcp_offers = OrderedDict()  # (#37) server → router, DNS
+        # fourth audit: what each (server address, MAC) hands out, and the
+        # server addresses answered from two MACs with different settings
+        # (a rogue server using your router's address)
+        self.dhcp_mac_offers = OrderedDict()
+        self.dhcp_twins = {}
+        # fourth audit: names an address got only from a connection (TLS
+        # SNI, HTTP Host), never from a DNS answer: anyone can write
+        # "icloud-content.com" there
+        self.ip_unconfirmed = {}
         self._form_wait = OrderedDict()  # (#34) a form POST's body next
         self._dup_pending = OrderedDict()  # (#39) address → (ts, MAC)
         # (ts, rtt, remote, dev, fid)
@@ -23977,9 +24566,15 @@ class NetworkModel:
     TIMELINE_KEEP = 3000          # timeline lines in memory
     RTT_KEEP = 2000               # round-trip times kept
     BCAST_KEEP = 5000             # who sent the last broadcasts
+    # third audit: DHCP servers and routers offered, router MACs, switches
+    # heard. A real network has a handful; past this the least used go
+    LAN_TALLY_KEEP = 64
     OBS_RECENT_KEEP = 4000        # newest observations (sessions keep 3,000)
     DEVICE_SITES_KEEP = 500       # websites listed on one device
     DEVICE_REMOTES_KEEP = 500     # remote addresses listed on one device
+    # round 5 (memory): and in all, over every device (_cap_device_lists)
+    DEVICE_SITES_TOTAL = 100000
+    DEVICE_REMOTES_TOTAL = 100000
     HTTP_HOSTS_KEEP = 2000        # websites reached over plain HTTP
     VPN_PEERS_KEEP = 1000         # addresses seen on a VPN port
     DOH_CLIENTS_KEEP = 512        # addresses that used encrypted DNS
@@ -24503,11 +25098,15 @@ class NetworkModel:
         # the device's current name instead of three names for one device
         dv = self.registry.by_key.get(device) if device else None
         if dv is not None and not named:
-            nm, sn = dv.display_name(), sentence_device_name(dv)
+            # third audit (UI): this computer and the router without a
+            # name of their own are "This computer" and "Your router", as
+            # in the alerts (they were "Device using a private Wi-Fi
+            # address (…)" next to "family-nas joined your network")
+            nm, sn = dv.display_name(), self.alert_device_name(dv)
             if sn != nm and nm and nm in text:
                 text = entry["text"] = text.replace(nm, sn, 1)
         if dv is not None:
-            nm = named or sentence_device_name(dv)
+            nm = named or self.alert_device_name(dv)
             if nm and nm in text:
                 entry["name"] = nm
         self.timeline.append(entry)
@@ -24530,7 +25129,10 @@ class NetworkModel:
         if dev.device_class == "This computer" or \
                 (dev.ip and dev.ip in self.my_ips):
             return "This computer"
-        if dev.ip and dev.ip == self.gateway_ip and looks_like_address(n):
+        # third audit (UI): a router with a private Wi-Fi address was
+        # "Device using a private Wi-Fi address (192.168.50.1)" in the
+        # Timeline; without a name of its own it is "Your router"
+        if dev.ip and dev.ip == self.gateway_ip:
             return "Your router"
         return n
 
@@ -24610,6 +25212,14 @@ class NetworkModel:
                     "count": (cur["count"] + 1) if cur else 1,
                     "pkt": d.get("no")})
         self.switch_ports[key] = rec
+        if len(self.switch_ports) > self.LAN_TALLY_KEEP:
+            # third audit: made-up switch names made one entry each; the
+            # ones heard from longest ago go
+            for k in sorted(self.switch_ports, key=lambda k:
+                            self.switch_ports[k]["last"])[
+                                :len(self.switch_ports) -
+                                self.LAN_TALLY_KEEP // 2]:
+                del self.switch_ports[k]
         if cur is None or cur.get("port") != rec["port"] or \
                 cur.get("vlan") != rec["vlan"]:
             name = rec["system"] or rec["chassis"]
@@ -24736,8 +25346,10 @@ class NetworkModel:
             self.bcast_talkers.append((ts, d["src_mac"] or src_ip))
         elif direction == "up" and d["dst_mac"]:
             self.gw_mac_traffic[d["dst_mac"]] += nbytes
+            trim_counter(self.gw_mac_traffic, self.LAN_TALLY_KEEP)
         elif direction == "down" and d["src_mac"]:
             self.gw_mac_traffic[d["src_mac"]] += nbytes
+            trim_counter(self.gw_mac_traffic, self.LAN_TALLY_KEEP)
 
         src_dev, dst_dev = self._observe_devices(d, src_local, dst_local,
                                                  direction, ts)
@@ -24986,8 +25598,11 @@ class NetworkModel:
                 ip == self.gateway_ip, together=len(both),
                 twin=(both[0], both[1], other) if other else False))
             if a and not a.updated:
-                a.evidence = [f"{t:.0f}: {ip} claimed by {m}" for t, m in
-                              list(self.registry.arp_claims.get(ip, ()))[-8:]]
+                # fourth audit (#40): the time of day, not a raw epoch
+                # ("1763420000: …"), so the line reads in every language
+                a.evidence = [f"{fmt_clock(t)}: {ip} claimed by {m}"
+                              for t, m in list(
+                                  self.registry.arp_claims.get(ip, ()))[-8:]]
                 if other:
                     a.evidence.append(f"also both answering for {other}")
                 if ip == self.gateway_ip:
@@ -25059,13 +25674,20 @@ class NetworkModel:
                     off["router"] = str(info["router"])
                 if info.get("dns_servers"):
                     off["dns"] = [str(x) for x in info["dns_servers"][:4]]
+            imp = self._note_dhcp_mac(server, d["src_mac"], info)
             if mt in (2, 5):
                 self.dhcp_servers[server] += 1
+                # third audit: a flood of offers with made-up server ids
+                # made one entry each. The busiest servers stay
+                trim_counter(self.dhcp_servers, self.LAN_TALLY_KEEP)
                 if len(self.dhcp_servers) > 1:
                     self._alert(self.alerts.dhcp_anomaly(
                         set(self.dhcp_servers), self.dhcp_rogue()))
+                if imp is not None:
+                    self._alert(self.alerts.dhcp_impostor(imp))
             if info.get("router"):
                 self.dhcp_routers[info["router"]] += 1
+                trim_counter(self.dhcp_routers, self.LAN_TALLY_KEEP)
             for s in info.get("dns_servers") or []:
                 if len(self.dhcp_dns) < 8:
                     self.dhcp_dns.add(s)
@@ -25629,6 +26251,19 @@ class NetworkModel:
                     for k in list(itertools.islice(
                             self.ip_to_domains, self.IP_NAMES_KEEP // 10)):
                         self.ip_to_domains.pop(k, None)
+                        self.ip_unconfirmed.pop(k, None)
+            un = self.ip_unconfirmed.get(ip)
+            if source == "DNS":
+                if un is not None:
+                    un.discard(key)
+                    if not un:
+                        del self.ip_unconfirmed[ip]
+            elif connection and key not in names:
+                if un is None and len(self.ip_unconfirmed) < \
+                        self.IP_NAMES_KEEP:
+                    un = self.ip_unconfirmed[ip] = set()
+                if un is not None and len(un) < 8:
+                    un.add(key)
             names.pop(key, None)
             names[key] = ts
             while len(names) > 8:
@@ -25840,23 +26475,53 @@ class NetworkModel:
         Basic, a password in a web address and FTP/POP3/IMAP sign-ins on
         their usual ports fit in one packet). A form whose body comes in
         the next packet is looked at then. Only who, where and how are
-        kept; the packet's bytes are read here and dropped."""
+        kept in the alert; the packet's bytes are read here and dropped.
+        Third audit: a form body split over several packets is put back
+        together (in order, up to the 4096 bytes http_form_login reads;
+        a new request ends it) until a password field shows, so
+        "pass" + "word=..." in two packets is seen too. Fifth audit: what
+        waits for the next packet (30 s at most, 256 forms) is only the
+        end that may still become a password field's start
+        (login_form_tail: "&pass"), never a value, plus how many bytes of
+        the body were read."""
         key4 = (d["src_ip"], d["sport"], d["dst_ip"], d["dport"])
         how, proto = d.get("login") or "", d.get("login_proto") or "HTTP"
-        if d.get("form_post") and not how:
-            self._bounded_put(self._form_wait, key4, d["time"], 256)
-            return None
+        fw = self._form_wait   # OrderedDict, oldest first: forget after 30 s
+        while fw and d["time"] - next(iter(fw.values()))[0] > 30:
+            fw.popitem(last=False)
         if not how:
-            if key4 not in self._form_wait:
+            post = d.get("form_post")
+            if not post and key4 not in fw:
                 return None
-            del self._form_wait[key4]
+            # a new POST drops the old body
+            _t, tail, seen = fw.pop(key4, (0, b"", 0))
+            tail, seen = (b"", 0) if post else (tail, seen)
             n = d.get("payload_len") or 0
             raw = d.get("raw") or b""
             if not raw and d.get("pkt") is not None:
                 with contextlib.suppress(Exception):
                     raw = bytes(d["pkt"])          # scapy's decoder
-            how = http_form_login(bytes(raw[-n:][:4096]) if n else b"")
+            load = bytes(raw[-n:][:4096]) if n else b""
+            if post:                               # the body after headers
+                cut = load.find(b"\r\n\r\n")
+                load = load[cut + 4:] if cut >= 0 else \
+                    load[load.find(b"\n\n") + 2:]
+            elif load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
+                              b"OPTI", b"PATC"):
+                return None                        # the next request
+            load = load[:max(0, 4096 - seen)]  # the body's first 4096 bytes
+            whole = len(tail) == seen          # tail is the body so far
+            buf = tail + load
+            # not at the body's start: a field can't start at byte 0 (the
+            # byte before it was a value's), so "^" must not match there
+            how = http_form_login(buf if whole else b"\0" + buf)
             if not how:
+                seen += len(load)
+                if seen < 4096:
+                    # fifth audit: only what may still become a password
+                    # field's start is kept, never the body itself
+                    self._bounded_put(self._form_wait, key4, (
+                        d["time"], login_form_tail(buf, whole), seen), 256)
                 return None
         return self.deep_login({"client": d["src_ip"],
                                 "server": d["dst_ip"], "port": d["dport"],
@@ -25988,8 +26653,7 @@ class NetworkModel:
         backup = 0
         service = ""
         for ip, n in ep["to"].most_common():
-            hit = known_bulk_service(self.ip_to_domains.get(ip) or (),
-                                     "backup")
+            hit = known_bulk_service(self.dns_names(ip), "backup")
             if hit:
                 backup += n
                 service = service or hit[0]
@@ -26028,8 +26692,27 @@ class NetworkModel:
             return None
         names = self.ip_to_domains.get(remote)
         dest = next(reversed(names)) if names else remote
-        return self._alert(self.alerts.beacon(dev, dest, remote, period, n,
-                                              bool(names)))
+        # fourth audit: names from a DNS answer only (a TLS hello can
+        # claim any name)
+        dns = self.dns_names(remote)
+        quiet = ""
+        if any(is_cdn_name(x) for x in dns):
+            # fifth audit: a TV polling a CDN host every 60 s ± 40 % was a
+            # WARNING under Unusual activity; a CDN host serves everyone
+            quiet = "cdn"
+        elif dns and (dev.user_class or dev.device_class) in BEACON_GADGETS:
+            quiet = "gadget"
+        return self._alert(self.alerts.beacon(
+            dev, dest, remote, period, n, bool(names), quiet=quiet))
+
+    def dns_names(self, ip):
+        """The names `ip` was given by a DNS answer (or by a source that
+        is not a connection's own claim). Fourth audit: a server of
+        anyone's can put "p42-content.icloud-content.com" in its TLS hello;
+        such a name alone no longer makes a night upload a backup."""
+        names = self.ip_to_domains.get(ip) or ()
+        un = self.ip_unconfirmed.get(ip)
+        return [n for n in names if not un or n not in un]
 
     def _bulk_service(self, dev, upload):
         """Second audit (#38): the known backup (upload) or streaming
@@ -26041,7 +26724,7 @@ class NetworkModel:
         by = b.cur_up_by if upload else b.cur_down_by
         for ip in (b.last_top[0 if upload else 1],
                    max(by, key=by.get) if by else ""):
-            hit = known_bulk_service(self.ip_to_domains.get(ip) or (),
+            hit = known_bulk_service(self.dns_names(ip),
                                      "backup" if upload else "stream") \
                 if ip else None
             if hit:
@@ -26247,6 +26930,7 @@ class NetworkModel:
             pass
         self.dns.expire(now)
         self.forget_aged(now)
+        self._cap_device_lists()
         yield "expiry"
         self._check_dns(now)
         self._check_broadcast(now)
@@ -26300,6 +26984,36 @@ class NetworkModel:
         self.registry.events = []
         self._announce_created()
 
+    def _cap_device_lists(self):
+        """Round 5 (memory): each device lists at most DEVICE_SITES_KEEP
+        websites and DEVICE_REMOTES_KEEP remote addresses, but nothing held
+        the sum: 1,000 devices meeting new websites filled 500 of each a
+        device (a million texts, about 125 MB), and the harsh looped replay
+        grew in a straight line until they had. Past DEVICE_SITES_TOTAL (or
+        DEVICE_REMOTES_TOTAL) in all, the devices seen longest ago let go of
+        that list first, your labelled ones last, until a tenth is free.
+        -> the keys of the devices whose list was emptied."""
+        devs = self.registry.by_key.values()
+        gone = []
+        for attr, cap in (("websites", self.DEVICE_SITES_TOTAL),
+                          ("remote_ips", self.DEVICE_REMOTES_TOTAL)):
+            total = sum(len(getattr(d, attr)) for d in devs)
+            if total <= cap:
+                continue
+            goal = cap - cap // 10
+            labelled = self.registry.labelled
+            for d in sorted(devs, key=lambda d: (labelled(d), d.last_seen)):
+                lst = getattr(d, attr)
+                if not lst:
+                    continue
+                total -= len(lst)
+                lst.clear()
+                self.dirty_devices.add(d.key)
+                gone.append(d.key)
+                if total <= goal:
+                    break
+        return gone
+
     REMOTE_KEEP = 6 * 3600   # audit #4: remote hosts and their names
     REMOTE_MAX = 8000        # was 30,000, far above a home network's day
 
@@ -26335,6 +27049,7 @@ class NetworkModel:
                 if ip not in keep and next(reversed(names.values()), 0) < cut]
         for ip in doms:
             del self.ip_to_domains[ip]
+            self.ip_unconfirmed.pop(ip, None)
         self.correlator._expire(now)     # without waiting for a new lookup
         return len(old) + len(doms) + len(self.cache.prune(now, keep))
 
@@ -26518,17 +27233,125 @@ class NetworkModel:
     def dhcp_trusted(self):
         """Second audit (#37): (server, router) of the DHCP server this
         network trusts: the one that names the router this computer uses
-        (live), else the first one seen. A rogue server arrives later and
-        often answers more, so the count can't decide."""
+        (its default route), else the first one seen. A rogue server often
+        answers more, so the count can't decide. Third audit #3: the
+        default route decides even when the rogue was heard first (and with
+        the packet clock); only a gateway guessed from a file's DHCP isn't
+        ground truth."""
         offers = [(s, o) for s, o in self.dhcp_offers.items()
                   if o.get("router")]
         if not offers:
             return None
-        if self.gateway_ip and not self.use_packet_clock:
+        if self.gateway_ip and not self.gateway_guessed:
             for s, o in offers:
                 if o["router"] == self.gateway_ip:
                     return s, o["router"]
+        # fifth audit: a capture file has no default route; the router
+        # the Internet traffic really goes through decides (the rogue
+        # heard first was trusted, and the real router accused)
+        best = None
+        for s, o in offers:
+            key = self.registry.ip_to_key.get(o["router"])
+            dev = self.registry.by_key.get(key) if key else None
+            n = self.gw_mac_traffic.get((dev.mac or "").lower(), 0) \
+                if dev is not None else 0
+            if n and (best is None or n > best[0]):
+                best = (n, s, o["router"])
+        if best is not None:
+            return best[1], best[2]
         return offers[0][0], offers[0][1]["router"]
+
+    def _note_dhcp_mac(self, server, mac, info):
+        """Fourth audit: what each MAC answering as DHCP server `server`
+        hands out. Two MACs that hand out different routers or DNS servers
+        under one server address (a rogue server using your router's
+        address; two relays of one real server give the same settings)
+        make a pair: then the real one's settings are the server's.
+        → dhcp_impostor() for this server, or None."""
+        mac = (mac or "").lower()
+        if not mac:
+            return None
+        mo = self.dhcp_mac_offers.get((server, mac))
+        if mo is None:
+            if len(self.dhcp_mac_offers) >= 32:
+                return None
+            mo = self.dhcp_mac_offers[(server, mac)] = {"router": "",
+                                                       "dns": []}
+        if info.get("router"):
+            mo["router"] = str(info["router"])
+        if info.get("dns_servers"):
+            mo["dns"] = [str(x) for x in info["dns_servers"][:4]]
+        if server not in self.dhcp_twins:
+            for (s, m), o in self.dhcp_mac_offers.items():
+                if s == server and m != mac and \
+                        (o["router"], o["dns"]) != (mo["router"],
+                                                     mo["dns"]):
+                    self.dhcp_twins[server] = [m, mac]
+                    break
+            else:
+                return None
+        elif mac not in self.dhcp_twins[server] and \
+                len(self.dhcp_twins[server]) < 4:
+            self.dhcp_twins[server].append(mac)
+        imp = self.dhcp_impostor(server)
+        if imp is not None and server in self.dhcp_offers:
+            self.dhcp_offers[server] = {"router": imp["real_router"],
+                                        "dns": list(imp["real_dns"])}
+        return imp
+
+    def dhcp_impostor(self, server=None):
+        """Fourth audit: a DHCP server address answered from two MACs with
+        different settings → {server, real, fake, sure, router, dns,
+        real_router, real_dns}, else None. The real one is the MAC your
+        router has (its ARP answers for the gateway address) or the one
+        the Internet traffic goes through; `sure` is False when neither
+        tells them apart (then the first one heard counts as real)."""
+        reg = self.registry
+        for s, macs in self.dhcp_twins.items():
+            if server is not None and s != server:
+                continue
+
+            def score(m):
+                return (m in reg.gw_macs, self.gw_mac_traffic.get(m, 0))
+            ranked = sorted(macs, key=score, reverse=True)
+            real = ranked[0]
+            ro = self.dhcp_mac_offers.get((s, real)) or {}
+            for fake in ranked[1:]:
+                fo = self.dhcp_mac_offers.get((s, fake)) or {}
+                if (fo.get("router"), fo.get("dns")) != \
+                        (ro.get("router"), ro.get("dns")):
+                    return {"server": s, "real": real, "fake": fake,
+                            "sure": score(real) > score(fake),
+                            "router": fo.get("router", ""),
+                            "dns": list(fo.get("dns") or []),
+                            "real_router": ro.get("router", ""),
+                            "real_dns": list(ro.get("dns") or [])}
+        return None
+
+    def refresh_dhcp_alerts(self):
+        """Fourth/fifth audit: in a capture file the DHCP answers come
+        before the traffic that shows which router is real, so the alert
+        could accuse the real router (and a rogue using its address could
+        not be told apart). Once more is known (infer_gateway, at the end
+        of a file), an open alert is said again with the right roles."""
+        eng = self.alerts
+        rogue = self.dhcp_rogue()
+        a = eng.alerts.get(eng._open.get(("dhcp_anomaly", ""), ""))
+        if a is not None and rogue is not None and not a.acknowledged and \
+                a.severity == "DANGER" and a.refs.get("remote") != rogue[0]:
+            eng.rewrite(a, eng._rogue_fields(set(self.dhcp_servers), rogue))
+        for s in list(self.dhcp_twins):
+            imp = self.dhcp_impostor(s)
+            a = eng.alerts.get(eng._open.get(
+                ("dhcp_anomaly", f"dhcp_impostor|{s}"), ""))
+            if imp is None or a is None or a.acknowledged:
+                continue
+            if (a.refs.get("mac"), a.refs.get("sure")) != \
+                    (imp["fake"], imp["sure"]):
+                eng.rewrite(a, eng._impostor_fields(imp))
+            if s in self.dhcp_offers:
+                self.dhcp_offers[s] = {"router": imp["real_router"],
+                                       "dns": list(imp["real_dns"])}
 
     def dhcp_rogue(self):
         """Second audit (#37): (server, router, DNS servers, trusted server,
@@ -26549,9 +27372,16 @@ class NetworkModel:
         from DHCP 'router' options or from where Internet traffic flows.
         Second audit (#37): when DHCP servers disagree about the router,
         the trusted server's router, never the busiest offer (a rogue
-        server answering every request named itself the gateway)."""
+        server answering every request named itself the gateway).
+        Fourth audit: an open DHCP alert is said again with what is known
+        now (refresh_dhcp_alerts), and a rogue answering with your
+        router's address never makes its router the gateway."""
+        self.refresh_dhcp_alerts()
         if self.dhcp_rogue() is not None:
             return self.dhcp_trusted()[1]
+        imp = self.dhcp_impostor()
+        if imp is not None and imp["real_router"]:
+            return imp["real_router"]
         if self.dhcp_routers:
             return self.dhcp_routers.most_common(1)[0][0]
         if self.gw_mac_traffic:
@@ -26582,7 +27412,74 @@ DEFAULT_SHORTCUTS = {
     "back": "<Alt-Left>", "forward": "<Alt-Right>", "explain": "<F1>",
     "group1": "<Control-Key-1>", "group2": "<Control-Key-2>",
     "group3": "<Control-Key-3>", "group4": "<Control-Key-4>",
+    # keyboard-only use: move between the window's regions (F6 is the
+    # Windows and Linux convention), jump to the table, the shortcut
+    # sheet, Beginner / Advanced, refresh, and the divider between the
+    # tabs and the Inspector. None is used by Tk's Entry / Text / Treeview.
+    "regions": "<F6>", "regions_back": "<Shift-F6>", "focus_table": "<F7>",
+    "shortcut_sheet": "<Shift-F1>", "mode_toggle": "<F8>",
+    "refresh": "<F5>", "pane_narrower": "<Control-Shift-Left>",
+    "pane_wider": "<Control-Shift-Right>",
 }
+
+# Keys the text boxes keep for themselves (Tk's Entry / Text bindings, and
+# the editing keys people expect there). The Settings window refuses to
+# give one of them to an action, and the self-test checks the defaults.
+# The older defaults (Ctrl+E, Ctrl+F, Ctrl+K, Ctrl+Z ...) were chosen
+# before this list; they stay, and each of them lets the box keep the key.
+RESERVED_EDIT_KEYS = tuple(
+    f"<Control-Key-{c}>" for c in "abdefhknptwyxcvzoi") + (
+    "<Control-Key-slash>", "<Control-Key-backslash>")
+RESERVED_PLAIN_KEYS = (
+    "<Tab>", "<Shift-Tab>", "<Control-Tab>", "<Control-Shift-Tab>",
+    "<Up>", "<Down>", "<Left>", "<Right>", "<Prior>", "<Next>", "<Home>",
+    "<End>", "<Return>", "<space>", "<Escape>", "<BackSpace>", "<Delete>",
+    "<Menu>", "<F10>", "<Shift-F10>", "<Shift-Left>", "<Shift-Right>",
+    "<Control-Left>", "<Control-Right>", "<Control-Home>", "<Control-End>",
+    "<Control-Shift-Home>", "<Control-Shift-End>")
+
+
+def _norm_seq(seq):
+    """"<Control-Key-1>" == "<Control-1>"; modifiers in one fixed order,
+    letters lower case, so two spellings of one key compare equal."""
+    parts = [p for p in (seq or "").strip().strip("<>").split("-") if p]
+    parts = [p for p in parts if p != "Key"]
+    if not parts:
+        return ""
+    key, mods = parts[-1], parts[:-1]
+    order = ("Control", "Alt", "Shift")
+    mods = [m for m in order if m in mods] + [m for m in mods
+                                              if m not in order]
+    if len(key) == 1 and key.isalpha() and "Shift" not in mods:
+        key = key.lower()
+    return "<" + "-".join(mods + [key]) + ">"
+
+
+def shortcut_reserved(name, seq):
+    """Why `seq` may not be given to the action `name`: a sentence, or ""
+    when it is free. The action's own default is always allowed."""
+    n = _norm_seq(seq)
+    if not n or n == _norm_seq(DEFAULT_SHORTCUTS.get(name, "")):
+        return ""
+    for r in RESERVED_EDIT_KEYS:
+        if n == _norm_seq(r):
+            return "Text boxes use that key (editing)."
+    for tok, label in fixed_key_tokens().items():
+        if n == tok:
+            return f"Already used by \u201c{label}\u201d."
+    for r in RESERVED_PLAIN_KEYS:
+        if n == _norm_seq(r):
+            return "That key is used to move around the window."
+    parts = n.strip("<>").split("-")
+    if "Control" in parts and "Alt" in parts:
+        return "Ctrl+Alt is used for typing letters on some keyboards."
+    if "Alt" in parts and len(parts[-1]) == 1:
+        return "Alt and a letter open the window's menus."
+    if not set(parts[:-1]) & {"Control", "Alt", "Meta"} and \
+            (len(parts[-1]) == 1 or parts[-1] in (
+                "slash", "period", "comma", "minus", "plus", "equal")):
+        return "A plain letter key types text."
+    return ""
 
 DEFAULT_FILTER_PRESETS = {
     "My phone": {"expr": "device:@mine-phone"},
@@ -26680,15 +27577,37 @@ def _default_config():
         "filters": {"presets": json.loads(json.dumps(DEFAULT_FILTER_PRESETS)),
                     "recent": []},
         "diagnostics": {"verbose_logging": False},
+        # third audit #1: asking local ports "GET /" is opt-in
+        "local_services": {"probe": False},
+        # Ctrl+K: the entries you ran last, newest first (labels, at most 20)
+        "palette": {"recent": []},
     }
 
 
-def migrate_config(data):
+def migrate_config(data, fixed=None):
     """Bring an older settings file up to the current schema without
-    losing anything the user chose."""
-    ver = int(data.get("config_version", 1) or 1)
+    losing anything the user chose. Third audit (settings #21): a schema
+    number that isn't a number (a list, 1e999) or a "performance" that
+    isn't a section stopped every start, even with --safe; they are set
+    back (named in `fixed`) and the rest of the file is kept."""
+    fixed = [] if fixed is None else fixed
+    try:
+        ver = data.get("config_version", 1)
+        # fifth audit (settings): `{}`, `null`, `""` or `false` became 1
+        # without a word (and the next save kept a .bak); like a list
+        # they are not a number, so they are named as set back too
+        if isinstance(ver, bool) or not isinstance(ver, (int, float)):
+            raise TypeError("config_version is not a number")
+        ver = int(ver or 1)
+    except (TypeError, ValueError, OverflowError):
+        ver = 1                  # unknown: the steps below are safe to redo
+        fixed.append("config_version")
     if ver < 2:
-        perf = data.setdefault("performance", {})
+        perf = data.get("performance")
+        if not isinstance(perf, dict):
+            if "performance" in data:
+                fixed.append("performance")
+            perf = data["performance"] = {}
         if "mode" not in perf:
             perf["mode"] = "Low CPU" if perf.get("cpu_friendly_mode") \
                 else "Automatic"
@@ -26743,6 +27662,33 @@ def config_beside_app_ok(default_path):
     return _dir_writable(folder)
 
 
+def config_beside_app_note(default_path, used_path):
+    """Third audit (install #28): a settings file next to the program
+    that the rule above turned down (most often a folder of your own that
+    your group may write to, as umask 002 makes them) was passed over
+    without a word, so an upgrade seemed to lose the settings. It stays
+    unused: a group can have other members, and the file decides where
+    updates come from. -> a plain-words note the first time (while the
+    data folder has no settings file yet), else "". Always logged."""
+    if os.path.abspath(default_path) == os.path.abspath(used_path) or \
+            not os.path.lexists(default_path):
+        return ""
+    folder = os.path.dirname(os.path.abspath(default_path))
+    LOG.warning("settings next to the program not used (others could "
+                "change %s); using %s", default_path, used_path)
+    if os.path.lexists(used_path):
+        return ""
+    how = "" if IS_WINDOWS else (
+        f" If no one else is in your user group, close the folder to "
+        f"others with chmod go-w \"{folder}\" \"{default_path}\" and "
+        f"start MiniWireshark again to use your old settings.")
+    return ("Your old settings file next to MiniWireshark was not used, "
+            "because other people on this computer could change it or "
+            f"its folder ({folder}). This run starts with the default "
+            f"settings, kept from now on in {os.path.dirname(used_path)}."
+            + how)
+
+
 # second audit (settings #21): values a choice also takes besides its
 # labels (a colour-blind code, any "N %" scale)
 CHOICE_ALSO_OK = {
@@ -26750,6 +27696,74 @@ CHOICE_ALSO_OK = {
                                                 "tritan"),
     "accessibility.ui_scale": lambda v: bool(re.match(r"^\d+\s*%$", v)),
 }
+
+
+# third audit (settings #23): what the lists and tables hold. A start with
+# `"filters.recent": [1]` or `"connectors.list": [1]` stopped at "startup
+# error"; items of another kind are dropped when the file is read
+CONFIG_LIST_ITEMS = {"filters.recent": str, "connectors.list": dict,
+                     "general.tours_done": str,
+                     "alerts.muted_devices": str, "alerts.expected": str}
+# a snooze lasts a day at most ("Until tomorrow" under two); an end later
+# than this is a hand edit or a clock that was wrong when it was set
+SNOOZE_LONGEST = 3 * 86400
+
+
+def snooze_end_ok(v, now=None):
+    """A snooze's end as the settings file holds it: a plain number (not
+    on/off), finite, after 1970 and at most SNOOZE_LONGEST from now."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return False
+    try:
+        v = float(v)
+    except OverflowError:
+        return False
+    now = time.time() if now is None else now
+    return math.isfinite(v) and 0 < v <= now + SNOOZE_LONGEST
+
+
+# fifth audit (settings): a snooze's end time is checked too (a word, NaN,
+# 1e999, a list or a time years away was kept, and the alerts read it)
+CONFIG_TABLE_VALUES = {"filters.presets": dict, "workspaces.saved": dict,
+                       "alerts.snoozed": snooze_end_ok}
+# lists whose items are also mended one by one (fifth audit: a helper's
+# `"id": [1]` stopped the helpers' start)
+CONFIG_LIST_REPAIR = {"connectors.list": connector_specs}
+# numbers with no Settings control, so no range there: `"interval": 0`
+# asked a connected helper without a pause, 1e308 stopped its thread
+CONFIG_RANGES = {"connectors.interval": (10, 3600)}
+
+
+def _item_fits(x, kind):
+    return isinstance(x, kind) if isinstance(kind, type) else kind(x)
+
+
+def _clean_config_contents(data, fixed):
+    for key, kind in list(CONFIG_LIST_ITEMS.items()) + \
+            list(CONFIG_TABLE_VALUES.items()):
+        section, _, k = key.partition(".")
+        have = data.get(section)
+        v = have.get(k) if isinstance(have, dict) else None
+        if isinstance(v, list):
+            keep = [x for x in v if _item_fits(x, kind)]
+            if key in CONFIG_LIST_REPAIR:
+                keep = CONFIG_LIST_REPAIR[key](keep)
+            if keep != v:
+                have[k] = keep
+                fixed.append(key)
+        elif isinstance(v, dict) and key in CONFIG_TABLE_VALUES:
+            keep = {n: x for n, x in v.items() if _item_fits(x, kind)}
+            if len(keep) != len(v):
+                have[k] = keep
+                fixed.append(key)
+    for key, (lo, hi) in CONFIG_RANGES.items():
+        section, _, k = key.partition(".")
+        have = data.get(section)
+        v = have.get(k) if isinstance(have, dict) else None
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and \
+                not lo <= v <= hi:
+            have[k] = min(max(v, lo), hi)
+            fixed.append(key)
 
 
 def _type_fits(value, default):
@@ -26808,6 +27822,10 @@ def clean_config_values(data):
                     elif hi is not None and v > hi:
                         have[k] = hi
                         fixed.append(key)
+    if _float(data.get("config_version", 0)) <= CONFIG_SCHEMA_VERSION:
+        # (B-32) a newer version's lists may hold what this one doesn't
+        # know: kept as they are, and the code that reads them copes
+        _clean_config_contents(data, fixed)
     return fixed
 
 
@@ -26820,12 +27838,14 @@ class AppConfig:
         default_path = os.path.join(APP_HOME, "miniwireshark_config.json")
         if path is None:
             path = os.environ.get("MINIWIRESHARK_CONFIG")
+        beside_note = ""
         if path is None:
             # second audit (install #28): the data folder's rule applies
             if config_beside_app_ok(default_path):
                 path = default_path
             else:
                 path = os.path.join(PATHS.data, "miniwireshark_config.json")
+                beside_note = config_beside_app_note(default_path, path)
         self.path = path
         self.warning = ""
         # the version that last showed the Welcome Center, as the file said
@@ -26835,6 +27855,8 @@ class AppConfig:
         self.repaired = []           # keys set back to their defaults
         self._disk_sig = None        # what this copy last read or wrote
         self.data = self._load()
+        if beside_note and not self.warning:
+            self.warning = beside_note
         self._base = _json_copy(self.data)
 
     def _parse(self, raw):
@@ -26845,7 +27867,8 @@ class AppConfig:
         data = json.loads(raw.decode("utf-8-sig"))
         if not isinstance(data, dict):
             raise ValueError("config is not an object")
-        data = migrate_config(data)
+        mig_fixed = []
+        data = migrate_config(data, mig_fixed)
         gen = data.get("general")
         from_version = str(gen.get("welcome_version") or "") \
             if isinstance(gen, dict) else ""
@@ -26861,14 +27884,14 @@ class AppConfig:
                 merged[section] = vals
         try:
             ver = int(data.get("config_version", 0) or 0)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             ver = 0
         if ver > CONFIG_SCHEMA_VERSION:
             LOG.info("settings were written by a newer MiniWireshark "
                      "(schema %s); keeping what this version doesn't "
                      "know", ver)
         merged["config_version"] = max(ver, CONFIG_SCHEMA_VERSION)
-        return merged, from_version, clean_config_values(merged)
+        return merged, from_version, mig_fixed + clean_config_values(merged)
 
     def _load(self):
         defaults = _default_config()
@@ -26910,18 +27933,19 @@ class AppConfig:
                     ", ".join(self.repaired[:6]) +
                     (" …" if len(self.repaired) > 6 else "") + ".")
             return merged
-        except (OSError, ValueError) as e:
-            LOG.warning("config unreadable (%s); using defaults", e)
-            try:
-                with open(self.path + ".damaged", "wb") as f:
-                    f.write(raw)
-                kept = True
-            except OSError:
-                kept = False
+        except Exception as e:                       # noqa: BLE001
+            # third audit (settings #21): any file this version can't
+            # read (too deeply nested, a value of a shape nobody checked)
+            # is set aside like a damaged one; before, only ValueError
+            # was, so such a file stopped every start, even with --safe
+            LOG.warning("config unreadable (%s: %s); using defaults",
+                        type(e).__name__, str(e)[:200])
+            kept = self._set_aside(raw)
             if kept:
-                self.warning = ("Your settings file looked damaged, so I "
-                                "reset it to defaults (a copy was kept as "
-                                "“.damaged”).")
+                self.warning = (
+                    "Your settings file was damaged, so MiniWireshark "
+                    "started with the default settings (a copy was kept "
+                    f"as “{os.path.basename(kept)}” in the same folder).")
             else:
                 # no copy, so the file must not be written over
                 self.read_only = True
@@ -26929,6 +27953,34 @@ class AppConfig:
                                 "copy could be made, so this run uses the "
                                 "defaults and leaves the file as it is.")
             return defaults
+
+    def _set_aside(self, raw):
+        """Keep the damaged file's bytes as `<name>.damaged` (or
+        `.damaged-<time>` when an older, different copy already has that
+        name) and take the file itself out of the way, so the next start
+        is a clean one and the person is told once. -> the copy's path,
+        or "" when no copy could be made (then the file stays as it is)."""
+        dest = self.path + ".damaged"
+        try:
+            with open(dest, "rb") as f:
+                same = f.read() == raw
+            if not same:
+                dest = f"{self.path}.damaged-{int(time.time())}"
+        except OSError:
+            same = False                       # no older copy: use the name
+        try:
+            if not same:
+                atomic_write_bytes(dest, raw)
+        except OSError as e:
+            LOG.warning("the damaged settings file couldn't be copied: %s",
+                        e)
+            return ""
+        try:
+            os.remove(self.path)
+        except OSError as e:
+            # the copy is kept, so the next save may write over it
+            LOG.info("the damaged settings file stays in place: %s", e)
+        return dest
 
     def get(self, dotted, default=None):
         ov = getattr(self, "overrides", None)
@@ -26985,8 +28037,9 @@ class AppConfig:
             return False
         try:
             other = self._parse(raw)[0]
-        except (ValueError, UnicodeDecodeError):
-            return False                 # damaged: this copy's settings win
+        except Exception:                            # noqa: BLE001
+            # damaged (third audit: of any shape): this copy's settings win
+            return False
         for section, vals in self.data.items():
             was = base.get(section)
             if isinstance(vals, dict) and isinstance(was, dict) and \
@@ -30907,6 +31960,16 @@ Clear the sort ¦ Annuler le tri ¦ Quitar el orden
 Export this table… ¦ Exporter ce tableau… ¦ Exportar esta tabla…
 Export this table ¦ Exporter ce tableau ¦ Exportar esta tabla
 Exporting the table ¦ Exportation du tableau ¦ Exportando la tabla
+Sort column: {col} — Shift+Enter sorts, Alt+Down opens the column menu ¦ Colonne de tri : {col} — Maj+Entrée trie, Alt+Bas ouvre le menu des colonnes ¦ Columna de orden: {col} — Mayús+Intro ordena, Alt+Abajo abre el menú de columnas
+Sorted by {col} ¦ Trié par {col} ¦ Ordenado por {col}
+This table can't be sorted. ¦ Ce tableau ne peut pas être trié. ¦ Esta tabla no se puede ordenar.
+Sort by ¦ Trier par ¦ Ordenar por
+Sort and columns ¦ Tri et colonnes ¦ Orden y columnas
+A row's menu, from the keyboard ¦ Menu d'une ligne, au clavier ¦ Menú de una fila, con el teclado
+A column's menu (sort, columns, export) ¦ Menu d'une colonne (tri, colonnes, export) ¦ Menú de una columna (orden, columnas, exportar)
+Sort by a column ¦ Trier par une colonne ¦ Ordenar por una columna
+Select every row ¦ Sélectionner toutes les lignes ¦ Seleccionar todas las filas
+Scroll a read-only text ¦ Faire défiler un texte en lecture seule ¦ Desplazar un texto de solo lectura
 (icon) ¦ (icône) ¦ (icono)
 Copy cell ¦ Copier la cellule ¦ Copiar la celda
 Copy row ¦ Copier la ligne ¦ Copiar la fila
@@ -32041,6 +33104,137 @@ Web app in development ¦ Application web en développement ¦ Aplicación web e
 Web server ¦ Serveur web ¦ Servidor web
 Secure web server ¦ Serveur web sécurisé ¦ Servidor web seguro
 Not sure what this is ¦ Pas sûr de ce que c'est ¦ No está claro qué es
+# third audit (owner): Local services by kind, each with a plain line
+Android push notifications ¦ Notifications Android ¦ Notificaciones de Android
+Apple file sharing (AFP) ¦ Partage de fichiers Apple (AFP) ¦ Archivos compartidos de Apple (AFP)
+Apple push notifications ¦ Notifications Apple ¦ Notificaciones de Apple
+Casting control (Chromecast) ¦ Contrôle de la diffusion (Chromecast) ¦ Control de la transmisión (Chromecast)
+Chat messaging (XMPP) ¦ Messagerie instantanée (XMPP) ¦ Mensajería instantánea (XMPP)
+Company directory lookup (LDAP, secure) ¦ Annuaire d'entreprise (LDAP, sécurisé) ¦ Directorio de empresa (LDAP, seguro)
+Database connection (Oracle) ¦ Connexion à une base de données (Oracle) ¦ Conexión a base de datos (Oracle)
+Device discovery (WS-Discovery) ¦ Découverte d'appareils (WS-Discovery) ¦ Detección de dispositivos (WS-Discovery)
+Encrypted DNS (DNS-over-TLS) ¦ DNS chiffré (DNS-over-TLS) ¦ DNS cifrado (DNS-over-TLS)
+File sharing (BitTorrent) ¦ Partage de fichiers (BitTorrent) ¦ Archivos compartidos (BitTorrent)
+File sync (rsync) ¦ Synchronisation de fichiers (rsync) ¦ Sincronización de archivos (rsync)
+File transfer (FTPS) ¦ Transfert de fichiers (FTPS) ¦ Transferencia de archivos (FTPS)
+Getting an IP address (DHCP) ¦ Obtention d'une adresse IP (DHCP) ¦ Obtención de una dirección IP (DHCP)
+Live video streaming (RTMP) ¦ Diffusion vidéo en direct (RTMP) ¦ Transmisión de vídeo en directo (RTMP)
+Local name lookup (LLMNR) ¦ Recherche de nom locale (LLMNR) ¦ Búsqueda de nombre local (LLMNR)
+Message queue (AMQP) ¦ File de messages (AMQP) ¦ Cola de mensajes (AMQP)
+Online gaming ¦ Jeu en ligne ¦ Juego en línea
+Online gaming (Minecraft) ¦ Jeu en ligne (Minecraft) ¦ Juego en línea (Minecraft)
+Online gaming (Steam) ¦ Jeu en ligne (Steam) ¦ Juego en línea (Steam)
+Online gaming (Xbox Live) ¦ Jeu en ligne (Xbox Live) ¦ Juego en línea (Xbox Live)
+PlayStation network ¦ Réseau PlayStation ¦ Red de PlayStation
+Proxy server (HTTP) ¦ Serveur proxy (HTTP) ¦ Servidor proxy (HTTP)
+Proxy server (SOCKS) ¦ Serveur proxy (SOCKS) ¦ Servidor proxy (SOCKS)
+Remote management (WinRM) ¦ Gestion à distance (WinRM) ¦ Gestión remota (WinRM)
+Remote management (WinRM, secure) ¦ Gestion à distance (WinRM, sécurisé) ¦ Gestión remota (WinRM, segura)
+Remote play (PlayStation) ¦ Jeu à distance (PlayStation) ¦ Juego remoto (PlayStation)
+Remote screen sharing (Apple Remote Desktop) ¦ Partage d'écran à distance (Apple Remote Desktop) ¦ Pantalla compartida remota (Apple Remote Desktop)
+Search database (Elasticsearch) ¦ Base de recherche (Elasticsearch) ¦ Base de datos de búsqueda (Elasticsearch)
+Smart home messaging (CoAP) ¦ Messagerie de la maison connectée (CoAP) ¦ Mensajería del hogar inteligente (CoAP)
+Steam in-home streaming ¦ Diffusion de jeux à domicile (Steam) ¦ Transmisión de juegos en casa (Steam)
+VPN mesh (Tailscale) ¦ Réseau VPN maillé (Tailscale) ¦ Red VPN en malla (Tailscale)
+VPN mesh (ZeroTier) ¦ Réseau VPN maillé (ZeroTier) ¦ Red VPN en malla (ZeroTier)
+VPN tunnel (IPsec NAT-T) ¦ Tunnel VPN (IPsec NAT-T) ¦ Túnel VPN (IPsec NAT-T)
+VPN tunnel (IPsec) ¦ Tunnel VPN (IPsec) ¦ Túnel VPN (IPsec)
+VPN tunnel (L2TP) ¦ Tunnel VPN (L2TP) ¦ Túnel VPN (L2TP)
+VPN tunnel (OpenVPN) ¦ Tunnel VPN (OpenVPN) ¦ Túnel VPN (OpenVPN)
+VPN tunnel (PPTP, outdated) ¦ Tunnel VPN (PPTP, dépassé) ¦ Túnel VPN (PPTP, obsoleto)
+VPN tunnel (WireGuard) ¦ Tunnel VPN (WireGuard) ¦ Túnel VPN (WireGuard)
+Video/voice call relay (Google STUN) ¦ Relais d'appels audio/vidéo (Google STUN) ¦ Relé de llamadas de voz/vídeo (Google STUN)
+Video/voice call relay (STUN/TURN) ¦ Relais d'appels audio/vidéo (STUN/TURN) ¦ Relé de llamadas de voz/vídeo (STUN/TURN)
+Web admin (alternate port) ¦ Administration web (autre port) ¦ Administración web (puerto alternativo)
+Web service (alternate port) ¦ Service web (autre port) ¦ Servicio web (puerto alternativo)
+Windows Update sharing ¦ Partage des mises à jour Windows ¦ Uso compartido de Windows Update
+Windows remote management (RPC) ¦ Gestion à distance de Windows (RPC) ¦ Administración remota de Windows (RPC)
+iPhone/iPad sync ¦ Synchronisation iPhone/iPad ¦ Sincronización de iPhone/iPad
+Websites and web apps ¦ Sites et applications web ¦ Sitios y aplicaciones web
+Databases and data stores ¦ Bases de données et stockage ¦ Bases de datos y almacenamiento
+File sharing, printing and streaming ¦ Partage de fichiers, impression et diffusion ¦ Archivos compartidos, impresión y transmisión
+Remote access to this computer ¦ Accès à distance à cet ordinateur ¦ Acceso remoto a este equipo
+Developer tools ¦ Outils de développement ¦ Herramientas de desarrollo
+Apps ¦ Applications ¦ Aplicaciones
+System and network services ¦ Services du système et du réseau ¦ Servicios del sistema y de la red
+Not sure what these are ¦ Pas sûr de ce que c'est ¦ No está claro qué son
+Looks up website names (DNS) for this computer or your network. ¦ Recherche les noms des sites (DNS) pour cet ordinateur ou votre réseau. ¦ Busca los nombres de los sitios (DNS) para este equipo o su red.
+Part of Windows. ¦ Fait partie de Windows. ¦ Forma parte de Windows.
+A website or app being built on this computer. Open it in your browser to see it. ¦ Un site ou une application en cours de création sur cet ordinateur. Ouvrez-le dans votre navigateur pour le voir. ¦ Un sitio o una aplicación que se está creando en este equipo. Ábralo en su navegador para verlo.
+Notebooks you open in your browser (code, notes and charts). ¦ Des carnets que vous ouvrez dans votre navigateur (code, notes et graphiques). ¦ Cuadernos que abre en su navegador (código, notas y gráficos).
+A settings page for a program, opened in a browser. ¦ La page de réglages d'un programme, ouverte dans un navigateur. ¦ La página de ajustes de un programa, abierta en un navegador.
+A web server: it sends web pages to a browser. ¦ Un serveur web : il envoie des pages web à un navigateur. ¦ Un servidor web: envía páginas web a un navegador.
+A database: programs keep and read their data here. ¦ Une base de données : des programmes y gardent et y lisent leurs données. ¦ Una base de datos: los programas guardan y leen aquí sus datos.
+A fast store that apps use to keep data close at hand. ¦ Un stockage rapide où les applications gardent des données à portée de main. ¦ Un almacenamiento rápido donde las aplicaciones guardan datos a mano.
+Finds printers on your network so you can print to them. ¦ Trouve les imprimantes de votre réseau pour que vous puissiez y imprimer. ¦ Encuentra las impresoras de su red para que pueda imprimir en ellas.
+Printing: pages go through it on their way to a printer. ¦ Impression : les pages passent par lui avant d'arriver à une imprimante. ¦ Impresión: las páginas pasan por aquí camino de una impresora.
+Shares files and folders with other computers. ¦ Partage des fichiers et des dossiers avec d'autres ordinateurs. ¦ Comparte archivos y carpetas con otros equipos.
+Sends and receives files (an FTP-style file server). ¦ Envoie et reçoit des fichiers (un serveur de fichiers de type FTP). ¦ Envía y recibe archivos (un servidor de archivos tipo FTP).
+Lets other computers open files stored here. ¦ Permet à d'autres ordinateurs d'ouvrir les fichiers stockés ici. ¦ Permite que otros equipos abran los archivos guardados aquí.
+Keeps your files in step with other computers or the cloud. ¦ Garde vos fichiers à jour avec d'autres ordinateurs ou le cloud. ¦ Mantiene sus archivos al día con otros equipos o la nube.
+Sends files to nearby Apple devices (AirDrop). ¦ Envoie des fichiers aux appareils Apple à proximité (AirDrop). ¦ Envía archivos a dispositivos Apple cercanos (AirDrop).
+Lets phones and computers play sound or video through this computer. ¦ Permet aux téléphones et ordinateurs de lire du son ou de la vidéo sur cet ordinateur. ¦ Permite que teléfonos y equipos reproduzcan sonido o vídeo en este equipo.
+Shares your films, music and photos with other devices. ¦ Partage vos films, musiques et photos avec d'autres appareils. ¦ Comparte sus películas, música y fotos con otros dispositivos.
+Streams video or sound to other devices. ¦ Diffuse de la vidéo ou du son vers d'autres appareils. ¦ Transmite vídeo o sonido a otros dispositivos.
+Lets this computer cast to a TV. ¦ Permet à cet ordinateur de diffuser sur une télé. ¦ Permite que este equipo transmita a una tele.
+Lets someone sign in to this computer and type commands. Normal if you set it up; worth a look if you didn't. ¦ Permet à quelqu'un de se connecter à cet ordinateur et de taper des commandes. Normal si vous l'avez installé ; à vérifier sinon. ¦ Permite que alguien inicie sesión en este equipo y escriba órdenes. Normal si usted lo configuró; conviene revisarlo si no.
+Lets someone see and control this computer's screen. Normal if you set it up; worth a look if you didn't. ¦ Permet à quelqu'un de voir et de contrôler l'écran de cet ordinateur. Normal si vous l'avez installé ; à vérifier sinon. ¦ Permite que alguien vea y controle la pantalla de este equipo. Normal si usted lo configuró; conviene revisarlo si no.
+A remote-help tool: someone you give the code to can use this computer. ¦ Un outil d'aide à distance : la personne à qui vous donnez le code peut utiliser cet ordinateur. ¦ Una herramienta de ayuda remota: quien reciba el código puede usar este equipo.
+Lets an administrator manage this computer from elsewhere. ¦ Permet à un administrateur de gérer cet ordinateur à distance. ¦ Permite que un administrador gestione este equipo a distancia.
+Runs programs in containers for software development. ¦ Fait tourner des programmes dans des conteneurs pour le développement. ¦ Ejecuta programas en contenedores para el desarrollo de software.
+Runs AI models on this computer for apps that ask it. ¦ Fait tourner des modèles d'IA sur cet ordinateur pour les applications qui le demandent. ¦ Ejecuta modelos de IA en este equipo para las aplicaciones que lo piden.
+Passes messages between programs. ¦ Transmet des messages entre programmes. ¦ Pasa mensajes entre programas.
+Relays connections for other programs (a proxy). ¦ Relaie les connexions d'autres programmes (un proxy). ¦ Retransmite las conexiones de otros programas (un proxy).
+Part of an app installed on this computer. ¦ Fait partie d'une application installée sur cet ordinateur. ¦ Forma parte de una aplicación instalada en este equipo.
+Part of a game or game launcher. ¦ Fait partie d'un jeu ou d'un lanceur de jeux. ¦ Forma parte de un juego o de un lanzador de juegos.
+Part of a chat or calling app. ¦ Fait partie d'une application de messagerie ou d'appels. ¦ Forma parte de una aplicación de chat o de llamadas.
+Connects this computer with your phone. ¦ Relie cet ordinateur à votre téléphone. ¦ Conecta este equipo con su teléfono.
+Brings notifications to apps on this computer. ¦ Apporte les notifications aux applications de cet ordinateur. ¦ Lleva las notificaciones a las aplicaciones de este equipo.
+Syncs an iPhone or iPad. ¦ Synchronise un iPhone ou un iPad. ¦ Sincroniza un iPhone o un iPad.
+Talks to smart home devices. ¦ Communique avec les appareils de la maison connectée. ¦ Se comunica con los dispositivos del hogar inteligente.
+Lets devices on your network find each other by name. ¦ Permet aux appareils de votre réseau de se trouver par leur nom. ¦ Permite que los dispositivos de su red se encuentren por su nombre.
+Lets devices on your network find each other (TVs, printers, speakers). ¦ Permet aux appareils de votre réseau de se trouver (télés, imprimantes, enceintes). ¦ Permite que los dispositivos de su red se encuentren (teles, impresoras, altavoces).
+Lets your Apple devices work together (Handoff, copy and paste). ¦ Permet à vos appareils Apple de travailler ensemble (Handoff, copier-coller). ¦ Permite que sus dispositivos Apple trabajen juntos (Handoff, copiar y pegar).
+Hands out network addresses (DHCP). ¦ Distribue les adresses réseau (DHCP). ¦ Reparte las direcciones de red (DHCP).
+Keeps this computer's clock right. ¦ Garde l'horloge de cet ordinateur à l'heure. ¦ Mantiene en hora el reloj de este equipo.
+A VPN: connects this computer to another network. ¦ Un VPN : relie cet ordinateur à un autre réseau. ¦ Una VPN: conecta este equipo con otra red.
+Part of the operating system. ¦ Fait partie du système d'exploitation. ¦ Forma parte del sistema operativo.
+Collects the system's log messages. ¦ Recueille les messages du journal du système. ¦ Recoge los mensajes del registro del sistema.
+Answers network monitoring tools (SNMP). ¦ Répond aux outils de surveillance du réseau (SNMP). ¦ Responde a las herramientas de supervisión de red (SNMP).
+A company directory (users and computers). ¦ Un annuaire d'entreprise (utilisateurs et ordinateurs). ¦ Un directorio de empresa (usuarios y equipos).
+An email server or email app. ¦ Un serveur ou une application de messagerie. ¦ Un servidor o una aplicación de correo.
+MiniWireshark doesn't recognise it: look up the program's name. ¦ MiniWireshark ne le reconnaît pas : cherchez le nom du programme. ¦ MiniWireshark no lo reconoce: busque el nombre del programa.
+Select a service to read what it does and who runs it. ¦ Sélectionnez un service pour lire ce qu'il fait et qui le lance. ¦ Seleccione un servicio para leer qué hace y quién lo ejecuta.
+Cache server (memcached) ¦ Serveur de cache (memcached) ¦ Servidor de caché (memcached)
+Web server (Apache) ¦ Serveur web (Apache) ¦ Servidor web (Apache)
+Web server (lighttpd) ¦ Serveur web (lighttpd) ¦ Servidor web (lighttpd)
+Web server (Caddy) ¦ Serveur web (Caddy) ¦ Servidor web (Caddy)
+Notebook server (Jupyter) ¦ Serveur de carnets (Jupyter) ¦ Servidor de cuadernos (Jupyter)
+AI model server (Ollama) ¦ Serveur de modèles d'IA (Ollama) ¦ Servidor de modelos de IA (Ollama)
+Containers (Docker) ¦ Conteneurs (Docker) ¦ Contenedores (Docker)
+Printer discovery ¦ Recherche d'imprimantes ¦ Búsqueda de impresoras
+Printing (Windows) ¦ Impression (Windows) ¦ Impresión (Windows)
+Website lookup (DNS) ¦ Recherche de sites (DNS) ¦ Búsqueda de sitios (DNS)
+Network service directory (RPC) ¦ Annuaire des services réseau (RPC) ¦ Directorio de servicios de red (RPC)
+Nearby Apple devices (Continuity) ¦ Appareils Apple à proximité (Continuité) ¦ Dispositivos Apple cercanos (Continuidad)
+AirDrop and sharing ¦ AirDrop et partage ¦ AirDrop y compartir
+Phone link (KDE Connect) ¦ Lien avec le téléphone (KDE Connect) ¦ Enlace con el teléfono (KDE Connect)
+Remote support (TeamViewer) ¦ Assistance à distance (TeamViewer) ¦ Asistencia remota (TeamViewer)
+Remote support (AnyDesk) ¦ Assistance à distance (AnyDesk) ¦ Asistencia remota (AnyDesk)
+Music app (Spotify) ¦ Application de musique (Spotify) ¦ Aplicación de música (Spotify)
+Game launcher (Steam) ¦ Lanceur de jeux (Steam) ¦ Lanzador de juegos (Steam)
+Chat app (Discord) ¦ Application de discussion (Discord) ¦ Aplicación de chat (Discord)
+File sync (Dropbox) ¦ Synchronisation de fichiers (Dropbox) ¦ Sincronización de archivos (Dropbox)
+File sync (OneDrive) ¦ Synchronisation de fichiers (OneDrive) ¦ Sincronización de archivos (OneDrive)
+Video calls (Zoom) ¦ Appels vidéo (Zoom) ¦ Videollamadas (Zoom)
+Windows background service ¦ Service Windows en arrière-plan ¦ Servicio de Windows en segundo plano
+Windows sign-in (Kerberos) ¦ Connexion Windows (Kerberos) ¦ Inicio de sesión de Windows (Kerberos)
+System service (macOS) ¦ Service du système (macOS) ¦ Servicio del sistema (macOS)
+System service (systemd) ¦ Service du système (systemd) ¦ Servicio del sistema (systemd)
+Part of Windows itself ¦ Fait partie de Windows lui-même ¦ Forma parte del propio Windows
+Unknown service on port %d ¦ Service inconnu sur le port %d ¦ Servicio desconocido en el puerto %d
+Run by ¦ Lancé par ¦ Ejecutado por
+Service ¦ Service ¦ Servicio
 Only this computer can reach it ¦ Seul cet ordinateur peut le joindre ¦ Solo este equipo puede acceder
 Other devices on your network can reach it ¦ D'autres appareils de votre réseau peuvent le joindre ¦ Otros dispositivos de su red pueden acceder
 This computer only ¦ Cet ordinateur seulement ¦ Solo este equipo
@@ -32050,6 +33244,10 @@ the operating system ¦ le système d'exploitation ¦ el sistema operativo
 unknown program (needs admin rights to name it) ¦ programme inconnu (il faut les droits d'administrateur pour le nommer) ¦ programa desconocido (hacen falta derechos de administrador para nombrarlo)
 Database connection (MongoDB) ¦ Connexion à une base de données (MongoDB) ¦ Conexión a base de datos (MongoDB)
 Local services opened in your browser (this computer) ¦ Services locaux ouverts dans votre navigateur (cet ordinateur) ¦ Servicios locales abiertos en su navegador (este equipo)
+Local services checked for a web page (this computer) ¦ Services locaux vérifiés pour savoir s'ils sont une page web (cet ordinateur) ¦ Servicios locales comprobados para saber si son una página web (este equipo)
+Check which ones are web pages ¦ Vérifier lesquels sont des pages web ¦ Comprobar cuáles son páginas web
+Off by default. When on, MiniWireshark asks each service that may be a web page for its home page (one “GET /”), only on this computer, to show its title. Listed in “What MiniWireshark sent”; the kill switch stops it. ¦ Désactivé par défaut. Une fois activé, MiniWireshark demande sa page d'accueil (un seul « GET / ») à chaque service qui pourrait être une page web, uniquement sur cet ordinateur, pour afficher son titre. Listé dans « Ce que MiniWireshark a envoyé » ; l'arrêt d'urgence l'arrête. ¦ Desactivado por defecto. Al activarlo, MiniWireshark pide su página de inicio (un solo «GET /») a cada servicio que podría ser una página web, solo en este equipo, para mostrar su título. Aparece en «Lo que envió MiniWireshark»; el interruptor de corte lo detiene.
+MiniWireshark is running as administrator, so it doesn't open this page: your browser would run as administrator too. ¦ MiniWireshark fonctionne en administrateur, il n'ouvre donc pas cette page : votre navigateur fonctionnerait lui aussi en administrateur. ¦ MiniWireshark se ejecuta como administrador, así que no abre esta página: su navegador también se ejecutaría como administrador.
 Large upload at night ¦ Gros envoi pendant la nuit ¦ Gran subida durante la noche
 Regular check-ins to one server ¦ Contacts réguliers avec un même serveur ¦ Contactos regulares con un mismo servidor
 Data hidden in name lookups ¦ Données cachées dans des recherches de noms ¦ Datos ocultos en búsquedas de nombres
@@ -32162,7 +33360,157 @@ Usually your provider's DNS being slow or a congested connection; it isn't a sec
 Very often normal: cloud and content services are spread across many countries. Location databases can also be wrong. ¦ Très souvent normal : les services cloud et de contenu sont répartis dans de nombreux pays. Les bases de localisation peuvent aussi se tromper. ¦ Muy a menudo normal: los servicios en la nube y de contenidos están repartidos por muchos países. Las bases de datos de ubicación también pueden equivocarse.
 Website names aren't being resolved reliably right now. ¦ Les noms de sites ne sont pas traduits en adresses de façon fiable en ce moment. ¦ Los nombres de los sitios no se están resolviendo de forma fiable ahora mismo.
 little evidence ¦ peu d'indices ¦ pocos indicios
+The interrupted session can't be restored: its crash copy is incomplete or damaged. It was left in the sessions folder. ¦ La session interrompue ne peut pas être restaurée : sa copie après plantage est incomplète ou abîmée. Elle a été laissée dans le dossier des sessions. ¦ La sesión interrumpida no se puede restaurar: su copia tras un fallo está incompleta o dañada. Se ha dejado en la carpeta de sesiones.
+The interrupted session can't be restored: its crash copy couldn't be read or copied. ¦ La session interrompue ne peut pas être restaurée : sa copie après plantage n'a pas pu être lue ni copiée. ¦ La sesión interrumpida no se puede restaurar: su copia tras un fallo no se pudo leer ni copiar.
 A device appeared that I haven't seen in this session. ¦ Un appareil que je n'avais pas vu pendant cette session est apparu. ¦ Apareció un dispositivo que no había visto en esta sesión.
+# fourth audit (#40): the fixed sentences of the alerts that stayed English
+Open your router's connected-devices list and look for this device. ¦ Ouvrez la liste des appareils connectés de votre box et cherchez cet appareil. ¦ Abra la lista de dispositivos conectados de su router y busque este dispositivo.
+If it isn't yours or a guest's, change your Wi-Fi password and re-check. ¦ S'il n'est ni à vous ni à un invité, changez votre mot de passe Wi-Fi et vérifiez à nouveau. ¦ Si no es suyo ni de un invitado, cambie la contraseña de su Wi-Fi y vuelva a comprobarlo.
+Disconnect from this network on any device you're unsure about. ¦ Déconnectez de ce réseau tout appareil dont vous n'êtes pas sûr. ¦ Desconecte de esta red cualquier dispositivo del que no esté seguro.
+Open your router's admin page from a device you trust and check its connected devices. ¦ Ouvrez la page d'administration de votre box depuis un appareil de confiance et vérifiez ses appareils connectés. ¦ Abra la página de administración de su router desde un dispositivo de confianza y revise sus dispositivos conectados.
+Restart the router; if this returns immediately, look for a device that shouldn't be there. ¦ Redémarrez la box ; si cela revient aussitôt, cherchez un appareil qui ne devrait pas être là. ¦ Reinicie el router; si vuelve a pasar enseguida, busque un dispositivo que no debería estar ahí.
+Did you just restart, update or replace the router? If yes, this is expected. ¦ Venez-vous de redémarrer, mettre à jour ou remplacer la box ? Si oui, c'est normal. ¦ ¿Acaba de reiniciar, actualizar o sustituir el router? Si es así, es lo esperado.
+If not, check the router's admin page and its connected devices before trusting this network. ¦ Sinon, vérifiez la page d'administration de la box et ses appareils connectés avant de faire confiance à ce réseau. ¦ Si no, revise la página de administración del router y sus dispositivos conectados antes de confiar en esta red.
+Normal if you have a second router, a mesh system or a device sharing its connection (phone hotspot, VM host). ¦ Normal si vous avez un second routeur, un système maillé ou un appareil qui partage sa connexion (point d'accès d'un téléphone, hôte de machines virtuelles). ¦ Normal si tiene un segundo router, un sistema en malla o un dispositivo que comparte su conexión (punto de acceso de un teléfono, anfitrión de máquinas virtuales).
+Otherwise find that device: a rogue router announcement can redirect IPv6 traffic through it. ¦ Sinon, trouvez cet appareil : une fausse annonce de routeur peut faire passer le trafic IPv6 par lui. ¦ Si no, busque ese dispositivo: un anuncio de router falso puede desviar el tráfico IPv6 a través de él.
+Check whether a second router or access point was plugged in recently. ¦ Vérifiez si un second routeur ou point d'accès a été branché récemment. ¦ Compruebe si se ha conectado hace poco un segundo router o punto de acceso.
+Unplug anything you don't recognize and see whether the second DHCP server disappears. ¦ Débranchez ce que vous ne reconnaissez pas et regardez si le second serveur DHCP disparaît. ¦ Desconecte lo que no reconozca y compruebe si desaparece el segundo servidor DHCP.
+Is the device downloading an update, streaming or on a video call? ¦ L'appareil télécharge-t-il une mise à jour, diffuse-t-il une vidéo ou est-il en appel vidéo ? ¦ ¿El dispositivo está descargando una actualización, reproduciendo contenido o en una videollamada?
+If it should be idle, restart it or look at what it is running. ¦ S'il devrait être inactif, redémarrez-le ou regardez ce qu'il exécute. ¦ Si debería estar inactivo, reinícielo o mire qué está ejecutando.
+Give it time — confidence rises as more evidence arrives. ¦ Laissez-lui du temps : la confiance augmente à mesure que les indices arrivent. ¦ Dele tiempo: la confianza aumenta a medida que llegan más indicios.
+Compare its MAC address with the labels on your devices or your router's list. ¦ Comparez son adresse MAC avec les étiquettes de vos appareils ou la liste de votre box. ¦ Compare su dirección MAC con las etiquetas de sus dispositivos o la lista de su router.
+Check the device's Wi-Fi signal and its distance from the router. ¦ Vérifiez le signal Wi-Fi de l'appareil et sa distance à la box. ¦ Compruebe la señal Wi-Fi del dispositivo y su distancia al router.
+Look for power-saving or roaming settings on the device. ¦ Cherchez des réglages d'économie d'énergie ou d'itinérance sur l'appareil. ¦ Busque ajustes de ahorro de energía o de itinerancia en el dispositivo.
+Check for two devices set to the same fixed IP. ¦ Cherchez deux appareils réglés sur la même adresse IP fixe. ¦ Busque dos dispositivos configurados con la misma IP fija.
+Renew the lease (reconnect the device) and see if it stops. ¦ Renouvelez le bail (reconnectez l'appareil) et regardez si cela cesse. ¦ Renueve la concesión (vuelva a conectar el dispositivo) y compruebe si se detiene.
+Did you (or an app/VPN) just change DNS settings? Then this is expected. ¦ Vous (ou une application, un VPN) venez de changer les réglages DNS ? Alors c'est normal. ¦ ¿Usted (o una aplicación o VPN) acaba de cambiar los ajustes DNS? Entonces es lo esperado.
+Otherwise, check the DNS settings in your router and on the device. ¦ Sinon, vérifiez les réglages DNS de votre box et de l'appareil. ¦ Si no, revise los ajustes DNS de su router y del dispositivo.
+Check whether websites load normally right now. ¦ Vérifiez si les sites se chargent normalement en ce moment. ¦ Compruebe si los sitios web cargan con normalidad ahora mismo.
+If not, restart the router; if it persists, try a different DNS server or contact your provider. ¦ Sinon, redémarrez la box ; si cela persiste, essayez un autre serveur DNS ou contactez votre fournisseur. ¦ Si no, reinicie el router; si persiste, pruebe otro servidor DNS o contacte con su proveedor.
+Run the Health tab's checks to compare router and Internet response times. ¦ Lancez les vérifications de l'onglet Santé pour comparer les temps de réponse de la box et d'Internet. ¦ Ejecute las comprobaciones de la pestaña Salud para comparar los tiempos de respuesta del router y de Internet.
+Slow DNS is often your provider's — a different DNS server can help. ¦ Un DNS lent est souvent celui de votre fournisseur : un autre serveur DNS peut aider. ¦ Un DNS lento suele ser el de su proveedor: otro servidor DNS puede ayudar.
+Usually harmless: VPNs, browsers with secure DNS, and some apps use their own DNS servers. ¦ En général sans danger : les VPN, les navigateurs avec DNS sécurisé et certaines applications utilisent leurs propres serveurs DNS. ¦ Normalmente inofensivo: las VPN, los navegadores con DNS seguro y algunas aplicaciones usan sus propios servidores DNS.
+Is the device updating, syncing a cloud folder, or running a peer-to-peer app? ¦ L'appareil se met-il à jour, synchronise-t-il un dossier cloud ou exécute-t-il une application pair-à-pair ? ¦ ¿El dispositivo se está actualizando, sincronizando una carpeta en la nube o ejecutando una aplicación P2P?
+If it should be idle, look at what it is running. ¦ S'il devrait être inactif, regardez ce qu'il exécute. ¦ Si debería estar inactivo, mire qué está ejecutando.
+Browsers, games and updates open many connections; check what the device is doing. ¦ Les navigateurs, jeux et mises à jour ouvrent beaucoup de connexions ; regardez ce que fait l'appareil. ¦ Los navegadores, los juegos y las actualizaciones abren muchas conexiones; mire qué está haciendo el dispositivo.
+Restart the device if it should be idle. ¦ Redémarrez l'appareil s'il devrait être inactif. ¦ Reinicie el dispositivo si debería estar inactivo.
+Is the device backing up photos, uploading video, or on a video call? ¦ L'appareil sauvegarde-t-il des photos, envoie-t-il une vidéo ou est-il en appel vidéo ? ¦ ¿El dispositivo está haciendo copia de fotos, subiendo vídeo o en una videollamada?
+If not, check what it is running — large unexpected uploads are worth understanding. ¦ Sinon, regardez ce qu'il exécute : un gros envoi inattendu mérite d'être compris. ¦ Si no, mire qué está ejecutando: merece la pena entender una subida grande e inesperada.
+A website or service may be refusing connections. ¦ Un site ou un service refuse peut-être les connexions. ¦ Puede que un sitio web o un servicio esté rechazando conexiones.
+Firewalls and ad-blockers also cause resets; check if something isn't working. ¦ Les pare-feu et bloqueurs de publicité provoquent aussi des réinitialisations ; vérifiez si quelque chose ne fonctionne pas. ¦ Los cortafuegos y los bloqueadores de anuncios también causan restablecimientos; compruebe si algo no funciona.
+Did you just install or enable something on that device (e.g. file sharing, casting)? ¦ Venez-vous d'installer ou d'activer quelque chose sur cet appareil (par exemple partage de fichiers, diffusion) ? ¦ ¿Acaba de instalar o activar algo en ese dispositivo (por ejemplo, compartir archivos o enviar contenido)?
+Avoid entering passwords on services that are not encrypted. ¦ Évitez de saisir des mots de passe sur des services non chiffrés. ¦ Evite escribir contraseñas en servicios sin cifrar.
+Check whether the device/app offers a secure (TLS) option. ¦ Vérifiez si l'appareil ou l'application propose une option sécurisée (TLS). ¦ Compruebe si el dispositivo o la aplicación ofrece una opción segura (TLS).
+Make sure remote access on that device is something you set up on purpose. ¦ Vérifiez que l'accès à distance sur cet appareil est bien quelque chose que vous avez configuré volontairement. ¦ Asegúrese de que el acceso remoto en ese dispositivo es algo que configuró a propósito.
+Use strong passwords and turn the service off if you don't need it. ¦ Utilisez des mots de passe solides et désactivez le service si vous n'en avez pas besoin. ¦ Use contraseñas seguras y desactive el servicio si no lo necesita.
+Usually normal: content networks and cloud services live in many countries. ¦ En général normal : les réseaux de contenu et les services cloud sont présents dans de nombreux pays. ¦ Normalmente es normal: las redes de contenidos y los servicios en la nube están en muchos países.
+Only worth a look if the device should rarely use the Internet. ¦ À regarder seulement si l'appareil ne devrait que rarement utiliser Internet. ¦ Solo merece una revisión si el dispositivo debería usar Internet muy poco.
+A misbehaving device or a network loop can flood the network. ¦ Un appareil défaillant ou une boucle réseau peut inonder le réseau. ¦ Un dispositivo que funciona mal o un bucle de red puede inundar la red.
+Unplug recently added network cables/switches and see if it stops. ¦ Débranchez les câbles réseau ou commutateurs ajoutés récemment et regardez si cela cesse. ¦ Desconecte los cables de red o conmutadores añadidos hace poco y compruebe si se detiene.
+If you ran a network scanner yourself, this is expected. ¦ Si vous avez lancé vous-même un scanner réseau, c'est normal. ¦ Si usted mismo ejecutó un escáner de red, es lo esperado.
+Otherwise, find that device and check what software it is running. ¦ Sinon, trouvez cet appareil et regardez quels logiciels il exécute. ¦ Si no, busque ese dispositivo y mire qué programas ejecuta.
+Look at which device contacted it and whether that was expected (an app, an update, a link someone opened). ¦ Regardez quel appareil l'a contacté et si c'était attendu (une application, une mise à jour, un lien que quelqu'un a ouvert). ¦ Mire qué dispositivo lo contactó y si era lo esperado (una aplicación, una actualización, un enlace que alguien abrió).
+A list entry is a reason to look, not proof: shared servers and old entries are common. ¦ Une entrée dans une liste est une raison de regarder, pas une preuve : les serveurs partagés et les entrées anciennes sont courants. ¦ Una entrada en una lista es un motivo para mirar, no una prueba: los servidores compartidos y las entradas antiguas son habituales.
+Your router's hardware (MAC) address changed during this session. ¦ L'adresse matérielle (MAC) de votre box a changé pendant cette session. ¦ La dirección de hardware (MAC) de su router cambió durante esta sesión.
+The address is on a public list of malicious servers you turned on in the Components Center. ¦ L'adresse figure sur une liste publique de serveurs malveillants que vous avez activée dans le Centre des composants. ¦ La dirección está en una lista pública de servidores maliciosos que activó en el Centro de componentes.
+Two different hardware addresses claimed the same IP address. ¦ Deux adresses matérielles différentes ont revendiqué la même adresse IP. ¦ Dos direcciones de hardware distintas reclamaron la misma dirección IP.
+More than one device answered DHCP requests. ¦ Plus d'un appareil a répondu aux demandes DHCP. ¦ Más de un dispositivo respondió a las solicitudes DHCP.
+A device other than your router announced itself as an IPv6 router. ¦ Un appareil autre que votre box s'est annoncé comme routeur IPv6. ¦ Un dispositivo distinto de su router se anunció como router IPv6.
+The same address was claimed by different hardware back and forth within a minute. ¦ La même adresse a été revendiquée tour à tour par des matériels différents en moins d'une minute. ¦ La misma dirección fue reclamada alternativamente por hardware distinto en menos de un minuto.
+Traffic this minute is far above this device's own recent average. ¦ Le trafic de cette minute est bien au-dessus de la moyenne récente de cet appareil. ¦ El tráfico de este minuto está muy por encima de la media reciente de este dispositivo.
+The device stayed hard to identify after sending a number of packets. ¦ L'appareil est resté difficile à identifier après avoir envoyé un certain nombre de paquets. ¦ El dispositivo siguió siendo difícil de identificar después de enviar varios paquetes.
+The device went offline and came back many times in a short window. ¦ L'appareil s'est déconnecté puis est revenu de nombreuses fois en peu de temps. ¦ El dispositivo se desconectó y volvió muchas veces en poco tiempo.
+Your router's address keeps switching between devices ¦ L'adresse de votre box passe sans cesse d'un appareil à l'autre ¦ La dirección de su router cambia continuamente entre dispositivos
+Only minimal evidence is available for this device. ¦ Il n'y a que très peu d'indices pour cet appareil. ¦ Solo hay muy pocos indicios para este dispositivo.
+A new service on this computer can be reached by others ¦ Un nouveau service de cet ordinateur est joignable par d'autres ¦ Otros pueden acceder a un nuevo servicio de este equipo
+A new local-only service on this computer. ¦ Un nouveau service de cet ordinateur, joignable seulement en local. ¦ Un nuevo servicio de este equipo, accesible solo en local.
+Another device may be pretending to be your router (ARP spoofing), which lets it see your traffic. ¦ Un autre appareil se fait peut-être passer pour votre box (usurpation ARP), ce qui lui permet de voir votre trafic. ¦ Puede que otro dispositivo se haga pasar por su router (suplantación ARP), lo que le permite ver su tráfico.
+Another device may be pretending to be this address. ¦ Un autre appareil se fait peut-être passer pour cette adresse. ¦ Puede que otro dispositivo se haga pasar por esta dirección.
+your router ¦ votre box ¦ su router
+various servers ¦ divers serveurs ¦ varios servidores
+the Internet ¦ Internet ¦ Internet
+the network ¦ le réseau ¦ la red
+unknown ¦ inconnu ¦ desconocido
+none ¦ aucun ¦ ninguno
+MAC seen locally ¦ MAC vue sur le réseau local ¦ MAC vista en la red local
+ARP reply ¦ réponse ARP ¦ respuesta ARP
+IPv6 Neighbor Discovery ¦ découverte des voisins IPv6 ¦ descubrimiento de vecinos IPv6
+DHCP lease ¦ bail DHCP ¦ concesión DHCP
+DHCP request ¦ demande DHCP ¦ solicitud DHCP
+mDNS advertisement ¦ annonce mDNS ¦ anuncio mDNS
+SSDP advertisement ¦ annonce SSDP ¦ anuncio SSDP
+Windows name (NetBIOS) ¦ nom Windows (NetBIOS) ¦ nombre de Windows (NetBIOS)
+Local traffic ¦ trafic local ¦ tráfico local
+Vendor (OUI) match ¦ fabricant reconnu (OUI) ¦ fabricante reconocido (OUI)
+Reverse DNS ¦ DNS inverse ¦ DNS inverso
+Can receive AirPlay audio/video from Apple devices. ¦ Peut recevoir l'audio et la vidéo AirPlay des appareils Apple. ¦ Puede recibir audio y vídeo AirPlay de dispositivos Apple.
+Can receive streamed audio (AirPlay-compatible speaker). ¦ Peut recevoir de l'audio diffusé (enceinte compatible AirPlay). ¦ Puede recibir audio transmitido (altavoz compatible con AirPlay).
+Can receive casted audio/video (Chromecast-compatible). ¦ Peut recevoir de l'audio et de la vidéo diffusés (compatible Chromecast). ¦ Puede recibir audio y vídeo enviados (compatible con Chromecast).
+Can be used as a Spotify Connect speaker. ¦ Peut servir d'enceinte Spotify Connect. ¦ Puede usarse como altavoz de Spotify Connect.
+This looks like a Sonos speaker. ¦ Cela ressemble à une enceinte Sonos. ¦ Parece un altavoz Sonos.
+This is a network printer. ¦ C'est une imprimante réseau. ¦ Es una impresora de red.
+Supports Apple HomeKit smart-home control. ¦ Prend en charge la maison connectée Apple HomeKit. ¦ Admite el control de hogar inteligente Apple HomeKit.
+Supports the Matter smart-home standard. ¦ Prend en charge la norme de maison connectée Matter. ¦ Admite el estándar de hogar inteligente Matter.
+Can be controlled remotely over SSH — make sure that's expected. ¦ Peut être contrôlé à distance par SSH : vérifiez que c'est voulu. ¦ Se puede controlar a distancia por SSH: compruebe que es lo esperado.
+Shares files over the network (Windows/SMB file sharing). ¦ Partage des fichiers sur le réseau (partage de fichiers Windows/SMB). ¦ Comparte archivos en la red (uso compartido de archivos de Windows/SMB).
+Shares files over the network (Apple file sharing). ¦ Partage des fichiers sur le réseau (partage de fichiers Apple). ¦ Comparte archivos en la red (uso compartido de archivos de Apple).
+A computer sharing its presence on the network. ¦ Un ordinateur qui signale sa présence sur le réseau. ¦ Un ordenador que anuncia su presencia en la red.
+Supports NVIDIA GameStream. ¦ Prend en charge NVIDIA GameStream. ¦ Admite NVIDIA GameStream.
+This looks like an Xbox console. ¦ Cela ressemble à une console Xbox. ¦ Parece una consola Xbox.
+This looks like a PlayStation console. ¦ Cela ressemble à une console PlayStation. ¦ Parece una consola PlayStation.
+One of them may be a device pretending to be your router's DHCP server. ¦ L'un d'eux est peut-être un appareil qui se fait passer pour le serveur DHCP de votre box. ¦ Puede que uno de ellos sea un dispositivo que se hace pasar por el servidor DHCP de su router.
+Two devices answered DHCP with the same server address and gave different settings. ¦ Deux appareils ont répondu au DHCP avec la même adresse de serveur et ont donné des réglages différents. ¦ Dos dispositivos respondieron al DHCP con la misma dirección de servidor y dieron ajustes distintos.
+Smart-home gadgets, TVs and speakers check in with their maker's server on a timer. ¦ Les objets connectés, téléviseurs et enceintes contactent le serveur de leur fabricant à intervalles réguliers. ¦ Los dispositivos de hogar inteligente, televisores y altavoces contactan con el servidor de su fabricante a intervalos regulares.
+This is what these gadgets usually do. It matters if you don't know the server. ¦ C'est ce que font d'habitude ces appareils. C'est important si vous ne connaissez pas le serveur. ¦ Es lo que suelen hacer estos dispositivos. Importa si no conoce el servidor.
+A content delivery network's server holds files for many websites and apps; apps and TVs fetch from it on a timer. ¦ Le serveur d'un réseau de diffusion de contenu (CDN) stocke des fichiers pour de nombreux sites et applications ; applications et téléviseurs y puisent à intervalles réguliers. ¦ El servidor de una red de distribución de contenidos (CDN) guarda archivos de muchos sitios y aplicaciones; las aplicaciones y los televisores los descargan a intervalos regulares.
+News, pictures and updates are fetched like this. It matters if the device should be idle. ¦ Les actualités, images et mises à jour sont récupérées ainsi. C'est important si l'appareil devrait être inactif. ¦ Las noticias, imágenes y actualizaciones se descargan así. Importa si el dispositivo debería estar inactivo.
+A content delivery network's server, looked up by name, was contacted at nearly even intervals. ¦ Le serveur d'un réseau de diffusion de contenu, dont le nom a été cherché, a été contacté à intervalles presque réguliers. ¦ Se contactó con el servidor de una red de distribución de contenidos, cuyo nombre se buscó, a intervalos casi regulares.
+A gadget contacted a server it looked up by name, at nearly even intervals. ¦ Un objet connecté a contacté un serveur dont il avait cherché le nom, à intervalles presque réguliers. ¦ Un dispositivo conectado contactó con un servidor cuyo nombre había buscado, a intervalos casi regulares.
+tab ¦ onglet ¦ pestaña
+view ¦ vue ¦ vista
+action ¦ action ¦ acción
+workspace ¦ espace de travail ¦ espacio de trabajo
+your workspace ¦ votre espace de travail ¦ su espacio de trabajo
+recent filter ¦ filtre récent ¦ filtro reciente
+device ¦ appareil ¦ dispositivo
+host ¦ hôte ¦ host
+search ¦ recherche ¦ búsqueda
+Commands ¦ Commandes ¦ Comandos
+Tabs ¦ Onglets ¦ Pestañas
+Filters ¦ Filtres ¦ Filtros
+Recent ¦ Récents ¦ Recientes
+Suggested ¦ Suggestions ¦ Sugerencias
+Filter packets: ¦ Filtrer les paquets : ¦ Filtrar paquetes:
+Show device ¦ Afficher l'appareil ¦ Mostrar el dispositivo
+Search everything for ¦ Tout rechercher pour ¦ Buscar en todo
+{n} of {m} – keep typing ¦ {n} sur {m} – continuez à taper ¦ {n} de {m} – siga escribiendo
+Type a packet number, for example :123 ¦ Saisissez un numéro de paquet, par exemple :123 ¦ Escriba un número de paquete, por ejemplo :123
+Type to search. Start with > commands, @ devices, # packet number, / filter, ? help. Tab changes the group. ¦ Tapez pour chercher. Commencez par > commandes, @ appareils, # numéro de paquet, / filtre, ? aide. Tab change de groupe. ¦ Escriba para buscar. Empiece con > comandos, @ dispositivos, # número de paquete, / filtro, ? ayuda. Tab cambia de grupo.
+# ---- keyboard-only navigation (F6 / F7 / F8, tab strip, dividers)
+Next part of the window ¦ Partie suivante de la fenêtre ¦ Siguiente parte de la ventana
+Previous part of the window ¦ Partie précédente de la fenêtre ¦ Parte anterior de la ventana
+Go to the table ¦ Aller au tableau ¦ Ir a la tabla
+Show the keyboard shortcuts ¦ Afficher les raccourcis clavier ¦ Mostrar los atajos de teclado
+Beginner / Advanced view ¦ Vue Débutant / Avancé ¦ Vista Principiante / Avanzada
+Refresh this tab ¦ Actualiser cet onglet ¦ Actualizar esta pestaña
+Move the divider left ¦ Déplacer la séparation vers la gauche ¦ Mover el divisor a la izquierda
+Move the divider right ¦ Déplacer la séparation vers la droite ¦ Mover el divisor a la derecha
+Text boxes use that key (editing). ¦ Les champs de texte utilisent cette touche (édition). ¦ Los cuadros de texto usan esa tecla (edición).
+That key is used to move around the window. ¦ Cette touche sert à se déplacer dans la fenêtre. ¦ Esa tecla sirve para moverse por la ventana.
+Ctrl+Alt is used for typing letters on some keyboards. ¦ Ctrl+Alt sert à saisir des lettres sur certains claviers. ¦ Ctrl+Alt sirve para escribir letras en algunos teclados.
+Alt and a letter open the window's menus. ¦ Alt et une lettre ouvrent les menus de la fenêtre. ¦ Alt y una letra abren los menús de la ventana.
+A plain letter key types text. ¦ Une simple touche de lettre saisit du texte. ¦ Una simple tecla de letra escribe texto.
+Move the Packets list divider ¦ Déplacer la séparation de la liste des paquets ¦ Mover el divisor de la lista de paquetes
+Move along the tabs ¦ Se déplacer entre les onglets ¦ Moverse entre las pestañas
+Move between the sub-views ¦ Passer d'une sous-vue à l'autre ¦ Moverse entre las subvistas
+Move between the Dashboard cards ¦ Passer d'une carte du Tableau de bord à l'autre ¦ Moverse entre las tarjetas del Panel
+Move along the toolbar ¦ Se déplacer dans la barre d'outils ¦ Moverse por la barra de herramientas
+Now in the Advanced view (%s goes back to Beginner). ¦ Vue Avancé activée (%s revient à Débutant). ¦ Vista Avanzada activada (%s vuelve a Principiante).
+Now in the Beginner view (%s shows Advanced again). ¦ Vue Débutant activée (%s réaffiche Avancé). ¦ Vista Principiante activada (%s vuelve a mostrar Avanzada).
+Refreshed this tab. ¦ Onglet actualisé. ¦ Pestaña actualizada.
+%s: divider at %d%%. ¦ %s : séparation à %d %%. ¦ %s: divisor al %d %%.
+Packet list ¦ Liste des paquets ¦ Lista de paquetes
+There is no divider to move: show the Inspector (F2) first. ¦ Aucune séparation à déplacer : affichez d'abord l'inspecteur (F2). ¦ No hay divisor que mover: muestre antes el inspector (F2).
 """
 
 I18N = {"fr": {}, "es": {}}
@@ -32338,6 +33686,11 @@ I18N_PATTERNS = [
     (r"(-?\d+) dBm \((\w+)\), link (.+?), channel (.+?)\. (.+)",
      r"\1 dBm ({t2}), lien \3, canal \4. {t5}",
      r"\1 dBm ({t2}), enlace \3, canal \4. {t5}"),
+    # third audit (UI): the pieces of Health's "Your connection" Wi-Fi
+    # line, translated one by one (the line stayed English)
+    (r"(-?\d+) dBm \((\w+)\)", r"\1 dBm ({t2})", r"\1 dBm ({t2})"),
+    (r"link (\d+ Mbit/s)", r"lien \1", r"enlace \1"),
+    (r"channel (\d+(?: \([\d.]+ GHz\))?)", r"canal \1", r"canal \1"),
     (r"Router answered in (\d+) ms", r"La box a répondu en \1 ms",
      r"El router respondió en \1 ms"),
     # ---- V5 M11: reports, workspace, statistics and the explain line
@@ -32997,9 +34350,9 @@ EVENT_PATTERNS = [
      r"Conexión segura con \1 (HTTP/3 — el nombre se leyó del primer "
      r"paquete de la conexión)"),
     (r"(\S+) is at (\S+) \(Windows name\)", r"\1 est à \2 (nom Windows)",
-     r"\1 está en \2 (nombre de Windows)"),
+     r"\1 corresponde a \2 (nombre de Windows)"),
     (r"(\S+) is at (\S+) \(IPv6\)", r"\1 est à \2 (IPv6)",
-     r"\1 está en \2 (IPv6)"),
+     r"\1 corresponde a \2 (IPv6)"),
     (r"Router announcement \(IPv6\) — network (.+)", r"Annonce du routeur "
      r"(IPv6) — réseau \1", r"Anuncio del router (IPv6) — red \1"),
     (r"Announced itself: (.+)", r"S'est annoncé : \1", r"Se anunció: \1"),
@@ -33208,7 +34561,7 @@ EVENT_PATTERNS = [
      r"\1 marcado como {t2}"),
     (r"(\S+) announced itself \(gratuitous ARP\)", r"\1 s'est annoncé (ARP "
      r"gratuit)", r"\1 se anunció (ARP gratuito)"),
-    (r"(\S+) is at (\S+)", r"\1 est à \2", r"\1 está en \2"),
+    (r"(\S+) is at (\S+)", r"\1 est à \2", r"\1 corresponde a \2"),
 ]
 I18N_PATTERNS += EVENT_PATTERNS
 # second audit 2026-11-14 (#33-#37, #40): the new alerts' sentences
@@ -33444,6 +34797,179 @@ I18N_PATTERNS[:0] = [
      r"\1 affichés · \2 en mémoire · affichage en pause",
      r"\1 mostrados · \2 en memoria · vista en pausa"),
 ]
+# fourth audit (#40): alert sentences built from changing parts that
+# stayed English in French and Spanish. In front: the general "(.+) keeps
+# switching between devices" left "The address 192.168.1.5" in English.
+_A4_EVENT = [
+    (r"The address (\S+) keeps switching between devices",
+     r"L'adresse \1 passe sans cesse d'un appareil à l'autre",
+     r"La dirección \1 cambia continuamente entre dispositivos"),
+    (r"Two network cards of one device \(MAC (\S+) and MAC (\S+)\) are both "
+     r"answering for (\S+)",
+     r"Deux cartes réseau d'un même appareil (MAC \1 et MAC \2) répondent "
+     r"toutes les deux pour \3",
+     r"Dos tarjetas de red de un mismo dispositivo (MAC \1 y MAC \2) "
+     r"responden ambas por \3"),
+    (r"This computer's ARP cache disagrees about your router",
+     r"Le cache ARP de cet ordinateur contredit le réseau pour votre box",
+     r"La caché ARP de este equipo contradice a la red sobre su router"),
+    (r"This computer's ARP cache disagrees about (\S+)",
+     r"Le cache ARP de cet ordinateur contredit le réseau pour \1",
+     r"La caché ARP de este equipo contradice a la red sobre \1"),
+    (r"A device answers DHCP in your router's name: MAC (\S+)",
+     r"Un appareil répond au DHCP au nom de votre box : MAC \1",
+     r"Un dispositivo responde al DHCP en nombre de su router: MAC \1"),
+    (r"Two devices answer DHCP as (\S+) and hand out different settings",
+     r"Deux appareils répondent au DHCP en tant que \1 et donnent des "
+     r"réglages différents",
+     r"Dos dispositivos responden al DHCP como \1 y dan ajustes distintos"),
+]
+_A4_TEXT = [
+    (r"Two network cards of one device \(MAC (\S+) and MAC (\S+)\) are both "
+     r"answering for this address and for another address \((\S+)\)\. This "
+     r"is known as ARP flux, and is common on Linux machines with two "
+     r"network connections\.",
+     r"Deux cartes réseau d'un même appareil (MAC \1 et MAC \2) répondent "
+     r"toutes les deux pour cette adresse et pour une autre adresse (\3). "
+     r"On appelle cela « ARP flux » ; c'est courant sur les machines Linux "
+     r"avec deux connexions réseau.",
+     r"Dos tarjetas de red de un mismo dispositivo (MAC \1 y MAC \2) "
+     r"responden ambas por esta dirección y por otra dirección (\3). Esto "
+     r"se llama «ARP flux» y es habitual en equipos Linux con dos "
+     r"conexiones de red."),
+    (r"(\S+) was claimed by (\d+) different MAC addresses, which also both "
+     r"answer for (\S+)\.",
+     r"\1 a été revendiquée par \2 adresses MAC différentes, qui répondent "
+     r"aussi toutes les deux pour \3.",
+     r"\1 fue reclamada por \2 direcciones MAC distintas, que también "
+     r"responden ambas por \3."),
+    (r"([\d:]+): (\S+) claimed by (\S+)", r"\1 : \2 revendiquée par \3",
+     r"\1: \2 reclamada por \3"),
+    (r"also both answering for (\S+)",
+     r"les deux répondent aussi pour \1", r"ambas responden también por \1"),
+    (r"An IPv6 Router Advertisement came from (\S+) for (.+?)\. Routers "
+     r"announcing on this network: (.+)\.",
+     r"Une annonce de routeur IPv6 est venue de \1 pour \2. Routeurs qui "
+     r"s'annoncent sur ce réseau : \3.",
+     r"Llegó un anuncio de router IPv6 de \1 para \2. Routers que se "
+     r"anuncian en esta red: \3."),
+    (r"An IPv6 Router Advertisement came from (\S+)\. Routers announcing "
+     r"on this network: (.+)\.",
+     r"Une annonce de routeur IPv6 est venue de \1. Routeurs qui "
+     r"s'annoncent sur ce réseau : \2.",
+     r"Llegó un anuncio de router IPv6 de \1. Routers que se anuncian en "
+     r"esta red: \2."),
+    (r"RA from (\S+)", r"Annonce de routeur venue de \1",
+     r"Anuncio de router de \1"),
+    (r"prefix (\S+)", r"préfixe \1", r"prefijo \1"),
+    (r"Only (.+) evidence is available for this device\.",
+     "Seuls ces indices sont disponibles pour cet appareil : {t1}.",
+     "Solo hay estos indicios para este dispositivo: {t1}."),
+    (r"(\d+) reconnects in the last (\d+) minutes\.",
+     r"\1 reconnexions ces \2 dernières minutes.",
+     r"\1 reconexiones en los últimos \2 minutos."),
+    (r"It had been using (\S+) for its lookups and is now using (\S+)\.",
+     r"Il utilisait \1 pour ses recherches de noms et utilise maintenant "
+     r"\2.",
+     r"Usaba \1 para sus búsquedas de nombres y ahora usa \2."),
+    (r"Previous server: (.+)", r"Serveur précédent : \1",
+     r"Servidor anterior: \1"),
+    (r"New server: (.+)", r"Nouveau serveur : \1", r"Servidor nuevo: \1"),
+    (r"(\d+)% of the last (\d+) DNS lookups failed or got no answer "
+     r"\(servers: (.+)\)\.",
+     "\\1 % des \\2 dernières recherches DNS ont échoué ou sont restées "
+     "sans réponse (serveurs : {t3}).",
+     "El \\1 % de las últimas \\2 búsquedas DNS fallaron o no tuvieron "
+     "respuesta (servidores: {t3})."),
+    (r"The typical DNS answer took (\d+) ms over the last (\d+) lookups "
+     r"\((.+)\)\.",
+     "La réponse DNS typique a pris \\1 ms sur les \\2 dernières "
+     "recherches ({t3}).",
+     "La respuesta DNS típica tardó \\1 ms en las últimas \\2 búsquedas "
+     "({t3})."),
+    (r"Lookups went to: (.+)\.", r"Recherches envoyées à : \1.",
+     r"Las búsquedas fueron a: \1."),
+    (r"It opened a connection to (.+?) on port (\d+) \((.+)\), which it "
+     r"had never used before\.",
+     "Il a ouvert une connexion vers {t1} sur le port \\2 ({t3}), qu'il "
+     "n'avait jamais utilisé.",
+     "Abrió una conexión con {t1} en el puerto \\2 ({t3}), que nunca "
+     "había usado."),
+    (r"It opened a connection to (.+?) on port (\d+), which it had never "
+     r"used before\.",
+     "Il a ouvert une connexion vers {t1} sur le port \\2, qu'il n'avait "
+     "jamais utilisé.",
+     "Abrió una conexión con {t1} en el puerto \\2, que nunca había "
+     "usado."),
+    (r"New: port (\d+) \((.+)\)", "Nouveau : port \\1 ({t2})",
+     "Nuevo: puerto \\1 ({t2})"),
+    (r"New: port (\d+)", r"Nouveau : port \1", r"Nuevo: puerto \1"),
+    (r"A device I already knew began announcing a new network service: "
+     r"(.+?)\. (.+)",
+     "Un appareil que je connaissais déjà a commencé à annoncer un "
+     "nouveau service réseau : \\1. {t2}",
+     "Un dispositivo que ya conocía empezó a anunciar un nuevo servicio "
+     "de red: \\1. {t2}"),
+    (r"A device I already knew began announcing a new network service: "
+     r"(.+)\.",
+     r"Un appareil que je connaissais déjà a commencé à annoncer un "
+     r"nouveau service réseau : \1.",
+     r"Un dispositivo que ya conocía empezó a anunciar un nuevo servicio "
+     r"de red: \1."),
+    (r"Unencrypted (\S+) traffic with (.+) was observed\.",
+     r"Du trafic \1 non chiffré avec \2 a été observé.",
+     r"Se observó tráfico \1 sin cifrar con \2."),
+    (r"It accepted an? (.+) connection \(port (\d+)\) from (\S+)\.",
+     "Il a accepté une connexion {t1} (port \\2) depuis \\3.",
+     "Aceptó una conexión {t1} (puerto \\2) desde \\3."),
+    (r"It advertises the remote-access service “(.+)” over (.+)\.",
+     r"Il annonce le service d'accès à distance « \1 » via \2.",
+     r"Anuncia el servicio de acceso remoto «\1» mediante \2."),
+    (r"Your router forwards Internet port (\d+) to it \(UPnP\)\.",
+     r"Votre box lui redirige le port Internet \1 (UPnP).",
+     r"Su router le reenvía el puerto de Internet \1 (UPnP)."),
+    (r"It is reachable from (.+)\. Seen in this computer's own connection "
+     r"table\.",
+     "Il est joignable depuis {t1}. Vu dans la table des connexions de "
+     "cet ordinateur.",
+     "Es accesible desde {t1}. Visto en la tabla de conexiones de este "
+     "equipo."),
+    (r"This computer has (\S+) → (\S+), but on the network (\S+) answers "
+     r"from (.+)\.",
+     r"Cet ordinateur associe \1 → \2, mais sur le réseau \3 répond "
+     r"depuis \4.",
+     r"Este equipo tiene \1 → \2, pero en la red \3 responde desde \4."),
+    (r"It connected to (\S+), located in (.+) \(per the lookup database\), "
+     r"after its usual destinations were learned\.",
+     r"Il s'est connecté à \1 (pays : \2, d'après la base de "
+     r"localisation), après l'apprentissage de ses destinations "
+     r"habituelles.",
+     r"Se conectó a \1 (país: \2, según la base de datos de ubicación), "
+     r"después de aprender sus destinos habituales."),
+    (r"About (\d+) broadcast/multicast packets per second, mostly from "
+     r"(.+)\.",
+     r"Environ \1 paquets de diffusion (broadcast/multicast) par seconde, "
+     r"surtout de \2.",
+     r"Unos \1 paquetes de difusión (broadcast/multicast) por segundo, "
+     r"sobre todo de \2."),
+    (r"Answers as DHCP server (\S+) came from MAC (\S+) and from MAC "
+     r"(\S+)\. MAC \3 gives (\S+) as the router and (.+?) for name "
+     r"lookups; MAC \2 gives (\S+) and (.+?)\.((?: .+)?)",
+     "Des réponses en tant que serveur DHCP \\1 sont venues de la MAC \\2 "
+     "et de la MAC \\3. La MAC \\3 donne {t4} comme routeur et {t5} pour "
+     "les recherches de noms ; la MAC \\2 donne {t6} et {t7}.{t8}",
+     "Llegaron respuestas como servidor DHCP \\1 de la MAC \\2 y de la "
+     "MAC \\3. La MAC \\3 da {t4} como router y {t5} para las búsquedas "
+     "de nombres; la MAC \\2 da {t6} y {t7}.{t8}"),
+    (r"MAC (\S+) is your router's\.", r"La MAC \1 est celle de votre box.",
+     r"La MAC \1 es la de su router."),
+    (r"Second MAC: (\S+)", r"Seconde MAC : \1", r"Segunda MAC: \1"),
+    (r"About (\d+) broadcast/multicast packets per second\.",
+     r"Environ \1 paquets de diffusion (broadcast/multicast) par seconde.",
+     r"Unos \1 paquetes de difusión (broadcast/multicast) por segundo."),
+]
+EVENT_PATTERNS[:0] = _A4_EVENT
+I18N_PATTERNS[:0] = _A4_EVENT + _A4_TEXT
 I18N_PATTERNS.sort(key=lambda x: 0 if x[0].startswith(
     ("Online now", r"Offline since (\d\d")) else 1)
 _I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
@@ -33455,6 +34981,14 @@ I18N_REVERSE = {}          # shown translation -> English source
 _I18N_CACHE = {}
 
 
+def _i18n_post(post, loc):
+    """The label's trailing part in `loc`: French puts a space before the
+    colon ("Gravité :", third audit), the others keep it as it is."""
+    if loc == "fr" and post.startswith(":"):
+        return " " + post
+    return post
+
+
 def _i18n_lookup(s, table, loc):
     hit = table.get(s)
     if hit is not None:
@@ -33462,10 +34996,10 @@ def _i18n_lookup(s, table, loc):
     tries = [("", s, "")]
     m = _I18N_CORE.match(s)
     if m and m.group(2) and (m.group(1) or m.group(3)):
-        tries.append((m.group(1), m.group(2), m.group(3)))
+        tries.append((m.group(1), m.group(2), _i18n_post(m.group(3), loc)))
         hit = table.get(m.group(2))
         if hit is not None:
-            return m.group(1) + hit + m.group(3)
+            return m.group(1) + hit + _i18n_post(m.group(3), loc)
     for pre, core, post in tries:
         for rx, fr, es in _I18N_PATTERNS_RX:
             mm = rx.match(core)
@@ -33571,6 +35105,7 @@ def translate_cell(v):
     if not _CELL_WORDS:
         words = {"High", "Medium", "Low", "Unconfirmed", "Unknown",
                  "Private address", "Your router / gateway", "Active",
+                 "Your router",
                  "Idle", "Offline", "Expired", "Online", "Closing",
                  "Closed", "Open", "Encrypted", "Not encrypted", "INFO",
                  "WARNING", "DANGER", "New", "Acknowledged", "New (saved)",
@@ -33582,6 +35117,9 @@ def translate_cell(v):
                  "Device without a network address (self-assigned 169.254)"}
         words.update(FRIENDLY_PROTO.values())
         words.update(PORT_SERVICES.values())
+        # third audit (UI): the Websites "How we know" cell ("◉ Connected"
+        # stayed English in French and Spanish)
+        words.update(ASSOC_SHORT.values())
         words.update(DEVICE_CLASSES)
         for c in DEVICE_CLASSES:
             words.update((f"Likely {c}", f"Possibly {c}"))
@@ -33617,7 +35155,10 @@ def timeline_text(model, e):
     dev = reg.by_key.get(reg.resolve(key))
     if dev is None:
         return text
-    new = sentence_device_name(dev)
+    # third audit (UI): "This computer" / "Your router" when they have no
+    # name of their own, as the alerts say
+    namer = getattr(model, "alert_device_name", None)
+    new = namer(dev) if namer is not None else sentence_device_name(dev)
     if looks_like_address(new) and not looks_like_address(old):
         return text           # "A device got address …" stays readable
     return text.replace(old, new, 1) if new and new != old else text
@@ -33662,6 +35203,11 @@ def translate_event(text):
                 hit = ({"fr": f"Appareil {maker}",
                         "es": f"Dispositivo {maker}"}.get(loc, g1) +
                        hit[len(g1):])
+            elif g1 in ("This computer", "Your router") and \
+                    hit.startswith(g1):
+                # third audit (UI): the names the Timeline now gives this
+                # computer and the router stayed English in a sentence
+                hit = table.get(g1, g1) + hit[len(g1):]
             break
     if hit is not None:
         hit = translate_anonymous_labels(hit, loc)
@@ -34706,12 +36252,58 @@ def pack_while_set(widget, var, allowed=None, **pack):
     return sync
 
 
+def tree_cell_font():
+    """The font a table's cells are drawn in (the Treeview style's)."""
+    try:
+        spec = ttk.Style().lookup("Treeview", "font") or "TkDefaultFont"
+        if spec == "TkDefaultFont":
+            return tkfont.nametofont(spec)
+        return tkfont.Font(font=spec)
+    except (tk.TclError, RuntimeError):
+        return tkfont.nametofont("TkDefaultFont")
+
+
+def cell_texts_width(tree, col):
+    """The width the fixed texts set with fit_cell_texts need in `col`
+    (0 when none were set), measured in the cells' font as it is now."""
+    texts = (getattr(tree, "_mw_cell_texts", None) or {}).get(col)
+    if not texts:
+        return 0
+    font = tree_cell_font()
+    return max(text_width(font, t) for t in texts) + 16
+
+
+def fit_cell_texts(tree, col, texts):
+    """Fourth audit (UI): a column whose cells are a few fixed words (the
+    Alerts *Severity*: "⚠ AVERTISSEMENT" was cut to "AVERTISSEM") is
+    made wide enough for the longest of them, measured, and widened again
+    for a bigger text size (fit_heading)."""
+    store = getattr(tree, "_mw_cell_texts", None)
+    if store is None:
+        store = tree._mw_cell_texts = {}
+    store[col] = [t for t in texts if t]
+    fit_heading(tree, col)
+
+
 def fit_heading(tree, col):
     try:
         text = str(tree.heading(col, "text") or "")
-        if not text:
+        head = heading_width(text) + 20 if text else 0
+        need = max(head, cell_texts_width(tree, col))
+        if not need:
             return
-        need = heading_width(text) + 20
+        # a column share_tree_width narrowed for a small window keeps its
+        # heading here: the room its words need is the width it gets back
+        # (and the one saved for it) when the window is wide again. Taking
+        # it back now made the narrowing look like the person's own
+        # resize, so the column's own width was lost.
+        w0 = getattr(tree, "_mw_w0", None)
+        if w0 and col in w0:
+            if int(w0[col]) < need:
+                w0[col] = need
+            need = head
+            if not need:
+                return
         if int(tree.column(col, "width")) < need:
             tree.column(col, width=need, minwidth=min(need, 60))
     except (tk.TclError, ValueError, TypeError, RuntimeError):
@@ -34918,6 +36510,508 @@ def focus_ring(widget, color="#2b7de9", width=2):
     widget.bind("<FocusIn>", on, add="+")
     widget.bind("<FocusOut>", off, add="+")
     off()
+
+
+def key_mod_masks(platform=None):
+    """(Shift, Control, Alt) bit masks of a Tk key event's `state`, for
+    this platform. Tk numbers the bits differently: on Windows 0x8 is
+    NumLock (on by default) and Alt is 0x20000; on X11 Alt is Mod1 (0x8)
+    (0x20000 in a Tk that gives Alt its own bit, as the self-made events
+    of a test do; Mod2, 0x10, is NumLock there and never counts); on macOS Command is Mod1 (0x8) and Option is Mod2 (0x10), and both
+    count as "Alt" here (Command keys belong to the menus)."""
+    p = platform or sys.platform
+    if p == "win32":
+        return 0x1, 0x4, 0x20000
+    if p == "darwin":
+        return 0x1, 0x4, 0x8 | 0x10
+    return 0x1, 0x4, 0x8 | 0x20000
+
+
+def _modified(event, platform=None):
+    """True when Shift, Ctrl or Alt is down: a plain-arrow binding stands
+    aside, so Alt+Left (Back), Ctrl+Shift+Left (divider) and the rest
+    still reach their own bindings. (A "<Left>" binding also matches
+    Alt+Left and Shift+Left, and a "break" stops the "all" bindings after
+    it.) The one test every keyboard route uses; NumLock and CapsLock
+    never count (they are other bits on every platform)."""
+    try:
+        st = int(getattr(event, "state", 0))
+    except (TypeError, ValueError):
+        return False
+    return bool(st & sum(key_mod_masks(platform)))
+
+
+def key_held(event, *names, platform=None):
+    """True when every named modifier ("shift", "control", "alt") is down
+    in the key event, on this platform's bits."""
+    shift, ctrl, alt = key_mod_masks(platform)
+    bits = {"shift": shift, "control": ctrl, "alt": alt}
+    try:
+        st = int(getattr(event, "state", 0))
+    except (TypeError, ValueError):
+        return False
+    return all(st & bits[n] for n in names)
+
+
+def _selects_words(w):
+    """True for a box the user types into (Ctrl+Shift+arrows select words
+    there). A read-only Text (the Inspector, the details) is not one."""
+    if isinstance(w, (tk.Entry, ttk.Entry)):
+        return True
+    if isinstance(w, tk.Text):
+        with contextlib.suppress(tk.TclError):
+            return str(w.cget("state")) == "normal"
+    return False
+
+
+def shortcut_default_losers(shortcuts):
+    """The actions that keep their own DEFAULT key while another action
+    was given that same key: a key saved by an older version (Start on
+    F5) that a newer default (Refresh on F5) now shares. The customised
+    action keeps the key; the default one waits (bound per action, the
+    later would silently win)."""
+    norm = {n: _norm_seq(q) for n, q in shortcuts.items()
+            if q and isinstance(q, str)}
+    custom = {n for n, q in norm.items()
+              if q != _norm_seq(DEFAULT_SHORTCUTS.get(n, ""))}
+    return {n for n, q in norm.items()
+            if n not in custom and any(
+                o != n and norm[o] == q for o in custom)}
+
+
+def _shortcut_sequence(state, keysym, platform=None):
+    """The Tk sequence for a key pressed in the shortcut box, "<Control-
+    Shift-F6>", with this platform's own modifier bits (NumLock is not
+    Alt on Windows)."""
+    shift, ctrl, alt = key_mod_masks(platform)
+    state = int(state)
+    mods = []
+    if state & ctrl:
+        mods.append("Control")
+    if state & shift:
+        mods.append("Shift")
+    if state & alt:
+        mods.append("Alt")
+    return "<" + "-".join(mods + [keysym]) + ">"
+
+
+class RovingGroup:
+    """A row of buttons that is one Tab stop: Tab lands on the one used
+    last (Start at first), Left / Right / Home / End walk the row. A
+    member that is disabled or hidden is passed over. Nothing moves for
+    the mouse. The Tab stop is decided when Tab is pressed (a takefocus
+    command), so a button that is enabled later joins at once."""
+
+    def __init__(self, root, widgets, default=None):
+        self.widgets = list(widgets)
+        self.current = default or self.widgets[0]
+        cmd = root.register(self._takefocus)
+        for w in self.widgets:
+            w.configure(takefocus=cmd)
+            for seq, how in (("<Left>", -1), ("<Right>", 1),
+                             ("<Home>", "first"), ("<End>", "last")):
+                w.bind(seq, lambda e, h=how, w=w: None if _modified(e)
+                       else self.move(w, h))
+            w.bind("<FocusIn>", lambda e, w=w: self._note(w), add="+")
+        groups = root.__dict__.setdefault("_roving_groups", [])
+        groups.append(self)
+
+    def usable(self, w):
+        try:
+            if not w.winfo_viewable():
+                return False
+            if isinstance(w, ttk.Widget):
+                return not w.instate(["disabled"])
+            return str(w.cget("state")) != "disabled"
+        except tk.TclError:
+            return False
+
+    def _note(self, w):
+        self.current = w
+
+    def stop(self):
+        """The member Tab lands on, or None when none can be used."""
+        if self.usable(self.current):
+            return self.current
+        return next((w for w in self.widgets if self.usable(w)), None)
+
+    def _takefocus(self, path):
+        st = self.stop()
+        return 1 if st is not None and str(st) == str(path) else 0
+
+    def move(self, frm, how):
+        ok = [w for w in self.widgets if self.usable(w) or w is frm]
+        if frm not in ok:
+            return "break"
+        i = ok.index(frm)
+        j = 0 if how == "first" else len(ok) - 1 if how == "last" \
+            else (i + how) % len(ok)
+        with contextlib.suppress(tk.TclError):
+            ok[j].focus_set()
+        return "break"
+
+
+def make_label_button(widget, fn, color="#2b7de9"):
+    """A clickable tk.Label that the keyboard can use: a Tab stop with the
+    focus ring, run by Return, Enter and Space. The mouse binding stays
+    the caller's own."""
+    with contextlib.suppress(tk.TclError):
+        widget.configure(takefocus=1)
+    focus_ring(widget, color)
+
+    def run(_e=None):
+        fn()
+        return "break"
+    for seq in ("<Return>", "<KP_Enter>", "<space>"):
+        widget.bind(seq, run)
+    return widget
+
+# ---- keyboard routes for text panes, canvases and tables (slice B) ----------
+
+def make_readonly_focusable(txt, color="#2b7de9"):
+    """A read-only (disabled) Text takes part in Tab, shows where the
+    keyboard focus is, scrolls with the keys and still copies. Tk skips a
+    disabled Text when Tab walks the window, so Inspector, Help, the
+    packet details and every report were out of reach of a keyboard-only
+    user. A click focuses it too, so the keys work right after it."""
+    with contextlib.suppress(tk.TclError):
+        txt.configure(takefocus=1)
+    focus_ring(txt, color)
+
+    def top(_e=None):
+        txt.yview_moveto(0)
+        txt.xview_moveto(0)
+
+    def bottom(_e=None):
+        txt.yview_moveto(1)
+
+    def alone(fn):
+        def run(e):
+            if _modified(e):
+                return None
+            fn()
+            return "break"
+        return run
+    plain = {"Up": lambda: txt.yview_scroll(-1, "units"),
+             "Down": lambda: txt.yview_scroll(1, "units"),
+             "Prior": lambda: txt.yview_scroll(-1, "pages"),
+             "Next": lambda: txt.yview_scroll(1, "pages"),
+             "Left": lambda: txt.xview_scroll(-1, "units"),
+             "Right": lambda: txt.xview_scroll(1, "units"),
+             "Home": top, "End": bottom}
+    for key, fn in plain.items():
+        txt.bind(f"<Key-{key}>", alone(fn), add="+")
+    for seq, fn in (("<Control-Home>", top), ("<Control-End>", bottom)):
+        txt.bind(seq, lambda e, f=fn: (f(), "break")[1], add="+")
+
+    def select_all(_e=None):
+        with contextlib.suppress(tk.TclError):
+            txt.tag_add("sel", "1.0", "end-1c")
+        return "break"
+
+    def copy(_e=None):
+        with contextlib.suppress(tk.TclError):
+            text = txt.get("sel.first", "sel.last")
+            if text:
+                txt.clipboard_clear()
+                txt.clipboard_append(text)
+        return "break"
+    for seq in ("<Control-a>", "<Control-A>"):
+        txt.bind(seq, select_all, add="+")
+    for seq in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+        txt.bind(seq, copy, add="+")
+    txt.bind("<Button-1>", lambda e: txt.focus_set(), add="+")
+    return txt
+
+
+def canvas_focus_ring(c, color="#2b7de9", width=2):
+    """Tab reaches a canvas and a ring shows it has the focus. The ring is
+    four thin frames laid over the edges while it is focused, so the
+    canvas keeps its size and its coordinates (the Map hit-tests with the
+    pointer's own coordinates)."""
+    with contextlib.suppress(tk.TclError):
+        c.configure(takefocus=1)
+    edges = []
+
+    def on(_e=None):
+        if edges:
+            return
+        with contextlib.suppress(tk.TclError):
+            for kw in ({"relx": 0, "rely": 0, "relwidth": 1,
+                        "height": width},
+                       {"relx": 0, "rely": 1, "anchor": "sw",
+                        "relwidth": 1, "height": width},
+                       {"relx": 0, "rely": 0, "relheight": 1,
+                        "width": width},
+                       {"relx": 1, "rely": 0, "anchor": "ne",
+                        "relheight": 1, "width": width}):
+                f = tk.Frame(c, bg=color, bd=0, highlightthickness=0)
+                f.place(**kw)
+                edges.append(f)
+
+    def off(_e=None):
+        for f in edges:
+            with contextlib.suppress(tk.TclError):
+                f.destroy()
+        del edges[:]
+    c.bind("<FocusIn>", on, add="+")
+    c.bind("<FocusOut>", off, add="+")
+    c.bind("<Destroy>", off, add="+")
+
+
+def key_menu_event(widget, iid=None, x=None, y=None):
+    """What a right-click handler needs, for a key press: the position of
+    the row (or of the widget's top-left corner) in the widget's own
+    and in screen coordinates."""
+    if iid is not None and isinstance(widget, ttk.Treeview):
+        with contextlib.suppress(tk.TclError):
+            widget.see(iid)
+            widget.update_idletasks()
+            box = widget.bbox(iid)
+            if box:
+                x = box[0] + min(40, max(4, box[2] // 4)) if x is None \
+                    else x
+                y = box[1] + box[3] // 2
+    x = 4 if x is None else x
+    y = 4 if y is None else y
+    try:
+        rx, ry = widget.winfo_rootx(), widget.winfo_rooty()
+    except tk.TclError:
+        rx = ry = 0
+    return types.SimpleNamespace(x=x, y=y, x_root=rx + x, y_root=ry + y + 6,
+                                 widget=widget, keysym="Menu", state=0)
+
+
+def tree_cursor_row(tree):
+    """The row the keyboard is on: the focus row, else the selected one."""
+    with contextlib.suppress(tk.TclError):
+        f = tree.focus()
+        if f and tree.exists(f):
+            return f
+        sel = tree.selection()
+        if sel:
+            return sel[0]
+    return None
+
+
+def bind_context_keys(widget, handler, pos=None):
+    """The Menu key and Shift+F10 open what a right-click opens. Tk binds
+    <<ContextMenu>> to the mouse only. handler(event) is the right-click
+    handler; the event is placed on the focused row (pos(widget) may
+    give another event)."""
+    def go(_e):
+        ev = pos(widget) if pos else key_menu_event(
+            widget, tree_cursor_row(widget) if isinstance(
+                widget, ttk.Treeview) else None)
+        if ev is not None:
+            handler(ev)
+        return "break"
+    for seq in ("<Key-Menu>", "<Key-App>", "<Shift-F10>"):
+        # (<Key-App> is the Windows keysym of the Menu key; X11 has none)
+        with contextlib.suppress(tk.TclError):
+            widget.bind(seq, go, add="+")
+
+
+def bind_open(widget, handler):
+    """Enter (and the keypad's Enter) open the selected row, with the same
+    handler a double-click runs. A table with the keyboard on a row that
+    isn't selected yet opens that row."""
+    def run(e):
+        if _modified(e):
+            return None
+        if isinstance(widget, ttk.Treeview):
+            with contextlib.suppress(tk.TclError):
+                row = tree_cursor_row(widget)
+                if row and not widget.selection():
+                    widget.selection_set(row)
+        return handler(e)
+    for seq in ("<Return>", "<KP_Enter>"):
+        widget.bind(seq, run)
+
+
+def _tree_is_open(tree, iid):
+    with contextlib.suppress(tk.TclError):
+        return str(tree.item(iid, "open")).lower() in ("1", "true", "yes")
+    return False
+
+
+def tree_edge_row(tree, last=False):
+    """The first or the last row you can see (children of closed rows
+    don't count)."""
+    kids = tree.get_children("")
+    if not kids:
+        return None
+    if not last:
+        return kids[0]
+    row = kids[-1]
+    while _tree_is_open(tree, row):
+        sub = tree.get_children(row)
+        if not sub:
+            break
+        row = sub[-1]
+    return row
+
+
+def tree_visible_rows(tree):
+    out, stack = [], [iter(tree.get_children(""))]
+    while stack:
+        for iid in stack[-1]:
+            out.append(iid)
+            if _tree_is_open(tree, iid):
+                sub = tree.get_children(iid)
+                if sub:
+                    stack.append(iter(sub))
+                    break
+        else:
+            stack.pop()
+    return out
+
+
+def tree_nav_keys(tree):
+    """Home / End (and Ctrl+Home / Ctrl+End) go to the first / last row,
+    Shift+Home / Shift+End extend the selection to it, Ctrl+A selects every
+    row where the table allows more than one. Only 1 of 11 tables had
+    these."""
+    def mode():
+        with contextlib.suppress(tk.TclError):
+            return str(tree.cget("selectmode"))
+        return "none"
+
+    def go(last, extend=False, need_plain=False):
+        def run(e):
+            if need_plain and _modified(e):
+                return None
+            iid = tree_edge_row(tree, last)
+            if iid is None or mode() == "none":
+                return "break"
+            with contextlib.suppress(tk.TclError):
+                if extend and mode() == "extended":
+                    rows = tree_visible_rows(tree)
+                    here = tree_cursor_row(tree)
+                    a = rows.index(here) if here in rows else (
+                        len(rows) - 1 if last else 0)
+                    b = rows.index(iid)
+                    tree.selection_set(rows[min(a, b):max(a, b) + 1])
+                else:
+                    tree.selection_set(iid)
+                    tree.focus(iid)
+                tree.see(iid)
+            return "break"
+        return run
+    tree.bind("<Home>", go(False, need_plain=True))
+    tree.bind("<End>", go(True, need_plain=True))
+    tree.bind("<Control-Home>", go(False))
+    tree.bind("<Control-End>", go(True))
+    tree.bind("<Shift-Home>", go(False, extend=True))
+    tree.bind("<Shift-End>", go(True, extend=True))
+
+    def select_all(_e):
+        if mode() != "extended":
+            return None
+        with contextlib.suppress(tk.TclError):
+            tree.selection_set(tree_visible_rows(tree))
+        return "break"
+    for seq in ("<Control-a>", "<Control-A>"):
+        tree.bind(seq, select_all)
+
+
+HEADING_STATUS = [None]          # the status bar's .set (the App fills it)
+
+
+class HeadingKeys:
+    """Sort and column menu from the keyboard (the mouse needs a click or
+    a right-click on a heading). Shift+Left / Shift+Right move a cursor
+    along the headings (the status bar names the column), Shift+Enter or
+    Shift+Space sorts by it, Alt+Down or Ctrl+Shift+C opens the column
+    menu at it."""
+
+    def __init__(self, tree, cols, sort, menu=None, title=None,
+                 can_sort=None):
+        self.tree, self.cols, self.sort, self.menu = tree, cols, sort, menu
+        self.title = title or (lambda c: str(tree.heading(c, "text")).rstrip(
+            " ▲▼"))
+        self.can_sort = can_sort
+        self.col = None
+        # Ctrl+Shift+Left / Right are the window's divider keys: a Tk
+        # "<Shift-Left>" also matches them, so they pass through
+        tree.bind("<Shift-Left>", lambda e: self.move(-1, e))
+        tree.bind("<Shift-Right>", lambda e: self.move(1, e))
+        for seq in ("<Shift-Return>", "<Shift-KP_Enter>", "<Shift-space>"):
+            tree.bind(seq, self.sort_now)
+        if menu is not None:
+            for seq in ("<Alt-Down>", "<Control-Shift-C>",
+                        "<Control-Shift-c>"):
+                tree.bind(seq, self.open_menu)
+
+    def say(self, text):
+        sink = HEADING_STATUS[0]
+        if sink is not None:
+            with contextlib.suppress(tk.TclError, RuntimeError):
+                sink(text)
+
+    def _cols(self):
+        try:
+            return list(self.cols())
+        except tk.TclError:
+            return []
+
+    def current(self):
+        cols = self._cols()
+        if self.col not in cols:
+            self.col = cols[0] if cols else None
+        return self.col
+
+    def name(self, col):
+        with contextlib.suppress(tk.TclError):
+            return self.title(col) or translate_text("(icon)")
+        return str(col)
+
+    def move(self, d, event=None):
+        if event is not None and key_held(event, "control"):
+            return None
+        cols = self._cols()
+        if not cols:
+            return "break"
+        i = cols.index(self.col) + d if self.col in cols else (
+            0 if d > 0 else len(cols) - 1)
+        self.col = cols[max(0, min(i, len(cols) - 1))]
+        self.say(translate_text(
+            "Sort column: {col} — Shift+Enter sorts, Alt+Down opens the "
+            "column menu").replace("{col}", self.name(self.col)))
+        return "break"
+
+    def sort_now(self, _e=None):
+        col = self.current()
+        if col is None:
+            return "break"
+        if self.can_sort is not None and not self.can_sort():
+            self.say(translate_text("This table can't be sorted."))
+            return "break"
+        self.sort(col)
+        self.say(translate_text("Sorted by {col}").replace(
+            "{col}", self.name(col)))
+        return "break"
+
+    def pos(self):
+        """A stand-in right-click on the cursor column's heading."""
+        x = 0
+        with contextlib.suppress(tk.TclError, ValueError, IndexError):
+            cur = self.current()
+            shown = list(self.tree.cget("displaycolumns"))
+            if not shown or shown[0] == "#all":
+                shown = list(self.tree["columns"])
+            order = (["#0"] if "tree" in str(self.tree.cget("show")) else []
+                     ) + shown
+            total = sum(int(self.tree.column(c, "width")) for c in order)
+            for c in order[:order.index(cur)]:
+                x += int(self.tree.column(c, "width"))
+            x -= int(self.tree.xview()[0] * total)
+        return key_menu_event(self.tree, None, x=max(4, x + 6), y=4)
+
+    def open_menu(self, _e=None):
+        self.current()
+        self.menu(self.pos())
+        return "break"
 
 
 def _walk_class(root, cls):
@@ -36488,6 +38582,22 @@ SETTINGS_PAGES = [
               "label": "Internet tabs"},
              {"key": "shortcuts.group4", "type": "shortcut",
               "label": "Tools and help tabs"},
+             {"key": "shortcuts.regions", "type": "shortcut",
+              "label": "Next part of the window"},
+             {"key": "shortcuts.regions_back", "type": "shortcut",
+              "label": "Previous part of the window"},
+             {"key": "shortcuts.focus_table", "type": "shortcut",
+              "label": "Go to the table"},
+             {"key": "shortcuts.shortcut_sheet", "type": "shortcut",
+              "label": "Show the keyboard shortcuts"},
+             {"key": "shortcuts.mode_toggle", "type": "shortcut",
+              "label": "Beginner / Advanced view"},
+             {"key": "shortcuts.refresh", "type": "shortcut",
+              "label": "Refresh this tab"},
+             {"key": "shortcuts.pane_narrower", "type": "shortcut",
+              "label": "Move the divider left"},
+             {"key": "shortcuts.pane_wider", "type": "shortcut",
+              "label": "Move the divider right"},
          ]},
      ]},
     {"id": "data", "icon": "\U0001F4BE", "title": "Data & Export",
@@ -36680,6 +38790,39 @@ def person_ids():
     return uid, gid, name, home
 
 
+def _login_uid():
+    """The user whose login session started this process (Linux:
+    /proc/self/loginuid, kept through su and gksu), or None when it is
+    unset (4294967295), root's own (0) or can't be read."""
+    try:
+        with open("/proc/self/loginuid", encoding="ascii") as f:
+            uid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return uid if 0 < uid < 4294967295 else None
+
+
+def opener_ids():
+    """(uid, gid, user name, home) of the person a browser or file
+    manager is opened as: person_ids(), else, for a root copy that sudo
+    or pkexec didn't start (su, gksu, a root login), the user of the
+    login session it was started from (fifth audit), when that isn't
+    root. None: open as this process (not root, or a real root login)."""
+    ids = person_ids()
+    if ids is not None or IS_WINDOWS or os.geteuid() != 0 or \
+            _invoking_uid() is not None:
+        return ids
+    uid = _login_uid()
+    if uid is None:
+        return None
+    try:
+        import pwd
+        pw = pwd.getpwuid(uid)
+    except (ImportError, KeyError):
+        return None
+    return uid, pw.pw_gid, pw.pw_name, pw.pw_dir
+
+
 def start_for_person(cmd, **kw):
     """Second audit (security #4): start a program for the person (their
     browser, file manager or editor) as that person, never as root. A
@@ -36687,7 +38830,7 @@ def start_for_person(cmd, **kw):
     root, so a page from any local server ran in a root browser.
     -> the Popen."""
     env = env_for_outside(kw.pop("env", None))
-    ids = person_ids()
+    ids = opener_ids()
     if ids is None:
         return subprocess.Popen(cmd, env=env, **kw)
     uid, gid, name, home = ids
@@ -36714,7 +38857,7 @@ def open_in_browser(url, feature, dest, detail=""):
     (raises OutboundBlocked while the kill switch is on). A root copy
     opens it as the person (start_for_person). -> True when asked."""
     outbound(feature, "browser", dest, detail)
-    if person_ids() is not None:
+    if opener_ids() is not None:
         start_for_person(["open" if IS_MAC else "xdg-open", url],
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL)
@@ -36750,6 +38893,10 @@ class SettingsWindow:
     F_TITLE = ("TkDefaultFont", 15, "bold")
 
     def __init__(self, app, page="general"):
+        # third audit: the same sizes in TkDefaultFont's real family (see
+        # default_font); the class keeps the tuples as the reference
+        for attr in ("F_BASE", "F_HELP", "F_SECTION", "F_TITLE"):
+            setattr(self, attr, default_font(*getattr(self, attr)[1:]))
         self.app = app
         self.cfg = app.config
         self.defaults = _default_config()
@@ -36761,6 +38908,7 @@ class SettingsWindow:
                     if c.get("key"):
                         self.controls[c["key"]] = c
         self.errors = {}
+        self.warnings = {}        # older saved keys that now clash (no block)
         self._wrap = []
         self._deps = []
         self._nav = {}
@@ -36780,6 +38928,9 @@ class SettingsWindow:
         self.win.transient(app.root)
         self._create_vars()
         self.baseline = self._snapshot()
+        for key, c in self.controls.items():
+            if c["type"] == "shortcut":
+                self._validate(key)       # fills the warnings
         self._build_chrome()
         self.show_page(self.page_id)
         self.win.bind("<Escape>", lambda e: self.cancel())
@@ -36866,15 +39017,32 @@ class SettingsWindow:
                 return "That folder doesn't exist."
         elif c["type"] == "shortcut":
             seq = str(v.get()).strip()
+            msg = ""
             for other, ov in self.vars.items():
                 if other != key and self.controls[other]["type"] == "shortcut" \
-                        and str(ov.get()).strip() == seq and seq:
-                    return (f"Already used by "
-                            f"\u201c{self.controls[other]['label']}\u201d.")
+                        and seq and _norm_seq(str(ov.get())) == _norm_seq(
+                            seq):
+                    msg = (f"Already used by "
+                           f"\u201c{self.controls[other]['label']}\u201d.")
+                    break
+            if not msg:
+                # the keys the program or a text box keeps for itself
+                msg = shortcut_reserved(key.split(".", 1)[1], seq)
+            # a key saved by an older version that a newer default or
+            # reserved key now collides with, and that was not changed in
+            # this window: a warning (the other action keeps its key), not
+            # an error that blocks Apply for the whole window
+            if msg and str(v.get()) == getattr(self, "baseline", {}).get(
+                    key, None):
+                self.warnings[key] = msg
+                return ""
+            self.warnings.pop(key, None)
+            return msg
         return ""
 
     def _validate_all(self):
         self.errors = {}
+        self.warnings = {}
         for key in self.controls:
             msg = self._validate(key)
             if msg:
@@ -37455,7 +39623,7 @@ class SettingsWindow:
                     cv.create_rectangle(x, 8, x + 22, 30, fill=col,
                                         outline="")
                     cv.create_text(x + 30, 19, text=label, anchor="w",
-                                   fill=col, font=("TkDefaultFont", 10,
+                                   fill=col, font=default_font(10,
                                                    "bold"))
                     x += 150
                 x = 8
@@ -37539,8 +39707,10 @@ class SettingsWindow:
             return
         try:
             msg = self.errors.get(key, "")
-            if msg:
-                lbl.configure(text="\u26a0 " + msg)
+            note = self.warnings.get(key, "")
+            if msg or note:
+                lbl.configure(text=("\u26a0 " + msg) if msg else
+                              "\u2139 " + note)
                 lbl.pack(fill="x")
             else:
                 lbl.pack_forget()
@@ -37748,6 +39918,7 @@ class SettingsWindow:
             self.vars[key].set(bool(d) if c["type"] == "bool"
                                else ("" if d is None else str(d)))
         self.errors = {}
+        self.warnings = {}
         self.baseline = self._snapshot()
         self._build_chrome()
         self.show_page(self.page_id)
@@ -37886,6 +40057,7 @@ def enable_sorting(tree, on_sort=None):
 
     for c in tree["columns"]:
         tree.heading(c, command=lambda cc=c: do_sort(cc))
+    state["do"] = do_sort
     return state
 
 
@@ -37984,6 +40156,14 @@ def make_scrollable(parent, bg="#ffffff", fit_width=False):
     return outer, inner
 
 
+def tree_shown_columns(tree):
+    """The column ids a table shows, left to right (no tree column)."""
+    shown = list(tree.cget("displaycolumns"))
+    if not shown or shown[0] == "#all":
+        shown = list(tree["columns"])
+    return shown
+
+
 def make_tree(parent, columns, bg="#ffffff", show="headings",
               selectmode="browse", hscroll=False, sortable=True):
     """columns: list of (id, title, width, anchor, stretch)."""
@@ -38005,8 +40185,10 @@ def make_tree(parent, columns, bg="#ffffff", show="headings",
         hs.grid(row=1, column=0, sticky="ew")
     frame.rowconfigure(0, weight=1)
     frame.columnconfigure(0, weight=1)
+    tree_nav_keys(tree)
     if sortable:
-        enable_sorting(tree)
+        st = enable_sorting(tree)
+        HeadingKeys(tree, lambda: tree_shown_columns(tree), st["do"])
     return frame, tree
 
 
@@ -38297,6 +40479,15 @@ class TableKit:
         for c in ("#0",) + self.columns:
             with contextlib.suppress(tk.TclError):
                 tree.heading(c, command=lambda cc=c: self.sort_by(cc))
+        # the keyboard: Home / End / Ctrl+A, the row menu (Menu key,
+        # Shift+F10), and the heading's sort and column menu
+        tree_nav_keys(tree)
+        self.heading_keys = HeadingKeys(
+            tree, self.visible_cols, self.sort_by,
+            menu=self._heading_menu_at, can_sort=lambda: self.sortable)
+        for seq in ("<Key-Menu>", "<Key-App>", "<Shift-F10>"):
+            with contextlib.suppress(tk.TclError):
+                tree.bind(seq, self.key_menu)
         self.load()
         app.kits.append(self)
         self.empty_soon()
@@ -38976,7 +41167,8 @@ class TableKit:
 
     def copy_cell(self, iid, col):
         if col:
-            copy_to_clipboard(self.app, self.cell_text(iid, col))
+            copy_to_clipboard(self.app, safe_tsv_row([self.cell_text(
+                iid, col)]))
 
     def copy_row(self, iid):
         copy_to_clipboard(self.app, safe_tsv_row(self.row_cells(iid)))
@@ -39029,10 +41221,8 @@ class TableKit:
             w = safe_csv_writer(buf)
             for r in rows:
                 w.writerow(r)
-            tmp = path + ".part"
-            with open(tmp, "w", encoding="utf-8", newline="") as f:
-                f.write(buf.getvalue())
-            os.replace(tmp, path)
+            # third audit #2: never through a link planted at path.part
+            atomic_write_bytes(path, buf.getvalue().encode("utf-8"))
             return len(rows) - 1
 
         def ok(n):
@@ -39065,6 +41255,59 @@ class TableKit:
         items = self.row_items(iid, self._col_at(e.x))
         if items:
             popup_menu(self.app, e, items)
+        return "break"
+
+    def _heading_menu_at(self, ev):
+        popup_menu(self.app, ev, self.header_items())
+
+    def _cursor_row(self):
+        return tree_cursor_row(self.tree)
+
+    def bind_open(self, handler=None):
+        """Enter opens the selected row, with the handler the double-click
+        runs (handler(event)). With none: the row's Open action, else its
+        filter (the Happening feed's only one)."""
+        bind_open(self.tree, handler or self._open_row)
+
+    def _open_row(self, _e=None):
+        sel = self.tree.selection()
+        key = self.key_of(sel[0]) if sel else None
+        if key is None or not self.menu:
+            return None
+        spec = self.menu(key) or {}
+        fn = spec.get("open") or spec.get("filter")
+        if fn:
+            fn()
+        return None
+
+    def sort_items(self):
+        """Sort by ▸ each shown column (a tick on the one in use)."""
+        if not self.sortable:
+            return []
+        out = []
+        for c in self.visible_cols():
+            title = str(self.tree.heading(c, "text")).rstrip(" ▲▼") or \
+                translate_text("(icon)")
+            out.append((title, lambda cc=c: self.sort_by(cc), True,
+                        c == self.sort_col))
+        return [("Sort by", out)] if out else []
+
+    def key_menu(self, _e=None):
+        """Menu key / Shift+F10: the row menu at the row the keyboard is
+        on (the heading's menu when there is no row), with Sort and
+        columns at its end."""
+        iid = self._cursor_row()
+        ev = key_menu_event(self.tree, iid)
+        tail = self.sort_items() + self.header_items()
+        if iid is None:
+            popup_menu(self.app, ev, tail)
+            return "break"
+        if iid not in self.tree.selection():
+            self.tree.selection_set(iid)
+        self.tree.focus(iid)
+        col = self.heading_keys.col
+        items = list(self.row_items(iid, col)) or []
+        popup_menu(self.app, ev, items + [None, ("Sort and columns", tail)])
         return "break"
 
     def header_items(self):
@@ -39136,7 +41379,7 @@ def mw_font(size, *style):
         return name
     except (tk.TclError, RuntimeError):
         pass
-    actual = tkfont.Font(font=("TkDefaultFont", size) + tuple(style)).actual()
+    actual = tkfont.Font(font=(_mw_family(), size) + tuple(style)).actual()
     scale = MW_FONT_SCALE[0]
     # keep the Font object: when it is garbage-collected, Tk deletes the
     # named font
@@ -39150,6 +41393,35 @@ def mw_font(size, *style):
 
 
 MW_FONT_SCALE = [1.0]
+
+
+def default_font(size, *style):
+    """Third audit: a font tuple of TkDefaultFont's family at a fixed
+    size, for the canvases, table tags, the table style and Settings,
+    which carried their own ("TkDefaultFont", n) tuples. Tk reads that as
+    an unknown family: right with Xft, the bitmap "fixed" font at one size
+    on a Tk without Xft. Unlike mw_font it does not follow the text size
+    (the callers size it themselves, or stay as they were)."""
+    return (_mw_family(), size) + tuple(style)
+
+
+def _mw_family():
+    """The family mw_font builds on. In a font tuple Tk reads
+    "TkDefaultFont" as a family name, not the named font. On X11 with
+    Xft, fontconfig maps that unknown name to the default sans, which is
+    TkDefaultFont's own family. A Tk without Xft (the Pythons uv
+    installs, python-build-standalone) falls back to the bitmap "fixed"
+    font at one size instead: every header was then 9 pt "fixed" and
+    the text size did nothing (third audit). On X11 we name
+    TkDefaultFont's real family; Windows and macOS keep the tuple."""
+    try:
+        if str(tk._default_root.tk.call("tk", "windowingsystem")) == "x11":
+            fam = tkfont.nametofont("TkDefaultFont").actual("family")
+            if fam:
+                return fam
+    except (tk.TclError, RuntimeError, AttributeError):
+        pass
+    return "TkDefaultFont"
 
 
 def scale_mw_fonts(scale):
@@ -39279,6 +41551,11 @@ def safe_tsv_row(cells):
 
 def copy_to_clipboard(app, text):
     text = hide_credentials(scrub_secrets(text))
+    # fourth audit: one value copied on its own (a domain, a device's
+    # name, a packet's summary or field) is pasted into a spreadsheet as
+    # a cell too, so a single line gets the formula guard of a copied row
+    if "\n" not in text and "\r" not in text:
+        text = safe_tsv_row(text.split("\t"))
     try:
         app.root.clipboard_clear()
         app.root.clipboard_append(text)
@@ -39318,6 +41595,7 @@ class DetailDialog:
                            font=mw_font(10),
                            insertbackground=t["text_fg"],
                            highlightthickness=0)
+        make_readonly_focusable(self.txt)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set)
         vs.pack(side="right", fill="y")
@@ -39610,7 +41888,38 @@ class Charts:
         if f is None:
             f = cls._FONTS[spec] = cls._Measured(
                 tkfont.Font(root=c, font=spec))
+            cls._hold(c, f.font, spec)
         return f
+
+    @staticmethod
+    def _hold(c, *fonts):
+        """Round 4: keeps a chart font loaded in Tk. Tk unloads a font
+        that no widget uses as soon as a measure is done. On a Tk without
+        Xft (the Pythons uv installs) the next measure of a text with a
+        sign outside Latin-1 ("–", "…") then searches every font of the X
+        server for it again: ~11 ms a measure, so the Health tab's
+        histogram took ~95 ms to redraw after each text-size change
+        (busy 157-276 ms against 130). A hidden canvas holds one empty
+        item per font; Tk then keeps the font and what it found."""
+        with contextlib.suppress(tk.TclError, AttributeError):
+            root = c._root()
+            keep = getattr(root, "_mw_font_keep", None)
+            if keep is None or not keep.winfo_exists():
+                keep = root._mw_font_keep = tk.Canvas(
+                    root, width=1, height=1, highlightthickness=0)
+                keep._mw_light_ok = True      # never shown
+            for font in fonts:
+                keep.create_text(0, 0, text="", font=font)
+
+    @classmethod
+    def held_fonts(cls, root):
+        """The fonts the hidden canvas keeps loaded (tests)."""
+        keep = getattr(root, "_mw_font_keep", None)
+        out = set()
+        with contextlib.suppress(tk.TclError, AttributeError):
+            for item in keep.find_all():
+                out.add(str(keep.itemcget(item, "font")))
+        return out
 
     @classmethod
     def forget_fonts(cls):
@@ -39643,7 +41952,7 @@ class Charts:
         labels and the title are measured so that none of them overlap
         (V5.0.2: they did with long labels, translations or a short
         chart)."""
-        small, bold = ("TkDefaultFont", 8), ("TkDefaultFont", 10, "bold")
+        small, bold = default_font(8), default_font(10, "bold")
         fs, fb = cls.font(c, small), cls.font(c, bold)
         title = translate_text(title)
         tw = fb.measure(title) if title else 0
@@ -39706,7 +42015,7 @@ class Charts:
                       fill=t["muted_fg"], text=x1, font=small)
         if vmax <= 0:
             c.create_text(left + pw / 2, top + ph / 2, text=empty,
-                          fill=t["muted_fg"], font=("TkDefaultFont", 9))
+                          fill=t["muted_fg"], font=default_font(9))
         for i, (label, vals, color) in enumerate(series):
             if not vals:
                 continue
@@ -39729,6 +42038,11 @@ class Charts:
         if recs is None:
             recs = c._mw_chart = OrderedDict()
             c.bind("<Button-3>", lambda e: cls.chart_menu(c, e), add="+")
+            # the keyboard reaches the chart's data too
+            canvas_focus_ring(c)
+            bind_context_keys(c, lambda e: cls.chart_menu(c, e),
+                              pos=lambda w: key_menu_event(w, None, x=12,
+                                                           y=12))
         recs[title or f"chart {len(recs) + 1}"] = {
             "anchor": anchor, "header": header, "rows": rows,
             "fmt": fmt, "texts": texts, "note": note}
@@ -39797,8 +42111,8 @@ class Charts:
         """items: list of (label, value, value_text, click_key). Labels
         and values are cut to their column, so a long device name or a
         value never runs into the chart beside it."""
-        bold, norm, small = (("TkDefaultFont", 10, "bold"),
-                             ("TkDefaultFont", 9), ("TkDefaultFont", 8))
+        bold, norm, small = (default_font(10, "bold"),
+                             default_font(9), default_font(8))
         tid = c.create_text(x, y, anchor="nw", text=cls.elide(
             c, translate_text(title), bold, w), fill=t["text_fg"],
             font=bold)
@@ -40070,6 +42384,15 @@ class BaseTab:
                            self.show_subview(n))
             b.pack(side="left", padx=(0, 4))
             self._sub_btns[n] = b
+            # one Tab stop for the row (the shown one, set in
+            # _style_subviews); arrows move along it
+            for seq, how in (("<Left>", -1), ("<Right>", 1),
+                             ("<Home>", "first"), ("<End>", "last")):
+                b.bind(seq, lambda e, h=how: None if _modified(e)
+                       else self._subview_move(h))
+            for seq in ("<Return>", "<KP_Enter>", "<Down>"):
+                b.bind(seq, lambda e: None if _modified(e)
+                       else self._subview_enter())
         self.subview = names[0]
         self._sub_frames[names[0]].pack(fill="both", expand=True)
         self._style_subviews()
@@ -40079,7 +42402,40 @@ class BaseTab:
         for n, b in getattr(self, "_sub_btns", {}).items():
             with contextlib.suppress(tk.TclError):
                 b.configure(style="Sub.Accent.TButton" if n == self.subview
-                            else "Sub.TButton")
+                            else "Sub.TButton",
+                            takefocus=1 if n == self.subview else 0)
+
+    def _subview_move(self, how):
+        """Left / Right / Home / End on a sub-view button: show the
+        neighbour sub-view and keep the focus on its button."""
+        names = list(getattr(self, "_sub_btns", {}))
+        if not names:
+            return "break"
+        i = names.index(self.subview) if self.subview in names else 0
+        j = 0 if how == "first" else len(names) - 1 if how == "last" \
+            else (i + how) % len(names)
+        self.show_subview(names[j])
+        with contextlib.suppress(tk.TclError):
+            self._sub_btns[names[j]].focus_set()
+        return "break"
+
+    def _subview_enter(self):
+        """Enter / Down on a sub-view button: into the sub-view's content
+        (the first control after the row, inside the shown sub-view)."""
+        btn = self._sub_btns.get(self.subview)
+        frame = self._sub_frames.get(self.subview)
+        if btn is None or frame is None:
+            return "break"
+        with contextlib.suppress(tk.TclError):
+            w, prefix = btn, str(frame) + "."
+            for _ in range(80):
+                w = w.tk_focusNext()
+                if w is None or w is btn:
+                    break
+                if str(w).startswith(prefix) and w.winfo_viewable():
+                    w.focus_set()
+                    break
+        return "break"
 
     def show_subview(self, name):
         if name not in getattr(self, "_sub_frames", {}):
@@ -40176,6 +42532,8 @@ class Inspector:
                          cursor="hand2")
         close.pack(side="right")
         close.bind("<Button-1>", lambda e: app.toggle_inspector(False))
+        make_label_button(close, lambda: app.toggle_inspector(False))
+        self.close_btn = close
         Tooltip(close, "Hide the inspector (F2 shows it again)")
         body = tk.Frame(self.frame, bg=WHITE)
         body.pack(fill="both", expand=True, padx=(8, 4))
@@ -40183,6 +42541,7 @@ class Inspector:
                            relief="flat", highlightthickness=0, padx=4,
                            pady=4, cursor="arrow", width=40,
                            font=mw_font(10))
+        make_readonly_focusable(self.txt)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set, state="disabled")
         vs.pack(side="right", fill="y")
@@ -40650,7 +43009,8 @@ class DashboardTab(BaseTab):
             self.big_vars[key] = v
             for w in (card, tl, vl):
                 w.bind("<Button-1>", lambda e, c=cmd: c())
-            card.bind("<Return>", lambda e, c=cmd: c())
+            card.configure(highlightcolor="#2b7de9")
+            self._card_keys(card, cmd)
             self.big.columnconfigure(i, weight=1, uniform="big")
         grid = tk.Frame(outer, bg=WHITE)
         grid.pack(fill="x")
@@ -40682,7 +43042,7 @@ class DashboardTab(BaseTab):
             self.vars[key] = v
             for w in (card, tl, vl):
                 w.bind("<Button-1>", lambda e, tg=target: self.app.goto(tg))
-            card.bind("<Return>", lambda e, tg=target: self.app.goto(tg))
+            self._card_keys(card, lambda tg=target: self.app.goto(tg))
             Tooltip(card, "Click to open the details.")
         for c in range(6):
             grid.columnconfigure(c, weight=1, uniform="card")
@@ -40702,6 +43062,53 @@ class DashboardTab(BaseTab):
                ("new", "What is new?"))
     ANSWER_FG = {"good": "#0b6b3a", "warn": "#8a5a00", "bad": "#8a1a08",
                  "muted": "#666666", "": "#222222"}
+
+    def _card_keys(self, card, fn):
+        """Return and Space open a card; the arrow keys move to the
+        neighbouring card, row by row as the cards are laid out (the grid
+        goes from six columns to three on a narrow window)."""
+        cards = self.__dict__.setdefault("_kb_cards", [])
+        cards.append(card)
+
+        def go(_e=None):
+            fn()
+            return "break"
+        for seq in ("<Return>", "<KP_Enter>", "<space>"):
+            card.bind(seq, go)
+        for seq, d in (("<Left>", (-1, 0)), ("<Right>", (1, 0)),
+                       ("<Up>", (0, -1)), ("<Down>", (0, 1))):
+            card.bind(seq, lambda e, d=d, c=card: None if _modified(e)
+                      else self._card_move(c, d))
+
+    def _card_move(self, card, d):
+        """The card to the left / right in the same row, or the nearest
+        one in the row above / below; stays put at an edge."""
+        try:
+            cx = card.winfo_rootx() + card.winfo_width() / 2
+            cy = card.winfo_rooty() + card.winfo_height() / 2
+            half = max(4, card.winfo_height() / 2)
+            best, key = None, None
+            for c in self._kb_cards:
+                if c is card or not c.winfo_viewable():
+                    continue
+                x = c.winfo_rootx() + c.winfo_width() / 2
+                y = c.winfo_rooty() + c.winfo_height() / 2
+                same_row = abs(y - cy) < half
+                if d[0]:
+                    if not same_row or (x - cx) * d[0] <= 0:
+                        continue
+                    k = abs(x - cx)
+                else:
+                    if same_row or (y - cy) * d[1] <= 0:
+                        continue
+                    k = (abs(y - cy), abs(x - cx))
+                if key is None or k < key:
+                    best, key = c, k
+            if best is not None:
+                best.focus_set()
+        except tk.TclError:
+            pass
+        return "break"
 
     def _build_answers(self, outer):
         box = tk.Frame(outer, bg=WHITE)
@@ -40728,7 +43135,7 @@ class DashboardTab(BaseTab):
             more.pack(anchor="w")
             for w in (card, q, a, more):
                 w.bind("<Button-1>", lambda e, k=key: self._answer_show(k))
-            card.bind("<Return>", lambda e, k=key: self._answer_show(k))
+            self._card_keys(card, lambda k=key: self._answer_show(k))
             card.bind("<Configure>", lambda e, lb=a: self._fit_answer(
                 lb, e.width), add="+")
             self.answer_lbls[key] = a
@@ -40739,6 +43146,7 @@ class DashboardTab(BaseTab):
         self.honest_lbl.pack(fill="x", padx=4, pady=(2, 8))
         self.honest_lbl.bind("<Button-1>",
                              lambda e: self.app.open_coverage())
+        make_label_button(self.honest_lbl, self.app.open_coverage)
         Tooltip(self.honest_lbl, "What this computer can and can't see "
                                  "from where it is — click for details.")
 
@@ -40767,7 +43175,7 @@ class DashboardTab(BaseTab):
         more.pack(side="right")
         for w in (card, title, self.story_lbl, more):
             w.bind("<Button-1>", lambda e: self.app.open_story())
-        card.bind("<Return>", lambda e: self.app.open_story())
+        self._card_keys(card, self.app.open_story)
         Tooltip(card, "The changes of the last days in plain sentences, "
                       "with what is new since you last looked.")
         self.story_card = card
@@ -40802,7 +43210,7 @@ class DashboardTab(BaseTab):
                               expand=True)
         for w in (card, title, self.unusual_lbl, more):
             w.bind("<Button-1>", lambda e: self.app.open_unusual())
-        card.bind("<Return>", lambda e: self.app.open_unusual())
+        self._card_keys(card, self.app.open_unusual)
         Tooltip(card, "Things a device did that differ from what it "
                       "usually does, each with the worrying and the "
                       "innocent reading.")
@@ -41118,6 +43526,7 @@ class FeedTab(BaseTab):
         self.kit = TableKit(self, self.tree, wrap, "feed",
                             key_of=lambda iid: iid, menu=self.menu_spec,
                             sortable=False)
+        self.kit.bind_open()          # no double-click here: Enter filters
         self.restyle()
         self.refresh()
 
@@ -41426,6 +43835,7 @@ class TimelineTab(BaseTab):
                             else None,
                             empty_state=self.empty_state,
                             menu=self.menu_spec, sortable=False)
+        self.kit.bind_open(self._on_double)
         self.pending = []
         self._rebuild_job = None
         self.on_theme()
@@ -41498,7 +43908,7 @@ class TimelineTab(BaseTab):
                 c.create_line(x, 0, x, h, fill=t["warn_fg"], width=2)
                 c.create_text(min(w - 30, x + 4), 2, anchor="nw",
                               text=hm_clock(asof), fill=t["warn_fg"],
-                              font=("TkDefaultFont", 8, "bold"))
+                              font=default_font(8, "bold"))
 
     def _strip_click(self, e):
         with contextlib.suppress(tk.TclError):
@@ -41624,11 +44034,11 @@ class TimelineTab(BaseTab):
                 self.tree.tag_configure(sev, foreground=fg,
                                         background=bg or "")
         with contextlib.suppress(tk.TclError):
-            self.tree.tag_configure("episode", font=("TkDefaultFont", 10,
+            self.tree.tag_configure("episode", font=default_font(10,
                                                      "bold"),
                                     background=self.t["card_bg"])
             self.tree.tag_configure("story_mark", foreground=self.t[
-                "warn_fg"], font=("TkDefaultFont", 9, "bold"))
+                "warn_fg"], font=default_font(9, "bold"))
 
     def _schedule_rebuild(self):
         if self._rebuild_job:
@@ -42383,6 +44793,7 @@ class WebsitesTab(BaseTab):
             relative={"last": self._site_last}, dot_col="#0",
             menu=self.menu_spec, all_keys=self._all_keys,
             explain=self.explain_row)
+        self.kit.bind_open(self._details)
         self._job = None
         self._dirty = False
         self.count_lbl = self.lbl(bar, "", muted=True)
@@ -42822,6 +45233,7 @@ class ConnectionsTab(BaseTab):
                          "packets": lambda k: flow(k, "packets"),
                          "id": lambda k: k if isinstance(k, int) else None},
             menu=self.menu_spec)
+        self.kit.bind_open(self._details)
         self._apply_grouping()
         self.apply_mode()
 
@@ -43213,6 +45625,7 @@ class MailView:
         wrap, self.tree = make_tree(frame, self.COLS, hscroll=True)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", self._details)
+        bind_open(self.tree, self._details)
         self.bar = bar
 
     def _full_power(self):
@@ -43353,14 +45766,18 @@ class LocalServicesView:
     tab (psutil). Each row says what the program probably is and whether
     other devices can reach it; a web app opens in the browser at
     127.0.0.1, through the outbound() gate. Reading the list sends
-    nothing."""
+    nothing; "Check which ones are web pages" (off by default, third
+    audit #1) asks the likely web ports "GET /", on this computer only."""
 
-    COLS = [("port", "Port", 60, "e", False),
-            ("proto", "Protocol", 76, "w", False),
-            ("what", "What it probably is", 200, "w", True),
-            ("safety", "Who can reach it", 250, "w", True),
-            ("program", "Program", 160, "w", True),
-            ("listens", "Listens on", 200, "w", True)]
+    # third audit (owner): grouped by kind, the name in the tree column,
+    # then a plain line saying what it does and the program behind it
+    COLS = [("about", "What it does", 300, "w", True),
+            ("program", "Run by", 150, "w", True),
+            ("safety", "Who can reach it", 220, "w", True),
+            ("port", "Port", 60, "e", False),
+            ("proto", "Protocol", 70, "w", False),
+            ("listens", "Listens on", 170, "w", True)]
+    NAME_COL = ("Service", 250)
     POLL_MS = 150
     READ_TIMEOUT = 8.0           # s: give up waiting for one read
     AUTO_EVERY = 15.0            # s: read again while shown, not watching
@@ -43413,24 +45830,51 @@ class LocalServicesView:
                                    command=self.open_selected,
                                    state="disabled")
         self.open_btn.pack(side="left", padx=(6, 0))
+        self.probe_var = tk.BooleanVar(value=bool(self.app.config.get(
+            "local_services.probe", False)))
+        if FEATURES.get("local_probe", True):
+            cb = ttk.Checkbutton(bar, text="Check which ones are web pages",
+                                 variable=self.probe_var,
+                                 command=self._set_probe)
+            cb.pack(side="left", padx=(12, 0))
+            Tooltip(cb, "Off by default. When on, MiniWireshark asks each "
+                        "service that may be a web page for its home page "
+                        "(one “GET /”), only on this computer, to show its "
+                        "title. Listed in “What MiniWireshark sent”; the "
+                        "kill switch stops it.")
         self.count_lbl = tk.Label(bar, text="", bg=WHITE, fg="#666666")
         self.count_lbl.pack(side="right")
         # shown only when some programs couldn't be named or listed
         self.note_lbl = tk.Label(frame, text="", bg=WHITE, fg="#8a5a00",
                                  wraplength=1000, justify="left",
                                  anchor="w", padx=12, font=mw_font(9))
-        wrap, self.tree = make_tree(frame, self.COLS, hscroll=True)
+        wrap, self.tree = make_tree(frame, self.COLS, hscroll=True,
+                                    show="tree headings")
+        self.tree.heading("#0", text=self.NAME_COL[0], anchor="w")
+        self.tree.column("#0", width=self.NAME_COL[1], minwidth=120,
+                         stretch=True)
+        self.tree.tag_configure("kind", font=mw_font(10, "bold"))
+        # the selected service in full sentences: a table cell is cut at
+        # its column's width, this line wraps
+        self.detail_lbl = tk.Label(
+            frame, text="Select a service to read what it does and who "
+            "runs it.", bg=WHITE, fg="#333333", wraplength=1000,
+            justify="left", anchor="w", padx=12, font=mw_font(9))
+        self.detail_lbl.pack(side="bottom", fill="x", pady=(0, 6))
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.wrap = wrap
+        self.iid_group = {}          # heading row -> ("kind", key)
         self.tree.bind("<Double-1>", self._double)
         self.tree.bind("<Return>", self._double)
         self.tree.bind("<<TreeviewSelect>>",
                        lambda e: self._sync_buttons(), add="+")
         self.kit = TableKit(
             tab, self.tree, wrap, "local_services",
-            key_of=lambda iid: self._key(self.iid_row.get(iid)),
+            key_of=lambda iid: self._key(self.iid_row.get(iid)) or
+            self.iid_group.get(iid),
             empty_state=self.empty_state,
-            sort_values={"port": lambda k: k[1] if k else None},
+            sort_values={"port": lambda k: k[1] if k and
+                         isinstance(k[1], int) else None},
             menu=self.menu_spec)
 
     @staticmethod
@@ -43548,17 +45992,35 @@ class LocalServicesView:
         except tk.TclError:
             return False
         self.iid_row.clear()
+        self.iid_group.clear()
         self.kit.clear()
         pick = None
+        # third audit (owner): under one heading per kind, in a fixed
+        # order, each heading with its count; empty headings are left out
+        by_kind = {}
         for r in rows:
-            key = self._key(r)
-            vals = self.kit.decorate(key, local_service_cells(r))
-            idx, slot = self.kit.insert_index("", key, vals)
-            iid = tree.insert("", idx, values=vals)
-            self.iid_row[iid] = r
-            self.kit.inserted("", iid, slot, key)
-            if key == want:
-                pick = iid
+            by_kind.setdefault(r.get("kind") or "unknown", []).append(r)
+        for kind, heading in LOCAL_KINDS:
+            members = by_kind.get(kind)
+            if not members:
+                continue
+            gkey = ("kind", kind)
+            text = f"{translate_text(heading)} ({len(members)})"
+            giid = tree.insert("", "end", text=text, values=(),
+                               open=True, tags=("kind",))
+            self.iid_group[giid] = gkey
+            for r in members:
+                key = self._key(r)
+                name, cells = local_service_view_cells(r)
+                vals = self.kit.decorate(key, cells)
+                name = self.kit.decorate_text(key, name)
+                idx, slot = self.kit.insert_index(giid, key, vals,
+                                                  text=name)
+                iid = tree.insert(giid, idx, text=name, values=vals)
+                self.iid_row[iid] = r
+                self.kit.inserted(giid, iid, slot, key)
+                if key == want:
+                    pick = iid
         with contextlib.suppress(tk.TclError):
             if pick is not None:
                 tree.selection_set(pick)
@@ -43586,20 +46048,33 @@ class LocalServicesView:
     def _start_probes(self, rows, own):
         """Ask the ports not asked yet "GET /" in the background (at most 8
         at a time); the table shows the answers when they are in. Not
-        for fixture rows, nor in Demo Mode (it sends nothing)."""
+        for fixture rows, nor in Demo Mode (it sends nothing), and only
+        when the person turned it on (local_services.probe, third audit
+        #1). The ledger lists each scan once, with the number of ports
+        asked; a port asked again over HTTPS has its own line."""
         if self.source is not None or \
-                getattr(self.app, "data_mode", "") == "demo":
+                getattr(self.app, "data_mode", "") == "demo" or \
+                not FEATURES.get("local_probe", True) or \
+                not self.app.config.get("local_services.probe", False):
             return False
         todo = [r["probe"] for r in rows
                 if r["probe"] and r["probe"] not in self.probes]
         if not todo:
+            return False
+        try:
+            outbound("local_probe", "http", "this computer",
+                     "GET / to %d port(s) of this computer" % len(todo),
+                     count=len(todo))
+        except OutboundBlocked:
+            for k in todo:            # not again until Refresh
+                self.probes[k] = None
             return False
         probes = self.probes          # Refresh starts a new one
 
         def one(k):
             port, _prog, host = k
             try:
-                probes[k] = probe_local_http(host, port, own)
+                probes[k] = probe_local_http(host, port, own, record=False)
             except (OSError, ValueError):            # the kill switch too
                 pass
 
@@ -43616,6 +46091,16 @@ class LocalServicesView:
         for k in todo:                # one is running: asked after it
             probes.pop(k, None)
         return False
+
+    def _set_probe(self):
+        """The "Check which ones are web pages" switch: saved; on asks
+        now, off forgets the answers (the port-based guess again)."""
+        on = bool(self.probe_var.get())
+        self.app.config.set("local_services.probe", on)
+        self.app.config.save()
+        if not on:
+            self.probes = {}
+        self.refresh(force=True)
 
     def empty_state(self):
         if self.reading():
@@ -43646,6 +46131,19 @@ class LocalServicesView:
         with contextlib.suppress(tk.TclError):
             self.open_btn.configure(
                 state="normal" if r is not None and r["url"] else "disabled")
+            self.detail_lbl.configure(text=self.detail_text(r))
+
+    @staticmethod
+    def detail_text(r):
+        """The selected service in words (third audit): its name, what it
+        does, the program running it and who can reach it."""
+        tt = translate_text
+        if r is None:
+            return tt("Select a service to read what it does and who runs "
+                      "it.")
+        name, (about, prog, safety, _p, _pr, _l) = \
+            local_service_view_cells(r)
+        return f"{name}: {about}  {tt('Run by')}: {prog}.  {safety}."
 
     def menu_spec(self, key):
         r = next((x for x in self.rows if self._key(x) == key), None)
@@ -43664,8 +46162,9 @@ class LocalServicesView:
 
     def _double(self, _e=None):
         r = self.selected_row()
-        if r is not None:
-            self.open_service(r)
+        if r is None:
+            return None              # a heading: opens or closes as usual
+        self.open_service(r)
         return "break"
 
     def open_selected(self):
@@ -43691,6 +46190,16 @@ class LocalServicesView:
             self.app._set_banner(tt(
                 "Demo Mode: this service is made up, so nothing is "
                 "opened."), "info")
+            return False
+        if is_admin() and opener_ids() is None:
+            # third audit #3: administrator with nobody to open it as (a
+            # root login, an elevated Windows copy): never a root browser
+            self.app._set_banner(
+                tt("MiniWireshark is running as administrator, so it "
+                   "doesn't open this page: your browser would run as "
+                   "administrator too.") + " " +
+                tt("To open it yourself, type this address in your "
+                   "browser:") + " " + url, "warn")
             return False
         parts = urllib.parse.urlsplit(url)
         try:
@@ -43787,6 +46296,7 @@ class RemoteTab(BaseTab):
                 "first": lambda k: host(k, lambda r: r.first_seen)},
             relative={"last": lambda k: host(k, lambda r: r.last_seen)},
             menu=self.menu_spec)
+        self.kit.bind_open(self._details)
 
     def _host(self, ip, fn):
         r = self.model.remote_hosts.get(ip)
@@ -44035,7 +46545,18 @@ class AlertsTab(BaseTab):
             dot_col="reason", menu=self.menu_spec,
             all_keys=lambda: list(self.model.alerts.alerts),
             explain=self.explain_row)
+        # fourth audit (UI): French "⚠ AVERTISSEMENT" was cut to
+        # "AVERTISSEM"; the column fits the longest severity of every
+        # language, so a language change needs no new width
+        fit_cell_texts(self.tree, "sev", self.severity_texts())
         self.on_theme()
+
+    def severity_texts(self):
+        """Every Severity cell this table can show, in every language."""
+        icons = self.app.SEVERITY_ICON
+        return [translate_text(f"{icons.get(sev, '')} {sev}", loc)
+                for loc in I18N_LOCALES
+                for sev in ("INFO", "WARNING", "DANGER")]
 
     def explain_row(self, aid):
         a = self.model.alerts.alerts.get(aid)
@@ -44116,14 +46637,26 @@ class AlertsTab(BaseTab):
         if q:
             dev = self.model.registry.by_key.get(a.device_key)
             hay = " ".join([a.reason, a.kind, a.device_key,
-                            dev.display_name() if dev else ""]).lower()
+                            dev.display_name() if dev else "",
+                            self.related_name(dev) if dev else ""]).lower()
             if q not in hay:
                 return False
         return True
 
+    def related_name(self, dev):
+        """The *Related to* cell: the device's name, but "This computer"
+        and "Your router" for those two when they have no name of their
+        own, as the alert titles and the Timeline say (fourth audit: the
+        cell said "Device using a private Wi-Fi address" next to the
+        title "This computer offers remote access")."""
+        n = dev.display_name()
+        namer = getattr(self.model, "alert_device_name", None)
+        own = namer(dev) if namer is not None else n
+        return own if own in ("This computer", "Your router") else n
+
     def values(self, a):
         dev = self.model.registry.by_key.get(a.device_key)
-        who = dev.display_name() if dev else (a.device_key.replace(
+        who = self.related_name(dev) if dev else (a.device_key.replace(
             "ip:", "") or "—")
         icon = self.app.SEVERITY_ICON.get(a.severity, "")
         status = "Acknowledged" if a.acknowledged else "New"
@@ -44369,6 +46902,10 @@ class MapTab(BaseTab):
         self.c.bind("<Motion>", self._hover)
         self.c.bind("<Button-3>", self._context)
         self.c.bind("<Button-2>", self._context)
+        # the keyboard: Tab reaches the map (with a ring), Menu key and
+        # Shift+F10 open the selected node's menu
+        canvas_focus_ring(self.c)
+        bind_context_keys(self.c, self._context, pos=self._key_pos)
         self.c.bind("<MouseWheel>", lambda e: self.zoom(1.1 if e.delta > 0
                                                         else 0.9))
         self.c.bind("<Button-4>", lambda e: self.zoom(1.1))
@@ -44481,6 +47018,18 @@ class MapTab(BaseTab):
             if dev:
                 app.show_device(dev.key)
 
+    def _key_pos(self, c):
+        """Where the selected node (the first one with none) is drawn."""
+        item = next((i for i, n in self.nodes.items()
+                     if self.selected == (n[0], n[1])), None)
+        if item is None:
+            item = next(iter(self.nodes), None)
+        bb = c.bbox(item) if item is not None else None
+        if not bb:
+            return None
+        return key_menu_event(c, None, x=int((bb[0] + bb[2]) / 2),
+                              y=int((bb[1] + bb[3]) / 2))
+
     def _context(self, e):
         node = self._node_at(e.x, e.y)
         if not node:
@@ -44529,7 +47078,7 @@ class MapTab(BaseTab):
         txt = self.c.create_text(e.x + 14, e.y + 12, anchor="nw",
                                  text=f"{node[2]}\n{node[3]}",
                                  fill=t["tooltip_fg"],
-                                 font=("TkDefaultFont", 9))
+                                 font=default_font(9))
         bb = self.c.bbox(txt)
         if bb:
             rect = self.c.create_rectangle(bb[0] - 5, bb[1] - 4, bb[2] + 5,
@@ -44583,9 +47132,32 @@ class MapTab(BaseTab):
             self.after_draw_declutter()
         else:
             self._connections(w, h)
+        self._label_backgrounds()
+        c.tag_lower("lblbg")
         c.tag_lower("edge")
         if self.list_wrap.winfo_ismapped():
             self.fill_list()
+
+    def _label_backgrounds(self):
+        """Third audit (UI): the dotted lines to the Internet column were
+        drawn through the names ("news.example.org"). Each name that shows
+        gets a patch of the map's own colour under it, above the lines, so
+        a line stops at the name instead of crossing it."""
+        c = self.c
+        bg = self.t["tab_bg"]
+        for tid, *_rest in getattr(self, "_label_ids", ()):
+            with contextlib.suppress(tk.TclError):
+                if str(c.itemcget(tid, "state")) == "hidden":
+                    continue
+                b = c.bbox(tid)
+                if not b:
+                    continue
+                tags = tuple(x for x in c.gettags(tid)
+                             if x.startswith("n:")) + ("lblbg",)
+                rid = c.create_rectangle(b[0] - 1, b[1], b[2] + 1, b[3],
+                                         fill=bg, outline="", tags=tags)
+                if tid in self.nodes:
+                    self.nodes[rid] = self.nodes[tid]
 
     def _conf_color(self, conf):
         t = self.t
@@ -44613,12 +47185,12 @@ class MapTab(BaseTab):
             lid = self.c.create_text(X, Y, text=letter,
                                      fill=t["tab_bg"] if not hollow
                                      else fill, tags=tag,
-                                     font=("TkDefaultFont", 8, "bold"))
+                                     font=default_font(8, "bold"))
             self.nodes[lid] = (kind, key, label, info)
         if show_label:
             tid = self.c.create_text(X, Y + R + 8, text=label[:22],
                                      fill=t["text_fg"], tags=tag,
-                                     font=("TkDefaultFont", 8,
+                                     font=default_font(8,
                                            "bold" if sel else "normal"))
             self.nodes[tid] = (kind, key, label, info)
             self._place_label(tid, X, Y, R, label, sel)
@@ -44652,7 +47224,7 @@ class MapTab(BaseTab):
             k = R * 0.7
             sid = c.create_text(X + k, Y - k, text="★", anchor="sw",
                                 fill=t["warn_fg"], tags=(f"n:{key}", "ov"),
-                                font=("TkDefaultFont", 10))
+                                font=default_font(10))
             for x, y, anchor in ((X + k, Y - k, "sw"), (X - k, Y - k, "se"),
                                  (X + k, Y + k, "nw"), (X - k, Y + k, "ne")):
                 c.coords(sid, x, y)
@@ -44843,7 +47415,7 @@ class MapTab(BaseTab):
             tt = self.c.create_text(X0, Y0 - R0 - 12,
                                     text="YOUR LOCAL NETWORK",
                                     fill=t["muted_fg"], tags=("deco",),
-                                    font=("TkDefaultFont", 9,
+                                    font=default_font(9,
                                           "bold"))
             if self.c.bbox(tt):
                 self._label_boxes = [self.c.bbox(tt)]
@@ -44944,7 +47516,7 @@ class MapTab(BaseTab):
             it = self.c.create_text(X, self.P(0, ty)[1],
                                     text="INTERNET (outside your network)",
                                     fill=t["muted_fg"], tags=("deco",),
-                                    font=("TkDefaultFont", 9,
+                                    font=default_font(9,
                                           "bold"))
             if self.c.bbox(it):
                 self._label_boxes = getattr(self, "_label_boxes", []) + [
@@ -45076,7 +47648,7 @@ class MapTab(BaseTab):
         for label, x in zip(("Devices", "Websites", "Remote hosts"), cols):
             X, Y = self.P(x, 16)
             self.c.create_text(X, Y, text=label, fill=t["muted_fg"],
-                               font=("TkDefaultFont", 9, "bold"))
+                               font=default_font(9, "bold"))
 
         def positions(items, keyfn):
             n = max(len(items), 1)
@@ -45348,7 +47920,7 @@ class HealthTab(BaseTab):
             bw = (w - 20) / n
             base = h - 22
             # labels that would touch: show every second (or third) one
-            fnt = Charts.font(c, ("TkDefaultFont", 7))
+            fnt = Charts.font(c, default_font(7))
             widest = max(fnt.measure(x) for x in DNS_BUCKET_LABELS) + 6
             step = max(1, int(math.ceil(widest / max(1.0, bw))))
             slow = _float(self.app.config.get("dns.slow_ms", 800), 800)
@@ -45364,14 +47936,14 @@ class HealthTab(BaseTab):
                                        outline="")
                     c.create_text((x0 + x1) / 2, base - bh - 7,
                                   text=f"{v / total:.0%}", fill=t["text_fg"],
-                                  font=("TkDefaultFont", 7))
+                                  font=default_font(7))
                 if i % step == 0:
                     c.create_text((x0 + x1) / 2, base + 9,
                                   text=DNS_BUCKET_LABELS[i],
                                   fill=t["muted_fg"],
-                                  font=("TkDefaultFont", 7))
+                                  font=default_font(7))
             c.create_text(w - 4, 2, text="ms", anchor="ne",
-                          fill=t["muted_fg"], font=("TkDefaultFont", 7))
+                          fill=t["muted_fg"], font=default_font(7))
             Charts.record(c, (c.find_all() or (None,))[0],
                           self.hist_title.cget("text"),
                           ["ms", "Lookups"],
@@ -45421,7 +47993,7 @@ class HealthTab(BaseTab):
                 c.create_text(w // 2, h // 2, text=translate_text(empty) + (
                     "\n" + translate_text("%d without an answer") % lost
                     if lost else ""), fill=t["muted_fg"], width=w - 24,
-                    justify="center", font=("TkDefaultFont", 9))
+                    justify="center", font=default_font(9))
                 return
             Charts.line(c, 4, 2, w - 8, h - 4,
                         [("Router", gw, t["chart_a"]),
@@ -45860,6 +48432,7 @@ class SecurityTab(BaseTab):
                             relief="flat", padx=14, pady=12,
                             font=mw_font(11), state="disabled",
                             highlightthickness=0)
+        make_readonly_focusable(self.text)
         # 5.3.4 (M9, MC6): unusual activity in one place, at the top of the
         # page (inside the text, so it scrolls with it on a short screen)
         self.unusual = None
@@ -47442,10 +50015,20 @@ class PacketsTab(BaseTab):
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Button-3>", self._context)
         self.tree.bind("<Button-2>", self._context)
+        # the keyboard: the row menu (Menu key, Shift+F10), the headings'
+        # sort cursor and column menu, Enter goes to the details
+        bind_context_keys(self.tree, self._context, pos=lambda w:
+                          key_menu_event(w, (w.selection() or
+                                             (tree_cursor_row(w),))[0]))
+        self.heading_keys = HeadingKeys(
+            self.tree, lambda: tree_shown_columns(self.tree),
+            self._sort_by, menu=self._heading_menu)
+        bind_open(self.tree, lambda e: self._focus_details())
         for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
             self.tree.bind(seq, self._wheel)
         for seq in ("<Up>", "<Down>", "<Prior>", "<Next>", "<Home>",
-                    "<End>"):
+                    "<End>", "<Control-Home>", "<Control-End>",
+                    "<Shift-Home>", "<Shift-End>"):
             self.tree.bind(seq, self._key)
         self.tree.bind("<Configure>", lambda e: self.render(), add="+")
         bottom = tk.Frame(vert, bg=WHITE)
@@ -47522,6 +50105,8 @@ class PacketsTab(BaseTab):
                     add="+")
         self.dtree.bind("<Button-3>", self._field_menu)
         self.dtree.bind("<Button-2>", self._field_menu)
+        tree_nav_keys(self.dtree)
+        bind_context_keys(self.dtree, self._field_menu)
         self.bytes_view.bind("<Button-1>", self._byte_click)
         self.matched = []        # filtered rows, in view order
         self.top = 0             # index of the first visible row
@@ -47688,11 +50273,24 @@ class PacketsTab(BaseTab):
             pass
         return show
 
+    def _focus_details(self):
+        """Enter on a packet: the keyboard goes to its fields."""
+        with contextlib.suppress(tk.TclError):
+            if not self.dtree.get_children(""):
+                return
+            row = tree_cursor_row(self.dtree) or \
+                self.dtree.get_children("")[0]
+            self.dtree.focus_set()
+            self.dtree.focus(row)
+            self.dtree.selection_set(row)
+            self.dtree.see(row)
+
     def _scrolled(self, parent):
         f = tk.Frame(parent, bg=WHITE)
         txt = tk.Text(f, wrap="none", font=self.app.mono, state="disabled",
                       fg="#222222", bg=WHITE, relief="flat", padx=6, pady=6,
                       highlightthickness=0, height=8)
+        make_readonly_focusable(txt)
         vs = ttk.Scrollbar(f, orient="vertical", command=txt.yview)
         hs = ttk.Scrollbar(f, orient="horizontal", command=txt.xview)
         txt.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
@@ -47874,7 +50472,7 @@ class PacketsTab(BaseTab):
         presets = self.app.config.get("filters.presets", {}) or {}
         recent = self.app.config.get("filters.recent", []) or []
         self.preset_box.configure(values=sorted(presets) + [
-            self.RECENT + r for r in recent[:8]])
+            self.RECENT + r for r in recent[:8] if isinstance(r, str)])
 
     def _remember_expr(self, expr):
         expr = (expr or "").strip()
@@ -48371,6 +50969,9 @@ class PacketsTab(BaseTab):
         return "break"
 
     def _key(self, e):
+        # Ctrl+Shift+Up / Down move the window's list | details divider
+        if e.keysym in ("Up", "Down") and key_held(e, "control", "shift"):
+            return None
         m = self.matched
         if not m:
             return "break"
@@ -49204,6 +51805,7 @@ class StreamsView(_SubView):
         self.txt = tk.Text(f, wrap="char", font=self.app.mono, bg=WHITE,
                            fg="#222222", relief="flat", highlightthickness=0,
                            padx=6, pady=6, cursor="arrow")
+        make_readonly_focusable(self.txt)
         vs = ttk.Scrollbar(f, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set, state="disabled")
         vs.pack(side="right", fill="y")
@@ -49413,6 +52015,7 @@ class ExchangesView(_SubView):
         wrap, self.tree = make_tree(self.frame, self.COLS, hscroll=True)
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
         self.tree.bind("<Double-1>", self._open)
+        bind_open(self.tree, self._open)
         self.rows = {}
 
     def refresh(self, force=False):
@@ -49541,8 +52144,10 @@ class ExpertView(_SubView):
         wrap.pack(fill="both", expand=True)
         self.tree.bind("<<TreeviewSelect>>", self._select)
         self.tree.bind("<Double-1>", self._open)
+        bind_open(self.tree, self._open)
         self.tree.bind("<Button-3>", self._menu)
         self.tree.bind("<Button-2>", self._menu)
+        bind_context_keys(self.tree, self._menu)
         self.detail = tk.Label(pw, text="", bg=WHITE, fg="#333333",
                                justify="left", anchor="nw", wraplength=900,
                                padx=8, pady=6)
@@ -49801,6 +52406,7 @@ class StatisticsView(_SubView):
                                               _human_bytes(by),
                                               f"{100 * by / max(1, tot[1]):.1f}"))
         tree.bind("<Double-1>", lambda e: self._filter_proto(tree))
+        bind_open(tree, lambda e: self._filter_proto(tree))
         self.note.configure(text=f"Out of {tot[0]:,} packets in memory "
                                  f"({_human_bytes(tot[1])}). Double-click a "
                                  f"protocol to filter the packet list.")
@@ -49847,6 +52453,8 @@ class StatisticsView(_SubView):
         tree.bind("<Double-1>", lambda e: self._open_conv(tree))
         tree.bind("<Button-3>", lambda e: self._conv_menu(tree, e))
         tree.bind("<Button-2>", lambda e: self._conv_menu(tree, e))
+        bind_open(tree, lambda e: self._open_conv(tree))
+        bind_context_keys(tree, lambda e: self._conv_menu(tree, e))
         self.note.configure(text=f"{len(flows):,} conversations among the "
                                  f"{len(rows):,} packets in memory. "
                                  f"Double-click one to follow it.")
@@ -49918,6 +52526,8 @@ class StatisticsView(_SubView):
         tree.bind("<Double-1>", lambda e: self._open_ep(tree))
         tree.bind("<Button-3>", lambda e: self._ep_menu(tree, e))
         tree.bind("<Button-2>", lambda e: self._ep_menu(tree, e))
+        bind_open(tree, lambda e: self._open_ep(tree))
+        bind_context_keys(tree, lambda e: self._ep_menu(tree, e))
         self.note.configure(text=f"{len(st):,} addresses in {len(rows):,} "
                                  f"packets in memory. A remote host is "
                                  f"never counted as a device on your "
@@ -50121,6 +52731,7 @@ class SourcesTab(BaseTab):
             ("detail", "Details", 380, "w", True)])
         self.tree.configure(height=2)
         self.tree.bind("<Double-1>", lambda e: self._edit())
+        bind_open(self.tree, lambda e: self._edit())
         wrap.grid(row=0, column=0, sticky="nsew", padx=6, pady=(0, 6))
         self.lbl(body, "Reported vs observed", muted=False,
                  font=mw_font(11, "bold")).grid(row=1, column=0,
@@ -50130,6 +52741,7 @@ class SourcesTab(BaseTab):
                              relief="flat", padx=10, pady=8,
                              highlightthickness=0,
                              font=mw_font(10))
+        make_readonly_focusable(self.recon)
         self.recon.grid(row=2, column=0, sticky="nsew", padx=6,
                         pady=(2, 6))
 
@@ -50199,7 +52811,7 @@ class SourcesTab(BaseTab):
             "Needs live capture" + ("" if pm.available else
                                     " and the optional psutil component"))))
         st_all = app.connectors.status if app.connectors else {}
-        for sp in app.config.get("connectors.list", []) or []:
+        for sp in connector_specs(app.config.get("connectors.list", [])):
             st = st_all.get(sp["id"], {})
             state = st.get("state", "waiting")
             label = {"ok": "✔ Connected", "auth": "✖ Wrong password",
@@ -50501,7 +53113,42 @@ KEYMAP_FIXED = (
     ("Close a window or a list", "Escape"),
     ("Move the Timeline time", "Left / Right (Shift: ten minutes)"),
     ("Complete a field name in a filter", "Tab"),
+    ("Move the Packets list divider", "Ctrl+Shift+Up / Ctrl+Shift+Down"),
+    ("Move along the tabs", "Left / Right / Home / End (on a tab)"),
+    ("Move between the sub-views", "Left / Right / Home / End "
+                                   "(on a sub-view)"),
+    ("Move between the Dashboard cards", "Arrow keys; Enter or Space "
+                                        "opens one"),
+    ("A row's menu, from the keyboard", "Menu key / Shift+F10"),
+    ("A column's menu (sort, columns, export)",
+     "Alt+Down (or Ctrl+Shift+C)"),
+    ("Sort by a column", "Shift+Left / Shift+Right, then Shift+Enter"),
+    ("Select every row", "Ctrl+A"),
+    ("Scroll a read-only text", "Up / Down / Page Up / Page Down / Home / "
+                               "End"),
+    ("Move along the toolbar", "Left / Right / Home / End (on a toolbar "
+                               "button)"),
 )
+
+_FIXED_KEY_WORDS = {"Ctrl": "Control", "Page Up": "Prior",
+                    "Page Down": "Next", "Esc": "Escape", "Enter": "Return",
+                    "Space": "space", "Menu key": "Menu"}
+
+
+def fixed_key_tokens():
+    """{normalised Tk sequence: what KEYMAP_FIXED calls it}: the keys the
+    program itself keeps, read from the keyboard map's own rows so a new
+    row is protected without a second list."""
+    out = {}
+    for name, keys in KEYMAP_FIXED:
+        keys = re.sub(r"\s*\([^)]*\)", "", keys)
+        for tok in keys.split(" / "):
+            parts = [p.strip() for p in tok.replace(";", " / ").split("+")]
+            parts = [_FIXED_KEY_WORDS.get(p, p) for p in parts if p]
+            if not parts or " " in parts[-1] or "-" in parts[-1]:
+                continue
+            out.setdefault(_norm_seq("<" + "-".join(parts) + ">"), name)
+    return out
 
 
 def help_body(topic, app):
@@ -50643,6 +53290,7 @@ class HelpTab(BaseTab):
         txt = tk.Text(right, wrap="word", bg="#fbfbfb", fg="#222222",
                       relief="flat", padx=14, pady=12, cursor="arrow",
                       font=mw_font(10), highlightthickness=0)
+        make_readonly_focusable(txt)
         vs = ttk.Scrollbar(right, orient="vertical", command=txt.yview)
         txt.configure(yscrollcommand=vs.set)
         vs.pack(side="right", fill="y")
@@ -50784,21 +53432,30 @@ class Job:
         if self.cancelled:
             raise JobCancelled()
 
-    def pieces_under_gate(self, gate, pieces, total=None):
+    def pieces_under_gate(self, gate, pieces, total=None, each=None):
         """Take items from the iterator `pieces`, each one while holding
-        the gate, giving the window its turn between them. -> list."""
+        the gate, giving the window its turn between them. -> list.
+        (third audit) With `each`, every item is handed to it (outside
+        the gate) and not kept: the list comes back empty."""
         out = []
+        n = 0
         it = iter(pieces)
         while True:
             with gate:
                 try:
-                    out.append(next(it))
+                    piece = next(it)
                 except StopIteration:
                     break
                 seen = gate.tk_entries
+            n += 1
+            if each is None:
+                out.append(piece)
+            else:
+                each(piece)
+            piece = None
             gate.yield_to_tk(seen)
             if total:
-                self.progress(min(0.95, len(out) / total))
+                self.progress(min(0.95, n / total))
             elif self.cancelled:
                 raise JobCancelled()
         return out
@@ -51233,6 +53890,7 @@ class SearchDrop:
     def __init__(self, app, entry):
         self.app, self.entry = app, entry
         self.frame = None
+        self.q = None               # the text the list was made for
         self.rows = []              # (label widget, action)
         self.sel = -1
         self._soon = debounce(entry, self.update, 150)
@@ -51245,11 +53903,18 @@ class SearchDrop:
 
     def escape(self):
         """Escape in the box: the list under it and the results window
-        both close (crowd test 5.3.4 #1)."""
+        both close (crowd test 5.3.4 #1). With nothing open, Escape
+        empties the box (third audit: the query stayed for good)."""
+        had = self.frame is not None
+        with contextlib.suppress(AttributeError):
+            had = had or self.app.search_window() is not None
         self.cancel()
         self.close()
         with contextlib.suppress(AttributeError):
             self.app.close_search_window()
+        if not had:
+            with contextlib.suppress(AttributeError, tk.TclError):
+                self.app.global_search_var.set("")
         return "break"
 
     def cancel(self):
@@ -51302,6 +53967,7 @@ class SearchDrop:
         fr = tk.Frame(root, bg=t["card_bg"], highlightthickness=1,
                       highlightbackground=t["border"], padx=2, pady=2)
         self.frame, self.rows, self.sel = fr, [], -1
+        self.q = q
         n = 0
         if not groups:
             tk.Label(fr, text=translate_text("No matches. Tip: device:, "
@@ -51368,6 +54034,15 @@ class SearchDrop:
     def open_selected(self):
         if self.frame is None:
             return False
+        # third audit: typed fast, Enter came before the list caught up
+        # and opened a row of the previous text. A list that isn't for
+        # what the box says now is not used: Enter searches the box.
+        with contextlib.suppress(AttributeError, tk.TclError):
+            if getattr(self, "q", None) != \
+                    self.app.global_search_var.get().strip():
+                self.cancel()
+                self.close()
+                return False
         if 0 <= self.sel < len(self.rows):
             self._run(self.rows[self.sel][1])
             return True
@@ -51534,14 +54209,20 @@ class TabStrip:
                          cursor="hand2")
         bar = tk.Frame(outer, height=3, bg=side, bd=0)
         bar.pack(fill="x")
+        # one Tab stop for the whole strip (the shown tab's label, set in
+        # sync()); Left / Right / Home / End move along the tabs
         lbl = tk.Label(outer, bg=side, fg=fg, padx=7, pady=3,
-                       font=mw_font(10, "bold"), takefocus=1)
+                       font=mw_font(10, "bold"), takefocus=0)
         focus_ring(lbl)             # 5.1.2: the focus can be seen
         lbl.pack(fill="both", expand=True)
         for w in (outer, bar, lbl):
             w.bind("<Button-1>", lambda e, t=tid: self.select(t))
         lbl.bind("<Return>", lambda e, t=tid: self.select(t))
         lbl.bind("<space>", lambda e, t=tid: self.select(t))
+        for seq, how in (("<Left>", -1), ("<Right>", 1), ("<Home>", "first"),
+                         ("<End>", "last")):
+            lbl.bind(seq, lambda e, h=how: None if _modified(e)
+                     else self.move(h))
         lbl.bind("<Enter>", lambda e, t=tid: self._hover(t, True))
         lbl.bind("<Leave>", lambda e, t=tid: self._hover(t, False))
         bind_plain(lbl, "<Configure>", self.schedule)
@@ -51552,6 +54233,37 @@ class TabStrip:
         with contextlib.suppress(tk.TclError):
             self.app.nb.select(tid)
             self.app.nb.focus_set()     # arrows and Ctrl+Tab keep working
+
+    def move(self, how):
+        """Left / Right / Home / End on a tab label (and Home / End on the
+        notebook): select the neighbour tab and keep the focus on the
+        strip, on the label of the tab now shown."""
+        if not self.order:
+            return "break"
+        cur = self._selected()
+        i = self.order.index(cur) if cur in self.order else 0
+        if how == "first":
+            j = 0
+        elif how == "last":
+            j = len(self.order) - 1
+        else:
+            j = (i + how) % len(self.order)
+        tid = self.order[j]
+        with contextlib.suppress(tk.TclError):
+            self.app.nb.select(tid)
+            self.tabs[tid][2].focus_set()
+        return "break"
+
+    def selected_label(self):
+        """The shown tab's label (the strip's one Tab stop), or None."""
+        cur = self._selected()
+        entry = self.tabs.get(cur)
+        if entry is None:
+            return None
+        try:
+            return entry[2] if entry[2].winfo_viewable() else None
+        except tk.TclError:
+            return None
 
     def cycle(self, step):
         """Ctrl+Tab / Ctrl+Shift+Tab from anywhere in the main window
@@ -51604,7 +54316,8 @@ class TabStrip:
                     lbl.configure(text=text)
                 outer.configure(bg=border)
                 bar.configure(bg=acc if on else side)
-                lbl.configure(bg=sel_bg if on else side, fg=fg)
+                lbl.configure(bg=sel_bg if on else side, fg=fg,
+                              takefocus=1 if on else 0)
             except tk.TclError:
                 pass
         self.order = ids
@@ -51897,6 +54610,9 @@ class MiniWireshark:
                                                False))
         self._async_results = queue.Queue()
         self.jobs = JobRunner(self)
+        # round 4: a crash copy or history save under way puts nothing on
+        # disk once "Delete ALL history" has taken this
+        self._forget_lock = threading.Lock()
 
         # ---- capture pipeline state (see section 6b)
         install_gui_gate()
@@ -52008,6 +54724,9 @@ class MiniWireshark:
         self.root.after(700, self._flush_ui)
         self.root.after(1000, self._tick_status)
         self.root.after(2000, self._refresh_insights)
+        # round 4: what an interrupted write left (harmless in any mode:
+        # only our own names, 6 hours old, whose writer is gone)
+        sweep_stale_temp_files()
         self._journal_found = "" if TOOL_MODE else \
             claim_interrupted_journal()
         if self._journal_found and not TOOL_MODE:
@@ -52237,7 +54956,7 @@ class MiniWireshark:
         header.pack(fill="x")
         self.header_frame = header
         self.hdr_title = tk.Label(header, text=tr("app_title"), fg="white",
-                                  bg="#2b3a55", font=("TkDefaultFont", 16,
+                                  bg="#2b3a55", font=default_font(16,
                                                       "bold"))
         self.hdr_title.pack(side="left")
         self.hdr_subtitle = tk.Label(header, text=tr("app_subtitle"),
@@ -52361,11 +55080,12 @@ class MiniWireshark:
         self.toolbar_frame = bar
         rgrp = ttk.Frame(bar)          # these three wrap together
         rgrp.pack(side="right")
-        ttk.Button(rgrp, text="Session ▾", width=-8,
-                   command=self._open_session_menu).pack(side="right")
-        ttk.Button(rgrp, text="Export ▾", width=-8,
-                   command=self._open_export_menu).pack(side="right",
-                                                        padx=(0, 6))
+        self.session_btn = ttk.Button(rgrp, text="Session ▾", width=-8,
+                                      command=self._open_session_menu)
+        self.session_btn.pack(side="right")
+        self.export_btn = ttk.Button(rgrp, text="Export ▾", width=-8,
+                                     command=self._open_export_menu)
+        self.export_btn.pack(side="right", padx=(0, 6))
         self.clear_btn = ttk.Button(rgrp, text=tr("btn_clear"), width=-8,
                                     command=self.clear)
         if not FEATURES.get("state_line", True):
@@ -52378,8 +55098,9 @@ class MiniWireshark:
         self.iface_box.pack(side="left", padx=(6, 2))
         self.iface_tip = Tooltip(self.iface_box, "")
         self.iface_box.bind("<<ComboboxSelected>>", self._on_iface_picked)
-        ttk.Button(bar, text="↻", width=3, command=self.refresh_adapters
-                   ).pack(side="left", padx=(0, 12))
+        self.adapters_btn = ttk.Button(bar, text="↻", width=3,
+                                       command=self.refresh_adapters)
+        self.adapters_btn.pack(side="left", padx=(0, 12))
         self.cap_filter_lbl = ttk.Label(bar, text="Capture filter:")
         self.cap_filter_lbl.pack(side="left")
         self.filter_var = tk.StringVar()
@@ -52397,6 +55118,12 @@ class MiniWireshark:
         self.stop_btn = ttk.Button(bar, text=tr("btn_stop"), command=self.stop,
                                    state="disabled")
         self.stop_btn.pack(side="left", padx=6)
+        # the tool bar's buttons are one Tab stop (a row you walk with
+        # Left / Right / Home / End), so the tab strip is not nine presses
+        # away; in the order they are drawn
+        self.toolbar_group = RovingGroup(self.root, [
+            self.adapters_btn, self.start_btn, self.stop_btn,
+            self.export_btn, self.session_btn], default=self.start_btn)
 
         self.body = ttk.PanedWindow(self.root, orient="horizontal")
         self.body.pack(fill="both", expand=True, padx=12, pady=(6, 4))
@@ -52427,6 +55154,13 @@ class MiniWireshark:
         self.nb = ttk.Notebook(left, style="Main.TNotebook")
         self.nb.pack(fill="both", expand=True)
         self.nb.enable_traversal()
+        # the strip above is the one Tab stop for switching tabs; the
+        # notebook keeps the arrow keys (class binding) and gets Home / End
+        self.nb.configure(takefocus=0)
+        self.nb.bind("<Home>", lambda e: None if _modified(e)
+                     else self.tabstrip.move("first"))
+        self.nb.bind("<End>", lambda e: None if _modified(e)
+                     else self.tabstrip.move("last"))
         self.tabs = OrderedDict()
         classes = {c.name: c for c in (
             DashboardTab, FeedTab, TimelineTab, DevicesTab, WebsitesTab,
@@ -52453,6 +55187,13 @@ class MiniWireshark:
                           ("<Control-ISO_Left_Tab>", -1)):
             with contextlib.suppress(tk.TclError):
                 self.root.bind(seq, lambda e, s=step: self.tabstrip.cycle(s))
+        # the Packets list | details divider (the Left / Right pair is a
+        # setting, see _apply_shortcuts)
+        for seq, step in (("<Control-Shift-Up>", -1),
+                          ("<Control-Shift-Down>", 1)):
+            with contextlib.suppress(tk.TclError):
+                self.root.bind_all(
+                    seq, lambda e, s=step: self._resize_pane_v(s, e))
         self.inspector = Inspector(self, self.body)
         self.inspector_visible = False
         self.body.bind("<Configure>", self._body_resized, add="+")
@@ -52469,7 +55210,9 @@ class MiniWireshark:
         self.status_var = DisplayVar(
             value="Getting ready — I'll pick a network card and start "
                   "watching automatically.")
+        HEADING_STATUS[0] = self.status_var.set
         status = tk.Frame(self.root, bg="#e3e6eb")
+        self.status_frame = status
         status.pack(side="bottom", fill="x", before=self.body)
         status._mw_noflow = True
         self.footer_var = DisplayVar(value="")
@@ -52484,6 +55227,7 @@ class MiniWireshark:
                                 fg="#1a3a6b", bg="#e3e6eb", padx=8, pady=4,
                                 cursor="hand2")
         self.job_lbl.bind("<Button-1>", lambda e: self.jobs.cancel_all())
+        make_label_button(self.job_lbl, lambda: self.jobs.cancel_all())
         Tooltip(self.job_lbl, "Work running in the background. Click to "
                               "cancel it.")
         # 5.1.2: messages history; the status text opens Diagnostics
@@ -52491,6 +55235,7 @@ class MiniWireshark:
                                 bg="#e3e6eb", padx=8, pady=4, cursor="hand2")
         self.msg_btn.pack(side="left")
         self.msg_btn.bind("<Button-1>", lambda e: self.open_messages())
+        make_label_button(self.msg_btn, lambda: self.open_messages())
         Tooltip(self.msg_btn, "The last 50 messages")
         self._sync_messages_btn()
         self.status_lbl = tk.Label(
@@ -52499,9 +55244,11 @@ class MiniWireshark:
             padx=10, pady=4, cursor="hand2")
         self.status_lbl.pack(side="left", fill="x", expand=True)
         self.status_lbl.bind("<Button-1>", lambda e: self.open_diagnostics())
+        make_label_button(self.status_lbl, lambda: self.open_diagnostics())
         Tooltip(self.status_lbl, "What the capture is doing. Click for "
                                  "Diagnostics.")
         foot.bind("<Button-1>", lambda e: self.open_coverage())
+        make_label_button(foot, lambda: self.open_coverage())
         Tooltip(foot, "What this computer can and can't see. Click for "
                       "the full coverage report.")
         self._restyle_mode_banner()
@@ -53735,6 +56482,12 @@ class MiniWireshark:
         for w in sites:
             items.append((f"Website: {w.domain}", "website",
                           lambda d=w.domain: self.show_website(d)))
+        # "@" reaches the Internet hosts too
+        for rec in sorted(self.model.remote_hosts.values(),
+                          key=lambda r: -(r.bytes_total or 0))[:200]:
+            items.append((f"Host: {rec.ip}" + (
+                f" ({rec.domain})" if rec.domain else ""), "host",
+                lambda i=rec.ip: self.show_remote(i)))
         n = 0
         for aid in self.model.alerts.order:
             a = self.model.alerts.alerts.get(aid)
@@ -53777,9 +56530,91 @@ class MiniWireshark:
             DEFAULT_SHORTCUTS.get(name, "")
         return _pretty_seq(seq) if seq else ""
 
-    def palette_key(self, label):
+    def palette_key(self, label, cat=""):
+        """The key shown beside a Ctrl+K row: an action's own shortcut, or
+        the Ctrl+1..4 that opens a tab's group."""
         name = self.PALETTE_KEYS.get(label)
+        if name is None and cat == "tab":
+            for tname, tab in self.tabs.items():
+                if palette_tab_label(tab.label_key, tname) == label:
+                    return self.shortcut_text(f"group{tab_group_of(tname) + 1}")
         return self.shortcut_text(name) if name else ""
+
+    def palette_dynamic(self, q, chip="all"):
+        """Rows Ctrl+K makes from what was typed, [(label, cat, action)]:
+        "Go to packet N", "Show device …", "Filter packets: …" and, last
+        (cat "search"), a search of everything. Only existing methods run:
+        go_to_packet, show_device, apply_filter and the header search."""
+        q = (q or "").strip()
+        if not q:
+            return []
+        key, _cats, rest, _cut = palette_scope(q, chip)
+        text = rest.strip()
+        rows = []
+        if key in ("all", "packet"):
+            n = palette_packet_number(text)
+            if n is not None:
+                rows.append((f"Go to packet {n}", "packet",
+                             lambda n=n: self.go_to_packet(n)))
+        if key in ("all", "filters", "devices"):
+            expr, addr = None, palette_address(text)
+            if addr:
+                expr = f"{addr[0]}:{addr[1]}"
+                dev = self.model.device_for(
+                    addr[1] if addr[0] == "ip" else None,
+                    addr[1] if addr[0] == "mac" else None)
+                if dev is not None:
+                    rows.append((f"Show device {self.device_label(dev)}",
+                                 "device",
+                                 lambda k=dev.key: self.show_device(k)))
+            elif key == "filters":
+                expr = palette_filter_expr(text) or text
+            else:
+                expr = palette_filter_expr(text) or palette_filter_expr(q)
+            if expr:
+                rows.append((f"Filter packets: {expr}", "filter",
+                             lambda e=expr: self.apply_filter(e)))
+        if key == "all":
+            rows.append((f"Search everything for \u201c{q}\u201d", "search",
+                         lambda s=q: self._palette_search(s)))
+        return rows
+
+    def _palette_search(self, q):
+        """The header search, with `q` in it (what is searched stays on this
+        computer)."""
+        drop = getattr(self, "search_drop", None)
+        if drop is not None:
+            drop.cancel()
+            drop.close()
+        self.global_search_var.set(q)
+        return self._search_enter()
+
+    def _focus_main(self):
+        """After a Ctrl+K choice: the keyboard goes to the shown tab's
+        table, else its filter box, else the tab strip. (It stayed on the
+        table of the tab that was left, now hidden.) A window the choice
+        opened keeps it."""
+        def go():
+            root = self.root
+            try:
+                root.update_idletasks()
+                w = root.focus_get()
+                if w is not None and w.winfo_toplevel() is not root:
+                    return
+                tab = self.tabs.get(self.current_tab_name())
+                if w is not None and tab is not None and w.winfo_viewable():
+                    top = str(tab.frame)
+                    if str(w) == top or str(w).startswith(top + "."):
+                        return
+                for cand in (getattr(tab, "tree", None),
+                             getattr(tab, "filter_entry", None), self.nb):
+                    if cand is not None and cand.winfo_viewable():
+                        cand.focus_set()
+                        return
+            except (tk.TclError, KeyError, AttributeError):
+                pass
+        with contextlib.suppress(tk.TclError):
+            self.root.after_idle(go)
 
     def _apply_preset(self, name):
         tab = self._select_tab("packets")
@@ -54022,12 +56857,12 @@ class MiniWireshark:
 
         def run(job):
             body(job)
-            with open(part, "rb") as f:
-                digest = hashlib.sha256(f.read()).hexdigest()
-            os.replace(part, path)
-            atomic_write_json(path + ".sha256", {
-                "journal": 2, "saved_at": time.time(), "sha256": digest,
-                "pid": os.getpid()})
+            # round 4: in place with its fingerprint whatever moment a
+            # crash comes, and never after Delete ALL history
+            if not publish_crash_copy(part, path,
+                                      cancelled=lambda: job.cancelled,
+                                      lock=self._forget_lock):
+                raise JobCancelled()
             return path
 
         def ok(_p):
@@ -54036,15 +56871,7 @@ class MiniWireshark:
         if background:
             return self.jobs.submit("journal", "Keeping a crash-safe copy",
                                     run, ok)
-        job = Job("journal", "", None)
-        run_inline = self.session_text_job(part)
-        parts_done = run_inline(job)
-        with open(parts_done, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()
-        os.replace(parts_done, path)
-        atomic_write_json(path + ".sha256", {
-            "journal": 2, "saved_at": time.time(), "sha256": digest,
-            "pid": os.getpid()})
+        run(Job("journal", "", None))
         ok(path)
         return path
 
@@ -54053,26 +56880,22 @@ class MiniWireshark:
         journal v1 (5.0.x) is one JSON object holding both."""
         path = path or getattr(self, "_journal_found", "") or PATHS.journal
         tmp = os.path.join(PATHS.sessions, "restored.mwsession.json")
+        # round 4: refused with a plain sentence, never a bare KeyError
         try:
-            side = read_json(path + ".sha256")
-            if isinstance(side, dict) and side.get("journal") == 2:
-                with open(path, "rb") as f:
-                    raw = f.read()
-                if hashlib.sha256(raw).hexdigest() != side.get("sha256"):
-                    raise ValueError("the journal is damaged")
-                with open(tmp + ".part", "wb") as f:
-                    f.write(raw)
-                os.replace(tmp + ".part", tmp)
-            else:
-                with open(path, encoding="utf-8") as f:
-                    j = json.load(f)
-                body = json.dumps(j["session"], default=str, sort_keys=True)
-                if hashlib.sha256(body.encode()).hexdigest() != j["sha256"]:
-                    raise ValueError("the journal is damaged")
-                atomic_write_json(tmp, j["session"], compact=True)
-        except (OSError, ValueError, KeyError, TypeError) as e:
-            messagebox.showerror("Restore", f"The interrupted session could "
-                                 f"not be read: {e}", parent=self.root)
+            raw, verified = read_crash_copy(path)
+            if not verified:
+                LOG.warning("crash copy without a matching fingerprint; "
+                            "it is whole and is restored")
+            atomic_write_bytes(tmp, raw)
+            problem = ""
+        except CrashCopyUnreadable as e:
+            problem = str(e)
+        except Exception:                            # noqa: BLE001
+            LOG.exception("restore the interrupted session")
+            problem = CRASH_COPY_UNREADABLE
+        if problem:
+            messagebox.showerror("Restore", translate_text(problem),
+                                 parent=self.root)
             return False
         self._load_session(tmp)
         for p_ in (path, path + ".sha256"):
@@ -54535,16 +57358,20 @@ class MiniWireshark:
         if self.data_mode in ("offline", "session"):
             head = tr("In this file, last hour")
         show = lambda: self.open_changes("Last hour")       # noqa: E731
+        # third audit (UI): "Depuis 23:13 : …" in French
+        colon = " : " if CURRENT_LOCALE == "fr" else ": "
         if not parts:
-            return head + ": " + tr("nothing new.") , "muted", show
-        return head + ": " + ", ".join(parts) + ".", "", show
+            return head + colon + tr("nothing new."), "muted", show
+        return head + colon + ", ".join(parts) + ".", "", show
 
     def honesty_line(self):
         v = self.model.vantage.classify(
             offline=self.data_mode in ("offline", "session"))
         spots = blind_spots(self.model, self.data_mode, self.active_mode())
         tr = translate_text
-        return (tr("From here") + ": " + tr(VANTAGE_TEXT[v][0]) +
+        # third audit (UI): French puts a space before the colon ("D'ici:")
+        colon = " : " if CURRENT_LOCALE == "fr" else ": "
+        return (tr("From here") + colon + tr(VANTAGE_TEXT[v][0]) +
                 (" · " + (tr("1 blind spot") if len(spots) == 1 else
                           tr("%d blind spots") % len(spots))
                  if spots else " · " + tr("no known blind spots")) +
@@ -55568,6 +58395,7 @@ class MiniWireshark:
                                                       pady=(10, 4))
         txt = tk.Text(win, wrap="none", bg=t["tab_bg"], fg=t["text_fg"],
                       font=self.mono, relief="flat", padx=8, pady=6)
+        make_readonly_focusable(txt)
         txt.pack(fill="both", expand=True, padx=12)
         text = self.boot_history_text()
         txt.insert("1.0", text)
@@ -55631,6 +58459,7 @@ class MiniWireshark:
             fill="x", padx=12, pady=(10, 4))
         txt = tk.Text(win, wrap="none", bg=t["tab_bg"], fg=t["text_fg"],
                       font=("TkFixedFont", 8))
+        make_readonly_focusable(txt)
         txt.pack(fill="both", expand=True, padx=12)
 
         def fill():
@@ -56745,7 +59574,7 @@ proc ::mw_retheme {w map fgnew deffg} {
             # table text follows the text size too (it stayed at 10 pt)
             st = ttk.Style()
             row = int(24 * scale)
-            body = ("TkDefaultFont", int(round(10 * scale)))
+            body = default_font(int(round(10 * scale)))
             head = body + ("bold",)
             # a style change, even to the same values, makes every ttk
             # widget of the window rebuild its layout
@@ -56953,6 +59782,257 @@ proc ::mw_explicit_fonts {top names} {
                 pass
 
 
+    # ---- keyboard-only: the window's regions, F7, F8, F5, dividers --------
+    def _in_main(self, event):
+        """False for a key pressed in another window (Settings, a dialog):
+        these shortcuts are for the main window; bind_all reaches all."""
+        w = getattr(event, "widget", None)
+        try:
+            return w is None or isinstance(w, str) or \
+                w.winfo_toplevel() is self.root
+        except (tk.TclError, AttributeError, KeyError):
+            return True
+
+    def _under(self, widget, ancestor):
+        """True when `widget` is `ancestor` or inside it."""
+        try:
+            p, a = str(widget), str(ancestor)
+        except (tk.TclError, AttributeError):
+            return False
+        return bool(a) and (p == a or p.startswith(a + "."))
+
+    def _first_stop_in(self, frame, start=None):
+        """The first widget inside `frame` that Tab reaches (after
+        `start`, else the shown tab's label)."""
+        w = start or self.tabstrip.selected_label() or self.search_entry
+        first = w
+        prefix = str(frame) + "."
+        for _ in range(600):
+            try:
+                w = w.tk_focusNext()
+            except tk.TclError:
+                return None
+            if w is None or w is first:
+                return None
+            try:
+                if str(w).startswith(prefix) and w.winfo_viewable():
+                    return w
+            except tk.TclError:
+                continue
+        return None
+
+    def _table_target(self, tab=None):
+        """The shown tab's table: its tree when that is on screen, else
+        the first table under it, else the first control Tab reaches."""
+        tab = tab or self.tabs.get(self.current_tab_name())
+        if tab is None:
+            return None
+        try:
+            t = getattr(tab, "tree", None)
+            if t is not None and t.winfo_viewable():
+                return t
+            for t in _walk_class(tab.frame, ttk.Treeview):
+                if t.winfo_viewable():
+                    return t
+        except (tk.TclError, AttributeError):
+            pass
+        return self._first_stop_in(tab.frame)
+
+    def _focus_table(self, event=None):
+        """F7: the shown tab's table, with its first row selected when
+        nothing is."""
+        if event is not None and not self._in_main(event):
+            return None
+        w = self._table_target()
+        if w is None:
+            return "break"
+        try:
+            if isinstance(w, ttk.Treeview):
+                kids = w.get_children()
+                if kids and not w.selection():
+                    w.selection_set(kids[0])
+                    w.focus(kids[0])
+                    w.see(kids[0])
+                elif w.selection():
+                    w.see(w.selection()[0])
+            w.focus_set()
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _regions(self):
+        """[(name, widget)] of the parts F6 visits, top to bottom: the
+        search box, the tab strip, the shown tab's filter box (when it
+        has one on screen), its table, the Inspector (when shown) and the
+        status line."""
+        out = [("search", self.search_entry)]
+        lbl = self.tabstrip.selected_label()
+        if lbl is not None:
+            out.append(("tabs", lbl))
+        tab = self.tabs.get(self.current_tab_name())
+        fe = getattr(tab, "filter_entry", None)
+        try:
+            if fe is not None and fe.winfo_viewable():
+                out.append(("filter", fe))
+        except tk.TclError:
+            pass
+        tbl = self._table_target(tab)
+        if tbl is not None and tbl is not fe:
+            out.append(("table", tbl))
+        if self.inspector_visible:
+            tgt = getattr(self.inspector, "txt", None) or \
+                getattr(self.inspector, "close_btn", None)
+            if tgt is not None:
+                out.append(("inspector", tgt))
+        out.append(("status", self.status_lbl))
+        return out
+
+    def _region_of(self, widget):
+        """The name of the region the focus is in ("" when none of the
+        F6 parts: the toolbar and banners count as the search box's)."""
+        if widget is None:
+            return ""
+        tab = self.tabs.get(self.current_tab_name())
+        fe = getattr(tab, "filter_entry", None)
+        if self.inspector_visible and self._under(
+                widget, self.inspector.frame):
+            return "inspector"
+        if self._under(widget, getattr(self, "status_frame", None)):
+            return "status"
+        if self._under(widget, self.tabstrip.frame) or self._under(
+                widget, self.nav_frame):
+            return "tabs"
+        if fe is not None and (widget is fe or (
+                tab is not None and str(fe.winfo_parent()) != str(tab.frame)
+                and self._under(widget, str(fe.winfo_parent())))):
+            return "filter"
+        if tab is not None and self._under(widget, tab.frame):
+            return "table"
+        if self._under(widget, self.nb):
+            return "table"
+        if self._under(widget, self.body):
+            return ""
+        return "search"
+
+    def _cycle_regions(self, step, event=None):
+        """F6 / Shift+F6: the next / previous part of the window, wrapping.
+        A part that is not on screen (no filter box, no Inspector) is
+        skipped."""
+        if event is not None and not self._in_main(event):
+            return None
+        regions = self._regions()
+        names = [n for n, _w in regions]
+        try:
+            cur = self._region_of(self.root.focus_get())
+        except (KeyError, tk.TclError):
+            cur = ""
+        if cur in names:
+            i = (names.index(cur) + step) % len(names)
+        else:
+            i = 0 if step > 0 else len(names) - 1
+        for k in range(len(names)):
+            _n, w = regions[(i + k * step) % len(names)]
+            try:
+                w.focus_set()
+                self._region_now = _n
+                break
+            except tk.TclError:
+                continue
+        return "break"
+
+    def _toggle_mode_key(self, event=None):
+        """F8: Beginner <-> Advanced."""
+        if event is not None and not self._in_main(event):
+            return None
+        now = "Beginner" if self.beginner_mode else "Advanced"
+        to = "Advanced" if now == "Beginner" else "Beginner"
+        self.mode_ui_var.set(to)
+        self._on_ui_mode_change()
+        self._set_banner("\U0001F441  " + translate_text(
+            "Now in the Advanced view (%s goes back to Beginner)."
+            if to == "Advanced" else
+            "Now in the Beginner view (%s shows Advanced again).")
+            % (self.shortcut_text("mode_toggle") or "F8"))
+        return "break"
+
+    def _refresh_key(self, event=None):
+        """F5: draw the shown tab again from the data."""
+        if event is not None and not self._in_main(event):
+            return None
+        self._refresh_shown_tab()
+        self._set_banner("\U0001F504  Refreshed this tab.")
+        return "break"
+
+    def _sheet_key(self, event=None):
+        """Shift+F1: the keyboard map (Help > Keyboard map)."""
+        if event is not None and not self._in_main(event):
+            return None
+        self.open_help("Keyboard map")
+        return "break"
+
+    PANE_STEP = 40
+
+    def _resize_pane(self, step, event=None):
+        """Ctrl+Shift+Left / Right: move a divider from the keyboard (the
+        mouse can, a ttk.PanedWindow's keys cannot). The Packets
+        fields | bytes divider when the focus is there, else the one
+        beside the Inspector."""
+        if event is not None:
+            if not self._in_main(event):
+                return None
+            if _selects_words(getattr(event, "widget", None)):
+                return None       # Ctrl+Shift+arrows select words there
+        pane, what = self.body, "Inspector"
+        foc = None
+        with contextlib.suppress(KeyError, tk.TclError):
+            foc = self.root.focus_get()
+        pk = self.tabs.get("packets")
+        dp = getattr(pk, "detail_pane", None)
+        if dp is not None and foc is not None and self._under(foc, dp) \
+                and dp.winfo_viewable():
+            pane, what = dp, "Packet details"
+        elif not self.inspector_visible:
+            self._set_banner("\u2194  There is no divider to move: show the "
+                             "Inspector (F2) first.")
+            return "break"
+        return self._move_sash(pane, step * px(self.PANE_STEP), what)
+
+    def _resize_pane_v(self, step, event=None):
+        """Ctrl+Shift+Up / Down: the Packets list | details divider."""
+        if event is not None:
+            if not self._in_main(event):
+                return None
+            if _selects_words(getattr(event, "widget", None)):
+                return None
+        pk = self.tabs.get("packets")
+        vert = getattr(pk, "vert_pane", None)
+        if vert is None or not pk.is_visible() or not vert.winfo_viewable():
+            return "break"
+        return self._move_sash(vert, step * px(self.PANE_STEP),
+                               "Packet list")
+
+    def _move_sash(self, pane, delta, what):
+        try:
+            vertical = str(pane.cget("orient")) == "vertical"
+            total = pane.winfo_height() if vertical else pane.winfo_width()
+            pos = pane.sashpos(0)
+            new = max(px(80), min(total - px(80), pos + int(delta)))
+            pane.sashpos(0, new)
+            pos = pane.sashpos(0)
+        except tk.TclError:
+            return "break"
+        pk = self.tabs.get("packets")
+        for pw, name in ((getattr(pk, "vert_pane", None), "packets.list"),
+                         (getattr(pk, "detail_pane", None),
+                          "packets.detail")):
+            if pw is pane:
+                with contextlib.suppress(tk.TclError, AttributeError):
+                    pk._pane_moved(pw, name)
+        self._set_banner("\u2194  " + translate_text("%s: divider at %d%%.")
+                         % (translate_text(what),
+                            round(100 * pos / max(1, total))))
+        return "break"
+
     def _focus_search(self, _event=None):
         """Ctrl+F: the shown tab's own filter box when it has one (5.1.2),
         else the header search."""
@@ -56983,6 +60063,15 @@ proc ::mw_explicit_fonts {top names} {
         for cmd in getattr(self, "_shortcut_cmds", []):
             with contextlib.suppress(tk.TclError, ValueError):
                 self.root.deletecommand(cmd)
+        # the text-field classes' own binding of the palette key (Ctrl+K cuts
+        # to the end of the line there): put back before the keys are set
+        for cls, seq, script in getattr(self, "_class_shortcuts", []):
+            with contextlib.suppress(tk.TclError):
+                if script:
+                    self.root.bind_class(cls, seq, script)
+                else:
+                    self.root.unbind_class(cls, seq)
+        self._class_shortcuts = []
         self._bound_shortcuts, self._shortcut_cmds = [], []
         actions = {
             "start": lambda e=None: self.start(),
@@ -56992,7 +60081,7 @@ proc ::mw_explicit_fonts {top names} {
             "find": self._focus_search,
             "undo": self._undo_shortcut,
             "inspector": lambda e=None: self.toggle_inspector(),
-            "palette": lambda e=None: self.open_palette(),
+            "palette": self._palette_shortcut,
             "goto_packet": lambda e=None: self.go_to_packet(),
             "back": lambda e=None: self._nav_key(self.router.back),
             "explain": lambda e=None: (self.set_explain(), "break")[1],
@@ -57001,19 +60090,54 @@ proc ::mw_explicit_fonts {top names} {
             "group2": lambda e=None: self.select_group(1),
             "group3": lambda e=None: self.select_group(2),
             "group4": lambda e=None: self.select_group(3),
+            "regions": lambda e=None: self._cycle_regions(1, e),
+            "regions_back": lambda e=None: self._cycle_regions(-1, e),
+            "focus_table": lambda e=None: self._focus_table(e),
+            "shortcut_sheet": lambda e=None: self._sheet_key(e),
+            "mode_toggle": lambda e=None: self._toggle_mode_key(e),
+            "refresh": lambda e=None: self._refresh_key(e),
+            "pane_narrower": lambda e=None: self._resize_pane(-1, e),
+            "pane_wider": lambda e=None: self._resize_pane(1, e),
         }
         shortcuts = dict(DEFAULT_SHORTCUTS)
         shortcuts.update(self.config.data.get("shortcuts") or {})
+        skip = shortcut_default_losers(shortcuts)
         for name, seq in shortcuts.items():
             fn = actions.get(name)
-            if not fn or not seq:
+            if not fn or not seq or name in skip:
                 continue
             try:
                 cmd = self.root.bind_all(seq, fn)
                 self._bound_shortcuts.append(seq)
                 self._shortcut_cmds.append(cmd)
+                if name == "palette":
+                    self._bind_palette_in_fields(seq, fn)
             except tk.TclError:
                 pass
+
+    def _palette_shortcut(self, event=None):
+        """Ctrl+K. In a text field it opens the palette and nothing else
+        (the field's own Ctrl+K deleted the text after the cursor). Only in
+        the main window: in the palette's own box (it would rebuild and
+        lose the query) and in the text boxes of other windows the key is
+        left alone."""
+        if event is not None and not self._in_main(event):
+            return None
+        self.open_palette()
+        return "break"
+
+    def _bind_palette_in_fields(self, seq, fn):
+        """Tk runs a text field's own binding of Ctrl+K (delete to the end
+        of the line) before the application-wide one, so "break" there is
+        too late: the key is bound on the field classes themselves, and
+        the previous binding is kept to put back when it is changed."""
+        for cls in ("TEntry", "Entry", "TCombobox", "TSpinbox", "Spinbox",
+                    "Text"):
+            with contextlib.suppress(tk.TclError):
+                script = self.root.bind_class(cls, seq)
+                cmd = self.root.bind_class(cls, seq, fn)
+                self._class_shortcuts.append((cls, seq, script))
+                self._shortcut_cmds.append(cmd)
 
     def _undo_shortcut(self, event=None):
         # in text fields Ctrl+Z belongs to the field
@@ -57040,14 +60164,7 @@ proc ::mw_explicit_fonts {top names} {
             if event.keysym in ("Control_L", "Control_R", "Shift_L",
                                "Shift_R", "Alt_L", "Alt_R"):
                 return
-            mods = []
-            if event.state & 0x4:
-                mods.append("Control")
-            if event.state & 0x1:
-                mods.append("Shift")
-            if event.state & 0x20000 or event.state & 0x0008:
-                mods.append("Alt")
-            seq = "<" + "-".join(mods + [event.keysym]) + ">"
+            seq = _shortcut_sequence(event.state, event.keysym)
             display_var.set(seq)
             win.destroy()
         win.bind("<KeyPress>", on_key)
@@ -57895,14 +61012,40 @@ proc ::mw_explicit_fonts {top names} {
                 self.inspector.refresh()
 
     def _flush_websites(self, m):
-        if m.dirty_websites:
+        if self._dirty_overflow(m, "dirty_websites"):
+            tab = self.tabs["websites"]
+            tab._dirty = True
+            tab.refresh()
+        elif m.dirty_websites:
             keys = self._take_dirty(m, "dirty_websites")
             self.tabs["websites"].update_keys(keys)
 
     def _flush_remotes(self, m):
-        if m.dirty_remotes:
+        if self._dirty_overflow(m, "dirty_remotes"):
+            tab = self.tabs["remote"]
+            tab._pending = True
+            tab.refresh()
+        elif m.dirty_remotes:
             keys = self._take_dirty(m, "dirty_remotes")
             self.tabs["remote"].update_keys(keys)
+
+    def _dirty_overflow(self, m, attr):
+        """Audit #56: rows changing faster than FLUSH_MAX a tick grew the
+        set without bound (61k each in a looped replay). Past FLOW_BACKLOG
+        it is dropped for one table refill, at most every 5 s. (third
+        audit) Past 4 x FLOW_BACKLOG it is dropped at once, so a burst
+        can't grow it in those 5 s."""
+        now = time.monotonic()
+        last = getattr(self, "_overflow_at", None)
+        if last is None:
+            last = self._overflow_at = {}
+        n = len(getattr(m, attr))
+        if n <= self.FLOW_BACKLOG or n <= 4 * self.FLOW_BACKLOG and \
+                now - last.get(attr, -1e9) <= 5:
+            return False
+        last[attr] = now
+        setattr(m, attr, set())
+        return True
 
     FLUSH_MAX = 250
     @classmethod
@@ -57967,6 +61110,10 @@ proc ::mw_explicit_fonts {top names} {
         gone = m.registry.removed            # 5.3.4 review: dropped keys
         if len(gone) > keep:
             del gone[:]
+            self._rebuild_on_restore = True
+        moved = m.registry.rekeyed           # third audit: the same
+        if len(moved) > keep:
+            del moved[:]
             self._rebuild_on_restore = True
 
     def _flush_flows(self, m):
@@ -58078,6 +61225,7 @@ proc ::mw_explicit_fonts {top names} {
                     gw = self.model.infer_gateway()
                     if gw and gw != self.model.gateway_ip:
                         self.model.set_identity(gateway_ip=gw)
+                        self.model.gateway_guessed = True
                 self._update_perf()
                 self._sync_overload_line()
                 cv = self.model.cache.version
@@ -58316,10 +61464,10 @@ proc ::mw_explicit_fonts {top names} {
                 self.tabs["sources"].refresh()
 
     def connector_set(self, cid, toggle_enabled=False, **changes):
-        specs = [dict(x) for x in self.config.get("connectors.list", [])
-                 or []]
+        specs = [dict(x) if isinstance(x, dict) else x
+                 for x in self.config.get("connectors.list", []) or []]
         for sp in specs:
-            if sp["id"] == cid:
+            if isinstance(sp, dict) and sp.get("id") == cid:
                 if toggle_enabled:
                     sp["enabled"] = not sp.get("enabled", True)
                 sp.update(changes)
@@ -58331,7 +61479,7 @@ proc ::mw_explicit_fonts {top names} {
 
     def connector_remove(self, cid):
         specs = [x for x in self.config.get("connectors.list", []) or []
-                 if x.get("id") != cid]
+                 if not (isinstance(x, dict) and x.get("id") == cid)]
         self.config.set("connectors.list", specs)
         self.config.save()
         self.vault.delete(cid)
@@ -58341,11 +61489,12 @@ proc ::mw_explicit_fonts {top names} {
 
     def connector_save(self, spec, password=None):
         """Add or update a helper; the password goes to the vault."""
-        specs = [dict(x) for x in self.config.get("connectors.list", [])
-                 or []]
+        specs = [dict(x) if isinstance(x, dict) else x
+                 for x in self.config.get("connectors.list", []) or []]
         if not spec.get("id"):
             spec["id"] = "c-" + uuid.uuid4().hex[:10]
-        specs = [x for x in specs if x.get("id") != spec["id"]] + [spec]
+        specs = [x for x in specs if not (
+            isinstance(x, dict) and x.get("id") == spec["id"])] + [spec]
         self.config.set("connectors.list", specs)
         self.config.save()
         cid = spec["id"]
@@ -58403,8 +61552,8 @@ proc ::mw_explicit_fonts {top names} {
         t = self.theme
         spec = {}
         if cid:
-            spec = next((dict(x) for x in self.config.get(
-                "connectors.list", []) or [] if x["id"] == cid), {})
+            spec = next((x for x in connector_specs(self.config.get(
+                "connectors.list", [])) if x["id"] == cid), {})
             kind = spec.get("kind", kind)
         cls = CONNECTOR_KINDS.get(kind or "pihole")
         win = tk.Toplevel(self.root)
@@ -59498,11 +62647,18 @@ proc ::mw_explicit_fonts {top names} {
         wp = self._wifi_view()
         w = wp.last if wp is not None else None
         if w:
-            lines.append("Wi-Fi        : " + (w.get("ssid") or "?")
+            ssid = w.get("ssid") or "?"
+            if self.data_mode == "demo" and ssid.endswith(" (simulated)"):
+                # the demo's own made-up network name, not a real one
+                ssid = ssid[:-len(" (simulated)")] + " (" + \
+                    tr("simulated") + ")"
+            lines.append("Wi-Fi        : " + ssid
                          + (f" via {w['bssid']}" if w.get("bssid") else ""))
             summ = wp.summary()
             if summ:
-                lines.append("               " + summ[3])
+                # third audit (UI): each piece in your language
+                lines.append("               " + ", ".join(
+                    tr(p) for p in summ[3].split(", ")))
         sw = self.model.switch_summary()
         if sw:
             lines.append("Switch port  : " + (sw["system"] or sw["chassis"])
@@ -60612,9 +63768,9 @@ proc ::mw_explicit_fonts {top names} {
             cv.create_rectangle(x0, 8, max(x0 + 2, x1), 22,
                                 fill=t["conf_high"], outline="")
         cv.create_text(0, 30, anchor="w", text=fmt_clock(start),
-                       fill=t["muted_fg"], font=("TkDefaultFont", 7))
+                       fill=t["muted_fg"], font=default_font(7))
         cv.create_text(w, 30, anchor="e", text="now (green = online)",
-                       fill=t["muted_fg"], font=("TkDefaultFont", 7))
+                       fill=t["muted_fg"], font=default_font(7))
 
     # ======================================================================
     #  Website / remote / flow / alert reports
@@ -61080,7 +64236,7 @@ proc ::mw_explicit_fonts {top names} {
             f"{a.kind}|{a.device_key}"
         sn = dict(self.config.get("alerts.snoozed", {}) or {})
         sn = {k: v for k, v in sn.items()
-              if isinstance(v, (int, float)) and v > now}
+              if snooze_end_ok(v, now) and v > now}
         sn[tag] = now + max(60.0, float(seconds))
         self.config.set("alerts.snoozed", dict(list(sn.items())[-200:]))
         self.config.save()
@@ -61265,15 +64421,23 @@ proc ::mw_explicit_fonts {top names} {
                 // 300 + 14)
 
         def run(job):
-            parts = job.pieces_under_gate(
-                gate, SessionCodec.iter_json(model, meta), total=n)
-            text = "".join(parts)
+            # third audit (memory): the pieces go to the file as they are
+            # made. Joined first, the whole session (24 MB with 10,000
+            # websites) was held two or three times over, every 30 s for
+            # the crash copy, and memory crept up with each copy
+            def pieces(write):
+                job.pieces_under_gate(
+                    gate, SessionCodec.iter_json(model, meta), total=n,
+                    each=write)
             if str(path).lower().endswith(".gz"):
                 # 5.1.2: opt-in, several times smaller
-                atomic_write_bytes(path, gzip.compress(text.encode("utf-8"),
-                                                       compresslevel=6))
+                def write_gz(f):
+                    with gzip.GzipFile(fileobj=f, mode="wb",
+                                       compresslevel=6) as z:
+                        pieces(lambda p: z.write(p.encode("utf-8")))
+                atomic_write_bytes(path, write_gz)
             else:
-                atomic_write_text(path, text)
+                atomic_write_text(path, lambda f: pieces(f.write))
             return path
         return run
 
@@ -61473,6 +64637,7 @@ proc ::mw_explicit_fonts {top names} {
         gw = self.model.infer_gateway()
         if gw:
             self.model.set_identity(gateway_ip=gw)
+            self.model.gateway_guessed = True
         self.root.after(1500, self._pcap_finalize, n, cancelled)
 
     def _pcap_finalize(self, n, cancelled):
@@ -61552,9 +64717,13 @@ proc ::mw_explicit_fonts {top names} {
         self.demo = DemoGenerator(self.lossless_sink())
         self.demo.start()
         self._restyle_mode_banner()
-        self._set_banner("\U0001F3AE  DEMO DATA — NOT LIVE TRAFFIC. Explore "
-                         "the tabs; nothing here is real and nothing mixes "
-                         "with your real session.", kind="warn")
+        # third audit (UI): the state line above already says "DEMO DATA —
+        # NOT LIVE TRAFFIC"; a second banner said it again under it on
+        # every tab and took about 45 pixels of a small screen. Any older
+        # message (Welcome, Stopped) goes too: it was about the session
+        # the demo just replaced.
+        self._banner_action(None)
+        self._hide_banner()
         # ST-04: the "I'll pick a network card" line is not true here
         self.status_var.set("Demo Mode — showing made-up traffic. Nothing "
                             "is being captured.")
@@ -61872,6 +65041,7 @@ proc ::mw_explicit_fonts {top names} {
             tx = tk.Text(col, wrap="word", bg=t["text_bg"], fg=t["text_fg"],
                          relief="flat", font=mw_font(9),
                          highlightthickness=0)
+            make_readonly_focusable(tx)
             tx.pack(fill="both", expand=True)
             texts.append(tx)
         panes.rowconfigure(0, weight=1)
@@ -62046,22 +65216,25 @@ proc ::mw_explicit_fonts {top names} {
         rows are plain dicts kept for the window); formatting and writing
         them — seconds on a OneDrive or network folder — happen in a
         background job. The file appears whole (written as .part, then
-        renamed)."""
+        renamed). Third audit #2: the temporary file is a new one of our
+        own, as in atomic_write_*: a link planted under its name is never
+        followed."""
+        tmp = _tmp_name(path)
+
         def run(job):
-            tmp = path + ".part"
-            with open(tmp, "w", newline="", encoding="utf-8") as f:
+            with _open_new_tmp(tmp, "w", encoding="utf-8", newline="") as f:
                 w = safe_csv_writer(f)
                 w.writerow(header)
                 for i, r in enumerate(rows):
                     w.writerow(r)
                     if i % 2000 == 1999:
                         job.progress(min(0.95, i / max(1, total)))
-            os.replace(tmp, path)
+            _replace_retrying(tmp, path)
             return path
 
         def failed(e):
             with contextlib.suppress(OSError):
-                os.remove(path + ".part")
+                os.remove(tmp)
             if not isinstance(e, JobCancelled):
                 messagebox.showerror("Export error", str(e),
                                      parent=self.root)
@@ -62975,6 +66148,7 @@ proc ::mw_explicit_fonts {top names} {
         txt = tk.Text(right, wrap="word", bg=t["card_bg"], fg=t["text_fg"],
                       relief="flat", height=18, padx=10, pady=4,
                       highlightthickness=0)
+        make_readonly_focusable(txt)
         txt.pack(fill="both", expand=True)
         txt.tag_configure("k", font=mw_font(9, "bold"),
                           foreground=t["muted_fg"])
@@ -63320,6 +66494,7 @@ proc ::mw_explicit_fonts {top names} {
         text = tk.Text(win, height=12, wrap="word", relief="flat",
                        bg=t["text_bg"], fg=t["text_fg"],
                        font=mw_font(10), highlightthickness=0)
+        make_readonly_focusable(text)
         text.pack(fill="both", expand=True, padx=12, pady=8)
 
         def fill(msg=""):
@@ -63482,6 +66657,7 @@ proc ::mw_explicit_fonts {top names} {
         if choice is None:
             return
         if choice:
+            self._stop_record_jobs()     # before the history is emptied
             self.history.clear()
             self._wipe_packets()
             self._forget_records()
@@ -63509,6 +66685,13 @@ proc ::mw_explicit_fonts {top names} {
         lw = getattr(self, "listen_watch", None)
         if lw is not None:
             lw.known, lw.learning = {}, True
+        # third audit #1: the crash journal was rewritten from the model
+        # still in memory within 30 s; start afresh like New session, no Undo
+        self._stop_record_jobs()
+        self.clear(confirmed=True)
+        self.model.baselines.reset()     # may be read before the delete ran
+        self._keep_undo(None)
+        self._banner_action(None)
         self._journal_written = False
         self._journal_count = -1
         gone = 0
@@ -63518,6 +66701,20 @@ proc ::mw_explicit_fonts {top names} {
                 gone += 1
         LOG.info("delete all history: %d other files removed", gone)
         return gone
+
+    def _stop_record_jobs(self):
+        """Round 4: the crash copy and history save under way are
+        cancelled while holding _forget_lock, which both take to check it
+        and write: one that had read the session before "Delete ALL
+        history" finishes first (and its files are deleted after) or
+        writes nothing. Before, a copy past its reading still put the
+        deleted session back on disk."""
+        active = getattr(getattr(self, "jobs", None), "active", {})
+        with self._forget_lock:
+            for kind in ("journal", "history"):
+                job = active.get(kind)
+                if job is not None:
+                    job.cancelled = True
 
     def reset_baselines(self, parent=None):
         if messagebox.askyesno("Reset learned baselines",
@@ -63682,11 +66879,20 @@ proc ::mw_explicit_fonts {top names} {
                 return None
 
             def run(job):
-                store(job.pieces_under_gate(self.gate,
-                                            self._history_pieces()))
+                pieces = job.pieces_under_gate(self.gate,
+                                               self._history_pieces())
+                # round 4: not after "Delete ALL history" (see
+                # _stop_record_jobs)
+                self._store_history_snapshot(lambda: store(pieces), job)
             return self.jobs.submit("history", "Saving history", run)
         store(self._history_pieces())
         return None
+
+    def _store_history_snapshot(self, write, job):
+        with self._forget_lock:
+            if job.cancelled:
+                raise JobCancelled()
+            write()
 
     # ======================================================================
     #  Country lookup glue (opt-in)
@@ -65345,6 +68551,7 @@ class DiagnosticsWindow:
         self.txt = tk.Text(body, wrap="none", bg=t["text_bg"],
                            fg=t["text_fg"], font=app.mono, relief="flat",
                            padx=8, pady=6, highlightthickness=0)
+        make_readonly_focusable(self.txt)
         vs = ttk.Scrollbar(body, orient="vertical", command=self.txt.yview)
         self.txt.configure(yscrollcommand=vs.set)
         vs.pack(side="right", fill="y")
@@ -65622,6 +68829,293 @@ TASK_WORKSPACES = {
 }
 
 
+# ---- Ctrl+K: ranked matching, scopes and rows made from what is typed -------
+@functools.lru_cache(maxsize=16384)
+def palette_fold(s):
+    """Lower case without accents, one character out for each one in (so a
+    position in the folded text is a position in the shown text):
+    "Paramètres" -> "parametres"."""
+    out = []
+    for c in s:
+        d = unicodedata.normalize("NFD", c)
+        out.append((d[:1] or c).lower()[:1] or c)
+    return "".join(out)
+
+
+_PAL_WORD = re.compile(r"[^\W_]+")
+_PAL_SKIP = frozenset(" -_‐‑‒–—")   # as search_fold
+
+
+@functools.lru_cache(maxsize=16384)
+def _pal_compact(f):
+    """The folded text without the characters a search skips ("wifi" is in
+    "wi-fi"), and where each kept character was."""
+    keep = tuple(i for i, c in enumerate(f) if c not in _PAL_SKIP)
+    return "".join(f[i] for i in keep), keep
+
+
+def _pal_subseq(tok, f):
+    """Positions of `tok`'s letters in order in `f`, the first at the start
+    of a word; [] when they are not all there."""
+    start = 0
+    while True:
+        i = f.find(tok[0], start)
+        if i < 0:
+            return []
+        if i == 0 or not f[i - 1].isalnum():
+            break
+        start = i + 1
+    pos = [i]
+    for ch in tok[1:]:
+        i = f.find(ch, i + 1)
+        if i < 0:
+            return []
+        pos.append(i)
+    return pos
+
+
+# what kind of thing comes first when words match equally well
+PALETTE_PRIOR = {"tab": 40, "workspace": 32, "your workspace": 32,
+                 "action": 30, "view": 25, "filter": 15, "recent filter": 12,
+                 "alert": 10, "setting": 10, "device": 8, "website": 8,
+                 "host": 6, "recent": 5, "help": 0}
+
+
+def palette_rank(tokens, label, cat, extra="", catx=""):
+    """How well `label` (kind `cat`) answers the words in `tokens` (folded,
+    see palette_fold), or None when one of them is nowhere in it. Each word
+    must hit: at the start of a word of the label 100, inside it 60, in the
+    kind's name 30, as letters in order 10 (words of 3 letters or more).
+    `extra` is the label in the language shown, `catx` the kind's name in
+    it. The whole label typed +500, starting with what was typed +200,
+    then the kind (tabs before settings), a shorter label first."""
+    prior = PALETTE_PRIOR.get(cat, 0)
+    short = min(len(label), 120) * 0.05
+    if not tokens:
+        return prior - short
+    fl = palette_fold(label)
+    fx = palette_fold(extra) if extra and extra != label else ""
+    words = _PAL_WORD.findall(fl)
+    cl = _pal_compact(fl)[0]
+    cx = ""
+    if fx:
+        words += _PAL_WORD.findall(fx)
+        cx = _pal_compact(fx)[0]
+    cwords = _PAL_WORD.findall(palette_fold(cat))
+    if catx:
+        cwords += _PAL_WORD.findall(palette_fold(catx))
+    total = 0
+    for tok in tokens:
+        if any(w.startswith(tok) for w in words):
+            total += 100
+        elif tok in cl or (cx and tok in cx):
+            total += 60
+        elif any(w.startswith(tok) for w in cwords):
+            total += 30
+        elif len(tok) >= 3 and (_pal_subseq(tok, fl) or
+                                (fx and _pal_subseq(tok, fx))):
+            total += 10
+        else:
+            return None
+    q = "".join(tokens)
+    for c in (cl, cx):
+        if c and c == q:
+            total += 500
+            break
+    for c in (cl, cx):
+        if c and c.startswith(q):
+            total += 200
+            break
+    return total + prior - short
+
+
+def palette_recent_bonus(i):
+    """Used lately: from +60 for the last one down to +5."""
+    return max(5, 60 - 3 * i)
+
+
+def palette_hits(tokens, text):
+    """The positions in `text` that the words in `tokens` matched (for the
+    bold letters of a row)."""
+    f = palette_fold(text)
+    hits = set()
+    for tok in tokens:
+        m = next((w for w in _PAL_WORD.finditer(f)
+                  if w.group().startswith(tok)), None)
+        if m is not None:
+            hits.update(range(m.start(), m.start() + len(tok)))
+            continue
+        c, keep = _pal_compact(f)
+        j = c.find(tok)
+        if j >= 0:
+            hits.update(keep[j:j + len(tok)])
+        elif len(tok) >= 3:
+            hits.update(_pal_subseq(tok, f))
+    return hits
+
+
+# the group buttons under the box: key, name; and the kinds each one shows
+PALETTE_CHIPS = (("all", "All"), ("commands", "Commands"), ("tabs", "Tabs"),
+                 ("settings", "Settings"), ("devices", "Devices"),
+                 ("help", "Help"), ("filters", "Filters"))
+PALETTE_SCOPE_CATS = {
+    "all": None,
+    "commands": {"action", "view", "tab", "workspace", "your workspace"},
+    "tabs": {"tab"}, "settings": {"setting"},
+    "devices": {"device", "website", "host"}, "help": {"help"},
+    "filters": {"filter", "recent filter"},
+    "packet": set(),                  # only the rows made from the number
+    "actions": {"action"}, "views": {"view"},
+    "workspaces": {"workspace", "your workspace"}, "alerts": {"alert"},
+    "websites": {"website"}, "hosts": {"host"},
+    "recents": {"recent", "recent filter"},
+}
+# a first character that picks the group, as in Slack or VS Code
+PALETTE_PREFIXES = {">": "commands", "@": "devices", "/": "filters",
+                    "?": "help", "#": "packet", ":": "packet"}
+# "help: dns": a kind's name and a colon
+PALETTE_NAMES = {"help": "help", "tab": "tabs", "tabs": "tabs",
+                 "setting": "settings", "settings": "settings",
+                 "action": "actions", "actions": "actions",
+                 "view": "views", "views": "views",
+                 "command": "commands", "commands": "commands",
+                 "workspace": "workspaces", "workspaces": "workspaces",
+                 "device": "devices", "devices": "devices",
+                 "website": "websites", "websites": "websites",
+                 "host": "hosts", "hosts": "hosts",
+                 "alert": "alerts", "alerts": "alerts",
+                 "filter": "filters", "filters": "filters",
+                 "recent": "recents"}
+_PAL_NAME_RE = re.compile(r"^([^\W\d_]+)\s*:\s*(.*)$", re.S)
+
+
+def palette_scope(q, chip="all"):
+    """What a query asks for: (key, kinds shown or None for all, the words
+    to look for, how many characters of `q` the scope's own prefix takes).
+    A prefix wins over the chip: ">" commands, "@" devices, websites and
+    hosts, "#" or ":" a packet number, "/" a filter, "?" help, or a kind's
+    name and a colon ("help: dns", in the language shown too)."""
+    s = q.lstrip()
+    lead = len(q) - len(s)
+    if s and s[0] in PALETTE_PREFIXES:
+        key = PALETTE_PREFIXES[s[0]]
+        return key, PALETTE_SCOPE_CATS[key], s[1:], lead + 1
+    m = _PAL_NAME_RE.match(s)
+    if m:
+        name = palette_fold(m.group(1))
+        key = PALETTE_NAMES.get(name)
+        if key is None and CURRENT_LOCALE != "en":
+            for en, k in PALETTE_NAMES.items():
+                if palette_fold(translate_text(en)) == name:
+                    key = k
+                    break
+        if key is not None:
+            return key, PALETTE_SCOPE_CATS[key], m.group(2), \
+                len(q) - len(m.group(2))
+    if chip not in PALETTE_SCOPE_CATS:
+        chip = "all"
+    return chip, PALETTE_SCOPE_CATS[chip], q, 0
+
+
+_PAL_PACKET_RE = re.compile(
+    r"^(?:(?:go\s*to|goto|jump\s*to|open|show)\s+)?"
+    r"(?:packet|pkt|frame|paquet|paquete)\s*(?:no\.?|number|num|#|:)?\s*"
+    r"(\d{1,9})$", re.I)
+_PAL_NUMBER_RE = re.compile(r"^[#:]?\s*(\d{1,9})$")
+PAL_FIELD_RE = re.compile(
+    r"(?<![\w.])(" + "|".join(sorted(DisplayFilter.FIELDS)) + r")\s*:\s*",
+    re.I)
+_PAL_MAC_RE = re.compile(r"^(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$")
+
+
+def palette_packet_number(text):
+    """"go to packet 123", "packet 123", "#123", ":123" or "123" -> 123."""
+    t = (text or "").strip()
+    m = _PAL_PACKET_RE.match(t) or _PAL_NUMBER_RE.match(t)
+    return int(m.group(1)) if m else None
+
+
+def palette_filter_expr(text):
+    """A filter written in the box ("ip:1.2.3.4", "port: 443 or
+    proto:dns") -> the expression, else None."""
+    t = (text or "").strip()
+    if not PAL_FIELD_RE.search(t):
+        return None
+    expr = PAL_FIELD_RE.sub(lambda m: m.group(1).lower() + ":", t).strip()
+    return None if expr.endswith(":") else expr
+
+
+def palette_address(text):
+    """A bare IP or MAC address -> ("ip" | "mac", address), else None."""
+    t = (text or "").strip()
+    if _PAL_MAC_RE.match(t):
+        return "mac", t.lower().replace("-", ":")
+    if ":" in t or "." in t:
+        try:
+            return "ip", str(ipaddress.ip_address(t))
+        except ValueError:
+            return None
+    return None
+
+
+class _PaletteLines:
+    """The rows of the Ctrl+K list with the calls of a Listbox (size, get,
+    curselection, selection_set, selection_clear, see, delete, insert), so
+    the code and the tests written for the Listbox still work. A "line" is
+    a row, a section title or a note."""
+
+    def __init__(self, pal):
+        self.pal = pal
+
+    def size(self):
+        return len(self.pal._entries)
+
+    def _text(self, n):
+        kind, v = self.pal._entries[n]
+        if kind != "row":
+            return v
+        r = self.pal.shown[v]
+        return f"{r[4]}    — {r[5]}" + (f"    [{r[6]}]" if r[6] else "")
+
+    def get(self, first, last=None):
+        if last is None:
+            return self._text(int(first))
+        end = len(self.pal._entries) - 1 if last == "end" else int(last)
+        return tuple(self._text(i) for i in range(int(first), end + 1))
+
+    def curselection(self):
+        p = self.pal
+        if 0 <= p._sel < len(p.shown):
+            return (p._line_of(p._sel),)
+        return ()
+
+    def selection_set(self, first, last=None):
+        for i, (kind, v) in enumerate(self.pal._entries):
+            if kind == "row" and i == int(first):
+                self.pal._select(v)
+                return
+
+    def selection_clear(self, first=None, last=None):
+        self.pal._sel = -1
+        self.pal._paint_sel()
+
+    def see(self, i):
+        with contextlib.suppress(tk.TclError):
+            self.pal.txt.see(f"{int(i) + 1}.0")
+
+    def delete(self, first, last=None):
+        p = self.pal
+        a = int(first)
+        b = len(p._entries) - 1 if last == "end" else int(
+            a if last is None else last)
+        del p._entries[a:b + 1]
+        p._draw()
+
+    def insert(self, index, text):
+        self.pal._entries.append(("note", str(text)))
+        self.pal._draw()
+
+
 def palette_tab_label(label_key, name=""):
     """A tab as the tab strip names it, without its icon ("Happening")."""
     label = translate_text(tr(label_key)) if label_key else name
@@ -65630,37 +69124,119 @@ def palette_tab_label(label_key, name=""):
 
 class CommandPalette:
     """Ctrl+K: type to reach any tab, view, setting, filter, device or
-    action."""
+    action. Words rank the rows (palette_rank); a first character or the
+    group buttons narrow them; numbers, addresses and filters become rows
+    of their own (app.palette_dynamic)."""
+
+    CAP = 100
+    # what Ctrl+K offers before anything is typed, after the recent ones
+    SUGGESTED = ("Settings", "Go to packet…", "Open a capture file…",
+                 "Save session…")
 
     def __init__(self, app):
         self.app = app
         t = app.theme
         self.items = app.palette_items()
+        self._recent = [x for x in (app.config.get("palette.recent", [])
+                                    or []) if isinstance(x, str)][:20]
+        self.chip = "all"
+        # label -> kind, for what may be written to the configuration
+        self._kind_of = {it[0]: it[1] for it in self.items}
+        self.shown = []           # (-score, label, kind, action, + the list's)
+        self._entries = []        # a line each: ("row", n) | ("head"|"note", text)
+        self._lines = {}
+        self._sel = -1
         self.win = tk.Toplevel(app.root)
         self.win.title("Go to…")
-        self.win.geometry(px_geo("620x420"))
         self.win.configure(bg=t["tab_bg"])
         self.win.transient(app.root)
+        self._place()
         self.q = tk.StringVar()
-        e = ttk.Entry(self.win, textvariable=self.q, font=("TkDefaultFont",
-                                                           12))
+        e = ttk.Entry(self.win, textvariable=self.q, font=default_font(12))
         e.pack(fill="x", padx=12, pady=(12, 6))
-        self.lb = tk.Listbox(self.win, bg=t["text_bg"], fg=t["text_fg"],
-                             selectbackground=t["accent"],
-                             activestyle="none", highlightthickness=0,
-                             font=mw_font(11))
-        self.lb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        self.shown = []
+        # the groups: clicked, or Tab / Shift+Tab in the box; never focused
+        self._selfg = "#ffffff" if wcag_contrast(t["accent"], "#ffffff") >= \
+            wcag_contrast(t["accent"], "#000000") else "#000000"
+        chips = tk.Frame(self.win, bg=t["tab_bg"])
+        chips.pack(fill="x", padx=12, pady=(0, 6))
+        self.chips = {}
+        for key, name in PALETTE_CHIPS:
+            lbl = tk.Label(chips, text=name, padx=8, pady=1,
+                           font=mw_font(9), cursor="hand2", takefocus=0)
+            lbl.pack(side="left", padx=(0, 4))
+            lbl.bind("<Button-1>", lambda ev, k=key: self._pick_chip(k))
+            self.chips[key] = lbl
+        tk.Label(self.win, text=translate_text(
+            "Type to search. Start with > commands, @ devices, # packet "
+            "number, / filter, ? help. Tab changes the group."),
+            bg=t["tab_bg"], fg=t["muted_fg"], font=mw_font(8), anchor="w",
+            justify="left", wraplength=580, takefocus=0).pack(
+            side="bottom", fill="x", padx=12, pady=(0, 8))
+        body = tk.Frame(self.win, bg=t["tab_bg"])
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        sb = ttk.Scrollbar(body, orient="vertical", takefocus=0)
+        sb.pack(side="right", fill="y")
+        self.txt = tx = tk.Text(
+            body, bg=t["text_bg"], fg=t["text_fg"], font=mw_font(11),
+            wrap="none", width=10, height=5, highlightthickness=0,
+            borderwidth=0, padx=6, pady=2, cursor="arrow", takefocus=0,
+            exportselection=0, insertwidth=0, spacing1=2, spacing3=2,
+            state="disabled", yscrollcommand=sb.set)
+        sb.configure(command=tx.yview)
+        tx.pack(side="left", fill="both", expand=True)
+        self.lb = _PaletteLines(self)
+        tx.tag_configure("cat", foreground=t["muted_fg"], font=mw_font(9))
+        tx.tag_configure("key", foreground=t["muted_fg"], font=mw_font(9))
+        tx.tag_configure("head", foreground=t["muted_fg"],
+                         font=mw_font(8, "bold"), spacing1=8)
+        tx.tag_configure("note", foreground=t["muted_fg"],
+                         font=mw_font(10, "italic"))
+        tx.tag_configure("hit", font=mw_font(11, "bold"),
+                         foreground=t.get("focus", t["accent"]))
+        tx.tag_configure("selrow", background=t["accent"],
+                         foreground=self._selfg)
+        tx.tag_raise("selrow")
+        tx.bind("<Configure>", self._tabstop)
+        tx.bind("<Button-1>", self._click)
+        tx.bind("<Double-Button-1>", lambda ev: self._click(ev, True))
+        for seq in ("<B1-Motion>", "<Triple-Button-1>", "<Shift-Button-1>",
+                    "<Control-Button-1>", "<ButtonRelease-1>"):
+            tx.bind(seq, lambda ev: "break")
         self.q.trace_add("write", lambda *a: self.filter())
         e.bind("<Return>", self.run)
-        e.bind("<Down>", lambda ev: self._move(1))
-        e.bind("<Up>", lambda ev: self._move(-1))
-        self.lb.bind("<Double-1>", self.run)
+        e.bind("<KP_Enter>", self.run)
+        e.bind("<Shift-Return>", lambda ev: self.run(keep=True))
+        for seq, d in (("<Down>", 1), ("<Up>", -1), ("<Control-n>", 1),
+                       ("<Control-p>", -1), ("<Control-j>", 1),
+                       ("<Next>", 10), ("<Prior>", -10)):
+            e.bind(seq, lambda ev, d=d: self._move(d))
+        e.bind("<Control-Home>", lambda ev: self._select(0))
+        e.bind("<Control-End>", lambda ev: self._select(len(self.shown) - 1))
+        e.bind("<Tab>", lambda ev: self._cycle(1))
+        e.bind("<Shift-Tab>", lambda ev: self._cycle(-1))
+        e.bind("<ISO_Left_Tab>", lambda ev: self._cycle(-1))
         self.win.bind("<Escape>", lambda ev: self.close())
         self.entry = e
         self.filter()
         e.focus_set()
         self.win.after(60, lambda: focus_toplevel(self.win, e))
+
+    def _place(self):
+        """620 x 420 over the middle of the main window."""
+        root = self.app.root
+        w, h = (int(x) for x in px_geo("620x420").split("x"))
+        try:
+            root.update_idletasks()
+            if root.winfo_width() < 200:
+                self.win.geometry(f"{w}x{h}")
+                return
+            x = root.winfo_rootx() + (root.winfo_width() - w) // 2
+            y = root.winfo_rooty() + (root.winfo_height() - h) // 2
+            x = max(0, min(x, root.winfo_screenwidth() - w))
+            y = max(0, min(y, root.winfo_screenheight() - h - 40))
+            self.win.geometry(f"{w}x{h}+{x}+{y}")
+        except tk.TclError:
+            self.win.geometry(f"{w}x{h}")
 
     def alive(self):
         try:
@@ -65674,52 +69250,248 @@ class CommandPalette:
         with contextlib.suppress(tk.TclError):
             self.win.destroy()
 
-    def filter(self):
-        q = self.q.get()
-        recent = list(getattr(self.app, "_palette_recent", ()))
-        scored = []
-        for label, cat, fn in self.items:
-            s = fuzzy_score(q, f"{label} {cat}")
-            if s is not None:
-                if label in recent:          # used lately: a small boost
-                    s += 3 + recent.index(label) * 0.1
-                scored.append((-s, label, cat, fn))
-        scored.sort(key=lambda x: x[0])
-        self.shown = scored[:60]
-        self.lb.delete(0, "end")
-        for _s, label, cat, _fn in self.shown:
-            key = self.app.palette_key(label)
-            self.lb.insert("end", f"{label}    — {translate_text(cat)}"
-                           + (f"    [{key}]" if key else ""))
-        if self.shown:
-            self.lb.selection_set(0)
-        else:
-            self.lb.insert("end", translate_text(
-                "No matches. Try a tab, a setting, a device or an action."))
-            with contextlib.suppress(tk.TclError):
-                self.lb.itemconfigure(0, foreground=self.app.theme[
-                    "muted_fg"])
+    # ---- groups ------------------------------------------------------------
+    def _active_chip(self):
+        key = palette_scope(self.q.get(), self.chip)[0]
+        return key if key in dict(PALETTE_CHIPS) else "all"
 
-    def _move(self, d):
-        sel = self.lb.curselection()
-        i = max(0, min(len(self.shown) - 1, (sel[0] if sel else 0) + d))
-        self.lb.selection_clear(0, "end")
-        self.lb.selection_set(i)
-        self.lb.see(i)
+    def _paint_chips(self):
+        t, active = self.app.theme, self._active_chip()
+        for key, lbl in self.chips.items():
+            on = key == active
+            with contextlib.suppress(tk.TclError):
+                lbl.configure(bg=t["accent"] if on else t["card_bg"],
+                              fg=self._selfg if on else t["text_fg"])
+
+    def _pick_chip(self, key):
+        """A group chosen: its prefix leaves the text, and the group stays
+        until another one is chosen."""
+        q = self.q.get()
+        cut = palette_scope(q, "all")[3]
+        self.chip = key
+        with contextlib.suppress(tk.TclError):
+            self.entry.focus_set()
+        if cut:
+            self.q.set(q[cut:])           # runs filter()
+        else:
+            self.filter()
         return "break"
 
-    def run(self, _e=None):
-        sel = self.lb.curselection()
-        if not sel or sel[0] >= len(self.shown):
-            return
-        label, fn = self.shown[sel[0]][1], self.shown[sel[0]][3]
-        rec = self.app.__dict__.setdefault("_palette_recent", deque(
-            maxlen=20))
-        if label in rec:
-            rec.remove(label)
-        rec.append(label)
+    def _cycle(self, d):
+        keys = [k for k, _n in PALETTE_CHIPS]
+        cur = self._active_chip()
+        return self._pick_chip(keys[(keys.index(cur) + d) % len(keys)])
+
+    # ---- the list ----------------------------------------------------------
+    def _row(self, neg, label, cat, fn, tokens=(), dyn=False):
+        """A `shown` entry: (-score, label, kind, action) and, after them,
+        what the list draws: label and kind as shown, key, matched letters,
+        and whether the row was made from the typed text."""
+        if dyn:
+            disp, cdisp = self._dyn_text(label), translate_text(cat)
+            key, hits = "", set()
+        else:
+            disp = translate_text(label) if CURRENT_LOCALE != "en" else label
+            cdisp = translate_text(cat)
+            key = self.app.palette_key(label, cat)
+            hits = palette_hits(tokens, disp) if tokens else set()
+        return (neg, label, cat, fn, disp, cdisp, key, hits, dyn)
+
+    @staticmethod
+    def _dyn_text(label):
+        for pre in ("Go to packet", "Filter packets:", "Show device",
+                    "Search everything for"):
+            if label.startswith(pre + " "):
+                return translate_text(pre) + label[len(pre):]
+        return label
+
+    def filter(self):
+        app = self.app
+        q = self.q.get()
+        key, cats, rest, _cut = palette_scope(q, self.chip)
+        self._paint_chips()
+        if not q.strip() and self.chip == "all":
+            return self._show_sections()
+        tokens = palette_fold(rest).split()
+        loc = CURRENT_LOCALE != "en"
+        order = {lab: i for i, lab in enumerate(self._recent)}
+        scored = []
+        for n, (label, cat, fn) in enumerate(self.items):
+            if cats is not None and cat not in cats:
+                continue
+            tl = translate_text(label) if loc else ""
+            tc = translate_text(cat) if loc else ""
+            s = palette_rank(tokens, label, cat, tl, tc)
+            if s is None:
+                continue
+            if label in order:
+                s += palette_recent_bonus(order[label])
+            scored.append((-s, n, label, cat, fn))
+        scored.sort(key=lambda x: x[:2])
+        total = len(scored)
+        dyn = app.palette_dynamic(q, self.chip) if q.strip() else []
+        shown = []
+        for i, (label, cat, fn) in enumerate(
+                d for d in dyn if d[1] != "search"):
+            shown.append(self._row(-10000.0 + i, label, cat, fn, dyn=True))
+        for neg, _n, label, cat, fn in scored[:self.CAP]:
+            shown.append(self._row(neg, label, cat, fn, tokens))
+        entries = [("row", i) for i in range(len(shown))]
+        if total > self.CAP:
+            entries.append(("note", translate_text(
+                "{n} of {m} – keep typing").format(n=self.CAP, m=total)))
+        if not shown:
+            entries.append(("note", translate_text(
+                "Type a packet number, for example :123" if key == "packet"
+                else "No matches. Try a tab, a setting, a device or an "
+                     "action.")))
+        for label, cat, fn in (d for d in dyn if d[1] == "search"):
+            shown.append(self._row(-1e-3, label, cat, fn, dyn=True))
+            entries.append(("row", len(shown) - 1))
+        self.shown, self._entries = shown, entries
+        self._sel = 0 if shown else -1
+        self._draw()
+
+    def _show_sections(self):
+        """Nothing typed: what you ran lately, then a few places to start."""
+        by_label = {}
+        for it in self.items:
+            by_label.setdefault(it[0], it)
+        rec = [by_label[x] for x in self._recent if x in by_label][:10]
+        used = {x[0] for x in rec}
+        sug = [it for it in self.items if it[1] == "tab"] + [
+            by_label[x] for x in self.SUGGESTED if x in by_label]
+        sug = [it for it in sug if it[0] not in used]
+        shown, entries = [], []
+        for title, group in (("Recent", rec), ("Suggested", sug)):
+            if not group:
+                continue
+            entries.append(("head", translate_text(title).upper()))
+            for label, cat, fn in group:
+                shown.append(self._row(0.0, label, cat, fn))
+                entries.append(("row", len(shown) - 1))
+        self.shown, self._entries = shown, entries
+        self._sel = 0 if shown else -1
+        self._draw()
+
+    def _line_of(self, i):
+        return self._lines.get(i, i)
+
+    def _draw(self):
+        tx = self.txt
+        tx.configure(state="normal")
+        tx.delete("1.0", "end")
+        self._lines = {}
+        for n, (kind, v) in enumerate(self._entries):
+            if n:
+                tx.insert("end", "\n")
+            if kind != "row":
+                tx.insert("end", v, kind)
+                continue
+            self._lines[v] = n
+            r = self.shown[v]
+            start = tx.index("end-1c")
+            tx.insert("end", r[4])
+            a = b = None
+            for h in sorted(r[7]) + [None]:
+                if h is not None and h == b:
+                    b = h + 1
+                    continue
+                if a is not None:
+                    tx.tag_add("hit", f"{start}+{a}c", f"{start}+{b}c")
+                a, b = (h, h + 1) if h is not None else (None, None)
+            tx.insert("end", "   " + r[5], "cat")
+            if r[6]:
+                tx.insert("end", "\t" + r[6], "key")
+        tx.configure(state="disabled")
+        self._tabstop()
+        self._paint_sel()
+        with contextlib.suppress(tk.TclError):
+            tx.yview_moveto(0)
+
+    def _tabstop(self, _e=None):
+        """The key of a row, right-aligned at the edge of the list."""
+        with contextlib.suppress(tk.TclError):
+            self.txt.configure(tabs=(max(100, self.txt.winfo_width() - 16),
+                                     "right"))
+
+    def _paint_sel(self):
+        tx = self.txt
+        with contextlib.suppress(tk.TclError):
+            tx.tag_remove("selrow", "1.0", "end")
+            if 0 <= self._sel < len(self.shown):
+                ln = self._lines.get(self._sel)
+                if ln is not None:
+                    tx.tag_add("selrow", f"{ln + 1}.0",
+                               f"{ln + 1}.0 lineend+1c")
+
+    def _select(self, i, see=True):
+        if not self.shown:
+            return "break"
+        self._sel = max(0, min(len(self.shown) - 1, i))
+        self._paint_sel()
+        if see:
+            with contextlib.suppress(tk.TclError):
+                if self._sel == 0:
+                    self.txt.see("1.0")
+                self.txt.see(f"{self._line_of(self._sel) + 1}.0")
+        return "break"
+
+    def _move(self, d):
+        return self._select((self._sel if self._sel >= 0 else 0) + d)
+
+    def _click(self, e, run=False):
+        """A click on a row selects it (twice runs it); the keyboard stays
+        in the box."""
+        with contextlib.suppress(tk.TclError, ValueError):
+            n = int(self.txt.index(f"@{e.x},{e.y}").split(".")[0]) - 1
+            if 0 <= n < len(self._entries) and \
+                    self._entries[n][0] == "row":
+                self._select(self._entries[n][1], see=False)
+                if run:
+                    self.run()
+        with contextlib.suppress(tk.TclError):
+            self.entry.focus_set()
+        return "break"
+
+    # ---- running ------------------------------------------------------------
+    # what is written to the configuration file: where to go and what to
+    # do, never names from the network (devices, websites, hosts, alerts,
+    # recent cards, filters typed). All of them stay in memory.
+    SAVED_KINDS = frozenset({"tab", "action", "view", "setting", "help",
+                             "workspace", "your workspace", "filter"})
+
+    def _remember(self, label, cat=None):
+        self._recent = ([label] + [x for x in self._recent
+                                   if x != label])[:20]
+        if cat is not None:
+            self._kind_of[label] = cat
+        cfg = self.app.config
+        cfg.set("palette.recent", [x for x in self._recent
+                                   if self._kind_of.get(x) in
+                                   self.SAVED_KINDS])
+        cfg.save()
+
+    def run(self, _e=None, keep=False):
+        """Enter runs the row; Shift+Enter runs it and keeps the box open."""
+        if not 0 <= self._sel < len(self.shown):
+            return "break"
+        row = self.shown[self._sel]
+        label, fn = row[1], row[3]
+        if not row[8]:
+            self._remember(label, row[2])
+        if keep:
+            self.entry.after_idle(lambda: focus_toplevel(self.win,
+                                                         self.entry))
+            fn()
+            return "break"
+        app = self.app
         self.close()
-        fn()
+        try:
+            fn()
+        finally:
+            app._focus_main()
+        return "break"
 
 
 STORAGE_CATEGORIES = (
@@ -65879,6 +69651,7 @@ class CrashDialog:
                  justify="left").pack(anchor="w", padx=14)
         txt = tk.Text(win, height=12, bg=t["text_bg"], fg=t["text_fg"],
                       font=app.mono, relief="flat", highlightthickness=0)
+        make_readonly_focusable(txt)
         txt.insert("1.0", text[-4000:])
         txt.config(state="disabled")
         txt.pack(fill="both", expand=True, padx=14, pady=8)
@@ -66457,6 +70230,141 @@ def journal_owner(path):
         return int(side.get("pid") or 0) if isinstance(side, dict) else 0
     except (TypeError, ValueError):
         return 0
+
+
+CRASH_COPY_DAMAGED = ("The interrupted session can't be restored: its crash "
+                      "copy is incomplete or damaged. It was left in the "
+                      "sessions folder.")
+CRASH_COPY_UNREADABLE = ("The interrupted session can't be restored: its "
+                         "crash copy couldn't be read or copied.")
+
+
+class CrashCopyUnreadable(ValueError):
+    """A crash copy that can't be restored; str() is a plain sentence."""
+
+
+def read_crash_copy(path, limit=SESSION_MAX_CHARS):
+    """Round 4: the crash copy (journal) at `path` as the bytes of a
+    session file. -> (data, verified): verified is False when its
+    fingerprint was missing or didn't match but the file holds a whole
+    session (it is only ever put in place whole). Raises
+    CrashCopyUnreadable with a plain message, never anything else: a
+    copy whose fingerprint was not written yet failed with the bare
+    KeyError 'sha256'."""
+    side = read_json(path + ".sha256")
+    side = side if isinstance(side, dict) else {}
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(limit + 1)
+    except OSError as e:
+        raise CrashCopyUnreadable(CRASH_COPY_UNREADABLE) from e
+    if len(raw) > limit:
+        raise CrashCopyUnreadable(CRASH_COPY_DAMAGED)
+    if side.get("journal") == 2:
+        good = [side.get("sha256")] + list(side.get("previous") or [])[:4]
+        if hashlib.sha256(raw).hexdigest() in good:
+            return raw, True
+    try:
+        j = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError) as e:
+        raise CrashCopyUnreadable(CRASH_COPY_DAMAGED) from e
+    if not isinstance(j, dict):
+        raise CrashCopyUnreadable(CRASH_COPY_DAMAGED)
+    if "schema_version" in j and isinstance(j.get("session"), dict):
+        return raw, False                        # journal v2, whole
+    if isinstance(j.get("session"), dict) and "sha256" in j:
+        # journal v1 (5.0.x): one object holding the session and its
+        # fingerprint
+        body = json.dumps(j["session"], default=str, sort_keys=True)
+        if hashlib.sha256(body.encode()).hexdigest() != j["sha256"]:
+            raise CrashCopyUnreadable(CRASH_COPY_DAMAGED)
+        return json.dumps(j["session"], separators=(",", ":"),
+                          default=str).encode("utf-8"), True
+    raise CrashCopyUnreadable(CRASH_COPY_DAMAGED)
+
+
+def publish_crash_copy(part, path, cancelled=None, lock=None):
+    """Round 4: put the finished crash copy `part` in place at `path`
+    with its fingerprint (path.sha256), so that a crash at any moment
+    leaves a pair that restores. The fingerprint names the new copy and
+    still accepts the one in place before the rename; it is written once
+    more without the old one after. Before, a kill between the rename and
+    the fingerprint (4 of 25 in round 4) left a copy that Restore turned
+    down. `cancelled()` true (Delete ALL history ran meanwhile): nothing
+    is put in place; it is asked holding `lock`, which Delete ALL takes
+    too. -> True when published."""
+    h = hashlib.sha256()
+    with open(part, "rb") as f:
+        # third audit: 1 MB at a time, not the whole file at once
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    old = read_json(path + ".sha256")
+    keep = []
+    if isinstance(old, dict) and os.path.exists(path):
+        keep = [d for d in [old.get("sha256")] + list(
+            old.get("previous") or [])[:3] if isinstance(d, str)]
+    side = {"journal": 2, "saved_at": time.time(), "sha256": h.hexdigest(),
+            "pid": os.getpid()}
+    with (lock if lock is not None else contextlib.nullcontext()):
+        if cancelled is not None and cancelled():
+            with contextlib.suppress(OSError):
+                os.remove(part)
+            return False
+        atomic_write_json(path + ".sha256", dict(side, previous=keep))
+        _replace_retrying(part, path)
+        atomic_write_json(path + ".sha256", side)
+    return True
+
+
+STALE_TMP_AGE = 6 * 3600
+# what MiniWireshark itself leaves when a write is cut short: the
+# temporary file of an atomic write (_tmp_name), the crash copy's part
+# and a restored session's part (5.3.4 and earlier)
+_STALE_TMP_RE = re.compile(r"\.tmp(\d+)-\d+$|"
+                           r"^journal\.mwsession\.json\.(\d+)\.part$|"
+                           r"^restored\.mwsession\.json\.part$")
+STALE_TMP_FOLDERS = ("", "sessions", "cache", "logs")
+
+
+def sweep_stale_temp_files(folder=None, now=None, age=STALE_TMP_AGE):
+    """Round 4: temporary files that an interrupted write left in the data
+    folder (18 MB of session data after 25 kills) were never removed.
+    Only the names MiniWireshark makes, only in its own data folder and
+    its sessions, cache and logs folders, only regular files untouched
+    for `age` seconds whose writer isn't running; a link is never
+    followed or removed. -> the removed paths."""
+    folder = folder or PATHS.data
+    now = time.time() if now is None else now
+    gone = []
+    for sub in STALE_TMP_FOLDERS:
+        d = os.path.join(folder, sub) if sub else folder
+        try:
+            if not stat.S_ISDIR(os.lstat(d).st_mode):
+                continue                         # a link: not followed
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for e in entries:
+            m = _STALE_TMP_RE.search(e.name)
+            if not m:
+                continue
+            try:
+                st = e.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or now - st.st_mtime < age:
+                continue
+            pid = m.group(1) or m.group(2)
+            if pid and int(pid) != os.getpid() and _pid_alive(pid):
+                continue
+            with contextlib.suppress(OSError):
+                os.remove(e.path)
+                gone.append(e.path)
+    if gone:
+        LOG.info("removed %d temporary files left by an interrupted write",
+                 len(gone))
+    return gone
 
 
 def claim_interrupted_journal(path=None, now=None, keep=3):
@@ -74556,15 +78464,51 @@ def _mutate_call_frame(rng, raw):
     return bytes(b)
 
 
+def _cpu_clock():
+    """This thread's CPU time clock, or None where there is none."""
+    clock = getattr(time, "thread_time", None)
+    try:
+        clock()
+        return clock
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+def call_frame_limit_check(cpu_slowest, waited, retime, limit=0.050,
+                           tries=5):
+    """Fifth audit: "one frame took 98 ms" failed `call decoder fuzz` once
+    on a busy machine. The 50 ms limit stays; what is measured changed.
+    `cpu_slowest` is the most CPU time one frame used (None without a CPU
+    clock): over the limit fails. `waited` holds the frames whose wall
+    time was over it; each is timed again (`retime(frame)` -> seconds)
+    and fails only when it is slow every one of `tries` times, so a frame
+    the machine set aside for a while (preemption, another program) no
+    longer fails while one that is slow every time still does.
+    -> "" when all is well, else what was slow."""
+    if cpu_slowest is not None and cpu_slowest >= limit:
+        return f"one frame took {cpu_slowest * 1000:.0f} ms of CPU time"
+    for frame in waited:
+        best = min(retime(frame) for _ in range(tries))
+        if best >= limit:
+            return (f"one frame took {best * 1000:.0f} ms each of "
+                    f"{tries} times")
+    return ""
+
+
 @self_test(slow=True)
 def t_call_decoder_fuzz(ctx):
     """5.3.4 (MC8, S4 and S12 for the new decoder): mutated call frames
     never make wire_rtc, either decoder or the call tracker raise, none
-    takes over 50 ms, and both decoders agree on every field."""
+    takes over 50 ms, and both decoders agree on every field. Fifth
+    audit: the 50 ms is this thread's CPU time, and a frame over 50 ms of
+    wall time is timed again and fails only when slow every time, so a
+    busy machine no longer fails it ("one frame took 98 ms")."""
     rng = random.Random(1010)
     frames = call_corpus().frames()
     m = _call_model(ctx, frames[:4000])        # streams to be fed lies
-    slowest, mutated = 0.0, []
+    cpu = _cpu_clock()
+    limit = 0.050
+    cpu_slowest, waited, mutated = 0.0, [], []
     # the time limit is the decoders' own: a garbage-collector pass (a
     # whole-heap walk that the app's frozen start-up objects keep short)
     # runs between frames, not inside the timed part
@@ -74575,13 +78519,17 @@ def t_call_decoder_fuzz(ctx):
             raw, ts, lt = frames[rng.randrange(len(frames))]
             b = _mutate_call_frame(rng, raw)
             t0 = time.perf_counter()
+            c0 = cpu() if cpu else 0.0
             r = wire_rtc(b[42:])
             if r is not None and r["kind"] == "RTP":
                 assert r["header_len"] <= len(b) - 42, r
             d = fast_decode(b, ts + 0.0001 * i, lt)
             assert isinstance(d, dict) and "proto" in d
             m.ingest(d)
-            slowest = max(slowest, time.perf_counter() - t0)
+            if cpu:
+                cpu_slowest = max(cpu_slowest, cpu() - c0)
+            if time.perf_counter() - t0 >= limit:
+                waited.append((b, ts + 0.0001 * i, lt))
             if i % 4 == 0:
                 mutated.append((b, ts, lt))
             if i % 500 == 499:
@@ -74591,7 +78539,22 @@ def t_call_decoder_fuzz(ctx):
             gc.enable()
     m.calls.summary()
     calls_card_text(m.calls)
-    assert slowest < 0.050, f"one frame took {slowest * 1000:.0f} ms"
+
+    def retime(frame):
+        b, ts, lt = frame
+        t0 = time.perf_counter()
+        wire_rtc(b[42:])
+        fast_decode(b, ts, lt)
+        return time.perf_counter() - t0
+    was_on = gc.isenabled()
+    gc.disable()
+    try:
+        slow = call_frame_limit_check(cpu_slowest if cpu else None,
+                                      waited, retime, limit)
+    finally:
+        if was_on:
+            gc.enable()
+    assert not slow, slow
     if ctx.scapy_ok:
         diffs = decoder_differences(mutated)
         assert not diffs, f"{len(diffs)} differences, e.g. " + \
@@ -76230,6 +80193,14 @@ def t_a2_beacon(ctx):
     assert beacon_period([60.0 * i for i in range(25)]) == 60.0
     assert beacon_period([60.0 * i + (i % 2) * 25 for i in range(25)]) \
         is None
+    # third audit: ±40 % jitter on a 60 s timer still counts; random
+    # (exponential) gaps with the same mean don't
+    jit = list(itertools.accumulate(60 * rng.uniform(0.6, 1.4)
+                                    for _ in range(25)))
+    assert 40 < (beacon_period(jit) or 0) < 80, jit
+    rnd = list(itertools.accumulate(rng.expovariate(1 / 60.0)
+                                    for _ in range(25)))
+    assert beacon_period(rnd) is None, rnd
 
 
 @self_test()
@@ -76326,6 +80297,402 @@ def t_a2_rogue_dhcp(ctx):
     got = a2_kinds(m, "dhcp_anomaly")
     assert len(got) == 1 and got[0].severity == "WARNING", got
     assert m.infer_gateway() == sb.GW[0]
+
+
+@self_test()
+def t_a3_rogue_dhcp_seen_first(ctx):
+    """Third audit #3: a rogue DHCP server heard before the real router no
+    longer makes the real router the suspect: the router this computer
+    uses (its default route) decides, not which offer came first."""
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    a2_dhcp_ack(sb, rogue, rmac, sb.PHONE, rogue, rogue)
+    sb.home_network()
+    m = a2_model(ctx, sb.frames)
+    assert m.dhcp_trusted() == (sb.GW[0], sb.GW[0]), m.dhcp_trusted()
+    assert m.dhcp_rogue()[:2] == (rogue, rogue), m.dhcp_rogue()
+    for _ in range(2):              # the answer doesn't move once used
+        assert m.infer_gateway() == sb.GW[0], m.infer_gateway()
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert got and got[-1].severity == "DANGER", got
+
+
+# ---- fourth and fifth audits: alerts ------------------------------------------
+def a4_dhcp_reply(sb, src, mac, server_id, client, router, dns):
+    """A DHCP ACK from `src`/`mac` that gives `server_id` as the server."""
+    chaddr = bytes.fromhex(client[1].replace(":", "")) + b"\x00" * 10
+    sb._emit(PK.Ether(src=mac, dst=client[1]) /
+             PK.IP(src=src, dst=client[0]) / PK.UDP(sport=67, dport=68) /
+             PK.BOOTP(op=2, yiaddr=client[0], chaddr=chaddr) /
+             PK.DHCP(options=[("message-type", "ack"),
+                              ("server_id", server_id),
+                              ("lease_time", 3600), ("router", router),
+                              ("name_server", dns), "end"]))
+
+
+@self_test()
+def t_a4_rogue_dhcp_on_router_ip(ctx):
+    """Fourth audit: a rogue DHCP server that answers with your router's
+    address as the server (its own MAC, from the router's address or from
+    its own) raised nothing, and its router became the gateway of a file.
+    It is now DANGER and names the MAC; the gateway stays the real router.
+    Two relays of one server that give the same settings raise nothing."""
+    S = ScenarioBuilder
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    for src in (S.GW[0], rogue):                      # r4, r4b
+        sb = S(t0=SCENARIO_T0)
+        sb.home_network()
+        for _ in range(6):
+            a4_dhcp_reply(sb, src, rmac, S.GW[0], S.PHONE, rogue, rogue)
+        sb.tls(S.PHONE, "www.example.com", "93.184.215.14")
+        m = a2_model(ctx, sb.frames)                  # live: router known
+        got = a2_kinds(m, "dhcp_anomaly")
+        assert len(got) == 1 and got[0].severity == "DANGER", \
+            (src, [(a.severity, a.reason) for a in got])
+        a = got[0]
+        assert a.reason == f"A device answers DHCP in your router's " \
+                           f"name: MAC {rmac}", a.reason
+        assert f"MAC {S.GW[1]} is your router's." in a.observed, a.observed
+        assert m.infer_gateway() == S.GW[0], m.infer_gateway()
+        assert m.dhcp_trusted() == (S.GW[0], S.GW[0]), m.dhcp_trusted()
+        for loc in ("fr", "es"):
+            for text in (a.reason, a.observed, a.interpretation,
+                         a.possible_explanations, a.why) + tuple(
+                             a.evidence[:2]):
+                assert translate_text(text, loc) != text, (loc, text)
+    # a capture file: no gateway known; the rogue is heard first and names
+    # itself as the router; the Internet traffic goes through the router
+    sb = S(t0=SCENARIO_T0)
+    a4_dhcp_reply(sb, S.GW[0], rmac, S.GW[0], S.PHONE, rogue, rogue)
+    sb.home_network()
+    for _ in range(3):
+        sb.tls(S.PHONE, "www.example.com", "93.184.215.14")
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    assert m.infer_gateway() == S.GW[0], m.infer_gateway()
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert len(got) == 1 and got[0].severity == "DANGER", got
+    assert rmac in got[0].reason and got[0].refs.get("sure"), \
+        (got[0].reason, got[0].refs)
+    # two relays of one server, same settings: nothing
+    sb = S(t0=SCENARIO_T0)
+    sb.home_network()
+    for _ in range(3):
+        a4_dhcp_reply(sb, "192.168.1.2", "02:77:00:00:00:02", S.GW[0],
+                      S.PHONE, S.GW[0], S.GW[0])
+    m = a2_model(ctx, sb.frames)
+    assert not a2_kinds(m, "dhcp_anomaly"), a2_kinds(m, "dhcp_anomaly")
+    assert m.dhcp_impostor() is None
+
+
+@self_test()
+def t_a5_rogue_dhcp_first_in_file(ctx):
+    """Fifth audit: in a capture FILE (no default route), a rogue DHCP
+    server heard before the real router still became the gateway, and
+    the alert accused the real router ("The usual one, 192.168.1.99").
+    The router the Internet traffic goes through decides now, and the
+    open alert is said again with the right roles."""
+    S = ScenarioBuilder
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = S(t0=SCENARIO_T0)
+    a2_dhcp_ack(sb, rogue, rmac, S.PHONE, rogue, rogue)
+    sb.home_network()
+    for _ in range(20):
+        sb.tls(S.PHONE, "www.example.com", "93.184.215.14", size=3000)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    assert m.infer_gateway() == S.GW[0], m.infer_gateway()
+    assert m.dhcp_trusted() == (S.GW[0], S.GW[0]), m.dhcp_trusted()
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert got and got[-1].severity == "DANGER", got
+    a = got[-1]
+    assert a.reason.endswith(rogue) and \
+        f"The usual one, {S.GW[0]}, gives {S.GW[0]}" in a.observed and \
+        a.refs.get("remote") == rogue, (a.reason, a.observed)
+
+
+@self_test()
+def t_a4_backup_name_from_dns_only(ctx):
+    """Fourth audit: a server that puts "p42-content.icloud-content.com"
+    in its TLS hello (the name never came from a DNS answer) made a 30 MB
+    upload at 3 am an iCloud backup (INFO, not Unusual). It is a "Large
+    upload at night" warning now; the same name from a DNS answer is
+    still said as a backup."""
+    rip = "45.9.40.77"
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.tls(sb.PHONE, "p42-content.icloud-content.com", rip, size=3000)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, sb.PHONE, rip, 30 * 1024 * 1024, 12)
+    m = a2_model(ctx, sb.frames)
+    assert "p42-content.icloud-content.com" in m.ip_to_domains.get(rip, ())
+    got = a2_kinds(m, "night_upload")
+    assert len(got) == 1 and got[0].severity == "WARNING" and \
+        not got[0].refs.get("explained"), \
+        [(a.severity, a.reason) for a in got]
+    assert "night_upload" in [f["kind"] for f in unusual_findings(m.alerts)]
+    # a DNS answer for the name makes it the server's name
+    m.register_website("p42-content.icloud-content.com", rip, None, "DNS")
+    assert m.dns_names(rip) == ["p42-content.icloud-content.com"]
+
+
+@self_test()
+def t_a4_check_ins_gadgets_and_cdn(ctx):
+    """Fourth/fifth audit: a smart plug that checks in with the server it
+    looked up every 60 s, and a TV polling a CDN host every 60 s ± 40 %,
+    were WARNINGs under Unusual activity: they are INFOs now, out of
+    Unusual activity. The same jittered timer to a server that is not a
+    CDN, and a gadget's timer to an address it never looked up, still
+    warn."""
+    rng = random.Random(11)
+    S = ScenarioBuilder
+    sb = S(t0=SCENARIO_T0)
+    sb.home_network()
+    plug_srv, cdn_srv, c2, bare = ("52.28.10.1", "23.50.1.9",
+                                    "185.199.110.77", "185.199.110.78")
+    sb.dns(S.PLUG, "devs.plugcloud-example.com", plug_srv)
+    sb.dns(S.TV, "tv-assets.akamaized.net", cdn_srv)
+    sb.dns(S.PHONE, "updates.example-app.net", c2)
+    t = sb.t
+    for i in range(120):
+        sb.t = t + 60 * i + rng.uniform(-1, 1)
+        a2_syn(sb, S.PLUG, plug_srv)
+        sb.t = t + 60 * i + 7 + rng.uniform(-1, 1)
+        a2_syn(sb, S.NAS, bare)
+    for host, srv in ((S.TV, cdn_srv), (S.PHONE, c2)):
+        sb.t = t
+        for _ in range(120):
+            sb.t += 60 * rng.uniform(0.6, 1.4)
+            a2_syn(sb, host, srv)
+    sb.frames.sort(key=lambda f: f[1])
+    m = a2_model(ctx, sb.frames)
+    plug, tv = m.device_for(S.PLUG[0]), m.device_for(S.TV[0])
+    phone, nas = m.device_for(S.PHONE[0]), m.device_for(S.NAS[0])
+    assert plug.device_class in BEACON_GADGETS and \
+        tv.device_class in BEACON_GADGETS, (plug.device_class,
+                                            tv.device_class)
+    by = {a.device_key: a for a in a2_kinds(m, "beacon")}
+    assert by.get(plug.key) is not None and \
+        by[plug.key].severity == "INFO", by.get(plug.key)
+    assert by.get(tv.key) is not None and by[tv.key].severity == "INFO" \
+        and by[tv.key].refs.get("explained") == "cdn", by.get(tv.key)
+    assert by.get(phone.key) is not None and \
+        by[phone.key].severity == "WARNING", by.get(phone.key)
+    nas.device_class = "Smart-home/IoT"        # a gadget, no name looked up
+    assert by.get(nas.key) is not None and \
+        by[nas.key].severity == "WARNING", by.get(nas.key)
+    un = {f["device"] for f in unusual_findings(m.alerts)
+          if f["kind"] == "beacon"}
+    assert phone.key in un and plug.key not in un and tv.key not in un, un
+    for a in (by[plug.key], by[tv.key]):
+        for loc in ("fr", "es"):
+            for text in (a.reason, a.observed, a.interpretation,
+                         a.possible_explanations, a.why):
+                assert translate_text(text, loc) != text, (loc, text)
+
+
+@self_test()
+def t_a4_load_balancer_names_not_tunnel(ctx):
+    """Fourth audit: many different AWS load-balancer names
+    (….elb.amazonaws.com, long random labels) raised "Data hidden in name
+    lookups"; their answers come from AWS's own name servers, so nothing
+    can be carried out. A tunnel domain is still caught."""
+    rng = random.Random(5)
+    abc = "abcdefghijklmnopqrstuvwxyz0123456789"
+    w = DnsTunnelWatch()
+    hits = []
+    for i in range(80):
+        lab = "".join(rng.choice(abc) for _ in range(32))
+        hits.append(w.note("dev", f"k8s-default-{lab}-{1000000 + i}."
+                           f"us-east-1.elb.amazonaws.com", 1, 100.0 + i))
+        hits.append(w.note("dev", f"{lab}.t.tunnel-example.net", 16,
+                           100.0 + i))
+    found = [h for h in hits if h]
+    assert found and all(h[0] == "tunnel-example.net" for h in found), \
+        {h[0] for h in found}
+
+
+@self_test()
+def t_a4_alert_sentences_fr_es(ctx):
+    """Fourth audit (#40): alert sentences that stayed English in French
+    and Spanish (ARP spoofing, DHCP, duplicate address, FTP/POP3/IMAP/
+    TELNET without encryption, "why it was flagged", "What to check" …)
+    are translated, and the ARP spoofing evidence says the time of day,
+    not a raw epoch."""
+    E = AlertEngine(ctx.cfg({}))
+    dev = DeviceRecord(key="aa:bb:cc:dd:ee:01", ip="192.168.1.20",
+                       mac="aa:bb:cc:dd:ee:01")
+    dev.alias = "Kitchen tablet"
+    k = dev.key
+    made = [
+        E.gateway_change("192.168.1.1", 2), E.duplicate_ip("192.168.1.30", 2),
+        E.dhcp_anomaly({"192.168.1.1", "192.168.1.99"}),
+        E.rogue_ra("aa:bb:cc:00:00:01", "Kitchen tablet", ["2001:db8::/64"],
+                   ["aa:bb:cc:00:00:01"]),
+        E.arp_spoof("192.168.1.1", 2, 6, True),
+        E.arp_spoof("192.168.1.31", 2, 1, False, together=2),
+        E.arp_spoof("192.168.1.32", 2, 1, False, together=2, twin=(
+            "aa:00:00:00:00:01", "aa:00:00:00:00:02", "192.168.1.33")),
+        E.chatty_device(dev), E.unknown_device(dev),
+        E.reconnect_cycle(dev, 5, 600),
+        E.dns_server_change("Kitchen tablet", k, "192.168.1.1", "8.8.8.8"),
+        E.dns_failures(0.4, 50, []), E.dns_slow(400, 50, ""),
+        E.dns_multi({"1.1.1.1", "8.8.8.8", "9.9.9.9", "192.168.1.1"}),
+        E.unusual_service(dev, 22, "203.0.113.5", [443]),
+        E.new_service(dev, "_airplay._tcp"),
+        E.remote_access("Kitchen tablet", k, "SSH", "It accepted a Remote "
+                        "terminal (SSH) connection (port 22) from "
+                        "192.168.1.5."),
+        E.remote_access("Kitchen tablet", k + "2", "_ssh._tcp", "It "
+                        "advertises the remote-access service “_ssh._tcp” "
+                        "over mDNS."),
+        E.remote_access("Kitchen tablet", k + "3", "VNC", "Your router "
+                        "forwards Internet port 5900 to it (UPnP)."),
+        E.new_listener(k, "python3", "TCP", 8000, "the network"),
+        E.arp_cache_mismatch("192.168.1.1", "aa:00:00:00:00:01",
+                             {"aa:00:00:00:00:02"}, True),
+        E.arp_cache_mismatch("192.168.1.7", "aa:00:00:00:00:01",
+                             {"aa:00:00:00:00:02"}, False),
+        E.new_country(dev, "France", "203.0.113.5"),
+        E.broadcast_storm(500, "Kitchen tablet"),
+    ] + [E.cleartext("Kitchen tablet", k + p, p, "203.0.113.5", True)
+         for p in ("FTP", "POP3", "IMAP", "TELNET")]
+    E._debounce.clear()
+    made.append(E.broadcast_storm(9, ""))
+    assert all(made), [i for i, a in enumerate(made) if a is None]
+    texts = [(a.kind, x) for a in made for x in
+             [a.reason, a.observed, a.interpretation,
+              a.possible_explanations, a.why] + list(a.evidence) if x]
+    texts += [(kd, why) for kd, (_c, why) in ALERT_META.items()]
+    # the fixed text of every alert: its type, what it usually means and
+    # what to check (most "What to check" steps were English)
+    texts += [(kd, t[0]) for kd, t in ALERT_TYPES.items()]
+    texts += [(kd, x) for kd, x in ALERT_MEANS.items()]
+    texts += [(kd, x) for kd, xs in ALERT_CHECKLIST.items() for x in xs]
+    texts += [("arp_spoof", "03:12:40: 192.168.1.1 claimed by "
+                            "aa:00:00:00:00:01"),
+              ("arp_spoof", "also both answering for 192.168.1.33")]
+    english = re.compile(r"\b(?:the|was|has|address|answering|keeps|"
+                         r"switching|traffic|observed|with|from)\b")
+    was = CURRENT_LOCALE
+    try:
+        for loc in ("fr", "es"):
+            set_locale(loc)
+            for kind, x in texts:
+                got = translate_text(x, loc)
+                ev = translate_event(x)
+                assert got != x or ev != x, (loc, kind, x)
+                best = got if got != x else ev
+                left = english.findall(re.sub(r"Kitchen tablet", "", best))
+                assert not left, (loc, kind, best)
+    finally:
+        set_locale(was)
+    # the evidence of an ARP fight carries the time of day
+    gw, ips, macs, nets = scenario_identity()
+    clock = [SCENARIO_T0]
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs, now_fn=lambda: clock[0])
+    m.set_identity(local_nets=nets)
+    for i in range(12):
+        clock[0] = SCENARIO_T0 + i
+        m._observe_arp(gw, ("00:1e:58:aa:00:01", "02:66:66:66:66:66")[i % 2],
+                       clock[0])
+    sp = a2_kinds(m, "arp_spoof")
+    assert sp and sp[0].evidence, sp
+    assert all(re.match(r"\d\d:\d\d:\d\d: ", e)
+               for e in sp[0].evidence if "claimed by" in e), sp[0].evidence
+
+
+@self_test()
+def t_a4_related_to_own_devices(ctx):
+    """Fourth audit (UI): the Alerts tab's *Related to* cell said "Device
+    using a private Wi-Fi address" for this computer (next to an alert
+    titled "This computer offers remote access") and for the router; it
+    says "This computer" and "Your router" now, as the Timeline does, in
+    French and Spanish too."""
+    m = NetworkModel(ctx.cfg({}), "192.168.50.1", ["192.168.50.10"],
+                     ["a6:3b:12:9e:44:10"])
+    m.set_identity(local_nets=[ipaddress.ip_network("192.168.50.0/24")])
+    reg = m.registry
+    me = DeviceRecord(key="a6:3b:12:9e:44:10", ip="192.168.50.10",
+                      mac="a6:3b:12:9e:44:10")
+    gw = DeviceRecord(key="a6:3b:12:9e:44:01", ip="192.168.50.1",
+                      mac="a6:3b:12:9e:44:01")
+    other = DeviceRecord(key="a6:3b:12:9e:44:77", ip="192.168.50.77",
+                         mac="a6:3b:12:9e:44:77")
+    for d in (me, gw, other):
+        d.randomized_mac = True
+        reg.by_key[d.key] = d
+    fake = types.SimpleNamespace(model=m, app=types.SimpleNamespace(
+        SEVERITY_ICON={}))
+    fake.related_name = lambda dev: AlertsTab.related_name(fake, dev)
+    label = "Device using a private Wi-Fi address"
+    want = {me.key: "This computer", gw.key: "Your router",
+            other.key: label}
+    for d in (me, gw, other):
+        a = m.alerts.remote_access(m.alert_device_name(d), d.key, "SSH",
+                                   "It accepted a Remote terminal (SSH) "
+                                   "connection (port 22) from 192.168.50.5.")
+        assert AlertsTab.values(fake, a)[3] == want[d.key], \
+            (d.ip, AlertsTab.values(fake, a)[3])
+    me.alias = "Study PC"
+    a = m.alerts.alerts[m.alerts._open[("remote_access", f"{me.key}|SSH")]]
+    assert AlertsTab.values(fake, a)[3] == "Study PC"
+    was = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        fr = [translate_cell(x) for x in ("This computer", "Your router")]
+        set_locale("es")
+        es = [translate_cell(x) for x in ("This computer", "Your router")]
+    finally:
+        set_locale(was)
+    assert fr == ["Cet ordinateur", "Votre box"], fr
+    assert es == ["Este equipo", "Su router"], es
+
+
+@self_test()
+def t_a4_cell_texts_keep_their_width(ctx):
+    """Fourth audit (UI): a column fitted to its cells' words keeps room
+    for the longest one at a bigger text size."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        root.deiconify()
+        root.geometry("900x200")
+        wrap, tree = make_tree(root, [
+            ("sev", "Severity", 60, "w", False),
+            ("what", "What happened", 400, "w", True),
+            ("who", "Related to", 200, "w", False)])
+        wrap.pack(fill="both", expand=True)
+        texts = ["⚠ AVERTISSEMENT", "‼ PELIGRO"]
+        fit_cell_texts(tree, "sev", texts)
+        font = tree_cell_font()
+
+        def fits():
+            return all(font.measure(t) + 12 <= int(tree.column("sev",
+                                                               "width"))
+                       for t in texts)
+        assert fits(), tree.column("sev", "width")
+        base = tkfont.nametofont("TkDefaultFont")
+        was = base.cget("size")
+        try:
+            base.configure(size=int(abs(was) * 1.6) * (1 if was > 0
+                                                         else -1))
+            _gui_pump(root, 0.2)
+            fit_tree_headings(tree)          # what a text size change does
+            font = tree_cell_font()
+            assert fits(), (tree.column("sev", "width"),
+                            font.measure(texts[0]))
+        finally:
+            base.configure(size=was)
+    finally:
+        root.destroy()
 
 
 @self_test()
@@ -76498,6 +80865,17 @@ def t_a2_login_in_default_mode(ctx):
         (0, head + b"\r\npassage=north&compass=" + c),
         (0, b"GET /login HTTP/1.1\r\nHost: shop.example\r\n\r\n"),
         (1, b"HTTP/1.1 200 OK\r\n\r\npassword=" + c)])
+    # third audit: the body split over packets, inside the field name
+    sb._tcp_talk(me, "93.184.215.66", gw, 46006, 80, [
+        (0, head + b"\r\nuser=alex&pass"), (0, b"word=" + c),
+        (1, b"HTTP/1.1 302 Found\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.67", gw, 46007, 80, [
+        (0, head + b"\r\n"), (0, b"user=alex&p"), (0, b"wd=" + c),
+        (1, b"HTTP/1.1 302 Found\r\n\r\n")])
+    sb._tcp_talk(me, "93.184.215.68", gw, 46008, 80, [   # no password
+        (0, head + b"\r\nuser=alex&rem"), (0, b"ember=1"),
+        (0, b"GET /pass HTTP/1.1\r\nHost: x\r\n\r\n"),
+        (1, b"HTTP/1.1 302 Found\r\n\r\n")])
     decoders = [fast_frame_decoder]
     if ctx.scapy_ok:
         decoders.append(default_frame_decoder)
@@ -76510,7 +80888,8 @@ def t_a2_login_in_default_mode(ctx):
         got = a2_kinds(m, "cleartext_login")
         where = sorted(a.refs.get("remote") for a in got)
         assert where == ["93.184.215.61", "93.184.215.62", "93.184.215.63",
-                         "93.184.215.64"], (mk.__name__, where)
+                         "93.184.215.64", "93.184.215.66",
+                         "93.184.215.67"], (mk.__name__, where)
         assert all(a.severity == "WARNING" and "unencrypted packet" in a.why
                    for a in got), got
         blob = json.dumps([alert_to_dict(a) for a in m.alerts.alerts
@@ -76518,6 +80897,28 @@ def t_a2_login_in_default_mode(ctx):
             repr(m.ev_feed)
         for form in ip013_secret_forms():
             assert form not in blob, "the password leaked into an alert"
+    # an unfinished split form is forgotten after 30 s (packet clock); a
+    # new POST on the same connection replaces the old body
+    k4 = ("192.168.1.10", 46009, "93.184.215.69", 80)
+
+    def form(t, body, post):
+        raw = (head + b"\r\n" if post else b"") + body
+        return {"src_ip": k4[0], "sport": k4[1], "dst_ip": k4[2],
+                "dport": k4[3], "form_post": post, "payload_len": len(raw),
+                "raw": raw, "time": t}
+    m._observe_login(form(100.0, b"user=alex&pass", True))
+    # fifth audit: only the start of the password field waits, never the
+    # rest of the body (no "user", no "alex")
+    assert m._form_wait[k4][1] == b"&pass", m._form_wait
+    assert m._observe_login(form(131.0, b"word=" + c, False)) is None
+    assert k4 not in m._form_wait, m._form_wait
+    m._observe_login(form(200.0, b"user=alex&pass", True))
+    m._observe_login(form(201.0, b"user=bob&rem", True))
+    # the new POST replaced the old body: its own end, which can't become
+    # a password field, so nothing of it is kept
+    assert m._form_wait[k4][1:] == (b"", 12), m._form_wait
+    m._observe_login(form(202.0, b"user=alex&password=" + c, True))
+    assert k4 not in m._form_wait, m._form_wait
     for raw, ts, lt in sb.frames:
         d = fast_decode(raw, ts, lt)
         text = repr({k: v for k, v in d.items()
@@ -78669,6 +83070,43 @@ def t_environment_diagnose(ctx):
     except RuntimeError_:
         pass
     return rep["worst"]
+
+
+@self_test()
+def t_a3_component_probe_sees_what_this_python_sees(ctx):
+    """Third audit: run with -I, the component check started its probe
+    without -I, so it found scapy in the person's own site-packages and
+    said "OK" while this copy could not import it."""
+    import types
+    mgr = RuntimeManager(root_dir=ctx.path("rtprobe"))
+    iso = types.SimpleNamespace(ignore_environment=1, no_user_site=1)
+    plain = types.SimpleNamespace(ignore_environment=0, no_user_site=0)
+    keep = {k: os.environ.get(k) for k in ("PYTHONPATH", "PYTHONNOUSERSITE")}
+    os.environ["PYTHONPATH"] = ctx.path("elsewhere")
+    os.environ.pop("PYTHONNOUSERSITE", None)
+    try:
+        e = mgr._env_for(sys.executable, flags=iso)
+        assert e.get("PYTHONNOUSERSITE") == "1", "user site must be off"
+        assert "PYTHONPATH" not in e, "-I ignores PYTHONPATH"
+        e = mgr._env_for(sys.executable, flags=plain)
+        assert "PYTHONNOUSERSITE" not in e and "PYTHONPATH" in e, \
+            "a plain start must keep the person's own setup"
+        other = ctx.path("other-python")
+        e = mgr._env_for(other, flags=iso)
+        assert "PYTHONNOUSERSITE" not in e and "PYTHONPATH" in e, \
+            "another Python is probed as it is"
+    finally:
+        for k, v in keep.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    # the real check, on the Python running now, agrees with the import
+    import importlib.util
+    pk = (mgr.components(sys.executable).get("packages") or {}).get("psutil")
+    if isinstance(pk, dict):
+        here = importlib.util.find_spec("psutil") is not None
+        assert bool(pk.get("version")) == here, (pk, here)
 
 
 @self_test()
@@ -84252,6 +88690,93 @@ def test_palette_matcher_resolvers_posture(ctx):
     assert calibrate(0.2) > 100
 
 @self_test(slow=False)
+def test_palette_rank_scopes_dynamic(ctx):
+    """Ctrl+K: words rank the rows (start of a word, inside, kind, letters
+    in order; every word must hit; accents don't matter), a first
+    character or "help:" picks a group, and numbers, addresses and filters
+    typed in the box are told apart."""
+    items = [("Happening", "tab"), ("Dashboard", "tab"),
+             ("Settings", "setting"), ("Settings › Alerts", "setting"),
+             ("Settings › Alerts › Mail alerts", "setting"),
+             ("Connections", "tab"), ("Connections → Mail", "view"),
+             ("Help: How the Happening feed works", "help"),
+             ("Packets → Statistics", "view"), ("Wi-Fi signal", "view"),
+             ("Device: Mail server", "device"), ("Start watching", "action")]
+
+    def ranked(q, **kw):
+        toks = palette_fold(q).split()
+        got = [(palette_rank(toks, lab, cat, *kw.get(lab, ())), lab)
+               for lab, cat in items]
+        return [lab for sc, lab in sorted(
+            (g for g in got if g[0] is not None), key=lambda g: -g[0])]
+    assert ranked("happening")[0] == "Happening"
+    assert ranked("sett")[0] == "Settings"
+    assert ranked("conn mail")[0] == "Connections → Mail"
+    assert ranked("mail")[0] == "Connections → Mail"
+    assert ranked("pkst") == ["Packets → Statistics"]      # letters in order
+    assert ranked("wifi") == ["Wi-Fi signal"]              # skipped hyphen
+    assert ranked("zzqqxxyy") == []
+    assert ranked("mail dashboard") == []                  # every word hits
+    assert ranked("watch")[0] == "Start watching"
+    # a kind's name counts, less than the label's own words
+    assert palette_rank(["help"], "Dns", "help") == 30 - 0.15
+    assert palette_rank(["help"], "Help me", "help") > 100
+    assert palette_rank([], "Dns", "tab") == 40 - 0.15
+    # accents: "parametres" finds the French "Paramètres"
+    assert palette_fold("Paramètres") == "parametres"
+    assert palette_rank(["parametres"], "Settings", "setting",
+                        "Paramètres", "paramètre") > 700
+    assert palette_rank(["parametres"], "Settings", "setting") is None
+    # used lately: +60 down to +5
+    assert palette_recent_bonus(0) == 60 and palette_recent_bonus(40) == 5
+    assert palette_recent_bonus(1) < palette_recent_bonus(0)
+    # the letters a row shows in bold
+    assert palette_hits(["conn", "mail"], "Connections → Mail") == \
+        {0, 1, 2, 3, 14, 15, 16, 17}
+    assert palette_hits(["wifi"], "Wi-Fi signal") == {0, 1, 3, 4}
+    # groups
+    assert palette_scope(">sett")[:3] == (
+        "commands", PALETTE_SCOPE_CATS["commands"], "sett")
+    assert palette_scope("@dev")[0] == "devices"
+    assert palette_scope("?dns")[0] == "help"
+    assert palette_scope("/ip:1.1.1.1")[0] == "filters"
+    assert palette_scope("#12")[0] == "packet"
+    assert palette_scope(":12")[0] == "packet"
+    assert palette_scope("help: dns")[0] == "help" and \
+        palette_scope("help: dns")[2] == "dns"
+    assert palette_scope("settings: net")[0] == "settings"
+    assert palette_scope("net", "tabs")[:1] == ("tabs",)
+    assert palette_scope(">net", "tabs")[0] == "commands"   # prefix wins
+    assert palette_scope("ip:1.2.3.4")[0] == "all"          # not a kind
+    assert palette_scope("  >x")[3] == 3
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        assert palette_scope("aide: dns")[0] == "help"
+    finally:
+        set_locale(old)
+    # numbers, filters and addresses
+    for t in ("go to packet 123", "Go to packet 123", "packet 123", "#123",
+              ":123", "123", "pkt 123"):
+        assert palette_packet_number(t) == 123, t
+    for t in ("go to packet", "12 apples", "1.2.3.4", "", "ip:12"):
+        assert palette_packet_number(t) is None, t
+    assert palette_filter_expr("ip:1.2.3.4") == "ip:1.2.3.4"
+    assert palette_filter_expr("port: 443 or PROTO:dns") == \
+        "port:443 or proto:dns"
+    assert palette_filter_expr("device: tv") == "device:tv"
+    assert palette_filter_expr("sev:warning") == "sev:warning"
+    assert palette_filter_expr("hello") is None
+    assert palette_filter_expr("ip:") is None
+    assert palette_filter_expr("zip:1") is None             # not the field
+    assert palette_address("192.168.1.20") == ("ip", "192.168.1.20")
+    assert palette_address("AA-BB-CC-DD-EE-FF") == ("mac",
+                                                    "aa:bb:cc:dd:ee:ff")
+    assert palette_address("fe80::1") == ("ip", "fe80::1")
+    assert palette_address("123") is None and palette_address("a.b") is None
+
+
+@self_test(slow=False)
 def test_v501_fixes_and_filters(ctx):
     """5.0.1: sub-second durations, conversation / address / expert
     filters, frame.time_relative (was always empty), time formats, CSV
@@ -85724,6 +90249,63 @@ def t_534_local_services_rows(ctx):
 
 
 @self_test()
+def t_a3_local_services_by_kind(ctx):
+    """Third audit (owner: "organized, not just all put there"): every
+    service goes under one heading with a plain line saying what it does,
+    the program's name counts before the port, and one MiniWireshark
+    doesn't know is "Unknown service on port X", in all three languages."""
+    rows = local_service_rows(_local_fake_listeners())
+    by = {(r["proto"], r["port"]): r for r in rows}
+    kinds = {k for k, _h in LOCAL_KINDS}
+    for r in rows:
+        assert r["kind"] in kinds and r["about"], r
+    assert by[("TCP", 5173)]["kind"] == "web"
+    assert by[("TCP", 5432)]["kind"] == "db"
+    assert by[("TCP", 631)]["kind"] == "share"
+    assert by[("UDP", 5353)]["kind"] == "system"
+    assert by[("TCP", 5000)]["kind"] == "share"            # AirPlay
+    unk = by[("TCP", 44321)]
+    assert unk["kind"] == "unknown" and unk["about"] == LOCAL_UNKNOWN_ABOUT
+    assert local_service_cells(unk)[2] == "Unknown service on port 44321"
+    name, cells = local_service_view_cells(by[("TCP", 5432)])
+    assert name == "Database connection (PostgreSQL)", name
+    assert cells[0] == "A database: programs keep and read their data " \
+        "here." and cells[1] == "postgres (pid 99)", cells
+    # a website *lookup* is not a web page; Windows' RPC is Windows
+    assert local_service_kind("Website lookup (DNS)")[0] == "system"
+    assert local_service_kind("Windows remote management (RPC)")[0] == \
+        "system"
+    assert local_service_kind("Remote desktop (RDP)")[0] == "remote"
+    # every service name the program knows lands under a real heading
+    whats = set(PORT_SERVICES.values()) | {w for _s, w, _b in
+                                           LOCAL_PROGRAM_HINTS} | \
+        set(LOCAL_PROGRAM_EXACT.values()) | set(LOCAL_WEB_SERVER.values()) \
+        | {LOCAL_DEV_WEB}
+    lost = sorted(w for w in whats if local_service_kind(w)[0] == "unknown")
+    assert not lost, lost
+    # the program's name says more than the port; whole names only where
+    # a prefix would catch other programs
+    assert local_service_guess("TCP", 445, "smbd")[0] == \
+        "Windows file sharing (SMB)"
+    assert local_service_guess("TCP", 11434, "ollama")[0] == \
+        "AI model server (Ollama)"
+    assert local_service_guess("TCP", 445, "System")[0] == \
+        "Part of Windows itself"
+    assert local_service_guess("TCP", 61000, "systemuiserver")[0] == \
+        LOCAL_UNKNOWN
+    # French and Spanish: every heading, line and name shown
+    shown = {h for _k, h in LOCAL_KINDS} | {a for _w, _k, a in
+                                            LOCAL_KIND_RULES} | \
+        {LOCAL_UNKNOWN_ABOUT, "Unknown service on port %d", "Run by",
+         "Service", "What it does"} | whats
+    for loc in ("fr", "es"):
+        missing = sorted(x for x in shown if x not in I18N[loc])
+        assert not missing, (loc, missing[:8])
+        assert translate_text("Unknown service on port %d", loc) % 7 != \
+            "Unknown service on port 7"
+
+
+@self_test()
 def t_534_local_services_from_connection_table(ctx):
     """5.3.4 (Local services): the rows come from the same connection
     table as the Security tab (psutil, here a stand-in): listening TCP
@@ -85761,7 +90343,9 @@ def t_534_local_services_open_through_gate(ctx):
     """5.3.4 (Local services): opening a web app goes through outbound()
     (listed in the ledger as this computer, stopped by the kill switch,
     which says what to type instead); a service that isn't a web page is
-    never opened."""
+    never opened. Third audit #3: an administrator copy with nobody to
+    open it as (root login, elevated Windows) refuses and says what to
+    type; a root copy started through sudo opens it as the person."""
     import webbrowser
     rows = {(r["proto"], r["port"]): r
             for r in local_service_rows(_local_fake_listeners())}
@@ -85772,8 +90356,26 @@ def t_534_local_services_open_through_gate(ctx):
     old_open, old_killed = webbrowser.open, LEDGER.killed
     webbrowser.open = lambda url, *a, **k: opened.append(url) or True
     n0 = len(LEDGER.snapshot("local_open"))
+    stack = contextlib.ExitStack()
     try:
         LEDGER.killed = False
+        with _b9_patched(globals(), is_admin=lambda: True,
+                         person_ids=lambda: None):
+            assert not LocalServicesView.open_service(
+                view, rows[("TCP", 5173)])
+        assert not opened and len(LEDGER.snapshot("local_open")) == n0
+        assert banners[-1][0] == "warn" and "administrator" in \
+            banners[-1][1] and "http://127.0.0.1:5173/" in banners[-1][1]
+        started = []
+        with _b9_patched(globals(), is_admin=lambda: True,
+                         person_ids=lambda: (1000, 1000, "me", "/home/me"),
+                         start_for_person=lambda cmd, **kw:
+                         started.append(cmd)):
+            assert LocalServicesView.open_service(view, rows[("TCP", 5173)])
+        assert not opened and started and \
+            started[0][-1] == "http://127.0.0.1:5173/", started
+        n0 += 1
+        stack.enter_context(_b9_patched(globals(), is_admin=lambda: False))
         assert LocalServicesView.open_service(view, rows[("TCP", 5173)])
         assert opened == ["http://127.0.0.1:5173/"], opened
         ent = LEDGER.snapshot("local_open")
@@ -85803,6 +90405,7 @@ def t_534_local_services_open_through_gate(ctx):
         assert not LocalServicesView.open_service(view, rows[("TCP", 3000)])
         assert "http://[::1]:3000/" in banners[-1][1], banners[-1]
     finally:
+        stack.close()
         webbrowser.open, LEDGER.killed = old_open, old_killed
 
 
@@ -86026,15 +90629,52 @@ def t_534_local_http_probe(ctx):
 
 
 @self_test()
+def t_a3_local_page_title(ctx):
+    """Third audit: the page title is the <title> element itself, not a
+    <titlebar> or an <svg>'s <title>, decoded by the charset the header
+    or a <meta> names (a Latin-1 page shows its accents); a probe that
+    isn't recorded on its own is still stopped by the kill switch."""
+    t = local_page_title
+    assert t(b"HTTP/1.0 200 OK\r\n\r\n<html><titlebar>x</titlebar>"
+             b"<svg><title>icon</title></svg><title lang=en>Real"
+             b"</title>") == "Real"
+    assert t(b"<svg><title>only icon</title></svg>") == ""
+    assert t(b"<svg><title>open svg") == ""
+    assert t(b"HTTP/1.0 200 OK\r\nContent-Type: text/html; "
+             b"charset=ISO-8859-1\r\n\r\n<title>Caf\xe9 cr\xe8me</title>"
+             ) == "Café crème"
+    assert t(b'<meta charset="windows-1252"><title>\xc9t\xe9</title>') == \
+        "Été"
+    assert t("<title>Página</title>".encode()) == "Página"
+    assert t(b"<title>no charset \xe9</title>") == "no charset é"
+    assert t(b"charset=nope-xyz <title>Caf\xe9</title>") == "Café"
+    assert t(b"<TITLE>Upper</TITLE>") == "Upper"
+    with _b9_patched(LEDGER, killed=True):
+        try:
+            probe_local_http("127.0.0.1", 9, record=False)
+            raise AssertionError("sent with the kill switch on")
+        except OutboundBlocked:
+            pass
+
+
+@self_test()
 def t_534_local_probe_skip_and_once(ctx):
     """Local services: ports known not to be web pages (Redis 6379, raw
     printing 9100, databases, SMB/NetBIOS, what the service table or the
     program's name marks as something else) are never asked; a port is
     asked once when it appears, the automatic re-read reuses the answer,
     Refresh asks again; a restarted program is asked again; Demo Mode
-    asks nothing; the answer's scheme wins over the port's."""
-    for port in (6379, 9100, 3306, 5432, 27017, 1433, 11211, 139, 445):
+    asks nothing; the answer's scheme wins over the port's. Third audit:
+    nothing is asked until local_services.probe is on (#1); the
+    well-known non-web ports are never asked, whatever the program is
+    called (#2); one ledger entry per scan, with its count."""
+    never = (6379, 9100, 3306, 5432, 27017, 1433, 11211, 137, 138, 139,
+             445, 22, 25, 53, 110, 143, 389, 465, 587, 993, 995, 5353, 1900)
+    for port in never:
         assert port in LOCAL_PROBE_SKIP, port
+    # the real path: an unknown program on each of them is not asked
+    odd = {("TCP", "127.0.0.1", p): (p, "mystery") for p in never}
+    assert not [r["port"] for r in local_service_rows(odd) if r["probe"]]
     listening = {("TCP", "127.0.0.1", p): (p, "x") for p in
                  (6379, 9100, 3306, 5432, 27017, 1433, 11211, 139, 445,
                   22, 631, 5173, 8443, 61000)}
@@ -86055,14 +90695,19 @@ def t_534_local_probe_skip_and_once(ctx):
     assert {x["port"]: x for x in r}[5173]["url"] is None
     seen = []
 
-    def probe(host, port, own=(), timeout=1.0):
+    def probe(host, port, own=(), timeout=1.0, record=True):
+        assert record is False          # the scan was listed once
         seen.append((host, port))
         return dict(plain, title="App %d" % port)
 
-    def view(mode="offline"):
+    def view(mode="offline", on=True):
         return types.SimpleNamespace(
             source=None, probes={}, _probe_seq=0,
-            app=types.SimpleNamespace(data_mode=mode),
+            app=types.SimpleNamespace(data_mode=mode, config=types.
+                                      SimpleNamespace(get=lambda k, d=None:
+                                                      on if k ==
+                                                      "local_services.probe"
+                                                      else d)),
             _pm=lambda: types.SimpleNamespace(available=False),
             refresh=lambda force=False: None)
 
@@ -86072,13 +90717,19 @@ def t_534_local_probe_skip_and_once(ctx):
                   if t.name == "local-probe"]:
             t.join(10)
         return started
-    with _b9_patched(globals(), probe_local_http=probe):
+    with _b9_patched(globals(), probe_local_http=probe), \
+            _b9_patched(LEDGER, killed=False):
+        off = view(on=False)                        # the default: off
+        assert not run(off, rows) and not seen and off.probes == {}
+        n0 = len(LEDGER.snapshot("local_probe"))
         v = view()
         assert run(v, rows) and sorted(seen) == [
             ("127.0.0.1", 5173), ("127.0.0.1", 8443),
             ("127.0.0.1", 61000)], seen
         assert v._probe_seq == 1 and v.probes[by[5173]["probe"]][
             "title"] == "App 5173"
+        ent = LEDGER.snapshot("local_probe")
+        assert len(ent) == n0 + 1 and ent[-1].get("count", 1) == 3, ent[-1:]
         assert not run(v, local_service_rows(listening, (), v.probes))
         assert len(seen) == 3                       # the re-read: no
         moved = dict(listening)
@@ -86092,6 +90743,262 @@ def t_534_local_probe_skip_and_once(ctx):
         fixture = view()
         fixture.source = lambda: ("ok", listening)
         assert not run(fixture, rows) and len(seen) == 7
+        LEDGER.killed = True                        # the kill switch
+        k = view()
+        assert not run(k, rows) and len(seen) == 7 and \
+            all(x is None for x in k.probes.values())
+
+
+@self_test()
+def t_a4_local_probe_skips_by_program(ctx):
+    """Fourth audit: the web-page check skipped by port only, so a raw
+    printer on 9101 and a second Redis on 6380 still got a "GET /" and a
+    TLS hello. Now the neighbouring ports of a database, Redis or raw
+    printing are skipped too, and so is a program whose name says it is
+    one, wherever it listens; nothing the view files under databases,
+    sharing, remote access or the system is asked."""
+    never = {9101: "python3", 9102: "nc", 6380: "python3", 5433: "x",
+             3307: "x", 27018: "x", 16379: "x", 26379: "redis-sentinel",
+             8080: "valkey-server", 3000: "keydb-server",
+             7000: "/opt/bin/my-cupsd", 8001: "mongos", 8002: "p910nd",
+             8003: "MySQLWorkbench.exe", 8004: "postgresql-14"}
+    asked = {5173: "node", 61000: "x", 8081: "helpdesk", 8000: "python3"}
+    listening = {("TCP", "127.0.0.1", p): (i, prog) for i, (p, prog) in
+                 enumerate(sorted({**never, **asked}.items()))}
+    rows = local_service_rows(listening)
+    got = sorted(r["port"] for r in rows if r["probe"])
+    assert got == sorted(asked), got
+    for r in rows:
+        if r["probe"]:
+            assert r["kind"] in ("web", "unknown"), r
+        elif r["kind"] in ("db", "share", "remote", "system"):
+            assert not local_probe_wanted("TCP", r["port"], r["program"],
+                                          r["what"], r["web"]), r
+    assert not local_probe_wanted("UDP", 5173, "node", LOCAL_DEV_WEB, True)
+
+
+@self_test()
+def t_a5_browser_as_login_person(ctx):
+    """Fifth audit: a root copy started without sudo or pkexec (su, gksu)
+    opened the browser and the file manager as root. They now open as
+    the user of the login session it was started from
+    (/proc/self/loginuid); with none (a real root login, or unset) as
+    before. Its data folder and whose files it trusts don't change."""
+    if IS_WINDOWS:
+        return "skip"
+    import pwd
+    import webbrowser
+    try:
+        nobody = pwd.getpwuid(65534)
+    except KeyError:
+        return "skip"
+    reads = iter(["1000\n", "0\n", "4294967295\n", "x\n"])
+
+    def fake_open(path, *a, **k):
+        assert path == "/proc/self/loginuid", path
+        return io.StringIO(next(reads))
+    with _b9_patched(globals(), open=fake_open):
+        assert [_login_uid() for _ in range(4)] == [1000, None, None, None]
+    opened, started = [], []
+
+    class FakePopen:
+        def __init__(self, cmd, **kw):
+            started.append((cmd, kw))
+    real = (subprocess.Popen, webbrowser.open, LEDGER.killed)
+    trusted = trusted_uids()
+    try:
+        subprocess.Popen = FakePopen
+        webbrowser.open = lambda url, *a, **k: opened.append(url) or True
+        LEDGER.killed = False
+        with _b9_patched(os.environ, SUDO_UID=None, PKEXEC_UID=None), \
+                _b9_patched(os, geteuid=lambda: 0):
+            with _b9_patched(globals(), _login_uid=lambda: 65534):
+                assert person_ids() is None       # unchanged elsewhere
+                assert opener_ids() == (65534, nobody.pw_gid,
+                                        nobody.pw_name, nobody.pw_dir)
+                assert open_in_browser("http://127.0.0.1:5173/",
+                                       "local_open", "127.0.0.1:5173", "t")
+                assert _open_path(ctx.path("a5_folder"))
+            assert not opened, opened
+            assert len(started) == 2 and all(
+                callable(kw.get("preexec_fn")) and
+                kw["env"].get("HOME") == nobody.pw_dir
+                for _c, kw in started), started
+            started.clear()
+            with _b9_patched(globals(), _login_uid=lambda: None):
+                assert opener_ids() is None       # a real root login
+                assert open_in_browser("http://127.0.0.1:5173/",
+                                       "local_open", "127.0.0.1:5173", "t")
+            assert opened == ["http://127.0.0.1:5173/"] and not started
+            # sudo said who: that person, not the login session's
+            with _b9_patched(os.environ, SUDO_UID="65534",
+                             SUDO_GID="65534"), \
+                    _b9_patched(globals(), _login_uid=lambda: 1000):
+                assert opener_ids()[0] == 65534
+    finally:
+        subprocess.Popen, webbrowser.open, LEDGER.killed = real
+    assert trusted_uids() == trusted
+
+
+@self_test()
+def t_a5_split_form_keeps_no_values(ctx):
+    """Fifth audit: while a form's next packet was awaited, up to 4 KB of
+    any form body (names, e-mail addresses, messages) stayed in memory.
+    Now only the end that may still become a password field's start
+    waits ("&pass", 'name="pa', '"password": '); a split password is
+    still found across two or three packets, in a form, a multipart
+    part or JSON, and a field that only looks like one after a value is
+    not."""
+    for f in _LOGIN_FIELD_NAMES:                     # spelled out right
+        assert _LOGIN_FORM_RX.search(b"&" + f + b"=x"), f
+    gwip, ips, macs, _nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gwip, ips, macs)
+    c = IP013_CANARY.encode()
+    heads = {"form": b"application/x-www-form-urlencoded",
+             "part": b"multipart/form-data; boundary=zz",
+             "json": b"application/json"}
+    port = [47000]
+
+    def talk(kind, parts):
+        """-> (the alert or None, every buffer that waited)"""
+        port[0] += 1
+        # a new server each time (one alert for each client and server)
+        k4 = ("192.168.1.10", port[0], "93.184.215.%d" % (port[0] - 46900),
+              80)
+        head = (b"POST /in HTTP/1.1\r\nHost: x\r\nContent-Type: " +
+                heads[kind] + b"\r\n\r\n")
+        waited, got = [], None
+        for i, body in enumerate(parts):
+            raw = (head if i == 0 else b"") + body
+            got = m._observe_login({
+                "src_ip": k4[0], "sport": k4[1], "dst_ip": k4[2],
+                "dport": k4[3], "form_post": i == 0,
+                "payload_len": len(raw), "raw": raw, "time": 10.0 + i})
+            if k4 in m._form_wait:
+                waited.append(m._form_wait[k4][1])
+        return got, waited
+    secret = (b"alex", b"bob@example.com", b"hello there", c)
+    for kind, parts, found in (
+            ("form", [b"user=alex&pass", b"word=" + c], True),
+            ("form", [b"user=alex&pa", b"ss", b"word=" + c], True),
+            ("form", [b"user=alex&password", b"=", c], True),
+            ("form", [b"pass", b"word=" + c], True),     # the body's start
+            ("form", [b"mail=bob@example.com&msg=hello there&n",
+                      b"ote=1&pwd=" + c], True),
+            ("form", [b"msg=hello there", b"password=" + c], False),
+            ("form", [b"mail=bob@example.com&msg=hello there"], False),
+            ("part", [b'--zz\r\nContent-Disposition: form-data; name="u"'
+                      b'\r\n\r\nalex\r\n--zz\r\nContent-Disposition: '
+                      b'form-data; name="pass', b'word"\r\n\r\n' + c],
+             True),
+            ("json", [b'{"user": "alex", "password"', b': "' + c + b'"}'],
+             True),
+            ("json", [b'{"user": "alex", "password": "', c + b'"}'], True),
+            ("json", [b'{"msg": "hello there", "pass', b'": "' + c + b'"}'],
+             True)):
+        got, waited = talk(kind, parts)
+        assert (got is not None) == found, (parts, got)
+        for buf in waited:
+            assert len(buf) <= 24 and not any(
+                x in buf for x in secret), (parts, waited)
+
+
+@self_test()
+def t_a4_local_page_title_own_title(ctx):
+    """Fourth audit: the page's own title is the one inside <head>, else
+    the first one outside every <svg> (nested, or written <svg/>); a
+    comment, a script, an empty <title/> and a <titlebar> are passed
+    over; still one quick pass over 64 KB of junk."""
+    t = local_page_title
+    for page in (b"<svg><svg></svg><title>icon</title></svg>"
+                 b"<title>Real</title>",
+                 b"<svg/><title>Real</title>",
+                 b"<svg viewBox='0 0 1 1'/><title>Real</title>",
+                 b"<body><title>early</title><head><title>Real</title>",
+                 b"<html><head><title>Real</title></head><body><svg>"
+                 b"<title>i</title></svg>",
+                 b"<!-- <title>old</title> --><title>Real</title>",
+                 b"<script>t='<title>x</title>'</script><title>Real</title>",
+                 b"<title/><p>body</p><title>Real</title>",
+                 b"<titlebar>x</titlebar><title-bar>y</title-bar>"
+                 b"<header>z</header><title>Real</title>",
+                 b"<SVG><TITLE>i</TITLE></SVG><HEAD><TITLE>Real</TITLE>"):
+        assert t(page) == "Real", (page, t(page))
+    assert t(b"<svg><title>icon</title>") == ""        # never closed
+    assert t(b"<!-- <title>x</title>") == ""
+    for junk in (b"<svg " * 13000, b"<svg>" * 13000, b"<!--" * 16000,
+                 b"<title/>" * 8000, b"<head>" * 10000):
+        t0 = time.perf_counter()
+        assert t(junk + b"<title>x") == ""
+        took = time.perf_counter() - t0
+        assert took < 0.2, (junk[:6], f"{took:.3f} s")
+
+
+@self_test()
+def t_a4_local_probe_tls_try_listed(ctx):
+    """Fourth audit: the scan's one ledger line counts the plain "GET /"
+    tries only; a port asked again over TLS had no line at all. It now
+    gets its own, and the kill switch stops it."""
+    lsk = _socket.socket()
+    lsk.bind(("127.0.0.1", 0))
+    lsk.listen(4)
+    lsk.settimeout(10)
+    hits = []
+
+    def serve(n):
+        for _ in range(n):
+            try:
+                c, _a = lsk.accept()
+            except OSError:
+                return
+            with c:
+                c.settimeout(3)
+                with contextlib.suppress(OSError):
+                    hits.append(c.recv(5))
+                    c.sendall(b"\x15\x03\x03\x00\x02\x02\x28")
+    port = lsk.getsockname()[1]
+    try:
+        with _b9_patched(LEDGER, killed=False):
+            th = threading.Thread(target=serve, args=(2,), daemon=True,
+                                  name="t-a4-tls")
+            th.start()
+            n0 = len(LEDGER.snapshot("local_probe"))
+            got = probe_local_http("127.0.0.1", port, timeout=2.0,
+                                   record=False)
+            th.join(5)
+            new = LEDGER.snapshot("local_probe")[n0:]
+        assert got["web"] is False and len(hits) == 2, (got, hits)
+        assert [(e["kind"], e["dest"], e["allowed"]) for e in new] == [
+            ("https", f"127.0.0.1:{port}", True)], new
+    finally:
+        lsk.close()
+
+
+@self_test()
+def t_a4_single_copy_cannot_start_a_formula(ctx):
+    """Fourth audit: "Copy domain", "Copy name", "Copy summary" and the
+    other single copies went to the clipboard unguarded, so a name from
+    the network such as =HYPERLINK(...) became a formula when pasted
+    into a spreadsheet. A single line now gets the copied row's guard;
+    a guarded row or cell is not guarded twice, and a report of several
+    lines is left as it is."""
+    board = []
+    root = types.SimpleNamespace(clipboard_clear=board.clear,
+                                 clipboard_append=board.append,
+                                 update_idletasks=lambda: None)
+    app = types.SimpleNamespace(root=root, _set_banner=lambda *_a: None)
+    for text, want in (('=HYPERLINK("http://x","y")',
+                        '\'=HYPERLINK("http://x","y")'),
+                       ("@SUM(1+1)", "'@SUM(1+1)"),
+                       ("+cmd|x", "'+cmd|x"),
+                       ("router\t=1", "router\t'=1"),
+                       ("example.com", "example.com"),
+                       (safe_tsv_row(["=a", "b"]), "'=a\tb"),
+                       (safe_tsv_row(["\tx"]), "'\tx"),
+                       ("Report\n======\n=not a cell",
+                        "Report\n======\n=not a cell")):
+        assert copy_to_clipboard(app, text) is True
+        assert board == [want], (text, board)
 
 
 @self_test()
@@ -87126,6 +92033,15 @@ def bench_gui(argv):
         print("--bench-gui opens the real window and needs a display. On a "
               "server, run it inside xvfb-run.")
         return 2
+    try:
+        load_scapy()            # it builds the test captures with scapy
+    except ImportError as e:
+        # third audit: this ended in a raw ModuleNotFoundError traceback
+        print(f"--bench-gui builds its test captures with scapy, and this "
+              f"Python can't load it ({type(e).__name__}: {e}). Install "
+              f"it with:\n  \"{sys.executable}\" -m pip install scapy\n"
+              f"or start MiniWireshark once: the first start offers it.")
+        return 2
     wanted = [a.upper() for a in argv if a.upper() in BENCH_SCENARIOS]
     if "all" in argv:
         wanted = list(BENCH_SCENARIOS)
@@ -87212,8 +92128,10 @@ def bench_gui(argv):
 # the window is photographed tab by tab, and one folder comes back with a
 # summary. Nothing is sent anywhere; nothing is installed.
 GATE_SHOT_TABS = ("dash", "feed", "timeline", "devices", "map", "health",
-                  "alerts", "websites", "connections", "remote", "packets",
-                  "security", "sources", "help")
+                  "alerts", "websites", "local_services", "connections",
+                  "remote", "packets", "security", "sources", "help")
+# a picture of a tab's sub-view: (tab, sub-view) (third audit)
+GATE_SHOT_SUBVIEWS = {"local_services": ("websites", "Local services")}
 
 
 def grab_window(root, path):
@@ -87347,9 +92265,12 @@ def gui_shots(out_dir, quick=False):
                      (f", {scale}" if scale else "") + ", window " +
                      f"{root.winfo_width()}x{root.winfo_height()}")
         for name in (GATE_SHOT_TABS if not quick else GATE_SHOT_TABS[:4]):
-            if name not in app.tabs:
+            tab_name, sub = GATE_SHOT_SUBVIEWS.get(name, (name, None))
+            if tab_name not in app.tabs:
                 continue
-            app._select_tab(name)
+            app._select_tab(tab_name)
+            if sub:
+                app.tabs[tab_name].show_subview(sub)
             _gui_pump(root, 0.8)
             park_pointer(root)
             _gui_pump(root, 0.2)
@@ -87367,6 +92288,9 @@ def gui_shots(out_dir, quick=False):
             problems += len(found)
             path = os.path.join(out_dir, f"{tag}-{name}.png")
             ok, how = grab_window(root, path)
+            if sub:
+                app.tabs[tab_name].show_subview(
+                    app.tabs[tab_name].SUBVIEWS[0])
             shots += ok
             tool = tool or (how if ok else "")
             lines.append(f"  {name:12s} " + (
@@ -88951,16 +93875,25 @@ def t_s14_long_history(ctx):
         t0 = time.perf_counter()
         r = fn(*a, **k)
         return r, (time.perf_counter() - t0) * 1000
-    old = ctx.path("s14_old.sqlite3")
-    s14_history_db(old, schema=1, obs_per_session=0)
-    st, took = ms(Store, old, session_id=10 ** 6)
-    try:
-        assert not st.error and st.schema_version() == STORE_SCHEMA_VERSION, \
-            st.error
-        assert took <= lim["history_90d_open"], f"migrating took {took:.0f}"
-        assert len(st.load_baselines()) == 40
-    finally:
-        st.stop(5)
+    tries = []
+    for n in range(2):
+        # a second, fresh file only when the first was slow: a CI runner's
+        # disk (Windows CI once took 4.7 s) is not the program.
+        # The limit itself is unchanged.
+        old = ctx.path(f"s14_old{n}.sqlite3")
+        s14_history_db(old, schema=1, obs_per_session=0)
+        st, took = ms(Store, old, session_id=10 ** 6)
+        try:
+            assert not st.error and \
+                st.schema_version() == STORE_SCHEMA_VERSION, st.error
+            assert len(st.load_baselines()) == 40
+        finally:
+            st.stop(5)
+        tries.append(took)
+        if took <= lim["history_90d_open"]:
+            break
+    assert min(tries) <= lim["history_90d_open"], \
+        "migrating took " + ", ".join(f"{t:.0f}" for t in tries) + " ms"
     path = ctx.path("s14.sqlite3")
     sessions = s14_history_db(path)
     st, took = ms(Store, path, session_id=10 ** 6)
@@ -89470,8 +94403,14 @@ def t_m17_tree_width_share(ctx):
         tree.configure(xscrollcommand=hs.set)
         root.geometry("420x240")
         _gui_pump(root, 0.4)
-        assert int(tree.column("who", "width")) >= \
-            heading_width("Contacted by") + 20, tree.column("who", "width")
+        # (third audit, CI windows 3.12: still 30 after 0.4 s on a busy
+        # runner; the share runs 40 ms after the table's last resize, so
+        # give the resize time to land, then check the same thing)
+        need = heading_width("Contacted by") + 20
+        _gui_pump(root, until=lambda: int(tree.column("who", "width"))
+                  >= need, timeout=5)
+        assert int(tree.column("who", "width")) >= need, (
+            tree.column("who", "width"), need, tree.winfo_width())
     finally:
         root.destroy()
 
@@ -90537,18 +95476,33 @@ def t_534_ci_short_tab_keeps_its_content(ctx):
         nb.add(tab.frame, text="t")
         top, sub = tab._head[1], tab._head[2]
         line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
-        rows = []
-        for h in (900, 8 * line + 200, 6 * line + 120, 900):
+
+        def row(h):
             root.geometry(f"600x{h}")
             _gui_pump(root, 0.3)
-            rows.append((bool(top.winfo_ismapped()),
-                         bool(sub.winfo_ismapped()),
-                         tab.body.winfo_ismapped(),
-                         tab.body.winfo_height()))
+            return (bool(top.winfo_ismapped()), bool(sub.winfo_ismapped()),
+                    tab.body.winfo_ismapped(), tab.body.winfo_height())
+        rows = [row(900)]
+        # the short heights come from what this Tk draws (third audit: a
+        # fixed "6 lines + 120" still left room for the first line with
+        # the fonts of a Tk without Xft): tab bar, tool bar, the header
+        # with both lines and its second line, measured at full height
+        over = root.winfo_height() - tab.frame.winfo_height()
+        bars = tab.body.winfo_y() - (top.winfo_y() + top.winfo_height())
+        both = top.winfo_height()
+        second = sub.winfo_height() + 2
+        content = over + bars + 6 * line
+        assert over > 0 and bars > 0 and second > 2, (over, bars, second)
+        for h in (8 * line + 200, 6 * line + 120,
+                  content + both - second // 2,         # no room for line 2
+                  content + (both - second) // 2,       # nor for line 1
+                  900):
+            rows.append(row(h))
         assert rows[0][:3] == (True, True, True), rows
         assert all(r[2] and r[3] >= 5 * line for r in rows), rows
-        assert not rows[2][0] and not rows[2][1], rows
-        assert rows[3][:2] == (True, True), rows
+        assert rows[3][:2] == (True, False), rows    # second line first
+        assert rows[4][:2] == (False, False), rows   # then the whole header
+        assert rows[5][:2] == (True, True), rows
         assert tab.frame.pack_slaves()[0] is top     # back in its place
         var = tk.StringVar(master=root, value="")
         lbl = tk.Label(tab.body, textvariable=var)
@@ -90567,6 +95521,81 @@ def t_534_ci_short_tab_keeps_its_content(ctx):
         assert not lbl.winfo_manager()
     finally:
         root.destroy()
+
+
+@self_test()
+def t_534_ci_shared_fonts_keep_the_default_family(ctx):
+    """5.3.4 (third audit): on X11 the shared fonts use TkDefaultFont's
+    family and grow with their size. A Tk without Xft (uv's Pythons)
+    read the old ("TkDefaultFont", n) as an unknown family and gave the
+    bitmap "fixed" font at one size, whatever the text size."""
+    root = _m16_tk()
+    if root is None:
+        return "skip"
+    try:
+        small = tkfont.nametofont(mw_font(9))
+        big = tkfont.nametofont(mw_font(20, "bold"))
+        assert big.metrics("linespace") > small.metrics("linespace"), (
+            small.actual(), big.actual())
+        if str(root.tk.call("tk", "windowingsystem")) == "x11":
+            fam = tkfont.nametofont("TkDefaultFont").actual("family")
+            assert small.actual("family") == fam, (small.actual(), fam)
+            assert big.actual("family") == fam, (big.actual(), fam)
+            assert big.actual("weight") == "bold", big.actual()
+    finally:
+        root.destroy()
+
+
+@self_test()
+def t_534_bench_gui_without_scapy_says_how(ctx):
+    """5.3.4 (third audit): --bench-gui on a Python without scapy says
+    how to install it and stops with exit code 2, instead of a raw
+    ModuleNotFoundError traceback."""
+    def no_scapy():
+        raise ModuleNotFoundError("No module named 'scapy'")
+    buf = io.StringIO()
+    with _b9_patched(globals(), load_scapy=no_scapy), \
+            _b9_patched(os.environ, DISPLAY=":0"), \
+            contextlib.redirect_stdout(buf):
+        rc = bench_gui(["S1", "S2", "--check"])
+    text = buf.getvalue()
+    assert rc == 2, (rc, text)
+    assert "-m pip install scapy" in text and "first start" in text, text
+    assert "S1 " not in text, text          # stopped before any scenario
+
+
+@self_test(needs_source=True)
+def t_a3_no_raw_default_font_tuples(ctx):
+    """Third audit: the program's own code builds no ("TkDefaultFont", n)
+    font tuple. Tk reads it as an unknown family name: the bitmap "fixed"
+    font at one size on a Tk without Xft (canvases, table tags, the table
+    style, Settings). default_font names TkDefaultFont's real family.
+    Tests may still build the tuple; SettingsWindow keeps its class-level
+    tuples as the reference and uses default_font per window."""
+    import ast
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        tree = ast.parse(f.read())
+    found = []
+
+    def visit(node, owner, in_class):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                visit(ch, ch.name if owner is None else owner, False)
+            elif isinstance(ch, ast.ClassDef):
+                visit(ch, owner, True)
+            else:
+                if isinstance(ch, ast.Tuple) and len(ch.elts) >= 2 and \
+                        isinstance(ch.elts[0], ast.Constant) and \
+                        ch.elts[0].value == "TkDefaultFont" and not (
+                            isinstance(ch.elts[1], ast.Constant) and
+                            isinstance(ch.elts[1].value, str)):
+                    test = owner is not None and re.match(
+                        r"_?(t|gt|gs)_", owner)
+                    if not test and not (in_class and owner is None):
+                        found.append((ch.lineno, owner))
+                visit(ch, owner, in_class and owner is None)
+    visit(tree, None, False)
+    assert not found, found[:10]
 
 
 @self_test(needs_source=True)
@@ -91756,13 +96785,13 @@ def t_a2_ipv6_many_extension_headers_fast(ctx):
     for raw in frames:
         d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
         assert d["transport"] in ("TCP", "UDP"), d["text"]
-    worst = 0.0
-    for _ in range(5):
-        t0 = time.perf_counter()
+    # third audit: an average over many runs (one slow run is a busy PC)
+    t0 = time.perf_counter()
+    for _ in range(50):
         d = fast_decode(frames[1], 1.0)
-        worst = max(worst, time.perf_counter() - t0)
+    each = (time.perf_counter() - t0) / 50
     assert d["text"] == "Secure web browsing (SYN)", d["text"]
-    assert worst < 0.005, f"{worst * 1000:.1f} ms for one frame"
+    assert each < 0.005, f"{each * 1000:.1f} ms for one frame"
     if ctx.scapy_ok:
         diffs = decoder_differences([(r, 1.0, 1) for r in frames[:3]])
         assert not diffs, diffs[:3]
@@ -91791,6 +96820,202 @@ def t_a2_udp_length_never_past_the_ip_packet(ctx):
             got = decode_packet(Ether(raw))["payload_len"]
             assert got == want, (got, want)
         assert not decoder_differences([(lie, 1.0, 1), (snapped, 1.0, 1)])
+
+
+def _a3_udp4(load, sport, dport, proto=17):
+    tl = 20 + (8 if proto == 17 else 0) + len(load)
+    hdr = struct.pack(">HHHH", sport, dport, 8 + len(load), 0) \
+        if proto == 17 else b""
+    return bytes(6) + b"\x02\x00\x00\x00\x00\x01\x08\x00" + \
+        struct.pack(">BBHHHBBH", 0x45, 0, tl, 0, 0, 64, proto, 0) + \
+        _socket.inet_aton("10.0.0.1") + _socket.inet_aton("10.0.0.2") + \
+        hdr + load
+
+
+@self_test()
+def t_a3_junk_dns_fails_fast(ctx):
+    """Third audit #1: what isn't DNS on ports 53, 5353 and 5355 (UDP or
+    TCP) is a plain row by its port from the fast decoder, not a scapy
+    re-read (6-17 ms a packet); real DNS still decodes."""
+    hdr = struct.pack(">HHHHHH", 1, 0x0100, 5, 0, 0, 0)    # 5 questions
+    chain = b"".join(b"\x01a" + struct.pack(">H", 0xC000 | (16 + 4 * i))
+                     for i in range(30)) + b"\x00"
+    hops = struct.pack(">HHHHHH", 1, 0x8180, 0, 200, 0, 0) + chain
+    hops += (b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 0)) * 110
+    tcp = struct.pack(">HHIIBBHHH", 5000, 53, 1, 0, 0x50, 0x18, 64240,
+                      0, 0) + struct.pack(">H", 1400) + b"\xff" * 1400
+    junk = [_a3_udp4(b"\xff" * 1400, 5000, p) for p in (53, 5353, 5355)] + \
+        [_a3_udp4(hdr, 5000, 53),                  # questions cut off
+         _a3_udp4(hdr[:4] + b"\x00\x01" + hdr[6:] + b"\xc0\x0c", 5000,
+                  53),                             # a name pointing at itself
+         _a3_udp4(hops, 53, 5000), _a3_udp4(tcp, 0, 0, proto=6)]
+    for raw in junk:
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())    # not declined
+        assert d["proto"] in ("UDP", "TCP") and d["dns"] is None and \
+            d["mdns"] is None, (d["proto"], d["text"])
+    assert _fast_decode(junk[0], 1.0, 1, None)["text"] == \
+        "Website lookup (DNS) (1400 bytes)"
+    q = _a3_udp4(struct.pack(">HHHHHH", 1, 0x0100, 1, 0, 0, 0) +
+                 b"\x07example\x03com\x00\x00\x01\x00\x01", 5000, 53)
+    assert fast_decode(q, 1.0)["text"] == "Looking up example.com"
+    t0, n = time.perf_counter(), 50
+    for _ in range(n):
+        for raw in junk:
+            fast_decode(raw, 1.0)
+    each = (time.perf_counter() - t0) / (n * len(junk))
+    # about 5-90 µs here; scapy took 1.5-6 ms
+    assert each < 0.0005, f"{each * 1e6:.0f} µs a junk packet"
+
+
+@self_test()
+def t_a3_ipv6_fragment_and_cut_chain_fast(ctx):
+    """Third audit #2: IPv6 fragment headers and an extension chain cut
+    short are read by the fast decoder (scapy took 12-112 ms), the way
+    scapy reads them; a multicast destination is found from its bytes."""
+    udp = struct.pack(">HHHH", 5000, 9999, 28, 0) + bytes(20)
+    dest = bytes([17, 0]) + b"\x01\x04" + bytes(4)
+
+    def v6(nh, body, plen=None, dst="2001:db8::2"):
+        return b"\x02\x00\x00\x00\x00\x02\x02\x00\x00\x00\x00\x01\x86\xdd" \
+            + struct.pack(">IHBB", 6 << 28, len(body) if plen is None
+                        else plen, nh, 64) + \
+            _socket.inet_pton(_socket.AF_INET6, "2001:db8::1") + \
+            _socket.inet_pton(_socket.AF_INET6, dst) + body
+
+    def frag(nxt, off):
+        return bytes([nxt, 0]) + struct.pack(">HI", off << 3, 7)
+    cases = [(v6(44, frag(60, 0) + dest + udp), "Quick message (20 bytes)"),
+             (v6(44, frag(60, 9) + bytes(40)), "Raw frame"),
+             (v6(60, bytes([60, 200]) + bytes(6), plen=8),
+              "IPv6 Extension Header - Destination Options Header frame"),
+             (v6(44, bytes([17, 0, 0, 0])), "Raw frame"),
+             (v6(17, udp, dst="ff02::fb"), "Quick message (20 bytes)")]
+    for raw, text in cases:
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
+        assert d["text"] == text, (d["text"], text)
+    assert d["multicast"] and not fast_decode(cases[0][0], 1.0)["multicast"]
+    t0 = time.perf_counter()
+    for _ in range(100):
+        for raw, _text in cases:
+            fast_decode(raw, 1.0)
+    each = (time.perf_counter() - t0) / (100 * len(cases))
+    assert each < 0.0005, f"{each * 1e6:.0f} µs an IPv6 frame"   # ~4 µs
+    if ctx.scapy_ok:
+        diffs = decoder_differences([(r, 1.0, 1) for r, _t in cases])
+        assert not diffs, diffs[:3]
+
+
+@self_test()
+def t_a3_udp_length_checked_against_ip_and_bytes(ctx):
+    """Third audit #3: a UDP size is never more than the bytes captured
+    unless the IP and UDP lengths agree (a snap length), and Ethernet
+    padding is cut at the smaller of the two lengths."""
+    def frame(load, ulen, total, pad=b""):
+        return bytes(6) + b"\x02\x00\x00\x00\x00\x01\x08\x00" + \
+            struct.pack(">BBHHHBBH", 0x45, 0, total, 0, 0, 64, 17, 0) + \
+            _socket.inet_aton("10.0.0.1") + _socket.inet_aton("10.0.0.2") + \
+            struct.pack(">HHHH", 40000, 443, ulen, 0) + load + pad
+    cases = [(frame(bytes(4), 65535, 0), 4),            # IP length 0
+             (frame(bytes(4), 65535, 65535), 4),        # both lie, apart
+             (frame(bytes(4), 12, 65535), 4),           # IP lies
+             (frame(bytes(4), 65535, 32), 4),           # UDP lies
+             (frame(bytes(10), 12, 38, pad=bytes(8)), 4),   # UDP is shorter
+             (frame(bytes(4), 12, 32, pad=bytes(18)), 4),   # padding
+             (frame(bytes(60), 1408, 1428), 1400)]      # snap length
+    for raw, want in cases:
+        d = fast_decode(raw, 1.0)
+        assert d["payload_len"] == want, (d["payload_len"], want)
+    assert _udp_payload_len(12, None, 4) == 4
+    assert _udp_payload_len(65535, None, 4) == 4
+    assert _udp_payload_len(1408, 1408, 60) == 1400
+    short = frame(bytes(4), 5, 32)              # length under 8: scapy's
+    assert fast_decode(short, 1.0)["payload_len"] <= 4
+    if ctx.scapy_ok:
+        for raw, want in cases:
+            got = decode_packet(Ether(raw))["payload_len"]
+            assert got == want, (got, want)
+
+
+def _r4_eth(et, body):
+    return b"\x02\x00\x00\x00\x00\x02\x02\x00\x00\x00\x00\x01" + \
+        struct.pack(">H", et) + body
+
+
+def _r4_v4(proto, load, total=None, vihl=0x45):
+    return _r4_eth(0x0800, struct.pack(
+        ">BBHHHBBH", vihl, 0, 20 + len(load) if total is None else total,
+        0, 0, 64, proto, 0) + _socket.inet_aton("10.0.0.1") +
+        _socket.inet_aton("10.0.0.2") + load)
+
+
+def _r4_v6(nh, body, plen=None):
+    return _r4_eth(0x86DD, struct.pack(
+        ">IHBB", 6 << 28, len(body) if plen is None else plen, nh, 64) +
+        _socket.inet_pton(_socket.AF_INET6, "2001:db8::1") +
+        _socket.inet_pton(_socket.AF_INET6, "2001:db8::2") + body)
+
+
+@self_test()
+def t_r4_damaged_ip_and_unknown_protocols_fast(ctx):
+    """Round 4: an IPv4 header shorter than 20 bytes, and an IP protocol
+    scapy has no decoder for, are a "Raw frame" from the fast decoder, as
+    scapy says, without asking scapy (2.5-6 ms and 0.1-4.5 ms a packet);
+    tunnels and IPv6 mobility still go to scapy."""
+    junk = bytes(range(256)) * 6
+    short = [_r4_eth(0x0800, bytes([v << 4 | ihl]) + junk[:1400])
+             for v in (4, 0, 8) for ihl in range(5)]
+    pad1 = bytes([142, 16]) + bytes(16 * 8 + 6)     # 134 one-byte pads
+    weird = [_r4_v4(82, bytes(40 + 1000), vihl=0x4F),     # 40 B of options
+             _r4_v6(0, pad1 + bytes(64)), _r4_v6(60, pad1 + bytes(64)),
+             _r4_v6(59, bytes(8))]
+    for raw in short + weird:
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
+        assert (d["proto"], d["text"]) == ("Raw", "Raw frame"), d["text"]
+    assert _fast_decode(short[0], 1.0, 1, None)["src_ip"] == ""
+    assert fast_decode(weird[1], 1.0)["src_ip"] == "2001:db8::1"
+    every = [_r4_v4(pr, bytes(40)) for pr in range(256)] + \
+        [_r4_v6(nh, bytes(40)) for nh in range(256)]
+    for raw in (every[4], every[41], every[47], every[256 + 4],
+                every[256 + 41], every[256 + 47], every[256 + 135]):
+        try:
+            _fast_decode(raw, 1.0, 1, TlsReassembler())
+            raise AssertionError("a tunnel not handed to scapy")
+        except NeedDeepParse:
+            pass
+    t0 = time.perf_counter()
+    for _ in range(20):
+        for raw in short + weird:
+            fast_decode(raw, 1.0)
+    each = (time.perf_counter() - t0) / (20 * len(short + weird))
+    assert each < 0.0005, f"{each * 1e6:.0f} µs a packet"     # ~5 µs
+    if ctx.scapy_ok:
+        # what scapy says for each of them, protocol by protocol (not for
+        # the short headers: scapy reads their addresses or not depending
+        # on the bytes after them, and says "Raw frame" either way)
+        diffs = decoder_differences([(r, 1.0, 1) for r in weird + every + [
+            _r4_v4(82, b""), _r4_v6(59, b""), _r4_v6(59, b"", plen=0)]])
+        assert not diffs, diffs[:3]
+        for raw in short:
+            assert decode_packet(Ether(raw))["text"] == "Raw frame"
+
+
+@self_test()
+def t_r4_ipv6_payload_length_zero_uses_bytes(ctx):
+    """Round 4: an IPv6 payload length of 0 (a jumbogram, or a large send
+    the network card cuts up later) is read from the bytes captured, as an
+    IPv4 total length of 0 already was; it went to scapy, which said
+    "Padding frame"."""
+    udp = struct.pack(">HHHH", 40000, 9999, 65535, 0) + bytes(4)
+    tcp = struct.pack(">HHIIBBHHH", 40000, 443, 1, 0, 0x50, 0x18, 64240,
+                      0, 0) + bytes(1400)
+    for raw, text, size in (
+            (_r4_v6(17, udp, plen=0), "Quick message (4 bytes)", 4),
+            (_r4_v6(6, tcp, plen=0), None, 1400),
+            (_r4_v4(6, tcp, total=0), None, 1400)):
+        d = _fast_decode(raw, 1.0, 1, TlsReassembler())   # not declined
+        assert d["payload_len"] == size, (d["payload_len"], size)
+        assert text is None or d["text"] == text, d["text"]
+        assert d["transport"] in ("TCP", "UDP"), d["text"]
 
 
 @self_test()
@@ -92268,6 +97493,8 @@ MEMORY_CAPS = (
     (NetworkModel, "BCAST_KEEP"),
     (NetworkModel, "DEVICE_SITES_KEEP"),
     (NetworkModel, "DEVICE_REMOTES_KEEP"), (NameCache, "MAX"),
+    (NetworkModel, "DEVICE_SITES_TOTAL"),
+    (NetworkModel, "DEVICE_REMOTES_TOTAL"),
     (AlertEngine, "DEBOUNCE_KEEP"),
     (AlertEngine, "KEEP"),
     (DnsTracker, "DOMAINS_KEEP"), (DnsTracker, "SERVERS_KEEP"),
@@ -92334,9 +97561,9 @@ def memory_census(m):
         "encrypted DNS users": (len(m.doh_seen), m.DOH_CLIENTS_KEEP),
         "names learned": (len(m.cache.ip_to_name), m.cache.MAX),
         # (30 minutes, and at most 200,000: the review thread's part)
-        "lookups": (len(c.order), 200000),
-        "lookups per address": (len(c.by_ip), 200000),
-        "lookups per device": (len(c.by_dev_ip), 200000),
+        "lookups": (len(c.order), c.MAX),
+        "lookups per address": (len(c.by_ip), c.MAX),
+        "lookups per device": (len(c.by_dev_ip), c.MAX),
         "names asked": (len(m.dns.domains), m.dns.DOMAINS_KEEP),
         "DNS servers": (len(m.dns.servers), m.dns.SERVERS_KEEP),
         "DNS waiting": (len(m.dns.pending), 4096),
@@ -92364,6 +97591,13 @@ def memory_census(m):
         "remote addresses of a device": (
             max((len(d.remote_ips) for d in reg.by_key.values()),
                 default=0), m.DEVICE_REMOTES_KEEP),
+        # round 5: and of all devices together
+        "websites of all devices": (sum(len(d.websites) for d in
+                                        reg.by_key.values()),
+                                    m.DEVICE_SITES_TOTAL),
+        "remote addresses of all devices": (
+            sum(len(d.remote_ips) for d in reg.by_key.values()),
+            m.DEVICE_REMOTES_TOTAL),
         "metric buckets": (max(sum(len(od) for od in ts.tiers.values())
                                for ts in m.metrics.series.values()),
                            sum(n for _r, n in METRIC_TIERS)),
@@ -92524,6 +97758,233 @@ def t_534_memory_flat_in_fast_time(ctx):
         assert g["total"] < MEMORY_FLAT_LIMIT, g
         assert not g["top"] or g["top"][0][1] < MEMORY_FLAT_LINE, g["top"]
         assert o1 - o0 < MEMORY_FLAT_OBJECTS, (o0, o1)
+
+
+@self_test()
+def t_534_loop_replay_bounded(ctx):
+    """Audit #56: a looped replay rewinds the clock, so the lookup
+    correlator never aged out and only its 200,000 cap held; changed-row
+    sets fed faster than a tick drains grew without bound. Now both
+    stop at a cap and a big backlog becomes one table refill."""
+    c = LookupCorrelator()
+    # third audit: the loops were c.MAX long, so the old 200,000 cap
+    # passed too. Fixed numbers now: 25,000 new names a loop must stop
+    # at 20,000
+    for loop in range(3):                          # same times each loop
+        for i in range(25000):
+            c.note_resolution("d", "s.example", "10.%d.%d.%d" % (
+                loop, i // 250, i % 250), 1000.0 + i * 0.01)
+    assert len(c.order) <= 20000 and len(c.by_dev_ip) <= 20000, \
+        len(c.order)
+    assert len(c.by_ip) <= 20000, len(c.by_ip)
+    assert c.match("d", "10.2.79.249", 1200.0)[0] == "s.example"
+    m = scenario_model(ctx.cfg(), [])
+    got = []
+    tab = types.SimpleNamespace(_pending=False, refresh=lambda: None,
+                                update_keys=got.extend)
+    win = types.SimpleNamespace(FLOW_BACKLOG=100, FLUSH_MAX=250,
+                                tabs={"remote": tab})
+    win._dirty_overflow = lambda mm, a: MiniWireshark._dirty_overflow(
+        win, mm, a)
+    win._take_dirty = MiniWireshark._take_dirty
+    m.dirty_remotes = {str(i) for i in range(101)}
+    MiniWireshark._flush_remotes(win, m)
+    assert not m.dirty_remotes and tab._pending and not got
+    tab._pending, m.dirty_remotes = False, {str(i) for i in range(101)}
+    MiniWireshark._flush_remotes(win, m)            # not again within 5 s
+    assert len(got) == 101 and not tab._pending
+    # third audit: within those 5 s a burst past 4 x the backlog is still
+    # dropped, so the set has a hard cap
+    m.dirty_remotes = {str(i) for i in range(401)}
+    MiniWireshark._flush_remotes(win, m)
+    assert not m.dirty_remotes and tab._pending, len(m.dirty_remotes)
+
+
+@self_test()
+def t_534_lan_tallies_capped(ctx):
+    """Third audit (memory): the DHCP servers and routers offered, the
+    MACs that internet traffic goes through, the switches heard (LLDP)
+    and the device list's change lists had no limit, so made-up ones
+    grew them for ever. Each now stops at its cap, the busiest stay (the
+    real router is still the gateway) and a minimised window lets go of
+    rekeys it has not drawn."""
+    cap = NetworkModel.LAN_TALLY_KEEP
+    assert cap <= 64
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    sb.home_network()
+    for i in range(300):
+        srv = "10.66.%d.%d" % (i // 250, 1 + i % 250)
+        mac = "02:66:00:00:%02x:%02x" % (i >> 8, i & 255)
+        a2_dhcp_ack(sb, srv, mac, sb.PHONE, srv, srv)
+        sb._emit(PK.Ether(src=sb.PHONE[1], dst=mac) /
+                 PK.IP(src=sb.PHONE[0], dst="8.8.%d.%d" % (i // 250,
+                                                         1 + i % 250)) /
+                 PK.TCP(sport=40000 + i, dport=443, flags="S"))
+        sb._emit(_lldp_frame(system="sw-%d" % i, port="p%d" % i,
+                             chassis=struct.pack(">IH", 0x021b5400, i)))
+    for _ in range(3):              # the real router carries the traffic
+        sb.dhcp(sb.PHONE)
+        sb.tls(sb.PHONE, "www.example.com", "93.184.215.14")
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    for name in ("dhcp_servers", "dhcp_routers", "gw_mac_traffic",
+                 "switch_ports"):
+        n = len(getattr(m, name))
+        assert 0 < n <= cap, (name, n)
+    assert sb.GW[0] in m.dhcp_servers and sb.GW[0] in m.dhcp_routers
+    assert sb.GW[1] in m.gw_mac_traffic
+    assert m.infer_gateway() == gw, m.infer_gateway()
+    assert any(r["system"] == "sw-299" for r in m.switch_ports.values())
+    assert a2_kinds(m, "dhcp_anomaly")              # still noticed
+    # the device list's change lists, with no window emptying them
+    m.set_identity(local_nets=[ipaddress.ip_network("192.168.0.0/16")])
+    reg = m.registry
+    reg.rekeyed, reg.removed = [], []
+    keep = reg.CHANGES_KEEP
+    for i in range(keep + 500):
+        ip = "192.168.%d.%d" % (10 + i // 250, 1 + i % 250)
+        reg.touch(ip, None, "arp_reply", "test", SCENARIO_T0 + 9000)
+        reg.touch(ip, "02:55:%02x:%02x:00:01" % (i >> 8, i & 255),
+                  "arp_reply", "test", SCENARIO_T0 + 9000)
+    assert 0 < len(reg.rekeyed) <= keep, len(reg.rekeyed)
+    assert reg.rekeyed[-1][1] == "02:55:%02x:%02x:00:01" % (
+        (keep + 499) >> 8, (keep + 499) & 255), reg.rekeyed[-1]
+    win = types.SimpleNamespace(MINIMIZED_KEEP=50, _rebuild_on_restore=False)
+    MiniWireshark._trim_queues_minimized(win, m)
+    assert not reg.rekeyed and win._rebuild_on_restore
+    # round 5 (memory): the list of removed keys has the same cap, both
+    # where expired devices leave memory and where two devices merge
+    reg.removed = []
+    t = SCENARIO_T0 + 9500
+    old = []
+    for i in range(keep + 500):
+        mac = "da:5e:%02x:%02x:00:01" % (i >> 8, i & 255)
+        reg.by_key[mac] = DeviceRecord(
+            key=mac, mac=mac, state=STATE_EXPIRED, first_seen=t + i,
+            last_seen=t + i, last_confirmed=t + i)
+        old.append(mac)
+    assert len(reg.prune_expired(keep=0)) == keep + 500
+    assert 0 < len(reg.removed) <= keep, len(reg.removed)
+    assert reg.removed[-1] == old[-1], reg.removed[-1]   # newest kept
+    reg.removed = []
+    for i in range(keep + 500):
+        a, b = ("02:5f:%02x:%02x:00:%02x" % (i >> 8, i & 255, j)
+                for j in (1, 2))
+        for k in (a, b):
+            reg.by_key[k] = DeviceRecord(key=k, mac=k, first_seen=t,
+                                         last_seen=t, last_confirmed=t)
+        assert reg.merge(a, b) is not None
+    assert 0 < len(reg.removed) <= keep, len(reg.removed)
+    assert reg.removed[-1] == b, reg.removed[-1]
+
+
+@self_test()
+def t_r5_device_lists_capped_in_all(ctx):
+    """Round 5 (memory): each device lists at most 500 websites and 500
+    remote addresses, but the sum over all devices had no cap, so in the
+    harsh looped replay (1,000 devices, new websites every loop) memory
+    grew in a straight line. Flooded through the capture path, the lists
+    of all devices together stay under their totals; past them the
+    devices seen longest ago let go first and your labelled ones last."""
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    cap = m.DEVICE_SITES_TOTAL = m.DEVICE_REMOTES_TOTAL = 400
+    sb = ScenarioBuilder(t0=SCENARIO_T0)
+    hosts = [("192.168.1.%d" % (100 + i), "02:00:5e:20:00:%02x" % i, "")
+             for i in range(30)]
+    for h in hosts:
+        sb.arp_announce(h)
+    for j in range(40):
+        for i, h in enumerate(hosts):
+            k = j * 30 + i
+            name = "r5-%d.flood%d.example" % (k, k % 9)
+            rip = "34.%d.%d.%d" % (1 + k // 62500, k // 250 % 250,
+                                   1 + k % 250)
+            sb.dns(h, name, rip)
+            sb.tls(h, name, rip, size=200)
+    replay_frames(m, sb.frames, decoder=fast_frame_decoder(m))
+    devs = [m.registry.by_key[h[1]] for h in hosts]
+    for attr in ("websites", "remote_ips"):
+        total = sum(len(getattr(d, attr)) for d in devs)
+        assert 0 < total <= cap, (attr, total)
+        # the device heard last still has its newest website
+        assert len(getattr(devs[-1], attr)) > 0, attr
+    assert "r5-1199.flood2.example" in devs[-1].websites
+    over = memory_over_caps(m)
+    assert "websites of all devices" not in over, over
+    assert "remote addresses of all devices" not in over, over
+    # which devices let go: the oldest unlabelled ones first
+    m.DEVICE_SITES_TOTAL = 900
+    reg = m.registry
+    t = SCENARIO_T0 + 5000
+    for key in list(reg.by_key):
+        reg.by_key[key].websites.clear()
+    four = []
+    for i, age in enumerate((0, 10, 20, -50)):
+        mac = "02:00:5e:21:00:%02x" % i
+        dev = DeviceRecord(key=mac, mac=mac, first_seen=t + age,
+                           last_seen=t + age, last_confirmed=t + age)
+        dev.websites.update("s%d-%d.example" % (i, n) for n in range(300))
+        reg.by_key[mac] = dev
+        four.append(dev)
+    four[3].alias = "Grandma's tablet"       # the oldest, but named
+    m.dirty_devices.clear()
+    gone = m._cap_device_lists()
+    assert gone == [four[0].key, four[1].key], gone
+    assert [len(d.websites) for d in four] == [0, 0, 300, 300]
+    assert set(gone) <= m.dirty_devices          # the table is redrawn
+    assert m._cap_device_lists() == []           # under the total now
+
+
+@self_test()
+def t_534_session_saved_in_pieces(ctx):
+    """Third audit (memory): saving the session, and the crash copy made
+    every 30 s while live, joined the whole session into one text first
+    (24 MB with 10,000 websites, held two or three times over), and
+    memory crept up with each copy. The pieces now go to the file as
+    they are made: the most held at once is a small part of the file,
+    and the file (plain or .gz) reads back as the same session."""
+    import tracemalloc
+    if tracemalloc.is_tracing():
+        return "skip"
+    m = scenario_model(ctx.cfg(), ctx.frames())
+    for i in range(8000):
+        m.register_website("s%d.piece%d.example.com" % (i, i % 50),
+                           "34.%d.%d.%d" % (i // 62500, i // 250 % 250,
+                                            1 + i % 250), None, "DNS")
+    app = types.SimpleNamespace(
+        model=m, gate=GuiGate(),
+        session_meta=lambda: {"data_source": "live", "interface": "eth0"})
+    got = {}
+    for name in ("s.mwsession.json", "s.mwsession.json.gz"):
+        path = ctx.path(name)
+        run = MiniWireshark.session_text_job(app, path)
+        tracemalloc.start()
+        try:
+            assert run(Job("t", "", None)) == path
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        size = os.path.getsize(path)
+        got[name] = read_session_payload(path)
+        if not name.endswith(".gz"):
+            assert size > 1_000_000, size
+            plain = size
+        # joined, the text alone was the size of the file (three times
+        # with the list of pieces and the encoded copy); now well under
+        # one file (0.2 to 0.6 of it, Python 3.12 and 3.8)
+        assert peak < plain * 0.8, (name, peak, plain)
+        assert not [n for n in os.listdir(ctx.tmp) if ".tmp" in n]
+    a, b = got["s.mwsession.json"], got["s.mwsession.json.gz"]
+    assert len(a["websites"]) == len(m.websites) >= 8000
+    a.pop("exported_at", None)
+    b.pop("exported_at", None)
+    assert a == b
 
 
 @self_test(needs_source=True)
@@ -93911,7 +99372,19 @@ def _gs_this_pc(app, ctx):
     assert len(m.alerts.alerts) == n0 + 1
     assert any(a.kind == "arp_cache_mismatch" and a.severity == "DANGER"
                for a in m.alerts.alerts.values())
-    assert ("192.168.1.201", "02:11:22:33:44:55") in app.arp_cache_only()
+    # (third audit: this failed on CI in full runs and never alone. The
+    # diagnosis printed on bd545db showed why: the waits above let the
+    # live network check put the runner's real networks (10.1.0.0/20,
+    # 172.17.0.0/16) back as the local networks, so 192.168.1.201 was
+    # off the LAN. Set the scenario's identity again with no wait between
+    # that and the check, as the program-attribution part above does.)
+    m.set_identity(my_ips=ident[1], local_nets=ident[3])
+    reg = m.registry
+    assert ("192.168.1.201", "02:11:22:33:44:55") in app.arp_cache_only(), (
+        app.arp_cache_only(), app.arp_cache,
+        "192.168.1.201" in reg.ip_to_key, "02:11:22:33:44:55" in reg.by_key,
+        reg.eligible_ip("192.168.1.201"), [str(n) for n in m.local_nets],
+        getattr(m.local_nets, "own", None))
     # security tab with listeners and a UPnP result
     app.upnp_result = {"upnp": True, "at": time.time(), "mappings": [
         {"Protocol": "TCP", "ExternalPort": "3389",
@@ -94803,6 +100276,14 @@ def _gs_v501(app, ctx):
         assert text.startswith("packet,time,severity,group,finding")
         assert text.count("\n") >= len(kids) + 1
         tab.clear_filter()
+        # back from the Expert list, the list's height and the details
+        # pane's sash settle a moment later (<Configure> renders again);
+        # on a slow Windows runner the first render can still see the
+        # old, one-row height
+        _gui_pump(root, until=lambda: len(tab.slots) >= 2, timeout=5)
+        assert len(tab.slots) >= 2, (
+            "the packet list keeps one row", len(tab.matched),
+            tab.tree.winfo_height(), tab._row_height(), tab.head_h)
         # time display formats
         tab.time_var.set("Seconds since start")
         tab._time_format()
@@ -95353,6 +100834,13 @@ def run_gui_test(live=False):
                    "history.enabled": True,
                    "history.retention": "7 days"})
     cfg.save()
+    # round 4: what an interrupted write left, swept when the window starts
+    # (a name "Delete ALL history" doesn't remove, so only the sweep can)
+    ctx.stale_tmp = os.path.join(PATHS.data,
+                                 "bootstrap_state.json.tmp99999999-1")
+    with open(ctx.stale_tmp, "w", encoding="utf-8") as f:
+        f.write("{}")
+    os.utime(ctx.stale_tmp, (time.time() - 7 * 3600,) * 2)
     root = tk.Tk()
     gw, ips, macs, nets = scenario_identity()
     app = MiniWireshark(root, "", set(), set(), "", config=cfg)
@@ -95578,9 +101066,17 @@ def gt_m2_background(app, ctx):
     # shared fonts look exactly like the tuples they replaced
     app._apply_text_size("Normal")
     _gui_pump(root, 0.1, until=lambda: app._text_size_job is None, timeout=5)
+    # (round 4) the look the old ("TkDefaultFont", size) tuples had where
+    # Tk read them as TkDefaultFont: its family at that size and style. A
+    # Tk without Xft (uv's Pythons) reads that tuple as an unknown family
+    # and draws the bitmap "fixed" font at one size, the third-audit bug
+    # mw_font fixes on X11; there the tuple is not the look to match
+    fam = "TkDefaultFont"
+    if str(root.tk.call("tk", "windowingsystem")) == "x11":
+        fam = tkfont.nametofont("TkDefaultFont").actual("family")
     for name, (size, style) in MW_FONTS.items():
         a = tkfont.nametofont(name).actual()
-        b = tkfont.Font(font=("TkDefaultFont", size) + style).actual()
+        b = tkfont.Font(font=(fam, size) + style).actual()
         assert a == b, (name, a, b)
     assert len(MW_FONTS) >= 8, sorted(MW_FONTS)
     app._apply_text_size("Large")
@@ -95780,6 +101276,434 @@ def gt_m3_table_kit(app, ctx):
     assert not ft.buffer
 
 
+def _tab_chain(app):
+    """Every widget Tab reaches from the header search box."""
+    seen, w = set(), app.search_entry
+    for _ in range(4000):
+        w = w.tk_focusNext()
+        if w is None or w in seen:
+            break
+        seen.add(w)
+    return seen
+
+
+@contextlib.contextmanager
+def _popups():
+    """The menus a key press opens, captured (never shown)."""
+    shown, orig = [], tk.Menu.tk_popup
+    tk.Menu.tk_popup = lambda menu, *a, **k: shown.append(menu)
+    try:
+        yield shown
+    finally:
+        tk.Menu.tk_popup = orig
+
+
+def _kbd_packet_row(app, ctx):
+    """A packet with its bytes to select. Earlier steps may leave the
+    window on a loaded session with no packets (the scripted capture is
+    fed again then, as the inspector step does)."""
+    root = app.root
+    pick = lambda: next((d for d in app.all_rows if d.get("raw")), None)
+    if pick() is None:
+        ident = scenario_identity()
+        m = app._new_model(identity=ident[:3])
+        m.set_identity(local_nets=ident[3])
+        app.replace_model(m)
+        app.data_mode = "live"
+        sink = app.lossless_sink()
+        for raw, _ts, lt in ctx.frames():
+            sink(raw, time.time(), lt)
+        _gui_pump(root, 0.3, lambda: not len(app.ring) and
+                  not app.worker.busy, timeout=30)
+        _gui_pump(root, 0.5)
+    row = pick()
+    assert row is not None, (len(app.all_rows), app.data_mode)
+    return row
+
+
+@gui_test_step("keyboard B: read-only text panes are in the Tab chain, "
+               "scroll and copy by key")
+def gt_kbd_text_panes(app, ctx):
+    root = app.root
+    app.toggle_inspector(True)
+    ptab = app._select_tab("packets")
+    ptab.show_subview("Packets")
+    row = _kbd_packet_row(app, ctx)
+    assert ptab.select_no(row["no"]), (row["no"], app.data_mode)
+    _gui_pump(root, 0.4)
+    nb = ptab.details.master.master
+    panes = {"inspector": app.inspector.txt, "bytes": ptab.bytes_view}
+    for i, page in enumerate(nb.tabs()):
+        nb.select(page)
+        _gui_pump(root, 0.2)
+        chain = _tab_chain(app)
+        for name, w in dict(panes, text=ptab.details,
+                            hex=ptab.hexview).items():
+            if w.winfo_viewable():
+                assert w in chain, f"{name} is not in the Tab chain"
+                assert str(w.cget("takefocus")) == "1"
+    nb.select(nb.tabs()[0])
+    _gui_pump(root, 0.2)
+    # Help body and the Inspector, on their own
+    app._select_tab("help")
+    _gui_pump(root, 0.3)
+    ht = app.tabs["help"].txt
+    assert ht.winfo_viewable() and ht in _tab_chain(app)
+    # scrolling, select all and copy, on a pane long enough to scroll
+    top = tk.Toplevel(root)
+    try:
+        txt = tk.Text(top, height=6, width=30, state="normal")
+        txt.insert("1.0", "\n".join(f"line {i}" for i in range(300)))
+        txt.configure(state="disabled")
+        make_readonly_focusable(txt)
+        entry = ttk.Entry(top)
+        entry.pack()
+        txt.pack(fill="both", expand=True)
+        _gui_pump(root, 0.2)
+        txt.focus_force()
+        _gui_pump(root, 0.2)
+        assert int(txt.cget("highlightthickness")) == 2
+        txt.event_generate("<Next>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[0] > 0, txt.yview()
+        y = txt.yview()[0]
+        txt.event_generate("<Down>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[0] > y
+        txt.event_generate("<End>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[1] == 1.0, txt.yview()
+        txt.event_generate("<Prior>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[1] < 1.0
+        txt.event_generate("<Home>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[0] == 0.0
+        txt.event_generate("<Control-End>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[1] == 1.0
+        txt.event_generate("<Control-Home>")
+        _gui_pump(root, 0.05)
+        assert txt.yview()[0] == 0.0
+        txt.event_generate("<Control-a>")
+        _gui_pump(root, 0.05)
+        assert txt.tag_ranges("sel"), "Ctrl+A selected nothing"
+        root.clipboard_clear()
+        txt.event_generate("<Control-c>")
+        _gui_pump(root, 0.1)
+        assert "line 299" in root.clipboard_get()
+        assert str(txt.cget("state")) == "disabled"
+        entry.focus_force()
+        _gui_pump(root, 0.1)
+        assert int(txt.cget("highlightthickness")) == 0
+    finally:
+        top.destroy()
+
+
+@gui_test_step("keyboard B: Enter, Home/End/Ctrl+A, the row menu, sort and "
+               "column menu on the tables")
+def gt_kbd_tables(app, ctx):
+    root = app.root
+    _kbd_packet_row(app, ctx)
+    app.mode_ui_var.set("Advanced")
+    app._on_ui_mode_change()
+    rows_seen = 0
+    with _popups() as shown:
+        for name in ("devices", "websites", "connections", "remote",
+                     "alerts", "timeline", "feed"):
+            tab = app._select_tab(name)
+            if name in ("connections",):
+                tab.show_subview("Connections")
+            _gui_pump(root, 0.3)
+            tree, kit = tab.tree, tab.kit
+            tree.focus_force()
+            _gui_pump(root, 0.1)
+            kids = tree.get_children("")
+            if kids:
+                rows_seen += 1
+                tree.selection_set(kids[0])
+                tree.focus(kids[0])
+            # Menu key and Shift+F10 open the row menu, with Sort and columns
+            for seq in ("<Shift-F10>", "<Key-Menu>"):
+                del shown[:]
+                tree.event_generate(seq)
+                _gui_pump(root, 0.05)
+                assert shown, f"{name}: {seq} opened no menu"
+                labels = _menu_labels(shown[-1])
+                pre = "Sort and columns > " if kids else ""   # no row: bare
+                if kids:
+                    assert "Sort and columns" in labels, (name, labels)
+                if kit.sortable:
+                    assert pre + "Sort by" in labels, (name, labels)
+                assert pre + "Columns" in labels, (name, labels)
+            # Home / End / Ctrl+Home / Ctrl+End
+            if len(kids) >= 2:
+                tree.event_generate("<End>")
+                _gui_pump(root, 0.05)
+                last = tree_visible_rows(tree)[-1]
+                assert tree.selection() == (last,) and tree.focus() == last, \
+                    (name, tree.selection(), last)
+                tree.event_generate("<Home>")
+                _gui_pump(root, 0.05)
+                # (a live table may re-sort between two keys: compare with
+                # the rows as they are now, not with the first look)
+                rows = tree_visible_rows(tree)
+                assert tree.selection() == (rows[0],), (name,
+                                                        tree.selection())
+                tree.event_generate("<Control-End>")
+                _gui_pump(root, 0.05)
+                rows = tree_visible_rows(tree)
+                assert tree.selection() == (rows[-1],), (name,
+                                                         tree.selection())
+                tree.event_generate("<Control-Home>")
+                _gui_pump(root, 0.05)
+                rows = tree_visible_rows(tree)
+                assert tree.selection() == (rows[0],), (name,
+                                                        tree.selection())
+                # Ctrl+A: every row where the table allows several
+                tree.event_generate("<Control-a>")
+                _gui_pump(root, 0.05)
+                if str(tree.cget("selectmode")) == "extended":
+                    assert len(tree.selection()) == len(
+                        tree_visible_rows(tree)), name
+                else:
+                    assert tree.selection() == (kids[0],), name
+            # the sort cursor and the column menu
+            if kit.sortable and kids:
+                kit.clear_sort()
+                cols = kit.visible_cols()
+                tree.event_generate("<Shift-Right>")
+                tree.event_generate("<Shift-Right>")
+                _gui_pump(root, 0.05)
+                want = cols[1]
+                assert kit.heading_keys.col == want, (name, cols)
+                assert kit.titles.get(want, want) and \
+                    tree.heading(want, "text").rstrip(" ▲▼") in \
+                    app.status_var.get(), app.status_var.get()
+                assert kit.sort_col is None
+                tree.event_generate("<Shift-Return>")
+                _gui_pump(root, 0.1)
+                assert kit.sort_col == want and not kit.sort_desc, \
+                    (name, kit.sort_col)
+                tree.event_generate("<Shift-space>")
+                _gui_pump(root, 0.1)
+                assert kit.sort_desc, "a second sort did not reverse"
+                tree.event_generate("<Shift-Left>")
+                assert kit.heading_keys.col == cols[0]
+                kit.clear_sort()
+            elif not kit.sortable:
+                tree.event_generate("<Shift-Return>")
+                assert kit.sort_col is None
+            for seq in ("<Alt-Down>", "<Control-Shift-C>"):
+                del shown[:]
+                tree.event_generate(seq)
+                _gui_pump(root, 0.05)
+                assert shown, f"{name}: {seq} opened no column menu"
+                labels = _menu_labels(shown[-1])
+                assert "Columns" in labels and \
+                    "Export this table…" in labels, (name, labels)
+    assert rows_seen >= 4, rows_seen
+
+
+@gui_test_step("keyboard B: Enter opens the selected row like a "
+               "double-click")
+def gt_kbd_enter_opens(app, ctx):
+    root = app.root
+    _kbd_packet_row(app, ctx)
+    calls = []
+    saved = {}
+
+    def spy(owner, attr):
+        saved[(id(owner), attr)] = (owner, attr, getattr(owner, attr))
+        setattr(owner, attr, lambda *a, **k: calls.append((attr, a)))
+
+    def both(tab, tree):
+        """Return, then the double-click handler: the same call."""
+        del calls[:]
+        tree.event_generate("<Return>")
+        _gui_pump(root, 0.1)
+        by_key = list(calls)
+        del calls[:]
+        tree.event_generate("<KP_Enter>")
+        _gui_pump(root, 0.1)
+        assert calls == by_key, (calls, by_key)
+        return by_key
+    try:
+        for owner, attr in ((app, "show_website"), (app, "show_flow"),
+                            (app, "show_remote"), (app, "connector_dialog"),
+                            (app, "open_ref")):
+            spy(owner, attr)
+        # Websites, Connections, Remote: Enter = what the double-click runs
+        for name, attr in (("websites", "show_website"),
+                           ("connections", "show_flow"),
+                           ("remote", "show_remote")):
+            tab = app._select_tab(name)
+            if name == "connections":
+                tab.show_subview("Connections")
+            _gui_pump(root, 0.3)
+            tree = tab.tree
+            tree.focus_force()
+            opened = None
+            for iid in tree_visible_rows(tree):
+                tree.selection_set(iid)
+                tree.focus(iid)
+                del calls[:]
+                tab._details()
+                if calls:
+                    opened = list(calls)
+                    break
+            assert opened, f"{name}: no row that opens"
+            assert opened[0][0] == attr
+            assert both(tab, tree) == opened, name
+            # nothing selected, the keyboard on a row: that row opens
+            tree.selection_set(())
+            del calls[:]
+            tree.event_generate("<Return>")
+            _gui_pump(root, 0.1)
+            assert calls == opened, (name, calls)
+        # Timeline: the story line it opens
+        tl = app._select_tab("timeline")
+        _gui_pump(root, 0.3)
+        opened_ev = []
+        tl._open_event = lambda e: opened_ev.append(e)
+        kids = tl.tree.get_children("")
+        if kids:
+            tl.tree.focus_force()
+            tl.tree.selection_set(kids[0])
+            tl.tree.event_generate("<Return>")
+            _gui_pump(root, 0.1)
+            assert len(opened_ev) == 1 and opened_ev[0] is tl.refs[kids[0]]
+        del tl._open_event
+        # Feed: its one action, "show only this", on Enter
+        fd = app._select_tab("feed")
+        _gui_pump(root, 0.2)
+        iid = fd.tree.insert("", "end", values=("Kbd-Test-Device", "did a "
+                                                "thing", "now"))
+        fd.tree.focus_force()
+        fd.tree.selection_set(iid)
+        fd.tree.event_generate("<Return>")
+        _gui_pump(root, 0.1)
+        assert fd.q_var.get() == "Kbd-Test-Device", fd.q_var.get()
+        fd.q_var.set("")
+        fd.refilter()
+        # Sources: Enter edits the selected connector
+        st = app._select_tab("sources")
+        _gui_pump(root, 0.2)
+        st.tree.focus_force()
+        _gui_pump(root, 0.1)
+        iid = st.tree.insert("", "end", iid="c:kbd-test",
+                             values=("",) * len(st.tree["columns"]))
+        try:
+            st.tree.selection_set(iid)
+            del calls[:]
+            st.tree.event_generate("<Return>")
+            _gui_pump(root, 0.1)
+            assert calls and calls[0][0] == "connector_dialog", calls
+        finally:
+            st.tree.delete(iid)
+        # Packets: Enter moves the keyboard to the packet's fields
+        pt = app._select_tab("packets")
+        pt.show_subview("Packets")
+        row = _kbd_packet_row(app, ctx)
+        assert pt.select_no(row["no"])
+        _gui_pump(root, 0.4)
+        pt.tree.focus_force()
+        pt.tree.event_generate("<Return>")
+        _gui_pump(root, 0.2)
+        assert root.focus_get() is pt.dtree, root.focus_get()
+    finally:
+        for owner, attr, orig in saved.values():
+            setattr(owner, attr, orig)
+
+
+@gui_test_step("keyboard B: the Menu key and Shift+F10 on the packet "
+               "list, its fields, the Map and the charts")
+def gt_kbd_context_keys(app, ctx):
+    root = app.root
+    with _popups() as shown:
+        pt = app._select_tab("packets")
+        pt.show_subview("Packets")
+        row = _kbd_packet_row(app, ctx)
+        assert pt.select_no(row["no"])
+        _gui_pump(root, 0.4)
+        pt.tree.focus_force()
+        _gui_pump(root, 0.1)
+        for seq in ("<Shift-F10>", "<Key-Menu>"):
+            del shown[:]
+            pt.tree.event_generate(seq)
+            _gui_pump(root, 0.05)
+            assert shown, f"packet list: {seq} opened no menu"
+            assert "Follow stream" in _menu_labels(shown[-1])
+        # a heading menu and a sort by the keyboard
+        del shown[:]
+        pt.tree.event_generate("<Alt-Down>")
+        _gui_pump(root, 0.05)
+        assert shown and "Columns" in _menu_labels(shown[-1]), shown
+        pt.tree.event_generate("<Shift-Right>")
+        pt.tree.event_generate("<Shift-Right>")
+        pt.tree.event_generate("<Shift-Return>")
+        _gui_pump(root, 0.2)
+        assert pt.sort_col == pt.heading_keys.col != None, pt.sort_col
+        pt._sort_by("no")
+        if pt.sort_col:
+            pt._sort_by("no")
+        # End goes to the last packet
+        pt.tree.event_generate("<End>")
+        _gui_pump(root, 0.2)
+        assert pt.sel_no == pt.matched[-1]["no"]
+        pt.tree.event_generate("<Home>")
+        _gui_pump(root, 0.2)
+        assert pt.sel_no == pt.matched[0]["no"]
+        # the details tree: field menu on the focused field
+        assert pt.select_no(row["no"])
+        _gui_pump(root, 0.4)
+        kids = pt.dtree.get_children("")
+        assert kids
+        pt.dtree.focus_force()
+        pt.dtree.selection_set(kids[0])
+        pt.dtree.focus(kids[0])
+        _gui_pump(root, 0.1)
+        for seq in ("<Shift-F10>", "<Key-Menu>"):
+            del shown[:]
+            pt.dtree.event_generate(seq)
+            _gui_pump(root, 0.05)
+            assert shown, f"field tree: {seq} opened no menu"
+        pt.dtree.event_generate("<End>")
+        _gui_pump(root, 0.05)
+        assert pt.dtree.focus() == tree_edge_row(pt.dtree, True)
+        # the Map
+        mp = app._select_tab("map")
+        mp.redraw(force=True)
+        _gui_pump(root, 0.4)
+        assert str(mp.c.cget("takefocus")) == "1"
+        if mp.nodes:
+            mp.c.focus_force()
+            _gui_pump(root, 0.1)
+            for seq in ("<Shift-F10>", "<Key-Menu>"):
+                del shown[:]
+                mp.c.event_generate(seq)
+                _gui_pump(root, 0.05)
+                assert shown, f"map: {seq} opened no menu"
+            assert any(isinstance(f, tk.Frame) for f in mp.c.winfo_children())
+        # the charts on Health
+        hl = app._select_tab("health")
+        _gui_pump(root, 0.5)
+        charts = [w for w in _all_widgets(hl.frame)
+                  if isinstance(w, tk.Canvas) and w.winfo_viewable() and
+                  Charts.chart_data(w)]
+        for c in charts[:3]:
+            assert str(c.cget("takefocus")) == "1"
+            c.focus_force()
+            _gui_pump(root, 0.1)
+            for seq in ("<Shift-F10>", "<Key-Menu>"):
+                del shown[:]
+                c.event_generate(seq)
+                _gui_pump(root, 0.05)
+                assert shown, f"chart: {seq} opened no menu"
+                assert "Copy chart data as text" in _menu_labels(shown[-1])
+        assert charts, "no chart with data on Health"
+
+
 @gui_test_step("5.1.2 M4: back/forward, tab groups, state line, cards, "
                "Clear with undo")
 def gt_m4_shell(app, ctx):
@@ -95830,11 +101754,26 @@ def gt_m4_shell(app, ctx):
             # runner it kept it, and the strip had 609 px of 1028)
             root.geometry(px_geo("1400x700"))
             _gui_pump(root, 0.4)
+            # (CI windows 3.14: busy after the language change, the resize
+            # check ran only after the next resize, so it never saw the
+            # window wide and the Inspector had no line to cross; wait for
+            # the wide width to land first)
+            _gui_pump(root, until=lambda: (getattr(app, "_body_w_prev", 0)
+                                           or 0) >= px(1180), timeout=5)
             root.geometry(px_geo("1024x700"))
             _gui_pump(root, 0.6)
             assert abs(root.winfo_width() - px(1024)) <= 2, \
                 (root.winfo_width(), root.winfo_screenwidth())
-            assert not app.inspector_visible, "the Inspector kept its room"
+            # (third audit, CI windows 3.14: after a language change the
+            # window is busy for a while, and the resize check runs 120 ms
+            # after the last resize; let it land before checking)
+            _gui_pump(root, until=lambda: not app.inspector_visible,
+                      timeout=5)
+            assert not app.inspector_visible, ("the Inspector kept its "
+                                               "room", lang,
+                                               app.body.winfo_width(),
+                                               getattr(app, "_body_w_prev",
+                                                       None))
             ts = app.tabstrip
             ts.relayout()
             width = ts.frame.winfo_width()
@@ -96375,6 +102314,8 @@ def keyboard_walk(app):
     by Tab from the header search box."""
     root = app.root
     out = {}
+    first_tab = next((n for n, t in app.tabs.items()
+                      if not (app.beginner_mode and t.advanced)), None)
     for name, tab in app.tabs.items():
         if app.beginner_mode and tab.advanced:
             continue
@@ -96395,20 +102336,116 @@ def keyboard_walk(app):
                     continue
                 if isinstance(x, ttk.Widget) and x.instate(["disabled"]):
                     continue
-                if not isinstance(x, ttk.Widget) and \
+                # a read-only Text must be reachable too (it scrolls and
+                # copies by key): only the other controls are exempt
+                if not isinstance(x, (ttk.Widget, tk.Text)) and \
                         str(x.cget("state")) == "disabled":
                     continue
             except tk.TclError:
                 continue
-            if x not in seen:
+            if x not in seen and not _roving_member_reached(app, x, seen):
                 miss.append(str(x))
-        for _o, _b, lbl in app.tabstrip.tabs.values():
-            with contextlib.suppress(tk.TclError):
-                if lbl.winfo_viewable() and lbl not in seen:
-                    miss.append(str(lbl))
+        # the strip is one Tab stop (the shown tab's label); the others are
+        # reached with Left / Right / Home / End, checked by arrow_walk()
+        stop = app.tabstrip.selected_label()
+        if stop is not None and stop not in seen:
+            miss.append(str(stop))
+        miss += arrow_walk(app, strip=name == first_tab)
         if miss:
             out[name] = miss
     return out
+
+
+def _roving_member_reached(app, x, seen):
+    """True when `x` is one of a row's buttons whose row's Tab stop was
+    reached (the arrow keys take it from there: see arrow_walk)."""
+    for g in getattr(app.root, "_roving_groups", ()):
+        if x in g.widgets:
+            return g.stop() in seen
+    for tab in app.tabs.values():
+        btns = getattr(tab, "_sub_btns", None)
+        if btns and x in btns.values():
+            return btns.get(getattr(tab, "subview", None)) in seen
+    return False
+
+
+def arrow_walk(app, strip=True):
+    """[what Left / Right can't reach] for the rows that are one Tab stop:
+    every enabled button of the tool bar, every visible tab label (when
+    `strip`), every sub-view of the shown tab. Each is walked with the
+    real key events."""
+    root, miss = app.root, []
+
+    def key(w, seq):
+        with contextlib.suppress(tk.TclError):
+            w.focus_force()
+            root.update()
+            w.event_generate(seq)
+            root.update()
+    for g in getattr(root, "_roving_groups", ()):
+        usable = [w for w in g.widgets if g.usable(w)]
+        if len(usable) < 2:
+            continue
+        key(usable[0], "<Home>")
+        seen = []
+        for _ in range(len(usable) + 1):
+            w = root.focus_get()
+            if w in usable and w not in seen:
+                seen.append(w)
+            key(w if w is not None else usable[0], "<Right>")
+        miss += [f"{w} (arrows)" for w in usable if w not in seen]
+    # the tabs: Right from the first one visits every visible label
+    order = list(app.tabstrip.order) if strip else []
+    cur = app.nb.select()
+    try:
+        if order:
+            app.tabstrip.move("first")
+            shown = [app.tabstrip._selected()]
+            for _ in range(len(order)):
+                key(root.focus_get() or app.tabstrip.tabs[order[0]][2],
+                    "<Right>")
+                shown.append(app.tabstrip._selected())
+            miss += [f"{t} (tab arrows)" for t in order if t not in shown]
+    finally:
+        with contextlib.suppress(tk.TclError):
+            app.nb.select(cur)
+    tab = app.tabs.get(app.current_tab_name())
+    names = list(getattr(tab, "_sub_btns", {}) or {})
+    if len(names) > 1:
+        keep = tab.subview
+        try:
+            tab.show_subview(names[0])
+            shown = [tab.subview]
+            for _ in range(len(names)):
+                key(tab._sub_btns[tab.subview], "<Right>")
+                shown.append(tab.subview)
+            miss += [f"{tab.name}/{n} (sub-view arrows)" for n in names
+                     if n not in shown]
+        finally:
+            tab.show_subview(keep)
+    return miss
+
+
+def tab_presses_to_content(app, name=None):
+    """How many Tab presses take the focus from the header search box to
+    the first control inside the shown tab (the tab `name` is shown
+    first); None when Tab never gets there."""
+    if name:
+        app._select_tab(name)
+        _gui_pump(app.root, 0.3)
+    frame = app.tabs[app.current_tab_name()].frame
+    prefix = str(frame) + "."
+    w = app.search_entry
+    for n in range(1, 400):
+        w = w.tk_focusNext()
+        if w is None or w is app.search_entry:
+            return None
+        try:
+            if str(w).startswith(prefix) and w.winfo_viewable():
+                return n
+        except tk.TclError:
+            continue
+    return None
 
 
 @gui_test_step("5.1.2 M8: keyboard walk, focus rings, dialog contract, "
@@ -96968,7 +103005,7 @@ def reachable_actions(app):
         for sv in getattr(tab, "_sub_frames", None) or {}:
             out.add(f"subview:{name}/{sv}")
     data_made = {"device", "your workspace", "recent filter", "website",
-                 "alert", "recent"}
+                 "alert", "recent", "host"}
     for label, cat, _fn in app.palette_items():
         if cat not in data_made:
             out.add(f"palette:{cat}:{label}")
@@ -98143,8 +104180,23 @@ def gt_534_local_services(app, ctx):
         return n
 
     def cells():
-        return [tuple(str(v) for v in view.tree.item(i, "values"))
-                for i in view.tree.get_children()]
+        """Every service row, as (port, protocol, name, who can reach it,
+        run by, listens on, what it does) — the rows sit under one
+        heading per kind (third audit)."""
+        out = []
+        for g in view.tree.get_children():
+            assert g in view.iid_group, ("a service outside a heading", g)
+            for i in view.tree.get_children(g):
+                about, prog, safety, port, proto, listens = (
+                    str(v) for v in view.tree.item(i, "values"))
+                name = str(view.tree.item(i, "text")).lstrip(ROW_DOT + " ")
+                out.append((port, proto, name, safety, prog, listens,
+                            about))
+        return out
+
+    def headings():
+        return [str(view.tree.item(g, "text"))
+                for g in view.tree.get_children()]
 
     def pick(port, proto="TCP"):
         for iid, r in view.iid_row.items():
@@ -98159,6 +104211,7 @@ def gt_534_local_services(app, ctx):
            app.config.get("appearance.theme"),
            app.config.get("appearance.text_size"), root.geometry())
     old_open, old_killed = webbrowser.open, LEDGER.killed
+    admin0, ids0 = is_admin, person_ids
     opened = []
     try:
         # (reachable_actions visits other tabs: first)
@@ -98170,6 +104223,9 @@ def gt_534_local_services(app, ctx):
         _gui_pump(root, 0.4)
         assert tab.subview == "Local services"
         assert view.tree.winfo_ismapped()
+        # third audit #1: asking ports "GET /" is off until switched on
+        assert view.probe_var.get() is False and \
+            not app.config.get("local_services.probe", True)
         rows = cells()
         assert len(rows) == 10, rows
         by = {(r[1], r[0]): r for r in rows}
@@ -98181,6 +104237,19 @@ def gt_534_local_services(app, ctx):
         assert by[("TCP", "631")][2] == "Printing (IPP)"
         assert by[("TCP", "5432")][2] == "Database connection (PostgreSQL)"
         assert "node (pid 4001)" == by[("TCP", "5173")][4]
+        # third audit (owner): one heading per kind, in a fixed order, with
+        # its count; a plain line for each; a clear name when unknown
+        assert headings() == [
+            "Websites and web apps (5)", "Databases and data stores (1)",
+            "File sharing, printing and streaming (2)",
+            "System and network services (1)",
+            "Not sure what these are (1)"], headings()
+        assert by[("TCP", "5432")][6] == \
+            "A database: programs keep and read their data here."
+        assert by[("TCP", "5173")][6].startswith("A website or app being "
+                                                 "built on this computer")
+        assert by[("TCP", "44321")][2] == "Unknown service on port 44321"
+        assert "doesn't recognise it" in by[("TCP", "44321")][6]
         # refresh 3 times and EN → FR → ES → EN: the same rows, widgets
         # and table kits every time
         base = (len(rows), widgets(view.frame), len(app.kits),
@@ -98210,6 +104279,19 @@ def gt_534_local_services(app, ctx):
         # open: only a TCP web app, at 127.0.0.1, through the gate
         webbrowser.open = lambda url, *a, **k: opened.append(url) or True
         LEDGER.killed = False
+        # third audit #3: a copy running as administrator with nobody to
+        # open it as (a root login) never opens a root browser, and says
+        # what to type; the rest is the person's own copy, so it runs the
+        # same as root in a test container as on a person's computer
+        G = globals()
+        G["is_admin"], G["person_ids"] = (lambda: True), (lambda: None)
+        pick(5173)
+        view.open_btn.invoke()
+        assert opened == [], opened
+        assert "administrator" in str(app.banner_lbl.cget("text")) and \
+            "http://127.0.0.1:5173/" in str(app.banner_lbl.cget("text"))
+        app._hide_banner()
+        G["is_admin"] = lambda: False
         n0 = len(LEDGER.snapshot("local_open"))
         pick(5173)
         assert str(view.open_btn.cget("state")) == "normal"
@@ -98309,6 +104391,7 @@ def gt_534_local_services(app, ctx):
         assert not found, "\n".join(found[:10])
     finally:
         webbrowser.open, LEDGER.killed = old_open, old_killed
+        globals()["is_admin"], globals()["person_ids"] = admin0, ids0
         view.source = src0
         app.config.set("general.language", old[0])
         app.config.set("appearance.theme", old[1])
@@ -98656,6 +104739,32 @@ def _text_size_options(app, label, other):
             f"the window on screen: busy {on[1]} ms, longest freeze "
             f"{on[0]} ms; (a) the same with the window hidden and shown "
             f"again: busy {shown[1]} ms, longest freeze {shown[0]} ms")
+
+
+@gui_test_step("round 4: chart fonts stay loaded, so measuring a dash is "
+               "quick on a Tk without Xft")
+def gt_r4_chart_fonts_held(app, ctx):
+    root = app.root
+    ht = app.tabs["health"]
+    # the Health histogram after a text-size change: its widths measured
+    # anew (Charts.forget_fonts), with "10–25" style labels
+    Charts.forget_fonts()
+    ht._draw_hist()
+    held = Charts.held_fonts(root)
+    assert Charts._FONTS, "no chart font made"
+    for spec, f in list(Charts._FONTS.items()):
+        assert str(f.font) in held, ("not kept loaded", spec, str(f.font))
+        # without the hold, a Tk without Xft spent ~11 ms on each of these
+        # (it unloaded the font after each measure and searched every
+        # X font for the dash again); with Xft, Windows or macOS ~0.1 ms
+        f.font.measure("10–25 …")
+        took = []
+        for i in range(3):
+            t0 = time.perf_counter()
+            f.font.measure("%d–%d …" % (i, i + 7))
+            took.append((time.perf_counter() - t0) * 1000)
+        assert min(took) < 3, (spec, [round(x, 2) for x in took])
+    _gui_pump(root, 0.1)
 
 
 @gui_test_step("Windows run: a text-size change re-lays the window out "
@@ -100381,6 +106490,56 @@ def gt_c534_search_window(app, ctx):
         app.global_search_var.set("")
 
 
+@gui_test_step("third audit: Escape twice empties the search box; Enter "
+               "searches what the box says, not a list left from before")
+def gt_a3_search_escape_and_enter(app, ctx):
+    root, drop, e = app.root, app.search_drop, app.search_entry
+    _gui_focus_main(app)
+    try:
+        app.global_search_var.set("vpn")
+        drop.update()
+        _gui_pump(root, 0.2)
+        assert drop.frame is not None, "no list for vpn"
+        e.focus_force()
+        _gui_pump(root, 0.1)
+        e.event_generate("<Escape>")
+        _gui_pump(root, 0.1)
+        assert drop.frame is None, "Escape left the list open"
+        assert app.global_search_var.get() == "vpn", \
+            "the first Escape only closes the list"
+        e.event_generate("<Escape>")
+        _gui_pump(root, 0.1)
+        assert app.global_search_var.get() == "", \
+            "Escape with nothing open keeps the text"
+        # typed faster than the list: the list still shows "vpn"
+        app.global_search_var.set("vpn")
+        drop.update()
+        _gui_pump(root, 0.1)
+        rows_vpn = drop.shown()
+        app.global_search_var.set("192.168")
+        drop.cancel()                   # Enter before the list redraws
+        assert drop.frame is not None and drop.shown() == rows_vpn
+        app._search_enter()
+        _gui_pump(root, 0.3)
+        win = app.search_window()
+        assert win is not None, "Enter ran a row of the old list"
+        assert "192.168" in win.title(), win.title()
+        app.close_search_window()
+        # the list for what the box says: Enter still opens its first row
+        app.global_search_var.set("192.168")
+        drop.update()
+        _gui_pump(root, 0.1)
+        assert drop.frame is not None
+        assert drop.open_selected() is True
+        _gui_pump(root, 0.2)
+        assert drop.frame is None
+    finally:
+        app.close_search_window()
+        drop.close()
+        app.global_search_var.set("")
+        _gui_pump(root, 0.1)
+
+
 @gui_test_step("crowd 5.3.4 #14: Settings takes the keyboard (Escape "
                "closes it), says no change was made until one is saved, "
                "asks Save / Don't save / Cancel, and follows the header's "
@@ -100480,6 +106639,12 @@ def gt_c534_palette_focus(app, ctx):
             [x for x in labels if not x.startswith("Settings")][:4]
         p.q.set("zzqqxxyy")
         _gui_pump(root, 0.1)
+        # nothing matches: the hint, and the one row that searches
+        # everything (the rows of a group have no such row)
+        assert [r[2] for r in p.shown] == ["search"] and \
+            "No matches" in p.lb.get(0), p.lb.get(0, "end")
+        p.q.set(">zzqqxxyy")
+        _gui_pump(root, 0.1)
         assert not p.shown and p.lb.size() == 1 and \
             "No matches" in p.lb.get(0), p.lb.get(0, "end")
         p.run()                          # Enter on the hint does nothing
@@ -100511,6 +106676,294 @@ def gt_c534_palette_focus(app, ctx):
     app.search_entry.focus_force()
     _gui_pump(root, 0.2)
     assert int(card.cget("highlightthickness")) == 1
+
+
+def _gui_key(app, widget, seq):
+    """Press `seq` in `widget` as the keyboard would (the widget has the
+    focus first)."""
+    widget.focus_force()
+    _gui_pump(app.root, 0.05, lambda: app.root.focus_get() is widget,
+              timeout=2)
+    widget.event_generate(seq)
+    _gui_pump(app.root, 0.1)
+
+
+@gui_test_step("Ctrl+K: go to a packet, run a filter, groups with > @ ? and "
+               "Tab, keys of the list, the number of rows, highlighting")
+def gt_kbd_palette_rows(app, ctx):
+    root = app.root
+    if not app.all_rows:             # the steps before replaced the data
+        _gt_back_to_scenario(app, ctx)
+    _gui_focus_main(app)
+    assert app.all_rows, "no packets"
+    no = app.all_rows[min(5, len(app.all_rows) - 1)]["no"]
+    p = app.open_palette()
+    try:
+        _gui_pump(root, 0.2)
+        # in the middle of the main window
+        cx = p.win.winfo_rootx() + p.win.winfo_width() / 2
+        mx = root.winfo_rootx() + root.winfo_width() / 2
+        assert abs(cx - mx) < 40, (cx, mx)
+        e = p.entry
+        # "go to packet N": first row, Enter opens it in the Packets tab
+        p.q.set(f"go to packet {no}")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == f"Go to packet {no}" and \
+            p.shown[0][2] == "packet", p.shown[:2]
+        assert p.shown[-1][2] == "search" and \
+            p.shown[-1][1] == f"Search everything for \u201cgo to packet "\
+            f"{no}\u201d", p.shown[-1][1]
+        app._select_tab("dash")
+        _gui_key(app, e, "<Return>")
+        assert not p.alive() and app.current_tab_name() == "packets", \
+            app.current_tab_name()
+        for q in (f"#{no}", f":{no}", str(no)):
+            p = app.open_palette()
+            p.q.set(q)
+            _gui_pump(root, 0.1)
+            assert p.shown[0][1] == f"Go to packet {no}", (q, p.shown[:2])
+            p.close()
+        # a filter typed in the box: first row, Enter applies it
+        p = app.open_palette()
+        p.q.set("ip:1.2.3.4")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Filter packets: ip:1.2.3.4" and \
+            p.shown[0][2] == "filter", p.shown[:2]
+        app._select_tab("dash")
+        _gui_key(app, p.entry, "<Return>")
+        assert app.current_tab_name() == "packets" and \
+            app.tabs["packets"].expr_var.get() == "ip:1.2.3.4", \
+            app.tabs["packets"].expr_var.get()
+        app.tabs["packets"].set_expression("")
+        for q, first in (("/port:443", "Filter packets: port:443"),
+                         ("filter: proto:dns", "Filter packets: proto:dns"),
+                         ("sev:warning", "Filter packets: sev:warning")):
+            p = app.open_palette()
+            p.q.set(q)
+            _gui_pump(root, 0.1)
+            assert p.shown[0][1] == first, (q, p.shown[:2])
+            p.close()
+        # a device's address: the device, then the filter
+        dev = next(iter(app.model.registry.by_key.values()))
+        p = app.open_palette()
+        p.q.set(dev.ip)
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1].startswith("Show device ") and \
+            p.shown[1][1] == f"Filter packets: ip:{dev.ip}", \
+            [x[1] for x in p.shown[:3]]
+        p.close()
+        # groups: only commands after ">", only devices (and sites, hosts)
+        # after "@", only Help after "?"; none has the search row
+        p = app.open_palette()
+        commands = PALETTE_SCOPE_CATS["commands"]
+        p.q.set(">")
+        _gui_pump(root, 0.1)
+        assert len(p.shown) > 10 and all(r[2] in commands for r in p.shown), \
+            sorted({r[2] for r in p.shown})
+        p.q.set(">go")
+        _gui_pump(root, 0.1)
+        assert p.shown and all(r[2] in commands for r in p.shown)
+        p.q.set("@dev")
+        _gui_pump(root, 0.1)
+        assert p.shown and all(r[2] in ("device", "website", "host")
+                               for r in p.shown), \
+            sorted({r[2] for r in p.shown})
+        p.q.set("?")
+        _gui_pump(root, 0.1)
+        assert p.shown and all(r[2] == "help" for r in p.shown)
+        p.q.set("help: dns")
+        _gui_pump(root, 0.1)
+        assert p.shown and all(r[2] == "help" for r in p.shown)
+        # Tab goes through the groups (the box keeps the keyboard), Shift+Tab
+        # back; a click on one picks it; none is a Tab stop
+        p.q.set("")
+        _gui_pump(root, 0.1)
+        assert p.chip == "all" and list(p.chips) == [
+            k for k, _n in PALETTE_CHIPS]
+        assert all(str(c.cget("takefocus")) == "0" for c in p.chips.values())
+        _gui_key(app, p.entry, "<Tab>")
+        assert p.chip == "commands" and root.focus_get() is p.entry
+        assert p.shown and all(r[2] in commands for r in p.shown)
+        _gui_key(app, p.entry, "<Tab>")
+        assert p.chip == "tabs" and all(r[2] == "tab" for r in p.shown)
+        _gui_key(app, p.entry, "<Shift-Tab>")
+        assert p.chip == "commands"
+        for _ in range(6):
+            _gui_key(app, p.entry, "<Tab>")
+        assert p.chip == "all", p.chip
+        p.q.set(">net")
+        _gui_pump(root, 0.1)
+        _gui_key(app, p.entry, "<Tab>")           # ">" gives way to Tabs
+        assert p.q.get() == "net" and p.chip == "tabs", (p.q.get(), p.chip)
+        p.chips["settings"].event_generate("<Button-1>")
+        _gui_pump(root, 0.1)
+        assert p.chip == "settings" and root.focus_get() is p.entry
+        assert all(r[2] == "setting" for r in p.shown)
+        p.q.set("")
+        p.chips["all"].event_generate("<Button-1>")
+        _gui_pump(root, 0.1)
+        # the keys of the list: PageDown by 10, Ctrl+N / Ctrl+P, the ends
+        p.q.set(">")
+        _gui_pump(root, 0.1)
+        assert p._sel == 0 and len(p.shown) > 25
+        _gui_key(app, p.entry, "<Control-n>")
+        assert p._sel == 1
+        _gui_key(app, p.entry, "<Control-p>")
+        assert p._sel == 0
+        _gui_key(app, p.entry, "<Down>")
+        _gui_key(app, p.entry, "<Control-j>")
+        assert p._sel == 2
+        _gui_key(app, p.entry, "<Up>")
+        _gui_key(app, p.entry, "<Up>")
+        _gui_key(app, p.entry, "<Next>")
+        assert p._sel == 10 and p.lb.curselection() == (10,), p._sel
+        assert p.txt.bbox("11.0") is not None, "row 10 not in view"
+        _gui_key(app, p.entry, "<Next>")
+        _gui_key(app, p.entry, "<Next>")
+        assert p._sel == 30 or p._sel == len(p.shown) - 1, p._sel
+        assert p.txt.bbox(f"{p._sel + 1}.0") is not None, "row not in view"
+        _gui_key(app, p.entry, "<Prior>")
+        assert p._sel == max(0, min(30, len(p.shown) - 1) - 10)
+        _gui_key(app, p.entry, "<Control-End>")
+        assert p._sel == len(p.shown) - 1
+        assert p.txt.bbox(f"{p._sel + 1}.0") is not None
+        _gui_key(app, p.entry, "<Control-Home>")
+        assert p._sel == 0
+        # Home and End stay in the box
+        p.q.set(">abc")
+        p.entry.icursor(2)
+        _gui_key(app, p.entry, "<End>")
+        assert p.entry.index("insert") == 4 and p._sel in (-1, 0)
+        _gui_key(app, p.entry, "<Home>")
+        assert p.entry.index("insert") == 0
+        # only the 100 best are listed, and the list says so
+        p.q.set("a")
+        _gui_pump(root, 0.1)
+        rows = [r for r in p.shown if not r[8]]
+        assert len(rows) == p.CAP, len(rows)
+        notes = [x for x in p.lb.get(0, "end") if "keep typing" in x]
+        assert len(notes) == 1 and notes[0].startswith(f"{p.CAP} of "), notes
+        # a click on a row selects it and the box keeps the keyboard
+        bb = p.txt.bbox("3.0")
+        assert bb is not None
+        p.txt.event_generate("<Button-1>", x=bb[0] + 8, y=bb[1] + bb[3] // 2)
+        _gui_pump(root, 0.1)
+        assert p._sel == 2 and root.focus_get() is p.entry, \
+            (p._sel, root.focus_get())
+        # matched letters in bold
+        p.q.set("conn mail")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Connections → Mail"
+        rng = p.txt.tag_ranges("hit")
+        assert rng and p.txt.get(rng[0], rng[1]) == "Conn", \
+            [str(r) for r in rng]
+        assert p.txt.get(rng[2], rng[3]) == "Mail"
+        # a tab row shows the key of its group
+        p.q.set("happening")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Happening" and p.shown[0][6] == "Ctrl+1", \
+            p.shown[0][:3] + p.shown[0][4:7]
+        assert "[Ctrl+1]" in p.lb.get(0)
+        # Shift+Enter runs a row and keeps the box open
+        p.q.set("explain inline")
+        _gui_pump(root, 0.1)
+        was = app.explain_on()
+        _gui_key(app, p.entry, "<Shift-Return>")
+        try:
+            assert p.alive() and app.explain_on() != was
+        finally:
+            app.set_explain(was)
+        assert app.explain_on() == was
+    finally:
+        p.close()
+        app.tabs["packets"].set_expression("")
+
+
+@gui_test_step("Ctrl+K: the keyboard lands in the tab that was opened; the "
+               "key works in the search box; recent rows are kept; French")
+def gt_kbd_palette_focus_recent(app, ctx):
+    root = app.root
+    _gui_focus_main(app)
+    # after running "Alerts" the focus is on something shown in that tab
+    app._select_tab("dash")
+    _gui_pump(root, 0.2)
+    _gui_focus_main(app)
+    p = app.open_palette()
+    p.q.set("alerts")
+    _gui_pump(root, 0.1)
+    assert p.shown[0][2] == "tab" and p.shown[0][4] == "Alerts", \
+        p.shown[0][:3]
+    p.run()
+    _gui_pump(root, 0.4)
+    assert app.current_tab_name() == "alerts"
+    w = root.focus_get()
+    top = str(app.tabs["alerts"].frame)
+    assert w is not None and w.winfo_viewable() and \
+        str(w).startswith(top + "."), (w, top)
+    # Ctrl+K in the header search box opens the palette and keeps the text
+    _gui_focus_main(app)
+    app.global_search_var.set("hello world")
+    app.search_entry.icursor(5)
+    _gui_key(app, app.search_entry, "<Control-k>")
+    assert app.global_search_var.get() == "hello world", \
+        app.global_search_var.get()
+    p = app._palette
+    assert p.alive()
+    p.close()
+    app.global_search_var.set("")
+    # the choices are kept, newest first, 20 at most, across restarts
+    label = "Explain inline (on / off)"
+    was = app.explain_on()
+    p = app.open_palette()
+    p.q.set("explain inline")
+    _gui_pump(root, 0.1)
+    assert p.shown[0][1] == label, p.shown[:2]
+    p.run()
+    _gui_pump(root, 0.2)
+    app.set_explain(was)
+    assert app.config.get("palette.recent")[0] == label
+    saved = json.load(open(app.config.path, encoding="utf-8"))
+    assert saved["palette"]["recent"][0] == label, saved.get("palette")
+    p = app.open_palette()
+    _gui_pump(root, 0.1)
+    assert p.lb.get(0) == "RECENT" and p.shown[0][1] == label, \
+        (p.lb.get(0), p.shown[0][:3])
+    heads = [x for x in p.lb.get(0, "end") if x.isupper()]
+    assert heads == ["RECENT", "SUGGESTED"], heads
+    assert any(r[2] == "tab" and r[6] for r in p.shown)
+    for i in range(25):
+        p._remember(f"Test row {i}", "action")
+    assert len(app.config.get("palette.recent")) == 20
+    assert app.config.get("palette.recent")[0] == "Test row 24"
+    p.close()
+    # a used row goes up when the same words match several
+    app.config.set("palette.recent", [label])
+    p = app.open_palette()
+    p.q.set("inl")
+    _gui_pump(root, 0.1)
+    assert p.shown[0][1] == label
+    p.close()
+    app.config.set("palette.recent", [])
+    app.config.save()
+    # French: the kinds are translated, "parametres" finds "Paramètres"
+    old = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        p = app.open_palette()
+        p.q.set("parametres")
+        _gui_pump(root, 0.1)
+        assert p.shown[0][1] == "Settings" and \
+            p.shown[0][4] == "Paramètres" and p.shown[0][5] == "paramètre", \
+            p.shown[0][:6]
+        p.q.set("onglet")
+        _gui_pump(root, 0.1)
+        assert p.shown and p.shown[0][5] == "onglet", p.shown[0][4:6]
+        p.q.set("")
+        _gui_pump(root, 0.1)
+        assert p.lb.get(0) == "SUGGESTIONS", p.lb.get(0)
+        p.close()
+    finally:
+        set_locale(old)
 
 
 # ---- 5.3.4 crowd test fixes (the ranked bug list): one test per fix ----
@@ -100725,6 +107178,287 @@ def t_c11_nameless_devices_told_apart(ctx):
         "address (self-assigned 169.254.12.34)", sentence_device_name(lone)
     assert translate_text(sentence_device_name(lone), "fr") == \
         "Appareil sans adresse réseau (169.254.12.34 auto-attribuée)"
+
+
+@self_test()
+def t_a3_timeline_names_own_devices(ctx):
+    """Third audit (UI): this computer and the router, when they have no
+    name of their own (a private Wi-Fi address), are "This computer" and
+    "Your router" in the Timeline, as in the alerts; they were "Device
+    using a private Wi-Fi address (192.168.50.10) joined your network"
+    next to "family-nas joined your network". French and Spanish say the
+    names in their own words."""
+    m = NetworkModel(ctx.cfg(), "192.168.50.1", ["192.168.50.10"],
+                     ["a6:3b:12:9e:44:10"])
+    m.set_identity(local_nets=[ipaddress.ip_network("192.168.50.0/24")])
+    reg = m.registry
+    label = "Device using a private Wi-Fi address"
+    me = DeviceRecord(key="a6:3b:12:9e:44:10", ip="192.168.50.10",
+                      mac="a6:3b:12:9e:44:10")
+    gw = DeviceRecord(key="a6:3b:12:9e:44:01", ip="192.168.50.1",
+                      mac="a6:3b:12:9e:44:01")
+    other = DeviceRecord(key="a6:3b:12:9e:44:77", ip="192.168.50.77",
+                         mac="a6:3b:12:9e:44:77")
+    for d in (me, gw, other):
+        d.randomized_mac = True
+        reg.by_key[d.key] = d
+    assert all(d.display_name() == label for d in (me, gw, other)), \
+        [d.display_name() for d in (me, gw, other)]
+    want = {me.key: "This computer joined your network",
+            gw.key: "Your router joined your network",
+            other.key: f"{label} (192.168.50.77) joined your network"}
+    for d in (me, gw, other):
+        e = m.push_timeline("new device", "INFO",
+                            f"{d.display_name()} joined your network",
+                            ("device", d.key), d.key)
+        assert e["text"] == want[d.key], e["text"]
+        assert timeline_text(m, e) == want[d.key], timeline_text(m, e)
+    # an entry stored before (an older history) is shown with the name too
+    old = {"text": f"{label} (192.168.50.10) joined your network",
+           "name": f"{label} (192.168.50.10)", "device": me.key}
+    assert timeline_text(m, old) == want[me.key], timeline_text(m, old)
+    # a name of its own still wins
+    me.alias = "Study PC"
+    assert timeline_text(m, old) == "Study PC joined your network"
+    me.alias = ""
+    was = CURRENT_LOCALE
+    try:
+        set_locale("fr")
+        fr = [translate_event(want[k]) for k in (me.key, gw.key)]
+        set_locale("es")
+        es = [translate_event(want[k]) for k in (me.key, gw.key)]
+    finally:
+        set_locale(was)
+    assert fr == ["Cet ordinateur a rejoint votre réseau",
+                  "Votre box a rejoint votre réseau"], fr
+    assert es == ["Este equipo se ha unido a su red",
+                  "Su router se ha unido a su red"], es
+
+
+@self_test()
+def t_a3_fr_label_colon_and_es_is_at(ctx):
+    """Third audit leftovers: a label translated on its words got its
+    colon back without French's space ("Gravité:"), and the Spanish
+    packet line "X is at <MAC>" read "X está en <MAC>" (is located in)."""
+    for en, fr in (("Severity:", "Gravité :"), ("Evidence:", "Preuve :"),
+                   ("Severity: ", "Gravité : ")):
+        assert translate_text(en, "fr") == fr, (en, translate_text(en, "fr"))
+    assert translate_text("Severity:", "es") == "Gravedad:", \
+        translate_text("Severity:", "es")
+    # the search box's own syntax stays as typed
+    assert "device:" in translate_text(
+        "No matches found. Tip: try device:, site:, ip:, port: or alert:",
+        "fr")
+    mac = "02:11:22:33:44:55"
+    for en, es in ((f"192.168.50.60 is at {mac}",
+                    f"192.168.50.60 corresponde a {mac}"),
+                   (f"fe80::1 is at {mac} (IPv6)",
+                    f"fe80::1 corresponde a {mac} (IPv6)"),
+                   ("LAPTOP is at 192.168.50.7 (Windows name)",
+                    "LAPTOP corresponde a 192.168.50.7 (nombre de Windows)")):
+        got = translate_text(en, "es")
+        assert got == es, (en, got)
+    assert translate_text(f"192.168.50.60 is at {mac}", "fr") == \
+        f"192.168.50.60 est à {mac}"
+
+
+@self_test()
+def t_a3_fr_es_leaks(ctx):
+    """Third audit (UI): words that stayed English in French and Spanish:
+    the Websites "How we know" cell ("◉ Connected"), the pieces of
+    Health's Wi-Fi line ("-78 dBm (weak), link 65 Mbit/s, channel 11
+    (2.4 GHz)"). (The GUI step "third audit UI: Demo Mode …" checks the
+    French colon and the Health line in the window.)"""
+    was = CURRENT_LOCALE
+    line = "-78 dBm (weak), link 65 Mbit/s, channel 11 (2.4 GHz), 802.11n"
+    try:
+        for loc, cell, wifi in (
+                ("fr", "◉ Connecté",
+                 "-78 dBm (faible), lien 65 Mbit/s, canal 11 (2.4 GHz), "
+                 "802.11n"),
+                ("es", "◉ Conectado",
+                 "-78 dBm (débil), enlace 65 Mbit/s, canal 11 (2.4 GHz), "
+                 "802.11n")):
+            set_locale(loc)
+            _CELL_CACHE.clear()
+            got = translate_cell(assoc_label(AS_CONNECTED))
+            assert got == cell, (loc, got)
+            for a in (AS_CONNECTED_AMBIG, AS_REPORTED, AS_LOOKUP_ONLY,
+                      AS_INFERRED):
+                en = assoc_label(a)
+                assert translate_cell(en) != en, (loc, en)
+            got = ", ".join(translate_text(p) for p in line.split(", "))
+            assert got == wifi, (loc, got)
+    finally:
+        set_locale(was)
+        _CELL_CACHE.clear()
+
+
+@gui_test_step("third audit UI: Demo Mode says DEMO DATA once; French "
+               "Dashboard and Health lines")
+def gt_a3_demo_once_and_french(app, ctx):
+    root = app.root
+    app._set_banner("An older message from before the demo.")
+    app.start_demo()
+    try:
+        _gui_pump(root, 0.5)
+
+        def demo_lines():
+            out = []
+            for frame, lbl in ((app.mode_banner, app.mode_lbl),
+                               (app.data_banner, app.data_lbl),
+                               (app.banner, app.banner_lbl)):
+                if frame.winfo_manager() and \
+                        "DEMO DATA" in str(lbl.cget("text")):
+                    out.append(str(lbl.cget("text")))
+            return out
+        lines = demo_lines()
+        assert len(lines) == 1, lines
+        assert not app.banner.winfo_manager(), app.banner_lbl.cget("text")
+        app.config.set("general.language", "Français")
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.5)
+        h = app.honesty_line()
+        assert h.startswith("D'ici : "), h
+        new = app.answer_new()[0]
+        assert re.match(r"(Depuis \d\d:\d\d|[^:]+) : ", new), new
+        info = app.connection_info_text()
+        wifi = [x.strip() for x in info.splitlines()
+                if "dBm" in x or x.startswith("Wi-Fi")]
+        assert wifi and "(simulé)" in wifi[0] and "simulated" not in info, \
+            wifi
+        assert any("lien" in x and "canal" in x and "weak" not in x and
+                   "channel" not in x for x in wifi), wifi
+    finally:
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        _gui_pump(root, 0.3)
+        app.stop_demo()
+        _gui_pump(root, 0.3)
+        _gt_back_to_scenario(app, ctx)
+
+
+@gui_test_step("fourth audit UI: the Alerts Severity column fits "
+               "AVERTISSEMENT in French, at every text size")
+def gt_a4_alert_severity_fits(app, ctx):
+    root = app.root
+    tab = app._select_tab("alerts")
+    tree = tab.tree
+    texts = tab.severity_texts()
+    assert any("AVERTISSEMENT" in t for t in texts) and \
+        any("PELIGRO" in t for t in texts), texts
+    # a window with room for the table: in a narrow one the fixed columns
+    # give up width first so every heading shows ("5.0.2 layout" and
+    # "review 6"), and the Severity words get their room back after
+    geo0, max0 = root.geometry(), root.maxsize()
+    root.maxsize(px(2000), px(1200))      # a 1024-px runner's screen too
+    root.geometry(px_geo("1600x900"))
+    _gui_pump(root, 0.4)
+    try:
+        for lang in ("Français", "Español", "English"):
+            app.config.set("general.language", lang)
+            app._apply_runtime_settings()
+            for size in ("Normal", "Extra large"):
+                app.config.set("appearance.text_size", size)
+                app._apply_text_size(defer=False)
+                _gui_pump(root, 0.3)
+                app.finish_text_size()
+                tab.rebuild()
+                _gui_pump(root, 0.3)
+                font = tree_cell_font()
+                width = int(tree.column("sev", "width"))
+                cut = [t for t in texts if font.measure(t) + 12 > width]
+                assert not cut, (lang, size, width, cut)
+                shown = [str(tree.item(i, "values")[0])
+                         for i in tree.get_children()[:40]]
+                cut = [t for t in shown if font.measure(t) + 12 > width]
+                assert not cut, (lang, size, width, cut)
+    finally:
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        app.config.set("appearance.text_size", "Normal")
+        app._apply_text_size(defer=False)
+        root.maxsize(*max0)
+        root.geometry(geo0)
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("third audit UI: Map lines stop at the names they cross")
+def gt_a3_map_lines_under_names(app, ctx):
+    root = app.root
+    tab = app._select_tab("map")
+    was = tab.mode_var.get()
+    try:
+        for mode in ("Topology", "Connections"):
+            tab.mode_var.set(mode)
+            tab.redraw(force=True)
+            _gui_pump(root, 0.3)
+            c = tab.c
+            order = {i: n for n, i in enumerate(c.find_all())}
+            labels = [t[0] for t in tab._label_ids
+                      if str(c.itemcget(t[0], "state")) != "hidden"]
+            assert labels, (mode, "no names drawn")
+            patches = [i for i in c.find_withtag("lblbg")]
+            crossed = 0
+            for tid in labels:
+                b = c.bbox(tid)
+                under = [p for p in patches if order[p] < order[tid] and
+                         c.coords(p)[0] <= b[0] + 1 and
+                         c.coords(p)[1] <= b[1] + 1 and
+                         c.coords(p)[2] >= b[2] - 1 and
+                         c.coords(p)[3] >= b[3] - 1]
+                assert under, (mode, c.itemcget(tid, "text"),
+                               "has no patch under it")
+                assert c.itemcget(under[0], "fill") == tab.t["tab_bg"]
+                edges = [i for i in c.find_overlapping(*b)
+                         if "edge" in c.gettags(i)]
+                crossed += bool(edges)
+                for e in edges:
+                    assert order[e] < order[under[0]], \
+                        (mode, c.itemcget(tid, "text"), "line over name")
+            LOG.debug("map %s: %d of %d names crossed by a line", mode,
+                      crossed, len(labels))
+    finally:
+        tab.mode_var.set(was)
+        tab.redraw(force=True)
+
+
+@gui_test_step("third audit: canvases, tables and Settings use "
+               "TkDefaultFont's real family, not the name as a family")
+def gt_a3_real_default_family(app, ctx):
+    """See t_a3_no_raw_default_font_tuples: what the window really uses."""
+    root = app.root
+    if str(root.tk.call("tk", "windowingsystem")) != "x11":
+        return "skip"
+    fam = tkfont.nametofont("TkDefaultFont").actual("family")
+    specs = {"table style": ttk.Style().lookup("Treeview", "font"),
+             "main button": ttk.Style().lookup("Accent.TButton", "font")}
+    tab = app._select_tab("map")
+    was = tab.mode_var.get()
+    tab.mode_var.set("Topology")
+    tab.redraw(force=True)
+    _gui_pump(root, 0.3)
+    texts = [i for i in tab.c.find_all() if tab.c.type(i) == "text"]
+    assert texts, "the map drew no text"
+    specs["map text"] = tab.c.itemcget(texts[0], "font")
+    tab.mode_var.set(was)
+    app._open_settings()
+    _gui_pump(root, 0.3)
+    sw = app._settings_win
+    try:
+        specs["Settings"] = sw.F_BASE
+    finally:
+        sw.win.destroy()
+    named = set(tkfont.names(root))
+    for what, spec in specs.items():
+        assert spec, (what, spec)
+        if isinstance(spec, str) and spec in named:
+            continue                     # a named font: Tk resolves it
+        first = spec[0] if isinstance(spec, tuple) else \
+            root.tk.splitlist(spec)[0]
+        assert first != "TkDefaultFont", (what, spec)
+        got = str(root.tk.call("font", "actual", spec, "-family"))
+        assert got == fam, (what, spec, got, fam)
 
 
 @gui_test_step("5.3.4 crowd #12: packet view — the details keep room, a "
@@ -101100,6 +107834,34 @@ def t_a2_cached_run_ignores_the_current_folder(ctx):
     assert r.stdout.decode().strip() == "source True", r
 
 
+@self_test(needs_source=True)
+def t_a3_cached_run_ignores_relative_pythonpath(ctx):
+    """Third audit: a relative PYTHONPATH entry ('.', 'sub', '') points
+    into the current folder too; a cached-run child imports nothing from
+    it, and an absolute entry stays."""
+    folder = ctx.path("a3_cwd")
+    os.makedirs(os.path.join(folder, "sub"), exist_ok=True)
+    marker = ctx.path("a3_hmac_ran")
+    for sub in ("", "sub"):
+        with open(os.path.join(folder, sub, "hmac.py"), "w",
+                  encoding="utf-8") as f:
+            f.write(f"open({marker!r}, 'w').write('ran')\n")
+    script = ctx.path("a3_src.py")
+    with open(script, "w", encoding="utf-8") as f:
+        f.write("print('ok')\n")
+    keep = os.path.abspath(ctx.path("a3_abs"))
+    env = cached_env(dict(os.environ, PYTHONPATH=os.pathsep.join(
+        (".", "sub", "", keep))))
+    assert env["PYTHONPATH"] == keep, env["PYTHONPATH"]
+    assert "PYTHONPATH" not in cached_env({"PYTHONPATH": "." + os.pathsep})
+    env.update(MW_PYC=os.path.join(folder, "none.pyc"),
+               MW_KEY=os.path.join(folder, "none.key"))
+    r = _run_hidden(cached_cmd(sys.executable, script), capture_output=True,
+                    env=env, timeout=60, cwd=folder)
+    assert not os.path.exists(marker), r.stderr.decode()[-300:]
+    assert r.stdout.decode().strip() == "ok", r
+
+
 @self_test()
 def t_a2_browser_opens_as_the_person(ctx):
     """Second audit (security #4): a root copy started through sudo or
@@ -101133,9 +107895,17 @@ def t_a2_browser_opens_as_the_person(ctx):
         assert all(callable(kw.get("preexec_fn")) for _c, kw in started)
         assert started[0][0][1] == "http://127.0.0.1:5173/"
         started.clear()
-        with _b9_patched(os.environ, SUDO_UID=None, PKEXEC_UID=None):
-            assert open_in_browser("http://127.0.0.1:5173/", "local_open",
-                                   "127.0.0.1:5173", "test")
+        # no person known at all: no SUDO_UID and no login id (a self-test
+        # run with sudo on a desktop has a login id of its own)
+        login_uid = globals()["_login_uid"]
+        globals()["_login_uid"] = lambda: None
+        try:
+            with _b9_patched(os.environ, SUDO_UID=None, PKEXEC_UID=None):
+                assert open_in_browser("http://127.0.0.1:5173/",
+                                       "local_open", "127.0.0.1:5173",
+                                       "test")
+        finally:
+            globals()["_login_uid"] = login_uid
         assert opened == ["http://127.0.0.1:5173/"] and not started
     finally:
         subprocess.Popen, webbrowser.open, LEDGER.killed = real
@@ -101171,6 +107941,213 @@ def t_a2_temp_file_never_follows_a_link(ctx):
         assert f.read() == "new"
     assert not os.path.lexists(_tmp_name(target))
 
+@self_test()
+def t_r4_crash_copy_restores_or_is_refused_plainly(ctx):
+    """Round 4: a crash copy (journal) cut at any byte, or a kill at any
+    moment of putting it in place, either restores or is refused with a
+    plain sentence (CrashCopyUnreadable). 4 of 25 kills between the
+    rename and the fingerprint left a whole copy that Restore turned down
+    with the bare KeyError 'sha256'."""
+    d = ctx.path(f"r4_journal_{uuid.uuid4().hex[:6]}")
+    os.makedirs(d)
+    jp = os.path.join(d, "journal.mwsession.json")
+
+    def body(tag):
+        return json.dumps({"schema_version": SESSION_SCHEMA_VERSION,
+                           "session": {"started": 1.0, "tag": tag},
+                           "devices": []}, separators=(",", ":"))
+
+    def put(text, **kw):
+        part = jp + ".1.part"
+        with open(part, "w", encoding="utf-8") as f:
+            f.write(text)
+        return publish_crash_copy(part, jp, **kw)
+
+    class Killed(BaseException):
+        pass
+    real = (atomic_write_json, _replace_retrying)
+    # a kill before, between and after each write and rename (the two
+    # fingerprints are renamed into place too)
+    for kill_at in range(6):
+        for n_ in os.listdir(d):
+            os.remove(os.path.join(d, n_))
+        assert put(body("old"))
+        steps = []
+
+        def step(fn):
+            def wrapped(*a, **k):
+                if len(steps) == kill_at:
+                    raise Killed()
+                steps.append(fn.__name__)
+                return fn(*a, **k)
+            return wrapped
+        globals()["atomic_write_json"] = step(real[0])
+        globals()["_replace_retrying"] = step(real[1])
+        try:
+            put(body("new"))
+        except Killed:
+            pass
+        finally:
+            globals()["atomic_write_json"], globals()["_replace_retrying"] \
+                = real
+        raw, verified = read_crash_copy(jp)
+        assert raw.decode() in (body("old"), body("new")), (kill_at, raw)
+        assert verified, f"killed after {steps}: the fingerprint doesn't " \
+            f"match the copy in place"
+        if kill_at >= 3:                  # past the copy's own rename
+            assert raw.decode() == body("new"), kill_at
+    # cut at any byte: refused plainly, with or without its fingerprint
+    whole = body("cut").encode()
+    put(whole.decode())
+    side = read_json(jp + ".sha256")
+    for with_side in (True, False):
+        for n in range(len(whole)):
+            with open(jp, "wb") as f:
+                f.write(whole[:n])
+            if with_side:
+                atomic_write_json(jp + ".sha256", side)
+            else:
+                with contextlib.suppress(OSError):
+                    os.remove(jp + ".sha256")
+            try:
+                read_crash_copy(jp)
+            except CrashCopyUnreadable as e:
+                assert str(e) == CRASH_COPY_DAMAGED, (n, e)
+            else:
+                raise AssertionError(f"a copy cut at byte {n} was taken")
+    # a whole copy whose fingerprint is old, missing or itself cut short
+    side_text = json.dumps(side)
+    for n in range(len(side_text) + 1):
+        with open(jp, "wb") as f:
+            f.write(whole)
+        with open(jp + ".sha256", "w", encoding="utf-8") as f:
+            f.write(side_text[:n].replace(side.get("sha256"), "0" * 64))
+        raw, _v = read_crash_copy(jp)
+        assert raw == whole, n
+    os.remove(jp + ".sha256")
+    assert read_crash_copy(jp) == (whole, False)
+    # junk, another kind of JSON, a missing file: plain refusals
+    for junk in (b"\xff\xfe", b"[1, 2]", b'{"a": 1}', b"[" * 100000,
+                 b'{"session": {}, "sha256": "x"}'):
+        with open(jp, "wb") as f:
+            f.write(junk)
+        try:
+            read_crash_copy(jp)
+        except CrashCopyUnreadable:
+            pass
+        else:
+            raise AssertionError(junk[:20])
+    os.remove(jp)
+    try:
+        read_crash_copy(jp)
+    except CrashCopyUnreadable as e:
+        assert str(e) == CRASH_COPY_UNREADABLE
+    else:
+        raise AssertionError("a missing copy was taken")
+    # a 5.0.x journal (v1) still restores
+    sess = {"schema_version": 1, "devices": [], "session": {}}
+    with open(jp, "w", encoding="utf-8") as f:
+        json.dump({"session": sess, "sha256": hashlib.sha256(json.dumps(
+            sess, default=str, sort_keys=True).encode()).hexdigest()}, f)
+    raw, verified = read_crash_copy(jp)
+    assert verified and json.loads(raw) == sess
+    # Delete ALL history ran meanwhile: nothing is put in place
+    os.remove(jp)
+    assert put(body("late"), cancelled=lambda: True,
+               lock=threading.Lock()) is False
+    assert os.listdir(d) == [], os.listdir(d)
+    for t in (CRASH_COPY_DAMAGED, CRASH_COPY_UNREADABLE):
+        for loc in ("fr", "es"):
+            assert translate_text(t, loc) != t, (loc, t)
+
+
+@self_test()
+def t_r4_stale_temp_files_swept(ctx):
+    """Round 4: temporary files left by an interrupted write (18 MB of
+    session data after 25 kills) are removed at start: only the names
+    MiniWireshark makes, only in its own data folder and its sessions,
+    cache and logs folders, only when untouched for 6 hours and their
+    writer isn't running, never through or of a link."""
+    d = ctx.path(f"r4_sweep_{uuid.uuid4().hex[:6]}")
+    outside = ctx.path(f"r4_outside_{uuid.uuid4().hex[:6]}")
+    for sub in ("sessions", "logs", "packets"):
+        os.makedirs(os.path.join(d, sub))
+    os.makedirs(outside)
+    old = time.time() - 7 * 3600
+    gone_pid = 99999999                   # above any pid_max
+    stale = [os.path.join(d, "sessions", f"journal.mwsession.json."
+                          f"{gone_pid}.part.tmp{gone_pid}-12345"),
+             os.path.join(d, "sessions", f"journal.mwsession.json."
+                          f"{gone_pid}.part"),
+             os.path.join(d, "sessions", f"journal.mwsession.json.sha256"
+                          f".tmp{gone_pid}-7"),
+             os.path.join(d, "sessions", "restored.mwsession.json.part"),
+             os.path.join(d, f"config.json.tmp{gone_pid}-1"),
+             os.path.join(d, "logs", f"x.json.tmp{gone_pid}-2")]
+    kept = [os.path.join(d, "sessions", f"autosave.mwsession.json.tmp"
+                         f"{gone_pid}-3"),               # too recent
+            os.path.join(d, f"networks.json.tmp{os.getppid()}-4"),  # alive
+            os.path.join(d, "sessions", "my notes.tmp"),
+            os.path.join(d, "geo.mmdb.part"),        # a download resumes
+            os.path.join(d, "packets", f"seg-1.pcap.tmp{gone_pid}-5"),
+            os.path.join(d, "sessions", "journal.mwsession.json"),
+            os.path.join(outside, f"a.json.tmp{gone_pid}-6")]
+    for p_ in stale + kept:
+        with open(p_, "w", encoding="utf-8") as f:
+            f.write("{}")
+        if p_ != kept[0]:
+            os.utime(p_, (old, old))
+    links = []
+    if hasattr(os, "symlink") and not IS_WINDOWS:
+        victim = os.path.join(outside, "victim.json")
+        with open(victim, "w", encoding="utf-8") as f:
+            f.write("keep")
+        os.utime(victim, (old, old))
+        links = [os.path.join(d, f"link.json.tmp{gone_pid}-8")]
+        os.symlink(victim, links[0])
+        os.symlink(outside, os.path.join(d, "cache"))  # a linked folder
+        kept.append(victim)
+    gone = sweep_stale_temp_files(d)
+    assert sorted(gone) == sorted(stale), (gone, stale)
+    left = [p_ for p_ in kept + links if not os.path.lexists(p_)]
+    assert not left, left
+    assert not any(os.path.exists(p_) for p_ in stale)
+    assert sweep_stale_temp_files(os.path.join(d, "no-such")) == []
+
+
+@self_test()
+def t_a3_csv_export_never_follows_a_link(ctx):
+    """Third audit #2: both CSV exports (the window's and a table's) used
+    a plain open() on path.part, so a link planted there was written
+    through. Now they write a new file of their own, as atomic_write_*."""
+    if IS_WINDOWS:
+        return "skip"                  # links need extra rights there
+    folder = ctx.path("a3_shared")
+    os.makedirs(folder, exist_ok=True)
+    victim = ctx.path("a3_victim.txt")
+    with open(victim, "w", encoding="utf-8") as f:
+        f.write("keep")
+    jobs = types.SimpleNamespace(submit=lambda kind, title, run, ok, bad:
+                                 ok(run(Job(kind, title, None))))
+    status = types.SimpleNamespace(set=lambda *_a: None)
+    win = types.SimpleNamespace(jobs=jobs, status_var=status, root=None)
+    kit = types.SimpleNamespace(app=win)
+    for name, write in (
+            ("window.csv", lambda p: MiniWireshark._write_csv_job(
+                win, p, ["a"], [["1"]], 1, "done")),
+            ("table.csv", lambda p: TableKit._export_write(
+                kit, p, [["a"], ["1"]], None))):
+        target = os.path.join(folder, name)
+        for planted in (target + ".part", _tmp_name(target)):
+            os.symlink(victim, planted)
+        write(target)
+        with open(victim, encoding="utf-8") as f:
+            assert f.read() == "keep", name
+        assert not os.path.islink(target)
+        with open(target, "rb") as f:
+            assert f.read() == b"a\r\n1\r\n", name
+        assert not os.path.lexists(_tmp_name(target))
+
 
 @self_test()
 def t_a2_copied_rows_cannot_start_a_formula(ctx):
@@ -101186,6 +108163,15 @@ def t_a2_copied_rows_cannot_start_a_formula(ctx):
     finally:
         globals()["copy_to_clipboard"] = real
     assert got == ["'=HYPERLINK(\"x\")\t'+1\trouter\t'-cmd"], got
+    # third audit: a single copied cell gets the same guard
+    try:
+        globals()["copy_to_clipboard"] = lambda app, text: got.append(text)
+        for cell in ("@SUM(1)", "\tx", "router"):
+            TableKit.copy_cell(types.SimpleNamespace(
+                app=None, cell_text=lambda iid, col, c=cell: c), "i1", "#1")
+    finally:
+        globals()["copy_to_clipboard"] = real
+    assert got[1:] == ["'@SUM(1)", "'\tx", "router"], got
     canvas = types.SimpleNamespace(_mw_chart={"Sites": {
         "anchor": None, "header": ["Site", "Bytes"], "note": "",
         "texts": None, "fmt": None,
@@ -101210,17 +108196,46 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
             f.write('{"seen": "192.168.1.77 example.com"}')
     keep = (app.known.data, app.networks.data, app.network_profile,
             app.history)
+    # third audit #1: the model stays whole for the steps after this one
+    was = (app.model, list(app.all_rows), app.count, set(app.bookmarks),
+           app.data_mode, app.data_label)
+    site = sorted(app.model.websites)[0]
+    ip = sorted(d.ip for d in app.model.registry.by_key.values()
+                if d.ip and d.ip != app.model.gateway_ip)[0]
     asked = []
     real = (messagebox.askyesno, messagebox.askyesnocancel)
     messagebox.askyesno = lambda *a, **k: asked.append(a) or True
     messagebox.askyesnocancel = lambda *a, **k: asked.append(a) or True
+    # The step pretends to watch live, so the once-a-second tick would read
+    # the runner's own listening programs and learn them afresh (a new
+    # listening.json, nothing old in it). Hold the programs table still so
+    # the step sees only what Delete ALL leaves behind.
+    app.procmap.refresh = lambda *a, **k: None
+    app._proc_seen = app.procmap.seq
     try:
+        app.data_mode = "live"
+        app.write_journal()
+        with open(PATHS.journal, encoding="utf-8") as f:
+            assert site in f.read()
         app.history = None                       # history off (default)
         app.clear_history()
         _gui_pump(root, 0.1)
         assert len(asked) == 1, asked
         left = [p for p in planted if os.path.exists(p)]
         assert not left, left
+        # third audit #1: the next journal tick writes nothing old
+        assert not app.model.has_data() and app._clear_undo is None
+        app.data_mode = "live"
+        app._journal_tick()
+        _gui_pump(root, 1.0, until=lambda: not app.jobs.active)
+        scratch = os.path.dirname(ctx.path("x"))    # the test's own pcap
+        for top, _dirs, names in os.walk(PATHS.data):
+            for n in names if not top.startswith(scratch) else ():
+                with contextlib.suppress(OSError), \
+                        open(os.path.join(top, n), "rb") as f:
+                    blob = f.read()
+                    assert site.encode() not in blob and \
+                        ip.encode() not in blob, (n, site, ip)
         assert not history_record_files(), history_record_files()
         assert app.known.data == {} and \
             app.networks.data == {"networks": {}}
@@ -101230,7 +108245,7 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
                 f.write("{}")
         cleared = []
         app.history = types.SimpleNamespace(
-            clear=lambda *a: cleared.append(a))
+            clear=lambda *a: cleared.append(a), load_baselines=dict)
         asked.clear()
         app.clear_history()
         assert cleared == [()] and len(asked) == 1, (cleared, asked)
@@ -101239,8 +108254,17 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
         assert not left, left
     finally:
         messagebox.askyesno, messagebox.askyesnocancel = real
+        with contextlib.suppress(AttributeError):
+            del app.procmap.refresh
         (app.known.data, app.networks.data, app.network_profile,
          app.history) = keep
+        app.replace_model(was[0])
+        app.all_rows.extend(was[1])
+        app.count = was[2]
+        app.bookmarks.update(was[3])
+        app.data_mode, app.data_label = was[4], was[5]
+        with contextlib.suppress(tk.TclError, KeyError, AttributeError):
+            app.tabs["packets"].rebuild()
 
 
 @gui_test_step("second audit privacy #8: with history off, closing keeps no "
@@ -101265,6 +108289,172 @@ def gt_a2_history_off_keeps_no_autosave(app, ctx):
         app.data_mode, app.history = keep
         with contextlib.suppress(OSError):
             os.remove(PATHS.autosave)
+
+
+def _r4_put_session_back(app, was):
+    app.replace_model(was[0])
+    app.all_rows.clear()
+    app.all_rows.extend(was[1])
+    app.count = was[2]
+    app.bookmarks.update(was[3])
+    app.data_mode, app.data_label = was[4], was[5]
+    with contextlib.suppress(tk.TclError, KeyError, AttributeError):
+        app.tabs["packets"].rebuild()
+
+
+@gui_test_step("round 4: a crash copy cut short is refused with a plain "
+               "sentence, a whole one without its fingerprint restores, "
+               "and what an interrupted write left is swept at start")
+def gt_r4_crash_copy_restore(app, ctx):
+    root = app.root
+    assert ctx.stale_tmp and not os.path.exists(ctx.stale_tmp), \
+        "a stale temporary file was not swept at start"
+    was = (app.model, list(app.all_rows), app.count, set(app.bookmarks),
+           app.data_mode, app.data_label)
+    shown = []
+    real = messagebox.showerror
+    messagebox.showerror = lambda *a, **k: shown.append(a)
+    try:
+        jp = app.write_journal(ctx.path("r4j.mwsession.json"))
+        with open(jp, "rb") as f:
+            raw = f.read()
+        n_dev = len(app.model.registry.by_key)
+        with open(jp, "wb") as f:
+            f.write(raw[:len(raw) // 2])
+        assert app.restore_journal(jp) is False
+        assert [a[1] for a in shown] == [translate_text(
+            CRASH_COPY_DAMAGED)], shown
+        assert os.path.exists(jp), "a refused copy is kept"
+        # killed between the rename and the fingerprint (round 4, 4/25)
+        with open(jp, "wb") as f:
+            f.write(raw)
+        os.remove(jp + ".sha256")
+        shown.clear()
+        assert app.restore_journal(jp), shown
+        _gui_pump(root, 0.3, until=lambda: not app.jobs.busy(), timeout=30)
+        _gui_pump(root, 0.3)
+        assert not shown, shown
+        assert app.data_mode == "session"
+        assert len(app.model.registry.by_key) == n_dev
+        assert not os.path.exists(jp)
+    finally:
+        messagebox.showerror = real
+        _r4_put_session_back(app, was)
+
+
+@gui_test_step("round 4: Delete ALL history in a live session leaves "
+               "nothing: not from a crash copy or history save under way, "
+               "the next crash copy or a clean exit")
+def gt_r4_delete_all_live_session(app, ctx):
+    root = app.root
+    was = (app.model, list(app.all_rows), app.count, set(app.bookmarks),
+           app.data_mode, app.data_label)
+    keep = (app.known.data, app.networks.data, app.network_profile,
+            app.history)
+    site = sorted(app.model.websites)[0]
+    ip = sorted(d.ip for d in app.model.registry.by_key.values()
+                if d.ip and d.ip != app.model.gateway_ip)[0]
+    own = not isinstance(app.history, Store)
+    st = Store(PATHS.history_db, app.session_id, {"source": "live"}) \
+        if own else app.history
+
+    def records():
+        """What the window keeps on disk of what it saw (the test's own
+        files, a saved session or capture, are left out)."""
+        out = []
+        for top, _dirs, names in os.walk(PATHS.data):
+            for n in names:
+                rel = os.path.relpath(os.path.join(top, n), PATHS.data)
+                if rel.startswith(("sessions", "packets", "history.",
+                                   "known_devices", "networks",
+                                   "listening")):
+                    out.append(os.path.join(top, n))
+        return out
+
+    def holding():
+        hits = []
+        for p_ in records():
+            with contextlib.suppress(OSError), open(p_, "rb") as f:
+                blob = f.read()
+            if site.encode() in blob or ip.encode() in blob:
+                hits.append(os.path.relpath(p_, PATHS.data))
+        return hits
+    real = (messagebox.askyesnocancel, globals()["publish_crash_copy"])
+    go, held = threading.Event(), []
+
+    def slow_publish(part, *a, **k):
+        held.append("journal")
+        with open(part, "rb") as f:
+            data = f.read()
+        go.wait(30)
+        # on Windows the copy, still open for its fingerprint, can't be
+        # deleted by Delete ALL: keep it as it would be there
+        if not os.path.exists(part):
+            with open(part, "wb") as f:
+                f.write(data)
+        return real[1](part, *a, **k)
+
+    def slow_snapshot(write, job):
+        held.append("history")
+        go.wait(30)
+        return MiniWireshark._store_history_snapshot(app, write, job)
+    app.procmap.refresh = lambda *a, **k: None   # see privacy #7
+    app._proc_seen = app.procmap.seq
+    messagebox.askyesnocancel = lambda *a, **k: True
+    try:
+        app.history = st
+        app.data_mode = "live"
+        app._write_history()
+        assert st.flush_now(30)
+        assert holding(), "the history should hold the session first"
+        for kind in ("history", "journal"):
+            # a save that has read the session when Delete ALL runs
+            go.clear()
+            held.clear()
+            if kind == "history":
+                app._store_history_snapshot = slow_snapshot
+                app._write_history(background=True)
+            else:
+                globals()["publish_crash_copy"] = slow_publish
+                app.write_journal(background=True)
+            _gui_pump(root, 0.05, until=lambda: held, timeout=30)
+            assert held == [kind], held
+            app.clear_history()
+            go.set()
+            _gui_pump(root, 0.2, until=lambda: not app.jobs.active,
+                      timeout=30)
+            assert st.flush_now(30)
+            assert not holding(), (kind, holding())
+            globals()["publish_crash_copy"] = real[1]
+            with contextlib.suppress(AttributeError):
+                del app._store_history_snapshot
+            if kind == "history":
+                _r4_put_session_back(app, was)
+                app.data_mode = "live"
+        # the next crash copy, then what a clean exit writes (_on_close)
+        app.data_mode = "live"
+        app._journal_tick()
+        _gui_pump(root, 0.3, until=lambda: not app.jobs.active, timeout=30)
+        app._write_history()
+        app._pump_store(reschedule=False)
+        app._exit_autosave()
+        assert st.flush_now(30)
+        assert not holding(), holding()
+        assert not os.path.exists(PATHS.journal)
+    finally:
+        go.set()
+        messagebox.askyesnocancel = real[0]
+        globals()["publish_crash_copy"] = real[1]
+        for attr in ("_store_history_snapshot",):
+            with contextlib.suppress(AttributeError):
+                delattr(app, attr)
+        with contextlib.suppress(AttributeError):
+            del app.procmap.refresh
+        if own:
+            st.stop(5)
+        (app.known.data, app.networks.data, app.network_profile,
+         app.history) = keep
+        _r4_put_session_back(app, was)
 
 
 @self_test()
@@ -101497,6 +108687,411 @@ def t_a2_settings_file_follows_the_folder_rule(ctx):
             _b9_patched(os.environ, MINIWIRESHARK_CONFIG=None):
         c = AppConfig()
     assert c.path == os.path.join(PATHS.data, name), c.path
+
+
+A3_BAD_SETTINGS = {
+    "version-list": b'{"config_version": [1], '
+                    b'"appearance": {"theme": "Dark"}}',
+    "version-inf": b'{"config_version": 1e999, '
+                   b'"appearance": {"theme": "Dark"}}',
+    "perf-number": b'{"config_version": 1, "performance": 5, '
+                   b'"appearance": {"theme": "Dark"}}',
+    "deep-list": b"[" * 100000 + b"]" * 100000,
+    "deep-object": b'{"a": ' * 100000 + b"1" + b"}" * 100000,
+}
+
+
+def _a3_real_start(ctx, tag, raw, safe=False, timeout=150):
+    """Start this program for real (--demo, the start test's exit after
+    the window) with `raw` as its settings file. -> (stdout, log, the
+    settings file's path)."""
+    d = ctx.path(f"a3-start-{tag}-{int(safe)}")
+    os.makedirs(os.path.join(d, "data"), exist_ok=True)
+    cfgp = os.path.join(d, "cfg.json")
+    with open(cfgp, "wb") as f:
+        f.write(raw)
+    env = dict(os.environ, MINIWIRESHARK_DATA=os.path.join(d, "data"),
+               MINIWIRESHARK_CONFIG=cfgp, MW_START_AND_EXIT="0.5",
+               MINIWIRESHARK_NO_CACHED_START="1")
+    for k in ("MW_FEATURES_OFF", "MW_READY_FILE"):
+        env.pop(k, None)
+    argv = self_cmd("--demo", *([SAFE_FLAG] if safe else []))
+    try:
+        r = _run_hidden(argv, env=env, capture_output=True, text=True,
+                        encoding="utf-8", errors="replace", timeout=timeout)
+        out = r.stdout or f"exit code {r.returncode}: {r.stderr[-300:]}"
+    except subprocess.TimeoutExpired:
+        out = f"still waiting after {timeout} s"
+    log = ""
+    with contextlib.suppress(OSError), open(
+            os.path.join(d, "data", "logs", "miniwireshark.log"),
+            encoding="utf-8", errors="replace") as fh:
+        log = fh.read()
+    return out, log, cfgp
+
+
+A3_GOOD_SETTINGS = b'{"general": {"show_welcome": false}}'
+
+
+@self_test(slow=True, needs_source=True)
+def t_a3_bad_settings_file_never_stops_the_start(ctx):
+    """Third audit (settings #21): the real program starts, with and
+    without --safe, whatever shape the settings file has: a schema number
+    that is a list or 1e999, "performance" as a number, JSON nested 100000
+    deep. Before, each stopped every start at "fatal error", Safe Mode
+    too, and the file stayed for the next start to fail again. Skipped
+    only where a start with good settings can't open the window either
+    (the lab's Python 3.8 Tk aborts in xcb)."""
+    runs = {}
+    cases = dict(A3_BAD_SETTINGS, control=A3_GOOD_SETTINGS)
+
+    def start(name, safe):
+        runs[(name, safe)] = _a3_real_start(ctx, name, cases[name], safe)
+    threads = [threading.Thread(target=start, args=(n, s), daemon=True)
+               for n in cases for s in (False, True)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(200)
+    assert len(runs) == 2 * len(cases), sorted(runs)
+    if not all("START_OK" in runs[("control", s)][0] for s in (False, True)):
+        return "skip"                # no real window on this machine
+    for (name, safe), (out, log, cfgp) in sorted(runs.items()):
+        tail = "\n".join(log.splitlines()[-6:])
+        assert "START_OK" in out and "mapped=True" in out, \
+            (name, safe, out[-300:], tail)
+        assert "fatal error" not in log, (name, safe, tail)
+        # the closed window saved settings this version can read
+        c = AppConfig(path=cfgp)
+        assert not c.warning, (name, safe, c.warning)
+        if name.startswith("deep"):
+            with open(cfgp + ".damaged", "rb") as f:
+                assert f.read() == A3_BAD_SETTINGS[name], name
+        elif name != "control":
+            assert c.get("appearance.theme") == "Dark", (name, safe)
+
+
+@self_test()
+def t_a3_settings_of_any_shape_load(ctx):
+    """Third audit (settings #21): a bad schema number or performance
+    section is set back and the rest is kept; a file nobody can read is
+    set aside once (copy kept, the file out of the way) so the next start
+    is quiet, and a later, different damage keeps the earlier copy."""
+    for name, raw in A3_BAD_SETTINGS.items():
+        p = ctx.path(f"a3-shape-{name}.json")
+        with open(p, "wb") as f:
+            f.write(raw)
+        c = AppConfig(path=p)
+        assert c.warning, name
+        assert isinstance(c.get("performance.mode"), str), name
+        assert c.data["config_version"] == CONFIG_SCHEMA_VERSION, name
+        if name.startswith("deep"):
+            assert "default settings" in c.warning and \
+                "copy was kept" in c.warning, c.warning
+            assert not os.path.exists(p), name       # set aside
+            with open(p + ".damaged", "rb") as f:
+                assert f.read() == raw
+            again = AppConfig(path=p)
+            assert not again.warning, again.warning  # told once
+            # the same damage again: the earlier, different copy stays
+            with open(p, "wb") as f:
+                f.write(raw[:-1])
+            AppConfig(path=p)
+            with open(p + ".damaged", "rb") as f:
+                assert f.read() == raw
+            assert [n for n in os.listdir(ctx.tmp)
+                    if n.startswith(os.path.basename(p) + ".damaged-")]
+        else:
+            assert c.get("appearance.theme") == "Dark", (name, c.warning)
+            want = "performance" if name == "perf-number" else \
+                "config_version"
+            assert want in c.repaired, c.repaired
+            assert c.save() and read_json(p)["config_version"] == \
+                CONFIG_SCHEMA_VERSION
+
+
+@self_test()
+def t_a3_settings_items_of_the_wrong_kind_are_dropped(ctx):
+    """Third audit (settings #23): list and table items of the wrong kind
+    are dropped (`"filters.recent": [1]` and `"connectors.list": [1]`
+    stopped the start at "startup error"); the connected helpers'
+    interval stays between 10 s and an hour (0 asked without a pause,
+    1e308 stopped their thread)."""
+    p = ctx.path("a3-items.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"filters": {"recent": ["dns", 1, None, {}],
+                               "presets": {"Mine": {"proto": "DNS"},
+                                           "Bad": 5}},
+                   "connectors": {"list": [1, "x", {"id": "c1"}],
+                                  "interval": 0},
+                   "alerts": {"muted_devices": ["a|b", 2],
+                              "expected": [[]]},
+                   "general": {"tours_done": [None, "basics"]},
+                   "workspaces": {"saved": {"W": {"tab": "health"},
+                                            "X": "y"}}}, f)
+    c = AppConfig(path=p)
+    assert c.get("filters.recent") == ["dns"]
+    assert list(c.get("filters.presets")) == ["Mine"]
+    assert c.get("connectors.list") == [{"id": "c1"}]
+    assert c.get("connectors.interval") == 10
+    assert c.get("alerts.muted_devices") == ["a|b"]
+    assert c.get("alerts.expected") == []
+    assert c.get("general.tours_done") == ["basics"]
+    assert list(c.get("workspaces.saved")) == ["W"]
+    assert "filters.recent" in c.repaired and \
+        "connectors.interval" in c.repaired, c.repaired
+    c.set("connectors.interval", 1e308)
+    clean_config_values(c.data)
+    assert c.get("connectors.interval") == 3600
+    # (B-32) a newer version's file keeps its lists as they are
+    p = ctx.path("a3-items-newer.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"config_version": 99, "filters": {"recent": [1]},
+                   "connectors": {"list": [1]}}, f)
+    c = AppConfig(path=p)
+    assert c.get("filters.recent") == [1] and \
+        c.get("connectors.list") == [1], c.repaired
+    m = ConnectorManager([1, "x", {"id": "c1", "kind": "nope"}], None,
+                         lambda *a: None)
+    assert m.conns == {}
+    assert ConnectorManager([], None, None, 0).interval == 10
+    assert ConnectorManager([], None, None, 1e308).interval == 3600
+
+
+def _r5_load(ctx, name, text):
+    p = ctx.path(f"r5-{name}.json")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+    return p, AppConfig(path=p)
+
+
+R5_SNOOZE_JUNK = ('"str|*": "123", "nan|*": NaN, "inf|*": 1e999, '
+                  '"neg|*": -5, "zero|*": 0, "huge|*": 1' + "0" * 400 +
+                  ', "far|*": %d, "bool|*": true, "null|*": null, '
+                  '"nest|*": {"a": [1, {"b": null}]}, "list|*": [%d]')
+
+
+@self_test()
+def t_r5_snoozes_of_any_shape_are_dropped_at_load(ctx):
+    """Fifth audit (settings): a snooze end in the settings file that
+    isn't a time a snooze can end at (a word, NaN, 1e999, a negative or
+    400-digit number, a time ten years away, on/off, a list or a table) is
+    dropped when the file is read and named in the warning; real snoozes,
+    over or not, are kept. The alerts read what is left, and also a newer
+    version's file (not cleaned, B-32), without ever stopping: before,
+    1e999 snoozed an alert type for ever and the 400-digit number stopped
+    every alert (OverflowError)."""
+    now = time.time()
+    far = int(now + 10 * 365 * 86400)
+    junk = R5_SNOOZE_JUNK % (far, int(now + 3600))
+    text = ('{"alerts": {"snoozed": {"ok|*": %r, "ok|aa:bb": %r, '
+            '"past|*": %r, %s}}}' % (now + 3600, now + 86400 * 1.9,
+                                     now - 100, junk))
+    _, c = _r5_load(ctx, "snoozes", text)
+    sn = c.get("alerts.snoozed")
+    assert sorted(sn) == ["ok|*", "ok|aa:bb", "past|*"], sorted(sn)
+    assert "alerts.snoozed" in c.repaired and c.warning, c.repaired
+    kinds = ["ok", "past", "str", "nan", "inf", "neg", "zero", "huge",
+             "far", "bool", "null", "nest", "list", "none"]
+    eng = AlertEngine(c)
+    for kind in kinds:
+        until = eng.snoozed_until(kind, "aa:bb")
+        assert until == 0.0 or kind == "ok" or kind == "past", (kind, until)
+        eng.is_muted(kind, "aa:bb", "aa:bb")
+    assert eng.is_muted("ok", "", "") and not eng.is_muted("past", "", "")
+    assert not eng.is_muted("inf", "", "") and not eng.is_muted("far", "", "")
+    # a newer version's file keeps the table as it is: read it raw
+    p, c = _r5_load(ctx, "snoozes-newer", '{"config_version": 99, '
+                    '"alerts": {"snoozed": {%s}}}' % junk)
+    assert "huge|*" in c.get("alerts.snoozed")
+    eng = AlertEngine(c)
+    for kind in kinds:
+        assert eng.snoozed_until(kind, "aa:bb") == 0.0, kind
+        assert not eng.is_muted(kind, "aa:bb", "aa:bb"), kind
+        assert eng._add(kind, "WARNING", "aa:bb", "r", "o", "i", "p")
+    a = eng._add("arp_spoof", "DANGER", "aa:bb", "r", "o", "i", "p")
+    app = types.SimpleNamespace(config=c, _set_banner=lambda *x, **k: 0)
+    c.save = lambda: True
+    MiniWireshark.alert_snooze(app, a, 3600)
+    assert sorted(c.get("alerts.snoozed")) == ["arp_spoof|aa:bb"]
+    assert eng.snoozed_until("arp_spoof", "aa:bb") > time.time()
+
+
+@self_test()
+def t_r5_connector_entries_are_mended_at_load(ctx):
+    """Fifth audit (settings): each connected helper in the settings
+    file is a table with an id; a known key of the wrong kind is taken
+    out (its default applies), an entry with no usable id or a second one
+    with the same id is dropped. The helpers and their buttons cope with a
+    newer version's raw list too: before, `"id": [1]` or `"kind": {}`
+    stopped the helpers' start (unhashable) and a "url" that isn't text
+    stopped it at .rstrip."""
+    entries = ('[{"id": "c1", "kind": "pihole", "url": "http://pi.hole", '
+               '"verify": "yes", "enabled": 1, "name": 5, "pin": null, '
+               '"username": [], "zzz": {"a": [1]}}, '
+               '{"id": [1], "kind": "pihole"}, {"id": "c2", "kind": {}}, '
+               '{"id": "c1", "kind": "adguard"}, {"id": ""}, '
+               '{"kind": "pihole"}, {"id": "c3", "kind": "adguard", '
+               '"url": 7}, [], 3, null]')
+    _, c = _r5_load(ctx, "conns", '{"connectors": {"list": %s}}' % entries)
+    got = c.get("connectors.list")
+    assert got == [{"id": "c1", "kind": "pihole", "url": "http://pi.hole",
+                    "zzz": {"a": [1]}}, {"id": "c2"},
+                   {"id": "c3", "kind": "adguard"}], got
+    assert "connectors.list" in c.repaired and c.warning, c.repaired
+    m = ConnectorManager(got, None, lambda *a: None)
+    assert sorted(m.conns) == ["c1", "c3"], m.conns
+    assert m.conns["c1"].verify and m.conns["c3"].url == ""
+    m.stop()
+    # a clean list is left alone and not named
+    _, c = _r5_load(ctx, "conns-ok", json.dumps({"connectors": {"list": [
+        {"id": "c1", "kind": "pihole", "url": "http://pi.hole",
+         "verify": True, "enabled": False}]}}))
+    assert not c.repaired and len(c.get("connectors.list")) == 1
+    # a newer version's file (B-32) keeps its list: everything copes
+    _, c = _r5_load(ctx, "conns-newer", '{"config_version": 99, '
+                    '"connectors": {"list": %s}}' % entries)
+    raw = c.get("connectors.list")
+    assert len(raw) == 10, raw
+    m = ConnectorManager(raw, None, lambda *a: None)
+    assert sorted(m.conns) == ["c1", "c3"], m.conns
+    m.update(raw)
+    m.stop()
+    c.save = lambda: True
+    app = types.SimpleNamespace(
+        config=c, vault=types.SimpleNamespace(delete=lambda cid: None),
+        _start_connectors=lambda: None, tabs={})
+    MiniWireshark.connector_set(app, "c1", toggle_enabled=True)
+    assert c.get("connectors.list")[0]["enabled"] is False
+    MiniWireshark.connector_save(app, {"id": "c2", "kind": "pihole"})
+    MiniWireshark.connector_remove(app, "c1")
+    left = c.get("connectors.list")
+    assert len(left) == 8 and left[-1] == {"id": "c2", "kind": "pihole"}
+    assert 3 in left and None in left         # kept for the newer version
+
+
+@self_test()
+def t_r5_settings_version_of_any_kind_is_named(ctx):
+    """Fifth audit (settings): a schema number that is not a number
+    (`{}`, null, "", false, "3") takes the path `[1]`, 1e999 and NaN take:
+    set back, named in the start's warning, the rest kept, and no .bak of
+    the bad file. Before, `{}` and the others became 1 without a word and
+    the first save kept a .bak. A missing number (a version-1 file) and a
+    real number stay quiet."""
+    for name, ver in (("obj", "{}"), ("null", "null"), ("empty", '""'),
+                      ("false", "false"), ("word", '"3"'),
+                      ("list", "[1]"), ("nan", "NaN"), ("inf", "1e999")):
+        p, c = _r5_load(ctx, f"ver-{name}", '{"config_version": %s, '
+                        '"appearance": {"theme": "Dark"}}' % ver)
+        assert "config_version" in c.repaired, (name, c.repaired)
+        assert "config_version" in c.warning, (name, c.warning)
+        assert c.get("appearance.theme") == "Dark", name
+        assert c.data["config_version"] == CONFIG_SCHEMA_VERSION, name
+        assert c.save() and not os.path.exists(p + ".bak"), name
+        assert read_json(p)["config_version"] == CONFIG_SCHEMA_VERSION
+        again = AppConfig(path=p)
+        assert not again.warning and not again.repaired, name
+    for name, text in (("missing", '{"appearance": {"theme": "Dark"}}'),
+                       ("two", '{"config_version": 2}'),
+                       ("now", '{"config_version": %d}' %
+                        CONFIG_SCHEMA_VERSION)):
+        p, c = _r5_load(ctx, f"ver-{name}", text)
+        assert not c.repaired and not c.warning, (name, c.repaired)
+
+
+@self_test()
+def t_r5_call_frame_limit_survives_a_busy_machine(ctx):
+    """Fifth audit: `call decoder fuzz` failed once on a busy machine
+    ("one frame took 98 ms", limit 50). The limit stays. A frame that
+    waited (the machine was busy once) passes; one that is slow every
+    time it is timed, or that used 50 ms of CPU time, still fails."""
+    calls = {"n": 0}
+
+    def once_slow(frame):            # set aside once, then quick
+        calls["n"] += 1
+        return 0.150 if calls["n"] == 1 else 0.001
+    assert call_frame_limit_check(0.002, [b"f"], once_slow) == ""
+    assert "every" not in call_frame_limit_check(
+        0.002, [b"f"], lambda f: 0.001)
+    slow = call_frame_limit_check(0.002, [b"f"], lambda f: 0.150)
+    assert "150 ms each of 5 times" in slow, slow
+    slow = call_frame_limit_check(0.150, [], lambda f: 0.0)
+    assert "150 ms of CPU time" in slow, slow
+    assert call_frame_limit_check(None, [b"f"], once_slow) == ""
+    # the CPU clock sees work, not waiting
+    cpu = _cpu_clock()
+    if cpu is None:
+        return "skip"
+    c0 = cpu()
+    time.sleep(0.15)
+    waited = cpu() - c0
+    c0 = cpu()
+    end = time.perf_counter() + 0.15
+    while time.perf_counter() < end:
+        pass
+    worked = cpu() - c0
+    assert waited < 0.05 <= worked, (waited, worked)
+
+
+@self_test(slow=True, needs_source=True)
+def t_a3_newer_settings_lists_never_stop_the_start(ctx):
+    """Third audit (settings #23): a settings file from a newer version
+    keeps its lists as they are (B-32), so the code that reads them must
+    cope: recent filters and connected helpers that aren't what this
+    version expects, and a helper interval of 0, no longer stop the real
+    start at "startup error". Skipped only where a start with good
+    settings can't open the window either."""
+    if "START_OK" not in _a3_real_start(ctx, "newer-control",
+                                        A3_GOOD_SETTINGS)[0]:
+        return "skip"                # no real window on this machine
+    raw = json.dumps({"config_version": 99,
+                      "general": {"show_welcome": False,
+                                  "auto_start_capture": False},
+                      "filters": {"recent": [1, {"x": 2}]},
+                      "connectors": {"list": [1], "interval": 0}}).encode()
+    out, log, cfgp = _a3_real_start(ctx, "newer", raw, timeout=180)
+    assert "START_OK" in out and "mapped=True" in out, \
+        (out[-300:], log[-1500:])
+    assert "startup error" not in log and "Traceback" not in log, \
+        log[-1500:]
+    assert read_json(cfgp)["filters"]["recent"] == [1, {"x": 2}]
+
+
+@self_test()
+def t_a3_settings_left_beside_the_program_are_named(ctx):
+    """Third audit (install #28): a settings file next to the program in
+    a folder of your own that your group may write to (umask 002) is not
+    used, as before, but it is no longer passed over without a word: the
+    first start says why and how to close the folder, once."""
+    if IS_WINDOWS:
+        return "skip"
+    prog = ctx.path("a3_group_dir")
+    os.makedirs(prog, exist_ok=True)
+    os.chmod(prog, 0o775)
+    data = ctx.path("a3_group_data")
+    os.makedirs(data, exist_ok=True)
+    os.chmod(data, 0o700)
+    name = "miniwireshark_config.json"
+    old = os.path.join(prog, name)
+    with open(old, "w", encoding="utf-8") as f:
+        json.dump({"appearance": {"theme": "Dark"}}, f)
+    os.chmod(old, 0o644)
+    assert not config_beside_app_ok(old)
+    with _b9_patched(globals(), APP_HOME=prog, SCRIPT_DIR=prog), \
+            _b9_patched(PATHS, data=data), \
+            _b9_patched(os.environ, MINIWIRESHARK_CONFIG=None):
+        c = AppConfig()
+        assert c.path == os.path.join(data, name), c.path
+        assert c.get("appearance.theme") == "Light"
+        assert "was not used" in c.warning and "chmod go-w" in c.warning \
+            and prog in c.warning, c.warning
+        assert c.save()
+        assert not AppConfig().warning               # said once
+        os.chmod(prog, 0o755)                        # closed: used again
+        c = AppConfig()
+        assert c.path == old and c.get("appearance.theme") == "Dark"
+        assert not c.warning
+    assert not config_beside_app_note(old, old)
 
 
 @self_test()
@@ -102188,6 +109783,697 @@ def t_q35_gui_test_counts_skips(ctx):
     assert _gs_live(None, types.SimpleNamespace(live=False)) == "skip"
 
 
+# ---- keyboard-only navigation, slice C (focus regions, tab strip, keys) ----
+NEW_KEYBOARD_SHORTCUTS = ("regions", "regions_back", "focus_table",
+                          "shortcut_sheet", "mode_toggle", "refresh",
+                          "pane_narrower", "pane_wider")
+# the defaults older than the reserved list: they keep their keys
+OLDER_SHORTCUTS = ("start", "stop", "clear", "export", "find", "undo",
+                   "inspector", "palette", "goto_packet", "back", "forward",
+                   "explain", "group1", "group2", "group3", "group4")
+
+
+@self_test(needs_source=True)
+def t_kbd_shortcut_names_have_controls_actions_and_no_clash(ctx):
+    """Every default shortcut has a Settings control and an action; no two
+    defaults are the same key; the new ones avoid every key a text box or
+    the program itself keeps (the older ones keep theirs)."""
+    import inspect
+    src = inspect.getsource(MiniWireshark._apply_shortcuts)
+    block = src[src.index("actions = {"):src.index("shortcuts = dict(")]
+    actions = set(re.findall(r'^\s+"(\w+)": ', block, re.M))
+    ctl = {k.split(".", 1)[1] for k in settings_schema_keys()
+           if k.startswith("shortcuts.")}
+    for name in DEFAULT_SHORTCUTS:
+        assert name in actions, f"shortcut {name}: no action"
+        assert name in ctl, f"shortcut {name}: no Settings control"
+    assert set(NEW_KEYBOARD_SHORTCUTS) <= set(DEFAULT_SHORTCUTS)
+    assert set(DEFAULT_SHORTCUTS) == set(NEW_KEYBOARD_SHORTCUTS) | \
+        set(OLDER_SHORTCUTS), "a new shortcut: add it to this test"
+    norm = {}
+    for name, seq in DEFAULT_SHORTCUTS.items():
+        n = _norm_seq(seq)
+        assert n and n not in norm, (name, seq, norm.get(n))
+        norm[n] = name
+    taken = {_norm_seq(x) for x in RESERVED_EDIT_KEYS + RESERVED_PLAIN_KEYS}
+    taken |= set(fixed_key_tokens())
+    for name in NEW_KEYBOARD_SHORTCUTS:
+        n = _norm_seq(DEFAULT_SHORTCUTS[name])
+        assert n not in taken, (name, n)
+        # not a plain letter, not Ctrl+Alt
+        assert "Alt" not in n or "Control" not in n, (name, n)
+    # the checker: its own default passes, a taken key is refused
+    assert shortcut_reserved("regions", "<F6>") == ""
+    assert _norm_seq("<Control-Key-1>") == _norm_seq("<Control-1>")
+    for bad in ("<Control-Key-w>", "<Tab>", "<Shift-Tab>", "<Control-Tab>",
+                "<Control-Alt-x>", "<Alt-a>", "<a>", "<Return>",
+                "<Control-slash>", "<Escape>"):
+        assert shortcut_reserved("regions", bad), bad
+    for good in ("<F9>", "<Control-Shift-F6>", "<F12>"):
+        assert shortcut_reserved("regions", good) == "", good
+    # the strings are in French and Spanish
+    labels = [c["label"] for pg in SETTINGS_PAGES for sec in pg["sections"]
+              for c in sec["controls"] if c.get("type") == "shortcut"]
+    assert len(labels) == len(DEFAULT_SHORTCUTS)
+    for text in labels + [n for n, _k in KEYMAP_FIXED] + [
+            "Text boxes use that key (editing).",
+            "That key is used to move around the window.",
+            "Refreshed this tab."]:
+        for loc in ("fr", "es"):
+            assert text in I18N[loc], (loc, text)
+
+
+@self_test()
+def t_kbd_roving_group_is_one_tab_stop(ctx):
+    """RovingGroup: one member is the Tab stop; a disabled one is passed
+    over; arrows walk the row. (A bare Tk window: no application.)"""
+    root = tk.Tk()
+    try:
+        root.withdraw()
+        fr = ttk.Frame(root)
+        fr.pack()
+        bs = [ttk.Button(fr, text=str(i)) for i in range(4)]
+        for b in bs:
+            b.pack(side="left")
+        root.deiconify()
+        root.update()
+        g = RovingGroup(root, bs, default=bs[1])
+        assert g.stop() is bs[1]
+        stops = [b for b in bs if g._takefocus(str(b))]
+        assert stops == [bs[1]], stops
+        bs[1].state(["disabled"])
+        assert g.stop() is bs[0]
+        bs[1].state(["!disabled"])
+        assert g.move(bs[1], 1) == "break"
+        g._note(bs[2])
+        assert g.stop() is bs[2]
+    finally:
+        root.destroy()
+
+
+class _KbdEvent:
+    def __init__(self, state, keysym=""):
+        self.state, self.keysym = state, keysym
+
+
+@self_test()
+def t_kbd_modifier_bits_follow_the_platform(ctx):
+    """Tk numbers the modifier bits per platform: on Windows 0x8 is
+    NumLock (on by default), Alt is 0x20000, so a plain key must stay
+    plain with NumLock on; on X11 0x8 is Alt; on macOS Command / Option
+    are 0x8 / 0x10. One helper answers for every keyboard route."""
+    ev = _KbdEvent
+    # Windows: NumLock (0x8) and CapsLock (0x2) are not modifiers
+    assert not _modified(ev(0x8), "win32")
+    assert not _modified(ev(0x8 | 0x2), "win32")
+    assert not _modified(ev(0), "win32")
+    for st in (0x1, 0x4, 0x20000, 0x8 | 0x20000, 0x8 | 0x4):
+        assert _modified(ev(st), "win32"), hex(st)
+    # X11: 0x8 is Alt (Mod1); 0x10 (NumLock) and 0x2 are not
+    assert _modified(ev(0x8), "linux") and _modified(ev(0x20000), "linux")
+    assert not _modified(ev(0x10), "linux") and not _modified(ev(0x2), "linux")
+    # macOS: Command 0x8, Option 0x10
+    assert _modified(ev(0x8), "darwin") and _modified(ev(0x10), "darwin")
+    assert not _modified(ev(0x2), "darwin")
+    # an event without a usable state is "plain", never an error
+    assert not _modified(ev(None), "win32") and not _modified(object())
+    assert key_held(ev(0x4 | 0x1), "control", "shift", platform="win32")
+    assert not key_held(ev(0x4 | 0x8), "control", "shift", platform="win32")
+    assert key_held(ev(0x4 | 0x1 | 0x8), "control", "shift", platform="linux")
+    # the shortcut box reads the same bits (NumLock is not Alt on Windows)
+    assert _shortcut_sequence(0x4 | 0x1 | 0x8, "F6", "win32") == \
+        "<Control-Shift-F6>"
+    assert _shortcut_sequence(0x20000, "Left", "win32") == "<Alt-Left>"
+    assert _shortcut_sequence(0x4 | 0x8, "k", "linux") == "<Control-Alt-k>"
+    assert _shortcut_sequence(0x10, "x", "darwin") == "<Alt-x>"
+    assert _shortcut_sequence(0, "F2", "linux") == "<F2>"
+
+
+@self_test()
+def t_kbd_saved_key_equal_to_a_new_default(ctx):
+    """Start remapped to F5 (now Refresh's default): Start keeps F5, the
+    default action waits; with no clash nothing is skipped."""
+    d = dict(DEFAULT_SHORTCUTS)
+    assert shortcut_default_losers(d) == set()
+    d["start"] = "<F5>"
+    assert shortcut_default_losers(d) == {"refresh"}
+    d["start"] = "<Key-F5>"
+    assert shortcut_default_losers(d) == {"refresh"}
+    d["start"] = DEFAULT_SHORTCUTS["start"]
+    d["stop"] = "<F8>"          # another new default, another action
+    assert shortcut_default_losers(d) == {"mode_toggle"}
+    d["clear"] = ""
+    assert "clear" not in shortcut_default_losers(d)
+
+
+def _kbd_mid_sash(pane):
+    """Put a divider half way before a keyboard move is measured: a step
+    run after a smaller window found the Packets divider already at its
+    limit (80 px above the bottom), so a move down had no room."""
+    with contextlib.suppress(tk.TclError):
+        pane.update_idletasks()
+        size = pane.winfo_height() if str(pane.cget("orient")) == \
+            "vertical" else pane.winfo_width()
+        pane.sashpos(0, size // 2)
+        pane.update_idletasks()
+
+
+def _kbd_press(root, widget, seq, pump=0.08):
+    """Focus `widget` (when given) and send it a key."""
+    if widget is not None:
+        with contextlib.suppress(tk.TclError):
+            widget.focus_force()
+        _gui_pump(root, 0.04)
+    w = root.focus_get() or widget or root
+    w.event_generate(seq)
+    _gui_pump(root, pump)
+
+
+@gui_test_step("kbd C1: F6 / Shift+F6 visit search, tabs, filter, table, "
+               "Inspector, status, and wrap")
+def gt_kbd_f6_regions(app, ctx):
+    root = app.root
+    keep = (app.inspector_visible, app.current_tab_name())
+    try:
+        for tabname, insp in (("devices", True), ("dash", False),
+                              ("alerts", True)):
+            app._select_tab(tabname)
+            _gui_pump(root, 0.5)
+            app.toggle_inspector(insp, remember=False)
+            _gui_pump(root, 0.4)
+            tab = app.tabs[tabname]
+            fe = getattr(tab, "filter_entry", None)
+            has_fe = fe is not None and fe.winfo_viewable()
+            want = ["search", "tabs"] + (["filter"] if has_fe else []) + \
+                ["table"] + (["inspector"] if insp else []) + ["status"]
+            regions = app._regions()
+            assert [n for n, _w in regions] == want, (tabname, regions)
+            widgets = dict(regions)
+            assert widgets["tabs"] is app.tabstrip.selected_label()
+            assert widgets["status"] is app.status_lbl
+            if has_fe:
+                assert widgets["filter"] is fe
+            assert widgets["table"] is app._table_target(tab)
+            _kbd_press(root, app.search_entry, "<F6>")     # search -> next
+            order = [app._region_of(root.focus_get())]
+            for _ in range(len(want) - 1):
+                _kbd_press(root, None, "<F6>")
+                order.append(app._region_of(root.focus_get()))
+            # the last press wrapped from the status line to the search box
+            assert order == want[1:] + ["search"], (tabname, order, want)
+            assert root.focus_get() is app.search_entry
+            # backwards from the search box: the status line, then up
+            _kbd_press(root, app.search_entry, "<Shift-F6>")
+            assert root.focus_get() is app.status_lbl, root.focus_get()
+            back = ["status"]
+            for _ in range(len(want) - 1):
+                _kbd_press(root, None, "<Shift-F6>")
+                back.append(app._region_of(root.focus_get()))
+            assert back == list(reversed(want)), (tabname, back, want)
+    finally:
+        app.toggle_inspector(keep[0], remember=False)
+        app._select_tab(keep[1] or "dash")
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C2: Tab from the search box reaches a tab's content in "
+               "at most 8 presses, every tab, both views")
+def gt_kbd_tab_presses(app, ctx):
+    root = app.root
+    mode = app.mode_ui_var.get()
+    worst = {}
+    try:
+        for view in ("Beginner", "Advanced"):
+            app.mode_ui_var.set(view)
+            app._on_ui_mode_change()
+            _gui_pump(root, 0.4)
+            for name, tab in app.tabs.items():
+                if app.beginner_mode and tab.advanced:
+                    continue
+                n = tab_presses_to_content(app, name)
+                worst[(view, name)] = n
+                assert n is not None and n <= 8, (view, name, n)
+        # only the shown tab's label is a Tab stop
+        stops = [str(l.cget("takefocus")) for _o, _b, l in
+                 app.tabstrip.tabs.values() if l.winfo_viewable()]
+        assert stops.count("1") == 1, stops
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        _gui_pump(root, 0.3)
+    return None
+
+
+@gui_test_step("kbd C3: Left / Right / Home / End on a tab label (and "
+               "Home / End on the notebook) switch tabs, focus stays on "
+               "the strip")
+def gt_kbd_tab_strip_arrows(app, ctx):
+    root = app.root
+    strip = app.tabstrip
+    app._select_tab("devices")
+    _gui_pump(root, 0.5)
+    order = list(strip.order)
+    assert len(order) >= 6, order
+    start = strip._selected()
+    i = order.index(start)
+    _kbd_press(root, strip.selected_label(), "<Right>")
+    assert strip._selected() == order[(i + 1) % len(order)], strip._selected()
+    assert root.focus_get() is strip.tabs[strip._selected()][2]
+    _kbd_press(root, None, "<Left>")
+    assert strip._selected() == start
+    assert root.focus_get() is strip.tabs[start][2]
+    _kbd_press(root, None, "<End>")
+    assert strip._selected() == order[-1]
+    assert root.focus_get() is strip.tabs[order[-1]][2]
+    _kbd_press(root, None, "<Right>")                 # wraps to the first
+    assert strip._selected() == order[0]
+    _kbd_press(root, None, "<Left>")                  # and back to the last
+    assert strip._selected() == order[-1]
+    _kbd_press(root, None, "<Home>")
+    assert strip._selected() == order[0]
+    # Alt+Left is Back, not "previous tab": the strip leaves it alone
+    went = []
+    app.router.back = lambda: went.append(1)
+    try:
+        cur = strip._selected()
+        _kbd_press(root, strip.tabs[cur][2], "<Alt-Left>")
+        assert went == [1] and strip._selected() == cur, (went,
+                                                          strip._selected())
+    finally:
+        del app.router.back
+    # the notebook itself (after a click on a tab): Home / End
+    _kbd_press(root, app.nb, "<End>")
+    assert strip._selected() == order[-1]
+    assert root.focus_get() is strip.tabs[order[-1]][2]
+    _gui_pump(root, 0.3)
+    stops = [str(l.cget("takefocus")) for _o, _b, l in
+             strip.tabs.values() if l.winfo_viewable()]
+    assert stops.count("1") == 1, stops
+    app._select_tab("dash")
+    _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C4: sub-view buttons: arrows switch, one Tab stop, "
+               "Enter / Down go into the content")
+def gt_kbd_subview_arrows(app, ctx):
+    root = app.root
+    mode = app.mode_ui_var.get()
+    tab = app._select_tab("packets")          # Advanced: shown for it
+    try:
+        _gui_pump(root, 0.5)
+        names = list(tab._sub_btns)
+        assert len(names) >= 3, names
+        tab.show_subview(names[0])
+        _gui_pump(root, 0.2)
+        stops = [n for n, b in tab._sub_btns.items()
+                 if str(b.cget("takefocus")) == "1"]
+        assert stops == [names[0]], stops
+        _kbd_press(root, tab._sub_btns[names[0]], "<Right>")
+        assert tab.subview == names[1], tab.subview
+        assert root.focus_get() is tab._sub_btns[names[1]]
+        assert [n for n, b in tab._sub_btns.items()
+                if str(b.cget("takefocus")) == "1"] == [names[1]]
+        _kbd_press(root, None, "<End>")
+        assert tab.subview == names[-1]
+        _kbd_press(root, None, "<Right>")                 # wraps
+        assert tab.subview == names[0]
+        _kbd_press(root, None, "<Left>")
+        assert tab.subview == names[-1]
+        _kbd_press(root, None, "<Home>")
+        assert tab.subview == names[0]
+        # into the content
+        for seq in ("<Down>", "<Return>"):
+            _kbd_press(root, tab._sub_btns[tab.subview], seq)
+            f = root.focus_get()
+            prefix = str(tab._sub_frames[tab.subview]) + "."
+            assert f is not None and str(f).startswith(prefix), (seq, f)
+        # the mouse way still works
+        tab._sub_btns[names[2]].invoke()
+        assert tab.subview == names[2]
+        tab.show_subview("Packets")
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C5: Dashboard cards: Space and Return open, arrows "
+               "move in grid order")
+def gt_kbd_dashboard_cards(app, ctx):
+    root = app.root
+    dt = app._select_tab("dash")
+    _gui_pump(root, 0.6)
+    calls = []
+    app.goto = lambda tg, arg=None: calls.append(tg)
+    try:
+        cards = dt.card_frames
+        cols = dt._card_cols
+        assert len(cards) == len(dt.CARDS) and cols >= 3 and \
+            len(cards) > cols
+        for seq in ("<space>", "<Return>"):
+            del calls[:]
+            _kbd_press(root, cards[0], seq)
+            assert calls == [dt.CARDS[0][2]], (seq, calls)
+        _kbd_press(root, cards[0], "<Right>")
+        assert root.focus_get() is cards[1]
+        _kbd_press(root, None, "<Left>")
+        assert root.focus_get() is cards[0]
+        _kbd_press(root, None, "<Left>")              # an edge: stays
+        assert root.focus_get() is cards[0]
+        _kbd_press(root, None, "<Down>")
+        assert root.focus_get() is cards[cols], (cols, root.focus_get())
+        _kbd_press(root, None, "<Up>")
+        assert root.focus_get() is cards[0]
+        # every card kind answers Space (answers, story, unusual, big)
+        for c in dt._kb_cards:
+            assert c.bind("<space>") and c.bind("<Right>"), c
+        assert len(dt._kb_cards) >= len(cards)
+    finally:
+        del app.goto
+
+
+@gui_test_step("kbd C6: status line, footer, messages, job and Inspector "
+               "close are keyboard-operable with a focus ring")
+def gt_kbd_status_widgets(app, ctx):
+    root = app.root
+    seen = []
+    app.open_diagnostics = lambda: seen.append("diag")
+    app.open_coverage = lambda: seen.append("coverage")
+    keep = app.inspector_visible
+    try:
+        app.toggle_inspector(True, remember=False)
+        _gui_pump(root, 0.4)
+        for w in (app.status_lbl, app.footer_lbl, app.msg_btn, app.job_lbl,
+                  app.inspector.close_btn):
+            assert str(w.cget("takefocus")) == "1", w
+            assert w.bind("<Return>") and w.bind("<space>"), w
+        for w, want in ((app.status_lbl, "diag"),
+                        (app.footer_lbl, "coverage")):
+            for seq in ("<Return>", "<space>"):
+                del seen[:]
+                _kbd_press(root, w, seq)
+                assert seen == [want], (w, seq, seen)
+            assert int(w.cget("highlightthickness")) == 2, \
+                "no focus ring on " + str(w)
+        app.search_entry.focus_force()
+        _gui_pump(root, 0.1)
+        assert int(app.status_lbl.cget("highlightthickness")) == 0
+        # the close mark: Space hides the Inspector, F2 shows it again
+        _kbd_press(root, app.inspector.close_btn, "<space>")
+        assert not app.inspector_visible
+    finally:
+        for n in ("open_diagnostics", "open_coverage"):
+            app.__dict__.pop(n, None)
+        app.toggle_inspector(keep, remember=False)
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C7: F7 table, F8 view, F5 refresh, Shift+F1 sheet, "
+               "Ctrl+Shift+arrows dividers")
+def gt_kbd_f_keys_and_dividers(app, ctx):
+    root = app.root
+    mode = app.mode_ui_var.get()
+    keep = app.inspector_visible
+    try:
+        # F7: the shown table, first row selected when none was
+        tab = app._select_tab("devices")
+        _gui_pump(root, 0.6)
+        kids = tab.tree.get_children()
+        assert kids, "the scenario should have devices"
+        tab.tree.selection_set(())
+        _kbd_press(root, app.search_entry, "<F7>")
+        assert root.focus_get() is tab.tree, root.focus_get()
+        assert tab.tree.selection(), "no row selected by F7"
+        # F8: Beginner <-> Advanced, twice
+        was = app.beginner_mode
+        _kbd_press(root, tab.tree, "<F8>")
+        assert app.beginner_mode == (not was)
+        assert app.mode_ui_var.get() == ("Beginner" if app.beginner_mode
+                                         else "Advanced")
+        _kbd_press(root, None, "<F8>")
+        assert app.beginner_mode == was
+        # F5: refreshes the shown tab
+        calls = []
+        app._refresh_shown_tab = lambda: calls.append(1)
+        try:
+            _kbd_press(root, tab.tree, "<F5>")
+        finally:
+            del app._refresh_shown_tab
+        assert calls == [1], calls
+        # Shift+F1: Help at the keyboard map, every binding listed
+        _kbd_press(root, tab.tree, "<Shift-F1>")
+        assert app.current_tab_name() == "help"
+        ht = app.tabs["help"]
+        _gui_pump(root, 0.4)
+        text = ht.txt.get("1.0", "end")
+        assert "Keyboard map" in text.splitlines()[0], text[:80]
+        for name in DEFAULT_SHORTCUTS:
+            assert _pretty_seq(DEFAULT_SHORTCUTS[name]) in text, name
+        for label, keys in KEYMAP_FIXED:
+            assert label in text and keys in text, label
+        # dividers: Ctrl+Shift+Left / Right (the Inspector's), with the
+        # focus on a tab label (in a text box these keys select words)
+        app._select_tab("devices")
+        app.toggle_inspector(True, remember=False)
+        _gui_pump(root, 0.6)
+        body = app.body
+        p0 = body.sashpos(0)
+        lbl = app.tabstrip.selected_label()
+        _kbd_press(root, lbl, "<Control-Shift-Left>")
+        p1 = body.sashpos(0)
+        assert p1 < p0, (p0, p1)
+        _kbd_press(root, lbl, "<Control-Shift-Right>")
+        assert body.sashpos(0) > p1
+        _kbd_press(root, app.search_entry, "<Control-Shift-Left>")
+        assert body.sashpos(0) > p1, "moved while typing in a text box"
+        # the Packets list | details divider
+        pt = app._select_tab("packets")
+        _gui_pump(root, 0.6)
+        _kbd_mid_sash(pt.vert_pane)
+        v0 = pt.vert_pane.sashpos(0)
+        _kbd_press(root, app.tabstrip.selected_label(),
+                   "<Control-Shift-Down>")
+        v1 = pt.vert_pane.sashpos(0)
+        assert v1 > v0, (v0, v1)
+        _kbd_press(root, None, "<Control-Shift-Up>")
+        assert pt.vert_pane.sashpos(0) < v1
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        app.toggle_inspector(keep, remember=False)
+        app._select_tab("dash")
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd C8: a new shortcut can be changed in Settings and the "
+               "old key stops working; taken keys are refused")
+def gt_kbd_remap_in_settings(app, ctx):
+    root = app.root
+    win = app._open_settings("shortcuts")
+    try:
+        _gui_pump(root, 0.5)
+        var = win.vars["shortcuts.regions"]
+        # refused: a text box's key, a fixed key, another action's key
+        for bad, why in (("<Control-Key-w>", "Text boxes"),
+                         ("<Tab>", "Already used by"),
+                         ("<Control-Tab>", "Already used by"),
+                         ("<F7>", "Already used by"),
+                         ("<Control-Alt-q>", "Ctrl+Alt")):
+            var.set(bad)
+            msg = win._validate("shortcuts.regions")
+            assert why in msg, (bad, msg)
+        var.set("<F9>")
+        assert win._validate("shortcuts.regions") == ""
+        assert win.apply(), win.errors
+        assert app.config.get("shortcuts.regions") == "<F9>"
+        root.update()
+        _kbd_press(root, app.search_entry, "<F9>")
+        assert root.focus_get() is app.tabstrip.selected_label(), \
+            root.focus_get()
+        _kbd_press(root, app.search_entry, "<F6>")        # no longer bound
+        assert root.focus_get() is app.search_entry, root.focus_get()
+    finally:
+        win.vars["shortcuts.regions"].set(DEFAULT_SHORTCUTS["regions"])
+        win.apply()
+        win.win.destroy()
+        _gui_pump(root, 0.3)
+    _kbd_press(root, app.search_entry, "<F6>")
+    assert root.focus_get() is app.tabstrip.selected_label()
+    app.search_entry.focus_force()
+
+
+@gui_test_step("kbd fix: the divider keys work with a table or a read-only "
+               "pane focused; Ctrl+K stays out of the palette's box and of "
+               "other windows' text boxes; the Apps key opens a row menu")
+def gt_kbd_fix_dividers_and_palette_key(app, ctx):
+    root = app.root
+    keep = (app.inspector_visible, app.current_tab_name())
+    try:
+        # Ctrl+Shift+Left / Right with a table focused (Shift+Left is the
+        # heading cursor's key; both were swallowed there)
+        app._select_tab("devices")
+        app.toggle_inspector(True, remember=False)
+        _gui_pump(root, 0.6)
+        tab = app.tabs["devices"]
+        table = app._table_target(tab)
+        body = app.body
+        p0 = body.sashpos(0)
+        _kbd_press(root, table, "<Control-Shift-Left>")
+        p1 = body.sashpos(0)
+        assert p1 < p0, ("table focused", p0, p1)
+        _kbd_press(root, table, "<Control-Shift-Right>")
+        assert body.sashpos(0) > p1
+        # the heading cursor still moves on Shift+Left (no Control)
+        hk = getattr(getattr(tab, "kit", None), "heading_keys", None)
+        if hk is not None:
+            hk.col = None
+            _kbd_press(root, table, "<Shift-Right>")
+            assert hk.col is not None
+        # Packets: Ctrl+Shift+Up / Down with the list focused move the
+        # divider and leave the selection where it was
+        pt = app._select_tab("packets")
+        _gui_pump(root, 0.6)
+        _kbd_mid_sash(pt.vert_pane)
+        v0, sel = pt.vert_pane.sashpos(0), pt.sel_no
+        _kbd_press(root, pt.tree, "<Control-Shift-Down>")
+        v1 = pt.vert_pane.sashpos(0)
+        assert v1 > v0, ("packet list focused", v0, v1)
+        _kbd_press(root, pt.tree, "<Control-Shift-Up>")
+        assert pt.vert_pane.sashpos(0) < v1 and pt.sel_no == sel
+        # a read-only Text (the Inspector) is not a text box for these keys
+        ro = app.inspector.txt
+        assert str(ro.cget("state")) == "disabled"
+        app._select_tab("devices")
+        _gui_pump(root, 0.5)
+        q0 = body.sashpos(0)
+        _kbd_press(root, ro, "<Control-Shift-Left>")
+        assert body.sashpos(0) < q0, "no move from the read-only Inspector"
+        pt = app._select_tab("packets")
+        _gui_pump(root, 0.5)
+        ro = next((t for t in _walk_class(pt.detail_bottom, tk.Text)
+                   if t.winfo_viewable() and str(t.cget("state")) ==
+                   "disabled"), None)
+        _kbd_mid_sash(pt.vert_pane)
+        w0 = pt.vert_pane.sashpos(0)
+        if ro is not None:
+            _kbd_press(root, ro, "<Control-Shift-Down>")
+            assert pt.vert_pane.sashpos(0) > w0, "read-only details pane"
+        # while typing in an editable box the keys stay the box's
+        eq = body.sashpos(0)
+        _kbd_press(root, app.search_entry, "<Control-Shift-Left>")
+        assert body.sashpos(0) == eq
+        # Ctrl+K in the palette's own box keeps the query
+        _gui_focus_main(app)
+        pal = app.open_palette()
+        pal.q.set("alerts")
+        _gui_pump(root, 0.1)
+        _kbd_press(root, pal.entry, "<Control-k>")
+        assert app._palette is pal and pal.alive() and pal.q.get() == \
+            "alerts", (app._palette is pal, pal.q.get())
+        pal.close()
+        # ... and in a text box of another window it does nothing
+        top = tk.Toplevel(root)
+        try:
+            box = tk.Text(top, width=20, height=3)
+            box.pack()
+            box.insert("1.0", "keep me")
+            box.mark_set("insert", "1.2")
+            _gui_pump(root, 0.1)
+            _kbd_press(root, box, "<Control-k>")
+            assert not (getattr(app, "_palette", None) is not None and
+                        app._palette.alive()), "palette opened from a dialog"
+        finally:
+            top.destroy()
+        # the Apps key (a keysym Windows has; X11 has none)
+        probe = tk.Frame(root)
+        try:
+            try:
+                probe.bind("<Key-App>", lambda e: None)
+                has_app = True
+            except tk.TclError:
+                has_app = False
+        finally:
+            probe.destroy()
+        if has_app:
+            assert pt.tree.bind("<Key-App>"), "the Apps key opens no menu"
+    finally:
+        app.toggle_inspector(keep[0], remember=False)
+        app._select_tab(keep[1])
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd fix: a saved key that equals a new default is a warning, "
+               "not an error; the customised action keeps the key")
+def gt_kbd_fix_saved_key_collides_with_new_default(app, ctx):
+    root = app.root
+    saved = app.config.get("shortcuts.start")
+    started, refreshed = [], []
+    orig_start = app.start
+    try:
+        app.config.set("shortcuts.start", "<F5>")
+        app.start = lambda *a, **k: started.append(1)
+        app._refresh_shown_tab = lambda: refreshed.append(1)
+        app._apply_shortcuts()
+        _kbd_press(root, app.tabstrip.selected_label(), "<F5>")
+        assert started == [1] and refreshed == [], (started, refreshed)
+        # Settings opens; Apply is not blocked by the legacy value
+        win = app._open_settings("shortcuts")
+        try:
+            _gui_pump(root, 0.5)
+            assert win._validate_all() == {}, win.errors
+            assert "shortcuts.start" in win.warnings or \
+                "shortcuts.refresh" in win.warnings, win.warnings
+            # a key typed now is still refused (reserved, or taken)
+            win.vars["shortcuts.stop"].set("<Control-Key-w>")
+            assert "Text boxes" in win._validate("shortcuts.stop")
+            win.vars["shortcuts.stop"].set(DEFAULT_SHORTCUTS["stop"])
+            win.vars["shortcuts.stop"].set("<F5>")
+            assert win._validate("shortcuts.stop"), "a new clash passed"
+            win.vars["shortcuts.stop"].set(DEFAULT_SHORTCUTS["stop"])
+            assert win._validate_all() == {}, win.errors
+        finally:
+            win.win.destroy()
+    finally:
+        app.start = orig_start
+        with contextlib.suppress(AttributeError):
+            del app._refresh_shown_tab
+        app.config.set("shortcuts.start", saved if saved is not None
+                       else DEFAULT_SHORTCUTS["start"])
+        app.config.save()
+        app._apply_shortcuts()
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("kbd fix: the palette's Recent list is kept for tabs and "
+               "actions only; names from the network stay in memory")
+def gt_kbd_fix_palette_recent_privacy(app, ctx):
+    keep = list(app.config.get("palette.recent", []) or [])
+    try:
+        app.config.set("palette.recent", [])
+        p = app.open_palette()
+        for label, cat in (("Settings", "setting"), ("Device: laptop", "device"),
+                           ("Website: example.org", "website"),
+                           ("Host: 203.0.113.9", "host"),
+                           ("Alert: Something", "alert"),
+                           ("Recent: a card", "recent"),
+                           ("Filter: ip:10.0.0.1", "recent filter"),
+                           ("Start watching", "action")):
+            p._remember(label, cat)
+        mem = list(p._recent)
+        assert "Device: laptop" in mem and "Website: example.org" in mem
+        saved = json.load(open(app.config.path, encoding="utf-8"))
+        assert saved["palette"]["recent"] == ["Start watching", "Settings"], \
+            saved["palette"]
+        raw = open(app.config.path, encoding="utf-8").read()
+        for bad in ("laptop", "example.org", "203.0.113.9", "10.0.0.1"):
+            assert bad not in raw, bad
+        p.close()
+    finally:
+        app.config.set("palette.recent", keep)
+        app.config.save()
+
+
+
 # ============================================================================
 #  21.  Application entry point
 # ============================================================================
@@ -102733,7 +111019,7 @@ def base_ttk_style():
         s.theme_use("clam")
     s.configure("TButton", padding=(10, 6))
     s.configure("Accent.TButton", padding=(14, 8),
-                font=("TkDefaultFont", 11, "bold"), foreground="#ffffff",
+                font=default_font(11, "bold"), foreground="#ffffff",
                 background=ACCENT_BUTTON_BG)
     s.map("Accent.TButton", background=[("active", ACCENT_BUTTON_ACTIVE),
                                         ("disabled", "#9bb8e8")])
