@@ -22359,9 +22359,10 @@ def device_scales_key():
         for n, w in CONFIDENCE_STEPS)
     lv = " · ".join(f"{LEVEL_GLYPH[x]} {LEVEL_WORD[x]}" for x in (
         LV_OBSERVED, LV_REPORTED, LV_CORRELATED, LV_INFERRED, LV_UNKNOWN))
-    return (f"Device evidence: is it a real device? {conf}. Evidence: how "
-            f"three facts are known, in order: on your network · name · "
-            f"kind ({lv}). “Likely” or “Possibly” before a kind is how sure "
+    return (f"Device evidence: is it a real device? {conf}. The Evidence "
+            f"column is off unless you turn it on (right-click a heading → "
+            f"Columns); it shows how three facts are known, in order: on "
+            f"your network · name · kind ({lv}). “Likely” or “Possibly” before a kind is how sure "
             f"that guess is, so a device with High evidence can still be "
             f"only “Possibly” a printer.")
 
@@ -33639,7 +33640,7 @@ router and Internet seen in traffic, not checked yet ¦ routeur et Internet vus 
 Weak signal — likely to make the connection slower. Move closer to the router or remove obstacles. ¦ Signal faible — risque de ralentir la connexion. Rapprochez-vous de la box ou enlevez les obstacles. ¦ Señal débil — probablemente haga la conexión más lenta. Acérquese al router o quite obstáculos.
 Time window ¦ Période ¦ Periodo
 %s of data so far ¦ %s de données pour l'instant ¦ %s de datos por ahora
-Device evidence: is it a real device? ●●● High (score 60+) · ●●○ Medium (score 30+) · ●○○ Low (score 10+) · ○○○ Unconfirmed. Evidence: how three facts are known, in order: on your network · name · kind (◉ Observed · ◈ Reported · ◎ Correlated · ◌ Inferred · ? Unknown). “Likely” or “Possibly” before a kind is how sure that guess is, so a device with High evidence can still be only “Possibly” a printer. ¦ Preuves de l'appareil : est-ce un vrai appareil ? ●●● Élevée (score 60+) · ●●○ Moyenne (score 30+) · ●○○ Faible (score 10+) · ○○○ Non confirmé. Preuves : comment trois faits sont connus, dans l'ordre : sur votre réseau · nom · type (◉ Observé · ◈ Signalé · ◎ Corrélé · ◌ Déduit · ? Inconnu). « Probable » ou « Peut-être » devant un type dit à quel point cette supposition est sûre : un appareil aux preuves élevées peut n'être que « Peut-être » une imprimante. ¦ Pruebas del dispositivo: ¿es un dispositivo real? ●●● Alta (puntuación 60+) · ●●○ Media (puntuación 30+) · ●○○ Baja (puntuación 10+) · ○○○ Sin confirmar. Pruebas: cómo se conocen tres datos, en orden: en su red · nombre · tipo (◉ Observado · ◈ Informado · ◎ Correlacionado · ◌ Deducido · ? Desconocido). «Probable» o «Posiblemente» delante de un tipo indica lo segura que es esa suposición, así que un dispositivo con pruebas altas puede ser solo «Posiblemente» una impresora.
+Device evidence: is it a real device? ●●● High (score 60+) · ●●○ Medium (score 30+) · ●○○ Low (score 10+) · ○○○ Unconfirmed. The Evidence column is off unless you turn it on (right-click a heading → Columns); it shows how three facts are known, in order: on your network · name · kind (◉ Observed · ◈ Reported · ◎ Correlated · ◌ Inferred · ? Unknown). “Likely” or “Possibly” before a kind is how sure that guess is, so a device with High evidence can still be only “Possibly” a printer. ¦ Preuves de l'appareil : est-ce un vrai appareil ? ●●● Élevée (score 60+) · ●●○ Moyenne (score 30+) · ●○○ Faible (score 10+) · ○○○ Non confirmé. La colonne Preuve est masquée sauf si vous l'affichez (clic droit sur un en-tête → Colonnes) ; elle montre comment trois faits sont connus, dans l'ordre : sur votre réseau · nom · type (◉ Observé · ◈ Signalé · ◎ Corrélé · ◌ Déduit · ? Inconnu). « Probable » ou « Peut-être » devant un type dit à quel point cette supposition est sûre : un appareil aux preuves élevées peut n'être que « Peut-être » une imprimante. ¦ Pruebas del dispositivo: ¿es un dispositivo real? ●●● Alta (puntuación 60+) · ●●○ Media (puntuación 30+) · ●○○ Baja (puntuación 10+) · ○○○ Sin confirmar. La columna Prueba está oculta salvo que la active (clic derecho en un encabezado → Columnas); muestra cómo se conocen tres datos, en orden: en su red · nombre · tipo (◉ Observado · ◈ Informado · ◎ Correlacionado · ◌ Deducido · ? Desconocido). «Probable» o «Posiblemente» delante de un tipo indica lo segura que es esa suposición, así que un dispositivo con pruebas altas puede ser solo «Posiblemente» una impresora.
 The devices on your local network. Device evidence shows how sure it is that each one is a real device — an IP address alone is never enough to count as a device. ¦ Les appareils de votre réseau local. Les preuves de l'appareil indiquent à quel point il est sûr que chacun est un vrai appareil — une adresse IP seule ne suffit jamais à compter comme appareil. ¦ Los dispositivos de su red local. Las pruebas del dispositivo indican lo seguro que es que cada uno sea un dispositivo real — una dirección IP sola nunca basta para contar como dispositivo.
 # 5.3.4: Websites → Local services
 Local services ¦ Services locaux ¦ Servicios locales
@@ -43896,6 +43897,7 @@ class DashboardTab(BaseTab):
         box.pack(fill="x", pady=(0, 2))
         self.answer_box = box
         self.answer_lbls, self.answer_show = {}, {}
+        self.answer_cards = {}          # key -> (card, its "Show me ›")
         for i, (key, question) in enumerate(self.ANSWERS):
             card = tk.Frame(box, bg="#f6f7fa", padx=12, pady=8,
                             highlightbackground="#e0e2e8",
@@ -43920,6 +43922,7 @@ class DashboardTab(BaseTab):
             card.bind("<Configure>", lambda e, lb=a: self._fit_answer(
                 lb, e.width), add="+")
             self.answer_lbls[key] = a
+            self.answer_cards[key] = (card, more)
             box.columnconfigure(i, weight=1, uniform="answer")
         self.honest_lbl = tk.Label(outer, text="", bg=WHITE, fg="#666666",
                                    anchor="w", justify="left",
@@ -44029,6 +44032,25 @@ class DashboardTab(BaseTab):
             if abs(int(float(str(lbl.cget("wraplength")) or 0)) - want) > 4:
                 lbl.configure(wraplength=want)
 
+    def _answer_usable(self, key, on):
+        """Seventh audit (kbd): an answer with nothing to show ("Is
+        anything wrong?" before anything is watched: "Can't tell yet …
+        Press Start watching") kept its card a Tab stop with a "Show me ›"
+        that Return, Space and a click all did nothing for. Such a card
+        is now left out of Tab and loses its "Show me ›" and hand
+        pointer until it has something to show."""
+        card, more = self.answer_cards.get(key, (None, None))
+        if card is None:
+            return
+        with contextlib.suppress(tk.TclError):
+            if str(card.cget("takefocus")) != ("1" if on else "0"):
+                card.configure(takefocus=1 if on else 0,
+                               cursor="hand2" if on else "")
+            if on and not more.winfo_manager():
+                more.pack(anchor="w")
+            elif not on and more.winfo_manager():
+                more.pack_forget()
+
     def _answer_show(self, key):
         fn = self.answer_show.get(key)
         if fn is not None:
@@ -44040,6 +44062,7 @@ class DashboardTab(BaseTab):
         for key, _q in self.ANSWERS:
             text, kind, show = got[key]
             self.answer_show[key] = show
+            self._answer_usable(key, show is not None)
             lbl = self.answer_lbls[key]
             fg = self.ANSWER_FG.get(kind, "#222222")
             table = PALETTES[palette_name(app.theme_name,
@@ -112967,42 +112990,149 @@ def _a6_plain_stop(w):
         return False
 
 
+def _a6_hex(w, colour):
+    r, g, b = (x // 257 for x in w.winfo_rgb(colour))
+    return "#%02x%02x%02x" % (r, g, b)
+
+
+def _a6_ring(w):
+    """Seventh audit (kbd): how a focused Label or Frame shows it has the
+    keyboard: (thickness, ring colour) when a ring can be seen (2 pixels
+    or more, 3:1 against the widget's own background, WCAG 1.4.11),
+    else None. A plain Label or Frame with keys but no ring is an
+    invisible stop all the same."""
+    try:
+        th = int(str(w.cget("highlightthickness")))
+        ring = _a6_hex(w, w.cget("highlightcolor"))
+        bg = _a6_hex(w, w.cget("background"))
+    except (tk.TclError, ValueError):
+        return None
+    if th < 2 or wcag_contrast(ring, bg) < 3:
+        return None
+    return th, ring
+
+
+def _a6_ring_goes(w, focused):
+    """The ring `focused` (from _a6_ring) is gone, or changed so it can
+    be told apart, once the focus has left `w`."""
+    try:
+        th = int(str(w.cget("highlightthickness")))
+        rest = _a6_hex(w, w.cget("highlightbackground"))
+    except (tk.TclError, ValueError):
+        return False
+    return th < focused[0] or wcag_contrast(rest, focused[1]) >= 3
+
+
+def _a6_walk(app, name, bad, seen):
+    """Tab from the search box round the main window once, on tab
+    `name`: every Label or Frame it lands on needs Return or Space and a
+    ring that can be seen, which goes when the focus leaves. -> stops"""
+    root = app.root
+    app.search_entry.focus_force()
+    _gui_pump(root, 0.05)
+    walked, last = 0, None
+    for _ in range(160):
+        w = root.focus_get()
+        if w is None:
+            break
+        w.event_generate("<Tab>")
+        _gui_pump(root, 0.01)
+        f = root.focus_get()
+        if last is not None and last[0] is not f and \
+                not _a6_ring_goes(*last):
+            bad.append((name, "ring stays", str(last[0])[-50:]))
+        last = None
+        if f is None or f is app.search_entry:
+            break
+        walked += 1
+        txt = ""
+        with contextlib.suppress(tk.TclError):
+            txt = str(f.cget("text"))[:30]
+        if _a6_plain_stop(f):
+            bad.append((name, f.winfo_class(), str(f)[-50:], txt))
+        elif f.winfo_class() in _A6_PLAIN:
+            ring = _a6_ring(f)
+            if ring is None:
+                bad.append((name, "no ring", f.winfo_class(),
+                            str(f)[-50:], txt))
+            else:
+                seen.add(str(f))
+                last = (f, ring)
+    return walked
+
+
 @gui_test_step("sixth audit kbd: Tab through the main window, every tab, "
                "lands only on things you can use (never a plain Label or "
                "Frame)")
 def gt_a6_tab_stops_usable(app, ctx):
+    """Seventh audit (kbd): still "a bare Label and two Frames" from the
+    search box on the Dashboard: the tab strip's label and the first two
+    answer cards. Each runs something from Return and Space and draws a
+    2-pixel ring (checked here, in both themes and both modes), and an
+    answer card with nothing to show is no longer a stop."""
     root = app.root
     mode = app.mode_ui_var.get()
-    bad, walked = [], 0
+    theme0, hc0 = app.theme_name, app.high_contrast
+    dash = app.tabs["dash"]
+    bad, seen, walked = [], set(), 0
     try:
-        app.mode_ui_var.set("Advanced")
-        app._on_ui_mode_change()
-        _gui_pump(root, 0.4)
-        for name in list(app.tabs):
-            app._select_tab(name)
-            _gui_pump(root, 0.35)
-            app.search_entry.focus_force()
-            _gui_pump(root, 0.05)
-            for _ in range(160):
-                w = root.focus_get()
-                if w is None:
-                    break
-                w.event_generate("<Tab>")
-                _gui_pump(root, 0.01)
-                f = root.focus_get()
-                if f is None or f is app.search_entry:
-                    break
-                walked += 1
-                if _a6_plain_stop(f):
-                    txt = ""
-                    with contextlib.suppress(tk.TclError):
-                        txt = str(f.cget("text"))[:30]
-                    bad.append((name, f.winfo_class(), str(f)[-50:], txt))
-        assert walked > 40, walked
+        for ui, theme in (("Advanced", "Light"), ("Beginner", "Dark")):
+            app.mode_ui_var.set(ui)
+            app._on_ui_mode_change()
+            app._apply_theme(theme, False)
+            _gui_pump(root, 0.4)
+            for name in list(app.tabs):
+                app._select_tab(name)
+                _gui_pump(root, 0.35)
+                walked += _a6_walk(app, f"{ui}/{theme}/{name}", bad, seen)
+        assert walked > 80, walked
         assert not bad, bad[:10]
+        # the auditor's three stops were among those checked
+        strip = app.tabstrip.tabs[str(dash.frame)][2]
+        cards = [dash.answer_cards[k][0] for k, _q in dash.ANSWERS[:2]]
+        missed = [str(w) for w in [strip] + cards if str(w) not in seen]
+        assert not missed, ("not reached by Tab", missed)
+        # Return on an answer card runs its "Show me"
+        app._select_tab("dash")
+        _gui_pump(root, 0.3)
+        shown = []
+        show0 = dict(dash.answer_show)
+        try:
+            for key, card in zip(("wrong", "usage"), cards):
+                dash.answer_show[key] = lambda k=key: shown.append(k)
+                card.focus_force()
+                _gui_pump(root, 0.05)
+                card.event_generate("<Return>")
+                _gui_pump(root, 0.05)
+        finally:
+            dash.answer_show.update(show0)
+        assert shown == ["wrong", "usage"], shown
+        # an answer with nothing to show ("Can't tell yet …") is not a
+        # stop and has no "Show me ›"; it is again once it has one
+        app.answer_wrong = lambda: ("Can't tell yet.", "muted", None)
+        try:
+            app._answers = None
+            dash._refresh_answers()
+            _gui_pump(root, 0.2)
+            card, more = dash.answer_cards["wrong"]
+            assert str(card.cget("takefocus")) == "0" and \
+                not more.winfo_manager(), (card.cget("takefocus"),
+                                           more.winfo_manager())
+            seen.clear()
+            _a6_walk(app, "dash, nothing to show", bad, seen)
+            assert str(card) not in seen and not bad, (bad, str(card))
+            assert str(cards[1]) in seen, sorted(seen)
+        finally:
+            del app.answer_wrong
+            app._answers = None
+            dash._refresh_answers()
+            _gui_pump(root, 0.2)
+        assert str(card.cget("takefocus")) == "1" and \
+            more.winfo_manager(), card.cget("takefocus")
     finally:
         app.mode_ui_var.set(mode)
         app._on_ui_mode_change()
+        app._apply_theme(theme0, hc0)
         _gui_pump(root, 0.3)
 
 
