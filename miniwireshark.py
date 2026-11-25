@@ -1999,6 +1999,40 @@ def _pid_alive(pid):
     return True
 
 
+def _pid_gone(pid):
+    """True only when it is certain that no process has this id: the
+    system said there is none (_pid_alive also says False when it can't
+    tell). Round 6: a temporary file whose writer is gone is removed at
+    any age, so a doubt must keep it."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if IS_WINDOWS:
+        try:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = k.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFO
+            if not h:
+                return ctypes.get_last_error() == 87   # no such process
+            try:
+                code = ctypes.c_ulong()
+                ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+            finally:
+                k.CloseHandle(h)
+            return bool(ok) and code.value != 259    # not STILL_ACTIVE
+        except (AttributeError, OSError):
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 class BootReceipt:
     """One small JSON file per start: what ran, how long it took, what
     failed (with the exact error). Written after every step, so even a hard
@@ -28963,12 +28997,15 @@ class Store:
                 # day, so switching back and forth with 3.0.0 doesn't copy
                 # the whole file on every start
                 try:
-                    dst = sqlite3.connect(bak + ".tmp")
+                    # round 6: the writer's process id in the name, so a
+                    # copy cut short is swept (sweep_stale_temp_files)
+                    tmp = _tmp_name(bak)
+                    dst = sqlite3.connect(tmp)
                     try:
                         con.backup(dst)
                     finally:
                         dst.close()
-                    os.replace(bak + ".tmp", bak)
+                    os.replace(tmp, bak)
                 except (sqlite3.Error, OSError) as e:
                     LOG.warning("history backup before migrating: %s", e)
         for v in range(ver + 1, STORE_SCHEMA_VERSION + 1):
@@ -29044,10 +29081,13 @@ class Store:
         if age < 20 * 3600:
             return
         try:
-            dst = sqlite3.connect(bak + ".tmp")
-            con.backup(dst)
-            dst.close()
-            os.replace(bak + ".tmp", bak)
+            tmp = _tmp_name(bak)       # round 6: swept if cut short
+            dst = sqlite3.connect(tmp)
+            try:
+                con.backup(dst)
+            finally:
+                dst.close()
+            os.replace(tmp, bak)
         except (sqlite3.Error, OSError) as e:
             LOG.info("history backup skipped: %s", e)
 
@@ -30219,6 +30259,8 @@ def remove_history_copies(path, live_too=False):
     import glob
     files = [path + ".bak", path + ".bak.tmp"] + \
         glob.glob(glob.escape(path) + ".v*.bak") + \
+        glob.glob(glob.escape(path) + ".bak.tmp*") + \
+        glob.glob(glob.escape(path) + ".v*.bak.tmp*") + \
         glob.glob(glob.escape(path) + ".corrupt-*")
     if live_too:
         files += [path, path + "-wal", path + "-shm"]
@@ -70976,29 +71018,43 @@ def publish_crash_copy(part, path, cancelled=None, lock=None):
 
 STALE_TMP_AGE = 6 * 3600
 # what MiniWireshark itself leaves when a write is cut short: the
-# temporary file of an atomic write (_tmp_name), the crash copy's part
-# and a restored session's part (5.3.4 and earlier)
-_STALE_TMP_RE = re.compile(r"\.tmp(\d+)-\d+$|"
+# temporary file of an atomic write (_tmp_name; round 6: also the history
+# backup's, with sqlite's -journal beside it), the crash copy's part, a
+# restored session's part (5.3.4 and earlier) and (round 6) the compiled
+# copy's <name>.pyc.<pid>.tmp and the history backup's temporary file of
+# 5.3.4 and earlier (a fixed name, without the writer's process id)
+_STALE_TMP_RE = re.compile(r"\.tmp(\d+)-\d+(?:-journal)?$|"
                            r"^journal\.mwsession\.json\.(\d+)\.part$|"
-                           r"^restored\.mwsession\.json\.part$")
-STALE_TMP_FOLDERS = ("", "sessions", "cache", "logs")
+                           r"^restored\.mwsession\.json\.part$|"
+                           r"\.pyc\.(\d+)\.tmp$|"
+                           r"^history\.sqlite3(?:\.v\d+)?\.bak\.tmp"
+                           r"(?:-journal)?$")
+STALE_TMP_FOLDERS = ("", "sessions", "cache", "logs",
+                     os.path.join("cache", "bytecode"))
 
 
 def sweep_stale_temp_files(folder=None, now=None, age=STALE_TMP_AGE):
     """Round 4: temporary files that an interrupted write left in the data
     folder (18 MB of session data after 25 kills) were never removed.
     Only the names MiniWireshark makes, only in its own data folder and
-    its sessions, cache and logs folders, only regular files untouched
-    for `age` seconds whose writer isn't running; a link is never
-    followed or removed. -> the removed paths."""
+    its sessions, cache, logs and compiled-copy folders, only regular
+    files untouched for `age` seconds whose writer isn't running; a link
+    is never followed or removed. Round 6: a file that names its writer's
+    process id goes at any age once that process is certainly gone, and
+    never while it runs; one written by this process, or one without an
+    id, only after `age`. -> the removed paths."""
     folder = folder or PATHS.data
     now = time.time() if now is None else now
     gone = []
     for sub in STALE_TMP_FOLDERS:
-        d = os.path.join(folder, sub) if sub else folder
+        d = folder
         try:
-            if not stat.S_ISDIR(os.lstat(d).st_mode):
-                continue                         # a link: not followed
+            # round 6: every folder on the way (cache/bytecode), not only
+            # the last, so a linked cache folder isn't gone through
+            for part in [""] + (sub.split(os.sep) if sub else []):
+                d = os.path.join(d, part) if part else d
+                if not stat.S_ISDIR(os.lstat(d).st_mode):
+                    raise NotADirectoryError(d)  # a link: not followed
             with os.scandir(d) as it:
                 entries = list(it)
         except OSError:
@@ -71011,11 +71067,14 @@ def sweep_stale_temp_files(folder=None, now=None, age=STALE_TMP_AGE):
                 st = e.stat(follow_symlinks=False)
             except OSError:
                 continue
-            if not stat.S_ISREG(st.st_mode) or now - st.st_mtime < age:
+            if not stat.S_ISREG(st.st_mode):
                 continue
-            pid = m.group(1) or m.group(2)
-            if pid and int(pid) != os.getpid() and _pid_alive(pid):
-                continue
+            pid = m.group(1) or m.group(2) or m.group(3)
+            if pid and int(pid) != os.getpid():
+                if not _pid_gone(pid):
+                    continue                     # running, or can't tell
+            elif now - st.st_mtime < age:
+                continue                         # ours, or no id: 6 hours
             with contextlib.suppress(OSError):
                 os.remove(e.path)
                 gone.append(e.path)
@@ -109279,7 +109338,12 @@ def t_r4_stale_temp_files_swept(ctx):
     session data after 25 kills) are removed at start: only the names
     MiniWireshark makes, only in its own data folder and its sessions,
     cache and logs folders, only when untouched for 6 hours and their
-    writer isn't running, never through or of a link."""
+    writer isn't running, never through or of a link.
+    Round 6: also the history backup's temporary file (and sqlite's
+    -journal beside it) and the compiled copy's .pyc.<pid>.tmp, which
+    were missed; and a file whose writer's process is gone goes at any
+    age (a crash copy cut short stayed 6 hours), while one whose writer
+    still runs is never removed."""
     d = ctx.path(f"r4_sweep_{uuid.uuid4().hex[:6]}")
     outside = ctx.path(f"r4_outside_{uuid.uuid4().hex[:6]}")
     for sub in ("sessions", "logs", "packets"):
@@ -109295,19 +109359,37 @@ def t_r4_stale_temp_files_swept(ctx):
                           f".tmp{gone_pid}-7"),
              os.path.join(d, "sessions", "restored.mwsession.json.part"),
              os.path.join(d, f"config.json.tmp{gone_pid}-1"),
-             os.path.join(d, "logs", f"x.json.tmp{gone_pid}-2")]
+             os.path.join(d, "logs", f"x.json.tmp{gone_pid}-2"),
+             # round 6: the history backup, now and as 5.3.4 named it
+             os.path.join(d, f"history.sqlite3.bak.tmp{gone_pid}-9"),
+             os.path.join(d, f"history.sqlite3.bak.tmp{gone_pid}-9-journal"),
+             os.path.join(d, "history.sqlite3.bak.tmp"),
+             os.path.join(d, "history.sqlite3.v3.bak.tmp-journal")]
+    young = [os.path.join(d, "sessions", f"autosave.mwsession.json.tmp"
+                          f"{gone_pid}-3"),      # recent, but its writer
+             os.path.join(d, "sessions", f"journal.mwsession.json."  # gone
+                          f"{gone_pid}.part"),
+             os.path.join(d, "sessions", f"journal.mwsession.json.sha256"
+                          f".tmp{gone_pid}-11")]
+    stale = stale[:1] + stale[2:]         # the .part is a young one now
+    alive = os.getppid()
     kept = [os.path.join(d, "sessions", f"autosave.mwsession.json.tmp"
-                         f"{gone_pid}-3"),               # too recent
-            os.path.join(d, f"networks.json.tmp{os.getppid()}-4"),  # alive
+                         f"{os.getpid()}-3"),     # ours, and too recent
+            os.path.join(d, f"networks.json.tmp{alive}-4"),  # alive
+            os.path.join(d, "history.sqlite3.v2.bak.tmp"),   # no id: recent
+            os.path.join(d, "sessions", f"autosave.mwsession.json.tmp"
+                         f"{alive}-4"),           # alive, recent
+            os.path.join(d, f"history.sqlite3.bak.tmp{alive}-9"),
             os.path.join(d, "sessions", "my notes.tmp"),
             os.path.join(d, "geo.mmdb.part"),        # a download resumes
             os.path.join(d, "packets", f"seg-1.pcap.tmp{gone_pid}-5"),
             os.path.join(d, "sessions", "journal.mwsession.json"),
             os.path.join(outside, f"a.json.tmp{gone_pid}-6")]
-    for p_ in stale + kept:
+    recent = set(young + kept[:1] + kept[2:4])
+    for p_ in stale + young + kept:
         with open(p_, "w", encoding="utf-8") as f:
             f.write("{}")
-        if p_ != kept[0]:
+        if p_ not in recent:
             os.utime(p_, (old, old))
     links = []
     if hasattr(os, "symlink") and not IS_WINDOWS:
@@ -109319,12 +109401,66 @@ def t_r4_stale_temp_files_swept(ctx):
         os.symlink(victim, links[0])
         os.symlink(outside, os.path.join(d, "cache"))  # a linked folder
         kept.append(victim)
+        # nor through it into the compiled-copy folder inside
+        os.makedirs(os.path.join(outside, "bytecode"))
+        kept.append(os.path.join(outside, "bytecode",
+                                 f"m.cpython-312.pyc.{gone_pid}.tmp"))
+        with open(kept[-1], "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.utime(kept[-1], (old, old))
     gone = sweep_stale_temp_files(d)
-    assert sorted(gone) == sorted(stale), (gone, stale)
+    assert sorted(gone) == sorted(stale + young), (gone, stale + young)
     left = [p_ for p_ in kept + links if not os.path.lexists(p_)]
     assert not left, left
-    assert not any(os.path.exists(p_) for p_ in stale)
+    assert not any(os.path.exists(p_) for p_ in stale + young)
     assert sweep_stale_temp_files(os.path.join(d, "no-such")) == []
+    # the compiled copy (keep_compiled_copy writes <it>.<pid>.tmp first)
+    # is where the sweep looks
+    assert os.path.dirname(compiled_copy_path()) == os.path.join(
+        PATHS.data, "cache", "bytecode")
+    d2 = ctx.path(f"r6_sweep_{uuid.uuid4().hex[:6]}")
+    bc = os.path.join(d2, "cache", "bytecode")
+    os.makedirs(bc)
+    pyc = os.path.basename(compiled_copy_path())
+    swept = [os.path.join(bc, f"{pyc}.{gone_pid}.tmp"),
+             os.path.join(bc, f"x-0123456789ab.cpython-38.pyc.{gone_pid}"
+                          f".tmp")]
+    stays = [os.path.join(bc, f"{pyc}.{alive}.tmp"), os.path.join(bc, pyc)]
+    for p_ in swept + stays:
+        with open(p_, "w", encoding="utf-8") as f:
+            f.write("{}")
+    os.utime(swept[0], (old, old))
+    os.utime(stays[0], (old, old))
+    assert sorted(sweep_stale_temp_files(d2)) == sorted(swept)
+    assert all(os.path.exists(p_) for p_ in stays)
+    # the nightly history backup, cut short, names its writer now
+    import sqlite3
+
+    class CutShort:
+        def backup(self, dst):
+            dst.execute("CREATE TABLE t(x)")
+            raise sqlite3.Error("cut short")
+    hist = os.path.join(d2, "history.sqlite3")
+    Store._backup_if_due(types.SimpleNamespace(path=hist), CutShort())
+    left = [f_ for f_ in os.listdir(d2) if f_.startswith("history")]
+    assert len(left) == 1 and _STALE_TMP_RE.search(left[0]) and \
+        _STALE_TMP_RE.search(left[0]).group(1) == str(os.getpid()), left
+    assert sweep_stale_temp_files(d2) == []        # ours, and recent
+    # gone only when certain
+    assert _pid_gone(gone_pid) and not _pid_gone(alive) and \
+        not _pid_gone(os.getpid()) and not _pid_gone("x") and \
+        not _pid_gone(0)
+    if not IS_WINDOWS:          # the system can't tell: the file stays
+        import unittest.mock
+        doubt = os.path.join(bc, f"{pyc}.{gone_pid}.tmp")
+        with open(doubt, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.utime(doubt, (old, old))
+        with unittest.mock.patch.object(os, "kill",
+                                        side_effect=OSError(5, "I/O")):
+            assert not _pid_gone(gone_pid)
+            assert sweep_stale_temp_files(d2) == []
+        assert os.path.exists(doubt)
 
 
 @self_test()
