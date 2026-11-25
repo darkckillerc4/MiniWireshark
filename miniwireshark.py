@@ -113126,6 +113126,13 @@ def gt_a6_tab_stops_usable(app, ctx):
                 # until the card has it
                 _gui_pump(root, 0.05, until=lambda c=card:
                           root.focus_get() is c, timeout=3)
+                if root.focus_get() is not card and root.focus_get():
+                    # (Windows CI) a card further down the Dashboard did
+                    # not take the focus that way: Tab there, as a person
+                    # would, from the card before it
+                    root.focus_get().event_generate("<Tab>")
+                    _gui_pump(root, 0.05, until=lambda c=card:
+                              root.focus_get() is c, timeout=3)
                 assert root.focus_get() is card, (key, root.focus_get())
                 card.event_generate("<Return>")
                 _gui_pump(root, 0.05)
