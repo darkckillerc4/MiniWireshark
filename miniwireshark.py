@@ -10244,8 +10244,8 @@ def _ipv6_upper(ipl):
 _LOGIN_FIELD = (rb"(?:password|passwd|passwort|kennwort|pass|pwd|pw|"
                 rb"user_?pass|login_?password|motdepasse|mot_de_passe|"
                 rb"contrase(?:%c3%b1|\xc3\xb1|n)a|senha)")
-_LOGIN_FORM_RX = re.compile(rb"(?:^|[&\s])" + _LOGIN_FIELD + rb"=[^&\s]",
-                            re.I)
+_LOGIN_FORM_RX = re.compile(rb"(?:^|[&\s])(" + _LOGIN_FIELD +
+                            rb")=[^&\s]", re.I)
 _LOGIN_JSON_RX = re.compile(rb"\"" + _LOGIN_FIELD + rb"\"\s*:\s*\"[^\"]",
                             re.I)
 _LOGIN_PART_RX = re.compile(rb"name=\"" + _LOGIN_FIELD + rb"\"", re.I)
@@ -10257,11 +10257,32 @@ _LOGIN_FORM_TYPES = (b"x-www-form-urlencoded", b"multipart/form-data",
                      b"application/json")
 
 
+# sixth audit: "pass=2&page=3" (a page or round number) was a login.
+# A field named only "pass" whose value is a number of 1 to 3 digits is
+# not taken for a password. "#" stands for such a digit while the rest of
+# the body is awaited (login_form_tail keeps no value, only its length)
+_LOGIN_COUNTER_RX = re.compile(rb"[0-9#]{1,3}(?:[&\s]|\Z)")
+_LOGIN_COUNTER_END_RX = re.compile(rb"(?:^|([&\s]))(pass)=([0-9#]{1,3})\Z",
+                                   re.I)
+
+
+def form_password_field(body):
+    """True when a form body (or a web address's query, after "&") has a
+    password field with a value. Not "pass" with a 1 to 3 digit number
+    (sixth audit: pass=2&page=3)."""
+    for m in _LOGIN_FORM_RX.finditer(body):
+        if m.group(1).lower() == b"pass" and \
+                _LOGIN_COUNTER_RX.match(body, m.end() - 1):
+            continue
+        return True
+    return False
+
+
 def http_form_login(body):
     """"a password field in a web form" when a request body carries a
     password field with a value, else ""."""
     body = body[:4096]
-    if _LOGIN_FORM_RX.search(body) or _LOGIN_JSON_RX.search(body) or \
+    if form_password_field(body) or _LOGIN_JSON_RX.search(body) or \
             _LOGIN_PART_RX.search(body):
         return "a password field in a web form"
     return ""
@@ -10290,7 +10311,14 @@ def login_form_tail(buf, whole=False):
     packet is awaited: only bytes that can still grow into the start of
     a password field ("&pass", 'name="pass', '"password": "'), never a
     value or another field. `whole`: buf starts at the body's start (a
-    field may start there without "&"). -> bytes, at most 64."""
+    field may start there without "&"). -> bytes, at most 64. Sixth
+    audit: "&pass=2" at the end may be a page number or a password's
+    first digits: it waits as "&pass=#", one "#" for each digit, so no
+    digit of it is kept."""
+    m = _LOGIN_COUNTER_END_RX.search(buf)
+    if m is not None and (m.group(1) or whole):
+        return (m.group(1) or b"") + m.group(2) + b"=" + \
+            b"#" * len(m.group(3))
     lo = buf.lower()
     for s in range(max(0, len(lo) - 64), len(lo)):
         c = lo[s:]
@@ -10317,12 +10345,16 @@ def _login_in_packet(d, load):
         how = ""
         if _LOGIN_BASIC_RX.search(head):
             how = "HTTP Basic sign-in"
-        elif _LOGIN_QUERY_RX.match(head.split(b"\n", 1)[0]):
+        elif _LOGIN_QUERY_RX.match(head.split(b"\n", 1)[0]) and \
+                form_password_field(b"&" + head.split(b"\n", 1)[0].split(
+                    b" ", 2)[1].split(b"?", 1)[-1]):
             how = "a password in the web address"
         elif head[:4] in (b"POST", b"PUT ", b"PATC"):
             cut = head.find(b"\r\n\r\n")
             cut, skip = (cut, 4) if cut >= 0 else (head.find(b"\n\n"), 2)
             if cut < 0:
+                # sixth audit: the headers go on in the next packet
+                d["form_head"] = True
                 return
             body = head[cut + skip:]
             how = http_form_login(body)
@@ -10342,12 +10374,20 @@ def _login_in_packet(d, load):
         d["login"], d["login_proto"] = "LOGIN command", "IMAP"
 
 
+# sixth audit: a request split inside its method ("PO" + "ST /login …",
+# or one byte a packet) was never looked at
+_FORM_METHODS = (b"POST ", b"PUT ", b"PATCH ")
+
+
 def _decode_tcp_payload(d, load, reasm):
     if FEATURES.get("login_warning", True) and (
             load[:5] in (b"PASS ", b"pass ") or load[:4] in (
                 b"GET ", b"POST", b"PUT ", b"PATC") or (
                 d.get("dport") == 143 and b" LOGIN " in load[:256].upper())):
         _login_in_packet(d, load)
+    elif 0 < len(load) < 6 and FEATURES.get("login_warning", True) and \
+            any(m.startswith(load) for m in _FORM_METHODS):
+        d["form_head"] = "prefix"
     # plain HTTP?
     if load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
                     b"OPTI", b"PATC", b"CONN") or load[:5] == b"HTTP/":
@@ -18587,7 +18627,8 @@ class AlertEngine:
                 return None
             f = self._rogue_fields(servers, rogue)
             return self._add("dhcp_anomaly", "DANGER", "", f[0], f[1], f[2],
-                             f[3], confidence="High", why=f[4],
+                             f[3], confidence="High" if rogue[5:6] != (
+                                 False,) else "Medium", why=f[4],
                              evidence=f[5], refs=f[6])
         if self._debounced("dhcp_anomaly", 300):
             return None
@@ -18605,8 +18646,31 @@ class AlertEngine:
     @staticmethod
     def _rogue_fields(servers, rogue):
         """(reason, observed, interpretation, explanations, why, evidence,
-        refs) of a second DHCP server handing out a different router."""
-        srv, router, dns, good, good_router = rogue
+        refs) of a second DHCP server handing out a different router.
+        Sixth audit: when nothing showed which one is real (rogue[5] is
+        False), neither is called the usual one."""
+        srv, router, dns, good, good_router = rogue[:5]
+        if rogue[5:6] == (False,):
+            return (
+                f"Two devices hand out addresses and different routers: "
+                f"{good} and {srv}",
+                f"{len(servers)} different DHCP servers seen: "
+                f"{', '.join(sorted(servers))}. {good} gives {good_router} "
+                f"as the router and {srv} gives {router}. Nothing in what "
+                f"was seen shows which router the Internet traffic really "
+                f"goes through, so neither is taken as your router.",
+                "One of them may be a device pretending to be your router: "
+                "devices that take an address from it send their Internet "
+                "traffic and name lookups through it.",
+                "A second router or a travel router plugged in by mistake "
+                "does the same. If you don't recognise that device, unplug "
+                "it and reconnect your devices.",
+                "Two DHCP servers named different routers, and nothing "
+                "showed which one is real.",
+                [f"DHCP server: {good}", f"Router it gives: {good_router}",
+                 f"DHCP server: {srv}", f"Router it gives: {router}"] +
+                ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
+                {"remote": srv, "sure": False})
         selfish = [w for w, on in (("router", router == srv),
                                     ("DNS server", srv in dns)) if on]
         tail = (" It names itself as the " + " and the ".join(selfish)
@@ -18632,7 +18696,7 @@ class AlertEngine:
             [f"DHCP server: {srv}", f"Router it gives: {router}",
              f"Usual router: {good_router}"] +
             ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
-            {"remote": srv})
+            {"remote": srv, "sure": True})
 
     def dhcp_impostor(self, imp):
         """Fourth audit: DHCP answers that carry one server address (your
@@ -19143,14 +19207,56 @@ class AlertEngine:
             refs={"most": n})
 
     # ---- second audit 2026-11-14 (#33, #35, #36) ---------------------------
-    def night_upload(self, dev, total, minutes, dest, service="", start=0.0):
+    def night_upload(self, dev, total, minutes, dest, service="", start=0.0,
+                     kind="backup"):
         """A device sent a lot to the Internet at night, more than twice
         what it ever sent in a night hour before. A known backup service
         (iCloud, Dropbox…) is said, and only an INFO: kept out of Unusual
-        activity, since phones and computers back up at night."""
+        activity, since phones and computers back up at night. Sixth
+        audit: so is a known call service (`kind` "call": Zoom, Teams…) or
+        video site ("video": YouTube, Vimeo) that the server's name came
+        from, and an upload by a device you marked as a NAS ("nas", no
+        service: its offsite backup)."""
         if self._debounced(f"nightup:{dev.key}", 6 * 3600):
             return None
         size = _human_bytes(total)
+        name = dev.display_name()
+        if service and kind in ("call", "video"):
+            call = kind == "call"
+            return self._add(
+                "night_upload", "INFO", dev.key,
+                f"{name} was on a call at night ({service})" if call else
+                f"{name} uploaded a video at night ({service})",
+                f"At night it sent {size} to {dest} in {minutes} minutes. "
+                f"That is {service}, " +
+                ("a video and voice call service." if call else
+                 "a video site."),
+                "This looks like a video or voice call." if call else
+                "This looks like a video upload.",
+                "A call sends your picture and sound for as long as it "
+                "lasts." if call else
+                "Phones and computers often upload videos while they "
+                "charge at night.",
+                confidence="Medium",
+                why="Most of the data went to a known call service, looked "
+                    "up by name." if call else
+                    "Most of the data went to a known video site, looked "
+                    "up by name.",
+                evidence=[f"Sent: {size}", f"To: {dest}"],
+                refs={"explained": service, "start": start})
+        if not service and kind == "nas":
+            return self._add(
+                "night_upload", "INFO", dev.key,
+                f"{name} sent {size} at night (you marked it as a NAS)",
+                f"At night it sent {size} to {dest} in {minutes} minutes. "
+                f"You marked this device as a NAS.",
+                "This looks like a NAS copying its backup to the Internet.",
+                "A NAS often copies its backup to a cloud service at night. "
+                "It matters if you never set that up.",
+                confidence="Low",
+                why="You marked this device as a NAS.",
+                evidence=[f"Sent: {size}", f"To: {dest}"],
+                refs={"explained": "nas", "start": start})
         if service:
             return self._add(
                 "night_upload", "INFO", dev.key,
@@ -24275,7 +24381,24 @@ KNOWN_BULK_SERVICES = (
     ("dssott.com", "Disney+", "stream"),
     ("aiv-cdn.net", "Prime Video", "stream"),
     ("scdn.co", "Spotify", "stream"),
+    # sixth audit: a call (Zoom at 23:10) or a video upload (YouTube at
+    # 03:00) sends a lot at night too. Said as one only when the server's
+    # name came from a DNS answer (NetworkModel.dns_names)
+    ("zoom.us", "Zoom", "call"),
+    ("zoom.com", "Zoom", "call"),
+    ("zoomgov.com", "Zoom", "call"),
+    ("teams.microsoft.com", "Microsoft Teams", "call"),
+    ("skype.com", "Skype", "call"),
+    ("webex.com", "Webex", "call"),
+    ("meet.google.com", "Google Meet", "call"),
+    ("discord.media", "Discord", "call"),
+    ("whatsapp.net", "WhatsApp", "call"),
+    ("youtube.com", "YouTube", "video"),
+    ("vimeo.com", "Vimeo", "video"),
 )
+# the kinds a night upload may be said as (kind=None in known_bulk_service
+# still finds a stream first: youtube.com is in both)
+NIGHT_UPLOAD_KINDS = ("backup", "call", "video")
 NIGHT_UPLOAD_BYTES = 20 * 1024 * 1024   # sent in one night hour
 NIGHT_UPLOAD_WINDOW = 3600.0
 BEACON_MIN_CONTACTS = 30
@@ -24503,6 +24626,10 @@ class NetworkModel:
         # SNI, HTTP Host), never from a DNS answer: anyone can write
         # "icloud-content.com" there
         self.ip_unconfirmed = {}
+        # sixth audit: a request whose method or headers go on in the
+        # next packet: key4 -> (time, method so far or None, the end that
+        # may still become a header end or a form type, form seen, bytes)
+        self._head_wait = OrderedDict()
         self._form_wait = OrderedDict()  # (#34) a form POST's body next
         self._dup_pending = OrderedDict()  # (#39) address → (ts, MAC)
         # (ts, rtt, remote, dev, fid)
@@ -25397,8 +25524,9 @@ class NetworkModel:
         self._observe_remote(d, ts, direction, src_dev, dst_dev, new_flow)
         if d["cleartext"]:
             self._observe_cleartext(d, src_dev, dst_dev, direction)
-        if d.get("login") or d.get("form_post") or (
-                self._form_wait and d.get("payload_len")):
+        if d.get("login") or d.get("form_post") or d.get("form_head") or (
+                (self._form_wait or self._head_wait) and
+                d.get("payload_len")):
             self._observe_login(d)
         self._baseline_observe(d, ts, src_dev, dst_dev, direction, flow,
                                new_flow)
@@ -26487,21 +26615,25 @@ class NetworkModel:
         key4 = (d["src_ip"], d["sport"], d["dst_ip"], d["dport"])
         how, proto = d.get("login") or "", d.get("login_proto") or "HTTP"
         fw = self._form_wait   # OrderedDict, oldest first: forget after 30 s
-        while fw and d["time"] - next(iter(fw.values()))[0] > 30:
-            fw.popitem(last=False)
-        if not how:
+        hw = self._head_wait
+        for od in (fw, hw):
+            while od and d["time"] - next(iter(od.values()))[0] > 30:
+                od.popitem(last=False)
+        fh = d.get("form_head")
+        if fh == "prefix" and key4 in fw:
+            fh = False                 # a body's next bytes ("P", "PU"…)
+        if d.get("form_post") or how:
+            hw.pop(key4, None)         # a request whose headers are whole
+        if not how and (fh or key4 in hw):
+            how = self._form_head(d, key4, fh)
+        elif not how:
             post = d.get("form_post")
             if not post and key4 not in fw:
                 return None
             # a new POST drops the old body
             _t, tail, seen = fw.pop(key4, (0, b"", 0))
             tail, seen = (b"", 0) if post else (tail, seen)
-            n = d.get("payload_len") or 0
-            raw = d.get("raw") or b""
-            if not raw and d.get("pkt") is not None:
-                with contextlib.suppress(Exception):
-                    raw = bytes(d["pkt"])          # scapy's decoder
-            load = bytes(raw[-n:][:4096]) if n else b""
+            load = self._login_load(d)
             if post:                               # the body after headers
                 cut = load.find(b"\r\n\r\n")
                 load = load[cut + 4:] if cut >= 0 else \
@@ -26509,23 +26641,107 @@ class NetworkModel:
             elif load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
                               b"OPTI", b"PATC"):
                 return None                        # the next request
-            load = load[:max(0, 4096 - seen)]  # the body's first 4096 bytes
-            whole = len(tail) == seen          # tail is the body so far
-            buf = tail + load
-            # not at the body's start: a field can't start at byte 0 (the
-            # byte before it was a value's), so "^" must not match there
-            how = http_form_login(buf if whole else b"\0" + buf)
-            if not how:
-                seen += len(load)
-                if seen < 4096:
-                    # fifth audit: only what may still become a password
-                    # field's start is kept, never the body itself
-                    self._bounded_put(self._form_wait, key4, (
-                        d["time"], login_form_tail(buf, whole), seen), 256)
-                return None
+            how = self._form_body(d, key4, tail, seen, load)
+        if not how:
+            return None
         return self.deep_login({"client": d["src_ip"],
                                 "server": d["dst_ip"], "port": d["dport"],
                                 "proto": proto, "how": how}, packet=True)
+
+    @staticmethod
+    def _login_load(d):
+        """The first 4096 bytes of a packet's TCP payload (read here,
+        never kept)."""
+        n = d.get("payload_len") or 0
+        raw = d.get("raw") or b""
+        if not raw and d.get("pkt") is not None:
+            with contextlib.suppress(Exception):
+                raw = bytes(d["pkt"])              # scapy's decoder
+        return bytes(raw[-n:][:4096]) if n else b""
+
+    def _form_body(self, d, key4, tail, seen, load):
+        """A form body's next bytes `load`, after `tail` (what waited) and
+        `seen` bytes of it → how a password went by, or "" (then only the
+        end that may still become a password field's start waits)."""
+        load = load[:max(0, 4096 - seen)]  # the body's first 4096 bytes
+        whole = len(tail) == seen          # tail is the body so far
+        buf = tail + load
+        # not at the body's start: a field can't start at byte 0 (the
+        # byte before it was a value's), so "^" must not match there
+        how = http_form_login(buf if whole else b"\0" + buf)
+        if not how:
+            seen += len(load)
+            if seen < 4096:
+                # fifth audit: only what may still become a password
+                # field's start is kept, never the body itself
+                self._bounded_put(self._form_wait, key4, (
+                    d["time"], login_form_tail(buf, whole), seen), 256)
+        return how
+
+    _HEAD_MARKS = (b"\r\n\r\n", b"\n\n") + _LOGIN_FORM_TYPES
+
+    def _form_head(self, d, key4, fh):
+        """Sixth audit: a POST split inside its method ("PO" + "ST …", one
+        byte a packet) or whose headers go on in the next packet was never
+        looked at. What waits (30 s at most, 256 requests) is the method
+        so far while it is shorter than "PATCH ", then only the end that
+        may still become the headers' end or a form type ("\r\n",
+        "multipart/fo"), whether a form type was seen and how many header
+        bytes went by: never a header's value. → how a password went by,
+        or ""."""
+        hw = self._head_wait
+        load = self._login_load(d)
+        st = hw.pop(key4, None)
+        if st is None or load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ",
+                                      b"DELE", b"OPTI", b"PATC"):
+            if not fh:
+                return ""                          # another request
+            self._form_wait.pop(key4, None)        # a new request
+            st = (0, b"", b"", False, 0)
+        _t, start, tail, form, n = st
+        if start is not None:                      # the method so far
+            buf = start + load
+            if not buf.startswith(_FORM_METHODS):
+                if len(buf) < 6 and any(m.startswith(buf)
+                                        for m in _FORM_METHODS):
+                    self._bounded_put(hw, key4, (d["time"], buf, b"",
+                                                 False, 0), 256)
+                return ""
+            if start:
+                # the method was split: the request so far, read at once
+                t = {"dport": d.get("dport")}
+                _login_in_packet(t, buf[:4096])
+                if t.get("login"):
+                    return t["login"]
+                if not t.get("form_head"):
+                    if not t.get("form_post"):
+                        return ""
+                    cut = buf.find(b"\r\n\r\n")
+                    body = buf[cut + 4:] if cut >= 0 else \
+                        buf[buf.find(b"\n\n") + 2:]
+                    return self._form_body(d, key4, b"", 0, body)
+            load = buf
+        low = (tail + load[:4096]).lower()
+        form = form or any(t in low for t in _LOGIN_FORM_TYPES)
+        cut = low.find(b"\r\n\r\n")
+        cut, skip = (cut, 4) if cut >= 0 else (low.find(b"\n\n"), 2)
+        if cut >= 0:
+            body = (tail + load)[cut + skip:]
+            if not form:
+                # not a web form: this packet's body only, as when the
+                # whole request comes in one packet (_login_in_packet)
+                return http_form_login(body[:4096])
+            return self._form_body(d, key4, b"", 0, body)
+        n += len(load)
+        if n < 4096:
+            keep = b""
+            for i in range(max(0, len(low) - 24), len(low)):
+                if any(m.startswith(low[i:]) for m in self._HEAD_MARKS):
+                    keep = low[i:]
+                    break
+            self._bounded_put(hw, key4, (d["time"], None, keep, form, n),
+                              256)
+        return ""
 
     def deep_login(self, t, packet=False):
         """5.3.4 (IP-013): a login the deep pass saw sent without
@@ -26651,12 +26867,18 @@ class NetworkModel:
         ep["told"] = True
         sent = sum(ep["to"].values()) or 1
         backup = 0
-        service = ""
+        service, skind = "", "backup"
         for ip, n in ep["to"].most_common():
-            hit = known_bulk_service(self.dns_names(ip), "backup")
+            names = self.dns_names(ip)
+            hit = None
+            for k in NIGHT_UPLOAD_KINDS:
+                hit = known_bulk_service(names, k)
+                if hit:
+                    break
             if hit:
                 backup += n
-                service = service or hit[0]
+                if not service:
+                    service, skind = hit
         top = ep["to"].most_common(1)
         top_ip = top[0][0] if top else ""
         names = self.ip_to_domains.get(top_ip)
@@ -26665,10 +26887,15 @@ class NetworkModel:
             dest += f" and {len(ep['to']) - 1} other servers" \
                 if len(ep["to"]) > 2 else " and 1 other server"
         minutes = mins[-1][0] - mins[0][0] + 1
+        if backup < 0.7 * sent:
+            service, skind = "", "backup"
+            # sixth audit: a NAS's first offsite backup was a warning. Only
+            # a device YOU marked as a NAS (a guessed kind can be wrong)
+            if dev.user_class == "NAS":
+                skind = "nas"
         return self._alert(self.alerts.night_upload(
-            dev, total, minutes, dest,
-            service if backup >= 0.7 * sent else "",
-            start=mins[0][0] * 60.0))
+            dev, total, minutes, dest, service, start=mins[0][0] * 60.0,
+            kind=skind))
 
     def _check_beacon(self, fk, starts, n, flow):
         """(#35) A device that opens a new connection to one server on a
@@ -27238,6 +27465,13 @@ class NetworkModel:
         default route decides even when the rogue was heard first (and with
         the packet clock); only a gateway guessed from a file's DHCP isn't
         ground truth."""
+        t = self._dhcp_trust()
+        return t[:2] if t is not None else None
+
+    def _dhcp_trust(self):
+        """(server, router, sure) for dhcp_trusted(); sure is False when
+        neither the default route nor the Internet traffic decided (the
+        first one heard was taken)."""
         offers = [(s, o) for s, o in self.dhcp_offers.items()
                   if o.get("router")]
         if not offers:
@@ -27245,7 +27479,7 @@ class NetworkModel:
         if self.gateway_ip and not self.gateway_guessed:
             for s, o in offers:
                 if o["router"] == self.gateway_ip:
-                    return s, o["router"]
+                    return s, o["router"], True
         # fifth audit: a capture file has no default route; the router
         # the Internet traffic really goes through decides (the rogue
         # heard first was trusted, and the real router accused)
@@ -27258,8 +27492,8 @@ class NetworkModel:
             if n and (best is None or n > best[0]):
                 best = (n, s, o["router"])
         if best is not None:
-            return best[1], best[2]
-        return offers[0][0], offers[0][1]["router"]
+            return best[1], best[2], True
+        return offers[0][0], offers[0][1]["router"], False
 
     def _note_dhcp_mac(self, server, mac, info):
         """Fourth audit: what each MAC answering as DHCP server `server`
@@ -27338,7 +27572,9 @@ class NetworkModel:
         rogue = self.dhcp_rogue()
         a = eng.alerts.get(eng._open.get(("dhcp_anomaly", ""), ""))
         if a is not None and rogue is not None and not a.acknowledged and \
-                a.severity == "DANGER" and a.refs.get("remote") != rogue[0]:
+                a.severity == "DANGER" and \
+                (a.refs.get("remote"), a.refs.get("sure", True)) != \
+                (rogue[0], rogue[5]):
             eng.rewrite(a, eng._rogue_fields(set(self.dhcp_servers), rogue))
         for s in list(self.dhcp_twins):
             imp = self.dhcp_impostor(s)
@@ -27355,17 +27591,31 @@ class NetworkModel:
 
     def dhcp_rogue(self):
         """Second audit (#37): (server, router, DNS servers, trusted server,
-        trusted router) of a second DHCP server that hands out a different
-        router than the trusted one, else None."""
-        trusted = self.dhcp_trusted()
+        trusted router, sure) of a second DHCP server that hands out a
+        different router than the trusted one, else None. Sixth audit:
+        `sure` is False when nothing showed which one is real (a file with
+        only DHCP in it): then neither is called the usual one."""
+        trusted = self._dhcp_trust()
         if trusted is None:
             return None
         for s, o in self.dhcp_offers.items():
             if s != trusted[0] and o.get("router") and \
                     o["router"] != trusted[1]:
                 return s, o["router"], list(o.get("dns") or []), \
-                    trusted[0], trusted[1]
+                    trusted[0], trusted[1], trusted[2]
         return None
+
+    def drop_unsure_gateway(self):
+        """Sixth audit: reading a file, a router guessed earlier (the rogue
+        DHCP server's, heard first in a file with only DHCP in it) is
+        dropped once two DHCP servers hand out different routers and
+        nothing shows which one is real. → True when it was dropped."""
+        rogue = self.dhcp_rogue()
+        if self.gateway_guessed and self.gateway_ip and \
+                rogue is not None and not rogue[5]:
+            self.set_identity(gateway_ip="")
+            return True
+        return False
 
     def infer_gateway(self):
         """For imported captures: work out which address is the router,
@@ -27377,8 +27627,10 @@ class NetworkModel:
         now (refresh_dhcp_alerts), and a rogue answering with your
         router's address never makes its router the gateway."""
         self.refresh_dhcp_alerts()
-        if self.dhcp_rogue() is not None:
-            return self.dhcp_trusted()[1]
+        rogue = self.dhcp_rogue()
+        if rogue is not None:
+            # sixth audit: nothing tells which router is real: none of them
+            return rogue[4] if rogue[5] else ""
         imp = self.dhcp_impostor()
         if imp is not None and imp["real_router"]:
             return imp["real_router"]
@@ -33467,6 +33719,17 @@ A content delivery network's server holds files for many websites and apps; apps
 News, pictures and updates are fetched like this. It matters if the device should be idle. ¦ Les actualités, images et mises à jour sont récupérées ainsi. C'est important si l'appareil devrait être inactif. ¦ Las noticias, imágenes y actualizaciones se descargan así. Importa si el dispositivo debería estar inactivo.
 A content delivery network's server, looked up by name, was contacted at nearly even intervals. ¦ Le serveur d'un réseau de diffusion de contenu, dont le nom a été cherché, a été contacté à intervalles presque réguliers. ¦ Se contactó con el servidor de una red de distribución de contenidos, cuyo nombre se buscó, a intervalos casi regulares.
 A gadget contacted a server it looked up by name, at nearly even intervals. ¦ Un objet connecté a contacté un serveur dont il avait cherché le nom, à intervalles presque réguliers. ¦ Un dispositivo conectado contactó con un servidor cuyo nombre había buscado, a intervalos casi regulares.
+This looks like a video or voice call. ¦ Cela ressemble à un appel vidéo ou vocal. ¦ Parece una videollamada o una llamada de voz.
+This looks like a video upload. ¦ Cela ressemble à l'envoi d'une vidéo. ¦ Parece la subida de un vídeo.
+A call sends your picture and sound for as long as it lasts. ¦ Un appel envoie votre image et votre son pendant toute sa durée. ¦ Una llamada envía su imagen y su sonido mientras dura.
+Phones and computers often upload videos while they charge at night. ¦ Les téléphones et les ordinateurs envoient souvent des vidéos pendant qu'ils chargent la nuit. ¦ Los teléfonos y los ordenadores suelen subir vídeos mientras se cargan de noche.
+Most of the data went to a known call service, looked up by name. ¦ La plupart des données sont allées vers un service d'appels connu, dont le nom a été cherché. ¦ La mayoría de los datos fueron a un servicio de llamadas conocido, cuyo nombre se buscó.
+Most of the data went to a known video site, looked up by name. ¦ La plupart des données sont allées vers un site de vidéos connu, dont le nom a été cherché. ¦ La mayoría de los datos fueron a un sitio de vídeos conocido, cuyo nombre se buscó.
+This looks like a NAS copying its backup to the Internet. ¦ Cela ressemble à un NAS qui copie sa sauvegarde sur Internet. ¦ Parece un NAS que copia su copia de seguridad en Internet.
+A NAS often copies its backup to a cloud service at night. It matters if you never set that up. ¦ Un NAS copie souvent sa sauvegarde vers un service en ligne la nuit. C'est important si vous ne l'avez jamais configuré. ¦ Un NAS suele copiar su copia de seguridad a un servicio en la nube de noche. Importa si nunca lo configuró.
+You marked this device as a NAS. ¦ Vous avez indiqué que cet appareil est un NAS. ¦ Usted indicó que este dispositivo es un NAS.
+One of them may be a device pretending to be your router: devices that take an address from it send their Internet traffic and name lookups through it. ¦ L'un d'eux est peut-être un appareil qui se fait passer pour votre box : les appareils qui en reçoivent une adresse font passer par lui leur trafic Internet et leurs recherches de noms. ¦ Puede que uno de ellos sea un dispositivo que se hace pasar por su router: los dispositivos que reciben una dirección de él envían a través de él su tráfico de Internet y sus búsquedas de nombres.
+Two DHCP servers named different routers, and nothing showed which one is real. ¦ Deux serveurs DHCP ont indiqué des routeurs différents, et rien n'a montré lequel est le vrai. ¦ Dos servidores DHCP indicaron routers distintos y nada mostró cuál es el verdadero.
 tab ¦ onglet ¦ pestaña
 view ¦ vue ¦ vista
 action ¦ action ¦ acción
@@ -34971,6 +35234,59 @@ _A4_TEXT = [
 ]
 EVENT_PATTERNS[:0] = _A4_EVENT
 I18N_PATTERNS[:0] = _A4_EVENT + _A4_TEXT
+# sixth audit: a call, a video upload or a NAS at night; two DHCP servers
+# when nothing shows which one is real
+_A6_EVENT = [
+    (r"(.+) was on a call at night \((.+)\)",
+     r"\1 était en appel pendant la nuit (\2)",
+     r"\1 estuvo en una llamada durante la noche (\2)"),
+    (r"(.+) uploaded a video at night \((.+)\)",
+     r"\1 a envoyé une vidéo pendant la nuit (\2)",
+     r"\1 subió un vídeo durante la noche (\2)"),
+    (r"(.+) sent (\d[\d.,]* [KMGT]?B) at night \(you marked it as a NAS\)",
+     r"\1 a envoyé \2 pendant la nuit (vous l'avez indiqué comme NAS)",
+     r"\1 envió \2 durante la noche (usted lo indicó como NAS)"),
+    (r"Two devices hand out addresses and different routers: (\S+) and "
+     r"(\S+)",
+     r"Deux appareils distribuent des adresses et des routeurs différents "
+     r": \1 et \2",
+     r"Dos dispositivos reparten direcciones y routers distintos: \1 y "
+     r"\2"),
+]
+_A6_TEXT = [
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"That is (.+), a video and voice call service\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. C'est \\4, "
+     "un service d'appels vidéo et vocaux.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Es \\4, un "
+     "servicio de videollamadas y llamadas de voz."),
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"That is (.+), a video site\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. C'est \\4, "
+     "un site de vidéos.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Es \\4, un "
+     "sitio de vídeos."),
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"You marked this device as a NAS\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. Vous avez "
+     "indiqué que cet appareil est un NAS.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Usted indicó "
+     "que este dispositivo es un NAS."),
+    (r"(\d+) different DHCP servers seen: ([0-9a-fA-F.:, ]+)\. (\S+) gives "
+     r"(\S+) as the router and (\S+) gives (\S+)\. Nothing in what was "
+     r"seen shows which router the Internet traffic really goes through, "
+     r"so neither is taken as your router\.",
+     r"\1 serveurs DHCP différents vus : \2. \3 donne \4 comme routeur et "
+     r"\5 donne \6. Rien de ce qui a été vu ne montre par quel routeur "
+     r"passe vraiment le trafic Internet, donc aucun n'est pris pour votre "
+     r"box.",
+     r"Se vieron \1 servidores DHCP distintos: \2. \3 da \4 como router y "
+     r"\5 da \6. Nada de lo que se vio muestra por qué router pasa de "
+     r"verdad el tráfico de Internet, así que ninguno se toma como su "
+     r"router."),
+]
+EVENT_PATTERNS[:0] = _A6_EVENT
+I18N_PATTERNS[:0] = _A6_EVENT + _A6_TEXT
 I18N_PATTERNS.sort(key=lambda x: 0 if x[0].startswith(
     ("Online now", r"Offline since (\d\d")) else 1)
 _I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
@@ -61534,6 +61850,8 @@ proc ::mw_explicit_fonts {top names} {
                     if gw and gw != self.model.gateway_ip:
                         self.model.set_identity(gateway_ip=gw)
                         self.model.gateway_guessed = True
+                    elif not gw:
+                        self.model.drop_unsure_gateway()
                 self._update_perf()
                 self._sync_overload_line()
                 cv = self.model.cache.version
@@ -64946,6 +65264,8 @@ proc ::mw_explicit_fonts {top names} {
         if gw:
             self.model.set_identity(gateway_ip=gw)
             self.model.gateway_guessed = True
+        else:
+            self.model.drop_unsure_gateway()
         self.root.after(1500, self._pcap_finalize, n, cancelled)
 
     def _pcap_finalize(self, n, cancelled):
@@ -80748,6 +81068,224 @@ def t_a5_rogue_dhcp_first_in_file(ctx):
     assert a.reason.endswith(rogue) and \
         f"The usual one, {S.GW[0]}, gives {S.GW[0]}" in a.observed and \
         a.refs.get("remote") == rogue, (a.reason, a.observed)
+
+
+# ---- sixth audit: alerts --------------------------------------------------------
+def a6_night_model(ctx, name, rip, host, mark="", tls=False, mb=30):
+    """A night upload of `mb` MB from `host` to `rip` at 3 am, after `name`
+    was looked up (or only sent in a TLS hello: `tls`); `mark`: the kind
+    you gave the device before it."""
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    if name and tls:
+        sb.tls(host, name, rip, size=3000)
+    elif name:
+        sb.dns(host, name, rip)
+    n0 = len(sb.frames)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, host, rip, mb * 1024 * 1024, 12)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    dec = fast_frame_decoder(m)
+    replay_frames(m, sb.frames[:n0], decoder=dec, tick_every=2000)
+    if mark:
+        m.device_for(host[0]).user_class = mark
+    replay_frames(m, sb.frames[n0:], decoder=dec, tick_every=2000)
+    return m
+
+
+@self_test()
+def t_a6_night_upload_call_video_nas(ctx):
+    """Sixth audit: a Zoom call at 23:10, a YouTube upload at 3 am and a
+    NAS's offsite backup were each "Large upload at night" warnings. A
+    call service or video site whose name came from a DNS answer, and a
+    device you marked as a NAS, are an INFO now, out of Unusual activity.
+    Still a WARNING: the same upload to an unknown server, to a server
+    that only claims Zoom's name in its TLS hello, mostly to an unknown
+    server, and from a device only guessed to be a NAS."""
+    S = ScenarioBuilder
+    cases = (("zoomsjc144-195.sjc.zoom.us", S.PHONE, "", "Zoom",
+              "was on a call at night (Zoom)"),
+             ("upload.youtube.com", S.PHONE, "", "YouTube",
+              "uploaded a video at night (YouTube)"),
+             ("", S.NAS, "NAS", "nas", "(you marked it as a NAS)"))
+    for name, host, mark, explained, words in cases:
+        m = a6_night_model(ctx, name, "144.195.1.2", host, mark)
+        got = a2_kinds(m, "night_upload")
+        assert len(got) == 1 and got[0].severity == "INFO" and \
+            got[0].refs.get("explained") == explained and \
+            words in got[0].reason, (name, [(a.severity, a.reason)
+                                            for a in got])
+        assert not unusual_findings(m.alerts), unusual_findings(m.alerts)
+        a = got[0]
+        for loc in ("fr", "es"):
+            for text in (a.reason, a.observed, a.interpretation,
+                         a.possible_explanations, a.why):
+                assert translate_text(text, loc) != text, (loc, text)
+            set_locale(loc)
+            try:
+                assert translate_event(a.reason) != a.reason, a.reason
+            finally:
+                set_locale("en")
+    # still warnings
+    warn = [a6_night_model(ctx, "upload.example.net", "93.184.215.99",
+                           S.PHONE),
+            a6_night_model(ctx, "zoomsjc144-195.sjc.zoom.us", "45.9.40.77",
+                           S.PHONE, tls=True),
+            a6_night_model(ctx, "", "85.10.1.2", S.NAS)]
+    # a call that carries a little while most goes to an unknown server
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.dns(S.PHONE, "zoomsjc144-195.sjc.zoom.us", "144.195.1.2")
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, S.PHONE, "144.195.1.2", 5 * 1024 * 1024, 12)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, S.PHONE, "93.184.215.99", 25 * 1024 * 1024, 12)
+    sb.frames.sort(key=lambda f: f[1])
+    warn.append(a2_model(ctx, sb.frames))
+    nas = warn[2].device_for(S.NAS[0])
+    assert nas.device_class == "NAS" and not nas.user_class, \
+        (nas.device_class, nas.user_class)
+    for i, m in enumerate(warn):
+        got = a2_kinds(m, "night_upload")
+        assert len(got) == 1 and got[0].severity == "WARNING" and \
+            not got[0].refs.get("explained"), \
+            (i, [(a.severity, a.reason) for a in got])
+        assert "night_upload" in [f["kind"] for f in
+                                  unusual_findings(m.alerts)], i
+    # a stream download name is still a stream, not a video upload
+    assert known_bulk_service("www.youtube.com") == ("YouTube", "stream")
+
+
+def a6_login_frames(talks):
+    """One connection a list of request packets (to a different server
+    each), then an answer."""
+    sb = ScenarioBuilder()
+    sb.home_network()
+    for i, parts in enumerate(talks):
+        sb._tcp_talk(sb.ME, f"93.184.216.{10 + i}", sb.GW[1], 47000 + i, 80,
+                     [(0, p) for p in parts] +
+                     [(1, b"HTTP/1.1 200 OK\r\n\r\n")])
+    return sb.frames
+
+
+@self_test()
+def t_a6_login_page_number_and_split_method(ctx):
+    """Sixth audit: "pass=2&page=3" (a page number) was a login, also
+    split over packets and in a web address; a POST split inside its
+    method ("PO" + "ST /login …"), one byte a packet from the first, or
+    with its headers going on in the next packet raised nothing. Now the
+    page number is quiet, a password made of digits after "pass=2" is
+    still seen, the split requests are seen, and what waits for the next
+    packet holds no header value and no password."""
+    c = IP013_CANARY.encode()
+    form = (b"POST /login HTTP/1.1\r\nHost: shop.example\r\nCookie: sid=" +
+            c + b"\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+            b"\r\n")
+    req = form + b"user=alex&password=" + c
+    quiet = [[form + b"pass=2&page=3"],
+             [form + b"q=1&pa", b"ss=2&page=3"],
+             [form + b"q=1&pass=12", b"&page=3"],
+             [form + b"page=3&pass=1"],
+             [b"GET /list?pass=2&page=3 HTTP/1.1\r\nHost: x\r\n\r\n"],
+             [b"PO", b"ST /list HTTP/1.1\r\nHost: x\r\n\r\nq=1"],
+             [req[:40], req[40:120].replace(b"x-www-form-urlencoded",
+                                            b"octet-stream"), b"p",
+              b"assword=" + c],
+             [b"P", b"U", b"T /x HTTP/1.1\r\n", b"Host: x\r\n\r\n", b"P"]]
+    loud = [[form + b"pass=hunter2"],
+            [form + b"q=1&pass=2", b"345678"],
+            [b"GET /a?pass=" + c + b" HTTP/1.1\r\nHost: x\r\n\r\n"],
+            [req[:2], req[2:]],
+            [req[i:i + 1] for i in range(len(req))],
+            [req[:30], req[30:]],
+            [req[:100], req[100:]],
+            [req[:3], req[3:60], req[60:115], req[115:]],
+            [form, b"P", b"assword=" + c]]
+    frames = a6_login_frames(quiet + loud)
+    decoders = [fast_frame_decoder]
+    if ctx.scapy_ok:
+        decoders.append(default_frame_decoder)
+    for mk in decoders:
+        gwip, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg({}), gwip, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        dec = mk(m)
+        for fr in frames:
+            replay_frames(m, [fr], decoder=dec)
+            kept = repr(list(m._head_wait.values())) + \
+                repr(list(m._form_wait.values()))
+            for bad in (c, b"sid", b"shop", b"alex", b"345", b"login"):
+                assert bad not in kept.encode(), (mk.__name__, bad, kept)
+        got = a2_kinds(m, "cleartext_login")
+        where = sorted(int(a.refs.get("remote").rsplit(".", 1)[1]) - 10
+                       for a in got)
+        assert where == list(range(len(quiet), len(quiet) + len(loud))), \
+            (mk.__name__, where)
+        blob = json.dumps([alert_to_dict(a) for a in m.alerts.alerts
+                           .values()])
+        assert IP013_CANARY not in blob
+    assert not form_password_field(b"&pass=2&page=3") and \
+        form_password_field(b"&pass=2345") and \
+        form_password_field(b"&pwd=2&page=3")
+    assert login_form_tail(b"q=1&pass=12", True) == b"&pass=##"
+
+
+@self_test()
+def t_a6_rogue_dhcp_first_only_dhcp(ctx):
+    """Sixth audit: a capture FILE with only DHCP in it, the rogue heard
+    first: the rogue became the gateway and the alert called it "the
+    usual one". Nothing there shows which router is real, so neither
+    becomes the gateway (one guessed earlier is dropped) and the alert
+    names both without saying which is the rogue. Once Internet traffic
+    shows the real router, it is the gateway and the alert accuses the
+    rogue."""
+    S = ScenarioBuilder
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = S(t0=SCENARIO_T0)
+    a2_dhcp_ack(sb, rogue, rmac, S.PHONE, rogue, rogue)
+    n0 = len(sb.frames)
+    sb.dhcp(S.PHONE)
+    sb.dhcp(S.TV)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    dec = fast_frame_decoder(m)
+    replay_frames(m, sb.frames[:n0], decoder=dec)
+    # what the window does while a file is read: the only router so far
+    assert m.infer_gateway() == rogue
+    m.set_identity(gateway_ip=rogue)
+    m.gateway_guessed = True
+    replay_frames(m, sb.frames[n0:], decoder=dec)
+    assert m.infer_gateway() == "", m.infer_gateway()
+    assert m.drop_unsure_gateway() and m.gateway_ip == "", m.gateway_ip
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert got and got[-1].severity == "DANGER", got
+    a = got[-1]
+    assert "The usual one" not in a.observed and \
+        a.reason.startswith("Two devices hand out addresses") and \
+        rogue in a.reason and S.GW[0] in a.reason and \
+        a.refs.get("sure") is False, (a.reason, a.observed, a.refs)
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why) + tuple(a.evidence):
+            assert translate_text(text, loc) != text, (loc, text)
+    # Internet traffic through the real router decides
+    sb2 = S(t0=sb.t + 5)
+    sb2.home_network()
+    for _ in range(20):
+        sb2.tls(S.PHONE, "www.example.com", "93.184.215.14", size=3000)
+    replay_frames(m, sb2.frames, decoder=dec)
+    assert m.infer_gateway() == S.GW[0], m.infer_gateway()
+    assert not m.drop_unsure_gateway()
+    a = a2_kinds(m, "dhcp_anomaly")[-1]
+    assert a.reason.endswith(rogue) and \
+        f"The usual one, {S.GW[0]}" in a.observed and \
+        a.refs.get("sure") is True, (a.reason, a.observed)
 
 
 @self_test()
