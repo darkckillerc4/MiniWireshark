@@ -92651,44 +92651,64 @@ def t_r7_every_copied_line_guarded(ctx):
         assert clipboard_safe_text(want) == want, want    # not twice
         assert copy_to_clipboard(app, text) is True
         assert board == [want], (text, board)
-    r = _m16_tk()
-    if r is None:
+    # (Windows CI) the Tk part runs in a child process: if Tk ends the
+    # process there, this test fails with what it said instead of the
+    # whole self-test run stopping without a word
+    if not _tk_can_draw():
         return None
-    try:
-        assert install_clipboard_guard(r) and install_clipboard_guard(r)
-        got = []
+    code = r'''
+import faulthandler, importlib.util, os, sys
+faulthandler.enable()
+sys.argv = ["x", "--bench"]
+spec = importlib.util.spec_from_file_location("mw", os.environ["MW_FILE"])
+mw = importlib.util.module_from_spec(spec)
+sys.modules["mw"] = mw
+spec.loader.exec_module(mw)
+tk, ttk = mw.tk, mw.ttk
+r = tk.Tk()
+r.withdraw()
+print("TK", flush=True)
+assert mw.install_clipboard_guard(r) and mw.install_clipboard_guard(r)
+print("GUARD", flush=True)
+got = []
 
-        def board_now():
-            got.append(r.clipboard_get())
-            return got[-1]
-        r.clipboard_clear()
-        r.clipboard_append("=1+1\nDevice\n=cmd|x")       # tkinter's own
-        assert board_now() == "'=1+1\nDevice\n'=cmd|x", got
-        txt = tk.Text(r)
-        txt.insert("1.0", "Name\n=HYPERLINK(\"http://x\")\n")
-        txt.configure(state="disabled")
-        txt.tag_add("sel", "1.0", "end-1c")
-        r.tk.call("tk_textCopy", txt._w)                 # Tk's Ctrl+C
-        assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
-        make_readonly_focusable(txt)
-        txt.event_generate("<Control-c>")
-        assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
-        ro = ttk.Entry(r)
-        ro.insert(0, "@SUM(1)")
-        ro.state(["readonly"])
-        ro.selection_range(0, "end")
-        ro.event_generate("<<Copy>>")
-        assert board_now() == "'@SUM(1)", got
-        box = ttk.Entry(r)                   # a search box you type in
-        box.insert(0, "-dns")
-        box.selection_range(0, "end")
-        box.event_generate("<<Copy>>")
-        assert board_now() == "-dns", got
-        put_on_clipboard(r, "x\n+y")
-        assert board_now() == "x\n'+y", got
-    finally:
-        with contextlib.suppress(tk.TclError):
-            r.destroy()
+def board_now():
+    got.append(r.clipboard_get())
+    return got[-1]
+r.clipboard_clear()
+r.clipboard_append("=1+1\nDevice\n=cmd|x")       # tkinter's own
+assert board_now() == "'=1+1\nDevice\n'=cmd|x", got
+txt = tk.Text(r)
+txt.insert("1.0", "Name\n=HYPERLINK(\"http://x\")\n")
+txt.configure(state="disabled")
+txt.tag_add("sel", "1.0", "end-1c")
+r.tk.call("tk_textCopy", txt._w)                 # Tk's Ctrl+C
+assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+mw.make_readonly_focusable(txt)
+txt.event_generate("<Control-c>")
+assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+ro = ttk.Entry(r)
+ro.insert(0, "@SUM(1)")
+ro.state(["readonly"])
+ro.selection_range(0, "end")
+ro.event_generate("<<Copy>>")
+assert board_now() == "'@SUM(1)", got
+box = ttk.Entry(r)                   # a search box you type in
+box.insert(0, "-dns")
+box.selection_range(0, "end")
+box.event_generate("<<Copy>>")
+assert board_now() == "-dns", got
+mw.put_on_clipboard(r, "x\n+y")
+assert board_now() == "x\n'+y", got
+print("OK", flush=True)
+r.destroy()
+'''
+    env = dict(os.environ, MW_FILE=os.path.abspath(__file__),
+               MINIWIRESHARK_DATA=ctx.path("r7-clip-data"))
+    r = subprocess.run([sys.executable, "-I", "-c", code], env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "OK" in r.stdout.split(), (
+        r.returncode, r.stdout[-300:], r.stderr[-1200:])
 
 
 @self_test(needs_source=True)
