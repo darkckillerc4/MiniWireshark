@@ -42277,39 +42277,81 @@ def _clip_box_editable(tkapp, w):
     return False
 
 
+_TK_CLIP_APPEND = []          # tkinter's own clipboard_append, once
+
+
+def _guarded_clipboard_append(self, string, **kw):
+    """Every tkinter clipboard_append of this program goes through the
+    guard (clipboard_safe_text), whichever widget or code calls it; what
+    is copied from a box the person types into is left as it is. (A text
+    appended in pieces is guarded piece by piece: a piece that starts in
+    the middle of a line can get a ' it didn't need, never one less.)"""
+    if not _clip_box_editable(self.tk, str(self)):
+        string = clipboard_safe_text(str(string))
+    return _TK_CLIP_APPEND[0](self, string, **kw)
+
+
 def install_clipboard_guard(widget):
-    """Seventh audit (security): no copy can skip the guard. Tk's own
-    copy (Ctrl+C or Copy in any text, entry or list box of this program)
-    is read back right after it and put on the clipboard guarded
-    (clipboard_safe_text); text copied from a box the person types into
-    is left as it is. Once per Tk. -> True when the guard is in place.
-    (Windows CI: wrapping Tk's own "clipboard" command instead made Tk
-    end the process with an access violation on its next use.)"""
+    """Seventh audit (security): no copy can skip the guard.
+    - tkinter's clipboard_append, from any widget or line of this
+      program, is guarded before it reaches Tk (_guarded_clipboard_append);
+    - Tk's own Copy and Cut (Ctrl+C or Ctrl+X in any text, entry or list
+      box, and Tk's tk_textCopy / tk_textCut however they are called) are
+      read back right after they ran and put on the clipboard guarded.
+    Text copied from a box the person types into is left as it is. Once
+    per Tk. -> True when the guard is in place. (Windows CI: wrapping
+    Tk's own "clipboard" command instead made Tk end the process with an
+    access violation on its next use, so that command is left alone; a
+    raw Tcl "clipboard append" is kept out of this file by
+    no_copy_skips_the_guard.)"""
     try:
         root = widget._root()
     except (AttributeError, tk.TclError):
         return False
     if getattr(root, "_mw_clip_guard", False):
         return True
+    if not _TK_CLIP_APPEND:
+        _TK_CLIP_APPEND.append(tk.Misc.clipboard_append)
+        tk.Misc.clipboard_append = _guarded_clipboard_append
     tkapp = root.tk
 
-    def after_copy(e):
-        w = getattr(e, "widget", None)
-        if _clip_box_editable(tkapp, str(w) if w is not None else "."):
-            return None
+    def guard_board(w):
+        if _clip_box_editable(tkapp, w):
+            return
         try:
             data = str(root.clipboard_get())
         except tk.TclError:
-            return None                 # nothing, or not text
+            return                      # nothing, or not text
         safe = clipboard_safe_text(data)
         if safe != data:
             with contextlib.suppress(tk.TclError):
                 root.clipboard_clear()
-                root.clipboard_append(safe)
+                _TK_CLIP_APPEND[0](root, safe)
+
+    def after_copy(e):
+        w = getattr(e, "widget", None)
+        guard_board(str(w) if w is not None else ".")
         return None
+
+    def after_proc(cmd="", *_rest):
+        # a Tcl execution trace: "tk_textCopy .w" has just run
+        try:
+            w = str(tkapp.splitlist(cmd)[1])
+        except (tk.TclError, IndexError, TypeError):
+            w = "."
+        guard_board(w)
+        return ""
     try:
-        # the "all" tag: after the widget's own Copy binding has run
+        # the "all" tag: after the widget's own Copy or Cut binding ran
         root.bind_all("<<Copy>>", after_copy, add="+")
+        root.bind_all("<<Cut>>", after_copy, add="+")
+        name = root.register(after_proc)
+        for proc in ("::tk_textCopy", "::tk_textCut"):
+            if not tkapp.call("info", "procs", proc):
+                tkapp.call("auto_load", proc)
+            if tkapp.call("info", "procs", proc):
+                tkapp.call("trace", "add", "execution", proc, "leave",
+                           name)
     except tk.TclError:
         LOG.warning("the clipboard guard could not be put in place")
         return False
@@ -79686,23 +79728,49 @@ def _cpu_clock(max_step=0.002):
     return clock
 
 
+def _thread_cpu_clock_any():
+    """This thread's CPU time clock at whatever resolution it has (on
+    Windows 15.6 ms ticks), or None where there is none."""
+    clock = getattr(time, "thread_time", None)
+    try:
+        clock()
+    except Exception:                                # noqa: BLE001
+        return None
+    return clock
+
+
 def call_frame_limit_check(cpu_slowest, waited, retime, limit=0.050,
-                           tries=5):
+                           tries=5, cpu=None):
     """Fifth audit: "one frame took 98 ms" failed `call decoder fuzz` once
     on a busy machine. The 50 ms limit stays; what is measured changed.
-    `cpu_slowest` is the most CPU time one frame used (None without a CPU
-    clock): over the limit fails. `waited` holds the frames whose wall
-    time was over it; each is timed again (`retime(frame)` -> seconds)
-    and fails only when it is slow every one of `tries` times, so a frame
-    the machine set aside for a while (preemption, another program) no
-    longer fails while one that is slow every time still does.
+    `cpu_slowest` is the most CPU time one frame used, on a fine CPU
+    clock (None without one, as on Windows): over the limit fails.
+    `waited` holds the frames whose wall time was over the limit. Each
+    is decoded `tries` more times (`retime(frame)` -> its wall seconds):
+    - on `cpu` (this thread's CPU clock at any resolution: Windows' 15.6
+      ms ticks over the 5 runs are within 3.2 ms a run) the CPU time it
+      used on average is over the limit: fails, however quick its wall
+      time was on some runs (round 8: a frame that is slow because of
+      its own work fails on Windows too);
+    - its wall time was over the limit every one of the `tries` times:
+      fails too (without a CPU clock, or a machine busy all along).
+    A frame that only waited once or twice (preemption, another program)
+    used little CPU time and was quick on another run: it passes. The
+    decoders give the same answer for the same bytes every time, so
+    their own cost is the same on every run.
     -> "" when all is well, else what was slow."""
     if cpu_slowest is not None and cpu_slowest >= limit:
         return f"one frame took {cpu_slowest * 1000:.0f} ms of CPU time"
     for frame in waited:
-        best = min(retime(frame) for _ in range(tries))
-        if best >= limit:
-            return (f"one frame took {best * 1000:.0f} ms each of "
+        c0 = cpu() if cpu else 0.0
+        walls = [retime(frame) for _ in range(tries)]
+        if cpu:
+            used = (cpu() - c0) / tries
+            if used >= limit:
+                return (f"one frame used {used * 1000:.0f} ms of CPU "
+                        f"time on average over {tries} runs")
+        if min(walls) >= limit:
+            return (f"one frame took {min(walls) * 1000:.0f} ms each of "
                     f"{tries} times")
     return ""
 
@@ -79762,7 +79830,8 @@ def t_call_decoder_fuzz(ctx):
     gc.disable()
     try:
         slow = call_frame_limit_check(cpu_slowest if cpu else None,
-                                      waited, retime, limit)
+                                      waited, retime, limit,
+                                      cpu=_thread_cpu_clock_any())
     finally:
         if was_on:
             gc.enable()
@@ -92674,14 +92743,27 @@ assert mw.install_clipboard_guard(r) and mw.install_clipboard_guard(r)
 print("GUARD", flush=True)
 got = []
 board_now = lambda: (got.append(r.clipboard_get()), got[-1])[1]
-# (this file's own writes all go through put_on_clipboard or
-# copy_to_clipboard: no_copy_skips_the_guard reads the source for that)
+r.clipboard_clear()
+r.clipboard_append("=1+1\nDevice\n=cmd|x")       # tkinter's own
+assert board_now() == "'=1+1\nDevice\n'=cmd|x", got
+lab = ttk.Label(r)                                # from any widget
+lab.clipboard_clear()
+lab.clipboard_append("@SUM(2)")
+assert board_now() == "'@SUM(2)", got
 txt = tk.Text(r)
 txt.insert("1.0", "Name\n=HYPERLINK(\"http://x\")\n")
 txt.configure(state="disabled")
 txt.tag_add("sel", "1.0", "end-1c")
+mw._TK_CLIP_APPEND[0](r, "other")                 # (unguarded, to compare)
+r.tk.call("tk_textCopy", txt._w)                 # Tk's Ctrl+C
+assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+r.clipboard_clear()
 txt.event_generate("<<Copy>>")                   # Tk's own Ctrl+C
 assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+r.clipboard_clear()
+txt.event_generate("<<Cut>>")                    # Ctrl+X: read-only text
+assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+assert txt.get("1.0", "end-1c").startswith("Name"), "cut a read-only text"
 mw.make_readonly_focusable(txt)
 txt.event_generate("<Control-c>")
 assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
@@ -92696,6 +92778,15 @@ box.insert(0, "-dns")
 box.selection_range(0, "end")
 box.event_generate("<<Copy>>")
 assert board_now() == "-dns", got
+box.clipboard_clear()
+box.clipboard_append("=typed")      # from a box you type in: as it is
+assert board_now() == "=typed", got
+ent = tk.Entry(r)                    # a classic read-only box: Ctrl+X
+ent.insert(0, "+cmd|x")
+ent.configure(state="readonly")
+ent.selection_range(0, "end")
+ent.event_generate("<<Cut>>")
+assert board_now() == "'+cmd|x", got
 mw.put_on_clipboard(r, "x\n+y")
 assert board_now() == "x\n'+y", got
 print("OK", flush=True)
@@ -92724,10 +92815,13 @@ def t_r7_no_copy_skips_the_guard(ctx):
             top = m.group(1)
         if top.startswith(("t_", "gt_", "_gs_")) or top in (
                 "put_on_clipboard", "copy_to_clipboard",
-                "install_clipboard_guard") or line.lstrip().startswith("#"):
+                "install_clipboard_guard", "_guarded_clipboard_append") or \
+                line.lstrip().startswith("#"):
             continue
         if re.search(r"\.clipboard_(append|clear)\(|[\"'\[{ ]clipboard\s+"
-                     r"append\b", line):
+                     r"append\b|[\"']clipboard[\"']\s*,\s*[\"']append|"
+                     r"_TK_CLIP_APPEND\[0\]\(",
+                     line):
             bad.append(f"{top}:{no}")
     assert not bad, "clipboard writes without the guard: " + ", ".join(bad)
 
@@ -103253,9 +103347,14 @@ def gt_kbd_text_panes(app, ctx):
     # seventh audit (security): the window puts the clipboard guard in
     # place as it opens, for Tk's own Ctrl+C too
     assert getattr(root, "_mw_clip_guard", False)
-    assert any("<<Copy>>" in str(b) for b in
-               root.tk.splitlist(root.tk.call("bind", "all"))), \
-        "no guard on Tk's own Copy"
+    for ev in ("<<Copy>>", "<<Cut>>"):
+        assert any(ev in str(b) for b in
+                   root.tk.splitlist(root.tk.call("bind", "all"))), \
+            f"no guard on Tk's own {ev}"
+    assert tk.Misc.clipboard_append is _guarded_clipboard_append, \
+        "tkinter's clipboard_append is not guarded"
+    for proc in ("::tk_textCopy", "::tk_textCut"):
+        assert root.tk.call("trace", "info", "execution", proc), proc
     app.toggle_inspector(True)
     ptab = app._select_tab("packets")
     ptab.show_subview("Packets")
@@ -103441,6 +103540,37 @@ def gt_kbd_tables(app, ctx):
     assert rows_seen >= 4, rows_seen
 
 
+def _gt_win_keypad_enter(root, widget, tries=3):
+    """Windows: press the keypad's Enter key for real (VK_RETURN with the
+    extended-key flag, what the keypad sends) with `widget` focused.
+    -> the keysyms the widget got for it (["Return"] when all is well)."""
+    import ctypes
+    user32 = ctypes.windll.user32
+    seen = []
+    tags = widget.bindtags()
+    root.bind_class("mw_keypad", "<KeyPress>",
+                    lambda e: seen.append(e.keysym))
+    widget.bindtags(("mw_keypad",) + tuple(tags))
+    try:
+        for _i in range(tries):
+            root.deiconify()
+            root.lift()
+            user32.SetForegroundWindow(int(root.wm_frame(), 16))
+            widget.focus_force()
+            _gui_pump(root, 0.2)
+            user32.keybd_event(0x0D, 0x1C, 0x1, 0)          # extended
+            user32.keybd_event(0x0D, 0x1C, 0x1 | 0x2, 0)    # key up
+            end = time.monotonic() + 2.0
+            while not seen and time.monotonic() < end:
+                _gui_pump(root, 0.05)
+            if seen:
+                break
+    finally:
+        widget.bindtags(tags)
+        root.unbind_class("mw_keypad", "<KeyPress>")
+    return seen
+
+
 @gui_test_step("keyboard B: Enter opens the selected row like a "
                "double-click")
 def gt_kbd_enter_opens(app, ctx):
@@ -103459,14 +103589,18 @@ def gt_kbd_enter_opens(app, ctx):
         tree.event_generate("<Return>")
         _gui_pump(root, 0.1)
         by_key = list(calls)
-        # (CI windows 3.14) Tk on Windows has no KP_Enter key: the keypad
-        # Enter arrives as Return (with the extended-key flag), checked
-        # above; a generated KP_Enter never reaches a binding there
-        if root.tk.call("tk", "windowingsystem") != "win32":
-            del calls[:]
+        del calls[:]
+        if root.tk.call("tk", "windowingsystem") == "win32":
+            # Tk on Windows has no KP_Enter keysym (tkWinKey.c maps
+            # VK_RETURN to Return, with or without the keypad's
+            # extended-key flag), so a generated KP_Enter reaches nothing
+            # there; the real keypad key is pressed instead
+            keys = _gt_win_keypad_enter(root, tree)
+            assert keys == ["Return"], ("the keypad Enter", keys)
+        else:
             tree.event_generate("<KP_Enter>")
             _gui_pump(root, 0.1)
-            assert calls == by_key, (calls, by_key)
+        assert calls == by_key, (calls, by_key)
         return by_key
     try:
         for owner, attr in ((app, "show_website"), (app, "show_flow"),
@@ -111389,6 +111523,42 @@ def t_r5_call_frame_limit_survives_a_busy_machine(ctx):
     slow = call_frame_limit_check(0.150, [], lambda f: 0.0)
     assert "150 ms of CPU time" in slow, slow
     assert call_frame_limit_check(None, [b"f"], once_slow) == ""
+    # round 8: a frame quick on the wall on some runs but busy with its
+    # own work fails, on any CPU clock (Windows: 15.6 ms ticks)
+    fake = {"t": 0.0}
+
+    def busy_clock():
+        return fake["t"]
+
+    def busy_once_slow(frame):
+        fake["t"] += 0.080                     # 80 ms of CPU a run
+        return once_slow(frame)
+    calls["n"] = 0
+    slow = call_frame_limit_check(None, [b"f"], busy_once_slow,
+                                  cpu=busy_clock)
+    assert "80 ms of CPU time on average over 5 runs" in slow, slow
+
+    def idle_once_slow(frame):
+        fake["t"] += 0.001
+        return once_slow(frame)
+    calls["n"] = 0
+    assert call_frame_limit_check(None, [b"f"], idle_once_slow,
+                                  cpu=busy_clock) == ""
+    any_cpu = _thread_cpu_clock_any()
+    if any_cpu is not None:
+        # the real clock, coarse or fine: 60 ms of work a run, reported
+        # as quick on the wall, still fails
+        def real_work(frame):
+            c0 = any_cpu()
+            end = time.perf_counter() + 5.0
+            while any_cpu() - c0 < 0.06 and time.perf_counter() < end:
+                pass
+            return 0.001
+        slow = call_frame_limit_check(None, [b"f"], real_work, tries=3,
+                                      cpu=any_cpu)
+        assert "of CPU time on average over 3 runs" in slow, slow
+        assert call_frame_limit_check(None, [b"f"], lambda f: (
+            time.sleep(0.02), 0.001)[1], tries=3, cpu=any_cpu) == ""
     # the CPU clock sees work, not waiting
     cpu = _cpu_clock()
     if cpu is None:
