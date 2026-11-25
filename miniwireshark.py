@@ -24460,7 +24460,8 @@ NIGHT_UPLOAD_KINDS = ("backup", "call", "video")
 # night to an attacker's address an INFO, kept out of Unusual activity. A
 # call or video upload is said as one only when the address is also in
 # the provider's own address ranges below. Where they come from (each
-# provider's published list, as it stood in November 2026; MiniWireshark
+# provider's published list; written down for 5.3.4 without downloading
+# them again, so a range a provider added later is missing; MiniWireshark
 # never downloads them):
 #   Zoom: "Zoom network firewall or proxy server settings" (Zoom support;
 #     assets.zoom.us/docs/ipranges/Zoom.txt), the ranges Zoom owns only,
