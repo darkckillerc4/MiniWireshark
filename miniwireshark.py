@@ -57757,6 +57757,11 @@ class MiniWireshark:
         with contextlib.suppress(tk.TclError, AttributeError):
             if not self.inspector_visible:
                 return
+            # round 8: an Inspector shown again still reported the width
+            # it had before it was hidden (314 px) until the divider was
+            # laid out, so it was left 1 pixel wide in a 1024-pixel window
+            # (F6 then could not reach it); measure after the layout
+            self.body.update_idletasks()
             total = self.body.winfo_width()
             want = min(px(Inspector.WIDTH), total // 3)
             limit = want - 20 if floor is None else min(want, floor)
@@ -61288,7 +61293,11 @@ proc ::mw_explicit_fonts {top names} {
         if self.inspector_visible:
             tgt = getattr(self.inspector, "txt", None) or \
                 getattr(self.inspector, "close_btn", None)
-            if tgt is not None:
+            try:
+                seen = tgt is not None and tgt.winfo_viewable()
+            except tk.TclError:
+                seen = False
+            if seen:                    # an Inspector with no room: skipped
                 out.append(("inspector", tgt))
         out.append(("status", self.status_lbl))
         return out
@@ -112875,6 +112884,45 @@ def _kbd_press(root, widget, seq, pump=0.08):
     w = root.focus_get() or widget or root
     w.event_generate(seq)
     _gui_pump(root, pump)
+
+
+@gui_test_step("round 8: the Inspector opened in a 1024-pixel window gets "
+               "its own width, and F6 reaches it")
+def gt_r8_inspector_opens_wide_enough(app, ctx):
+    """Round 8: opened again in a 1024x768 window, the Inspector was left
+    1 pixel wide (it measured its old width before the layout), so it
+    showed nothing and F6 stopped on the table."""
+    root = app.root
+    keep = (root.geometry(), root.maxsize(), app.inspector_visible,
+            getattr(app, "_insp_auto_hidden", False),
+            getattr(app, "_body_w_prev", None))
+    try:
+        root.maxsize(4000, 3000)
+        root.geometry("1024x768")
+        _gui_pump(root, 0.8)
+        app._select_tab("devices")
+        app.toggle_inspector(False, remember=False)
+        _gui_pump(root, 0.4)
+        app.toggle_inspector(True, remember=False)
+        _gui_pump(root, 0.6)
+        total = app.body.winfo_width()
+        want = min(px(Inspector.WIDTH), total // 3)
+        got = app.inspector.frame.winfo_width()
+        assert got >= want - 20, (got, want, total, app.body.sashpos(0))
+        assert "inspector" in [n for n, _w in app._regions()]
+        table = app._table_target(app.tabs["devices"])
+        table.focus_force()
+        _gui_pump(root, 0.1)
+        _kbd_press(root, None, "<F6>")
+        assert app._region_of(root.focus_get()) == "inspector", \
+            root.focus_get()
+    finally:
+        root.maxsize(*keep[1])
+        root.geometry(keep[0])
+        _gui_pump(root, 0.5)
+        app.toggle_inspector(keep[2], remember=False)
+        app._insp_auto_hidden, app._body_w_prev = keep[3], keep[4]
+        _gui_pump(root, 0.3)
 
 
 @gui_test_step("kbd C1: F6 / Shift+F6 visit search, tabs, filter, table, "
