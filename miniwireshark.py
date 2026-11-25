@@ -31034,7 +31034,7 @@ Start Monitoring, Demo Mode, the Quick Start Guide and Diagnostics in one place 
 Start watching automatically when MiniWireshark opens ¦ Commencer à observer automatiquement à l'ouverture ¦ Empezar a observar automáticamente al abrir MiniWireshark
 Picks the best network card for you and begins right away. Turn off to choose a card and press Start yourself. ¦ Choisit la meilleure carte réseau et commence aussitôt. Désactivez pour choisir une carte et démarrer vous-même. ¦ Elige la mejor tarjeta de red y empieza enseguida. Desactívelo para elegir la tarjeta y pulsar Empezar usted mismo.
 Ask before clearing data ¦ Demander avant d'effacer les données ¦ Preguntar antes de borrar los datos
-Shows a confirmation before Clear wipes the devices, websites and alerts collected so far. ¦ Demande confirmation avant qu'Effacer supprime les appareils, sites et alertes collectés. ¦ Pide confirmación antes de que Borrar elimine los dispositivos, sitios y alertas recogidos.
+Shows a confirmation before Clear wipes the devices, websites and alerts collected so far, and before the Stop key stops watching. ¦ Demande confirmation avant qu'Effacer supprime les appareils, sites et alertes collectés, et avant que la touche Arrêter arrête l'observation. ¦ Pide confirmación antes de que Borrar elimine los dispositivos, sitios y alertas recogidos, y antes de que la tecla Detener detenga la observación.
 Explanations ¦ Explications ¦ Explicaciones
 Include plain-English guidance ¦ Inclure des conseils en langage simple ¦ Incluir consejos en lenguaje sencillo
 Adds “what should I check?” advice to device cards, alerts and the Security check. Turn off for just the facts. ¦ Ajoute des conseils « que dois-je vérifier ? » aux fiches d'appareils, alertes et au contrôle de sécurité. Désactivez pour n'avoir que les faits. ¦ Añade consejos de «¿qué debo comprobar?» a las fichas de dispositivos, alertas y la revisión de seguridad. Desactívelo para ver solo los hechos.
@@ -31717,6 +31717,8 @@ Your networks ¦ Vos réseaux ¦ Sus redes
 now (green = online) ¦ maintenant (vert = en ligne) ¦ ahora (verde = conectado)
 waiting to retry download ¦ en attente d'un nouvel essai de téléchargement ¦ esperando para reintentar la descarga
 Stopped watching. ¦ Observation arrêtée. ¦ Observación detenida.
+Stop watching? ¦ Arrêter l'observation ? ¦ ¿Detener la observación?
+Watching the network stops. Everything seen so far stays on screen.⏎⏎Stop now? ¦ L'observation du réseau s'arrête. Tout ce qui a été vu reste à l'écran.⏎⏎Arrêter maintenant ? ¦ La observación de la red se detiene. Todo lo visto hasta ahora sigue en pantalla.⏎⏎¿Detener ahora?
 Unsaved changes ¦ Modifications non enregistrées ¦ Cambios sin guardar
 This is mine ¦ C'est à moi ¦ Es mío
 Settings saved. ¦ Paramètres enregistrés. ¦ Ajustes guardados.
@@ -36823,9 +36825,19 @@ def share_tree_width(tree):
                 changed = True
         left = avail - sum(new.values())
         s_need = sum(info[c][2] for c in stretch)
+        # (sixth audit, 1024 wide in French and Spanish) Tk squeezes the
+        # stretching columns only when the table changes size: an Alerts
+        # table first shown in a narrow window kept "What happened" at
+        # 440 pixels and pushed Confidence, Times and Status off its
+        # right edge. Wider than the room the fixed columns leave, they
+        # get that room (never less than their heading).
+        wide = sum(info[c][0] for c in stretch) > left + 4
+        with contextlib.suppress(tk.TclError):
+            if str(tree.cget("xscrollcommand")):
+                wide = False                 # reached with the scroll bar
         for c in stretch:
             want = max(info[c][2], left * info[c][2] // max(1, s_need))
-            if info[c][0] < info[c][2] or changed:
+            if info[c][0] < info[c][2] or changed or wide:
                 if want != info[c][0]:
                     tree.column(c, width=want)
                     changed = True
@@ -38324,7 +38336,8 @@ SETTINGS_PAGES = [
              {"key": "general.confirm_before_clear", "type": "bool",
               "label": "Ask before clearing data",
               "help": "Shows a confirmation before Clear wipes the devices, "
-                      "websites and alerts collected so far."},
+                      "websites and alerts collected so far, and before the "
+                      "Stop key stops watching."},
          ]},
          {"title": "Explanations", "controls": [
              {"key": "appearance.explain_inline", "type": "bool",
@@ -47145,6 +47158,13 @@ class RemoteTab(BaseTab):
 class AlertsTab(BaseTab):
     name, label_key = "alerts", "tab_alerts"
     VIEW_VARS = ("q_var", "sev_var")
+    COLUMNS = [("sev", "Severity", 100, "w", False),
+               ("when", "Last seen", 80, "center", False),
+               ("reason", "What happened", 440, "w", True),
+               ("device", "Related to", 190, "w", False),
+               ("conf", "Confidence", 85, "w", False),
+               ("count", "Times", 55, "e", False),
+               ("status", "Status", 110, "w", False)]
 
     def build(self):
         top = self.header("\U0001F514  Alerts — every alert separates "
@@ -47213,16 +47233,10 @@ class AlertsTab(BaseTab):
                                      command=self.app.review_alerts)
         self.review_btn.pack(side="right", padx=(4, 0))
         self._review_job = None
-        wrap, self.tree = make_tree(
-            self.frame, [("sev", "Severity", 100, "w", False),
-                         ("when", "Last seen", 80, "center", False),
-                         ("reason", "What happened", 440, "w", True),
-                         ("device", "Related to", 190, "w", False),
-                         ("conf", "Confidence", 85, "w", False),
-                         ("count", "Times", 55, "e", False),
-                         ("status", "Status", 110, "w", False)],
-            selectmode="extended")
+        wrap, self.tree = make_tree(self.frame, self.COLUMNS,
+                                    selectmode="extended")
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.table_wrap = wrap
         self.tree.bind("<Double-1>", self._details)
         self.tree.bind("<Return>", self._details)
         self.iids = IidMap()
@@ -60770,8 +60784,8 @@ proc ::mw_explicit_fonts {top names} {
         self._class_shortcuts = []
         self._bound_shortcuts, self._shortcut_cmds = [], []
         actions = {
-            "start": lambda e=None: self.start(),
-            "stop": lambda e=None: self.stop(),
+            "start": lambda e=None: self._capture_key(True, e),
+            "stop": lambda e=None: self._capture_key(False, e),
             "clear": lambda e=None: self.clear(),
             "export": lambda e=None: self._open_export_menu(),
             "find": self._focus_search,
@@ -60810,6 +60824,36 @@ proc ::mw_explicit_fonts {top names} {
                     self._bind_palette_in_fields(seq, fn)
             except tk.TclError:
                 pass
+
+    def _capture_key(self, start, event=None):
+        """Ctrl+R (Start) and Ctrl+period (Stop). (Sixth audit) They fired
+        while the focus was in a text box, and Stop stopped watching at
+        once: in a box the person types into they are left to the box,
+        and in other windows to that window (as the divider keys are),
+        and Stop asks first, as Clear does (the same setting)."""
+        if event is not None:
+            if not self._in_main(event):
+                return None
+            if _selects_words(getattr(event, "widget", None)):
+                return None
+        if start:
+            self.start()
+        elif self._confirm_stop():
+            self.stop()
+        return "break"
+
+    def _confirm_stop(self):
+        """The Stop key asks before it stops watching, unless "Ask before
+        clearing data" is off. Nothing running: nothing to ask."""
+        running = self.sniffer is not None or self._capture_starting or \
+            bool(self._restart_job)
+        if not running or \
+                not self.config.get("general.confirm_before_clear", True):
+            return True
+        return messagebox.askyesno(
+            "Stop watching?",
+            "Watching the network stops. Everything seen so far stays on "
+            "screen.\n\nStop now?", parent=self.root)
 
     def _palette_shortcut(self, event=None):
         """Ctrl+K. In a text field it opens the palette and nothing else
@@ -111900,6 +111944,194 @@ def gt_kbd_fix_palette_recent_privacy(app, ctx):
     finally:
         app.config.set("palette.recent", keep)
         app.config.save()
+
+
+@gui_test_step("sixth audit kbd: Start and Stop keys stay out of text boxes "
+               "and other windows; the Stop key asks first, No keeps "
+               "watching")
+def gt_a6_capture_keys(app, ctx):
+    root = app.root
+    calls, asked = [], []
+    real_ask = messagebox.askyesno
+    answer = [False]
+    app.start = lambda *a, **k: calls.append("start")
+    app.stop = lambda *a, **k: calls.append("stop")
+    sn0 = app.sniffer
+    cfg = app.config
+    had = cfg.get("general.confirm_before_clear", True)
+    messagebox.askyesno = lambda *a, **k: asked.append(a) or answer[0]
+    start = _norm_seq(cfg.get("shortcuts.start") or
+                      DEFAULT_SHORTCUTS["start"])
+    stop = _norm_seq(cfg.get("shortcuts.stop") or DEFAULT_SHORTCUTS["stop"])
+    try:
+        app._select_tab("devices")
+        _gui_pump(root, 0.4)
+        table = app._table_target(app.tabs["devices"])
+        app.sniffer = types.SimpleNamespace(stop=lambda: None)  # watching
+        # typing in the search box: both keys are the box's
+        for seq in (start, stop):
+            _kbd_press(root, app.search_entry, seq)
+        assert calls == [] and asked == [], (calls, asked)
+        # ... and in a text box of another window
+        top = tk.Toplevel(root)
+        try:
+            box = ttk.Entry(top)
+            box.pack()
+            _gui_pump(root, 0.1)
+            for seq in (start, stop):
+                _kbd_press(root, box, seq)
+        finally:
+            top.destroy()
+        assert calls == [] and asked == [], (calls, asked)
+        # on the table: Start starts; Stop asks, and No keeps watching
+        _kbd_press(root, table, start)
+        assert calls == ["start"], calls
+        del calls[:]
+        _kbd_press(root, table, stop)
+        assert len(asked) == 1 and calls == [], (asked, calls)
+        assert "Stop now?" in asked[0][1], asked[0]
+        answer[0] = True
+        _kbd_press(root, table, stop)
+        assert len(asked) == 2 and calls == ["stop"], (asked, calls)
+        # "Ask before clearing data" off: it stops at once
+        del calls[:], asked[:]
+        cfg.set("general.confirm_before_clear", False)
+        _kbd_press(root, table, stop)
+        assert calls == ["stop"] and asked == [], (calls, asked)
+        # nothing running: nothing to ask
+        cfg.set("general.confirm_before_clear", True)
+        app.sniffer = None
+        del calls[:]
+        _kbd_press(root, table, stop)
+        assert calls == ["stop"] and asked == [], (calls, asked)
+    finally:
+        messagebox.askyesno = real_ask
+        app.sniffer = sn0
+        cfg.set("general.confirm_before_clear", had)
+        for n in ("start", "stop"):
+            app.__dict__.pop(n, None)
+        _gui_pump(root, 0.2)
+
+
+_A6_PLAIN = ("Label", "Frame", "TLabel", "TFrame", "Labelframe",
+             "TLabelframe")
+
+
+def _a6_plain_stop(w):
+    """A Label or Frame that Tab lands on and that nothing runs from:
+    no Return or Space of its own (a card, a tab's label, the status
+    line and the Inspector's close mark all have them)."""
+    try:
+        if w.winfo_class() not in _A6_PLAIN:
+            return False
+        return not any(w.bind(s) for s in ("<Return>", "<Key-Return>",
+                                           "<space>", "<Key-space>"))
+    except tk.TclError:
+        return False
+
+
+@gui_test_step("sixth audit kbd: Tab through the main window, every tab, "
+               "lands only on things you can use (never a plain Label or "
+               "Frame)")
+def gt_a6_tab_stops_usable(app, ctx):
+    root = app.root
+    mode = app.mode_ui_var.get()
+    bad, walked = [], 0
+    try:
+        app.mode_ui_var.set("Advanced")
+        app._on_ui_mode_change()
+        _gui_pump(root, 0.4)
+        for name in list(app.tabs):
+            app._select_tab(name)
+            _gui_pump(root, 0.35)
+            app.search_entry.focus_force()
+            _gui_pump(root, 0.05)
+            for _ in range(160):
+                w = root.focus_get()
+                if w is None:
+                    break
+                w.event_generate("<Tab>")
+                _gui_pump(root, 0.01)
+                f = root.focus_get()
+                if f is None or f is app.search_entry:
+                    break
+                walked += 1
+                if _a6_plain_stop(f):
+                    txt = ""
+                    with contextlib.suppress(tk.TclError):
+                        txt = str(f.cget("text"))[:30]
+                    bad.append((name, f.winfo_class(), str(f)[-50:], txt))
+        assert walked > 40, walked
+        assert not bad, bad[:10]
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("sixth audit UI: Alerts at 1024 wide in French and Spanish, "
+               "Normal and Extra large: every heading shows, nothing is "
+               "pushed off the table")
+def gt_a6_alerts_1024(app, ctx):
+    root = app.root
+    tab = app._select_tab("alerts")
+    texts = tab.severity_texts()
+    real = tab.table_wrap
+    pack0 = {k: v for k, v in real.pack_info().items() if k != "in"}
+    geo0, max0 = root.geometry(), root.maxsize()
+    root.maxsize(px(4000), px(3000))     # a 1024-px screen: truly 1024
+    root.geometry(px_geo("1024x690"))
+    _gui_pump(root, 0.5)
+    try:
+        for lang in ("Français", "Español"):
+            app.config.set("general.language", lang)
+            app._apply_runtime_settings()
+            for size in ("Normal", "Extra large"):
+                app.config.set("appearance.text_size", size)
+                app._apply_text_size(defer=False)
+                _gui_pump(root, 0.3)
+                app.finish_text_size()
+                tab.rebuild()
+                _gui_pump(root, 0.4)
+                # the table as at a start in a narrow window: built with
+                # its own widths and first laid out at 1024 wide (Tk then
+                # leaves "What happened" at 440 pixels; it squeezes only
+                # a table that changes size)
+                spec = [(c, translate_text(h), w, a, st)
+                        for c, h, w, a, st in tab.COLUMNS]
+                wrap, t2 = make_tree(tab.frame, spec, selectmode="extended")
+                try:
+                    fit_cell_texts(t2, "sev", texts)
+                    fit_tree_headings(t2)
+                    wrap.pack(before=real, fill="both", expand=True,
+                              padx=6, pady=(0, 6))
+                    real.pack_forget()
+                    _gui_pump(root, 0.6)
+                    avail = t2.winfo_width()
+                    ws = {c: int(t2.column(c, "width"))
+                          for c in t2["columns"]}
+                    found = [x for x in layout_audit(root, cells=True)
+                             if x[1] == str(t2) and
+                             x[0] in ("heading-cut", "column-cut")]
+                    assert avail > 100 and not found and \
+                        sum(ws.values()) <= avail + 4, (
+                            lang, size, avail, ws, found)
+                    font = tree_cell_font()
+                    cut = [t for t in texts
+                           if font.measure(t) + 12 > ws.get("sev", 0)]
+                    assert not cut, (lang, size, ws, cut)
+                finally:
+                    real.pack(before=wrap, **pack0)
+                    wrap.destroy()
+                    _gui_pump(root, 0.2)
+    finally:
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        app.config.set("appearance.text_size", "Normal")
+        app._apply_text_size(defer=False)
+        root.maxsize(*max0)
+        root.geometry(geo0)
+        _gui_pump(root, 0.4)
 
 
 
