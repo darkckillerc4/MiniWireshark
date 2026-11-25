@@ -75856,11 +75856,14 @@ class DeepEngine:
         # 5.3.4 (S6): the deep thread (or one reader thread per worker
         # process) counts here while the analysis thread counts in offer();
         # unlocked, counts were lost (Python 3.8 stress: 7 % of "done"), so
-        # in_flight() never reached 0 and the 60 s coverage was too low
+        # in_flight() never reached 0 and the 60 s coverage was too low.
+        # Round 8 (CI): stored before they count as done, so drain() can't
+        # return while the last batch's findings are still on their way
+        # (the thread run then lacked them next to the process run)
+        self.store.add(findings, messages, txns)
         with self.cv:
             self.done += n
             self._tick(0, n, 0)
-        self.store.add(findings, messages, txns)
 
     def _tick(self, off, done, shed):
         sec = int(time.monotonic())
@@ -90094,6 +90097,34 @@ def t_534_audit_text_size_judged_by_median(ctx):
     # the limits in force by default
     assert text_size_misses([10] * 6, [10] * 6) == []
     assert text_size_misses([TEXT_SIZE_LIMITS_MS[0] + 1] * 6, [10] * 6)
+
+
+@self_test()
+def t_r8_deep_drain_waits_for_the_findings(ctx):
+    """Round 8 (CI self-test 3.12): `deep worker process and mode
+    switching` failed once with findings in the process run that the
+    thread run lacked. The deep thread counted a batch as done before it
+    stored the batch's findings, so drain() could return in between. Now
+    a drained engine holds every finding of what it analysed."""
+    rows = _deep_rows(ScenarioBuilder().home_network())
+    e = DeepEngine()
+    e.configure("Full Power", cores=1, prefer_process=False, policy="Off")
+    add = e.store.add
+
+    def slow_add(*a):
+        time.sleep(0.3)                 # a busy machine, for a moment
+        add(*a)
+    e.store.add = slow_add
+    try:
+        e._ensure_backend()
+        assert e.backend == "thread", e.last_error
+        for d in rows:
+            e.offer(d, d["no"])
+        assert e.drain(30), e.status_text()
+        got = len(e.store.findings)
+    finally:
+        e.stop()
+    assert got > 0, "drain() returned before the findings were stored"
 
 
 @self_test()
