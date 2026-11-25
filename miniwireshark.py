@@ -36905,14 +36905,23 @@ def dialog_contract(win):
 def focus_ring(widget, color="#2b7de9", width=2):
     """A visible ring when a plain widget (a label used as a tab) has the
     keyboard focus. The ring takes the place of padding, so nothing
-    moves or grows."""
+    moves or grows. The padding it gives back is the widget's own as it
+    is now (ring_padding), not the one it had when it was made: compact
+    mode trims the tab labels' padding on a short window, and a tab that
+    had the keyboard took its full padding back when the focus left
+    (sixth audit, Windows runner: 4 pixels more per row of tabs, so
+    Local services showed 4 rows instead of 5)."""
     try:
-        padx = int(str(widget.cget("padx")))
-        pady = int(str(widget.cget("pady")))
+        widget._mw_ring_pad = (int(str(widget.cget("padx"))),
+                               int(str(widget.cget("pady"))))
     except (tk.TclError, ValueError):
         return
+    widget._mw_ring_w = width
+    widget._mw_ring_on = False
 
     def on(_e=None):
+        padx, pady = widget._mw_ring_pad
+        widget._mw_ring_on = True
         with contextlib.suppress(tk.TclError):
             widget.configure(highlightthickness=width, highlightcolor=color,
                              highlightbackground=color,
@@ -36920,11 +36929,34 @@ def focus_ring(widget, color="#2b7de9", width=2):
                              pady=max(0, pady - width))
 
     def off(_e=None):
+        padx, pady = widget._mw_ring_pad
+        widget._mw_ring_on = False
         with contextlib.suppress(tk.TclError):
             widget.configure(highlightthickness=0, padx=padx, pady=pady)
     widget.bind("<FocusIn>", on, add="+")
     widget.bind("<FocusOut>", off, add="+")
     off()
+
+
+def ring_padding(widget, padx=None, pady=None):
+    """Change the padding of a widget that may carry a focus_ring: the
+    ring keeps taking its width out of the new padding while it shows,
+    and gives the new padding back when the focus leaves."""
+    base = getattr(widget, "_mw_ring_pad", None)
+    try:
+        if base is None:
+            kw = {k: v for k, v in (("padx", padx), ("pady", pady))
+                  if v is not None}
+            if kw:
+                widget.configure(**kw)
+            return
+        padx = base[0] if padx is None else padx
+        pady = base[1] if pady is None else pady
+        widget._mw_ring_pad = (padx, pady)
+        cut = widget._mw_ring_w if widget._mw_ring_on else 0
+        widget.configure(padx=max(0, padx - cut), pady=max(0, pady - cut))
+    except tk.TclError:
+        pass
 
 
 def key_mod_masks(platform=None):
@@ -46595,6 +46627,11 @@ class LocalServicesView:
 
     def on_subview(self, shown):
         """The sub-view row shows the count while Local services is shown."""
+        if not shown:
+            with contextlib.suppress(tk.TclError, AttributeError):
+                sub = self.tab._sub_bar
+                if _pack_pady(sub.pack_info()) != 6:
+                    sub.pack_configure(pady=(6, 0))
         if not self._count_on_sub:
             return
         with contextlib.suppress(tk.TclError):
@@ -46783,6 +46820,25 @@ class LocalServicesView:
         except (tk.TclError, ValueError, TypeError):
             return None
 
+    def _compact_bars(self, short):
+        """A short window: the gaps around the table shrink, and the
+        Refresh and Open buttons take the sub-view buttons' slimmer
+        padding (sixth audit: 4 rows in Spanish on the Windows runner's
+        768-pixel screen, in French on Ubuntu 24.04's fonts)."""
+        gap = (0, 2) if short else (0, 6)
+        if _pack_pady(self.bar.pack_info()) != sum(gap):
+            self.bar.pack_configure(pady=gap)
+            self.wrap.pack_configure(pady=(0, 0 if short else 6))
+        want = "Sub.TButton" if short else "TButton"
+        for b in (self.refresh_btn, self.open_btn):
+            if (str(b.cget("style")) or "TButton") != want:
+                b.configure(style=want)
+        sub = getattr(self.tab, "_sub_bar", None)
+        if sub is not None and sub.winfo_manager() == "pack":
+            top = 2 if short else 6
+            if _pack_pady(sub.pack_info()) != top:
+                sub.pack_configure(pady=(top, 0))
+
     def fit_rows(self):
         """A short window (Extra large text at 1024×690): the table keeps
         MIN_ROWS rows. The line under it then steps aside while it only
@@ -46798,12 +46854,21 @@ class LocalServicesView:
                 return
             need = self._table_need()
             shown = bool(lbl.winfo_manager())
-            # the room the table, the line and the gaps share: the same
-            # whatever is shown, so the choice can't go back and forth
+            sub = getattr(self.tab, "_sub_bar", None)
+            short = self._detail_mode != "full"
+            if not short:
+                self._bar_full_h = self.bar.winfo_height()
+            bar_full = getattr(self, "_bar_full_h", None) or \
+                self.bar.winfo_height()
+            # the room the table, the line, the button row and the gaps
+            # share: the same whatever is shown or compact, so the choice
+            # can't go back and forth
             pads = _pack_pady(self.wrap.pack_info()) + \
-                _pack_pady(self.bar.pack_info())
-            total = self.wrap.winfo_height() + pads + (
-                lbl.winfo_height() + 6 if shown else 0)
+                _pack_pady(self.bar.pack_info()) + (
+                    _pack_pady(sub.pack_info()) if sub is not None else 0)
+            total = self.wrap.winfo_height() + self.bar.winfo_height() + \
+                pads + (lbl.winfo_height() + 6 if shown else 0)
+            full_pads = 6 + 6 + (6 if sub is not None else 0)
             f = tkfont.nametofont(mw_font(9))
             line = f.metrics("linespace") + 2
             width = max(100, self.frame.winfo_width() - 2 * px(12) - 8)
@@ -46813,7 +46878,7 @@ class LocalServicesView:
             if r is not None:
                 lines = max(1, int(math.ceil(f.measure(text) /
                                              max(1, wrapw))))
-            if total >= need + 12 + lines * line + 6:
+            if total >= need + bar_full + full_pads + lines * line + 6:
                 mode = "full"
             elif r is not None:
                 mode = "line"
@@ -46821,12 +46886,7 @@ class LocalServicesView:
             else:
                 mode = "hidden"
             self._detail_mode = mode
-            # a short window: the gaps around the table shrink too
-            gap = (0, 6) if mode == "full" else (0, 2)
-            if _pack_pady(self.bar.pack_info()) != sum(gap):
-                self.bar.pack_configure(pady=gap)
-                self.wrap.pack_configure(pady=(0, gap[1] if
-                                               mode == "full" else 0))
+            self._compact_bars(mode != "full")
             if str(lbl.cget("text")) != text:
                 lbl.configure(text=text)
             if mode == "hidden" and shown:
@@ -54917,8 +54977,10 @@ class TabStrip:
         bar.pack(fill="x")
         # one Tab stop for the whole strip (the shown tab's label, set in
         # sync()); Left / Right / Home / End move along the tabs
-        lbl = tk.Label(outer, bg=side, fg=fg, padx=7, pady=3,
-                       font=mw_font(10, "bold"), takefocus=0)
+        # (compact mode: a tab added on a short window is compact too)
+        lbl = tk.Label(outer, bg=side, fg=fg, padx=7,
+                       pady=1 if getattr(self.app, "_compact", False)
+                       else 3, font=mw_font(10, "bold"), takefocus=0)
         focus_ring(lbl)             # 5.1.2: the focus can be seen
         lbl.pack(fill="both", expand=True)
         for w in (outer, bar, lbl):
@@ -56174,7 +56236,7 @@ class MiniWireshark:
                                          (12, 8, 12, 2))
             self.body.pack_configure(pady=(2, 2) if c else (6, 4))
             for _o, _b, lbl in self.tabstrip.tabs.values():
-                lbl.configure(pady=1 if c else 3)
+                ring_padding(lbl, pady=1 if c else 3)
             self.tabstrip.schedule()
             if self.config.get("capture.quick_filters", None) is None:
                 self.tabs["packets"].toggle_quick_filters(not c,
@@ -105669,6 +105731,124 @@ def gt_r5_local_services_fit(app, ctx):
         setup("Français", "Normal", "1280x800")
         assert str(view.count_lbl.cget("text")).endswith(
             "joignables depuis le réseau"), view.count_lbl.cget("text")
+    finally:
+        view.source = src0
+        app.config.set("general.language", old[0])
+        app.config.set("appearance.text_size", old[1])
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.geometry(old[2])
+        _gui_pump(root, 0.4, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        tab.show_subview("Websites")
+        view.reload()
+        _gui_pump(root, 0.2)
+
+
+@gui_test_step("sixth audit: a tab that had the keyboard keeps compact "
+               "mode's padding (and its focus ring)")
+def gt_r6_tab_ring_keeps_compact(app, ctx):
+    root = app.root
+    ts = app.tabstrip
+    compact0 = bool(app._compact)
+    focus0 = root.focus_get()
+    labs = [ts.tabs[t][2] for t in ts.order]
+    a, b, c = labs[0], labs[1], labs[2]
+
+    def pady(w):
+        return int(str(w.cget("pady")))
+
+    def ring(w):
+        return int(str(w.cget("highlightthickness")))
+    try:
+        app._apply_density(True)                  # a short window
+        _gui_pump(root, 0.2)
+        assert pady(c) == 1, pady(c)
+        a.focus_force()
+        _gui_pump(root, 0.2)
+        assert ring(a) > 0, "no focus ring on the tab"
+        b.focus_force()                           # the keyboard moves on
+        _gui_pump(root, 0.2)
+        # it took back the padding it had when it was made (3), 4 pixels
+        # more than the other tabs on every row
+        assert ring(a) == 0 and pady(a) == 1, (ring(a), pady(a))
+        assert a.winfo_reqheight() == c.winfo_reqheight(), (
+            a.winfo_reqheight(), c.winfo_reqheight())
+        # the window grows while a tab has the keyboard, then shrinks
+        app._apply_density(False)
+        _gui_pump(root, 0.2)
+        assert ring(b) > 0 and pady(b) == 1 and pady(a) == 3, (
+            ring(b), pady(b), pady(a))
+        app._apply_density(True)
+        _gui_pump(root, 0.2)
+        a.focus_force()
+        _gui_pump(root, 0.2)
+        assert ring(b) == 0 and pady(b) == 1, (ring(b), pady(b))
+        assert b.winfo_reqheight() == c.winfo_reqheight()
+    finally:
+        app._apply_density(compact0)
+        with contextlib.suppress(tk.TclError, AttributeError):
+            (focus0 or root).focus_force()
+        _gui_pump(root, 0.2)
+
+
+@gui_test_step("sixth audit: Local services on a short window: the Refresh "
+               "row and the gaps get slimmer, and come back in full on a "
+               "tall window and on Websites")
+def gt_r6_local_services_slim_bars(app, ctx):
+    root = app.root
+    tab = app._select_tab("websites")
+    view = tab.local
+    sub = tab._sub_bar
+    src0 = view.source
+    view.source = lambda: ("ok", _ls_listeners_all())
+    old = (app.config.get("general.language"),
+           app.config.get("appearance.text_size"), root.geometry())
+
+    def setup(size, geo):
+        app.config.set("appearance.text_size", size)
+        app._apply_text_size(defer=False)
+        root.geometry(geo)
+        _gui_pump(root, 0.5, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        app._select_tab("websites")
+        tab.show_subview("Local services")
+        app._hide_banner()
+        view.reload()
+        _gui_pump(root, 0.6)
+
+    def above_table():
+        """Pixels from the top of the sub-view row to the table."""
+        return view.wrap.winfo_rooty() - sub.winfo_rooty() + \
+            _pack_pady(sub.pack_info())
+    try:
+        app.config.set("general.language", "Español")
+        app._apply_runtime_settings()
+        setup("Normal", "1280x800")
+        assert view._detail_mode == "full", view._detail_mode
+        tall = (above_table(), view.refresh_btn.winfo_height())
+        assert _pack_pady(sub.pack_info()) == 6, sub.pack_info()
+        setup("Extra large", "1024x690")
+        assert view._detail_mode != "full", view._detail_mode
+        # the Refresh row no taller than the sub-view buttons' row, and
+        # 2-pixel gaps: 10 pixels more for the table in Spanish
+        bh = max(view.refresh_btn.winfo_height(),
+                 view.open_btn.winfo_height())
+        sh = max(b.winfo_height() for b in sub.winfo_children()
+                 if b.winfo_class() == "TButton")
+        assert bh <= sh, (bh, sh)
+        assert _pack_pady(sub.pack_info()) == 2, sub.pack_info()
+        assert _pack_pady(view.bar.pack_info()) == 2, view.bar.pack_info()
+        # back on a tall window: the full buttons and gaps
+        setup("Normal", "1280x800")
+        assert view._detail_mode == "full", view._detail_mode
+        assert (above_table(), view.refresh_btn.winfo_height()) == tall, (
+            above_table(), view.refresh_btn.winfo_height(), tall)
+        # Websites keeps its own gap under the sub-view row
+        setup("Extra large", "1024x690")
+        tab.show_subview("Websites")
+        _gui_pump(root, 0.3)
+        assert _pack_pady(sub.pack_info()) == 6, sub.pack_info()
     finally:
         view.source = src0
         app.config.set("general.language", old[0])
