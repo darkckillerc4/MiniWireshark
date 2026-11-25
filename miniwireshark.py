@@ -48546,6 +48546,23 @@ class MapTab(BaseTab):
             else len(self.KIND_ORDER), d.display_name().lower(), d.key))
         pos, i, ring = {}, 0, 0
         n = len(order)
+        # 5.3.4: a map only a few lines tall (150 % in a 1024x768 window)
+        # has no room for a ring: its devices sat on the router, letters
+        # on letters. They stand in a row either side of the router then.
+        ui = self._ui_scale()
+        clear, gap = 28 * ui + 6, 20 * ui + 8   # router+device radii, step
+        self._row_layout = bool(n) and \
+            base_r * (0.55 if n > 14 else 0.72) < clear
+        if self._row_layout:
+            far = 0
+            for j, d in enumerate(order):
+                off = clear + (j // 2) * gap
+                pos[d.key] = (cx + (off if j % 2 == 0 else -off), cy)
+                far = max(far, off)
+            for k, (fx, fy) in saved.items():
+                if k in pos:
+                    pos[k] = (fx * w, fy * h)
+            return pos, (cx, cy), far + 10 * ui
         while i < n:
             cap = 14 + 10 * ring
             chunk = order[i:i + cap]
@@ -48573,11 +48590,16 @@ class MapTab(BaseTab):
         self._pos = pos
         X0, Y0 = self.P(cx, cy)
         R0 = radius * self.scale * 1.08
-        self.c.create_oval(X0 - R0, Y0 - R0, X0 + R0, Y0 + R0,
+        # a row of devices on a short map: a flat ring, as tall as the map
+        row = getattr(self, "_row_layout", False)
+        R0y = min(radius * 1.08, max(4, h / 2 - 2)) * self.scale \
+            if row else R0
+        self.c.create_oval(X0 - R0, Y0 - R0y, X0 + R0, Y0 + R0y,
                            outline=t["muted_fg"], dash=(4, 3),
                            tags=("deco",))
-        if radius >= 60:          # small ring: the title would sit on a node
-            tt = self.c.create_text(X0, Y0 - R0 - 12,
+        # small ring: the title would sit on a node (a row: above the map)
+        if radius >= 60 and not row:
+            tt = self.c.create_text(X0, Y0 - R0y - 12,
                                     text="YOUR LOCAL NETWORK",
                                     fill=t["muted_fg"], tags=("deco",),
                                     font=default_font(9,
@@ -48600,7 +48622,8 @@ class MapTab(BaseTab):
         me = m.my_device_key()
         sw_pos = None
         if sw and self.layer_switch.get():
-            sw_pos = (cx - radius * 0.35, cy + radius * 0.35)
+            sw_pos = (cx - radius - 14 * ui, cy) if row else \
+                (cx - radius * 0.35, cy + radius * 0.35)
         traffic = self.ov_traffic.get()
         self._list_rows = []
         for dev in devs:
@@ -104599,13 +104622,11 @@ def gt_m8_access(app, ctx):
     # the window at 150 %: nothing cut off or drawn over (the Linux stand-in
     # for the Windows 125-200 % check, which needs a Windows machine)
     sc0 = float(root.tk.call("tk", "scaling"))
-    geo0, max0 = root.geometry(), root.maxsize()
+    geo0 = root.geometry()
     found = []
     try:
         apply_ui_scale(root, "150 %")
-        # (a 1024x768 screen) Tk holds the window to the screen unless its
-        # maximum size allows more; the check is of a 1366x768 window
-        root.maxsize(px(4000), px(3000))
+        # as big as the screen allows (Tk holds it to a 1024x768 screen)
         root.geometry(px_geo("1366x768"))
         app._apply_text_size(defer=False)
         _gui_pump(root, 0.8)
@@ -104614,10 +104635,26 @@ def gt_m8_access(app, ctx):
             _gui_pump(root, 0.6)
             found += [(name,) + x for x in layout_audit(root)
                       if x[0] in ("canvas-text-overlap", "overlap")]
+        # 5.3.4: the Map in the window a 1024x768 screen gives, on any
+        # screen: a map a few lines tall had its devices on the router
+        # ("H × R"; with other fonts the circles only, letters apart)
+        root.geometry("1024x768")
+        _gui_pump(root, 0.8)
+        found += [("map 1024x768",) + x for x in layout_audit(root)
+                  if x[0] in ("canvas-text-overlap", "overlap")]
+        mc, rs = app.tabs["map"].c, []
+        for i in mc.find_withtag("node"):
+            if mc.type(i) == "oval" and mc.winfo_ismapped():
+                x1, y1, x2, y2 = mc.coords(i)
+                rs.append(((x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1) / 2,
+                           mc.gettags(i)[0]))
+        found += [("map 1024x768", "nodes-overlap", a[3], b[3])
+                  for k, a in enumerate(rs) for b in rs[k + 1:]
+                  if math.hypot(a[0] - b[0], a[1] - b[1]) <
+                  a[2] + b[2] - 2]
     finally:
         root.tk.call("tk", "scaling", sc0)
         UI_SCALE[0] = old
-        root.maxsize(*max0)
         root.geometry(geo0)
         app._apply_text_size(defer=False)
         _gui_pump(root, 0.5)
