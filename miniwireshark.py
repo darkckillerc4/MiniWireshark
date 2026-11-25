@@ -113711,11 +113711,13 @@ def gt_a6_tab_stops_usable(app, ctx):
         app._select_tab("dash")
         _gui_pump(root, 0.3)
         shown = []
-        show0 = dict(dash.answer_show)
+        # (round 8) the Dashboard's own refresh puts its answers back in
+        # answer_show every few seconds, so the spy sits on what the
+        # card's Return calls instead
+        dash._answer_show = shown.append
         try:
             for i, (key, card) in enumerate(zip(("wrong", "usage"),
                                                 cards)):
-                dash.answer_show[key] = lambda k=key: shown.append(k)
                 card.focus_force()
                 # (CI) Tk gives a key to the window with the focus: wait
                 # until the card has it
@@ -113737,7 +113739,7 @@ def gt_a6_tab_stops_usable(app, ctx):
                 card.event_generate("<Return>")
                 _gui_pump(root, 0.05)
         finally:
-            dash.answer_show.update(show0)
+            del dash._answer_show
         assert shown == ["wrong", "usage"], shown
         # an answer with nothing to show ("Can't tell yet …") is not a
         # stop and has no "Show me ›"; it is again once it has one
