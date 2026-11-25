@@ -42299,15 +42299,19 @@ def install_clipboard_guard(widget):
       box, and Tk's tk_textCopy / tk_textCut however they are called) are
       read back right after they ran and put on the clipboard guarded.
     Text copied from a box the person types into is left as it is. Once
-    per Tk. -> True when the guard is in place. (Windows CI: wrapping
-    Tk's own "clipboard" command instead made Tk end the process with an
-    access violation on its next use, so that command is left alone; a
-    raw Tcl "clipboard append" is kept out of this file by
-    no_copy_skips_the_guard.)"""
+    per Tk (called before every copy). -> True when the guard is in
+    place. A raw Tcl "clipboard append" is kept out of this file by
+    no_copy_skips_the_guard.
+    Round 8 (Windows CI): Tk on Windows ends the whole process with an
+    access violation on the first clipboard use while the main window
+    has never been made (a window hidden before it was first shown, as
+    while asking for the password); the window is made first."""
     try:
         root = widget._root()
     except (AttributeError, tk.TclError):
         return False
+    with contextlib.suppress(tk.TclError):
+        root.winfo_id()                 # makes the window if not made yet
     if getattr(root, "_mw_clip_guard", False):
         return True
     if not _TK_CLIP_APPEND:
@@ -92737,7 +92741,7 @@ sys.modules["mw"] = mw
 spec.loader.exec_module(mw)
 tk, ttk = mw.tk, mw.ttk
 r = tk.Tk()
-r.withdraw()
+r.withdraw()          # never shown: Tk on Windows crashed on a copy here
 print("TK", flush=True)
 assert mw.install_clipboard_guard(r) and mw.install_clipboard_guard(r)
 print("GUARD", flush=True)
