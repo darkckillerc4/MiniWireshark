@@ -33087,7 +33087,8 @@ Program ¦ Programme ¦ Programa
 Listens on ¦ À l'écoute sur ¦ Escucha en
 Who can reach it ¦ Qui peut le joindre ¦ Quién puede acceder
 Some programs couldn't be named or listed without administrator rights. ¦ Certains programmes n'ont pas pu être nommés ou listés sans les droits d'administrateur. ¦ Algunos programas no se pudieron nombrar ni listar sin derechos de administrador.
-%d reachable from the network ¦ %d joignable(s) depuis le réseau ¦ %d accesible(s) desde la red
+%d reachable from the network ¦ %d joignables depuis le réseau ¦ %d accesibles desde la red
+1 reachable from the network ¦ 1 joignable depuis le réseau ¦ 1 accesible desde la red
 Reading the list of services on this computer… ¦ Lecture de la liste des services de cet ordinateur… ¦ Leyendo la lista de servicios de este equipo…
 The list of services needs the optional psutil component (Settings → Repair). ¦ La liste des services nécessite le composant facultatif psutil (Paramètres → Réparer). ¦ La lista de servicios necesita el componente opcional psutil (Ajustes → Reparar).
 This computer didn't let MiniWireshark read the list of services without administrator rights. ¦ Cet ordinateur n'a pas laissé MiniWireshark lire la liste des services sans les droits d'administrateur. ¦ Este equipo no dejó que MiniWireshark leyera la lista de servicios sin derechos de administrador.
@@ -36331,7 +36332,12 @@ def share_tree_width(tree):
     by" cut to a few letters, while the fixed columns kept all their
     width. The fixed columns now give up width (down to their own
     heading's) until every stretching column shows its heading; they
-    get it back as the table grows again. → True when widths changed."""
+    get it back as the table grows again. → True when widths changed.
+    A table that sizes its own columns (_mw_fits_itself: Local services,
+    fifth audit) does it its own way, at the same moments."""
+    own = getattr(tree, "_mw_fits_itself", None)
+    if own is not None:
+        return bool(own())
     try:
         avail = tree.winfo_width()
         if avail < 100:
@@ -42237,7 +42243,11 @@ class BaseTab:
                     continue
                 fixed += w.winfo_reqheight() + _pack_pady(info)
             line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
-            room = h - fixed - 6 * line
+            # (fifth audit) a view may say what its content needs in
+            # pixels (Local services: 5 table rows)
+            content = getattr(self, "_fit_need", None)
+            want = content() if content is not None else None
+            room = h - fixed - (want if want is not None else 6 * line)
             full = 2 * int(top.cget("pady"))
             for c in top.winfo_children():
                 if c.winfo_manager() == "pack":
@@ -42385,6 +42395,7 @@ class BaseTab:
         outer = self.frame
         bar = tk.Frame(outer, bg=WHITE, padx=12)
         bar.pack(fill="x", pady=(6, 0))
+        self._sub_bar = bar
         self._sub_frames, self._sub_btns = {}, {}
         self._sub_cb = on_switch
         for n in names:
@@ -44470,8 +44481,17 @@ class DevicesTab(BaseTab):
 
     def default_cols(self):
         """Beginner's shorter column set is the default, not a lock: the
-        heading's right-click menu shows any column."""
-        cols = [c[0] for c in self.COLS if c[0] != "tags"]
+        heading's right-click menu shows any column.
+        Fifth audit: "Evidence" (◉ ◎ ◌, how a device's presence, name and
+        kind are known) is no longer shown by default. Its cells are only
+        those signs, which a Tk without Xft has no font for: the column
+        was blank for every device in every language, right of "Device
+        evidence", the scale that says how sure MiniWireshark is ("Prueba"
+        next to "Pruebas del dispositivo"). The Inspector and the device
+        card list each fact with how it is known, and the heading's menu
+        (Columns) shows the column."""
+        cols = [c[0] for c in self.COLS if c[0] not in ("tags",
+                                                         "evidence")]
         if self.app.beginner_mode:
             cols = [c for c in cols if c not in ("ipv6", "packets")]
         if any(d.place or d.owner
@@ -44732,6 +44752,7 @@ class WebsitesTab(BaseTab):
         self.local = LocalServicesView(self, views["Local services"])
 
     def _on_subview(self, name):
+        self.local.on_subview(name == "Local services")
         if name == "Local services":
             self.local.shown()
         elif self._dirty:
@@ -45832,6 +45853,7 @@ class LocalServicesView:
                    add="+")
         bar = tk.Frame(frame, bg=WHITE, padx=12)
         bar.pack(fill="x", pady=(0, 6))
+        self.bar = bar
         self.refresh_btn = ttk.Button(
             bar, text="Refresh", command=lambda: self.reload(reprobe=True))
         self.refresh_btn.pack(side="left")
@@ -45851,8 +45873,16 @@ class LocalServicesView:
                         "(one “GET /”), only on this computer, to show its "
                         "title. Listed in “What MiniWireshark sent”; the "
                         "kill switch stops it.")
-        self.count_lbl = tk.Label(bar, text="", bg=WHITE, fg="#666666")
-        self.count_lbl.pack(side="right")
+        # fifth audit: the count sits at the right of the sub-view buttons
+        # (Websites | Local services), shown with this sub-view. In this
+        # bar it took a row of its own in French and Spanish, and at Extra
+        # large in English, a row the table needs in a short window
+        sub_bar = getattr(tab, "_sub_bar", None)
+        self._count_on_sub = sub_bar is not None
+        self.count_lbl = tk.Label(sub_bar if self._count_on_sub else bar,
+                                  text="", bg=WHITE, fg="#666666")
+        if not self._count_on_sub:
+            self.count_lbl.pack(side="right")
         # shown only when some programs couldn't be named or listed
         self.note_lbl = tk.Label(frame, text="", bg=WHITE, fg="#8a5a00",
                                  wraplength=1000, justify="left",
@@ -45863,6 +45893,11 @@ class LocalServicesView:
         self.tree.column("#0", width=self.NAME_COL[1], minwidth=120,
                          stretch=True)
         self.tree.tag_configure("kind", font=mw_font(10, "bold"))
+        # fifth audit: this table sizes its own columns (fit_names)
+        self.tree._mw_fits_itself = self.fit_names
+        self._full = {}              # iid -> the whole heading or name
+        self._fit_job = self._fit_sig = self._x0 = self._fit_set = None
+        self._detail_mode = "full"
         # the selected service in full sentences: a table cell is cut at
         # its column's width, this line wraps
         self.detail_lbl = tk.Label(
@@ -45877,6 +45912,8 @@ class LocalServicesView:
         self.tree.bind("<Return>", self._double)
         self.tree.bind("<<TreeviewSelect>>",
                        lambda e: self._sync_buttons(), add="+")
+        bind_plain(self.tree, "<Configure>", self._fit_soon)
+        bind_plain(frame, "<Configure>", self._fit_soon)
         self.kit = TableKit(
             tab, self.tree, wrap, "local_services",
             key_of=lambda iid: self._key(self.iid_row.get(iid)) or
@@ -45945,6 +45982,7 @@ class LocalServicesView:
                 self._probe_seq != self._probe_seen) and \
                 self._poll_job is None:
             self.refresh()
+        self._fit_soon()             # a text-size or window change
 
     def reload(self, reprobe=False):
         """Refresh: read the connection table again (in the background)
@@ -46002,6 +46040,7 @@ class LocalServicesView:
             return False
         self.iid_row.clear()
         self.iid_group.clear()
+        self._full.clear()
         self.kit.clear()
         pick = None
         # third audit (owner): under one heading per kind, in a fixed
@@ -46018,6 +46057,7 @@ class LocalServicesView:
             giid = tree.insert("", "end", text=text, values=(),
                                open=True, tags=("kind",))
             self.iid_group[giid] = gkey
+            self._full[giid] = text
             for r in members:
                 key = self._key(r)
                 name, cells = local_service_view_cells(r)
@@ -46027,6 +46067,7 @@ class LocalServicesView:
                                                   text=name)
                 iid = tree.insert(giid, idx, text=name, values=vals)
                 self.iid_row[iid] = r
+                self._full[iid] = name
                 self.kit.inserted(giid, iid, slot, key)
                 if key == want:
                     pick = iid
@@ -46038,8 +46079,11 @@ class LocalServicesView:
             text = translate_text(plural(len(rows), "service")) \
                 if rows else ""
             if n_net:
-                text += "  ·  " + translate_text(
-                    "%d reachable from the network") % n_net
+                # fifth audit: "1 joignable", "3 joignables", not
+                # "joignable(s)"
+                text += "  ·  " + (translate_text(
+                    "1 reachable from the network") if n_net == 1 else
+                    translate_text("%d reachable from the network") % n_net)
             self.count_lbl.configure(text=text)
             if partial:
                 self.note_lbl.configure(text=(
@@ -46052,6 +46096,8 @@ class LocalServicesView:
                 self.note_lbl.pack_forget()
         self._sync_buttons()
         self.kit.empty_soon()
+        self._fit_sig = None
+        self._fit_soon()
         return True
 
     def _start_probes(self, rows, own):
@@ -46140,7 +46186,256 @@ class LocalServicesView:
         with contextlib.suppress(tk.TclError):
             self.open_btn.configure(
                 state="normal" if r is not None and r["url"] else "disabled")
-            self.detail_lbl.configure(text=self.detail_text(r))
+        self.fit_rows()
+
+    # ---- fifth audit: whole names, and rows in a short window --------------
+    MIN_ROWS = 5            # rows the table keeps in a short window
+    NAME_SHARE = 0.45       # at most this much of the table for the names
+
+    def on_subview(self, shown):
+        """The sub-view row shows the count while Local services is shown."""
+        if not self._count_on_sub:
+            return
+        with contextlib.suppress(tk.TclError):
+            if shown and not self.count_lbl.winfo_manager():
+                self.count_lbl.pack(side="right")
+            elif not shown and self.count_lbl.winfo_manager():
+                self.count_lbl.pack_forget()
+
+    def _fit_soon(self, *_a):
+        if self._fit_job is None:
+            with contextlib.suppress(tk.TclError):
+                self._fit_job = self.tree.after_idle(self._fit_now)
+
+    def _fit_now(self):
+        self._fit_job = None
+        self.fit_names()
+        self.fit_rows()
+
+    def _fonts(self):
+        """(headings' font, names' font, the names' font spec)."""
+        head = tkfont.nametofont(mw_font(10, "bold"))
+        spec = str(ttk.Style().lookup("Treeview", "font") or
+                   "TkDefaultFont")
+        return head, Charts.font(self.tree, spec), spec
+
+    def _measure_x0(self):
+        """Where Tk starts a heading's text in the name column (after the
+        open/close arrow), measured on a row on screen; None when no row
+        shows."""
+        tree = self.tree
+        for g in tree.get_children():
+            bb = tree.bbox(g, "#0")
+            if not bb:
+                continue
+            y = bb[1] + bb[3] // 2
+            for x in range(bb[0], bb[0] + min(bb[2], px(80))):
+                if "text" in str(tree.identify_element(x, y)):
+                    return x - bb[0]
+        return None
+
+    def _text_x(self, depth):
+        try:
+            indent = float(self.tree.winfo_fpixels(
+                ttk.Style().lookup("Treeview", "indent") or 20))
+        except (tk.TclError, ValueError):
+            indent = 20.0
+        x0 = self._x0 if self._x0 is not None else px(20)
+        return int(math.ceil(x0 + depth * indent))
+
+    @staticmethod
+    def _elide(font, text, room):
+        if font.measure(text) <= room:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid].rstrip() + "…") <= room:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo].rstrip() + "…"
+
+    def fit_names(self):
+        """The name column is as wide as its longest heading (with its
+        count) or service name, measured in the shown language and font;
+        the other columns give it room down to their own heading's
+        width, and it takes its share when there is more. Only when even
+        that can't give it what it needs (NAME_SHARE of the table at
+        most) are the longest texts shortened with "…". In the fifth
+        audit it stayed at 250 pixels (less after Tk squeezed it):
+        "File sharing, printing and streamin", "Partage de fichiers,
+        impression et", "Connexion à une base de donn". Runs again when
+        something else (a text-size change's fit) moved the widths.
+        → True when something changed."""
+        tree = self.tree
+        try:
+            if not tree.winfo_ismapped():
+                return False
+            avail = tree.winfo_width()
+            if avail < 100:
+                return False
+            head, body, spec = self._fonts()
+            disp = tuple(tree["displaycolumns"])
+            all_c = ("#0",) + tuple(tree["columns"])
+            sig = (avail, spec, str(head.actual()), heading_font()[1],
+                   str(heading_font()[0].actual()), self._sig, UI_SCALE[0],
+                   disp, CURRENT_LOCALE,
+                   tuple(str(tree.heading(c, "text")) for c in all_c))
+            now = tuple((int(tree.column(c, "width")),
+                         int(tree.column(c, "minwidth"))) for c in all_c)
+            if sig == self._fit_sig and now == self._fit_set:
+                return False
+            if self._x0 is None:
+                self._x0 = self._measure_x0()
+            items = []
+            for g in tree.get_children():
+                items.append((g, 0))
+                items += [(i, 1) for i in tree.get_children(g)]
+            pad = px(8)
+
+            def need(iid, depth):
+                f = head if depth == 0 else body
+                return self._text_x(depth) + f.measure(
+                    self._full.get(iid, "")) + pad
+            min0 = heading_width(str(tree.heading("#0", "text"))) + 20
+            want0 = max([min0] + [need(i, d) for i, d in items])
+            all_cols = list(tree["columns"])
+            cols = all_cols if not disp or disp[0] == "#all" else \
+                [c for c in disp if c in all_cols]
+            spec_of = {c[0]: c for c in self.COLS}
+            mins, base = {}, {}
+            for c in cols:
+                text = str(tree.heading(c, "text") or "").rstrip(" ▲▼")
+                mins[c] = max(30, heading_width(text) + 20 if text else 30)
+                base[c] = max(mins[c], int(spec_of.get(c, (c, "", 80))[2]))
+            fixed = [c for c in cols if not spec_of.get(c, ("",) * 5)[4]]
+            stretch = [c for c in cols if c not in fixed]
+            room = avail - 4 - sum(base[c] for c in fixed)
+            w0 = min(want0, max(min0, int(avail * self.NAME_SHARE)))
+            rest = room - w0
+            s_base = sum(base[c] for c in stretch)
+            s_min = sum(mins[c] for c in stretch)
+            new = {c: base[c] for c in fixed}
+            if rest >= s_base:
+                # more than enough: the names take their share too
+                extra = rest - s_base
+                weights = s_base + w0
+                for c in stretch:
+                    new[c] = base[c] + extra * base[c] // max(1, weights)
+                w0 = room - sum(new[c] for c in stretch)
+            elif rest >= s_min:
+                give = rest - s_min
+                span = max(1, s_base - s_min)
+                for c in stretch:
+                    new[c] = mins[c] + give * (base[c] - mins[c]) // span
+            else:                              # scrolls sideways
+                for c in stretch:
+                    new[c] = mins[c]
+            changed = False
+            if int(tree.column("#0", "width")) != w0:
+                tree.column("#0", width=w0, minwidth=min(w0, want0))
+                changed = True
+            for c in cols:
+                if int(tree.column(c, "width")) != new[c]:
+                    tree.column(c, width=new[c], minwidth=mins[c])
+                    changed = True
+            # what still doesn't fit is shortened with "…"
+            for iid, depth in items:
+                full = self._full.get(iid)
+                if full is None:
+                    continue
+                f = head if depth == 0 else body
+                shown = self._elide(f, full, w0 - self._text_x(depth) - pad)
+                if str(tree.item(iid, "text")) != shown:
+                    tree.item(iid, text=shown)
+                    changed = True
+            self._fit_sig = sig if self._x0 is not None else None
+            self._fit_set = tuple((int(tree.column(c, "width")),
+                                   int(tree.column(c, "minwidth")))
+                                  for c in all_c)
+            return changed
+        except (tk.TclError, ValueError, TypeError, RuntimeError):
+            return False
+
+    def _table_need(self):
+        """Pixels the table needs for its heading and MIN_ROWS rows."""
+        tree = self.tree
+        rowh = int(float(str(ttk.Style().lookup("Treeview", "rowheight")
+                             or 20)))
+        head_h = 0
+        while head_h < px(80) and str(tree.identify_region(
+                px(10), head_h)) in ("heading", "separator"):
+            head_h += 1
+        if head_h in (0, px(80)):                # not on screen yet
+            head_h = rowh + 4
+        hs = self.wrap.grid_slaves(row=1, column=0)
+        hs_h = hs[0].winfo_reqheight() if hs else 0
+        return head_h + self.MIN_ROWS * rowh + hs_h + 6
+
+    def _fit_need(self):
+        """BaseTab._fit_header: the explanation above steps aside unless
+        the table keeps MIN_ROWS rows and the line under it one line."""
+        try:
+            f = tkfont.nametofont(mw_font(9))
+            return self._table_need() + 12 + f.metrics("linespace") + 8
+        except (tk.TclError, ValueError, TypeError):
+            return None
+
+    def fit_rows(self):
+        """A short window (Extra large text at 1024×690): the table keeps
+        MIN_ROWS rows. The line under it then steps aside while it only
+        says "Select a service…", and holds one line (cut with "…") for
+        the selected service; it wraps in full when there is room. In the
+        fifth audit the table showed about 2 rows there."""
+        lbl = self.detail_lbl
+        r = self.selected_row()
+        text = self.detail_text(r)
+        try:
+            if not self.frame.winfo_ismapped():
+                lbl.configure(text=text)
+                return
+            need = self._table_need()
+            shown = bool(lbl.winfo_manager())
+            # the room the table, the line and the gaps share: the same
+            # whatever is shown, so the choice can't go back and forth
+            pads = _pack_pady(self.wrap.pack_info()) + \
+                _pack_pady(self.bar.pack_info())
+            total = self.wrap.winfo_height() + pads + (
+                lbl.winfo_height() + 6 if shown else 0)
+            f = tkfont.nametofont(mw_font(9))
+            line = f.metrics("linespace") + 2
+            width = max(100, self.frame.winfo_width() - 2 * px(12) - 8)
+            wrapw = min(width, int(float(str(lbl.cget("wraplength")) or 0))
+                        or width)
+            lines = 1
+            if r is not None:
+                lines = max(1, int(math.ceil(f.measure(text) /
+                                             max(1, wrapw))))
+            if total >= need + 12 + lines * line + 6:
+                mode = "full"
+            elif r is not None:
+                mode = "line"
+                text = self._elide(f, text, width)
+            else:
+                mode = "hidden"
+            self._detail_mode = mode
+            # a short window: the gaps around the table shrink too
+            gap = (0, 6) if mode == "full" else (0, 2)
+            if _pack_pady(self.bar.pack_info()) != sum(gap):
+                self.bar.pack_configure(pady=gap)
+                self.wrap.pack_configure(pady=(0, gap[1] if
+                                               mode == "full" else 0))
+            if str(lbl.cget("text")) != text:
+                lbl.configure(text=text)
+            if mode == "hidden" and shown:
+                lbl.pack_forget()
+            elif mode != "hidden" and not shown:
+                lbl.pack(side="bottom", fill="x", pady=(0, 6),
+                         before=self.wrap)
+        except (tk.TclError, ValueError, TypeError):
+            with contextlib.suppress(tk.TclError):
+                lbl.configure(text=text)
 
     @staticmethod
     def detail_text(r):
@@ -104430,6 +104725,191 @@ def gt_534_local_services(app, ctx):
     tab.show_subview("Local services")
     tab.set_filter("")
     assert tab.subview == "Websites"
+
+
+def _ls_listeners_all():
+    """Demo Mode's services and the test fixture's together: headings and
+    names of every length (Local services, fifth audit)."""
+    out = dict(_local_fake_listeners())
+    out.update(DEMO_LOCAL_LISTENERS)
+    out[("TCP", "0.0.0.0", 445)] = (4, "System")
+    out[("TCP", "0.0.0.0", 3389)] = (11, "svchost.exe")
+    return out
+
+
+def _ls_name_cuts(view):
+    """Headings and service names of the Local services table whose text
+    doesn't show whole in its column: [(text shown, why)]. Measured on
+    the table itself: where Tk starts the text (its element under the
+    pointer) plus the text's width in the row's font, against the
+    column's right edge."""
+    tree = view.tree
+    out = []
+    body = tkfont.Font(font=ttk.Style().lookup("Treeview", "font") or
+                       "TkDefaultFont")
+    head = tkfont.nametofont(str(tree.tag_configure("kind", "font")))
+    kinds = dict(LOCAL_KINDS)
+    tree.xview_moveto(0)
+    rel = None                  # the text's start inside its cell
+    for g in tree.get_children():
+        kids = tuple(tree.get_children(g))
+        for iid in (g,) + kids:
+            if iid == g:
+                full = "%s (%d)" % (translate_text(
+                    kinds[view.iid_group[g][1]]), len(kids))
+            else:
+                full = local_service_view_cells(view.iid_row[iid])[0]
+            shown = str(tree.item(iid, "text"))
+            tree.see(iid)
+            tree.update()
+            bb = tree.bbox(iid, "#0")
+            if not bb:
+                out.append((shown, "not on screen"))
+                continue
+            y = bb[1] + bb[3] // 2
+            if rel is None and y < tree.winfo_height():
+                x = bb[0]
+                while x < bb[0] + bb[2] and \
+                        "text" not in str(tree.identify_element(x, y)):
+                    x += 1
+                if x < bb[0] + bb[2]:
+                    rel = x - bb[0]
+            if rel is None:
+                out.append((shown, "no text found in the cell"))
+                continue
+            x = bb[0] + rel
+            need = (head if iid == g else body).measure(shown)
+            if full not in shown:
+                out.append((shown, "shortened, full: " + full))
+            elif x + need > bb[0] + bb[2]:
+                out.append((shown, "cut: text %d px from %d, column ends "
+                            "at %d" % (need, x, bb[0] + bb[2])))
+    return out
+
+
+def _ls_rows_shown(view):
+    """How many rows (headings included) of the table show whole."""
+    tree = view.tree
+    tree.yview_moveto(0)
+    tree.update_idletasks()
+    h = tree.winfo_height()
+    n = 0
+    for g in tree.get_children():
+        for iid in (g,) + tuple(tree.get_children(g)):
+            bb = tree.bbox(iid)
+            if bb and bb[1] + bb[3] <= h:
+                n += 1
+    return n
+
+
+@gui_test_step("fifth audit: Local services shows every heading and name "
+               "whole at 1280×800 (EN, FR, ES), at least 5 rows at "
+               "1024×690 Extra large, and counts in proper words")
+def gt_r5_local_services_fit(app, ctx):
+    root = app.root
+    tab = app._select_tab("websites")
+    view = tab.local
+    src0 = view.source
+    fake = {"listening": _ls_listeners_all()}
+    view.source = lambda: ("ok", dict(fake["listening"]))
+    old = (app.config.get("general.language"),
+           app.config.get("appearance.text_size"), root.geometry())
+
+    def setup(lang, size, geo):
+        app.config.set("general.language", lang)
+        app.config.set("appearance.text_size", size)
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.geometry(geo)
+        _gui_pump(root, 0.5, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        app._select_tab("websites")
+        tab.show_subview("Local services")
+        # (a tip line of an earlier step: one line under the header, as
+        # in the fifth audit's pictures, is the capture's own)
+        app._hide_banner()
+        view.reload()
+        _gui_pump(root, 0.6)
+    try:
+        problems = []
+        for lang in ("English", "Français", "Español"):
+            setup(lang, "Normal", "1280x800")
+            assert view.tree.winfo_ismapped(), lang
+            problems += [(lang,) + p for p in _ls_name_cuts(view)]
+            # whole words for the count: "joignables", not "joignable(s)"
+            assert "(s)" not in str(view.count_lbl.cget("text")), \
+                (lang, view.count_lbl.cget("text"))
+        assert not problems, problems[:8]
+        few = []
+        for lang in ("English", "Français", "Español"):
+            setup(lang, "Extra large", "1024x690")
+            n = _ls_rows_shown(view)
+            if n < 5:
+                few.append((lang, n))
+        assert not few, f"rows shown at 1024×690 Extra large: {few}"
+        # one service reachable from the network: singular in each language
+        fake["listening"] = {("TCP", "0.0.0.0", 8080): (4002, "python3"),
+                             ("TCP", "127.0.0.1", 631): (88, "cupsd")}
+        for lang, want in (("English", "1 reachable from the network"),
+                           ("Français", "1 joignable depuis le réseau"),
+                           ("Español", "1 accesible desde la red")):
+            setup(lang, "Normal", "1280x800")
+            text = str(view.count_lbl.cget("text"))
+            assert text.endswith(want), (lang, text)
+        fake["listening"] = _ls_listeners_all()
+        setup("Français", "Normal", "1280x800")
+        assert str(view.count_lbl.cget("text")).endswith(
+            "joignables depuis le réseau"), view.count_lbl.cget("text")
+    finally:
+        view.source = src0
+        app.config.set("general.language", old[0])
+        app.config.set("appearance.text_size", old[1])
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.geometry(old[2])
+        _gui_pump(root, 0.4, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        tab.show_subview("Websites")
+        view.reload()
+        _gui_pump(root, 0.2)
+
+
+@gui_test_step("fifth audit: Devices shows one evidence column by default "
+               "(Device evidence); Evidence can still be shown")
+def gt_r5_devices_one_evidence_column(app, ctx):
+    root = app.root
+    dt = app.tabs["devices"]
+    app._select_tab("devices")
+    kit = dt.kit
+    mode = app.mode_ui_var.get()
+    try:
+        for ui in ("Advanced", "Beginner"):
+            app.mode_ui_var.set(ui)
+            app._on_ui_mode_change()
+            kit.reset_columns()
+            _gui_pump(root, 0.3)
+            shown = list(dt.tree["displaycolumns"])
+            assert "conf" in shown, (ui, shown)
+            assert "evidence" not in shown, (ui, shown)
+            # the column is still offered under Columns, not shown
+            cols = next(it[1] for it in kit.header_items()
+                        if it and it[0] == "Columns")
+            ev = [c for c in cols if c[0] == translate_text("Evidence")]
+            assert ev and ev[0][3] is False, (ui, [c[0] for c in cols])
+            ev[0][1]()
+            dt.rebuild()
+            _gui_pump(root, 0.3)
+            assert "evidence" in list(dt.tree["displaycolumns"]), ui
+            assert str(dt.tree.heading("evidence", "text")).startswith(
+                translate_text("Evidence")), ui
+            kit.reset_columns()
+            _gui_pump(root, 0.2)
+            assert "evidence" not in list(dt.tree["displaycolumns"]), ui
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        kit.reset_columns()
+        _gui_pump(root, 0.2)
 
 
 @gui_test_step("audit2 Local services in Demo Mode: made-up services, the "
