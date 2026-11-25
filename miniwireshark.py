@@ -27217,29 +27217,59 @@ class NetworkModel:
         the sum: 1,000 devices meeting new websites filled 500 of each a
         device (a million texts, about 125 MB), and the harsh looped replay
         grew in a straight line until they had. Past DEVICE_SITES_TOTAL (or
-        DEVICE_REMOTES_TOTAL) in all, the devices seen longest ago let go of
-        that list first, your labelled ones last, until a tenth is free.
-        -> the keys of the devices whose list was emptied."""
+        DEVICE_REMOTES_TOTAL) in all, entries go until a tenth is free.
+        Round 6: entry by entry (a quiet device lost its WHOLE list
+        before): the devices seen longest ago give their oldest entries
+        first, your labelled devices last, and each keeps its newest few
+        until every device is down to them. An entry's age is when that
+        device last met the website (its tie), else when the website or
+        remote host was last seen, never later than the device itself;
+        one whose record is already forgotten is oldest. Only the devices
+        that give are sorted, so it stays cheap in the tick.
+        -> the keys of the devices whose lists were shortened."""
         devs = self.registry.by_key.values()
-        gone = []
+        gone = {}
         for attr, cap in (("websites", self.DEVICE_SITES_TOTAL),
                           ("remote_ips", self.DEVICE_REMOTES_TOTAL)):
             total = sum(len(getattr(d, attr)) for d in devs)
             if total <= cap:
                 continue
-            goal = cap - cap // 10
+            drop = total - (cap - cap // 10)
             labelled = self.registry.labelled
-            for d in sorted(devs, key=lambda d: (labelled(d), d.last_seen)):
-                lst = getattr(d, attr)
-                if not lst:
-                    continue
-                total -= len(lst)
-                lst.clear()
-                self.dirty_devices.add(d.key)
-                gone.append(d.key)
-                if total <= goal:
+            order = sorted((d for d in devs if getattr(d, attr)),
+                           key=lambda d: (labelled(d), d.last_seen))
+            # the newest `floor` of every device together are at most half
+            # of what is kept, so the second round (to none) is for a
+            # network of tens of thousands of devices only
+            floor = max(1, (cap - cap // 10) // (2 * len(order)))
+            recs = self.websites if attr == "websites" else \
+                self.remote_hosts
+            for keep in (floor, 0):
+                for d in order:
+                    lst = getattr(d, attr)
+                    n = min(len(lst) - keep, drop)
+                    if n <= 0:
+                        continue
+                    seen, key = d.last_seen, d.key
+
+                    def age(e, seen=seen, key=key):
+                        r = recs.get(e)
+                        if r is None:
+                            return 0.0
+                        tie = r.ties.get(key) if attr == "websites" \
+                            else None
+                        return min(tie[2] if tie else r.last_seen, seen)
+                    timed = sorted(lst)        # the same order every time
+                    timed.sort(key=age)
+                    lst.difference_update(timed[:n])
+                    gone[key] = True
+                    drop -= n
+                    if drop <= 0:
+                        break
+                if drop <= 0:
                     break
-        return gone
+        self.dirty_devices.update(gone)
+        return list(gone)
 
     REMOTE_KEEP = 6 * 3600   # audit #4: remote hosts and their names
     REMOTE_MAX = 8000        # was 30,000, far above a home network's day
@@ -98774,7 +98804,9 @@ def t_r5_device_lists_capped_in_all(ctx):
     harsh looped replay (1,000 devices, new websites every loop) memory
     grew in a straight line. Flooded through the capture path, the lists
     of all devices together stay under their totals; past them the
-    devices seen longest ago let go first and your labelled ones last."""
+    devices seen longest ago let go first and your labelled ones last.
+    Round 6: the real totals (100,000 of each) are held too; the test set
+    small ones of its own, so 10**9 passed it."""
     gw, ips, macs, nets = scenario_identity()
     m = NetworkModel(ctx.cfg({}), gw, ips, macs)
     m.set_identity(local_nets=nets)
@@ -98804,7 +98836,8 @@ def t_r5_device_lists_capped_in_all(ctx):
     over = memory_over_caps(m)
     assert "websites of all devices" not in over, over
     assert "remote addresses of all devices" not in over, over
-    # which devices let go: the oldest unlabelled ones first
+    # which devices let go: the oldest unlabelled ones first (round 6: one
+    # entry at a time, so each keeps its newest few)
     m.DEVICE_SITES_TOTAL = 900
     reg = m.registry
     t = SCENARIO_T0 + 5000
@@ -98815,16 +98848,109 @@ def t_r5_device_lists_capped_in_all(ctx):
         mac = "02:00:5e:21:00:%02x" % i
         dev = DeviceRecord(key=mac, mac=mac, first_seen=t + age,
                            last_seen=t + age, last_confirmed=t + age)
-        dev.websites.update("s%d-%d.example" % (i, n) for n in range(300))
+        for n in range(300):
+            s = "s%d-%d.example" % (i, n)
+            dev.websites.add(s)
+            m.websites[s] = WebsiteRecord(domain=s, last_seen=t + age)
         reg.by_key[mac] = dev
         four.append(dev)
     four[3].alias = "Grandma's tablet"       # the oldest, but named
     m.dirty_devices.clear()
     gone = m._cap_device_lists()
     assert gone == [four[0].key, four[1].key], gone
-    assert [len(d.websites) for d in four] == [0, 0, 300, 300]
+    # 1,200 -> 810: 390 go, each device keeps its newest 810 // 8 = 101
+    assert [len(d.websites) for d in four] == [101, 109, 300, 300], \
+        [len(d.websites) for d in four]
     assert set(gone) <= m.dirty_devices          # the table is redrawn
     assert m._cap_device_lists() == []           # under the total now
+    # round 6: the real totals (100,000 of each, as the CHANGELOG says)
+    # hold too; above, the instance's own small totals were tested
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    assert "DEVICE_SITES_TOTAL" not in vars(m)
+    for i in range(260):
+        mac = "02:00:5e:22:%02x:%02x" % (i >> 8, i & 255)
+        dev = DeviceRecord(key=mac, mac=mac, first_seen=t, last_seen=t + i,
+                           last_confirmed=t)
+        dev.websites.update("w%d-%d.example" % (i, n)
+                            for n in range(m.DEVICE_SITES_KEEP))
+        dev.remote_ips.update("34.%d.%d.%d" % (i, n >> 8, n & 255)
+                              for n in range(m.DEVICE_REMOTES_KEEP))
+        m.registry.by_key[mac] = dev
+    m._cap_device_lists()
+    for attr in ("websites", "remote_ips"):
+        total = sum(len(getattr(d, attr)) for d in m.registry.by_key.values())
+        assert 0 < total <= 100000, (attr, total)
+
+
+@self_test()
+def t_r6_device_lists_evict_oldest_entries(ctx):
+    """Round 6 (memory): past the total for all devices, a device that was
+    merely quiet (a server heard every few hours) lost its WHOLE list of
+    websites and remote addresses. Now the devices seen longest ago give
+    their oldest entries first (one whose website is already forgotten,
+    then by when that device last met it), each keeps its newest few
+    while the others still have older ones to give, and a labelled device
+    gives last."""
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.DEVICE_SITES_TOTAL = 900
+    m.DEVICE_REMOTES_TOTAL = 400
+    t = SCENARIO_T0 + 20000
+    reg = m.registry
+
+    def device(n, seen):
+        mac = "02:00:5e:23:00:%02x" % n
+        dev = DeviceRecord(key=mac, mac=mac, first_seen=t - 30000,
+                           last_seen=seen, last_confirmed=seen)
+        reg.by_key[mac] = dev
+        return dev
+
+    def sites(dev, fmt, times):
+        for n, ts in enumerate(times):
+            s = fmt % n
+            dev.websites.add(s)
+            w = m.websites.setdefault(s, WebsiteRecord(domain=s,
+                                                       last_seen=t))
+            w.ties[dev.key] = [AS_CONNECTED, ts, ts, 1]
+
+    quiet = device(1, t - 5000)               # heard hours ago
+    busy = device(2, t - 1)
+    fresh = device(3, t)
+    named = device(4, t - 9000)
+    named.alias = "Office server"
+    sites(quiet, "q%d.example", [t - 6000 - n for n in range(300)])
+    sites(busy, "bo%d.example", [t - 8000 - n for n in range(100)])
+    sites(busy, "bn%d.example", [t - 100 - n for n in range(200)])
+    sites(fresh, "c%d.example", [t - n * 0.1 for n in range(300)])
+    sites(named, "l%d.example", [t - 9500] * 300)
+    quiet.websites.update("gone%d.example" % n for n in range(5))  # forgotten
+    m.dirty_devices.clear()
+    gone = m._cap_device_lists()
+    # 1,205 -> 810: 395 go; each device keeps its newest 810 // 8 = 101.
+    # The quiet one gives first (the forgotten ones among its oldest)...
+    assert quiet.websites == {"q%d.example" % n for n in range(101)}, \
+        len(quiet.websites)
+    # ...then the one heard a second before the fresh one: its oldest
+    assert busy.websites == {"bn%d.example" % n for n in range(109)}, \
+        len(busy.websites)
+    assert len(fresh.websites) == 300 and len(named.websites) == 300
+    assert gone == [quiet.key, busy.key], gone
+    assert set(gone) <= m.dirty_devices and named.key not in m.dirty_devices
+    assert sum(len(d.websites) for d in reg.by_key.values()) == 810
+    # remote addresses: by when the remote host was last seen
+    for n in range(300):
+        for dev, ts in ((quiet, t - 7000 - n), (fresh, t - n)):
+            ip = "35.%d.%d.%d" % (dev is fresh, n >> 8, n & 255)
+            dev.remote_ips.add(ip)
+            m.remote_hosts[ip] = RemoteHostRecord(ip=ip, last_seen=ts)
+    m._cap_device_lists()
+    # 600 -> 360: each of the two keeps 90; the quiet one's older 210 go
+    # first, then the fresh one's oldest 30
+    assert len(quiet.remote_ips) == 90 and len(fresh.remote_ips) == 270, \
+        (len(quiet.remote_ips), len(fresh.remote_ips))
+    assert "35.0.0.0" in quiet.remote_ips and \
+        "35.1.1.43" not in fresh.remote_ips and \
+        "35.1.1.13" in fresh.remote_ips
 
 
 @self_test()
