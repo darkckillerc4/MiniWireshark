@@ -30854,7 +30854,7 @@ Confidence ¦ Confiance ¦ Confianza
 Evidence ¦ Preuve ¦ Prueba
 Status ¦ État ¦ Estado
 Traffic ↑/↓ ¦ Trafic ↑/↓ ¦ Tráfico ↑/↓
-Last seen ¦ Vu pour la dernière fois ¦ Visto por última vez
+Last seen ¦ Vu en dernier ¦ Última vez
 Websites and online services your devices looked up or connected to. ¦ Sites web et services en ligne que vos appareils ont recherchés ou contactés. ¦ Sitios web y servicios en línea que sus dispositivos buscaron o a los que se conectaron.
 Seen via ¦ Vu via ¦ Visto mediante
 Category ¦ Catégorie ¦ Categoría
@@ -30863,7 +30863,7 @@ Lookups / visits ¦ Recherches / visites ¦ Búsquedas / visitas
 How we know ¦ Comment on le sait ¦ Cómo lo sabemos
 Traffic ¦ Trafic ¦ Tráfico
 Contacted by ¦ Contacté par ¦ Contactado por
-First seen ¦ Vu pour la première fois ¦ Visto por primera vez
+First seen ¦ Vu en premier ¦ Primera vez
 Where ¦ Où ¦ Dónde
 Server IPs ¦ IP des serveurs ¦ IP de servidores
 Connections — each row is one conversation between a device and something else. Upload is what the device sent; download is what it received. ¦ Connexions — chaque ligne est une conversation entre un appareil et autre chose. L'envoi est ce que l'appareil a émis ; le téléchargement ce qu'il a reçu. ¦ Conexiones — cada fila es una conversación entre un dispositivo y otra cosa. La subida es lo que envió el dispositivo; la descarga, lo que recibió.
@@ -112263,7 +112263,11 @@ def gt_a6_alerts_1024(app, ctx):
     pack0 = {k: v for k, v in real.pack_info().items() if k != "in"}
     geo0, max0 = root.geometry(), root.maxsize()
     root.maxsize(px(4000), px(3000))     # a 1024-px screen: truly 1024
-    root.geometry(px_geo("1024x690"))
+    # 1024 wide is what this step is about; at 690 high, Extra large and
+    # French the header, tool bar and three rows of tabs left the table
+    # 0-120 px (font-dependent; Known limits: "Extra large text on a
+    # small screen"), too little for Tk to lay its columns out
+    root.geometry(px_geo("1024x900"))
     _gui_pump(root, 0.5)
     try:
         for lang in ("Français", "Español"):
