@@ -105832,8 +105832,11 @@ def gt_r6_inspector_and_saved_widths(app, ctx):
         if kt is None or tr is None or str(tr.cget("xscrollcommand")):
             continue
         cols = [c for c in tr["columns"]]
+        # a column an earlier step narrowed (a 1024-pixel screen) counts
+        # with the width it gets back, kept in _mw_w0
+        w0 = getattr(tr, "_mw_w0", None) or {}
         if any(int(tr.column(c, "stretch")) for c in cols) and \
-                sum(int(tr.column(c, "width")) for c in cols
+                sum(int(w0.get(c) or tr.column(c, "width")) for c in cols
                     if not int(tr.column(c, "stretch"))) > 500:
             name = nm
             break
