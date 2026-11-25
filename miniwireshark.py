@@ -92671,10 +92671,7 @@ print("TK", flush=True)
 assert mw.install_clipboard_guard(r) and mw.install_clipboard_guard(r)
 print("GUARD", flush=True)
 got = []
-
-def board_now():
-    got.append(r.clipboard_get())
-    return got[-1]
+board_now = lambda: (got.append(r.clipboard_get()), got[-1])[1]
 r.clipboard_clear()
 r.clipboard_append("=1+1\nDevice\n=cmd|x")       # tkinter's own
 assert board_now() == "'=1+1\nDevice\n'=cmd|x", got
