@@ -51414,7 +51414,11 @@ class PacketsTab(BaseTab):
                 return
             need, keep = self.details_room()
             pos = vert.sashpos(0)
-            if total - pos >= need or total < keep + 40:
+            # (5.3.4) the list keeps its three rows too: a pane that grew
+            # (a panel above it closed) gave all the new room to the
+            # details and left the list the one row it had
+            if (total - pos >= need and pos >= keep) or \
+                    total < keep + 40:
                 # too short for three rows and the details: the packet
                 # list comes first (halving it left one row on Windows)
                 return
@@ -109146,6 +109150,7 @@ def gt_c534_settings(app, ctx):
                "cards show the keyboard focus")
 def gt_c534_palette_focus(app, ctx):
     root = app.root
+    panel0 = app.state_panel is not None
     p = app.open_palette()
     try:
         p.q.set("happening")
@@ -109175,6 +109180,9 @@ def gt_c534_palette_focus(app, ctx):
         assert not p.alive(), "a click away left Ctrl+K open"
     finally:
         p.close()
+        # the click on the mode line also opened the panel under it:
+        # closed again, so later steps see the window as it was
+        app.toggle_state_panel(panel0)
     # Tab into a drop-down list or a number box draws a ring
     st = ttk.Style()
     ring = st.lookup("TCheckbutton", "focuscolor")
@@ -110075,6 +110083,39 @@ def gt_c12_packet_view(app, ctx):
         (vals, len(app.all_rows))
     assert tree.set(top, "pct") == "100.0", tree.set(top, "pct")
     pt.show_subview("Packets")
+
+
+@gui_test_step("5.3.4: the packet list keeps three rows when its pane grows "
+               "(a panel above it closes) with the divider near the top")
+def gt_534_packets_list_keeps_rows(app, ctx):
+    root = app.root
+    pt = app.tabs["packets"]
+    vert = pt.vert_pane
+    geo, max0 = root.geometry(), root.maxsize()
+    root.maxsize(px(4000), px(3000))     # a 768-px screen: truly 1000 high
+    try:
+        app._select_tab("packets")
+        pt.show_subview("Packets")
+        root.geometry(px_geo("1024x760"))
+        _gui_pump(root, 0.8)
+        # the divider where a shorter pane left it: the list one row
+        _need, keep = pt.details_room()
+        vert.sashpos(0, max(10, keep // 3))
+        _gui_pump(root, 0.3)
+        # the pane grows (in the full run: the panel under the mode line
+        # closed); the room for both now: the list gets its rows back
+        root.geometry(px_geo("1024x1000"))
+        _gui_pump(root, 1.0)
+        total, pos = vert.winfo_height(), vert.sashpos(0)
+        need, keep = pt.details_room()
+        assert total >= need + keep, (total, need, keep)
+        assert pos >= keep - 2 and total - pos >= need - 2, \
+            (total, pos, need, keep)
+        assert pt._nslots() >= 3, (total, pos, keep, pt._nslots())
+    finally:
+        root.maxsize(*max0)
+        root.geometry(geo)
+        _gui_pump(root, 0.4)
 
 
 @gui_test_step("5.3.4 crowd #13: the network sheet previews cleanly, has a "
