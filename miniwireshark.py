@@ -111600,8 +111600,9 @@ def t_r5_call_frame_limit_survives_a_busy_machine(ctx):
         assert "of CPU time on average over 3 runs" in slow, slow
         assert call_frame_limit_check(None, [b"f"], lambda f: (
             time.sleep(0.02), 0.001)[1], tries=3, cpu=any_cpu) == ""
-    # the CPU clock sees work, not waiting
-    cpu = _cpu_clock()
+    # the CPU clock sees work, not waiting (round 8: on Windows too, on
+    # its coarse clock; the limits below are 3 of its 15.6 ms ticks away)
+    cpu = any_cpu
     if cpu is None:
         return "skip"
     c0 = cpu()
