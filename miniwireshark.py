@@ -36401,6 +36401,15 @@ def share_tree_width(tree):
                 info[c][0] >= info[c][2] for c in stretch):
             return False                       # nothing is cut
         excess = {c: max(0, base[c] - info[c][2]) for c in fixed}
+        # (fourth audit) a column of a few fixed words (the Alerts
+        # Severity) keeps room for them while the other fixed columns can
+        # give up enough; only past that does it go down to its heading
+        words = {c: max(info[c][2], min(base[c], cell_texts_width(tree, c)))
+                 for c in fixed}
+        if any(words[c] > info[c][2] for c in fixed):
+            spare = {c: max(0, base[c] - words[c]) for c in fixed}
+            if sum(spare.values()) >= sum(base.values()) - room:
+                excess = spare
         total = sum(excess.values())
         if total <= 0:
             return False
@@ -60016,7 +60025,11 @@ proc ::mw_explicit_fonts {top names} {
             vertical = str(pane.cget("orient")) == "vertical"
             total = pane.winfo_height() if vertical else pane.winfo_width()
             pos = pane.sashpos(0)
-            new = max(px(80), min(total - px(80), pos + int(delta)))
+            # each side keeps 80 px, or a quarter of a short pane (the
+            # Packets list and details get about 150 px on a 768-pixel
+            # screen: with 80 px kept each side the divider couldn't move)
+            edge = min(px(80), max(1, total // 4))
+            new = max(edge, min(total - edge, pos + int(delta)))
             pane.sashpos(0, new)
             pos = pane.sashpos(0)
         except tk.TclError:
@@ -100814,6 +100827,9 @@ def gui_test_record(results, name, fn):
     except Exception as e:                           # noqa: BLE001
         results.append(("FAIL", name, f"{type(e).__name__}: {e}\n" +
                         traceback.format_exc(limit=6)))
+    finally:
+        with contextlib.suppress(Exception):
+            _kbd_restore_geo()        # a window made taller for the step
 
 
 def run_gui_test(live=False):
@@ -101318,6 +101334,8 @@ def _kbd_packet_row(app, ctx):
         _gui_pump(root, 0.5)
     row = pick()
     assert row is not None, (len(app.all_rows), app.data_mode)
+    if app.current_tab_name() == "packets":
+        _kbd_room(root, app.tabs["packets"].vert_pane)
     return row
 
 
@@ -101523,10 +101541,14 @@ def gt_kbd_enter_opens(app, ctx):
         tree.event_generate("<Return>")
         _gui_pump(root, 0.1)
         by_key = list(calls)
-        del calls[:]
-        tree.event_generate("<KP_Enter>")
-        _gui_pump(root, 0.1)
-        assert calls == by_key, (calls, by_key)
+        # (CI windows 3.14) Tk on Windows has no KP_Enter key: the keypad
+        # Enter arrives as Return (with the extended-key flag), checked
+        # above; a generated KP_Enter never reaches a binding there
+        if root.tk.call("tk", "windowingsystem") != "win32":
+            del calls[:]
+            tree.event_generate("<KP_Enter>")
+            _gui_pump(root, 0.1)
+            assert calls == by_key, (calls, by_key)
         return by_key
     try:
         for owner, attr in ((app, "show_website"), (app, "show_flow"),
@@ -109025,9 +109047,11 @@ def t_r5_call_frame_limit_survives_a_busy_machine(ctx):
     c0 = cpu()
     time.sleep(0.15)
     waited = cpu() - c0
+    # (CI windows 3.12: 150 ms of wall time got 47 ms of CPU time on a
+    # busy runner) work until the CPU clock has counted 60 ms, at most 5 s
     c0 = cpu()
-    end = time.perf_counter() + 0.15
-    while time.perf_counter() < end:
+    end = time.perf_counter() + 5.0
+    while cpu() - c0 < 0.06 and time.perf_counter() < end:
         pass
     worked = cpu() - c0
     assert waited < 0.05 <= worked, (waited, worked)
@@ -109926,14 +109950,54 @@ def t_kbd_saved_key_equal_to_a_new_default(ctx):
     assert "clear" not in shortcut_default_losers(d)
 
 
-def _kbd_mid_sash(pane):
+_KBD_GEO = {}
+
+
+def _kbd_room(root, pane, need=None):
+    """(CI windows, a 768-pixel screen) with the GUI test's banners and
+    filter rows the Packets list and details got about 10 pixels, so
+    neither the divider keys nor the packet's fields could be reached.
+    Make the window taller for the step (Tk allows a window taller than
+    the screen once its maximum size allows it); gui_test_record puts it
+    back after the step."""
+    need = need or px(200)
+    with contextlib.suppress(tk.TclError):
+        for _i in range(4):
+            root.update_idletasks()
+            have = pane.winfo_height()
+            if have >= need:
+                break
+            if "root" not in _KBD_GEO:
+                _KBD_GEO.update(root=root, geo=root.geometry(),
+                                max=root.maxsize())
+            root.maxsize(px(4000), px(3000))
+            root.geometry("%dx%d" % (root.winfo_width(),
+                                     root.winfo_height() + need - have + 40))
+            _gui_pump(root, 0.4)
+
+
+def _kbd_restore_geo():
+    if not _KBD_GEO:
+        return
+    was = dict(_KBD_GEO)
+    _KBD_GEO.clear()
+    with contextlib.suppress(tk.TclError):
+        was["root"].maxsize(*was["max"])
+        was["root"].geometry(was["geo"])
+        _gui_pump(was["root"], 0.3)
+
+
+def _kbd_mid_sash(root, pane):
     """Put a divider half way before a keyboard move is measured: a step
     run after a smaller window found the Packets divider already at its
-    limit (80 px above the bottom), so a move down had no room."""
+    limit, so a move down had no room (and on a 768-pixel screen the
+    Inspector's divider started past its limit)."""
     with contextlib.suppress(tk.TclError):
+        vertical = str(pane.cget("orient")) == "vertical"
+        if vertical:
+            _kbd_room(root, pane)
         pane.update_idletasks()
-        size = pane.winfo_height() if str(pane.cget("orient")) == \
-            "vertical" else pane.winfo_width()
+        size = pane.winfo_height() if vertical else pane.winfo_width()
         pane.sashpos(0, size // 2)
         pane.update_idletasks()
 
@@ -110237,6 +110301,7 @@ def gt_kbd_f_keys_and_dividers(app, ctx):
         app.toggle_inspector(True, remember=False)
         _gui_pump(root, 0.6)
         body = app.body
+        _kbd_mid_sash(root, body)
         p0 = body.sashpos(0)
         lbl = app.tabstrip.selected_label()
         _kbd_press(root, lbl, "<Control-Shift-Left>")
@@ -110249,7 +110314,7 @@ def gt_kbd_f_keys_and_dividers(app, ctx):
         # the Packets list | details divider
         pt = app._select_tab("packets")
         _gui_pump(root, 0.6)
-        _kbd_mid_sash(pt.vert_pane)
+        _kbd_mid_sash(root, pt.vert_pane)
         v0 = pt.vert_pane.sashpos(0)
         _kbd_press(root, app.tabstrip.selected_label(),
                    "<Control-Shift-Down>")
@@ -110317,6 +110382,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         tab = app.tabs["devices"]
         table = app._table_target(tab)
         body = app.body
+        _kbd_mid_sash(root, body)
         p0 = body.sashpos(0)
         _kbd_press(root, table, "<Control-Shift-Left>")
         p1 = body.sashpos(0)
@@ -110333,7 +110399,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         # divider and leave the selection where it was
         pt = app._select_tab("packets")
         _gui_pump(root, 0.6)
-        _kbd_mid_sash(pt.vert_pane)
+        _kbd_mid_sash(root, pt.vert_pane)
         v0, sel = pt.vert_pane.sashpos(0), pt.sel_no
         _kbd_press(root, pt.tree, "<Control-Shift-Down>")
         v1 = pt.vert_pane.sashpos(0)
@@ -110345,6 +110411,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         assert str(ro.cget("state")) == "disabled"
         app._select_tab("devices")
         _gui_pump(root, 0.5)
+        _kbd_mid_sash(root, body)
         q0 = body.sashpos(0)
         _kbd_press(root, ro, "<Control-Shift-Left>")
         assert body.sashpos(0) < q0, "no move from the read-only Inspector"
@@ -110353,7 +110420,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         ro = next((t for t in _walk_class(pt.detail_bottom, tk.Text)
                    if t.winfo_viewable() and str(t.cget("state")) ==
                    "disabled"), None)
-        _kbd_mid_sash(pt.vert_pane)
+        _kbd_mid_sash(root, pt.vert_pane)
         w0 = pt.vert_pane.sashpos(0)
         if ro is not None:
             _kbd_press(root, ro, "<Control-Shift-Down>")
