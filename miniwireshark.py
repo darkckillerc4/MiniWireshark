@@ -78772,14 +78772,39 @@ def _mutate_call_frame(rng, raw):
     return bytes(b)
 
 
-def _cpu_clock():
-    """This thread's CPU time clock, or None where there is none."""
+_CPU_CLOCK_STEP = []
+
+
+def _cpu_clock_step(clock, spin=0.2):
+    """The smallest step the clock was seen to move by, in seconds (it
+    ticks in 15.6 ms steps on Windows), or None when it never moved."""
+    steps = []
+    end = time.perf_counter() + spin
+    last = clock()
+    while time.perf_counter() < end and len(steps) < 5:
+        now = clock()
+        if now != last:
+            steps.append(now - last)
+            last = now
+    return min(steps) if steps else None
+
+
+def _cpu_clock(max_step=0.002):
+    """This thread's CPU time clock, or None where there is none or where
+    it is too coarse to time a 50 ms limit (round 6: Windows counts thread
+    time in 15.6 ms ticks, so a 60 ms frame could read as 47 ms). Without
+    it the frames are timed again on the wall clock instead."""
     clock = getattr(time, "thread_time", None)
     try:
         clock()
-        return clock
     except Exception:                                # noqa: BLE001
         return None
+    if not _CPU_CLOCK_STEP:
+        _CPU_CLOCK_STEP.append(_cpu_clock_step(clock))
+    step = _CPU_CLOCK_STEP[0]
+    if step is None or step > max_step:
+        return None
+    return clock
 
 
 def call_frame_limit_check(cpu_slowest, waited, retime, limit=0.050,
@@ -109539,6 +109564,28 @@ def t_r5_call_frame_limit_survives_a_busy_machine(ctx):
         pass
     worked = cpu() - c0
     assert waited < 0.05 <= worked, (waited, worked)
+
+
+@self_test()
+def t_r6_coarse_cpu_clock_not_used(ctx):
+    """Round 6: on Windows the thread CPU clock moves in 15.6 ms ticks,
+    too coarse for the 50 ms frame limit; such a clock is not used (the
+    frames are timed again on the wall clock), a fine one is."""
+    ticks = iter(range(0, 10 ** 6))
+    coarse = lambda: next(ticks) // 1000 * 0.0156   # noqa: E731
+    step = _cpu_clock_step(coarse)
+    assert step is not None and abs(step - 0.0156) < 1e-9, step
+    assert _cpu_clock_step(lambda: 1.0, spin=0.02) is None
+    fine = time.perf_counter
+    assert _cpu_clock_step(fine) < 0.002
+    keep = list(_CPU_CLOCK_STEP)
+    try:
+        _CPU_CLOCK_STEP[:] = [0.0156]
+        assert _cpu_clock() is None
+        _CPU_CLOCK_STEP[:] = [0.000001]
+        assert _cpu_clock() is getattr(time, "thread_time", None)
+    finally:
+        _CPU_CLOCK_STEP[:] = keep
 
 
 @self_test(slow=True, needs_source=True)
