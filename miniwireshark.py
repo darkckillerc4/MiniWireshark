@@ -47638,7 +47638,7 @@ class AlertsTab(BaseTab):
             tk.Label(legend, text=f"{icon} {name}", bg=WHITE, fg=fg,
                      font=mw_font(9)).pack(side="left",
                                                      padx=(0, 16))
-        bar = self.toolbar()
+        bar = self.bar = self.toolbar()
         self.show_ack_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="Show acknowledged", command=self.rebuild,
                         variable=self.show_ack_var).pack(side="left")
@@ -47683,14 +47683,17 @@ class AlertsTab(BaseTab):
         self.held_var = tk.StringVar(value="")
         self.lbl(bar, "", textvariable=self.held_var).pack(side="right",
                                                            padx=(4, 0))
+        self._slim = [inv, more]
         for label, fn in (("Acknowledge", self.acknowledge),
                           ("Details", self._details)):
-            ttk.Button(bar, text=label, command=fn).pack(side="right",
-                                                         padx=(4, 0))
+            b = ttk.Button(bar, text=label, command=fn)
+            b.pack(side="right", padx=(4, 0))
+            self._slim.append(b)
         # 5.1.2: one alert at a time, newest danger first
         self.review_btn = ttk.Button(bar, text="Review",
                                      command=self.app.review_alerts)
         self.review_btn.pack(side="right", padx=(4, 0))
+        self._slim.append(self.review_btn)
         self._review_job = None
         wrap, self.tree = make_tree(self.frame, self.COLUMNS,
                                     selectmode="extended")
@@ -47714,7 +47717,39 @@ class AlertsTab(BaseTab):
         # "AVERTISSEM"; the column fits the longest severity of every
         # language, so a language change needs no new width
         fit_cell_texts(self.tree, "sev", self.severity_texts())
+        self.apply_density(bool(getattr(self.app, "_compact", False)))
         self.on_theme()
+
+    MIN_ROWS = 3
+
+    def apply_density(self, compact):
+        """5.3.4: a short window (Extra large text at 1024×690, French
+        on Ubuntu's DejaVu fonts) left the table 2 rows under the tool
+        bar's two rows of buttons. Compact mode (MiniWireshark.
+        _apply_density) gives the bar's buttons the sub-view buttons'
+        slimmer padding and a smaller gap under the bar; nothing is
+        hidden."""
+        with contextlib.suppress(tk.TclError, AttributeError):
+            gap = (0, 2) if compact else (0, 6)
+            if _pack_pady(self.bar.pack_info()) != sum(gap):
+                self.bar.pack_configure(pady=gap)
+            for w in self._slim:
+                base = w.winfo_class()
+                want = ("Sub." + base) if compact else base
+                if (str(w.cget("style")) or base) != want:
+                    w.configure(style=want)
+
+    def _fit_need(self):
+        """BaseTab._fit_header: the explanation above steps aside unless
+        the table keeps its heading and MIN_ROWS rows (5.3.4; at least
+        the six lines any tab keeps)."""
+        try:
+            rowh = int(float(str(ttk.Style().lookup("Treeview",
+                                                    "rowheight") or 20)))
+            line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+            return max(6 * line, (self.MIN_ROWS + 1) * rowh + px(10))
+        except (tk.TclError, ValueError, TypeError):
+            return None
 
     def severity_texts(self):
         """Every Severity cell this table can show, in every language."""
@@ -56664,6 +56699,10 @@ class MiniWireshark:
             if self.config.get("capture.quick_filters", None) is None:
                 self.tabs["packets"].toggle_quick_filters(not c,
                                                           remember=False)
+            for tab in self.tabs.values():
+                fn = getattr(tab, "apply_density", None)
+                if fn is not None:
+                    fn(c)
         for fr in (getattr(self, "header_frame", None),
                    getattr(self, "toolbar_frame", None)):
             fl = getattr(fr, "_mw_flow", None)
@@ -60390,6 +60429,8 @@ class MiniWireshark:
         # sub-view switches: lighter than the big Accent buttons (they
         # took 40 pixels of height above every packet list)
         s.configure("Sub.TButton", padding=(10, 3))
+        # 5.3.4: the Alerts tool bar's drop-down buttons in compact mode
+        s.configure("Sub.TMenubutton", padding=(5, 2))
         s.configure("Sub.Accent.TButton", padding=(10, 3),
                     font=mw_font(10, "bold"))
         # the main notebook's tabs are drawn by TabStrip (they wrap)
@@ -113428,11 +113469,11 @@ def gt_a6_alerts_1024(app, ctx):
     pack0 = {k: v for k, v in real.pack_info().items() if k != "in"}
     geo0, max0 = root.geometry(), root.maxsize()
     root.maxsize(px(4000), px(3000))     # a 1024-px screen: truly 1024
-    # 1024 wide is what this step is about; at 690 high, Extra large and
-    # French the header, tool bar and three rows of tabs left the table
-    # 0-120 px (font-dependent; Known limits: "Extra large text on a
-    # small screen"), too little for Tk to lay its columns out
-    root.geometry(px_geo("1024x900"))
+    # (5.3.4) at 690 high, Extra large and French the header, tool bar
+    # and three rows of tabs left the table 0-120 px (font-dependent),
+    # too little for Tk to lay its columns out; the tab now gives way
+    # above its table in a short window
+    root.geometry(px_geo("1024x690"))
     _gui_pump(root, 0.5)
     try:
         for lang in ("Français", "Español"):
@@ -113472,6 +113513,17 @@ def gt_a6_alerts_1024(app, ctx):
                     cut = [t for t in texts
                            if font.measure(t) + 12 > ws.get("sev", 0)]
                     assert not cut, (lang, size, ws, cut)
+                    # (5.3.4) room for at least 3 rows, counted with the
+                    # tree's own row height (the first row's box)
+                    for _i in range(4):
+                        t2.insert("", "end", values=("·",) * len(spec))
+                    _gui_pump(root, 0.2)
+                    box = t2.bbox(t2.get_children()[0])
+                    rows = (t2.winfo_height() - int(box[1])) // \
+                        max(1, int(box[3])) if box else 0
+                    assert rows >= 3, (lang, size, rows, box,
+                                       t2.winfo_height(),
+                                       root.winfo_height())
                 finally:
                     real.pack(before=wrap, **pack0)
                     wrap.destroy()
