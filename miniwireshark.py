@@ -105807,7 +105807,8 @@ def gt_r6_local_services_slim_bars(app, ctx):
     src0 = view.source
     view.source = lambda: ("ok", _ls_listeners_all())
     old = (app.config.get("general.language"),
-           app.config.get("appearance.text_size"), root.geometry())
+           app.config.get("appearance.text_size"), root.geometry(),
+           root.minsize())
 
     def setup(size, geo):
         app.config.set("appearance.text_size", size)
@@ -105821,6 +105822,15 @@ def gt_r6_local_services_slim_bars(app, ctx):
         view.reload()
         _gui_pump(root, 0.6)
 
+    def setup_short():
+        """Extra large on a short window, made shorter until the view is
+        short: on Windows (smaller fonts) 1024x690 still had room for
+        everything."""
+        for geo in ("1024x690", "1024x620", "1024x560", "1024x500"):
+            setup("Extra large", geo)
+            if view._detail_mode != "full":
+                return
+
     def above_table():
         """Pixels from the top of the sub-view row to the table."""
         return view.wrap.winfo_rooty() - sub.winfo_rooty() + \
@@ -105832,7 +105842,8 @@ def gt_r6_local_services_slim_bars(app, ctx):
         assert view._detail_mode == "full", view._detail_mode
         tall = (above_table(), view.refresh_btn.winfo_height())
         assert _pack_pady(sub.pack_info()) == 6, sub.pack_info()
-        setup("Extra large", "1024x690")
+        root.minsize(400, 300)
+        setup_short()
         assert view._detail_mode != "full", view._detail_mode
         # the Refresh row no taller than the sub-view buttons' row, and
         # 2-pixel gaps: 10 pixels more for the table in Spanish
@@ -105849,7 +105860,7 @@ def gt_r6_local_services_slim_bars(app, ctx):
         assert (above_table(), view.refresh_btn.winfo_height()) == tall, (
             above_table(), view.refresh_btn.winfo_height(), tall)
         # Websites keeps its own gap under the sub-view row
-        setup("Extra large", "1024x690")
+        setup_short()
         tab.show_subview("Websites")
         _gui_pump(root, 0.3)
         assert _pack_pady(sub.pack_info()) == 6, sub.pack_info()
@@ -105859,6 +105870,7 @@ def gt_r6_local_services_slim_bars(app, ctx):
         app.config.set("appearance.text_size", old[1])
         app._apply_runtime_settings()
         app._apply_text_size(defer=False)
+        root.minsize(*old[3])
         root.geometry(old[2])
         _gui_pump(root, 0.4, until=lambda: not getattr(
             app, "_theme_pending", False), timeout=10)
