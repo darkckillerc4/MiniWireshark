@@ -103707,10 +103707,13 @@ def gt_m8_access(app, ctx):
     # the window at 150 %: nothing cut off or drawn over (the Linux stand-in
     # for the Windows 125-200 % check, which needs a Windows machine)
     sc0 = float(root.tk.call("tk", "scaling"))
-    geo0 = root.geometry()
+    geo0, max0 = root.geometry(), root.maxsize()
     found = []
     try:
         apply_ui_scale(root, "150 %")
+        # (a 1024x768 screen) Tk holds the window to the screen unless its
+        # maximum size allows more; the check is of a 1366x768 window
+        root.maxsize(px(4000), px(3000))
         root.geometry(px_geo("1366x768"))
         app._apply_text_size(defer=False)
         _gui_pump(root, 0.8)
@@ -103722,6 +103725,7 @@ def gt_m8_access(app, ctx):
     finally:
         root.tk.call("tk", "scaling", sc0)
         UI_SCALE[0] = old
+        root.maxsize(*max0)
         root.geometry(geo0)
         app._apply_text_size(defer=False)
         _gui_pump(root, 0.5)
