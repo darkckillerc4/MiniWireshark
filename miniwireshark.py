@@ -28298,6 +28298,12 @@ def clean_config_values(data):
     return fixed
 
 
+SETTINGS_IS_FOLDER = ("Your settings can't be read: there is a folder where "
+                      "the settings file should be. This run uses the "
+                      "defaults and leaves the folder as it is; move or "
+                      "rename that folder so your settings can be saved.")
+
+
 class AppConfig:
     """JSON-backed settings. Degrades to defaults on any read/parse problem
     rather than crashing (keeping a backup of the damaged file); migrates
@@ -28370,6 +28376,14 @@ class AppConfig:
         # or indexer holding it on Windows) is retried, then left alone:
         # before, it counted as damaged and the next save replaced the
         # user's settings with the defaults
+        if os.path.isdir(self.path):
+            # round 8 (keyboard check on Windows): a folder with the
+            # settings file's name was reported as a file another program
+            # held, after a second of retries that could never work
+            LOG.warning("settings: %s is a folder, not a file", self.path)
+            self.read_only = True
+            self.warning = SETTINGS_IS_FOLDER
+            return defaults
         raw = None
         for attempt in range(4):
             try:
@@ -33273,6 +33287,7 @@ Danger: %s ¦ Danger : %s ¦ Peligro: %s
 Danger (%d times): %s ¦ Danger (%d fois) : %s ¦ Peligro (%d veces): %s
 What changed: the story ¦ Ce qui a changé : le récit ¦ Qué cambió: el relato
 Read the story ¦ Lire le récit ¦ Leer el relato
+Your settings can't be read: there is a folder where the settings file should be. This run uses the defaults and leaves the folder as it is; move or rename that folder so your settings can be saved. ¦ Vos réglages ne peuvent pas être lus : il y a un dossier à la place du fichier de réglages. Cette session utilise les réglages par défaut et laisse le dossier tel quel ; déplacez ou renommez ce dossier pour que vos réglages puissent être enregistrés. ¦ No se pueden leer sus ajustes: hay una carpeta donde debería estar el archivo de ajustes. Esta sesión usa los ajustes predeterminados y deja la carpeta como está; mueva o cambie el nombre de esa carpeta para que sus ajustes se puedan guardar.
 The changes of the last days in plain sentences, with what is new since you last looked. ¦ Les changements des derniers jours en phrases simples, avec ce qui est nouveau depuis votre dernier coup d'œil. ¦ Los cambios de los últimos días con frases sencillas, con lo nuevo desde la última vez que miró.
 1 change in this data. ¦ 1 changement dans ces données. ¦ 1 cambio en estos datos.
 %d changes in this data. ¦ %d changements dans ces données. ¦ %d cambios en estos datos.
@@ -58933,8 +58948,21 @@ class MiniWireshark:
             ("Warnings", lines(dg["alerts"], lambda t, sev, x:
                                f"{fmt_clock(t)}  {sev}: {x}")),
         ]
-        return DetailDialog(self, f"What changed — {period.lower()}",
-                            sections, size="700x600")
+        # round 8 (keyboard check on Windows): each click opened another
+        # window (seven at once); one is reused, like the device cards
+        title = f"What changed — {period.lower()}"
+        old = getattr(self, "_changes_dlg", None)
+        if old is not None and old.alive():
+            with contextlib.suppress(tk.TclError):
+                old.win.title(title)
+                old.set_sections(sections)
+                old.win.deiconify()
+                old.win.lift()
+                old.win.focus_force()
+                return old
+        dlg = DetailDialog(self, title, sections, size="700x600")
+        self._changes_dlg = dlg
+        return dlg
 
     # ---- Story mode (5.3.4 M7) -----------------------------------------------
     def story_period(self):
@@ -83439,6 +83467,29 @@ def t_m2_history_two_copies_and_clock(ctx):
         time.time = real_time
     assert st2.counts()["observations"] == 1, st2.counts()
     st2.stop(5)
+
+
+@self_test()
+def t_r8_settings_path_is_a_folder(ctx):
+    """Round 8 (keyboard check on Windows): with a folder where the
+    settings file should be, the banner said another program might be
+    holding the file. It now says there is a folder there, at once (no
+    retries), uses the defaults and saves nothing over the folder."""
+    path = ctx.path("cfg-is-a-folder.json")
+    os.makedirs(os.path.join(path, "inside"), exist_ok=True)
+    t0 = time.monotonic()
+    c = AppConfig(path=path)
+    took = time.monotonic() - t0
+    assert c.read_only and c.warning == SETTINGS_IS_FOLDER, c.warning
+    assert "another program" not in c.warning and "folder" in c.warning
+    assert took < 0.5, took                      # no 1-second retries
+    assert c.save() is False
+    assert os.path.isdir(os.path.join(path, "inside"))
+    assert c.get("appearance.theme") == _default_config()[
+        "appearance"]["theme"]
+    for loc in ("fr", "es"):
+        assert translate_text(SETTINGS_IS_FOLDER, loc) != \
+            SETTINGS_IS_FOLDER, loc
 
 
 @self_test()
@@ -112884,6 +112935,48 @@ def _kbd_press(root, widget, seq, pump=0.08):
     w = root.focus_get() or widget or root
     w.event_generate(seq)
     _gui_pump(root, pump)
+
+
+@gui_test_step("round 8: What changed opens one window, reused on each "
+               "click (like the device cards)")
+def gt_r8_what_changed_one_window(app, ctx):
+    """Round 8 (keyboard check on Windows): each click on the Dashboard's
+    What changed card opened another "What changed — last hour" window,
+    seven at once. One window is reused, showing the period asked for."""
+    root = app.root
+
+    def windows():
+        out = []
+        for w in root.winfo_children():
+            with contextlib.suppress(tk.TclError):
+                if isinstance(w, tk.Toplevel) and w.winfo_exists() and \
+                        str(w.title()).startswith(
+                            translate_text("What changed")[:6]):
+                    out.append(w)
+        return out
+    for w in windows():
+        w.destroy()
+    try:
+        first = app.open_changes("Last hour")
+        _gui_pump(root, 0.2)
+        for _ in range(3):
+            again = app.open_changes("Last hour")
+            _gui_pump(root, 0.1)
+            assert again is first, "a new window for the same click"
+        day = app.open_changes("Last 24 hours")
+        _gui_pump(root, 0.2)
+        assert day is first
+        assert len(windows()) == 1, [w.title() for w in windows()]
+        assert "24" in first.win.title(), first.win.title()
+        first.win.destroy()
+        _gui_pump(root, 0.1)
+        fresh = app.open_changes("Last hour")
+        assert fresh is not first and fresh.alive()
+        assert len(windows()) == 1
+    finally:
+        for w in windows():
+            w.destroy()
+        _gui_pump(root, 0.1)
 
 
 @gui_test_step("round 8: the Inspector opened in a 1024-pixel window gets "
