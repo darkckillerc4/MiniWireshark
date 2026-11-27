@@ -27,7 +27,6 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **Connected helpers:** a Pi-hole or AdGuard Home certificate is checked before the password is sent.
 - **Windows:** the Npcap installer is no longer refused by its own signature check. **macOS:** an apostrophe in a folder name can't break the administrator prompt, and Wi-Fi is found without Apple's removed `airport` tool.
 - **Help → About** shows the version, the MIT licence and the Wireshark trademark notice.
-- **Leaving the demo never starts watching.** "Exit demo" used to start a real capture on your network card at once, with no question. Now it ends the demo and waits for you to click *Start watching*. The top line says *ACTIVE SCANNING* only on a network you marked as yours (after Stop it could say so on a network that was never checked). In Demo Mode, the Settings buttons that go online (update check, reference lists, data pack, country lookups, repair) ask first.
 - **50-tester crowd fixes.** A recorded shortcut can't be a bare letter any more (Win+F was saved as "f", so typing an f jumped to search), Command is understood on macOS and Num Lock is no longer read as Alt on Windows. Opening a file no longer says it "starts a fresh live session". A broadcast address is never named the router. ARP has its own line in the Protocol hierarchy instead of counting under IPv4. Help calls the Happening tab by its name.
 
 **New features**
@@ -79,6 +78,10 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 - **IPv6 fragments and cut-short IPv6 headers are quick.** A fragment header, or a chain of IPv6 extension headers cut short, sent the packet to the slower decoder: 0.2 to 0.6 ms a packet here, up to 112 ms in the third audit. Both now take about 3 to 5 microseconds. Each new IPv6 address also costs less: 4 instead of 12 microseconds a packet.
 - **Damaged IP headers and unknown IP protocols are quick.** An IPv4 header shorter than its 20 bytes, or an IP protocol that neither decoder knows (also behind IPv4 options or IPv6 option headers), was read again by the slower decoder only to be called "Raw frame": 0.1 to 6 ms a packet. The fast decoder now says "Raw frame" itself, in about 5 microseconds.
 - *Compare sessions* over 90 days of history takes about 60 ms instead of 4.9 seconds.
+
+**Changed**
+
+- **Leaving Demo Mode no longer starts a capture by itself.** "Exit demo" used to start a real capture on your network card at once, with no question. Now it ends the demo and waits for you to click *Start watching*. The top line says *ACTIVE SCANNING* only on a network you marked as yours (after Stop it could say so on a network that was never checked). In Demo Mode, the Settings buttons that go online (update check, reference lists, data pack, country lookups, repair) ask first.
 
 **Fixes**
 
