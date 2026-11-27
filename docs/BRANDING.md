@@ -1,6 +1,6 @@
 # Logo and images
 
-Everything here is in [`assets/`](assets/), drawn as SVG in the app's own palette (navy `#0f1b2d` to `#1b3354`, accent `#7fbaff`, wave `#4ea1ff` to `#b48cff`). Use them freely when you write about MiniWireshark.
+Everything here is in [`assets/`](assets/), drawn as SVG in the app's own palette (the PNG and ICO files are exported from the SVGs) (navy `#0f1b2d` to `#1b3354`, accent `#7fbaff`, wave `#4ea1ff` to `#b48cff`). Use them freely when you write about MiniWireshark. They are released under the repository's MIT License (see [LICENSE](../LICENSE)).
 
 ## Logo
 
@@ -22,12 +22,13 @@ A hub with four devices, and the traffic wave from the banner.
 |---|---|
 | [`banner.svg`](assets/banner.svg) | The top of the README |
 | [`social-preview.png`](assets/social-preview.png) | The card shown when the repository link is shared (1280×640) |
+| [`social-preview.svg`](assets/social-preview.svg) | The editable source of that card (export it to PNG at 1280×640) |
 
 To use the social preview on GitHub: open the repository's **Settings → General → Social preview → Edit → Upload an image** and choose `docs/assets/social-preview.png`. GitHub only accepts this upload from the website.
 
 ## Icons
 
-One icon for each area of the app, 48×48 SVG. They are used in the README and in [Under the hood](UNDER-THE-HOOD.md).
+One icon for each area of the app, 48×48 SVG. They are used in the README, in [Under the hood](UNDER-THE-HOOD.md) and in [Can I trust it?](TRUST.md).
 
 | | | | | | |
 |:-:|:-:|:-:|:-:|:-:|:-:|
@@ -37,7 +38,7 @@ One icon for each area of the app, 48×48 SVG. They are used in the README and i
 
 ## Screenshots
 
-28 pictures, every tab in the light and the dark theme, all from Demo Mode. See [Screenshots](SCREENSHOTS.md). To take them again after a change to the window, run the release gate, which photographs every tab:
+34 pictures, every tab in the light and the dark theme, all from Demo Mode. See [Screenshots](SCREENSHOTS.md). To take them again after a change to the window, run the release gate, which photographs every tab:
 
 ```bash
 xvfb-run -a python miniwireshark.py --release-gate

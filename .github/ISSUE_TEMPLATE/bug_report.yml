@@ -10,7 +10,7 @@ body:
     id: version
     attributes:
       label: MiniWireshark version
-      placeholder: "5.1.2"
+      placeholder: "5.3.4"
     validations:
       required: true
   - type: input

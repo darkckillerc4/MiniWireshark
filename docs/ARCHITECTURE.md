@@ -1,6 +1,6 @@
 # Architecture
 
-MiniWireshark is about 66,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
+MiniWireshark is about 115,000 lines in a single file, `miniwireshark.py`. It is one file on purpose: it is easy to download, check and run, and it can't break because one of its parts went missing. Only files the program creates at run time (logs, sessions, history, caches) live elsewhere, in the [data folder](INSTALL.md#where-it-keeps-its-files).
 
 ## The map of the file
 
@@ -16,7 +16,7 @@ The module docstring at the top lists every region in file order, and the self-t
 
 | Group | Regions | What lives there |
 |---|---|---|
-| Start-up | 1, 1a, 1b, 2, 2b, 2c, 2d, 3 | Paths and logging, the launcher and private Python runtime, the dependency manager, the loading window and its steps, optional reference data |
+| Start-up | 1, 1a, 1c, 1b, 2, 2b, 2c, 2d, 3 | Paths and logging, the launcher and private Python runtime, the dependency manager, the loading window and its steps, optional reference data |
 | Outbound gate | 2a | `outbound()`, the single gate every network send passes through, and the self-traffic ledger |
 | Decoding | 4, 5, 5b, 5c | Constants and helpers, the protocol decoder, the fast wire decoder, QUIC Initial parsing |
 | Capture | 6, 6b | Capture workers and the v2 pipeline (ring buffer and analysis worker) |
@@ -44,7 +44,8 @@ python miniwireshark.py
    │
    ├─ Loading window (2b, 2c): the bootstrap steps, in plain English.
    │     Missing packages go into a private per-Python folder, never the
-   │     system Python. Each download is checked against a pinned SHA-256.
+   │     system Python. Required packages are checked against a pinned
+   │     SHA-256; optional ones come from PyPI through pip at exact pinned versions, with pip checking PyPI's own hashes.
    │
    ├─ Load scapy, find the gateway, this computer's addresses and the
    │     best network card. Warm up the first views.
@@ -54,7 +55,7 @@ python miniwireshark.py
 
 If a step that only capture needs fails, MiniWireshark continues in *limited mode* instead of stopping. You can still open files and the demo.
 
-From 5.1.2 the compiled code is cached per Python version in the data folder. Later processes of the same file (the private-Python hand-off and the Full Power workers) load that copy, which saves about 2.5 seconds and about 150 MB.
+From 5.1.2 the compiled code is cached per Python version in the data folder. Later processes of the same file (the private-Python hand-off, the Full Power workers and, from 5.3.4, the window itself on Windows) load that copy, which saves a few seconds and about 150 MB. From 5.3.4 the copy is signed with a per-install HMAC key and never used by a process running as root.
 
 ## How a packet becomes an answer
 
@@ -63,7 +64,7 @@ From 5.1.2 the compiled code is cached per Python version in the data folder. La
      │  raw bytes, time, link type
      ▼
  capture thread (6b) ──▶ RawRing ──▶ AnalysisWorker ──▶ NetworkModel (13)
-   never parses           drops are     fast_decode (5b),     devices, websites,
+   never parses           drops are     fast_decode (5b/5c),     devices, websites,
                           counted here  holds GuiGate         remote hosts, flows,
                           by cause      ≤ ~25 ms at a time    metrics, alerts
                                                                  │
@@ -103,7 +104,7 @@ Observations are facts with a source, a time and, when they came from a packet, 
 
 ## Settings are one table
 
-Every option is declared exactly once in `SETTINGS_PAGES` (region 16), grouped by what a person is trying to do. The Settings window is generated from that table, and the self-tests prove that no option is orphaned or phantom.
+Every option is declared exactly once in `SETTINGS_PAGES` (region 16), grouped by what a person is trying to do. The Settings window is generated from that table, and a self-test checks that every option in the table has a default.
 
 ## Privacy is enforced in code
 
@@ -113,13 +114,13 @@ Every option is declared exactly once in `SETTINGS_PAGES` (region 16), grouped b
 
 ## Testing
 
-All test traffic comes from **replay scenarios** (20a): a scripted home network made of ordinary packets with reserved `.example` names. The same frames drive the self-tests, the fuzzer, the GUI test and the benchmarks.
+All test traffic comes from **replay scenarios** (20a): a scripted home network made of ordinary packets with reserved `example.com`, `.org` and `.net` names. The same frames drive the self-tests, the fuzzer, the GUI test and the benchmarks.
 
 | Command | What runs |
 |---|---|
-| `--self-test` | The built-in suite (region 20b), no capture or admin rights needed |
+| `--self-test [NAME]` | The built-in suite (region 20b), or only the named tests; no capture or admin rights needed |
 | `--gui-test` | The real window, driven through every tab (region 20c) |
 | `--bench-gui S1 S2` | Window-performance scenarios against fixed budgets (`BENCH_LIMITS`) |
 | `--release-gate` | All of the above plus pictures of every tab |
 
-CI runs a syntax check and the self-test on Python 3.8, 3.12 and 3.13 for every push and pull request ([`ci.yml`](../.github/workflows/ci.yml)).
+CI runs on every pull request and every push to `main` ([`ci.yml`](../.github/workflows/ci.yml)): the self-test on Python 3.8, 3.12 and 3.13, the GUI test on Linux and Windows, the self-test on macOS, a privacy check and a docs check.

@@ -10,8 +10,13 @@ MiniWireshark is a single-file network monitor that explains your network in pla
 | [User guide](USER-GUIDE.md) | Learn the window: the tabs, filters, shortcuts and settings |
 | [Features](FEATURES.md) | See everything MiniWireshark can do, with the alerts it raises |
 | [Screenshots](SCREENSHOTS.md) | See every tab, in the light and the dark theme |
+| [Can I trust it?](TRUST.md) | Check for yourself what it sends, keeps and asks for, and how it is tested |
 | [Under the hood](UNDER-THE-HOOD.md) | Read about the runtime manager, the fast decoder, signed updates and the self-tests |
 | [Architecture](ARCHITECTURE.md) | Understand how the one file is organised and how a packet becomes an answer |
+| [Alerts reference](ALERTS.md) | Look up an alert: why it fired, what it usually means and what to check |
+| [Packet filter fields](FIELDS.md) | Write a field filter: every protocol and field the Packets tab knows |
+| [Keyboard only](KEYBOARD.md) | Use everything without a mouse, and what is tested |
+| [Glossary](GLOSSARY.md) | Look up a word: network terms and MiniWireshark features in plain English |
 | [FAQ and troubleshooting](FAQ.md) | Fix a problem, or check what MiniWireshark does with your data |
 | [Logo and images](BRANDING.md) | Use the logo, icons, Windows icon or social preview |
 | [Version index](VERSIONS.md) | Download an older version and check its SHA-256 |

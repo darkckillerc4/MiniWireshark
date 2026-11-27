@@ -1,0 +1,17 @@
+# Keeps editors consistent with the CI docs check: UTF-8, LF line endings,
+# a final newline and no trailing spaces.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.py]
+indent_style = space
+indent_size = 4
+
+[*.{yml,yaml,json}]
+indent_style = space
+indent_size = 2

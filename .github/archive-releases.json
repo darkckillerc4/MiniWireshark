@@ -1,5 +1,5 @@
 {
-  "_comment": "Every archived MiniWireshark version, oldest first. 'source' is a file in this repo (legacy/) or <commit>:<path> from git history. sha256 must match the copy kept in the owner's All_MiniWireshark_Version archive.",
+  "_comment": "Every archived MiniWireshark version, oldest first. 'source' is a file in this repo (legacy/) or <commit>:<path> from git history. sha256 must match the file at that source.",
   "releases": [
     {"tag": "v1.0.0", "title": "MiniWireshark 1.x (legacy)", "target": "786f4a0", "source": "legacy/miniwireshark-1.0.0.py", "asset": "miniwireshark-1.0.0.py", "sha256": "01c01cf7d954f71e0e6e4cfeef4fd5cb47699e44226fbd0cfab289058116ebf0", "prerelease": false},
     {"tag": "v2.0.0", "title": "MiniWireshark 2.0.0 (legacy)", "target": "786f4a0", "source": "legacy/miniwireshark-2.0.0.py", "asset": "miniwireshark-2.0.0.py", "sha256": "950c342063a9c79026836fade381cd4b9abadfaf62f182f51f5ac6872c2879e8", "prerelease": false},
